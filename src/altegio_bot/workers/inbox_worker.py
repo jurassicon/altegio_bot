@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Sequence
 from zoneinfo import ZoneInfo
@@ -14,7 +14,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from altegio_bot.db import SessionLocal
 from altegio_bot.models.models import AltegioEvent, Client, Record, RecordService
 
-
 logger = logging.getLogger("inbox_worker")
 TZ = ZoneInfo("Europe/Belgrade")
 
@@ -24,27 +23,18 @@ def utcnow() -> datetime:
 
 
 def parse_dt(value: str | None) -> datetime | None:
-    """
-    В общем: приводим даты из Altegio к timezone-aware datetime.
-
-    В частности:
-    - '2026-03-28T14:30:00+01:00' -> fromisoformat OK
-    - '2026-01-20T13:25:04+0100'  -> добавляем ':' в таймзону и парсим
-    - '2026-03-28 14:30:00'       -> считаем локальным временем TZ и делаем aware
-    """
     if not value:
         return None
 
     v = value.strip()
 
-    # чинит +0100 -> +01:00
-    if len(v) >= 5 and (v[-5] in "+-") and (v[-3] != ":"):
+    # fix +0100 -> +01:00
+    if len(v) >= 5 and v[-5] in "+-" and v[-3] != ":":
         v = v[:-2] + ":" + v[-2:]
 
     try:
         dt = datetime.fromisoformat(v)
     except ValueError:
-        # последняя попытка: заменим пробел на T
         try:
             dt = datetime.fromisoformat(v.replace(" ", "T"))
         except ValueError:
@@ -61,30 +51,28 @@ def sum_total_cost(services: list[dict[str, Any]]) -> Decimal | None:
     any_found = False
     for s in services:
         cost = s.get("cost_to_pay")
-        amount = s.get("amount") or 1
         if cost is None:
             continue
+        amount = s.get("amount") or 1
         any_found = True
         total += Decimal(str(cost)) * Decimal(str(amount))
     return total if any_found else None
 
 
-async def _upsert_client(session: AsyncSession, company_id: int, client_data: dict[str, Any]) -> int:
-    """
-    В общем: создаём/обновляем клиента и возвращаем внутренний client.id.
-
-    В частности:
-    - уникальность по (company_id, altegio_client_id)
-    - обновляем phone/display_name/email/raw
-    """
+async def upsert_client(session: AsyncSession, company_id: int, client_data: dict[str, Any]) -> int:
     altegio_client_id = client_data.get("id")
+    if altegio_client_id is None:
+        raise ValueError("client.id missing in payload")
+
+    display_name = client_data.get("display_name") or client_data.get("name")
+
     stmt = (
         insert(Client)
         .values(
-            company_id=company_id,
-            altegio_client_id=altegio_client_id,
+            company_id=int(company_id),
+            altegio_client_id=int(altegio_client_id),
             phone_e164=client_data.get("phone"),
-            display_name=client_data.get("display_name") or client_data.get("name"),
+            display_name=display_name,
             email=client_data.get("email"),
             raw=client_data,
         )
@@ -92,7 +80,7 @@ async def _upsert_client(session: AsyncSession, company_id: int, client_data: di
             constraint="uq_clients_company_altegio_id",
             set_={
                 "phone_e164": client_data.get("phone"),
-                "display_name": client_data.get("display_name") or client_data.get("name"),
+                "display_name": display_name,
                 "email": client_data.get("email"),
                 "raw": client_data,
             },
@@ -103,22 +91,17 @@ async def _upsert_client(session: AsyncSession, company_id: int, client_data: di
     return int(res.scalar_one())
 
 
-async def _upsert_record(
+async def upsert_record(
     session: AsyncSession,
     company_id: int,
     payload_event_status: str | None,
     record_data: dict[str, Any],
     client_pk: int | None,
 ) -> int:
-    """
-    В общем: создаём/обновляем запись и возвращаем внутренний record.id.
-
-    В частности:
-    - уникальность по (company_id, altegio_record_id)
-    - starts_at/ends_at/duration_sec считаем из data.datetime и length/seance_length
-    - is_deleted учитывает data.deleted или event_status == 'delete'
-    """
     altegio_record_id = record_data.get("id")
+    if altegio_record_id is None:
+        raise ValueError("record.id missing in payload")
+
     client_data = record_data.get("client") or {}
     staff_data = record_data.get("staff") or {}
 
@@ -131,18 +114,20 @@ async def _upsert_record(
     total_cost = sum_total_cost(services)
 
     is_deleted = bool(record_data.get("deleted")) or (payload_event_status == "delete")
-
     last_change_at = parse_dt(record_data.get("last_change_date"))
+
+    staff_id = record_data.get("staff_id") or staff_data.get("id")
+    staff_name = staff_data.get("name")
 
     stmt = (
         insert(Record)
         .values(
-            company_id=company_id,
-            altegio_record_id=altegio_record_id,
+            company_id=int(company_id),
+            altegio_record_id=int(altegio_record_id),
             client_id=client_pk,
             altegio_client_id=client_data.get("id"),
-            staff_id=record_data.get("staff_id") or staff_data.get("id"),
-            staff_name=staff_data.get("name"),
+            staff_id=int(staff_id) if staff_id is not None else None,
+            staff_name=staff_name,
             starts_at=starts_at,
             ends_at=ends_at,
             duration_sec=duration_sec,
@@ -161,8 +146,8 @@ async def _upsert_record(
             set_={
                 "client_id": client_pk,
                 "altegio_client_id": client_data.get("id"),
-                "staff_id": record_data.get("staff_id") or staff_data.get("id"),
-                "staff_name": staff_data.get("name"),
+                "staff_id": int(staff_id) if staff_id is not None else None,
+                "staff_name": staff_name,
                 "starts_at": starts_at,
                 "ends_at": ends_at,
                 "duration_sec": duration_sec,
@@ -179,18 +164,12 @@ async def _upsert_record(
         )
         .returning(Record.id)
     )
+
     res = await session.execute(stmt)
     return int(res.scalar_one())
 
 
-async def _replace_record_services(session: AsyncSession, record_pk: int, services: list[dict[str, Any]]) -> None:
-    """
-    В общем: делаем список услуг записи точной копией payload.
-
-    В частности:
-    - удаляем старые строки record_services по record_id
-    - вставляем новые
-    """
+async def replace_record_services(session: AsyncSession, record_pk: int, services: list[dict[str, Any]]) -> None:
     await session.execute(delete(RecordService).where(RecordService.record_id == record_pk))
 
     if not services:
@@ -198,10 +177,13 @@ async def _replace_record_services(session: AsyncSession, record_pk: int, servic
 
     rows: list[dict[str, Any]] = []
     for s in services:
+        sid = s.get("id")
+        if sid is None:
+            continue
         rows.append(
             {
                 "record_id": record_pk,
-                "service_id": int(s.get("id")),
+                "service_id": int(sid),
                 "title": s.get("title"),
                 "amount": s.get("amount"),
                 "cost_to_pay": Decimal(str(s.get("cost_to_pay"))) if s.get("cost_to_pay") is not None else None,
@@ -212,7 +194,7 @@ async def _replace_record_services(session: AsyncSession, record_pk: int, servic
     await session.execute(insert(RecordService), rows)
 
 
-async def _lock_next_batch(session: AsyncSession, batch_size: int) -> Sequence[AltegioEvent]:
+async def lock_next_batch(session: AsyncSession, batch_size: int) -> Sequence[AltegioEvent]:
     stmt = (
         select(AltegioEvent)
         .where(AltegioEvent.status == "received")
@@ -230,33 +212,33 @@ async def _lock_next_batch(session: AsyncSession, batch_size: int) -> Sequence[A
 
 
 async def handle_event(session: AsyncSession, event: AltegioEvent) -> None:
-    """
-    В общем: превращаем "сырой webhook" в нормальные данные в БД.
-
-    В частности:
-    - если resource == client: upsert клиента
-    - если resource == record: upsert клиента, upsert записи, заменить услуги
-    """
     payload = event.payload or {}
-    resource = event.resource or payload.get("resource") or payload.get("type")
     company_id = event.company_id or payload.get("company_id")
+    resource = event.resource or payload.get("resource")
     data = payload.get("data") or {}
 
+    logger.info(
+        "event=%s company=%s resource=%s resource_id=%s",
+        event.id,
+        company_id,
+        resource,
+        event.resource_id,
+    )
+
     if not company_id:
-        raise ValueError("company_id missing in event")
+        raise ValueError("company_id missing")
 
     if resource == "client":
-        await _upsert_client(session, int(company_id), data)
+        await upsert_client(session, int(company_id), data)
         return
 
     if resource == "record":
-        # клиент внутри record payload
         client_data = data.get("client") or {}
         client_pk: int | None = None
         if client_data.get("id") is not None:
-            client_pk = await _upsert_client(session, int(company_id), client_data)
+            client_pk = await upsert_client(session, int(company_id), client_data)
 
-        record_pk = await _upsert_record(
+        record_pk = await upsert_record(
             session=session,
             company_id=int(company_id),
             payload_event_status=event.event_status,
@@ -264,12 +246,10 @@ async def handle_event(session: AsyncSession, event: AltegioEvent) -> None:
             client_pk=client_pk,
         )
 
-        services = data.get("services") or []
-        await _replace_record_services(session, record_pk, services)
+        await replace_record_services(session, record_pk, data.get("services") or [])
         return
 
-    # неизвестный тип — не падаем, но логируем
-    logger.info("Skip resource=%s event_id=%s", resource, event.id)
+    logger.info("skip resource=%s event=%s", resource, event.id)
 
 
 async def process_one_event(event_id: int) -> None:
@@ -278,7 +258,6 @@ async def process_one_event(event_id: int) -> None:
             stmt = select(AltegioEvent).where(AltegioEvent.id == event_id).with_for_update()
             res = await session.execute(stmt)
             event = res.scalar_one_or_none()
-
             if event is None:
                 return
 
@@ -289,8 +268,8 @@ async def process_one_event(event_id: int) -> None:
                 event.error = None
             except Exception as e:
                 event.status = "failed"
-                event.error = str(e)
                 event.processed_at = utcnow()
+                event.error = str(e)
                 logger.exception("Event failed id=%s: %s", event_id, e)
 
 
@@ -302,7 +281,7 @@ async def run_loop(batch_size: int = 50, poll_interval_sec: float = 1.0) -> None
 
         async with SessionLocal() as session:
             async with session.begin():
-                events = await _lock_next_batch(session, batch_size)
+                events = await lock_next_batch(session, batch_size)
                 event_ids = [e.id for e in events]
 
         if not event_ids:
