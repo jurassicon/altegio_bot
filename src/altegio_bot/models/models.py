@@ -13,6 +13,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    Enum,
     func,
 )
 from sqlalchemy.dialects.postgresql import JSONB
@@ -141,3 +142,111 @@ class RecordService(Base):
     raw: Mapped[dict] = mapped_column(JSONB, default=dict)
 
     record: Mapped[Record] = relationship(back_populates="services")
+
+
+class MessageTemplate(Base):
+    __tablename__ = "message_templates"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    company_id: Mapped[int] = mapped_column(Integer, index=True)
+
+    # "record_created", "reminder_24h", ...
+    code: Mapped[str] = mapped_column(String(64), index=True)
+
+    # "de"
+    language: Mapped[str] = mapped_column(String(8), default="de")
+
+    # Текст шаблона с плейсхолдерами {client_name}, {date}, ...
+    body: Mapped[str] = mapped_column(Text)
+
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+
+class MessageJob(Base):
+    __tablename__ = "message_jobs"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+
+    company_id: Mapped[int] = mapped_column(Integer, index=True)
+    record_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("records.id", ondelete="CASCADE"), index=True, nullable=True
+    )
+    client_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("clients.id", ondelete="CASCADE"), index=True, nullable=True
+    )
+
+    # тип задачи: record_created/reminder_24h/...
+    job_type: Mapped[str] = mapped_column(String(64), index=True)
+
+    # когда надо отправить
+    run_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+    # queued/running/done/canceled/failed
+    status: Mapped[str] = mapped_column(String(32), default="queued", index=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # полезно для аналитики и идемпотентности
+    dedupe_key: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+
+    payload: Mapped[dict] = mapped_column(JSONB, default=dict)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+
+class OutboxMessage(Base):
+    __tablename__ = "outbox_messages"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+
+    company_id: Mapped[int] = mapped_column(Integer, index=True)
+    client_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("clients.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    record_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("records.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    job_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("message_jobs.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+
+    # куда (wa phone)
+    phone_e164: Mapped[str] = mapped_column(String(32), index=True)
+
+    template_code: Mapped[str] = mapped_column(String(64), index=True)
+    language: Mapped[str] = mapped_column(String(8), default="de")
+    body: Mapped[str] = mapped_column(Text)
+
+    # queued/sending/sent/delivered/read/failed
+    status: Mapped[str] = mapped_column(String(32), default="queued", index=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # метаданные Meta (message_id)
+    provider_message_id: Mapped[str | None] = mapped_column(String(128), index=True, nullable=True)
+
+    scheduled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    meta: Mapped[dict] = mapped_column(JSONB, default=dict)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class ContactRateLimit(Base):
+    __tablename__ = "contact_rate_limits"
+
+    phone_e164: Mapped[str] = mapped_column(String(32), primary_key=True)
+    next_allowed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
