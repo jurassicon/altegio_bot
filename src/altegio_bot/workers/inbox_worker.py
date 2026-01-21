@@ -12,6 +12,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.db import SessionLocal
+from altegio_bot.message_planner import plan_jobs_for_record_event
 from altegio_bot.models.models import AltegioEvent, Client, Record, RecordService
 
 logger = logging.getLogger("inbox_worker")
@@ -244,6 +245,13 @@ async def handle_event(session: AsyncSession, event: AltegioEvent) -> None:
             payload_event_status=event.event_status,
             record_data=data,
             client_pk=client_pk,
+        )
+
+        await plan_jobs_for_record_event(
+            session,
+            record=record_obj,
+            client=client_obj,
+            event_status=event.event_status,
         )
 
         await replace_record_services(session, record_pk, data.get("services") or [])
