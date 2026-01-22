@@ -39,7 +39,6 @@ async def enqueue_job(
     company_id: int,
     record_id: int,
     client_id: int | None,
-    phone_e164: str | None,
     job_type: str,
     run_at: datetime,
 ) -> None:
@@ -48,11 +47,9 @@ async def enqueue_job(
         company_id=company_id,
         record_id=record_id,
         client_id=client_id,
-        phone_e164=phone_e164,
         job_type=job_type,
         run_at=run_at,
         status="queued",
-        created_at=utcnow(),
     )
     stmt = stmt.on_conflict_do_nothing(index_elements=["dedupe_key"])
     await session.execute(stmt)
@@ -66,9 +63,7 @@ async def plan_jobs_for_record_event(
     event_status: str,
 ) -> None:
     now = utcnow()
-
     client_id = client.id if client is not None else None
-    phone = client.phone_e164 if client is not None else None
 
     if event_status == "create":
         await enqueue_job(
@@ -76,11 +71,10 @@ async def plan_jobs_for_record_event(
             company_id=record.company_id,
             record_id=record.id,
             client_id=client_id,
-            phone_e164=phone,
             job_type="record_created",
             run_at=now,
         )
-        await _plan_reminders(session, record, client_id, phone, now)
+        await _plan_reminders(session, record, client_id, now)
         return
 
     if event_status == "update":
@@ -94,11 +88,10 @@ async def plan_jobs_for_record_event(
             company_id=record.company_id,
             record_id=record.id,
             client_id=client_id,
-            phone_e164=phone,
             job_type="record_updated",
             run_at=now,
         )
-        await _plan_reminders(session, record, client_id, phone, now)
+        await _plan_reminders(session, record, client_id, now)
         return
 
     if event_status == "delete":
@@ -112,7 +105,6 @@ async def plan_jobs_for_record_event(
             company_id=record.company_id,
             record_id=record.id,
             client_id=client_id,
-            phone_e164=phone,
             job_type="record_canceled",
             run_at=now,
         )
@@ -121,7 +113,6 @@ async def plan_jobs_for_record_event(
             company_id=record.company_id,
             record_id=record.id,
             client_id=client_id,
-            phone_e164=phone,
             job_type="comeback_3d",
             run_at=now + timedelta(days=3),
         )
@@ -132,7 +123,6 @@ async def _plan_reminders(
     session: AsyncSession,
     record: Record,
     client_id: int | None,
-    phone: str | None,
     now: datetime,
 ) -> None:
     if record.starts_at is None:
@@ -147,7 +137,6 @@ async def _plan_reminders(
             company_id=record.company_id,
             record_id=record.id,
             client_id=client_id,
-            phone_e164=phone,
             job_type="reminder_24h",
             run_at=run_24h,
         )
@@ -158,7 +147,6 @@ async def _plan_reminders(
             company_id=record.company_id,
             record_id=record.id,
             client_id=client_id,
-            phone_e164=phone,
             job_type="reminder_2h",
             run_at=run_2h,
         )
