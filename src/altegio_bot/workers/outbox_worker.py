@@ -72,7 +72,6 @@ async def _apply_rate_limit(
     phone_e164: str,
 ) -> datetime | None:
     now = utcnow()
-
     stmt = (
         select(ContactRateLimit)
         .where(ContactRateLimit.phone_e164 == phone_e164)
@@ -82,17 +81,37 @@ async def _apply_rate_limit(
     rl = res.scalar_one_or_none()
 
     if rl is None:
-        rl = ContactRateLimit(
-            phone_e164=phone_e164,
-            next_allowed_at=now,
-        )
+        rl = ContactRateLimit(phone_e164=phone_e164, next_allowed_at=now)
         session.add(rl)
         await session.flush()
 
-    if rl.next_allowed_at is not None and rl.next_allowed_at > now:
+    if rl.next_allowed_at > now:
         return rl.next_allowed_at
 
     rl.next_allowed_at = now + timedelta(seconds=MIN_SECONDS_BETWEEN_MESSAGES)
+    return None
+
+
+async def _load_record(
+    session: AsyncSession,
+    job: MessageJob,
+) -> Record | None:
+    if job.record_id is None:
+        return None
+    return await session.get(Record, job.record_id)
+
+
+async def _load_client(
+    session: AsyncSession,
+    job: MessageJob,
+    record: Record | None,
+) -> Client | None:
+    if job.client_id is not None:
+        return await session.get(Client, job.client_id)
+
+    if record is not None and record.client_id is not None:
+        return await session.get(Client, record.client_id)
+
     return None
 
 
@@ -126,10 +145,10 @@ async def _render_message(
         services = list(svc_res.scalars().all())
 
         lines: list[str] = []
-        for s in services:
-            lines.append(f"{s.title} — {_fmt_money(s.cost_to_pay)}€")
-            if s.cost_to_pay is not None:
-                total_cost += s.cost_to_pay
+        for svc in services:
+            lines.append(f"{svc.title} — {_fmt_money(svc.cost_to_pay)}€")
+            if svc.cost_to_pay is not None:
+                total_cost += svc.cost_to_pay
 
         services_text = "\n".join(lines)
 
@@ -159,15 +178,13 @@ async def process_job(job_id: int) -> None:
             if job is None:
                 return
 
-            phone = job.phone_e164
-            if not phone and job.client_id:
-                c = await session.get(Client, job.client_id)
-                phone = c.phone_e164 if c else None
+            record = await _load_record(session, job)
+            client = await _load_client(session, job, record)
 
+            phone = client.phone_e164 if client else None
             if not phone:
                 job.status = "failed"
-                job.error = "No phone_e164"
-                job.processed_at = utcnow()
+                job.last_error = "No phone_e164"
                 return
 
             delay_until = await _apply_rate_limit(session, phone)
@@ -175,14 +192,6 @@ async def process_job(job_id: int) -> None:
                 job.status = "queued"
                 job.run_at = delay_until
                 return
-
-            record = None
-            if job.record_id:
-                record = await session.get(Record, job.record_id)
-
-            client = None
-            if job.client_id:
-                client = await session.get(Client, job.client_id)
 
             try:
                 body = await _render_message(
@@ -194,25 +203,26 @@ async def process_job(job_id: int) -> None:
                 )
             except Exception as exc:
                 job.status = "failed"
-                job.error = f"Template render error: {exc}"
-                job.processed_at = utcnow()
+                job.last_error = f"Template render error: {exc}"
                 return
 
             out = OutboxMessage(
                 company_id=job.company_id,
+                client_id=(client.id if client else None),
+                record_id=(record.id if record else None),
                 job_id=job.id,
                 phone_e164=phone,
                 template_code=job.job_type,
+                language="de",
                 body=body,
                 status="sent",
-                created_at=utcnow(),
+                scheduled_at=utcnow(),
                 sent_at=utcnow(),
             )
             session.add(out)
 
             job.status = "done"
-            job.error = None
-            job.processed_at = utcnow()
+            job.last_error = None
 
             logger.info(
                 "Outbox sent (test) job_id=%s phone=%s type=%s",
