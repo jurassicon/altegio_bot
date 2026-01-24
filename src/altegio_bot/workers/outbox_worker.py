@@ -22,6 +22,11 @@ from altegio_bot.models.models import (
 logger = logging.getLogger("outbox_worker")
 
 MIN_SECONDS_BETWEEN_MESSAGES = 30
+UNSUBSCRIBE_LINKS = {
+    758285: "https://example.com/unsubscribe/karlsruhe",
+    1271200: "https://example.com/unsubscribe/rastatt",
+}
+
 
 
 def utcnow() -> datetime:
@@ -151,6 +156,7 @@ async def _render_message(
                 total_cost += svc.cost_to_pay
 
         services_text = "\n".join(lines)
+        unsubscribe_link = UNSUBSCRIBE_LINKS.get(company_id, "")
 
     ctx = {
         "client_name": (client.display_name if client else ""),
@@ -160,6 +166,7 @@ async def _render_message(
         "services": services_text,
         "total_cost": _fmt_money(total_cost),
         "short_link": (record.short_link if record else ""),
+        "unsubscribe_link": unsubscribe_link,
     }
 
     return tmpl.body.format(**ctx)
