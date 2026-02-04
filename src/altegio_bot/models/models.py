@@ -241,7 +241,16 @@ class OutboxMessage(Base):
 
     meta: Mapped[dict] = mapped_column(JSONB, default=dict)
 
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(DateTime(
+        timezone=True), server_default=func.now()
+    )
+
+    sender_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey("whatsapp_senders.id"),
+        index=True,
+        nullable=True
+    )
 
 
 class ContactRateLimit(Base):
@@ -250,3 +259,49 @@ class ContactRateLimit(Base):
     phone_e164: Mapped[str] = mapped_column(String(32), primary_key=True)
     next_allowed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class WhatsAppSender(Base):
+    __tablename__ = "whatsapp_senders"
+
+    id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, autoincrement=True
+    )
+    company_id: Mapped[int] = mapped_column(Integer, index=True)
+    sender_code: Mapped[str] = mapped_column(String(32), index=True)
+
+    phone_number_id: Mapped[str] = mapped_column(String(64))
+    display_phone: Mapped[str | None] = mapped_column(
+        String(32), nullable=True
+    )
+
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "company_id",
+            "sender_code",
+            name="uq_whatsapp_senders_company_code",
+        ),
+    )
+
+
+class ServiceSenderRule(Base):
+    __tablename__ = "service_sender_rules"
+
+    id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, autoincrement=True
+    )
+
+    company_id: Mapped[int] = mapped_column(Integer, index=True)
+    service_id: Mapped[int] = mapped_column(Integer, index=True)
+
+    sender_code: Mapped[str] = mapped_column(String(32))
+
+    __table_args__ = (
+        UniqueConstraint(
+            "company_id",
+            "service_id",
+            name="uq_service_sender_rules_company_service",
+        ),
+    )
