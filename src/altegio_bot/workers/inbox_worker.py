@@ -15,8 +15,8 @@ from altegio_bot.db import SessionLocal
 from altegio_bot.message_planner import plan_jobs_for_record_event
 from altegio_bot.models.models import AltegioEvent, Client, Record, RecordService
 
-logger = logging.getLogger("inbox_worker")
-TZ = ZoneInfo("Europe/Belgrade")
+logger = logging.getLogger('inbox_worker')
+TZ = ZoneInfo('Europe/Belgrade')
 
 
 def utcnow() -> datetime:
@@ -29,14 +29,14 @@ def parse_dt(value: str | None) -> datetime | None:
 
     v = value.strip()
 
-    if len(v) >= 5 and v[-5] in "+-" and v[-3] != ":":
-        v = v[:-2] + ":" + v[-2:]
+    if len(v) >= 5 and v[-5] in '+-' and v[-3] != ':':
+        v = v[:-2] + ':' + v[-2:]
 
     try:
         dt = datetime.fromisoformat(v)
     except ValueError:
         try:
-            dt = datetime.fromisoformat(v.replace(" ", "T"))
+            dt = datetime.fromisoformat(v.replace(' ', 'T'))
         except ValueError:
             return None
 
@@ -47,15 +47,15 @@ def parse_dt(value: str | None) -> datetime | None:
 
 
 def sum_total_cost(services: list[dict[str, Any]]) -> Decimal | None:
-    total = Decimal("0")
+    total = Decimal('0')
     any_found = False
 
     for svc in services:
-        cost = svc.get("cost_to_pay")
+        cost = svc.get('cost_to_pay')
         if cost is None:
             continue
 
-        amount = svc.get("amount") or 1
+        amount = svc.get('amount') or 1
         any_found = True
         total += Decimal(str(cost)) * Decimal(str(amount))
 
@@ -67,29 +67,29 @@ async def upsert_client(
     company_id: int,
     client_data: dict[str, Any],
 ) -> int:
-    altegio_client_id = client_data.get("id")
+    altegio_client_id = client_data.get('id')
     if altegio_client_id is None:
-        raise ValueError("client.id missing in payload")
+        raise ValueError('client.id missing in payload')
 
-    display_name = client_data.get("display_name") or client_data.get("name")
+    display_name = client_data.get('display_name') or client_data.get('name')
 
     stmt = (
         insert(Client)
         .values(
             company_id=int(company_id),
             altegio_client_id=int(altegio_client_id),
-            phone_e164=client_data.get("phone"),
+            phone_e164=client_data.get('phone'),
             display_name=display_name,
-            email=client_data.get("email"),
+            email=client_data.get('email'),
             raw=client_data,
         )
         .on_conflict_do_update(
-            constraint="uq_clients_company_altegio_id",
+            constraint='uq_clients_company_altegio_id',
             set_={
-                "phone_e164": client_data.get("phone"),
-                "display_name": display_name,
-                "email": client_data.get("email"),
-                "raw": client_data,
+                'phone_e164': client_data.get('phone'),
+                'display_name': display_name,
+                'email': client_data.get('email'),
+                'raw': client_data,
             },
         )
         .returning(Client.id)
@@ -105,36 +105,36 @@ async def upsert_record(
     record_data: dict[str, Any],
     client_pk: int | None,
 ) -> int:
-    altegio_record_id = record_data.get("id")
+    altegio_record_id = record_data.get('id')
     if altegio_record_id is None:
-        raise ValueError("record.id missing in payload")
+        raise ValueError('record.id missing in payload')
 
-    client_data = record_data.get("client") or {}
-    staff_data = record_data.get("staff") or {}
+    client_data = record_data.get('client') or {}
+    staff_data = record_data.get('staff') or {}
 
-    starts_at = parse_dt(record_data.get("datetime"))
+    starts_at = parse_dt(record_data.get('datetime'))
     if starts_at is None:
-        starts_at = parse_dt(record_data.get("date"))
+        starts_at = parse_dt(record_data.get('date'))
 
-    duration_sec = record_data.get("seance_length") or record_data.get("length")
+    duration_sec = record_data.get('seance_length') or record_data.get('length')
     duration_sec = int(duration_sec) if duration_sec is not None else None
 
     ends_at = None
     if starts_at and duration_sec:
         ends_at = starts_at + timedelta(seconds=duration_sec)
 
-    services = record_data.get("services") or []
+    services = record_data.get('services') or []
     total_cost = sum_total_cost(services)
 
-    is_deleted = bool(record_data.get("deleted"))
-    if payload_event_status == "delete":
+    is_deleted = bool(record_data.get('deleted'))
+    if payload_event_status == 'delete':
         is_deleted = True
 
-    last_change_at = parse_dt(record_data.get("last_change_date"))
+    last_change_at = parse_dt(record_data.get('last_change_date'))
 
-    staff_id = record_data.get("staff_id") or staff_data.get("id")
+    staff_id = record_data.get('staff_id') or staff_data.get('id')
     staff_id_val = int(staff_id) if staff_id is not None else None
-    staff_name = staff_data.get("name")
+    staff_name = staff_data.get('name')
 
     stmt = (
         insert(Record)
@@ -142,41 +142,41 @@ async def upsert_record(
             company_id=int(company_id),
             altegio_record_id=int(altegio_record_id),
             client_id=client_pk,
-            altegio_client_id=client_data.get("id"),
+            altegio_client_id=client_data.get('id'),
             staff_id=staff_id_val,
             staff_name=staff_name,
             starts_at=starts_at,
             ends_at=ends_at,
             duration_sec=duration_sec,
-            comment=record_data.get("comment"),
-            short_link=record_data.get("short_link"),
-            confirmed=record_data.get("confirmed"),
-            attendance=record_data.get("attendance"),
-            visit_attendance=record_data.get("visit_attendance"),
+            comment=record_data.get('comment'),
+            short_link=record_data.get('short_link'),
+            confirmed=record_data.get('confirmed'),
+            attendance=record_data.get('attendance'),
+            visit_attendance=record_data.get('visit_attendance'),
             is_deleted=is_deleted,
             total_cost=total_cost,
             last_change_at=last_change_at,
             raw=record_data,
         )
         .on_conflict_do_update(
-            constraint="uq_records_company_altegio_id",
+            constraint='uq_records_company_altegio_id',
             set_={
-                "client_id": client_pk,
-                "altegio_client_id": client_data.get("id"),
-                "staff_id": staff_id_val,
-                "staff_name": staff_name,
-                "starts_at": starts_at,
-                "ends_at": ends_at,
-                "duration_sec": duration_sec,
-                "comment": record_data.get("comment"),
-                "short_link": record_data.get("short_link"),
-                "confirmed": record_data.get("confirmed"),
-                "attendance": record_data.get("attendance"),
-                "visit_attendance": record_data.get("visit_attendance"),
-                "is_deleted": is_deleted,
-                "total_cost": total_cost,
-                "last_change_at": last_change_at,
-                "raw": record_data,
+                'client_id': client_pk,
+                'altegio_client_id': client_data.get('id'),
+                'staff_id': staff_id_val,
+                'staff_name': staff_name,
+                'starts_at': starts_at,
+                'ends_at': ends_at,
+                'duration_sec': duration_sec,
+                'comment': record_data.get('comment'),
+                'short_link': record_data.get('short_link'),
+                'confirmed': record_data.get('confirmed'),
+                'attendance': record_data.get('attendance'),
+                'visit_attendance': record_data.get('visit_attendance'),
+                'is_deleted': is_deleted,
+                'total_cost': total_cost,
+                'last_change_at': last_change_at,
+                'raw': record_data,
             },
         )
         .returning(Record.id)
@@ -200,23 +200,23 @@ async def replace_record_services(
 
     rows: list[dict[str, Any]] = []
     for svc in services:
-        sid = svc.get("id")
+        sid = svc.get('id')
         if sid is None:
             continue
 
-        cost_to_pay = svc.get("cost_to_pay")
+        cost_to_pay = svc.get('cost_to_pay')
         cost_val = None
         if cost_to_pay is not None:
             cost_val = Decimal(str(cost_to_pay))
 
         rows.append(
             {
-                "record_id": record_pk,
-                "service_id": int(sid),
-                "title": svc.get("title"),
-                "amount": svc.get("amount"),
-                "cost_to_pay": cost_val,
-                "raw": svc,
+                'record_id': record_pk,
+                'service_id': int(sid),
+                'title': svc.get('title'),
+                'amount': svc.get('amount'),
+                'cost_to_pay': cost_val,
+                'raw': svc,
             }
         )
 
@@ -229,7 +229,7 @@ async def lock_next_batch(
 ) -> Sequence[AltegioEvent]:
     stmt = (
         select(AltegioEvent)
-        .where(AltegioEvent.status == "received")
+        .where(AltegioEvent.status == 'received')
         .order_by(AltegioEvent.received_at.asc())
         .limit(batch_size)
         .with_for_update(skip_locked=True)
@@ -238,7 +238,7 @@ async def lock_next_batch(
     events = list(res.scalars().all())
 
     for event in events:
-        event.status = "processing"
+        event.status = 'processing'
 
     return events
 
@@ -246,13 +246,13 @@ async def lock_next_batch(
 async def handle_event(session: AsyncSession, event: AltegioEvent) -> None:
     payload = event.payload or {}
 
-    company_id = event.company_id or payload.get("company_id")
-    resource = event.resource or payload.get("resource")
-    data = payload.get("data") or {}
-    event_status = event.event_status or payload.get("status")
+    company_id = event.company_id or payload.get('company_id')
+    resource = event.resource or payload.get('resource')
+    data = payload.get('data') or {}
+    event_status = event.event_status or payload.get('status')
 
     logger.info(
-        "event=%s company=%s resource=%s resource_id=%s",
+        'event=%s company=%s resource=%s resource_id=%s',
         event.id,
         company_id,
         resource,
@@ -260,16 +260,16 @@ async def handle_event(session: AsyncSession, event: AltegioEvent) -> None:
     )
 
     if not company_id:
-        raise ValueError("company_id missing")
+        raise ValueError('company_id missing')
 
-    if resource == "client":
+    if resource == 'client':
         await upsert_client(session, int(company_id), data)
         return
 
-    if resource == "record":
-        client_data = data.get("client") or {}
+    if resource == 'record':
+        client_data = data.get('client') or {}
         client_pk: int | None = None
-        if client_data.get("id") is not None:
+        if client_data.get('id') is not None:
             client_pk = await upsert_client(session, int(company_id), client_data)
 
         record_pk = await upsert_record(
@@ -283,7 +283,7 @@ async def handle_event(session: AsyncSession, event: AltegioEvent) -> None:
         await replace_record_services(
             session,
             record_pk,
-            data.get("services") or [],
+            data.get('services') or [],
         )
 
         record_obj = await session.get(Record, record_pk)
@@ -301,7 +301,7 @@ async def handle_event(session: AsyncSession, event: AltegioEvent) -> None:
 
         return
 
-    logger.info("skip resource=%s event=%s", resource, event.id)
+    logger.info('skip resource=%s event=%s', resource, event.id)
 
 
 async def process_one_event(event_id: int) -> None:
@@ -319,19 +319,19 @@ async def process_one_event(event_id: int) -> None:
 
             try:
                 await handle_event(session, event)
-                event.status = "processed"
+                event.status = 'processed'
                 event.processed_at = utcnow()
                 event.error = None
             except Exception as exc:
-                event.status = "failed"
+                event.status = 'failed'
                 event.processed_at = utcnow()
                 event.error = str(exc)
-                logger.exception("Event failed id=%s", event_id)
+                logger.exception('Event failed id=%s', event_id)
 
 
 async def run_loop(batch_size: int = 50, poll_sec: float = 1.0) -> None:
     logger.info(
-        "Inbox worker started. batch_size=%s poll=%ss",
+        'Inbox worker started. batch_size=%s poll=%ss',
         batch_size,
         poll_sec,
     )
@@ -355,10 +355,10 @@ async def run_loop(batch_size: int = 50, poll_sec: float = 1.0) -> None:
 def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        format='%(asctime)s %(levelname)s %(name)s: %(message)s',
     )
     asyncio.run(run_loop())
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
