@@ -19,12 +19,12 @@ from altegio_bot.models.models import (
     RecordService,
 )
 
-logger = logging.getLogger("outbox_worker")
+logger = logging.getLogger('outbox_worker')
 
 MIN_SECONDS_BETWEEN_MESSAGES = 30
 UNSUBSCRIBE_LINKS = {
-    758285: "https://example.com/unsubscribe/karlsruhe",
-    1271200: "https://example.com/unsubscribe/rastatt",
+    758285: 'https://example.com/unsubscribe/karlsruhe',
+    1271200: 'https://example.com/unsubscribe/rastatt',
 }
 
 
@@ -35,20 +35,20 @@ def utcnow() -> datetime:
 
 def _fmt_money(value: Decimal | None) -> str:
     if value is None:
-        return "0.00"
-    return f"{value:.2f}"
+        return '0.00'
+    return f'{value:.2f}'
 
 
 def _fmt_date(dt: datetime | None) -> str:
     if dt is None:
-        return ""
-    return dt.astimezone().strftime("%d.%m.%Y")
+        return ''
+    return dt.astimezone().strftime('%d.%m.%Y')
 
 
 def _fmt_time(dt: datetime | None) -> str:
     if dt is None:
-        return ""
-    return dt.astimezone().strftime("%H:%M")
+        return ''
+    return dt.astimezone().strftime('%H:%M')
 
 
 async def _lock_next_jobs(
@@ -57,7 +57,7 @@ async def _lock_next_jobs(
 ) -> list[MessageJob]:
     stmt = (
         select(MessageJob)
-        .where(MessageJob.status == "queued")
+        .where(MessageJob.status == 'queued')
         .where(MessageJob.run_at <= utcnow())
         .order_by(MessageJob.run_at.asc())
         .limit(batch_size)
@@ -67,7 +67,7 @@ async def _lock_next_jobs(
     jobs = list(res.scalars().all())
 
     for job in jobs:
-        job.status = "processing"
+        job.status = 'processing'
 
     return jobs
 
@@ -137,8 +137,8 @@ async def _render_message(
     res = await session.execute(stmt)
     tmpl = res.scalar_one()
 
-    services_text = ""
-    total_cost = Decimal("0.00")
+    services_text = ''
+    total_cost = Decimal('0.00')
 
     if record is not None:
         svc_stmt = (
@@ -151,22 +151,22 @@ async def _render_message(
 
         lines: list[str] = []
         for svc in services:
-            lines.append(f"{svc.title} — {_fmt_money(svc.cost_to_pay)}€")
+            lines.append(f'{svc.title} — {_fmt_money(svc.cost_to_pay)}€')
             if svc.cost_to_pay is not None:
                 total_cost += svc.cost_to_pay
 
-        services_text = "\n".join(lines)
-        unsubscribe_link = UNSUBSCRIBE_LINKS.get(company_id, "")
+        services_text = '\n'.join(lines)
+        unsubscribe_link = UNSUBSCRIBE_LINKS.get(company_id, '')
 
     ctx = {
-        "client_name": (client.display_name if client else ""),
-        "staff_name": (record.staff_name if record else ""),
-        "date": _fmt_date(record.starts_at if record else None),
-        "time": _fmt_time(record.starts_at if record else None),
-        "services": services_text,
-        "total_cost": _fmt_money(total_cost),
-        "short_link": (record.short_link if record else ""),
-        "unsubscribe_link": unsubscribe_link,
+        'client_name': (client.display_name if client else ''),
+        'staff_name': (record.staff_name if record else ''),
+        'date': _fmt_date(record.starts_at if record else None),
+        'time': _fmt_time(record.starts_at if record else None),
+        'services': services_text,
+        'total_cost': _fmt_money(total_cost),
+        'short_link': (record.short_link if record else ''),
+        'unsubscribe_link': unsubscribe_link,
     }
 
     return tmpl.body.format(**ctx)
@@ -190,13 +190,13 @@ async def process_job(job_id: int) -> None:
 
             phone = client.phone_e164 if client else None
             if not phone:
-                job.status = "failed"
-                job.last_error = "No phone_e164"
+                job.status = 'failed'
+                job.last_error = 'No phone_e164'
                 return
 
             delay_until = await _apply_rate_limit(session, phone)
             if delay_until is not None:
-                job.status = "queued"
+                job.status = 'queued'
                 job.run_at = delay_until
                 return
 
@@ -209,8 +209,8 @@ async def process_job(job_id: int) -> None:
                     client=client,
                 )
             except Exception as exc:
-                job.status = "failed"
-                job.last_error = f"Template render error: {exc}"
+                job.status = 'failed'
+                job.last_error = f'Template render error: {exc}'
                 return
 
             out = OutboxMessage(
@@ -220,19 +220,19 @@ async def process_job(job_id: int) -> None:
                 job_id=job.id,
                 phone_e164=phone,
                 template_code=job.job_type,
-                language="de",
+                language='de',
                 body=body,
-                status="sent",
+                status='sent',
                 scheduled_at=utcnow(),
                 sent_at=utcnow(),
             )
             session.add(out)
 
-            job.status = "done"
+            job.status = 'done'
             job.last_error = None
 
             logger.info(
-                "Outbox sent (test) job_id=%s phone=%s type=%s",
+                'Outbox sent (test) job_id=%s phone=%s type=%s',
                 job.id,
                 phone,
                 job.job_type,
@@ -242,9 +242,9 @@ async def process_job(job_id: int) -> None:
 async def run_loop(batch_size: int = 50, poll_sec: float = 1.0) -> None:
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        format='%(asctime)s %(levelname)s %(name)s: %(message)s',
     )
-    logger.info("Outbox worker started")
+    logger.info('Outbox worker started')
 
     while True:
         job_ids: list[int] = []
@@ -266,5 +266,5 @@ def main() -> None:
     asyncio.run(run_loop())
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
