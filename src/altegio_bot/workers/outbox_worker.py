@@ -6,7 +6,6 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.db import SessionLocal
@@ -19,6 +18,7 @@ from altegio_bot.models.models import (
     Record,
     RecordService,
 )
+from altegio_bot.providers.base import WhatsAppProvider
 from altegio_bot.providers.dummy import DummyProvider, safe_send
 from altegio_bot.whatsapp_routing import (
     pick_sender_code_for_record,
@@ -27,13 +27,23 @@ from altegio_bot.whatsapp_routing import (
 
 logger = logging.getLogger("outbox_worker")
 
-provider = DummyProvider()
-
 MIN_SECONDS_BETWEEN_MESSAGES = 30
+
 UNSUBSCRIBE_LINKS = {
     758285: "https://example.com/unsubscribe/karlsruhe",
     1271200: "https://example.com/unsubscribe/rastatt",
 }
+
+PRE_APPOINTMENT_NOTES_DE = (
+    "\n\nWichtige Hinweise vor dem Termin:\n"
+    "• Bitte pünktlich kommen — ab 15 Min. Verspätung können wir "
+    "nicht garantieren, dass der Termin stattfindet.\n"
+    "• Wimpern bitte sauber: ohne Mascara, ohne geklebte Wimpern.\n"
+    "• Falls Sie schon eine Kundenkarte haben, bitte mitbringen.\n"
+    "• Auffüllen: ab 3. Woche 60 €, ab 4. Woche 70 €, ab 5. Woche "
+    "keine Auffüllung (Neuauflage).\n"
+    "• Zahlung: bar oder mit Karte.\n"
+)
 
 
 def utcnow() -> datetime:
@@ -127,6 +137,35 @@ async def _load_client(
     return None
 
 
+async def _is_new_client_for_record(
+    session: AsyncSession,
+    *,
+    company_id: int,
+    client_id: int | None,
+    record_id: int | None,
+    record_starts_at: datetime | None,
+) -> bool:
+    """
+    Новый клиент = нет более ранних записей (records) у этого клиента в этой
+    компании (по starts_at), кроме текущей записи.
+    """
+    if client_id is None or record_id is None or record_starts_at is None:
+        return False
+
+    stmt = (
+        select(Record.id)
+        .where(Record.company_id == company_id)
+        .where(Record.client_id == client_id)
+        .where(Record.id != record_id)
+        .where(Record.starts_at.is_not(None))
+        .where(Record.starts_at < record_starts_at)
+        .limit(1)
+    )
+    res = await session.execute(stmt)
+    prev_id = res.scalar_one_or_none()
+    return prev_id is None
+
+
 async def _render_message(
     session: AsyncSession,
     *,
@@ -184,6 +223,18 @@ async def _render_message(
             f"No active sender for company={company_id} code={sender_code}"
         )
 
+    pre_appointment_notes = ""
+    if template_code == "record_created" and record is not None:
+        is_new = await _is_new_client_for_record(
+            session=session,
+            company_id=company_id,
+            client_id=(record.client_id if record else None),
+            record_id=record.id,
+            record_starts_at=record.starts_at,
+        )
+        if is_new:
+            pre_appointment_notes = PRE_APPOINTMENT_NOTES_DE
+
     ctx = {
         "client_name": (client.display_name if client else ""),
         "staff_name": (record.staff_name if record else ""),
@@ -195,13 +246,27 @@ async def _render_message(
         "unsubscribe_link": unsubscribe_link,
         "sender_id": sender_id,
         "sender_code": sender_code,
+        "pre_appointment_notes": pre_appointment_notes,
     }
 
     body = tmpl.body.format(**ctx)
     return body, sender_id
 
 
-async def _get_existing_outbox_by_job_id(
+async def _load_job(
+    session: AsyncSession,
+    job_id: int,
+) -> MessageJob | None:
+    stmt = (
+        select(MessageJob)
+        .where(MessageJob.id == job_id)
+        .with_for_update()
+    )
+    res = await session.execute(stmt)
+    return res.scalar_one_or_none()
+
+
+async def _find_existing_outbox(
     session: AsyncSession,
     job_id: int,
 ) -> OutboxMessage | None:
@@ -215,28 +280,25 @@ async def _get_existing_outbox_by_job_id(
     return res.scalar_one_or_none()
 
 
-async def process_job(job_id: int) -> None:
+async def process_job(
+    job_id: int,
+    provider: WhatsAppProvider,
+) -> None:
     async with SessionLocal() as session:
         async with session.begin():
-            job_stmt = (
-                select(MessageJob)
-                .where(MessageJob.id == job_id)
-                .with_for_update()
-            )
-            res = await session.execute(job_stmt)
-            job = res.scalar_one_or_none()
+            job = await _load_job(session, job_id)
             if job is None:
                 return
 
-            existing = await _get_existing_outbox_by_job_id(session, job.id)
+            existing = await _find_existing_outbox(session, job.id)
             if existing is not None:
-                job.status = "done"
-                job.last_error = None
                 logger.info(
                     "Skip job_id=%s (already sent outbox_id=%s)",
                     job.id,
                     existing.id,
                 )
+                job.status = "done"
+                job.last_error = None
                 return
 
             record = await _load_record(session, job)
@@ -267,6 +329,36 @@ async def process_job(job_id: int) -> None:
                 job.last_error = f"Template render error: {exc}"
                 return
 
+            msg_id, err = await safe_send(
+                provider=provider,
+                sender_id=sender_id,
+                phone=phone,
+                text=body,
+            )
+            if err is not None:
+                out = OutboxMessage(
+                    company_id=job.company_id,
+                    client_id=(client.id if client else None),
+                    record_id=(record.id if record else None),
+                    job_id=job.id,
+                    sender_id=sender_id,
+                    phone_e164=phone,
+                    template_code=job.job_type,
+                    language="de",
+                    body=body,
+                    status="failed",
+                    error=err,
+                    provider_message_id=msg_id,
+                    scheduled_at=utcnow(),
+                    sent_at=utcnow(),
+                    meta={},
+                )
+                session.add(out)
+
+                job.status = "failed"
+                job.last_error = f"Send failed: {err}"
+                return
+
             out = OutboxMessage(
                 company_id=job.company_id,
                 client_id=(client.id if client else None),
@@ -277,59 +369,32 @@ async def process_job(job_id: int) -> None:
                 template_code=job.job_type,
                 language="de",
                 body=body,
-                status="sending",
+                status="sent",
+                error=None,
+                provider_message_id=msg_id,
                 scheduled_at=utcnow(),
+                sent_at=utcnow(),
                 meta={},
             )
             session.add(out)
 
-            try:
-                await session.flush()
-            except IntegrityError:
-                existing = await _get_existing_outbox_by_job_id(session, job.id)
-                job.status = "done"
-                job.last_error = None
-                logger.info(
-                    "Skip job_id=%s (race, already outbox_id=%s)",
-                    job.id,
-                    existing.id if existing else None,
-                )
-                return
+            job.status = "done"
+            job.last_error = None
 
-            msg_id, err = await safe_send(
-                provider=provider,
-                sender_id=sender_id,
-                phone=phone,
-                text=body,
+            logger.info(
+                "Outbox sent job_id=%s outbox_id=%s sender_id=%s phone=%s",
+                job.id,
+                out.id,
+                sender_id,
+                phone,
             )
 
-            if msg_id is not None:
-                out.status = "sent"
-                out.sent_at = utcnow()
-                out.provider_message_id = msg_id
-                out.error = None
 
-                job.status = "done"
-                job.last_error = None
-
-                logger.info(
-                    "Outbox sent job_id=%s outbox_id=%s sender_id=%s phone=%s",
-                    job.id,
-                    out.id,
-                    sender_id,
-                    phone,
-                )
-                return
-
-            out.status = "failed"
-            out.sent_at = utcnow()
-            out.error = err or "unknown send error"
-
-            job.status = "failed"
-            job.last_error = f"Send error: {out.error}"
-
-
-async def run_loop(batch_size: int = 50, poll_sec: float = 1.0) -> None:
+async def run_loop(
+    provider: WhatsAppProvider,
+    batch_size: int = 50,
+    poll_sec: float = 1.0,
+) -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -349,11 +414,12 @@ async def run_loop(batch_size: int = 50, poll_sec: float = 1.0) -> None:
             continue
 
         for jid in job_ids:
-            await process_job(jid)
+            await process_job(job_id=jid, provider=provider)
 
 
 def main() -> None:
-    asyncio.run(run_loop())
+    provider = DummyProvider()
+    asyncio.run(run_loop(provider=provider))
 
 
 if __name__ == "__main__":
