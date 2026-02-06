@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -19,18 +18,19 @@ from altegio_bot.models.models import (
     Record,
     RecordService,
 )
-from altegio_bot.providers.dummy import DummyProvider
+from altegio_bot.providers.base import WhatsAppProvider
+from altegio_bot.providers.dummy import DummyProvider, safe_send
 from altegio_bot.whatsapp_routing import (
     pick_sender_code_for_record,
     pick_sender_id,
 )
 
-logger = logging.getLogger('outbox_worker')
+logger = logging.getLogger("outbox_worker")
 
 MIN_SECONDS_BETWEEN_MESSAGES = 30
 UNSUBSCRIBE_LINKS = {
-    758285: 'https://example.com/unsubscribe/karlsruhe',
-    1271200: 'https://example.com/unsubscribe/rastatt',
+    758285: "https://example.com/unsubscribe/karlsruhe",
+    1271200: "https://example.com/unsubscribe/rastatt",
 }
 
 
@@ -40,20 +40,20 @@ def utcnow() -> datetime:
 
 def _fmt_money(value: Decimal | None) -> str:
     if value is None:
-        return '0.00'
-    return f'{value:.2f}'
+        return "0.00"
+    return f"{value:.2f}"
 
 
 def _fmt_date(dt: datetime | None) -> str:
     if dt is None:
-        return ''
-    return dt.astimezone().strftime('%d.%m.%Y')
+        return ""
+    return dt.astimezone().strftime("%d.%m.%Y")
 
 
 def _fmt_time(dt: datetime | None) -> str:
     if dt is None:
-        return ''
-    return dt.astimezone().strftime('%H:%M')
+        return ""
+    return dt.astimezone().strftime("%H:%M")
 
 
 async def _lock_next_jobs(
@@ -62,7 +62,7 @@ async def _lock_next_jobs(
 ) -> list[MessageJob]:
     stmt = (
         select(MessageJob)
-        .where(MessageJob.status == 'queued')
+        .where(MessageJob.status == "queued")
         .where(MessageJob.run_at <= utcnow())
         .order_by(MessageJob.run_at.asc())
         .limit(batch_size)
@@ -72,7 +72,7 @@ async def _lock_next_jobs(
     jobs = list(res.scalars().all())
 
     for job in jobs:
-        job.status = 'processing'
+        job.status = "processing"
 
     return jobs
 
@@ -142,8 +142,8 @@ async def _render_message(
     res = await session.execute(stmt)
     tmpl = res.scalar_one()
 
-    services_text = ''
-    total_cost = Decimal('0.00')
+    services_text = ""
+    total_cost = Decimal("0.00")
 
     if record is not None:
         svc_stmt = (
@@ -156,15 +156,15 @@ async def _render_message(
 
         lines: list[str] = []
         for svc in services:
-            lines.append(f'{svc.title} — {_fmt_money(svc.cost_to_pay)}€')
+            lines.append(f"{svc.title} — {_fmt_money(svc.cost_to_pay)}€")
             if svc.cost_to_pay is not None:
                 total_cost += svc.cost_to_pay
 
-        services_text = '\n'.join(lines)
+        services_text = "\n".join(lines)
 
-    unsubscribe_link = UNSUBSCRIBE_LINKS.get(company_id, '')
+    unsubscribe_link = UNSUBSCRIBE_LINKS.get(company_id, "")
 
-    sender_code = 'default'
+    sender_code = "default"
     if record is not None:
         sender_code = await pick_sender_code_for_record(
             session=session,
@@ -179,73 +179,76 @@ async def _render_message(
     )
     if sender_id is None:
         raise ValueError(
-            f'No active sender for company={company_id} code={sender_code}'
+            f"No active sender for company={company_id} code={sender_code}"
         )
 
     ctx = {
-        'client_name': (client.display_name if client else ''),
-        'staff_name': (record.staff_name if record else ''),
-        'date': _fmt_date(record.starts_at if record else None),
-        'time': _fmt_time(record.starts_at if record else None),
-        'services': services_text,
-        'total_cost': _fmt_money(total_cost),
-        'short_link': (record.short_link if record else ''),
-        'unsubscribe_link': unsubscribe_link,
-        'sender_id': sender_id,
-        'sender_code': sender_code,
+        "client_name": (client.display_name if client else ""),
+        "staff_name": (record.staff_name if record else ""),
+        "date": _fmt_date(record.starts_at if record else None),
+        "time": _fmt_time(record.starts_at if record else None),
+        "services": services_text,
+        "total_cost": _fmt_money(total_cost),
+        "short_link": (record.short_link if record else ""),
+        "unsubscribe_link": unsubscribe_link,
+        "sender_id": sender_id,
+        "sender_code": sender_code,
     }
 
     body = tmpl.body.format(**ctx)
     return body, sender_id
 
 
-@dataclass
-class Job:
-    id: int
-    phone: str
-    text: str
+async def _lock_job(
+    session: AsyncSession,
+    job_id: int,
+) -> MessageJob | None:
+    stmt = select(MessageJob).where(MessageJob.id == job_id).with_for_update()
+    res = await session.execute(stmt)
+    return res.scalar_one_or_none()
 
 
-class SmsProvider:
-    async def send(self, phone: str, text: str) -> str:
-        raise NotImplementedError
+async def _lock_outbox(
+    session: AsyncSession,
+    outbox_id: int,
+) -> OutboxMessage | None:
+    stmt = (
+        select(OutboxMessage)
+        .where(OutboxMessage.id == outbox_id)
+        .with_for_update()
+    )
+    res = await session.execute(stmt)
+    return res.scalar_one_or_none()
 
 
-class DummySmsProvider(SmsProvider):
-    async def send(self, phone: str, text: str) -> str:
-        print("SEND:", phone, text)
-        return "dummy-id"
+async def process_job(job_id: int, provider: WhatsAppProvider) -> None:
+    outbox_id: int | None = None
+    company_id: int | None = None
 
+    sender_id: int | None = None
+    phone: str | None = None
+    body: str | None = None
 
-async def process_job(
-        job_id: int,
-        job: Job,
-        provider: SmsProvider
-) -> None:
     async with SessionLocal() as session:
         async with session.begin():
-            stmt = (
-                select(MessageJob)
-                .where(MessageJob.id == job_id)
-                .with_for_update()
-            )
-            res = await session.execute(stmt)
-            job = res.scalar_one_or_none()
+            job = await _lock_job(session, job_id)
             if job is None:
                 return
+
+            company_id = job.company_id
 
             record = await _load_record(session, job)
             client = await _load_client(session, job, record)
 
             phone = client.phone_e164 if client else None
             if not phone:
-                job.status = 'failed'
-                job.last_error = 'No phone_e164'
+                job.status = "failed"
+                job.last_error = "No phone_e164"
                 return
 
             delay_until = await _apply_rate_limit(session, phone)
             if delay_until is not None:
-                job.status = 'queued'
+                job.status = "queued"
                 job.run_at = delay_until
                 return
 
@@ -258,8 +261,8 @@ async def process_job(
                     client=client,
                 )
             except Exception as exc:
-                job.status = 'failed'
-                job.last_error = f'Template render error: {exc}'
+                job.status = "failed"
+                job.last_error = f"Template render error: {exc}"
                 return
 
             out = OutboxMessage(
@@ -270,39 +273,81 @@ async def process_job(
                 sender_id=sender_id,
                 phone_e164=phone,
                 template_code=job.job_type,
-                language='de',
+                language="de",
                 body=body,
-                status='sending',
+                status="sending",
                 scheduled_at=utcnow(),
-                sent_at=utcnow(),
+                sent_at=None,
+                provider_message_id=None,
+                error=None,
+                meta={},
             )
             session.add(out)
-            try:
-                msg_id = await provider.send(job.phone, job.text)
-            except Exception as exc:
-                print("FAILED:", job.id, exc)
+            await session.flush()
+            outbox_id = int(out.id)
+
+    if outbox_id is None or company_id is None:
+        return
+
+    if sender_id is None or phone is None or body is None:
+        async with SessionLocal() as session:
+            async with session.begin():
+                job = await _lock_job(session, job_id)
+                out = await _lock_outbox(session, outbox_id)
+                if job is not None:
+                    job.status = "failed"
+                    job.last_error = "Internal error: missing send data"
+                if out is not None:
+                    out.status = "failed"
+                    out.error = "Internal error: missing send data"
+        return
+
+    msg_id, err = await safe_send(provider, sender_id, phone, body)
+
+    async with SessionLocal() as session:
+        async with session.begin():
+            job = await _lock_job(session, job_id)
+            out = await _lock_outbox(session, outbox_id)
+
+            if job is None or out is None:
                 return
 
-            print("DONE:", job.id, msg_id)
+            if err is not None or msg_id is None:
+                out.status = "failed"
+                out.error = err or "Unknown send error"
+                out.sent_at = None
 
-            job.status = 'done'
+                job.status = "failed"
+                job.last_error = f"Send error: {out.error}"
+                return
+
+            out.status = "sent"
+            out.provider_message_id = msg_id
+            out.error = None
+            out.sent_at = utcnow()
+
+            job.status = "done"
             job.last_error = None
 
             logger.info(
-                'Outbox sent (test) job_id=%s sender_id=%s phone=%s type=%s',
+                "Outbox sent job_id=%s outbox_id=%s sender_id=%s phone=%s",
                 job.id,
+                out.id,
                 sender_id,
                 phone,
-                job.job_type,
             )
 
 
-async def run_loop(batch_size: int = 50, poll_sec: float = 1.0) -> None:
+async def run_loop(
+    provider: WhatsAppProvider,
+    batch_size: int = 50,
+    poll_sec: float = 1.0,
+) -> None:
     logging.basicConfig(
         level=logging.INFO,
-        format='%(asctime)s %(levelname)s %(name)s: %(message)s',
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    logger.info('Outbox worker started')
+    logger.info("Outbox worker started")
 
     while True:
         job_ids: list[int] = []
@@ -317,17 +362,13 @@ async def run_loop(batch_size: int = 50, poll_sec: float = 1.0) -> None:
             continue
 
         for jid in job_ids:
-            await process_job(jid)
+            await process_job(jid, provider)
 
 
-async def main() -> None:
-    asyncio.run(run_loop())
-    jobs = [Job(1, "+49123", "hello")]
-    provider = DummySmsProvider()
-
-    for job in jobs:
-        await process_job(job, provider)
+def main() -> None:
+    provider = DummyProvider()
+    asyncio.run(run_loop(provider=provider))
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
