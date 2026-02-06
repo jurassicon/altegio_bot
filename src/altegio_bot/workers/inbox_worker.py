@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.db import SessionLocal
 from altegio_bot.message_planner import plan_jobs_for_record_event
+from altegio_bot.service_filter import record_has_allowed_service
 from altegio_bot.models.models import AltegioEvent, Client, Record, RecordService
 
 logger = logging.getLogger('inbox_worker')
@@ -189,8 +190,13 @@ async def upsert_record(
 async def replace_record_services(
     session: AsyncSession,
     record_pk: int,
-    services: list[dict[str, Any]],
+    services: list[dict[str, Any]] | None,
 ) -> None:
+    # Если services вообще не пришли в вебхуке — ничего не трогаем.
+    if services is None:
+        return
+
+    # Если пришёл пустой список — значит сервисов реально нет -> очищаем.
     await session.execute(
         delete(RecordService).where(RecordService.record_id == record_pk)
     )
@@ -200,23 +206,21 @@ async def replace_record_services(
 
     rows: list[dict[str, Any]] = []
     for svc in services:
-        sid = svc.get('id')
+        sid = svc.get("id")
         if sid is None:
             continue
 
-        cost_to_pay = svc.get('cost_to_pay')
-        cost_val = None
-        if cost_to_pay is not None:
-            cost_val = Decimal(str(cost_to_pay))
+        cost_to_pay = svc.get("cost_to_pay")
+        cost_val = Decimal(str(cost_to_pay)) if cost_to_pay is not None else None
 
         rows.append(
             {
-                'record_id': record_pk,
-                'service_id': int(sid),
-                'title': svc.get('title'),
-                'amount': svc.get('amount'),
-                'cost_to_pay': cost_val,
-                'raw': svc,
+                "record_id": record_pk,
+                "service_id": int(sid),
+                "title": svc.get("title"),
+                "amount": svc.get("amount"),
+                "cost_to_pay": cost_val,
+                "raw": svc,
             }
         )
 
@@ -280,11 +284,8 @@ async def handle_event(session: AsyncSession, event: AltegioEvent) -> None:
             client_pk=client_pk,
         )
 
-        await replace_record_services(
-            session,
-            record_pk,
-            data.get('services') or [],
-        )
+        services_payload = data.get("services")
+        await replace_record_services(session, record_pk, services_payload)
 
         record_obj = await session.get(Record, record_pk)
         client_obj = None
@@ -292,8 +293,21 @@ async def handle_event(session: AsyncSession, event: AltegioEvent) -> None:
             client_obj = await session.get(Client, client_pk)
 
         if record_obj is not None and event_status is not None:
+            allowed = await record_has_allowed_service(
+                session=session,
+                company_id=int(record_obj.company_id),
+                record_id=int(record_obj.id),
+            )
+            if not allowed:
+                logger.info(
+                    "Ignore record_id=%s company_id=%s (not lashes services)",
+                    record_obj.id,
+                    record_obj.company_id,
+                )
+                return
+
             await plan_jobs_for_record_event(
-                session,
+                session=session,
                 record=record_obj,
                 client=client_obj,
                 event_status=event_status,
