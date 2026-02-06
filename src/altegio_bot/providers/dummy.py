@@ -24,3 +24,17 @@ class DummyProvider(WhatsAppProvider):
             provider_message_id,
         )
         return provider_message_id
+
+
+async def safe_send(
+    provider: WhatsAppProvider,
+    sender_id: int,
+    phone: str,
+    text: str,
+) -> tuple[str | None, str | None]:
+    try:
+        msg_id = await provider.send(sender_id, phone, text)
+        return msg_id, None
+    except Exception as exc:
+        logger.exception("send failed: %s", exc)
+        return None, str(exc)
