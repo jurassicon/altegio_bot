@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.db import SessionLocal
@@ -18,7 +19,6 @@ from altegio_bot.models.models import (
     Record,
     RecordService,
 )
-from altegio_bot.providers.base import WhatsAppProvider
 from altegio_bot.providers.dummy import DummyProvider, safe_send
 from altegio_bot.whatsapp_routing import (
     pick_sender_code_for_record,
@@ -26,6 +26,8 @@ from altegio_bot.whatsapp_routing import (
 )
 
 logger = logging.getLogger("outbox_worker")
+
+provider = DummyProvider()
 
 MIN_SECONDS_BETWEEN_MESSAGES = 30
 UNSUBSCRIBE_LINKS = {
@@ -199,43 +201,43 @@ async def _render_message(
     return body, sender_id
 
 
-async def _lock_job(
+async def _get_existing_outbox_by_job_id(
     session: AsyncSession,
     job_id: int,
-) -> MessageJob | None:
-    stmt = select(MessageJob).where(MessageJob.id == job_id).with_for_update()
-    res = await session.execute(stmt)
-    return res.scalar_one_or_none()
-
-
-async def _lock_outbox(
-    session: AsyncSession,
-    outbox_id: int,
 ) -> OutboxMessage | None:
     stmt = (
         select(OutboxMessage)
-        .where(OutboxMessage.id == outbox_id)
-        .with_for_update()
+        .where(OutboxMessage.job_id == job_id)
+        .order_by(OutboxMessage.id.desc())
+        .limit(1)
     )
     res = await session.execute(stmt)
     return res.scalar_one_or_none()
 
 
-async def process_job(job_id: int, provider: WhatsAppProvider) -> None:
-    outbox_id: int | None = None
-    company_id: int | None = None
-
-    sender_id: int | None = None
-    phone: str | None = None
-    body: str | None = None
-
+async def process_job(job_id: int) -> None:
     async with SessionLocal() as session:
         async with session.begin():
-            job = await _lock_job(session, job_id)
+            job_stmt = (
+                select(MessageJob)
+                .where(MessageJob.id == job_id)
+                .with_for_update()
+            )
+            res = await session.execute(job_stmt)
+            job = res.scalar_one_or_none()
             if job is None:
                 return
 
-            company_id = job.company_id
+            existing = await _get_existing_outbox_by_job_id(session, job.id)
+            if existing is not None:
+                job.status = "done"
+                job.last_error = None
+                logger.info(
+                    "Skip job_id=%s (already sent outbox_id=%s)",
+                    job.id,
+                    existing.id,
+                )
+                return
 
             record = await _load_record(session, job)
             client = await _load_client(session, job, record)
@@ -277,72 +279,57 @@ async def process_job(job_id: int, provider: WhatsAppProvider) -> None:
                 body=body,
                 status="sending",
                 scheduled_at=utcnow(),
-                sent_at=None,
-                provider_message_id=None,
-                error=None,
                 meta={},
             )
             session.add(out)
-            await session.flush()
-            outbox_id = int(out.id)
 
-    if outbox_id is None or company_id is None:
-        return
-
-    if sender_id is None or phone is None or body is None:
-        async with SessionLocal() as session:
-            async with session.begin():
-                job = await _lock_job(session, job_id)
-                out = await _lock_outbox(session, outbox_id)
-                if job is not None:
-                    job.status = "failed"
-                    job.last_error = "Internal error: missing send data"
-                if out is not None:
-                    out.status = "failed"
-                    out.error = "Internal error: missing send data"
-        return
-
-    msg_id, err = await safe_send(provider, sender_id, phone, body)
-
-    async with SessionLocal() as session:
-        async with session.begin():
-            job = await _lock_job(session, job_id)
-            out = await _lock_outbox(session, outbox_id)
-
-            if job is None or out is None:
+            try:
+                await session.flush()
+            except IntegrityError:
+                existing = await _get_existing_outbox_by_job_id(session, job.id)
+                job.status = "done"
+                job.last_error = None
+                logger.info(
+                    "Skip job_id=%s (race, already outbox_id=%s)",
+                    job.id,
+                    existing.id if existing else None,
+                )
                 return
 
-            if err is not None or msg_id is None:
-                out.status = "failed"
-                out.error = err or "Unknown send error"
-                out.sent_at = None
-
-                job.status = "failed"
-                job.last_error = f"Send error: {out.error}"
-                return
-
-            out.status = "sent"
-            out.provider_message_id = msg_id
-            out.error = None
-            out.sent_at = utcnow()
-
-            job.status = "done"
-            job.last_error = None
-
-            logger.info(
-                "Outbox sent job_id=%s outbox_id=%s sender_id=%s phone=%s",
-                job.id,
-                out.id,
-                sender_id,
-                phone,
+            msg_id, err = await safe_send(
+                provider=provider,
+                sender_id=sender_id,
+                phone=phone,
+                text=body,
             )
 
+            if msg_id is not None:
+                out.status = "sent"
+                out.sent_at = utcnow()
+                out.provider_message_id = msg_id
+                out.error = None
 
-async def run_loop(
-    provider: WhatsAppProvider,
-    batch_size: int = 50,
-    poll_sec: float = 1.0,
-) -> None:
+                job.status = "done"
+                job.last_error = None
+
+                logger.info(
+                    "Outbox sent job_id=%s outbox_id=%s sender_id=%s phone=%s",
+                    job.id,
+                    out.id,
+                    sender_id,
+                    phone,
+                )
+                return
+
+            out.status = "failed"
+            out.sent_at = utcnow()
+            out.error = err or "unknown send error"
+
+            job.status = "failed"
+            job.last_error = f"Send error: {out.error}"
+
+
+async def run_loop(batch_size: int = 50, poll_sec: float = 1.0) -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -362,12 +349,11 @@ async def run_loop(
             continue
 
         for jid in job_ids:
-            await process_job(jid, provider)
+            await process_job(jid)
 
 
 def main() -> None:
-    provider = DummyProvider()
-    asyncio.run(run_loop(provider=provider))
+    asyncio.run(run_loop())
 
 
 if __name__ == "__main__":
