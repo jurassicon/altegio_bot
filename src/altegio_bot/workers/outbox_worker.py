@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -18,6 +19,11 @@ from altegio_bot.models.models import (
     Record,
     RecordService,
 )
+from altegio_bot.providers.dummy import DummyProvider
+from altegio_bot.whatsapp_routing import (
+    pick_sender_code_for_record,
+    pick_sender_id,
+)
 
 logger = logging.getLogger('outbox_worker')
 
@@ -26,7 +32,6 @@ UNSUBSCRIBE_LINKS = {
     758285: 'https://example.com/unsubscribe/karlsruhe',
     1271200: 'https://example.com/unsubscribe/rastatt',
 }
-
 
 
 def utcnow() -> datetime:
@@ -127,7 +132,7 @@ async def _render_message(
     template_code: str,
     record: Record | None,
     client: Client | None,
-) -> str:
+) -> tuple[str, int]:
     stmt = (
         select(MessageTemplate)
         .where(MessageTemplate.company_id == company_id)
@@ -156,7 +161,26 @@ async def _render_message(
                 total_cost += svc.cost_to_pay
 
         services_text = '\n'.join(lines)
-        unsubscribe_link = UNSUBSCRIBE_LINKS.get(company_id, '')
+
+    unsubscribe_link = UNSUBSCRIBE_LINKS.get(company_id, '')
+
+    sender_code = 'default'
+    if record is not None:
+        sender_code = await pick_sender_code_for_record(
+            session=session,
+            company_id=company_id,
+            record_id=record.id,
+        )
+
+    sender_id = await pick_sender_id(
+        session=session,
+        company_id=company_id,
+        sender_code=sender_code,
+    )
+    if sender_id is None:
+        raise ValueError(
+            f'No active sender for company={company_id} code={sender_code}'
+        )
 
     ctx = {
         'client_name': (client.display_name if client else ''),
@@ -167,12 +191,37 @@ async def _render_message(
         'total_cost': _fmt_money(total_cost),
         'short_link': (record.short_link if record else ''),
         'unsubscribe_link': unsubscribe_link,
+        'sender_id': sender_id,
+        'sender_code': sender_code,
     }
 
-    return tmpl.body.format(**ctx)
+    body = tmpl.body.format(**ctx)
+    return body, sender_id
 
 
-async def process_job(job_id: int) -> None:
+@dataclass
+class Job:
+    id: int
+    phone: str
+    text: str
+
+
+class SmsProvider:
+    async def send(self, phone: str, text: str) -> str:
+        raise NotImplementedError
+
+
+class DummySmsProvider(SmsProvider):
+    async def send(self, phone: str, text: str) -> str:
+        print("SEND:", phone, text)
+        return "dummy-id"
+
+
+async def process_job(
+        job_id: int,
+        job: Job,
+        provider: SmsProvider
+) -> None:
     async with SessionLocal() as session:
         async with session.begin():
             stmt = (
@@ -201,8 +250,8 @@ async def process_job(job_id: int) -> None:
                 return
 
             try:
-                body = await _render_message(
-                    session,
+                body, sender_id = await _render_message(
+                    session=session,
                     company_id=job.company_id,
                     template_code=job.job_type,
                     record=record,
@@ -218,22 +267,31 @@ async def process_job(job_id: int) -> None:
                 client_id=(client.id if client else None),
                 record_id=(record.id if record else None),
                 job_id=job.id,
+                sender_id=sender_id,
                 phone_e164=phone,
                 template_code=job.job_type,
                 language='de',
                 body=body,
-                status='sent',
+                status='sending',
                 scheduled_at=utcnow(),
                 sent_at=utcnow(),
             )
             session.add(out)
+            try:
+                msg_id = await provider.send(job.phone, job.text)
+            except Exception as exc:
+                print("FAILED:", job.id, exc)
+                return
+
+            print("DONE:", job.id, msg_id)
 
             job.status = 'done'
             job.last_error = None
 
             logger.info(
-                'Outbox sent (test) job_id=%s phone=%s type=%s',
+                'Outbox sent (test) job_id=%s sender_id=%s phone=%s type=%s',
                 job.id,
+                sender_id,
                 phone,
                 job.job_type,
             )
@@ -262,8 +320,13 @@ async def run_loop(batch_size: int = 50, poll_sec: float = 1.0) -> None:
             await process_job(jid)
 
 
-def main() -> None:
+async def main() -> None:
     asyncio.run(run_loop())
+    jobs = [Job(1, "+49123", "hello")]
+    provider = DummySmsProvider()
+
+    for job in jobs:
+        await process_job(job, provider)
 
 
 if __name__ == '__main__':
