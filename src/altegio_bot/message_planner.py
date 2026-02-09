@@ -16,9 +16,28 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _dedupe_key(job_type: str, record_id: int, run_at: datetime) -> str:
+def _record_updated_bucket(now: datetime) -> int:
+    return int(now.timestamp()) // UPDATE_DEBOUNCE_SEC
+
+
+def _dedupe_key(
+    job_type: str,
+    record_id: int,
+    run_at: datetime,
+    *,
+    now: datetime | None = None,
+) -> str:
+    """
+    Dedupe rules:
+    - record_updated: dedupe внутри окна debounce, но допускаем новые
+      update-job'ы в следующих окнах.
+    - остальные: dedupe по (job_type, record_id, run_at).
+    """
     if job_type == "record_updated":
-        return f"{job_type}:{record_id}"
+        now_val = now or run_at
+        bucket = _record_updated_bucket(now_val)
+        return f"{job_type}:{record_id}:{bucket}"
+
     return f"{job_type}:{record_id}:{run_at.isoformat()}"
 
 
@@ -45,9 +64,15 @@ async def enqueue_job(
     client_id: int | None,
     job_type: str,
     run_at: datetime,
+    now: datetime | None = None,
 ) -> None:
     insert_stmt = pg_insert(MessageJob).values(
-        dedupe_key=_dedupe_key(job_type, record_id, run_at),
+        dedupe_key=_dedupe_key(
+            job_type,
+            record_id,
+            run_at,
+            now=now,
+        ),
         company_id=company_id,
         record_id=record_id,
         client_id=client_id,
@@ -91,12 +116,12 @@ async def plan_jobs_for_record_event(
             client_id=client_id,
             job_type="record_created",
             run_at=now,
+            now=now,
         )
         await _plan_reminders(session, record, client_id, now)
         return
 
     if event_status == "update":
-        # ВАЖНО: отменяем старые queued update/reminders, чтобы не копились
         await cancel_queued_jobs(
             session,
             record_id=record.id,
@@ -109,6 +134,7 @@ async def plan_jobs_for_record_event(
             client_id=client_id,
             job_type="record_updated",
             run_at=now + timedelta(seconds=UPDATE_DEBOUNCE_SEC),
+            now=now,
         )
         await _plan_reminders(session, record, client_id, now)
         return
@@ -126,6 +152,7 @@ async def plan_jobs_for_record_event(
             client_id=client_id,
             job_type="record_canceled",
             run_at=now,
+            now=now,
         )
         await enqueue_job(
             session,
@@ -134,6 +161,7 @@ async def plan_jobs_for_record_event(
             client_id=client_id,
             job_type="comeback_3d",
             run_at=now + timedelta(days=3),
+            now=now,
         )
         return
 
@@ -149,11 +177,9 @@ async def _plan_reminders(
 
     delta = record.starts_at - now
 
-    # Поздно: напоминания уже не имеют смысла
     if delta <= timedelta(hours=2):
         return
 
-    # > 24 часа до визита → только 24h
     if delta > timedelta(hours=24):
         run_24h = record.starts_at - timedelta(hours=24)
         if run_24h > now:
@@ -164,10 +190,10 @@ async def _plan_reminders(
                 client_id=client_id,
                 job_type="reminder_24h",
                 run_at=run_24h,
+                now=now,
             )
         return
 
-    # <= 24 часа до визита → только 2h
     run_2h = record.starts_at - timedelta(hours=2)
     if run_2h > now:
         await enqueue_job(
@@ -177,4 +203,5 @@ async def _plan_reminders(
             client_id=client_id,
             job_type="reminder_2h",
             run_at=run_2h,
+            now=now,
         )
