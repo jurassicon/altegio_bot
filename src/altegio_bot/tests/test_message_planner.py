@@ -5,8 +5,6 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-import pytest
-
 import altegio_bot.message_planner as mp
 
 
@@ -31,7 +29,7 @@ def run(coro: Any) -> Any:
 
 
 def test_create_schedules_record_created_and_24h_only(
-    monkeypatch: Any,
+        monkeypatch: Any,
 ) -> None:
     fixed_now = datetime(2026, 2, 6, 22, 0, tzinfo=timezone.utc)
     record = FakeRecord(
@@ -44,20 +42,20 @@ def test_create_schedules_record_created_and_24h_only(
     calls: list[tuple[str, datetime]] = []
 
     async def fake_enqueue_job(
-        session: Any,
-        *,
-        company_id: int,
-        record_id: int,
-        client_id: int | None,
-        job_type: str,
-        run_at: datetime,
+            session: Any,
+            *,
+            company_id: int,
+            record_id: int,
+            client_id: int | None,
+            job_type: str,
+            run_at: datetime,
     ) -> None:
         calls.append((job_type, run_at))
 
     async def fake_cancel_queued_jobs(
-        session: Any,
-        record_id: int,
-        job_types: Any,
+            session: Any,
+            record_id: int,
+            job_types: Any,
     ) -> None:
         raise AssertionError(
             "cancel_queued_jobs should not be called on create"
@@ -83,7 +81,7 @@ def test_create_schedules_record_created_and_24h_only(
 
 
 def test_create_schedules_2h_only_when_less_or_equal_24h(
-    monkeypatch: Any,
+        monkeypatch: Any,
 ) -> None:
     fixed_now = datetime(2026, 2, 6, 22, 0, tzinfo=timezone.utc)
     record = FakeRecord(
@@ -154,20 +152,20 @@ def test_update_debounced_record_updated(monkeypatch: Any) -> None:
     canceled: list[tuple[int, tuple[str, ...]]] = []
 
     async def fake_enqueue_job(
-        session: Any,
-        *,
-        company_id: int,
-        record_id: int,
-        client_id: int | None,
-        job_type: str,
-        run_at: datetime,
+            session: Any,
+            *,
+            company_id: int,
+            record_id: int,
+            client_id: int | None,
+            job_type: str,
+            run_at: datetime,
     ) -> None:
         calls.append((job_type, run_at))
 
     async def fake_cancel_queued_jobs(
-        session: Any,
-        record_id: int,
-        job_types: Any,
+            session: Any,
+            record_id: int,
+            job_types: Any,
     ) -> None:
         canceled.append((record_id, tuple(job_types)))
 
@@ -207,9 +205,9 @@ def test_delete_schedules_canceled_and_comeback(monkeypatch: Any) -> None:
         calls.append(kwargs["job_type"])
 
     async def fake_cancel_queued_jobs(
-        session: Any,
-        record_id: int,
-        job_types: Any,
+            session: Any,
+            record_id: int,
+            job_types: Any,
     ) -> None:
         return None
 
