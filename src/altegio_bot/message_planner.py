@@ -9,12 +9,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.models.models import Client, MessageJob, Record
 
+UPDATE_DEBOUNCE_SEC = 60
+
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
 def _dedupe_key(job_type: str, record_id: int, run_at: datetime) -> str:
+    if job_type == "record_updated":
+        return f"{job_type}:{record_id}"
     return f"{job_type}:{record_id}:{run_at.isoformat()}"
 
 
@@ -104,7 +108,7 @@ async def plan_jobs_for_record_event(
             record_id=record.id,
             client_id=client_id,
             job_type="record_updated",
-            run_at=now,
+            run_at=now + timedelta(seconds=UPDATE_DEBOUNCE_SEC),
         )
         await _plan_reminders(session, record, client_id, now)
         return
