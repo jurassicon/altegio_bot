@@ -340,17 +340,17 @@ async def _render_message(
     return body, sender_id, used_lang
 
 
-async def _load_job(
-    session: AsyncSession,
-    job_id: int,
-) -> MessageJob | None:
+async def _load_job(session: AsyncSession, job_id: int) -> MessageJob:
     stmt = (
         select(MessageJob)
         .where(MessageJob.id == job_id)
         .with_for_update()
     )
     res = await session.execute(stmt)
-    return res.scalar_one_or_none()
+    job = res.scalar_one_or_none()
+    if job is None:
+        raise RuntimeError(f"MessageJob not found: id={job_id}")
+    return job
 
 
 async def _find_existing_outbox(
