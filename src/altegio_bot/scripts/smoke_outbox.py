@@ -23,7 +23,7 @@ from altegio_bot.models.models import (
 )
 from altegio_bot.workers import outbox_worker as ow
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("smoke_outbox")
 
 
 def utcnow() -> datetime:
@@ -49,8 +49,18 @@ class SmokeProvider:
     async def send_message(self, *args: Any, **kwargs: Any) -> str:
         return await self.send_text(*args, **kwargs)
 
+    async def send(self, sender_id: int, phone: str, text: str) -> str:
+        logger.info(
+            "Smoke send sender_id=%s phone=%s text_len=%s",
+            sender_id,
+            phone,
+            len(text),
+        )
+        return await self.send_message(sender_id, phone, text)
+
     async def __call__(self, *args: Any, **kwargs: Any) -> str:
         return await self.send_text(*args, **kwargs)
+
 
 
 def _database_url() -> str:
