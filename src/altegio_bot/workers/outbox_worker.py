@@ -229,15 +229,19 @@ async def _render_message(
     template_code: str,
     record: Record | None,
     client: Client | None,
-) -> tuple[str, int]:
-    stmt = (
-        select(MessageTemplate)
-        .where(MessageTemplate.company_id == company_id)
-        .where(MessageTemplate.code == template_code)
-        .where(MessageTemplate.is_active.is_(True))
+) -> tuple[str, int, str]:
+    language = _pick_language(company_id, client)
+
+    tmpl, used_lang = await _load_template(
+        session,
+        company_id=company_id,
+        template_code=template_code,
+        language=language,
     )
-    res = await session.execute(stmt)
-    tmpl = res.scalar_one()
+    if tmpl is None:
+        raise ValueError(
+            f"Template not found: company={company_id} code={template_code}"
+        )
 
     services_text = ""
     total_cost = Decimal("0.00")
@@ -280,11 +284,15 @@ async def _render_message(
         )
 
     pre_appointment_notes = ""
-    if template_code == "record_created" and record is not None:
+    if (
+        template_code == "record_created"
+        and record is not None
+        and used_lang == "de"
+    ):
         is_new = await _is_new_client_for_record(
             session=session,
             company_id=company_id,
-            client_id=(record.client_id if record else None),
+            client_id=record.client_id,
             record_id=record.id,
             record_starts_at=record.starts_at,
         )
@@ -306,7 +314,7 @@ async def _render_message(
     }
 
     body = tmpl.body.format(**ctx)
-    return body, sender_id
+    return body, sender_id, used_lang
 
 
 async def _load_job(
@@ -373,7 +381,7 @@ async def process_job(
                 return
 
             try:
-                body, sender_id = await _render_message(
+                body, sender_id, lang = await _render_message(
                     session=session,
                     company_id=job.company_id,
                     template_code=job.job_type,
@@ -400,7 +408,7 @@ async def process_job(
                     sender_id=sender_id,
                     phone_e164=phone,
                     template_code=job.job_type,
-                    language="de",
+                    language=lang,
                     body=body,
                     status="failed",
                     error=err,
@@ -423,7 +431,7 @@ async def process_job(
                 sender_id=sender_id,
                 phone_e164=phone,
                 template_code=job.job_type,
-                language="de",
+                language=lang,
                 body=body,
                 status="sent",
                 error=None,
