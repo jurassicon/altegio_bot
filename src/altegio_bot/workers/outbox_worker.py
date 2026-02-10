@@ -29,6 +29,13 @@ logger = logging.getLogger("outbox_worker")
 
 MIN_SECONDS_BETWEEN_MESSAGES = 30
 
+DEFAULT_LANGUAGE = "de"
+
+DEFAULT_LANGUAGE_BY_COMPANY = {
+    758285: "de",   # Karlsruhe
+    1271200: "de",  # Rastatt
+}
+
 UNSUBSCRIBE_LINKS = {
     758285: "https://example.com/unsubscribe/karlsruhe",
     1271200: "https://example.com/unsubscribe/rastatt",
@@ -121,6 +128,55 @@ async def _load_record(
     if job.record_id is None:
         return None
     return await session.get(Record, job.record_id)
+
+
+def _pick_language(company_id: int, client: Client | None) -> str:
+    # На будущее: если появится client.language — подцепим тут.
+    return DEFAULT_LANGUAGE_BY_COMPANY.get(company_id, DEFAULT_LANGUAGE)
+
+
+async def _load_template(
+    session: AsyncSession,
+    *,
+    company_id: int,
+    template_code: str,
+    language: str,
+) -> tuple[MessageTemplate | None, str]:
+    """
+    Возвращает (template, used_language).
+
+    Приоритет:
+    1) company+code+language
+    2) company+code+DEFAULT_LANGUAGE (если отличается)
+    3) company+code (любой язык)
+    """
+    base = (
+        select(MessageTemplate)
+        .where(MessageTemplate.company_id == company_id)
+        .where(MessageTemplate.code == template_code)
+        .where(MessageTemplate.is_active.is_(True))
+    )
+
+    stmt = base.where(MessageTemplate.language == language).limit(1)
+    res = await session.execute(stmt)
+    tmpl = res.scalar_one_or_none()
+    if tmpl is not None:
+        return tmpl, language
+
+    if language != DEFAULT_LANGUAGE:
+        stmt = base.where(MessageTemplate.language == DEFAULT_LANGUAGE).limit(1)
+        res = await session.execute(stmt)
+        tmpl = res.scalar_one_or_none()
+        if tmpl is not None:
+            return tmpl, DEFAULT_LANGUAGE
+
+    stmt = base.order_by(MessageTemplate.id.asc()).limit(1)
+    res = await session.execute(stmt)
+    tmpl = res.scalar_one_or_none()
+    if tmpl is not None:
+        return tmpl, tmpl.language
+
+    return None, language
 
 
 async def _load_client(
