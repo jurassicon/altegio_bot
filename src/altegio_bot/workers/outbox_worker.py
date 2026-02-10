@@ -537,6 +537,38 @@ async def run_loop(
             await process_job(job_id=jid, provider=provider)
 
 
+async def run_once(
+    session_maker: Any,
+    *,
+    provider: Any,
+    limit: int = 10,
+) -> int:
+    from sqlalchemy import select
+
+    from altegio_bot.models.models import MessageJob
+
+    async with session_maker() as session:
+        stmt = (
+            select(MessageJob.id)
+            .where(MessageJob.status == "queued")
+            .where(MessageJob.run_at <= utcnow())
+            .order_by(MessageJob.run_at.asc(), MessageJob.id.asc())
+            .limit(limit)
+        )
+        res = await session.execute(stmt)
+        ids = list(res.scalars().all())
+
+        for job_id in ids:
+            await process_job_in_session(
+                session,
+                int(job_id),
+                provider=provider,
+            )
+
+        await session.commit()
+        return len(ids)
+
+
 def main() -> None:
     provider = DummyProvider()
     asyncio.run(run_loop(provider=provider))
