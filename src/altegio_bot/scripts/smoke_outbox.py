@@ -47,7 +47,12 @@ class SmokeConfig:
 
 
 class SmokeProvider:
+    def __init__(self, *, delay_ms: int = 0) -> None:
+        self._delay_sec = delay_ms / 1000
+
     async def send_text(self, *args: Any, **kwargs: Any) -> str:
+        if self._delay_sec:
+            await asyncio.sleep(self._delay_sec)
         return f"smoke-{os.urandom(4).hex()}"
 
     async def send_message(self, *args: Any, **kwargs: Any) -> str:
@@ -302,59 +307,12 @@ async def _create_fixtures(
     return int(job.id)
 
 
-async def _force_requeue_job(session: AsyncSession, job_id: int) -> None:
-    stmt = text(
-        """
-        UPDATE message_jobs
-        SET status = 'queued',
-            run_at = now() - interval '1 minute',
-            last_error = NULL
-        WHERE id = :job_id;
-        """
-    )
-    await session.execute(stmt, {"job_id": job_id})
-
-
 async def _count_outbox_for_job(session: AsyncSession, job_id: int) -> int:
     stmt = select(func.count()).select_from(ow.OutboxMessage).where(
         ow.OutboxMessage.job_id == job_id
     )
     res = await session.execute(stmt)
     return int(res.scalar_one())
-
-
-async def _run_worker_once(
-    session_maker: async_sessionmaker[AsyncSession],
-    *,
-    provider: Any,
-    limit: int,
-    job_id: int | None,
-    company_id: int | None,
-) -> tuple[int, list[int]]:
-    async with session_maker() as session:
-        if job_id is not None:
-            await ow.process_job_in_session(session, job_id, provider=provider)
-            await session.commit()
-            return 1, [job_id]
-
-        stmt = (
-            select(MessageJob.id)
-            .where(MessageJob.status == "queued")
-            .where(MessageJob.run_at <= func.now())
-            .order_by(MessageJob.run_at.asc(), MessageJob.id.asc())
-            .limit(limit)
-        )
-        if company_id is not None:
-            stmt = stmt.where(MessageJob.company_id == company_id)
-
-        res = await session.execute(stmt)
-        ids = [int(x) for x in res.scalars().all()]
-
-        for _id in ids:
-            await ow.process_job_in_session(session, _id, provider=provider)
-
-        await session.commit()
-        return len(ids), ids
 
 
 async def _print_job_state(session: AsyncSession, job_id: int) -> None:
@@ -384,6 +342,27 @@ async def _print_job_state(session: AsyncSession, job_id: int) -> None:
     print(f"outbox_error={out.error!r}")
 
 
+async def _race_job_lock(
+    session_maker: async_sessionmaker[AsyncSession],
+    *,
+    job_id: int,
+    provider: Any,
+) -> None:
+    async def _run_one(tag: str) -> None:
+        async with session_maker() as session:
+            logger.info("race start tag=%s job_id=%s", tag, job_id)
+            await ow.process_job_in_session(session, job_id, provider=provider)
+            await session.commit()
+            logger.info("race end tag=%s job_id=%s", tag, job_id)
+
+    await asyncio.gather(_run_one("A"), _run_one("B"))
+
+    async with session_maker() as session:
+        out_cnt = await _count_outbox_for_job(session, job_id)
+        print(f"outbox_count={out_cnt}")
+        await _print_job_state(session, job_id)
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="smoke_outbox",
@@ -395,9 +374,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=10)
     parser.add_argument("--no-fix-sequences", action="store_true")
 
-    parser.add_argument("--rerun-same-job", action="store_true")
     parser.add_argument("--print-state", action="store_true")
     parser.add_argument("--seed-rate-limit-minutes", type=int, default=None)
+
+    parser.add_argument("--race-job-lock", action="store_true")
+    parser.add_argument("--send-delay-ms", type=int, default=0)
 
     parser.add_argument("--company-id", type=int, default=758285)
     parser.add_argument("--service-id", type=int, default=1)
@@ -410,34 +391,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--staff", type=str, default="Tanja")
 
     return parser.parse_args()
-
-
-async def _rerun_same_job(
-    session_maker: async_sessionmaker[AsyncSession],
-    *,
-    job_id: int,
-    provider: Any,
-) -> None:
-    async with session_maker() as session:
-        before = await _count_outbox_for_job(session, job_id)
-        print(f"outbox_count_before={before}")
-
-        await ow.process_job_in_session(session, job_id, provider=provider)
-        await session.commit()
-
-        mid = await _count_outbox_for_job(session, job_id)
-        print(f"outbox_count_after_first={mid}")
-
-        await _force_requeue_job(session, job_id)
-        await session.commit()
-
-        await ow.process_job_in_session(session, job_id, provider=provider)
-        await session.commit()
-
-        after = await _count_outbox_for_job(session, job_id)
-        print(f"outbox_count_after_second={after}")
-
-        await _print_job_state(session, job_id)
 
 
 async def main() -> None:
@@ -455,7 +408,7 @@ async def main() -> None:
         staff_name=args.staff,
     )
     session_maker = _make_sessionmaker()
-    provider = SmokeProvider()
+    provider = SmokeProvider(delay_ms=args.send_delay_ms)
 
     if args.run_worker_once:
         if args.seed_rate_limit_minutes is not None and args.job_id is None:
@@ -470,25 +423,14 @@ async def main() -> None:
                 )
                 await session.commit()
 
-        if args.rerun_same_job:
+        async with session_maker() as session:
             if args.job_id is None:
-                raise RuntimeError("--rerun-same-job needs --job-id")
-            await _rerun_same_job(session_maker, job_id=args.job_id, provider=provider)
-            return
-
-        count, ids = await _run_worker_once(
-            session_maker,
-            provider=provider,
-            limit=args.limit,
-            job_id=args.job_id,
-            company_id=cfg.company_id,
-        )
-        print(f"processed_jobs={count}")
-
-        if args.print_state and ids:
-            async with session_maker() as session:
-                for _id in ids:
-                    await _print_job_state(session, _id)
+                raise RuntimeError("--run-worker-once needs --job-id")
+            await ow.process_job_in_session(session, args.job_id, provider=provider)
+            await session.commit()
+            print("processed_jobs=1")
+            if args.print_state:
+                await _print_job_state(session, args.job_id)
         return
 
     async with session_maker() as session:
@@ -503,19 +445,13 @@ async def main() -> None:
     if args.seed_only:
         return
 
-    if args.rerun_same_job:
-        await _rerun_same_job(session_maker, job_id=job_id, provider=provider)
+    if args.race_job_lock:
+        await _race_job_lock(session_maker, job_id=job_id, provider=provider)
         return
 
-    await _run_worker_once(
-        session_maker,
-        provider=provider,
-        limit=1,
-        job_id=job_id,
-        company_id=cfg.company_id,
-    )
-
     async with session_maker() as session:
+        await ow.process_job_in_session(session, job_id, provider=provider)
+        await session.commit()
         await _print_job_state(session, job_id)
 
 
