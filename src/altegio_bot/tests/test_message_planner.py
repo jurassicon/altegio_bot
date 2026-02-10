@@ -226,3 +226,26 @@ def test_delete_schedules_canceled_and_comeback(monkeypatch: Any) -> None:
 
     assert "record_canceled" in calls
     assert "comeback_3d" in calls
+
+
+def test_record_updated_dedupe_bucket() -> None:
+    fixed_now = datetime(2026, 2, 6, 22, 0, tzinfo=timezone.utc)
+
+    k1 = mp._dedupe_key(
+        "record_updated",
+        2,
+        fixed_now + timedelta(seconds=60),
+    )
+    k2 = mp._dedupe_key(
+        "record_updated",
+        2,
+        fixed_now + timedelta(seconds=90),
+    )
+    k3 = mp._dedupe_key(
+        "record_updated",
+        2,
+        fixed_now + timedelta(seconds=121),
+    )
+
+    assert k1 == k2
+    assert k1 != k3
