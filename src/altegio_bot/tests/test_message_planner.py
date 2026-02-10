@@ -42,15 +42,17 @@ def test_create_schedules_record_created_and_24h_only(
     calls: list[tuple[str, datetime]] = []
 
     async def fake_enqueue_job(
-            session: Any,
-            *,
-            company_id: int,
-            record_id: int,
-            client_id: int | None,
-            job_type: str,
-            run_at: datetime,
+        session: Any,
+        *,
+        company_id: int,
+        record_id: int,
+        client_id: int | None,
+        job_type: str,
+        run_at: datetime,
+        now: datetime | None = None,
     ) -> None:
         calls.append((job_type, run_at))
+
 
     async def fake_cancel_queued_jobs(
             session: Any,
@@ -159,6 +161,7 @@ def test_update_debounced_record_updated(monkeypatch: Any) -> None:
             client_id: int | None,
             job_type: str,
             run_at: datetime,
+            now: datetime | None = None,
     ) -> None:
         calls.append((job_type, run_at))
 
