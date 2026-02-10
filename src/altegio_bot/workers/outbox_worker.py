@@ -542,8 +542,9 @@ async def run_once(
     *,
     provider: Any,
     limit: int = 10,
+    company_id: int | None = None,
 ) -> int:
-    from sqlalchemy import select
+    from sqlalchemy import func, select
 
     from altegio_bot.models.models import MessageJob
 
@@ -551,22 +552,22 @@ async def run_once(
         stmt = (
             select(MessageJob.id)
             .where(MessageJob.status == "queued")
-            .where(MessageJob.run_at <= utcnow())
+            .where(MessageJob.run_at <= func.now())
             .order_by(MessageJob.run_at.asc(), MessageJob.id.asc())
             .limit(limit)
         )
+        if company_id is not None:
+            stmt = stmt.where(MessageJob.company_id == company_id)
+
         res = await session.execute(stmt)
         ids = list(res.scalars().all())
 
         for job_id in ids:
-            await process_job_in_session(
-                session,
-                int(job_id),
-                provider=provider,
-            )
+            await process_job_in_session(session, int(job_id), provider=provider)
 
         await session.commit()
         return len(ids)
+
 
 
 def main() -> None:
