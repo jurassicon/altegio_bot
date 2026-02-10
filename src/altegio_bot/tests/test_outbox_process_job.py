@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Optional
 
 from altegio_bot.workers import outbox_worker as ow
@@ -318,9 +318,14 @@ def test_process_job_creates_outbox_on_send_fail(monkeypatch: Any) -> None:
     session = FakeSession()
     run(ow.process_job_in_session(session, 6, provider=object()))  # type: ignore
 
-    assert job.status == "failed"
+    # retry: первая ошибка = queued + сдвиг run_at
+    assert job.status == "queued"
     assert job.last_error == "Send failed: provider error"
+    assert job.run_at == fixed_now + timedelta(seconds=30)
+
     assert len(session.added) == 1
     out = session.added[0]
     assert out.status == "failed"
     assert out.error == "provider error"
+    assert out.provider_message_id == "msg-2"
+
