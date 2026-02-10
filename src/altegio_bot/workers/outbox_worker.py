@@ -340,17 +340,38 @@ async def _render_message(
     return body, sender_id, used_lang
 
 
-async def _load_job(session: AsyncSession, job_id: int) -> MessageJob:
+async def _load_job(
+    session: AsyncSession,
+    job_id: int,
+) -> MessageJob | None:
+    """
+    Пытаемся залочить job по id.
+
+    Важно: с skip_locked=True залоченная другой транзакцией строка вернётся
+    как None. Это НЕ "not found" — просто job занят. В этом случае возвращаем
+    None и тихо выходим из обработки.
+    """
     stmt = (
         select(MessageJob)
         .where(MessageJob.id == job_id)
-        .with_for_update()
+        .with_for_update(skip_locked=True)
     )
     res = await session.execute(stmt)
     job = res.scalar_one_or_none()
-    if job is None:
+    if job is not None:
+        return job
+
+    # Тут либо job залочен, либо реально не существует.
+    exists_stmt = select(MessageJob.id).where(MessageJob.id == job_id)
+    exists_res = await session.execute(exists_stmt)
+    exists_id = exists_res.scalar_one_or_none()
+
+    if exists_id is None:
         raise RuntimeError(f"MessageJob not found: id={job_id}")
-    return job
+
+    logger.info("Skip job_id=%s (locked)", job_id)
+    return None
+
 
 
 async def _find_existing_outbox(
