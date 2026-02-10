@@ -191,6 +191,7 @@ class MessageJob(Base):
     # queued/running/done/canceled/failed
     status: Mapped[str] = mapped_column(String(32), default="queued", index=True)
     attempts: Mapped[int] = mapped_column(Integer, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, default=5)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # полезно для аналитики и идемпотентности
