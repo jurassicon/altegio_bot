@@ -343,6 +343,114 @@ async def _find_existing_outbox(
     res = await session.execute(stmt)
     return res.scalar_one_or_none()
 
+async def process_job_in_session(
+    session: AsyncSession,
+    job_id: int,
+    provider: WhatsAppProvider,
+) -> None:
+    job = await _load_job(session, job_id)
+    if job is None:
+        return
+
+    existing = await _find_existing_outbox(session, job.id)
+    if existing is not None:
+        logger.info(
+            "Skip job_id=%s (already sent outbox_id=%s)",
+            job.id,
+            existing.id,
+        )
+        job.status = "done"
+        job.last_error = None
+        return
+
+    record = await _load_record(session, job)
+    client = await _load_client(session, job, record)
+
+    phone = client.phone_e164 if client else None
+    if not phone:
+        job.status = "failed"
+        job.last_error = "No phone_e164"
+        return
+
+    delay_until = await _apply_rate_limit(session, phone)
+    if delay_until is not None:
+        job.status = "queued"
+        job.run_at = delay_until
+        return
+
+    try:
+        body, sender_id, lang = await _render_message(
+            session=session,
+            company_id=job.company_id,
+            template_code=job.job_type,
+            record=record,
+            client=client,
+        )
+    except Exception as exc:
+        job.status = "failed"
+        job.last_error = f"Template render error: {exc}"
+        return
+
+    msg_id, err = await safe_send(
+        provider=provider,
+        sender_id=sender_id,
+        phone=phone,
+        text=body,
+    )
+    if err is not None:
+        out = OutboxMessage(
+            company_id=job.company_id,
+            client_id=(client.id if client else None),
+            record_id=(record.id if record else None),
+            job_id=job.id,
+            sender_id=sender_id,
+            phone_e164=phone,
+            template_code=job.job_type,
+            language=lang,
+            body=body,
+            status="failed",
+            error=err,
+            provider_message_id=msg_id,
+            scheduled_at=utcnow(),
+            sent_at=utcnow(),
+            meta={},
+        )
+        session.add(out)
+
+        job.status = "failed"
+        job.last_error = f"Send failed: {err}"
+        return
+
+    out = OutboxMessage(
+        company_id=job.company_id,
+        client_id=(client.id if client else None),
+        record_id=(record.id if record else None),
+        job_id=job.id,
+        sender_id=sender_id,
+        phone_e164=phone,
+        template_code=job.job_type,
+        language=lang,
+        body=body,
+        status="sent",
+        error=None,
+        provider_message_id=msg_id,
+        scheduled_at=utcnow(),
+        sent_at=utcnow(),
+        meta={},
+    )
+    session.add(out)
+
+    job.status = "done"
+    job.last_error = None
+
+    logger.info(
+        "Outbox sent job_id=%s outbox_id=%s sender_id=%s phone=%s",
+        job.id,
+        out.id,
+        sender_id,
+        phone,
+    )
+
 
 async def process_job(
     job_id: int,
@@ -350,107 +458,10 @@ async def process_job(
 ) -> None:
     async with SessionLocal() as session:
         async with session.begin():
-            job = await _load_job(session, job_id)
-            if job is None:
-                return
-
-            existing = await _find_existing_outbox(session, job.id)
-            if existing is not None:
-                logger.info(
-                    "Skip job_id=%s (already sent outbox_id=%s)",
-                    job.id,
-                    existing.id,
-                )
-                job.status = "done"
-                job.last_error = None
-                return
-
-            record = await _load_record(session, job)
-            client = await _load_client(session, job, record)
-
-            phone = client.phone_e164 if client else None
-            if not phone:
-                job.status = "failed"
-                job.last_error = "No phone_e164"
-                return
-
-            delay_until = await _apply_rate_limit(session, phone)
-            if delay_until is not None:
-                job.status = "queued"
-                job.run_at = delay_until
-                return
-
-            try:
-                body, sender_id, lang = await _render_message(
-                    session=session,
-                    company_id=job.company_id,
-                    template_code=job.job_type,
-                    record=record,
-                    client=client,
-                )
-            except Exception as exc:
-                job.status = "failed"
-                job.last_error = f"Template render error: {exc}"
-                return
-
-            msg_id, err = await safe_send(
+            await process_job_in_session(
+                session=session,
+                job_id=job_id,
                 provider=provider,
-                sender_id=sender_id,
-                phone=phone,
-                text=body,
-            )
-            if err is not None:
-                out = OutboxMessage(
-                    company_id=job.company_id,
-                    client_id=(client.id if client else None),
-                    record_id=(record.id if record else None),
-                    job_id=job.id,
-                    sender_id=sender_id,
-                    phone_e164=phone,
-                    template_code=job.job_type,
-                    language=lang,
-                    body=body,
-                    status="failed",
-                    error=err,
-                    provider_message_id=msg_id,
-                    scheduled_at=utcnow(),
-                    sent_at=utcnow(),
-                    meta={},
-                )
-                session.add(out)
-
-                job.status = "failed"
-                job.last_error = f"Send failed: {err}"
-                return
-
-            out = OutboxMessage(
-                company_id=job.company_id,
-                client_id=(client.id if client else None),
-                record_id=(record.id if record else None),
-                job_id=job.id,
-                sender_id=sender_id,
-                phone_e164=phone,
-                template_code=job.job_type,
-                language=lang,
-                body=body,
-                status="sent",
-                error=None,
-                provider_message_id=msg_id,
-                scheduled_at=utcnow(),
-                sent_at=utcnow(),
-                meta={},
-            )
-            session.add(out)
-
-            job.status = "done"
-            job.last_error = None
-
-            logger.info(
-                "Outbox sent job_id=%s outbox_id=%s sender_id=%s phone=%s",
-                job.id,
-                out.id,
-                sender_id,
-                phone,
             )
 
 
