@@ -55,6 +55,21 @@ PRE_APPOINTMENT_NOTES_DE = (
 SUCCESS_OUTBOX_STATUSES = ("sent", "delivered", "read")
 
 
+async def _find_success_outbox(
+    session: AsyncSession,
+    job_id: int,
+) -> OutboxMessage | None:
+    stmt = (
+        select(OutboxMessage)
+        .where(OutboxMessage.job_id == job_id)
+        .where(OutboxMessage.status.in_(SUCCESS_OUTBOX_STATUSES))
+        .order_by(OutboxMessage.id.desc())
+        .limit(1)
+    )
+    res = await session.execute(stmt)
+    return res.scalar_one_or_none()
+
+
 def _retry_delay_seconds(attempt: int) -> int:
     base = 30
     delay = base * (2 ** (attempt - 1))
@@ -361,19 +376,17 @@ async def process_job_in_session(
     if job is None:
         return
 
-    # ВАЖНО: используем старую функцию, которую тесты мокают.
-    existing = await _find_existing_outbox(session, job.id)
-    if existing is not None and getattr(existing, "status", None) in SUCCESS_OUTBOX_STATUSES:
+    success = await _find_success_outbox(session, job.id)
+    if success is not None:
         logger.info(
             "Skip job_id=%s (already sent outbox_id=%s)",
             job.id,
-            getattr(existing, "id", None),
+            getattr(success, "id", None),
         )
         job.status = "done"
         job.last_error = None
         return
 
-    # attempts/max_attempts: в проде поля есть, а в тестовых FakeJob может не быть.
     attempts = getattr(job, "attempts", 0)
     max_attempts = getattr(job, "max_attempts", 5)
 
