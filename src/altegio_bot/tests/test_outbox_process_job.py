@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from datetime import datetime, timezone, timedelta
-from typing import Any, Optional
+from datetime import datetime, timedelta, timezone
+from typing import Any
 
 from altegio_bot.workers import outbox_worker as ow
+
+
+def run(coro: Any) -> Any:
+    return asyncio.run(coro)
 
 
 @dataclass
@@ -18,6 +22,8 @@ class FakeJob:
     record_id: int | None = None
     client_id: int | None = None
     last_error: str | None = None
+    attempts: int = 0
+    max_attempts: int = 5
 
 
 @dataclass
@@ -32,9 +38,11 @@ class FakeRecord:
     id: int
     company_id: int
     client_id: int | None = 1
+    staff_name: str = "Tanja"
+    starts_at: datetime | None = None
+    short_link: str = ""
 
 
-@dataclass
 class FakeOutbox:
     def __init__(self, **kwargs: Any) -> None:
         for key, value in kwargs.items():
@@ -53,13 +61,24 @@ class FakeSession:
         self.added.append(obj)
 
 
+def patch_outbox_checks(
+    monkeypatch: Any,
+    *,
+    result: Any,
+) -> None:
+    async def _fake_find_success(session: Any, job_id: int) -> Any:
+        return result
 
-def run(coro: Any) -> Any:
-    return asyncio.run(coro)
+    async def _fake_find_existing(session: Any, job_id: int) -> Any:
+        return result
+
+    monkeypatch.setattr(ow, "_find_success_outbox", _fake_find_success)
+    monkeypatch.setattr(ow, "_find_existing_outbox", _fake_find_existing)
 
 
 def test_process_job_skips_if_outbox_exists(monkeypatch: Any) -> None:
     fixed_now = datetime(2026, 2, 10, 12, 0, tzinfo=timezone.utc)
+
     job = FakeJob(
         id=1,
         company_id=758285,
@@ -71,22 +90,21 @@ def test_process_job_skips_if_outbox_exists(monkeypatch: Any) -> None:
     async def fake_load_job(session: Any, job_id: int) -> Any:
         return job
 
-    async def fake_find_existing(session: Any, job_id: int) -> Any:
-        return FakeOutbox(
-            company_id=758285,
-            job_id=job_id,
-            status="sent",
-            phone_e164="+491234",
-            provider_message_id="x",
-            error=None,
-            id=99,
-        )
+    existing = FakeOutbox(
+        id=99,
+        company_id=758285,
+        job_id=1,
+        status="sent",
+        phone_e164="+491234",
+        provider_message_id="x",
+        error=None,
+    )
 
     async def fake_safe_send(*args: Any, **kwargs: Any) -> Any:
         raise AssertionError("safe_send should not be called")
 
     monkeypatch.setattr(ow, "_load_job", fake_load_job)
-    monkeypatch.setattr(ow, "_find_existing_outbox", fake_find_existing)
+    patch_outbox_checks(monkeypatch, result=existing)
     monkeypatch.setattr(ow, "safe_send", fake_safe_send)
 
     session = FakeSession()
@@ -99,6 +117,7 @@ def test_process_job_skips_if_outbox_exists(monkeypatch: Any) -> None:
 
 def test_process_job_fails_when_no_phone(monkeypatch: Any) -> None:
     fixed_now = datetime(2026, 2, 10, 12, 0, tzinfo=timezone.utc)
+
     job = FakeJob(
         id=2,
         company_id=758285,
@@ -112,9 +131,6 @@ def test_process_job_fails_when_no_phone(monkeypatch: Any) -> None:
     async def fake_load_job(session: Any, job_id: int) -> Any:
         return job
 
-    async def fake_find_existing(session: Any, job_id: int) -> Any:
-        return None
-
     async def fake_load_record(session: Any, job_obj: Any) -> Any:
         return FakeRecord(id=10, company_id=758285)
 
@@ -122,7 +138,7 @@ def test_process_job_fails_when_no_phone(monkeypatch: Any) -> None:
         return FakeClient(id=1, phone_e164=None)
 
     monkeypatch.setattr(ow, "_load_job", fake_load_job)
-    monkeypatch.setattr(ow, "_find_existing_outbox", fake_find_existing)
+    patch_outbox_checks(monkeypatch, result=None)
     monkeypatch.setattr(ow, "_load_record", fake_load_record)
     monkeypatch.setattr(ow, "_load_client", fake_load_client)
 
@@ -136,6 +152,7 @@ def test_process_job_fails_when_no_phone(monkeypatch: Any) -> None:
 def test_process_job_requeues_on_rate_limit(monkeypatch: Any) -> None:
     fixed_now = datetime(2026, 2, 10, 12, 0, tzinfo=timezone.utc)
     delay = datetime(2026, 2, 10, 12, 5, tzinfo=timezone.utc)
+
     job = FakeJob(
         id=3,
         company_id=758285,
@@ -149,9 +166,6 @@ def test_process_job_requeues_on_rate_limit(monkeypatch: Any) -> None:
     async def fake_load_job(session: Any, job_id: int) -> Any:
         return job
 
-    async def fake_find_existing(session: Any, job_id: int) -> Any:
-        return None
-
     async def fake_load_record(session: Any, job_obj: Any) -> Any:
         return FakeRecord(id=10, company_id=758285)
 
@@ -162,7 +176,7 @@ def test_process_job_requeues_on_rate_limit(monkeypatch: Any) -> None:
         return delay
 
     monkeypatch.setattr(ow, "_load_job", fake_load_job)
-    monkeypatch.setattr(ow, "_find_existing_outbox", fake_find_existing)
+    patch_outbox_checks(monkeypatch, result=None)
     monkeypatch.setattr(ow, "_load_record", fake_load_record)
     monkeypatch.setattr(ow, "_load_client", fake_load_client)
     monkeypatch.setattr(ow, "_apply_rate_limit", fake_apply_rl)
@@ -176,6 +190,7 @@ def test_process_job_requeues_on_rate_limit(monkeypatch: Any) -> None:
 
 def test_process_job_fails_on_template_render(monkeypatch: Any) -> None:
     fixed_now = datetime(2026, 2, 10, 12, 0, tzinfo=timezone.utc)
+
     job = FakeJob(
         id=4,
         company_id=758285,
@@ -188,9 +203,6 @@ def test_process_job_fails_on_template_render(monkeypatch: Any) -> None:
 
     async def fake_load_job(session: Any, job_id: int) -> Any:
         return job
-
-    async def fake_find_existing(session: Any, job_id: int) -> Any:
-        return None
 
     async def fake_load_record(session: Any, job_obj: Any) -> Any:
         return FakeRecord(id=10, company_id=758285)
@@ -205,7 +217,7 @@ def test_process_job_fails_on_template_render(monkeypatch: Any) -> None:
         raise ValueError("boom")
 
     monkeypatch.setattr(ow, "_load_job", fake_load_job)
-    monkeypatch.setattr(ow, "_find_existing_outbox", fake_find_existing)
+    patch_outbox_checks(monkeypatch, result=None)
     monkeypatch.setattr(ow, "_load_record", fake_load_record)
     monkeypatch.setattr(ow, "_load_client", fake_load_client)
     monkeypatch.setattr(ow, "_apply_rate_limit", fake_apply_rl)
@@ -220,6 +232,7 @@ def test_process_job_fails_on_template_render(monkeypatch: Any) -> None:
 
 def test_process_job_creates_outbox_on_send_ok(monkeypatch: Any) -> None:
     fixed_now = datetime(2026, 2, 10, 12, 0, tzinfo=timezone.utc)
+
     job = FakeJob(
         id=5,
         company_id=758285,
@@ -232,9 +245,6 @@ def test_process_job_creates_outbox_on_send_ok(monkeypatch: Any) -> None:
 
     async def fake_load_job(session: Any, job_id: int) -> Any:
         return job
-
-    async def fake_find_existing(session: Any, job_id: int) -> Any:
-        return None
 
     async def fake_load_record(session: Any, job_obj: Any) -> Any:
         return FakeRecord(id=10, company_id=758285)
@@ -252,7 +262,7 @@ def test_process_job_creates_outbox_on_send_ok(monkeypatch: Any) -> None:
         return ("msg-1", None)
 
     monkeypatch.setattr(ow, "_load_job", fake_load_job)
-    monkeypatch.setattr(ow, "_find_existing_outbox", fake_find_existing)
+    patch_outbox_checks(monkeypatch, result=None)
     monkeypatch.setattr(ow, "_load_record", fake_load_record)
     monkeypatch.setattr(ow, "_load_client", fake_load_client)
     monkeypatch.setattr(ow, "_apply_rate_limit", fake_apply_rl)
@@ -266,14 +276,19 @@ def test_process_job_creates_outbox_on_send_ok(monkeypatch: Any) -> None:
 
     assert job.status == "done"
     assert job.last_error is None
+    assert job.attempts == 1
+
     assert len(session.added) == 1
     out = session.added[0]
     assert out.status == "sent"
     assert out.provider_message_id == "msg-1"
+    assert out.scheduled_at == fixed_now
+    assert out.sent_at == fixed_now
 
 
-def test_process_job_creates_outbox_on_send_fail(monkeypatch: Any) -> None:
+def test_process_job_requeues_on_send_fail(monkeypatch: Any) -> None:
     fixed_now = datetime(2026, 2, 10, 12, 0, tzinfo=timezone.utc)
+
     job = FakeJob(
         id=6,
         company_id=758285,
@@ -286,9 +301,6 @@ def test_process_job_creates_outbox_on_send_fail(monkeypatch: Any) -> None:
 
     async def fake_load_job(session: Any, job_id: int) -> Any:
         return job
-
-    async def fake_find_existing(session: Any, job_id: int) -> Any:
-        return None
 
     async def fake_load_record(session: Any, job_obj: Any) -> Any:
         return FakeRecord(id=10, company_id=758285)
@@ -306,7 +318,7 @@ def test_process_job_creates_outbox_on_send_fail(monkeypatch: Any) -> None:
         return ("msg-2", "provider error")
 
     monkeypatch.setattr(ow, "_load_job", fake_load_job)
-    monkeypatch.setattr(ow, "_find_existing_outbox", fake_find_existing)
+    patch_outbox_checks(monkeypatch, result=None)
     monkeypatch.setattr(ow, "_load_record", fake_load_record)
     monkeypatch.setattr(ow, "_load_client", fake_load_client)
     monkeypatch.setattr(ow, "_apply_rate_limit", fake_apply_rl)
@@ -318,9 +330,9 @@ def test_process_job_creates_outbox_on_send_fail(monkeypatch: Any) -> None:
     session = FakeSession()
     run(ow.process_job_in_session(session, 6, provider=object()))  # type: ignore
 
-    # retry: первая ошибка = queued + сдвиг run_at
     assert job.status == "queued"
     assert job.last_error == "Send failed: provider error"
+    assert job.attempts == 1
     assert job.run_at == fixed_now + timedelta(seconds=30)
 
     assert len(session.added) == 1
@@ -328,4 +340,98 @@ def test_process_job_creates_outbox_on_send_fail(monkeypatch: Any) -> None:
     assert out.status == "failed"
     assert out.error == "provider error"
     assert out.provider_message_id == "msg-2"
+    assert out.scheduled_at == fixed_now
+    assert out.sent_at == fixed_now
 
+
+def test_process_job_fails_when_max_attempts_reached_before_send(
+    monkeypatch: Any,
+) -> None:
+    fixed_now = datetime(2026, 2, 10, 12, 0, tzinfo=timezone.utc)
+
+    job = FakeJob(
+        id=7,
+        company_id=758285,
+        job_type="record_updated",
+        status="queued",
+        run_at=fixed_now,
+        record_id=10,
+        client_id=1,
+        attempts=5,
+        max_attempts=5,
+    )
+
+    async def fake_load_job(session: Any, job_id: int) -> Any:
+        return job
+
+    async def fake_safe_send(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("safe_send should not be called")
+
+    monkeypatch.setattr(ow, "_load_job", fake_load_job)
+    patch_outbox_checks(monkeypatch, result=None)
+    monkeypatch.setattr(ow, "safe_send", fake_safe_send)
+
+    session = FakeSession()
+    run(ow.process_job_in_session(session, 7, provider=object()))  # type: ignore
+
+    assert job.status == "failed"
+    assert job.last_error == "Max attempts reached"
+    assert session.added == []
+
+
+def test_process_job_fails_on_send_fail_when_attempt_becomes_max(
+    monkeypatch: Any,
+) -> None:
+    fixed_now = datetime(2026, 2, 10, 12, 0, tzinfo=timezone.utc)
+
+    job = FakeJob(
+        id=8,
+        company_id=758285,
+        job_type="record_updated",
+        status="queued",
+        run_at=fixed_now,
+        record_id=10,
+        client_id=1,
+        attempts=4,
+        max_attempts=5,
+    )
+
+    async def fake_load_job(session: Any, job_id: int) -> Any:
+        return job
+
+    async def fake_load_record(session: Any, job_obj: Any) -> Any:
+        return FakeRecord(id=10, company_id=758285)
+
+    async def fake_load_client(session: Any, job_obj: Any, record: Any) -> Any:
+        return FakeClient(id=1, phone_e164="+491234")
+
+    async def fake_apply_rl(session: Any, phone: str) -> Any:
+        return None
+
+    async def fake_render(*args: Any, **kwargs: Any) -> Any:
+        return ("TEXT", 123, "de")
+
+    async def fake_safe_send(*args: Any, **kwargs: Any) -> Any:
+        return ("msg-3", "provider error")
+
+    monkeypatch.setattr(ow, "_load_job", fake_load_job)
+    patch_outbox_checks(monkeypatch, result=None)
+    monkeypatch.setattr(ow, "_load_record", fake_load_record)
+    monkeypatch.setattr(ow, "_load_client", fake_load_client)
+    monkeypatch.setattr(ow, "_apply_rate_limit", fake_apply_rl)
+    monkeypatch.setattr(ow, "_render_message", fake_render)
+    monkeypatch.setattr(ow, "safe_send", fake_safe_send)
+    monkeypatch.setattr(ow, "utcnow", lambda: fixed_now)
+    monkeypatch.setattr(ow, "OutboxMessage", FakeOutbox)
+
+    session = FakeSession()
+    run(ow.process_job_in_session(session, 8, provider=object()))  # type: ignore
+
+    assert job.status == "failed"
+    assert job.last_error == "Send failed: provider error"
+    assert job.attempts == 5
+
+    assert len(session.added) == 1
+    out = session.added[0]
+    assert out.status == "failed"
+    assert out.provider_message_id == "msg-3"
