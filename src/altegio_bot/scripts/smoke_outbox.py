@@ -9,8 +9,12 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import select, text
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy import func, select, text
+from sqlalchemy.ext.asyncio import (
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
 from altegio_bot.models.models import (
     Client,
@@ -62,7 +66,6 @@ class SmokeProvider:
         return await self.send_text(*args, **kwargs)
 
 
-
 def _database_url() -> str:
     url = os.getenv("DATABASE_URL", "").strip()
     if not url:
@@ -93,6 +96,41 @@ async def _fix_sequences(session: AsyncSession) -> None:
         );
         """
         await session.execute(text(sql))
+
+
+async def _seed_rate_limit(
+    session: AsyncSession,
+    phone_e164: str,
+    minutes: int,
+) -> None:
+    next_allowed_at = utcnow() + timedelta(minutes=minutes)
+    stmt = text(
+        """
+        INSERT INTO contact_rate_limits (phone_e164, next_allowed_at)
+        VALUES (:phone_e164, :next_allowed_at)
+        ON CONFLICT (phone_e164)
+        DO UPDATE SET
+          next_allowed_at = EXCLUDED.next_allowed_at,
+          updated_at = now();
+        """
+    )
+    await session.execute(
+        stmt,
+        {"phone_e164": phone_e164, "next_allowed_at": next_allowed_at},
+    )
+
+
+async def _seed_rate_limit_for_job(
+    session: AsyncSession,
+    job_id: int,
+    minutes: int,
+) -> None:
+    job = await ow._load_job(session, job_id)  # noqa: SLF001
+    record = await ow._load_record(session, job)  # noqa: SLF001
+    client = await ow._load_client(session, job, record)  # noqa: SLF001
+    if not client.phone_e164:
+        raise RuntimeError("Cannot seed rate limit: job client has no phone")
+    await _seed_rate_limit(session, client.phone_e164, minutes)
 
 
 async def _get_or_create_sender(
@@ -182,6 +220,7 @@ async def _create_fixtures(
     cfg: SmokeConfig,
     *,
     fix_sequences: bool,
+    seed_rate_limit_minutes: int | None,
 ) -> int:
     if fix_sequences:
         await _fix_sequences(session)
@@ -200,6 +239,13 @@ async def _create_fixtures(
     )
     session.add(client)
     await session.flush()
+
+    if seed_rate_limit_minutes is not None:
+        await _seed_rate_limit(
+            session,
+            phone_e164=cfg.phone_e164,
+            minutes=seed_rate_limit_minutes,
+        )
 
     starts_at = utcnow() + timedelta(hours=2)
     record = Record(
@@ -256,21 +302,40 @@ async def _create_fixtures(
     return int(job.id)
 
 
+async def _force_requeue_job(session: AsyncSession, job_id: int) -> None:
+    stmt = text(
+        """
+        UPDATE message_jobs
+        SET status = 'queued',
+            run_at = now() - interval '1 minute',
+            last_error = NULL
+        WHERE id = :job_id;
+        """
+    )
+    await session.execute(stmt, {"job_id": job_id})
+
+
+async def _count_outbox_for_job(session: AsyncSession, job_id: int) -> int:
+    stmt = select(func.count()).select_from(ow.OutboxMessage).where(
+        ow.OutboxMessage.job_id == job_id
+    )
+    res = await session.execute(stmt)
+    return int(res.scalar_one())
+
+
 async def _run_worker_once(
     session_maker: async_sessionmaker[AsyncSession],
     *,
     provider: Any,
     limit: int,
     job_id: int | None,
-    company_id: int | None = None,
-) -> int:
-    from sqlalchemy import func, select
-
+    company_id: int | None,
+) -> tuple[int, list[int]]:
     async with session_maker() as session:
         if job_id is not None:
             await ow.process_job_in_session(session, job_id, provider=provider)
             await session.commit()
-            return 1
+            return 1, [job_id]
 
         stmt = (
             select(MessageJob.id)
@@ -283,22 +348,21 @@ async def _run_worker_once(
             stmt = stmt.where(MessageJob.company_id == company_id)
 
         res = await session.execute(stmt)
-        ids = list(res.scalars().all())
+        ids = [int(x) for x in res.scalars().all()]
 
         for _id in ids:
-            await ow.process_job_in_session(session, int(_id), provider=provider)
+            await ow.process_job_in_session(session, _id, provider=provider)
 
         await session.commit()
-        return len(ids)
+        return len(ids), ids
 
 
-
-async def _print_job_state(
-    session: AsyncSession,
-    job_id: int,
-) -> None:
+async def _print_job_state(session: AsyncSession, job_id: int) -> None:
     job = await ow._load_job(session, job_id)  # noqa: SLF001
-    print(f"job_id={job.id} status={job.status} attempts={job.attempts}")
+    print(
+        f"job_id={job.id} status={job.status} attempts={job.attempts} "
+        f"run_at={job.run_at.isoformat()}"
+    )
     print(f"job_error={job.last_error!r}")
 
     stmt = (
@@ -331,6 +395,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=10)
     parser.add_argument("--no-fix-sequences", action="store_true")
 
+    parser.add_argument("--rerun-same-job", action="store_true")
+    parser.add_argument("--print-state", action="store_true")
+    parser.add_argument("--seed-rate-limit-minutes", type=int, default=None)
+
     parser.add_argument("--company-id", type=int, default=758285)
     parser.add_argument("--service-id", type=int, default=1)
     parser.add_argument("--sender-code", type=str, default="default")
@@ -342,6 +410,34 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--staff", type=str, default="Tanja")
 
     return parser.parse_args()
+
+
+async def _rerun_same_job(
+    session_maker: async_sessionmaker[AsyncSession],
+    *,
+    job_id: int,
+    provider: Any,
+) -> None:
+    async with session_maker() as session:
+        before = await _count_outbox_for_job(session, job_id)
+        print(f"outbox_count_before={before}")
+
+        await ow.process_job_in_session(session, job_id, provider=provider)
+        await session.commit()
+
+        mid = await _count_outbox_for_job(session, job_id)
+        print(f"outbox_count_after_first={mid}")
+
+        await _force_requeue_job(session, job_id)
+        await session.commit()
+
+        await ow.process_job_in_session(session, job_id, provider=provider)
+        await session.commit()
+
+        after = await _count_outbox_for_job(session, job_id)
+        print(f"outbox_count_after_second={after}")
+
+        await _print_job_state(session, job_id)
 
 
 async def main() -> None:
@@ -362,7 +458,25 @@ async def main() -> None:
     provider = SmokeProvider()
 
     if args.run_worker_once:
-        count = await _run_worker_once(
+        if args.seed_rate_limit_minutes is not None and args.job_id is None:
+            raise RuntimeError("--seed-rate-limit-minutes needs --job-id")
+
+        if args.seed_rate_limit_minutes is not None and args.job_id is not None:
+            async with session_maker() as session:
+                await _seed_rate_limit_for_job(
+                    session,
+                    job_id=args.job_id,
+                    minutes=args.seed_rate_limit_minutes,
+                )
+                await session.commit()
+
+        if args.rerun_same_job:
+            if args.job_id is None:
+                raise RuntimeError("--rerun-same-job needs --job-id")
+            await _rerun_same_job(session_maker, job_id=args.job_id, provider=provider)
+            return
+
+        count, ids = await _run_worker_once(
             session_maker,
             provider=provider,
             limit=args.limit,
@@ -370,6 +484,11 @@ async def main() -> None:
             company_id=cfg.company_id,
         )
         print(f"processed_jobs={count}")
+
+        if args.print_state and ids:
+            async with session_maker() as session:
+                for _id in ids:
+                    await _print_job_state(session, _id)
         return
 
     async with session_maker() as session:
@@ -377,10 +496,15 @@ async def main() -> None:
             session,
             cfg,
             fix_sequences=not args.no_fix_sequences,
+            seed_rate_limit_minutes=args.seed_rate_limit_minutes,
         )
         print(f"seed_job_id={job_id}")
 
     if args.seed_only:
+        return
+
+    if args.rerun_same_job:
+        await _rerun_same_job(session_maker, job_id=job_id, provider=provider)
         return
 
     await _run_worker_once(
