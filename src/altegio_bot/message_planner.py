@@ -16,10 +16,6 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _record_updated_bucket(now: datetime) -> int:
-    return int(now.timestamp()) // UPDATE_DEBOUNCE_SEC
-
-
 def _dedupe_key(
     job_type: str,
     record_id: int,
@@ -29,13 +25,13 @@ def _dedupe_key(
 ) -> str:
     """
     Dedupe rules:
-    - record_updated: dedupe внутри окна debounce, но допускаем новые
-      update-job'ы в следующих окнах.
+    - record_updated: dedupe внутри окна debounce (bucket), но допускаем
+      новые update-job'ы в следующих окнах.
     - остальные: dedupe по (job_type, record_id, run_at).
     """
     if job_type == "record_updated":
-        now_val = now or run_at
-        bucket = _record_updated_bucket(now_val)
+        base_dt = now or run_at
+        bucket = int(base_dt.timestamp()) // UPDATE_DEBOUNCE_SEC
         return f"{job_type}:{record_id}:{bucket}"
 
     return f"{job_type}:{record_id}:{run_at.isoformat()}"
