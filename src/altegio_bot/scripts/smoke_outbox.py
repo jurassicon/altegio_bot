@@ -350,6 +350,27 @@ async def _create_fixtures(
     return int(job.id)
 
 
+async def _clone_job(session: AsyncSession, job_id: int) -> int:
+    job = await ow._load_job(session, job_id)  # noqa: SLF001
+
+    clone = MessageJob(
+        company_id=job.company_id,
+        record_id=job.record_id,
+        client_id=job.client_id,
+        job_type=job.job_type,
+        run_at=utcnow() - timedelta(seconds=1),
+        status="queued",
+        attempts=0,
+        max_attempts=getattr(job, "max_attempts", 5),
+        last_error=None,
+        dedupe_key=os.urandom(12).hex(),
+        payload=job.payload or {},
+    )
+    session.add(clone)
+    await session.flush()
+    return int(clone.id)
+
+
 async def _print_job_state(session: AsyncSession, job_id: int) -> None:
     job = await ow._load_job(session, job_id)  # noqa: SLF001
     print(
@@ -445,6 +466,50 @@ async def _race_job_lock(
         await _print_job_state(session, job_id)
 
 
+async def _race_rate_limit(
+    session_maker: async_sessionmaker[AsyncSession],
+    *,
+    job_id: int,
+    provider: Any,
+    phone_e164: str,
+    reset_rate_limit: bool,
+    show_rate_limit: bool,
+) -> None:
+    async with session_maker() as session:
+        clone_id = await _clone_job(session, job_id)
+
+        if reset_rate_limit:
+            await _reset_rate_limit(session, phone_e164)
+
+        await session.commit()
+
+    print(f"clone_job_id={clone_id}")
+
+    async def _run_one(tag: str, jid: int) -> None:
+        async with session_maker() as session:
+            logger.info("rate race start tag=%s job_id=%s", tag, jid)
+            await ow.process_job_in_session(session, jid, provider=provider)
+            await session.commit()
+            logger.info("rate race end tag=%s job_id=%s", tag, jid)
+
+    await asyncio.gather(
+        _run_one("A", job_id),
+        _run_one("B", clone_id),
+    )
+
+    async with session_maker() as session:
+        if show_rate_limit:
+            await _print_rate_limit(session, phone_e164)
+
+        cnt1 = await _count_outbox_for_job(session, job_id)
+        cnt2 = await _count_outbox_for_job(session, clone_id)
+        print(f"outbox_count_job1={cnt1}")
+        print(f"outbox_count_job2={cnt2}")
+
+        await _print_job_state(session, job_id)
+        await _print_job_state(session, clone_id)
+
+
 async def _run_worker_once(
         session_maker: async_sessionmaker[AsyncSession],
         *,
@@ -514,6 +579,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--reset-rate-limit", action="store_true")
     parser.add_argument("--show-rate-limit", action="store_true")
 
+    parser.add_argument("--race-rate-limit", action="store_true")
     return parser.parse_args()
 
 
@@ -567,6 +633,17 @@ async def main() -> None:
 
     if args.rerun_same_job:
         await _rerun_same_job(
+            session_maker,
+            job_id=job_id,
+            provider=provider,
+            phone_e164=cfg.phone_e164,
+            reset_rate_limit=args.reset_rate_limit,
+            show_rate_limit=args.show_rate_limit,
+        )
+        return
+
+    if args.race_rate_limit:
+        await _race_rate_limit(
             session_maker,
             job_id=job_id,
             provider=provider,
