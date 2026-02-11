@@ -4,8 +4,9 @@ import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.db import SessionLocal
@@ -32,7 +33,7 @@ MIN_SECONDS_BETWEEN_MESSAGES = 30
 DEFAULT_LANGUAGE = "de"
 
 DEFAULT_LANGUAGE_BY_COMPANY = {
-    758285: "de",   # Karlsruhe
+    758285: "de",  # Karlsruhe
     1271200: "de",  # Rastatt
 }
 
@@ -56,8 +57,8 @@ SUCCESS_OUTBOX_STATUSES = ("sent", "delivered", "read")
 
 
 async def _find_success_outbox(
-    session: AsyncSession,
-    job_id: int,
+        session: AsyncSession,
+        job_id: int,
 ) -> OutboxMessage | None:
     stmt = (
         select(OutboxMessage)
@@ -99,8 +100,8 @@ def _fmt_time(dt: datetime | None) -> str:
 
 
 async def _lock_next_jobs(
-    session: AsyncSession,
-    batch_size: int,
+        session: AsyncSession,
+        batch_size: int,
 ) -> list[MessageJob]:
     stmt = (
         select(MessageJob)
@@ -120,22 +121,31 @@ async def _lock_next_jobs(
 
 
 async def _apply_rate_limit(
-    session: AsyncSession,
-    phone_e164: str,
+        session: AsyncSession,
+        phone_e164: str,
 ) -> datetime | None:
     now = utcnow()
+
+    # Важно: если строки ещё нет, два воркера могут одновременно попытаться
+    # вставить её и получить UniqueViolation. Поэтому сначала делаем upsert.
+    await session.execute(
+        text(
+            """
+            INSERT INTO contact_rate_limits (phone_e164, next_allowed_at)
+            VALUES (:phone_e164,
+                    :next_allowed_at) ON CONFLICT (phone_e164) DO NOTHING;
+            """
+        ),
+        {"phone_e164": phone_e164, "next_allowed_at": now},
+    )
+
     stmt = (
         select(ContactRateLimit)
         .where(ContactRateLimit.phone_e164 == phone_e164)
         .with_for_update()
     )
     res = await session.execute(stmt)
-    rl = res.scalar_one_or_none()
-
-    if rl is None:
-        rl = ContactRateLimit(phone_e164=phone_e164, next_allowed_at=now)
-        session.add(rl)
-        await session.flush()
+    rl = res.scalar_one()
 
     if rl.next_allowed_at > now:
         return rl.next_allowed_at
@@ -145,8 +155,8 @@ async def _apply_rate_limit(
 
 
 async def _load_record(
-    session: AsyncSession,
-    job: MessageJob,
+        session: AsyncSession,
+        job: MessageJob,
 ) -> Record | None:
     if job.record_id is None:
         return None
@@ -159,11 +169,11 @@ def _pick_language(company_id: int, client: Client | None) -> str:
 
 
 async def _load_template(
-    session: AsyncSession,
-    *,
-    company_id: int,
-    template_code: str,
-    language: str,
+        session: AsyncSession,
+        *,
+        company_id: int,
+        template_code: str,
+        language: str,
 ) -> tuple[MessageTemplate | None, str]:
     """
     Возвращает (template, used_language).
@@ -187,7 +197,8 @@ async def _load_template(
         return tmpl, language
 
     if language != DEFAULT_LANGUAGE:
-        stmt = base.where(MessageTemplate.language == DEFAULT_LANGUAGE).limit(1)
+        stmt = base.where(MessageTemplate.language == DEFAULT_LANGUAGE).limit(
+            1)
         res = await session.execute(stmt)
         tmpl = res.scalar_one_or_none()
         if tmpl is not None:
@@ -203,9 +214,9 @@ async def _load_template(
 
 
 async def _load_client(
-    session: AsyncSession,
-    job: MessageJob,
-    record: Record | None,
+        session: AsyncSession,
+        job: MessageJob,
+        record: Record | None,
 ) -> Client | None:
     if job.client_id is not None:
         return await session.get(Client, job.client_id)
@@ -217,12 +228,12 @@ async def _load_client(
 
 
 async def _is_new_client_for_record(
-    session: AsyncSession,
-    *,
-    company_id: int,
-    client_id: int | None,
-    record_id: int | None,
-    record_starts_at: datetime | None,
+        session: AsyncSession,
+        *,
+        company_id: int,
+        client_id: int | None,
+        record_id: int | None,
+        record_starts_at: datetime | None,
 ) -> bool:
     """
     Новый клиент = нет более ранних записей (records) у этого клиента в этой
@@ -246,12 +257,12 @@ async def _is_new_client_for_record(
 
 
 async def _render_message(
-    session: AsyncSession,
-    *,
-    company_id: int,
-    template_code: str,
-    record: Record | None,
-    client: Client | None,
+        session: AsyncSession,
+        *,
+        company_id: int,
+        template_code: str,
+        record: Record | None,
+        client: Client | None,
 ) -> tuple[str, int, str]:
     language = _pick_language(company_id, client)
 
@@ -308,9 +319,9 @@ async def _render_message(
 
     pre_appointment_notes = ""
     if (
-        template_code == "record_created"
-        and record is not None
-        and used_lang == "de"
+            template_code == "record_created"
+            and record is not None
+            and used_lang == "de"
     ):
         is_new = await _is_new_client_for_record(
             session=session,
@@ -341,8 +352,8 @@ async def _render_message(
 
 
 async def _load_job(
-    session: AsyncSession,
-    job_id: int,
+        session: AsyncSession,
+        job_id: int,
 ) -> MessageJob | None:
     """
     Пытаемся залочить job по id.
@@ -373,10 +384,9 @@ async def _load_job(
     return None
 
 
-
 async def _find_existing_outbox(
-    session: AsyncSession,
-    job_id: int,
+        session: AsyncSession,
+        job_id: int,
 ) -> OutboxMessage | None:
     stmt = (
         select(OutboxMessage)
@@ -389,9 +399,9 @@ async def _find_existing_outbox(
 
 
 async def process_job_in_session(
-    session: AsyncSession,
-    job_id: int,
-    provider: WhatsAppProvider,
+        session: AsyncSession,
+        job_id: int,
+        provider: WhatsAppProvider,
 ) -> None:
     job = await _load_job(session, job_id)
     if job is None:
@@ -519,8 +529,8 @@ async def process_job_in_session(
 
 
 async def process_job(
-    job_id: int,
-    provider: WhatsAppProvider,
+        job_id: int,
+        provider: WhatsAppProvider,
 ) -> None:
     async with SessionLocal() as session:
         async with session.begin():
@@ -532,9 +542,9 @@ async def process_job(
 
 
 async def run_loop(
-    provider: WhatsAppProvider,
-    batch_size: int = 50,
-    poll_sec: float = 1.0,
+        provider: WhatsAppProvider,
+        batch_size: int = 50,
+        poll_sec: float = 1.0,
 ) -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -559,11 +569,11 @@ async def run_loop(
 
 
 async def run_once(
-    session_maker: Any,
-    *,
-    provider: Any,
-    limit: int = 10,
-    company_id: int | None = None,
+        session_maker: Any,
+        *,
+        provider: Any,
+        limit: int = 10,
+        company_id: int | None = None,
 ) -> int:
     from sqlalchemy import func, select
 
@@ -584,11 +594,11 @@ async def run_once(
         ids = list(res.scalars().all())
 
         for job_id in ids:
-            await process_job_in_session(session, int(job_id), provider=provider)
+            await process_job_in_session(session, int(job_id),
+                                         provider=provider)
 
         await session.commit()
         return len(ids)
-
 
 
 def main() -> None:
