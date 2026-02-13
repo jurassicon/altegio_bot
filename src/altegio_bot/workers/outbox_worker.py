@@ -33,6 +33,8 @@ MIN_SECONDS_BETWEEN_MESSAGES = 30
 
 DEFAULT_LANGUAGE = 'de'
 
+PAST_RECORD_GRACE_MINUTES = 5
+
 DEFAULT_LANGUAGE_BY_COMPANY = {
     758285: 'de',   # Karlsruhe
     1271200: 'de',  # Rastatt
@@ -57,6 +59,13 @@ PRE_APPOINTMENT_NOTES_DE = (
 SUCCESS_OUTBOX_STATUSES = ('sent', 'delivered', 'read')
 
 
+def _record_is_in_past(record: Record | None) -> bool:
+    if record is None or record.starts_at is None:
+        return False
+    cutoff = utcnow() - timedelta(minutes=PAST_RECORD_GRACE_MINUTES)
+    return record.starts_at < cutoff
+
+
 async def _find_success_outbox(
     session: AsyncSession,
     job_id: int,
@@ -65,6 +74,20 @@ async def _find_success_outbox(
         select(OutboxMessage)
         .where(OutboxMessage.job_id == job_id)
         .where(OutboxMessage.status.in_(SUCCESS_OUTBOX_STATUSES))
+        .order_by(OutboxMessage.id.desc())
+        .limit(1)
+    )
+    res = await session.execute(stmt)
+    return res.scalar_one_or_none()
+
+
+async def _find_existing_outbox(
+    session: AsyncSession,
+    job_id: int,
+) -> OutboxMessage | None:
+    stmt = (
+        select(OutboxMessage)
+        .where(OutboxMessage.job_id == job_id)
         .order_by(OutboxMessage.id.desc())
         .limit(1)
     )
@@ -390,6 +413,10 @@ async def process_job_in_session(
         return
 
     record = await _load_record(session, job)
+    if _record_is_in_past(record):
+        job.status = 'canceled'
+        job.last_error = 'Skipped: record starts_at is in the past'
+        return
     client = await _load_client(session, job, record)
 
     phone = client.phone_e164 if client else None
