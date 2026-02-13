@@ -384,6 +384,11 @@ async def _load_job(
     return None
 
 
+def _is_token_expired_error(err: str) -> bool:
+    low = err.lower()
+    return 'access token' in low and 'expired' in low
+
+
 async def process_job_in_session(
     session: AsyncSession,
     job_id: int,
@@ -475,6 +480,10 @@ async def process_job_in_session(
         session.add(out)
 
         job.last_error = f'Send failed: {err}'
+
+        if _is_token_expired_error(err):
+            job.status = 'failed'
+            return
 
         max_attempts = getattr(job, 'max_attempts', 5)
         if attempts >= max_attempts:
