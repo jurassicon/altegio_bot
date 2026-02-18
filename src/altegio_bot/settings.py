@@ -2,13 +2,13 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    
     model_config = SettingsConfigDict(
-        env_file=".env", env_file_encoding="utf-8"
+        env_file='.env',
+        env_file_encoding='utf-8',
     )
 
-    app_name: str = "altegio_bot"
-    env: str = "dev"
+    app_name: str = 'altegio_bot'
+    env: str = 'dev'
 
     database_url: str
     altegio_webhook_secret: str
@@ -23,6 +23,8 @@ class Settings(BaseSettings):
 
     whatsapp_graph_url: str = 'https://graph.facebook.com'
     whatsapp_api_version: str = 'v20.0'
+
+    whatsapp_webhook_verify_token: str = ''
 
 
 settings = Settings()
