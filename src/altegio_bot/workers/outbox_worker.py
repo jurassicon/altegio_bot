@@ -144,10 +144,12 @@ async def _lock_next_jobs(
     session: AsyncSession,
     batch_size: int,
 ) -> list[MessageJob]:
+    now = utcnow()
+
     stmt = (
         select(MessageJob)
         .where(MessageJob.status == 'queued')
-        .where(MessageJob.run_at <= utcnow())
+        .where(MessageJob.run_at <= now)
         .order_by(MessageJob.run_at.asc())
         .limit(batch_size)
         .with_for_update(skip_locked=True)
@@ -155,7 +157,6 @@ async def _lock_next_jobs(
     res = await session.execute(stmt)
     jobs = list(res.scalars().all())
 
-    now = utcnow()
     for job in jobs:
         job.status = 'processing'
         job.locked_at = now
