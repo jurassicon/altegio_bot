@@ -15,6 +15,7 @@ class Settings(BaseSettings):
 
     whatsapp_provider: str = 'dummy'
     allow_real_send: bool = False
+    stop_worker_on_token_expired: bool = False
 
     whatsapp_access_token: str = ''
     meta_wa_phone_number_id: str = ''
