@@ -329,6 +329,12 @@ class MessageJob(Base):
         server_default=func.now(),
         onupdate=func.now(),
     )
+    
+    locked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        index=True,
+    )
 
 
 class OutboxMessage(Base):
