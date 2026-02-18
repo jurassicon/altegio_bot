@@ -18,16 +18,22 @@ class _Session:
     def begin(self) -> _BeginCM:
         return _BeginCM()
 
+    async def execute(self, *_: Any, **__: Any) -> Any:
+        class _Result:
+            rowcount = 0
+
+        return _Result()
+
 
 class _SessionLocalCM:
     async def __aenter__(self) -> _Session:
         return _Session()
 
     async def __aexit__(
-        self,
-        exc_type: Any,
-        exc: Any,
-        tb: Any,
+            self,
+            exc_type: Any,
+            exc: Any,
+            tb: Any,
     ) -> None:
         return None
 
