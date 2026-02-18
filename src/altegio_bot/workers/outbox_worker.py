@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import select, text
+from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.db import SessionLocal
@@ -24,16 +24,20 @@ from altegio_bot.providers.base import WhatsAppProvider
 from altegio_bot.providers.dummy import DummyProvider, safe_send
 from altegio_bot.whatsapp_routing import (
     pick_sender_code_for_record,
-    pick_sender_id,
+    pick_sender_id
 )
 
 logger = logging.getLogger('outbox_worker')
 
 MIN_SECONDS_BETWEEN_MESSAGES = 30
-
 DEFAULT_LANGUAGE = 'de'
-
 PAST_RECORD_GRACE_MINUTES = 5
+
+TOKEN_EXPIRED_RETRY_SECONDS = 60
+STOP_WORKER_ON_TOKEN_EXPIRED_ENV = 'STOP_WORKER_ON_TOKEN_EXPIRED'
+_TOKEN_EXPIRED = False
+
+STALE_PROCESSING_MINUTES = 10
 
 DEFAULT_LANGUAGE_BY_COMPANY = {
     758285: 'de',   # Karlsruhe
@@ -57,6 +61,23 @@ PRE_APPOINTMENT_NOTES_DE = (
 )
 
 SUCCESS_OUTBOX_STATUSES = ('sent', 'delivered', 'read')
+
+
+def _stop_worker_on_token_expired() -> bool:
+    return os.getenv(STOP_WORKER_ON_TOKEN_EXPIRED_ENV, '0').strip() == '1'
+
+
+def _mark_token_expired() -> None:
+    global _TOKEN_EXPIRED
+    _TOKEN_EXPIRED = True
+
+
+def _token_expired() -> bool:
+    return _TOKEN_EXPIRED
+
+
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 def _record_is_in_past(record: Record | None) -> bool:
@@ -101,10 +122,6 @@ def _retry_delay_seconds(attempt: int) -> int:
     return min(delay, 15 * 60)
 
 
-def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
-
-
 def _fmt_money(value: Decimal | None) -> str:
     if value is None:
         return '0.00'
@@ -138,10 +155,47 @@ async def _lock_next_jobs(
     res = await session.execute(stmt)
     jobs = list(res.scalars().all())
 
+    now = utcnow()
     for job in jobs:
         job.status = 'processing'
+        job.locked_at = now
 
     return jobs
+
+
+async def _requeue_processing_jobs(
+    session: AsyncSession,
+    job_ids: list[int],
+) -> None:
+    if not job_ids:
+        return
+
+    stmt = (
+        update(MessageJob)
+        .where(MessageJob.id.in_(job_ids))
+        .where(MessageJob.status == 'processing')
+        .values(status='queued', locked_at=None)
+    )
+    await session.execute(stmt)
+
+
+async def _requeue_stale_processing_jobs(session: AsyncSession) -> int:
+    cutoff = utcnow() - timedelta(minutes=STALE_PROCESSING_MINUTES)
+
+    stmt = (
+        update(MessageJob)
+        .where(MessageJob.status == 'processing')
+        .where(MessageJob.locked_at.is_not(None))
+        .where(MessageJob.locked_at < cutoff)
+        .values(
+            status='queued',
+            locked_at=None,
+            run_at=utcnow(),
+            last_error='Recovered: stale processing job',
+        )
+    )
+    res = await session.execute(stmt)
+    return int(getattr(res, 'rowcount', 0) or 0)
 
 
 async def _apply_rate_limit(
@@ -152,11 +206,11 @@ async def _apply_rate_limit(
 
     await session.execute(
         text(
-            """
+            '''
             INSERT INTO contact_rate_limits (phone_e164, next_allowed_at)
             VALUES (:phone_e164, :next_allowed_at)
             ON CONFLICT (phone_e164) DO NOTHING;
-            """
+            '''
         ),
         {'phone_e164': phone_e164, 'next_allowed_at': now},
     )
@@ -406,6 +460,7 @@ async def process_job_in_session(
             getattr(success, 'id', None),
         )
         job.status = 'done'
+        job.locked_at = None
         job.last_error = None
         return
 
@@ -414,25 +469,30 @@ async def process_job_in_session(
 
     if attempts >= max_attempts:
         job.status = 'failed'
+        job.locked_at = None
         job.last_error = 'Max attempts reached'
         return
 
     record = await _load_record(session, job)
     if _record_is_in_past(record):
         job.status = 'canceled'
+        job.locked_at = None
         job.last_error = 'Skipped: record starts_at is in the past'
         return
+
     client = await _load_client(session, job, record)
 
     phone = client.phone_e164 if client else None
     if not phone:
         job.status = 'failed'
+        job.locked_at = None
         job.last_error = 'No phone_e164'
         return
 
     delay_until = await _apply_rate_limit(session, phone)
     if delay_until is not None:
         job.status = 'queued'
+        job.locked_at = None
         job.run_at = delay_until
         return
 
@@ -446,6 +506,7 @@ async def process_job_in_session(
         )
     except Exception as exc:
         job.status = 'failed'
+        job.locked_at = None
         job.last_error = f'Template render error: {exc}'
         return
 
@@ -479,19 +540,27 @@ async def process_job_in_session(
         )
         session.add(out)
 
-        job.last_error = f'Send failed: {err}'
-
         if _is_token_expired_error(err):
-            job.status = 'failed'
+            _mark_token_expired()
+            job.status = 'queued'
+            job.locked_at = None
+            job.run_at = utcnow() + timedelta(
+                seconds=TOKEN_EXPIRED_RETRY_SECONDS
+            )
+            job.last_error = f'Send blocked: {err}'
             return
+
+        job.last_error = f'Send failed: {err}'
 
         max_attempts = getattr(job, 'max_attempts', 5)
         if attempts >= max_attempts:
             job.status = 'failed'
+            job.locked_at = None
             return
 
         delay = _retry_delay_seconds(attempts)
         job.status = 'queued'
+        job.locked_at = None
         job.run_at = utcnow() + timedelta(seconds=delay)
         return
 
@@ -515,6 +584,7 @@ async def process_job_in_session(
     session.add(out)
 
     job.status = 'done'
+    job.locked_at = None
     job.last_error = None
 
     logger.info(
@@ -551,6 +621,15 @@ async def run_loop(
     logger.info('Outbox worker started')
 
     while True:
+        async with SessionLocal() as session:
+            async with session.begin():
+                recovered = await _requeue_stale_processing_jobs(session)
+                if recovered:
+                    logger.warning(
+                        'Recovered stale processing jobs: %s',
+                        recovered,
+                    )
+
         job_ids: list[int] = []
 
         async with SessionLocal() as session:
@@ -562,8 +641,22 @@ async def run_loop(
             await asyncio.sleep(poll_sec)
             continue
 
-        for jid in job_ids:
+        for idx, jid in enumerate(job_ids):
             await process_job(job_id=jid, provider=provider)
+
+            if _token_expired() and _stop_worker_on_token_expired():
+                remaining = job_ids[idx + 1:]
+                if remaining:
+                    async with SessionLocal() as session:
+                        async with session.begin():
+                            await _requeue_processing_jobs(session, remaining)
+
+                logger.error(
+                    'Stopping outbox worker: access token expired '
+                    '(requeued %s jobs)',
+                    len(remaining),
+                )
+                return
 
 
 async def run_once(
@@ -575,9 +668,10 @@ async def run_once(
 ) -> int:
     from sqlalchemy import func, select
 
-    from altegio_bot.models.models import MessageJob
-
     async with session_maker() as session:
+        async with session.begin():
+            await _requeue_stale_processing_jobs(session)
+
         stmt = (
             select(MessageJob.id)
             .where(MessageJob.status == 'queued')
