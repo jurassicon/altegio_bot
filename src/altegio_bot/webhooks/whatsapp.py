@@ -6,6 +6,8 @@ import logging
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi.responses import JSONResponse
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
 from altegio_bot.db import SessionLocal
@@ -48,19 +50,44 @@ async def whatsapp_ingest(request: Request) -> Response:
     headers = dict(request.headers)
 
     async with SessionLocal() as session:
-        async with session.begin():
-            evt = WhatsAppEvent(
-                dedupe_key=dedupe_key,
-                status='received',
-                error=None,
-                query=query,
-                headers=headers,
-                payload=payload,
-            )
-            session.add(evt)
-            try:
+        try:
+            async with session.begin():
+                evt = WhatsAppEvent(
+                    dedupe_key=dedupe_key,
+                    status='received',
+                    error=None,
+                    query=query,
+                    headers=headers,
+                    payload=payload,
+                )
+                session.add(evt)
                 await session.flush()
-            except IntegrityError:
-                logger.info('Duplicate whatsapp event: %s', dedupe_key)
 
-    return Response(status_code=200)
+            return JSONResponse(
+                {
+                    'ok': True,
+                    'duplicate': False,
+                    'id': evt.id,
+                    'dedupe_key': dedupe_key,
+                }
+            )
+
+        except IntegrityError:
+            await session.rollback()
+            logger.info('Duplicate whatsapp event: %s', dedupe_key)
+
+            res = await session.execute(
+                select(WhatsAppEvent.id).where(
+                    WhatsAppEvent.dedupe_key == dedupe_key
+                )
+            )
+            existing_id = res.scalar_one_or_none()
+
+            return JSONResponse(
+                {
+                    'ok': True,
+                    'duplicate': True,
+                    'id': existing_id,
+                    'dedupe_key': dedupe_key,
+                }
+            )
