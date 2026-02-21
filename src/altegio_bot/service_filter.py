@@ -13,14 +13,12 @@ from altegio_bot.models.models import RecordService
 logger = logging.getLogger(__name__)
 
 LASH_CATEGORY_IDS_BY_COMPANY: dict[int, set[int]] = {
-    # 10707687 Wimpernverlängerung
-    # 12414859 Happy Monday
-    # 13329127 Black Friday
     1271200: {10707687, 12414859, 13329127},
     758285: {10707687, 12414859, 13329127},
 }
 
 _SERVICE_CATEGORY_CACHE: dict[tuple[int, int], int] = {}
+_CACHE_MAX_SIZE = 5000
 
 
 def _get_api_base_url() -> str:
@@ -40,6 +38,12 @@ def _get_altegio_tokens() -> tuple[str, str] | None:
     return partner, user
 
 
+def _cache_put(key: tuple[int, int], category_id: int) -> None:
+    if len(_SERVICE_CATEGORY_CACHE) >= _CACHE_MAX_SIZE:
+        _SERVICE_CATEGORY_CACHE.clear()
+    _SERVICE_CATEGORY_CACHE[key] = category_id
+
+
 async def _fetch_service_category_id(
     *,
     company_id: int,
@@ -51,16 +55,11 @@ async def _fetch_service_category_id(
 
     partner_token, user_token = tokens
 
-    url = (
-        f'{_get_api_base_url()}/company/{company_id}/services/{service_id}'
-    )
+    url = f'{_get_api_base_url()}/company/{company_id}/services/{service_id}'
     headers = {
         'Accept': _get_api_accept(),
         'Content-Type': 'application/json',
-        'Authorization': (
-            f'Bearer {partner_token}, '
-            f'User {user_token}'
-        ),
+        'Authorization': f'Bearer {partner_token}, User {user_token}',
     }
 
     try:
@@ -68,7 +67,7 @@ async def _fetch_service_category_id(
             resp = await client.get(url, headers=headers)
     except httpx.HTTPError as exc:
         logger.warning(
-            'alteg.io service lookup failed company_id=%s service_id=%s: %s',
+            'altegio service lookup failed company_id=%s service_id=%s: %s',
             company_id,
             service_id,
             exc,
@@ -82,14 +81,23 @@ async def _fetch_service_category_id(
         resp.raise_for_status()
     except httpx.HTTPStatusError as exc:
         logger.warning(
-            'alteg.io service lookup bad status company_id=%s service_id=%s: %s',
+            'altegio service lookup bad status company_id=%s service_id=%s: %s',
             company_id,
             service_id,
             exc,
         )
         return None
 
-    payload: Any = resp.json()
+    try:
+        payload: Any = resp.json()
+    except ValueError:
+        logger.warning(
+            'altegio service lookup invalid json company_id=%s service_id=%s',
+            company_id,
+            service_id,
+        )
+        return None
+
     if not isinstance(payload, dict):
         return None
 
@@ -98,6 +106,8 @@ async def _fetch_service_category_id(
         return None
 
     category_id = data.get('category_id')
+    if category_id is None:
+        category_id = data.get('categoryId')
 
     if isinstance(category_id, int):
         return category_id
@@ -135,7 +145,7 @@ async def record_has_allowed_service(
             )
             if fetched is None:
                 continue
-            _SERVICE_CATEGORY_CACHE[key] = fetched
+            _cache_put(key, fetched)
             category_id = fetched
 
         if category_id in allowed_categories:
