@@ -3,7 +3,8 @@ name: CI + Deploy
 on:
   pull_request:
   push:
-    branches: [ main ]
+    branches:
+      - main
 
 jobs:
   test:
@@ -18,32 +19,41 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install uv
-        run: pip install --no-cache-dir uv
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
 
-      - name: Sync deps (locked)
+      - name: Install deps
         run: uv sync --frozen
+
+      - name: Create minimal .env for tests
+        run: |
+          cat > .env <<'EOF'
+          DATABASE_URL=postgresql+asyncpg://user:pass@localhost:5432/db
+          ALTEGIO_WEBHOOK_SECRET=dummy_secret
+          EOF
 
       - name: Run tests
         env:
-          PYTHONPATH: ${{ github.workspace }}/src
+          PYTHONPATH: src
         run: uv run pytest -q
 
   deploy:
     needs: test
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
 
     steps:
-      - name: Deploy via SSH
+      - name: Deploy over SSH
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
-          key: ${{ secrets.SSH_KEY }}
-          port: ${{ secrets.SSH_PORT }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
           script: |
-            set -e
+            set -euo pipefail
+
             cd /opt/altegio_bot
 
             git fetch origin main
@@ -51,14 +61,18 @@ jobs:
 
             docker build -t altegio-bot:latest .
 
+            docker restart altegio-api || true
+
             docker rm -f altegio-inbox-worker altegio-outbox-worker 2>/dev/null || true
+
+            IMG='altegio-bot:latest'
 
             docker run -d \
               --name altegio-outbox-worker \
               --restart unless-stopped \
               --link altegio-postgres:altegio-postgres \
               -v /opt/altegio_bot/.env:/app/.env:ro \
-              altegio-bot:latest \
+              "$IMG" \
               sh -lc 'set -a; . /app/.env; set +a; /app/.venv/bin/python -m altegio_bot.scripts.run_outbox_worker'
 
             docker run -d \
@@ -66,9 +80,7 @@ jobs:
               --restart unless-stopped \
               --link altegio-postgres:altegio-postgres \
               -v /opt/altegio_bot/.env:/app/.env:ro \
-              altegio-bot:latest \
+              "$IMG" \
               sh -lc 'set -a; . /app/.env; set +a; /app/.venv/bin/python -c "import asyncio; from altegio_bot.workers.inbox_worker import run_loop; asyncio.run(run_loop())"'
 
-            docker restart altegio-api
-
-            docker exec -i altegio-api uv run --env-file /app/.env alembic upgrade head
+            docker ps --format 'table {{.Names}}\t{{.Status}}' | grep -E 'altegio-(api|postgres|inbox-worker|outbox-worker)'
