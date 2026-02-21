@@ -84,3 +84,18 @@ jobs:
               sh -lc 'set -a; . /app/.env; set +a; /app/.venv/bin/python -c "import asyncio; from altegio_bot.workers.inbox_worker import run_loop; asyncio.run(run_loop())"'
 
             docker ps --format 'table {{.Names}}\t{{.Status}}' | grep -E 'altegio-(api|postgres|inbox-worker|outbox-worker)'
+
+  notify:
+    name: Send Telegram Notification
+    runs-on: ubuntu-latest
+    needs: deploy
+    steps:
+      - name: Notify via Telegram
+        uses: appleboy/telegram-action@master
+        with:
+          token: ${{ secrets.TELEGRAM_TOKEN }}
+          to: ${{ secrets.TELEGRAM_TO }}
+          message: |
+            🚀 *Altegio_bot deployed successfully!*
+            Branch: `${{ github.ref_name }}`
+            Commit: `${{ github.sha }}`
