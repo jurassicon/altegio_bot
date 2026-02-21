@@ -1,0 +1,74 @@
+name: CI + Deploy
+
+on:
+  pull_request:
+  push:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install uv
+        run: pip install --no-cache-dir uv
+
+      - name: Sync deps (locked)
+        run: uv sync --frozen
+
+      - name: Run tests
+        env:
+          PYTHONPATH: ${{ github.workspace }}/src
+        run: uv run pytest -q
+
+  deploy:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT }}
+          script: |
+            set -e
+            cd /opt/altegio_bot
+
+            git fetch origin main
+            git reset --hard origin/main
+
+            docker build -t altegio-bot:latest .
+
+            docker rm -f altegio-inbox-worker altegio-outbox-worker 2>/dev/null || true
+
+            docker run -d \
+              --name altegio-outbox-worker \
+              --restart unless-stopped \
+              --link altegio-postgres:altegio-postgres \
+              -v /opt/altegio_bot/.env:/app/.env:ro \
+              altegio-bot:latest \
+              sh -lc 'set -a; . /app/.env; set +a; /app/.venv/bin/python -m altegio_bot.scripts.run_outbox_worker'
+
+            docker run -d \
+              --name altegio-inbox-worker \
+              --restart unless-stopped \
+              --link altegio-postgres:altegio-postgres \
+              -v /opt/altegio_bot/.env:/app/.env:ro \
+              altegio-bot:latest \
+              sh -lc 'set -a; . /app/.env; set +a; /app/.venv/bin/python -c "import asyncio; from altegio_bot.workers.inbox_worker import run_loop; asyncio.run(run_loop())"'
+
+            docker restart altegio-api
+
+            docker exec -i altegio-api uv run --env-file /app/.env alembic upgrade head
