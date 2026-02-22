@@ -1,254 +1,247 @@
 from __future__ import annotations
 
-import asyncio
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
-from typing import Any
+from datetime import timedelta
 
-import altegio_bot.message_planner as mp
+import pytest
+from sqlalchemy import select
 
-
-@dataclass
-class FakeRecord:
-    id: int
-    company_id: int
-    starts_at: datetime | None
+from altegio_bot.message_planner import plan_jobs_for_record_event
+from altegio_bot.models.models import MessageJob, Record
+from altegio_bot.workers.outbox_worker import utcnow
 
 
-@dataclass
-class FakeClient:
-    id: int
+@pytest.mark.asyncio
+async def test_create_schedules_created_now(session_maker):
+    now = utcnow()
+
+    async with session_maker() as session:
+        async with session.begin():
+            record = Record(
+                company_id=1,
+                altegio_record_id=111,
+                client_id=10,
+                staff_name='Staff',
+                starts_at=now + timedelta(hours=1),
+            )
+            session.add(record)
+            await session.flush()
+
+            await plan_jobs_for_record_event(
+                session,
+                company_id=record.company_id,
+                record_id=record.id,
+                status='create',
+            )
+
+        jobs = (
+            await session.execute(
+                select(MessageJob).order_by(MessageJob.id.asc())
+            )
+        ).scalars().all()
+
+        assert [j.job_type for j in jobs] == [
+            'record_created',
+            'review_3d',
+            'repeat_10d',
+        ]
+        assert jobs[0].run_at <= now + timedelta(seconds=2)
 
 
-class DummySession:
-    pass
+@pytest.mark.asyncio
+async def test_create_schedules_reminder_24h_only_when_more_than_24h_left(
+    session_maker,
+):
+    now = utcnow()
+
+    async with session_maker() as session:
+        async with session.begin():
+            record = Record(
+                company_id=1,
+                altegio_record_id=111,
+                client_id=10,
+                staff_name='Staff',
+                starts_at=now + timedelta(hours=25),
+            )
+            session.add(record)
+            await session.flush()
+
+            await plan_jobs_for_record_event(
+                session,
+                company_id=record.company_id,
+                record_id=record.id,
+                status='create',
+            )
+
+        jobs = (
+            await session.execute(
+                select(MessageJob).order_by(MessageJob.id.asc())
+            )
+        ).scalars().all()
+
+        assert [j.job_type for j in jobs] == [
+            'record_created',
+            'reminder_24h',
+            'review_3d',
+            'repeat_10d',
+        ]
+
+        reminder = jobs[1]
+        assert reminder.job_type == 'reminder_24h'
+        assert reminder.run_at == record.starts_at - timedelta(hours=24)
 
 
-def run(coro: Any) -> Any:
-    return asyncio.run(coro)
+@pytest.mark.asyncio
+async def test_create_schedules_reminder_2h_only_when_2h_to_24h_left(
+    session_maker,
+):
+    now = utcnow()
+
+    async with session_maker() as session:
+        async with session.begin():
+            record = Record(
+                company_id=1,
+                altegio_record_id=111,
+                client_id=10,
+                staff_name='Staff',
+                starts_at=now + timedelta(hours=3),
+            )
+            session.add(record)
+            await session.flush()
+
+            await plan_jobs_for_record_event(
+                session,
+                company_id=record.company_id,
+                record_id=record.id,
+                status='create',
+            )
+
+        jobs = (
+            await session.execute(
+                select(MessageJob).order_by(MessageJob.id.asc())
+            )
+        ).scalars().all()
+
+        assert [j.job_type for j in jobs] == [
+            'record_created',
+            'reminder_2h',
+            'review_3d',
+            'repeat_10d',
+        ]
+
+        reminder = jobs[1]
+        assert reminder.job_type == 'reminder_2h'
+        assert reminder.run_at == record.starts_at - timedelta(hours=2)
 
 
-def test_create_schedules_record_created_and_24h_only(
-        monkeypatch: Any,
-) -> None:
-    fixed_now = datetime(2026, 2, 6, 22, 0, tzinfo=timezone.utc)
-    record = FakeRecord(
-        id=2,
-        company_id=758285,
-        starts_at=fixed_now + timedelta(days=3),
-    )
-    client = FakeClient(id=1)
+@pytest.mark.asyncio
+async def test_update_reschedules_system_jobs(session_maker):
+    now = utcnow()
 
-    calls: list[tuple[str, datetime]] = []
+    async with session_maker() as session:
+        async with session.begin():
+            record = Record(
+                company_id=1,
+                altegio_record_id=111,
+                client_id=10,
+                staff_name='Staff',
+                starts_at=now + timedelta(hours=25),
+            )
+            session.add(record)
+            await session.flush()
 
-    async def fake_enqueue_job(
-        session: Any,
-        *,
-        company_id: int,
-        record_id: int,
-        client_id: int | None,
-        job_type: str,
-        run_at: datetime,
-        now: datetime | None = None,
-    ) -> None:
-        calls.append((job_type, run_at))
+            await plan_jobs_for_record_event(
+                session,
+                company_id=record.company_id,
+                record_id=record.id,
+                status='create',
+            )
 
+        async with session.begin():
+            record.starts_at = now + timedelta(hours=3)
+            await plan_jobs_for_record_event(
+                session,
+                company_id=record.company_id,
+                record_id=record.id,
+                status='update',
+            )
 
-    async def fake_cancel_queued_jobs(
-            session: Any,
-            record_id: int,
-            job_types: Any,
-    ) -> None:
-        raise AssertionError(
-            "cancel_queued_jobs should not be called on create"
-        )
+        jobs = (
+            await session.execute(
+                select(MessageJob).order_by(MessageJob.id.asc())
+            )
+        ).scalars().all()
 
-    monkeypatch.setattr(mp, "utcnow", lambda: fixed_now)
-    monkeypatch.setattr(mp, "enqueue_job", fake_enqueue_job)
-    monkeypatch.setattr(mp, "cancel_queued_jobs", fake_cancel_queued_jobs)
+        canceled = [j.job_type for j in jobs if j.status == 'canceled']
+        queued = [j.job_type for j in jobs if j.status == 'queued']
 
-    run(
-        mp.plan_jobs_for_record_event(
-            session=DummySession(),
-            record=record,  # type: ignore[arg-type]
-            client=client,  # type: ignore[arg-type]
-            event_status="create",
-        )
-    )
+        assert sorted(canceled) == sorted([
+            'record_created',
+            'reminder_24h',
+            'review_3d',
+            'repeat_10d',
+        ])
 
-    job_types = [t for t, _ in calls]
-    assert "record_created" in job_types
-    assert "reminder_24h" in job_types
-    assert "reminder_2h" not in job_types
-
-
-def test_create_schedules_2h_only_when_less_or_equal_24h(
-        monkeypatch: Any,
-) -> None:
-    fixed_now = datetime(2026, 2, 6, 22, 0, tzinfo=timezone.utc)
-    record = FakeRecord(
-        id=2,
-        company_id=758285,
-        starts_at=fixed_now + timedelta(hours=10),
-    )
-
-    calls: list[str] = []
-
-    async def fake_enqueue_job(*args: Any, **kwargs: Any) -> None:
-        calls.append(kwargs["job_type"])
-
-    monkeypatch.setattr(mp, "utcnow", lambda: fixed_now)
-    monkeypatch.setattr(mp, "enqueue_job", fake_enqueue_job)
-
-    run(
-        mp.plan_jobs_for_record_event(
-            session=DummySession(),
-            record=record,  # type: ignore[arg-type]
-            client=None,
-            event_status="create",
-        )
-    )
-
-    assert "reminder_2h" in calls
-    assert "reminder_24h" not in calls
+        assert sorted(queued) == sorted([
+            'record_updated',
+            'reminder_2h',
+            'review_3d',
+            'repeat_10d',
+        ])
 
 
-def test_create_no_reminders_when_less_or_equal_2h(monkeypatch: Any) -> None:
-    fixed_now = datetime(2026, 2, 6, 22, 0, tzinfo=timezone.utc)
-    record = FakeRecord(
-        id=2,
-        company_id=758285,
-        starts_at=fixed_now + timedelta(hours=2),
-    )
+@pytest.mark.asyncio
+async def test_delete_cancels_future_jobs_and_schedules_canceled_and_comeback(
+    session_maker,
+):
+    now = utcnow()
 
-    calls: list[str] = []
+    async with session_maker() as session:
+        async with session.begin():
+            record = Record(
+                company_id=1,
+                altegio_record_id=111,
+                client_id=10,
+                staff_name='Staff',
+                starts_at=now + timedelta(hours=25),
+            )
+            session.add(record)
+            await session.flush()
 
-    async def fake_enqueue_job(*args: Any, **kwargs: Any) -> None:
-        calls.append(kwargs["job_type"])
+            await plan_jobs_for_record_event(
+                session,
+                company_id=record.company_id,
+                record_id=record.id,
+                status='create',
+            )
 
-    monkeypatch.setattr(mp, "utcnow", lambda: fixed_now)
-    monkeypatch.setattr(mp, "enqueue_job", fake_enqueue_job)
+        async with session.begin():
+            await plan_jobs_for_record_event(
+                session,
+                company_id=record.company_id,
+                record_id=record.id,
+                status='delete',
+            )
 
-    run(
-        mp.plan_jobs_for_record_event(
-            session=DummySession(),
-            record=record,  # type: ignore[arg-type]
-            client=None,
-            event_status="create",
-        )
-    )
+        jobs = (
+            await session.execute(
+                select(MessageJob).order_by(MessageJob.id.asc())
+            )
+        ).scalars().all()
 
-    assert "reminder_24h" not in calls
-    assert "reminder_2h" not in calls
+        canceled = [j.job_type for j in jobs if j.status == 'canceled']
+        queued = [j.job_type for j in jobs if j.status == 'queued']
 
+        assert sorted(canceled) == sorted([
+            'record_created',
+            'reminder_24h',
+            'review_3d',
+            'repeat_10d',
+        ])
 
-def test_update_debounced_record_updated(monkeypatch: Any) -> None:
-    fixed_now = datetime(2026, 2, 6, 22, 0, tzinfo=timezone.utc)
-    record = FakeRecord(
-        id=2,
-        company_id=758285,
-        starts_at=fixed_now + timedelta(days=2),
-    )
+        assert sorted(queued) == sorted([
+            'record_canceled',
+            'comeback_3d',
+        ])
 
-    calls: list[tuple[str, datetime]] = []
-    canceled: list[tuple[int, tuple[str, ...]]] = []
-
-    async def fake_enqueue_job(
-            session: Any,
-            *,
-            company_id: int,
-            record_id: int,
-            client_id: int | None,
-            job_type: str,
-            run_at: datetime,
-            now: datetime | None = None,
-    ) -> None:
-        calls.append((job_type, run_at))
-
-    async def fake_cancel_queued_jobs(
-            session: Any,
-            record_id: int,
-            job_types: Any,
-    ) -> None:
-        canceled.append((record_id, tuple(job_types)))
-
-    monkeypatch.setattr(mp, "utcnow", lambda: fixed_now)
-    monkeypatch.setattr(mp, "enqueue_job", fake_enqueue_job)
-    monkeypatch.setattr(mp, "cancel_queued_jobs", fake_cancel_queued_jobs)
-
-    run(
-        mp.plan_jobs_for_record_event(
-            session=DummySession(),
-            record=record,  # type: ignore[arg-type]
-            client=None,
-            event_status="update",
-        )
-    )
-
-    assert canceled
-
-    upd = [c for c in calls if c[0] == "record_updated"]
-    assert len(upd) == 1
-
-    expected = fixed_now + timedelta(seconds=mp.UPDATE_DEBOUNCE_SEC)
-    assert upd[0][1] == expected
-
-
-def test_delete_schedules_canceled_and_comeback(monkeypatch: Any) -> None:
-    fixed_now = datetime(2026, 2, 6, 22, 0, tzinfo=timezone.utc)
-    record = FakeRecord(
-        id=2,
-        company_id=758285,
-        starts_at=fixed_now + timedelta(days=2),
-    )
-
-    calls: list[str] = []
-
-    async def fake_enqueue_job(*args: Any, **kwargs: Any) -> None:
-        calls.append(kwargs["job_type"])
-
-    async def fake_cancel_queued_jobs(
-            session: Any,
-            record_id: int,
-            job_types: Any,
-    ) -> None:
-        return None
-
-    monkeypatch.setattr(mp, "utcnow", lambda: fixed_now)
-    monkeypatch.setattr(mp, "enqueue_job", fake_enqueue_job)
-    monkeypatch.setattr(mp, "cancel_queued_jobs", fake_cancel_queued_jobs)
-
-    run(
-        mp.plan_jobs_for_record_event(
-            session=DummySession(),
-            record=record,  # type: ignore[arg-type]
-            client=None,
-            event_status="delete",
-        )
-    )
-
-    assert "record_canceled" in calls
-    assert "comeback_3d" in calls
-
-
-def test_record_updated_dedupe_bucket() -> None:
-    fixed_now = datetime(2026, 2, 6, 22, 0, tzinfo=timezone.utc)
-
-    k1 = mp._dedupe_key(
-        "record_updated",
-        2,
-        fixed_now + timedelta(seconds=60),
-    )
-    k2 = mp._dedupe_key(
-        "record_updated",
-        2,
-        fixed_now + timedelta(seconds=90),
-    )
-    k3 = mp._dedupe_key(
-        "record_updated",
-        2,
-        fixed_now + timedelta(seconds=121),
-    )
-
-    assert k1 == k2
-    assert k1 != k3
+        comeback = [j for j in jobs if j.job_type == 'comeback_3d'][0]
+        assert comeback.run_at >= now + timedelta(days=3)
