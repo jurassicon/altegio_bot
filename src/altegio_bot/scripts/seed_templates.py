@@ -1,70 +1,60 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from sqlalchemy import delete
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.db import SessionLocal
 from altegio_bot.models.models import MessageTemplate
 
 
-TEMPLATES: dict[int, dict[str, str]] = {
-    758285: {
-        'brand': 'KitiLash',
-        'address': '76133 Karlsruhe, Kaiserstraße, 68',
-        'phone': '+491742310386',
-        'map_link': 'https://goo.gl/maps/p7quWqbAqY9cusuRA',
-        'instagram': 'https://www.instagram.com/kitilash001',
-        'unsubscribe_link': 'https://example.com/unsubscribe/karlsruhe',
-        'booking_link': 'https://example.com/book/karlsruhe',
-        'review_link': 'https://example.com/review/karlsruhe',
-    },
-    1271200: {
-        'brand': 'KitiLash Rastatt',
-        'address': '76437 Rastatt, Rathausstraße 5',
-        'phone': '+491742310386',
-        'map_link': 'https://maps.app.goo.gl/xvYYbJbPaWcnp9Xv5',
-        'instagram': 'https://www.instagram.com/kitilash001',
-        'unsubscribe_link': 'https://example.com/unsubscribe/rastatt',
-        'booking_link': 'https://example.com/book/rastatt',
-        'review_link': 'https://example.com/review/rastatt',
-    },
+@dataclass(frozen=True)
+class _CompanyCfg:
+    company_id: int
+    brand_line: str
+    address_line: str
+    phone_line: str
+    maps_line: str
+    instagram_line: str
+    booking_link: str
+
+
+COMPANIES: dict[int, _CompanyCfg] = {
+    758285: _CompanyCfg(
+        company_id=758285,
+        brand_line='*KitiLash*',
+        address_line='76133 Karlsruhe, Kaiserstraße, 68',
+        phone_line='☎ +491742310386',
+        maps_line='📍https://goo.gl/maps/p7quWqbAqY9cusuRA',
+        instagram_line='📺 https://www.instagram.com/kitilash001',
+        booking_link='https://n813709.alteg.io/',
+    ),
+    1271200: _CompanyCfg(
+        company_id=1271200,
+        brand_line='*KitiLash Rastatt*',
+        address_line='76437 Rastatt, Rathausstraße 5',
+        phone_line='☎ +491742310386',
+        maps_line='📍https://maps.app.goo.gl/xvYYbJbPaWcnp9Xv5',
+        instagram_line='📺 https://www.instagram.com/kitilash001',
+        booking_link='https://n813709.alteg.io/',
+    ),
 }
 
-CODES = (
-    'record_created',
-    'record_updated',
-    'record_canceled',
-    'reminder_24h',
-    'reminder_2h',
-    'comeback_3d',
-    'repeat_10d',
-    'review_3d',
-)
 
-LANG = 'de'
-
-
-def _footer(cfg: dict[str, str]) -> str:
-    brand = cfg['brand']
-    address = cfg['address']
-    phone = cfg['phone']
-    map_link = cfg['map_link']
-    instagram = cfg['instagram']
-    unsubscribe_link = cfg['unsubscribe_link']
-
+def _footer(cfg: _CompanyCfg) -> str:
     return (
-        f'\n\n*{brand}*\n'
-        f'{address}\n'
-        f'☎ {phone}\n\n'
-        f'📍{map_link}\n'
-        f'📺 {instagram}\n'
+        f'\n\n{cfg.brand_line}\n'
+        f'{cfg.address_line}\n'
+        f'{cfg.phone_line}\n\n'
+        f'{cfg.maps_line}\n'
+        f'{cfg.instagram_line}\n'
         '_______________________\n'
         'Wenn die Links inaktiv sind, fügen Sie uns zur Kontaktliste hinzu.\n\n'
-        f'Newsletter abbestellen: {unsubscribe_link}'
+        'Newsletter abbestellen: {unsubscribe_link}'
     )
 
 
-def _body_record_created(cfg: dict[str, str]) -> str:
+def _body_record_created(cfg: _CompanyCfg) -> str:
     return (
         '*{client_name}, hallo! Ihre Terminbuchung wurde bestätigt:*\n\n'
         '*Ausgewählte Mitarbeiterin:* {staff_name}\n'
@@ -72,13 +62,13 @@ def _body_record_created(cfg: dict[str, str]) -> str:
         '*Zeit:* {time}\n'
         '*Service:*\n'
         '{services}\n'
-        '*Summe:* {total_cost}€'
+        '*Summe:* {total_cost}€\n'
         '{pre_appointment_notes}'
-        + _footer(cfg)
+        f'{_footer(cfg)}'
     )
 
 
-def _body_record_updated(cfg: dict[str, str]) -> str:
+def _body_record_updated(cfg: _CompanyCfg) -> str:
     return (
         '*{client_name}, hallo! Ihr Termin wurde geändert:*\n\n'
         '*Ausgewählte Mitarbeiterin:* {staff_name}\n'
@@ -87,21 +77,21 @@ def _body_record_updated(cfg: dict[str, str]) -> str:
         '*Service:*\n'
         '{services}\n'
         '*Summe:* {total_cost}€'
-        + _footer(cfg)
+        f'{_footer(cfg)}'
     )
 
 
-def _body_record_canceled(cfg: dict[str, str]) -> str:
-    booking_link = cfg['booking_link']
+def _body_record_canceled(cfg: _CompanyCfg) -> str:
     return (
         '*{client_name}, hallo!*\n\n'
-        'Ihr Termin wurde storniert.\n'
-        f'Neuen Termin buchen: {booking_link}'
-        + _footer(cfg)
+        'Ihr Termin wurde storniert.\n\n'
+        'Wenn Sie einen neuen Termin vereinbaren möchten, buchen Sie hier:\n'
+        '{booking_link}'
+        f'{_footer(cfg)}'
     )
 
 
-def _body_reminder_24h(cfg: dict[str, str]) -> str:
+def _body_reminder_24h(cfg: _CompanyCfg) -> str:
     return (
         '*{client_name}, hallo!* Erinnerung an Ihren Termin morgen.\n\n'
         '*Mitarbeiterin:* {staff_name}\n'
@@ -110,102 +100,104 @@ def _body_reminder_24h(cfg: dict[str, str]) -> str:
         '*Service:*\n'
         '{services}\n'
         '*Summe:* {total_cost}€'
-        + _footer(cfg)
+        f'{_footer(cfg)}'
     )
 
 
-def _body_reminder_2h(cfg: dict[str, str]) -> str:
+def _body_reminder_2h(cfg: _CompanyCfg) -> str:
     return (
-        '*{client_name}, hallo!* Erinnerung: Ihr Termin findet in ca. 2 Stunden statt.\n\n'
+        '*{client_name}, hallo!*\n\n'
+        'Erinnerung: Ihr Termin beginnt in ca. 2 Stunden.\n\n'
         '*Mitarbeiterin:* {staff_name}\n'
         '*Datum:* {date}\n'
         '*Zeit:* {time}\n'
         '*Service:*\n'
         '{services}\n'
         '*Summe:* {total_cost}€'
-        + _footer(cfg)
+        f'{_footer(cfg)}'
     )
 
 
-def _body_comeback_3d(cfg: dict[str, str]) -> str:
-    booking_link = cfg['booking_link']
+def _body_review_3d(cfg: _CompanyCfg) -> str:
+    return (
+        '*{client_name}, hallo!*\n\n'
+        'Vielen Dank für Ihren Besuch bei KitiLash!\n'
+        'Wenn Sie zufrieden waren, würden wir uns sehr über eine kurze '
+        'Bewertung freuen.\n\n'
+        'Link: {short_link}'
+        f'{_footer(cfg)}'
+    )
+
+
+def _body_comeback_3d(cfg: _CompanyCfg) -> str:
     return (
         '*{client_name}, hallo!*\n\n'
         'Schade, dass es diesmal nicht geklappt hat.\n'
-        f'Neuen Termin buchen: {booking_link}'
-        + _footer(cfg)
+        'Wenn Sie einen neuen Termin möchten, buchen Sie hier:\n'
+        '{booking_link}'
+        f'{_footer(cfg)}'
     )
 
 
-def _body_repeat_10d(cfg: dict[str, str]) -> str:
-    booking_link = cfg['booking_link']
+def _body_repeat_10d(cfg: _CompanyCfg) -> str:
     return (
-        '*{client_name}, hallo!*\n\n'
-        'Möchten Sie Ihren letzten Service erneut buchen?\n'
-        '*Letzter Service:* {primary_service}\n\n'
-        f'Termin buchen: {booking_link}'
-        + _footer(cfg)
+        '*Hallo, {client_name}* 🙂\n\n'
+        'Ich hoffe, dir geht es gut.\n\n'
+        'Ich bin Julia vom Beautystudio KitiLash.\n'
+        'Ich habe gesehen, dass du vor 10 Tagen bei uns für die '
+        'Wimpernverlängerung *"{primary_service}"* da warst.\n\n'
+        'Ich würde mich freuen, wenn du wiederkommst. Du kannst natürlich '
+        'dieselbe Meisterin und die gleiche Behandlung wählen, oder du '
+        'probierst etwas Neues aus. Wir haben eine tolle Auswahl an Looks.\n'
+        'Denke an den Auffüllpreis bis 3 Wochen und buche deinen Termin '
+        'rechtzeitig.\n\n'
+        '*Wir warten auf dich im KitiLash: {booking_link}*\n\n'
+        'Ich freue mich auf deine Antwort!\n\n'
+        'Liebe Grüße, Julia'
+        f'{_footer(cfg)}'
     )
 
 
-def _body_review_3d(cfg: dict[str, str]) -> str:
-    review_link = cfg['review_link']
-    return (
-        '*{client_name}, hallo!*\n\n'
-        'Vielen Dank, dass Sie bei uns waren! '
-        'Wenn Sie 30 Sekunden Zeit haben, freuen wir uns sehr über eine Bewertung:\n'
-        f'{review_link}'
-        + _footer(cfg)
-    )
-
-
-def _make_body(code: str, cfg: dict[str, str]) -> str:
-    mapping = {
-        'record_created': _body_record_created,
-        'record_updated': _body_record_updated,
-        'record_canceled': _body_record_canceled,
-        'reminder_24h': _body_reminder_24h,
-        'reminder_2h': _body_reminder_2h,
-        'comeback_3d': _body_comeback_3d,
-        'repeat_10d': _body_repeat_10d,
-        'review_3d': _body_review_3d,
+def _templates_for_company(cfg: _CompanyCfg) -> list[MessageTemplate]:
+    bodies = {
+        'record_created': _body_record_created(cfg),
+        'record_updated': _body_record_updated(cfg),
+        'record_canceled': _body_record_canceled(cfg),
+        'reminder_24h': _body_reminder_24h(cfg),
+        'reminder_2h': _body_reminder_2h(cfg),
+        'review_3d': _body_review_3d(cfg),
+        'comeback_3d': _body_comeback_3d(cfg),
+        'repeat_10d': _body_repeat_10d(cfg),
     }
-    return mapping[code](cfg)
 
-
-async def seed_company(
-    session: AsyncSession,
-    *,
-    company_id: int,
-) -> None:
-    cfg = TEMPLATES[company_id]
-
-    await session.execute(
-        delete(MessageTemplate).where(
-            MessageTemplate.company_id == company_id,
-            MessageTemplate.language == LANG,
-            MessageTemplate.code.in_(CODES),
-        )
-    )
-
-    for code in CODES:
-        body = _make_body(code, cfg)
-        session.add(
+    out: list[MessageTemplate] = []
+    for code, body in bodies.items():
+        out.append(
             MessageTemplate(
-                company_id=company_id,
+                company_id=cfg.company_id,
                 code=code,
-                language=LANG,
+                language='de',
                 body=body,
                 is_active=True,
             )
         )
+    return out
 
 
 async def main() -> None:
     async with SessionLocal() as session:
         async with session.begin():
-            await seed_company(session, company_id=758285)
-            await seed_company(session, company_id=1271200)
+            await session.execute(
+                delete(MessageTemplate).where(
+                    MessageTemplate.company_id.in_(list(COMPANIES.keys()))
+                )
+            )
+
+            for cfg in COMPANIES.values():
+                for tmpl in _templates_for_company(cfg):
+                    session.add(tmpl)
+
+    print('seeded message_templates for:', ', '.join(map(str, COMPANIES)))
 
 
 if __name__ == '__main__':
