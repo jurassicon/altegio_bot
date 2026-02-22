@@ -10,33 +10,44 @@ jobs:
   test:
     runs-on: ubuntu-latest
 
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: altegio
+          POSTGRES_PASSWORD: altegio
+          POSTGRES_DB: altegio_bot
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U altegio -d altegio_bot"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+
+    env:
+      PYTHONPATH: src
+      DATABASE_URL: postgresql+asyncpg://altegio:altegio@localhost:5432/altegio_bot
+      ALTEGIO_WEBHOOK_SECRET: test_secret
+
+      WHATSAPP_WEBHOOK_VERIFY_TOKEN: test
+      WHATSAPP_ACCESS_TOKEN: test
+      WHATSAPP_GRAPH_URL: https://graph.facebook.com
+      WHATSAPP_API_VERSION: v20.0
+      META_WA_PHONE_NUMBER_ID: "1"
+
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: astral-sh/setup-uv@v3
         with:
-          python-version: '3.12'
-
-      - name: Setup uv
-        uses: astral-sh/setup-uv@v3
-        with:
+          python-version: "3.12"
           enable-cache: true
 
       - name: Install deps
         run: uv sync --frozen
 
-      - name: Create minimal .env for tests
-        run: |
-          cat > .env <<'EOF'
-          DATABASE_URL=postgresql+asyncpg://user:pass@localhost:5432/db
-          ALTEGIO_WEBHOOK_SECRET=dummy_secret
-          EOF
-
       - name: Run tests
-        env:
-          PYTHONPATH: src
         run: uv run pytest -q
 
   deploy:
