@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
     create_async_engine,
 )
+from sqlalchemy.pool import NullPool
 
 from altegio_bot.models.models import Base
 
@@ -20,14 +21,17 @@ def _require_env(name: str) -> str:
     return value
 
 
-@pytest_asyncio.fixture(scope='session')
+@pytest_asyncio.fixture()
 async def engine() -> AsyncEngine:
     database_url = _require_env('DATABASE_URL')
 
-    engine = create_async_engine(database_url, echo=False)
+    engine = create_async_engine(
+        database_url,
+        echo=False,
+        poolclass=NullPool,
+    )
 
     async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.drop_all)
         await conn.run_sync(Base.metadata.create_all)
 
     yield engine
@@ -39,7 +43,7 @@ async def session_maker(engine: AsyncEngine):
     async with engine.begin() as conn:
         table_names = [t.name for t in Base.metadata.sorted_tables]
         if table_names:
-            quoted = ', '.join([f'"{name}"' for name in table_names])
+            quoted = ', '.join([f'\"{name}\"' for name in table_names])
             await conn.execute(
                 text(f'TRUNCATE {quoted} RESTART IDENTITY CASCADE')
             )
