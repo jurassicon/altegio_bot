@@ -11,41 +11,47 @@ from sqlalchemy.ext.asyncio import (
 )
 from sqlalchemy.pool import NullPool
 
-from altegio_bot.models.models import Base
+from altegio_bot.models.models import Base, Client
 
 
-def _require_env(name: str) -> str:
-    value = (os.getenv(name) or '').strip()
-    if not value:
-        raise RuntimeError(f'Missing required env var: {name}')
-    return value
+def _get_db_url() -> str:
+    url = (os.getenv('DATABASE_URL') or '').strip()
+    if not url:
+        raise RuntimeError('DATABASE_URL env var is required for tests')
+    return url
 
 
-@pytest_asyncio.fixture()
+@pytest_asyncio.fixture
 async def engine() -> AsyncEngine:
-    database_url = _require_env('DATABASE_URL')
-
     engine = create_async_engine(
-        database_url,
-        echo=False,
+        _get_db_url(),
         poolclass=NullPool,
     )
-
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-
     yield engine
     await engine.dispose()
 
 
-@pytest_asyncio.fixture()
+@pytest_asyncio.fixture
 async def session_maker(engine: AsyncEngine):
     async with engine.begin() as conn:
         table_names = [t.name for t in Base.metadata.sorted_tables]
         if table_names:
-            quoted = ', '.join([f'\"{name}\"' for name in table_names])
-            await conn.execute(
-                text(f'TRUNCATE {quoted} RESTART IDENTITY CASCADE')
+            quoted = ', '.join([f'"{name}"' for name in table_names])
+            sql = f'TRUNCATE {quoted} RESTART IDENTITY CASCADE'
+            await conn.execute(text(sql))
+
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+
+    async with maker() as session:
+        async with session.begin():
+            session.add(
+                Client(
+                    id=10,
+                    company_id=1,
+                    altegio_client_id=10,
+                    phone_e164='+10000000000',
+                    display_name='Test Client',
+                )
             )
 
-    return async_sessionmaker(engine, expire_on_commit=False)
+    return maker
