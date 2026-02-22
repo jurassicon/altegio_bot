@@ -24,7 +24,7 @@ from altegio_bot.providers.base import WhatsAppProvider
 from altegio_bot.providers.dummy import DummyProvider, safe_send
 from altegio_bot.whatsapp_routing import (
     pick_sender_code_for_record,
-    pick_sender_id
+    pick_sender_id,
 )
 
 logger = logging.getLogger('outbox_worker')
@@ -33,6 +33,13 @@ MIN_SECONDS_BETWEEN_MESSAGES = 30
 DEFAULT_LANGUAGE = 'de'
 PAST_RECORD_GRACE_MINUTES = 5
 
+PRE_APPOINTMENT_JOB_TYPES = (
+    'record_created',
+    'record_updated',
+    'reminder_24h',
+    'reminder_2h',
+)
+
 TOKEN_EXPIRED_RETRY_SECONDS = 60
 STOP_WORKER_ON_TOKEN_EXPIRED_ENV = 'STOP_WORKER_ON_TOKEN_EXPIRED'
 _TOKEN_EXPIRED = False
@@ -40,8 +47,8 @@ _TOKEN_EXPIRED = False
 STALE_PROCESSING_MINUTES = 10
 
 DEFAULT_LANGUAGE_BY_COMPANY = {
-    758285: 'de',   # Karlsruhe
-    1271200: 'de',  # Rastatt
+    758285: 'de',
+    1271200: 'de',
 }
 
 UNSUBSCRIBE_LINKS = {
@@ -80,11 +87,20 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _record_is_in_past(record: Record | None) -> bool:
+def _record_is_in_past(record: Record | None, *, job_type: str) -> bool:
+    if job_type not in PRE_APPOINTMENT_JOB_TYPES:
+        return False
+
     if record is None or record.starts_at is None:
         return False
     cutoff = utcnow() - timedelta(minutes=PAST_RECORD_GRACE_MINUTES)
     return record.starts_at < cutoff
+
+
+def _record_attended(record: Record | None) -> bool:
+    if record is None:
+        return False
+    return bool((record.attendance or 0) == 1 or (record.visit_attendance or 0) == 1)
 
 
 async def _find_success_outbox(
@@ -341,6 +357,7 @@ async def _render_message(
         )
 
     services_text = ''
+    primary_service = ''
     total_cost = Decimal('0.00')
 
     if record is not None:
@@ -351,6 +368,9 @@ async def _render_message(
         )
         svc_res = await session.execute(svc_stmt)
         services = list(svc_res.scalars().all())
+
+        if services:
+            primary_service = services[0].title or ''
 
         lines: list[str] = []
         for svc in services:
@@ -402,6 +422,7 @@ async def _render_message(
         'date': _fmt_date(record.starts_at if record else None),
         'time': _fmt_time(record.starts_at if record else None),
         'services': services_text,
+        'primary_service': primary_service,
         'total_cost': _fmt_money(total_cost),
         'short_link': (record.short_link if record else ''),
         'unsubscribe_link': unsubscribe_link,
@@ -475,13 +496,48 @@ async def process_job_in_session(
         return
 
     record = await _load_record(session, job)
-    if _record_is_in_past(record):
+    if _record_is_in_past(record, job_type=job.job_type):
         job.status = 'canceled'
         job.locked_at = None
         job.last_error = 'Skipped: record starts_at is in the past'
         return
 
     client = await _load_client(session, job, record)
+
+    if record is not None and record.is_deleted:
+        if job.job_type in ('record_created', 'record_updated', 'reminder_24h', 'reminder_2h'):
+            job.status = 'canceled'
+            job.locked_at = None
+            job.last_error = 'Skipped: record is deleted'
+            return
+
+    if job.job_type == 'comeback_3d':
+        if record is None or not record.is_deleted:
+            job.status = 'canceled'
+            job.locked_at = None
+            job.last_error = 'Skipped: record is not deleted'
+            return
+
+    if job.job_type in ('review_3d', 'repeat_10d'):
+        if not _record_attended(record):
+            job.status = 'canceled'
+            job.locked_at = None
+            job.last_error = 'Skipped: record not attended'
+            return
+
+    if job.job_type == 'review_3d' and record is not None:
+        is_new = await _is_new_client_for_record(
+            session=session,
+            company_id=job.company_id,
+            client_id=record.client_id,
+            record_id=record.id,
+            record_starts_at=record.starts_at,
+        )
+        if not is_new:
+            job.status = 'canceled'
+            job.locked_at = None
+            job.last_error = 'Skipped: not a new client'
+            return
 
     phone = client.phone_e164 if client else None
     if not phone:
