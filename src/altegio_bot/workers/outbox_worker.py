@@ -51,6 +51,11 @@ DEFAULT_LANGUAGE_BY_COMPANY = {
     1271200: 'de',
 }
 
+BOOKING_LINKS = {
+    758285: 'https://n813709.alteg.io/',
+    1271200: 'https://n813709.alteg.io/',
+}
+
 UNSUBSCRIBE_LINKS = {
     758285: 'https://example.com/unsubscribe/karlsruhe',
     1271200: 'https://example.com/unsubscribe/rastatt',
@@ -100,7 +105,10 @@ def _record_is_in_past(record: Record | None, *, job_type: str) -> bool:
 def _record_attended(record: Record | None) -> bool:
     if record is None:
         return False
-    return bool((record.attendance or 0) == 1 or (record.visit_attendance or 0) == 1)
+
+    attendance = getattr(record, 'attendance', 0) or 0
+    visit_attendance = getattr(record, 'visit_attendance', 0) or 0
+    return bool(attendance == 1 or visit_attendance == 1)
 
 
 async def _find_success_outbox(
@@ -381,6 +389,7 @@ async def _render_message(
         services_text = '\n'.join(lines)
 
     unsubscribe_link = UNSUBSCRIBE_LINKS.get(company_id, '')
+    booking_link = BOOKING_LINKS.get(company_id, '')
 
     sender_code = 'default'
     if record is not None:
@@ -426,6 +435,7 @@ async def _render_message(
         'total_cost': _fmt_money(total_cost),
         'short_link': (record.short_link if record else ''),
         'unsubscribe_link': unsubscribe_link,
+        'booking_link': booking_link,
         'sender_id': sender_id,
         'sender_code': sender_code,
         'pre_appointment_notes': pre_appointment_notes,
@@ -504,8 +514,30 @@ async def process_job_in_session(
 
     client = await _load_client(session, job, record)
 
-    if record is not None and record.is_deleted:
-        if job.job_type in ('record_created', 'record_updated', 'reminder_24h', 'reminder_2h'):
+    if record is not None and job.job_type in ('review_3d', 'repeat_10d'):
+        if not _record_attended(record):
+            job.status = 'canceled'
+            job.locked_at = None
+            job.last_error = 'Skipped: record is not attended'
+            return
+
+    if record is not None and job.job_type == 'review_3d':
+        is_new = await _is_new_client_for_record(
+            session=session,
+            company_id=job.company_id,
+            client_id=getattr(record, 'client_id', None),
+            record_id=getattr(record, 'id', None),
+            record_starts_at=getattr(record, 'starts_at', None),
+        )
+        if not is_new:
+            job.status = 'canceled'
+            job.locked_at = None
+            job.last_error = 'Skipped: review only for new clients'
+            return
+
+    if record is not None and getattr(record, 'is_deleted', False):
+        allow_deleted = job.job_type in ('record_canceled', 'comeback_3d')
+        if not allow_deleted:
             job.status = 'canceled'
             job.locked_at = None
             job.last_error = 'Skipped: record is deleted'
