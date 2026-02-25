@@ -1,8 +1,8 @@
-'''add message_jobs locked_at
+'''ensure message_jobs locked_at exists
 
-Revision ID: 6f237a8a2850
-Revises: b09b0b0548dc
-Create Date: 2026-02-13 21:44:49.952448
+Revision ID: f3a1c4e9b2d0
+Revises: c6b3a9d7e210
+Create Date: 2026-02-25 00:00:00.000000
 '''
 
 from typing import Sequence, Union
@@ -11,8 +11,8 @@ from alembic import op
 import sqlalchemy as sa
 
 
-revision: str = '6f237a8a2850'
-down_revision: Union[str, Sequence[str], None] = 'b09b0b0548dc'
+revision: str = 'f3a1c4e9b2d0'
+down_revision: Union[str, Sequence[str], None] = 'c6b3a9d7e210'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
