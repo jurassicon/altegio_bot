@@ -22,10 +22,7 @@ from altegio_bot.models.models import (
 )
 from altegio_bot.providers.base import WhatsAppProvider
 from altegio_bot.providers.dummy import DummyProvider, safe_send
-from altegio_bot.whatsapp_routing import (
-    pick_sender_code_for_record,
-    pick_sender_id,
-)
+from altegio_bot.whatsapp_routing import pick_sender_code_for_record, pick_sender_id
 
 logger = logging.getLogger('outbox_worker')
 
@@ -38,6 +35,12 @@ PRE_APPOINTMENT_JOB_TYPES = (
     'record_updated',
     'reminder_24h',
     'reminder_2h',
+)
+
+MARKETING_JOB_TYPES = (
+    'review_3d',
+    'repeat_10d',
+    'comeback_3d',
 )
 
 TOKEN_EXPIRED_RETRY_SECONDS = 60
@@ -98,6 +101,7 @@ def _record_is_in_past(record: Record | None, *, job_type: str) -> bool:
 
     if record is None or record.starts_at is None:
         return False
+
     cutoff = utcnow() - timedelta(minutes=PAST_RECORD_GRACE_MINUTES)
     return record.starts_at < cutoff
 
@@ -514,6 +518,14 @@ async def process_job_in_session(
 
     client = await _load_client(session, job, record)
 
+    if client is not None:
+        opted_out = bool(getattr(client, 'wa_opted_out', False))
+        if opted_out and job.job_type in MARKETING_JOB_TYPES:
+            job.status = 'canceled'
+            job.locked_at = None
+            job.last_error = 'Skipped: client unsubscribed'
+            return
+
     if record is not None and job.job_type in ('review_3d', 'repeat_10d'):
         if not _record_attended(record):
             job.status = 'canceled'
@@ -633,9 +645,7 @@ async def process_job_in_session(
             _mark_token_expired()
             job.status = 'queued'
             job.locked_at = None
-            job.run_at = utcnow() + timedelta(
-                seconds=TOKEN_EXPIRED_RETRY_SECONDS
-            )
+            job.run_at = utcnow() + timedelta(seconds=TOKEN_EXPIRED_RETRY_SECONDS)
             job.last_error = f'Send blocked: {err}'
             return
 
@@ -785,7 +795,6 @@ def _build_provider() -> WhatsAppProvider:
     name = os.getenv('WHATSAPP_PROVIDER', 'dummy').strip()
     if name == 'meta_cloud':
         from altegio_bot.providers.meta_cloud import MetaCloudProvider
-
         return MetaCloudProvider()
     return DummyProvider()
 
