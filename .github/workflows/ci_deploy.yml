@@ -1,48 +1,26 @@
 name: CI + Deploy
 
 on:
-  pull_request:
   push:
     branches:
       - main
+  pull_request:
+
+concurrency:
+  group: altegio-bot-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  test:
+  tests:
     runs-on: ubuntu-latest
-
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: altegio
-          POSTGRES_PASSWORD: altegio
-          POSTGRES_DB: altegio_bot
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd="pg_isready -U altegio -d altegio_bot"
-          --health-interval=5s
-          --health-timeout=5s
-          --health-retries=20
-
-    env:
-      PYTHONPATH: src
-      DATABASE_URL: postgresql+asyncpg://altegio:altegio@localhost:5432/altegio_bot
-      ALTEGIO_WEBHOOK_SECRET: test_secret
-
-      WHATSAPP_WEBHOOK_VERIFY_TOKEN: test
-      WHATSAPP_ACCESS_TOKEN: test
-      WHATSAPP_GRAPH_URL: https://graph.facebook.com
-      WHATSAPP_API_VERSION: v20.0
-      META_WA_PHONE_NUMBER_ID: '1'
-
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: astral-sh/setup-uv@v3
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v4
         with:
           python-version: '3.12'
-          enable-cache: true
 
       - name: Install deps
         run: uv sync --frozen
@@ -51,17 +29,17 @@ jobs:
         run: uv run pytest -q
 
   deploy:
-    needs: test
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    needs: tests
     runs-on: ubuntu-latest
-
+    if: github.ref == 'refs/heads/main'
     steps:
       - name: Deploy over SSH
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.SSH_HOST }}
-          username: ${{ secrets.SSH_USER }}
-          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          username: ${{ secrets.SSH_USERNAME }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT }}
           script: |
             set -euo pipefail
 
@@ -70,31 +48,30 @@ jobs:
             git fetch origin main
             git reset --hard origin/main
 
+            if ! docker ps --format '{{.Names}}' | grep -qx 'altegio-postgres'; then
+              echo 'ERROR: altegio-postgres container is not running' >&2
+              exit 1
+            fi
+
             docker build -t altegio-bot:latest .
 
             IMG='altegio-bot:latest'
             ENV_FILE='/opt/altegio_bot/.env'
+            NET='altegio-net'
 
-            FMT='{{range $k,$v := .NetworkSettings.Networks}}{{println $k}}{{end}}'
-            NET="$(docker inspect -f "$FMT" altegio-postgres | head -n 1)"
-
-            if [ -z "${NET}" ]; then
-              echo 'ERROR: cannot detect docker network for altegio-postgres' >&2
-              exit 1
-            fi
-
-            echo "Using network: ${NET}"
+            docker network inspect "${NET}" >/dev/null 2>&1 || docker network create "${NET}"
+            docker network connect "${NET}" altegio-postgres 2>/dev/null || true
 
             docker run --rm \
               --network "${NET}" \
-              -v "${ENV_FILE}:/app/.env:ro" \
               "${IMG}" \
-              sh -lc '
-                set -a
-                . /app/.env
-                set +a
-                /app/.venv/bin/alembic upgrade head
-              '
+              python -c 'import socket; socket.getaddrinfo("altegio-postgres", 5432); print("dns ok")'
+
+            docker run --rm \
+              --network "${NET}" \
+              --env-file "${ENV_FILE}" \
+              "${IMG}" \
+              /app/.venv/bin/alembic upgrade head
 
             docker rm -f \
               altegio-api \
@@ -108,53 +85,33 @@ jobs:
               --restart unless-stopped \
               --network "${NET}" \
               -p 8000:8000 \
-              -v "${ENV_FILE}:/app/.env:ro" \
-              "${IMG}"
-
-            OUTBOX_CMD='
-              set -a
-              . /app/.env
-              set +a
-              /app/.venv/bin/python -m altegio_bot.scripts.run_outbox_worker
-            '
+              --env-file "${ENV_FILE}" \
+              "${IMG}" \
+              /app/.venv/bin/uvicorn altegio_bot.main:app --host 0.0.0.0 --port 8000
 
             docker run -d \
               --name altegio-outbox-worker \
               --restart unless-stopped \
               --network "${NET}" \
-              -v "${ENV_FILE}:/app/.env:ro" \
+              --env-file "${ENV_FILE}" \
               "${IMG}" \
-              sh -lc "${OUTBOX_CMD}"
-
-            INBOX_CMD='
-              set -a
-              . /app/.env
-              set +a
-              /app/.venv/bin/python -m altegio_bot.scripts.run_inbox_worker
-            '
+              /app/.venv/bin/python -m altegio_bot.scripts.run_outbox_worker
 
             docker run -d \
               --name altegio-inbox-worker \
               --restart unless-stopped \
               --network "${NET}" \
-              -v "${ENV_FILE}:/app/.env:ro" \
+              --env-file "${ENV_FILE}" \
               "${IMG}" \
-              sh -lc "${INBOX_CMD}"
-
-            WA_INBOX_CMD='
-              set -a
-              . /app/.env
-              set +a
-              /app/.venv/bin/python -m altegio_bot.scripts.run_whatsapp_inbox_worker
-            '
+              /app/.venv/bin/python -m altegio_bot.workers.inbox_worker
 
             docker run -d \
               --name altegio-whatsapp-inbox-worker \
               --restart unless-stopped \
               --network "${NET}" \
-              -v "${ENV_FILE}:/app/.env:ro" \
+              --env-file "${ENV_FILE}" \
               "${IMG}" \
-              sh -lc "${WA_INBOX_CMD}"
+              /app/.venv/bin/python -m altegio_bot.scripts.run_whatsapp_inbox_worker
 
             docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}' | \
               grep -E 'altegio-(api|postgres|inbox-worker|outbox-worker|whatsapp-inbox-worker)'
