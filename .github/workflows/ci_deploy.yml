@@ -1,70 +1,63 @@
-name: CI + Deploy
+name: CI / Deploy
 
 on:
-  pull_request:
   push:
     branches:
       - main
+  workflow_dispatch:
 
 jobs:
-  test:
+  tests:
     runs-on: ubuntu-latest
 
     services:
       postgres:
         image: postgres:16
         env:
-          POSTGRES_USER: altegio
-          POSTGRES_PASSWORD: altegio
-          POSTGRES_DB: altegio_bot
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: altegio_bot_test
         ports:
           - 5432:5432
         options: >-
-          --health-cmd="pg_isready -U altegio -d altegio_bot"
-          --health-interval=5s
-          --health-timeout=5s
-          --health-retries=20
-
-    env:
-      PYTHONPATH: src
-      DATABASE_URL: postgresql+asyncpg://altegio:altegio@localhost:5432/altegio_bot
-      ALTEGIO_WEBHOOK_SECRET: test_secret
-
-      WHATSAPP_WEBHOOK_VERIFY_TOKEN: test
-      WHATSAPP_ACCESS_TOKEN: test
-      WHATSAPP_GRAPH_URL: https://graph.facebook.com
-      WHATSAPP_API_VERSION: v20.0
-      META_WA_PHONE_NUMBER_ID: '1'
+          --health-cmd 'pg_isready -U postgres -d altegio_bot_test'
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: astral-sh/setup-uv@v3
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-          enable-cache: true
+
+      - name: Install uv
+        run: python -m pip install --upgrade pip uv
 
       - name: Install deps
         run: uv sync --frozen
 
-      - name: Apply migrations
-        run: uv run alembic upgrade head
-
       - name: Run tests
+        env:
+          DATABASE_URL: 'postgresql+asyncpg://postgres:postgres@localhost:5432/altegio_bot_test'
+          ALTEGIO_WEBHOOK_SECRET: 'test-secret'
         run: uv run pytest -q
 
   deploy:
-    needs: test
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    needs: tests
     runs-on: ubuntu-latest
 
     steps:
-      - name: Deploy over SSH
+      - name: Deploy to server via SSH
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.SSH_HOST }}
-          username: ${{ secrets.SSH_USER }}
-          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          username: root
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: ${{ secrets.SSH_PORT }}
           script: |
             set -euo pipefail
 
@@ -84,9 +77,7 @@ jobs:
               exit 1
             fi
 
-            DB_URL="$(grep -E '^DATABASE_URL=' "${ENV_FILE}" | head -n 1 | \
-              cut -d= -f2- || true)"
-
+            DB_URL="$(grep -E '^DATABASE_URL=' "${ENV_FILE}" | head -n 1 | cut -d= -f2- || true)"
             if [ -z "${DB_URL}" ]; then
               echo 'ERROR: DATABASE_URL is missing in .env' >&2
               exit 1
@@ -98,22 +89,15 @@ jobs:
               exit 1
             fi
 
-            docker network inspect "${NET}" >/dev/null 2>&1 || \
-              docker network create "${NET}"
+            docker network inspect "${NET}" >/dev/null 2>&1 || docker network create "${NET}"
 
-            docker network connect "${NET}" altegio-postgres \
-              2>/dev/null || true
+            docker network connect "${NET}" altegio-postgres 2>/dev/null || true
 
             docker run --rm \
               --network "${NET}" \
               -v "${ENV_FILE}:/app/.env:ro" \
               "${IMG}" \
-              sh -lc '
-                set -a
-                . /app/.env
-                set +a
-                /app/.venv/bin/alembic upgrade head
-              '
+              /app/.venv/bin/alembic upgrade head
 
             docker rm -f \
               altegio-api \
@@ -128,14 +112,8 @@ jobs:
               --network "${NET}" \
               -p 8000:8000 \
               -v "${ENV_FILE}:/app/.env:ro" \
-              "${IMG}"
-
-            OUTBOX_CMD='
-              set -a
-              . /app/.env
-              set +a
-              /app/.venv/bin/python -m altegio_bot.scripts.run_outbox_worker
-            '
+              "${IMG}" \
+              /app/.venv/bin/uvicorn altegio_bot.main:app --host 0.0.0.0 --port 8000
 
             docker run -d \
               --name altegio-outbox-worker \
@@ -143,14 +121,7 @@ jobs:
               --network "${NET}" \
               -v "${ENV_FILE}:/app/.env:ro" \
               "${IMG}" \
-              sh -lc "${OUTBOX_CMD}"
-
-            INBOX_CMD='
-              set -a
-              . /app/.env
-              set +a
-              /app/.venv/bin/python -m altegio_bot.scripts.run_inbox_worker
-            '
+              /app/.venv/bin/python -m altegio_bot.scripts.run_outbox_worker
 
             docker run -d \
               --name altegio-inbox-worker \
@@ -158,14 +129,7 @@ jobs:
               --network "${NET}" \
               -v "${ENV_FILE}:/app/.env:ro" \
               "${IMG}" \
-              sh -lc "${INBOX_CMD}"
-
-            WA_INBOX_CMD='
-              set -a
-              . /app/.env
-              set +a
-              /app/.venv/bin/python -m altegio_bot.scripts.run_whatsapp_inbox_worker
-            '
+              /app/.venv/bin/python -m altegio_bot.scripts.run_inbox_worker
 
             docker run -d \
               --name altegio-whatsapp-inbox-worker \
@@ -173,7 +137,7 @@ jobs:
               --network "${NET}" \
               -v "${ENV_FILE}:/app/.env:ro" \
               "${IMG}" \
-              sh -lc "${WA_INBOX_CMD}"
+              /app/.venv/bin/python -m altegio_bot.scripts.run_whatsapp_inbox_worker
 
             docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}' | \
               grep -E 'altegio-(api|postgres|inbox-worker|outbox-worker|whatsapp-inbox-worker)'
@@ -183,16 +147,19 @@ jobs:
             docker builder prune -f
 
   notify:
-    name: Send Telegram Notification
-    runs-on: ubuntu-latest
     needs: deploy
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+
     steps:
-      - name: Notify via Telegram
+      - name: Telegram notify
         uses: appleboy/telegram-action@master
         with:
-          token: ${{ secrets.TELEGRAM_TOKEN }}
           to: ${{ secrets.TELEGRAM_TO }}
+          token: ${{ secrets.TELEGRAM_TOKEN }}
           message: |
-            🚀 *Altegio_bot deployed successfully!*
-            Branch: `${{ github.ref_name }}`
-            Commit: `${{ github.sha }}`
+            altegio_bot deploy: ${{ job.status }}
+            repo: ${{ github.repository }}
+            branch: ${{ github.ref_name }}
+            sha: ${{ github.sha }}
+            run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
