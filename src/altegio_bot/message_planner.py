@@ -3,11 +3,11 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import update, select
+from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from altegio_bot.models.models import MessageJob, Record
+from altegio_bot.models.models import Client, MessageJob, Record
 
 UPDATE_DEBOUNCE_SEC = 60
 
@@ -17,6 +17,12 @@ REVIEW_REQUEST_DAYS = 3
 FOLLOWUP_JOB_TYPES = (
     'repeat_10d',
     'review_3d',
+)
+
+MARKETING_JOB_TYPES = (
+    'review_3d',
+    'repeat_10d',
+    'comeback_3d',
 )
 
 REMINDER_JOB_TYPES = (
@@ -48,12 +54,12 @@ def _dedupe_key(
       новые update-job'ы в следующих окнах.
     - остальные: dedupe по (job_type, record_id, run_at).
     """
-    if job_type == "record_updated":
+    if job_type == 'record_updated':
         base_dt = now or run_at
         bucket = int(base_dt.timestamp()) // UPDATE_DEBOUNCE_SEC
-        return f"{job_type}:{record_id}:{bucket}"
+        return f'{job_type}:{record_id}:{bucket}'
 
-    return f"{job_type}:{record_id}:{run_at.isoformat()}"
+    return f'{job_type}:{record_id}:{run_at.isoformat()}'
 
 
 async def cancel_queued_jobs(
@@ -101,22 +107,22 @@ async def enqueue_job(
         client_id=client_id,
         job_type=job_type,
         run_at=run_at,
-        status="queued",
+        status='queued',
     )
 
     excluded = insert_stmt.excluded
 
     stmt = insert_stmt.on_conflict_do_update(
-        index_elements=["dedupe_key"],
+        index_elements=['dedupe_key'],
         set_={
-            "company_id": excluded.company_id,
-            "record_id": excluded.record_id,
-            "client_id": excluded.client_id,
-            "job_type": excluded.job_type,
-            "run_at": excluded.run_at,
-            "status": "queued",
+            'company_id': excluded.company_id,
+            'record_id': excluded.record_id,
+            'client_id': excluded.client_id,
+            'job_type': excluded.job_type,
+            'run_at': excluded.run_at,
+            'status': 'queued',
         },
-        where=MessageJob.status == "canceled",
+        where=MessageJob.status == 'canceled',
     )
     await session.execute(stmt)
 
@@ -141,6 +147,11 @@ async def plan_jobs_for_record_event(
 
     client_id = record.client_id
 
+    opted_out = False
+    if client_id is not None:
+        client = await session.get(Client, client_id)
+        opted_out = bool(getattr(client, 'wa_opted_out', False))
+
     if status == 'create':
         await add_job(
             session,
@@ -152,7 +163,8 @@ async def plan_jobs_for_record_event(
             payload={'kind': 'record_created'},
         )
         await _plan_reminders(session, record=record, client_id=client_id)
-        await _plan_followups(session, record=record, client_id=client_id)
+        if not opted_out:
+            await _plan_followups(session, record=record, client_id=client_id)
         return
 
     if status == 'update':
@@ -172,7 +184,8 @@ async def plan_jobs_for_record_event(
             payload={'kind': 'record_updated'},
         )
         await _plan_reminders(session, record=record, client_id=client_id)
-        await _plan_followups(session, record=record, client_id=client_id)
+        if not opted_out:
+            await _plan_followups(session, record=record, client_id=client_id)
         return
 
     if status == 'delete':
@@ -192,15 +205,16 @@ async def plan_jobs_for_record_event(
             payload={'kind': 'record_canceled'},
         )
 
-        await add_job(
-            session,
-            company_id=company_id,
-            record_id=record.id,
-            client_id=client_id,
-            job_type='comeback_3d',
-            run_at=utcnow() + timedelta(days=3),
-            payload={'kind': 'comeback_3d'},
-        )
+        if not opted_out:
+            await add_job(
+                session,
+                company_id=company_id,
+                record_id=record.id,
+                client_id=client_id,
+                job_type='comeback_3d',
+                run_at=utcnow() + timedelta(days=3),
+                payload={'kind': 'comeback_3d'},
+            )
         return
 
 
