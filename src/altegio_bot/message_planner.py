@@ -1,315 +1,389 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from altegio_bot.models.models import Client, MessageJob, Record
+from altegio_bot.models.models import Client, MessageJob, MessageTemplate, Record
+from altegio_bot.utils import utcnow
 
-UPDATE_DEBOUNCE_SEC = 60
-
-FOLLOWUP_REPEAT_DAYS = 10
-REVIEW_REQUEST_DAYS = 3
-
-FOLLOWUP_JOB_TYPES = (
-    'repeat_10d',
-    'review_3d',
-)
-
-MARKETING_JOB_TYPES = (
-    'review_3d',
-    'repeat_10d',
-    'comeback_3d',
-)
-
-REMINDER_JOB_TYPES = (
-    'reminder_24h',
-    'reminder_2h',
-)
+REMINDER_24H = 'reminder_24h'
+REVIEW_3D = 'review_3d'
+REPEAT_10D = 'repeat_10d'
+COMEBACK_3D = 'comeback_3d'
+COMEBACK_14D = 'comeback_14d'
+COMEBACK_30D = 'comeback_30d'
+REMINDER_2H = 'reminder_2h'
+FIRST_VISIT_REMINDER = 'first_visit_reminder'
 
 SYSTEM_JOB_TYPES = (
-    'record_created',
-    'record_updated',
-    'record_canceled',
-) + REMINDER_JOB_TYPES + ('comeback_3d',) + FOLLOWUP_JOB_TYPES
+    REMINDER_24H,
+    REVIEW_3D,
+    REPEAT_10D,
+    COMEBACK_3D,
+    COMEBACK_14D,
+    COMEBACK_30D,
+    REMINDER_2H,
+    FIRST_VISIT_REMINDER,
+)
 
 
-def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def _dedupe_key(
-        job_type: str,
-        record_id: int,
-        run_at: datetime,
-        *,
-        now: datetime | None = None,
+def make_dedupe_key(
+    *,
+    job_type: str,
+    company_id: int,
+    record_id: int,
+    run_at: datetime,
 ) -> str:
-    """
-    Dedupe rules:
-    - record_updated: dedupe внутри окна debounce (bucket), но допускаем
-      новые update-job'ы в следующих окнах.
-    - остальные: dedupe по (job_type, record_id, run_at).
-    """
-    if job_type == 'record_updated':
-        base_dt = now or run_at
-        bucket = int(base_dt.timestamp()) // UPDATE_DEBOUNCE_SEC
-        return f'{job_type}:{record_id}:{bucket}'
-
-    return f'{job_type}:{record_id}:{run_at.isoformat()}'
+    return f'{job_type}:{company_id}:{record_id}:{run_at.isoformat()}'
 
 
 async def cancel_queued_jobs(
-        session: AsyncSession,
-        *,
-        record_id: int,
-        job_types: list[str],
+    session: AsyncSession,
+    *,
+    company_id: int,
+    record_id: int,
 ) -> int:
-    if not job_types:
-        return 0
-
     stmt = (
         update(MessageJob)
+        .where(MessageJob.company_id == company_id)
         .where(MessageJob.record_id == record_id)
-        .where(MessageJob.job_type.in_(job_types))
+        .where(MessageJob.job_type.in_(SYSTEM_JOB_TYPES))
         .where(MessageJob.status == 'queued')
-        .values(
-            status='canceled',
-            updated_at=utcnow(),
-        )
+        .values(status='canceled', updated_at=utcnow())
     )
     res = await session.execute(stmt)
-    return int(getattr(res, 'rowcount', 0) or 0)
+    return int(res.rowcount or 0)
+
+
+async def delete_jobs(
+    session: AsyncSession,
+    *,
+    company_id: int,
+    record_id: int,
+) -> int:
+    stmt = (
+        delete(MessageJob)
+        .where(MessageJob.company_id == company_id)
+        .where(MessageJob.record_id == record_id)
+        .where(MessageJob.job_type.in_(SYSTEM_JOB_TYPES))
+    )
+    res = await session.execute(stmt)
+    return int(res.rowcount or 0)
 
 
 async def enqueue_job(
-        session: AsyncSession,
-        *,
-        company_id: int,
-        record_id: int,
-        client_id: int | None,
-        job_type: str,
-        run_at: datetime,
-        now: datetime | None = None,
+    session: AsyncSession,
+    *,
+    company_id: int,
+    record_id: int,
+    client_id: int,
+    job_type: str,
+    run_at: datetime,
+    payload: dict[str, Any],
 ) -> None:
-    insert_stmt = pg_insert(MessageJob).values(
-        dedupe_key=_dedupe_key(
-            job_type,
-            record_id,
-            run_at,
-            now=now,
-        ),
+    dedupe_key = make_dedupe_key(
+        job_type=job_type,
+        company_id=company_id,
+        record_id=record_id,
+        run_at=run_at,
+    )
+
+    stmt = pg_insert(MessageJob).values(
         company_id=company_id,
         record_id=record_id,
         client_id=client_id,
         job_type=job_type,
         run_at=run_at,
         status='queued',
+        last_error=None,
+        dedupe_key=dedupe_key,
+        payload=payload,
+        locked_at=None,
     )
 
-    excluded = insert_stmt.excluded
-
-    stmt = insert_stmt.on_conflict_do_update(
-        index_elements=['dedupe_key'],
+    stmt = stmt.on_conflict_do_update(
+        index_elements=[MessageJob.dedupe_key],
         set_={
-            'company_id': excluded.company_id,
-            'record_id': excluded.record_id,
-            'client_id': excluded.client_id,
-            'job_type': excluded.job_type,
-            'run_at': excluded.run_at,
             'status': 'queued',
+            'last_error': None,
+            'locked_at': None,
+            'payload': stmt.excluded.payload,
+            'updated_at': utcnow(),
         },
-        where=MessageJob.status == 'canceled',
+        where=MessageJob.status.in_(('canceled', 'failed')),
     )
+
     await session.execute(stmt)
 
 
-async def plan_jobs_for_record_event(
-        session: AsyncSession,
-        *,
-        company_id: int,
-        record_id: int,
-        status: str,
+async def enqueue_followup(
+    session: AsyncSession,
+    *,
+    company_id: int,
+    record_id: int,
+    client_id: int,
+    code: str,
+    run_at: datetime,
 ) -> None:
+    await enqueue_job(
+        session,
+        company_id=company_id,
+        record_id=record_id,
+        client_id=client_id,
+        job_type=code,
+        run_at=run_at,
+        payload={'kind': code},
+    )
+
+
+async def get_template(
+    session: AsyncSession,
+    *,
+    company_id: int,
+    code: str,
+    language: str,
+) -> MessageTemplate | None:
     stmt = (
-        select(Record)
-        .where(Record.company_id == company_id)
-        .where(Record.id == record_id)
+        select(MessageTemplate)
+        .where(MessageTemplate.company_id == company_id)
+        .where(MessageTemplate.code == code)
+        .where(MessageTemplate.language == language)
         .limit(1)
     )
     res = await session.execute(stmt)
-    record = res.scalar_one_or_none()
-    if record is None:
-        return
+    return res.scalar_one_or_none()
 
-    client_id = record.client_id
 
-    opted_out = False
-    if client_id is not None:
-        client = await session.get(Client, client_id)
-        opted_out = bool(getattr(client, 'wa_opted_out', False))
+async def _has_template(
+    session: AsyncSession,
+    *,
+    company_id: int,
+    code: str,
+    language: str,
+) -> bool:
+    return await get_template(
+        session,
+        company_id=company_id,
+        code=code,
+        language=language,
+    ) is not None
 
-    if status == 'create':
-        await add_job(
-            session,
-            company_id=company_id,
-            record_id=record.id,
-            client_id=client_id,
-            job_type='record_created',
-            run_at=utcnow(),
-            payload={'kind': 'record_created'},
-        )
-        await _plan_reminders(session, record=record, client_id=client_id)
-        if not opted_out:
-            await _plan_followups(session, record=record, client_id=client_id)
-        return
 
-    if status == 'update':
-        await cancel_queued_jobs(
-            session,
-            record_id=record.id,
-            job_types=list(SYSTEM_JOB_TYPES),
-        )
-
-        await add_job(
-            session,
-            company_id=company_id,
-            record_id=record.id,
-            client_id=client_id,
-            job_type='record_updated',
-            run_at=utcnow(),
-            payload={'kind': 'record_updated'},
-        )
-        await _plan_reminders(session, record=record, client_id=client_id)
-        if not opted_out:
-            await _plan_followups(session, record=record, client_id=client_id)
-        return
-
-    if status == 'delete':
-        await cancel_queued_jobs(
-            session,
-            record_id=record.id,
-            job_types=list(SYSTEM_JOB_TYPES),
-        )
-
-        await add_job(
-            session,
-            company_id=company_id,
-            record_id=record.id,
-            client_id=client_id,
-            job_type='record_canceled',
-            run_at=utcnow(),
-            payload={'kind': 'record_canceled'},
-        )
-
-        if not opted_out:
-            await add_job(
-                session,
-                company_id=company_id,
-                record_id=record.id,
-                client_id=client_id,
-                job_type='comeback_3d',
-                run_at=utcnow() + timedelta(days=3),
-                payload={'kind': 'comeback_3d'},
-            )
-        return
+async def _should_send_followups(
+    session: AsyncSession,
+    *,
+    company_id: int,
+    client_id: int,
+) -> bool:
+    client = await session.get(Client, client_id)
+    if client is None:
+        return False
+    if client.whatsapp_opt_out:
+        return False
+    return True
 
 
 async def _plan_reminders(
-        session: AsyncSession,
-        *,
-        record: Record,
-        client_id: int | None,
+    session: AsyncSession,
+    *,
+    company_id: int,
+    record: Record,
+    client_id: int,
 ) -> None:
-    now = utcnow()
-
     if record.starts_at is None:
         return
 
-    delta = record.starts_at - now
+    starts_at = record.starts_at
 
-    reminder_at_24h = record.starts_at - timedelta(hours=24)
-    reminder_at_2h = record.starts_at - timedelta(hours=2)
-
-    if delta > timedelta(hours=24):
+    run_at_24h = starts_at - timedelta(hours=24)
+    if run_at_24h > utcnow():
         await add_job(
             session,
-            company_id=record.company_id,
-            record_id=record.id,
+            company_id=company_id,
+            record_id=int(record.id),
             client_id=client_id,
-            job_type='reminder_24h',
-            run_at=reminder_at_24h,
-            payload={'kind': 'reminder_24h'},
+            job_type=REMINDER_24H,
+            run_at=run_at_24h,
+            payload={'kind': REMINDER_24H},
         )
-        return
 
-    if delta > timedelta(hours=2):
+    run_at_2h = starts_at - timedelta(hours=2)
+    if run_at_2h > utcnow():
         await add_job(
             session,
-            company_id=record.company_id,
-            record_id=record.id,
+            company_id=company_id,
+            record_id=int(record.id),
             client_id=client_id,
-            job_type='reminder_2h',
-            run_at=reminder_at_2h,
-            payload={'kind': 'reminder_2h'},
+            job_type=REMINDER_2H,
+            run_at=run_at_2h,
+            payload={'kind': REMINDER_2H},
         )
+
+
+async def _plan_followups(
+    session: AsyncSession,
+    *,
+    company_id: int,
+    record: Record,
+    client_id: int,
+    language: str,
+) -> None:
+    if record.starts_at is None:
         return
+
+    if not await _should_send_followups(
+        session,
+        company_id=company_id,
+        client_id=client_id,
+    ):
+        return
+
+    starts_at = record.starts_at
+
+    review_at = starts_at + timedelta(days=3)
+    if review_at > utcnow():
+        if await _has_template(
+            session,
+            company_id=company_id,
+            code=REVIEW_3D,
+            language=language,
+        ):
+            await enqueue_followup(
+                session,
+                company_id=company_id,
+                record_id=int(record.id),
+                client_id=client_id,
+                code=REVIEW_3D,
+                run_at=review_at,
+            )
+
+    repeat_at = starts_at + timedelta(days=10)
+    if repeat_at > utcnow():
+        if await _has_template(
+            session,
+            company_id=company_id,
+            code=REPEAT_10D,
+            language=language,
+        ):
+            await enqueue_followup(
+                session,
+                company_id=company_id,
+                record_id=int(record.id),
+                client_id=client_id,
+                code=REPEAT_10D,
+                run_at=repeat_at,
+            )
+
+
+async def plan_jobs_for_record_event(
+    session: AsyncSession,
+    *,
+    company_id: int,
+    record_id: int,
+    client_id: int,
+    event_kind: str,
+) -> None:
+    record = await session.get(Record, record_id)
+    if record is None:
+        return
+
+    client = await session.get(Client, client_id)
+    if client is None:
+        return
+
+    language = client.language or 'de'
+
+    if event_kind == 'record_updated':
+        await cancel_queued_jobs(
+            session,
+            company_id=company_id,
+            record_id=record_id,
+        )
+
+    if event_kind in ('record_created', 'record_updated'):
+        if record.is_first_visit:
+            if record.starts_at is not None:
+                first_visit_at = record.starts_at - timedelta(hours=24)
+                if first_visit_at > utcnow():
+                    await add_job(
+                        session,
+                        company_id=company_id,
+                        record_id=record_id,
+                        client_id=client_id,
+                        job_type=FIRST_VISIT_REMINDER,
+                        run_at=first_visit_at,
+                        payload={'kind': FIRST_VISIT_REMINDER},
+                    )
+
+        await _plan_reminders(
+            session,
+            company_id=company_id,
+            record=record,
+            client_id=client_id,
+        )
+
+        await _plan_followups(
+            session,
+            company_id=company_id,
+            record=record,
+            client_id=client_id,
+            language=language,
+        )
 
 
 async def add_job(
-        session: AsyncSession,
-        *,
-        company_id: int,
-        record_id: int,
-        client_id: int | None,
-        job_type: str,
-        run_at: Any,
-        payload: dict[str, Any],
-) -> MessageJob:
-    dedupe_key = f'{job_type}:{company_id}:{record_id}:{run_at}'
+    session: AsyncSession,
+    *,
+    company_id: int,
+    record_id: int,
+    client_id: int,
+    job_type: str,
+    run_at: datetime,
+    payload: dict[str, Any],
+) -> None:
+    '''Create a job idempotently.
 
-    job = MessageJob(
+    Inbox/outbox workers can receive duplicates (retries, webhook repeats, etc).
+    We keep `dedupe_key` as a unique constraint and use UPSERT to avoid worker
+    crashes on IntegrityError.
+
+    If the job already exists and was previously canceled/failed, we re-queue
+    it (same dedupe_key means the schedule is the same).
+    '''
+    dedupe_key = make_dedupe_key(
+        job_type=job_type,
+        company_id=company_id,
+        record_id=record_id,
+        run_at=run_at,
+    )
+
+    stmt = pg_insert(MessageJob).values(
         company_id=company_id,
         record_id=record_id,
         client_id=client_id,
         job_type=job_type,
         run_at=run_at,
         status='queued',
+        last_error=None,
         dedupe_key=dedupe_key,
         payload=payload,
-    )
-    session.add(job)
-    return job
-
-
-async def _plan_followups(
-        session: AsyncSession,
-        *,
-        record: Record,
-        client_id: int | None,
-) -> None:
-    if record.starts_at is None:
-        return
-
-    await add_job(
-        session,
-        company_id=record.company_id,
-        record_id=record.id,
-        client_id=client_id,
-        job_type='review_3d',
-        run_at=record.starts_at + timedelta(days=REVIEW_REQUEST_DAYS),
-        payload={'kind': 'review_3d'},
+        locked_at=None,
     )
 
-    await add_job(
-        session,
-        company_id=record.company_id,
-        record_id=record.id,
-        client_id=client_id,
-        job_type='repeat_10d',
-        run_at=record.starts_at + timedelta(days=FOLLOWUP_REPEAT_DAYS),
-        payload={'kind': 'repeat_10d'},
+    stmt = stmt.on_conflict_do_update(
+        index_elements=[MessageJob.dedupe_key],
+        set_={
+            'status': 'queued',
+            'last_error': None,
+            'locked_at': None,
+            'payload': stmt.excluded.payload,
+            'updated_at': utcnow(),
+        },
+        where=MessageJob.status.in_(('canceled', 'failed')),
     )
+
+    await session.execute(stmt)
