@@ -108,10 +108,27 @@ class Client(Base):
         index=True,
         nullable=True,
     )
-    display_name: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    display_name: Mapped[str | None] = mapped_column(String(256),
+                                                     nullable=True)
     email: Mapped[str | None] = mapped_column(String(256), nullable=True)
 
     raw: Mapped[dict] = mapped_column(JSONB, default=dict)
+
+    wa_opted_out: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default=text('false'),
+        index=True,
+    )
+    wa_opted_out_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    wa_opt_out_reason: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
 
     records: Mapped[list["Record"]] = relationship(back_populates="client")
 
@@ -175,7 +192,8 @@ class Record(Base):
 
     confirmed: Mapped[int | None] = mapped_column(Integer, nullable=True)
     attendance: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    visit_attendance: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    visit_attendance: Mapped[int | None] = mapped_column(Integer,
+                                                         nullable=True)
 
     is_deleted: Mapped[bool] = mapped_column(
         Boolean,
@@ -329,7 +347,7 @@ class MessageJob(Base):
         server_default=func.now(),
         onupdate=func.now(),
     )
-    
+
     locked_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
         nullable=True,
@@ -374,7 +392,8 @@ class OutboxMessage(Base):
     body: Mapped[str] = mapped_column(Text)
 
     # queued/sending/sent/delivered/read/failed
-    status: Mapped[str] = mapped_column(String(32), default="queued", index=True)
+    status: Mapped[str] = mapped_column(String(32), default="queued",
+                                        index=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     provider_message_id: Mapped[str | None] = mapped_column(
@@ -434,7 +453,8 @@ class WhatsAppSender(Base):
     sender_code: Mapped[str] = mapped_column(String(32), index=True)
 
     phone_number_id: Mapped[str] = mapped_column(String(64))
-    display_phone: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    display_phone: Mapped[str | None] = mapped_column(String(32),
+                                                      nullable=True)
 
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
 
