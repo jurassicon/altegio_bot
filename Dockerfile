@@ -2,17 +2,22 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
 RUN pip install --no-cache-dir uv
 
 COPY pyproject.toml uv.lock /app/
-RUN uv sync --frozen
 
-COPY alembic /app/alembic
+# Важно: не устанавливаем сам проект на этом слое (src ещё не скопирован)!!
+RUN uv sync --frozen --no-install-project
+
 COPY alembic.ini /app/
+COPY alembic /app/alembic
 COPY src /app/src
 
 ENV PYTHONPATH=/app/src
 
 EXPOSE 8000
 
-CMD ["uv", "run", "--env-file", ".env", "uvicorn", "altegio_bot.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "altegio_bot.main:app", "--host", "0.0.0.0", "--port", "8000"]
