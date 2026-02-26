@@ -19,4 +19,4 @@ ENV PATH=/app/.venv/bin:$PATH
 
 EXPOSE 8000
 
-CMD ['/app/.venv/bin/uvicorn', 'altegio_bot.main:app', '--host', '0.0.0.0', '--port', '8000']
+CMD ["/app/.venv/bin/uvicorn", "altegio_bot.main:app", "--host", "0.0.0.0", "--port", "8000"]

@@ -37,6 +37,30 @@ async def client(monkeypatch) -> AsyncGenerator[AsyncClient, None]:
 
 
 # ---------------------------------------------------------------------------
+# Smoke test – verifies the app imports and starts (catches missing deps)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_health_endpoint_responds(client: AsyncClient) -> None:
+    """GET /health must return 200 without any auth or DB.
+
+    This test doubles as a startup smoke test: if a required dependency
+    (e.g. python-multipart) is missing, FastAPI raises RuntimeError when
+    the application module is loaded, and this test fails at collection time.
+    """
+    response = await client.get('/health')
+    assert response.status_code == 200
+    assert response.json() == {'ok': True}
+
+
+@pytest.mark.asyncio
+async def test_ops_login_page_reachable(client: AsyncClient) -> None:
+    """GET /ops/login must return 200 without authentication."""
+    response = await client.get('/ops/login', headers={'accept': 'text/html'})
+    assert response.status_code == 200
+
+
+# ---------------------------------------------------------------------------
 # Session token unit tests (no HTTP)
 # ---------------------------------------------------------------------------
 
