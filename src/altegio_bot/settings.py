@@ -28,6 +28,9 @@ class Settings(BaseSettings):
 
     whatsapp_webhook_verify_token: str = ''
 
+    whatsapp_allowed_phone_number_ids: str = ''
+    meta_app_secret: str = ''
+
     altegio_api_base_url: str = 'https://api.alteg.io/api/v1'
     altegio_api_accept: str = 'application/vnd.api.v2+json'
     altegio_partner_token: str = ''
