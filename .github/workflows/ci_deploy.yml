@@ -1,4 +1,4 @@
-name: CI + Deploy
+name: CI / Deploy
 
 on:
   push:
@@ -13,7 +13,6 @@ concurrency:
 jobs:
   tests:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
 
     services:
       postgres:
@@ -23,12 +22,12 @@ jobs:
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: altegio_bot_test
         ports:
-          - 5433:5432
+          - 5432/tcp
         options: >-
-          --health-cmd pg_isready -U postgres -d altegio_bot_test
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 10
+          --health-cmd="pg_isready -U postgres -d altegio_bot_test"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
 
     steps:
       - name: Checkout
@@ -42,30 +41,47 @@ jobs:
       - name: Install uv
         run: python -m pip install --upgrade pip uv
 
-      - name: Cache uv
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cache/uv
-            .venv
-          key: ${{ runner.os }}-py312-uv-${{ hashFiles('uv.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-py312-uv-
-
       - name: Install deps
         run: uv sync --frozen
 
+      - name: Export DATABASE_URL (service dynamic port)
+        run: |
+          echo 'PG_PORT=${{ job.services.postgres.ports[5432] }}' >> "$GITHUB_ENV"
+          echo 'DATABASE_URL=postgresql+asyncpg://postgres:postgres@127.0.0.1:${{ job.services.postgres.ports[5432] }}/altegio_bot_test' >> "$GITHUB_ENV"
+
+      - name: Wait for Postgres
+        run: |
+          uv run python - <<'PY'
+          import asyncio
+          import os
+
+          import asyncpg
+
+          async def main() -> None:
+              dsn = os.environ['DATABASE_URL']
+              for _ in range(60):
+                  try:
+                      conn = await asyncpg.connect(dsn, timeout=3)
+                      await conn.close()
+                      print('Postgres is ready')
+                      return
+                  except Exception:
+                      await asyncio.sleep(1)
+
+              raise SystemExit('Postgres did not become ready in time')
+
+          asyncio.run(main())
+          PY
+
       - name: Run tests
         env:
-          DATABASE_URL: 'postgresql+asyncpg://postgres:postgres@localhost:5433/altegio_bot_test'
           ALTEGIO_WEBHOOK_SECRET: 'test-secret'
         run: uv run pytest -q
 
   deploy:
     needs: tests
-    runs-on: ubuntu-latest
-    timeout-minutes: 25
     if: needs.tests.result == 'success'
+    runs-on: ubuntu-latest
 
     steps:
       - name: Deploy to server via SSH
@@ -80,51 +96,27 @@ jobs:
 
             cd /opt/altegio_bot
 
-            echo '== Update code =='
             git fetch origin main
             git reset --hard origin/main
 
-            echo '== Build image =='
             docker build -t altegio-bot:latest .
 
             IMG='altegio-bot:latest'
             ENV_FILE='/opt/altegio_bot/.env'
             NET='altegio-net'
 
-            if [ ! -f "${ENV_FILE}" ]; then
-              echo "ERROR: env file not found: ${ENV_FILE}" >&2
-              exit 1
-            fi
+            test -f "${ENV_FILE}" || { echo "ERROR: env file not found: ${ENV_FILE}" >&2; exit 1; }
 
-            DB_URL="$(grep -E '^DATABASE_URL=' "${ENV_FILE}" | head -n 1 | cut -d= -f2- || true)"
-            if [ -z "${DB_URL}" ]; then
-              echo 'ERROR: DATABASE_URL is missing in .env' >&2
-              exit 1
-            fi
-            if echo "${DB_URL}" | grep -Eq '@(localhost|127\.0\.0\.1)'; then
-              echo 'ERROR: DATABASE_URL points to localhost.' >&2
-              echo 'Use a docker hostname, e.g. altegio-postgres.' >&2
-              exit 1
-            fi
-
-            echo '== Network =='
             docker network inspect "${NET}" >/dev/null 2>&1 || docker network create "${NET}"
             docker network connect "${NET}" altegio-postgres 2>/dev/null || true
 
-            echo '== Alembic migrate =='
             docker run --rm \
               --network "${NET}" \
               -v "${ENV_FILE}:/app/.env:ro" \
               "${IMG}" \
-              /app/.venv/bin/alembic upgrade head
+              sh -c 'set -a; . /app/.env; set +a; /app/.venv/bin/alembic upgrade head'
 
-            echo '== Restart containers =='
-            docker rm -f \
-              altegio-api \
-              altegio-inbox-worker \
-              altegio-outbox-worker \
-              altegio-whatsapp-inbox-worker \
-              2>/dev/null || true
+            docker rm -f altegio-api altegio-inbox-worker altegio-outbox-worker altegio-whatsapp-inbox-worker 2>/dev/null || true
 
             docker run -d \
               --name altegio-api \
@@ -141,7 +133,7 @@ jobs:
               --network "${NET}" \
               -v "${ENV_FILE}:/app/.env:ro" \
               "${IMG}" \
-              /app/.venv/bin/python -m altegio_bot.scripts.run_outbox_worker
+              sh -c 'set -a; . /app/.env; set +a; /app/.venv/bin/python -m altegio_bot.workers.outbox_worker'
 
             docker run -d \
               --name altegio-inbox-worker \
@@ -149,7 +141,7 @@ jobs:
               --network "${NET}" \
               -v "${ENV_FILE}:/app/.env:ro" \
               "${IMG}" \
-              /app/.venv/bin/python -m altegio_bot.scripts.run_inbox_worker
+              sh -c 'set -a; . /app/.env; set +a; /app/.venv/bin/python -m altegio_bot.workers.inbox_worker'
 
             docker run -d \
               --name altegio-whatsapp-inbox-worker \
@@ -157,9 +149,10 @@ jobs:
               --network "${NET}" \
               -v "${ENV_FILE}:/app/.env:ro" \
               "${IMG}" \
-              /app/.venv/bin/python -m altegio_bot.scripts.run_whatsapp_inbox_worker
+              sh -c 'set -a; . /app/.env; set +a; /app/.venv/bin/python -m altegio_bot.scripts.run_whatsapp_inbox_worker'
 
-            echo '== Cleanup =='
+            docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}'
+
             docker container prune -f
             docker image prune -f
 
@@ -175,7 +168,7 @@ jobs:
           to: ${{ secrets.TELEGRAM_TO }}
           token: ${{ secrets.TELEGRAM_TOKEN }}
           message: |
-            🤖 AltegioBot CI/Deploy report
+            🤖 AltegioBot CI / Deploy report
 
             Branch: ${{ github.ref_name }}
             Commit: ${{ github.sha }}
