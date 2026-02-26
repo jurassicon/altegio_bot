@@ -77,7 +77,7 @@ def test_outbox_skips_marketing_when_opted_out(monkeypatch: Any) -> None:
     monkeypatch.setattr(ow, 'safe_send', fake_safe_send)
 
     session = FakeSession()
-    run(ow.process_job_in_session(session, 1, provider=object()))  # type: ignore
+    run(ow.process_job_in_session(session, 1, provider=object()))
 
     assert job.status == 'canceled'
     assert job.last_error == 'Skipped: client unsubscribed'
