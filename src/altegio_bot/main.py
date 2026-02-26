@@ -9,11 +9,13 @@ from sqlalchemy.exc import IntegrityError
 
 from .db import SessionLocal
 from .models import AltegioEvent
+from .ops.router import router as ops_router
 from .settings import settings
 from .webhooks.whatsapp import router as whatsapp_router
 
 app = FastAPI(title=settings.app_name)
 app.include_router(whatsapp_router)
+app.include_router(ops_router)
 
 
 def _safe_headers(request: Request) -> dict[str, str]:

@@ -36,5 +36,22 @@ class Settings(BaseSettings):
     altegio_partner_token: str = ''
     altegio_user_token: str = ''
 
+    # Ops-cabinet access
+    ops_token: str = ''
+    ops_user: str = ''
+    ops_pass: str = ''
+
+    # marketing_only | all
+    wa_optout_policy: str = 'marketing_only'
+
+    # Minutes after which a "processing" job is considered stuck
+    ops_stuck_minutes: int = 15
+
+    # Warn if failed outbox messages in 24h exceed this number
+    ops_failed_warning_threshold: int = 10
+
+    # Local timezone for display (IANA name)
+    ops_local_tz: str = 'Europe/Berlin'
+
 
 settings = Settings()
