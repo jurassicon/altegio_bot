@@ -21,13 +21,15 @@ jobs:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: altegio_bot_test
-        ports:
-          - 5432/tcp
         options: >-
           --health-cmd="pg_isready -U postgres -d altegio_bot_test"
           --health-interval=10s
           --health-timeout=5s
           --health-retries=10
+
+    env:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/altegio_bot_test
+      ALTEGIO_WEBHOOK_SECRET: test-secret
 
     steps:
       - name: Checkout
@@ -44,11 +46,6 @@ jobs:
       - name: Install deps
         run: uv sync --frozen
 
-      - name: Export DATABASE_URL (service dynamic port)
-        run: |
-          echo 'PG_PORT=${{ job.services.postgres.ports[5432] }}' >> "$GITHUB_ENV"
-          echo 'DATABASE_URL=postgresql+asyncpg://postgres:postgres@127.0.0.1:${{ job.services.postgres.ports[5432] }}/altegio_bot_test' >> "$GITHUB_ENV"
-
       - name: Wait for Postgres
         run: |
           uv run python - <<'PY'
@@ -56,6 +53,7 @@ jobs:
           import os
 
           import asyncpg
+
 
           async def main() -> None:
               dsn = os.environ['DATABASE_URL']
@@ -70,12 +68,11 @@ jobs:
 
               raise SystemExit('Postgres did not become ready in time')
 
+
           asyncio.run(main())
           PY
 
       - name: Run tests
-        env:
-          ALTEGIO_WEBHOOK_SECRET: 'test-secret'
         run: uv run pytest -q
 
   deploy:
@@ -105,7 +102,10 @@ jobs:
             ENV_FILE='/opt/altegio_bot/.env'
             NET='altegio-net'
 
-            test -f "${ENV_FILE}" || { echo "ERROR: env file not found: ${ENV_FILE}" >&2; exit 1; }
+            test -f "${ENV_FILE}" || {
+              echo "ERROR: env file not found: ${ENV_FILE}" >&2
+              exit 1
+            }
 
             docker network inspect "${NET}" >/dev/null 2>&1 || docker network create "${NET}"
             docker network connect "${NET}" altegio-postgres 2>/dev/null || true
@@ -116,13 +116,18 @@ jobs:
               "${IMG}" \
               sh -c 'set -a; . /app/.env; set +a; /app/.venv/bin/alembic upgrade head'
 
-            docker rm -f altegio-api altegio-inbox-worker altegio-outbox-worker altegio-whatsapp-inbox-worker 2>/dev/null || true
+            docker rm -f \
+              altegio-api \
+              altegio-inbox-worker \
+              altegio-outbox-worker \
+              altegio-whatsapp-inbox-worker \
+              2>/dev/null || true
 
             docker run -d \
               --name altegio-api \
               --restart unless-stopped \
               --network "${NET}" \
-              -p 8000:8000 \
+              -p 127.0.0.1:8000:8000 \
               -v "${ENV_FILE}:/app/.env:ro" \
               "${IMG}" \
               /app/.venv/bin/uvicorn altegio_bot.main:app --host 0.0.0.0 --port 8000
@@ -175,5 +180,7 @@ jobs:
 
             Tests: ${{ needs.tests.result }}
             Deploy: ${{ needs.deploy.result }}
+
+            Overall: ${{ (needs.tests.result == 'success' && needs.deploy.result == 'success') && 'success' || 'check' }}
 
             Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
