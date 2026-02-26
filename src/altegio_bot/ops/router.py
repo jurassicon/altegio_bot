@@ -244,7 +244,7 @@ def _safe_identifier(value: str) -> bool:
     return bool(_SAFE_IDENTIFIER_RE.match(value))
 
 
-
+def _period_params(request: Request) -> tuple[datetime, datetime]:
     """Return (from_dt, to_dt) UTC based on ?period= / ?from_dt= / ?to_dt=."""
     now = datetime.now(timezone.utc)
     period = request.query_params.get('period', '24h')
