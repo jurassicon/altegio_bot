@@ -293,7 +293,7 @@ async def plan_jobs_for_record_event(
                 )
 
     if norm_status == 'delete' and not opted_out:
-        comeback_at = utcnow().replace(microsecond=0) + timedelta(days=3)
+        comeback_at = utcnow() + timedelta(days=3)
         await add_job(
             session,
             company_id=cid,
