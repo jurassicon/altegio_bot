@@ -9,6 +9,7 @@ from httpx import ASGITransport, AsyncClient
 
 import altegio_bot.ops.router as ops_router_module
 from altegio_bot.main import app
+from altegio_bot.ops.auth import require_ops_auth
 
 
 @pytest_asyncio.fixture
@@ -17,6 +18,7 @@ async def http_client(
 ) -> AsyncGenerator[AsyncClient, None]:
     """AsyncClient wired to the ASGI app with a test DB session."""
     monkeypatch.setattr(ops_router_module, 'SessionLocal', session_maker)
+    monkeypatch.setitem(app.dependency_overrides, require_ops_auth, lambda: None)
     async with AsyncClient(
         transport=ASGITransport(app=app), base_url='http://test'
     ) as client:
