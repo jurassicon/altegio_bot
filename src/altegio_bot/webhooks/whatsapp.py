@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import logging
 from typing import Any
@@ -25,6 +26,53 @@ def _payload_dedupe_key(payload: dict[str, Any]) -> str:
     return f'wa:{digest}'
 
 
+def _extract_phone_number_id(payload: dict[str, Any]) -> str | None:
+    try:
+        entry0 = (payload.get('entry') or [])[0]
+        changes0 = (entry0.get('changes') or [])[0]
+        value = changes0.get('value') or {}
+        metadata = value.get('metadata') or {}
+        pni = metadata.get('phone_number_id')
+        if pni is None:
+            return None
+        return str(pni)
+    except Exception:
+        return None
+
+
+def _parse_allowed_phone_number_ids() -> set[str]:
+    raw = getattr(settings, 'whatsapp_allowed_phone_number_ids', '')
+    ids: list[str] = []
+
+    if raw:
+        ids = [x.strip() for x in str(raw).split(',')]
+        ids = [x for x in ids if x]
+
+    if not ids and settings.meta_wa_phone_number_id:
+        ids = [str(settings.meta_wa_phone_number_id).strip()]
+
+    return {x for x in ids if x}
+
+
+def _verify_signature(
+    *,
+    body: bytes,
+    signature_header: str | None,
+    app_secret: str,
+) -> bool:
+    if not signature_header:
+        return False
+
+    if not signature_header.startswith('sha256='):
+        return False
+
+    received = signature_header.split('=', 1)[1].strip()
+    mac = hmac.new(app_secret.encode('utf-8'), body, hashlib.sha256)
+    expected = mac.hexdigest()
+
+    return hmac.compare_digest(received, expected)
+
+
 @router.get('/webhook/whatsapp')
 async def whatsapp_verify(request: Request) -> Response:
     qp = request.query_params
@@ -43,19 +91,52 @@ async def whatsapp_verify(request: Request) -> Response:
 
 @router.post('/webhook/whatsapp')
 async def whatsapp_ingest(request: Request) -> Response:
-    payload = await request.json()
+    body = await request.body()
 
-    dedupe_key = _payload_dedupe_key(payload)
+    try:
+        payload: dict[str, Any] = json.loads(body.decode('utf-8'))
+    except Exception:
+        raise HTTPException(status_code=400, detail='Invalid JSON')
+
     query = dict(request.query_params)
     headers = dict(request.headers)
+
+    app_secret = getattr(settings, 'meta_app_secret', '')
+    if app_secret:
+        sig = (
+            request.headers.get('x-hub-signature-256')
+            or request.headers.get('X-Hub-Signature-256')
+        )
+        if not _verify_signature(
+            body=body,
+            signature_header=sig,
+            app_secret=app_secret,
+        ):
+            logger.warning('Webhook signature mismatch')
+            raise HTTPException(status_code=403, detail='Bad signature')
+
+    pni = _extract_phone_number_id(payload)
+    allowed = _parse_allowed_phone_number_ids()
+
+    status = 'received'
+    error: str | None = None
+    ignored = False
+
+    if pni is not None and allowed and pni not in allowed:
+        status = 'ignored'
+        ignored = True
+        error = f'Ignored: phone_number_id not allowed ({pni})'
+        logger.info('Ignored webhook event phone_number_id=%s', pni)
+
+    dedupe_key = _payload_dedupe_key(payload)
 
     async with SessionLocal() as session:
         try:
             async with session.begin():
                 evt = WhatsAppEvent(
                     dedupe_key=dedupe_key,
-                    status='received',
-                    error=None,
+                    status=status,
+                    error=error,
                     query=query,
                     headers=headers,
                     payload=payload,
@@ -67,8 +148,10 @@ async def whatsapp_ingest(request: Request) -> Response:
                 {
                     'ok': True,
                     'duplicate': False,
+                    'ignored': ignored,
                     'id': evt.id,
                     'dedupe_key': dedupe_key,
+                    'phone_number_id': pni,
                 }
             )
 
@@ -87,7 +170,9 @@ async def whatsapp_ingest(request: Request) -> Response:
                 {
                     'ok': True,
                     'duplicate': True,
+                    'ignored': ignored,
                     'id': existing_id,
                     'dedupe_key': dedupe_key,
+                    'phone_number_id': pni,
                 }
             )
