@@ -30,7 +30,7 @@ async def test_create_schedules_created_now(session_maker):
                 session,
                 company_id=record.company_id,
                 record_id=record.id,
-                status='create',
+                event_status='create',
             )
 
         jobs = (
@@ -69,7 +69,7 @@ async def test_create_schedules_reminder_24h_only_when_more_than_24h_left(
                 session,
                 company_id=record.company_id,
                 record_id=record.id,
-                status='create',
+                event_status='create',
             )
 
         jobs = (
@@ -112,7 +112,7 @@ async def test_create_schedules_reminder_2h_only_when_2h_to_24h_left(
                 session,
                 company_id=record.company_id,
                 record_id=record.id,
-                status='create',
+                event_status='create',
             )
 
         jobs = (
@@ -153,7 +153,7 @@ async def test_update_reschedules_system_jobs(session_maker):
                 session,
                 company_id=record.company_id,
                 record_id=record.id,
-                status='create',
+                event_status='create',
             )
 
         async with session.begin():
@@ -162,7 +162,7 @@ async def test_update_reschedules_system_jobs(session_maker):
                 session,
                 company_id=record.company_id,
                 record_id=record.id,
-                status='update',
+                event_status='update',
             )
 
         jobs = (
@@ -211,7 +211,7 @@ async def test_delete_cancels_future_jobs_and_schedules_canceled_and_comeback(
                 session,
                 company_id=record.company_id,
                 record_id=record.id,
-                status='create',
+                event_status='create',
             )
 
         async with session.begin():
@@ -219,7 +219,7 @@ async def test_delete_cancels_future_jobs_and_schedules_canceled_and_comeback(
                 session,
                 company_id=record.company_id,
                 record_id=record.id,
-                status='delete',
+                event_status='delete',
             )
 
         jobs = (

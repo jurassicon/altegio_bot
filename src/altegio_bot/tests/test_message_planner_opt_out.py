@@ -34,7 +34,7 @@ async def test_opted_out_client_does_not_get_followups(session_maker) -> None:
                 session,
                 company_id=record.company_id,
                 record_id=record.id,
-                status='create',
+                event_status='create',
             )
 
         jobs = (
