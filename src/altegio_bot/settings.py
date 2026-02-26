@@ -40,6 +40,8 @@ class Settings(BaseSettings):
     ops_token: str = ''
     ops_user: str = ''
     ops_pass: str = ''
+    # Secret used to sign session cookies. Falls back to ops_pass when not set.
+    ops_secret: str = ''
 
     # marketing_only | all
     wa_optout_policy: str = 'marketing_only'

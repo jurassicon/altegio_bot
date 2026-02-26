@@ -1,24 +1,35 @@
 """Ops-cabinet router – read-only HTML dashboard.
 
-All routes are protected by require_ops_auth dependency.
+All routes on `router` are protected by require_ops_auth.
+`login_router` is public (login / logout pages).
 """
 from __future__ import annotations
 
 import json
+import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Depends, Request
-from fastapi.responses import HTMLResponse
+from fastapi import APIRouter, Depends, Form, Request
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from sqlalchemy import text
 
 from altegio_bot.db import SessionLocal
 from altegio_bot.settings import settings
 
-from .auth import require_ops_auth
+from .auth import (
+    SESSION_COOKIE,
+    SESSION_MAX_AGE,
+    check_session_token,
+    make_session_token,
+    require_ops_auth,
+)
 
 router = APIRouter(prefix='/ops', dependencies=[Depends(require_ops_auth)])
+
+# Public router – no auth dependency (login / logout)
+login_router = APIRouter(prefix='/ops')
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -131,6 +142,9 @@ _NAV = """
           <a class="nav-link" href="/ops/optouts">🚫 Opt-outs</a>
         </li>
       </ul>
+      <form method="post" action="/ops/logout" class="d-flex">
+        <button type="submit" class="btn btn-outline-light btn-sm">Logout</button>
+      </form>
     </div>
   </div>
 </nav>
@@ -1509,3 +1523,107 @@ async def ops_index() -> HTMLResponse:
         status_code=302,
         headers={'Location': '/ops/monitoring'},
     )
+
+
+# ---------------------------------------------------------------------------
+# /ops/login  /ops/logout  (public – no auth dependency)
+# ---------------------------------------------------------------------------
+
+def _login_page(error: str = '') -> str:
+    error_html = (
+        f'<div class="alert alert-danger mt-3">{_esc(error)}</div>'
+        if error else ''
+    )
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ops Login</title>
+  <link rel="stylesheet"
+    href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css"
+    integrity="sha384-QWTKZyjpPEjISv5WaRU9OFeRpok6YctnYmDr5pNlyT2bRjXh0JMhjY6hW+ALEwIH"
+    crossorigin="anonymous">
+</head>
+<body class="bg-light d-flex justify-content-center align-items-center min-vh-100">
+  <div class="card shadow-sm p-4" style="min-width:320px">
+    <h5 class="card-title mb-3 text-center">🤖 Ops Login</h5>
+    {error_html}
+    <form method="post" action="/ops/login">
+      <div class="mb-3">
+        <label class="form-label">Username</label>
+        <input type="text" name="username" class="form-control"
+               autocomplete="username" required autofocus>
+      </div>
+      <div class="mb-3">
+        <label class="form-label">Password</label>
+        <input type="password" name="password" class="form-control"
+               autocomplete="current-password" required>
+      </div>
+      <button type="submit" class="btn btn-primary w-100">Login</button>
+    </form>
+  </div>
+</body>
+</html>"""
+
+
+@login_router.get('/login', response_class=HTMLResponse)
+async def ops_login_get(request: Request) -> Response:
+    ops_user = settings.ops_user
+    ops_pass = settings.ops_pass
+    signing_key = settings.ops_secret or ops_pass
+    # If already authenticated via session cookie, skip the login page
+    if ops_user:
+        session = request.cookies.get(SESSION_COOKIE, '')
+        if session and check_session_token(session, ops_user, signing_key):
+            return RedirectResponse('/ops/monitoring', status_code=302)
+    return HTMLResponse(_login_page())
+
+
+@login_router.post('/login', response_class=HTMLResponse)
+async def ops_login_post(
+    request: Request,
+    username: str = Form(...),
+    password: str = Form(...),
+) -> Response:
+    import posixpath
+
+    ops_user = settings.ops_user
+    ops_pass = settings.ops_pass
+    signing_key = settings.ops_secret or ops_pass
+
+    next_url = request.query_params.get('next', '/ops/monitoring')
+    # Prevent open-redirect: normalise and allow only /ops/* paths
+    next_url = posixpath.normpath(next_url)
+    if not next_url.startswith('/ops/'):
+        next_url = '/ops/monitoring'
+
+    valid = bool(
+        ops_user
+        and secrets.compare_digest(username.encode(), ops_user.encode())
+        and secrets.compare_digest(password.encode(), ops_pass.encode())
+    )
+
+    if not valid:
+        return HTMLResponse(
+            _login_page(error='Invalid username or password'), status_code=401
+        )
+
+    token = make_session_token(ops_user, signing_key)
+    response: Response = RedirectResponse(next_url, status_code=303)
+    response.set_cookie(
+        SESSION_COOKIE,
+        token,
+        max_age=SESSION_MAX_AGE,
+        httponly=True,
+        samesite='lax',
+        secure=settings.env != 'dev',
+    )
+    return response
+
+
+@login_router.post('/logout')
+async def ops_logout() -> Response:
+    response: Response = RedirectResponse('/ops/login', status_code=303)
+    response.delete_cookie(SESSION_COOKIE)
+    return response
