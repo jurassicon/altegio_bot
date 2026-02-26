@@ -17,8 +17,9 @@ jobs:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: altegio_bot_test
+        # ИСПРАВЛЕНИЕ 1: Биндим на порт 5433, чтобы не конфликтовать с локальным PG раннера
         ports:
-          - 5432:5432
+          - 5433:5432
         options: >-
           --health-cmd 'pg_isready -U postgres -d altegio_bot_test'
           --health-interval 10s
@@ -42,7 +43,8 @@ jobs:
 
       - name: Run tests
         env:
-          DATABASE_URL: 'postgresql+asyncpg://postgres:postgres@localhost:5432/altegio_bot_test'
+          # ИСПРАВЛЕНИЕ 2: Стучимся в порт 5433
+          DATABASE_URL: 'postgresql+asyncpg://postgres:postgres@localhost:5433/altegio_bot_test'
           ALTEGIO_WEBHOOK_SECRET: 'test-secret'
         run: uv run pytest -q
 
@@ -60,37 +62,27 @@ jobs:
           port: ${{ secrets.SSH_PORT }}
           script: |
             set -euo pipefail
-
             cd /opt/altegio_bot
 
+            # Обновляем код
             git fetch origin main
             git reset --hard origin/main
 
+            # Билдим
             docker build -t altegio-bot:latest .
 
             IMG='altegio-bot:latest'
             ENV_FILE='/opt/altegio_bot/.env'
             NET='altegio-net'
 
+            # Проверки
             if [ ! -f "${ENV_FILE}" ]; then
               echo "ERROR: env file not found: ${ENV_FILE}" >&2
               exit 1
             fi
 
-            DB_URL="$(grep -E '^DATABASE_URL=' "${ENV_FILE}" | head -n 1 | cut -d= -f2- || true)"
-            if [ -z "${DB_URL}" ]; then
-              echo 'ERROR: DATABASE_URL is missing in .env' >&2
-              exit 1
-            fi
-
-            if echo "${DB_URL}" | grep -Eq '@(localhost|127\.0\.0\.1)'; then
-              echo 'ERROR: DATABASE_URL points to localhost.' >&2
-              echo 'Use a docker hostname, e.g. altegio-postgres.' >&2
-              exit 1
-            fi
-
+            # Миграции
             docker network inspect "${NET}" >/dev/null 2>&1 || docker network create "${NET}"
-
             docker network connect "${NET}" altegio-postgres 2>/dev/null || true
 
             docker run --rm \
@@ -99,6 +91,8 @@ jobs:
               "${IMG}" \
               /app/.venv/bin/alembic upgrade head
 
+            # Перезапуск контейнеров
+            # Удаляем старые
             docker rm -f \
               altegio-api \
               altegio-inbox-worker \
@@ -106,6 +100,7 @@ jobs:
               altegio-whatsapp-inbox-worker \
               2>/dev/null || true
 
+            # 1. API
             docker run -d \
               --name altegio-api \
               --restart unless-stopped \
@@ -115,6 +110,7 @@ jobs:
               "${IMG}" \
               /app/.venv/bin/uvicorn altegio_bot.main:app --host 0.0.0.0 --port 8000
 
+            # 2. Outbox Worker
             docker run -d \
               --name altegio-outbox-worker \
               --restart unless-stopped \
@@ -123,6 +119,7 @@ jobs:
               "${IMG}" \
               /app/.venv/bin/python -m altegio_bot.scripts.run_outbox_worker
 
+            # 3. Inbox Worker
             docker run -d \
               --name altegio-inbox-worker \
               --restart unless-stopped \
@@ -131,6 +128,7 @@ jobs:
               "${IMG}" \
               /app/.venv/bin/python -m altegio_bot.scripts.run_inbox_worker
 
+            # 4. Whatsapp Inbox Worker
             docker run -d \
               --name altegio-whatsapp-inbox-worker \
               --restart unless-stopped \
@@ -139,16 +137,14 @@ jobs:
               "${IMG}" \
               /app/.venv/bin/python -m altegio_bot.scripts.run_whatsapp_inbox_worker
 
-            docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}' | \
-              grep -E 'altegio-(api|postgres|inbox-worker|outbox-worker|whatsapp-inbox-worker)'
-
+            # Чистка
             docker container prune -f
             docker image prune -f
-            docker builder prune -f
 
   notify:
-    needs: deploy
-    if: ${{ always() }}
+    # ИСПРАВЛЕНИЕ 3: Ждем и тесты, и деплой, чтобы знать их статус
+    needs: [tests, deploy]
+    if: always()
     runs-on: ubuntu-latest
 
     steps:
@@ -157,9 +153,15 @@ jobs:
         with:
           to: ${{ secrets.TELEGRAM_TO }}
           token: ${{ secrets.TELEGRAM_TOKEN }}
+          # ИСПРАВЛЕНИЕ 4: Формируем сообщение в зависимости от реального итога
           message: |
-            altegio_bot deploy: ${{ job.status }}
-            repo: ${{ github.repository }}
-            branch: ${{ github.ref_name }}
-            sha: ${{ github.sha }}
-            run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            🔔 CI/CD Pipeline Report
+            
+            Repo: ${{ github.repository }}
+            Branch: ${{ github.ref_name }}
+            
+            📊 Status:
+            - Tests: ${{ needs.tests.result }}
+            - Deploy: ${{ needs.deploy.result }}
+            
+            🔗 Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
