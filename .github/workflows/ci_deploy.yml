@@ -25,7 +25,7 @@ jobs:
           --health-cmd="pg_isready -U postgres -d altegio_bot_test"
           --health-interval=10s
           --health-timeout=5s
-          --health-retries=10
+          --health-retries=20
 
     env:
       DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/altegio_bot_test
@@ -55,18 +55,32 @@ jobs:
           import asyncpg
 
 
+          def to_asyncpg_dsn(sqlalchemy_dsn: str) -> str:
+              dsn = sqlalchemy_dsn.strip().strip('"').strip("'")
+              if dsn.startswith('postgresql+asyncpg://'):
+                  return 'postgresql://' + dsn.split('://', 1)[1]
+              if dsn.startswith('postgresql+psycopg://'):
+                  return 'postgresql://' + dsn.split('://', 1)[1]
+              return dsn
+
+
           async def main() -> None:
-              dsn = os.environ['DATABASE_URL']
-              for _ in range(60):
+              raw = os.environ['DATABASE_URL']
+              dsn = to_asyncpg_dsn(raw)
+
+              last_err: Exception | None = None
+
+              for _ in range(120):
                   try:
                       conn = await asyncpg.connect(dsn, timeout=3)
                       await conn.close()
                       print('Postgres is ready')
                       return
-                  except Exception:
+                  except Exception as e:
+                      last_err = e
                       await asyncio.sleep(1)
 
-              raise SystemExit('Postgres did not become ready in time')
+              raise SystemExit(f'Postgres did not become ready in time. Last error: {last_err!r}')
 
 
           asyncio.run(main())
@@ -74,6 +88,16 @@ jobs:
 
       - name: Run tests
         run: uv run pytest -q
+
+      - name: Debug Postgres logs (only on failure)
+        if: failure()
+        run: |
+          docker ps -a
+          PG_ID="$(docker ps -aq --filter ancestor=postgres:16 | head -n 1)"
+          if [ -n "${PG_ID}" ]; then
+            echo "Postgres container id: ${PG_ID}"
+            docker logs --tail 200 "${PG_ID}" || true
+          fi
 
   deploy:
     needs: tests
@@ -180,7 +204,5 @@ jobs:
 
             Tests: ${{ needs.tests.result }}
             Deploy: ${{ needs.deploy.result }}
-
-            Overall: ${{ (needs.tests.result == 'success' && needs.deploy.result == 'success') && 'success' || 'check' }}
 
             Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
