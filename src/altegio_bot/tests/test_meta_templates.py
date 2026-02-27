@@ -4,6 +4,7 @@ import pytest
 
 from altegio_bot.meta_templates import (
     TEMPLATE_LANGUAGE,
+    UNIVERSAL_JOB_TYPES,
     build_template_params,
     resolve_meta_template,
 )
@@ -87,6 +88,32 @@ def test_resolve_ra_record_updated_fallback() -> None:
     )
 
 
+def test_resolve_ra_repeat_10d_uses_canonical_ka() -> None:
+    # repeat_10d is a UNIVERSAL template (no address footer).
+    # Rastatt should use the canonical kitilash_ka_* variant.
+    assert resolve_meta_template(RA, 'repeat_10d') == (
+        'kitilash_ka_repeat_10d_v1'
+    )
+
+
+def test_resolve_ra_review_3d_uses_canonical_ka() -> None:
+    assert resolve_meta_template(RA, 'review_3d') == (
+        'kitilash_ka_review_3d_v1'
+    )
+
+
+def test_resolve_ra_comeback_3d_uses_canonical_ka() -> None:
+    assert resolve_meta_template(RA, 'comeback_3d') == (
+        'kitilash_ka_comeback_3d_v1'
+    )
+
+
+def test_resolve_ra_newsletter_uses_canonical_ka() -> None:
+    assert resolve_meta_template(RA, 'newsletter_new_clients_monthly') == (
+        'kitilash_ka_newsletter_new_clients_monthly_v1'
+    )
+
+
 def test_resolve_unknown_job_type_returns_none() -> None:
     assert resolve_meta_template(KA, 'unknown_job') is None
 
@@ -97,6 +124,17 @@ def test_resolve_unknown_company_returns_none() -> None:
 
 def test_template_language_constant() -> None:
     assert TEMPLATE_LANGUAGE == 'de'
+
+
+def test_universal_job_types_contains_expected() -> None:
+    assert 'repeat_10d' in UNIVERSAL_JOB_TYPES
+    assert 'review_3d' in UNIVERSAL_JOB_TYPES
+    assert 'comeback_3d' in UNIVERSAL_JOB_TYPES
+    assert 'newsletter_new_clients_monthly' in UNIVERSAL_JOB_TYPES
+    # branch-specific types must NOT be in the universal set
+    assert 'record_created' not in UNIVERSAL_JOB_TYPES
+    assert 'record_updated' not in UNIVERSAL_JOB_TYPES
+    assert 'reminder_24h' not in UNIVERSAL_JOB_TYPES
 
 
 # ---------------------------------------------------------------------------

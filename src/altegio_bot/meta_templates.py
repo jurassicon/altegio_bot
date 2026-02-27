@@ -7,9 +7,15 @@ Branch prefixes:
   ka = Karlsruhe  (company_id 758285)
   ra = Rastatt    (company_id 1271200)
 
-Rastatt currently only has kitilash_ra_record_created_v1 registered
-in Meta WABA.  All other Rastatt job types fall back to the matching
-kitilash_ka_* template and this is explicitly logged.
+Universal templates (no address footer, shared across branches):
+  review_3d, repeat_10d, comeback_3d, newsletter_new_clients_monthly
+  → always use canonical kitilash_ka_* variant for both companies.
+
+Branch-specific templates (contain address footer):
+  record_created, record_updated, record_canceled, reminder_24h, reminder_2h
+  → Karlsruhe: kitilash_ka_*
+  → Rastatt: kitilash_ra_* where available; others currently fall back
+    to kitilash_ka_* and the fallback is logged as a WARNING.
 """
 from __future__ import annotations
 
@@ -20,6 +26,15 @@ logger = logging.getLogger(__name__)
 
 # Language code sent with every template request.
 TEMPLATE_LANGUAGE = 'de'
+
+# Job types whose templates have NO address footer and are therefore
+# shared across all branches (canonical ka_* is used for everyone).
+UNIVERSAL_JOB_TYPES: frozenset[str] = frozenset({
+    'review_3d',
+    'repeat_10d',
+    'comeback_3d',
+    'newsletter_new_clients_monthly',
+})
 
 # ---------------------------------------------------------------------------
 # Template name map: (company_id, job_type) -> Meta template name
@@ -74,18 +89,9 @@ META_TEMPLATE_MAP: dict[tuple[int, str], str] = {
 # Karlsruhe new-client variant for record_created
 _KA_NEW_CLIENT_TEMPLATE = 'kitilash_ka_record_created_new_client_v1'
 
-# Template names that are actually owned by a different branch (fallbacks).
-# Used purely for log warnings.
-_RA_FALLBACKS: frozenset[str] = frozenset({
-    'record_updated',
-    'record_canceled',
-    'reminder_24h',
-    'reminder_2h',
-    'review_3d',
-    'repeat_10d',
-    'comeback_3d',
-    'newsletter_new_clients_monthly',
-})
+# Branch-specific job types that have a dedicated ra_* template in Meta WABA.
+# All other branch-specific Rastatt types fall back to ka_* (logged as WARNING).
+_RA_DEDICATED: frozenset[str] = frozenset({'record_created'})
 
 
 def resolve_meta_template(
@@ -96,14 +102,16 @@ def resolve_meta_template(
 ) -> str | None:
     """Return the Meta template name for *company_id* / *job_type*.
 
-    Returns ``None`` when no template is registered (caller should fall
-    back to free-form text and log a warning).
+    Returns ``None`` when no template is registered (caller should
+    fail the job or fall back to free-form text depending on send_mode).
 
-    For Karlsruhe ``record_created`` with ``is_new_client=True`` the
-    dedicated new-client template is returned.
-
-    Rastatt job types without a dedicated ra_* template fall back to
-    the matching ka_* template; a WARNING is logged.
+    Resolution rules:
+    1. Universal templates (no address footer) always use the canonical
+       kitilash_ka_* variant regardless of company_id.
+    2. Karlsruhe ``record_created`` with ``is_new_client=True`` uses the
+       dedicated new-client variant.
+    3. Rastatt branch-specific types without a dedicated ra_* template
+       fall back to the matching ka_* template; a WARNING is logged.
     """
     if (
         company_id == _KA
@@ -122,9 +130,13 @@ def resolve_meta_template(
         )
         return None
 
-    if company_id == _RA and job_type in _RA_FALLBACKS:
+    if (
+        company_id == _RA
+        and job_type not in UNIVERSAL_JOB_TYPES
+        and job_type not in _RA_DEDICATED
+    ):
         logger.warning(
-            'Rastatt: no ra_* template for job_type=%s, '
+            'Rastatt: no dedicated ra_* template for job_type=%s, '
             'using fallback template=%s',
             job_type,
             name,

@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from altegio_bot.db import SessionLocal
 from altegio_bot.meta_templates import (
     TEMPLATE_LANGUAGE,
+    UNIVERSAL_JOB_TYPES,
     build_template_params,
     resolve_meta_template,
 )
@@ -637,17 +638,27 @@ async def process_job_in_session(
             is_new_client=is_new,
         )
         if meta_template_name is None:
-            logger.warning(
+            # In template/auto mode failing is preferred over text fallback
+            # so that misconfigured jobs surface immediately.
+            # Exception: text mode always allows free-form sends.
+            job.status = 'failed'
+            job.locked_at = None
+            job.last_error = (
+                f'No Meta template for company={job.company_id} '
+                f'job_type={job.job_type}'
+            )
+            logger.error(
                 'No Meta template for company=%s job_type=%s; '
-                'falling back to text send',
+                'failing job_id=%s (send_mode=%s)',
                 job.company_id,
                 job.job_type,
+                job.id,
+                send_mode,
             )
-            use_template = False
-        else:
-            template_params = build_template_params(
-                meta_template_name, msg_ctx
-            )
+            return
+        template_params = build_template_params(
+            meta_template_name, msg_ctx
+        )
 
     if use_template:
         assert meta_template_name is not None
@@ -660,9 +671,10 @@ async def process_job_in_session(
             params=template_params,
         )
         send_meta: dict[str, Any] = {
-            'send_mode': 'template',
-            'meta_template_name': meta_template_name,
-            'template_params': template_params,
+            'send_type': 'template',
+            'template': meta_template_name,
+            'params': template_params,
+            'lang': TEMPLATE_LANGUAGE,
         }
     else:
         msg_id, err = await safe_send(
@@ -671,7 +683,7 @@ async def process_job_in_session(
             phone=phone,
             text=body,
         )
-        send_meta = {'send_mode': 'text'}
+        send_meta = {'send_type': 'text'}
 
     if err is not None:
         out = OutboxMessage(
@@ -740,13 +752,13 @@ async def process_job_in_session(
 
     logger.info(
         'Outbox sent job_id=%s outbox_id=%s sender_id=%s phone=%s '
-        'send_mode=%s template=%s',
+        'send_type=%s template=%s',
         job.id,
         getattr(out, 'id', None),
         sender_id,
         phone,
-        send_meta.get('send_mode'),
-        send_meta.get('meta_template_name'),
+        send_meta.get('send_type'),
+        send_meta.get('template'),
     )
 
 
