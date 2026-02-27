@@ -35,6 +35,7 @@ class Settings(BaseSettings):
     altegio_api_accept: str = 'application/vnd.api.v2+json'
     altegio_partner_token: str = ''
     altegio_user_token: str = ''
+    loyalty_card_type_id: str = ''
 
     # Ops-cabinet access
     ops_token: str = ''

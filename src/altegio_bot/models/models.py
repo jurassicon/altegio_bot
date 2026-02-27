@@ -79,6 +79,58 @@ class AltegioEvent(Base):
     payload: Mapped[dict] = mapped_column(JSONB, default=dict)
 
 
+class SmartTestRun(Base):
+    """Record of a smart-test execution for idempotency and auditing."""
+
+    __tablename__ = 'smart_test_runs'
+
+    id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        autoincrement=True,
+    )
+
+    test_code: Mapped[str] = mapped_column(String(128), index=True)
+    phone_e164: Mapped[str] = mapped_column(String(32), index=True)
+    company_id: Mapped[int] = mapped_column(Integer, index=True)
+    location_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    loyalty_card_id: Mapped[str | None] = mapped_column(
+        String(128), nullable=True
+    )
+    loyalty_card_number: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+    loyalty_card_type_id: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+
+    provider_message_id: Mapped[str | None] = mapped_column(
+        String(128), nullable=True, index=True
+    )
+    template_name: Mapped[str | None] = mapped_column(
+        String(128), nullable=True
+    )
+
+    # pending / pass / fail
+    outcome: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
+    deleted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    delete_status: Mapped[str | None] = mapped_column(
+        String(32), nullable=True
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        index=True,
+    )
+
+    meta: Mapped[dict] = mapped_column(JSONB, default=dict)
+
+
 class Client(Base):
     """
     Клиент в контексте филиала (company_id).
