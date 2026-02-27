@@ -256,7 +256,7 @@ def test_process_job_creates_outbox_on_send_ok(monkeypatch: Any) -> None:
         return None
 
     async def fake_render(*args: Any, **kwargs: Any) -> Any:
-        return ("TEXT", 123, "de")
+        return ("TEXT", 123, "de", {})
 
     async def fake_safe_send(*args: Any, **kwargs: Any) -> Any:
         return ("msg-1", None)
@@ -268,6 +268,7 @@ def test_process_job_creates_outbox_on_send_ok(monkeypatch: Any) -> None:
     monkeypatch.setattr(ow, "_apply_rate_limit", fake_apply_rl)
     monkeypatch.setattr(ow, "_render_message", fake_render)
     monkeypatch.setattr(ow, "safe_send", fake_safe_send)
+    monkeypatch.setattr(ow, "safe_send_template", fake_safe_send)
     monkeypatch.setattr(ow, "utcnow", lambda: fixed_now)
     monkeypatch.setattr(ow, "OutboxMessage", FakeOutbox)
 
@@ -312,7 +313,7 @@ def test_process_job_requeues_on_send_fail(monkeypatch: Any) -> None:
         return None
 
     async def fake_render(*args: Any, **kwargs: Any) -> Any:
-        return ("TEXT", 123, "de")
+        return ("TEXT", 123, "de", {})
 
     async def fake_safe_send(*args: Any, **kwargs: Any) -> Any:
         return ("msg-2", "provider error")
@@ -324,6 +325,7 @@ def test_process_job_requeues_on_send_fail(monkeypatch: Any) -> None:
     monkeypatch.setattr(ow, "_apply_rate_limit", fake_apply_rl)
     monkeypatch.setattr(ow, "_render_message", fake_render)
     monkeypatch.setattr(ow, "safe_send", fake_safe_send)
+    monkeypatch.setattr(ow, "safe_send_template", fake_safe_send)
     monkeypatch.setattr(ow, "utcnow", lambda: fixed_now)
     monkeypatch.setattr(ow, "OutboxMessage", FakeOutbox)
 
@@ -409,7 +411,7 @@ def test_process_job_fails_on_send_fail_when_attempt_becomes_max(
         return None
 
     async def fake_render(*args: Any, **kwargs: Any) -> Any:
-        return ("TEXT", 123, "de")
+        return ("TEXT", 123, "de", {})
 
     async def fake_safe_send(*args: Any, **kwargs: Any) -> Any:
         return ("msg-3", "provider error")
@@ -421,6 +423,7 @@ def test_process_job_fails_on_send_fail_when_attempt_becomes_max(
     monkeypatch.setattr(ow, "_apply_rate_limit", fake_apply_rl)
     monkeypatch.setattr(ow, "_render_message", fake_render)
     monkeypatch.setattr(ow, "safe_send", fake_safe_send)
+    monkeypatch.setattr(ow, "safe_send_template", fake_safe_send)
     monkeypatch.setattr(ow, "utcnow", lambda: fixed_now)
     monkeypatch.setattr(ow, "OutboxMessage", FakeOutbox)
 
@@ -435,3 +438,129 @@ def test_process_job_fails_on_send_fail_when_attempt_becomes_max(
     out = session.added[0]
     assert out.status == "failed"
     assert out.provider_message_id == "msg-3"
+
+
+def test_process_job_fails_when_no_template_in_auto_mode(
+    monkeypatch: Any,
+) -> None:
+    """In auto/template mode: no Meta template → job must fail, no text fallback."""
+    fixed_now = datetime(2026, 2, 10, 12, 0, tzinfo=timezone.utc)
+
+    job = FakeJob(
+        id=9,
+        company_id=999999,  # unknown company → no template
+        job_type="record_updated",
+        status="queued",
+        run_at=fixed_now,
+        record_id=10,
+        client_id=1,
+    )
+
+    async def fake_load_job(session: Any, job_id: int) -> Any:
+        return job
+
+    async def fake_load_record(session: Any, job_obj: Any) -> Any:
+        return FakeRecord(id=10, company_id=999999)
+
+    async def fake_load_client(session: Any, job_obj: Any, record: Any) -> Any:
+        return FakeClient(id=1, phone_e164="+491234")
+
+    async def fake_apply_rl(session: Any, phone: str) -> Any:
+        return None
+
+    async def fake_render(*args: Any, **kwargs: Any) -> Any:
+        return ("TEXT", 123, "de", {})
+
+    async def fake_safe_send(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("safe_send must not be called when template is missing")
+
+    monkeypatch.setattr(ow, "_load_job", fake_load_job)
+    patch_outbox_checks(monkeypatch, result=None)
+    monkeypatch.setattr(ow, "_load_record", fake_load_record)
+    monkeypatch.setattr(ow, "_load_client", fake_load_client)
+    monkeypatch.setattr(ow, "_apply_rate_limit", fake_apply_rl)
+    monkeypatch.setattr(ow, "_render_message", fake_render)
+    monkeypatch.setattr(ow, "safe_send", fake_safe_send)
+    monkeypatch.setattr(ow, "safe_send_template", fake_safe_send)
+    # Force auto mode (default, but be explicit)
+    from altegio_bot.settings import Settings
+    monkeypatch.setattr(
+        ow, "settings",
+        Settings.model_construct(whatsapp_send_mode="auto"),
+    )
+
+    session = FakeSession()
+    run(ow.process_job_in_session(session, 9, provider=object()))  # type: ignore
+
+    assert job.status == "failed"
+    assert job.last_error is not None
+    assert "No Meta template" in job.last_error
+    assert session.added == []  # no outbox record when template lookup fails
+
+
+def test_process_job_sends_text_when_mode_is_text(
+    monkeypatch: Any,
+) -> None:
+    """In text mode free-form send is used even if template would exist."""
+    fixed_now = datetime(2026, 2, 10, 12, 0, tzinfo=timezone.utc)
+
+    job = FakeJob(
+        id=10,
+        company_id=758285,
+        job_type="record_updated",
+        status="queued",
+        run_at=fixed_now,
+        record_id=10,
+        client_id=1,
+    )
+
+    async def fake_load_job(session: Any, job_id: int) -> Any:
+        return job
+
+    async def fake_load_record(session: Any, job_obj: Any) -> Any:
+        return FakeRecord(id=10, company_id=758285)
+
+    async def fake_load_client(session: Any, job_obj: Any, record: Any) -> Any:
+        return FakeClient(id=1, phone_e164="+491234")
+
+    async def fake_apply_rl(session: Any, phone: str) -> Any:
+        return None
+
+    async def fake_render(*args: Any, **kwargs: Any) -> Any:
+        return ("TEXT", 123, "de", {})
+
+    safe_send_template_called: list[bool] = []
+
+    async def fake_safe_send_text(*args: Any, **kwargs: Any) -> Any:
+        return ("msg-text", None)
+
+    async def fake_safe_send_tpl(*args: Any, **kwargs: Any) -> Any:
+        safe_send_template_called.append(True)
+        return ("msg-tpl", None)
+
+    monkeypatch.setattr(ow, "_load_job", fake_load_job)
+    patch_outbox_checks(monkeypatch, result=None)
+    monkeypatch.setattr(ow, "_load_record", fake_load_record)
+    monkeypatch.setattr(ow, "_load_client", fake_load_client)
+    monkeypatch.setattr(ow, "_apply_rate_limit", fake_apply_rl)
+    monkeypatch.setattr(ow, "_render_message", fake_render)
+    monkeypatch.setattr(ow, "safe_send", fake_safe_send_text)
+    monkeypatch.setattr(ow, "safe_send_template", fake_safe_send_tpl)
+    monkeypatch.setattr(ow, "utcnow", lambda: fixed_now)
+    monkeypatch.setattr(ow, "OutboxMessage", FakeOutbox)
+    from altegio_bot.settings import Settings
+    monkeypatch.setattr(
+        ow, "settings",
+        Settings.model_construct(whatsapp_send_mode="text"),
+    )
+
+    session = FakeSession()
+    run(ow.process_job_in_session(session, 10, provider=object()))  # type: ignore
+
+    assert job.status == "done"
+    assert safe_send_template_called == []  # template send must not be called
+    assert len(session.added) == 1
+    out = session.added[0]
+    assert out.status == "sent"
+    assert out.provider_message_id == "msg-text"
+    assert out.meta == {"send_type": "text"}

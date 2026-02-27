@@ -46,6 +46,12 @@ class Settings(BaseSettings):
     # marketing_only | all
     wa_optout_policy: str = 'marketing_only'
 
+    # template | text | auto
+    # template: always use Meta templates (except STOP/START acks)
+    # text:     always use free-form text (dev/testing only)
+    # auto:     templates for business-initiated, text for conversational
+    whatsapp_send_mode: str = 'auto'
+
     # Minutes after which a "processing" job is considered stuck
     ops_stuck_minutes: int = 15
 

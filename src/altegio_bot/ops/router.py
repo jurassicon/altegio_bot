@@ -499,6 +499,8 @@ async def ops_history(request: Request) -> str:
                   om.company_id,
                   om.phone_e164,
                   om.template_code,
+                  om.meta ->> 'send_type' AS send_type,
+                  om.meta ->> 'template'  AS meta_template,
                   om.status,
                   om.provider_message_id,
                   om.error,
@@ -535,7 +537,7 @@ async def ops_history(request: Request) -> str:
     ])
 
     cols = [
-        'ID', 'Sent At', 'Company', 'Phone', 'Template',
+        'ID', 'Sent At', 'Company', 'Phone', 'Template', 'Send',
         'Status', 'WA Delivery', 'Provider Msg ID', 'Error',
     ]
     table_rows = []
@@ -546,12 +548,31 @@ async def ops_history(request: Request) -> str:
         if r.wa_err_code:
             wa_delivery += f' <span class="text-danger small">{_esc(r.wa_err_code)}</span>'
         row_class = 'warn' if r.status == 'failed' else ''
+        # Show send type badge
+        send_type = r.send_type or ''
+        send_badge = (
+            '<span class="badge bg-primary">tpl</span>'
+            if send_type == 'template'
+            else (
+                '<span class="badge bg-secondary">txt</span>'
+                if send_type == 'text'
+                else ''
+            )
+        )
+        # Template column: show job type + meta template name if available
+        tpl_cell = _esc(r.template_code or '')
+        if r.meta_template:
+            tpl_cell += (
+                f'<br><span class="text-muted small">'
+                f'{_esc(r.meta_template)}</span>'
+            )
         table_rows.append([
             f'<a href="/ops/outbox/{r.id}">{r.id}</a>',
             _esc(_fmt_dt(r.ts, tz)),
             _esc(company_name),
             _esc(r.phone_e164),
-            _esc(r.template_code),
+            tpl_cell,
+            send_badge,
             _status_badge(r.status),
             wa_delivery,
             _esc((r.provider_message_id or '')[:40]),
@@ -1018,10 +1039,15 @@ async def ops_outbox(outbox_id: int) -> str:
         pass
 
     meta_json = ''
+    meta_dict: dict = {}
     try:
-        meta_json = json.dumps(om.meta, indent=2, ensure_ascii=False)
+        meta_dict = dict(om.meta) if om.meta else {}
+        meta_json = json.dumps(meta_dict, indent=2, ensure_ascii=False)
     except Exception:
         meta_json = str(om.meta)
+
+    send_type = meta_dict.get('send_type', '')
+    meta_template = meta_dict.get('template', '')
 
     details = f"""
 <div class="card mb-3">
@@ -1034,8 +1060,12 @@ async def ops_outbox(outbox_id: int) -> str:
       <dd class="col-sm-9">{_esc(company_name)}</dd>
       <dt class="col-sm-3">Phone</dt>
       <dd class="col-sm-9">{_esc(om.phone_e164)}</dd>
-      <dt class="col-sm-3">Template</dt>
+      <dt class="col-sm-3">Send Type</dt>
+      <dd class="col-sm-9">{_esc(send_type) or '<span class="text-muted">—</span>'}</dd>
+      <dt class="col-sm-3">Job Template</dt>
       <dd class="col-sm-9">{_esc(om.template_code)}</dd>
+      <dt class="col-sm-3">Meta Template</dt>
+      <dd class="col-sm-9">{_esc(meta_template) or '<span class="text-muted">—</span>'}</dd>
       <dt class="col-sm-3">Language</dt>
       <dd class="col-sm-9">{_esc(om.language)}</dd>
       <dt class="col-sm-3">Sender</dt>
