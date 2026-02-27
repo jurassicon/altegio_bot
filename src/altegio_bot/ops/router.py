@@ -291,9 +291,22 @@ async def ops_queue(request: Request) -> str:
     company_id = request.query_params.get('company_id', '')
     job_type = request.query_params.get('job_type', '')
     status_filter = request.query_params.get('status', '')
-    period = request.query_params.get('period', '7d')
-    from_dt, to_dt = _period_params(request)
+    # view: upcoming_7d (default), upcoming_24h, recent_24h, recent_7d
+    view = request.query_params.get('view', '')
+    if not view:
+        view = 'recent_24h' if status_filter in ('processing', 'failed') else 'upcoming_7d'
     tz = _local_tz()
+    now = datetime.now(timezone.utc)
+
+    # Compute time bounds based on view
+    is_upcoming = view.startswith('upcoming')
+    window_hours = 24 if '24h' in view else 7 * 24
+    if is_upcoming:
+        from_dt = now
+        to_dt = now + timedelta(hours=window_hours)
+    else:
+        from_dt = now - timedelta(hours=window_hours)
+        to_dt = now
 
     async with SessionLocal() as session:
         # Metrics
@@ -321,10 +334,24 @@ async def ops_queue(request: Request) -> str:
         # NOTE: `filters` contains only hardcoded SQL clauses with named
         # placeholders.  All user input is passed via `params` as bound
         # parameters to text(), so there is no SQL injection risk.
-        filters = [
-            'mj.status IN (:s_queued, :s_proc, :s_failed)',
-            'mj.run_at >= :from_dt AND mj.run_at < :to_dt',
-        ]
+        if is_upcoming:
+            # Show future queued jobs by default; apply run_at window
+            filters = [
+                'mj.run_at >= :from_dt AND mj.run_at < :to_dt',
+            ]
+            if status_filter and _safe_identifier(status_filter):
+                filters.append('mj.status = :status_filter')
+            else:
+                filters.append("mj.status = 'queued'")
+        else:
+            # Show recently updated jobs (processing/failed) via updated_at
+            filters = [
+                'mj.status IN (:s_queued, :s_proc, :s_failed)',
+                'mj.updated_at >= :from_dt AND mj.updated_at < :to_dt',
+            ]
+            if status_filter and _safe_identifier(status_filter):
+                filters.append('mj.status = :status_filter')
+
         params: dict[str, Any] = {
             's_queued': 'queued',
             's_proc': 'processing',
@@ -333,6 +360,8 @@ async def ops_queue(request: Request) -> str:
             'to_dt': to_dt,
             'stuck_min': settings.ops_stuck_minutes,
         }
+        if status_filter and _safe_identifier(status_filter):
+            params['status_filter'] = status_filter
 
         if company_id:
             filters.append('mj.company_id = :company_id')
@@ -340,11 +369,13 @@ async def ops_queue(request: Request) -> str:
         if job_type and _safe_identifier(job_type):
             filters.append('mj.job_type = :job_type')
             params['job_type'] = job_type
-        if status_filter and _safe_identifier(status_filter):
-            filters.append('mj.status = :status_filter')
-            params['status_filter'] = status_filter
 
         where = ' AND '.join(filters)
+        order = (
+            'mj.run_at ASC'
+            if is_upcoming
+            else 'mj.updated_at DESC NULLS LAST'
+        )
         rows_q = await session.execute(
             text(f"""
                 SELECT
@@ -355,10 +386,7 @@ async def ops_queue(request: Request) -> str:
                 FROM message_jobs mj
                 LEFT JOIN clients c ON c.id = mj.client_id
                 WHERE {where}
-                ORDER BY
-                  CASE WHEN mj.status='queued' THEN mj.run_at END ASC NULLS LAST,
-                  CASE WHEN mj.status IN ('processing','failed')
-                       THEN mj.updated_at END DESC NULLS LAST
+                ORDER BY {order}
                 LIMIT 200
             """),
             params,
@@ -376,9 +404,10 @@ async def ops_queue(request: Request) -> str:
         ('company_id', 'Company', 'select:758285,1271200', company_id),
         ('job_type', 'Job type', 'text', job_type),
         ('status', 'Status', 'select:queued,processing,failed', status_filter),
-        ('period', 'Period', 'select:24h,today,7d', period),
+        ('view', 'View', 'select:upcoming_7d,upcoming_24h,recent_24h,recent_7d', view),
     ])
 
+    view_label = view.replace('_', ' ')
     cols = ['ID', 'Company', 'Type', 'Status', 'Run At', 'Attempts', 'Client', 'Error']
     table_rows = []
     row_classes = []
@@ -409,7 +438,7 @@ async def ops_queue(request: Request) -> str:
 <h4>📋 Queue</h4>
 {metrics_html}
 {form}
-<p class="text-muted small">Showing {len(jobs)} rows · period {_esc(period)}</p>
+<p class="text-muted small">Showing {len(jobs)} rows · view: {_esc(view_label)}</p>
 {_table(cols, table_rows, row_classes)}
 """
     return _page('Queue', body)
@@ -1334,6 +1363,103 @@ async def ops_monitoring() -> str:
         )
         ob_speed = outbox_speed_q.fetchone()
 
+        # --- Upcoming Reminders (next 24h and 7d) ---
+        upcoming_reminders_q = await session.execute(
+            text("""
+                SELECT
+                  company_id,
+                  job_type,
+                  COUNT(*) FILTER (
+                    WHERE run_at >= :now AND run_at < :next_24h
+                  ) AS next_24h_cnt,
+                  COUNT(*) FILTER (
+                    WHERE run_at >= :now AND run_at < :next_7d
+                  ) AS next_7d_cnt
+                FROM message_jobs
+                WHERE status = 'queued'
+                  AND job_type IN ('reminder_24h', 'reminder_2h')
+                GROUP BY company_id, job_type
+                ORDER BY company_id, job_type
+            """),
+            {
+                'now': now,
+                'next_24h': now + timedelta(hours=24),
+                'next_7d': now + timedelta(days=7),
+            },
+        )
+        upcoming_reminder_rows = upcoming_reminders_q.fetchall()
+
+        # --- Missing Reminders ---
+        # reminder_24h: records with starts_at in [now+24h, now+8d]
+        # without a queued/done reminder_24h job
+        missing_24h_q = await session.execute(
+            text("""
+                SELECT r.company_id, COUNT(*) AS missing_cnt
+                FROM records r
+                WHERE r.starts_at >= :h24
+                  AND r.starts_at < :d8
+                  AND r.is_deleted = false
+                  AND r.client_id IS NOT NULL
+                  AND NOT EXISTS (
+                    SELECT 1 FROM message_jobs mj
+                    WHERE mj.record_id = r.id
+                      AND mj.job_type = 'reminder_24h'
+                      AND mj.status IN ('queued', 'done', 'processing')
+                  )
+                GROUP BY r.company_id
+                ORDER BY r.company_id
+            """),
+            {
+                'h24': now + timedelta(hours=24),
+                'd8': now + timedelta(days=8),
+            },
+        )
+        missing_24h_rows = missing_24h_q.fetchall()
+
+        # reminder_2h: records with starts_at in [now+2h, now+26h]
+        # without a queued/done reminder_2h job
+        missing_2h_q = await session.execute(
+            text("""
+                SELECT r.company_id, COUNT(*) AS missing_cnt
+                FROM records r
+                WHERE r.starts_at >= :h2
+                  AND r.starts_at < :h26
+                  AND r.is_deleted = false
+                  AND r.client_id IS NOT NULL
+                  AND NOT EXISTS (
+                    SELECT 1 FROM message_jobs mj
+                    WHERE mj.record_id = r.id
+                      AND mj.job_type = 'reminder_2h'
+                      AND mj.status IN ('queued', 'done', 'processing')
+                  )
+                GROUP BY r.company_id
+                ORDER BY r.company_id
+            """),
+            {
+                'h2': now + timedelta(hours=2),
+                'h26': now + timedelta(hours=26),
+            },
+        )
+        missing_2h_rows = missing_2h_q.fetchall()
+
+        # --- Opt-out Impact ---
+        optout_impact_q = await session.execute(
+            text("""
+                SELECT mj.company_id, COUNT(*) AS optout_queued_cnt
+                FROM message_jobs mj
+                JOIN clients c ON c.id = mj.client_id
+                WHERE mj.status = 'queued'
+                  AND mj.job_type = ANY(
+                    ARRAY['review_3d','repeat_10d','comeback_3d',
+                          'newsletter_new_clients_monthly']
+                  )
+                  AND c.wa_opted_out = true
+                GROUP BY mj.company_id
+                ORDER BY mj.company_id
+            """),
+        )
+        optout_impact_rows = optout_impact_q.fetchall()
+
         # --- Problematic tasks ---
         overdue_q = await session.execute(
             text("""
@@ -1512,6 +1638,131 @@ async def ops_monitoring() -> str:
         {scheduled_html or '<tr><td colspan="3" class="text-muted">No reminders scheduled in the next 15 minutes</td></tr>'}
       </tbody>
     </table>
+  </div>
+</div>
+"""
+
+    # 3d) Upcoming reminders (next 24h / 7d)
+    upcoming_rem_html = ''
+    for ur in upcoming_reminder_rows:
+        cname = COMPANIES.get(ur.company_id, str(ur.company_id))
+        upcoming_rem_html += (
+            f'<tr>'
+            f'<td>{_esc(cname)}</td>'
+            f'<td>{_esc(ur.job_type)}</td>'
+            f'<td>{ur.next_24h_cnt}</td>'
+            f'<td>{ur.next_7d_cnt}</td>'
+            f'</tr>'
+        )
+    upcoming_reminders_section = f"""
+<div class="card mb-3">
+  <div class="card-header">🔔 Upcoming Reminders</div>
+  <div class="card-body">
+    <table class="table table-sm mb-0">
+      <thead><tr>
+        <th>Company</th><th>Job Type</th><th>Next 24h</th><th>Next 7d</th>
+      </tr></thead>
+      <tbody>
+        {upcoming_rem_html or '<tr><td colspan="4" class="text-muted">No upcoming reminders</td></tr>'}
+      </tbody>
+    </table>
+    <p class="mb-0 mt-1">
+      <a href="/ops/queue?view=upcoming_7d&job_type=reminder_24h" class="small">
+        → View reminder_24h queue
+      </a>
+      &nbsp;·&nbsp;
+      <a href="/ops/queue?view=upcoming_7d&job_type=reminder_2h" class="small">
+        → View reminder_2h queue
+      </a>
+    </p>
+  </div>
+</div>
+"""
+
+    # 3e) Missing reminders
+    missing_24h_by_company: dict[int, int] = {
+        r.company_id: r.missing_cnt for r in missing_24h_rows
+    }
+    missing_2h_by_company: dict[int, int] = {
+        r.company_id: r.missing_cnt for r in missing_2h_rows
+    }
+    all_company_ids = sorted(
+        set(missing_24h_by_company) | set(missing_2h_by_company)
+    )
+    missing_rem_html = ''
+    for cid in all_company_ids:
+        cname = COMPANIES.get(cid, str(cid))
+        m24 = missing_24h_by_company.get(cid, 0)
+        m2 = missing_2h_by_company.get(cid, 0)
+        cls24 = 'text-danger fw-bold' if m24 > 0 else 'text-success'
+        cls2 = 'text-danger fw-bold' if m2 > 0 else 'text-success'
+        missing_rem_html += (
+            f'<tr>'
+            f'<td>{_esc(cname)}</td>'
+            f'<td class="{cls24}">{m24}</td>'
+            f'<td class="{cls2}">{m2}</td>'
+            f'</tr>'
+        )
+    total_missing_24h = sum(missing_24h_by_company.values())
+    total_missing_2h = sum(missing_2h_by_company.values())
+    missing_border = (
+        'border-danger'
+        if total_missing_24h > 0 or total_missing_2h > 0
+        else 'border-success'
+    )
+    missing_reminders_section = f"""
+<div class="card mb-3 {missing_border}">
+  <div class="card-header">⚠️ Missing Reminders</div>
+  <div class="card-body">
+    <p class="small text-muted mb-1">
+      reminder_24h: records with appointment in 24h–8d without a reminder job.
+      reminder_2h: records with appointment in 2h–26h (next 24h window) without a reminder job.
+    </p>
+    <table class="table table-sm mb-0">
+      <thead><tr>
+        <th>Company</th>
+        <th>Missing reminder_24h (24h–8d)</th>
+        <th>Missing reminder_2h (2h–26h)</th>
+      </tr></thead>
+      <tbody>
+        {missing_rem_html or '<tr><td colspan="3" class="text-success">No missing reminders ✓</td></tr>'}
+      </tbody>
+    </table>
+  </div>
+</div>
+"""
+
+    # 3f) Opt-out impact
+    optout_impact_html = ''
+    total_impact = 0
+    for oi in optout_impact_rows:
+        cname = COMPANIES.get(oi.company_id, str(oi.company_id))
+        optout_impact_html += (
+            f'<li class="list-group-item d-flex justify-content-between align-items-center">'
+            f'{_esc(cname)}'
+            f'<span class="badge bg-danger rounded-pill">{oi.optout_queued_cnt}</span>'
+            f'</li>'
+        )
+        total_impact += oi.optout_queued_cnt
+    optout_impact_border = 'border-danger' if total_impact > 0 else 'border-success'
+    impact_note = (
+        '<div class="alert alert-danger mb-2 py-1 small">'
+        f'⚠️ {total_impact} queued marketing job(s) for opted-out clients!'
+        '</div>'
+        if total_impact > 0
+        else ''
+    )
+    optout_impact_section = f"""
+<div class="card mb-3 {optout_impact_border}">
+  <div class="card-header">🚫 Opt-out Impact (queued marketing jobs)</div>
+  <div class="card-body">
+    {impact_note}
+    <ul class="list-group list-group-flush">
+      {optout_impact_html or '<li class="list-group-item text-success">No marketing jobs queued for opted-out clients ✓</li>'}
+    </ul>
+    <p class="small text-muted mt-1 mb-0">
+      Affected job types: review_3d, repeat_10d, comeback_3d, newsletter_new_clients_monthly
+    </p>
   </div>
 </div>
 """
@@ -1705,6 +1956,18 @@ async def ops_monitoring() -> str:
         warnings.append(f'⚠️ {overdue_cnt} overdue queued job(s) past their run_at')
     if locked_cnt > 0:
         warnings.append(f'⚠️ {locked_cnt} job(s) locked but still in queued status')
+    if total_missing_24h > 0:
+        warnings.append(
+            f'⚠️ {total_missing_24h} record(s) missing reminder_24h job'
+        )
+    if total_missing_2h > 0:
+        warnings.append(
+            f'⚠️ {total_missing_2h} record(s) missing reminder_2h job'
+        )
+    if total_impact > 0:
+        warnings.append(
+            f'⚠️ {total_impact} queued marketing job(s) for opted-out clients'
+        )
 
     warnings_html = ''
     if warnings:
@@ -1727,6 +1990,9 @@ async def ops_monitoring() -> str:
 {queue_html}
 {queue_by_type_section}
 {scheduled_section}
+{upcoming_reminders_section}
+{missing_reminders_section}
+{optout_impact_section}
 {outbox_html}
 {problems_html}
 {optout_html}
