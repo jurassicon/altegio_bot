@@ -613,6 +613,47 @@ async def ops_job(job_id: int) -> str:
         )
         outbox_rows = outbox_q.fetchall()
 
+        # --- record history ---
+        record_jobs: list = []
+        altegio_events: list = []
+        altegio_record_id: int | None = None
+        if job.record_id:
+            rec_q = await session.execute(
+                text('SELECT altegio_record_id FROM records WHERE id = :rid'),
+                {'rid': job.record_id},
+            )
+            rec = rec_q.fetchone()
+            if rec:
+                altegio_record_id = rec.altegio_record_id
+
+            record_jobs_q = await session.execute(
+                text("""
+                    SELECT
+                      mj.id, mj.job_type, mj.status,
+                      mj.run_at, mj.created_at, mj.attempts, mj.max_attempts,
+                      mj.last_error,
+                      c.display_name, c.phone_e164
+                    FROM message_jobs mj
+                    LEFT JOIN clients c ON c.id = mj.client_id
+                    WHERE mj.record_id = :rid
+                    ORDER BY mj.created_at ASC
+                """),
+                {'rid': job.record_id},
+            )
+            record_jobs = record_jobs_q.fetchall()
+
+            if altegio_record_id:
+                events_q = await session.execute(
+                    text("""
+                        SELECT id, received_at, event_status, status, error
+                        FROM altegio_events
+                        WHERE resource = 'record' AND resource_id = :rid
+                        ORDER BY received_at ASC
+                    """),
+                    {'rid': altegio_record_id},
+                )
+                altegio_events = events_q.fetchall()
+
     is_stuck = (
         job.status == 'processing'
         and job.locked_at is not None
@@ -657,10 +698,14 @@ async def ops_job(job_id: int) -> str:
       <dd class="col-sm-9">{_esc(_fmt_dt(job.updated_at, tz))}</dd>
       <dt class="col-sm-3">Client</dt>
       <dd class="col-sm-9">
-        {_esc(job.display_name or '')} {_esc(job.phone_e164 or '')}
+        {_esc(job.display_name or '')}
+        {f'<a href="/ops/history?phone_e164={_esc(job.phone_e164)}">{_esc(job.phone_e164)}</a>' if job.phone_e164 else ''}
       </dd>
       <dt class="col-sm-3">Record ID</dt>
-      <dd class="col-sm-9">{_esc(str(job.record_id or ''))}</dd>
+      <dd class="col-sm-9">
+        {f'<a href="/ops/record/{job.record_id}">{job.record_id}</a>' if job.record_id else ''}
+        {f'<span class="text-muted small">(altegio: {altegio_record_id})</span>' if altegio_record_id else ''}
+      </dd>
       <dt class="col-sm-3">Last Error</dt>
       <dd class="col-sm-9 text-danger">{_esc(job.last_error or '')}</dd>
     </dl>
@@ -692,12 +737,226 @@ async def ops_job(job_id: int) -> str:
 {_table(cols, outbox_table_rows) if outbox_table_rows else '<p class="text-muted">No outbox messages.</p>'}
 """
 
+    # --- Record Altegio events section ---
+    altegio_events_section = ''
+    if altegio_events:
+        ev_cols = ['Event ID', 'Received At', 'Event Status', 'Processing Status', 'Error']
+        ev_rows = []
+        for e in altegio_events:
+            ev_rows.append([
+                str(e.id),
+                _esc(_fmt_dt(e.received_at, tz)),
+                _status_badge(e.event_status) if e.event_status else '',
+                _status_badge(e.status),
+                f'<span class="text-danger small">{_esc((e.error or "")[:80])}</span>',
+            ])
+        altegio_events_section = f"""
+<h5>Altegio Events for this Record (altegio_record_id: {_esc(str(altegio_record_id))})</h5>
+{_table(ev_cols, ev_rows)}
+"""
+
+    # --- All jobs for same record section ---
+    record_jobs_section = ''
+    if record_jobs:
+        rj_cols = ['ID', 'Type', 'Status', 'Run At', 'Created At', 'Attempts', 'Error']
+        rj_rows = []
+        rj_classes = []
+        for rj in record_jobs:
+            row_id = (
+                f'<a href="/ops/job/{rj.id}"><strong>{rj.id}</strong></a>'
+                if rj.id == job_id
+                else f'<a href="/ops/job/{rj.id}">{rj.id}</a>'
+            )
+            rj_rows.append([
+                row_id,
+                _esc(rj.job_type),
+                _status_badge(rj.status),
+                _esc(_fmt_dt(rj.run_at, tz)),
+                _esc(_fmt_dt(rj.created_at, tz)),
+                f'{rj.attempts}/{rj.max_attempts}',
+                f'<span class="text-danger small">{_esc((rj.last_error or "")[:80])}</span>',
+            ])
+            rj_classes.append('table-active' if rj.id == job_id else '')
+        record_jobs_section = f"""
+<h5>All Jobs for this Record</h5>
+{_table(rj_cols, rj_rows, rj_classes)}
+"""
+
     body = f"""
 <h4>📋 Job #{job_id}</h4>
 {details}
+{altegio_events_section}
+{record_jobs_section}
 {outbox_section}
 """
     return _page(f'Job {job_id}', body)
+
+
+# ---------------------------------------------------------------------------
+# /ops/record/{record_id}  – full timeline for a booking record
+# ---------------------------------------------------------------------------
+
+@router.get('/record/{record_id}', response_class=HTMLResponse)
+async def ops_record(record_id: int) -> str:
+    tz = _local_tz()
+
+    async with SessionLocal() as session:
+        rec_q = await session.execute(
+            text("""
+                SELECT r.*, c.display_name, c.phone_e164
+                FROM records r
+                LEFT JOIN clients c ON c.id = r.client_id
+                WHERE r.id = :rid
+            """),
+            {'rid': record_id},
+        )
+        rec = rec_q.fetchone()
+
+        if rec is None:
+            return _page('Record Not Found', '<div class="alert alert-danger">Record not found.</div>')
+
+        events_q = await session.execute(
+            text("""
+                SELECT id, received_at, event_status, status, error
+                FROM altegio_events
+                WHERE resource = 'record' AND resource_id = :altegio_rid
+                ORDER BY received_at ASC
+            """),
+            {'altegio_rid': rec.altegio_record_id},
+        )
+        altegio_events = events_q.fetchall()
+
+        jobs_q = await session.execute(
+            text("""
+                SELECT
+                  mj.id, mj.job_type, mj.status,
+                  mj.run_at, mj.created_at, mj.attempts, mj.max_attempts,
+                  mj.last_error
+                FROM message_jobs mj
+                WHERE mj.record_id = :rid
+                ORDER BY mj.created_at ASC
+            """),
+            {'rid': record_id},
+        )
+        jobs = jobs_q.fetchall()
+
+        outbox_q = await session.execute(
+            text("""
+                SELECT
+                  om.id, om.status, om.phone_e164, om.template_code,
+                  COALESCE(om.sent_at, om.scheduled_at) AS ts,
+                  om.provider_message_id, om.error,
+                  ws.wa_status
+                FROM outbox_messages om
+                LEFT JOIN LATERAL (
+                  SELECT
+                    payload #>> '{entry,0,changes,0,value,statuses,0,status}' AS wa_status
+                  FROM whatsapp_events we
+                  WHERE
+                    payload #>> '{entry,0,changes,0,value,statuses,0,id}'
+                      = om.provider_message_id
+                    AND om.provider_message_id IS NOT NULL
+                  ORDER BY we.received_at DESC
+                  LIMIT 1
+                ) ws ON true
+                WHERE om.record_id = :rid
+                ORDER BY om.id DESC
+                LIMIT 50
+            """),
+            {'rid': record_id},
+        )
+        outbox_rows = outbox_q.fetchall()
+
+    company_name = COMPANIES.get(rec.company_id, str(rec.company_id))
+    phone_link = (
+        f'<a href="/ops/history?phone_e164={_esc(rec.phone_e164)}">{_esc(rec.phone_e164)}</a>'
+        if rec.phone_e164 else ''
+    )
+
+    details = f"""
+<div class="card mb-3">
+  <div class="card-header">Record #{record_id}</div>
+  <div class="card-body">
+    <dl class="row mb-0">
+      <dt class="col-sm-3">Company</dt>
+      <dd class="col-sm-9">{_esc(company_name)}</dd>
+      <dt class="col-sm-3">Altegio Record ID</dt>
+      <dd class="col-sm-9">{_esc(str(rec.altegio_record_id))}</dd>
+      <dt class="col-sm-3">Client</dt>
+      <dd class="col-sm-9">{_esc(rec.display_name or '')} {phone_link}</dd>
+      <dt class="col-sm-3">Starts At</dt>
+      <dd class="col-sm-9">{_esc(_fmt_dt(rec.starts_at, tz))}</dd>
+      <dt class="col-sm-3">Ends At</dt>
+      <dd class="col-sm-9">{_esc(_fmt_dt(rec.ends_at, tz))}</dd>
+      <dt class="col-sm-3">Deleted</dt>
+      <dd class="col-sm-9">{'Yes' if rec.is_deleted else 'No'}</dd>
+      <dt class="col-sm-3">Staff</dt>
+      <dd class="col-sm-9">{_esc(rec.staff_name or '')}</dd>
+    </dl>
+  </div>
+</div>
+"""
+
+    ev_cols = ['Event ID', 'Received At', 'Event Status', 'Processing Status', 'Error']
+    ev_rows = []
+    for e in altegio_events:
+        ev_rows.append([
+            str(e.id),
+            _esc(_fmt_dt(e.received_at, tz)),
+            _status_badge(e.event_status) if e.event_status else '',
+            _status_badge(e.status),
+            f'<span class="text-danger small">{_esc((e.error or "")[:80])}</span>',
+        ])
+
+    events_section = f"""
+<h5>Altegio Events</h5>
+{_table(ev_cols, ev_rows) if ev_rows else '<p class="text-muted">No altegio events found.</p>'}
+"""
+
+    j_cols = ['ID', 'Type', 'Status', 'Run At', 'Created At', 'Attempts', 'Error']
+    j_rows = []
+    for jb in jobs:
+        j_rows.append([
+            f'<a href="/ops/job/{jb.id}">{jb.id}</a>',
+            _esc(jb.job_type),
+            _status_badge(jb.status),
+            _esc(_fmt_dt(jb.run_at, tz)),
+            _esc(_fmt_dt(jb.created_at, tz)),
+            f'{jb.attempts}/{jb.max_attempts}',
+            f'<span class="text-danger small">{_esc((jb.last_error or "")[:80])}</span>',
+        ])
+
+    jobs_section = f"""
+<h5>Message Jobs</h5>
+{_table(j_cols, j_rows) if j_rows else '<p class="text-muted">No jobs found.</p>'}
+"""
+
+    om_cols = ['ID', 'Status', 'WA Delivery', 'Phone', 'Template', 'Sent At', 'Error']
+    om_rows = []
+    for r in outbox_rows:
+        om_rows.append([
+            f'<a href="/ops/outbox/{r.id}">{r.id}</a>',
+            _status_badge(r.status),
+            _status_badge(r.wa_status) if r.wa_status else '',
+            _esc(r.phone_e164),
+            _esc(r.template_code),
+            _esc(_fmt_dt(r.ts, tz)),
+            f'<span class="text-danger small">{_esc((r.error or "")[:80])}</span>',
+        ])
+
+    outbox_section = f"""
+<h5>Outbox Messages</h5>
+{_table(om_cols, om_rows) if om_rows else '<p class="text-muted">No outbox messages.</p>'}
+"""
+
+    body = f"""
+<h4>📅 Record #{record_id}</h4>
+{details}
+{events_section}
+{jobs_section}
+{outbox_section}
+"""
+    return _page(f'Record {record_id}', body)
 
 
 # ---------------------------------------------------------------------------

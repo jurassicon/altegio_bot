@@ -6,6 +6,7 @@ import os
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -22,6 +23,7 @@ from altegio_bot.models.models import (
 )
 from altegio_bot.providers.base import WhatsAppProvider
 from altegio_bot.providers.dummy import DummyProvider, safe_send
+from altegio_bot.settings import settings
 from altegio_bot.whatsapp_routing import pick_sender_code_for_record, pick_sender_id
 
 logger = logging.getLogger('outbox_worker')
@@ -159,13 +161,15 @@ def _fmt_money(value: Decimal | None) -> str:
 def _fmt_date(dt: datetime | None) -> str:
     if dt is None:
         return ''
-    return dt.astimezone().strftime('%d.%m.%Y')
+    tz = ZoneInfo(settings.ops_local_tz)
+    return dt.astimezone(tz).strftime('%d.%m.%Y')
 
 
 def _fmt_time(dt: datetime | None) -> str:
     if dt is None:
         return ''
-    return dt.astimezone().strftime('%H:%M')
+    tz = ZoneInfo(settings.ops_local_tz)
+    return dt.astimezone(tz).strftime('%H:%M')
 
 
 async def _lock_next_jobs(

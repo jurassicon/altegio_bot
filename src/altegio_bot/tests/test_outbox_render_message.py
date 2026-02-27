@@ -213,3 +213,23 @@ def test_render_message_raises_when_no_sender(monkeypatch: Any) -> None:
         raise AssertionError("Expected ValueError, got success")
     except ValueError as exc:
         assert "No active sender" in str(exc)
+
+
+def test_fmt_time_uses_configured_local_timezone(monkeypatch: Any) -> None:
+    """_fmt_time must display the local time, not UTC."""
+    import altegio_bot.workers.outbox_worker as ow_module
+    from altegio_bot.settings import Settings
+
+    # 10:00 UTC = 11:00 in UTC+1 (Europe/Belgrade winter time)
+    dt_utc = datetime(2026, 2, 27, 10, 0, tzinfo=timezone.utc)
+
+    fake_settings = Settings.model_construct(ops_local_tz='Europe/Belgrade')
+    monkeypatch.setattr(ow_module, 'settings', fake_settings)
+
+    assert ow_module._fmt_time(dt_utc) == '11:00'
+    assert ow_module._fmt_date(dt_utc) == '27.02.2026'
+
+
+def test_fmt_time_returns_empty_for_none() -> None:
+    assert ow._fmt_time(None) == ''
+    assert ow._fmt_date(None) == ''
