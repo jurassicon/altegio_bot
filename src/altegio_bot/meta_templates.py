@@ -63,7 +63,7 @@ META_TEMPLATE_MAP: dict[tuple[int, str], str] = {
     (_KA, 'comeback_3d'):
         'kitilash_ka_comeback_3d_v1',
     (_KA, 'newsletter_new_clients_monthly'):
-        'kitilash_ka_newsletter_new_clients_monthly_v1',
+        'kitilash_ka_newsletter_new_clients_monthly_v2',
     # --- Rastatt ---
     # ra_record_created_v1 exists; others fall back to ka_* templates
     (_RA, 'record_created'):
@@ -83,7 +83,7 @@ META_TEMPLATE_MAP: dict[tuple[int, str], str] = {
     (_RA, 'comeback_3d'):
         'kitilash_ka_comeback_3d_v1',
     (_RA, 'newsletter_new_clients_monthly'):
-        'kitilash_ka_newsletter_new_clients_monthly_v1',
+        'kitilash_ka_newsletter_new_clients_monthly_v2',
 }
 
 # Karlsruhe new-client variant for record_created
@@ -219,10 +219,21 @@ def build_template_params(
             ctx.get('booking_link', ''),
         ]
 
-    if n in (
-        'kitilash_ka_comeback_3d_v1',
-        'kitilash_ka_newsletter_new_clients_monthly_v1',
-    ):
+    if n == 'kitilash_ka_comeback_3d_v1':
+        return [
+            ctx.get('client_name', ''),
+            ctx.get('booking_link', ''),
+        ]
+
+    if n == 'kitilash_ka_newsletter_new_clients_monthly_v2':
+        return [
+            ctx.get('client_name', ''),
+            ctx.get('booking_link', ''),
+            ctx.get('loyalty_card_text', ''),
+        ]
+
+    # Legacy v1 – kept for backward compatibility
+    if n == 'kitilash_ka_newsletter_new_clients_monthly_v1':
         return [
             ctx.get('client_name', ''),
             ctx.get('booking_link', ''),

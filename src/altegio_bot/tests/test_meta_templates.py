@@ -71,7 +71,7 @@ def test_resolve_ka_comeback_3d() -> None:
 
 def test_resolve_ka_newsletter() -> None:
     assert resolve_meta_template(KA, 'newsletter_new_clients_monthly') == (
-        'kitilash_ka_newsletter_new_clients_monthly_v1'
+        'kitilash_ka_newsletter_new_clients_monthly_v2'
     )
 
 
@@ -110,7 +110,7 @@ def test_resolve_ra_comeback_3d_uses_canonical_ka() -> None:
 
 def test_resolve_ra_newsletter_uses_canonical_ka() -> None:
     assert resolve_meta_template(RA, 'newsletter_new_clients_monthly') == (
-        'kitilash_ka_newsletter_new_clients_monthly_v1'
+        'kitilash_ka_newsletter_new_clients_monthly_v2'
     )
 
 
@@ -228,6 +228,25 @@ def test_params_comeback_3d() -> None:
 
 
 def test_params_newsletter() -> None:
+    params = build_template_params(
+        'kitilash_ka_newsletter_new_clients_monthly_v2', _CTX
+    )
+    assert params == ['Anna', 'https://booking.link/', '']
+
+
+def test_params_newsletter_with_loyalty_card() -> None:
+    ctx = dict(_CTX, loyalty_card_text='Kundenkarte #0074454347287392')
+    params = build_template_params(
+        'kitilash_ka_newsletter_new_clients_monthly_v2', ctx
+    )
+    assert params == [
+        'Anna',
+        'https://booking.link/',
+        'Kundenkarte #0074454347287392',
+    ]
+
+
+def test_params_newsletter_v1_legacy() -> None:
     params = build_template_params(
         'kitilash_ka_newsletter_new_clients_monthly_v1', _CTX
     )

@@ -49,6 +49,7 @@ MARKETING_JOB_TYPES = (
     'review_3d',
     'repeat_10d',
     'comeback_3d',
+    'newsletter_new_clients_monthly',
 )
 
 TOKEN_EXPIRED_RETRY_SECONDS = 60
@@ -620,6 +621,13 @@ async def process_job_in_session(
         job.locked_at = None
         job.last_error = f'Template render error: {exc}'
         return
+
+    # Inject job-payload extras that templates may reference.
+    loyalty_card_text = (getattr(job, 'payload', None) or {}).get(
+        'loyalty_card_text', ''
+    )
+    if loyalty_card_text:
+        msg_ctx['loyalty_card_text'] = loyalty_card_text
 
     attempts = getattr(job, 'attempts', 0) + 1
     setattr(job, 'attempts', attempts)

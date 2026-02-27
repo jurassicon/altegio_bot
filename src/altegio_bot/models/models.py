@@ -79,6 +79,58 @@ class AltegioEvent(Base):
     payload: Mapped[dict] = mapped_column(JSONB, default=dict)
 
 
+class SmartTestRun(Base):
+    """Record of a smart-test execution for idempotency and auditing."""
+
+    __tablename__ = 'smart_test_runs'
+
+    id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        autoincrement=True,
+    )
+
+    test_code: Mapped[str] = mapped_column(String(128), index=True)
+    phone_e164: Mapped[str] = mapped_column(String(32), index=True)
+    company_id: Mapped[int] = mapped_column(Integer, index=True)
+    location_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    loyalty_card_id: Mapped[str | None] = mapped_column(
+        String(128), nullable=True
+    )
+    loyalty_card_number: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+    loyalty_card_type_id: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+
+    provider_message_id: Mapped[str | None] = mapped_column(
+        String(128), nullable=True, index=True
+    )
+    template_name: Mapped[str | None] = mapped_column(
+        String(128), nullable=True
+    )
+
+    # pending / pass / fail
+    outcome: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
+    deleted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    delete_status: Mapped[str | None] = mapped_column(
+        String(32), nullable=True
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        index=True,
+    )
+
+    meta: Mapped[dict] = mapped_column(JSONB, default=dict)
+
+
 class Client(Base):
     """
     Клиент в контексте филиала (company_id).
@@ -546,3 +598,118 @@ class WhatsAppEvent(Base):
     query: Mapped[dict] = mapped_column(JSONB, default=dict)
     headers: Mapped[dict] = mapped_column(JSONB, default=dict)
     payload: Mapped[dict] = mapped_column(JSONB, default=dict)
+
+
+class CampaignRun(Base):
+    """Tracks a single execution of a newsletter campaign."""
+
+    __tablename__ = 'campaign_runs'
+
+    id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, autoincrement=True
+    )
+
+    campaign_code: Mapped[str] = mapped_column(String(128), index=True)
+    mode: Mapped[str] = mapped_column(String(32))
+    company_ids: Mapped[list] = mapped_column(JSONB, default=list)
+
+    period_start: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    period_end: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+    status: Mapped[str] = mapped_column(String(32), default='running')
+
+    total_clients_seen: Mapped[int] = mapped_column(Integer, default=0)
+    candidates_count: Mapped[int] = mapped_column(Integer, default=0)
+    excluded_opted_out: Mapped[int] = mapped_column(Integer, default=0)
+    excluded_more_than_one_record: Mapped[int] = mapped_column(
+        Integer, default=0
+    )
+    excluded_has_arrived: Mapped[int] = mapped_column(Integer, default=0)
+    excluded_no_phone: Mapped[int] = mapped_column(Integer, default=0)
+
+    sent_count: Mapped[int] = mapped_column(Integer, default=0)
+    failed_count: Mapped[int] = mapped_column(Integer, default=0)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    meta: Mapped[dict] = mapped_column(JSONB, default=dict)
+
+    recipients: Mapped[list['CampaignRecipient']] = relationship(
+        back_populates='run', cascade='all, delete-orphan'
+    )
+
+
+class CampaignRecipient(Base):
+    """Stores per-client eligibility snapshot and send result for a campaign."""
+
+    __tablename__ = 'campaign_recipients'
+
+    id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, autoincrement=True
+    )
+
+    campaign_run_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey('campaign_runs.id', ondelete='CASCADE'),
+        index=True,
+    )
+
+    company_id: Mapped[int] = mapped_column(Integer, index=True)
+
+    client_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey('clients.id', ondelete='SET NULL'),
+        index=True,
+        nullable=True,
+    )
+    altegio_client_id: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True
+    )
+
+    phone_e164: Mapped[str | None] = mapped_column(
+        String(32), index=True, nullable=True
+    )
+    display_name: Mapped[str | None] = mapped_column(
+        String(256), nullable=True
+    )
+
+    status: Mapped[str] = mapped_column(String(32), default='candidate')
+
+    excluded_reason: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+
+    total_records_in_period: Mapped[int] = mapped_column(Integer, default=0)
+    arrived_records_in_period: Mapped[int] = mapped_column(Integer, default=0)
+    is_opted_out: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    loyalty_card_id: Mapped[str | None] = mapped_column(
+        String(128), nullable=True
+    )
+    loyalty_card_number: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+
+    provider_message_id: Mapped[str | None] = mapped_column(
+        String(128), nullable=True, index=True
+    )
+
+    deleted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    delete_status: Mapped[str | None] = mapped_column(
+        String(32), nullable=True
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    meta: Mapped[dict] = mapped_column(JSONB, default=dict)
+
+    run: Mapped['CampaignRun'] = relationship(back_populates='recipients')
