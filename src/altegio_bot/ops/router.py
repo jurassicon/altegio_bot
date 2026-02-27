@@ -137,7 +137,7 @@ _NAV = """
           <a class="nav-link" href="/ops/history">📨 History</a>
         </li>
         <li class="nav-item">
-          <a class="nav-link" href="/ops/whatsapp/inbox">💬 WA Inbox</a>
+          <a class="nav-link" href="/ops/whatsapp/inbox">💬 WA Events</a>
         </li>
         <li class="nav-item">
           <a class="nav-link" href="/ops/optouts">🚫 Opt-outs</a>
@@ -1153,8 +1153,32 @@ def _detect_cmd(payload: dict | None) -> str:
     return ''
 
 
+def _wa_tabs_html(active_tab: str, base_params: str) -> str:
+    """Render Bootstrap nav-tabs for Inbox / Delivery."""
+    tabs = [
+        ('inbox', '📥 Inbox', 'Входящие сообщения'),
+        ('delivery', '📬 Delivery', 'Статусы доставки'),
+    ]
+    items = []
+    for tab_id, label, title in tabs:
+        params = f'tab={tab_id}'
+        if base_params:
+            params = f'{base_params}&tab={tab_id}'
+        active = ' active' if tab_id == active_tab else ''
+        items.append(
+            f'<li class="nav-item">'
+            f'<a class="nav-link{active}" href="/ops/whatsapp/inbox?{params}"'
+            f' title="{_esc(title)}">{label}</a>'
+            f'</li>'
+        )
+    return '<ul class="nav nav-tabs mb-3">' + ''.join(items) + '</ul>'
+
+
 @router.get('/whatsapp/inbox', response_class=HTMLResponse)
 async def ops_wa_inbox(request: Request) -> str:
+    tab = request.query_params.get('tab', 'inbox')
+    if tab not in ('inbox', 'delivery'):
+        tab = 'inbox'
     pni_filter = request.query_params.get('pni', '')
     from_filter = request.query_params.get('wa_from', '')
     status_filter = request.query_params.get('status', '')
@@ -1162,6 +1186,20 @@ async def ops_wa_inbox(request: Request) -> str:
     period = request.query_params.get('period', '24h')
     from_dt, to_dt = _period_params(request)
     tz = _local_tz()
+
+    # Build base params string (without tab) for tab links
+    base_parts = []
+    if pni_filter:
+        base_parts.append(f'pni={_esc(pni_filter)}')
+    if from_filter:
+        base_parts.append(f'wa_from={_esc(from_filter)}')
+    if status_filter:
+        base_parts.append(f'status={_esc(status_filter)}')
+    if only_cmds:
+        base_parts.append(f'only_commands={_esc(only_cmds)}')
+    if period and period != '24h':
+        base_parts.append(f'period={_esc(period)}')
+    base_params_str = '&'.join(base_parts)
 
     async with SessionLocal() as session:
         # NOTE: all user inputs go into `params` as bound parameters;
@@ -1178,38 +1216,77 @@ async def ops_wa_inbox(request: Request) -> str:
                 '= :pni'
             )
             params['pni'] = pni_filter
-        if from_filter:
+
+        if tab == 'inbox':
+            # Only inbound messages: messages[0].id must exist
             filters.append(
-                "we.payload #>> '{entry,0,changes,0,value,messages,0,from}' "
-                'ILIKE :wa_from'
+                "we.payload #> '{entry,0,changes,0,value,messages,0,id}' IS NOT NULL"
             )
-            params['wa_from'] = f'%{from_filter}%'
-        if status_filter and _safe_identifier(status_filter):
-            filters.append('we.status = :status_filter')
-            params['status_filter'] = status_filter
-        if only_cmds == '1':
+            if from_filter:
+                filters.append(
+                    "we.payload #>> '{entry,0,changes,0,value,messages,0,from}' "
+                    'ILIKE :wa_from'
+                )
+                params['wa_from'] = f'%{from_filter}%'
+            if status_filter and _safe_identifier(status_filter):
+                filters.append('we.status = :status_filter')
+                params['status_filter'] = status_filter
+            if only_cmds == '1':
+                filters.append(
+                    "upper(trim(we.payload #>> "
+                    "'{entry,0,changes,0,value,messages,0,text,body}')) "
+                    "IN ('STOP','START')"
+                )
+
+            where = ' AND '.join(filters)
+            rows_q = await session.execute(
+                text(f"""
+                    SELECT
+                      we.id,
+                      we.received_at,
+                      we.status,
+                      we.error,
+                      we.payload
+                    FROM whatsapp_events we
+                    WHERE {where}
+                    ORDER BY we.received_at DESC
+                    LIMIT 200
+                """),
+                params,
+            )
+            rows = rows_q.fetchall()
+
+        else:
+            # delivery tab: only status events, deduplicated by (status_msg_id, status_value)
             filters.append(
-                "upper(trim(we.payload #>> '{entry,0,changes,0,value,messages,0,text,body}')) "
-                "IN ('STOP','START')"
+                "we.payload #> '{entry,0,changes,0,value,statuses,0,id}' IS NOT NULL"
             )
 
-        where = ' AND '.join(filters)
-        rows_q = await session.execute(
-            text(f"""
-                SELECT
-                  we.id,
-                  we.received_at,
-                  we.status,
-                  we.error,
-                  we.payload
-                FROM whatsapp_events we
-                WHERE {where}
-                ORDER BY we.received_at DESC
-                LIMIT 200
-            """),
-            params,
-        )
-        rows = rows_q.fetchall()
+            where = ' AND '.join(filters)
+            rows_q = await session.execute(
+                text(f"""
+                    SELECT
+                      we.payload #>> '{{entry,0,changes,0,value,statuses,0,id}}' AS status_msg_id,
+                      we.payload #>> '{{entry,0,changes,0,value,statuses,0,status}}' AS status_value,
+                      we.payload #>> '{{entry,0,changes,0,value,metadata,phone_number_id}}' AS pni,
+                      we.payload #>> '{{entry,0,changes,0,value,statuses,0,errors,0,code}}' AS err_code,
+                      we.payload #>> '{{entry,0,changes,0,value,statuses,0,errors,0,title}}' AS err_details,
+                      max(we.received_at) AS received_at,
+                      count(*) AS cnt
+                    FROM whatsapp_events we
+                    WHERE {where}
+                    GROUP BY
+                      status_msg_id,
+                      status_value,
+                      pni,
+                      err_code,
+                      err_details
+                    ORDER BY received_at DESC
+                    LIMIT 200
+                """),
+                params,
+            )
+            rows = rows_q.fetchall()
 
     def _pni_from_payload(p: dict) -> str:
         try:
@@ -1231,50 +1308,84 @@ async def ops_wa_inbox(request: Request) -> str:
         except Exception:
             return ''
 
-    form = _filter_form('/ops/whatsapp/inbox', [
-        ('pni', 'Phone Number ID', 'text', pni_filter),
-        ('wa_from', 'From (phone)', 'text', from_filter),
-        ('status', 'Status', 'select:received,ignored,processed,failed', status_filter),
-        ('only_commands', 'Only STOP/START', 'select:,1', only_cmds),
-        ('period', 'Period', 'select:24h,today,7d', period),
-    ])
+    tabs_html = _wa_tabs_html(tab, base_params_str)
 
-    cols = ['ID', 'Received At', 'PNI', 'From', 'Body', 'Cmd', 'Status', 'Error']
-    table_rows = []
-    row_classes = []
-    for r in rows:
-        payload = r.payload or {}
-        pni = _pni_from_payload(payload)
-        wa_from = _from_from_payload(payload)
-        msg_body = _body_from_payload(payload)
-        cmd = _detect_cmd(payload)
-        cmd_badge = ''
-        if cmd == 'stop':
-            cmd_badge = '<span class="badge bg-danger">STOP</span>'
-        elif cmd == 'start':
-            cmd_badge = '<span class="badge bg-success">START</span>'
-        row_class = 'warn' if r.status == 'ignored' else (
-            'stuck' if r.status == 'failed' else ''
-        )
-        table_rows.append([
-            str(r.id),
-            _esc(_fmt_dt(r.received_at, tz)),
-            _esc(pni[:30]),
-            _esc(wa_from),
-            _esc((msg_body or '')[:60]),
-            cmd_badge,
-            _status_badge(r.status),
-            f'<span class="small text-muted">{_esc((r.error or "")[:80])}</span>',
+    if tab == 'inbox':
+        form = _filter_form('/ops/whatsapp/inbox', [
+            ('pni', 'Phone Number ID', 'text', pni_filter),
+            ('wa_from', 'From (phone)', 'text', from_filter),
+            ('status', 'Status', 'select:received,ignored,processed,failed', status_filter),
+            ('only_commands', 'Only STOP/START', 'select:,1', only_cmds),
+            ('period', 'Period', 'select:24h,today,7d', period),
         ])
-        row_classes.append(row_class)
+        cols = ['ID', 'Received At', 'PNI', 'From', 'Body', 'Cmd', 'Status', 'Error']
+        table_rows = []
+        row_classes = []
+        for r in rows:
+            payload = r.payload or {}
+            pni = _pni_from_payload(payload)
+            wa_from = _from_from_payload(payload)
+            msg_body = _body_from_payload(payload)
+            cmd = _detect_cmd(payload)
+            cmd_badge = ''
+            if cmd == 'stop':
+                cmd_badge = '<span class="badge bg-danger">STOP</span>'
+            elif cmd == 'start':
+                cmd_badge = '<span class="badge bg-success">START</span>'
+            row_class = 'warn' if r.status == 'ignored' else (
+                'stuck' if r.status == 'failed' else ''
+            )
+            table_rows.append([
+                str(r.id),
+                _esc(_fmt_dt(r.received_at, tz)),
+                _esc(pni[:30]),
+                _esc(wa_from),
+                _esc((msg_body or '')[:60]),
+                cmd_badge,
+                _status_badge(r.status),
+                f'<span class="small text-muted">{_esc((r.error or "")[:80])}</span>',
+            ])
+            row_classes.append(row_class)
 
-    body = f"""
-<h4>💬 WhatsApp Inbox</h4>
+        body = f"""
+<h4>💬 WhatsApp Events</h4>
+{tabs_html}
 {form}
 <p class="text-muted small">Showing {len(rows)} rows · period {_esc(period)}</p>
 {_table(cols, table_rows, row_classes)}
 """
-    return _page('WA Inbox', body)
+    else:
+        form = _filter_form('/ops/whatsapp/inbox', [
+            ('pni', 'Phone Number ID', 'text', pni_filter),
+            ('period', 'Period', 'select:24h,today,7d', period),
+        ])
+        cols = ['Status Msg ID', 'Status', 'PNI', 'Err Code', 'Err Details', 'Last Seen', 'Count']
+        table_rows = []
+        row_classes = []
+        for r in rows:
+            status_badge = _status_badge(r.status_value) if r.status_value else ''
+            err_html = f'<span class="text-danger small">{_esc(r.err_code or "")}</span>'
+            row_class = 'stuck' if r.err_code else ''
+            table_rows.append([
+                _esc((r.status_msg_id or '')[:60]),
+                status_badge,
+                _esc((r.pni or '')[:30]),
+                err_html,
+                _esc((r.err_details or '')[:80]),
+                _esc(_fmt_dt(r.received_at, tz)),
+                _esc(str(r.cnt)),
+            ])
+            row_classes.append(row_class)
+
+        body = f"""
+<h4>💬 WhatsApp Events</h4>
+{tabs_html}
+{form}
+<p class="text-muted small">Showing {len(rows)} aggregated statuses · period {_esc(period)}</p>
+{_table(cols, table_rows, row_classes)}
+"""
+
+    return _page('WA Events', body)
 
 
 # ---------------------------------------------------------------------------
