@@ -1272,6 +1272,102 @@ async def ops_monitoring() -> str:
         )
         last_cmds = last_cmds_q.fetchall()
 
+        # --- Queue breakdown by job type ---
+        queue_by_type_q = await session.execute(
+            text("""
+                SELECT
+                  job_type,
+                  COUNT(*) FILTER (WHERE status='queued')     AS queued_cnt,
+                  COUNT(*) FILTER (WHERE status='processing') AS proc_cnt,
+                  COUNT(*) FILTER (
+                    WHERE status='failed' AND updated_at >= :w24h
+                  )                                           AS failed_24h
+                FROM message_jobs
+                GROUP BY job_type
+                ORDER BY queued_cnt DESC, job_type
+            """),
+            {'w24h': window_24h},
+        )
+        queue_by_type = queue_by_type_q.fetchall()
+
+        # --- Scheduled Reminders (next 15 min) ---
+        next_15m = now + timedelta(minutes=15)
+        scheduled_q = await session.execute(
+            text("""
+                SELECT
+                  job_type,
+                  COUNT(*) AS cnt,
+                  MIN(run_at) AS next_run
+                FROM message_jobs
+                WHERE status = 'queued'
+                  AND run_at >= :now
+                  AND run_at <= :next_15m
+                GROUP BY job_type
+                ORDER BY next_run
+            """),
+            {'now': now, 'next_15m': next_15m},
+        )
+        scheduled_rows = scheduled_q.fetchall()
+
+        # --- Outbox status distribution (24h) ---
+        outbox_status_q = await session.execute(
+            text("""
+                SELECT status, COUNT(*) AS cnt
+                FROM outbox_messages
+                WHERE created_at >= :w24h
+                GROUP BY status
+                ORDER BY cnt DESC
+            """),
+            {'w24h': window_24h},
+        )
+        outbox_status_rows = outbox_status_q.fetchall()
+
+        # Outbox throughput (last 1h)
+        outbox_speed_q = await session.execute(
+            text("""
+                SELECT COUNT(*) AS sent_1h
+                FROM outbox_messages
+                WHERE status IN ('sent', 'delivered', 'read')
+                  AND sent_at >= :w1h
+            """),
+            {'w1h': window_1h},
+        )
+        ob_speed = outbox_speed_q.fetchone()
+
+        # --- Problematic tasks ---
+        overdue_q = await session.execute(
+            text("""
+                SELECT COUNT(*) AS overdue_cnt
+                FROM message_jobs
+                WHERE status = 'queued' AND run_at < :now
+            """),
+            {'now': now},
+        )
+        overdue_row = overdue_q.fetchone()
+
+        locked_q = await session.execute(
+            text("""
+                SELECT COUNT(*) AS locked_cnt
+                FROM message_jobs
+                WHERE locked_at IS NOT NULL AND status = 'queued'
+            """)
+        )
+        locked_row = locked_q.fetchone()
+
+        no_outbox_q = await session.execute(
+            text("""
+                SELECT COUNT(*) AS no_outbox_cnt
+                FROM message_jobs mj
+                WHERE mj.status = 'done'
+                  AND mj.updated_at >= :w24h
+                  AND NOT EXISTS (
+                    SELECT 1 FROM outbox_messages om WHERE om.job_id = mj.id
+                  )
+            """),
+            {'w24h': window_24h},
+        )
+        no_outbox_row = no_outbox_q.fetchone()
+
     # ---- Build HTML ----
 
     # 1) API Health
@@ -1366,6 +1462,60 @@ async def ops_monitoring() -> str:
 </div>
 """
 
+    # 3b) Queue breakdown by job type
+    queue_by_type_html = ''
+    for qt_row in queue_by_type:
+        queue_by_type_html += (
+            f'<tr>'
+            f'<td>{_esc(qt_row.job_type)}</td>'
+            f'<td>{qt_row.queued_cnt}</td>'
+            f'<td>{qt_row.proc_cnt}</td>'
+            f'<td>{qt_row.failed_24h}</td>'
+            f'</tr>'
+        )
+    queue_by_type_section = f"""
+<div class="card mb-3">
+  <div class="card-header">📊 Queue by Job Type</div>
+  <div class="card-body">
+    <table class="table table-sm mb-0">
+      <thead><tr>
+        <th>Job Type</th><th>Queued</th><th>Processing</th><th>Failed (24h)</th>
+      </tr></thead>
+      <tbody>
+        {queue_by_type_html or '<tr><td colspan="4" class="text-muted">No jobs</td></tr>'}
+      </tbody>
+    </table>
+  </div>
+</div>
+"""
+
+    # 3c) Scheduled Reminders (next 15 min)
+    scheduled_html = ''
+    for sr in scheduled_rows:
+        next_run_str = _fmt_dt(sr.next_run, tz)
+        scheduled_html += (
+            f'<tr>'
+            f'<td>{_esc(sr.job_type)}</td>'
+            f'<td>{sr.cnt}</td>'
+            f'<td>{_esc(next_run_str)}</td>'
+            f'</tr>'
+        )
+    scheduled_section = f"""
+<div class="card mb-3">
+  <div class="card-header">⏰ Scheduled Reminders (next 15 min)</div>
+  <div class="card-body">
+    <table class="table table-sm mb-0">
+      <thead><tr>
+        <th>Job Type</th><th>Count</th><th>Next Run</th>
+      </tr></thead>
+      <tbody>
+        {scheduled_html or '<tr><td colspan="3" class="text-muted">No reminders scheduled in the next 15 minutes</td></tr>'}
+      </tbody>
+    </table>
+  </div>
+</div>
+"""
+
     # 4) Outbox Health
     ob_total = ob.total_cnt or 0
     ob_sent = ob.sent_cnt or 0
@@ -1392,6 +1542,26 @@ async def ops_monitoring() -> str:
             f'</li>'
         )
 
+    _STATUS_BADGE_COLORS = {
+        'queued': 'secondary',
+        'sending': 'primary',
+        'sent': 'success',
+        'delivered': 'success',
+        'read': 'info',
+        'failed': 'danger',
+    }
+    outbox_status_html = ''
+    for row in outbox_status_rows:
+        color = _STATUS_BADGE_COLORS.get(row.status, 'secondary')
+        outbox_status_html += (
+            f'<li class="list-group-item d-flex justify-content-between align-items-center">'
+            f'{_esc(row.status)}'
+            f'<span class="badge bg-{color} rounded-pill">{row.cnt}</span>'
+            f'</li>'
+        )
+
+    ob_sent_1h = ob_speed.sent_1h if ob_speed else 0
+
     outbox_html = f"""
 <div class="card mb-3 {ob_border}">
   <div class="card-header">📨 Outbox Health (24h)</div>
@@ -1411,15 +1581,24 @@ async def ops_monitoring() -> str:
           Fail rate: {fail_rate}%
         </span>
       </div>
+      <div class="col-auto">
+        <span class="badge bg-primary fs-6">Throughput (1h): {ob_sent_1h}</span>
+      </div>
     </div>
     <div class="row g-3">
-      <div class="col-md-6">
+      <div class="col-md-4">
+        <p class="fw-bold mb-1">Status Distribution (24h)</p>
+        <ul class="list-group list-group-flush">
+          {outbox_status_html or '<li class="list-group-item text-muted">No messages</li>'}
+        </ul>
+      </div>
+      <div class="col-md-4">
         <p class="fw-bold mb-1">Top Outbox Errors</p>
         <ul class="list-group list-group-flush">
           {top_errors_html or '<li class="list-group-item text-muted">None</li>'}
         </ul>
       </div>
-      <div class="col-md-6">
+      <div class="col-md-4">
         <p class="fw-bold mb-1">Top WA Delivery Errors</p>
         <ul class="list-group list-group-flush">
           {wa_errors_html or '<li class="list-group-item text-muted">None</li>'}
@@ -1473,6 +1652,43 @@ async def ops_monitoring() -> str:
 </div>
 """
 
+    # 6) Problematic tasks
+    overdue_cnt = overdue_row.overdue_cnt if overdue_row else 0
+    locked_cnt = locked_row.locked_cnt if locked_row else 0
+    no_outbox_cnt = no_outbox_row.no_outbox_cnt if no_outbox_row else 0
+    problems_border = (
+        'border-danger'
+        if overdue_cnt > 0 or locked_cnt > 0
+        else 'border-success'
+    )
+    overdue_cls = 'bg-danger' if overdue_cnt > 0 else 'bg-success'
+    locked_cls = 'bg-danger' if locked_cnt > 0 else 'bg-success'
+    no_outbox_cls = 'bg-warning text-dark' if no_outbox_cnt > 0 else 'bg-success'
+    problems_html = f"""
+<div class="card mb-3 {problems_border}">
+  <div class="card-header">🔍 Problematic Tasks</div>
+  <div class="card-body">
+    <div class="row g-3">
+      <div class="col-auto">
+        <span class="badge {overdue_cls} fs-6">
+          Overdue (queued past run_at): {overdue_cnt}
+        </span>
+      </div>
+      <div class="col-auto">
+        <span class="badge {locked_cls} fs-6">
+          Locked (queued + locked_at set): {locked_cnt}
+        </span>
+      </div>
+      <div class="col-auto">
+        <span class="badge {no_outbox_cls} fs-6">
+          Done without outbox (24h): {no_outbox_cnt}
+        </span>
+      </div>
+    </div>
+  </div>
+</div>
+"""
+
     warnings = []
     if altegio_warn:
         warnings.append('⚠️ Last Altegio webhook > 15 minutes ago')
@@ -1485,6 +1701,10 @@ async def ops_monitoring() -> str:
             f'⚠️ {ob_failed} failed outbox messages in last 24h '
             f'(threshold: {settings.ops_failed_warning_threshold})'
         )
+    if overdue_cnt > 0:
+        warnings.append(f'⚠️ {overdue_cnt} overdue queued job(s) past their run_at')
+    if locked_cnt > 0:
+        warnings.append(f'⚠️ {locked_cnt} job(s) locked but still in queued status')
 
     warnings_html = ''
     if warnings:
@@ -1505,7 +1725,10 @@ async def ops_monitoring() -> str:
 {health_html}
 {ingress_html}
 {queue_html}
+{queue_by_type_section}
+{scheduled_section}
 {outbox_html}
+{problems_html}
 {optout_html}
 """
     return _page('Monitoring', body)

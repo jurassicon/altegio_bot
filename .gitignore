@@ -46,3 +46,4 @@ project_tree.txt
 # ===== Alembic cache files (миграции НЕ игнорим) =====
 alembic/**/__pycache__/
 alembic/**/*.py[cod]
+test.db
