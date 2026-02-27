@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncGenerator
 from datetime import datetime, timezone
+from urllib.parse import urlencode
 
 import pytest
 import pytest_asyncio
@@ -10,7 +11,7 @@ from httpx import ASGITransport, AsyncClient
 
 import altegio_bot.ops.router as ops_router_module
 from altegio_bot.main import app
-from altegio_bot.models.models import AltegioEvent, MessageJob, Record
+from altegio_bot.models.models import AltegioEvent, Client, MessageJob, OutboxMessage, Record
 from altegio_bot.ops.auth import require_ops_auth
 
 
@@ -187,4 +188,87 @@ async def test_ops_record_shows_full_timeline(
     assert 'Altegio Events' in response.text
     assert 'Message Jobs' in response.text
     assert 'comeback_3d' in response.text
+
+
+@pytest.mark.asyncio
+async def test_ops_history_phone_search_with_country_code(
+    http_client: AsyncClient,
+    session_maker,
+) -> None:
+    """History phone filter finds messages even when stored phone lacks country code."""
+    now = datetime.now(timezone.utc)
+    async with session_maker() as session:
+        async with session.begin():
+            # phone stored in local format (without country code / without +)
+            client = Client(
+                id=50,
+                company_id=1,
+                altegio_client_id=50,
+                display_name='Phone Test',
+                phone_e164='736855823',
+                raw={},
+            )
+            session.add(client)
+            await session.flush()
+
+            msg = OutboxMessage(
+                company_id=1,
+                client_id=50,
+                phone_e164='736855823',
+                template_code='record_created',
+                language='de',
+                body='Test',
+                status='sent',
+                scheduled_at=now,
+                sent_at=now,
+                meta={},
+            )
+            session.add(msg)
+
+    # Search with country-code prefix: '491736855823' should find '736855823'
+    response = await http_client.get(
+        '/ops/history?' + urlencode({'phone_e164': '491736855823', 'period': '24h'})
+    )
+    assert response.status_code == 200
+    assert '736855823' in response.text
+
+    # Searching without country code should also work
+    response2 = await http_client.get(
+        '/ops/history?' + urlencode({'phone_e164': '736855823', 'period': '24h'})
+    )
+    assert response2.status_code == 200
+    assert '736855823' in response2.text
+
+
+@pytest.mark.asyncio
+async def test_ops_optouts_deduplication(
+    http_client: AsyncClient,
+    session_maker,
+) -> None:
+    """Optouts page shows one row per (company, phone) even when multiple client
+    records share the same phone."""
+    opted_out_at = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    phone = '+381638400431'
+    async with session_maker() as session:
+        async with session.begin():
+            # Three client records for the same company+phone
+            for cid, acid in [(60, 60), (61, 61), (62, 62)]:
+                session.add(
+                    Client(
+                        id=cid,
+                        company_id=1,
+                        altegio_client_id=acid,
+                        display_name='Dup Test',
+                        phone_e164=phone,
+                        wa_opted_out=True,
+                        wa_opted_out_at=opted_out_at,
+                        wa_opt_out_reason='wa:stop',
+                        raw={},
+                    )
+                )
+
+    response = await http_client.get('/ops/optouts')
+    assert response.status_code == 200
+    # The phone should appear exactly once (deduplicated by company+phone)
+    assert response.text.count(phone) == 1
 
