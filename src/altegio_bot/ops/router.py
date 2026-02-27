@@ -6,6 +6,7 @@ All routes on `router` are protected by require_ops_auth.
 from __future__ import annotations
 
 import json
+import re
 import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -476,8 +477,14 @@ async def ops_history(request: Request) -> str:
             filters.append('om.template_code = :template_code')
             params['template_code'] = template_code
         if phone:
-            filters.append('om.phone_e164 ILIKE :phone')
-            params['phone'] = f'%{phone}%'
+            phone_digits = re.sub(r'\D', '', phone.strip())
+            if phone_digits:
+                filters.append(
+                    "(replace(om.phone_e164, '+', '') ILIKE :phone_pattern "
+                    "OR :phone_digits ILIKE '%' || replace(om.phone_e164, '+', '') || '%')"
+                )
+                params['phone_pattern'] = f'%{phone_digits}%'
+                params['phone_digits'] = phone_digits
         if provider_msg_id:
             filters.append('om.provider_message_id ILIKE :pmid')
             params['pmid'] = f'%{provider_msg_id}%'
@@ -1263,8 +1270,14 @@ async def ops_optouts(request: Request) -> str:
             filters.append('c.company_id = :company_id')
             params['company_id'] = int(company_id)
         if phone:
-            filters.append('c.phone_e164 ILIKE :phone')
-            params['phone'] = f'%{phone}%'
+            phone_digits = re.sub(r'\D', '', phone.strip())
+            if phone_digits:
+                filters.append(
+                    "(replace(c.phone_e164, '+', '') ILIKE :phone_pattern "
+                    "OR :phone_digits ILIKE '%' || replace(c.phone_e164, '+', '') || '%')"
+                )
+                params['phone_pattern'] = f'%{phone_digits}%'
+                params['phone_digits'] = phone_digits
 
         now = datetime.now(timezone.utc)
         if period == 'today':
@@ -1292,25 +1305,28 @@ async def ops_optouts(request: Request) -> str:
         where = ' AND '.join(filters)
         rows_q = await session.execute(
             text(f"""
-                SELECT
-                  c.id, c.company_id, c.display_name, c.phone_e164,
-                  c.wa_opted_out_at, c.wa_opt_out_reason,
-                  -- last STOP command event
-                  (
-                    SELECT we.id
-                    FROM whatsapp_events we
-                    WHERE
-                      upper(trim(
-                        we.payload #>> '{{entry,0,changes,0,value,messages,0,text,body}}'
-                      )) = 'STOP'
-                      AND we.payload #>> '{{entry,0,changes,0,value,messages,0,from}}'
-                          LIKE '%' || replace(c.phone_e164, '+', '') || '%'
-                    ORDER BY we.received_at DESC
-                    LIMIT 1
-                  ) AS last_stop_event_id
-                FROM clients c
-                WHERE {where}
-                ORDER BY c.wa_opted_out_at DESC NULLS LAST
+                SELECT * FROM (
+                  SELECT DISTINCT ON (c.company_id, c.phone_e164)
+                    c.id, c.company_id, c.display_name, c.phone_e164,
+                    c.wa_opted_out_at, c.wa_opt_out_reason,
+                    -- last STOP command event
+                    (
+                      SELECT we.id
+                      FROM whatsapp_events we
+                      WHERE
+                        upper(trim(
+                          we.payload #>> '{{entry,0,changes,0,value,messages,0,text,body}}'
+                        )) = 'STOP'
+                        AND we.payload #>> '{{entry,0,changes,0,value,messages,0,from}}'
+                            LIKE '%' || replace(c.phone_e164, '+', '') || '%'
+                      ORDER BY we.received_at DESC
+                      LIMIT 1
+                    ) AS last_stop_event_id
+                  FROM clients c
+                  WHERE {where}
+                  ORDER BY c.company_id, c.phone_e164, c.wa_opted_out_at DESC NULLS LAST
+                ) sub
+                ORDER BY sub.wa_opted_out_at DESC NULLS LAST
                 LIMIT 200
             """),
             params,
