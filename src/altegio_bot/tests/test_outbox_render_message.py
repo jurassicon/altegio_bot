@@ -108,7 +108,7 @@ def test_render_message_renders_services_and_total_cost(monkeypatch: Any) -> Non
     )
     client = FakeClient(id=1, display_name="Anna")
 
-    body, sender_id, lang = run(
+    body, sender_id, lang, _ctx = run(
         ow._render_message(
             session=session,  # type: ignore[arg-type]
             company_id=758285,
@@ -158,7 +158,7 @@ def test_render_message_adds_notes_for_new_client(monkeypatch: Any) -> None:
     )
     client = FakeClient(id=1, display_name="Anna")
 
-    body, sender_id, lang = run(
+    body, sender_id, lang, _ctx = run(
         ow._render_message(
             session=session,  # type: ignore[arg-type]
             company_id=758285,

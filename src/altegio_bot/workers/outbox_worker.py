@@ -12,6 +12,11 @@ from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.db import SessionLocal
+from altegio_bot.meta_templates import (
+    TEMPLATE_LANGUAGE,
+    build_template_params,
+    resolve_meta_template,
+)
 from altegio_bot.models.models import (
     Client,
     ContactRateLimit,
@@ -22,7 +27,7 @@ from altegio_bot.models.models import (
     RecordService,
 )
 from altegio_bot.providers.base import WhatsAppProvider
-from altegio_bot.providers.dummy import DummyProvider, safe_send
+from altegio_bot.providers.dummy import DummyProvider, safe_send, safe_send_template
 from altegio_bot.settings import settings
 from altegio_bot.whatsapp_routing import pick_sender_code_for_record, pick_sender_id
 
@@ -358,7 +363,7 @@ async def _render_message(
     template_code: str,
     record: Record | None,
     client: Client | None,
-) -> tuple[str, int, str]:
+) -> tuple[str, int, str, dict[str, Any]]:
     language = _pick_language(company_id, client)
 
     tmpl, used_lang = await _load_template(
@@ -433,7 +438,7 @@ async def _render_message(
         if is_new:
             pre_appointment_notes = PRE_APPOINTMENT_NOTES_DE
 
-    ctx = {
+    ctx: dict[str, Any] = {
         'client_name': (client.display_name if client else ''),
         'staff_name': (record.staff_name if record else ''),
         'date': _fmt_date(record.starts_at if record else None),
@@ -450,7 +455,7 @@ async def _render_message(
     }
 
     body = tmpl.body.format(**ctx)
-    return body, sender_id, used_lang
+    return body, sender_id, used_lang, ctx
 
 
 async def _load_job(
@@ -602,7 +607,7 @@ async def process_job_in_session(
         return
 
     try:
-        body, sender_id, lang = await _render_message(
+        body, sender_id, lang, msg_ctx = await _render_message(
             session=session,
             company_id=job.company_id,
             template_code=job.job_type,
@@ -618,12 +623,55 @@ async def process_job_in_session(
     attempts = getattr(job, 'attempts', 0) + 1
     setattr(job, 'attempts', attempts)
 
-    msg_id, err = await safe_send(
-        provider=provider,
-        sender_id=sender_id,
-        phone=phone,
-        text=body,
-    )
+    send_mode = settings.whatsapp_send_mode.strip().lower()
+    use_template = send_mode in ('template', 'auto')
+
+    meta_template_name: str | None = None
+    template_params: list[str] = []
+
+    if use_template:
+        is_new = bool(msg_ctx.get('pre_appointment_notes', ''))
+        meta_template_name = resolve_meta_template(
+            job.company_id,
+            job.job_type,
+            is_new_client=is_new,
+        )
+        if meta_template_name is None:
+            logger.warning(
+                'No Meta template for company=%s job_type=%s; '
+                'falling back to text send',
+                job.company_id,
+                job.job_type,
+            )
+            use_template = False
+        else:
+            template_params = build_template_params(
+                meta_template_name, msg_ctx
+            )
+
+    if use_template:
+        assert meta_template_name is not None
+        msg_id, err = await safe_send_template(
+            provider=provider,
+            sender_id=sender_id,
+            phone=phone,
+            template_name=meta_template_name,
+            language=TEMPLATE_LANGUAGE,
+            params=template_params,
+        )
+        send_meta: dict[str, Any] = {
+            'send_mode': 'template',
+            'meta_template_name': meta_template_name,
+            'template_params': template_params,
+        }
+    else:
+        msg_id, err = await safe_send(
+            provider=provider,
+            sender_id=sender_id,
+            phone=phone,
+            text=body,
+        )
+        send_meta = {'send_mode': 'text'}
 
     if err is not None:
         out = OutboxMessage(
@@ -641,7 +689,7 @@ async def process_job_in_session(
             provider_message_id=msg_id,
             scheduled_at=job.run_at,
             sent_at=utcnow(),
-            meta={},
+            meta=send_meta,
         )
         session.add(out)
 
@@ -682,7 +730,7 @@ async def process_job_in_session(
         provider_message_id=msg_id,
         scheduled_at=job.run_at,
         sent_at=utcnow(),
-        meta={},
+        meta=send_meta,
     )
     session.add(out)
 
@@ -691,11 +739,14 @@ async def process_job_in_session(
     job.last_error = None
 
     logger.info(
-        'Outbox sent job_id=%s outbox_id=%s sender_id=%s phone=%s',
+        'Outbox sent job_id=%s outbox_id=%s sender_id=%s phone=%s '
+        'send_mode=%s template=%s',
         job.id,
         getattr(out, 'id', None),
         sender_id,
         phone,
+        send_meta.get('send_mode'),
+        send_meta.get('meta_template_name'),
     )
 
 

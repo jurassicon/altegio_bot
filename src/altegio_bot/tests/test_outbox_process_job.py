@@ -256,7 +256,7 @@ def test_process_job_creates_outbox_on_send_ok(monkeypatch: Any) -> None:
         return None
 
     async def fake_render(*args: Any, **kwargs: Any) -> Any:
-        return ("TEXT", 123, "de")
+        return ("TEXT", 123, "de", {})
 
     async def fake_safe_send(*args: Any, **kwargs: Any) -> Any:
         return ("msg-1", None)
@@ -268,6 +268,7 @@ def test_process_job_creates_outbox_on_send_ok(monkeypatch: Any) -> None:
     monkeypatch.setattr(ow, "_apply_rate_limit", fake_apply_rl)
     monkeypatch.setattr(ow, "_render_message", fake_render)
     monkeypatch.setattr(ow, "safe_send", fake_safe_send)
+    monkeypatch.setattr(ow, "safe_send_template", fake_safe_send)
     monkeypatch.setattr(ow, "utcnow", lambda: fixed_now)
     monkeypatch.setattr(ow, "OutboxMessage", FakeOutbox)
 
@@ -312,7 +313,7 @@ def test_process_job_requeues_on_send_fail(monkeypatch: Any) -> None:
         return None
 
     async def fake_render(*args: Any, **kwargs: Any) -> Any:
-        return ("TEXT", 123, "de")
+        return ("TEXT", 123, "de", {})
 
     async def fake_safe_send(*args: Any, **kwargs: Any) -> Any:
         return ("msg-2", "provider error")
@@ -324,6 +325,7 @@ def test_process_job_requeues_on_send_fail(monkeypatch: Any) -> None:
     monkeypatch.setattr(ow, "_apply_rate_limit", fake_apply_rl)
     monkeypatch.setattr(ow, "_render_message", fake_render)
     monkeypatch.setattr(ow, "safe_send", fake_safe_send)
+    monkeypatch.setattr(ow, "safe_send_template", fake_safe_send)
     monkeypatch.setattr(ow, "utcnow", lambda: fixed_now)
     monkeypatch.setattr(ow, "OutboxMessage", FakeOutbox)
 
@@ -409,7 +411,7 @@ def test_process_job_fails_on_send_fail_when_attempt_becomes_max(
         return None
 
     async def fake_render(*args: Any, **kwargs: Any) -> Any:
-        return ("TEXT", 123, "de")
+        return ("TEXT", 123, "de", {})
 
     async def fake_safe_send(*args: Any, **kwargs: Any) -> Any:
         return ("msg-3", "provider error")
@@ -421,6 +423,7 @@ def test_process_job_fails_on_send_fail_when_attempt_becomes_max(
     monkeypatch.setattr(ow, "_apply_rate_limit", fake_apply_rl)
     monkeypatch.setattr(ow, "_render_message", fake_render)
     monkeypatch.setattr(ow, "safe_send", fake_safe_send)
+    monkeypatch.setattr(ow, "safe_send_template", fake_safe_send)
     monkeypatch.setattr(ow, "utcnow", lambda: fixed_now)
     monkeypatch.setattr(ow, "OutboxMessage", FakeOutbox)
 

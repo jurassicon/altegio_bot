@@ -131,3 +131,80 @@ class MetaCloudProvider(WhatsAppProvider):
                 return msg_id
 
         raise RuntimeError(f'Unexpected Meta response: {data}')
+
+    async def send_template(
+        self,
+        sender_id: int,
+        phone_e164: str,
+        template_name: str,
+        language: str,
+        params: list[str],
+    ) -> str:
+        """Send an approved Meta template message."""
+        if not self._allow_real_send:
+            raise RuntimeError('Real send disabled (set ALLOW_REAL_SEND=1)')
+
+        phone_number_id = await self._get_phone_number_id(sender_id)
+        to_number = _strip_plus(phone_e164)
+
+        url = (
+            f'{self._graph_url}/{self._api_version}'
+            f'/{phone_number_id}/messages'
+        )
+        payload: dict[str, Any] = {
+            'messaging_product': 'whatsapp',
+            'to': to_number,
+            'type': 'template',
+            'template': {
+                'name': template_name,
+                'language': {'code': language},
+                'components': [
+                    {
+                        'type': 'body',
+                        'parameters': [
+                            {'type': 'text', 'text': p}
+                            for p in params
+                        ],
+                    }
+                ],
+            },
+        }
+
+        res = await self._client.post(
+            url, headers=self._headers(), json=payload
+        )
+
+        data: dict[str, Any] = {}
+        try:
+            data = res.json()
+        except Exception:
+            data = {}
+
+        if res.status_code >= 400:
+            err = data.get('error') if isinstance(data, dict) else None
+            msg = None
+            if isinstance(err, dict):
+                msg = err.get('message')
+            raise RuntimeError(
+                f'Meta send_template failed status={res.status_code} '
+                f'template={template_name} body={msg or data}'
+            )
+
+        messages = data.get('messages') if isinstance(data, dict) else None
+        if isinstance(messages, list) and messages:
+            first = messages[0]
+            if isinstance(first, dict) and first.get('id'):
+                msg_id = str(first['id'])
+                logger.info(
+                    'Meta template sent sender_id=%s phone=%s '
+                    'template=%s msg_id=%s',
+                    sender_id,
+                    phone_e164,
+                    template_name,
+                    msg_id,
+                )
+                return msg_id
+
+        raise RuntimeError(
+            f'Unexpected Meta response for template: {data}'
+        )
