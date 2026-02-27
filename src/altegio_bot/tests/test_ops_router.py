@@ -53,7 +53,23 @@ async def test_ops_history_returns_200(http_client: AsyncClient) -> None:
 async def test_ops_wa_inbox_returns_200(http_client: AsyncClient) -> None:
     response = await http_client.get('/ops/whatsapp/inbox')
     assert response.status_code == 200
-    assert 'WA Inbox' in response.text
+    assert 'WA Events' in response.text
+
+
+@pytest.mark.asyncio
+async def test_ops_wa_inbox_tab_inbox(http_client: AsyncClient) -> None:
+    response = await http_client.get('/ops/whatsapp/inbox?tab=inbox')
+    assert response.status_code == 200
+    assert 'Inbox' in response.text
+    assert 'Delivery' in response.text
+
+
+@pytest.mark.asyncio
+async def test_ops_wa_delivery_tab(http_client: AsyncClient) -> None:
+    response = await http_client.get('/ops/whatsapp/inbox?tab=delivery')
+    assert response.status_code == 200
+    assert 'Status Msg ID' in response.text
+    assert 'Delivery' in response.text
 
 
 @pytest.mark.asyncio
