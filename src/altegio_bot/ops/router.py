@@ -1619,6 +1619,21 @@ async def ops_monitoring() -> str:
         )
         wa_ing = wa_ingress_q.fetchone()
 
+        # Chatwoot-specific ingress metrics
+        cw_ingress_q = await session.execute(
+            text("""
+                SELECT
+                  MAX(received_at) AS last_cw,
+                  COUNT(*) FILTER (WHERE received_at >= :w5)  AS cw_5m,
+                  COUNT(*) FILTER (WHERE received_at >= :w15) AS cw_15m,
+                  COUNT(*) FILTER (WHERE received_at >= :w1h) AS cw_1h
+                FROM whatsapp_events
+                WHERE chatwoot_conversation_id IS NOT NULL
+            """),
+            {'w5': window_5m, 'w15': window_15m, 'w1h': window_1h},
+        )
+        cw_ing = cw_ingress_q.fetchone()
+
         # --- Queue Health ---
         queue_q = await session.execute(
             text("""
@@ -1965,6 +1980,26 @@ async def ops_monitoring() -> str:
         or (now - wa_last.replace(tzinfo=timezone.utc)).total_seconds() > 15 * 60
     )
 
+    from altegio_bot.settings import settings as _settings
+    cw_enabled = _settings.chatwoot_enabled
+    cw_last = cw_ing.last_cw if cw_ing else None
+
+    cw_row_html = ''
+    if cw_enabled:
+        cw_warn = (
+            cw_last is None
+            or (now - cw_last.replace(tzinfo=timezone.utc)).total_seconds() > 15 * 60
+        )
+        cw_row_html = (
+            f'<tr class="{"warn" if cw_warn else ""}">'
+            f'<td>Chatwoot</td>'
+            f'<td>{_esc(_fmt_dt(cw_last, tz))} ({_esc(_ago(cw_last))})</td>'
+            f'<td>{cw_ing.cw_5m if cw_ing else 0}</td>'
+            f'<td>{cw_ing.cw_15m if cw_ing else 0}</td>'
+            f'<td>{cw_ing.cw_1h if cw_ing else 0}</td>'
+            f'</tr>'
+        )
+
     ingress_html = f"""
 <div class="card mb-3 {'border-warning' if altegio_warn or wa_warn else 'border-success'}">
   <div class="card-header">📡 Webhook Ingress</div>
@@ -1989,6 +2024,7 @@ async def ops_monitoring() -> str:
           <td>{wa_ing.wa_15m} (+{wa_ing.wa_ignored_15m} ign)</td>
           <td>{wa_ing.wa_1h} (+{wa_ing.wa_ignored_1h} ign)</td>
         </tr>
+        {cw_row_html}
       </tbody>
     </table>
   </div>

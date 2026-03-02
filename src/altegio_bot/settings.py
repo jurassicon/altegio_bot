@@ -62,5 +62,13 @@ class Settings(BaseSettings):
     # Local timezone for display (IANA name)
     ops_local_tz: str = 'Europe/Berlin'
 
+    # Chatwoot integration
+    chatwoot_enabled: bool = False
+    chatwoot_base_url: str = ''
+    chatwoot_api_token: str = ''
+    chatwoot_inbox_id: int = 0
+    chatwoot_account_id: int = 0
+    chatwoot_webhook_secret: str = ''
+
 
 settings = Settings()

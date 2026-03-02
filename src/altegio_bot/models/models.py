@@ -599,6 +599,14 @@ class WhatsAppEvent(Base):
     headers: Mapped[dict] = mapped_column(JSONB, default=dict)
     payload: Mapped[dict] = mapped_column(JSONB, default=dict)
 
+    # Chatwoot conversation that originated this event (set when webhook comes
+    # from Chatwoot instead of Meta directly)
+    chatwoot_conversation_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        nullable=True,
+        index=True,
+    )
+
 
 class CampaignRun(Base):
     """Tracks a single execution of a newsletter campaign."""

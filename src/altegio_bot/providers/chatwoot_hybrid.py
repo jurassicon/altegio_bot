@@ -1,0 +1,102 @@
+"""Dual-write WhatsApp provider.
+
+PRIMARY:   MetaCloudProvider  – blocking, must succeed
+SECONDARY: ChatwootClient     – async, best-effort (never fails the send)
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+from typing import Any
+
+from altegio_bot.chatwoot_client import ChatwootClient
+from altegio_bot.providers.base import WhatsAppProvider
+from altegio_bot.providers.meta_cloud import MetaCloudProvider
+from altegio_bot.settings import settings
+
+logger = logging.getLogger(__name__)
+
+
+class ChatwootHybridProvider:
+    """Wraps MetaCloudProvider and mirrors outbound messages to Chatwoot."""
+
+    def __init__(
+        self,
+        *,
+        primary: MetaCloudProvider | None = None,
+        chatwoot: ChatwootClient | None = None,
+    ) -> None:
+        self._primary: WhatsAppProvider = primary or MetaCloudProvider()
+        self._chatwoot: ChatwootClient = chatwoot or ChatwootClient()
+
+    async def aclose(self) -> None:
+        aclose_primary = getattr(self._primary, 'aclose', None)
+        if callable(aclose_primary):
+            await aclose_primary()
+        await self._chatwoot.aclose()
+
+    async def send(
+        self,
+        sender_id: int,
+        phone_e164: str,
+        text: str,
+    ) -> str:
+        # PRIMARY – must succeed
+        msg_id = await self._primary.send(sender_id, phone_e164, text)
+
+        # SECONDARY – best-effort
+        asyncio.ensure_future(
+            self._log_to_chatwoot(phone_e164, text, meta={'msg_id': msg_id})
+        )
+
+        return msg_id
+
+    async def send_template(
+        self,
+        sender_id: int,
+        phone_e164: str,
+        template_name: str,
+        language: str,
+        params: list[str],
+    ) -> str:
+        # PRIMARY – must succeed
+        msg_id = await self._primary.send_template(
+            sender_id, phone_e164, template_name, language, params
+        )
+
+        # SECONDARY – best-effort
+        content = f'[template:{template_name}] ' + ' | '.join(params)
+        asyncio.ensure_future(
+            self._log_to_chatwoot(phone_e164, content, meta={'msg_id': msg_id})
+        )
+
+        return msg_id
+
+    async def _log_to_chatwoot(
+        self,
+        phone_e164: str,
+        content: str,
+        *,
+        meta: dict[str, Any] | None = None,
+    ) -> None:
+        try:
+            contact_id = await self._chatwoot.get_or_create_contact(phone_e164)
+            conversation_id = await self._chatwoot.get_or_create_conversation(contact_id)
+            await self._chatwoot.send_message(
+                conversation_id,
+                content,
+                message_type='outgoing',
+            )
+            logger.debug(
+                'Chatwoot log ok phone=%s conversation_id=%s extra=%s',
+                phone_e164,
+                conversation_id,
+                meta,
+            )
+        except Exception as exc:
+            logger.warning(
+                'Chatwoot log failed phone=%s err=%s extra=%s',
+                phone_e164,
+                exc,
+                meta,
+            )

@@ -16,6 +16,10 @@ def _build_provider() -> Any:
     if key == 'meta_cloud':
         return MetaCloudProvider()
 
+    if key == 'chatwoot_hybrid':
+        from altegio_bot.providers.chatwoot_hybrid import ChatwootHybridProvider
+        return ChatwootHybridProvider()
+
     return DummyProvider()
 
 
