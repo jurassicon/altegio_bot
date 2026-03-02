@@ -871,6 +871,9 @@ def _build_provider() -> WhatsAppProvider:
     if name == 'meta_cloud':
         from altegio_bot.providers.meta_cloud import MetaCloudProvider
         return MetaCloudProvider()
+    if name == 'chatwoot_hybrid':
+        from altegio_bot.providers.chatwoot_hybrid import ChatwootHybridProvider
+        return ChatwootHybridProvider()
     return DummyProvider()
 
 

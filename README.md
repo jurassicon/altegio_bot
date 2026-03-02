@@ -348,3 +348,82 @@ Ensure that:
 ## License
 
 Proprietary project.
+
+## Chatwoot Integration
+
+### Overview
+
+The bot supports an optional **dual-write hybrid strategy** that mirrors messages
+to a self-hosted [Chatwoot](https://www.chatwoot.com/) instance. This lets salon
+administrators see full conversation history and respond manually in the
+Chatwoot UI, while the automated bot continues to work normally.
+
+```
+Outgoing (Bot → Customer):
+  MessageJob → outbox_worker → ChatwootHybridProvider
+    ├→ [PRIMARY]   MetaCloudProvider.send()  → Meta API → Customer ✅
+    └→ [SECONDARY] ChatwootClient.send_message() → Chatwoot API (async)
+         ↳ If fails → log warning, continue
+
+Incoming (Customer → Bot via Chatwoot):
+  Customer → Meta → Chatwoot (Meta webhooks point here)
+    ↓
+  Chatwoot UI (admins see message)
+    ↓
+  Chatwoot webhook → /webhook/chatwoot
+    ↓
+  WhatsAppEvent (DB)   [chatwoot_conversation_id is set]
+    ↓
+  whatsapp_inbox_worker
+    ↓
+  If START/STOP → auto-reply via ChatwootHybridProvider
+  Else → do nothing (admin replies manually)
+```
+
+### Configuration
+
+Add to your `.env`:
+
+```bash
+# Enable Chatwoot integration
+CHATWOOT_ENABLED=true
+CHATWOOT_BASE_URL=https://chatwoot.kitilash.com
+CHATWOOT_API_TOKEN=your_chatwoot_api_token
+CHATWOOT_ACCOUNT_ID=1
+CHATWOOT_INBOX_ID=1
+
+# Optional: verify webhook signatures from Chatwoot
+CHATWOOT_WEBHOOK_SECRET=your_shared_secret
+
+# Switch the provider to dual-write mode
+WHATSAPP_PROVIDER=chatwoot_hybrid
+```
+
+When `CHATWOOT_ENABLED=false` (default) the bot works exactly as before —
+webhooks come directly from Meta to `/webhook/whatsapp`.
+
+### Migrate Existing Contacts
+
+```bash
+docker exec -i altegio-api sh -lc '
+set -a
+. /app/.env
+set +a
+/app/.venv/bin/python -m altegio_bot.scripts.migrate_contacts_to_chatwoot
+'
+```
+
+### DB Migration
+
+```bash
+docker exec -i altegio-api alembic upgrade head
+```
+
+This adds the `chatwoot_conversation_id` column to `whatsapp_events`.
+
+### Backward Compatibility
+
+| Setting | Behaviour |
+|---------|-----------|
+| `CHATWOOT_ENABLED=false` (default) | Exactly as before — Meta direct |
+| `CHATWOOT_ENABLED=true` + `WHATSAPP_PROVIDER=chatwoot_hybrid` | Dual-write enabled |
