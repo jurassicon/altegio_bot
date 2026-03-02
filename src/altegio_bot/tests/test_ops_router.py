@@ -2,17 +2,39 @@
 from __future__ import annotations
 
 from collections.abc import AsyncGenerator
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode
 
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
+from starlette.requests import Request as StarletteRequest
+from starlette.datastructures import QueryParams
 
 import altegio_bot.ops.router as ops_router_module
 from altegio_bot.main import app
 from altegio_bot.models.models import AltegioEvent, Client, MessageJob, OutboxMessage, Record
 from altegio_bot.ops.auth import require_ops_auth
+from altegio_bot.ops.router import _period_params
+
+
+def _make_request(period: str | None = None, from_dt: str = '', to_dt: str = '') -> StarletteRequest:
+    """Build a minimal Starlette Request with the given query params."""
+    params: dict[str, str] = {}
+    if period is not None:
+        params['period'] = period
+    if from_dt:
+        params['from_dt'] = from_dt
+    if to_dt:
+        params['to_dt'] = to_dt
+    scope = {
+        'type': 'http',
+        'method': 'GET',
+        'path': '/ops/history',
+        'query_string': urlencode(params).encode(),
+        'headers': [],
+    }
+    return StarletteRequest(scope)
 
 
 @pytest_asyncio.fixture
@@ -287,4 +309,112 @@ async def test_ops_optouts_deduplication(
     assert response.status_code == 200
     # The phone should appear exactly once (deduplicated by company+phone)
     assert response.text.count(phone) == 1
+
+
+# ---------------------------------------------------------------------------
+# _period_params unit tests
+# ---------------------------------------------------------------------------
+
+def test_period_params_today() -> None:
+    req = _make_request('today')
+    from_dt, to_dt = _period_params(req)
+    now = datetime.now(timezone.utc)
+    assert from_dt.hour == 0 and from_dt.minute == 0 and from_dt.second == 0
+    assert from_dt.date() == now.date()
+    assert to_dt <= now + timedelta(seconds=1)
+
+
+def test_period_params_yesterday() -> None:
+    req = _make_request('yesterday')
+    from_dt, to_dt = _period_params(req)
+    now = datetime.now(timezone.utc)
+    yesterday = now - timedelta(days=1)
+    assert from_dt.date() == yesterday.date()
+    assert from_dt.hour == 0 and from_dt.minute == 0 and from_dt.second == 0
+    assert to_dt == from_dt + timedelta(days=1)
+
+
+def test_period_params_last_7d() -> None:
+    req = _make_request('last_7d')
+    from_dt, to_dt = _period_params(req)
+    now = datetime.now(timezone.utc)
+    assert abs((to_dt - from_dt).days - 7) <= 1
+    assert to_dt <= now + timedelta(seconds=1)
+
+
+def test_period_params_last_30d() -> None:
+    req = _make_request('last_30d')
+    from_dt, to_dt = _period_params(req)
+    now = datetime.now(timezone.utc)
+    assert abs((to_dt - from_dt).days - 30) <= 1
+    assert to_dt <= now + timedelta(seconds=1)
+
+
+def test_period_params_this_week() -> None:
+    req = _make_request('this_week')
+    from_dt, to_dt = _period_params(req)
+    now = datetime.now(timezone.utc)
+    # from_dt should be Monday of this week at midnight
+    assert from_dt.weekday() == 0
+    assert from_dt.hour == 0 and from_dt.minute == 0 and from_dt.second == 0
+    assert to_dt <= now + timedelta(seconds=1)
+
+
+def test_period_params_last_week() -> None:
+    req = _make_request('last_week')
+    from_dt, to_dt = _period_params(req)
+    # Both bounds should be Mondays
+    assert from_dt.weekday() == 0
+    assert to_dt.weekday() == 0
+    # Exactly 7 days apart
+    assert (to_dt - from_dt) == timedelta(days=7)
+
+
+def test_period_params_this_month() -> None:
+    req = _make_request('this_month')
+    from_dt, to_dt = _period_params(req)
+    now = datetime.now(timezone.utc)
+    assert from_dt.day == 1
+    assert from_dt.hour == 0 and from_dt.minute == 0 and from_dt.second == 0
+    assert from_dt.month == now.month
+    assert to_dt <= now + timedelta(seconds=1)
+
+
+def test_period_params_last_month() -> None:
+    req = _make_request('last_month')
+    from_dt, to_dt = _period_params(req)
+    now = datetime.now(timezone.utc)
+    first_of_this_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    assert to_dt == first_of_this_month
+    assert from_dt.day == 1
+    assert from_dt.month != now.month or from_dt.year != now.year
+
+
+def test_period_params_legacy_24h() -> None:
+    req = _make_request('24h')
+    from_dt, to_dt = _period_params(req)
+    now = datetime.now(timezone.utc)
+    assert abs((to_dt - from_dt).total_seconds() - 86400) < 2
+
+
+def test_period_params_legacy_7d() -> None:
+    req = _make_request('7d')
+    from_dt, to_dt = _period_params(req)
+    assert abs((to_dt - from_dt).days - 7) <= 1
+
+
+def test_period_params_default_no_period() -> None:
+    """When no period query param is supplied, _period_params falls back to 24h."""
+    req = _make_request()
+    from_dt, to_dt = _period_params(req)
+    assert abs((to_dt - from_dt).total_seconds() - 86400) < 2
+
+
+@pytest.mark.asyncio
+async def test_ops_history_default_period_is_today(http_client: AsyncClient) -> None:
+    """The /ops/history page should default to period=today (not 24h)."""
+    response = await http_client.get('/ops/history')
+    assert response.status_code == 200
+    # The period select should have 'today' selected by default
+    assert 'value="today" selected' in response.text
 
