@@ -1,27 +1,27 @@
 # Altegio Bot
 
-WhatsApp-бот для интеграции с CRM Altegio. Автоматизирует отправку уведомлений клиентам о записях, напоминаниях и рассылках.
+WhatsApp bot for integration with Altegio CRM. Automates sending notifications to clients about appointments, reminders, and newsletters.
 
-## Основные возможности
+## Main Features
 
-- 📅 Автоматические уведомления о создании/изменении/отмене записей
-- ⏰ Напоминания за 24 часа и 2 часа до визита
-- 💳 Выпуск карт лояльности через Altegio API
-- 📧 Ежемесячные рассылки для новых клиентов
-- 📊 Ops-кабинет для мониторинга сообщений
+- 📅 Automatic notifications for appointment creation/modification/cancellation
+- ⏰ Reminders 24 hours and 2 hours before the visit
+- 💳 Loyalty card issuance via Altegio API
+- 📧 Monthly newsletters for new clients
+- 📊 Ops cabinet for message monitoring
 
-## Архитектура
+## Architecture
 
-- **API**: FastAPI (webhooks от Altegio и WhatsApp)
-- **БД**: PostgreSQL + SQLAlchemy
-- **Очередь**: Асинхронный воркер для отправки сообщений
-- **WhatsApp**: Meta Business API (официальные шаблоны)
+- **API**: FastAPI (webhooks from Altegio and WhatsApp)
+- **DB**: PostgreSQL + SQLAlchemy
+- **Queue**: Asynchronous worker for sending messages
+- **WhatsApp**: Meta Business API (official templates)
 
-## Установка и запуск
+## Installation and Launch
 
-### Переменные окружения
+### Environment Variables
 
-Создайте файл `.env`:
+Create a `.env` file:
 
 ```bash
 # Database
@@ -60,19 +60,19 @@ WA_OPTOUT_POLICY=marketing_only
 docker compose up -d
 ```
 
-### Миграции
+### Migrations
 
 ```bash
 docker exec -i altegio-api alembic upgrade head
 ```
 
-## Тестирование
+## Testing
 
-### 🧪 Тестирование создания карты лояльности
+### 🧪 Loyalty Card Creation Testing
 
-Проект включает специальный скрипт для комплексного тестирования функционала выпуска карт лояльности и отправки сообщений.
+The project includes a special script for comprehensive testing of loyalty card issuance and message sending functionality.
 
-#### Базовый тест (с автоматическим удалением карты)
+#### Basic Test (with automatic card deletion)
 
 ```bash
 docker exec -i altegio-api sh -lc '
@@ -91,11 +91,11 @@ set +a
   --card-type-id 46454
 '```
 
-**Флаг `--cleanup`**: Автоматически удаляет тестовую карту после завершения теста. Используйте для "чистых" тестов, которые не оставляют следов в CRM.
+**`--cleanup` flag**: Automatically deletes the test card after the test is completed. Use it for "clean" tests that leave no traces in the CRM.
 
-#### Тест с сохранением карты в CRM
+#### Test with card preservation in CRM
 
-Если нужно оставить карту в системе Altegio (например, для ручной проверки в CRM):
+If you need to leave the card in the Altegio system (e.g., for manual verification in the CRM):
 
 ```bash
 docker exec -i altegio-api sh -lc '
@@ -113,42 +113,42 @@ set +a
   --card-type-id 46454
 '```
 
-⚠️ **Без флага `--cleanup` карта останется в CRM Altegio!**
+⚠️ **Without the `--cleanup` flag, the card will remain in Altegio CRM!**
 
-#### Что делает тест?
+#### What does the test do?
 
-1. ✅ **Проверяет Meta-шаблон**: Убеждается, что шаблон существует и имеет статус `APPROVED` в WhatsApp Business API
-2. ✅ **Проверяет идемпотентность**: Пропускает тест, если он уже выполнялся успешно в последние 24 часа (можно обойти флагом `--force`)
-3. ✅ **Создаёт карту лояльности**: Выпускает тестовую карту через Altegio API с префиксом `99` (тестовые карты)
-4. ✅ **Отправляет WhatsApp сообщение**: Использует официальный Meta-шаблон с номером карты
-5. ✅ **Отслеживает доставку**: Ждёт webhook-событий от WhatsApp (`sent` → `delivered` → `read`)
-6. ✅ **Опционально удаляет карту**: Если указан `--cleanup`, удаляет тестовую карту из Altegio
+1. ✅ **Checks Meta template**: Ensures the template exists and has `APPROVED` status in WhatsApp Business API.
+2. ✅ **Checks idempotency**: Skips the test if it has already been successfully performed in the last 24 hours (can be bypassed with the `--force` flag).
+3. ✅ **Creates loyalty card**: Issues a test card via Altegio API with prefix `99` (test cards).
+4. ✅ **Sends WhatsApp message**: Uses the official Meta template with the card number.
+5. ✅ **Tracks delivery**: Waits for webhook events from WhatsApp (`sent` → `delivered` → `read`).
+6. ✅ **Optionally deletes card**: If `--cleanup` is specified, deletes the test card from Altegio.
 
-#### Параметры команды
+#### Command Parameters
 
-| Параметр | Описание | Обязательный | Пример |
-|----------|----------|--------------|--------|
-| `--phone` | Номер телефона получателя (с кодом страны) | ✅ | `381638400431` или `+381638400431` |
-| `--company-id` | ID компании в Altegio | ✅ | `758285` |
-| `--card-type-id` | ID типа карты лояльности | ✅ | `46454` |
-| `--booking-link` | Ссылка на онлайн-запись | | `https://n813709.alteg.io/` |
-| `--template` | Имя Meta-шаблона | | `kitilash_ka_newsletter_new_clients_monthly_v2` |
-| `--expect-status` | Ожидаемый статус доставки | | `delivered` (по умолчанию) или `sent` |
-| `--timeout` | Таймаут ожидания webhook (секунды) | | `180` (по умолчанию) |
-| `--cleanup` | Удалить карту после теста | | флаг без значения |
-| `--force` | Игнорировать кэш (запустить повторно) | | флаг без значения |
-| `--location-id` | ID локации (если отличается от company-id) | | `758285` |
+| Parameter | Description | Required | Example |
+|-----------|-------------|----------|---------|
+| `--phone` | Recipient's phone number (with country code) | ✅ | `381638400431` or `+381638400431` |
+| `--company-id` | Company ID in Altegio | ✅ | `758285` |
+| `--card-type-id` | Loyalty card type ID | ✅ | `46454` |
+| `--booking-link` | Online booking link | | `https://n813709.alteg.io/` |
+| `--template` | Meta template name | | `kitilash_ka_newsletter_new_clients_monthly_v2` |
+| `--expect-status` | Expected delivery status | | `delivered` (default) or `sent` |
+| `--timeout` | Webhook wait timeout (seconds) | | `180` (default) |
+| `--cleanup` | Delete card after test | | flag without value |
+| `--force` | Ignore cache (run again) | | flag without value |
+| `--location-id` | Location ID (if different from company-id) | | `758285` |
 
-#### Форматы номера карты
+#### Card Number Formats
 
-- **Тестовые карты**: Префикс `99` + `YYMMDD` + 8 случайных цифр = 16 символов
-  - Пример: `9926022832320706` (тест от 28.02.2026)
+- **Test cards**: Prefix `99` + `YYMMDD` + 8 random digits = 16 characters
+  - Example: `9926022832320706` (test from 2026-02-28)
   
-- **Продакшн карты**: Префикс `00` + `YYMMDD` + 8 случайных цифр = 16 символов
-  - Пример: `0026022845678901` (продакшн от 28.02.2026)
-  - Используются в реальных рассылках (`run_monthly_newsletter_smart.py --mode send-real`)
+- **Production cards**: Prefix `00` + `YYMMDD` + 8 random digits = 16 characters
+  - Example: `0026022845678901` (production from 2026-02-28)
+  - Used in real newsletters (`run_monthly_newsletter_smart.py --mode send-real`)
 
-#### Логи успешного теста
+#### Successful Test Logs
 
 ```
 INFO smart_test: Smart test START phone=+381638400431 company=758285
@@ -161,34 +161,34 @@ INFO smart_test: Card deleted: card_id=47719627
 INFO smart_test: === RESULT: PASS ===
 ```
 
-#### Exit коды
+#### Exit Codes
 
-- `0` = PASS (тест успешен)
-- `2` = FAIL (тест провален или ошибка)
+- `0` = PASS (test successful)
+- `2` = FAIL (test failed or error)
 
-### 🧪 Unit-тесты
+### 🧪 Unit Tests
 
-Запуск всех тестов:
+Run all tests:
 
 ```bash
 docker exec -i altegio-api pytest
 ```
 
-Тесты с coverage:
+Tests with coverage:
 
 ```bash
 docker exec -i altegio-api pytest --cov=altegio_bot --cov-report=html
 ```
 
-Тесты клиента карт лояльности:
+Loyalty card client tests:
 
 ```bash
 docker exec -i altegio-api pytest src/altegio_bot/tests/test_altegio_loyalty.py -v
 ```
 
-### 📋 Ручное создание карты через Python
+### 📋 Manual Card Creation via Python
 
-Если нужно создать карту программно без отправки сообщения:
+If you need to create a card programmatically without sending a message:
 
 ```python
 import asyncio
@@ -199,22 +199,22 @@ async def create_card():
     try:
         card = await loyalty.issue_card(
             location_id=758285,
-            loyalty_card_number='9926022899999999',  # Уникальный 16-значный номер
+            loyalty_card_number='9926022899999999',  # Unique 16-digit number
             loyalty_card_type_id='46454',
-            phone=381638400431,  # Номер БЕЗ знака +
+            phone=381638400431,  # Number WITHOUT + sign
         )
-        print(f"Карта создана: {card}")
-        print(f"ID карты: {card.get('id')}")
-        print(f"Номер: {card.get('loyalty_card_number')}")
+        print(f"Card created: {card}")
+        print(f"Card ID: {card.get('id')}")
+        print(f"Number: {card.get('loyalty_card_number')}")
     finally:
         await loyalty.aclose()
 
 asyncio.run(create_card())
 ```
 
-### 📧 Тестирование месячной рассылки
+### 📧 Monthly Newsletter Testing
 
-#### Режим `list` (посмотреть кандидатов)
+#### `list` mode (view candidates)
 
 ```bash
 docker exec -i altegio-api /app/.venv/bin/python \
@@ -223,7 +223,7 @@ docker exec -i altegio-api /app/.venv/bin/python \
   --company-id 758285
 ```
 
-#### Режим `dry-run` (имитация без отправки)
+#### `dry-run` mode (simulation without sending)
 
 ```bash
 docker exec -i altegio-api /app/.venv/bin/python \
@@ -233,7 +233,7 @@ docker exec -i altegio-api /app/.venv/bin/python \
   --booking-link https://n813709.alteg.io/
 ```
 
-#### Режим `send-test` (отправка одному тестовому получателю)
+#### `send-test` mode (sending to one test recipient)
 
 ```bash
 docker exec -i altegio-api /app/.venv/bin/python \
@@ -245,9 +245,9 @@ docker exec -i altegio-api /app/.venv/bin/python \
   --cleanup
 ```
 
-#### Режим `send-real` (боевая рассылка)
+#### `send-real` mode (production newsletter)
 
-⚠️ **ВНИМАНИЕ**: Этот режим создаёт реальные карты и отправляет реальные сообщения!
+⚠️ **WARNING**: This mode creates real cards and sends real messages!
 
 ```bash
 docker exec -i altegio-api /app/.venv/bin/python \
@@ -255,60 +255,60 @@ docker exec -i altegio-api /app/.venv/bin/python \
   --mode send-real \
   --company-id 758285 \
   --booking-link https://n813709.alteg.io/ \
-  --limit 10  # Ограничить первыми 10 получателями
+  --limit 10  # Limit to the first 10 recipients
 ```
 
-## Структура проекта
+## Project Structure
 
 ```
 altegio_bot/
 ├── src/altegio_bot/
-│   ├── altegio_loyalty.py       # Клиент Altegio Loyalty API
-│   ├── meta_templates.py        # Маппинг шаблонов WhatsApp
-│   ├── message_planner.py       # Планировщик отправки сообщений
+│   ├── altegio_loyalty.py       # Altegio Loyalty API client
+│   ├── meta_templates.py        # WhatsApp template mapping
+│   ├── message_planner.py       # Message sending planner
 │   ├── models/
-│   │   └── models.py            # SQLAlchemy модели
+│   │   └── models.py            # SQLAlchemy models
 │   ├── ops/
-│   │   ├── router.py            # Ops-кабинет (мониторинг)
-│   │   └── auth.py              # Аутентификация
+│   │   ├── router.py            # Ops cabinet (monitoring)
+│   │   └── auth.py              # Authentication
 │   ├── scripts/
-│   │   ├── run_test_newsletter_smart.py      # 🧪 Тестовая рассылка
-│   │   ├── run_monthly_newsletter_smart.py   # 📧 Продакшн рассылка
-│   │   └── seed_templates.py                 # Seed шаблонов сообщений
+│   │   ├── run_test_newsletter_smart.py      # 🧪 Test newsletter
+│   │   ├── run_monthly_newsletter_smart.py   # 📧 Production newsletter
+│   │   └── seed_templates.py                 # Message templates seed
 │   ├── workers/
-│   │   └── outbox_worker.py     # Воркер отправки сообщений
+│   │   └── outbox_worker.py     # Message sending worker
 │   ├── webhooks/
 │   │   └── whatsapp.py          # WhatsApp webhook handler
-│   └── tests/                   # Unit-тесты
-├── alembic/                     # Миграции БД
+│   └── tests/                   # Unit tests
+├── alembic/                     # DB migrations
 ├── docker-compose.yml
 ├── Dockerfile
 └── README.md
 ```
 
-## Мониторинг и отладка
+## Monitoring and Debugging
 
-### Ops-кабинет
+### Ops Cabinet
 
-Откройте в браузере: `http://localhost:8000/ops/login`
+Open in browser: `http://localhost:8000/ops/login`
 
-- **Monitoring**: Статистика сообщений за 24ч, проваленные задачи
-- **Outbox**: Очередь исходящих сообщений
-- **Events**: Webhook-события от WhatsApp
-- **Opt-outs**: Клиенты, отписавшиеся от рассылок
-- **Campaign Runs**: История рассылок
+- **Monitoring**: Message statistics for 24h, failed tasks
+- **Outbox**: Outgoing message queue
+- **Events**: WhatsApp webhook events
+- **Opt-outs**: Clients who opted out of newsletters
+- **Campaign Runs**: Newsletter history
 
-### Логи
+### Logs
 
 ```bash
-# API логи
+# API logs
 docker logs -f altegio-api
 
-# Воркер логи
+# Worker logs
 docker logs -f altegio-worker
 ```
 
-### Проверка health
+### Health Check
 
 ```bash
 curl http://localhost:8000/health
@@ -316,35 +316,35 @@ curl http://localhost:8000/health
 
 ## API Endpoints
 
-| Метод | Путь | Описание |
-|-------|------|----------|
-| `POST` | `/webhooks/altegio` | Webhook от Altegio (записи) |
-| `POST` | `/webhooks/whatsapp` | Webhook от WhatsApp (статусы доставки) |
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/webhooks/altegio` | Altegio webhook (appointments) |
+| `POST` | `/webhooks/whatsapp` | WhatsApp webhook (delivery statuses) |
 | `GET` | `/health` | Health check |
-| `GET` | `/ops/monitoring` | Дашборд мониторинга (требует auth) |
-| `GET` | `/ops/outbox` | Очередь сообщений (требует auth) |
+| `GET` | `/ops/monitoring` | Monitoring dashboard (requires auth) |
+| `GET` | `/ops/outbox` | Message queue (requires auth) |
 
 ## Troubleshooting
 
-### Карта создана, но не видна в CRM
+### Card created but not visible in CRM
 
-✅ **Это нормально**, если вы использовали флаг `--cleanup`. Карта создаётся и сразу удаляется после теста.
+✅ **This is normal** if you used the `--cleanup` flag. The card is created and immediately deleted after the test.
 
-🔧 **Решение**: Запустите тест **без** `--cleanup`, чтобы карта осталась в системе.
+🔧 **Solution**: Run the test **without** `--cleanup` so the card remains in the system.
 
-### Сообщение не доставлено
+### Message not delivered
 
-1. Проверьте, что телефон зарегистрирован в WhatsApp
-2. Убедитесь, что Meta-шаблон имеет статус `APPROVED`
-3. Проверьте лимиты отправки в WhatsApp Business API
+1. Check if the phone is registered in WhatsApp.
+2. Ensure the Meta template has `APPROVED` status.
+3. Check sending limits in WhatsApp Business API.
 
-### Ошибка "No loyalty card types found"
+### Error "No loyalty card types found"
 
-Убедитесь, что:
-1. В Altegio настроены типы карт лояльности
-2. Правильный `location_id` (обычно равен `company_id`)
-3. API токены имеют права на работу с картами
+Ensure that:
+1. Loyalty card types are configured in Altegio.
+2. The `location_id` is correct (usually equals `company_id`).
+3. API tokens have permissions to work with cards.
 
-## Лицензия
+## License
 
-Проприетарный проект.
+Proprietary project.
