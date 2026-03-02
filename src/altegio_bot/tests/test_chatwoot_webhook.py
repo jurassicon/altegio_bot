@@ -5,6 +5,7 @@ import json
 from typing import Any
 
 import pytest
+from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
 
 from altegio_bot.models.models import WhatsAppEvent
@@ -36,13 +37,11 @@ def _cw_payload(
 @pytest.mark.asyncio
 async def test_incoming_message_saved(session_maker) -> None:
     """Incoming message webhook should create a WhatsAppEvent with chatwoot_conversation_id."""
-    from fastapi.testclient import TestClient
     import os
     os.environ.setdefault('DATABASE_URL', 'postgresql+asyncpg://localhost/test')
     os.environ.setdefault('ALTEGIO_WEBHOOK_SECRET', 'test')
 
     from altegio_bot.main import app
-    from altegio_bot.db import SessionLocal
 
     # Patch SessionLocal to use the test session_maker
     import altegio_bot.webhooks.chatwoot as cw_module
@@ -51,9 +50,9 @@ async def test_incoming_message_saved(session_maker) -> None:
     try:
         cw_module.SessionLocal = session_maker  # type: ignore[assignment]
 
-        with TestClient(app) as tc:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url='http://test') as tc:
             payload = _cw_payload(phone='+49123456789', content='STOP', conversation_id=99)
-            resp = tc.post(
+            resp = await tc.post(
                 '/webhook/chatwoot',
                 content=json.dumps(payload),
                 headers={'Content-Type': 'application/json'},
@@ -80,7 +79,6 @@ async def test_incoming_message_saved(session_maker) -> None:
 @pytest.mark.asyncio
 async def test_outgoing_message_skipped(session_maker) -> None:
     """Outgoing messages from the bot should be skipped (not saved as events)."""
-    from fastapi.testclient import TestClient
     import altegio_bot.webhooks.chatwoot as cw_module
     original_session_local = cw_module.SessionLocal
 
@@ -89,9 +87,9 @@ async def test_outgoing_message_skipped(session_maker) -> None:
     try:
         cw_module.SessionLocal = session_maker  # type: ignore[assignment]
 
-        with TestClient(app) as tc:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url='http://test') as tc:
             payload = _cw_payload(message_type='outgoing')
-            resp = tc.post(
+            resp = await tc.post(
                 '/webhook/chatwoot',
                 content=json.dumps(payload),
                 headers={'Content-Type': 'application/json'},
@@ -116,7 +114,6 @@ async def test_outgoing_message_skipped(session_maker) -> None:
 @pytest.mark.asyncio
 async def test_duplicate_skipped(session_maker) -> None:
     """Sending the same payload twice should return duplicate=True on second call."""
-    from fastapi.testclient import TestClient
     import altegio_bot.webhooks.chatwoot as cw_module
     original_session_local = cw_module.SessionLocal
 
@@ -126,13 +123,13 @@ async def test_duplicate_skipped(session_maker) -> None:
         cw_module.SessionLocal = session_maker  # type: ignore[assignment]
 
         payload = _cw_payload(conversation_id=77)
-        with TestClient(app) as tc:
-            resp1 = tc.post(
+        async with AsyncClient(transport=ASGITransport(app=app), base_url='http://test') as tc:
+            resp1 = await tc.post(
                 '/webhook/chatwoot',
                 content=json.dumps(payload),
                 headers={'Content-Type': 'application/json'},
             )
-            resp2 = tc.post(
+            resp2 = await tc.post(
                 '/webhook/chatwoot',
                 content=json.dumps(payload),
                 headers={'Content-Type': 'application/json'},
@@ -146,11 +143,10 @@ async def test_duplicate_skipped(session_maker) -> None:
 @pytest.mark.asyncio
 async def test_invalid_json_returns_400(session_maker) -> None:
     """Bad JSON body should return HTTP 400."""
-    from fastapi.testclient import TestClient
     from altegio_bot.main import app
 
-    with TestClient(app) as tc:
-        resp = tc.post(
+    async with AsyncClient(transport=ASGITransport(app=app), base_url='http://test') as tc:
+        resp = await tc.post(
             '/webhook/chatwoot',
             content=b'not-json',
             headers={'Content-Type': 'application/json'},
@@ -161,8 +157,6 @@ async def test_invalid_json_returns_400(session_maker) -> None:
 @pytest.mark.asyncio
 async def test_signature_rejected_when_secret_set() -> None:
     """When chatwoot_webhook_secret is set, bad/missing signature → 403."""
-    import altegio_bot.webhooks.chatwoot as cw_module
-    from fastapi.testclient import TestClient
     from altegio_bot.main import app
     from altegio_bot.settings import settings as _settings
 
@@ -170,8 +164,8 @@ async def test_signature_rejected_when_secret_set() -> None:
     try:
         _settings.chatwoot_webhook_secret = 'super-secret'
         payload = _cw_payload()
-        with TestClient(app) as tc:
-            resp = tc.post(
+        async with AsyncClient(transport=ASGITransport(app=app), base_url='http://test') as tc:
+            resp = await tc.post(
                 '/webhook/chatwoot',
                 content=json.dumps(payload),
                 headers={
