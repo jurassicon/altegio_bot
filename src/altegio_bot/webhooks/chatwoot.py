@@ -146,9 +146,11 @@ async def chatwoot_ingest(request: Request) -> Response:
         )
         return JSONResponse({'ok': True, 'skipped': True})
 
-    # phone_number_id is not available from Chatwoot; leave it empty.
-    # The inbox worker will still look up the sender by phone_number_id,
-    # but for START/STOP it only needs the customer phone number.
+    # phone_number_id is not available from Chatwoot payloads.
+    # The inbox worker will attempt to look up the sender by phone_number_id,
+    # but when it is absent (None/empty) _pick_sender returns (None, None).
+    # The worker still processes START/STOP opt-out changes via the customer
+    # phone number; it only skips sending the ack reply when no sender is found.
     meta_payload = _to_meta_payload(
         phone_e164=phone_e164,
         text=content,
