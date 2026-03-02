@@ -277,6 +277,36 @@ def _period_params(request: Request) -> tuple[datetime, datetime]:
     if period == 'today':
         from_dt = now.replace(hour=0, minute=0, second=0, microsecond=0)
         return from_dt, now
+    if period == 'yesterday':
+        yesterday = now - timedelta(days=1)
+        from_dt = yesterday.replace(hour=0, minute=0, second=0, microsecond=0)
+        to_dt = from_dt + timedelta(days=1)
+        return from_dt, to_dt
+    if period == 'last_7d':
+        return now - timedelta(days=7), now
+    if period == 'last_30d':
+        return now - timedelta(days=30), now
+    if period == 'this_week':
+        days_since_monday = now.weekday()
+        monday = now - timedelta(days=days_since_monday)
+        from_dt = monday.replace(hour=0, minute=0, second=0, microsecond=0)
+        return from_dt, now
+    if period == 'last_week':
+        days_since_monday = now.weekday()
+        this_monday = now - timedelta(days=days_since_monday)
+        last_monday = this_monday - timedelta(days=7)
+        from_dt = last_monday.replace(hour=0, minute=0, second=0, microsecond=0)
+        to_dt = this_monday.replace(hour=0, minute=0, second=0, microsecond=0)
+        return from_dt, to_dt
+    if period == 'this_month':
+        from_dt = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        return from_dt, now
+    if period == 'last_month':
+        first_of_this_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        last_day_prev_month = first_of_this_month - timedelta(days=1)
+        from_dt = last_day_prev_month.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        to_dt = first_of_this_month
+        return from_dt, to_dt
     if period == '7d':
         return now - timedelta(days=7), now
     # default: 24h
@@ -455,7 +485,7 @@ async def ops_history(request: Request) -> str:
     template_code = request.query_params.get('template_code', '')
     phone = request.query_params.get('phone_e164', '')
     provider_msg_id = request.query_params.get('provider_message_id', '')
-    period = request.query_params.get('period', '24h')
+    period = request.query_params.get('period', 'today')
     from_dt, to_dt = _period_params(request)
     tz = _local_tz()
 
@@ -463,7 +493,7 @@ async def ops_history(request: Request) -> str:
         # NOTE: `filters` contains only hardcoded SQL clauses; user input
         # is exclusively passed as bound parameters via `params`.
         filters = [
-            'om.created_at >= :from_dt AND om.created_at < :to_dt',
+            'COALESCE(om.sent_at, om.scheduled_at) >= :from_dt AND COALESCE(om.sent_at, om.scheduled_at) < :to_dt',
         ]
         params: dict[str, Any] = {
             'from_dt': from_dt,
@@ -521,7 +551,7 @@ async def ops_history(request: Request) -> str:
                   LIMIT 1
                 ) ws ON true
                 WHERE {where}
-                ORDER BY om.created_at DESC
+                ORDER BY COALESCE(om.sent_at, om.scheduled_at) DESC
                 LIMIT 200
             """),
             params,
@@ -533,7 +563,7 @@ async def ops_history(request: Request) -> str:
         ('template_code', 'Template', 'text', template_code),
         ('phone_e164', 'Phone', 'text', phone),
         ('provider_message_id', 'Provider Msg ID', 'text', provider_msg_id),
-        ('period', 'Period', 'select:24h,today,7d', period),
+        ('period', 'Period', 'select:today,yesterday,last_7d,last_30d,this_week,last_week,this_month,last_month', period),
     ])
 
     cols = [
