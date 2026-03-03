@@ -41,12 +41,14 @@ class ChatwootHybridProvider:
         phone_e164: str,
         text: str,
     ) -> str:
-        # PRIMARY – must succeed
+        # PRIMARY – must succeed (Отправка напрямую в Meta)
         msg_id = await self._primary.send(sender_id, phone_e164, text)
 
-        # SECONDARY – best-effort
+        # SECONDARY – best-effort (Логируем в Chatwoot как ПРИВАТНУЮ ЗАМЕТКУ)
         asyncio.ensure_future(
-            self._log_to_chatwoot(phone_e164, text, meta={'msg_id': msg_id})
+            self._log_to_chatwoot(
+                phone_e164, text, meta={'msg_id': msg_id}, private=True
+            )
         )
 
         return msg_id
@@ -64,10 +66,12 @@ class ChatwootHybridProvider:
             sender_id, phone_e164, template_name, language, params
         )
 
-        # SECONDARY – best-effort
-        content = f'[template:{template_name}] ' + ' | '.join(params)
+        # SECONDARY – best-effort (Логируем в Chatwoot как ПРИВАТНУЮ ЗАМЕТКУ)
+        content = f'[Шаблон отправлен: {template_name}] ' + ' | '.join(params)
         asyncio.ensure_future(
-            self._log_to_chatwoot(phone_e164, content, meta={'msg_id': msg_id})
+            self._log_to_chatwoot(
+                phone_e164, content, meta={'msg_id': msg_id}, private=True
+            )
         )
 
         return msg_id
@@ -78,14 +82,18 @@ class ChatwootHybridProvider:
         content: str,
         *,
         meta: dict[str, Any] | None = None,
+        private: bool = False,
     ) -> None:
         try:
             contact_id = await self._chatwoot.get_or_create_contact(phone_e164)
-            conversation_id = await self._chatwoot.get_or_create_conversation(contact_id)
+            conversation_id = await self._chatwoot.get_or_create_conversation(
+                contact_id
+            )
             await self._chatwoot.send_message(
                 conversation_id,
                 content,
                 message_type='outgoing',
+                private=private,  # Передаем флаг приватности
             )
             logger.debug(
                 'Chatwoot log ok phone=%s conversation_id=%s extra=%s',
