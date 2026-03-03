@@ -6,6 +6,7 @@ import binascii
 import hashlib
 import hmac
 import logging
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -105,7 +106,8 @@ async def chatwoot_ingest(request: Request) -> JSONResponse:
     # Verify signature (if enabled)
     if not _verify_signature(body, signature):
         logger.warning('Invalid Chatwoot webhook signature')
-        logger.error("Signature verification failed - check debug logs above for details")
+        logger.error(
+            "Signature verification failed - check debug logs above for details")
         raise HTTPException(status_code=403, detail='Invalid signature')
 
     try:
@@ -151,7 +153,21 @@ async def chatwoot_ingest(request: Request) -> JSONResponse:
         logger.warning('Missing message id in webhook payload')
         raise HTTPException(status_code=400, detail='Missing message_id')
 
-    # Normalize to Meta webhook format
+        # === ИСПРАВЛЕНИЕ: Безопасный парсинг даты из Chatwoot ===
+    created_at_raw = payload.get('created_at')
+    try:
+        if isinstance(created_at_raw, str):
+            # Переводим строку '2026-03-03T17:03:48.182Z' в Unix timestamp
+            timestamp_sec = int(datetime.fromisoformat(
+                created_at_raw.replace('Z', '+00:00')
+            ).timestamp())
+        else:
+            timestamp_sec = int(
+                created_at_raw or datetime.now(timezone.utc).timestamp())
+    except (ValueError, TypeError):
+        timestamp_sec = int(datetime.now(timezone.utc).timestamp())
+
+    # Normalize to Meta webhook format (compatible with existing worker)
     normalized_payload = {
         'entry': [{
             'changes': [{
@@ -161,7 +177,8 @@ async def chatwoot_ingest(request: Request) -> JSONResponse:
                         'type': 'text',
                         'text': {'body': text},
                         'id': str(chatwoot_message_id),
-                        'timestamp': str(int(payload.get('created_at', 0))),
+                        'timestamp': str(timestamp_sec),
+                        # <--- Используем высчитанные секунды
                     }],
                     'metadata': {
                         'phone_number_id': settings.meta_wa_phone_number_id
@@ -193,8 +210,12 @@ async def chatwoot_ingest(request: Request) -> JSONResponse:
                 await session.flush()
 
                 logger.info(
-                    'Chatwoot webhook saved: conv_id=%s msg_id=%s phone=%s text="%s"',
-                    chatwoot_conversation_id, chatwoot_message_id, phone_e164, text[:50]
+                    'Chatwoot webhook saved: conv_id=%s msg_id=%s '
+                    'phone=%s text="%s"',
+                    chatwoot_conversation_id,
+                    chatwoot_message_id,
+                    phone_e164,
+                    text[:50]
                 )
 
                 return JSONResponse({
