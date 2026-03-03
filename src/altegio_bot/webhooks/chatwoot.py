@@ -47,6 +47,9 @@ async def chatwoot_ingest(request: Request) -> JSONResponse:
     # Read body for signature verification
     body = await request.body()
 
+    # test loggin for debug
+    logger.info(f"RECEIVED WEBHOOK FROM CHATWOOT: {body}")
+
     # Verify signature (if enabled)
     signature = request.headers.get('x-chatwoot-signature')
     if not _verify_signature(body, signature):
