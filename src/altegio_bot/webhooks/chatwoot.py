@@ -1,39 +1,10 @@
-"""Chatwoot webhook handler.
-
-Chatwoot sends webhooks when:
-- A new message arrives from a customer (message_created, message_type: incoming)
-- An agent replies (message_created, message_type: outgoing)
-
-We only care about *incoming* messages so the inbox worker can process
-START/STOP commands.  All other traffic is ignored (admins reply manually
-in the Chatwoot UI).
-
-The payload from Chatwoot looks like::
-
-    {
-        "event": "message_created",
-        "message_type": "incoming",          # or "outgoing"
-        "content": "STOP",
-        "conversation": {
-            "id": 42,
-            "meta": {
-                "sender": {
-                    "phone_number": "+49123456789"
-                }
-            }
-        },
-        "inbox": {"id": 1}
-    }
-"""
+"""Chatwoot webhook handler."""
 from __future__ import annotations
 
-import hashlib
-import hmac
-import json
 import logging
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import IntegrityError
 
@@ -46,151 +17,114 @@ logger = logging.getLogger('chatwoot_webhook')
 router = APIRouter()
 
 
-def _verify_signature(body: bytes, signature_header: str | None) -> bool:
-    """Verify HMAC-SHA256 signature when chatwoot_webhook_secret is set."""
-    secret = settings.chatwoot_webhook_secret
-    if not secret:
-        return True  # no secret configured – accept all
-
-    if not signature_header:
-        return False
-
-    mac = hmac.new(secret.encode('utf-8'), body, hashlib.sha256)
-    expected = mac.hexdigest()
-    return hmac.compare_digest(signature_header.strip(), expected)
-
-
-def _dedupe_key(payload: dict[str, Any]) -> str:
-    raw = json.dumps(payload, sort_keys=True, separators=(',', ':'))
-    digest = hashlib.sha256(raw.encode('utf-8')).hexdigest()
-    return f'cw:{digest}'
-
-
-def _to_meta_payload(
-    phone_e164: str,
-    text: str,
-    conversation_id: int,
-    phone_number_id: str | None,
-) -> dict[str, Any]:
-    """Wrap the Chatwoot message into the same Meta Cloud API shape that the
-    inbox worker already knows how to parse.
-
-    This lets the *existing* ``whatsapp_inbox_worker`` handle START/STOP
-    commands without any changes to the command-parsing logic.
-    """
-    metadata: dict[str, Any] = {}
-    if phone_number_id:
-        metadata['phone_number_id'] = phone_number_id
-
-    return {
-        'object': 'whatsapp_business_account',
-        'entry': [
-            {
-                'id': 'chatwoot',
-                'changes': [
-                    {
-                        'field': 'messages',
-                        'value': {
-                            'metadata': metadata,
-                            'messages': [
-                                {
-                                    'from': phone_e164.lstrip('+'),
-                                    'id': f'cw:{conversation_id}',
-                                    'timestamp': '0',
-                                    'type': 'text',
-                                    'text': {'body': text},
-                                }
-                            ],
-                        },
-                    }
-                ],
-            }
-        ],
-        '_chatwoot': {
-            'conversation_id': conversation_id,
-        },
-    }
+def _safe_headers(request: Request) -> dict[str, str]:
+    deny = {'authorization', 'cookie', 'x-chatwoot-signature'}
+    return {k: v for k, v in request.headers.items() if k.lower() not in deny}
 
 
 @router.post('/webhook/chatwoot')
-async def chatwoot_ingest(request: Request) -> Response:
-    body = await request.body()
-
-    sig = request.headers.get('x-chatwoot-signature') or request.headers.get('X-Chatwoot-Signature')
-    if not _verify_signature(body, sig):
-        logger.warning('Chatwoot webhook signature mismatch')
-        raise HTTPException(status_code=403, detail='Bad signature')
+async def chatwoot_ingest(request: Request) -> JSONResponse:
+    """Receive webhooks from Chatwoot on message_created events."""
 
     try:
-        raw_payload: dict[str, Any] = json.loads(body.decode('utf-8'))
+        payload = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail='Invalid JSON')
 
-    event_type = raw_payload.get('event')
-    message_type = raw_payload.get('message_type')
-
-    # Only process incoming customer messages
-    if event_type != 'message_created' or message_type != 'incoming':
-        return JSONResponse({'ok': True, 'skipped': True})
-
-    content: str = str(raw_payload.get('content') or '')
-    conversation: dict[str, Any] = raw_payload.get('conversation') or {}
-    conversation_id: int | None = conversation.get('id')
-    meta_block: dict[str, Any] = conversation.get('meta') or {}
-    sender: dict[str, Any] = meta_block.get('sender') or {}
-    phone_e164: str = str(sender.get('phone_number') or '').strip()
-
-    if not phone_e164 or conversation_id is None:
-        logger.info(
-            'Chatwoot webhook missing phone or conversation_id – skipping'
-        )
-        return JSONResponse({'ok': True, 'skipped': True})
-
-    # phone_number_id is not available from Chatwoot payloads.
-    # The inbox worker will attempt to look up the sender by phone_number_id,
-    # but when it is absent (None/empty) _pick_sender returns (None, None).
-    # The worker still processes START/STOP opt-out changes via the customer
-    # phone number; it only skips sending the ack reply when no sender is found.
-    meta_payload = _to_meta_payload(
-        phone_e164=phone_e164,
-        text=content,
-        conversation_id=conversation_id,
-        phone_number_id=None,
+    # Log for debugging
+    logger.info(
+        'Chatwoot webhook received: event=%s', payload.get('event')
     )
 
-    dedupe_key = _dedupe_key(raw_payload)
+    event_type = payload.get('event')
+    if event_type != 'message_created':
+        return JSONResponse({'ok': True, 'skipped': f'event={event_type}'})
+
+    message = payload.get('message', {})
+    message_type = message.get('message_type')
+
+    # Only process incoming messages (from customers, not agents)
+    if message_type != 'incoming':
+        logger.info('Skipping non-incoming message: message_type=%s',
+                    message_type)
+        return JSONResponse(
+            {'ok': True, 'skipped': f'message_type={message_type}'})
+
+    conversation = payload.get('conversation', {})
+    sender = payload.get('sender', {})
+
+    phone_e164 = sender.get('phone_number')
+    text = message.get('content', '')
+    chatwoot_message_id = message.get('id')
+    chatwoot_conversation_id = conversation.get('id')
+
+    if not phone_e164:
+        logger.warning('Missing phone_number in webhook payload')
+        raise HTTPException(status_code=400, detail='Missing phone_number')
+
+    if not chatwoot_message_id:
+        logger.warning('Missing message id in webhook payload')
+        raise HTTPException(status_code=400, detail='Missing message_id')
+
+    # Normalize to Meta webhook format (compatible with existing worker)
+    normalized_payload = {
+        'entry': [{
+            'changes': [{
+                'value': {
+                    'messages': [{
+                        'from': phone_e164,
+                        'type': 'text',
+                        'text': {'body': text},
+                        'id': str(chatwoot_message_id),
+                        'timestamp': str(int(message.get('created_at', 0))),
+                    }],
+                    'metadata': {
+                        'phone_number_id': settings.meta_wa_phone_number_id
+                    }
+                }
+            }]
+        }],
+        '_chatwoot': {
+            'conversation_id': chatwoot_conversation_id,
+            'message_id': chatwoot_message_id,
+            'account_id': payload.get('account', {}).get('id'),
+        }
+    }
+
+    dedupe_key = f"chatwoot:{chatwoot_conversation_id}:{chatwoot_message_id}"
 
     async with SessionLocal() as session:
         try:
             async with session.begin():
-                evt = WhatsAppEvent(
+                event = WhatsAppEvent(
                     dedupe_key=dedupe_key,
                     status='received',
                     error=None,
-                    query={},
-                    headers=dict(request.headers),
-                    payload=meta_payload,
-                    chatwoot_conversation_id=conversation_id,
+                    query=dict(request.query_params),
+                    headers=_safe_headers(request),
+                    payload=normalized_payload,
                 )
-                session.add(evt)
+                session.add(event)
                 await session.flush()
 
-            return JSONResponse(
-                {
+                logger.info(
+                    'Chatwoot webhook saved: conv_id=%s msg_id=%s phone=%s text="%s"',
+                    chatwoot_conversation_id, chatwoot_message_id, phone_e164,
+                    text[:50]
+                )
+
+                return JSONResponse({
                     'ok': True,
                     'duplicate': False,
-                    'id': evt.id,
+                    'id': event.id,
                     'dedupe_key': dedupe_key,
-                }
-            )
+                })
 
         except IntegrityError:
             await session.rollback()
             logger.info('Duplicate chatwoot event: %s', dedupe_key)
-            return JSONResponse(
-                {
-                    'ok': True,
-                    'duplicate': True,
-                    'dedupe_key': dedupe_key,
-                }
-            )
+            return JSONResponse({
+                'ok': True,
+                'duplicate': True,
+                'dedupe_key': dedupe_key,
+            })
