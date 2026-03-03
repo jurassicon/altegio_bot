@@ -1,9 +1,15 @@
 """
-Fixed migration script with rate limiting and retry logic.
+Migrate existing clients from altegio_bot DB to Chatwoot contacts.
 
 Usage:
-  python -m altegio_bot.scripts.migrate_contacts_to_chatwoot_fixed \
-    --dry-run --limit 10
+  # Dry run (no changes)
+  python -m altegio_bot.scripts.migrate_contacts_to_chatwoot --dry-run --limit 10
+
+  # Migrate first 50 contacts
+  python -m altegio_bot.scripts.migrate_contacts_to_chatwoot --limit 50
+
+  # Migrate all contacts with last appointment in last 12 months
+  python -m altegio_bot.scripts.migrate_contacts_to_chatwoot --months 12
 """
 
 import argparse
@@ -13,7 +19,7 @@ from datetime import timedelta
 from typing import Any
 
 import httpx
-from sqlalchemy import select, and_, func
+from sqlalchemy import select
 from altegio_bot.db import SessionLocal
 from altegio_bot.models.models import Client, Record
 from altegio_bot.settings import settings
@@ -25,8 +31,8 @@ logger = logging.getLogger(__name__)
 class ChatwootClientFixed:
     """Chatwoot API client with retry logic."""
 
-    def __init__(self, url: str, account_id: str, inbox_id: str, api_key: str):
-        self.url = url.rstrip('/')
+    def __init__(self, base_url: str, account_id: str, inbox_id: str, api_key: str):
+        self.base_url = base_url.rstrip('/')
         self.account_id = account_id
         self.inbox_id = inbox_id
         self.api_key = api_key
@@ -74,7 +80,7 @@ class ChatwootClientFixed:
                     )
                     await asyncio.sleep(wait_time)
                 else:
-                    raise  # 4xx errors (except 429) - don't retry
+                    raise
 
             except (httpx.TimeoutException, httpx.ConnectError) as e:
                 wait_time = 2 ** attempt
@@ -87,10 +93,9 @@ class ChatwootClientFixed:
 
     async def find_contact_by_phone(self, phone_e164: str) -> dict | None:
         """Find contact by phone number."""
-        # Remove + for search
         search_phone = phone_e164.lstrip('+')
 
-        url = f'{self.url}/api/v1/accounts/{self.account_id}/contacts/search'
+        url = f'{self.base_url}/api/v1/accounts/{self.account_id}/contacts/search'
         params = {'q': search_phone}
 
         response = await self._request_with_retry(
@@ -112,7 +117,7 @@ class ChatwootClientFixed:
         custom_attributes: dict | None = None
     ) -> dict:
         """Create new contact."""
-        url = f'{self.url}/api/v1/accounts/{self.account_id}/contacts'
+        url = f'{self.base_url}/api/v1/accounts/{self.account_id}/contacts'
 
         payload: dict[str, Any] = {
             'inbox_id': self.inbox_id,
@@ -138,7 +143,7 @@ class ChatwootClientFixed:
         custom_attributes: dict
     ) -> dict:
         """Update contact custom attributes."""
-        url = f'{self.url}/api/v1/accounts/{self.account_id}/contacts/{contact_id}'
+        url = f'{self.base_url}/api/v1/accounts/{self.account_id}/contacts/{contact_id}'
 
         payload = {'custom_attributes': custom_attributes}
 
@@ -161,12 +166,11 @@ async def get_clients_with_recent_records(
     cutoff_date = utcnow() - timedelta(days=30 * months)
 
     async with SessionLocal() as session:
-        # Get unique clients with records after cutoff_date
         stmt = (
             select(Client)
             .join(Record, Record.client_id == Client.id)
             .where(Record.starts_at >= cutoff_date)
-            .where(Client.phone_e164.isnot(None))  # Must have phone
+            .where(Client.phone_e164.isnot(None))
             .where(Client.phone_e164 != '')
             .group_by(Client.id)
             .order_by(Client.id)
@@ -203,28 +207,20 @@ async def migrate_one_client(
     client: Client,
     chatwoot: ChatwootClientFixed,
     dry_run: bool = False
-) -> tuple[str, str]:  # (status, message)
-    """
-    Migrate single client to Chatwoot.
-
-    Returns:
-        ('created'|'updated'|'skipped'|'error', 'message')
-    """
+) -> tuple[str, str]:
+    """Migrate single client to Chatwoot."""
 
     if not client.phone_e164:
         return ('skipped', 'No phone number')
 
     try:
-        # Check if exists
         existing = await chatwoot.find_contact_by_phone(client.phone_e164)
 
-        # Prepare custom attributes
         custom_attrs = {
             'altegio_client_id': client.altegio_client_id or 0,
             'opted_out_status': 'yes' if client.wa_opted_out else 'no',
         }
 
-        # Get last appointment
         last_appt = await get_last_appointment_date(client.id)
         if last_appt:
             custom_attrs['last_appointment_date'] = last_appt
@@ -235,7 +231,6 @@ async def migrate_one_client(
             else:
                 return ('created', 'Would create new contact')
 
-        # Real migration
         if existing:
             await chatwoot.update_contact_attributes(
                 existing['id'], custom_attrs
@@ -249,8 +244,7 @@ async def migrate_one_client(
             )
             return ('created', f'Created contact id={contact.get("id")}')
 
-        # Add delay between requests (rate limiting)
-        await asyncio.sleep(0.6)  # ~1.5 req/sec
+        await asyncio.sleep(0.6)
 
     except Exception as e:
         return ('error', str(e))
@@ -262,15 +256,11 @@ async def migrate_contacts(
     months: int = 12,
     delay_sec: float = 0.6,
 ) -> dict[str, int]:
-    """
-    Migrate clients to Chatwoot with rate limiting and retry.
-
-    Returns:
-        Stats dict with counts
-    """
+    """Migrate clients to Chatwoot with rate limiting and retry."""
 
     if not settings.chatwoot_enabled:
-        logger.error('CHATWOOT_ENABLED=false. Enable Chatwoot first.')
+        logger.error('CHATWOOT_ENABLED is false. Enable Chatwoot first.')
+        logger.error('Set CHATWOOT_ENABLED=true in .env and restart containers')
         return {}
 
     logger.info('=== Migration Start ===')
@@ -278,16 +268,17 @@ async def migrate_contacts(
     logger.info(f'Limit: {limit or "None (all)"}')
     logger.info(f'Period: Last {months} months')
     logger.info(f'Delay: {delay_sec}s between requests')
+    logger.info(f'Chatwoot URL: {settings.chatwoot_base_url}')
+    logger.info(f'Account ID: {settings.chatwoot_account_id}')
+    logger.info(f'Inbox ID: {settings.chatwoot_inbox_id}')
 
-    # Initialize Chatwoot client
     chatwoot = ChatwootClientFixed(
-        url=settings.chatwoot_url,
+        base_url=settings.chatwoot_base_url,
         account_id=settings.chatwoot_account_id,
         inbox_id=settings.chatwoot_inbox_id,
         api_key=settings.chatwoot_api_key,
     )
 
-    # Get clients
     logger.info('Fetching clients from database...')
     clients = await get_clients_with_recent_records(months=months, limit=limit)
     logger.info(f'Found {len(clients)} clients to migrate')
@@ -297,7 +288,6 @@ async def migrate_contacts(
         await chatwoot.aclose()
         return {}
 
-    # Stats
     stats = {
         'total': len(clients),
         'created': 0,
@@ -306,12 +296,10 @@ async def migrate_contacts(
         'error': 0,
     }
 
-    # Migrate
     for i, client in enumerate(clients, 1):
         status, message = await migrate_one_client(client, chatwoot, dry_run)
         stats[status] += 1
 
-        # Log progress
         if i % 10 == 0 or i == len(clients):
             logger.info(
                 f'Progress: {i}/{len(clients)} | '
@@ -321,18 +309,15 @@ async def migrate_contacts(
                 f'API calls: {chatwoot.request_count}'
             )
 
-        # Detailed log for each
         log_func = logger.info if status != 'error' else logger.error
         log_func(
             f'[{i}/{len(clients)}] {client.phone_e164} ({client.display_name}): '
             f'{status} - {message}'
         )
 
-        # Rate limiting delay (except for last item)
         if i < len(clients) and not dry_run:
             await asyncio.sleep(delay_sec)
 
-    # Summary
     logger.info('=== Migration Complete ===')
     logger.info(f'Total: {stats["total"]}')
     logger.info(f'Created: {stats["created"]}')
@@ -347,30 +332,14 @@ async def migrate_contacts(
 
 async def main() -> None:
     parser = argparse.ArgumentParser(
-        description='Migrate contacts to Chatwoot (fixed version with retry)'
+        description='Migrate contacts to Chatwoot with retry logic'
     )
-    parser.add_argument(
-        '--dry-run',
-        action='store_true',
-        help='Preview without changes'
-    )
-    parser.add_argument(
-        '--limit',
-        type=int,
-        help='Max contacts to process'
-    )
-    parser.add_argument(
-        '--months',
-        type=int,
-        default=12,
-        help='Include clients with appointments in last N months (default: 12)'
-    )
-    parser.add_argument(
-        '--delay',
-        type=float,
-        default=0.6,
-        help='Delay between API requests in seconds (default: 0.6 = ~1.5 req/sec)'
-    )
+    parser.add_argument('--dry-run', action='store_true', help='Preview without changes')
+    parser.add_argument('--limit', type=int, help='Max contacts to process')
+    parser.add_argument('--months', type=int, default=12,
+                       help='Include clients with appointments in last N months')
+    parser.add_argument('--delay', type=float, default=0.6,
+                       help='Delay between API requests in seconds')
 
     args = parser.parse_args()
 
