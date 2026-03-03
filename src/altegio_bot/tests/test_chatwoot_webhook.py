@@ -1,30 +1,28 @@
 """Tests for Chatwoot webhook handler."""
 from __future__ import annotations
 
-import json
 import hashlib
 import hmac
+import json
 
 import pytest
 from httpx import AsyncClient, ASGITransport
 
 
 def _cw_payload(
-    phone: str = '+4915112345678',
-    content: str = 'Hello',
-    conversation_id: int = 1,
-    message_id: int = 1,
-    message_type: str = 'incoming',  # ← FIX: default to 'incoming'
+        phone: str = '+4915112345678',
+        content: str = 'Hello',
+        conversation_id: int = 1,
+        message_id: int = 1,
+        message_type: int | str = 0,  # 0 is incoming in Chatwoot
 ) -> dict:
     """Build a minimal Chatwoot message_created webhook payload."""
     return {
         'event': 'message_created',
-        'message': {
-            'id': message_id,
-            'content': content,
-            'message_type': message_type,
-            'created_at': 1234567890,
-        },
+        'id': message_id,
+        'content': content,
+        'message_type': message_type,
+        'created_at': 1234567890,
         'conversation': {
             'id': conversation_id,
         },
@@ -41,7 +39,8 @@ def _cw_payload(
 async def test_incoming_message_saved(session_maker) -> None:
     """Incoming message webhook should create a WhatsAppEvent with chatwoot_conversation_id."""
     import os
-    os.environ.setdefault('DATABASE_URL', 'postgresql+asyncpg://localhost/test')
+    os.environ.setdefault('DATABASE_URL',
+                          'postgresql+asyncpg://localhost/test')
     os.environ.setdefault('ALTEGIO_WEBHOOK_SECRET', 'test')
 
     from altegio_bot.main import app
@@ -53,8 +52,10 @@ async def test_incoming_message_saved(session_maker) -> None:
     try:
         cw_module.SessionLocal = session_maker  # type: ignore[assignment]
 
-        async with AsyncClient(transport=ASGITransport(app=app), base_url='http://test') as tc:
-            payload = _cw_payload(phone='+49123456789', content='STOP', conversation_id=99)
+        async with AsyncClient(transport=ASGITransport(app=app),
+                               base_url='http://test') as tc:
+            payload = _cw_payload(phone='+49123456789', content='STOP',
+                                  conversation_id=99)
             resp = await tc.post(
                 '/webhook/chatwoot',
                 content=json.dumps(payload),
@@ -63,7 +64,8 @@ async def test_incoming_message_saved(session_maker) -> None:
             assert resp.status_code == 200
             data = resp.json()
             assert data['ok'] is True
-            assert data.get('duplicate') is False  # FIX: Now returns duplicate field
+            assert data.get(
+                'duplicate') is False  # FIX: Now returns duplicate field
 
             # Verify event was saved
             async with session_maker() as session:
@@ -95,7 +97,7 @@ async def test_outgoing_message_skipped(session_maker) -> None:
         async with AsyncClient(
                 transport=ASGITransport(app=app), base_url='http://test'
         ) as tc:
-            payload = _cw_payload(message_type='outgoing')
+            payload = _cw_payload(message_type=1)  # 1 — это outgoing
             resp = await tc.post(
                 '/webhook/chatwoot',
                 content=json.dumps(payload),
@@ -103,7 +105,7 @@ async def test_outgoing_message_skipped(session_maker) -> None:
             )
             assert resp.status_code == 200
             data = resp.json()
-            assert data.get('skipped') == 'message_type=outgoing'
+            assert data.get('skipped') == 'message_type=1'
 
     finally:
         cw_module.SessionLocal = original_session_local
