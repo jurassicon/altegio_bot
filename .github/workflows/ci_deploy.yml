@@ -13,7 +13,6 @@ concurrency:
 jobs:
   tests:
     runs-on: ubuntu-latest
-    # ... (эта часть остается без изменений)
     services:
       postgres:
         image: postgres:16
@@ -84,22 +83,28 @@ jobs:
           port: ${{ secrets.SSH_PORT }}
           script: |
             set -euo pipefail
-
+            
             cd /opt/altegio_bot
-
+            
             echo "📦 Fetching new code..."
             git fetch origin main
             git reset --hard origin/main
 
+            echo "🧹 Cleaning up old containers to avoid metadata conflicts..."
+            docker-compose down
+            
             echo "🚀 Starting services via Docker Compose..."
             docker-compose up -d --build
-
+            
+            # Ожидаем несколько секунд, чтобы API успел проинициализироваться
+            sleep 5
+            
             echo "init Migrations..."
             docker exec altegio_bot_altegio-api_1 /app/.venv/bin/alembic upgrade head
-
+            
             echo "✅ Deployment successful! Current status:"
             docker-compose ps
-
+            
             docker image prune -f
 
   notify:
