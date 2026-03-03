@@ -123,8 +123,8 @@ async def chatwoot_ingest(request: Request) -> JSONResponse:
     if event_type != 'message_created':
         return JSONResponse({'ok': True, 'skipped': f'event={event_type}'})
 
-    message = payload.get('message', {})
-    message_type = message.get('message_type')
+    # === ИСПРАВЛЕНИЕ: Chatwoot присылает данные в корне (root) ===
+    message_type = payload.get('message_type')
 
     # Only process incoming messages (from customers, not agents)
     if message_type not in (0, 'incoming'):
@@ -139,8 +139,8 @@ async def chatwoot_ingest(request: Request) -> JSONResponse:
     sender = payload.get('sender', {})
 
     phone_e164 = sender.get('phone_number')
-    text = message.get('content', '')
-    chatwoot_message_id = message.get('id')
+    text = payload.get('content', '')  # Достаем текст из корня
+    chatwoot_message_id = payload.get('id')  # Достаем ID из корня
     chatwoot_conversation_id = conversation.get('id')
 
     if not phone_e164:
@@ -151,7 +151,7 @@ async def chatwoot_ingest(request: Request) -> JSONResponse:
         logger.warning('Missing message id in webhook payload')
         raise HTTPException(status_code=400, detail='Missing message_id')
 
-    # Normalize to Meta webhook format (compatible with existing worker)
+    # Normalize to Meta webhook format
     normalized_payload = {
         'entry': [{
             'changes': [{
@@ -161,7 +161,7 @@ async def chatwoot_ingest(request: Request) -> JSONResponse:
                         'type': 'text',
                         'text': {'body': text},
                         'id': str(chatwoot_message_id),
-                        'timestamp': str(int(message.get('created_at', 0))),
+                        'timestamp': str(int(payload.get('created_at', 0))),
                     }],
                     'metadata': {
                         'phone_number_id': settings.meta_wa_phone_number_id
