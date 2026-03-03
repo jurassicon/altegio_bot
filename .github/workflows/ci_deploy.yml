@@ -13,7 +13,7 @@ concurrency:
 jobs:
   tests:
     runs-on: ubuntu-latest
-
+    # ... (эта часть остается без изменений)
     services:
       postgres:
         image: postgres:16
@@ -28,84 +28,52 @@ jobs:
           --health-interval=10s
           --health-timeout=5s
           --health-retries=20
-
     env:
       DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/altegio_bot_test
       ALTEGIO_WEBHOOK_SECRET: test-secret
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-
       - name: Install uv
         run: python -m pip install --upgrade pip uv
-
       - name: Install deps
         run: uv sync --frozen
-
       - name: Wait for Postgres
         run: |
           uv run python - <<'PY'
           import asyncio
           import os
-
           import asyncpg
-
-
           def to_asyncpg_dsn(sqlalchemy_dsn: str) -> str:
               dsn = sqlalchemy_dsn.strip().strip('"').strip("'")
               if dsn.startswith('postgresql+asyncpg://'):
                   return 'postgresql://' + dsn.split('://', 1)[1]
-              if dsn.startswith('postgresql+psycopg://'):
-                  return 'postgresql://' + dsn.split('://', 1)[1]
               return dsn
-
-
           async def main() -> None:
               raw = os.environ['DATABASE_URL']
               dsn = to_asyncpg_dsn(raw)
-
-              last_err: Exception | None = None
-
               for _ in range(120):
                   try:
                       conn = await asyncpg.connect(dsn, timeout=3)
                       await conn.close()
                       print('Postgres is ready')
                       return
-                  except Exception as e:
-                      last_err = e
+                  except:
                       await asyncio.sleep(1)
-
-              raise SystemExit(f'Postgres did not become ready in time. Last error: {last_err!r}')
-
-
+              raise SystemExit('Postgres did not become ready')
           asyncio.run(main())
           PY
-
       - name: Run tests
         run: uv run pytest -q
-
-      - name: Debug Postgres logs (only on failure)
-        if: failure()
-        run: |
-          docker ps -a
-          PG_ID="$(docker ps -aq --filter ancestor=postgres:16 | head -n 1)"
-          if [ -n "${PG_ID}" ]; then
-            echo "Postgres container id: ${PG_ID}"
-            docker logs --tail 200 "${PG_ID}" || true
-          fi
 
   deploy:
     needs: tests
     if: needs.tests.result == 'success'
     runs-on: ubuntu-latest
-
     steps:
       - name: Deploy to server via SSH
         uses: appleboy/ssh-action@v1.0.3
@@ -119,79 +87,25 @@ jobs:
 
             cd /opt/altegio_bot
 
+            echo "📦 Fetching new code..."
             git fetch origin main
             git reset --hard origin/main
 
-            docker build -t altegio-bot:latest .
+            echo "🚀 Starting services via Docker Compose..."
+            docker-compose up -d --build
 
-            IMG='altegio-bot:latest'
-            ENV_FILE='/opt/altegio_bot/.env'
-            NET='altegio-net'
+            echo "init Migrations..."
+            docker exec altegio_bot_altegio-api_1 /app/.venv/bin/alembic upgrade head
 
-            test -f "${ENV_FILE}" || {
-              echo "ERROR: env file not found: ${ENV_FILE}" >&2
-              exit 1
-            }
+            echo "✅ Deployment successful! Current status:"
+            docker-compose ps
 
-            docker network inspect "${NET}" >/dev/null 2>&1 || docker network create "${NET}"
-            docker network connect "${NET}" altegio-postgres 2>/dev/null || true
-
-            docker run --rm \
-              --network "${NET}" \
-              -v "${ENV_FILE}:/app/.env:ro" \
-              "${IMG}" \
-              sh -c 'set -a; . /app/.env; set +a; /app/.venv/bin/alembic upgrade head'
-
-            docker rm -f \
-              altegio-api \
-              altegio-inbox-worker \
-              altegio-outbox-worker \
-              altegio-whatsapp-inbox-worker \
-              2>/dev/null || true
-
-            docker run -d \
-              --name altegio-api \
-              --restart unless-stopped \
-              --network "${NET}" \
-              -p 127.0.0.1:8000:8000 \
-              -v "${ENV_FILE}:/app/.env:ro" \
-              "${IMG}" \
-              /app/.venv/bin/uvicorn altegio_bot.main:app --host 0.0.0.0 --port 8000
-
-            docker run -d \
-              --name altegio-outbox-worker \
-              --restart unless-stopped \
-              --network "${NET}" \
-              -v "${ENV_FILE}:/app/.env:ro" \
-              "${IMG}" \
-              sh -c 'set -a; . /app/.env; set +a; /app/.venv/bin/python -m altegio_bot.workers.outbox_worker'
-
-            docker run -d \
-              --name altegio-inbox-worker \
-              --restart unless-stopped \
-              --network "${NET}" \
-              -v "${ENV_FILE}:/app/.env:ro" \
-              "${IMG}" \
-              sh -c 'set -a; . /app/.env; set +a; /app/.venv/bin/python -m altegio_bot.workers.inbox_worker'
-
-            docker run -d \
-              --name altegio-whatsapp-inbox-worker \
-              --restart unless-stopped \
-              --network "${NET}" \
-              -v "${ENV_FILE}:/app/.env:ro" \
-              "${IMG}" \
-              sh -c 'set -a; . /app/.env; set +a; /app/.venv/bin/python -m altegio_bot.scripts.run_whatsapp_inbox_worker'
-
-            docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}'
-
-            docker container prune -f
             docker image prune -f
 
   notify:
     needs: [tests, deploy]
     if: always()
     runs-on: ubuntu-latest
-
     steps:
       - name: Telegram notify
         uses: appleboy/telegram-action@master
