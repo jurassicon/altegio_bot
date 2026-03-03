@@ -268,12 +268,12 @@ async def migrate_contacts(
     logger.info(f'Limit: {limit or "None (all)"}')
     logger.info(f'Period: Last {months} months')
     logger.info(f'Delay: {delay_sec}s between requests')
-    logger.info(f'Chatwoot URL: {settings.chatwoot_url}')
+    logger.info(f'Chatwoot URL: {settings.chatwoot_base_url}')
     logger.info(f'Account ID: {settings.chatwoot_account_id}')
     logger.info(f'Inbox ID: {settings.chatwoot_inbox_id}')
 
     chatwoot = ChatwootClientFixed(
-        base_url=settings.chatwoot_url,
+        base_url=settings.chatwoot_base_url,
         account_id=settings.chatwoot_account_id,
         inbox_id=settings.chatwoot_inbox_id,
         api_key=settings.chatwoot_api_token,
