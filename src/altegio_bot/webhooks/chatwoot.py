@@ -1,8 +1,9 @@
 """Chatwoot webhook handler."""
 from __future__ import annotations
 
+import hashlib
+import hmac
 import logging
-from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -18,16 +19,43 @@ router = APIRouter()
 
 
 def _safe_headers(request: Request) -> dict[str, str]:
-    deny = {'authorization', 'cookie', 'x-chatwoot-signature'}
+    deny = {'authorization', 'cookie'}
     return {k: v for k, v in request.headers.items() if k.lower() not in deny}
+
+
+def _verify_signature(body: bytes, signature: str | None) -> bool:
+    """Verify HMAC signature from Chatwoot (optional)."""
+    if not settings.chatwoot_webhook_secret:
+        return True  # Signature verification disabled
+
+    if not signature:
+        return False  # Secret is set but signature is missing
+
+    expected = hmac.new(
+        settings.chatwoot_webhook_secret.encode(),
+        body,
+        hashlib.sha256
+    ).hexdigest()
+
+    return hmac.compare_digest(signature, expected)
 
 
 @router.post('/webhook/chatwoot')
 async def chatwoot_ingest(request: Request) -> JSONResponse:
     """Receive webhooks from Chatwoot on message_created events."""
 
+    # Read body for signature verification
+    body = await request.body()
+
+    # Verify signature (if enabled)
+    signature = request.headers.get('x-chatwoot-signature')
+    if not _verify_signature(body, signature):
+        logger.warning('Invalid Chatwoot webhook signature')
+        raise HTTPException(status_code=403, detail='Invalid signature')
+
     try:
-        payload = await request.json()
+        import json
+        payload = json.loads(body)
     except Exception:
         raise HTTPException(status_code=400, detail='Invalid JSON')
 
@@ -45,10 +73,12 @@ async def chatwoot_ingest(request: Request) -> JSONResponse:
 
     # Only process incoming messages (from customers, not agents)
     if message_type != 'incoming':
-        logger.info('Skipping non-incoming message: message_type=%s',
-                    message_type)
+        logger.info(
+            'Skipping non-incoming message: message_type=%s', message_type
+        )
         return JSONResponse(
-            {'ok': True, 'skipped': f'message_type={message_type}'})
+            {'ok': True, 'skipped': f'message_type={message_type}'}
+        )
 
     conversation = payload.get('conversation', {})
     sender = payload.get('sender', {})
@@ -109,8 +139,7 @@ async def chatwoot_ingest(request: Request) -> JSONResponse:
 
                 logger.info(
                     'Chatwoot webhook saved: conv_id=%s msg_id=%s phone=%s text="%s"',
-                    chatwoot_conversation_id, chatwoot_message_id, phone_e164,
-                    text[:50]
+                    chatwoot_conversation_id, chatwoot_message_id, phone_e164, text[:50]
                 )
 
                 return JSONResponse({
