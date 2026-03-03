@@ -1,6 +1,8 @@
 """Chatwoot webhook handler."""
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import hmac
 import logging
@@ -31,8 +33,15 @@ def _verify_signature(body: bytes, signature: str | None) -> bool:
     if not signature:
         return False  # Secret is set but signature is missing
 
+    # Try to decode secret as base64 first (Chatwoot's default)
+    try:
+        secret_bytes = base64.b64decode(settings.chatwoot_webhook_secret)
+    except binascii.Error:
+        # Fallback to raw string if not base64
+        secret_bytes = settings.chatwoot_webhook_secret.encode()
+
     expected = hmac.new(
-        settings.chatwoot_webhook_secret.encode(),
+        secret_bytes,
         body,
         hashlib.sha256
     ).hexdigest()
@@ -47,13 +56,55 @@ async def chatwoot_ingest(request: Request) -> JSONResponse:
     # Read body for signature verification
     body = await request.body()
 
-    # test loggin for debug
-    logger.info(f"RECEIVED WEBHOOK FROM CHATWOOT: {body}")
+    # === ENHANCED DEBUGGING ===
+    signature = request.headers.get('x-chatwoot-signature')
+
+    # Log all headers (to check exact casing)
+    logger.debug(f"Webhook headers: {dict(request.headers)}")
+
+    # Log raw body details
+    logger.debug(f"Raw body length: {len(body)}")
+    logger.debug(f"Body (first 200 chars): {body[:200]!r}")
+
+    # Log received signature
+    logger.debug(f"Received signature: {signature!r}")
+
+    # Compute and log expected signatures for debugging
+    if settings.chatwoot_webhook_secret and signature:
+        # Method 1: Raw string
+        expected_raw = hmac.new(
+            settings.chatwoot_webhook_secret.encode(),
+            body,
+            hashlib.sha256
+        ).hexdigest()
+        logger.debug(f"Expected (raw secret): {expected_raw}")
+
+        # Method 2: Base64-decoded secret
+        try:
+            decoded_secret = base64.b64decode(settings.chatwoot_webhook_secret)
+            expected_b64 = hmac.new(
+                decoded_secret,
+                body,
+                hashlib.sha256
+            ).hexdigest()
+            logger.debug(f"Expected (base64-decoded secret): {expected_b64}")
+
+            # Check which one matches
+            if hmac.compare_digest(signature, expected_raw):
+                logger.info("Signature matches: RAW secret method")
+            elif hmac.compare_digest(signature, expected_b64):
+                logger.info("Signature matches: BASE64-decoded secret method")
+            else:
+                logger.warning("Signature DOES NOT match either method")
+        except binascii.Error as e:
+            logger.debug(f"Could not decode secret as base64: {e}")
+
+    # === END DEBUGGING ===
 
     # Verify signature (if enabled)
-    signature = request.headers.get('x-chatwoot-signature')
     if not _verify_signature(body, signature):
         logger.warning('Invalid Chatwoot webhook signature')
+        logger.error("Signature verification failed - check debug logs above for details")
         raise HTTPException(status_code=403, detail='Invalid signature')
 
     try:
