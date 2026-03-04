@@ -830,26 +830,3 @@ async def run_once(
 
         await session.commit()
         return len(ids)
-
-
-def _build_provider() -> WhatsAppProvider:
-    name = os.getenv("WHATSAPP_PROVIDER", "dummy").strip().lower()
-    logger.info(f"[DEBUG] raw={repr(name)} stripped={repr(name)}")
-    if name == "meta_cloud":
-        from altegio_bot.providers.meta_cloud import MetaCloudProvider
-
-        return MetaCloudProvider()
-    if name == "chatwoot_hybrid":
-        from altegio_bot.providers.chatwoot_hybrid import ChatwootHybridProvider
-
-        return ChatwootHybridProvider()
-    return DummyProvider()
-
-
-def main() -> None:
-    provider = _build_provider()
-    asyncio.run(run_loop(provider=provider))
-
-
-if __name__ == "__main__":
-    main()
