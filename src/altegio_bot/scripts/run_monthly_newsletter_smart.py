@@ -666,7 +666,6 @@ async def _run_mode_send_real(
             loyalty_card_text = f"{_LOYALTY_CARD_PREFIX}{issued_num}"
 
             display = candidate.display_name or "KitiLash Kunde"
-            template_params = [display, booking_link, loyalty_card_text]
 
             try:
                 async with SessionLocal() as session:
