@@ -64,9 +64,9 @@ def test_resolve_ra_record_created() -> None:
     assert resolve_meta_template(RA, "record_created") == ("kitilash_ra_record_created_v1")
 
 
-def test_resolve_ra_record_updated_fallback() -> None:
+def test_resolve_ra_record_updated() -> None:
     # Rastatt falls back to ka template with a warning
-    assert resolve_meta_template(RA, "record_updated") == ("kitilash_ka_record_updated_v1")
+    assert resolve_meta_template(RA, "record_updated") == ("kitilash_ra_record_updated_v1")
 
 
 def test_resolve_ra_repeat_10d_uses_canonical_ka() -> None:
@@ -75,8 +75,8 @@ def test_resolve_ra_repeat_10d_uses_canonical_ka() -> None:
     assert resolve_meta_template(RA, "repeat_10d") == ("kitilash_ka_repeat_10d_v1")
 
 
-def test_resolve_ra_review_3d_uses_canonical_ka() -> None:
-    assert resolve_meta_template(RA, "review_3d") == ("kitilash_ka_review_3d_v1")
+def test_resolve_ra_review_3d() -> None:
+    assert resolve_meta_template(RA, "review_3d") == ("kitilash_ra_review_3d_v1")
 
 
 def test_resolve_ra_comeback_3d_uses_canonical_ka() -> None:
