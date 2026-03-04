@@ -39,11 +39,6 @@ def _cw_payload(
 @pytest.mark.asyncio
 async def test_incoming_message_saved(session_maker) -> None:
     """Incoming message webhook should create a WhatsAppEvent with chatwoot_conversation_id."""
-    import os
-
-    os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://localhost/test")
-    os.environ.setdefault("ALTEGIO_WEBHOOK_SECRET", "test")
-
     # Patch SessionLocal to use the test session_maker
     import altegio_bot.webhooks.chatwoot as cw_module
     from altegio_bot.main import app
