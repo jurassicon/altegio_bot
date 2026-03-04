@@ -119,38 +119,29 @@ jobs:
             git reset --hard origin/main
             
             echo "🚀 Deployment with Orphan removal..."
-            # Запускаем сборку и старт
             docker compose up -d --build --remove-orphans
             
-            # --- Улучшенное ожидание базы данных ---
             echo "⏳ Waiting for Postgres to be healthy..."
-            
-            # Мы ищем контейнер по метке сервиса, это надежнее, чем имя
             MAX_ATTEMPTS=60
             ATTEMPTS=0
             
+            # Ищем контейнер, который принадлежит сервису postgres.
             until [ $ATTEMPTS -ge $MAX_ATTEMPTS ]; do
-
-                STATUS=$(docker ps --filter "name=postgres" --format "{{.Status}}" | grep -o "healthy" || echo "not ready")
+                # Находим имя контейнера базы данных, как бы он ни назывался
+                DB_CONTAINER=$(docker ps --filter "label=com.docker.compose.service=postgres" --filter "label=com.docker.compose.project=altegio_bot" --format "{{.Names}}" | head -n 1)
             
-                if [ "$STATUS" == "healthy" ]; then
-                    echo "✅ Postgres is ready!"
+                if [ -n "$DB_CONTAINER" ] && [ "$(docker inspect -f '{{.State.Health.Status}}' $DB_CONTAINER)" == "healthy" ]; then
+                    echo "✅ Postgres ($DB_CONTAINER) is ready!"
                     break
                 fi
             
                 ATTEMPTS=$((ATTEMPTS + 1))
-                echo "... waiting ($ATTEMPTS/$MAX_ATTEMPTS) ..."
+                echo "... waiting for database ($ATTEMPTS/$MAX_ATTEMPTS) ..."
                 sleep 1
-            
-                if [ $ATTEMPTS -ge $MAX_ATTEMPTS ]; then
-                    echo "❌ ERROR: Postgres did not become healthy in time"
-                    exit 1
-                fi
             done
             
             echo "⚙️ Applying DB Migrations..."
-            # Находим имя API контейнера динамически
-            API_CONTAINER=$(docker ps --filter "name=altegio-api" --format "{{.Names}}")
+            API_CONTAINER=$(docker ps --filter "label=com.docker.compose.service=altegio-api" --filter "label=com.docker.compose.project=altegio_bot" --format "{{.Names}}" | head -n 1)
             docker exec "$API_CONTAINER" /app/.venv/bin/alembic upgrade head
             
             echo "🧹 Aggressive cleanup of unused images..."
@@ -161,22 +152,27 @@ jobs:
 
   notify:
     name: Telegram Notification
-    needs: deploy
+    needs: [ lint, tests, deploy ]
+
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - name: Telegram notify
+      - name: Notify via Telegram
         uses: appleboy/telegram-action@master
         with:
           to: ${{ secrets.TELEGRAM_TO }}
           token: ${{ secrets.TELEGRAM_TOKEN }}
+
           message: |
-            🤖 AltegioBot CI / Deploy report
+            🤖 *AltegioBot CI / Deploy Report*
 
-            Branch: ${{ github.ref_name }}
-            Commit: ${{ github.sha }}
+            *Branch:* `${{ github.ref_name }}`
+            *Commit:* `${{ github.sha }}`
 
-            Tests: ${{ needs.tests.result }}
-            Deploy: ${{ needs.deploy.result }}
+            *Statuses:*
+            🎨 **Lint:** `${{ needs.lint.result }}`
+            🧪 **Tests:** `${{ needs.tests.result }}`
+            🚀 **Deploy:** `${{ needs.deploy.result }}`
 
-            Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            *Run details:*
+            ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
