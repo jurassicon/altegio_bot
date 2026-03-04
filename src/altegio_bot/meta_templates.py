@@ -77,14 +77,9 @@ _RA_NEW_CLIENT_TEMPLATE = "kitilash_ra_record_created_new_client_v1"
 
 # Branch-specific job types that have a dedicated ra_* template in Meta WABA.
 # All other branch-specific Rastatt types fall back to ka_* (logged as WARNING).
-_RA_DEDICATED: frozenset[str] = frozenset({
-    "record_created",
-    "record_updated",
-    "record_canceled",
-    "reminder_24h",
-    "reminder_2h",
-    "review_3d"
-})
+_RA_DEDICATED: frozenset[str] = frozenset(
+    {"record_created", "record_updated", "record_canceled", "reminder_24h", "reminder_2h", "review_3d"}
+)
 
 
 def resolve_meta_template(
@@ -184,10 +179,10 @@ def build_template_params(
         ]
 
     if n in (
-            "kitilash_ka_reminder_24h_v1",
-            "kitilash_ka_reminder_2h_v1",
-            "kitilash_ra_reminder_24h_v1",
-            "kitilash_ra_reminder_2h_v1"
+        "kitilash_ka_reminder_24h_v1",
+        "kitilash_ka_reminder_2h_v1",
+        "kitilash_ra_reminder_24h_v1",
+        "kitilash_ra_reminder_2h_v1",
     ):
         return [
             ctx.get("client_name", ""),
