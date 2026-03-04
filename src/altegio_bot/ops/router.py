@@ -88,9 +88,7 @@ def _ago(dt: datetime | None) -> str:
 def _esc(s: Any) -> str:
     if s is None:
         return ""
-    return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">",
-                                                                     "&gt;").replace(
-        '"', "&quot;")
+    return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
 
 
 def _status_badge(status: str | None) -> str:
@@ -184,12 +182,10 @@ def _filter_form(action: str, fields: list[tuple[str, str, str, str]]) -> str:
     fields: list of (name, label, type, current_value)
     type: text | select:opt1,opt2,...
     """
-    parts = [
-        f'<form method="get" action="{action}" class="row g-2 mb-3 align-items-end">']
+    parts = [f'<form method="get" action="{action}" class="row g-2 mb-3 align-items-end">']
     for name, label, ftype, val in fields:
         parts.append('<div class="col-auto">')
-        parts.append(
-            f'<label class="form-label small mb-1">{_esc(label)}</label>')
+        parts.append(f'<label class="form-label small mb-1">{_esc(label)}</label>')
         if ftype.startswith("select:"):
             options_str = ftype[7:]
             options = [""] + options_str.split(",")
@@ -205,14 +201,12 @@ def _filter_form(action: str, fields: list[tuple[str, str, str, str]]) -> str:
                 f' value="{_esc(val)}" placeholder="{_esc(label)}">'
             )
         parts.append("</div>")
-    parts.append(
-        '<div class="col-auto"><button type="submit" class="btn btn-primary btn-sm">Filter</button></div>')
+    parts.append('<div class="col-auto"><button type="submit" class="btn btn-primary btn-sm">Filter</button></div>')
     parts.append("</form>")
     return "\n".join(parts)
 
 
-def _table(cols: list[str], rows: list[list[str]],
-           row_classes: list[str] | None = None) -> str:
+def _table(cols: list[str], rows: list[list[str]], row_classes: list[str] | None = None) -> str:
     th = "".join(f"<th>{_esc(c)}</th>" for c in cols)
     body_rows = []
     for i, row in enumerate(rows):
@@ -262,8 +256,7 @@ def _period_params(request: Request) -> tuple[datetime, datetime]:
 
     if from_str and to_str:
         try:
-            from_dt = datetime.fromisoformat(from_str).replace(
-                tzinfo=timezone.utc)
+            from_dt = datetime.fromisoformat(from_str).replace(tzinfo=timezone.utc)
             to_dt = datetime.fromisoformat(to_str).replace(tzinfo=timezone.utc)
             return from_dt, to_dt
         except ValueError:
@@ -290,19 +283,16 @@ def _period_params(request: Request) -> tuple[datetime, datetime]:
         days_since_monday = now.weekday()
         this_monday = now - timedelta(days=days_since_monday)
         last_monday = this_monday - timedelta(days=7)
-        from_dt = last_monday.replace(hour=0, minute=0, second=0,
-                                      microsecond=0)
+        from_dt = last_monday.replace(hour=0, minute=0, second=0, microsecond=0)
         to_dt = this_monday.replace(hour=0, minute=0, second=0, microsecond=0)
         return from_dt, to_dt
     if period == "this_month":
         from_dt = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
         return from_dt, now
     if period == "last_month":
-        first_of_this_month = now.replace(day=1, hour=0, minute=0, second=0,
-                                          microsecond=0)
+        first_of_this_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
         last_day_prev_month = first_of_this_month - timedelta(days=1)
-        from_dt = last_day_prev_month.replace(day=1, hour=0, minute=0,
-                                              second=0, microsecond=0)
+        from_dt = last_day_prev_month.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
         to_dt = first_of_this_month
         return from_dt, to_dt
     if period == "7d":
@@ -324,8 +314,7 @@ async def ops_queue(request: Request) -> str:
     # view: upcoming_7d (default), upcoming_24h, recent_24h, recent_7d
     view = request.query_params.get("view", "")
     if not view:
-        view = "recent_24h" if status_filter in ("processing",
-                                                 "failed") else "upcoming_7d"
+        view = "recent_24h" if status_filter in ("processing", "failed") else "upcoming_7d"
     tz = _local_tz()
     now = datetime.now(timezone.utc)
 
@@ -434,25 +423,21 @@ async def ops_queue(request: Request) -> str:
         [
             ("company_id", "Company", "select:758285,1271200", company_id),
             ("job_type", "Job type", "text", job_type),
-            ("status", "Status", "select:queued,processing,failed",
-             status_filter),
-            ("view", "View",
-             "select:upcoming_7d,upcoming_24h,recent_24h,recent_7d", view),
+            ("status", "Status", "select:queued,processing,failed", status_filter),
+            ("view", "View", "select:upcoming_7d,upcoming_24h,recent_24h,recent_7d", view),
         ],
     )
 
     view_label = view.replace("_", " ")
-    cols = ["ID", "Company", "Type", "Status", "Run At", "Attempts", "Client",
-            "Error"]
+    cols = ["ID", "Company", "Type", "Status", "Run At", "Attempts", "Client", "Error"]
     table_rows = []
     row_classes = []
     for j in jobs:
         is_stuck = (
-                j.status == "processing"
-                and j.locked_at is not None
-                and (datetime.now(timezone.utc) - j.locked_at.replace(
-            tzinfo=timezone.utc)).total_seconds()
-                > settings.ops_stuck_minutes * 60
+            j.status == "processing"
+            and j.locked_at is not None
+            and (datetime.now(timezone.utc) - j.locked_at.replace(tzinfo=timezone.utc)).total_seconds()
+            > settings.ops_stuck_minutes * 60
         )
         company_name = COMPANIES.get(j.company_id, str(j.company_id))
         client_info = ""
@@ -572,8 +557,7 @@ async def ops_history(request: Request) -> str:
             ("company_id", "Company", "select:758285,1271200", company_id),
             ("template_code", "Template", "text", template_code),
             ("phone_e164", "Phone", "text", phone),
-            ("provider_message_id", "Provider Msg ID", "text",
-             provider_msg_id),
+            ("provider_message_id", "Provider Msg ID", "text", provider_msg_id),
             (
                 "period",
                 "Period",
@@ -608,8 +592,7 @@ async def ops_history(request: Request) -> str:
         send_badge = (
             '<span class="badge bg-primary">tpl</span>'
             if send_type == "template"
-            else (
-                '<span class="badge bg-secondary">txt</span>' if send_type == "text" else "")
+            else ('<span class="badge bg-secondary">txt</span>' if send_type == "text" else "")
         )
         # Template column: show job type + meta template name if available
         tpl_cell = _esc(r.template_code or "")
@@ -664,8 +647,7 @@ async def ops_job(job_id: int) -> str:
         job = job_q.fetchone()
 
         if job is None:
-            return _page("Job Not Found",
-                         '<div class="alert alert-danger">Job not found.</div>')
+            return _page("Job Not Found", '<div class="alert alert-danger">Job not found.</div>')
 
         outbox_q = await session.execute(
             text("""
@@ -745,11 +727,10 @@ async def ops_job(job_id: int) -> str:
                 altegio_events = events_q.fetchall()
 
     is_stuck = (
-            job.status == "processing"
-            and job.locked_at is not None
-            and (datetime.now(timezone.utc) - job.locked_at.replace(
-        tzinfo=timezone.utc)).total_seconds()
-            > settings.ops_stuck_minutes * 60
+        job.status == "processing"
+        and job.locked_at is not None
+        and (datetime.now(timezone.utc) - job.locked_at.replace(tzinfo=timezone.utc)).total_seconds()
+        > settings.ops_stuck_minutes * 60
     )
     company_name = COMPANIES.get(job.company_id, str(job.company_id))
 
@@ -788,9 +769,9 @@ async def ops_job(job_id: int) -> str:
       <dd class="col-sm-9">
         {_esc(job.display_name or "")}
         {
-    (f'<a href="/ops/history?phone_e164={_esc(job.phone_e164)}">{_esc(job.phone_e164)}</a>')
-    if job.phone_e164
-    else ""
+        (f'<a href="/ops/history?phone_e164={_esc(job.phone_e164)}">{_esc(job.phone_e164)}</a>')
+        if job.phone_e164
+        else ""
     }
       </dd>
       <dt class="col-sm-3">Record ID</dt>
@@ -811,8 +792,7 @@ async def ops_job(job_id: int) -> str:
 </div>
 """
 
-    cols = ["ID", "Status", "WA Delivery", "Phone", "Template", "Sent At",
-            "Error"]
+    cols = ["ID", "Status", "WA Delivery", "Phone", "Template", "Sent At", "Error"]
     outbox_table_rows = []
     for r in outbox_rows:
         outbox_table_rows.append(
@@ -835,8 +815,7 @@ async def ops_job(job_id: int) -> str:
     # --- Record Altegio events section ---
     altegio_events_section = ""
     if altegio_events:
-        ev_cols = ["Event ID", "Received At", "Event Status",
-                   "Processing Status", "Error"]
+        ev_cols = ["Event ID", "Received At", "Event Status", "Processing Status", "Error"]
         ev_rows = []
         for e in altegio_events:
             ev_rows.append(
@@ -856,8 +835,7 @@ async def ops_job(job_id: int) -> str:
     # --- All jobs for same record section ---
     record_jobs_section = ""
     if record_jobs:
-        rj_cols = ["ID", "Type", "Status", "Run At", "Created At", "Attempts",
-                   "Error"]
+        rj_cols = ["ID", "Type", "Status", "Run At", "Created At", "Attempts", "Error"]
         rj_rows = []
         rj_classes = []
         for rj in record_jobs:
@@ -915,8 +893,7 @@ async def ops_record(record_id: int) -> str:
         rec = rec_q.fetchone()
 
         if rec is None:
-            return _page("Record Not Found",
-                         '<div class="alert alert-danger">Record not found.</div>')
+            return _page("Record Not Found", '<div class="alert alert-danger">Record not found.</div>')
 
         events_q = await session.execute(
             text("""
@@ -1007,8 +984,7 @@ async def ops_record(record_id: int) -> str:
 </div>
 """
 
-    ev_cols = ["Event ID", "Received At", "Event Status", "Processing Status",
-               "Error"]
+    ev_cols = ["Event ID", "Received At", "Event Status", "Processing Status", "Error"]
     ev_rows = []
     for e in altegio_events:
         ev_rows.append(
@@ -1026,8 +1002,7 @@ async def ops_record(record_id: int) -> str:
 {_table(ev_cols, ev_rows) if ev_rows else '<p class="text-muted">No altegio events found.</p>'}
 """
 
-    j_cols = ["ID", "Type", "Status", "Run At", "Created At", "Attempts",
-              "Error"]
+    j_cols = ["ID", "Type", "Status", "Run At", "Created At", "Attempts", "Error"]
     j_rows = []
     for jb in jobs:
         j_rows.append(
@@ -1047,8 +1022,7 @@ async def ops_record(record_id: int) -> str:
 {_table(j_cols, j_rows) if j_rows else '<p class="text-muted">No jobs found.</p>'}
 """
 
-    om_cols = ["ID", "Status", "WA Delivery", "Phone", "Template", "Sent At",
-               "Error"]
+    om_cols = ["ID", "Status", "WA Delivery", "Phone", "Template", "Sent At", "Error"]
     om_rows = []
     for r in outbox_rows:
         om_rows.append(
@@ -1100,8 +1074,7 @@ async def ops_outbox(outbox_id: int) -> str:
         om = om_q.fetchone()
 
         if om is None:
-            return _page("Not Found",
-                         '<div class="alert alert-danger">Not found.</div>')
+            return _page("Not Found", '<div class="alert alert-danger">Not found.</div>')
 
         delivery_q = await session.execute(
             text("""
@@ -1308,17 +1281,14 @@ async def ops_wa_inbox(request: Request) -> str:
         }
 
         if pni_filter:
-            filters.append(
-                "we.payload #>> '{entry,0,changes,0,value,metadata,phone_number_id}' = :pni")
+            filters.append("we.payload #>> '{entry,0,changes,0,value,metadata,phone_number_id}' = :pni")
             params["pni"] = pni_filter
 
         if tab == "inbox":
             # Only inbound messages: messages[0].id must exist
-            filters.append(
-                "we.payload #> '{entry,0,changes,0,value,messages,0,id}' IS NOT NULL")
+            filters.append("we.payload #> '{entry,0,changes,0,value,messages,0,id}' IS NOT NULL")
             if from_filter:
-                filters.append(
-                    "we.payload #>> '{entry,0,changes,0,value,messages,0,from}' ILIKE :wa_from")
+                filters.append("we.payload #>> '{entry,0,changes,0,value,messages,0,from}' ILIKE :wa_from")
                 params["wa_from"] = f"%{from_filter}%"
             if status_filter and _safe_identifier(status_filter):
                 filters.append("we.status = :status_filter")
@@ -1348,8 +1318,7 @@ async def ops_wa_inbox(request: Request) -> str:
 
         else:
             # delivery tab: only status events, deduplicated by (status_msg_id, status_value)
-            filters.append(
-                "we.payload #> '{entry,0,changes,0,value,statuses,0,id}' IS NOT NULL")
+            filters.append("we.payload #> '{entry,0,changes,0,value,statuses,0,id}' IS NOT NULL")
 
             where = " AND ".join(filters)
             rows_q = await session.execute(
@@ -1379,8 +1348,7 @@ async def ops_wa_inbox(request: Request) -> str:
 
     def _pni_from_payload(p: dict) -> str:
         try:
-            return p["entry"][0]["changes"][0]["value"]["metadata"][
-                "phone_number_id"]
+            return p["entry"][0]["changes"][0]["value"]["metadata"]["phone_number_id"]
         except Exception:
             return ""
 
@@ -1392,8 +1360,7 @@ async def ops_wa_inbox(request: Request) -> str:
 
     def _body_from_payload(p: dict) -> str:
         try:
-            return p["entry"][0]["changes"][0]["value"]["messages"][0]["text"][
-                "body"]
+            return p["entry"][0]["changes"][0]["value"]["messages"][0]["text"]["body"]
         except Exception:
             return ""
 
@@ -1405,14 +1372,12 @@ async def ops_wa_inbox(request: Request) -> str:
             [
                 ("pni", "Phone Number ID", "text", pni_filter),
                 ("wa_from", "From (phone)", "text", from_filter),
-                ("status", "Status",
-                 "select:received,ignored,processed,failed", status_filter),
+                ("status", "Status", "select:received,ignored,processed,failed", status_filter),
                 ("only_commands", "Only STOP/START", "select:,1", only_cmds),
                 ("period", "Period", "select:24h,today,7d", period),
             ],
         )
-        cols = ["ID", "Received At", "PNI", "From", "Body", "Cmd", "Status",
-                "Error"]
+        cols = ["ID", "Received At", "PNI", "From", "Body", "Cmd", "Status", "Error"]
         table_rows = []
         row_classes = []
         for r in rows:
@@ -1426,8 +1391,7 @@ async def ops_wa_inbox(request: Request) -> str:
                 cmd_badge = '<span class="badge bg-danger">STOP</span>'
             elif cmd == "start":
                 cmd_badge = '<span class="badge bg-success">START</span>'
-            row_class = "warn" if r.status == "ignored" else (
-                "stuck" if r.status == "failed" else "")
+            row_class = "warn" if r.status == "ignored" else ("stuck" if r.status == "failed" else "")
             table_rows.append(
                 [
                     str(r.id),
@@ -1457,13 +1421,11 @@ async def ops_wa_inbox(request: Request) -> str:
                 ("period", "Period", "select:24h,today,7d", period),
             ],
         )
-        cols = ["Status Msg ID", "Status", "PNI", "Err Code", "Err Details",
-                "Last Seen", "Count"]
+        cols = ["Status Msg ID", "Status", "PNI", "Err Code", "Err Details", "Last Seen", "Count"]
         table_rows = []
         row_classes = []
         for r in rows:
-            status_badge = _status_badge(
-                r.status_value) if r.status_value else ""
+            status_badge = _status_badge(r.status_value) if r.status_value else ""
             err_html = f'<span class="text-danger small">{_esc(r.err_code or "")}</span>'
             row_class = "stuck" if r.err_code else ""
             table_rows.append(
@@ -1525,24 +1487,18 @@ async def ops_optouts(request: Request) -> str:
 
         now = datetime.now(timezone.utc)
         if period == "today":
-            params["from_dt"] = now.replace(hour=0, minute=0, second=0,
-                                            microsecond=0)
+            params["from_dt"] = now.replace(hour=0, minute=0, second=0, microsecond=0)
             params["to_dt"] = now
-            filters.append(
-                "c.wa_opted_out_at >= :from_dt AND c.wa_opted_out_at < :to_dt")
+            filters.append("c.wa_opted_out_at >= :from_dt AND c.wa_opted_out_at < :to_dt")
         elif period == "7d":
             params["from_dt"] = now - timedelta(days=7)
             params["to_dt"] = now
-            filters.append(
-                "c.wa_opted_out_at >= :from_dt AND c.wa_opted_out_at < :to_dt")
+            filters.append("c.wa_opted_out_at >= :from_dt AND c.wa_opted_out_at < :to_dt")
         elif from_dt_raw and to_dt_raw:
             try:
-                params["from_dt"] = datetime.fromisoformat(
-                    from_dt_raw).replace(tzinfo=timezone.utc)
-                params["to_dt"] = datetime.fromisoformat(to_dt_raw).replace(
-                    tzinfo=timezone.utc)
-                filters.append(
-                    "c.wa_opted_out_at >= :from_dt AND c.wa_opted_out_at < :to_dt")
+                params["from_dt"] = datetime.fromisoformat(from_dt_raw).replace(tzinfo=timezone.utc)
+                params["to_dt"] = datetime.fromisoformat(to_dt_raw).replace(tzinfo=timezone.utc)
+                filters.append("c.wa_opted_out_at >= :from_dt AND c.wa_opted_out_at < :to_dt")
             except ValueError:
                 pass
 
@@ -2042,10 +1998,8 @@ async def ops_monitoring() -> str:
     # 2) Webhook Ingress
     altegio_last = altegio_ing.last_altegio
     wa_last = wa_ing.last_wa
-    altegio_warn = altegio_last is None or (now - altegio_last.replace(
-        tzinfo=timezone.utc)).total_seconds() > 15 * 60
-    wa_warn = wa_last is None or (now - wa_last.replace(
-        tzinfo=timezone.utc)).total_seconds() > 15 * 60
+    altegio_warn = altegio_last is None or (now - altegio_last.replace(tzinfo=timezone.utc)).total_seconds() > 15 * 60
+    wa_warn = wa_last is None or (now - wa_last.replace(tzinfo=timezone.utc)).total_seconds() > 15 * 60
 
     from altegio_bot.settings import settings as _settings
 
@@ -2054,8 +2008,7 @@ async def ops_monitoring() -> str:
 
     cw_row_html = ""
     if cw_enabled:
-        cw_warn = cw_last is None or (now - cw_last.replace(
-            tzinfo=timezone.utc)).total_seconds() > 15 * 60
+        cw_warn = cw_last is None or (now - cw_last.replace(tzinfo=timezone.utc)).total_seconds() > 15 * 60
         cw_row_html = (
             f'<tr class="{"warn" if cw_warn else ""}">'
             f"<td>Chatwoot</td>"
@@ -2099,8 +2052,7 @@ async def ops_monitoring() -> str:
 
     # 3) Queue Health
     total_stuck = qt.stuck_cnt or 0
-    queue_border = "border-danger" if total_stuck > 0 or (
-                qt.failed_24h or 0) > 0 else "border-success"
+    queue_border = "border-danger" if total_stuck > 0 or (qt.failed_24h or 0) > 0 else "border-success"
     queue_rows_html = ""
     for qr in queue_rows:
         cname = COMPANIES.get(qr.company_id, str(qr.company_id))
@@ -2179,8 +2131,8 @@ async def ops_monitoring() -> str:
       </tr></thead>
       <tbody>
         {
-    scheduled_html
-    or ('<tr><td colspan="3" class="text-muted">No reminders scheduled in the next 15 minutes</td></tr>')
+        scheduled_html
+        or ('<tr><td colspan="3" class="text-muted">No reminders scheduled in the next 15 minutes</td></tr>')
     }
       </tbody>
     </table>
@@ -2226,12 +2178,9 @@ async def ops_monitoring() -> str:
 """
 
     # 3e) Missing reminders
-    missing_24h_by_company: dict[int, int] = {r.company_id: r.missing_cnt for r
-                                              in missing_24h_rows}
-    missing_2h_by_company: dict[int, int] = {r.company_id: r.missing_cnt for r
-                                             in missing_2h_rows}
-    all_company_ids = sorted(
-        set(missing_24h_by_company) | set(missing_2h_by_company))
+    missing_24h_by_company: dict[int, int] = {r.company_id: r.missing_cnt for r in missing_24h_rows}
+    missing_2h_by_company: dict[int, int] = {r.company_id: r.missing_cnt for r in missing_2h_rows}
+    all_company_ids = sorted(set(missing_24h_by_company) | set(missing_2h_by_company))
     missing_rem_html = ""
     for cid in all_company_ids:
         cname = COMPANIES.get(cid, str(cid))
@@ -2242,8 +2191,7 @@ async def ops_monitoring() -> str:
         missing_rem_html += f'<tr><td>{_esc(cname)}</td><td class="{cls24}">{m24}</td><td class="{cls2}">{m2}</td></tr>'
     total_missing_24h = sum(missing_24h_by_company.values())
     total_missing_2h = sum(missing_2h_by_company.values())
-    missing_border = "border-danger" if (
-                total_missing_24h > 0 or total_missing_2h > 0) else "border-success"
+    missing_border = "border-danger" if (total_missing_24h > 0 or total_missing_2h > 0) else "border-success"
     missing_reminders_section = f"""
 <div class="card mb-3 {missing_border}">
   <div class="card-header">⚠️ Missing Reminders</div>
@@ -2293,8 +2241,8 @@ async def ops_monitoring() -> str:
     {impact_note}
     <ul class="list-group list-group-flush">
       {
-    optout_impact_html or
-    '<li class="list-group-item text-success">No marketing jobs queued for opted-out clients ✓</li>'
+        optout_impact_html
+        or '<li class="list-group-item text-success">No marketing jobs queued for opted-out clients ✓</li>'
     }
     </ul>
     <p class="small text-muted mt-1 mb-0">
@@ -2435,9 +2383,9 @@ async def ops_monitoring() -> str:
     <p><a href="/ops/optouts">→ View all opt-outs</a></p>
     <h6>Last 20 STOP/START Events</h6>
     {
-    _table(["ID", "Received At", "From", "Cmd", "Status"], last_cmds_rows)
-    if last_cmds_rows
-    else '<p class="text-muted">No commands yet.</p>'
+        _table(["ID", "Received At", "From", "Cmd", "Status"], last_cmds_rows)
+        if last_cmds_rows
+        else '<p class="text-muted">No commands yet.</p>'
     }
   </div>
 </div>
@@ -2488,20 +2436,15 @@ async def ops_monitoring() -> str:
             f"⚠️ {ob_failed} failed outbox messages in last 24h (threshold: {settings.ops_failed_warning_threshold})"
         )
     if overdue_cnt > 0:
-        warnings.append(
-            f"⚠️ {overdue_cnt} overdue queued job(s) past their run_at")
+        warnings.append(f"⚠️ {overdue_cnt} overdue queued job(s) past their run_at")
     if locked_cnt > 0:
-        warnings.append(
-            f"⚠️ {locked_cnt} job(s) locked but still in queued status")
+        warnings.append(f"⚠️ {locked_cnt} job(s) locked but still in queued status")
     if total_missing_24h > 0:
-        warnings.append(
-            f"⚠️ {total_missing_24h} record(s) missing reminder_24h job")
+        warnings.append(f"⚠️ {total_missing_24h} record(s) missing reminder_24h job")
     if total_missing_2h > 0:
-        warnings.append(
-            f"⚠️ {total_missing_2h} record(s) missing reminder_2h job")
+        warnings.append(f"⚠️ {total_missing_2h} record(s) missing reminder_2h job")
     if total_impact > 0:
-        warnings.append(
-            f"⚠️ {total_impact} queued marketing job(s) for opted-out clients")
+        warnings.append(f"⚠️ {total_impact} queued marketing job(s) for opted-out clients")
 
     warnings_html = ""
     if warnings:
@@ -2602,9 +2545,9 @@ async def ops_login_get(request: Request) -> Response:
 
 @login_router.post("/login", response_class=HTMLResponse)
 async def ops_login_post(
-        request: Request,
-        username: str = Form(...),
-        password: str = Form(...),
+    request: Request,
+    username: str = Form(...),
+    password: str = Form(...),
 ) -> Response:
     import posixpath
 
@@ -2625,8 +2568,7 @@ async def ops_login_post(
     )
 
     if not valid:
-        return HTMLResponse(_login_page(error="Invalid username or password"),
-                            status_code=401)
+        return HTMLResponse(_login_page(error="Invalid username or password"), status_code=401)
 
     token = make_session_token(ops_user, signing_key)
     response: Response = RedirectResponse(next_url, status_code=303)
