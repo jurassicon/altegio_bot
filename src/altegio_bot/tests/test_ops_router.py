@@ -386,6 +386,7 @@ def test_period_params_last_month() -> None:
 def test_period_params_legacy_24h() -> None:
     req = _make_request("24h")
     from_dt, to_dt = _period_params(req)
+    now = datetime.now(timezone.utc)
     assert abs((to_dt - from_dt).total_seconds() - 86400) < 2
 
 
