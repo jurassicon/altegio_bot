@@ -13,8 +13,8 @@ from altegio_bot.models.models import RecordService
 logger = logging.getLogger(__name__)
 
 LASH_CATEGORY_IDS_BY_COMPANY: dict[int, set[int]] = {
-    1271200: {10707687, 12414859, 13329127},
-    758285: {10707687, 12414859, 13329127},
+    1271200: {10707687, 12414859, 13329127, 13351976},
+    758285: {10707687, 12414859, 13329127, 13351956},
 }
 
 _SERVICE_CATEGORY_CACHE: dict[tuple[int, int], int] = {}
