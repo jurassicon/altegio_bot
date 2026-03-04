@@ -834,6 +834,7 @@ async def run_once(
 
 def _build_provider() -> WhatsAppProvider:
     name = os.getenv("WHATSAPP_PROVIDER", "dummy").strip().lower()
+    logger.info(f"[DEBUG] raw={repr(name)} stripped={repr(name)}")
     if name == "meta_cloud":
         from altegio_bot.providers.meta_cloud import MetaCloudProvider
 
