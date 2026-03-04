@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 
+from altegio_bot.providers.chatwoot_hybrid import ChatwootHybridProvider
 from altegio_bot.providers.dummy import DummyProvider
 from altegio_bot.providers.meta_cloud import MetaCloudProvider
 from altegio_bot.workers.outbox_worker import run_loop
@@ -12,6 +13,8 @@ def _provider_from_env():
     key = os.getenv("WHATSAPP_PROVIDER", "dummy").strip().lower()
     if key == "meta_cloud":
         return MetaCloudProvider()
+    if key == "chatwoot_hybrid":
+        return ChatwootHybridProvider()
     return DummyProvider()
 
 
