@@ -665,8 +665,6 @@ async def _run_mode_send_real(
             card_id = str(card_resp.get("id") or card_resp.get("loyalty_card_id") or "")
             loyalty_card_text = f"{_LOYALTY_CARD_PREFIX}{issued_num}"
 
-            display = candidate.display_name or "KitiLash Kunde"
-
             try:
                 async with SessionLocal() as session:
                     async with session.begin():
