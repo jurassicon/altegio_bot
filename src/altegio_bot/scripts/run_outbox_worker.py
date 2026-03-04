@@ -1,25 +1,20 @@
 from __future__ import annotations
 
 import asyncio
-import os
+import logging
 
-from altegio_bot.providers.chatwoot_hybrid import ChatwootHybridProvider
-from altegio_bot.providers.dummy import DummyProvider
-from altegio_bot.providers.meta_cloud import MetaCloudProvider
+from altegio_bot.providers.factory import get_provider
 from altegio_bot.workers.outbox_worker import run_loop
 
 
-def _provider_from_env():
-    key = os.getenv("WHATSAPP_PROVIDER", "dummy").strip().lower()
-    if key == "meta_cloud":
-        return MetaCloudProvider()
-    if key == "chatwoot_hybrid":
-        return ChatwootHybridProvider()
-    return DummyProvider()
-
-
 async def main() -> None:
-    provider = _provider_from_env()
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+    provider = get_provider()
+
     try:
         await run_loop(provider=provider)
     finally:
