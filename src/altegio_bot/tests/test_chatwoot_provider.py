@@ -1,4 +1,5 @@
 """Unit tests for ChatwootHybridProvider."""
+
 from __future__ import annotations
 
 import asyncio
@@ -20,9 +21,9 @@ class _FakeMetaProvider:
 
     async def send(self, sender_id: int, phone_e164: str, text: str) -> str:
         if self._raise:
-            raise RuntimeError('Meta API failure')
+            raise RuntimeError("Meta API failure")
         self.sent.append((sender_id, phone_e164, text))
-        return f'meta-{uuid4()}'
+        return f"meta-{uuid4()}"
 
     async def send_template(
         self,
@@ -33,7 +34,7 @@ class _FakeMetaProvider:
         params: list[str],
     ) -> str:
         self.templates.append((sender_id, phone_e164, template_name, language, params))
-        return f'meta-tpl-{uuid4()}'
+        return f"meta-tpl-{uuid4()}"
 
 
 class _FakeChatwootClient:
@@ -51,9 +52,11 @@ class _FakeChatwootClient:
     async def get_or_create_conversation(self, contact_id: int) -> int:
         return self._conv_id
 
-    async def send_message(self, conv_id: int, content: str, *, message_type: str = 'outgoing', private: bool = False) -> int:
+    async def send_message(
+        self, conv_id: int, content: str, *, message_type: str = "outgoing", private: bool = False
+    ) -> int:
         if self._raise:
-            raise RuntimeError('Chatwoot API failure')
+            raise RuntimeError("Chatwoot API failure")
         self.logged.append((conv_id, content))
         return 999
 
@@ -68,8 +71,8 @@ async def test_send_delegates_to_primary() -> None:
     cw = _FakeChatwootClient()
     provider = ChatwootHybridProvider(primary=meta, chatwoot=cw)  # type: ignore[arg-type]
 
-    msg_id = await provider.send(1, '+49123', 'Hello')
-    assert msg_id.startswith('meta-')
+    msg_id = await provider.send(1, "+49123", "Hello")
+    assert msg_id.startswith("meta-")
     assert len(meta.sent) == 1
     # Allow the fire-and-forget task to run
     await asyncio.sleep(0.05)
@@ -82,8 +85,8 @@ async def test_send_fails_if_primary_fails() -> None:
     cw = _FakeChatwootClient()
     provider = ChatwootHybridProvider(primary=meta, chatwoot=cw)  # type: ignore[arg-type]
 
-    with pytest.raises(RuntimeError, match='Meta API failure'):
-        await provider.send(1, '+49123', 'Hello')
+    with pytest.raises(RuntimeError, match="Meta API failure"):
+        await provider.send(1, "+49123", "Hello")
 
 
 @pytest.mark.asyncio
@@ -93,8 +96,8 @@ async def test_send_continues_if_chatwoot_fails() -> None:
     cw = _FakeChatwootClient(raise_on_log=True)
     provider = ChatwootHybridProvider(primary=meta, chatwoot=cw)  # type: ignore[arg-type]
 
-    msg_id = await provider.send(1, '+49123', 'Hello')
-    assert msg_id.startswith('meta-')
+    msg_id = await provider.send(1, "+49123", "Hello")
+    assert msg_id.startswith("meta-")
     # Give the fire-and-forget task a moment to complete (and swallow the error)
     await asyncio.sleep(0.05)
 
@@ -106,8 +109,8 @@ async def test_send_template_delegates_to_primary() -> None:
     cw = _FakeChatwootClient()
     provider = ChatwootHybridProvider(primary=meta, chatwoot=cw)  # type: ignore[arg-type]
 
-    msg_id = await provider.send_template(1, '+49123', 'my_tpl', 'de', ['p1', 'p2'])
-    assert msg_id.startswith('meta-tpl-')
+    msg_id = await provider.send_template(1, "+49123", "my_tpl", "de", ["p1", "p2"])
+    assert msg_id.startswith("meta-tpl-")
     assert len(meta.templates) == 1
     await asyncio.sleep(0.05)
 

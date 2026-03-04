@@ -25,6 +25,7 @@ dev = [
   'pytest-asyncio>=0.24',
   'pytest>=8.3',
   'respx>=0.21',
+  "ruff>=0.15.4",
 ]
 
 [tool.setuptools]
@@ -40,4 +41,28 @@ addopts = '-q'
 testpaths = ['src/altegio_bot/tests']
 
 [tool.ruff]
-line-length = 79
+
+line-length = 120
+
+exclude = [
+    ".git",
+    ".venv",
+    "venv",
+    "alembic",
+    "__pycache__",
+    "altegio_bot.egg-info"
+]
+
+[tool.ruff.lint.per-file-ignores]
+# В файлах __init__.py разрешаем импортировать модули.
+"__init__.py" = ["F401"]
+
+[tool.ruff.lint]
+# Включаем базовые правила:
+# E - ошибки стиля (pycodestyle)
+# F - логические ошибки (Pyflakes), например, неиспользуемые переменные
+# I - сортировка импортов (isort)
+select = ["E", "F", "I"]
+
+# Если какое-то правило бесит, его можно отключить тут:
+ignore = []

@@ -48,11 +48,11 @@ class SmokeConfig:
 
 class SmokeProvider:
     def __init__(
-            self,
-            *,
-            delay_ms: int = 0,
-            fail_first_send: bool = False,
-            fail_always_send: bool = False,
+        self,
+        *,
+        delay_ms: int = 0,
+        fail_first_send: bool = False,
+        fail_always_send: bool = False,
     ) -> None:
         self._delay_sec = delay_ms / 1000
         self._fail_first_send = fail_first_send
@@ -122,9 +122,9 @@ async def _fix_sequences(session: AsyncSession) -> None:
 
 
 async def _seed_rate_limit(
-        session: AsyncSession,
-        phone_e164: str,
-        minutes: int,
+    session: AsyncSession,
+    phone_e164: str,
+    minutes: int,
 ) -> None:
     next_allowed_at = utcnow() + timedelta(minutes=minutes)
     stmt = text(
@@ -168,25 +168,18 @@ async def _print_rate_limit(session: AsyncSession, phone_e164: str) -> None:
         print("rate_limit: <none>")
         return
 
-    print(
-        "rate_limit: "
-        f"phone={row['phone_e164']} "
-        f"next_allowed_at={row['next_allowed_at']} "
-        f"db_now={row['db_now']}"
-    )
+    print(f"rate_limit: phone={row['phone_e164']} next_allowed_at={row['next_allowed_at']} db_now={row['db_now']}")
 
 
 async def _count_outbox_for_job(session: AsyncSession, job_id: int) -> int:
-    stmt = select(func.count()).select_from(ow.OutboxMessage).where(
-        ow.OutboxMessage.job_id == job_id
-    )
+    stmt = select(func.count()).select_from(ow.OutboxMessage).where(ow.OutboxMessage.job_id == job_id)
     res = await session.execute(stmt)
     return int(res.scalar_one())
 
 
 async def _get_or_create_sender(
-        session: AsyncSession,
-        cfg: SmokeConfig,
+    session: AsyncSession,
+    cfg: SmokeConfig,
 ) -> WhatsAppSender:
     stmt = select(WhatsAppSender).where(
         WhatsAppSender.company_id == cfg.company_id,
@@ -210,8 +203,8 @@ async def _get_or_create_sender(
 
 
 async def _ensure_service_sender_rule(
-        session: AsyncSession,
-        cfg: SmokeConfig,
+    session: AsyncSession,
+    cfg: SmokeConfig,
 ) -> None:
     stmt = select(ServiceSenderRule).where(
         ServiceSenderRule.company_id == cfg.company_id,
@@ -232,8 +225,8 @@ async def _ensure_service_sender_rule(
 
 
 async def _ensure_template(
-        session: AsyncSession,
-        cfg: SmokeConfig,
+    session: AsyncSession,
+    cfg: SmokeConfig,
 ) -> None:
     stmt = select(MessageTemplate).where(
         MessageTemplate.company_id == cfg.company_id,
@@ -243,12 +236,7 @@ async def _ensure_template(
     res = await session.execute(stmt)
     tmpl = res.scalar_one_or_none()
 
-    body = (
-        "*{client_name}, hallo!*\\n\\n"
-        "Это smoke-шаблон.\\n"
-        "Mitarbeiterin: {staff_name}\\n"
-        "Link: {short_link}\\n"
-    )
+    body = "*{client_name}, hallo!*\\n\\nЭто smoke-шаблон.\\nMitarbeiterin: {staff_name}\\nLink: {short_link}\\n"
 
     if tmpl:
         tmpl.body = body
@@ -267,11 +255,11 @@ async def _ensure_template(
 
 
 async def _create_fixtures(
-        session: AsyncSession,
-        cfg: SmokeConfig,
-        *,
-        fix_sequences: bool,
-        seed_rate_limit_minutes: int | None,
+    session: AsyncSession,
+    cfg: SmokeConfig,
+    *,
+    fix_sequences: bool,
+    seed_rate_limit_minutes: int | None,
 ) -> int:
     if fix_sequences:
         await _fix_sequences(session)
@@ -292,8 +280,7 @@ async def _create_fixtures(
     await session.flush()
 
     if seed_rate_limit_minutes is not None:
-        await _seed_rate_limit(session, cfg.phone_e164,
-                               seed_rate_limit_minutes)
+        await _seed_rate_limit(session, cfg.phone_e164, seed_rate_limit_minutes)
 
     starts_at = utcnow() + timedelta(hours=2)
     record = Record(
@@ -373,17 +360,11 @@ async def _clone_job(session: AsyncSession, job_id: int) -> int:
 
 async def _print_job_state(session: AsyncSession, job_id: int) -> None:
     job = await ow._load_job(session, job_id)  # noqa: SLF001
-    print(
-        f"job_id={job.id} status={job.status} attempts={job.attempts} "
-        f"run_at={job.run_at.isoformat()}"
-    )
+    print(f"job_id={job.id} status={job.status} attempts={job.attempts} run_at={job.run_at.isoformat()}")
     print(f"job_error={job.last_error!r}")
 
     stmt = (
-        select(ow.OutboxMessage)
-        .where(ow.OutboxMessage.job_id == job.id)
-        .order_by(ow.OutboxMessage.id.desc())
-        .limit(1)
+        select(ow.OutboxMessage).where(ow.OutboxMessage.job_id == job.id).order_by(ow.OutboxMessage.id.desc()).limit(1)
     )
     res = await session.execute(stmt)
     out = res.scalar_one_or_none()
@@ -391,10 +372,7 @@ async def _print_job_state(session: AsyncSession, job_id: int) -> None:
         print("outbox: <none>")
         return
 
-    print(
-        "outbox: "
-        f"id={out.id} status={out.status} msg_id={out.provider_message_id}"
-    )
+    print(f"outbox: id={out.id} status={out.status} msg_id={out.provider_message_id}")
     print(f"outbox_error={out.error!r}")
 
 
@@ -446,10 +424,10 @@ async def _rerun_same_job(
 
 
 async def _race_job_lock(
-        session_maker: async_sessionmaker[AsyncSession],
-        *,
-        job_id: int,
-        provider: Any,
+    session_maker: async_sessionmaker[AsyncSession],
+    *,
+    job_id: int,
+    provider: Any,
 ) -> None:
     async def _run_one(tag: str) -> None:
         async with session_maker() as session:
@@ -511,12 +489,12 @@ async def _race_rate_limit(
 
 
 async def _run_worker_once(
-        session_maker: async_sessionmaker[AsyncSession],
-        *,
-        provider: Any,
-        limit: int,
-        job_id: int | None,
-        company_id: int | None,
+    session_maker: async_sessionmaker[AsyncSession],
+    *,
+    provider: Any,
+    limit: int,
+    job_id: int | None,
+    company_id: int | None,
 ) -> int:
     async with session_maker() as session:
         if job_id is not None:
@@ -538,8 +516,7 @@ async def _run_worker_once(
         ids = list(res.scalars().all())
 
         for _id in ids:
-            await ow.process_job_in_session(session, int(_id),
-                                            provider=provider)
+            await ow.process_job_in_session(session, int(_id), provider=provider)
 
         await session.commit()
         return len(ids)

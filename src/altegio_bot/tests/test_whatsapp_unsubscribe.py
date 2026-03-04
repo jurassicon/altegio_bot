@@ -23,7 +23,7 @@ class CaptureProvider(WhatsAppProvider):
 
     async def send(self, sender_id: int, phone_e164: str, text: str) -> str:
         self.sent.append((sender_id, phone_e164, text))
-        return 'msg-1'
+        return "msg-1"
 
 
 def _utcnow() -> datetime:
@@ -32,22 +32,22 @@ def _utcnow() -> datetime:
 
 def _payload(phone_number_id: str, from_phone: str, text: str) -> dict[str, Any]:
     return {
-        'object': 'whatsapp_business_account',
-        'entry': [
+        "object": "whatsapp_business_account",
+        "entry": [
             {
-                'id': 'WABA',
-                'changes': [
+                "id": "WABA",
+                "changes": [
                     {
-                        'field': 'messages',
-                        'value': {
-                            'metadata': {'phone_number_id': phone_number_id},
-                            'messages': [
+                        "field": "messages",
+                        "value": {
+                            "metadata": {"phone_number_id": phone_number_id},
+                            "messages": [
                                 {
-                                    'from': from_phone,
-                                    'id': 'wamid.TEST',
-                                    'timestamp': '1700000000',
-                                    'type': 'text',
-                                    'text': {'body': text},
+                                    "from": from_phone,
+                                    "id": "wamid.TEST",
+                                    "timestamp": "1700000000",
+                                    "type": "text",
+                                    "text": {"body": text},
                                 }
                             ],
                         },
@@ -62,7 +62,7 @@ def _payload(phone_number_id: str, from_phone: str, text: str) -> dict[str, Any]
 async def test_stop_sets_opt_out_global_and_cancels_jobs(session_maker) -> None:
     provider = CaptureProvider()
     now = _utcnow()
-    phone = '+10000000010'
+    phone = "+10000000010"
 
     async with session_maker() as session:
         async with session.begin():
@@ -74,7 +74,7 @@ async def test_stop_sets_opt_out_global_and_cancels_jobs(session_maker) -> None:
                 id=20,
                 company_id=2,
                 altegio_client_id=20,
-                display_name='Client 20',
+                display_name="Client 20",
                 phone_e164=phone,
                 raw={},
             )
@@ -101,9 +101,9 @@ async def test_stop_sets_opt_out_global_and_cancels_jobs(session_maker) -> None:
                 WhatsAppSender(
                     id=1,
                     company_id=1,
-                    sender_code='default',
-                    phone_number_id='PNID',
-                    display_phone='+49',
+                    sender_code="default",
+                    phone_number_id="PNID",
+                    display_phone="+49",
                     is_active=True,
                 )
             )
@@ -114,32 +114,32 @@ async def test_stop_sets_opt_out_global_and_cancels_jobs(session_maker) -> None:
                         company_id=1,
                         record_id=r1.id,
                         client_id=10,
-                        job_type='review_3d',
+                        job_type="review_3d",
                         run_at=now,
-                        status='queued',
-                        dedupe_key='t1',
+                        status="queued",
+                        dedupe_key="t1",
                         payload={},
                     ),
                     MessageJob(
                         company_id=2,
                         record_id=r2.id,
                         client_id=20,
-                        job_type='repeat_10d',
+                        job_type="repeat_10d",
                         run_at=now,
-                        status='queued',
-                        dedupe_key='t2',
+                        status="queued",
+                        dedupe_key="t2",
                         payload={},
                     ),
                 ]
             )
 
             evt = WhatsAppEvent(
-                dedupe_key='wa:test-1',
-                status='received',
+                dedupe_key="wa:test-1",
+                status="received",
                 error=None,
                 query={},
                 headers={},
-                payload=_payload('PNID', '10000000010', 'STOP'),
+                payload=_payload("PNID", "10000000010", "STOP"),
             )
             session.add(evt)
             await session.flush()
@@ -155,23 +155,21 @@ async def test_stop_sets_opt_out_global_and_cancels_jobs(session_maker) -> None:
         assert c20_after is not None
         assert c20_after.wa_opted_out is True
 
-        res = await session.execute(
-            select(MessageJob).order_by(MessageJob.id.asc())
-        )
+        res = await session.execute(select(MessageJob).order_by(MessageJob.id.asc()))
         jobs = list(res.scalars().all())
-        assert [j.status for j in jobs] == ['canceled', 'canceled']
+        assert [j.status for j in jobs] == ["canceled", "canceled"]
 
         assert provider.sent
         sender_id, sent_phone, text = provider.sent[0]
         assert sender_id == 1
         assert sent_phone == phone
-        assert 'abgemeldet' in text.lower()
+        assert "abgemeldet" in text.lower()
 
 
 @pytest.mark.asyncio
 async def test_start_clears_opt_out(session_maker) -> None:
     provider = CaptureProvider()
-    phone = '+10000000010'
+    phone = "+10000000010"
 
     async with session_maker() as session:
         async with session.begin():
@@ -179,26 +177,26 @@ async def test_start_clears_opt_out(session_maker) -> None:
             assert c is not None
             c.phone_e164 = phone
             c.wa_opted_out = True
-            c.wa_opt_out_reason = 'wa:stop'
+            c.wa_opt_out_reason = "wa:stop"
 
             session.add(
                 WhatsAppSender(
                     id=1,
                     company_id=1,
-                    sender_code='default',
-                    phone_number_id='PNID',
-                    display_phone='+49',
+                    sender_code="default",
+                    phone_number_id="PNID",
+                    display_phone="+49",
                     is_active=True,
                 )
             )
 
             evt = WhatsAppEvent(
-                dedupe_key='wa:test-2',
-                status='received',
+                dedupe_key="wa:test-2",
+                status="received",
                 error=None,
                 query={},
                 headers={},
-                payload=_payload('PNID', '10000000010', 'START'),
+                payload=_payload("PNID", "10000000010", "START"),
             )
             session.add(evt)
             await session.flush()

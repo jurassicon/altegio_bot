@@ -1,9 +1,10 @@
 """Unit tests for ChatwootClient."""
+
 from __future__ import annotations
 
+import httpx
 import pytest
 import respx
-import httpx
 
 from altegio_bot.chatwoot_client import ChatwootClient
 
@@ -11,8 +12,8 @@ from altegio_bot.chatwoot_client import ChatwootClient
 @pytest.fixture
 def client() -> ChatwootClient:
     return ChatwootClient(
-        base_url='https://chatwoot.example.com',
-        api_token='test-token',
+        base_url="https://chatwoot.example.com",
+        api_token="test-token",
         account_id=1,
         inbox_id=2,
     )
@@ -22,18 +23,18 @@ def client() -> ChatwootClient:
 @pytest.mark.asyncio
 async def test_get_or_create_contact_found(client: ChatwootClient) -> None:
     """Should return existing contact id when found by phone."""
-    respx.get('https://chatwoot.example.com/api/v1/accounts/1/contacts/search').mock(
+    respx.get("https://chatwoot.example.com/api/v1/accounts/1/contacts/search").mock(
         return_value=httpx.Response(
             200,
             json={
-                'payload': [
-                    {'id': 42, 'phone_number': '+49123456789', 'name': 'Test'},
+                "payload": [
+                    {"id": 42, "phone_number": "+49123456789", "name": "Test"},
                 ]
             },
         )
     )
 
-    cid = await client.get_or_create_contact('+49123456789')
+    cid = await client.get_or_create_contact("+49123456789")
     assert cid == 42
 
 
@@ -41,14 +42,14 @@ async def test_get_or_create_contact_found(client: ChatwootClient) -> None:
 @pytest.mark.asyncio
 async def test_get_or_create_contact_creates_when_not_found(client: ChatwootClient) -> None:
     """Should create a new contact when not found."""
-    respx.get('https://chatwoot.example.com/api/v1/accounts/1/contacts/search').mock(
-        return_value=httpx.Response(200, json={'payload': []})
+    respx.get("https://chatwoot.example.com/api/v1/accounts/1/contacts/search").mock(
+        return_value=httpx.Response(200, json={"payload": []})
     )
-    respx.post('https://chatwoot.example.com/api/v1/accounts/1/contacts').mock(
-        return_value=httpx.Response(200, json={'id': 99, 'phone_number': '+49987654321'})
+    respx.post("https://chatwoot.example.com/api/v1/accounts/1/contacts").mock(
+        return_value=httpx.Response(200, json={"id": 99, "phone_number": "+49987654321"})
     )
 
-    cid = await client.get_or_create_contact('+49987654321', name='Alice')
+    cid = await client.get_or_create_contact("+49987654321", name="Alice")
     assert cid == 99
 
 
@@ -56,15 +57,13 @@ async def test_get_or_create_contact_creates_when_not_found(client: ChatwootClie
 @pytest.mark.asyncio
 async def test_get_or_create_conversation_returns_open(client: ChatwootClient) -> None:
     """Should reuse an existing open conversation on the correct inbox."""
-    respx.get(
-        'https://chatwoot.example.com/api/v1/accounts/1/contacts/42/conversations'
-    ).mock(
+    respx.get("https://chatwoot.example.com/api/v1/accounts/1/contacts/42/conversations").mock(
         return_value=httpx.Response(
             200,
             json={
-                'payload': [
-                    {'id': 7, 'inbox_id': 2, 'status': 'open'},
-                    {'id': 6, 'inbox_id': 2, 'status': 'resolved'},
+                "payload": [
+                    {"id": 7, "inbox_id": 2, "status": "open"},
+                    {"id": 6, "inbox_id": 2, "status": "resolved"},
                 ]
             },
         )
@@ -78,13 +77,11 @@ async def test_get_or_create_conversation_returns_open(client: ChatwootClient) -
 @pytest.mark.asyncio
 async def test_get_or_create_conversation_creates_when_none(client: ChatwootClient) -> None:
     """Should create a conversation when no open one exists."""
-    respx.get(
-        'https://chatwoot.example.com/api/v1/accounts/1/contacts/42/conversations'
-    ).mock(
-        return_value=httpx.Response(200, json={'payload': []})
+    respx.get("https://chatwoot.example.com/api/v1/accounts/1/contacts/42/conversations").mock(
+        return_value=httpx.Response(200, json={"payload": []})
     )
-    respx.post('https://chatwoot.example.com/api/v1/accounts/1/conversations').mock(
-        return_value=httpx.Response(200, json={'id': 15, 'status': 'open'})
+    respx.post("https://chatwoot.example.com/api/v1/accounts/1/conversations").mock(
+        return_value=httpx.Response(200, json={"id": 15, "status": "open"})
     )
 
     conv_id = await client.get_or_create_conversation(42)
@@ -95,13 +92,11 @@ async def test_get_or_create_conversation_creates_when_none(client: ChatwootClie
 @pytest.mark.asyncio
 async def test_send_message(client: ChatwootClient) -> None:
     """Should post a message and return the message id."""
-    respx.post(
-        'https://chatwoot.example.com/api/v1/accounts/1/conversations/15/messages'
-    ).mock(
-        return_value=httpx.Response(200, json={'id': 101, 'content': 'Hello'})
+    respx.post("https://chatwoot.example.com/api/v1/accounts/1/conversations/15/messages").mock(
+        return_value=httpx.Response(200, json={"id": 101, "content": "Hello"})
     )
 
-    msg_id = await client.send_message(15, 'Hello', message_type='outgoing')
+    msg_id = await client.send_message(15, "Hello", message_type="outgoing")
     assert msg_id == 101
 
 
@@ -109,20 +104,16 @@ async def test_send_message(client: ChatwootClient) -> None:
 @pytest.mark.asyncio
 async def test_log_incoming_message(client: ChatwootClient) -> None:
     """log_incoming_message should create contact, conversation, and message."""
-    respx.get('https://chatwoot.example.com/api/v1/accounts/1/contacts/search').mock(
-        return_value=httpx.Response(200, json={'payload': [{'id': 5, 'phone_number': '+49111222333'}]})
+    respx.get("https://chatwoot.example.com/api/v1/accounts/1/contacts/search").mock(
+        return_value=httpx.Response(200, json={"payload": [{"id": 5, "phone_number": "+49111222333"}]})
     )
-    respx.get(
-        'https://chatwoot.example.com/api/v1/accounts/1/contacts/5/conversations'
-    ).mock(
-        return_value=httpx.Response(200, json={'payload': [{'id': 20, 'inbox_id': 2, 'status': 'open'}]})
+    respx.get("https://chatwoot.example.com/api/v1/accounts/1/contacts/5/conversations").mock(
+        return_value=httpx.Response(200, json={"payload": [{"id": 20, "inbox_id": 2, "status": "open"}]})
     )
-    respx.post(
-        'https://chatwoot.example.com/api/v1/accounts/1/conversations/20/messages'
-    ).mock(
-        return_value=httpx.Response(200, json={'id': 200, 'content': 'Hi'})
+    respx.post("https://chatwoot.example.com/api/v1/accounts/1/conversations/20/messages").mock(
+        return_value=httpx.Response(200, json={"id": 200, "content": "Hi"})
     )
 
-    conv_id, msg_id = await client.log_incoming_message('+49111222333', 'Hi')
+    conv_id, msg_id = await client.log_incoming_message("+49111222333", "Hi")
     assert conv_id == 20
     assert msg_id == 200

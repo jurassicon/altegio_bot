@@ -3,6 +3,7 @@
 PRIMARY:   MetaCloudProvider  – blocking, must succeed
 SECONDARY: ChatwootClient     – async, best-effort (never fails the send)
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -12,7 +13,6 @@ from typing import Any
 from altegio_bot.chatwoot_client import ChatwootClient
 from altegio_bot.providers.base import WhatsAppProvider
 from altegio_bot.providers.meta_cloud import MetaCloudProvider
-from altegio_bot.settings import settings
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +30,7 @@ class ChatwootHybridProvider:
         self._chatwoot: ChatwootClient = chatwoot or ChatwootClient()
 
     async def aclose(self) -> None:
-        aclose_primary = getattr(self._primary, 'aclose', None)
+        aclose_primary = getattr(self._primary, "aclose", None)
         if callable(aclose_primary):
             await aclose_primary()
         await self._chatwoot.aclose()
@@ -45,11 +45,7 @@ class ChatwootHybridProvider:
         msg_id = await self._primary.send(sender_id, phone_e164, text)
 
         # SECONDARY – best-effort (Логируем в Chatwoot как ПРИВАТНУЮ ЗАМЕТКУ)
-        asyncio.ensure_future(
-            self._log_to_chatwoot(
-                phone_e164, text, meta={'msg_id': msg_id}, private=True
-            )
-        )
+        asyncio.ensure_future(self._log_to_chatwoot(phone_e164, text, meta={"msg_id": msg_id}, private=True))
 
         return msg_id
 
@@ -62,17 +58,11 @@ class ChatwootHybridProvider:
         params: list[str],
     ) -> str:
         # PRIMARY – must succeed
-        msg_id = await self._primary.send_template(
-            sender_id, phone_e164, template_name, language, params
-        )
+        msg_id = await self._primary.send_template(sender_id, phone_e164, template_name, language, params)
 
         # SECONDARY – best-effort (Логируем в Chatwoot как ПРИВАТНУЮ ЗАМЕТКУ)
-        content = f'[Шаблон отправлен: {template_name}] ' + ' | '.join(params)
-        asyncio.ensure_future(
-            self._log_to_chatwoot(
-                phone_e164, content, meta={'msg_id': msg_id}, private=True
-            )
-        )
+        content = f"[Шаблон отправлен: {template_name}] " + " | ".join(params)
+        asyncio.ensure_future(self._log_to_chatwoot(phone_e164, content, meta={"msg_id": msg_id}, private=True))
 
         return msg_id
 
@@ -86,24 +76,22 @@ class ChatwootHybridProvider:
     ) -> None:
         try:
             contact_id = await self._chatwoot.get_or_create_contact(phone_e164)
-            conversation_id = await self._chatwoot.get_or_create_conversation(
-                contact_id
-            )
+            conversation_id = await self._chatwoot.get_or_create_conversation(contact_id)
             await self._chatwoot.send_message(
                 conversation_id,
                 content,
-                message_type='outgoing',
+                message_type="outgoing",
                 private=private,  # Передаем флаг приватности
             )
             logger.debug(
-                'Chatwoot log ok phone=%s conversation_id=%s extra=%s',
+                "Chatwoot log ok phone=%s conversation_id=%s extra=%s",
                 phone_e164,
                 conversation_id,
                 meta,
             )
         except Exception as exc:
             logger.warning(
-                'Chatwoot log failed phone=%s err=%s extra=%s',
+                "Chatwoot log failed phone=%s err=%s extra=%s",
                 phone_e164,
                 exc,
                 meta,

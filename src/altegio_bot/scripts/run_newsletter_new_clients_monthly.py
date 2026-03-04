@@ -22,6 +22,7 @@ Environment variables required:
     ALTEGIO_PARTNER_TOKEN
     ALTEGIO_USER_TOKEN
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -40,8 +41,8 @@ from altegio_bot.utils import utcnow
 
 logger = logging.getLogger(__name__)
 
-NEWSLETTER_JOB_TYPE = 'newsletter_new_clients_monthly'
-_LOYALTY_CARD_PREFIX = 'Kundenkarte #'
+NEWSLETTER_JOB_TYPE = "newsletter_new_clients_monthly"
+_LOYALTY_CARD_PREFIX = "Kundenkarte #"
 
 
 def _prev_month_range(
@@ -82,9 +83,7 @@ async def _fetch_new_clients(
         .where(Record.client_id.is_not(None))
         .where(Record.starts_at >= period_start)
         .where(Record.starts_at < period_end)
-        .where(
-            (Record.attendance == 1) | (Record.visit_attendance == 1)
-        )
+        .where((Record.attendance == 1) | (Record.visit_attendance == 1))
         .distinct()
         .subquery()
     )
@@ -128,7 +127,7 @@ async def _fetch_new_clients(
 
 def _format_card_text(card_number: str) -> str:
     """Format a card number as displayed in the template."""
-    return f'{_LOYALTY_CARD_PREFIX}{card_number}'
+    return f"{_LOYALTY_CARD_PREFIX}{card_number}"
 
 
 async def run_newsletter(
@@ -145,7 +144,7 @@ async def run_newsletter(
     """
     period_start, period_end = _prev_month_range(ref_date)
     logger.info(
-        'Newsletter run company=%s location=%s period=[%s, %s) dry_run=%s',
+        "Newsletter run company=%s location=%s period=[%s, %s) dry_run=%s",
         company_id,
         location_id,
         period_start.date(),
@@ -159,13 +158,9 @@ async def run_newsletter(
         if card_type_id is None:
             card_types = await loyalty.get_card_types(location_id)
             if not card_types:
-                raise RuntimeError(
-                    f'No loyalty card types found for location_id={location_id}'
-                )
-            card_type_id = str(
-                card_types[0].get('id') or card_types[0].get('loyalty_card_type_id')
-            )
-            logger.info('Using card_type_id=%s', card_type_id)
+                raise RuntimeError(f"No loyalty card types found for location_id={location_id}")
+            card_type_id = str(card_types[0].get("id") or card_types[0].get("loyalty_card_type_id"))
+            logger.info("Using card_type_id=%s", card_type_id)
 
         sent = 0
         skipped = 0
@@ -178,25 +173,22 @@ async def run_newsletter(
                 period_start=period_start,
                 period_end=period_end,
             )
-            logger.info('Qualifying new clients: %d', len(clients))
+            logger.info("Qualifying new clients: %d", len(clients))
 
         for client in clients:
             if not client.phone_e164:
-                logger.warning(
-                    'Skip client_id=%s: no phone', client.id
-                )
+                logger.warning("Skip client_id=%s: no phone", client.id)
                 skipped += 1
                 continue
 
             # Strip '+' to get numeric phone for Altegio API.
-            phone_num = int(client.phone_e164.lstrip('+'))
-            card_number_str = client.phone_e164.lstrip('+').zfill(16)
+            phone_num = int(client.phone_e164.lstrip("+"))
+            card_number_str = client.phone_e164.lstrip("+").zfill(16)
             loyalty_card_text = _format_card_text(card_number_str)
 
             if dry_run:
                 logger.info(
-                    '[dry_run] Would issue card + queue job for '
-                    'client_id=%s phone=%s card_text=%s',
+                    "[dry_run] Would issue card + queue job for client_id=%s phone=%s card_text=%s",
                     client.id,
                     client.phone_e164,
                     loyalty_card_text,
@@ -211,18 +203,16 @@ async def run_newsletter(
                     loyalty_card_type_id=card_type_id,
                     phone=phone_num,
                 )
-                issued_number = (
-                    str(card.get('loyalty_card_number') or card_number_str)
-                )
+                issued_number = str(card.get("loyalty_card_number") or card_number_str)
                 loyalty_card_text = _format_card_text(issued_number)
                 logger.info(
-                    'Issued card client_id=%s card_number=%s',
+                    "Issued card client_id=%s card_number=%s",
                     client.id,
                     issued_number,
                 )
             except Exception as exc:
                 logger.error(
-                    'Failed to issue card for client_id=%s: %s',
+                    "Failed to issue card for client_id=%s: %s",
                     client.id,
                     exc,
                 )
@@ -240,17 +230,15 @@ async def run_newsletter(
                             job_type=NEWSLETTER_JOB_TYPE,
                             run_at=utcnow(),
                             payload={
-                                'kind': NEWSLETTER_JOB_TYPE,
-                                'loyalty_card_text': loyalty_card_text,
+                                "kind": NEWSLETTER_JOB_TYPE,
+                                "loyalty_card_text": loyalty_card_text,
                             },
                         )
                 sent += 1
-                logger.info(
-                    'Queued newsletter job client_id=%s', client.id
-                )
+                logger.info("Queued newsletter job client_id=%s", client.id)
             except Exception as exc:
                 logger.error(
-                    'Failed to queue job for client_id=%s: %s',
+                    "Failed to queue job for client_id=%s: %s",
                     client.id,
                     exc,
                 )
@@ -259,8 +247,8 @@ async def run_newsletter(
     finally:
         await loyalty.aclose()
 
-    summary = {'sent': sent, 'skipped': skipped, 'errors': errors}
-    logger.info('Newsletter run complete: %s', summary)
+    summary = {"sent": sent, "skipped": skipped, "errors": errors}
+    logger.info("Newsletter run complete: %s", summary)
     return summary
 
 
@@ -269,19 +257,17 @@ async def main() -> None:
 
     logging.basicConfig(
         level=logging.INFO,
-        format='%(asctime)s %(levelname)s %(name)s: %(message)s',
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
-    parser = argparse.ArgumentParser(
-        description='Run monthly newsletter for new clients.'
-    )
-    parser.add_argument('--company-id', type=int, required=True)
-    parser.add_argument('--location-id', type=int, required=True)
-    parser.add_argument('--card-type-id', type=str, default=None)
+    parser = argparse.ArgumentParser(description="Run monthly newsletter for new clients.")
+    parser.add_argument("--company-id", type=int, required=True)
+    parser.add_argument("--location-id", type=int, required=True)
+    parser.add_argument("--card-type-id", type=str, default=None)
     parser.add_argument(
-        '--dry-run',
-        action='store_true',
-        help='Log actions without issuing cards or queuing jobs.',
+        "--dry-run",
+        action="store_true",
+        help="Log actions without issuing cards or queuing jobs.",
     )
     args = parser.parse_args()
 
@@ -293,5 +279,5 @@ async def main() -> None:
     )
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     asyncio.run(main())

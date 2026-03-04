@@ -24,7 +24,7 @@ async def test_opted_out_client_does_not_get_followups(session_maker) -> None:
                 company_id=1,
                 altegio_record_id=111,
                 client_id=10,
-                staff_name='Staff',
+                staff_name="Staff",
                 starts_at=now + timedelta(hours=1),
             )
             session.add(record)
@@ -34,13 +34,9 @@ async def test_opted_out_client_does_not_get_followups(session_maker) -> None:
                 session,
                 company_id=record.company_id,
                 record_id=record.id,
-                event_status='create',
+                event_status="create",
             )
 
-        jobs = (
-            await session.execute(
-                select(MessageJob).order_by(MessageJob.id.asc())
-            )
-        ).scalars().all()
+        jobs = (await session.execute(select(MessageJob).order_by(MessageJob.id.asc()))).scalars().all()
 
-        assert [j.job_type for j in jobs] == ['record_created']
+        assert [j.job_type for j in jobs] == ["record_created"]

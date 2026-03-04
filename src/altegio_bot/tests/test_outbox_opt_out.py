@@ -30,7 +30,7 @@ class FakeJob:
 @dataclass
 class FakeClient:
     id: int
-    phone_e164: str | None = '+491234567890'
+    phone_e164: str | None = "+491234567890"
     wa_opted_out: bool = True
 
 
@@ -48,8 +48,8 @@ def test_outbox_skips_marketing_when_opted_out(monkeypatch: Any) -> None:
     job = FakeJob(
         id=1,
         company_id=758285,
-        job_type='review_3d',
-        status='queued',
+        job_type="review_3d",
+        status="queued",
         run_at=fixed_now,
         record_id=None,
         client_id=1,
@@ -68,17 +68,17 @@ def test_outbox_skips_marketing_when_opted_out(monkeypatch: Any) -> None:
         return FakeClient(id=1)
 
     async def fake_safe_send(*args: Any, **kwargs: Any) -> Any:
-        raise AssertionError('safe_send should not be called')
+        raise AssertionError("safe_send should not be called")
 
-    monkeypatch.setattr(ow, '_load_job', fake_load_job)
-    monkeypatch.setattr(ow, '_find_success_outbox', fake_find_success)
-    monkeypatch.setattr(ow, '_load_record', fake_load_record)
-    monkeypatch.setattr(ow, '_load_client', fake_load_client)
-    monkeypatch.setattr(ow, 'safe_send', fake_safe_send)
+    monkeypatch.setattr(ow, "_load_job", fake_load_job)
+    monkeypatch.setattr(ow, "_find_success_outbox", fake_find_success)
+    monkeypatch.setattr(ow, "_load_record", fake_load_record)
+    monkeypatch.setattr(ow, "_load_client", fake_load_client)
+    monkeypatch.setattr(ow, "safe_send", fake_safe_send)
 
     session = FakeSession()
     run(ow.process_job_in_session(session, 1, provider=object()))
 
-    assert job.status == 'canceled'
-    assert job.last_error == 'Skipped: client unsubscribed'
+    assert job.status == "canceled"
+    assert job.last_error == "Skipped: client unsubscribed"
     assert session.added == []

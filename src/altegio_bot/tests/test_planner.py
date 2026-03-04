@@ -33,8 +33,7 @@ async def main() -> None:
 
         async with session.begin():
             stmt = (
-                select(MessageJob.job_type, MessageJob.status,
-                       MessageJob.run_at)
+                select(MessageJob.job_type, MessageJob.status, MessageJob.run_at)
                 .where(MessageJob.record_id == RECORD_ID)
                 .order_by(MessageJob.run_at.asc())
             )

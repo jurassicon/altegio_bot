@@ -1,20 +1,15 @@
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
 import logging
 
-from altegio_bot.models.models import (
-    RecordService,
-    ServiceSenderRule,
-    WhatsAppSender
-)
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from altegio_bot.models.models import RecordService, ServiceSenderRule, WhatsAppSender
 
 logger = logging.getLogger(__name__)
-logger.info('Starting inbox worker')
+logger.info("Starting inbox worker")
 
 
-async def pick_sender_code_for_record(
-        session: AsyncSession, company_id: int, record_id: int
-) -> str:
+async def pick_sender_code_for_record(session: AsyncSession, company_id: int, record_id: int) -> str:
     stmp = (
         select(RecordService.service_id)
         .where(RecordService.record_id == record_id)
@@ -25,7 +20,7 @@ async def pick_sender_code_for_record(
     service_id = res.scalar_one_or_none()
 
     if service_id is None:
-        return 'default'
+        return "default"
 
     stmt = (
         select(ServiceSenderRule.sender_code)
@@ -42,12 +37,10 @@ async def pick_sender_code_for_record(
         sender_code,
     )
 
-    return sender_code or 'default'
+    return sender_code or "default"
 
 
-async def pick_sender_id_by_code(
-        session: AsyncSession, company_id: int, sender_code: str = 'default'
-) -> int | None:
+async def pick_sender_id_by_code(session: AsyncSession, company_id: int, sender_code: str = "default") -> int | None:
     stmp = (
         select(WhatsAppSender.id)
         .where(WhatsAppSender.company_id == company_id)

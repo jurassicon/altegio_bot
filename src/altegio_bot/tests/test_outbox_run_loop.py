@@ -30,10 +30,10 @@ class _SessionLocalCM:
         return _Session()
 
     async def __aexit__(
-            self,
-            exc_type: Any,
-            exc: Any,
-            tb: Any,
+        self,
+        exc_type: Any,
+        exc: Any,
+        tb: Any,
     ) -> None:
         return None
 
@@ -64,9 +64,7 @@ def test_run_loop_sleeps_when_no_jobs(monkeypatch: Any) -> None:
     monkeypatch.setattr(ow.asyncio, "sleep", fake_sleep)
 
     try:
-        asyncio.run(
-            ow.run_loop(provider=object(), batch_size=50, poll_sec=1.5)
-        )
+        asyncio.run(ow.run_loop(provider=object(), batch_size=50, poll_sec=1.5))
         raise AssertionError("Expected CancelledError")
     except asyncio.CancelledError:
         pass
@@ -106,9 +104,7 @@ def test_run_loop_processes_job_ids(monkeypatch: Any) -> None:
     monkeypatch.setattr(ow.asyncio, "sleep", fake_sleep)
 
     try:
-        asyncio.run(
-            ow.run_loop(provider=object(), batch_size=50, poll_sec=1.0)
-        )
+        asyncio.run(ow.run_loop(provider=object(), batch_size=50, poll_sec=1.0))
         raise AssertionError("Expected CancelledError")
     except asyncio.CancelledError:
         pass

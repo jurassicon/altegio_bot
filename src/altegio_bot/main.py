@@ -19,12 +19,12 @@ app = FastAPI(title=settings.app_name)
 app.include_router(whatsapp_router)
 app.include_router(chatwoot_router)
 app.include_router(ops_login_router)  # public: /ops/login, /ops/logout
-app.include_router(ops_router)        # protected: everything else under /ops/
+app.include_router(ops_router)  # protected: everything else under /ops/
 
 
 def _safe_headers(request: Request) -> dict[str, str]:
     # Не сохраняем потенциально чувствительные заголовки
-    deny = {'authorization', 'cookie'}
+    deny = {"authorization", "cookie"}
     out: dict[str, str] = {}
     for key, value in request.headers.items():
         low_key = key.lower()
@@ -35,16 +35,16 @@ def _safe_headers(request: Request) -> dict[str, str]:
 
 
 def _make_dedupe_key(payload: dict[str, Any], query: dict[str, Any]) -> str:
-    '''
+    """
     Стабильный ключ, чтобы одинаковый вебхук не обработался дважды.
     Берём главные поля + last_change_date (если есть), иначе хэш всего payload.
-    '''
-    company_id = payload.get('company_id')
-    resource = payload.get('resource') or payload.get('type')
-    resource_id = payload.get('resource_id')
-    event_status = payload.get('status')
-    last_change = (payload.get('data') or {}).get('last_change_date')
-    secret = query.get('secret') or query.get('userGuid')
+    """
+    company_id = payload.get("company_id")
+    resource = payload.get("resource") or payload.get("type")
+    resource_id = payload.get("resource_id")
+    event_status = payload.get("status")
+    last_change = (payload.get("data") or {}).get("last_change_date")
+    secret = query.get("secret") or query.get("userGuid")
 
     main_fields = [company_id, resource, resource_id, event_status]
     if any(x is None for x in main_fields):
@@ -52,47 +52,44 @@ def _make_dedupe_key(payload: dict[str, Any], query: dict[str, Any]) -> str:
             payload,
             ensure_ascii=False,
             sort_keys=True,
-            separators=(',', ':'),
+            separators=(",", ":"),
         )
-        digest = hashlib.sha256(canon.encode('utf-8')).hexdigest()
-        base = f'fallback:{digest}'
+        digest = hashlib.sha256(canon.encode("utf-8")).hexdigest()
+        base = f"fallback:{digest}"
     else:
-        base = (
-            f'{company_id}:{resource}:{resource_id}:{event_status}:'
-            f'{last_change}:{secret}'
-        )
+        base = f"{company_id}:{resource}:{resource_id}:{event_status}:{last_change}:{secret}"
 
-    return hashlib.sha256(base.encode('utf-8')).hexdigest()
+    return hashlib.sha256(base.encode("utf-8")).hexdigest()
 
 
-@app.get('/health')
+@app.get("/health")
 async def health() -> dict[str, bool]:
-    return {'ok': True}
+    return {"ok": True}
 
 
-@app.post('/webhooks/altegio')
+@app.post("/webhooks/altegio")
 async def altegio_webhook(request: Request) -> dict[str, bool]:
     # 1) проверяем секрет (в логах это query param 'secret')
     query = dict(request.query_params)
-    provided = query.get('secret')
+    provided = query.get("secret")
     if provided != settings.altegio_webhook_secret:
-        raise HTTPException(status_code=403, detail='Invalid webhook secret')
+        raise HTTPException(status_code=403, detail="Invalid webhook secret")
 
     # 2) читаем payload
     try:
         payload = await request.json()
     except Exception:
-        raise HTTPException(status_code=400, detail='Invalid JSON')
+        raise HTTPException(status_code=400, detail="Invalid JSON")
 
     # 3) сохраняем в inbox
     dedupe_key = _make_dedupe_key(payload, query)
 
     event = AltegioEvent(
         dedupe_key=dedupe_key,
-        company_id=payload.get('company_id'),
-        resource=payload.get('resource'),
-        resource_id=payload.get('resource_id'),
-        event_status=payload.get('status'),
+        company_id=payload.get("company_id"),
+        resource=payload.get("resource"),
+        resource_id=payload.get("resource_id"),
+        event_status=payload.get("status"),
         query=query,
         headers=_safe_headers(request),
         payload=payload,
@@ -106,4 +103,4 @@ async def altegio_webhook(request: Request) -> dict[str, bool]:
             # Уже получили такое событие — отвечаем ok (идемпотентность)
             await session.rollback()
 
-    return {'ok': True}
+    return {"ok": True}

@@ -8,24 +8,24 @@ from altegio_bot.providers.base import WhatsAppProvider
 
 logger = logging.getLogger(__name__)
 
-ALLOW_REAL_SEND_ENV = 'ALLOW_REAL_SEND'
-WHATSAPP_PROVIDER_ENV = 'WHATSAPP_PROVIDER'
-META_PROVIDER_KEY = 'meta_cloud'
+ALLOW_REAL_SEND_ENV = "ALLOW_REAL_SEND"
+WHATSAPP_PROVIDER_ENV = "WHATSAPP_PROVIDER"
+META_PROVIDER_KEY = "meta_cloud"
 
 
 def _provider_key(provider: WhatsAppProvider) -> str:
-    key = os.getenv(WHATSAPP_PROVIDER_ENV, '').strip().lower()
+    key = os.getenv(WHATSAPP_PROVIDER_ENV, "").strip().lower()
     if key:
         return key
 
-    module_name = provider.__class__.__module__.rsplit('.', 1)[-1]
+    module_name = provider.__class__.__module__.rsplit(".", 1)[-1]
     return module_name.strip().lower()
 
 
 def _real_send_allowed(provider: WhatsAppProvider) -> bool:
     if _provider_key(provider) != META_PROVIDER_KEY:
         return True
-    return os.getenv(ALLOW_REAL_SEND_ENV, '0').strip() == '1'
+    return os.getenv(ALLOW_REAL_SEND_ENV, "0").strip() == "1"
 
 
 class DummyProvider(WhatsAppProvider):
@@ -35,9 +35,9 @@ class DummyProvider(WhatsAppProvider):
         phone_e164: str,
         text: str,
     ) -> str:
-        provider_message_id = f'dummy-{uuid4()}'
+        provider_message_id = f"dummy-{uuid4()}"
         logger.info(
-            'Dummy send sender_id=%s phone=%s text_len=%s msg_id=%s',
+            "Dummy send sender_id=%s phone=%s text_len=%s msg_id=%s",
             sender_id,
             phone_e164,
             len(text),
@@ -53,10 +53,9 @@ class DummyProvider(WhatsAppProvider):
         language: str,
         params: list[str],
     ) -> str:
-        provider_message_id = f'dummy-tpl-{uuid4()}'
+        provider_message_id = f"dummy-tpl-{uuid4()}"
         logger.info(
-            'Dummy send_template sender_id=%s phone=%s '
-            'template=%s lang=%s params=%s msg_id=%s',
+            "Dummy send_template sender_id=%s phone=%s template=%s lang=%s params=%s msg_id=%s",
             sender_id,
             phone_e164,
             template_name,
@@ -74,13 +73,13 @@ async def safe_send(
     text: str,
 ) -> tuple[str | None, str | None]:
     if not _real_send_allowed(provider):
-        return None, 'Real send disabled'
+        return None, "Real send disabled"
 
     try:
         msg_id = await provider.send(sender_id, phone, text)
         return msg_id, None
     except Exception as exc:
-        logger.exception('send failed: %s', exc)
+        logger.exception("send failed: %s", exc)
         return None, str(exc)
 
 
@@ -93,14 +92,11 @@ async def safe_send_template(
     params: list[str],
 ) -> tuple[str | None, str | None]:
     if not _real_send_allowed(provider):
-        return None, 'Real send disabled'
+        return None, "Real send disabled"
 
     try:
-        msg_id = await provider.send_template(
-            sender_id, phone, template_name, language, params
-        )
+        msg_id = await provider.send_template(sender_id, phone, template_name, language, params)
         return msg_id, None
     except Exception as exc:
-        logger.exception('send_template failed: %s', exc)
+        logger.exception("send_template failed: %s", exc)
         return None, str(exc)
-

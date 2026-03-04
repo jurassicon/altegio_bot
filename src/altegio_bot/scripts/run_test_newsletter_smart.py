@@ -23,15 +23,15 @@ Usage::
       --timeout 180 \\
       --cleanup
 """
+
 from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import random
 import string
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Any
 
 import httpx
@@ -44,28 +44,29 @@ from altegio_bot.models.models import OutboxMessage, SmartTestRun
 from altegio_bot.settings import settings
 from altegio_bot.utils import utcnow
 
-logger = logging.getLogger('smart_test')
+logger = logging.getLogger("smart_test")
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-TEST_CODE = 'newsletter_smart_test'
+TEST_CODE = "newsletter_smart_test"
 IDEMPOTENCY_WINDOW_HOURS = 24
-TEMPLATE_LANGUAGE = 'de'
-EXPECTED_TEMPLATE_ID = '1331641148769327'
-DEFAULT_CARD_TYPE_TITLE = 'Kundenkarte - 10 %'
-_LOYALTY_CARD_PREFIX = 'Kundenkarte #'
+TEMPLATE_LANGUAGE = "de"
+EXPECTED_TEMPLATE_ID = "1331641148769327"
+DEFAULT_CARD_TYPE_TITLE = "Kundenkarte - 10 %"
+_LOYALTY_CARD_PREFIX = "Kundenkarte #"
 
 # Statuses that count as PASS for each --expect-status value.
-_PASS_FOR_DELIVERED: frozenset[str] = frozenset({'delivered', 'read'})
-_PASS_FOR_SENT: frozenset[str] = frozenset({'sent', 'delivered', 'read'})
-_FAIL_STATUS = 'failed'
+_PASS_FOR_DELIVERED: frozenset[str] = frozenset({"delivered", "read"})
+_PASS_FOR_SENT: frozenset[str] = frozenset({"sent", "delivered", "read"})
+_FAIL_STATUS = "failed"
 
 
 # ---------------------------------------------------------------------------
 # A) Meta WABA template verification
 # ---------------------------------------------------------------------------
+
 
 async def check_meta_template(
     template_name: str,
@@ -81,22 +82,18 @@ async def check_meta_template(
     Returns ``(ok, error_message)``.  *ok* is ``True`` iff the template is
     found with ``status == APPROVED``.
     """
-    url = (
-        f'{graph_url.rstrip("/")}/{api_version}'
-        f'/{waba_id}/message_templates'
-    )
+    url = f"{graph_url.rstrip('/')}/{api_version}/{waba_id}/message_templates"
     params = {
-        'fields': 'name,id,status,language,category',
-        'name': template_name,
-        'access_token': access_token,
+        "fields": "name,id,status,language,category",
+        "name": template_name,
+        "access_token": access_token,
     }
     async with httpx.AsyncClient(timeout=20.0) as client:
         resp = await client.get(url, params=params)
 
     if resp.status_code >= 400:
         return False, (
-            f'Meta API returned HTTP {resp.status_code} when checking '
-            f'template {template_name!r}: {resp.text[:300]}'
+            f"Meta API returned HTTP {resp.status_code} when checking template {template_name!r}: {resp.text[:300]}"
         )
 
     data: Any = {}
@@ -107,39 +104,30 @@ async def check_meta_template(
 
     templates = []
     if isinstance(data, dict):
-        templates = data.get('data', []) or []
+        templates = data.get("data", []) or []
 
-    matched = [
-        t for t in templates
-        if isinstance(t, dict) and t.get('name') == template_name
-    ]
+    matched = [t for t in templates if isinstance(t, dict) and t.get("name") == template_name]
     if not matched:
-        return False, (
-            f'Template {template_name!r} not found in WABA {waba_id!r}.'
-        )
+        return False, (f"Template {template_name!r} not found in WABA {waba_id!r}.")
 
     tmpl = matched[0]
-    status = (tmpl.get('status') or '').upper()
-    if status != 'APPROVED':
-        return False, (
-            f'Template {template_name!r} status is {status!r}, '
-            f'expected APPROVED.'
-        )
+    status = (tmpl.get("status") or "").upper()
+    if status != "APPROVED":
+        return False, (f"Template {template_name!r} status is {status!r}, expected APPROVED.")
 
-    if expected_template_id and str(tmpl.get('id')) != expected_template_id:
+    if expected_template_id and str(tmpl.get("id")) != expected_template_id:
         logger.warning(
-            'Template id mismatch: got %s, expected %s '
-            '(not critical, sending by name)',
-            tmpl.get('id'),
+            "Template id mismatch: got %s, expected %s (not critical, sending by name)",
+            tmpl.get("id"),
             expected_template_id,
         )
 
     logger.info(
-        'Template %r APPROVED (id=%s, language=%s, category=%s)',
+        "Template %r APPROVED (id=%s, language=%s, category=%s)",
         template_name,
-        tmpl.get('id'),
-        tmpl.get('language'),
-        tmpl.get('category'),
+        tmpl.get("id"),
+        tmpl.get("language"),
+        tmpl.get("category"),
     )
     return True, None
 
@@ -147,6 +135,7 @@ async def check_meta_template(
 # ---------------------------------------------------------------------------
 # B) Idempotency helpers
 # ---------------------------------------------------------------------------
+
 
 async def _find_recent_success(
     session: AsyncSession,
@@ -161,7 +150,7 @@ async def _find_recent_success(
         select(SmartTestRun)
         .where(SmartTestRun.phone_e164 == phone_e164)
         .where(SmartTestRun.test_code == test_code)
-        .where(SmartTestRun.outcome == 'pass')
+        .where(SmartTestRun.outcome == "pass")
         .where(SmartTestRun.created_at >= cutoff)
         .order_by(SmartTestRun.created_at.desc())
         .limit(1)
@@ -174,6 +163,7 @@ async def _find_recent_success(
 # C) Card number generation
 # ---------------------------------------------------------------------------
 
+
 def _gen_card_number() -> str:
     """Generate a 16-digit test card number.
 
@@ -181,14 +171,15 @@ def _gen_card_number() -> str:
     The ``99`` prefix makes test cards easy to identify.
     """
     now = utcnow()
-    yymmdd = now.strftime('%y%m%d')
-    random_part = ''.join(random.choices(string.digits, k=8))
-    return f'99{yymmdd}{random_part}'
+    yymmdd = now.strftime("%y%m%d")
+    random_part = "".join(random.choices(string.digits, k=8))
+    return f"99{yymmdd}{random_part}"
 
 
 # ---------------------------------------------------------------------------
 # D) Direct Meta template send (bypasses DB sender lookup)
 # ---------------------------------------------------------------------------
+
 
 async def _send_template_direct(
     *,
@@ -202,28 +193,24 @@ async def _send_template_direct(
     phone_number_id: str,
 ) -> str:
     """Send a Meta WhatsApp template message directly, returning the message id."""
-    to_number = phone_e164.lstrip('+').strip()
-    url = (
-        f'{graph_url.rstrip("/")}/{api_version}/{phone_number_id}/messages'
-    )
+    to_number = phone_e164.lstrip("+").strip()
+    url = f"{graph_url.rstrip('/')}/{api_version}/{phone_number_id}/messages"
     payload: dict[str, Any] = {
-        'messaging_product': 'whatsapp',
-        'to': to_number,
-        'type': 'template',
-        'template': {
-            'name': template_name,
-            'language': {'code': language},
-            'components': [
+        "messaging_product": "whatsapp",
+        "to": to_number,
+        "type": "template",
+        "template": {
+            "name": template_name,
+            "language": {"code": language},
+            "components": [
                 {
-                    'type': 'body',
-                    'parameters': [
-                        {'type': 'text', 'text': p} for p in params
-                    ],
+                    "type": "body",
+                    "parameters": [{"type": "text", "text": p} for p in params],
                 }
             ],
         },
     }
-    headers = {'Authorization': f'Bearer {access_token}'}
+    headers = {"Authorization": f"Bearer {access_token}"}
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.post(url, headers=headers, json=payload)
 
@@ -234,24 +221,23 @@ async def _send_template_direct(
         data = {}
 
     if resp.status_code >= 400:
-        err = data.get('error') if isinstance(data, dict) else None
-        msg = err.get('message') if isinstance(err, dict) else str(data)
-        raise RuntimeError(
-            f'Meta send_template failed HTTP {resp.status_code}: {msg}'
-        )
+        err = data.get("error") if isinstance(data, dict) else None
+        msg = err.get("message") if isinstance(err, dict) else str(data)
+        raise RuntimeError(f"Meta send_template failed HTTP {resp.status_code}: {msg}")
 
-    messages = data.get('messages') if isinstance(data, dict) else None
+    messages = data.get("messages") if isinstance(data, dict) else None
     if isinstance(messages, list) and messages:
         first = messages[0]
-        if isinstance(first, dict) and first.get('id'):
-            return str(first['id'])
+        if isinstance(first, dict) and first.get("id"):
+            return str(first["id"])
 
-    raise RuntimeError(f'Unexpected Meta response: {data}')
+    raise RuntimeError(f"Unexpected Meta response: {data}")
 
 
 # ---------------------------------------------------------------------------
 # E) Status polling
 # ---------------------------------------------------------------------------
+
 
 def _evaluate_outcome(
     statuses_seen: list[str],
@@ -263,15 +249,11 @@ def _evaluate_outcome(
     A ``failed`` status anywhere is an immediate FAIL.
     """
     if _FAIL_STATUS in statuses_seen:
-        return 'fail'
+        return "fail"
 
-    pass_set = (
-        _PASS_FOR_DELIVERED
-        if expect_status == 'delivered'
-        else _PASS_FOR_SENT
-    )
+    pass_set = _PASS_FOR_DELIVERED if expect_status == "delivered" else _PASS_FOR_SENT
     if any(s in pass_set for s in statuses_seen):
-        return 'pass'
+        return "pass"
 
     return None
 
@@ -301,7 +283,7 @@ async def _poll_statuses(
     err_details: str | None = None
 
     sql = text(
-        '''
+        """
         SELECT
           received_at,
           payload #>> \'{entry,0,changes,0,value,statuses,0,status}\' AS status_value,
@@ -311,12 +293,12 @@ async def _poll_statuses(
         FROM whatsapp_events
         WHERE payload #>> \'{entry,0,changes,0,value,statuses,0,id}\' = :msg_id
         ORDER BY received_at ASC
-        '''
+        """
     )
 
     while utcnow() < deadline:
         async with SessionLocal() as session:
-            res = await session.execute(sql, {'msg_id': provider_message_id})
+            res = await session.execute(sql, {"msg_id": provider_message_id})
             rows = res.fetchall()
 
         for row in rows:
@@ -336,12 +318,12 @@ async def _poll_statuses(
         outcome = _evaluate_outcome(statuses_seen, expect_status=expect_status)
         if outcome is not None:
             return {
-                'outcome': outcome,
-                'statuses_seen': statuses_seen,
-                'first_seen_at': first_seen_at,
-                'last_seen_at': last_seen_at,
-                'err_code': err_code,
-                'err_details': err_details,
+                "outcome": outcome,
+                "statuses_seen": statuses_seen,
+                "first_seen_at": first_seen_at,
+                "last_seen_at": last_seen_at,
+                "err_code": err_code,
+                "err_details": err_details,
             }
 
         remaining = (deadline - utcnow()).total_seconds()
@@ -351,18 +333,19 @@ async def _poll_statuses(
         await asyncio.sleep(min(poll_interval, remaining))
 
     return {
-        'outcome': 'timeout',
-        'statuses_seen': statuses_seen,
-        'first_seen_at': first_seen_at,
-        'last_seen_at': last_seen_at,
-        'err_code': err_code,
-        'err_details': err_details,
+        "outcome": "timeout",
+        "statuses_seen": statuses_seen,
+        "first_seen_at": first_seen_at,
+        "last_seen_at": last_seen_at,
+        "err_code": err_code,
+        "err_details": err_details,
     }
 
 
 # ---------------------------------------------------------------------------
 # Main orchestration
 # ---------------------------------------------------------------------------
+
 
 async def run_smart_test(
     *,
@@ -383,12 +366,12 @@ async def run_smart_test(
     """Orchestrate the full smart test.  Returns exit code (0=PASS, 2=FAIL)."""
 
     # Normalise phone to e164 (with leading +)
-    phone_stripped = phone.lstrip('+').strip()
-    phone_e164 = f'+{phone_stripped}'
+    phone_stripped = phone.lstrip("+").strip()
+    phone_e164 = f"+{phone_stripped}"
     phone_int = int(phone_stripped)
 
     logger.info(
-        'Smart test START phone=%s company=%s template=%s expect=%s',
+        "Smart test START phone=%s company=%s template=%s expect=%s",
         phone_e164,
         company_id,
         template_name,
@@ -405,13 +388,13 @@ async def run_smart_test(
     phone_number_id = settings.meta_wa_phone_number_id
 
     if not access_token:
-        logger.error('FAIL: WHATSAPP_ACCESS_TOKEN is not set')
+        logger.error("FAIL: WHATSAPP_ACCESS_TOKEN is not set")
         return 2
     if not waba_id:
-        logger.error('FAIL: META_WABA_ID is not set')
+        logger.error("FAIL: META_WABA_ID is not set")
         return 2
     if not phone_number_id:
-        logger.error('FAIL: META_WA_PHONE_NUMBER_ID is not set')
+        logger.error("FAIL: META_WA_PHONE_NUMBER_ID is not set")
         return 2
 
     ok, err_msg = await check_meta_template(
@@ -423,7 +406,7 @@ async def run_smart_test(
         expected_template_id=expected_template_id or EXPECTED_TEMPLATE_ID,
     )
     if not ok:
-        logger.error('FAIL (template check): %s', err_msg)
+        logger.error("FAIL (template check): %s", err_msg)
         return 2
 
     # -----------------------------------------------------------------------
@@ -439,8 +422,7 @@ async def run_smart_test(
             )
         if recent is not None:
             logger.info(
-                'PASS (already passed recently): run_id=%s created_at=%s '
-                'provider_message_id=%s',
+                "PASS (already passed recently): run_id=%s created_at=%s provider_message_id=%s",
                 recent.id,
                 recent.created_at,
                 recent.provider_message_id,
@@ -461,11 +443,7 @@ async def run_smart_test(
             card_types = await loyalty.get_card_types(location_id)
             # First try to find by title
             match = next(
-                (
-                    t for t in card_types
-                    if isinstance(t, dict)
-                    and t.get('title') == DEFAULT_CARD_TYPE_TITLE
-                ),
+                (t for t in card_types if isinstance(t, dict) and t.get("title") == DEFAULT_CARD_TYPE_TITLE),
                 None,
             )
             if match is None and card_types:
@@ -473,25 +451,23 @@ async def run_smart_test(
             if match is None:
                 await loyalty.aclose()
                 logger.error(
-                    'FAIL: no loyalty card types found for location_id=%s',
+                    "FAIL: no loyalty card types found for location_id=%s",
                     location_id,
                 )
                 return 2
-            resolved_card_type_id = str(
-                match.get('id') or match.get('loyalty_card_type_id') or ''
-            )
+            resolved_card_type_id = str(match.get("id") or match.get("loyalty_card_type_id") or "")
             logger.info(
-                'Resolved card_type_id=%s (title=%s)',
+                "Resolved card_type_id=%s (title=%s)",
                 resolved_card_type_id,
-                match.get('title'),
+                match.get("title"),
             )
 
         resolved_type_id = resolved_card_type_id
         card_number = _gen_card_number()
-        loyalty_card_text = f'{_LOYALTY_CARD_PREFIX}{card_number}'
+        loyalty_card_text = f"{_LOYALTY_CARD_PREFIX}{card_number}"
 
         logger.info(
-            'Issuing loyalty card number=%s type_id=%s phone=%s',
+            "Issuing loyalty card number=%s type_id=%s phone=%s",
             card_number,
             resolved_type_id,
             phone_int,
@@ -502,19 +478,15 @@ async def run_smart_test(
             loyalty_card_type_id=resolved_type_id,
             phone=phone_int,
         )
-        card_id = str(
-            card_resp.get('id') or card_resp.get('loyalty_card_id') or ''
-        )
-        issued_number = str(
-            card_resp.get('loyalty_card_number') or card_number
-        )
+        card_id = str(card_resp.get("id") or card_resp.get("loyalty_card_id") or "")
+        issued_number = str(card_resp.get("loyalty_card_number") or card_number)
         card_number = issued_number
-        loyalty_card_text = f'{_LOYALTY_CARD_PREFIX}{card_number}'
-        logger.info('Card issued: id=%s number=%s', card_id, card_number)
+        loyalty_card_text = f"{_LOYALTY_CARD_PREFIX}{card_number}"
+        logger.info("Card issued: id=%s number=%s", card_id, card_number)
 
     except Exception as exc:
         await loyalty.aclose()
-        logger.error('FAIL (issue card): %s', exc)
+        logger.error("FAIL (issue card): %s", exc)
         return 2
 
     # -----------------------------------------------------------------------
@@ -532,17 +504,17 @@ async def run_smart_test(
                 loyalty_card_number=card_number,
                 loyalty_card_type_id=resolved_type_id,
                 template_name=template_name,
-                outcome='pending',
+                outcome="pending",
                 meta={
-                    'booking_link': booking_link,
-                    'client_name': client_name,
-                    'expect_status': expect_status,
+                    "booking_link": booking_link,
+                    "client_name": client_name,
+                    "expect_status": expect_status,
                 },
             )
             session.add(run_record)
             await session.flush()
             run_id = run_record.id
-            logger.info('SmartTestRun created id=%s', run_id)
+            logger.info("SmartTestRun created id=%s", run_id)
 
     # -----------------------------------------------------------------------
     # D) Send WhatsApp template message
@@ -561,15 +533,15 @@ async def run_smart_test(
             api_version=api_version,
             phone_number_id=phone_number_id,
         )
-        logger.info('Message sent: provider_message_id=%s', provider_message_id)
+        logger.info("Message sent: provider_message_id=%s", provider_message_id)
     except Exception as exc:
-        logger.error('FAIL (send template): %s', exc)
+        logger.error("FAIL (send template): %s", exc)
         # Update run record
         async with SessionLocal() as session:
             async with session.begin():
                 rec = await session.get(SmartTestRun, run_id)
                 if rec is not None:
-                    rec.outcome = 'fail'
+                    rec.outcome = "fail"
                     rec.meta = dict(rec.meta or {}, send_error=str(exc))
         await _maybe_cleanup(
             loyalty=loyalty,
@@ -593,16 +565,16 @@ async def run_smart_test(
                 phone_e164=phone_e164,
                 template_code=template_name,
                 language=TEMPLATE_LANGUAGE,
-                body='',
-                status='sent',
+                body="",
+                status="sent",
                 provider_message_id=provider_message_id,
                 scheduled_at=utcnow(),
                 sent_at=utcnow(),
                 meta={
-                    'send_type': 'template',
-                    'template': template_name,
-                    'params': template_params,
-                    'test_code': TEST_CODE,
+                    "send_type": "template",
+                    "template": template_name,
+                    "params": template_params,
+                    "test_code": TEST_CODE,
                 },
             )
             session.add(outbox)
@@ -611,8 +583,7 @@ async def run_smart_test(
     # E) Poll for delivery status
     # -----------------------------------------------------------------------
     logger.info(
-        'Polling for status provider_message_id=%s '
-        'expect=%s timeout=%ss',
+        "Polling for status provider_message_id=%s expect=%s timeout=%ss",
         provider_message_id,
         expect_status,
         timeout_sec,
@@ -623,16 +594,15 @@ async def run_smart_test(
         timeout_sec=timeout_sec,
     )
 
-    outcome = poll_result['outcome']
-    statuses_seen = poll_result['statuses_seen']
-    first_seen_at = poll_result['first_seen_at']
-    last_seen_at = poll_result['last_seen_at']
-    poll_err_code = poll_result['err_code']
-    poll_err_details = poll_result['err_details']
+    outcome = poll_result["outcome"]
+    statuses_seen = poll_result["statuses_seen"]
+    first_seen_at = poll_result["first_seen_at"]
+    last_seen_at = poll_result["last_seen_at"]
+    poll_err_code = poll_result["err_code"]
+    poll_err_details = poll_result["err_details"]
 
     logger.info(
-        'Poll complete: outcome=%s statuses_seen=%s '
-        'first_seen_at=%s last_seen_at=%s err_code=%s err_details=%s',
+        "Poll complete: outcome=%s statuses_seen=%s first_seen_at=%s last_seen_at=%s err_code=%s err_details=%s",
         outcome,
         statuses_seen,
         first_seen_at,
@@ -642,8 +612,8 @@ async def run_smart_test(
     )
 
     # Map outcome to pass/fail
-    final_outcome = 'pass' if outcome == 'pass' else 'fail'
-    exit_code = 0 if final_outcome == 'pass' else 2
+    final_outcome = "pass" if outcome == "pass" else "fail"
+    exit_code = 0 if final_outcome == "pass" else 2
 
     # Update SmartTestRun
     async with SessionLocal() as session:
@@ -654,18 +624,12 @@ async def run_smart_test(
                 rec.meta = dict(
                     rec.meta or {},
                     poll_result={
-                        'statuses_seen': statuses_seen,
-                        'first_seen_at': (
-                            first_seen_at.isoformat()
-                            if first_seen_at else None
-                        ),
-                        'last_seen_at': (
-                            last_seen_at.isoformat()
-                            if last_seen_at else None
-                        ),
-                        'err_code': poll_err_code,
-                        'err_details': poll_err_details,
-                        'poll_outcome': outcome,
+                        "statuses_seen": statuses_seen,
+                        "first_seen_at": (first_seen_at.isoformat() if first_seen_at else None),
+                        "last_seen_at": (last_seen_at.isoformat() if last_seen_at else None),
+                        "err_code": poll_err_code,
+                        "err_details": poll_err_details,
+                        "poll_outcome": outcome,
                     },
                 )
 
@@ -674,33 +638,29 @@ async def run_smart_test(
         async with session.begin():
             outbox_stmt = (
                 select(OutboxMessage)
-                .where(
-                    OutboxMessage.provider_message_id == provider_message_id
-                )
+                .where(OutboxMessage.provider_message_id == provider_message_id)
                 .order_by(OutboxMessage.id.desc())
                 .limit(1)
             )
             outbox_res = await session.execute(outbox_stmt)
             outbox_row = outbox_res.scalar_one_or_none()
             if outbox_row is not None:
-                if 'delivered' in statuses_seen:
-                    outbox_row.status = 'delivered'
-                elif 'read' in statuses_seen:
-                    outbox_row.status = 'read'
-                elif 'sent' in statuses_seen:
-                    outbox_row.status = 'sent'
-                elif outcome == 'timeout':
-                    outbox_row.status = 'sent'  # keep as sent on timeout
+                if "delivered" in statuses_seen:
+                    outbox_row.status = "delivered"
+                elif "read" in statuses_seen:
+                    outbox_row.status = "read"
+                elif "sent" in statuses_seen:
+                    outbox_row.status = "sent"
+                elif outcome == "timeout":
+                    outbox_row.status = "sent"  # keep as sent on timeout
                 else:
-                    outbox_row.status = 'failed'
-                    outbox_row.error = (
-                        f'err_code={poll_err_code} err_details={poll_err_details}'
-                    )
+                    outbox_row.status = "failed"
+                    outbox_row.error = f"err_code={poll_err_code} err_details={poll_err_details}"
 
     # -----------------------------------------------------------------------
     # F) Cleanup
     # -----------------------------------------------------------------------
-    should_cleanup = cleanup or (cleanup_on_fail and final_outcome == 'fail')
+    should_cleanup = cleanup or (cleanup_on_fail and final_outcome == "fail")
     await _maybe_cleanup(
         loyalty=loyalty,
         location_id=location_id,
@@ -712,12 +672,12 @@ async def run_smart_test(
 
     # Final summary
     logger.info(
-        '=== SUMMARY ===\n'
-        '  provider_message_id : %s\n'
-        '  statuses_seen       : %s\n'
-        '  first_seen_at       : %s\n'
-        '  last_seen_at        : %s\n'
-        '  outcome             : %s',
+        "=== SUMMARY ===\n"
+        "  provider_message_id : %s\n"
+        "  statuses_seen       : %s\n"
+        "  first_seen_at       : %s\n"
+        "  last_seen_at        : %s\n"
+        "  outcome             : %s",
         provider_message_id,
         statuses_seen,
         first_seen_at,
@@ -726,10 +686,10 @@ async def run_smart_test(
     )
 
     if exit_code == 0:
-        logger.info('=== RESULT: PASS ===')
+        logger.info("=== RESULT: PASS ===")
     else:
         logger.error(
-            '=== RESULT: FAIL (poll_outcome=%s err_code=%s) ===',
+            "=== RESULT: FAIL (poll_outcome=%s err_code=%s) ===",
             outcome,
             poll_err_code,
         )
@@ -740,6 +700,7 @@ async def run_smart_test(
 # ---------------------------------------------------------------------------
 # Cleanup helper
 # ---------------------------------------------------------------------------
+
 
 async def _maybe_cleanup(
     *,
@@ -754,11 +715,11 @@ async def _maybe_cleanup(
 
     try:
         await loyalty.delete_card(location_id, int(card_id))
-        logger.info('Card deleted: card_id=%s', card_id)
-        delete_status = 'deleted'
+        logger.info("Card deleted: card_id=%s", card_id)
+        delete_status = "deleted"
     except Exception as exc:
-        logger.warning('Failed to delete card card_id=%s: %s', card_id, exc)
-        delete_status = f'error: {exc}'
+        logger.warning("Failed to delete card card_id=%s: %s", card_id, exc)
+        delete_status = f"error: {exc}"
 
     async with SessionLocal() as session:
         async with session.begin():
@@ -772,72 +733,71 @@ async def _maybe_cleanup(
 # CLI entry point
 # ---------------------------------------------------------------------------
 
+
 async def main() -> None:
     import argparse
 
     logging.basicConfig(
         level=logging.INFO,
-        format='%(asctime)s %(levelname)s %(name)s: %(message)s',
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
-    parser = argparse.ArgumentParser(
-        description='Smart integration test for WhatsApp newsletter template.'
-    )
+    parser = argparse.ArgumentParser(description="Smart integration test for WhatsApp newsletter template.")
     parser.add_argument(
-        '--phone',
+        "--phone",
         required=True,
-        help='Recipient phone number (e.g. 381638400431 or +381638400431)',
+        help="Recipient phone number (e.g. 381638400431 or +381638400431)",
     )
-    parser.add_argument('--company-id', type=int, required=True)
+    parser.add_argument("--company-id", type=int, required=True)
     parser.add_argument(
-        '--location-id',
+        "--location-id",
         type=int,
         default=None,
-        help='Altegio location id (defaults to --company-id)',
+        help="Altegio location id (defaults to --company-id)",
     )
     parser.add_argument(
-        '--booking-link',
-        default='https://n813709.alteg.io/',
+        "--booking-link",
+        default="https://n813709.alteg.io/",
     )
     parser.add_argument(
-        '--template',
-        default='kitilash_ka_newsletter_new_clients_monthly_v2',
+        "--template",
+        default="kitilash_ka_newsletter_new_clients_monthly_v2",
     )
     parser.add_argument(
-        '--expect-status',
-        choices=['sent', 'delivered'],
-        default='delivered',
+        "--expect-status",
+        choices=["sent", "delivered"],
+        default="delivered",
     )
-    parser.add_argument('--timeout', type=int, default=180)
+    parser.add_argument("--timeout", type=int, default=180)
     parser.add_argument(
-        '--cleanup',
-        action='store_true',
-        help='Delete the loyalty card after a PASS.',
-    )
-    parser.add_argument(
-        '--cleanup-on-fail',
-        action='store_true',
-        help='Also delete the loyalty card after a FAIL.',
+        "--cleanup",
+        action="store_true",
+        help="Delete the loyalty card after a PASS.",
     )
     parser.add_argument(
-        '--force',
-        action='store_true',
-        help='Ignore idempotency check and always run.',
+        "--cleanup-on-fail",
+        action="store_true",
+        help="Also delete the loyalty card after a FAIL.",
     )
     parser.add_argument(
-        '--card-type-id',
+        "--force",
+        action="store_true",
+        help="Ignore idempotency check and always run.",
+    )
+    parser.add_argument(
+        "--card-type-id",
         default=None,
-        help='Altegio loyalty_card_type_id (overrides env LOYALTY_CARD_TYPE_ID).',
+        help="Altegio loyalty_card_type_id (overrides env LOYALTY_CARD_TYPE_ID).",
     )
     parser.add_argument(
-        '--client-name',
-        default='KitiLash Kunde',
-        help='client_name parameter for the template.',
+        "--client-name",
+        default="KitiLash Kunde",
+        help="client_name parameter for the template.",
     )
     parser.add_argument(
-        '--expected-template-id',
+        "--expected-template-id",
         default=EXPECTED_TEMPLATE_ID,
-        help='Expected Meta template id for validation warning (default: %(default)s).',
+        help="Expected Meta template id for validation warning (default: %(default)s).",
     )
     args = parser.parse_args()
 
@@ -861,5 +821,5 @@ async def main() -> None:
     sys.exit(exit_code)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     asyncio.run(main())

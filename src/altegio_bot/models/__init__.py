@@ -1,2 +1,5 @@
 # altegio_bot/models/__init__.py
-from .models import Base, AltegioEvent
+from .models import AltegioEvent as AltegioEvent
+from .models import Base
+
+__all__ = ["AltegioEvent", "Base"]

@@ -17,6 +17,7 @@ Branch-specific templates (contain address footer):
   → Rastatt: kitilash_ra_* where available; others currently fall back
     to kitilash_ka_* and the fallback is logged as a WARNING.
 """
+
 from __future__ import annotations
 
 import logging
@@ -25,16 +26,18 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 # Language code sent with every template request.
-TEMPLATE_LANGUAGE = 'de'
+TEMPLATE_LANGUAGE = "de"
 
 # Job types whose templates have NO address footer and are therefore
 # shared across all branches (canonical ka_* is used for everyone).
-UNIVERSAL_JOB_TYPES: frozenset[str] = frozenset({
-    'review_3d',
-    'repeat_10d',
-    'comeback_3d',
-    'newsletter_new_clients_monthly',
-})
+UNIVERSAL_JOB_TYPES: frozenset[str] = frozenset(
+    {
+        "review_3d",
+        "repeat_10d",
+        "comeback_3d",
+        "newsletter_new_clients_monthly",
+    }
+)
 
 # ---------------------------------------------------------------------------
 # Template name map: (company_id, job_type) -> Meta template name
@@ -46,52 +49,34 @@ _RA = 1271200
 
 META_TEMPLATE_MAP: dict[tuple[int, str], str] = {
     # --- Karlsruhe ---
-    (_KA, 'record_created'):
-        'kitilash_ka_record_created_v1',
-    (_KA, 'record_updated'):
-        'kitilash_ka_record_updated_v1',
-    (_KA, 'record_canceled'):
-        'kitilash_ka_record_canceled_v1',
-    (_KA, 'reminder_24h'):
-        'kitilash_ka_reminder_24h_v1',
-    (_KA, 'reminder_2h'):
-        'kitilash_ka_reminder_2h_v1',
-    (_KA, 'review_3d'):
-        'kitilash_ka_review_3d_v1',
-    (_KA, 'repeat_10d'):
-        'kitilash_ka_repeat_10d_v1',
-    (_KA, 'comeback_3d'):
-        'kitilash_ka_comeback_3d_v1',
-    (_KA, 'newsletter_new_clients_monthly'):
-        'kitilash_ka_newsletter_new_clients_monthly_v2',
+    (_KA, "record_created"): "kitilash_ka_record_created_v1",
+    (_KA, "record_updated"): "kitilash_ka_record_updated_v1",
+    (_KA, "record_canceled"): "kitilash_ka_record_canceled_v1",
+    (_KA, "reminder_24h"): "kitilash_ka_reminder_24h_v1",
+    (_KA, "reminder_2h"): "kitilash_ka_reminder_2h_v1",
+    (_KA, "review_3d"): "kitilash_ka_review_3d_v1",
+    (_KA, "repeat_10d"): "kitilash_ka_repeat_10d_v1",
+    (_KA, "comeback_3d"): "kitilash_ka_comeback_3d_v1",
+    (_KA, "newsletter_new_clients_monthly"): "kitilash_ka_newsletter_new_clients_monthly_v2",
     # --- Rastatt ---
     # ra_record_created_v1 exists; others fall back to ka_* templates
-    (_RA, 'record_created'):
-        'kitilash_ra_record_created_v1',
-    (_RA, 'record_updated'):
-        'kitilash_ka_record_updated_v1',
-    (_RA, 'record_canceled'):
-        'kitilash_ka_record_canceled_v1',
-    (_RA, 'reminder_24h'):
-        'kitilash_ka_reminder_24h_v1',
-    (_RA, 'reminder_2h'):
-        'kitilash_ka_reminder_2h_v1',
-    (_RA, 'review_3d'):
-        'kitilash_ka_review_3d_v1',
-    (_RA, 'repeat_10d'):
-        'kitilash_ka_repeat_10d_v1',
-    (_RA, 'comeback_3d'):
-        'kitilash_ka_comeback_3d_v1',
-    (_RA, 'newsletter_new_clients_monthly'):
-        'kitilash_ka_newsletter_new_clients_monthly_v2',
+    (_RA, "record_created"): "kitilash_ra_record_created_v1",
+    (_RA, "record_updated"): "kitilash_ka_record_updated_v1",
+    (_RA, "record_canceled"): "kitilash_ka_record_canceled_v1",
+    (_RA, "reminder_24h"): "kitilash_ka_reminder_24h_v1",
+    (_RA, "reminder_2h"): "kitilash_ka_reminder_2h_v1",
+    (_RA, "review_3d"): "kitilash_ka_review_3d_v1",
+    (_RA, "repeat_10d"): "kitilash_ka_repeat_10d_v1",
+    (_RA, "comeback_3d"): "kitilash_ka_comeback_3d_v1",
+    (_RA, "newsletter_new_clients_monthly"): "kitilash_ka_newsletter_new_clients_monthly_v2",
 }
 
 # Karlsruhe new-client variant for record_created
-_KA_NEW_CLIENT_TEMPLATE = 'kitilash_ka_record_created_new_client_v1'
+_KA_NEW_CLIENT_TEMPLATE = "kitilash_ka_record_created_new_client_v1"
 
 # Branch-specific job types that have a dedicated ra_* template in Meta WABA.
 # All other branch-specific Rastatt types fall back to ka_* (logged as WARNING).
-_RA_DEDICATED: frozenset[str] = frozenset({'record_created'})
+_RA_DEDICATED: frozenset[str] = frozenset({"record_created"})
 
 
 def resolve_meta_template(
@@ -113,31 +98,22 @@ def resolve_meta_template(
     3. Rastatt branch-specific types without a dedicated ra_* template
        fall back to the matching ka_* template; a WARNING is logged.
     """
-    if (
-        company_id == _KA
-        and job_type == 'record_created'
-        and is_new_client
-    ):
+    if company_id == _KA and job_type == "record_created" and is_new_client:
         return _KA_NEW_CLIENT_TEMPLATE
 
     name = META_TEMPLATE_MAP.get((company_id, job_type))
 
     if name is None:
         logger.warning(
-            'No Meta template for company_id=%s job_type=%s',
+            "No Meta template for company_id=%s job_type=%s",
             company_id,
             job_type,
         )
         return None
 
-    if (
-        company_id == _RA
-        and job_type not in UNIVERSAL_JOB_TYPES
-        and job_type not in _RA_DEDICATED
-    ):
+    if company_id == _RA and job_type not in UNIVERSAL_JOB_TYPES and job_type not in _RA_DEDICATED:
         logger.warning(
-            'Rastatt: no dedicated ra_* template for job_type=%s, '
-            'using fallback template=%s',
+            "Rastatt: no dedicated ra_* template for job_type=%s, using fallback template=%s",
             job_type,
             name,
         )
@@ -162,84 +138,82 @@ def build_template_params(
 
     # record_created (ka and ra variants share the same param order)
     if n in (
-        'kitilash_ka_record_created_v1',
-        'kitilash_ka_record_created_new_client_v1',
-        'kitilash_ra_record_created_v1',
+        "kitilash_ka_record_created_v1",
+        "kitilash_ka_record_created_new_client_v1",
+        "kitilash_ra_record_created_v1",
     ):
         return [
-            ctx.get('client_name', ''),
-            ctx.get('staff_name', ''),
-            ctx.get('date', ''),
-            ctx.get('time', ''),
-            ctx.get('services', ''),
-            ctx.get('total_cost', ''),
-            ctx.get('short_link', ''),
+            ctx.get("client_name", ""),
+            ctx.get("staff_name", ""),
+            ctx.get("date", ""),
+            ctx.get("time", ""),
+            ctx.get("services", ""),
+            ctx.get("total_cost", ""),
+            ctx.get("short_link", ""),
         ]
 
-    if n == 'kitilash_ka_record_updated_v1':
+    if n == "kitilash_ka_record_updated_v1":
         return [
-            ctx.get('client_name', ''),
-            ctx.get('staff_name', ''),
-            ctx.get('date', ''),
-            ctx.get('time', ''),
-            ctx.get('services', ''),
-            ctx.get('total_cost', ''),
-            ctx.get('short_link', ''),
+            ctx.get("client_name", ""),
+            ctx.get("staff_name", ""),
+            ctx.get("date", ""),
+            ctx.get("time", ""),
+            ctx.get("services", ""),
+            ctx.get("total_cost", ""),
+            ctx.get("short_link", ""),
         ]
 
-    if n == 'kitilash_ka_record_canceled_v1':
+    if n == "kitilash_ka_record_canceled_v1":
         return [
-            ctx.get('client_name', ''),
-            ctx.get('date', ''),
-            ctx.get('time', ''),
-            ctx.get('services', ''),
-            ctx.get('booking_link', ''),
+            ctx.get("client_name", ""),
+            ctx.get("date", ""),
+            ctx.get("time", ""),
+            ctx.get("services", ""),
+            ctx.get("booking_link", ""),
         ]
 
-    if n in ('kitilash_ka_reminder_24h_v1', 'kitilash_ka_reminder_2h_v1'):
+    if n in ("kitilash_ka_reminder_24h_v1", "kitilash_ka_reminder_2h_v1"):
         return [
-            ctx.get('client_name', ''),
-            ctx.get('staff_name', ''),
-            ctx.get('date', ''),
-            ctx.get('time', ''),
-            ctx.get('services', ''),
-            ctx.get('short_link', ''),
+            ctx.get("client_name", ""),
+            ctx.get("staff_name", ""),
+            ctx.get("date", ""),
+            ctx.get("time", ""),
+            ctx.get("services", ""),
+            ctx.get("short_link", ""),
         ]
 
-    if n == 'kitilash_ka_review_3d_v1':
+    if n == "kitilash_ka_review_3d_v1":
         return [
-            ctx.get('client_name', ''),
-            ctx.get('short_link', ''),
+            ctx.get("client_name", ""),
+            ctx.get("short_link", ""),
         ]
 
-    if n == 'kitilash_ka_repeat_10d_v1':
+    if n == "kitilash_ka_repeat_10d_v1":
         return [
-            ctx.get('client_name', ''),
-            ctx.get('primary_service', ''),
-            ctx.get('booking_link', ''),
+            ctx.get("client_name", ""),
+            ctx.get("primary_service", ""),
+            ctx.get("booking_link", ""),
         ]
 
-    if n == 'kitilash_ka_comeback_3d_v1':
+    if n == "kitilash_ka_comeback_3d_v1":
         return [
-            ctx.get('client_name', ''),
-            ctx.get('booking_link', ''),
+            ctx.get("client_name", ""),
+            ctx.get("booking_link", ""),
         ]
 
-    if n == 'kitilash_ka_newsletter_new_clients_monthly_v2':
+    if n == "kitilash_ka_newsletter_new_clients_monthly_v2":
         return [
-            ctx.get('client_name', ''),
-            ctx.get('booking_link', ''),
-            ctx.get('loyalty_card_text', ''),
+            ctx.get("client_name", ""),
+            ctx.get("booking_link", ""),
+            ctx.get("loyalty_card_text", ""),
         ]
 
     # Legacy v1 – kept for backward compatibility
-    if n == 'kitilash_ka_newsletter_new_clients_monthly_v1':
+    if n == "kitilash_ka_newsletter_new_clients_monthly_v1":
         return [
-            ctx.get('client_name', ''),
-            ctx.get('booking_link', ''),
+            ctx.get("client_name", ""),
+            ctx.get("booking_link", ""),
         ]
 
-    logger.warning(
-        'build_template_params: unknown template_name=%s', template_name
-    )
+    logger.warning("build_template_params: unknown template_name=%s", template_name)
     return []

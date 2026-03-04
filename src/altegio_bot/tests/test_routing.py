@@ -9,7 +9,7 @@ async def main() -> None:
         sender_id = await pick_sender_id(
             session=session,
             company_id=758285,
-            sender_code='nails',
+            sender_code="nails",
         )
         print(sender_id)
 

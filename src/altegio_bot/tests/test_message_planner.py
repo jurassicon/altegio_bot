@@ -20,7 +20,7 @@ async def test_create_schedules_created_now(session_maker):
                 company_id=1,
                 altegio_record_id=111,
                 client_id=10,
-                staff_name='Staff',
+                staff_name="Staff",
                 starts_at=now + timedelta(hours=1),
             )
             session.add(record)
@@ -30,19 +30,15 @@ async def test_create_schedules_created_now(session_maker):
                 session,
                 company_id=record.company_id,
                 record_id=record.id,
-                event_status='create',
+                event_status="create",
             )
 
-        jobs = (
-            await session.execute(
-                select(MessageJob).order_by(MessageJob.id.asc())
-            )
-        ).scalars().all()
+        jobs = (await session.execute(select(MessageJob).order_by(MessageJob.id.asc()))).scalars().all()
 
         assert [j.job_type for j in jobs] == [
-            'record_created',
-            'review_3d',
-            'repeat_10d',
+            "record_created",
+            "review_3d",
+            "repeat_10d",
         ]
         assert jobs[0].run_at <= now + timedelta(seconds=2)
 
@@ -59,7 +55,7 @@ async def test_create_schedules_reminder_24h_only_when_more_than_24h_left(
                 company_id=1,
                 altegio_record_id=111,
                 client_id=10,
-                staff_name='Staff',
+                staff_name="Staff",
                 starts_at=now + timedelta(hours=25),
             )
             session.add(record)
@@ -69,24 +65,20 @@ async def test_create_schedules_reminder_24h_only_when_more_than_24h_left(
                 session,
                 company_id=record.company_id,
                 record_id=record.id,
-                event_status='create',
+                event_status="create",
             )
 
-        jobs = (
-            await session.execute(
-                select(MessageJob).order_by(MessageJob.id.asc())
-            )
-        ).scalars().all()
+        jobs = (await session.execute(select(MessageJob).order_by(MessageJob.id.asc()))).scalars().all()
 
         assert [j.job_type for j in jobs] == [
-            'record_created',
-            'reminder_24h',
-            'review_3d',
-            'repeat_10d',
+            "record_created",
+            "reminder_24h",
+            "review_3d",
+            "repeat_10d",
         ]
 
         reminder = jobs[1]
-        assert reminder.job_type == 'reminder_24h'
+        assert reminder.job_type == "reminder_24h"
         assert reminder.run_at == record.starts_at - timedelta(hours=24)
 
 
@@ -102,7 +94,7 @@ async def test_create_schedules_reminder_2h_only_when_2h_to_24h_left(
                 company_id=1,
                 altegio_record_id=111,
                 client_id=10,
-                staff_name='Staff',
+                staff_name="Staff",
                 starts_at=now + timedelta(hours=3),
             )
             session.add(record)
@@ -112,24 +104,20 @@ async def test_create_schedules_reminder_2h_only_when_2h_to_24h_left(
                 session,
                 company_id=record.company_id,
                 record_id=record.id,
-                event_status='create',
+                event_status="create",
             )
 
-        jobs = (
-            await session.execute(
-                select(MessageJob).order_by(MessageJob.id.asc())
-            )
-        ).scalars().all()
+        jobs = (await session.execute(select(MessageJob).order_by(MessageJob.id.asc()))).scalars().all()
 
         assert [j.job_type for j in jobs] == [
-            'record_created',
-            'reminder_2h',
-            'review_3d',
-            'repeat_10d',
+            "record_created",
+            "reminder_2h",
+            "review_3d",
+            "repeat_10d",
         ]
 
         reminder = jobs[1]
-        assert reminder.job_type == 'reminder_2h'
+        assert reminder.job_type == "reminder_2h"
         assert reminder.run_at == record.starts_at - timedelta(hours=2)
 
 
@@ -143,7 +131,7 @@ async def test_update_reschedules_system_jobs(session_maker):
                 company_id=1,
                 altegio_record_id=111,
                 client_id=10,
-                staff_name='Staff',
+                staff_name="Staff",
                 starts_at=now + timedelta(hours=25),
             )
             session.add(record)
@@ -153,7 +141,7 @@ async def test_update_reschedules_system_jobs(session_maker):
                 session,
                 company_id=record.company_id,
                 record_id=record.id,
-                event_status='create',
+                event_status="create",
             )
 
         async with session.begin():
@@ -162,31 +150,31 @@ async def test_update_reschedules_system_jobs(session_maker):
                 session,
                 company_id=record.company_id,
                 record_id=record.id,
-                event_status='update',
+                event_status="update",
             )
 
-        jobs = (
-            await session.execute(
-                select(MessageJob).order_by(MessageJob.id.asc())
-            )
-        ).scalars().all()
+        jobs = (await session.execute(select(MessageJob).order_by(MessageJob.id.asc()))).scalars().all()
 
-        canceled = [j.job_type for j in jobs if j.status == 'canceled']
-        queued = [j.job_type for j in jobs if j.status == 'queued']
+        canceled = [j.job_type for j in jobs if j.status == "canceled"]
+        queued = [j.job_type for j in jobs if j.status == "queued"]
 
-        assert sorted(canceled) == sorted([
-            'record_created',
-            'reminder_24h',
-            'review_3d',
-            'repeat_10d',
-        ])
+        assert sorted(canceled) == sorted(
+            [
+                "record_created",
+                "reminder_24h",
+                "review_3d",
+                "repeat_10d",
+            ]
+        )
 
-        assert sorted(queued) == sorted([
-            'record_updated',
-            'reminder_2h',
-            'review_3d',
-            'repeat_10d',
-        ])
+        assert sorted(queued) == sorted(
+            [
+                "record_updated",
+                "reminder_2h",
+                "review_3d",
+                "repeat_10d",
+            ]
+        )
 
 
 @pytest.mark.asyncio
@@ -201,7 +189,7 @@ async def test_delete_cancels_future_jobs_and_schedules_canceled_and_comeback(
                 company_id=1,
                 altegio_record_id=111,
                 client_id=10,
-                staff_name='Staff',
+                staff_name="Staff",
                 starts_at=now + timedelta(hours=25),
             )
             session.add(record)
@@ -211,7 +199,7 @@ async def test_delete_cancels_future_jobs_and_schedules_canceled_and_comeback(
                 session,
                 company_id=record.company_id,
                 record_id=record.id,
-                event_status='create',
+                event_status="create",
             )
 
         async with session.begin():
@@ -219,29 +207,29 @@ async def test_delete_cancels_future_jobs_and_schedules_canceled_and_comeback(
                 session,
                 company_id=record.company_id,
                 record_id=record.id,
-                event_status='delete',
+                event_status="delete",
             )
 
-        jobs = (
-            await session.execute(
-                select(MessageJob).order_by(MessageJob.id.asc())
-            )
-        ).scalars().all()
+        jobs = (await session.execute(select(MessageJob).order_by(MessageJob.id.asc()))).scalars().all()
 
-        canceled = [j.job_type for j in jobs if j.status == 'canceled']
-        queued = [j.job_type for j in jobs if j.status == 'queued']
+        canceled = [j.job_type for j in jobs if j.status == "canceled"]
+        queued = [j.job_type for j in jobs if j.status == "queued"]
 
-        assert sorted(canceled) == sorted([
-            'record_created',
-            'reminder_24h',
-            'review_3d',
-            'repeat_10d',
-        ])
+        assert sorted(canceled) == sorted(
+            [
+                "record_created",
+                "reminder_24h",
+                "review_3d",
+                "repeat_10d",
+            ]
+        )
 
-        assert sorted(queued) == sorted([
-            'record_canceled',
-            'comeback_3d',
-        ])
+        assert sorted(queued) == sorted(
+            [
+                "record_canceled",
+                "comeback_3d",
+            ]
+        )
 
-        comeback = [j for j in jobs if j.job_type == 'comeback_3d'][0]
+        comeback = [j for j in jobs if j.job_type == "comeback_3d"][0]
         assert comeback.run_at >= now + timedelta(days=3)

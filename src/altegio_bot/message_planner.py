@@ -10,16 +10,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from altegio_bot.models.models import Client, MessageJob, Record
 from altegio_bot.utils import utcnow
 
-RECORD_CREATED = 'record_created'
-RECORD_UPDATED = 'record_updated'
-RECORD_CANCELED = 'record_canceled'
+RECORD_CREATED = "record_created"
+RECORD_UPDATED = "record_updated"
+RECORD_CANCELED = "record_canceled"
 
-REMINDER_24H = 'reminder_24h'
-REMINDER_2H = 'reminder_2h'
+REMINDER_24H = "reminder_24h"
+REMINDER_2H = "reminder_2h"
 
-REVIEW_3D = 'review_3d'
-REPEAT_10D = 'repeat_10d'
-COMEBACK_3D = 'comeback_3d'
+REVIEW_3D = "review_3d"
+REPEAT_10D = "repeat_10d"
+COMEBACK_3D = "comeback_3d"
 
 SYSTEM_JOB_TYPES = (
     RECORD_CREATED,
@@ -47,23 +47,23 @@ def _normalize_event_status(value: str | None) -> str | None:
     if not v:
         return None
 
-    if v in ('create', 'created', 'record_created'):
-        return 'create'
+    if v in ("create", "created", "record_created"):
+        return "create"
 
-    if v in ('update', 'updated', 'record_updated'):
-        return 'update'
+    if v in ("update", "updated", "record_updated"):
+        return "update"
 
-    if v in ('delete', 'deleted', 'cancel', 'canceled', 'record_canceled'):
-        return 'delete'
+    if v in ("delete", "deleted", "cancel", "canceled", "record_canceled"):
+        return "delete"
 
     return None
 
 
 def _record_event_job_type(event_status: str) -> str:
-    if event_status == 'create':
+    if event_status == "create":
         return RECORD_CREATED
 
-    if event_status == 'update':
+    if event_status == "update":
         return RECORD_UPDATED
 
     return RECORD_CANCELED
@@ -77,7 +77,7 @@ def make_dedupe_key(
     run_at: datetime,
 ) -> str:
     rid = int(record_id) if record_id is not None else 0
-    return f'{job_type}:{company_id}:{rid}:{run_at.isoformat()}'
+    return f"{job_type}:{company_id}:{rid}:{run_at.isoformat()}"
 
 
 async def cancel_queued_jobs(
@@ -92,16 +92,16 @@ async def cancel_queued_jobs(
         .where(MessageJob.company_id == company_id)
         .where(MessageJob.record_id == record_id)
         .where(MessageJob.job_type.in_(SYSTEM_JOB_TYPES))
-        .where(MessageJob.status == 'queued')
+        .where(MessageJob.status == "queued")
         .values(
-            status='canceled',
+            status="canceled",
             updated_at=utcnow(),
             last_error=reason,
             locked_at=None,
         )
     )
     res = await session.execute(stmt)
-    return int(getattr(res, 'rowcount', 0) or 0)
+    return int(getattr(res, "rowcount", 0) or 0)
 
 
 async def add_job(
@@ -127,7 +127,7 @@ async def add_job(
         client_id=client_id,
         job_type=job_type,
         run_at=run_at,
-        status='queued',
+        status="queued",
         last_error=None,
         dedupe_key=dedupe_key,
         payload=payload,
@@ -137,13 +137,13 @@ async def add_job(
     stmt = stmt.on_conflict_do_update(
         index_elements=[MessageJob.dedupe_key],
         set_={
-            'status': 'queued',
-            'last_error': None,
-            'locked_at': None,
-            'payload': stmt.excluded.payload,
-            'updated_at': utcnow(),
+            "status": "queued",
+            "last_error": None,
+            "locked_at": None,
+            "payload": stmt.excluded.payload,
+            "updated_at": utcnow(),
         },
-        where=MessageJob.status.in_(('canceled', 'failed')),
+        where=MessageJob.status.in_(("canceled", "failed")),
     )
 
     await session.execute(stmt)
@@ -204,18 +204,14 @@ async def plan_jobs_for_record_event(
     if record_obj is None:
         return
 
-    cid = (
-        int(company_id)
-        if company_id is not None
-        else int(record_obj.company_id)
-    )
+    cid = int(company_id) if company_id is not None else int(record_obj.company_id)
 
     now = utcnow().replace(microsecond=0)
 
-    if norm_status in ('update', 'delete'):
-        reason = 'Canceled: rescheduled'
-        if norm_status == 'delete':
-            reason = 'Canceled: record deleted'
+    if norm_status in ("update", "delete"):
+        reason = "Canceled: rescheduled"
+        if norm_status == "delete":
+            reason = "Canceled: record deleted"
 
         await cancel_queued_jobs(
             session,
@@ -232,12 +228,12 @@ async def plan_jobs_for_record_event(
         client_id=record_obj.client_id,
         job_type=job_type,
         run_at=now,
-        payload={'kind': job_type},
+        payload={"kind": job_type},
     )
 
     starts_at = record_obj.starts_at
 
-    if norm_status in ('create', 'update') and starts_at is not None:
+    if norm_status in ("create", "update") and starts_at is not None:
         run_at_24h = starts_at - timedelta(hours=24)
         if run_at_24h > now:
             await add_job(
@@ -247,7 +243,7 @@ async def plan_jobs_for_record_event(
                 client_id=record_obj.client_id,
                 job_type=REMINDER_24H,
                 run_at=run_at_24h,
-                payload={'kind': REMINDER_24H},
+                payload={"kind": REMINDER_24H},
             )
 
         delta = starts_at - now
@@ -261,12 +257,12 @@ async def plan_jobs_for_record_event(
                     client_id=record_obj.client_id,
                     job_type=REMINDER_2H,
                     run_at=run_at_2h,
-                    payload={'kind': REMINDER_2H},
+                    payload={"kind": REMINDER_2H},
                 )
 
-    opted_out = bool(getattr(client_obj, 'wa_opted_out', False))
+    opted_out = bool(getattr(client_obj, "wa_opted_out", False))
 
-    if norm_status in ('create', 'update') and not opted_out:
+    if norm_status in ("create", "update") and not opted_out:
         if starts_at is not None:
             review_at = starts_at + timedelta(days=3)
             if review_at > now:
@@ -277,7 +273,7 @@ async def plan_jobs_for_record_event(
                     client_id=record_obj.client_id,
                     job_type=REVIEW_3D,
                     run_at=review_at,
-                    payload={'kind': REVIEW_3D},
+                    payload={"kind": REVIEW_3D},
                 )
 
             repeat_at = starts_at + timedelta(days=10)
@@ -289,10 +285,10 @@ async def plan_jobs_for_record_event(
                     client_id=record_obj.client_id,
                     job_type=REPEAT_10D,
                     run_at=repeat_at,
-                    payload={'kind': REPEAT_10D},
+                    payload={"kind": REPEAT_10D},
                 )
 
-    if norm_status == 'delete' and not opted_out:
+    if norm_status == "delete" and not opted_out:
         comeback_at = utcnow() + timedelta(days=3)
         await add_job(
             session,
@@ -301,5 +297,5 @@ async def plan_jobs_for_record_event(
             client_id=record_obj.client_id,
             job_type=COMEBACK_3D,
             run_at=comeback_at,
-            payload={'kind': COMEBACK_3D},
+            payload={"kind": COMEBACK_3D},
         )

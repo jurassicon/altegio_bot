@@ -1,4 +1,5 @@
 """Tests for the ops monitoring routes (/ops/*)."""
+
 from __future__ import annotations
 
 from collections.abc import AsyncGenerator
@@ -9,7 +10,6 @@ import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from starlette.requests import Request as StarletteRequest
-from starlette.datastructures import QueryParams
 
 import altegio_bot.ops.router as ops_router_module
 from altegio_bot.main import app
@@ -18,101 +18,97 @@ from altegio_bot.ops.auth import require_ops_auth
 from altegio_bot.ops.router import _period_params
 
 
-def _make_request(period: str | None = None, from_dt: str = '', to_dt: str = '') -> StarletteRequest:
+def _make_request(period: str | None = None, from_dt: str = "", to_dt: str = "") -> StarletteRequest:
     """Build a minimal Starlette Request with the given query params."""
     params: dict[str, str] = {}
     if period is not None:
-        params['period'] = period
+        params["period"] = period
     if from_dt:
-        params['from_dt'] = from_dt
+        params["from_dt"] = from_dt
     if to_dt:
-        params['to_dt'] = to_dt
+        params["to_dt"] = to_dt
     scope = {
-        'type': 'http',
-        'method': 'GET',
-        'path': '/ops/history',
-        'query_string': urlencode(params).encode(),
-        'headers': [],
+        "type": "http",
+        "method": "GET",
+        "path": "/ops/history",
+        "query_string": urlencode(params).encode(),
+        "headers": [],
     }
     return StarletteRequest(scope)
 
 
 @pytest_asyncio.fixture
-async def http_client(
-    session_maker, monkeypatch
-) -> AsyncGenerator[AsyncClient, None]:
+async def http_client(session_maker, monkeypatch) -> AsyncGenerator[AsyncClient, None]:
     """AsyncClient wired to the ASGI app with a test DB session."""
-    monkeypatch.setattr(ops_router_module, 'SessionLocal', session_maker)
+    monkeypatch.setattr(ops_router_module, "SessionLocal", session_maker)
     monkeypatch.setitem(app.dependency_overrides, require_ops_auth, lambda: None)
-    async with AsyncClient(
-        transport=ASGITransport(app=app), base_url='http://test'
-    ) as client:
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         yield client
 
 
 @pytest.mark.asyncio
 async def test_ops_monitoring_returns_200(http_client: AsyncClient) -> None:
-    response = await http_client.get('/ops/monitoring')
+    response = await http_client.get("/ops/monitoring")
     assert response.status_code == 200
-    assert 'Monitoring' in response.text
+    assert "Monitoring" in response.text
 
 
 @pytest.mark.asyncio
 async def test_ops_queue_returns_200(http_client: AsyncClient) -> None:
-    response = await http_client.get('/ops/queue')
+    response = await http_client.get("/ops/queue")
     assert response.status_code == 200
-    assert 'Queue' in response.text
+    assert "Queue" in response.text
 
 
 @pytest.mark.asyncio
 async def test_ops_history_returns_200(http_client: AsyncClient) -> None:
-    response = await http_client.get('/ops/history')
+    response = await http_client.get("/ops/history")
     assert response.status_code == 200
-    assert 'History' in response.text
+    assert "History" in response.text
 
 
 @pytest.mark.asyncio
 async def test_ops_wa_inbox_returns_200(http_client: AsyncClient) -> None:
-    response = await http_client.get('/ops/whatsapp/inbox')
+    response = await http_client.get("/ops/whatsapp/inbox")
     assert response.status_code == 200
-    assert 'WA Events' in response.text
+    assert "WA Events" in response.text
 
 
 @pytest.mark.asyncio
 async def test_ops_wa_inbox_tab_inbox(http_client: AsyncClient) -> None:
-    response = await http_client.get('/ops/whatsapp/inbox?tab=inbox')
+    response = await http_client.get("/ops/whatsapp/inbox?tab=inbox")
     assert response.status_code == 200
-    assert 'Inbox' in response.text
-    assert 'Delivery' in response.text
+    assert "Inbox" in response.text
+    assert "Delivery" in response.text
 
 
 @pytest.mark.asyncio
 async def test_ops_wa_delivery_tab(http_client: AsyncClient) -> None:
-    response = await http_client.get('/ops/whatsapp/inbox?tab=delivery')
+    response = await http_client.get("/ops/whatsapp/inbox?tab=delivery")
     assert response.status_code == 200
-    assert 'Status Msg ID' in response.text
-    assert 'Delivery' in response.text
+    assert "Status Msg ID" in response.text
+    assert "Delivery" in response.text
 
 
 @pytest.mark.asyncio
 async def test_ops_optouts_returns_200(http_client: AsyncClient) -> None:
-    response = await http_client.get('/ops/optouts')
+    response = await http_client.get("/ops/optouts")
     assert response.status_code == 200
-    assert 'Opt-outs' in response.text
+    assert "Opt-outs" in response.text
 
 
 @pytest.mark.asyncio
 async def test_ops_job_not_found(http_client: AsyncClient) -> None:
-    response = await http_client.get('/ops/job/9999999')
+    response = await http_client.get("/ops/job/9999999")
     assert response.status_code == 200
-    assert 'Job not found' in response.text
+    assert "Job not found" in response.text
 
 
 @pytest.mark.asyncio
 async def test_ops_record_not_found(http_client: AsyncClient) -> None:
-    response = await http_client.get('/ops/record/9999999')
+    response = await http_client.get("/ops/record/9999999")
     assert response.status_code == 200
-    assert 'Record not found' in response.text
+    assert "Record not found" in response.text
 
 
 @pytest.mark.asyncio
@@ -137,12 +133,12 @@ async def test_ops_job_shows_record_history(
             await session.flush()
 
             event = AltegioEvent(
-                dedupe_key='ev-42-create',
+                dedupe_key="ev-42-create",
                 company_id=1,
-                resource='record',
+                resource="record",
                 resource_id=42,
-                event_status='create',
-                status='processed',
+                event_status="create",
+                status="processed",
                 query={},
                 headers={},
                 payload={},
@@ -154,21 +150,21 @@ async def test_ops_job_shows_record_history(
                 company_id=1,
                 record_id=1,
                 client_id=1,
-                job_type='record_created',
+                job_type="record_created",
                 run_at=now,
-                status='done',
+                status="done",
                 attempts=1,
                 max_attempts=5,
-                dedupe_key='job-1',
+                dedupe_key="job-1",
                 payload={},
             )
             session.add(job)
 
-    response = await http_client.get('/ops/job/1')
+    response = await http_client.get("/ops/job/1")
     assert response.status_code == 200
-    assert 'Altegio Events for this Record' in response.text
-    assert 'All Jobs for this Record' in response.text
-    assert 'altegio: 42' in response.text
+    assert "Altegio Events for this Record" in response.text
+    assert "All Jobs for this Record" in response.text
+    assert "altegio: 42" in response.text
 
 
 @pytest.mark.asyncio
@@ -193,12 +189,12 @@ async def test_ops_record_shows_full_timeline(
             await session.flush()
 
             event = AltegioEvent(
-                dedupe_key='ev-99-delete',
+                dedupe_key="ev-99-delete",
                 company_id=1,
-                resource='record',
+                resource="record",
                 resource_id=99,
-                event_status='delete',
-                status='processed',
+                event_status="delete",
+                status="processed",
                 query={},
                 headers={},
                 payload={},
@@ -210,22 +206,22 @@ async def test_ops_record_shows_full_timeline(
                 company_id=1,
                 record_id=2,
                 client_id=1,
-                job_type='comeback_3d',
+                job_type="comeback_3d",
                 run_at=now,
-                status='queued',
+                status="queued",
                 attempts=0,
                 max_attempts=5,
-                dedupe_key='job-2',
+                dedupe_key="job-2",
                 payload={},
             )
             session.add(job)
 
-    response = await http_client.get('/ops/record/2')
+    response = await http_client.get("/ops/record/2")
     assert response.status_code == 200
-    assert 'Record #2' in response.text
-    assert 'Altegio Events' in response.text
-    assert 'Message Jobs' in response.text
-    assert 'comeback_3d' in response.text
+    assert "Record #2" in response.text
+    assert "Altegio Events" in response.text
+    assert "Message Jobs" in response.text
+    assert "comeback_3d" in response.text
 
 
 @pytest.mark.asyncio
@@ -242,8 +238,8 @@ async def test_ops_history_phone_search_with_country_code(
                 id=50,
                 company_id=1,
                 altegio_client_id=50,
-                display_name='Phone Test',
-                phone_e164='736855823',
+                display_name="Phone Test",
+                phone_e164="736855823",
                 raw={},
             )
             session.add(client)
@@ -252,11 +248,11 @@ async def test_ops_history_phone_search_with_country_code(
             msg = OutboxMessage(
                 company_id=1,
                 client_id=50,
-                phone_e164='736855823',
-                template_code='record_created',
-                language='de',
-                body='Test',
-                status='sent',
+                phone_e164="736855823",
+                template_code="record_created",
+                language="de",
+                body="Test",
+                status="sent",
                 scheduled_at=now,
                 sent_at=now,
                 meta={},
@@ -264,18 +260,14 @@ async def test_ops_history_phone_search_with_country_code(
             session.add(msg)
 
     # Search with country-code prefix: '491736855823' should find '736855823'
-    response = await http_client.get(
-        '/ops/history?' + urlencode({'phone_e164': '491736855823', 'period': '24h'})
-    )
+    response = await http_client.get("/ops/history?" + urlencode({"phone_e164": "491736855823", "period": "24h"}))
     assert response.status_code == 200
-    assert '736855823' in response.text
+    assert "736855823" in response.text
 
     # Searching without country code should also work
-    response2 = await http_client.get(
-        '/ops/history?' + urlencode({'phone_e164': '736855823', 'period': '24h'})
-    )
+    response2 = await http_client.get("/ops/history?" + urlencode({"phone_e164": "736855823", "period": "24h"}))
     assert response2.status_code == 200
-    assert '736855823' in response2.text
+    assert "736855823" in response2.text
 
 
 @pytest.mark.asyncio
@@ -286,7 +278,7 @@ async def test_ops_optouts_deduplication(
     """Optouts page shows one row per (company, phone) even when multiple client
     records share the same phone."""
     opted_out_at = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
-    phone = '+381638400431'
+    phone = "+381638400431"
     async with session_maker() as session:
         async with session.begin():
             # Three client records for the same company+phone
@@ -296,16 +288,16 @@ async def test_ops_optouts_deduplication(
                         id=cid,
                         company_id=1,
                         altegio_client_id=acid,
-                        display_name='Dup Test',
+                        display_name="Dup Test",
                         phone_e164=phone,
                         wa_opted_out=True,
                         wa_opted_out_at=opted_out_at,
-                        wa_opt_out_reason='wa:stop',
+                        wa_opt_out_reason="wa:stop",
                         raw={},
                     )
                 )
 
-    response = await http_client.get('/ops/optouts')
+    response = await http_client.get("/ops/optouts")
     assert response.status_code == 200
     # The phone should appear exactly once (deduplicated by company+phone)
     assert response.text.count(phone) == 1
@@ -315,8 +307,9 @@ async def test_ops_optouts_deduplication(
 # _period_params unit tests
 # ---------------------------------------------------------------------------
 
+
 def test_period_params_today() -> None:
-    req = _make_request('today')
+    req = _make_request("today")
     from_dt, to_dt = _period_params(req)
     now = datetime.now(timezone.utc)
     assert from_dt.hour == 0 and from_dt.minute == 0 and from_dt.second == 0
@@ -325,7 +318,7 @@ def test_period_params_today() -> None:
 
 
 def test_period_params_yesterday() -> None:
-    req = _make_request('yesterday')
+    req = _make_request("yesterday")
     from_dt, to_dt = _period_params(req)
     now = datetime.now(timezone.utc)
     yesterday = now - timedelta(days=1)
@@ -335,7 +328,7 @@ def test_period_params_yesterday() -> None:
 
 
 def test_period_params_last_7d() -> None:
-    req = _make_request('last_7d')
+    req = _make_request("last_7d")
     from_dt, to_dt = _period_params(req)
     now = datetime.now(timezone.utc)
     assert abs((to_dt - from_dt).days - 7) <= 1
@@ -343,7 +336,7 @@ def test_period_params_last_7d() -> None:
 
 
 def test_period_params_last_30d() -> None:
-    req = _make_request('last_30d')
+    req = _make_request("last_30d")
     from_dt, to_dt = _period_params(req)
     now = datetime.now(timezone.utc)
     assert abs((to_dt - from_dt).days - 30) <= 1
@@ -351,7 +344,7 @@ def test_period_params_last_30d() -> None:
 
 
 def test_period_params_this_week() -> None:
-    req = _make_request('this_week')
+    req = _make_request("this_week")
     from_dt, to_dt = _period_params(req)
     now = datetime.now(timezone.utc)
     # from_dt should be Monday of this week at midnight
@@ -361,7 +354,7 @@ def test_period_params_this_week() -> None:
 
 
 def test_period_params_last_week() -> None:
-    req = _make_request('last_week')
+    req = _make_request("last_week")
     from_dt, to_dt = _period_params(req)
     # Both bounds should be Mondays
     assert from_dt.weekday() == 0
@@ -371,7 +364,7 @@ def test_period_params_last_week() -> None:
 
 
 def test_period_params_this_month() -> None:
-    req = _make_request('this_month')
+    req = _make_request("this_month")
     from_dt, to_dt = _period_params(req)
     now = datetime.now(timezone.utc)
     assert from_dt.day == 1
@@ -381,7 +374,7 @@ def test_period_params_this_month() -> None:
 
 
 def test_period_params_last_month() -> None:
-    req = _make_request('last_month')
+    req = _make_request("last_month")
     from_dt, to_dt = _period_params(req)
     now = datetime.now(timezone.utc)
     first_of_this_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
@@ -391,14 +384,13 @@ def test_period_params_last_month() -> None:
 
 
 def test_period_params_legacy_24h() -> None:
-    req = _make_request('24h')
+    req = _make_request("24h")
     from_dt, to_dt = _period_params(req)
-    now = datetime.now(timezone.utc)
     assert abs((to_dt - from_dt).total_seconds() - 86400) < 2
 
 
 def test_period_params_legacy_7d() -> None:
-    req = _make_request('7d')
+    req = _make_request("7d")
     from_dt, to_dt = _period_params(req)
     assert abs((to_dt - from_dt).days - 7) <= 1
 
@@ -413,8 +405,7 @@ def test_period_params_default_no_period() -> None:
 @pytest.mark.asyncio
 async def test_ops_history_default_period_is_today(http_client: AsyncClient) -> None:
     """The /ops/history page should default to period=today (not 24h)."""
-    response = await http_client.get('/ops/history')
+    response = await http_client.get("/ops/history")
     assert response.status_code == 200
     # The period select should have 'today' selected by default
     assert 'value="today" selected' in response.text
-

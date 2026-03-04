@@ -9,8 +9,8 @@ from altegio_bot.workers.outbox_worker import run_loop
 
 
 def _provider_from_env():
-    key = os.getenv('WHATSAPP_PROVIDER', 'dummy').strip().lower()
-    if key == 'meta_cloud':
+    key = os.getenv("WHATSAPP_PROVIDER", "dummy").strip().lower()
+    if key == "meta_cloud":
         return MetaCloudProvider()
     return DummyProvider()
 
@@ -20,10 +20,10 @@ async def main() -> None:
     try:
         await run_loop(provider=provider)
     finally:
-        aclose = getattr(provider, 'aclose', None)
+        aclose = getattr(provider, "aclose", None)
         if callable(aclose):
             await aclose()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     asyncio.run(main())

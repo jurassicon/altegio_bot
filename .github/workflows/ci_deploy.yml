@@ -89,23 +89,24 @@ jobs:
             echo "📦 Fetching new code..."
             git fetch origin main
             git reset --hard origin/main
-
-            echo "🧹 Cleaning up old containers to avoid metadata conflicts..."
-            docker-compose down
             
-            echo "🚀 Starting services via Docker Compose..."
-            docker-compose up -d --build
+            # Мы не делаем 'down', чтобы не прерывать работу базы данных без нужды.
+            # 'up -d' сам перезапустит только те контейнеры, где изменился код или настройки.
+            echo "🚀 Deployment with Orphan removal..."
+            docker compose up -d --build --remove-orphans
             
-            # Ожидаем несколько секунд, чтобы API успел проинициализироваться
+            # Ожидаем готовности API
             sleep 5
             
             echo "init Migrations..."
             docker exec altegio_bot_altegio-api_1 /app/.venv/bin/alembic upgrade head
             
-            echo "✅ Deployment successful! Current status:"
-            docker-compose ps
+            echo "🧹 Aggressive cleanup of unused images..."
+            # Флаг -a удаляет все образы, которые не используются запущенными контейнерами
+            docker image prune -af
             
-            docker image prune -f
+            echo "✅ Done! Containers status:"
+            docker compose ps
 
   notify:
     needs: [tests, deploy]

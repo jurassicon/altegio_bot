@@ -484,8 +484,10 @@ def test_process_job_fails_when_no_template_in_auto_mode(
     monkeypatch.setattr(ow, "safe_send_template", fake_safe_send)
     # Force auto mode (default, but be explicit)
     from altegio_bot.settings import Settings
+
     monkeypatch.setattr(
-        ow, "settings",
+        ow,
+        "settings",
         Settings.model_construct(whatsapp_send_mode="auto"),
     )
 
@@ -549,8 +551,10 @@ def test_process_job_sends_text_when_mode_is_text(
     monkeypatch.setattr(ow, "utcnow", lambda: fixed_now)
     monkeypatch.setattr(ow, "OutboxMessage", FakeOutbox)
     from altegio_bot.settings import Settings
+
     monkeypatch.setattr(
-        ow, "settings",
+        ow,
+        "settings",
         Settings.model_construct(whatsapp_send_mode="text"),
     )
 

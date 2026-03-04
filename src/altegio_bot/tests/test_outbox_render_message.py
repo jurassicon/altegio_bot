@@ -68,13 +68,7 @@ def run(coro: Any) -> Any:
 
 def test_render_message_renders_services_and_total_cost(monkeypatch: Any) -> None:
     tmpl = FakeTemplate(
-        body=(
-            "Hello {client_name}\n"
-            "Date {date} Time {time}\n"
-            "{services}\n"
-            "Total {total_cost}\n"
-            "Sender {sender_id}\n"
-        )
+        body=("Hello {client_name}\nDate {date} Time {time}\n{services}\nTotal {total_cost}\nSender {sender_id}\n")
     )
 
     async def fake_load_template(*args: Any, **kwargs: Any) -> tuple[Any, str]:
@@ -126,9 +120,7 @@ def test_render_message_renders_services_and_total_cost(monkeypatch: Any) -> Non
 
 
 def test_render_message_adds_notes_for_new_client(monkeypatch: Any) -> None:
-    tmpl = FakeTemplate(
-        body="Hi {client_name}{pre_appointment_notes}\nSender {sender_id}\n"
-    )
+    tmpl = FakeTemplate(body="Hi {client_name}{pre_appointment_notes}\nSender {sender_id}\n")
 
     async def fake_load_template(*args: Any, **kwargs: Any) -> tuple[Any, str]:
         return tmpl, "de"
@@ -223,13 +215,13 @@ def test_fmt_time_uses_configured_local_timezone(monkeypatch: Any) -> None:
     # 10:00 UTC = 11:00 in UTC+1 (Europe/Belgrade winter time)
     dt_utc = datetime(2026, 2, 27, 10, 0, tzinfo=timezone.utc)
 
-    fake_settings = Settings.model_construct(ops_local_tz='Europe/Belgrade')
-    monkeypatch.setattr(ow_module, 'settings', fake_settings)
+    fake_settings = Settings.model_construct(ops_local_tz="Europe/Belgrade")
+    monkeypatch.setattr(ow_module, "settings", fake_settings)
 
-    assert ow_module._fmt_time(dt_utc) == '11:00'
-    assert ow_module._fmt_date(dt_utc) == '27.02.2026'
+    assert ow_module._fmt_time(dt_utc) == "11:00"
+    assert ow_module._fmt_date(dt_utc) == "27.02.2026"
 
 
 def test_fmt_time_returns_empty_for_none() -> None:
-    assert ow._fmt_time(None) == ''
-    assert ow._fmt_date(None) == ''
+    assert ow._fmt_time(None) == ""
+    assert ow._fmt_date(None) == ""
