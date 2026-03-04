@@ -27,7 +27,7 @@ from altegio_bot.models.models import (
     RecordService,
 )
 from altegio_bot.providers.base import WhatsAppProvider
-from altegio_bot.providers.dummy import DummyProvider, safe_send, safe_send_template
+from altegio_bot.providers.dummy import safe_send, safe_send_template
 from altegio_bot.settings import settings
 from altegio_bot.whatsapp_routing import pick_sender_code_for_record, pick_sender_id
 
