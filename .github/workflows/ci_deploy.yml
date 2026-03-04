@@ -111,36 +111,51 @@ jobs:
           port: ${{ secrets.SSH_PORT }}
           script: |
             set -euo pipefail
-
+            
             cd /opt/altegio_bot
-
+            
             echo "📦 Fetching new code..."
             git fetch origin main
             git reset --hard origin/main
-
+            
             echo "🚀 Deployment with Orphan removal..."
+            # Запускаем сборку и старт
             docker compose up -d --build --remove-orphans
-
+            
+            # --- Улучшенное ожидание базы данных ---
             echo "⏳ Waiting for Postgres to be healthy..."
-            ATTEMPTS=0
+            
+            # Мы ищем контейнер по метке сервиса, это надежнее, чем имя
             MAX_ATTEMPTS=60
-            until [ "$(docker inspect -f '{{.State.Health.Status}}' altegio_bot_postgres_1)" == "healthy" ]; do
+            ATTEMPTS=0
+            
+            until [ $ATTEMPTS -ge $MAX_ATTEMPTS ]; do
+
+                STATUS=$(docker ps --filter "name=postgres" --format "{{.Status}}" | grep -o "healthy" || echo "not ready")
+            
+                if [ "$STATUS" == "healthy" ]; then
+                    echo "✅ Postgres is ready!"
+                    break
+                fi
+            
                 ATTEMPTS=$((ATTEMPTS + 1))
+                echo "... waiting ($ATTEMPTS/$MAX_ATTEMPTS) ..."
+                sleep 1
+            
                 if [ $ATTEMPTS -ge $MAX_ATTEMPTS ]; then
                     echo "❌ ERROR: Postgres did not become healthy in time"
                     exit 1
                 fi
-                echo "... waiting ($ATTEMPTS/$MAX_ATTEMPTS) ..."
-                sleep 1
             done
-            echo "✅ Postgres is ready!"
-
+            
             echo "⚙️ Applying DB Migrations..."
-            docker exec altegio_bot_altegio-api_1 /app/.venv/bin/alembic upgrade head
-
+            # Находим имя API контейнера динамически
+            API_CONTAINER=$(docker ps --filter "name=altegio-api" --format "{{.Names}}")
+            docker exec "$API_CONTAINER" /app/.venv/bin/alembic upgrade head
+            
             echo "🧹 Aggressive cleanup of unused images..."
             docker image prune -af
-
+            
             echo "✅ Done! Containers status:"
             docker compose ps
 
