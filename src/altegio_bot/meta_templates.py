@@ -61,11 +61,11 @@ META_TEMPLATE_MAP: dict[tuple[int, str], str] = {
     # --- Rastatt ---
     # ra_record_created_v1 exists; others fall back to ka_* templates
     (_RA, "record_created"): "kitilash_ra_record_created_v1",
-    (_RA, "record_updated"): "kitilash_ka_record_updated_v1",
-    (_RA, "record_canceled"): "kitilash_ka_record_canceled_v1",
-    (_RA, "reminder_24h"): "kitilash_ka_reminder_24h_v1",
-    (_RA, "reminder_2h"): "kitilash_ka_reminder_2h_v1",
-    (_RA, "review_3d"): "kitilash_ka_review_3d_v1",
+    (_RA, "record_updated"): "kitilash_ra_record_updated_v1",
+    (_RA, "record_canceled"): "kitilash_ra_record_canceled_v1",
+    (_RA, "reminder_24h"): "kitilash_ra_reminder_24h_v1",
+    (_RA, "reminder_2h"): "kitilash_ra_reminder_2h_v1",
+    (_RA, "review_3d"): "kitilash_ra_review_3d_v1",
     (_RA, "repeat_10d"): "kitilash_ka_repeat_10d_v1",
     (_RA, "comeback_3d"): "kitilash_ka_comeback_3d_v1",
     (_RA, "newsletter_new_clients_monthly"): "kitilash_ka_newsletter_new_clients_monthly_v2",
@@ -73,10 +73,18 @@ META_TEMPLATE_MAP: dict[tuple[int, str], str] = {
 
 # Karlsruhe new-client variant for record_created
 _KA_NEW_CLIENT_TEMPLATE = "kitilash_ka_record_created_new_client_v1"
+_RA_NEW_CLIENT_TEMPLATE = "kitilash_ra_record_created_new_client_v1"
 
 # Branch-specific job types that have a dedicated ra_* template in Meta WABA.
 # All other branch-specific Rastatt types fall back to ka_* (logged as WARNING).
-_RA_DEDICATED: frozenset[str] = frozenset({"record_created"})
+_RA_DEDICATED: frozenset[str] = frozenset({
+    "record_created",
+    "record_updated",
+    "record_canceled",
+    "reminder_24h",
+    "reminder_2h",
+    "review_3d"
+})
 
 
 def resolve_meta_template(
@@ -100,6 +108,8 @@ def resolve_meta_template(
     """
     if company_id == _KA and job_type == "record_created" and is_new_client:
         return _KA_NEW_CLIENT_TEMPLATE
+    if company_id == _RA and job_type == "record_created" and is_new_client:
+        return _RA_NEW_CLIENT_TEMPLATE
 
     name = META_TEMPLATE_MAP.get((company_id, job_type))
 
@@ -141,6 +151,7 @@ def build_template_params(
         "kitilash_ka_record_created_v1",
         "kitilash_ka_record_created_new_client_v1",
         "kitilash_ra_record_created_v1",
+        "kitilash_ra_record_created_new_client_v1",
     ):
         return [
             ctx.get("client_name", ""),
@@ -152,7 +163,7 @@ def build_template_params(
             ctx.get("short_link", ""),
         ]
 
-    if n == "kitilash_ka_record_updated_v1":
+    if n in ("kitilash_ka_record_updated_v1", "kitilash_ra_record_updated_v1"):
         return [
             ctx.get("client_name", ""),
             ctx.get("staff_name", ""),
@@ -163,7 +174,7 @@ def build_template_params(
             ctx.get("short_link", ""),
         ]
 
-    if n == "kitilash_ka_record_canceled_v1":
+    if n in ("kitilash_ka_record_canceled_v1", "kitilash_ra_record_canceled_v1"):
         return [
             ctx.get("client_name", ""),
             ctx.get("date", ""),
@@ -172,7 +183,12 @@ def build_template_params(
             ctx.get("booking_link", ""),
         ]
 
-    if n in ("kitilash_ka_reminder_24h_v1", "kitilash_ka_reminder_2h_v1"):
+    if n in (
+            "kitilash_ka_reminder_24h_v1",
+            "kitilash_ka_reminder_2h_v1",
+            "kitilash_ra_reminder_24h_v1",
+            "kitilash_ra_reminder_2h_v1"
+    ):
         return [
             ctx.get("client_name", ""),
             ctx.get("staff_name", ""),
@@ -182,7 +198,7 @@ def build_template_params(
             ctx.get("short_link", ""),
         ]
 
-    if n == "kitilash_ka_review_3d_v1":
+    if n in ("kitilash_ka_review_3d_v1", "kitilash_ra_review_3d_v1"):
         return [
             ctx.get("client_name", ""),
             ctx.get("short_link", ""),
