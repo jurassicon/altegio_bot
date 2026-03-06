@@ -204,7 +204,9 @@ async def plan_jobs_for_record_event(
     if record_obj is None:
         return
 
-    cid = int(company_id) if company_id is not None else int(record_obj.company_id)
+    cid = int(company_id) if company_id is not None else int(
+        record_obj.company_id
+    )
 
     now = utcnow().replace(microsecond=0)
 
@@ -289,13 +291,33 @@ async def plan_jobs_for_record_event(
                 )
 
     if norm_status == "delete" and not opted_out:
-        comeback_at = utcnow() + timedelta(days=3)
-        await add_job(
-            session,
-            company_id=cid,
-            record_id=int(record_obj.id),
-            client_id=record_obj.client_id,
-            job_type=COMEBACK_3D,
-            run_at=comeback_at,
-            payload={"kind": COMEBACK_3D},
-        )
+        already_queued = False
+
+        # Дедупликация на входе: проверяем, нет ли уже такой задачи в очереди
+        if record_obj.client_id is not None:
+            from sqlalchemy import select
+
+            stmt = (
+                select(MessageJob.id)
+                .where(MessageJob.company_id == cid)
+                .where(MessageJob.client_id == record_obj.client_id)
+                .where(MessageJob.job_type == COMEBACK_3D)
+                .where(MessageJob.status == "queued")
+                .limit(1)
+            )
+            res = await session.execute(stmt)
+            if res.scalar_one_or_none() is not None:
+                already_queued = True
+
+        # Создаем задачу только если дубликатов нет
+        if not already_queued:
+            comeback_at = utcnow() + timedelta(days=3)
+            await add_job(
+                session,
+                company_id=cid,
+                record_id=int(record_obj.id),
+                client_id=record_obj.client_id,
+                job_type=COMEBACK_3D,
+                run_at=comeback_at,
+                payload={"kind": COMEBACK_3D},
+            )
