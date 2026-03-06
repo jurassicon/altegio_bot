@@ -204,9 +204,7 @@ async def plan_jobs_for_record_event(
     if record_obj is None:
         return
 
-    cid = int(company_id) if company_id is not None else int(
-        record_obj.company_id
-    )
+    cid = int(company_id) if company_id is not None else int(record_obj.company_id)
 
     now = utcnow().replace(microsecond=0)
 
