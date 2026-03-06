@@ -364,7 +364,9 @@ async def _print_job_state(session: AsyncSession, job_id: int) -> None:
     print(f"job_error={job.last_error!r}")
 
     stmt = (
-        select(ow.OutboxMessage).where(ow.OutboxMessage.job_id == job.id).order_by(ow.OutboxMessage.id.desc()).limit(1)
+        select(ow.OutboxMessage).where(
+            ow.OutboxMessage.job_id == job.id
+        ).order_by(ow.OutboxMessage.id.desc()).limit(1)
     )
     res = await session.execute(stmt)
     out = res.scalar_one_or_none()
