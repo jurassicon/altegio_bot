@@ -142,7 +142,10 @@ async def _find_existing_outbox(
     session: AsyncSession,
     job_id: int,
 ) -> OutboxMessage | None:
-    stmt = select(OutboxMessage).where(OutboxMessage.job_id == job_id).order_by(OutboxMessage.id.desc()).limit(1)
+    stmt = select(OutboxMessage).where(
+        OutboxMessage.job_id == job_id
+    ).order_by(OutboxMessage.id.desc()).limit(1)
+
     res = await session.execute(stmt)
     return res.scalar_one_or_none()
 
@@ -249,7 +252,10 @@ async def _apply_rate_limit(
         {"phone_e164": phone_e164, "next_allowed_at": now},
     )
 
-    stmt = select(ContactRateLimit).where(ContactRateLimit.phone_e164 == phone_e164).with_for_update()
+    stmt = select(ContactRateLimit).where(
+        ContactRateLimit.phone_e164 == phone_e164
+    ).with_for_update()
+
     res = await session.execute(stmt)
     rl = res.scalar_one()
 
@@ -365,7 +371,9 @@ async def _render_message(
         language=language,
     )
     if tmpl is None:
-        raise ValueError(f"Template not found: company={company_id} code={template_code}")
+        raise ValueError(
+            f"Template not found: company={company_id} code={template_code}"
+        )
 
     services_text = ""
     primary_service = ""
@@ -373,7 +381,9 @@ async def _render_message(
 
     if record is not None:
         svc_stmt = (
-            select(RecordService).where(RecordService.record_id == record.id).order_by(RecordService.service_id.asc())
+            select(RecordService).where(
+                RecordService.record_id == record.id
+            ).order_by(RecordService.service_id.asc())
         )
         svc_res = await session.execute(svc_stmt)
         services = list(svc_res.scalars().all())
@@ -406,7 +416,9 @@ async def _render_message(
         sender_code=sender_code,
     )
     if sender_id is None:
-        raise ValueError(f"No active sender for company={company_id} code={sender_code}")
+        raise ValueError(
+            f"No active sender for company={company_id} code={sender_code}"
+        )
 
     pre_appointment_notes = ""
     if template_code == "record_created" and record is not None and used_lang == "de":
@@ -444,7 +456,10 @@ async def _load_job(
     session: AsyncSession,
     job_id: int,
 ) -> MessageJob | None:
-    stmt = select(MessageJob).where(MessageJob.id == job_id).with_for_update(skip_locked=True)
+    stmt = select(MessageJob).where(
+        MessageJob.id == job_id
+    ).with_for_update(skip_locked=True)
+
     res = await session.execute(stmt)
     job = res.scalar_one_or_none()
     if job is not None:
@@ -542,6 +557,48 @@ async def process_job_in_session(
             job.last_error = "Skipped: record is deleted"
             return
 
+        if client is not None:
+            # Правило 1: Есть ли у клиента активная будущая запись?
+            future_stmt = (
+                select(Record.id)
+                .where(Record.company_id == job.company_id)
+                .where(Record.client_id == client.id)
+                .where(Record.is_deleted.is_(False))
+                .where(Record.starts_at > utcnow())
+                .limit(1)
+            )
+            future_res = await session.execute(future_stmt)
+            if future_res.scalar_one_or_none() is not None:
+                job.status = "canceled"
+                job.locked_at = None
+                job.last_error = (
+                    "Skipped: client already "
+                    "has a future appointment"
+                )
+                return
+
+            # Правило 2: Не спамить частыми отменами (кулдаун 30 дней)
+            cutoff_30d = utcnow() - timedelta(days=30)
+            sent_stmt = (
+                select(OutboxMessage.id)
+                .where(OutboxMessage.company_id == job.company_id)
+                .where(OutboxMessage.client_id == client.id)
+                .where(OutboxMessage.template_code == "comeback_3d")
+                .where(OutboxMessage.status.in_(SUCCESS_OUTBOX_STATUSES))
+                .where(OutboxMessage.sent_at > cutoff_30d)
+                .limit(1)
+            )
+            sent_res = await session.execute(sent_stmt)
+            if sent_res.scalar_one_or_none() is not None:
+                job.status = "canceled"
+                job.locked_at = None
+                job.last_error = (
+                    "Skipped: comeback_3d already"
+                    " sent in the last 30 days"
+                )
+                return
+
+
     if job.job_type == "comeback_3d":
         if record is None or not record.is_deleted:
             job.status = "canceled"
@@ -599,7 +656,10 @@ async def process_job_in_session(
         return
 
     # Inject job-payload extras that templates may reference.
-    loyalty_card_text = (getattr(job, "payload", None) or {}).get("loyalty_card_text", "")
+    loyalty_card_text = (
+            getattr(job, "payload", None) or {}
+    ).get("loyalty_card_text", "")
+
     if loyalty_card_text:
         msg_ctx["loyalty_card_text"] = loyalty_card_text
 
@@ -625,9 +685,13 @@ async def process_job_in_session(
             # Exception: text mode always allows free-form sends.
             job.status = "failed"
             job.locked_at = None
-            job.last_error = f"No Meta template for company={job.company_id} job_type={job.job_type}"
+            job.last_error = (
+                f"No Meta template for company={job.company_id} "
+                "job_type={job.job_type}"
+            )
             logger.error(
-                "No Meta template for company=%s job_type=%s; failing job_id=%s (send_mode=%s)",
+                "No Meta template for company=%s job_type=%s; "
+                "failing job_id=%s (send_mode=%s)",
                 job.company_id,
                 job.job_type,
                 job.id,
@@ -727,7 +791,8 @@ async def process_job_in_session(
     job.last_error = None
 
     logger.info(
-        "Outbox sent job_id=%s outbox_id=%s sender_id=%s phone=%s send_type=%s template=%s",
+        "Outbox sent job_id=%s outbox_id=%s "
+        "sender_id=%s phone=%s send_type=%s template=%s",
         job.id,
         getattr(out, "id", None),
         sender_id,
@@ -793,7 +858,8 @@ async def run_loop(
                             await _requeue_processing_jobs(session, remaining)
 
                 logger.error(
-                    "Stopping outbox worker: access token expired (requeued %s jobs)",
+                    "Stopping outbox worker: access "
+                    "token expired (requeued %s jobs)",
                     len(remaining),
                 )
                 return
@@ -826,7 +892,9 @@ async def run_once(
         ids = list(res.scalars().all())
 
         for job_id in ids:
-            await process_job_in_session(session, int(job_id), provider=provider)
+            await process_job_in_session(
+                session, int(job_id), provider=provider
+            )
 
         await session.commit()
         return len(ids)
