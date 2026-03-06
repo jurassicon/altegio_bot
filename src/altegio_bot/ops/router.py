@@ -2435,9 +2435,11 @@ async def ops_monitoring() -> str:
 
     warnings = []
     if altegio_warn:
-        warnings.append(f"⚠️ Last Altegio webhook > 15 minutes ago at {_fmt_dt(altegio_last, tz)}")
+        _al_ts = altegio_last.replace(tzinfo=timezone.utc).astimezone(tz).strftime("%Y-%m-%d %H:%M") if altegio_last else "—"
+        warnings.append(f"⚠️ Last Altegio webhook > 15 minutes ago at {_al_ts}")
     if wa_warn:
-        warnings.append(f"⚠️ Last WhatsApp webhook > 15 minutes ago at {_fmt_dt(wa_last, tz)}")
+        _wa_ts = wa_last.replace(tzinfo=timezone.utc).astimezone(tz).strftime("%Y-%m-%d %H:%M") if wa_last else "—"
+        warnings.append(f"⚠️ Last WhatsApp webhook > 15 minutes ago at {_wa_ts}")
     if total_stuck > 0:
         warnings.append(f"⚠️ {total_stuck} stuck processing job(s)")
     if ob_warn:
