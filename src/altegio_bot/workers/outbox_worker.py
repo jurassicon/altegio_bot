@@ -545,47 +545,54 @@ async def process_job_in_session(
             job.last_error = "Skipped: record is deleted"
             return
 
-        if client is not None:
-            # Правило 1: Есть ли у клиента активная будущая запись?
-            future_stmt = (
-                select(Record.id)
-                .where(Record.company_id == job.company_id)
-                .where(Record.client_id == client.id)
-                .where(Record.is_deleted.is_(False))
-                .where(Record.starts_at > utcnow())
-                .limit(1)
-            )
-            future_res = await session.execute(future_stmt)
-            if future_res.scalar_one_or_none() is not None:
-                job.status = "canceled"
-                job.locked_at = None
-                job.last_error = "Skipped: client already has a future appointment"
-                return
-
-            # Правило 2: Не спамить частыми отменами (кулдаун 30 дней)
-            cutoff_30d = utcnow() - timedelta(days=30)
-            sent_stmt = (
-                select(OutboxMessage.id)
-                .where(OutboxMessage.company_id == job.company_id)
-                .where(OutboxMessage.client_id == client.id)
-                .where(OutboxMessage.template_code == "comeback_3d")
-                .where(OutboxMessage.status.in_(SUCCESS_OUTBOX_STATUSES))
-                .where(OutboxMessage.sent_at > cutoff_30d)
-                .limit(1)
-            )
-            sent_res = await session.execute(sent_stmt)
-            if sent_res.scalar_one_or_none() is not None:
-                job.status = "canceled"
-                job.locked_at = None
-                job.last_error = "Skipped: comeback_3d already sent in the last 30 days"
-                return
-
     if job.job_type == "comeback_3d":
         if record is None or not record.is_deleted:
             job.status = "canceled"
             job.locked_at = None
             job.last_error = "Skipped: record is not deleted"
             return
+
+        if job.job_type == "comeback_3d":
+            if record is None or not record.is_deleted:
+                job.status = "canceled"
+                job.locked_at = None
+                job.last_error = "Skipped: record is not deleted"
+                return
+
+            if client is not None:
+                # Правило 1: Есть ли у клиента активная будущая запись?
+                future_stmt = (
+                    select(Record.id)
+                    .where(Record.company_id == job.company_id)
+                    .where(Record.client_id == client.id)
+                    .where(Record.is_deleted.is_(False))
+                    .where(Record.starts_at > utcnow())
+                    .limit(1)
+                )
+                future_res = await session.execute(future_stmt)
+                if future_res.scalar_one_or_none() is not None:
+                    job.status = "canceled"
+                    job.locked_at = None
+                    job.last_error = "Skipped: client already has a future appointment"
+                    return
+
+                # Правило 2: Не спамить частыми отменами (кулдаун 30 дней)
+                cutoff_30d = utcnow() - timedelta(days=30)
+                sent_stmt = (
+                    select(OutboxMessage.id)
+                    .where(OutboxMessage.company_id == job.company_id)
+                    .where(OutboxMessage.client_id == client.id)
+                    .where(OutboxMessage.template_code == "comeback_3d")
+                    .where(OutboxMessage.status.in_(SUCCESS_OUTBOX_STATUSES))
+                    .where(OutboxMessage.sent_at > cutoff_30d)
+                    .limit(1)
+                )
+                sent_res = await session.execute(sent_stmt)
+                if sent_res.scalar_one_or_none() is not None:
+                    job.status = "canceled"
+                    job.locked_at = None
+                    job.last_error = "Skipped: comeback_3d already sent in the last 30 days"
+                    return
 
     if job.job_type in ("review_3d", "repeat_10d"):
         if not _record_attended(record):
