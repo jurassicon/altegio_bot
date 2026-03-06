@@ -2435,7 +2435,9 @@ async def ops_monitoring() -> str:
 
     warnings = []
     if altegio_warn:
-        _al_ts = altegio_last.replace(tzinfo=timezone.utc).astimezone(tz).strftime("%Y-%m-%d %H:%M") if altegio_last else "—"
+        _al_ts = (
+            altegio_last.replace(tzinfo=timezone.utc).astimezone(tz).strftime("%Y-%m-%d %H:%M") if altegio_last else "—"
+        )
         warnings.append(f"⚠️ Last Altegio webhook > 15 minutes ago at {_al_ts}")
     if wa_warn:
         _wa_ts = wa_last.replace(tzinfo=timezone.utc).astimezone(tz).strftime("%Y-%m-%d %H:%M") if wa_last else "—"
