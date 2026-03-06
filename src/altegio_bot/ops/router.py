@@ -177,18 +177,26 @@ def _page(title: str, body: str) -> str:
 </html>"""
 
 
-def _filter_form(action: str, fields: list[tuple[str, str, str, str]]) -> str:
+def _filter_form(
+    action: str,
+    fields: list[tuple[str, str, str, str]],
+    hidden: dict[str, str] | None = None,
+) -> str:
     """
     fields: list of (name, label, type, current_value)
     type: text | select:opt1,opt2,...
+    hidden: optional dict of name -> value for hidden inputs (e.g. tab preservation)
     """
     parts = [f'<form method="get" action="{action}" class="row g-2 mb-3 align-items-end">']
+    for name, val in (hidden or {}).items():
+        parts.append(f'<input type="hidden" name="{_esc(name)}" value="{_esc(val)}">')
     for name, label, ftype, val in fields:
         parts.append('<div class="col-auto">')
         parts.append(f'<label class="form-label small mb-1">{_esc(label)}</label>')
         if ftype.startswith("select:"):
             options_str = ftype[7:]
-            options = [""] + options_str.split(",")
+            options_list = options_str.split(",")
+            options = options_list if (options_list and options_list[0] == "") else [""] + options_list
             sel = f'<select name="{name}" class="form-select form-select-sm">'
             for o in options:
                 selected = " selected" if o == val else ""
@@ -1420,6 +1428,7 @@ async def ops_wa_inbox(request: Request) -> str:
                 ("pni", "Phone Number ID", "text", pni_filter),
                 ("period", "Period", "select:24h,today,7d", period),
             ],
+            hidden={"tab": "delivery"},
         )
         cols = ["Status Msg ID", "Status", "PNI", "Err Code", "Err Details", "Last Seen", "Count"]
         table_rows = []
@@ -2426,9 +2435,9 @@ async def ops_monitoring() -> str:
 
     warnings = []
     if altegio_warn:
-        warnings.append("⚠️ Last Altegio webhook > 15 minutes ago")
+        warnings.append(f"⚠️ Last Altegio webhook > 15 minutes ago at {_fmt_dt(altegio_last, tz)}")
     if wa_warn:
-        warnings.append("⚠️ Last WhatsApp webhook > 15 minutes ago")
+        warnings.append(f"⚠️ Last WhatsApp webhook > 15 minutes ago at {_fmt_dt(wa_last, tz)}")
     if total_stuck > 0:
         warnings.append(f"⚠️ {total_stuck} stuck processing job(s)")
     if ob_warn:
