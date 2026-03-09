@@ -142,11 +142,18 @@ class ChatwootClient:
     ) -> int:
         """Post a message to a conversation. Returns the message ID."""
         url = self._api(f"/conversations/{conversation_id}/messages")
+
+        # Формируем тело без поля private
         body: dict[str, Any] = {
             "content": content,
             "message_type": message_type,
-            "private": private,
         }
+
+        # Chatwoot выдает 422, если отправить поле private для входящих сообщений,
+        # поэтому добавляем его ТОЛЬКО для исходящих/заметок.
+        if message_type == "outgoing":
+            body["private"] = private
+
         res = await self._client.post(url, headers=self._headers(), json=body)
         res.raise_for_status()
         data: dict[str, Any] = res.json()
@@ -172,11 +179,10 @@ class ChatwootClient:
             name=contact_name,
         )
         conversation_id = await self.get_or_create_conversation(contact_id)
-        note_content = f"👤 [ВХОДЯЩЕЕ ОТ КЛИЕНТА]:\n{content}"
+
         message_id = await self.send_message(
             conversation_id,
-            note_content,
-            message_type="outgoing",
-            private=True,
+            content,
+            message_type="incoming",
         )
         return conversation_id, message_id
