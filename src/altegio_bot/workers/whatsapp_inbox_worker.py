@@ -246,8 +246,6 @@ def _extract_actions(payload: dict[str, Any]) -> list[dict[str, Any]]:
 
                 text = _extract_message_text(msg)
                 cmd = _parse_command(text)
-                if cmd is None:
-                    continue
 
                 phone = _norm_phone(msg.get("from"))
                 if phone is None:
@@ -277,13 +275,30 @@ async def handle_event(
         return
 
     action = actions[0]
-    cmd = str(action["cmd"])
+    cmd = action.get("cmd")
     phone_e164 = str(action["phone_e164"])
     phone_number_id = action.get("phone_number_id")
+    text = action.get("text", "")
 
     sender_id, company_id = await _pick_sender(session, phone_number_id)
     if company_id is not None:
         event.company_id = company_id
+
+    if text:
+        from altegio_bot.chatwoot_client import ChatwootClient
+
+        cw = ChatwootClient()
+        try:
+            await cw.log_incoming_message(phone_e164, text)
+            logger.info("Forwarded incoming message to Chatwoot phone=%s", phone_e164)
+        except Exception as exc:
+            logger.warning("Failed to forward to Chatwoot phone=%s err=%s", phone_e164, exc)
+        finally:
+            await cw.aclose()
+
+    if cmd is None:
+        event.error = None
+        return
 
     reason = f"wa:{cmd}"
     opted_out = cmd == "stop"
