@@ -34,15 +34,7 @@ class _FakeMetaProvider:
         params: list[str],
         fallback_text: str = "",
     ) -> str:
-        self.templates.append(
-            (sender_id,
-             phone_e164,
-             template_name,
-             language,
-             params,
-             fallback_text
-             )
-        )
+        self.templates.append((sender_id, phone_e164, template_name, language, params, fallback_text))
         return f"meta-tpl-{uuid4()}"
 
 
