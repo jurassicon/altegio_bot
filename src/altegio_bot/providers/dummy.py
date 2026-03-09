@@ -52,6 +52,7 @@ class DummyProvider(WhatsAppProvider):
         template_name: str,
         language: str,
         params: list[str],
+        fallback_text: str = "",
     ) -> str:
         provider_message_id = f"dummy-tpl-{uuid4()}"
         logger.info(
@@ -90,12 +91,15 @@ async def safe_send_template(
     template_name: str,
     language: str,
     params: list[str],
+    fallback_text: str = "",
 ) -> tuple[str | None, str | None]:
     if not _real_send_allowed(provider):
         return None, "Real send disabled"
 
     try:
-        msg_id = await provider.send_template(sender_id, phone, template_name, language, params)
+        msg_id = await provider.send_template(
+            sender_id, phone, template_name, language, params, fallback_text=fallback_text
+        )
         return msg_id, None
     except Exception as exc:
         logger.exception("send_template failed: %s", exc)

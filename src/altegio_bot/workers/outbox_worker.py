@@ -691,6 +691,7 @@ async def process_job_in_session(
             template_name=meta_template_name,
             language=TEMPLATE_LANGUAGE,
             params=template_params,
+            fallback_text=body,
         )
         send_meta: dict[str, Any] = {
             "send_type": "template",

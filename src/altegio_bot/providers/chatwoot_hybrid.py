@@ -56,12 +56,15 @@ class ChatwootHybridProvider:
         template_name: str,
         language: str,
         params: list[str],
+        fallback_text: str = "",
     ) -> str:
-        # PRIMARY – must succeed
-        msg_id = await self._primary.send_template(sender_id, phone_e164, template_name, language, params)
+        # PRIMARY – must succeed (отправка в Meta игнорирует fallback_text)
+        msg_id = await self._primary.send_template(
+            sender_id, phone_e164, template_name, language, params, fallback_text
+        )
 
-        # SECONDARY – best-effort (Логируем в Chatwoot как ПРИВАТНУЮ ЗАМЕТКУ)
-        content = f"[Шаблон отправлен: {template_name}] " + " | ".join(params)
+        # SECONDARY – best-effort (Отправляем в Chatwoot красивый сгенерированный текст)
+        content = fallback_text if fallback_text else (f"[{template_name}] " + " | ".join(params))
         asyncio.ensure_future(self._log_to_chatwoot(phone_e164, content, meta={"msg_id": msg_id}, private=True))
 
         return msg_id

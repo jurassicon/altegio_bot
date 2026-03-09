@@ -129,6 +129,7 @@ class MetaCloudProvider(WhatsAppProvider):
         template_name: str,
         language: str,
         params: list[str],
+        fallback_text: str = "",
     ) -> str:
         """Send an approved Meta template message."""
         if not self._allow_real_send:

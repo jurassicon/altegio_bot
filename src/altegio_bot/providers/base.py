@@ -19,5 +19,6 @@ class WhatsAppProvider(Protocol):
         template_name: str,
         language: str,
         params: list[str],
+        fallback_text: str = "",
     ) -> str:
         pass
