@@ -172,9 +172,11 @@ class ChatwootClient:
             name=contact_name,
         )
         conversation_id = await self.get_or_create_conversation(contact_id)
+        note_content = f"👤 [ВХОДЯЩЕЕ ОТ КЛИЕНТА]:\n{content}"
         message_id = await self.send_message(
             conversation_id,
-            content,
-            message_type="incoming",
+            note_content,
+            message_type="outgoing",
+            private=True,
         )
         return conversation_id, message_id
