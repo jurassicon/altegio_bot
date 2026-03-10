@@ -281,16 +281,25 @@ async def handle_event(
     text = action.get("text", "")
 
     sender_id, company_id = await _pick_sender(session, phone_number_id)
-    if company_id is not None:
-        event.company_id = company_id
-
     if text:
+        # 1. Ищем имя клиента в нашей базе данных.
+        variants = _phone_variants(phone_e164)
+        stmt = (
+            select(Client.display_name)
+            .where(Client.phone_e164.in_(variants))
+            .where(Client.display_name.is_not(None))
+            .limit(1)
+        )
+        res = await session.execute(stmt)
+        client_name = res.scalar_one_or_none()
+
+        # 2. Передаем найденное имя в Chatwoot.
         from altegio_bot.chatwoot_client import ChatwootClient
 
         cw = ChatwootClient()
         try:
-            await cw.log_incoming_message(phone_e164, text)
-            logger.info("Forwarded incoming message to Chatwoot phone=%s", phone_e164)
+            await cw.log_incoming_message(phone_e164, text, contact_name=client_name)
+            logger.info("Forwarded incoming message to Chatwoot phone=%s name=%s", phone_e164, client_name)
         except Exception as exc:
             logger.warning("Failed to forward to Chatwoot phone=%s err=%s", phone_e164, exc)
         finally:
