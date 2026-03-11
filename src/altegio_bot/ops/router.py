@@ -196,7 +196,7 @@ def _filter_form(
         if ftype.startswith("select:"):
             options_str = ftype[7:]
             options_list = options_str.split(",")
-            options = options_list if (options_list and options_list[0] == "") else [""] + options_list
+            options = options_list
             sel = f'<select name="{name}" class="form-select form-select-sm">'
             for o in options:
                 selected = " selected" if o == val else ""
@@ -429,9 +429,9 @@ async def ops_queue(request: Request) -> str:
     form = _filter_form(
         "/ops/queue",
         [
-            ("company_id", "Company", "select:758285,1271200", company_id),
+            ("company_id", "Company", "select:,758285,1271200", company_id),
             ("job_type", "Job type", "text", job_type),
-            ("status", "Status", "select:queued,processing,failed", status_filter),
+            ("status", "Status", "select:,queued,processing,failed", status_filter),
             ("view", "View", "select:upcoming_7d,upcoming_24h,recent_24h,recent_7d", view),
         ],
     )
@@ -1275,7 +1275,7 @@ async def ops_wa_inbox(request: Request) -> str:
         base_parts.append(f"status={_esc(status_filter)}")
     if only_cmds:
         base_parts.append(f"only_commands={_esc(only_cmds)}")
-    if period and period != "24h":
+    if period:
         base_parts.append(f"period={_esc(period)}")
     base_params_str = "&".join(base_parts)
 
@@ -1327,6 +1327,9 @@ async def ops_wa_inbox(request: Request) -> str:
         else:
             # delivery tab: only status events, deduplicated by (status_msg_id, status_value)
             filters.append("we.payload #> '{entry,0,changes,0,value,statuses,0,id}' IS NOT NULL")
+            if status_filter and status_filter in {"sent", "delivered", "read", "failed"}:
+                filters.append("we.payload #>> '{entry,0,changes,0,value,statuses,0,status}' = :status_filter")
+                params["status_filter"] = status_filter
 
             where = " AND ".join(filters)
             rows_q = await session.execute(
@@ -1380,7 +1383,7 @@ async def ops_wa_inbox(request: Request) -> str:
             [
                 ("pni", "Phone Number ID", "text", pni_filter),
                 ("wa_from", "From (phone)", "text", from_filter),
-                ("status", "Status", "select:received,ignored,processed,failed", status_filter),
+                ("status", "Status", "select:,received,ignored,processed,failed", status_filter),
                 ("only_commands", "Only STOP/START", "select:,1", only_cmds),
                 ("period", "Period", "select:24h,today,7d", period),
             ],
@@ -1426,6 +1429,7 @@ async def ops_wa_inbox(request: Request) -> str:
             "/ops/whatsapp/inbox",
             [
                 ("pni", "Phone Number ID", "text", pni_filter),
+                ("status", "Delivery Status", "select:,sent,delivered,read,failed", status_filter),
                 ("period", "Period", "select:24h,today,7d", period),
             ],
             hidden={"tab": "delivery"},
