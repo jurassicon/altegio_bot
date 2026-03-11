@@ -72,6 +72,11 @@ class ChatwootClient:
                         if phone == phone_e164:
                             cid = contact.get("id")
                             if cid is not None:
+                                current_name = contact.get("name")
+                                if name and current_name != name:
+                                    update_url = self._api(f"/contacts/{cid}")
+                                    # Отправляем PUT-запрос на обновление.
+                                    await self._client.put(update_url, headers=self._headers(), json={"name": name})
                                 return int(cid)
 
         # Create new contact
