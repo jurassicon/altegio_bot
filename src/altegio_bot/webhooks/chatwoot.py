@@ -22,9 +22,11 @@ logger = logging.getLogger("chatwoot_webhook")
 
 router = APIRouter()
 
+
 def _safe_headers(request: Request) -> dict[str, str]:
     deny = {"authorization", "cookie"}
     return {k: v for k, v in request.headers.items() if k.lower() not in deny}
+
 
 def _verify_signature(body: bytes, signature: str | None) -> bool:
     """Verify HMAC signature from Chatwoot (optional)."""
@@ -44,6 +46,7 @@ def _verify_signature(body: bytes, signature: str | None) -> bool:
     expected = hmac.new(secret_bytes, body, hashlib.sha256).hexdigest()
 
     return hmac.compare_digest(signature, expected)
+
 
 @router.post("/webhook/chatwoot")
 async def chatwoot_ingest(request: Request) -> JSONResponse:
