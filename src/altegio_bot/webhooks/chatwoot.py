@@ -6,6 +6,7 @@ import base64
 import binascii
 import hashlib
 import hmac
+import json
 import logging
 from datetime import datetime, timezone
 
@@ -21,11 +22,9 @@ logger = logging.getLogger("chatwoot_webhook")
 
 router = APIRouter()
 
-
 def _safe_headers(request: Request) -> dict[str, str]:
     deny = {"authorization", "cookie"}
     return {k: v for k, v in request.headers.items() if k.lower() not in deny}
-
 
 def _verify_signature(body: bytes, signature: str | None) -> bool:
     """Verify HMAC signature from Chatwoot (optional)."""
@@ -46,7 +45,6 @@ def _verify_signature(body: bytes, signature: str | None) -> bool:
 
     return hmac.compare_digest(signature, expected)
 
-
 @router.post("/webhook/chatwoot")
 async def chatwoot_ingest(request: Request) -> JSONResponse:
     """Receive webhooks from Chatwoot on message_created events."""
@@ -59,12 +57,9 @@ async def chatwoot_ingest(request: Request) -> JSONResponse:
     # Verify signature (if enabled)
     if not _verify_signature(body, signature):
         logger.warning("Invalid Chatwoot webhook signature")
-        logger.error("Signature verification failed - check debug logs above for details")
         raise HTTPException(status_code=403, detail="Invalid signature")
 
     try:
-        import json
-
         payload = json.loads(body)
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON")
@@ -76,7 +71,6 @@ async def chatwoot_ingest(request: Request) -> JSONResponse:
     if event_type != "message_created":
         return JSONResponse({"ok": True, "skipped": f"event={event_type}"})
 
-    # === ИСПРАВЛЕНИЕ: Chatwoot присылает данные в корне (root) ===
     message_type = payload.get("message_type")
 
     # Handle outgoing messages with source_id as delivery status events
@@ -84,7 +78,10 @@ async def chatwoot_ingest(request: Request) -> JSONResponse:
         source_id = payload.get("source_id")
         if not source_id:
             # System message without a WhatsApp message ID — skip
-            logger.debug("Skipping outgoing message without source_id: message_id=%s", payload.get("id"))
+            logger.debug(
+                "Skipping outgoing message without source_id: message_id=%s",
+                payload.get("id"),
+            )
             return JSONResponse({"ok": True, "skipped": "outgoing_no_source_id"})
 
         chatwoot_message_id = payload.get("id")
@@ -94,7 +91,10 @@ async def chatwoot_ingest(request: Request) -> JSONResponse:
 
         cw_status = payload.get("status")
         if not cw_status:
-            logger.debug("Outgoing message has no status field, defaulting to 'sent': message_id=%s", chatwoot_message_id)  # noqa: E501
+            logger.debug(
+                "Outgoing message has no status field, defaulting to 'sent': message_id=%s",
+                chatwoot_message_id,
+            )
             cw_status = "sent"
 
         # Recipient phone: Chatwoot puts the customer in conversation.meta.sender for outgoing messages
@@ -194,8 +194,8 @@ async def chatwoot_ingest(request: Request) -> JSONResponse:
     sender = payload.get("sender", {})
 
     phone_e164 = sender.get("phone_number")
-    text = payload.get("content", "")  # Достаем текст из корня
-    chatwoot_message_id = payload.get("id")  # Достаем ID из корня
+    text = payload.get("content", "")
+    chatwoot_message_id = payload.get("id")
     chatwoot_conversation_id = conversation.get("id")
 
     if not phone_e164:
@@ -206,11 +206,10 @@ async def chatwoot_ingest(request: Request) -> JSONResponse:
         logger.warning("Missing message id in webhook payload")
         raise HTTPException(status_code=400, detail="Missing message_id")
 
-        # === ИСПРАВЛЕНИЕ: Безопасный парсинг даты из Chatwoot ===
+    # Parse created_at timestamp
     created_at_raw = payload.get("created_at")
     try:
         if isinstance(created_at_raw, str):
-            # Переводим строку '2026-03-03T17:03:48.182Z' в Unix timestamp
             timestamp_sec = int(datetime.fromisoformat(created_at_raw.replace("Z", "+00:00")).timestamp())
         else:
             timestamp_sec = int(created_at_raw or datetime.now(timezone.utc).timestamp())
@@ -231,7 +230,6 @@ async def chatwoot_ingest(request: Request) -> JSONResponse:
                                     "text": {"body": text},
                                     "id": str(chatwoot_message_id),
                                     "timestamp": str(timestamp_sec),
-                                    # <--- Используем высчитанные секунды
                                 }
                             ],
                             "metadata": {"phone_number_id": settings.meta_wa_phone_number_id},
