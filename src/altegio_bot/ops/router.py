@@ -1325,31 +1325,71 @@ async def ops_wa_inbox(request: Request) -> str:
             rows = rows_q.fetchall()
 
         else:
-            # delivery tab: only status events, deduplicated by (status_msg_id, status_value)
-            filters.append("we.payload #> '{entry,0,changes,0,value,statuses,0,id}' IS NOT NULL")
-            if status_filter and status_filter in {"sent", "delivered", "read", "failed"}:
-                filters.append("we.payload #>> '{entry,0,changes,0,value,statuses,0,status}' = :status_filter")
-                params["status_filter"] = status_filter
+            # delivery tab: status events from whatsapp_events + fallback from outbox_messages
+            wa_filters = list(filters)  # copy base (time + pni) filters
+            wa_filters.append("we.payload #> '{entry,0,changes,0,value,statuses,0,id}' IS NOT NULL")
 
-            where = " AND ".join(filters)
+            # outbox_messages filters (use sent_at for time range; fall back to scheduled_at)
+            om_filters = [
+                "COALESCE(om.sent_at, om.scheduled_at) >= :from_dt",
+                "COALESCE(om.sent_at, om.scheduled_at) < :to_dt",
+                "om.provider_message_id IS NOT NULL",
+                "om.status IN ('sent', 'failed')",
+            ]
+            if pni_filter:
+                om_filters.append("ws.phone_number_id = :pni")
+
+            if status_filter and status_filter in {"sent", "delivered", "read", "failed"}:
+                wa_filters.append("we.payload #>> '{entry,0,changes,0,value,statuses,0,status}' = :status_filter")
+                params["status_filter"] = status_filter
+                if status_filter in {"sent", "failed"}:
+                    # outbox_messages can represent sent/failed; filter to match
+                    om_filters.append("om.status = :status_filter")
+                else:
+                    # delivered/read only come from webhook statuses, not outbox_messages
+                    om_filters.append("FALSE")
+
+            wa_where = " AND ".join(wa_filters)
+            om_where = " AND ".join(om_filters)
+
             rows_q = await session.execute(
                 text(f"""
-                    SELECT
-                      we.payload #>> '{{entry,0,changes,0,value,statuses,0,id}}' AS status_msg_id,
-                      we.payload #>> '{{entry,0,changes,0,value,statuses,0,status}}' AS status_value,
-                      we.payload #>> '{{entry,0,changes,0,value,metadata,phone_number_id}}' AS pni,
-                      we.payload #>> '{{entry,0,changes,0,value,statuses,0,errors,0,code}}' AS err_code,
-                      we.payload #>> '{{entry,0,changes,0,value,statuses,0,errors,0,title}}' AS err_details,
-                      max(we.received_at) AS received_at,
-                      count(*) AS cnt
-                    FROM whatsapp_events we
-                    WHERE {where}
-                    GROUP BY
-                      status_msg_id,
-                      status_value,
-                      pni,
-                      err_code,
-                      err_details
+                    WITH wa_statuses AS (
+                        SELECT
+                          we.payload #>> '{{entry,0,changes,0,value,statuses,0,id}}' AS status_msg_id,
+                          we.payload #>> '{{entry,0,changes,0,value,statuses,0,status}}' AS status_value,
+                          we.payload #>> '{{entry,0,changes,0,value,metadata,phone_number_id}}' AS pni,
+                          we.payload #>> '{{entry,0,changes,0,value,statuses,0,errors,0,code}}' AS err_code,
+                          we.payload #>> '{{entry,0,changes,0,value,statuses,0,errors,0,title}}' AS err_details,
+                          max(we.received_at) AS received_at,
+                          count(*) AS cnt
+                        FROM whatsapp_events we
+                        WHERE {wa_where}
+                        GROUP BY
+                          status_msg_id,
+                          status_value,
+                          pni,
+                          err_code,
+                          err_details
+                    ),
+                    om_fallback AS (
+                        SELECT
+                          om.provider_message_id AS status_msg_id,
+                          om.status AS status_value,
+                          ws.phone_number_id AS pni,
+                          NULL::text AS err_code,
+                          om.error AS err_details,
+                          COALESCE(om.sent_at, om.scheduled_at) AS received_at,
+                          1::bigint AS cnt
+                        FROM outbox_messages om
+                        LEFT JOIN whatsapp_senders ws ON ws.id = om.sender_id
+                        LEFT JOIN wa_statuses wa ON wa.status_msg_id = om.provider_message_id
+                        WHERE {om_where}
+                          AND wa.status_msg_id IS NULL
+                    )
+                    SELECT * FROM wa_statuses
+                    UNION ALL
+                    SELECT * FROM om_fallback
                     ORDER BY received_at DESC
                     LIMIT 200
                 """),

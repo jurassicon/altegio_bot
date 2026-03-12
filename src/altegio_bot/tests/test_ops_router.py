@@ -91,6 +91,76 @@ async def test_ops_wa_delivery_tab(http_client: AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
+async def test_ops_wa_delivery_tab_fallback_from_outbox(
+    http_client: AsyncClient,
+    session_maker,
+) -> None:
+    """Delivery tab shows outbox_messages when no whatsapp_events statuses exist."""
+    now = datetime.now(timezone.utc)
+    provider_message_id = "wamid.test_delivery_fallback_001"
+    async with session_maker() as session:
+        async with session.begin():
+            msg = OutboxMessage(
+                company_id=1,
+                phone_e164="+79001234567",
+                template_code="test_template",
+                language="ru",
+                body="Test message",
+                status="sent",
+                scheduled_at=now - timedelta(hours=1),
+                sent_at=now - timedelta(hours=1),
+                provider_message_id=provider_message_id,
+                meta={},
+            )
+            session.add(msg)
+
+    response = await http_client.get("/ops/whatsapp/inbox?tab=delivery&period=24h")
+    assert response.status_code == 200
+    assert provider_message_id in response.text
+
+
+@pytest.mark.asyncio
+async def test_ops_wa_delivery_tab_fallback_failed_status(
+    http_client: AsyncClient,
+    session_maker,
+) -> None:
+    """Delivery tab shows failed outbox_messages in the fallback, and status filter works."""
+    now = datetime.now(timezone.utc)
+    provider_message_id = "wamid.test_delivery_fallback_failed_001"
+    async with session_maker() as session:
+        async with session.begin():
+            msg = OutboxMessage(
+                company_id=1,
+                phone_e164="+79001234568",
+                template_code="test_template",
+                language="ru",
+                body="Failed message",
+                status="failed",
+                error="provider rejected",
+                scheduled_at=now - timedelta(hours=1),
+                sent_at=now - timedelta(hours=1),
+                provider_message_id=provider_message_id,
+                meta={},
+            )
+            session.add(msg)
+
+    # Without status filter: failed message should appear
+    response = await http_client.get("/ops/whatsapp/inbox?tab=delivery&period=24h")
+    assert response.status_code == 200
+    assert provider_message_id in response.text
+
+    # With status=failed filter: still visible
+    response_filtered = await http_client.get("/ops/whatsapp/inbox?tab=delivery&period=24h&status=failed")
+    assert response_filtered.status_code == 200
+    assert provider_message_id in response_filtered.text
+
+    # With status=sent filter: should NOT appear
+    response_sent = await http_client.get("/ops/whatsapp/inbox?tab=delivery&period=24h&status=sent")
+    assert response_sent.status_code == 200
+    assert provider_message_id not in response_sent.text
+
+
+@pytest.mark.asyncio
 async def test_ops_optouts_returns_200(http_client: AsyncClient) -> None:
     response = await http_client.get("/ops/optouts")
     assert response.status_code == 200
