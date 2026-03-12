@@ -54,42 +54,7 @@ async def chatwoot_ingest(request: Request) -> JSONResponse:
     # Read body for signature verification
     body = await request.body()
 
-    # === ENHANCED DEBUGGING ===
     signature = request.headers.get("x-chatwoot-signature")
-
-    # Log all headers (to check exact casing)
-    logger.warning(f"Webhook headers: {dict(request.headers)}")
-
-    # Log raw body details
-    logger.warning(f"Raw body length: {len(body)}")
-    logger.warning(f"Body (first 200 chars): {body[:200]!r}")
-
-    # Log received signature
-    logger.warning(f"Received signature: {signature!r}")
-
-    # Compute and log expected signatures for debugging
-    if settings.chatwoot_webhook_secret and signature:
-        # Method 1: Raw string
-        expected_raw = hmac.new(settings.chatwoot_webhook_secret.encode(), body, hashlib.sha256).hexdigest()
-        logger.warning(f"Expected (raw secret): {expected_raw}")
-
-        # Method 2: Base64-decoded secret
-        try:
-            decoded_secret = base64.b64decode(settings.chatwoot_webhook_secret)
-            expected_b64 = hmac.new(decoded_secret, body, hashlib.sha256).hexdigest()
-            logger.warning(f"Expected (base64-decoded secret): {expected_b64}")
-
-            # Check which one matches
-            if hmac.compare_digest(signature, expected_raw):
-                logger.warning("Signature matches: RAW secret method")
-            elif hmac.compare_digest(signature, expected_b64):
-                logger.warning("Signature matches: BASE64-decoded secret method")
-            else:
-                logger.warning("Signature DOES NOT match either method")
-        except binascii.Error as e:
-            logger.warning(f"Could not decode secret as base64: {e}")
-
-    # === END DEBUGGING ===
 
     # Verify signature (if enabled)
     if not _verify_signature(body, signature):
@@ -114,9 +79,115 @@ async def chatwoot_ingest(request: Request) -> JSONResponse:
     # === ИСПРАВЛЕНИЕ: Chatwoot присылает данные в корне (root) ===
     message_type = payload.get("message_type")
 
+    # Handle outgoing messages with source_id as delivery status events
+    if message_type in (1, "outgoing"):
+        source_id = payload.get("source_id")
+        if not source_id:
+            # System message without a WhatsApp message ID — skip
+            logger.debug("Skipping outgoing message without source_id: message_id=%s", payload.get("id"))
+            return JSONResponse({"ok": True, "skipped": "outgoing_no_source_id"})
+
+        chatwoot_message_id = payload.get("id")
+        conversation = payload.get("conversation", {})
+        chatwoot_conversation_id = conversation.get("id")
+        account_id = payload.get("account", {}).get("id")
+
+        cw_status = payload.get("status")
+        if not cw_status:
+            logger.debug("Outgoing message has no status field, defaulting to 'sent': message_id=%s", chatwoot_message_id)  # noqa: E501
+            cw_status = "sent"
+
+        # Recipient phone: Chatwoot puts the customer in conversation.meta.sender for outgoing messages
+        conv_sender = conversation.get("meta", {}).get("sender", {})
+        phone_e164 = conv_sender.get("phone_number") or payload.get("sender", {}).get("phone_number", "")
+        phone_digits = phone_e164.lstrip("+") if phone_e164 else ""
+
+        created_at_raw = payload.get("created_at")
+        try:
+            if isinstance(created_at_raw, str):
+                timestamp_sec = int(datetime.fromisoformat(created_at_raw.replace("Z", "+00:00")).timestamp())
+            else:
+                timestamp_sec = int(created_at_raw or datetime.now(timezone.utc).timestamp())
+        except (ValueError, TypeError):
+            timestamp_sec = int(datetime.now(timezone.utc).timestamp())
+
+        # Normalize to Meta webhook format for delivery statuses
+        # (compatible with existing SQL queries: payload #>> '{entry,0,changes,0,value,statuses,0,id}')
+        delivery_payload = {
+            "entry": [
+                {
+                    "changes": [
+                        {
+                            "value": {
+                                "statuses": [
+                                    {
+                                        "id": source_id,
+                                        "status": cw_status,
+                                        "timestamp": str(timestamp_sec),
+                                        "recipient_id": phone_digits,
+                                        "errors": [],
+                                    }
+                                ],
+                                "metadata": {"phone_number_id": settings.meta_wa_phone_number_id},
+                            }
+                        }
+                    ]
+                }
+            ],
+            "_chatwoot": {
+                "conversation_id": chatwoot_conversation_id,
+                "message_id": chatwoot_message_id,
+                "account_id": account_id,
+            },
+        }
+
+        dedupe_key = f"chatwoot_delivery:{chatwoot_message_id}"
+
+        async with SessionLocal() as session:
+            try:
+                async with session.begin():
+                    event = WhatsAppEvent(
+                        dedupe_key=dedupe_key,
+                        status="received",
+                        error=None,
+                        query=dict(request.query_params),
+                        headers=_safe_headers(request),
+                        payload=delivery_payload,
+                    )
+                    session.add(event)
+                    await session.flush()
+
+                    logger.info(
+                        "Chatwoot delivery status saved: conv_id=%s msg_id=%s source_id=%s status=%s",
+                        chatwoot_conversation_id,
+                        chatwoot_message_id,
+                        source_id,
+                        cw_status,
+                    )
+
+                    return JSONResponse(
+                        {
+                            "ok": True,
+                            "duplicate": False,
+                            "id": event.id,
+                            "dedupe_key": dedupe_key,
+                        }
+                    )
+
+            except IntegrityError:
+                await session.rollback()
+                logger.info("Duplicate chatwoot delivery event: %s", dedupe_key)
+                return JSONResponse(
+                    {
+                        "ok": True,
+                        "duplicate": True,
+                        "dedupe_key": dedupe_key,
+                    }
+                )
+
     # Only process incoming messages (from customers, not agents)
     if message_type not in (0, "incoming"):
-        logger.warning("Skipping non-incoming message: message_type=%s", message_type)
+        logger.info("Skipping non-incoming message: message_type=%s", message_type)
         return JSONResponse({"ok": True, "skipped": f"message_type={message_type}"})
 
     conversation = payload.get("conversation", {})

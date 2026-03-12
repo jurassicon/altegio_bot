@@ -16,9 +16,11 @@ def _cw_payload(
     conversation_id: int = 1,
     message_id: int = 1,
     message_type: int | str = 0,  # 0 is incoming in Chatwoot
+    source_id: str | None = None,
+    status: str | None = None,
 ) -> dict:
     """Build a minimal Chatwoot message_created webhook payload."""
-    return {
+    payload: dict = {
         "event": "message_created",
         "id": message_id,
         "content": content,
@@ -26,6 +28,11 @@ def _cw_payload(
         "created_at": 1234567890,
         "conversation": {
             "id": conversation_id,
+            "meta": {
+                "sender": {
+                    "phone_number": phone,
+                },
+            },
         },
         "sender": {
             "phone_number": phone,
@@ -34,6 +41,11 @@ def _cw_payload(
             "id": 2,
         },
     }
+    if source_id is not None:
+        payload["source_id"] = source_id
+    if status is not None:
+        payload["status"] = status
+    return payload
 
 
 @pytest.mark.asyncio
@@ -78,7 +90,7 @@ async def test_incoming_message_saved(session_maker) -> None:
 
 @pytest.mark.asyncio
 async def test_outgoing_message_skipped(session_maker) -> None:
-    """Outgoing messages from the bot should be skipped."""
+    """Outgoing messages without source_id (system messages) should be skipped."""
     import altegio_bot.webhooks.chatwoot as cw_module
 
     original_session_local = cw_module.SessionLocal
@@ -89,7 +101,7 @@ async def test_outgoing_message_skipped(session_maker) -> None:
         cw_module.SessionLocal = session_maker  # type: ignore[assignment]
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as tc:
-            payload = _cw_payload(message_type=1)  # 1 — это outgoing
+            payload = _cw_payload(message_type=1)  # 1 — outgoing, no source_id
             resp = await tc.post(
                 "/webhook/chatwoot",
                 content=json.dumps(payload),
@@ -97,7 +109,62 @@ async def test_outgoing_message_skipped(session_maker) -> None:
             )
             assert resp.status_code == 200
             data = resp.json()
-            assert data.get("skipped") == "message_type=1"
+            assert data.get("skipped") == "outgoing_no_source_id"
+
+    finally:
+        cw_module.SessionLocal = original_session_local
+
+
+@pytest.mark.asyncio
+async def test_outgoing_delivery_status_saved(session_maker) -> None:
+    """Outgoing messages with source_id should be saved as delivery status events."""
+    import altegio_bot.webhooks.chatwoot as cw_module
+
+    original_session_local = cw_module.SessionLocal
+
+    from altegio_bot.main import app
+
+    try:
+        cw_module.SessionLocal = session_maker  # type: ignore[assignment]
+
+        source_id = "wamid.HBgLNzkyNjgyMDI5ODIVAgARGBJBNTFBMkI3MTQyRTc2RUNBRTgA"
+        payload = _cw_payload(
+            phone="+79268202982",
+            message_type=1,
+            message_id=126,
+            conversation_id=11,
+            source_id=source_id,
+            status="read",
+        )
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as tc:
+            resp = await tc.post(
+                "/webhook/chatwoot",
+                content=json.dumps(payload),
+                headers={"Content-Type": "application/json"},
+            )
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["ok"] is True
+            assert data.get("duplicate") is False
+            assert data.get("dedupe_key") == "chatwoot_delivery:126"
+
+        # Verify the event was saved with delivery status format
+        async with session_maker() as session:
+            from sqlalchemy import select
+
+            from altegio_bot.models.models import WhatsAppEvent
+
+            stmt = select(WhatsAppEvent).where(WhatsAppEvent.dedupe_key == "chatwoot_delivery:126")
+            result = await session.execute(stmt)
+            event = result.scalar_one_or_none()
+            assert event is not None
+            status_entry = event.payload["entry"][0]["changes"][0]["value"]["statuses"][0]
+            assert status_entry["id"] == source_id
+            assert status_entry["status"] == "read"
+            assert status_entry["recipient_id"] == "79268202982"
+            assert event.payload["_chatwoot"]["conversation_id"] == 11
+            assert event.payload["_chatwoot"]["message_id"] == 126
 
     finally:
         cw_module.SessionLocal = original_session_local
