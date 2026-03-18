@@ -67,11 +67,6 @@ BOOKING_LINKS = {
     1271200: "https://n813709.alteg.io/",
 }
 
-UNSUBSCRIBE_LINKS = {
-    758285: "https://example.com/unsubscribe/karlsruhe",
-    1271200: "https://example.com/unsubscribe/rastatt",
-}
-
 PRE_APPOINTMENT_NOTES_DE = (
     "\n\nWichtige Hinweise vor dem Termin:\n"
     "• Bitte pünktlich kommen — ab 15 Min. Verspätung können wir "
@@ -391,7 +386,7 @@ async def _render_message(
 
         services_text = "\n".join(lines)
 
-    unsubscribe_link = UNSUBSCRIBE_LINKS.get(company_id, "")
+    unsubscribe_link = ""
     booking_link = BOOKING_LINKS.get(company_id, "")
 
     sender_code = "default"
