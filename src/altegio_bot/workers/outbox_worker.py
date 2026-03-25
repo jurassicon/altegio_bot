@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from altegio_bot.chatwoot_client import ChatwootClient  # ← новый импорт
 from altegio_bot.db import SessionLocal
 from altegio_bot.meta_templates import (
     TEMPLATE_LANGUAGE,
@@ -29,6 +30,7 @@ from altegio_bot.models.models import (
 from altegio_bot.providers.base import WhatsAppProvider
 from altegio_bot.providers.dummy import safe_send, safe_send_template
 from altegio_bot.settings import settings
+from altegio_bot.utils import fire_and_forget  # ← новый импорт
 from altegio_bot.whatsapp_routing import pick_sender_code_for_record, pick_sender_id
 
 logger = logging.getLogger("outbox_worker")
@@ -666,7 +668,7 @@ async def process_job_in_session(
             # Exception: text mode always allows free-form sends.
             job.status = "failed"
             job.locked_at = None
-            job.last_error = f"No Meta template for company={job.company_id} job_type={{job.job_type}}"
+            job.last_error = f"No Meta template for company={job.company_id} job_type={job.job_type}"
             logger.error(
                 "No Meta template for company=%s job_type=%s; failing job_id=%s (send_mode=%s)",
                 job.company_id,
@@ -777,6 +779,31 @@ async def process_job_in_session(
         send_meta.get("send_type"),
         send_meta.get("template"),
     )
+
+    # Chatwoot: заменяем сырой шаблон на красивый текст.
+    # Запускаем фоном — воркер не ждёт, транзакция уже зафиксирована выше.
+    # Условия: Chatwoot включён + сообщение отправлено как шаблон + есть wamid.
+    if settings.chatwoot_enabled and send_meta.get("send_type") == "template" and msg_id is not None:
+        chatwoot_conv_id: int | None = (getattr(job, "payload", None) or {}).get("chatwoot_conversation_id")
+        if chatwoot_conv_id is not None:
+            fire_and_forget(
+                ChatwootClient().sync_template_message(
+                    conversation_id=chatwoot_conv_id,
+                    wamid=str(msg_id),
+                    formatted_text=body,
+                )
+            )
+            logger.debug(
+                "Chatwoot sync запущен фоном: job_id=%s wamid=%s conv_id=%s",
+                job.id,
+                msg_id,
+                chatwoot_conv_id,
+            )
+        else:
+            logger.debug(
+                "Chatwoot sync пропущен: job_id=%s — нет chatwoot_conversation_id в payload",
+                job.id,
+            )
 
 
 async def process_job(
