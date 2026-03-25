@@ -97,45 +97,109 @@ class ChatwootClient:
             raise RuntimeError(f"Failed to create Chatwoot contact: {data}")
         return int(contact_id)
 
-    async def get_or_create_conversation(
-        self,
-        contact_id: int,
-    ) -> int:
-        """Return an open conversation ID for this contact, creating one if needed."""
-        # List existing conversations for the contact
+    async def get_or_create_conversation(self, contact_id: int) -> int:
+        """Return a single persistent conversation for this contact.
+
+        Strategy (WhatsApp-style single thread):
+        1. Fetch all conversations for the contact in our inbox.
+        2. Prefer an already-open one — return it immediately.
+        3. If only resolved/pending ones exist — reopen the most recent one
+           via PATCH /conversations/{id}/toggle_status instead of creating
+           a new conversation. This keeps the full history in one thread.
+        4. Only create a brand-new conversation when none exist at all.
+        """
         list_url = self._api(f"/contacts/{contact_id}/conversations")
         res = await self._client.get(list_url, headers=self._headers())
+
+        best_conv_id: int | None = None  # самый свежий resolved/pending
+        best_conv_created: int = -1  # unix timestamp для сравнения
+
         if res.status_code == 200:
             data = res.json()
-            conversations = (data.get("payload") or []) if isinstance(data, dict) else (data or [])
+            conversations = data.get("payload") or [] if isinstance(data, dict) else (data or [])
+
             if isinstance(conversations, list):
                 for conv in conversations:
                     if not isinstance(conv, dict):
                         continue
-                    # Prefer open conversations on our inbox
-                    inbox_id = conv.get("inbox_id")
-                    status = conv.get("status", "")
-                    if inbox_id == self._inbox_id and status == "open":
-                        cid = conv.get("id")
-                        if cid is not None:
-                            return int(cid)
 
-        # Create a new conversation
+                    # Только наш inbox
+                    if conv.get("inbox_id") != self._inbox_id:
+                        continue
+
+                    cid = conv.get("id")
+                    if cid is None:
+                        continue
+
+                    status = conv.get("status", "")
+
+                    # ── Шаг 2: уже открытая — берём сразу ──────────────
+                    if status == "open":
+                        logger.debug(
+                            "Chatwoot: reusing open conversation_id=%s for contact_id=%s",
+                            cid,
+                            contact_id,
+                        )
+                        return int(cid)
+
+                    # ── Шаг 3: resolved/pending — запоминаем самую свежую
+                    created_at = conv.get("created_at") or 0
+                    if isinstance(created_at, str):
+                        # Chatwoot может вернуть ISO-строку
+                        try:
+                            from datetime import datetime as _dt
+
+                            created_at = int(_dt.fromisoformat(created_at.replace("Z", "+00:00")).timestamp())
+                        except Exception:
+                            created_at = 0
+
+                    if int(created_at) > best_conv_created:
+                        best_conv_created = int(created_at)
+                        best_conv_id = int(cid)
+
+        # ── Шаг 3: реоткрываем самую свежую resolved/pending беседу ────
+        if best_conv_id is not None:
+            reopen_url = self._api(f"/conversations/{best_conv_id}/toggle_status")
+            patch_res = await self._client.post(
+                reopen_url,
+                headers=self._headers(),
+                json={"status": "open"},
+            )
+            if patch_res.status_code in (200, 201):
+                logger.info(
+                    "Chatwoot: reopened conversation_id=%s for contact_id=%s (WhatsApp-style single thread)",
+                    best_conv_id,
+                    contact_id,
+                )
+                return best_conv_id
+
+            # Если реоткрытие не удалось — логируем и падаем в создание новой
+            logger.warning(
+                "Chatwoot: failed to reopen conversation_id=%s (status=%s), will create new",
+                best_conv_id,
+                patch_res.status_code,
+            )
+
+        # ── Шаг 4: создаём новую беседу (только если нет ни одной) ─────
         create_url = self._api("/conversations")
-        body = {
-            "inbox_id": self._inbox_id,
-            "contact_id": contact_id,
-        }
-        res = await self._client.post(
+        create_res = await self._client.post(
             create_url,
             headers=self._headers(),
-            json=body,
+            json={
+                "inbox_id": self._inbox_id,
+                "contact_id": contact_id,
+            },
         )
-        res.raise_for_status()
-        data = res.json()
+        create_res.raise_for_status()
+        data = create_res.json()
         conv_id = data.get("id")
         if conv_id is None:
             raise RuntimeError(f"Failed to create Chatwoot conversation: {data}")
+        logger.info(
+            "Chatwoot: created new conversation_id=%s for contact_id=%s",
+            conv_id,
+            contact_id,
+        )
         return int(conv_id)
 
     async def send_message(
