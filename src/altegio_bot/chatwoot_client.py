@@ -4,6 +4,7 @@ Only the methods required for the dual-write integration are implemented:
 - get_or_create_contact  – upsert a contact by phone number
 - get_or_create_conversation – open/reuse a conversation for a contact
 - send_message           – post an outbound message to a conversation
+- sync_template_message  – заменить сырой шаблон на красивый текст
 """
 
 from __future__ import annotations
@@ -191,3 +192,32 @@ class ChatwootClient:
             message_type="incoming",
         )
         return conversation_id, message_id
+
+    async def sync_template_message(
+        self,
+        conversation_id: int,
+        wamid: str,
+        formatted_text: str,
+    ) -> bool:
+        """Заменяет сырое шаблонное сообщение на красивый текст.
+
+        Тонкая обёртка над sync_beautiful_message_to_chatwoot() — удобна,
+        когда у вас уже есть экземпляр ChatwootClient и не хочется
+        передавать учётные данные отдельно.
+
+        Типичное использование в воркере:
+            asyncio.create_task(
+                client.sync_template_message(conv_id, wamid, beautiful_text)
+            )
+        """
+        # Импортируем здесь, чтобы избежать циклического импорта
+        from altegio_bot.chatwoot_sync import sync_beautiful_message_to_chatwoot
+
+        return await sync_beautiful_message_to_chatwoot(
+            chatwoot_base_url=self._base_url,
+            chatwoot_account_id=self._account_id,
+            chatwoot_api_token=self._api_token,
+            conversation_id=conversation_id,
+            wamid=wamid,
+            formatted_text=formatted_text,
+        )
