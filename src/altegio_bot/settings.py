@@ -63,7 +63,7 @@ class Settings(BaseSettings):
     ops_local_tz: str = "Europe/Berlin"
 
     # Chatwoot integration
-    chatwoot_enabled: bool = False
+    chatwoot_enabled: bool = True
     chatwoot_base_url: str = ""
     chatwoot_api_token: str = ""
     chatwoot_inbox_id: int = 0
