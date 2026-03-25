@@ -194,24 +194,18 @@ class ChatwootClient:
         return conversation_id, message_id
 
     async def sync_template_message(
-        self,
-        conversation_id: int,
-        wamid: str,
-        formatted_text: str,
+            self,
+            conversation_id: int,
+            wamid: str,
+            formatted_text: str,
     ) -> bool:
         """Заменяет сырое шаблонное сообщение на красивый текст.
 
-        Тонкая обёртка над sync_beautiful_message_to_chatwoot() — удобна,
-        когда у вас уже есть экземпляр ChatwootClient и не хочется
-        передавать учётные данные отдельно.
-
-        Типичное использование в воркере:
-            asyncio.create_task(
-                client.sync_template_message(conv_id, wamid, beautiful_text)
-            )
+        Делегирует в sync_beautiful_message_to_chatwoot() — там ретраи,
+        обработка ошибок и тесты.
         """
-        # Импортируем здесь, чтобы избежать циклического импорта
-        from altegio_bot.chatwoot_sync import sync_beautiful_message_to_chatwoot
+        from altegio_bot.chatwoot_sync import \
+            sync_beautiful_message_to_chatwoot
 
         return await sync_beautiful_message_to_chatwoot(
             chatwoot_base_url=self._base_url,
