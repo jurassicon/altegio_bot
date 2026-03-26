@@ -259,3 +259,34 @@ def test_params_unknown_template_returns_empty() -> None:
 def test_params_missing_ctx_keys_use_empty_string() -> None:
     params = build_template_params("kitilash_ka_record_updated_v1", {})
     assert params == ["", "", "", "", "", "", ""]
+
+
+# ---------------------------------------------------------------------------
+# Newline replacement in services param (multi-service records)
+# ---------------------------------------------------------------------------
+
+_CTX_MULTI = dict(
+    _CTX,
+    services="Maniküre mit Gel-Lack — 45.00€\nHygienische Pediküre — 45.00€",
+)
+_SERVICES_FLAT = "Maniküre mit Gel-Lack — 45.00€, Hygienische Pediküre — 45.00€"
+
+
+def test_multiservice_record_created_newline_replaced() -> None:
+    params = build_template_params("kitilash_ka_record_created_v1", _CTX_MULTI)
+    assert params[4] == _SERVICES_FLAT
+
+
+def test_multiservice_record_updated_newline_replaced() -> None:
+    params = build_template_params("kitilash_ka_record_updated_v1", _CTX_MULTI)
+    assert params[4] == _SERVICES_FLAT
+
+
+def test_multiservice_record_canceled_newline_replaced() -> None:
+    params = build_template_params("kitilash_ka_record_canceled_v1", _CTX_MULTI)
+    assert params[3] == _SERVICES_FLAT
+
+
+def test_multiservice_reminder_24h_newline_replaced() -> None:
+    params = build_template_params("kitilash_ka_reminder_24h_v1", _CTX_MULTI)
+    assert params[4] == _SERVICES_FLAT
