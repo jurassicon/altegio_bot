@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import timezone
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 from altegio_bot.workers.inbox_worker import parse_dt, parse_starts_at
 
@@ -139,3 +140,40 @@ class TestStartsAtParsing:
     def test_invalid_both_returns_none(self):
         """Both fields malformed → None."""
         assert parse_starts_at({"date": "bad", "datetime": "also-bad"}) is None
+
+    def test_upsert_record_uses_date_field_not_datetime(self):
+        """date field (local naive) must be used; datetime offset is ignored."""
+        # Local time 10:30 in Europe/Belgrade winter (UTC+1) → 09:30 UTC.
+        # The wrong +03:00 offset in datetime must be completely ignored.
+        TZ = ZoneInfo("Europe/Belgrade")
+        naive = datetime(2026, 1, 15, 10, 30, 0)
+        expected_utc = naive.replace(tzinfo=TZ).astimezone(timezone.utc)
+
+        result = parse_starts_at(
+            {
+                "date": "2026-01-15 10:30:00",
+                "datetime": "2026-01-15T10:30:00+03:00",  # wrong offset — must be IGNORED
+            }
+        )
+
+        assert result is not None
+        assert result.tzinfo == timezone.utc
+        assert result == expected_utc  # 09:30 UTC
+
+    def test_upsert_record_fallback_to_datetime_strips_offset(self):
+        """When 'date' is absent, fallback uses 'datetime' but strips its offset."""
+        # datetime carries +03:00 — entirely wrong. The bare wall-clock time
+        # 10:30 should be interpreted as Europe/Belgrade (UTC+1 in January).
+        TZ = ZoneInfo("Europe/Belgrade")
+        naive = datetime(2026, 1, 15, 10, 30, 0)
+        expected_utc = naive.replace(tzinfo=TZ).astimezone(timezone.utc)
+
+        result = parse_starts_at(
+            {
+                "datetime": "2026-01-15T10:30:00+03:00",  # offset must be stripped
+            }
+        )
+
+        assert result is not None
+        assert result.tzinfo == timezone.utc
+        assert result == expected_utc  # 09:30 UTC
