@@ -114,9 +114,9 @@ def test_render_message_renders_services_and_total_cost(monkeypatch: Any) -> Non
 
     assert sender_id == 123
     assert lang == "de"
-    assert "Lashes — 50.00€" in body
-    assert "Fix — 30.00€" in body
-    assert "Total 80.00" in body
+    assert "Lashes — 50.00€" in _ctx["services"]
+    assert "Fix — 30.00€" in _ctx["services"]
+    assert _ctx["total_cost"] == "80.00"
 
 
 def test_render_message_adds_notes_for_new_client(monkeypatch: Any) -> None:
@@ -162,7 +162,7 @@ def test_render_message_adds_notes_for_new_client(monkeypatch: Any) -> None:
 
     assert sender_id == 777
     assert lang == "de"
-    assert ow.PRE_APPOINTMENT_NOTES_DE.strip() in body
+    assert _ctx["pre_appointment_notes"].strip() == ow.PRE_APPOINTMENT_NOTES_DE.strip()
 
 
 def test_render_message_raises_when_no_sender(monkeypatch: Any) -> None:

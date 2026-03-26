@@ -435,7 +435,7 @@ async def _render_message(
         "pre_appointment_notes": pre_appointment_notes,
     }
 
-    body = tmpl.body.format(**ctx)
+    body = tmpl.body
     return body, sender_id, used_lang, ctx
 
 
@@ -540,13 +540,6 @@ async def process_job_in_session(
             job.status = "canceled"
             job.locked_at = None
             job.last_error = "Skipped: record is deleted"
-            return
-
-    if job.job_type == "comeback_3d":
-        if record is None or not record.is_deleted:
-            job.status = "canceled"
-            job.locked_at = None
-            job.last_error = "Skipped: record is not deleted"
             return
 
         if job.job_type == "comeback_3d":
@@ -679,6 +672,22 @@ async def process_job_in_session(
             return
         template_params = build_template_params(meta_template_name, msg_ctx)
 
+        final_body = body
+        for i, val in enumerate(template_params):
+            placeholder = f"{{{{{i + 1}}}}}"
+            final_body = final_body.replace(placeholder, str(val))
+        try:
+            final_body = final_body.format(**msg_ctx)
+        except Exception:
+            pass
+
+    else:
+        final_body = body
+        try:
+            final_body = final_body.format(**msg_ctx)
+        except Exception:
+            pass
+
     if use_template:
         assert meta_template_name is not None
         msg_id, err = await safe_send_template(
@@ -688,7 +697,7 @@ async def process_job_in_session(
             template_name=meta_template_name,
             language=TEMPLATE_LANGUAGE,
             params=template_params,
-            fallback_text=body,
+            fallback_text=final_body,
         )
         send_meta: dict[str, Any] = {
             "send_type": "template",
@@ -701,7 +710,7 @@ async def process_job_in_session(
             provider=provider,
             sender_id=sender_id,
             phone=phone,
-            text=body,
+            text=final_body,
         )
         send_meta = {"send_type": "text"}
 
@@ -715,7 +724,7 @@ async def process_job_in_session(
             phone_e164=phone,
             template_code=job.job_type,
             language=lang,
-            body=body,
+            body=final_body,
             status="failed",
             error=err,
             provider_message_id=msg_id,
@@ -756,7 +765,7 @@ async def process_job_in_session(
         phone_e164=phone,
         template_code=job.job_type,
         language=lang,
-        body=body,
+        body=final_body,
         status="sent",
         error=None,
         provider_message_id=msg_id,
@@ -786,7 +795,7 @@ async def process_job_in_session(
             _sync_chatwoot_for_phone(
                 phone_e164=phone,
                 wamid=str(msg_id),
-                formatted_text=body,
+                formatted_text=final_body,
             )
         )
         logger.debug(
