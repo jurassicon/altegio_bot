@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
-from altegio_bot.workers.inbox_worker import parse_dt, parse_starts_at
+from altegio_bot.workers.inbox_worker import _parse_starts_at, parse_dt
 
 
 class TestParseDt:
@@ -70,11 +70,11 @@ class TestParseDt:
 
 
 class TestStartsAtParsing:
-    """Tests for parse_starts_at DST and field-priority logic."""
+    """Tests for _parse_starts_at DST and field-priority logic."""
 
     def test_date_field_winter(self):
         """date present, winter (CET UTC+1): 10:30 local → 09:30 UTC."""
-        result = parse_starts_at({"date": "2026-01-15 10:30:00"})
+        result = _parse_starts_at({"date": "2026-01-15 10:30:00"})
         assert result is not None
         assert result.tzinfo == timezone.utc
         assert result.hour == 9
@@ -82,7 +82,7 @@ class TestStartsAtParsing:
 
     def test_date_field_summer(self):
         """date present, summer (CEST UTC+2): 10:30 local → 08:30 UTC."""
-        result = parse_starts_at({"date": "2026-07-15 10:30:00"})
+        result = _parse_starts_at({"date": "2026-07-15 10:30:00"})
         assert result is not None
         assert result.tzinfo == timezone.utc
         assert result.hour == 8
@@ -90,7 +90,7 @@ class TestStartsAtParsing:
 
     def test_date_field_preferred_over_datetime(self):
         """date is always used even when datetime is also present."""
-        result = parse_starts_at(
+        result = _parse_starts_at(
             {
                 "date": "2026-07-15 10:30:00",
                 # Wrong offset (+01:00 instead of +02:00) — must be ignored.
@@ -106,7 +106,7 @@ class TestStartsAtParsing:
     def test_datetime_fallback_strips_bad_offset(self):
         """date absent: datetime fallback strips the wrong offset and applies TZ."""
         # datetime carries a wrong +01:00 offset (should be +02:00 in summer).
-        result = parse_starts_at({"datetime": "2026-07-15T10:30:00+01:00"})
+        result = _parse_starts_at({"datetime": "2026-07-15T10:30:00+01:00"})
         assert result is not None
         assert result.tzinfo == timezone.utc
         # Local wall-clock 10:30 in Europe/Belgrade summer (UTC+2) → 08:30 UTC.
@@ -115,12 +115,12 @@ class TestStartsAtParsing:
 
     def test_both_absent_returns_none(self):
         """Neither date nor datetime present → None."""
-        assert parse_starts_at({}) is None
-        assert parse_starts_at({"date": None, "datetime": None}) is None
+        assert _parse_starts_at({}) is None
+        assert _parse_starts_at({"date": None, "datetime": None}) is None
 
     def test_dst_spring_forward(self):
         """2026-03-29 03:00 is summer time (CEST UTC+2): → 01:00 UTC."""
-        result = parse_starts_at({"date": "2026-03-29 03:00:00"})
+        result = _parse_starts_at({"date": "2026-03-29 03:00:00"})
         assert result is not None
         assert result.tzinfo == timezone.utc
         assert result.hour == 1
@@ -128,18 +128,18 @@ class TestStartsAtParsing:
 
     def test_invalid_date_falls_back_to_datetime(self):
         """Malformed date value falls back to datetime field."""
-        result = parse_starts_at({"date": "not-a-date", "datetime": "2026-01-15T10:30:00+01:00"})
+        result = _parse_starts_at({"date": "not-a-date", "datetime": "2026-01-15T10:30:00+01:00"})
         assert result is not None
         assert result.hour == 9
         assert result.minute == 30
 
     def test_invalid_date_and_short_datetime_returns_none(self):
         """Malformed date and too-short datetime → None."""
-        assert parse_starts_at({"date": "bad", "datetime": "2026"}) is None
+        assert _parse_starts_at({"date": "bad", "datetime": "2026"}) is None
 
     def test_invalid_both_returns_none(self):
         """Both fields malformed → None."""
-        assert parse_starts_at({"date": "bad", "datetime": "also-bad"}) is None
+        assert _parse_starts_at({"date": "bad", "datetime": "also-bad"}) is None
 
     def test_upsert_record_uses_date_field_not_datetime(self):
         """date field (local naive) must be used; datetime offset is ignored."""
@@ -149,7 +149,7 @@ class TestStartsAtParsing:
         naive = datetime(2026, 1, 15, 10, 30, 0)
         expected_utc = naive.replace(tzinfo=TZ).astimezone(timezone.utc)
 
-        result = parse_starts_at(
+        result = _parse_starts_at(
             {
                 "date": "2026-01-15 10:30:00",
                 "datetime": "2026-01-15T10:30:00+03:00",  # wrong offset — must be IGNORED
@@ -160,6 +160,12 @@ class TestStartsAtParsing:
         assert result.tzinfo == timezone.utc
         assert result == expected_utc  # 09:30 UTC
 
+    def test_dst_fall_back(self):
+        """DST fallback: 2026-10-25 10:30 → CET (UTC+1) → 09:30 UTC."""
+        result = _parse_starts_at({"date": "2026-10-25 10:30:00"})
+        assert result is not None
+        assert result == datetime(2026, 10, 25, 9, 30, tzinfo=timezone.utc)
+
     def test_upsert_record_fallback_to_datetime_strips_offset(self):
         """When 'date' is absent, fallback uses 'datetime' but strips its offset."""
         # datetime carries +03:00 — entirely wrong. The bare wall-clock time
@@ -168,7 +174,7 @@ class TestStartsAtParsing:
         naive = datetime(2026, 1, 15, 10, 30, 0)
         expected_utc = naive.replace(tzinfo=TZ).astimezone(timezone.utc)
 
-        result = parse_starts_at(
+        result = _parse_starts_at(
             {
                 "datetime": "2026-01-15T10:30:00+03:00",  # offset must be stripped
             }
