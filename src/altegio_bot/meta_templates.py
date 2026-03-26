@@ -140,6 +140,7 @@ def build_template_params(
     Returns an empty list for unknown template names (caller logs).
     """
     n = template_name
+    services = ctx.get("services", "").replace("\n", ", ")
 
     # record_created (ka and ra variants share the same param order)
     if n in (
@@ -153,7 +154,7 @@ def build_template_params(
             ctx.get("staff_name", ""),
             ctx.get("date", ""),
             ctx.get("time", ""),
-            ctx.get("services", ""),
+            services,
             ctx.get("total_cost", ""),
             ctx.get("short_link", ""),
         ]
@@ -164,7 +165,7 @@ def build_template_params(
             ctx.get("staff_name", ""),
             ctx.get("date", ""),
             ctx.get("time", ""),
-            ctx.get("services", ""),
+            services,
             ctx.get("total_cost", ""),
             ctx.get("short_link", ""),
         ]
@@ -174,7 +175,7 @@ def build_template_params(
             ctx.get("client_name", ""),
             ctx.get("date", ""),
             ctx.get("time", ""),
-            ctx.get("services", ""),
+            services,
             ctx.get("booking_link", ""),
         ]
 
@@ -189,7 +190,7 @@ def build_template_params(
             ctx.get("staff_name", ""),
             ctx.get("date", ""),
             ctx.get("time", ""),
-            ctx.get("services", ""),
+            services,
             ctx.get("short_link", ""),
         ]
 
