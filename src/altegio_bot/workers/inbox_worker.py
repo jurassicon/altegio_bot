@@ -51,26 +51,25 @@ def parse_dt(value: str | None) -> datetime | None:
     return dt
 
 
-def parse_starts_at(record_data: dict[str, Any]) -> datetime | None:
+def _parse_starts_at(record_data: dict[str, Any]) -> datetime | None:
     """Return starts_at from record_data, preferring the ``date`` field.
 
-    The ``datetime`` field from Altegio contains a wrong UTC offset and must
-    NOT be trusted.  The ``date`` field carries correct local wall-clock time
-    (e.g. ``"2026-04-10 10:30:00"``); we stamp it with the correct local
-    timezone so Python automatically resolves the right DST offset.
+    Altegio's ``datetime`` field contains a **wrong** UTC offset (e.g. +01:00
+    in summer when Europe/Belgrade is actually UTC+2 / CEST).  We therefore:
+      1. Prefer the ``date`` field — correct naïve local wall-clock time.
+      2. Fall back to ``datetime`` but **strip the offset** (first 19 chars only).
+    In both cases we stamp with the correct local timezone so Python resolves
+    the right DST offset automatically, then convert to UTC.
     """
-    raw_date_str = record_data.get("date")  # e.g. "2026-04-10 10:30:00"
+    raw_date_str = record_data.get("date")
     if raw_date_str:
         try:
-            # Parse as naive, then stamp with the correct local timezone.
-            # Python automatically resolves the right DST offset for this specific date.
             naive_dt = datetime.fromisoformat(raw_date_str.strip().replace(" ", "T"))
             return naive_dt.replace(tzinfo=TZ).astimezone(timezone.utc)
         except ValueError:
             pass
 
-    # Rare fallback: `date` is absent, use `datetime` but strip the bad offset.
-    dt_str = record_data.get("datetime")  # e.g. "2026-04-10T10:30:00+01:00"
+    dt_str = record_data.get("datetime")
     if dt_str and len(dt_str) >= 19:
         try:
             naive_dt = datetime.fromisoformat(dt_str[:19])
@@ -147,7 +146,7 @@ async def upsert_record(
     client_data = record_data.get("client") or {}
     staff_data = record_data.get("staff") or {}
 
-    starts_at = parse_starts_at(record_data)
+    starts_at = _parse_starts_at(record_data)
 
     duration_sec = record_data.get("seance_length") or record_data.get("length")
     duration_sec = int(duration_sec) if duration_sec is not None else None
