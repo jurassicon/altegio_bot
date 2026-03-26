@@ -42,7 +42,11 @@ def parse_dt(value: str | None) -> datetime | None:
             return None
 
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=TZ)
+        # Altegio sends local time without timezone info (Europe/Belgrade).
+        # Using .replace(tzinfo=TZ) alone can produce the wrong UTC offset during
+        # DST transitions because fold=0 is assumed by default.
+        # Normalising via UTC forces Python to resolve the correct DST-aware offset.
+        dt = dt.replace(tzinfo=TZ).astimezone(timezone.utc).astimezone(TZ)
 
     return dt
 
