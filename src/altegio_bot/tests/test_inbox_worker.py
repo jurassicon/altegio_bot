@@ -160,6 +160,12 @@ class TestStartsAtParsing:
         assert result.tzinfo == timezone.utc
         assert result == expected_utc  # 09:30 UTC
 
+    def test_dst_fall_back(self):
+        """DST fallback: 2026-10-25 10:30 → CET (UTC+1) → 09:30 UTC."""
+        result = parse_starts_at({"date": "2026-10-25 10:30:00"})
+        assert result is not None
+        assert result == datetime(2026, 10, 25, 9, 30, tzinfo=timezone.utc)
+
     def test_upsert_record_fallback_to_datetime_strips_offset(self):
         """When 'date' is absent, fallback uses 'datetime' but strips its offset."""
         # datetime carries +03:00 — entirely wrong. The bare wall-clock time
