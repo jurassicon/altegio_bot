@@ -32,6 +32,8 @@ class _FakeMetaProvider:
         language: str,
         params: list[str],
         fallback_text: str = "",
+        *,
+        contact_name: str | None = None,
     ) -> str:
         self.templates.append((sender_id, phone_e164, template_name, language, params, fallback_text))
         return f"meta-tpl-{uuid4()}"
@@ -44,7 +46,7 @@ class _FakeChatwootClient:
         self.notes: list[tuple[str, str]] = []
         self._raise = raise_on_log
 
-    async def mirror_outbound_as_note(self, phone_e164: str, text: str) -> None:
+    async def mirror_outbound_as_note(self, phone_e164: str, text: str, *, contact_name: str | None = None) -> None:
         if self._raise:
             raise RuntimeError("Chatwoot API failure")
         self.notes.append((phone_e164, text))
@@ -127,3 +129,24 @@ async def test_aclose_calls_both() -> None:
     await provider.aclose()
     assert closed_meta
     assert closed_cw
+
+
+@pytest.mark.asyncio
+async def test_send_propagates_contact_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    """contact_name passed to send() must reach _log_to_chatwoot."""
+    meta = _FakeMetaProvider()
+    cw = _FakeChatwootClient()
+    provider = ChatwootHybridProvider(primary=meta, chatwoot=cw)  # type: ignore[arg-type]
+
+    captured_names: list[str | None] = []
+    original_log = provider._log_to_chatwoot
+
+    async def _spy_log(phone: str, text: str, *, contact_name: str | None = None, meta: object = None) -> None:
+        captured_names.append(contact_name)
+        await original_log(phone, text, contact_name=contact_name, meta=meta)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(provider, "_log_to_chatwoot", _spy_log)
+
+    await provider.send(1, "+49123", "Hello", contact_name="Anna Müller")
+    await asyncio.sleep(0.05)
+    assert captured_names == ["Anna Müller"]
