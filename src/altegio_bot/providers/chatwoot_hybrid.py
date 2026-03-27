@@ -40,12 +40,16 @@ class ChatwootHybridProvider:
         sender_id: int,
         phone_e164: str,
         text: str,
+        *,
+        contact_name: str | None = None,
     ) -> str:
         # PRIMARY – must succeed (Отправка напрямую в Meta)
         msg_id = await self._primary.send(sender_id, phone_e164, text)
 
         # SECONDARY – best-effort (Логируем в Chatwoot как ПРИВАТНУЮ ЗАМЕТКУ)
-        asyncio.ensure_future(self._log_to_chatwoot(phone_e164, text, meta={"msg_id": msg_id}))
+        asyncio.ensure_future(
+            self._log_to_chatwoot(phone_e164, text, contact_name=contact_name, meta={"msg_id": msg_id})
+        )
 
         return msg_id
 
@@ -57,6 +61,8 @@ class ChatwootHybridProvider:
         language: str,
         params: list[str],
         fallback_text: str = "",
+        *,
+        contact_name: str | None = None,
     ) -> str:
         # PRIMARY – must succeed (отправка в Meta игнорирует fallback_text)
         msg_id = await self._primary.send_template(
@@ -65,7 +71,9 @@ class ChatwootHybridProvider:
 
         # SECONDARY – best-effort (Отправляем в Chatwoot красивый сгенерированный текст)
         content = fallback_text if fallback_text else (f"[{template_name}] " + " | ".join(params))
-        asyncio.ensure_future(self._log_to_chatwoot(phone_e164, content, meta={"msg_id": msg_id}))
+        asyncio.ensure_future(
+            self._log_to_chatwoot(phone_e164, content, contact_name=contact_name, meta={"msg_id": msg_id})
+        )
 
         return msg_id
 
@@ -74,10 +82,11 @@ class ChatwootHybridProvider:
         phone_e164: str,
         content: str,
         *,
+        contact_name: str | None = None,
         meta: dict[str, Any] | None = None,
     ) -> None:
         try:
-            await self._chatwoot.mirror_outbound_as_note(phone_e164, content)
+            await self._chatwoot.mirror_outbound_as_note(phone_e164, content, contact_name=contact_name)
             logger.debug(
                 "Chatwoot mirror ok phone=%s extra=%s",
                 phone_e164,

@@ -9,6 +9,8 @@ class WhatsAppProvider(Protocol):
         sender_id: int,
         phone_e164: str,
         text: str,
+        *,
+        contact_name: str | None = None,
     ) -> str:
         pass
 
@@ -20,5 +22,7 @@ class WhatsAppProvider(Protocol):
         language: str,
         params: list[str],
         fallback_text: str = "",
+        *,
+        contact_name: str | None = None,
     ) -> str:
         pass

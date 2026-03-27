@@ -261,6 +261,8 @@ class ChatwootClient:
         self,
         phone_e164: str,
         text: str,
+        *,
+        contact_name: str | None = None,
     ) -> None:
         """Mirror an outbound message to Chatwoot as a private agent note.
 
@@ -271,7 +273,7 @@ class ChatwootClient:
         Never raises — best-effort.
         """
         try:
-            contact_id = await self.get_or_create_contact(phone_e164)
+            contact_id = await self.get_or_create_contact(phone_e164, name=contact_name)
             conversation_id = await self.get_or_create_conversation(contact_id)
             msg_id = await self.send_message(
                 conversation_id,

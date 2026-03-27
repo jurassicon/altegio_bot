@@ -142,3 +142,28 @@ async def test_mirror_outbound_as_note(client: ChatwootClient) -> None:
     body = json.loads(sent_body)
     assert body["private"] is True
     assert body["message_type"] == "outgoing"
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_mirror_outbound_as_note_with_contact_name(client: ChatwootClient) -> None:
+    """mirror_outbound_as_note with contact_name should pass name to get_or_create_contact."""
+    search_mock = respx.get("https://chatwoot.example.com/api/v1/accounts/1/contacts/search").mock(
+        return_value=httpx.Response(200, json={"payload": []})
+    )
+    create_mock = respx.post("https://chatwoot.example.com/api/v1/accounts/1/contacts").mock(
+        return_value=httpx.Response(200, json={"id": 77, "phone_number": "+49111222333"})
+    )
+    respx.get("https://chatwoot.example.com/api/v1/accounts/1/contacts/77/conversations").mock(
+        return_value=httpx.Response(200, json={"payload": [{"id": 20, "inbox_id": 2, "status": "open"}]})
+    )
+    respx.post("https://chatwoot.example.com/api/v1/accounts/1/conversations/20/messages").mock(
+        return_value=httpx.Response(200, json={"id": 301, "content": "Note"})
+    )
+
+    await client.mirror_outbound_as_note("+49111222333", "Note", contact_name="Alice Müller")
+
+    assert search_mock.called
+    assert create_mock.called
+    create_body = json.loads(create_mock.calls[0].request.content)
+    assert create_body["name"] == "Alice Müller"
