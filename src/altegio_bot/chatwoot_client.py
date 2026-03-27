@@ -1,10 +1,10 @@
 """Chatwoot API client – thin async wrapper around the Chatwoot REST API.
 
 Only the methods required for the dual-write integration are implemented:
-- get_or_create_contact  – upsert a contact by phone number
+- get_or_create_contact      – upsert a contact by phone number
 - get_or_create_conversation – open/reuse a conversation for a contact
-- send_message           – post an outbound message to a conversation
-- sync_template_message  – заменить сырой шаблон на красивый текст
+- send_message               – post an outbound message to a conversation
+- mirror_outbound_as_note    – mirror outbound message as a private agent note
 """
 
 from __future__ import annotations
@@ -257,24 +257,35 @@ class ChatwootClient:
         )
         return conversation_id, message_id
 
-    async def sync_template_message(
+    async def mirror_outbound_as_note(
         self,
-        conversation_id: int,
-        wamid: str,
-        formatted_text: str,
-    ) -> bool:
-        """Заменяет сырое шаблонное сообщение на красивый текст.
+        phone_e164: str,
+        text: str,
+    ) -> None:
+        """Mirror an outbound message to Chatwoot as a private agent note.
 
-        Делегирует в sync_beautiful_message_to_chatwoot() — там ретраи,
-        обработка ошибок и тесты.
+        Pattern from irida_whisper/_send_private_note:
+          private=True → yellow speech bubble, visible to agents only,
+          never delivered to the customer, no conflict with Meta webhook.
+
+        Never raises — best-effort.
         """
-        from altegio_bot.chatwoot_sync import sync_beautiful_message_to_chatwoot
-
-        return await sync_beautiful_message_to_chatwoot(
-            chatwoot_base_url=self._base_url,
-            chatwoot_account_id=self._account_id,
-            chatwoot_api_token=self._api_token,
-            conversation_id=conversation_id,
-            wamid=wamid,
-            formatted_text=formatted_text,
-        )
+        try:
+            contact_id = await self.get_or_create_contact(phone_e164)
+            conversation_id = await self.get_or_create_conversation(contact_id)
+            msg_id = await self.send_message(
+                conversation_id,
+                text,
+                message_type="outgoing",
+                private=True,
+            )
+            logger.info(
+                "Chatwoot mirror note posted msg_id=%s conv=%s phone=%s",
+                msg_id,
+                conversation_id,
+                phone_e164,
+            )
+        except Exception:
+            logger.exception(
+                "Chatwoot mirror failed (best-effort, ignored) phone=%s", phone_e164
+            )

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import httpx
 import pytest
 import respx
@@ -117,3 +119,26 @@ async def test_log_incoming_message(client: ChatwootClient) -> None:
     conv_id, msg_id = await client.log_incoming_message("+49111222333", "Hi")
     assert conv_id == 20
     assert msg_id == 200
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_mirror_outbound_as_note(client: ChatwootClient) -> None:
+    """mirror_outbound_as_note should post a private outgoing message."""
+    respx.get("https://chatwoot.example.com/api/v1/accounts/1/contacts/search").mock(
+        return_value=httpx.Response(200, json={"payload": [{"id": 5, "phone_number": "+49111222333"}]})
+    )
+    respx.get("https://chatwoot.example.com/api/v1/accounts/1/contacts/5/conversations").mock(
+        return_value=httpx.Response(200, json={"payload": [{"id": 20, "inbox_id": 2, "status": "open"}]})
+    )
+    post_mock = respx.post("https://chatwoot.example.com/api/v1/accounts/1/conversations/20/messages").mock(
+        return_value=httpx.Response(200, json={"id": 300, "content": "Note"})
+    )
+
+    await client.mirror_outbound_as_note("+49111222333", "Note")
+
+    assert post_mock.called
+    sent_body = post_mock.calls[0].request.content
+    body = json.loads(sent_body)
+    assert body["private"] is True
+    assert body["message_type"] == "outgoing"

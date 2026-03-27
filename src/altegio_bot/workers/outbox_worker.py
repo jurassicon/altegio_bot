@@ -11,7 +11,6 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from altegio_bot.chatwoot_client import ChatwootClient  # ← новый импорт
 from altegio_bot.db import SessionLocal
 from altegio_bot.meta_templates import (
     TEMPLATE_LANGUAGE,
@@ -30,7 +29,6 @@ from altegio_bot.models.models import (
 from altegio_bot.providers.base import WhatsAppProvider
 from altegio_bot.providers.dummy import safe_send, safe_send_template
 from altegio_bot.settings import settings
-from altegio_bot.utils import fire_and_forget  # ← новый импорт
 from altegio_bot.whatsapp_routing import pick_sender_code_for_record, pick_sender_id
 
 logger = logging.getLogger("outbox_worker")
@@ -788,49 +786,6 @@ async def process_job_in_session(
         send_meta.get("send_type"),
         send_meta.get("template"),
     )
-
-    # Chatwoot: заменяем сырой шаблон на красивый текст.
-    if settings.chatwoot_enabled and send_meta.get("send_type") == "template" and msg_id is not None:
-        fire_and_forget(
-            _sync_chatwoot_for_phone(
-                phone_e164=phone,
-                wamid=str(msg_id),
-                formatted_text=final_body,
-            )
-        )
-        logger.debug(
-            "Chatwoot sync запущен фоном: job_id=%s wamid=%s phone=%s",
-            job.id,
-            msg_id,
-            phone,
-        )
-
-
-async def _sync_chatwoot_for_phone(
-    *,
-    phone_e164: str,
-    wamid: str,
-    formatted_text: str,
-) -> None:
-    chatwoot_client: ChatwootClient | None = None
-    try:
-        chatwoot_client = ChatwootClient()
-        contact_id = await chatwoot_client.get_or_create_contact(phone_e164)
-        conversation_id = await chatwoot_client.get_or_create_conversation(contact_id)
-
-        await chatwoot_client.sync_template_message(
-            conversation_id=conversation_id,
-            wamid=wamid,
-            formatted_text=formatted_text,
-        )
-    except Exception:
-        logger.exception("Chatwoot sync failed: phone=%s wamid=%s", phone_e164, wamid)
-    finally:
-        if chatwoot_client is not None:
-            try:
-                await chatwoot_client.aclose()
-            except Exception:
-                pass
 
 
 async def process_job(
