@@ -167,3 +167,20 @@ async def test_mirror_outbound_as_note_with_contact_name(client: ChatwootClient)
     assert create_mock.called
     create_body = json.loads(create_mock.calls[0].request.content)
     assert create_body["name"] == "Alice Müller"
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_get_or_create_contact_sends_name_on_create(client: ChatwootClient) -> None:
+    """name= must be included in the POST body when creating a new contact."""
+    respx.get("https://chatwoot.example.com/api/v1/accounts/1/contacts/search").mock(
+        return_value=httpx.Response(200, json={"payload": []})
+    )
+    create_route = respx.post("https://chatwoot.example.com/api/v1/accounts/1/contacts").mock(
+        return_value=httpx.Response(200, json={"id": 77, "phone_number": "+49111000111"})
+    )
+
+    cid = await client.get_or_create_contact("+49111000111", name="Bob Mustermann")
+    assert cid == 77
+    body = json.loads(create_route.calls[0].request.content)
+    assert body.get("name") == "Bob Mustermann"

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Sequence
@@ -22,6 +23,16 @@ TZ = ZoneInfo("Europe/Belgrade")
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _normalize_phone(raw: str | None) -> str | None:
+    """Normalize any phone string to E.164 (+digits). Returns None if empty."""
+    if not raw:
+        return None
+    digits = re.sub(r"\D+", "", raw)
+    if not digits:
+        return None
+    return f"+{digits}"
 
 
 def parse_dt(value: str | None) -> datetime | None:
@@ -106,13 +117,14 @@ async def upsert_client(
         raise ValueError("client.id missing in payload")
 
     display_name = client_data.get("display_name") or client_data.get("name")
+    phone = _normalize_phone(client_data.get("phone"))
 
     stmt = (
         insert(Client)
         .values(
             company_id=int(company_id),
             altegio_client_id=int(altegio_client_id),
-            phone_e164=client_data.get("phone"),
+            phone_e164=phone,
             display_name=display_name,
             email=client_data.get("email"),
             raw=client_data,
@@ -120,7 +132,7 @@ async def upsert_client(
         .on_conflict_do_update(
             constraint="uq_clients_company_altegio_id",
             set_={
-                "phone_e164": client_data.get("phone"),
+                "phone_e164": phone,
                 "display_name": display_name,
                 "email": client_data.get("email"),
                 "raw": client_data,

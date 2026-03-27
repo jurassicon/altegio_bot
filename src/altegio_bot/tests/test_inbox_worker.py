@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
-from altegio_bot.workers.inbox_worker import _parse_starts_at, parse_dt
+from altegio_bot.workers.inbox_worker import _normalize_phone, _parse_starts_at, parse_dt
 
 
 class TestParseDt:
@@ -183,3 +183,25 @@ class TestStartsAtParsing:
         assert result is not None
         assert result.tzinfo == timezone.utc
         assert result == expected_utc  # 09:30 UTC
+
+
+class TestNormalizePhone:
+    """Tests for _normalize_phone."""
+
+    def test_none_returns_none(self):
+        assert _normalize_phone(None) is None
+
+    def test_empty_string_returns_none(self):
+        assert _normalize_phone("") is None
+
+    def test_digits_only_adds_plus(self):
+        assert _normalize_phone("4917637706557") == "+4917637706557"
+
+    def test_already_has_plus(self):
+        assert _normalize_phone("+4917637706557") == "+4917637706557"
+
+    def test_strips_spaces_and_dashes(self):
+        assert _normalize_phone("+49 176-3770-6557") == "+4917637706557"
+
+    def test_whitespace_only_returns_none(self):
+        assert _normalize_phone("   ") is None
