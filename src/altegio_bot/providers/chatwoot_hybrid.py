@@ -45,7 +45,7 @@ class ChatwootHybridProvider:
         msg_id = await self._primary.send(sender_id, phone_e164, text)
 
         # SECONDARY – best-effort (Логируем в Chatwoot как ПРИВАТНУЮ ЗАМЕТКУ)
-        asyncio.ensure_future(self._log_to_chatwoot(phone_e164, text, meta={"msg_id": msg_id}, private=True))
+        asyncio.ensure_future(self._log_to_chatwoot(phone_e164, text, meta={"msg_id": msg_id}))
 
         return msg_id
 
@@ -65,7 +65,7 @@ class ChatwootHybridProvider:
 
         # SECONDARY – best-effort (Отправляем в Chatwoot красивый сгенерированный текст)
         content = fallback_text if fallback_text else (f"[{template_name}] " + " | ".join(params))
-        asyncio.ensure_future(self._log_to_chatwoot(phone_e164, content, meta={"msg_id": msg_id}, private=True))
+        asyncio.ensure_future(self._log_to_chatwoot(phone_e164, content, meta={"msg_id": msg_id}))
 
         return msg_id
 
@@ -75,21 +75,12 @@ class ChatwootHybridProvider:
         content: str,
         *,
         meta: dict[str, Any] | None = None,
-        private: bool = False,
     ) -> None:
         try:
-            contact_id = await self._chatwoot.get_or_create_contact(phone_e164)
-            conversation_id = await self._chatwoot.get_or_create_conversation(contact_id)
-            await self._chatwoot.send_message(
-                conversation_id,
-                content,
-                message_type="outgoing",
-                private=private,  # Передаем флаг приватности
-            )
+            await self._chatwoot.mirror_outbound_as_note(phone_e164, content)
             logger.debug(
-                "Chatwoot log ok phone=%s conversation_id=%s extra=%s",
+                "Chatwoot mirror ok phone=%s extra=%s",
                 phone_e164,
-                conversation_id,
                 meta,
             )
         except Exception as exc:
