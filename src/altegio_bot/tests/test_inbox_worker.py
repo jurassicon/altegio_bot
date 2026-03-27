@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
 
-from altegio_bot.workers.inbox_worker import _normalize_phone, _parse_starts_at, parse_dt
+from altegio_bot.workers.inbox_worker import _normalize_phone, _parse_starts_at, handle_event, parse_dt
 
 
 class TestParseDt:
@@ -205,3 +206,65 @@ class TestNormalizePhone:
 
     def test_whitespace_only_returns_none(self):
         assert _normalize_phone("   ") is None
+
+
+class TestHandleEventVisitAttendance:
+    """Tests that visit_attendance update events are skipped without creating jobs."""
+
+    def _make_event(self, visit_attendance: int, event_status: str = "update") -> MagicMock:
+        event = MagicMock()
+        event.id = 1
+        event.company_id = 123
+        event.resource = "record"
+        event.resource_id = 42
+        event.event_status = event_status
+        event.payload = {
+            "data": {
+                "id": 42,
+                "client": {"id": 7, "display_name": "Test Client", "phone": "+79001234567"},
+                "services": [],
+                "visit_attendance": visit_attendance,
+                "date": "2026-01-15 10:30:00",
+                "staff_id": 5,
+            }
+        }
+        return event
+
+    async def _run_handle(self, event: MagicMock) -> bool:
+        """Run handle_event with mocked DB and return True if plan_jobs was called."""
+        session = AsyncMock()
+
+        with (
+            patch("altegio_bot.workers.inbox_worker.upsert_client", new=AsyncMock(return_value=7)),
+            patch("altegio_bot.workers.inbox_worker.upsert_record", new=AsyncMock(return_value=99)),
+            patch("altegio_bot.workers.inbox_worker.replace_record_services", new=AsyncMock()),
+            patch("altegio_bot.workers.inbox_worker.record_has_allowed_service", new=AsyncMock(return_value=True)),
+            patch("altegio_bot.workers.inbox_worker.plan_jobs_for_record_event", new=AsyncMock()) as mock_plan,
+        ):
+            session.get = AsyncMock(return_value=MagicMock(id=99, company_id=123))
+            await handle_event(session, event)
+            return mock_plan.called
+
+    async def test_visit_attendance_minus_one_skipped(self):
+        """visit_attendance=-1 (not arrived) must not trigger job creation."""
+        event = self._make_event(visit_attendance=-1)
+        called = await self._run_handle(event)
+        assert not called, "plan_jobs should NOT be called for visit_attendance=-1"
+
+    async def test_visit_attendance_one_skipped(self):
+        """visit_attendance=1 (arrived) must not trigger job creation."""
+        event = self._make_event(visit_attendance=1)
+        called = await self._run_handle(event)
+        assert not called, "plan_jobs should NOT be called for visit_attendance=1"
+
+    async def test_visit_attendance_zero_processed(self):
+        """visit_attendance=0 (pending) must proceed to job creation."""
+        event = self._make_event(visit_attendance=0)
+        called = await self._run_handle(event)
+        assert called, "plan_jobs SHOULD be called for visit_attendance=0"
+
+    async def test_non_update_status_not_skipped(self):
+        """create events must not be skipped regardless of visit_attendance."""
+        event = self._make_event(visit_attendance=-1, event_status="create")
+        called = await self._run_handle(event)
+        assert called, "plan_jobs SHOULD be called for event_status=create"

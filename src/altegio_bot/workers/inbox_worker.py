@@ -328,6 +328,19 @@ async def handle_event(session: AsyncSession, event: AltegioEvent) -> None:
         services_payload = data.get("services")
         await replace_record_services(session, record_pk, services_payload)
 
+        # Пропускаем события смены статуса визита (visit_attendance).
+        # Альтеджио присылает update с visit_attendance != 0 когда клиент отмечен как
+        # пришедший (1) или не пришедший (-1). Такие события не требуют создания job'ов.
+        if event_status == "update":
+            visit_attendance = data.get("visit_attendance")
+            if visit_attendance is not None and int(visit_attendance) != 0:
+                logger.info(
+                    "Skip visit_attendance change: record_id=%s visit_attendance=%s",
+                    record_pk,
+                    visit_attendance,
+                )
+                return
+
         record_obj = await session.get(Record, record_pk)
 
         if record_obj is not None and event_status is not None:
