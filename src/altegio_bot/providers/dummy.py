@@ -34,6 +34,8 @@ class DummyProvider(WhatsAppProvider):
         sender_id: int,
         phone_e164: str,
         text: str,
+        *,
+        contact_name: str | None = None,
     ) -> str:
         provider_message_id = f"dummy-{uuid4()}"
         logger.info(
@@ -53,6 +55,8 @@ class DummyProvider(WhatsAppProvider):
         language: str,
         params: list[str],
         fallback_text: str = "",
+        *,
+        contact_name: str | None = None,
     ) -> str:
         provider_message_id = f"dummy-tpl-{uuid4()}"
         logger.info(
@@ -72,12 +76,14 @@ async def safe_send(
     sender_id: int,
     phone: str,
     text: str,
+    *,
+    contact_name: str | None = None,
 ) -> tuple[str | None, str | None]:
     if not _real_send_allowed(provider):
         return None, "Real send disabled"
 
     try:
-        msg_id = await provider.send(sender_id, phone, text)
+        msg_id = await provider.send(sender_id, phone, text, contact_name=contact_name)
         return msg_id, None
     except Exception as exc:
         logger.exception("send failed: %s", exc)
@@ -92,13 +98,21 @@ async def safe_send_template(
     language: str,
     params: list[str],
     fallback_text: str = "",
+    *,
+    contact_name: str | None = None,
 ) -> tuple[str | None, str | None]:
     if not _real_send_allowed(provider):
         return None, "Real send disabled"
 
     try:
         msg_id = await provider.send_template(
-            sender_id, phone, template_name, language, params, fallback_text=fallback_text
+            sender_id,
+            phone,
+            template_name,
+            language,
+            params,
+            fallback_text=fallback_text,
+            contact_name=contact_name,
         )
         return msg_id, None
     except Exception as exc:

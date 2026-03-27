@@ -74,6 +74,8 @@ class MetaCloudProvider(WhatsAppProvider):
         sender_id: int,
         phone_e164: str,
         text: str,
+        *,
+        contact_name: str | None = None,
     ) -> str:
         if not self._allow_real_send:
             raise RuntimeError("Real send disabled (set ALLOW_REAL_SEND=1)")
@@ -130,6 +132,8 @@ class MetaCloudProvider(WhatsAppProvider):
         language: str,
         params: list[str],
         fallback_text: str = "",
+        *,
+        contact_name: str | None = None,
     ) -> str:
         """Send an approved Meta template message."""
         if not self._allow_real_send:

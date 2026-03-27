@@ -696,6 +696,7 @@ async def process_job_in_session(
             language=TEMPLATE_LANGUAGE,
             params=template_params,
             fallback_text=final_body,
+            contact_name=client.display_name if client else None,
         )
         send_meta: dict[str, Any] = {
             "send_type": "template",
@@ -709,6 +710,7 @@ async def process_job_in_session(
             sender_id=sender_id,
             phone=phone,
             text=final_body,
+            contact_name=client.display_name if client else None,
         )
         send_meta = {"send_type": "text"}
 
