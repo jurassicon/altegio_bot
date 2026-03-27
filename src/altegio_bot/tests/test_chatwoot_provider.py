@@ -14,14 +14,14 @@ class _FakeMetaProvider:
     """Stub MetaCloudProvider that records calls."""
 
     def __init__(self, raise_on_send: bool = False) -> None:
-        self.sent: list[tuple[int, str, str]] = []
+        self.sent: list[tuple[int, str, str, str | None]] = []
         self.templates: list[tuple] = []
         self._raise = raise_on_send
 
-    async def send(self, sender_id: int, phone_e164: str, text: str) -> str:
+    async def send(self, sender_id: int, phone_e164: str, text: str, contact_name: str | None = None) -> str:
         if self._raise:
             raise RuntimeError("Meta API failure")
-        self.sent.append((sender_id, phone_e164, text))
+        self.sent.append((sender_id, phone_e164, text, contact_name))
         return f"meta-{uuid4()}"
 
     async def send_template(

@@ -21,7 +21,7 @@ class CaptureProvider(WhatsAppProvider):
     def __init__(self) -> None:
         self.sent: list[tuple[int, str, str]] = []
 
-    async def send(self, sender_id: int, phone_e164: str, text: str) -> str:
+    async def send(self, sender_id: int, phone_e164: str, text: str, contact_name: str | None = None) -> str:
         self.sent.append((sender_id, phone_e164, text))
         return "msg-1"
 
