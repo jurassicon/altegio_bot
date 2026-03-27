@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any
 from uuid import uuid4
 
 import pytest
@@ -42,24 +41,13 @@ class _FakeChatwootClient:
     """Stub ChatwootClient that records calls."""
 
     def __init__(self, raise_on_log: bool = False) -> None:
-        self.logged: list[tuple[int, str]] = []
+        self.notes: list[tuple[str, str]] = []
         self._raise = raise_on_log
-        self._contact_id = 1
-        self._conv_id = 10
 
-    async def get_or_create_contact(self, phone: str, *, name: Any = None) -> int:
-        return self._contact_id
-
-    async def get_or_create_conversation(self, contact_id: int) -> int:
-        return self._conv_id
-
-    async def send_message(
-        self, conv_id: int, content: str, *, message_type: str = "outgoing", private: bool = False
-    ) -> int:
+    async def mirror_outbound_as_note(self, phone_e164: str, text: str) -> None:
         if self._raise:
             raise RuntimeError("Chatwoot API failure")
-        self.logged.append((conv_id, content))
-        return 999
+        self.notes.append((phone_e164, text))
 
     async def aclose(self) -> None:
         pass
