@@ -44,7 +44,7 @@ async def test_create_schedules_created_now(session_maker):
 
 
 @pytest.mark.asyncio
-async def test_create_schedules_reminder_24h_only_when_more_than_24h_left(
+async def test_create_schedules_both_reminders_when_more_than_24h_left(
     session_maker,
 ):
     now = utcnow()
@@ -73,13 +73,17 @@ async def test_create_schedules_reminder_24h_only_when_more_than_24h_left(
         assert [j.job_type for j in jobs] == [
             "record_created",
             "reminder_24h",
+            "reminder_2h",
             "review_3d",
             "repeat_10d",
         ]
+        reminder_24h = jobs[1]
+        assert reminder_24h.job_type == "reminder_24h"
+        assert reminder_24h.run_at == record.starts_at - timedelta(hours=24)
 
-        reminder = jobs[1]
-        assert reminder.job_type == "reminder_24h"
-        assert reminder.run_at == record.starts_at - timedelta(hours=24)
+        reminder_2h = jobs[2]
+        assert reminder_2h.job_type == "reminder_2h"
+        assert reminder_2h.run_at == record.starts_at - timedelta(hours=2)
 
 
 @pytest.mark.asyncio
@@ -158,14 +162,13 @@ async def test_update_reschedules_system_jobs(session_maker):
         canceled = [j.job_type for j in jobs if j.status == "canceled"]
         queued = [j.job_type for j in jobs if j.status == "queued"]
 
-        assert sorted(canceled) == sorted(
-            [
-                "record_created",
-                "reminder_24h",
-                "review_3d",
-                "repeat_10d",
-            ]
-        )
+        assert sorted(canceled) == sorted([
+            "record_created",
+            "reminder_24h",
+            "reminder_2h",
+            "review_3d",
+            "repeat_10d",
+        ])
 
         assert sorted(queued) == sorted(
             [
@@ -215,14 +218,13 @@ async def test_delete_cancels_future_jobs_and_schedules_canceled_and_comeback(
         canceled = [j.job_type for j in jobs if j.status == "canceled"]
         queued = [j.job_type for j in jobs if j.status == "queued"]
 
-        assert sorted(canceled) == sorted(
-            [
-                "record_created",
-                "reminder_24h",
-                "review_3d",
-                "repeat_10d",
-            ]
-        )
+        assert sorted(canceled) == sorted([
+            "record_created",
+            "reminder_24h",
+            "reminder_2h",
+            "review_3d",
+            "repeat_10d",
+        ])
 
         assert sorted(queued) == sorted(
             [

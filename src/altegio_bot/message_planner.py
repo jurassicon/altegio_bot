@@ -247,7 +247,7 @@ async def plan_jobs_for_record_event(
             )
 
         delta = starts_at - now
-        if timedelta(hours=2) < delta <= timedelta(hours=24):
+        if delta > timedelta(hours=2):
             run_at_2h = starts_at - timedelta(hours=2)
             if run_at_2h > now:
                 await add_job(
