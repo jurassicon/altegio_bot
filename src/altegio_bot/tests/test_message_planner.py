@@ -162,13 +162,15 @@ async def test_update_reschedules_system_jobs(session_maker):
         canceled = [j.job_type for j in jobs if j.status == "canceled"]
         queued = [j.job_type for j in jobs if j.status == "queued"]
 
-        assert sorted(canceled) == sorted([
-            "record_created",
-            "reminder_24h",
-            "reminder_2h",
-            "review_3d",
-            "repeat_10d",
-        ])
+        assert sorted(canceled) == sorted(
+            [
+                "record_created",
+                "reminder_24h",
+                "reminder_2h",
+                "review_3d",
+                "repeat_10d",
+            ]
+        )
 
         assert sorted(queued) == sorted(
             [
@@ -218,13 +220,15 @@ async def test_delete_cancels_future_jobs_and_schedules_canceled_and_comeback(
         canceled = [j.job_type for j in jobs if j.status == "canceled"]
         queued = [j.job_type for j in jobs if j.status == "queued"]
 
-        assert sorted(canceled) == sorted([
-            "record_created",
-            "reminder_24h",
-            "reminder_2h",
-            "review_3d",
-            "repeat_10d",
-        ])
+        assert sorted(canceled) == sorted(
+            [
+                "record_created",
+                "reminder_24h",
+                "reminder_2h",
+                "review_3d",
+                "repeat_10d",
+            ]
+        )
 
         assert sorted(queued) == sorted(
             [
