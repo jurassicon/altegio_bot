@@ -67,6 +67,11 @@ BOOKING_LINKS = {
     1271200: "https://n813709.alteg.io/",
 }
 
+GOOGLE_MAPS_REVIEW_LINKS: dict[int, str] = {
+    758285: "https://g.page/r/CdOqDUWhxCAbEBM/review",  # Karlsruhe
+    1271200: "https://g.page/r/CWd7fy4dua5kEBM/review",  # Rastatt
+}
+
 PRE_APPOINTMENT_NOTES_DE = (
     "\n\nWichtige Hinweise vor dem Termin:\n"
     "• Bitte pünktlich kommen — ab 15 Min. Verspätung können wir "
@@ -432,6 +437,9 @@ async def _render_message(
         "sender_code": sender_code,
         "pre_appointment_notes": pre_appointment_notes,
     }
+
+    if template_code == "review_3d":
+        ctx["short_link"] = GOOGLE_MAPS_REVIEW_LINKS.get(company_id, ctx["short_link"])
 
     body = tmpl.body
     return body, sender_id, used_lang, ctx
