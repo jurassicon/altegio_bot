@@ -221,6 +221,18 @@ def test_params_review_3d() -> None:
     assert params == ["Anna", "https://short.link/abc"]
 
 
+def test_params_review_3d_ka_uses_google_maps_link() -> None:
+    ctx = dict(_CTX, short_link="https://g.page/r/CdOqDUWhxCAbEBM/review")
+    params = build_template_params("kitilash_ka_review_3d_v1", ctx)
+    assert params == ["Anna", "https://g.page/r/CdOqDUWhxCAbEBM/review"]
+
+
+def test_params_review_3d_ra_uses_google_maps_link() -> None:
+    ctx = dict(_CTX, short_link="https://g.page/r/CWd7fy4dua5kEBM/review")
+    params = build_template_params("kitilash_ra_review_3d_v1", ctx)
+    assert params == ["Anna", "https://g.page/r/CWd7fy4dua5kEBM/review"]
+
+
 def test_params_repeat_10d() -> None:
     params = build_template_params("kitilash_ka_repeat_10d_v1", _CTX)
     assert params == ["Anna", "Mascara", "https://booking.link/"]
