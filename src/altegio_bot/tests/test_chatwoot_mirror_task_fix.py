@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 from uuid import uuid4
 
 import pytest
@@ -65,17 +64,20 @@ class _SlowChatwoot:
 
 
 async def test_send_creates_tracked_task_not_orphan() -> None:
-    """After send(), a task must appear in _background_tasks (not an orphan)."""
+    """After send(), a task must appear in _background_tasks immediately (not an orphan)."""
     meta = _FakeMeta()
     cw = _FakeChatwoot()
     provider = ChatwootHybridProvider(primary=meta, chatwoot=cw)  # type: ignore[arg-type]
 
     await provider.send(1, "+49100000001", "hello")
 
-    # The task is scheduled but may not have finished yet; it must be tracked.
-    assert len(provider._background_tasks) <= 1
+    # The task must be in the set right after send() returns, before it runs.
+    assert len(provider._background_tasks) == 1, "task was not added to _background_tasks"
+    task = next(iter(provider._background_tasks))
+    assert isinstance(task, asyncio.Task), "tracked item must be an asyncio.Task, not a bare Future/coroutine"
+
+    # Let the task run; the discard callback removes it from the set.
     await asyncio.sleep(0.05)
-    # After it finishes, discard callback removes it from the set.
     assert len(provider._background_tasks) == 0
     assert len(cw.notes) == 1
 
@@ -155,16 +157,82 @@ async def test_mirror_note_is_actually_posted() -> None:
 
 
 def test_orphan_task_pattern_is_not_used() -> None:
-    """ensure_future must not be used for mirror tasks in ChatwootHybridProvider."""
-    import altegio_bot.providers.chatwoot_hybrid as _mod
+    """_background_tasks must hold proper asyncio.Task objects, not bare Futures or coroutines.
 
-    source = inspect.getsource(_mod)
-    # asyncio.ensure_future should not appear in mirror-scheduling code paths.
-    assert "ensure_future" not in source, "ensure_future found – orphan task pattern must not be used"
+    This is a behavioral check: it verifies that _schedule_mirror stores the result
+    of asyncio.create_task() (which returns an asyncio.Task), not a raw coroutine or
+    a Future produced by the older asyncio.ensure_future() pattern.
+    """
+
+    # We need a running event loop to create tasks; use asyncio.run with a sync wrapper.
+    async def _check() -> None:
+        meta = _FakeMeta()
+        cw = _FakeChatwoot()
+        provider = ChatwootHybridProvider(primary=meta, chatwoot=cw)  # type: ignore[arg-type]
+        await provider.send(1, "+49100000099", "type check")
+        # Grab the live task before it finishes.
+        assert provider._background_tasks, "expected at least one tracked task"
+        for item in provider._background_tasks:
+            assert isinstance(item, asyncio.Task), f"item in _background_tasks must be asyncio.Task, got {type(item)}"
+        await asyncio.sleep(0.05)  # let task finish cleanly
+
+    asyncio.run(_check())
+
+
+async def test_mirror_task_exception_does_not_crash_send() -> None:
+    """An exception inside the mirror coroutine must not propagate to the caller of send()."""
+    meta = _FakeMeta()
+
+    class _BrokenChatwoot:
+        async def mirror_outbound_as_note(self, phone_e164: str, text: str, *, contact_name: str | None = None) -> None:
+            raise RuntimeError("Chatwoot is down")
+
+        async def aclose(self) -> None:
+            pass
+
+    provider = ChatwootHybridProvider(primary=meta, chatwoot=_BrokenChatwoot())  # type: ignore[arg-type]
+
+    # send() itself must succeed even though the mirror will raise.
+    msg_id = await provider.send(1, "+49100000010", "should not crash")
+    assert msg_id.startswith("meta-")
+
+    # Let the mirror task run (and swallow its error).
+    await asyncio.sleep(0.05)
+    assert len(provider._background_tasks) == 0
+
+
+async def test_realistic_shutdown_flow() -> None:
+    """Realistic scenario: multiple sends, then aclose() — all mirrors must be posted."""
+    meta = _FakeMeta()
+    cw = _FakeChatwoot()
+
+    # Give mirror calls a small delay to simulate network latency.
+    original_mirror = cw.mirror_outbound_as_note
+
+    async def _latent_mirror(phone: str, text: str, *, contact_name: str | None = None) -> None:
+        await asyncio.sleep(0.02)
+        await original_mirror(phone, text, contact_name=contact_name)
+
+    cw.mirror_outbound_as_note = _latent_mirror  # type: ignore[method-assign]
+
+    provider = ChatwootHybridProvider(primary=meta, chatwoot=cw)  # type: ignore[arg-type]
+
+    phones = [f"+4910000001{i}" for i in range(5)]
+    for phone in phones:
+        await provider.send(1, phone, f"msg to {phone}")
+
+    # All five tasks should be in-flight right now.
+    assert len(provider._background_tasks) == 5
+
+    # aclose() must wait for all of them.
+    await provider.aclose()
+
+    assert len(cw.notes) == 5
+    noted_phones = {note[0] for note in cw.notes}
+    assert noted_phones == set(phones)
 
 
 async def test_safe_send_passes_mirror_kwargs() -> None:
-    """safe_send must forward company_id / staff_id when provider supports them."""
     received: dict[str, object] = {}
 
     class _CaptureMeta:

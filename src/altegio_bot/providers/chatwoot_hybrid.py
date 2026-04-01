@@ -38,7 +38,7 @@ class ChatwootHybridProvider:
 
     async def aclose(self) -> None:
         if self._background_tasks:
-            done, pending = await asyncio.wait(self._background_tasks, timeout=_ACLOSE_TIMEOUT)
+            _, pending = await asyncio.wait(self._background_tasks, timeout=_ACLOSE_TIMEOUT)
             if pending:
                 logger.warning(
                     "aclose: %d background mirror task(s) did not finish within %.1fs",
