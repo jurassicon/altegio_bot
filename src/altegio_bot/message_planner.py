@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import update
+from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -37,6 +37,11 @@ MARKETING_JOB_TYPES = (
     REPEAT_10D,
     COMEBACK_3D,
 )
+
+# Максимальное количество посещений клиента, при котором ещё отправляется запрос
+# на отзыв. Клиентам с большим опытом (более MAX_VISITS_FOR_REVIEW визитов)
+# сообщение с просьбой об отзыве не отправляется.
+MAX_VISITS_FOR_REVIEW = 3
 
 
 def _normalize_event_status(value: str | None) -> str | None:
@@ -147,6 +152,24 @@ async def add_job(
     )
 
     await session.execute(stmt)
+
+
+async def _count_client_visits(
+    session: AsyncSession,
+    *,
+    client_id: int,
+    company_id: int,
+) -> int:
+    """Возвращает количество не удалённых записей (визитов) клиента в филиале."""
+    stmt = (
+        select(func.count())
+        .select_from(Record)
+        .where(Record.client_id == client_id)
+        .where(Record.company_id == company_id)
+        .where(Record.is_deleted.is_(False))
+    )
+    result = await session.execute(stmt)
+    return result.scalar_one()
 
 
 async def _load_record_and_client(
@@ -266,15 +289,26 @@ async def plan_jobs_for_record_event(
         if starts_at is not None:
             review_at = starts_at + timedelta(days=3)
             if review_at > now:
-                await add_job(
-                    session,
-                    company_id=cid,
-                    record_id=int(record_obj.id),
-                    client_id=record_obj.client_id,
-                    job_type=REVIEW_3D,
-                    run_at=review_at,
-                    payload={"kind": REVIEW_3D},
-                )
+                # Отправляем запрос на отзыв только новым клиентам (не более MAX_VISITS_FOR_REVIEW визитов)
+                is_new_visitor = True
+                if record_obj.client_id is not None:
+                    visit_count = await _count_client_visits(
+                        session,
+                        client_id=record_obj.client_id,
+                        company_id=cid,
+                    )
+                    is_new_visitor = visit_count <= MAX_VISITS_FOR_REVIEW
+
+                if is_new_visitor:
+                    await add_job(
+                        session,
+                        company_id=cid,
+                        record_id=int(record_obj.id),
+                        client_id=record_obj.client_id,
+                        job_type=REVIEW_3D,
+                        run_at=review_at,
+                        payload={"kind": REVIEW_3D},
+                    )
 
             repeat_at = starts_at + timedelta(days=10)
             if repeat_at > now:
@@ -293,8 +327,6 @@ async def plan_jobs_for_record_event(
 
         # Дедупликация на входе: проверяем, нет ли уже такой задачи в очереди
         if record_obj.client_id is not None:
-            from sqlalchemy import select
-
             stmt = (
                 select(MessageJob.id)
                 .where(MessageJob.company_id == cid)
