@@ -139,6 +139,54 @@ async def test_aclose_logs_warning_when_tasks_timeout(caplog: pytest.LogCaptureF
     assert any("did not finish" in r.message for r in caplog.records)
 
 
+async def test_aclose_cancels_pending_tasks_before_closing_client() -> None:
+    """After the aclose() timeout, pending tasks must be cancelled before the client is closed.
+
+    This prevents tasks that were still sleeping from waking up and calling into
+    an already-closed ChatwootClient instance.
+    """
+    cancelled_after_close: list[bool] = []
+
+    class _TrackingChatwoot:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def mirror_outbound_as_note(self, phone_e164: str, text: str, *, contact_name: str | None = None) -> None:
+            # Sleep longer than the patched timeout so the task is pending at aclose().
+            await asyncio.sleep(10.0)
+            # If we ever reach here AFTER close, that's the bug we're guarding against.
+            if self.closed:
+                cancelled_after_close.append(True)
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    meta = _FakeMeta()
+    cw = _TrackingChatwoot()
+    provider = ChatwootHybridProvider(primary=meta, chatwoot=cw)  # type: ignore[arg-type]
+
+    import altegio_bot.providers.chatwoot_hybrid as _mod
+
+    original_timeout = _mod._ACLOSE_TIMEOUT
+    _mod._ACLOSE_TIMEOUT = 0.05  # type: ignore[assignment]
+    try:
+        await provider.send(1, "+49100000020", "cancel me")
+        # Grab the task reference before aclose() discards it.
+        assert len(provider._background_tasks) == 1
+        task = next(iter(provider._background_tasks))
+
+        await provider.aclose()
+    finally:
+        _mod._ACLOSE_TIMEOUT = original_timeout  # type: ignore[assignment]
+
+    # The task must have been cancelled, not left running.
+    assert task.cancelled(), "pending task was not cancelled by aclose()"
+    # The chatwoot client must be closed.
+    assert cw.closed
+    # The running task must never have used the client after it was closed.
+    assert cancelled_after_close == []
+
+
 async def test_mirror_note_is_actually_posted() -> None:
     """End-to-end: send() → await task → mirror_outbound_as_note was called."""
     meta = _FakeMeta()
