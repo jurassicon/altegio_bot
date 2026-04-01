@@ -16,9 +16,15 @@ from altegio_bot.providers.meta_cloud import MetaCloudProvider
 
 logger = logging.getLogger(__name__)
 
+_ACLOSE_TIMEOUT = 3.0
+
 
 class ChatwootHybridProvider:
     """Wraps MetaCloudProvider and mirrors outbound messages to Chatwoot."""
+
+    # Signals to safe_send / safe_send_template that this provider accepts
+    # company_id and staff_id keyword arguments.
+    _supports_mirror_kwargs: bool = True
 
     def __init__(
         self,
@@ -28,12 +34,31 @@ class ChatwootHybridProvider:
     ) -> None:
         self._primary: WhatsAppProvider = primary or MetaCloudProvider()
         self._chatwoot: ChatwootClient = chatwoot or ChatwootClient()
+        self._background_tasks: set[asyncio.Task[None]] = set()
 
     async def aclose(self) -> None:
+        if self._background_tasks:
+            _, pending = await asyncio.wait(self._background_tasks, timeout=_ACLOSE_TIMEOUT)
+            if pending:
+                logger.warning(
+                    "aclose: %d background mirror task(s) did not finish within %.1fs; cancelling",
+                    len(pending),
+                    _ACLOSE_TIMEOUT,
+                )
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+
         aclose_primary = getattr(self._primary, "aclose", None)
         if callable(aclose_primary):
             await aclose_primary()
         await self._chatwoot.aclose()
+
+    def _schedule_mirror(self, coro: Any) -> None:
+        """Schedule a mirror coroutine as a tracked background task."""
+        task: asyncio.Task[None] = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
 
     async def send(
         self,
@@ -41,13 +66,15 @@ class ChatwootHybridProvider:
         phone_e164: str,
         text: str,
         *,
+        company_id: int = 0,
+        staff_id: int | None = None,
         contact_name: str | None = None,
     ) -> str:
         # PRIMARY – must succeed (Отправка напрямую в Meta)
         msg_id = await self._primary.send(sender_id, phone_e164, text)
 
         # SECONDARY – best-effort (Логируем в Chatwoot как ПРИВАТНУЮ ЗАМЕТКУ)
-        asyncio.ensure_future(
+        self._schedule_mirror(
             self._log_to_chatwoot(phone_e164, text, contact_name=contact_name, meta={"msg_id": msg_id})
         )
 
@@ -62,6 +89,8 @@ class ChatwootHybridProvider:
         params: list[str],
         fallback_text: str = "",
         *,
+        company_id: int = 0,
+        staff_id: int | None = None,
         contact_name: str | None = None,
     ) -> str:
         # PRIMARY – must succeed (отправка в Meta игнорирует fallback_text)
@@ -71,7 +100,7 @@ class ChatwootHybridProvider:
 
         # SECONDARY – best-effort (Отправляем в Chatwoot красивый сгенерированный текст)
         content = fallback_text if fallback_text else (f"[{template_name}] " + " | ".join(params))
-        asyncio.ensure_future(
+        self._schedule_mirror(
             self._log_to_chatwoot(phone_e164, content, contact_name=contact_name, meta={"msg_id": msg_id})
         )
 
