@@ -526,20 +526,6 @@ async def process_job_in_session(
             job.last_error = "Skipped: record is not attended"
             return
 
-    if record is not None and job.job_type == "review_3d":
-        is_new = await _is_new_client_for_record(
-            session=session,
-            company_id=job.company_id,
-            client_id=getattr(record, "client_id", None),
-            record_id=getattr(record, "id", None),
-            record_starts_at=getattr(record, "starts_at", None),
-        )
-        if not is_new:
-            job.status = "canceled"
-            job.locked_at = None
-            job.last_error = "Skipped: review only for new clients"
-            return
-
     if record is not None and getattr(record, "is_deleted", False):
         allow_deleted = job.job_type in ("record_canceled", "comeback_3d")
         if not allow_deleted:
@@ -595,20 +581,6 @@ async def process_job_in_session(
             job.status = "canceled"
             job.locked_at = None
             job.last_error = "Skipped: record not attended"
-            return
-
-    if job.job_type == "review_3d" and record is not None:
-        is_new = await _is_new_client_for_record(
-            session=session,
-            company_id=job.company_id,
-            client_id=record.client_id,
-            record_id=record.id,
-            record_starts_at=record.starts_at,
-        )
-        if not is_new:
-            job.status = "canceled"
-            job.locked_at = None
-            job.last_error = "Skipped: not a new client"
             return
 
     phone = client.phone_e164 if client else None
