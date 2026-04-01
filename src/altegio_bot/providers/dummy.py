@@ -28,6 +28,11 @@ def _real_send_allowed(provider: WhatsAppProvider) -> bool:
     return os.getenv(ALLOW_REAL_SEND_ENV, "0").strip() == "1"
 
 
+def _supports_mirror(provider: WhatsAppProvider) -> bool:
+    """Return True if the provider accepts company_id / staff_id kwargs."""
+    return bool(getattr(provider, "_supports_mirror_kwargs", False))
+
+
 class DummyProvider(WhatsAppProvider):
     async def send(
         self,
@@ -77,13 +82,19 @@ async def safe_send(
     phone: str,
     text: str,
     *,
+    company_id: int = 0,
+    staff_id: int | None = None,
     contact_name: str | None = None,
 ) -> tuple[str | None, str | None]:
     if not _real_send_allowed(provider):
         return None, "Real send disabled"
 
     try:
-        msg_id = await provider.send(sender_id, phone, text, contact_name=contact_name)
+        kwargs: dict[str, object] = {"contact_name": contact_name}
+        if _supports_mirror(provider):
+            kwargs["company_id"] = company_id
+            kwargs["staff_id"] = staff_id
+        msg_id = await provider.send(sender_id, phone, text, **kwargs)  # type: ignore[call-arg]
         return msg_id, None
     except Exception as exc:
         logger.exception("send failed: %s", exc)
@@ -99,20 +110,20 @@ async def safe_send_template(
     params: list[str],
     fallback_text: str = "",
     *,
+    company_id: int = 0,
+    staff_id: int | None = None,
     contact_name: str | None = None,
 ) -> tuple[str | None, str | None]:
     if not _real_send_allowed(provider):
         return None, "Real send disabled"
 
     try:
-        msg_id = await provider.send_template(
-            sender_id,
-            phone,
-            template_name,
-            language,
-            params,
-            fallback_text=fallback_text,
-            contact_name=contact_name,
+        kwargs: dict[str, object] = {"fallback_text": fallback_text, "contact_name": contact_name}
+        if _supports_mirror(provider):
+            kwargs["company_id"] = company_id
+            kwargs["staff_id"] = staff_id
+        msg_id = await provider.send_template(  # type: ignore[call-arg]
+            sender_id, phone, template_name, language, params, **kwargs
         )
         return msg_id, None
     except Exception as exc:
