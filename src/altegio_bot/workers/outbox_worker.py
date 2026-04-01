@@ -12,6 +12,7 @@ from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.db import SessionLocal
+from altegio_bot.message_planner import MAX_VISITS_FOR_REVIEW, count_client_visits
 from altegio_bot.meta_templates import (
     TEMPLATE_LANGUAGE,
     build_template_params,
@@ -524,6 +525,19 @@ async def process_job_in_session(
             job.status = "canceled"
             job.locked_at = None
             job.last_error = "Skipped: record is not attended"
+            return
+
+    if job.job_type == "review_3d" and job.client_id is not None:
+        attended = await count_client_visits(
+            session,
+            client_id=job.client_id,
+            company_id=job.company_id,
+            attended_only=True,
+        )
+        if attended > MAX_VISITS_FOR_REVIEW:
+            job.status = "canceled"
+            job.locked_at = None
+            job.last_error = f"Skipped: client has >{MAX_VISITS_FOR_REVIEW} attended visits"
             return
 
     if record is not None and getattr(record, "is_deleted", False):

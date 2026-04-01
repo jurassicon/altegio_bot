@@ -21,39 +21,15 @@ import argparse
 import asyncio
 import logging
 
-from sqlalchemy import or_, select, update
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, update
 
 from altegio_bot.db import SessionLocal
-from altegio_bot.message_planner import MAX_VISITS_FOR_REVIEW, REVIEW_3D
-from altegio_bot.models.models import MessageJob, Record
+from altegio_bot.message_planner import MAX_VISITS_FOR_REVIEW, REVIEW_3D, count_client_visits
+from altegio_bot.models.models import MessageJob
 
 logger = logging.getLogger("cancel_review_3d_over_visit_limit")
 
 CANCEL_REASON = f"Skipped: client has >{MAX_VISITS_FOR_REVIEW} attended visits (backfill)"
-
-
-async def _count_attended_visits(
-    session: AsyncSession,
-    *,
-    client_id: int,
-    company_id: int,
-) -> int:
-    """Количество подтверждённых визитов клиента в филиале (не удалённых)."""
-    stmt = (
-        select(Record.id)
-        .where(Record.client_id == client_id)
-        .where(Record.company_id == company_id)
-        .where(Record.is_deleted.is_(False))
-        .where(
-            or_(
-                Record.attendance == 1,
-                Record.visit_attendance == 1,
-            )
-        )
-    )
-    result = await session.execute(stmt)
-    return len(result.all())
 
 
 async def run_cancel(
@@ -103,10 +79,11 @@ async def run_cancel(
                 )
                 continue
 
-            attended = await _count_attended_visits(
+            attended = await count_client_visits(
                 session,
                 client_id=client_id,
                 company_id=company_id,
+                attended_only=True,
             )
 
             if attended > MAX_VISITS_FOR_REVIEW:

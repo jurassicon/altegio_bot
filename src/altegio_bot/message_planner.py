@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -154,13 +154,18 @@ async def add_job(
     await session.execute(stmt)
 
 
-async def _count_client_visits(
+async def count_client_visits(
     session: AsyncSession,
     *,
     client_id: int,
     company_id: int,
+    attended_only: bool = False,
 ) -> int:
-    """Возвращает количество не удалённых записей (визитов) клиента в филиале."""
+    """Возвращает количество не удалённых записей (визитов) клиента в филиале.
+
+    При ``attended_only=True`` учитываются только подтверждённые визиты
+    (``attendance=1`` или ``visit_attendance=1``).
+    """
     stmt = (
         select(func.count())
         .select_from(Record)
@@ -168,8 +173,19 @@ async def _count_client_visits(
         .where(Record.company_id == company_id)
         .where(Record.is_deleted.is_(False))
     )
+    if attended_only:
+        stmt = stmt.where(
+            or_(
+                Record.attendance == 1,
+                Record.visit_attendance == 1,
+            )
+        )
     result = await session.execute(stmt)
     return result.scalar_one()
+
+
+# Backward-compatible private alias kept for legacy call-sites.
+_count_client_visits = count_client_visits
 
 
 async def _load_record_and_client(
