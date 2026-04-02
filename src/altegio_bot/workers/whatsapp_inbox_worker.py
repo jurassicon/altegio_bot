@@ -9,6 +9,7 @@ from typing import Any, Sequence
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from altegio_bot.chatwoot_client import ChatwootClient
 from altegio_bot.db import SessionLocal
 from altegio_bot.models.models import Client, MessageJob, WhatsAppEvent, WhatsAppSender
 from altegio_bot.providers.base import WhatsAppProvider
@@ -103,6 +104,21 @@ def _parse_command(text: str) -> str | None:
         return "start"
 
     return None
+
+
+def _is_chatwoot_origin(event: WhatsAppEvent, payload: dict[str, Any]) -> bool:
+    """Return True if this event originated from Chatwoot (not from Meta directly).
+
+    Prevents an infinite loop:
+    Chatwoot webhook -> WhatsAppEvent -> worker -> log_incoming_message -> Chatwoot webhook -> ...
+    """
+    if payload.get("_chatwoot") is not None:
+        return True
+    if isinstance(event.dedupe_key, str) and event.dedupe_key.startswith("chatwoot:"):
+        return True
+    if event.chatwoot_conversation_id is not None:
+        return True
+    return False
 
 
 async def _pick_sender(
@@ -282,28 +298,33 @@ async def handle_event(
 
     sender_id, company_id = await _pick_sender(session, phone_number_id)
     if text:
-        # 1. Ищем имя клиента в нашей базе данных.
-        variants = _phone_variants(phone_e164)
-        stmt = (
-            select(Client.display_name)
-            .where(Client.phone_e164.in_(variants))
-            .where(Client.display_name.is_not(None))
-            .limit(1)
-        )
-        res = await session.execute(stmt)
-        client_name = res.scalar_one_or_none()
+        if _is_chatwoot_origin(event, payload):
+            logger.debug(
+                "Skipping Chatwoot log for chatwoot-origin event dedupe_key=%s phone=%s",
+                event.dedupe_key,
+                phone_e164,
+            )
+        else:
+            # 1. Ищем имя клиента в нашей базе данных.
+            variants = _phone_variants(phone_e164)
+            stmt = (
+                select(Client.display_name)
+                .where(Client.phone_e164.in_(variants))
+                .where(Client.display_name.is_not(None))
+                .limit(1)
+            )
+            res = await session.execute(stmt)
+            client_name = res.scalar_one_or_none()
 
-        # 2. Передаем найденное имя в Chatwoot.
-        from altegio_bot.chatwoot_client import ChatwootClient
-
-        cw = ChatwootClient()
-        try:
-            await cw.log_incoming_message(phone_e164, text, contact_name=client_name)
-            logger.info("Forwarded incoming message to Chatwoot phone=%s name=%s", phone_e164, client_name)
-        except Exception as exc:
-            logger.warning("Failed to forward to Chatwoot phone=%s err=%s", phone_e164, exc)
-        finally:
-            await cw.aclose()
+            # 2. Передаем найденное имя в Chatwoot.
+            cw = ChatwootClient()
+            try:
+                await cw.log_incoming_message(phone_e164, text, contact_name=client_name)
+                logger.info("Forwarded incoming message to Chatwoot phone=%s name=%s", phone_e164, client_name)
+            except Exception as exc:
+                logger.warning("Failed to forward to Chatwoot phone=%s err=%s", phone_e164, exc)
+            finally:
+                await cw.aclose()
 
     if cmd is None:
         event.error = None
