@@ -12,6 +12,7 @@ from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.db import SessionLocal
+from altegio_bot.message_planner import MAX_VISITS_FOR_REVIEW, count_client_visits
 from altegio_bot.meta_templates import (
     TEMPLATE_LANGUAGE,
     build_template_params,
@@ -526,18 +527,17 @@ async def process_job_in_session(
             job.last_error = "Skipped: record is not attended"
             return
 
-    if record is not None and job.job_type == "review_3d":
-        is_new = await _is_new_client_for_record(
-            session=session,
+    if job.job_type == "review_3d" and job.client_id is not None:
+        attended = await count_client_visits(
+            session,
+            client_id=job.client_id,
             company_id=job.company_id,
-            client_id=getattr(record, "client_id", None),
-            record_id=getattr(record, "id", None),
-            record_starts_at=getattr(record, "starts_at", None),
+            attended_only=True,
         )
-        if not is_new:
+        if attended > MAX_VISITS_FOR_REVIEW:
             job.status = "canceled"
             job.locked_at = None
-            job.last_error = "Skipped: review only for new clients"
+            job.last_error = f"Skipped: client has >{MAX_VISITS_FOR_REVIEW} attended visits"
             return
 
     if record is not None and getattr(record, "is_deleted", False):
@@ -589,27 +589,6 @@ async def process_job_in_session(
                     job.locked_at = None
                     job.last_error = "Skipped: comeback_3d already sent in the last 30 days"
                     return
-
-    if job.job_type in ("review_3d", "repeat_10d"):
-        if not _record_attended(record):
-            job.status = "canceled"
-            job.locked_at = None
-            job.last_error = "Skipped: record not attended"
-            return
-
-    if job.job_type == "review_3d" and record is not None:
-        is_new = await _is_new_client_for_record(
-            session=session,
-            company_id=job.company_id,
-            client_id=record.client_id,
-            record_id=record.id,
-            record_starts_at=record.starts_at,
-        )
-        if not is_new:
-            job.status = "canceled"
-            job.locked_at = None
-            job.last_error = "Skipped: not a new client"
-            return
 
     phone = client.phone_e164 if client else None
     if not phone:
