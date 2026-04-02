@@ -1,13 +1,29 @@
 from __future__ import annotations
 
 from datetime import timedelta
+from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import select
 
+from altegio_bot import message_planner as planner_mod
 from altegio_bot.message_planner import plan_jobs_for_record_event
 from altegio_bot.models.models import MessageJob, Record
 from altegio_bot.workers.outbox_worker import utcnow
+
+
+@pytest.fixture(autouse=True)
+def _mock_altegio_api(monkeypatch):
+    """Mock the Altegio API call for all tests in this module.
+
+    Tests here cover scheduling logic, not the visit-limit gate.
+    Return 1 (new visitor) so review_3d is always eligible.
+    """
+    monkeypatch.setattr(
+        planner_mod,
+        "count_attended_client_visits",
+        AsyncMock(return_value=1),
+    )
 
 
 @pytest.mark.asyncio
