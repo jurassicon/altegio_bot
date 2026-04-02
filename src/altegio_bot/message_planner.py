@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -7,8 +8,12 @@ from sqlalchemy import func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from altegio_bot.altegio_records import count_attended_client_visits
+from altegio_bot.db import SessionLocal  # noqa: F401 – re-exported
 from altegio_bot.models.models import Client, MessageJob, Record
 from altegio_bot.utils import utcnow
+
+logger = logging.getLogger(__name__)
 
 RECORD_CREATED = "record_created"
 RECORD_UPDATED = "record_updated"
@@ -38,9 +43,9 @@ MARKETING_JOB_TYPES = (
     COMEBACK_3D,
 )
 
-# Максимальное количество посещений клиента, при котором ещё отправляется запрос
-# на отзыв. Клиентам с большим опытом (более MAX_VISITS_FOR_REVIEW визитов)
-# сообщение с просьбой об отзыве не отправляется.
+# Maximum attended visits a client may have and still receive a review
+# request.  Clients above this threshold are considered experienced
+# and do not need a prompt.
 MAX_VISITS_FOR_REVIEW = 3
 
 
@@ -161,10 +166,15 @@ async def count_client_visits(
     company_id: int,
     attended_only: bool = False,
 ) -> int:
-    """Возвращает количество не удалённых записей (визитов) клиента в филиале.
+    """Return the number of non-deleted records for a client in the branch.
 
-    При ``attended_only=True`` учитываются только подтверждённые визиты
-    (``attendance=1`` или ``visit_attendance=1``).
+    When ``attended_only=True`` only confirmed visits are counted
+    (``attendance=1`` or ``visit_attendance=1``).
+
+    Note: this counts only records present in the local ``records``
+    table, which is a partial sync.  Do not use this for review_3d
+    eligibility — use ``count_attended_client_visits`` from
+    ``altegio_records`` instead.
     """
     stmt = (
         select(func.count())
@@ -182,10 +192,6 @@ async def count_client_visits(
         )
     result = await session.execute(stmt)
     return result.scalar_one()
-
-
-# Backward-compatible private alias kept for legacy call-sites.
-_count_client_visits = count_client_visits
 
 
 async def _load_record_and_client(
@@ -305,16 +311,28 @@ async def plan_jobs_for_record_event(
         if starts_at is not None:
             review_at = starts_at + timedelta(days=3)
             if review_at > now:
-                # Отправляем запрос на отзыв только новым клиентам (не более MAX_VISITS_FOR_REVIEW визитов)
-                is_new_visitor = True
-                if record_obj.client_id is not None:
-                    visit_count = await _count_client_visits(
-                        session,
-                        client_id=record_obj.client_id,
-                        company_id=cid,
-                        attended_only=True,
-                    )
-                    is_new_visitor = visit_count <= MAX_VISITS_FOR_REVIEW
+                # review_3d eligibility uses the Altegio API as the
+                # source of truth for attended visit counts.  The local
+                # ``records`` table is a partial sync — webhook events
+                # missed before the bot was set up are absent, causing
+                # systematic under-counting (e.g. a client with 19
+                # real visits may appear to have only 1 locally).
+                is_new_visitor = False
+                altegio_cid = getattr(client_obj, "altegio_client_id", None) if client_obj is not None else None
+                if altegio_cid is not None:
+                    try:
+                        visit_count = await count_attended_client_visits(
+                            company_id=cid,
+                            altegio_client_id=altegio_cid,
+                        )
+                        is_new_visitor = visit_count <= MAX_VISITS_FOR_REVIEW
+                    except Exception as exc:
+                        logger.warning(
+                            "Altegio API error for review_3d client_id=%s altegio_client_id=%s: %s",
+                            record_obj.client_id,
+                            altegio_cid,
+                            exc,
+                        )
 
                 if is_new_visitor:
                     await add_job(
@@ -342,7 +360,6 @@ async def plan_jobs_for_record_event(
     if norm_status == "delete" and not opted_out:
         already_queued = False
 
-        # Дедупликация на входе: проверяем, нет ли уже такой задачи в очереди
         if record_obj.client_id is not None:
             stmt = (
                 select(MessageJob.id)
@@ -356,7 +373,6 @@ async def plan_jobs_for_record_event(
             if res.scalar_one_or_none() is not None:
                 already_queued = True
 
-        # Создаем задачу только если дубликатов нет
         if not already_queued:
             comeback_at = utcnow() + timedelta(days=3)
             await add_job(
