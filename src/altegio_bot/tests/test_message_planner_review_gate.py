@@ -24,6 +24,7 @@ async def _create_past_records(session, *, company_id: int, client_id: int, coun
             client_id=client_id,
             staff_name="Staff",
             starts_at=now - timedelta(days=30 + i),
+            attendance=1,
         )
         session.add(record)
     await session.flush()
