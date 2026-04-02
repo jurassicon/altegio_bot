@@ -312,6 +312,7 @@ async def plan_jobs_for_record_event(
                         session,
                         client_id=record_obj.client_id,
                         company_id=cid,
+                        attended_only=True,
                     )
                     is_new_visitor = visit_count <= MAX_VISITS_FOR_REVIEW
 

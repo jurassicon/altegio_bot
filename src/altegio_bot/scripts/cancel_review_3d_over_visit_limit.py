@@ -6,11 +6,11 @@ visit_attendance=1) в данном филиале.
 Используется для бэкфилла: задачи, созданные до введения фильтра на стороне
 планировщика, могут относиться к «не-новым» клиентам и должны быть отменены.
 
-Запуск (dry-run по умолчанию):
+Запуск с предпросмотром (dry-run):
     python -m altegio_bot.scripts.cancel_review_3d_over_visit_limit \\
         --company-id 758285 --dry-run
 
-Реальная отмена:
+Реальная отмена (без флага --dry-run):
     python -m altegio_bot.scripts.cancel_review_3d_over_visit_limit \\
         --company-id 758285
 """
