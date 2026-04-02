@@ -1,10 +1,14 @@
 """
 Отменяет задачи review_3d (status='queued') для клиентов,
-у которых более MAX_VISITS_FOR_REVIEW подтверждённых визитов (attendance=1 или
-visit_attendance=1) в данном филиале.
+у которых более MAX_VISITS_FOR_REVIEW подтверждённых визитов
+по данным Altegio API (attendance=1 или visit_attendance=1).
 
-Используется для бэкфилла: задачи, созданные до введения фильтра на стороне
-планировщика, могут относиться к «не-новым» клиентам и должны быть отменены.
+Используется для бэкфилла: задачи, созданные до введения фильтра на
+стороне планировщика, могут относиться к «не-новым» клиентам.
+
+Источник истины — Altegio API, а не локальная таблица ``records``.
+Локальная таблица содержит только частичную синхронизацию истории
+клиента, поэтому её данные не подходят для этого решения.
 
 Запуск с предпросмотром (dry-run):
     python -m altegio_bot.scripts.cancel_review_3d_over_visit_limit \\
@@ -23,14 +27,15 @@ import logging
 
 from sqlalchemy import select, update
 
+from altegio_bot.altegio_records import count_attended_client_visits
 from altegio_bot.db import SessionLocal
-from altegio_bot.message_planner import MAX_VISITS_FOR_REVIEW, REVIEW_3D, count_client_visits
-from altegio_bot.models.models import MessageJob
+from altegio_bot.message_planner import MAX_VISITS_FOR_REVIEW, REVIEW_3D
+from altegio_bot.models.models import Client, MessageJob
 from altegio_bot.utils import utcnow
 
 logger = logging.getLogger("cancel_review_3d_over_visit_limit")
 
-CANCEL_REASON = f"Skipped: client has >{MAX_VISITS_FOR_REVIEW} attended visits (backfill)"
+CANCEL_REASON = f"Skipped: client has >{MAX_VISITS_FOR_REVIEW} attended visits (backfill, Altegio API)"
 
 
 async def run_cancel(
@@ -39,12 +44,21 @@ async def run_cancel(
     dry_run: bool,
     limit: int | None,
 ) -> None:
-    # ── Phase 1: read-only — collect job IDs and per-client attended counts ──
-    job_rows: list[tuple[int, int | None, int | None]] = []  # (job_id, client_id, record_id)
+    # ── Phase 1: read-only — collect job IDs and altegio_client_ids ──
+    # Join with clients to get altegio_client_id in a single query.
+    job_rows: list[
+        tuple[int, int | None, int | None, int | None]
+    ] = []  # (job_id, client_id, record_id, altegio_client_id)
 
     async with SessionLocal() as session:
         stmt = (
-            select(MessageJob.id, MessageJob.client_id, MessageJob.record_id)
+            select(
+                MessageJob.id,
+                MessageJob.client_id,
+                MessageJob.record_id,
+                Client.altegio_client_id,
+            )
+            .outerjoin(Client, Client.id == MessageJob.client_id)
             .where(MessageJob.company_id == company_id)
             .where(MessageJob.job_type == REVIEW_3D)
             .where(MessageJob.status == "queued")
@@ -62,52 +76,72 @@ async def run_cancel(
         limit,
     )
 
+    # ── Phase 2: check each client via Altegio API ──
     checked = 0
     skipped_no_client = 0
+    skipped_no_altegio_id = 0
+    skipped_api_error = 0
     kept = 0
     ids_to_cancel: list[int] = []
 
-    async with SessionLocal() as session:
-        for job_id, client_id, record_id in job_rows:
-            checked += 1
+    for job_id, client_id, record_id, altegio_client_id in job_rows:
+        checked += 1
 
-            if client_id is None:
-                skipped_no_client += 1
-                logger.warning(
-                    "Skip job id=%d: client_id is NULL (record_id=%s)",
-                    job_id,
-                    record_id,
-                )
-                continue
-
-            attended = await count_client_visits(
-                session,
-                client_id=client_id,
-                company_id=company_id,
-                attended_only=True,
+        if client_id is None:
+            skipped_no_client += 1
+            logger.warning(
+                "Skip job id=%d: client_id is NULL (record_id=%s)",
+                job_id,
+                record_id,
             )
+            continue
 
-            if attended > MAX_VISITS_FOR_REVIEW:
-                logger.info(
-                    "CANCEL job id=%d client_id=%d record_id=%s attended=%d dry_run=%s",
-                    job_id,
-                    client_id,
-                    record_id,
-                    attended,
-                    dry_run,
-                )
-                ids_to_cancel.append(job_id)
-            else:
-                logger.debug(
-                    "Keep job id=%d client_id=%d record_id=%s attended=%d",
-                    job_id,
-                    client_id,
-                    record_id,
-                    attended,
-                )
-                kept += 1
+        if altegio_client_id is None:
+            skipped_no_altegio_id += 1
+            logger.warning(
+                "Skip job id=%d client_id=%d: altegio_client_id is NULL",
+                job_id,
+                client_id,
+            )
+            continue
 
-    # ── Phase 2: write — cancel collected jobs in a single short transaction ──
+        try:
+            attended = await count_attended_client_visits(
+                company_id=company_id,
+                altegio_client_id=altegio_client_id,
+            )
+        except Exception as exc:
+            skipped_api_error += 1
+            logger.warning(
+                "Skip job id=%d client_id=%d altegio_client_id=%d: Altegio API error: %s",
+                job_id,
+                client_id,
+                altegio_client_id,
+                exc,
+            )
+            continue
+
+        if attended > MAX_VISITS_FOR_REVIEW:
+            logger.info(
+                "CANCEL job id=%d client_id=%d altegio_client_id=%d attended=%d dry_run=%s",
+                job_id,
+                client_id,
+                altegio_client_id,
+                attended,
+                dry_run,
+            )
+            ids_to_cancel.append(job_id)
+        else:
+            logger.debug(
+                "Keep job id=%d client_id=%d altegio_client_id=%d attended=%d",
+                job_id,
+                client_id,
+                altegio_client_id,
+                attended,
+            )
+            kept += 1
+
+    # ── Phase 3: write — cancel jobs in a single short transaction ──
     if ids_to_cancel and not dry_run:
         async with SessionLocal() as session:
             async with session.begin():
@@ -124,18 +158,24 @@ async def run_cancel(
                 )
 
     logger.info(
-        "Done: checked=%d canceled=%d kept=%d skipped_no_client=%d dry_run=%s",
+        "Done: checked=%d canceled=%d kept=%d "
+        "skipped_no_client=%d skipped_no_altegio_id=%d "
+        "skipped_api_error=%d dry_run=%s",
         checked,
         len(ids_to_cancel),
         kept,
         skipped_no_client,
+        skipped_no_altegio_id,
+        skipped_api_error,
         dry_run,
     )
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Cancel queued review_3d jobs for clients with >3 attended visits.",
+        description=(
+            f"Cancel queued review_3d jobs for clients with >{MAX_VISITS_FOR_REVIEW} attended visits (Altegio API)."
+        ),
     )
     parser.add_argument(
         "--company-id",
