@@ -188,6 +188,7 @@ async def chatwoot_ingest(request: Request) -> JSONResponse:
                     query=dict(request.query_params),
                     headers=_safe_headers(request),
                     payload=normalized_payload,
+                    chatwoot_conversation_id=chatwoot_conversation_id,
                 )
                 session.add(event)
                 await session.flush()
