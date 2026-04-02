@@ -11,8 +11,9 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from altegio_bot.altegio_records import count_attended_client_visits
 from altegio_bot.db import SessionLocal
-from altegio_bot.message_planner import MAX_VISITS_FOR_REVIEW, count_client_visits
+from altegio_bot.message_planner import MAX_VISITS_FOR_REVIEW
 from altegio_bot.meta_templates import (
     TEMPLATE_LANGUAGE,
     build_template_params,
@@ -527,17 +528,48 @@ async def process_job_in_session(
             job.last_error = "Skipped: record is not attended"
             return
 
-    if job.job_type == "review_3d" and job.client_id is not None:
-        attended = await count_client_visits(
-            session,
-            client_id=job.client_id,
-            company_id=job.company_id,
-            attended_only=True,
-        )
+    if job.job_type == "review_3d":
+        # Guard uses Altegio API as source of truth for visit counts.
+        # The local ``records`` table is a partial sync and under-
+        # counts real visits (webhooks missed before bot deployment
+        # are absent).  A transient API failure requeues the job
+        # with exponential backoff — never treat failure as 0 visits.
+        altegio_cid = getattr(client, "altegio_client_id", None) if client is not None else None
+        if altegio_cid is None:
+            job.status = "canceled"
+            job.locked_at = None
+            job.last_error = "Skipped: no altegio_client_id for review_3d"
+            return
+        try:
+            attended = await count_attended_client_visits(
+                company_id=job.company_id,
+                altegio_client_id=altegio_cid,
+            )
+        except Exception as exc:
+            next_attempt = attempts + 1
+            setattr(job, "attempts", next_attempt)
+            logger.warning(
+                "review_3d guard: Altegio API failed job_id=%s altegio_client_id=%s attempt=%d: %s",
+                job.id,
+                altegio_cid,
+                next_attempt,
+                exc,
+            )
+            if next_attempt >= max_attempts:
+                job.status = "failed"
+                job.locked_at = None
+                job.last_error = f"Altegio API error (max attempts): {exc}"
+            else:
+                delay = _retry_delay_seconds(next_attempt)
+                job.status = "queued"
+                job.locked_at = None
+                job.run_at = utcnow() + timedelta(seconds=delay)
+                job.last_error = f"Altegio API error: {exc}"
+            return
         if attended > MAX_VISITS_FOR_REVIEW:
             job.status = "canceled"
             job.locked_at = None
-            job.last_error = f"Skipped: client has >{MAX_VISITS_FOR_REVIEW} attended visits"
+            job.last_error = f"Skipped: client has >{MAX_VISITS_FOR_REVIEW} attended visits (Altegio API)"
             return
 
     if record is not None and getattr(record, "is_deleted", False):
