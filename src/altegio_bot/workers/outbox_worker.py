@@ -28,6 +28,7 @@ from altegio_bot.models.models import (
     Record,
     RecordService,
 )
+from altegio_bot.perf import perf_log
 from altegio_bot.providers.base import WhatsAppProvider
 from altegio_bot.providers.dummy import safe_send, safe_send_template
 from altegio_bot.settings import settings
@@ -479,9 +480,26 @@ async def process_job_in_session(
     job_id: int,
     provider: WhatsAppProvider,
 ) -> None:
+    with perf_log("outbox_worker", "process_job", job_id=job_id) as ctx:
+        await _process_job_in_session_inner(session, job_id, provider, ctx)
+
+
+async def _process_job_in_session_inner(
+    session: AsyncSession,
+    job_id: int,
+    provider: WhatsAppProvider,
+    ctx: dict[str, Any],
+) -> None:
     job = await _load_job(session, job_id)
     if job is None:
         return
+
+    ctx.update(
+        company_id=job.company_id,
+        record_id=job.record_id,
+        client_id=job.client_id,
+        job_type=job.job_type,
+    )
 
     success = await _find_success_outbox(session, job.id)
     if success is not None:

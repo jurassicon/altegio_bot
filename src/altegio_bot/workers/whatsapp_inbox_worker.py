@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from altegio_bot.chatwoot_client import ChatwootClient
 from altegio_bot.db import SessionLocal
 from altegio_bot.models.models import Client, MessageJob, WhatsAppEvent, WhatsAppSender
+from altegio_bot.perf import perf_log
 from altegio_bot.providers.base import WhatsAppProvider
 from altegio_bot.providers.dummy import safe_send
 
@@ -390,23 +391,26 @@ async def process_one_event(
     event_id: int,
     provider: WhatsAppProvider,
 ) -> None:
-    async with SessionLocal() as session:
-        async with session.begin():
-            stmt = select(WhatsAppEvent).where(WhatsAppEvent.id == event_id).with_for_update()
-            res = await session.execute(stmt)
-            event = res.scalar_one_or_none()
-            if event is None:
-                return
+    with perf_log("whatsapp_inbox_worker", "process_event", event_id=event_id) as ctx:
+        async with SessionLocal() as session:
+            async with session.begin():
+                stmt = select(WhatsAppEvent).where(WhatsAppEvent.id == event_id).with_for_update()
+                res = await session.execute(stmt)
+                event = res.scalar_one_or_none()
+                if event is None:
+                    return
 
-            try:
-                await handle_event(session, event, provider)
-                event.status = "processed"
-                event.processed_at = utcnow()
-            except Exception as exc:
-                event.status = "failed"
-                event.processed_at = utcnow()
-                event.error = str(exc)
-                logger.exception("WhatsApp event failed id=%s", event_id)
+                try:
+                    await handle_event(session, event, provider)
+                    event.status = "processed"
+                    event.processed_at = utcnow()
+                except Exception as exc:
+                    event.status = "failed"
+                    event.processed_at = utcnow()
+                    event.error = str(exc)
+                    logger.exception("WhatsApp event failed id=%s", event_id)
+
+                ctx.update(outcome=event.status)
 
 
 async def run_loop(

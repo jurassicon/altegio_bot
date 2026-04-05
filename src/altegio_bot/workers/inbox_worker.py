@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from altegio_bot.db import SessionLocal
 from altegio_bot.message_planner import plan_jobs_for_record_event
 from altegio_bot.models.models import AltegioEvent, Client, Record, RecordService
+from altegio_bot.perf import perf_log
 from altegio_bot.service_filter import record_has_allowed_service
 
 logger = logging.getLogger("inbox_worker")
@@ -370,24 +371,33 @@ async def handle_event(session: AsyncSession, event: AltegioEvent) -> None:
 
 
 async def process_one_event(event_id: int) -> None:
-    async with SessionLocal() as session:
-        async with session.begin():
-            stmt = select(AltegioEvent).where(AltegioEvent.id == event_id).with_for_update()
-            res = await session.execute(stmt)
-            event = res.scalar_one_or_none()
-            if event is None:
-                return
+    with perf_log("inbox_worker", "process_event", event_id=event_id) as ctx:
+        async with SessionLocal() as session:
+            async with session.begin():
+                stmt = select(AltegioEvent).where(AltegioEvent.id == event_id).with_for_update()
+                res = await session.execute(stmt)
+                event = res.scalar_one_or_none()
+                if event is None:
+                    return
 
-            try:
-                await handle_event(session, event)
-                event.status = "processed"
-                event.processed_at = utcnow()
-                event.error = None
-            except Exception as exc:
-                event.status = "failed"
-                event.processed_at = utcnow()
-                event.error = str(exc)
-                logger.exception("Event failed id=%s", event_id)
+                ctx.update(
+                    company_id=event.company_id,
+                    resource=event.resource,
+                    resource_id=event.resource_id,
+                )
+
+                try:
+                    await handle_event(session, event)
+                    event.status = "processed"
+                    event.processed_at = utcnow()
+                    event.error = None
+                except Exception as exc:
+                    event.status = "failed"
+                    event.processed_at = utcnow()
+                    event.error = str(exc)
+                    logger.exception("Event failed id=%s", event_id)
+
+                ctx.update(outcome=event.status)
 
 
 async def run_loop(batch_size: int = 50, poll_sec: float = 1.0) -> None:
