@@ -113,7 +113,7 @@ def _is_chatwoot_origin(event: WhatsAppEvent, payload: dict[str, Any]) -> bool:
     Prevents an infinite loop:
     Chatwoot webhook -> WhatsAppEvent -> worker -> log_incoming_message -> Chatwoot webhook -> ...
     """
-    if payload.get("_chatwoot") is not None:
+    if "_chatwoot" in payload:
         return True
     if isinstance(event.dedupe_key, str) and event.dedupe_key.startswith("chatwoot:"):
         return True

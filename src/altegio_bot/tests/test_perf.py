@@ -324,3 +324,16 @@ def test_wa_inbox_perf_chatwoot_origin(
     assert len(caplog.records) == 1
     rec = json.loads(caplog.records[0].message)
     assert rec["origin"] == "chatwoot"
+
+
+def test_is_chatwoot_origin_none_value() -> None:
+    """'_chatwoot' key with None value still counts as chatwoot origin."""
+    from altegio_bot.workers.whatsapp_inbox_worker import _is_chatwoot_origin
+
+    @dataclass
+    class _MinEvent:
+        dedupe_key: str | None = None
+        chatwoot_conversation_id: int | None = None
+
+    event = _MinEvent()
+    assert _is_chatwoot_origin(event, {"_chatwoot": None}) is True  # type: ignore[arg-type]
