@@ -400,6 +400,13 @@ async def process_one_event(
                 if event is None:
                     return
 
+                ctx.update(
+                    company_id=event.company_id,
+                    dedupe_key=event.dedupe_key,
+                    chatwoot_conversation_id=event.chatwoot_conversation_id,
+                    origin="chatwoot" if _is_chatwoot_origin(event, event.payload or {}) else "meta",
+                )
+
                 try:
                     await handle_event(session, event, provider)
                     event.status = "processed"

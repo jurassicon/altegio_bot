@@ -501,6 +501,15 @@ async def _process_job_in_session_inner(
         job_type=job.job_type,
     )
 
+    await _run_job_logic(session, job, provider)
+    ctx.update(outcome=job.status)
+
+
+async def _run_job_logic(
+    session: AsyncSession,
+    job: MessageJob,
+    provider: WhatsAppProvider,
+) -> None:
     success = await _find_success_outbox(session, job.id)
     if success is not None:
         logger.info(
