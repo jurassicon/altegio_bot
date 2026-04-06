@@ -206,8 +206,9 @@ async def execute_followup(run_id: int) -> dict:
                         recipient_id,
                     )
                     if fresh is None:
-                        stats["skipped"] += 1
-                        continue
+                        # Недостижимый кейс после claim-шага,
+                        # но ошибка re-evaluate подхватит и вернёт в planned.
+                        raise RuntimeError(f"recipient_id={recipient_id} not found after claim")
 
                     if not _is_eligible_for_followup(fresh, policy):
                         fresh.followup_status = "followup_skipped"
