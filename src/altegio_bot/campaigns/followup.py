@@ -104,17 +104,19 @@ async def plan_followup(session: AsyncSession, run_id: int) -> int:
 
     count = 0
     for r in recipients:
+        # Идемпотентность: если статус уже выставлен — не трогаем.
+        # Повторный вызов plan_followup не должен сбрасывать
+        # followup_queued / followup_skipped обратно в planned.
+        if r.followup_status is not None:
+            continue
+
         if _is_eligible_for_followup(r, run.followup_policy):
             r.followup_status = "followup_planned"
             count += 1
-        else:
-            # Помечаем followup_skipped только тех, кто реально участвовал
-            # в send-real (не был исключён при сегментации).
-            # Используем excluded_reason is None как признак «прошёл сегментацию».
-            # (CampaignRecipient не имеет свойства is_eligible — оно только
-            # у ClientCandidate; здесь проверяем через excluded_reason.)
-            if r.followup_status is None and r.excluded_reason is None:
-                r.followup_status = "followup_skipped"
+        elif r.excluded_reason is None:
+            # Помечаем followup_skipped только тех, кто прошёл сегментацию
+            # (excluded_reason is None == не был исключён при сегментации).
+            r.followup_status = "followup_skipped"
 
     await session.flush()
     logger.info("plan_followup run_id=%d planned=%d", run_id, count)
@@ -155,6 +157,11 @@ async def execute_followup(run_id: int) -> dict:
         client_id = recipient.client_id
 
         if not client_id:
+            async with SessionLocal() as session:
+                async with session.begin():
+                    r = await session.get(CampaignRecipient, recipient.id)
+                    if r is not None:
+                        r.followup_status = "followup_skipped"
             stats["skipped"] += 1
             continue
 
