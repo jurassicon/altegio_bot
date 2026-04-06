@@ -24,28 +24,34 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from altegio_bot.campaigns.runner import FOLLOWUP_JOB_TYPE
 from altegio_bot.db import SessionLocal
 from altegio_bot.message_planner import add_job, make_dedupe_key
-from altegio_bot.models.models import (
-    CampaignRecipient,
-    CampaignRun,
-    MessageJob,
-)
+from altegio_bot.models.models import CampaignRecipient, CampaignRun, MessageJob
 from altegio_bot.utils import utcnow
 
 logger = logging.getLogger(__name__)
 
-# Статусы, при которых follow-up не отправляется
+# Статусы CampaignRecipient, при которых follow-up не отправляется
 _HARD_FAILURE_STATUSES = {
-    'cleanup_failed',
+    "cleanup_failed",
 }
 
-# Причины исключения, при которых follow-up не отправляется
+# Причины excluded_reason, при которых follow-up не отправляется
 _HARD_FAILURE_REASONS = {
-    'no_phone',
-    'invalid_phone',
-    'no_whatsapp',
-    'cleanup_failed',
-    'provider_error',
-    'delivery_failed',
+    "no_phone",
+    "invalid_phone",
+    "no_whatsapp",
+    "cleanup_failed",
+    "provider_error",
+    "delivery_failed",
+}
+
+# Статусы, при которых получатель «участвовал» в send-real (не исключён)
+_SENT_PIPELINE_STATUSES = {
+    "queued",
+    "provider_accepted",
+    "delivered",
+    "read",
+    "replied",
+    "booked_after_campaign",
 }
 
 
@@ -61,30 +67,20 @@ def _is_eligible_for_followup(
         return False
 
     # Клиент не прошёл сегментацию — исключаем
-    if recipient.status == 'skipped':
+    if recipient.status == "skipped":
         return False
 
-    # Не было отправки — нечего follow-up'ить
-    if recipient.status not in (
-        'queued',
-        'provider_accepted',
-        'delivered',
-        'read',
-        'replied',
-        'booked_after_campaign',
-    ):
+    # Не было реальной отправки — нечего follow-up'ить
+    if recipient.status not in _SENT_PIPELINE_STATUSES:
         return False
 
-    if policy == 'unread_only':
+    if policy == "unread_only":
         return recipient.read_at is None
 
-    if policy == 'unread_or_not_booked':
-        return (
-            recipient.read_at is None
-            or recipient.booked_after_at is None
-        )
+    if policy == "unread_or_not_booked":
+        return recipient.read_at is None or recipient.booked_after_at is None
 
-    logger.warning('Unknown followup_policy=%s', policy)
+    logger.warning("Unknown followup_policy=%s", policy)
     return False
 
 
@@ -95,36 +91,33 @@ async def plan_followup(session: AsyncSession, run_id: int) -> int:
     """
     run = await session.get(CampaignRun, run_id)
     if run is None:
-        raise ValueError(f'CampaignRun {run_id} not found')
+        raise ValueError(f"CampaignRun {run_id} not found")
 
     if not run.followup_enabled:
-        raise ValueError(
-            f'Follow-up не включён для run_id={run_id}'
-        )
+        raise ValueError(f"Follow-up не включён для run_id={run_id}")
 
     if not run.followup_policy:
-        raise ValueError(
-            f'followup_policy не задана для run_id={run_id}'
-        )
+        raise ValueError(f"followup_policy не задана для run_id={run_id}")
 
-    stmt = select(CampaignRecipient).where(
-        CampaignRecipient.campaign_run_id == run_id
-    )
+    stmt = select(CampaignRecipient).where(CampaignRecipient.campaign_run_id == run_id)
     recipients = (await session.execute(stmt)).scalars().all()
 
     count = 0
     for r in recipients:
         if _is_eligible_for_followup(r, run.followup_policy):
-            r.followup_status = 'followup_planned'
+            r.followup_status = "followup_planned"
             count += 1
         else:
-            if r.followup_status is None and r.is_eligible:
-                r.followup_status = 'followup_skipped'
+            # Помечаем followup_skipped только тех, кто реально участвовал
+            # в send-real (не был исключён при сегментации).
+            # Используем excluded_reason is None как признак «прошёл сегментацию».
+            # (CampaignRecipient не имеет свойства is_eligible — оно только
+            # у ClientCandidate; здесь проверяем через excluded_reason.)
+            if r.followup_status is None and r.excluded_reason is None:
+                r.followup_status = "followup_skipped"
 
     await session.flush()
-    logger.info(
-        'plan_followup run_id=%d planned=%d', run_id, count
-    )
+    logger.info("plan_followup run_id=%d planned=%d", run_id, count)
     return count
 
 
@@ -136,31 +129,24 @@ async def execute_followup(run_id: int) -> dict:
     async with SessionLocal() as session:
         run = await session.get(CampaignRun, run_id)
         if run is None:
-            raise ValueError(f'CampaignRun {run_id} not found')
+            raise ValueError(f"CampaignRun {run_id} not found")
 
         if not run.followup_enabled:
-            raise ValueError(
-                f'Follow-up не включён для run_id={run_id}'
-            )
+            raise ValueError(f"Follow-up не включён для run_id={run_id}")
 
         template_name = run.followup_template_name
         if not template_name:
-            raise ValueError(
-                f'followup_template_name не задан для run_id={run_id}'
-            )
+            raise ValueError(f"followup_template_name не задан для run_id={run_id}")
 
-        policy = run.followup_policy or ''
-        company_id_list = run.company_ids or []
+        policy = run.followup_policy or ""
 
-    stats = {'queued': 0, 'skipped': 0, 'failed': 0}
+    stats: dict[str, int] = {"queued": 0, "skipped": 0, "failed": 0}
 
     async with SessionLocal() as session:
         stmt = (
             select(CampaignRecipient)
             .where(CampaignRecipient.campaign_run_id == run_id)
-            .where(
-                CampaignRecipient.followup_status == 'followup_planned'
-            )
+            .where(CampaignRecipient.followup_status == "followup_planned")
         )
         recipients = (await session.execute(stmt)).scalars().all()
 
@@ -169,19 +155,19 @@ async def execute_followup(run_id: int) -> dict:
         client_id = recipient.client_id
 
         if not client_id:
-            stats['skipped'] += 1
+            stats["skipped"] += 1
             continue
 
         # Re-evaluate по актуальным данным
         async with SessionLocal() as session:
             fresh = await session.get(CampaignRecipient, recipient.id)
             if fresh is None:
-                stats['skipped'] += 1
+                stats["skipped"] += 1
                 continue
             if not _is_eligible_for_followup(fresh, policy):
-                fresh.followup_status = 'followup_skipped'
+                fresh.followup_status = "followup_skipped"
                 await session.commit()
-                stats['skipped'] += 1
+                stats["skipped"] += 1
                 continue
 
         # Создать follow-up job
@@ -197,10 +183,10 @@ async def execute_followup(run_id: int) -> dict:
                         job_type=FOLLOWUP_JOB_TYPE,
                         run_at=run_at,
                         payload={
-                            'kind': FOLLOWUP_JOB_TYPE,
-                            'template_name': template_name,
-                            'campaign_run_id': run_id,
-                            'campaign_recipient_id': recipient.id,
+                            "kind": FOLLOWUP_JOB_TYPE,
+                            "template_name": template_name,
+                            "campaign_run_id": run_id,
+                            "campaign_recipient_id": recipient.id,
                         },
                     )
 
@@ -210,38 +196,21 @@ async def execute_followup(run_id: int) -> dict:
                         record_id=None,
                         run_at=run_at,
                     )
-                    job = await session.scalar(
-                        select(MessageJob).where(
-                            MessageJob.dedupe_key == dedupe_key
-                        )
-                    )
+                    job = await session.scalar(select(MessageJob).where(MessageJob.dedupe_key == dedupe_key))
 
-                    r = await session.get(
-                        CampaignRecipient, recipient.id
-                    )
+                    r = await session.get(CampaignRecipient, recipient.id)
                     if r:
-                        r.followup_status = 'followup_queued'
+                        r.followup_status = "followup_queued"
                         if job:
                             r.followup_message_job_id = job.id
 
-            stats['queued'] += 1
-            logger.info(
-                'followup queued client_id=%d run_id=%d',
-                client_id,
-                run_id,
-            )
+            stats["queued"] += 1
+            logger.info("followup queued client_id=%d run_id=%d", client_id, run_id)
         except Exception as exc:
-            stats['failed'] += 1
-            logger.error(
-                'followup failed client_id=%d run_id=%d: %s',
-                client_id,
-                run_id,
-                exc,
-            )
+            stats["failed"] += 1
+            logger.error("followup failed client_id=%d run_id=%d: %s", client_id, run_id, exc)
 
-    logger.info(
-        'execute_followup run_id=%d stats=%s', run_id, stats
-    )
+    logger.info("execute_followup run_id=%d stats=%s", run_id, stats)
     return stats
 
 

@@ -14,7 +14,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal
 
@@ -39,9 +39,9 @@ from altegio_bot.utils import utcnow
 
 logger = logging.getLogger(__name__)
 
-NEWSLETTER_JOB_TYPE = 'newsletter_new_clients_monthly'
-FOLLOWUP_JOB_TYPE = 'newsletter_new_clients_followup'
-CAMPAIGN_CODE = 'new_clients_monthly'
+NEWSLETTER_JOB_TYPE = "newsletter_new_clients_monthly"
+FOLLOWUP_JOB_TYPE = "newsletter_new_clients_followup"
+CAMPAIGN_CODE = "new_clients_monthly"
 
 
 @dataclass
@@ -52,7 +52,7 @@ class RunParams:
     location_id: int
     period_start: datetime
     period_end: datetime
-    mode: Literal['preview', 'send-real']
+    mode: Literal["preview", "send-real"]
     campaign_code: str = CAMPAIGN_CODE
     card_type_id: str | None = None
     source_preview_run_id: int | None = None
@@ -78,7 +78,7 @@ async def _create_run(
         card_type_id=params.card_type_id,
         period_start=params.period_start,
         period_end=params.period_end,
-        status='running',
+        status="running",
         attribution_window_days=params.attribution_window_days,
         followup_enabled=params.followup_enabled,
         followup_delay_days=params.followup_delay_days,
@@ -107,7 +107,7 @@ def _build_recipient(
         confirmed_records_in_period=candidate.confirmed_records_in_period,
         records_before_period=candidate.records_before_period,
         is_opted_out=client.wa_opted_out,
-        status='skipped' if candidate.excluded_reason else 'candidate',
+        status="skipped" if candidate.excluded_reason else "candidate",
         excluded_reason=candidate.excluded_reason,
     )
     return r
@@ -124,17 +124,17 @@ def _update_run_exclusion_counters(
             run.candidates_count += 1
             continue
         reason = c.excluded_reason
-        if reason == 'opted_out':
+        if reason == "opted_out":
             run.excluded_opted_out += 1
-        elif reason == 'no_phone':
+        elif reason == "no_phone":
             run.excluded_no_phone += 1
             run.excluded_multiple_records += 0  # для clarity
-        elif reason == 'has_records_before_period':
+        elif reason == "has_records_before_period":
             run.excluded_has_records_before += 1
-        elif reason == 'multiple_records_in_period':
+        elif reason == "multiple_records_in_period":
             run.excluded_multiple_records += 1
             run.excluded_more_than_one_record += 1  # legacy
-        elif reason == 'no_confirmed_record_in_period':
+        elif reason == "no_confirmed_record_in_period":
             run.excluded_no_confirmed_record += 1
 
 
@@ -164,12 +164,11 @@ async def run_preview(params: RunParams) -> CampaignRun:
                 # 'candidate' (eligible) или 'skipped' (excluded)
                 session.add(recipient)
 
-            run.status = 'completed'
+            run.status = "completed"
             run.completed_at = utcnow()
 
     logger.info(
-        'preview run_id=%d company=%d period=[%s, %s) '
-        'total=%d eligible=%d',
+        "preview run_id=%d company=%d period=[%s, %s) total=%d eligible=%d",
         run.id,
         params.company_id,
         params.period_start.date(),
@@ -215,19 +214,17 @@ async def run_send_real(params: RunParams) -> CampaignRun:
     # ------------------------------------------------------------------
     loyalty = AltegioLoyaltyClient()
     try:
-        card_type_id = await _resolve_card_type(
-            loyalty, params.location_id, params.card_type_id
-        )
+        card_type_id = await _resolve_card_type(loyalty, params.location_id, params.card_type_id)
 
         # ------------------------------------------------------------------
         # Шаг 3: обработать каждого кандидата
         # ------------------------------------------------------------------
         stats = {
-            'cleanup_failed': 0,
-            'cards_deleted': 0,
-            'cards_issued': 0,
-            'queued': 0,
-            'failed': 0,
+            "cleanup_failed": 0,
+            "cards_deleted": 0,
+            "cards_issued": 0,
+            "queued": 0,
+            "failed": 0,
         }
 
         for candidate in candidates:
@@ -260,18 +257,18 @@ async def run_send_real(params: RunParams) -> CampaignRun:
         async with session.begin():
             run = await session.get(CampaignRun, run_id)
             if run is None:
-                raise RuntimeError(f'CampaignRun {run_id} not found')
-            run.cleanup_failed_count = stats['cleanup_failed']
-            run.cards_deleted_count = stats['cards_deleted']
-            run.cards_issued_count = stats['cards_issued']
-            run.queued_count = stats['queued']
-            run.failed_count = stats['failed']
-            run.sent_count = stats['queued']  # legacy alias
-            run.status = 'completed'
+                raise RuntimeError(f"CampaignRun {run_id} not found")
+            run.cleanup_failed_count = stats["cleanup_failed"]
+            run.cards_deleted_count = stats["cards_deleted"]
+            run.cards_issued_count = stats["cards_issued"]
+            run.queued_count = stats["queued"]
+            run.failed_count = stats["failed"]
+            run.sent_count = stats["queued"]  # legacy alias
+            run.status = "completed"
             run.completed_at = utcnow()
 
     logger.info(
-        'send-real run_id=%d company=%d stats=%s',
+        "send-real run_id=%d company=%d stats=%s",
         run_id,
         params.company_id,
         stats,
@@ -315,31 +312,31 @@ async def _process_eligible(
         )
 
     if not cleanup.ok:
-        stats['cleanup_failed'] += 1
-        stats['cards_deleted'] += len(cleanup.deleted_ids)
+        stats["cleanup_failed"] += 1
+        stats["cards_deleted"] += len(cleanup.deleted_ids)
         async with SessionLocal() as session:
             async with session.begin():
                 r = await session.get(CampaignRecipient, recipient_id)
                 if r:
-                    r.status = 'cleanup_failed'
-                    r.excluded_reason = 'cleanup_failed'
+                    r.status = "cleanup_failed"
+                    r.excluded_reason = "cleanup_failed"
                     r.cleanup_card_ids = cleanup.deleted_ids
                     r.cleanup_failed_reason = cleanup.reason
         logger.warning(
-            'cleanup_failed client_id=%d reason=%s',
+            "cleanup_failed client_id=%d reason=%s",
             client_id,
             cleanup.reason,
         )
         return
 
-    stats['cards_deleted'] += len(cleanup.deleted_ids)
+    stats["cards_deleted"] += len(cleanup.deleted_ids)
 
     # ------------------------------------------------------------------
     # Выпуск новой loyalty-карты (HTTP-вызов вне транзакции)
     # ------------------------------------------------------------------
     phone_e164 = client.phone_e164
     card_number = make_card_number(phone_e164)
-    phone_num = int(phone_e164.lstrip('+'))
+    phone_num = int(phone_e164.lstrip("+"))
 
     try:
         card = await loyalty.issue_card(
@@ -348,25 +345,21 @@ async def _process_eligible(
             loyalty_card_type_id=card_type_id,
             phone=phone_num,
         )
-        issued_number = str(
-            card.get('loyalty_card_number') or card_number
-        )
-        issued_id = str(card.get('id') or card.get('loyalty_card_id') or '')
+        issued_number = str(card.get("loyalty_card_number") or card_number)
+        issued_id = str(card.get("id") or card.get("loyalty_card_id") or "")
     except Exception as exc:
-        stats['failed'] += 1
+        stats["failed"] += 1
         async with SessionLocal() as session:
             async with session.begin():
                 r = await session.get(CampaignRecipient, recipient_id)
                 if r:
-                    r.status = 'skipped'
-                    r.excluded_reason = 'card_issue_failed'
+                    r.status = "skipped"
+                    r.excluded_reason = "card_issue_failed"
                     r.cleanup_card_ids = cleanup.deleted_ids
-        logger.error(
-            'card_issue_failed client_id=%d: %s', client_id, exc
-        )
+        logger.error("card_issue_failed client_id=%d: %s", client_id, exc)
         return
 
-    stats['cards_issued'] += 1
+    stats["cards_issued"] += 1
 
     # ------------------------------------------------------------------
     # Создать MessageJob и обновить получателя (одна транзакция)
@@ -378,16 +371,14 @@ async def _process_eligible(
         async with session.begin():
             r = await session.get(CampaignRecipient, recipient_id)
             if r is None:
-                logger.error(
-                    'recipient_id=%d not found', recipient_id
-                )
+                logger.error("recipient_id=%d not found", recipient_id)
                 return
 
             r.loyalty_card_id = issued_id
             r.loyalty_card_number = issued_number
             r.loyalty_card_type_id = card_type_id
             r.cleanup_card_ids = cleanup.deleted_ids
-            r.status = 'card_issued'
+            r.status = "card_issued"
 
             await add_job(
                 session,
@@ -397,10 +388,10 @@ async def _process_eligible(
                 job_type=NEWSLETTER_JOB_TYPE,
                 run_at=run_at,
                 payload={
-                    'kind': NEWSLETTER_JOB_TYPE,
-                    'loyalty_card_text': loyalty_card_text,
-                    'campaign_run_id': run_id,
-                    'campaign_recipient_id': recipient_id,
+                    "kind": NEWSLETTER_JOB_TYPE,
+                    "loyalty_card_text": loyalty_card_text,
+                    "campaign_run_id": run_id,
+                    "campaign_recipient_id": recipient_id,
                 },
             )
 
@@ -411,20 +402,14 @@ async def _process_eligible(
                 record_id=None,
                 run_at=run_at,
             )
-            job = await session.scalar(
-                select(MessageJob).where(
-                    MessageJob.dedupe_key == dedupe_key
-                )
-            )
+            job = await session.scalar(select(MessageJob).where(MessageJob.dedupe_key == dedupe_key))
             if job:
                 r.message_job_id = job.id
 
-            r.status = 'queued'
+            r.status = "queued"
 
-    stats['queued'] += 1
-    logger.info(
-        'queued client_id=%d card=%s', client_id, issued_number
-    )
+    stats["queued"] += 1
+    logger.info("queued client_id=%d card=%s", client_id, issued_number)
 
 
 async def _resolve_card_type(
@@ -437,8 +422,6 @@ async def _resolve_card_type(
         return card_type_id
     types = await loyalty.get_card_types(location_id)
     if not types:
-        raise RuntimeError(
-            f'No loyalty card types for location_id={location_id}'
-        )
-    tid = types[0].get('id') or types[0].get('loyalty_card_type_id')
+        raise RuntimeError(f"No loyalty card types for location_id={location_id}")
+    tid = types[0].get("id") or types[0].get("loyalty_card_type_id")
     return str(tid)

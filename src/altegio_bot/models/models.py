@@ -17,12 +17,7 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.orm import (
-    DeclarativeBase,
-    Mapped,
-    mapped_column,
-    relationship,
-)
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
 class Base(DeclarativeBase):
@@ -30,7 +25,7 @@ class Base(DeclarativeBase):
 
 
 class AltegioEvent(Base):
-    __tablename__ = 'altegio_events'
+    __tablename__ = "altegio_events"
 
     id: Mapped[int] = mapped_column(
         BigInteger,
@@ -54,7 +49,7 @@ class AltegioEvent(Base):
     )
 
     # received/processing/processed/failed
-    status: Mapped[str] = mapped_column(String(32), default='received')
+    status: Mapped[str] = mapped_column(String(32), default="received")
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     company_id: Mapped[int | None] = mapped_column(
@@ -87,7 +82,7 @@ class AltegioEvent(Base):
 class SmartTestRun(Base):
     """Record of a smart-test execution for idempotency and auditing."""
 
-    __tablename__ = 'smart_test_runs'
+    __tablename__ = "smart_test_runs"
 
     id: Mapped[int] = mapped_column(
         BigInteger,
@@ -100,32 +95,18 @@ class SmartTestRun(Base):
     company_id: Mapped[int] = mapped_column(Integer, index=True)
     location_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
-    loyalty_card_id: Mapped[str | None] = mapped_column(
-        String(128), nullable=True
-    )
-    loyalty_card_number: Mapped[str | None] = mapped_column(
-        String(64), nullable=True
-    )
-    loyalty_card_type_id: Mapped[str | None] = mapped_column(
-        String(64), nullable=True
-    )
+    loyalty_card_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    loyalty_card_number: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    loyalty_card_type_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
-    provider_message_id: Mapped[str | None] = mapped_column(
-        String(128), nullable=True, index=True
-    )
-    template_name: Mapped[str | None] = mapped_column(
-        String(128), nullable=True
-    )
+    provider_message_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    template_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
     # pending / pass / fail
     outcome: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
-    deleted_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
-    delete_status: Mapped[str | None] = mapped_column(
-        String(32), nullable=True
-    )
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    delete_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -142,12 +123,12 @@ class Client(Base):
     Уникальность: (company_id, altegio_client_id).
     """
 
-    __tablename__ = 'clients'
+    __tablename__ = "clients"
     __table_args__ = (
         UniqueConstraint(
-            'company_id',
-            'altegio_client_id',
-            name='uq_clients_company_altegio_id',
+            "company_id",
+            "altegio_client_id",
+            name="uq_clients_company_altegio_id",
         ),
     )
 
@@ -165,9 +146,7 @@ class Client(Base):
         index=True,
         nullable=True,
     )
-    display_name: Mapped[str | None] = mapped_column(
-        String(256), nullable=True
-    )
+    display_name: Mapped[str | None] = mapped_column(String(256), nullable=True)
     email: Mapped[str | None] = mapped_column(String(256), nullable=True)
 
     raw: Mapped[dict] = mapped_column(JSONB, default=dict)
@@ -176,7 +155,7 @@ class Client(Base):
         Boolean,
         nullable=False,
         default=False,
-        server_default=text('false'),
+        server_default=text("false"),
         index=True,
     )
     wa_opted_out_at: Mapped[datetime | None] = mapped_column(
@@ -188,7 +167,7 @@ class Client(Base):
         nullable=True,
     )
 
-    records: Mapped[list['Record']] = relationship(back_populates='client')
+    records: Mapped[list["Record"]] = relationship(back_populates="client")
 
 
 class Record(Base):
@@ -197,12 +176,12 @@ class Record(Base):
     Уникальность: (company_id, altegio_record_id).
     """
 
-    __tablename__ = 'records'
+    __tablename__ = "records"
     __table_args__ = (
         UniqueConstraint(
-            'company_id',
-            'altegio_record_id',
-            name='uq_records_company_altegio_id',
+            "company_id",
+            "altegio_record_id",
+            name="uq_records_company_altegio_id",
         ),
     )
 
@@ -217,7 +196,7 @@ class Record(Base):
 
     client_id: Mapped[int | None] = mapped_column(
         BigInteger,
-        ForeignKey('clients.id', ondelete='SET NULL'),
+        ForeignKey("clients.id", ondelete="SET NULL"),
         index=True,
         nullable=True,
     )
@@ -250,9 +229,7 @@ class Record(Base):
 
     confirmed: Mapped[int | None] = mapped_column(Integer, nullable=True)
     attendance: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    visit_attendance: Mapped[int | None] = mapped_column(
-        Integer, nullable=True
-    )
+    visit_attendance: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     is_deleted: Mapped[bool] = mapped_column(
         Boolean,
@@ -272,10 +249,10 @@ class Record(Base):
 
     raw: Mapped[dict] = mapped_column(JSONB, default=dict)
 
-    client: Mapped[Client | None] = relationship(back_populates='records')
-    services: Mapped[list['RecordService']] = relationship(
-        back_populates='record',
-        cascade='all, delete-orphan',
+    client: Mapped[Client | None] = relationship(back_populates="records")
+    services: Mapped[list["RecordService"]] = relationship(
+        back_populates="record",
+        cascade="all, delete-orphan",
     )
 
 
@@ -284,11 +261,11 @@ class RecordService(Base):
     Услуги внутри записи. Ключ: (record_id, service_id)
     """
 
-    __tablename__ = 'record_services'
+    __tablename__ = "record_services"
 
     record_id: Mapped[int] = mapped_column(
         BigInteger,
-        ForeignKey('records.id', ondelete='CASCADE'),
+        ForeignKey("records.id", ondelete="CASCADE"),
         primary_key=True,
     )
     service_id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -302,11 +279,11 @@ class RecordService(Base):
 
     raw: Mapped[dict] = mapped_column(JSONB, default=dict)
 
-    record: Mapped[Record] = relationship(back_populates='services')
+    record: Mapped[Record] = relationship(back_populates="services")
 
 
 class MessageTemplate(Base):
-    __tablename__ = 'message_templates'
+    __tablename__ = "message_templates"
 
     id: Mapped[int] = mapped_column(
         BigInteger,
@@ -315,13 +292,13 @@ class MessageTemplate(Base):
     )
     company_id: Mapped[int] = mapped_column(Integer, index=True)
 
-    # 'record_created', 'reminder_24h', ...
+    # "record_created", "reminder_24h", ...
     code: Mapped[str] = mapped_column(String(64), index=True)
 
-    # 'de'
-    language: Mapped[str] = mapped_column(String(8), default='de')
+    # "de"
+    language: Mapped[str] = mapped_column(String(8), default="de")
 
-    # Текст с плейсхолдерами {client_name}, {date}, ...
+    # Текст шаблона с плейсхолдерами {client_name}, {date}, ...
     body: Mapped[str] = mapped_column(Text)
 
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
@@ -338,7 +315,7 @@ class MessageTemplate(Base):
 
 
 class MessageJob(Base):
-    __tablename__ = 'message_jobs'
+    __tablename__ = "message_jobs"
 
     id: Mapped[int] = mapped_column(
         BigInteger,
@@ -349,13 +326,13 @@ class MessageJob(Base):
     company_id: Mapped[int] = mapped_column(Integer, index=True)
     record_id: Mapped[int | None] = mapped_column(
         BigInteger,
-        ForeignKey('records.id', ondelete='CASCADE'),
+        ForeignKey("records.id", ondelete="CASCADE"),
         index=True,
         nullable=True,
     )
     client_id: Mapped[int | None] = mapped_column(
         BigInteger,
-        ForeignKey('clients.id', ondelete='CASCADE'),
+        ForeignKey("clients.id", ondelete="CASCADE"),
         index=True,
         nullable=True,
     )
@@ -379,12 +356,12 @@ class MessageJob(Base):
     attempts: Mapped[int] = mapped_column(
         Integer,
         nullable=False,
-        server_default=text('0'),
+        server_default=text("0"),
     )
     max_attempts: Mapped[int] = mapped_column(
         Integer,
         nullable=False,
-        server_default=text('5'),
+        server_default=text("5"),
     )
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
@@ -415,7 +392,7 @@ class MessageJob(Base):
 
 
 class OutboxMessage(Base):
-    __tablename__ = 'outbox_messages'
+    __tablename__ = "outbox_messages"
 
     id: Mapped[int] = mapped_column(
         BigInteger,
@@ -426,19 +403,19 @@ class OutboxMessage(Base):
     company_id: Mapped[int] = mapped_column(Integer, index=True)
     client_id: Mapped[int | None] = mapped_column(
         BigInteger,
-        ForeignKey('clients.id', ondelete='SET NULL'),
+        ForeignKey("clients.id", ondelete="SET NULL"),
         index=True,
         nullable=True,
     )
     record_id: Mapped[int | None] = mapped_column(
         BigInteger,
-        ForeignKey('records.id', ondelete='SET NULL'),
+        ForeignKey("records.id", ondelete="SET NULL"),
         index=True,
         nullable=True,
     )
     job_id: Mapped[int | None] = mapped_column(
         BigInteger,
-        ForeignKey('message_jobs.id', ondelete='SET NULL'),
+        ForeignKey("message_jobs.id", ondelete="SET NULL"),
         index=True,
         nullable=True,
     )
@@ -447,13 +424,11 @@ class OutboxMessage(Base):
     phone_e164: Mapped[str] = mapped_column(String(32), index=True)
 
     template_code: Mapped[str] = mapped_column(String(64), index=True)
-    language: Mapped[str] = mapped_column(String(8), default='de')
+    language: Mapped[str] = mapped_column(String(8), default="de")
     body: Mapped[str] = mapped_column(Text)
 
     # queued/sending/sent/delivered/read/failed
-    status: Mapped[str] = mapped_column(
-        String(32), default='queued', index=True
-    )
+    status: Mapped[str] = mapped_column(String(32), default="queued", index=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     provider_message_id: Mapped[str | None] = mapped_column(
@@ -480,14 +455,14 @@ class OutboxMessage(Base):
 
     sender_id: Mapped[int | None] = mapped_column(
         BigInteger,
-        ForeignKey('whatsapp_senders.id'),
+        ForeignKey("whatsapp_senders.id"),
         index=True,
         nullable=True,
     )
 
 
 class ContactRateLimit(Base):
-    __tablename__ = 'contact_rate_limits'
+    __tablename__ = "contact_rate_limits"
 
     phone_e164: Mapped[str] = mapped_column(String(32), primary_key=True)
     next_allowed_at: Mapped[datetime] = mapped_column(
@@ -502,7 +477,7 @@ class ContactRateLimit(Base):
 
 
 class WhatsAppSender(Base):
-    __tablename__ = 'whatsapp_senders'
+    __tablename__ = "whatsapp_senders"
 
     id: Mapped[int] = mapped_column(
         BigInteger,
@@ -513,23 +488,21 @@ class WhatsAppSender(Base):
     sender_code: Mapped[str] = mapped_column(String(32), index=True)
 
     phone_number_id: Mapped[str] = mapped_column(String(64))
-    display_phone: Mapped[str | None] = mapped_column(
-        String(32), nullable=True
-    )
+    display_phone: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
 
     __table_args__ = (
         UniqueConstraint(
-            'company_id',
-            'sender_code',
-            name='uq_whatsapp_senders_company_code',
+            "company_id",
+            "sender_code",
+            name="uq_whatsapp_senders_company_code",
         ),
     )
 
 
 class ServiceSenderRule(Base):
-    __tablename__ = 'service_sender_rules'
+    __tablename__ = "service_sender_rules"
 
     id: Mapped[int] = mapped_column(
         BigInteger,
@@ -544,15 +517,15 @@ class ServiceSenderRule(Base):
 
     __table_args__ = (
         UniqueConstraint(
-            'company_id',
-            'service_id',
-            name='uq_service_sender_rules_company_service',
+            "company_id",
+            "service_id",
+            name="uq_service_sender_rules_company_service",
         ),
     )
 
 
 class WhatsAppEvent(Base):
-    __tablename__ = 'whatsapp_events'
+    __tablename__ = "whatsapp_events"
 
     id: Mapped[int] = mapped_column(
         BigInteger,
@@ -578,7 +551,7 @@ class WhatsAppEvent(Base):
 
     status: Mapped[str] = mapped_column(
         String(32),
-        default='received',
+        default="received",
         index=True,
     )
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -608,7 +581,8 @@ class WhatsAppEvent(Base):
     headers: Mapped[dict] = mapped_column(JSONB, default=dict)
     payload: Mapped[dict] = mapped_column(JSONB, default=dict)
 
-    # Chatwoot conversation that originated this event
+    # Chatwoot conversation that originated this event (set when webhook comes
+    # from Chatwoot instead of Meta directly)
     chatwoot_conversation_id: Mapped[int | None] = mapped_column(
         BigInteger,
         nullable=True,
@@ -620,14 +594,13 @@ class WhatsAppEvent(Base):
 # Campaign models
 # ---------------------------------------------------------------------------
 
+
 class CampaignRun(Base):
     """Один запуск кампании: preview или send-real."""
 
-    __tablename__ = 'campaign_runs'
+    __tablename__ = "campaign_runs"
 
-    id: Mapped[int] = mapped_column(
-        BigInteger, primary_key=True, autoincrement=True
-    )
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
 
     # Код кампании, например 'new_clients_monthly'
     campaign_code: Mapped[str] = mapped_column(String(128), index=True)
@@ -642,29 +615,23 @@ class CampaignRun(Base):
     # Nullable: у preview этого поля нет.
     source_preview_run_id: Mapped[int | None] = mapped_column(
         BigInteger,
-        ForeignKey('campaign_runs.id', ondelete='SET NULL'),
+        ForeignKey("campaign_runs.id", ondelete="SET NULL"),
         nullable=True,
         index=True,
     )
 
     # Параметры loyalty-карт (для send-real)
-    location_id: Mapped[int | None] = mapped_column(
-        Integer, nullable=True
-    )
-    card_type_id: Mapped[str | None] = mapped_column(
-        String(64), nullable=True
-    )
+    location_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    card_type_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     period_start: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     period_end: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
     # running / completed / failed
-    status: Mapped[str] = mapped_column(String(32), default='running')
+    status: Mapped[str] = mapped_column(String(32), default="running")
 
     # Окно атрибуции в днях (по умолчанию 30)
-    attribution_window_days: Mapped[int] = mapped_column(
-        Integer, nullable=False, server_default=text('30')
-    )
+    attribution_window_days: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("30"))
 
     # -----------------------------------------------------------------------
     # Follow-up policy
@@ -673,20 +640,14 @@ class CampaignRun(Base):
         Boolean,
         nullable=False,
         default=False,
-        server_default=text('false'),
+        server_default=text("false"),
     )
     # Через сколько дней проверять follow-up (например, 7 или 14)
-    followup_delay_days: Mapped[int | None] = mapped_column(
-        Integer, nullable=True
-    )
+    followup_delay_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # 'unread_only' | 'unread_or_not_booked'
-    followup_policy: Mapped[str | None] = mapped_column(
-        String(32), nullable=True
-    )
+    followup_policy: Mapped[str | None] = mapped_column(String(32), nullable=True)
     # WhatsApp template для follow-up (отдельный approved template)
-    followup_template_name: Mapped[str | None] = mapped_column(
-        String(128), nullable=True
-    )
+    followup_template_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
     # -----------------------------------------------------------------------
     # Счётчики сегментации
@@ -696,83 +657,49 @@ class CampaignRun(Base):
 
     # Исключения (legacy — оставлены для обратной совместимости)
     excluded_opted_out: Mapped[int] = mapped_column(Integer, default=0)
-    excluded_more_than_one_record: Mapped[int] = mapped_column(
-        Integer, default=0
-    )
+    excluded_more_than_one_record: Mapped[int] = mapped_column(Integer, default=0)
     excluded_has_arrived: Mapped[int] = mapped_column(Integer, default=0)
     excluded_no_phone: Mapped[int] = mapped_column(Integer, default=0)
 
     # Исключения (новые)
-    excluded_multiple_records: Mapped[int] = mapped_column(
-        Integer, nullable=False, server_default=text('0')
-    )
-    excluded_no_confirmed_record: Mapped[int] = mapped_column(
-        Integer, nullable=False, server_default=text('0')
-    )
-    excluded_has_records_before: Mapped[int] = mapped_column(
-        Integer, nullable=False, server_default=text('0')
-    )
-    excluded_invalid_phone: Mapped[int] = mapped_column(
-        Integer, nullable=False, server_default=text('0')
-    )
-    excluded_no_whatsapp: Mapped[int] = mapped_column(
-        Integer, nullable=False, server_default=text('0')
-    )
+    excluded_multiple_records: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    excluded_no_confirmed_record: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    excluded_has_records_before: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    excluded_invalid_phone: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    excluded_no_whatsapp: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
 
     # -----------------------------------------------------------------------
     # Счётчики доставки и атрибуции
     # -----------------------------------------------------------------------
     sent_count: Mapped[int] = mapped_column(Integer, default=0)
     failed_count: Mapped[int] = mapped_column(Integer, default=0)
-    queued_count: Mapped[int] = mapped_column(
-        Integer, nullable=False, server_default=text('0')
-    )
-    provider_accepted_count: Mapped[int] = mapped_column(
-        Integer, nullable=False, server_default=text('0')
-    )
-    delivered_count: Mapped[int] = mapped_column(
-        Integer, nullable=False, server_default=text('0')
-    )
-    read_count: Mapped[int] = mapped_column(
-        Integer, nullable=False, server_default=text('0')
-    )
-    replied_count: Mapped[int] = mapped_column(
-        Integer, nullable=False, server_default=text('0')
-    )
-    booked_after_count: Mapped[int] = mapped_column(
-        Integer, nullable=False, server_default=text('0')
-    )
-    opted_out_after_count: Mapped[int] = mapped_column(
-        Integer, nullable=False, server_default=text('0')
-    )
+    queued_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    provider_accepted_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    delivered_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    read_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    replied_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    booked_after_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    opted_out_after_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
 
     # -----------------------------------------------------------------------
     # Счётчики loyalty-карт
     # -----------------------------------------------------------------------
-    cleanup_failed_count: Mapped[int] = mapped_column(
-        Integer, nullable=False, server_default=text('0')
-    )
-    cards_deleted_count: Mapped[int] = mapped_column(
-        Integer, nullable=False, server_default=text('0')
-    )
-    cards_issued_count: Mapped[int] = mapped_column(
-        Integer, nullable=False, server_default=text('0')
-    )
+    cleanup_failed_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    cards_deleted_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    cards_issued_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),
         index=True,
     )
-    completed_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     meta: Mapped[dict] = mapped_column(JSONB, default=dict)
 
-    recipients: Mapped[list['CampaignRecipient']] = relationship(
-        back_populates='run',
-        cascade='all, delete-orphan',
+    recipients: Mapped[list["CampaignRecipient"]] = relationship(
+        back_populates="run",
+        cascade="all, delete-orphan",
     )
 
 
@@ -782,15 +709,13 @@ class CampaignRecipient(Base):
     Создаётся как для preview, так и для send-real.
     """
 
-    __tablename__ = 'campaign_recipients'
+    __tablename__ = "campaign_recipients"
 
-    id: Mapped[int] = mapped_column(
-        BigInteger, primary_key=True, autoincrement=True
-    )
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
 
     campaign_run_id: Mapped[int] = mapped_column(
         BigInteger,
-        ForeignKey('campaign_runs.id', ondelete='CASCADE'),
+        ForeignKey("campaign_runs.id", ondelete="CASCADE"),
         index=True,
     )
 
@@ -798,20 +723,14 @@ class CampaignRecipient(Base):
 
     client_id: Mapped[int | None] = mapped_column(
         BigInteger,
-        ForeignKey('clients.id', ondelete='SET NULL'),
+        ForeignKey("clients.id", ondelete="SET NULL"),
         index=True,
         nullable=True,
     )
-    altegio_client_id: Mapped[int | None] = mapped_column(
-        BigInteger, nullable=True
-    )
+    altegio_client_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
-    phone_e164: Mapped[str | None] = mapped_column(
-        String(32), index=True, nullable=True
-    )
-    display_name: Mapped[str | None] = mapped_column(
-        String(256), nullable=True
-    )
+    phone_e164: Mapped[str | None] = mapped_column(String(32), index=True, nullable=True)
+    display_name: Mapped[str | None] = mapped_column(String(256), nullable=True)
 
     # -----------------------------------------------------------------------
     # Статус (полная цепочка)
@@ -819,51 +738,35 @@ class CampaignRecipient(Base):
     #   → queue_failed | queued → provider_accepted → delivered
     #   → read → replied → booked_after_campaign
     # -----------------------------------------------------------------------
-    status: Mapped[str] = mapped_column(String(64), default='candidate')
+    status: Mapped[str] = mapped_column(String(64), default="candidate")
 
-    # Причина исключения (если статус skipped/cleanup_failed)
+    # Причина исключения (если статус skipped/cleanup_failed).
     # Значения: opted_out / no_phone / invalid_phone / no_whatsapp /
     #           multiple_records_in_period / no_confirmed_record_in_period /
     #           has_records_before_period / cleanup_failed /
     #           provider_error / delivery_failed / card_issue_failed
-    excluded_reason: Mapped[str | None] = mapped_column(
-        String(64), nullable=True
-    )
+    excluded_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     # -----------------------------------------------------------------------
     # Снимок сегментации (заполняется при создании записи)
     # -----------------------------------------------------------------------
     # Все записи клиента в периоде (не удалённые)
     total_records_in_period: Mapped[int] = mapped_column(Integer, default=0)
-    # Подтверждённые записи (confirmed == 1) в периоде
-    # TODO: Согласовать с командой, что считается "подтверждённой" записью.
-    #       Сейчас: confirmed == 1. Альтернатива: attendance == 1.
-    confirmed_records_in_period: Mapped[int] = mapped_column(
-        Integer, nullable=False, server_default=text('0')
-    )
+    # Подтверждённые записи (confirmed == CONFIRMED_FLAG) в периоде
+    confirmed_records_in_period: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
     # Все записи клиента ДО начала периода (любой статус)
-    records_before_period: Mapped[int] = mapped_column(
-        Integer, nullable=False, server_default=text('0')
-    )
+    records_before_period: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
     # Legacy-поле (оставлено для обратной совместимости)
-    arrived_records_in_period: Mapped[int] = mapped_column(
-        Integer, default=0
-    )
+    arrived_records_in_period: Mapped[int] = mapped_column(Integer, default=0)
     is_opted_out: Mapped[bool] = mapped_column(Boolean, default=False)
 
     # -----------------------------------------------------------------------
     # Loyalty-карты
     # -----------------------------------------------------------------------
     # Выпущенная в этом run карта
-    loyalty_card_id: Mapped[str | None] = mapped_column(
-        String(128), nullable=True
-    )
-    loyalty_card_number: Mapped[str | None] = mapped_column(
-        String(64), nullable=True
-    )
-    loyalty_card_type_id: Mapped[str | None] = mapped_column(
-        String(64), nullable=True
-    )
+    loyalty_card_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    loyalty_card_number: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    loyalty_card_type_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # Список ID campaign-карт, удалённых перед выпуском новой
     cleanup_card_ids: Mapped[list] = mapped_column(
         JSONB,
@@ -871,80 +774,56 @@ class CampaignRecipient(Base):
         default=list,
         server_default=text("'[]'::jsonb"),
     )
-    cleanup_failed_reason: Mapped[str | None] = mapped_column(
-        String(256), nullable=True
-    )
+    cleanup_failed_reason: Mapped[str | None] = mapped_column(String(256), nullable=True)
 
     # -----------------------------------------------------------------------
     # Tracking отправки
     # -----------------------------------------------------------------------
     message_job_id: Mapped[int | None] = mapped_column(
         BigInteger,
-        ForeignKey('message_jobs.id', ondelete='SET NULL'),
+        ForeignKey("message_jobs.id", ondelete="SET NULL"),
         nullable=True,
         index=True,
     )
     outbox_message_id: Mapped[int | None] = mapped_column(
         BigInteger,
-        ForeignKey('outbox_messages.id', ondelete='SET NULL'),
+        ForeignKey("outbox_messages.id", ondelete="SET NULL"),
         nullable=True,
         index=True,
     )
-    provider_message_id: Mapped[str | None] = mapped_column(
-        String(128), nullable=True, index=True
-    )
+    provider_message_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
 
     # -----------------------------------------------------------------------
     # Attribution timestamps (заполняются по мере событий)
     # -----------------------------------------------------------------------
-    sent_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
-    read_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
-    replied_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
-    booked_after_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
-    opted_out_after_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    replied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    booked_after_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    opted_out_after_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     # -----------------------------------------------------------------------
     # Follow-up
     # -----------------------------------------------------------------------
-    followup_status: Mapped[str | None] = mapped_column(
-        String(32), nullable=True
-    )
+    followup_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
     followup_message_job_id: Mapped[int | None] = mapped_column(
         BigInteger,
-        ForeignKey('message_jobs.id', ondelete='SET NULL'),
+        ForeignKey("message_jobs.id", ondelete="SET NULL"),
         nullable=True,
     )
     followup_outbox_id: Mapped[int | None] = mapped_column(
         BigInteger,
-        ForeignKey('outbox_messages.id', ondelete='SET NULL'),
+        ForeignKey("outbox_messages.id", ondelete="SET NULL"),
         nullable=True,
     )
-    followup_sent_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
+    followup_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     # Legacy-поля
-    deleted_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
-    delete_status: Mapped[str | None] = mapped_column(
-        String(32), nullable=True
-    )
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    delete_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     meta: Mapped[dict] = mapped_column(JSONB, default=dict)
 
-    run: Mapped['CampaignRun'] = relationship(back_populates='recipients')
+    run: Mapped["CampaignRun"] = relationship(back_populates="recipients")
