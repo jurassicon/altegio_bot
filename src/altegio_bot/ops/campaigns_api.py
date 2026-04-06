@@ -325,6 +325,12 @@ async def plan_followup_endpoint(
             if run is None:
                 raise HTTPException(status_code=404, detail="Run not found")
 
+            if run.mode != "send-real":
+                raise HTTPException(
+                    status_code=400,
+                    detail="Follow-up доступен только для send-real run",
+                )
+
             if body.followup_policy:
                 run.followup_policy = body.followup_policy
             if body.followup_delay_days is not None:
@@ -332,7 +338,6 @@ async def plan_followup_endpoint(
             if body.followup_template_name:
                 run.followup_template_name = body.followup_template_name
 
-            # Включаем follow-up если не был включён
             run.followup_enabled = True
 
             try:
@@ -358,6 +363,13 @@ async def run_followup_now(run_id: int) -> dict[str, Any]:
         run = await session.get(CampaignRun, run_id)
         if run is None:
             raise HTTPException(status_code=404, detail="Run not found")
+
+        if run.mode != "send-real":
+            raise HTTPException(
+                status_code=400,
+                detail="Follow-up доступен только для send-real run",
+            )
+
         if not run.followup_enabled:
             raise HTTPException(
                 status_code=400,
@@ -370,7 +382,10 @@ async def run_followup_now(run_id: int) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
         logger.exception("followup failed run_id=%d: %s", run_id, exc)
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise HTTPException(
+            status_code=500,
+            detail="Internal follow-up error",
+        )
 
     return {"run_id": run_id, "stats": stats}
 

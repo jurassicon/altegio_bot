@@ -1,24 +1,9 @@
-"""Follow-up рассылка: дорассылка по клиентам основной кампании.
-
-Логика:
-  1. В момент создания run сохраняется follow-up policy.
-  2. После истечения followup_delay_days проверяем каждого получателя.
-  3. По политике unread_only берём только тех, у кого нет read_at.
-  4. По политике unread_or_not_booked берём тех, у кого нет read_at
-     или нет booked_after_at.
-  5. Исключения: клиенты с hard failure, cleanup_failed, no_phone,
-     invalid_phone, no_whatsapp, provider_error, delivery_failed.
-
-Follow-up использует отдельный WhatsApp template (followup_template_name)
-т.к. отправка происходит за пределами 24-часового окна.
-"""
-
 from __future__ import annotations
 
 import logging
 from datetime import timedelta
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.campaigns.runner import FOLLOWUP_JOB_TYPE
@@ -54,23 +39,24 @@ _SENT_PIPELINE_STATUSES = {
     "booked_after_campaign",
 }
 
+# Временный служебный статус, чтобы два параллельных follow-up запуска
+# не забрали одного и того же получателя одновременно.
+_FOLLOWUP_PROCESSING = "followup_processing"
+
 
 def _is_eligible_for_followup(
     recipient: CampaignRecipient,
     policy: str,
 ) -> bool:
     """Проверить, нужно ли отправить follow-up этому получателю."""
-    # Hard failure — исключаем
     if recipient.status in _HARD_FAILURE_STATUSES:
         return False
     if recipient.excluded_reason in _HARD_FAILURE_REASONS:
         return False
 
-    # Клиент не прошёл сегментацию — исключаем
     if recipient.status == "skipped":
         return False
 
-    # Не было реальной отправки — нечего follow-up'ить
     if recipient.status not in _SENT_PIPELINE_STATUSES:
         return False
 
@@ -103,24 +89,39 @@ async def plan_followup(session: AsyncSession, run_id: int) -> int:
     recipients = (await session.execute(stmt)).scalars().all()
 
     count = 0
-    for r in recipients:
+    for recipient in recipients:
         # Идемпотентность: если статус уже выставлен — не трогаем.
         # Повторный вызов plan_followup не должен сбрасывать
         # followup_queued / followup_skipped обратно в planned.
-        if r.followup_status is not None:
+        if recipient.followup_status is not None:
             continue
 
-        if _is_eligible_for_followup(r, run.followup_policy):
-            r.followup_status = "followup_planned"
+        if _is_eligible_for_followup(recipient, run.followup_policy):
+            recipient.followup_status = "followup_planned"
             count += 1
-        elif r.excluded_reason is None:
-            # Помечаем followup_skipped только тех, кто прошёл сегментацию
-            # (excluded_reason is None == не был исключён при сегментации).
-            r.followup_status = "followup_skipped"
+        elif recipient.excluded_reason is None:
+            recipient.followup_status = "followup_skipped"
 
     await session.flush()
     logger.info("plan_followup run_id=%d planned=%d", run_id, count)
     return count
+
+
+async def _set_followup_status(
+    recipient_id: int,
+    status: str,
+    *,
+    message_job_id: int | None = None,
+) -> None:
+    """Best-effort обновление статуса follow-up получателя."""
+    async with SessionLocal() as session:
+        async with session.begin():
+            recipient = await session.get(CampaignRecipient, recipient_id)
+            if recipient is None:
+                return
+            recipient.followup_status = status
+            if message_job_id is not None:
+                recipient.followup_message_job_id = message_job_id
 
 
 async def execute_followup(run_id: int) -> dict:
@@ -142,7 +143,11 @@ async def execute_followup(run_id: int) -> dict:
 
         policy = run.followup_policy or ""
 
-    stats: dict[str, int] = {"queued": 0, "skipped": 0, "failed": 0}
+    stats: dict[str, int] = {
+        "queued": 0,
+        "skipped": 0,
+        "failed": 0,
+    }
 
     async with SessionLocal() as session:
         stmt = (
@@ -155,33 +160,92 @@ async def execute_followup(run_id: int) -> dict:
     for recipient in recipients:
         company_id = recipient.company_id
         client_id = recipient.client_id
+        recipient_id = recipient.id
 
         if not client_id:
-            async with SessionLocal() as session:
-                async with session.begin():
-                    r = await session.get(CampaignRecipient, recipient.id)
-                    if r is not None:
-                        r.followup_status = "followup_skipped"
+            await _set_followup_status(
+                recipient_id,
+                "followup_skipped",
+            )
             stats["skipped"] += 1
             continue
 
-        # Re-evaluate по актуальным данным
-        async with SessionLocal() as session:
-            fresh = await session.get(CampaignRecipient, recipient.id)
-            if fresh is None:
-                stats["skipped"] += 1
-                continue
-            if not _is_eligible_for_followup(fresh, policy):
-                fresh.followup_status = "followup_skipped"
-                await session.commit()
+        # Шаг 1. Атомарно "забираем" получателя в обработку.
+        # Это защищает от дублей при параллельных /followup/run-now.
+        try:
+            async with SessionLocal() as session:
+                async with session.begin():
+                    claim_result = await session.execute(
+                        update(CampaignRecipient)
+                        .where(CampaignRecipient.id == recipient_id)
+                        .where(CampaignRecipient.followup_status == "followup_planned")
+                        .values(followup_status=_FOLLOWUP_PROCESSING)
+                    )
+
+            if (claim_result.rowcount or 0) == 0:
                 stats["skipped"] += 1
                 continue
 
-        # Создать follow-up job
+        except Exception as exc:
+            stats["failed"] += 1
+            logger.error(
+                "followup claim failed recipient_id=%d run_id=%d: %s",
+                recipient_id,
+                run_id,
+                exc,
+            )
+            continue
+
+        # Шаг 2. Re-evaluate по актуальным данным.
+        # Ошибка одного recipient не должна обрывать весь цикл.
+        try:
+            async with SessionLocal() as session:
+                async with session.begin():
+                    fresh = await session.get(
+                        CampaignRecipient,
+                        recipient_id,
+                    )
+                    if fresh is None:
+                        stats["skipped"] += 1
+                        continue
+
+                    if not _is_eligible_for_followup(fresh, policy):
+                        fresh.followup_status = "followup_skipped"
+                        stats["skipped"] += 1
+                        continue
+
+        except Exception as exc:
+            stats["failed"] += 1
+            logger.error(
+                "followup re-evaluate failed recipient_id=%d client_id=%d run_id=%d: %s",
+                recipient_id,
+                client_id,
+                run_id,
+                exc,
+            )
+            # Возвращаем в planned, чтобы можно было безопасно
+            # повторно запустить /followup/run-now.
+            await _set_followup_status(
+                recipient_id,
+                "followup_planned",
+            )
+            continue
+
+        # Шаг 3. Создаём follow-up job.
         run_at = utcnow()
         try:
             async with SessionLocal() as session:
                 async with session.begin():
+                    current = await session.get(
+                        CampaignRecipient,
+                        recipient_id,
+                    )
+                    if current is None:
+                        raise RuntimeError(f"recipient_id={recipient_id} not found")
+
+                    if current.followup_status != _FOLLOWUP_PROCESSING:
+                        raise RuntimeError("recipient not claimed for follow-up")
+
                     await add_job(
                         session,
                         company_id=company_id,
@@ -193,7 +257,7 @@ async def execute_followup(run_id: int) -> dict:
                             "kind": FOLLOWUP_JOB_TYPE,
                             "template_name": template_name,
                             "campaign_run_id": run_id,
-                            "campaign_recipient_id": recipient.id,
+                            "campaign_recipient_id": recipient_id,
                         },
                     )
 
@@ -205,19 +269,37 @@ async def execute_followup(run_id: int) -> dict:
                     )
                     job = await session.scalar(select(MessageJob).where(MessageJob.dedupe_key == dedupe_key))
 
-                    r = await session.get(CampaignRecipient, recipient.id)
-                    if r:
-                        r.followup_status = "followup_queued"
-                        if job:
-                            r.followup_message_job_id = job.id
+                    current.followup_status = "followup_queued"
+                    if job:
+                        current.followup_message_job_id = job.id
 
             stats["queued"] += 1
-            logger.info("followup queued client_id=%d run_id=%d", client_id, run_id)
+            logger.info(
+                "followup queued client_id=%d run_id=%d",
+                client_id,
+                run_id,
+            )
+
         except Exception as exc:
             stats["failed"] += 1
-            logger.error("followup failed client_id=%d run_id=%d: %s", client_id, run_id, exc)
+            logger.error(
+                "followup failed recipient_id=%d client_id=%d run_id=%d: %s",
+                recipient_id,
+                client_id,
+                run_id,
+                exc,
+            )
+            # Возвращаем в planned для безопасного ручного ретрая.
+            await _set_followup_status(
+                recipient_id,
+                "followup_planned",
+            )
 
-    logger.info("execute_followup run_id=%d stats=%s", run_id, stats)
+    logger.info(
+        "execute_followup run_id=%d stats=%s",
+        run_id,
+        stats,
+    )
     return stats
 
 
