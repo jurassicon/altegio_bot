@@ -182,7 +182,9 @@ async def monthly_dashboard(
     """Monthly dashboard по всем филиалам за указанный месяц.
 
     Учитываются только runs с mode='send-real' и status='completed'.
-    Preview runs в дашборд не попадают.
+    Данные берутся из run_report(), который использует pre-aggregated
+    счётчики с fallback на live outbox_messages — актуальнее прямой
+    агрегации полей CampaignRun.
     """
     month_start = datetime(year, month, 1, tzinfo=timezone.utc)
     next_month = month + 1 if month < 12 else 1
@@ -196,32 +198,29 @@ async def monthly_dashboard(
         .where(CampaignRun.period_start >= month_start)
         .where(CampaignRun.period_start < month_end)
         .where(CampaignRun.status == "completed")
-        # Только реальные рассылки; preview не считаем в дашборде
         .where(CampaignRun.mode == "send-real")
         .order_by(CampaignRun.created_at.desc())
     )
     all_runs = (await session.execute(runs_stmt)).scalars().all()
-
-    # Фильтруем по компаниям (company_ids — JSON-массив)
     runs = [r for r in all_runs if any(cid in (r.company_ids or []) for cid in cids_filter)]
 
-    # Группируем по company_id
-    per_company: dict[int, list[CampaignRun]] = {}
+    per_company: dict[int, list[dict[str, Any]]] = {}
     for run in runs:
+        report = await run_report(session, run.id)
         for cid in run.company_ids or []:
             if cid in cids_filter:
-                per_company.setdefault(cid, []).append(run)
+                per_company.setdefault(cid, []).append(report)
 
     company_reports = []
     for cid in cids_filter:
-        cid_runs = per_company.get(cid, [])
-        totals = _aggregate_company(cid_runs)
+        cid_reports = per_company.get(cid, [])
+        totals = _aggregate_company_reports(cid_reports)
         company_reports.append(
             {
                 "company_id": cid,
                 "company_name": COMPANIES.get(cid, str(cid)),
-                "runs_count": len(cid_runs),
-                "run_ids": [r.id for r in cid_runs],
+                "runs_count": len(cid_reports),
+                "run_ids": [r["run_id"] for r in cid_reports],
                 "totals": totals,
             }
         )
@@ -234,21 +233,22 @@ async def monthly_dashboard(
     }
 
 
-def _aggregate_company(runs: list[CampaignRun]) -> dict[str, Any]:
-    """Агрегировать метрики по списку runs одной компании."""
-    if not runs:
+def _aggregate_company_reports(
+    reports: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if not reports:
         return _empty_totals()
 
-    total_found = sum(r.total_clients_seen for r in runs)
-    eligible = sum(r.candidates_count for r in runs)
-    sent = sum(r.queued_count for r in runs)
-    delivered = sum(r.delivered_count for r in runs)
-    read = sum(r.read_count for r in runs)
-    replied = sum(r.replied_count for r in runs)
-    booked = sum(r.booked_after_count for r in runs)
-    opted_out = sum(r.opted_out_after_count for r in runs)
-    invalid = sum(r.excluded_invalid_phone for r in runs)
-    no_wa = sum(r.excluded_no_whatsapp for r in runs)
+    total_found = sum(r["total_found"] for r in reports)
+    eligible = sum(r["eligible"] for r in reports)
+    sent = sum(r["queued"] for r in reports)
+    delivered = sum(r["delivered"] for r in reports)
+    read = sum(r["read"] for r in reports)
+    replied = sum(r["replied"] for r in reports)
+    booked = sum(r["booked_after_campaign"] for r in reports)
+    opted_out = sum(r["opted_out_after_campaign"] for r in reports)
+    invalid = sum(r["excluded"]["invalid_phone"] for r in reports)
+    no_wa = sum(r["excluded"]["no_whatsapp"] for r in reports)
 
     problematic = invalid + no_wa
 
@@ -262,9 +262,7 @@ def _aggregate_company(runs: list[CampaignRun]) -> dict[str, Any]:
         "booked_after_30d": booked,
         "opted_out": opted_out,
         "problematic_phones_pct": _pct(problematic, eligible),
-        # sent / eligible
         "coverage_rate": _pct(sent, eligible),
-        # booked / sent
         "booking_conversion": _pct(booked, sent),
     }
 

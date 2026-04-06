@@ -128,7 +128,6 @@ def _update_run_exclusion_counters(
             run.excluded_opted_out += 1
         elif reason == "no_phone":
             run.excluded_no_phone += 1
-            run.excluded_multiple_records += 0  # для clarity
         elif reason == "has_records_before_period":
             run.excluded_has_records_before += 1
         elif reason == "multiple_records_in_period":
@@ -287,11 +286,9 @@ async def _process_eligible(
     campaign_code: str,
     stats: dict,
 ) -> None:
-    """Обработать одного eligible клиента: cleanup → card → job."""
     client = candidate.client
     client_id = client.id
 
-    # Создать получателя со статусом 'candidate'
     async with SessionLocal() as session:
         async with session.begin():
             recipient = _build_recipient(run_id, candidate)
@@ -299,9 +296,6 @@ async def _process_eligible(
             await session.flush()
             recipient_id = recipient.id
 
-    # ------------------------------------------------------------------
-    # Cleanup старых campaign-карт (HTTP-вызов вне транзакции)
-    # ------------------------------------------------------------------
     async with SessionLocal() as session:
         cleanup = await cleanup_campaign_cards(
             session,
@@ -322,18 +316,10 @@ async def _process_eligible(
                     r.excluded_reason = "cleanup_failed"
                     r.cleanup_card_ids = cleanup.deleted_ids
                     r.cleanup_failed_reason = cleanup.reason
-        logger.warning(
-            "cleanup_failed client_id=%d reason=%s",
-            client_id,
-            cleanup.reason,
-        )
         return
 
     stats["cards_deleted"] += len(cleanup.deleted_ids)
 
-    # ------------------------------------------------------------------
-    # Выпуск новой loyalty-карты (HTTP-вызов вне транзакции)
-    # ------------------------------------------------------------------
     phone_e164 = client.phone_e164
     card_number = make_card_number(phone_e164)
     phone_num = int(phone_e164.lstrip("+"))
@@ -360,56 +346,66 @@ async def _process_eligible(
         return
 
     stats["cards_issued"] += 1
-
-    # ------------------------------------------------------------------
-    # Создать MessageJob и обновить получателя (одна транзакция)
-    # ------------------------------------------------------------------
     loyalty_card_text = make_card_text(issued_number)
     run_at = utcnow()
 
-    async with SessionLocal() as session:
-        async with session.begin():
-            r = await session.get(CampaignRecipient, recipient_id)
-            if r is None:
-                logger.error("recipient_id=%d not found", recipient_id)
-                return
+    try:
+        async with SessionLocal() as session:
+            async with session.begin():
+                r = await session.get(CampaignRecipient, recipient_id)
+                if r is None:
+                    raise RuntimeError(f"recipient_id={recipient_id} not found")
 
-            r.loyalty_card_id = issued_id
-            r.loyalty_card_number = issued_number
-            r.loyalty_card_type_id = card_type_id
-            r.cleanup_card_ids = cleanup.deleted_ids
-            r.status = "card_issued"
+                r.loyalty_card_id = issued_id
+                r.loyalty_card_number = issued_number
+                r.loyalty_card_type_id = card_type_id
+                r.cleanup_card_ids = cleanup.deleted_ids
+                r.status = "card_issued"
 
-            await add_job(
-                session,
-                company_id=company_id,
-                record_id=None,
-                client_id=client_id,
-                job_type=NEWSLETTER_JOB_TYPE,
-                run_at=run_at,
-                payload={
-                    "kind": NEWSLETTER_JOB_TYPE,
-                    "loyalty_card_text": loyalty_card_text,
-                    "campaign_run_id": run_id,
-                    "campaign_recipient_id": recipient_id,
-                },
-            )
+                await add_job(
+                    session,
+                    company_id=company_id,
+                    record_id=None,
+                    client_id=client_id,
+                    job_type=NEWSLETTER_JOB_TYPE,
+                    run_at=run_at,
+                    payload={
+                        "kind": NEWSLETTER_JOB_TYPE,
+                        "loyalty_card_text": loyalty_card_text,
+                        "campaign_run_id": run_id,
+                        "campaign_recipient_id": recipient_id,
+                    },
+                )
 
-            # Получить ID созданного job
-            dedupe_key = make_dedupe_key(
-                job_type=NEWSLETTER_JOB_TYPE,
-                company_id=company_id,
-                record_id=None,
-                run_at=run_at,
-            )
-            job = await session.scalar(select(MessageJob).where(MessageJob.dedupe_key == dedupe_key))
-            if job:
-                r.message_job_id = job.id
+                dedupe_key = make_dedupe_key(
+                    job_type=NEWSLETTER_JOB_TYPE,
+                    company_id=company_id,
+                    record_id=None,
+                    run_at=run_at,
+                )
+                job = await session.scalar(select(MessageJob).where(MessageJob.dedupe_key == dedupe_key))
+                if job:
+                    r.message_job_id = job.id
 
-            r.status = "queued"
+                r.status = "queued"
 
-    stats["queued"] += 1
-    logger.info("queued client_id=%d card=%s", client_id, issued_number)
+        stats["queued"] += 1
+        logger.info("queued client_id=%d card=%s", client_id, issued_number)
+
+    except Exception as exc:
+        stats["failed"] += 1
+        logger.error("queue_failed client_id=%d: %s", client_id, exc)
+
+        async with SessionLocal() as session:
+            async with session.begin():
+                r = await session.get(CampaignRecipient, recipient_id)
+                if r:
+                    r.status = "skipped"
+                    r.excluded_reason = "queue_failed"
+                    r.loyalty_card_id = issued_id
+                    r.loyalty_card_number = issued_number
+                    r.loyalty_card_type_id = card_type_id
+                    r.cleanup_card_ids = cleanup.deleted_ids
 
 
 async def _resolve_card_type(
