@@ -268,6 +268,7 @@ async def get_run_progress(run_id: int) -> dict[str, Any]:
         "execution_job": execution_job,
         "progress": progress,
         "last_error": _last_error(run),
+        "followup_auto": _followup_auto(run),
     }
 
 
@@ -598,6 +599,21 @@ def _last_error(run: CampaignRun) -> str | None:
     return (run.meta or {}).get("last_error")
 
 
+def _followup_auto(run: CampaignRun) -> dict[str, Any] | None:
+    """Блок авто-follow-up из run.meta, если авто-worker уже запускался."""
+    meta = run.meta or {}
+    if "followup_auto_status" not in meta:
+        return None
+    return {
+        "followup_auto_status": meta.get("followup_auto_status"),
+        "followup_auto_started_at": meta.get("followup_auto_started_at"),
+        "followup_auto_completed_at": meta.get("followup_auto_completed_at"),
+        "followup_auto_last_error": meta.get("followup_auto_last_error"),
+        "followup_auto_planned_count": meta.get("followup_auto_planned_count"),
+        "followup_auto_queued_count": meta.get("followup_auto_queued_count"),
+    }
+
+
 def _run_summary(run: CampaignRun) -> dict[str, Any]:
     """Краткая сводка по run для списков."""
     return {
@@ -631,6 +647,7 @@ def _run_detail(run: CampaignRun) -> dict[str, Any]:
             "followup_delay_days": run.followup_delay_days,
             "followup_policy": run.followup_policy,
             "followup_template_name": run.followup_template_name,
+            "followup_auto": _followup_auto(run),
             "excluded": {
                 "opted_out": run.excluded_opted_out,
                 "no_phone": run.excluded_no_phone,
