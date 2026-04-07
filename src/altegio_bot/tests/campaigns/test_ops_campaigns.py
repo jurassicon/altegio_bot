@@ -307,6 +307,23 @@ async def test_ops_new_clients_page_shows_template_block(http_client: AsyncClien
 
 
 @pytest.mark.asyncio
+async def test_ops_new_clients_page_has_company_template_mapping(http_client: AsyncClient) -> None:
+    """JS-маппинг COMPANY_TEMPLATES содержит template_name для каждой компании."""
+    response = await http_client.get("/ops/campaigns/new-clients")
+    assert response.status_code == 200
+    text = response.text
+    # Маппинг присутствует в JS
+    assert "COMPANY_TEMPLATES" in text
+    # Karlsruhe и Rastatt имеют template в маппинге
+    assert "758285" in text
+    assert "1271200" in text
+    # Для Karlsruhe — KA-шаблон
+    assert "kitilash_ka_newsletter_new_clients_monthly_v2" in text
+    # loadTemplateText принимает companyId из select
+    assert "loadTemplateText(companySelect.value)" in text
+
+
+@pytest.mark.asyncio
 async def test_ops_new_clients_page_has_preview_button(http_client: AsyncClient) -> None:
     """На странице есть кнопка Create Preview."""
     response = await http_client.get("/ops/campaigns/new-clients")
@@ -474,6 +491,8 @@ async def test_ops_new_clients_page_has_template_text_block(http_client: AsyncCl
     text = response.text
     assert "template-text-block" in text
     assert "loadTemplateText" in text
+    # id для динамического обновления имени шаблона
+    assert "template-name-display" in text
     # Должен быть fallback alert текст в JS
     assert "Не удалось загрузить текст шаблона из Meta" in text
 
@@ -483,7 +502,7 @@ async def test_template_text_endpoint_returns_data(
     http_client: AsyncClient,
     session_maker,
 ) -> None:
-    """Endpoint /template-text возвращает данные шаблона из БД."""
+    """Endpoint /template-text возвращает данные шаблона из БД (KA, с company_id)."""
     from altegio_bot.models.models import MessageTemplate
 
     async with session_maker() as session:
@@ -498,7 +517,9 @@ async def test_template_text_endpoint_returns_data(
             session.add(tpl)
 
     response = await http_client.get(
-        "/ops/campaigns/new-clients/template-text?template_name=kitilash_ka_newsletter_new_clients_monthly_v2"
+        "/ops/campaigns/new-clients/template-text"
+        "?template_name=kitilash_ka_newsletter_new_clients_monthly_v2"
+        "&company_id=758285"
     )
     assert response.status_code == 200
     data = response.json()
@@ -516,6 +537,120 @@ async def test_template_text_endpoint_returns_404_if_not_found(
     assert response.status_code == 404
     data = response.json()
     assert "не найден" in data["detail"]
+
+
+# ---------------------------------------------------------------------------
+# template-text: per-company детерминированный поиск
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_template_text_endpoint_karlsruhe(
+    http_client: AsyncClient,
+    session_maker,
+) -> None:
+    """Endpoint возвращает шаблон для Karlsruhe (company_id=758285)."""
+    from altegio_bot.models.models import MessageTemplate
+
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(
+                MessageTemplate(
+                    company_id=758285,
+                    code="newsletter_new_clients_monthly",
+                    language="de",
+                    body="KA: Hallo {{1}}",
+                    is_active=True,
+                )
+            )
+
+    response = await http_client.get(
+        "/ops/campaigns/new-clients/template-text"
+        "?template_name=kitilash_ka_newsletter_new_clients_monthly_v2"
+        "&company_id=758285"
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["code"] == "newsletter_new_clients_monthly"
+    assert data["company_id"] == 758285
+    assert "KA:" in data["body"]
+
+
+@pytest.mark.asyncio
+async def test_template_text_endpoint_rastatt_falls_back_to_ka(
+    http_client: AsyncClient,
+    session_maker,
+) -> None:
+    """Rastatt использует KA-шаблон. Endpoint находит его через fallback."""
+    from altegio_bot.models.models import MessageTemplate
+
+    async with session_maker() as session:
+        async with session.begin():
+            # Только KA-запись в БД (Rastatt uses KA template per META_TEMPLATE_MAP)
+            session.add(
+                MessageTemplate(
+                    company_id=758285,
+                    code="newsletter_new_clients_monthly",
+                    language="de",
+                    body="Universal: Hallo {{1}}",
+                    is_active=True,
+                )
+            )
+
+    # RA campaign company, но template_name — KA (оба используют kitilash_ka_... шаблон)
+    response = await http_client.get(
+        "/ops/campaigns/new-clients/template-text"
+        "?template_name=kitilash_ka_newsletter_new_clients_monthly_v2"
+        "&company_id=1271200"
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["code"] == "newsletter_new_clients_monthly"
+    # Нашли KA-запись через fallback (RA не имеет своей записи с этим кодом)
+    assert data["company_id"] == 758285
+    assert "Universal" in data["body"]
+
+
+@pytest.mark.asyncio
+async def test_template_text_no_substring_ambiguity(
+    http_client: AsyncClient,
+    session_maker,
+) -> None:
+    """Exact match: запрос на newsletter_new_clients_monthly не захватывает newsletter_new_clients."""
+    from altegio_bot.models.models import MessageTemplate
+
+    async with session_maker() as session:
+        async with session.begin():
+            # Короткий код — потенциальная ловушка substring matching
+            session.add(
+                MessageTemplate(
+                    company_id=758285,
+                    code="newsletter_new_clients",
+                    language="de",
+                    body="SHORT: body without monthly",
+                    is_active=True,
+                )
+            )
+            # Полный код — именно его ищем
+            session.add(
+                MessageTemplate(
+                    company_id=758285,
+                    code="newsletter_new_clients_monthly",
+                    language="de",
+                    body="FULL: body with monthly",
+                    is_active=True,
+                )
+            )
+
+    response = await http_client.get(
+        "/ops/campaigns/new-clients/template-text?template_name=kitilash_ka_newsletter_new_clients_monthly_v2"
+    )
+    assert response.status_code == 200
+    data = response.json()
+    # Строгий exact match: должен вернуть именно newsletter_new_clients_monthly
+    assert data["code"] == "newsletter_new_clients_monthly"
+    assert "FULL" in data["body"]
+    assert "SHORT" not in data["body"]
 
 
 # ---------------------------------------------------------------------------

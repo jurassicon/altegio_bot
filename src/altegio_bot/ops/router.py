@@ -19,6 +19,7 @@ from sqlalchemy import func, select, text
 
 from altegio_bot.campaigns.reports import monthly_dashboard
 from altegio_bot.db import SessionLocal
+from altegio_bot.meta_templates import META_TEMPLATE_MAP
 from altegio_bot.models.models import CampaignRecipient, CampaignRun
 from altegio_bot.settings import settings
 
@@ -2808,6 +2809,12 @@ _NC_META_TEMPLATE = "kitilash_ka_newsletter_new_clients_monthly_v2"
 _NC_TEMPLATE_LANGUAGE = "de"
 _NC_TEMPLATE_PARAMS = ["{{1}} — имя клиента", "{{2}} — ссылка для записи", "{{3}} — текст карты лояльности"]
 
+# Маппинг company_id → Meta template name для newsletter_new_clients_monthly
+_NC_JOB_TYPE = "newsletter_new_clients_monthly"
+_NC_COMPANY_TEMPLATES: dict[int, str] = {
+    cid: META_TEMPLATE_MAP[(cid, _NC_JOB_TYPE)] for cid in COMPANIES if (cid, _NC_JOB_TYPE) in META_TEMPLATE_MAP
+}
+
 # Маппинг location_id → человекочитаемое название филиала
 LOCATIONS: dict[int, str] = {758285: "Karlsruhe", 1271200: "Rastatt"}
 
@@ -2829,6 +2836,9 @@ async def ops_new_clients_campaign_page(request: Request) -> str:
 
     # JavaScript-маппинг company_id → location_id (по умолчанию совпадает)
     company_location_js = json.dumps({str(cid): cid for cid in COMPANIES})
+
+    # JavaScript-маппинг company_id → Meta template name для newsletter
+    company_templates_js = json.dumps({str(cid): tname for cid, tname in _NC_COMPANY_TEMPLATES.items()})
 
     # Location options для select (human-readable)
     location_options_html = "".join(
@@ -2937,7 +2947,7 @@ async def ops_new_clients_campaign_page(request: Request) -> str:
   <div class="card-body">
     <dl class="row mb-2">
       <dt class="col-sm-3">Meta-шаблон</dt>
-      <dd class="col-sm-9"><code>{_esc(_NC_META_TEMPLATE)}</code></dd>
+      <dd class="col-sm-9"><code id="template-name-display">{_esc(_NC_META_TEMPLATE)}</code></dd>
       <dt class="col-sm-3">Язык</dt>
       <dd class="col-sm-9"><strong>{_esc(_NC_TEMPLATE_LANGUAGE)}</strong> (немецкий)</dd>
       <dt class="col-sm-3">Job type</dt>
@@ -3033,6 +3043,7 @@ async def ops_new_clients_campaign_page(request: Request) -> str:
 // Состояние страницы
 // ============================================================
 const COMPANY_LOCATION = {company_location_js};
+const COMPANY_TEMPLATES = {company_templates_js};
 let previewRunId = null;
 let runRunId = null;
 let progressInterval = null;
@@ -3051,11 +3062,14 @@ document.addEventListener("DOMContentLoaded", function () {{
     locationSelect.value = String(lid);
   }}
   companySelect.addEventListener("change", function () {{
+    const cid = companySelect.value;
     syncLocation();
     // Сбросить список карт при смене компании
     const ct = document.getElementById("f-card-type");
     ct.innerHTML = '<option value="">— загрузите типы карт →</option>';
     document.getElementById("card-load-status").textContent = "";
+    // Перезагрузить шаблон для новой компании
+    loadTemplateText(cid);
   }});
   syncLocation();
 
@@ -3072,20 +3086,39 @@ document.addEventListener("DOMContentLoaded", function () {{
   document.getElementById("btn-preview").addEventListener("click", createPreview);
   document.getElementById("btn-run").addEventListener("click", runCampaign);
 
-  // Загрузить текст шаблона из БД
-  loadTemplateText();
+  // Загрузить текст шаблона для company по умолчанию
+  loadTemplateText(companySelect.value);
 }});
 
 // ============================================================
 // Загрузка текста Meta-шаблона из БД
 // ============================================================
-async function loadTemplateText() {{
+async function loadTemplateText(companyId) {{
   const block = document.getElementById("template-text-block");
-  const templateName = "{_esc(_NC_META_TEMPLATE)}";
+  const nameDisplay = document.getElementById("template-name-display");
+  const templateName = COMPANY_TEMPLATES[String(companyId)] || "";
+
+  // Обновить отображение имени шаблона
+  if (nameDisplay) {{
+    nameDisplay.textContent = templateName || "—";
+  }}
+
+  if (!templateName) {{
+    block.innerHTML =
+      '<div class="alert alert-warning mb-0">' +
+      '<strong>⚠️ Не удалось загрузить текст шаблона из Meta</strong><br>' +
+      '<small>Шаблон для компании ' + escHtml(String(companyId)) +
+      ' не найден в маппинге.</small></div>';
+    return;
+  }}
+
+  block.innerHTML = '<div class="text-muted small">⏳ Загрузка текста шаблона из БД…</div>';
+
   try {{
-    const resp = await fetch(
-      "/ops/campaigns/new-clients/template-text?template_name=" + encodeURIComponent(templateName)
-    );
+    const url = "/ops/campaigns/new-clients/template-text" +
+      "?template_name=" + encodeURIComponent(templateName) +
+      "&company_id=" + encodeURIComponent(companyId);
+    const resp = await fetch(url);
     if (!resp.ok) {{
       block.innerHTML =
         '<div class="alert alert-warning mb-0">' +

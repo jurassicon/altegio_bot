@@ -21,6 +21,7 @@ Endpoint'ы:
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any, Literal
 
@@ -200,6 +201,33 @@ async def get_card_types_for_location(
 
 
 # ==========================================================================
+# Нормализация имени Meta-шаблона
+# ==========================================================================
+
+_TEMPLATE_PREFIXES = ("kitilash_ka_", "kitilash_ra_")
+
+
+def normalize_meta_template_name(template_name: str) -> str:
+    """Нормализовать имя Meta-шаблона в code для точного поиска в БД.
+
+    Пример:
+        "kitilash_ka_newsletter_new_clients_monthly_v2"
+        → "newsletter_new_clients_monthly"
+
+    Алгоритм:
+        1. Убрать известный префикс компании (kitilash_ka_, kitilash_ra_).
+        2. Убрать версионный суффикс (_v1, _v2, _v3, ...).
+    """
+    code = template_name
+    for prefix in _TEMPLATE_PREFIXES:
+        if code.startswith(prefix):
+            code = code[len(prefix) :]
+            break
+    code = re.sub(r"_v\d+$", "", code)
+    return code
+
+
+# ==========================================================================
 # Текст Meta-шаблона из БД
 # ==========================================================================
 
@@ -207,29 +235,47 @@ async def get_card_types_for_location(
 @router.get("/new-clients/template-text")
 async def get_template_text(
     template_name: str = Query(..., description="Meta template name"),
+    company_id: int | None = Query(default=None, description="Campaign company ID"),
 ) -> dict[str, Any]:
     """Загрузить текст шаблона из локальной БД (message_templates).
 
     Шаблоны синхронизируются из Meta через sync_meta_templates.py.
-    Возвращает body, language и метаданные; если шаблон не найден — 404.
-    """
-    async with SessionLocal() as session:
-        stmt = select(MessageTemplate).where(MessageTemplate.is_active.is_(True)).order_by(MessageTemplate.id.desc())
-        rows = (await session.execute(stmt)).scalars().all()
 
-    # Ищем по совпадению code внутри template_name или наоборот
-    # (sync_meta_templates.py нормализует name → code без префикса/версии,
-    #  например "newsletter_new_clients_monthly" из "kitilash_ka_newsletter_new_clients_monthly_v2")
-    match = None
-    for row in rows:
-        if row.code and (row.code in template_name or template_name.endswith(row.code)):
-            match = row
-            break
+    Алгоритм поиска:
+        1. Нормализуем template_name → code через normalize_meta_template_name().
+        2. Ищем точное совпадение: WHERE code = :code AND is_active = true.
+        3. Если передан company_id — предпочитаем запись для этой компании.
+        4. Если для company_id не найдено — берём любую активную запись с этим кодом.
+        5. Результат детерминирован: ORDER BY id ASC LIMIT 1.
+
+    Если шаблон не найден — возвращает 404.
+    """
+    code = normalize_meta_template_name(template_name)
+
+    async with SessionLocal() as session:
+        base_stmt = (
+            select(MessageTemplate)
+            .where(MessageTemplate.code == code)
+            .where(MessageTemplate.is_active.is_(True))
+            .order_by(MessageTemplate.id.asc())
+            .limit(1)
+        )
+
+        match = None
+
+        # Сначала ищем шаблон для конкретной компании
+        if company_id is not None:
+            company_stmt = base_stmt.where(MessageTemplate.company_id == company_id)
+            match = (await session.execute(company_stmt)).scalar_one_or_none()
+
+        # Fallback: берём первый активный шаблон с таким кодом (детерминированно по id ASC)
+        if match is None:
+            match = (await session.execute(base_stmt)).scalar_one_or_none()
 
     if match is None:
         raise HTTPException(
             status_code=404,
-            detail=f"Шаблон '{template_name}' не найден в локальной БД",
+            detail=f"Шаблон с кодом '{code}' (из '{template_name}') не найден в локальной БД",
         )
 
     return {
