@@ -9,6 +9,7 @@ Endpoint'ы:
   GET  /ops/campaigns/runs
   GET  /ops/campaigns/runs/{run_id}
   GET  /ops/campaigns/runs/{run_id}/progress
+  POST /ops/campaigns/runs/{run_id}/resume
   GET  /ops/campaigns/runs/{run_id}/recipients
   GET  /ops/campaigns/runs/{run_id}/report
   GET  /ops/campaigns/dashboard/monthly
@@ -33,6 +34,7 @@ from altegio_bot.campaigns.runner import (
     CAMPAIGN_EXECUTION_JOB_TYPE,
     RunParams,
     enqueue_send_real,
+    resume_send_real,
     run_preview,
 )
 from altegio_bot.db import SessionLocal
@@ -442,6 +444,52 @@ async def run_followup_now(run_id: int) -> dict[str, Any]:
         )
 
     return {"run_id": run_id, "stats": stats}
+
+
+# ==========================================================================
+# Resume
+# ==========================================================================
+
+
+@router.post("/runs/{run_id}/resume")
+async def resume_run(run_id: int) -> dict[str, Any]:
+    """Продолжить failed send-real run по сохранённому snapshot получателей.
+
+    Безопасен: не пересчитывает сегмент, не трогает cleanup_failed
+    и card_issue_failed. Resume синхронный — приемлемо, т.к. кампании
+    по 20-30 клиентов, общее время < 15 с.
+
+    Разрешённые для обработки статусы:
+      candidate → полный flow (cleanup, issue card, queue)
+      card_issued → только допоставить MessageJob
+      skipped + queue_failed → только допоставить MessageJob
+
+    Возвращает итоговый статус run и сводку по resume.
+    """
+    async with SessionLocal() as session:
+        run = await session.get(CampaignRun, run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="Run not found")
+
+    try:
+        result = await resume_send_real(run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.exception("resume failed run_id=%d: %s", run_id, exc)
+        raise HTTPException(status_code=500, detail="Internal resume error")
+
+    # Получить финальный статус run после обновления
+    async with SessionLocal() as session:
+        run = await session.get(CampaignRun, run_id)
+
+    return {
+        "run_id": run_id,
+        "accepted": True,
+        "message": "Resume completed",
+        "status": run.status if run else "unknown",
+        "summary": result,
+    }
 
 
 # ==========================================================================

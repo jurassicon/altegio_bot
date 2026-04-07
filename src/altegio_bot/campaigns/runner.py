@@ -586,3 +586,395 @@ async def _resolve_card_type(
 
     type_id = types[0].get("id") or types[0].get("loyalty_card_type_id")
     return str(type_id)
+
+
+# ==========================================================================
+# Resume: продолжение failed send-real run
+# ==========================================================================
+
+
+async def _enqueue_newsletter_job_for_recipient(
+    *,
+    recipient_id: int,
+    company_id: int,
+    client_id: int,
+    run_id: int,
+    loyalty_card_number: str,
+    loyalty_card_id: str,
+    loyalty_card_type_id: str,
+) -> None:
+    """Создать MessageJob рассылки и перевести recipient → queued.
+
+    Не выполняет cleanup и не выпускает карту. Используется при resume
+    для получателей, у которых карта уже выпущена (card_issued, queue_failed).
+    """
+    loyalty_card_text = make_card_text(loyalty_card_number)
+    run_at = utcnow()
+
+    async with SessionLocal() as session:
+        async with session.begin():
+            recipient = await session.get(CampaignRecipient, recipient_id)
+            if recipient is None:
+                raise RuntimeError(f"recipient_id={recipient_id} not found")
+
+            recipient.loyalty_card_id = loyalty_card_id
+            recipient.loyalty_card_number = loyalty_card_number
+            recipient.loyalty_card_type_id = loyalty_card_type_id
+            # Сбрасываем excluded_reason — получатель теперь снова в пайплайне
+            recipient.excluded_reason = None
+
+            await add_job(
+                session,
+                company_id=company_id,
+                record_id=None,
+                client_id=client_id,
+                job_type=NEWSLETTER_JOB_TYPE,
+                run_at=run_at,
+                payload={
+                    "kind": NEWSLETTER_JOB_TYPE,
+                    "loyalty_card_text": loyalty_card_text,
+                    "campaign_run_id": run_id,
+                    "campaign_recipient_id": recipient_id,
+                },
+            )
+
+            dedupe_key = make_dedupe_key(
+                job_type=NEWSLETTER_JOB_TYPE,
+                company_id=company_id,
+                record_id=None,
+                run_at=run_at,
+            )
+            job = await session.scalar(select(MessageJob).where(MessageJob.dedupe_key == dedupe_key))
+            if job:
+                recipient.message_job_id = job.id
+
+            recipient.status = "queued"
+
+    logger.info(
+        "resume queued recipient_id=%d client_id=%d run_id=%d",
+        recipient_id,
+        client_id,
+        run_id,
+    )
+
+
+async def _resume_candidate_recipient(
+    *,
+    loyalty: AltegioLoyaltyClient,
+    recipient: CampaignRecipient,
+    run_id: int,
+    company_id: int,
+    location_id: int,
+    card_type_id: str,
+    campaign_code: str,
+) -> bool:
+    """Resume flow для candidate recipient: cleanup → выпуск карты → очередь.
+
+    Использует уже существующего CampaignRecipient (создавать нового не нужно).
+    Возвращает True, если recipient успешно поставлен в очередь.
+    """
+    recipient_id = recipient.id
+    client_id = recipient.client_id
+    phone_e164 = recipient.phone_e164
+
+    # Cleanup — читаем в отдельной сессии, удаление карт через API
+    async with SessionLocal() as session:
+        cleanup = await cleanup_campaign_cards(
+            session,
+            loyalty,
+            location_id=location_id,
+            client_id=client_id,
+            campaign_code=campaign_code,
+        )
+
+    if not cleanup.ok:
+        async with SessionLocal() as session:
+            async with session.begin():
+                r = await session.get(CampaignRecipient, recipient_id)
+                if r:
+                    r.status = "cleanup_failed"
+                    r.excluded_reason = "cleanup_failed"
+                    r.cleanup_card_ids = cleanup.deleted_ids
+                    r.cleanup_failed_reason = cleanup.reason
+        logger.warning(
+            "resume cleanup_failed recipient_id=%d run_id=%d: %s",
+            recipient_id,
+            run_id,
+            cleanup.reason,
+        )
+        return False
+
+    card_number = make_card_number(phone_e164)
+    phone_num = int(phone_e164.lstrip("+"))
+
+    try:
+        card = await loyalty.issue_card(
+            location_id,
+            loyalty_card_number=card_number,
+            loyalty_card_type_id=card_type_id,
+            phone=phone_num,
+        )
+        issued_number = str(card.get("loyalty_card_number") or card_number)
+        issued_id = str(card.get("id") or card.get("loyalty_card_id") or "")
+    except Exception as exc:
+        async with SessionLocal() as session:
+            async with session.begin():
+                r = await session.get(CampaignRecipient, recipient_id)
+                if r:
+                    r.status = "skipped"
+                    r.excluded_reason = "card_issue_failed"
+                    r.cleanup_card_ids = cleanup.deleted_ids
+        logger.error(
+            "resume card_issue_failed recipient_id=%d run_id=%d: %s",
+            recipient_id,
+            run_id,
+            exc,
+        )
+        return False
+
+    try:
+        await _enqueue_newsletter_job_for_recipient(
+            recipient_id=recipient_id,
+            company_id=company_id,
+            client_id=client_id,
+            run_id=run_id,
+            loyalty_card_number=issued_number,
+            loyalty_card_id=issued_id,
+            loyalty_card_type_id=card_type_id,
+        )
+        # Сохранить cleanup_card_ids, если cleanup что-то удалил и поле ещё пустое
+        if cleanup.deleted_ids:
+            async with SessionLocal() as session:
+                async with session.begin():
+                    r = await session.get(CampaignRecipient, recipient_id)
+                    if r and not r.cleanup_card_ids:
+                        r.cleanup_card_ids = cleanup.deleted_ids
+        return True
+
+    except Exception as exc:
+        logger.error(
+            "resume queue_failed recipient_id=%d run_id=%d: %s",
+            recipient_id,
+            run_id,
+            exc,
+        )
+        async with SessionLocal() as session:
+            async with session.begin():
+                r = await session.get(CampaignRecipient, recipient_id)
+                if r:
+                    r.status = "skipped"
+                    r.excluded_reason = "queue_failed"
+                    r.loyalty_card_id = issued_id
+                    r.loyalty_card_number = issued_number
+                    r.loyalty_card_type_id = card_type_id
+                    r.cleanup_card_ids = cleanup.deleted_ids
+        return False
+
+
+async def resume_send_real(run_id: int) -> dict:
+    """Продолжить выполнение failed send-real run по сохранённому snapshot.
+
+    Не пересчитывает сегмент. Работает только с уже существующими
+    CampaignRecipient. Безопасен: не трогает cleanup_failed и card_issue_failed.
+
+    Разрешённые для resume статусы получателей:
+      - candidate: полный flow (cleanup → выпуск карты → очередь)
+      - card_issued: только допоставить MessageJob (карта уже выпущена)
+      - skipped + queue_failed с картой: только допоставить MessageJob
+
+    Не трогаются (manual action required):
+      - cleanup_failed
+      - skipped + card_issue_failed
+
+    Логика финального статуса run:
+      - все pending обработаны, ничего manual → completed
+      - все pending обработаны, но есть manual → failed + "partially completed"
+      - остались pending-получатели → failed + "still pending" (можно повторить)
+
+    Возвращает:
+      resumed_count — успешно поставлено в очередь за этот запуск
+      skipped_count — не тронуто (уже queued или исключено по другой причине)
+      remaining_manual_count — требует ручных действий
+    """
+    async with SessionLocal() as session:
+        run = await session.get(CampaignRun, run_id)
+        if run is None:
+            raise ValueError(f"CampaignRun {run_id} not found")
+        if run.mode != "send-real":
+            raise ValueError(f"Resume доступен только для send-real. mode={run.mode!r}")
+        if run.status != "failed":
+            raise ValueError(f"Resume доступен только для failed run. status={run.status!r}")
+        params = _params_from_run(run)
+
+    async with SessionLocal() as session:
+        stmt = select(CampaignRecipient).where(CampaignRecipient.campaign_run_id == run_id)
+        recipients = (await session.execute(stmt)).scalars().all()
+
+    loyalty = AltegioLoyaltyClient()
+    stats = {"resumed": 0, "skipped": 0}
+
+    try:
+        card_type_id = await _resolve_card_type(
+            loyalty,
+            params.location_id,
+            params.card_type_id,
+        )
+
+        for recipient in recipients:
+            st = recipient.status
+            reason = recipient.excluded_reason
+
+            if st == "queued":
+                # Уже в очереди — пропускаем
+                stats["skipped"] += 1
+                continue
+
+            if st == "cleanup_failed":
+                # Требует ручных действий — не трогаем
+                continue
+
+            if st == "skipped" and reason == "card_issue_failed":
+                # Выпуск карты провалился — требует ручных действий
+                continue
+
+            if st == "skipped" and reason != "queue_failed":
+                # Исключён по другой причине (opted_out, no_phone и т.д.)
+                stats["skipped"] += 1
+                continue
+
+            try:
+                if st == "candidate":
+                    ok = await _resume_candidate_recipient(
+                        loyalty=loyalty,
+                        recipient=recipient,
+                        run_id=run_id,
+                        company_id=params.company_id,
+                        location_id=params.location_id,
+                        card_type_id=card_type_id,
+                        campaign_code=params.campaign_code,
+                    )
+                    if ok:
+                        stats["resumed"] += 1
+
+                elif st == "card_issued":
+                    # Карта уже выпущена — только допоставить job
+                    await _enqueue_newsletter_job_for_recipient(
+                        recipient_id=recipient.id,
+                        company_id=params.company_id,
+                        client_id=recipient.client_id,
+                        run_id=run_id,
+                        loyalty_card_number=recipient.loyalty_card_number or "",
+                        loyalty_card_id=recipient.loyalty_card_id or "",
+                        loyalty_card_type_id=recipient.loyalty_card_type_id or card_type_id,
+                    )
+                    stats["resumed"] += 1
+
+                else:
+                    # skipped + queue_failed: карта выпущена, очередь не прошла
+                    await _enqueue_newsletter_job_for_recipient(
+                        recipient_id=recipient.id,
+                        company_id=params.company_id,
+                        client_id=recipient.client_id,
+                        run_id=run_id,
+                        loyalty_card_number=recipient.loyalty_card_number or "",
+                        loyalty_card_id=recipient.loyalty_card_id or "",
+                        loyalty_card_type_id=recipient.loyalty_card_type_id or card_type_id,
+                    )
+                    stats["resumed"] += 1
+
+            except Exception as exc:
+                logger.error(
+                    "resume step failed recipient_id=%d run_id=%d: %s",
+                    recipient.id,
+                    run_id,
+                    exc,
+                )
+                # Не прерываем весь resume из-за одного получателя
+
+    finally:
+        await loyalty.aclose()
+
+    # Подсчитать финальное состояние получателей после resume
+    async with SessionLocal() as session:
+        cleanup_failed_count: int = (
+            await session.scalar(
+                select(func.count())
+                .select_from(CampaignRecipient)
+                .where(CampaignRecipient.campaign_run_id == run_id)
+                .where(CampaignRecipient.status == "cleanup_failed")
+            )
+            or 0
+        )
+        card_issue_failed_count: int = (
+            await session.scalar(
+                select(func.count())
+                .select_from(CampaignRecipient)
+                .where(CampaignRecipient.campaign_run_id == run_id)
+                .where(CampaignRecipient.status == "skipped")
+                .where(CampaignRecipient.excluded_reason == "card_issue_failed")
+            )
+            or 0
+        )
+        remaining_manual_count = cleanup_failed_count + card_issue_failed_count
+
+        # Получатели, которые всё ещё можно возобновить (не обработались в этом запуске)
+        still_candidate_count: int = (
+            await session.scalar(
+                select(func.count())
+                .select_from(CampaignRecipient)
+                .where(CampaignRecipient.campaign_run_id == run_id)
+                .where(CampaignRecipient.status.in_(["candidate", "card_issued"]))
+            )
+            or 0
+        )
+        still_queue_failed_count: int = (
+            await session.scalar(
+                select(func.count())
+                .select_from(CampaignRecipient)
+                .where(CampaignRecipient.campaign_run_id == run_id)
+                .where(CampaignRecipient.status == "skipped")
+                .where(CampaignRecipient.excluded_reason == "queue_failed")
+            )
+            or 0
+        )
+        remaining_pending_count = still_candidate_count + still_queue_failed_count
+
+    # Обновить статус run на основе результатов
+    async with SessionLocal() as session:
+        async with session.begin():
+            run = await session.get(CampaignRun, run_id)
+            if run is None:
+                raise RuntimeError(f"CampaignRun {run_id} not found after resume")
+
+            meta = dict(run.meta or {})
+
+            if remaining_pending_count == 0 and remaining_manual_count == 0:
+                # Все получатели обработаны успешно
+                run.status = "completed"
+                meta.pop("last_error", None)
+                run.completed_at = utcnow()
+            elif remaining_pending_count == 0:
+                # Все resumable обработаны, но часть требует ручных действий
+                run.status = "failed"
+                meta["last_error"] = "Resume completed partially: some recipients still require manual action"
+                run.completed_at = utcnow()
+            else:
+                # Часть получателей не удалось обработать — можно повторить resume
+                run.status = "failed"
+                meta["last_error"] = f"Resume partially failed: {remaining_pending_count} recipients still pending"
+
+            run.meta = meta
+
+    logger.info(
+        "resume_send_real run_id=%d stats=%s manual=%d pending=%d",
+        run_id,
+        stats,
+        remaining_manual_count,
+        remaining_pending_count,
+    )
+
+    return {
+        "resumed_count": stats["resumed"],
+        "skipped_count": stats["skipped"],
+        "remaining_manual_count": remaining_manual_count,
+    }
