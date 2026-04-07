@@ -1,16 +1,3 @@
-"""Оркестратор кампании рассылки по новым клиентам.
-
-Поддерживает два режима:
-  * preview   — только сегментация и сохранение снимка в БД,
-                без отправки сообщений и выпуска карт.
-  * send-real — сегментация, cleanup старых карт, выпуск новой
-                карты, постановка в очередь MessageJob.
-
-Каждый preview и каждый send-real сохраняется как отдельный
-исторический CampaignRun. send-real может ссылаться на preview
-через source_preview_run_id.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -18,7 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.altegio_loyalty import AltegioLoyaltyClient
@@ -43,6 +30,9 @@ NEWSLETTER_JOB_TYPE = "newsletter_new_clients_monthly"
 FOLLOWUP_JOB_TYPE = "newsletter_new_clients_followup"
 CAMPAIGN_CODE = "new_clients_monthly"
 
+# Новый job type: не отправка сообщения, а фоновое выполнение всей кампании
+CAMPAIGN_EXECUTION_JOB_TYPE = "campaign_execute_new_clients_monthly"
+
 
 @dataclass
 class RunParams:
@@ -59,7 +49,6 @@ class RunParams:
     attribution_window_days: int = 30
     followup_enabled: bool = False
     followup_delay_days: int | None = None
-    # 'unread_only' | 'unread_or_not_booked'
     followup_policy: str | None = None
     followup_template_name: str | None = None
 
@@ -67,8 +56,10 @@ class RunParams:
 async def _create_run(
     session: AsyncSession,
     params: RunParams,
+    *,
+    status: str = "running",
 ) -> CampaignRun:
-    """Создать и сохранить CampaignRun со статусом 'running'."""
+    """Создать и сохранить CampaignRun с указанным статусом."""
     run = CampaignRun(
         campaign_code=params.campaign_code,
         mode=params.mode,
@@ -78,7 +69,7 @@ async def _create_run(
         card_type_id=params.card_type_id,
         period_start=params.period_start,
         period_end=params.period_end,
-        status="running",
+        status=status,
         attribution_window_days=params.attribution_window_days,
         followup_enabled=params.followup_enabled,
         followup_delay_days=params.followup_delay_days,
@@ -90,13 +81,86 @@ async def _create_run(
     return run
 
 
+async def _enqueue_campaign_execution_job(
+    session: AsyncSession,
+    *,
+    run_id: int,
+    company_id: int,
+) -> MessageJob:
+    """Поставить фоновый execution-job для кампании.
+
+    Здесь не используем add_job(), потому что dedupe_key для campaign
+    execution должен включать run_id, а стандартный make_dedupe_key()
+    его не учитывает.
+    """
+    run_at = utcnow()
+    job = MessageJob(
+        company_id=company_id,
+        record_id=None,
+        client_id=None,
+        job_type=CAMPAIGN_EXECUTION_JOB_TYPE,
+        run_at=run_at,
+        status="queued",
+        attempts=0,
+        max_attempts=1,
+        last_error=None,
+        dedupe_key=(f"{CAMPAIGN_EXECUTION_JOB_TYPE}:{company_id}:run:{run_id}"),
+        payload={
+            "kind": CAMPAIGN_EXECUTION_JOB_TYPE,
+            "campaign_run_id": run_id,
+        },
+        locked_at=None,
+    )
+    session.add(job)
+    await session.flush()
+    return job
+
+
+def _params_from_run(run: CampaignRun) -> RunParams:
+    """Собрать RunParams из уже созданного CampaignRun."""
+    company_ids = run.company_ids or []
+    if not company_ids:
+        raise RuntimeError(f"CampaignRun {run.id} has empty company_ids")
+
+    return RunParams(
+        company_id=int(company_ids[0]),
+        location_id=int(run.location_id),
+        period_start=run.period_start,
+        period_end=run.period_end,
+        mode="send-real",
+        campaign_code=run.campaign_code,
+        card_type_id=run.card_type_id,
+        source_preview_run_id=run.source_preview_run_id,
+        attribution_window_days=run.attribution_window_days,
+        followup_enabled=run.followup_enabled,
+        followup_delay_days=run.followup_delay_days,
+        followup_policy=run.followup_policy,
+        followup_template_name=run.followup_template_name,
+    )
+
+
+async def _mark_run_failed(run_id: int, error: str) -> None:
+    """Пометить CampaignRun как failed и сохранить last_error в meta."""
+    async with SessionLocal() as session:
+        async with session.begin():
+            run = await session.get(CampaignRun, run_id)
+            if run is None:
+                return
+
+            meta = dict(run.meta or {})
+            meta["last_error"] = error
+            run.meta = meta
+            run.status = "failed"
+            run.completed_at = utcnow()
+
+
 def _build_recipient(
     run_id: int,
     candidate: ClientCandidate,
 ) -> CampaignRecipient:
     """Создать CampaignRecipient из кандидата."""
     client = candidate.client
-    r = CampaignRecipient(
+    recipient = CampaignRecipient(
         campaign_run_id=run_id,
         company_id=client.company_id,
         client_id=client.id,
@@ -110,7 +174,7 @@ def _build_recipient(
         status="skipped" if candidate.excluded_reason else "candidate",
         excluded_reason=candidate.excluded_reason,
     )
-    return r
+    return recipient
 
 
 def _update_run_exclusion_counters(
@@ -119,11 +183,12 @@ def _update_run_exclusion_counters(
 ) -> None:
     """Обновить счётчики исключений в run по результатам сегментации."""
     run.total_clients_seen = len(candidates)
-    for c in candidates:
-        if not c.excluded_reason:
+    for candidate in candidates:
+        if not candidate.excluded_reason:
             run.candidates_count += 1
             continue
-        reason = c.excluded_reason
+
+        reason = candidate.excluded_reason
         if reason == "opted_out":
             run.excluded_opted_out += 1
         elif reason == "no_phone":
@@ -132,21 +197,16 @@ def _update_run_exclusion_counters(
             run.excluded_has_records_before += 1
         elif reason == "multiple_records_in_period":
             run.excluded_multiple_records += 1
-            run.excluded_more_than_one_record += 1  # legacy
+            run.excluded_more_than_one_record += 1
         elif reason == "no_confirmed_record_in_period":
             run.excluded_no_confirmed_record += 1
 
 
 async def run_preview(params: RunParams) -> CampaignRun:
-    """Запустить preview: сегментация без отправки.
-
-    Сохраняет CampaignRun(mode='preview') и CampaignRecipient
-    для каждого клиента. Карты не выпускаются, сообщения не
-    отправляются.
-    """
+    """Запустить preview: сегментация без отправки."""
     async with SessionLocal() as session:
         async with session.begin():
-            run = await _create_run(session, params)
+            run = await _create_run(session, params, status="running")
 
             candidates = await find_candidates(
                 session,
@@ -157,10 +217,8 @@ async def run_preview(params: RunParams) -> CampaignRun:
 
             _update_run_exclusion_counters(run, candidates)
 
-            for c in candidates:
-                recipient = _build_recipient(run.id, c)
-                # В preview нет loyalty-действий — status остаётся
-                # 'candidate' (eligible) или 'skipped' (excluded)
+            for candidate in candidates:
+                recipient = _build_recipient(run.id, candidate)
                 session.add(recipient)
 
             run.status = "completed"
@@ -178,27 +236,54 @@ async def run_preview(params: RunParams) -> CampaignRun:
     return run
 
 
-async def run_send_real(params: RunParams) -> CampaignRun:
-    """Запустить send-real: сегментация + выпуск карт + очередь.
+async def enqueue_send_real(params: RunParams) -> CampaignRun:
+    """Создать queued-run и поставить execution-job в message_jobs.
 
-    Для каждого eligible клиента:
-      1. Cleanup старых campaign-карт.
-         Если cleanup failed — пометить, пропустить клиента.
-      2. Выпустить новую loyalty-карту.
-         Если выпуск не удался — пометить, пропустить.
-      3. Создать MessageJob.
-      4. Обновить CampaignRecipient.status = 'queued'.
-
-    Каждый клиент обрабатывается в отдельной транзакции,
-    чтобы сбой одного не влиял на остальных.
+    HTTP endpoint использует именно эту функцию, чтобы быстро вернуть
+    accepted и не ждать весь send-real синхронно.
     """
-    # ------------------------------------------------------------------
-    # Шаг 1: создать run и найти кандидатов
-    # ------------------------------------------------------------------
     async with SessionLocal() as session:
         async with session.begin():
-            run = await _create_run(session, params)
-            run_id = run.id
+            run = await _create_run(session, params, status="queued")
+            await _enqueue_campaign_execution_job(
+                session,
+                run_id=run.id,
+                company_id=params.company_id,
+            )
+
+    logger.info(
+        "send-real queued run_id=%d company=%d period=[%s, %s)",
+        run.id,
+        params.company_id,
+        params.period_start.date(),
+        params.period_end.date(),
+    )
+    return run
+
+
+async def _execute_send_real_for_existing_run(
+    run_id: int,
+    params: RunParams,
+) -> None:
+    """Выполнить send-real для уже созданного CampaignRun."""
+    async with SessionLocal() as session:
+        async with session.begin():
+            run = await session.get(CampaignRun, run_id)
+            if run is None:
+                raise RuntimeError(f"CampaignRun {run_id} not found")
+
+            existing_recipients = await session.scalar(
+                select(func.count()).select_from(CampaignRecipient).where(CampaignRecipient.campaign_run_id == run_id)
+            )
+            if int(existing_recipients or 0) > 0:
+                raise RuntimeError(f"CampaignRun {run_id} already has recipients; re-running is unsafe")
+
+            run.status = "running"
+            run.completed_at = None
+
+            meta = dict(run.meta or {})
+            meta.pop("last_error", None)
+            run.meta = meta
 
             candidates = await find_candidates(
                 session,
@@ -208,16 +293,15 @@ async def run_send_real(params: RunParams) -> CampaignRun:
             )
             _update_run_exclusion_counters(run, candidates)
 
-    # ------------------------------------------------------------------
-    # Шаг 2: resolve card_type_id, если не задан
-    # ------------------------------------------------------------------
     loyalty = AltegioLoyaltyClient()
-    try:
-        card_type_id = await _resolve_card_type(loyalty, params.location_id, params.card_type_id)
 
-        # ------------------------------------------------------------------
-        # Шаг 3: обработать каждого кандидата
-        # ------------------------------------------------------------------
+    try:
+        card_type_id = await _resolve_card_type(
+            loyalty,
+            params.location_id,
+            params.card_type_id,
+        )
+
         stats = {
             "cleanup_failed": 0,
             "cards_deleted": 0,
@@ -226,13 +310,15 @@ async def run_send_real(params: RunParams) -> CampaignRun:
             "failed": 0,
         }
 
+        # candidates уже получены выше при подсчёте счётчиков — повторный
+        # find_candidates не нужен и мог бы дать расхождение с уже сохранёнными
+        # run.candidates_count / run.excluded_* если данные изменились.
         for candidate in candidates:
             if candidate.excluded_reason:
-                # Сохранить excluded получателя
                 async with SessionLocal() as session:
                     async with session.begin():
-                        r = _build_recipient(run_id, candidate)
-                        session.add(r)
+                        recipient = _build_recipient(run_id, candidate)
+                        session.add(recipient)
                 continue
 
             await _process_eligible(
@@ -246,33 +332,86 @@ async def run_send_real(params: RunParams) -> CampaignRun:
                 stats=stats,
             )
 
+        async with SessionLocal() as session:
+            async with session.begin():
+                run = await session.get(CampaignRun, run_id)
+                if run is None:
+                    raise RuntimeError(f"CampaignRun {run_id} not found")
+
+                run.cleanup_failed_count = stats["cleanup_failed"]
+                run.cards_deleted_count = stats["cards_deleted"]
+                run.cards_issued_count = stats["cards_issued"]
+                run.queued_count = stats["queued"]
+                run.failed_count = stats["failed"]
+                run.sent_count = stats["queued"]
+                run.status = "completed"
+                run.completed_at = utcnow()
+
+                meta = dict(run.meta or {})
+                meta.pop("last_error", None)
+                run.meta = meta
+
+        logger.info(
+            "send-real completed run_id=%d company=%d stats=%s",
+            run_id,
+            params.company_id,
+            stats,
+        )
+
+    except Exception as exc:
+        logger.exception(
+            "send-real failed run_id=%d company=%d: %s",
+            run_id,
+            params.company_id,
+            exc,
+        )
+        await _mark_run_failed(run_id, str(exc))
+        raise
+
     finally:
         await loyalty.aclose()
 
-    # ------------------------------------------------------------------
-    # Шаг 4: завершить run, обновить счётчики
-    # ------------------------------------------------------------------
+
+async def execute_queued_send_real(run_id: int) -> None:
+    """Выполнить queued send-real CampaignRun."""
+    async with SessionLocal() as session:
+        run = await session.get(CampaignRun, run_id)
+        if run is None:
+            raise RuntimeError(f"CampaignRun {run_id} not found")
+
+        if run.mode != "send-real":
+            raise RuntimeError(f"CampaignRun {run_id} mode={run.mode} is not send-real")
+
+        if run.status == "completed":
+            logger.info(
+                "skip queued execution run_id=%d (already completed)",
+                run_id,
+            )
+            return
+
+        params = _params_from_run(run)
+
+    await _execute_send_real_for_existing_run(run_id, params)
+
+
+async def run_send_real(params: RunParams) -> CampaignRun:
+    """Синхронный запуск send-real.
+
+    Оставлен для ручных/тестовых сценариев. API лучше использовать
+    через enqueue_send_real(), чтобы не держать HTTP-запрос.
+    """
     async with SessionLocal() as session:
         async with session.begin():
-            run = await session.get(CampaignRun, run_id)
-            if run is None:
-                raise RuntimeError(f"CampaignRun {run_id} not found")
-            run.cleanup_failed_count = stats["cleanup_failed"]
-            run.cards_deleted_count = stats["cards_deleted"]
-            run.cards_issued_count = stats["cards_issued"]
-            run.queued_count = stats["queued"]
-            run.failed_count = stats["failed"]
-            run.sent_count = stats["queued"]  # legacy alias
-            run.status = "completed"
-            run.completed_at = utcnow()
+            run = await _create_run(session, params, status="running")
+            run_id = run.id
 
-    logger.info(
-        "send-real run_id=%d company=%d stats=%s",
-        run_id,
-        params.company_id,
-        stats,
-    )
-    return run
+    await _execute_send_real_for_existing_run(run_id, params)
+
+    async with SessionLocal() as session:
+        run = await session.get(CampaignRun, run_id)
+        if run is None:
+            raise RuntimeError(f"CampaignRun {run_id} not found")
+        return run
 
 
 async def _process_eligible(
@@ -310,12 +449,15 @@ async def _process_eligible(
         stats["cards_deleted"] += len(cleanup.deleted_ids)
         async with SessionLocal() as session:
             async with session.begin():
-                r = await session.get(CampaignRecipient, recipient_id)
-                if r:
-                    r.status = "cleanup_failed"
-                    r.excluded_reason = "cleanup_failed"
-                    r.cleanup_card_ids = cleanup.deleted_ids
-                    r.cleanup_failed_reason = cleanup.reason
+                recipient = await session.get(
+                    CampaignRecipient,
+                    recipient_id,
+                )
+                if recipient:
+                    recipient.status = "cleanup_failed"
+                    recipient.excluded_reason = "cleanup_failed"
+                    recipient.cleanup_card_ids = cleanup.deleted_ids
+                    recipient.cleanup_failed_reason = cleanup.reason
         return
 
     stats["cards_deleted"] += len(cleanup.deleted_ids)
@@ -337,12 +479,19 @@ async def _process_eligible(
         stats["failed"] += 1
         async with SessionLocal() as session:
             async with session.begin():
-                r = await session.get(CampaignRecipient, recipient_id)
-                if r:
-                    r.status = "skipped"
-                    r.excluded_reason = "card_issue_failed"
-                    r.cleanup_card_ids = cleanup.deleted_ids
-        logger.error("card_issue_failed client_id=%d: %s", client_id, exc)
+                recipient = await session.get(
+                    CampaignRecipient,
+                    recipient_id,
+                )
+                if recipient:
+                    recipient.status = "skipped"
+                    recipient.excluded_reason = "card_issue_failed"
+                    recipient.cleanup_card_ids = cleanup.deleted_ids
+        logger.error(
+            "card_issue_failed client_id=%d: %s",
+            client_id,
+            exc,
+        )
         return
 
     stats["cards_issued"] += 1
@@ -352,15 +501,18 @@ async def _process_eligible(
     try:
         async with SessionLocal() as session:
             async with session.begin():
-                r = await session.get(CampaignRecipient, recipient_id)
-                if r is None:
+                recipient = await session.get(
+                    CampaignRecipient,
+                    recipient_id,
+                )
+                if recipient is None:
                     raise RuntimeError(f"recipient_id={recipient_id} not found")
 
-                r.loyalty_card_id = issued_id
-                r.loyalty_card_number = issued_number
-                r.loyalty_card_type_id = card_type_id
-                r.cleanup_card_ids = cleanup.deleted_ids
-                r.status = "card_issued"
+                recipient.loyalty_card_id = issued_id
+                recipient.loyalty_card_number = issued_number
+                recipient.loyalty_card_type_id = card_type_id
+                recipient.cleanup_card_ids = cleanup.deleted_ids
+                recipient.status = "card_issued"
 
                 await add_job(
                     session,
@@ -385,27 +537,38 @@ async def _process_eligible(
                 )
                 job = await session.scalar(select(MessageJob).where(MessageJob.dedupe_key == dedupe_key))
                 if job:
-                    r.message_job_id = job.id
+                    recipient.message_job_id = job.id
 
-                r.status = "queued"
+                recipient.status = "queued"
 
         stats["queued"] += 1
-        logger.info("queued client_id=%d card=%s", client_id, issued_number)
+        logger.info(
+            "queued client_id=%d card=%s",
+            client_id,
+            issued_number,
+        )
 
     except Exception as exc:
         stats["failed"] += 1
-        logger.error("queue_failed client_id=%d: %s", client_id, exc)
+        logger.error(
+            "queue_failed client_id=%d: %s",
+            client_id,
+            exc,
+        )
 
         async with SessionLocal() as session:
             async with session.begin():
-                r = await session.get(CampaignRecipient, recipient_id)
-                if r:
-                    r.status = "skipped"
-                    r.excluded_reason = "queue_failed"
-                    r.loyalty_card_id = issued_id
-                    r.loyalty_card_number = issued_number
-                    r.loyalty_card_type_id = card_type_id
-                    r.cleanup_card_ids = cleanup.deleted_ids
+                recipient = await session.get(
+                    CampaignRecipient,
+                    recipient_id,
+                )
+                if recipient:
+                    recipient.status = "skipped"
+                    recipient.excluded_reason = "queue_failed"
+                    recipient.loyalty_card_id = issued_id
+                    recipient.loyalty_card_number = issued_number
+                    recipient.loyalty_card_type_id = card_type_id
+                    recipient.cleanup_card_ids = cleanup.deleted_ids
 
 
 async def _resolve_card_type(
@@ -416,8 +579,10 @@ async def _resolve_card_type(
     """Вернуть card_type_id, запросив из API если не задан."""
     if card_type_id:
         return card_type_id
+
     types = await loyalty.get_card_types(location_id)
     if not types:
         raise RuntimeError(f"No loyalty card types for location_id={location_id}")
-    tid = types[0].get("id") or types[0].get("loyalty_card_type_id")
-    return str(tid)
+
+    type_id = types[0].get("id") or types[0].get("loyalty_card_type_id")
+    return str(type_id)

@@ -12,6 +12,7 @@ from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.altegio_records import count_attended_client_visits
+from altegio_bot.campaigns.runner import CAMPAIGN_EXECUTION_JOB_TYPE
 from altegio_bot.db import SessionLocal
 from altegio_bot.message_planner import MAX_VISITS_FOR_REVIEW
 from altegio_bot.meta_templates import (
@@ -186,13 +187,14 @@ async def _lock_next_jobs(
     stmt = (
         select(MessageJob)
         .where(MessageJob.status == "queued")
+        .where(MessageJob.job_type != CAMPAIGN_EXECUTION_JOB_TYPE)
         .where(MessageJob.run_at <= now)
         .order_by(MessageJob.run_at.asc())
         .limit(batch_size)
         .with_for_update(skip_locked=True)
     )
-    res = await session.execute(stmt)
-    jobs = list(res.scalars().all())
+    result = await session.execute(stmt)
+    jobs = list(result.scalars().all())
 
     for job in jobs:
         job.status = "processing"
@@ -223,6 +225,7 @@ async def _requeue_stale_processing_jobs(session: AsyncSession) -> int:
     stmt = (
         update(MessageJob)
         .where(MessageJob.status == "processing")
+        .where(MessageJob.job_type != CAMPAIGN_EXECUTION_JOB_TYPE)
         .where(MessageJob.locked_at.is_not(None))
         .where(MessageJob.locked_at < cutoff)
         .values(
@@ -232,8 +235,8 @@ async def _requeue_stale_processing_jobs(session: AsyncSession) -> int:
             last_error="Recovered: stale processing job",
         )
     )
-    res = await session.execute(stmt)
-    return int(getattr(res, "rowcount", 0) or 0)
+    result = await session.execute(stmt)
+    return int(getattr(result, "rowcount", 0) or 0)
 
 
 async def _apply_rate_limit(
@@ -914,6 +917,7 @@ async def run_once(
         stmt = (
             select(MessageJob.id)
             .where(MessageJob.status == "queued")
+            .where(MessageJob.job_type != CAMPAIGN_EXECUTION_JOB_TYPE)
             .where(MessageJob.run_at <= func.now())
             .order_by(MessageJob.run_at.asc(), MessageJob.id.asc())
             .limit(limit)
@@ -921,8 +925,8 @@ async def run_once(
         if company_id is not None:
             stmt = stmt.where(MessageJob.company_id == company_id)
 
-        res = await session.execute(stmt)
-        ids = list(res.scalars().all())
+        result = await session.execute(stmt)
+        ids = list(result.scalars().all())
 
         for job_id in ids:
             await process_job_in_session(session, int(job_id), provider=provider)

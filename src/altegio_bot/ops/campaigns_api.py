@@ -8,6 +8,7 @@ Endpoint'ы:
   POST /ops/campaigns/new-clients/run
   GET  /ops/campaigns/runs
   GET  /ops/campaigns/runs/{run_id}
+  GET  /ops/campaigns/runs/{run_id}/progress
   GET  /ops/campaigns/runs/{run_id}/recipients
   GET  /ops/campaigns/runs/{run_id}/report
   GET  /ops/campaigns/dashboard/monthly
@@ -21,15 +22,21 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 
 from altegio_bot.campaigns.followup import execute_followup, followup_run_at, plan_followup
 from altegio_bot.campaigns.reports import monthly_dashboard, run_report
-from altegio_bot.campaigns.runner import CAMPAIGN_CODE, RunParams, run_preview, run_send_real
+from altegio_bot.campaigns.runner import (
+    CAMPAIGN_CODE,
+    CAMPAIGN_EXECUTION_JOB_TYPE,
+    RunParams,
+    enqueue_send_real,
+    run_preview,
+)
 from altegio_bot.db import SessionLocal
-from altegio_bot.models.models import CampaignRecipient, CampaignRun
+from altegio_bot.models.models import CampaignRecipient, CampaignRun, MessageJob
 from altegio_bot.ops.auth import require_ops_auth
 
 logger = logging.getLogger(__name__)
@@ -120,12 +127,15 @@ async def create_preview(body: PreviewRequest) -> dict[str, Any]:
 # ==========================================================================
 
 
-@router.post("/new-clients/run")
+@router.post(
+    "/new-clients/run",
+    status_code=status.HTTP_202_ACCEPTED,
+)
 async def create_run(body: RunRequest) -> dict[str, Any]:
-    """Запустить send-real: выпуск карт + рассылка.
+    """Поставить send-real кампанию в очередь.
 
-    Выполняется синхронно. Для больших объёмов рекомендуется
-    вынести в фоновую задачу (TODO).
+    Endpoint быстро создаёт CampaignRun со статусом queued,
+    ставит execution-job в message_jobs и сразу возвращает accepted.
     """
     _validate_period(body.period_start, body.period_end)
 
@@ -145,12 +155,18 @@ async def create_run(body: RunRequest) -> dict[str, Any]:
     )
 
     try:
-        run = await run_send_real(params)
+        run = await enqueue_send_real(params)
     except Exception as exc:
-        logger.exception("send-real failed: %s", exc)
-        raise HTTPException(status_code=500, detail=str(exc))
+        logger.exception("send-real enqueue failed: %s", exc)
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to queue campaign run",
+        )
 
-    return _run_summary(run)
+    result = _run_summary(run)
+    result["accepted"] = True
+    result["message"] = "Campaign run accepted and queued"
+    return result
 
 
 # ==========================================================================
@@ -206,12 +222,50 @@ async def list_runs(
 
 @router.get("/runs/{run_id}")
 async def get_run(run_id: int) -> dict[str, Any]:
-    """Детальная информация о конкретном run."""
+    """Детальная информация о конкретном run.
+
+    Включает execution_job (фоновый MessageJob, ведущий кампанию),
+    progress (live-счётчики из CampaignRecipient) и last_error.
+    """
     async with SessionLocal() as session:
         run = await session.get(CampaignRun, run_id)
         if run is None:
             raise HTTPException(status_code=404, detail="Run not found")
-    return _run_detail(run)
+        execution_job = await _fetch_execution_job(session, run_id)
+        progress = await _fetch_progress(session, run_id, run.total_clients_seen or 0)
+
+    result = _run_detail(run)
+    result["execution_job"] = execution_job
+    result["progress"] = progress
+    return result
+
+
+# ==========================================================================
+# Progress (polling endpoint)
+# ==========================================================================
+
+
+@router.get("/runs/{run_id}/progress")
+async def get_run_progress(run_id: int) -> dict[str, Any]:
+    """Live-прогресс выполнения run.
+
+    Лёгкий polling endpoint для оператора: возвращает execution_job,
+    live-счётчики получателей и last_error без полной детализации run.
+    """
+    async with SessionLocal() as session:
+        run = await session.get(CampaignRun, run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="Run not found")
+        execution_job = await _fetch_execution_job(session, run_id)
+        progress = await _fetch_progress(session, run_id, run.total_clients_seen or 0)
+
+    return {
+        "run_id": run_id,
+        "status": run.status,
+        "execution_job": execution_job,
+        "progress": progress,
+        "last_error": _last_error(run),
+    }
 
 
 # ==========================================================================
@@ -391,8 +445,77 @@ async def run_followup_now(run_id: int) -> dict[str, Any]:
 
 
 # ==========================================================================
+# Вспомогательные async-функции (требуют session)
+# ==========================================================================
+
+
+async def _fetch_execution_job(session: Any, run_id: int) -> dict[str, Any] | None:
+    """Найти последний execution MessageJob для данного run_id."""
+    stmt = (
+        select(MessageJob)
+        .where(MessageJob.job_type == CAMPAIGN_EXECUTION_JOB_TYPE)
+        .where(MessageJob.payload.contains({"campaign_run_id": run_id}))
+        .order_by(MessageJob.id.desc())
+        .limit(1)
+    )
+    job = (await session.execute(stmt)).scalar_one_or_none()
+    if job is None:
+        return None
+    return {
+        "id": job.id,
+        "status": job.status,
+        "attempts": job.attempts,
+        "max_attempts": job.max_attempts,
+        "run_at": _iso(job.run_at),
+        "locked_at": _iso(job.locked_at),
+        "last_error": job.last_error,
+        "created_at": _iso(job.created_at),
+        "updated_at": _iso(job.updated_at),
+    }
+
+
+async def _fetch_progress(session: Any, run_id: int, total_clients_seen: int) -> dict[str, Any]:
+    """Live-счётчики получателей по статусам из CampaignRecipient."""
+    stmt = (
+        select(CampaignRecipient.status, func.count(CampaignRecipient.id).label("cnt"))
+        .where(CampaignRecipient.campaign_run_id == run_id)
+        .group_by(CampaignRecipient.status)
+    )
+    rows = (await session.execute(stmt)).all()
+    counts: dict[str, int] = {s: int(c) for s, c in rows}
+
+    skipped = counts.get("skipped", 0)
+    cleanup_failed = counts.get("cleanup_failed", 0)
+    queued = counts.get("queued", 0)
+    candidate = counts.get("candidate", 0)
+    card_issued = counts.get("card_issued", 0)
+
+    recipients_total = sum(counts.values())
+    recipients_done = skipped + cleanup_failed + queued
+    recipients_in_progress = candidate + card_issued
+    progress_pct = round(recipients_done / total_clients_seen, 4) if total_clients_seen > 0 else 0.0
+
+    return {
+        "recipients_total": recipients_total,
+        "recipients_skipped": skipped,
+        "recipients_cleanup_failed": cleanup_failed,
+        "recipients_queued": queued,
+        "recipients_candidate": candidate,
+        "recipients_card_issued": card_issued,
+        "recipients_done": recipients_done,
+        "recipients_in_progress": recipients_in_progress,
+        "progress_pct": progress_pct,
+    }
+
+
+# ==========================================================================
 # Вспомогательные функции
 # ==========================================================================
+
+
+def _last_error(run: CampaignRun) -> str | None:
+    """Последняя ошибка из run.meta['last_error']."""
+    return (run.meta or {}).get("last_error")
 
 
 def _run_summary(run: CampaignRun) -> dict[str, Any]:
@@ -411,6 +534,7 @@ def _run_summary(run: CampaignRun) -> dict[str, Any]:
         "queued_count": run.queued_count,
         "cards_issued_count": run.cards_issued_count,
         "followup_enabled": run.followup_enabled,
+        "last_error": _last_error(run),
         "created_at": _iso(run.created_at),
         "completed_at": _iso(run.completed_at),
     }
