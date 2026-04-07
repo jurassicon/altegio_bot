@@ -611,6 +611,8 @@ def _followup_auto(run: CampaignRun) -> dict[str, Any] | None:
         "followup_auto_last_error",
         "followup_auto_planned_count",
         "followup_auto_queued_count",
+        "followup_auto_recovered",
+        "followup_auto_recovered_at",
     )
 
     if not any(key in meta for key in keys):
@@ -623,6 +625,8 @@ def _followup_auto(run: CampaignRun) -> dict[str, Any] | None:
         "followup_auto_last_error": meta.get("followup_auto_last_error"),
         "followup_auto_planned_count": meta.get("followup_auto_planned_count"),
         "followup_auto_queued_count": meta.get("followup_auto_queued_count"),
+        "followup_auto_recovered": meta.get("followup_auto_recovered"),
+        "followup_auto_recovered_at": meta.get("followup_auto_recovered_at"),
     }
 
 

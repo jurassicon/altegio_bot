@@ -1,12 +1,20 @@
-"""Тесты followup_worker: авто-планирование и авто-запуск follow-up.
+"""Тесты followup_worker: авто-планирование, авто-запуск и stale recovery.
 
-Шесть сценариев:
-  1. Due completed run с followup_enabled → auto plan + execute.
-  2. Run с followup_enabled=False → игнорируется.
-  3. Run ещё не due → игнорируется.
-  4. Run с meta['followup_auto_status']='completed' → не трогается повторно.
-  5. Ошибка в plan_followup → записывается в meta['followup_auto_last_error'].
-  6. GET /ops/campaigns/runs/{run_id} включает followup_auto блок.
+Десять сценариев:
+
+  Базовые:
+    1. Due completed run с followup_enabled → auto plan + execute.
+    2. Run с followup_enabled=False → игнорируется.
+    3. Run ещё не due → игнорируется.
+    4. Run с meta['followup_auto_status']='completed' → не трогается повторно.
+    5. Ошибка в plan_followup → записывается в meta['followup_auto_last_error'].
+    6. GET /ops/campaigns/runs/{run_id} включает followup_auto блок.
+
+  Stale recovery:
+    7. Stale processing run (started_at > threshold) → reclaim-ится.
+    8. Fresh processing run (started_at < threshold) → не трогается.
+    9. Failed run → не reclaim-ится.
+   10. GET /ops/campaigns/runs/{run_id} включает recovery-поля при наличии.
 """
 
 from __future__ import annotations
@@ -24,7 +32,11 @@ import altegio_bot.workers.followup_worker as followup_worker_module
 from altegio_bot.main import app
 from altegio_bot.models.models import CampaignRecipient, CampaignRun
 from altegio_bot.ops.auth import require_ops_auth
-from altegio_bot.workers.followup_worker import _claim_due_runs, process_run
+from altegio_bot.workers.followup_worker import (
+    STALE_PROCESSING_MINUTES,
+    _claim_due_runs,
+    process_run,
+)
 
 COMPANY = 758285
 LOCATION = 1
@@ -89,6 +101,16 @@ def _make_recipient(session, run_id: int, **kw) -> CampaignRecipient:
     r = CampaignRecipient(**defaults)
     session.add(r)
     return r
+
+
+def _stale_ts() -> str:
+    """ISO timestamp старше STALE_PROCESSING_MINUTES."""
+    return (datetime.now(timezone.utc) - timedelta(minutes=STALE_PROCESSING_MINUTES + 5)).isoformat()
+
+
+def _fresh_ts() -> str:
+    """ISO timestamp свежее STALE_PROCESSING_MINUTES."""
+    return datetime.now(timezone.utc).isoformat()
 
 
 @pytest.fixture
@@ -307,3 +329,139 @@ async def test_get_run_includes_followup_auto_block(
     assert fa["followup_auto_queued_count"] == 8
     assert fa["followup_auto_completed_at"] == "2026-04-01T12:00:05+00:00"
     assert fa["followup_auto_last_error"] is None
+
+
+# ---------------------------------------------------------------------------
+# Тест 7: stale processing run → reclaim-ится
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_stale_processing_run_is_reclaimed(
+    worker_session,
+    session_maker,
+) -> None:
+    """Run с followup_auto_status='processing' и старым started_at должен быть reclaim-нут."""
+    async with session_maker() as session:
+        async with session.begin():
+            run = _make_run(
+                session,
+                meta={
+                    "followup_auto_status": "processing",
+                    "followup_auto_started_at": _stale_ts(),
+                },
+            )
+            await session.flush()
+            run_id = run.id
+
+    async with session_maker() as session:
+        async with session.begin():
+            claimed = await _claim_due_runs(session)
+
+    assert run_id in claimed
+
+    # Проверяем, что meta обновилась корректно
+    async with session_maker() as session:
+        run = await session.get(CampaignRun, run_id)
+
+    assert run is not None
+    meta = run.meta or {}
+    assert meta.get("followup_auto_status") == "processing"
+    assert meta.get("followup_auto_recovered") is True
+    assert "followup_auto_recovered_at" in meta
+
+
+# ---------------------------------------------------------------------------
+# Тест 8: fresh processing run → не reclaim-ится
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_fresh_processing_run_is_not_reclaimed(
+    worker_session,
+    session_maker,
+) -> None:
+    """Run с followup_auto_status='processing' и свежим started_at не должен быть reclaim-нут."""
+    async with session_maker() as session:
+        async with session.begin():
+            run = _make_run(
+                session,
+                meta={
+                    "followup_auto_status": "processing",
+                    "followup_auto_started_at": _fresh_ts(),
+                },
+            )
+            await session.flush()
+            run_id = run.id
+
+    async with session_maker() as session:
+        async with session.begin():
+            claimed = await _claim_due_runs(session)
+
+    assert run_id not in claimed
+
+
+# ---------------------------------------------------------------------------
+# Тест 9: failed run → не reclaim-ится
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_failed_run_is_not_reclaimed(
+    worker_session,
+    session_maker,
+) -> None:
+    """Run с followup_auto_status='failed' не должен автоматически reclaim-иться."""
+    async with session_maker() as session:
+        async with session.begin():
+            run = _make_run(
+                session,
+                meta={
+                    "followup_auto_status": "failed",
+                    "followup_auto_last_error": "some error",
+                },
+            )
+            await session.flush()
+            run_id = run.id
+
+    async with session_maker() as session:
+        async with session.begin():
+            claimed = await _claim_due_runs(session)
+
+    assert run_id not in claimed
+
+
+# ---------------------------------------------------------------------------
+# Тест 10: GET /ops/campaigns/runs/{run_id} включает recovery-поля
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_run_includes_recovery_fields(
+    worker_http_client,
+    session_maker,
+) -> None:
+    """GET /ops/campaigns/runs/{run_id} должен включать followup_auto_recovered поля."""
+    async with session_maker() as session:
+        async with session.begin():
+            run = _make_run(
+                session,
+                meta={
+                    "followup_auto_status": "completed",
+                    "followup_auto_recovered": True,
+                    "followup_auto_recovered_at": "2026-04-01T11:30:00+00:00",
+                    "followup_auto_planned_count": 5,
+                    "followup_auto_queued_count": 5,
+                },
+            )
+            await session.flush()
+            run_id = run.id
+
+    response = await worker_http_client.get(f"/ops/campaigns/runs/{run_id}")
+    assert response.status_code == 200
+
+    data = response.json()
+    fa = data.get("followup_auto")
+    assert fa is not None
+    assert fa["followup_auto_recovered"] is True
+    assert fa["followup_auto_recovered_at"] == "2026-04-01T11:30:00+00:00"

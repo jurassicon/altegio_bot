@@ -6,11 +6,13 @@
 
 Состояние хранится в run.meta (без миграций):
   followup_auto_status:        "processing" | "completed" | "failed"
-  followup_auto_started_at:    ISO timestamp
-  followup_auto_completed_at:  ISO timestamp
+  followup_auto_started_at:    ISO timestamp начала (или последнего reclaim)
+  followup_auto_completed_at:  ISO timestamp успешного завершения
   followup_auto_last_error:    строка ошибки (только при "failed")
   followup_auto_planned_count: int
   followup_auto_queued_count:  int
+  followup_auto_recovered:     true — если run был reclaim-нут из stale processing
+  followup_auto_recovered_at:  ISO timestamp reclaim-а
 
 Политика ошибок:
   - Ошибка одного run не обрывает worker.
@@ -18,12 +20,18 @@
   - Для повторного запуска оператор использует ручные endpoint'ы:
     POST /ops/campaigns/runs/{run_id}/followup/plan
     POST /ops/campaigns/runs/{run_id}/followup/run-now
+
+Stale recovery:
+  - Если worker упал после claim, run навсегда остаётся в "processing".
+  - Worker автоматически reclaim-ит такие run'ы через STALE_PROCESSING_MINUTES.
+  - Факт recovery виден в meta: followup_auto_recovered = true.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import timedelta
 
 from sqlalchemy import and_, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -36,19 +44,32 @@ from altegio_bot.utils import utcnow
 
 logger = logging.getLogger("followup_worker")
 
+STALE_PROCESSING_MINUTES = 30
+
 
 async def _claim_due_runs(session: AsyncSession, *, limit: int = 5) -> list[int]:
     """Найти и атомарно забрать due runs для авто-follow-up.
 
-    Run считается due, если:
-      completed_at + followup_delay_days * interval '1 day' <= now
+    Забирает два типа runs:
 
-    Атомарность обеспечивается за счёт SELECT FOR UPDATE SKIP LOCKED:
+    1. Обычные due runs — никогда не обрабатывались:
+       meta->>'followup_auto_status' IS NULL
+
+    2. Stale processing runs — worker упал после claim:
+       meta->>'followup_auto_status' = 'processing'
+       AND followup_auto_started_at старше STALE_PROCESSING_MINUTES
+
+    Атомарность обеспечивается через SELECT FOR UPDATE SKIP LOCKED:
     два параллельных worker'а не заберут один и тот же run.
+
+    При reclaim stale run в meta добавляются:
+      followup_auto_recovered = true
+      followup_auto_recovered_at = now
 
     Возвращает список run_id.
     """
     now = utcnow()
+    stale_cutoff = now - timedelta(minutes=STALE_PROCESSING_MINUTES)
 
     stmt = (
         select(CampaignRun)
@@ -65,10 +86,16 @@ async def _claim_due_runs(session: AsyncSession, *, limit: int = 5) -> list[int]
                 text(
                     "campaign_runs.completed_at + (campaign_runs.followup_delay_days * interval '1 day') <= :now"
                 ).bindparams(now=now),
-                # ещё не обработан авто-worker'ом
                 or_(
+                    # Тип 1: никогда не обрабатывался
                     CampaignRun.meta.is_(None),
                     CampaignRun.meta["followup_auto_status"].astext.is_(None),
+                    # Тип 2: stale processing — worker упал
+                    text(
+                        "campaign_runs.meta->>'followup_auto_status' = 'processing' "
+                        "AND campaign_runs.meta->>'followup_auto_started_at' IS NOT NULL "
+                        "AND (campaign_runs.meta->>'followup_auto_started_at')::timestamptz <= :stale_cutoff"
+                    ).bindparams(stale_cutoff=stale_cutoff),
                 ),
             )
         )
@@ -85,8 +112,21 @@ async def _claim_due_runs(session: AsyncSession, *, limit: int = 5) -> list[int]
     run_ids: list[int] = []
     for run in runs:
         meta = dict(run.meta or {})
+        is_recovery = meta.get("followup_auto_status") == "processing"
+        old_started_at = meta.get("followup_auto_started_at")
+
         meta["followup_auto_status"] = "processing"
         meta["followup_auto_started_at"] = started_at
+
+        if is_recovery:
+            meta["followup_auto_recovered"] = True
+            meta["followup_auto_recovered_at"] = started_at
+            logger.warning(
+                "followup_worker: recovering stale run_id=%d (stale since %s)",
+                run.id,
+                old_started_at,
+            )
+
         run.meta = meta
         run_ids.append(run.id)
 
@@ -123,7 +163,7 @@ async def process_run(run_id: int) -> None:
             stats,
         )
 
-        # 3. Записываем успех
+        # 3. Записываем успех (сохраняем recovery-поля, если они есть)
         async with SessionLocal() as session:
             async with session.begin():
                 run = await session.get(CampaignRun, run_id)
