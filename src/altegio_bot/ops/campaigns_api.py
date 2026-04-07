@@ -240,6 +240,7 @@ async def get_run(run_id: int) -> dict[str, Any]:
     result = _run_detail(run)
     result["execution_job"] = execution_job
     result["progress"] = progress
+    result["followup_auto"] = _followup_auto(run)
     return result
 
 
@@ -597,6 +598,32 @@ async def _fetch_progress(
 def _last_error(run: CampaignRun) -> str | None:
     """Последняя ошибка из run.meta['last_error']."""
     return (run.meta or {}).get("last_error")
+
+
+def _followup_auto(run: CampaignRun) -> dict[str, Any] | None:
+    """Блок auto follow-up из run.meta, если worker уже запускался."""
+    meta = run.meta or {}
+
+    keys = (
+        "followup_auto_status",
+        "followup_auto_started_at",
+        "followup_auto_completed_at",
+        "followup_auto_last_error",
+        "followup_auto_planned_count",
+        "followup_auto_queued_count",
+    )
+
+    if not any(key in meta for key in keys):
+        return None
+
+    return {
+        "followup_auto_status": meta.get("followup_auto_status"),
+        "followup_auto_started_at": meta.get("followup_auto_started_at"),
+        "followup_auto_completed_at": meta.get("followup_auto_completed_at"),
+        "followup_auto_last_error": meta.get("followup_auto_last_error"),
+        "followup_auto_planned_count": meta.get("followup_auto_planned_count"),
+        "followup_auto_queued_count": meta.get("followup_auto_queued_count"),
+    }
 
 
 def _followup_auto(run: CampaignRun) -> dict[str, Any] | None:
