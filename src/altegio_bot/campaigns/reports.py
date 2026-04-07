@@ -39,6 +39,15 @@ def _pct(num: int, den: int) -> float:
     return round(num / den, 4) if den else 0.0
 
 
+def _use_or_fallback(run_value: int | None, fallback: int) -> int:
+    """Вернуть run_value если он уже записан (даже если 0), иначе fallback.
+
+    Использует явную проверку is not None вместо `or`, чтобы не подменять
+    реальный 0 fallback-значением.
+    """
+    return run_value if run_value is not None else fallback
+
+
 async def run_report(session: AsyncSession, run_id: int) -> dict[str, Any]:
     """Полный отчёт по одному CampaignRun."""
     run = await session.get(CampaignRun, run_id)
@@ -69,7 +78,16 @@ async def run_report(session: AsyncSession, run_id: int) -> dict[str, Any]:
 
     total = run.total_clients_seen
     eligible = run.candidates_count
-    queued = run.queued_count or status_counts.get("queued", 0)
+    queued = _use_or_fallback(run.queued_count, status_counts.get("queued", 0))
+
+    # Для счётчиков доставки и атрибуции: если в CampaignRun уже записано значение
+    # (включая 0), используем его. Fallback на attr только если значение None.
+    # Это важно: `or` некорректен, потому что 0 тоже falsy.
+    provider_accepted = _use_or_fallback(run.provider_accepted_count, attr["provider_accepted"])
+    delivered = _use_or_fallback(run.delivered_count, attr["delivered"])
+    read = _use_or_fallback(run.read_count, attr["read"])
+    replied = _use_or_fallback(run.replied_count, attr["replied"])
+    booked_after = _use_or_fallback(run.booked_after_count, attr["booked_after"])
 
     return {
         "run_id": run.id,
@@ -101,12 +119,12 @@ async def run_report(session: AsyncSession, run_id: int) -> dict[str, Any]:
         "cleanup_failed": run.cleanup_failed_count,
         # Доставка (кумулятивно: если прочитали — это и delivered, и provider_accepted)
         "queued": queued,
-        "provider_accepted": run.provider_accepted_count or attr["provider_accepted"],
-        "delivered": run.delivered_count or attr["delivered"],
-        "read": run.read_count or attr["read"],
+        "provider_accepted": provider_accepted,
+        "delivered": delivered,
+        "read": read,
         # Атрибуция (из полей CampaignRecipient)
-        "replied": run.replied_count or attr["replied"],
-        "booked_after_campaign": run.booked_after_count or attr["booked_after"],
+        "replied": replied,
+        "booked_after_campaign": booked_after,
         "opted_out_after_campaign": run.opted_out_after_count,
         # Follow-up
         "followup_enabled": run.followup_enabled,
@@ -172,6 +190,50 @@ async def _fetch_attribution(session: AsyncSession, run_id: int) -> dict[str, An
     }
 
 
+def _aggregate_company_reports(
+    reports: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if not reports:
+        return _empty_totals()
+
+    total_found = sum(r["total_found"] for r in reports)
+    eligible = sum(r["eligible"] for r in reports)
+    # queued — количество сообщений, поставленных в очередь на отправку.
+    # Называем честно: это очередь, а не факт отправки.
+    queued = sum(r["queued"] for r in reports)
+    delivered = sum(r["delivered"] for r in reports)
+    read = sum(r["read"] for r in reports)
+    replied = sum(r["replied"] for r in reports)
+    booked = sum(r["booked_after_campaign"] for r in reports)
+    opted_out = sum(r["opted_out_after_campaign"] for r in reports)
+    invalid = sum(r["excluded"]["invalid_phone"] for r in reports)
+    no_wa = sum(r["excluded"]["no_whatsapp"] for r in reports)
+    cards_issued = sum(r["cards_issued"] for r in reports)
+    cards_deleted = sum(r["cards_deleted"] for r in reports)
+    cleanup_failed = sum(r["cleanup_failed"] for r in reports)
+
+    problematic = invalid + no_wa
+
+    return {
+        "new_clients_found": total_found,
+        "eligible": eligible,
+        # "queued" — честное имя: сколько сообщений попало в очередь.
+        # Прежнее поле "sent" удалено, так как оно вводило в заблуждение.
+        "queued": queued,
+        "delivered": delivered,
+        "read": read,
+        "replied": replied,
+        "booked_after_30d": booked,
+        "opted_out": opted_out,
+        "cards_issued": cards_issued,
+        "cards_deleted": cards_deleted,
+        "cleanup_failed": cleanup_failed,
+        "problematic_phones_pct": _pct(problematic, eligible),
+        "coverage_rate": _pct(queued, eligible),
+        "booking_conversion": _pct(booked, queued),
+    }
+
+
 async def monthly_dashboard(
     session: AsyncSession,
     *,
@@ -181,10 +243,13 @@ async def monthly_dashboard(
 ) -> dict[str, Any]:
     """Monthly dashboard по всем филиалам за указанный месяц.
 
-    Учитываются только runs с mode='send-real' и status='completed'.
-    Данные берутся из run_report(), который использует pre-aggregated
-    счётчики с fallback на live outbox_messages — актуальнее прямой
-    агрегации полей CampaignRun.
+    Возвращает:
+      1. companies — исходный подробный формат по филиалам;
+      2. summary — агрегированные totals для HTML ops dashboard;
+      3. by_company — плоский список по филиалам для HTML ops dashboard.
+
+    Это сохраняет обратную совместимость для JSON API и даёт HTML-роуту
+    те ключи, которые он уже ожидает.
     """
     month_start = datetime(year, month, 1, tzinfo=timezone.utc)
     next_month = month + 1 if month < 12 else 1
@@ -211,59 +276,66 @@ async def monthly_dashboard(
             if cid in cids_filter:
                 per_company.setdefault(cid, []).append(report)
 
-    company_reports = []
+    companies: list[dict[str, Any]] = []
+    by_company: list[dict[str, Any]] = []
+
     for cid in cids_filter:
         cid_reports = per_company.get(cid, [])
         totals = _aggregate_company_reports(cid_reports)
-        company_reports.append(
+        company_name = COMPANIES.get(cid, str(cid))
+
+        companies.append(
             {
                 "company_id": cid,
-                "company_name": COMPANIES.get(cid, str(cid)),
+                "company_name": company_name,
                 "runs_count": len(cid_reports),
                 "run_ids": [r["run_id"] for r in cid_reports],
                 "totals": totals,
             }
         )
 
+        by_company.append(
+            {
+                "company_id": cid,
+                "company_name": company_name,
+                "runs_count": len(cid_reports),
+                "total_clients_seen": totals["new_clients_found"],
+                "candidates_count": totals["eligible"],
+                # queued_count — честное имя: сколько сообщений попало в очередь
+                "queued_count": totals["queued"],
+                "delivered_count": totals["delivered"],
+                "read_count": totals["read"],
+                "replied_count": totals["replied"],
+                "booked_after_count": totals["booked_after_30d"],
+                "cards_issued_count": totals["cards_issued"],
+                "cards_deleted_count": totals["cards_deleted"],
+                "cleanup_failed_count": totals["cleanup_failed"],
+                "opted_out_after_count": totals["opted_out"],
+            }
+        )
+
+    summary = {
+        "runs_count": sum(row["runs_count"] for row in by_company),
+        "total_clients_seen": sum(row["total_clients_seen"] for row in by_company),
+        "candidates_count": sum(row["candidates_count"] for row in by_company),
+        "queued_count": sum(row["queued_count"] for row in by_company),
+        "delivered_count": sum(row["delivered_count"] for row in by_company),
+        "read_count": sum(row["read_count"] for row in by_company),
+        "replied_count": sum(row["replied_count"] for row in by_company),
+        "booked_after_count": sum(row["booked_after_count"] for row in by_company),
+        "cards_issued_count": sum(row["cards_issued_count"] for row in by_company),
+        "cards_deleted_count": sum(row["cards_deleted_count"] for row in by_company),
+        "cleanup_failed_count": sum(row["cleanup_failed_count"] for row in by_company),
+        "opted_out_after_count": sum(row["opted_out_after_count"] for row in by_company),
+    }
+
     return {
         "year": year,
         "month": month,
         "period": f"{year}-{month:02d}",
-        "companies": company_reports,
-    }
-
-
-def _aggregate_company_reports(
-    reports: list[dict[str, Any]],
-) -> dict[str, Any]:
-    if not reports:
-        return _empty_totals()
-
-    total_found = sum(r["total_found"] for r in reports)
-    eligible = sum(r["eligible"] for r in reports)
-    sent = sum(r["queued"] for r in reports)
-    delivered = sum(r["delivered"] for r in reports)
-    read = sum(r["read"] for r in reports)
-    replied = sum(r["replied"] for r in reports)
-    booked = sum(r["booked_after_campaign"] for r in reports)
-    opted_out = sum(r["opted_out_after_campaign"] for r in reports)
-    invalid = sum(r["excluded"]["invalid_phone"] for r in reports)
-    no_wa = sum(r["excluded"]["no_whatsapp"] for r in reports)
-
-    problematic = invalid + no_wa
-
-    return {
-        "new_clients_found": total_found,
-        "eligible": eligible,
-        "sent": sent,
-        "delivered": delivered,
-        "read": read,
-        "replied": replied,
-        "booked_after_30d": booked,
-        "opted_out": opted_out,
-        "problematic_phones_pct": _pct(problematic, eligible),
-        "coverage_rate": _pct(sent, eligible),
-        "booking_conversion": _pct(booked, sent),
+        "companies": companies,
+        "summary": summary,
+        "by_company": by_company,
     }
 
 
@@ -271,12 +343,16 @@ def _empty_totals() -> dict[str, Any]:
     return {
         "new_clients_found": 0,
         "eligible": 0,
-        "sent": 0,
+        # queued вместо sent: честное отражение семантики поля
+        "queued": 0,
         "delivered": 0,
         "read": 0,
         "replied": 0,
         "booked_after_30d": 0,
         "opted_out": 0,
+        "cards_issued": 0,
+        "cards_deleted": 0,
+        "cleanup_failed": 0,
         "problematic_phones_pct": 0.0,
         "coverage_rate": 0.0,
         "booking_conversion": 0.0,
