@@ -26,6 +26,7 @@ from typing import Any, Literal
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.campaigns.followup import execute_followup, followup_run_at, plan_followup
 from altegio_bot.campaigns.reports import monthly_dashboard, run_report
@@ -453,19 +454,7 @@ async def run_followup_now(run_id: int) -> dict[str, Any]:
 
 @router.post("/runs/{run_id}/resume")
 async def resume_run(run_id: int) -> dict[str, Any]:
-    """Продолжить failed send-real run по сохранённому snapshot получателей.
-
-    Безопасен: не пересчитывает сегмент, не трогает cleanup_failed
-    и card_issue_failed. Resume синхронный — приемлемо, т.к. кампании
-    по 20-30 клиентов, общее время < 15 с.
-
-    Разрешённые для обработки статусы:
-      candidate → полный flow (cleanup, issue card, queue)
-      card_issued → только допоставить MessageJob
-      skipped + queue_failed → только допоставить MessageJob
-
-    Возвращает итоговый статус run и сводку по resume.
-    """
+    """Продолжить failed send-real run по сохранённому snapshot получателей."""
     async with SessionLocal() as session:
         run = await session.get(CampaignRun, run_id)
         if run is None:
@@ -479,15 +468,20 @@ async def resume_run(run_id: int) -> dict[str, Any]:
         logger.exception("resume failed run_id=%d: %s", run_id, exc)
         raise HTTPException(status_code=500, detail="Internal resume error")
 
-    # Получить финальный статус run после обновления
     async with SessionLocal() as session:
         run = await session.get(CampaignRun, run_id)
+
+    if run is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Run disappeared after resume",
+        )
 
     return {
         "run_id": run_id,
         "accepted": True,
         "message": "Resume completed",
-        "status": run.status if run else "unknown",
+        "status": run.status,
         "summary": result,
     }
 
@@ -497,7 +491,10 @@ async def resume_run(run_id: int) -> dict[str, Any]:
 # ==========================================================================
 
 
-async def _fetch_execution_job(session: Any, run_id: int) -> dict[str, Any] | None:
+async def _fetch_execution_job(
+    session: AsyncSession,
+    run_id: int,
+) -> dict[str, Any] | None:
     """Найти последний execution MessageJob для данного run_id."""
     stmt = (
         select(MessageJob)
@@ -509,6 +506,7 @@ async def _fetch_execution_job(session: Any, run_id: int) -> dict[str, Any] | No
     job = (await session.execute(stmt)).scalar_one_or_none()
     if job is None:
         return None
+
     return {
         "id": job.id,
         "status": job.status,
@@ -522,30 +520,68 @@ async def _fetch_execution_job(session: Any, run_id: int) -> dict[str, Any] | No
     }
 
 
-async def _fetch_progress(session: Any, run_id: int, total_clients_seen: int) -> dict[str, Any]:
-    """Live-счётчики получателей по статусам из CampaignRecipient."""
+async def _fetch_progress(
+    session: AsyncSession,
+    run_id: int,
+    total_clients_seen: int,
+) -> dict[str, Any]:
+    """Live-счётчики получателей по статусам из CampaignRecipient.
+
+    skipped + queue_failed не считается done — такой получатель resumable,
+    поэтому попадает в recipients_in_progress.
+    """
     stmt = (
-        select(CampaignRecipient.status, func.count(CampaignRecipient.id).label("cnt"))
+        select(
+            CampaignRecipient.status,
+            CampaignRecipient.excluded_reason,
+            func.count(CampaignRecipient.id).label("cnt"),
+        )
         .where(CampaignRecipient.campaign_run_id == run_id)
-        .group_by(CampaignRecipient.status)
+        .group_by(CampaignRecipient.status, CampaignRecipient.excluded_reason)
     )
     rows = (await session.execute(stmt)).all()
-    counts: dict[str, int] = {s: int(c) for s, c in rows}
 
-    skipped = counts.get("skipped", 0)
-    cleanup_failed = counts.get("cleanup_failed", 0)
-    queued = counts.get("queued", 0)
-    candidate = counts.get("candidate", 0)
-    card_issued = counts.get("card_issued", 0)
+    skipped_done = 0
+    queue_failed_pending = 0
+    cleanup_failed = 0
+    queued = 0
+    candidate = 0
+    card_issued = 0
+    other = 0
 
-    recipients_total = sum(counts.values())
-    recipients_done = skipped + cleanup_failed + queued
-    recipients_in_progress = candidate + card_issued
-    progress_pct = round(recipients_done / total_clients_seen, 4) if total_clients_seen > 0 else 0.0
+    for status_value, reason, count in rows:
+        cnt = int(count)
+        if status_value == "skipped":
+            if reason == "queue_failed":
+                queue_failed_pending += cnt
+            else:
+                skipped_done += cnt
+        elif status_value == "cleanup_failed":
+            cleanup_failed += cnt
+        elif status_value == "queued":
+            queued += cnt
+        elif status_value == "candidate":
+            candidate += cnt
+        elif status_value == "card_issued":
+            card_issued += cnt
+        else:
+            other += cnt
+
+    recipients_total = skipped_done + queue_failed_pending + cleanup_failed + queued + candidate + card_issued + other
+    recipients_done = skipped_done + cleanup_failed + queued + other
+    recipients_in_progress = candidate + card_issued + queue_failed_pending
+
+    raw_progress = (
+        round(recipients_done / total_clients_seen, 4)
+        if total_clients_seen > 0
+        else 0.0
+    )
+    progress_pct = min(raw_progress, 1.0)
 
     return {
         "recipients_total": recipients_total,
-        "recipients_skipped": skipped,
+        "recipients_skipped": skipped_done,
+        "recipients_queue_failed_pending": queue_failed_pending,
         "recipients_cleanup_failed": cleanup_failed,
         "recipients_queued": queued,
         "recipients_candidate": candidate,
