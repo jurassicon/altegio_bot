@@ -392,6 +392,15 @@ async def execute_queued_send_real(run_id: int) -> None:
             )
             return
 
+        if run.status == "failed":
+            # failed run нельзя повторно исполнять через старый execution job —
+            # для retry используется resume_send_real.
+            logger.warning(
+                "skip queued execution run_id=%d (already failed)",
+                run_id,
+            )
+            return
+
         params = _params_from_run(run)
 
     await _execute_send_real_for_existing_run(run_id, params)

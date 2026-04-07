@@ -11,6 +11,8 @@
   followup_auto_last_error:    строка ошибки (только при "failed")
   followup_auto_planned_count: int
   followup_auto_queued_count:  int
+  followup_auto_skipped_count: int
+  followup_auto_failed_count:  int
   followup_auto_recovered:     true — если run был reclaim-нут из stale processing
   followup_auto_recovered_at:  ISO timestamp reclaim-а
 
@@ -80,6 +82,7 @@ async def _claim_due_runs(session: AsyncSession, *, limit: int = 5) -> list[int]
                 CampaignRun.status == "completed",
                 CampaignRun.followup_enabled.is_(True),
                 CampaignRun.followup_delay_days.is_not(None),
+                CampaignRun.followup_policy.is_not(None),
                 CampaignRun.followup_template_name.is_not(None),
                 CampaignRun.completed_at.is_not(None),
                 # due: completed_at + N days <= now
@@ -156,6 +159,8 @@ async def process_run(run_id: int) -> None:
         # 2. Выполняем: создаём MessageJob для каждого followup_planned получателя
         stats = await execute_followup(run_id)
         queued_count = stats.get("queued", 0)
+        skipped_count = stats.get("skipped", 0)
+        failed_count = stats.get("failed", 0)
 
         logger.info(
             "followup_worker: executed run_id=%d stats=%s",
@@ -173,13 +178,17 @@ async def process_run(run_id: int) -> None:
                     meta["followup_auto_completed_at"] = utcnow().isoformat()
                     meta["followup_auto_planned_count"] = planned_count
                     meta["followup_auto_queued_count"] = queued_count
+                    meta["followup_auto_skipped_count"] = skipped_count
+                    meta["followup_auto_failed_count"] = failed_count
                     meta.pop("followup_auto_last_error", None)
                     run.meta = meta
 
         logger.info(
-            "followup_worker: done run_id=%d queued=%d",
+            "followup_worker: done run_id=%d queued=%d skipped=%d failed=%d",
             run_id,
             queued_count,
+            skipped_count,
+            failed_count,
         )
 
     except Exception as exc:

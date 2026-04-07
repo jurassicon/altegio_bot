@@ -390,6 +390,12 @@ async def plan_followup_endpoint(
                     detail="Follow-up доступен только для send-real run",
                 )
 
+            if run.status != "completed":
+                raise HTTPException(
+                    status_code=400,
+                    detail="Follow-up можно планировать только для completed run",
+                )
+
             if body.followup_policy:
                 run.followup_policy = body.followup_policy
             if body.followup_delay_days is not None:
@@ -611,6 +617,8 @@ def _followup_auto(run: CampaignRun) -> dict[str, Any] | None:
         "followup_auto_last_error",
         "followup_auto_planned_count",
         "followup_auto_queued_count",
+        "followup_auto_skipped_count",
+        "followup_auto_failed_count",
         "followup_auto_recovered",
         "followup_auto_recovered_at",
     )
@@ -625,6 +633,8 @@ def _followup_auto(run: CampaignRun) -> dict[str, Any] | None:
         "followup_auto_last_error": meta.get("followup_auto_last_error"),
         "followup_auto_planned_count": meta.get("followup_auto_planned_count"),
         "followup_auto_queued_count": meta.get("followup_auto_queued_count"),
+        "followup_auto_skipped_count": meta.get("followup_auto_skipped_count"),
+        "followup_auto_failed_count": meta.get("followup_auto_failed_count"),
         "followup_auto_recovered": meta.get("followup_auto_recovered"),
         "followup_auto_recovered_at": meta.get("followup_auto_recovered_at"),
     }

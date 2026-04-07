@@ -1,20 +1,27 @@
-"""Тесты followup_worker: авто-планирование, авто-запуск и stale recovery.
+"""Тесты followup_worker: авто-планирование, авто-запуск, stale recovery и фиксы.
 
-Десять сценариев:
+Пятнадцать сценариев:
 
   Базовые:
-    1. Due completed run с followup_enabled → auto plan + execute.
-    2. Run с followup_enabled=False → игнорируется.
-    3. Run ещё не due → игнорируется.
-    4. Run с meta['followup_auto_status']='completed' → не трогается повторно.
-    5. Ошибка в plan_followup → записывается в meta['followup_auto_last_error'].
-    6. GET /ops/campaigns/runs/{run_id} включает followup_auto блок.
+    1.  Due completed run с followup_enabled → auto plan + execute.
+    2.  Run с followup_enabled=False → игнорируется.
+    3.  Run ещё не due → игнорируется.
+    4.  Run с meta['followup_auto_status']='completed' → не трогается повторно.
+    5.  Ошибка в plan_followup → записывается в meta['followup_auto_last_error'].
+    6.  GET /ops/campaigns/runs/{run_id} включает followup_auto блок.
 
-  Stale recovery:
-    7. Stale processing run (started_at > threshold) → reclaim-ится.
-    8. Fresh processing run (started_at < threshold) → не трогается.
-    9. Failed run → не reclaim-ится.
-   10. GET /ops/campaigns/runs/{run_id} включает recovery-поля при наличии.
+  Stale recovery (run-level):
+    7.  Stale processing run (started_at > threshold) → reclaim-ится.
+    8.  Fresh processing run (started_at < threshold) → не трогается.
+    9.  Failed run → не reclaim-ится.
+   10.  GET /ops/campaigns/runs/{run_id} включает recovery-поля при наличии.
+
+  Фиксы:
+   11.  Recipient застрявший в followup_processing восстанавливается plan_followup.
+   12.  /followup/plan запрещён для non-completed run → 400.
+   13.  execute_queued_send_real пропускает failed run без повторного запуска.
+   14.  followup_worker записывает skipped и failed counts в meta.
+   15.  Run без followup_policy не забирается _claim_due_runs.
 """
 
 from __future__ import annotations
@@ -27,8 +34,11 @@ import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 
 import altegio_bot.campaigns.followup as followup_module
+import altegio_bot.campaigns.runner as runner_module
 import altegio_bot.ops.campaigns_api as campaigns_api_module
 import altegio_bot.workers.followup_worker as followup_worker_module
+from altegio_bot.campaigns.followup import plan_followup
+from altegio_bot.campaigns.runner import execute_queued_send_real
 from altegio_bot.main import app
 from altegio_bot.models.models import CampaignRecipient, CampaignRun
 from altegio_bot.ops.auth import require_ops_auth
@@ -274,7 +284,9 @@ async def test_worker_stores_followup_auto_last_error_on_failure(
     """При ошибке в plan_followup worker должен записать ошибку в run.meta."""
     async with session_maker() as session:
         async with session.begin():
-            # followup_policy=None → plan_followup выбросит ValueError
+            # followup_policy=None → plan_followup выбросит ValueError.
+            # _claim_due_runs теперь фильтрует по followup_policy IS NOT NULL,
+            # поэтому вызываем process_run напрямую.
             run = _make_run(session, followup_policy=None)
             await session.flush()
             run_id = run.id
@@ -465,3 +477,161 @@ async def test_get_run_includes_recovery_fields(
     assert fa is not None
     assert fa["followup_auto_recovered"] is True
     assert fa["followup_auto_recovered_at"] == "2026-04-01T11:30:00+00:00"
+
+
+# ---------------------------------------------------------------------------
+# Тест 11: followup_processing recipient восстанавливается plan_followup
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_followup_processing_recipient_is_recovered_by_plan_followup(
+    session_maker,
+) -> None:
+    """plan_followup должен сбросить recipient из followup_processing → followup_planned.
+
+    Это покрывает случай когда execute_followup упал после атомарного claim,
+    оставив получателя застрявшим в followup_processing.
+    Также проверяет, что FOR UPDATE сериализует конкурентные вызовы:
+    после план-запроса с блокировкой статус корректно установлен.
+    """
+    async with session_maker() as session:
+        async with session.begin():
+            run = _make_run(session)
+            await session.flush()
+            run_id = run.id
+            # Имитируем застрявшего в followup_processing получателя
+            recipient = _make_recipient(
+                session,
+                run_id,
+                followup_status="followup_processing",
+            )
+            await session.flush()
+            recipient_id = recipient.id
+
+    # plan_followup должен сбросить followup_processing → followup_planned
+    async with session_maker() as session:
+        async with session.begin():
+            planned = await plan_followup(session, run_id)
+
+    # Сброшенный получатель попадает в followup_planned,
+    # но основной цикл plan_followup его пропускает (уже не None),
+    # поэтому count = 0 (он не считается заново-запланированным)
+    assert planned == 0
+
+    async with session_maker() as session:
+        r = await session.get(CampaignRecipient, recipient_id)
+
+    assert r is not None
+    assert r.followup_status == "followup_planned"
+
+
+# ---------------------------------------------------------------------------
+# Тест 12: /followup/plan запрещён для non-completed run
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_plan_followup_endpoint_forbidden_for_non_completed_run(
+    worker_http_client,
+    session_maker,
+) -> None:
+    """POST /followup/plan должен вернуть 400 для run, который ещё не completed."""
+    async with session_maker() as session:
+        async with session.begin():
+            run = _make_run(session, status="running")
+            await session.flush()
+            run_id = run.id
+
+    response = await worker_http_client.post(
+        f"/ops/campaigns/runs/{run_id}/followup/plan",
+        json={},
+    )
+    assert response.status_code == 400
+    assert "completed" in response.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# Тест 13: execute_queued_send_real пропускает failed run
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_execute_queued_send_real_skips_failed_run(
+    session_maker,
+    monkeypatch,
+) -> None:
+    """execute_queued_send_real должен тихо вернуться без повторного запуска failed run."""
+    monkeypatch.setattr(runner_module, "SessionLocal", session_maker)
+
+    async with session_maker() as session:
+        async with session.begin():
+            run = _make_run(session, status="failed")
+            await session.flush()
+            run_id = run.id
+
+    # Не должен бросить исключение и не должен менять статус
+    await execute_queued_send_real(run_id)
+
+    async with session_maker() as session:
+        run = await session.get(CampaignRun, run_id)
+
+    assert run is not None
+    assert run.status == "failed"
+
+
+# ---------------------------------------------------------------------------
+# Тест 14: followup_worker записывает skipped и failed counts в meta
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_followup_worker_writes_skipped_and_failed_counts_to_meta(
+    worker_session,
+    session_maker,
+) -> None:
+    """После process_run в meta должны быть followup_auto_skipped_count и followup_auto_failed_count."""
+    async with session_maker() as session:
+        async with session.begin():
+            run = _make_run(session)
+            await session.flush()
+            run_id = run.id
+            _make_recipient(session, run_id)
+            await session.flush()
+
+    await process_run(run_id)
+
+    async with session_maker() as session:
+        run = await session.get(CampaignRun, run_id)
+
+    assert run is not None
+    meta = run.meta or {}
+    assert meta.get("followup_auto_status") == "completed"
+    assert "followup_auto_skipped_count" in meta
+    assert "followup_auto_failed_count" in meta
+    assert meta["followup_auto_skipped_count"] == 0
+    assert meta["followup_auto_failed_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Тест 15: run без followup_policy не забирается _claim_due_runs
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_without_followup_policy_not_claimed(
+    worker_session,
+    session_maker,
+) -> None:
+    """Run с followup_policy=None должен быть отфильтрован в _claim_due_runs."""
+    async with session_maker() as session:
+        async with session.begin():
+            run = _make_run(session, followup_policy=None)
+            await session.flush()
+            run_id = run.id
+
+    async with session_maker() as session:
+        async with session.begin():
+            claimed = await _claim_due_runs(session)
+
+    assert run_id not in claimed

@@ -74,6 +74,23 @@ async def plan_followup(session: AsyncSession, run_id: int) -> int:
     """Пометить получателей follow-up статусом 'followup_planned'.
 
     Возвращает количество клиентов, запланированных для follow-up.
+
+    Recovery от застрявших followup_processing:
+    В начале функции выполняется UPDATE, который сбрасывает всех получателей
+    из followup_processing обратно в followup_planned. Это покрывает случай,
+    когда execute_followup упал (SIGKILL, OOM) после атомарного claim, но до
+    создания MessageJob, и получатель навсегда завис. plan_followup
+    вызывается либо оператором явно, либо при stale-recovery worker'а — в
+    обоих случаях предыдущая сессия execute_followup мертва, сброс безопасен.
+    Защита от дублей сохраняется: execute_followup по-прежнему клеймит
+    каждого получателя атомарно перед отправкой.
+
+    Конкурентная безопасность:
+    Запрос к получателям выполняется с FOR UPDATE. Второй параллельный вызов
+    plan_followup будет ждать завершения первого, а затем увидит уже
+    выставленные статусы и вернёт 0 (идемпотентность сохраняется).
+    UPDATE-операции execute_followup по отдельным строкам также сериализуются
+    относительно этого запроса.
     """
     run = await session.get(CampaignRun, run_id)
     if run is None:
@@ -85,7 +102,18 @@ async def plan_followup(session: AsyncSession, run_id: int) -> int:
     if not run.followup_policy:
         raise ValueError(f"followup_policy не задана для run_id={run_id}")
 
-    stmt = select(CampaignRecipient).where(CampaignRecipient.campaign_run_id == run_id)
+    # Recovery: сбросить застрявших получателей followup_processing → followup_planned.
+    # Основной цикл ниже пропустит их (followup_status is not None), но
+    # execute_followup заберёт их при следующем вызове.
+    await session.execute(
+        update(CampaignRecipient)
+        .where(CampaignRecipient.campaign_run_id == run_id)
+        .where(CampaignRecipient.followup_status == _FOLLOWUP_PROCESSING)
+        .values(followup_status="followup_planned")
+    )
+    await session.flush()
+
+    stmt = select(CampaignRecipient).where(CampaignRecipient.campaign_run_id == run_id).with_for_update()
     recipients = (await session.execute(stmt)).scalars().all()
 
     count = 0
