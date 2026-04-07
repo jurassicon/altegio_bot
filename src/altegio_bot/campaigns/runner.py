@@ -119,9 +119,7 @@ async def _enqueue_campaign_execution_job(
 def _params_from_run(run: CampaignRun) -> RunParams:
     """Собрать RunParams из уже созданного CampaignRun."""
     if run.mode != "send-real":
-        raise RuntimeError(
-            f"_params_from_run expects send-real run, got mode={run.mode!r}"
-        )
+        raise RuntimeError(f"_params_from_run expects send-real run, got mode={run.mode!r}")
 
     company_ids = run.company_ids or []
     if not company_ids:
@@ -885,20 +883,13 @@ async def resume_send_real(run_id: int) -> dict:
         if run is None:
             raise ValueError(f"CampaignRun {run_id} not found")
         if run.mode != "send-real":
-            raise ValueError(
-                f"Resume доступен только для send-real. mode={run.mode!r}"
-            )
+            raise ValueError(f"Resume доступен только для send-real. mode={run.mode!r}")
         if run.status != "failed":
-            raise ValueError(
-                f"Resume доступен только для failed run. "
-                f"status={run.status!r}"
-            )
+            raise ValueError(f"Resume доступен только для failed run. status={run.status!r}")
         params = _params_from_run(run)
 
     async with SessionLocal() as session:
-        stmt = select(CampaignRecipient).where(
-            CampaignRecipient.campaign_run_id == run_id
-        )
+        stmt = select(CampaignRecipient).where(CampaignRecipient.campaign_run_id == run_id)
         recipients = (await session.execute(stmt)).scalars().all()
 
     loyalty = AltegioLoyaltyClient()
@@ -943,28 +934,15 @@ async def resume_send_real(run_id: int) -> dict:
                     if ok:
                         stats["resumed"] += 1
 
-                elif (
-                    st == "card_issued"
-                    or (
-                        st == "skipped"
-                        and reason == "queue_failed"
-                    )
-                ):
+                elif st == "card_issued" or (st == "skipped" and reason == "queue_failed"):
                     await _enqueue_newsletter_job_for_recipient(
                         recipient_id=recipient.id,
                         company_id=params.company_id,
                         client_id=recipient.client_id,
                         run_id=run_id,
-                        loyalty_card_number=(
-                            recipient.loyalty_card_number or ""
-                        ),
-                        loyalty_card_id=(
-                            recipient.loyalty_card_id or ""
-                        ),
-                        loyalty_card_type_id=(
-                            recipient.loyalty_card_type_id
-                            or card_type_id
-                        ),
+                        loyalty_card_number=(recipient.loyalty_card_number or ""),
+                        loyalty_card_id=(recipient.loyalty_card_id or ""),
+                        loyalty_card_type_id=(recipient.loyalty_card_type_id or card_type_id),
                     )
                     stats["resumed"] += 1
 
@@ -980,40 +958,27 @@ async def resume_send_real(run_id: int) -> dict:
     finally:
         await loyalty.aclose()
 
-    remaining_manual_count, remaining_pending_count = (
-        await _recalculate_run_after_resume(run_id)
-    )
+    remaining_manual_count, remaining_pending_count = await _recalculate_run_after_resume(run_id)
 
     async with SessionLocal() as session:
         async with session.begin():
             run = await session.get(CampaignRun, run_id)
             if run is None:
-                raise RuntimeError(
-                    f"CampaignRun {run_id} not found after resume"
-                )
+                raise RuntimeError(f"CampaignRun {run_id} not found after resume")
 
             meta = dict(run.meta or {})
 
-            if (
-                remaining_pending_count == 0
-                and remaining_manual_count == 0
-            ):
+            if remaining_pending_count == 0 and remaining_manual_count == 0:
                 run.status = "completed"
                 meta.pop("last_error", None)
                 run.completed_at = utcnow()
             elif remaining_pending_count == 0:
                 run.status = "failed"
-                meta["last_error"] = (
-                    "Resume completed partially: "
-                    "some recipients still require manual action"
-                )
+                meta["last_error"] = "Resume completed partially: some recipients still require manual action"
                 run.completed_at = utcnow()
             else:
                 run.status = "failed"
-                meta["last_error"] = (
-                    "Resume partially failed: "
-                    f"{remaining_pending_count} recipients still pending"
-                )
+                meta["last_error"] = f"Resume partially failed: {remaining_pending_count} recipients still pending"
 
             run.meta = meta
 

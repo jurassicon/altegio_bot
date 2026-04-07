@@ -571,11 +571,7 @@ async def _fetch_progress(
     recipients_done = skipped_done + cleanup_failed + queued + other
     recipients_in_progress = candidate + card_issued + queue_failed_pending
 
-    raw_progress = (
-        round(recipients_done / total_clients_seen, 4)
-        if total_clients_seen > 0
-        else 0.0
-    )
+    raw_progress = round(recipients_done / total_clients_seen, 4) if total_clients_seen > 0 else 0.0
     progress_pct = min(raw_progress, 1.0)
 
     return {
