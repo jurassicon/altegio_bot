@@ -223,6 +223,7 @@ def normalize_meta_template_name(template_name: str) -> str:
         if code.startswith(prefix):
             code = code[len(prefix) :]
             break
+    # Убираем версионный суффикс: _v1, _v2, _v3, …
     code = re.sub(r"_v\d+$", "", code)
     return code
 
