@@ -15,9 +15,11 @@ from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
-from sqlalchemy import text
+from sqlalchemy import func, select, text
 
+from altegio_bot.campaigns.reports import monthly_dashboard
 from altegio_bot.db import SessionLocal
+from altegio_bot.models.models import CampaignRecipient, CampaignRun
 from altegio_bot.settings import settings
 
 from .auth import (
@@ -136,6 +138,9 @@ _NAV = """
         </li>
         <li class="nav-item">
           <a class="nav-link" href="/ops/optouts">🚫 Opt-outs</a>
+        </li>
+        <li class="nav-item">
+          <a class="nav-link" href="/ops/campaigns">📣 Campaigns</a>
         </li>
       </ul>
       <form method="post" action="/ops/logout" class="d-flex">
@@ -2531,6 +2536,623 @@ async def ops_monitoring() -> str:
 {optout_html}
 """
     return _page("Monitoring", body)
+
+
+# ---------------------------------------------------------------------------
+# Campaign helpers
+# ---------------------------------------------------------------------------
+
+
+def _campaign_status_badge(status: str | None) -> str:
+    if not status:
+        return ""
+    colors = {
+        "running": "primary",
+        "completed": "success",
+        "failed": "danger",
+        "queued": "secondary",
+        "paused": "warning",
+    }
+    color = colors.get(status, "secondary")
+    return f'<span class="badge bg-{color}">{_esc(status)}</span>'
+
+
+def _campaign_mode_badge(mode: str | None) -> str:
+    if not mode:
+        return ""
+    color = "info" if mode == "preview" else "dark"
+    return f'<span class="badge bg-{color}">{_esc(mode)}</span>'
+
+
+def _fmt_company_ids(company_ids: list | None) -> str:
+    if not company_ids:
+        return "—"
+    return ", ".join(str(cid) for cid in company_ids)
+
+
+def _followup_auto_summary(meta: dict | None) -> str:
+    if not meta:
+        return ""
+    status = meta.get("followup_auto_status")
+    if not status:
+        return ""
+    queued = meta.get("followup_auto_queued_count", 0)
+    planned = meta.get("followup_auto_planned_count", 0)
+    return f"{_esc(status)} (queued {queued}/{planned})"
+
+
+def _iso_str(val: Any) -> str | None:
+    if val is None:
+        return None
+    if isinstance(val, datetime):
+        return val.isoformat()
+    return str(val)
+
+
+# ---------------------------------------------------------------------------
+# /ops/campaigns  – список runs
+# ---------------------------------------------------------------------------
+
+
+@router.get("/campaigns", response_class=HTMLResponse)
+async def ops_campaigns_list(request: Request) -> str:
+    company_id_str = request.query_params.get("company_id", "")
+    mode_filter = request.query_params.get("mode", "")
+    status_filter = request.query_params.get("status", "")
+    limit_str = request.query_params.get("limit", "50")
+    try:
+        limit = max(1, min(int(limit_str), 500))
+    except ValueError:
+        limit = 50
+
+    tz = _local_tz()
+
+    async with SessionLocal() as session:
+        conditions: list[Any] = []
+        if company_id_str:
+            try:
+                conditions.append(CampaignRun.company_ids.contains([int(company_id_str)]))
+            except ValueError:
+                pass
+        if mode_filter:
+            conditions.append(CampaignRun.mode == mode_filter)
+        if status_filter:
+            conditions.append(CampaignRun.status == status_filter)
+
+        stmt = select(CampaignRun).where(*conditions).order_by(CampaignRun.created_at.desc()).limit(limit)
+        runs = (await session.execute(stmt)).scalars().all()
+
+        total_stmt = select(func.count()).select_from(CampaignRun).where(*conditions)
+        total: int = (await session.scalar(total_stmt)) or 0
+
+    filter_form = _filter_form(
+        "/ops/campaigns",
+        [
+            ("company_id", "Company ID", "text", company_id_str),
+            ("mode", "Mode", "select:preview,send-real", mode_filter),
+            ("status", "Status", "select:running,completed,failed,queued", status_filter),
+            ("limit", "Limit", "text", str(limit)),
+        ],
+    )
+
+    cols = [
+        "ID",
+        "Created",
+        "Completed",
+        "Companies",
+        "Mode",
+        "Status",
+        "Seen",
+        "Candidates",
+        "Queued",
+        "Cards",
+        "Followup",
+        "Last Error",
+        "",
+    ]
+    rows = []
+    for run in runs:
+        meta = run.meta or {}
+        last_error = meta.get("last_error", "")
+        rows.append(
+            [
+                str(run.id),
+                _esc(_fmt_dt(run.created_at, tz)),
+                _esc(_fmt_dt(run.completed_at, tz)),
+                _esc(_fmt_company_ids(run.company_ids)),
+                _campaign_mode_badge(run.mode),
+                _campaign_status_badge(run.status),
+                str(run.total_clients_seen or 0),
+                str(run.candidates_count or 0),
+                str(run.queued_count or 0),
+                str(run.cards_issued_count or 0),
+                "✓" if run.followup_enabled else "",
+                f'<span class="text-danger small">{_esc((last_error or "")[:60])}</span>',
+                f'<a href="/ops/campaigns/{run.id}" class="btn btn-sm btn-outline-primary">open</a>',
+            ]
+        )
+
+    table_html = _table(cols, rows) if rows else '<p class="text-muted">Нет рассылок по заданным фильтрам.</p>'
+
+    body = f"""
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <h4>📣 Campaign Runs</h4>
+  <div>
+    <a href="/ops/campaigns/dashboard" class="btn btn-sm btn-outline-secondary me-2">📊 Dashboard</a>
+    <span class="badge bg-secondary">{total} total</span>
+  </div>
+</div>
+{filter_form}
+{table_html}
+"""
+    return _page("Campaigns", body)
+
+
+# ---------------------------------------------------------------------------
+# /ops/campaigns/dashboard  – monthly dashboard
+# Важно: этот route ДОЛЖЕН идти ДО /campaigns/{run_id}
+# ---------------------------------------------------------------------------
+
+
+@router.get("/campaigns/dashboard", response_class=HTMLResponse)
+async def ops_campaigns_dashboard(request: Request) -> str:
+    now = datetime.now(timezone.utc)
+    year_str = request.query_params.get("year", str(now.year))
+    month_str = request.query_params.get("month", str(now.month))
+    company_ids_str = request.query_params.get("company_ids", "")
+
+    try:
+        year = int(year_str)
+    except ValueError:
+        year = now.year
+    try:
+        month = int(month_str)
+        month = max(1, min(12, month))
+    except ValueError:
+        month = now.month
+
+    cids: list[int] | None = None
+    if company_ids_str:
+        try:
+            cids = [int(x.strip()) for x in company_ids_str.split(",") if x.strip()]
+        except ValueError:
+            cids = None
+
+    async with SessionLocal() as session:
+        data = await monthly_dashboard(session, year=year, month=month, company_ids=cids)
+
+    summary = data.get("summary", {})
+    by_company = data.get("by_company", [])
+
+    filter_form = _filter_form(
+        "/ops/campaigns/dashboard",
+        [
+            ("year", "Year", "text", str(year)),
+            ("month", "Month", "text", str(month)),
+            ("company_ids", "Company IDs (comma)", "text", company_ids_str),
+        ],
+    )
+
+    metrics = _metric_cards(
+        [
+            ("Runs", summary.get("runs_count", 0), "primary"),
+            ("Seen", summary.get("total_clients_seen", 0), "secondary"),
+            ("Candidates", summary.get("candidates_count", 0), "info"),
+            ("Queued", summary.get("queued_count", 0), "secondary"),
+            ("Delivered", summary.get("delivered_count", 0), "success"),
+            ("Read", summary.get("read_count", 0), "info"),
+            ("Replied", summary.get("replied_count", 0), "success"),
+            ("Booked", summary.get("booked_after_count", 0), "success"),
+            ("Cards issued", summary.get("cards_issued_count", 0), "dark"),
+            ("Cards deleted", summary.get("cards_deleted_count", 0), "warning"),
+            ("Opt-out after", summary.get("opted_out_after_count", 0), "danger"),
+        ]
+    )
+
+    by_company_html = ""
+    if by_company:
+        bc_cols = [
+            "Company ID",
+            "Runs",
+            "Seen",
+            "Candidates",
+            "Queued",
+            "Delivered",
+            "Read",
+            "Replied",
+            "Booked",
+            "Cards issued",
+            "Opt-out after",
+        ]
+        bc_rows = []
+        for row in by_company:
+            bc_rows.append(
+                [
+                    _esc(str(row.get("company_id", ""))),
+                    str(row.get("runs_count", 0)),
+                    str(row.get("total_clients_seen", 0)),
+                    str(row.get("candidates_count", 0)),
+                    str(row.get("queued_count", 0)),
+                    str(row.get("delivered_count", 0)),
+                    str(row.get("read_count", 0)),
+                    str(row.get("replied_count", 0)),
+                    str(row.get("booked_after_count", 0)),
+                    str(row.get("cards_issued_count", 0)),
+                    str(row.get("opted_out_after_count", 0)),
+                ]
+            )
+        by_company_html = f"<h5>По филиалам</h5>{_table(bc_cols, bc_rows)}"
+    else:
+        by_company_html = '<p class="text-muted">Нет данных по филиалам.</p>'
+
+    body = f"""
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <h4>📊 Campaign Dashboard — {year}/{month:02d}</h4>
+  <a href="/ops/campaigns" class="btn btn-sm btn-outline-secondary">← Campaigns</a>
+</div>
+{filter_form}
+{metrics}
+{by_company_html}
+"""
+    return _page("Campaign Dashboard", body)
+
+
+# ---------------------------------------------------------------------------
+# /ops/campaigns/{run_id}  – детальная страница run
+# ---------------------------------------------------------------------------
+
+
+@router.get("/campaigns/{run_id}", response_class=HTMLResponse)
+async def ops_campaign_run_detail(run_id: int) -> str:
+    tz = _local_tz()
+
+    async with SessionLocal() as session:
+        run = await session.get(CampaignRun, run_id)
+        if run is None:
+            return _page(
+                "Campaign Run Not Found",
+                '<div class="alert alert-danger">Campaign run not found.</div>',
+            )
+
+        # Считаем количество получателей по статусам
+        recipient_count_stmt = (
+            select(CampaignRecipient.status, func.count(CampaignRecipient.id).label("cnt"))
+            .where(CampaignRecipient.campaign_run_id == run_id)
+            .group_by(CampaignRecipient.status)
+        )
+        recipient_rows = (await session.execute(recipient_count_stmt)).all()
+        recipients_by_status: dict[str, int] = {row.status: int(row.cnt) for row in recipient_rows}
+        recipients_total = sum(recipients_by_status.values())
+
+    meta = run.meta or {}
+    last_error = meta.get("last_error")
+
+    error_block = ""
+    if last_error:
+        error_block = f"""
+<div class="alert alert-danger">
+  <strong>Last Error:</strong> {_esc(last_error)}
+</div>
+"""
+
+    # --- Summary block ---
+    summary_block = f"""
+<div class="card mb-3">
+  <div class="card-header d-flex justify-content-between">
+    <span>Run #{run_id} {_campaign_mode_badge(run.mode)} {_campaign_status_badge(run.status)}</span>
+    <div>
+      <a href="/ops/campaigns/runs/{
+        run_id
+    }/report" class="btn btn-sm btn-outline-secondary me-1" target="_blank">JSON report</a>
+      <a href="/ops/campaigns/runs/{
+        run_id
+    }/recipients" class="btn btn-sm btn-outline-secondary me-1" target="_blank">JSON recipients</a>
+      <a href="/ops/campaigns/runs/{
+        run_id
+    }/progress" class="btn btn-sm btn-outline-secondary" target="_blank">JSON progress</a>
+    </div>
+  </div>
+  <div class="card-body">
+    <dl class="row mb-0">
+      <dt class="col-sm-3">Companies</dt>
+      <dd class="col-sm-9">{_esc(_fmt_company_ids(run.company_ids))}</dd>
+      <dt class="col-sm-3">Period</dt>
+      <dd class="col-sm-9">{_esc(_fmt_dt(run.period_start))} → {_esc(_fmt_dt(run.period_end))}</dd>
+      <dt class="col-sm-3">Created</dt>
+      <dd class="col-sm-9">{_esc(_fmt_dt(run.created_at, tz))}</dd>
+      <dt class="col-sm-3">Completed</dt>
+      <dd class="col-sm-9">{_esc(_fmt_dt(run.completed_at, tz))}</dd>
+      <dt class="col-sm-3">Location ID</dt>
+      <dd class="col-sm-9">{_esc(str(run.location_id or "—"))}</dd>
+      <dt class="col-sm-3">Card Type ID</dt>
+      <dd class="col-sm-9">{_esc(str(run.card_type_id or "—"))}</dd>
+      <dt class="col-sm-3">Attribution Window</dt>
+      <dd class="col-sm-9">{run.attribution_window_days} days</dd>
+      <dt class="col-sm-3">Source Preview Run</dt>
+      <dd class="col-sm-9">{
+        f'<a href="/ops/campaigns/{run.source_preview_run_id}">{run.source_preview_run_id}</a>'
+        if run.source_preview_run_id
+        else "—"
+    }</dd>
+    </dl>
+  </div>
+</div>
+"""
+
+    # --- Progress block ---
+    progress_block = _metric_cards(
+        [
+            ("Seen", run.total_clients_seen or 0, "secondary"),
+            ("Candidates", run.candidates_count or 0, "info"),
+            ("Queued", run.queued_count or 0, "primary"),
+        ]
+    )
+    progress_block = f"""
+<div class="card mb-3">
+  <div class="card-header">📈 Progress</div>
+  <div class="card-body">
+    {progress_block}
+  </div>
+</div>
+"""
+
+    # --- Delivery block ---
+    delivery_block = _metric_cards(
+        [
+            ("Sent", run.sent_count or 0, "success"),
+            ("Provider accepted", run.provider_accepted_count or 0, "secondary"),
+            ("Delivered", run.delivered_count or 0, "success"),
+            ("Read", run.read_count or 0, "info"),
+            ("Replied", run.replied_count or 0, "success"),
+            ("Booked after", run.booked_after_count or 0, "success"),
+            ("Opted-out after", run.opted_out_after_count or 0, "danger"),
+        ]
+    )
+    delivery_block = f"""
+<div class="card mb-3">
+  <div class="card-header">📨 Delivery</div>
+  <div class="card-body">
+    {delivery_block}
+  </div>
+</div>
+"""
+
+    # --- Loyalty block ---
+    loyalty_block = _metric_cards(
+        [
+            ("Cards issued", run.cards_issued_count or 0, "dark"),
+            ("Cards deleted", run.cards_deleted_count or 0, "warning"),
+            ("Cleanup failed", run.cleanup_failed_count or 0, "danger"),
+        ]
+    )
+    loyalty_block = f"""
+<div class="card mb-3">
+  <div class="card-header">🎁 Loyalty</div>
+  <div class="card-body">
+    {loyalty_block}
+  </div>
+</div>
+"""
+
+    # --- Excluded block ---
+    excluded_block = _metric_cards(
+        [
+            ("Opted out", run.excluded_opted_out or 0, "warning"),
+            ("No phone", run.excluded_no_phone or 0, "secondary"),
+            ("Invalid phone", run.excluded_invalid_phone or 0, "secondary"),
+            ("No WA", run.excluded_no_whatsapp or 0, "secondary"),
+            ("Multiple records", run.excluded_multiple_records or 0, "secondary"),
+            ("No confirmed record", run.excluded_no_confirmed_record or 0, "secondary"),
+            ("Has records before", run.excluded_has_records_before or 0, "secondary"),
+        ]
+    )
+    excluded_block = f"""
+<div class="card mb-3">
+  <div class="card-header">🚫 Excluded</div>
+  <div class="card-body">
+    {excluded_block}
+  </div>
+</div>
+"""
+
+    # --- Followup block ---
+    followup_block = f"""
+<div class="card mb-3">
+  <div class="card-header">🔁 Follow-up</div>
+  <div class="card-body">
+    <dl class="row mb-0">
+      <dt class="col-sm-3">Enabled</dt>
+      <dd class="col-sm-9">{"✓ Yes" if run.followup_enabled else "No"}</dd>
+      <dt class="col-sm-3">Delay</dt>
+      <dd class="col-sm-9">{_esc(str(run.followup_delay_days) + " days" if run.followup_delay_days else "—")}</dd>
+      <dt class="col-sm-3">Policy</dt>
+      <dd class="col-sm-9">{_esc(run.followup_policy or "—")}</dd>
+      <dt class="col-sm-3">Template</dt>
+      <dd class="col-sm-9">{_esc(run.followup_template_name or "—")}</dd>
+    </dl>
+  </div>
+</div>
+"""
+
+    # --- Auto-followup block ---
+    followup_auto_keys = (
+        "followup_auto_status",
+        "followup_auto_started_at",
+        "followup_auto_completed_at",
+        "followup_auto_last_error",
+        "followup_auto_planned_count",
+        "followup_auto_queued_count",
+        "followup_auto_skipped_count",
+        "followup_auto_failed_count",
+        "followup_auto_recovered",
+        "followup_auto_recovered_at",
+    )
+    has_auto_followup = any(k in meta for k in followup_auto_keys)
+    auto_followup_block = ""
+    if has_auto_followup:
+        fa_status = meta.get("followup_auto_status", "")
+        fa_error = meta.get("followup_auto_last_error", "")
+        fa_error_html = f'<span class="text-danger">{_esc(fa_error)}</span>' if fa_error else "—"
+        auto_followup_block = f"""
+<div class="card mb-3">
+  <div class="card-header">⚙️ Auto Follow-up</div>
+  <div class="card-body">
+    <dl class="row mb-0">
+      <dt class="col-sm-3">Status</dt>
+      <dd class="col-sm-9">{_campaign_status_badge(fa_status) or _esc(fa_status)}</dd>
+      <dt class="col-sm-3">Started</dt>
+      <dd class="col-sm-9">{_esc(str(meta.get("followup_auto_started_at") or "—"))}</dd>
+      <dt class="col-sm-3">Completed</dt>
+      <dd class="col-sm-9">{_esc(str(meta.get("followup_auto_completed_at") or "—"))}</dd>
+      <dt class="col-sm-3">Planned / Queued / Skipped / Failed</dt>
+      <dd class="col-sm-9">
+        {meta.get("followup_auto_planned_count", 0)} /
+        {meta.get("followup_auto_queued_count", 0)} /
+        {meta.get("followup_auto_skipped_count", 0)} /
+        {meta.get("followup_auto_failed_count", 0)}
+      </dd>
+      <dt class="col-sm-3">Last Error</dt>
+      <dd class="col-sm-9">{fa_error_html}</dd>
+      <dt class="col-sm-3">Recovered</dt>
+      <dd class="col-sm-9">{_esc(str(meta.get("followup_auto_recovered") or "No"))}</dd>
+    </dl>
+  </div>
+</div>
+"""
+
+    # --- Recipients summary block ---
+    recip_rows = []
+    for st, cnt in sorted(recipients_by_status.items()):
+        recip_rows.append([_status_badge(st), str(cnt)])
+    recipients_summary = f"""
+<div class="card mb-3">
+  <div class="card-header d-flex justify-content-between">
+    <span>👥 Recipients ({recipients_total} total)</span>
+    <a href="/ops/campaigns/{run_id}/recipients" class="btn btn-sm btn-outline-primary">View all</a>
+  </div>
+  <div class="card-body">
+    {_table(["Status", "Count"], recip_rows) if recip_rows else '<p class="text-muted">Нет получателей.</p>'}
+  </div>
+</div>
+"""
+
+    body = f"""
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <h4>📣 Campaign Run #{run_id}</h4>
+  <a href="/ops/campaigns" class="btn btn-sm btn-outline-secondary">← Back</a>
+</div>
+{error_block}
+{summary_block}
+{progress_block}
+{delivery_block}
+{loyalty_block}
+{excluded_block}
+{followup_block}
+{auto_followup_block}
+{recipients_summary}
+"""
+    return _page(f"Campaign Run {run_id}", body)
+
+
+# ---------------------------------------------------------------------------
+# /ops/campaigns/{run_id}/recipients  – таблица получателей
+# ---------------------------------------------------------------------------
+
+
+@router.get("/campaigns/{run_id}/recipients", response_class=HTMLResponse)
+async def ops_campaign_recipients(request: Request, run_id: int) -> str:
+    tz = _local_tz()
+    status_filter = request.query_params.get("status", "")
+    excluded_reason_filter = request.query_params.get("excluded_reason", "")
+    limit_str = request.query_params.get("limit", "100")
+    try:
+        limit = max(1, min(int(limit_str), 1000))
+    except ValueError:
+        limit = 100
+
+    async with SessionLocal() as session:
+        run = await session.get(CampaignRun, run_id)
+        if run is None:
+            return _page(
+                "Not Found",
+                '<div class="alert alert-danger">Campaign run not found.</div>',
+            )
+
+        conditions: list[Any] = [CampaignRecipient.campaign_run_id == run_id]
+        if status_filter:
+            conditions.append(CampaignRecipient.status == status_filter)
+        if excluded_reason_filter:
+            conditions.append(CampaignRecipient.excluded_reason == excluded_reason_filter)
+
+        total_stmt = select(func.count()).select_from(CampaignRecipient).where(*conditions)
+        total: int = (await session.scalar(total_stmt)) or 0
+
+        stmt = select(CampaignRecipient).where(*conditions).order_by(CampaignRecipient.id.asc()).limit(limit)
+        recipients = (await session.execute(stmt)).scalars().all()
+
+    filter_form = _filter_form(
+        f"/ops/campaigns/{run_id}/recipients",
+        [
+            (
+                "status",
+                "Status",
+                "select:candidate,card_issued,skipped,queued,cleanup_failed",
+                status_filter,
+            ),
+            ("excluded_reason", "Excluded Reason", "text", excluded_reason_filter),
+            ("limit", "Limit", "text", str(limit)),
+        ],
+    )
+
+    cols = [
+        "ID",
+        "Client ID",
+        "Name",
+        "Phone",
+        "Status",
+        "Excluded Reason",
+        "Card #",
+        "Msg Job ID",
+        "Sent",
+        "Read",
+        "Replied",
+        "Booked",
+        "Followup",
+    ]
+    rows = []
+    for r in recipients:
+        rows.append(
+            [
+                str(r.id),
+                str(r.client_id or ""),
+                _esc(r.display_name or ""),
+                _esc(r.phone_e164 or ""),
+                _status_badge(r.status),
+                _esc(r.excluded_reason or ""),
+                _esc(r.loyalty_card_number or ""),
+                str(r.message_job_id or ""),
+                _esc(_fmt_dt(r.sent_at, tz)),
+                _esc(_fmt_dt(r.read_at, tz)),
+                _esc(_fmt_dt(r.replied_at, tz)),
+                _esc(_fmt_dt(r.booked_after_at, tz)),
+                _esc(r.followup_status or ""),
+            ]
+        )
+
+    table_html = _table(cols, rows) if rows else '<p class="text-muted">Нет получателей по заданным фильтрам.</p>'
+
+    body = f"""
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <h4>👥 Recipients — Run #{run_id}</h4>
+  <div>
+    <a href="/ops/campaigns/{run_id}" class="btn btn-sm btn-outline-secondary me-2">← Run detail</a>
+    <span class="badge bg-secondary">{total} total</span>
+  </div>
+</div>
+{filter_form}
+{table_html}
+"""
+    return _page(f"Recipients — Run {run_id}", body)
 
 
 # ---------------------------------------------------------------------------
