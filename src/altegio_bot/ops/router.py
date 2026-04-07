@@ -2808,6 +2808,9 @@ _NC_META_TEMPLATE = "kitilash_ka_newsletter_new_clients_monthly_v2"
 _NC_TEMPLATE_LANGUAGE = "de"
 _NC_TEMPLATE_PARAMS = ["{{1}} — имя клиента", "{{2}} — ссылка для записи", "{{3}} — текст карты лояльности"]
 
+# Маппинг location_id → человекочитаемое название филиала
+LOCATIONS: dict[int, str] = {758285: "Karlsruhe", 1271200: "Rastatt"}
+
 
 @router.get("/campaigns/new-clients", response_class=HTMLResponse)
 async def ops_new_clients_campaign_page(request: Request) -> str:
@@ -2826,6 +2829,11 @@ async def ops_new_clients_campaign_page(request: Request) -> str:
 
     # JavaScript-маппинг company_id → location_id (по умолчанию совпадает)
     company_location_js = json.dumps({str(cid): cid for cid in COMPANIES})
+
+    # Location options для select (human-readable)
+    location_options_html = "".join(
+        f'<option value="{lid}">{_esc(lname)} (location_id={lid})</option>' for lid, lname in LOCATIONS.items()
+    )
 
     # Параметры шаблона
     template_params_html = "".join(f"<li><code>{_esc(p)}</code></li>" for p in _NC_TEMPLATE_PARAMS)
@@ -2850,9 +2858,11 @@ async def ops_new_clients_campaign_page(request: Request) -> str:
       </div>
 
       <div class="col-md-4">
-        <label class="form-label">Location ID <span class="text-muted small">(Altegio salon ID)</span></label>
-        <input type="number" id="f-location" class="form-control" value="">
-        <div class="form-text">По умолчанию равен company_id. Измените при необходимости.</div>
+        <label class="form-label">Филиал (Location)</label>
+        <select id="f-location" class="form-select">
+          {location_options_html}
+        </select>
+        <div class="form-text">Филиал Altegio. Синхронизируется с компанией.</div>
       </div>
 
       <div class="col-md-4">
@@ -2885,6 +2895,39 @@ async def ops_new_clients_campaign_page(request: Request) -> str:
       </div>
 
     </div>
+
+    <!-- ========== FOLLOW-UP НАСТРОЙКИ ========== -->
+    <hr class="my-3">
+    <h6 class="fw-bold">📩 Follow-up настройки</h6>
+    <div class="row g-3">
+
+      <div class="col-md-3">
+        <div class="form-check mt-2">
+          <input type="checkbox" id="f-followup-enabled" class="form-check-input">
+          <label class="form-check-label" for="f-followup-enabled">Follow-up включён</label>
+        </div>
+      </div>
+
+      <div class="col-md-3">
+        <label class="form-label">Задержка (дней)</label>
+        <input type="number" id="f-followup-delay" class="form-control" value="3" min="1" max="90" disabled>
+      </div>
+
+      <div class="col-md-3">
+        <label class="form-label">Политика</label>
+        <select id="f-followup-policy" class="form-select" disabled>
+          <option value="unread_only">unread_only</option>
+          <option value="unread_or_not_booked">unread_or_not_booked</option>
+        </select>
+      </div>
+
+      <div class="col-md-3">
+        <label class="form-label">Шаблон follow-up</label>
+        <input type="text" id="f-followup-template" class="form-control"
+               placeholder="Имя Meta-шаблона" disabled>
+      </div>
+
+    </div>
   </div>
 </div>
 
@@ -2892,7 +2935,7 @@ async def ops_new_clients_campaign_page(request: Request) -> str:
 <div class="card mb-3">
   <div class="card-header fw-bold">📄 Текст рассылки (Meta WhatsApp — только для просмотра)</div>
   <div class="card-body">
-    <dl class="row mb-0">
+    <dl class="row mb-2">
       <dt class="col-sm-3">Meta-шаблон</dt>
       <dd class="col-sm-9"><code>{_esc(_NC_META_TEMPLATE)}</code></dd>
       <dt class="col-sm-3">Язык</dt>
@@ -2905,14 +2948,11 @@ async def ops_new_clients_campaign_page(request: Request) -> str:
           {template_params_html}
         </ul>
       </dd>
-      <dt class="col-sm-3">Что уходит клиенту</dt>
-      <dd class="col-sm-9 text-muted">
-        Персонализированное WhatsApp-сообщение с именем клиента,
-        ссылкой на запись и номером карты лояльности (Kundenkarte).
-        Шаблон зарегистрирован в Meta WABA и утверждён как маркетинговый.
-        <br><small class="text-muted">Редактировать шаблон можно только в Meta Business Manager.</small>
-      </dd>
     </dl>
+    <!-- Реальный текст шаблона (загружается из БД через AJAX) -->
+    <div id="template-text-block">
+      <div class="text-muted small">⏳ Загрузка текста шаблона из БД…</div>
+    </div>
   </div>
 </div>
 
@@ -2935,7 +2975,8 @@ async def ops_new_clients_campaign_page(request: Request) -> str:
     </div>
     <div class="card-body">
       <div id="preview-metrics" class="row g-2 mb-3"></div>
-      <div id="preview-excluded" class="row g-2 mb-0"></div>
+      <!-- Excluded breakdown -->
+      <div id="excluded-breakdown" class="mb-0"></div>
     </div>
   </div>
 
@@ -3001,12 +3042,13 @@ let progressInterval = null;
 // ============================================================
 document.addEventListener("DOMContentLoaded", function () {{
   const companySelect = document.getElementById("f-company");
-  const locationInput = document.getElementById("f-location");
+  const locationSelect = document.getElementById("f-location");
 
   // Установить location_id по умолчанию из company_id
   function syncLocation() {{
     const cid = companySelect.value;
-    locationInput.value = COMPANY_LOCATION[cid] || cid;
+    const lid = COMPANY_LOCATION[cid] || cid;
+    locationSelect.value = String(lid);
   }}
   companySelect.addEventListener("change", function () {{
     syncLocation();
@@ -3017,10 +3059,57 @@ document.addEventListener("DOMContentLoaded", function () {{
   }});
   syncLocation();
 
+  // Follow-up toggle
+  const fuCheckbox = document.getElementById("f-followup-enabled");
+  fuCheckbox.addEventListener("change", function () {{
+    const enabled = fuCheckbox.checked;
+    document.getElementById("f-followup-delay").disabled = !enabled;
+    document.getElementById("f-followup-policy").disabled = !enabled;
+    document.getElementById("f-followup-template").disabled = !enabled;
+  }});
+
   document.getElementById("btn-load-cards").addEventListener("click", loadCardTypes);
   document.getElementById("btn-preview").addEventListener("click", createPreview);
   document.getElementById("btn-run").addEventListener("click", runCampaign);
+
+  // Загрузить текст шаблона из БД
+  loadTemplateText();
 }});
+
+// ============================================================
+// Загрузка текста Meta-шаблона из БД
+// ============================================================
+async function loadTemplateText() {{
+  const block = document.getElementById("template-text-block");
+  const templateName = "{_esc(_NC_META_TEMPLATE)}";
+  try {{
+    const resp = await fetch(
+      "/ops/campaigns/new-clients/template-text?template_name=" + encodeURIComponent(templateName)
+    );
+    if (!resp.ok) {{
+      block.innerHTML =
+        '<div class="alert alert-warning mb-0">' +
+        '<strong>⚠️ Не удалось загрузить текст шаблона из Meta</strong><br>' +
+        '<small>Шаблон <code>' + escHtml(templateName) + '</code> не найден в локальной БД. ' +
+        'Запустите <code>sync_meta_templates.py</code> для синхронизации.</small></div>';
+      return;
+    }}
+    const data = await resp.json();
+    const bodyText = data.body || "(пусто)";
+    block.innerHTML =
+      '<div class="border rounded p-3 bg-light">' +
+      '<div class="mb-2"><strong>📝 Текст шаблона</strong>' +
+      (data.language ? ' <span class="badge bg-secondary">' + escHtml(data.language) + '</span>' : '') +
+      '</div>' +
+      '<pre class="mb-0" style="white-space:pre-wrap;font-size:0.9em;">' +
+      escHtml(bodyText) + '</pre></div>';
+  }} catch (e) {{
+    block.innerHTML =
+      '<div class="alert alert-warning mb-0">' +
+      '<strong>⚠️ Не удалось загрузить текст шаблона из Meta</strong><br>' +
+      '<small>Ошибка сети: ' + escHtml(e.message) + '</small></div>';
+  }}
+}}
 
 // ============================================================
 // Загрузка типов карт
@@ -3028,7 +3117,7 @@ document.addEventListener("DOMContentLoaded", function () {{
 async function loadCardTypes() {{
   const locationId = document.getElementById("f-location").value.trim();
   if (!locationId) {{
-    alert("Введите Location ID перед загрузкой типов карт.");
+    alert("Выберите филиал перед загрузкой типов карт.");
     return;
   }}
   const statusEl = document.getElementById("card-load-status");
@@ -3118,6 +3207,28 @@ function renderPreviewSummary(data) {{
       '<div class="small text-muted">' + escHtml(m[0]) + '</div>' +
       '</div></div></div>';
   }}).join("");
+
+  // Excluded breakdown
+  const exc = data.excluded || {{}};
+  const reasons = [
+    ["opted_out", "Opted out (отписались)"],
+    ["no_phone", "Нет телефона"],
+    ["invalid_phone", "Невалидный телефон"],
+    ["no_whatsapp", "Нет WhatsApp"],
+    ["multiple_records_in_period", "Несколько записей в периоде"],
+    ["no_confirmed_record_in_period", "Нет подтв. записи в периоде"],
+    ["has_records_before_period", "Есть записи до периода"],
+  ];
+  let breakdownHtml = '<h6 class="fw-bold mt-2">🔍 Причины исключения (breakdown)</h6>';
+  breakdownHtml += '<table class="table table-sm table-bordered mb-0" style="max-width:500px">';
+  breakdownHtml += '<thead class="table-light"><tr><th>Причина</th>';
+  breakdownHtml += '<th class="text-end">Кол-во</th></tr></thead><tbody>';
+  reasons.forEach(function(r) {{
+    const val = exc[r[0]] != null ? exc[r[0]] : 0;
+    breakdownHtml += '<tr><td>' + escHtml(r[1]) + '</td><td class="text-end">' + val + '</td></tr>';
+  }});
+  breakdownHtml += '</tbody></table>';
+  document.getElementById("excluded-breakdown").innerHTML = breakdownHtml;
 
   // Ссылки
   const btnCls = "btn btn-sm btn-outline-secondary";
@@ -3315,9 +3426,15 @@ function buildPayload() {{
     return null;
   }}
   if (!locationId || isNaN(locationId)) {{
-    alert("Укажите Location ID.");
+    alert("Выберите филиал.");
     return null;
   }}
+
+  // Follow-up настройки
+  const followupEnabled = document.getElementById("f-followup-enabled").checked;
+  const followupDelay = parseInt(document.getElementById("f-followup-delay").value, 10) || null;
+  const followupPolicy = document.getElementById("f-followup-policy").value || null;
+  const followupTemplate = document.getElementById("f-followup-template").value.trim() || null;
 
   // period_end — конец дня (включительно)
   return {{
@@ -3327,6 +3444,10 @@ function buildPayload() {{
     period_start: periodStartDate + "T00:00:00Z",
     period_end: periodEndDate + "T23:59:59Z",
     attribution_window_days: attribution,
+    followup_enabled: followupEnabled,
+    followup_delay_days: followupEnabled ? followupDelay : null,
+    followup_policy: followupEnabled ? followupPolicy : null,
+    followup_template_name: followupEnabled ? followupTemplate : null,
   }};
 }}
 

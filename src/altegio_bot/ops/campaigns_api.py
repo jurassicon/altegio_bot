@@ -41,7 +41,7 @@ from altegio_bot.campaigns.runner import (
     run_preview,
 )
 from altegio_bot.db import SessionLocal
-from altegio_bot.models.models import CampaignRecipient, CampaignRun, MessageJob
+from altegio_bot.models.models import CampaignRecipient, CampaignRun, MessageJob, MessageTemplate
 from altegio_bot.ops.auth import require_ops_auth
 
 logger = logging.getLogger(__name__)
@@ -197,6 +197,53 @@ async def get_card_types_for_location(
         raise HTTPException(status_code=502, detail=f"Altegio API error: {exc}")
     finally:
         await client.aclose()
+
+
+# ==========================================================================
+# Текст Meta-шаблона из БД
+# ==========================================================================
+
+
+@router.get("/new-clients/template-text")
+async def get_template_text(
+    template_name: str = Query(..., description="Meta template name"),
+) -> dict[str, Any]:
+    """Загрузить текст шаблона из локальной БД (message_templates).
+
+    Шаблоны синхронизируются из Meta через sync_meta_templates.py.
+    Возвращает body, language и метаданные; если шаблон не найден — 404.
+    """
+    async with SessionLocal() as session:
+        stmt = select(MessageTemplate).where(MessageTemplate.is_active.is_(True)).order_by(MessageTemplate.id.desc())
+        rows = (await session.execute(stmt)).scalars().all()
+
+    # Ищем по точному совпадению code или по вхождению имени
+    # (sync_meta_templates.py нормализует name → code без префикса/версии)
+    match = None
+    for row in rows:
+        # Прямое совпадение по code (например "newsletter_new_clients_monthly")
+        if row.code and template_name.endswith(row.code):
+            match = row
+            break
+        # Или полное имя шаблона совпадает с началом кода
+        if row.code and row.code in template_name:
+            match = row
+            break
+
+    if match is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Шаблон '{template_name}' не найден в локальной БД",
+        )
+
+    return {
+        "template_name": template_name,
+        "code": match.code,
+        "language": match.language,
+        "body": match.body,
+        "company_id": match.company_id,
+        "is_active": match.is_active,
+    }
 
 
 # ==========================================================================
@@ -686,6 +733,15 @@ def _run_summary(run: CampaignRun) -> dict[str, Any]:
         "last_error": _last_error(run),
         "created_at": _iso(run.created_at),
         "completed_at": _iso(run.completed_at),
+        "excluded": {
+            "opted_out": run.excluded_opted_out or 0,
+            "no_phone": run.excluded_no_phone or 0,
+            "invalid_phone": run.excluded_invalid_phone or 0,
+            "no_whatsapp": run.excluded_no_whatsapp or 0,
+            "multiple_records_in_period": run.excluded_multiple_records or 0,
+            "no_confirmed_record_in_period": run.excluded_no_confirmed_record or 0,
+            "has_records_before_period": run.excluded_has_records_before or 0,
+        },
     }
 
 

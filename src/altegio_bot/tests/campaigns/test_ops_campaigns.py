@@ -9,6 +9,7 @@ import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 
+import altegio_bot.ops.campaigns_api as campaigns_api_module
 import altegio_bot.ops.router as ops_router_module
 from altegio_bot.main import app
 from altegio_bot.models.models import CampaignRecipient, CampaignRun
@@ -18,6 +19,7 @@ from altegio_bot.ops.auth import require_ops_auth
 @pytest_asyncio.fixture
 async def http_client(session_maker, monkeypatch) -> AsyncGenerator[AsyncClient, None]:
     monkeypatch.setattr(ops_router_module, "SessionLocal", session_maker)
+    monkeypatch.setattr(campaigns_api_module, "SessionLocal", session_maker)
     monkeypatch.setitem(app.dependency_overrides, require_ops_auth, lambda: None)
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         yield client
@@ -407,3 +409,135 @@ async def test_card_types_endpoint_requires_location_id(
     """Endpoint возвращает 422, если location_id не передан."""
     response = await http_client.get("/ops/campaigns/new-clients/card-types")
     assert response.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# Follow-up поля на странице
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_ops_new_clients_page_has_followup_fields(http_client: AsyncClient) -> None:
+    """На странице есть follow-up поля: checkbox, delay, policy, template."""
+    response = await http_client.get("/ops/campaigns/new-clients")
+    assert response.status_code == 200
+    text = response.text
+    assert "f-followup-enabled" in text
+    assert "f-followup-delay" in text
+    assert "f-followup-policy" in text
+    assert "f-followup-template" in text
+    # Follow-up включён checkbox
+    assert "Follow-up включён" in text
+
+
+@pytest.mark.asyncio
+async def test_ops_new_clients_buildpayload_contains_followup(http_client: AsyncClient) -> None:
+    """buildPayload() в JS содержит followup_enabled, followup_delay_days, followup_policy, followup_template_name."""
+    response = await http_client.get("/ops/campaigns/new-clients")
+    assert response.status_code == 200
+    text = response.text
+    assert "followup_enabled" in text
+    assert "followup_delay_days" in text
+    assert "followup_policy" in text
+    assert "followup_template_name" in text
+
+
+# ---------------------------------------------------------------------------
+# Location — human-readable select
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_ops_new_clients_page_has_location_select(http_client: AsyncClient) -> None:
+    """Location теперь human-readable select, а не numeric input."""
+    response = await http_client.get("/ops/campaigns/new-clients")
+    assert response.status_code == 200
+    text = response.text
+    # Это select, а не input type=number
+    assert 'id="f-location"' in text
+    assert "form-select" in text.split('id="f-location"')[1][:200]
+    # Human-readable названия филиалов
+    assert "Karlsruhe (location_id=758285)" in text
+    assert "Rastatt (location_id=1271200)" in text
+
+
+# ---------------------------------------------------------------------------
+# Template text блок (с AJAX загрузкой)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_ops_new_clients_page_has_template_text_block(http_client: AsyncClient) -> None:
+    """На странице есть блок для загрузки реального текста шаблона из БД."""
+    response = await http_client.get("/ops/campaigns/new-clients")
+    assert response.status_code == 200
+    text = response.text
+    assert "template-text-block" in text
+    assert "loadTemplateText" in text
+    # Должен быть fallback alert текст в JS
+    assert "Не удалось загрузить текст шаблона из Meta" in text
+
+
+@pytest.mark.asyncio
+async def test_template_text_endpoint_returns_data(
+    http_client: AsyncClient,
+    session_maker,
+) -> None:
+    """Endpoint /template-text возвращает данные шаблона из БД."""
+    from altegio_bot.models.models import MessageTemplate
+
+    async with session_maker() as session:
+        async with session.begin():
+            tpl = MessageTemplate(
+                company_id=758285,
+                code="newsletter_new_clients_monthly",
+                language="de",
+                body="Hallo {{1}}, buche jetzt: {{2}}. Deine Karte: {{3}}",
+                is_active=True,
+            )
+            session.add(tpl)
+
+    response = await http_client.get(
+        "/ops/campaigns/new-clients/template-text?template_name=kitilash_ka_newsletter_new_clients_monthly_v2"
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["language"] == "de"
+    assert "Hallo" in data["body"]
+    assert data["code"] == "newsletter_new_clients_monthly"
+
+
+@pytest.mark.asyncio
+async def test_template_text_endpoint_returns_404_if_not_found(
+    http_client: AsyncClient,
+) -> None:
+    """Endpoint /template-text возвращает 404 если шаблон не найден."""
+    response = await http_client.get("/ops/campaigns/new-clients/template-text?template_name=nonexistent_template")
+    assert response.status_code == 404
+    data = response.json()
+    assert "не найден" in data["detail"]
+
+
+# ---------------------------------------------------------------------------
+# Excluded breakdown после preview
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_ops_new_clients_page_has_excluded_breakdown_section(
+    http_client: AsyncClient,
+) -> None:
+    """На странице есть секция excluded breakdown после preview."""
+    response = await http_client.get("/ops/campaigns/new-clients")
+    assert response.status_code == 200
+    text = response.text
+    assert "excluded-breakdown" in text
+    # JS содержит рендеринг excluded reasons
+    assert "opted_out" in text
+    assert "no_phone" in text
+    assert "invalid_phone" in text
+    assert "no_whatsapp" in text
+    assert "multiple_records_in_period" in text
+    assert "no_confirmed_record_in_period" in text
+    assert "has_records_before_period" in text
+    assert "Причины исключения" in text
