@@ -172,7 +172,7 @@ def upgrade() -> None:
         sa.Column(
             'cleanup_card_ids',
             postgresql.JSONB(astext_type=sa.Text()),
-            server_default="'[]'::jsonb",
+            server_default=sa.text("'[]'::jsonb"),
             nullable=False,
         ),
     )
