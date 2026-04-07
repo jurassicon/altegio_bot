@@ -4,6 +4,7 @@
 что и в ops/router.py).
 
 Endpoint'ы:
+  GET  /ops/campaigns/new-clients/card-types
   POST /ops/campaigns/new-clients/preview
   POST /ops/campaigns/new-clients/run
   GET  /ops/campaigns/runs
@@ -28,6 +29,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from altegio_bot.altegio_loyalty import AltegioLoyaltyClient
 from altegio_bot.campaigns.followup import execute_followup, followup_run_at, plan_followup
 from altegio_bot.campaigns.reports import monthly_dashboard, run_report
 from altegio_bot.campaigns.runner import (
@@ -170,6 +172,31 @@ async def create_run(body: RunRequest) -> dict[str, Any]:
     result["accepted"] = True
     result["message"] = "Campaign run accepted and queued"
     return result
+
+
+# ==========================================================================
+# Справочник типов карт лояльности
+# ==========================================================================
+
+
+@router.get("/new-clients/card-types")
+async def get_card_types_for_location(
+    location_id: int = Query(..., description="Altegio salon/location ID"),
+) -> list[dict[str, Any]]:
+    """Возвращает список типов карт лояльности для заданного location_id.
+
+    Используется HTML-страницей запуска кампании для динамической
+    подгрузки типов карт через AJAX.
+    """
+    client = AltegioLoyaltyClient()
+    try:
+        card_types = await client.get_card_types(location_id)
+        return card_types
+    except Exception as exc:
+        logger.exception("get_card_types failed for location_id=%d: %s", location_id, exc)
+        raise HTTPException(status_code=502, detail=f"Altegio API error: {exc}")
+    finally:
+        await client.aclose()
 
 
 # ==========================================================================

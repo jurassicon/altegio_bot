@@ -2678,6 +2678,7 @@ async def ops_campaigns_list(request: Request) -> str:
 <div class="d-flex justify-content-between align-items-center mb-3">
   <h4>📣 Campaign Runs</h4>
   <div>
+    <a href="/ops/campaigns/new-clients" class="btn btn-sm btn-success me-2">🚀 New Clients Campaign</a>
     <a href="/ops/campaigns/dashboard" class="btn btn-sm btn-outline-secondary me-2">📊 Dashboard</a>
     <span class="badge bg-secondary">{total} total</span>
   </div>
@@ -2795,6 +2796,557 @@ async def ops_campaigns_dashboard(request: Request) -> str:
 {by_company_html}
 """
     return _page("Campaign Dashboard", body)
+
+
+# ---------------------------------------------------------------------------
+# /ops/campaigns/new-clients  – страница запуска кампании новых клиентов
+# Важно: этот route ДОЛЖЕН идти ДО /campaigns/{run_id}
+# ---------------------------------------------------------------------------
+
+# Данные о Meta-шаблоне кампании (только для отображения)
+_NC_META_TEMPLATE = "kitilash_ka_newsletter_new_clients_monthly_v2"
+_NC_TEMPLATE_LANGUAGE = "de"
+_NC_TEMPLATE_PARAMS = ["{{1}} — имя клиента", "{{2}} — ссылка для записи", "{{3}} — текст карты лояльности"]
+
+
+@router.get("/campaigns/new-clients", response_class=HTMLResponse)
+async def ops_new_clients_campaign_page(request: Request) -> str:
+    """Страница запуска кампании новых клиентов из браузера."""
+    now = datetime.now(timezone.utc)
+
+    # Период по умолчанию — прошлый календарный месяц
+    first_of_this_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    last_day_prev = first_of_this_month - timedelta(days=1)
+    first_of_prev = last_day_prev.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    default_period_start = first_of_prev.strftime("%Y-%m-%d")
+    default_period_end = last_day_prev.strftime("%Y-%m-%d")
+
+    # Компании для выбора
+    company_options = "".join(f'<option value="{cid}">{_esc(name)}</option>' for cid, name in COMPANIES.items())
+
+    # JavaScript-маппинг company_id → location_id (по умолчанию совпадает)
+    company_location_js = json.dumps({str(cid): cid for cid in COMPANIES})
+
+    # Параметры шаблона
+    template_params_html = "".join(f"<li><code>{_esc(p)}</code></li>" for p in _NC_TEMPLATE_PARAMS)
+
+    body = f"""
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <h4>🚀 New Clients Campaign</h4>
+  <a href="/ops/campaigns" class="btn btn-sm btn-outline-secondary">← Campaign Runs</a>
+</div>
+
+<!-- ========== ФОРМА ========== -->
+<div class="card mb-3">
+  <div class="card-header fw-bold">⚙️ Параметры кампании</div>
+  <div class="card-body">
+    <div class="row g-3">
+
+      <div class="col-md-4">
+        <label class="form-label">Компания</label>
+        <select id="f-company" class="form-select">
+          {company_options}
+        </select>
+      </div>
+
+      <div class="col-md-4">
+        <label class="form-label">Location ID <span class="text-muted small">(Altegio salon ID)</span></label>
+        <input type="number" id="f-location" class="form-control" value="">
+        <div class="form-text">По умолчанию равен company_id. Измените при необходимости.</div>
+      </div>
+
+      <div class="col-md-4">
+        <label class="form-label">Тип карты лояльности</label>
+        <div class="input-group">
+          <select id="f-card-type" class="form-select">
+            <option value="">— загрузите типы карт →</option>
+          </select>
+          <button id="btn-load-cards" class="btn btn-outline-secondary btn-sm" type="button"
+                  title="Загрузить типы карт из Altegio">
+            🔄 Загрузить
+          </button>
+        </div>
+        <div id="card-load-status" class="form-text"></div>
+      </div>
+
+      <div class="col-md-4">
+        <label class="form-label">Период с (включительно)</label>
+        <input type="date" id="f-period-start" class="form-control" value="{_esc(default_period_start)}">
+      </div>
+
+      <div class="col-md-4">
+        <label class="form-label">Период по (включительно)</label>
+        <input type="date" id="f-period-end" class="form-control" value="{_esc(default_period_end)}">
+      </div>
+
+      <div class="col-md-4">
+        <label class="form-label">Attribution window (дней)</label>
+        <input type="number" id="f-attribution" class="form-control" value="30" min="1" max="365">
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<!-- ========== БЛОК ШАБЛОНА ========== -->
+<div class="card mb-3">
+  <div class="card-header fw-bold">📄 Текст рассылки (Meta WhatsApp — только для просмотра)</div>
+  <div class="card-body">
+    <dl class="row mb-0">
+      <dt class="col-sm-3">Meta-шаблон</dt>
+      <dd class="col-sm-9"><code>{_esc(_NC_META_TEMPLATE)}</code></dd>
+      <dt class="col-sm-3">Язык</dt>
+      <dd class="col-sm-9"><strong>{_esc(_NC_TEMPLATE_LANGUAGE)}</strong> (немецкий)</dd>
+      <dt class="col-sm-3">Job type</dt>
+      <dd class="col-sm-9"><code>newsletter_new_clients_monthly</code></dd>
+      <dt class="col-sm-3">Переменные</dt>
+      <dd class="col-sm-9">
+        <ul class="mb-0 ps-3">
+          {template_params_html}
+        </ul>
+      </dd>
+      <dt class="col-sm-3">Что уходит клиенту</dt>
+      <dd class="col-sm-9 text-muted">
+        Персонализированное WhatsApp-сообщение с именем клиента,
+        ссылкой на запись и номером карты лояльности (Kundenkarte).
+        Шаблон зарегистрирован в Meta WABA и утверждён как маркетинговый.
+        <br><small class="text-muted">Редактировать шаблон можно только в Meta Business Manager.</small>
+      </dd>
+    </dl>
+  </div>
+</div>
+
+<!-- ========== КНОПКА PREVIEW ========== -->
+<div class="mb-3">
+  <button id="btn-preview" class="btn btn-primary">
+    🔍 Create Preview
+  </button>
+  <span id="preview-spinner" class="ms-2 text-muted d-none">Выполняется сегментация…</span>
+</div>
+<div id="preview-alert" class="mb-3"></div>
+
+<!-- ========== РЕЗУЛЬТАТЫ PREVIEW ========== -->
+<div id="preview-results" class="d-none">
+
+  <div class="card mb-3">
+    <div class="card-header fw-bold d-flex justify-content-between">
+      <span>📊 Preview — результаты сегментации</span>
+      <div id="preview-links"></div>
+    </div>
+    <div class="card-body">
+      <div id="preview-metrics" class="row g-2 mb-3"></div>
+      <div id="preview-excluded" class="row g-2 mb-0"></div>
+    </div>
+  </div>
+
+  <!-- Recipients table -->
+  <div class="card mb-3">
+    <div class="card-header d-flex justify-content-between align-items-center">
+      <span>👥 Получатели preview</span>
+      <div class="btn-group btn-group-sm" role="group">
+        <button id="btn-eligible" class="btn btn-primary" onclick="loadRecipients(true)">
+          ✅ Только eligible
+        </button>
+        <button id="btn-all-recip" class="btn btn-outline-secondary" onclick="loadRecipients(false)">
+          📋 Все записи
+        </button>
+      </div>
+    </div>
+    <div class="card-body p-0">
+      <div id="recipients-loading" class="text-muted p-3 d-none">Загрузка…</div>
+      <div id="recipients-table"></div>
+    </div>
+  </div>
+
+  <!-- RUN кнопка -->
+  <div class="mb-3">
+    <button id="btn-run" class="btn btn-success btn-lg" disabled>
+      🚀 Run Campaign
+    </button>
+    <span class="text-muted ms-2 small">Доступно после создания preview</span>
+  </div>
+  <div id="run-alert" class="mb-3"></div>
+
+</div>
+
+<!-- ========== ПРОГРЕСС ========== -->
+<div id="progress-section" class="d-none">
+  <div class="card mb-3">
+    <div class="card-header fw-bold">⏳ Прогресс выполнения кампании</div>
+    <div class="card-body">
+      <div id="progress-bar-wrap" class="mb-3">
+        <div class="progress">
+          <div id="progress-bar" class="progress-bar progress-bar-striped progress-bar-animated bg-success"
+               role="progressbar" style="width:0%">0%</div>
+        </div>
+      </div>
+      <div id="progress-metrics" class="row g-2 mb-3"></div>
+      <div id="progress-status" class="text-muted small"></div>
+      <div id="progress-error" class="text-danger mt-2"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+// ============================================================
+// Состояние страницы
+// ============================================================
+const COMPANY_LOCATION = {company_location_js};
+let previewRunId = null;
+let runRunId = null;
+let progressInterval = null;
+
+// ============================================================
+// Инициализация
+// ============================================================
+document.addEventListener("DOMContentLoaded", function () {{
+  const companySelect = document.getElementById("f-company");
+  const locationInput = document.getElementById("f-location");
+
+  // Установить location_id по умолчанию из company_id
+  function syncLocation() {{
+    const cid = companySelect.value;
+    locationInput.value = COMPANY_LOCATION[cid] || cid;
+  }}
+  companySelect.addEventListener("change", function () {{
+    syncLocation();
+    // Сбросить список карт при смене компании
+    const ct = document.getElementById("f-card-type");
+    ct.innerHTML = '<option value="">— загрузите типы карт →</option>';
+    document.getElementById("card-load-status").textContent = "";
+  }});
+  syncLocation();
+
+  document.getElementById("btn-load-cards").addEventListener("click", loadCardTypes);
+  document.getElementById("btn-preview").addEventListener("click", createPreview);
+  document.getElementById("btn-run").addEventListener("click", runCampaign);
+}});
+
+// ============================================================
+// Загрузка типов карт
+// ============================================================
+async function loadCardTypes() {{
+  const locationId = document.getElementById("f-location").value.trim();
+  if (!locationId) {{
+    alert("Введите Location ID перед загрузкой типов карт.");
+    return;
+  }}
+  const statusEl = document.getElementById("card-load-status");
+  const cardSelect = document.getElementById("f-card-type");
+  statusEl.textContent = "Загружаю…";
+  cardSelect.innerHTML = '<option value="">— загрузка… —</option>';
+
+  try {{
+    const resp = await fetch(
+      "/ops/campaigns/new-clients/card-types?location_id=" + encodeURIComponent(locationId)
+    );
+    if (!resp.ok) {{
+      const err = await resp.json().catch(() => ({{detail: resp.statusText}}));
+      statusEl.textContent = "Ошибка: " + (err.detail || resp.statusText);
+      cardSelect.innerHTML = '<option value="">— ошибка загрузки —</option>';
+      return;
+    }}
+    const types = await resp.json();
+    if (!Array.isArray(types) || types.length === 0) {{
+      statusEl.textContent = "Типы карт не найдены для этого location_id.";
+      cardSelect.innerHTML = '<option value="">— нет карт —</option>';
+      return;
+    }}
+    cardSelect.innerHTML = types.map(function(t) {{
+      const id = t.id || t.loyalty_card_type_id || "";
+      const title = t.title || t.name || String(id);
+      return '<option value="' + escHtml(String(id)) + '">' + escHtml(title) + '</option>';
+    }}).join("");
+    statusEl.textContent = "Загружено " + types.length + " тип(ов) карт.";
+  }} catch (e) {{
+    statusEl.textContent = "Ошибка сети: " + e.message;
+    cardSelect.innerHTML = '<option value="">— ошибка —</option>';
+  }}
+}}
+
+// ============================================================
+// Создать Preview
+// ============================================================
+async function createPreview() {{
+  const payload = buildPayload();
+  if (!payload) return;
+
+  setAlert("preview-alert", "", "");
+  document.getElementById("preview-spinner").classList.remove("d-none");
+  document.getElementById("btn-preview").disabled = true;
+
+  try {{
+    const resp = await fetch("/ops/campaigns/new-clients/preview", {{
+      method: "POST",
+      headers: {{"Content-Type": "application/json"}},
+      body: JSON.stringify(payload),
+    }});
+    const data = await resp.json();
+    if (!resp.ok) {{
+      setAlert("preview-alert", "danger", "Preview ошибка: " + (data.detail || JSON.stringify(data)));
+      return;
+    }}
+    previewRunId = data.id;
+    renderPreviewSummary(data);
+    document.getElementById("preview-results").classList.remove("d-none");
+    document.getElementById("btn-run").disabled = false;
+    loadRecipients(true);
+    setAlert("preview-alert", "success", "Preview готов! Run ID: " + previewRunId);
+  }} catch (e) {{
+    setAlert("preview-alert", "danger", "Ошибка сети: " + e.message);
+  }} finally {{
+    document.getElementById("preview-spinner").classList.add("d-none");
+    document.getElementById("btn-preview").disabled = false;
+  }}
+}}
+
+// ============================================================
+// Показать результаты Preview
+// ============================================================
+function renderPreviewSummary(data) {{
+  const runId = data.id;
+  // Метрики
+  const metrics = [
+    ["Всего найдено", data.total_clients_seen || 0, "secondary"],
+    ["Eligible (candidates)", data.candidates_count || 0, "success"],
+    ["Исключено", (data.total_clients_seen || 0) - (data.candidates_count || 0), "warning"],
+  ];
+  document.getElementById("preview-metrics").innerHTML = metrics.map(function(m) {{
+    return '<div class="col-auto"><div class="card border-' + m[2] +
+      ' text-center" style="min-width:110px"><div class="card-body p-2">' +
+      '<div class="fs-5 fw-bold text-' + m[2] + '">' + escHtml(String(m[1])) + '</div>' +
+      '<div class="small text-muted">' + escHtml(m[0]) + '</div>' +
+      '</div></div></div>';
+  }}).join("");
+
+  // Ссылки
+  const btnCls = "btn btn-sm btn-outline-secondary";
+  document.getElementById("preview-links").innerHTML =
+    '<a href="/ops/campaigns/' + runId + '" class="' + btnCls + ' me-1" target="_blank">Detail</a>' +
+    '<a href="/ops/campaigns/runs/' + runId + '/recipients" class="' + btnCls + ' me-1"' +
+    ' target="_blank">JSON recipients</a>' +
+    '<a href="/ops/campaigns/runs/' + runId + '/report" class="' + btnCls + '"' +
+    ' target="_blank">JSON report</a>';
+}}
+
+// ============================================================
+// Загрузить получателей preview
+// ============================================================
+async function loadRecipients(eligibleOnly) {{
+  if (!previewRunId) return;
+  document.getElementById("btn-eligible").className =
+    eligibleOnly ? "btn btn-primary" : "btn btn-outline-secondary";
+  document.getElementById("btn-all-recip").className =
+    eligibleOnly ? "btn btn-outline-secondary" : "btn btn-primary";
+
+  const loading = document.getElementById("recipients-loading");
+  loading.classList.remove("d-none");
+  document.getElementById("recipients-table").innerHTML = "";
+
+  const url = "/ops/campaigns/runs/" + previewRunId + "/recipients" +
+    (eligibleOnly ? "?status=candidate&limit=500" : "?limit=500");
+
+  try {{
+    const resp = await fetch(url);
+    const data = await resp.json();
+    if (!resp.ok) {{
+      document.getElementById("recipients-table").innerHTML =
+        '<div class="alert alert-danger m-3">Ошибка загрузки получателей</div>';
+      return;
+    }}
+    renderRecipientsTable(data.items || [], data.total || 0);
+  }} catch (e) {{
+    document.getElementById("recipients-table").innerHTML =
+      '<div class="alert alert-danger m-3">Ошибка сети: ' + escHtml(e.message) + '</div>';
+  }} finally {{
+    loading.classList.add("d-none");
+  }}
+}}
+
+function renderRecipientsTable(items, total) {{
+  if (items.length === 0) {{
+    document.getElementById("recipients-table").innerHTML =
+      '<p class="text-muted p-3">Нет записей по заданному фильтру.</p>';
+    return;
+  }}
+  const cols = ["Имя", "Телефон", "Статус", "Причина исключения",
+                "Записей в периоде", "Подтверждённых", "Записей до периода"];
+  const header = '<tr>' + cols.map(function(c) {{
+    return '<th>' + escHtml(c) + '</th>';
+  }}).join("") + '</tr>';
+  const rows = items.map(function(r) {{
+    const seg = r.segment || {{}};
+    const statusColor = r.status === "candidate" ? "success" : "secondary";
+    return '<tr>' +
+      '<td>' + escHtml(r.display_name || "") + '</td>' +
+      '<td>' + escHtml(r.phone_e164 || "") + '</td>' +
+      '<td><span class="badge bg-' + statusColor + '">' + escHtml(r.status || "") + '</span></td>' +
+      '<td>' + escHtml(r.excluded_reason || "") + '</td>' +
+      '<td>' + escHtml(String(seg.total_records_in_period ?? "")) + '</td>' +
+      '<td>' + escHtml(String(seg.confirmed_records_in_period ?? "")) + '</td>' +
+      '<td>' + escHtml(String(seg.records_before_period ?? "")) + '</td>' +
+      '</tr>';
+  }}).join("");
+  document.getElementById("recipients-table").innerHTML =
+    '<div class="table-responsive">' +
+    '<table class="table table-sm table-hover table-bordered align-middle mb-0">' +
+    '<thead class="table-dark">' + header + '</thead>' +
+    '<tbody>' + rows + '</tbody>' +
+    '</table>' +
+    '</div>' +
+    '<p class="text-muted small p-2 mb-0">Показано ' + items.length + ' из ' + total + ' записей</p>';
+}}
+
+// ============================================================
+// Запуск кампании
+// ============================================================
+async function runCampaign() {{
+  if (!previewRunId) {{
+    alert("Сначала создайте preview.");
+    return;
+  }}
+  if (!confirm("Запустить реальную рассылку? Это отправит WhatsApp-сообщения клиентам.")) return;
+
+  const payload = buildPayload();
+  if (!payload) return;
+  payload.source_preview_run_id = previewRunId;
+
+  setAlert("run-alert", "", "");
+  document.getElementById("btn-run").disabled = true;
+
+  try {{
+    const resp = await fetch("/ops/campaigns/new-clients/run", {{
+      method: "POST",
+      headers: {{"Content-Type": "application/json"}},
+      body: JSON.stringify(payload),
+    }});
+    const data = await resp.json();
+    if (!resp.ok) {{
+      setAlert("run-alert", "danger", "Ошибка запуска: " + (data.detail || JSON.stringify(data)));
+      document.getElementById("btn-run").disabled = false;
+      return;
+    }}
+    runRunId = data.id;
+    setAlert("run-alert", "success",
+      "✅ Кампания принята в очередь! Run ID: " + runRunId +
+      ' <a href="/ops/campaigns/' + runRunId + '" target="_blank" class="alert-link">Открыть detail</a>');
+    startProgressPolling(runRunId);
+    document.getElementById("progress-section").classList.remove("d-none");
+  }} catch (e) {{
+    setAlert("run-alert", "danger", "Ошибка сети: " + e.message);
+    document.getElementById("btn-run").disabled = false;
+  }}
+}}
+
+// ============================================================
+// Progress polling
+// ============================================================
+function startProgressPolling(runId) {{
+  if (progressInterval) clearInterval(progressInterval);
+  pollProgress(runId);
+  progressInterval = setInterval(function () {{ pollProgress(runId); }}, 3000);
+}}
+
+async function pollProgress(runId) {{
+  try {{
+    const resp = await fetch("/ops/campaigns/runs/" + runId + "/progress");
+    if (!resp.ok) return;
+    const data = await resp.json();
+    renderProgress(data);
+    // Остановить polling при завершении
+    const done = data.status === "completed" || data.status === "failed";
+    if (done && progressInterval) {{
+      clearInterval(progressInterval);
+      progressInterval = null;
+    }}
+  }} catch (_) {{}}
+}}
+
+function renderProgress(data) {{
+  const p = data.progress || {{}};
+  const pct = Math.round((p.progress_pct || 0) * 100);
+  const bar = document.getElementById("progress-bar");
+  bar.style.width = pct + "%";
+  bar.textContent = pct + "%";
+  if (data.status === "completed") {{
+    bar.className = "progress-bar bg-success";
+  }} else if (data.status === "failed") {{
+    bar.className = "progress-bar bg-danger";
+  }}
+
+  const metrics = [
+    ["Всего", p.recipients_total || 0, "secondary"],
+    ["Done", p.recipients_done || 0, "success"],
+    ["In progress", p.recipients_in_progress || 0, "primary"],
+    ["Queued", p.recipients_queued || 0, "info"],
+    ["Failed pending", p.recipients_queue_failed_pending || 0, "warning"],
+    ["Cleanup failed", p.recipients_cleanup_failed || 0, "danger"],
+  ];
+  document.getElementById("progress-metrics").innerHTML = metrics.map(function(m) {{
+    return '<div class="col-auto"><div class="card border-' + m[2] +
+      ' text-center" style="min-width:100px"><div class="card-body p-2">' +
+      '<div class="fs-5 fw-bold text-' + m[2] + '">' + m[1] + '</div>' +
+      '<div class="small text-muted">' + escHtml(m[0]) + '</div>' +
+      '</div></div></div>';
+  }}).join("");
+
+  const isDone = data.status === "completed" || data.status === "failed";
+  document.getElementById("progress-status").textContent =
+    "Статус: " + (data.status || "") + (isDone ? " — polling остановлен" : " — обновление каждые 3 сек");
+
+  const err = (data.last_error || "") || ((data.execution_job || {{}}).last_error || "");
+  document.getElementById("progress-error").textContent = err ? ("Ошибка: " + err) : "";
+}}
+
+// ============================================================
+// Утилиты
+// ============================================================
+function buildPayload() {{
+  const companyId = parseInt(document.getElementById("f-company").value, 10);
+  const locationId = parseInt(document.getElementById("f-location").value, 10);
+  const cardTypeEl = document.getElementById("f-card-type");
+  const cardTypeId = cardTypeEl.value || null;
+  const periodStartDate = document.getElementById("f-period-start").value;
+  const periodEndDate = document.getElementById("f-period-end").value;
+  const attribution = parseInt(document.getElementById("f-attribution").value, 10) || 30;
+
+  if (!periodStartDate || !periodEndDate) {{
+    alert("Укажите период.");
+    return null;
+  }}
+  if (!locationId || isNaN(locationId)) {{
+    alert("Укажите Location ID.");
+    return null;
+  }}
+
+  // period_end — конец дня (включительно)
+  return {{
+    company_id: companyId,
+    location_id: locationId,
+    card_type_id: cardTypeId,
+    period_start: periodStartDate + "T00:00:00Z",
+    period_end: periodEndDate + "T23:59:59Z",
+    attribution_window_days: attribution,
+  }};
+}}
+
+function setAlert(id, type, msg) {{
+  const el = document.getElementById(id);
+  if (!type || !msg) {{ el.innerHTML = ""; return; }}
+  el.innerHTML = '<div class="alert alert-' + type + ' alert-dismissible">' + msg +
+    '<button type="button" class="btn-close" onclick="this.parentElement.remove()"></button></div>';
+}}
+
+function escHtml(s) {{
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}}
+</script>
+"""
+    return _page("New Clients Campaign", body)
 
 
 # ---------------------------------------------------------------------------

@@ -246,3 +246,164 @@ async def test_ops_campaigns_dashboard_default_params(http_client: AsyncClient) 
     response = await http_client.get("/ops/campaigns/dashboard")
     assert response.status_code == 200
     assert "Dashboard" in response.text
+
+
+# ---------------------------------------------------------------------------
+# /ops/campaigns/new-clients  – страница запуска кампании
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_ops_new_clients_page_returns_200(http_client: AsyncClient) -> None:
+    """Страница запуска кампании открывается без ошибок."""
+    response = await http_client.get("/ops/campaigns/new-clients")
+    assert response.status_code == 200
+    assert "New Clients Campaign" in response.text
+
+
+@pytest.mark.asyncio
+async def test_ops_new_clients_page_default_period_is_last_month(
+    http_client: AsyncClient,
+) -> None:
+    """По умолчанию форма заполнена прошлым месяцем."""
+    from datetime import timedelta
+
+    now = datetime.now(timezone.utc)
+    first_of_this_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    last_day_prev = first_of_this_month - timedelta(days=1)
+    first_of_prev = last_day_prev.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+    expected_start = first_of_prev.strftime("%Y-%m-%d")
+    expected_end = last_day_prev.strftime("%Y-%m-%d")
+
+    response = await http_client.get("/ops/campaigns/new-clients")
+    assert response.status_code == 200
+    assert expected_start in response.text, f"Ожидался period_start={expected_start}"
+    assert expected_end in response.text, f"Ожидался period_end={expected_end}"
+
+
+@pytest.mark.asyncio
+async def test_ops_new_clients_page_shows_company_names(http_client: AsyncClient) -> None:
+    """На странице отображаются human-readable названия компаний."""
+    response = await http_client.get("/ops/campaigns/new-clients")
+    assert response.status_code == 200
+    assert "Karlsruhe" in response.text
+    assert "Rastatt" in response.text
+
+
+@pytest.mark.asyncio
+async def test_ops_new_clients_page_shows_template_block(http_client: AsyncClient) -> None:
+    """На странице есть read-only блок с информацией о Meta-шаблоне."""
+    response = await http_client.get("/ops/campaigns/new-clients")
+    assert response.status_code == 200
+    assert "kitilash_ka_newsletter_new_clients_monthly_v2" in response.text
+    assert "newsletter_new_clients_monthly" in response.text
+    # Язык шаблона
+    assert "de" in response.text
+    # Блок помечен как только для просмотра
+    assert "только для просмотра" in response.text
+
+
+@pytest.mark.asyncio
+async def test_ops_new_clients_page_has_preview_button(http_client: AsyncClient) -> None:
+    """На странице есть кнопка Create Preview."""
+    response = await http_client.get("/ops/campaigns/new-clients")
+    assert response.status_code == 200
+    assert "Create Preview" in response.text
+    assert "btn-preview" in response.text
+
+
+@pytest.mark.asyncio
+async def test_ops_new_clients_page_has_run_button(http_client: AsyncClient) -> None:
+    """На странице есть кнопка Run Campaign (изначально disabled)."""
+    response = await http_client.get("/ops/campaigns/new-clients")
+    assert response.status_code == 200
+    assert "Run Campaign" in response.text
+    assert "btn-run" in response.text
+    # Кнопка disabled до preview
+    assert "disabled" in response.text
+
+
+@pytest.mark.asyncio
+async def test_ops_campaigns_list_has_new_clients_button(http_client: AsyncClient) -> None:
+    """Список кампаний содержит кнопку перехода к запуску кампании новых клиентов."""
+    response = await http_client.get("/ops/campaigns")
+    assert response.status_code == 200
+    assert "New Clients Campaign" in response.text
+    assert "/ops/campaigns/new-clients" in response.text
+
+
+@pytest.mark.asyncio
+async def test_ops_new_clients_page_has_recipients_section(http_client: AsyncClient) -> None:
+    """На странице есть секция для отображения получателей после preview."""
+    response = await http_client.get("/ops/campaigns/new-clients")
+    assert response.status_code == 200
+    assert "Только eligible" in response.text
+    assert "Все записи" in response.text
+    assert "recipients-table" in response.text
+
+
+@pytest.mark.asyncio
+async def test_ops_new_clients_page_has_progress_section(http_client: AsyncClient) -> None:
+    """На странице есть секция прогресса (скрытая до запуска)."""
+    response = await http_client.get("/ops/campaigns/new-clients")
+    assert response.status_code == 200
+    assert "progress-section" in response.text
+    assert "progress-bar" in response.text
+    assert "pollProgress" in response.text
+
+
+@pytest.mark.asyncio
+async def test_ops_new_clients_run_uses_source_preview_run_id(
+    http_client: AsyncClient,
+) -> None:
+    """JavaScript-код содержит передачу source_preview_run_id в payload."""
+    response = await http_client.get("/ops/campaigns/new-clients")
+    assert response.status_code == 200
+    assert "source_preview_run_id" in response.text
+    assert "previewRunId" in response.text
+
+
+# ---------------------------------------------------------------------------
+# /ops/campaigns/new-clients/card-types  – JSON endpoint
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_card_types_endpoint_returns_data(
+    http_client: AsyncClient,
+    monkeypatch,
+) -> None:
+    """Endpoint возвращает список типов карт от Altegio."""
+    from altegio_bot.altegio_loyalty import AltegioLoyaltyClient
+
+    fake_types = [
+        {"id": 46657, "title": "Kundenkarte - 10 %"},
+        {"id": 46658, "title": "Kundenkarte - 20 %"},
+    ]
+
+    async def mock_get_card_types(self, location_id: int):
+        return fake_types
+
+    async def mock_aclose(self):
+        pass
+
+    monkeypatch.setattr(AltegioLoyaltyClient, "get_card_types", mock_get_card_types)
+    monkeypatch.setattr(AltegioLoyaltyClient, "aclose", mock_aclose)
+
+    response = await http_client.get("/ops/campaigns/new-clients/card-types?location_id=758285")
+    assert response.status_code == 200
+    data = response.json()
+    assert isinstance(data, list)
+    assert len(data) == 2
+    assert data[0]["title"] == "Kundenkarte - 10 %"
+    assert data[0]["id"] == 46657
+
+
+@pytest.mark.asyncio
+async def test_card_types_endpoint_requires_location_id(
+    http_client: AsyncClient,
+) -> None:
+    """Endpoint возвращает 422, если location_id не передан."""
+    response = await http_client.get("/ops/campaigns/new-clients/card-types")
+    assert response.status_code == 422
