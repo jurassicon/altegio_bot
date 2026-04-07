@@ -204,7 +204,10 @@ async def get_card_types_for_location(
 # Нормализация имени Meta-шаблона
 # ==========================================================================
 
-_TEMPLATE_PREFIXES = ("kitilash_ka_", "kitilash_ra_")
+# Все шаблоны этого проекта имеют префикс вида "kitilash_{brand}_".
+# Regex снимает любой такой префикс, поэтому добавление нового бренда
+# (kitilash_xx_) не требует изменения этого кода.
+_BRAND_PREFIX_RE = re.compile(r"^kitilash_[a-z]+_")
 
 
 def normalize_meta_template_name(template_name: str) -> str:
@@ -215,14 +218,10 @@ def normalize_meta_template_name(template_name: str) -> str:
         → "newsletter_new_clients_monthly"
 
     Алгоритм:
-        1. Убрать известный префикс компании (kitilash_ka_, kitilash_ra_).
+        1. Убрать брендовый префикс вида kitilash_{brand}_ (любой бренд).
         2. Убрать версионный суффикс (_v1, _v2, _v3, ...).
     """
-    code = template_name
-    for prefix in _TEMPLATE_PREFIXES:
-        if code.startswith(prefix):
-            code = code[len(prefix) :]
-            break
+    code = _BRAND_PREFIX_RE.sub("", template_name)
     # Убираем версионный суффикс: _v1, _v2, _v3, …
     code = re.sub(r"_v\d+$", "", code)
     return code

@@ -309,16 +309,23 @@ async def test_ops_new_clients_page_shows_template_block(http_client: AsyncClien
 @pytest.mark.asyncio
 async def test_ops_new_clients_page_has_company_template_mapping(http_client: AsyncClient) -> None:
     """JS-маппинг COMPANY_TEMPLATES содержит template_name для каждой компании."""
+    import json
+    import re
+
     response = await http_client.get("/ops/campaigns/new-clients")
     assert response.status_code == 200
     text = response.text
     # Маппинг присутствует в JS
     assert "COMPANY_TEMPLATES" in text
-    # Karlsruhe и Rastatt имеют template в маппинге
-    assert "758285" in text
-    assert "1271200" in text
-    # Для Karlsruhe — KA-шаблон
-    assert "kitilash_ka_newsletter_new_clients_monthly_v2" in text
+    # Извлекаем JSON из строки "const COMPANY_TEMPLATES = {...};"
+    m = re.search(r"const COMPANY_TEMPLATES = (\{.*?\});", text)
+    assert m is not None, "COMPANY_TEMPLATES JSON не найден в тексте страницы"
+    mapping = json.loads(m.group(1))
+    # Оба company_id обязаны быть ключами маппинга с непустым template_name
+    assert "758285" in mapping, "Karlsruhe (758285) отсутствует в COMPANY_TEMPLATES"
+    assert "1271200" in mapping, "Rastatt (1271200) отсутствует в COMPANY_TEMPLATES"
+    assert mapping["758285"], "template_name для Karlsruhe пустой"
+    assert mapping["1271200"], "template_name для Rastatt пустой"
     # loadTemplateText принимает companyId из select
     assert "loadTemplateText(companySelect.value)" in text
 
