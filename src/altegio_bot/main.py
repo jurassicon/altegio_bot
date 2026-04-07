@@ -20,8 +20,10 @@ app = FastAPI(title=settings.app_name)
 app.include_router(whatsapp_router)
 app.include_router(chatwoot_router)
 app.include_router(ops_login_router)  # public: /ops/login, /ops/logout
+app.include_router(campaigns_router)  # protected: /ops/campaigns/ (JSON) — регистрируем до ops_router,
+# чтобы точные маршруты JSON API (/runs, /runs/{id}, /dashboard/monthly) имели приоритет
+# перед wildcard HTML-маршрутами (/campaigns/{run_id: int})
 app.include_router(ops_router)  # protected: /ops/ (HTML dashboard)
-app.include_router(campaigns_router)  # protected: /ops/campaigns/ (JSON)
 
 
 def _safe_headers(request: Request) -> dict[str, str]:
