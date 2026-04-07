@@ -1,4 +1,4 @@
-"""Тесты endpoint'а resume для failed send-real campaign run.
+"""Тесты endpoint"а resume для failed send-real campaign run.
 
 Семь сценариев:
   1. Resume candidate recipient — полный flow, recipient → queued.
@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import select
 
 import altegio_bot.campaigns.runner as runner_module
 import altegio_bot.ops.campaigns_api as campaigns_api_module
@@ -39,6 +40,9 @@ PHONE = "+10000000001"
 class _MockLoyalty:
     """Заглушка AltegioLoyaltyClient для тестов resume."""
 
+    def __init__(self) -> None:
+        self.issue_card_call_count = 0
+
     async def issue_card(
         self,
         location_id,
@@ -47,7 +51,11 @@ class _MockLoyalty:
         loyalty_card_type_id,
         phone,
     ):
-        return {"loyalty_card_number": loyalty_card_number, "id": "mock-card-id"}
+        self.issue_card_call_count += 1
+        return {
+            "loyalty_card_number": loyalty_card_number,
+            "id": "mock-card-id",
+        }
 
     async def delete_card(self, location_id, card_id):
         pass
@@ -104,14 +112,31 @@ def _make_recipient(
 
 
 @pytest_asyncio.fixture
-async def resume_client(session_maker, monkeypatch) -> AsyncGenerator[AsyncClient, None]:
+async def resume_client(
+    session_maker,
+    monkeypatch,
+) -> AsyncGenerator[tuple[AsyncClient, _MockLoyalty], None]:
     """HTTP-клиент с test DB и замоканным loyalty-клиентом."""
+    loyalty = _MockLoyalty()
+
     monkeypatch.setattr(campaigns_api_module, "SessionLocal", session_maker)
     monkeypatch.setattr(runner_module, "SessionLocal", session_maker)
-    monkeypatch.setattr(runner_module, "AltegioLoyaltyClient", lambda: _MockLoyalty())
-    monkeypatch.setitem(app.dependency_overrides, require_ops_auth, lambda: None)
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        yield client
+    monkeypatch.setattr(
+        runner_module,
+        "AltegioLoyaltyClient",
+        lambda: loyalty,
+    )
+    monkeypatch.setitem(
+        app.dependency_overrides,
+        require_ops_auth,
+        lambda: None,
+    )
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        yield client, loyalty
 
 
 # ---------------------------------------------------------------------------
@@ -120,13 +145,17 @@ async def resume_client(session_maker, monkeypatch) -> AsyncGenerator[AsyncClien
 
 
 @pytest.mark.asyncio
-async def test_resume_candidate_recipient(resume_client, session_maker) -> None:
+async def test_resume_candidate_recipient(
+    resume_client,
+    session_maker,
+) -> None:
     """Resume candidate recipient должен пройти полный flow и стать queued."""
     async with session_maker() as session:
         async with session.begin():
             run = _make_run(session)
             await session.flush()
             run_id = run.id
+
             recipient = _make_recipient(
                 session,
                 run_id,
@@ -135,7 +164,8 @@ async def test_resume_candidate_recipient(resume_client, session_maker) -> None:
             await session.flush()
             recipient_id = recipient.id
 
-    response = await resume_client.post(f"/ops/campaigns/runs/{run_id}/resume")
+    client, _ = resume_client
+    response = await client.post(f"/ops/campaigns/runs/{run_id}/resume")
     assert response.status_code == 200
     data = response.json()
 
@@ -145,9 +175,10 @@ async def test_resume_candidate_recipient(resume_client, session_maker) -> None:
     assert data["summary"]["remaining_manual_count"] == 0
     assert data["status"] == "completed"
 
-    # Проверить статус recipient в БД
     async with session_maker() as session:
         r = await session.get(CampaignRecipient, recipient_id)
+
+    assert r is not None
     assert r.status == "queued"
     assert r.message_job_id is not None
 
@@ -158,8 +189,13 @@ async def test_resume_candidate_recipient(resume_client, session_maker) -> None:
 
 
 @pytest.mark.asyncio
-async def test_resume_card_issued_recipient(resume_client, session_maker) -> None:
+async def test_resume_card_issued_recipient(
+    resume_client,
+    session_maker,
+) -> None:
     """Resume card_issued не выпускает новую карту — только допоставляет job."""
+    client, loyalty = resume_client
+
     async with session_maker() as session:
         async with session.begin():
             run = _make_run(session)
@@ -176,17 +212,18 @@ async def test_resume_card_issued_recipient(resume_client, session_maker) -> Non
             await session.flush()
             recipient_id = recipient.id
 
-    response = await resume_client.post(f"/ops/campaigns/runs/{run_id}/resume")
+    response = await client.post(f"/ops/campaigns/runs/{run_id}/resume")
     assert response.status_code == 200
     data = response.json()
 
     assert data["summary"]["resumed_count"] == 1
     assert data["status"] == "completed"
+    assert loyalty.issue_card_call_count == 0
 
     async with session_maker() as session:
         r = await session.get(CampaignRecipient, recipient_id)
+
     assert r.status == "queued"
-    # Карта не изменилась — та же, что была выпущена ранее
     assert r.loyalty_card_id == "existing-card-id"
     assert r.loyalty_card_number == "0010000000010"
 
@@ -197,8 +234,13 @@ async def test_resume_card_issued_recipient(resume_client, session_maker) -> Non
 
 
 @pytest.mark.asyncio
-async def test_resume_queue_failed_recipient(resume_client, session_maker) -> None:
+async def test_resume_queue_failed_recipient(
+    resume_client,
+    session_maker,
+) -> None:
     """Resume skipped+queue_failed допоставляет job без повторного выпуска карты."""
+    client, loyalty = resume_client
+
     async with session_maker() as session:
         async with session.begin():
             run = _make_run(session)
@@ -216,17 +258,19 @@ async def test_resume_queue_failed_recipient(resume_client, session_maker) -> No
             await session.flush()
             recipient_id = recipient.id
 
-    response = await resume_client.post(f"/ops/campaigns/runs/{run_id}/resume")
+    response = await client.post(f"/ops/campaigns/runs/{run_id}/resume")
     assert response.status_code == 200
     data = response.json()
 
     assert data["summary"]["resumed_count"] == 1
     assert data["status"] == "completed"
+    assert loyalty.issue_card_call_count == 0
 
     async with session_maker() as session:
         r = await session.get(CampaignRecipient, recipient_id)
+
     assert r.status == "queued"
-    assert r.excluded_reason is None  # Сброшен при постановке в очередь
+    assert r.excluded_reason is None
     assert r.loyalty_card_id == "qf-card-id"
 
 
@@ -236,34 +280,38 @@ async def test_resume_queue_failed_recipient(resume_client, session_maker) -> No
 
 
 @pytest.mark.asyncio
-async def test_resume_does_not_touch_cleanup_failed(resume_client, session_maker) -> None:
+async def test_resume_does_not_touch_cleanup_failed(
+    resume_client,
+    session_maker,
+) -> None:
     """Resume не должен трогать cleanup_failed получателей."""
     async with session_maker() as session:
         async with session.begin():
             run = _make_run(session)
             await session.flush()
             run_id = run.id
-            recipient = _make_recipient(
+
+            _make_recipient(
                 session,
                 run_id,
                 recipient_status="cleanup_failed",
                 excluded_reason="cleanup_failed",
             )
-            await session.flush()
-            recipient_id = recipient.id
 
-    response = await resume_client.post(f"/ops/campaigns/runs/{run_id}/resume")
+    client, _ = resume_client
+    response = await client.post(f"/ops/campaigns/runs/{run_id}/resume")
     assert response.status_code == 200
     data = response.json()
 
     assert data["summary"]["resumed_count"] == 0
     assert data["summary"]["remaining_manual_count"] == 1
-    # Статус run остаётся failed — есть получатель требующий ручных действий
     assert data["status"] == "failed"
 
     async with session_maker() as session:
-        r = await session.get(CampaignRecipient, recipient_id)
-    assert r.status == "cleanup_failed"  # Не изменился
+        result = await session.execute(select(CampaignRecipient).where(CampaignRecipient.campaign_run_id == run_id))
+        r = result.scalar_one()
+
+    assert r.status == "cleanup_failed"
 
 
 # ---------------------------------------------------------------------------
@@ -288,7 +336,8 @@ async def test_resume_does_not_touch_card_issue_failed(resume_client, session_ma
             await session.flush()
             recipient_id = recipient.id
 
-    response = await resume_client.post(f"/ops/campaigns/runs/{run_id}/resume")
+    client, _ = resume_client
+    response = await client.post(f"/ops/campaigns/runs/{run_id}/resume")
     assert response.status_code == 200
     data = response.json()
 
@@ -316,7 +365,8 @@ async def test_resume_forbidden_for_preview(resume_client, session_maker) -> Non
             await session.flush()
             run_id = run.id
 
-    response = await resume_client.post(f"/ops/campaigns/runs/{run_id}/resume")
+    client, _ = resume_client
+    response = await client.post(f"/ops/campaigns/runs/{run_id}/resume")
     assert response.status_code == 400
     assert "send-real" in response.json()["detail"]
 
@@ -335,6 +385,44 @@ async def test_resume_forbidden_for_non_failed_run(resume_client, session_maker)
             await session.flush()
             run_id = run.id
 
-    response = await resume_client.post(f"/ops/campaigns/runs/{run_id}/resume")
+    client, _ = resume_client
+    response = await client.post(f"/ops/campaigns/runs/{run_id}/resume")
     assert response.status_code == 400
     assert "failed" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_resume_recalculates_run_counters(
+    resume_client,
+    session_maker,
+) -> None:
+    """Resume должен пересчитывать агрегаты CampaignRun."""
+    client, _ = resume_client
+
+    async with session_maker() as session:
+        async with session.begin():
+            run = _make_run(session)
+            await session.flush()
+            run_id = run.id
+
+            _make_recipient(
+                session,
+                run_id,
+                recipient_status="card_issued",
+                loyalty_card_number="0010000000010",
+                loyalty_card_id="existing-card-id",
+                loyalty_card_type_id=CARD_TYPE,
+            )
+
+    response = await client.post(f"/ops/campaigns/runs/{run_id}/resume")
+    assert response.status_code == 200
+
+    async with session_maker() as session:
+        run = await session.get(CampaignRun, run_id)
+
+    assert run is not None
+    assert run.status == "completed"
+    assert run.queued_count == 1
+    assert run.sent_count == 1
+    assert run.cards_issued_count == 1
+    assert run.failed_count == 0

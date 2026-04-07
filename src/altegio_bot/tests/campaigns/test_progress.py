@@ -185,3 +185,54 @@ async def test_list_runs_includes_last_error_when_failed(http_client, session_ma
 
     assert failed["last_error"] == "cleanup step timed out"
     assert ok["last_error"] is None
+
+
+@pytest.mark.asyncio
+async def test_progress_does_not_count_queue_failed_as_done(
+    http_client,
+    session_maker,
+) -> None:
+    """queue_failed не должен считаться done в progress.
+
+    Такой recipient ещё можно резюмить, значит он pending/in_progress,
+    а не завершённый.
+    """
+    async with session_maker() as session:
+        async with session.begin():
+            run = _make_run(
+                session,
+                status="failed",
+                total_clients_seen=2,
+                candidates_count=2,
+            )
+            await session.flush()
+            run_id = run.id
+
+            session.add(
+                CampaignRecipient(
+                    campaign_run_id=run_id,
+                    company_id=COMPANY,
+                    client_id=1,
+                    phone_e164="+10000000001",
+                    status="skipped",
+                    excluded_reason="queue_failed",
+                )
+            )
+            session.add(
+                CampaignRecipient(
+                    campaign_run_id=run_id,
+                    company_id=COMPANY,
+                    client_id=10,
+                    phone_e164="+10000000010",
+                    status="queued",
+                )
+            )
+
+    response = await http_client.get(f"/ops/campaigns/runs/{run_id}/progress")
+    assert response.status_code == 200
+    data = response.json()
+
+    assert data["progress"]["recipients_done"] == 1
+    assert data["progress"]["recipients_queue_failed_pending"] == 1
+    assert data["progress"]["recipients_in_progress"] == 1
+    assert data["progress"]["progress_pct"] == 0.5
