@@ -626,21 +626,6 @@ def _followup_auto(run: CampaignRun) -> dict[str, Any] | None:
     }
 
 
-def _followup_auto(run: CampaignRun) -> dict[str, Any] | None:
-    """Блок авто-follow-up из run.meta, если авто-worker уже запускался."""
-    meta = run.meta or {}
-    if "followup_auto_status" not in meta:
-        return None
-    return {
-        "followup_auto_status": meta.get("followup_auto_status"),
-        "followup_auto_started_at": meta.get("followup_auto_started_at"),
-        "followup_auto_completed_at": meta.get("followup_auto_completed_at"),
-        "followup_auto_last_error": meta.get("followup_auto_last_error"),
-        "followup_auto_planned_count": meta.get("followup_auto_planned_count"),
-        "followup_auto_queued_count": meta.get("followup_auto_queued_count"),
-    }
-
-
 def _run_summary(run: CampaignRun) -> dict[str, Any]:
     """Краткая сводка по run для списков."""
     return {
