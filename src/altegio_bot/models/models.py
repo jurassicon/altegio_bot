@@ -590,42 +590,124 @@ class WhatsAppEvent(Base):
     )
 
 
+# ---------------------------------------------------------------------------
+# Campaign models
+# ---------------------------------------------------------------------------
+
+
 class CampaignRun(Base):
-    """Tracks a single execution of a newsletter campaign."""
+    """Один запуск кампании: preview или send-real."""
 
     __tablename__ = "campaign_runs"
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
 
+    # Код кампании, например 'new_clients_monthly'
     campaign_code: Mapped[str] = mapped_column(String(128), index=True)
+
+    # 'preview' | 'send-real'
     mode: Mapped[str] = mapped_column(String(32))
+
+    # Список company_id, охваченных рассылкой
     company_ids: Mapped[list] = mapped_column(JSONB, default=list)
+
+    # Ссылка на preview-run, на базе которого запущен send-real.
+    # Nullable: у preview этого поля нет.
+    source_preview_run_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey("campaign_runs.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    # Параметры loyalty-карт (для send-real)
+    location_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    card_type_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     period_start: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     period_end: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
+    # running / completed / failed
     status: Mapped[str] = mapped_column(String(32), default="running")
 
+    # Окно атрибуции в днях (по умолчанию 30)
+    attribution_window_days: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("30"))
+
+    # -----------------------------------------------------------------------
+    # Follow-up policy
+    # -----------------------------------------------------------------------
+    followup_enabled: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default=text("false"),
+    )
+    # Через сколько дней проверять follow-up (например, 7 или 14)
+    followup_delay_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # 'unread_only' | 'unread_or_not_booked'
+    followup_policy: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # WhatsApp template для follow-up (отдельный approved template)
+    followup_template_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+    # -----------------------------------------------------------------------
+    # Счётчики сегментации
+    # -----------------------------------------------------------------------
     total_clients_seen: Mapped[int] = mapped_column(Integer, default=0)
     candidates_count: Mapped[int] = mapped_column(Integer, default=0)
+
+    # Исключения (legacy — оставлены для обратной совместимости)
     excluded_opted_out: Mapped[int] = mapped_column(Integer, default=0)
     excluded_more_than_one_record: Mapped[int] = mapped_column(Integer, default=0)
     excluded_has_arrived: Mapped[int] = mapped_column(Integer, default=0)
     excluded_no_phone: Mapped[int] = mapped_column(Integer, default=0)
 
+    # Исключения (новые)
+    excluded_multiple_records: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    excluded_no_confirmed_record: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    excluded_has_records_before: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    excluded_invalid_phone: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    excluded_no_whatsapp: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+
+    # -----------------------------------------------------------------------
+    # Счётчики доставки и атрибуции
+    # -----------------------------------------------------------------------
     sent_count: Mapped[int] = mapped_column(Integer, default=0)
     failed_count: Mapped[int] = mapped_column(Integer, default=0)
+    queued_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    provider_accepted_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    delivered_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    read_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    replied_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    booked_after_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    opted_out_after_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
 
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+    # -----------------------------------------------------------------------
+    # Счётчики loyalty-карт
+    # -----------------------------------------------------------------------
+    cleanup_failed_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    cards_deleted_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    cards_issued_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        index=True,
+    )
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     meta: Mapped[dict] = mapped_column(JSONB, default=dict)
 
-    recipients: Mapped[list["CampaignRecipient"]] = relationship(back_populates="run", cascade="all, delete-orphan")
+    recipients: Mapped[list["CampaignRecipient"]] = relationship(
+        back_populates="run",
+        cascade="all, delete-orphan",
+    )
 
 
 class CampaignRecipient(Base):
-    """Stores per-client eligibility snapshot and send result for a campaign."""
+    """
+    Снимок сегментации и результат рассылки для одного клиента.
+    Создаётся как для preview, так и для send-real.
+    """
 
     __tablename__ = "campaign_recipients"
 
@@ -650,19 +732,93 @@ class CampaignRecipient(Base):
     phone_e164: Mapped[str | None] = mapped_column(String(32), index=True, nullable=True)
     display_name: Mapped[str | None] = mapped_column(String(256), nullable=True)
 
-    status: Mapped[str] = mapped_column(String(32), default="candidate")
+    # -----------------------------------------------------------------------
+    # Статус (полная цепочка)
+    # candidate → skipped | cleanup_failed | cleanup_ok → card_issued
+    #   → queue_failed | queued → provider_accepted → delivered
+    #   → read → replied → booked_after_campaign
+    # -----------------------------------------------------------------------
+    status: Mapped[str] = mapped_column(String(64), default="candidate")
 
+    # Причина исключения (если статус skipped/cleanup_failed).
+    # Значения: opted_out / no_phone / invalid_phone / no_whatsapp /
+    #           multiple_records_in_period / no_confirmed_record_in_period /
+    #           has_records_before_period / cleanup_failed /
+    #           provider_error / delivery_failed / card_issue_failed
     excluded_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
+    # -----------------------------------------------------------------------
+    # Снимок сегментации (заполняется при создании записи)
+    # -----------------------------------------------------------------------
+    # Все записи клиента в периоде (не удалённые)
     total_records_in_period: Mapped[int] = mapped_column(Integer, default=0)
+    # Подтверждённые записи (confirmed == CONFIRMED_FLAG) в периоде
+    confirmed_records_in_period: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    # Все записи клиента ДО начала периода (любой статус)
+    records_before_period: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    # Legacy-поле (оставлено для обратной совместимости)
     arrived_records_in_period: Mapped[int] = mapped_column(Integer, default=0)
     is_opted_out: Mapped[bool] = mapped_column(Boolean, default=False)
 
+    # -----------------------------------------------------------------------
+    # Loyalty-карты
+    # -----------------------------------------------------------------------
+    # Выпущенная в этом run карта
     loyalty_card_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     loyalty_card_number: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    loyalty_card_type_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Список ID campaign-карт, удалённых перед выпуском новой
+    cleanup_card_ids: Mapped[list] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=list,
+        server_default=text("'[]'::jsonb"),
+    )
+    cleanup_failed_reason: Mapped[str | None] = mapped_column(String(256), nullable=True)
 
+    # -----------------------------------------------------------------------
+    # Tracking отправки
+    # -----------------------------------------------------------------------
+    message_job_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey("message_jobs.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    outbox_message_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey("outbox_messages.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     provider_message_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
 
+    # -----------------------------------------------------------------------
+    # Attribution timestamps (заполняются по мере событий)
+    # -----------------------------------------------------------------------
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    replied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    booked_after_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    opted_out_after_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # -----------------------------------------------------------------------
+    # Follow-up
+    # -----------------------------------------------------------------------
+    followup_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    followup_message_job_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey("message_jobs.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    followup_outbox_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey("outbox_messages.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    followup_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # Legacy-поля
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     delete_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
