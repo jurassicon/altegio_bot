@@ -4,6 +4,7 @@
 что и в ops/router.py).
 
 Endpoint'ы:
+  GET  /ops/campaigns/new-clients/card-types
   POST /ops/campaigns/new-clients/preview
   POST /ops/campaigns/new-clients/run
   GET  /ops/campaigns/runs
@@ -20,6 +21,7 @@ Endpoint'ы:
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any, Literal
 
@@ -28,6 +30,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from altegio_bot.altegio_loyalty import AltegioLoyaltyClient
 from altegio_bot.campaigns.followup import execute_followup, followup_run_at, plan_followup
 from altegio_bot.campaigns.reports import monthly_dashboard, run_report
 from altegio_bot.campaigns.runner import (
@@ -39,7 +42,7 @@ from altegio_bot.campaigns.runner import (
     run_preview,
 )
 from altegio_bot.db import SessionLocal
-from altegio_bot.models.models import CampaignRecipient, CampaignRun, MessageJob
+from altegio_bot.models.models import CampaignRecipient, CampaignRun, MessageJob, MessageTemplate
 from altegio_bot.ops.auth import require_ops_auth
 
 logger = logging.getLogger(__name__)
@@ -170,6 +173,119 @@ async def create_run(body: RunRequest) -> dict[str, Any]:
     result["accepted"] = True
     result["message"] = "Campaign run accepted and queued"
     return result
+
+
+# ==========================================================================
+# Справочник типов карт лояльности
+# ==========================================================================
+
+
+@router.get("/new-clients/card-types")
+async def get_card_types_for_location(
+    location_id: int = Query(..., description="Altegio salon/location ID"),
+) -> list[dict[str, Any]]:
+    """Возвращает список типов карт лояльности для заданного location_id.
+
+    Используется HTML-страницей запуска кампании для динамической
+    подгрузки типов карт через AJAX.
+    """
+    client = AltegioLoyaltyClient()
+    try:
+        card_types = await client.get_card_types(location_id)
+        return card_types
+    except Exception as exc:
+        logger.exception("get_card_types failed for location_id=%d: %s", location_id, exc)
+        raise HTTPException(status_code=502, detail=f"Altegio API error: {exc}")
+    finally:
+        await client.aclose()
+
+
+# ==========================================================================
+# Нормализация имени Meta-шаблона
+# ==========================================================================
+
+# Все шаблоны этого проекта имеют префикс вида "kitilash_{brand}_".
+# Regex снимает любой такой префикс, поэтому добавление нового бренда
+# (kitilash_xx_) не требует изменения этого кода.
+_BRAND_PREFIX_RE = re.compile(r"^kitilash_[a-z]+_")
+
+
+def normalize_meta_template_name(template_name: str) -> str:
+    """Нормализовать имя Meta-шаблона в code для точного поиска в БД.
+
+    Пример:
+        "kitilash_ka_newsletter_new_clients_monthly_v2"
+        → "newsletter_new_clients_monthly"
+
+    Алгоритм:
+        1. Убрать брендовый префикс вида kitilash_{brand}_ (любой бренд).
+        2. Убрать версионный суффикс (_v1, _v2, _v3, ...).
+    """
+    code = _BRAND_PREFIX_RE.sub("", template_name)
+    # Убираем версионный суффикс: _v1, _v2, _v3, …
+    code = re.sub(r"_v\d+$", "", code)
+    return code
+
+
+# ==========================================================================
+# Текст Meta-шаблона из БД
+# ==========================================================================
+
+
+@router.get("/new-clients/template-text")
+async def get_template_text(
+    template_name: str = Query(..., description="Meta template name"),
+    company_id: int | None = Query(default=None, description="Campaign company ID"),
+) -> dict[str, Any]:
+    """Загрузить текст шаблона из локальной БД (message_templates).
+
+    Шаблоны синхронизируются из Meta через sync_meta_templates.py.
+
+    Алгоритм поиска:
+        1. Нормализуем template_name → code через normalize_meta_template_name().
+        2. Ищем точное совпадение: WHERE code = :code AND is_active = true.
+        3. Если передан company_id — предпочитаем запись для этой компании.
+        4. Если для company_id не найдено — берём любую активную запись с этим кодом.
+        5. Результат детерминирован: ORDER BY id ASC LIMIT 1.
+
+    Если шаблон не найден — возвращает 404.
+    """
+    code = normalize_meta_template_name(template_name)
+
+    async with SessionLocal() as session:
+        base_stmt = (
+            select(MessageTemplate)
+            .where(MessageTemplate.code == code)
+            .where(MessageTemplate.is_active.is_(True))
+            .order_by(MessageTemplate.id.asc())
+            .limit(1)
+        )
+
+        match = None
+
+        # Сначала ищем шаблон для конкретной компании
+        if company_id is not None:
+            company_stmt = base_stmt.where(MessageTemplate.company_id == company_id)
+            match = (await session.execute(company_stmt)).scalar_one_or_none()
+
+        # Fallback: берём первый активный шаблон с таким кодом (детерминированно по id ASC)
+        if match is None:
+            match = (await session.execute(base_stmt)).scalar_one_or_none()
+
+    if match is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Шаблон с кодом '{code}' (из '{template_name}') не найден в локальной БД",
+        )
+
+    return {
+        "template_name": template_name,
+        "code": match.code,
+        "language": match.language,
+        "body": match.body,
+        "company_id": match.company_id,
+        "is_active": match.is_active,
+    }
 
 
 # ==========================================================================
@@ -659,6 +775,15 @@ def _run_summary(run: CampaignRun) -> dict[str, Any]:
         "last_error": _last_error(run),
         "created_at": _iso(run.created_at),
         "completed_at": _iso(run.completed_at),
+        "excluded": {
+            "opted_out": run.excluded_opted_out or 0,
+            "no_phone": run.excluded_no_phone or 0,
+            "invalid_phone": run.excluded_invalid_phone or 0,
+            "no_whatsapp": run.excluded_no_whatsapp or 0,
+            "multiple_records_in_period": run.excluded_multiple_records or 0,
+            "no_confirmed_record_in_period": run.excluded_no_confirmed_record or 0,
+            "has_records_before_period": run.excluded_has_records_before or 0,
+        },
     }
 
 
