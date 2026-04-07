@@ -217,16 +217,12 @@ async def get_template_text(
         stmt = select(MessageTemplate).where(MessageTemplate.is_active.is_(True)).order_by(MessageTemplate.id.desc())
         rows = (await session.execute(stmt)).scalars().all()
 
-    # Ищем по точному совпадению code или по вхождению имени
-    # (sync_meta_templates.py нормализует name → code без префикса/версии)
+    # Ищем по совпадению code внутри template_name или наоборот
+    # (sync_meta_templates.py нормализует name → code без префикса/версии,
+    #  например "newsletter_new_clients_monthly" из "kitilash_ka_newsletter_new_clients_monthly_v2")
     match = None
     for row in rows:
-        # Прямое совпадение по code (например "newsletter_new_clients_monthly")
-        if row.code and template_name.endswith(row.code):
-            match = row
-            break
-        # Или полное имя шаблона совпадает с началом кода
-        if row.code and row.code in template_name:
+        if row.code and (row.code in template_name or template_name.endswith(row.code)):
             match = row
             break
 
