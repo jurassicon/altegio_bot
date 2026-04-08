@@ -37,6 +37,7 @@ from altegio_bot.campaigns.runner import (
     CAMPAIGN_CODE,
     CAMPAIGN_EXECUTION_JOB_TYPE,
     RunParams,
+    discard_preview_run,
     enqueue_send_real,
     resume_send_real,
     run_preview,
@@ -572,6 +573,44 @@ async def run_followup_now(run_id: int) -> dict[str, Any]:
 
 
 # ==========================================================================
+# Discard preview
+# ==========================================================================
+
+
+@router.post("/runs/{run_id}/discard")
+async def discard_run(run_id: int) -> dict[str, Any]:
+    """Пометить preview-run как discarded (soft-delete).
+
+    Разрешено только для preview-run, который ещё не использован
+    как source_preview_run_id для какого-либо send-real.
+    """
+    async with SessionLocal() as session:
+        run = await session.get(CampaignRun, run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="Run not found")
+
+    try:
+        await discard_preview_run(run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.exception("discard failed run_id=%d: %s", run_id, exc)
+        raise HTTPException(status_code=500, detail="Internal discard error")
+
+    async with SessionLocal() as session:
+        run = await session.get(CampaignRun, run_id)
+
+    if run is None:
+        raise HTTPException(status_code=500, detail="Run disappeared after discard")
+
+    return {
+        "run_id": run_id,
+        "status": run.status,
+        "message": "Preview run discarded",
+    }
+
+
+# ==========================================================================
 # Resume
 # ==========================================================================
 
@@ -775,6 +814,9 @@ def _run_summary(run: CampaignRun) -> dict[str, Any]:
         "last_error": _last_error(run),
         "created_at": _iso(run.created_at),
         "completed_at": _iso(run.completed_at),
+        # Preview-специфичные поля
+        "is_preview": run.mode == "preview",
+        "is_discardable": (run.mode == "preview" and run.status not in ("discarded",)),
         "excluded": {
             "opted_out": run.excluded_opted_out or 0,
             "no_phone": run.excluded_no_phone or 0,
@@ -842,6 +884,11 @@ def _recipient_dict(r: CampaignRecipient) -> dict[str, Any]:
             "total_records_in_period": r.total_records_in_period,
             "confirmed_records_in_period": r.confirmed_records_in_period,
             "records_before_period": r.records_before_period,
+            "lash_records_in_period": r.lash_records_in_period,
+            "confirmed_lash_records_in_period": r.confirmed_lash_records_in_period,
+            "service_titles_in_period": list(r.service_titles_in_period or []),
+            "total_records_before_period_any": r.total_records_before_period_any,
+            "local_client_found": r.local_client_found,
             "is_opted_out": r.is_opted_out,
         },
         "loyalty": {

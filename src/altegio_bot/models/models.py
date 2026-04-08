@@ -761,6 +761,22 @@ class CampaignRecipient(Base):
     is_opted_out: Mapped[bool] = mapped_column(Boolean, default=False)
 
     # -----------------------------------------------------------------------
+    # CRM-диагностика (заполняется при сегментации через Altegio CRM API)
+    # -----------------------------------------------------------------------
+    # Ресничные записи в периоде (из local RecordService + category lookup)
+    lash_records_in_period: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    # Подтверждённые ресничные записи в периоде
+    confirmed_lash_records_in_period: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    # Названия услуг из периода (для диагностики)
+    service_titles_in_period: Mapped[list] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb")
+    )
+    # Все записи до начала периода по данным Altegio CRM (источник истины)
+    total_records_before_period_any: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    # Найден ли локальный Client в нашей БД
+    local_client_found: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+
+    # -----------------------------------------------------------------------
     # Loyalty-карты
     # -----------------------------------------------------------------------
     # Выпущенная в этом run карта

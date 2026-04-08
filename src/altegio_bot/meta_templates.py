@@ -36,6 +36,7 @@ UNIVERSAL_JOB_TYPES: frozenset[str] = frozenset(
         "repeat_10d",
         "comeback_3d",
         "newsletter_new_clients_monthly",
+        "newsletter_new_clients_followup",
     }
 )
 
@@ -58,6 +59,7 @@ META_TEMPLATE_MAP: dict[tuple[int, str], str] = {
     (_KA, "repeat_10d"): "kitilash_ka_repeat_10d_v1",
     (_KA, "comeback_3d"): "kitilash_ka_comeback_3d_v1",
     (_KA, "newsletter_new_clients_monthly"): "kitilash_ka_newsletter_new_clients_monthly_v2",
+    (_KA, "newsletter_new_clients_followup"): "kitilash_ka_newsletter_new_clients_followup_v1",
     # --- Rastatt ---
     # ra_record_created_v1 exists; others fall back to ka_* templates
     (_RA, "record_created"): "kitilash_ra_record_created_v1",
@@ -69,6 +71,7 @@ META_TEMPLATE_MAP: dict[tuple[int, str], str] = {
     (_RA, "repeat_10d"): "kitilash_ka_repeat_10d_v1",
     (_RA, "comeback_3d"): "kitilash_ka_comeback_3d_v1",
     (_RA, "newsletter_new_clients_monthly"): "kitilash_ka_newsletter_new_clients_monthly_v2",
+    (_RA, "newsletter_new_clients_followup"): "kitilash_ka_newsletter_new_clients_followup_v1",
 }
 
 # Karlsruhe new-client variant for record_created
@@ -222,6 +225,12 @@ def build_template_params(
 
     # Legacy v1 – kept for backward compatibility
     if n == "kitilash_ka_newsletter_new_clients_monthly_v1":
+        return [
+            ctx.get("client_name", ""),
+            ctx.get("booking_link", ""),
+        ]
+
+    if n == "kitilash_ka_newsletter_new_clients_followup_v1":
         return [
             ctx.get("client_name", ""),
             ctx.get("booking_link", ""),

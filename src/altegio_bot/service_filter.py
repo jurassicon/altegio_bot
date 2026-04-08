@@ -117,6 +117,31 @@ async def _fetch_service_category_id(
     return None
 
 
+async def is_lash_service(company_id: int, service_id: int) -> bool:
+    """Вернуть True, если service_id принадлежит категории ресниц для компании.
+
+    Использует in-memory кеш и Altegio API для получения category_id.
+    При сбое API возвращает False (консервативная стратегия).
+    """
+    allowed = LASH_CATEGORY_IDS_BY_COMPANY.get(company_id)
+    if not allowed:
+        return False
+
+    key = (company_id, service_id)
+    category_id = _SERVICE_CATEGORY_CACHE.get(key)
+    if category_id is None:
+        fetched = await _fetch_service_category_id(
+            company_id=company_id,
+            service_id=service_id,
+        )
+        if fetched is None:
+            return False
+        _cache_put(key, fetched)
+        category_id = fetched
+
+    return category_id in allowed
+
+
 async def record_has_allowed_service(
     session: AsyncSession,
     *,

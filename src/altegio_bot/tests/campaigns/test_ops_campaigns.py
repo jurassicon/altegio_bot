@@ -467,22 +467,24 @@ async def test_ops_new_clients_buildpayload_contains_followup(http_client: Async
 
 
 # ---------------------------------------------------------------------------
-# Location — human-readable select
+# Company / филиал select (единый, заменяет отдельный location)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_ops_new_clients_page_has_location_select(http_client: AsyncClient) -> None:
-    """Location теперь human-readable select, а не numeric input."""
+async def test_ops_new_clients_page_has_company_select(http_client: AsyncClient) -> None:
+    """Один dropdown id="f-company" выбирает филиал (company_id = location_id)."""
     response = await http_client.get("/ops/campaigns/new-clients")
     assert response.status_code == 200
     text = response.text
-    # Это select, а не input type=number
-    assert 'id="f-location"' in text
-    assert "form-select" in text.split('id="f-location"')[1][:200]
-    # Human-readable названия филиалов
-    assert "Karlsruhe (location_id=758285)" in text
-    assert "Rastatt (location_id=1271200)" in text
+    # Единый select для кабинета/филиала
+    assert 'id="f-company"' in text
+    assert "form-select" in text.split('id="f-company"')[1][:200]
+    # Отдельного f-location быть не должно
+    assert 'id="f-location"' not in text
+    # Опции содержат человекочитаемые названия филиалов
+    assert "Karlsruhe" in text
+    assert "Rastatt" in text
 
 
 # ---------------------------------------------------------------------------
