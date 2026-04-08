@@ -11,8 +11,10 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from altegio_bot.altegio_records import count_attended_client_visits
-from altegio_bot.campaigns.runner import CAMPAIGN_EXECUTION_JOB_TYPE
+from altegio_bot.altegio_records import (
+    client_has_future_appointments,
+    count_attended_client_visits,
+)
 from altegio_bot.db import SessionLocal
 from altegio_bot.message_planner import MAX_VISITS_FOR_REVIEW
 from altegio_bot.meta_templates import (
@@ -59,6 +61,13 @@ TOKEN_EXPIRED_RETRY_SECONDS = 60
 STOP_WORKER_ON_TOKEN_EXPIRED_ENV = "STOP_WORKER_ON_TOKEN_EXPIRED"
 _TOKEN_EXPIRED = False
 
+# Maximum number of Altegio API guard retries (for repeat_10d / review_3d
+# pre-send checks). This counter is stored in job.payload["_api_guard_attempts"]
+# and is intentionally separate from the ``attempts`` field, which counts only
+# real WhatsApp send attempts. This prevents transient Altegio API outages from
+# consuming the send-attempt budget.
+MAX_API_GUARD_ATTEMPTS = 5
+
 STALE_PROCESSING_MINUTES = 10
 
 DEFAULT_LANGUAGE_BY_COMPANY = {
@@ -72,8 +81,8 @@ BOOKING_LINKS = {
 }
 
 GOOGLE_MAPS_REVIEW_LINKS: dict[int, str] = {
-    758285: "https://g.page/r/CdOqDUWhxCAbEBM/review",  # Karlsruhe
-    1271200: "https://g.page/r/CWd7fy4dua5kEBM/review",  # Rastatt
+    758285: "https://g.page/r/CdOqDUWhxCAbEBM/review",
+    1271200: "https://g.page/r/CWd7fy4dua5kEBM/review",
 }
 
 PRE_APPOINTMENT_NOTES_DE = (
@@ -158,6 +167,35 @@ def _retry_delay_seconds(attempt: int) -> int:
     return min(delay, 15 * 60)
 
 
+def _get_api_guard_attempts(job: MessageJob) -> int:
+    """Return the current API guard retry count from job.payload."""
+    return int((getattr(job, "payload", None) or {}).get("_api_guard_attempts", 0))
+
+
+def _handle_api_guard_error(job: MessageJob, exc: Exception) -> None:
+    """Increment the API guard counter and requeue or permanently fail the job.
+
+    The guard counter lives in ``job.payload["_api_guard_attempts"]`` so it
+    does not share the ``attempts`` budget with actual WhatsApp send attempts.
+    """
+    payload = dict(getattr(job, "payload", None) or {})
+    count = int(payload.get("_api_guard_attempts", 0)) + 1
+    payload["_api_guard_attempts"] = count
+    job.payload = payload
+
+    if count >= MAX_API_GUARD_ATTEMPTS:
+        job.status = "failed"
+        job.locked_at = None
+        job.last_error = f"Altegio API error (max guard attempts): {exc}"
+        return
+
+    delay = _retry_delay_seconds(count)
+    job.status = "queued"
+    job.locked_at = None
+    job.run_at = utcnow() + timedelta(seconds=delay)
+    job.last_error = f"Altegio API error: {exc}"
+
+
 def _fmt_money(value: Decimal | None) -> str:
     if value is None:
         return "0.00"
@@ -187,14 +225,13 @@ async def _lock_next_jobs(
     stmt = (
         select(MessageJob)
         .where(MessageJob.status == "queued")
-        .where(MessageJob.job_type != CAMPAIGN_EXECUTION_JOB_TYPE)
         .where(MessageJob.run_at <= now)
         .order_by(MessageJob.run_at.asc())
         .limit(batch_size)
         .with_for_update(skip_locked=True)
     )
-    result = await session.execute(stmt)
-    jobs = list(result.scalars().all())
+    res = await session.execute(stmt)
+    jobs = list(res.scalars().all())
 
     for job in jobs:
         job.status = "processing"
@@ -225,7 +262,6 @@ async def _requeue_stale_processing_jobs(session: AsyncSession) -> int:
     stmt = (
         update(MessageJob)
         .where(MessageJob.status == "processing")
-        .where(MessageJob.job_type != CAMPAIGN_EXECUTION_JOB_TYPE)
         .where(MessageJob.locked_at.is_not(None))
         .where(MessageJob.locked_at < cutoff)
         .values(
@@ -235,8 +271,8 @@ async def _requeue_stale_processing_jobs(session: AsyncSession) -> int:
             last_error="Recovered: stale processing job",
         )
     )
-    result = await session.execute(stmt)
-    return int(getattr(result, "rowcount", 0) or 0)
+    res = await session.execute(stmt)
+    return int(getattr(res, "rowcount", 0) or 0)
 
 
 async def _apply_rate_limit(
@@ -445,7 +481,10 @@ async def _render_message(
     }
 
     if template_code == "review_3d":
-        ctx["short_link"] = GOOGLE_MAPS_REVIEW_LINKS.get(company_id, ctx["short_link"])
+        ctx["short_link"] = GOOGLE_MAPS_REVIEW_LINKS.get(
+            company_id,
+            ctx["short_link"],
+        )
 
     body = tmpl.body
     return body, sender_id, used_lang, ctx
@@ -559,47 +598,63 @@ async def _run_job_logic(
             return
 
     if job.job_type == "review_3d":
-        # Guard uses Altegio API as source of truth for visit counts.
-        # The local ``records`` table is a partial sync and under-
-        # counts real visits (webhooks missed before bot deployment
-        # are absent).  A transient API failure requeues the job
-        # with exponential backoff — never treat failure as 0 visits.
         altegio_cid = getattr(client, "altegio_client_id", None) if client is not None else None
         if altegio_cid is None:
             job.status = "canceled"
             job.locked_at = None
             job.last_error = "Skipped: no altegio_client_id for review_3d"
             return
+
         try:
             attended = await count_attended_client_visits(
                 company_id=job.company_id,
                 altegio_client_id=altegio_cid,
             )
         except Exception as exc:
-            next_attempt = attempts + 1
-            setattr(job, "attempts", next_attempt)
             logger.warning(
-                "review_3d guard: Altegio API failed job_id=%s altegio_client_id=%s attempt=%d: %s",
+                "review_3d guard: Altegio API failed job_id=%s altegio_client_id=%s guard_attempt=%d: %s",
                 job.id,
                 altegio_cid,
-                next_attempt,
+                _get_api_guard_attempts(job) + 1,
                 exc,
             )
-            if next_attempt >= max_attempts:
-                job.status = "failed"
-                job.locked_at = None
-                job.last_error = f"Altegio API error (max attempts): {exc}"
-            else:
-                delay = _retry_delay_seconds(next_attempt)
-                job.status = "queued"
-                job.locked_at = None
-                job.run_at = utcnow() + timedelta(seconds=delay)
-                job.last_error = f"Altegio API error: {exc}"
+            _handle_api_guard_error(job, exc)
             return
+
         if attended > MAX_VISITS_FOR_REVIEW:
             job.status = "canceled"
             job.locked_at = None
             job.last_error = f"Skipped: client has >{MAX_VISITS_FOR_REVIEW} attended visits (Altegio API)"
+            return
+
+    if job.job_type == "repeat_10d":
+        altegio_cid = getattr(client, "altegio_client_id", None) if client is not None else None
+        if altegio_cid is None:
+            job.status = "canceled"
+            job.locked_at = None
+            job.last_error = "Skipped: no altegio_client_id for repeat_10d"
+            return
+
+        try:
+            has_future_appointment = await client_has_future_appointments(
+                company_id=job.company_id,
+                altegio_client_id=altegio_cid,
+            )
+        except Exception as exc:
+            logger.warning(
+                "repeat_10d guard: Altegio API failed job_id=%s altegio_client_id=%s guard_attempt=%d: %s",
+                job.id,
+                altegio_cid,
+                _get_api_guard_attempts(job) + 1,
+                exc,
+            )
+            _handle_api_guard_error(job, exc)
+            return
+
+        if has_future_appointment:
+            job.status = "canceled"
+            job.locked_at = None
+            job.last_error = "Skipped: client already has a future appointment (Altegio API)"
             return
 
     if record is not None and getattr(record, "is_deleted", False):
@@ -618,7 +673,6 @@ async def _run_job_logic(
                 return
 
             if client is not None:
-                # Правило 1: Есть ли у клиента активная будущая запись?
                 future_stmt = (
                     select(Record.id)
                     .where(Record.company_id == job.company_id)
@@ -634,7 +688,6 @@ async def _run_job_logic(
                     job.last_error = "Skipped: client already has a future appointment"
                     return
 
-                # Правило 2: Не спамить частыми отменами (кулдаун 30 дней)
                 cutoff_30d = utcnow() - timedelta(days=30)
                 sent_stmt = (
                     select(OutboxMessage.id)
@@ -680,7 +733,6 @@ async def _run_job_logic(
         job.last_error = f"Template render error: {exc}"
         return
 
-    # Inject job-payload extras that templates may reference.
     loyalty_card_text = (getattr(job, "payload", None) or {}).get("loyalty_card_text", "")
 
     if loyalty_card_text:
@@ -703,9 +755,6 @@ async def _run_job_logic(
             is_new_client=is_new,
         )
         if meta_template_name is None:
-            # In template/auto mode failing is preferred over text fallback
-            # so that misconfigured jobs surface immediately.
-            # Exception: text mode always allows free-form sends.
             job.status = "failed"
             job.locked_at = None
             job.last_error = f"No Meta template for company={job.company_id} job_type={job.job_type}"
@@ -917,7 +966,6 @@ async def run_once(
         stmt = (
             select(MessageJob.id)
             .where(MessageJob.status == "queued")
-            .where(MessageJob.job_type != CAMPAIGN_EXECUTION_JOB_TYPE)
             .where(MessageJob.run_at <= func.now())
             .order_by(MessageJob.run_at.asc(), MessageJob.id.asc())
             .limit(limit)
@@ -925,11 +973,15 @@ async def run_once(
         if company_id is not None:
             stmt = stmt.where(MessageJob.company_id == company_id)
 
-        result = await session.execute(stmt)
-        ids = list(result.scalars().all())
+        res = await session.execute(stmt)
+        ids = list(res.scalars().all())
 
         for job_id in ids:
-            await process_job_in_session(session, int(job_id), provider=provider)
+            await process_job_in_session(
+                session,
+                int(job_id),
+                provider=provider,
+            )
 
         await session.commit()
         return len(ids)

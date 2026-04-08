@@ -18,7 +18,7 @@ Covers three layers:
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from unittest.mock import AsyncMock
@@ -59,6 +59,7 @@ class FakeJob:
     attempts: int = 0
     max_attempts: int = 5
     locked_at: datetime | None = None
+    payload: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -528,18 +529,27 @@ def test_worker_requeues_review_3d_on_api_error(
     )
 
     assert job.status == "queued"
-    assert job.attempts == 1
+    # Guard failures use the separate _api_guard_attempts counter in payload;
+    # the send-attempt budget (job.attempts) must remain untouched.
+    assert job.attempts == 0
+    assert job.payload.get("_api_guard_attempts") == 1
     assert job.locked_at is None
     assert job.run_at == FIXED_NOW + timedelta(seconds=30)  # _retry_delay_seconds(1)
     assert "Altegio API error" in (job.last_error or "")
 
 
-def test_worker_fails_review_3d_on_api_error_after_max_attempts(
+def test_worker_fails_review_3d_on_api_error_after_max_guard_attempts(
     monkeypatch: Any,
 ) -> None:
-    """API error at max_attempts: job is marked failed (terminal)."""
+    """API guard error at MAX_API_GUARD_ATTEMPTS: job is marked failed (terminal).
+
+    Guard retries use payload['_api_guard_attempts'], not job.attempts.
+    Setting the guard counter to MAX_API_GUARD_ATTEMPTS - 1 means the next
+    failure will tip it over the limit and permanently fail the job.
+    """
     job = _make_review_3d_job()
-    job.attempts = job.max_attempts - 1  # next attempt hits the limit
+    # Simulate the job having already exhausted all but one guard retry.
+    job.payload = {"_api_guard_attempts": ow.MAX_API_GUARD_ATTEMPTS - 1}
     _patch_worker_common(monkeypatch, job)
 
     async def _raise(*_a: Any, **_kw: Any) -> int:
@@ -560,8 +570,9 @@ def test_worker_fails_review_3d_on_api_error_after_max_attempts(
     )
 
     assert job.status == "failed"
-    assert job.attempts == job.max_attempts
-    assert "max attempts" in (job.last_error or "").lower()
+    assert job.attempts == 0  # send budget untouched
+    assert job.payload.get("_api_guard_attempts") == ow.MAX_API_GUARD_ATTEMPTS
+    assert "max guard attempts" in (job.last_error or "").lower()
 
 
 # ─────────────────────────────────────────────────────────────────────
