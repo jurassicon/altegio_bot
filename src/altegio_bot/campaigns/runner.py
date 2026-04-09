@@ -14,12 +14,13 @@ from altegio_bot.campaigns.loyalty_cleanup import (
     make_card_number,
     make_card_text,
 )
-from altegio_bot.campaigns.segment import ClientCandidate, find_candidates
+from altegio_bot.campaigns.segment import ClientCandidate, ClientSnapshot, find_candidates
 from altegio_bot.db import SessionLocal
 from altegio_bot.message_planner import add_job, make_dedupe_key
 from altegio_bot.models.models import (
     CampaignRecipient,
     CampaignRun,
+    Client,
     MessageJob,
 )
 from altegio_bot.utils import utcnow
@@ -173,6 +174,11 @@ def _build_recipient(
         total_records_in_period=candidate.total_records_in_period,
         confirmed_records_in_period=candidate.confirmed_records_in_period,
         records_before_period=candidate.records_before_period,
+        lash_records_in_period=candidate.lash_records_in_period,
+        confirmed_lash_records_in_period=candidate.confirmed_lash_records_in_period,
+        service_titles_in_period=candidate.service_titles_in_period or [],
+        total_records_before_period_any=candidate.records_before_period,
+        local_client_found=candidate.local_client_found,
         is_opted_out=client.wa_opted_out,
         status="skipped" if candidate.excluded_reason else "candidate",
         excluded_reason=candidate.excluded_reason,
@@ -184,58 +190,127 @@ def _update_run_exclusion_counters(
     run: CampaignRun,
     candidates: list[ClientCandidate],
 ) -> None:
-    """Обновить счётчики исключений в run по результатам сегментации."""
+    """Пересчитать счётчики исключений в run по результатам сегментации.
+
+    Идемпотентна: перед накоплением все агрегируемые поля обнуляются.
+    Повторный вызов с теми же candidates всегда даёт тот же результат.
+    """
+    # Обнуляем все счётчики перед пересчётом — идемпотентность
+    run.total_clients_seen = 0
+    run.candidates_count = 0
+    run.excluded_opted_out = 0
+    run.excluded_no_phone = 0
+    run.excluded_has_records_before = 0
+    run.excluded_multiple_records = 0
+    run.excluded_more_than_one_record = 0
+    run.excluded_no_confirmed_record = 0
+    run.excluded_crm_unavailable = 0
+    run.excluded_service_category_unavailable = 0
+
     run.total_clients_seen = len(candidates)
+
     for candidate in candidates:
-        if not candidate.excluded_reason:
+        reason = candidate.excluded_reason
+        if not reason:
             run.candidates_count += 1
             continue
 
-        reason = candidate.excluded_reason
         if reason == "opted_out":
             run.excluded_opted_out += 1
         elif reason == "no_phone":
             run.excluded_no_phone += 1
         elif reason == "has_records_before_period":
             run.excluded_has_records_before += 1
-        elif reason == "multiple_records_in_period":
+        elif reason in ("multiple_records_in_period", "multiple_lash_records_in_period"):
             run.excluded_multiple_records += 1
             run.excluded_more_than_one_record += 1
-        elif reason == "no_confirmed_record_in_period":
+        elif reason in (
+            "no_confirmed_record_in_period",
+            "no_lash_record_in_period",
+            "no_confirmed_lash_record_in_period",
+        ):
             run.excluded_no_confirmed_record += 1
+        elif reason == "crm_history_unavailable":
+            run.excluded_crm_unavailable += 1
+        elif reason == "service_category_unavailable":
+            run.excluded_service_category_unavailable += 1
 
 
 async def run_preview(params: RunParams) -> CampaignRun:
-    """Запустить preview: сегментация без отправки."""
+    """Запустить preview: сегментация без отправки.
+
+    Транзакционная безопасность:
+      1. Короткая транзакция: создать run со статусом 'running'.
+      2. CRM HTTP-запросы без открытой транзакции БД.
+      3. Короткая транзакция: сохранить recipients + перевести в 'completed'.
+    """
+    # Фаза 1: создать run (короткая транзакция)
     async with SessionLocal() as session:
         async with session.begin():
             run = await _create_run(session, params, status="running")
+            run_id = run.id
 
-            candidates = await find_candidates(
-                session,
-                company_id=params.company_id,
-                period_start=params.period_start,
-                period_end=params.period_end,
-            )
+    # Фаза 2: CRM HTTP-запросы (без открытой транзакции БД)
+    try:
+        candidates = await find_candidates(
+            company_id=params.company_id,
+            period_start=params.period_start,
+            period_end=params.period_end,
+        )
+    except Exception as exc:
+        await _mark_run_failed(run_id, str(exc))
+        raise
+
+    # Фаза 3: сохранить результаты (короткая транзакция)
+    async with SessionLocal() as session:
+        async with session.begin():
+            run = await session.get(CampaignRun, run_id)
+            if run is None:
+                raise RuntimeError(f"CampaignRun {run_id} disappeared after creation")
+
+            # Финальная проверка статуса — до любых изменений.
+            # Если между фазой 1 и фазой 3 run был переведён во внешнее состояние
+            # (например, failed через timeout или отмену), откатываем транзакцию
+            # и сигнализируем об ошибке. Не должно быть ложного success-flow.
+            if run.status != "running":
+                logger.error(
+                    "preview run_id=%d: finalization aborted — status=%r instead of 'running' "
+                    "(run was externally modified between segmentation and finalization)",
+                    run_id,
+                    run.status,
+                )
+                raise RuntimeError(
+                    f"preview run_id={run_id}: finalization aborted — status was {run.status!r} instead of 'running'"
+                )
 
             _update_run_exclusion_counters(run, candidates)
-
             for candidate in candidates:
-                recipient = _build_recipient(run.id, candidate)
-                session.add(recipient)
+                session.add(_build_recipient(run_id, candidate))
+
+            # Записать источник обнаружения кандидатов в meta
+            meta = dict(run.meta or {})
+            meta["discovery_source"] = "local_db"
+            run.meta = meta
 
             run.status = "completed"
             run.completed_at = utcnow()
 
+            # Захватить значения счётчиков до закрытия сессии.
+            # SessionLocal настроен с expire_on_commit=False, поэтому атрибуты
+            # доступны после коммита. Но явные локальные переменные надёжнее.
+            total_seen = run.total_clients_seen
+            cands_count = run.candidates_count
+
     logger.info(
-        "preview run_id=%d company=%d period=[%s, %s) total=%d eligible=%d",
-        run.id,
+        "preview completed run_id=%d company=%d period=[%s, %s) total=%d eligible=%d",
+        run_id,
         params.company_id,
         params.period_start.date(),
         params.period_end.date(),
-        run.total_clients_seen,
-        run.candidates_count,
+        total_seen,
+        cands_count,
     )
+    # expire_on_commit=False — атрибуты run доступны после закрытия сессии.
     return run
 
 
@@ -264,11 +339,100 @@ async def enqueue_send_real(params: RunParams) -> CampaignRun:
     return run
 
 
+async def _load_candidates_from_preview_snapshot(
+    session: AsyncSession,
+    preview_run_id: int,
+) -> list[ClientCandidate]:
+    """Загрузить кандидатов из snapshot preview-run.
+
+    Не пересчитывает сегментацию — использует сохранённые CampaignRecipient.
+    Если локальный Client не найден — recipient помечается excluded_reason='no_local_client'.
+    """
+    stmt = (
+        select(CampaignRecipient)
+        .where(CampaignRecipient.campaign_run_id == preview_run_id)
+        .order_by(CampaignRecipient.id.asc())
+    )
+    preview_recipients = (await session.execute(stmt)).scalars().all()
+
+    if not preview_recipients:
+        raise RuntimeError(f"Preview run {preview_run_id} has no recipients (empty snapshot)")
+
+    # Предзагрузить клиентов одним запросом
+    local_client_ids = [r.client_id for r in preview_recipients if r.client_id is not None]
+    clients_map: dict[int, Client] = {}
+    if local_client_ids:
+        clients_stmt = select(Client).where(Client.id.in_(local_client_ids))
+        clients_map = {c.id: c for c in (await session.execute(clients_stmt)).scalars()}
+
+    candidates: list[ClientCandidate] = []
+    for r in preview_recipients:
+        local_client = clients_map.get(r.client_id) if r.client_id else None
+
+        if local_client is None:
+            # Нет локального клиента — используем данные из snapshot
+            excluded = r.excluded_reason or "no_local_client"
+            snapshot = ClientSnapshot(
+                id=None,
+                company_id=r.company_id,
+                altegio_client_id=r.altegio_client_id,
+                display_name=r.display_name,
+                phone_e164=r.phone_e164,
+                wa_opted_out=bool(r.is_opted_out),
+            )
+        else:
+            excluded = r.excluded_reason  # None → eligible
+            snapshot = ClientSnapshot(
+                id=local_client.id,
+                company_id=local_client.company_id,
+                altegio_client_id=local_client.altegio_client_id,
+                display_name=local_client.display_name,
+                phone_e164=local_client.phone_e164,
+                wa_opted_out=bool(local_client.wa_opted_out),
+            )
+
+        c = ClientCandidate(
+            client=snapshot,
+            total_records_in_period=r.total_records_in_period or 0,
+            confirmed_records_in_period=r.confirmed_records_in_period or 0,
+            lash_records_in_period=r.lash_records_in_period or 0,
+            confirmed_lash_records_in_period=r.confirmed_lash_records_in_period or 0,
+            service_titles_in_period=list(r.service_titles_in_period or []),
+            records_before_period=r.records_before_period or 0,
+            local_client_found=local_client is not None,
+            excluded_reason=excluded,
+        )
+        candidates.append(c)
+
+    logger.info(
+        "snapshot loaded preview_run_id=%d total=%d eligible=%d",
+        preview_run_id,
+        len(candidates),
+        sum(1 for c in candidates if c.is_eligible),
+    )
+    return candidates
+
+
 async def _execute_send_real_for_existing_run(
     run_id: int,
     params: RunParams,
 ) -> None:
-    """Выполнить send-real для уже созданного CampaignRun."""
+    """Выполнить send-real для уже созданного CampaignRun.
+
+    Если source_preview_run_id задан — использует snapshot preview-run
+    и НЕ пересчитывает сегментацию. Это гарантирует, что оператор
+    запускает именно то, что видел в preview.
+
+    Транзакционная безопасность:
+      1. Короткая транзакция: перевести run в 'running'.
+      2. Загрузить кандидатов — без открытой транзакции БД:
+         - snapshot: короткая сессия (только SELECT).
+         - fresh: CRM HTTP-запросы без открытой транзакции.
+      3. Короткая транзакция: обновить счётчики run.
+      4. Обработать каждого кандидата (loyalty + messages).
+      5. Короткая транзакция: финализировать run.
+    """
+    # Фаза 1: перевести в 'running' (короткая транзакция)
     async with SessionLocal() as session:
         async with session.begin():
             run = await session.get(CampaignRun, run_id)
@@ -286,14 +450,37 @@ async def _execute_send_real_for_existing_run(
 
             meta = dict(run.meta or {})
             meta.pop("last_error", None)
+            if params.source_preview_run_id:
+                meta["used_preview_snapshot"] = params.source_preview_run_id
+                # Источник данных — snapshot preview-run, не свежая сегментация.
+                meta["discovery_source"] = "preview_snapshot"
+            else:
+                # Свежая сегментация через локальную БД — фиксируем ограничение обнаружения.
+                meta["discovery_source"] = "local_db"
             run.meta = meta
 
-            candidates = await find_candidates(
+    # Фаза 2: загрузить кандидатов (вне открытой транзакции)
+    if params.source_preview_run_id:
+        # Snapshot: короткая сессия только для SELECT
+        async with SessionLocal() as session:
+            candidates = await _load_candidates_from_preview_snapshot(
                 session,
-                company_id=params.company_id,
-                period_start=params.period_start,
-                period_end=params.period_end,
+                params.source_preview_run_id,
             )
+    else:
+        # Свежая сегментация — CRM HTTP-запросы без открытой транзакции БД
+        candidates = await find_candidates(
+            company_id=params.company_id,
+            period_start=params.period_start,
+            period_end=params.period_end,
+        )
+
+    # Фаза 3: обновить счётчики (короткая транзакция)
+    async with SessionLocal() as session:
+        async with session.begin():
+            run = await session.get(CampaignRun, run_id)
+            if run is None:
+                raise RuntimeError(f"CampaignRun {run_id} not found")
             _update_run_exclusion_counters(run, candidates)
 
     loyalty = AltegioLoyaltyClient()
@@ -341,19 +528,36 @@ async def _execute_send_real_for_existing_run(
                 if run is None:
                     raise RuntimeError(f"CampaignRun {run_id} not found")
 
+                # Финальная проверка статуса — до любых изменений.
+                # Если между фазой 1 и финализацией run был переведён во внешнее состояние,
+                # откатываем транзакцию и сигнализируем. Не должно быть ложного success-flow.
+                if run.status != "running":
+                    logger.error(
+                        "send-real run_id=%d: finalization aborted — status=%r instead of 'running' "
+                        "(run was externally modified between processing and finalization)",
+                        run_id,
+                        run.status,
+                    )
+                    raise RuntimeError(
+                        f"send-real run_id={run_id}: finalization aborted — "
+                        f"status was {run.status!r} instead of 'running'"
+                    )
+
                 run.cleanup_failed_count = stats["cleanup_failed"]
                 run.cards_deleted_count = stats["cards_deleted"]
                 run.cards_issued_count = stats["cards_issued"]
                 run.queued_count = stats["queued"]
                 run.failed_count = stats["failed"]
                 run.sent_count = stats["queued"]
-                run.status = "completed"
-                run.completed_at = utcnow()
 
                 meta = dict(run.meta or {})
                 meta.pop("last_error", None)
                 run.meta = meta
 
+                run.status = "completed"
+                run.completed_at = utcnow()
+
+        # Лог только после успешной финализации (exception выше не допустит сюда при guard)
         logger.info(
             "send-real completed run_id=%d company=%d stats=%s",
             run_id,
@@ -439,6 +643,20 @@ async def _process_eligible(
 ) -> None:
     client = candidate.client
     client_id = client.id
+
+    # Инвариант: eligible candidate обязан иметь локальный client_id.
+    # Snapshot с id=None может прийти из _load_candidates_from_preview_snapshot
+    # при отсутствии локального Client, но такой candidate всегда excluded
+    # (excluded_reason='no_local_client'). Если это условие нарушено — это баг.
+    if client_id is None:
+        logger.error(
+            "process_eligible: eligible candidate has client.id=None "
+            "(company=%d phone=%s) — skipping (invariant violation)",
+            client.company_id,
+            client.phone_e164,
+        )
+        stats["failed"] += 1
+        return
 
     async with SessionLocal() as session:
         async with session.begin():
@@ -1004,3 +1222,52 @@ async def resume_send_real(run_id: int) -> dict:
         "skipped_count": stats["skipped"],
         "remaining_manual_count": remaining_manual_count,
     }
+
+
+# ==========================================================================
+# Discard preview run
+# ==========================================================================
+
+
+async def discard_preview_run(run_id: int) -> None:
+    """Пометить preview-run как discarded (soft-delete).
+
+    Правила:
+    - Только для mode='preview'.
+    - Только если run ещё не использован как source для send-real.
+    - Только если status не 'discarded' уже.
+    - Дискардинг запрещён, если run использован как source_preview_run_id
+      хотя бы в одном send-real run.
+
+    Raises:
+        ValueError: при нарушении правил.
+    """
+    async with SessionLocal() as session:
+        async with session.begin():
+            run = await session.get(CampaignRun, run_id)
+            if run is None:
+                raise ValueError(f"CampaignRun {run_id} not found")
+
+            if run.mode != "preview":
+                raise ValueError(f"Discard доступен только для preview run. mode={run.mode!r}")
+
+            if run.status == "discarded":
+                raise ValueError(f"CampaignRun {run_id} уже discarded")
+
+            # Проверить: не использован ли этот preview как источник send-real
+            used_as_source = await session.scalar(
+                select(func.count())
+                .select_from(CampaignRun)
+                .where(CampaignRun.source_preview_run_id == run_id)
+                .where(CampaignRun.mode == "send-real")
+            )
+            if int(used_as_source or 0) > 0:
+                raise ValueError(f"Preview run {run_id} уже использован как источник для send-real — discard запрещён.")
+
+            run.status = "discarded"
+            run.completed_at = utcnow()
+            meta = dict(run.meta or {})
+            meta["discarded_at"] = utcnow().isoformat()
+            run.meta = meta
+
+    logger.info("preview run_id=%d discarded", run_id)

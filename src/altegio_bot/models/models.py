@@ -667,6 +667,12 @@ class CampaignRun(Base):
     excluded_has_records_before: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
     excluded_invalid_phone: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
     excluded_no_whatsapp: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    # CRM API был недоступен — история клиента не проверена → исключён
+    excluded_crm_unavailable: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    # Altegio service category API недоступен — ресничность услуги не определена → исключён
+    excluded_service_category_unavailable: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
+    )
 
     # -----------------------------------------------------------------------
     # Счётчики доставки и атрибуции
@@ -759,6 +765,22 @@ class CampaignRecipient(Base):
     # Legacy-поле (оставлено для обратной совместимости)
     arrived_records_in_period: Mapped[int] = mapped_column(Integer, default=0)
     is_opted_out: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    # -----------------------------------------------------------------------
+    # CRM-диагностика (заполняется при сегментации через Altegio CRM API)
+    # -----------------------------------------------------------------------
+    # Ресничные записи в периоде (из local RecordService + category lookup)
+    lash_records_in_period: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    # Подтверждённые ресничные записи в периоде
+    confirmed_lash_records_in_period: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    # Названия услуг из периода (для диагностики)
+    service_titles_in_period: Mapped[list] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb")
+    )
+    # Все записи до начала периода по данным Altegio CRM (источник истины)
+    total_records_before_period_any: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    # Найден ли локальный Client в нашей БД
+    local_client_found: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
 
     # -----------------------------------------------------------------------
     # Loyalty-карты

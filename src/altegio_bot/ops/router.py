@@ -2553,9 +2553,10 @@ def _campaign_status_badge(status: str | None) -> str:
         "failed": "danger",
         "queued": "secondary",
         "paused": "warning",
+        "discarded": "light",
     }
     color = colors.get(status, "secondary")
-    return f'<span class="badge bg-{color}">{_esc(status)}</span>'
+    return f'<span class="badge bg-{color} text-dark">{_esc(status)}</span>'
 
 
 def _campaign_mode_badge(mode: str | None) -> str:
@@ -2629,7 +2630,7 @@ async def ops_campaigns_list(request: Request) -> str:
     filter_form = _filter_form(
         "/ops/campaigns",
         [
-            ("company_id", "Company ID", "text", company_id_str),
+            ("company_id", "Кабинет / филиал (ID)", "text", company_id_str),
             ("mode", "Mode", "select:preview,send-real", mode_filter),
             ("status", "Status", "select:running,completed,failed,queued", status_filter),
             ("limit", "Limit", "text", str(limit)),
@@ -2640,7 +2641,7 @@ async def ops_campaigns_list(request: Request) -> str:
         "ID",
         "Created",
         "Completed",
-        "Companies",
+        "Кабинет",
         "Mode",
         "Status",
         "Seen",
@@ -2655,6 +2656,21 @@ async def ops_campaigns_list(request: Request) -> str:
     for run in runs:
         meta = run.meta or {}
         last_error = meta.get("last_error", "")
+        # Действия зависят от режима и статуса
+        if run.mode == "preview" and run.status not in ("discarded",):
+            actions = (
+                f'<a href="/ops/campaigns/{run.id}" class="btn btn-sm btn-outline-primary me-1">open</a>'
+                f'<button class="btn btn-sm btn-success me-1" '
+                f'onclick="runFromPreview({run.id})" title="Run campaign from this preview">'
+                f"▶ Run</button>"
+                f'<button class="btn btn-sm btn-outline-danger" '
+                f'onclick="discardPreview({run.id})" title="Discard this preview">'
+                f"✕ Discard</button>"
+            )
+        elif run.mode == "preview" and run.status == "discarded":
+            actions = f'<a href="/ops/campaigns/{run.id}" class="btn btn-sm btn-outline-secondary">open</a>'
+        else:
+            actions = f'<a href="/ops/campaigns/{run.id}" class="btn btn-sm btn-outline-primary">open</a>'
         rows.append(
             [
                 str(run.id),
@@ -2669,7 +2685,7 @@ async def ops_campaigns_list(request: Request) -> str:
                 str(run.cards_issued_count or 0),
                 "✓" if run.followup_enabled else "",
                 f'<span class="text-danger small">{_esc((last_error or "")[:60])}</span>',
-                f'<a href="/ops/campaigns/{run.id}" class="btn btn-sm btn-outline-primary">open</a>',
+                actions,
             ]
         )
 
@@ -2686,6 +2702,31 @@ async def ops_campaigns_list(request: Request) -> str:
 </div>
 {filter_form}
 {table_html}
+<div id="list-alert" class="mt-3"></div>
+<script>
+function setListAlert(type, msg) {{
+  const el = document.getElementById("list-alert");
+  el.innerHTML = type
+    ? '<div class="alert alert-' + type + '">' + msg + '</div>'
+    : "";
+}}
+
+async function discardPreview(runId) {{
+  if (!confirm("Дискардить preview run #" + runId + "? Это действие нельзя отменить.")) return;
+  const resp = await fetch("/ops/campaigns/runs/" + runId + "/discard", {{method: "POST"}});
+  const data = await resp.json();
+  if (resp.ok) {{
+    setListAlert("success", "Preview run #" + runId + " помечен как discarded. Обновите страницу.");
+  }} else {{
+    setListAlert("danger", "Ошибка: " + (data.detail || JSON.stringify(data)));
+  }}
+}}
+
+async function runFromPreview(previewRunId) {{
+  if (!confirm("Запустить send-real кампанию на основе preview #" + previewRunId + "?")) return;
+  window.location.href = "/ops/campaigns/new-clients?from_preview=" + previewRunId;
+}}
+</script>
 """
     return _page("Campaigns", body)
 
@@ -2815,6 +2856,16 @@ _NC_COMPANY_TEMPLATES: dict[int, str] = {
     cid: META_TEMPLATE_MAP[(cid, _NC_JOB_TYPE)] for cid in COMPANIES if (cid, _NC_JOB_TYPE) in META_TEMPLATE_MAP
 }
 
+# Follow-up шаблон по умолчанию (универсальный для обоих филиалов)
+_NC_FOLLOWUP_JOB_TYPE = "newsletter_new_clients_followup"
+_NC_FOLLOWUP_DEFAULT_TEMPLATE = "kitilash_ka_newsletter_new_clients_followup_v1"
+_NC_FOLLOWUP_PARAMS = ["{{1}} — имя клиента", "{{2}} — ссылка для записи"]
+
+# Маппинг company_id → follow-up template name (сейчас универсальный)
+_NC_COMPANY_FOLLOWUP_TEMPLATES: dict[int, str] = {
+    cid: META_TEMPLATE_MAP.get((cid, _NC_FOLLOWUP_JOB_TYPE), _NC_FOLLOWUP_DEFAULT_TEMPLATE) for cid in COMPANIES
+}
+
 # Маппинг location_id → человекочитаемое название филиала
 LOCATIONS: dict[int, str] = {758285: "Karlsruhe", 1271200: "Rastatt"}
 
@@ -2831,22 +2882,23 @@ async def ops_new_clients_campaign_page(request: Request) -> str:
     default_period_start = first_of_prev.strftime("%Y-%m-%d")
     default_period_end = last_day_prev.strftime("%Y-%m-%d")
 
-    # Компании для выбора
-    company_options = "".join(f'<option value="{cid}">{_esc(name)}</option>' for cid, name in COMPANIES.items())
+    # Если передан from_preview — предзаполнить previewRunId
+    from_preview_id = request.query_params.get("from_preview", "")
 
-    # JavaScript-маппинг company_id → location_id (по умолчанию совпадает)
-    company_location_js = json.dumps({str(cid): cid for cid in COMPANIES})
+    # Компании для выбора (один dropdown — и компания, и location_id)
+    company_options = "".join(f'<option value="{cid}">{_esc(name)}</option>' for cid, name in COMPANIES.items())
 
     # JavaScript-маппинг company_id → Meta template name для newsletter
     company_templates_js = json.dumps({str(cid): tname for cid, tname in _NC_COMPANY_TEMPLATES.items()})
 
-    # Location options для select (human-readable)
-    location_options_html = "".join(
-        f'<option value="{lid}">{_esc(lname)} (location_id={lid})</option>' for lid, lname in LOCATIONS.items()
+    # JavaScript-маппинг company_id → follow-up template name
+    company_followup_templates_js = json.dumps(
+        {str(cid): tname for cid, tname in _NC_COMPANY_FOLLOWUP_TEMPLATES.items()}
     )
 
     # Параметры шаблона
     template_params_html = "".join(f"<li><code>{_esc(p)}</code></li>" for p in _NC_TEMPLATE_PARAMS)
+    followup_params_html = "".join(f"<li><code>{_esc(p)}</code></li>" for p in _NC_FOLLOWUP_PARAMS)
 
     body = f"""
 <div class="d-flex justify-content-between align-items-center mb-3">
@@ -2861,18 +2913,11 @@ async def ops_new_clients_campaign_page(request: Request) -> str:
     <div class="row g-3">
 
       <div class="col-md-4">
-        <label class="form-label">Компания</label>
+        <label class="form-label">Кабинет / филиал Altegio</label>
         <select id="f-company" class="form-select">
           {company_options}
         </select>
-      </div>
-
-      <div class="col-md-4">
-        <label class="form-label">Филиал (Location)</label>
-        <select id="f-location" class="form-select">
-          {location_options_html}
-        </select>
-        <div class="form-text">Филиал Altegio. Синхронизируется с компанией.</div>
+        <div class="form-text">Выбор филиала задаёт company_id и location_id одновременно.</div>
       </div>
 
       <div class="col-md-4">
@@ -2890,6 +2935,11 @@ async def ops_new_clients_campaign_page(request: Request) -> str:
       </div>
 
       <div class="col-md-4">
+        <label class="form-label">Attribution window (дней)</label>
+        <input type="number" id="f-attribution" class="form-control" value="30" min="1" max="365">
+      </div>
+
+      <div class="col-md-4">
         <label class="form-label">Период с (включительно)</label>
         <input type="date" id="f-period-start" class="form-control" value="{_esc(default_period_start)}">
       </div>
@@ -2897,11 +2947,6 @@ async def ops_new_clients_campaign_page(request: Request) -> str:
       <div class="col-md-4">
         <label class="form-label">Период по (включительно)</label>
         <input type="date" id="f-period-end" class="form-control" value="{_esc(default_period_end)}">
-      </div>
-
-      <div class="col-md-4">
-        <label class="form-label">Attribution window (дней)</label>
-        <input type="number" id="f-attribution" class="form-control" value="30" min="1" max="365">
       </div>
 
     </div>
@@ -2933,11 +2978,15 @@ async def ops_new_clients_campaign_page(request: Request) -> str:
 
       <div class="col-md-3">
         <label class="form-label">Шаблон follow-up</label>
-        <input type="text" id="f-followup-template" class="form-control"
-               placeholder="Имя Meta-шаблона" disabled>
+        <input type="text" id="f-followup-template" class="form-control" disabled>
+        <div class="form-text">Подставляется автоматически по умолчанию.</div>
       </div>
 
     </div>
+
+    <!-- Follow-up template text (read-only preview) -->
+    <div id="followup-template-text-block" class="mt-3 d-none"></div>
+
   </div>
 </div>
 
@@ -2962,6 +3011,23 @@ async def ops_new_clients_campaign_page(request: Request) -> str:
     <!-- Реальный текст шаблона (загружается из БД через AJAX) -->
     <div id="template-text-block">
       <div class="text-muted small">⏳ Загрузка текста шаблона из БД…</div>
+    </div>
+    <!-- Follow-up шаблон -->
+    <hr class="my-3">
+    <dl class="row mb-2">
+      <dt class="col-sm-3">Follow-up шаблон</dt>
+      <dd class="col-sm-9"><code id="followup-template-name-display">{_esc(_NC_FOLLOWUP_DEFAULT_TEMPLATE)}</code></dd>
+      <dt class="col-sm-3">Job type</dt>
+      <dd class="col-sm-9"><code>newsletter_new_clients_followup</code></dd>
+      <dt class="col-sm-3">Переменные</dt>
+      <dd class="col-sm-9">
+        <ul class="mb-0 ps-3">
+          {followup_params_html}
+        </ul>
+      </dd>
+    </dl>
+    <div id="followup-template-text-block-card">
+      <div class="text-muted small">⏳ Загрузка текста follow-up шаблона…</div>
     </div>
   </div>
 </div>
@@ -3042,9 +3108,9 @@ async def ops_new_clients_campaign_page(request: Request) -> str:
 // ============================================================
 // Состояние страницы
 // ============================================================
-const COMPANY_LOCATION = {company_location_js};
 const COMPANY_TEMPLATES = {company_templates_js};
-let previewRunId = null;
+const COMPANY_FOLLOWUP_TEMPLATES = {company_followup_templates_js};
+let previewRunId = {from_preview_id or "null"};
 let runRunId = null;
 let progressInterval = null;
 
@@ -3053,25 +3119,18 @@ let progressInterval = null;
 // ============================================================
 document.addEventListener("DOMContentLoaded", function () {{
   const companySelect = document.getElementById("f-company");
-  const locationSelect = document.getElementById("f-location");
 
-  // Установить location_id по умолчанию из company_id
-  function syncLocation() {{
-    const cid = companySelect.value;
-    const lid = COMPANY_LOCATION[cid] || cid;
-    locationSelect.value = String(lid);
-  }}
   companySelect.addEventListener("change", function () {{
     const cid = companySelect.value;
-    syncLocation();
     // Сбросить список карт при смене компании
     const ct = document.getElementById("f-card-type");
     ct.innerHTML = '<option value="">— загрузите типы карт →</option>';
     document.getElementById("card-load-status").textContent = "";
-    // Перезагрузить шаблон для новой компании
+    // Перезагрузить шаблоны для новой компании
     loadTemplateText(cid);
+    setFollowupTemplateDefault(cid);
+    loadFollowupTemplateText(cid);
   }});
-  syncLocation();
 
   // Follow-up toggle
   const fuCheckbox = document.getElementById("f-followup-enabled");
@@ -3080,28 +3139,156 @@ document.addEventListener("DOMContentLoaded", function () {{
     document.getElementById("f-followup-delay").disabled = !enabled;
     document.getElementById("f-followup-policy").disabled = !enabled;
     document.getElementById("f-followup-template").disabled = !enabled;
+    if (enabled) {{
+      const fuTemplateEl = document.getElementById("f-followup-template");
+      if (!fuTemplateEl.value) {{
+        setFollowupTemplateDefault(companySelect.value);
+      }}
+    }}
   }});
 
   document.getElementById("btn-load-cards").addEventListener("click", loadCardTypes);
   document.getElementById("btn-preview").addEventListener("click", createPreview);
   document.getElementById("btn-run").addEventListener("click", runCampaign);
 
-  // Загрузить текст шаблона для company по умолчанию
+  // Загрузить тексты шаблонов для company по умолчанию
   loadTemplateText(companySelect.value);
+  loadFollowupTemplateText(companySelect.value);
+  setFollowupTemplateDefault(companySelect.value);
+
+  // Если открыта со страницы history (from_preview), подгрузить параметры preview
+  if (previewRunId) {{
+    loadPreviewAndPrefill(previewRunId);
+  }}
 }});
+
+// ============================================================
+// Предзаполнение формы из preview run (from_preview=ID)
+// ============================================================
+async function loadPreviewAndPrefill(runId) {{
+  try {{
+    const resp = await fetch("/ops/campaigns/runs/" + runId);
+    if (!resp.ok) {{
+      setAlert("preview-alert", "warning",
+        "Не удалось загрузить параметры preview #" + runId +
+        ". Проверьте ID.");
+      return;
+    }}
+    const run = await resp.json();
+
+    // Только completed preview можно использовать как источник
+    if (run.status !== "completed") {{
+      setAlert("preview-alert", "danger",
+        "Preview #" + runId + " имеет статус «" + run.status + "». " +
+        "Только завершённые (completed) previews можно запускать.");
+      document.getElementById("btn-run").disabled = true;
+      return;
+    }}
+
+    // Заполнить поля из preview
+    const companyId = (run.company_ids || [])[0];
+    if (companyId) {{
+      const companySelect = document.getElementById("f-company");
+      companySelect.value = String(companyId);
+      loadTemplateText(String(companyId));
+      setFollowupTemplateDefault(String(companyId));
+      loadFollowupTemplateText(String(companyId));
+    }}
+
+    if (run.period_start) {{
+      document.getElementById("f-period-start").value =
+        run.period_start.substring(0, 10);
+    }}
+    if (run.period_end) {{
+      document.getElementById("f-period-end").value =
+        run.period_end.substring(0, 10);
+    }}
+
+    // Предзаполнить и зафиксировать card_type_id из снимка
+    if (run.card_type_id) {{
+      const cardEl = document.getElementById("f-card-type");
+      let found = false;
+      for (let opt of cardEl.options) {{ if (opt.value === String(run.card_type_id)) {{ found = true; break; }} }}
+      if (!found) {{
+        const opt = document.createElement("option");
+        opt.value = String(run.card_type_id);
+        opt.text = "Card " + run.card_type_id + " (из preview)";
+        cardEl.appendChild(opt);
+      }}
+      cardEl.value = String(run.card_type_id);
+      cardEl.disabled = true;
+    }}
+
+    // Предзаполнить и зафиксировать followup-параметры из снимка
+    const fuCheckbox = document.getElementById("f-followup-enabled");
+    fuCheckbox.checked = !!run.followup_enabled;
+    fuCheckbox.disabled = true;
+
+    const fuDelay = document.getElementById("f-followup-delay");
+    const fuPolicy = document.getElementById("f-followup-policy");
+    const fuTemplate = document.getElementById("f-followup-template");
+
+    if (run.followup_enabled) {{
+      fuDelay.value = run.followup_delay_days || "";
+      fuPolicy.value = run.followup_policy || "";
+      fuTemplate.value = run.followup_template_name || "";
+    }}
+    fuDelay.disabled = true;
+    fuPolicy.disabled = true;
+    fuTemplate.disabled = true;
+
+    // Заблокировать ключевые поля — они должны совпадать с preview
+    document.getElementById("f-company").disabled = true;
+    document.getElementById("f-period-start").disabled = true;
+    document.getElementById("f-period-end").disabled = true;
+
+    // Показать таблицу получателей и активировать Run
+    document.getElementById("preview-results").classList.remove("d-none");
+    document.getElementById("btn-run").disabled = false;
+    loadRecipients(true);
+    setAlert("preview-alert", "info",
+      "🔒 Параметры зафиксированы по preview #" + runId +
+      " (компания, период, тип карты, follow-up). Нажмите «Run Campaign» для запуска.");
+
+  }} catch (e) {{
+    setAlert("preview-alert", "danger", "Ошибка загрузки preview: " + e.message);
+  }}
+}}
 
 // ============================================================
 // Загрузка текста Meta-шаблона из БД
 // ============================================================
+async function _fetchTemplateText(templateName, companyId) {{
+  const url = "/ops/campaigns/new-clients/template-text" +
+    "?template_name=" + encodeURIComponent(templateName) +
+    "&company_id=" + encodeURIComponent(companyId);
+  const resp = await fetch(url);
+  if (!resp.ok) return null;
+  return await resp.json();
+}}
+
+function _renderTemplateBlock(data, templateName) {{
+  if (!data) {{
+    return '<div class="alert alert-warning mb-0">' +
+      '<strong>⚠️ Не удалось загрузить текст шаблона из Meta</strong><br>' +
+      '<small>Шаблон <code>' + escHtml(templateName) + '</code> не найден в локальной БД. ' +
+      'Запустите <code>sync_meta_templates.py</code> для синхронизации.</small></div>';
+  }}
+  const bodyText = data.body || "(пусто)";
+  return '<div class="border rounded p-3 bg-light">' +
+    '<div class="mb-2"><strong>📝 Текст шаблона</strong>' +
+    (data.language ? ' <span class="badge bg-secondary">' + escHtml(data.language) + '</span>' : '') +
+    '</div>' +
+    '<pre class="mb-0" style="white-space:pre-wrap;font-size:0.9em;">' +
+    escHtml(bodyText) + '</pre></div>';
+}}
+
 async function loadTemplateText(companyId) {{
   const block = document.getElementById("template-text-block");
   const nameDisplay = document.getElementById("template-name-display");
   const templateName = COMPANY_TEMPLATES[String(companyId)] || "";
 
-  // Обновить отображение имени шаблона
-  if (nameDisplay) {{
-    nameDisplay.textContent = templateName || "—";
-  }}
+  if (nameDisplay) {{ nameDisplay.textContent = templateName || "—"; }}
 
   if (!templateName) {{
     block.innerHTML =
@@ -3113,29 +3300,9 @@ async function loadTemplateText(companyId) {{
   }}
 
   block.innerHTML = '<div class="text-muted small">⏳ Загрузка текста шаблона из БД…</div>';
-
   try {{
-    const url = "/ops/campaigns/new-clients/template-text" +
-      "?template_name=" + encodeURIComponent(templateName) +
-      "&company_id=" + encodeURIComponent(companyId);
-    const resp = await fetch(url);
-    if (!resp.ok) {{
-      block.innerHTML =
-        '<div class="alert alert-warning mb-0">' +
-        '<strong>⚠️ Не удалось загрузить текст шаблона из Meta</strong><br>' +
-        '<small>Шаблон <code>' + escHtml(templateName) + '</code> не найден в локальной БД. ' +
-        'Запустите <code>sync_meta_templates.py</code> для синхронизации.</small></div>';
-      return;
-    }}
-    const data = await resp.json();
-    const bodyText = data.body || "(пусто)";
-    block.innerHTML =
-      '<div class="border rounded p-3 bg-light">' +
-      '<div class="mb-2"><strong>📝 Текст шаблона</strong>' +
-      (data.language ? ' <span class="badge bg-secondary">' + escHtml(data.language) + '</span>' : '') +
-      '</div>' +
-      '<pre class="mb-0" style="white-space:pre-wrap;font-size:0.9em;">' +
-      escHtml(bodyText) + '</pre></div>';
+    const data = await _fetchTemplateText(templateName, companyId);
+    block.innerHTML = _renderTemplateBlock(data, templateName);
   }} catch (e) {{
     block.innerHTML =
       '<div class="alert alert-warning mb-0">' +
@@ -3144,13 +3311,39 @@ async function loadTemplateText(companyId) {{
   }}
 }}
 
+function setFollowupTemplateDefault(companyId) {{
+  const fuTemplateEl = document.getElementById("f-followup-template");
+  const nameDisplay = document.getElementById("followup-template-name-display");
+  const templateName = COMPANY_FOLLOWUP_TEMPLATES[String(companyId)] || "";
+  if (fuTemplateEl) {{ fuTemplateEl.value = templateName; }}
+  if (nameDisplay) {{ nameDisplay.textContent = templateName || "—"; }}
+}}
+
+async function loadFollowupTemplateText(companyId) {{
+  const block = document.getElementById("followup-template-text-block-card");
+  const templateName = COMPANY_FOLLOWUP_TEMPLATES[String(companyId)] || "";
+  if (!block) return;
+  if (!templateName) {{
+    block.innerHTML = '<div class="text-muted small">Follow-up шаблон не задан.</div>';
+    return;
+  }}
+  block.innerHTML = '<div class="text-muted small">⏳ Загрузка follow-up шаблона…</div>';
+  try {{
+    const data = await _fetchTemplateText(templateName, companyId);
+    block.innerHTML = _renderTemplateBlock(data, templateName);
+  }} catch (e) {{
+    block.innerHTML = '<div class="text-muted small">Ошибка загрузки: ' + escHtml(e.message) + '</div>';
+  }}
+}}
+
 // ============================================================
 // Загрузка типов карт
 // ============================================================
 async function loadCardTypes() {{
-  const locationId = document.getElementById("f-location").value.trim();
+  // location_id == company_id (один dropdown для обоих)
+  const locationId = document.getElementById("f-company").value.trim();
   if (!locationId) {{
-    alert("Выберите филиал перед загрузкой типов карт.");
+    alert("Выберите кабинет перед загрузкой типов карт.");
     return;
   }}
   const statusEl = document.getElementById("card-load-status");
@@ -3248,9 +3441,13 @@ function renderPreviewSummary(data) {{
     ["no_phone", "Нет телефона"],
     ["invalid_phone", "Невалидный телефон"],
     ["no_whatsapp", "Нет WhatsApp"],
-    ["multiple_records_in_period", "Несколько записей в периоде"],
-    ["no_confirmed_record_in_period", "Нет подтв. записи в периоде"],
-    ["has_records_before_period", "Есть записи до периода"],
+    ["has_records_before_period", "Есть записи до периода (CRM)"],
+    ["crm_history_unavailable", "⚠️ CRM недоступен при проверке"],
+    ["no_lash_record_in_period", "Нет ресничных записей в периоде"],
+    ["no_confirmed_lash_record_in_period", "Нет подтв. ресничной записи"],
+    ["multiple_lash_records_in_period", "Несколько lash-записей в периоде"],
+    ["multiple_records_in_period", "Несколько записей (устар.)"],
+    ["no_confirmed_record_in_period", "Нет подтв. записи (устар.)"],
   ];
   let breakdownHtml = '<h6 class="fw-bold mt-2">🔍 Причины исключения (breakdown)</h6>';
   breakdownHtml += '<table class="table table-sm table-bordered mb-0" style="max-width:500px">';
@@ -3313,22 +3510,30 @@ function renderRecipientsTable(items, total) {{
       '<p class="text-muted p-3">Нет записей по заданному фильтру.</p>';
     return;
   }}
-  const cols = ["Имя", "Телефон", "Статус", "Причина исключения",
-                "Записей в периоде", "Подтверждённых", "Записей до периода"];
+  const cols = [
+    "Имя", "Телефон", "Статус", "Причина исключения",
+    "Ресничных", "Подтверждённых лаш", "До периода (CRM)",
+    "Услуги в периоде", "Лок. клиент"
+  ];
   const header = '<tr>' + cols.map(function(c) {{
     return '<th>' + escHtml(c) + '</th>';
   }}).join("") + '</tr>';
   const rows = items.map(function(r) {{
     const seg = r.segment || {{}};
     const statusColor = r.status === "candidate" ? "success" : "secondary";
+    const titles = (seg.service_titles_in_period || []).join(", ") || "—";
+    const localFound = seg.local_client_found ? "✓" : "—";
+    const beforeCrm = seg.total_records_before_period_any ?? seg.records_before_period ?? "?";
     return '<tr>' +
       '<td>' + escHtml(r.display_name || "") + '</td>' +
       '<td>' + escHtml(r.phone_e164 || "") + '</td>' +
       '<td><span class="badge bg-' + statusColor + '">' + escHtml(r.status || "") + '</span></td>' +
-      '<td>' + escHtml(r.excluded_reason || "") + '</td>' +
-      '<td>' + escHtml(String(seg.total_records_in_period ?? "")) + '</td>' +
-      '<td>' + escHtml(String(seg.confirmed_records_in_period ?? "")) + '</td>' +
-      '<td>' + escHtml(String(seg.records_before_period ?? "")) + '</td>' +
+      '<td><small>' + escHtml(r.excluded_reason || "") + '</small></td>' +
+      '<td>' + escHtml(String(seg.lash_records_in_period ?? "—")) + '</td>' +
+      '<td>' + escHtml(String(seg.confirmed_lash_records_in_period ?? "—")) + '</td>' +
+      '<td>' + escHtml(String(beforeCrm)) + '</td>' +
+      '<td><small>' + escHtml(titles) + '</small></td>' +
+      '<td>' + localFound + '</td>' +
       '</tr>';
   }}).join("");
   document.getElementById("recipients-table").innerHTML =
@@ -3446,8 +3651,13 @@ function renderProgress(data) {{
 // Утилиты
 // ============================================================
 function buildPayload() {{
+  // ВАЖНО: эта функция читает значения полей через JS .value — включая disabled элементы.
+  // HTML form submit НЕ используется. Disabled поля не теряются из payload.
+  // Это позволяет lock-логике prefill блокировать UI, но включать зафиксированные
+  // значения из preview-снимка в JSON-запрос к backend.
   const companyId = parseInt(document.getElementById("f-company").value, 10);
-  const locationId = parseInt(document.getElementById("f-location").value, 10);
+  // location_id == company_id (один dropdown для обоих)
+  const locationId = companyId;
   const cardTypeEl = document.getElementById("f-card-type");
   const cardTypeId = cardTypeEl.value || null;
   const periodStartDate = document.getElementById("f-period-start").value;
@@ -3458,8 +3668,8 @@ function buildPayload() {{
     alert("Укажите период.");
     return null;
   }}
-  if (!locationId || isNaN(locationId)) {{
-    alert("Выберите филиал.");
+  if (!companyId || isNaN(companyId)) {{
+    alert("Выберите кабинет / филиал.");
     return null;
   }}
 
@@ -3467,7 +3677,11 @@ function buildPayload() {{
   const followupEnabled = document.getElementById("f-followup-enabled").checked;
   const followupDelay = parseInt(document.getElementById("f-followup-delay").value, 10) || null;
   const followupPolicy = document.getElementById("f-followup-policy").value || null;
-  const followupTemplate = document.getElementById("f-followup-template").value.trim() || null;
+  // Если не указан — подставить дефолт по company
+  const fuTemplateEl = document.getElementById("f-followup-template");
+  const followupTemplate = (fuTemplateEl.value && fuTemplateEl.value.trim())
+    || COMPANY_FOLLOWUP_TEMPLATES[String(companyId)]
+    || null;
 
   // period_end — конец дня (включительно)
   return {{
@@ -3541,6 +3755,21 @@ async def ops_campaign_run_detail(run_id: int) -> str:
 </div>
 """
 
+    # Действия для preview run
+    preview_actions_block = ""
+    if run.mode == "preview" and run.status not in ("discarded",):
+        preview_actions_block = f"""
+<div class="alert alert-info d-flex align-items-center gap-3 mb-3">
+  <span>Это preview-run. Вы можете запустить send-real на основе этого снимка или дискардить его.</span>
+  <a href="/ops/campaigns/new-clients?from_preview={run_id}"
+     class="btn btn-success btn-sm">▶ Run from preview</a>
+  <button class="btn btn-outline-danger btn-sm"
+          onclick="discardAndRefresh({run_id})">✕ Discard preview</button>
+</div>
+"""
+    elif run.mode == "preview" and run.status == "discarded":
+        preview_actions_block = '<div class="alert alert-secondary mb-3">Этот preview-run был дискарден.</div>'
+
     # --- Summary block ---
     summary_block = f"""
 <div class="card mb-3">
@@ -3560,7 +3789,7 @@ async def ops_campaign_run_detail(run_id: int) -> str:
   </div>
   <div class="card-body">
     <dl class="row mb-0">
-      <dt class="col-sm-3">Companies</dt>
+      <dt class="col-sm-3">Кабинет / филиал</dt>
       <dd class="col-sm-9">{_esc(_fmt_company_ids(run.company_ids))}</dd>
       <dt class="col-sm-3">Period</dt>
       <dd class="col-sm-9">{_esc(_fmt_dt(run.period_start))} → {_esc(_fmt_dt(run.period_end))}</dd>
@@ -3568,8 +3797,6 @@ async def ops_campaign_run_detail(run_id: int) -> str:
       <dd class="col-sm-9">{_esc(_fmt_dt(run.created_at, tz))}</dd>
       <dt class="col-sm-3">Completed</dt>
       <dd class="col-sm-9">{_esc(_fmt_dt(run.completed_at, tz))}</dd>
-      <dt class="col-sm-3">Location ID</dt>
-      <dd class="col-sm-9">{_esc(str(run.location_id or "—"))}</dd>
       <dt class="col-sm-3">Card Type ID</dt>
       <dd class="col-sm-9">{_esc(str(run.card_type_id or "—"))}</dd>
       <dt class="col-sm-3">Attribution Window</dt>
@@ -3647,9 +3874,10 @@ async def ops_campaign_run_detail(run_id: int) -> str:
             ("No phone", run.excluded_no_phone or 0, "secondary"),
             ("Invalid phone", run.excluded_invalid_phone or 0, "secondary"),
             ("No WA", run.excluded_no_whatsapp or 0, "secondary"),
-            ("Multiple records", run.excluded_multiple_records or 0, "secondary"),
-            ("No confirmed record", run.excluded_no_confirmed_record or 0, "secondary"),
+            ("Multiple lash records", run.excluded_multiple_records or 0, "secondary"),
+            ("No confirmed lash", run.excluded_no_confirmed_record or 0, "secondary"),
             ("Has records before", run.excluded_has_records_before or 0, "secondary"),
+            ("CRM unavailable", getattr(run, "excluded_crm_unavailable", 0) or 0, "danger"),
         ]
     )
     excluded_block = f"""
@@ -3747,6 +3975,7 @@ async def ops_campaign_run_detail(run_id: int) -> str:
   <h4>📣 Campaign Run #{run_id}</h4>
   <a href="/ops/campaigns" class="btn btn-sm btn-outline-secondary">← Back</a>
 </div>
+{preview_actions_block}
 {error_block}
 {summary_block}
 {progress_block}
@@ -3756,6 +3985,21 @@ async def ops_campaign_run_detail(run_id: int) -> str:
 {followup_block}
 {auto_followup_block}
 {recipients_summary}
+<div id="detail-alert" class="mt-3"></div>
+<script>
+async function discardAndRefresh(runId) {{
+  if (!confirm("Дискардить preview run #" + runId + "?")) return;
+  const el = document.getElementById("detail-alert");
+  const resp = await fetch("/ops/campaigns/runs/" + runId + "/discard", {{method: "POST"}});
+  const data = await resp.json();
+  if (resp.ok) {{
+    el.innerHTML = '<div class="alert alert-success">Run дискарден. <a href="">Обновите страницу.</a></div>';
+  }} else {{
+    el.innerHTML = '<div class="alert alert-danger">Ошибка: ' +
+      (data.detail || JSON.stringify(data)) + '</div>';
+  }}
+}}
+</script>
 """
     return _page(f"Campaign Run {run_id}", body)
 

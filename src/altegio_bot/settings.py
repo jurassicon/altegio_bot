@@ -1,3 +1,4 @@
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -61,6 +62,22 @@ class Settings(BaseSettings):
 
     # Local timezone for display (IANA name)
     ops_local_tz: str = "Europe/Berlin"
+
+    # Максимальное число параллельных CRM-запросов при сегментации кампании.
+    # Защищает от перегрузки Altegio API. Переопределяется через env:
+    #   CAMPAIGN_CRM_MAX_CONCURRENCY=8
+    # Значение обязано быть >= 1; 0 или отрицательное — ошибка при старте.
+    campaign_crm_max_concurrency: int = 8
+
+    @field_validator("campaign_crm_max_concurrency")
+    @classmethod
+    def validate_campaign_crm_max_concurrency(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError(
+                f"campaign_crm_max_concurrency должен быть >= 1, получено {v}. "
+                "Проверьте переменную окружения CAMPAIGN_CRM_MAX_CONCURRENCY."
+            )
+        return v
 
     # Chatwoot integration
     chatwoot_enabled: bool = True

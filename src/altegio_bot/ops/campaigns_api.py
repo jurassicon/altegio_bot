@@ -37,6 +37,7 @@ from altegio_bot.campaigns.runner import (
     CAMPAIGN_CODE,
     CAMPAIGN_EXECUTION_JOB_TYPE,
     RunParams,
+    discard_preview_run,
     enqueue_send_real,
     resume_send_real,
     run_preview,
@@ -123,7 +124,10 @@ async def create_preview(body: PreviewRequest) -> dict[str, Any]:
         run = await run_preview(params)
     except Exception as exc:
         logger.exception("preview failed: %s", exc)
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise HTTPException(
+            status_code=500,
+            detail="Preview failed due to internal error. See server logs for details.",
+        )
 
     return _run_summary(run)
 
@@ -142,14 +146,36 @@ async def create_run(body: RunRequest) -> dict[str, Any]:
 
     Endpoint быстро создаёт CampaignRun со статусом queued,
     ставит execution-job в message_jobs и сразу возвращает accepted.
+
+    Если передан source_preview_run_id — валидирует совместимость:
+    company_id, period_start, period_end и campaign_code должны совпадать
+    с параметрами preview-run. Несовпадение → 400.
     """
     _validate_period(body.period_start, body.period_end)
+
+    period_start_utc = _ensure_utc(body.period_start)
+    period_end_utc = _ensure_utc(body.period_end)
+
+    # Backend-валидация: параметры запуска должны совпадать с preview-snapshot
+    if body.source_preview_run_id is not None:
+        await _validate_run_matches_preview(
+            preview_run_id=body.source_preview_run_id,
+            company_id=body.company_id,
+            period_start=period_start_utc,
+            period_end=period_end_utc,
+            campaign_code=CAMPAIGN_CODE,
+            card_type_id=body.card_type_id,
+            followup_enabled=body.followup_enabled,
+            followup_delay_days=body.followup_delay_days,
+            followup_policy=body.followup_policy,
+            followup_template_name=body.followup_template_name,
+        )
 
     params = RunParams(
         company_id=body.company_id,
         location_id=body.location_id,
-        period_start=_ensure_utc(body.period_start),
-        period_end=_ensure_utc(body.period_end),
+        period_start=period_start_utc,
+        period_end=period_end_utc,
         mode="send-real",
         card_type_id=body.card_type_id,
         source_preview_run_id=body.source_preview_run_id,
@@ -173,6 +199,146 @@ async def create_run(body: RunRequest) -> dict[str, Any]:
     result["accepted"] = True
     result["message"] = "Campaign run accepted and queued"
     return result
+
+
+def _normalise_nullable_str(v: str | None) -> str | None:
+    """Нормализовать nullable строку: trim + пустая/пробельная строка → None.
+
+    Используется при сравнении параметров preview и send-real запросов.
+    Предотвращает ложные mismatch:
+    - '' vs None → оба None (эквивалентны)
+    - '   ' vs None → оба None (пробелы — не значимое значение)
+    - ' abc ' vs 'abc' → оба 'abc' (trim убирает случайные пробелы)
+    - '0' → '0' (truthy строка остаётся как есть)
+    """
+    if v is None:
+        return None
+    stripped = v.strip()
+    return stripped if stripped else None
+
+
+async def _validate_run_matches_preview(
+    *,
+    preview_run_id: int,
+    company_id: int,
+    period_start: datetime,
+    period_end: datetime,
+    campaign_code: str,
+    card_type_id: str | None,
+    followup_enabled: bool,
+    followup_delay_days: int | None,
+    followup_policy: str | None,
+    followup_template_name: str | None,
+) -> None:
+    """Проверить совместимость параметров send-real с preview-snapshot.
+
+    Гарантирует, что send-real запускается именно для того снимка,
+    который оператор видел в preview. Несовпадение любого ключевого
+    параметра возвращает HTTP 400.
+
+    Проверяемые поля:
+      - mode == 'preview' и status == 'completed' (только завершённые previews)
+      - campaign_code
+      - company_id (первый из company_ids)
+      - period_start, period_end (с точностью до секунды)
+      - card_type_id
+      - followup_enabled, followup_delay_days, followup_policy, followup_template_name
+    """
+    async with SessionLocal() as session:
+        preview_run = await session.get(CampaignRun, preview_run_id)
+
+    if preview_run is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Preview run {preview_run_id} not found",
+        )
+
+    if preview_run.mode != "preview":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Run {preview_run_id} is not a preview (mode={preview_run.mode!r})",
+        )
+
+    # Только completed previews могут быть источником send-real.
+    # failed/running/queued/discarded — нельзя: данные неполные или сброшены.
+    if preview_run.status != "completed":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Preview run {preview_run_id} has status={preview_run.status!r}; "
+                f"only 'completed' previews can be used as source for send-real"
+            ),
+        )
+
+    # Проверка campaign_code
+    if preview_run.campaign_code != campaign_code:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Campaign code mismatch: preview has {preview_run.campaign_code!r}, request has {campaign_code!r}"
+            ),
+        )
+
+    # Проверка company_id
+    preview_company_ids = preview_run.company_ids or []
+    if not preview_company_ids or int(preview_company_ids[0]) != company_id:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Company ID mismatch: preview was for company_id={preview_company_ids}, "
+                f"request has company_id={company_id}"
+            ),
+        )
+
+    # Проверка периода (с точностью до секунды)
+    def _truncate_sec(dt: datetime) -> datetime:
+        return dt.replace(microsecond=0)
+
+    preview_start = _ensure_utc(preview_run.period_start)
+    preview_end = _ensure_utc(preview_run.period_end)
+
+    if _truncate_sec(preview_start) != _truncate_sec(period_start):
+        raise HTTPException(
+            status_code=400,
+            detail=(f"Period start mismatch: preview={preview_start.isoformat()}, request={period_start.isoformat()}"),
+        )
+
+    if _truncate_sec(preview_end) != _truncate_sec(period_end):
+        raise HTTPException(
+            status_code=400,
+            detail=(f"Period end mismatch: preview={preview_end.isoformat()}, request={period_end.isoformat()}"),
+        )
+
+    # Проверка card_type_id и followup-параметров — зафиксированы в снимке.
+    # Используем _normalise_nullable_str для строк: пустая строка эквивалентна None.
+    # Для int полей (followup_delay_days) — прямое сравнение без or-None,
+    # чтобы 0 не трактовался как None.
+    nullable_str_checks: list[tuple[str, str | None, str | None]] = [
+        ("card_type_id", preview_run.card_type_id, card_type_id),
+        ("followup_policy", preview_run.followup_policy, followup_policy),
+        ("followup_template_name", preview_run.followup_template_name, followup_template_name),
+    ]
+    for field_name, preview_val, request_val in nullable_str_checks:
+        if _normalise_nullable_str(preview_val) != _normalise_nullable_str(request_val):
+            raise HTTPException(
+                status_code=400,
+                detail=(f"{field_name} mismatch: preview has {preview_val!r}, request has {request_val!r}"),
+            )
+
+    if bool(preview_run.followup_enabled) != bool(followup_enabled):
+        raise HTTPException(
+            status_code=400,
+            detail=(f"followup_enabled mismatch: preview={preview_run.followup_enabled}, request={followup_enabled}"),
+        )
+
+    if preview_run.followup_delay_days != followup_delay_days:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"followup_delay_days mismatch: preview={preview_run.followup_delay_days}, "
+                f"request={followup_delay_days}"
+            ),
+        )
 
 
 # ==========================================================================
@@ -572,6 +738,44 @@ async def run_followup_now(run_id: int) -> dict[str, Any]:
 
 
 # ==========================================================================
+# Discard preview
+# ==========================================================================
+
+
+@router.post("/runs/{run_id}/discard")
+async def discard_run(run_id: int) -> dict[str, Any]:
+    """Пометить preview-run как discarded (soft-delete).
+
+    Разрешено только для preview-run, который ещё не использован
+    как source_preview_run_id для какого-либо send-real.
+    """
+    async with SessionLocal() as session:
+        run = await session.get(CampaignRun, run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="Run not found")
+
+    try:
+        await discard_preview_run(run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.exception("discard failed run_id=%d: %s", run_id, exc)
+        raise HTTPException(status_code=500, detail="Internal discard error")
+
+    async with SessionLocal() as session:
+        run = await session.get(CampaignRun, run_id)
+
+    if run is None:
+        raise HTTPException(status_code=500, detail="Run disappeared after discard")
+
+    return {
+        "run_id": run_id,
+        "status": run.status,
+        "message": "Preview run discarded",
+    }
+
+
+# ==========================================================================
 # Resume
 # ==========================================================================
 
@@ -775,6 +979,9 @@ def _run_summary(run: CampaignRun) -> dict[str, Any]:
         "last_error": _last_error(run),
         "created_at": _iso(run.created_at),
         "completed_at": _iso(run.completed_at),
+        # Preview-специфичные поля
+        "is_preview": run.mode == "preview",
+        "is_discardable": (run.mode == "preview" and run.status not in ("discarded",)),
         "excluded": {
             "opted_out": run.excluded_opted_out or 0,
             "no_phone": run.excluded_no_phone or 0,
@@ -783,6 +990,8 @@ def _run_summary(run: CampaignRun) -> dict[str, Any]:
             "multiple_records_in_period": run.excluded_multiple_records or 0,
             "no_confirmed_record_in_period": run.excluded_no_confirmed_record or 0,
             "has_records_before_period": run.excluded_has_records_before or 0,
+            "crm_history_unavailable": run.excluded_crm_unavailable or 0,
+            "service_category_unavailable": run.excluded_service_category_unavailable or 0,
         },
     }
 
@@ -807,6 +1016,8 @@ def _run_detail(run: CampaignRun) -> dict[str, Any]:
                 "multiple_records_in_period": run.excluded_multiple_records,
                 "no_confirmed_record_in_period": run.excluded_no_confirmed_record,
                 "has_records_before_period": run.excluded_has_records_before,
+                "crm_history_unavailable": run.excluded_crm_unavailable,
+                "service_category_unavailable": run.excluded_service_category_unavailable,
             },
             "delivery": {
                 "sent": run.sent_count,
@@ -842,6 +1053,11 @@ def _recipient_dict(r: CampaignRecipient) -> dict[str, Any]:
             "total_records_in_period": r.total_records_in_period,
             "confirmed_records_in_period": r.confirmed_records_in_period,
             "records_before_period": r.records_before_period,
+            "lash_records_in_period": r.lash_records_in_period,
+            "confirmed_lash_records_in_period": r.confirmed_lash_records_in_period,
+            "service_titles_in_period": list(r.service_titles_in_period or []),
+            "total_records_before_period_any": r.total_records_before_period_any,
+            "local_client_found": r.local_client_found,
             "is_opted_out": r.is_opted_out,
         },
         "loyalty": {
