@@ -62,6 +62,11 @@ class Settings(BaseSettings):
     # Local timezone for display (IANA name)
     ops_local_tz: str = "Europe/Berlin"
 
+    # Максимальное число параллельных CRM-запросов при сегментации кампании.
+    # Защищает от перегрузки Altegio API. Переопределяется через env:
+    #   CAMPAIGN_CRM_MAX_CONCURRENCY=8
+    campaign_crm_max_concurrency: int = 8
+
     # Chatwoot integration
     chatwoot_enabled: bool = True
     chatwoot_base_url: str = ""

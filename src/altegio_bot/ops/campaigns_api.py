@@ -201,6 +201,15 @@ async def create_run(body: RunRequest) -> dict[str, Any]:
     return result
 
 
+def _normalise_nullable_str(v: str | None) -> str | None:
+    """Нормализовать nullable строку: пустая строка → None.
+
+    Используется при сравнении параметров preview и send-real запросов.
+    Предотвращает ложные mismatch когда одно значение '' а другое None.
+    """
+    return v if v else None
+
+
 async def _validate_run_matches_preview(
     *,
     preview_run_id: int,
@@ -293,50 +302,34 @@ async def _validate_run_matches_preview(
             detail=(f"Period end mismatch: preview={preview_end.isoformat()}, request={period_end.isoformat()}"),
         )
 
-    # Проверка card_type_id — зафиксирован в снимке
-    if (preview_run.card_type_id or None) != (card_type_id or None):
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"card_type_id mismatch: preview has {preview_run.card_type_id!r}, "
-                f"request has {card_type_id!r}"
-            ),
-        )
+    # Проверка card_type_id и followup-параметров — зафиксированы в снимке.
+    # Используем _normalise_nullable_str для строк: пустая строка эквивалентна None.
+    # Для int полей (followup_delay_days) — прямое сравнение без or-None,
+    # чтобы 0 не трактовался как None.
+    nullable_str_checks: list[tuple[str, str | None, str | None]] = [
+        ("card_type_id", preview_run.card_type_id, card_type_id),
+        ("followup_policy", preview_run.followup_policy, followup_policy),
+        ("followup_template_name", preview_run.followup_template_name, followup_template_name),
+    ]
+    for field_name, preview_val, request_val in nullable_str_checks:
+        if _normalise_nullable_str(preview_val) != _normalise_nullable_str(request_val):
+            raise HTTPException(
+                status_code=400,
+                detail=(f"{field_name} mismatch: preview has {preview_val!r}, request has {request_val!r}"),
+            )
 
-    # Проверка followup-параметров — зафиксированы в снимке
     if bool(preview_run.followup_enabled) != bool(followup_enabled):
         raise HTTPException(
             status_code=400,
-            detail=(
-                f"followup_enabled mismatch: preview={preview_run.followup_enabled}, "
-                f"request={followup_enabled}"
-            ),
+            detail=(f"followup_enabled mismatch: preview={preview_run.followup_enabled}, request={followup_enabled}"),
         )
 
-    if (preview_run.followup_delay_days or None) != (followup_delay_days or None):
+    if preview_run.followup_delay_days != followup_delay_days:
         raise HTTPException(
             status_code=400,
             detail=(
                 f"followup_delay_days mismatch: preview={preview_run.followup_delay_days}, "
                 f"request={followup_delay_days}"
-            ),
-        )
-
-    if (preview_run.followup_policy or None) != (followup_policy or None):
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"followup_policy mismatch: preview={preview_run.followup_policy!r}, "
-                f"request={followup_policy!r}"
-            ),
-        )
-
-    if (preview_run.followup_template_name or None) != (followup_template_name or None):
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"followup_template_name mismatch: preview={preview_run.followup_template_name!r}, "
-                f"request={followup_template_name!r}"
             ),
         )
 

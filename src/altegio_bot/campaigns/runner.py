@@ -14,7 +14,7 @@ from altegio_bot.campaigns.loyalty_cleanup import (
     make_card_number,
     make_card_text,
 )
-from altegio_bot.campaigns.segment import ClientCandidate, find_candidates
+from altegio_bot.campaigns.segment import ClientCandidate, ClientSnapshot, find_candidates
 from altegio_bot.db import SessionLocal
 from altegio_bot.message_planner import add_job, make_dedupe_key
 from altegio_bot.models.models import (
@@ -270,8 +270,29 @@ async def run_preview(params: RunParams) -> CampaignRun:
             _update_run_exclusion_counters(run, candidates)
             for candidate in candidates:
                 session.add(_build_recipient(run_id, candidate))
-            run.status = "completed"
-            run.completed_at = utcnow()
+
+            # Записать источник обнаружения кандидатов в meta
+            meta = dict(run.meta or {})
+            meta["discovery_source"] = "local_db"
+            run.meta = meta
+
+            # Финальная проверка статуса: run должен быть 'running'.
+            # Если нет (например, был отменён извне) — не перезаписываем статус.
+            if run.status != "running":
+                logger.warning(
+                    "preview run_id=%d: status=%r at finalization, expected 'running' — skipping completed",
+                    run_id,
+                    run.status,
+                )
+            else:
+                run.status = "completed"
+                run.completed_at = utcnow()
+
+            # Захватить значения счётчиков до закрытия сессии.
+            # SessionLocal настроен с expire_on_commit=False, поэтому атрибуты
+            # доступны после коммита. Но явные локальные переменные надёжнее.
+            total_seen = run.total_clients_seen
+            cands_count = run.candidates_count
 
     logger.info(
         "preview run_id=%d company=%d period=[%s, %s) total=%d eligible=%d",
@@ -279,9 +300,10 @@ async def run_preview(params: RunParams) -> CampaignRun:
         params.company_id,
         params.period_start.date(),
         params.period_end.date(),
-        run.total_clients_seen,
-        run.candidates_count,
+        total_seen,
+        cands_count,
     )
+    # expire_on_commit=False — атрибуты run доступны после закрытия сессии.
     return run
 
 
@@ -341,27 +363,29 @@ async def _load_candidates_from_preview_snapshot(
         local_client = clients_map.get(r.client_id) if r.client_id else None
 
         if local_client is None:
-            # Нет локального клиента — создаём placeholder для счётчиков
+            # Нет локального клиента — используем данные из snapshot
             excluded = r.excluded_reason or "no_local_client"
-        else:
-            excluded = r.excluded_reason  # None → eligible
-
-        # Строим минимальный Client-like объект из snapshot данных,
-        # если реального объекта нет (для счётчиков)
-        effective_client = local_client
-
-        if effective_client is None:
-            # Dummy-клиент для корректной работы _update_run_exclusion_counters
-            effective_client = Client(
+            snapshot = ClientSnapshot(
+                id=None,
                 company_id=r.company_id,
                 altegio_client_id=r.altegio_client_id,
-                phone_e164=r.phone_e164,
                 display_name=r.display_name,
-                wa_opted_out=r.is_opted_out or False,
+                phone_e164=r.phone_e164,
+                wa_opted_out=bool(r.is_opted_out),
+            )
+        else:
+            excluded = r.excluded_reason  # None → eligible
+            snapshot = ClientSnapshot(
+                id=local_client.id,
+                company_id=local_client.company_id,
+                altegio_client_id=local_client.altegio_client_id,
+                display_name=local_client.display_name,
+                phone_e164=local_client.phone_e164,
+                wa_opted_out=bool(local_client.wa_opted_out),
             )
 
         c = ClientCandidate(
-            client=effective_client,
+            client=snapshot,
             total_records_in_period=r.total_records_in_period or 0,
             confirmed_records_in_period=r.confirmed_records_in_period or 0,
             lash_records_in_period=r.lash_records_in_period or 0,
@@ -421,6 +445,9 @@ async def _execute_send_real_for_existing_run(
             meta.pop("last_error", None)
             if params.source_preview_run_id:
                 meta["used_preview_snapshot"] = params.source_preview_run_id
+            else:
+                # Свежая сегментация через локальную БД — фиксируем ограничение обнаружения.
+                meta["discovery_source"] = "local_db"
             run.meta = meta
 
     # Фаза 2: загрузить кандидатов (вне открытой транзакции)
@@ -498,12 +525,22 @@ async def _execute_send_real_for_existing_run(
                 run.queued_count = stats["queued"]
                 run.failed_count = stats["failed"]
                 run.sent_count = stats["queued"]
-                run.status = "completed"
-                run.completed_at = utcnow()
 
                 meta = dict(run.meta or {})
                 meta.pop("last_error", None)
                 run.meta = meta
+
+                # Финальная проверка статуса: run должен быть 'running'.
+                # Если нет (например, был отменён извне) — не перезаписываем статус.
+                if run.status != "running":
+                    logger.warning(
+                        "send-real run_id=%d: status=%r at finalization, expected 'running' — skipping completed",
+                        run_id,
+                        run.status,
+                    )
+                else:
+                    run.status = "completed"
+                    run.completed_at = utcnow()
 
         logger.info(
             "send-real completed run_id=%d company=%d stats=%s",

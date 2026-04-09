@@ -368,3 +368,102 @@ async def test_preview_endpoint_hides_internal_error(
     assert "internal error" in detail.lower() or "failed" in detail.lower()
 
     monkeypatch.setattr(api_mod, "run_preview", original_run_preview)
+
+
+# ---------------------------------------------------------------------------
+# Тест 11.5: _normalise_nullable_str
+# ---------------------------------------------------------------------------
+
+
+def test_normalise_nullable_str_empty_is_none() -> None:
+    """Пустая строка нормализуется в None."""
+    from altegio_bot.ops.campaigns_api import _normalise_nullable_str
+
+    assert _normalise_nullable_str("") is None
+    assert _normalise_nullable_str(None) is None
+    assert _normalise_nullable_str("abc") == "abc"
+    assert _normalise_nullable_str("0") == "0"  # "0" — truthy, не None
+
+
+# ---------------------------------------------------------------------------
+# Тест 11.7: discovery_source записывается в meta после run_preview
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_preview_writes_discovery_source(session_maker) -> None:
+    """После run_preview run.meta['discovery_source'] == 'local_db'."""
+    import altegio_bot.campaigns.runner as runner_module
+    from altegio_bot.campaigns.runner import RunParams, run_preview
+    from altegio_bot.models.models import CampaignRun
+
+    original_session_local = runner_module.SessionLocal
+    runner_module.SessionLocal = session_maker
+
+    params = RunParams(
+        company_id=COMPANY,
+        location_id=COMPANY,
+        period_start=PERIOD_START,
+        period_end=PERIOD_END,
+        mode="preview",
+    )
+
+    try:
+        with patch("altegio_bot.campaigns.runner.find_candidates", new=AsyncMock(return_value=[])):
+            run = await run_preview(params)
+
+        assert run.meta is not None
+        assert run.meta.get("discovery_source") == "local_db"
+
+        # Проверить и в БД
+        async with session_maker() as session:
+            db_run = await session.get(CampaignRun, run.id)
+            assert db_run.meta.get("discovery_source") == "local_db"
+    finally:
+        runner_module.SessionLocal = original_session_local
+
+
+# ---------------------------------------------------------------------------
+# Тест 11.3: final state guard — run.status != 'running' при финализации
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_preview_final_state_guard(session_maker) -> None:
+    """Если run.status != 'running' при финализации preview — статус не перезаписывается."""
+    import altegio_bot.campaigns.runner as runner_module
+    from altegio_bot.campaigns.runner import RunParams, run_preview
+    from altegio_bot.models.models import CampaignRun
+
+    async def fake_find_candidates(**kw):
+        return []
+
+    # Подменяем SessionLocal в runner.py
+    original_session_local = runner_module.SessionLocal
+    runner_module.SessionLocal = session_maker
+
+    # Запускаем preview — создаёт run со статусом 'running', потом финализирует
+    params = RunParams(
+        company_id=COMPANY,
+        location_id=COMPANY,
+        period_start=PERIOD_START,
+        period_end=PERIOD_END,
+        mode="preview",
+    )
+
+    try:
+        with patch("altegio_bot.campaigns.runner.find_candidates", new=fake_find_candidates):
+            run = await run_preview(params)
+
+        # Run должен быть completed
+        assert run.status == "completed"
+        assert run.meta.get("discovery_source") == "local_db"
+
+        # Убедиться что run_id существует в БД
+        async with session_maker() as session:
+            db_run = await session.get(CampaignRun, run.id)
+            assert db_run is not None
+            assert db_run.status == "completed"
+            assert db_run.meta.get("discovery_source") == "local_db"
+    finally:
+        runner_module.SessionLocal = original_session_local

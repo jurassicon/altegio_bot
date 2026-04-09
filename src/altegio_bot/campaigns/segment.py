@@ -69,22 +69,37 @@ from altegio_bot.campaigns.altegio_crm import (
 from altegio_bot.db import SessionLocal
 from altegio_bot.models.models import Client, Record
 from altegio_bot.service_filter import LASH_CATEGORY_IDS_BY_COMPANY, ServiceLookupError, is_lash_service
+from altegio_bot.settings import settings
 
 logger = logging.getLogger(__name__)
 
 # Единственная точка правды: что считается «подтверждённой» записью.
 CONFIRMED_FLAG = 1
 
-# Ограниченная конкурентность CRM-запросов: не более N параллельных запросов.
-# Защищает от перегрузки Altegio API и локального пула соединений.
-_CRM_MAX_CONCURRENCY = 8
+
+@dataclass(frozen=True)
+class ClientSnapshot:
+    """Immutable snapshot клиента для конкурентных CRM-задач.
+
+    Заменяет прямую передачу ORM Client объектов в конкурентные asyncio задачи.
+    ORM объекты привязаны к сессии и небезопасны для использования после её закрытия
+    (expiry при expire_on_commit=True и детачинг). ClientSnapshot — plain dataclass
+    без SQLAlchemy зависимостей, безопасен для передачи в любые задачи.
+    """
+
+    id: int | None
+    company_id: int
+    altegio_client_id: int | None
+    display_name: str | None
+    phone_e164: str | None
+    wa_opted_out: bool
 
 
 @dataclass
 class ClientCandidate:
     """Кандидат на рассылку с метаданными сегментации."""
 
-    client: Client
+    client: ClientSnapshot
 
     # --- Записи в периоде (из CRM) ---
     # Все не удалённые не-отменённые записи клиента в периоде
@@ -209,9 +224,14 @@ async def _check_lash_services(
     return lash_count, confirmed_lash_count, sorted(titles)
 
 
-def _make_crm_unavailable_candidate(client: Client) -> ClientCandidate:
+def _make_excluded_candidate(snapshot: ClientSnapshot, reason: str) -> ClientCandidate:
+    """Создать ClientCandidate с указанной причиной исключения.
+
+    Единый helper для всех случаев исключения (замена двух отдельных функций).
+    Все счётчики — нули; excluded_reason задаётся явно.
+    """
     return ClientCandidate(
-        client=client,
+        client=snapshot,
         total_records_in_period=0,
         confirmed_records_in_period=0,
         lash_records_in_period=0,
@@ -219,28 +239,14 @@ def _make_crm_unavailable_candidate(client: Client) -> ClientCandidate:
         service_titles_in_period=[],
         records_before_period=0,
         local_client_found=True,
-        excluded_reason="crm_history_unavailable",
-    )
-
-
-def _make_service_unavailable_candidate(client: Client) -> ClientCandidate:
-    return ClientCandidate(
-        client=client,
-        total_records_in_period=0,
-        confirmed_records_in_period=0,
-        lash_records_in_period=0,
-        confirmed_lash_records_in_period=0,
-        service_titles_in_period=[],
-        records_before_period=0,
-        local_client_found=True,
-        excluded_reason="service_category_unavailable",
+        excluded_reason=reason,
     )
 
 
 async def _process_one_client(
     http: httpx.AsyncClient,
     sem: asyncio.Semaphore,
-    client: Client,
+    snapshot: ClientSnapshot,
     company_id: int,
     period_start: datetime,
     period_end: datetime,
@@ -248,73 +254,75 @@ async def _process_one_client(
     """Получить CRM-данные для одного клиента и классифицировать его.
 
     Защищена семафором для ограничения конкурентности.
+    Внешний try/except Exception — защитный пояс: если какое-то неожиданное
+    исключение не было поймано внутренними блоками, клиент помечается
+    crm_history_unavailable, а не роняет весь asyncio.gather.
     """
-    if not client.altegio_client_id:
-        logger.warning(
-            "segment: client_id=%d has no altegio_client_id — cannot check CRM",
-            client.id,
-        )
-        return ClientCandidate(
-            client=client,
-            total_records_in_period=0,
-            confirmed_records_in_period=0,
-            lash_records_in_period=0,
-            confirmed_lash_records_in_period=0,
-            service_titles_in_period=[],
-            records_before_period=0,
-            local_client_found=True,
-            excluded_reason="crm_history_unavailable",
-        )
-
-    async with sem:
-        # CRM: получить ВСЕ записи клиента
-        try:
-            crm_records = await get_client_crm_records(
-                http,
-                company_id=company_id,
-                altegio_client_id=int(client.altegio_client_id),
-            )
-        except CrmUnavailableError as exc:
+    try:
+        if not snapshot.altegio_client_id:
             logger.warning(
-                "segment: CRM unavailable for client_id=%d altegio_id=%s: %s",
-                client.id,
-                client.altegio_client_id,
-                exc,
+                "segment: client_id=%s has no altegio_client_id — cannot check CRM",
+                snapshot.id,
             )
-            return _make_crm_unavailable_candidate(client)
+            return _make_excluded_candidate(snapshot, "crm_history_unavailable")
 
-        # Разбить на in-period и before-period
-        in_period_records, count_before = classify_crm_records(crm_records, period_start, period_end)
+        async with sem:
+            # CRM: получить ВСЕ записи клиента
+            try:
+                crm_records = await get_client_crm_records(
+                    http,
+                    company_id=company_id,
+                    altegio_client_id=int(snapshot.altegio_client_id),
+                )
+            except CrmUnavailableError as exc:
+                logger.warning(
+                    "segment: CRM unavailable for client_id=%s altegio_id=%s: %s",
+                    snapshot.id,
+                    snapshot.altegio_client_id,
+                    exc,
+                )
+                return _make_excluded_candidate(snapshot, "crm_history_unavailable")
 
-        # Базовые счётчики по in-period записям
-        total_in_period = len(in_period_records)
-        confirmed_in_period = sum(1 for r in in_period_records if r.is_confirmed)
+            # Разбить на in-period и before-period
+            in_period_records, count_before = classify_crm_records(crm_records, period_start, period_end)
 
-        # Ресничные записи и названия услуг
-        try:
-            lash_count, confirmed_lash_count, service_titles = await _check_lash_services(
-                http, company_id, in_period_records
+            # Базовые счётчики по in-period записям
+            total_in_period = len(in_period_records)
+            confirmed_in_period = sum(1 for r in in_period_records if r.is_confirmed)
+
+            # Ресничные записи и названия услуг
+            try:
+                lash_count, confirmed_lash_count, service_titles = await _check_lash_services(
+                    http, company_id, in_period_records
+                )
+            except ServiceLookupError as exc:
+                logger.warning(
+                    "segment: service category lookup failed for client_id=%s: %s",
+                    snapshot.id,
+                    exc,
+                )
+                return _make_excluded_candidate(snapshot, "service_category_unavailable")
+
+            c = ClientCandidate(
+                client=snapshot,
+                total_records_in_period=total_in_period,
+                confirmed_records_in_period=confirmed_in_period,
+                lash_records_in_period=lash_count,
+                confirmed_lash_records_in_period=confirmed_lash_count,
+                service_titles_in_period=service_titles,
+                records_before_period=count_before,
+                local_client_found=True,
             )
-        except ServiceLookupError as exc:
-            logger.warning(
-                "segment: service category lookup failed for client_id=%d: %s",
-                client.id,
-                exc,
-            )
-            return _make_service_unavailable_candidate(client)
+            _classify(c)
+            return c
 
-        c = ClientCandidate(
-            client=client,
-            total_records_in_period=total_in_period,
-            confirmed_records_in_period=confirmed_in_period,
-            lash_records_in_period=lash_count,
-            confirmed_lash_records_in_period=confirmed_lash_count,
-            service_titles_in_period=service_titles,
-            records_before_period=count_before,
-            local_client_found=True,
+    except Exception:
+        logger.exception(
+            "segment: unexpected error for client_id=%s altegio_id=%s — marking crm_history_unavailable",
+            snapshot.id,
+            snapshot.altegio_client_id,
         )
-        _classify(c)
-        return c
+        return _make_excluded_candidate(snapshot, "crm_history_unavailable")
 
 
 async def find_candidates(
@@ -339,15 +347,18 @@ async def find_candidates(
 
     Шаги:
     1. SQL: candidate client_id (non-deleted records in period, local DB).
-    2. SQL: Client объекты (wa_opted_out, phone_e164).
-       → Транзакция закрывается до HTTP-запросов.
+    2. SQL: Client объекты (wa_opted_out, phone_e164) → конвертируем в
+       ClientSnapshot до закрытия сессии. ORM объекты в задачи не передаются.
     3. CRM API (один переиспользуемый HTTP client): для каждого клиента
        получить все записи → разбить на in-period и before-period.
-       Конкурентность ограничена семафором (_CRM_MAX_CONCURRENCY).
+       Конкурентность ограничена семафором (settings.campaign_crm_max_concurrency).
     4. Определить ресничность услуг (category lookup с LRU-кешем).
        При ошибке lookup → service_category_unavailable (не silent non-lash).
     5. Классификация по правилам Варианта А.
-    6. Вернуть список ClientCandidate.
+    6. asyncio.gather с return_exceptions=True: единичный сбой задачи не
+       прерывает остальные. Основная защита — outer except Exception в
+       _process_one_client; gather как резервный пояс безопасности.
+    7. Вернуть список ClientCandidate.
 
     Returns:
         Список ClientCandidate (eligible + excluded).
@@ -383,27 +394,65 @@ async def find_candidates(
             Client.company_id == company_id,
         )
         clients_map: dict[int, Client] = {c.id: c for c in (await session.execute(clients_stmt)).scalars()}
-    # Session closed here — no open DB connection during CRM HTTP calls
+
+        # Конвертировать ORM Client → ClientSnapshot ДО закрытия сессии.
+        # ORM объекты не должны покидать сессию — они привязаны к ней.
+        # ClientSnapshot — immutable plain dataclass, безопасен для передачи
+        # в конкурентные asyncio задачи.
+        snapshots: dict[int, ClientSnapshot] = {
+            cid: ClientSnapshot(
+                id=client.id,
+                company_id=client.company_id,
+                altegio_client_id=client.altegio_client_id,
+                display_name=client.display_name,
+                phone_e164=client.phone_e164,
+                wa_opted_out=bool(client.wa_opted_out),
+            )
+            for cid, client in clients_map.items()
+        }
+    # Session closed here — snapshots are safe, ORM objects are not used further
 
     # ------------------------------------------------------------------
     # Шаги 3-5. CRM HTTP calls + классификация с ограниченной конкурентностью
     # ------------------------------------------------------------------
-    sem = asyncio.Semaphore(_CRM_MAX_CONCURRENCY)
+    max_concurrency = settings.campaign_crm_max_concurrency
+    sem = asyncio.Semaphore(max_concurrency)
+    logger.debug(
+        "segment: starting CRM processing company_id=%d candidates=%d concurrency=%d",
+        company_id,
+        len(candidate_client_ids),
+        max_concurrency,
+    )
 
     async with httpx.AsyncClient(timeout=30.0) as http:
         tasks = []
         for client_id in candidate_client_ids:
-            client = clients_map.get(client_id)
-            if client is None:
+            snapshot = snapshots.get(client_id)
+            if snapshot is None:
                 logger.warning(
                     "segment: record in period for client_id=%d but Client not found (company=%d)",
                     client_id,
                     company_id,
                 )
                 continue
-            tasks.append(_process_one_client(http, sem, client, company_id, period_start, period_end))
+            tasks.append(_process_one_client(http, sem, snapshot, company_id, period_start, period_end))
 
-        candidates: list[ClientCandidate] = list(await asyncio.gather(*tasks))
+        # return_exceptions=True: резервный пояс безопасности.
+        # Основная защита — outer except Exception в _process_one_client.
+        # Если BaseException (KeyboardInterrupt и т.п.) всё же пробьётся — логируем и пропускаем таск.
+        raw_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    candidates: list[ClientCandidate] = []
+    for result in raw_results:
+        if isinstance(result, ClientCandidate):
+            candidates.append(result)
+        else:
+            # BaseException пробилось через outer except Exception в _process_one_client.
+            # Логируем и отбрасываем — не должно происходить в штатном режиме.
+            logger.error(
+                "segment: unexpected exception escaped _process_one_client (task dropped): %r",
+                result,
+            )
 
     logger.info(
         "segment company_id=%d period=[%s, %s) total=%d eligible=%d"

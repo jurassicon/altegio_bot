@@ -3651,6 +3651,10 @@ function renderProgress(data) {{
 // Утилиты
 // ============================================================
 function buildPayload() {{
+  // ВАЖНО: эта функция читает значения полей через JS .value — включая disabled элементы.
+  // HTML form submit НЕ используется. Disabled поля не теряются из payload.
+  // Это позволяет lock-логике prefill блокировать UI, но включать зафиксированные
+  // значения из preview-снимка в JSON-запрос к backend.
   const companyId = parseInt(document.getElementById("f-company").value, 10);
   // location_id == company_id (один dropdown для обоих)
   const locationId = companyId;

@@ -148,21 +148,32 @@ async def _fetch_service_category_id(
             f"altegio service lookup bad status {resp.status_code}: company={company_id} service={service_id}"
         ) from exc
 
+    # Невалидный JSON или неожиданная структура ответа — это ServiceLookupError,
+    # а не «услуга не lash». Нельзя допускать путь:
+    #   malformed response → return None → is_lash=False → ложно-eligible клиент.
     try:
         payload: Any = resp.json()
-    except ValueError:
-        logger.warning(
-            "altegio service lookup invalid json company_id=%s service_id=%s",
-            company_id,
-            service_id,
-        )
-        return None
+    except Exception as exc:
+        raise ServiceLookupError(
+            f"altegio service lookup invalid JSON: company={company_id} service={service_id}: {exc}"
+        ) from exc
 
     if not isinstance(payload, dict):
-        return None
+        raise ServiceLookupError(
+            f"altegio service lookup unexpected payload type {type(payload).__name__}: "
+            f"company={company_id} service={service_id}"
+        )
 
     data = payload.get("data")
-    if not isinstance(data, dict):
+    if data is not None and not isinstance(data, dict):
+        raise ServiceLookupError(
+            f"altegio service lookup unexpected 'data' type {type(data).__name__}: "
+            f"company={company_id} service={service_id}"
+        )
+
+    if data is None:
+        # Ответ валидный, но поле data отсутствует — услуга не найдена.
+        # Трактуем как «не lash» (не ошибка lookup).
         return None
 
     category_id = data.get("category_id")
@@ -174,6 +185,8 @@ async def _fetch_service_category_id(
     if isinstance(category_id, str) and category_id.isdigit():
         return int(category_id)
 
+    # category_id отсутствует или непарсируемый — услуга не имеет категории.
+    # Это валидный ответ API: услуга существует, но категория не назначена → не lash.
     return None
 
 
