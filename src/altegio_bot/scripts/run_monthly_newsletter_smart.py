@@ -19,7 +19,7 @@ Usage::
       [--test-phone 381638400431] \\
       [--limit 200] \\
       [--booking-link https://n813709.alteg.io/] \\
-      [--template kitilash_ka_newsletter_new_clients_monthly_v2] \\
+      [--template kitilash_ka_newsletter_new_clients_monthly_v1] \\
       [--expect-status sent|delivered] \\
       [--timeout 180] \\
       [--cleanup] \\
@@ -69,7 +69,7 @@ from altegio_bot.utils import utcnow
 logger = logging.getLogger("monthly_newsletter_smart")
 
 CAMPAIGN_CODE = "newsletter_new_clients_monthly"
-DEFAULT_TEMPLATE = "kitilash_ka_newsletter_new_clients_monthly_v2"
+DEFAULT_TEMPLATE = "kitilash_ka_newsletter_new_clients_monthly_v1"
 _LOYALTY_CARD_PREFIX = "Kundenkarte #"
 
 # 'arrived' status documented:
