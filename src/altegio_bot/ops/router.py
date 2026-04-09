@@ -3176,6 +3176,15 @@ async function loadPreviewAndPrefill(runId) {{
     }}
     const run = await resp.json();
 
+    // Только completed preview можно использовать как источник
+    if (run.status !== "completed") {{
+      setAlert("preview-alert", "danger",
+        "Preview #" + runId + " имеет статус «" + run.status + "». " +
+        "Только завершённые (completed) previews можно запускать.");
+      document.getElementById("btn-run").disabled = true;
+      return;
+    }}
+
     // Заполнить поля из preview
     const companyId = (run.company_ids || [])[0];
     if (companyId) {{
@@ -3195,6 +3204,39 @@ async function loadPreviewAndPrefill(runId) {{
         run.period_end.substring(0, 10);
     }}
 
+    // Предзаполнить и зафиксировать card_type_id из снимка
+    if (run.card_type_id) {{
+      const cardEl = document.getElementById("f-card-type");
+      let found = false;
+      for (let opt of cardEl.options) {{ if (opt.value === String(run.card_type_id)) {{ found = true; break; }} }}
+      if (!found) {{
+        const opt = document.createElement("option");
+        opt.value = String(run.card_type_id);
+        opt.text = "Card " + run.card_type_id + " (из preview)";
+        cardEl.appendChild(opt);
+      }}
+      cardEl.value = String(run.card_type_id);
+      cardEl.disabled = true;
+    }}
+
+    // Предзаполнить и зафиксировать followup-параметры из снимка
+    const fuCheckbox = document.getElementById("f-followup-enabled");
+    fuCheckbox.checked = !!run.followup_enabled;
+    fuCheckbox.disabled = true;
+
+    const fuDelay = document.getElementById("f-followup-delay");
+    const fuPolicy = document.getElementById("f-followup-policy");
+    const fuTemplate = document.getElementById("f-followup-template");
+
+    if (run.followup_enabled) {{
+      fuDelay.value = run.followup_delay_days || "";
+      fuPolicy.value = run.followup_policy || "";
+      fuTemplate.value = run.followup_template_name || "";
+    }}
+    fuDelay.disabled = true;
+    fuPolicy.disabled = true;
+    fuTemplate.disabled = true;
+
     // Заблокировать ключевые поля — они должны совпадать с preview
     document.getElementById("f-company").disabled = true;
     document.getElementById("f-period-start").disabled = true;
@@ -3206,7 +3248,7 @@ async function loadPreviewAndPrefill(runId) {{
     loadRecipients(true);
     setAlert("preview-alert", "info",
       "🔒 Параметры зафиксированы по preview #" + runId +
-      " (компания, период). Нажмите «Run Campaign» для запуска.");
+      " (компания, период, тип карты, follow-up). Нажмите «Run Campaign» для запуска.");
 
   }} catch (e) {{
     setAlert("preview-alert", "danger", "Ошибка загрузки preview: " + e.message);

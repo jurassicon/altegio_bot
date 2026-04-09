@@ -164,6 +164,11 @@ async def create_run(body: RunRequest) -> dict[str, Any]:
             period_start=period_start_utc,
             period_end=period_end_utc,
             campaign_code=CAMPAIGN_CODE,
+            card_type_id=body.card_type_id,
+            followup_enabled=body.followup_enabled,
+            followup_delay_days=body.followup_delay_days,
+            followup_policy=body.followup_policy,
+            followup_template_name=body.followup_template_name,
         )
 
     params = RunParams(
@@ -203,6 +208,11 @@ async def _validate_run_matches_preview(
     period_start: datetime,
     period_end: datetime,
     campaign_code: str,
+    card_type_id: str | None,
+    followup_enabled: bool,
+    followup_delay_days: int | None,
+    followup_policy: str | None,
+    followup_template_name: str | None,
 ) -> None:
     """Проверить совместимость параметров send-real с preview-snapshot.
 
@@ -211,10 +221,12 @@ async def _validate_run_matches_preview(
     параметра возвращает HTTP 400.
 
     Проверяемые поля:
+      - mode == 'preview' и status == 'completed' (только завершённые previews)
+      - campaign_code
       - company_id (первый из company_ids)
       - period_start, period_end (с точностью до секунды)
-      - campaign_code
-      - mode == 'preview' и status != 'discarded'
+      - card_type_id
+      - followup_enabled, followup_delay_days, followup_policy, followup_template_name
     """
     async with SessionLocal() as session:
         preview_run = await session.get(CampaignRun, preview_run_id)
@@ -231,10 +243,15 @@ async def _validate_run_matches_preview(
             detail=f"Run {preview_run_id} is not a preview (mode={preview_run.mode!r})",
         )
 
-    if preview_run.status == "discarded":
+    # Только completed previews могут быть источником send-real.
+    # failed/running/queued/discarded — нельзя: данные неполные или сброшены.
+    if preview_run.status != "completed":
         raise HTTPException(
             status_code=400,
-            detail=f"Preview run {preview_run_id} has been discarded and cannot be used",
+            detail=(
+                f"Preview run {preview_run_id} has status={preview_run.status!r}; "
+                f"only 'completed' previews can be used as source for send-real"
+            ),
         )
 
     # Проверка campaign_code
@@ -274,6 +291,53 @@ async def _validate_run_matches_preview(
         raise HTTPException(
             status_code=400,
             detail=(f"Period end mismatch: preview={preview_end.isoformat()}, request={period_end.isoformat()}"),
+        )
+
+    # Проверка card_type_id — зафиксирован в снимке
+    if (preview_run.card_type_id or None) != (card_type_id or None):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"card_type_id mismatch: preview has {preview_run.card_type_id!r}, "
+                f"request has {card_type_id!r}"
+            ),
+        )
+
+    # Проверка followup-параметров — зафиксированы в снимке
+    if bool(preview_run.followup_enabled) != bool(followup_enabled):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"followup_enabled mismatch: preview={preview_run.followup_enabled}, "
+                f"request={followup_enabled}"
+            ),
+        )
+
+    if (preview_run.followup_delay_days or None) != (followup_delay_days or None):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"followup_delay_days mismatch: preview={preview_run.followup_delay_days}, "
+                f"request={followup_delay_days}"
+            ),
+        )
+
+    if (preview_run.followup_policy or None) != (followup_policy or None):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"followup_policy mismatch: preview={preview_run.followup_policy!r}, "
+                f"request={followup_policy!r}"
+            ),
+        )
+
+    if (preview_run.followup_template_name or None) != (followup_template_name or None):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"followup_template_name mismatch: preview={preview_run.followup_template_name!r}, "
+                f"request={followup_template_name!r}"
+            ),
         )
 
 
@@ -927,6 +991,7 @@ def _run_summary(run: CampaignRun) -> dict[str, Any]:
             "no_confirmed_record_in_period": run.excluded_no_confirmed_record or 0,
             "has_records_before_period": run.excluded_has_records_before or 0,
             "crm_history_unavailable": run.excluded_crm_unavailable or 0,
+            "service_category_unavailable": run.excluded_service_category_unavailable or 0,
         },
     }
 
@@ -952,6 +1017,7 @@ def _run_detail(run: CampaignRun) -> dict[str, Any]:
                 "no_confirmed_record_in_period": run.excluded_no_confirmed_record,
                 "has_records_before_period": run.excluded_has_records_before,
                 "crm_history_unavailable": run.excluded_crm_unavailable,
+                "service_category_unavailable": run.excluded_service_category_unavailable,
             },
             "delivery": {
                 "sent": run.sent_count,

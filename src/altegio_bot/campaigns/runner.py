@@ -205,6 +205,7 @@ def _update_run_exclusion_counters(
     run.excluded_more_than_one_record = 0
     run.excluded_no_confirmed_record = 0
     run.excluded_crm_unavailable = 0
+    run.excluded_service_category_unavailable = 0
 
     run.total_clients_seen = len(candidates)
 
@@ -231,33 +232,50 @@ def _update_run_exclusion_counters(
             run.excluded_no_confirmed_record += 1
         elif reason == "crm_history_unavailable":
             run.excluded_crm_unavailable += 1
+        elif reason == "service_category_unavailable":
+            run.excluded_service_category_unavailable += 1
 
 
 async def run_preview(params: RunParams) -> CampaignRun:
-    """Запустить preview: сегментация без отправки."""
+    """Запустить preview: сегментация без отправки.
+
+    Транзакционная безопасность:
+      1. Короткая транзакция: создать run со статусом 'running'.
+      2. CRM HTTP-запросы без открытой транзакции БД.
+      3. Короткая транзакция: сохранить recipients + перевести в 'completed'.
+    """
+    # Фаза 1: создать run (короткая транзакция)
     async with SessionLocal() as session:
         async with session.begin():
             run = await _create_run(session, params, status="running")
+            run_id = run.id
 
-            candidates = await find_candidates(
-                session,
-                company_id=params.company_id,
-                period_start=params.period_start,
-                period_end=params.period_end,
-            )
+    # Фаза 2: CRM HTTP-запросы (без открытой транзакции БД)
+    try:
+        candidates = await find_candidates(
+            company_id=params.company_id,
+            period_start=params.period_start,
+            period_end=params.period_end,
+        )
+    except Exception as exc:
+        await _mark_run_failed(run_id, str(exc))
+        raise
 
+    # Фаза 3: сохранить результаты (короткая транзакция)
+    async with SessionLocal() as session:
+        async with session.begin():
+            run = await session.get(CampaignRun, run_id)
+            if run is None:
+                raise RuntimeError(f"CampaignRun {run_id} disappeared after creation")
             _update_run_exclusion_counters(run, candidates)
-
             for candidate in candidates:
-                recipient = _build_recipient(run.id, candidate)
-                session.add(recipient)
-
+                session.add(_build_recipient(run_id, candidate))
             run.status = "completed"
             run.completed_at = utcnow()
 
     logger.info(
         "preview run_id=%d company=%d period=[%s, %s) total=%d eligible=%d",
-        run.id,
+        run_id,
         params.company_id,
         params.period_start.date(),
         params.period_end.date(),
@@ -371,9 +389,19 @@ async def _execute_send_real_for_existing_run(
     """Выполнить send-real для уже созданного CampaignRun.
 
     Если source_preview_run_id задан — использует snapshot preview-run
-    и НЕ пересчитывает сегментацию.  Это гарантирует, что оператор
+    и НЕ пересчитывает сегментацию. Это гарантирует, что оператор
     запускает именно то, что видел в preview.
+
+    Транзакционная безопасность:
+      1. Короткая транзакция: перевести run в 'running'.
+      2. Загрузить кандидатов — без открытой транзакции БД:
+         - snapshot: короткая сессия (только SELECT).
+         - fresh: CRM HTTP-запросы без открытой транзакции.
+      3. Короткая транзакция: обновить счётчики run.
+      4. Обработать каждого кандидата (loyalty + messages).
+      5. Короткая транзакция: финализировать run.
     """
+    # Фаза 1: перевести в 'running' (короткая транзакция)
     async with SessionLocal() as session:
         async with session.begin():
             run = await session.get(CampaignRun, run_id)
@@ -391,25 +419,32 @@ async def _execute_send_real_for_existing_run(
 
             meta = dict(run.meta or {})
             meta.pop("last_error", None)
+            if params.source_preview_run_id:
+                meta["used_preview_snapshot"] = params.source_preview_run_id
             run.meta = meta
 
-            # --- Сегментация: snapshot или fresh ---
-            if params.source_preview_run_id:
-                # Использовать snapshot preview — не пересчитывать
-                candidates = await _load_candidates_from_preview_snapshot(
-                    session,
-                    params.source_preview_run_id,
-                )
-                meta["used_preview_snapshot"] = params.source_preview_run_id
-                run.meta = meta
-            else:
-                # Свежая сегментация из CRM
-                candidates = await find_candidates(
-                    session,
-                    company_id=params.company_id,
-                    period_start=params.period_start,
-                    period_end=params.period_end,
-                )
+    # Фаза 2: загрузить кандидатов (вне открытой транзакции)
+    if params.source_preview_run_id:
+        # Snapshot: короткая сессия только для SELECT
+        async with SessionLocal() as session:
+            candidates = await _load_candidates_from_preview_snapshot(
+                session,
+                params.source_preview_run_id,
+            )
+    else:
+        # Свежая сегментация — CRM HTTP-запросы без открытой транзакции БД
+        candidates = await find_candidates(
+            company_id=params.company_id,
+            period_start=params.period_start,
+            period_end=params.period_end,
+        )
+
+    # Фаза 3: обновить счётчики (короткая транзакция)
+    async with SessionLocal() as session:
+        async with session.begin():
+            run = await session.get(CampaignRun, run_id)
+            if run is None:
+                raise RuntimeError(f"CampaignRun {run_id} not found")
             _update_run_exclusion_counters(run, candidates)
 
     loyalty = AltegioLoyaltyClient()

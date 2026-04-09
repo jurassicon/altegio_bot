@@ -26,6 +26,7 @@ def _make_run() -> SimpleNamespace:
         excluded_more_than_one_record=0,
         excluded_no_confirmed_record=0,
         excluded_crm_unavailable=0,
+        excluded_service_category_unavailable=0,
     )
 
 
@@ -56,10 +57,11 @@ def test_counters_basic_mapping() -> None:
         _make_candidate("no_lash_record_in_period"),
         _make_candidate("no_confirmed_lash_record_in_period"),
         _make_candidate("crm_history_unavailable"),
+        _make_candidate("service_category_unavailable"),
     ]
     _update_run_exclusion_counters(run, candidates)
 
-    assert run.total_clients_seen == 8
+    assert run.total_clients_seen == 9
     assert run.candidates_count == 1
     assert run.excluded_opted_out == 1
     assert run.excluded_no_phone == 1
@@ -68,6 +70,7 @@ def test_counters_basic_mapping() -> None:
     assert run.excluded_more_than_one_record == 1
     assert run.excluded_no_confirmed_record == 2  # no_lash + no_confirmed_lash
     assert run.excluded_crm_unavailable == 1
+    assert run.excluded_service_category_unavailable == 1
 
 
 def test_counters_idempotent_double_call() -> None:

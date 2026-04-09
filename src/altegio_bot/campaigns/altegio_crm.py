@@ -206,12 +206,31 @@ async def get_client_crm_records(
             resp = await http_client.get(url, headers=_headers(), params=params)
             resp.raise_for_status()
 
-            payload = resp.json()
+            try:
+                payload = resp.json()
+            except Exception as exc:
+                raise CrmUnavailableError(
+                    f"CRM API returned invalid JSON: company={company_id} client={altegio_client_id}: {exc}"
+                ) from exc
+
+            if not isinstance(payload, dict):
+                raise CrmUnavailableError(
+                    f"CRM API returned unexpected payload type {type(payload).__name__}: "
+                    f"company={company_id} client={altegio_client_id}"
+                )
+
+            data = payload.get("data")
             raw_records: list[dict[str, Any]] = []
-            if isinstance(payload, dict):
-                data = payload.get("data")
-                if isinstance(data, list):
-                    raw_records = data
+            if data is None:
+                # Empty response — treat as no records on this page
+                pass
+            elif isinstance(data, list):
+                raw_records = data
+            else:
+                raise CrmUnavailableError(
+                    f"CRM API returned unexpected 'data' type {type(data).__name__}: "
+                    f"company={company_id} client={altegio_client_id}"
+                )
 
             for rec in raw_records:
                 starts_at = _parse_record_starts_at(rec)

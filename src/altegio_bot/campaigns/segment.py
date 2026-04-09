@@ -16,6 +16,16 @@
   - Исключение: wa_opted_out берётся из локальной БД (clients.wa_opted_out).
   - Исключение: phone_e164 берётся из локальной БД (clients.phone_e164).
 
+Ограничение обнаружения (Discovery Limitation):
+  Кандидаты обнаруживаются через локальную БД (таблица records).
+  Это означает, что клиенты, которые посещали салон ДО запуска бота
+  (до синхронизации записей), НЕ будут обнаружены как кандидаты.
+  Это false negative (пропуск), а не false positive (ложная рассылка).
+  Безопасно: мы никогда не отправляем тем, кто не должен получать рассылку.
+  НЕ безопасно: мы можем пропустить часть новых клиентов.
+  Если это неприемлемо — нужен другой способ обнаружения (например, через
+  CRM API с перебором всех клиентов компании, если endpoint существует).
+
 Локальная БД используется ТОЛЬКО для:
   - Обнаружения candidate client_id (performance: не опрашивать CRM по всем клиентам).
   - wa_opted_out и phone_e164.
@@ -31,18 +41,24 @@ CRM недоступность:
   - Если Altegio CRM API вернул ошибку → клиент получает excluded_reason =
     'crm_history_unavailable'. Возвращать 0 и считать клиента новым НЕЛЬЗЯ.
 
+Service lookup недоступность:
+  - Если Altegio API для получения category_id услуги вернул ошибку →
+    клиент получает excluded_reason = 'service_category_unavailable'.
+    Считать услугу non-lash и пропускать проверку НЕЛЬЗЯ — это даст
+    ложно-eligible клиентов.
+
 Константа CONFIRMED_FLAG = 1 — единственная точка правды для «подтверждена».
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime
 
 import httpx
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.campaigns.altegio_crm import (
     CrmRecord,
@@ -50,13 +66,18 @@ from altegio_bot.campaigns.altegio_crm import (
     classify_crm_records,
     get_client_crm_records,
 )
+from altegio_bot.db import SessionLocal
 from altegio_bot.models.models import Client, Record
-from altegio_bot.service_filter import LASH_CATEGORY_IDS_BY_COMPANY, is_lash_service
+from altegio_bot.service_filter import LASH_CATEGORY_IDS_BY_COMPANY, ServiceLookupError, is_lash_service
 
 logger = logging.getLogger(__name__)
 
 # Единственная точка правды: что считается «подтверждённой» записью.
 CONFIRMED_FLAG = 1
+
+# Ограниченная конкурентность CRM-запросов: не более N параллельных запросов.
+# Защищает от перегрузки Altegio API и локального пула соединений.
+_CRM_MAX_CONCURRENCY = 8
 
 
 @dataclass
@@ -97,8 +118,9 @@ def _classify(candidate: ClientCandidate) -> None:
     """Проставить excluded_reason по бизнес-правилам «Вариант А».
 
     Порядок проверок важен: более приоритетные идут первыми.
-    crm_history_unavailable устанавливается до вызова _classify() напрямую
-    в find_candidates(), но здесь проверяем для полноты.
+    crm_history_unavailable и service_category_unavailable устанавливаются
+    до вызова _classify() напрямую в find_candidates(), но здесь проверяем
+    для полноты.
     """
     client = candidate.client
 
@@ -110,8 +132,8 @@ def _classify(candidate: ClientCandidate) -> None:
         candidate.excluded_reason = "no_phone"
         return
 
-    # crm_history_unavailable — установлено ранее, не перезаписываем
-    if candidate.excluded_reason == "crm_history_unavailable":
+    # crm_history_unavailable / service_category_unavailable — установлены ранее
+    if candidate.excluded_reason in ("crm_history_unavailable", "service_category_unavailable"):
         return
 
     # Клиент с историей до периода — не новый
@@ -147,6 +169,10 @@ async def _check_lash_services(
 
     Возвращает:
         (lash_records_in_period, confirmed_lash_records_in_period, service_titles)
+
+    Raises:
+        ServiceLookupError: если Altegio service category API недоступен.
+            Caller должен пометить клиента excluded_reason='service_category_unavailable'.
     """
     has_lash_config = bool(LASH_CATEGORY_IDS_BY_COMPANY.get(company_id))
 
@@ -159,16 +185,9 @@ async def _check_lash_services(
     lash_svc_ids: set[int] = set()
     if has_lash_config:
         for svc_id in unique_svc_ids:
-            try:
-                if await is_lash_service(company_id, svc_id, http_client):
-                    lash_svc_ids.add(svc_id)
-            except Exception as exc:
-                logger.warning(
-                    "is_lash_service failed company=%d service=%d: %s (treating as non-lash)",
-                    company_id,
-                    svc_id,
-                    exc,
-                )
+            # ServiceLookupError propagates to caller — не глотаем!
+            if await is_lash_service(company_id, svc_id, http_client):
+                lash_svc_ids.add(svc_id)
     else:
         logger.warning(
             "No LASH_CATEGORY_IDS_BY_COMPANY for company_id=%d — lash filter disabled",
@@ -190,8 +209,115 @@ async def _check_lash_services(
     return lash_count, confirmed_lash_count, sorted(titles)
 
 
+def _make_crm_unavailable_candidate(client: Client) -> ClientCandidate:
+    return ClientCandidate(
+        client=client,
+        total_records_in_period=0,
+        confirmed_records_in_period=0,
+        lash_records_in_period=0,
+        confirmed_lash_records_in_period=0,
+        service_titles_in_period=[],
+        records_before_period=0,
+        local_client_found=True,
+        excluded_reason="crm_history_unavailable",
+    )
+
+
+def _make_service_unavailable_candidate(client: Client) -> ClientCandidate:
+    return ClientCandidate(
+        client=client,
+        total_records_in_period=0,
+        confirmed_records_in_period=0,
+        lash_records_in_period=0,
+        confirmed_lash_records_in_period=0,
+        service_titles_in_period=[],
+        records_before_period=0,
+        local_client_found=True,
+        excluded_reason="service_category_unavailable",
+    )
+
+
+async def _process_one_client(
+    http: httpx.AsyncClient,
+    sem: asyncio.Semaphore,
+    client: Client,
+    company_id: int,
+    period_start: datetime,
+    period_end: datetime,
+) -> ClientCandidate:
+    """Получить CRM-данные для одного клиента и классифицировать его.
+
+    Защищена семафором для ограничения конкурентности.
+    """
+    if not client.altegio_client_id:
+        logger.warning(
+            "segment: client_id=%d has no altegio_client_id — cannot check CRM",
+            client.id,
+        )
+        return ClientCandidate(
+            client=client,
+            total_records_in_period=0,
+            confirmed_records_in_period=0,
+            lash_records_in_period=0,
+            confirmed_lash_records_in_period=0,
+            service_titles_in_period=[],
+            records_before_period=0,
+            local_client_found=True,
+            excluded_reason="crm_history_unavailable",
+        )
+
+    async with sem:
+        # CRM: получить ВСЕ записи клиента
+        try:
+            crm_records = await get_client_crm_records(
+                http,
+                company_id=company_id,
+                altegio_client_id=int(client.altegio_client_id),
+            )
+        except CrmUnavailableError as exc:
+            logger.warning(
+                "segment: CRM unavailable for client_id=%d altegio_id=%s: %s",
+                client.id,
+                client.altegio_client_id,
+                exc,
+            )
+            return _make_crm_unavailable_candidate(client)
+
+        # Разбить на in-period и before-period
+        in_period_records, count_before = classify_crm_records(crm_records, period_start, period_end)
+
+        # Базовые счётчики по in-period записям
+        total_in_period = len(in_period_records)
+        confirmed_in_period = sum(1 for r in in_period_records if r.is_confirmed)
+
+        # Ресничные записи и названия услуг
+        try:
+            lash_count, confirmed_lash_count, service_titles = await _check_lash_services(
+                http, company_id, in_period_records
+            )
+        except ServiceLookupError as exc:
+            logger.warning(
+                "segment: service category lookup failed for client_id=%d: %s",
+                client.id,
+                exc,
+            )
+            return _make_service_unavailable_candidate(client)
+
+        c = ClientCandidate(
+            client=client,
+            total_records_in_period=total_in_period,
+            confirmed_records_in_period=confirmed_in_period,
+            lash_records_in_period=lash_count,
+            confirmed_lash_records_in_period=confirmed_lash_count,
+            service_titles_in_period=service_titles,
+            records_before_period=count_before,
+            local_client_found=True,
+        )
+        _classify(c)
+        return c
+
+
 async def find_candidates(
-    session: AsyncSession,
     *,
     company_id: int,
     period_start: datetime,
@@ -203,12 +329,23 @@ async def find_candidates(
     Локальная БД используется только для обнаружения candidate client_id
     и для wa_opted_out / phone_e164.
 
+    ВАЖНО — Discovery Limitation:
+        Кандидаты обнаруживаются через таблицу records локальной БД.
+        Клиенты, которые посещали салон ДО запуска бота (до синхронизации
+        записей в локальную БД), могут быть пропущены. Это false negative.
+        Безопасно: ложных рассылок не будет. Небезопасно: часть новых клиентов
+        может не получить рассылку. Принятое ограничение зафиксировано в meta
+        CampaignRun через поле discovery_source='local_db'.
+
     Шаги:
     1. SQL: candidate client_id (non-deleted records in period, local DB).
     2. SQL: Client объекты (wa_opted_out, phone_e164).
+       → Транзакция закрывается до HTTP-запросов.
     3. CRM API (один переиспользуемый HTTP client): для каждого клиента
        получить все записи → разбить на in-period и before-period.
+       Конкурентность ограничена семафором (_CRM_MAX_CONCURRENCY).
     4. Определить ресничность услуг (category lookup с LRU-кешем).
+       При ошибке lookup → service_category_unavailable (не silent non-lash).
     5. Классификация по правилам Варианта А.
     6. Вернуть список ClientCandidate.
 
@@ -216,47 +353,45 @@ async def find_candidates(
         Список ClientCandidate (eligible + excluded).
     """
     # ------------------------------------------------------------------
-    # Шаг 1. Обнаружение: client_id с записями в периоде (local DB)
-    # Используем только для построения списка кандидатов. Реальные данные
-    # придут из CRM.
+    # Шаг 1-2. DB queries в короткой сессии (закрывается до HTTP-вызовов)
     # ------------------------------------------------------------------
-    records_stmt = (
-        select(Record.client_id)
-        .where(Record.company_id == company_id)
-        .where(Record.client_id.is_not(None))
-        .where(Record.starts_at >= period_start)
-        .where(Record.starts_at < period_end)
-        .where(Record.is_deleted.is_(False))
-        .distinct()
-    )
-    candidate_client_ids_result = (await session.execute(records_stmt)).scalars().all()
-    candidate_client_ids: list[int] = list(candidate_client_ids_result)
-
-    if not candidate_client_ids:
-        logger.info(
-            "segment company_id=%d period=[%s, %s) → 0 candidate client_ids in local DB",
-            company_id,
-            period_start.date(),
-            period_end.date(),
+    async with SessionLocal() as session:
+        records_stmt = (
+            select(Record.client_id)
+            .where(Record.company_id == company_id)
+            .where(Record.client_id.is_not(None))
+            .where(Record.starts_at >= period_start)
+            .where(Record.starts_at < period_end)
+            .where(Record.is_deleted.is_(False))
+            .distinct()
         )
-        return []
+        candidate_client_ids_result = (await session.execute(records_stmt)).scalars().all()
+        candidate_client_ids: list[int] = list(candidate_client_ids_result)
+
+        if not candidate_client_ids:
+            logger.info(
+                "segment company_id=%d period=[%s, %s) → 0 candidate client_ids in local DB"
+                " (discovery limitation: may miss clients before bot start)",
+                company_id,
+                period_start.date(),
+                period_end.date(),
+            )
+            return []
+
+        clients_stmt = select(Client).where(
+            Client.id.in_(candidate_client_ids),
+            Client.company_id == company_id,
+        )
+        clients_map: dict[int, Client] = {c.id: c for c in (await session.execute(clients_stmt)).scalars()}
+    # Session closed here — no open DB connection during CRM HTTP calls
 
     # ------------------------------------------------------------------
-    # Шаг 2. Загрузить Client объекты (wa_opted_out, phone_e164)
+    # Шаги 3-5. CRM HTTP calls + классификация с ограниченной конкурентностью
     # ------------------------------------------------------------------
-    clients_stmt = select(Client).where(
-        Client.id.in_(candidate_client_ids),
-        Client.company_id == company_id,
-    )
-    clients_map: dict[int, Client] = {c.id: c for c in (await session.execute(clients_stmt)).scalars()}
-
-    # ------------------------------------------------------------------
-    # Шаг 3-5. CRM lookup + классификация
-    # Один переиспользуемый AsyncClient для всего батча (keep-alive)
-    # ------------------------------------------------------------------
-    candidates: list[ClientCandidate] = []
+    sem = asyncio.Semaphore(_CRM_MAX_CONCURRENCY)
 
     async with httpx.AsyncClient(timeout=30.0) as http:
+        tasks = []
         for client_id in candidate_client_ids:
             client = clients_map.get(client_id)
             if client is None:
@@ -266,87 +401,20 @@ async def find_candidates(
                     company_id,
                 )
                 continue
+            tasks.append(_process_one_client(http, sem, client, company_id, period_start, period_end))
 
-            if not client.altegio_client_id:
-                # Нет altegio_client_id — не можем запросить CRM
-                logger.warning(
-                    "segment: client_id=%d has no altegio_client_id — cannot check CRM",
-                    client_id,
-                )
-                c = ClientCandidate(
-                    client=client,
-                    total_records_in_period=0,
-                    confirmed_records_in_period=0,
-                    lash_records_in_period=0,
-                    confirmed_lash_records_in_period=0,
-                    service_titles_in_period=[],
-                    records_before_period=0,
-                    local_client_found=True,
-                    excluded_reason="crm_history_unavailable",
-                )
-                candidates.append(c)
-                continue
-
-            # CRM: получить ВСЕ записи клиента
-            try:
-                crm_records = await get_client_crm_records(
-                    http,
-                    company_id=company_id,
-                    altegio_client_id=int(client.altegio_client_id),
-                )
-            except CrmUnavailableError as exc:
-                logger.warning(
-                    "segment: CRM unavailable for client_id=%d altegio_id=%s: %s",
-                    client_id,
-                    client.altegio_client_id,
-                    exc,
-                )
-                c = ClientCandidate(
-                    client=client,
-                    total_records_in_period=0,
-                    confirmed_records_in_period=0,
-                    lash_records_in_period=0,
-                    confirmed_lash_records_in_period=0,
-                    service_titles_in_period=[],
-                    records_before_period=0,
-                    local_client_found=True,
-                    excluded_reason="crm_history_unavailable",
-                )
-                candidates.append(c)
-                continue
-
-            # Разбить на in-period и before-period
-            in_period_records, count_before = classify_crm_records(crm_records, period_start, period_end)
-
-            # Базовые счётчики по in-period записям
-            total_in_period = len(in_period_records)
-            confirmed_in_period = sum(1 for r in in_period_records if r.is_confirmed)
-
-            # Ресничные записи и названия услуг
-            lash_count, confirmed_lash_count, service_titles = await _check_lash_services(
-                http, company_id, in_period_records
-            )
-
-            c = ClientCandidate(
-                client=client,
-                total_records_in_period=total_in_period,
-                confirmed_records_in_period=confirmed_in_period,
-                lash_records_in_period=lash_count,
-                confirmed_lash_records_in_period=confirmed_lash_count,
-                service_titles_in_period=service_titles,
-                records_before_period=count_before,
-                local_client_found=True,
-            )
-            _classify(c)
-            candidates.append(c)
+        candidates: list[ClientCandidate] = list(await asyncio.gather(*tasks))
 
     logger.info(
-        "segment company_id=%d period=[%s, %s) total=%d eligible=%d crm_unavailable=%d",
+        "segment company_id=%d period=[%s, %s) total=%d eligible=%d"
+        " crm_unavailable=%d service_unavailable=%d"
+        " (discovery via local_db — may miss pre-bot clients)",
         company_id,
         period_start.date(),
         period_end.date(),
         len(candidates),
         sum(1 for c in candidates if c.is_eligible),
         sum(1 for c in candidates if c.excluded_reason == "crm_history_unavailable"),
+        sum(1 for c in candidates if c.excluded_reason == "service_category_unavailable"),
     )
     return candidates

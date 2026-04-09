@@ -669,6 +669,10 @@ class CampaignRun(Base):
     excluded_no_whatsapp: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
     # CRM API был недоступен — история клиента не проверена → исключён
     excluded_crm_unavailable: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    # Altegio service category API недоступен — ресничность услуги не определена → исключён
+    excluded_service_category_unavailable: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
+    )
 
     # -----------------------------------------------------------------------
     # Счётчики доставки и атрибуции

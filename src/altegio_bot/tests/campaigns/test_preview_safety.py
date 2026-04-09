@@ -2,7 +2,8 @@
 
 Проверяет:
 - Backend validation: несовпадение company_id / period / campaign_code → 400.
-- Discarded preview → 400.
+- Только completed preview → 202; failed/running/queued/discarded → 400.
+- card_type_id и followup-параметры зафиксированы в снимке → несовпадение → 400.
 - Совпадающие параметры → запрос проходит валидацию (202).
 - UI: страница с from_preview содержит JS prefill и lock логику.
 """
@@ -38,7 +39,10 @@ COMPANY = 758285
 
 
 async def _create_preview_run(session_maker, **kw) -> int:
-    """Создать preview CampaignRun для тестов."""
+    """Создать preview CampaignRun для тестов.
+
+    По умолчанию статус 'completed' — только такие previews разрешены как источник send-real.
+    """
     defaults = dict(
         campaign_code="new_clients_monthly",
         mode="preview",
@@ -46,6 +50,11 @@ async def _create_preview_run(session_maker, **kw) -> int:
         period_start=PERIOD_START,
         period_end=PERIOD_END,
         status="completed",
+        card_type_id=None,
+        followup_enabled=False,
+        followup_delay_days=None,
+        followup_policy=None,
+        followup_template_name=None,
     )
     defaults.update(kw)
     async with session_maker() as session:
@@ -128,7 +137,108 @@ async def test_run_from_discarded_preview_returns_400(
     }
     resp = await http_client.post("/ops/campaigns/new-clients/run", json=body)
     assert resp.status_code == 400
-    assert "discarded" in resp.json()["detail"]
+    detail = resp.json()["detail"]
+    # Сообщение теперь объясняет требование к статусу
+    assert "completed" in detail
+    assert "discarded" in detail
+
+
+# ---------------------------------------------------------------------------
+# Тест: failed preview → 400 (только completed разрешён)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_from_failed_preview_returns_400(
+    http_client: AsyncClient,
+    session_maker,
+) -> None:
+    """Failed preview → 400: только completed previews можно использовать."""
+    preview_run_id = await _create_preview_run(session_maker, status="failed")
+
+    body = {
+        "company_id": COMPANY,
+        "location_id": COMPANY,
+        "period_start": "2026-01-01T00:00:00Z",
+        "period_end": "2026-01-31T23:59:59Z",
+        "source_preview_run_id": preview_run_id,
+    }
+    resp = await http_client.post("/ops/campaigns/new-clients/run", json=body)
+    assert resp.status_code == 400
+    assert "completed" in resp.json()["detail"]
+    assert "failed" in resp.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_run_from_running_preview_returns_400(
+    http_client: AsyncClient,
+    session_maker,
+) -> None:
+    """Running preview → 400: данные неполные."""
+    preview_run_id = await _create_preview_run(session_maker, status="running")
+
+    body = {
+        "company_id": COMPANY,
+        "location_id": COMPANY,
+        "period_start": "2026-01-01T00:00:00Z",
+        "period_end": "2026-01-31T23:59:59Z",
+        "source_preview_run_id": preview_run_id,
+    }
+    resp = await http_client.post("/ops/campaigns/new-clients/run", json=body)
+    assert resp.status_code == 400
+    assert "completed" in resp.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# Тест: card_type_id mismatch → 400
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_from_preview_card_type_mismatch_returns_400(
+    http_client: AsyncClient,
+    session_maker,
+) -> None:
+    """card_type_id в запросе не совпадает с preview → 400."""
+    preview_run_id = await _create_preview_run(session_maker, card_type_id="type_abc")
+
+    body = {
+        "company_id": COMPANY,
+        "location_id": COMPANY,
+        "period_start": "2026-01-01T00:00:00Z",
+        "period_end": "2026-01-31T23:59:59Z",
+        "source_preview_run_id": preview_run_id,
+        "card_type_id": "type_xyz",  # ДРУГОЙ тип карты
+    }
+    resp = await http_client.post("/ops/campaigns/new-clients/run", json=body)
+    assert resp.status_code == 400
+    assert "card_type_id" in resp.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# Тест: followup_enabled mismatch → 400
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_from_preview_followup_mismatch_returns_400(
+    http_client: AsyncClient,
+    session_maker,
+) -> None:
+    """followup_enabled в запросе не совпадает с preview → 400."""
+    preview_run_id = await _create_preview_run(session_maker, followup_enabled=True)
+
+    body = {
+        "company_id": COMPANY,
+        "location_id": COMPANY,
+        "period_start": "2026-01-01T00:00:00Z",
+        "period_end": "2026-01-31T23:59:59Z",
+        "source_preview_run_id": preview_run_id,
+        "followup_enabled": False,  # ОТЛИЧАЕТСЯ от preview
+    }
+    resp = await http_client.post("/ops/campaigns/new-clients/run", json=body)
+    assert resp.status_code == 400
+    assert "followup_enabled" in resp.json()["detail"]
 
 
 # ---------------------------------------------------------------------------

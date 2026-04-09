@@ -24,6 +24,19 @@ from altegio_bot.models.models import RecordService
 
 logger = logging.getLogger(__name__)
 
+
+class ServiceLookupError(Exception):
+    """Altegio service category lookup failed (network or HTTP error).
+
+    Отличается от «услуга не является ресничной»:
+    - ServiceLookupError = API недоступен, ответ не получен.
+    - False из is_lash_service = ответ получен, услуга не ресничная.
+
+    Caller в segment.py обязан обработать это исключение и пометить клиента
+    excluded_reason='service_category_unavailable', а НЕ считать услугу non-lash.
+    """
+
+
 LASH_CATEGORY_IDS_BY_COMPANY: dict[int, set[int]] = {
     1271200: {10707687, 12414859, 13329127, 13351976},
     758285: {10707687, 12414859, 13329127, 13351956},
@@ -120,27 +133,20 @@ async def _fetch_service_category_id(
             async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await _do_request(client)
     except httpx.HTTPError as exc:
-        logger.warning(
-            "altegio service lookup failed company_id=%s service_id=%s: %s",
-            company_id,
-            service_id,
-            exc,
-        )
-        return None
+        raise ServiceLookupError(
+            f"altegio service lookup network error: company={company_id} service={service_id}: {exc}"
+        ) from exc
 
     if resp.status_code == 404:
+        # Service not found — definitively not lash, not an error
         return None
 
     try:
         resp.raise_for_status()
     except httpx.HTTPStatusError as exc:
-        logger.warning(
-            "altegio service lookup bad status company_id=%s service_id=%s: %s",
-            company_id,
-            service_id,
-            exc,
-        )
-        return None
+        raise ServiceLookupError(
+            f"altegio service lookup bad status {resp.status_code}: company={company_id} service={service_id}"
+        ) from exc
 
     try:
         payload: Any = resp.json()
@@ -179,12 +185,16 @@ async def is_lash_service(
     """Вернуть True, если service_id принадлежит категории ресниц для компании.
 
     Использует LRU-кеш и Altegio API для получения category_id.
-    При сбое API возвращает False (консервативная стратегия).
 
     Args:
         http_client: если передан — переиспользуется для API-запроса.
                      Позволяет избежать лишних TCP/TLS handshake при массовом
                      обходе services (батч сегментации кампании).
+
+    Raises:
+        ServiceLookupError: при сетевой ошибке или HTTP-ошибке (не 404).
+            Caller обязан обработать это как 'service_category_unavailable',
+            а НЕ молча считать услугу non-lash.
     """
     allowed = LASH_CATEGORY_IDS_BY_COMPANY.get(company_id)
     if not allowed:
@@ -193,12 +203,14 @@ async def is_lash_service(
     key = (company_id, service_id)
     category_id = _cache_get(key)
     if category_id is None:
+        # Может выбросить ServiceLookupError — propagate to caller
         fetched = await _fetch_service_category_id(
             company_id=company_id,
             service_id=service_id,
             http_client=http_client,
         )
         if fetched is None:
+            # 404 or no category_id in response — definitively not lash
             return False
         _cache_put(key, fetched)
         category_id = fetched
