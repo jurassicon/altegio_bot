@@ -467,3 +467,171 @@ async def test_run_preview_final_state_guard(session_maker) -> None:
             assert db_run.meta.get("discovery_source") == "local_db"
     finally:
         runner_module.SessionLocal = original_session_local
+
+
+# ---------------------------------------------------------------------------
+# Тест 11.3-real (preview): guard срабатывает при реальном изменении статуса
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_preview_guard_raises_when_status_changed_externally(session_maker) -> None:
+    """Guard preview: если статус run меняется между фазами → RuntimeError, не completed."""
+    from sqlalchemy import select
+
+    import altegio_bot.campaigns.runner as runner_module
+    from altegio_bot.campaigns.runner import RunParams, run_preview
+    from altegio_bot.models.models import CampaignRun
+
+    original_session_local = runner_module.SessionLocal
+    runner_module.SessionLocal = session_maker
+
+    params = RunParams(
+        company_id=COMPANY,
+        location_id=COMPANY,
+        period_start=PERIOD_START,
+        period_end=PERIOD_END,
+        mode="preview",
+    )
+
+    async def inject_failed_status(**kw):
+        """Симулирует внешнюю модификацию: переводит run в 'failed' до финализации."""
+        async with session_maker() as s:
+            async with s.begin():
+                stmt = (
+                    select(CampaignRun).where(CampaignRun.status == "running").order_by(CampaignRun.id.desc()).limit(1)
+                )
+                run = (await s.execute(stmt)).scalar_one_or_none()
+                if run is not None:
+                    run.status = "failed"
+        return []
+
+    try:
+        with patch("altegio_bot.campaigns.runner.find_candidates", side_effect=inject_failed_status):
+            with pytest.raises(RuntimeError, match="finalization aborted"):
+                await run_preview(params)
+
+        # Убедиться: run НЕ переведён в 'completed'
+        async with session_maker() as s:
+            stmt = select(CampaignRun).where(CampaignRun.mode == "preview").order_by(CampaignRun.id.desc()).limit(1)
+            run = (await s.execute(stmt)).scalar_one_or_none()
+            assert run is not None
+            assert run.status != "completed", f"Ожидался не-completed статус, получили {run.status!r}"
+    finally:
+        runner_module.SessionLocal = original_session_local
+
+
+# ---------------------------------------------------------------------------
+# Тест 11.3-real (send-real): guard срабатывает при реальном изменении статуса
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_send_real_guard_raises_when_status_changed_externally(session_maker) -> None:
+    """Guard send-real: если статус run меняется до финализации → raise, run не completed."""
+
+    import altegio_bot.campaigns.runner as runner_module
+    from altegio_bot.campaigns.runner import RunParams, _create_run, _execute_send_real_for_existing_run
+    from altegio_bot.models.models import CampaignRun
+
+    original_session_local = runner_module.SessionLocal
+    runner_module.SessionLocal = session_maker
+
+    params = RunParams(
+        company_id=COMPANY,
+        location_id=COMPANY,
+        period_start=PERIOD_START,
+        period_end=PERIOD_END,
+        mode="send-real",
+    )
+
+    async with session_maker() as session:
+        async with session.begin():
+            run = await _create_run(session, params, status="queued")
+            run_id = run.id
+
+    async def inject_discarded_status(**kw):
+        """Симулирует отмену run между phase 1 (running) и phase 5 (финализация)."""
+        async with session_maker() as s:
+            async with s.begin():
+                r = await s.get(CampaignRun, run_id)
+                if r is not None:
+                    r.status = "discarded"
+        return []
+
+    try:
+        with (
+            patch("altegio_bot.campaigns.runner.find_candidates", side_effect=inject_discarded_status),
+            patch(
+                "altegio_bot.campaigns.runner._resolve_card_type",
+                new=AsyncMock(return_value="default_card_type"),
+            ),
+        ):
+            with pytest.raises(Exception, match="finalization aborted"):
+                await _execute_send_real_for_existing_run(run_id, params)
+
+        # Убедиться: run НЕ переведён в 'completed'.
+        # _mark_run_failed вызывается из outer except → статус 'failed'.
+        async with session_maker() as s:
+            r = await s.get(CampaignRun, run_id)
+            assert r is not None
+            assert r.status != "completed", f"Ожидался не-completed статус, получили {r.status!r}"
+            assert r.status == "failed", f"Ожидался 'failed' (от _mark_run_failed), получили {r.status!r}"
+    finally:
+        runner_module.SessionLocal = original_session_local
+
+
+# ---------------------------------------------------------------------------
+# Тест 5: discovery_source для snapshot-based send-real
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_send_real_snapshot_writes_preview_snapshot_discovery_source(session_maker) -> None:
+    """Send-real из preview записывает discovery_source='preview_snapshot' в meta."""
+    import altegio_bot.campaigns.runner as runner_module
+    from altegio_bot.campaigns.runner import RunParams, _create_run, _execute_send_real_for_existing_run
+    from altegio_bot.models.models import CampaignRun
+
+    original_session_local = runner_module.SessionLocal
+    runner_module.SessionLocal = session_maker
+
+    # Сначала создаём реальный preview run, чтобы удовлетворить FK-ограничение
+    preview_run_id = await _create_preview_run(session_maker)
+
+    params = RunParams(
+        company_id=COMPANY,
+        location_id=COMPANY,
+        period_start=PERIOD_START,
+        period_end=PERIOD_END,
+        mode="send-real",
+        source_preview_run_id=preview_run_id,
+    )
+
+    async with session_maker() as session:
+        async with session.begin():
+            run = await _create_run(session, params, status="queued")
+            run_id = run.id
+
+    try:
+        with (
+            patch(
+                "altegio_bot.campaigns.runner._load_candidates_from_preview_snapshot",
+                new=AsyncMock(return_value=[]),
+            ),
+            patch(
+                "altegio_bot.campaigns.runner._resolve_card_type",
+                new=AsyncMock(return_value="default_card_type"),
+            ),
+        ):
+            await _execute_send_real_for_existing_run(run_id, params)
+
+        async with session_maker() as s:
+            r = await s.get(CampaignRun, run_id)
+            assert r is not None
+            assert r.meta.get("discovery_source") == "preview_snapshot", (
+                f"Ожидался discovery_source='preview_snapshot', получили: {r.meta}"
+            )
+            assert r.meta.get("used_preview_snapshot") == preview_run_id
+    finally:
+        runner_module.SessionLocal = original_session_local

@@ -1,7 +1,5 @@
 """Сегментация: поиск новых клиентов для рассылки.
 
-Вариант А — строгие бизнес-правила:
-
   Клиент eligible только если:
   1. В периоде у него РОВНО ОДНА lash-запись (любого статуса, не удалённая).
   2. Эта единственная lash-запись подтверждена (confirmed == 1).
@@ -257,6 +255,11 @@ async def _process_one_client(
     Внешний try/except Exception — защитный пояс: если какое-то неожиданное
     исключение не было поймано внутренними блоками, клиент помечается
     crm_history_unavailable, а не роняет весь asyncio.gather.
+
+    Только BaseException (KeyboardInterrupt и т.п.) может пробиться через этот
+    пояс. В этом случае asyncio.gather с return_exceptions=True поймает его
+    в виде объекта исключения, а find_candidates создаст excluded candidate
+    для данного snapshot — клиент не теряется.
     """
     try:
         if not snapshot.altegio_client_id:
@@ -357,7 +360,9 @@ async def find_candidates(
     5. Классификация по правилам Варианта А.
     6. asyncio.gather с return_exceptions=True: единичный сбой задачи не
        прерывает остальные. Основная защита — outer except Exception в
-       _process_one_client; gather как резервный пояс безопасности.
+       _process_one_client. task_snapshots параллельный список — если gather
+       всё же вернёт exception-объект, snapshot известен и клиент превращается
+       в excluded candidate (crm_history_unavailable), а не дропается молча.
     7. Вернуть список ClientCandidate.
 
     Returns:
@@ -425,6 +430,11 @@ async def find_candidates(
     )
 
     async with httpx.AsyncClient(timeout=30.0) as http:
+        # task_snapshots параллелен tasks: tasks[i] соответствует task_snapshots[i].
+        # Это нужно для резервной ветки gather: если result — exception-объект,
+        # мы знаем, какой snapshot потерпел сбой, и создаём excluded candidate,
+        # а не дропаем задачу молча.
+        task_snapshots: list[ClientSnapshot] = []
         tasks = []
         for client_id in candidate_client_ids:
             snapshot = snapshots.get(client_id)
@@ -435,24 +445,29 @@ async def find_candidates(
                     company_id,
                 )
                 continue
+            task_snapshots.append(snapshot)
             tasks.append(_process_one_client(http, sem, snapshot, company_id, period_start, period_end))
 
         # return_exceptions=True: резервный пояс безопасности.
         # Основная защита — outer except Exception в _process_one_client.
-        # Если BaseException (KeyboardInterrupt и т.п.) всё же пробьётся — логируем и пропускаем таск.
+        # Если BaseException всё же пробьётся — gather вернёт его в results,
+        # и мы создадим excluded candidate для конкретного snapshot.
         raw_results = await asyncio.gather(*tasks, return_exceptions=True)
 
     candidates: list[ClientCandidate] = []
-    for result in raw_results:
+    for snapshot, result in zip(task_snapshots, raw_results):
         if isinstance(result, ClientCandidate):
             candidates.append(result)
         else:
-            # BaseException пробилось через outer except Exception в _process_one_client.
-            # Логируем и отбрасываем — не должно происходить в штатном режиме.
+            # BaseException пробилось через outer except Exception.
+            # Не дропаем задачу молча — превращаем snapshot в excluded candidate.
             logger.error(
-                "segment: unexpected exception escaped _process_one_client (task dropped): %r",
+                "segment: BaseException escaped _process_one_client for client_id=%s "
+                "— marking crm_history_unavailable: %r",
+                snapshot.id,
                 result,
             )
+            candidates.append(_make_excluded_candidate(snapshot, "crm_history_unavailable"))
 
     logger.info(
         "segment company_id=%d period=[%s, %s) total=%d eligible=%d"

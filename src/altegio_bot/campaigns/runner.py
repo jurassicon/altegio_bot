@@ -267,6 +267,22 @@ async def run_preview(params: RunParams) -> CampaignRun:
             run = await session.get(CampaignRun, run_id)
             if run is None:
                 raise RuntimeError(f"CampaignRun {run_id} disappeared after creation")
+
+            # Финальная проверка статуса — до любых изменений.
+            # Если между фазой 1 и фазой 3 run был переведён во внешнее состояние
+            # (например, failed через timeout или отмену), откатываем транзакцию
+            # и сигнализируем об ошибке. Не должно быть ложного success-flow.
+            if run.status != "running":
+                logger.error(
+                    "preview run_id=%d: finalization aborted — status=%r instead of 'running' "
+                    "(run was externally modified between segmentation and finalization)",
+                    run_id,
+                    run.status,
+                )
+                raise RuntimeError(
+                    f"preview run_id={run_id}: finalization aborted — status was {run.status!r} instead of 'running'"
+                )
+
             _update_run_exclusion_counters(run, candidates)
             for candidate in candidates:
                 session.add(_build_recipient(run_id, candidate))
@@ -276,17 +292,8 @@ async def run_preview(params: RunParams) -> CampaignRun:
             meta["discovery_source"] = "local_db"
             run.meta = meta
 
-            # Финальная проверка статуса: run должен быть 'running'.
-            # Если нет (например, был отменён извне) — не перезаписываем статус.
-            if run.status != "running":
-                logger.warning(
-                    "preview run_id=%d: status=%r at finalization, expected 'running' — skipping completed",
-                    run_id,
-                    run.status,
-                )
-            else:
-                run.status = "completed"
-                run.completed_at = utcnow()
+            run.status = "completed"
+            run.completed_at = utcnow()
 
             # Захватить значения счётчиков до закрытия сессии.
             # SessionLocal настроен с expire_on_commit=False, поэтому атрибуты
@@ -295,7 +302,7 @@ async def run_preview(params: RunParams) -> CampaignRun:
             cands_count = run.candidates_count
 
     logger.info(
-        "preview run_id=%d company=%d period=[%s, %s) total=%d eligible=%d",
+        "preview completed run_id=%d company=%d period=[%s, %s) total=%d eligible=%d",
         run_id,
         params.company_id,
         params.period_start.date(),
@@ -445,6 +452,8 @@ async def _execute_send_real_for_existing_run(
             meta.pop("last_error", None)
             if params.source_preview_run_id:
                 meta["used_preview_snapshot"] = params.source_preview_run_id
+                # Источник данных — snapshot preview-run, не свежая сегментация.
+                meta["discovery_source"] = "preview_snapshot"
             else:
                 # Свежая сегментация через локальную БД — фиксируем ограничение обнаружения.
                 meta["discovery_source"] = "local_db"
@@ -519,6 +528,21 @@ async def _execute_send_real_for_existing_run(
                 if run is None:
                     raise RuntimeError(f"CampaignRun {run_id} not found")
 
+                # Финальная проверка статуса — до любых изменений.
+                # Если между фазой 1 и финализацией run был переведён во внешнее состояние,
+                # откатываем транзакцию и сигнализируем. Не должно быть ложного success-flow.
+                if run.status != "running":
+                    logger.error(
+                        "send-real run_id=%d: finalization aborted — status=%r instead of 'running' "
+                        "(run was externally modified between processing and finalization)",
+                        run_id,
+                        run.status,
+                    )
+                    raise RuntimeError(
+                        f"send-real run_id={run_id}: finalization aborted — "
+                        f"status was {run.status!r} instead of 'running'"
+                    )
+
                 run.cleanup_failed_count = stats["cleanup_failed"]
                 run.cards_deleted_count = stats["cards_deleted"]
                 run.cards_issued_count = stats["cards_issued"]
@@ -530,18 +554,10 @@ async def _execute_send_real_for_existing_run(
                 meta.pop("last_error", None)
                 run.meta = meta
 
-                # Финальная проверка статуса: run должен быть 'running'.
-                # Если нет (например, был отменён извне) — не перезаписываем статус.
-                if run.status != "running":
-                    logger.warning(
-                        "send-real run_id=%d: status=%r at finalization, expected 'running' — skipping completed",
-                        run_id,
-                        run.status,
-                    )
-                else:
-                    run.status = "completed"
-                    run.completed_at = utcnow()
+                run.status = "completed"
+                run.completed_at = utcnow()
 
+        # Лог только после успешной финализации (exception выше не допустит сюда при guard)
         logger.info(
             "send-real completed run_id=%d company=%d stats=%s",
             run_id,
@@ -627,6 +643,20 @@ async def _process_eligible(
 ) -> None:
     client = candidate.client
     client_id = client.id
+
+    # Инвариант: eligible candidate обязан иметь локальный client_id.
+    # Snapshot с id=None может прийти из _load_candidates_from_preview_snapshot
+    # при отсутствии локального Client, но такой candidate всегда excluded
+    # (excluded_reason='no_local_client'). Если это условие нарушено — это баг.
+    if client_id is None:
+        logger.error(
+            "process_eligible: eligible candidate has client.id=None "
+            "(company=%d phone=%s) — skipping (invariant violation)",
+            client.company_id,
+            client.phone_e164,
+        )
+        stats["failed"] += 1
+        return
 
     async with SessionLocal() as session:
         async with session.begin():

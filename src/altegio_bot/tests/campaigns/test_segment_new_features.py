@@ -340,3 +340,129 @@ async def test_find_candidates_uses_settings_concurrency(session_maker, monkeypa
         )
 
     assert captured_concurrency == [3], f"Ожидался Semaphore(3), вызвано с {captured_concurrency}"
+
+
+# ---------------------------------------------------------------------------
+# Тест 11.6-extra: валидатор campaign_crm_max_concurrency в settings
+# ---------------------------------------------------------------------------
+
+
+def test_campaign_crm_max_concurrency_validator_rejects_zero() -> None:
+    """Settings отвергают campaign_crm_max_concurrency=0 при инициализации."""
+    import pytest
+    from pydantic import ValidationError
+
+    # Создаём изолированный Settings только с нужным полем, чтобы не зависеть
+    # от DATABASE_URL и других обязательных полей продакшн-класса.
+    from altegio_bot.settings import Settings
+
+    with pytest.raises((ValidationError, ValueError)):
+        Settings(
+            database_url="postgresql+asyncpg://test/test",
+            altegio_webhook_secret="secret",
+            campaign_crm_max_concurrency=0,
+        )
+
+
+def test_campaign_crm_max_concurrency_validator_rejects_negative() -> None:
+    """Settings отвергают отрицательные значения campaign_crm_max_concurrency."""
+    import pytest
+    from pydantic import ValidationError
+
+    from altegio_bot.settings import Settings
+
+    with pytest.raises((ValidationError, ValueError)):
+        Settings(
+            database_url="postgresql+asyncpg://test/test",
+            altegio_webhook_secret="secret",
+            campaign_crm_max_concurrency=-5,
+        )
+
+
+def test_campaign_crm_max_concurrency_validator_accepts_one() -> None:
+    """campaign_crm_max_concurrency=1 — минимально допустимое значение."""
+    from altegio_bot.settings import Settings
+
+    s = Settings(
+        database_url="postgresql+asyncpg://test/test",
+        altegio_webhook_secret="secret",
+        campaign_crm_max_concurrency=1,
+    )
+    assert s.campaign_crm_max_concurrency == 1
+
+
+# ---------------------------------------------------------------------------
+# Тест: gather резервная ветка — BaseException превращается в excluded candidate
+# ---------------------------------------------------------------------------
+
+
+class _TestBaseException(BaseException):
+    """Тестовый BaseException, который не поймает except Exception."""
+
+
+@pytest.mark.asyncio
+async def test_gather_base_exception_produces_excluded_candidate(session_maker, monkeypatch) -> None:
+    """Если BaseException пробивается через _process_one_client, клиент не теряется.
+
+    Ожидаемое поведение:
+    - gather с return_exceptions=True ловит BaseException в results
+    - task_snapshots[i] известен → создаётся excluded candidate
+    - клиент присутствует в итоге как crm_history_unavailable, не дропается
+    """
+    monkeypatch.setattr(segment_module, "SessionLocal", session_maker)
+
+    async with session_maker() as session:
+        async with session.begin():
+            client = Client(
+                company_id=COMPANY,
+                altegio_client_id=_next_id(),
+                phone_e164="+491234567890",
+                raw={},
+            )
+            session.add(client)
+            await session.flush()
+            rec = Record(
+                company_id=COMPANY,
+                altegio_record_id=_next_id(),
+                client_id=client.id,
+                starts_at=PERIOD_START + timedelta(days=5),
+                confirmed=1,
+                is_deleted=False,
+            )
+            session.add(rec)
+
+    # Патчим _process_one_client так, чтобы он бросал BaseException.
+    # outer except Exception не поймает _TestBaseException.
+    # asyncio.gather с return_exceptions=True положит его в results.
+    async def raises_base_exception(http, sem, snapshot, company_id, period_start, period_end):
+        raise _TestBaseException("simulated unhandled base error")
+
+    monkeypatch.setattr(segment_module, "_process_one_client", raises_base_exception)
+
+    results = await find_candidates(
+        company_id=COMPANY,
+        period_start=PERIOD_START,
+        period_end=PERIOD_END,
+    )
+
+    # Клиент не должен быть потерян — должен стать excluded
+    assert len(results) == 1
+    assert results[0].excluded_reason == "crm_history_unavailable"
+    assert isinstance(results[0].client, ClientSnapshot)
+
+
+# ---------------------------------------------------------------------------
+# Тест: _normalise_nullable_str — trim и пробельные строки
+# ---------------------------------------------------------------------------
+
+
+def test_normalise_nullable_str_with_whitespace() -> None:
+    """_normalise_nullable_str: trim + пробельные строки → None."""
+    from altegio_bot.ops.campaigns_api import _normalise_nullable_str
+
+    assert _normalise_nullable_str("") is None
+    assert _normalise_nullable_str("   ") is None
+    assert _normalise_nullable_str(" abc ") == "abc"
+    assert _normalise_nullable_str("0") == "0"
+    assert _normalise_nullable_str(None) is None
+    assert _normalise_nullable_str("abc") == "abc"

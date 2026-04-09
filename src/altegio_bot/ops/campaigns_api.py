@@ -202,12 +202,19 @@ async def create_run(body: RunRequest) -> dict[str, Any]:
 
 
 def _normalise_nullable_str(v: str | None) -> str | None:
-    """Нормализовать nullable строку: пустая строка → None.
+    """Нормализовать nullable строку: trim + пустая/пробельная строка → None.
 
     Используется при сравнении параметров preview и send-real запросов.
-    Предотвращает ложные mismatch когда одно значение '' а другое None.
+    Предотвращает ложные mismatch:
+    - '' vs None → оба None (эквивалентны)
+    - '   ' vs None → оба None (пробелы — не значимое значение)
+    - ' abc ' vs 'abc' → оба 'abc' (trim убирает случайные пробелы)
+    - '0' → '0' (truthy строка остаётся как есть)
     """
-    return v if v else None
+    if v is None:
+        return None
+    stripped = v.strip()
+    return stripped if stripped else None
 
 
 async def _validate_run_matches_preview(
