@@ -2846,7 +2846,7 @@ async def ops_campaigns_dashboard(request: Request) -> str:
 # ---------------------------------------------------------------------------
 
 # Данные о Meta-шаблоне кампании (только для отображения)
-_NC_META_TEMPLATE = "kitilash_ka_newsletter_new_clients_monthly_v2"
+_NC_META_TEMPLATE = "kitilash_ka_newsletter_new_clients_monthly_v1"
 _NC_TEMPLATE_LANGUAGE = "de"
 _NC_TEMPLATE_PARAMS = ["{{1}} — имя клиента", "{{2}} — ссылка для записи", "{{3}} — текст карты лояльности"]
 

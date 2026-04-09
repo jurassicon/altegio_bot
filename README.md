@@ -84,7 +84,7 @@ set +a
   --phone 381638400431 \
   --company-id 758285 \
   --booking-link https://n813709.alteg.io/ \
-  --template kitilash_ka_newsletter_new_clients_monthly_v2 \
+  --template kitilash_ka_newsletter_new_clients_monthly_v1 \
   --expect-status delivered \
   --timeout 180 \
   --cleanup \
@@ -107,7 +107,7 @@ set +a
   --phone 381638400431 \
   --company-id 758285 \
   --booking-link https://n813709.alteg.io/ \
-  --template kitilash_ka_newsletter_new_clients_monthly_v2 \
+  --template kitilash_ka_newsletter_new_clients_monthly_v1 \
   --expect-status delivered \
   --timeout 180 \
   --card-type-id 46454
@@ -132,7 +132,7 @@ set +a
 | `--company-id` | Company ID in Altegio | ✅ | `758285` |
 | `--card-type-id` | Loyalty card type ID | ✅ | `46454` |
 | `--booking-link` | Online booking link | | `https://n813709.alteg.io/` |
-| `--template` | Meta template name | | `kitilash_ka_newsletter_new_clients_monthly_v2` |
+| `--template` | Meta template name | | `kitilash_ka_newsletter_new_clients_monthly_v1` |
 | `--expect-status` | Expected delivery status | | `delivered` (default) or `sent` |
 | `--timeout` | Webhook wait timeout (seconds) | | `180` (default) |
 | `--cleanup` | Delete card after test | | flag without value |
@@ -152,7 +152,7 @@ set +a
 
 ```
 INFO smart_test: Smart test START phone=+381638400431 company=758285
-INFO smart_test: Template 'kitilash_ka_newsletter_new_clients_monthly_v2' APPROVED
+INFO smart_test: Template 'kitilash_ka_newsletter_new_clients_monthly_v1' APPROVED
 INFO smart_test: Issuing loyalty card number=9926022832320706 type_id=46454 phone=381638400431
 INFO smart_test: Card issued: id=47719627 number=9926022832320706
 INFO smart_test: Message sent: provider_message_id=wamid.HBg...

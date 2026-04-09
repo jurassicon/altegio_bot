@@ -88,7 +88,7 @@ async def test_check_meta_template_approved() -> None:
                     "data": [
                         {
                             "id": "1331641148769327",
-                            "name": "kitilash_ka_newsletter_new_clients_monthly_v2",
+                            "name": "kitilash_ka_newsletter_new_clients_monthly_v1",
                             "status": "APPROVED",
                             "language": "de",
                             "category": "MARKETING",
@@ -98,7 +98,7 @@ async def test_check_meta_template_approved() -> None:
             )
         )
         ok, err = await check_meta_template(
-            "kitilash_ka_newsletter_new_clients_monthly_v2",
+            "kitilash_ka_newsletter_new_clients_monthly_v1",
             access_token=TOKEN,
             graph_url=GRAPH_URL,
             api_version=API_VERSION,

@@ -18,7 +18,7 @@ Usage::
       --phone 381638400431 \\
       --company-id 758285 \\
       --booking-link https://n813709.alteg.io/ \\
-      --template kitilash_ka_newsletter_new_clients_monthly_v2 \\
+      --template kitilash_ka_newsletter_new_clients_monthly_v1 \\
       --expect-status delivered \\
       --timeout 180 \\
       --cleanup
@@ -761,7 +761,7 @@ async def main() -> None:
     )
     parser.add_argument(
         "--template",
-        default="kitilash_ka_newsletter_new_clients_monthly_v2",
+        default="kitilash_ka_newsletter_new_clients_monthly_v1",
     )
     parser.add_argument(
         "--expect-status",
