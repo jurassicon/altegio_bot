@@ -1,20 +1,17 @@
 """Тесты сегментации новых клиентов (campaigns/segment.py).
 
-Новая логика (Вариант А):
-- Источник истины для «до периода»: Altegio CRM API (мокируется).
-- Ресничные записи в периоде: local RecordService + LASH_CATEGORY_IDS_BY_COMPANY.
-- Классификация:
-    eligible: ровно 1 подтверждённая ресничная запись + 0 записей до периода в CRM
-    opted_out: wa_opted_out=True
-    no_phone: нет phone_e164
-    has_records_before_period: CRM вернул > 0 записей до периода
-    no_lash_record_in_period: нет ресничных записей в периоде
-    no_confirmed_lash_record_in_period: нет подтверждённой ресничной записи
-    multiple_lash_records_in_period: 2+ подтверждённых ресничных
+Архитектура «Вариант А» (CRM как единый источник истины):
+  - Локальная БД: только для обнаружения candidate client_id и wa_opted_out / phone_e164.
+  - Altegio CRM API: записи в периоде, услуги, подтверждённость, история до периода.
+  - Мокируем get_client_crm_records + is_lash_service.
 
-Мокирование:
-- count_client_records_before_period → int (мок возвращает 0 или N)
-- is_lash_service → bool (мок: True для service_id в LASH_IDS)
+Строгое правило множественности:
+  - lash_records >= 2 → multiple_lash_records_in_period (даже если подтверждена только одна)
+  - lash_records == 1 и не подтверждена → no_confirmed_lash_record_in_period
+  - lash_records == 0 → no_lash_record_in_period
+
+CRM недоступность:
+  - CrmUnavailableError → crm_history_unavailable (клиент не считается новым)
 """
 
 from __future__ import annotations
@@ -24,17 +21,15 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from altegio_bot.campaigns.altegio_crm import CrmRecord, CrmUnavailableError
 from altegio_bot.campaigns.segment import find_candidates
-from altegio_bot.models.models import Client, Record, RecordService
-from altegio_bot.service_filter import LASH_CATEGORY_IDS_BY_COMPANY
+from altegio_bot.models.models import Client, Record
 
 PERIOD_START = datetime(2026, 1, 1, tzinfo=timezone.utc)
 PERIOD_END = datetime(2026, 2, 1, tzinfo=timezone.utc)
 COMPANY = 758285
 
-# Возьмём первую известную lash category_id для тестов
-_LASH_CATEGORIES = LASH_CATEGORY_IDS_BY_COMPANY.get(COMPANY, set())
-# Фиктивный service_id, который мок пометит как «ресничный»
+# Фиктивные service_id для тестов
 LASH_SVC_ID = 99001
 NON_LASH_SVC_ID = 99002
 
@@ -85,43 +80,60 @@ def _make_record(client_id: int, *, days_offset: int = 5, confirmed: int = 1, **
     return Record(**defaults)
 
 
-def _make_lash_service(record_id: int, service_id: int = LASH_SVC_ID) -> RecordService:
-    return RecordService(
-        record_id=record_id,
-        service_id=service_id,
-        title="Wimpernverlängerung",
+def _crm_record(
+    *,
+    days_offset: int = 5,
+    confirmed: int = 1,
+    deleted: bool = False,
+    service_ids: list[int] | None = None,
+    service_titles: list[str] | None = None,
+    before_period: bool = False,
+) -> CrmRecord:
+    """Создать CrmRecord для тестов."""
+    if before_period:
+        starts_at = PERIOD_START - timedelta(days=30)
+    else:
+        starts_at = PERIOD_START + timedelta(days=days_offset)
+    return CrmRecord(
+        crm_id=_record_id(),
+        starts_at=starts_at,
+        confirmed=confirmed,
+        deleted=deleted,
+        service_ids=service_ids or [LASH_SVC_ID],
+        service_titles=service_titles or ["Wimpernverlängerung"],
     )
 
 
-def _mock_lash(svc_id: int) -> bool:
-    """Мок для is_lash_service: True только для LASH_SVC_ID."""
-    return svc_id == LASH_SVC_ID
-
-
-def _patch_crm(records_before: int = 0):
-    """Мок для count_client_records_before_period."""
+def _patch_crm(records: list[CrmRecord] | None = None, *, raise_error: bool = False):
+    """Мок для get_client_crm_records."""
+    if raise_error:
+        return patch(
+            "altegio_bot.campaigns.segment.get_client_crm_records",
+            new=AsyncMock(side_effect=CrmUnavailableError("CRM недоступен (тест)")),
+        )
     return patch(
-        "altegio_bot.campaigns.segment.count_client_records_before_period",
-        new=AsyncMock(return_value=records_before),
+        "altegio_bot.campaigns.segment.get_client_crm_records",
+        new=AsyncMock(return_value=records or []),
     )
 
 
-def _patch_lash(is_lash: bool = True):
-    """Мок для is_lash_service."""
+def _patch_lash(lash_ids: set[int] | None = None):
+    """Мок для is_lash_service: True только если service_id в lash_ids."""
+    ids = lash_ids if lash_ids is not None else {LASH_SVC_ID}
     return patch(
         "altegio_bot.campaigns.segment.is_lash_service",
-        new=AsyncMock(side_effect=lambda company_id, svc_id: _mock_lash(svc_id)),
+        new=AsyncMock(side_effect=lambda company_id, svc_id, http_client=None: svc_id in ids),
     )
 
 
 # ---------------------------------------------------------------------------
-# Тест 1: eligible-клиент (одна подтверждённая ресничная запись, нет истории)
+# Тест 1: eligible-клиент
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_eligible_client(session_maker) -> None:
-    """Ровно 1 подтверждённая ресничная запись + нет истории → eligible."""
+    """1 подтверждённая lash-запись из CRM + нет истории → eligible."""
     async with session_maker() as session:
         async with session.begin():
             client = _make_client(altegio_client_id=_alt_id())
@@ -129,10 +141,10 @@ async def test_eligible_client(session_maker) -> None:
             await session.flush()
             rec = _make_record(client.id)
             session.add(rec)
-            await session.flush()
-            session.add(_make_lash_service(rec.id))
 
-    with _patch_crm(0), _patch_lash():
+    crm_records = [_crm_record(confirmed=1, service_ids=[LASH_SVC_ID])]
+
+    with _patch_crm(crm_records), _patch_lash():
         async with session_maker() as session:
             result = await find_candidates(
                 session,
@@ -156,7 +168,7 @@ async def test_eligible_client(session_maker) -> None:
 
 @pytest.mark.asyncio
 async def test_opted_out_excluded(session_maker) -> None:
-    """wa_opted_out=True → excluded с причиной 'opted_out'."""
+    """wa_opted_out=True → excluded 'opted_out'."""
     async with session_maker() as session:
         async with session.begin():
             client = _make_client(altegio_client_id=_alt_id(), wa_opted_out=True)
@@ -164,10 +176,10 @@ async def test_opted_out_excluded(session_maker) -> None:
             await session.flush()
             rec = _make_record(client.id)
             session.add(rec)
-            await session.flush()
-            session.add(_make_lash_service(rec.id))
 
-    with _patch_crm(0), _patch_lash():
+    crm_records = [_crm_record(confirmed=1)]
+
+    with _patch_crm(crm_records), _patch_lash():
         async with session_maker() as session:
             result = await find_candidates(
                 session,
@@ -189,7 +201,7 @@ async def test_opted_out_excluded(session_maker) -> None:
 
 @pytest.mark.asyncio
 async def test_no_phone_excluded(session_maker) -> None:
-    """phone_e164=None → excluded с причиной 'no_phone'."""
+    """phone_e164=None → excluded 'no_phone'."""
     async with session_maker() as session:
         async with session.begin():
             client = _make_client(altegio_client_id=_alt_id(), phone_e164=None)
@@ -197,10 +209,10 @@ async def test_no_phone_excluded(session_maker) -> None:
             await session.flush()
             rec = _make_record(client.id)
             session.add(rec)
-            await session.flush()
-            session.add(_make_lash_service(rec.id))
 
-    with _patch_crm(0), _patch_lash():
+    crm_records = [_crm_record(confirmed=1)]
+
+    with _patch_crm(crm_records), _patch_lash():
         async with session_maker() as session:
             result = await find_candidates(
                 session,
@@ -216,16 +228,15 @@ async def test_no_phone_excluded(session_maker) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Тест 4: has_records_before_period (из Altegio CRM)
+# Тест 4: has_records_before_period (из CRM, не из локальной БД)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_has_records_before_period_excluded_from_crm(session_maker) -> None:
-    """CRM вернул записи до периода → excluded 'has_records_before_period'.
+    """CRM вернул запись до периода → excluded 'has_records_before_period'.
 
-    Источник правды — Altegio CRM API (мокируем count_client_records_before_period).
-    Даже если в локальной БД нет записей до периода — решение принимается по CRM.
+    Источник истины — CRM API. Локальная БД может быть пустой для этого периода.
     """
     async with session_maker() as session:
         async with session.begin():
@@ -234,11 +245,14 @@ async def test_has_records_before_period_excluded_from_crm(session_maker) -> Non
             await session.flush()
             rec = _make_record(client.id)
             session.add(rec)
-            await session.flush()
-            session.add(_make_lash_service(rec.id))
 
-    # CRM говорит: у клиента есть 1 запись до периода
-    with _patch_crm(1), _patch_lash():
+    # CRM возвращает: 1 запись в периоде + 1 запись ДО периода
+    crm_records = [
+        _crm_record(confirmed=1, service_ids=[LASH_SVC_ID]),
+        _crm_record(before_period=True, service_ids=[LASH_SVC_ID]),
+    ]
+
+    with _patch_crm(crm_records), _patch_lash():
         async with session_maker() as session:
             result = await find_candidates(
                 session,
@@ -261,7 +275,7 @@ async def test_has_records_before_period_excluded_from_crm(session_maker) -> Non
 
 @pytest.mark.asyncio
 async def test_no_lash_record_excluded(session_maker) -> None:
-    """Только не-ресничные услуги в периоде → excluded 'no_lash_record_in_period'."""
+    """Только не-ресничные услуги в CRM → excluded 'no_lash_record_in_period'."""
     async with session_maker() as session:
         async with session.begin():
             client = _make_client(altegio_client_id=_alt_id())
@@ -269,11 +283,11 @@ async def test_no_lash_record_excluded(session_maker) -> None:
             await session.flush()
             rec = _make_record(client.id)
             session.add(rec)
-            await session.flush()
-            # Добавить NON-lash service
-            session.add(RecordService(record_id=rec.id, service_id=NON_LASH_SVC_ID, title="Massage"))
 
-    with _patch_crm(0), _patch_lash():
+    # CRM запись с NON-lash сервисом
+    crm_records = [_crm_record(confirmed=1, service_ids=[NON_LASH_SVC_ID])]
+
+    with _patch_crm(crm_records), _patch_lash({LASH_SVC_ID}):
         async with session_maker() as session:
             result = await find_candidates(
                 session,
@@ -295,18 +309,19 @@ async def test_no_lash_record_excluded(session_maker) -> None:
 
 @pytest.mark.asyncio
 async def test_no_confirmed_lash_excluded(session_maker) -> None:
-    """Ресничная запись есть, но неподтверждённая → excluded."""
+    """Ровно 1 lash-запись, но неподтверждённая → excluded."""
     async with session_maker() as session:
         async with session.begin():
             client = _make_client(altegio_client_id=_alt_id())
             session.add(client)
             await session.flush()
-            rec = _make_record(client.id, confirmed=0)  # не подтверждена
+            rec = _make_record(client.id, confirmed=0)
             session.add(rec)
-            await session.flush()
-            session.add(_make_lash_service(rec.id))
 
-    with _patch_crm(0), _patch_lash():
+    # CRM: 1 lash-запись, confirmed=0
+    crm_records = [_crm_record(confirmed=0, service_ids=[LASH_SVC_ID])]
+
+    with _patch_crm(crm_records), _patch_lash():
         async with session_maker() as session:
             result = await find_candidates(
                 session,
@@ -322,13 +337,13 @@ async def test_no_confirmed_lash_excluded(session_maker) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Тест 7: multiple_lash_records_in_period
+# Тест 7: multiple_lash_records — строгое правило (2 подтверждённые)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_multiple_lash_records_excluded(session_maker) -> None:
-    """2+ подтверждённых ресничных записей → excluded 'multiple_lash_records_in_period'."""
+async def test_multiple_confirmed_lash_excluded(session_maker) -> None:
+    """2 подтверждённые lash-записи → excluded 'multiple_lash_records_in_period'."""
     async with session_maker() as session:
         async with session.begin():
             client = _make_client(altegio_client_id=_alt_id())
@@ -338,11 +353,14 @@ async def test_multiple_lash_records_excluded(session_maker) -> None:
             rec2 = _make_record(client.id, days_offset=15)
             session.add(rec1)
             session.add(rec2)
-            await session.flush()
-            session.add(_make_lash_service(rec1.id))
-            session.add(_make_lash_service(rec2.id))
 
-    with _patch_crm(0), _patch_lash():
+    # CRM: 2 подтверждённые lash-записи
+    crm_records = [
+        _crm_record(days_offset=3, confirmed=1, service_ids=[LASH_SVC_ID]),
+        _crm_record(days_offset=15, confirmed=1, service_ids=[LASH_SVC_ID]),
+    ]
+
+    with _patch_crm(crm_records), _patch_lash():
         async with session_maker() as session:
             result = await find_candidates(
                 session,
@@ -355,11 +373,133 @@ async def test_multiple_lash_records_excluded(session_maker) -> None:
     assert match is not None
     assert not match.is_eligible
     assert match.excluded_reason == "multiple_lash_records_in_period"
+    assert match.lash_records_in_period == 2
     assert match.confirmed_lash_records_in_period == 2
 
 
 # ---------------------------------------------------------------------------
-# Тест 8: local_client_found flag
+# Тест 8: strict multiplicity — 1 confirmed + 1 unconfirmed → excluded
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_strict_multiplicity_one_confirmed_one_unconfirmed(session_maker) -> None:
+    """1 подтверждённая + 1 неподтверждённая lash-запись → excluded.
+
+    Правило строгое: 2+ lash-записей в периоде вообще — excluded,
+    даже если подтверждена только одна.
+    """
+    async with session_maker() as session:
+        async with session.begin():
+            client = _make_client(altegio_client_id=_alt_id())
+            session.add(client)
+            await session.flush()
+            rec1 = _make_record(client.id, days_offset=3, confirmed=1)
+            rec2 = _make_record(client.id, days_offset=20, confirmed=0)
+            session.add(rec1)
+            session.add(rec2)
+
+    # CRM: 1 confirmed lash + 1 unconfirmed lash
+    crm_records = [
+        _crm_record(days_offset=3, confirmed=1, service_ids=[LASH_SVC_ID]),
+        _crm_record(days_offset=20, confirmed=0, service_ids=[LASH_SVC_ID]),
+    ]
+
+    with _patch_crm(crm_records), _patch_lash():
+        async with session_maker() as session:
+            result = await find_candidates(
+                session,
+                company_id=COMPANY,
+                period_start=PERIOD_START,
+                period_end=PERIOD_END,
+            )
+
+    match = next((c for c in result if c.client.id == client.id), None)
+    assert match is not None
+    assert not match.is_eligible
+    # Строгое правило: 2+ lash-записей вообще
+    assert match.excluded_reason == "multiple_lash_records_in_period"
+    assert match.lash_records_in_period == 2
+    # Только 1 из 2 подтверждена
+    assert match.confirmed_lash_records_in_period == 1
+
+
+# ---------------------------------------------------------------------------
+# Тест 9: CRM error → crm_history_unavailable (клиент не становится eligible)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_crm_error_client_not_eligible(session_maker) -> None:
+    """При ошибке CRM клиент исключается с причиной 'crm_history_unavailable'.
+
+    Нельзя считать клиента новым, если не удалось проверить его историю.
+    """
+    async with session_maker() as session:
+        async with session.begin():
+            client = _make_client(altegio_client_id=_alt_id())
+            session.add(client)
+            await session.flush()
+            rec = _make_record(client.id)
+            session.add(rec)
+
+    with _patch_crm(raise_error=True), _patch_lash():
+        async with session_maker() as session:
+            result = await find_candidates(
+                session,
+                company_id=COMPANY,
+                period_start=PERIOD_START,
+                period_end=PERIOD_END,
+            )
+
+    match = next((c for c in result if c.client.id == client.id), None)
+    assert match is not None, "Клиент должен присутствовать в результатах (как excluded)"
+    assert not match.is_eligible, "Клиент с недоступным CRM не может быть eligible"
+    assert match.excluded_reason == "crm_history_unavailable"
+
+
+# ---------------------------------------------------------------------------
+# Тест 10: CRM = источник истины — локальная БД игнорируется для records
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_crm_source_of_truth_overrides_local_db(session_maker) -> None:
+    """CRM говорит «есть запись до периода» → excluded, даже если в локальной БД истории нет."""
+    async with session_maker() as session:
+        async with session.begin():
+            client = _make_client(altegio_client_id=_alt_id())
+            session.add(client)
+            await session.flush()
+            # Локальная БД: только in-period запись, до периода ничего нет
+            rec = _make_record(client.id, days_offset=5)
+            session.add(rec)
+            # Намеренно НЕ добавляем записей до периода в локальную БД
+
+    # CRM: in-period + before-period
+    crm_records = [
+        _crm_record(days_offset=5, confirmed=1, service_ids=[LASH_SVC_ID]),
+        _crm_record(before_period=True, service_ids=[NON_LASH_SVC_ID]),
+    ]
+
+    with _patch_crm(crm_records), _patch_lash():
+        async with session_maker() as session:
+            result = await find_candidates(
+                session,
+                company_id=COMPANY,
+                period_start=PERIOD_START,
+                period_end=PERIOD_END,
+            )
+
+    match = next((c for c in result if c.client.id == client.id), None)
+    assert match is not None
+    assert not match.is_eligible
+    assert match.excluded_reason == "has_records_before_period"
+    assert match.records_before_period == 1
+
+
+# ---------------------------------------------------------------------------
+# Тест 11: local_client_found flag
 # ---------------------------------------------------------------------------
 
 
@@ -373,10 +513,10 @@ async def test_local_client_found_flag(session_maker) -> None:
             await session.flush()
             rec = _make_record(client.id)
             session.add(rec)
-            await session.flush()
-            session.add(_make_lash_service(rec.id))
 
-    with _patch_crm(0), _patch_lash():
+    crm_records = [_crm_record(confirmed=1)]
+
+    with _patch_crm(crm_records), _patch_lash():
         async with session_maker() as session:
             result = await find_candidates(
                 session,
@@ -391,13 +531,13 @@ async def test_local_client_found_flag(session_maker) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Тест 9: service_titles_in_period собираются корректно
+# Тест 12: service_titles_in_period из CRM
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_service_titles_collected(session_maker) -> None:
-    """service_titles_in_period содержит названия услуг из периода."""
+async def test_service_titles_from_crm(session_maker) -> None:
+    """service_titles_in_period заполняются из данных CRM."""
     async with session_maker() as session:
         async with session.begin():
             client = _make_client(altegio_client_id=_alt_id())
@@ -405,16 +545,16 @@ async def test_service_titles_collected(session_maker) -> None:
             await session.flush()
             rec = _make_record(client.id)
             session.add(rec)
-            await session.flush()
-            session.add(
-                RecordService(
-                    record_id=rec.id,
-                    service_id=LASH_SVC_ID,
-                    title="Wimpernverlängerung",
-                )
-            )
 
-    with _patch_crm(0), _patch_lash():
+    crm_records = [
+        _crm_record(
+            confirmed=1,
+            service_ids=[LASH_SVC_ID],
+            service_titles=["Wimpernverlängerung"],
+        )
+    ]
+
+    with _patch_crm(crm_records), _patch_lash():
         async with session_maker() as session:
             result = await find_candidates(
                 session,

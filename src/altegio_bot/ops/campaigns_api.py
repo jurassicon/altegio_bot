@@ -124,7 +124,10 @@ async def create_preview(body: PreviewRequest) -> dict[str, Any]:
         run = await run_preview(params)
     except Exception as exc:
         logger.exception("preview failed: %s", exc)
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise HTTPException(
+            status_code=500,
+            detail="Preview failed due to internal error. See server logs for details.",
+        )
 
     return _run_summary(run)
 
@@ -143,14 +146,31 @@ async def create_run(body: RunRequest) -> dict[str, Any]:
 
     Endpoint быстро создаёт CampaignRun со статусом queued,
     ставит execution-job в message_jobs и сразу возвращает accepted.
+
+    Если передан source_preview_run_id — валидирует совместимость:
+    company_id, period_start, period_end и campaign_code должны совпадать
+    с параметрами preview-run. Несовпадение → 400.
     """
     _validate_period(body.period_start, body.period_end)
+
+    period_start_utc = _ensure_utc(body.period_start)
+    period_end_utc = _ensure_utc(body.period_end)
+
+    # Backend-валидация: параметры запуска должны совпадать с preview-snapshot
+    if body.source_preview_run_id is not None:
+        await _validate_run_matches_preview(
+            preview_run_id=body.source_preview_run_id,
+            company_id=body.company_id,
+            period_start=period_start_utc,
+            period_end=period_end_utc,
+            campaign_code=CAMPAIGN_CODE,
+        )
 
     params = RunParams(
         company_id=body.company_id,
         location_id=body.location_id,
-        period_start=_ensure_utc(body.period_start),
-        period_end=_ensure_utc(body.period_end),
+        period_start=period_start_utc,
+        period_end=period_end_utc,
         mode="send-real",
         card_type_id=body.card_type_id,
         source_preview_run_id=body.source_preview_run_id,
@@ -174,6 +194,87 @@ async def create_run(body: RunRequest) -> dict[str, Any]:
     result["accepted"] = True
     result["message"] = "Campaign run accepted and queued"
     return result
+
+
+async def _validate_run_matches_preview(
+    *,
+    preview_run_id: int,
+    company_id: int,
+    period_start: datetime,
+    period_end: datetime,
+    campaign_code: str,
+) -> None:
+    """Проверить совместимость параметров send-real с preview-snapshot.
+
+    Гарантирует, что send-real запускается именно для того снимка,
+    который оператор видел в preview. Несовпадение любого ключевого
+    параметра возвращает HTTP 400.
+
+    Проверяемые поля:
+      - company_id (первый из company_ids)
+      - period_start, period_end (с точностью до секунды)
+      - campaign_code
+      - mode == 'preview' и status != 'discarded'
+    """
+    async with SessionLocal() as session:
+        preview_run = await session.get(CampaignRun, preview_run_id)
+
+    if preview_run is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Preview run {preview_run_id} not found",
+        )
+
+    if preview_run.mode != "preview":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Run {preview_run_id} is not a preview (mode={preview_run.mode!r})",
+        )
+
+    if preview_run.status == "discarded":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Preview run {preview_run_id} has been discarded and cannot be used",
+        )
+
+    # Проверка campaign_code
+    if preview_run.campaign_code != campaign_code:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Campaign code mismatch: preview has {preview_run.campaign_code!r}, request has {campaign_code!r}"
+            ),
+        )
+
+    # Проверка company_id
+    preview_company_ids = preview_run.company_ids or []
+    if not preview_company_ids or int(preview_company_ids[0]) != company_id:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Company ID mismatch: preview was for company_id={preview_company_ids}, "
+                f"request has company_id={company_id}"
+            ),
+        )
+
+    # Проверка периода (с точностью до секунды)
+    def _truncate_sec(dt: datetime) -> datetime:
+        return dt.replace(microsecond=0)
+
+    preview_start = _ensure_utc(preview_run.period_start)
+    preview_end = _ensure_utc(preview_run.period_end)
+
+    if _truncate_sec(preview_start) != _truncate_sec(period_start):
+        raise HTTPException(
+            status_code=400,
+            detail=(f"Period start mismatch: preview={preview_start.isoformat()}, request={period_start.isoformat()}"),
+        )
+
+    if _truncate_sec(preview_end) != _truncate_sec(period_end):
+        raise HTTPException(
+            status_code=400,
+            detail=(f"Period end mismatch: preview={preview_end.isoformat()}, request={period_end.isoformat()}"),
+        )
 
 
 # ==========================================================================
@@ -825,6 +926,7 @@ def _run_summary(run: CampaignRun) -> dict[str, Any]:
             "multiple_records_in_period": run.excluded_multiple_records or 0,
             "no_confirmed_record_in_period": run.excluded_no_confirmed_record or 0,
             "has_records_before_period": run.excluded_has_records_before or 0,
+            "crm_history_unavailable": run.excluded_crm_unavailable or 0,
         },
     }
 
@@ -849,6 +951,7 @@ def _run_detail(run: CampaignRun) -> dict[str, Any]:
                 "multiple_records_in_period": run.excluded_multiple_records,
                 "no_confirmed_record_in_period": run.excluded_no_confirmed_record,
                 "has_records_before_period": run.excluded_has_records_before,
+                "crm_history_unavailable": run.excluded_crm_unavailable,
             },
             "delivery": {
                 "sent": run.sent_count,

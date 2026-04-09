@@ -190,14 +190,30 @@ def _update_run_exclusion_counters(
     run: CampaignRun,
     candidates: list[ClientCandidate],
 ) -> None:
-    """Обновить счётчики исключений в run по результатам сегментации."""
+    """Пересчитать счётчики исключений в run по результатам сегментации.
+
+    Идемпотентна: перед накоплением все агрегируемые поля обнуляются.
+    Повторный вызов с теми же candidates всегда даёт тот же результат.
+    """
+    # Обнуляем все счётчики перед пересчётом — идемпотентность
+    run.total_clients_seen = 0
+    run.candidates_count = 0
+    run.excluded_opted_out = 0
+    run.excluded_no_phone = 0
+    run.excluded_has_records_before = 0
+    run.excluded_multiple_records = 0
+    run.excluded_more_than_one_record = 0
+    run.excluded_no_confirmed_record = 0
+    run.excluded_crm_unavailable = 0
+
     run.total_clients_seen = len(candidates)
+
     for candidate in candidates:
-        if not candidate.excluded_reason:
+        reason = candidate.excluded_reason
+        if not reason:
             run.candidates_count += 1
             continue
 
-        reason = candidate.excluded_reason
         if reason == "opted_out":
             run.excluded_opted_out += 1
         elif reason == "no_phone":
@@ -213,6 +229,8 @@ def _update_run_exclusion_counters(
             "no_confirmed_lash_record_in_period",
         ):
             run.excluded_no_confirmed_record += 1
+        elif reason == "crm_history_unavailable":
+            run.excluded_crm_unavailable += 1
 
 
 async def run_preview(params: RunParams) -> CampaignRun:

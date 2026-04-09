@@ -1,7 +1,19 @@
+"""Фильтрация услуг по категориям (lash / не lash).
+
+Использует Altegio API для получения category_id услуги.
+Результаты кешируются в LRU-кеше (OrderedDict) для снижения нагрузки на API.
+
+LRU-стратегия вытеснения: при достижении _CACHE_MAX_SIZE вытесняется
+самая редко используемая запись (не весь кеш). Это предотвращает
+cache stampede, при котором полный .clear() мог бы внезапно вызвать
+массовые запросы к API для всех service_id одновременно.
+"""
+
 from __future__ import annotations
 
 import logging
 import os
+from collections import OrderedDict
 from typing import Any
 
 import httpx
@@ -17,8 +29,44 @@ LASH_CATEGORY_IDS_BY_COMPANY: dict[int, set[int]] = {
     758285: {10707687, 12414859, 13329127, 13351956},
 }
 
-_SERVICE_CATEGORY_CACHE: dict[tuple[int, int], int] = {}
+# ---------------------------------------------------------------------------
+# LRU-кеш: (company_id, service_id) → category_id
+# ---------------------------------------------------------------------------
+
+_LRU_CACHE: OrderedDict[tuple[int, int], int] = OrderedDict()
 _CACHE_MAX_SIZE = 5000
+
+
+def _cache_get(key: tuple[int, int]) -> int | None:
+    """Получить значение из LRU-кеша; обновляет порядок (MRU)."""
+    if key in _LRU_CACHE:
+        _LRU_CACHE.move_to_end(key)
+        return _LRU_CACHE[key]
+    return None
+
+
+def _cache_put(key: tuple[int, int], category_id: int) -> None:
+    """Сохранить значение в LRU-кеше.
+
+    Если ключ уже есть — обновляет позицию (MRU).
+    При переполнении вытесняет один самый старый элемент (LRU),
+    а не очищает весь кеш целиком.
+    """
+    if key in _LRU_CACHE:
+        _LRU_CACHE.move_to_end(key)
+        _LRU_CACHE[key] = category_id
+        return
+
+    if len(_LRU_CACHE) >= _CACHE_MAX_SIZE:
+        # Вытеснить самый старый (наименее используемый) элемент
+        _LRU_CACHE.popitem(last=False)
+
+    _LRU_CACHE[key] = category_id
+
+
+# ---------------------------------------------------------------------------
+# API helpers
+# ---------------------------------------------------------------------------
 
 
 def _get_api_base_url() -> str:
@@ -38,23 +86,23 @@ def _get_altegio_tokens() -> tuple[str, str] | None:
     return partner, user
 
 
-def _cache_put(key: tuple[int, int], category_id: int) -> None:
-    if len(_SERVICE_CATEGORY_CACHE) >= _CACHE_MAX_SIZE:
-        _SERVICE_CATEGORY_CACHE.clear()
-    _SERVICE_CATEGORY_CACHE[key] = category_id
-
-
 async def _fetch_service_category_id(
     *,
     company_id: int,
     service_id: int,
+    http_client: httpx.AsyncClient | None = None,
 ) -> int | None:
+    """Получить category_id услуги через Altegio API.
+
+    Args:
+        http_client: если передан — переиспользуется (keep-alive соединения).
+                     Если None — создаётся новый клиент для одного запроса.
+    """
     tokens = _get_altegio_tokens()
     if tokens is None:
         return None
 
     partner_token, user_token = tokens
-
     url = f"{_get_api_base_url()}/company/{company_id}/services/{service_id}"
     headers = {
         "Accept": _get_api_accept(),
@@ -62,9 +110,15 @@ async def _fetch_service_category_id(
         "Authorization": f"Bearer {partner_token}, User {user_token}",
     }
 
+    async def _do_request(client: httpx.AsyncClient) -> httpx.Response:
+        return await client.get(url, headers=headers)
+
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(url, headers=headers)
+        if http_client is not None:
+            resp = await _do_request(http_client)
+        else:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await _do_request(client)
     except httpx.HTTPError as exc:
         logger.warning(
             "altegio service lookup failed company_id=%s service_id=%s: %s",
@@ -117,22 +171,32 @@ async def _fetch_service_category_id(
     return None
 
 
-async def is_lash_service(company_id: int, service_id: int) -> bool:
+async def is_lash_service(
+    company_id: int,
+    service_id: int,
+    http_client: httpx.AsyncClient | None = None,
+) -> bool:
     """Вернуть True, если service_id принадлежит категории ресниц для компании.
 
-    Использует in-memory кеш и Altegio API для получения category_id.
+    Использует LRU-кеш и Altegio API для получения category_id.
     При сбое API возвращает False (консервативная стратегия).
+
+    Args:
+        http_client: если передан — переиспользуется для API-запроса.
+                     Позволяет избежать лишних TCP/TLS handshake при массовом
+                     обходе services (батч сегментации кампании).
     """
     allowed = LASH_CATEGORY_IDS_BY_COMPANY.get(company_id)
     if not allowed:
         return False
 
     key = (company_id, service_id)
-    category_id = _SERVICE_CATEGORY_CACHE.get(key)
+    category_id = _cache_get(key)
     if category_id is None:
         fetched = await _fetch_service_category_id(
             company_id=company_id,
             service_id=service_id,
+            http_client=http_client,
         )
         if fetched is None:
             return False
@@ -159,7 +223,7 @@ async def record_has_allowed_service(
     for sid in service_ids:
         key = (company_id, sid)
 
-        category_id = _SERVICE_CATEGORY_CACHE.get(key)
+        category_id = _cache_get(key)
         if category_id is None:
             fetched = await _fetch_service_category_id(
                 company_id=company_id,

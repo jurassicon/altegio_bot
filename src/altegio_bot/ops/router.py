@@ -2630,7 +2630,7 @@ async def ops_campaigns_list(request: Request) -> str:
     filter_form = _filter_form(
         "/ops/campaigns",
         [
-            ("company_id", "Company ID", "text", company_id_str),
+            ("company_id", "Кабинет / филиал (ID)", "text", company_id_str),
             ("mode", "Mode", "select:preview,send-real", mode_filter),
             ("status", "Status", "select:running,completed,failed,queued", status_filter),
             ("limit", "Limit", "text", str(limit)),
@@ -3129,6 +3129,7 @@ document.addEventListener("DOMContentLoaded", function () {{
     // Перезагрузить шаблоны для новой компании
     loadTemplateText(cid);
     setFollowupTemplateDefault(cid);
+    loadFollowupTemplateText(cid);
   }});
 
   // Follow-up toggle
@@ -3155,15 +3156,62 @@ document.addEventListener("DOMContentLoaded", function () {{
   loadFollowupTemplateText(companySelect.value);
   setFollowupTemplateDefault(companySelect.value);
 
-  // Если открыта со страницы history (from_preview), показать preview данные
+  // Если открыта со страницы history (from_preview), подгрузить параметры preview
   if (previewRunId) {{
+    loadPreviewAndPrefill(previewRunId);
+  }}
+}});
+
+// ============================================================
+// Предзаполнение формы из preview run (from_preview=ID)
+// ============================================================
+async function loadPreviewAndPrefill(runId) {{
+  try {{
+    const resp = await fetch("/ops/campaigns/runs/" + runId);
+    if (!resp.ok) {{
+      setAlert("preview-alert", "warning",
+        "Не удалось загрузить параметры preview #" + runId +
+        ". Проверьте ID.");
+      return;
+    }}
+    const run = await resp.json();
+
+    // Заполнить поля из preview
+    const companyId = (run.company_ids || [])[0];
+    if (companyId) {{
+      const companySelect = document.getElementById("f-company");
+      companySelect.value = String(companyId);
+      loadTemplateText(String(companyId));
+      setFollowupTemplateDefault(String(companyId));
+      loadFollowupTemplateText(String(companyId));
+    }}
+
+    if (run.period_start) {{
+      document.getElementById("f-period-start").value =
+        run.period_start.substring(0, 10);
+    }}
+    if (run.period_end) {{
+      document.getElementById("f-period-end").value =
+        run.period_end.substring(0, 10);
+    }}
+
+    // Заблокировать ключевые поля — они должны совпадать с preview
+    document.getElementById("f-company").disabled = true;
+    document.getElementById("f-period-start").disabled = true;
+    document.getElementById("f-period-end").disabled = true;
+
+    // Показать таблицу получателей и активировать Run
     document.getElementById("preview-results").classList.remove("d-none");
     document.getElementById("btn-run").disabled = false;
     loadRecipients(true);
     setAlert("preview-alert", "info",
-      "Загружен preview #" + previewRunId + ". Нажмите «Run Campaign» для запуска.");
+      "🔒 Параметры зафиксированы по preview #" + runId +
+      " (компания, период). Нажмите «Run Campaign» для запуска.");
+
+  }} catch (e) {{
+    setAlert("preview-alert", "danger", "Ошибка загрузки preview: " + e.message);
   }}
-}});
+}}
 
 // ============================================================
 // Загрузка текста Meta-шаблона из БД
@@ -3352,9 +3400,10 @@ function renderPreviewSummary(data) {{
     ["invalid_phone", "Невалидный телефон"],
     ["no_whatsapp", "Нет WhatsApp"],
     ["has_records_before_period", "Есть записи до периода (CRM)"],
+    ["crm_history_unavailable", "⚠️ CRM недоступен при проверке"],
     ["no_lash_record_in_period", "Нет ресничных записей в периоде"],
     ["no_confirmed_lash_record_in_period", "Нет подтв. ресничной записи"],
-    ["multiple_lash_records_in_period", "Несколько подтв. ресничных записей"],
+    ["multiple_lash_records_in_period", "Несколько lash-записей в периоде"],
     ["multiple_records_in_period", "Несколько записей (устар.)"],
     ["no_confirmed_record_in_period", "Нет подтв. записи (устар.)"],
   ];
@@ -3702,8 +3751,6 @@ async def ops_campaign_run_detail(run_id: int) -> str:
       <dd class="col-sm-9">{_esc(_fmt_dt(run.created_at, tz))}</dd>
       <dt class="col-sm-3">Completed</dt>
       <dd class="col-sm-9">{_esc(_fmt_dt(run.completed_at, tz))}</dd>
-      <dt class="col-sm-3">Location ID</dt>
-      <dd class="col-sm-9">{_esc(str(run.location_id or "—"))}</dd>
       <dt class="col-sm-3">Card Type ID</dt>
       <dd class="col-sm-9">{_esc(str(run.card_type_id or "—"))}</dd>
       <dt class="col-sm-3">Attribution Window</dt>
@@ -3781,9 +3828,10 @@ async def ops_campaign_run_detail(run_id: int) -> str:
             ("No phone", run.excluded_no_phone or 0, "secondary"),
             ("Invalid phone", run.excluded_invalid_phone or 0, "secondary"),
             ("No WA", run.excluded_no_whatsapp or 0, "secondary"),
-            ("Multiple records", run.excluded_multiple_records or 0, "secondary"),
-            ("No confirmed record", run.excluded_no_confirmed_record or 0, "secondary"),
+            ("Multiple lash records", run.excluded_multiple_records or 0, "secondary"),
+            ("No confirmed lash", run.excluded_no_confirmed_record or 0, "secondary"),
             ("Has records before", run.excluded_has_records_before or 0, "secondary"),
+            ("CRM unavailable", getattr(run, "excluded_crm_unavailable", 0) or 0, "danger"),
         ]
     )
     excluded_block = f"""

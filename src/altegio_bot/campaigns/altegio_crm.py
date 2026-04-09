@@ -1,11 +1,19 @@
 """Altegio CRM API: чтение истории клиентов для сегментации.
 
-Используется в campaigns/segment.py для проверки наличия записей ДО
-начала периода — именно это и есть «старый клиент» по бизнес-правилу.
+Используется в campaigns/segment.py для двух целей:
+  1. Получить ВСЕ записи клиента (in-period + history) из CRM.
+  2. Через classify_crm_records() разбить их на «в периоде» и «до периода».
 
 Источник истины: Altegio CRM API (endpoint /records/{company_id}).
-Локальная БД records не используется для этого шага:
-  - bot работает меньше месяца → история до его запуска в локальной БД отсутствует.
+Локальная БД records НЕ является источником истины для сегментации:
+  - bot работает меньше месяца → история до его запуска в локальной БД отсутствует;
+  - даже для текущего периода CRM является каноническим источником записей.
+
+Важно:
+  - При сетевой ошибке / недоступности API функции выбрасывают CrmUnavailableError.
+  - Caller (segment.py) обязан обработать эту ошибку и исключить клиента
+    с причиной 'crm_history_unavailable'. Возвращать 0 и считать клиента
+    новым НЕЛЬЗЯ — это даст ложно-новых клиентов.
 
 Authorization: Bearer {partner_token},{user_token}
 """
@@ -13,6 +21,7 @@ Authorization: Bearer {partner_token},{user_token}
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -25,6 +34,52 @@ logger = logging.getLogger(__name__)
 
 _PAGE_SIZE = 200
 _ALTEGIO_LOCAL_TZ = ZoneInfo("Europe/Belgrade")
+
+
+# ---------------------------------------------------------------------------
+# Исключение: CRM недоступен
+# ---------------------------------------------------------------------------
+
+
+class CrmUnavailableError(Exception):
+    """Altegio CRM API недоступен или вернул ошибку.
+
+    Вызывается при сетевых ошибках и HTTP 4xx/5xx ответах.
+    Сегментатор обязан исключить такого клиента с причиной
+    'crm_history_unavailable', а НЕ считать его новым.
+    """
+
+
+# ---------------------------------------------------------------------------
+# Структура записи из CRM
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class CrmRecord:
+    """Одна запись клиента из Altegio CRM API."""
+
+    crm_id: int | None
+    starts_at: datetime | None  # UTC; None если не удалось распарсить дату
+    confirmed: int  # 1 = подтверждена, 0 = отменена; None-like → 0
+    deleted: bool
+    service_ids: list[int] = field(default_factory=list)
+    service_titles: list[str] = field(default_factory=list)
+
+    @property
+    def is_confirmed(self) -> bool:
+        """True если запись подтверждена (confirmed == 1)."""
+        return self.confirmed == 1
+
+    @property
+    def is_active(self) -> bool:
+        """True если запись не удалена и не отменена."""
+        return not self.deleted and self.confirmed != 0
+
+
+# ---------------------------------------------------------------------------
+# Вспомогательные функции
+# ---------------------------------------------------------------------------
 
 
 def _auth_header() -> str:
@@ -72,70 +127,162 @@ def _parse_record_starts_at(record_data: dict[str, Any]) -> datetime | None:
     return None
 
 
-async def count_client_records_before_period(
+def _parse_confirmed(record_data: dict[str, Any]) -> int:
+    """Вернуть значение поля confirmed (0 или 1; по умолчанию 0)."""
+    raw = record_data.get("confirmed")
+    if raw is not None:
+        try:
+            return int(raw)
+        except (ValueError, TypeError):
+            pass
+    return 0
+
+
+def _parse_services(record_data: dict[str, Any]) -> tuple[list[int], list[str]]:
+    """Извлечь service_ids и service_titles из записи CRM.
+
+    Altegio API включает список услуг прямо в каждую запись.
+    Формат: [{"id": 99001, "title": "Wimpernverlängerung", ...}, ...]
+    """
+    service_ids: list[int] = []
+    service_titles: list[str] = []
+
+    services = record_data.get("services")
+    if not isinstance(services, list):
+        return service_ids, service_titles
+
+    for svc in services:
+        if not isinstance(svc, dict):
+            continue
+        svc_id = svc.get("id")
+        if isinstance(svc_id, int) and svc_id > 0:
+            service_ids.append(svc_id)
+        title = svc.get("title") or svc.get("name") or ""
+        if title and isinstance(title, str):
+            service_titles.append(title.strip())
+
+    return service_ids, service_titles
+
+
+# ---------------------------------------------------------------------------
+# Основная функция: получить все записи клиента из CRM
+# ---------------------------------------------------------------------------
+
+
+async def get_client_crm_records(
+    http_client: httpx.AsyncClient,
     *,
     company_id: int,
     altegio_client_id: int,
-    period_start: datetime,
-    timeout_sec: float = 25.0,
-) -> int:
-    """Подсчитать все записи клиента ДО period_start из Altegio CRM API.
+) -> list[CrmRecord]:
+    """Получить ВСЕ записи клиента из Altegio CRM API.
 
-    Считаются ВСЕ записи — любого статуса, включая удалённые и
-    неподтверждённые.  Любая запись до периода означает «старый клиент».
+    Выполняет постраничный обход endpoint /records/{company_id}?client_id=X.
+    Возвращает все записи независимо от статуса и даты.
 
-    Возвращает 0 при сетевых ошибках (conservative fallback): если мы не
-    можем проверить историю, безопаснее считать клиента новым, чем
-    заблокировать его.  Ошибка логируется как WARNING.
+    Args:
+        http_client: переиспользуемый AsyncClient (передаётся снаружи).
+        company_id: ID компании в Altegio.
+        altegio_client_id: ID клиента в Altegio CRM.
 
-    При явном HTTP 4xx (кроме 429) — также возвращает 0 с WARNING.
+    Returns:
+        Список CrmRecord со всеми записями клиента.
+
+    Raises:
+        CrmUnavailableError: при сетевой ошибке или HTTP-ошибке.
     """
     base = settings.altegio_api_base_url.rstrip("/")
     url = f"{base}/records/{company_id}"
     page = 1
-    total = 0
+    all_records: list[CrmRecord] = []
 
     try:
-        async with httpx.AsyncClient(timeout=timeout_sec) as http:
-            while True:
-                params: dict[str, Any] = {
-                    "client_id": altegio_client_id,
-                    "count": _PAGE_SIZE,
-                    "page": page,
-                }
-                resp = await http.get(url, headers=_headers(), params=params)
-                resp.raise_for_status()
+        while True:
+            params: dict[str, Any] = {
+                "client_id": altegio_client_id,
+                "count": _PAGE_SIZE,
+                "page": page,
+            }
+            resp = await http_client.get(url, headers=_headers(), params=params)
+            resp.raise_for_status()
 
-                payload = resp.json()
-                records: list[dict[str, Any]] = []
-                if isinstance(payload, dict):
-                    data = payload.get("data")
-                    if isinstance(data, list):
-                        records = data
+            payload = resp.json()
+            raw_records: list[dict[str, Any]] = []
+            if isinstance(payload, dict):
+                data = payload.get("data")
+                if isinstance(data, list):
+                    raw_records = data
 
-                for rec in records:
-                    starts_at = _parse_record_starts_at(rec)
-                    if starts_at is not None and starts_at < period_start:
-                        total += 1
-
-                if len(records) < _PAGE_SIZE:
-                    break
-
-                logger.debug(
-                    "crm history page=%d company=%d client=%d",
-                    page,
-                    company_id,
-                    altegio_client_id,
+            for rec in raw_records:
+                starts_at = _parse_record_starts_at(rec)
+                service_ids, service_titles = _parse_services(rec)
+                all_records.append(
+                    CrmRecord(
+                        crm_id=rec.get("id"),
+                        starts_at=starts_at,
+                        confirmed=_parse_confirmed(rec),
+                        deleted=bool(rec.get("deleted")),
+                        service_ids=service_ids,
+                        service_titles=service_titles,
+                    )
                 )
-                page += 1
+
+            if len(raw_records) < _PAGE_SIZE:
+                break
+
+            logger.debug(
+                "crm records page=%d company=%d client=%d total_so_far=%d",
+                page,
+                company_id,
+                altegio_client_id,
+                len(all_records),
+            )
+            page += 1
 
     except httpx.HTTPError as exc:
-        logger.warning(
-            "crm history fetch failed company=%d client=%d: %s — treating as 0 prior records",
-            company_id,
-            altegio_client_id,
-            exc,
-        )
-        return 0
+        raise CrmUnavailableError(
+            f"CRM API недоступен: company={company_id} client={altegio_client_id}: {exc}"
+        ) from exc
 
-    return total
+    return all_records
+
+
+# ---------------------------------------------------------------------------
+# Хелпер: классификация записей по периоду
+# ---------------------------------------------------------------------------
+
+
+def classify_crm_records(
+    records: list[CrmRecord],
+    period_start: datetime,
+    period_end: datetime,
+) -> tuple[list[CrmRecord], int]:
+    """Разбить записи CRM на «в периоде» и «до периода».
+
+    Args:
+        records: все записи клиента из CRM.
+        period_start: начало периода (inclusive), UTC.
+        period_end: конец периода (exclusive), UTC.
+
+    Returns:
+        (in_period_records, count_before_period):
+          - in_period_records: не удалённые записи с starts_at в [period_start, period_end)
+          - count_before_period: кол-во записей (любого статуса, включая удалённые)
+            с starts_at < period_start.
+
+    Записи с starts_at == None попадают в «неизвестные» и не учитываются ни там, ни там.
+    Это консервативно: если дату распарсить нельзя, в неизвестное не засчитываем.
+    """
+    in_period: list[CrmRecord] = []
+    count_before = 0
+
+    for rec in records:
+        if rec.starts_at is None:
+            continue
+        if rec.starts_at < period_start:
+            count_before += 1
+        elif period_start <= rec.starts_at < period_end:
+            if not rec.deleted:
+                in_period.append(rec)
+
+    return in_period, count_before

@@ -667,6 +667,8 @@ class CampaignRun(Base):
     excluded_has_records_before: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
     excluded_invalid_phone: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
     excluded_no_whatsapp: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    # CRM API был недоступен — история клиента не проверена → исключён
+    excluded_crm_unavailable: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
 
     # -----------------------------------------------------------------------
     # Счётчики доставки и атрибуции
