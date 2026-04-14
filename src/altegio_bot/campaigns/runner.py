@@ -1289,8 +1289,12 @@ async def discard_preview_run(run_id: int) -> None:
             if run.mode != "preview":
                 raise ValueError(f"Discard доступен только для preview run. mode={run.mode!r}")
 
-            if run.status == "discarded":
-                raise ValueError(f"CampaignRun {run_id} уже discarded")
+            # Discard разрешён только для completed preview.
+            # running → race condition: run_preview() ещё записывает статус.
+            # discarded/deleted → уже в терминальном состоянии.
+            # failed/queued → нестабильные состояния, discard не имеет смысла.
+            if run.status != "completed":
+                raise ValueError(f"Discard доступен только для completed preview. status={run.status!r}")
 
             # Проверить: не использован ли этот preview как источник send-real
             used_as_source = await session.scalar(

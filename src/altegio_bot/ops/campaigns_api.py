@@ -1905,7 +1905,9 @@ def _run_summary(run: CampaignRun, *, used_as_source: bool = False) -> dict[str,
         "completed_at": _iso(run.completed_at),
         # Preview-специфичные поля
         "is_preview": run.mode == "preview",
-        "is_discardable": (run.mode == "preview" and run.status not in ("discarded", "deleted")),
+        # Discard разрешён только для completed preview, не использованного как source.
+        # running → race condition; discarded/deleted → уже терминал; used_as_source → запрещено бэкендом.
+        "is_discardable": (run.mode == "preview" and run.status == "completed" and not used_as_source),
         # delete allowed only for stable terminal states (not running — race condition risk)
         "is_deletable": (run.mode == "preview" and run.status in ("completed", "discarded") and not used_as_source),
         # snapshot editing (add/remove) requires completed + not yet used for send-real

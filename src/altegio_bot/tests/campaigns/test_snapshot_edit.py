@@ -13,8 +13,11 @@
  10. delete_preview_run — forbidden for running preview (race condition guard).
  11. remove_recipient — forbidden for running preview.
  12. add_recipient — forbidden for running preview (via HTTP).
- 13. summary flags: running preview not marked editable/deletable.
- 14. summary flags: used-as-source preview not marked editable/deletable.
+ 13. summary flags: running preview not marked editable/deletable/discardable.
+ 14. summary flags: used-as-source preview not marked editable/deletable/discardable.
+ 15. discard_preview_run — success: status → 'discarded'.
+ 16. discard_preview_run — forbidden for running preview (race condition guard).
+ 17. discard_preview_run — forbidden when referenced by send-real.
 """
 
 from __future__ import annotations
@@ -31,6 +34,7 @@ import altegio_bot.ops.campaigns_api as campaigns_api_module
 import altegio_bot.ops.router as ops_router_module
 from altegio_bot.campaigns.runner import (
     delete_preview_run,
+    discard_preview_run,
     remove_recipient_from_preview,
 )
 from altegio_bot.main import app
@@ -480,13 +484,13 @@ async def test_add_recipient_forbidden_for_running(http_client: AsyncClient, ses
 
 
 # ---------------------------------------------------------------------------
-# 13. summary flags: running preview NOT marked editable/deletable
+# 13. summary flags: running preview NOT marked editable/deletable/discardable
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_summary_flags_running_not_editable(http_client: AsyncClient, session_maker) -> None:
-    """GET /runs/{id} → is_snapshot_editable=False, is_deletable=False для running preview."""
+    """GET /runs/{id} → все action-флаги False для running preview."""
     run_id = await _make_preview_run(session_maker, status="running")
 
     resp = await http_client.get(f"/ops/campaigns/runs/{run_id}")
@@ -495,18 +499,18 @@ async def test_summary_flags_running_not_editable(http_client: AsyncClient, sess
 
     assert data["is_snapshot_editable"] is False, "running preview must not be marked editable"
     assert data["is_deletable"] is False, "running preview must not be marked deletable"
-    # discardable is still True — discard does not edit the snapshot
-    assert data["is_discardable"] is True
+    # discard during running is a race condition — must also be False
+    assert data["is_discardable"] is False, "running preview must not be marked discardable"
 
 
 # ---------------------------------------------------------------------------
-# 14. summary flags: used-as-source preview NOT marked editable/deletable
+# 14. summary flags: used-as-source preview NOT marked editable/deletable/discardable
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_summary_flags_used_source_not_editable(http_client: AsyncClient, session_maker) -> None:
-    """GET /runs/{id} → is_snapshot_editable=False, is_deletable=False если уже used_as_source."""
+    """GET /runs/{id} → все action-флаги False если уже used_as_source."""
     preview_id = await _make_preview_run(session_maker, status="completed")
     await _make_send_real_run(session_maker, source_preview_run_id=preview_id)
 
@@ -516,3 +520,67 @@ async def test_summary_flags_used_source_not_editable(http_client: AsyncClient, 
 
     assert data["is_snapshot_editable"] is False, "used-as-source preview must not be editable"
     assert data["is_deletable"] is False, "used-as-source preview must not be deletable"
+    assert data["is_discardable"] is False, "used-as-source preview must not be discardable"
+
+
+# ---------------------------------------------------------------------------
+# 15. discard_preview_run — success
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_discard_preview_run_success(session_maker, monkeypatch) -> None:
+    """discard_preview_run переводит status в 'discarded' и записывает discarded_at в meta."""
+    monkeypatch.setattr(runner_module, "SessionLocal", session_maker)
+
+    run_id = await _make_preview_run(session_maker, status="completed")
+
+    await discard_preview_run(run_id)
+
+    async with session_maker() as session:
+        run = await session.get(CampaignRun, run_id)
+
+    assert run is not None
+    assert run.status == "discarded"
+    assert "discarded_at" in (run.meta or {})
+
+
+# ---------------------------------------------------------------------------
+# 16. discard_preview_run — forbidden for running preview (race condition guard)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_discard_preview_forbidden_for_running(session_maker, monkeypatch) -> None:
+    """discard_preview_run запрещено для running preview — race condition с run_preview()."""
+    monkeypatch.setattr(runner_module, "SessionLocal", session_maker)
+
+    run_id = await _make_preview_run(session_maker, status="running")
+
+    with pytest.raises(ValueError, match="completed"):
+        await discard_preview_run(run_id)
+
+    async with session_maker() as session:
+        run = await session.get(CampaignRun, run_id)
+    assert run.status == "running", "status must remain 'running'"
+
+
+# ---------------------------------------------------------------------------
+# 17. discard_preview_run — forbidden when referenced by send-real
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_discard_preview_forbidden_when_referenced(session_maker, monkeypatch) -> None:
+    """discard_preview_run запрещено, если preview используется как source_preview_run_id."""
+    monkeypatch.setattr(runner_module, "SessionLocal", session_maker)
+
+    preview_id = await _make_preview_run(session_maker, status="completed")
+    await _make_send_real_run(session_maker, source_preview_run_id=preview_id)
+
+    with pytest.raises(ValueError, match="send-real"):
+        await discard_preview_run(preview_id)
+
+    async with session_maker() as session:
+        run = await session.get(CampaignRun, preview_id)
+    assert run.status == "completed"

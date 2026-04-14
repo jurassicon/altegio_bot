@@ -2687,15 +2687,10 @@ async def ops_campaigns_list(request: Request) -> str:
                 f"🗑 Delete</button>"
             )
         elif run.mode == "preview" and run.status == "completed" and is_used:
-            # Used as source — can discard/delete but snapshot is locked
+            # Used as source — snapshot and discard/delete locked (backend forbids both)
             actions = (
                 f'<a href="/ops/campaigns/{run.id}" class="btn btn-sm btn-outline-primary me-1">open</a>'
-                f'<button class="btn btn-sm btn-outline-warning me-1" '
-                f'onclick="discardPreview({run.id})">'
-                f"⊘ Discard</button>"
-                f'<button class="btn btn-sm btn-outline-danger" '
-                f'onclick="deletePreview({run.id})">'
-                f"🗑 Delete</button>"
+                f'<span class="text-muted small">used as source</span>'
             )
         elif run.mode == "preview" and run.status == "running":
             # Running — no edit actions; snapshot being built
@@ -3849,16 +3844,12 @@ async def ops_campaign_run_detail(run_id: int) -> str:
 </div>
 """
     elif run.mode == "preview" and run.status == "completed" and used_as_source:
-        # Snapshot used by send-real — can still discard/delete, but no editing
+        # Snapshot used by send-real — discard/delete/edit all forbidden by backend
         preview_actions_block = f"""
 <div class="alert alert-warning d-flex align-items-center gap-3 mb-3 flex-wrap">
-  <span>Preview уже использован для send-real. Редактирование snapshot заблокировано.</span>
+  <span>Preview уже использован для send-real. Редактирование snapshot и удаление заблокированы.</span>
   <a href="/ops/campaigns/new-clients?from_preview={run_id}"
      class="btn btn-success btn-sm">▶ Run again</a>
-  <button class="btn btn-outline-warning btn-sm"
-          onclick="discardAndRefresh({run_id})">⊘ Discard</button>
-  <button class="btn btn-outline-danger btn-sm"
-          onclick="deleteAndRedirect({run_id})">🗑 Delete</button>
 </div>
 """
     elif run.mode == "preview" and run.status == "completed":
