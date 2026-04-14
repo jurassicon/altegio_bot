@@ -26,7 +26,7 @@ import pytest
 import pytest_asyncio
 
 import altegio_bot.campaigns.segment as segment_module
-from altegio_bot.campaigns.altegio_crm import CrmRecord, CrmUnavailableError
+from altegio_bot.campaigns.altegio_crm import CrmClientRef, CrmRecord, CrmUnavailableError
 from altegio_bot.campaigns.segment import find_candidates
 from altegio_bot.models.models import Client, Record
 from altegio_bot.service_filter import ServiceLookupError
@@ -129,6 +129,17 @@ def _patch_crm(records: list[CrmRecord] | None = None, *, raise_error: bool = Fa
     )
 
 
+def _patch_crm_discovery(refs: list[CrmClientRef] | None = None):
+    """Мок для get_company_period_client_refs (CRM company-level discovery).
+
+    Обязателен для всех тестов, вызывающих find_candidates().
+    """
+    return patch(
+        "altegio_bot.campaigns.segment.get_company_period_client_refs",
+        new=AsyncMock(return_value=refs or []),
+    )
+
+
 def _patch_lash(lash_ids: set[int] | None = None, *, raise_error: bool = False):
     """Мок для is_lash_service: True только если service_id в lash_ids.
 
@@ -174,8 +185,9 @@ async def test_eligible_client(patched_db) -> None:
             session.add(rec)
 
     crm_records = [_crm_record(confirmed=1, service_ids=[LASH_SVC_ID])]
+    discovery_refs = [CrmClientRef(altegio_client_id=client.altegio_client_id)]
 
-    with _patch_crm(crm_records), _patch_lash():
+    with _patch_crm(crm_records), _patch_lash(), _patch_crm_discovery(discovery_refs):
         result = await find_candidates(
             company_id=COMPANY,
             period_start=PERIOD_START,
@@ -207,8 +219,9 @@ async def test_opted_out_excluded(patched_db) -> None:
             session.add(rec)
 
     crm_records = [_crm_record(confirmed=1)]
+    discovery_refs = [CrmClientRef(altegio_client_id=client.altegio_client_id)]
 
-    with _patch_crm(crm_records), _patch_lash():
+    with _patch_crm(crm_records), _patch_lash(), _patch_crm_discovery(discovery_refs):
         result = await find_candidates(
             company_id=COMPANY,
             period_start=PERIOD_START,
@@ -238,8 +251,9 @@ async def test_no_phone_excluded(patched_db) -> None:
             session.add(rec)
 
     crm_records = [_crm_record(confirmed=1)]
+    discovery_refs = [CrmClientRef(altegio_client_id=client.altegio_client_id)]
 
-    with _patch_crm(crm_records), _patch_lash():
+    with _patch_crm(crm_records), _patch_lash(), _patch_crm_discovery(discovery_refs):
         result = await find_candidates(
             company_id=COMPANY,
             period_start=PERIOD_START,
@@ -276,8 +290,9 @@ async def test_has_records_before_period_excluded_from_crm(patched_db) -> None:
         _crm_record(confirmed=1, service_ids=[LASH_SVC_ID]),
         _crm_record(before_period=True, service_ids=[LASH_SVC_ID]),
     ]
+    discovery_refs = [CrmClientRef(altegio_client_id=client.altegio_client_id)]
 
-    with _patch_crm(crm_records), _patch_lash():
+    with _patch_crm(crm_records), _patch_lash(), _patch_crm_discovery(discovery_refs):
         result = await find_candidates(
             company_id=COMPANY,
             period_start=PERIOD_START,
@@ -309,8 +324,9 @@ async def test_no_lash_record_excluded(patched_db) -> None:
 
     # CRM запись с NON-lash сервисом
     crm_records = [_crm_record(confirmed=1, service_ids=[NON_LASH_SVC_ID])]
+    discovery_refs = [CrmClientRef(altegio_client_id=client.altegio_client_id)]
 
-    with _patch_crm(crm_records), _patch_lash({LASH_SVC_ID}):
+    with _patch_crm(crm_records), _patch_lash({LASH_SVC_ID}), _patch_crm_discovery(discovery_refs):
         result = await find_candidates(
             company_id=COMPANY,
             period_start=PERIOD_START,
@@ -345,8 +361,9 @@ async def test_no_confirmed_lash_excluded(patched_db) -> None:
 
     # CRM: 1 lash-запись, confirmed=1 (не отменена), но attendance=0 (не пришёл)
     crm_records = [_crm_record(confirmed=1, attendance=0, service_ids=[LASH_SVC_ID])]
+    discovery_refs = [CrmClientRef(altegio_client_id=client.altegio_client_id)]
 
-    with _patch_crm(crm_records), _patch_lash():
+    with _patch_crm(crm_records), _patch_lash(), _patch_crm_discovery(discovery_refs):
         result = await find_candidates(
             company_id=COMPANY,
             period_start=PERIOD_START,
@@ -382,8 +399,9 @@ async def test_multiple_confirmed_lash_excluded(patched_db) -> None:
         _crm_record(days_offset=3, confirmed=1, service_ids=[LASH_SVC_ID]),
         _crm_record(days_offset=15, confirmed=1, service_ids=[LASH_SVC_ID]),
     ]
+    discovery_refs = [CrmClientRef(altegio_client_id=client.altegio_client_id)]
 
-    with _patch_crm(crm_records), _patch_lash():
+    with _patch_crm(crm_records), _patch_lash(), _patch_crm_discovery(discovery_refs):
         result = await find_candidates(
             company_id=COMPANY,
             period_start=PERIOD_START,
@@ -426,8 +444,9 @@ async def test_strict_multiplicity_one_confirmed_one_unconfirmed(patched_db) -> 
         _crm_record(days_offset=3, confirmed=1, attendance=1, service_ids=[LASH_SVC_ID]),
         _crm_record(days_offset=20, confirmed=0, attendance=0, service_ids=[LASH_SVC_ID]),
     ]
+    discovery_refs = [CrmClientRef(altegio_client_id=client.altegio_client_id)]
 
-    with _patch_crm(crm_records), _patch_lash():
+    with _patch_crm(crm_records), _patch_lash(), _patch_crm_discovery(discovery_refs):
         result = await find_candidates(
             company_id=COMPANY,
             period_start=PERIOD_START,
@@ -463,7 +482,9 @@ async def test_crm_error_client_not_eligible(patched_db) -> None:
             rec = _make_record(client.id)
             session.add(rec)
 
-    with _patch_crm(raise_error=True), _patch_lash():
+    discovery_refs = [CrmClientRef(altegio_client_id=client.altegio_client_id)]
+
+    with _patch_crm(raise_error=True), _patch_lash(), _patch_crm_discovery(discovery_refs):
         result = await find_candidates(
             company_id=COMPANY,
             period_start=PERIOD_START,
@@ -499,8 +520,9 @@ async def test_crm_source_of_truth_overrides_local_db(patched_db) -> None:
         _crm_record(days_offset=5, confirmed=1, service_ids=[LASH_SVC_ID]),
         _crm_record(before_period=True, service_ids=[NON_LASH_SVC_ID]),
     ]
+    discovery_refs = [CrmClientRef(altegio_client_id=client.altegio_client_id)]
 
-    with _patch_crm(crm_records), _patch_lash():
+    with _patch_crm(crm_records), _patch_lash(), _patch_crm_discovery(discovery_refs):
         result = await find_candidates(
             company_id=COMPANY,
             period_start=PERIOD_START,
@@ -531,8 +553,9 @@ async def test_local_client_found_flag(patched_db) -> None:
             session.add(rec)
 
     crm_records = [_crm_record(confirmed=1)]
+    discovery_refs = [CrmClientRef(altegio_client_id=client.altegio_client_id)]
 
-    with _patch_crm(crm_records), _patch_lash():
+    with _patch_crm(crm_records), _patch_lash(), _patch_crm_discovery(discovery_refs):
         result = await find_candidates(
             company_id=COMPANY,
             period_start=PERIOD_START,
@@ -567,8 +590,9 @@ async def test_service_titles_from_crm(patched_db) -> None:
             service_titles=["Wimpernverlängerung"],
         )
     ]
+    discovery_refs = [CrmClientRef(altegio_client_id=client.altegio_client_id)]
 
-    with _patch_crm(crm_records), _patch_lash():
+    with _patch_crm(crm_records), _patch_lash(), _patch_crm_discovery(discovery_refs):
         result = await find_candidates(
             company_id=COMPANY,
             period_start=PERIOD_START,
@@ -601,8 +625,9 @@ async def test_service_lookup_failure_excluded(patched_db) -> None:
             session.add(rec)
 
     crm_records = [_crm_record(confirmed=1, service_ids=[LASH_SVC_ID])]
+    discovery_refs = [CrmClientRef(altegio_client_id=client.altegio_client_id)]
 
-    with _patch_crm(crm_records), _patch_lash(raise_error=True):
+    with _patch_crm(crm_records), _patch_lash(raise_error=True), _patch_crm_discovery(discovery_refs):
         result = await find_candidates(
             company_id=COMPANY,
             period_start=PERIOD_START,

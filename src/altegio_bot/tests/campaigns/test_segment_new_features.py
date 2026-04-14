@@ -18,7 +18,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 import altegio_bot.campaigns.segment as segment_module
-from altegio_bot.campaigns.altegio_crm import CrmRecord, CrmUnavailableError
+from altegio_bot.campaigns.altegio_crm import CrmClientRef, CrmRecord, CrmUnavailableError
 from altegio_bot.campaigns.segment import (
     ClientCandidate,
     ClientSnapshot,
@@ -181,13 +181,16 @@ async def test_find_candidates_return_exceptions_resilience(session_maker, monke
             raise RuntimeError("simulated unexpected crash")
         return [_crm_record(service_ids=[lash_svc_id])]
 
+    altegio_ids: list[int] = []
     async with session_maker() as session:
         async with session.begin():
             # Два клиента с записями в периоде
             for _ in range(2):
+                alt_id = _next_id()
+                altegio_ids.append(alt_id)
                 client = Client(
                     company_id=COMPANY,
-                    altegio_client_id=_next_id(),
+                    altegio_client_id=alt_id,
                     phone_e164="+491234567890",
                     raw={},
                 )
@@ -203,11 +206,17 @@ async def test_find_candidates_return_exceptions_resilience(session_maker, monke
                 )
                 session.add(rec)
 
+    discovery_refs = [CrmClientRef(altegio_client_id=aid) for aid in altegio_ids]
+
     with (
         patch("altegio_bot.campaigns.segment.get_client_crm_records", new=AsyncMock(side_effect=selective_crm)),
         patch(
             "altegio_bot.campaigns.segment.is_lash_service",
             new=AsyncMock(side_effect=lambda company_id, svc_id, http_client=None: svc_id == lash_svc_id),
+        ),
+        patch(
+            "altegio_bot.campaigns.segment.get_company_period_client_refs",
+            new=AsyncMock(return_value=discovery_refs),
         ),
     ):
         results = await find_candidates(
@@ -265,6 +274,10 @@ async def test_find_candidates_client_is_snapshot(session_maker, monkeypatch) ->
         patch(
             "altegio_bot.campaigns.segment.is_lash_service",
             new=AsyncMock(side_effect=lambda company_id, svc_id, http_client=None: svc_id == lash_svc_id),
+        ),
+        patch(
+            "altegio_bot.campaigns.segment.get_company_period_client_refs",
+            new=AsyncMock(return_value=[CrmClientRef(altegio_client_id=client.altegio_client_id)]),
         ),
     ):
         results = await find_candidates(
@@ -333,6 +346,10 @@ async def test_find_candidates_uses_settings_concurrency(session_maker, monkeypa
         patch(
             "altegio_bot.campaigns.segment.is_lash_service",
             new=AsyncMock(return_value=False),
+        ),
+        patch(
+            "altegio_bot.campaigns.segment.get_company_period_client_refs",
+            new=AsyncMock(return_value=[CrmClientRef(altegio_client_id=client.altegio_client_id)]),
         ),
     ):
         await find_candidates(
@@ -441,11 +458,15 @@ async def test_gather_base_exception_produces_excluded_candidate(session_maker, 
 
     monkeypatch.setattr(segment_module, "_process_one_client", raises_base_exception)
 
-    results = await find_candidates(
-        company_id=COMPANY,
-        period_start=PERIOD_START,
-        period_end=PERIOD_END,
-    )
+    with patch(
+        "altegio_bot.campaigns.segment.get_company_period_client_refs",
+        new=AsyncMock(return_value=[CrmClientRef(altegio_client_id=client.altegio_client_id)]),
+    ):
+        results = await find_candidates(
+            company_id=COMPANY,
+            period_start=PERIOD_START,
+            period_end=PERIOD_END,
+        )
 
     # Клиент не должен быть потерян — должен стать excluded
     assert len(results) == 1

@@ -289,7 +289,7 @@ async def run_preview(params: RunParams) -> CampaignRun:
 
             # Записать источник обнаружения кандидатов в meta
             meta = dict(run.meta or {})
-            meta["discovery_source"] = "local_db"
+            meta["discovery_source"] = "crm_api"
             run.meta = meta
 
             run.status = "completed"
@@ -346,7 +346,14 @@ async def _load_candidates_from_preview_snapshot(
     """Загрузить кандидатов из snapshot preview-run.
 
     Не пересчитывает сегментацию — использует сохранённые CampaignRecipient.
-    Если локальный Client не найден — recipient помечается excluded_reason='no_local_client'.
+
+    Три случая для каждого recipient:
+      1. r.client_id is None (CRM-only client): локальной записи не было и не ожидается.
+         Восстанавливаем snapshot из recipient.phone_e164 (нормализованный через CRM fallback).
+         excluded_reason=None (eligible) сохраняется как-есть — send-real обработает его.
+      2. r.client_id is not None, local client найден: используем свежие данные из БД.
+      3. r.client_id is not None, local client не найден: данные испорчены / клиент удалён.
+         Помечаем excluded_reason='no_local_client'.
     """
     stmt = (
         select(CampaignRecipient)
@@ -358,7 +365,7 @@ async def _load_candidates_from_preview_snapshot(
     if not preview_recipients:
         raise RuntimeError(f"Preview run {preview_run_id} has no recipients (empty snapshot)")
 
-    # Предзагрузить клиентов одним запросом
+    # Предзагрузить клиентов одним запросом (только те, у кого есть client_id)
     local_client_ids = [r.client_id for r in preview_recipients if r.client_id is not None]
     clients_map: dict[int, Client] = {}
     if local_client_ids:
@@ -369,9 +376,22 @@ async def _load_candidates_from_preview_snapshot(
     for r in preview_recipients:
         local_client = clients_map.get(r.client_id) if r.client_id else None
 
-        if local_client is None:
-            # Нет локального клиента — используем данные из snapshot
-            excluded = r.excluded_reason or "no_local_client"
+        if local_client is not None:
+            # Случай 2: локальный клиент найден — используем свежие данные
+            excluded = r.excluded_reason  # None → eligible
+            snapshot = ClientSnapshot(
+                id=local_client.id,
+                company_id=local_client.company_id,
+                altegio_client_id=local_client.altegio_client_id,
+                display_name=local_client.display_name,
+                phone_e164=local_client.phone_e164,
+                wa_opted_out=bool(local_client.wa_opted_out),
+            )
+        elif r.client_id is None:
+            # Случай 1: CRM-only client (client_id=None в preview snapshot).
+            # phone_e164 сохранён в recipient из CRM fallback (_normalize_phone).
+            # Восстанавливаем snapshot точно как в preview — не назначаем no_local_client.
+            excluded = r.excluded_reason  # None если eligible в preview
             snapshot = ClientSnapshot(
                 id=None,
                 company_id=r.company_id,
@@ -381,14 +401,16 @@ async def _load_candidates_from_preview_snapshot(
                 wa_opted_out=bool(r.is_opted_out),
             )
         else:
-            excluded = r.excluded_reason  # None → eligible
+            # Случай 3: client_id был задан, но клиент исчез из БД (удалён/испорчен).
+            # Это нештатная ситуация — помечаем excluded.
+            excluded = r.excluded_reason or "no_local_client"
             snapshot = ClientSnapshot(
-                id=local_client.id,
-                company_id=local_client.company_id,
-                altegio_client_id=local_client.altegio_client_id,
-                display_name=local_client.display_name,
-                phone_e164=local_client.phone_e164,
-                wa_opted_out=bool(local_client.wa_opted_out),
+                id=None,
+                company_id=r.company_id,
+                altegio_client_id=r.altegio_client_id,
+                display_name=r.display_name,
+                phone_e164=r.phone_e164,
+                wa_opted_out=bool(r.is_opted_out),
             )
 
         c = ClientCandidate(
@@ -452,23 +474,24 @@ async def _execute_send_real_for_existing_run(
             meta.pop("last_error", None)
             if params.source_preview_run_id:
                 meta["used_preview_snapshot"] = params.source_preview_run_id
-                # Источник данных — snapshot preview-run, не свежая сегментация.
+                # Источник данных — snapshot preview-run (сегментация через CRM API в preview).
                 meta["discovery_source"] = "preview_snapshot"
             else:
-                # Свежая сегментация через локальную БД — фиксируем ограничение обнаружения.
-                meta["discovery_source"] = "local_db"
+                # Свежая сегментация через CRM API (get_company_period_client_refs).
+                meta["discovery_source"] = "crm_api"
             run.meta = meta
 
     # Фаза 2: загрузить кандидатов (вне открытой транзакции)
     if params.source_preview_run_id:
-        # Snapshot: короткая сессия только для SELECT
+        # Snapshot: короткая сессия только для SELECT.
+        # CRM-only клиенты восстанавливаются из recipient.phone_e164 (CRM fallback).
         async with SessionLocal() as session:
             candidates = await _load_candidates_from_preview_snapshot(
                 session,
                 params.source_preview_run_id,
             )
     else:
-        # Свежая сегментация — CRM HTTP-запросы без открытой транзакции БД
+        # Свежая сегментация — CRM API discovery без открытой транзакции БД.
         candidates = await find_candidates(
             company_id=params.company_id,
             period_start=params.period_start,
@@ -642,21 +665,7 @@ async def _process_eligible(
     stats: dict,
 ) -> None:
     client = candidate.client
-    client_id = client.id
-
-    # Инвариант: eligible candidate обязан иметь локальный client_id.
-    # Snapshot с id=None может прийти из _load_candidates_from_preview_snapshot
-    # при отсутствии локального Client, но такой candidate всегда excluded
-    # (excluded_reason='no_local_client'). Если это условие нарушено — это баг.
-    if client_id is None:
-        logger.error(
-            "process_eligible: eligible candidate has client.id=None "
-            "(company=%d phone=%s) — skipping (invariant violation)",
-            client.company_id,
-            client.phone_e164,
-        )
-        stats["failed"] += 1
-        return
+    client_id = client.id  # None для CRM-only clients — допустимо
 
     async with SessionLocal() as session:
         async with session.begin():
@@ -718,7 +727,7 @@ async def _process_eligible(
                     recipient.excluded_reason = "card_issue_failed"
                     recipient.cleanup_card_ids = cleanup.deleted_ids
         logger.error(
-            "card_issue_failed client_id=%d: %s",
+            "card_issue_failed client_id=%s: %s",
             client_id,
             exc,
         )
@@ -773,7 +782,7 @@ async def _process_eligible(
 
         stats["queued"] += 1
         logger.info(
-            "queued client_id=%d card=%s",
+            "queued client_id=%s card=%s",
             client_id,
             issued_number,
         )
@@ -781,7 +790,7 @@ async def _process_eligible(
     except Exception as exc:
         stats["failed"] += 1
         logger.error(
-            "queue_failed client_id=%d: %s",
+            "queue_failed client_id=%s: %s",
             client_id,
             exc,
         )

@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -102,6 +102,24 @@ class CrmRecord:
     def is_active(self) -> bool:
         """True если запись не удалена и не отменена."""
         return not self.deleted and self.confirmed != 0
+
+
+# ---------------------------------------------------------------------------
+# Ссылка на клиента из ответа компании
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class CrmClientRef:
+    """Ссылка на клиента из ответа CRM при обходе записей компании за период.
+
+    Используется в get_company_period_client_refs() для построения списка
+    уникальных клиентов, обнаруженных в CRM за период кампании.
+    """
+
+    altegio_client_id: int
+    name: str | None = None
+    phone_raw: str | None = None  # Сырой телефон из CRM (не нормализован)
 
 
 # ---------------------------------------------------------------------------
@@ -342,6 +360,136 @@ async def get_client_crm_records(
         ) from exc
 
     return all_records
+
+
+# ---------------------------------------------------------------------------
+# Компания-уровень: получить уникальных клиентов за период
+# ---------------------------------------------------------------------------
+
+
+async def get_company_period_client_refs(
+    http_client: httpx.AsyncClient,
+    *,
+    company_id: int,
+    period_start: datetime,
+    period_end: datetime,
+) -> list[CrmClientRef]:
+    """Получить уникальных клиентов компании за период из Altegio CRM.
+
+    Пагинирует GET /records/{company_id}?start_date=...&end_date=...
+    Используется для CRM-based discovery в find_candidates() вместо
+    локальной БД. Позволяет обнаружить клиентов, которые посещали салон
+    до запуска бота (нет записей в локальной records таблице).
+
+    Даты конвертируются из UTC в Europe/Belgrade (локальное время Altegio).
+    start_date — inclusive, end_date — inclusive в формате YYYY-MM-DD.
+    period_end (exclusive UTC) → end_date = (period_end - 1 day).local.date().
+
+    Args:
+        http_client: переиспользуемый AsyncClient (передаётся снаружи).
+        company_id: ID компании в Altegio.
+        period_start: начало периода (inclusive), UTC.
+        period_end: конец периода (exclusive), UTC.
+
+    Returns:
+        Список уникальных CrmClientRef, по одному на altegio_client_id.
+
+    Raises:
+        CrmUnavailableError: при сетевой ошибке или HTTP-ошибке.
+    """
+    base = settings.altegio_api_base_url.rstrip("/")
+    url = f"{base}/records/{company_id}"
+    page = 1
+    seen_client_ids: set[int] = set()
+    refs: list[CrmClientRef] = []
+
+    # period_end exclusive → subtract 1 day for inclusive end_date param
+    local_start = period_start.astimezone(_ALTEGIO_LOCAL_TZ)
+    local_end = (period_end - timedelta(days=1)).astimezone(_ALTEGIO_LOCAL_TZ)
+    start_date_str = local_start.strftime("%Y-%m-%d")
+    end_date_str = local_end.strftime("%Y-%m-%d")
+
+    try:
+        while True:
+            params: dict[str, Any] = {
+                "start_date": start_date_str,
+                "end_date": end_date_str,
+                "count": _PAGE_SIZE,
+                "page": page,
+            }
+            resp = await http_client.get(url, headers=_headers(), params=params)
+            resp.raise_for_status()
+
+            try:
+                payload = resp.json()
+            except Exception as exc:
+                raise CrmUnavailableError(f"CRM API returned invalid JSON: company={company_id}: {exc}") from exc
+
+            if not isinstance(payload, dict):
+                raise CrmUnavailableError(
+                    f"CRM API returned unexpected payload type {type(payload).__name__}: company={company_id}"
+                )
+
+            data = payload.get("data")
+            raw_records: list[dict[str, Any]] = []
+            if data is None:
+                pass
+            elif isinstance(data, list):
+                raw_records = data
+            else:
+                raise CrmUnavailableError(
+                    f"CRM API returned unexpected 'data' type {type(data).__name__}: company={company_id}"
+                )
+
+            for rec in raw_records:
+                # Try nested "client" dict first, then flat "client_id"
+                client_data = rec.get("client")
+                if isinstance(client_data, dict):
+                    client_id = client_data.get("id")
+                    name = client_data.get("name") or client_data.get("display_name")
+                    phone_raw = client_data.get("phone")
+                else:
+                    client_id = rec.get("client_id")
+                    name = None
+                    phone_raw = None
+
+                if not isinstance(client_id, int) or client_id <= 0:
+                    continue
+
+                if client_id not in seen_client_ids:
+                    seen_client_ids.add(client_id)
+                    refs.append(
+                        CrmClientRef(
+                            altegio_client_id=client_id,
+                            name=name,
+                            phone_raw=phone_raw,
+                        )
+                    )
+
+            if len(raw_records) < _PAGE_SIZE:
+                break
+
+            logger.debug(
+                "crm company period page=%d company=%d start=%s end=%s refs_so_far=%d",
+                page,
+                company_id,
+                start_date_str,
+                end_date_str,
+                len(refs),
+            )
+            page += 1
+
+    except httpx.HTTPError as exc:
+        raise CrmUnavailableError(f"CRM API недоступен (company period): company={company_id}: {exc}") from exc
+
+    logger.info(
+        "crm company period discovery: company=%d period=[%s, %s) unique_clients=%d",
+        company_id,
+        start_date_str,
+        end_date_str,
+        len(refs),
+    )
+    return refs
 
 
 # ---------------------------------------------------------------------------

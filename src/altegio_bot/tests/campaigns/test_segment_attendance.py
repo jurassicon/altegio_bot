@@ -26,7 +26,7 @@ from httpx import ASGITransport, AsyncClient
 import altegio_bot.campaigns.segment as segment_module
 import altegio_bot.ops.campaigns_api as campaigns_api_module
 import altegio_bot.ops.router as ops_router_module
-from altegio_bot.campaigns.altegio_crm import CrmRecord, CrmUnavailableError
+from altegio_bot.campaigns.altegio_crm import CrmClientRef, CrmRecord, CrmUnavailableError
 from altegio_bot.campaigns.segment import find_candidates
 from altegio_bot.main import app
 from altegio_bot.models.models import Client, Record
@@ -103,6 +103,28 @@ def _patch_crm(records: list[CrmRecord] | None = None, *, raise_error: bool = Fa
     )
 
 
+def _patch_crm_discovery(
+    refs: list[CrmClientRef] | None = None,
+    *,
+    raise_error: bool = False,
+):
+    """Мок CRM company-level discovery (get_company_period_client_refs).
+
+    Заменяет HTTP-вызов, который обнаруживает клиентов компании за период.
+    Все тесты find_candidates() обязаны использовать этот мок, поскольку
+    после перехода на CRM-discovery локальная таблица records не задействована.
+    """
+    if raise_error:
+        return patch(
+            "altegio_bot.campaigns.segment.get_company_period_client_refs",
+            new=AsyncMock(side_effect=CrmUnavailableError("CRM discovery down")),
+        )
+    return patch(
+        "altegio_bot.campaigns.segment.get_company_period_client_refs",
+        new=AsyncMock(return_value=refs or []),
+    )
+
+
 def _patch_lash(lash_ids: set[int] | None = None):
     ids = lash_ids if lash_ids is not None else {LASH_SVC_ID}
     return patch(
@@ -140,8 +162,9 @@ async def test_confirmed_but_not_attended_is_not_eligible(patched_db) -> None:
 
     # CRM: запись подтверждена, но клиент не пришёл
     crm_records = [_crm_record(confirmed=1, attendance=0, service_ids=[LASH_SVC_ID])]
+    discovery_refs = [CrmClientRef(altegio_client_id=client.altegio_client_id)]
 
-    with _patch_crm(crm_records), _patch_lash():
+    with _patch_crm(crm_records), _patch_lash(), _patch_crm_discovery(discovery_refs):
         result = await find_candidates(
             company_id=COMPANY,
             period_start=PERIOD_START,
@@ -176,8 +199,9 @@ async def test_attended_new_client_is_eligible(patched_db) -> None:
 
     # CRM: ровно 1 запись, клиент пришёл, нет истории до периода
     crm_records = [_crm_record(confirmed=1, attendance=1, service_ids=[LASH_SVC_ID])]
+    discovery_refs = [CrmClientRef(altegio_client_id=client.altegio_client_id)]
 
-    with _patch_crm(crm_records), _patch_lash():
+    with _patch_crm(crm_records), _patch_lash(), _patch_crm_discovery(discovery_refs):
         result = await find_candidates(
             company_id=COMPANY,
             period_start=PERIOD_START,
@@ -209,8 +233,9 @@ async def test_cancelled_record_is_not_eligible(patched_db) -> None:
             session.add(rec)
 
     crm_records = [_crm_record(confirmed=0, attendance=0, service_ids=[LASH_SVC_ID])]
+    discovery_refs = [CrmClientRef(altegio_client_id=client.altegio_client_id)]
 
-    with _patch_crm(crm_records), _patch_lash():
+    with _patch_crm(crm_records), _patch_lash(), _patch_crm_discovery(discovery_refs):
         result = await find_candidates(
             company_id=COMPANY,
             period_start=PERIOD_START,
@@ -427,8 +452,9 @@ async def test_visit_attendance_fallback_makes_eligible(patched_db) -> None:
             service_titles=["Wimpernverlängerung"],
         )
     ]
+    discovery_refs = [CrmClientRef(altegio_client_id=client.altegio_client_id)]
 
-    with _patch_crm(crm_records), _patch_lash():
+    with _patch_crm(crm_records), _patch_lash(), _patch_crm_discovery(discovery_refs):
         result = await find_candidates(
             company_id=COMPANY,
             period_start=PERIOD_START,
@@ -476,8 +502,9 @@ async def test_visit_attendance_fallback_excluded_when_zero(patched_db) -> None:
             service_titles=["Wimpernverlängerung"],
         )
     ]
+    discovery_refs = [CrmClientRef(altegio_client_id=client.altegio_client_id)]
 
-    with _patch_crm(crm_records), _patch_lash():
+    with _patch_crm(crm_records), _patch_lash(), _patch_crm_discovery(discovery_refs):
         result = await find_candidates(
             company_id=COMPANY,
             period_start=PERIOD_START,
@@ -1156,3 +1183,167 @@ async def test_batch_debug_mixed_valid_invalid_valid_order(debug_http_client) ->
     assert summary["total_phones"] == 3
     assert summary["discovery_status_counts"].get("invalid_phone", 0) == 1
     assert summary["discovery_status_counts"].get("not_in_local_db", 0) == 2
+
+
+# ===========================================================================
+# CRM-based discovery тесты (переход с local DB на CRM API)
+# ===========================================================================
+
+
+# ---------------------------------------------------------------------------
+# Тест P: Lalka Marinova scenario — клиент есть в local clients, но нет в records
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_crm_discovery_finds_client_without_local_record(patched_db) -> None:
+    """CRM discovery обнаруживает клиента, которого нет в локальной таблице records.
+
+    Это ключевой сценарий «Lalka Marinova»:
+      - Клиент есть в локальной таблице clients (синхронизирован через webhook).
+      - Записи клиента НЕ попали в локальную таблицу records (посетил ДО запуска бота).
+      - CRM API возвращает клиента в company-level discovery.
+      - Результат: клиент обнаружен и правильно классифицирован как eligible.
+
+    До перехода на CRM discovery такой клиент полностью пропускался,
+    потому что find_candidates() искал по локальной таблице records.
+    """
+    async with patched_db() as session:
+        async with session.begin():
+            # Клиент ЕСТЬ в clients, но НЕТ записей в records
+            client = _make_client(altegio_client_id=_next_id())
+            session.add(client)
+            # Намеренно НЕ добавляем Record — симулируем отсутствие webhook sync
+
+    # CRM discovery возвращает клиента (CRM знает о нём)
+    discovery_refs = [CrmClientRef(altegio_client_id=client.altegio_client_id)]
+    # CRM per-client: 1 lash-запись в периоде, посетил, нет истории до периода
+    crm_records = [_crm_record(confirmed=1, attendance=1, service_ids=[LASH_SVC_ID])]
+
+    with _patch_crm(crm_records), _patch_lash(), _patch_crm_discovery(discovery_refs):
+        result = await find_candidates(
+            company_id=COMPANY,
+            period_start=PERIOD_START,
+            period_end=PERIOD_END,
+        )
+
+    # Клиент должен быть обнаружен и eligible
+    assert len(result) == 1, f"Ожидали 1 кандидата, получили {len(result)}"
+    match = result[0]
+    assert match.client.id == client.id, "Snapshot должен ссылаться на правильного клиента"
+    assert match.local_client_found is True, "Клиент найден в локальной БД (clients)"
+    assert match.is_eligible, f"Клиент должен быть eligible, но: {match.excluded_reason}"
+    assert match.lash_records_in_period == 1
+    assert match.confirmed_lash_records_in_period == 1
+    assert match.records_before_period == 0
+
+
+# ---------------------------------------------------------------------------
+# Тест Q: CRM-only клиент — не в local DB → excluded с no_phone
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_crm_only_client_excluded_with_no_phone(patched_db) -> None:
+    """Клиент обнаружен CRM, но отсутствует в локальной БД → excluded с no_phone.
+
+    Если клиента нет ни в clients, ни в records — нет нормализованного phone_e164.
+    Такой клиент появится в candidates (это прогресс по сравнению со старым кодом),
+    но не сможет получить рассылку до тех пор, пока не будет синхронизирован в БД.
+    """
+    crm_only_altegio_id = _next_id()  # этот ID не существует в локальной БД
+
+    # CRM discovery возвращает клиента, которого нет в local DB
+    discovery_refs = [CrmClientRef(altegio_client_id=crm_only_altegio_id, name="Unknown CRM Client")]
+    # CRM per-client: 1 lash-запись, attendance=1 — технически eligible по CRM
+    crm_records = [_crm_record(confirmed=1, attendance=1, service_ids=[LASH_SVC_ID])]
+
+    with _patch_crm(crm_records), _patch_lash(), _patch_crm_discovery(discovery_refs):
+        result = await find_candidates(
+            company_id=COMPANY,
+            period_start=PERIOD_START,
+            period_end=PERIOD_END,
+        )
+
+    assert len(result) == 1
+    match = result[0]
+    assert match.local_client_found is False, "Клиента НЕТ в локальной БД"
+    assert match.client.id is None, "Snapshot id=None для CRM-only клиента"
+    assert match.client.phone_e164 is None, "Нет нормализованного телефона"
+    assert not match.is_eligible, "CRM-only без phone_e164 не может быть eligible"
+    assert match.excluded_reason == "no_phone"
+
+
+# ---------------------------------------------------------------------------
+# Тест R: CRM discovery недоступен → find_candidates пробрасывает CrmUnavailableError
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_crm_discovery_unavailable_returns_empty(patched_db) -> None:
+    """Если CRM company-period API недоступен — find_candidates() пробрасывает CrmUnavailableError.
+
+    Это явный failure mode: ошибка discovery НЕ должна выглядеть как пустая выборка,
+    иначе ops не поймут, что произошёл сбой.
+    runner.py перехватывает CrmUnavailableError и помечает run как failed.
+    """
+    async with patched_db() as session:
+        async with session.begin():
+            client = _make_client(altegio_client_id=_next_id())
+            session.add(client)
+            await session.flush()
+            session.add(_make_record(client.id))
+
+    with _patch_crm_discovery(raise_error=True), pytest.raises(CrmUnavailableError):
+        await find_candidates(
+            company_id=COMPANY,
+            period_start=PERIOD_START,
+            period_end=PERIOD_END,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Тест S: CRM-only клиент с phone_raw → phone_e164 нормализуется, клиент eligible
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_crm_only_client_with_phone_raw_is_eligible(patched_db) -> None:
+    """CRM-only клиент с phone_raw становится eligible, если phone_raw нормализуем.
+
+    Сценарий: клиент посетил салон ДО запуска бота, в локальной БД нет записи.
+    CRM discovery возвращает ref с phone_raw (сырой номер из CRM API).
+    После нормализации (+digits) клиент получает phone_e164 и проходит проверку.
+
+    Это исправление корневой проблемы issue #59:
+    до этого CRM-only клиенты всегда excluded с no_phone.
+    """
+    crm_only_altegio_id = _next_id()  # ID не существует в локальной БД
+
+    # CRM discovery: клиент с raw phone (как из Altegio API)
+    discovery_refs = [
+        CrmClientRef(
+            altegio_client_id=crm_only_altegio_id,
+            name="Lalka Marinova",
+            phone_raw="49151 234 56789",  # сырой формат с пробелами
+        )
+    ]
+    # CRM per-client: 1 lash-запись в периоде, attendance=1, нет истории до периода
+    crm_records = [_crm_record(confirmed=1, attendance=1, service_ids=[LASH_SVC_ID])]
+
+    with _patch_crm(crm_records), _patch_lash(), _patch_crm_discovery(discovery_refs):
+        result = await find_candidates(
+            company_id=COMPANY,
+            period_start=PERIOD_START,
+            period_end=PERIOD_END,
+        )
+
+    assert len(result) == 1
+    match = result[0]
+    assert match.local_client_found is False, "Клиента НЕТ в локальной БД"
+    assert match.client.id is None, "Snapshot id=None для CRM-only клиента"
+    assert match.client.phone_e164 == "+4915123456789", f"phone_raw нормализован неверно: {match.client.phone_e164}"
+    assert match.is_eligible, f"CRM-only клиент с валидным phone_raw должен быть eligible: {match.excluded_reason}"
+    assert match.lash_records_in_period == 1
+    assert match.confirmed_lash_records_in_period == 1
+    assert match.records_before_period == 0
