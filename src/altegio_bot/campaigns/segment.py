@@ -15,7 +15,8 @@
   - Всё из CRM Altegio API (GET /records/{company_id}?client_id=X):
       записи в периоде, услуги, статус подтверждения, история до периода.
   - Исключение: wa_opted_out берётся из локальной БД (clients.wa_opted_out).
-  - Исключение: phone_e164 берётся из локальной БД (clients.phone_e164).
+  - Исключение: phone_e164 берётся из локальной БД (clients.phone_e164),
+    с fallback на нормализованный CrmClientRef.phone_raw для CRM-only клиентов.
 
 Обнаружение кандидатов (Discovery):
   Кандидаты обнаруживаются через CRM API (GET /records/{company_id}?start_date=...&end_date=...)
@@ -23,7 +24,8 @@
   ДО запуска бота (до синхронизации записей в локальную БД).
   После обнаружения в CRM — ищем клиента в локальной БД по altegio_client_id,
   чтобы получить wa_opted_out и нормализованный phone_e164.
-  Если клиент не найден в локальной БД — phone_e164=None → excluded с no_phone.
+  Если клиент не найден в локальной БД — используем нормализованный phone_raw из CRM.
+  Если ни local, ни CRM phone не нормализуемы → excluded с no_phone.
 
 Локальная БД используется ТОЛЬКО для:
   - wa_opted_out и phone_e164 (через lookup по altegio_client_id).
@@ -36,7 +38,9 @@
   - Если lash-записей == 1 и attendance != 1 → no_confirmed_lash_record_in_period.
 
 CRM недоступность:
-  - Если Altegio CRM API вернул ошибку при discovery → возвращаем [].
+  - Если Altegio CRM API вернул ошибку при discovery → пробрасываем CrmUnavailableError
+    выше, runner.py помечает run как failed. Возвращать [] НЕЛЬЗЯ — это неотличимо
+    от «нет клиентов в периоде» и скроет реальный сбой.
   - Если Altegio CRM API вернул ошибку для конкретного клиента → клиент получает
     excluded_reason = 'crm_history_unavailable'. Возвращать 0 НЕЛЬЗЯ.
 
@@ -55,6 +59,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -80,6 +85,23 @@ logger = logging.getLogger(__name__)
 ATTENDED_FLAG = 1
 # «Подтверждена, не отменена» (confirmed=1) — диагностический счётчик; НЕ критерий eligible.
 CONFIRMED_FLAG = 1
+
+
+def _normalize_phone(raw: str | None) -> str | None:
+    """Нормализовать сырой номер телефона в E.164 формат (+digits).
+
+    Используется как fallback для CRM-only клиентов, у которых нет записи
+    в локальной БД (и, следовательно, нет нормализованного phone_e164).
+
+    Returns:
+        "+<digits>" если digits непусты, иначе None.
+    """
+    if not raw:
+        return None
+    digits = re.sub(r"\D+", "", raw)
+    if not digits:
+        return None
+    return f"+{digits}"
 
 
 @dataclass(frozen=True)
@@ -413,8 +435,10 @@ async def find_candidates(
     Шаги:
     1. CRM API discovery: получить уникальных клиентов компании за период.
        Это гарантирует обнаружение клиентов, которые посещали салон ДО запуска бота.
+       При ошибке discovery → CrmUnavailableError пробрасывается выше.
     2. SQL: Client объекты по altegio_client_id (wa_opted_out, phone_e164).
-       Если клиент не в локальной БД → phone_e164=None → excluded с no_phone.
+       Если клиент не в локальной БД → phone_e164 = _normalize_phone(ref.phone_raw).
+       Если и CRM phone не нормализуется → excluded с no_phone.
        ORM объекты конвертируются в ClientSnapshot до закрытия сессии.
     3. CRM API (один переиспользуемый HTTP client): для каждого клиента
        получить все записи → разбить на in-period и before-period.
@@ -431,7 +455,10 @@ async def find_candidates(
 
     Returns:
         Список ClientCandidate (eligible + excluded).
-        Пустой список если CRM discovery недоступен.
+
+    Raises:
+        CrmUnavailableError: если CRM company-period discovery API недоступен.
+            runner.py перехватывает это исключение и помечает run как failed.
     """
     # ------------------------------------------------------------------
     # Шаг 1. CRM discovery: кто побывал в компании за период?
@@ -449,13 +476,13 @@ async def find_candidates(
             )
         except CrmUnavailableError as exc:
             logger.error(
-                "segment: CRM discovery unavailable for company_id=%d period=[%s, %s): %s — returning []",
+                "segment: CRM discovery unavailable for company_id=%d period=[%s, %s): %s — failing run",
                 company_id,
                 period_start.date(),
                 period_end.date(),
                 exc,
             )
-            return []
+            raise
 
         if not crm_refs:
             logger.info(
@@ -505,14 +532,17 @@ async def find_candidates(
                         )
                     )
                 else:
-                    # CRM-only: not in local DB → no normalized phone → excluded с no_phone
+                    # CRM-only: not in local DB.
+                    # Попытаться нормализовать phone_raw из CRM как fallback.
+                    # Если нормализация не удалась — phone_e164=None → excluded с no_phone.
+                    crm_phone = _normalize_phone(ref.phone_raw)
                     snapshots.append(
                         ClientSnapshot(
                             id=None,
                             company_id=company_id,
                             altegio_client_id=ref.altegio_client_id,
                             display_name=ref.name,
-                            phone_e164=None,
+                            phone_e164=crm_phone,
                             wa_opted_out=False,
                         )
                     )

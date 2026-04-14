@@ -1275,30 +1275,75 @@ async def test_crm_only_client_excluded_with_no_phone(patched_db) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Тест R: CRM discovery недоступен → find_candidates возвращает []
+# Тест R: CRM discovery недоступен → find_candidates пробрасывает CrmUnavailableError
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_crm_discovery_unavailable_returns_empty(patched_db) -> None:
-    """Если CRM company-period API недоступен — find_candidates() возвращает [].
+    """Если CRM company-period API недоступен — find_candidates() пробрасывает CrmUnavailableError.
 
-    Безопасный failure mode: лучше не отправить никому, чем отправить
-    неправильным людям. Discovery failure ≠ «нет клиентов в периоде».
+    Это явный failure mode: ошибка discovery НЕ должна выглядеть как пустая выборка,
+    иначе ops не поймут, что произошёл сбой.
+    runner.py перехватывает CrmUnavailableError и помечает run как failed.
     """
     async with patched_db() as session:
         async with session.begin():
-            # Есть клиент в БД, но CRM discovery вернёт ошибку
             client = _make_client(altegio_client_id=_next_id())
             session.add(client)
             await session.flush()
             session.add(_make_record(client.id))
 
-    with _patch_crm_discovery(raise_error=True):
+    with _patch_crm_discovery(raise_error=True), pytest.raises(CrmUnavailableError):
+        await find_candidates(
+            company_id=COMPANY,
+            period_start=PERIOD_START,
+            period_end=PERIOD_END,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Тест S: CRM-only клиент с phone_raw → phone_e164 нормализуется, клиент eligible
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_crm_only_client_with_phone_raw_is_eligible(patched_db) -> None:
+    """CRM-only клиент с phone_raw становится eligible, если phone_raw нормализуем.
+
+    Сценарий: клиент посетил салон ДО запуска бота, в локальной БД нет записи.
+    CRM discovery возвращает ref с phone_raw (сырой номер из CRM API).
+    После нормализации (+digits) клиент получает phone_e164 и проходит проверку.
+
+    Это исправление корневой проблемы issue #59:
+    до этого CRM-only клиенты всегда excluded с no_phone.
+    """
+    crm_only_altegio_id = _next_id()  # ID не существует в локальной БД
+
+    # CRM discovery: клиент с raw phone (как из Altegio API)
+    discovery_refs = [
+        CrmClientRef(
+            altegio_client_id=crm_only_altegio_id,
+            name="Lalka Marinova",
+            phone_raw="49151 234 56789",  # сырой формат с пробелами
+        )
+    ]
+    # CRM per-client: 1 lash-запись в периоде, attendance=1, нет истории до периода
+    crm_records = [_crm_record(confirmed=1, attendance=1, service_ids=[LASH_SVC_ID])]
+
+    with _patch_crm(crm_records), _patch_lash(), _patch_crm_discovery(discovery_refs):
         result = await find_candidates(
             company_id=COMPANY,
             period_start=PERIOD_START,
             period_end=PERIOD_END,
         )
 
-    assert result == [], "При ошибке CRM discovery должен вернуться пустой список"
+    assert len(result) == 1
+    match = result[0]
+    assert match.local_client_found is False, "Клиента НЕТ в локальной БД"
+    assert match.client.id is None, "Snapshot id=None для CRM-only клиента"
+    assert match.client.phone_e164 == "+4915123456789", f"phone_raw нормализован неверно: {match.client.phone_e164}"
+    assert match.is_eligible, f"CRM-only клиент с валидным phone_raw должен быть eligible: {match.excluded_reason}"
+    assert match.lash_records_in_period == 1
+    assert match.confirmed_lash_records_in_period == 1
+    assert match.records_before_period == 0
