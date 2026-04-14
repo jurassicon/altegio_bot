@@ -39,6 +39,7 @@ from altegio_bot.campaigns.altegio_crm import (
     classify_crm_records,
     get_client_crm_records,
 )
+from altegio_bot.campaigns.segment import check_lash_services, compute_excluded_reason
 from altegio_bot.campaigns.followup import execute_followup, followup_run_at, plan_followup
 from altegio_bot.campaigns.reports import monthly_dashboard, run_report
 from altegio_bot.campaigns.runner import (
@@ -53,7 +54,7 @@ from altegio_bot.campaigns.runner import (
 from altegio_bot.db import SessionLocal
 from altegio_bot.models.models import CampaignRecipient, CampaignRun, Client, MessageJob, MessageTemplate, Record
 from altegio_bot.ops.auth import require_ops_auth
-from altegio_bot.service_filter import ServiceLookupError, is_lash_service
+from altegio_bot.service_filter import ServiceLookupError
 
 logger = logging.getLogger(__name__)
 
@@ -484,7 +485,7 @@ async def debug_client_segmentation(
     lash_count: int = 0
     attended_lash_count: int = 0
     confirmed_count: int = 0
-    lash_svc_ids: set[int] = set()
+    lash_svc_ids: frozenset[int] = frozenset()
     service_lookup_error: str | None = None
 
     try:
@@ -498,51 +499,34 @@ async def debug_client_segmentation(
             # 3. Разбить по периоду
             in_period_records, count_before = classify_crm_records(crm_records, period_start_utc, period_end_utc)
 
-            # 4. Классификация услуг (ресничные + посещённые)
-            unique_svc_ids: set[int] = set()
-            for rec in in_period_records:
-                unique_svc_ids.update(rec.service_ids)
-                if rec.is_confirmed:
-                    confirmed_count += 1
+            # 4. Подтверждённые записи (диагностика, не является критерием eligible)
+            confirmed_count = sum(1 for r in in_period_records if r.is_confirmed)
 
+            # 5. Ресничные и посещённые записи.
+            # Используем ту же функцию, что и основной segment pipeline — никакого расхождения.
             try:
-                for svc_id in unique_svc_ids:
-                    if await is_lash_service(company_id, svc_id, http):
-                        lash_svc_ids.add(svc_id)
+                lash_count, attended_lash_count, _, lash_svc_ids = await check_lash_services(
+                    http, company_id, in_period_records
+                )
             except ServiceLookupError as exc:
                 service_lookup_error = str(exc)
-
-            if service_lookup_error is None:
-                for rec in in_period_records:
-                    if any(sid in lash_svc_ids for sid in rec.service_ids):
-                        lash_count += 1
-                        if rec.is_attended:
-                            attended_lash_count += 1
 
     except CrmUnavailableError as exc:
         crm_error = str(exc)
 
     # ------------------------------------------------------------------
-    # 5. Итоговая классификация
+    # 6. Классификация.
+    # Используем ту же функцию, что и основной segment pipeline — никакого расхождения.
     # ------------------------------------------------------------------
-    excluded_reason: str | None = None
-
-    if crm_error:
-        excluded_reason = "crm_history_unavailable"
-    elif service_lookup_error:
-        excluded_reason = "service_category_unavailable"
-    elif local_client.wa_opted_out:
-        excluded_reason = "opted_out"
-    elif not local_client.phone_e164:
-        excluded_reason = "no_phone"
-    elif count_before > 0:
-        excluded_reason = "has_records_before_period"
-    elif lash_count == 0:
-        excluded_reason = "no_lash_record_in_period"
-    elif lash_count >= 2:
-        excluded_reason = "multiple_lash_records_in_period"
-    elif attended_lash_count == 0:
-        excluded_reason = "no_confirmed_lash_record_in_period"
+    excluded_reason: str | None = compute_excluded_reason(
+        wa_opted_out=bool(local_client.wa_opted_out),
+        phone_e164=local_client.phone_e164,
+        crm_unavailable=crm_error is not None,
+        service_unavailable=service_lookup_error is not None,
+        count_before=count_before,
+        lash_count=lash_count,
+        attended_lash_count=attended_lash_count,
+    )
 
     def _crm_rec_dict(r: CrmRecord) -> dict[str, Any]:
         return {
