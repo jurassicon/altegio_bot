@@ -705,7 +705,10 @@ async def _run_job_logic(
                     job.last_error = "Skipped: comeback_3d already sent in the last 30 days"
                     return
 
+    # Effective phone: local client takes priority; CRM-only campaign jobs store phone in payload.
     phone = client.phone_e164 if client else None
+    if phone is None:
+        phone = (getattr(job, "payload", None) or {}).get("phone_e164")
     if not phone:
         job.status = "failed"
         job.locked_at = None
@@ -733,10 +736,14 @@ async def _run_job_logic(
         job.last_error = f"Template render error: {exc}"
         return
 
-    loyalty_card_text = (getattr(job, "payload", None) or {}).get("loyalty_card_text", "")
+    _job_payload = getattr(job, "payload", None) or {}
+    loyalty_card_text = _job_payload.get("loyalty_card_text", "")
 
     if loyalty_card_text:
         msg_ctx["loyalty_card_text"] = loyalty_card_text
+
+    # Effective contact_name for Chatwoot mirror: prefer local client, then payload (CRM-only).
+    contact_name = client.display_name if client else _job_payload.get("contact_name")
 
     attempts = getattr(job, "attempts", 0) + 1
     setattr(job, "attempts", attempts)
@@ -794,7 +801,8 @@ async def _run_job_logic(
             language=TEMPLATE_LANGUAGE,
             params=template_params,
             fallback_text=final_body,
-            contact_name=client.display_name if client else None,
+            contact_name=contact_name,
+            company_id=job.company_id,
         )
         send_meta: dict[str, Any] = {
             "send_type": "template",
@@ -808,7 +816,8 @@ async def _run_job_logic(
             sender_id=sender_id,
             phone=phone,
             text=final_body,
-            contact_name=client.display_name if client else None,
+            contact_name=contact_name,
+            company_id=job.company_id,
         )
         send_meta = {"send_type": "text"}
 

@@ -190,7 +190,10 @@ async def execute_followup(run_id: int) -> dict:
         client_id = recipient.client_id
         recipient_id = recipient.id
 
-        if not client_id:
+        # Пропускаем только если нет ни локального клиента, ни телефона.
+        # CRM-only получатели (client_id=None, но phone_e164 есть) — обрабатываем:
+        # phone хранится в payload MessageJob, outbox_worker умеет его использовать.
+        if not client_id and not recipient.phone_e164:
             await _set_followup_status(
                 recipient_id,
                 "followup_skipped",
@@ -275,6 +278,19 @@ async def execute_followup(run_id: int) -> dict:
                     if current.followup_status != _FOLLOWUP_PROCESSING:
                         raise RuntimeError("recipient not claimed for follow-up")
 
+                    # Для CRM-only получателей (client_id=None) сохраняем phone_e164
+                    # в payload — outbox_worker использует его при отправке.
+                    followup_payload: dict = {
+                        "kind": FOLLOWUP_JOB_TYPE,
+                        "template_name": template_name,
+                        "campaign_run_id": run_id,
+                        "campaign_recipient_id": recipient_id,
+                    }
+                    if not current.client_id and current.phone_e164:
+                        followup_payload["phone_e164"] = current.phone_e164
+                        if current.display_name:
+                            followup_payload["contact_name"] = current.display_name
+
                     await add_job(
                         session,
                         company_id=company_id,
@@ -282,12 +298,7 @@ async def execute_followup(run_id: int) -> dict:
                         client_id=client_id,
                         job_type=FOLLOWUP_JOB_TYPE,
                         run_at=run_at,
-                        payload={
-                            "kind": FOLLOWUP_JOB_TYPE,
-                            "template_name": template_name,
-                            "campaign_run_id": run_id,
-                            "campaign_recipient_id": recipient_id,
-                        },
+                        payload=followup_payload,
                     )
 
                     dedupe_key = make_dedupe_key(
