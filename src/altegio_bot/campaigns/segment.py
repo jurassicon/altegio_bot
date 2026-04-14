@@ -2,7 +2,10 @@
 
   Клиент eligible только если:
   1. В периоде у него РОВНО ОДНА lash-запись (любого статуса, не удалённая).
-  2. Эта единственная lash-запись подтверждена (confirmed == 1).
+  2. Эта единственная lash-запись имеет статус «Пришел» (attendance == 1).
+     ВАЖНО: confirmed == 1 означает только «запись не отменена»; это НЕ то же
+     самое, что «клиент пришёл». Клиенты с будущими или несостоявшимися
+     записями имеют confirmed=1, но attendance=0 — они НЕ eligible.
   3. ДО начала периода у него нет НИ ОДНОЙ записи в Altegio CRM
      (любой услуги, любого статуса).
   4. Есть phone_e164.
@@ -31,9 +34,9 @@
 
 Множественность:
   - Если lash-записей в периоде >= 2 → multiple_lash_records_in_period (даже если
-    подтверждена только одна).
+    посещена только одна).
   - Если lash-записей == 0 → no_lash_record_in_period.
-  - Если lash-записей == 1 и она не подтверждена → no_confirmed_lash_record_in_period.
+  - Если lash-записей == 1 и attendance != 1 → no_confirmed_lash_record_in_period.
 
 CRM недоступность:
   - Если Altegio CRM API вернул ошибку → клиент получает excluded_reason =
@@ -45,7 +48,9 @@ Service lookup недоступность:
     Считать услугу non-lash и пропускать проверку НЕЛЬЗЯ — это даст
     ложно-eligible клиентов.
 
-Константа CONFIRMED_FLAG = 1 — единственная точка правды для «подтверждена».
+Константа ATTENDED_FLAG = 1 — единственная точка правды для «Пришел» (attendance).
+Константа CONFIRMED_FLAG = 1 — «запись не отменена» (confirmed); используется
+только в диагностических счётчиках, НЕ для определения eligible.
 """
 
 from __future__ import annotations
@@ -71,7 +76,9 @@ from altegio_bot.settings import settings
 
 logger = logging.getLogger(__name__)
 
-# Единственная точка правды: что считается «подтверждённой» записью.
+# «Пришел» (attendance=1) — единственный критерий eligible lash-записи.
+ATTENDED_FLAG = 1
+# «Подтверждена, не отменена» (confirmed=1) — диагностический счётчик; НЕ критерий eligible.
 CONFIRMED_FLAG = 1
 
 
@@ -102,11 +109,12 @@ class ClientCandidate:
     # --- Записи в периоде (из CRM) ---
     # Все не удалённые не-отменённые записи клиента в периоде
     total_records_in_period: int
-    # Подтверждённые записи (confirmed == CONFIRMED_FLAG)
+    # Подтверждённые записи (confirmed == CONFIRMED_FLAG) — диагностика
     confirmed_records_in_period: int
 
     # --- Ресничные записи в периоде (из CRM + category lookup) ---
     lash_records_in_period: int
+    # Посещённые lash-записи (attendance == ATTENDED_FLAG) — критерий eligible
     confirmed_lash_records_in_period: int
 
     # --- Услуги в периоде (для диагностики) ---
@@ -127,61 +135,94 @@ class ClientCandidate:
         return self.excluded_reason is None
 
 
-def _classify(candidate: ClientCandidate) -> None:
-    """Проставить excluded_reason по бизнес-правилам «Вариант А».
+def compute_excluded_reason(
+    *,
+    wa_opted_out: bool,
+    phone_e164: str | None,
+    crm_unavailable: bool = False,
+    service_unavailable: bool = False,
+    count_before: int,
+    lash_count: int,
+    attended_lash_count: int,
+) -> str | None:
+    """Вычислить excluded_reason по бизнес-правилам «Вариант А».
+
+    Единственная точка правды для логики классификации.
+    Используется и в основном pipeline (_classify / _process_one_client),
+    и в debug endpoint — что гарантирует их идентичное поведение.
 
     Порядок проверок важен: более приоритетные идут первыми.
-    crm_history_unavailable и service_category_unavailable устанавливаются
-    до вызова _classify() напрямую в find_candidates(), но здесь проверяем
-    для полноты.
+
+    Args:
+        wa_opted_out:       клиент отписался от WhatsApp рассылок.
+        phone_e164:         нормализованный номер телефона (или None).
+        crm_unavailable:    CRM API вернул ошибку.
+        service_unavailable: category lookup для услуг вернул ошибку.
+        count_before:       кол-во записей до начала периода.
+        lash_count:         кол-во ресничных записей в периоде.
+        attended_lash_count: кол-во ресничных записей со статусом «Пришел».
+
+    Returns:
+        excluded_reason строкой, или None если клиент eligible.
+    """
+    if wa_opted_out:
+        return "opted_out"
+    if not phone_e164:
+        return "no_phone"
+    if crm_unavailable:
+        return "crm_history_unavailable"
+    if service_unavailable:
+        return "service_category_unavailable"
+    if count_before > 0:
+        return "has_records_before_period"
+    if lash_count == 0:
+        return "no_lash_record_in_period"
+    # 2+ lash-записей — excluded даже если одна из них с attendance=1
+    if lash_count >= 2:
+        return "multiple_lash_records_in_period"
+    if attended_lash_count == 0:
+        return "no_confirmed_lash_record_in_period"
+    return None
+
+
+def _classify(candidate: ClientCandidate) -> None:
+    """Проставить excluded_reason через compute_excluded_reason.
+
+    Обёртка над compute_excluded_reason, сохраняющая результат в candidate.
+    Вызывается только когда CRM и service lookup доступны (crm/service_unavailable=False):
+    эти случаи обрабатываются раньше через _make_excluded_candidate().
+    Проверка candidate.excluded_reason — защитная: при нормальном flow он None.
     """
     client = candidate.client
-
-    if client.wa_opted_out:
-        candidate.excluded_reason = "opted_out"
-        return
-
-    if not client.phone_e164:
-        candidate.excluded_reason = "no_phone"
-        return
-
-    # crm_history_unavailable / service_category_unavailable — установлены ранее
-    if candidate.excluded_reason in ("crm_history_unavailable", "service_category_unavailable"):
-        return
-
-    # Клиент с историей до периода — не новый
-    if candidate.records_before_period > 0:
-        candidate.excluded_reason = "has_records_before_period"
-        return
-
-    # Нет ресничных записей в периоде вообще
-    if candidate.lash_records_in_period == 0:
-        candidate.excluded_reason = "no_lash_record_in_period"
-        return
-
-    # 2+ lash-записей в периоде (включая неподтверждённые) — не подходит
-    # Правило строгое: даже если только 1 подтверждена, 2+ записей → excluded
-    if candidate.lash_records_in_period >= 2:
-        candidate.excluded_reason = "multiple_lash_records_in_period"
-        return
-
-    # Ровно 1 lash-запись в периоде, но она не подтверждена
-    if candidate.confirmed_lash_records_in_period == 0:
-        candidate.excluded_reason = "no_confirmed_lash_record_in_period"
-        return
-
-    # Клиент прошёл все проверки — eligible
+    candidate.excluded_reason = compute_excluded_reason(
+        wa_opted_out=client.wa_opted_out,
+        phone_e164=client.phone_e164,
+        crm_unavailable=candidate.excluded_reason == "crm_history_unavailable",
+        service_unavailable=candidate.excluded_reason == "service_category_unavailable",
+        count_before=candidate.records_before_period,
+        lash_count=candidate.lash_records_in_period,
+        attended_lash_count=candidate.confirmed_lash_records_in_period,
+    )
 
 
-async def _check_lash_services(
+async def check_lash_services(
     http_client: httpx.AsyncClient,
     company_id: int,
     crm_records: list[CrmRecord],
-) -> tuple[int, int, list[str]]:
+) -> tuple[int, int, list[str], frozenset[int]]:
     """Подсчитать ресничные записи и собрать названия услуг.
 
+    Публичная функция: используется как в основном pipeline (_process_one_client),
+    так и в debug endpoint — гарантирует идентичную lash-логику в обоих местах.
+
     Возвращает:
-        (lash_records_in_period, confirmed_lash_records_in_period, service_titles)
+        (lash_count, attended_lash_count, service_titles, lash_svc_ids)
+
+        lash_count              — все не удалённые lash-записи в периоде.
+        attended_lash_count     — lash-записи со статусом «Пришел»
+                                  (attendance == ATTENDED_FLAG). Критерий eligible.
+        service_titles          — уникальные названия услуг (для диагностики).
+        lash_svc_ids            — frozenset ID ресничных услуг (для debug-вывода).
 
     Raises:
         ServiceLookupError: если Altegio service category API недоступен.
@@ -195,12 +236,12 @@ async def _check_lash_services(
         unique_svc_ids.update(rec.service_ids)
 
     # Определить lash service_id через category lookup с кешем
-    lash_svc_ids: set[int] = set()
+    _lash_svc_ids: set[int] = set()
     if has_lash_config:
         for svc_id in unique_svc_ids:
             # ServiceLookupError propagates to caller — не глотаем!
             if await is_lash_service(company_id, svc_id, http_client):
-                lash_svc_ids.add(svc_id)
+                _lash_svc_ids.add(svc_id)
     else:
         logger.warning(
             "No LASH_CATEGORY_IDS_BY_COMPANY for company_id=%d — lash filter disabled",
@@ -208,18 +249,20 @@ async def _check_lash_services(
         )
 
     lash_count = 0
-    confirmed_lash_count = 0
+    attended_lash_count = 0
     titles: set[str] = set()
 
     for rec in crm_records:
-        has_lash = any(sid in lash_svc_ids for sid in rec.service_ids)
+        has_lash = any(sid in _lash_svc_ids for sid in rec.service_ids)
         if has_lash:
             lash_count += 1
-            if rec.is_confirmed:
-                confirmed_lash_count += 1
+            # Критерий eligible: attendance == 1 («Пришел»), а не просто confirmed == 1.
+            # confirmed=1 лишь означает «запись не отменена» — это НЕ эквивалент явки.
+            if rec.is_attended:
+                attended_lash_count += 1
         titles.update(t for t in rec.service_titles if t)
 
-    return lash_count, confirmed_lash_count, sorted(titles)
+    return lash_count, attended_lash_count, sorted(titles), frozenset(_lash_svc_ids)
 
 
 def _make_excluded_candidate(snapshot: ClientSnapshot, reason: str) -> ClientCandidate:
@@ -295,7 +338,7 @@ async def _process_one_client(
 
             # Ресничные записи и названия услуг
             try:
-                lash_count, confirmed_lash_count, service_titles = await _check_lash_services(
+                lash_count, confirmed_lash_count, service_titles, _ = await check_lash_services(
                     http, company_id, in_period_records
                 )
             except ServiceLookupError as exc:
@@ -317,6 +360,20 @@ async def _process_one_client(
                 local_client_found=True,
             )
             _classify(c)
+            logger.debug(
+                "segment debug: client_id=%s altegio_client_id=%s "
+                "records_before=%d total_in_period=%d "
+                "lash_in_period=%d attended_lash_in_period=%d "
+                "services=%r → %s",
+                snapshot.id,
+                snapshot.altegio_client_id,
+                count_before,
+                total_in_period,
+                lash_count,
+                confirmed_lash_count,
+                service_titles,
+                c.excluded_reason if c.excluded_reason else "ELIGIBLE",
+            )
             return c
 
     except Exception:

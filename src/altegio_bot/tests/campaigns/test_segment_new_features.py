@@ -55,11 +55,13 @@ def _make_snapshot(**kw) -> ClientSnapshot:
     return ClientSnapshot(**defaults)
 
 
-def _crm_record(*, days_offset: int = 5, confirmed: int = 1, service_ids=None) -> CrmRecord:
+def _crm_record(*, days_offset: int = 5, confirmed: int = 1, attendance: int = 1, service_ids=None) -> CrmRecord:
+    """По умолчанию confirmed=1 AND attendance=1 — клиент пришёл («Пришел»)."""
     return CrmRecord(
         crm_id=_next_id(),
         starts_at=PERIOD_START + timedelta(days=days_offset),
         confirmed=confirmed,
+        attendance=attendance,
         deleted=False,
         service_ids=service_ids or [99001],
         service_titles=["Wimpernverlängerung"],
