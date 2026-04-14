@@ -2631,6 +2631,16 @@ async def ops_campaigns_list(request: Request) -> str:
         total_stmt = select(func.count()).select_from(CampaignRun).where(*conditions)
         total: int = (await session.scalar(total_stmt)) or 0
 
+        # Batch-check which preview runs are already used by a send-real
+        preview_ids = {r.id for r in runs if r.mode == "preview"}
+        used_as_source_ids: set[int] = set()
+        if preview_ids:
+            src_stmt = select(CampaignRun.source_preview_run_id).where(
+                CampaignRun.source_preview_run_id.in_(preview_ids),
+                CampaignRun.mode == "send-real",
+            )
+            used_as_source_ids = {row[0] for row in (await session.execute(src_stmt)).all() if row[0] is not None}
+
     filter_form = _filter_form(
         "/ops/campaigns",
         [
@@ -2660,8 +2670,10 @@ async def ops_campaigns_list(request: Request) -> str:
     for run in runs:
         meta = run.meta or {}
         last_error = meta.get("last_error", "")
-        # Действия зависят от режима и статуса
-        if run.mode == "preview" and run.status not in ("discarded", "deleted"):
+        # Действия зависят от режима, статуса и признака used_as_source
+        is_used = run.id in used_as_source_ids
+        if run.mode == "preview" and run.status == "completed" and not is_used:
+            # Editable: Run / Discard / Delete / (can edit snapshot)
             actions = (
                 f'<a href="/ops/campaigns/{run.id}" class="btn btn-sm btn-outline-primary me-1">open</a>'
                 f'<button class="btn btn-sm btn-success me-1" '
@@ -2671,17 +2683,37 @@ async def ops_campaigns_list(request: Request) -> str:
                 f'onclick="discardPreview({run.id})" title="Discard this preview">'
                 f"⊘ Discard</button>"
                 f'<button class="btn btn-sm btn-outline-danger" '
-                f'onclick="deletePreview({run.id})" title="Delete this preview permanently">'
+                f'onclick="deletePreview({run.id})" title="Delete this preview">'
                 f"🗑 Delete</button>"
             )
-        elif run.mode == "preview" and run.status in ("discarded",):
+        elif run.mode == "preview" and run.status == "completed" and is_used:
+            # Used as source — can discard/delete but snapshot is locked
+            actions = (
+                f'<a href="/ops/campaigns/{run.id}" class="btn btn-sm btn-outline-primary me-1">open</a>'
+                f'<button class="btn btn-sm btn-outline-warning me-1" '
+                f'onclick="discardPreview({run.id})">'
+                f"⊘ Discard</button>"
+                f'<button class="btn btn-sm btn-outline-danger" '
+                f'onclick="deletePreview({run.id})">'
+                f"🗑 Delete</button>"
+            )
+        elif run.mode == "preview" and run.status == "running":
+            # Running — no edit actions; snapshot being built
+            actions = (
+                f'<a href="/ops/campaigns/{run.id}" class="btn btn-sm btn-outline-primary me-1">open</a>'
+                f'<span class="text-muted small">running…</span>'
+            )
+        elif run.mode == "preview" and run.status == "discarded":
             actions = (
                 f'<a href="/ops/campaigns/{run.id}" class="btn btn-sm btn-outline-secondary me-1">open</a>'
-                f'<button class="btn btn-sm btn-outline-danger btn-sm" '
-                f'onclick="deletePreview({run.id})" title="Delete this preview permanently">'
+                f'<button class="btn btn-sm btn-outline-danger" '
+                f'onclick="deletePreview({run.id})" title="Delete this preview">'
                 f"🗑 Delete</button>"
             )
         elif run.mode == "preview" and run.status == "deleted":
+            actions = f'<a href="/ops/campaigns/{run.id}" class="btn btn-sm btn-outline-secondary">open</a>'
+        elif run.mode == "preview":
+            # failed / queued / other preview states
             actions = f'<a href="/ops/campaigns/{run.id}" class="btn btn-sm btn-outline-secondary">open</a>'
         else:
             actions = f'<a href="/ops/campaigns/{run.id}" class="btn btn-sm btn-outline-primary">open</a>'
@@ -3769,6 +3801,19 @@ async def ops_campaign_run_detail(run_id: int) -> str:
         recipients_by_status: dict[str, int] = {row.status: int(row.cnt) for row in recipient_rows}
         recipients_total = sum(recipients_by_status.values())
 
+        # Проверить, используется ли preview как источник для send-real
+        used_as_source = False
+        if run.mode == "preview":
+            src_count = await session.scalar(
+                select(func.count())
+                .select_from(CampaignRun)
+                .where(
+                    CampaignRun.source_preview_run_id == run_id,
+                    CampaignRun.mode == "send-real",
+                )
+            )
+            used_as_source = int(src_count or 0) > 0
+
     meta = run.meta or {}
     last_error = meta.get("last_error")
 
@@ -3788,6 +3833,13 @@ async def ops_campaign_run_detail(run_id: int) -> str:
             "Этот preview-run был удалён (soft-delete). Данные сохранены для аудита."
             "</div>"
         )
+    elif run.mode == "preview" and run.status == "running":
+        preview_actions_block = (
+            '<div class="alert alert-info mb-3">'
+            "Preview запускается — snapshot ещё строится. "
+            "Редактирование, удаление и добавление получателей недоступны до завершения."
+            "</div>"
+        )
     elif run.mode == "preview" and run.status == "discarded":
         preview_actions_block = f"""
 <div class="alert alert-secondary d-flex align-items-center gap-3 mb-3">
@@ -3796,7 +3848,20 @@ async def ops_campaign_run_detail(run_id: int) -> str:
           onclick="deleteAndRedirect({run_id})">🗑 Удалить окончательно</button>
 </div>
 """
-    elif run.mode == "preview" and run.status in ("completed", "running"):
+    elif run.mode == "preview" and run.status == "completed" and used_as_source:
+        # Snapshot used by send-real — can still discard/delete, but no editing
+        preview_actions_block = f"""
+<div class="alert alert-warning d-flex align-items-center gap-3 mb-3 flex-wrap">
+  <span>Preview уже использован для send-real. Редактирование snapshot заблокировано.</span>
+  <a href="/ops/campaigns/new-clients?from_preview={run_id}"
+     class="btn btn-success btn-sm">▶ Run again</a>
+  <button class="btn btn-outline-warning btn-sm"
+          onclick="discardAndRefresh({run_id})">⊘ Discard</button>
+  <button class="btn btn-outline-danger btn-sm"
+          onclick="deleteAndRedirect({run_id})">🗑 Delete</button>
+</div>
+"""
+    elif run.mode == "preview" and run.status == "completed":
         preview_actions_block = f"""
 <div class="alert alert-info d-flex align-items-center gap-3 mb-3 flex-wrap">
   <span>Это preview-run. Запустите send-real или отредактируйте snapshot.</span>
@@ -3831,11 +3896,10 @@ async def ops_campaign_run_detail(run_id: int) -> str:
 </div>
 """
     elif run.mode == "preview":
+        # failed / queued / other — no editing, no delete
         preview_actions_block = f"""
-<div class="alert alert-warning d-flex align-items-center gap-3 mb-3">
-  <span>Preview run (status={run.status}).</span>
-  <button class="btn btn-outline-danger btn-sm"
-          onclick="deleteAndRedirect({run_id})">🗑 Delete</button>
+<div class="alert alert-secondary mb-3">
+  <span>Preview run (status={run.status!r}). Действия недоступны.</span>
 </div>
 """
 
@@ -4147,6 +4211,19 @@ async def ops_campaign_recipients(request: Request, run_id: int) -> str:
                 '<div class="alert alert-danger">Campaign run not found.</div>',
             )
 
+        # Check if snapshot is still editable (not used by send-real)
+        used_as_source = False
+        if run.mode == "preview":
+            src_count = await session.scalar(
+                select(func.count())
+                .select_from(CampaignRun)
+                .where(
+                    CampaignRun.source_preview_run_id == run_id,
+                    CampaignRun.mode == "send-real",
+                )
+            )
+            used_as_source = int(src_count or 0) > 0
+
         conditions: list[Any] = [CampaignRecipient.campaign_run_id == run_id]
         if status_filter:
             conditions.append(CampaignRecipient.status == status_filter)
@@ -4173,8 +4250,8 @@ async def ops_campaign_recipients(request: Request, run_id: int) -> str:
         ],
     )
 
-    # Для preview-run (completed/running, не used as source) — показывать кнопку Remove
-    is_editable_preview = run.mode == "preview" and run.status in ("completed", "running")
+    # Remove button только для completed preview, не используемого send-real
+    is_editable_preview = run.mode == "preview" and run.status == "completed" and not used_as_source
 
     base_cols = [
         "ID",

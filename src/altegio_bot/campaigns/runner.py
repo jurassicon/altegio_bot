@@ -1428,6 +1428,9 @@ async def delete_preview_run(run_id: int) -> None:
             if run.status == "deleted":
                 raise ValueError(f"CampaignRun {run_id} уже удалён")
 
+            if run.status not in ("completed", "discarded"):
+                raise ValueError(f"Delete доступен только для completed или discarded preview. status={run.status!r}")
+
             used_as_source = await session.scalar(
                 select(func.count())
                 .select_from(CampaignRun)
@@ -1478,9 +1481,9 @@ async def remove_recipient_from_preview(
             if run.mode != "preview":
                 raise ValueError(f"Редактирование snapshot доступно только для preview run. mode={run.mode!r}")
 
-            if run.status not in ("completed", "running"):
+            if run.status != "completed":
                 raise ValueError(
-                    f"Редактирование snapshot доступно только для completed/running preview. status={run.status!r}"
+                    f"Редактирование snapshot доступно только для completed preview. status={run.status!r}"
                 )
 
             used_as_source = await session.scalar(

@@ -1066,8 +1066,18 @@ async def list_runs(
         )
         runs = (await session.execute(data_stmt)).scalars().all()
 
+        # Batch-check which preview runs are already used as source by a send-real
+        preview_ids = {r.id for r in runs if r.mode == "preview"}
+        used_as_source_ids: set[int] = set()
+        if preview_ids:
+            src_stmt = select(CampaignRun.source_preview_run_id).where(
+                CampaignRun.source_preview_run_id.in_(preview_ids),
+                CampaignRun.mode == "send-real",
+            )
+            used_as_source_ids = {row[0] for row in (await session.execute(src_stmt)).all() if row[0] is not None}
+
     return {
-        "items": [_run_summary(r) for r in runs],
+        "items": [_run_summary(r, used_as_source=(r.id in used_as_source_ids)) for r in runs],
         "total": total,
         "offset": offset,
         "limit": limit,
@@ -1092,8 +1102,19 @@ async def get_run(run_id: int) -> dict[str, Any]:
             raise HTTPException(status_code=404, detail="Run not found")
         execution_job = await _fetch_execution_job(session, run_id)
         progress = await _fetch_progress(session, run_id, run.total_clients_seen or 0)
+        used_as_source = False
+        if run.mode == "preview":
+            src_count = await session.scalar(
+                select(func.count())
+                .select_from(CampaignRun)
+                .where(
+                    CampaignRun.source_preview_run_id == run_id,
+                    CampaignRun.mode == "send-real",
+                )
+            )
+            used_as_source = int(src_count or 0) > 0
 
-    result = _run_detail(run)
+    result = _run_detail(run, used_as_source=used_as_source)
     result["execution_job"] = execution_job
     result["progress"] = progress
     result["followup_auto"] = _followup_auto(run)
@@ -1471,10 +1492,10 @@ async def add_recipient(run_id: int, body: AddRecipientRequest) -> dict[str, Any
             status_code=400,
             detail="Add recipient доступен только для preview run",
         )
-    if run.status not in ("completed", "running"):
+    if run.status != "completed":
         raise HTTPException(
             status_code=400,
-            detail=f"Run status={run.status!r} не позволяет редактирование snapshot",
+            detail=f"Add recipient доступен только для completed preview. status={run.status!r}",
         )
 
     async with SessionLocal() as session:
@@ -1863,7 +1884,7 @@ def _followup_auto(run: CampaignRun) -> dict[str, Any] | None:
     }
 
 
-def _run_summary(run: CampaignRun) -> dict[str, Any]:
+def _run_summary(run: CampaignRun, *, used_as_source: bool = False) -> dict[str, Any]:
     """Краткая сводка по run для списков."""
     return {
         "id": run.id,
@@ -1885,8 +1906,10 @@ def _run_summary(run: CampaignRun) -> dict[str, Any]:
         # Preview-специфичные поля
         "is_preview": run.mode == "preview",
         "is_discardable": (run.mode == "preview" and run.status not in ("discarded", "deleted")),
-        "is_deletable": (run.mode == "preview" and run.status != "deleted"),
-        "is_snapshot_editable": (run.mode == "preview" and run.status in ("completed", "running")),
+        # delete allowed only for stable terminal states (not running — race condition risk)
+        "is_deletable": (run.mode == "preview" and run.status in ("completed", "discarded") and not used_as_source),
+        # snapshot editing (add/remove) requires completed + not yet used for send-real
+        "is_snapshot_editable": (run.mode == "preview" and run.status == "completed" and not used_as_source),
         "excluded": {
             "opted_out": run.excluded_opted_out or 0,
             "no_phone": run.excluded_no_phone or 0,
@@ -1901,9 +1924,9 @@ def _run_summary(run: CampaignRun) -> dict[str, Any]:
     }
 
 
-def _run_detail(run: CampaignRun) -> dict[str, Any]:
+def _run_detail(run: CampaignRun, *, used_as_source: bool = False) -> dict[str, Any]:
     """Полная информация по run."""
-    base = _run_summary(run)
+    base = _run_summary(run, used_as_source=used_as_source)
     base.update(
         {
             "location_id": run.location_id,

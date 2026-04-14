@@ -10,6 +10,11 @@
   7. send-real from edited preview uses edited snapshot (manual_removed пропускается).
   8. manual_removed reason appears in /recipients JSON.
   9. deleted run исчезает из /runs по умолчанию, но виден при include_deleted=true.
+ 10. delete_preview_run — forbidden for running preview (race condition guard).
+ 11. remove_recipient — forbidden for running preview.
+ 12. add_recipient — forbidden for running preview (via HTTP).
+ 13. summary flags: running preview not marked editable/deletable.
+ 14. summary flags: used-as-source preview not marked editable/deletable.
 """
 
 from __future__ import annotations
@@ -412,3 +417,102 @@ async def test_deleted_run_hidden_from_list(http_client: AsyncClient, session_ma
     assert resp2.status_code == 200
     ids_with_deleted = [r["id"] for r in resp2.json()["items"]]
     assert run_id in ids_with_deleted, "deleted run must appear when include_deleted=true"
+
+
+# ---------------------------------------------------------------------------
+# 10. delete_preview_run forbidden for running preview (race condition guard)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_delete_preview_forbidden_for_running(session_maker, monkeypatch) -> None:
+    """delete_preview_run запрещено для running preview — race condition с run_preview()."""
+    monkeypatch.setattr(runner_module, "SessionLocal", session_maker)
+
+    run_id = await _make_preview_run(session_maker, status="running")
+
+    with pytest.raises(ValueError, match="completed"):
+        await delete_preview_run(run_id)
+
+    async with session_maker() as session:
+        run = await session.get(CampaignRun, run_id)
+    assert run.status == "running", "status must remain 'running'"
+
+
+# ---------------------------------------------------------------------------
+# 11. remove_recipient forbidden for running preview
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_remove_recipient_forbidden_for_running(session_maker, monkeypatch) -> None:
+    """remove_recipient_from_preview запрещено для running preview."""
+    monkeypatch.setattr(runner_module, "SessionLocal", session_maker)
+
+    run_id = await _make_preview_run(session_maker, status="running")
+    recipient_id = await _make_recipient(session_maker, run_id=run_id, status="candidate")
+
+    with pytest.raises(ValueError, match="completed"):
+        await remove_recipient_from_preview(run_id, recipient_id)
+
+    async with session_maker() as session:
+        r = await session.get(CampaignRecipient, recipient_id)
+    assert r.status == "candidate", "recipient status must not change"
+
+
+# ---------------------------------------------------------------------------
+# 12. add_recipient forbidden for running preview (via HTTP 400)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_add_recipient_forbidden_for_running(http_client: AsyncClient, session_maker) -> None:
+    """POST /runs/{id}/recipients/add → 400 для running preview."""
+    run_id = await _make_preview_run(session_maker, status="running")
+
+    resp = await http_client.post(
+        f"/ops/campaigns/runs/{run_id}/recipients/add",
+        json={"phone": "+491234567890", "altegio_client_id": 9999},
+    )
+
+    assert resp.status_code == 400, resp.text
+    assert "completed" in resp.text.lower()
+
+
+# ---------------------------------------------------------------------------
+# 13. summary flags: running preview NOT marked editable/deletable
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_summary_flags_running_not_editable(http_client: AsyncClient, session_maker) -> None:
+    """GET /runs/{id} → is_snapshot_editable=False, is_deletable=False для running preview."""
+    run_id = await _make_preview_run(session_maker, status="running")
+
+    resp = await http_client.get(f"/ops/campaigns/runs/{run_id}")
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+
+    assert data["is_snapshot_editable"] is False, "running preview must not be marked editable"
+    assert data["is_deletable"] is False, "running preview must not be marked deletable"
+    # discardable is still True — discard does not edit the snapshot
+    assert data["is_discardable"] is True
+
+
+# ---------------------------------------------------------------------------
+# 14. summary flags: used-as-source preview NOT marked editable/deletable
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_summary_flags_used_source_not_editable(http_client: AsyncClient, session_maker) -> None:
+    """GET /runs/{id} → is_snapshot_editable=False, is_deletable=False если уже used_as_source."""
+    preview_id = await _make_preview_run(session_maker, status="completed")
+    await _make_send_real_run(session_maker, source_preview_run_id=preview_id)
+
+    resp = await http_client.get(f"/ops/campaigns/runs/{preview_id}")
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+
+    assert data["is_snapshot_editable"] is False, "used-as-source preview must not be editable"
+    assert data["is_deletable"] is False, "used-as-source preview must not be deletable"
