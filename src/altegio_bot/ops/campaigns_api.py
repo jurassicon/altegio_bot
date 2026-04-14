@@ -7,6 +7,7 @@ Endpoint'ы:
   GET  /ops/campaigns/new-clients/card-types
   POST /ops/campaigns/new-clients/preview
   POST /ops/campaigns/new-clients/run
+  GET  /ops/campaigns/debug-client
   GET  /ops/campaigns/runs
   GET  /ops/campaigns/runs/{run_id}
   GET  /ops/campaigns/runs/{run_id}/progress
@@ -25,12 +26,19 @@ import re
 from datetime import datetime, timezone
 from typing import Any, Literal
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.altegio_loyalty import AltegioLoyaltyClient
+from altegio_bot.campaigns.altegio_crm import (
+    CrmRecord,
+    CrmUnavailableError,
+    classify_crm_records,
+    get_client_crm_records,
+)
 from altegio_bot.campaigns.followup import execute_followup, followup_run_at, plan_followup
 from altegio_bot.campaigns.reports import monthly_dashboard, run_report
 from altegio_bot.campaigns.runner import (
@@ -43,8 +51,9 @@ from altegio_bot.campaigns.runner import (
     run_preview,
 )
 from altegio_bot.db import SessionLocal
-from altegio_bot.models.models import CampaignRecipient, CampaignRun, MessageJob, MessageTemplate
+from altegio_bot.models.models import CampaignRecipient, CampaignRun, Client, MessageJob, MessageTemplate, Record
 from altegio_bot.ops.auth import require_ops_auth
+from altegio_bot.service_filter import ServiceLookupError, is_lash_service
 
 logger = logging.getLogger(__name__)
 
@@ -364,6 +373,225 @@ async def get_card_types_for_location(
         raise HTTPException(status_code=502, detail=f"Altegio API error: {exc}")
     finally:
         await client.aclose()
+
+
+# ==========================================================================
+# Debug: диагностика сегментации для конкретного клиента
+# ==========================================================================
+
+
+def _debug_normalize_phone(raw: str) -> str | None:
+    """Нормализовать телефон в формат E.164 (+цифры). None если пустой."""
+    digits = re.sub(r"\D+", "", raw)
+    return f"+{digits}" if digits else None
+
+
+def _debug_parse_dt(value: str) -> datetime:
+    """Распарсить ISO datetime строку → UTC datetime.
+
+    Принимает любой ISO 8601 формат, включая «2026-03-01T00:00:00+00:00»
+    и «2026-03-01T00:00:00Z». Используется вместо FastAPI datetime Query
+    чтобы избежать 422 при передаче «+00:00» в query string.
+    """
+    # Заменить Z → +00:00 для совместимости с fromisoformat
+    v = value.strip().replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(v)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Невалидный формат datetime: {value!r} — {exc}")
+    return _ensure_utc(dt)
+
+
+@router.get("/debug-client")
+async def debug_client_segmentation(
+    company_id: int = Query(..., description="Altegio company ID"),
+    phone: str = Query(..., description="Номер телефона клиента (любой формат)"),
+    period_start: str = Query(..., description="Начало периода (ISO 8601, UTC)"),
+    period_end: str = Query(..., description="Конец периода (ISO 8601, UTC)"),
+) -> dict[str, Any]:
+    """Диагностика сегментации для конкретного клиента.
+
+    Возвращает пошаговую диагностику: локальный клиент, CRM-записи,
+    разбивку по периоду/до периода, ресничные/посещённые записи и итоговый вывод.
+
+    Используется для отладки false positive / false negative случаев.
+    Делает живой запрос к Altegio CRM API.
+    """
+    period_start_utc = _debug_parse_dt(period_start)
+    period_end_utc = _debug_parse_dt(period_end)
+
+    phone_e164 = _debug_normalize_phone(phone)
+    if not phone_e164:
+        raise HTTPException(status_code=400, detail=f"Не удалось нормализовать телефон: {phone!r}")
+
+    # ------------------------------------------------------------------
+    # 1. Локальный клиент и его записи в периоде
+    # ------------------------------------------------------------------
+    async with SessionLocal() as session:
+        client_stmt = select(Client).where(Client.company_id == company_id, Client.phone_e164 == phone_e164).limit(1)
+        local_client: Client | None = (await session.execute(client_stmt)).scalar_one_or_none()
+
+        local_records_in_period: list[Record] = []
+        if local_client is not None:
+            rec_stmt = (
+                select(Record)
+                .where(
+                    Record.company_id == company_id,
+                    Record.client_id == local_client.id,
+                    Record.starts_at >= period_start_utc,
+                    Record.starts_at < period_end_utc,
+                    Record.is_deleted.is_(False),
+                )
+                .order_by(Record.starts_at.asc())
+            )
+            local_records_in_period = list((await session.execute(rec_stmt)).scalars().all())
+
+    local_client_dict: dict[str, Any] | None = None
+    if local_client is not None:
+        local_client_dict = {
+            "id": local_client.id,
+            "company_id": local_client.company_id,
+            "altegio_client_id": local_client.altegio_client_id,
+            "phone_e164": local_client.phone_e164,
+            "display_name": local_client.display_name,
+            "wa_opted_out": bool(local_client.wa_opted_out),
+        }
+
+    if local_client is None or local_client.altegio_client_id is None:
+        return {
+            "phone_e164": phone_e164,
+            "local_client": local_client_dict,
+            "error": (
+                "Клиент не найден в локальной БД"
+                if local_client is None
+                else "altegio_client_id отсутствует у клиента в локальной БД"
+            ),
+            "local_records_in_period": [],
+            "crm_records": None,
+            "classification": None,
+            "eligibility": {"is_eligible": False, "excluded_reason": "crm_history_unavailable"},
+        }
+
+    altegio_client_id: int = int(local_client.altegio_client_id)
+
+    # ------------------------------------------------------------------
+    # 2. CRM-записи (все записи клиента)
+    # ------------------------------------------------------------------
+    crm_error: str | None = None
+    crm_records: list[CrmRecord] = []
+    in_period_records: list[CrmRecord] = []
+    count_before: int = 0
+    lash_count: int = 0
+    attended_lash_count: int = 0
+    confirmed_count: int = 0
+    lash_svc_ids: set[int] = set()
+    service_lookup_error: str | None = None
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as http:
+            crm_records = await get_client_crm_records(
+                http,
+                company_id=company_id,
+                altegio_client_id=altegio_client_id,
+            )
+
+            # 3. Разбить по периоду
+            in_period_records, count_before = classify_crm_records(crm_records, period_start_utc, period_end_utc)
+
+            # 4. Классификация услуг (ресничные + посещённые)
+            unique_svc_ids: set[int] = set()
+            for rec in in_period_records:
+                unique_svc_ids.update(rec.service_ids)
+                if rec.is_confirmed:
+                    confirmed_count += 1
+
+            try:
+                for svc_id in unique_svc_ids:
+                    if await is_lash_service(company_id, svc_id, http):
+                        lash_svc_ids.add(svc_id)
+            except ServiceLookupError as exc:
+                service_lookup_error = str(exc)
+
+            if service_lookup_error is None:
+                for rec in in_period_records:
+                    if any(sid in lash_svc_ids for sid in rec.service_ids):
+                        lash_count += 1
+                        if rec.is_attended:
+                            attended_lash_count += 1
+
+    except CrmUnavailableError as exc:
+        crm_error = str(exc)
+
+    # ------------------------------------------------------------------
+    # 5. Итоговая классификация
+    # ------------------------------------------------------------------
+    excluded_reason: str | None = None
+
+    if crm_error:
+        excluded_reason = "crm_history_unavailable"
+    elif service_lookup_error:
+        excluded_reason = "service_category_unavailable"
+    elif local_client.wa_opted_out:
+        excluded_reason = "opted_out"
+    elif not local_client.phone_e164:
+        excluded_reason = "no_phone"
+    elif count_before > 0:
+        excluded_reason = "has_records_before_period"
+    elif lash_count == 0:
+        excluded_reason = "no_lash_record_in_period"
+    elif lash_count >= 2:
+        excluded_reason = "multiple_lash_records_in_period"
+    elif attended_lash_count == 0:
+        excluded_reason = "no_confirmed_lash_record_in_period"
+
+    def _crm_rec_dict(r: CrmRecord) -> dict[str, Any]:
+        return {
+            "crm_id": r.crm_id,
+            "starts_at": r.starts_at.isoformat() if r.starts_at else None,
+            "confirmed": r.confirmed,
+            "attendance": r.attendance,
+            "deleted": r.deleted,
+            "is_confirmed": r.is_confirmed,
+            "is_attended": r.is_attended,
+            "service_ids": r.service_ids,
+            "service_titles": r.service_titles,
+        }
+
+    return {
+        "phone_e164": phone_e164,
+        "local_client": local_client_dict,
+        "local_records_in_period": [
+            {
+                "id": r.id,
+                "altegio_record_id": r.altegio_record_id,
+                "starts_at": r.starts_at.isoformat() if r.starts_at else None,
+                "confirmed": r.confirmed,
+                "attendance": r.attendance,
+                "visit_attendance": r.visit_attendance,
+                "is_deleted": r.is_deleted,
+            }
+            for r in local_records_in_period
+        ],
+        "crm_error": crm_error,
+        "crm_records_total": len(crm_records),
+        "crm_records": [_crm_rec_dict(r) for r in crm_records],
+        "classification": None
+        if crm_error
+        else {
+            "count_before_period": count_before,
+            "in_period_records": [_crm_rec_dict(r) for r in in_period_records],
+            "total_in_period": len(in_period_records),
+            "confirmed_in_period": confirmed_count,
+            "lash_records_in_period": lash_count,
+            "attended_lash_records_in_period": attended_lash_count,
+            "service_lookup_error": service_lookup_error,
+            "lash_service_ids_found": sorted(lash_svc_ids) if service_lookup_error is None else None,
+        },
+        "eligibility": {
+            "is_eligible": excluded_reason is None,
+            "excluded_reason": excluded_reason,
+        },
+    }
 
 
 # ==========================================================================

@@ -61,15 +61,29 @@ class CrmRecord:
 
     crm_id: int | None
     starts_at: datetime | None  # UTC; None если не удалось распарсить дату
-    confirmed: int  # 1 = подтверждена, 0 = отменена; None-like → 0
+    confirmed: int  # 1 = не отменена (активна), 0 = отменена; None-like → 0
     deleted: bool
     service_ids: list[int] = field(default_factory=list)
     service_titles: list[str] = field(default_factory=list)
+    # attendance == 1 означает статус «Пришел» в Altegio.
+    # Отличается от confirmed: confirmed=1 — запись активна (не отменена),
+    # attendance=1 — клиент фактически явился на приём.
+    # Поле может отсутствовать в ответе CRM (тогда 0 по умолчанию).
+    attendance: int = 0
 
     @property
     def is_confirmed(self) -> bool:
-        """True если запись подтверждена (confirmed == 1)."""
+        """True если запись не отменена (confirmed == 1).
+
+        Не означает, что клиент пришёл — только что запись не была отменена.
+        Для проверки явки используй is_attended.
+        """
         return self.confirmed == 1
+
+    @property
+    def is_attended(self) -> bool:
+        """True если клиент фактически явился («Пришел», attendance == 1)."""
+        return self.attendance == 1
 
     @property
     def is_active(self) -> bool:
@@ -130,6 +144,21 @@ def _parse_record_starts_at(record_data: dict[str, Any]) -> datetime | None:
 def _parse_confirmed(record_data: dict[str, Any]) -> int:
     """Вернуть значение поля confirmed (0 или 1; по умолчанию 0)."""
     raw = record_data.get("confirmed")
+    if raw is not None:
+        try:
+            return int(raw)
+        except (ValueError, TypeError):
+            pass
+    return 0
+
+
+def _parse_attendance(record_data: dict[str, Any]) -> int:
+    """Вернуть значение поля attendance (0 или 1; по умолчанию 0).
+
+    attendance == 1 означает статус «Пришел» в Altegio.
+    Если поле отсутствует в ответе API — возвращаем 0 (не явился).
+    """
+    raw = record_data.get("attendance")
     if raw is not None:
         try:
             return int(raw)
@@ -243,6 +272,7 @@ async def get_client_crm_records(
                         deleted=bool(rec.get("deleted")),
                         service_ids=service_ids,
                         service_titles=service_titles,
+                        attendance=_parse_attendance(rec),
                     )
                 )
 

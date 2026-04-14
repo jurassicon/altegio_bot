@@ -90,12 +90,17 @@ def _crm_record(
     *,
     days_offset: int = 5,
     confirmed: int = 1,
+    attendance: int = 1,
     deleted: bool = False,
     service_ids: list[int] | None = None,
     service_titles: list[str] | None = None,
     before_period: bool = False,
 ) -> CrmRecord:
-    """Создать CrmRecord для тестов."""
+    """Создать CrmRecord для тестов.
+
+    По умолчанию confirmed=1 AND attendance=1 — клиент пришёл («Пришел»).
+    Для записей до периода или без явки передай attendance=0.
+    """
     if before_period:
         starts_at = PERIOD_START - timedelta(days=30)
     else:
@@ -104,6 +109,7 @@ def _crm_record(
         crm_id=_record_id(),
         starts_at=starts_at,
         confirmed=confirmed,
+        attendance=attendance,
         deleted=deleted,
         service_ids=service_ids or [LASH_SVC_ID],
         service_titles=service_titles or ["Wimpernverlängerung"],
@@ -324,17 +330,21 @@ async def test_no_lash_record_excluded(patched_db) -> None:
 
 @pytest.mark.asyncio
 async def test_no_confirmed_lash_excluded(patched_db) -> None:
-    """Ровно 1 lash-запись, но неподтверждённая → excluded."""
+    """Ровно 1 lash-запись, но клиент не пришёл (attendance=0) → excluded.
+
+    Критерий eligible — attendance=1 («Пришел»), а не просто confirmed=1.
+    confirmed=1 означает только «запись не отменена», но не факт явки.
+    """
     async with patched_db() as session:
         async with session.begin():
             client = _make_client(altegio_client_id=_alt_id())
             session.add(client)
             await session.flush()
-            rec = _make_record(client.id, confirmed=0)
+            rec = _make_record(client.id, confirmed=1)
             session.add(rec)
 
-    # CRM: 1 lash-запись, confirmed=0
-    crm_records = [_crm_record(confirmed=0, service_ids=[LASH_SVC_ID])]
+    # CRM: 1 lash-запись, confirmed=1 (не отменена), но attendance=0 (не пришёл)
+    crm_records = [_crm_record(confirmed=1, attendance=0, service_ids=[LASH_SVC_ID])]
 
     with _patch_crm(crm_records), _patch_lash():
         result = await find_candidates(
@@ -410,10 +420,11 @@ async def test_strict_multiplicity_one_confirmed_one_unconfirmed(patched_db) -> 
             session.add(rec1)
             session.add(rec2)
 
-    # CRM: 1 confirmed lash + 1 unconfirmed lash
+    # CRM: 1 attended lash + 1 not-attended lash
+    # confirmed=1 + attendance=1 → пришёл; confirmed=0 + attendance=0 → не пришёл
     crm_records = [
-        _crm_record(days_offset=3, confirmed=1, service_ids=[LASH_SVC_ID]),
-        _crm_record(days_offset=20, confirmed=0, service_ids=[LASH_SVC_ID]),
+        _crm_record(days_offset=3, confirmed=1, attendance=1, service_ids=[LASH_SVC_ID]),
+        _crm_record(days_offset=20, confirmed=0, attendance=0, service_ids=[LASH_SVC_ID]),
     ]
 
     with _patch_crm(crm_records), _patch_lash():
@@ -429,7 +440,7 @@ async def test_strict_multiplicity_one_confirmed_one_unconfirmed(patched_db) -> 
     # Строгое правило: 2+ lash-записей вообще
     assert match.excluded_reason == "multiple_lash_records_in_period"
     assert match.lash_records_in_period == 2
-    # Только 1 из 2 подтверждена
+    # Только 1 из 2 имеет attendance=1
     assert match.confirmed_lash_records_in_period == 1
 
 

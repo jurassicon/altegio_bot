@@ -2,7 +2,10 @@
 
   Клиент eligible только если:
   1. В периоде у него РОВНО ОДНА lash-запись (любого статуса, не удалённая).
-  2. Эта единственная lash-запись подтверждена (confirmed == 1).
+  2. Эта единственная lash-запись имеет статус «Пришел» (attendance == 1).
+     ВАЖНО: confirmed == 1 означает только «запись не отменена»; это НЕ то же
+     самое, что «клиент пришёл». Клиенты с будущими или несостоявшимися
+     записями имеют confirmed=1, но attendance=0 — они НЕ eligible.
   3. ДО начала периода у него нет НИ ОДНОЙ записи в Altegio CRM
      (любой услуги, любого статуса).
   4. Есть phone_e164.
@@ -31,9 +34,9 @@
 
 Множественность:
   - Если lash-записей в периоде >= 2 → multiple_lash_records_in_period (даже если
-    подтверждена только одна).
+    посещена только одна).
   - Если lash-записей == 0 → no_lash_record_in_period.
-  - Если lash-записей == 1 и она не подтверждена → no_confirmed_lash_record_in_period.
+  - Если lash-записей == 1 и attendance != 1 → no_confirmed_lash_record_in_period.
 
 CRM недоступность:
   - Если Altegio CRM API вернул ошибку → клиент получает excluded_reason =
@@ -45,7 +48,9 @@ Service lookup недоступность:
     Считать услугу non-lash и пропускать проверку НЕЛЬЗЯ — это даст
     ложно-eligible клиентов.
 
-Константа CONFIRMED_FLAG = 1 — единственная точка правды для «подтверждена».
+Константа ATTENDED_FLAG = 1 — единственная точка правды для «Пришел» (attendance).
+Константа CONFIRMED_FLAG = 1 — «запись не отменена» (confirmed); используется
+только в диагностических счётчиках, НЕ для определения eligible.
 """
 
 from __future__ import annotations
@@ -71,7 +76,9 @@ from altegio_bot.settings import settings
 
 logger = logging.getLogger(__name__)
 
-# Единственная точка правды: что считается «подтверждённой» записью.
+# «Пришел» (attendance=1) — единственный критерий eligible lash-записи.
+ATTENDED_FLAG = 1
+# «Подтверждена, не отменена» (confirmed=1) — диагностический счётчик; НЕ критерий eligible.
 CONFIRMED_FLAG = 1
 
 
@@ -102,11 +109,12 @@ class ClientCandidate:
     # --- Записи в периоде (из CRM) ---
     # Все не удалённые не-отменённые записи клиента в периоде
     total_records_in_period: int
-    # Подтверждённые записи (confirmed == CONFIRMED_FLAG)
+    # Подтверждённые записи (confirmed == CONFIRMED_FLAG) — диагностика
     confirmed_records_in_period: int
 
     # --- Ресничные записи в периоде (из CRM + category lookup) ---
     lash_records_in_period: int
+    # Посещённые lash-записи (attendance == ATTENDED_FLAG) — критерий eligible
     confirmed_lash_records_in_period: int
 
     # --- Услуги в периоде (для диагностики) ---
@@ -159,13 +167,13 @@ def _classify(candidate: ClientCandidate) -> None:
         candidate.excluded_reason = "no_lash_record_in_period"
         return
 
-    # 2+ lash-записей в периоде (включая неподтверждённые) — не подходит
-    # Правило строгое: даже если только 1 подтверждена, 2+ записей → excluded
+    # 2+ lash-записей в периоде (включая непосещённые) — не подходит
+    # Правило строгое: даже если только 1 с attendance=1, 2+ записей → excluded
     if candidate.lash_records_in_period >= 2:
         candidate.excluded_reason = "multiple_lash_records_in_period"
         return
 
-    # Ровно 1 lash-запись в периоде, но она не подтверждена
+    # Ровно 1 lash-запись в периоде, но клиент не пришёл (attendance != 1)
     if candidate.confirmed_lash_records_in_period == 0:
         candidate.excluded_reason = "no_confirmed_lash_record_in_period"
         return
@@ -181,7 +189,12 @@ async def _check_lash_services(
     """Подсчитать ресничные записи и собрать названия услуг.
 
     Возвращает:
-        (lash_records_in_period, confirmed_lash_records_in_period, service_titles)
+        (lash_records_in_period, attended_lash_records_in_period, service_titles)
+
+        lash_records_in_period — все не удалённые lash-записи в периоде.
+        attended_lash_records_in_period — lash-записи со статусом «Пришел»
+            (attendance == ATTENDED_FLAG). Именно этот счётчик используется
+            для определения eligible: клиент должен был фактически прийти.
 
     Raises:
         ServiceLookupError: если Altegio service category API недоступен.
@@ -208,18 +221,20 @@ async def _check_lash_services(
         )
 
     lash_count = 0
-    confirmed_lash_count = 0
+    attended_lash_count = 0
     titles: set[str] = set()
 
     for rec in crm_records:
         has_lash = any(sid in lash_svc_ids for sid in rec.service_ids)
         if has_lash:
             lash_count += 1
-            if rec.is_confirmed:
-                confirmed_lash_count += 1
+            # Критерий eligible: attendance == 1 («Пришел»), а не просто confirmed == 1.
+            # confirmed=1 лишь означает «запись не отменена» — это НЕ эквивалент явки.
+            if rec.is_attended:
+                attended_lash_count += 1
         titles.update(t for t in rec.service_titles if t)
 
-    return lash_count, confirmed_lash_count, sorted(titles)
+    return lash_count, attended_lash_count, sorted(titles)
 
 
 def _make_excluded_candidate(snapshot: ClientSnapshot, reason: str) -> ClientCandidate:
@@ -317,6 +332,20 @@ async def _process_one_client(
                 local_client_found=True,
             )
             _classify(c)
+            logger.debug(
+                "segment debug: client_id=%s altegio_client_id=%s "
+                "records_before=%d total_in_period=%d "
+                "lash_in_period=%d attended_lash_in_period=%d "
+                "services=%r → %s",
+                snapshot.id,
+                snapshot.altegio_client_id,
+                count_before,
+                total_in_period,
+                lash_count,
+                confirmed_lash_count,
+                service_titles,
+                c.excluded_reason if c.excluded_reason else "ELIGIBLE",
+            )
             return c
 
     except Exception:
