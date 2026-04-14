@@ -21,6 +21,7 @@ Endpoint'ы:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from datetime import datetime, timezone
@@ -52,6 +53,7 @@ from altegio_bot.campaigns.runner import (
 )
 from altegio_bot.campaigns.segment import check_lash_services, compute_excluded_reason
 from altegio_bot.db import SessionLocal
+from altegio_bot.settings import settings
 from altegio_bot.models.models import CampaignRecipient, CampaignRun, Client, MessageJob, MessageTemplate, Record
 from altegio_bot.ops.auth import require_ops_auth
 from altegio_bot.service_filter import ServiceLookupError
@@ -600,6 +602,319 @@ async def debug_client_segmentation(
                 "eligible: все условия выполнены" if excluded_reason is None else f"excluded: {excluded_reason}"
             ),
         },
+    }
+
+
+# ==========================================================================
+# Debug batch: диагностика сегментации для списка клиентов
+# ==========================================================================
+
+
+class BatchDebugRequest(BaseModel):
+    """Тело запроса для batch debug endpoint.
+
+    phones — список номеров в любом формате (с пробелами, скобками, +49…).
+    Нормализация выполняется внутри endpoint'а.
+    Максимум 50 номеров: больше не нужно для ручного расследования,
+    а лимит защищает CRM API от перегрузки.
+    """
+
+    company_id: int
+    period_start: str = Field(..., description="ISO 8601 UTC, напр. 2026-03-01T00:00:00Z")
+    period_end: str = Field(..., description="ISO 8601 UTC, напр. 2026-04-01T00:00:00Z")
+    phones: list[str] = Field(..., min_length=1, max_length=50)
+
+
+@router.post("/debug-clients-batch")
+async def debug_clients_batch(body: BatchDebugRequest) -> dict[str, Any]:
+    """Batch диагностика сегментации для списка клиентов.
+
+    Предназначен для расследования mismatch «в CRM 15 клиентов, в preview 3»:
+    передаёшь все телефоны из CRM-скрина — получаешь таблицу с объяснением
+    по каждому, почему он eligible или excluded.
+
+    Каждый клиент в ``results`` содержит:
+      - ``discovery_status``       — виден ли пайплайну через локальную БД:
+            "in_local_db_with_records" — найден и записи за период есть → обнаружен
+            "in_local_db_no_records"   — найден, но записей за период нет → пропущен
+            "not_in_local_db"          — не найден вообще → пропущен
+      - ``local_records_in_period`` — кол-во записей в локальной БД за период
+      - ``crm_records_total``       — всего записей в CRM (null если нет altegio_client_id)
+      - ``crm_in_period``           — записей в CRM за период
+      - ``crm_before_period``       — записей в CRM до начала периода
+      - ``lash_in_period``          — ресничных записей в CRM за период
+      - ``attended_lash_in_period`` — ресничных с attendance=1
+      - ``is_eligible`` / ``excluded_reason`` / ``decision_notes`` — итог
+
+    ``summary`` агрегирует counts по всем клиентам — для быстрого диагноза
+    без чтения каждой строки.
+
+    Конкурентность CRM-вызовов ограничена ``settings.campaign_crm_max_concurrency``
+    (тот же семафор, что и в основном segment pipeline).
+    """
+    period_start_utc = _debug_parse_dt(body.period_start)
+    period_end_utc = _debug_parse_dt(body.period_end)
+
+    # ------------------------------------------------------------------
+    # 1. Нормализация телефонов
+    # ------------------------------------------------------------------
+    normalized: list[tuple[str, str | None]] = []  # (phone_input, phone_e164 | None)
+    for raw in body.phones:
+        normalized.append((raw, _debug_normalize_phone(raw)))
+
+    valid_phones_e164 = [e164 for _, e164 in normalized if e164]
+
+    # ------------------------------------------------------------------
+    # 2. Bulk lookup: clients + records в периоде (одна сессия, два запроса)
+    # ------------------------------------------------------------------
+    clients_by_phone: dict[str, Client] = {}
+    records_by_client_id: dict[int, int] = {}  # client_id → кол-во записей в периоде
+
+    async with SessionLocal() as session:
+        if valid_phones_e164:
+            cl_stmt = select(Client).where(
+                Client.company_id == body.company_id,
+                Client.phone_e164.in_(valid_phones_e164),
+            )
+            for c in (await session.execute(cl_stmt)).scalars():
+                if c.phone_e164:
+                    clients_by_phone[c.phone_e164] = c
+
+            found_client_ids = [c.id for c in clients_by_phone.values() if c.id is not None]
+            if found_client_ids:
+                # Подсчёт записей в периоде без загрузки всех объектов
+                from sqlalchemy import func as sql_func
+
+                count_stmt = (
+                    select(Record.client_id, sql_func.count().label("cnt"))
+                    .where(
+                        Record.company_id == body.company_id,
+                        Record.client_id.in_(found_client_ids),
+                        Record.starts_at >= period_start_utc,
+                        Record.starts_at < period_end_utc,
+                        Record.is_deleted.is_(False),
+                    )
+                    .group_by(Record.client_id)
+                )
+                for row in (await session.execute(count_stmt)).all():
+                    records_by_client_id[row.client_id] = row.cnt
+
+    # ------------------------------------------------------------------
+    # 3. CRM calls: concurrent с семафором
+    # ------------------------------------------------------------------
+    async def _process_one(
+        http: httpx.AsyncClient,
+        sem: asyncio.Semaphore,
+        phone_e164: str,
+        local_client: Client | None,
+        local_rec_count: int,
+    ) -> dict[str, Any]:
+        """Диагностика одного клиента: локальная БД + CRM + классификация."""
+
+        # Базовые поля, которые всегда заполняются
+        entry: dict[str, Any] = {
+            "phone_e164": phone_e164,
+            "display_name": local_client.display_name if local_client else None,
+            "local_client_found": local_client is not None,
+            "local_records_in_period": local_rec_count,
+        }
+
+        # Клиент не найден в локальной БД → discovery его пропустит
+        if local_client is None:
+            entry["discovery_status"] = "not_in_local_db"
+            entry["crm_records_total"] = None
+            entry["crm_in_period"] = None
+            entry["crm_before_period"] = None
+            entry["lash_in_period"] = None
+            entry["attended_lash_in_period"] = None
+            entry["is_eligible"] = False
+            entry["excluded_reason"] = "not_in_local_db"
+            entry["decision_notes"] = (
+                "не обнаружен: клиента нет в локальной таблице clients — "
+                "discovery его пропускает без вызова CRM"
+            )
+            return entry
+
+        entry["discovery_status"] = (
+            "in_local_db_with_records" if local_rec_count > 0 else "in_local_db_no_records"
+        )
+
+        # Нет altegio_client_id → CRM недоступен
+        if not local_client.altegio_client_id:
+            entry["crm_records_total"] = None
+            entry["crm_in_period"] = None
+            entry["crm_before_period"] = None
+            entry["lash_in_period"] = None
+            entry["attended_lash_in_period"] = None
+            entry["is_eligible"] = False
+            entry["excluded_reason"] = "crm_history_unavailable"
+            entry["decision_notes"] = "excluded: нет altegio_client_id — невозможно запросить CRM"
+            return entry
+
+        # CRM call под семафором
+        async with sem:
+            try:
+                crm_records = await get_client_crm_records(
+                    http,
+                    company_id=body.company_id,
+                    altegio_client_id=int(local_client.altegio_client_id),
+                )
+                in_period_recs, count_before = classify_crm_records(
+                    crm_records, period_start_utc, period_end_utc
+                )
+
+                lash_count = 0
+                attended_lash_count = 0
+                service_lookup_error: str | None = None
+                try:
+                    lash_count, attended_lash_count, _, _ = await check_lash_services(
+                        http, body.company_id, in_period_recs
+                    )
+                except ServiceLookupError as exc:
+                    service_lookup_error = str(exc)
+
+                entry["crm_records_total"] = len(crm_records)
+                entry["crm_in_period"] = len(in_period_recs)
+                entry["crm_before_period"] = count_before
+                entry["lash_in_period"] = lash_count
+                entry["attended_lash_in_period"] = attended_lash_count
+
+                excluded = compute_excluded_reason(
+                    wa_opted_out=bool(local_client.wa_opted_out),
+                    phone_e164=local_client.phone_e164,
+                    crm_unavailable=False,
+                    service_unavailable=service_lookup_error is not None,
+                    count_before=count_before,
+                    lash_count=lash_count,
+                    attended_lash_count=attended_lash_count,
+                )
+                entry["is_eligible"] = excluded is None
+                entry["excluded_reason"] = excluded
+                entry["decision_notes"] = (
+                    "eligible: все условия выполнены"
+                    if excluded is None
+                    else f"excluded: {excluded}"
+                )
+
+            except CrmUnavailableError as exc:
+                entry["crm_records_total"] = None
+                entry["crm_in_period"] = None
+                entry["crm_before_period"] = None
+                entry["lash_in_period"] = None
+                entry["attended_lash_in_period"] = None
+                entry["is_eligible"] = False
+                entry["excluded_reason"] = "crm_history_unavailable"
+                entry["decision_notes"] = f"excluded: CRM недоступен — {exc}"
+
+        return entry
+
+    # Разделяем: невалидные телефоны обрабатываем сразу, валидные — через gather
+    results: list[dict[str, Any]] = []
+    valid_tasks: list[Any] = []
+    valid_inputs: list[str] = []  # phone_input для каждой задачи
+
+    # Заглушка результата для невалидного телефона
+    def _invalid_phone_entry(phone_input: str) -> dict[str, Any]:
+        return {
+            "phone_input": phone_input,
+            "phone_e164": None,
+            "display_name": None,
+            "local_client_found": False,
+            "local_records_in_period": 0,
+            "discovery_status": "invalid_phone",
+            "crm_records_total": None,
+            "crm_in_period": None,
+            "crm_before_period": None,
+            "lash_in_period": None,
+            "attended_lash_in_period": None,
+            "is_eligible": False,
+            "excluded_reason": "invalid_phone",
+            "decision_notes": "excluded: не удалось нормализовать телефон",
+        }
+
+    async with httpx.AsyncClient(timeout=30.0) as http:
+        sem = asyncio.Semaphore(settings.campaign_crm_max_concurrency)
+
+        for phone_input, phone_e164 in normalized:
+            if phone_e164 is None:
+                results.append(_invalid_phone_entry(phone_input))
+                continue
+            local_c = clients_by_phone.get(phone_e164)
+            local_cnt = records_by_client_id.get(local_c.id, 0) if local_c else 0
+            valid_tasks.append(_process_one(http, sem, phone_e164, local_c, local_cnt))
+            valid_inputs.append(phone_input)
+
+        raw = await asyncio.gather(*valid_tasks, return_exceptions=True)
+
+    # Собираем финальный список results в порядке входных телефонов.
+    # Если задача упала с BaseException — добавляем error-запись, а не дропаем.
+    task_idx = 0
+    final_results: list[dict[str, Any]] = []
+    for phone_input, phone_e164 in normalized:
+        if phone_e164 is None:
+            # Уже добавлено выше через _invalid_phone_entry, переносим в итог
+            final_results.append(results[len(final_results)])
+        else:
+            outcome = raw[task_idx]
+            task_idx += 1
+            if isinstance(outcome, dict):
+                outcome["phone_input"] = phone_input
+                final_results.append(outcome)
+            else:
+                logger.error(
+                    "debug_clients_batch: unexpected exception for phone=%r: %r",
+                    phone_e164,
+                    outcome,
+                )
+                final_results.append(
+                    {
+                        "phone_input": phone_input,
+                        "phone_e164": phone_e164,
+                        "display_name": None,
+                        "local_client_found": False,
+                        "local_records_in_period": 0,
+                        "discovery_status": "error",
+                        "crm_records_total": None,
+                        "crm_in_period": None,
+                        "crm_before_period": None,
+                        "lash_in_period": None,
+                        "attended_lash_in_period": None,
+                        "is_eligible": False,
+                        "excluded_reason": "internal_error",
+                        "decision_notes": f"excluded: внутренняя ошибка — {outcome!r}",
+                    }
+                )
+
+    # ------------------------------------------------------------------
+    # 4. Summary: агрегированные счётчики для быстрого диагноза
+    # ------------------------------------------------------------------
+    discovery_counts: dict[str, int] = {}
+    exclusion_counts: dict[str, int] = {}
+    eligible_count = 0
+
+    for r in final_results:
+        ds = r.get("discovery_status", "unknown")
+        discovery_counts[ds] = discovery_counts.get(ds, 0) + 1
+        if r.get("is_eligible"):
+            eligible_count += 1
+        else:
+            reason = r.get("excluded_reason") or "unknown"
+            exclusion_counts[reason] = exclusion_counts.get(reason, 0) + 1
+
+    summary: dict[str, Any] = {
+        "total_phones": len(final_results),
+        "eligible": eligible_count,
+        "excluded": len(final_results) - eligible_count,
+        "discovery_status_counts": discovery_counts,
+        "excluded_by_reason": exclusion_counts,
+    }
+
+    return {
+        "company_id": body.company_id,
+        "period_start": period_start_utc.isoformat(),
+        "period_end": period_end_utc.isoformat(),
+        "summary": summary,
+        "results": final_results,
     }
 
 

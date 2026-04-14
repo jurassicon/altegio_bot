@@ -818,3 +818,272 @@ async def test_debug_endpoint_excluded_has_decision_notes(session_maker, debug_h
     assert "decision_notes" in elig
     assert "excluded" in elig["decision_notes"]
     assert "has_records_before_period" in elig["decision_notes"]
+
+
+# ===========================================================================
+# Batch debug endpoint: /ops/campaigns/debug-clients-batch
+# ===========================================================================
+
+
+def _batch_body(phones: list[str]) -> dict:
+    return {
+        "company_id": COMPANY,
+        "period_start": PERIOD_START.isoformat(),
+        "period_end": PERIOD_END.isoformat(),
+        "phones": phones,
+    }
+
+
+def _crm_record_eligible() -> CrmRecord:
+    """CrmRecord, который даёт eligible при одной lash-записи за период."""
+    return CrmRecord(
+        crm_id=_next_id(),
+        starts_at=PERIOD_START + timedelta(days=5),
+        confirmed=1,
+        attendance=1,
+        attendance_source="attendance",
+        deleted=False,
+        service_ids=[LASH_SVC_ID],
+        service_titles=["Wimpernverlängerung"],
+    )
+
+
+# ---------------------------------------------------------------------------
+# K: основной сценарий расследования — mix клиентов
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_batch_debug_mix_of_clients(session_maker, debug_http_client) -> None:
+    """Batch endpoint корректно диагностирует клиентов трёх категорий одновременно:
+
+      1. Eligible клиент — в локальной БД, запись за период есть, CRM подтверждает.
+      2. not_in_local_db — телефон не известен локальной БД (Discovery Gap!).
+      3. Excluded — в локальной БД, но history до периода есть.
+
+    Это ключевой сценарий расследования mismatch «в CRM 15, в preview 3».
+    """
+    altegio_eligible = _next_id()
+    altegio_excluded = _next_id()
+
+    async with session_maker() as session:
+        async with session.begin():
+            # Клиент 1: eligible (новый, пришёл, нет истории)
+            c_eligible = Client(
+                company_id=COMPANY,
+                altegio_client_id=altegio_eligible,
+                phone_e164="+4915100000010",
+                display_name="Anna Neu",
+                raw={},
+            )
+            session.add(c_eligible)
+            await session.flush()
+            session.add(
+                Record(
+                    company_id=COMPANY,
+                    altegio_record_id=_next_id(),
+                    client_id=c_eligible.id,
+                    starts_at=PERIOD_START + timedelta(days=5),
+                    confirmed=1,
+                    is_deleted=False,
+                )
+            )
+
+            # Клиент 2: в локальной БД, есть запись, но history до периода
+            c_excluded = Client(
+                company_id=COMPANY,
+                altegio_client_id=altegio_excluded,
+                phone_e164="+4915100000011",
+                display_name="Petra Alt",
+                raw={},
+            )
+            session.add(c_excluded)
+            await session.flush()
+            session.add(
+                Record(
+                    company_id=COMPANY,
+                    altegio_record_id=_next_id(),
+                    client_id=c_excluded.id,
+                    starts_at=PERIOD_START + timedelta(days=3),
+                    confirmed=1,
+                    is_deleted=False,
+                )
+            )
+
+    # Клиент 3: +4915100000012 — в БД нет вообще (Discovery Gap)
+
+    # CRM mocks:
+    # - eligible: одна запись в периоде, attendance=1, нет истории до периода
+    crm_eligible = [_crm_record_eligible()]
+    # - excluded: одна запись в периоде + одна до периода
+    crm_before = CrmRecord(
+        crm_id=_next_id(),
+        starts_at=PERIOD_START - timedelta(days=30),
+        confirmed=1,
+        attendance=1,
+        attendance_source="attendance",
+        deleted=False,
+        service_ids=[LASH_SVC_ID],
+        service_titles=["Wimpernverlängerung"],
+    )
+    crm_in = _crm_record_eligible()
+    crm_excluded = [crm_before, crm_in]
+
+    async def _crm_side_effect(http, *, company_id, altegio_client_id):
+        if altegio_client_id == altegio_eligible:
+            return crm_eligible
+        return crm_excluded
+
+    with (
+        patch(
+            "altegio_bot.ops.campaigns_api.get_client_crm_records",
+            side_effect=_crm_side_effect,
+        ),
+        patch(
+            "altegio_bot.campaigns.segment.is_lash_service",
+            new=AsyncMock(side_effect=lambda company_id, svc_id, http_client=None: svc_id == LASH_SVC_ID),
+        ),
+    ):
+        resp = await debug_http_client.post(
+            "/ops/campaigns/debug-clients-batch",
+            json=_batch_body(["+4915100000010", "+4915100000011", "+4915100000012"]),
+        )
+
+    assert resp.status_code == 200
+    data = resp.json()
+
+    summary = data["summary"]
+    assert summary["total_phones"] == 3
+    assert summary["eligible"] == 1
+    assert summary["excluded"] == 2
+
+    # Discovery gap правильно считается
+    disc = summary["discovery_status_counts"]
+    assert disc.get("in_local_db_with_records", 0) == 2
+    assert disc.get("not_in_local_db", 0) == 1
+
+    # not_in_local_db должна быть одной из причин исключения в excluded_by_reason
+    exc_reasons = summary["excluded_by_reason"]
+    assert exc_reasons.get("not_in_local_db", 0) == 1
+    assert exc_reasons.get("has_records_before_period", 0) == 1
+
+    results = {r["phone_e164"]: r for r in data["results"] if r.get("phone_e164")}
+
+    # Клиент 1: eligible
+    r1 = results["+4915100000010"]
+    assert r1["is_eligible"] is True
+    assert r1["discovery_status"] == "in_local_db_with_records"
+    assert r1["local_records_in_period"] == 1
+    assert r1["crm_in_period"] == 1
+    assert r1["crm_before_period"] == 0
+    assert r1["lash_in_period"] == 1
+    assert r1["attended_lash_in_period"] == 1
+
+    # Клиент 2: excluded по истории
+    r2 = results["+4915100000011"]
+    assert r2["is_eligible"] is False
+    assert r2["excluded_reason"] == "has_records_before_period"
+    assert r2["discovery_status"] == "in_local_db_with_records"
+    assert r2["crm_before_period"] == 1
+
+    # Клиент 3: Discovery Gap
+    r3 = results["+4915100000012"]
+    assert r3["is_eligible"] is False
+    assert r3["excluded_reason"] == "not_in_local_db"
+    assert r3["discovery_status"] == "not_in_local_db"
+    assert r3["local_client_found"] is False
+    assert r3["crm_records_total"] is None  # CRM не вызывался
+    assert "не обнаружен" in r3["decision_notes"] or "not_in_local_db" in r3["excluded_reason"]
+
+
+# ---------------------------------------------------------------------------
+# L: невалидный телефон в батче
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_batch_debug_invalid_phone_handled_gracefully(debug_http_client) -> None:
+    """Невалидный телефон в батче не ронит весь запрос.
+
+    Возвращает discovery_status='invalid_phone' для проблемного номера,
+    остальные обрабатываются нормально.
+    """
+    with patch(
+        "altegio_bot.ops.campaigns_api.get_client_crm_records",
+        new=AsyncMock(return_value=[]),
+    ):
+        resp = await debug_http_client.post(
+            "/ops/campaigns/debug-clients-batch",
+            json=_batch_body(["not-a-phone", "+4915100000099"]),
+        )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["summary"]["total_phones"] == 2
+
+    results_by_input = {r["phone_input"]: r for r in data["results"]}
+
+    invalid = results_by_input["not-a-phone"]
+    assert invalid["discovery_status"] == "invalid_phone"
+    assert invalid["is_eligible"] is False
+    assert invalid["excluded_reason"] == "invalid_phone"
+
+    # Валидный телефон обработан (клиент не найден в БД — not_in_local_db)
+    valid = results_by_input["+4915100000099"]
+    assert valid["phone_e164"] == "+4915100000099"
+    assert valid["discovery_status"] == "not_in_local_db"
+
+
+# ---------------------------------------------------------------------------
+# M: невалидный datetime → 400
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_batch_debug_invalid_period_returns_400(debug_http_client) -> None:
+    """Batch endpoint возвращает 400 при невалидном формате datetime."""
+    resp = await debug_http_client.post(
+        "/ops/campaigns/debug-clients-batch",
+        json={
+            "company_id": COMPANY,
+            "period_start": "not-a-date",
+            "period_end": PERIOD_END.isoformat(),
+            "phones": ["+4915100000001"],
+        },
+    )
+    assert resp.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# N: порядок результатов совпадает с порядком входных телефонов
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_batch_debug_preserves_phone_order(session_maker, debug_http_client) -> None:
+    """Результаты возвращаются в том же порядке, что входные телефоны.
+
+    Важно для UI: оператор видит ту же последовательность, что и в CRM-скрине.
+    """
+    phones_input = [
+        "+4915100000020",  # не в БД
+        "+4915100000021",  # не в БД
+        "+4915100000022",  # не в БД
+    ]
+
+    with patch(
+        "altegio_bot.ops.campaigns_api.get_client_crm_records",
+        new=AsyncMock(return_value=[]),
+    ):
+        resp = await debug_http_client.post(
+            "/ops/campaigns/debug-clients-batch",
+            json=_batch_body(phones_input),
+        )
+
+    assert resp.status_code == 200
+    results = resp.json()["results"]
+    assert len(results) == 3
+    for i, phone in enumerate(phones_input):
+        assert results[i]["phone_input"] == phone, (
+            f"Позиция {i}: ожидали {phone!r}, получили {results[i]['phone_input']!r}"
+        )
