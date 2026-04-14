@@ -540,8 +540,8 @@ async def test_debug_endpoint_shows_raw_crm_fields(session_maker, debug_http_cli
             service_titles=["Wimpernverlängerung"],
             raw_debug={
                 "confirmed": 1,
-                "attendance": None,          # сырое поле из CRM — отсутствовало
-                "visit_attendance": 1,       # fallback-источник
+                "attendance": None,  # сырое поле из CRM — отсутствовало
+                "visit_attendance": 1,  # fallback-источник
                 "deleted": False,
                 "service_ids": [LASH_SVC_ID],
                 "service_titles": ["Wimpernverlängerung"],

@@ -247,5 +247,5 @@ async def test_raw_debug_contains_crm_fields() -> None:
 
     # Проверяем, что именно сырые значения (до нормализации)
     assert rd["confirmed"] == 1
-    assert rd["attendance"] == 0       # сырое поле — 0, несмотря на visit_attendance=1
-    assert rd["visit_attendance"] == 1 # fallback-поле присутствует в raw_debug
+    assert rd["attendance"] == 0  # сырое поле — 0, несмотря на visit_attendance=1
+    assert rd["visit_attendance"] == 1  # fallback-поле присутствует в raw_debug

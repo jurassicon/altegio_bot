@@ -304,13 +304,9 @@ async def get_client_crm_records(
                     "attendance": rec.get("attendance"),
                     "visit_attendance": rec.get("visit_attendance"),
                     "deleted": rec.get("deleted"),
-                    "service_ids": [
-                        s.get("id") for s in rec.get("services", []) if isinstance(s, dict)
-                    ],
+                    "service_ids": [s.get("id") for s in rec.get("services", []) if isinstance(s, dict)],
                     "service_titles": [
-                        s.get("title") or s.get("name")
-                        for s in rec.get("services", [])
-                        if isinstance(s, dict)
+                        s.get("title") or s.get("name") for s in rec.get("services", []) if isinstance(s, dict)
                     ],
                     "starts_at": rec.get("date") or rec.get("datetime"),
                 }

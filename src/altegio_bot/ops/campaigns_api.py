@@ -39,7 +39,6 @@ from altegio_bot.campaigns.altegio_crm import (
     classify_crm_records,
     get_client_crm_records,
 )
-from altegio_bot.campaigns.segment import check_lash_services, compute_excluded_reason
 from altegio_bot.campaigns.followup import execute_followup, followup_run_at, plan_followup
 from altegio_bot.campaigns.reports import monthly_dashboard, run_report
 from altegio_bot.campaigns.runner import (
@@ -51,6 +50,7 @@ from altegio_bot.campaigns.runner import (
     resume_send_real,
     run_preview,
 )
+from altegio_bot.campaigns.segment import check_lash_services, compute_excluded_reason
 from altegio_bot.db import SessionLocal
 from altegio_bot.models.models import CampaignRecipient, CampaignRun, Client, MessageJob, MessageTemplate, Record
 from altegio_bot.ops.auth import require_ops_auth
@@ -597,9 +597,7 @@ async def debug_client_segmentation(
             "excluded_reason": excluded_reason,
             # Резюме: что конкретно привело к решению
             "decision_notes": (
-                "eligible: все условия выполнены"
-                if excluded_reason is None
-                else f"excluded: {excluded_reason}"
+                "eligible: все условия выполнены" if excluded_reason is None else f"excluded: {excluded_reason}"
             ),
         },
     }
