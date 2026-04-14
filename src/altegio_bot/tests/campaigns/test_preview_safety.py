@@ -392,7 +392,7 @@ def test_normalise_nullable_str_empty_is_none() -> None:
 
 @pytest.mark.asyncio
 async def test_run_preview_writes_discovery_source(session_maker) -> None:
-    """После run_preview run.meta['discovery_source'] == 'local_db'."""
+    """После run_preview run.meta['discovery_source'] == 'crm_api'."""
     import altegio_bot.campaigns.runner as runner_module
     from altegio_bot.campaigns.runner import RunParams, run_preview
     from altegio_bot.models.models import CampaignRun
@@ -413,12 +413,12 @@ async def test_run_preview_writes_discovery_source(session_maker) -> None:
             run = await run_preview(params)
 
         assert run.meta is not None
-        assert run.meta.get("discovery_source") == "local_db"
+        assert run.meta.get("discovery_source") == "crm_api"
 
         # Проверить и в БД
         async with session_maker() as session:
             db_run = await session.get(CampaignRun, run.id)
-            assert db_run.meta.get("discovery_source") == "local_db"
+            assert db_run.meta.get("discovery_source") == "crm_api"
     finally:
         runner_module.SessionLocal = original_session_local
 
@@ -457,14 +457,14 @@ async def test_run_preview_final_state_guard(session_maker) -> None:
 
         # Run должен быть completed
         assert run.status == "completed"
-        assert run.meta.get("discovery_source") == "local_db"
+        assert run.meta.get("discovery_source") == "crm_api"
 
         # Убедиться что run_id существует в БД
         async with session_maker() as session:
             db_run = await session.get(CampaignRun, run.id)
             assert db_run is not None
             assert db_run.status == "completed"
-            assert db_run.meta.get("discovery_source") == "local_db"
+            assert db_run.meta.get("discovery_source") == "crm_api"
     finally:
         runner_module.SessionLocal = original_session_local
 

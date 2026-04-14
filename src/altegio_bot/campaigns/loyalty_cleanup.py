@@ -35,7 +35,7 @@ class CleanupResult:
 async def find_campaign_card_ids(
     session: AsyncSession,
     *,
-    client_id: int,
+    client_id: int | None,
     campaign_code: str,
 ) -> list[str]:
     """Найти loyalty_card_id, выпущенные кампанией для client_id.
@@ -44,7 +44,13 @@ async def find_campaign_card_ids(
     в предыдущих cleanup-проходах. Если card_id уже присутствует
     в cleanup_card_ids любой записи этого клиента, он пропускается —
     это предотвращает повторный вызов delete для уже удалённых карт.
+
+    client_id=None (CRM-only client) → всегда [] (нет локальной записи,
+    значит нет и предыдущих campaign cards для очистки).
     """
+    if client_id is None:
+        return []
+
     # Карты, выпущенные этой кампанией для клиента
     issued_stmt = (
         select(CampaignRecipient.loyalty_card_id)
@@ -88,13 +94,16 @@ async def cleanup_campaign_cards(
     loyalty: AltegioLoyaltyClient,
     *,
     location_id: int,
-    client_id: int,
+    client_id: int | None,
     campaign_code: str,
 ) -> CleanupResult:
     """Удалить все loyalty-карты, выпущенные кампанией для client_id.
 
     Если удаление любой карты не удалось — возвращает ok=False.
     В этом случае не выпускать новую карту и не отправлять сообщение.
+
+    client_id=None (CRM-only client) → CleanupResult(ok=True, deleted_ids=[])
+    (нет локальной записи → нет предыдущих campaign cards → очистка не нужна).
     """
     card_ids = await find_campaign_card_ids(
         session,
