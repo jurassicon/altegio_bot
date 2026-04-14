@@ -53,10 +53,10 @@ from altegio_bot.campaigns.runner import (
 )
 from altegio_bot.campaigns.segment import check_lash_services, compute_excluded_reason
 from altegio_bot.db import SessionLocal
-from altegio_bot.settings import settings
 from altegio_bot.models.models import CampaignRecipient, CampaignRun, Client, MessageJob, MessageTemplate, Record
 from altegio_bot.ops.auth import require_ops_auth
 from altegio_bot.service_filter import ServiceLookupError
+from altegio_bot.settings import settings
 
 logger = logging.getLogger(__name__)
 
@@ -730,14 +730,11 @@ async def debug_clients_batch(body: BatchDebugRequest) -> dict[str, Any]:
             entry["is_eligible"] = False
             entry["excluded_reason"] = "not_in_local_db"
             entry["decision_notes"] = (
-                "не обнаружен: клиента нет в локальной таблице clients — "
-                "discovery его пропускает без вызова CRM"
+                "не обнаружен: клиента нет в локальной таблице clients — discovery его пропускает без вызова CRM"
             )
             return entry
 
-        entry["discovery_status"] = (
-            "in_local_db_with_records" if local_rec_count > 0 else "in_local_db_no_records"
-        )
+        entry["discovery_status"] = "in_local_db_with_records" if local_rec_count > 0 else "in_local_db_no_records"
 
         # Нет altegio_client_id → CRM недоступен
         if not local_client.altegio_client_id:
@@ -759,9 +756,7 @@ async def debug_clients_batch(body: BatchDebugRequest) -> dict[str, Any]:
                     company_id=body.company_id,
                     altegio_client_id=int(local_client.altegio_client_id),
                 )
-                in_period_recs, count_before = classify_crm_records(
-                    crm_records, period_start_utc, period_end_utc
-                )
+                in_period_recs, count_before = classify_crm_records(crm_records, period_start_utc, period_end_utc)
 
                 lash_count = 0
                 attended_lash_count = 0
@@ -791,9 +786,7 @@ async def debug_clients_batch(body: BatchDebugRequest) -> dict[str, Any]:
                 entry["is_eligible"] = excluded is None
                 entry["excluded_reason"] = excluded
                 entry["decision_notes"] = (
-                    "eligible: все условия выполнены"
-                    if excluded is None
-                    else f"excluded: {excluded}"
+                    "eligible: все условия выполнены" if excluded is None else f"excluded: {excluded}"
                 )
 
             except CrmUnavailableError as exc:
@@ -808,12 +801,9 @@ async def debug_clients_batch(body: BatchDebugRequest) -> dict[str, Any]:
 
         return entry
 
-    # Разделяем: невалидные телефоны обрабатываем сразу, валидные — через gather
-    results: list[dict[str, Any]] = []
-    valid_tasks: list[Any] = []
-    valid_inputs: list[str] = []  # phone_input для каждой задачи
-
-    # Заглушка результата для невалидного телефона
+    # ------------------------------------------------------------------
+    # Вспомогательная функция для невалидного телефона
+    # ------------------------------------------------------------------
     def _invalid_phone_entry(phone_input: str) -> dict[str, Any]:
         return {
             "phone_input": phone_input,
@@ -832,31 +822,42 @@ async def debug_clients_batch(body: BatchDebugRequest) -> dict[str, Any]:
             "decision_notes": "excluded: не удалось нормализовать телефон",
         }
 
+    # ------------------------------------------------------------------
+    # Собираем слоты: каждый слот — это либо готовый dict (невалидный телефон),
+    # либо индекс в список задач (валидный телефон, нужен CRM-запрос).
+    # Такая схема сохраняет порядок входных телефонов при любом их чередовании
+    # и не использует хрупкую индексацию через промежуточные списки.
+    # ------------------------------------------------------------------
+    # slot: dict → готовый результат (invalid)
+    #        int → индекс в tasks (будет заменён после gather)
+    slots: list[tuple[str, str | None, dict[str, Any] | int]] = []
+    tasks: list[Any] = []
+
     async with httpx.AsyncClient(timeout=30.0) as http:
         sem = asyncio.Semaphore(settings.campaign_crm_max_concurrency)
 
         for phone_input, phone_e164 in normalized:
             if phone_e164 is None:
-                results.append(_invalid_phone_entry(phone_input))
-                continue
-            local_c = clients_by_phone.get(phone_e164)
-            local_cnt = records_by_client_id.get(local_c.id, 0) if local_c else 0
-            valid_tasks.append(_process_one(http, sem, phone_e164, local_c, local_cnt))
-            valid_inputs.append(phone_input)
+                slots.append((phone_input, None, _invalid_phone_entry(phone_input)))
+            else:
+                local_c = clients_by_phone.get(phone_e164)
+                local_cnt = records_by_client_id.get(local_c.id, 0) if local_c else 0
+                task_index = len(tasks)
+                tasks.append(_process_one(http, sem, phone_e164, local_c, local_cnt))
+                slots.append((phone_input, phone_e164, task_index))
 
-        raw = await asyncio.gather(*valid_tasks, return_exceptions=True)
+        raw = await asyncio.gather(*tasks, return_exceptions=True)
 
-    # Собираем финальный список results в порядке входных телефонов.
-    # Если задача упала с BaseException — добавляем error-запись, а не дропаем.
-    task_idx = 0
+    # Один проход — собираем final_results строго в порядке входных телефонов.
+    # Если gather вернул исключение вместо dict — логируем и возвращаем error-запись.
     final_results: list[dict[str, Any]] = []
-    for phone_input, phone_e164 in normalized:
-        if phone_e164 is None:
-            # Уже добавлено выше через _invalid_phone_entry, переносим в итог
-            final_results.append(results[len(final_results)])
+    for phone_input, phone_e164, slot in slots:
+        if isinstance(slot, dict):
+            # Невалидный телефон — готовый результат
+            final_results.append(slot)
         else:
-            outcome = raw[task_idx]
-            task_idx += 1
+            # Валидный телефон — берём результат gather по индексу
+            outcome = raw[slot]
             if isinstance(outcome, dict):
                 outcome["phone_input"] = phone_input
                 final_results.append(outcome)

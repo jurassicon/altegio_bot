@@ -1087,3 +1087,72 @@ async def test_batch_debug_preserves_phone_order(session_maker, debug_http_clien
         assert results[i]["phone_input"] == phone, (
             f"Позиция {i}: ожидали {phone!r}, получили {results[i]['phone_input']!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# O: смешанный порядок — valid / invalid / valid
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_batch_debug_mixed_valid_invalid_valid_order(debug_http_client) -> None:
+    """Смешанный порядок: valid → invalid → valid — порядок и маркировка корректны.
+
+    Это регрессионный тест на баг с results[len(final_results)]:
+    при смешанном порядке старая логика могла вернуть IndexError или
+    перепутать результаты местами.
+
+    Проверяем:
+    - порядок совпадает с входным,
+    - invalid_phone правильно маркируется на позиции 1 (middle),
+    - оба валидных телефона получают not_in_local_db (их нет в БД),
+    - endpoint не падает.
+    """
+    phones_input = [
+        "+4915100000030",  # valid — не в БД
+        "not-a-phone-at-all",  # invalid
+        "+4915100000031",  # valid — не в БД
+    ]
+
+    with patch(
+        "altegio_bot.ops.campaigns_api.get_client_crm_records",
+        new=AsyncMock(return_value=[]),
+    ):
+        resp = await debug_http_client.post(
+            "/ops/campaigns/debug-clients-batch",
+            json=_batch_body(phones_input),
+        )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    results = data["results"]
+
+    # Порядок строго соответствует входному
+    assert len(results) == 3
+    assert results[0]["phone_input"] == "+4915100000030"
+    assert results[1]["phone_input"] == "not-a-phone-at-all"
+    assert results[2]["phone_input"] == "+4915100000031"
+
+    # Позиция 0: валидный, не в БД
+    assert results[0]["discovery_status"] == "not_in_local_db"
+    assert results[0]["phone_e164"] == "+4915100000030"
+    assert results[0]["is_eligible"] is False
+    assert results[0]["excluded_reason"] == "not_in_local_db"
+
+    # Позиция 1: невалидный телефон посередине
+    assert results[1]["discovery_status"] == "invalid_phone"
+    assert results[1]["phone_e164"] is None
+    assert results[1]["is_eligible"] is False
+    assert results[1]["excluded_reason"] == "invalid_phone"
+
+    # Позиция 2: валидный, не в БД
+    assert results[2]["discovery_status"] == "not_in_local_db"
+    assert results[2]["phone_e164"] == "+4915100000031"
+    assert results[2]["is_eligible"] is False
+    assert results[2]["excluded_reason"] == "not_in_local_db"
+
+    # Summary корректный
+    summary = data["summary"]
+    assert summary["total_phones"] == 3
+    assert summary["discovery_status_counts"].get("invalid_phone", 0) == 1
+    assert summary["discovery_status_counts"].get("not_in_local_db", 0) == 2
