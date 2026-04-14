@@ -46,8 +46,11 @@ from altegio_bot.campaigns.runner import (
     CAMPAIGN_CODE,
     CAMPAIGN_EXECUTION_JOB_TYPE,
     RunParams,
+    delete_preview_run,
     discard_preview_run,
     enqueue_send_real,
+    recompute_run_counters,
+    remove_recipient_from_preview,
     resume_send_real,
     run_preview,
 )
@@ -1025,6 +1028,8 @@ async def get_template_text(
 async def list_runs(
     company_id: int | None = Query(default=None),
     mode: str | None = Query(default=None),
+    status: str | None = Query(default=None),
+    include_deleted: bool = Query(default=False),
     campaign_code: str = Query(default=CAMPAIGN_CODE),
     limit: int = Query(default=50, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
@@ -1034,10 +1039,17 @@ async def list_runs(
     Фильтр по company_id применяется в SQL через оператор JSONB @>
     (containment), чтобы не отсекать результаты до применения
     limit/offset и считать честный total.
+
+    По умолчанию soft-deleted runs (status='deleted') скрыты.
+    Передайте include_deleted=true чтобы их увидеть.
     """
     async with SessionLocal() as session:
         # Строим базовое условие
         conditions = [CampaignRun.campaign_code == campaign_code]
+        if not include_deleted and status != "deleted":
+            conditions.append(CampaignRun.status != "deleted")
+        if status:
+            conditions.append(CampaignRun.status == status)
         if mode:
             conditions.append(CampaignRun.mode == mode)
         if company_id is not None:
@@ -1338,6 +1350,335 @@ async def discard_run(run_id: int) -> dict[str, Any]:
 
 
 # ==========================================================================
+# Delete preview run (stronger than discard — hides from list)
+# ==========================================================================
+
+
+@router.post("/runs/{run_id}/delete")
+async def delete_run(run_id: int) -> dict[str, Any]:
+    """Soft-delete preview-run: status='deleted', скрывается из списка.
+
+    Строже, чем /discard: run перестаёт отображаться в /runs по умолчанию.
+    CampaignRecipient физически не удаляются — аудит сохраняется.
+
+    Запрещено, если preview уже используется как source_preview_run_id
+    в каком-либо send-real.
+    """
+    async with SessionLocal() as session:
+        run = await session.get(CampaignRun, run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="Run not found")
+
+    try:
+        await delete_preview_run(run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.exception("delete_preview failed run_id=%d: %s", run_id, exc)
+        raise HTTPException(status_code=500, detail="Internal delete error")
+
+    return {
+        "run_id": run_id,
+        "status": "deleted",
+        "message": "Preview run удалён (soft-delete)",
+    }
+
+
+# ==========================================================================
+# Manual remove recipient from preview snapshot
+# ==========================================================================
+
+
+@router.post("/runs/{run_id}/recipients/{recipient_id}/remove")
+async def remove_recipient(run_id: int, recipient_id: int) -> dict[str, Any]:
+    """Мягко исключить получателя из preview snapshot.
+
+    Устанавливает status='skipped', excluded_reason='manual_removed'.
+    Пересчитывает счётчики run.
+
+    Разрешено только для completed/running preview, который ещё не
+    использован как source_preview_run_id в send-real.
+    """
+    try:
+        r = await remove_recipient_from_preview(run_id, recipient_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.exception(
+            "remove_recipient failed run_id=%d recipient_id=%d: %s",
+            run_id,
+            recipient_id,
+            exc,
+        )
+        raise HTTPException(status_code=500, detail="Internal remove error")
+
+    return {
+        "run_id": run_id,
+        "recipient_id": recipient_id,
+        "recipient": _recipient_dict(r),
+        "message": "Получатель исключён из snapshot (manual_removed)",
+    }
+
+
+# ==========================================================================
+# Manual add recipient to preview snapshot
+# ==========================================================================
+
+
+class AddRecipientRequest(BaseModel):
+    """Запрос на добавление клиента в preview snapshot.
+
+    Нужно указать хотя бы одно из: phone или altegio_client_id.
+    Если передан только phone — клиент ищется в локальной БД для
+    получения altegio_client_id (необходим для CRM-проверки).
+    """
+
+    phone: str | None = None
+    altegio_client_id: int | None = None
+
+
+@router.post("/runs/{run_id}/recipients/add", status_code=201)
+async def add_recipient(run_id: int, body: AddRecipientRequest) -> dict[str, Any]:
+    """Добавить клиента в preview snapshot вручную.
+
+    Алгоритм:
+      1. Проверить, что run — editable preview (completed, не используется send-real).
+      2. Нормализовать phone, найти клиента в локальной БД.
+      3. Проверить дубликат в snapshot.
+      4. Вызвать Altegio CRM API: получить записи, классифицировать, проверить eligible.
+      5. Если клиент не eligible — вернуть 422 с excluded_reason.
+      6. Создать CampaignRecipient, пересчитать счётчики run.
+
+    Ограничения:
+      - Для полной проверки eligible нужен altegio_client_id (получается автоматически
+        из локальной БД по phone, или передаётся напрямую).
+      - Если клиент не найден в локальной БД и altegio_client_id не передан — 400.
+    """
+    if not body.phone and body.altegio_client_id is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Нужно указать phone или altegio_client_id",
+        )
+
+    # --- Загрузить и проверить run ---
+    async with SessionLocal() as session:
+        run = await session.get(CampaignRun, run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="Run not found")
+
+    if run.mode != "preview":
+        raise HTTPException(
+            status_code=400,
+            detail="Add recipient доступен только для preview run",
+        )
+    if run.status not in ("completed", "running"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Run status={run.status!r} не позволяет редактирование snapshot",
+        )
+
+    async with SessionLocal() as session:
+        used = await session.scalar(
+            select(func.count())
+            .select_from(CampaignRun)
+            .where(CampaignRun.source_preview_run_id == run_id)
+            .where(CampaignRun.mode == "send-real")
+        )
+    if int(used or 0) > 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Preview уже использован для send-real — редактирование запрещено",
+        )
+
+    company_ids = run.company_ids or []
+    if not company_ids:
+        raise HTTPException(status_code=500, detail="Run has no company_ids")
+    company_id = int(company_ids[0])
+
+    # --- Нормализация phone ---
+    phone_e164: str | None = None
+    if body.phone:
+        phone_e164 = _debug_normalize_phone(body.phone)
+        if not phone_e164:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Невалидный телефон: {body.phone!r}",
+            )
+
+    # --- Поиск клиента в локальной БД ---
+    local_client: Client | None = None
+    altegio_cid: int | None = body.altegio_client_id
+
+    async with SessionLocal() as session:
+        if phone_e164 and altegio_cid is None:
+            stmt = select(Client).where(Client.company_id == company_id, Client.phone_e164 == phone_e164).limit(1)
+            local_client = (await session.execute(stmt)).scalar_one_or_none()
+            if local_client is not None:
+                altegio_cid = local_client.altegio_client_id
+        elif altegio_cid is not None:
+            stmt = (
+                select(Client)
+                .where(
+                    Client.company_id == company_id,
+                    Client.altegio_client_id == altegio_cid,
+                )
+                .limit(1)
+            )
+            local_client = (await session.execute(stmt)).scalar_one_or_none()
+            if local_client is not None and phone_e164 is None:
+                phone_e164 = local_client.phone_e164
+
+    if altegio_cid is None:
+        raise HTTPException(
+            status_code=400,
+            detail=("Клиент не найден в локальной БД; укажите altegio_client_id для прямой проверки в Altegio CRM"),
+        )
+
+    if not phone_e164:
+        raise HTTPException(
+            status_code=400,
+            detail="Не удалось определить phone_e164 для клиента",
+        )
+
+    # --- Проверка дубликата в snapshot ---
+    async with SessionLocal() as session:
+        dup_count = (
+            await session.scalar(
+                select(func.count())
+                .select_from(CampaignRecipient)
+                .where(
+                    CampaignRecipient.campaign_run_id == run_id,
+                    CampaignRecipient.phone_e164 == phone_e164,
+                )
+            )
+        ) or 0
+
+    if dup_count > 0:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Клиент с phone_e164={phone_e164!r} уже есть в snapshot run {run_id}",
+        )
+
+    # --- CRM: проверка eligible ---
+    wa_opted_out = bool(local_client.wa_opted_out) if local_client else False
+    display_name: str | None = local_client.display_name if local_client else None
+    local_client_found = local_client is not None
+
+    crm_error: str | None = None
+    in_period_records: list = []
+    count_before = 0
+    count_after = 0
+    lash_count = 0
+    attended_lash_count = 0
+    service_titles: list[str] = []
+    service_lookup_error: str | None = None
+
+    period_start_utc = _ensure_utc(run.period_start)
+    period_end_utc = _ensure_utc(run.period_end)
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as http:
+            crm_records = await get_client_crm_records(
+                http,
+                company_id=company_id,
+                altegio_client_id=int(altegio_cid),
+            )
+            in_period_records, count_before, count_after = classify_crm_records(
+                crm_records,
+                period_start_utc,
+                period_end_utc,
+            )
+            service_titles = [t for r in in_period_records for t in (r.service_titles or [])]
+            try:
+                lash_count, attended_lash_count, _, _ = await check_lash_services(http, company_id, in_period_records)
+            except ServiceLookupError as exc:
+                service_lookup_error = str(exc)
+    except CrmUnavailableError as exc:
+        crm_error = str(exc)
+    except Exception as exc:
+        logger.exception(
+            "add_recipient CRM error run_id=%d altegio_cid=%s: %s",
+            run_id,
+            altegio_cid,
+            exc,
+        )
+        raise HTTPException(status_code=502, detail=f"Altegio CRM API error: {exc}")
+
+    excluded_reason = compute_excluded_reason(
+        wa_opted_out=wa_opted_out,
+        phone_e164=phone_e164,
+        crm_unavailable=crm_error is not None,
+        service_unavailable=service_lookup_error is not None,
+        count_before=count_before,
+        count_after=count_after,
+        lash_count=lash_count,
+        attended_lash_count=attended_lash_count,
+    )
+
+    if excluded_reason is not None:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": f"Клиент не eligible: {excluded_reason}",
+                "excluded_reason": excluded_reason,
+                "crm_error": crm_error,
+                "service_lookup_error": service_lookup_error,
+                "count_before": count_before,
+                "count_after": count_after,
+                "lash_count": lash_count,
+                "attended_lash_count": attended_lash_count,
+            },
+        )
+
+    # --- Создать CampaignRecipient ---
+    now_iso = datetime.now(timezone.utc).isoformat()
+    async with SessionLocal() as session:
+        async with session.begin():
+            new_r = CampaignRecipient(
+                campaign_run_id=run_id,
+                company_id=company_id,
+                client_id=local_client.id if local_client else None,
+                altegio_client_id=int(altegio_cid),
+                phone_e164=phone_e164,
+                display_name=display_name,
+                total_records_in_period=len(in_period_records),
+                confirmed_records_in_period=sum(1 for r in in_period_records if r.is_confirmed),
+                records_before_period=count_before,
+                records_after_period=count_after,
+                lash_records_in_period=lash_count,
+                confirmed_lash_records_in_period=attended_lash_count,
+                service_titles_in_period=service_titles,
+                total_records_before_period_any=count_before,
+                local_client_found=local_client_found,
+                is_opted_out=wa_opted_out,
+                status="candidate",
+                excluded_reason=None,
+                meta={"manually_added_at": now_iso},
+            )
+            session.add(new_r)
+            await session.flush()
+            new_recipient_id = new_r.id
+
+    await recompute_run_counters(run_id)
+
+    logger.info(
+        "manual_added recipient_id=%d run_id=%d phone=%s",
+        new_recipient_id,
+        run_id,
+        phone_e164,
+    )
+
+    async with SessionLocal() as session:
+        r = await session.get(CampaignRecipient, new_recipient_id)
+
+    return {
+        "run_id": run_id,
+        "recipient": _recipient_dict(r),
+        "message": "Получатель добавлен в snapshot",
+    }
+
+
+# ==========================================================================
 # Resume
 # ==========================================================================
 
@@ -1543,7 +1884,9 @@ def _run_summary(run: CampaignRun) -> dict[str, Any]:
         "completed_at": _iso(run.completed_at),
         # Preview-специфичные поля
         "is_preview": run.mode == "preview",
-        "is_discardable": (run.mode == "preview" and run.status not in ("discarded",)),
+        "is_discardable": (run.mode == "preview" and run.status not in ("discarded", "deleted")),
+        "is_deletable": (run.mode == "preview" and run.status != "deleted"),
+        "is_snapshot_editable": (run.mode == "preview" and run.status in ("completed", "running")),
         "excluded": {
             "opted_out": run.excluded_opted_out or 0,
             "no_phone": run.excluded_no_phone or 0,
