@@ -15,6 +15,7 @@ from altegio_bot.altegio_records import (
     client_has_future_appointments,
     count_attended_client_visits,
 )
+from altegio_bot.campaigns.runner import CAMPAIGN_EXECUTION_JOB_TYPE
 from altegio_bot.db import SessionLocal
 from altegio_bot.message_planner import MAX_VISITS_FOR_REVIEW
 from altegio_bot.meta_templates import (
@@ -225,6 +226,7 @@ async def _lock_next_jobs(
     stmt = (
         select(MessageJob)
         .where(MessageJob.status == "queued")
+        .where(MessageJob.job_type != CAMPAIGN_EXECUTION_JOB_TYPE)
         .where(MessageJob.run_at <= now)
         .order_by(MessageJob.run_at.asc())
         .limit(batch_size)
@@ -552,6 +554,19 @@ async def _run_job_logic(
     job: MessageJob,
     provider: WhatsAppProvider,
 ) -> None:
+    # Safety guard: orchestrator jobs must never reach outbox_worker.
+    # _lock_next_jobs() already excludes them, but if somehow an execution job
+    # arrives here (e.g. via direct process_job_in_session call), requeue it so
+    # campaign_worker can pick it up, rather than letting it fail with "No phone_e164".
+    if job.job_type == CAMPAIGN_EXECUTION_JOB_TYPE:
+        logger.error(
+            "outbox_worker received campaign execution job_id=%s — requeuing for campaign_worker",
+            job.id,
+        )
+        job.status = "queued"
+        job.locked_at = None
+        return
+
     success = await _find_success_outbox(session, job.id)
     if success is not None:
         logger.info(
@@ -975,6 +990,7 @@ async def run_once(
         stmt = (
             select(MessageJob.id)
             .where(MessageJob.status == "queued")
+            .where(MessageJob.job_type != CAMPAIGN_EXECUTION_JOB_TYPE)
             .where(MessageJob.run_at <= func.now())
             .order_by(MessageJob.run_at.asc(), MessageJob.id.asc())
             .limit(limit)
