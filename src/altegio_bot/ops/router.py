@@ -2554,6 +2554,7 @@ def _campaign_status_badge(status: str | None) -> str:
         "queued": "secondary",
         "paused": "warning",
         "discarded": "light",
+        "deleted": "dark",
     }
     color = colors.get(status, "secondary")
     return f'<span class="badge bg-{color} text-dark">{_esc(status)}</span>'
@@ -2620,6 +2621,9 @@ async def ops_campaigns_list(request: Request) -> str:
             conditions.append(CampaignRun.mode == mode_filter)
         if status_filter:
             conditions.append(CampaignRun.status == status_filter)
+        else:
+            # По умолчанию скрываем soft-deleted runs
+            conditions.append(CampaignRun.status != "deleted")
 
         stmt = select(CampaignRun).where(*conditions).order_by(CampaignRun.created_at.desc()).limit(limit)
         runs = (await session.execute(stmt)).scalars().all()
@@ -2627,12 +2631,22 @@ async def ops_campaigns_list(request: Request) -> str:
         total_stmt = select(func.count()).select_from(CampaignRun).where(*conditions)
         total: int = (await session.scalar(total_stmt)) or 0
 
+        # Batch-check which preview runs are already used by a send-real
+        preview_ids = {r.id for r in runs if r.mode == "preview"}
+        used_as_source_ids: set[int] = set()
+        if preview_ids:
+            src_stmt = select(CampaignRun.source_preview_run_id).where(
+                CampaignRun.source_preview_run_id.in_(preview_ids),
+                CampaignRun.mode == "send-real",
+            )
+            used_as_source_ids = {row[0] for row in (await session.execute(src_stmt)).all() if row[0] is not None}
+
     filter_form = _filter_form(
         "/ops/campaigns",
         [
             ("company_id", "Кабинет / филиал (ID)", "text", company_id_str),
             ("mode", "Mode", "select:preview,send-real", mode_filter),
-            ("status", "Status", "select:running,completed,failed,queued", status_filter),
+            ("status", "Status", "select:running,completed,failed,queued,discarded,deleted", status_filter),
             ("limit", "Limit", "text", str(limit)),
         ],
     )
@@ -2656,18 +2670,45 @@ async def ops_campaigns_list(request: Request) -> str:
     for run in runs:
         meta = run.meta or {}
         last_error = meta.get("last_error", "")
-        # Действия зависят от режима и статуса
-        if run.mode == "preview" and run.status not in ("discarded",):
+        # Действия зависят от режима, статуса и признака used_as_source
+        is_used = run.id in used_as_source_ids
+        if run.mode == "preview" and run.status == "completed" and not is_used:
+            # Editable: Run / Discard / Delete / (can edit snapshot)
             actions = (
                 f'<a href="/ops/campaigns/{run.id}" class="btn btn-sm btn-outline-primary me-1">open</a>'
                 f'<button class="btn btn-sm btn-success me-1" '
                 f'onclick="runFromPreview({run.id})" title="Run campaign from this preview">'
                 f"▶ Run</button>"
-                f'<button class="btn btn-sm btn-outline-danger" '
+                f'<button class="btn btn-sm btn-outline-warning me-1" '
                 f'onclick="discardPreview({run.id})" title="Discard this preview">'
-                f"✕ Discard</button>"
+                f"⊘ Discard</button>"
+                f'<button class="btn btn-sm btn-outline-danger" '
+                f'onclick="deletePreview({run.id})" title="Delete this preview">'
+                f"🗑 Delete</button>"
+            )
+        elif run.mode == "preview" and run.status == "completed" and is_used:
+            # Used as source — snapshot and discard/delete locked (backend forbids both)
+            actions = (
+                f'<a href="/ops/campaigns/{run.id}" class="btn btn-sm btn-outline-primary me-1">open</a>'
+                f'<span class="text-muted small">used as source</span>'
+            )
+        elif run.mode == "preview" and run.status == "running":
+            # Running — no edit actions; snapshot being built
+            actions = (
+                f'<a href="/ops/campaigns/{run.id}" class="btn btn-sm btn-outline-primary me-1">open</a>'
+                f'<span class="text-muted small">running…</span>'
             )
         elif run.mode == "preview" and run.status == "discarded":
+            actions = (
+                f'<a href="/ops/campaigns/{run.id}" class="btn btn-sm btn-outline-secondary me-1">open</a>'
+                f'<button class="btn btn-sm btn-outline-danger" '
+                f'onclick="deletePreview({run.id})" title="Delete this preview">'
+                f"🗑 Delete</button>"
+            )
+        elif run.mode == "preview" and run.status == "deleted":
+            actions = f'<a href="/ops/campaigns/{run.id}" class="btn btn-sm btn-outline-secondary">open</a>'
+        elif run.mode == "preview":
+            # failed / queued / other preview states
             actions = f'<a href="/ops/campaigns/{run.id}" class="btn btn-sm btn-outline-secondary">open</a>'
         else:
             actions = f'<a href="/ops/campaigns/{run.id}" class="btn btn-sm btn-outline-primary">open</a>'
@@ -2719,6 +2760,17 @@ async function discardPreview(runId) {{
     setListAlert("success", "Preview run #" + runId + " помечен как discarded. Обновите страницу.");
   }} else {{
     setListAlert("danger", "Ошибка: " + (data.detail || JSON.stringify(data)));
+  }}
+}}
+
+async function deletePreview(runId) {{
+  if (!confirm("Удалить preview run #" + runId + "? Soft-delete. Данные сохраняются.")) return;
+  const resp = await fetch("/ops/campaigns/runs/" + runId + "/delete", {{method: "POST"}});
+  const data = await resp.json();
+  if (resp.ok) {{
+    setListAlert("success", "Preview run #" + runId + " удалён. Обновите страницу.");
+  }} else {{
+    setListAlert("danger", "Ошибка удаления: " + (data.detail || JSON.stringify(data)));
   }}
 }}
 
@@ -3744,6 +3796,19 @@ async def ops_campaign_run_detail(run_id: int) -> str:
         recipients_by_status: dict[str, int] = {row.status: int(row.cnt) for row in recipient_rows}
         recipients_total = sum(recipients_by_status.values())
 
+        # Проверить, используется ли preview как источник для send-real
+        used_as_source = False
+        if run.mode == "preview":
+            src_count = await session.scalar(
+                select(func.count())
+                .select_from(CampaignRun)
+                .where(
+                    CampaignRun.source_preview_run_id == run_id,
+                    CampaignRun.mode == "send-real",
+                )
+            )
+            used_as_source = int(src_count or 0) > 0
+
     meta = run.meta or {}
     last_error = meta.get("last_error")
 
@@ -3757,18 +3822,77 @@ async def ops_campaign_run_detail(run_id: int) -> str:
 
     # Действия для preview run
     preview_actions_block = ""
-    if run.mode == "preview" and run.status not in ("discarded",):
+    if run.mode == "preview" and run.status == "deleted":
+        preview_actions_block = (
+            '<div class="alert alert-dark mb-3">'
+            "Этот preview-run был удалён (soft-delete). Данные сохранены для аудита."
+            "</div>"
+        )
+    elif run.mode == "preview" and run.status == "running":
+        preview_actions_block = (
+            '<div class="alert alert-info mb-3">'
+            "Preview запускается — snapshot ещё строится. "
+            "Редактирование, удаление и добавление получателей недоступны до завершения."
+            "</div>"
+        )
+    elif run.mode == "preview" and run.status == "discarded":
         preview_actions_block = f"""
-<div class="alert alert-info d-flex align-items-center gap-3 mb-3">
-  <span>Это preview-run. Вы можете запустить send-real на основе этого снимка или дискардить его.</span>
-  <a href="/ops/campaigns/new-clients?from_preview={run_id}"
-     class="btn btn-success btn-sm">▶ Run from preview</a>
+<div class="alert alert-secondary d-flex align-items-center gap-3 mb-3">
+  <span>Этот preview-run был дискарден.</span>
   <button class="btn btn-outline-danger btn-sm"
-          onclick="discardAndRefresh({run_id})">✕ Discard preview</button>
+          onclick="deleteAndRedirect({run_id})">🗑 Удалить окончательно</button>
 </div>
 """
-    elif run.mode == "preview" and run.status == "discarded":
-        preview_actions_block = '<div class="alert alert-secondary mb-3">Этот preview-run был дискарден.</div>'
+    elif run.mode == "preview" and run.status == "completed" and used_as_source:
+        # Snapshot used by send-real — discard/delete/edit all forbidden by backend
+        preview_actions_block = f"""
+<div class="alert alert-warning d-flex align-items-center gap-3 mb-3 flex-wrap">
+  <span>Preview уже использован для send-real. Редактирование snapshot и удаление заблокированы.</span>
+  <a href="/ops/campaigns/new-clients?from_preview={run_id}"
+     class="btn btn-success btn-sm">▶ Run again</a>
+</div>
+"""
+    elif run.mode == "preview" and run.status == "completed":
+        preview_actions_block = f"""
+<div class="alert alert-info d-flex align-items-center gap-3 mb-3 flex-wrap">
+  <span>Это preview-run. Запустите send-real или отредактируйте snapshot.</span>
+  <a href="/ops/campaigns/new-clients?from_preview={run_id}"
+     class="btn btn-success btn-sm">▶ Run from preview</a>
+  <button class="btn btn-outline-warning btn-sm"
+          onclick="discardAndRefresh({run_id})">⊘ Discard</button>
+  <button class="btn btn-outline-danger btn-sm"
+          onclick="deleteAndRedirect({run_id})">🗑 Delete</button>
+  <button class="btn btn-outline-secondary btn-sm"
+          onclick="showAddRecipientForm()">➕ Add recipient</button>
+</div>
+<div id="add-recipient-form" class="card mb-3 d-none">
+  <div class="card-header">➕ Добавить получателя в snapshot</div>
+  <div class="card-body">
+    <div class="row g-2 align-items-end">
+      <div class="col-auto">
+        <label class="form-label small mb-1">Phone</label>
+        <input id="add-phone" type="text" class="form-control form-control-sm" placeholder="+49...">
+      </div>
+      <div class="col-auto">
+        <label class="form-label small mb-1">Altegio Client ID</label>
+        <input id="add-altegio-cid" type="number" class="form-control form-control-sm" placeholder="необязательно">
+      </div>
+      <div class="col-auto">
+        <button class="btn btn-primary btn-sm" onclick="submitAddRecipient({run_id})">Добавить</button>
+        <button class="btn btn-outline-secondary btn-sm ms-1" onclick="hideAddRecipientForm()">Отмена</button>
+      </div>
+    </div>
+    <div id="add-recipient-alert" class="mt-2"></div>
+  </div>
+</div>
+"""
+    elif run.mode == "preview":
+        # failed / queued / other — no editing, no delete
+        preview_actions_block = f"""
+<div class="alert alert-secondary mb-3">
+  <span>Preview run (status={run.status!r}). Действия недоступны.</span>
+</div>
+"""
 
     # --- Summary block ---
     summary_block = f"""
@@ -3999,6 +4123,56 @@ async function discardAndRefresh(runId) {{
       (data.detail || JSON.stringify(data)) + '</div>';
   }}
 }}
+
+async function deleteAndRedirect(runId) {{
+  if (!confirm("Удалить preview run #" + runId + "? Run скроется из списка. Данные сохранятся для аудита.")) return;
+  const el = document.getElementById("detail-alert");
+  const resp = await fetch("/ops/campaigns/runs/" + runId + "/delete", {{method: "POST"}});
+  const data = await resp.json();
+  if (resp.ok) {{
+    el.innerHTML = '<div class="alert alert-success">Run удалён. '
+      + '<a href="/ops/campaigns">Вернуться в список.</a></div>';
+  }} else {{
+    el.innerHTML = '<div class="alert alert-danger">Ошибка удаления: ' +
+      (data.detail || JSON.stringify(data)) + '</div>';
+  }}
+}}
+
+function showAddRecipientForm() {{
+  document.getElementById("add-recipient-form").classList.remove("d-none");
+}}
+function hideAddRecipientForm() {{
+  document.getElementById("add-recipient-form").classList.add("d-none");
+  document.getElementById("add-recipient-alert").innerHTML = "";
+}}
+
+async function submitAddRecipient(runId) {{
+  const phone = document.getElementById("add-phone").value.trim();
+  const cid = document.getElementById("add-altegio-cid").value.trim();
+  const alertEl = document.getElementById("add-recipient-alert");
+  if (!phone && !cid) {{
+    alertEl.innerHTML = '<div class="alert alert-warning py-1 mb-0">Укажите phone или altegio_client_id</div>';
+    return;
+  }}
+  const body = {{}};
+  if (phone) body.phone = phone;
+  if (cid) body.altegio_client_id = parseInt(cid);
+  const resp = await fetch("/ops/campaigns/runs/" + runId + "/recipients/add", {{
+    method: "POST",
+    headers: {{"Content-Type": "application/json"}},
+    body: JSON.stringify(body),
+  }});
+  const data = await resp.json();
+  if (resp.ok) {{
+    alertEl.innerHTML = '<div class="alert alert-success py-1 mb-0">Получатель добавлен (id=' +
+      data.recipient.id + '). <a href="">Обновите страницу.</a></div>';
+  }} else {{
+    const detail = typeof data.detail === "object"
+      ? (data.detail.message || JSON.stringify(data.detail))
+      : (data.detail || JSON.stringify(data));
+    alertEl.innerHTML = '<div class="alert alert-danger py-1 mb-0">Ошибка: ' + detail + '</div>';
+  }}
+}}
 </script>
 """
     return _page(f"Campaign Run {run_id}", body)
@@ -4028,6 +4202,19 @@ async def ops_campaign_recipients(request: Request, run_id: int) -> str:
                 '<div class="alert alert-danger">Campaign run not found.</div>',
             )
 
+        # Check if snapshot is still editable (not used by send-real)
+        used_as_source = False
+        if run.mode == "preview":
+            src_count = await session.scalar(
+                select(func.count())
+                .select_from(CampaignRun)
+                .where(
+                    CampaignRun.source_preview_run_id == run_id,
+                    CampaignRun.mode == "send-real",
+                )
+            )
+            used_as_source = int(src_count or 0) > 0
+
         conditions: list[Any] = [CampaignRecipient.campaign_run_id == run_id]
         if status_filter:
             conditions.append(CampaignRecipient.status == status_filter)
@@ -4054,7 +4241,10 @@ async def ops_campaign_recipients(request: Request, run_id: int) -> str:
         ],
     )
 
-    cols = [
+    # Remove button только для completed preview, не используемого send-real
+    is_editable_preview = run.mode == "preview" and run.status == "completed" and not used_as_source
+
+    base_cols = [
         "ID",
         "Client ID",
         "Name",
@@ -4069,27 +4259,54 @@ async def ops_campaign_recipients(request: Request, run_id: int) -> str:
         "Booked",
         "Followup",
     ]
+    cols = base_cols + ([""] if is_editable_preview else [])
     rows = []
     for r in recipients:
-        rows.append(
-            [
-                str(r.id),
-                str(r.client_id or ""),
-                _esc(r.display_name or ""),
-                _esc(r.phone_e164 or ""),
-                _status_badge(r.status),
-                _esc(r.excluded_reason or ""),
-                _esc(r.loyalty_card_number or ""),
-                str(r.message_job_id or ""),
-                _esc(_fmt_dt(r.sent_at, tz)),
-                _esc(_fmt_dt(r.read_at, tz)),
-                _esc(_fmt_dt(r.replied_at, tz)),
-                _esc(_fmt_dt(r.booked_after_at, tz)),
-                _esc(r.followup_status or ""),
-            ]
-        )
+        row = [
+            str(r.id),
+            str(r.client_id or ""),
+            _esc(r.display_name or ""),
+            _esc(r.phone_e164 or ""),
+            _status_badge(r.status),
+            _esc(r.excluded_reason or ""),
+            _esc(r.loyalty_card_number or ""),
+            str(r.message_job_id or ""),
+            _esc(_fmt_dt(r.sent_at, tz)),
+            _esc(_fmt_dt(r.read_at, tz)),
+            _esc(_fmt_dt(r.replied_at, tz)),
+            _esc(_fmt_dt(r.booked_after_at, tz)),
+            _esc(r.followup_status or ""),
+        ]
+        if is_editable_preview:
+            if r.excluded_reason == "manual_removed":
+                row.append('<span class="text-muted small">removed</span>')
+            else:
+                row.append(
+                    f'<button class="btn btn-sm btn-outline-danger" '
+                    f'onclick="removeRecipient({run_id},{r.id})">✕ Remove</button>'
+                )
+        rows.append(row)
 
     table_html = _table(cols, rows) if rows else '<p class="text-muted">Нет получателей по заданным фильтрам.</p>'
+
+    remove_js = ""
+    if is_editable_preview:
+        remove_js = """
+<script>
+async function removeRecipient(runId, recipientId) {
+  if (!confirm("Исключить получателя #" + recipientId + " из snapshot? (soft-remove)")) return;
+  const resp = await fetch(
+    "/ops/campaigns/runs/" + runId + "/recipients/" + recipientId + "/remove",
+    {method: "POST"}
+  );
+  const data = await resp.json();
+  if (resp.ok) {
+    location.reload();
+  } else {
+    alert("Ошибка: " + (data.detail || JSON.stringify(data)));
+  }
+}
+</script>"""
 
     body = f"""
 <div class="d-flex justify-content-between align-items-center mb-3">
@@ -4101,6 +4318,7 @@ async def ops_campaign_recipients(request: Request, run_id: int) -> str:
 </div>
 {filter_form}
 {table_html}
+{remove_js}
 """
     return _page(f"Recipients — Run {run_id}", body)
 

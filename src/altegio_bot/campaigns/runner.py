@@ -1289,8 +1289,12 @@ async def discard_preview_run(run_id: int) -> None:
             if run.mode != "preview":
                 raise ValueError(f"Discard доступен только для preview run. mode={run.mode!r}")
 
-            if run.status == "discarded":
-                raise ValueError(f"CampaignRun {run_id} уже discarded")
+            # Discard разрешён только для completed preview.
+            # running → race condition: run_preview() ещё записывает статус.
+            # discarded/deleted → уже в терминальном состоянии.
+            # failed/queued → нестабильные состояния, discard не имеет смысла.
+            if run.status != "completed":
+                raise ValueError(f"Discard доступен только для completed preview. status={run.status!r}")
 
             # Проверить: не использован ли этот preview как источник send-real
             used_as_source = await session.scalar(
@@ -1309,3 +1313,218 @@ async def discard_preview_run(run_id: int) -> None:
             run.meta = meta
 
     logger.info("preview run_id=%d discarded", run_id)
+
+
+# ==========================================================================
+# Counter recompute from existing DB recipients
+# ==========================================================================
+
+
+def _update_run_counters_from_recipients(
+    run: CampaignRun,
+    recipients: list[CampaignRecipient],
+) -> None:
+    """Пересчитать счётчики CampaignRun по существующим CampaignRecipient.
+
+    Идемпотентна: обнуляет все агрегаты перед накоплением.
+    Логика маппинга excluded_reason → счётчики идентична
+    _update_run_exclusion_counters.  Используется после ручного
+    добавления / удаления получателей из snapshot.
+
+    Причина «manual_removed» не маппируется ни в один специализированный
+    счётчик — такой получатель виден в total_clients_seen, но не в
+    candidates_count и не в excluded_*.
+    """
+    run.total_clients_seen = 0
+    run.candidates_count = 0
+    run.excluded_opted_out = 0
+    run.excluded_no_phone = 0
+    run.excluded_has_records_before = 0
+    run.excluded_multiple_records = 0
+    run.excluded_more_than_one_record = 0
+    run.excluded_no_confirmed_record = 0
+    run.excluded_crm_unavailable = 0
+    run.excluded_service_category_unavailable = 0
+    run.excluded_returned_after_visit = 0
+
+    run.total_clients_seen = len(recipients)
+
+    for r in recipients:
+        reason = r.excluded_reason
+        if not reason:
+            run.candidates_count += 1
+            continue
+        if reason == "opted_out":
+            run.excluded_opted_out += 1
+        elif reason == "no_phone":
+            run.excluded_no_phone += 1
+        elif reason == "has_records_before_period":
+            run.excluded_has_records_before += 1
+        elif reason in ("multiple_records_in_period", "multiple_lash_records_in_period"):
+            run.excluded_multiple_records += 1
+            run.excluded_more_than_one_record += 1
+        elif reason in (
+            "no_confirmed_record_in_period",
+            "no_lash_record_in_period",
+            "no_confirmed_lash_record_in_period",
+        ):
+            run.excluded_no_confirmed_record += 1
+        elif reason == "crm_history_unavailable":
+            run.excluded_crm_unavailable += 1
+        elif reason == "service_category_unavailable":
+            run.excluded_service_category_unavailable += 1
+        elif reason == "returned_after_first_visit":
+            run.excluded_returned_after_visit += 1
+        # "manual_removed" и прочие нестандартные причины:
+        # учитываются только в total_clients_seen.
+
+
+async def recompute_run_counters(run_id: int) -> None:
+    """Загрузить получателей из БД и пересчитать счётчики CampaignRun.
+
+    Используется после ручного изменения snapshot (add/remove recipient).
+    """
+    async with SessionLocal() as session:
+        async with session.begin():
+            run = await session.get(CampaignRun, run_id)
+            if run is None:
+                raise ValueError(f"CampaignRun {run_id} not found")
+
+            stmt = select(CampaignRecipient).where(CampaignRecipient.campaign_run_id == run_id)
+            recipients = list((await session.execute(stmt)).scalars().all())
+
+            _update_run_counters_from_recipients(run, recipients)
+
+    logger.info(
+        "recompute_run_counters run_id=%d total_seen=%d",
+        run_id,
+        len(recipients),
+    )
+
+
+# ==========================================================================
+# Delete preview run (soft-delete)
+# ==========================================================================
+
+
+async def delete_preview_run(run_id: int) -> None:
+    """Soft-delete preview run: status='deleted', recipients сохраняются.
+
+    Правила:
+    - Только для mode='preview'.
+    - Запрещено, если preview используется как source_preview_run_id в
+      каком-либо send-real.
+    - Запрещено, если run уже 'deleted'.
+    - CampaignRecipient физически НЕ удаляются — аудит сохраняется.
+
+    Raises:
+        ValueError: при нарушении правил.
+    """
+    async with SessionLocal() as session:
+        async with session.begin():
+            run = await session.get(CampaignRun, run_id)
+            if run is None:
+                raise ValueError(f"CampaignRun {run_id} not found")
+
+            if run.mode != "preview":
+                raise ValueError(f"Delete доступен только для preview run. mode={run.mode!r}")
+
+            if run.status == "deleted":
+                raise ValueError(f"CampaignRun {run_id} уже удалён")
+
+            if run.status not in ("completed", "discarded"):
+                raise ValueError(f"Delete доступен только для completed или discarded preview. status={run.status!r}")
+
+            used_as_source = await session.scalar(
+                select(func.count())
+                .select_from(CampaignRun)
+                .where(CampaignRun.source_preview_run_id == run_id)
+                .where(CampaignRun.mode == "send-real")
+            )
+            if int(used_as_source or 0) > 0:
+                raise ValueError(f"Preview run {run_id} используется как источник для send-real — удаление запрещено.")
+
+            run.status = "deleted"
+            run.completed_at = utcnow()
+            meta = dict(run.meta or {})
+            meta["deleted_at"] = utcnow().isoformat()
+            run.meta = meta
+
+    logger.info("preview run_id=%d soft-deleted", run_id)
+
+
+# ==========================================================================
+# Remove recipient from preview (soft-exclude)
+# ==========================================================================
+
+
+async def remove_recipient_from_preview(
+    run_id: int,
+    recipient_id: int,
+) -> CampaignRecipient:
+    """Мягко исключить получателя из preview snapshot.
+
+    Устанавливает status='skipped', excluded_reason='manual_removed'.
+    Пересчитывает счётчики run через recompute_run_counters.
+
+    Правила:
+    - run должен быть mode='preview' и status='completed'.
+    - run не должен использоваться как source_preview_run_id в send-real.
+    - recipient должен принадлежать указанному run.
+    - Повторный вызов на уже excluded получателе — idempotent.
+
+    Raises:
+        ValueError: при нарушении правил.
+    """
+    async with SessionLocal() as session:
+        async with session.begin():
+            run = await session.get(CampaignRun, run_id)
+            if run is None:
+                raise ValueError(f"CampaignRun {run_id} not found")
+
+            if run.mode != "preview":
+                raise ValueError(f"Редактирование snapshot доступно только для preview run. mode={run.mode!r}")
+
+            if run.status != "completed":
+                raise ValueError(
+                    f"Редактирование snapshot доступно только для completed preview. status={run.status!r}"
+                )
+
+            used_as_source = await session.scalar(
+                select(func.count())
+                .select_from(CampaignRun)
+                .where(CampaignRun.source_preview_run_id == run_id)
+                .where(CampaignRun.mode == "send-real")
+            )
+            if int(used_as_source or 0) > 0:
+                raise ValueError(
+                    f"Preview run {run_id} уже использован как источник для send-real — редактирование запрещено."
+                )
+
+            recipient = await session.get(CampaignRecipient, recipient_id)
+            if recipient is None:
+                raise ValueError(f"CampaignRecipient {recipient_id} not found")
+
+            if recipient.campaign_run_id != run_id:
+                raise ValueError(f"CampaignRecipient {recipient_id} не принадлежит run {run_id}")
+
+            if recipient.excluded_reason != "manual_removed":
+                meta = dict(recipient.meta or {})
+                meta["manually_removed_at"] = utcnow().isoformat()
+                recipient.meta = meta
+                recipient.status = "skipped"
+                recipient.excluded_reason = "manual_removed"
+
+    await recompute_run_counters(run_id)
+
+    logger.info(
+        "manual_removed recipient_id=%d run_id=%d",
+        recipient_id,
+        run_id,
+    )
+
+    async with SessionLocal() as session:
+        r = await session.get(CampaignRecipient, recipient_id)
+        if r is None:
+            raise RuntimeError(f"CampaignRecipient {recipient_id} disappeared after removal")
+        return r
