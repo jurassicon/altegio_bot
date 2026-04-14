@@ -484,6 +484,7 @@ async def debug_client_segmentation(
     crm_records: list[CrmRecord] = []
     in_period_records: list[CrmRecord] = []
     count_before: int = 0
+    count_after: int = 0
     lash_count: int = 0
     attended_lash_count: int = 0
     confirmed_count: int = 0
@@ -499,7 +500,9 @@ async def debug_client_segmentation(
             )
 
             # 3. Разбить по периоду
-            in_period_records, count_before = classify_crm_records(crm_records, period_start_utc, period_end_utc)
+            in_period_records, count_before, count_after = classify_crm_records(
+                crm_records, period_start_utc, period_end_utc
+            )
 
             # 4. Подтверждённые записи (диагностика, не является критерием eligible)
             confirmed_count = sum(1 for r in in_period_records if r.is_confirmed)
@@ -526,6 +529,7 @@ async def debug_client_segmentation(
         crm_unavailable=crm_error is not None,
         service_unavailable=service_lookup_error is not None,
         count_before=count_before,
+        count_after=count_after,
         lash_count=lash_count,
         attended_lash_count=attended_lash_count,
     )
@@ -569,6 +573,7 @@ async def debug_client_segmentation(
         if crm_error
         else {
             "count_before_period": count_before,
+            "count_after_period": count_after,
             "in_period_records": [_crm_rec_dict(r) for r in in_period_records],
             "total_in_period": len(in_period_records),
             "confirmed_in_period": confirmed_count,
@@ -756,7 +761,9 @@ async def debug_clients_batch(body: BatchDebugRequest) -> dict[str, Any]:
                     company_id=body.company_id,
                     altegio_client_id=int(local_client.altegio_client_id),
                 )
-                in_period_recs, count_before = classify_crm_records(crm_records, period_start_utc, period_end_utc)
+                in_period_recs, count_before, count_after_batch = classify_crm_records(
+                    crm_records, period_start_utc, period_end_utc
+                )
 
                 lash_count = 0
                 attended_lash_count = 0
@@ -771,6 +778,7 @@ async def debug_clients_batch(body: BatchDebugRequest) -> dict[str, Any]:
                 entry["crm_records_total"] = len(crm_records)
                 entry["crm_in_period"] = len(in_period_recs)
                 entry["crm_before_period"] = count_before
+                entry["crm_after_period"] = count_after_batch
                 entry["lash_in_period"] = lash_count
                 entry["attended_lash_in_period"] = attended_lash_count
 
@@ -780,6 +788,7 @@ async def debug_clients_batch(body: BatchDebugRequest) -> dict[str, Any]:
                     crm_unavailable=False,
                     service_unavailable=service_lookup_error is not None,
                     count_before=count_before,
+                    count_after=count_after_batch,
                     lash_count=lash_count,
                     attended_lash_count=attended_lash_count,
                 )

@@ -8,8 +8,12 @@
      записями имеют confirmed=1, но attendance=0 — они НЕ eligible.
   3. ДО начала периода у него нет НИ ОДНОЙ записи в Altegio CRM
      (любой услуги, любого статуса).
-  4. Есть phone_e164.
-  5. Не в wa_opted_out.
+  4. ПОСЛЕ периода у него нет ни одной не удалённой записи. Если есть —
+     клиент уже вернулся сам и не нуждается в welcome-рассылке.
+     Статус будущей записи не важен: подтверждённая, «Пришел», запланированная —
+     любая считается возвратом.
+  5. Есть phone_e164.
+  6. Не в wa_opted_out.
 
 Источники истины:
   - Всё из CRM Altegio API (GET /records/{company_id}?client_id=X):
@@ -148,6 +152,11 @@ class ClientCandidate:
     # --- История до периода (источник истины: Altegio CRM API) ---
     records_before_period: int
 
+    # --- Записи после периода (источник истины: Altegio CRM API) ---
+    # Кол-во не удалённых записей с starts_at >= period_end.
+    # Если > 0 → excluded_reason = 'returned_after_first_visit'.
+    records_after_period: int = field(default=0)
+
     # --- Диагностика ---
     # True если Client найден в локальной БД
     local_client_found: bool = field(default=True)
@@ -167,6 +176,7 @@ def compute_excluded_reason(
     crm_unavailable: bool = False,
     service_unavailable: bool = False,
     count_before: int,
+    count_after: int = 0,
     lash_count: int,
     attended_lash_count: int,
 ) -> str | None:
@@ -179,12 +189,14 @@ def compute_excluded_reason(
     Порядок проверок важен: более приоритетные идут первыми.
 
     Args:
-        wa_opted_out:       клиент отписался от WhatsApp рассылок.
-        phone_e164:         нормализованный номер телефона (или None).
-        crm_unavailable:    CRM API вернул ошибку.
+        wa_opted_out:        клиент отписался от WhatsApp рассылок.
+        phone_e164:          нормализованный номер телефона (или None).
+        crm_unavailable:     CRM API вернул ошибку.
         service_unavailable: category lookup для услуг вернул ошибку.
-        count_before:       кол-во записей до начала периода.
-        lash_count:         кол-во ресничных записей в периоде.
+        count_before:        кол-во записей до начала периода.
+        count_after:         кол-во не удалённых записей после окончания периода.
+                             Если > 0 — клиент уже вернулся в салон сам.
+        lash_count:          кол-во ресничных записей в периоде.
         attended_lash_count: кол-во ресничных записей со статусом «Пришел».
 
     Returns:
@@ -200,6 +212,10 @@ def compute_excluded_reason(
         return "service_category_unavailable"
     if count_before > 0:
         return "has_records_before_period"
+    # Клиент уже вернулся в салон после окончания периода — рассылка не нужна.
+    # Статус записи не важен: любая не удалённая запись после period_end означает возврат.
+    if count_after > 0:
+        return "returned_after_first_visit"
     if lash_count == 0:
         return "no_lash_record_in_period"
     # 2+ lash-записей — excluded даже если одна из них с attendance=1
@@ -225,6 +241,7 @@ def _classify(candidate: ClientCandidate) -> None:
         crm_unavailable=candidate.excluded_reason == "crm_history_unavailable",
         service_unavailable=candidate.excluded_reason == "service_category_unavailable",
         count_before=candidate.records_before_period,
+        count_after=candidate.records_after_period,
         lash_count=candidate.lash_records_in_period,
         attended_lash_count=candidate.confirmed_lash_records_in_period,
     )
@@ -362,8 +379,8 @@ async def _process_one_client(
                     snapshot, "crm_history_unavailable", local_client_found=local_client_found
                 )
 
-            # Разбить на in-period и before-period
-            in_period_records, count_before = classify_crm_records(crm_records, period_start, period_end)
+            # Разбить на in-period, before-period и after-period
+            in_period_records, count_before, count_after = classify_crm_records(crm_records, period_start, period_end)
 
             # Базовые счётчики по in-period записям
             total_in_period = len(in_period_records)
@@ -392,6 +409,7 @@ async def _process_one_client(
                 confirmed_lash_records_in_period=confirmed_lash_count,
                 service_titles_in_period=service_titles,
                 records_before_period=count_before,
+                records_after_period=count_after,
                 local_client_found=local_client_found,
             )
             _classify(c)
@@ -399,13 +417,14 @@ async def _process_one_client(
                 "segment debug: client_id=%s altegio_client_id=%s "
                 "records_before=%d total_in_period=%d "
                 "lash_in_period=%d attended_lash_in_period=%d "
-                "services=%r → %s",
+                "records_after=%d services=%r → %s",
                 snapshot.id,
                 snapshot.altegio_client_id,
                 count_before,
                 total_in_period,
                 lash_count,
                 confirmed_lash_count,
+                count_after,
                 service_titles,
                 c.excluded_reason if c.excluded_reason else "ELIGIBLE",
             )
@@ -601,7 +620,7 @@ async def find_candidates(
 
     logger.info(
         "segment company_id=%d period=[%s, %s) total=%d eligible=%d"
-        " crm_unavailable=%d service_unavailable=%d no_phone=%d"
+        " crm_unavailable=%d service_unavailable=%d no_phone=%d returned_after=%d"
         " (discovery via CRM API)",
         company_id,
         period_start.date(),
@@ -611,5 +630,6 @@ async def find_candidates(
         sum(1 for c in candidates if c.excluded_reason == "crm_history_unavailable"),
         sum(1 for c in candidates if c.excluded_reason == "service_category_unavailable"),
         sum(1 for c in candidates if c.excluded_reason == "no_phone"),
+        sum(1 for c in candidates if c.excluded_reason == "returned_after_first_visit"),
     )
     return candidates

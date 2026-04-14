@@ -501,8 +501,8 @@ def classify_crm_records(
     records: list[CrmRecord],
     period_start: datetime,
     period_end: datetime,
-) -> tuple[list[CrmRecord], int]:
-    """Разбить записи CRM на «в периоде» и «до периода».
+) -> tuple[list[CrmRecord], int, int]:
+    """Разбить записи CRM на «в периоде», «до периода» и «после периода».
 
     Args:
         records: все записи клиента из CRM.
@@ -510,16 +510,20 @@ def classify_crm_records(
         period_end: конец периода (exclusive), UTC.
 
     Returns:
-        (in_period_records, count_before_period):
-          - in_period_records: не удалённые записи с starts_at в [period_start, period_end)
+        (in_period_records, count_before_period, count_after_period):
+          - in_period_records: не удалённые записи с starts_at в [period_start, period_end).
           - count_before_period: кол-во записей (любого статуса, включая удалённые)
-            с starts_at < period_start.
+            с starts_at < period_start. Консервативно: даже отменённые/удалённые
+            до периода означают, что клиент не новый.
+          - count_after_period: кол-во не удалённых записей с starts_at >= period_end.
+            Если > 0 → клиент уже вернулся в салон после окончания периода кампании.
+            Удалённые записи (cancelled/removed) не считаются: отменённый визит ≠ возврат.
 
-    Записи с starts_at == None попадают в «неизвестные» и не учитываются ни там, ни там.
-    Это консервативно: если дату распарсить нельзя, в неизвестное не засчитываем.
+    Записи с starts_at == None попадают в «неизвестные» и не учитываются.
     """
     in_period: list[CrmRecord] = []
     count_before = 0
+    count_after = 0
 
     for rec in records:
         if rec.starts_at is None:
@@ -529,5 +533,9 @@ def classify_crm_records(
         elif period_start <= rec.starts_at < period_end:
             if not rec.deleted:
                 in_period.append(rec)
+        else:
+            # starts_at >= period_end: запись после окончания периода
+            if not rec.deleted:
+                count_after += 1
 
-    return in_period, count_before
+    return in_period, count_before, count_after

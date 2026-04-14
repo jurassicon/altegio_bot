@@ -673,6 +673,8 @@ class CampaignRun(Base):
     excluded_service_category_unavailable: Mapped[int] = mapped_column(
         Integer, nullable=False, server_default=text("0")
     )
+    # Клиент уже вернулся в салон после окончания периода кампании → рассылка не нужна
+    excluded_returned_after_visit: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
 
     # -----------------------------------------------------------------------
     # Счётчики доставки и атрибуции
@@ -779,6 +781,9 @@ class CampaignRecipient(Base):
     )
     # Все записи до начала периода по данным Altegio CRM (источник истины)
     total_records_before_period_any: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    # Не удалённые записи ПОСЛЕ периода кампании по данным Altegio CRM.
+    # Если > 0 → клиент уже вернулся сам, рассылка не нужна → excluded_reason='returned_after_first_visit'.
+    records_after_period: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
     # Найден ли локальный Client в нашей БД
     local_client_found: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
 
