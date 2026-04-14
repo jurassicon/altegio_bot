@@ -174,6 +174,7 @@ def _build_recipient(
         total_records_in_period=candidate.total_records_in_period,
         confirmed_records_in_period=candidate.confirmed_records_in_period,
         records_before_period=candidate.records_before_period,
+        records_after_period=candidate.records_after_period,
         lash_records_in_period=candidate.lash_records_in_period,
         confirmed_lash_records_in_period=candidate.confirmed_lash_records_in_period,
         service_titles_in_period=candidate.service_titles_in_period or [],
@@ -206,6 +207,7 @@ def _update_run_exclusion_counters(
     run.excluded_no_confirmed_record = 0
     run.excluded_crm_unavailable = 0
     run.excluded_service_category_unavailable = 0
+    run.excluded_returned_after_visit = 0
 
     run.total_clients_seen = len(candidates)
 
@@ -234,6 +236,8 @@ def _update_run_exclusion_counters(
             run.excluded_crm_unavailable += 1
         elif reason == "service_category_unavailable":
             run.excluded_service_category_unavailable += 1
+        elif reason == "returned_after_first_visit":
+            run.excluded_returned_after_visit += 1
 
 
 async def run_preview(params: RunParams) -> CampaignRun:
@@ -421,6 +425,7 @@ async def _load_candidates_from_preview_snapshot(
             confirmed_lash_records_in_period=r.confirmed_lash_records_in_period or 0,
             service_titles_in_period=list(r.service_titles_in_period or []),
             records_before_period=r.records_before_period or 0,
+            records_after_period=r.records_after_period or 0,
             local_client_found=local_client is not None,
             excluded_reason=excluded,
         )

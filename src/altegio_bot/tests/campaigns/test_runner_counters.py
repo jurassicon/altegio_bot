@@ -27,6 +27,7 @@ def _make_run() -> SimpleNamespace:
         excluded_no_confirmed_record=0,
         excluded_crm_unavailable=0,
         excluded_service_category_unavailable=0,
+        excluded_returned_after_visit=0,
     )
 
 
@@ -113,6 +114,38 @@ def test_counters_reset_before_recalculate() -> None:
     assert run.candidates_count == 0  # Сброшено и пересчитано
     assert run.excluded_opted_out == 2
     assert run.total_clients_seen == 2
+
+
+def test_counters_returned_after_visit_mapped() -> None:
+    """returned_after_first_visit корректно попадает в excluded_returned_after_visit."""
+    run = _make_run()
+    candidates = [
+        _make_candidate("returned_after_first_visit"),
+        _make_candidate("returned_after_first_visit"),
+    ]
+    _update_run_exclusion_counters(run, candidates)
+
+    assert run.excluded_returned_after_visit == 2
+    assert run.candidates_count == 0
+    assert run.excluded_has_records_before == 0  # Не смешивается с другими причинами
+
+
+def test_counters_returned_after_visit_idempotent() -> None:
+    """Повторный вызов с returned_after_first_visit не удваивает счётчик."""
+    run = _make_run()
+    candidates = [
+        _make_candidate(None),
+        _make_candidate("returned_after_first_visit"),
+    ]
+
+    _update_run_exclusion_counters(run, candidates)
+    assert run.excluded_returned_after_visit == 1
+    assert run.candidates_count == 1
+
+    # Повторный вызов — должно остаться то же самое
+    _update_run_exclusion_counters(run, candidates)
+    assert run.excluded_returned_after_visit == 1
+    assert run.candidates_count == 1
 
 
 def test_counters_crm_unavailable_mapped() -> None:
