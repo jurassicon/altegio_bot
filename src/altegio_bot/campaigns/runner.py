@@ -207,6 +207,7 @@ def _update_run_exclusion_counters(
     run.excluded_no_confirmed_record = 0
     run.excluded_crm_unavailable = 0
     run.excluded_service_category_unavailable = 0
+    run.excluded_returned_after_visit = 0
 
     run.total_clients_seen = len(candidates)
 
