@@ -758,6 +758,20 @@ async def _process_eligible(
                 recipient.cleanup_card_ids = cleanup.deleted_ids
                 recipient.status = "card_issued"
 
+                # Для CRM-only клиентов (client_id=None) сохраняем phone_e164 в payload,
+                # чтобы outbox_worker мог отправить сообщение без локальной записи Client
+                # (и создать Chatwoot-зеркало по номеру телефона).
+                job_payload: dict = {
+                    "kind": NEWSLETTER_JOB_TYPE,
+                    "loyalty_card_text": loyalty_card_text,
+                    "campaign_run_id": run_id,
+                    "campaign_recipient_id": recipient_id,
+                }
+                if client_id is None:
+                    job_payload["phone_e164"] = phone_e164
+                    if client.display_name:
+                        job_payload["contact_name"] = client.display_name
+
                 await add_job(
                     session,
                     company_id=company_id,
@@ -765,12 +779,7 @@ async def _process_eligible(
                     client_id=client_id,
                     job_type=NEWSLETTER_JOB_TYPE,
                     run_at=run_at,
-                    payload={
-                        "kind": NEWSLETTER_JOB_TYPE,
-                        "loyalty_card_text": loyalty_card_text,
-                        "campaign_run_id": run_id,
-                        "campaign_recipient_id": recipient_id,
-                    },
+                    payload=job_payload,
                 )
 
                 dedupe_key = make_dedupe_key(
@@ -841,16 +850,21 @@ async def _enqueue_newsletter_job_for_recipient(
     *,
     recipient_id: int,
     company_id: int,
-    client_id: int,
+    client_id: int | None,
     run_id: int,
     loyalty_card_number: str,
     loyalty_card_id: str,
     loyalty_card_type_id: str,
+    phone_e164: str | None = None,
+    contact_name: str | None = None,
 ) -> None:
     """Создать MessageJob рассылки и перевести recipient → queued.
 
     Не выполняет cleanup и не выпускает карту. Используется при resume
     для получателей, у которых карта уже выпущена (card_issued, queue_failed).
+
+    Для CRM-only клиентов (client_id=None) передавать phone_e164, чтобы
+    outbox_worker мог отправить сообщение без локальной записи Client.
     """
     loyalty_card_text = make_card_text(loyalty_card_number)
     run_at = utcnow()
@@ -867,6 +881,17 @@ async def _enqueue_newsletter_job_for_recipient(
             # Сбрасываем excluded_reason — получатель теперь снова в пайплайне
             recipient.excluded_reason = None
 
+            resume_payload: dict = {
+                "kind": NEWSLETTER_JOB_TYPE,
+                "loyalty_card_text": loyalty_card_text,
+                "campaign_run_id": run_id,
+                "campaign_recipient_id": recipient_id,
+            }
+            if client_id is None and phone_e164:
+                resume_payload["phone_e164"] = phone_e164
+                if contact_name:
+                    resume_payload["contact_name"] = contact_name
+
             await add_job(
                 session,
                 company_id=company_id,
@@ -874,12 +899,7 @@ async def _enqueue_newsletter_job_for_recipient(
                 client_id=client_id,
                 job_type=NEWSLETTER_JOB_TYPE,
                 run_at=run_at,
-                payload={
-                    "kind": NEWSLETTER_JOB_TYPE,
-                    "loyalty_card_text": loyalty_card_text,
-                    "campaign_run_id": run_id,
-                    "campaign_recipient_id": recipient_id,
-                },
+                payload=resume_payload,
             )
 
             dedupe_key = make_dedupe_key(
@@ -1060,6 +1080,8 @@ async def _resume_candidate_recipient(
             loyalty_card_number=issued_number,
             loyalty_card_id=issued_id,
             loyalty_card_type_id=card_type_id,
+            phone_e164=phone_e164,
+            contact_name=recipient.display_name,
         )
         # Сохранить cleanup_card_ids, если cleanup что-то удалил и поле ещё пустое
         if cleanup.deleted_ids:
@@ -1184,6 +1206,8 @@ async def resume_send_real(run_id: int) -> dict:
                         loyalty_card_number=(recipient.loyalty_card_number or ""),
                         loyalty_card_id=(recipient.loyalty_card_id or ""),
                         loyalty_card_type_id=(recipient.loyalty_card_type_id or card_type_id),
+                        phone_e164=recipient.phone_e164,
+                        contact_name=recipient.display_name,
                     )
                     stats["resumed"] += 1
 

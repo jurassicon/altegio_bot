@@ -15,6 +15,7 @@ from altegio_bot.altegio_records import (
     client_has_future_appointments,
     count_attended_client_visits,
 )
+from altegio_bot.campaigns.runner import CAMPAIGN_EXECUTION_JOB_TYPE
 from altegio_bot.db import SessionLocal
 from altegio_bot.message_planner import MAX_VISITS_FOR_REVIEW
 from altegio_bot.meta_templates import (
@@ -225,6 +226,7 @@ async def _lock_next_jobs(
     stmt = (
         select(MessageJob)
         .where(MessageJob.status == "queued")
+        .where(MessageJob.job_type != CAMPAIGN_EXECUTION_JOB_TYPE)
         .where(MessageJob.run_at <= now)
         .order_by(MessageJob.run_at.asc())
         .limit(batch_size)
@@ -552,6 +554,19 @@ async def _run_job_logic(
     job: MessageJob,
     provider: WhatsAppProvider,
 ) -> None:
+    # Safety guard: orchestrator jobs must never reach outbox_worker.
+    # _lock_next_jobs() already excludes them, but if somehow an execution job
+    # arrives here (e.g. via direct process_job_in_session call), requeue it so
+    # campaign_worker can pick it up, rather than letting it fail with "No phone_e164".
+    if job.job_type == CAMPAIGN_EXECUTION_JOB_TYPE:
+        logger.error(
+            "outbox_worker received campaign execution job_id=%s — requeuing for campaign_worker",
+            job.id,
+        )
+        job.status = "queued"
+        job.locked_at = None
+        return
+
     success = await _find_success_outbox(session, job.id)
     if success is not None:
         logger.info(
@@ -705,7 +720,10 @@ async def _run_job_logic(
                     job.last_error = "Skipped: comeback_3d already sent in the last 30 days"
                     return
 
+    # Effective phone: local client takes priority; CRM-only campaign jobs store phone in payload.
     phone = client.phone_e164 if client else None
+    if phone is None:
+        phone = (getattr(job, "payload", None) or {}).get("phone_e164")
     if not phone:
         job.status = "failed"
         job.locked_at = None
@@ -733,10 +751,14 @@ async def _run_job_logic(
         job.last_error = f"Template render error: {exc}"
         return
 
-    loyalty_card_text = (getattr(job, "payload", None) or {}).get("loyalty_card_text", "")
+    _job_payload = getattr(job, "payload", None) or {}
+    loyalty_card_text = _job_payload.get("loyalty_card_text", "")
 
     if loyalty_card_text:
         msg_ctx["loyalty_card_text"] = loyalty_card_text
+
+    # Effective contact_name for Chatwoot mirror: prefer local client, then payload (CRM-only).
+    contact_name = client.display_name if client else _job_payload.get("contact_name")
 
     attempts = getattr(job, "attempts", 0) + 1
     setattr(job, "attempts", attempts)
@@ -794,7 +816,8 @@ async def _run_job_logic(
             language=TEMPLATE_LANGUAGE,
             params=template_params,
             fallback_text=final_body,
-            contact_name=client.display_name if client else None,
+            contact_name=contact_name,
+            company_id=job.company_id,
         )
         send_meta: dict[str, Any] = {
             "send_type": "template",
@@ -808,7 +831,8 @@ async def _run_job_logic(
             sender_id=sender_id,
             phone=phone,
             text=final_body,
-            contact_name=client.display_name if client else None,
+            contact_name=contact_name,
+            company_id=job.company_id,
         )
         send_meta = {"send_type": "text"}
 
@@ -966,6 +990,7 @@ async def run_once(
         stmt = (
             select(MessageJob.id)
             .where(MessageJob.status == "queued")
+            .where(MessageJob.job_type != CAMPAIGN_EXECUTION_JOB_TYPE)
             .where(MessageJob.run_at <= func.now())
             .order_by(MessageJob.run_at.asc(), MessageJob.id.asc())
             .limit(limit)
