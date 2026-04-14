@@ -68,8 +68,21 @@ class CrmRecord:
     # attendance == 1 означает статус «Пришел» в Altegio.
     # Отличается от confirmed: confirmed=1 — запись активна (не отменена),
     # attendance=1 — клиент фактически явился на приём.
-    # Поле может отсутствовать в ответе CRM (тогда 0 по умолчанию).
+    #
+    # Источник истины: поле ``attendance`` из ответа CRM (Altegio API).
+    # Fallback 1: если ``attendance`` отсутствует или None — используется
+    #             ``visit_attendance`` (присутствует в локальной модели Record
+    #             и может нести тот же семантический смысл «Пришел»).
+    # Default: если оба поля отсутствуют — 0 («не явился»).
     attendance: int = 0
+    # Какое поле стало источником значения attendance:
+    #   "attendance"       — основное поле из ответа CRM
+    #   "visit_attendance" — fallback, если attendance отсутствует
+    #   "default"          — оба поля отсутствовали, возвращено 0 по умолчанию
+    attendance_source: str = "default"
+    # Сырые attendance-related поля из ответа CRM (для диагностики debug endpoint).
+    # Заполняется в get_client_crm_records(), до парсинга.
+    raw_debug: dict = field(default_factory=dict)
 
     @property
     def is_confirmed(self) -> bool:
@@ -152,19 +165,38 @@ def _parse_confirmed(record_data: dict[str, Any]) -> int:
     return 0
 
 
-def _parse_attendance(record_data: dict[str, Any]) -> int:
-    """Вернуть значение поля attendance (0 или 1; по умолчанию 0).
+def _parse_attendance_with_source(record_data: dict[str, Any]) -> tuple[int, str]:
+    """Вернуть (attendance_value, source) из сырого ответа CRM.
 
-    attendance == 1 означает статус «Пришел» в Altegio.
-    Если поле отсутствует в ответе API — возвращаем 0 (не явился).
+    Источник истины: поле ``attendance`` из ответа Altegio CRM API.
+    Fallback 1:     если ``attendance`` отсутствует или None — ``visit_attendance``.
+                    Это поле присутствует в локальной модели Record и может
+                    нести тот же семантический смысл «Пришел» для части записей.
+    Default:        если оба поля отсутствуют — (0, "default").
+
+    Если в будущем появится третье attendance-like поле из CRM, его следует
+    добавить сюда как Fallback 2 перед возвратом дефолта.
+
+    Возвращает:
+        (value, source):
+          value  — 0 или 1 (int);
+          source — "attendance" | "visit_attendance" | "default" (str)
     """
-    raw = record_data.get("attendance")
-    if raw is not None:
+    raw_att = record_data.get("attendance")
+    if raw_att is not None:
         try:
-            return int(raw)
+            return int(raw_att), "attendance"
         except (ValueError, TypeError):
             pass
-    return 0
+
+    raw_visit = record_data.get("visit_attendance")
+    if raw_visit is not None:
+        try:
+            return int(raw_visit), "visit_attendance"
+        except (ValueError, TypeError):
+            pass
+
+    return 0, "default"
 
 
 def _parse_services(record_data: dict[str, Any]) -> tuple[list[int], list[str]]:
@@ -264,6 +296,24 @@ async def get_client_crm_records(
             for rec in raw_records:
                 starts_at = _parse_record_starts_at(rec)
                 service_ids, service_titles = _parse_services(rec)
+                att_val, att_source = _parse_attendance_with_source(rec)
+                # Сохраняем сырые attendance-related поля для диагностики.
+                # Берём ДО парсинга — именно то, что пришло из CRM.
+                raw_debug: dict[str, Any] = {
+                    "confirmed": rec.get("confirmed"),
+                    "attendance": rec.get("attendance"),
+                    "visit_attendance": rec.get("visit_attendance"),
+                    "deleted": rec.get("deleted"),
+                    "service_ids": [
+                        s.get("id") for s in rec.get("services", []) if isinstance(s, dict)
+                    ],
+                    "service_titles": [
+                        s.get("title") or s.get("name")
+                        for s in rec.get("services", [])
+                        if isinstance(s, dict)
+                    ],
+                    "starts_at": rec.get("date") or rec.get("datetime"),
+                }
                 all_records.append(
                     CrmRecord(
                         crm_id=rec.get("id"),
@@ -272,7 +322,9 @@ async def get_client_crm_records(
                         deleted=bool(rec.get("deleted")),
                         service_ids=service_ids,
                         service_titles=service_titles,
-                        attendance=_parse_attendance(rec),
+                        attendance=att_val,
+                        attendance_source=att_source,
+                        raw_debug=raw_debug,
                     )
                 )
 

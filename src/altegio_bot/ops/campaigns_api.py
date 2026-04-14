@@ -548,13 +548,17 @@ async def debug_client_segmentation(
         return {
             "crm_id": r.crm_id,
             "starts_at": r.starts_at.isoformat() if r.starts_at else None,
+            # Нормализованные поля (после парсинга)
             "confirmed": r.confirmed,
             "attendance": r.attendance,
+            "attendance_source": r.attendance_source,
             "deleted": r.deleted,
             "is_confirmed": r.is_confirmed,
             "is_attended": r.is_attended,
             "service_ids": r.service_ids,
             "service_titles": r.service_titles,
+            # Сырые поля из CRM ответа (до парсинга) — для расследования mismatch
+            "raw_crm_fields": r.raw_debug,
         }
 
     return {
@@ -586,10 +590,33 @@ async def debug_client_segmentation(
             "attended_lash_records_in_period": attended_lash_count,
             "service_lookup_error": service_lookup_error,
             "lash_service_ids_found": sorted(lash_svc_ids) if service_lookup_error is None else None,
+            # Явная диагностика по каждой in-period записи: откуда взят attended flag
+            "attendance_notes": [
+                {
+                    "crm_id": r.crm_id,
+                    "is_attended": r.is_attended,
+                    "attendance_value": r.attendance,
+                    "attendance_source": r.attendance_source,
+                    "explanation": (
+                        f"attended=True (источник: {r.attendance_source!r})"
+                        if r.is_attended
+                        else f"attended=False (источник: {r.attendance_source!r}, "
+                        f"raw_attendance={r.raw_debug.get('attendance')!r}, "
+                        f"raw_visit_attendance={r.raw_debug.get('visit_attendance')!r})"
+                    ),
+                }
+                for r in in_period_records
+            ],
         },
         "eligibility": {
             "is_eligible": excluded_reason is None,
             "excluded_reason": excluded_reason,
+            # Резюме: что конкретно привело к решению
+            "decision_notes": (
+                "eligible: все условия выполнены"
+                if excluded_reason is None
+                else f"excluded: {excluded_reason}"
+            ),
         },
     }
 
