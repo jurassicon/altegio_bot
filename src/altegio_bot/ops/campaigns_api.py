@@ -11,6 +11,7 @@ Endpoint'ы:
   GET  /ops/campaigns/runs
   GET  /ops/campaigns/runs/{run_id}
   GET  /ops/campaigns/runs/{run_id}/progress
+  POST /ops/campaigns/runs/{run_id}/recompute
   POST /ops/campaigns/runs/{run_id}/resume
   GET  /ops/campaigns/runs/{run_id}/recipients
   GET  /ops/campaigns/runs/{run_id}/report
@@ -49,6 +50,7 @@ from altegio_bot.campaigns.runner import (
     delete_preview_run,
     discard_preview_run,
     enqueue_send_real,
+    recompute_campaign_run_stats,
     recompute_run_counters,
     remove_recipient_from_preview,
     resume_send_real,
@@ -1149,6 +1151,40 @@ async def get_run_progress(run_id: int) -> dict[str, Any]:
         "last_error": _last_error(run),
         "followup_auto": _followup_auto(run),
     }
+
+
+# ==========================================================================
+# Recompute run stats (manual recovery after retry / admin tool)
+# ==========================================================================
+
+
+@router.post("/runs/{run_id}/recompute")
+async def recompute_run_stats(run_id: int) -> dict[str, Any]:
+    """Полный идемпотентный пересчёт агрегатных счётчиков CampaignRun.
+
+    Источник правды:
+    - CampaignRecipient (сегментация, атрибуция, loyalty)
+    - OutboxMessage     (воронка доставки)
+
+    Безопасен для повторного вызова. Возвращает JSON с пересчитанными
+    значениями всех счётчиков.
+
+    Доступен для send-real и preview runs.
+    """
+    try:
+        async with SessionLocal() as session:
+            async with session.begin():
+                summary = await recompute_campaign_run_stats(session, run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except Exception as exc:
+        logger.exception("recompute_run_stats failed run_id=%d: %s", run_id, exc)
+        raise HTTPException(
+            status_code=500,
+            detail="Internal recompute error",
+        )
+
+    return {"recomputed": True, "run_id": run_id, "stats": summary}
 
 
 # ==========================================================================

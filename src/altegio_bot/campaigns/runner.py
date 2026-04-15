@@ -22,6 +22,7 @@ from altegio_bot.models.models import (
     CampaignRun,
     Client,
     MessageJob,
+    OutboxMessage,
 )
 from altegio_bot.utils import utcnow
 
@@ -1439,6 +1440,136 @@ async def recompute_run_counters(run_id: int) -> None:
         run_id,
         len(recipients),
     )
+
+
+# ==========================================================================
+# Full stats recompute (segmentation + delivery + loyalty)
+# ==========================================================================
+
+# Outbox statuses that count as provider-accepted (cumulative)
+_PROVIDER_ACCEPTED = frozenset({"sent", "delivered", "read"})
+# Outbox statuses that count as delivered (cumulative)
+_DELIVERED = frozenset({"delivered", "read"})
+
+
+def _recompute_stats_from_db(
+    run: CampaignRun,
+    recipients: list[CampaignRecipient],
+    outbox_status_counts: dict[str, int],
+) -> None:
+    """Apply full stats recompute to *run* (in-place, no DB I/O).
+
+    Three groups of counters are refreshed:
+    1. Segmentation — from CampaignRecipient.excluded_reason
+       (delegates to _update_run_counters_from_recipients).
+    2. Delivery funnel — from OutboxMessage.status counts supplied
+       via *outbox_status_counts* (keyed by outbox status value).
+    3. Loyalty / attribution — from CampaignRecipient fields.
+
+    Idempotent: all counters are zeroed before accumulation.
+    """
+    # --- 1. Segmentation counters (delegates to existing helper) ---
+    _update_run_counters_from_recipients(run, recipients)
+
+    # --- 2. Delivery funnel ---
+    # queued / sent: any recipient that has an outbox message created
+    queued = sum(1 for r in recipients if r.outbox_message_id is not None)
+    run.queued_count = queued
+    run.sent_count = queued  # redundant alias, kept in sync
+
+    # failed: recipients who tried to queue but failed
+    failed = sum(1 for r in recipients if r.excluded_reason == "queue_failed")
+    run.failed_count = failed
+
+    # provider_accepted / delivered / read from OutboxMessage statuses
+    run.provider_accepted_count = sum(outbox_status_counts.get(s, 0) for s in _PROVIDER_ACCEPTED)
+    run.delivered_count = sum(outbox_status_counts.get(s, 0) for s in _DELIVERED)
+    run.read_count = outbox_status_counts.get("read", 0)
+
+    # --- 3. Attribution (CampaignRecipient timestamps) ---
+    run.replied_count = sum(1 for r in recipients if r.replied_at is not None)
+    run.booked_after_count = sum(1 for r in recipients if r.booked_after_at is not None)
+    run.opted_out_after_count = sum(1 for r in recipients if r.opted_out_after_at is not None)
+
+    # --- 4. Loyalty counters ---
+    run.cards_issued_count = sum(1 for r in recipients if r.loyalty_card_id is not None)
+    run.cards_deleted_count = sum(len(r.cleanup_card_ids or []) for r in recipients)
+    run.cleanup_failed_count = sum(
+        1 for r in recipients if r.cleanup_failed_reason is not None or r.status == "cleanup_failed"
+    )
+
+
+async def recompute_campaign_run_stats(
+    session: AsyncSession,
+    run_id: int,
+) -> dict:
+    """Full idempotent recompute of all CampaignRun aggregate counters.
+
+    Accepts an open SQLAlchemy *session* (must already be inside a
+    transaction when the caller wants atomic writes).
+
+    Source of truth:
+    - CampaignRecipient rows  (segmentation, attribution, loyalty)
+    - OutboxMessage rows      (delivery funnel)
+
+    Safe to call multiple times; always converges to the same result.
+    Returns a summary dict suitable for returning to the API caller.
+
+    Supports both preview and send-real runs.
+    """
+    run = await session.get(CampaignRun, run_id)
+    if run is None:
+        raise ValueError(f"CampaignRun {run_id} not found")
+
+    # Load all recipients for this run
+    r_stmt = select(CampaignRecipient).where(CampaignRecipient.campaign_run_id == run_id)
+    recipients = list((await session.execute(r_stmt)).scalars().all())
+
+    # Aggregate OutboxMessage statuses for recipients in this run
+    ob_stmt = (
+        select(
+            OutboxMessage.status,
+            func.count(OutboxMessage.id).label("cnt"),
+        )
+        .join(
+            CampaignRecipient,
+            CampaignRecipient.outbox_message_id == OutboxMessage.id,
+        )
+        .where(CampaignRecipient.campaign_run_id == run_id)
+        .group_by(OutboxMessage.status)
+    )
+    ob_rows = (await session.execute(ob_stmt)).all()
+    outbox_status_counts: dict[str, int] = {status: int(cnt) for status, cnt in ob_rows}
+
+    _recompute_stats_from_db(run, recipients, outbox_status_counts)
+
+    logger.info(
+        "recompute_campaign_run_stats run_id=%d total_seen=%d queued=%d provider_accepted=%d delivered=%d read=%d",
+        run_id,
+        run.total_clients_seen,
+        run.queued_count,
+        run.provider_accepted_count,
+        run.delivered_count,
+        run.read_count,
+    )
+
+    return {
+        "run_id": run_id,
+        "total_clients_seen": run.total_clients_seen,
+        "candidates_count": run.candidates_count,
+        "queued_count": run.queued_count,
+        "sent_count": run.sent_count,
+        "failed_count": run.failed_count,
+        "provider_accepted_count": run.provider_accepted_count,
+        "delivered_count": run.delivered_count,
+        "read_count": run.read_count,
+        "replied_count": run.replied_count,
+        "booked_after_count": run.booked_after_count,
+        "opted_out_after_count": run.opted_out_after_count,
+        "cards_issued_count": run.cards_issued_count,
+        "cards_deleted_count": run.cards_deleted_count,
+        "cleanup_failed_count": run.cleanup_failed_count,
+    }
 
 
 # ==========================================================================
