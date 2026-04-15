@@ -20,6 +20,7 @@ from altegio_bot.db import SessionLocal
 from altegio_bot.message_planner import MAX_VISITS_FOR_REVIEW
 from altegio_bot.meta_templates import (
     TEMPLATE_LANGUAGE,
+    UNIVERSAL_JOB_TYPES,
     build_template_params,
     resolve_meta_template,
 )
@@ -330,21 +331,28 @@ async def _load_template(
 
     Lookup order (deterministic, always order_by id ASC where no unique match):
 
-    Phase 1 — company-specific rows (current behaviour, unchanged):
+    Phase 1 — company-specific rows (always executed):
       1. company_id + code + requested language  (exact)
       2. company_id + code + DEFAULT_LANGUAGE    (only when language ≠ DEFAULT_LANGUAGE)
       3. company_id + code (any language)
 
-    Phase 2 — cross-company fallback:
+    Phase 2 — cross-company fallback (ONLY for universal template codes):
       4. code + requested language  (any company, id ASC)
       5. code + DEFAULT_LANGUAGE    (any company, only when language ≠ DEFAULT_LANGUAGE)
       6. code (any company, any language, id ASC)
 
-    Phase 2 is reached only when Phase 1 finds nothing.  It covers universal
-    templates (newsletter_new_clients_monthly, newsletter_new_clients_followup,
-    …) that are stored in message_templates under a single canonical company_id
-    but are shared by all branches.  This mirrors the fallback already present
-    in the preview endpoint get_template_text().
+    Phase 2 is reached only when Phase 1 finds nothing AND *template_code* is in
+    UNIVERSAL_JOB_TYPES.  Universal templates (review_3d, repeat_10d, comeback_3d,
+    newsletter_new_clients_monthly, newsletter_new_clients_followup) have no address
+    footer and are stored in message_templates under a single canonical company_id
+    but shared by all branches.
+
+    Phase 2 is intentionally SKIPPED for branch-specific codes (record_created,
+    record_updated, record_canceled, reminder_24h, reminder_2h).  Those templates
+    contain branch-specific address footers; silently using another branch's row
+    would produce incorrect text and mislead the recipient about the salon location.
+
+    Mirrors the fallback already present in the preview endpoint get_template_text().
     """
     # ------------------------------------------------------------------
     # Phase 1: company-specific rows (existing priority, unchanged)
@@ -376,10 +384,13 @@ async def _load_template(
         return tmpl, tmpl.language
 
     # ------------------------------------------------------------------
-    # Phase 2: cross-company fallback
-    # Mirrors get_template_text() fallback so preview and send use the
-    # same effective DB row for universal templates.
+    # Phase 2: cross-company fallback — universal templates only.
+    # Branch-specific codes (record_*, reminder_*) intentionally skip this
+    # to prevent accidentally serving the wrong branch's address footer.
     # ------------------------------------------------------------------
+    if template_code not in UNIVERSAL_JOB_TYPES:
+        return None, language
+
     cross = (
         select(MessageTemplate).where(MessageTemplate.code == template_code).where(MessageTemplate.is_active.is_(True))
     )
