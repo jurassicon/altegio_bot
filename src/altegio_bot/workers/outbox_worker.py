@@ -845,6 +845,13 @@ async def _run_job_logic(
     if loyalty_card_text:
         msg_ctx["loyalty_card_text"] = loyalty_card_text
 
+    # CRM-only newsletter jobs (client is None): populate client_name from payload.contact_name.
+    # Without this, msg_ctx["client_name"] stays "" and Meta rejects the template call with
+    # "Required parameter is missing" because template param #1 must not be empty.
+    # Local-client jobs are unaffected: client is not None so _render_message already set client_name.
+    if client is None and _job_payload.get("contact_name"):
+        msg_ctx["client_name"] = _job_payload["contact_name"]
+
     # Effective contact_name for Chatwoot mirror: prefer local client, then payload (CRM-only).
     contact_name = client.display_name if client else _job_payload.get("contact_name")
 

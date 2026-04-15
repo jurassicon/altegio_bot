@@ -348,3 +348,257 @@ async def test_outbox_worker_newsletter_ra_uses_v1_template(monkeypatch: Any) ->
     assert captured_template[0] == V1, (
         f"Rastatt must use v1, got {captured_template[0]!r}. If this is v2, the template MAP was not updated."
     )
+
+
+# ---------------------------------------------------------------------------
+# 6. CRM-only client_name fallback from payload.contact_name
+#    Regression for job 2031: card issued OK, but Meta rejected with
+#    "Required parameter is missing" because client_name="" for CRM-only jobs.
+# ---------------------------------------------------------------------------
+
+FOLLOWUP_JOB_TYPE = "newsletter_new_clients_followup"
+V1_FOLLOWUP = "kitilash_ka_newsletter_new_clients_followup_v1"
+
+
+@dataclass
+class _FakeClient:
+    id: int
+    display_name: str = "Anna Müller"
+    phone_e164: str = "+4912345678"
+    wa_opted_out: bool = False
+    altegio_client_id: int | None = None
+
+
+def _make_render_ctx(client_name: str = "") -> dict:
+    return {
+        "client_name": client_name,
+        "booking_link": "https://n813709.alteg.io/",
+        "loyalty_card_text": "",
+        "sender_id": 1,
+        "sender_code": "default",
+        "staff_name": "",
+        "date": "",
+        "time": "",
+        "services": "",
+        "primary_service": "",
+        "total_cost": "0.00",
+        "short_link": "",
+        "unsubscribe_link": "",
+        "pre_appointment_notes": "",
+    }
+
+
+@pytest.mark.asyncio
+async def test_crm_only_monthly_newsletter_uses_contact_name_as_param1(monkeypatch: Any) -> None:
+    """CRM-only monthly newsletter: template param #1 comes from payload.contact_name.
+
+    Reproduces job 2031 bug: client is None so _render_message returns client_name="".
+    Without the fix, build_template_params sends ["", booking_link, card_text] to Meta,
+    which rejects with "Required parameter is missing".
+    After the fix, outbox_worker patches msg_ctx["client_name"] from payload.contact_name
+    before build_template_params is called.
+    """
+    captured_params: list[list[str]] = []
+    card_text = "Kundenkarte #0000491787793093"
+
+    job = _FakeJob(
+        id=2031,
+        company_id=KA,
+        job_type=JOB_TYPE,
+        payload={
+            "kind": JOB_TYPE,
+            "contact_name": "Dilek Celik",
+            "loyalty_card_text": card_text,
+            "phone_e164": "+491787793093",
+        },
+    )
+    session = _FakeSession()
+
+    monkeypatch.setattr(ow, "_find_success_outbox", AsyncMock(return_value=None))
+    monkeypatch.setattr(ow, "_find_existing_outbox", AsyncMock(return_value=None))
+    monkeypatch.setattr(ow, "_load_record", AsyncMock(return_value=None))
+    monkeypatch.setattr(ow, "_load_client", AsyncMock(return_value=None))
+    monkeypatch.setattr(ow, "_apply_rate_limit", AsyncMock(return_value=None))
+
+    async def _fake_render(session, *, company_id, template_code, record, client):
+        # Simulates CRM-only: no local client → client_name=""
+        return "Hallo {{1}}, ...", 1, "de", _make_render_ctx(client_name="")
+
+    monkeypatch.setattr(ow, "_render_message", _fake_render)
+
+    async def _fake_send_template(provider, sender_id, phone, template_name, language, params, **kw):
+        captured_params.append(list(params))
+        return "wamid.fake2031", None
+
+    monkeypatch.setattr(ow, "safe_send_template", _fake_send_template)
+    monkeypatch.setattr(ow.settings, "whatsapp_send_mode", "template")
+
+    provider = MagicMock()
+    await ow._run_job_logic(session, job, provider=provider)  # type: ignore[arg-type]
+
+    assert job.status == "done", f"Expected job.status='done', got {job.status!r} last_error={job.last_error!r}"
+    assert len(captured_params) == 1, "safe_send_template must be called exactly once"
+    params = captured_params[0]
+    assert len(params) == 3, f"Monthly v1 template expects 3 params, got {len(params)}: {params}"
+    assert params[0] == "Dilek Celik", (
+        f"Template param #1 must be payload.contact_name='Dilek Celik', got {params[0]!r}. "
+        "This was the bug in job 2031: empty client_name → Meta rejected with 'Required parameter is missing'."
+    )
+    assert params[2] == card_text, f"Template param #3 must be loyalty_card_text, got {params[2]!r}"
+
+
+@pytest.mark.asyncio
+async def test_crm_only_followup_newsletter_uses_contact_name_as_param1(monkeypatch: Any) -> None:
+    """CRM-only followup newsletter: template param #1 also comes from payload.contact_name.
+
+    The followup template has 2 params [client_name, booking_link].
+    The same fallback logic must apply so followup does not send an empty first param.
+    """
+    captured_params: list[list[str]] = []
+
+    job = _FakeJob(
+        id=2099,
+        company_id=KA,
+        job_type=FOLLOWUP_JOB_TYPE,
+        payload={
+            "kind": FOLLOWUP_JOB_TYPE,
+            "contact_name": "Hana Novak",
+            "phone_e164": "+491777000111",
+        },
+    )
+    session = _FakeSession()
+
+    monkeypatch.setattr(ow, "_find_success_outbox", AsyncMock(return_value=None))
+    monkeypatch.setattr(ow, "_find_existing_outbox", AsyncMock(return_value=None))
+    monkeypatch.setattr(ow, "_load_record", AsyncMock(return_value=None))
+    monkeypatch.setattr(ow, "_load_client", AsyncMock(return_value=None))
+    monkeypatch.setattr(ow, "_apply_rate_limit", AsyncMock(return_value=None))
+
+    async def _fake_render(session, *, company_id, template_code, record, client):
+        return "Hallo {{1}}, ...", 1, "de", _make_render_ctx(client_name="")
+
+    monkeypatch.setattr(ow, "_render_message", _fake_render)
+
+    async def _fake_send_template(provider, sender_id, phone, template_name, language, params, **kw):
+        captured_params.append(list(params))
+        return "wamid.fakefollowup", None
+
+    monkeypatch.setattr(ow, "safe_send_template", _fake_send_template)
+    monkeypatch.setattr(ow.settings, "whatsapp_send_mode", "template")
+
+    provider = MagicMock()
+    await ow._run_job_logic(session, job, provider=provider)  # type: ignore[arg-type]
+
+    assert job.status == "done", f"Expected job.status='done', got {job.status!r} last_error={job.last_error!r}"
+    assert len(captured_params) == 1
+    params = captured_params[0]
+    assert len(params) == 2, f"Followup v1 template expects 2 params, got {len(params)}: {params}"
+    assert params[0] == "Hana Novak", f"Template param #1 must be payload.contact_name='Hana Novak', got {params[0]!r}"
+
+
+@pytest.mark.asyncio
+async def test_local_client_monthly_newsletter_uses_display_name_not_payload(monkeypatch: Any) -> None:
+    """Local-client newsletter: client.display_name takes priority over payload.contact_name.
+
+    When a local Client row exists, _render_message already sets client_name=display_name.
+    The payload fallback must NOT overwrite it even if contact_name is present in payload.
+    """
+    captured_params: list[list[str]] = []
+    card_text = "Kundenkarte #0099887766554433"
+
+    job = _FakeJob(
+        id=3001,
+        company_id=KA,
+        job_type=JOB_TYPE,
+        payload={
+            "kind": JOB_TYPE,
+            "contact_name": "WRONG NAME FROM PAYLOAD",
+            "loyalty_card_text": card_text,
+            "phone_e164": "+491234567890",
+        },
+    )
+    session = _FakeSession()
+
+    local_client = _FakeClient(id=42, display_name="Maria Müller", phone_e164="+491234567890")
+
+    monkeypatch.setattr(ow, "_find_success_outbox", AsyncMock(return_value=None))
+    monkeypatch.setattr(ow, "_find_existing_outbox", AsyncMock(return_value=None))
+    monkeypatch.setattr(ow, "_load_record", AsyncMock(return_value=None))
+    monkeypatch.setattr(ow, "_load_client", AsyncMock(return_value=local_client))
+    monkeypatch.setattr(ow, "_apply_rate_limit", AsyncMock(return_value=None))
+
+    async def _fake_render(session, *, company_id, template_code, record, client):
+        # Local client present: _render_message sets client_name=display_name
+        name = client.display_name if client else ""
+        return "Hallo {{1}}, ...", 1, "de", _make_render_ctx(client_name=name)
+
+    monkeypatch.setattr(ow, "_render_message", _fake_render)
+
+    async def _fake_send_template(provider, sender_id, phone, template_name, language, params, **kw):
+        captured_params.append(list(params))
+        return "wamid.fake3001", None
+
+    monkeypatch.setattr(ow, "safe_send_template", _fake_send_template)
+    monkeypatch.setattr(ow.settings, "whatsapp_send_mode", "template")
+
+    provider = MagicMock()
+    await ow._run_job_logic(session, job, provider=provider)  # type: ignore[arg-type]
+
+    assert job.status == "done", f"Expected job.status='done', got {job.status!r} last_error={job.last_error!r}"
+    assert len(captured_params) == 1
+    params = captured_params[0]
+    assert params[0] == "Maria Müller", (
+        f"Local-client param #1 must be client.display_name='Maria Müller', got {params[0]!r}. "
+        "payload.contact_name must not overwrite a local client's display_name."
+    )
+
+
+@pytest.mark.asyncio
+async def test_crm_only_no_contact_name_param1_is_empty(monkeypatch: Any) -> None:
+    """CRM-only job with no contact_name in payload: client_name stays '' (no crash).
+
+    If payload.contact_name is absent, the fallback simply does not fire.
+    This is a degenerate case — the job would likely still fail Meta validation,
+    but the outbox_worker must not crash and must attempt the send.
+    """
+    captured_params: list[list[str]] = []
+    card_text = "Kundenkarte #0000000000000000"
+
+    job = _FakeJob(
+        id=3002,
+        company_id=KA,
+        job_type=JOB_TYPE,
+        payload={
+            "kind": JOB_TYPE,
+            "loyalty_card_text": card_text,
+            "phone_e164": "+491111111111",
+            # no contact_name
+        },
+    )
+    session = _FakeSession()
+
+    monkeypatch.setattr(ow, "_find_success_outbox", AsyncMock(return_value=None))
+    monkeypatch.setattr(ow, "_find_existing_outbox", AsyncMock(return_value=None))
+    monkeypatch.setattr(ow, "_load_record", AsyncMock(return_value=None))
+    monkeypatch.setattr(ow, "_load_client", AsyncMock(return_value=None))
+    monkeypatch.setattr(ow, "_apply_rate_limit", AsyncMock(return_value=None))
+
+    async def _fake_render(session, *, company_id, template_code, record, client):
+        return "Hallo {{1}}, ...", 1, "de", _make_render_ctx(client_name="")
+
+    monkeypatch.setattr(ow, "_render_message", _fake_render)
+
+    async def _fake_send_template(provider, sender_id, phone, template_name, language, params, **kw):
+        captured_params.append(list(params))
+        return "wamid.fake3002", None
+
+    monkeypatch.setattr(ow, "safe_send_template", _fake_send_template)
+    monkeypatch.setattr(ow.settings, "whatsapp_send_mode", "template")
+
+    provider = MagicMock()
+    await ow._run_job_logic(session, job, provider=provider)  # type: ignore[arg-type]
+
+    # Worker must not crash — it attempts the send regardless of empty param
+    assert len(captured_params) == 1
+    params = captured_params[0]
+    assert params[0] == "", f"Without contact_name in payload, param #1 must remain '', got {params[0]!r}"
