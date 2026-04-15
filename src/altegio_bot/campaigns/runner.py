@@ -441,6 +441,50 @@ async def _load_candidates_from_preview_snapshot(
     return candidates
 
 
+async def _auto_hide_preview_run(
+    session: AsyncSession,
+    preview_run_id: int,
+    *,
+    send_real_run_id: int,
+) -> None:
+    """Set meta['hidden']=True on a preview run after a clean send-real.
+
+    The preview is NOT deleted — it stays in the DB and remains accessible
+    via direct link.  This call is idempotent: if the preview is already
+    hidden it does nothing.
+
+    Must be called inside an active transaction (the caller's session.begin()
+    context).
+    """
+    preview = await session.get(CampaignRun, preview_run_id)
+    if preview is None:
+        logger.warning(
+            "auto-hide: preview run_id=%d not found (referenced by send-real run_id=%d)",
+            preview_run_id,
+            send_real_run_id,
+        )
+        return
+    if preview.mode != "preview":
+        logger.warning(
+            "auto-hide: run_id=%d is mode=%r, not preview — skipping",
+            preview_run_id,
+            preview.mode,
+        )
+        return
+    preview_meta = dict(preview.meta or {})
+    if preview_meta.get("hidden"):
+        return  # Already hidden — idempotent
+    preview_meta["hidden"] = True
+    preview_meta["hidden_reason"] = "auto_hidden_after_successful_send_real"
+    preview_meta["hidden_by_run_id"] = send_real_run_id
+    preview.meta = preview_meta
+    logger.info(
+        "auto-hid preview run_id=%d after successful send-real run_id=%d",
+        preview_run_id,
+        send_real_run_id,
+    )
+
+
 async def _execute_send_real_for_existing_run(
     run_id: int,
     params: RunParams,
@@ -619,6 +663,15 @@ async def _execute_send_real_for_existing_run(
                     run.status = "completed"
                 else:
                     run.status = "completed"
+                    # Clean success: auto-hide the source preview snapshot so it
+                    # no longer appears in the default runs list.  The preview
+                    # stays in the DB and is still accessible via direct link.
+                    if run.source_preview_run_id:
+                        await _auto_hide_preview_run(
+                            session,
+                            run.source_preview_run_id,
+                            send_real_run_id=run.id,
+                        )
 
                 run.meta = meta
                 run.completed_at = utcnow()

@@ -31,7 +31,7 @@ from typing import Any, Literal
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import func, not_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.altegio_loyalty import AltegioLoyaltyClient
@@ -1033,6 +1033,7 @@ async def list_runs(
     mode: str | None = Query(default=None),
     status: str | None = Query(default=None),
     include_deleted: bool = Query(default=False),
+    include_hidden: bool = Query(default=False),
     campaign_code: str = Query(default=CAMPAIGN_CODE),
     limit: int = Query(default=50, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
@@ -1045,12 +1046,26 @@ async def list_runs(
 
     По умолчанию soft-deleted runs (status='deleted') скрыты.
     Передайте include_deleted=true чтобы их увидеть.
+
+    По умолчанию auto-hidden preview runs (meta->>'hidden' == 'true')
+    скрыты.  Передайте include_hidden=true чтобы их увидеть.
+    Preview скрывается автоматически после успешного send-real,
+    но остаётся в БД и доступен по прямой ссылке из run detail.
     """
     async with SessionLocal() as session:
         # Строим базовое условие
         conditions = [CampaignRun.campaign_code == campaign_code]
         if not include_deleted and status != "deleted":
             conditions.append(CampaignRun.status != "deleted")
+        if not include_hidden:
+            # Exclude preview runs auto-hidden after successful send-real.
+            # JSONB @> containment check; handles NULL meta via or_().
+            conditions.append(
+                or_(
+                    CampaignRun.meta.is_(None),
+                    not_(CampaignRun.meta.contains({"hidden": True})),
+                )
+            )
         if status:
             conditions.append(CampaignRun.status == status)
         if mode:
@@ -1942,6 +1957,10 @@ def _run_summary(run: CampaignRun, *, used_as_source: bool = False) -> dict[str,
         "completed_at": _iso(run.completed_at),
         # Preview-специфичные поля
         "is_preview": run.mode == "preview",
+        # hidden=True: preview was auto-hidden after a successful send-real.
+        # Still accessible via direct link; absent from the default list.
+        "hidden": bool((run.meta or {}).get("hidden")),
+        "hidden_reason": (run.meta or {}).get("hidden_reason"),
         # Discard разрешён только для completed preview, не использованного как source.
         # running → race condition; discarded/deleted → уже терминал; used_as_source → запрещено бэкендом.
         "is_discardable": (run.mode == "preview" and run.status == "completed" and not used_as_source),
