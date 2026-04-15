@@ -167,6 +167,7 @@ async def create_run(body: RunRequest) -> dict[str, Any]:
     с параметрами preview-run. Несовпадение → 400.
     """
     _validate_period(body.period_start, body.period_end)
+    _validate_card_type_id_for_send_real(body.card_type_id)
 
     period_start_utc = _ensure_utc(body.period_start)
     period_end_utc = _ensure_utc(body.period_end)
@@ -2015,6 +2016,20 @@ def _recipient_dict(r: CampaignRecipient) -> dict[str, Any]:
         },
         "created_at": _iso(r.created_at),
     }
+
+
+def _validate_card_type_id_for_send_real(card_type_id: str | None) -> None:
+    """card_type_id обязателен для send-real new-clients campaign.
+
+    Запрещает запуск рассылки без явного выбора типа карты лояльности.
+    Предотвращает создание CampaignRun и execution job без валидного card_type_id.
+    Возвращает HTTP 422, если card_type_id не передан, пустой или содержит только пробелы.
+    """
+    if not card_type_id or not card_type_id.strip():
+        raise HTTPException(
+            status_code=422,
+            detail="Выберите тип карты лояльности перед запуском кампании",
+        )
 
 
 def _validate_period(period_start: datetime, period_end: datetime) -> None:
