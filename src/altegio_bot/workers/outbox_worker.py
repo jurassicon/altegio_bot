@@ -326,6 +326,29 @@ async def _load_template(
     template_code: str,
     language: str,
 ) -> tuple[MessageTemplate | None, str]:
+    """Look up the active MessageTemplate for *company_id* / *template_code*.
+
+    Lookup order (deterministic, always order_by id ASC where no unique match):
+
+    Phase 1 — company-specific rows (current behaviour, unchanged):
+      1. company_id + code + requested language  (exact)
+      2. company_id + code + DEFAULT_LANGUAGE    (only when language ≠ DEFAULT_LANGUAGE)
+      3. company_id + code (any language)
+
+    Phase 2 — cross-company fallback:
+      4. code + requested language  (any company, id ASC)
+      5. code + DEFAULT_LANGUAGE    (any company, only when language ≠ DEFAULT_LANGUAGE)
+      6. code (any company, any language, id ASC)
+
+    Phase 2 is reached only when Phase 1 finds nothing.  It covers universal
+    templates (newsletter_new_clients_monthly, newsletter_new_clients_followup,
+    …) that are stored in message_templates under a single canonical company_id
+    but are shared by all branches.  This mirrors the fallback already present
+    in the preview endpoint get_template_text().
+    """
+    # ------------------------------------------------------------------
+    # Phase 1: company-specific rows (existing priority, unchanged)
+    # ------------------------------------------------------------------
     base = (
         select(MessageTemplate)
         .where(MessageTemplate.company_id == company_id)
@@ -350,6 +373,60 @@ async def _load_template(
     res = await session.execute(stmt)
     tmpl = res.scalar_one_or_none()
     if tmpl is not None:
+        return tmpl, tmpl.language
+
+    # ------------------------------------------------------------------
+    # Phase 2: cross-company fallback
+    # Mirrors get_template_text() fallback so preview and send use the
+    # same effective DB row for universal templates.
+    # ------------------------------------------------------------------
+    cross = (
+        select(MessageTemplate).where(MessageTemplate.code == template_code).where(MessageTemplate.is_active.is_(True))
+    )
+
+    stmt = cross.where(MessageTemplate.language == language).order_by(MessageTemplate.id.asc()).limit(1)
+    res = await session.execute(stmt)
+    tmpl = res.scalar_one_or_none()
+    if tmpl is not None:
+        logger.info(
+            "_load_template cross-company fallback: company=%s code=%s language=%s"
+            " → using template_id=%s from company=%s",
+            company_id,
+            template_code,
+            language,
+            tmpl.id,
+            tmpl.company_id,
+        )
+        return tmpl, language
+
+    if language != DEFAULT_LANGUAGE:
+        stmt = cross.where(MessageTemplate.language == DEFAULT_LANGUAGE).order_by(MessageTemplate.id.asc()).limit(1)
+        res = await session.execute(stmt)
+        tmpl = res.scalar_one_or_none()
+        if tmpl is not None:
+            logger.info(
+                "_load_template cross-company fallback: company=%s code=%s"
+                " → DEFAULT_LANGUAGE fallback template_id=%s from company=%s",
+                company_id,
+                template_code,
+                tmpl.id,
+                tmpl.company_id,
+            )
+            return tmpl, DEFAULT_LANGUAGE
+
+    stmt = cross.order_by(MessageTemplate.id.asc()).limit(1)
+    res = await session.execute(stmt)
+    tmpl = res.scalar_one_or_none()
+    if tmpl is not None:
+        logger.info(
+            "_load_template cross-company fallback: company=%s code=%s"
+            " → any-language fallback template_id=%s from company=%s language=%s",
+            company_id,
+            template_code,
+            tmpl.id,
+            tmpl.company_id,
+            tmpl.language,
+        )
         return tmpl, tmpl.language
 
     return None, language
