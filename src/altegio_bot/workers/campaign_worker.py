@@ -106,7 +106,14 @@ async def process_job_in_session(
         job.status = "failed"
         job.locked_at = None
         job.last_error = "Missing campaign_run_id in payload"
+        logger.error("campaign job_id=%s: missing campaign_run_id in payload", job.id)
         return
+
+    logger.info(
+        "picked campaign execution job_id=%s run_id=%s",
+        job.id,
+        run_id,
+    )
 
     try:
         await execute_queued_send_real(int(run_id))

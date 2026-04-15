@@ -42,6 +42,7 @@ async def _create_preview_run(session_maker, **kw) -> int:
     """Создать preview CampaignRun для тестов.
 
     По умолчанию статус 'completed' — только такие previews разрешены как источник send-real.
+    card_type_id по умолчанию непустой — send-real требует явно выбранного типа карты.
     """
     defaults = dict(
         campaign_code="new_clients_monthly",
@@ -50,7 +51,7 @@ async def _create_preview_run(session_maker, **kw) -> int:
         period_start=PERIOD_START,
         period_end=PERIOD_END,
         status="completed",
-        card_type_id=None,
+        card_type_id="test-card-type",
         followup_enabled=False,
         followup_delay_days=None,
         followup_policy=None,
@@ -83,6 +84,7 @@ async def test_run_from_preview_company_mismatch_returns_400(
         "location_id": 1271200,
         "period_start": "2026-01-01T00:00:00Z",
         "period_end": "2026-01-31T23:59:59Z",
+        "card_type_id": "test-card-type",  # совпадает с preview, чтобы card-валидация пропустила
         "source_preview_run_id": preview_run_id,
     }
     resp = await http_client.post("/ops/campaigns/new-clients/run", json=body)
@@ -108,6 +110,7 @@ async def test_run_from_preview_period_start_mismatch_returns_400(
         "location_id": COMPANY,
         "period_start": "2026-02-01T00:00:00Z",  # ДРУГОЙ период
         "period_end": "2026-02-28T23:59:59Z",
+        "card_type_id": "test-card-type",  # совпадает с preview, чтобы card-валидация пропустила
         "source_preview_run_id": preview_run_id,
     }
     resp = await http_client.post("/ops/campaigns/new-clients/run", json=body)
@@ -133,6 +136,7 @@ async def test_run_from_discarded_preview_returns_400(
         "location_id": COMPANY,
         "period_start": "2026-01-01T00:00:00Z",
         "period_end": "2026-01-31T23:59:59Z",
+        "card_type_id": "test-card-type",  # совпадает с preview, чтобы card-валидация пропустила
         "source_preview_run_id": preview_run_id,
     }
     resp = await http_client.post("/ops/campaigns/new-clients/run", json=body)
@@ -161,6 +165,7 @@ async def test_run_from_failed_preview_returns_400(
         "location_id": COMPANY,
         "period_start": "2026-01-01T00:00:00Z",
         "period_end": "2026-01-31T23:59:59Z",
+        "card_type_id": "test-card-type",  # совпадает с preview, чтобы card-валидация пропустила
         "source_preview_run_id": preview_run_id,
     }
     resp = await http_client.post("/ops/campaigns/new-clients/run", json=body)
@@ -182,6 +187,7 @@ async def test_run_from_running_preview_returns_400(
         "location_id": COMPANY,
         "period_start": "2026-01-01T00:00:00Z",
         "period_end": "2026-01-31T23:59:59Z",
+        "card_type_id": "test-card-type",  # совпадает с preview, чтобы card-валидация пропустила
         "source_preview_run_id": preview_run_id,
     }
     resp = await http_client.post("/ops/campaigns/new-clients/run", json=body)
@@ -233,6 +239,7 @@ async def test_run_from_preview_followup_mismatch_returns_400(
         "location_id": COMPANY,
         "period_start": "2026-01-01T00:00:00Z",
         "period_end": "2026-01-31T23:59:59Z",
+        "card_type_id": "test-card-type",  # совпадает с preview, чтобы card-валидация пропустила
         "source_preview_run_id": preview_run_id,
         "followup_enabled": False,  # ОТЛИЧАЕТСЯ от preview
     }
@@ -257,6 +264,7 @@ async def test_run_from_nonexistent_preview_returns_400(
         "location_id": COMPANY,
         "period_start": "2026-01-01T00:00:00Z",
         "period_end": "2026-01-31T23:59:59Z",
+        "card_type_id": "test-card-type",  # обязательное поле, card-валидация пропускает
         "source_preview_run_id": 99999999,  # не существует
     }
     resp = await http_client.post("/ops/campaigns/new-clients/run", json=body)
@@ -282,6 +290,7 @@ async def test_run_from_preview_matching_params_accepted(
         "location_id": COMPANY,
         "period_start": "2026-01-01T00:00:00Z",
         "period_end": "2026-01-31T23:59:59Z",
+        "card_type_id": "test-card-type",  # совпадает с preview-default
         "source_preview_run_id": preview_run_id,
     }
 

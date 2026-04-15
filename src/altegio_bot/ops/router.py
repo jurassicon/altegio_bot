@@ -3606,6 +3606,13 @@ async function runCampaign() {{
     alert("Сначала создайте preview.");
     return;
   }}
+  // Явная проверка выбора типа карты лояльности — до confirm.
+  // Backend всё равно вернёт 422, но UX-слой должен помочь оператору раньше.
+  const cardTypeId = document.getElementById("f-card-type").value;
+  if (!cardTypeId) {{
+    setAlert("run-alert", "danger", "Выберите тип карты лояльности перед запуском кампании.");
+    return;
+  }}
   if (!confirm("Запустить реальную рассылку? Это отправит WhatsApp-сообщения клиентам.")) return;
 
   const payload = buildPayload();
