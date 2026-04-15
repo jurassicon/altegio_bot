@@ -946,7 +946,7 @@ def normalize_meta_template_name(template_name: str) -> str:
     """Нормализовать имя Meta-шаблона в code для точного поиска в БД.
 
     Пример:
-        "kitilash_ka_newsletter_new_clients_monthly_v2"
+        "kitilash_ka_newsletter_new_clients_monthly_v1"
         → "newsletter_new_clients_monthly"
 
     Алгоритм:

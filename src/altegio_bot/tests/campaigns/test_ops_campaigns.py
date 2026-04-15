@@ -298,7 +298,7 @@ async def test_ops_new_clients_page_shows_template_block(http_client: AsyncClien
     """На странице есть read-only блок с информацией о Meta-шаблоне."""
     response = await http_client.get("/ops/campaigns/new-clients")
     assert response.status_code == 200
-    assert "kitilash_ka_newsletter_new_clients_monthly_v2" in response.text
+    assert "kitilash_ka_newsletter_new_clients_monthly_v1" in response.text
     assert "newsletter_new_clients_monthly" in response.text
     # Язык шаблона
     assert "de" in response.text
@@ -527,7 +527,7 @@ async def test_template_text_endpoint_returns_data(
 
     response = await http_client.get(
         "/ops/campaigns/new-clients/template-text"
-        "?template_name=kitilash_ka_newsletter_new_clients_monthly_v2"
+        "?template_name=kitilash_ka_newsletter_new_clients_monthly_v1"
         "&company_id=758285"
     )
     assert response.status_code == 200
@@ -575,7 +575,7 @@ async def test_template_text_endpoint_karlsruhe(
 
     response = await http_client.get(
         "/ops/campaigns/new-clients/template-text"
-        "?template_name=kitilash_ka_newsletter_new_clients_monthly_v2"
+        "?template_name=kitilash_ka_newsletter_new_clients_monthly_v1"
         "&company_id=758285"
     )
     assert response.status_code == 200
@@ -609,7 +609,7 @@ async def test_template_text_endpoint_rastatt_falls_back_to_ka(
     # RA campaign company, но template_name — KA (оба используют kitilash_ka_... шаблон)
     response = await http_client.get(
         "/ops/campaigns/new-clients/template-text"
-        "?template_name=kitilash_ka_newsletter_new_clients_monthly_v2"
+        "?template_name=kitilash_ka_newsletter_new_clients_monthly_v1"
         "&company_id=1271200"
     )
     assert response.status_code == 200
@@ -652,7 +652,7 @@ async def test_template_text_no_substring_ambiguity(
             )
 
     response = await http_client.get(
-        "/ops/campaigns/new-clients/template-text?template_name=kitilash_ka_newsletter_new_clients_monthly_v2"
+        "/ops/campaigns/new-clients/template-text?template_name=kitilash_ka_newsletter_new_clients_monthly_v1"
     )
     assert response.status_code == 200
     data = response.json()
