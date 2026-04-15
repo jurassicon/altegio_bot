@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -228,3 +229,82 @@ def test_execution_job_payload_structure() -> None:
     assert isinstance(payload["campaign_run_id"], int)
     # No phone_e164 — intentional: this is an orchestrator job, not an outbound message.
     assert "phone_e164" not in payload
+
+
+# ---------------------------------------------------------------------------
+# 7. Smoke: run_campaign_worker entrypoint is importable and wired correctly
+# ---------------------------------------------------------------------------
+
+
+def test_run_campaign_worker_entrypoint_importable() -> None:
+    """run_campaign_worker script импортируется без ошибок."""
+    import altegio_bot.scripts.run_campaign_worker as entrypoint
+
+    assert callable(entrypoint.main)
+
+
+def test_run_campaign_worker_calls_run_loop(monkeypatch: Any) -> None:
+    """main() в run_campaign_worker вызывает campaign_worker.run_loop."""
+    import altegio_bot.scripts.run_campaign_worker as entrypoint
+    import altegio_bot.workers.campaign_worker as cw
+
+    calls: list[str] = []
+
+    async def _fake_run_loop(**kw: Any) -> None:
+        calls.append("run_loop")
+
+    monkeypatch.setattr(cw, "run_loop", _fake_run_loop)
+    monkeypatch.setattr(entrypoint, "run_loop", _fake_run_loop)
+
+    asyncio.get_event_loop().run_until_complete(entrypoint.main())
+
+    assert calls == ["run_loop"], f"expected run_loop to be called once, got {calls}"
+
+
+# ---------------------------------------------------------------------------
+# 8. campaign_worker logs "picked" before executing the job
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_campaign_worker_logs_picked_job(monkeypatch: Any, caplog: Any) -> None:
+    """process_job_in_session логирует 'picked' при обработке валидного execution job."""
+    import logging
+
+    import altegio_bot.workers.campaign_worker as cw
+
+    job = _FakeJob(
+        id=30,
+        company_id=COMPANY_ID,
+        job_type=CAMPAIGN_EXECUTION_JOB_TYPE,
+        status="processing",
+        payload={"kind": CAMPAIGN_EXECUTION_JOB_TYPE, "campaign_run_id": 77},
+    )
+    session = _FakeSession()
+
+    monkeypatch.setattr(cw, "_load_job", AsyncMock(return_value=job))
+    monkeypatch.setattr(cw, "execute_queued_send_real", AsyncMock(return_value=None))
+
+    with caplog.at_level(logging.INFO, logger="campaign_worker"):
+        await cw.process_job_in_session(session, 30)
+
+    assert any("picked" in r.message for r in caplog.records), (
+        f"Expected 'picked' in logs, got: {[r.message for r in caplog.records]}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 9. Docker-compose service guard: altegio-campaign-worker present in compose
+# ---------------------------------------------------------------------------
+
+
+def test_docker_compose_has_campaign_worker_service() -> None:
+    """docker-compose.yml содержит сервис altegio-campaign-worker."""
+    import pathlib
+
+    compose_path = pathlib.Path(__file__).parents[4] / "docker-compose.yml"
+    assert compose_path.exists(), f"docker-compose.yml not found at {compose_path}"
+
+    content = compose_path.read_text()
+    assert "altegio-campaign-worker" in content, "altegio-campaign-worker service not found in docker-compose.yml"
+    assert "run_campaign_worker" in content, "run_campaign_worker command not found in docker-compose.yml"
