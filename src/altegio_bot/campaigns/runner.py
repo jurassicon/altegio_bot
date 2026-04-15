@@ -663,15 +663,11 @@ async def _execute_send_real_for_existing_run(
                     run.status = "completed"
                 else:
                     run.status = "completed"
-                    # Clean success: auto-hide the source preview snapshot so it
-                    # no longer appears in the default runs list.  The preview
-                    # stays in the DB and is still accessible via direct link.
-                    if run.source_preview_run_id:
-                        await _auto_hide_preview_run(
-                            session,
-                            run.source_preview_run_id,
-                            send_real_run_id=run.id,
-                        )
+                    # Preview is NOT hidden here: message jobs are only
+                    # queued at this point — outbox has not processed them
+                    # yet.  Auto-hide runs later inside
+                    # recompute_campaign_run_stats once all recipients
+                    # have left the in-flight states.
 
                 run.meta = meta
                 run.completed_at = utcnow()
@@ -1504,6 +1500,49 @@ _PROVIDER_ACCEPTED = frozenset({"sent", "delivered", "read"})
 # Outbox statuses that count as delivered (cumulative)
 _DELIVERED = frozenset({"delivered", "read"})
 
+# Recipient statuses that block auto-hide of the source preview run.
+# These indicate in-flight processing or a problematic state that may
+# still require operator attention / manual recovery.
+# Checked inside recompute_campaign_run_stats AFTER
+# _sync_recipient_statuses, so values reflect real outbox state.
+_BLOCKING_HIDE_STATUSES: frozenset[str] = frozenset(
+    {
+        "candidate",  # not yet processed
+        "cleanup_failed",  # pre-queue failure — recovery may be needed
+        "card_issued",  # card issued but message not queued (stuck)
+        "queued",  # queued but outbox has not confirmed delivery yet
+    }
+)
+
+
+def _is_reconciled_for_hide(
+    run: CampaignRun,
+    recipients: list[CampaignRecipient],
+) -> bool:
+    """Return True when a send-real run is fully reconciled.
+
+    Checks that:
+    - run is a completed send-real with a source preview
+    - no last_error or partial_failure in meta
+    - no recipient is in an in-flight / problematic status
+
+    Must be called after _sync_recipient_statuses so statuses reflect
+    actual outbox delivery progress.
+    """
+    if run.mode != "send-real":
+        return False
+    if run.status != "completed":
+        return False
+    if run.source_preview_run_id is None:
+        return False
+    meta = run.meta or {}
+    if meta.get("last_error"):
+        return False
+    if meta.get("partial_failure"):
+        return False
+    return not any(r.status in _BLOCKING_HIDE_STATUSES for r in recipients)
+
+
 # Rank for picking the "best" outbox row when multiple exist for one job.
 # Higher = more advanced delivery state.
 _OUTBOX_STATUS_RANK: dict[str, int] = {
@@ -1764,6 +1803,19 @@ async def recompute_campaign_run_stats(
         run.delivered_count,
         run.read_count,
     )
+
+    # Step 7: auto-hide source preview if the run is fully reconciled.
+    # Triggered only when all recipients have left the in-flight states
+    # (candidate / cleanup_failed / card_issued / queued), meaning the
+    # outbox has confirmed every message queued in this send-real.
+    # Called after _sync_recipient_statuses (step 4) so statuses already
+    # reflect actual outbox delivery progress.
+    if _is_reconciled_for_hide(run, recipients):
+        await _auto_hide_preview_run(
+            session,
+            run.source_preview_run_id,
+            send_real_run_id=run_id,
+        )
 
     return {
         "run_id": run_id,
