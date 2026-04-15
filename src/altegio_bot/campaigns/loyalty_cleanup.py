@@ -146,4 +146,4 @@ def make_card_number(phone_e164: str) -> str:
 
 def make_card_text(card_number: str) -> str:
     """Форматировать текст карты для шаблона сообщения."""
-    return f"Kundenkarte #{card_number}"
+    return f"#{card_number}"
