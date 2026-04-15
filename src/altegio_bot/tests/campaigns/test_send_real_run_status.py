@@ -218,9 +218,7 @@ async def test_all_eligible_failed_run_becomes_failed(runner_fail, monkeypatch) 
     with patch.object(runner_module, "find_candidates", return_value=[candidate]):
         run = await run_send_real(_make_params())
 
-    assert run.status == "failed", (
-        f"Expected run.status='failed' when all card issuances fail, got {run.status!r}"
-    )
+    assert run.status == "failed", f"Expected run.status='failed' when all card issuances fail, got {run.status!r}"
     assert run.queued_count == 0
     assert run.failed_count == 1
     assert run.cards_issued_count == 0
@@ -269,9 +267,7 @@ async def test_partial_success_run_is_completed(runner_partial, monkeypatch) -> 
     with patch.object(runner_module, "find_candidates", return_value=[c1, c2]):
         run = await run_send_real(_make_params())
 
-    assert run.status == "completed", (
-        f"Partial success must keep run.status='completed', got {run.status!r}"
-    )
+    assert run.status == "completed", f"Partial success must keep run.status='completed', got {run.status!r}"
     assert run.queued_count == 1
     assert run.failed_count == 1
 
@@ -292,9 +288,7 @@ async def test_partial_success_meta_has_partial_failure_flag(runner_partial, mon
     assert run.meta.get("partial_failure_count") == 1, (
         f"meta['partial_failure_count'] must be 1, got {run.meta.get('partial_failure_count')!r}"
     )
-    assert "last_error" not in run.meta, (
-        "Partial success must NOT set last_error (run is completed, not failed)"
-    )
+    assert "last_error" not in run.meta, "Partial success must NOT set last_error (run is completed, not failed)"
 
 
 # ---------------------------------------------------------------------------
@@ -339,9 +333,7 @@ async def test_zero_eligible_all_excluded_run_is_completed(runner_ok, monkeypatc
     with patch.object(runner_module, "find_candidates", return_value=candidates):
         run = await run_send_real(_make_params())
 
-    assert run.status == "completed", (
-        f"Run with zero eligible (all excluded) must be completed, got {run.status!r}"
-    )
+    assert run.status == "completed", f"Run with zero eligible (all excluded) must be completed, got {run.status!r}"
     assert run.failed_count == 0
     assert run.queued_count == 0
     assert run.meta is not None
@@ -376,11 +368,7 @@ async def test_card_issue_failed_recipient_is_manual_action(runner_fail, monkeyp
         from sqlalchemy import select
 
         recipients = (
-            (
-                await session.execute(
-                    select(CampaignRecipient).where(CampaignRecipient.campaign_run_id == run.id)
-                )
-            )
+            (await session.execute(select(CampaignRecipient).where(CampaignRecipient.campaign_run_id == run.id)))
             .scalars()
             .all()
         )
@@ -403,9 +391,7 @@ async def test_card_issue_failed_recipient_is_manual_action(runner_fail, monkeyp
 
 
 @pytest.mark.asyncio
-async def test_cleanup_failed_only_eligible_run_becomes_failed(
-    runner_ok, session_maker, monkeypatch
-) -> None:
+async def test_cleanup_failed_only_eligible_run_becomes_failed(runner_ok, session_maker, monkeypatch) -> None:
     """When the only eligible recipient hits cleanup_failed, run.status must be 'failed'.
 
     cleanup_failed increments stats['cleanup_failed'], not stats['failed'].
@@ -416,9 +402,7 @@ async def test_cleanup_failed_only_eligible_run_becomes_failed(
 
     # Patch cleanup_campaign_cards to return failure — this is the pre-queue failure path
     # that was NOT previously covered by the silent-success guard.
-    failing_cleanup = AsyncMock(
-        return_value=CleanupResult(ok=False, reason="API error: 503")
-    )
+    failing_cleanup = AsyncMock(return_value=CleanupResult(ok=False, reason="API error: 503"))
 
     with (
         patch.object(runner_module, "find_candidates", return_value=[candidate]),
@@ -436,15 +420,11 @@ async def test_cleanup_failed_only_eligible_run_becomes_failed(
 
 
 @pytest.mark.asyncio
-async def test_cleanup_failed_only_eligible_last_error_in_meta(
-    runner_ok, session_maker, monkeypatch
-) -> None:
+async def test_cleanup_failed_only_eligible_last_error_in_meta(runner_ok, session_maker, monkeypatch) -> None:
     """run.meta['last_error'] is set when cleanup fails for the only eligible recipient."""
     candidate = _eligible_candidate()
 
-    failing_cleanup = AsyncMock(
-        return_value=CleanupResult(ok=False, reason="API error: 503")
-    )
+    failing_cleanup = AsyncMock(return_value=CleanupResult(ok=False, reason="API error: 503"))
 
     with (
         patch.object(runner_module, "find_candidates", return_value=[candidate]),
@@ -457,15 +437,11 @@ async def test_cleanup_failed_only_eligible_last_error_in_meta(
     assert last_error, "run.meta['last_error'] must be set when cleanup fails"
     assert "0 queued" in last_error, f"last_error must mention '0 queued', got: {last_error!r}"
     assert "1 recipient" in last_error, f"last_error must mention recipient count, got: {last_error!r}"
-    assert "cleanup_failed=1" in last_error, (
-        f"last_error must mention cleanup_failed count, got: {last_error!r}"
-    )
+    assert "cleanup_failed=1" in last_error, f"last_error must mention cleanup_failed count, got: {last_error!r}"
 
 
 @pytest.mark.asyncio
-async def test_partial_success_with_cleanup_failed_is_completed(
-    runner_ok, session_maker, monkeypatch
-) -> None:
+async def test_partial_success_with_cleanup_failed_is_completed(runner_ok, session_maker, monkeypatch) -> None:
     """One queued + one cleanup_failed → run.status == 'completed' (partial success).
 
     cleanup_failed is part of prequeue_failures. When some recipients are queued
@@ -499,9 +475,7 @@ async def test_partial_success_with_cleanup_failed_is_completed(
 
 
 @pytest.mark.asyncio
-async def test_partial_failure_count_includes_cleanup_failed(
-    runner_ok, session_maker, monkeypatch
-) -> None:
+async def test_partial_failure_count_includes_cleanup_failed(runner_ok, session_maker, monkeypatch) -> None:
     """meta['partial_failure_count'] = stats['failed'] + stats['cleanup_failed'].
 
     partial_failure_count must reflect the total number of recipients that failed

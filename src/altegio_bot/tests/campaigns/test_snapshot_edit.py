@@ -147,7 +147,7 @@ async def _make_recipient(
 
 
 # ---------------------------------------------------------------------------
-# 1. delete_preview_run — success
+# 1. delete_preview_run — success.
 # ---------------------------------------------------------------------------
 
 
@@ -169,7 +169,7 @@ async def test_delete_preview_run_success(session_maker, monkeypatch) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 2. delete_preview — forbidden when referenced by send-real
+# 2. delete_preview — forbidden when referenced by send-real.
 # ---------------------------------------------------------------------------
 
 
@@ -191,7 +191,7 @@ async def test_delete_preview_forbidden_when_referenced(session_maker, monkeypat
 
 
 # ---------------------------------------------------------------------------
-# 3. remove_recipient — soft-exclude
+# 3. remove_recipient — soft-exclude.
 # ---------------------------------------------------------------------------
 
 
@@ -211,7 +211,7 @@ async def test_remove_recipient_from_preview(session_maker, monkeypatch) -> None
 
 
 # ---------------------------------------------------------------------------
-# 4. counters recompute after manual remove
+# 4. counters recompute after manual remove.
 # ---------------------------------------------------------------------------
 
 
@@ -257,7 +257,7 @@ async def test_counters_recompute_after_manual_remove(session_maker, monkeypatch
 
 
 # ---------------------------------------------------------------------------
-# 5. add recipient — success (mocked CRM)
+# 5. add recipient — success (mocked CRM).
 # ---------------------------------------------------------------------------
 
 
@@ -314,7 +314,7 @@ async def test_add_recipient_success(http_client: AsyncClient, session_maker) ->
 
 
 # ---------------------------------------------------------------------------
-# 6. duplicate add → 409
+# 6. duplicate add → 409.
 # ---------------------------------------------------------------------------
 
 
@@ -339,7 +339,7 @@ async def test_duplicate_add_rejected(http_client: AsyncClient, session_maker) -
 
 
 # ---------------------------------------------------------------------------
-# 7. send-real from edited preview: manual_removed recipient skipped
+# 7. send-real from edited preview: manual_removed recipient skipped.
 # ---------------------------------------------------------------------------
 
 
@@ -372,7 +372,7 @@ async def test_send_real_snapshot_skips_manual_removed(session_maker, monkeypatc
 
 
 # ---------------------------------------------------------------------------
-# 8. manual_removed reason in /recipients JSON
+# 8. manual_removed reason in /recipients JSON.
 # ---------------------------------------------------------------------------
 
 
@@ -398,7 +398,7 @@ async def test_manual_removed_in_recipients_json(http_client: AsyncClient, sessi
 
 
 # ---------------------------------------------------------------------------
-# 9. deleted run invisible from /runs (visible with include_deleted=true)
+# 9. deleted run invisible from /runs (visible with include_deleted=true).
 # ---------------------------------------------------------------------------
 
 
@@ -424,7 +424,7 @@ async def test_deleted_run_hidden_from_list(http_client: AsyncClient, session_ma
 
 
 # ---------------------------------------------------------------------------
-# 10. delete_preview_run forbidden for running preview (race condition guard)
+# 10. delete_preview_run forbidden for running preview (race condition guard).
 # ---------------------------------------------------------------------------
 
 
@@ -444,7 +444,7 @@ async def test_delete_preview_forbidden_for_running(session_maker, monkeypatch) 
 
 
 # ---------------------------------------------------------------------------
-# 11. remove_recipient forbidden for running preview
+# 11. remove_recipient forbidden for running preview.
 # ---------------------------------------------------------------------------
 
 
@@ -465,7 +465,7 @@ async def test_remove_recipient_forbidden_for_running(session_maker, monkeypatch
 
 
 # ---------------------------------------------------------------------------
-# 12. add_recipient forbidden for running preview (via HTTP 400)
+# 12. add_recipient forbidden for running preview (via HTTP 400).
 # ---------------------------------------------------------------------------
 
 
@@ -484,7 +484,7 @@ async def test_add_recipient_forbidden_for_running(http_client: AsyncClient, ses
 
 
 # ---------------------------------------------------------------------------
-# 13. summary flags: running preview NOT marked editable/deletable/discardable
+# 13. summary flags: running preview NOT marked editable/deletable/discardable.
 # ---------------------------------------------------------------------------
 
 
@@ -504,7 +504,7 @@ async def test_summary_flags_running_not_editable(http_client: AsyncClient, sess
 
 
 # ---------------------------------------------------------------------------
-# 14. summary flags: used-as-source preview NOT marked editable/deletable/discardable
+# 14. summary flags: used-as-source preview NOT marked editable/deletable/discardable.
 # ---------------------------------------------------------------------------
 
 
@@ -524,7 +524,7 @@ async def test_summary_flags_used_source_not_editable(http_client: AsyncClient, 
 
 
 # ---------------------------------------------------------------------------
-# 15. discard_preview_run — success
+# 15. discard_preview_run — success.
 # ---------------------------------------------------------------------------
 
 
@@ -546,7 +546,7 @@ async def test_discard_preview_run_success(session_maker, monkeypatch) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 16. discard_preview_run — forbidden for running preview (race condition guard)
+# 16. discard_preview_run — forbidden for running preview (race condition guard).
 # ---------------------------------------------------------------------------
 
 
@@ -566,7 +566,7 @@ async def test_discard_preview_forbidden_for_running(session_maker, monkeypatch)
 
 
 # ---------------------------------------------------------------------------
-# 17. discard_preview_run — forbidden when referenced by send-real
+# 17. discard_preview_run — forbidden when referenced by send-real.
 # ---------------------------------------------------------------------------
 
 
