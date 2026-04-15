@@ -8,6 +8,7 @@ from sqlalchemy import (
     Boolean,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     Numeric,
     String,
@@ -130,6 +131,8 @@ class Client(Base):
             "altegio_client_id",
             name="uq_clients_company_altegio_id",
         ),
+        Index("ix_clients_company_phone", "company_id", "phone_e164"),
+        Index("ix_clients_wa_opted_out_at", "wa_opted_out", "wa_opted_out_at"),
     )
 
     id: Mapped[int] = mapped_column(
@@ -317,6 +320,17 @@ class MessageTemplate(Base):
 class MessageJob(Base):
     __tablename__ = "message_jobs"
 
+    __table_args__ = (
+        Index("ix_message_jobs_status_run_at", "status", "run_at"),
+        Index(
+            "ix_message_jobs_company_type_status",
+            "company_id",
+            "job_type",
+            "status",
+        ),
+        Index("ix_message_jobs_status_locked_at", "status", "locked_at"),
+    )
+
     id: Mapped[int] = mapped_column(
         BigInteger,
         primary_key=True,
@@ -393,6 +407,17 @@ class MessageJob(Base):
 
 class OutboxMessage(Base):
     __tablename__ = "outbox_messages"
+
+    __table_args__ = (
+        Index("ix_outbox_messages_sent_at", "sent_at"),
+        Index("ix_outbox_messages_company_sent_at", "company_id", "sent_at"),
+        Index("ix_outbox_messages_created_at", "created_at"),
+        Index(
+            "ix_outbox_messages_company_created_at",
+            "company_id",
+            "created_at",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(
         BigInteger,
@@ -746,7 +771,7 @@ class CampaignRecipient(Base):
     #   → queue_failed | queued → provider_accepted → delivered
     #   → read → replied → booked_after_campaign
     # -----------------------------------------------------------------------
-    status: Mapped[str] = mapped_column(String(64), default="candidate")
+    status: Mapped[str] = mapped_column(String(32), default="candidate")
 
     # Причина исключения (если статус skipped/cleanup_failed).
     # Значения: opted_out / no_phone / invalid_phone / no_whatsapp /

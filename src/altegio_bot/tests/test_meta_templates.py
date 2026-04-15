@@ -65,7 +65,7 @@ def test_resolve_ra_record_created() -> None:
 
 
 def test_resolve_ra_record_updated() -> None:
-    # Rastatt falls back to ka template with a warning
+    # Rastatt has a dedicated ra_* template for record_updated.
     assert resolve_meta_template(RA, "record_updated") == ("kitilash_ra_record_updated_v1")
 
 

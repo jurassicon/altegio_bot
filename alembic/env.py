@@ -3,24 +3,28 @@ from __future__ import annotations
 import asyncio
 from logging.config import fileConfig
 
-from alembic import context
 from sqlalchemy import pool
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
+from alembic import context
+from altegio_bot.models import Base
 from altegio_bot.settings import settings
-
 
 config = context.config
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-# ВАЖНО: импортируем settings и Base.metadata
-# 1) settings.database_url берём из .env (pydantic-settings)
-# 2) Base.metadata — это "карта" таблиц из SQLAlchemy моделей
-
-from altegio_bot.models import Base
 target_metadata = Base.metadata
+
+
+def include_object(object_, name, type_, reflected, compare_to):
+    if type_ == "index" and name in (
+        "ix_whatsapp_events_msg_id",
+        "ix_whatsapp_events_cmd_body",
+    ):
+        return False
+    return True
 
 
 def run_migrations_offline() -> None:
@@ -32,6 +36,7 @@ def run_migrations_offline() -> None:
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
         compare_type=True,
+        include_object=include_object,
     )
 
     with context.begin_transaction():
@@ -43,6 +48,7 @@ def do_run_migrations(connection) -> None:
         connection=connection,
         target_metadata=target_metadata,
         compare_type=True,
+        include_object=include_object,
     )
 
     with context.begin_transaction():
