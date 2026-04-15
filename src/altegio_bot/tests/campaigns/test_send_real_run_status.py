@@ -1,4 +1,4 @@
-"""Tests: send-real run status when card issuance fails.
+"""Tests: send-real run status when card issuance or cleanup fails.
 
 Context (run 12 silent-success bug):
   - preview run 11: eligible=1
@@ -7,11 +7,13 @@ Context (run 12 silent-success bug):
     regardless of stats['failed'] and stats['queued']
   - UI showed 100% completed with no visible error
 
-Fix:
-  - if eligible_count > 0 and queued == 0 and failed > 0:
+Fix (commit 8731348 + cleanup extension):
+  prequeue_failures = stats["failed"] + stats["cleanup_failed"]
+  - if eligible_count > 0 and queued == 0 and prequeue_failures > 0:
       run.status = 'failed', meta['last_error'] = descriptive message
-  - if queued > 0 and failed > 0 (partial):
+  - if queued > 0 and prequeue_failures > 0 (partial):
       run.status = 'completed', meta['partial_failure'] = True
+      meta['partial_failure_count'] = prequeue_failures
   - normal success: run.status = 'completed', no last_error
 
 Coverage:
@@ -19,21 +21,25 @@ Coverage:
   2. run.meta contains last_error with card failure count
   3. run.failed_count == 1, run.queued_count == 0
   4. when some recipients queue and some fail → partial-success: completed + partial_failure meta
-  5. normal success: completed with no last_error in meta
-  6. resume_send_real does not silently re-process card_issue_failed recipients
-     (_is_manual_action_recipient guards them correctly)
+  5. partial_failure_count includes both card_issue_failed and cleanup_failed
+  6. normal success: completed with no last_error in meta
   7. zero eligible candidates (all pre-excluded) → completed with no error
+  8. resume_send_real does not silently re-process card_issue_failed recipients
+  9. cleanup_failed for the only eligible → run becomes failed (not completed)
+  10. partial success with one queued and one cleanup_failed → completed + partial_failure
+  11. partial_failure_count includes cleanup_failed recipients
 """
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 import pytest_asyncio
 
 import altegio_bot.campaigns.runner as runner_module
+from altegio_bot.campaigns.loyalty_cleanup import CleanupResult
 from altegio_bot.campaigns.runner import RunParams, run_send_real
 from altegio_bot.campaigns.segment import ClientCandidate, ClientSnapshot
 from altegio_bot.models.models import CampaignRecipient
@@ -212,7 +218,9 @@ async def test_all_eligible_failed_run_becomes_failed(runner_fail, monkeypatch) 
     with patch.object(runner_module, "find_candidates", return_value=[candidate]):
         run = await run_send_real(_make_params())
 
-    assert run.status == "failed", f"Expected run.status='failed' when all card issuances fail, got {run.status!r}"
+    assert run.status == "failed", (
+        f"Expected run.status='failed' when all card issuances fail, got {run.status!r}"
+    )
     assert run.queued_count == 0
     assert run.failed_count == 1
     assert run.cards_issued_count == 0
@@ -248,7 +256,7 @@ async def test_all_eligible_failed_counters_correct(runner_fail, monkeypatch) ->
 
 
 # ---------------------------------------------------------------------------
-# 2. Partial success: some queued, some failed
+# 2. Partial success: some queued, some failed (card_issue_failed)
 # ---------------------------------------------------------------------------
 
 
@@ -261,7 +269,9 @@ async def test_partial_success_run_is_completed(runner_partial, monkeypatch) -> 
     with patch.object(runner_module, "find_candidates", return_value=[c1, c2]):
         run = await run_send_real(_make_params())
 
-    assert run.status == "completed", f"Partial success must keep run.status='completed', got {run.status!r}"
+    assert run.status == "completed", (
+        f"Partial success must keep run.status='completed', got {run.status!r}"
+    )
     assert run.queued_count == 1
     assert run.failed_count == 1
 
@@ -282,7 +292,9 @@ async def test_partial_success_meta_has_partial_failure_flag(runner_partial, mon
     assert run.meta.get("partial_failure_count") == 1, (
         f"meta['partial_failure_count'] must be 1, got {run.meta.get('partial_failure_count')!r}"
     )
-    assert "last_error" not in run.meta, "Partial success must NOT set last_error (run is completed, not failed)"
+    assert "last_error" not in run.meta, (
+        "Partial success must NOT set last_error (run is completed, not failed)"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -316,7 +328,7 @@ async def test_zero_eligible_all_excluded_run_is_completed(runner_ok, monkeypatc
     """When all candidates are pre-excluded (no eligible), run must be completed (not failed).
 
     The all-failed guard only fires when eligible_count > 0. If every candidate
-    was excluded before _process_eligible, stats['failed'] == 0 and the guard
+    was excluded before _process_eligible, prequeue_failures == 0 and the guard
     does not trigger — run stays completed.
     """
     candidates = [
@@ -327,7 +339,9 @@ async def test_zero_eligible_all_excluded_run_is_completed(runner_ok, monkeypatc
     with patch.object(runner_module, "find_candidates", return_value=candidates):
         run = await run_send_real(_make_params())
 
-    assert run.status == "completed", f"Run with zero eligible (all excluded) must be completed, got {run.status!r}"
+    assert run.status == "completed", (
+        f"Run with zero eligible (all excluded) must be completed, got {run.status!r}"
+    )
     assert run.failed_count == 0
     assert run.queued_count == 0
     assert run.meta is not None
@@ -362,7 +376,11 @@ async def test_card_issue_failed_recipient_is_manual_action(runner_fail, monkeyp
         from sqlalchemy import select
 
         recipients = (
-            (await session.execute(select(CampaignRecipient).where(CampaignRecipient.campaign_run_id == run.id)))
+            (
+                await session.execute(
+                    select(CampaignRecipient).where(CampaignRecipient.campaign_run_id == run.id)
+                )
+            )
             .scalars()
             .all()
         )
@@ -377,3 +395,140 @@ async def test_card_issue_failed_recipient_is_manual_action(runner_fail, monkeyp
     assert not _is_resume_pending_recipient(r), (
         "card_issue_failed recipient must NOT be resume-pending (would silently retry)"
     )
+
+
+# ---------------------------------------------------------------------------
+# 6. cleanup_failed path — new tests (commit extension)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cleanup_failed_only_eligible_run_becomes_failed(
+    runner_ok, session_maker, monkeypatch
+) -> None:
+    """When the only eligible recipient hits cleanup_failed, run.status must be 'failed'.
+
+    cleanup_failed increments stats['cleanup_failed'], not stats['failed'].
+    prequeue_failures = stats['failed'] + stats['cleanup_failed'].
+    With queued==0 and prequeue_failures>0, the finalization guard must set run.status='failed'.
+    """
+    candidate = _eligible_candidate()
+
+    # Patch cleanup_campaign_cards to return failure — this is the pre-queue failure path
+    # that was NOT previously covered by the silent-success guard.
+    failing_cleanup = AsyncMock(
+        return_value=CleanupResult(ok=False, reason="API error: 503")
+    )
+
+    with (
+        patch.object(runner_module, "find_candidates", return_value=[candidate]),
+        patch.object(runner_module, "cleanup_campaign_cards", failing_cleanup),
+    ):
+        run = await run_send_real(_make_params())
+
+    assert run.status == "failed", (
+        f"Expected run.status='failed' when cleanup fails for the only eligible, got {run.status!r}"
+    )
+    assert run.queued_count == 0
+    assert run.cleanup_failed_count == 1
+    assert run.failed_count == 0  # card_issue_failed is 0; cleanup_failed is separate counter
+    assert run.cards_issued_count == 0
+
+
+@pytest.mark.asyncio
+async def test_cleanup_failed_only_eligible_last_error_in_meta(
+    runner_ok, session_maker, monkeypatch
+) -> None:
+    """run.meta['last_error'] is set when cleanup fails for the only eligible recipient."""
+    candidate = _eligible_candidate()
+
+    failing_cleanup = AsyncMock(
+        return_value=CleanupResult(ok=False, reason="API error: 503")
+    )
+
+    with (
+        patch.object(runner_module, "find_candidates", return_value=[candidate]),
+        patch.object(runner_module, "cleanup_campaign_cards", failing_cleanup),
+    ):
+        run = await run_send_real(_make_params())
+
+    assert run.meta is not None
+    last_error = run.meta.get("last_error", "")
+    assert last_error, "run.meta['last_error'] must be set when cleanup fails"
+    assert "0 queued" in last_error, f"last_error must mention '0 queued', got: {last_error!r}"
+    assert "1 recipient" in last_error, f"last_error must mention recipient count, got: {last_error!r}"
+    assert "cleanup_failed=1" in last_error, (
+        f"last_error must mention cleanup_failed count, got: {last_error!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_partial_success_with_cleanup_failed_is_completed(
+    runner_ok, session_maker, monkeypatch
+) -> None:
+    """One queued + one cleanup_failed → run.status == 'completed' (partial success).
+
+    cleanup_failed is part of prequeue_failures. When some recipients are queued
+    and some have prequeue_failures, run stays 'completed' with partial_failure flag.
+    """
+    c1 = _eligible_candidate(phone_e164="+4915111111111")  # will succeed
+    c2 = _eligible_candidate(phone_e164="+4915222222222")  # will hit cleanup_failed
+
+    call_count = 0
+
+    async def _selective_cleanup(session, loyalty, *, location_id, client_id, campaign_code):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            # First candidate: cleanup OK
+            return CleanupResult(ok=True, deleted_ids=[])
+        # Second candidate: cleanup fails
+        return CleanupResult(ok=False, reason="Altegio: card locked")
+
+    with (
+        patch.object(runner_module, "find_candidates", return_value=[c1, c2]),
+        patch.object(runner_module, "cleanup_campaign_cards", _selective_cleanup),
+    ):
+        run = await run_send_real(_make_params())
+
+    assert run.status == "completed", (
+        f"Partial success (1 queued + 1 cleanup_failed) must be 'completed', got {run.status!r}"
+    )
+    assert run.queued_count == 1
+    assert run.cleanup_failed_count == 1
+
+
+@pytest.mark.asyncio
+async def test_partial_failure_count_includes_cleanup_failed(
+    runner_ok, session_maker, monkeypatch
+) -> None:
+    """meta['partial_failure_count'] = stats['failed'] + stats['cleanup_failed'].
+
+    partial_failure_count must reflect the total number of recipients that failed
+    before being queued, regardless of whether they failed at cleanup or card issuance.
+    """
+    c1 = _eligible_candidate(phone_e164="+4915111111111")  # will succeed
+    c2 = _eligible_candidate(phone_e164="+4915222222222")  # will hit cleanup_failed
+
+    call_count = 0
+
+    async def _selective_cleanup(session, loyalty, *, location_id, client_id, campaign_code):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return CleanupResult(ok=True, deleted_ids=[])
+        return CleanupResult(ok=False, reason="Altegio: card locked")
+
+    with (
+        patch.object(runner_module, "find_candidates", return_value=[c1, c2]),
+        patch.object(runner_module, "cleanup_campaign_cards", _selective_cleanup),
+    ):
+        run = await run_send_real(_make_params())
+
+    assert run.meta is not None
+    assert run.meta.get("partial_failure") is True
+    # partial_failure_count must count cleanup_failed too (0 card_issue_failed + 1 cleanup_failed = 1)
+    assert run.meta.get("partial_failure_count") == 1, (
+        f"partial_failure_count must include cleanup_failed, got {run.meta.get('partial_failure_count')!r}"
+    )
+    assert "last_error" not in run.meta, "Partial success must NOT set last_error"

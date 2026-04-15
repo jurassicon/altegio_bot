@@ -582,31 +582,39 @@ async def _execute_send_real_for_existing_run(
                 # eligible_count = candidates that entered _process_eligible (no pre-run exclusion)
                 eligible_count = sum(1 for c in candidates if not c.excluded_reason)
 
+                # prequeue_failures covers every path that stops a recipient short of
+                # being queued: card issuance failure AND loyalty-card cleanup failure.
+                prequeue_failures = stats["failed"] + stats["cleanup_failed"]
+
                 meta = dict(run.meta or {})
                 meta.pop("last_error", None)
                 meta.pop("partial_failure", None)
                 meta.pop("partial_failure_count", None)
 
-                if eligible_count > 0 and stats["queued"] == 0 and stats["failed"] > 0:
+                if eligible_count > 0 and stats["queued"] == 0 and prequeue_failures > 0:
                     # All eligible recipients failed before any job was queued.
                     # Setting status=completed would silently hide the failure — use failed instead.
                     error_msg = (
                         f"Campaign finished with 0 queued recipients; "
-                        f"card issuance or queueing failed for {stats['failed']} recipient(s)"
+                        f"pre-queue failures for {prequeue_failures} recipient(s) "
+                        f"(card_issue_failed={stats['failed']}, cleanup_failed={stats['cleanup_failed']})"
                     )
                     meta["last_error"] = error_msg
                     run.status = "failed"
                     logger.error(
-                        "send-real all-failed run_id=%d company=%d eligible=%d failed=%d",
+                        "send-real all-failed run_id=%d company=%d eligible=%d "
+                        "prequeue_failures=%d (failed=%d cleanup_failed=%d)",
                         run_id,
                         params.company_id,
                         eligible_count,
+                        prequeue_failures,
                         stats["failed"],
+                        stats["cleanup_failed"],
                     )
-                elif stats["queued"] > 0 and stats["failed"] > 0:
-                    # Partial success: some recipients queued, some failed.
+                elif stats["queued"] > 0 and prequeue_failures > 0:
+                    # Partial success: some recipients queued, some failed before queue.
                     meta["partial_failure"] = True
-                    meta["partial_failure_count"] = stats["failed"]
+                    meta["partial_failure_count"] = prequeue_failures
                     run.status = "completed"
                 else:
                     run.status = "completed"
