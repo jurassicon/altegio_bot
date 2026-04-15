@@ -8,11 +8,12 @@ from datetime import datetime, timezone
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import select
 
 import altegio_bot.ops.campaigns_api as campaigns_api_module
 import altegio_bot.ops.router as ops_router_module
 from altegio_bot.main import app
-from altegio_bot.models.models import CampaignRecipient, CampaignRun
+from altegio_bot.models.models import CampaignRecipient, CampaignRun, MessageJob
 from altegio_bot.ops.auth import require_ops_auth
 
 
@@ -685,3 +686,441 @@ async def test_ops_new_clients_page_has_excluded_breakdown_section(
     assert "no_confirmed_record_in_period" in text
     assert "has_records_before_period" in text
     assert "Причины исключения" in text
+
+
+# ---------------------------------------------------------------------------
+# POST /ops/campaigns/runs/{run_id}/recompute
+# ---------------------------------------------------------------------------
+
+
+@pytest_asyncio.fixture
+async def stale_send_real_run(session_maker) -> int:
+    """Production-realistic run with stale counters.
+
+    Reproduces the actual production path:
+    - CampaignRecipient has message_job_id set (job was created)
+    - outbox_message_id is NULL (back-reference never filled by worker)
+    - OutboxMessage exists only via job_id FK
+    - CampaignRun counters are stale (queued_count=0)
+
+    recompute должен найти outbox через job_id, заполнить ссылку,
+    обновить счётчики и синхронизировать статус получателя.
+    """
+    from altegio_bot.models.models import OutboxMessage
+
+    now = datetime.now(timezone.utc)
+    async with session_maker() as session:
+        async with session.begin():
+            run = CampaignRun(
+                campaign_code="new_clients_monthly",
+                mode="send-real",
+                company_ids=[758285],
+                period_start=now.replace(day=1, hour=0, minute=0, second=0, microsecond=0),
+                period_end=now,
+                status="completed",
+                # Stale counters — queued=0 even though one message was sent
+                total_clients_seen=3,
+                candidates_count=1,
+                queued_count=0,
+                sent_count=0,
+                provider_accepted_count=0,
+                delivered_count=0,
+                read_count=0,
+                cards_issued_count=0,
+                cleanup_failed_count=0,
+                cards_deleted_count=0,
+                followup_enabled=False,
+                meta={},
+            )
+            session.add(run)
+            await session.flush()
+            run_id = run.id
+
+            # Create the MessageJob that triggered the send
+            job = MessageJob(
+                company_id=758285,
+                job_type="newsletter_new_clients_monthly",
+                run_at=now,
+                status="done",
+                dedupe_key=f"test-recompute-stale-{run_id}",
+                payload={
+                    "campaign_run_id": run_id,
+                    "campaign_recipient_id": 0,  # patched below
+                },
+            )
+            session.add(job)
+            await session.flush()
+            job_id = job.id
+
+            # OutboxMessage linked via job_id ONLY — no back-ref on recipient
+            outbox = OutboxMessage(
+                company_id=758285,
+                job_id=job_id,
+                phone_e164="+49151000001",
+                template_code="newsletter_new_clients_monthly",
+                language="de",
+                body="Test body",
+                status="sent",
+                scheduled_at=now,
+            )
+            session.add(outbox)
+
+            # Excluded recipient (opted_out)
+            session.add(
+                CampaignRecipient(
+                    campaign_run_id=run_id,
+                    company_id=758285,
+                    altegio_client_id=10,
+                    phone_e164="+49151000000",
+                    display_name="Opted Out Client",
+                    status="skipped",
+                    excluded_reason="opted_out",
+                )
+            )
+            # Excluded recipient (no_phone)
+            session.add(
+                CampaignRecipient(
+                    campaign_run_id=run_id,
+                    company_id=758285,
+                    altegio_client_id=11,
+                    phone_e164=None,
+                    display_name="No Phone Client",
+                    status="skipped",
+                    excluded_reason="no_phone",
+                )
+            )
+            # Eligible recipient: has message_job_id but outbox_message_id=NULL
+            # This is the real production gap we're testing.
+            eligible = CampaignRecipient(
+                campaign_run_id=run_id,
+                company_id=758285,
+                altegio_client_id=12,
+                phone_e164="+49151000001",
+                display_name="Success Client",
+                status="queued",
+                loyalty_card_id="CARD-001",
+                message_job_id=job_id,
+                outbox_message_id=None,  # gap: never backfilled
+            )
+            session.add(eligible)
+
+    return run_id
+
+
+@pytest.mark.asyncio
+async def test_recompute_endpoint_returns_200(
+    http_client: AsyncClient,
+    stale_send_real_run: int,
+) -> None:
+    """POST /recompute возвращает 200 с JSON summary."""
+    run_id = stale_send_real_run
+    response = await http_client.post(f"/ops/campaigns/runs/{run_id}/recompute")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["recomputed"] is True
+    assert data["run_id"] == run_id
+    assert "stats" in data
+
+
+@pytest.mark.asyncio
+async def test_recompute_fixes_stale_counters(
+    http_client: AsyncClient,
+    stale_send_real_run: int,
+    session_maker,
+) -> None:
+    """После recompute счётчики в БД соответствуют реальному состоянию.
+
+    Production regression scenario:
+    - CampaignRecipient has message_job_id, outbox_message_id=NULL
+    - OutboxMessage exists via job_id only
+    - recompute должен найти outbox и выставить queued_count=1
+    """
+    run_id = stale_send_real_run
+
+    # Counters are stale before recompute
+    async with session_maker() as session:
+        run_before = await session.get(CampaignRun, run_id)
+    assert run_before.queued_count == 0
+
+    response = await http_client.post(f"/ops/campaigns/runs/{run_id}/recompute")
+    assert response.status_code == 200
+
+    async with session_maker() as session:
+        run_after = await session.get(CampaignRun, run_id)
+
+    assert run_after.queued_count == 1, "queued_count должен стать 1 после recompute"
+    assert run_after.sent_count == 1
+    assert run_after.provider_accepted_count == 1  # outbox.status='sent'
+    assert run_after.cards_issued_count == 1
+    assert run_after.candidates_count == 1
+    assert run_after.total_clients_seen == 3
+    assert run_after.excluded_opted_out == 1
+    assert run_after.excluded_no_phone == 1
+
+
+@pytest.mark.asyncio
+async def test_recompute_backfills_outbox_link_via_job_id(
+    http_client: AsyncClient,
+    stale_send_real_run: int,
+    session_maker,
+) -> None:
+    """recompute заполняет outbox_message_id на recipient через job_id.
+
+    Это основной regression test для production gap: outbox_worker создаёт
+    OutboxMessage с job_id но не записывает обратную ссылку в recipient.
+    После recompute recipient должен иметь outbox_message_id заполненным.
+    """
+    from altegio_bot.models.models import OutboxMessage
+
+    run_id = stale_send_real_run
+
+    # Verify precondition: eligible recipient has no outbox_message_id
+    async with session_maker() as session:
+        stmt = (
+            select(CampaignRecipient)
+            .where(CampaignRecipient.campaign_run_id == run_id)
+            .where(CampaignRecipient.message_job_id.is_not(None))
+        )
+        recip_before = (await session.execute(stmt)).scalars().first()
+        assert recip_before is not None
+        assert recip_before.outbox_message_id is None, "precondition: outbox_message_id should be NULL before recompute"
+
+    response = await http_client.post(f"/ops/campaigns/runs/{run_id}/recompute")
+    assert response.status_code == 200
+
+    # After recompute: outbox_message_id must be backfilled
+    async with session_maker() as session:
+        stmt = (
+            select(CampaignRecipient)
+            .where(CampaignRecipient.campaign_run_id == run_id)
+            .where(CampaignRecipient.message_job_id.is_not(None))
+        )
+        recip_after = (await session.execute(stmt)).scalars().first()
+        assert recip_after is not None
+        assert recip_after.outbox_message_id is not None, "outbox_message_id should be backfilled by recompute"
+        # Verify the linked outbox is real
+        ob = await session.get(OutboxMessage, recip_after.outbox_message_id)
+        assert ob is not None
+        assert ob.status == "sent"
+
+
+@pytest.mark.asyncio
+async def test_recompute_syncs_recipient_status_from_outbox(
+    http_client: AsyncClient,
+    stale_send_real_run: int,
+    session_maker,
+) -> None:
+    """После recompute статус получателя синхронизируется с outbox.
+
+    Variant A: если outbox.status='sent', recipient.status должен стать
+    'provider_accepted' (не оставаться 'queued').
+    Это исправляет misleading recipients summary на detail page.
+    """
+    run_id = stale_send_real_run
+
+    # Precondition: recipient status is 'queued'
+    async with session_maker() as session:
+        stmt = (
+            select(CampaignRecipient)
+            .where(CampaignRecipient.campaign_run_id == run_id)
+            .where(CampaignRecipient.message_job_id.is_not(None))
+        )
+        r = (await session.execute(stmt)).scalars().first()
+        assert r is not None
+        assert r.status == "queued"
+
+    response = await http_client.post(f"/ops/campaigns/runs/{run_id}/recompute")
+    assert response.status_code == 200
+
+    # After recompute: status should be 'provider_accepted' (outbox='sent')
+    async with session_maker() as session:
+        stmt = (
+            select(CampaignRecipient)
+            .where(CampaignRecipient.campaign_run_id == run_id)
+            .where(CampaignRecipient.message_job_id.is_not(None))
+        )
+        r_after = (await session.execute(stmt)).scalars().first()
+        assert r_after is not None
+
+    assert r_after.status == "provider_accepted", (
+        "recipient status должен быть 'provider_accepted' после recompute когда outbox.status='sent'"
+    )
+
+
+@pytest.mark.asyncio
+async def test_recompute_delivery_counters_from_outbox(
+    http_client: AsyncClient,
+    stale_send_real_run: int,
+    session_maker,
+) -> None:
+    """provider_accepted, delivered, read берутся из OutboxMessage.status."""
+    from altegio_bot.models.models import OutboxMessage
+
+    run_id = stale_send_real_run
+
+    # Update the outbox to 'read' via job_id lookup (production path)
+    async with session_maker() as session:
+        async with session.begin():
+            stmt = (
+                select(CampaignRecipient)
+                .where(CampaignRecipient.campaign_run_id == run_id)
+                .where(CampaignRecipient.message_job_id.is_not(None))
+            )
+            recip = (await session.execute(stmt)).scalars().first()
+            assert recip is not None
+            # find outbox via job_id (production path)
+            ob_stmt = (
+                select(OutboxMessage)
+                .where(OutboxMessage.job_id == recip.message_job_id)
+                .order_by(OutboxMessage.id.desc())
+                .limit(1)
+            )
+            ob = (await session.execute(ob_stmt)).scalars().first()
+            assert ob is not None
+            ob.status = "read"
+
+    response = await http_client.post(f"/ops/campaigns/runs/{run_id}/recompute")
+    assert response.status_code == 200
+
+    async with session_maker() as session:
+        run = await session.get(CampaignRun, run_id)
+
+    # Cumulative: read => also delivered and provider_accepted
+    assert run.read_count == 1
+    assert run.delivered_count == 1
+    assert run.provider_accepted_count == 1
+
+
+@pytest.mark.asyncio
+async def test_recompute_is_idempotent(
+    http_client: AsyncClient,
+    stale_send_real_run: int,
+    session_maker,
+) -> None:
+    """Повторный вызов recompute даёт тот же результат."""
+    run_id = stale_send_real_run
+
+    resp1 = await http_client.post(f"/ops/campaigns/runs/{run_id}/recompute")
+    resp2 = await http_client.post(f"/ops/campaigns/runs/{run_id}/recompute")
+
+    assert resp1.status_code == 200
+    assert resp2.status_code == 200
+
+    async with session_maker() as session:
+        run = await session.get(CampaignRun, run_id)
+
+    assert run.queued_count == 1
+    assert run.candidates_count == 1
+
+
+@pytest.mark.asyncio
+async def test_recompute_not_found(http_client: AsyncClient) -> None:
+    """POST /recompute для несуществующего run возвращает 404."""
+    response = await http_client.post("/ops/campaigns/runs/9999999/recompute")
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_recompute_button_present_for_send_real(
+    http_client: AsyncClient,
+    sample_run: int,
+) -> None:
+    """Кнопка Recompute stats доступна на detail page send-real run."""
+    response = await http_client.get(f"/ops/campaigns/{sample_run}")
+    assert response.status_code == 200
+    assert "Recompute stats" in response.text
+    assert "recomputeStats" in response.text
+
+
+@pytest.mark.asyncio
+async def test_recompute_button_disabled_for_preview(
+    http_client: AsyncClient,
+    session_maker,
+) -> None:
+    """Для preview run кнопка Recompute stats disabled."""
+    now = datetime.now(timezone.utc)
+    async with session_maker() as session:
+        async with session.begin():
+            run = CampaignRun(
+                campaign_code="new_clients_monthly",
+                mode="preview",
+                company_ids=[758285],
+                period_start=now.replace(day=1, hour=0, minute=0, second=0, microsecond=0),
+                period_end=now,
+                status="completed",
+                meta={},
+            )
+            session.add(run)
+            await session.flush()
+            run_id = run.id
+
+    response = await http_client.get(f"/ops/campaigns/{run_id}")
+    assert response.status_code == 200
+    assert "Recompute stats" in response.text
+    # Button must be disabled for preview
+    assert "disabled" in response.text
+
+
+@pytest.mark.asyncio
+async def test_recompute_attribution_counters(
+    http_client: AsyncClient,
+    session_maker,
+) -> None:
+    """replied / booked_after / opted_out_after берутся из CampaignRecipient timestamps."""
+    from altegio_bot.models.models import OutboxMessage
+
+    now = datetime.now(timezone.utc)
+    async with session_maker() as session:
+        async with session.begin():
+            run = CampaignRun(
+                campaign_code="new_clients_monthly",
+                mode="send-real",
+                company_ids=[758285],
+                period_start=now.replace(day=1, hour=0, minute=0, second=0, microsecond=0),
+                period_end=now,
+                status="completed",
+                replied_count=0,
+                booked_after_count=0,
+                opted_out_after_count=0,
+                meta={},
+            )
+            session.add(run)
+            await session.flush()
+            run_id = run.id
+
+            outbox = OutboxMessage(
+                company_id=758285,
+                phone_e164="+49151000099",
+                template_code="newsletter_new_clients_monthly",
+                language="de",
+                body="Test",
+                status="read",
+                scheduled_at=now,
+            )
+            session.add(outbox)
+            await session.flush()
+
+            session.add(
+                CampaignRecipient(
+                    campaign_run_id=run_id,
+                    company_id=758285,
+                    altegio_client_id=20,
+                    phone_e164="+49151000099",
+                    display_name="Attribution Client",
+                    status="queued",
+                    outbox_message_id=outbox.id,
+                    replied_at=now,
+                    booked_after_at=now,
+                    opted_out_after_at=now,
+                )
+            )
+
+    response = await http_client.post(f"/ops/campaigns/runs/{run_id}/recompute")
+    assert response.status_code == 200
+
+    async with session_maker() as session:
+        run = await session.get(CampaignRun, run_id)
+
+    assert run.replied_count == 1
+    assert run.booked_after_count == 1
+    assert run.opted_out_after_count == 1

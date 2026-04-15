@@ -25,6 +25,7 @@ from altegio_bot.meta_templates import (
     resolve_meta_template,
 )
 from altegio_bot.models.models import (
+    CampaignRecipient,
     Client,
     ContactRateLimit,
     MessageJob,
@@ -973,6 +974,7 @@ async def _run_job_logic(
         job.run_at = utcnow() + timedelta(seconds=delay)
         return
 
+    now_sent = utcnow()
     out = OutboxMessage(
         company_id=job.company_id,
         client_id=(client.id if client else None),
@@ -987,10 +989,24 @@ async def _run_job_logic(
         error=None,
         provider_message_id=msg_id,
         scheduled_at=job.run_at,
-        sent_at=utcnow(),
+        sent_at=now_sent,
         meta=send_meta,
     )
     session.add(out)
+
+    # Backfill CampaignRecipient → OutboxMessage link if this is a campaign
+    # job.  Flush first so out.id is populated by the RETURNING clause.
+    campaign_recipient_id = _job_payload.get("campaign_recipient_id")
+    if campaign_recipient_id is not None:
+        await session.flush()
+        recipient = await session.get(CampaignRecipient, int(campaign_recipient_id))
+        if recipient is not None:
+            if recipient.outbox_message_id is None:
+                recipient.outbox_message_id = out.id
+            if recipient.provider_message_id is None and msg_id:
+                recipient.provider_message_id = msg_id
+            if recipient.sent_at is None:
+                recipient.sent_at = now_sent
 
     job.status = "done"
     job.locked_at = None

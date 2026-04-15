@@ -3901,6 +3901,20 @@ async def ops_campaign_run_detail(run_id: int) -> str:
 </div>
 """
 
+    # Recompute button: always available for send-real; blocked for preview
+    if run.mode == "send-real":
+        recompute_btn = (
+            f'<button class="btn btn-sm btn-outline-warning ms-2"'
+            f' onclick="recomputeStats({run_id})">'
+            f"&#x21BB; Recompute stats</button>"
+        )
+    else:
+        recompute_btn = (
+            '<button class="btn btn-sm btn-outline-secondary ms-2"'
+            ' disabled title="Recompute не применимо к preview run">'
+            "&#x21BB; Recompute stats</button>"
+        )
+
     # --- Summary block ---
     summary_block = f"""
 <div class="card mb-3">
@@ -3916,6 +3930,7 @@ async def ops_campaign_run_detail(run_id: int) -> str:
       <a href="/ops/campaigns/runs/{
         run_id
     }/progress" class="btn btn-sm btn-outline-secondary" target="_blank">JSON progress</a>
+      {recompute_btn}
     </div>
   </div>
   <div class="card-body">
@@ -4178,6 +4193,32 @@ async function submitAddRecipient(runId) {{
       ? (data.detail.message || JSON.stringify(data.detail))
       : (data.detail || JSON.stringify(data));
     alertEl.innerHTML = '<div class="alert alert-danger py-1 mb-0">Ошибка: ' + detail + '</div>';
+  }}
+}}
+
+async function recomputeStats(runId) {{
+  const el = document.getElementById("detail-alert");
+  el.innerHTML = '<div class="alert alert-info">Пересчёт статистики…</div>';
+  try {{
+    const resp = await fetch(
+      "/ops/campaigns/runs/" + runId + "/recompute",
+      {{method: "POST"}}
+    );
+    const data = await resp.json();
+    if (resp.ok) {{
+      el.innerHTML =
+        '<div class="alert alert-success">' +
+        'Статистика пересчитана. ' +
+        '<a href="">Обновите страницу</a> чтобы увидеть актуальные значения.' +
+        '</div>';
+    }} else {{
+      el.innerHTML =
+        '<div class="alert alert-danger">Ошибка: ' +
+        (data.detail || JSON.stringify(data)) + '</div>';
+    }}
+  }} catch (err) {{
+    el.innerHTML =
+      '<div class="alert alert-danger">Сетевая ошибка: ' + err + '</div>';
   }}
 }}
 </script>

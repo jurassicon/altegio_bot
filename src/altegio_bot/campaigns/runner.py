@@ -22,6 +22,7 @@ from altegio_bot.models.models import (
     CampaignRun,
     Client,
     MessageJob,
+    OutboxMessage,
 )
 from altegio_bot.utils import utcnow
 
@@ -1439,6 +1440,295 @@ async def recompute_run_counters(run_id: int) -> None:
         run_id,
         len(recipients),
     )
+
+
+# ==========================================================================
+# Full stats recompute (segmentation + delivery + loyalty)
+# ==========================================================================
+
+# Outbox statuses that count as provider-accepted (cumulative)
+_PROVIDER_ACCEPTED = frozenset({"sent", "delivered", "read"})
+# Outbox statuses that count as delivered (cumulative)
+_DELIVERED = frozenset({"delivered", "read"})
+
+# Rank for picking the "best" outbox row when multiple exist for one job.
+# Higher = more advanced delivery state.
+_OUTBOX_STATUS_RANK: dict[str, int] = {
+    "failed": 0,
+    "queued": 1,
+    "sending": 2,
+    "sent": 3,
+    "delivered": 4,
+    "read": 5,
+}
+
+# Rank for CampaignRecipient status — used to ensure we never regress.
+_RECIPIENT_STATUS_RANK: dict[str, int] = {
+    "candidate": 0,
+    "cleanup_ok": 1,
+    "card_issued": 2,
+    "queued": 3,
+    "provider_accepted": 4,
+    "delivered": 5,
+    "read": 6,
+    "replied": 7,
+    "booked_after_campaign": 8,
+}
+
+# Maps OutboxMessage.status → the CampaignRecipient.status it implies.
+# Only delivery-advancing statuses are mapped; 'failed'/'queued' etc. are
+# intentionally omitted so they never regress a recipient.
+_OUTBOX_TO_RECIPIENT_STATUS: dict[str, str] = {
+    "sent": "provider_accepted",
+    "delivered": "delivered",
+    "read": "read",
+}
+
+
+async def _resolve_outbox_for_recipients(
+    session: AsyncSession,
+    recipients: list[CampaignRecipient],
+) -> dict[int, "OutboxMessage"]:
+    """Return {recipient.id -> best OutboxMessage} for all recipients.
+
+    Two-pass lookup:
+    1. Direct: recipients that already have outbox_message_id set.
+    2. Fallback: recipients with outbox_message_id=None but message_job_id
+       set — resolved via OutboxMessage.job_id.  The "best" row per job is
+       the one with the highest _OUTBOX_STATUS_RANK (most advanced delivery
+       state).  Ties are broken by highest id (most recent row).
+    """
+    result: dict[int, OutboxMessage] = {}
+
+    # --- Pass 1: direct via outbox_message_id ---
+    direct_ids = [r.outbox_message_id for r in recipients if r.outbox_message_id is not None]
+    if direct_ids:
+        stmt = select(OutboxMessage).where(OutboxMessage.id.in_(direct_ids))
+        rows = (await session.execute(stmt)).scalars().all()
+        outbox_by_id: dict[int, OutboxMessage] = {ob.id: ob for ob in rows}
+        for r in recipients:
+            if r.outbox_message_id is not None:
+                ob = outbox_by_id.get(r.outbox_message_id)
+                if ob is not None:
+                    result[r.id] = ob
+
+    # --- Pass 2: fallback via message_job_id ---
+    needs_job_lookup = [
+        r for r in recipients if r.id not in result and r.outbox_message_id is None and r.message_job_id is not None
+    ]
+    if needs_job_lookup:
+        job_ids = list({r.message_job_id for r in needs_job_lookup})
+        stmt = (
+            select(OutboxMessage)
+            .where(OutboxMessage.job_id.in_(job_ids))
+            .order_by(OutboxMessage.job_id, OutboxMessage.id.desc())
+        )
+        all_outboxes = (await session.execute(stmt)).scalars().all()
+
+        # For each job_id pick the row with the highest delivery rank.
+        best_by_job: dict[int, OutboxMessage] = {}
+        for ob in all_outboxes:
+            jid = ob.job_id
+            if jid is None:
+                continue
+            if jid not in best_by_job:
+                best_by_job[jid] = ob  # first = highest id (desc order)
+            else:
+                existing_rank = _OUTBOX_STATUS_RANK.get(best_by_job[jid].status, 0)
+                new_rank = _OUTBOX_STATUS_RANK.get(ob.status, 0)
+                if new_rank > existing_rank:
+                    best_by_job[jid] = ob
+
+        for r in needs_job_lookup:
+            ob = best_by_job.get(r.message_job_id)  # type: ignore[arg-type]
+            if ob is not None:
+                result[r.id] = ob
+
+    return result
+
+
+def _backfill_recipient_links(
+    recipients: list[CampaignRecipient],
+    outbox_by_recipient: dict[int, "OutboxMessage"],
+) -> None:
+    """Write resolved outbox links back onto recipients (in-place, no I/O).
+
+    Only sets fields that are currently None — never overwrites existing
+    data.  Applied before computing delivery counters so subsequent stats
+    use the fully-resolved state.
+    """
+    for r in recipients:
+        ob = outbox_by_recipient.get(r.id)
+        if ob is None:
+            continue
+        if r.outbox_message_id is None:
+            r.outbox_message_id = ob.id
+        if r.provider_message_id is None and ob.provider_message_id:
+            r.provider_message_id = ob.provider_message_id
+        if r.sent_at is None and ob.sent_at:
+            r.sent_at = ob.sent_at
+
+
+def _sync_recipient_statuses(
+    recipients: list[CampaignRecipient],
+    outbox_by_recipient: dict[int, "OutboxMessage"],
+) -> None:
+    """Advance CampaignRecipient.status based on linked OutboxMessage state.
+
+    Variant A fix: ensures the detail-page recipients summary never shows
+    'queued' for a message that was already sent/delivered/read.
+
+    Rules:
+    - Only advances status (never regresses).
+    - Maps: outbox 'sent' → recipient 'provider_accepted'
+             outbox 'delivered' → recipient 'delivered'
+             outbox 'read'      → recipient 'read'
+    - Other outbox statuses ('failed', 'queued', etc.) are not mapped and
+      do not change recipient status.
+    """
+    for r in recipients:
+        ob = outbox_by_recipient.get(r.id)
+        if ob is None:
+            continue
+        target = _OUTBOX_TO_RECIPIENT_STATUS.get(ob.status)
+        if target is None:
+            continue
+        current_rank = _RECIPIENT_STATUS_RANK.get(r.status, 0)
+        target_rank = _RECIPIENT_STATUS_RANK.get(target, 0)
+        if target_rank > current_rank:
+            r.status = target
+
+
+def _recompute_stats_from_db(
+    run: CampaignRun,
+    recipients: list[CampaignRecipient],
+    outbox_status_counts: dict[str, int],
+) -> None:
+    """Apply full stats recompute to *run* (in-place, no DB I/O).
+
+    Three groups of counters are refreshed:
+    1. Segmentation — from CampaignRecipient.excluded_reason
+       (delegates to _update_run_counters_from_recipients).
+    2. Delivery funnel — from *outbox_status_counts* (pre-computed by
+       caller from _resolve_outbox_for_recipients).
+    3. Loyalty / attribution — from CampaignRecipient fields.
+
+    Idempotent: all counters are zeroed before accumulation.
+
+    Note: queued_count uses message_job_id (job was created) as source of
+    truth, not outbox_message_id.  This is correct because a message is
+    "queued" the moment a MessageJob is enqueued, before any OutboxMessage
+    row exists.
+    """
+    # --- 1. Segmentation counters (delegates to existing helper) ---
+    _update_run_counters_from_recipients(run, recipients)
+
+    # --- 2. Delivery funnel ---
+    # queued / sent: a MessageJob was created for this recipient
+    queued = sum(1 for r in recipients if r.message_job_id is not None)
+    run.queued_count = queued
+    run.sent_count = queued  # redundant alias, kept in sync
+
+    # failed: recipients who tried to queue but failed
+    failed = sum(1 for r in recipients if r.excluded_reason == "queue_failed")
+    run.failed_count = failed
+
+    # provider_accepted / delivered / read from OutboxMessage statuses
+    run.provider_accepted_count = sum(outbox_status_counts.get(s, 0) for s in _PROVIDER_ACCEPTED)
+    run.delivered_count = sum(outbox_status_counts.get(s, 0) for s in _DELIVERED)
+    run.read_count = outbox_status_counts.get("read", 0)
+
+    # --- 3. Attribution (CampaignRecipient timestamps) ---
+    run.replied_count = sum(1 for r in recipients if r.replied_at is not None)
+    run.booked_after_count = sum(1 for r in recipients if r.booked_after_at is not None)
+    run.opted_out_after_count = sum(1 for r in recipients if r.opted_out_after_at is not None)
+
+    # --- 4. Loyalty counters ---
+    run.cards_issued_count = sum(1 for r in recipients if r.loyalty_card_id is not None)
+    run.cards_deleted_count = sum(len(r.cleanup_card_ids or []) for r in recipients)
+    run.cleanup_failed_count = sum(
+        1 for r in recipients if r.cleanup_failed_reason is not None or r.status == "cleanup_failed"
+    )
+
+
+async def recompute_campaign_run_stats(
+    session: AsyncSession,
+    run_id: int,
+) -> dict:
+    """Full idempotent recompute of all CampaignRun aggregate counters.
+
+    Accepts an open SQLAlchemy *session* (must already be inside a
+    transaction when the caller wants atomic writes).
+
+    Steps:
+    1. Load all CampaignRecipient rows for the run.
+    2. Resolve the best OutboxMessage for each recipient — first via the
+       direct outbox_message_id FK, then via message_job_id lookup for
+       rows where the back-reference was never filled (the production
+       gap this function was designed to close).
+    3. Backfill missing outbox_message_id / provider_message_id / sent_at
+       on recipients in memory (persisted at transaction commit).
+    4. Sync CampaignRecipient.status forward from outbox state (Variant A).
+    5. Compute outbox_status_counts in Python from the resolved map.
+    6. Recompute all CampaignRun aggregate counters.
+
+    Safe to call multiple times — always converges to the same result.
+    Supports both preview and send-real runs.
+    """
+    run = await session.get(CampaignRun, run_id)
+    if run is None:
+        raise ValueError(f"CampaignRun {run_id} not found")
+
+    # Step 1: load recipients
+    r_stmt = select(CampaignRecipient).where(CampaignRecipient.campaign_run_id == run_id)
+    recipients = list((await session.execute(r_stmt)).scalars().all())
+
+    # Step 2: resolve best outbox per recipient (direct + job_id fallback)
+    outbox_by_recipient = await _resolve_outbox_for_recipients(session, recipients)
+
+    # Step 3: backfill missing outbox links (in-memory + persisted on commit)
+    _backfill_recipient_links(recipients, outbox_by_recipient)
+
+    # Step 4: sync CampaignRecipient.status from outbox state (Variant A)
+    _sync_recipient_statuses(recipients, outbox_by_recipient)
+
+    # Step 5: compute outbox_status_counts from resolved map (Python, no SQL)
+    outbox_status_counts: dict[str, int] = {}
+    for ob in outbox_by_recipient.values():
+        if ob is not None:
+            s = ob.status
+            outbox_status_counts[s] = outbox_status_counts.get(s, 0) + 1
+
+    # Step 6: recompute all run counters
+    _recompute_stats_from_db(run, recipients, outbox_status_counts)
+
+    logger.info(
+        "recompute_campaign_run_stats run_id=%d total_seen=%d queued=%d provider_accepted=%d delivered=%d read=%d",
+        run_id,
+        run.total_clients_seen,
+        run.queued_count,
+        run.provider_accepted_count,
+        run.delivered_count,
+        run.read_count,
+    )
+
+    return {
+        "run_id": run_id,
+        "total_clients_seen": run.total_clients_seen,
+        "candidates_count": run.candidates_count,
+        "queued_count": run.queued_count,
+        "sent_count": run.sent_count,
+        "failed_count": run.failed_count,
+        "provider_accepted_count": run.provider_accepted_count,
+        "delivered_count": run.delivered_count,
+        "read_count": run.read_count,
+        "replied_count": run.replied_count,
+        "booked_after_count": run.booked_after_count,
+        "opted_out_after_count": run.opted_out_after_count,
+        "cards_issued_count": run.cards_issued_count,
+        "cards_deleted_count": run.cards_deleted_count,
+        "cleanup_failed_count": run.cleanup_failed_count,
+    }
 
 
 # ==========================================================================
