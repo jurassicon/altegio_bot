@@ -223,13 +223,6 @@ def build_template_params(
             ctx.get("loyalty_card_text", ""),
         ]
 
-    # Legacy v1 – kept for backward compatibility
-    if n == "kitilash_ka_newsletter_new_clients_monthly_v1":
-        return [
-            ctx.get("client_name", ""),
-            ctx.get("booking_link", ""),
-        ]
-
     if n == "kitilash_ka_newsletter_new_clients_followup_v1":
         return [
             ctx.get("client_name", ""),

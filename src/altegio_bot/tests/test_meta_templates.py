@@ -65,7 +65,7 @@ def test_resolve_ra_record_created() -> None:
 
 
 def test_resolve_ra_record_updated() -> None:
-    # Rastatt falls back to ka template with a warning
+    # Rastatt has a dedicated ra_* template for record_updated.
     assert resolve_meta_template(RA, "record_updated") == ("kitilash_ra_record_updated_v1")
 
 
@@ -258,11 +258,9 @@ def test_params_newsletter_with_loyalty_card() -> None:
     ]
 
 
-def test_params_newsletter_v1_current() -> None:
-    params = build_template_params(
-        "kitilash_ka_newsletter_new_clients_monthly_v1",
-        _CTX,
-    )
+def test_params_newsletter_v1_no_card() -> None:
+    """v1 без loyalty_card_text в ctx → третий параметр пустая строка."""
+    params = build_template_params("kitilash_ka_newsletter_new_clients_monthly_v1", _CTX)
     assert params == ["Anna", "https://booking.link/", ""]
 
 
