@@ -20,6 +20,7 @@ from altegio_bot.db import SessionLocal
 from altegio_bot.message_planner import MAX_VISITS_FOR_REVIEW
 from altegio_bot.meta_templates import (
     TEMPLATE_LANGUAGE,
+    UNIVERSAL_JOB_TYPES,
     build_template_params,
     resolve_meta_template,
 )
@@ -326,6 +327,36 @@ async def _load_template(
     template_code: str,
     language: str,
 ) -> tuple[MessageTemplate | None, str]:
+    """Look up the active MessageTemplate for *company_id* / *template_code*.
+
+    Lookup order (deterministic, always order_by id ASC where no unique match):
+
+    Phase 1 — company-specific rows (always executed):
+      1. company_id + code + requested language  (exact)
+      2. company_id + code + DEFAULT_LANGUAGE    (only when language ≠ DEFAULT_LANGUAGE)
+      3. company_id + code (any language)
+
+    Phase 2 — cross-company fallback (ONLY for universal template codes):
+      4. code + requested language  (any company, id ASC)
+      5. code + DEFAULT_LANGUAGE    (any company, only when language ≠ DEFAULT_LANGUAGE)
+      6. code (any company, any language, id ASC)
+
+    Phase 2 is reached only when Phase 1 finds nothing AND *template_code* is in
+    UNIVERSAL_JOB_TYPES.  Universal templates (review_3d, repeat_10d, comeback_3d,
+    newsletter_new_clients_monthly, newsletter_new_clients_followup) have no address
+    footer and are stored in message_templates under a single canonical company_id
+    but shared by all branches.
+
+    Phase 2 is intentionally SKIPPED for branch-specific codes (record_created,
+    record_updated, record_canceled, reminder_24h, reminder_2h).  Those templates
+    contain branch-specific address footers; silently using another branch's row
+    would produce incorrect text and mislead the recipient about the salon location.
+
+    Mirrors the fallback already present in the preview endpoint get_template_text().
+    """
+    # ------------------------------------------------------------------
+    # Phase 1: company-specific rows (existing priority, unchanged)
+    # ------------------------------------------------------------------
     base = (
         select(MessageTemplate)
         .where(MessageTemplate.company_id == company_id)
@@ -350,6 +381,63 @@ async def _load_template(
     res = await session.execute(stmt)
     tmpl = res.scalar_one_or_none()
     if tmpl is not None:
+        return tmpl, tmpl.language
+
+    # ------------------------------------------------------------------
+    # Phase 2: cross-company fallback — universal templates only.
+    # Branch-specific codes (record_*, reminder_*) intentionally skip this
+    # to prevent accidentally serving the wrong branch's address footer.
+    # ------------------------------------------------------------------
+    if template_code not in UNIVERSAL_JOB_TYPES:
+        return None, language
+
+    cross = (
+        select(MessageTemplate).where(MessageTemplate.code == template_code).where(MessageTemplate.is_active.is_(True))
+    )
+
+    stmt = cross.where(MessageTemplate.language == language).order_by(MessageTemplate.id.asc()).limit(1)
+    res = await session.execute(stmt)
+    tmpl = res.scalar_one_or_none()
+    if tmpl is not None:
+        logger.info(
+            "_load_template cross-company fallback: company=%s code=%s language=%s"
+            " → using template_id=%s from company=%s",
+            company_id,
+            template_code,
+            language,
+            tmpl.id,
+            tmpl.company_id,
+        )
+        return tmpl, language
+
+    if language != DEFAULT_LANGUAGE:
+        stmt = cross.where(MessageTemplate.language == DEFAULT_LANGUAGE).order_by(MessageTemplate.id.asc()).limit(1)
+        res = await session.execute(stmt)
+        tmpl = res.scalar_one_or_none()
+        if tmpl is not None:
+            logger.info(
+                "_load_template cross-company fallback: company=%s code=%s"
+                " → DEFAULT_LANGUAGE fallback template_id=%s from company=%s",
+                company_id,
+                template_code,
+                tmpl.id,
+                tmpl.company_id,
+            )
+            return tmpl, DEFAULT_LANGUAGE
+
+    stmt = cross.order_by(MessageTemplate.id.asc()).limit(1)
+    res = await session.execute(stmt)
+    tmpl = res.scalar_one_or_none()
+    if tmpl is not None:
+        logger.info(
+            "_load_template cross-company fallback: company=%s code=%s"
+            " → any-language fallback template_id=%s from company=%s language=%s",
+            company_id,
+            template_code,
+            tmpl.id,
+            tmpl.company_id,
+            tmpl.language,
+        )
         return tmpl, tmpl.language
 
     return None, language
