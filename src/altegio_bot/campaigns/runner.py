@@ -578,18 +578,49 @@ async def _execute_send_real_for_existing_run(
                 run.failed_count = stats["failed"]
                 run.sent_count = stats["queued"]
 
+                # Determine final status based on outcomes.
+                # eligible_count = candidates that entered _process_eligible (no pre-run exclusion)
+                eligible_count = sum(1 for c in candidates if not c.excluded_reason)
+
                 meta = dict(run.meta or {})
                 meta.pop("last_error", None)
-                run.meta = meta
+                meta.pop("partial_failure", None)
+                meta.pop("partial_failure_count", None)
 
-                run.status = "completed"
+                if eligible_count > 0 and stats["queued"] == 0 and stats["failed"] > 0:
+                    # All eligible recipients failed before any job was queued.
+                    # Setting status=completed would silently hide the failure — use failed instead.
+                    error_msg = (
+                        f"Campaign finished with 0 queued recipients; "
+                        f"card issuance or queueing failed for {stats['failed']} recipient(s)"
+                    )
+                    meta["last_error"] = error_msg
+                    run.status = "failed"
+                    logger.error(
+                        "send-real all-failed run_id=%d company=%d eligible=%d failed=%d",
+                        run_id,
+                        params.company_id,
+                        eligible_count,
+                        stats["failed"],
+                    )
+                elif stats["queued"] > 0 and stats["failed"] > 0:
+                    # Partial success: some recipients queued, some failed.
+                    meta["partial_failure"] = True
+                    meta["partial_failure_count"] = stats["failed"]
+                    run.status = "completed"
+                else:
+                    run.status = "completed"
+
+                run.meta = meta
                 run.completed_at = utcnow()
+                final_status = run.status  # capture before session closes
 
         # Лог только после успешной финализации (exception выше не допустит сюда при guard)
         logger.info(
-            "send-real completed run_id=%d company=%d stats=%s",
+            "send-real finished run_id=%d company=%d status=%s stats=%s",
             run_id,
             params.company_id,
+            final_status,
             stats,
         )
 
