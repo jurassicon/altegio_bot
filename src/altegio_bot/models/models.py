@@ -485,6 +485,14 @@ class OutboxMessage(Base):
         nullable=True,
     )
 
+    # 'bot' = sent by automation/campaign worker
+    # 'operator' = relayed from Chatwoot human operator via altegio_bot → Meta
+    message_source: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        server_default=text("'bot'"),
+    )
+
 
 class ContactRateLimit(Base):
     __tablename__ = "contact_rate_limits"
