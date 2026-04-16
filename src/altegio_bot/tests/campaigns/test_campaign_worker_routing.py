@@ -308,3 +308,451 @@ def test_docker_compose_has_campaign_worker_service() -> None:
     content = compose_path.read_text()
     assert "altegio-campaign-worker" in content, "altegio-campaign-worker service not found in docker-compose.yml"
     assert "run_campaign_worker" in content, "run_campaign_worker command not found in docker-compose.yml"
+
+
+# ---------------------------------------------------------------------------
+# 10-15. Auto-recompute after successful campaign send
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _FakeCampaignRecipient:
+    id: int
+    outbox_message_id: int | None = None
+    provider_message_id: str | None = None
+    sent_at: Any = None
+
+
+class _FakeSessionWithGet(_FakeSession):
+    """Extends _FakeSession with async flush and get support for outbox tests."""
+
+    def __init__(self, recipient: _FakeCampaignRecipient | None = None) -> None:
+        super().__init__()
+        self._recipient = recipient
+        self.flushed = False
+
+    async def flush(self) -> None:
+        self.flushed = True
+        # Assign id to newly added objects (simulates DB RETURNING).
+        for obj in self.added:
+            if not hasattr(obj, "id") or obj.id is None:
+                self._pk += 1
+                setattr(obj, "id", self._pk)
+
+    async def get(self, model: Any, pk: Any) -> Any:
+        if self._recipient is not None and pk == self._recipient.id:
+            return self._recipient
+        return None
+
+
+async def _make_campaign_send_succeed(
+    monkeypatch: Any,
+    *,
+    campaign_run_id: int = 42,
+    campaign_recipient_id: int = 10,
+    has_campaign_payload: bool = True,
+) -> tuple[_FakeJob, _FakeSessionWithGet]:
+    """Set up a campaign newsletter job that passes all guards and sends OK.
+
+    Returns (job, session) after calling _run_job_logic.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+
+    payload: dict = {}
+    if has_campaign_payload:
+        payload["campaign_run_id"] = campaign_run_id
+        payload["campaign_recipient_id"] = campaign_recipient_id
+
+    job = _FakeJob(
+        id=99,
+        company_id=COMPANY_ID,
+        job_type=NEWSLETTER_JOB_TYPE,
+        client_id=1,
+        payload=payload,
+    )
+    recipient = _FakeCampaignRecipient(id=campaign_recipient_id)
+    session = _FakeSessionWithGet(recipient=recipient)
+
+    monkeypatch.setattr(ow, "_find_success_outbox", AsyncMock(return_value=None))
+    monkeypatch.setattr(ow, "_load_record", AsyncMock(return_value=None))
+    monkeypatch.setattr(ow, "_load_client", AsyncMock(return_value=_FakeClient(id=1)))
+    monkeypatch.setattr(ow, "_apply_rate_limit", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        ow,
+        "_render_message",
+        AsyncMock(
+            return_value=(
+                "Hallo {client_name}",
+                "sender_1",
+                "de",
+                {"client_name": "Anna"},
+            )
+        ),
+    )
+
+    # Patch settings so send_mode is 'text' (avoids Meta template resolution).
+    fake_settings = MagicMock()
+    fake_settings.whatsapp_send_mode = "text"
+    monkeypatch.setattr(ow, "settings", fake_settings)
+
+    monkeypatch.setattr(ow, "safe_send", AsyncMock(return_value=("wa_msg_id_1", None)))
+
+    return job, session
+
+
+@pytest.mark.asyncio
+async def test_run_job_logic_returns_campaign_run_id_on_success(
+    monkeypatch: Any,
+) -> None:
+    """_run_job_logic returns campaign_run_id when a campaign msg is sent."""
+    job, session = await _make_campaign_send_succeed(monkeypatch, campaign_run_id=42)
+    result = await ow._run_job_logic(session, job, provider=MagicMock())  # type: ignore[arg-type]
+
+    assert result == 42, f"expected 42, got {result!r}"
+    assert job.status == "done"
+
+
+@pytest.mark.asyncio
+async def test_run_job_logic_returns_none_for_non_campaign_job(
+    monkeypatch: Any,
+) -> None:
+    """_run_job_logic returns None when the job has no campaign_run_id."""
+    job, session = await _make_campaign_send_succeed(monkeypatch, has_campaign_payload=False)
+    result = await ow._run_job_logic(session, job, provider=MagicMock())  # type: ignore[arg-type]
+
+    assert result is None, f"expected None, got {result!r}"
+    assert job.status == "done"
+
+
+@pytest.mark.asyncio
+async def test_process_job_triggers_recompute_after_commit(
+    monkeypatch: Any,
+) -> None:
+    """process_job calls _try_recompute_campaign_run_stats after the tx."""
+    recompute_calls: list[int] = []
+
+    async def _fake_pjs(session: Any, job_id: int, provider: Any) -> int | None:
+        return 77  # simulate successful campaign send
+
+    async def _fake_recompute(run_id: int) -> None:
+        recompute_calls.append(run_id)
+
+    # Fake SessionLocal context-manager so no real DB is needed.
+    class _FakeCtx:
+        async def __aenter__(self) -> Any:
+            return MagicMock()
+
+        async def __aexit__(self, *a: Any) -> None:
+            pass
+
+    class _FakeBeginCtx:
+        async def __aenter__(self) -> Any:
+            return MagicMock()
+
+        async def __aexit__(self, *a: Any) -> None:
+            pass
+
+    class _FakeSession2:
+        def begin(self) -> _FakeBeginCtx:
+            return _FakeBeginCtx()
+
+    # Replace module-level SessionLocal and helpers.
+    monkeypatch.setattr(ow, "process_job_in_session", _fake_pjs)
+    monkeypatch.setattr(ow, "_try_recompute_campaign_run_stats", _fake_recompute)
+
+    # Make SessionLocal() return a context manager that yields a session
+    # with a .begin() method (also a context manager).
+    class _FakeSessionCtxMgr:
+        async def __aenter__(self) -> _FakeSession2:
+            return _FakeSession2()
+
+        async def __aexit__(self, *a: Any) -> None:
+            pass
+
+    monkeypatch.setattr(ow, "SessionLocal", lambda: _FakeSessionCtxMgr())
+
+    await ow.process_job(job_id=1, provider=MagicMock())
+
+    assert recompute_calls == [77], f"expected recompute called with run_id=77, got {recompute_calls}"
+
+
+@pytest.mark.asyncio
+async def test_process_job_no_recompute_for_non_campaign(
+    monkeypatch: Any,
+) -> None:
+    """process_job does NOT call _try_recompute when process_job_in_session
+    returns None (non-campaign job)."""
+    recompute_calls: list[int] = []
+
+    async def _fake_pjs(session: Any, job_id: int, provider: Any) -> int | None:
+        return None  # non-campaign job
+
+    async def _fake_recompute(run_id: int) -> None:
+        recompute_calls.append(run_id)
+
+    class _FakeSession2:
+        def begin(self) -> Any:
+            class _Ctx:
+                async def __aenter__(self) -> Any:
+                    return None
+
+                async def __aexit__(self, *a: Any) -> None:
+                    pass
+
+            return _Ctx()
+
+    class _FakeSessionCtxMgr:
+        async def __aenter__(self) -> _FakeSession2:
+            return _FakeSession2()
+
+        async def __aexit__(self, *a: Any) -> None:
+            pass
+
+    monkeypatch.setattr(ow, "process_job_in_session", _fake_pjs)
+    monkeypatch.setattr(ow, "_try_recompute_campaign_run_stats", _fake_recompute)
+    monkeypatch.setattr(ow, "SessionLocal", lambda: _FakeSessionCtxMgr())
+
+    await ow.process_job(job_id=2, provider=MagicMock())
+
+    assert recompute_calls == [], f"expected no recompute, got {recompute_calls}"
+
+
+@pytest.mark.asyncio
+async def test_recompute_failure_does_not_propagate(monkeypatch: Any) -> None:
+    """_try_recompute_campaign_run_stats swallows exceptions (best-effort)."""
+
+    async def _fail_recompute(session: Any, run_id: int) -> None:
+        raise RuntimeError("DB exploded")
+
+    class _FakeSession2:
+        def begin(self) -> Any:
+            class _Ctx:
+                async def __aenter__(self) -> Any:
+                    return None
+
+                async def __aexit__(self, *a: Any) -> None:
+                    pass
+
+            return _Ctx()
+
+    class _FakeSessionCtxMgr:
+        async def __aenter__(self) -> _FakeSession2:
+            return _FakeSession2()
+
+        async def __aexit__(self, *a: Any) -> None:
+            pass
+
+    monkeypatch.setattr(ow, "SessionLocal", lambda: _FakeSessionCtxMgr())
+    monkeypatch.setattr(ow, "recompute_campaign_run_stats", _fail_recompute)
+
+    # Must NOT raise even though recompute_campaign_run_stats raises.
+    await ow._try_recompute_campaign_run_stats(run_id=55)
+
+
+@pytest.mark.asyncio
+async def test_run_job_logic_send_failure_returns_none(
+    monkeypatch: Any,
+) -> None:
+    """When the WhatsApp send fails, _run_job_logic returns None
+    (no recompute triggered, send is already NOT successful)."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    job = _FakeJob(
+        id=88,
+        company_id=COMPANY_ID,
+        job_type=NEWSLETTER_JOB_TYPE,
+        client_id=1,
+        payload={"campaign_run_id": 42, "campaign_recipient_id": 10},
+    )
+    session = _FakeSessionWithGet()
+
+    monkeypatch.setattr(ow, "_find_success_outbox", AsyncMock(return_value=None))
+    monkeypatch.setattr(ow, "_load_record", AsyncMock(return_value=None))
+    monkeypatch.setattr(ow, "_load_client", AsyncMock(return_value=_FakeClient(id=1)))
+    monkeypatch.setattr(ow, "_apply_rate_limit", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        ow,
+        "_render_message",
+        AsyncMock(return_value=("Hello", "sender_1", "de", {})),
+    )
+
+    fake_settings = MagicMock()
+    fake_settings.whatsapp_send_mode = "text"
+    monkeypatch.setattr(ow, "settings", fake_settings)
+
+    # Send returns an error.
+    monkeypatch.setattr(
+        ow,
+        "safe_send",
+        AsyncMock(return_value=(None, "Meta API error")),
+    )
+
+    result = await ow._run_job_logic(session, job, provider=MagicMock())  # type: ignore[arg-type]
+
+    assert result is None, f"expected None on send failure, got {result!r}"
+    # Job should be requeued or failed, not done.
+    assert job.status != "done"
+
+
+# ---------------------------------------------------------------------------
+# 16-21. Batch deduplication via _pending_recomputes in run_loop cycle
+# ---------------------------------------------------------------------------
+
+
+def _fake_session_local() -> Any:
+    """Return a patched SessionLocal that needs no real DB connection."""
+
+    class _FakeBeginCtx:
+        async def __aenter__(self) -> Any:
+            return MagicMock()
+
+        async def __aexit__(self, *a: Any) -> None:
+            pass
+
+    class _FakeSession2:
+        def begin(self) -> _FakeBeginCtx:
+            return _FakeBeginCtx()
+
+    class _FakeSessionCtxMgr:
+        async def __aenter__(self) -> _FakeSession2:
+            return _FakeSession2()
+
+        async def __aexit__(self, *a: Any) -> None:
+            pass
+
+    return lambda: _FakeSessionCtxMgr()
+
+
+@pytest.mark.asyncio
+async def test_process_job_deferred_adds_to_set_no_immediate_recompute(
+    monkeypatch: Any,
+) -> None:
+    """_pending_recomputes set receives the run_id; recompute is NOT
+    triggered immediately when a set is passed (deferred/batch mode)."""
+    recompute_calls: list[int] = []
+
+    async def _fake_pjs(session: Any, job_id: int, provider: Any) -> int | None:
+        return 42
+
+    async def _bad_recompute(run_id: int) -> None:
+        recompute_calls.append(run_id)
+
+    monkeypatch.setattr(ow, "process_job_in_session", _fake_pjs)
+    monkeypatch.setattr(ow, "_try_recompute_campaign_run_stats", _bad_recompute)
+    monkeypatch.setattr(ow, "SessionLocal", _fake_session_local())
+
+    pending: set[int] = set()
+    await ow.process_job(job_id=1, provider=MagicMock(), _pending_recomputes=pending)
+
+    assert pending == {42}, f"expected {{42}} in pending, got {pending}"
+    assert recompute_calls == [], "recompute must NOT fire immediately in deferred mode"
+
+
+@pytest.mark.asyncio
+async def test_process_job_deferred_non_campaign_nothing_added(
+    monkeypatch: Any,
+) -> None:
+    """Non-campaign job (run_id=None) leaves the pending set empty."""
+
+    async def _fake_pjs(session: Any, job_id: int, provider: Any) -> int | None:
+        return None
+
+    monkeypatch.setattr(ow, "process_job_in_session", _fake_pjs)
+    monkeypatch.setattr(ow, "SessionLocal", _fake_session_local())
+
+    pending: set[int] = set()
+    await ow.process_job(job_id=2, provider=MagicMock(), _pending_recomputes=pending)
+
+    assert pending == set(), f"pending must stay empty, got {pending}"
+
+
+@pytest.mark.asyncio
+async def test_batch_same_run_id_one_recompute(monkeypatch: Any) -> None:
+    """Multiple campaign sends for the same run_id in one batch cycle
+    result in exactly one recompute call."""
+    recompute_calls: list[int] = []
+
+    async def _fake_pjs(session: Any, job_id: int, provider: Any) -> int | None:
+        return 42  # both jobs belong to run 42
+
+    async def _fake_recompute(run_id: int) -> None:
+        recompute_calls.append(run_id)
+
+    monkeypatch.setattr(ow, "process_job_in_session", _fake_pjs)
+    monkeypatch.setattr(ow, "_try_recompute_campaign_run_stats", _fake_recompute)
+    monkeypatch.setattr(ow, "SessionLocal", _fake_session_local())
+
+    # Simulate run_loop: one pending set shared across the cycle.
+    pending: set[int] = set()
+    await ow.process_job(job_id=1, provider=MagicMock(), _pending_recomputes=pending)
+    await ow.process_job(job_id=2, provider=MagicMock(), _pending_recomputes=pending)
+
+    # Caller (run_loop) flushes after the loop.
+    for run_id in pending:
+        await ow._try_recompute_campaign_run_stats(run_id)
+
+    assert recompute_calls == [42], f"expected exactly one recompute(42), got {recompute_calls}"
+
+
+@pytest.mark.asyncio
+async def test_batch_different_run_ids_one_recompute_each(
+    monkeypatch: Any,
+) -> None:
+    """Campaign sends for two different run_ids each get one recompute."""
+    recompute_calls: list[int] = []
+
+    async def _fake_pjs(session: Any, job_id: int, provider: Any) -> int | None:
+        # job_id doubles as run_id (42 and 43 passed as job_ids below).
+        return job_id
+
+    async def _fake_recompute(run_id: int) -> None:
+        recompute_calls.append(run_id)
+
+    monkeypatch.setattr(ow, "process_job_in_session", _fake_pjs)
+    monkeypatch.setattr(ow, "_try_recompute_campaign_run_stats", _fake_recompute)
+    monkeypatch.setattr(ow, "SessionLocal", _fake_session_local())
+
+    pending: set[int] = set()
+    await ow.process_job(job_id=42, provider=MagicMock(), _pending_recomputes=pending)
+    await ow.process_job(job_id=43, provider=MagicMock(), _pending_recomputes=pending)
+
+    for run_id in pending:
+        await ow._try_recompute_campaign_run_stats(run_id)
+
+    assert sorted(recompute_calls) == [42, 43], f"expected one recompute per run, got {recompute_calls}"
+
+
+@pytest.mark.asyncio
+async def test_batch_recompute_fires_after_all_sends_not_during(
+    monkeypatch: Any,
+) -> None:
+    """Recompute events must appear after all send events, never interleaved.
+
+    Timeline we want:  send_1 → send_2 → recompute_42
+    Broken timeline:   send_1 → recompute_42 → send_2
+    """
+    events: list[str] = []
+
+    async def _fake_pjs(session: Any, job_id: int, provider: Any) -> int | None:
+        events.append(f"send_{job_id}")
+        return 42
+
+    async def _fake_recompute(run_id: int) -> None:
+        events.append(f"recompute_{run_id}")
+
+    monkeypatch.setattr(ow, "process_job_in_session", _fake_pjs)
+    monkeypatch.setattr(ow, "_try_recompute_campaign_run_stats", _fake_recompute)
+    monkeypatch.setattr(ow, "SessionLocal", _fake_session_local())
+
+    pending: set[int] = set()
+    await ow.process_job(job_id=1, provider=MagicMock(), _pending_recomputes=pending)
+    await ow.process_job(job_id=2, provider=MagicMock(), _pending_recomputes=pending)
+    # Caller triggers recompute after the loop.
+    for run_id in pending:
+        await ow._try_recompute_campaign_run_stats(run_id)
+
+    send_indices = [i for i, e in enumerate(events) if e.startswith("send_")]
+    recompute_indices = [i for i, e in enumerate(events) if e.startswith("recompute_")]
+
+    assert send_indices and recompute_indices, f"unexpected events: {events}"
+    assert max(send_indices) < min(recompute_indices), f"recompute must fire after all sends; events={events}"

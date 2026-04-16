@@ -15,7 +15,10 @@ from altegio_bot.altegio_records import (
     client_has_future_appointments,
     count_attended_client_visits,
 )
-from altegio_bot.campaigns.runner import CAMPAIGN_EXECUTION_JOB_TYPE
+from altegio_bot.campaigns.runner import (
+    CAMPAIGN_EXECUTION_JOB_TYPE,
+    recompute_campaign_run_stats,
+)
 from altegio_bot.db import SessionLocal
 from altegio_bot.message_planner import MAX_VISITS_FOR_REVIEW
 from altegio_bot.meta_templates import (
@@ -612,9 +615,16 @@ async def process_job_in_session(
     session: AsyncSession,
     job_id: int,
     provider: WhatsAppProvider,
-) -> None:
+) -> int | None:
+    """Process one job inside *session*.
+
+    Returns the ``campaign_run_id`` when a campaign message is successfully
+    sent so the caller can trigger a post-commit stats recompute.
+    """
+    campaign_run_id: int | None = None
     with perf_log("outbox_worker", "process_job", job_id=job_id) as ctx:
-        await _process_job_in_session_inner(session, job_id, provider, ctx)
+        campaign_run_id = await _process_job_in_session_inner(session, job_id, provider, ctx)
+    return campaign_run_id
 
 
 async def _process_job_in_session_inner(
@@ -622,10 +632,10 @@ async def _process_job_in_session_inner(
     job_id: int,
     provider: WhatsAppProvider,
     ctx: dict[str, Any],
-) -> None:
+) -> int | None:
     job = await _load_job(session, job_id)
     if job is None:
-        return
+        return None
 
     ctx.update(
         company_id=job.company_id,
@@ -634,15 +644,23 @@ async def _process_job_in_session_inner(
         job_type=job.job_type,
     )
 
-    await _run_job_logic(session, job, provider)
+    campaign_run_id = await _run_job_logic(session, job, provider)
     ctx.update(outcome=job.status)
+    return campaign_run_id
 
 
 async def _run_job_logic(
     session: AsyncSession,
     job: MessageJob,
     provider: WhatsAppProvider,
-) -> None:
+) -> int | None:
+    """Process one outbox job.
+
+    Returns the ``campaign_run_id`` (int) when a campaign message is
+    successfully sent so the caller can trigger a best-effort recompute
+    after the transaction commits.  Returns ``None`` for every other
+    outcome (non-campaign job, send failure, guard skip, etc.).
+    """
     # Safety guard: orchestrator jobs must never reach outbox_worker.
     # _lock_next_jobs() already excludes them, but if somehow an execution job
     # arrives here (e.g. via direct process_job_in_session call), requeue it so
@@ -1022,18 +1040,69 @@ async def _run_job_logic(
         send_meta.get("template"),
     )
 
+    # Signal to the caller that this campaign run needs a post-commit
+    # stats recompute.  Only returned when the job is a campaign message
+    # (payload contains campaign_run_id) and the send succeeded.
+    _campaign_run_id = _job_payload.get("campaign_run_id")
+    if _campaign_run_id is not None:
+        return int(_campaign_run_id)
+    return None
+
+
+async def _try_recompute_campaign_run_stats(run_id: int) -> None:
+    """Best-effort recompute of a campaign run's stats after a send.
+
+    Opens its own session so any failure is completely isolated from the
+    already-committed outbox send.  All exceptions are caught and logged
+    as warnings — they never propagate to the caller.
+    """
+    try:
+        async with SessionLocal() as session:
+            async with session.begin():
+                await recompute_campaign_run_stats(session, run_id)
+        logger.info("auto-recompute ok run_id=%s", run_id)
+    except Exception as exc:
+        logger.warning(
+            "auto-recompute failed run_id=%s (best-effort, ignored): %s",
+            run_id,
+            exc,
+        )
+
 
 async def process_job(
     job_id: int,
     provider: WhatsAppProvider,
+    *,
+    _pending_recomputes: set[int] | None = None,
 ) -> None:
+    """Process one outbox job in its own session/transaction.
+
+    *_pending_recomputes* is an optional set supplied by batch callers
+    (e.g. ``run_loop``).  When provided, a successful campaign send adds
+    its ``campaign_run_id`` to the set instead of triggering recompute
+    immediately — the caller is responsible for deduplicating and calling
+    :func:`_try_recompute_campaign_run_stats` once per unique run_id
+    after the whole batch is done.
+
+    When *_pending_recomputes* is ``None`` (the default), the function
+    is self-contained: recompute fires right after the commit, which is
+    correct for any caller that processes a single job at a time.
+    """
+    campaign_run_id: int | None = None
     async with SessionLocal() as session:
         async with session.begin():
-            await process_job_in_session(
+            campaign_run_id = await process_job_in_session(
                 session=session,
                 job_id=job_id,
                 provider=provider,
             )
+    if campaign_run_id is not None:
+        if _pending_recomputes is not None:
+            # Deferred / batch mode: caller will flush once per unique run.
+            _pending_recomputes.add(campaign_run_id)
+        else:
+            # Self-contained mode: recompute immediately after this commit.
+            await _try_recompute_campaign_run_stats(campaign_run_id)
 
 
 async def run_loop(
@@ -1068,8 +1137,16 @@ async def run_loop(
             await asyncio.sleep(poll_sec)
             continue
 
+        # Collect campaign run_ids across the whole cycle so that
+        # recompute is called once per unique run, not once per message.
+        pending: set[int] = set()
+
         for idx, jid in enumerate(job_ids):
-            await process_job(job_id=jid, provider=provider)
+            await process_job(
+                job_id=jid,
+                provider=provider,
+                _pending_recomputes=pending,
+            )
 
             if _token_expired() and _stop_worker_on_token_expired():
                 remaining = job_ids[idx + 1 :]
@@ -1082,7 +1159,14 @@ async def run_loop(
                     "Stopping outbox worker: access token expired (requeued %s jobs)",
                     len(remaining),
                 )
+                # Still recompute for runs that did get sent this cycle.
+                for run_id in pending:
+                    await _try_recompute_campaign_run_stats(run_id)
                 return
+
+        # End of cycle: one recompute per unique campaign run.
+        for run_id in pending:
+            await _try_recompute_campaign_run_stats(run_id)
 
 
 async def run_once(
@@ -1112,12 +1196,22 @@ async def run_once(
         res = await session.execute(stmt)
         ids = list(res.scalars().all())
 
+        campaign_run_ids: set[int] = set()
         for job_id in ids:
-            await process_job_in_session(
+            run_id = await process_job_in_session(
                 session,
                 int(job_id),
                 provider=provider,
             )
+            if run_id is not None:
+                campaign_run_ids.add(run_id)
 
         await session.commit()
+
+        # Best-effort recompute for each campaign run that got at least one
+        # new sent message.  Each call opens its own session so recompute
+        # failures cannot affect the committed sends above.
+        for run_id in campaign_run_ids:
+            await _try_recompute_campaign_run_stats(run_id)
+
         return len(ids)

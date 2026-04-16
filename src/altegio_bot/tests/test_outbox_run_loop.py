@@ -89,7 +89,7 @@ def test_run_loop_processes_job_ids(monkeypatch: Any) -> None:
 
     calls: list[int] = []
 
-    async def fake_process_job(job_id: int, provider: Any) -> None:
+    async def fake_process_job(job_id: int, provider: Any, **kwargs: Any) -> None:
         _ = provider
         calls.append(job_id)
         if len(calls) == len(jobs):
