@@ -8,6 +8,11 @@
   * Если удаление хотя бы одной карты не удалось — не выпускаем
     новую карту и не отправляем сообщение.
   * Помечаем клиента cleanup_failed с причиной.
+
+resolve_or_issue_loyalty_card (для CRM-only, client_id=None):
+  * 0 существующих карт → issue_new (API-запрос, может поднять исключение).
+  * 1 существующая карта → reused_existing (без API-запроса).
+  * 2+ карт → failed_conflict (без API-запроса, требует ручного разбора).
 """
 
 from __future__ import annotations
@@ -29,6 +34,23 @@ class CleanupResult:
     ok: bool
     deleted_ids: list[str] = field(default_factory=list)
     failed_card_id: str | None = None
+    reason: str | None = None
+
+
+@dataclass
+class CardResolution:
+    """Результат resolve_or_issue_loyalty_card.
+
+    outcome:
+      'issued_new'      — новая карта выпущена через API (cards_issued +1).
+      'reused_existing' — найдена существующая карта в БД (без API-запроса).
+      'failed_conflict' — найдено 2+ карт для одного номера; безопасный отказ.
+    """
+
+    outcome: str
+    loyalty_card_id: str
+    loyalty_card_number: str
+    loyalty_card_type_id: str
     reason: str | None = None
 
 
@@ -112,7 +134,7 @@ async def cleanup_campaign_cards(
     )
 
     if not card_ids:
-        logger.debug("cleanup client_id=%d: no pending campaign cards", client_id)
+        logger.debug("cleanup client_id=%s: no pending campaign cards", client_id)
         return CleanupResult(ok=True, deleted_ids=[])
 
     deleted: list[str] = []
@@ -120,10 +142,10 @@ async def cleanup_campaign_cards(
         try:
             await loyalty.delete_card(location_id, int(card_id))
             deleted.append(card_id)
-            logger.info("cleanup deleted card_id=%s client_id=%d", card_id, client_id)
+            logger.info("cleanup deleted card_id=%s client_id=%s", card_id, client_id)
         except Exception as exc:
             logger.error(
-                "cleanup FAILED card_id=%s client_id=%d: %s",
+                "cleanup FAILED card_id=%s client_id=%s: %s",
                 card_id,
                 client_id,
                 exc,
@@ -147,3 +169,129 @@ def make_card_number(phone_e164: str) -> str:
 def make_card_text(card_number: str) -> str:
     """Форматировать текст карты для шаблона сообщения."""
     return f"#{card_number}"
+
+
+async def find_existing_campaign_card_for_phone(
+    session: AsyncSession,
+    *,
+    phone_e164: str,
+    campaign_code: str,
+) -> list[tuple[str, str, str]]:
+    """Найти loyalty-карты, уже выпущенные кампанией для phone_e164.
+
+    Возвращает список кортежей (card_id, card_number, card_type_id) для
+    всех CampaignRecipient, у которых phone_e164 совпадает, кампания
+    совпадает и loyalty_card_id заполнен.
+
+    Используется для CRM-only клиентов (client_id=None): у них нет
+    локальной записи Client, поэтому поиск выполняется по номеру телефона.
+    """
+    stmt = (
+        select(
+            CampaignRecipient.loyalty_card_id,
+            CampaignRecipient.loyalty_card_number,
+            CampaignRecipient.loyalty_card_type_id,
+        )
+        .join(CampaignRun, CampaignRun.id == CampaignRecipient.campaign_run_id)
+        .where(CampaignRecipient.phone_e164 == phone_e164)
+        .where(CampaignRun.campaign_code == campaign_code)
+        .where(CampaignRecipient.loyalty_card_id.is_not(None))
+        .where(CampaignRecipient.loyalty_card_id != "")
+    )
+    rows = (await session.execute(stmt)).all()
+    return [
+        (
+            row.loyalty_card_id,
+            row.loyalty_card_number or "",
+            row.loyalty_card_type_id or "",
+        )
+        for row in rows
+    ]
+
+
+async def resolve_or_issue_loyalty_card(
+    session: AsyncSession,
+    loyalty: AltegioLoyaltyClient,
+    *,
+    phone_e164: str,
+    location_id: int,
+    card_type_id: str,
+    campaign_code: str,
+) -> CardResolution:
+    """Переиспользовать существующую карту или выпустить новую.
+
+    Матрица решений по числу найденных записей CampaignRecipient для
+    phone_e164 + campaign_code с непустым loyalty_card_id:
+
+      0 → issue_new: вызывает loyalty.issue_card().
+          Поднимает исключение при ошибке API — вызывающий код должен
+          трактовать это как card_issue_failed.
+      1 → reused_existing: возвращает данные существующей карты, API не вызывается.
+      2+ → failed_conflict: возвращает CardResolution(outcome='failed_conflict')
+           без API-запроса. Вызывающий код должен безопасно завершить
+           обработку получателя с excluded_reason='card_conflict'.
+
+    Почему безопаснее прямого issue_card:
+      - Повторная попытка send-real для телефона, у которого уже была
+        выпущена карта (например, queue_failed в предыдущем запуске),
+        переиспользует существующую карту вместо попытки создать дубликат.
+      - Неоднозначное состояние (2+ карт) становится явным вместо
+        молчаливого создания ещё одной карты.
+    """
+    existing = await find_existing_campaign_card_for_phone(session, phone_e164=phone_e164, campaign_code=campaign_code)
+
+    if len(existing) > 1:
+        card_ids = [c[0] for c in existing]
+        reason = f"found {len(existing)} existing cards for phone {phone_e164}: " + ", ".join(card_ids)
+        logger.warning(
+            "card_conflict phone=%s campaign=%s ids=%s",
+            phone_e164,
+            campaign_code,
+            card_ids,
+        )
+        return CardResolution(
+            outcome="failed_conflict",
+            loyalty_card_id="",
+            loyalty_card_number="",
+            loyalty_card_type_id="",
+            reason=reason,
+        )
+
+    if len(existing) == 1:
+        card_id, card_number, existing_type_id = existing[0]
+        logger.info(
+            "card_reused card_id=%s phone=%s campaign=%s",
+            card_id,
+            phone_e164,
+            campaign_code,
+        )
+        return CardResolution(
+            outcome="reused_existing",
+            loyalty_card_id=card_id,
+            loyalty_card_number=card_number,
+            loyalty_card_type_id=existing_type_id or card_type_id,
+        )
+
+    # 0 существующих карт — выпустить новую.
+    card_number = make_card_number(phone_e164)
+    phone_num = int(phone_e164.lstrip("+"))
+    card = await loyalty.issue_card(
+        location_id,
+        loyalty_card_number=card_number,
+        loyalty_card_type_id=card_type_id,
+        phone=phone_num,
+    )
+    issued_number = str(card.get("loyalty_card_number") or card_number)
+    issued_id = str(card.get("id") or card.get("loyalty_card_id") or "")
+    logger.info(
+        "card_issued card_id=%s phone=%s campaign=%s",
+        issued_id,
+        phone_e164,
+        campaign_code,
+    )
+    return CardResolution(
+        outcome="issued_new",
+        loyalty_card_id=issued_id,
+        loyalty_card_number=issued_number,
+        loyalty_card_type_id=card_type_id,
+    )
