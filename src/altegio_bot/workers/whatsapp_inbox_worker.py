@@ -9,9 +9,17 @@ from typing import Any, Sequence
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from altegio_bot.campaigns.runner import recompute_campaign_run_stats
 from altegio_bot.chatwoot_client import ChatwootClient
 from altegio_bot.db import SessionLocal
-from altegio_bot.models.models import Client, MessageJob, WhatsAppEvent, WhatsAppSender
+from altegio_bot.models.models import (
+    CampaignRecipient,
+    Client,
+    MessageJob,
+    OutboxMessage,
+    WhatsAppEvent,
+    WhatsAppSender,
+)
 from altegio_bot.perf import perf_log
 from altegio_bot.providers.base import WhatsAppProvider
 from altegio_bot.providers.dummy import safe_send
@@ -42,6 +50,22 @@ START_KEYWORDS = {
     "подпиши",
     "prijava",
 }
+
+# Rank used to ensure OutboxMessage.status never regresses.
+# A new status is applied only when its rank exceeds the current rank.
+# 'failed' has rank 0 so it only applies when outbox is still in
+# queued/sending state — never downgrades a delivered/read message.
+_WA_STATUS_RANK: dict[str, int] = {
+    "failed": 0,
+    "queued": 1,
+    "sending": 2,
+    "sent": 3,
+    "delivered": 4,
+    "read": 5,
+}
+
+# Meta status values we will apply to OutboxMessage.
+_WA_HANDLED_STATUSES = frozenset({"sent", "delivered", "read", "failed"})
 
 
 def utcnow() -> datetime:
@@ -280,6 +304,139 @@ def _extract_actions(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return actions
 
 
+def _extract_status_updates(
+    payload: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Extract delivery status events from a Meta WhatsApp payload.
+
+    Returns a list of dicts with keys: wamid, status, timestamp, raw.
+    Only includes entries whose status is in _WA_HANDLED_STATUSES.
+    """
+    updates: list[dict[str, Any]] = []
+
+    for entry in payload.get("entry") or []:
+        if not isinstance(entry, dict):
+            continue
+
+        for change in entry.get("changes") or []:
+            if not isinstance(change, dict):
+                continue
+
+            value = change.get("value") or {}
+            if not isinstance(value, dict):
+                continue
+
+            for st in value.get("statuses") or []:
+                if not isinstance(st, dict):
+                    continue
+
+                wamid = st.get("id")
+                status = st.get("status")
+                timestamp = st.get("timestamp")
+
+                if not wamid or not status:
+                    continue
+
+                if status not in _WA_HANDLED_STATUSES:
+                    continue
+
+                updates.append(
+                    {
+                        "wamid": str(wamid),
+                        "status": str(status),
+                        "timestamp": timestamp,
+                        "raw": st,
+                    }
+                )
+
+    return updates
+
+
+async def _apply_status_updates(
+    session: AsyncSession,
+    status_updates: list[dict[str, Any]],
+) -> list[int]:
+    """Apply Meta delivery status webhooks to OutboxMessage rows.
+
+    Looks up each wamid via provider_message_id, advances status
+    monotonically (no regression), and stores the raw payload in meta.
+
+    Returns distinct campaign_run_id values for affected OutboxMessage
+    rows that are linked to a CampaignRecipient — so the caller can
+    trigger recompute_campaign_run_stats for each run.
+    """
+    if not status_updates:
+        return []
+
+    wamids = [u["wamid"] for u in status_updates]
+
+    stmt = select(OutboxMessage).where(OutboxMessage.provider_message_id.in_(wamids))
+    res = await session.execute(stmt)
+    outbox_by_wamid: dict[str, OutboxMessage] = {}
+    for ob in res.scalars().all():
+        if ob.provider_message_id:
+            outbox_by_wamid[ob.provider_message_id] = ob
+
+    updated_outbox_ids: list[int] = []
+
+    for upd in status_updates:
+        wamid = upd["wamid"]
+        new_status = upd["status"]
+        ob = outbox_by_wamid.get(wamid)
+        if ob is None:
+            logger.debug(
+                "status_webhook: no OutboxMessage wamid=%s status=%s",
+                wamid,
+                new_status,
+            )
+            continue
+
+        current_rank = _WA_STATUS_RANK.get(ob.status, 0)
+        new_rank = _WA_STATUS_RANK.get(new_status, 0)
+
+        if new_rank <= current_rank:
+            logger.debug(
+                "status_webhook: no-op (no-regression) outbox_id=%s wamid=%s current=%s new=%s",
+                ob.id,
+                wamid,
+                ob.status,
+                new_status,
+            )
+            continue
+
+        logger.info(
+            "status_webhook: advancing outbox_id=%s wamid=%s %s -> %s",
+            ob.id,
+            wamid,
+            ob.status,
+            new_status,
+        )
+
+        ob.status = new_status
+
+        # Persist timestamp and raw payload in meta for audit.
+        meta = dict(ob.meta or {})
+        meta[f"wa_status_{new_status}"] = {
+            "timestamp": upd.get("timestamp"),
+            "raw": upd.get("raw"),
+        }
+        ob.meta = meta
+
+        updated_outbox_ids.append(int(ob.id))
+
+    if not updated_outbox_ids:
+        return []
+
+    # Resolve campaign_run_ids linked to the updated outbox messages.
+    cr_stmt = (
+        select(CampaignRecipient.campaign_run_id)
+        .where(CampaignRecipient.outbox_message_id.in_(updated_outbox_ids))
+        .distinct()
+    )
+    cr_res = await session.execute(cr_stmt)
+    return [int(r) for r in cr_res.scalars().all()]
+
+
 async def handle_event(
     session: AsyncSession,
     event: WhatsAppEvent,
@@ -287,6 +444,25 @@ async def handle_event(
 ) -> None:
     payload = event.payload or {}
 
+    # ------------------------------------------------------------------ #
+    # 1. Delivery status webhooks (value.statuses)                        #
+    # ------------------------------------------------------------------ #
+    status_updates = _extract_status_updates(payload)
+    if status_updates:
+        run_ids = await _apply_status_updates(session, status_updates)
+        for run_id in run_ids:
+            try:
+                await recompute_campaign_run_stats(session, run_id)
+            except Exception as exc:
+                logger.warning(
+                    "status_webhook: recompute failed run_id=%s err=%s",
+                    run_id,
+                    exc,
+                )
+
+    # ------------------------------------------------------------------ #
+    # 2. Inbound messages (value.messages) — STOP/START, Chatwoot        #
+    # ------------------------------------------------------------------ #
     actions = _extract_actions(payload)
     if not actions:
         return
