@@ -1,15 +1,17 @@
 """Тесты retry campaign message_job через Ops API.
 
 Сценарии:
-  1. retry сбрасывает упавший job корректно (outcome=retried).
+  1. retry сбрасывает failed job корректно (outcome=retried).
   2. retry отклоняет job с успешным OutboxMessage (outcome=already_sent).
   3. retry отклоняет получателя без message_job_id (outcome=no_message_job).
   4. retry отклоняет job неправильного типа (outcome=wrong_job_type).
   5. endpoint возвращает 404 если recipient не принадлежит run_id.
   6. retry отклоняет job в статусе 'done' (outcome=not_retryable).
-  7. retry допускает canceled job (outcome=retried).
+  7. retry отклоняет canceled/unsubscribed job (outcome=not_retryable).
   8. retry допускает queued+locked (застрявший) job (outcome=retried).
   9. retry записывает last_manual_retry_at в recipient.meta.
+ 10. regression: canceled/opted-out job не проходит retry ни при каком
+     значении last_error связанном с unsubscribe / opt-out.
 """
 
 from __future__ import annotations
@@ -328,12 +330,17 @@ async def test_retry_rejects_done_job_without_outbox(http_client: AsyncClient, s
 
 
 # ---------------------------------------------------------------------------
-# Тест 7: retry допускает canceled job
+# Тест 7: retry отклоняет canceled/unsubscribed job
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_retry_allows_canceled_job(http_client: AsyncClient, session_maker) -> None:
+async def test_retry_rejects_canceled_unsubscribed_job(http_client: AsyncClient, session_maker) -> None:
+    """canceled из-за unsubscribe — not_retryable.
+
+    Retry для canceled = обход opt-out / compliance guardrails.
+    Job должна оставаться canceled, статус не меняется.
+    """
     async with session_maker() as session:
         async with session.begin():
             run = _make_run(session)
@@ -353,15 +360,14 @@ async def test_retry_allows_canceled_job(http_client: AsyncClient, session_maker
     resp = await http_client.post(f"/ops/campaigns/runs/{run_id}/recipients/{rec_id}/retry")
     assert resp.status_code == 200
     data = resp.json()
-    assert data["outcome"] == "retried"
-    assert data["prev_status"] == "canceled"
+    assert data["outcome"] == "not_retryable"
+    assert data["job_status"] == "canceled"
 
+    # Job должна остаться canceled, ничего не сброшено
     async with session_maker() as session:
         job_db = await session.get(MessageJob, job_id)
-    assert job_db.status == "queued"
-    assert job_db.attempts == 0
-    assert job_db.locked_at is None
-    assert job_db.last_error is None
+    assert job_db.status == "canceled"
+    assert job_db.last_error == "Skipped: client unsubscribed"
 
 
 # ---------------------------------------------------------------------------
@@ -434,3 +440,56 @@ async def test_retry_records_meta_timestamp(http_client: AsyncClient, session_ma
         rec_db = await session.get(CampaignRecipient, rec_id)
     meta = rec_db.meta or {}
     assert "last_manual_retry_at" in meta
+
+
+# ---------------------------------------------------------------------------
+# Тест 10: regression — canceled job не проходит retry
+#          независимо от содержимого last_error
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_retry_rejects_any_canceled_job_regression(http_client: AsyncClient, session_maker) -> None:
+    """Regression: ни одна canceled job не должна быть retried.
+
+    Проверяем несколько типичных cancel-причин из outbox_worker:
+      - 'Skipped: client unsubscribed'    (opt-out)
+      - 'Skipped: record is deleted'      (data issue)
+      - 'Skipped: record starts_at is in the past' (past record)
+
+    Все они должны возвращать not_retryable / job_status=canceled.
+    """
+    cancel_reasons = [
+        "Skipped: client unsubscribed",
+        "Skipped: record is deleted",
+        "Skipped: record starts_at is in the past",
+    ]
+
+    for i, reason in enumerate(cancel_reasons):
+        async with session_maker() as session:
+            async with session.begin():
+                run = _make_run(session)
+                await session.flush()
+                job = _make_job(
+                    session,
+                    job_status="canceled",
+                    attempts=0,
+                    last_error=reason,
+                    dedupe_key=f"dk-test-retry-10-{i}",
+                )
+                await session.flush()
+                r = _make_recipient(session, run.id, message_job_id=job.id)
+                await session.flush()
+                run_id, rec_id, job_id = run.id, r.id, job.id
+
+        resp = await http_client.post(f"/ops/campaigns/runs/{run_id}/recipients/{rec_id}/retry")
+        assert resp.status_code == 200, f"reason={reason!r}"
+        data = resp.json()
+        assert data["outcome"] == "not_retryable", f"reason={reason!r} got outcome={data['outcome']!r}"
+        assert data["job_status"] == "canceled", f"reason={reason!r}"
+
+        # Job не должна быть изменена
+        async with session_maker() as session:
+            job_db = await session.get(MessageJob, job_id)
+        assert job_db.status == "canceled", f"reason={reason!r}"
+        assert job_db.last_error == reason, f"reason={reason!r}"

@@ -2002,8 +2002,18 @@ async def remove_recipient_from_preview(
 _SENT_OUTBOX_STATUSES = frozenset({"sent", "delivered", "read"})
 
 # Статусы MessageJob, которые разрешают принудительный retry.
-# done/running/processing — нельзя: уже выполняется или завершено.
-_JOB_RETRYABLE_STATUSES = frozenset({"failed", "canceled", "queued"})
+#
+# 'failed'  — job исчерпала max_attempts, нужна повторная попытка.
+# 'queued'  — job застряла (locked_at не сброшен, attempts > 0).
+#
+# 'canceled' намеренно исключён: cancel означает policy-решение
+# (unsubscribe / opt-out / запись в прошлом и т.д.).
+# Разрешать retry для canceled = обходить compliance guardrails.
+# Если оператор хочет форсировать send после opt-out, он должен
+# сначала восстановить согласие клиента, а не делать raw retry.
+#
+# 'done' / 'running' — финальный или активный статус, retry запрещён.
+_JOB_RETRYABLE_STATUSES = frozenset({"failed", "queued"})
 
 
 async def retry_recipient_job(recipient_id: int) -> dict:
@@ -2013,7 +2023,11 @@ async def retry_recipient_job(recipient_id: int) -> dict:
       - у получателя есть message_job_id
       - job существует и имеет тип NEWSLETTER_JOB_TYPE
       - нет успешного OutboxMessage (дубликат запрещён)
-      - job в допустимом для retry статусе
+      - job в допустимом для retry статусе: failed или queued
+
+    'canceled' специально исключён из допустимых статусов — cancel
+    означает policy-решение (unsubscribe, opt-out, запись в прошлом).
+    Retry для canceled = обход compliance guardrails.
 
     Сброс: status='queued', locked_at=None, last_error=None,
            run_at=now(), attempts=0.
@@ -2027,7 +2041,7 @@ async def retry_recipient_job(recipient_id: int) -> dict:
       already_sent         — есть успешный OutboxMessage, дубликат запрещён
       no_message_job       — у получателя нет message_job_id или job не найден
       wrong_job_type       — job не является NEWSLETTER_JOB_TYPE
-      not_retryable        — job в финальном или активном статусе
+      not_retryable        — job в финальном/активном/policy статусе
       recipient_not_found  — получатель не найден
     """
     async with SessionLocal() as session:
