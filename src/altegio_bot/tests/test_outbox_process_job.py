@@ -61,6 +61,19 @@ class FakeSession:
         self.added.append(obj)
 
 
+# Complete render context for kitilash_ka_record_updated_v1 (7 params).
+# Tests that exercise send/retry logic use this to pass preflight validation.
+_RECORD_UPDATED_CTX: dict = {
+    "client_name": "Anna",
+    "staff_name": "Tanja",
+    "date": "01.05.2026",
+    "time": "10:00",
+    "services": "Haarschnitt",
+    "total_cost": "30.00",
+    "short_link": "https://example.com",
+}
+
+
 def patch_outbox_checks(
     monkeypatch: Any,
     *,
@@ -256,7 +269,7 @@ def test_process_job_creates_outbox_on_send_ok(monkeypatch: Any) -> None:
         return None
 
     async def fake_render(*args: Any, **kwargs: Any) -> Any:
-        return ("TEXT", 123, "de", {})
+        return ("TEXT", 123, "de", _RECORD_UPDATED_CTX)
 
     async def fake_safe_send(*args: Any, **kwargs: Any) -> Any:
         return ("msg-1", None)
@@ -313,7 +326,7 @@ def test_process_job_requeues_on_send_fail(monkeypatch: Any) -> None:
         return None
 
     async def fake_render(*args: Any, **kwargs: Any) -> Any:
-        return ("TEXT", 123, "de", {})
+        return ("TEXT", 123, "de", _RECORD_UPDATED_CTX)
 
     async def fake_safe_send(*args: Any, **kwargs: Any) -> Any:
         return ("msg-2", "provider error")
@@ -411,7 +424,7 @@ def test_process_job_fails_on_send_fail_when_attempt_becomes_max(
         return None
 
     async def fake_render(*args: Any, **kwargs: Any) -> Any:
-        return ("TEXT", 123, "de", {})
+        return ("TEXT", 123, "de", _RECORD_UPDATED_CTX)
 
     async def fake_safe_send(*args: Any, **kwargs: Any) -> Any:
         return ("msg-3", "provider error")

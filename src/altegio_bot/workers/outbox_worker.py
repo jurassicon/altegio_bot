@@ -41,6 +41,7 @@ from altegio_bot.perf import perf_log
 from altegio_bot.providers.base import WhatsAppProvider
 from altegio_bot.providers.dummy import safe_send, safe_send_template
 from altegio_bot.settings import settings
+from altegio_bot.template_validation import validate_template_params
 from altegio_bot.whatsapp_routing import pick_sender_code_for_record, pick_sender_id
 
 logger = logging.getLogger("outbox_worker")
@@ -903,6 +904,43 @@ async def _run_job_logic(
             )
             return
         template_params = build_template_params(meta_template_name, msg_ctx)
+
+        preflight_err = validate_template_params(meta_template_name, template_params)
+        if preflight_err is not None:
+            logger.error(
+                "Preflight validation failed: %s job_id=%s template=%s",
+                preflight_err,
+                job.id,
+                meta_template_name,
+            )
+            out = OutboxMessage(
+                company_id=job.company_id,
+                client_id=(client.id if client else None),
+                record_id=(record.id if record else None),
+                job_id=job.id,
+                sender_id=sender_id,
+                phone_e164=phone,
+                template_code=job.job_type,
+                language=lang,
+                body=body,
+                status="failed",
+                error=preflight_err,
+                provider_message_id=None,
+                scheduled_at=job.run_at,
+                sent_at=utcnow(),
+                meta={
+                    "send_type": "template",
+                    "template": meta_template_name,
+                    "params": template_params,
+                    "lang": TEMPLATE_LANGUAGE,
+                    "validation": "local_preflight_failure",
+                },
+            )
+            session.add(out)
+            job.status = "failed"
+            job.locked_at = None
+            job.last_error = preflight_err
+            return
 
         final_body = body
         for i, val in enumerate(template_params):
