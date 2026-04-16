@@ -86,9 +86,10 @@ def _make_render_result(body: str = "Hallo Anna! Karte: 123") -> tuple:
     """Return (body, sender_id, lang, msg_ctx) — same shape as _render_message."""
     msg_ctx = {
         "client_name": "Anna Müller",
+        "booking_link": "https://n813709.alteg.io/",
+        "loyalty_card_text": "",
         "sender_id": 1,
         "sender_code": "default",
-        "loyalty_card_text": "",
     }
     return body, 1, "de", msg_ctx
 

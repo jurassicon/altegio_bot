@@ -231,6 +231,7 @@ async def test_outbox_worker_injects_loyalty_card_text_for_newsletter(monkeypatc
         payload={
             "kind": JOB_TYPE,
             "loyalty_card_text": card_text,
+            "contact_name": "Maria Müller",
             "campaign_run_id": 8,
         },
     )
@@ -303,6 +304,7 @@ async def test_outbox_worker_newsletter_ra_uses_v1_template(monkeypatch: Any) ->
         payload={
             "kind": JOB_TYPE,
             "loyalty_card_text": "Kundenkarte #0074454347287392",
+            "contact_name": "Maria Müller",
             "phone_e164": "+49721987654",
         },
     )
@@ -554,14 +556,19 @@ async def test_local_client_monthly_newsletter_uses_display_name_not_payload(mon
 
 
 @pytest.mark.asyncio
-async def test_crm_only_no_contact_name_param1_is_empty(monkeypatch: Any) -> None:
-    """CRM-only job with no contact_name in payload: client_name stays '' (no crash).
+async def test_crm_only_no_contact_name_fails_preflight(monkeypatch: Any) -> None:
+    """CRM-only job with no contact_name: preflight catches empty param #1 locally.
 
-    If payload.contact_name is absent, the fallback simply does not fire.
-    This is a degenerate case — the job would likely still fail Meta validation,
-    but the outbox_worker must not crash and must attempt the send.
+    Previously the worker would attempt the send with params[0]="" and Meta
+    would reject with "Required parameter is missing".  Now the preflight
+    validation catches this before any Meta request is made.
+
+    Expected behaviour after the fix:
+    - safe_send_template is NOT called
+    - job.status == "failed"
+    - job.last_error starts with "Local template validation failed"
     """
-    captured_params: list[list[str]] = []
+    send_template_calls: list[Any] = []
     card_text = "Kundenkarte #0000000000000000"
 
     job = _FakeJob(
@@ -572,7 +579,7 @@ async def test_crm_only_no_contact_name_param1_is_empty(monkeypatch: Any) -> Non
             "kind": JOB_TYPE,
             "loyalty_card_text": card_text,
             "phone_e164": "+491111111111",
-            # no contact_name
+            # no contact_name — client_name stays ""
         },
     )
     session = _FakeSession()
@@ -589,7 +596,7 @@ async def test_crm_only_no_contact_name_param1_is_empty(monkeypatch: Any) -> Non
     monkeypatch.setattr(ow, "_render_message", _fake_render)
 
     async def _fake_send_template(provider, sender_id, phone, template_name, language, params, **kw):
-        captured_params.append(list(params))
+        send_template_calls.append(list(params))
         return "wamid.fake3002", None
 
     monkeypatch.setattr(ow, "safe_send_template", _fake_send_template)
@@ -598,7 +605,11 @@ async def test_crm_only_no_contact_name_param1_is_empty(monkeypatch: Any) -> Non
     provider = MagicMock()
     await ow._run_job_logic(session, job, provider=provider)  # type: ignore[arg-type]
 
-    # Worker must not crash — it attempts the send regardless of empty param
-    assert len(captured_params) == 1
-    params = captured_params[0]
-    assert params[0] == "", f"Without contact_name in payload, param #1 must remain '', got {params[0]!r}"
+    assert len(send_template_calls) == 0, (
+        f"safe_send_template must NOT be called when preflight validation fails; got calls: {send_template_calls}"
+    )
+    assert job.status == "failed", f"Expected job.status='failed', got {job.status!r}"
+    assert job.last_error is not None
+    assert "Local template validation failed" in job.last_error, (
+        f"last_error must indicate local validation failure, got: {job.last_error!r}"
+    )
