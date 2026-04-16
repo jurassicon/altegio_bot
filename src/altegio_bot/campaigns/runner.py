@@ -13,6 +13,7 @@ from altegio_bot.campaigns.loyalty_cleanup import (
     cleanup_campaign_cards,
     make_card_number,
     make_card_text,
+    resolve_or_issue_loyalty_card,
 )
 from altegio_bot.campaigns.segment import ClientCandidate, ClientSnapshot, find_candidates
 from altegio_bot.db import SessionLocal
@@ -569,6 +570,7 @@ async def _execute_send_real_for_existing_run(
             "cleanup_failed": 0,
             "cards_deleted": 0,
             "cards_issued": 0,
+            "cards_reused": 0,
             "queued": 0,
             "failed": 0,
         }
@@ -635,6 +637,9 @@ async def _execute_send_real_for_existing_run(
                 meta.pop("last_error", None)
                 meta.pop("partial_failure", None)
                 meta.pop("partial_failure_count", None)
+                meta.pop("cards_reused_count", None)
+                if stats["cards_reused"]:
+                    meta["cards_reused_count"] = stats["cards_reused"]
 
                 if eligible_count > 0 and stats["queued"] == 0 and prequeue_failures > 0:
                     # All eligible recipients failed before any job was queued.
@@ -796,18 +801,18 @@ async def _process_eligible(
     stats["cards_deleted"] += len(cleanup.deleted_ids)
 
     phone_e164 = client.phone_e164
-    card_number = make_card_number(phone_e164)
-    phone_num = int(phone_e164.lstrip("+"))
 
     try:
-        card = await loyalty.issue_card(
-            location_id,
-            loyalty_card_number=card_number,
-            loyalty_card_type_id=card_type_id,
-            phone=phone_num,
-        )
-        issued_number = str(card.get("loyalty_card_number") or card_number)
-        issued_id = str(card.get("id") or card.get("loyalty_card_id") or "")
+        async with SessionLocal() as session:
+            resolution = await resolve_or_issue_loyalty_card(
+                session,
+                loyalty,
+                phone_e164=phone_e164,
+                location_id=location_id,
+                card_type_id=card_type_id,
+                campaign_code=campaign_code,
+                company_id=company_id,
+            )
     except Exception as exc:
         stats["failed"] += 1
         async with SessionLocal() as session:
@@ -820,14 +825,37 @@ async def _process_eligible(
                     recipient.status = "skipped"
                     recipient.excluded_reason = "card_issue_failed"
                     recipient.cleanup_card_ids = cleanup.deleted_ids
+        logger.error("card_issue_failed client_id=%s: %s", client_id, exc)
+        return
+
+    if resolution.outcome == "failed_conflict":
+        stats["failed"] += 1
+        async with SessionLocal() as session:
+            async with session.begin():
+                recipient = await session.get(
+                    CampaignRecipient,
+                    recipient_id,
+                )
+                if recipient:
+                    recipient.status = "skipped"
+                    recipient.excluded_reason = "card_conflict"
+                    recipient.cleanup_failed_reason = resolution.reason
+                    recipient.cleanup_card_ids = cleanup.deleted_ids
         logger.error(
-            "card_issue_failed client_id=%s: %s",
+            "card_conflict client_id=%s phone=%s: %s",
             client_id,
-            exc,
+            phone_e164,
+            resolution.reason,
         )
         return
 
-    stats["cards_issued"] += 1
+    if resolution.outcome == "reused_existing":
+        stats["cards_reused"] += 1
+    else:
+        stats["cards_issued"] += 1
+
+    issued_id = resolution.loyalty_card_id
+    issued_number = resolution.loyalty_card_number
     loyalty_card_text = make_card_text(issued_number)
     run_at = utcnow()
 
