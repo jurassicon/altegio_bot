@@ -4291,6 +4291,8 @@ async def ops_campaign_recipients(request: Request, run_id: int) -> str:
 
     # Remove button только для completed preview, не используемого send-real
     is_editable_preview = run.mode == "preview" and run.status == "completed" and not used_as_source
+    # Retry button доступен для send-real runs (не для preview)
+    is_send_real = run.mode == "send-real"
 
     base_cols = [
         "ID",
@@ -4307,7 +4309,13 @@ async def ops_campaign_recipients(request: Request, run_id: int) -> str:
         "Booked",
         "Followup",
     ]
-    cols = base_cols + ([""] if is_editable_preview else [])
+    extra_cols: list[str] = []
+    if is_editable_preview:
+        extra_cols.append("")
+    if is_send_real:
+        extra_cols.append("Actions")
+    cols = base_cols + extra_cols
+
     rows = []
     for r in recipients:
         row = [
@@ -4331,8 +4339,18 @@ async def ops_campaign_recipients(request: Request, run_id: int) -> str:
             else:
                 row.append(
                     f'<button class="btn btn-sm btn-outline-danger" '
-                    f'onclick="removeRecipient({run_id},{r.id})">✕ Remove</button>'
+                    f'onclick="removeRecipient({run_id},{r.id})">'
+                    f"✕ Remove</button>"
                 )
+        if is_send_real:
+            if r.message_job_id:
+                row.append(
+                    f'<button class="btn btn-sm btn-outline-warning" '
+                    f'onclick="retryRecipient({run_id},{r.id})">'
+                    f"↩ Retry</button>"
+                )
+            else:
+                row.append('<span class="text-muted small">no job</span>')
         rows.append(row)
 
     table_html = _table(cols, rows) if rows else '<p class="text-muted">Нет получателей по заданным фильтрам.</p>'
@@ -4356,6 +4374,46 @@ async function removeRecipient(runId, recipientId) {
 }
 </script>"""
 
+    retry_js = ""
+    if is_send_real:
+        retry_js = """
+<script>
+async function retryRecipient(runId, recipientId) {
+  if (!confirm("Retry message job for recipient #" + recipientId + "?")) return;
+  const resp = await fetch(
+    "/ops/campaigns/runs/" + runId + "/recipients/" + recipientId + "/retry",
+    {method: "POST"}
+  );
+  const data = await resp.json();
+  if (!resp.ok) {
+    alert("Error: " + (data.detail || JSON.stringify(data)));
+    return;
+  }
+  const outcome = data.outcome;
+  if (outcome === "retried") {
+    alert(
+      "Retried! Job #" + data.job_id + " reset to queued.\\n" +
+      "Previous status: " + data.prev_status +
+      ", attempts: " + data.prev_attempts +
+      ".\\nAuto-sync will update run stats after send."
+    );
+    location.reload();
+  } else if (outcome === "already_sent") {
+    alert(
+      "Already sent (outbox #" + data.outbox_id + "). Retry not allowed."
+    );
+  } else if (outcome === "no_message_job") {
+    alert("No message job found for this recipient.");
+  } else if (outcome === "wrong_job_type") {
+    alert("Job type " + data.job_type + " cannot be retried here.");
+  } else if (outcome === "not_retryable") {
+    alert("Job status '" + data.job_status + "' is not retryable.");
+  } else {
+    alert("Outcome: " + outcome + "\\n" + JSON.stringify(data));
+  }
+}
+</script>"""
+
     body = f"""
 <div class="d-flex justify-content-between align-items-center mb-3">
   <h4>👥 Recipients — Run #{run_id}</h4>
@@ -4367,6 +4425,7 @@ async function removeRecipient(runId, recipientId) {
 {filter_form}
 {table_html}
 {remove_js}
+{retry_js}
 """
     return _page(f"Recipients — Run {run_id}", body)
 

@@ -54,6 +54,7 @@ from altegio_bot.campaigns.runner import (
     recompute_run_counters,
     remove_recipient_from_preview,
     resume_send_real,
+    retry_recipient_job,
     run_preview,
 )
 from altegio_bot.campaigns.segment import check_lash_services, compute_excluded_reason
@@ -1788,6 +1789,62 @@ async def resume_run(run_id: int) -> dict[str, Any]:
         "status": run.status,
         "summary": result,
     }
+
+
+# ==========================================================================
+# Retry: принудительный повтор упавшего/застрявшего message_job
+# ==========================================================================
+
+
+@router.post("/runs/{run_id}/recipients/{recipient_id}/retry")
+async def retry_recipient(
+    run_id: int,
+    recipient_id: int,
+) -> dict[str, Any]:
+    """Принудительный retry message_job для одного campaign recipient.
+
+    Сбрасывает MessageJob в состояние 'queued' (status, locked_at,
+    last_error, attempts=0, run_at=now()), чтобы outbox_worker
+    подобрал его как обычную задачу.
+
+    После успешной отправки auto-sync (recompute_campaign_run_stats)
+    обновит счётчики run автоматически — без ручного Recompute.
+
+    Guardrails — запрещает retry если:
+      - у получателя нет message_job_id (job не был создан)
+      - job имеет тип, отличный от NEWSLETTER_JOB_TYPE
+      - существует успешный OutboxMessage (сообщение уже доставлено)
+      - job в статусе 'done' или 'running'
+
+    Возвращает JSON с полем ``outcome``:
+      retried              — job сброшен, ждёт обработки
+      already_sent         — дубликат запрещён
+      no_message_job       — job не найден
+      wrong_job_type       — не campaign newsletter job
+      not_retryable        — job в финальном/активном статусе
+      recipient_not_found  — получатель не найден
+
+    Validate принадлежность recipient к run перед вызовом helper:
+    возвращает 404, если recipient не принадлежит run_id.
+    """
+    async with SessionLocal() as session:
+        recipient = await session.get(CampaignRecipient, recipient_id)
+        if recipient is None or recipient.campaign_run_id != run_id:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Recipient {recipient_id} not found in run {run_id}",
+            )
+
+    result = await retry_recipient_job(recipient_id)
+
+    logger.info(
+        "ops_retry run_id=%d recipient_id=%d outcome=%s",
+        run_id,
+        recipient_id,
+        result.get("outcome"),
+    )
+
+    return {"run_id": run_id, "recipient_id": recipient_id, **result}
 
 
 # ==========================================================================
