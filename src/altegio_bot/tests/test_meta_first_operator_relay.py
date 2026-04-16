@@ -28,6 +28,7 @@ from altegio_bot.providers.base import WhatsAppProvider
 from altegio_bot.workers.whatsapp_inbox_worker import (
     _apply_status_updates,
     _is_operator_relay,
+    _resolve_relay_sender,
     handle_event,
 )
 
@@ -803,3 +804,251 @@ async def test_webhook_operator_outgoing_accepted(session_maker) -> None:
     finally:
         cw_module.SessionLocal = original_session_local
         _s.chatwoot_operator_relay_enabled = original_relay
+
+
+# ---------------------------------------------------------------------------
+# Tests: ambiguous sender routing (pre-merge hardening)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_sender_blocks_relay(session_maker) -> None:
+    """Two active senders for the same phone_number_id → relay blocked.
+
+    OutboxMessage must NOT be created and event.error must describe the
+    ambiguity so operators can diagnose the misconfiguration.
+    """
+    provider = _FakeProvider(wamid="wamid.SHOULD_NOT_APPEAR")
+
+    async with session_maker() as session:
+        async with session.begin():
+            # Two active senders, same phone_number_id, different company_ids.
+            session.add(
+                WhatsAppSender(
+                    id=50,
+                    company_id=10,
+                    sender_code="default",
+                    phone_number_id="PNID_SHARED",
+                    display_phone="+49000000000",
+                    is_active=True,
+                )
+            )
+            session.add(
+                WhatsAppSender(
+                    id=51,
+                    company_id=20,
+                    sender_code="default",
+                    phone_number_id="PNID_SHARED",
+                    display_phone="+49000000000",
+                    is_active=True,
+                )
+            )
+
+            evt = WhatsAppEvent(
+                dedupe_key="chatwoot_out:700:800",
+                status="received",
+                error=None,
+                query={},
+                headers={},
+                payload=_operator_relay_payload(
+                    recipient_phone="+49700800900",
+                    phone_number_id="PNID_SHARED",
+                    conversation_id=700,
+                    message_id=800,
+                ),
+                chatwoot_conversation_id=700,
+            )
+            session.add(evt)
+            await session.flush()
+            evt_id = evt.id
+
+            from altegio_bot.settings import settings as _s
+
+            original = _s.chatwoot_operator_relay_enabled
+            _s.chatwoot_operator_relay_enabled = True
+            try:
+                await handle_event(session, evt, provider)
+            finally:
+                _s.chatwoot_operator_relay_enabled = original
+
+    # Provider must NOT have been called.
+    assert len(provider.sent) == 0
+
+    # event.error must describe the ambiguity.
+    async with session_maker() as session:
+        reloaded = await session.get(WhatsAppEvent, evt_id)
+    assert reloaded is not None
+    assert reloaded.error is not None
+    assert "ambiguous" in reloaded.error
+    assert "PNID_SHARED" in reloaded.error
+
+    # No OutboxMessage created.
+    async with session_maker() as session:
+        result = await session.execute(
+            select(OutboxMessage).where(OutboxMessage.provider_message_id == "wamid.SHOULD_NOT_APPEAR")
+        )
+        assert result.scalar_one_or_none() is None
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_sender_no_outbox_created(session_maker) -> None:
+    """Verify zero OutboxMessage rows exist after ambiguous relay attempt."""
+    provider = _FakeProvider()
+
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(
+                WhatsAppSender(
+                    id=60,
+                    company_id=30,
+                    sender_code="a",
+                    phone_number_id="PNID_AMB2",
+                    display_phone="+49",
+                    is_active=True,
+                )
+            )
+            session.add(
+                WhatsAppSender(
+                    id=61,
+                    company_id=40,
+                    sender_code="b",
+                    phone_number_id="PNID_AMB2",
+                    display_phone="+49",
+                    is_active=True,
+                )
+            )
+
+            evt = WhatsAppEvent(
+                dedupe_key="chatwoot_out:800:900",
+                status="received",
+                error=None,
+                query={},
+                headers={},
+                payload=_operator_relay_payload(
+                    phone_number_id="PNID_AMB2",
+                    conversation_id=800,
+                    message_id=900,
+                ),
+                chatwoot_conversation_id=800,
+            )
+            session.add(evt)
+            await session.flush()
+
+            from altegio_bot.settings import settings as _s
+
+            original = _s.chatwoot_operator_relay_enabled
+            _s.chatwoot_operator_relay_enabled = True
+            try:
+                await handle_event(session, evt, provider)
+            finally:
+                _s.chatwoot_operator_relay_enabled = original
+
+    async with session_maker() as session:
+        result = await session.execute(select(OutboxMessage).where(OutboxMessage.template_code == "operator_relay"))
+        rows = result.scalars().all()
+
+    assert len(rows) == 0
+
+
+@pytest.mark.asyncio
+async def test_resolve_relay_sender_zero(session_maker) -> None:
+    """_resolve_relay_sender returns error when no active sender exists."""
+    async with session_maker() as session:
+        sid, cid, err = await _resolve_relay_sender(session, "PNID_NONE")
+    assert sid is None
+    assert cid is None
+    assert err is not None
+    assert "no active sender" in err
+
+
+@pytest.mark.asyncio
+async def test_resolve_relay_sender_one(session_maker) -> None:
+    """_resolve_relay_sender succeeds when exactly one active sender exists."""
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(
+                WhatsAppSender(
+                    id=70,
+                    company_id=99,
+                    sender_code="solo",
+                    phone_number_id="PNID_SOLO",
+                    display_phone="+49",
+                    is_active=True,
+                )
+            )
+
+        sid, cid, err = await _resolve_relay_sender(session, "PNID_SOLO")
+
+    assert err is None
+    assert sid == 70
+    assert cid == 99
+
+
+@pytest.mark.asyncio
+async def test_resolve_relay_sender_many(session_maker) -> None:
+    """_resolve_relay_sender returns ambiguous error for >1 active senders."""
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(
+                WhatsAppSender(
+                    id=80,
+                    company_id=11,
+                    sender_code="x",
+                    phone_number_id="PNID_MULTI",
+                    display_phone="+49",
+                    is_active=True,
+                )
+            )
+            session.add(
+                WhatsAppSender(
+                    id=81,
+                    company_id=22,
+                    sender_code="y",
+                    phone_number_id="PNID_MULTI",
+                    display_phone="+49",
+                    is_active=True,
+                )
+            )
+
+        sid, cid, err = await _resolve_relay_sender(session, "PNID_MULTI")
+
+    assert sid is None
+    assert cid is None
+    assert err is not None
+    assert "ambiguous" in err
+    assert "PNID_MULTI" in err
+
+
+@pytest.mark.asyncio
+async def test_resolve_relay_sender_inactive_not_counted(
+    session_maker,
+) -> None:
+    """Inactive senders must not cause a false ambiguity error."""
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(
+                WhatsAppSender(
+                    id=90,
+                    company_id=55,
+                    sender_code="active",
+                    phone_number_id="PNID_MIXED",
+                    display_phone="+49",
+                    is_active=True,
+                )
+            )
+            session.add(
+                WhatsAppSender(
+                    id=91,
+                    company_id=66,
+                    sender_code="inactive",
+                    phone_number_id="PNID_MIXED",
+                    display_phone="+49",
+                    is_active=False,  # inactive — must be ignored
+                )
+            )
+
+        sid, cid, err = await _resolve_relay_sender(session, "PNID_MIXED")
+
+    assert err is None
+    assert sid == 90
+    assert cid == 55

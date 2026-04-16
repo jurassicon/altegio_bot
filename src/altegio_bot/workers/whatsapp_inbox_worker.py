@@ -179,6 +179,62 @@ async def _pick_sender(
     return int(sender.id), int(sender.company_id)
 
 
+async def _resolve_relay_sender(
+    session: AsyncSession,
+    phone_number_id: str | None,
+) -> tuple[int | None, int | None, str | None]:
+    """Strict, fail-closed sender resolution for operator relay.
+
+    Returns (sender_id, company_id, error).
+    error is None on success; non-None means the relay must be blocked.
+
+    Unlike _pick_sender(), this never silently picks an arbitrary match:
+    - 0 active senders → error
+    - 1 active sender  → ok
+    - >1 active senders → error (ambiguous routing — different company_ids
+      share the same phone_number_id; picking one would be wrong)
+    """
+    if not phone_number_id:
+        return None, None, "operator_relay: missing phone_number_id"
+
+    stmt = (
+        select(WhatsAppSender)
+        .where(WhatsAppSender.phone_number_id == phone_number_id)
+        .where(WhatsAppSender.is_active.is_(True))
+    )
+    res = await session.execute(stmt)
+    senders = list(res.scalars().all())
+
+    if not senders:
+        return (
+            None,
+            None,
+            f"operator_relay: no active sender for phone_number_id={phone_number_id}",
+        )
+
+    if len(senders) > 1:
+        company_ids = [str(s.company_id) for s in senders]
+        logger.warning(
+            "operator_relay: ambiguous sender routing "
+            "phone_number_id=%s matched %d senders "
+            "company_ids=%s — blocking send",
+            phone_number_id,
+            len(senders),
+            ",".join(company_ids),
+        )
+        return (
+            None,
+            None,
+            f"operator_relay: ambiguous sender routing for "
+            f"phone_number_id={phone_number_id} "
+            f"(matched {len(senders)} senders across "
+            f"company_ids={','.join(company_ids)})",
+        )
+
+    s = senders[0]
+    return int(s.id), int(s.company_id), None
+
+
 def _phone_variants(phone_e164: str) -> list[str]:
     digits = re.sub(r"\D+", "", phone_e164)
     variants = {
@@ -480,7 +536,18 @@ async def _handle_operator_relay(
         event.error = "operator_relay: missing recipient_phone or text"
         return
 
-    sender_id, company_id = await _pick_sender(session, phone_number_id)
+    sender_id, company_id, routing_err = await _resolve_relay_sender(session, phone_number_id)
+
+    if routing_err is not None:
+        logger.warning(
+            "operator_relay: routing blocked conv_id=%s msg_id=%s phone_number_id=%s err=%s",
+            conversation_id,
+            chatwoot_message_id,
+            phone_number_id,
+            routing_err,
+        )
+        event.error = routing_err
+        return
 
     logger.info(
         "operator_relay: accepted conv_id=%s msg_id=%s phone=%s phone_number_id=%s sender_id=%s company_id=%s agent=%s",
@@ -492,14 +559,6 @@ async def _handle_operator_relay(
         company_id,
         agent_name,
     )
-
-    if sender_id is None or company_id is None:
-        logger.warning(
-            "operator_relay: no active WhatsAppSender for phone_number_id=%s — skipping",
-            phone_number_id,
-        )
-        event.error = f"operator_relay: no sender for phone_number_id={phone_number_id}"
-        return
 
     wamid, err = await safe_send(
         provider=provider,
