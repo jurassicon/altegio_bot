@@ -811,6 +811,7 @@ async def _process_eligible(
                 location_id=location_id,
                 card_type_id=card_type_id,
                 campaign_code=campaign_code,
+                company_id=company_id,
             )
     except Exception as exc:
         stats["failed"] += 1

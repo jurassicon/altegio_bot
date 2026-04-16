@@ -9,10 +9,12 @@ returned a 409 Conflict or created a duplicate, requiring manual cleanup.
 
 New behaviour
 -------------
-resolve_or_issue_loyalty_card() checks CampaignRecipient records first:
-  0 prior cards → issued_new   (API called, cards_issued counter +1)
-  1 prior card  → reused_existing  (no API call, cards_reused in meta)
-  2+ prior cards → failed_conflict (no API call, recipient → card_conflict)
+resolve_or_issue_loyalty_card() checks CampaignRecipient records first,
+scoped to phone_e164 + campaign_code + company_id:
+  0 prior cards in same branch → issued_new   (API called, counter +1)
+  1 prior card  in same branch → reused_existing  (no API call)
+  2+ prior cards in same branch → failed_conflict (no API call)
+  Cards from a different company_id are ignored completely.
 
 Test coverage
 -------------
@@ -23,6 +25,13 @@ Test coverage
 5. cards_reused_count stored in run.meta when a card is reused.
 6. Existing successful send path (fresh run, no prior cards) still works.
 7. find_existing_campaign_card_for_phone only matches same campaign_code.
+
+Regression: branch scoping (company_id)
+----------------------------------------
+R1. same phone + same campaign_code + different company_id must NOT reuse.
+R2. same phone with cards in TWO branches must NOT produce failed_conflict
+    for the current branch (only own branch cards count).
+R3. same phone with 1 card in same branch still reuses correctly.
 """
 
 from __future__ import annotations
@@ -119,12 +128,16 @@ def _crm_candidate(phone: str = PHONE) -> ClientCandidate:
     )
 
 
+COMPANY_OTHER = 999999  # Second branch for cross-branch regression tests
+
+
 async def _create_run_with_card(
     session_maker,
     *,
     phone: str = PHONE,
     card_id: str,
     campaign_code: str = CAMPAIGN_CODE,
+    company_id: int = COMPANY,
 ) -> int:
     """Create a CampaignRun with one recipient that already has a loyalty card."""
     async with session_maker() as session:
@@ -132,7 +145,7 @@ async def _create_run_with_card(
             run = CampaignRun(
                 campaign_code=campaign_code,
                 mode="send-real",
-                company_ids=[COMPANY],
+                company_ids=[company_id],
                 period_start=PERIOD_START,
                 period_end=PERIOD_END,
                 status="completed",
@@ -141,7 +154,7 @@ async def _create_run_with_card(
             await session.flush()
             r = CampaignRecipient(
                 campaign_run_id=run.id,
-                company_id=COMPANY,
+                company_id=company_id,
                 client_id=None,
                 phone_e164=phone,
                 display_name="Lalka Marinova",
@@ -181,7 +194,12 @@ async def test_find_existing_returns_empty_when_no_prior_cards(
 ) -> None:
     """No prior recipients → empty list returned."""
     async with session_maker() as session:
-        result = await find_existing_campaign_card_for_phone(session, phone_e164=PHONE, campaign_code=CAMPAIGN_CODE)
+        result = await find_existing_campaign_card_for_phone(
+            session,
+            phone_e164=PHONE,
+            campaign_code=CAMPAIGN_CODE,
+            company_id=COMPANY,
+        )
     assert result == []
 
 
@@ -190,7 +208,12 @@ async def test_find_existing_returns_card_when_present(session_maker) -> None:
     """One prior recipient with a card → that card returned."""
     await _create_run_with_card(session_maker, card_id="card-abc")
     async with session_maker() as session:
-        result = await find_existing_campaign_card_for_phone(session, phone_e164=PHONE, campaign_code=CAMPAIGN_CODE)
+        result = await find_existing_campaign_card_for_phone(
+            session,
+            phone_e164=PHONE,
+            campaign_code=CAMPAIGN_CODE,
+            company_id=COMPANY,
+        )
     assert len(result) == 1
     assert result[0][0] == "card-abc"
 
@@ -202,7 +225,12 @@ async def test_find_existing_ignores_different_campaign_code(
     """Card in a different campaign_code is NOT returned for this campaign."""
     await _create_run_with_card(session_maker, card_id="card-other", campaign_code="other_campaign")
     async with session_maker() as session:
-        result = await find_existing_campaign_card_for_phone(session, phone_e164=PHONE, campaign_code=CAMPAIGN_CODE)
+        result = await find_existing_campaign_card_for_phone(
+            session,
+            phone_e164=PHONE,
+            campaign_code=CAMPAIGN_CODE,
+            company_id=COMPANY,
+        )
     assert result == [], "Cards from a different campaign must not be returned"
 
 
@@ -211,7 +239,12 @@ async def test_find_existing_ignores_different_phone(session_maker) -> None:
     """Card for a different phone is NOT returned."""
     await _create_run_with_card(session_maker, phone="+4915999888777", card_id="card-other-phone")
     async with session_maker() as session:
-        result = await find_existing_campaign_card_for_phone(session, phone_e164=PHONE, campaign_code=CAMPAIGN_CODE)
+        result = await find_existing_campaign_card_for_phone(
+            session,
+            phone_e164=PHONE,
+            campaign_code=CAMPAIGN_CODE,
+            company_id=COMPANY,
+        )
     assert result == []
 
 
@@ -232,6 +265,7 @@ async def test_resolve_issues_new_card_when_no_prior(session_maker) -> None:
             location_id=LOCATION,
             card_type_id=CARD_TYPE,
             campaign_code=CAMPAIGN_CODE,
+            company_id=COMPANY,
         )
 
     assert res.outcome == "issued_new"
@@ -253,6 +287,7 @@ async def test_resolve_reuses_existing_card(session_maker) -> None:
             location_id=LOCATION,
             card_type_id=CARD_TYPE,
             campaign_code=CAMPAIGN_CODE,
+            company_id=COMPANY,
         )
 
     assert res.outcome == "reused_existing", f"Expected reused_existing, got {res.outcome!r}"
@@ -275,6 +310,7 @@ async def test_resolve_conflict_when_two_cards_exist(session_maker) -> None:
             location_id=LOCATION,
             card_type_id=CARD_TYPE,
             campaign_code=CAMPAIGN_CODE,
+            company_id=COMPANY,
         )
 
     assert res.outcome == "failed_conflict", f"Expected failed_conflict, got {res.outcome!r}"
@@ -423,3 +459,104 @@ async def test_recompute_not_broken_after_reuse(runner_with_mock_loyalty, sessio
     assert run.status == "completed"
     # recompute is NOT triggered by send-real itself
     assert recompute_calls == [], "recompute_campaign_run_stats must not be called during send-real"
+
+
+# ---------------------------------------------------------------------------
+# Regression: branch / company_id scoping
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_find_existing_ignores_different_company_id(
+    session_maker,
+) -> None:
+    """R1: same phone + same campaign_code + different company_id is NOT returned.
+
+    A card issued in branch COMPANY_OTHER must be invisible when looking
+    up cards for branch COMPANY.
+    """
+    await _create_run_with_card(
+        session_maker,
+        card_id="card-other-branch",
+        company_id=COMPANY_OTHER,
+    )
+    async with session_maker() as session:
+        result = await find_existing_campaign_card_for_phone(
+            session,
+            phone_e164=PHONE,
+            campaign_code=CAMPAIGN_CODE,
+            company_id=COMPANY,
+        )
+    assert result == [], "Card from a different company_id must not be returned for the current branch"
+
+
+@pytest.mark.asyncio
+async def test_resolve_no_conflict_when_other_branch_has_cards(
+    session_maker,
+) -> None:
+    """R2: cards in a different branch must NOT produce failed_conflict here.
+
+    Phone has 2 cards total: 1 in COMPANY_OTHER, 1 in COMPANY.
+    The lookup for COMPANY sees only 1 card → reused_existing, not conflict.
+    """
+    # Card in a different branch
+    await _create_run_with_card(
+        session_maker,
+        card_id="card-branch-other",
+        company_id=COMPANY_OTHER,
+    )
+    # Card in the current branch
+    await _create_run_with_card(
+        session_maker,
+        card_id="card-branch-current",
+        company_id=COMPANY,
+    )
+
+    loyalty = _MockLoyalty()
+    async with session_maker() as session:
+        res = await resolve_or_issue_loyalty_card(
+            session,
+            loyalty,
+            phone_e164=PHONE,
+            location_id=LOCATION,
+            card_type_id=CARD_TYPE,
+            campaign_code=CAMPAIGN_CODE,
+            company_id=COMPANY,
+        )
+
+    assert res.outcome == "reused_existing", (
+        f"Expected reused_existing (only 1 card in current branch), got {res.outcome!r}"
+    )
+    assert res.loyalty_card_id == "card-branch-current"
+    assert len(loyalty.issued) == 0, "loyalty.issue_card must NOT be called when reusing existing card"
+
+
+@pytest.mark.asyncio
+async def test_resolve_reuses_same_branch_card_correctly(
+    session_maker,
+) -> None:
+    """R3: same phone with 1 card in the same branch still reuses correctly.
+
+    Sanity-check that scoping does not break the happy-path reuse.
+    """
+    await _create_run_with_card(
+        session_maker,
+        card_id="card-same-branch",
+        company_id=COMPANY,
+    )
+
+    loyalty = _MockLoyalty()
+    async with session_maker() as session:
+        res = await resolve_or_issue_loyalty_card(
+            session,
+            loyalty,
+            phone_e164=PHONE,
+            location_id=LOCATION,
+            card_type_id=CARD_TYPE,
+            campaign_code=CAMPAIGN_CODE,
+            company_id=COMPANY,
+        )
+
+    assert res.outcome == "reused_existing", f"Expected reused_existing for same-branch card, got {res.outcome!r}"
+    assert res.loyalty_card_id == "card-same-branch"
+    assert len(loyalty.issued) == 0

@@ -10,9 +10,14 @@
   * Помечаем клиента cleanup_failed с причиной.
 
 resolve_or_issue_loyalty_card (для CRM-only, client_id=None):
-  * 0 существующих карт → issue_new (API-запрос, может поднять исключение).
-  * 1 существующая карта → reused_existing (без API-запроса).
-  * 2+ карт → failed_conflict (без API-запроса, требует ручного разбора).
+  * 0 существующих карт в том же филиале → issue_new
+    (API-запрос, может поднять исключение).
+  * 1 существующая карта в том же филиале → reused_existing
+    (без API-запроса).
+  * 2+ карт в том же филиале → failed_conflict
+    (без API-запроса, требует ручного разбора).
+  * Карты другого филиала (company_id) не учитываются —
+    cross-branch reuse не происходит.
 """
 
 from __future__ import annotations
@@ -176,15 +181,27 @@ async def find_existing_campaign_card_for_phone(
     *,
     phone_e164: str,
     campaign_code: str,
+    company_id: int,
 ) -> list[tuple[str, str, str]]:
-    """Найти loyalty-карты, уже выпущенные кампанией для phone_e164.
+    """Найти loyalty-карты, выпущенные кампанией для phone_e164 в компании.
 
     Возвращает список кортежей (card_id, card_number, card_type_id) для
-    всех CampaignRecipient, у которых phone_e164 совпадает, кампания
-    совпадает и loyalty_card_id заполнен.
+    всех CampaignRecipient, у которых phone_e164, campaign_code и
+    company_id совпадают, и loyalty_card_id заполнен.
+
+    Фильтрация по company_id обязательна: одинаковый campaign_code
+    используется в нескольких филиалах, и без этого фильтра
+    возможен ложный cross-branch reuse или ложный failed_conflict.
 
     Используется для CRM-only клиентов (client_id=None): у них нет
     локальной записи Client, поэтому поиск выполняется по номеру телефона.
+
+    # TODO: рассмотреть исключение карт, которые уже были помечены
+    # как удалённые (cleanup_card_ids). В текущем потоке CRM-only
+    # клиент не проходит через cleanup_campaign_cards, поэтому
+    # cleanup_card_ids всегда пустой для этих записей — риск низкий.
+    # Если в будущем добавится cleanup для CRM-only, нужно добавить
+    # фильтр аналогично find_campaign_card_ids().
     """
     stmt = (
         select(
@@ -195,6 +212,7 @@ async def find_existing_campaign_card_for_phone(
         .join(CampaignRun, CampaignRun.id == CampaignRecipient.campaign_run_id)
         .where(CampaignRecipient.phone_e164 == phone_e164)
         .where(CampaignRun.campaign_code == campaign_code)
+        .where(CampaignRecipient.company_id == company_id)
         .where(CampaignRecipient.loyalty_card_id.is_not(None))
         .where(CampaignRecipient.loyalty_card_id != "")
     )
@@ -217,19 +235,25 @@ async def resolve_or_issue_loyalty_card(
     location_id: int,
     card_type_id: str,
     campaign_code: str,
+    company_id: int,
 ) -> CardResolution:
     """Переиспользовать существующую карту или выпустить новую.
 
     Матрица решений по числу найденных записей CampaignRecipient для
-    phone_e164 + campaign_code с непустым loyalty_card_id:
+    phone_e164 + campaign_code + company_id с непустым loyalty_card_id:
 
       0 → issue_new: вызывает loyalty.issue_card().
           Поднимает исключение при ошибке API — вызывающий код должен
           трактовать это как card_issue_failed.
-      1 → reused_existing: возвращает данные существующей карты, API не вызывается.
-      2+ → failed_conflict: возвращает CardResolution(outcome='failed_conflict')
-           без API-запроса. Вызывающий код должен безопасно завершить
-           обработку получателя с excluded_reason='card_conflict'.
+      1 → reused_existing: возвращает данные существующей карты,
+          API не вызывается.
+      2+ → failed_conflict: возвращает
+           CardResolution(outcome='failed_conflict') без API-запроса.
+           Вызывающий код должен безопасно завершить обработку
+           получателя с excluded_reason='card_conflict'.
+
+    Карты другого филиала (иной company_id) игнорируются полностью —
+    cross-branch reuse не происходит.
 
     Почему безопаснее прямого issue_card:
       - Повторная попытка send-real для телефона, у которого уже была
@@ -238,7 +262,12 @@ async def resolve_or_issue_loyalty_card(
       - Неоднозначное состояние (2+ карт) становится явным вместо
         молчаливого создания ещё одной карты.
     """
-    existing = await find_existing_campaign_card_for_phone(session, phone_e164=phone_e164, campaign_code=campaign_code)
+    existing = await find_existing_campaign_card_for_phone(
+        session,
+        phone_e164=phone_e164,
+        campaign_code=campaign_code,
+        company_id=company_id,
+    )
 
     if len(existing) > 1:
         card_ids = [c[0] for c in existing]
