@@ -1990,3 +1990,110 @@ async def remove_recipient_from_preview(
         if r is None:
             raise RuntimeError(f"CampaignRecipient {recipient_id} disappeared after removal")
         return r
+
+
+# ==========================================================================
+# Retry: сброс упавшего/застрявшего message_job для одного получателя
+# ==========================================================================
+
+# Статусы OutboxMessage, означающие что сообщение уже доставлено.
+# Дублирует SUCCESS_OUTBOX_STATUSES из outbox_worker, чтобы не создавать
+# циклического импорта.
+_SENT_OUTBOX_STATUSES = frozenset({"sent", "delivered", "read"})
+
+# Статусы MessageJob, которые разрешают принудительный retry.
+# done/running/processing — нельзя: уже выполняется или завершено.
+_JOB_RETRYABLE_STATUSES = frozenset({"failed", "canceled", "queued"})
+
+
+async def retry_recipient_job(recipient_id: int) -> dict:
+    """Безопасный сброс message_job для повторной доставки сообщения.
+
+    Проверяет все guardrails перед изменением состояния:
+      - у получателя есть message_job_id
+      - job существует и имеет тип NEWSLETTER_JOB_TYPE
+      - нет успешного OutboxMessage (дубликат запрещён)
+      - job в допустимом для retry статусе
+
+    Сброс: status='queued', locked_at=None, last_error=None,
+           run_at=now(), attempts=0.
+
+    После retry outbox_worker подберёт job как обычную очередную задачу.
+    После успешной отправки auto-sync (recompute_campaign_run_stats)
+    обновит счётчики run автоматически.
+
+    Возвращает dict с полем ``outcome``:
+      retried              — job сброшен, ждёт обработки
+      already_sent         — есть успешный OutboxMessage, дубликат запрещён
+      no_message_job       — у получателя нет message_job_id или job не найден
+      wrong_job_type       — job не является NEWSLETTER_JOB_TYPE
+      not_retryable        — job в финальном или активном статусе
+      recipient_not_found  — получатель не найден
+    """
+    async with SessionLocal() as session:
+        async with session.begin():
+            recipient = await session.get(CampaignRecipient, recipient_id)
+            if recipient is None:
+                return {"outcome": "recipient_not_found"}
+
+            if not recipient.message_job_id:
+                return {"outcome": "no_message_job"}
+
+            job = await session.get(MessageJob, recipient.message_job_id)
+            if job is None:
+                return {"outcome": "no_message_job"}
+
+            if job.job_type != NEWSLETTER_JOB_TYPE:
+                return {
+                    "outcome": "wrong_job_type",
+                    "job_type": job.job_type,
+                }
+
+            # Duplicate guard: проверить наличие успешного OutboxMessage
+            success_stmt = (
+                select(OutboxMessage)
+                .where(OutboxMessage.job_id == job.id)
+                .where(OutboxMessage.status.in_(_SENT_OUTBOX_STATUSES))
+                .order_by(OutboxMessage.id.desc())
+                .limit(1)
+            )
+            success = (await session.execute(success_stmt)).scalar_one_or_none()
+            if success is not None:
+                return {
+                    "outcome": "already_sent",
+                    "outbox_id": success.id,
+                }
+
+            if job.status not in _JOB_RETRYABLE_STATUSES:
+                return {
+                    "outcome": "not_retryable",
+                    "job_status": job.status,
+                }
+
+            prev_status = job.status
+            prev_attempts = job.attempts
+
+            job.status = "queued"
+            job.locked_at = None
+            job.last_error = None
+            job.run_at = utcnow()
+            job.attempts = 0
+
+            meta = dict(recipient.meta or {})
+            meta["last_manual_retry_at"] = utcnow().isoformat()
+            recipient.meta = meta
+
+    logger.info(
+        "manual_retry recipient_id=%d job_id=%d prev_status=%s prev_attempts=%d",
+        recipient_id,
+        job.id,
+        prev_status,
+        prev_attempts,
+    )
+
+    return {
+        "outcome": "retried",
+        "job_id": job.id,
+        "prev_status": prev_status,
+        "prev_attempts": prev_attempts,
+    }
