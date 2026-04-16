@@ -1072,7 +1072,22 @@ async def _try_recompute_campaign_run_stats(run_id: int) -> None:
 async def process_job(
     job_id: int,
     provider: WhatsAppProvider,
+    *,
+    _pending_recomputes: set[int] | None = None,
 ) -> None:
+    """Process one outbox job in its own session/transaction.
+
+    *_pending_recomputes* is an optional set supplied by batch callers
+    (e.g. ``run_loop``).  When provided, a successful campaign send adds
+    its ``campaign_run_id`` to the set instead of triggering recompute
+    immediately — the caller is responsible for deduplicating and calling
+    :func:`_try_recompute_campaign_run_stats` once per unique run_id
+    after the whole batch is done.
+
+    When *_pending_recomputes* is ``None`` (the default), the function
+    is self-contained: recompute fires right after the commit, which is
+    correct for any caller that processes a single job at a time.
+    """
     campaign_run_id: int | None = None
     async with SessionLocal() as session:
         async with session.begin():
@@ -1081,10 +1096,13 @@ async def process_job(
                 job_id=job_id,
                 provider=provider,
             )
-    # Run stats recompute after the send transaction commits so that any
-    # recompute failure cannot roll back the already-persisted send.
     if campaign_run_id is not None:
-        await _try_recompute_campaign_run_stats(campaign_run_id)
+        if _pending_recomputes is not None:
+            # Deferred / batch mode: caller will flush once per unique run.
+            _pending_recomputes.add(campaign_run_id)
+        else:
+            # Self-contained mode: recompute immediately after this commit.
+            await _try_recompute_campaign_run_stats(campaign_run_id)
 
 
 async def run_loop(
@@ -1119,8 +1137,16 @@ async def run_loop(
             await asyncio.sleep(poll_sec)
             continue
 
+        # Collect campaign run_ids across the whole cycle so that
+        # recompute is called once per unique run, not once per message.
+        pending: set[int] = set()
+
         for idx, jid in enumerate(job_ids):
-            await process_job(job_id=jid, provider=provider)
+            await process_job(
+                job_id=jid,
+                provider=provider,
+                _pending_recomputes=pending,
+            )
 
             if _token_expired() and _stop_worker_on_token_expired():
                 remaining = job_ids[idx + 1 :]
@@ -1133,7 +1159,14 @@ async def run_loop(
                     "Stopping outbox worker: access token expired (requeued %s jobs)",
                     len(remaining),
                 )
+                # Still recompute for runs that did get sent this cycle.
+                for run_id in pending:
+                    await _try_recompute_campaign_run_stats(run_id)
                 return
+
+        # End of cycle: one recompute per unique campaign run.
+        for run_id in pending:
+            await _try_recompute_campaign_run_stats(run_id)
 
 
 async def run_once(

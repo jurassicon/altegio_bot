@@ -592,3 +592,167 @@ async def test_run_job_logic_send_failure_returns_none(
     assert result is None, f"expected None on send failure, got {result!r}"
     # Job should be requeued or failed, not done.
     assert job.status != "done"
+
+
+# ---------------------------------------------------------------------------
+# 16-21. Batch deduplication via _pending_recomputes in run_loop cycle
+# ---------------------------------------------------------------------------
+
+
+def _fake_session_local() -> Any:
+    """Return a patched SessionLocal that needs no real DB connection."""
+
+    class _FakeBeginCtx:
+        async def __aenter__(self) -> Any:
+            return MagicMock()
+
+        async def __aexit__(self, *a: Any) -> None:
+            pass
+
+    class _FakeSession2:
+        def begin(self) -> _FakeBeginCtx:
+            return _FakeBeginCtx()
+
+    class _FakeSessionCtxMgr:
+        async def __aenter__(self) -> _FakeSession2:
+            return _FakeSession2()
+
+        async def __aexit__(self, *a: Any) -> None:
+            pass
+
+    return lambda: _FakeSessionCtxMgr()
+
+
+@pytest.mark.asyncio
+async def test_process_job_deferred_adds_to_set_no_immediate_recompute(
+    monkeypatch: Any,
+) -> None:
+    """_pending_recomputes set receives the run_id; recompute is NOT
+    triggered immediately when a set is passed (deferred/batch mode)."""
+    recompute_calls: list[int] = []
+
+    async def _fake_pjs(session: Any, job_id: int, provider: Any) -> int | None:
+        return 42
+
+    async def _bad_recompute(run_id: int) -> None:
+        recompute_calls.append(run_id)
+
+    monkeypatch.setattr(ow, "process_job_in_session", _fake_pjs)
+    monkeypatch.setattr(ow, "_try_recompute_campaign_run_stats", _bad_recompute)
+    monkeypatch.setattr(ow, "SessionLocal", _fake_session_local())
+
+    pending: set[int] = set()
+    await ow.process_job(job_id=1, provider=MagicMock(), _pending_recomputes=pending)
+
+    assert pending == {42}, f"expected {{42}} in pending, got {pending}"
+    assert recompute_calls == [], "recompute must NOT fire immediately in deferred mode"
+
+
+@pytest.mark.asyncio
+async def test_process_job_deferred_non_campaign_nothing_added(
+    monkeypatch: Any,
+) -> None:
+    """Non-campaign job (run_id=None) leaves the pending set empty."""
+
+    async def _fake_pjs(session: Any, job_id: int, provider: Any) -> int | None:
+        return None
+
+    monkeypatch.setattr(ow, "process_job_in_session", _fake_pjs)
+    monkeypatch.setattr(ow, "SessionLocal", _fake_session_local())
+
+    pending: set[int] = set()
+    await ow.process_job(job_id=2, provider=MagicMock(), _pending_recomputes=pending)
+
+    assert pending == set(), f"pending must stay empty, got {pending}"
+
+
+@pytest.mark.asyncio
+async def test_batch_same_run_id_one_recompute(monkeypatch: Any) -> None:
+    """Multiple campaign sends for the same run_id in one batch cycle
+    result in exactly one recompute call."""
+    recompute_calls: list[int] = []
+
+    async def _fake_pjs(session: Any, job_id: int, provider: Any) -> int | None:
+        return 42  # both jobs belong to run 42
+
+    async def _fake_recompute(run_id: int) -> None:
+        recompute_calls.append(run_id)
+
+    monkeypatch.setattr(ow, "process_job_in_session", _fake_pjs)
+    monkeypatch.setattr(ow, "_try_recompute_campaign_run_stats", _fake_recompute)
+    monkeypatch.setattr(ow, "SessionLocal", _fake_session_local())
+
+    # Simulate run_loop: one pending set shared across the cycle.
+    pending: set[int] = set()
+    await ow.process_job(job_id=1, provider=MagicMock(), _pending_recomputes=pending)
+    await ow.process_job(job_id=2, provider=MagicMock(), _pending_recomputes=pending)
+
+    # Caller (run_loop) flushes after the loop.
+    for run_id in pending:
+        await ow._try_recompute_campaign_run_stats(run_id)
+
+    assert recompute_calls == [42], f"expected exactly one recompute(42), got {recompute_calls}"
+
+
+@pytest.mark.asyncio
+async def test_batch_different_run_ids_one_recompute_each(
+    monkeypatch: Any,
+) -> None:
+    """Campaign sends for two different run_ids each get one recompute."""
+    recompute_calls: list[int] = []
+
+    async def _fake_pjs(session: Any, job_id: int, provider: Any) -> int | None:
+        # job_id doubles as run_id (42 and 43 passed as job_ids below).
+        return job_id
+
+    async def _fake_recompute(run_id: int) -> None:
+        recompute_calls.append(run_id)
+
+    monkeypatch.setattr(ow, "process_job_in_session", _fake_pjs)
+    monkeypatch.setattr(ow, "_try_recompute_campaign_run_stats", _fake_recompute)
+    monkeypatch.setattr(ow, "SessionLocal", _fake_session_local())
+
+    pending: set[int] = set()
+    await ow.process_job(job_id=42, provider=MagicMock(), _pending_recomputes=pending)
+    await ow.process_job(job_id=43, provider=MagicMock(), _pending_recomputes=pending)
+
+    for run_id in pending:
+        await ow._try_recompute_campaign_run_stats(run_id)
+
+    assert sorted(recompute_calls) == [42, 43], f"expected one recompute per run, got {recompute_calls}"
+
+
+@pytest.mark.asyncio
+async def test_batch_recompute_fires_after_all_sends_not_during(
+    monkeypatch: Any,
+) -> None:
+    """Recompute events must appear after all send events, never interleaved.
+
+    Timeline we want:  send_1 → send_2 → recompute_42
+    Broken timeline:   send_1 → recompute_42 → send_2
+    """
+    events: list[str] = []
+
+    async def _fake_pjs(session: Any, job_id: int, provider: Any) -> int | None:
+        events.append(f"send_{job_id}")
+        return 42
+
+    async def _fake_recompute(run_id: int) -> None:
+        events.append(f"recompute_{run_id}")
+
+    monkeypatch.setattr(ow, "process_job_in_session", _fake_pjs)
+    monkeypatch.setattr(ow, "_try_recompute_campaign_run_stats", _fake_recompute)
+    monkeypatch.setattr(ow, "SessionLocal", _fake_session_local())
+
+    pending: set[int] = set()
+    await ow.process_job(job_id=1, provider=MagicMock(), _pending_recomputes=pending)
+    await ow.process_job(job_id=2, provider=MagicMock(), _pending_recomputes=pending)
+    # Caller triggers recompute after the loop.
+    for run_id in pending:
+        await ow._try_recompute_campaign_run_stats(run_id)
+
+    send_indices = [i for i, e in enumerate(events) if e.startswith("send_")]
+    recompute_indices = [i for i, e in enumerate(events) if e.startswith("recompute_")]
+
+    assert send_indices and recompute_indices, f"unexpected events: {events}"
+    assert max(send_indices) < min(recompute_indices), f"recompute must fire after all sends; events={events}"
