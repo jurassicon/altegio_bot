@@ -140,7 +140,7 @@ async def chatwoot_ingest(request: Request) -> JSONResponse:
         if settings.chatwoot_operator_relay_enabled and sender_type in _HUMAN_SENDER_TYPES:
             return await _ingest_operator_outgoing(request, payload)
 
-        logger.debug(
+        logger.info(
             "chatwoot_webhook: skipping outgoing relay_enabled=%s sender_type=%s",
             settings.chatwoot_operator_relay_enabled,
             sender_type,
