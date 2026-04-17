@@ -87,5 +87,10 @@ class Settings(BaseSettings):
     chatwoot_account_id: int = 0
     chatwoot_webhook_secret: str = ""
 
+    # Meta-first cutover: route Chatwoot operator replies through
+    # altegio_bot → Meta instead of relying on Chatwoot WhatsApp inbox.
+    # Default False (safe). Enable only after verifying no double-send risk.
+    chatwoot_operator_relay_enabled: bool = False
+
 
 settings = Settings()

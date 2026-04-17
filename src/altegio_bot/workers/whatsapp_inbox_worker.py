@@ -23,6 +23,7 @@ from altegio_bot.models.models import (
 from altegio_bot.perf import perf_log
 from altegio_bot.providers.base import WhatsAppProvider
 from altegio_bot.providers.dummy import safe_send
+from altegio_bot.settings import settings
 
 logger = logging.getLogger("whatsapp_inbox_worker")
 
@@ -131,6 +132,17 @@ def _parse_command(text: str) -> str | None:
     return None
 
 
+def _is_operator_relay(payload: dict[str, Any]) -> bool:
+    """Return True if this event is an operator relay from Chatwoot.
+
+    Operator relay events carry _chatwoot_operator_relay in the payload,
+    written by the Chatwoot webhook handler.  They must be sent to Meta,
+    NOT forwarded back to Chatwoot (that would duplicate the message the
+    operator already sees in their own Chatwoot UI).
+    """
+    return "_chatwoot_operator_relay" in payload
+
+
 def _is_chatwoot_origin(event: WhatsAppEvent, payload: dict[str, Any]) -> bool:
     """Return True if this event originated from Chatwoot (not from Meta directly).
 
@@ -165,6 +177,71 @@ async def _pick_sender(
         return None, None
 
     return int(sender.id), int(sender.company_id)
+
+
+async def _resolve_relay_sender(
+    session: AsyncSession,
+    phone_number_id: str | None,
+) -> tuple[int | None, int | None, str | None]:
+    """Strict, fail-closed sender resolution for operator relay.
+
+    Returns (sender_id, company_id, error).
+    error is None on success; non-None means the relay must be blocked.
+
+    Resolution rules (in order):
+    - 0 active senders → error.
+    - Active senders span >1 distinct company_ids → ambiguous error.
+      Picking one would silently route through the wrong company context.
+    - Multiple active senders but all in the same company → pick
+      deterministically to avoid arbitrary ordering:
+        1. prefer sender_code == 'default';
+        2. fallback: sender with the lowest id.
+    """
+    if not phone_number_id:
+        return None, None, "operator_relay: missing phone_number_id"
+
+    stmt = (
+        select(WhatsAppSender)
+        .where(WhatsAppSender.phone_number_id == phone_number_id)
+        .where(WhatsAppSender.is_active.is_(True))
+    )
+    res = await session.execute(stmt)
+    senders = list(res.scalars().all())
+
+    if not senders:
+        return (
+            None,
+            None,
+            f"operator_relay: no active sender for phone_number_id={phone_number_id}",
+        )
+
+    distinct_companies = {s.company_id for s in senders}
+
+    if len(distinct_companies) > 1:
+        cids = sorted(str(c) for c in distinct_companies)
+        logger.warning(
+            "operator_relay: ambiguous sender routing "
+            "phone_number_id=%s matched %d senders "
+            "across %d company_ids=%s — blocking send",
+            phone_number_id,
+            len(senders),
+            len(distinct_companies),
+            ",".join(cids),
+        )
+        return (
+            None,
+            None,
+            f"operator_relay: ambiguous sender routing for "
+            f"phone_number_id={phone_number_id} "
+            f"(matched {len(senders)} senders across "
+            f"company_ids={','.join(cids)})",
+        )
+
+    # All senders belong to the same company.
+    # Deterministic selection: prefer sender_code='default', else min id.
+    default_senders = [s for s in senders if s.sender_code == "default"]
+    chosen = (default_senders or sorted(senders, key=lambda s: s.id))[0]
+    return int(chosen.id), int(chosen.company_id), None
 
 
 def _phone_variants(phone_e164: str) -> list[str]:
@@ -437,12 +514,141 @@ async def _apply_status_updates(
     return [int(r) for r in cr_res.scalars().all()]
 
 
+async def _handle_operator_relay(
+    session: AsyncSession,
+    event: WhatsAppEvent,
+    payload: dict[str, Any],
+    provider: WhatsAppProvider,
+) -> None:
+    """Send operator reply from Chatwoot through Meta API.
+
+    Creates an OutboxMessage with message_source='operator' so subsequent
+    Meta delivery/read webhooks can be matched to this canonical record.
+
+    Guard: this function is only called when chatwoot_operator_relay_enabled
+    is True (checked in handle_event).
+    """
+    relay = payload.get("_chatwoot_operator_relay") or {}
+    phone_e164 = relay.get("recipient_phone")
+    text = relay.get("text", "")
+    conversation_id = relay.get("conversation_id")
+    chatwoot_message_id = relay.get("message_id")
+    phone_number_id = relay.get("phone_number_id")
+    agent_name = relay.get("agent_name", "")
+
+    if not phone_e164 or not text:
+        logger.warning(
+            "operator_relay: missing recipient_phone or text conv_id=%s msg_id=%s — skipping",
+            conversation_id,
+            chatwoot_message_id,
+        )
+        event.error = "operator_relay: missing recipient_phone or text"
+        return
+
+    sender_id, company_id, routing_err = await _resolve_relay_sender(session, phone_number_id)
+
+    if routing_err is not None:
+        logger.warning(
+            "operator_relay: routing blocked conv_id=%s msg_id=%s phone_number_id=%s err=%s",
+            conversation_id,
+            chatwoot_message_id,
+            phone_number_id,
+            routing_err,
+        )
+        event.error = routing_err
+        return
+
+    logger.info(
+        "operator_relay: accepted conv_id=%s msg_id=%s phone=%s phone_number_id=%s sender_id=%s company_id=%s agent=%s",
+        conversation_id,
+        chatwoot_message_id,
+        phone_e164,
+        phone_number_id,
+        sender_id,
+        company_id,
+        agent_name,
+    )
+
+    wamid, err = await safe_send(
+        provider=provider,
+        sender_id=sender_id,
+        phone=phone_e164,
+        text=text,
+        company_id=company_id,
+    )
+
+    if err is not None:
+        logger.warning(
+            "operator_relay: send failed phone=%s sender_id=%s err=%s",
+            phone_e164,
+            sender_id,
+            err,
+        )
+        event.error = f"operator_relay: send failed: {err}"
+        return
+
+    logger.info(
+        "operator_relay: sent phone=%s wamid=%s sender_id=%s company_id=%s",
+        phone_e164,
+        wamid,
+        sender_id,
+        company_id,
+    )
+
+    now = utcnow()
+    outbox = OutboxMessage(
+        company_id=company_id,
+        client_id=None,
+        record_id=None,
+        job_id=None,
+        sender_id=sender_id,
+        phone_e164=phone_e164,
+        template_code="operator_relay",
+        language="de",
+        body=text,
+        status="sent",
+        provider_message_id=wamid,
+        scheduled_at=now,
+        sent_at=now,
+        message_source="operator",
+        meta={
+            "chatwoot_conversation_id": conversation_id,
+            "chatwoot_message_id": chatwoot_message_id,
+            "agent_name": agent_name,
+        },
+    )
+    session.add(outbox)
+    await session.flush()
+
+    logger.info(
+        "operator_relay: outbox created outbox_id=%s wamid=%s phone=%s company_id=%s",
+        outbox.id,
+        wamid,
+        phone_e164,
+        company_id,
+    )
+
+
 async def handle_event(
     session: AsyncSession,
     event: WhatsAppEvent,
     provider: WhatsAppProvider,
 ) -> None:
     payload = event.payload or {}
+
+    # ------------------------------------------------------------------ #
+    # 0. Operator relay: Chatwoot outgoing → Meta (Meta-first path)       #
+    # ------------------------------------------------------------------ #
+    if _is_operator_relay(payload):
+        if settings.chatwoot_operator_relay_enabled:
+            await _handle_operator_relay(session, event, payload, provider)
+        else:
+            logger.warning(
+                "operator_relay: event received but chatwoot_operator_relay_enabled=False, skipping event_id=%s",
+                event.id,
+            )
+            event.error = "operator_relay: disabled by chatwoot_operator_relay_enabled"
+        return
 
     # ------------------------------------------------------------------ #
     # 1. Delivery status webhooks (value.statuses)                        #
