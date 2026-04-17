@@ -716,7 +716,12 @@ async def handle_event(
                 await cw.log_incoming_message(phone_e164, text, contact_name=client_name)
                 logger.info("Forwarded incoming message to Chatwoot phone=%s name=%s", phone_e164, client_name)
             except Exception as exc:
-                logger.warning("Failed to forward to Chatwoot phone=%s err=%s", phone_e164, exc)
+                logger.warning(
+                    "chatwoot: forward failed phone=%s %s: %s",
+                    phone_e164,
+                    type(exc).__name__,
+                    exc,
+                )
             finally:
                 await cw.aclose()
 

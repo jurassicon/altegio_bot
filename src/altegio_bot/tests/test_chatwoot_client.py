@@ -77,17 +77,24 @@ async def test_get_or_create_conversation_returns_open(client: ChatwootClient) -
 
 @respx.mock
 @pytest.mark.asyncio
-async def test_get_or_create_conversation_creates_when_none(client: ChatwootClient) -> None:
-    """Should create a conversation when no open one exists."""
+async def test_get_or_create_conversation_creates_when_none(
+    client: ChatwootClient,
+) -> None:
+    """Should create a conversation with status=open when none exist."""
     respx.get("https://chatwoot.example.com/api/v1/accounts/1/contacts/42/conversations").mock(
         return_value=httpx.Response(200, json={"payload": []})
     )
-    respx.post("https://chatwoot.example.com/api/v1/accounts/1/conversations").mock(
+    create_route = respx.post("https://chatwoot.example.com/api/v1/accounts/1/conversations").mock(
         return_value=httpx.Response(200, json={"id": 15, "status": "open"})
     )
 
     conv_id = await client.get_or_create_conversation(42)
     assert conv_id == 15
+
+    body = json.loads(create_route.calls[0].request.content)
+    assert body["status"] == "open"
+    assert body["inbox_id"] == 2
+    assert body["contact_id"] == 42
 
 
 @respx.mock
@@ -167,6 +174,81 @@ async def test_mirror_outbound_as_note_with_contact_name(client: ChatwootClient)
     assert create_mock.called
     create_body = json.loads(create_mock.calls[0].request.content)
     assert create_body["name"] == "Alice Müller"
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_log_incoming_message_logs_success(
+    client: ChatwootClient,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """log_incoming_message should emit INFO with phone/ids on success."""
+    respx.get("https://chatwoot.example.com/api/v1/accounts/1/contacts/search").mock(
+        return_value=httpx.Response(200, json={"payload": [{"id": 5, "phone_number": "+49111222333"}]})
+    )
+    respx.get("https://chatwoot.example.com/api/v1/accounts/1/contacts/5/conversations").mock(
+        return_value=httpx.Response(200, json={"payload": [{"id": 20, "inbox_id": 2, "status": "open"}]})
+    )
+    respx.post("https://chatwoot.example.com/api/v1/accounts/1/conversations/20/messages").mock(
+        return_value=httpx.Response(200, json={"id": 200, "content": "Hi"})
+    )
+
+    import logging
+
+    with caplog.at_level(logging.INFO, logger="altegio_bot.chatwoot_client"):
+        conv_id, msg_id = await client.log_incoming_message("+49111222333", "Hi")
+
+    assert conv_id == 20
+    assert msg_id == 200
+    assert "+49111222333" in caplog.text
+    assert "20" in caplog.text
+    assert "200" in caplog.text
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_send_message_error_logs_response_body(
+    client: ChatwootClient,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """On HTTP error, _log_and_raise should log status code and body."""
+    respx.post("https://chatwoot.example.com/api/v1/accounts/1/conversations/15/messages").mock(
+        return_value=httpx.Response(422, json={"error": "unprocessable entity"})
+    )
+
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="altegio_bot.chatwoot_client"):
+        with pytest.raises(httpx.HTTPStatusError):
+            await client.send_message(15, "Hello", message_type="incoming")
+
+    assert "422" in caplog.text
+    assert "unprocessable entity" in caplog.text
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_get_or_create_conversation_reopens_resolved(
+    client: ChatwootClient,
+) -> None:
+    """Should reopen most recent resolved conversation, not create new."""
+    respx.get("https://chatwoot.example.com/api/v1/accounts/1/contacts/42/conversations").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "payload": [
+                    {"id": 10, "inbox_id": 2, "status": "resolved", "created_at": 100},
+                ]
+            },
+        )
+    )
+    toggle_route = respx.post("https://chatwoot.example.com/api/v1/accounts/1/conversations/10/toggle_status").mock(
+        return_value=httpx.Response(200, json={"id": 10, "status": "open"})
+    )
+
+    conv_id = await client.get_or_create_conversation(42)
+    assert conv_id == 10
+    assert toggle_route.called
 
 
 @respx.mock

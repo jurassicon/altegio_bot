@@ -19,6 +19,18 @@ from altegio_bot.settings import settings
 logger = logging.getLogger(__name__)
 
 
+def _log_and_raise(res: httpx.Response, ctx: str) -> None:
+    """Log response body on error, then raise via raise_for_status."""
+    if res.is_error:
+        logger.warning(
+            "chatwoot: %s failed status=%s body=%.300s",
+            ctx,
+            res.status_code,
+            res.text,
+        )
+        res.raise_for_status()
+
+
 class ChatwootClient:
     """Async Chatwoot API client."""
 
@@ -90,7 +102,7 @@ class ChatwootClient:
             headers=self._headers(),
             json=body,
         )
-        res.raise_for_status()
+        _log_and_raise(res, "create_contact")
         data = res.json()
         contact_id = data.get("id") or (data.get("payload") or {}).get("contact", {}).get("id")
         if contact_id is None:
@@ -188,9 +200,10 @@ class ChatwootClient:
             json={
                 "inbox_id": self._inbox_id,
                 "contact_id": contact_id,
+                "status": "open",
             },
         )
-        create_res.raise_for_status()
+        _log_and_raise(create_res, "create_conversation")
         data = create_res.json()
         conv_id = data.get("id")
         if conv_id is None:
@@ -225,7 +238,7 @@ class ChatwootClient:
             body["private"] = private
 
         res = await self._client.post(url, headers=self._headers(), json=body)
-        res.raise_for_status()
+        _log_and_raise(res, "send_message")
         data: dict[str, Any] = res.json()
         msg_id = data.get("id")
         if msg_id is None:
@@ -254,6 +267,13 @@ class ChatwootClient:
             conversation_id,
             content,
             message_type="incoming",
+        )
+        logger.info(
+            "chatwoot: incoming logged phone=%s contact_id=%s conversation_id=%s message_id=%s",
+            phone_e164,
+            contact_id,
+            conversation_id,
+            message_id,
         )
         return conversation_id, message_id
 
