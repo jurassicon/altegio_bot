@@ -146,7 +146,7 @@ jobs:
             fi
 
             echo "⚙️ Applying DB Migrations..."
-            docker compose run --rm --no-deps altegio-api /app/.venv/bin/alembic upgrade head
+            docker compose run --rm --no-deps altegio-api /app/.venv/bin/alembic upgrade heads
 
             echo "🚀 Starting updated containers..."
             docker compose up -d --remove-orphans
