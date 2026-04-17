@@ -6,11 +6,6 @@ import logging
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s %(levelname)s %(name)s: %(message)s',
-)
 from sqlalchemy.exc import IntegrityError
 
 from .db import SessionLocal
@@ -21,6 +16,11 @@ from .ops.router import router as ops_router
 from .settings import settings
 from .webhooks.chatwoot import router as chatwoot_router
 from .webhooks.whatsapp import router as whatsapp_router
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 
 app = FastAPI(title=settings.app_name)
 app.include_router(whatsapp_router)
