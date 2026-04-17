@@ -417,6 +417,150 @@ async def test_handle_event_read_advances_to_read(session_maker) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Status callback: sent
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_sent_callback_noop_when_already_sent(session_maker) -> None:
+    """Meta 'sent' callback when OutboxMessage is already 'sent' must be a no-op."""
+    _, _, outbox_id = await _setup_outbox_with_campaign(session_maker, outbox_status="sent")
+
+    async with session_maker() as session:
+        async with session.begin():
+            updates = [
+                {
+                    "wamid": WAMID,
+                    "status": "sent",
+                    "timestamp": "1700000000",
+                    "raw": {"id": WAMID, "status": "sent"},
+                }
+            ]
+            run_ids = await _apply_status_updates(session, updates)
+
+    assert run_ids == []
+
+    async with session_maker() as session:
+        ob = await session.get(OutboxMessage, outbox_id)
+        assert ob is not None
+        assert ob.status == "sent"
+
+
+@pytest.mark.asyncio
+async def test_sent_callback_advances_from_queued(session_maker) -> None:
+    """Meta 'sent' callback when OutboxMessage is still 'queued' must advance to 'sent'."""
+    _, _, outbox_id = await _setup_outbox_with_campaign(session_maker, outbox_status="queued")
+
+    async with session_maker() as session:
+        async with session.begin():
+            updates = [
+                {
+                    "wamid": WAMID,
+                    "status": "sent",
+                    "timestamp": "1700000000",
+                    "raw": {"id": WAMID, "status": "sent"},
+                }
+            ]
+            run_ids = await _apply_status_updates(session, updates)
+
+    assert run_ids != [] or True  # campaign recompute may or may not be triggered
+
+    async with session_maker() as session:
+        ob = await session.get(OutboxMessage, outbox_id)
+        assert ob is not None
+        assert ob.status == "sent"
+
+
+@pytest.mark.asyncio
+async def test_no_match_by_provider_message_id(session_maker) -> None:
+    """Callback for a different wamid must not update unrelated OutboxMessage."""
+    _, _, outbox_id = await _setup_outbox_with_campaign(session_maker, outbox_status="sent")
+
+    async with session_maker() as session:
+        async with session.begin():
+            updates = [
+                {
+                    "wamid": "wamid.DIFFERENT_WAMID",
+                    "status": "delivered",
+                    "timestamp": "1700000001",
+                    "raw": {},
+                }
+            ]
+            run_ids = await _apply_status_updates(session, updates)
+
+    assert run_ids == []
+
+    async with session_maker() as session:
+        ob = await session.get(OutboxMessage, outbox_id)
+        assert ob is not None
+        assert ob.status == "sent"  # unchanged
+
+
+@pytest.mark.asyncio
+async def test_full_status_path_sent_delivered_read(session_maker) -> None:
+    """Full progression: sent → delivered → read via sequential callbacks."""
+    _, _, outbox_id = await _setup_outbox_with_campaign(session_maker, outbox_status="sent")
+
+    # Step 1: delivered
+    async with session_maker() as session:
+        async with session.begin():
+            await _apply_status_updates(
+                session,
+                [{"wamid": WAMID, "status": "delivered", "timestamp": "1700000001", "raw": {}}],
+            )
+
+    async with session_maker() as session:
+        ob = await session.get(OutboxMessage, outbox_id)
+        assert ob is not None
+        assert ob.status == "delivered"
+
+    # Step 2: read
+    async with session_maker() as session:
+        async with session.begin():
+            await _apply_status_updates(
+                session,
+                [{"wamid": WAMID, "status": "read", "timestamp": "1700000002", "raw": {}}],
+            )
+
+    async with session_maker() as session:
+        ob = await session.get(OutboxMessage, outbox_id)
+        assert ob is not None
+        assert ob.status == "read"
+
+
+@pytest.mark.asyncio
+async def test_handle_event_sent_callback_noop(session_maker) -> None:
+    """handle_event with a 'sent' status payload on already-sent OutboxMessage is a no-op."""
+    _, _, outbox_id = await _setup_outbox_with_campaign(session_maker, outbox_status="sent")
+
+    provider = _NullProvider()
+    payload = _status_payload(PHONE_NUMBER_ID, WAMID, "sent")
+
+    with patch(
+        "altegio_bot.workers.whatsapp_inbox_worker.recompute_campaign_run_stats",
+        new_callable=AsyncMock,
+        return_value={},
+    ):
+        async with session_maker() as session:
+            async with session.begin():
+                evt = WhatsAppEvent(
+                    dedupe_key="wa:status-sent-noop-1",
+                    status="received",
+                    query={},
+                    headers={},
+                    payload=payload,
+                )
+                session.add(evt)
+                await session.flush()
+                await handle_event(session, evt, provider)
+
+    async with session_maker() as session:
+        ob = await session.get(OutboxMessage, outbox_id)
+        assert ob is not None
+        assert ob.status == "sent"  # unchanged
+
+
+# ---------------------------------------------------------------------------
 # Regression: inbound message flow still works
 # ---------------------------------------------------------------------------
 

@@ -271,3 +271,5 @@ async def client_has_future_appointments(
             return True
 
     return False
+
+

@@ -447,6 +447,12 @@ async def _apply_status_updates(
 
     wamids = [u["wamid"] for u in status_updates]
 
+    logger.info(
+        "status_webhook: processing %d update(s) wamids=%s",
+        len(status_updates),
+        wamids,
+    )
+
     stmt = select(OutboxMessage).where(OutboxMessage.provider_message_id.in_(wamids))
     res = await session.execute(stmt)
     outbox_by_wamid: dict[str, OutboxMessage] = {}
@@ -461,8 +467,8 @@ async def _apply_status_updates(
         new_status = upd["status"]
         ob = outbox_by_wamid.get(wamid)
         if ob is None:
-            logger.debug(
-                "status_webhook: no OutboxMessage wamid=%s status=%s",
+            logger.info(
+                "status_webhook: no OutboxMessage matched wamid=%s status=%s",
                 wamid,
                 new_status,
             )
@@ -655,6 +661,11 @@ async def handle_event(
     # ------------------------------------------------------------------ #
     status_updates = _extract_status_updates(payload)
     if status_updates:
+        logger.info(
+            "status_webhook: received %d status update(s) event_id=%s",
+            len(status_updates),
+            event.id,
+        )
         run_ids = await _apply_status_updates(session, status_updates)
         for run_id in run_ids:
             try:
