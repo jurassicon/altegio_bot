@@ -2,9 +2,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s %(name)s: %(message)s',
+)
 from sqlalchemy.exc import IntegrityError
 
 from .db import SessionLocal
