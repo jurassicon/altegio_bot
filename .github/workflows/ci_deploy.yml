@@ -111,42 +111,49 @@ jobs:
           port: ${{ secrets.SSH_PORT }}
           script: |
             set -euo pipefail
-            
+
             cd /opt/altegio_bot
-            
+
             echo "📦 Fetching new code..."
             git fetch origin main
             git reset --hard origin/main
-            
-            echo "🚀 Deployment with Orphan removal..."
-            docker compose up -d --build --remove-orphans
-            
+
+            echo "🔨 Building new images (without starting containers)..."
+            docker compose build
+
             echo "⏳ Waiting for Postgres to be healthy..."
             MAX_ATTEMPTS=60
             ATTEMPTS=0
-            
+
             # Ищем контейнер, который принадлежит сервису postgres.
             until [ $ATTEMPTS -ge $MAX_ATTEMPTS ]; do
                 # Находим имя контейнера базы данных, как бы он ни назывался
                 DB_CONTAINER=$(docker ps --filter "label=com.docker.compose.service=postgres" --filter "label=com.docker.compose.project=altegio_bot" --format "{{.Names}}" | head -n 1)
-            
+
                 if [ -n "$DB_CONTAINER" ] && [ "$(docker inspect -f '{{.State.Health.Status}}' $DB_CONTAINER)" == "healthy" ]; then
                     echo "✅ Postgres ($DB_CONTAINER) is ready!"
                     break
                 fi
-            
+
                 ATTEMPTS=$((ATTEMPTS + 1))
                 echo "... waiting for database ($ATTEMPTS/$MAX_ATTEMPTS) ..."
                 sleep 1
             done
-            
+
+            if [ $ATTEMPTS -ge $MAX_ATTEMPTS ]; then
+                echo "❌ Timed out waiting for Postgres"
+                exit 1
+            fi
+
             echo "⚙️ Applying DB Migrations..."
-            API_CONTAINER=$(docker ps --filter "label=com.docker.compose.service=altegio-api" --filter "label=com.docker.compose.project=altegio_bot" --format "{{.Names}}" | head -n 1)
-            docker exec "$API_CONTAINER" /app/.venv/bin/alembic upgrade head
-            
+            docker compose run --rm --no-deps altegio-api /app/.venv/bin/alembic upgrade head
+
+            echo "🚀 Starting updated containers..."
+            docker compose up -d --remove-orphans
+
             echo "🧹 Aggressive cleanup of unused images..."
             docker image prune -af
-            
+
             echo "✅ Done! Containers status:"
             docker compose ps
 
