@@ -1326,3 +1326,255 @@ async def test_ambiguous_sender_logs_warning(session_maker, caplog) -> None:
     assert any("PNID_WARN" in m for m in warning_messages), (
         f"expected phone_number_id in warning, got: {warning_messages}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Tests: inbox_company_map routing
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_resolve_relay_sender_with_company_hint(session_maker) -> None:
+    """company_id_hint resolves ambiguous phone_number_id to correct company."""
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(
+                WhatsAppSender(
+                    id=140,
+                    company_id=758285,
+                    sender_code="default",
+                    phone_number_id="PNID_HINT",
+                    display_phone="+49",
+                    is_active=True,
+                )
+            )
+            session.add(
+                WhatsAppSender(
+                    id=141,
+                    company_id=1271200,
+                    sender_code="default",
+                    phone_number_id="PNID_HINT",
+                    display_phone="+49",
+                    is_active=True,
+                )
+            )
+
+        sid, cid, err = await _resolve_relay_sender(session, "PNID_HINT", company_id_hint=758285)
+
+    assert err is None
+    assert cid == 758285
+    assert sid == 140
+
+
+@pytest.mark.asyncio
+async def test_relay_with_inbox_company_map(session_maker, monkeypatch) -> None:
+    """CHATWOOT_INBOX_COMPANY_MAP disambiguates relay for two company_ids."""
+    monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
+    provider = _FakeProvider(wamid="wamid.INBOX_MAP")
+
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(
+                WhatsAppSender(
+                    id=150,
+                    company_id=758285,
+                    sender_code="default",
+                    phone_number_id="PNID_MAP",
+                    display_phone="+49",
+                    is_active=True,
+                )
+            )
+            session.add(
+                WhatsAppSender(
+                    id=151,
+                    company_id=1271200,
+                    sender_code="default",
+                    phone_number_id="PNID_MAP",
+                    display_phone="+49",
+                    is_active=True,
+                )
+            )
+
+            relay_payload: dict[str, Any] = {
+                "_chatwoot_operator_relay": {
+                    "recipient_phone": "+49123000000",
+                    "text": "Hello via inbox map",
+                    "conversation_id": 1001,
+                    "message_id": 2001,
+                    "phone_number_id": "PNID_MAP",
+                    "chatwoot_inbox_id": 8,
+                    "agent_name": "Test",
+                    "agent_id": 1,
+                },
+            }
+            evt = WhatsAppEvent(
+                dedupe_key="chatwoot_out:1001:2001",
+                status="received",
+                error=None,
+                query={},
+                headers={},
+                payload=relay_payload,
+                chatwoot_conversation_id=1001,
+            )
+            session.add(evt)
+            await session.flush()
+
+            from altegio_bot.settings import settings as _s
+
+            orig_relay = _s.chatwoot_operator_relay_enabled
+            orig_map = _s.chatwoot_inbox_company_map
+            _s.chatwoot_operator_relay_enabled = True
+            _s.chatwoot_inbox_company_map = '{"8": 758285, "7": 1271200}'
+            try:
+                await handle_event(session, evt, provider)
+            finally:
+                _s.chatwoot_operator_relay_enabled = orig_relay
+                _s.chatwoot_inbox_company_map = orig_map
+
+    assert len(provider.sent) == 1
+    async with session_maker() as session:
+        result = await session.execute(
+            select(OutboxMessage).where(OutboxMessage.provider_message_id == "wamid.INBOX_MAP")
+        )
+        ob = result.scalar_one_or_none()
+    assert ob is not None
+    assert ob.company_id == 758285
+    assert ob.sender_id == 150
+
+
+@pytest.mark.asyncio
+async def test_relay_inbox_not_in_map_fail_closed(session_maker) -> None:
+    """inbox_id present, map configured but inbox_id absent → fail-closed."""
+    provider = _FakeProvider()
+
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(
+                WhatsAppSender(
+                    id=160,
+                    company_id=758285,
+                    sender_code="default",
+                    phone_number_id="PNID_NOMAP",
+                    display_phone="+49",
+                    is_active=True,
+                )
+            )
+
+            relay_payload: dict[str, Any] = {
+                "_chatwoot_operator_relay": {
+                    "recipient_phone": "+49111000000",
+                    "text": "Missing inbox",
+                    "conversation_id": 1002,
+                    "message_id": 2002,
+                    "phone_number_id": "PNID_NOMAP",
+                    "chatwoot_inbox_id": 99,
+                    "agent_name": "Test",
+                    "agent_id": 1,
+                },
+            }
+            evt = WhatsAppEvent(
+                dedupe_key="chatwoot_out:1002:2002",
+                status="received",
+                error=None,
+                query={},
+                headers={},
+                payload=relay_payload,
+                chatwoot_conversation_id=1002,
+            )
+            session.add(evt)
+            await session.flush()
+            evt_id = evt.id
+
+            from altegio_bot.settings import settings as _s
+
+            orig_relay = _s.chatwoot_operator_relay_enabled
+            orig_map = _s.chatwoot_inbox_company_map
+            _s.chatwoot_operator_relay_enabled = True
+            _s.chatwoot_inbox_company_map = '{"8": 758285}'  # 99 absent
+            try:
+                await handle_event(session, evt, provider)
+            finally:
+                _s.chatwoot_operator_relay_enabled = orig_relay
+                _s.chatwoot_inbox_company_map = orig_map
+
+    assert len(provider.sent) == 0
+    async with session_maker() as session:
+        reloaded = await session.get(WhatsAppEvent, evt_id)
+    assert reloaded is not None
+    assert reloaded.error is not None
+    assert "fail-closed" in reloaded.error
+    assert "99" in reloaded.error
+
+
+@pytest.mark.asyncio
+async def test_relay_ambiguous_without_map_still_blocks(
+    session_maker,
+) -> None:
+    """Safety guard intact: no map + ambiguous phone_number_id → still blocked."""
+    provider = _FakeProvider()
+
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(
+                WhatsAppSender(
+                    id=170,
+                    company_id=11,
+                    sender_code="default",
+                    phone_number_id="PNID_NOMAP2",
+                    display_phone="+49",
+                    is_active=True,
+                )
+            )
+            session.add(
+                WhatsAppSender(
+                    id=171,
+                    company_id=22,
+                    sender_code="default",
+                    phone_number_id="PNID_NOMAP2",
+                    display_phone="+49",
+                    is_active=True,
+                )
+            )
+
+            relay_payload: dict[str, Any] = {
+                "_chatwoot_operator_relay": {
+                    "recipient_phone": "+49000111222",
+                    "text": "No hint",
+                    "conversation_id": 1003,
+                    "message_id": 2003,
+                    "phone_number_id": "PNID_NOMAP2",
+                    "agent_name": "Test",
+                    "agent_id": 1,
+                },
+            }
+            evt = WhatsAppEvent(
+                dedupe_key="chatwoot_out:1003:2003",
+                status="received",
+                error=None,
+                query={},
+                headers={},
+                payload=relay_payload,
+                chatwoot_conversation_id=1003,
+            )
+            session.add(evt)
+            await session.flush()
+            evt_id = evt.id
+
+            from altegio_bot.settings import settings as _s
+
+            orig_relay = _s.chatwoot_operator_relay_enabled
+            orig_map = _s.chatwoot_inbox_company_map
+            _s.chatwoot_operator_relay_enabled = True
+            _s.chatwoot_inbox_company_map = "{}"  # not configured
+            try:
+                await handle_event(session, evt, provider)
+            finally:
+                _s.chatwoot_operator_relay_enabled = orig_relay
+                _s.chatwoot_inbox_company_map = orig_map
+
+    assert len(provider.sent) == 0
+    async with session_maker() as session:
+        reloaded = await session.get(WhatsAppEvent, evt_id)
+    assert reloaded is not None
+    assert reloaded.error is not None
+    assert "ambiguous" in reloaded.error

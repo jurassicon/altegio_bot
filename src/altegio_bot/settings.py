@@ -92,5 +92,12 @@ class Settings(BaseSettings):
     # Default False (safe). Enable only after verifying no double-send risk.
     chatwoot_operator_relay_enabled: bool = False
 
+    # JSON mapping Chatwoot inbox_id -> company_id for operator relay.
+    # Required when multiple company_ids share the same WA phone_number_id.
+    # Example: CHATWOOT_INBOX_COMPANY_MAP={"8": 758285, "7": 1271200}
+    # If empty (default) — routing falls back to phone_number_id only.
+    # If non-empty and inbox_id not found — relay is fail-closed.
+    chatwoot_inbox_company_map: str = "{}"
+
 
 settings = Settings()

@@ -248,6 +248,7 @@ async def _ingest_operator_outgoing(
 
     chatwoot_message_id = payload.get("id")
     chatwoot_conversation_id = conversation.get("id")
+    chatwoot_inbox_id = conversation.get("inbox_id")
     text = payload.get("content", "")
 
     # Recipient phone is the contact (customer) in the conversation.
@@ -272,6 +273,7 @@ async def _ingest_operator_outgoing(
             "conversation_id": chatwoot_conversation_id,
             "message_id": chatwoot_message_id,
             "phone_number_id": settings.meta_wa_phone_number_id,
+            "chatwoot_inbox_id": chatwoot_inbox_id,
             "agent_name": sender.get("name", ""),
             "agent_id": sender.get("id"),
         },
