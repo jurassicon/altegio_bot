@@ -38,7 +38,8 @@ router = APIRouter()
 
 # Chatwoot sender types that represent human operators.
 # 'agent_bot' means the message was sent by an automated bot — never relay.
-_HUMAN_SENDER_TYPES = frozenset({"agent", "supervisor"})
+# 'user' is used by API-type inboxes for agent messages.
+_HUMAN_SENDER_TYPES = frozenset({"agent", "supervisor", "user"})
 
 # content_type values that are purely internal — never relay to Meta.
 _SKIP_CONTENT_TYPES = frozenset({"activity", "input_select", "input_email"})
@@ -140,10 +141,19 @@ async def chatwoot_ingest(request: Request) -> JSONResponse:
         if settings.chatwoot_operator_relay_enabled and sender_type in _HUMAN_SENDER_TYPES:
             return await _ingest_operator_outgoing(request, payload)
 
+        conv_id = (payload.get("conversation") or {}).get("id")
+        msg_id = payload.get("id")
         logger.info(
-            "chatwoot_webhook: skipping outgoing relay_enabled=%s sender_type=%s",
+            "chatwoot_webhook: skipping outgoing relay_enabled=%s"
+            " message_type=%s sender_type=%s private=%s"
+            " content_type=%s conv_id=%s msg_id=%s",
             settings.chatwoot_operator_relay_enabled,
+            message_type,
             sender_type,
+            private,
+            content_type,
+            conv_id,
+            msg_id,
         )
         return JSONResponse({"ok": True, "skipped": f"message_type={message_type}"})
 

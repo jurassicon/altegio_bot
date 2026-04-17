@@ -182,3 +182,68 @@ async def test_signature_rejected_when_secret_set() -> None:
 
     finally:
         _settings.chatwoot_webhook_secret = original_secret
+
+
+@pytest.mark.asyncio
+async def test_operator_relay_user_sender_type(session_maker) -> None:
+    """API inbox agent messages (sender.type='user') should be relayed when relay enabled."""
+    import altegio_bot.webhooks.chatwoot as cw_module
+    from altegio_bot.main import app
+    from altegio_bot.settings import settings as _settings
+
+    original_session_local = cw_module.SessionLocal
+    original_relay = _settings.chatwoot_operator_relay_enabled
+    original_phone_id = _settings.meta_wa_phone_number_id
+
+    try:
+        cw_module.SessionLocal = session_maker  # type: ignore[assignment]
+        _settings.chatwoot_operator_relay_enabled = True
+        _settings.meta_wa_phone_number_id = "123456789"
+
+        payload = {
+            "event": "message_created",
+            "id": 999,
+            "content": "Hello from agent",
+            "message_type": 1,
+            "private": False,
+            "content_type": "text",
+            "conversation": {
+                "id": 50,
+                "meta": {
+                    "sender": {"phone_number": "+49111222333"},
+                },
+            },
+            "sender": {"type": "user", "name": "Test Agent", "id": 7},
+            "account": {"id": 2},
+        }
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as tc:
+            resp = await tc.post(
+                "/webhook/chatwoot",
+                content=json.dumps(payload),
+                headers={"Content-Type": "application/json"},
+            )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["ok"] is True
+        assert data.get("duplicate") is False
+        assert data.get("dedupe_key") == "chatwoot_out:50:999"
+
+        async with session_maker() as session:
+            from sqlalchemy import select
+
+            from altegio_bot.models.models import WhatsAppEvent
+
+            stmt = select(WhatsAppEvent).where(WhatsAppEvent.dedupe_key == "chatwoot_out:50:999")
+            result = await session.execute(stmt)
+            event = result.scalar_one_or_none()
+            assert event is not None
+            relay = event.payload.get("_chatwoot_operator_relay") or {}
+            assert relay["recipient_phone"] == "+49111222333"
+            assert relay["text"] == "Hello from agent"
+
+    finally:
+        cw_module.SessionLocal = original_session_local
+        _settings.chatwoot_operator_relay_enabled = original_relay
+        _settings.meta_wa_phone_number_id = original_phone_id
