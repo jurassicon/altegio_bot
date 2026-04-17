@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 from datetime import datetime, timezone
@@ -179,21 +180,63 @@ async def _pick_sender(
     return int(sender.id), int(sender.company_id)
 
 
+def _company_hint_from_inbox(
+    chatwoot_inbox_id: int | None,
+) -> tuple[int | None, str | None]:
+    """Resolve company_id hint from Chatwoot inbox_id via settings mapping.
+
+    Returns (company_id, error):
+    - (None, None)  — mapping not configured; fall through to default logic.
+    - (cid,  None)  — inbox found in mapping; use cid as routing hint.
+    - (None, msg)   — mapping configured but inbox absent; fail-closed.
+    """
+    if chatwoot_inbox_id is None:
+        return None, None
+
+    raw = settings.chatwoot_inbox_company_map.strip()
+    if not raw or raw == "{}":
+        return None, None  # not configured
+
+    try:
+        mapping: dict = json.loads(raw)
+    except Exception as exc:
+        return (
+            None,
+            f"operator_relay: invalid CHATWOOT_INBOX_COMPANY_MAP: {exc}",
+        )
+
+    key = str(chatwoot_inbox_id)
+    if key not in mapping:
+        return (
+            None,
+            f"operator_relay: inbox_id={chatwoot_inbox_id} not found in CHATWOOT_INBOX_COMPANY_MAP — fail-closed",
+        )
+
+    return int(mapping[key]), None
+
+
 async def _resolve_relay_sender(
     session: AsyncSession,
     phone_number_id: str | None,
+    *,
+    company_id_hint: int | None = None,
 ) -> tuple[int | None, int | None, str | None]:
     """Strict, fail-closed sender resolution for operator relay.
 
     Returns (sender_id, company_id, error).
     error is None on success; non-None means the relay must be blocked.
 
+    If company_id_hint is provided (from inbox mapping), senders are
+    filtered to that company first — routing is unambiguous within one
+    company, safety-guard remains intact.
+
     Resolution rules (in order):
     - 0 active senders → error.
+    - company_id_hint given → filter to that company; pick deterministically.
     - Active senders span >1 distinct company_ids → ambiguous error.
       Picking one would silently route through the wrong company context.
     - Multiple active senders but all in the same company → pick
-      deterministically to avoid arbitrary ordering:
+      deterministically:
         1. prefer sender_code == 'default';
         2. fallback: sender with the lowest id.
     """
@@ -215,6 +258,28 @@ async def _resolve_relay_sender(
             f"operator_relay: no active sender for phone_number_id={phone_number_id}",
         )
 
+    # ── Hint path: inbox mapping resolved a specific company ───────────
+    if company_id_hint is not None:
+        hinted = [s for s in senders if s.company_id == company_id_hint]
+        if not hinted:
+            return (
+                None,
+                None,
+                f"operator_relay: no active sender for "
+                f"phone_number_id={phone_number_id} "
+                f"company_id={company_id_hint} (from inbox mapping)",
+            )
+        default_s = [s for s in hinted if s.sender_code == "default"]
+        chosen = (default_s or sorted(hinted, key=lambda s: s.id))[0]
+        logger.info(
+            "operator_relay: resolved via inbox_company_map sender_id=%s company_id=%s hint=%s",
+            chosen.id,
+            chosen.company_id,
+            company_id_hint,
+        )
+        return int(chosen.id), int(chosen.company_id), None
+
+    # ── Default path: no hint, existing safety-guard ───────────────────
     distinct_companies = {s.company_id for s in senders}
 
     if len(distinct_companies) > 1:
@@ -237,8 +302,6 @@ async def _resolve_relay_sender(
             f"company_ids={','.join(cids)})",
         )
 
-    # All senders belong to the same company.
-    # Deterministic selection: prefer sender_code='default', else min id.
     default_senders = [s for s in senders if s.sender_code == "default"]
     chosen = (default_senders or sorted(senders, key=lambda s: s.id))[0]
     return int(chosen.id), int(chosen.company_id), None
@@ -540,6 +603,7 @@ async def _handle_operator_relay(
     conversation_id = relay.get("conversation_id")
     chatwoot_message_id = relay.get("message_id")
     phone_number_id = relay.get("phone_number_id")
+    chatwoot_inbox_id = relay.get("chatwoot_inbox_id")
     agent_name = relay.get("agent_name", "")
 
     if not phone_e164 or not text:
@@ -551,7 +615,23 @@ async def _handle_operator_relay(
         event.error = "operator_relay: missing recipient_phone or text"
         return
 
-    sender_id, company_id, routing_err = await _resolve_relay_sender(session, phone_number_id)
+    company_id_hint, hint_err = _company_hint_from_inbox(chatwoot_inbox_id)
+    if hint_err is not None:
+        logger.warning(
+            "operator_relay: inbox routing error conv_id=%s msg_id=%s inbox_id=%s: %s",
+            conversation_id,
+            chatwoot_message_id,
+            chatwoot_inbox_id,
+            hint_err,
+        )
+        event.error = hint_err
+        return
+
+    sender_id, company_id, routing_err = await _resolve_relay_sender(
+        session,
+        phone_number_id,
+        company_id_hint=company_id_hint,
+    )
 
     if routing_err is not None:
         logger.warning(
