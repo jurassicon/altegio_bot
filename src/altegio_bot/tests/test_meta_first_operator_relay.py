@@ -170,8 +170,11 @@ async def _make_sender(
 
 
 @pytest.mark.asyncio
-async def test_operator_outgoing_sent_to_meta(session_maker) -> None:
+async def test_operator_outgoing_sent_to_meta(session_maker, monkeypatch) -> None:
     """When relay is enabled, operator message must be sent via provider."""
+    # Ensure safe_send does not short-circuit on WHATSAPP_PROVIDER env var.
+    monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
+
     provider = _FakeProvider(wamid="wamid.OP_TEST_001")
 
     async with session_maker() as session:
@@ -445,8 +448,9 @@ async def test_loop_prevention_bot_outgoing_not_relayed(
 
 
 @pytest.mark.asyncio
-async def test_operator_relay_outbox_persisted(session_maker) -> None:
+async def test_operator_relay_outbox_persisted(session_maker, monkeypatch) -> None:
     """Operator relay must create an OutboxMessage with source='operator'."""
+    monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
     provider = _FakeProvider(wamid="wamid.OP_PERSIST")
 
     async with session_maker() as session:
@@ -1052,3 +1056,273 @@ async def test_resolve_relay_sender_inactive_not_counted(
     assert err is None
     assert sid == 90
     assert cid == 55
+
+
+# ---------------------------------------------------------------------------
+# Tests: same-company multi-sender (Fix 1 — no over-blocking)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_resolve_relay_sender_same_company_prefers_default(
+    session_maker,
+) -> None:
+    """Two active senders in the same company: sender_code='default' wins."""
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(
+                WhatsAppSender(
+                    id=100,
+                    company_id=77,
+                    sender_code="english",
+                    phone_number_id="PNID_SC1",
+                    display_phone="+49",
+                    is_active=True,
+                )
+            )
+            session.add(
+                WhatsAppSender(
+                    id=101,
+                    company_id=77,
+                    sender_code="default",
+                    phone_number_id="PNID_SC1",
+                    display_phone="+49",
+                    is_active=True,
+                )
+            )
+
+        sid, cid, err = await _resolve_relay_sender(session, "PNID_SC1")
+
+    assert err is None
+    assert cid == 77
+    assert sid == 101  # sender_code='default' preferred
+
+
+@pytest.mark.asyncio
+async def test_resolve_relay_sender_same_company_no_default_picks_min_id(
+    session_maker,
+) -> None:
+    """Two active senders, same company, no 'default' code → min id chosen."""
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(
+                WhatsAppSender(
+                    id=200,
+                    company_id=88,
+                    sender_code="english",
+                    phone_number_id="PNID_SC2",
+                    display_phone="+49",
+                    is_active=True,
+                )
+            )
+            session.add(
+                WhatsAppSender(
+                    id=201,
+                    company_id=88,
+                    sender_code="german",
+                    phone_number_id="PNID_SC2",
+                    display_phone="+49",
+                    is_active=True,
+                )
+            )
+
+        sid, cid, err = await _resolve_relay_sender(session, "PNID_SC2")
+
+    assert err is None
+    assert cid == 88
+    assert sid == 200  # min id when no 'default' sender_code
+
+
+@pytest.mark.asyncio
+async def test_relay_same_company_multi_sender_sends_successfully(session_maker, monkeypatch) -> None:
+    """Relay must succeed (not block) when two senders share same company."""
+    monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
+    provider = _FakeProvider(wamid="wamid.SAMECOMPANY")
+
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(
+                WhatsAppSender(
+                    id=110,
+                    company_id=50,
+                    sender_code="english",
+                    phone_number_id="PNID_SC3",
+                    display_phone="+49",
+                    is_active=True,
+                )
+            )
+            session.add(
+                WhatsAppSender(
+                    id=111,
+                    company_id=50,
+                    sender_code="default",
+                    phone_number_id="PNID_SC3",
+                    display_phone="+49",
+                    is_active=True,
+                )
+            )
+
+            evt = WhatsAppEvent(
+                dedupe_key="chatwoot_out:600:700",
+                status="received",
+                error=None,
+                query={},
+                headers={},
+                payload=_operator_relay_payload(
+                    phone_number_id="PNID_SC3",
+                    conversation_id=600,
+                    message_id=700,
+                ),
+                chatwoot_conversation_id=600,
+            )
+            session.add(evt)
+            await session.flush()
+
+            from altegio_bot.settings import settings as _s
+
+            original = _s.chatwoot_operator_relay_enabled
+            _s.chatwoot_operator_relay_enabled = True
+            try:
+                await handle_event(session, evt, provider)
+            finally:
+                _s.chatwoot_operator_relay_enabled = original
+
+    # Must have sent exactly once, using the 'default' sender (id=111).
+    assert len(provider.sent) == 1
+    # OutboxMessage created with company_id=50.
+    async with session_maker() as session:
+        result = await session.execute(
+            select(OutboxMessage).where(OutboxMessage.provider_message_id == "wamid.SAMECOMPANY")
+        )
+        ob = result.scalar_one_or_none()
+    assert ob is not None
+    assert ob.company_id == 50
+    assert ob.sender_id == 111
+
+
+# ---------------------------------------------------------------------------
+# Test: send failure path (Fix 3)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_operator_relay_send_failure(session_maker, monkeypatch) -> None:
+    """When provider.send raises, event.error is set, no OutboxMessage created."""
+    monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
+    provider = _ErrorProvider()
+
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(
+                WhatsAppSender(
+                    id=120,
+                    company_id=99,
+                    sender_code="default",
+                    phone_number_id="PNID_ERR",
+                    display_phone="+49",
+                    is_active=True,
+                )
+            )
+            evt = WhatsAppEvent(
+                dedupe_key="chatwoot_out:900:1000",
+                status="received",
+                error=None,
+                query={},
+                headers={},
+                payload=_operator_relay_payload(
+                    recipient_phone="+49900100200",
+                    phone_number_id="PNID_ERR",
+                    conversation_id=900,
+                    message_id=1000,
+                ),
+                chatwoot_conversation_id=900,
+            )
+            session.add(evt)
+            await session.flush()
+            evt_id = evt.id
+
+            from altegio_bot.settings import settings as _s
+
+            original = _s.chatwoot_operator_relay_enabled
+            _s.chatwoot_operator_relay_enabled = True
+            try:
+                await handle_event(session, evt, provider)
+            finally:
+                _s.chatwoot_operator_relay_enabled = original
+
+    async with session_maker() as session:
+        reloaded = await session.get(WhatsAppEvent, evt_id)
+    assert reloaded is not None
+    assert reloaded.error is not None
+    assert "send failed" in reloaded.error
+
+    async with session_maker() as session:
+        result = await session.execute(select(OutboxMessage).where(OutboxMessage.phone_e164 == "+49900100200"))
+        assert result.scalar_one_or_none() is None
+
+
+# ---------------------------------------------------------------------------
+# Test: WARNING log on ambiguous routing (Fix 4)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_sender_logs_warning(session_maker, caplog) -> None:
+    """Ambiguous routing must emit a WARNING to whatsapp_inbox_worker logger."""
+    import logging
+
+    provider = _FakeProvider()
+
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(
+                WhatsAppSender(
+                    id=130,
+                    company_id=11,
+                    sender_code="default",
+                    phone_number_id="PNID_WARN",
+                    display_phone="+49",
+                    is_active=True,
+                )
+            )
+            session.add(
+                WhatsAppSender(
+                    id=131,
+                    company_id=22,
+                    sender_code="default",
+                    phone_number_id="PNID_WARN",
+                    display_phone="+49",
+                    is_active=True,
+                )
+            )
+            evt = WhatsAppEvent(
+                dedupe_key="chatwoot_out:1100:1200",
+                status="received",
+                error=None,
+                query={},
+                headers={},
+                payload=_operator_relay_payload(
+                    phone_number_id="PNID_WARN",
+                    conversation_id=1100,
+                    message_id=1200,
+                ),
+                chatwoot_conversation_id=1100,
+            )
+            session.add(evt)
+            await session.flush()
+
+            from altegio_bot.settings import settings as _s
+
+            original = _s.chatwoot_operator_relay_enabled
+            _s.chatwoot_operator_relay_enabled = True
+            with caplog.at_level(logging.WARNING, logger="whatsapp_inbox_worker"):
+                try:
+                    await handle_event(session, evt, provider)
+                finally:
+                    _s.chatwoot_operator_relay_enabled = original
+
+    warning_messages = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any("ambiguous" in m for m in warning_messages), f"expected ambiguous warning, got: {warning_messages}"
+    assert any("PNID_WARN" in m for m in warning_messages), (
+        f"expected phone_number_id in warning, got: {warning_messages}"
+    )

@@ -188,11 +188,14 @@ async def _resolve_relay_sender(
     Returns (sender_id, company_id, error).
     error is None on success; non-None means the relay must be blocked.
 
-    Unlike _pick_sender(), this never silently picks an arbitrary match:
-    - 0 active senders → error
-    - 1 active sender  → ok
-    - >1 active senders → error (ambiguous routing — different company_ids
-      share the same phone_number_id; picking one would be wrong)
+    Resolution rules (in order):
+    - 0 active senders → error.
+    - Active senders span >1 distinct company_ids → ambiguous error.
+      Picking one would silently route through the wrong company context.
+    - Multiple active senders but all in the same company → pick
+      deterministically to avoid arbitrary ordering:
+        1. prefer sender_code == 'default';
+        2. fallback: sender with the lowest id.
     """
     if not phone_number_id:
         return None, None, "operator_relay: missing phone_number_id"
@@ -212,15 +215,18 @@ async def _resolve_relay_sender(
             f"operator_relay: no active sender for phone_number_id={phone_number_id}",
         )
 
-    if len(senders) > 1:
-        company_ids = [str(s.company_id) for s in senders]
+    distinct_companies = {s.company_id for s in senders}
+
+    if len(distinct_companies) > 1:
+        cids = sorted(str(c) for c in distinct_companies)
         logger.warning(
             "operator_relay: ambiguous sender routing "
             "phone_number_id=%s matched %d senders "
-            "company_ids=%s — blocking send",
+            "across %d company_ids=%s — blocking send",
             phone_number_id,
             len(senders),
-            ",".join(company_ids),
+            len(distinct_companies),
+            ",".join(cids),
         )
         return (
             None,
@@ -228,11 +234,14 @@ async def _resolve_relay_sender(
             f"operator_relay: ambiguous sender routing for "
             f"phone_number_id={phone_number_id} "
             f"(matched {len(senders)} senders across "
-            f"company_ids={','.join(company_ids)})",
+            f"company_ids={','.join(cids)})",
         )
 
-    s = senders[0]
-    return int(s.id), int(s.company_id), None
+    # All senders belong to the same company.
+    # Deterministic selection: prefer sender_code='default', else min id.
+    default_senders = [s for s in senders if s.sender_code == "default"]
+    chosen = (default_senders or sorted(senders, key=lambda s: s.id))[0]
+    return int(chosen.id), int(chosen.company_id), None
 
 
 def _phone_variants(phone_e164: str) -> list[str]:
