@@ -8,7 +8,39 @@ import httpx
 import pytest
 import respx
 
-from altegio_bot.chatwoot_client import ChatwootClient
+from altegio_bot.chatwoot_client import ChatwootClient, append_wa_deeplink
+
+# ---------------------------------------------------------------------------
+# append_wa_deeplink – unit tests
+# ---------------------------------------------------------------------------
+
+
+def test_append_wa_deeplink_standard_phone() -> None:
+    result = append_wa_deeplink("Hello", "+4917630316130")
+    assert result == "Hello\n\n---\n\U0001f4ac Написать в WhatsApp: https://wa.me/4917630316130"
+
+
+def test_append_wa_deeplink_normalises_messy_phone() -> None:
+    result = append_wa_deeplink("Hi", "+49 (176) 303-16130")
+    assert "https://wa.me/4917630316130" in result
+
+
+def test_append_wa_deeplink_idempotent() -> None:
+    first = append_wa_deeplink("Hi", "+4917630316130")
+    second = append_wa_deeplink(first, "+4917630316130")
+    assert first == second
+
+
+def test_append_wa_deeplink_none_phone() -> None:
+    assert append_wa_deeplink("Hi", None) == "Hi"
+
+
+def test_append_wa_deeplink_empty_phone() -> None:
+    assert append_wa_deeplink("Hi", "") == "Hi"
+
+
+def test_append_wa_deeplink_no_digits_in_phone() -> None:
+    assert append_wa_deeplink("Hi", "+++---") == "Hi"
 
 
 @pytest.fixture
@@ -266,3 +298,58 @@ async def test_get_or_create_contact_sends_name_on_create(client: ChatwootClient
     assert cid == 77
     body = json.loads(create_route.calls[0].request.content)
     assert body.get("name") == "Bob Mustermann"
+
+
+# ---------------------------------------------------------------------------
+# Integration: deeplink injected into Chatwoot body
+# ---------------------------------------------------------------------------
+
+
+def _mock_contact_and_conv(phone: str, contact_id: int, conv_id: int) -> None:
+    respx.get("https://chatwoot.example.com/api/v1/accounts/1/contacts/search").mock(
+        return_value=httpx.Response(
+            200,
+            json={"payload": [{"id": contact_id, "phone_number": phone}]},
+        )
+    )
+    respx.get(f"https://chatwoot.example.com/api/v1/accounts/1/contacts/{contact_id}/conversations").mock(
+        return_value=httpx.Response(
+            200,
+            json={"payload": [{"id": conv_id, "inbox_id": 2, "status": "open"}]},
+        )
+    )
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_log_incoming_message_body_contains_deeplink(
+    client: ChatwootClient,
+) -> None:
+    _mock_contact_and_conv("+4917630316130", 5, 20)
+    post_route = respx.post("https://chatwoot.example.com/api/v1/accounts/1/conversations/20/messages").mock(
+        return_value=httpx.Response(200, json={"id": 200, "content": "x"})
+    )
+
+    await client.log_incoming_message("+4917630316130", "Привет")
+
+    sent = json.loads(post_route.calls[0].request.content)
+    assert "https://wa.me/4917630316130" in sent["content"]
+    assert "Привет" in sent["content"]
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_mirror_outbound_body_contains_deeplink(
+    client: ChatwootClient,
+) -> None:
+    _mock_contact_and_conv("+4917630316130", 5, 20)
+    post_route = respx.post("https://chatwoot.example.com/api/v1/accounts/1/conversations/20/messages").mock(
+        return_value=httpx.Response(200, json={"id": 300, "content": "x"})
+    )
+
+    await client.mirror_outbound_as_note("+4917630316130", "Запись подтверждена")
+
+    sent = json.loads(post_route.calls[0].request.content)
+    assert "https://wa.me/4917630316130" in sent["content"]
+    assert "Запись подтверждена" in sent["content"]
+    assert sent["private"] is True

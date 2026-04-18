@@ -10,6 +10,7 @@ Only the methods required for the dual-write integration are implemented:
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 import httpx
@@ -17,6 +18,23 @@ import httpx
 from altegio_bot.settings import settings
 
 logger = logging.getLogger(__name__)
+
+
+def append_wa_deeplink(text: str, phone_e164: str | None) -> str:
+    """Append a WhatsApp deeplink footer to a Chatwoot message body.
+
+    Idempotent: skipped when the deeplink is already present or when
+    phone_e164 contains no digits.
+    """
+    if not phone_e164:
+        return text
+    digits = re.sub(r"\D", "", phone_e164)
+    if not digits:
+        return text
+    wa_url = f"https://wa.me/{digits}"
+    if wa_url in text:
+        return text
+    return f"{text}\n\n---\n\U0001f4ac Написать в WhatsApp: {wa_url}"
 
 
 def _log_and_raise(res: httpx.Response, ctx: str) -> None:
@@ -265,7 +283,7 @@ class ChatwootClient:
 
         message_id = await self.send_message(
             conversation_id,
-            content,
+            append_wa_deeplink(content, phone_e164),
             message_type="incoming",
         )
         logger.info(
@@ -297,7 +315,7 @@ class ChatwootClient:
             conversation_id = await self.get_or_create_conversation(contact_id)
             msg_id = await self.send_message(
                 conversation_id,
-                text,
+                append_wa_deeplink(text, phone_e164),
                 message_type="outgoing",
                 private=True,
             )
