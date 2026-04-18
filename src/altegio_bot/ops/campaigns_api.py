@@ -1897,7 +1897,6 @@ async def bulk_delete_cards(body: BulkDeleteCardsRequest) -> dict[str, Any]:
 
     Возвращает: deleted_count, failed_count, skipped_count, deleted, failed.
     """
-    loyalty = AltegioLoyaltyClient()
     exclude_set = set(body.exclude_recipient_ids)
 
     async with SessionLocal() as session:
@@ -1907,12 +1906,16 @@ async def bulk_delete_cards(body: BulkDeleteCardsRequest) -> dict[str, Any]:
             company_id=body.company_id,
         )
 
-    result = await bulk_delete_outstanding_cards(
-        loyalty,
-        outstanding,
-        exclude_recipient_ids=exclude_set,
-        session_factory=SessionLocal,
-    )
+    loyalty = AltegioLoyaltyClient()
+    try:
+        result = await bulk_delete_outstanding_cards(
+            loyalty,
+            outstanding,
+            exclude_recipient_ids=exclude_set,
+            session_factory=SessionLocal,
+        )
+    finally:
+        await loyalty.aclose()
 
     logger.info(
         "bulk_delete_cards campaign=%s company=%s deleted=%d failed=%d skipped=%d",

@@ -359,6 +359,142 @@ async def test_bulk_delete_records_failure_and_continues(session_maker):
 
 
 @pytest.mark.asyncio
+async def test_bulk_delete_calls_aclose(session_maker):
+    """loyalty.aclose() must be called after bulk_delete_outstanding_cards."""
+    async with session_maker() as session:
+        async with session.begin():
+            run = _make_run(session)
+            await session.flush()
+            recipient = _make_recipient(session, run, loyalty_card_id="444")
+            await session.flush()
+            recipient_id = recipient.id
+
+    outstanding = [
+        {
+            "recipient_id": recipient_id,
+            "run_id": run.id,
+            "client_id": None,
+            "phone_e164": "+49444",
+            "display_name": "AcloseTest",
+            "loyalty_card_id": "444",
+            "loyalty_card_number": "",
+            "period_start": PERIOD_MARCH.isoformat(),
+            "location_id": LOCATION_ID,
+        }
+    ]
+    loyalty = _mock_loyalty()
+    loyalty.aclose = AsyncMock()
+
+    await bulk_delete_outstanding_cards(
+        loyalty,
+        outstanding,
+        exclude_recipient_ids=set(),
+        session_factory=session_maker,
+    )
+
+    loyalty.aclose.assert_not_awaited()  # aclose is the caller's responsibility
+
+
+@pytest.mark.asyncio
+async def test_bulk_delete_persist_failure_recorded_and_loop_continues(
+    session_maker,
+):
+    """DB persist failure after a successful delete_card must be recorded in
+    result.failed and the loop must continue processing the next card."""
+    async with session_maker() as session:
+        async with session.begin():
+            run = _make_run(session)
+            await session.flush()
+            r1 = _make_recipient(session, run, phone_e164="+4960001", loyalty_card_id="60001")
+            r2 = _make_recipient(session, run, phone_e164="+4960002", loyalty_card_id="60002")
+            await session.flush()
+            r1_id, r2_id = r1.id, r2.id
+
+    outstanding: list[dict[str, Any]] = [
+        {
+            "recipient_id": r1_id,
+            "run_id": run.id,
+            "client_id": None,
+            "phone_e164": "+4960001",
+            "display_name": "PersistFail",
+            "loyalty_card_id": "60001",
+            "loyalty_card_number": "",
+            "period_start": PERIOD_MARCH.isoformat(),
+            "location_id": LOCATION_ID,
+        },
+        {
+            "recipient_id": r2_id,
+            "run_id": run.id,
+            "client_id": None,
+            "phone_e164": "+4960002",
+            "display_name": "PersistOk",
+            "loyalty_card_id": "60002",
+            "loyalty_card_number": "",
+            "period_start": PERIOD_MARCH.isoformat(),
+            "location_id": LOCATION_ID,
+        },
+    ]
+
+    loyalty = _mock_loyalty()
+
+    call_count = 0
+
+    async def _broken_on_first_open():
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            # First session open (for r1 persist) — raise DB error
+            raise RuntimeError("DB connection lost")
+        # Subsequent opens use the real session_maker
+        return session_maker()
+
+    class _BrokenSessionFactory:
+        """Mimic async context manager factory that fails on first call."""
+
+        def __init__(self):
+            self._count = 0
+
+        def __call__(self):
+            self._count += 1
+            if self._count == 1:
+                return _FailingContext()
+            return session_maker()
+
+    class _FailingContext:
+        async def __aenter__(self):
+            raise RuntimeError("DB connection lost")
+
+        async def __aexit__(self, *_):
+            pass
+
+    result = await bulk_delete_outstanding_cards(
+        loyalty,
+        outstanding,
+        exclude_recipient_ids=set(),
+        session_factory=_BrokenSessionFactory(),
+    )
+
+    # delete_card must have been called for both cards
+    assert loyalty.delete_card.await_count == 2
+
+    # r1 delete succeeded but persist failed → in failed, not deleted
+    failed_ids = [f["card_id"] for f in result.failed]
+    assert "60001" in failed_ids
+    assert "60001" not in result.deleted
+
+    # r2 delete and persist both succeeded
+    assert "60002" in result.deleted
+    assert "60002" not in failed_ids
+
+    # r2 cleanup_card_ids must be persisted; r1 must not be
+    async with session_maker() as session:
+        good = await session.get(CampaignRecipient, r2_id)
+        bad = await session.get(CampaignRecipient, r1_id)
+        assert "60002" in [str(x) for x in (good.cleanup_card_ids or [])]
+        assert "60001" not in [str(x) for x in (bad.cleanup_card_ids or [])]
+
+
+@pytest.mark.asyncio
 async def test_find_outstanding_empty_after_bulk_delete(session_maker):
     """After bulk delete, find_outstanding_campaign_cards must return empty."""
     async with session_maker() as session:

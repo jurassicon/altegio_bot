@@ -469,14 +469,30 @@ async def bulk_delete_outstanding_cards(
 
         # Persist: add card_id to cleanup_card_ids so find_outstanding_campaign_cards
         # will exclude it in future calls.
-        async with session_factory() as session:
-            async with session.begin():
-                recipient = await session.get(CampaignRecipient, recipient_id)
-                if recipient is not None:
-                    current = list(recipient.cleanup_card_ids or [])
-                    if card_id not in [str(x) for x in current]:
-                        current.append(card_id)
-                        recipient.cleanup_card_ids = current
+        try:
+            async with session_factory() as session:
+                async with session.begin():
+                    recipient = await session.get(CampaignRecipient, recipient_id)
+                    if recipient is not None:
+                        current = list(recipient.cleanup_card_ids or [])
+                        if card_id not in [str(x) for x in current]:
+                            current.append(card_id)
+                            recipient.cleanup_card_ids = current
+        except Exception as db_exc:
+            logger.error(
+                "bulk_delete persist FAILED card_id=%s recipient_id=%s: %s (card already deleted in Altegio)",
+                card_id,
+                recipient_id,
+                db_exc,
+            )
+            result.failed.append(
+                {
+                    "card_id": card_id,
+                    "recipient_id": recipient_id,
+                    "error": f"persist failed after delete: {db_exc}",
+                }
+            )
+            continue
 
         result.deleted.append(card_id)
         logger.info(
