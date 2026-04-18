@@ -360,7 +360,12 @@ async def test_bulk_delete_records_failure_and_continues(session_maker):
 
 @pytest.mark.asyncio
 async def test_bulk_delete_calls_aclose(session_maker):
-    """loyalty.aclose() must be called after bulk_delete_outstanding_cards."""
+    """bulk_delete_outstanding_cards must NOT call aclose() itself.
+
+    aclose() is the caller's responsibility (the API handler wraps the call
+    in try/finally). This test verifies the lower-level function does not
+    close the client, so the caller retains full control over its lifecycle.
+    """
     async with session_maker() as session:
         async with session.begin():
             run = _make_run(session)
