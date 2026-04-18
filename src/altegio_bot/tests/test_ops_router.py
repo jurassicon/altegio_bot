@@ -13,7 +13,14 @@ from starlette.requests import Request as StarletteRequest
 
 import altegio_bot.ops.router as ops_router_module
 from altegio_bot.main import app
-from altegio_bot.models.models import AltegioEvent, Client, MessageJob, OutboxMessage, Record
+from altegio_bot.models.models import (
+    AltegioEvent,
+    Client,
+    MessageJob,
+    OutboxMessage,
+    Record,
+    WhatsAppEvent,
+)
 from altegio_bot.ops.auth import require_ops_auth
 from altegio_bot.ops.router import _period_params
 
@@ -409,3 +416,61 @@ async def test_ops_history_default_period_is_today(http_client: AsyncClient) -> 
     assert response.status_code == 200
     # The period select should have 'today' selected by default
     assert 'value="today" selected' in response.text
+
+
+def _inbound_payload(from_phone: str, body: str) -> dict:
+    return {
+        "entry": [
+            {
+                "changes": [
+                    {
+                        "value": {
+                            "metadata": {"phone_number_id": "pni-test"},
+                            "messages": [
+                                {
+                                    "id": "wamid.test-real",
+                                    "from": from_phone,
+                                    "type": "text",
+                                    "text": {"body": body},
+                                }
+                            ],
+                        }
+                    }
+                ]
+            }
+        ]
+    }
+
+
+@pytest.mark.asyncio
+async def test_wa_inbox_excludes_chatwoot_origin_events(
+    http_client: AsyncClient,
+    session_maker,
+) -> None:
+    """Chatwoot-origin mirror rows (chatwoot_conversation_id IS NOT NULL)
+    must not appear on the Inbox tab; real Meta events must remain visible."""
+    async with session_maker() as session:
+        async with session.begin():
+            real_event = WhatsAppEvent(
+                dedupe_key="wa:wamid.test-real",
+                status="processed",
+                payload=_inbound_payload("491meta000", "msg-from-meta"),
+                query={},
+                headers={},
+                chatwoot_conversation_id=None,
+            )
+            session.add(real_event)
+            cw_event = WhatsAppEvent(
+                dedupe_key="chatwoot:230:1470",
+                status="processed",
+                payload=_inbound_payload("491cw000", "msg-from-chatwoot"),
+                query={},
+                headers={},
+                chatwoot_conversation_id=230,
+            )
+            session.add(cw_event)
+
+    response = await http_client.get("/ops/whatsapp/inbox?tab=inbox&period=24h")
+    assert response.status_code == 200
+    assert "491meta000" in response.text
+    assert "491cw000" not in response.text

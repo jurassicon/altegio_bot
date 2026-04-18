@@ -1301,6 +1301,9 @@ async def ops_wa_inbox(request: Request) -> str:
         if tab == "inbox":
             # Only inbound messages: messages[0].id must exist
             filters.append("we.payload #> '{entry,0,changes,0,value,messages,0,id}' IS NOT NULL")
+            # Exclude Chatwoot-origin echo copies (they mirror real Meta
+            # inbound events but originate from Chatwoot webhooks)
+            filters.append("we.chatwoot_conversation_id IS NULL")
             if from_filter:
                 filters.append("we.payload #>> '{entry,0,changes,0,value,messages,0,from}' ILIKE :wa_from")
                 params["wa_from"] = f"%{from_filter}%"
