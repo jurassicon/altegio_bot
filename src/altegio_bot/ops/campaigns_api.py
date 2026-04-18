@@ -18,6 +18,8 @@ Endpoint'ы:
   GET  /ops/campaigns/dashboard/monthly
   POST /ops/campaigns/runs/{run_id}/followup/plan
   POST /ops/campaigns/runs/{run_id}/followup/run-now
+  GET  /ops/campaigns/outstanding-cards
+  POST /ops/campaigns/bulk-delete-cards
 """
 
 from __future__ import annotations
@@ -42,6 +44,10 @@ from altegio_bot.campaigns.altegio_crm import (
     get_client_crm_records,
 )
 from altegio_bot.campaigns.followup import execute_followup, followup_run_at, plan_followup
+from altegio_bot.campaigns.loyalty_cleanup import (
+    bulk_delete_outstanding_cards,
+    find_outstanding_campaign_cards,
+)
 from altegio_bot.campaigns.reports import monthly_dashboard, run_report
 from altegio_bot.campaigns.runner import (
     CAMPAIGN_CODE,
@@ -1845,6 +1851,88 @@ async def retry_recipient(
     )
 
     return {"run_id": run_id, "recipient_id": recipient_id, **result}
+
+
+# ==========================================================================
+# Outstanding loyalty cards — cross-period cleanup
+# ==========================================================================
+
+
+@router.get("/outstanding-cards")
+async def get_outstanding_cards(
+    campaign_code: str = Query(...),
+    company_id: int = Query(...),
+) -> dict[str, Any]:
+    """Список loyalty-карт прошлых периодов, которые ещё не были удалены.
+
+    Возвращает карты из всех send-real runs для данного campaign_code + company_id,
+    у которых loyalty_card_id заполнен и не отмечен в cleanup_card_ids.
+
+    Используется UI на странице запуска кампании для предварительного просмотра
+    карт, которые будут удалены перед следующим run.
+    """
+    async with SessionLocal() as session:
+        cards = await find_outstanding_campaign_cards(
+            session,
+            campaign_code=campaign_code,
+            company_id=company_id,
+        )
+    return {"campaign_code": campaign_code, "company_id": company_id, "cards": cards, "total": len(cards)}
+
+
+class BulkDeleteCardsRequest(BaseModel):
+    campaign_code: str
+    company_id: int
+    exclude_recipient_ids: list[int] = Field(default_factory=list)
+
+
+@router.post("/bulk-delete-cards")
+async def bulk_delete_cards(body: BulkDeleteCardsRequest) -> dict[str, Any]:
+    """Удалить loyalty-карты прошлых периодов через Altegio API.
+
+    Находит все незатронутые карты (через find_outstanding_campaign_cards),
+    исключает recipient_ids из exclude_recipient_ids, удаляет остальные.
+    Каждая успешная операция записывается в cleanup_card_ids получателя
+    немедленно — частичные ошибки не откатывают уже выполненные удаления.
+
+    Возвращает: deleted_count, failed_count, skipped_count, deleted, failed.
+    """
+    exclude_set = set(body.exclude_recipient_ids)
+
+    async with SessionLocal() as session:
+        outstanding = await find_outstanding_campaign_cards(
+            session,
+            campaign_code=body.campaign_code,
+            company_id=body.company_id,
+        )
+
+    loyalty = AltegioLoyaltyClient()
+    try:
+        result = await bulk_delete_outstanding_cards(
+            loyalty,
+            outstanding,
+            exclude_recipient_ids=exclude_set,
+            session_factory=SessionLocal,
+        )
+    finally:
+        await loyalty.aclose()
+
+    logger.info(
+        "bulk_delete_cards campaign=%s company=%s deleted=%d failed=%d skipped=%d",
+        body.campaign_code,
+        body.company_id,
+        len(result.deleted),
+        len(result.failed),
+        result.skipped,
+    )
+
+    return {
+        "deleted_count": len(result.deleted),
+        "failed_count": len(result.failed),
+        "skipped_count": result.skipped,
+        "deleted": result.deleted,
+        "failed": result.failed,
+    }
 
 
 # ==========================================================================

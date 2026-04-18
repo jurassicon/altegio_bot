@@ -2958,6 +2958,30 @@ async def ops_new_clients_campaign_page(request: Request) -> str:
   <a href="/ops/campaigns" class="btn btn-sm btn-outline-secondary">← Campaign Runs</a>
 </div>
 
+<!-- ========== КАРТЫ ПРОШЛЫХ ПЕРИОДОВ ========== -->
+<div id="outstanding-cards-section" class="card mb-3 border-warning d-none">
+  <div class="card-header fw-bold d-flex justify-content-between align-items-center">
+    <span>🗑️ Карты лояльности прошлых периодов</span>
+    <span id="outstanding-count-badge" class="badge bg-warning text-dark"></span>
+  </div>
+  <div class="card-body">
+    <p class="text-muted small mb-2">
+      Карты выданы в предыдущих рассылках и не были удалены автоматически.
+      Выберите карты для удаления перед запуском новой рассылки.
+    </p>
+    <div id="outstanding-cards-table"></div>
+    <div class="mt-3 d-flex gap-2">
+      <button class="btn btn-sm btn-outline-secondary" onclick="outstandingSelectAll(true)">Выбрать все</button>
+      <button class="btn btn-sm btn-outline-secondary" onclick="outstandingSelectAll(false)">Снять все</button>
+      <button id="btn-delete-outstanding" class="btn btn-sm btn-danger ms-auto"
+              onclick="deleteOutstandingCards()">
+        🗑️ Удалить выбранные
+      </button>
+    </div>
+    <div id="outstanding-delete-result" class="mt-2"></div>
+  </div>
+</div>
+
 <!-- ========== ФОРМА ========== -->
 <div class="card mb-3">
   <div class="card-header fw-bold">⚙️ Параметры кампании</div>
@@ -3182,6 +3206,8 @@ document.addEventListener("DOMContentLoaded", function () {{
     loadTemplateText(cid);
     setFollowupTemplateDefault(cid);
     loadFollowupTemplateText(cid);
+    // Перезагрузить карты прошлых периодов для новой компании
+    loadOutstandingCards(cid);
   }});
 
   // Follow-up toggle
@@ -3203,10 +3229,11 @@ document.addEventListener("DOMContentLoaded", function () {{
   document.getElementById("btn-preview").addEventListener("click", createPreview);
   document.getElementById("btn-run").addEventListener("click", runCampaign);
 
-  // Загрузить тексты шаблонов для company по умолчанию
+  // Загрузить тексты шаблонов и карты прошлых периодов для company по умолчанию
   loadTemplateText(companySelect.value);
   loadFollowupTemplateText(companySelect.value);
   setFollowupTemplateDefault(companySelect.value);
+  loadOutstandingCards(companySelect.value);
 
   // Если открыта со страницы history (from_preview), подгрузить параметры preview
   if (previewRunId) {{
@@ -3770,6 +3797,101 @@ function escHtml(s) {{
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
+}}
+
+// ---------------------------------------------------------------------------
+// Outstanding cards (previous-period loyalty cards cleanup)
+// ---------------------------------------------------------------------------
+
+async function loadOutstandingCards(companyId) {{
+  const section = document.getElementById("outstanding-cards-section");
+  const tableEl = document.getElementById("outstanding-cards-table");
+  const badge   = document.getElementById("outstanding-count-badge");
+  section.classList.add("d-none");
+  tableEl.innerHTML = "";
+
+  if (!companyId) return;
+
+  let data;
+  try {{
+    const resp = await fetch(
+      "/ops/campaigns/outstanding-cards?campaign_code=new_clients_monthly&company_id=" + companyId
+    );
+    data = await resp.json();
+  }} catch (e) {{
+    return;
+  }}
+
+  if (!data.cards || data.cards.length === 0) return;
+
+  badge.textContent = data.cards.length + " карт";
+  section.classList.remove("d-none");
+
+  let html = '<table class="table table-sm table-bordered mb-0">'
+    + '<thead><tr>'
+    + '<th style="width:2em"><input type="checkbox" id="oc-check-all" checked '
+    + '  onchange="outstandingSelectAll(this.checked)"></th>'
+    + '<th>Клиент</th><th>Телефон</th><th>Карта №</th><th>Период</th>'
+    + '</tr></thead><tbody>';
+
+  for (const c of data.cards) {{
+    const period = c.period_start ? c.period_start.substring(0, 7) : "—";
+    html += '<tr>'
+      + '<td><input type="checkbox" class="oc-check" data-recipient="' + c.recipient_id + '" checked></td>'
+      + '<td>' + escHtml(c.display_name || "—") + '</td>'
+      + '<td>' + escHtml(c.phone_e164) + '</td>'
+      + '<td><code>' + escHtml(c.loyalty_card_number || c.loyalty_card_id) + '</code></td>'
+      + '<td>' + escHtml(period) + '</td>'
+      + '</tr>';
+  }}
+  html += '</tbody></table>';
+  tableEl.innerHTML = html;
+}}
+
+function outstandingSelectAll(checked) {{
+  document.querySelectorAll(".oc-check").forEach(cb => cb.checked = checked);
+  const all = document.getElementById("oc-check-all");
+  if (all) all.checked = checked;
+}}
+
+async function deleteOutstandingCards() {{
+  const checked = Array.from(document.querySelectorAll(".oc-check:not(:checked)"))
+    .map(cb => parseInt(cb.dataset.recipient, 10));
+  const companyId = parseInt(document.getElementById("f-company").value, 10);
+
+  const btn = document.getElementById("btn-delete-outstanding");
+  btn.disabled = true;
+  btn.textContent = "⏳ Удаление…";
+
+  let data;
+  try {{
+    const resp = await fetch("/ops/campaigns/bulk-delete-cards", {{
+      method: "POST",
+      headers: {{"Content-Type": "application/json"}},
+      body: JSON.stringify({{
+        campaign_code: "new_clients_monthly",
+        company_id: companyId,
+        exclude_recipient_ids: checked,
+      }}),
+    }});
+    data = await resp.json();
+  }} catch (e) {{
+    showAlert("outstanding-delete-result", "danger", "Ошибка запроса: " + e);
+    btn.disabled = false;
+    btn.textContent = "🗑️ Удалить выбранные";
+    return;
+  }}
+
+  const msg = "Удалено: " + data.deleted_count
+    + ", ошибок: " + data.failed_count
+    + ", пропущено: " + data.skipped_count;
+  showAlert("outstanding-delete-result", data.failed_count > 0 ? "warning" : "success", msg);
+
+  btn.disabled = false;
+  btn.textContent = "🗑️ Удалить выбранные";
+
+  // Reload to reflect deletions
+  await loadOutstandingCards(companyId);
 }}
 </script>
 """

@@ -18,12 +18,19 @@ resolve_or_issue_loyalty_card (для CRM-only, client_id=None):
     (без API-запроса, требует ручного разбора).
   * Карты другого филиала (company_id) не учитываются —
     cross-branch reuse не происходит.
+
+find_outstanding_campaign_cards / bulk_delete_outstanding_cards:
+  Используются для массового удаления карт прошлых периодов перед
+  запуском новой рассылки. Клиенты прошлых периодов больше не
+  попадают в сегментацию как «новые», поэтому их карты не удаляются
+  автоматически — нужна отдельная ручная/полуавтоматическая очистка.
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -324,3 +331,174 @@ async def resolve_or_issue_loyalty_card(
         loyalty_card_number=issued_number,
         loyalty_card_type_id=card_type_id,
     )
+
+
+# ---------------------------------------------------------------------------
+# Bulk outstanding-cards lookup and deletion (cross-period cleanup)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class BulkDeleteResult:
+    deleted: list[str] = field(default_factory=list)
+    failed: list[dict[str, Any]] = field(default_factory=list)
+    skipped: int = 0
+
+
+async def find_outstanding_campaign_cards(
+    session: AsyncSession,
+    *,
+    campaign_code: str,
+    company_id: int,
+) -> list[dict[str, Any]]:
+    """Find all loyalty cards issued by previous send-real runs that are not yet deleted.
+
+    A card is considered deleted when its card_id appears in the cleanup_card_ids
+    of any CampaignRecipient for the same campaign_code + company_id scope.
+
+    Returns a list of dicts ordered by period_start DESC (most recent run first).
+    Each dict contains: recipient_id, run_id, client_id, phone_e164, display_name,
+    loyalty_card_id, loyalty_card_number, period_start (ISO string), location_id.
+    """
+    issued_stmt = (
+        select(
+            CampaignRecipient.id.label("recipient_id"),
+            CampaignRecipient.campaign_run_id,
+            CampaignRecipient.client_id,
+            CampaignRecipient.phone_e164,
+            CampaignRecipient.display_name,
+            CampaignRecipient.loyalty_card_id,
+            CampaignRecipient.loyalty_card_number,
+            CampaignRun.period_start,
+            CampaignRun.location_id.label("run_location_id"),
+        )
+        .join(CampaignRun, CampaignRun.id == CampaignRecipient.campaign_run_id)
+        .where(CampaignRun.campaign_code == campaign_code)
+        .where(CampaignRun.mode == "send-real")
+        .where(CampaignRecipient.company_id == company_id)
+        .where(CampaignRecipient.loyalty_card_id.isnot(None))
+        .where(CampaignRecipient.loyalty_card_id != "")
+        .order_by(CampaignRun.period_start.desc())
+    )
+    issued_rows = (await session.execute(issued_stmt)).all()
+    if not issued_rows:
+        return []
+
+    # Collect all card_ids already deleted within this campaign+company scope.
+    cleanup_stmt = (
+        select(CampaignRecipient.cleanup_card_ids)
+        .join(CampaignRun, CampaignRun.id == CampaignRecipient.campaign_run_id)
+        .where(CampaignRun.campaign_code == campaign_code)
+        .where(CampaignRecipient.company_id == company_id)
+        .where(CampaignRecipient.cleanup_card_ids != [])
+    )
+    cleanup_rows = (await session.execute(cleanup_stmt)).scalars().all()
+    already_deleted: set[str] = set()
+    for cids in cleanup_rows:
+        if isinstance(cids, list):
+            already_deleted.update(str(x) for x in cids)
+
+    result: list[dict[str, Any]] = []
+    for row in issued_rows:
+        card_id = str(row.loyalty_card_id)
+        if card_id in already_deleted:
+            continue
+        result.append(
+            {
+                "recipient_id": row.recipient_id,
+                "run_id": row.campaign_run_id,
+                "client_id": row.client_id,
+                "phone_e164": row.phone_e164 or "",
+                "display_name": row.display_name or "",
+                "loyalty_card_id": card_id,
+                "loyalty_card_number": row.loyalty_card_number or "",
+                "period_start": row.period_start.isoformat() if row.period_start else None,
+                "location_id": row.run_location_id,
+            }
+        )
+    return result
+
+
+async def bulk_delete_outstanding_cards(
+    loyalty: AltegioLoyaltyClient,
+    outstanding: list[dict[str, Any]],
+    *,
+    exclude_recipient_ids: set[int],
+    session_factory: Any,
+) -> BulkDeleteResult:
+    """Delete outstanding loyalty cards, persisting each successful deletion separately.
+
+    Iterates over *outstanding* (from find_outstanding_campaign_cards), skips
+    recipients in *exclude_recipient_ids*, and for each remaining card:
+      1. Calls loyalty.delete_card() via the Altegio API.
+      2. Opens a short DB transaction to record the card_id in
+         CampaignRecipient.cleanup_card_ids so it won't be picked up again.
+
+    Partial failures are tolerated: a failed delete is recorded in the result
+    and the loop continues with the next card.
+    """
+    result = BulkDeleteResult()
+
+    for card in outstanding:
+        if card["recipient_id"] in exclude_recipient_ids:
+            result.skipped += 1
+            continue
+
+        card_id = card["loyalty_card_id"]
+        location_id = card["location_id"]
+        recipient_id = card["recipient_id"]
+
+        try:
+            await loyalty.delete_card(location_id, int(card_id))
+        except Exception as exc:
+            logger.error(
+                "bulk_delete card_id=%s recipient_id=%s location_id=%s: %s",
+                card_id,
+                recipient_id,
+                location_id,
+                exc,
+            )
+            result.failed.append(
+                {
+                    "card_id": card_id,
+                    "recipient_id": recipient_id,
+                    "error": str(exc),
+                }
+            )
+            continue
+
+        # Persist: add card_id to cleanup_card_ids so find_outstanding_campaign_cards
+        # will exclude it in future calls.
+        try:
+            async with session_factory() as session:
+                async with session.begin():
+                    recipient = await session.get(CampaignRecipient, recipient_id)
+                    if recipient is not None:
+                        current = list(recipient.cleanup_card_ids or [])
+                        if card_id not in [str(x) for x in current]:
+                            current.append(card_id)
+                            recipient.cleanup_card_ids = current
+        except Exception as db_exc:
+            logger.error(
+                "bulk_delete persist FAILED card_id=%s recipient_id=%s: %s (card already deleted in Altegio)",
+                card_id,
+                recipient_id,
+                db_exc,
+            )
+            result.failed.append(
+                {
+                    "card_id": card_id,
+                    "recipient_id": recipient_id,
+                    "error": f"persist failed after delete: {db_exc}",
+                }
+            )
+            continue
+
+        result.deleted.append(card_id)
+        logger.info(
+            "bulk_delete: deleted card_id=%s recipient_id=%s",
+            card_id,
+            recipient_id,
+        )
+
+    return result
