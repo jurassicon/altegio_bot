@@ -1329,6 +1329,74 @@ async def test_ambiguous_sender_logs_warning(session_maker, caplog) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Test: operator relay must NOT mirror to Chatwoot
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_operator_relay_no_chatwoot_mirror(session_maker, monkeypatch) -> None:
+    """When a ChatwootHybridProvider is passed, operator relay must use _primary
+    directly and never call mirror_outbound_as_note, because the operator's
+    message is already visible in Chatwoot."""
+    monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
+
+    primary = _FakeProvider(wamid="wamid.NO_MIRROR")
+    mirror_calls: list[str] = []
+
+    class _HybridLike:
+        """Simulates ChatwootHybridProvider with _primary and a tracked mirror."""
+
+        _supports_mirror_kwargs: bool = True
+        _primary = primary
+
+        async def send(self, sender_id: int, phone_e164: str, text: str, **kwargs: Any) -> str:
+            # If this is called instead of _primary.send, that's a bug.
+            mirror_calls.append(phone_e164)
+            return "wamid.SHOULD_NOT_APPEAR"
+
+        async def send_template(self, *args: Any, **kwargs: Any) -> str:
+            return "wamid.SHOULD_NOT_APPEAR"
+
+    hybrid = _HybridLike()
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _make_sender(session, sender_id=200, company_id=1, phone_number_id="PNID_NM")
+
+            evt = WhatsAppEvent(
+                dedupe_key="chatwoot_out:500:600",
+                status="received",
+                error=None,
+                query={},
+                headers={},
+                payload=_operator_relay_payload(
+                    recipient_phone="+49500600700",
+                    text="No mirror please",
+                    conversation_id=500,
+                    message_id=600,
+                    phone_number_id="PNID_NM",
+                ),
+                chatwoot_conversation_id=500,
+            )
+            session.add(evt)
+            await session.flush()
+
+            from altegio_bot.settings import settings as _s
+
+            original = _s.chatwoot_operator_relay_enabled
+            _s.chatwoot_operator_relay_enabled = True
+            try:
+                await handle_event(session, evt, hybrid)  # type: ignore[arg-type]
+            finally:
+                _s.chatwoot_operator_relay_enabled = original
+
+    # Must have sent via _primary, not via hybrid.send (which tracks to mirror_calls).
+    assert len(primary.sent) == 1, "meta_provider.send must have been called once"
+    assert primary.sent[0]["phone_e164"] == "+49500600700"
+    assert mirror_calls == [], "ChatwootHybridProvider.send (mirror path) must NOT be called"
+
+
+# ---------------------------------------------------------------------------
 # Tests: inbox_company_map routing
 # ---------------------------------------------------------------------------
 
