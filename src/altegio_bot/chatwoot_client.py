@@ -263,6 +263,35 @@ class ChatwootClient:
             raise RuntimeError(f"Chatwoot send_message returned no id: {data}")
         return int(msg_id)
 
+    async def _conversation_has_inbound(self, conversation_id: int) -> bool:
+        """Return True if the conversation has any incoming message from client.
+
+        Used to decide whether to attach a wa.me deeplink to mirror notes:
+        deeplink is only useful when the client has never written themselves,
+        so a master can initiate contact via personal WhatsApp.  Once the
+        client has written in, the deeplink is noise.
+
+        Returns False on any API error so deeplink is kept as the safe default.
+        """
+        url = self._api(f"/conversations/{conversation_id}/messages")
+        try:
+            res = await self._client.get(url, headers=self._headers())
+            if res.status_code != 200:
+                return False
+            data = res.json()
+            messages: list = []
+            if isinstance(data, list):
+                messages = data
+            elif isinstance(data, dict):
+                payload = data.get("payload", [])
+                if isinstance(payload, list):
+                    messages = payload
+                elif isinstance(payload, dict):
+                    messages = payload.get("messages", [])
+            return any(m.get("message_type") in (0, "incoming") for m in messages if isinstance(m, dict))
+        except Exception:
+            return False
+
     async def log_incoming_message(
         self,
         phone_e164: str,
@@ -274,6 +303,9 @@ class ChatwootClient:
 
         Returns (conversation_id, chatwoot_message_id).
         Best-effort: callers should catch all exceptions.
+
+        No wa.me deeplink is appended — the client already has WhatsApp open
+        and the link would only add noise to the conversation view.
         """
         contact_id = await self.get_or_create_contact(
             phone_e164,
@@ -283,7 +315,7 @@ class ChatwootClient:
 
         message_id = await self.send_message(
             conversation_id,
-            append_wa_deeplink(content, phone_e164),
+            content,
             message_type="incoming",
         )
         logger.info(
@@ -308,14 +340,20 @@ class ChatwootClient:
           private=True → yellow speech bubble, visible to agents only,
           never delivered to the customer, no conflict with Meta webhook.
 
+        Deeplink policy: attach a wa.me link only when the conversation has
+        no prior inbound from the client.  Once the client has written in,
+        the deeplink is redundant and pollutes the conversation view.
+
         Never raises — best-effort.
         """
         try:
             contact_id = await self.get_or_create_contact(phone_e164, name=contact_name)
             conversation_id = await self.get_or_create_conversation(contact_id)
+            has_inbound = await self._conversation_has_inbound(conversation_id)
+            body = text if has_inbound else append_wa_deeplink(text, phone_e164)
             msg_id = await self.send_message(
                 conversation_id,
-                append_wa_deeplink(text, phone_e164),
+                body,
                 message_type="outgoing",
                 private=True,
             )

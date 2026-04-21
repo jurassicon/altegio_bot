@@ -170,6 +170,10 @@ async def test_mirror_outbound_as_note(client: ChatwootClient) -> None:
     respx.get("https://chatwoot.example.com/api/v1/accounts/1/contacts/5/conversations").mock(
         return_value=httpx.Response(200, json={"payload": [{"id": 20, "inbox_id": 2, "status": "open"}]})
     )
+    # No prior inbound from client.
+    respx.get("https://chatwoot.example.com/api/v1/accounts/1/conversations/20/messages").mock(
+        return_value=httpx.Response(200, json={"payload": []})
+    )
     post_mock = respx.post("https://chatwoot.example.com/api/v1/accounts/1/conversations/20/messages").mock(
         return_value=httpx.Response(200, json={"id": 300, "content": "Note"})
     )
@@ -195,6 +199,10 @@ async def test_mirror_outbound_as_note_with_contact_name(client: ChatwootClient)
     )
     respx.get("https://chatwoot.example.com/api/v1/accounts/1/contacts/77/conversations").mock(
         return_value=httpx.Response(200, json={"payload": [{"id": 20, "inbox_id": 2, "status": "open"}]})
+    )
+    # No prior inbound from client.
+    respx.get("https://chatwoot.example.com/api/v1/accounts/1/conversations/20/messages").mock(
+        return_value=httpx.Response(200, json={"payload": []})
     )
     respx.post("https://chatwoot.example.com/api/v1/accounts/1/conversations/20/messages").mock(
         return_value=httpx.Response(200, json={"id": 301, "content": "Note"})
@@ -320,11 +328,24 @@ def _mock_contact_and_conv(phone: str, contact_id: int, conv_id: int) -> None:
     )
 
 
+def _mock_messages(conv_id: int, messages: list) -> None:
+    """Mock GET /conversations/{conv_id}/messages."""
+    respx.get(f"https://chatwoot.example.com/api/v1/accounts/1/conversations/{conv_id}/messages").mock(
+        return_value=httpx.Response(200, json={"payload": messages})
+    )
+
+
+# ---------------------------------------------------------------------------
+# Deeplink rules for log_incoming_message
+# ---------------------------------------------------------------------------
+
+
 @respx.mock
 @pytest.mark.asyncio
-async def test_log_incoming_message_body_contains_deeplink(
+async def test_log_incoming_message_body_no_deeplink(
     client: ChatwootClient,
 ) -> None:
+    """Incoming customer message must NOT contain a wa.me deeplink."""
     _mock_contact_and_conv("+4917630316130", 5, 20)
     post_route = respx.post("https://chatwoot.example.com/api/v1/accounts/1/conversations/20/messages").mock(
         return_value=httpx.Response(200, json={"id": 200, "content": "x"})
@@ -333,16 +354,24 @@ async def test_log_incoming_message_body_contains_deeplink(
     await client.log_incoming_message("+4917630316130", "Привет")
 
     sent = json.loads(post_route.calls[0].request.content)
-    assert "https://wa.me/4917630316130" in sent["content"]
     assert "Привет" in sent["content"]
+    assert "https://wa.me/" not in sent["content"]
+
+
+# ---------------------------------------------------------------------------
+# Deeplink rules for mirror_outbound_as_note
+# ---------------------------------------------------------------------------
 
 
 @respx.mock
 @pytest.mark.asyncio
-async def test_mirror_outbound_body_contains_deeplink(
+async def test_mirror_outbound_no_prior_inbound_contains_deeplink(
     client: ChatwootClient,
 ) -> None:
+    """Bot mirror note BEFORE first client inbound must contain a wa.me deeplink."""
     _mock_contact_and_conv("+4917630316130", 5, 20)
+    # Conversation has only outgoing/activity messages — no inbound from client.
+    _mock_messages(20, [{"id": 1, "message_type": 1, "content": "prev outgoing"}])
     post_route = respx.post("https://chatwoot.example.com/api/v1/accounts/1/conversations/20/messages").mock(
         return_value=httpx.Response(200, json={"id": 300, "content": "x"})
     )
@@ -350,6 +379,48 @@ async def test_mirror_outbound_body_contains_deeplink(
     await client.mirror_outbound_as_note("+4917630316130", "Запись подтверждена")
 
     sent = json.loads(post_route.calls[0].request.content)
-    assert "https://wa.me/4917630316130" in sent["content"]
     assert "Запись подтверждена" in sent["content"]
+    assert "https://wa.me/4917630316130" in sent["content"]
     assert sent["private"] is True
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_mirror_outbound_after_inbound_no_deeplink(
+    client: ChatwootClient,
+) -> None:
+    """Bot mirror note AFTER client wrote in must NOT contain a wa.me deeplink."""
+    _mock_contact_and_conv("+4917630316130", 5, 20)
+    # Conversation already has an incoming message from the client.
+    _mock_messages(20, [{"id": 1, "message_type": 0, "content": "client wrote"}])
+    post_route = respx.post("https://chatwoot.example.com/api/v1/accounts/1/conversations/20/messages").mock(
+        return_value=httpx.Response(200, json={"id": 301, "content": "x"})
+    )
+
+    await client.mirror_outbound_as_note("+4917630316130", "Запись подтверждена")
+
+    sent = json.loads(post_route.calls[0].request.content)
+    assert "Запись подтверждена" in sent["content"]
+    assert "https://wa.me/" not in sent["content"]
+    assert sent["private"] is True
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_mirror_outbound_messages_api_error_keeps_deeplink(
+    client: ChatwootClient,
+) -> None:
+    """When messages API fails, default to including deeplink (safe fallback)."""
+    _mock_contact_and_conv("+4917630316130", 5, 20)
+    # Simulate a 500 from the messages endpoint.
+    respx.get("https://chatwoot.example.com/api/v1/accounts/1/conversations/20/messages").mock(
+        return_value=httpx.Response(500)
+    )
+    post_route = respx.post("https://chatwoot.example.com/api/v1/accounts/1/conversations/20/messages").mock(
+        return_value=httpx.Response(200, json={"id": 302, "content": "x"})
+    )
+
+    await client.mirror_outbound_as_note("+4917630316130", "Nachricht")
+
+    sent = json.loads(post_route.calls[0].request.content)
+    assert "https://wa.me/4917630316130" in sent["content"]
