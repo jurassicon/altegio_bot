@@ -655,8 +655,11 @@ async def _handle_operator_relay(
         agent_name,
     )
 
+    # Use the primary (Meta) transport directly — the operator's message is
+    # already visible in Chatwoot, so mirroring it back would create a duplicate.
+    meta_provider = getattr(provider, "_primary", provider)
     wamid, err = await safe_send(
-        provider=provider,
+        provider=meta_provider,
         sender_id=sender_id,
         phone=phone_e164,
         text=text,
