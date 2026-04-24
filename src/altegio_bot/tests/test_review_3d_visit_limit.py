@@ -408,6 +408,7 @@ def _patch_worker_common(
     monkeypatch.setattr(ow, "safe_send", fake_safe_send)
     monkeypatch.setattr(ow, "safe_send_template", fake_safe_send)
     monkeypatch.setattr(ow, "utcnow", lambda: FIXED_NOW)
+    monkeypatch.setattr(ow, "_count_131026_failures", AsyncMock(return_value=0))
 
 
 def test_worker_cancels_review_3d_when_visits_over_limit(

@@ -63,6 +63,14 @@ class Settings(BaseSettings):
     # Local timezone for display (IANA name)
     ops_local_tz: str = "Europe/Berlin"
 
+    # Temporary auto-suppression for wa error code 131026
+    # (undeliverable recipient / WA unreachable).
+    # After `threshold` failures within `window_days`, automated sends to
+    # that phone are skipped and logged as status='canceled'.
+    wa_131026_suppression_enabled: bool = True
+    wa_131026_suppression_threshold: int = 2
+    wa_131026_suppression_window_days: int = 14
+
     # Максимальное число параллельных CRM-запросов при сегментации кампании.
     # Защищает от перегрузки Altegio API. Переопределяется через env:
     #   CAMPAIGN_CRM_MAX_CONCURRENCY=8

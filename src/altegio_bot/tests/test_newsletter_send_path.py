@@ -243,6 +243,7 @@ async def test_outbox_worker_injects_loyalty_card_text_for_newsletter(monkeypatc
     monkeypatch.setattr(ow, "_load_record", AsyncMock(return_value=None))
     monkeypatch.setattr(ow, "_load_client", AsyncMock(return_value=None))
     monkeypatch.setattr(ow, "_apply_rate_limit", AsyncMock(return_value=None))
+    monkeypatch.setattr(ow, "_count_131026_failures", AsyncMock(return_value=0))
 
     # Fake _render_message returning a booking_link context
     async def _fake_render_message(session, *, company_id, template_code, record, client):
@@ -315,6 +316,7 @@ async def test_outbox_worker_newsletter_ra_uses_v1_template(monkeypatch: Any) ->
     monkeypatch.setattr(ow, "_load_record", AsyncMock(return_value=None))
     monkeypatch.setattr(ow, "_load_client", AsyncMock(return_value=None))
     monkeypatch.setattr(ow, "_apply_rate_limit", AsyncMock(return_value=None))
+    monkeypatch.setattr(ow, "_count_131026_failures", AsyncMock(return_value=0))
 
     async def _fake_render_message(session, *, company_id, template_code, record, client):
         ctx = {
@@ -421,6 +423,7 @@ async def test_crm_only_monthly_newsletter_uses_contact_name_as_param1(monkeypat
     monkeypatch.setattr(ow, "_load_record", AsyncMock(return_value=None))
     monkeypatch.setattr(ow, "_load_client", AsyncMock(return_value=None))
     monkeypatch.setattr(ow, "_apply_rate_limit", AsyncMock(return_value=None))
+    monkeypatch.setattr(ow, "_count_131026_failures", AsyncMock(return_value=0))
 
     async def _fake_render(session, *, company_id, template_code, record, client):
         # Simulates CRM-only: no local client → client_name=""
@@ -475,6 +478,7 @@ async def test_crm_only_followup_newsletter_uses_contact_name_as_param1(monkeypa
     monkeypatch.setattr(ow, "_load_record", AsyncMock(return_value=None))
     monkeypatch.setattr(ow, "_load_client", AsyncMock(return_value=None))
     monkeypatch.setattr(ow, "_apply_rate_limit", AsyncMock(return_value=None))
+    monkeypatch.setattr(ow, "_count_131026_failures", AsyncMock(return_value=0))
 
     async def _fake_render(session, *, company_id, template_code, record, client):
         return "Hallo {{1}}, ...", 1, "de", _make_render_ctx(client_name="")
@@ -528,6 +532,7 @@ async def test_local_client_monthly_newsletter_uses_display_name_not_payload(mon
     monkeypatch.setattr(ow, "_load_record", AsyncMock(return_value=None))
     monkeypatch.setattr(ow, "_load_client", AsyncMock(return_value=local_client))
     monkeypatch.setattr(ow, "_apply_rate_limit", AsyncMock(return_value=None))
+    monkeypatch.setattr(ow, "_count_131026_failures", AsyncMock(return_value=0))
 
     async def _fake_render(session, *, company_id, template_code, record, client):
         # Local client present: _render_message sets client_name=display_name
@@ -589,6 +594,7 @@ async def test_crm_only_no_contact_name_fails_preflight(monkeypatch: Any) -> Non
     monkeypatch.setattr(ow, "_load_record", AsyncMock(return_value=None))
     monkeypatch.setattr(ow, "_load_client", AsyncMock(return_value=None))
     monkeypatch.setattr(ow, "_apply_rate_limit", AsyncMock(return_value=None))
+    monkeypatch.setattr(ow, "_count_131026_failures", AsyncMock(return_value=0))
 
     async def _fake_render(session, *, company_id, template_code, record, client):
         return "Hallo {{1}}, ...", 1, "de", _make_render_ctx(client_name="")

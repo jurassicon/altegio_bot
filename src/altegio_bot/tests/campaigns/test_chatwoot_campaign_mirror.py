@@ -101,6 +101,7 @@ def _patch_outbox_no_prior_send(monkeypatch: Any) -> None:
 
 def _patch_rate_limit_ok(monkeypatch: Any) -> None:
     monkeypatch.setattr(ow, "_apply_rate_limit", AsyncMock(return_value=None))
+    monkeypatch.setattr(ow, "_count_131026_failures", AsyncMock(return_value=0))
 
 
 def _patch_render(monkeypatch: Any, body: str = "Hallo Anna! Karte: 123") -> None:

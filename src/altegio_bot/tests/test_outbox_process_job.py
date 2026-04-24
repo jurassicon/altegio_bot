@@ -85,8 +85,12 @@ def patch_outbox_checks(
     async def _fake_find_existing(session: Any, job_id: int) -> Any:
         return result
 
+    async def _fake_count_131026(session: Any, phone: str, window_days: int) -> int:
+        return 0
+
     monkeypatch.setattr(ow, "_find_success_outbox", _fake_find_success)
     monkeypatch.setattr(ow, "_find_existing_outbox", _fake_find_existing)
+    monkeypatch.setattr(ow, "_count_131026_failures", _fake_count_131026)
 
 
 def test_process_job_skips_if_outbox_exists(monkeypatch: Any) -> None:

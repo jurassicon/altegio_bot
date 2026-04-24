@@ -94,6 +94,15 @@ def _esc(s: Any) -> str:
     return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
 
 
+def _error_cell(error: str | None) -> str:
+    text = (error or "")[:80]
+    cell = f'<span class="text-danger small">{_esc(text)}</span>'
+    if error and error.startswith("suppressed_131026"):
+        badge = '<span class="badge bg-info text-dark me-1">suppressed 131026</span>'
+        cell = badge + cell
+    return cell
+
+
 def _status_badge(status: str | None) -> str:
     if not status:
         return ""
@@ -169,6 +178,7 @@ def _page(title: str, body: str) -> str:
     .table-sm td, .table-sm th {{ font-size: .85rem; }}
     .warn {{ background-color: #fff3cd !important; }}
     .stuck {{ background-color: #f8d7da !important; }}
+    .suppressed {{ background-color: #cff4fc !important; }}
   </style>
 </head>
 <body class="bg-light">
@@ -601,6 +611,8 @@ async def ops_history(request: Request) -> str:
         if r.wa_err_code:
             wa_delivery += f' <span class="text-danger small">{_esc(r.wa_err_code)}</span>'
         row_class = "warn" if r.status == "failed" else ""
+        if r.error and r.error.startswith("suppressed_131026"):
+            row_class = "suppressed"
         # Show send type badge
         send_type = r.send_type or ""
         send_badge = (
@@ -623,7 +635,7 @@ async def ops_history(request: Request) -> str:
                 _status_badge(r.status),
                 wa_delivery,
                 _esc((r.provider_message_id or "")[:40]),
-                f'<span class="text-danger small">{_esc((r.error or "")[:80])}</span>',
+                _error_cell(r.error),
             ]
         )
         row_classes.append(row_class)

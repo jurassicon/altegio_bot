@@ -376,6 +376,7 @@ def _patch_unit_common(monkeypatch: Any, job: _FakeJob, client: _FakeClient | No
     monkeypatch.setattr(worker_mod, "safe_send", fake_safe_send)
     monkeypatch.setattr(worker_mod, "safe_send_template", fake_safe_send)
     monkeypatch.setattr(worker_mod, "utcnow", lambda: FIXED_NOW)
+    monkeypatch.setattr(worker_mod, "_count_131026_failures", AsyncMock(return_value=0))
 
 
 def test_repeat_10d_guard_passes_when_no_future_appointment(monkeypatch: Any) -> None:
