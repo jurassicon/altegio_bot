@@ -612,6 +612,38 @@ def _is_token_expired_error(err: str) -> bool:
     return "access token" in low and "expired" in low
 
 
+async def _count_131026_failures(
+    session: AsyncSession,
+    phone: str,
+    window_days: int,
+) -> int:
+    """Count automated wa_err_code=131026 failures for phone in window."""
+    window_start = utcnow() - timedelta(days=window_days)
+    result = await session.execute(
+        text(
+            "SELECT COUNT(*) FROM outbox_messages om "
+            "WHERE om.phone_e164 = :phone "
+            "  AND om.status = 'failed' "
+            "  AND om.sent_at >= :window_start "
+            "  AND om.provider_message_id IS NOT NULL "
+            "  AND om.message_source = 'bot' "
+            "  AND EXISTS ( "
+            "    SELECT 1 FROM whatsapp_events we WHERE "
+            "      payload "
+            "        #>> '{entry,0,changes,0,value,statuses,0,id}' "
+            "        = om.provider_message_id "
+            "      AND payload "
+            "        #>> "
+            "        '{entry,0,changes,0,value,statuses,0,errors,0,code}' "
+            "        = '131026' "
+            "    LIMIT 1 "
+            "  )"
+        ),
+        {"phone": phone, "window_start": window_start},
+    )
+    return result.scalar_one()
+
+
 async def process_job_in_session(
     session: AsyncSession,
     job_id: int,
@@ -837,6 +869,50 @@ async def _run_job_logic(
         job.locked_at = None
         job.last_error = "No phone_e164"
         return
+
+    if settings.wa_131026_suppression_enabled:
+        n_fail = await _count_131026_failures(
+            session,
+            phone,
+            settings.wa_131026_suppression_window_days,
+        )
+        if n_fail >= settings.wa_131026_suppression_threshold:
+            _wd = settings.wa_131026_suppression_window_days
+            reason = f"suppressed_131026: repeated undeliverable ({n_fail} in {_wd}d)"
+            out = OutboxMessage(
+                company_id=job.company_id,
+                client_id=(client.id if client else None),
+                record_id=(record.id if record else None),
+                job_id=job.id,
+                sender_id=None,
+                phone_e164=phone,
+                template_code=job.job_type,
+                language=DEFAULT_LANGUAGE,
+                body="",
+                status="canceled",
+                error=reason,
+                provider_message_id=None,
+                scheduled_at=job.run_at,
+                sent_at=utcnow(),
+                meta={
+                    "suppression_code": "131026",
+                    "threshold": (settings.wa_131026_suppression_threshold),
+                    "window_days": _wd,
+                    "matched_failures": n_fail,
+                },
+            )
+            session.add(out)
+            job.status = "canceled"
+            job.locked_at = None
+            job.last_error = reason
+            logger.info(
+                "Suppressed 131026 job_id=%s phone=%s failures=%d window=%dd",
+                job.id,
+                phone,
+                n_fail,
+                _wd,
+            )
+            return
 
     delay_until = await _apply_rate_limit(session, phone)
     if delay_until is not None:

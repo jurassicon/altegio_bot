@@ -169,6 +169,7 @@ def _patch_common(monkeypatch: Any) -> None:
     monkeypatch.setattr(ow, "_load_record", AsyncMock(return_value=None))
     monkeypatch.setattr(ow, "_load_client", AsyncMock(return_value=None))
     monkeypatch.setattr(ow, "_apply_rate_limit", AsyncMock(return_value=None))
+    monkeypatch.setattr(ow, "_count_131026_failures", AsyncMock(return_value=0))
 
 
 # ---------------------------------------------------------------------------

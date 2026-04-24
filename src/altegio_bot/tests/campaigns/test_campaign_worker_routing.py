@@ -377,6 +377,7 @@ async def _make_campaign_send_succeed(
     monkeypatch.setattr(ow, "_load_record", AsyncMock(return_value=None))
     monkeypatch.setattr(ow, "_load_client", AsyncMock(return_value=_FakeClient(id=1)))
     monkeypatch.setattr(ow, "_apply_rate_limit", AsyncMock(return_value=None))
+    monkeypatch.setattr(ow, "_count_131026_failures", AsyncMock(return_value=0))
     monkeypatch.setattr(
         ow,
         "_render_message",
@@ -393,6 +394,7 @@ async def _make_campaign_send_succeed(
     # Patch settings so send_mode is 'text' (avoids Meta template resolution).
     fake_settings = MagicMock()
     fake_settings.whatsapp_send_mode = "text"
+    fake_settings.wa_131026_suppression_enabled = False
     monkeypatch.setattr(ow, "settings", fake_settings)
 
     monkeypatch.setattr(ow, "safe_send", AsyncMock(return_value=("wa_msg_id_1", None)))
@@ -570,6 +572,7 @@ async def test_run_job_logic_send_failure_returns_none(
     monkeypatch.setattr(ow, "_load_record", AsyncMock(return_value=None))
     monkeypatch.setattr(ow, "_load_client", AsyncMock(return_value=_FakeClient(id=1)))
     monkeypatch.setattr(ow, "_apply_rate_limit", AsyncMock(return_value=None))
+    monkeypatch.setattr(ow, "_count_131026_failures", AsyncMock(return_value=0))
     monkeypatch.setattr(
         ow,
         "_render_message",
@@ -578,6 +581,9 @@ async def test_run_job_logic_send_failure_returns_none(
 
     fake_settings = MagicMock()
     fake_settings.whatsapp_send_mode = "text"
+    fake_settings.wa_131026_suppression_enabled = True
+    fake_settings.wa_131026_suppression_threshold = 2
+    fake_settings.wa_131026_suppression_window_days = 14
     monkeypatch.setattr(ow, "settings", fake_settings)
 
     # Send returns an error.
