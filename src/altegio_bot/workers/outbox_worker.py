@@ -617,13 +617,22 @@ async def _count_131026_failures(
     phone: str,
     window_days: int,
 ) -> int:
-    """Count automated wa_err_code=131026 failures for phone in window."""
+    """Count Meta 131026 undeliverable events for phone within window.
+
+    Real production pattern:
+    - outbox_messages.status stays 'sent' (Meta accepted the API call)
+    - delivery webhook arrives later with statuses[0].status='failed'
+      and statuses[0].errors[0].code=131026
+    - The webhook worker does NOT downgrade 'sent' to 'failed' because
+      'failed' has rank 0 which is lower than 'sent' rank 3.
+    So om.status is NOT checked here — we rely solely on the webhook
+    payload in whatsapp_events.
+    """
     window_start = utcnow() - timedelta(days=window_days)
     result = await session.execute(
         text(
             "SELECT COUNT(*) FROM outbox_messages om "
             "WHERE om.phone_e164 = :phone "
-            "  AND om.status = 'failed' "
             "  AND om.sent_at >= :window_start "
             "  AND om.provider_message_id IS NOT NULL "
             "  AND om.message_source = 'bot' "
@@ -632,6 +641,10 @@ async def _count_131026_failures(
             "      payload "
             "        #>> '{entry,0,changes,0,value,statuses,0,id}' "
             "        = om.provider_message_id "
+            "      AND payload "
+            "        #>> "
+            "        '{entry,0,changes,0,value,statuses,0,status}' "
+            "        = 'failed' "
             "      AND payload "
             "        #>> "
             "        '{entry,0,changes,0,value,statuses,0,errors,0,code}' "
