@@ -281,6 +281,160 @@ async def test_repeat_10d_sends_and_marks_done_when_no_future_appointment(
 
 
 # ---------------------------------------------------------------------------
+# New guard: skip if client already returned after source record
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_repeat_10d_canceled_when_client_returned_after_source(
+    session_maker,
+    monkeypatch,
+) -> None:
+    """Guard fires: non-deleted record after source record → job canceled."""
+    monkeypatch.setattr(
+        worker_mod,
+        "client_has_future_appointments",
+        AsyncMock(return_value=False),
+    )
+    send_mock = AsyncMock()
+    monkeypatch.setattr(worker_mod, "safe_send", send_mock)
+    monkeypatch.setattr(worker_mod, "safe_send_template", send_mock)
+
+    async with session_maker() as session:
+        async with session.begin():
+            job = await _make_repeat_job(session)
+            source_record = await session.get(Record, job.record_id)
+            later_record = Record(
+                company_id=1,
+                altegio_record_id=222,
+                client_id=source_record.client_id,
+                altegio_client_id=9001,
+                starts_at=worker_mod.utcnow() - timedelta(days=5),
+                is_deleted=False,
+                raw={},
+            )
+            session.add(later_record)
+
+        async with session.begin():
+            await worker_mod.process_job_in_session(
+                session=session,
+                job_id=job.id,
+                provider=DummyProvider(),
+            )
+
+        refreshed_job = await session.get(MessageJob, job.id)
+        outbox_rows = (
+            (await session.execute(select(OutboxMessage).where(OutboxMessage.job_id == job.id))).scalars().all()
+        )
+
+    send_mock.assert_not_called()
+    assert refreshed_job is not None
+    assert refreshed_job.status == "canceled"
+    assert refreshed_job.locked_at is None
+    assert refreshed_job.last_error == ("Skipped: client already returned within repeat_10d window")
+    assert outbox_rows == []
+
+
+@pytest.mark.asyncio
+async def test_repeat_10d_not_canceled_when_no_appointment_after_source(
+    session_maker,
+    monkeypatch,
+) -> None:
+    """Guard does not fire when there are no records after source record."""
+    monkeypatch.setattr(
+        worker_mod,
+        "client_has_future_appointments",
+        AsyncMock(return_value=False),
+    )
+    monkeypatch.setattr(worker_mod.settings, "whatsapp_send_mode", "text")
+    send_mock = AsyncMock(return_value=("msg-no-later-001", None))
+    monkeypatch.setattr(worker_mod, "safe_send", send_mock)
+
+    async def _fake_render(session, *, company_id, template_code, record, client):
+        return (
+            "Hallo {client_name}!",
+            None,
+            "de",
+            {"client_name": client.display_name if client else ""},
+        )
+
+    monkeypatch.setattr(worker_mod, "_render_message", _fake_render)
+
+    async with session_maker() as session:
+        async with session.begin():
+            job = await _make_repeat_job(session)
+
+        async with session.begin():
+            await worker_mod.process_job_in_session(
+                session=session,
+                job_id=job.id,
+                provider=DummyProvider(),
+            )
+
+        refreshed_job = await session.get(MessageJob, job.id)
+
+    send_mock.assert_awaited_once()
+    assert refreshed_job is not None
+    assert refreshed_job.status == "done"
+    assert refreshed_job.last_error is None
+
+
+@pytest.mark.asyncio
+async def test_repeat_10d_not_canceled_when_only_deleted_appointment_after_source(
+    session_maker,
+    monkeypatch,
+) -> None:
+    """Deleted record after source record is not a valid return — guard skips."""
+    monkeypatch.setattr(
+        worker_mod,
+        "client_has_future_appointments",
+        AsyncMock(return_value=False),
+    )
+    monkeypatch.setattr(worker_mod.settings, "whatsapp_send_mode", "text")
+    send_mock = AsyncMock(return_value=("msg-deleted-001", None))
+    monkeypatch.setattr(worker_mod, "safe_send", send_mock)
+
+    async def _fake_render(session, *, company_id, template_code, record, client):
+        return (
+            "Hallo {client_name}!",
+            None,
+            "de",
+            {"client_name": client.display_name if client else ""},
+        )
+
+    monkeypatch.setattr(worker_mod, "_render_message", _fake_render)
+
+    async with session_maker() as session:
+        async with session.begin():
+            job = await _make_repeat_job(session)
+            source_record = await session.get(Record, job.record_id)
+            deleted_later = Record(
+                company_id=1,
+                altegio_record_id=333,
+                client_id=source_record.client_id,
+                altegio_client_id=9001,
+                starts_at=worker_mod.utcnow() - timedelta(days=3),
+                is_deleted=True,
+                raw={},
+            )
+            session.add(deleted_later)
+
+        async with session.begin():
+            await worker_mod.process_job_in_session(
+                session=session,
+                job_id=job.id,
+                provider=DummyProvider(),
+            )
+
+        refreshed_job = await session.get(MessageJob, job.id)
+
+    send_mock.assert_awaited_once()
+    assert refreshed_job is not None
+    assert refreshed_job.status == "done"
+    assert refreshed_job.last_error is None
+
+
+# ---------------------------------------------------------------------------
 # Unit tests (fake session — no real DB needed)
 # ---------------------------------------------------------------------------
 
