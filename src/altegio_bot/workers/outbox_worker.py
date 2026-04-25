@@ -825,6 +825,25 @@ async def _run_job_logic(
             job.last_error = "Skipped: client already has a future appointment (Altegio API)"
             return
 
+        if record is not None and record.client_id is not None and record.starts_at is not None:
+            later_stmt = (
+                select(Record.id)
+                .where(Record.company_id == job.company_id)
+                .where(Record.client_id == record.client_id)
+                .where(Record.is_deleted.is_(False))
+                .where(Record.id != record.id)
+                .where(Record.starts_at.is_not(None))
+                .where(Record.starts_at > record.starts_at)
+                .where(Record.starts_at <= utcnow())
+                .limit(1)
+            )
+            later_res = await session.execute(later_stmt)
+            if later_res.scalar_one_or_none() is not None:
+                job.status = "canceled"
+                job.locked_at = None
+                job.last_error = "Skipped: client already returned within repeat_10d window"
+                return
+
     if record is not None and getattr(record, "is_deleted", False):
         allow_deleted = job.job_type in ("record_canceled", "comeback_3d")
         if not allow_deleted:
