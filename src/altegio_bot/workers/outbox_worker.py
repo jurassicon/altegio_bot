@@ -865,6 +865,12 @@ async def _run_job_logic(
             job.last_error = "Skipped: record is not deleted"
             return
 
+        if record.starts_at is None:
+            job.status = "canceled"
+            job.locked_at = None
+            job.last_error = "Skipped: source record starts_at missing for comeback_3d"
+            return
+
         if client is not None:
             future_stmt = (
                 select(Record.id)
@@ -898,17 +904,10 @@ async def _run_job_logic(
                 job.last_error = "Skipped: comeback_3d already sent in the last 30 days"
                 return
 
-        if record.starts_at is None:
-            job.status = "canceled"
-            job.locked_at = None
-            job.last_error = "Skipped: source record starts_at missing for comeback_3d"
-            return
-
-        if record.client_id is not None:
             later_stmt = (
                 select(Record.id)
                 .where(Record.company_id == job.company_id)
-                .where(Record.client_id == record.client_id)
+                .where(Record.client_id == client.id)
                 .where(Record.is_deleted.is_(False))
                 .where(Record.id != record.id)
                 .where(Record.starts_at.is_not(None))

@@ -369,3 +369,62 @@ async def test_comeback_3d_canceled_when_source_starts_at_is_missing(
     assert refreshed_job.status == "canceled"
     assert refreshed_job.locked_at is None
     assert refreshed_job.last_error == ("Skipped: source record starts_at missing for comeback_3d")
+
+
+@pytest.mark.asyncio
+async def test_comeback_3d_not_suppressed_when_below_131026_threshold(
+    session_maker,
+    monkeypatch,
+) -> None:
+    """comeback_3d passes all guards and reaches send when 131026 failures < threshold."""
+    send_mock = _patch_text_send(monkeypatch, "msg-131026-below-001")
+    monkeypatch.setattr(worker_mod, "_count_131026_failures", AsyncMock(return_value=1))
+
+    async with session_maker() as session:
+        async with session.begin():
+            job = await _make_comeback_job(session)
+
+        async with session.begin():
+            await worker_mod.process_job_in_session(
+                session=session,
+                job_id=job.id,
+                provider=DummyProvider(),
+            )
+
+        refreshed_job = await session.get(MessageJob, job.id)
+
+    send_mock.assert_awaited_once()
+    assert refreshed_job is not None
+    assert refreshed_job.status == "done"
+    assert "suppressed_131026" not in (refreshed_job.last_error or "")
+
+
+@pytest.mark.asyncio
+async def test_comeback_3d_suppressed_when_above_131026_threshold(
+    session_maker,
+    monkeypatch,
+) -> None:
+    """comeback_3d is canceled (not sent) when 131026 failures >= threshold."""
+    send_mock = AsyncMock()
+    monkeypatch.setattr(worker_mod, "safe_send", send_mock)
+    monkeypatch.setattr(worker_mod, "safe_send_template", send_mock)
+    monkeypatch.setattr(worker_mod, "_count_131026_failures", AsyncMock(return_value=2))
+
+    async with session_maker() as session:
+        async with session.begin():
+            job = await _make_comeback_job(session)
+
+        async with session.begin():
+            await worker_mod.process_job_in_session(
+                session=session,
+                job_id=job.id,
+                provider=DummyProvider(),
+            )
+
+        refreshed_job = await session.get(MessageJob, job.id)
+
+    send_mock.assert_not_called()
+    assert refreshed_job is not None
+    assert refreshed_job.status == "canceled"
+    assert refreshed_job.locked_at is None
+    assert (refreshed_job.last_error or "").startswith("suppressed_131026")
