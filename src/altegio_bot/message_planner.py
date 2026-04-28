@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import func, or_, select, update
@@ -25,6 +25,8 @@ REMINDER_2H = "reminder_2h"
 REVIEW_3D = "review_3d"
 REPEAT_10D = "repeat_10d"
 COMEBACK_3D = "comeback_3d"
+COMEBACK_3D_DELAY = timedelta(days=3)
+COMEBACK_3D_SOURCE_CANCELLED_AT_KEY = "source_cancelled_at"
 
 SYSTEM_JOB_TYPES = (
     RECORD_CREATED,
@@ -77,6 +79,13 @@ def _record_event_job_type(event_status: str) -> str:
         return RECORD_UPDATED
 
     return RECORD_CANCELED
+
+
+def _as_utc(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+
+    return dt.astimezone(timezone.utc)
 
 
 def make_dedupe_key(
@@ -228,6 +237,7 @@ async def plan_jobs_for_record_event(
     event_status: str | None = None,
     status: str | None = None,
     event_kind: str | None = None,
+    source_cancelled_at: datetime | None = None,
 ) -> None:
     norm_status = _normalize_event_status(event_status)
     if norm_status is None:
@@ -374,7 +384,8 @@ async def plan_jobs_for_record_event(
                 already_queued = True
 
         if not already_queued:
-            comeback_at = utcnow() + timedelta(days=3)
+            cancelled_at = _as_utc(source_cancelled_at) if source_cancelled_at is not None else now
+            comeback_at = cancelled_at + COMEBACK_3D_DELAY
             await add_job(
                 session,
                 company_id=cid,
@@ -382,5 +393,8 @@ async def plan_jobs_for_record_event(
                 client_id=record_obj.client_id,
                 job_type=COMEBACK_3D,
                 run_at=comeback_at,
-                payload={"kind": COMEBACK_3D},
+                payload={
+                    "kind": COMEBACK_3D,
+                    COMEBACK_3D_SOURCE_CANCELLED_AT_KEY: cancelled_at.isoformat(),
+                },
             )

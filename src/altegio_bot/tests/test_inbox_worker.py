@@ -268,3 +268,21 @@ class TestHandleEventVisitAttendance:
         event = self._make_event(visit_attendance=-1, event_status="create")
         called = await self._run_handle(event)
         assert called, "plan_jobs SHOULD be called for event_status=create"
+
+    async def test_delete_event_passes_last_change_date_as_source_cancelled_at(self):
+        event = self._make_event(visit_attendance=0, event_status="delete")
+        event.payload["data"]["last_change_date"] = "2026-04-01T14:00:00+0200"
+        session = AsyncMock()
+
+        with (
+            patch("altegio_bot.workers.inbox_worker.upsert_client", new=AsyncMock(return_value=7)),
+            patch("altegio_bot.workers.inbox_worker.upsert_record", new=AsyncMock(return_value=99)),
+            patch("altegio_bot.workers.inbox_worker.replace_record_services", new=AsyncMock()),
+            patch("altegio_bot.workers.inbox_worker.record_has_allowed_service", new=AsyncMock(return_value=True)),
+            patch("altegio_bot.workers.inbox_worker.plan_jobs_for_record_event", new=AsyncMock()) as mock_plan,
+        ):
+            session.get = AsyncMock(return_value=MagicMock(id=99, company_id=123))
+            await handle_event(session, event)
+
+        mock_plan.assert_awaited_once()
+        assert mock_plan.await_args.kwargs["source_cancelled_at"] == datetime(2026, 4, 1, 12, 0, tzinfo=timezone.utc)

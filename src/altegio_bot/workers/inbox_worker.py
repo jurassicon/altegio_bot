@@ -63,6 +63,50 @@ def parse_dt(value: str | None) -> datetime | None:
     return dt
 
 
+def _normalize_event_status(value: str | None) -> str | None:
+    if value is None:
+        return None
+
+    v = str(value).strip().lower()
+    if v in ("delete", "deleted", "cancel", "canceled", "record_canceled"):
+        return "delete"
+
+    if v in ("create", "created", "record_created"):
+        return "create"
+
+    if v in ("update", "updated", "record_updated"):
+        return "update"
+
+    return None
+
+
+def _as_utc(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+
+    return dt.astimezone(timezone.utc)
+
+
+def _resolve_source_cancelled_at(
+    event: AltegioEvent,
+    payload: dict[str, Any],
+    event_status: str | None,
+) -> datetime | None:
+    if _normalize_event_status(event_status) != "delete":
+        return None
+
+    data = payload.get("data") or {}
+    last_change_at = parse_dt(data.get("last_change_date"))
+    if last_change_at is not None:
+        return _as_utc(last_change_at)
+
+    received_at = getattr(event, "received_at", None)
+    if isinstance(received_at, datetime):
+        return _as_utc(received_at)
+
+    return utcnow()
+
+
 def _parse_starts_at(record_data: dict[str, Any]) -> datetime | None:
     """Return starts_at from record_data, preferring the ``date`` field.
 
@@ -363,6 +407,7 @@ async def handle_event(session: AsyncSession, event: AltegioEvent) -> None:
                 company_id=int(record_obj.company_id),
                 record_id=int(record_obj.id),
                 status=str(event_status),
+                source_cancelled_at=_resolve_source_cancelled_at(event, payload, event_status),
             )
 
         return

@@ -8,7 +8,7 @@ from decimal import Decimal
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import select, text, update
+from sqlalchemy import or_, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.altegio_records import (
@@ -20,7 +20,11 @@ from altegio_bot.campaigns.runner import (
     recompute_campaign_run_stats,
 )
 from altegio_bot.db import SessionLocal
-from altegio_bot.message_planner import MAX_VISITS_FOR_REVIEW
+from altegio_bot.message_planner import (
+    COMEBACK_3D_DELAY,
+    COMEBACK_3D_SOURCE_CANCELLED_AT_KEY,
+    MAX_VISITS_FOR_REVIEW,
+)
 from altegio_bot.meta_templates import (
     TEMPLATE_LANGUAGE,
     UNIVERSAL_JOB_TYPES,
@@ -74,6 +78,20 @@ _TOKEN_EXPIRED = False
 # real WhatsApp send attempts. This prevents transient Altegio API outages from
 # consuming the send-attempt budget.
 MAX_API_GUARD_ATTEMPTS = 5
+
+COMEBACK_3D_MISSING_SOURCE_REASON = "Skipped: source record missing for comeback_3d"
+COMEBACK_3D_MISSING_SOURCE_TIME_REASON = "Skipped: source record starts_at missing for comeback_3d"
+COMEBACK_3D_MISSING_CANCEL_TIME_REASON = "Skipped: source cancellation time is missing for comeback_3d guard"
+COMEBACK_3D_ALREADY_RETURNED_REASON = "Skipped: client already returned within comeback_3d window"
+
+_COMEBACK_3D_CANCELLED_AT_PAYLOAD_KEYS = (
+    COMEBACK_3D_SOURCE_CANCELLED_AT_KEY,
+    "source_canceled_at",
+    "cancelled_at",
+    "canceled_at",
+    "deleted_at",
+    "event_received_at",
+)
 
 STALE_PROCESSING_MINUTES = 10
 
@@ -319,6 +337,74 @@ async def _load_record(
     if job.record_id is None:
         return None
     return await session.get(Record, job.record_id)
+
+
+def _as_utc(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+
+    return dt.astimezone(timezone.utc)
+
+
+def _parse_payload_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return _as_utc(value)
+
+    if not isinstance(value, str):
+        return None
+
+    raw = value.strip()
+    if not raw:
+        return None
+
+    try:
+        return _as_utc(datetime.fromisoformat(raw.replace("Z", "+00:00")))
+    except ValueError:
+        return None
+
+
+def _resolve_comeback_cancelled_at(job: MessageJob, record: Record | None) -> datetime | None:
+    payload = getattr(job, "payload", None) or {}
+    for key in _COMEBACK_3D_CANCELLED_AT_PAYLOAD_KEYS:
+        resolved = _parse_payload_datetime(payload.get(key))
+        if resolved is not None:
+            return resolved
+
+    created_at = getattr(job, "created_at", None)
+    if isinstance(created_at, datetime):
+        return _as_utc(created_at)
+
+    run_at = getattr(job, "run_at", None)
+    if isinstance(run_at, datetime):
+        return _as_utc(run_at) - COMEBACK_3D_DELAY
+
+    return None
+
+
+async def _client_returned_since(
+    session: AsyncSession,
+    company_id: int,
+    altegio_client_id: int,
+    since: datetime,
+    *,
+    exclude_record_id: int | None = None,
+) -> bool:
+    stmt = (
+        select(Record.id)
+        .where(Record.company_id == company_id)
+        .where(Record.altegio_client_id == altegio_client_id)
+        .where(Record.is_deleted.is_(False))
+        .where(or_(Record.confirmed.is_(None), Record.confirmed != 0))
+        .where(Record.starts_at.is_not(None))
+        .where(Record.starts_at > _as_utc(since))
+        .where(Record.starts_at <= utcnow())
+        .limit(1)
+    )
+    if exclude_record_id is not None:
+        stmt = stmt.where(Record.id != exclude_record_id)
+
+    res = await session.execute(stmt)
+    return res.scalar_one_or_none() is not None
 
 
 def _pick_language(company_id: int, client: Client | None) -> str:
@@ -825,20 +911,15 @@ async def _run_job_logic(
             job.last_error = "Skipped: client already has a future appointment (Altegio API)"
             return
 
-        if record is not None and record.client_id is not None and record.starts_at is not None:
-            later_stmt = (
-                select(Record.id)
-                .where(Record.company_id == job.company_id)
-                .where(Record.client_id == record.client_id)
-                .where(Record.is_deleted.is_(False))
-                .where(Record.id != record.id)
-                .where(Record.starts_at.is_not(None))
-                .where(Record.starts_at > record.starts_at)
-                .where(Record.starts_at <= utcnow())
-                .limit(1)
+        if record is not None and record.starts_at is not None:
+            returned = await _client_returned_since(
+                session,
+                job.company_id,
+                int(altegio_cid),
+                record.starts_at,
+                exclude_record_id=int(record.id),
             )
-            later_res = await session.execute(later_stmt)
-            if later_res.scalar_one_or_none() is not None:
+            if returned:
                 job.status = "canceled"
                 job.locked_at = None
                 job.last_error = "Skipped: client already returned within repeat_10d window"
@@ -856,7 +937,13 @@ async def _run_job_logic(
         if record is None:
             job.status = "canceled"
             job.locked_at = None
-            job.last_error = "Skipped: source record missing for comeback_3d"
+            job.last_error = COMEBACK_3D_MISSING_SOURCE_REASON
+            return
+
+        if record.starts_at is None:
+            job.status = "canceled"
+            job.locked_at = None
+            job.last_error = COMEBACK_3D_MISSING_SOURCE_TIME_REASON
             return
 
         if not record.is_deleted:
@@ -865,10 +952,20 @@ async def _run_job_logic(
             job.last_error = "Skipped: record is not deleted"
             return
 
-        if record.starts_at is None:
+        altegio_cid_comeback = getattr(client, "altegio_client_id", None) if client is not None else None
+        if altegio_cid_comeback is None:
+            altegio_cid_comeback = getattr(record, "altegio_client_id", None)
+        if altegio_cid_comeback is None:
             job.status = "canceled"
             job.locked_at = None
-            job.last_error = "Skipped: source record starts_at missing for comeback_3d"
+            job.last_error = "Skipped: no altegio_client_id for comeback_3d"
+            return
+
+        comeback_cancelled_at = _resolve_comeback_cancelled_at(job, record)
+        if comeback_cancelled_at is None:
+            job.status = "canceled"
+            job.locked_at = None
+            job.last_error = COMEBACK_3D_MISSING_CANCEL_TIME_REASON
             return
 
         if client is not None:
@@ -904,23 +1001,18 @@ async def _run_job_logic(
                 job.last_error = "Skipped: comeback_3d already sent in the last 30 days"
                 return
 
-            later_stmt = (
-                select(Record.id)
-                .where(Record.company_id == job.company_id)
-                .where(Record.client_id == client.id)
-                .where(Record.is_deleted.is_(False))
-                .where(Record.id != record.id)
-                .where(Record.starts_at.is_not(None))
-                .where(Record.starts_at > record.starts_at)
-                .where(Record.starts_at <= utcnow())
-                .limit(1)
-            )
-            later_res = await session.execute(later_stmt)
-            if later_res.scalar_one_or_none() is not None:
-                job.status = "canceled"
-                job.locked_at = None
-                job.last_error = "Skipped: client already returned within comeback_3d window"
-                return
+        comeback_returned = await _client_returned_since(
+            session,
+            job.company_id,
+            int(altegio_cid_comeback),
+            comeback_cancelled_at,
+            exclude_record_id=int(record.id),
+        )
+        if comeback_returned:
+            job.status = "canceled"
+            job.locked_at = None
+            job.last_error = COMEBACK_3D_ALREADY_RETURNED_REASON
+            return
 
     # Effective phone: local client takes priority; CRM-only campaign jobs store phone in payload.
     phone = client.phone_e164 if client else None

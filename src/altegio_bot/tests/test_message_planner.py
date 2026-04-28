@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock
 
 import pytest
@@ -203,6 +203,7 @@ async def test_delete_cancels_future_jobs_and_schedules_canceled_and_comeback(
     session_maker,
 ):
     now = utcnow()
+    cancelled_at = datetime(2026, 4, 1, 12, 0, tzinfo=timezone.utc)
 
     async with session_maker() as session:
         async with session.begin():
@@ -229,6 +230,7 @@ async def test_delete_cancels_future_jobs_and_schedules_canceled_and_comeback(
                 company_id=record.company_id,
                 record_id=record.id,
                 event_status="delete",
+                source_cancelled_at=cancelled_at,
             )
 
         jobs = (await session.execute(select(MessageJob).order_by(MessageJob.id.asc()))).scalars().all()
@@ -254,4 +256,5 @@ async def test_delete_cancels_future_jobs_and_schedules_canceled_and_comeback(
         )
 
         comeback = [j for j in jobs if j.job_type == "comeback_3d"][0]
-        assert comeback.run_at >= now + timedelta(days=3)
+        assert comeback.run_at == cancelled_at + timedelta(days=3)
+        assert comeback.payload["source_cancelled_at"] == cancelled_at.isoformat()
