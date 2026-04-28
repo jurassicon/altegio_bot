@@ -852,45 +852,76 @@ async def _run_job_logic(
             job.last_error = "Skipped: record is deleted"
             return
 
-        if job.job_type == "comeback_3d":
-            if record is None or not record.is_deleted:
+    if job.job_type == "comeback_3d":
+        if record is None:
+            job.status = "canceled"
+            job.locked_at = None
+            job.last_error = "Skipped: source record missing for comeback_3d"
+            return
+
+        if not record.is_deleted:
+            job.status = "canceled"
+            job.locked_at = None
+            job.last_error = "Skipped: record is not deleted"
+            return
+
+        if client is not None:
+            future_stmt = (
+                select(Record.id)
+                .where(Record.company_id == job.company_id)
+                .where(Record.client_id == client.id)
+                .where(Record.is_deleted.is_(False))
+                .where(Record.starts_at > utcnow())
+                .limit(1)
+            )
+            future_res = await session.execute(future_stmt)
+            if future_res.scalar_one_or_none() is not None:
                 job.status = "canceled"
                 job.locked_at = None
-                job.last_error = "Skipped: record is not deleted"
+                job.last_error = "Skipped: client already has a future appointment"
                 return
 
-            if client is not None:
-                future_stmt = (
-                    select(Record.id)
-                    .where(Record.company_id == job.company_id)
-                    .where(Record.client_id == client.id)
-                    .where(Record.is_deleted.is_(False))
-                    .where(Record.starts_at > utcnow())
-                    .limit(1)
-                )
-                future_res = await session.execute(future_stmt)
-                if future_res.scalar_one_or_none() is not None:
-                    job.status = "canceled"
-                    job.locked_at = None
-                    job.last_error = "Skipped: client already has a future appointment"
-                    return
+            cutoff_30d = utcnow() - timedelta(days=30)
+            sent_stmt = (
+                select(OutboxMessage.id)
+                .where(OutboxMessage.company_id == job.company_id)
+                .where(OutboxMessage.client_id == client.id)
+                .where(OutboxMessage.template_code == "comeback_3d")
+                .where(OutboxMessage.status.in_(SUCCESS_OUTBOX_STATUSES))
+                .where(OutboxMessage.sent_at > cutoff_30d)
+                .limit(1)
+            )
+            sent_res = await session.execute(sent_stmt)
+            if sent_res.scalar_one_or_none() is not None:
+                job.status = "canceled"
+                job.locked_at = None
+                job.last_error = "Skipped: comeback_3d already sent in the last 30 days"
+                return
 
-                cutoff_30d = utcnow() - timedelta(days=30)
-                sent_stmt = (
-                    select(OutboxMessage.id)
-                    .where(OutboxMessage.company_id == job.company_id)
-                    .where(OutboxMessage.client_id == client.id)
-                    .where(OutboxMessage.template_code == "comeback_3d")
-                    .where(OutboxMessage.status.in_(SUCCESS_OUTBOX_STATUSES))
-                    .where(OutboxMessage.sent_at > cutoff_30d)
-                    .limit(1)
-                )
-                sent_res = await session.execute(sent_stmt)
-                if sent_res.scalar_one_or_none() is not None:
-                    job.status = "canceled"
-                    job.locked_at = None
-                    job.last_error = "Skipped: comeback_3d already sent in the last 30 days"
-                    return
+        if record.starts_at is None:
+            job.status = "canceled"
+            job.locked_at = None
+            job.last_error = "Skipped: source record starts_at missing for comeback_3d"
+            return
+
+        if record.client_id is not None:
+            later_stmt = (
+                select(Record.id)
+                .where(Record.company_id == job.company_id)
+                .where(Record.client_id == record.client_id)
+                .where(Record.is_deleted.is_(False))
+                .where(Record.id != record.id)
+                .where(Record.starts_at.is_not(None))
+                .where(Record.starts_at > record.starts_at)
+                .where(Record.starts_at <= utcnow())
+                .limit(1)
+            )
+            later_res = await session.execute(later_stmt)
+            if later_res.scalar_one_or_none() is not None:
+                job.status = "canceled"
+                job.locked_at = None
+                job.last_error = "Skipped: client already returned within comeback_3d window"
+                return
 
     # Effective phone: local client takes priority; CRM-only campaign jobs store phone in payload.
     phone = client.phone_e164 if client else None

@@ -351,7 +351,7 @@ def test_suppressed_outbox_row_created(monkeypatch: Any) -> None:
 
 def test_not_suppressed_when_below_threshold(monkeypatch: Any) -> None:
     """1 failure below default threshold of 2 -> send proceeds."""
-    job = _FakeJob(id=4, company_id=758285, job_type="comeback_3d")
+    job = _FakeJob(id=4, company_id=758285, job_type="reminder_2h")
     _base_patches(monkeypatch, job=job, n_failures=1)
 
     async def _fail_render(*a: Any, **kw: Any) -> Any:
