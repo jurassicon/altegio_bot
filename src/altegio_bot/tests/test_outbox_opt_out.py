@@ -4,6 +4,9 @@ import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
+from unittest.mock import AsyncMock
+
+import pytest
 
 from altegio_bot.workers import outbox_worker as ow
 
@@ -42,13 +45,14 @@ class FakeSession:
         self.added.append(obj)
 
 
-def test_outbox_skips_marketing_when_opted_out(monkeypatch: Any) -> None:
+@pytest.mark.parametrize("job_type", ow.MARKETING_JOB_TYPES)
+def test_outbox_skips_marketing_when_opted_out(monkeypatch: Any, job_type: str) -> None:
     fixed_now = datetime(2026, 2, 10, 12, 0, tzinfo=timezone.utc)
 
     job = FakeJob(
         id=1,
         company_id=758285,
-        job_type="review_3d",
+        job_type=job_type,
         status="queued",
         run_at=fixed_now,
         record_id=None,
@@ -67,18 +71,21 @@ def test_outbox_skips_marketing_when_opted_out(monkeypatch: Any) -> None:
     async def fake_load_client(session: Any, job_obj: Any, record: Any) -> Any:
         return FakeClient(id=1)
 
-    async def fake_safe_send(*args: Any, **kwargs: Any) -> Any:
-        raise AssertionError("safe_send should not be called")
-
     monkeypatch.setattr(ow, "_load_job", fake_load_job)
     monkeypatch.setattr(ow, "_find_success_outbox", fake_find_success)
     monkeypatch.setattr(ow, "_load_record", fake_load_record)
     monkeypatch.setattr(ow, "_load_client", fake_load_client)
-    monkeypatch.setattr(ow, "safe_send", fake_safe_send)
+    safe_send = AsyncMock()
+    safe_send_template = AsyncMock()
+    monkeypatch.setattr(ow, "safe_send", safe_send)
+    monkeypatch.setattr(ow, "safe_send_template", safe_send_template)
 
     session = FakeSession()
     run(ow.process_job_in_session(session, 1, provider=object()))
 
     assert job.status == "canceled"
+    assert job.locked_at is None
     assert job.last_error == "Skipped: client unsubscribed"
+    safe_send.assert_not_called()
+    safe_send_template.assert_not_called()
     assert session.added == []

@@ -13,12 +13,12 @@ Covers:
 4.  other error codes -> not suppressed
 5.  old 131026 failures outside window -> not suppressed
 6.  outbox row without matching webhook -> not suppressed
-7.  automated send is skipped when suppression is active
-8.  provider.send is NOT called for suppressed automated sends
-9.  outbox row is created with the suppression reason
-10. not suppressed when below threshold (1 < 2)
-11. ops data model: status=canceled, error starts with suppressed_131026
-12. operator_relay is not in the outbox_worker suppression path
+7.  transactional job types are not suppressed before send
+8.  marketing job types are still suppressed before send
+9.  provider.send is NOT called for suppressed marketing sends
+10. outbox row is created with the suppression reason
+11. not suppressed when below threshold (1 < 2)
+12. ops data model: status=canceled, error starts with suppressed_131026
 """
 
 from __future__ import annotations
@@ -249,6 +249,21 @@ class _FakeClient:
     phone_e164: str = PHONE
     wa_opted_out: bool = False
     display_name: str = "Anna"
+    altegio_client_id: int | None = 9001
+
+
+@dataclass
+class _FakeRecord:
+    id: int = 10
+    client_id: int | None = 1
+    starts_at: datetime | None = field(default_factory=lambda: NOW - timedelta(days=4))
+    is_deleted: bool = False
+    altegio_client_id: int | None = 9001
+
+
+class _FakeScalarResult:
+    def scalar_one_or_none(self) -> None:
+        return None
 
 
 class _FakeSession:
@@ -258,15 +273,21 @@ class _FakeSession:
     def add(self, obj: Any) -> None:
         self.added.append(obj)
 
+    async def execute(self, stmt: Any) -> _FakeScalarResult:
+        return _FakeScalarResult()
+
 
 def _base_patches(
     monkeypatch: Any,
     *,
     job: _FakeJob,
     n_failures: int = 2,
-) -> None:
+    record: Any = None,
+    client: Any = None,
+) -> AsyncMock:
     """Apply common outbox_worker monkeypatches."""
     _j = job
+    _client = client or _FakeClient(id=1)
 
     async def _fake_load_job(session: Any, job_id: int) -> _FakeJob:
         return _j
@@ -274,61 +295,158 @@ def _base_patches(
     monkeypatch.setattr(ow, "_load_job", _fake_load_job)
     monkeypatch.setattr(ow, "_find_success_outbox", AsyncMock(return_value=None))
     monkeypatch.setattr(ow, "_find_existing_outbox", AsyncMock(return_value=None))
-    monkeypatch.setattr(ow, "_load_record", AsyncMock(return_value=None))
-    monkeypatch.setattr(ow, "_load_client", AsyncMock(return_value=_FakeClient(id=1)))
-    monkeypatch.setattr(
-        ow,
-        "_count_131026_failures",
-        AsyncMock(return_value=n_failures),
-    )
+    monkeypatch.setattr(ow, "_load_record", AsyncMock(return_value=record))
+    monkeypatch.setattr(ow, "_load_client", AsyncMock(return_value=_client))
+    count_mock = AsyncMock(return_value=n_failures)
+    monkeypatch.setattr(ow, "_count_131026_failures", count_mock)
     monkeypatch.setattr(ow, "utcnow", lambda: NOW)
+    return count_mock
 
 
 def _run(coro: Any) -> Any:
     return asyncio.run(coro)
 
 
-def test_suppression_cancels_job(monkeypatch: Any) -> None:
-    """Suppression fires -> job is marked canceled."""
-    job = _FakeJob(id=1, company_id=758285, job_type="reminder_24h")
-    _base_patches(monkeypatch, job=job, n_failures=2)
+def _patch_text_send_path(monkeypatch: Any, *, message_id: str = "wamid.sent") -> AsyncMock:
+    monkeypatch.setattr(ow.settings, "whatsapp_send_mode", "text")
+    monkeypatch.setattr(ow, "_apply_rate_limit", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        ow,
+        "_render_message",
+        AsyncMock(
+            return_value=(
+                "Hallo {client_name}",
+                123,
+                "de",
+                {"client_name": "Anna"},
+            )
+        ),
+    )
+    send_mock = AsyncMock(return_value=(message_id, None))
+    monkeypatch.setattr(ow, "safe_send", send_mock)
+    monkeypatch.setattr(
+        ow,
+        "safe_send_template",
+        AsyncMock(
+            side_effect=AssertionError(
+                "safe_send_template не должен вызываться в text mode",
+            )
+        ),
+    )
+    return send_mock
+
+
+def _patch_marketing_guards(monkeypatch: Any) -> None:
+    monkeypatch.setattr(ow, "count_attended_client_visits", AsyncMock(return_value=1))
+    monkeypatch.setattr(ow, "client_has_future_appointments", AsyncMock(return_value=False))
+    monkeypatch.setattr(ow, "_client_returned_since", AsyncMock(return_value=False))
+
+
+def _record_for_job_type(job_type: str) -> _FakeRecord | None:
+    if job_type != "comeback_3d":
+        return None
+
+    return _FakeRecord(is_deleted=True)
+
+
+@pytest.mark.parametrize(
+    "job_type",
+    [
+        "review_3d",
+        "repeat_10d",
+        "comeback_3d",
+        "newsletter_new_clients_monthly",
+        "newsletter_new_clients_followup",
+    ],
+)
+def test_131026_suppression_allowed_for_marketing_job_types(job_type: str) -> None:
+    assert ow._job_type_allows_131026_suppression(job_type) is True
+
+
+@pytest.mark.parametrize(
+    "job_type",
+    [
+        "record_created",
+        "record_updated",
+        "record_canceled",
+        "reminder_24h",
+        "reminder_2h",
+        "operator_relay",
+        "unknown_future_transactional",
+    ],
+)
+def test_131026_suppression_not_allowed_for_transactional_job_types(job_type: str) -> None:
+    assert ow._job_type_allows_131026_suppression(job_type) is False
+
+
+@pytest.mark.parametrize(
+    "job_type",
+    [
+        "record_created",
+        "record_updated",
+        "record_canceled",
+        "reminder_24h",
+        "reminder_2h",
+        "operator_relay",
+        "unknown_future_transactional",
+    ],
+)
+def test_transactional_job_not_suppressed_when_131026_threshold_reached(
+    monkeypatch: Any,
+    job_type: str,
+) -> None:
+    """Transactional job доходит до provider send даже при repeated 131026."""
+    job = _FakeJob(id=2, company_id=758285, job_type=job_type)
+    count_mock = _base_patches(monkeypatch, job=job, n_failures=3)
     session = _FakeSession()
+    send_mock = _patch_text_send_path(monkeypatch)
 
-    async def _no_send(*a: Any, **kw: Any) -> Any:
-        raise AssertionError("provider.send must NOT be called")
+    _run(ow.process_job_in_session(session, 2, provider=object()))
 
-    monkeypatch.setattr(ow, "safe_send", _no_send)
-    monkeypatch.setattr(ow, "safe_send_template", _no_send)
+    send_mock.assert_awaited_once()
+    count_mock.assert_not_awaited()
+    assert job.status == "done"
+    assert job.last_error is None
+    assert all(not (getattr(out, "error", "") or "").startswith("suppressed_131026") for out in session.added)
+
+
+@pytest.mark.parametrize(
+    "job_type",
+    [
+        "review_3d",
+        "repeat_10d",
+        "comeback_3d",
+        "newsletter_new_clients_monthly",
+        "newsletter_new_clients_followup",
+    ],
+)
+def test_marketing_job_suppressed_when_131026_threshold_reached(
+    monkeypatch: Any,
+    job_type: str,
+) -> None:
+    """Маркетинговый job сохраняет pre-send suppression при repeated 131026."""
+    job = _FakeJob(id=1, company_id=758285, job_type=job_type)
+    record = _record_for_job_type(job_type)
+    count_mock = _base_patches(monkeypatch, job=job, n_failures=2, record=record)
+    _patch_marketing_guards(monkeypatch)
+    session = _FakeSession()
+    send_mock = AsyncMock()
+
+    monkeypatch.setattr(ow, "safe_send", send_mock)
+    monkeypatch.setattr(ow, "safe_send_template", send_mock)
 
     _run(ow.process_job_in_session(session, 1, provider=object()))
 
+    send_mock.assert_not_called()
+    count_mock.assert_awaited_once()
     assert job.status == "canceled"
     assert job.last_error is not None
     assert job.last_error.startswith("suppressed_131026")
 
 
-def test_provider_send_not_called_when_suppressed(monkeypatch: Any) -> None:
-    """provider.send must never be reached when suppressed."""
-    send_calls: list[tuple[Any, ...]] = []
-    job = _FakeJob(id=2, company_id=758285, job_type="record_created")
-    _base_patches(monkeypatch, job=job, n_failures=3)
-    session = _FakeSession()
-
-    async def _spy_send(*a: Any, **kw: Any) -> tuple[str, None]:
-        send_calls.append(a)
-        return ("wamid.x", None)
-
-    monkeypatch.setattr(ow, "safe_send", _spy_send)
-    monkeypatch.setattr(ow, "safe_send_template", _spy_send)
-
-    _run(ow.process_job_in_session(session, 2, provider=object()))
-
-    assert send_calls == [], "provider.send was called despite suppression"
-
-
 def test_suppressed_outbox_row_created(monkeypatch: Any) -> None:
     """A canceled OutboxMessage row is persisted for audit when suppressed."""
-    job = _FakeJob(id=3, company_id=758285, job_type="reminder_24h")
+    job = _FakeJob(id=3, company_id=758285, job_type="newsletter_new_clients_monthly")
     _base_patches(monkeypatch, job=job, n_failures=2)
     session = _FakeSession()
 
@@ -351,20 +469,15 @@ def test_suppressed_outbox_row_created(monkeypatch: Any) -> None:
 
 def test_not_suppressed_when_below_threshold(monkeypatch: Any) -> None:
     """1 failure below default threshold of 2 -> send proceeds."""
-    job = _FakeJob(id=4, company_id=758285, job_type="reminder_2h")
+    job = _FakeJob(id=4, company_id=758285, job_type="newsletter_new_clients_monthly")
     _base_patches(monkeypatch, job=job, n_failures=1)
-
-    async def _fail_render(*a: Any, **kw: Any) -> Any:
-        raise ValueError("render intentionally failed")
-
-    monkeypatch.setattr(ow, "_render_message", _fail_render)
-    monkeypatch.setattr(ow, "_apply_rate_limit", AsyncMock(return_value=None))
+    send_mock = _patch_text_send_path(monkeypatch)
     session = _FakeSession()
 
     _run(ow.process_job_in_session(session, 4, provider=object()))
 
-    # Not suppressed -> reached render -> failed there, not at gate
-    assert job.status == "failed"
+    send_mock.assert_awaited_once()
+    assert job.status == "done"
     assert "suppressed_131026" not in (job.last_error or "")
 
 
@@ -375,7 +488,7 @@ def test_ops_suppressed_row_has_expected_fields(monkeypatch: Any) -> None:
     - _error_cell() checks error.startswith('suppressed_131026') for badge
     - row_class is set to 'suppressed' for CSS highlight
     """
-    job = _FakeJob(id=5, company_id=758285, job_type="reminder_2h")
+    job = _FakeJob(id=5, company_id=758285, job_type="newsletter_new_clients_followup")
     _base_patches(monkeypatch, job=job, n_failures=2)
     session = _FakeSession()
     monkeypatch.setattr(ow, "safe_send", AsyncMock(return_value=("x", None)))

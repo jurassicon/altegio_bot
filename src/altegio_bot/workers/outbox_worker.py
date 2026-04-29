@@ -66,6 +66,15 @@ MARKETING_JOB_TYPES = (
     "repeat_10d",
     "comeback_3d",
     "newsletter_new_clients_monthly",
+    "newsletter_new_clients_followup",
+)
+
+WA_131026_SUPPRESSIBLE_JOB_TYPES: tuple[str, ...] = (
+    "review_3d",
+    "repeat_10d",
+    "comeback_3d",
+    "newsletter_new_clients_monthly",
+    "newsletter_new_clients_followup",
 )
 
 TOKEN_EXPIRED_RETRY_SECONDS = 60
@@ -159,6 +168,11 @@ def _record_attended(record: Record | None) -> bool:
     attendance = getattr(record, "attendance", 0) or 0
     visit_attendance = getattr(record, "visit_attendance", 0) or 0
     return bool(attendance == 1 or visit_attendance == 1)
+
+
+def _job_type_allows_131026_suppression(job_type: str) -> bool:
+    """Вернуть True только для маркетинговых job types с разрешенным pre-send suppression."""
+    return job_type in WA_131026_SUPPRESSIBLE_JOB_TYPES
 
 
 async def _find_success_outbox(
@@ -1024,7 +1038,7 @@ async def _run_job_logic(
         job.last_error = "No phone_e164"
         return
 
-    if settings.wa_131026_suppression_enabled:
+    if settings.wa_131026_suppression_enabled and _job_type_allows_131026_suppression(job.job_type):
         n_fail = await _count_131026_failures(
             session,
             phone,
