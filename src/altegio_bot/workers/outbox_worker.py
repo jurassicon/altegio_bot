@@ -66,6 +66,7 @@ MARKETING_JOB_TYPES = (
     "repeat_10d",
     "comeback_3d",
     "newsletter_new_clients_monthly",
+    "newsletter_new_clients_followup",
 )
 
 WA_131026_SUPPRESSIBLE_JOB_TYPES: tuple[str, ...] = (
