@@ -2667,7 +2667,7 @@ async def test_service_lookup_error_does_not_count_as_lash(session_maker, monkey
     # Must not raise; ServiceLookupError is caught inside filter_lash_record_ids
     async with session_maker() as session:
         async with session.begin():
-            await recompute_campaign_run_stats(session, run_id)
+            summary = await recompute_campaign_run_stats(session, run_id)
 
     async with session_maker() as session:
         recip = await session.get(CampaignRecipient, recipient_id)
@@ -2675,6 +2675,14 @@ async def test_service_lookup_error_does_not_count_as_lash(session_maker, monkey
 
     assert recip.booked_after_at is None, "ServiceLookupError must not silently count as lash"
     assert run.booked_after_count == 0
+    # P2: lookup failure must appear in summary return value
+    assert summary["booked_after_service_lookup_failed_count"] == 1
+    assert _ERROR_SVC_ID in summary["booked_after_service_lookup_failed_service_ids"]
+    # P2: lookup failure must be persisted in run.meta for operator visibility
+    assert run.meta is not None
+    lr = run.meta.get("last_recompute", {})
+    assert lr.get("booked_after_service_lookup_failed_count", 0) == 1
+    assert _ERROR_SVC_ID in lr.get("booked_after_service_lookup_failed_service_ids", [])
 
 
 # ---------------------------------------------------------------------------
@@ -2825,3 +2833,293 @@ async def test_oezelm_regression_non_lash_bookings_do_not_count(session_maker) -
         run = await session.get(CampaignRun, run_id)
 
     assert run.booked_after_count == 0, "Özelm: non-lash bookings must not count as booked_after"
+
+
+# ---------------------------------------------------------------------------
+# P1: lash lookup called only for records matched to eligible recipients
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_lash_lookup_skips_unrelated_record(session_maker, monkeypatch) -> None:
+    """filter_lash_record_ids receives only related recipient's record_id, not unrelated ones.
+
+    Two records exist inside the broad overall attribution window:
+    - record A belongs to the eligible campaign recipient (lash service, cached).
+    - record B belongs to an unrelated client with no CampaignRecipient row.
+
+    After Phase-1 filtering (P1 fix), filter_lash_record_ids must receive only
+    record A's id. If record B's id were also passed, the spy would capture it.
+    """
+    _seed_lash_cache()
+    run_id = await _make_run(session_maker)
+
+    related_altegio_client_id = 79100
+    unrelated_altegio_client_id = 79200
+
+    async with session_maker() as session:
+        async with session.begin():
+            # Record A — belongs to the eligible campaign recipient
+            record_a = Record(
+                company_id=758285,
+                altegio_record_id=30001,
+                client_id=None,
+                altegio_client_id=related_altegio_client_id,
+                raw={},
+            )
+            session.add(record_a)
+            await session.flush()
+            session.add(RecordService(record_id=record_a.id, service_id=_LASH_SVC_ID))
+
+            # Record B — unrelated client, no CampaignRecipient
+            record_b = Record(
+                company_id=758285,
+                altegio_record_id=30002,
+                client_id=None,
+                altegio_client_id=unrelated_altegio_client_id,
+                raw={},
+            )
+            session.add(record_b)
+            await session.flush()
+            session.add(RecordService(record_id=record_b.id, service_id=_LASH_SVC_ID))
+
+            session.add(
+                AltegioEvent(
+                    dedupe_key="test-p1-spy-related-001",
+                    company_id=758285,
+                    resource="record",
+                    resource_id=30001,
+                    event_status="create",
+                    received_at=_COMPLETED_AT + timedelta(days=3),
+                )
+            )
+            # Unrelated event is within the broad window but has no matching recipient
+            session.add(
+                AltegioEvent(
+                    dedupe_key="test-p1-spy-unrelated-001",
+                    company_id=758285,
+                    resource="record",
+                    resource_id=30002,
+                    event_status="create",
+                    received_at=_COMPLETED_AT + timedelta(days=1),
+                )
+            )
+
+            session.add(
+                CampaignRecipient(
+                    campaign_run_id=run_id,
+                    company_id=758285,
+                    client_id=None,
+                    altegio_client_id=related_altegio_client_id,
+                    phone_e164="+4915179100001",
+                    display_name="Related Client",
+                    status="provider_accepted",
+                    provider_message_id="wamid.p1-spy-001",
+                    sent_at=_COMPLETED_AT,
+                )
+            )
+
+    # Spy: capture all record_ids passed to filter_lash_record_ids
+    from altegio_bot.service_filter import filter_lash_record_ids as _real_filter
+
+    captured_record_ids: list[int] = []
+
+    async def _spy_filter(session, *, company_id, record_ids, http_client=None):
+        captured_record_ids.extend(record_ids)
+        return await _real_filter(session, company_id=company_id, record_ids=record_ids, http_client=http_client)
+
+    monkeypatch.setattr("altegio_bot.campaigns.runner.filter_lash_record_ids", _spy_filter)
+
+    async with session_maker() as session:
+        async with session.begin():
+            summary = await recompute_campaign_run_stats(session, run_id)
+
+    async with session_maker() as session:
+        record_a_db = await session.get(Record, record_a.id)
+        record_b_db = await session.get(Record, record_b.id)
+
+    assert record_a_db.id in captured_record_ids, "related record must be passed to lash lookup"
+    assert record_b_db.id not in captured_record_ids, "unrelated record must NOT be passed to lash lookup"
+    assert summary["booked_after_count"] == 1
+    assert summary["booked_after_service_lookup_failed_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# P1+P2: unrelated record with error service is filtered before lookup
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_unrelated_error_service_filtered_before_lookup(session_maker, monkeypatch) -> None:
+    """Unrelated client with ServiceLookupError service does not affect failure diagnostics.
+
+    The unrelated client's record is inside the broad overall window, but has no
+    matching CampaignRecipient. After Phase-1 filtering (P1 fix), it is excluded
+    before lash lookup. is_lash_service is never called for it, so:
+    - recompute does not crash.
+    - booked_after_count == 1 (valid related lash booking is attributed).
+    - booked_after_service_lookup_failed_count == 0 (no failures for candidates).
+    - run.meta has no last_recompute key (no failures to persist).
+    """
+    _seed_lash_cache()
+    run_id = await _make_run(session_maker)
+
+    related_altegio_client_id = 79300
+    unrelated_altegio_client_id = 79400
+    unrelated_svc_id = 55001  # would raise ServiceLookupError if ever looked up
+
+    async with session_maker() as session:
+        async with session.begin():
+            # Related record — belongs to the eligible campaign recipient
+            record_rel = Record(
+                company_id=758285,
+                altegio_record_id=30003,
+                client_id=None,
+                altegio_client_id=related_altegio_client_id,
+                raw={},
+            )
+            session.add(record_rel)
+            await session.flush()
+            session.add(RecordService(record_id=record_rel.id, service_id=_LASH_SVC_ID))
+
+            # Unrelated record — no CampaignRecipient; its service would error
+            record_unrel = Record(
+                company_id=758285,
+                altegio_record_id=30004,
+                client_id=None,
+                altegio_client_id=unrelated_altegio_client_id,
+                raw={},
+            )
+            session.add(record_unrel)
+            await session.flush()
+            session.add(RecordService(record_id=record_unrel.id, service_id=unrelated_svc_id))
+
+            session.add(
+                AltegioEvent(
+                    dedupe_key="test-p1-errsvc-related-001",
+                    company_id=758285,
+                    resource="record",
+                    resource_id=30003,
+                    event_status="create",
+                    received_at=_COMPLETED_AT + timedelta(days=4),
+                )
+            )
+            session.add(
+                AltegioEvent(
+                    dedupe_key="test-p1-errsvc-unrelated-001",
+                    company_id=758285,
+                    resource="record",
+                    resource_id=30004,
+                    event_status="create",
+                    received_at=_COMPLETED_AT + timedelta(days=2),
+                )
+            )
+
+            session.add(
+                CampaignRecipient(
+                    campaign_run_id=run_id,
+                    company_id=758285,
+                    client_id=None,
+                    altegio_client_id=related_altegio_client_id,
+                    phone_e164="+4915179300001",
+                    display_name="Related Client P1",
+                    status="provider_accepted",
+                    provider_message_id="wamid.p1-errsvc-001",
+                    sent_at=_COMPLETED_AT,
+                )
+            )
+
+    # Monkeypatch: raise ServiceLookupError for the unrelated service_id.
+    # If P1 fix is working, is_lash_service is never called for unrelated_svc_id
+    # (the unrelated record is filtered out in Phase 1 before lash lookup).
+    async def _selective_error_is_lash(company_id, service_id, http_client=None):
+        if service_id == unrelated_svc_id:
+            raise ServiceLookupError(f"must not be called for service_id={service_id}")
+        return service_id == _LASH_SVC_ID and company_id == 758285
+
+    monkeypatch.setattr("altegio_bot.service_filter.is_lash_service", _selective_error_is_lash)
+
+    async with session_maker() as session:
+        async with session.begin():
+            summary = await recompute_campaign_run_stats(session, run_id)
+
+    async with session_maker() as session:
+        run = await session.get(CampaignRun, run_id)
+
+    assert summary["booked_after_count"] == 1
+    assert summary["booked_after_service_lookup_failed_count"] == 0, (
+        "unrelated record filtered before lookup — failure count must be 0"
+    )
+    lr = (run.meta or {}).get("last_recompute", {})
+    assert lr.get("booked_after_service_lookup_failed_count", 0) == 0
+
+
+# ---------------------------------------------------------------------------
+# P2: API endpoint returns diagnostics field when lookup failures occurred
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_recompute_endpoint_includes_diagnostics_on_lookup_failure(
+    http_client: AsyncClient,
+    session_maker,
+    monkeypatch,
+) -> None:
+    """POST /runs/{run_id}/recompute returns booked_after_service_lookup_failed_count in stats."""
+    run_id = await _make_run(session_maker)
+
+    async def _always_raise(company_id, service_id, http_client=None):
+        raise ServiceLookupError(f"endpoint-diag mock error service_id={service_id}")
+
+    monkeypatch.setattr("altegio_bot.service_filter.is_lash_service", _always_raise)
+
+    altegio_client_id = 79500
+
+    async with session_maker() as session:
+        async with session.begin():
+            record = Record(
+                company_id=758285,
+                altegio_record_id=30005,
+                client_id=None,
+                altegio_client_id=altegio_client_id,
+                raw={},
+            )
+            session.add(record)
+            await session.flush()
+            session.add(RecordService(record_id=record.id, service_id=_ERROR_SVC_ID))
+
+            session.add(
+                AltegioEvent(
+                    dedupe_key="test-p2-endpoint-diag-001",
+                    company_id=758285,
+                    resource="record",
+                    resource_id=30005,
+                    event_status="create",
+                    received_at=_COMPLETED_AT + timedelta(days=5),
+                )
+            )
+
+            session.add(
+                CampaignRecipient(
+                    campaign_run_id=run_id,
+                    company_id=758285,
+                    client_id=None,
+                    altegio_client_id=altegio_client_id,
+                    phone_e164="+4915179500001",
+                    display_name="Diag Client",
+                    status="provider_accepted",
+                    provider_message_id="wamid.p2-diag-001",
+                    sent_at=_COMPLETED_AT,
+                )
+            )
+
+    response = await http_client.post(f"/ops/campaigns/runs/{run_id}/recompute")
+    assert response.status_code == 200
+
+    stats = response.json()["stats"]
+    assert "booked_after_service_lookup_failed_count" in stats, (
+        "recompute endpoint must expose lookup failure diagnostics"
+    )
+    assert stats["booked_after_service_lookup_failed_count"] == 1
+    assert _ERROR_SVC_ID in stats["booked_after_service_lookup_failed_service_ids"]
+    assert stats["booked_after_count"] == 0

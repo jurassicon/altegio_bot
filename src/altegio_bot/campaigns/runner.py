@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Literal
+from typing import Any, Literal
 
 from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -27,7 +27,7 @@ from altegio_bot.models.models import (
     OutboxMessage,
     Record,
 )
-from altegio_bot.service_filter import filter_lash_record_ids
+from altegio_bot.service_filter import LashRecordFilterResult, filter_lash_record_ids
 from altegio_bot.utils import utcnow
 
 logger = logging.getLogger(__name__)
@@ -1783,7 +1783,7 @@ async def _sync_booked_after_from_altegio_events(
     run: CampaignRun,
     recipients: list[CampaignRecipient],
     outbox_by_recipient: dict[int, "OutboxMessage"],
-) -> None:
+) -> dict[str, Any]:
     """Backfill CampaignRecipient.booked_after_at from AltegioEvent records.
 
     Booked-after semantics:
@@ -1801,9 +1801,21 @@ async def _sync_booked_after_from_altegio_events(
     Record.is_deleted is NOT filtered: the create event proves the booking was
     made regardless of later cancellation or deletion status.
     Does nothing if run.completed_at is None.
+
+    Returns a diagnostics dict with keys:
+      lookup_failed_service_ids: set[int] — service IDs where Altegio lookup failed.
+      lookup_failed_record_ids:  set[int] — candidate record IDs excluded due to
+                                            lookup failure (not confirmed non-lash).
+    Lash lookup runs only on records pre-filtered to eligible recipients and their
+    per-recipient attribution windows — unrelated bookings are never checked.
     """
+    _empty: dict[str, Any] = {
+        "lookup_failed_service_ids": set(),
+        "lookup_failed_record_ids": set(),
+    }
+
     if run.completed_at is None:
-        return
+        return _empty
 
     window_days = timedelta(days=run.attribution_window_days)
 
@@ -1815,7 +1827,7 @@ async def _sync_booked_after_from_altegio_events(
     ]
 
     if not eligible:
-        return
+        return _empty
 
     company_ids = list({r.company_id for r in eligible})
 
@@ -1866,34 +1878,56 @@ async def _sync_booked_after_from_altegio_events(
         .order_by(AltegioEvent.received_at.asc())
     )
 
-    rows = (await session.execute(stmt)).all()
+    raw_rows = (await session.execute(stmt)).all()
 
-    # Filter to records containing at least one lash service.
-    # Group record_ids by company for the batch category lookup.
-    record_ids_by_company: dict[int, set[int]] = {}
-    for row in rows:
-        record_ids_by_company.setdefault(row.company_id, set()).add(row.record_id)
-
-    lash_record_ids: set[int] = set()
-    for cid, rids in record_ids_by_company.items():
-        lash_record_ids.update(await filter_lash_record_ids(session, company_id=cid, record_ids=list(rids)))
-
-    for row in rows:
-        if row.record_id not in lash_record_ids:
-            continue
-
+    # Phase 1: recipient + per-recipient window filtering.
+    # Only rows belonging to eligible recipients within their exact window are
+    # kept as candidates. Lash lookup is deferred to Phase 2 and will run
+    # only on these candidate record_ids — unrelated bookings are never checked.
+    candidate_rows: list[tuple[CampaignRecipient, Any]] = []
+    for row in raw_rows:
         r: CampaignRecipient | None = None
         if row.client_id is not None:
             r = by_client.get((row.company_id, row.client_id))
         if r is None and row.altegio_client_id is not None:
             r = by_altegio_client.get((row.company_id, int(row.altegio_client_id)))
+        if r is None:
+            continue
+        attr_start = _attr_start(r)
+        attr_end = attr_start + window_days
+        if not (row.received_at > attr_start and row.received_at <= attr_end):
+            continue
+        candidate_rows.append((r, row))
 
-        if r is not None and r.booked_after_at is None:
-            # Per-recipient window check (start may differ from overall_start)
-            attr_start = _attr_start(r)
-            attr_end = attr_start + window_days
-            if row.received_at > attr_start and row.received_at <= attr_end:
-                r.booked_after_at = row.received_at
+    if not candidate_rows:
+        return _empty
+
+    # Phase 2: lash service lookup on candidate record_ids only.
+    record_ids_by_company: dict[int, set[int]] = {}
+    for _r, row in candidate_rows:
+        record_ids_by_company.setdefault(row.company_id, set()).add(row.record_id)
+
+    lash_record_ids: set[int] = set()
+    all_failed_svc_ids: set[int] = set()
+    all_failed_rec_ids: set[int] = set()
+    for cid, rids in record_ids_by_company.items():
+        result: LashRecordFilterResult = await filter_lash_record_ids(session, company_id=cid, record_ids=list(rids))
+        lash_record_ids.update(result.lash_record_ids)
+        all_failed_svc_ids.update(result.lookup_failed_service_ids)
+        all_failed_rec_ids.update(result.lookup_failed_record_ids)
+
+    # Phase 3: attribution — candidate_rows already ordered by received_at ASC.
+    # First lash event per recipient wins (booked_after_at is None guard).
+    for r, row in candidate_rows:
+        if row.record_id not in lash_record_ids:
+            continue
+        if r.booked_after_at is None:
+            r.booked_after_at = row.received_at
+
+    return {
+        "lookup_failed_service_ids": all_failed_svc_ids,
+        "lookup_failed_record_ids": all_failed_rec_ids,
+    }
 
 
 def _sync_recipient_statuses(
@@ -2025,7 +2059,24 @@ async def recompute_campaign_run_stats(
     _backfill_recipient_read_at(recipients, outbox_by_recipient)
 
     # Step 4b: backfill booked_after_at from AltegioEvent record/create events
-    await _sync_booked_after_from_altegio_events(session, run, recipients, outbox_by_recipient)
+    booked_after_diags = await _sync_booked_after_from_altegio_events(session, run, recipients, outbox_by_recipient)
+    failed_svc_ids: set[int] = booked_after_diags.get("lookup_failed_service_ids", set())
+    failed_rec_ids: set[int] = booked_after_diags.get("lookup_failed_record_ids", set())
+    if failed_svc_ids or failed_rec_ids:
+        meta = dict(run.meta or {})
+        meta["last_recompute"] = {
+            "booked_after_service_lookup_failed_count": len(failed_svc_ids),
+            "booked_after_service_lookup_failed_service_ids": sorted(failed_svc_ids),
+            "booked_after_service_lookup_failed_record_ids": sorted(failed_rec_ids),
+            "booked_after_service_lookup_failed_at": utcnow().isoformat(),
+        }
+        run.meta = meta
+        logger.warning(
+            "recompute run_id=%d: %d service lookup failure(s) service_ids=%s",
+            run_id,
+            len(failed_svc_ids),
+            sorted(failed_svc_ids),
+        )
 
     # Step 5: compute outbox_status_counts from resolved map (Python, no SQL)
     outbox_status_counts: dict[str, int] = {}
@@ -2076,6 +2127,8 @@ async def recompute_campaign_run_stats(
         "cards_issued_count": run.cards_issued_count,
         "cards_deleted_count": run.cards_deleted_count,
         "cleanup_failed_count": run.cleanup_failed_count,
+        "booked_after_service_lookup_failed_count": len(failed_svc_ids),
+        "booked_after_service_lookup_failed_service_ids": sorted(failed_svc_ids),
     }
 
 

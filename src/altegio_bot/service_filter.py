@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import os
 from collections import OrderedDict
+from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
@@ -35,6 +36,20 @@ class ServiceLookupError(Exception):
     Caller в segment.py обязан обработать это исключение и пометить клиента
     excluded_reason='service_category_unavailable', а НЕ считать услугу non-lash.
     """
+
+
+@dataclass
+class LashRecordFilterResult:
+    """Result of filter_lash_record_ids, including service lookup diagnostics.
+
+    lookup_failed_service_ids: service IDs for which Altegio API lookup failed.
+    lookup_failed_record_ids: records excluded because lookup failed for their
+        service(s) and none of their services were confirmed lash.
+    """
+
+    lash_record_ids: set[int] = field(default_factory=set)
+    lookup_failed_service_ids: set[int] = field(default_factory=set)
+    lookup_failed_record_ids: set[int] = field(default_factory=set)
 
 
 LASH_CATEGORY_IDS_BY_COMPANY: dict[int, set[int]] = {
@@ -237,8 +252,8 @@ async def filter_lash_record_ids(
     company_id: int,
     record_ids: list[int],
     http_client: httpx.AsyncClient | None = None,
-) -> set[int]:
-    """Return the subset of record_ids that contain at least one lash service.
+) -> LashRecordFilterResult:
+    """Return lash record_ids and service lookup diagnostics.
 
     Queries RecordService in one batch, then resolves service categories via
     the process-local LRU cache; cache misses trigger an Altegio API call
@@ -252,8 +267,8 @@ async def filter_lash_record_ids(
     - That service is treated as 'unknown'. A record is included only if
       another of its services is confirmed lash.
     - A warning is logged per affected service_id; the error is not propagated.
-    - TODO: add explicit service_category_unavailable counter for recompute
-            attribution if per-record granularity is needed later.
+    - Affected service_ids and record_ids are returned in LashRecordFilterResult
+      for caller diagnostics.
 
     Args:
         session:    async DB session (read-only use within existing transaction).
@@ -262,15 +277,16 @@ async def filter_lash_record_ids(
         http_client: if provided, reused for Altegio API calls (keep-alive).
 
     Returns:
-        Set of record_ids confirmed to have ≥1 lash service.
-        Records with only unresolvable services are excluded conservatively.
+        LashRecordFilterResult with confirmed lash record_ids plus lookup failure
+        diagnostics (failed service_ids and the record_ids affected by them).
     """
+    empty = LashRecordFilterResult()
     if not record_ids:
-        return set()
+        return empty
 
     allowed = LASH_CATEGORY_IDS_BY_COMPANY.get(company_id)
     if not allowed:
-        return set()
+        return empty
 
     # Batch query: all services for the candidate records
     stmt = select(RecordService.record_id, RecordService.service_id).where(RecordService.record_id.in_(record_ids))
@@ -299,15 +315,23 @@ async def filter_lash_record_ids(
                 svc_id,
             )
 
-    # Include a record only if at least one of its services is confirmed lash.
-    # Records whose services are all unknown (lookup failed) are excluded
-    # conservatively — they are not silently counted as non-lash without a trace.
-    result: set[int] = set()
+    # Classify each record:
+    # - confirmed lash if any service is in lash_svc
+    # - lookup-failed if none confirmed lash and at least one service in unknown_svc
+    lash_record_ids: set[int] = set()
+    failed_record_ids: set[int] = set()
     for rec_id in record_ids:
         svc_ids = record_svcs.get(rec_id, set())
         if any(s in lash_svc for s in svc_ids):
-            result.add(rec_id)
-    return result
+            lash_record_ids.add(rec_id)
+        elif any(s in unknown_svc for s in svc_ids):
+            failed_record_ids.add(rec_id)
+
+    return LashRecordFilterResult(
+        lash_record_ids=lash_record_ids,
+        lookup_failed_service_ids=set(unknown_svc),
+        lookup_failed_record_ids=failed_record_ids,
+    )
 
 
 async def record_has_allowed_service(
