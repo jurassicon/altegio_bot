@@ -33,12 +33,30 @@ from altegio_bot.models.models import (
     MessageJob,
     OutboxMessage,
     Record,
+    RecordService,
 )
 from altegio_bot.ops.auth import require_ops_auth
+from altegio_bot.service_filter import ServiceLookupError, _cache_put
 
 _UTC = timezone.utc
 _NOW = datetime(2026, 5, 4, 12, 0, 0, tzinfo=_UTC)
 _COMPLETED_AT = datetime(2026, 4, 16, 11, 47, 46, tzinfo=_UTC)
+
+# ---------------------------------------------------------------------------
+# Lash service test constants — pre-populated into the process-local LRU
+# cache so no Altegio API calls happen during tests.
+# 10707687 is in LASH_CATEGORY_IDS_BY_COMPANY[758285].
+# ---------------------------------------------------------------------------
+_LASH_SVC_ID = 42001
+_NON_LASH_SVC_ID = 42002
+_LASH_CATEGORY_ID = 10707687  # valid lash category for company 758285
+_ERROR_SVC_ID = 42999  # used for ServiceLookupError tests; never pre-cached
+
+
+def _seed_lash_cache() -> None:
+    """Pre-populate LRU cache so no Altegio API calls happen in booked-after tests."""
+    _cache_put((758285, _LASH_SVC_ID), _LASH_CATEGORY_ID)
+    _cache_put((758285, _NON_LASH_SVC_ID), 99999)  # non-lash category
 
 
 # ---------------------------------------------------------------------------
@@ -285,7 +303,8 @@ async def test_recompute_counts_read_also_as_delivered(session_maker) -> None:
 
 @pytest.mark.asyncio
 async def test_recompute_sets_booked_after_at_from_altegio_events(session_maker) -> None:
-    """booked_after_at is set when there is a record/create event in attribution window."""
+    """booked_after_at is set when there is a lash record/create event in attribution window."""
+    _seed_lash_cache()
     run_id = await _make_run(session_maker, attribution_window_days=30)
     book_event_at = _COMPLETED_AT + timedelta(days=18)  # inside 30-day window
 
@@ -301,6 +320,7 @@ async def test_recompute_sets_booked_after_at_from_altegio_events(session_maker)
             )
             session.add(record)
             await session.flush()
+            session.add(RecordService(record_id=record.id, service_id=_LASH_SVC_ID))
 
             ae = AltegioEvent(
                 dedupe_key="test-booked-after-001",
@@ -346,6 +366,7 @@ async def test_recompute_sets_booked_after_at_from_altegio_events(session_maker)
 @pytest.mark.asyncio
 async def test_booked_after_uses_event_received_at_not_starts_at(session_maker) -> None:
     """booked_after_at reflects when booking was made, not when appointment starts."""
+    _seed_lash_cache()
     run_id = await _make_run(session_maker, attribution_window_days=30)
     event_received_at = _COMPLETED_AT + timedelta(days=18)  # inside window
     appointment_starts_at = _COMPLETED_AT + timedelta(days=90)  # far outside window
@@ -361,6 +382,7 @@ async def test_booked_after_uses_event_received_at_not_starts_at(session_maker) 
             )
             session.add(record)
             await session.flush()
+            session.add(RecordService(record_id=record.id, service_id=_LASH_SVC_ID))
 
             session.add(
                 AltegioEvent(
@@ -404,6 +426,7 @@ async def test_booked_after_uses_event_received_at_not_starts_at(session_maker) 
 @pytest.mark.asyncio
 async def test_booked_after_ignores_events_before_campaign_completed(session_maker) -> None:
     """AltegioEvent received before run.completed_at does not count as booked-after."""
+    _seed_lash_cache()
     run_id = await _make_run(session_maker)
     event_before = _COMPLETED_AT - timedelta(hours=1)  # before campaign ended
 
@@ -417,6 +440,7 @@ async def test_booked_after_ignores_events_before_campaign_completed(session_mak
             )
             session.add(record)
             await session.flush()
+            session.add(RecordService(record_id=record.id, service_id=_LASH_SVC_ID))
 
             session.add(
                 AltegioEvent(
@@ -462,6 +486,7 @@ async def test_booked_after_ignores_events_before_campaign_completed(session_mak
 @pytest.mark.asyncio
 async def test_booked_after_ignores_events_outside_attribution_window(session_maker) -> None:
     """AltegioEvent received after attribution window end does not count."""
+    _seed_lash_cache()
     run_id = await _make_run(session_maker, attribution_window_days=30)
     event_too_late = _COMPLETED_AT + timedelta(days=31)  # 1 day past window
 
@@ -475,6 +500,7 @@ async def test_booked_after_ignores_events_outside_attribution_window(session_ma
             )
             session.add(record)
             await session.flush()
+            session.add(RecordService(record_id=record.id, service_id=_LASH_SVC_ID))
 
             session.add(
                 AltegioEvent(
@@ -518,6 +544,7 @@ async def test_booked_after_ignores_events_outside_attribution_window(session_ma
 @pytest.mark.asyncio
 async def test_provider_accepted_recipient_eligible_for_booked_after(session_maker) -> None:
     """Recipient with only sent_at (no delivered/read) qualifies for booked-after."""
+    _seed_lash_cache()
     run_id = await _make_run(session_maker)
     event_at = _COMPLETED_AT + timedelta(days=1)
 
@@ -531,6 +558,7 @@ async def test_provider_accepted_recipient_eligible_for_booked_after(session_mak
             )
             session.add(record)
             await session.flush()
+            session.add(RecordService(record_id=record.id, service_id=_LASH_SVC_ID))
 
             session.add(
                 AltegioEvent(
@@ -815,6 +843,7 @@ async def test_recompute_endpoint_returns_analytics_stats(
     session_maker,
 ) -> None:
     """POST /runs/{run_id}/recompute returns JSON with read_count and booked_after_count."""
+    _seed_lash_cache()
     run_id = await _make_run(session_maker)
 
     async with session_maker() as session:
@@ -840,6 +869,7 @@ async def test_recompute_endpoint_returns_analytics_stats(
             )
             session.add(record)
             await session.flush()
+            session.add(RecordService(record_id=record.id, service_id=_LASH_SVC_ID))
 
             session.add(
                 AltegioEvent(
@@ -886,7 +916,11 @@ async def test_recompute_endpoint_returns_analytics_stats(
 
 @pytest.mark.asyncio
 async def test_booked_after_null_when_event_between_completed_and_sent(session_maker) -> None:
-    """Event after run.completed_at but before recipient.sent_at → booked_after_at=None."""
+    """Event after run.completed_at but before recipient.sent_at → booked_after_at=None.
+
+    Lash service present so NULL is proven to come from timing, not missing service.
+    """
+    _seed_lash_cache()
     run_id = await _make_run(session_maker)
 
     # sent_at is 5 seconds after completed_at
@@ -904,6 +938,7 @@ async def test_booked_after_null_when_event_between_completed_and_sent(session_m
             )
             session.add(record)
             await session.flush()
+            session.add(RecordService(record_id=record.id, service_id=_LASH_SVC_ID))
 
             session.add(
                 AltegioEvent(
@@ -944,6 +979,7 @@ async def test_booked_after_null_when_event_between_completed_and_sent(session_m
 @pytest.mark.asyncio
 async def test_booked_after_set_when_event_after_sent_at(session_maker) -> None:
     """Event 1 second after recipient.sent_at → booked_after_at is set."""
+    _seed_lash_cache()
     run_id = await _make_run(session_maker)
 
     sent_at = _COMPLETED_AT + timedelta(seconds=5)
@@ -959,6 +995,7 @@ async def test_booked_after_set_when_event_after_sent_at(session_maker) -> None:
             )
             session.add(record)
             await session.flush()
+            session.add(RecordService(record_id=record.id, service_id=_LASH_SVC_ID))
 
             session.add(
                 AltegioEvent(
@@ -1137,6 +1174,7 @@ async def test_booked_after_null_for_failed_outbox_recipient(session_maker) -> N
 @pytest.mark.asyncio
 async def test_booked_after_set_for_outbox_sent_recipient(session_maker) -> None:
     """Recipient with outbox.status='sent' → booked_after_at is set (positive send signal)."""
+    _seed_lash_cache()
     run_id = await _make_run(session_maker)
     event_at = _COMPLETED_AT + timedelta(days=1)
 
@@ -1164,6 +1202,7 @@ async def test_booked_after_set_for_outbox_sent_recipient(session_maker) -> None
             )
             session.add(record)
             await session.flush()
+            session.add(RecordService(record_id=record.id, service_id=_LASH_SVC_ID))
 
             session.add(
                 AltegioEvent(
@@ -1261,8 +1300,14 @@ async def test_booked_after_null_for_skipped_recipient(session_maker) -> None:
 
 
 @pytest.mark.asyncio
-async def test_booked_after_null_for_deleted_record(session_maker) -> None:
-    """Record with is_deleted=True → booked_after_at=None even with event in window."""
+async def test_booked_after_null_for_deleted_record_without_lash_service(session_maker) -> None:
+    """Record with is_deleted=True and no lash service → booked_after_at=None.
+
+    is_deleted is no longer filtered (create event proves booking regardless of
+    later status). The NULL here is because the record has no RecordService with
+    a lash category. See test_booked_after_set_for_deleted_lash_record for the
+    case where a deleted record WITH a lash service still counts.
+    """
     run_id = await _make_run(session_maker)
     event_at = _COMPLETED_AT + timedelta(days=1)
 
@@ -1308,7 +1353,7 @@ async def test_booked_after_null_for_deleted_record(session_maker) -> None:
     async with session_maker() as session:
         run = await session.get(CampaignRun, run_id)
 
-    assert run.booked_after_count == 0, "deleted records must not count as booked-after"
+    assert run.booked_after_count == 0, "no lash service → booked_after_count stays 0"
 
 
 # ---------------------------------------------------------------------------
@@ -1439,6 +1484,7 @@ def test_followup_unread_or_not_booked_excludes_read_status_and_booked() -> None
 @pytest.mark.asyncio
 async def test_booked_after_crm_only_via_altegio_client_id(session_maker) -> None:
     """booked_after_at set via Record.altegio_client_id when recipient.client_id=None."""
+    _seed_lash_cache()
     run_id = await _make_run(session_maker)
     event_at = _COMPLETED_AT + timedelta(days=5)
     altegio_client_id = 99887
@@ -1454,6 +1500,7 @@ async def test_booked_after_crm_only_via_altegio_client_id(session_maker) -> Non
             )
             session.add(record)
             await session.flush()
+            session.add(RecordService(record_id=record.id, service_id=_LASH_SVC_ID))
 
             session.add(
                 AltegioEvent(
@@ -1652,7 +1699,9 @@ async def test_booked_after_null_when_sent_before_completed_and_event_between(se
 
     With the max() guard, attr_start=completed_at, so an event between
     sent_at and completed_at is outside the attribution window.
+    Lash service present to confirm NULL is due to timing, not missing service.
     """
+    _seed_lash_cache()
     run_id = await _make_run(session_maker)
     sent_at = _COMPLETED_AT - timedelta(hours=2)
     event_at = _COMPLETED_AT - timedelta(hours=1)
@@ -1669,6 +1718,7 @@ async def test_booked_after_null_when_sent_before_completed_and_event_between(se
             )
             session.add(record)
             await session.flush()
+            session.add(RecordService(record_id=record.id, service_id=_LASH_SVC_ID))
 
             session.add(
                 AltegioEvent(
@@ -1712,6 +1762,7 @@ async def test_booked_after_set_when_sent_before_completed_and_event_after(sessi
     attr_start = max(completed_at, sent_at) = completed_at; event is after
     completed_at so it is within the attribution window.
     """
+    _seed_lash_cache()
     run_id = await _make_run(session_maker)
     sent_at = _COMPLETED_AT - timedelta(hours=2)
     event_at = _COMPLETED_AT + timedelta(days=1)
@@ -1728,6 +1779,7 @@ async def test_booked_after_set_when_sent_before_completed_and_event_after(sessi
             )
             session.add(record)
             await session.flush()
+            session.add(RecordService(record_id=record.id, service_id=_LASH_SVC_ID))
 
             session.add(
                 AltegioEvent(
@@ -1919,3 +1971,857 @@ async def test_booked_after_null_for_card_issue_failed_recipient(session_maker) 
         run = await session.get(CampaignRun, run_id)
 
     assert run.booked_after_count == 0, "card_issue_failed must block booked-after attribution"
+
+
+# ===========================================================================
+# Lash-only booked-after attribution (new business rule)
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Test 1: lash booking inside window → booked_after_at set
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_lash_booking_after_campaign_counts(session_maker) -> None:
+    """Lash record/create inside attribution window → booked_after_at set."""
+    _seed_lash_cache()
+    run_id = await _make_run(session_maker)
+    event_at = _COMPLETED_AT + timedelta(days=3)
+    altegio_client_id = 99200
+
+    async with session_maker() as session:
+        async with session.begin():
+            record = Record(
+                company_id=758285,
+                altegio_record_id=20001,
+                client_id=None,
+                altegio_client_id=altegio_client_id,
+                raw={},
+            )
+            session.add(record)
+            await session.flush()
+            session.add(RecordService(record_id=record.id, service_id=_LASH_SVC_ID))
+
+            session.add(
+                AltegioEvent(
+                    dedupe_key="test-lash-001",
+                    company_id=758285,
+                    resource="record",
+                    resource_id=20001,
+                    event_status="create",
+                    received_at=event_at,
+                )
+            )
+
+            recipient = CampaignRecipient(
+                campaign_run_id=run_id,
+                company_id=758285,
+                client_id=None,
+                altegio_client_id=altegio_client_id,
+                phone_e164="+49151000200",
+                display_name="Lash Client",
+                status="provider_accepted",
+                provider_message_id="wamid.lash-001",
+                sent_at=_COMPLETED_AT,
+            )
+            session.add(recipient)
+            await session.flush()
+            recipient_id = recipient.id
+
+    async with session_maker() as session:
+        async with session.begin():
+            await recompute_campaign_run_stats(session, run_id)
+
+    async with session_maker() as session:
+        recip = await session.get(CampaignRecipient, recipient_id)
+        run = await session.get(CampaignRun, run_id)
+
+    assert recip.booked_after_at == event_at
+    assert run.booked_after_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Test 2: non-lash booking → booked_after_at stays None
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_non_lash_booking_after_campaign_does_not_count(session_maker) -> None:
+    """Non-lash record/create inside attribution window → booked_after_at=None.
+
+    Regression: Özelm-style case — Hygienische Pediküre, Gesichtsreinigung
+    must NOT count as booked_after for a lash welcome campaign.
+    """
+    _seed_lash_cache()
+    run_id = await _make_run(session_maker)
+    event_at = _COMPLETED_AT + timedelta(days=3)
+    altegio_client_id = 99201
+
+    async with session_maker() as session:
+        async with session.begin():
+            record = Record(
+                company_id=758285,
+                altegio_record_id=20002,
+                client_id=None,
+                altegio_client_id=altegio_client_id,
+                raw={},
+            )
+            session.add(record)
+            await session.flush()
+            session.add(RecordService(record_id=record.id, service_id=_NON_LASH_SVC_ID))
+
+            session.add(
+                AltegioEvent(
+                    dedupe_key="test-nonlash-001",
+                    company_id=758285,
+                    resource="record",
+                    resource_id=20002,
+                    event_status="create",
+                    received_at=event_at,
+                )
+            )
+
+            session.add(
+                CampaignRecipient(
+                    campaign_run_id=run_id,
+                    company_id=758285,
+                    client_id=None,
+                    altegio_client_id=altegio_client_id,
+                    phone_e164="+49151000201",
+                    display_name="Non-Lash Client",
+                    status="provider_accepted",
+                    provider_message_id="wamid.nonlash-001",
+                    sent_at=_COMPLETED_AT,
+                )
+            )
+
+    async with session_maker() as session:
+        async with session.begin():
+            await recompute_campaign_run_stats(session, run_id)
+
+    async with session_maker() as session:
+        run = await session.get(CampaignRun, run_id)
+
+    assert run.booked_after_count == 0, "non-lash booking must not count as booked_after"
+
+
+# ---------------------------------------------------------------------------
+# Test 3: mixed services (non-lash + lash) → booked_after_at set
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_mixed_services_booking_counts_when_lash_present(session_maker) -> None:
+    """Record with one non-lash + one lash service → booked_after_at is set."""
+    _seed_lash_cache()
+    run_id = await _make_run(session_maker)
+    event_at = _COMPLETED_AT + timedelta(days=2)
+    altegio_client_id = 99202
+
+    async with session_maker() as session:
+        async with session.begin():
+            record = Record(
+                company_id=758285,
+                altegio_record_id=20003,
+                client_id=None,
+                altegio_client_id=altegio_client_id,
+                raw={},
+            )
+            session.add(record)
+            await session.flush()
+            # Both a non-lash and a lash service — lash wins
+            session.add(RecordService(record_id=record.id, service_id=_NON_LASH_SVC_ID))
+            session.add(RecordService(record_id=record.id, service_id=_LASH_SVC_ID))
+
+            session.add(
+                AltegioEvent(
+                    dedupe_key="test-mixed-svc-001",
+                    company_id=758285,
+                    resource="record",
+                    resource_id=20003,
+                    event_status="create",
+                    received_at=event_at,
+                )
+            )
+
+            recipient = CampaignRecipient(
+                campaign_run_id=run_id,
+                company_id=758285,
+                client_id=None,
+                altegio_client_id=altegio_client_id,
+                phone_e164="+49151000202",
+                display_name="Mixed Services Client",
+                status="provider_accepted",
+                provider_message_id="wamid.mixed-001",
+                sent_at=_COMPLETED_AT,
+            )
+            session.add(recipient)
+            await session.flush()
+            recipient_id = recipient.id
+
+    async with session_maker() as session:
+        async with session.begin():
+            await recompute_campaign_run_stats(session, run_id)
+
+    async with session_maker() as session:
+        recip = await session.get(CampaignRecipient, recipient_id)
+
+    assert recip.booked_after_at == event_at, "record with ≥1 lash service must count"
+
+
+# ---------------------------------------------------------------------------
+# Test 4: future appointment date doesn't block attribution (event time matters)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_lash_booking_with_future_appointment_still_counts(session_maker) -> None:
+    """Record.starts_at far in future; event.received_at inside window → booked_after_at set."""
+    _seed_lash_cache()
+    run_id = await _make_run(session_maker, attribution_window_days=30)
+    event_at = _COMPLETED_AT + timedelta(days=10)
+    altegio_client_id = 99203
+
+    async with session_maker() as session:
+        async with session.begin():
+            record = Record(
+                company_id=758285,
+                altegio_record_id=20004,
+                client_id=None,
+                altegio_client_id=altegio_client_id,
+                starts_at=_COMPLETED_AT + timedelta(days=180),  # far future
+                raw={},
+            )
+            session.add(record)
+            await session.flush()
+            session.add(RecordService(record_id=record.id, service_id=_LASH_SVC_ID))
+
+            session.add(
+                AltegioEvent(
+                    dedupe_key="test-future-appt-001",
+                    company_id=758285,
+                    resource="record",
+                    resource_id=20004,
+                    event_status="create",
+                    received_at=event_at,
+                )
+            )
+
+            recipient = CampaignRecipient(
+                campaign_run_id=run_id,
+                company_id=758285,
+                client_id=None,
+                altegio_client_id=altegio_client_id,
+                phone_e164="+49151000203",
+                display_name="Future Appt Client",
+                status="provider_accepted",
+                provider_message_id="wamid.future-001",
+                sent_at=_COMPLETED_AT,
+            )
+            session.add(recipient)
+            await session.flush()
+            recipient_id = recipient.id
+
+    async with session_maker() as session:
+        async with session.begin():
+            await recompute_campaign_run_stats(session, run_id)
+
+    async with session_maker() as session:
+        recip = await session.get(CampaignRecipient, recipient_id)
+
+    assert recip.booked_after_at == event_at, "appointment start date must not affect attribution"
+
+
+# ---------------------------------------------------------------------------
+# Test 5 & 6: attendance/confirmed/is_deleted are NOT checked
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_lash_booking_counts_regardless_of_attendance(session_maker) -> None:
+    """attendance=0, confirmed=0, visit_attendance=0 → booked_after_at still set for lash."""
+    _seed_lash_cache()
+    run_id = await _make_run(session_maker)
+    event_at = _COMPLETED_AT + timedelta(days=4)
+    altegio_client_id = 99204
+
+    async with session_maker() as session:
+        async with session.begin():
+            record = Record(
+                company_id=758285,
+                altegio_record_id=20005,
+                client_id=None,
+                altegio_client_id=altegio_client_id,
+                attendance=0,
+                confirmed=0,
+                visit_attendance=0,
+                raw={},
+            )
+            session.add(record)
+            await session.flush()
+            session.add(RecordService(record_id=record.id, service_id=_LASH_SVC_ID))
+
+            session.add(
+                AltegioEvent(
+                    dedupe_key="test-attendance-ignored-001",
+                    company_id=758285,
+                    resource="record",
+                    resource_id=20005,
+                    event_status="create",
+                    received_at=event_at,
+                )
+            )
+
+            recipient = CampaignRecipient(
+                campaign_run_id=run_id,
+                company_id=758285,
+                client_id=None,
+                altegio_client_id=altegio_client_id,
+                phone_e164="+49151000204",
+                display_name="No-Show Client",
+                status="provider_accepted",
+                provider_message_id="wamid.noshow-001",
+                sent_at=_COMPLETED_AT,
+            )
+            session.add(recipient)
+            await session.flush()
+            recipient_id = recipient.id
+
+    async with session_maker() as session:
+        async with session.begin():
+            await recompute_campaign_run_stats(session, run_id)
+
+    async with session_maker() as session:
+        recip = await session.get(CampaignRecipient, recipient_id)
+
+    assert recip.booked_after_at == event_at, "visit attendance must not block lash attribution"
+
+
+@pytest.mark.asyncio
+async def test_booked_after_set_for_deleted_lash_record(session_maker) -> None:
+    """Lash record with is_deleted=True still counts — create event proves booking happened.
+
+    Business rule: we count the booking creation event, not the current record
+    status. Cancellation in Altegio uses confirmed=0; is_deleted=True may indicate
+    physical deletion. Either way, the marketing action (booking intent) occurred.
+    """
+    _seed_lash_cache()
+    run_id = await _make_run(session_maker)
+    event_at = _COMPLETED_AT + timedelta(days=2)
+    altegio_client_id = 99205
+
+    async with session_maker() as session:
+        async with session.begin():
+            record = Record(
+                company_id=758285,
+                altegio_record_id=20006,
+                client_id=None,
+                altegio_client_id=altegio_client_id,
+                is_deleted=True,
+                raw={},
+            )
+            session.add(record)
+            await session.flush()
+            session.add(RecordService(record_id=record.id, service_id=_LASH_SVC_ID))
+
+            session.add(
+                AltegioEvent(
+                    dedupe_key="test-deleted-lash-001",
+                    company_id=758285,
+                    resource="record",
+                    resource_id=20006,
+                    event_status="create",
+                    received_at=event_at,
+                )
+            )
+
+            recipient = CampaignRecipient(
+                campaign_run_id=run_id,
+                company_id=758285,
+                client_id=None,
+                altegio_client_id=altegio_client_id,
+                phone_e164="+49151000205",
+                display_name="Deleted Lash Client",
+                status="provider_accepted",
+                provider_message_id="wamid.deleted-001",
+                sent_at=_COMPLETED_AT,
+            )
+            session.add(recipient)
+            await session.flush()
+            recipient_id = recipient.id
+
+    async with session_maker() as session:
+        async with session.begin():
+            await recompute_campaign_run_stats(session, run_id)
+
+    async with session_maker() as session:
+        recip = await session.get(CampaignRecipient, recipient_id)
+        run = await session.get(CampaignRun, run_id)
+
+    assert recip.booked_after_at == event_at, "deleted lash record must count — create proves booking"
+    assert run.booked_after_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Test 7: first lash booking wins over earlier non-lash booking
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_first_lash_event_wins_over_earlier_non_lash(session_maker) -> None:
+    """Earlier non-lash event is ignored; later lash event sets booked_after_at."""
+    _seed_lash_cache()
+    run_id = await _make_run(session_maker)
+    non_lash_event_at = _COMPLETED_AT + timedelta(days=1)
+    lash_event_at = _COMPLETED_AT + timedelta(days=3)
+    altegio_client_id = 99206
+
+    async with session_maker() as session:
+        async with session.begin():
+            non_lash_record = Record(
+                company_id=758285,
+                altegio_record_id=20007,
+                client_id=None,
+                altegio_client_id=altegio_client_id,
+                raw={},
+            )
+            session.add(non_lash_record)
+            await session.flush()
+            session.add(RecordService(record_id=non_lash_record.id, service_id=_NON_LASH_SVC_ID))
+
+            lash_record = Record(
+                company_id=758285,
+                altegio_record_id=20008,
+                client_id=None,
+                altegio_client_id=altegio_client_id,
+                raw={},
+            )
+            session.add(lash_record)
+            await session.flush()
+            session.add(RecordService(record_id=lash_record.id, service_id=_LASH_SVC_ID))
+
+            session.add(
+                AltegioEvent(
+                    dedupe_key="test-nonlash-first-001",
+                    company_id=758285,
+                    resource="record",
+                    resource_id=20007,
+                    event_status="create",
+                    received_at=non_lash_event_at,
+                )
+            )
+            session.add(
+                AltegioEvent(
+                    dedupe_key="test-lash-second-001",
+                    company_id=758285,
+                    resource="record",
+                    resource_id=20008,
+                    event_status="create",
+                    received_at=lash_event_at,
+                )
+            )
+
+            recipient = CampaignRecipient(
+                campaign_run_id=run_id,
+                company_id=758285,
+                client_id=None,
+                altegio_client_id=altegio_client_id,
+                phone_e164="+49151000206",
+                display_name="Mixed Order Client",
+                status="provider_accepted",
+                provider_message_id="wamid.mixed-order-001",
+                sent_at=_COMPLETED_AT,
+            )
+            session.add(recipient)
+            await session.flush()
+            recipient_id = recipient.id
+
+    async with session_maker() as session:
+        async with session.begin():
+            await recompute_campaign_run_stats(session, run_id)
+
+    async with session_maker() as session:
+        recip = await session.get(CampaignRecipient, recipient_id)
+
+    assert recip.booked_after_at == lash_event_at, "booked_after_at must be the LASH event time"
+
+
+# ---------------------------------------------------------------------------
+# Test 8: lash event outside window ignored; lash event inside window counts
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_lash_event_outside_window_ignored_inside_counts(session_maker) -> None:
+    """Lash event outside attribution window is excluded; lash event inside is counted."""
+    _seed_lash_cache()
+    run_id = await _make_run(session_maker, attribution_window_days=7)
+    inside_event_at = _COMPLETED_AT + timedelta(days=5)
+    outside_event_at = _COMPLETED_AT + timedelta(days=8)  # > 7-day window
+    altegio_client_id = 99207
+
+    async with session_maker() as session:
+        async with session.begin():
+            record_inside = Record(
+                company_id=758285,
+                altegio_record_id=20009,
+                client_id=None,
+                altegio_client_id=altegio_client_id,
+                raw={},
+            )
+            session.add(record_inside)
+            await session.flush()
+            session.add(RecordService(record_id=record_inside.id, service_id=_LASH_SVC_ID))
+
+            record_outside = Record(
+                company_id=758285,
+                altegio_record_id=20010,
+                client_id=None,
+                altegio_client_id=altegio_client_id,
+                raw={},
+            )
+            session.add(record_outside)
+            await session.flush()
+            session.add(RecordService(record_id=record_outside.id, service_id=_LASH_SVC_ID))
+
+            session.add(
+                AltegioEvent(
+                    dedupe_key="test-inside-window-001",
+                    company_id=758285,
+                    resource="record",
+                    resource_id=20009,
+                    event_status="create",
+                    received_at=inside_event_at,
+                )
+            )
+            session.add(
+                AltegioEvent(
+                    dedupe_key="test-outside-window-001",
+                    company_id=758285,
+                    resource="record",
+                    resource_id=20010,
+                    event_status="create",
+                    received_at=outside_event_at,
+                )
+            )
+
+            recipient = CampaignRecipient(
+                campaign_run_id=run_id,
+                company_id=758285,
+                client_id=None,
+                altegio_client_id=altegio_client_id,
+                phone_e164="+49151000207",
+                display_name="Window Client",
+                status="provider_accepted",
+                provider_message_id="wamid.window-001",
+                sent_at=_COMPLETED_AT,
+            )
+            session.add(recipient)
+            await session.flush()
+            recipient_id = recipient.id
+
+    async with session_maker() as session:
+        async with session.begin():
+            await recompute_campaign_run_stats(session, run_id)
+
+    async with session_maker() as session:
+        recip = await session.get(CampaignRecipient, recipient_id)
+
+    assert recip.booked_after_at == inside_event_at, "booked_after_at must use inside-window event"
+
+
+# ---------------------------------------------------------------------------
+# Test 9: failed outbox hard-blocks even with lash booking present
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_failed_outbox_blocks_lash_attribution(session_maker) -> None:
+    """failed outbox + lash record → booked_after_at=None (eligibility blocks attribution)."""
+    _seed_lash_cache()
+    run_id = await _make_run(session_maker)
+    event_at = _COMPLETED_AT + timedelta(days=2)
+    altegio_client_id = 99208
+
+    async with session_maker() as session:
+        async with session.begin():
+            outbox = OutboxMessage(
+                company_id=758285,
+                phone_e164="+49151000208",
+                template_code="newsletter_new_clients_monthly",
+                language="de",
+                body="Test",
+                status="failed",
+                scheduled_at=_COMPLETED_AT,
+                sent_at=_COMPLETED_AT,
+                provider_message_id="wamid.failed-lash-001",
+                meta={},
+            )
+            session.add(outbox)
+            await session.flush()
+
+            record = Record(
+                company_id=758285,
+                altegio_record_id=20011,
+                client_id=None,
+                altegio_client_id=altegio_client_id,
+                raw={},
+            )
+            session.add(record)
+            await session.flush()
+            session.add(RecordService(record_id=record.id, service_id=_LASH_SVC_ID))
+
+            session.add(
+                AltegioEvent(
+                    dedupe_key="test-failed-lash-001",
+                    company_id=758285,
+                    resource="record",
+                    resource_id=20011,
+                    event_status="create",
+                    received_at=event_at,
+                )
+            )
+
+            session.add(
+                CampaignRecipient(
+                    campaign_run_id=run_id,
+                    company_id=758285,
+                    client_id=None,
+                    altegio_client_id=altegio_client_id,
+                    phone_e164="+49151000208",
+                    display_name="Failed+Lash Client",
+                    status="queued",
+                    outbox_message_id=outbox.id,
+                    provider_message_id=None,
+                    sent_at=None,
+                )
+            )
+
+    async with session_maker() as session:
+        async with session.begin():
+            await recompute_campaign_run_stats(session, run_id)
+
+    async with session_maker() as session:
+        run = await session.get(CampaignRun, run_id)
+
+    assert run.booked_after_count == 0, "failed outbox must block attribution regardless of lash service"
+
+
+# ---------------------------------------------------------------------------
+# Test 10: ServiceLookupError → no booked_after_at, warning logged, no crash
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_service_lookup_error_does_not_count_as_lash(session_maker, monkeypatch) -> None:
+    """ServiceLookupError → record excluded from attribution; recompute does not crash."""
+    run_id = await _make_run(session_maker)
+    event_at = _COMPLETED_AT + timedelta(days=2)
+    altegio_client_id = 99209
+
+    async def _raise_lookup_error(company_id, service_id, http_client=None):
+        raise ServiceLookupError(f"mock error for service_id={service_id}")
+
+    monkeypatch.setattr("altegio_bot.service_filter.is_lash_service", _raise_lookup_error)
+
+    async with session_maker() as session:
+        async with session.begin():
+            record = Record(
+                company_id=758285,
+                altegio_record_id=20012,
+                client_id=None,
+                altegio_client_id=altegio_client_id,
+                raw={},
+            )
+            session.add(record)
+            await session.flush()
+            session.add(RecordService(record_id=record.id, service_id=_ERROR_SVC_ID))
+
+            session.add(
+                AltegioEvent(
+                    dedupe_key="test-lookup-error-001",
+                    company_id=758285,
+                    resource="record",
+                    resource_id=20012,
+                    event_status="create",
+                    received_at=event_at,
+                )
+            )
+
+            recipient = CampaignRecipient(
+                campaign_run_id=run_id,
+                company_id=758285,
+                client_id=None,
+                altegio_client_id=altegio_client_id,
+                phone_e164="+49151000209",
+                display_name="Error Client",
+                status="provider_accepted",
+                provider_message_id="wamid.error-001",
+                sent_at=_COMPLETED_AT,
+            )
+            session.add(recipient)
+            await session.flush()
+            recipient_id = recipient.id
+
+    # Must not raise; ServiceLookupError is caught inside filter_lash_record_ids
+    async with session_maker() as session:
+        async with session.begin():
+            await recompute_campaign_run_stats(session, run_id)
+
+    async with session_maker() as session:
+        recip = await session.get(CampaignRecipient, recipient_id)
+        run = await session.get(CampaignRun, run_id)
+
+    assert recip.booked_after_at is None, "ServiceLookupError must not silently count as lash"
+    assert run.booked_after_count == 0
+
+
+# ---------------------------------------------------------------------------
+# Test 11: CRM-only fallback via altegio_client_id with lash service
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_lash_attribution_crm_only_fallback(session_maker) -> None:
+    """CRM-only recipient (client_id=None) matched via altegio_client_id + lash service → set."""
+    _seed_lash_cache()
+    run_id = await _make_run(session_maker)
+    event_at = _COMPLETED_AT + timedelta(days=6)
+    altegio_client_id = 99210
+
+    async with session_maker() as session:
+        async with session.begin():
+            record = Record(
+                company_id=758285,
+                altegio_record_id=20013,
+                client_id=None,
+                altegio_client_id=altegio_client_id,
+                raw={},
+            )
+            session.add(record)
+            await session.flush()
+            session.add(RecordService(record_id=record.id, service_id=_LASH_SVC_ID))
+
+            session.add(
+                AltegioEvent(
+                    dedupe_key="test-crm-lash-001",
+                    company_id=758285,
+                    resource="record",
+                    resource_id=20013,
+                    event_status="create",
+                    received_at=event_at,
+                )
+            )
+
+            recipient = CampaignRecipient(
+                campaign_run_id=run_id,
+                company_id=758285,
+                client_id=None,
+                altegio_client_id=altegio_client_id,
+                phone_e164="+49151000210",
+                display_name="CRM-only Lash Client",
+                status="provider_accepted",
+                provider_message_id="wamid.crm-lash-001",
+                sent_at=_COMPLETED_AT,
+            )
+            session.add(recipient)
+            await session.flush()
+            recipient_id = recipient.id
+
+    async with session_maker() as session:
+        async with session.begin():
+            await recompute_campaign_run_stats(session, run_id)
+
+    async with session_maker() as session:
+        recip = await session.get(CampaignRecipient, recipient_id)
+        run = await session.get(CampaignRun, run_id)
+
+    assert recip.booked_after_at == event_at
+    assert run.booked_after_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Test 12: Özelm regression — non-lash bookings after campaign → count stays 0
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_oezelm_regression_non_lash_bookings_do_not_count(session_maker) -> None:
+    """Production regression: multiple non-lash bookings (Pediküre, Gesichtsreinigung) → 0.
+
+    Before the lash filter was added, Campaign Run #16 incorrectly attributed
+    non-lash records for Özelm as booked_after. This test prevents regression.
+    """
+    _seed_lash_cache()
+    run_id = await _make_run(session_maker)
+    altegio_client_id = 99211
+
+    async with session_maker() as session:
+        async with session.begin():
+            pedikure_record = Record(
+                company_id=758285,
+                altegio_record_id=20014,
+                client_id=None,
+                altegio_client_id=altegio_client_id,
+                raw={},
+            )
+            session.add(pedikure_record)
+            await session.flush()
+            session.add(RecordService(record_id=pedikure_record.id, service_id=_NON_LASH_SVC_ID))
+
+            gesicht_record = Record(
+                company_id=758285,
+                altegio_record_id=20015,
+                client_id=None,
+                altegio_client_id=altegio_client_id,
+                raw={},
+            )
+            session.add(gesicht_record)
+            await session.flush()
+            session.add(RecordService(record_id=gesicht_record.id, service_id=_NON_LASH_SVC_ID))
+
+            # Both events inside attribution window
+            session.add(
+                AltegioEvent(
+                    dedupe_key="test-oezelm-pedikure-001",
+                    company_id=758285,
+                    resource="record",
+                    resource_id=20014,
+                    event_status="create",
+                    received_at=_COMPLETED_AT + timedelta(days=2),
+                )
+            )
+            session.add(
+                AltegioEvent(
+                    dedupe_key="test-oezelm-gesicht-001",
+                    company_id=758285,
+                    resource="record",
+                    resource_id=20015,
+                    event_status="create",
+                    received_at=_COMPLETED_AT + timedelta(days=3),
+                )
+            )
+
+            session.add(
+                CampaignRecipient(
+                    campaign_run_id=run_id,
+                    company_id=758285,
+                    client_id=None,
+                    altegio_client_id=altegio_client_id,
+                    phone_e164="+49151000211",
+                    display_name="Özelm",
+                    status="provider_accepted",
+                    provider_message_id="wamid.oezelm-001",
+                    sent_at=_COMPLETED_AT,
+                )
+            )
+
+    async with session_maker() as session:
+        async with session.begin():
+            await recompute_campaign_run_stats(session, run_id)
+
+    async with session_maker() as session:
+        run = await session.get(CampaignRun, run_id)
+
+    assert run.booked_after_count == 0, "Özelm: non-lash bookings must not count as booked_after"

@@ -27,6 +27,7 @@ from altegio_bot.models.models import (
     OutboxMessage,
     Record,
 )
+from altegio_bot.service_filter import filter_lash_record_ids
 from altegio_bot.utils import utcnow
 
 logger = logging.getLogger(__name__)
@@ -1785,17 +1786,20 @@ async def _sync_booked_after_from_altegio_events(
 ) -> None:
     """Backfill CampaignRecipient.booked_after_at from AltegioEvent records.
 
-    For each eligible recipient without booked_after_at, finds the first
-    'record/create' AltegioEvent within the per-recipient attribution window
-    that links (via Record) to the same client.
+    Booked-after semantics:
+    A recipient is counted as booked_after only when the client creates a new
+    booking that contains at least one lash service within the attribution
+    window. The metric is based on the booking creation event time, not
+    appointment start. Visit attendance, payment and no-show status are
+    intentionally not checked.
 
     Eligibility (positive send signal required — see _is_booked_after_eligible).
     Attribution window per recipient:
       start = max(run.completed_at, recipient.sent_at)  — never before campaign end
       end   = start + run.attribution_window_days
     Matching priority: Record.client_id → Record.altegio_client_id (fallback).
-    Deleted records (is_deleted=True) are excluded.
-    Legacy NULL is_deleted values are treated as not deleted via COALESCE.
+    Record.is_deleted is NOT filtered: the create event proves the booking was
+    made regardless of later cancellation or deletion status.
     Does nothing if run.completed_at is None.
     """
     if run.completed_at is None:
@@ -1840,6 +1844,7 @@ async def _sync_booked_after_from_altegio_events(
     stmt = (
         select(
             AltegioEvent.received_at,
+            Record.id.label("record_id"),
             Record.company_id,
             Record.client_id,
             Record.altegio_client_id,
@@ -1856,14 +1861,27 @@ async def _sync_booked_after_from_altegio_events(
         .where(AltegioEvent.event_status == "create")
         .where(AltegioEvent.received_at > overall_start)
         .where(AltegioEvent.received_at <= overall_end)
-        # Treat legacy NULL is_deleted values as not deleted.
-        .where(func.coalesce(Record.is_deleted, False).is_(False))
+        # is_deleted is intentionally NOT filtered: the create event proves the
+        # booking was made regardless of later cancellation or deletion status.
         .order_by(AltegioEvent.received_at.asc())
     )
 
     rows = (await session.execute(stmt)).all()
 
+    # Filter to records containing at least one lash service.
+    # Group record_ids by company for the batch category lookup.
+    record_ids_by_company: dict[int, set[int]] = {}
     for row in rows:
+        record_ids_by_company.setdefault(row.company_id, set()).add(row.record_id)
+
+    lash_record_ids: set[int] = set()
+    for cid, rids in record_ids_by_company.items():
+        lash_record_ids.update(await filter_lash_record_ids(session, company_id=cid, record_ids=list(rids)))
+
+    for row in rows:
+        if row.record_id not in lash_record_ids:
+            continue
+
         r: CampaignRecipient | None = None
         if row.client_id is not None:
             r = by_client.get((row.company_id, row.client_id))

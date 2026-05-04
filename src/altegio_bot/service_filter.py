@@ -231,6 +231,85 @@ async def is_lash_service(
     return category_id in allowed
 
 
+async def filter_lash_record_ids(
+    session: AsyncSession,
+    *,
+    company_id: int,
+    record_ids: list[int],
+    http_client: httpx.AsyncClient | None = None,
+) -> set[int]:
+    """Return the subset of record_ids that contain at least one lash service.
+
+    Queries RecordService in one batch, then resolves service categories via
+    the process-local LRU cache; cache misses trigger an Altegio API call
+    (using http_client if provided, otherwise a single-shot client per call).
+
+    Booked-after semantics: a booking counts only when it contains ≥1 lash
+    service. This function is the authoritative lash gate for recompute
+    attribution — it does NOT use title substrings.
+
+    ServiceLookupError for a service_id:
+    - That service is treated as 'unknown'. A record is included only if
+      another of its services is confirmed lash.
+    - A warning is logged per affected service_id; the error is not propagated.
+    - TODO: add explicit service_category_unavailable counter for recompute
+            attribution if per-record granularity is needed later.
+
+    Args:
+        session:    async DB session (read-only use within existing transaction).
+        company_id: Altegio company ID (key for LASH_CATEGORY_IDS_BY_COMPANY).
+        record_ids: Record.id (PK) values to inspect.
+        http_client: if provided, reused for Altegio API calls (keep-alive).
+
+    Returns:
+        Set of record_ids confirmed to have ≥1 lash service.
+        Records with only unresolvable services are excluded conservatively.
+    """
+    if not record_ids:
+        return set()
+
+    allowed = LASH_CATEGORY_IDS_BY_COMPANY.get(company_id)
+    if not allowed:
+        return set()
+
+    # Batch query: all services for the candidate records
+    stmt = select(RecordService.record_id, RecordService.service_id).where(RecordService.record_id.in_(record_ids))
+    rows = (await session.execute(stmt)).all()
+
+    # Build record → service_ids mapping and collect all unique service_ids
+    record_svcs: dict[int, set[int]] = {}
+    all_svc_ids: set[int] = set()
+    for row in rows:
+        record_svcs.setdefault(row.record_id, set()).add(row.service_id)
+        all_svc_ids.add(row.service_id)
+
+    # Resolve each unique service_id once (cache + optional API)
+    lash_svc: set[int] = set()
+    unknown_svc: set[int] = set()
+    for svc_id in all_svc_ids:
+        try:
+            if await is_lash_service(company_id, svc_id, http_client):
+                lash_svc.add(svc_id)
+        except ServiceLookupError:
+            unknown_svc.add(svc_id)
+            logger.warning(
+                "recompute booked-after: service category lookup failed "
+                "company_id=%d service_id=%d — record excluded from lash attribution",
+                company_id,
+                svc_id,
+            )
+
+    # Include a record only if at least one of its services is confirmed lash.
+    # Records whose services are all unknown (lookup failed) are excluded
+    # conservatively — they are not silently counted as non-lash without a trace.
+    result: set[int] = set()
+    for rec_id in record_ids:
+        svc_ids = record_svcs.get(rec_id, set())
+        if any(s in lash_svc for s in svc_ids):
+            result.add(rec_id)
+    return result
+
+
 async def record_has_allowed_service(
     session: AsyncSession,
     *,
