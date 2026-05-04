@@ -1791,10 +1791,10 @@ async def _sync_booked_after_from_altegio_events(
 
     Eligibility (positive send signal required — see _is_booked_after_eligible).
     Attribution window per recipient:
-      start = recipient.sent_at (after _backfill_recipient_links) or run.completed_at
+      start = max(run.completed_at, recipient.sent_at)  — never before campaign end
       end   = start + run.attribution_window_days
     Matching priority: Record.client_id → Record.altegio_client_id (fallback).
-    Deleted records (Record.is_deleted=True) are excluded.
+    Deleted records (is_deleted=True or NULL) are excluded via COALESCE.
     Does nothing if run.completed_at is None.
     """
     if run.completed_at is None:
