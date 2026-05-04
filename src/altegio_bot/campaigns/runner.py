@@ -1703,7 +1703,9 @@ _BOOKED_AFTER_POSITIVE_STATUSES: frozenset[str] = frozenset(
 )
 
 # Recipient statuses that definitively block booked-after attribution.
-_BOOKED_AFTER_FAILURE_STATUSES: frozenset[str] = frozenset({"skipped", "cleanup_failed"})
+_BOOKED_AFTER_FAILURE_STATUSES: frozenset[str] = frozenset(
+    {"skipped", "cleanup_failed", "queue_failed", "card_issue_failed"}
+)
 
 # OutboxMessage statuses that confirm the provider accepted the message.
 _OUTBOX_POSITIVE_FOR_ATTRIBUTION: frozenset[str] = frozenset({"sent", "delivered", "read"})
@@ -1715,23 +1717,26 @@ def _is_booked_after_eligible(
 ) -> bool:
     """Return True when recipient has a positive send signal for booked-after attribution.
 
-    Positive send signal priority (first match wins):
-      1. recipient.status in _BOOKED_AFTER_POSITIVE_STATUSES
-      2. linked OutboxMessage.status in _OUTBOX_POSITIVE_FOR_ATTRIBUTION
-      3. recipient.provider_message_id is not None (non-failure, non-excluded)
-      4. recipient.sent_at is not None (non-failure, non-excluded)
+    If a linked OutboxMessage exists its status is authoritative — a failed/queued
+    outbox row HARD BLOCKS attribution even if _backfill_recipient_links already
+    copied sent_at/provider_message_id to the recipient.
+
+    When no outbox row is linked, fall back to recipient-level signals (status,
+    provider_message_id, sent_at).
 
     message_job_id alone and outbox_message_id alone are intentionally NOT
     positive signals — a job can be queued/canceled/failed without a message
-    ever reaching the provider, and an outbox row can be in failed/queued state.
+    ever reaching the provider.
     """
     if r.excluded_reason is not None:
         return False
     if r.status in _BOOKED_AFTER_FAILURE_STATUSES:
         return False
+    if ob is not None:
+        # Outbox row is authoritative — do not fall through to copied recipient fields.
+        return ob.status in _OUTBOX_POSITIVE_FOR_ATTRIBUTION
+    # No linked outbox — use recipient-level signals.
     if r.status in _BOOKED_AFTER_POSITIVE_STATUSES:
-        return True
-    if ob is not None and ob.status in _OUTBOX_POSITIVE_FOR_ATTRIBUTION:
         return True
     if r.provider_message_id is not None:
         return True
@@ -1810,7 +1815,9 @@ async def _sync_booked_after_from_altegio_events(
     company_ids = list({r.company_id for r in eligible})
 
     def _attr_start(r: CampaignRecipient) -> datetime:
-        return r.sent_at or run.completed_at  # type: ignore[return-value]
+        if r.sent_at is not None:
+            return max(run.completed_at, r.sent_at)  # type: ignore[arg-type]
+        return run.completed_at  # type: ignore[return-value]
 
     # One DB query covering the union of all per-recipient windows
     overall_start = min(_attr_start(r) for r in eligible)
@@ -1848,7 +1855,7 @@ async def _sync_booked_after_from_altegio_events(
         .where(AltegioEvent.event_status == "create")
         .where(AltegioEvent.received_at > overall_start)
         .where(AltegioEvent.received_at <= overall_end)
-        .where(Record.is_deleted.is_(False))
+        .where(func.coalesce(Record.is_deleted, False).is_(False))
         .order_by(AltegioEvent.received_at.asc())
     )
 
