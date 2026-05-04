@@ -14,6 +14,9 @@ from altegio_bot.utils import utcnow
 
 logger = logging.getLogger(__name__)
 
+# Статусы, которые означают «сообщение прочитано или позже» для follow-up политик.
+_READ_OR_LATER_STATUSES: frozenset[str] = frozenset({"read", "replied", "booked_after_campaign"})
+
 # Статусы CampaignRecipient, при которых follow-up не отправляется
 _HARD_FAILURE_STATUSES = {
     "cleanup_failed",
@@ -61,10 +64,12 @@ def _is_eligible_for_followup(
         return False
 
     if policy == "unread_only":
-        return recipient.read_at is None
+        is_read = recipient.read_at is not None or recipient.status in _READ_OR_LATER_STATUSES
+        return not is_read
 
     if policy == "unread_or_not_booked":
-        return recipient.read_at is None or recipient.booked_after_at is None
+        is_read = recipient.read_at is not None or recipient.status in _READ_OR_LATER_STATUSES
+        return not is_read or recipient.booked_after_at is None
 
     logger.warning("Unknown followup_policy=%s", policy)
     return False
