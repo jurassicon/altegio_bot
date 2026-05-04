@@ -61,10 +61,12 @@ def _is_eligible_for_followup(
         return False
 
     if policy == "unread_only":
-        return recipient.read_at is None
+        is_read = recipient.read_at is not None or recipient.status == "read"
+        return not is_read
 
     if policy == "unread_or_not_booked":
-        return recipient.read_at is None or recipient.booked_after_at is None
+        is_read = recipient.read_at is not None or recipient.status == "read"
+        return not is_read or recipient.booked_after_at is None
 
     logger.warning("Unknown followup_policy=%s", policy)
     return False

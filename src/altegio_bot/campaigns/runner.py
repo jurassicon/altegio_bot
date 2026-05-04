@@ -1691,6 +1691,55 @@ def _backfill_recipient_links(
             r.sent_at = ob.sent_at
 
 
+# Recipient statuses that imply provider-accepted / sent for booked-after attribution.
+_BOOKED_AFTER_POSITIVE_STATUSES: frozenset[str] = frozenset(
+    {
+        "provider_accepted",
+        "delivered",
+        "read",
+        "replied",
+        "booked_after_campaign",
+    }
+)
+
+# Recipient statuses that definitively block booked-after attribution.
+_BOOKED_AFTER_FAILURE_STATUSES: frozenset[str] = frozenset({"skipped", "cleanup_failed"})
+
+# OutboxMessage statuses that confirm the provider accepted the message.
+_OUTBOX_POSITIVE_FOR_ATTRIBUTION: frozenset[str] = frozenset({"sent", "delivered", "read"})
+
+
+def _is_booked_after_eligible(
+    r: CampaignRecipient,
+    ob: "OutboxMessage | None",
+) -> bool:
+    """Return True when recipient has a positive send signal for booked-after attribution.
+
+    Positive send signal priority (first match wins):
+      1. recipient.status in _BOOKED_AFTER_POSITIVE_STATUSES
+      2. linked OutboxMessage.status in _OUTBOX_POSITIVE_FOR_ATTRIBUTION
+      3. recipient.provider_message_id is not None (non-failure, non-excluded)
+      4. recipient.sent_at is not None (non-failure, non-excluded)
+
+    message_job_id alone and outbox_message_id alone are intentionally NOT
+    positive signals — a job can be queued/canceled/failed without a message
+    ever reaching the provider, and an outbox row can be in failed/queued state.
+    """
+    if r.excluded_reason is not None:
+        return False
+    if r.status in _BOOKED_AFTER_FAILURE_STATUSES:
+        return False
+    if r.status in _BOOKED_AFTER_POSITIVE_STATUSES:
+        return True
+    if ob is not None and ob.status in _OUTBOX_POSITIVE_FOR_ATTRIBUTION:
+        return True
+    if r.provider_message_id is not None:
+        return True
+    if r.sent_at is not None:
+        return True
+    return False
+
+
 def _backfill_recipient_read_at(
     recipients: list[CampaignRecipient],
     outbox_by_recipient: dict[int, OutboxMessage],
@@ -1699,8 +1748,14 @@ def _backfill_recipient_read_at(
 
     Only fills if read_at is currently None — never overwrites.
     Timestamp is taken from outbox.meta['wa_status_read']['timestamp'] (Unix epoch,
-    int or numeric string).  Falls back to utcnow() when timestamp is absent or
-    unparseable.
+    int or numeric string).  If the timestamp is absent or unparseable, read_at is
+    left as None — utcnow() is NOT used as a fallback to avoid fabricating audit
+    timestamps.
+
+    read_count is still incremented by _recompute_stats_from_db from
+    outbox_status_counts, so a missing timestamp does NOT break delivery metrics.
+    _sync_recipient_statuses sets recipient.status='read' so follow-up eligibility
+    also remains correct without read_at.
     """
     for r in recipients:
         if r.read_at is not None:
@@ -1714,49 +1769,52 @@ def _backfill_recipient_read_at(
             try:
                 r.read_at = datetime.fromtimestamp(int(ts_raw), tz=timezone.utc)
             except (ValueError, TypeError, OSError):
-                r.read_at = utcnow()
-        else:
-            r.read_at = utcnow()
+                pass  # leave read_at as None — do not fabricate a timestamp
 
 
 async def _sync_booked_after_from_altegio_events(
     session: AsyncSession,
     run: CampaignRun,
     recipients: list[CampaignRecipient],
+    outbox_by_recipient: dict[int, "OutboxMessage"],
 ) -> None:
     """Backfill CampaignRecipient.booked_after_at from AltegioEvent records.
 
-    For each provider-accepted recipient without booked_after_at, finds the
-    first 'record/create' AltegioEvent within the attribution window that
-    links (via Record) to the same client.
+    For each eligible recipient without booked_after_at, finds the first
+    'record/create' AltegioEvent within the per-recipient attribution window
+    that links (via Record) to the same client.
 
-    Attribution window: run.completed_at < received_at <= completed_at + window_days.
+    Eligibility (positive send signal required — see _is_booked_after_eligible).
+    Attribution window per recipient:
+      start = recipient.sent_at (after _backfill_recipient_links) or run.completed_at
+      end   = start + run.attribution_window_days
     Matching priority: Record.client_id → Record.altegio_client_id (fallback).
+    Deleted records (Record.is_deleted=True) are excluded.
     Does nothing if run.completed_at is None.
     """
     if run.completed_at is None:
         return
 
-    window_start = run.completed_at
-    window_end = run.completed_at + timedelta(days=run.attribution_window_days)
+    window_days = timedelta(days=run.attribution_window_days)
 
-    # Provider-accepted: any recipient that entered the send pipeline
+    # Only positive-send recipients without booked_after_at
     eligible = [
         r
         for r in recipients
-        if r.booked_after_at is None
-        and (
-            r.provider_message_id is not None
-            or r.outbox_message_id is not None
-            or r.message_job_id is not None
-            or r.sent_at is not None
-        )
+        if r.booked_after_at is None and _is_booked_after_eligible(r, outbox_by_recipient.get(r.id))
     ]
 
     if not eligible:
         return
 
     company_ids = list({r.company_id for r in eligible})
+
+    def _attr_start(r: CampaignRecipient) -> datetime:
+        return r.sent_at or run.completed_at  # type: ignore[return-value]
+
+    # One DB query covering the union of all per-recipient windows
+    overall_start = min(_attr_start(r) for r in eligible)
+    overall_end = max(_attr_start(r) for r in eligible) + window_days
 
     # Build lookup maps: (company_id, client_id) and (company_id, altegio_client_id)
     by_client: dict[tuple[int, int], CampaignRecipient] = {}
@@ -1788,8 +1846,9 @@ async def _sync_booked_after_from_altegio_events(
         .where(AltegioEvent.company_id.in_(company_ids))
         .where(AltegioEvent.resource == "record")
         .where(AltegioEvent.event_status == "create")
-        .where(AltegioEvent.received_at > window_start)
-        .where(AltegioEvent.received_at <= window_end)
+        .where(AltegioEvent.received_at > overall_start)
+        .where(AltegioEvent.received_at <= overall_end)
+        .where(Record.is_deleted.is_(False))
         .order_by(AltegioEvent.received_at.asc())
     )
 
@@ -1803,7 +1862,11 @@ async def _sync_booked_after_from_altegio_events(
             r = by_altegio_client.get((row.company_id, int(row.altegio_client_id)))
 
         if r is not None and r.booked_after_at is None:
-            r.booked_after_at = row.received_at
+            # Per-recipient window check (start may differ from overall_start)
+            attr_start = _attr_start(r)
+            attr_end = attr_start + window_days
+            if row.received_at > attr_start and row.received_at <= attr_end:
+                r.booked_after_at = row.received_at
 
 
 def _sync_recipient_statuses(
@@ -1935,7 +1998,7 @@ async def recompute_campaign_run_stats(
     _backfill_recipient_read_at(recipients, outbox_by_recipient)
 
     # Step 4b: backfill booked_after_at from AltegioEvent record/create events
-    await _sync_booked_after_from_altegio_events(session, run, recipients)
+    await _sync_booked_after_from_altegio_events(session, run, recipients, outbox_by_recipient)
 
     # Step 5: compute outbox_status_counts from resolved map (Python, no SQL)
     outbox_status_counts: dict[str, int] = {}

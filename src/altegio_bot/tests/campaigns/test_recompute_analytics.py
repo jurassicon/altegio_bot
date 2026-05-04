@@ -877,3 +877,612 @@ async def test_recompute_endpoint_returns_analytics_stats(
     assert "booked_after_count" in stats
     assert stats["read_count"] == 1
     assert stats["booked_after_count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Blocker 1: per-recipient attribution window (sent_at, not completed_at)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_booked_after_null_when_event_between_completed_and_sent(session_maker) -> None:
+    """Event after run.completed_at but before recipient.sent_at → booked_after_at=None."""
+    run_id = await _make_run(session_maker)
+
+    # sent_at is 5 seconds after completed_at
+    sent_at = _COMPLETED_AT + timedelta(seconds=5)
+    # event is 2 seconds after completed_at — before sent_at
+    event_at = _COMPLETED_AT + timedelta(seconds=2)
+
+    async with session_maker() as session:
+        async with session.begin():
+            record = Record(
+                company_id=758285,
+                altegio_record_id=10001,
+                client_id=1,
+                raw={},
+            )
+            session.add(record)
+            await session.flush()
+
+            session.add(
+                AltegioEvent(
+                    dedupe_key="test-per-recip-window-001",
+                    company_id=758285,
+                    resource="record",
+                    resource_id=10001,
+                    event_status="create",
+                    received_at=event_at,
+                )
+            )
+
+            recipient = CampaignRecipient(
+                campaign_run_id=run_id,
+                company_id=758285,
+                client_id=1,
+                phone_e164="+10000000001",
+                display_name="Per-Window Client",
+                status="provider_accepted",
+                sent_at=sent_at,
+            )
+            session.add(recipient)
+            await session.flush()
+            recipient_id = recipient.id
+
+    async with session_maker() as session:
+        async with session.begin():
+            await recompute_campaign_run_stats(session, run_id)
+
+    async with session_maker() as session:
+        run = await session.get(CampaignRun, run_id)
+        recip = await session.get(CampaignRecipient, recipient_id)
+
+    assert recip.booked_after_at is None, "event before sent_at must not count as booked-after"
+    assert run.booked_after_count == 0
+
+
+@pytest.mark.asyncio
+async def test_booked_after_set_when_event_after_sent_at(session_maker) -> None:
+    """Event 1 second after recipient.sent_at → booked_after_at is set."""
+    run_id = await _make_run(session_maker)
+
+    sent_at = _COMPLETED_AT + timedelta(seconds=5)
+    event_at = _COMPLETED_AT + timedelta(seconds=6)  # 1s after sent_at
+
+    async with session_maker() as session:
+        async with session.begin():
+            record = Record(
+                company_id=758285,
+                altegio_record_id=10002,
+                client_id=1,
+                raw={},
+            )
+            session.add(record)
+            await session.flush()
+
+            session.add(
+                AltegioEvent(
+                    dedupe_key="test-per-recip-window-002",
+                    company_id=758285,
+                    resource="record",
+                    resource_id=10002,
+                    event_status="create",
+                    received_at=event_at,
+                )
+            )
+
+            recipient = CampaignRecipient(
+                campaign_run_id=run_id,
+                company_id=758285,
+                client_id=1,
+                phone_e164="+10000000001",
+                display_name="Per-Window Client 2",
+                status="provider_accepted",
+                sent_at=sent_at,
+            )
+            session.add(recipient)
+            await session.flush()
+            recipient_id = recipient.id
+
+    async with session_maker() as session:
+        async with session.begin():
+            await recompute_campaign_run_stats(session, run_id)
+
+    async with session_maker() as session:
+        recip = await session.get(CampaignRecipient, recipient_id)
+
+    assert recip.booked_after_at == event_at
+
+
+# ---------------------------------------------------------------------------
+# Blocker 2: positive send signal required
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_booked_after_null_for_job_only_recipient(session_maker) -> None:
+    """Recipient with only message_job_id (no sent_at/provider_message_id) → booked_after_at=None."""
+    run_id = await _make_run(session_maker)
+    event_at = _COMPLETED_AT + timedelta(days=1)
+
+    async with session_maker() as session:
+        async with session.begin():
+            job = MessageJob(
+                company_id=758285,
+                job_type="newsletter_new_clients_monthly",
+                run_at=_COMPLETED_AT,
+                status="queued",
+                dedupe_key="test-job-only-001",
+                payload={"campaign_run_id": run_id},
+            )
+            session.add(job)
+            await session.flush()
+
+            record = Record(
+                company_id=758285,
+                altegio_record_id=10003,
+                client_id=1,
+                raw={},
+            )
+            session.add(record)
+            await session.flush()
+
+            session.add(
+                AltegioEvent(
+                    dedupe_key="test-job-only-event-001",
+                    company_id=758285,
+                    resource="record",
+                    resource_id=10003,
+                    event_status="create",
+                    received_at=event_at,
+                )
+            )
+
+            session.add(
+                CampaignRecipient(
+                    campaign_run_id=run_id,
+                    company_id=758285,
+                    client_id=1,
+                    phone_e164="+10000000001",
+                    display_name="Job Only Client",
+                    status="queued",
+                    message_job_id=job.id,
+                    outbox_message_id=None,
+                    provider_message_id=None,
+                    sent_at=None,
+                )
+            )
+            await session.flush()
+
+    async with session_maker() as session:
+        async with session.begin():
+            await recompute_campaign_run_stats(session, run_id)
+
+    async with session_maker() as session:
+        run = await session.get(CampaignRun, run_id)
+
+    assert run.booked_after_count == 0, "message_job_id alone is not a positive send signal"
+
+
+@pytest.mark.asyncio
+async def test_booked_after_null_for_failed_outbox_recipient(session_maker) -> None:
+    """Recipient with outbox.status='failed' → booked_after_at=None (no positive send)."""
+    run_id = await _make_run(session_maker)
+    event_at = _COMPLETED_AT + timedelta(days=1)
+
+    async with session_maker() as session:
+        async with session.begin():
+            outbox = OutboxMessage(
+                company_id=758285,
+                phone_e164="+10000000001",
+                template_code="newsletter_new_clients_monthly",
+                language="de",
+                body="Test",
+                status="failed",
+                scheduled_at=_COMPLETED_AT,
+                meta={},
+            )
+            session.add(outbox)
+            await session.flush()
+
+            record = Record(
+                company_id=758285,
+                altegio_record_id=10004,
+                client_id=1,
+                raw={},
+            )
+            session.add(record)
+            await session.flush()
+
+            session.add(
+                AltegioEvent(
+                    dedupe_key="test-failed-outbox-event-001",
+                    company_id=758285,
+                    resource="record",
+                    resource_id=10004,
+                    event_status="create",
+                    received_at=event_at,
+                )
+            )
+
+            session.add(
+                CampaignRecipient(
+                    campaign_run_id=run_id,
+                    company_id=758285,
+                    client_id=1,
+                    phone_e164="+10000000001",
+                    display_name="Failed Outbox Client",
+                    status="queued",
+                    outbox_message_id=outbox.id,
+                    provider_message_id=None,
+                    sent_at=None,
+                )
+            )
+
+    async with session_maker() as session:
+        async with session.begin():
+            await recompute_campaign_run_stats(session, run_id)
+
+    async with session_maker() as session:
+        run = await session.get(CampaignRun, run_id)
+
+    assert run.booked_after_count == 0, "failed outbox is not a positive send signal"
+
+
+@pytest.mark.asyncio
+async def test_booked_after_set_for_outbox_sent_recipient(session_maker) -> None:
+    """Recipient with outbox.status='sent' → booked_after_at is set (positive send signal)."""
+    run_id = await _make_run(session_maker)
+    event_at = _COMPLETED_AT + timedelta(days=1)
+
+    async with session_maker() as session:
+        async with session.begin():
+            outbox = OutboxMessage(
+                company_id=758285,
+                phone_e164="+10000000001",
+                template_code="newsletter_new_clients_monthly",
+                language="de",
+                body="Test",
+                status="sent",
+                scheduled_at=_COMPLETED_AT,
+                sent_at=_COMPLETED_AT,
+                meta={},
+            )
+            session.add(outbox)
+            await session.flush()
+
+            record = Record(
+                company_id=758285,
+                altegio_record_id=10005,
+                client_id=1,
+                raw={},
+            )
+            session.add(record)
+            await session.flush()
+
+            session.add(
+                AltegioEvent(
+                    dedupe_key="test-outbox-sent-event-001",
+                    company_id=758285,
+                    resource="record",
+                    resource_id=10005,
+                    event_status="create",
+                    received_at=event_at,
+                )
+            )
+
+            recipient = CampaignRecipient(
+                campaign_run_id=run_id,
+                company_id=758285,
+                client_id=1,
+                phone_e164="+10000000001",
+                display_name="Sent Outbox Client",
+                status="queued",
+                outbox_message_id=outbox.id,
+                provider_message_id=None,
+                sent_at=None,  # will be backfilled from outbox.sent_at
+            )
+            session.add(recipient)
+            await session.flush()
+            recipient_id = recipient.id
+
+    async with session_maker() as session:
+        async with session.begin():
+            await recompute_campaign_run_stats(session, run_id)
+
+    async with session_maker() as session:
+        recip = await session.get(CampaignRecipient, recipient_id)
+
+    assert recip.booked_after_at == event_at, "outbox.status='sent' is a positive send signal"
+
+
+@pytest.mark.asyncio
+async def test_booked_after_null_for_skipped_recipient(session_maker) -> None:
+    """Skipped recipient (excluded_reason set) → booked_after_at=None even with sent_at."""
+    run_id = await _make_run(session_maker)
+    event_at = _COMPLETED_AT + timedelta(days=1)
+
+    async with session_maker() as session:
+        async with session.begin():
+            record = Record(
+                company_id=758285,
+                altegio_record_id=10006,
+                client_id=1,
+                raw={},
+            )
+            session.add(record)
+            await session.flush()
+
+            session.add(
+                AltegioEvent(
+                    dedupe_key="test-skipped-event-001",
+                    company_id=758285,
+                    resource="record",
+                    resource_id=10006,
+                    event_status="create",
+                    received_at=event_at,
+                )
+            )
+
+            session.add(
+                CampaignRecipient(
+                    campaign_run_id=run_id,
+                    company_id=758285,
+                    client_id=1,
+                    phone_e164="+10000000001",
+                    display_name="Skipped Client",
+                    status="skipped",
+                    excluded_reason="provider_error",
+                    # provider_message_id and sent_at are intentionally not None
+                    # to confirm that excluded_reason blocks attribution regardless
+                    provider_message_id="wamid.test-skipped",
+                    sent_at=_COMPLETED_AT,
+                )
+            )
+
+    async with session_maker() as session:
+        async with session.begin():
+            await recompute_campaign_run_stats(session, run_id)
+
+    async with session_maker() as session:
+        run = await session.get(CampaignRun, run_id)
+
+    assert run.booked_after_count == 0, "excluded_reason blocks booked-after attribution"
+
+
+# ---------------------------------------------------------------------------
+# Blocker 3: deleted records are excluded
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_booked_after_null_for_deleted_record(session_maker) -> None:
+    """Record with is_deleted=True → booked_after_at=None even with event in window."""
+    run_id = await _make_run(session_maker)
+    event_at = _COMPLETED_AT + timedelta(days=1)
+
+    async with session_maker() as session:
+        async with session.begin():
+            record = Record(
+                company_id=758285,
+                altegio_record_id=10007,
+                client_id=1,
+                is_deleted=True,
+                raw={},
+            )
+            session.add(record)
+            await session.flush()
+
+            session.add(
+                AltegioEvent(
+                    dedupe_key="test-deleted-record-001",
+                    company_id=758285,
+                    resource="record",
+                    resource_id=10007,
+                    event_status="create",
+                    received_at=event_at,
+                )
+            )
+
+            session.add(
+                CampaignRecipient(
+                    campaign_run_id=run_id,
+                    company_id=758285,
+                    client_id=1,
+                    phone_e164="+10000000001",
+                    display_name="Deleted Record Client",
+                    status="provider_accepted",
+                    sent_at=_COMPLETED_AT,
+                )
+            )
+
+    async with session_maker() as session:
+        async with session.begin():
+            await recompute_campaign_run_stats(session, run_id)
+
+    async with session_maker() as session:
+        run = await session.get(CampaignRun, run_id)
+
+    assert run.booked_after_count == 0, "deleted records must not count as booked-after"
+
+
+# ---------------------------------------------------------------------------
+# Blocker 4: read_at must not be fabricated via utcnow()
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_read_at_stays_null_when_no_meta_timestamp(session_maker) -> None:
+    """read_at=None when outbox.status='read' but meta has no timestamp.
+
+    read_count must still be 1 (from outbox_status_counts).
+    recipient.status must be 'read' (from _sync_recipient_statuses).
+    follow-up unread_only must NOT pick this recipient as unread.
+    """
+    run_id = await _make_run(session_maker)
+
+    async with session_maker() as session:
+        async with session.begin():
+            outbox = OutboxMessage(
+                company_id=758285,
+                phone_e164="+4915199990050",
+                template_code="newsletter_new_clients_monthly",
+                language="de",
+                body="Test",
+                status="read",
+                scheduled_at=_COMPLETED_AT,
+                meta={},  # no wa_status_read key at all
+            )
+            session.add(outbox)
+            await session.flush()
+
+            recipient = CampaignRecipient(
+                campaign_run_id=run_id,
+                company_id=758285,
+                phone_e164="+4915199990050",
+                display_name="No Timestamp Client",
+                status="queued",
+                outbox_message_id=outbox.id,
+                sent_at=_COMPLETED_AT,
+                read_at=None,
+            )
+            session.add(recipient)
+            await session.flush()
+            recipient_id = recipient.id
+
+    async with session_maker() as session:
+        async with session.begin():
+            await recompute_campaign_run_stats(session, run_id)
+
+    async with session_maker() as session:
+        run = await session.get(CampaignRun, run_id)
+        recip = await session.get(CampaignRecipient, recipient_id)
+
+    assert recip.read_at is None, "no timestamp must not produce a fabricated read_at"
+    assert run.read_count == 1, "read_count must still be 1 from outbox status"
+    assert recip.status == "read", "recipient.status must be 'read' from status sync"
+
+    # follow-up eligibility: unread_only must not pick this recipient
+    assert _is_eligible_for_followup(recip, "unread_only") is False, (
+        "status='read' must block unread_only follow-up even without read_at"
+    )
+
+
+@pytest.mark.asyncio
+async def test_read_at_stays_null_when_bad_meta_timestamp(session_maker) -> None:
+    """read_at=None when wa_status_read timestamp is present but unparseable."""
+    run_id = await _make_run(session_maker)
+
+    async with session_maker() as session:
+        async with session.begin():
+            outbox = OutboxMessage(
+                company_id=758285,
+                phone_e164="+4915199990051",
+                template_code="newsletter_new_clients_monthly",
+                language="de",
+                body="Test",
+                status="read",
+                scheduled_at=_COMPLETED_AT,
+                meta={"wa_status_read": {"timestamp": "bad"}},
+            )
+            session.add(outbox)
+            await session.flush()
+
+            recipient = CampaignRecipient(
+                campaign_run_id=run_id,
+                company_id=758285,
+                phone_e164="+4915199990051",
+                display_name="Bad Timestamp Client",
+                status="queued",
+                outbox_message_id=outbox.id,
+                sent_at=_COMPLETED_AT,
+                read_at=None,
+            )
+            session.add(recipient)
+            await session.flush()
+            recipient_id = recipient.id
+
+    async with session_maker() as session:
+        async with session.begin():
+            await recompute_campaign_run_stats(session, run_id)
+
+    async with session_maker() as session:
+        run = await session.get(CampaignRun, run_id)
+        recip = await session.get(CampaignRecipient, recipient_id)
+
+    assert recip.read_at is None, "bad timestamp must not produce a fabricated read_at"
+    assert run.read_count == 1
+
+
+def test_followup_unread_only_excludes_recipient_with_read_status_but_no_read_at() -> None:
+    """unread_only: status='read' without read_at → still NOT eligible (status wins)."""
+    r = _make_recipient(status="read", read_at=None)
+    assert _is_eligible_for_followup(r, "unread_only") is False
+
+
+def test_followup_unread_or_not_booked_excludes_read_status_and_booked() -> None:
+    """unread_or_not_booked: status='read' (no read_at) + booked_after_at set → excluded."""
+    r = _make_recipient(status="read", read_at=None, booked_after_at=_NOW)
+    assert _is_eligible_for_followup(r, "unread_or_not_booked") is False
+
+
+# ---------------------------------------------------------------------------
+# Blocker 5: CRM-only fallback attribution via altegio_client_id
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_booked_after_crm_only_via_altegio_client_id(session_maker) -> None:
+    """booked_after_at set via Record.altegio_client_id when recipient.client_id=None."""
+    run_id = await _make_run(session_maker)
+    event_at = _COMPLETED_AT + timedelta(days=5)
+    altegio_client_id = 99887
+
+    async with session_maker() as session:
+        async with session.begin():
+            record = Record(
+                company_id=758285,
+                altegio_record_id=10008,
+                client_id=None,  # no local client
+                altegio_client_id=altegio_client_id,
+                raw={},
+            )
+            session.add(record)
+            await session.flush()
+
+            session.add(
+                AltegioEvent(
+                    dedupe_key="test-crm-only-fallback-001",
+                    company_id=758285,
+                    resource="record",
+                    resource_id=10008,
+                    event_status="create",
+                    received_at=event_at,
+                )
+            )
+
+            recipient = CampaignRecipient(
+                campaign_run_id=run_id,
+                company_id=758285,
+                client_id=None,  # CRM-only: no local Client row
+                altegio_client_id=altegio_client_id,
+                phone_e164="+4915199990099",
+                display_name="CRM-only Client",
+                status="provider_accepted",
+                provider_message_id="wamid.test-crm-only",
+                sent_at=_COMPLETED_AT,
+            )
+            session.add(recipient)
+            await session.flush()
+            recipient_id = recipient.id
+
+    async with session_maker() as session:
+        async with session.begin():
+            await recompute_campaign_run_stats(session, run_id)
+
+    async with session_maker() as session:
+        run = await session.get(CampaignRun, run_id)
+        recip = await session.get(CampaignRecipient, recipient_id)
+
+    assert recip.booked_after_at == event_at, "CRM-only fallback via altegio_client_id must work"
+    assert run.booked_after_count == 1
