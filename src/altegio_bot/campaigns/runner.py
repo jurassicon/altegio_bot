@@ -1794,7 +1794,8 @@ async def _sync_booked_after_from_altegio_events(
       start = max(run.completed_at, recipient.sent_at)  — never before campaign end
       end   = start + run.attribution_window_days
     Matching priority: Record.client_id → Record.altegio_client_id (fallback).
-    Deleted records (is_deleted=True or NULL) are excluded via COALESCE.
+    Deleted records (is_deleted=True) are excluded.
+    Legacy NULL is_deleted values are treated as not deleted via COALESCE.
     Does nothing if run.completed_at is None.
     """
     if run.completed_at is None:
@@ -1855,6 +1856,7 @@ async def _sync_booked_after_from_altegio_events(
         .where(AltegioEvent.event_status == "create")
         .where(AltegioEvent.received_at > overall_start)
         .where(AltegioEvent.received_at <= overall_end)
+        # Treat legacy NULL is_deleted values as not deleted.
         .where(func.coalesce(Record.is_deleted, False).is_(False))
         .order_by(AltegioEvent.received_at.asc())
     )
