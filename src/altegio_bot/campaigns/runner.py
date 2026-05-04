@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Literal
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.altegio_loyalty import AltegioLoyaltyClient
@@ -19,11 +19,13 @@ from altegio_bot.campaigns.segment import ClientCandidate, ClientSnapshot, find_
 from altegio_bot.db import SessionLocal
 from altegio_bot.message_planner import add_job, make_dedupe_key
 from altegio_bot.models.models import (
+    AltegioEvent,
     CampaignRecipient,
     CampaignRun,
     Client,
     MessageJob,
     OutboxMessage,
+    Record,
 )
 from altegio_bot.utils import utcnow
 
@@ -1689,6 +1691,121 @@ def _backfill_recipient_links(
             r.sent_at = ob.sent_at
 
 
+def _backfill_recipient_read_at(
+    recipients: list[CampaignRecipient],
+    outbox_by_recipient: dict[int, OutboxMessage],
+) -> None:
+    """Set CampaignRecipient.read_at from linked OutboxMessage when status='read'.
+
+    Only fills if read_at is currently None — never overwrites.
+    Timestamp is taken from outbox.meta['wa_status_read']['timestamp'] (Unix epoch,
+    int or numeric string).  Falls back to utcnow() when timestamp is absent or
+    unparseable.
+    """
+    for r in recipients:
+        if r.read_at is not None:
+            continue
+        ob = outbox_by_recipient.get(r.id)
+        if ob is None or ob.status != "read":
+            continue
+        wa_read = (ob.meta or {}).get("wa_status_read")
+        ts_raw = wa_read.get("timestamp") if isinstance(wa_read, dict) else None
+        if ts_raw is not None:
+            try:
+                r.read_at = datetime.fromtimestamp(int(ts_raw), tz=timezone.utc)
+            except (ValueError, TypeError, OSError):
+                r.read_at = utcnow()
+        else:
+            r.read_at = utcnow()
+
+
+async def _sync_booked_after_from_altegio_events(
+    session: AsyncSession,
+    run: CampaignRun,
+    recipients: list[CampaignRecipient],
+) -> None:
+    """Backfill CampaignRecipient.booked_after_at from AltegioEvent records.
+
+    For each provider-accepted recipient without booked_after_at, finds the
+    first 'record/create' AltegioEvent within the attribution window that
+    links (via Record) to the same client.
+
+    Attribution window: run.completed_at < received_at <= completed_at + window_days.
+    Matching priority: Record.client_id → Record.altegio_client_id (fallback).
+    Does nothing if run.completed_at is None.
+    """
+    if run.completed_at is None:
+        return
+
+    window_start = run.completed_at
+    window_end = run.completed_at + timedelta(days=run.attribution_window_days)
+
+    # Provider-accepted: any recipient that entered the send pipeline
+    eligible = [
+        r
+        for r in recipients
+        if r.booked_after_at is None
+        and (
+            r.provider_message_id is not None
+            or r.outbox_message_id is not None
+            or r.message_job_id is not None
+            or r.sent_at is not None
+        )
+    ]
+
+    if not eligible:
+        return
+
+    company_ids = list({r.company_id for r in eligible})
+
+    # Build lookup maps: (company_id, client_id) and (company_id, altegio_client_id)
+    by_client: dict[tuple[int, int], CampaignRecipient] = {}
+    by_altegio_client: dict[tuple[int, int], CampaignRecipient] = {}
+    for r in eligible:
+        if r.client_id is not None:
+            key = (r.company_id, r.client_id)
+            if key not in by_client:
+                by_client[key] = r
+        if r.altegio_client_id is not None:
+            key = (r.company_id, int(r.altegio_client_id))
+            if key not in by_altegio_client:
+                by_altegio_client[key] = r
+
+    stmt = (
+        select(
+            AltegioEvent.received_at,
+            Record.company_id,
+            Record.client_id,
+            Record.altegio_client_id,
+        )
+        .join(
+            Record,
+            and_(
+                Record.company_id == AltegioEvent.company_id,
+                Record.altegio_record_id == AltegioEvent.resource_id,
+            ),
+        )
+        .where(AltegioEvent.company_id.in_(company_ids))
+        .where(AltegioEvent.resource == "record")
+        .where(AltegioEvent.event_status == "create")
+        .where(AltegioEvent.received_at > window_start)
+        .where(AltegioEvent.received_at <= window_end)
+        .order_by(AltegioEvent.received_at.asc())
+    )
+
+    rows = (await session.execute(stmt)).all()
+
+    for row in rows:
+        r: CampaignRecipient | None = None
+        if row.client_id is not None:
+            r = by_client.get((row.company_id, row.client_id))
+        if r is None and row.altegio_client_id is not None:
+            r = by_altegio_client.get((row.company_id, int(row.altegio_client_id)))
+
+        if r is not None and r.booked_after_at is None:
+            r.booked_after_at = row.received_at
+
+
 def _sync_recipient_statuses(
     recipients: list[CampaignRecipient],
     outbox_by_recipient: dict[int, "OutboxMessage"],
@@ -1789,6 +1906,8 @@ async def recompute_campaign_run_stats(
     3. Backfill missing outbox_message_id / provider_message_id / sent_at
        on recipients in memory (persisted at transaction commit).
     4. Sync CampaignRecipient.status forward from outbox state (Variant A).
+    4a. Backfill CampaignRecipient.read_at from outbox meta when status='read'.
+    4b. Backfill CampaignRecipient.booked_after_at from AltegioEvent records.
     5. Compute outbox_status_counts in Python from the resolved map.
     6. Recompute all CampaignRun aggregate counters.
 
@@ -1811,6 +1930,12 @@ async def recompute_campaign_run_stats(
 
     # Step 4: sync CampaignRecipient.status from outbox state (Variant A)
     _sync_recipient_statuses(recipients, outbox_by_recipient)
+
+    # Step 4a: backfill read_at from outbox meta (Meta delivery timestamp)
+    _backfill_recipient_read_at(recipients, outbox_by_recipient)
+
+    # Step 4b: backfill booked_after_at from AltegioEvent record/create events
+    await _sync_booked_after_from_altegio_events(session, run, recipients)
 
     # Step 5: compute outbox_status_counts from resolved map (Python, no SQL)
     outbox_status_counts: dict[str, int] = {}
