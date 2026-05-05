@@ -1819,12 +1819,10 @@ async def _sync_booked_after_from_altegio_events(
 
     window_days = timedelta(days=run.attribution_window_days)
 
-    # Only positive-send recipients without booked_after_at
-    eligible = [
-        r
-        for r in recipients
-        if r.booked_after_at is None and _is_booked_after_eligible(r, outbox_by_recipient.get(r.id))
-    ]
+    # All positive-send recipients — NOT filtered by booked_after_at.
+    # Full recompute: existing booked_after_at (including stale non-lash attributions)
+    # will be overwritten by Phase 3. Only eligibility gates are checked here.
+    eligible = [r for r in recipients if _is_booked_after_eligible(r, outbox_by_recipient.get(r.id))]
 
     if not eligible:
         return _empty
@@ -1899,30 +1897,38 @@ async def _sync_booked_after_from_altegio_events(
             continue
         candidate_rows.append((r, row))
 
-    if not candidate_rows:
-        return _empty
-
     # Phase 2: lash service lookup on candidate record_ids only.
-    record_ids_by_company: dict[int, set[int]] = {}
-    for _r, row in candidate_rows:
-        record_ids_by_company.setdefault(row.company_id, set()).add(row.record_id)
-
+    # Skipped (no lookups) when there are no candidate rows, but Phase 3 still
+    # runs to clear any stale non-lash booked_after_at on eligible recipients.
     lash_record_ids: set[int] = set()
     all_failed_svc_ids: set[int] = set()
     all_failed_rec_ids: set[int] = set()
-    for cid, rids in record_ids_by_company.items():
-        result: LashRecordFilterResult = await filter_lash_record_ids(session, company_id=cid, record_ids=list(rids))
-        lash_record_ids.update(result.lash_record_ids)
-        all_failed_svc_ids.update(result.lookup_failed_service_ids)
-        all_failed_rec_ids.update(result.lookup_failed_record_ids)
+    if candidate_rows:
+        record_ids_by_company: dict[int, set[int]] = {}
+        for _r, row in candidate_rows:
+            record_ids_by_company.setdefault(row.company_id, set()).add(row.record_id)
 
-    # Phase 3: attribution — candidate_rows already ordered by received_at ASC.
-    # First lash event per recipient wins (booked_after_at is None guard).
+        for cid, rids in record_ids_by_company.items():
+            result: LashRecordFilterResult = await filter_lash_record_ids(
+                session, company_id=cid, record_ids=list(rids)
+            )
+            lash_record_ids.update(result.lash_record_ids)
+            all_failed_svc_ids.update(result.lookup_failed_service_ids)
+            all_failed_rec_ids.update(result.lookup_failed_record_ids)
+
+    # Derive first confirmed-lash event per eligible recipient.
+    # candidate_rows already ordered by received_at ASC — first match wins.
+    first_lash_by_recipient: dict[int, datetime] = {}
     for r, row in candidate_rows:
-        if row.record_id not in lash_record_ids:
-            continue
-        if r.booked_after_at is None:
-            r.booked_after_at = row.received_at
+        if row.record_id in lash_record_ids and r.id not in first_lash_by_recipient:
+            first_lash_by_recipient[r.id] = row.received_at
+
+    # Phase 3: full recompute — set or clear booked_after_at for every eligible
+    # recipient. Stale non-lash attributions are corrected: if no confirmed lash
+    # booking exists the value becomes None. Lookup failures also result in None
+    # (undercount + explicit diagnostics is preferable to stale overcount).
+    for r in eligible:
+        r.booked_after_at = first_lash_by_recipient.get(r.id)
 
     return {
         "lookup_failed_service_ids": all_failed_svc_ids,
@@ -2062,15 +2068,17 @@ async def recompute_campaign_run_stats(
     booked_after_diags = await _sync_booked_after_from_altegio_events(session, run, recipients, outbox_by_recipient)
     failed_svc_ids: set[int] = booked_after_diags.get("lookup_failed_service_ids", set())
     failed_rec_ids: set[int] = booked_after_diags.get("lookup_failed_record_ids", set())
-    if failed_svc_ids or failed_rec_ids:
-        meta = dict(run.meta or {})
-        meta["last_recompute"] = {
-            "booked_after_service_lookup_failed_count": len(failed_svc_ids),
-            "booked_after_service_lookup_failed_service_ids": sorted(failed_svc_ids),
-            "booked_after_service_lookup_failed_record_ids": sorted(failed_rec_ids),
-            "booked_after_service_lookup_failed_at": utcnow().isoformat(),
-        }
-        run.meta = meta
+    # Always write last_recompute so a successful recompute clears stale failure data.
+    meta = dict(run.meta or {})
+    meta["last_recompute"] = {
+        "booked_after_service_lookup_failed_count": len(failed_svc_ids),
+        "booked_after_service_lookup_failed_service_ids": sorted(failed_svc_ids),
+        "booked_after_service_lookup_failed_record_count": len(failed_rec_ids),
+        "booked_after_service_lookup_failed_record_ids": sorted(failed_rec_ids),
+        "booked_after_service_lookup_checked_at": utcnow().isoformat(),
+    }
+    run.meta = meta
+    if failed_svc_ids:
         logger.warning(
             "recompute run_id=%d: %d service lookup failure(s) service_ids=%s",
             run_id,
@@ -2129,6 +2137,8 @@ async def recompute_campaign_run_stats(
         "cleanup_failed_count": run.cleanup_failed_count,
         "booked_after_service_lookup_failed_count": len(failed_svc_ids),
         "booked_after_service_lookup_failed_service_ids": sorted(failed_svc_ids),
+        "booked_after_service_lookup_failed_record_count": len(failed_rec_ids),
+        "booked_after_service_lookup_failed_record_ids": sorted(failed_rec_ids),
     }
 
 

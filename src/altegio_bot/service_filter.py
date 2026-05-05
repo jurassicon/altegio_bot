@@ -119,15 +119,26 @@ async def _fetch_service_category_id(
     company_id: int,
     service_id: int,
     http_client: httpx.AsyncClient | None = None,
+    strict: bool = False,
 ) -> int | None:
     """Получить category_id услуги через Altegio API.
 
     Args:
         http_client: если передан — переиспользуется (keep-alive соединения).
                      Если None — создаётся новый клиент для одного запроса.
+        strict:      если True и токены не настроены — raise ServiceLookupError
+                     вместо тихого None. Используется в recompute attribution,
+                     где отсутствующие credentials должны быть явно видны
+                     в diagnostics, а не маскироваться как «не lash».
     """
     tokens = _get_altegio_tokens()
     if tokens is None:
+        if strict:
+            raise ServiceLookupError(
+                f"altegio service lookup unavailable: credentials missing "
+                f"(ALTEGIO_PARTNER_TOKEN or ALTEGIO_USER_TOKEN not set) "
+                f"company={company_id} service={service_id}"
+            )
         return None
 
     partner_token, user_token = tokens
@@ -209,18 +220,25 @@ async def is_lash_service(
     company_id: int,
     service_id: int,
     http_client: httpx.AsyncClient | None = None,
+    *,
+    strict_lookup: bool = False,
 ) -> bool:
     """Вернуть True, если service_id принадлежит категории ресниц для компании.
 
     Использует LRU-кеш и Altegio API для получения category_id.
 
     Args:
-        http_client: если передан — переиспользуется для API-запроса.
-                     Позволяет избежать лишних TCP/TLS handshake при массовом
-                     обходе services (батч сегментации кампании).
+        http_client:    если передан — переиспользуется для API-запроса.
+                        Позволяет избежать лишних TCP/TLS handshake при массовом
+                        обходе services (батч сегментации кампании).
+        strict_lookup:  если True, отсутствующие API-credentials поднимают
+                        ServiceLookupError вместо тихого False.
+                        Используется из filter_lash_record_ids (recompute path)
+                        чтобы missing credentials были явно видны в diagnostics.
 
     Raises:
-        ServiceLookupError: при сетевой ошибке или HTTP-ошибке (не 404).
+        ServiceLookupError: при сетевой ошибке, HTTP-ошибке (не 404),
+            или при strict_lookup=True когда credentials отсутствуют.
             Caller обязан обработать это как 'service_category_unavailable',
             а НЕ молча считать услугу non-lash.
     """
@@ -236,6 +254,7 @@ async def is_lash_service(
             company_id=company_id,
             service_id=service_id,
             http_client=http_client,
+            strict=strict_lookup,
         )
         if fetched is None:
             # 404 or no category_id in response — definitively not lash
@@ -299,12 +318,15 @@ async def filter_lash_record_ids(
         record_svcs.setdefault(row.record_id, set()).add(row.service_id)
         all_svc_ids.add(row.service_id)
 
-    # Resolve each unique service_id once (cache + optional API)
+    # Resolve each unique service_id once (cache + optional API).
+    # strict_lookup=True: missing credentials surface as ServiceLookupError
+    # instead of silent False, so operators see diagnostics rather than
+    # an authoritative-looking undercount.
     lash_svc: set[int] = set()
     unknown_svc: set[int] = set()
     for svc_id in all_svc_ids:
         try:
-            if await is_lash_service(company_id, svc_id, http_client):
+            if await is_lash_service(company_id, svc_id, http_client, strict_lookup=True):
                 lash_svc.add(svc_id)
         except ServiceLookupError:
             unknown_svc.add(svc_id)

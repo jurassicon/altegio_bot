@@ -51,6 +51,7 @@ _LASH_SVC_ID = 42001
 _NON_LASH_SVC_ID = 42002
 _LASH_CATEGORY_ID = 10707687  # valid lash category for company 758285
 _ERROR_SVC_ID = 42999  # used for ServiceLookupError tests; never pre-cached
+_UNCACHED_SVC_ID = 43001  # cache-miss with no API tokens → strict lookup failure (P3)
 
 
 def _seed_lash_cache() -> None:
@@ -2620,7 +2621,7 @@ async def test_service_lookup_error_does_not_count_as_lash(session_maker, monkey
     event_at = _COMPLETED_AT + timedelta(days=2)
     altegio_client_id = 99209
 
-    async def _raise_lookup_error(company_id, service_id, http_client=None):
+    async def _raise_lookup_error(company_id, service_id, http_client=None, *, strict_lookup=False):
         raise ServiceLookupError(f"mock error for service_id={service_id}")
 
     monkeypatch.setattr("altegio_bot.service_filter.is_lash_service", _raise_lookup_error)
@@ -3032,7 +3033,7 @@ async def test_unrelated_error_service_filtered_before_lookup(session_maker, mon
     # Monkeypatch: raise ServiceLookupError for the unrelated service_id.
     # If P1 fix is working, is_lash_service is never called for unrelated_svc_id
     # (the unrelated record is filtered out in Phase 1 before lash lookup).
-    async def _selective_error_is_lash(company_id, service_id, http_client=None):
+    async def _selective_error_is_lash(company_id, service_id, http_client=None, *, strict_lookup=False):
         if service_id == unrelated_svc_id:
             raise ServiceLookupError(f"must not be called for service_id={service_id}")
         return service_id == _LASH_SVC_ID and company_id == 758285
@@ -3068,7 +3069,7 @@ async def test_recompute_endpoint_includes_diagnostics_on_lookup_failure(
     """POST /runs/{run_id}/recompute returns booked_after_service_lookup_failed_count in stats."""
     run_id = await _make_run(session_maker)
 
-    async def _always_raise(company_id, service_id, http_client=None):
+    async def _always_raise(company_id, service_id, http_client=None, *, strict_lookup=False):
         raise ServiceLookupError(f"endpoint-diag mock error service_id={service_id}")
 
     monkeypatch.setattr("altegio_bot.service_filter.is_lash_service", _always_raise)
@@ -3123,3 +3124,465 @@ async def test_recompute_endpoint_includes_diagnostics_on_lookup_failure(
     assert stats["booked_after_service_lookup_failed_count"] == 1
     assert _ERROR_SVC_ID in stats["booked_after_service_lookup_failed_service_ids"]
     assert stats["booked_after_count"] == 0
+
+
+# ==========================================================================
+# P1: Full recompute semantics — stale non-lash attributions are corrected
+# ==========================================================================
+
+
+@pytest.mark.asyncio
+async def test_stale_non_lash_booked_after_cleared_by_recompute(session_maker) -> None:
+    """Recipient has old booked_after_at from non-lash booking; only non-lash events exist.
+
+    After lash-only recompute: booked_after_at → None, booked_after_count → 0.
+    """
+    _seed_lash_cache()
+    run_id = await _make_run(session_maker)
+    stale_ts = _COMPLETED_AT + timedelta(days=1)
+
+    async with session_maker() as session:
+        async with session.begin():
+            record = Record(
+                company_id=758285,
+                altegio_record_id=40001,
+                client_id=None,
+                altegio_client_id=80001,
+                raw={},
+            )
+            session.add(record)
+            await session.flush()
+            session.add(RecordService(record_id=record.id, service_id=_NON_LASH_SVC_ID))
+            session.add(
+                AltegioEvent(
+                    dedupe_key="test-p1-stale-clear-001",
+                    company_id=758285,
+                    resource="record",
+                    resource_id=40001,
+                    event_status="create",
+                    received_at=stale_ts,
+                )
+            )
+            recipient = CampaignRecipient(
+                campaign_run_id=run_id,
+                company_id=758285,
+                client_id=None,
+                altegio_client_id=80001,
+                phone_e164="+4915180001001",
+                display_name="Stale NonLash",
+                status="provider_accepted",
+                provider_message_id="wamid.stale-clear-001",
+                sent_at=_COMPLETED_AT,
+                booked_after_at=stale_ts,  # stale non-lash attribution
+            )
+            session.add(recipient)
+            await session.flush()
+            recipient_id = recipient.id
+
+    async with session_maker() as session:
+        async with session.begin():
+            await recompute_campaign_run_stats(session, run_id)
+
+    async with session_maker() as session:
+        recip = await session.get(CampaignRecipient, recipient_id)
+        run = await session.get(CampaignRun, run_id)
+
+    assert recip.booked_after_at is None, "stale non-lash booked_after_at must be cleared"
+    assert run.booked_after_count == 0
+
+
+@pytest.mark.asyncio
+async def test_stale_non_lash_replaced_by_lash_event(session_maker) -> None:
+    """Recipient has old non-lash booked_after_at; recompute finds non-lash first, lash later.
+
+    After recompute: booked_after_at is updated to the lash event timestamp.
+    """
+    _seed_lash_cache()
+    run_id = await _make_run(session_maker)
+    non_lash_at = _COMPLETED_AT + timedelta(days=2)
+    lash_at = _COMPLETED_AT + timedelta(days=5)
+
+    async with session_maker() as session:
+        async with session.begin():
+            record_nl = Record(
+                company_id=758285,
+                altegio_record_id=40002,
+                client_id=None,
+                altegio_client_id=80002,
+                raw={},
+            )
+            session.add(record_nl)
+            await session.flush()
+            session.add(RecordService(record_id=record_nl.id, service_id=_NON_LASH_SVC_ID))
+
+            record_l = Record(
+                company_id=758285,
+                altegio_record_id=40003,
+                client_id=None,
+                altegio_client_id=80002,
+                raw={},
+            )
+            session.add(record_l)
+            await session.flush()
+            session.add(RecordService(record_id=record_l.id, service_id=_LASH_SVC_ID))
+
+            session.add(
+                AltegioEvent(
+                    dedupe_key="test-p1-stale-replace-nl-001",
+                    company_id=758285,
+                    resource="record",
+                    resource_id=40002,
+                    event_status="create",
+                    received_at=non_lash_at,
+                )
+            )
+            session.add(
+                AltegioEvent(
+                    dedupe_key="test-p1-stale-replace-l-001",
+                    company_id=758285,
+                    resource="record",
+                    resource_id=40003,
+                    event_status="create",
+                    received_at=lash_at,
+                )
+            )
+            recipient = CampaignRecipient(
+                campaign_run_id=run_id,
+                company_id=758285,
+                client_id=None,
+                altegio_client_id=80002,
+                phone_e164="+4915180002001",
+                display_name="Stale Then Lash",
+                status="provider_accepted",
+                provider_message_id="wamid.stale-replace-001",
+                sent_at=_COMPLETED_AT,
+                booked_after_at=non_lash_at,  # stale attribution from non-lash
+            )
+            session.add(recipient)
+            await session.flush()
+            recipient_id = recipient.id
+
+    async with session_maker() as session:
+        async with session.begin():
+            await recompute_campaign_run_stats(session, run_id)
+
+    async with session_maker() as session:
+        recip = await session.get(CampaignRecipient, recipient_id)
+        run = await session.get(CampaignRun, run_id)
+
+    assert recip.booked_after_at == lash_at, "booked_after_at must be updated to lash event"
+    assert run.booked_after_count == 1
+
+
+@pytest.mark.asyncio
+async def test_stale_later_booked_after_corrected_to_earlier_lash(session_maker) -> None:
+    """Recipient has booked_after_at pointing to a later event; earlier lash event exists.
+
+    After recompute: booked_after_at is updated to the earlier lash booking.
+    """
+    _seed_lash_cache()
+    run_id = await _make_run(session_maker)
+    earlier_lash_at = _COMPLETED_AT + timedelta(days=3)
+    later_lash_at = _COMPLETED_AT + timedelta(days=10)
+
+    async with session_maker() as session:
+        async with session.begin():
+            record_early = Record(
+                company_id=758285,
+                altegio_record_id=40004,
+                client_id=None,
+                altegio_client_id=80003,
+                raw={},
+            )
+            session.add(record_early)
+            await session.flush()
+            session.add(RecordService(record_id=record_early.id, service_id=_LASH_SVC_ID))
+
+            record_late = Record(
+                company_id=758285,
+                altegio_record_id=40005,
+                client_id=None,
+                altegio_client_id=80003,
+                raw={},
+            )
+            session.add(record_late)
+            await session.flush()
+            session.add(RecordService(record_id=record_late.id, service_id=_LASH_SVC_ID))
+
+            session.add(
+                AltegioEvent(
+                    dedupe_key="test-p1-earlier-lash-001",
+                    company_id=758285,
+                    resource="record",
+                    resource_id=40004,
+                    event_status="create",
+                    received_at=earlier_lash_at,
+                )
+            )
+            session.add(
+                AltegioEvent(
+                    dedupe_key="test-p1-later-lash-001",
+                    company_id=758285,
+                    resource="record",
+                    resource_id=40005,
+                    event_status="create",
+                    received_at=later_lash_at,
+                )
+            )
+            recipient = CampaignRecipient(
+                campaign_run_id=run_id,
+                company_id=758285,
+                client_id=None,
+                altegio_client_id=80003,
+                phone_e164="+4915180003001",
+                display_name="Later Overwrite",
+                status="provider_accepted",
+                provider_message_id="wamid.later-overwrite-001",
+                sent_at=_COMPLETED_AT,
+                booked_after_at=later_lash_at,  # stale: points to later booking
+            )
+            session.add(recipient)
+            await session.flush()
+            recipient_id = recipient.id
+
+    async with session_maker() as session:
+        async with session.begin():
+            await recompute_campaign_run_stats(session, run_id)
+
+    async with session_maker() as session:
+        recip = await session.get(CampaignRecipient, recipient_id)
+        run = await session.get(CampaignRun, run_id)
+
+    assert recip.booked_after_at == earlier_lash_at, "must correct to earlier lash event"
+    assert run.booked_after_count == 1
+
+
+# ==========================================================================
+# P2: Lookup failure on candidate record → clear attribution + diagnostics
+# ==========================================================================
+
+
+@pytest.mark.asyncio
+async def test_lookup_failure_clears_stale_booked_after_and_surfaces_diagnostics(session_maker, monkeypatch) -> None:
+    """ServiceLookupError on candidate record clears stale booked_after_at.
+
+    The recipient had a pre-existing booked_after_at. The candidate record's
+    service raises ServiceLookupError. After recompute:
+    - booked_after_at is None (undercount preferred over stale overcount)
+    - summary failure count > 0
+    - run.meta['last_recompute'] contains diagnostics
+    """
+    run_id = await _make_run(session_maker)
+    stale_ts = _COMPLETED_AT + timedelta(days=3)
+
+    async def _always_fail(company_id, service_id, http_client=None, *, strict_lookup=False):
+        raise ServiceLookupError(f"p2-lookup-fail service_id={service_id}")
+
+    monkeypatch.setattr("altegio_bot.service_filter.is_lash_service", _always_fail)
+
+    async with session_maker() as session:
+        async with session.begin():
+            record = Record(
+                company_id=758285,
+                altegio_record_id=40006,
+                client_id=None,
+                altegio_client_id=80004,
+                raw={},
+            )
+            session.add(record)
+            await session.flush()
+            session.add(RecordService(record_id=record.id, service_id=_ERROR_SVC_ID))
+            session.add(
+                AltegioEvent(
+                    dedupe_key="test-p2-lookup-fail-001",
+                    company_id=758285,
+                    resource="record",
+                    resource_id=40006,
+                    event_status="create",
+                    received_at=stale_ts,
+                )
+            )
+            recipient = CampaignRecipient(
+                campaign_run_id=run_id,
+                company_id=758285,
+                client_id=None,
+                altegio_client_id=80004,
+                phone_e164="+4915180004001",
+                display_name="Stale Lookup Fail",
+                status="provider_accepted",
+                provider_message_id="wamid.p2-lookup-fail-001",
+                sent_at=_COMPLETED_AT,
+                booked_after_at=stale_ts,  # stale; will be cleared on lookup failure
+            )
+            session.add(recipient)
+            await session.flush()
+            recipient_id = recipient.id
+
+    async with session_maker() as session:
+        async with session.begin():
+            summary = await recompute_campaign_run_stats(session, run_id)
+
+    async with session_maker() as session:
+        recip = await session.get(CampaignRecipient, recipient_id)
+        run = await session.get(CampaignRun, run_id)
+
+    assert recip.booked_after_at is None, "lookup failure must clear stale booked_after_at"
+    assert run.booked_after_count == 0
+    assert summary["booked_after_service_lookup_failed_count"] == 1
+    lr = run.meta["last_recompute"]
+    assert lr["booked_after_service_lookup_failed_count"] == 1
+    assert _ERROR_SVC_ID in lr["booked_after_service_lookup_failed_service_ids"]
+
+
+# ==========================================================================
+# P3: Missing API credentials on cache-miss → strict lookup failure
+# ==========================================================================
+
+
+@pytest.mark.asyncio
+async def test_missing_credentials_on_cache_miss_surfaces_as_lookup_failure(session_maker) -> None:
+    """Cache-miss service + no API tokens → treated as lookup failure, not silent non-lash.
+
+    In the test environment, ALTEGIO_PARTNER_TOKEN / ALTEGIO_USER_TOKEN are not
+    set. filter_lash_record_ids calls is_lash_service with strict_lookup=True,
+    which causes _fetch_service_category_id to raise ServiceLookupError when
+    credentials are missing, rather than silently returning False.
+    """
+    run_id = await _make_run(session_maker)
+    event_at = _COMPLETED_AT + timedelta(days=4)
+
+    # _UNCACHED_SVC_ID is NOT pre-seeded in the LRU cache.
+    # With no API tokens in the test env, strict_lookup will raise ServiceLookupError.
+
+    async with session_maker() as session:
+        async with session.begin():
+            record = Record(
+                company_id=758285,
+                altegio_record_id=40007,
+                client_id=None,
+                altegio_client_id=80005,
+                raw={},
+            )
+            session.add(record)
+            await session.flush()
+            session.add(RecordService(record_id=record.id, service_id=_UNCACHED_SVC_ID))
+            session.add(
+                AltegioEvent(
+                    dedupe_key="test-p3-missing-creds-001",
+                    company_id=758285,
+                    resource="record",
+                    resource_id=40007,
+                    event_status="create",
+                    received_at=event_at,
+                )
+            )
+            session.add(
+                CampaignRecipient(
+                    campaign_run_id=run_id,
+                    company_id=758285,
+                    client_id=None,
+                    altegio_client_id=80005,
+                    phone_e164="+4915180005001",
+                    display_name="Missing Creds",
+                    status="provider_accepted",
+                    provider_message_id="wamid.missing-creds-001",
+                    sent_at=_COMPLETED_AT,
+                )
+            )
+
+    async with session_maker() as session:
+        async with session.begin():
+            summary = await recompute_campaign_run_stats(session, run_id)
+
+    async with session_maker() as session:
+        run = await session.get(CampaignRun, run_id)
+
+    assert summary["booked_after_service_lookup_failed_count"] == 1, (
+        "missing credentials must surface as lookup failure, not silent non-lash"
+    )
+    assert _UNCACHED_SVC_ID in summary["booked_after_service_lookup_failed_service_ids"]
+    lr = run.meta["last_recompute"]
+    assert lr["booked_after_service_lookup_failed_count"] == 1
+    assert summary["booked_after_count"] == 0
+
+
+# ==========================================================================
+# P4: last_recompute always written; successful recompute clears stale failures
+# ==========================================================================
+
+
+@pytest.mark.asyncio
+async def test_last_recompute_meta_cleared_on_clean_recompute(session_maker, monkeypatch) -> None:
+    """run.meta['last_recompute'] is written on every recompute.
+
+    Recompute #1 with ServiceLookupError → failure count > 0.
+    Recompute #2 after seeding cache (simulating resolution) → failure count == 0,
+    stale failed_service_ids are cleared.
+    """
+    run_id = await _make_run(session_maker)
+    event_at = _COMPLETED_AT + timedelta(days=7)
+    svc_id_for_p4 = 44001  # distinct ID; NOT in LRU cache before recompute #1
+
+    async with session_maker() as session:
+        async with session.begin():
+            record = Record(
+                company_id=758285,
+                altegio_record_id=40008,
+                client_id=None,
+                altegio_client_id=80006,
+                raw={},
+            )
+            session.add(record)
+            await session.flush()
+            session.add(RecordService(record_id=record.id, service_id=svc_id_for_p4))
+            session.add(
+                AltegioEvent(
+                    dedupe_key="test-p4-meta-clear-001",
+                    company_id=758285,
+                    resource="record",
+                    resource_id=40008,
+                    event_status="create",
+                    received_at=event_at,
+                )
+            )
+            session.add(
+                CampaignRecipient(
+                    campaign_run_id=run_id,
+                    company_id=758285,
+                    client_id=None,
+                    altegio_client_id=80006,
+                    phone_e164="+4915180006001",
+                    display_name="P4 Meta Clear",
+                    status="provider_accepted",
+                    provider_message_id="wamid.p4-meta-001",
+                    sent_at=_COMPLETED_AT,
+                )
+            )
+
+    # Recompute #1: no tokens, cache miss → lookup failure
+    async with session_maker() as session:
+        async with session.begin():
+            summary1 = await recompute_campaign_run_stats(session, run_id)
+
+    async with session_maker() as session:
+        run = await session.get(CampaignRun, run_id)
+
+    assert summary1["booked_after_service_lookup_failed_count"] == 1
+    assert run.meta["last_recompute"]["booked_after_service_lookup_failed_count"] == 1
+
+    # Seed the cache so the service resolves as lash on the next recompute
+    _cache_put((758285, svc_id_for_p4), _LASH_CATEGORY_ID)
+
+    # Recompute #2: cache hit → no failure; meta must be refreshed
+    async with session_maker() as session:
+        async with session.begin():
+            summary2 = await recompute_campaign_run_stats(session, run_id)
+
+    async with session_maker() as session:
+        run = await session.get(CampaignRun, run_id)
+
+    assert summary2["booked_after_service_lookup_failed_count"] == 0, "clean recompute must reset failure count"
+    lr2 = run.meta["last_recompute"]
+    assert lr2["booked_after_service_lookup_failed_count"] == 0
+    assert lr2["booked_after_service_lookup_failed_service_ids"] == []
+    assert summary2["booked_after_count"] == 1, "lash booking now resolves correctly"
