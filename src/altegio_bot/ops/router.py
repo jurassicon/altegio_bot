@@ -4165,7 +4165,7 @@ async def ops_campaign_run_detail(run_id: int) -> str:
   <strong>&#x26A0; Предупреждение пересчёта:</strong>
   Последний пересчёт завершился с предупреждениями: часть категорий услуг не удалось проверить.
   Booked after может быть занижен{lr_checked_html}.<br>
-  <small>Сервисы без категории: {lr_svc_ids_str}. Записей затронуто: {_esc(str(lr_rec_count))}.</small>
+  <small>Сервисы с ошибкой проверки: {lr_svc_ids_str}. Записей затронуто: {_esc(str(lr_rec_count))}.</small>
 </div>
 """
 
