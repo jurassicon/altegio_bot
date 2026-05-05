@@ -478,6 +478,20 @@ async def run_smart_test(
         logger.error("FAIL (template check): %s", err_msg)
         return 2
 
+    probe_params = _build_smart_template_params(
+        template_name,
+        client_name=client_name,
+        booking_link=booking_link,
+        loyalty_card_text="Kundenkarte #0000000000000000",
+    )
+    if not probe_params:
+        logger.error(
+            "FAIL: unsupported or unknown template parameters for template=%r. "
+            "Add a build_template_params branch in meta_templates.py for this template.",
+            template_name,
+        )
+        return 2
+
     # -----------------------------------------------------------------------
     # B) Idempotency
     # -----------------------------------------------------------------------

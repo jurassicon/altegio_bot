@@ -325,6 +325,52 @@ async def test_run_smart_test_fails_fast_when_followup_header_url_missing(monkey
     assert exit_code == 2, f"Expected exit_code=2 (fail-fast), got {exit_code}"
 
 
+@pytest.mark.asyncio
+async def test_run_smart_test_unknown_template_params_fails_before_card_issue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Approved-but-unsupported templates must fail before issuing loyalty cards."""
+    import altegio_bot.scripts.run_test_newsletter_smart as sm
+
+    issue_card_called = False
+
+    async def _fake_check_meta_template(*args: object, **kwargs: object) -> tuple[bool, None]:
+        return True, None
+
+    class _FailingLoyalty:
+        async def issue_card(self, *args: object, **kwargs: object) -> dict[str, object]:
+            nonlocal issue_card_called
+            issue_card_called = True
+            raise AssertionError("issue_card must not be called for unsupported template params")
+
+        async def aclose(self) -> None:
+            pass
+
+    monkeypatch.setattr(sm.settings, "whatsapp_access_token", "tok")
+    monkeypatch.setattr(sm.settings, "meta_waba_id", "waba123")
+    monkeypatch.setattr(sm.settings, "meta_wa_phone_number_id", "phone123")
+    monkeypatch.setattr(sm, "check_meta_template", _fake_check_meta_template)
+    monkeypatch.setattr(sm, "AltegioLoyaltyClient", _FailingLoyalty)
+
+    exit_code = await sm.run_smart_test(
+        phone="381638400431",
+        company_id=758285,
+        location_id=758285,
+        booking_link="https://n813709.alteg.io/",
+        template_name="approved_but_unsupported_template",
+        expect_status="delivered",
+        timeout_sec=10,
+        cleanup=False,
+        cleanup_on_fail=False,
+        force=True,
+        card_type_id="999",
+        client_name="Test",
+    )
+
+    assert exit_code == 2, f"Expected exit_code=2 for unsupported template params, got {exit_code}"
+    assert issue_card_called is False
+
+
 # ---------------------------------------------------------------------------
 # _build_smart_template_params — param count by template type
 # ---------------------------------------------------------------------------
