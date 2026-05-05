@@ -69,8 +69,8 @@ META_TEMPLATE_MAP: dict[tuple[int, str], str] = {
     (_KA, "review_3d"): "kitilash_ka_review_3d_v1",
     (_KA, "repeat_10d"): "kitilash_ka_repeat_10d_v1",
     (_KA, "comeback_3d"): "kitilash_ka_comeback_3d_v1",
-    (_KA, "newsletter_new_clients_monthly"): "kitilash_ka_newsletter_new_clients_monthly_v1",
-    (_KA, "newsletter_new_clients_followup"): "kitilash_ka_newsletter_new_clients_followup_v1",
+    (_KA, "newsletter_new_clients_monthly"): NEWSLETTER_MONTHLY_TEMPLATE,
+    (_KA, "newsletter_new_clients_followup"): NEWSLETTER_FOLLOWUP_TEMPLATE,
     # --- Rastatt ---
     # ra_record_created_v1 exists; others fall back to ka_* templates
     (_RA, "record_created"): "kitilash_ra_record_created_v1",
@@ -81,8 +81,8 @@ META_TEMPLATE_MAP: dict[tuple[int, str], str] = {
     (_RA, "review_3d"): "kitilash_ra_review_3d_v1",
     (_RA, "repeat_10d"): "kitilash_ka_repeat_10d_v1",
     (_RA, "comeback_3d"): "kitilash_ka_comeback_3d_v1",
-    (_RA, "newsletter_new_clients_monthly"): "kitilash_ka_newsletter_new_clients_monthly_v1",
-    (_RA, "newsletter_new_clients_followup"): "kitilash_ka_newsletter_new_clients_followup_v1",
+    (_RA, "newsletter_new_clients_monthly"): NEWSLETTER_MONTHLY_TEMPLATE,
+    (_RA, "newsletter_new_clients_followup"): NEWSLETTER_FOLLOWUP_TEMPLATE,
 }
 
 # Karlsruhe new-client variant for record_created

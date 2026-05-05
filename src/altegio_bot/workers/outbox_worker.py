@@ -92,6 +92,30 @@ _TOKEN_EXPIRED = False
 MAX_API_GUARD_ATTEMPTS = 5
 
 COMEBACK_3D_MISSING_SOURCE_REASON = "Skipped: source record missing for comeback_3d"
+
+
+def _resolve_template_header_image_url(template_name: str) -> str | None:
+    """Return the configured image URL for templates that have an IMAGE HEADER component.
+
+    Returns None both when the template does not require a header and when the
+    URL is not configured — callers must check ``requires_image_header`` first
+    to distinguish the two cases.
+    """
+    if template_name == NEWSLETTER_MONTHLY_TEMPLATE:
+        return settings.meta_newsletter_monthly_header_image_url.strip() or None
+    if template_name == NEWSLETTER_FOLLOWUP_TEMPLATE:
+        return settings.meta_newsletter_followup_header_image_url.strip() or None
+    return None
+
+
+def _missing_required_header_error(template_name: str) -> str:
+    return (
+        f"Template {template_name} requires image header but image URL is not configured. "
+        "Set META_NEWSLETTER_MONTHLY_HEADER_IMAGE_URL or "
+        "META_NEWSLETTER_FOLLOWUP_HEADER_IMAGE_URL in .env."
+    )
+
+
 COMEBACK_3D_MISSING_SOURCE_TIME_REASON = "Skipped: source record starts_at missing for comeback_3d"
 COMEBACK_3D_MISSING_CANCEL_TIME_REASON = "Skipped: source cancellation time is missing for comeback_3d guard"
 COMEBACK_3D_ALREADY_RETURNED_REASON = "Skipped: client already returned within comeback_3d window"
@@ -1156,16 +1180,9 @@ async def _run_job_logic(
         # a missing URL fails fast with a clear error (no blank-header send).
         header_image_url: str | None = None
         if requires_image_header(meta_template_name):
-            if meta_template_name == NEWSLETTER_MONTHLY_TEMPLATE:
-                header_image_url = settings.meta_newsletter_monthly_header_image_url or None
-            elif meta_template_name == NEWSLETTER_FOLLOWUP_TEMPLATE:
-                header_image_url = settings.meta_newsletter_followup_header_image_url or None
+            header_image_url = _resolve_template_header_image_url(meta_template_name)
             if not header_image_url:
-                err_msg = (
-                    f"Newsletter image header URL not configured for template={meta_template_name}. "
-                    "Set META_NEWSLETTER_MONTHLY_HEADER_IMAGE_URL or "
-                    "META_NEWSLETTER_FOLLOWUP_HEADER_IMAGE_URL in .env."
-                )
+                err_msg = _missing_required_header_error(meta_template_name)
                 logger.error(
                     "Missing header image URL template=%s job_id=%s",
                     meta_template_name,

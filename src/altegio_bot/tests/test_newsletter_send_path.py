@@ -39,6 +39,7 @@ import pytest
 
 import altegio_bot.workers.outbox_worker as ow
 from altegio_bot.meta_templates import (
+    META_TEMPLATE_MAP,
     NEWSLETTER_FOLLOWUP_TEMPLATE,
     NEWSLETTER_IMAGE_HEADER_TEMPLATES,
     NEWSLETTER_MONTHLY_TEMPLATE,
@@ -636,7 +637,28 @@ async def test_crm_only_no_contact_name_fails_preflight(monkeypatch: Any) -> Non
 
 
 # ---------------------------------------------------------------------------
-# 7. Image header support — requires_image_header() and NEWSLETTER_IMAGE_HEADER_TEMPLATES
+# 7. META_TEMPLATE_MAP uses constants (single source of truth)
+# ---------------------------------------------------------------------------
+
+
+def test_meta_template_map_ka_monthly_uses_constant() -> None:
+    assert META_TEMPLATE_MAP[(758285, "newsletter_new_clients_monthly")] == NEWSLETTER_MONTHLY_TEMPLATE
+
+
+def test_meta_template_map_ra_monthly_uses_constant() -> None:
+    assert META_TEMPLATE_MAP[(1271200, "newsletter_new_clients_monthly")] == NEWSLETTER_MONTHLY_TEMPLATE
+
+
+def test_meta_template_map_ka_followup_uses_constant() -> None:
+    assert META_TEMPLATE_MAP[(758285, "newsletter_new_clients_followup")] == NEWSLETTER_FOLLOWUP_TEMPLATE
+
+
+def test_meta_template_map_ra_followup_uses_constant() -> None:
+    assert META_TEMPLATE_MAP[(1271200, "newsletter_new_clients_followup")] == NEWSLETTER_FOLLOWUP_TEMPLATE
+
+
+# ---------------------------------------------------------------------------
+# 8. Image header support — requires_image_header() and NEWSLETTER_IMAGE_HEADER_TEMPLATES
 # ---------------------------------------------------------------------------
 
 
