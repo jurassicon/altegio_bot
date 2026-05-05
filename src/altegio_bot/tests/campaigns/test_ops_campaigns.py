@@ -1412,7 +1412,7 @@ async def test_campaign_new_page_has_outstanding_cards_status_container(
     assert response.status_code == 200
     text = response.text
 
-    # outstanding-delete-result стоит ДО outstanding-cards-section (P1)
+    # outstanding-delete-result стоит ДО outstanding-cards-section
     idx_result = text.find('id="outstanding-delete-result"')
     idx_section = text.find('id="outstanding-cards-section"')
     assert idx_result != -1, "outstanding-delete-result не найден в HTML"
@@ -1428,13 +1428,29 @@ async def test_campaign_new_page_has_outstanding_cards_status_container(
     assert "failed_count" in text
     assert "skipped_count" in text
 
-    # Используется f.card_id (с fallback на f.loyalty_card_id) — P2
+    # Используется f.card_id (с fallback на f.loyalty_card_id)
     assert "f.card_id" in text
 
-    # Экранирование detail и exception — P3
-    delete_fn = text[text.find("async function deleteOutstandingCards") :][:3000]
+    # Экранирование detail и exception
+    delete_fn = text[text.find("async function deleteOutstandingCards") :][:3500]
     assert "escHtml(String(detail))" in delete_fn
     assert "escHtml(String(e))" in delete_fn
+
+    # Кнопка гарантированно сбрасывается через finally (P1)
+    assert "finally" in delete_fn
+    assert "btn.disabled = false" in delete_fn
+
+    # После успешного удаления loadOutstandingCards возвращает статус (P2)
+    assert "reloadResult" in delete_fn
+    assert "reloadResult.state" in delete_fn
+    assert '"empty"' in delete_fn
+    assert "reloadResult.ok" in delete_fn
+
+    # Сообщение при ошибке перезагрузки списка (P1/P2)
+    assert "Карты удалены, но список не удалось обновить" in text
+
+    # После успешного удаления перезагружаются outstanding cards
+    assert "loadOutstandingCards" in delete_fn
 
     # Русские UX-тексты для bulk-delete
     assert "Удаляем выбранные карты" in text
@@ -1443,9 +1459,17 @@ async def test_campaign_new_page_has_outstanding_cards_status_container(
     assert "Не удалось удалить карты" in text
     assert "Нет карт для удаления" in text
 
-    # Кнопка disabled до конца reload (нет finally, сброс явный в каждом пути) — P4
-    assert "finally" not in delete_fn
-    assert "btn.disabled = false" in delete_fn
 
-    # После успешного удаления перезагружаются outstanding cards
-    assert "loadOutstandingCards" in delete_fn
+@pytest.mark.asyncio
+async def test_campaign_new_page_clears_outstanding_delete_result_on_company_change(
+    http_client: AsyncClient,
+) -> None:
+    """При смене филиала JS очищает старый результат удаления карт (P3)."""
+    response = await http_client.get("/ops/campaigns/new-clients")
+    assert response.status_code == 200
+    text = response.text
+
+    # Обработчик change компании содержит очистку outstanding-delete-result
+    change_block = text[text.find("companySelect.addEventListener") :][:800]
+    assert "outstanding-delete-result" in change_block
+    assert "innerHTML" in change_block

@@ -3210,6 +3210,8 @@ document.addEventListener("DOMContentLoaded", function () {{
 
   companySelect.addEventListener("change", function () {{
     const cid = companySelect.value;
+    // Очистить результат предыдущей операции удаления при смене филиала
+    document.getElementById("outstanding-delete-result").innerHTML = "";
     // Перезагрузить шаблоны для новой компании
     loadTemplateText(cid);
     setFollowupTemplateDefault(cid);
@@ -3826,19 +3828,24 @@ async function loadOutstandingCards(companyId) {{
   section.classList.add("d-none");
   tableEl.innerHTML = "";
 
-  if (!companyId) return;
+  if (!companyId) return {{ok: true, state: "empty", count: 0}};
 
   let data;
   try {{
     const resp = await fetch(
       "/ops/campaigns/outstanding-cards?campaign_code=new_clients_monthly&company_id=" + companyId
     );
+    if (!resp.ok) {{
+      return {{ok: false, state: "failed", error: resp.statusText}};
+    }}
     data = await resp.json();
   }} catch (e) {{
-    return;
+    return {{ok: false, state: "failed", error: String(e)}};
   }}
 
-  if (!data.cards || data.cards.length === 0) return;
+  if (!data.cards || data.cards.length === 0) {{
+    return {{ok: true, state: "empty", count: 0}};
+  }}
 
   badge.textContent = data.cards.length + " карт";
   section.classList.remove("d-none");
@@ -3862,6 +3869,7 @@ async function loadOutstandingCards(companyId) {{
   }}
   html += '</tbody></table>';
   tableEl.innerHTML = html;
+  return {{ok: true, state: "loaded", count: data.cards.length}};
 }}
 
 function outstandingSelectAll(checked) {{
@@ -3888,7 +3896,10 @@ async function deleteOutstandingCards() {{
   btn.textContent = "⏳ Удаление…";
   setAlert("outstanding-delete-result", "info", "Удаляем выбранные карты...");
 
-  let data;
+  let deleteSucceeded = false;
+  let alertMsg = "";
+  let alertType = "success";
+
   try {{
     const resp = await fetch("/ops/campaigns/bulk-delete-cards", {{
       method: "POST",
@@ -3904,45 +3915,49 @@ async function deleteOutstandingCards() {{
       try {{ const err = await resp.json(); detail = err.detail || detail; }} catch (_) {{}}
       setAlert("outstanding-delete-result", "danger",
         "Не удалось удалить карты. " + escHtml(String(detail)));
-      btn.disabled = false;
-      btn.textContent = "🗑️ Удалить выбранные";
       return;
     }}
-    data = await resp.json();
+    const data = await resp.json();
+    deleteSucceeded = true;
+
+    const msg = "Удалено: " + data.deleted_count
+      + ", ошибок: " + data.failed_count
+      + ", пропущено: " + data.skipped_count;
+    alertType = data.failed_count > 0 ? "warning" : "success";
+    alertMsg = escHtml(msg);
+    if (data.failed_count > 0) {{
+      const failDetails = (data.failed || []).map(function(f) {{
+        const cardId = f.card_id || f.loyalty_card_id || "";
+        return "card_id=" + escHtml(String(cardId))
+          + " recipient=" + escHtml(String(f.recipient_id))
+          + ": " + escHtml(String(f.error));
+      }}).join("; ");
+      if (failDetails) alertMsg += "<br><small>" + failDetails + "</small>";
+    }}
+    setAlert("outstanding-delete-result", alertType, alertMsg);
+
+    if (data.deleted_count > 0) {{
+      const reloadResult = await loadOutstandingCards(companyId);
+      if (reloadResult.ok && reloadResult.state === "empty") {{
+        setAlert("outstanding-delete-result", alertType,
+          alertMsg + "<br><small>Нет карт для удаления.</small>");
+      }} else if (!reloadResult.ok) {{
+        setAlert("outstanding-delete-result", "warning",
+          "Карты удалены, но список не удалось обновить. Обновите страницу."
+          + (reloadResult.error ? " (" + escHtml(reloadResult.error) + ")" : ""));
+      }}
+    }}
   }} catch (e) {{
-    setAlert("outstanding-delete-result", "danger", "Ошибка запроса: " + escHtml(String(e)));
+    if (deleteSucceeded) {{
+      setAlert("outstanding-delete-result", "warning",
+        "Карты удалены, но список не удалось обновить. Обновите страницу.");
+    }} else {{
+      setAlert("outstanding-delete-result", "danger", "Ошибка запроса: " + escHtml(String(e)));
+    }}
+  }} finally {{
     btn.disabled = false;
     btn.textContent = "🗑️ Удалить выбранные";
-    return;
   }}
-
-  const msg = "Удалено: " + data.deleted_count
-    + ", ошибок: " + data.failed_count
-    + ", пропущено: " + data.skipped_count;
-  const alertType = data.failed_count > 0 ? "warning" : "success";
-  let alertMsg = escHtml(msg);
-  if (data.failed_count > 0) {{
-    const failDetails = (data.failed || []).map(function(f) {{
-      const cardId = f.card_id || f.loyalty_card_id || "";
-      return "card_id=" + escHtml(String(cardId))
-        + " recipient=" + escHtml(String(f.recipient_id))
-        + ": " + escHtml(String(f.error));
-    }}).join("; ");
-    if (failDetails) alertMsg += "<br><small>" + failDetails + "</small>";
-  }}
-  setAlert("outstanding-delete-result", alertType, alertMsg);
-
-  if (data.deleted_count > 0) {{
-    await loadOutstandingCards(companyId);
-    const section = document.getElementById("outstanding-cards-section");
-    if (section.classList.contains("d-none")) {{
-      setAlert("outstanding-delete-result", alertType,
-        alertMsg + "<br><small>Нет карт для удаления.</small>");
-    }}
-  }}
-
-  btn.disabled = false;
-  btn.textContent = "🗑️ Удалить выбранные";
 }}
 </script>
 """
