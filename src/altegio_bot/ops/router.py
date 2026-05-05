@@ -2977,6 +2977,7 @@ async def ops_new_clients_campaign_page(request: Request) -> str:
 </div>
 
 <!-- ========== КАРТЫ ПРОШЛЫХ ПЕРИОДОВ ========== -->
+<div id="outstanding-delete-result" class="mb-2"></div>
 <div id="outstanding-cards-section" class="card mb-3 border-warning d-none">
   <div class="card-header fw-bold d-flex justify-content-between align-items-center">
     <span>🗑️ Карты лояльности прошлых периодов</span>
@@ -2996,7 +2997,6 @@ async def ops_new_clients_campaign_page(request: Request) -> str:
         🗑️ Удалить выбранные
       </button>
     </div>
-    <div id="outstanding-delete-result" class="mt-2"></div>
   </div>
 </div>
 
@@ -3016,15 +3016,9 @@ async def ops_new_clients_campaign_page(request: Request) -> str:
 
       <div class="col-md-4">
         <label class="form-label">Тип карты лояльности</label>
-        <div class="input-group">
-          <select id="f-card-type" class="form-select">
-            <option value="">— загрузите типы карт →</option>
-          </select>
-          <button id="btn-load-cards" class="btn btn-outline-secondary btn-sm" type="button"
-                  title="Загрузить типы карт из Altegio">
-            🔄 Загрузить
-          </button>
-        </div>
+        <select id="f-card-type" class="form-select" disabled>
+          <option value="">— выберите филиал —</option>
+        </select>
         <div id="card-load-status" class="form-text"></div>
       </div>
 
@@ -3216,16 +3210,16 @@ document.addEventListener("DOMContentLoaded", function () {{
 
   companySelect.addEventListener("change", function () {{
     const cid = companySelect.value;
-    // Сбросить список карт при смене компании
-    const ct = document.getElementById("f-card-type");
-    ct.innerHTML = '<option value="">— загрузите типы карт →</option>';
-    document.getElementById("card-load-status").textContent = "";
+    // Очистить результат предыдущей операции удаления при смене филиала
+    document.getElementById("outstanding-delete-result").innerHTML = "";
     // Перезагрузить шаблоны для новой компании
     loadTemplateText(cid);
     setFollowupTemplateDefault(cid);
     loadFollowupTemplateText(cid);
     // Перезагрузить карты прошлых периодов для новой компании
     loadOutstandingCards(cid);
+    // Автоматически загрузить типы карт для выбранного филиала
+    loadCardTypes();
   }});
 
   // Follow-up toggle
@@ -3243,14 +3237,14 @@ document.addEventListener("DOMContentLoaded", function () {{
     }}
   }});
 
-  document.getElementById("btn-load-cards").addEventListener("click", loadCardTypes);
   document.getElementById("btn-preview").addEventListener("click", createPreview);
   document.getElementById("btn-run").addEventListener("click", runCampaign);
 
-  // Загрузить тексты шаблонов и карты прошлых периодов для company по умолчанию
+  // Загрузить тексты шаблонов, типы карт и карты прошлых периодов для company по умолчанию
   loadTemplateText(companySelect.value);
   loadFollowupTemplateText(companySelect.value);
   setFollowupTemplateDefault(companySelect.value);
+  loadCardTypes();
   loadOutstandingCards(companySelect.value);
 
   // Если открыта со страницы history (from_preview), подгрузить параметры preview
@@ -3439,14 +3433,19 @@ async function loadFollowupTemplateText(companyId) {{
 async function loadCardTypes() {{
   // location_id == company_id (один dropdown для обоих)
   const locationId = document.getElementById("f-company").value.trim();
-  if (!locationId) {{
-    alert("Выберите кабинет перед загрузкой типов карт.");
-    return;
-  }}
   const statusEl = document.getElementById("card-load-status");
   const cardSelect = document.getElementById("f-card-type");
-  statusEl.textContent = "Загружаю…";
+
+  if (!locationId) {{
+    cardSelect.innerHTML = '<option value="">— выберите филиал —</option>';
+    cardSelect.disabled = true;
+    statusEl.textContent = "";
+    return;
+  }}
+
+  statusEl.textContent = "Загрузка типов карт...";
   cardSelect.innerHTML = '<option value="">— загрузка… —</option>';
+  cardSelect.disabled = true;
 
   try {{
     const resp = await fetch(
@@ -3454,14 +3453,14 @@ async function loadCardTypes() {{
     );
     if (!resp.ok) {{
       const err = await resp.json().catch(() => ({{detail: resp.statusText}}));
-      statusEl.textContent = "Ошибка: " + (err.detail || resp.statusText);
+      statusEl.textContent = "Не удалось загрузить типы карт. " + (err.detail || resp.statusText);
       cardSelect.innerHTML = '<option value="">— ошибка загрузки —</option>';
       return;
     }}
     const types = await resp.json();
     if (!Array.isArray(types) || types.length === 0) {{
-      statusEl.textContent = "Типы карт не найдены для этого location_id.";
-      cardSelect.innerHTML = '<option value="">— нет карт —</option>';
+      statusEl.textContent = "Нет доступных типов карт.";
+      cardSelect.innerHTML = '<option value="">— нет доступных типов карт —</option>';
       return;
     }}
     cardSelect.innerHTML = types.map(function(t) {{
@@ -3469,10 +3468,11 @@ async function loadCardTypes() {{
       const title = t.title || t.name || String(id);
       return '<option value="' + escHtml(String(id)) + '">' + escHtml(title) + '</option>';
     }}).join("");
+    cardSelect.disabled = false;
     statusEl.textContent = "Загружено " + types.length + " тип(ов) карт.";
   }} catch (e) {{
-    statusEl.textContent = "Ошибка сети: " + e.message;
-    cardSelect.innerHTML = '<option value="">— ошибка —</option>';
+    statusEl.textContent = "Не удалось загрузить типы карт. " + e.message;
+    cardSelect.innerHTML = '<option value="">— ошибка загрузки —</option>';
   }}
 }}
 
@@ -3828,19 +3828,24 @@ async function loadOutstandingCards(companyId) {{
   section.classList.add("d-none");
   tableEl.innerHTML = "";
 
-  if (!companyId) return;
+  if (!companyId) return {{ok: true, state: "empty", count: 0}};
 
   let data;
   try {{
     const resp = await fetch(
       "/ops/campaigns/outstanding-cards?campaign_code=new_clients_monthly&company_id=" + companyId
     );
+    if (!resp.ok) {{
+      return {{ok: false, state: "failed", error: resp.statusText}};
+    }}
     data = await resp.json();
   }} catch (e) {{
-    return;
+    return {{ok: false, state: "failed", error: String(e)}};
   }}
 
-  if (!data.cards || data.cards.length === 0) return;
+  if (!data.cards || data.cards.length === 0) {{
+    return {{ok: true, state: "empty", count: 0}};
+  }}
 
   badge.textContent = data.cards.length + " карт";
   section.classList.remove("d-none");
@@ -3864,6 +3869,7 @@ async function loadOutstandingCards(companyId) {{
   }}
   html += '</tbody></table>';
   tableEl.innerHTML = html;
+  return {{ok: true, state: "loaded", count: data.cards.length}};
 }}
 
 function outstandingSelectAll(checked) {{
@@ -3873,15 +3879,27 @@ function outstandingSelectAll(checked) {{
 }}
 
 async function deleteOutstandingCards() {{
-  const checked = Array.from(document.querySelectorAll(".oc-check:not(:checked)"))
+  const btn = document.getElementById("btn-delete-outstanding");
+  if (btn.disabled) return;
+
+  const selectedBoxes = Array.from(document.querySelectorAll(".oc-check:checked"));
+  if (selectedBoxes.length === 0) {{
+    setAlert("outstanding-delete-result", "warning", "Выберите хотя бы одну карту для удаления.");
+    return;
+  }}
+
+  const excludedIds = Array.from(document.querySelectorAll(".oc-check:not(:checked)"))
     .map(cb => parseInt(cb.dataset.recipient, 10));
   const companyId = parseInt(document.getElementById("f-company").value, 10);
 
-  const btn = document.getElementById("btn-delete-outstanding");
   btn.disabled = true;
   btn.textContent = "⏳ Удаление…";
+  setAlert("outstanding-delete-result", "info", "Удаляем выбранные карты...");
 
-  let data;
+  let deleteSucceeded = false;
+  let alertMsg = "";
+  let alertType = "success";
+
   try {{
     const resp = await fetch("/ops/campaigns/bulk-delete-cards", {{
       method: "POST",
@@ -3889,27 +3907,59 @@ async function deleteOutstandingCards() {{
       body: JSON.stringify({{
         campaign_code: "new_clients_monthly",
         company_id: companyId,
-        exclude_recipient_ids: checked,
+        exclude_recipient_ids: excludedIds,
       }}),
     }});
-    data = await resp.json();
+    if (!resp.ok) {{
+      let detail = resp.statusText;
+      try {{ const err = await resp.json(); detail = err.detail || detail; }} catch (_) {{}}
+      setAlert("outstanding-delete-result", "danger",
+        "Не удалось удалить карты. " + escHtml(String(detail)));
+      return;
+    }}
+    const data = await resp.json();
+    deleteSucceeded = true;
+
+    const msg = "Удалено: " + data.deleted_count
+      + ", ошибок: " + data.failed_count
+      + ", пропущено: " + data.skipped_count;
+    alertType = data.failed_count > 0 ? "warning" : "success";
+    alertMsg = escHtml(msg);
+    if (data.failed_count > 0) {{
+      const failDetails = (data.failed || []).map(function(f) {{
+        const cardId = f.card_id || f.loyalty_card_id || "";
+        return "card_id=" + escHtml(String(cardId))
+          + " recipient=" + escHtml(String(f.recipient_id))
+          + ": " + escHtml(String(f.error));
+      }}).join("; ");
+      if (failDetails) alertMsg += "<br><small>" + failDetails + "</small>";
+    }}
+    setAlert("outstanding-delete-result", alertType, alertMsg);
+
+    if (data.deleted_count > 0) {{
+      const reloadResult = await loadOutstandingCards(companyId);
+      if (reloadResult.ok && reloadResult.state === "empty") {{
+        setAlert("outstanding-delete-result", alertType,
+          alertMsg + "<br><small>Нет карт для удаления.</small>");
+      }} else if (!reloadResult.ok) {{
+        const reloadWarning = "<br><small>Карты удалены, но список не удалось обновить. Обновите страницу."
+          + (reloadResult.error ? " (" + escHtml(reloadResult.error) + ")" : "")
+          + "</small>";
+        setAlert("outstanding-delete-result", "warning", alertMsg + reloadWarning);
+      }}
+    }}
   }} catch (e) {{
-    showAlert("outstanding-delete-result", "danger", "Ошибка запроса: " + e);
+    if (deleteSucceeded) {{
+      const reloadWarning = "<br><small>Карты удалены, но список не удалось обновить. Обновите страницу.</small>";
+      setAlert("outstanding-delete-result", "warning",
+        (alertMsg || "") + reloadWarning);
+    }} else {{
+      setAlert("outstanding-delete-result", "danger", "Ошибка запроса: " + escHtml(String(e)));
+    }}
+  }} finally {{
     btn.disabled = false;
     btn.textContent = "🗑️ Удалить выбранные";
-    return;
   }}
-
-  const msg = "Удалено: " + data.deleted_count
-    + ", ошибок: " + data.failed_count
-    + ", пропущено: " + data.skipped_count;
-  showAlert("outstanding-delete-result", data.failed_count > 0 ? "warning" : "success", msg);
-
-  btn.disabled = false;
-  btn.textContent = "🗑️ Удалить выбранные";
-
-  // Reload to reflect deletions
-  await loadOutstandingCards(companyId);
 }}
 </script>
 """

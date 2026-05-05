@@ -1366,3 +1366,136 @@ async def test_send_real_without_preview_shows_no_empty_preview_block(
     assert response.status_code == 200
     assert "Открыть превью" not in response.text
     assert "Связанное превью" not in response.text
+
+
+# ---------------------------------------------------------------------------
+# UX fixes: auto card type loader & outstanding cards delete UX
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_campaign_new_page_has_auto_card_type_loader(http_client: AsyncClient) -> None:
+    """Страница загружает типы карт автоматически — без кнопки Загрузить."""
+    response = await http_client.get("/ops/campaigns/new-clients")
+    assert response.status_code == 200
+    text = response.text
+
+    # Функция loadCardTypes присутствует в JS
+    assert "loadCardTypes" in text
+
+    # Автовызов на инициализации страницы
+    assert "loadCardTypes()" in text
+
+    # Автовызов при смене филиала
+    company_change_block = text[text.find("companySelect.addEventListener") :][:600]
+    assert "loadCardTypes()" in company_change_block
+
+    # Кнопки «Загрузить» (btn-load-cards) нет ни в HTML, ни в JS
+    assert "btn-load-cards" not in text
+    assert "🔄 Загрузить" not in text
+
+    # Select присутствует
+    assert 'id="f-card-type"' in text
+
+    # Русские тексты загрузки присутствуют в JS
+    assert "Загрузка типов карт" in text
+    assert "Нет доступных типов карт" in text
+    assert "Не удалось загрузить типы карт" in text
+
+
+@pytest.mark.asyncio
+async def test_campaign_new_page_has_outstanding_cards_status_container(
+    http_client: AsyncClient,
+) -> None:
+    """Страница содержит контейнер статуса удаления карт и корректный JS для bulk-delete."""
+    response = await http_client.get("/ops/campaigns/new-clients")
+    assert response.status_code == 200
+    text = response.text
+
+    # outstanding-delete-result стоит ДО outstanding-cards-section
+    idx_result = text.find('id="outstanding-delete-result"')
+    idx_section = text.find('id="outstanding-cards-section"')
+    assert idx_result != -1, "outstanding-delete-result не найден в HTML"
+    assert idx_section != -1, "outstanding-cards-section не найден в HTML"
+    assert idx_result < idx_section, "outstanding-delete-result должен быть расположен перед outstanding-cards-section"
+
+    # Кнопка удаления выбранных карт
+    assert "btn-delete-outstanding" in text
+    assert "deleteOutstandingCards" in text
+
+    # JS содержит обработку полей ответа bulk-delete
+    assert "deleted_count" in text
+    assert "failed_count" in text
+    assert "skipped_count" in text
+
+    # Используется f.card_id (с fallback на f.loyalty_card_id)
+    assert "f.card_id" in text
+
+    # Экранирование detail и exception
+    delete_fn = text[text.find("async function deleteOutstandingCards") :][:3500]
+    assert "escHtml(String(detail))" in delete_fn
+    assert "escHtml(String(e))" in delete_fn
+
+    # Кнопка гарантированно сбрасывается через finally (P1)
+    assert "finally" in delete_fn
+    assert "btn.disabled = false" in delete_fn
+
+    # После успешного удаления loadOutstandingCards возвращает статус (P2)
+    assert "reloadResult" in delete_fn
+    assert "reloadResult.state" in delete_fn
+    assert '"empty"' in delete_fn
+    assert "reloadResult.ok" in delete_fn
+
+    # При ошибке reload alertMsg (с failDetails) сохраняется — не заменяется статичным текстом
+    assert "alertMsg + reloadWarning" in delete_fn
+
+    # Сообщение при ошибке перезагрузки списка
+    assert "Карты удалены, но список не удалось обновить" in text
+
+    # После успешного удаления перезагружаются outstanding cards
+    assert "loadOutstandingCards" in delete_fn
+
+    # Русские UX-тексты для bulk-delete
+    assert "Удаляем выбранные карты" in text
+    assert "Удалено:" in text
+    assert "Выберите хотя бы одну карту для удаления" in text
+    assert "Не удалось удалить карты" in text
+    assert "Нет карт для удаления" in text
+
+
+@pytest.mark.asyncio
+async def test_campaign_new_page_preserves_failed_card_details_on_reload_warning(
+    http_client: AsyncClient,
+) -> None:
+    """JS не теряет детали failed-карт при ошибке reload списка."""
+    response = await http_client.get("/ops/campaigns/new-clients")
+    assert response.status_code == 200
+    text = response.text
+
+    delete_fn = text[text.find("async function deleteOutstandingCards") :][:3500]
+
+    # failDetails строится из card_id / recipient_id / error
+    assert "card_id=" in delete_fn
+    assert "recipient=" in delete_fn
+    assert "alertMsg +=" in delete_fn
+
+    # При !reloadResult.ok алерт строится как alertMsg + reloadWarning (не только статичный текст)
+    assert "alertMsg + reloadWarning" in delete_fn
+
+    # В catch при deleteSucceeded тоже используется alertMsg
+    assert "(alertMsg || " in delete_fn
+
+
+@pytest.mark.asyncio
+async def test_campaign_new_page_clears_outstanding_delete_result_on_company_change(
+    http_client: AsyncClient,
+) -> None:
+    """При смене филиала JS очищает старый результат удаления карт (P3)."""
+    response = await http_client.get("/ops/campaigns/new-clients")
+    assert response.status_code == 200
+    text = response.text
+
+    # Обработчик change компании содержит очистку outstanding-delete-result
+    change_block = text[text.find("companySelect.addEventListener") :][:800]
+    assert "outstanding-delete-result" in change_block
+    assert "innerHTML" in change_block
