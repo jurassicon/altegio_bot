@@ -1210,3 +1210,159 @@ async def test_persistent_recompute_warning_absent_when_last_recompute_clean(
     response = await http_client.get(f"/ops/campaigns/{run_id}")
     assert response.status_code == 200
     assert "Booked after может быть занижен" not in response.text
+
+
+# ---------------------------------------------------------------------------
+# Preview runs hidden from list / accessible via direct link
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_preview_run_hidden_from_campaign_list(
+    http_client: AsyncClient,
+    session_maker,
+) -> None:
+    """Preview runs do not appear in the default campaign list; send-real runs do (Case A)."""
+    now = datetime.now(timezone.utc)
+    async with session_maker() as session:
+        async with session.begin():
+            preview_run = CampaignRun(
+                campaign_code="new_clients_monthly",
+                mode="preview",
+                company_ids=[758285],
+                period_start=now.replace(day=1, hour=0, minute=0, second=0, microsecond=0),
+                period_end=now,
+                status="completed",
+                followup_enabled=False,
+                meta={},
+            )
+            send_real_run = CampaignRun(
+                campaign_code="new_clients_monthly",
+                mode="send-real",
+                company_ids=[758285],
+                period_start=now.replace(day=1, hour=0, minute=0, second=0, microsecond=0),
+                period_end=now,
+                status="completed",
+                followup_enabled=False,
+                meta={},
+            )
+            session.add(preview_run)
+            session.add(send_real_run)
+            await session.flush()
+            preview_id = preview_run.id
+            send_real_id = send_real_run.id
+
+    response = await http_client.get("/ops/campaigns")
+    assert response.status_code == 200
+    # Send-real run must appear (its detail link)
+    assert f'href="/ops/campaigns/{send_real_id}"' in response.text
+    # Preview run detail link must NOT appear in default list
+    assert f'href="/ops/campaigns/{preview_id}"' not in response.text
+
+    # Explicit mode=preview filter must still show it
+    response_preview = await http_client.get("/ops/campaigns?mode=preview")
+    assert response_preview.status_code == 200
+    assert f'href="/ops/campaigns/{preview_id}"' in response_preview.text
+
+
+@pytest.mark.asyncio
+async def test_preview_run_detail_accessible_via_direct_link(
+    http_client: AsyncClient,
+    session_maker,
+) -> None:
+    """Preview run detail page is accessible by direct URL even though hidden from list (Case B)."""
+    now = datetime.now(timezone.utc)
+    async with session_maker() as session:
+        async with session.begin():
+            run = CampaignRun(
+                campaign_code="new_clients_monthly",
+                mode="preview",
+                company_ids=[758285],
+                period_start=now.replace(day=1, hour=0, minute=0, second=0, microsecond=0),
+                period_end=now,
+                status="completed",
+                followup_enabled=False,
+                meta={},
+            )
+            session.add(run)
+            await session.flush()
+            run_id = run.id
+
+    response = await http_client.get(f"/ops/campaigns/{run_id}")
+    assert response.status_code == 200
+    assert f"Run #{run_id}" in response.text
+    assert "превью" in response.text.lower()
+
+
+@pytest.mark.asyncio
+async def test_send_real_detail_links_to_source_preview(
+    http_client: AsyncClient,
+    session_maker,
+) -> None:
+    """Send-real run detail shows link to its source preview run (Case C)."""
+    now = datetime.now(timezone.utc)
+    async with session_maker() as session:
+        async with session.begin():
+            preview_run = CampaignRun(
+                campaign_code="new_clients_monthly",
+                mode="preview",
+                company_ids=[758285],
+                period_start=now.replace(day=1, hour=0, minute=0, second=0, microsecond=0),
+                period_end=now,
+                status="completed",
+                followup_enabled=False,
+                meta={},
+            )
+            session.add(preview_run)
+            await session.flush()
+            preview_id = preview_run.id
+
+            send_real_run = CampaignRun(
+                campaign_code="new_clients_monthly",
+                mode="send-real",
+                company_ids=[758285],
+                period_start=now.replace(day=1, hour=0, minute=0, second=0, microsecond=0),
+                period_end=now,
+                status="completed",
+                source_preview_run_id=preview_id,
+                followup_enabled=False,
+                meta={},
+            )
+            session.add(send_real_run)
+            await session.flush()
+            send_real_id = send_real_run.id
+
+    response = await http_client.get(f"/ops/campaigns/{send_real_id}")
+    assert response.status_code == 200
+    assert f"/ops/campaigns/{preview_id}" in response.text
+    assert "превью" in response.text.lower()
+
+
+@pytest.mark.asyncio
+async def test_send_real_without_preview_shows_no_empty_preview_block(
+    http_client: AsyncClient,
+    session_maker,
+) -> None:
+    """Send-real run without source_preview_run_id shows no broken or empty preview link (Case D)."""
+    now = datetime.now(timezone.utc)
+    async with session_maker() as session:
+        async with session.begin():
+            run = CampaignRun(
+                campaign_code="new_clients_monthly",
+                mode="send-real",
+                company_ids=[758285],
+                period_start=now.replace(day=1, hour=0, minute=0, second=0, microsecond=0),
+                period_end=now,
+                status="completed",
+                source_preview_run_id=None,
+                followup_enabled=False,
+                meta={},
+            )
+            session.add(run)
+            await session.flush()
+            run_id = run.id
+
+    response = await http_client.get(f"/ops/campaigns/{run_id}")
+    assert response.status_code == 200
+    assert "Открыть превью" not in response.text
+    assert "Связанное превью" not in response.text
