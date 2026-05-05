@@ -3942,15 +3942,17 @@ async function deleteOutstandingCards() {{
         setAlert("outstanding-delete-result", alertType,
           alertMsg + "<br><small>Нет карт для удаления.</small>");
       }} else if (!reloadResult.ok) {{
-        setAlert("outstanding-delete-result", "warning",
-          "Карты удалены, но список не удалось обновить. Обновите страницу."
-          + (reloadResult.error ? " (" + escHtml(reloadResult.error) + ")" : ""));
+        const reloadWarning = "<br><small>Карты удалены, но список не удалось обновить. Обновите страницу."
+          + (reloadResult.error ? " (" + escHtml(reloadResult.error) + ")" : "")
+          + "</small>";
+        setAlert("outstanding-delete-result", "warning", alertMsg + reloadWarning);
       }}
     }}
   }} catch (e) {{
     if (deleteSucceeded) {{
+      const reloadWarning = "<br><small>Карты удалены, но список не удалось обновить. Обновите страницу.</small>";
       setAlert("outstanding-delete-result", "warning",
-        "Карты удалены, но список не удалось обновить. Обновите страницу.");
+        (alertMsg || "") + reloadWarning);
     }} else {{
       setAlert("outstanding-delete-result", "danger", "Ошибка запроса: " + escHtml(String(e)));
     }}

@@ -1446,7 +1446,10 @@ async def test_campaign_new_page_has_outstanding_cards_status_container(
     assert '"empty"' in delete_fn
     assert "reloadResult.ok" in delete_fn
 
-    # Сообщение при ошибке перезагрузки списка (P1/P2)
+    # При ошибке reload alertMsg (с failDetails) сохраняется — не заменяется статичным текстом
+    assert "alertMsg + reloadWarning" in delete_fn
+
+    # Сообщение при ошибке перезагрузки списка
     assert "Карты удалены, но список не удалось обновить" in text
 
     # После успешного удаления перезагружаются outstanding cards
@@ -1458,6 +1461,29 @@ async def test_campaign_new_page_has_outstanding_cards_status_container(
     assert "Выберите хотя бы одну карту для удаления" in text
     assert "Не удалось удалить карты" in text
     assert "Нет карт для удаления" in text
+
+
+@pytest.mark.asyncio
+async def test_campaign_new_page_preserves_failed_card_details_on_reload_warning(
+    http_client: AsyncClient,
+) -> None:
+    """JS не теряет детали failed-карт при ошибке reload списка."""
+    response = await http_client.get("/ops/campaigns/new-clients")
+    assert response.status_code == 200
+    text = response.text
+
+    delete_fn = text[text.find("async function deleteOutstandingCards") :][:3500]
+
+    # failDetails строится из card_id / recipient_id / error
+    assert "card_id=" in delete_fn
+    assert "recipient=" in delete_fn
+    assert "alertMsg +=" in delete_fn
+
+    # При !reloadResult.ok алерт строится как alertMsg + reloadWarning (не только статичный текст)
+    assert "alertMsg + reloadWarning" in delete_fn
+
+    # В catch при deleteSucceeded тоже используется alertMsg
+    assert "(alertMsg || " in delete_fn
 
 
 @pytest.mark.asyncio
