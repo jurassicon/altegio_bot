@@ -1824,6 +1824,11 @@ async def _sync_booked_after_from_altegio_events(
     # will be overwritten by Phase 3. Only eligibility gates are checked here.
     eligible = [r for r in recipients if _is_booked_after_eligible(r, outbox_by_recipient.get(r.id))]
 
+    eligible_ids = {r.id for r in eligible}
+    for r in recipients:
+        if r.id not in eligible_ids:
+            r.booked_after_at = None
+
     if not eligible:
         return _empty
 

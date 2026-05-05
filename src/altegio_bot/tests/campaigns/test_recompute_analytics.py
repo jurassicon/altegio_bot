@@ -36,7 +36,7 @@ from altegio_bot.models.models import (
     RecordService,
 )
 from altegio_bot.ops.auth import require_ops_auth
-from altegio_bot.service_filter import ServiceLookupError, _cache_put
+from altegio_bot.service_filter import _LRU_CACHE, ServiceLookupError, _cache_put
 
 _UTC = timezone.utc
 _NOW = datetime(2026, 5, 4, 12, 0, 0, tzinfo=_UTC)
@@ -3440,7 +3440,7 @@ async def test_lookup_failure_clears_stale_booked_after_and_surfaces_diagnostics
 
 
 @pytest.mark.asyncio
-async def test_missing_credentials_on_cache_miss_surfaces_as_lookup_failure(session_maker) -> None:
+async def test_missing_credentials_on_cache_miss_surfaces_as_lookup_failure(session_maker, monkeypatch) -> None:
     """Cache-miss service + no API tokens → treated as lookup failure, not silent non-lash.
 
     In the test environment, ALTEGIO_PARTNER_TOKEN / ALTEGIO_USER_TOKEN are not
@@ -3448,6 +3448,9 @@ async def test_missing_credentials_on_cache_miss_surfaces_as_lookup_failure(sess
     which causes _fetch_service_category_id to raise ServiceLookupError when
     credentials are missing, rather than silently returning False.
     """
+    monkeypatch.delenv("ALTEGIO_PARTNER_TOKEN", raising=False)
+    monkeypatch.delenv("ALTEGIO_USER_TOKEN", raising=False)
+    _LRU_CACHE.pop((758285, _UNCACHED_SVC_ID), None)
     run_id = await _make_run(session_maker)
     event_at = _COMPLETED_AT + timedelta(days=4)
 
@@ -3504,6 +3507,204 @@ async def test_missing_credentials_on_cache_miss_surfaces_as_lookup_failure(sess
     lr = run.meta["last_recompute"]
     assert lr["booked_after_service_lookup_failed_count"] == 1
     assert summary["booked_after_count"] == 0
+
+
+# ==========================================================================
+# P1: Stale booked_after_at cleared for ineligible recipients
+# ==========================================================================
+
+
+@pytest.mark.asyncio
+async def test_stale_booked_after_cleared_for_failed_outbox_recipient(session_maker) -> None:
+    """OutboxMessage with status='failed' hard-blocks attribution; stale booked_after_at is cleared."""
+    run_id = await _make_run(session_maker)
+    stale_ts = _COMPLETED_AT + timedelta(days=1)
+
+    async with session_maker() as session:
+        async with session.begin():
+            outbox = OutboxMessage(
+                company_id=758285,
+                phone_e164="+4915180007001",
+                template_code="newsletter_new_clients_monthly",
+                language="de",
+                body="Test",
+                status="failed",
+                scheduled_at=_COMPLETED_AT,
+            )
+            session.add(outbox)
+            await session.flush()
+
+            recipient = CampaignRecipient(
+                campaign_run_id=run_id,
+                company_id=758285,
+                client_id=None,
+                altegio_client_id=80007,
+                phone_e164="+4915180007001",
+                display_name="Failed Outbox",
+                status="provider_accepted",
+                sent_at=_COMPLETED_AT,
+                provider_message_id="wamid.p1-failed-001",
+                outbox_message_id=outbox.id,
+                booked_after_at=stale_ts,
+            )
+            session.add(recipient)
+            await session.flush()
+            recipient_id = recipient.id
+
+    async with session_maker() as session:
+        async with session.begin():
+            await recompute_campaign_run_stats(session, run_id)
+
+    async with session_maker() as session:
+        recip = await session.get(CampaignRecipient, recipient_id)
+
+    assert recip.booked_after_at is None, "stale booked_after_at must be cleared when outbox.status='failed'"
+
+
+@pytest.mark.asyncio
+async def test_stale_booked_after_cleared_for_skipped_recipient(session_maker) -> None:
+    """Recipient with status='skipped' is ineligible; stale booked_after_at is cleared."""
+    run_id = await _make_run(session_maker)
+    stale_ts = _COMPLETED_AT + timedelta(days=2)
+
+    async with session_maker() as session:
+        async with session.begin():
+            recipient = CampaignRecipient(
+                campaign_run_id=run_id,
+                company_id=758285,
+                client_id=None,
+                altegio_client_id=80008,
+                phone_e164="+4915180008001",
+                display_name="Skipped Client",
+                status="skipped",
+                excluded_reason="no_phone",
+                booked_after_at=stale_ts,
+            )
+            session.add(recipient)
+            await session.flush()
+            recipient_id = recipient.id
+
+    async with session_maker() as session:
+        async with session.begin():
+            await recompute_campaign_run_stats(session, run_id)
+
+    async with session_maker() as session:
+        recip = await session.get(CampaignRecipient, recipient_id)
+
+    assert recip.booked_after_at is None, "stale booked_after_at must be cleared for skipped/excluded recipient"
+
+
+@pytest.mark.asyncio
+async def test_stale_booked_after_cleared_for_job_only_recipient(session_maker) -> None:
+    """Recipient with no positive send signal (status='queued', no outbox/sent_at/provider_id)
+    is ineligible; stale booked_after_at is cleared."""
+    run_id = await _make_run(session_maker)
+    stale_ts = _COMPLETED_AT + timedelta(days=3)
+
+    async with session_maker() as session:
+        async with session.begin():
+            recipient = CampaignRecipient(
+                campaign_run_id=run_id,
+                company_id=758285,
+                client_id=None,
+                altegio_client_id=80009,
+                phone_e164="+4915180009001",
+                display_name="Job Only",
+                status="queued",
+                provider_message_id=None,
+                sent_at=None,
+                outbox_message_id=None,
+                booked_after_at=stale_ts,
+            )
+            session.add(recipient)
+            await session.flush()
+            recipient_id = recipient.id
+
+    async with session_maker() as session:
+        async with session.begin():
+            await recompute_campaign_run_stats(session, run_id)
+
+    async with session_maker() as session:
+        recip = await session.get(CampaignRecipient, recipient_id)
+
+    assert recip.booked_after_at is None, (
+        "stale booked_after_at must be cleared when recipient has no positive send signal"
+    )
+
+
+@pytest.mark.asyncio
+async def test_positive_send_attributed_alongside_ineligible_neighbor(session_maker) -> None:
+    """Positive-send recipient is attributed; ineligible neighbor's stale booked_after_at is cleared.
+
+    Regression: the ineligible-clearing code must not prevent attribution for
+    eligible recipients that share the same run.
+    """
+    _seed_lash_cache()
+    run_id = await _make_run(session_maker)
+    event_at = _COMPLETED_AT + timedelta(days=5)
+    stale_ts = _COMPLETED_AT + timedelta(days=1)
+
+    async with session_maker() as session:
+        async with session.begin():
+            record = Record(
+                company_id=758285,
+                altegio_record_id=40009,
+                client_id=None,
+                altegio_client_id=80010,
+                raw={},
+            )
+            session.add(record)
+            await session.flush()
+            session.add(RecordService(record_id=record.id, service_id=_LASH_SVC_ID))
+            session.add(
+                AltegioEvent(
+                    dedupe_key="test-p1-regression-positive-001",
+                    company_id=758285,
+                    resource="record",
+                    resource_id=40009,
+                    event_status="create",
+                    received_at=event_at,
+                )
+            )
+            eligible_recipient = CampaignRecipient(
+                campaign_run_id=run_id,
+                company_id=758285,
+                client_id=None,
+                altegio_client_id=80010,
+                phone_e164="+4915180010001",
+                display_name="Positive Send",
+                status="provider_accepted",
+                sent_at=_COMPLETED_AT,
+                provider_message_id="wamid.p1-regression-001",
+                booked_after_at=None,
+            )
+            ineligible_recipient = CampaignRecipient(
+                campaign_run_id=run_id,
+                company_id=758285,
+                client_id=None,
+                altegio_client_id=80011,
+                phone_e164="+4915180011001",
+                display_name="Stale Ineligible",
+                status="skipped",
+                booked_after_at=stale_ts,
+            )
+            session.add(eligible_recipient)
+            session.add(ineligible_recipient)
+            await session.flush()
+            eligible_id = eligible_recipient.id
+            ineligible_id = ineligible_recipient.id
+
+    async with session_maker() as session:
+        async with session.begin():
+            summary = await recompute_campaign_run_stats(session, run_id)
+
+    async with session_maker() as session:
+        eligible = await session.get(CampaignRecipient, eligible_id)
+        ineligible = await session.get(CampaignRecipient, ineligible_id)
+
+    assert eligible.booked_after_at == event_at, "eligible recipient must be attributed"
+    assert ineligible.booked_after_at is None, "ineligible neighbor's stale booked_after_at must be cleared"
+    assert summary["booked_after_count"] == 1
 
 
 # ==========================================================================

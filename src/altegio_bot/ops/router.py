@@ -4343,11 +4343,26 @@ async function recomputeStats(runId) {{
     );
     const data = await resp.json();
     if (resp.ok) {{
-      el.innerHTML =
-        '<div class="alert alert-success">' +
-        'Статистика пересчитана. ' +
-        '<a href="">Обновите страницу</a> чтобы увидеть актуальные значения.' +
-        '</div>';
+      const failedCount = (data.stats || {{}}).booked_after_service_lookup_failed_count || 0;
+      if (failedCount > 0) {{
+        const s = data.stats;
+        const svcIds = (s.booked_after_service_lookup_failed_service_ids || []).join(", ") || "—";
+        const recCount = s.booked_after_service_lookup_failed_record_count || 0;
+        el.innerHTML =
+          '<div class="alert alert-warning">' +
+          'Recompute completed with service lookup warnings. ' +
+          'Booked-after count may be undercounted. ' +
+          'Failed services: ' + svcIds + '. ' +
+          'Failed records: ' + recCount + '. ' +
+          '<a href="">Обновите страницу</a> чтобы увидеть актуальные значения.' +
+          '</div>';
+      }} else {{
+        el.innerHTML =
+          '<div class="alert alert-success">' +
+          'Статистика пересчитана. ' +
+          '<a href="">Обновите страницу</a> чтобы увидеть актуальные значения.' +
+          '</div>';
+      }}
     }} else {{
       el.innerHTML =
         '<div class="alert alert-danger">Ошибка: ' +

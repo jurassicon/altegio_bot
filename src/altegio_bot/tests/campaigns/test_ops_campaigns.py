@@ -1124,3 +1124,16 @@ async def test_recompute_attribution_counters(
     assert run.replied_count == 1
     assert run.booked_after_count == 1
     assert run.opted_out_after_count == 1
+
+
+@pytest.mark.asyncio
+async def test_recompute_warning_js_present_in_page(
+    http_client: AsyncClient,
+    sample_run: int,
+) -> None:
+    """JS warning handler for service lookup failures is present in the run detail page."""
+    response = await http_client.get(f"/ops/campaigns/{sample_run}")
+    assert response.status_code == 200
+    assert "booked_after_service_lookup_failed_count" in response.text
+    assert "alert-warning" in response.text
+    assert "may be undercounted" in response.text
