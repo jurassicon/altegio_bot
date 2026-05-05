@@ -1366,3 +1366,74 @@ async def test_send_real_without_preview_shows_no_empty_preview_block(
     assert response.status_code == 200
     assert "Открыть превью" not in response.text
     assert "Связанное превью" not in response.text
+
+
+# ---------------------------------------------------------------------------
+# UX fixes: auto card type loader & outstanding cards delete UX
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_campaign_new_page_has_auto_card_type_loader(http_client: AsyncClient) -> None:
+    """Страница загружает типы карт автоматически — без кнопки Загрузить."""
+    response = await http_client.get("/ops/campaigns/new-clients")
+    assert response.status_code == 200
+    text = response.text
+
+    # Функция loadCardTypes присутствует в JS
+    assert "loadCardTypes" in text
+
+    # Автовызов на инициализации страницы
+    assert "loadCardTypes()" in text
+
+    # Автовызов при смене филиала
+    company_change_block = text[text.find("companySelect.addEventListener") :][:600]
+    assert "loadCardTypes()" in company_change_block
+
+    # Кнопки «Загрузить» (btn-load-cards) нет ни в HTML, ни в JS
+    assert "btn-load-cards" not in text
+    assert "🔄 Загрузить" not in text
+
+    # Select присутствует
+    assert 'id="f-card-type"' in text
+
+    # Русские тексты загрузки присутствуют в JS
+    assert "Загрузка типов карт" in text
+    assert "Нет доступных типов карт" in text
+    assert "Не удалось загрузить типы карт" in text
+
+
+@pytest.mark.asyncio
+async def test_campaign_new_page_has_outstanding_cards_status_container(
+    http_client: AsyncClient,
+) -> None:
+    """Страница содержит контейнер статуса удаления карт и корректный JS для bulk-delete."""
+    response = await http_client.get("/ops/campaigns/new-clients")
+    assert response.status_code == 200
+    text = response.text
+
+    # Контейнер для результата операции удаления
+    assert "outstanding-delete-result" in text
+
+    # Кнопка удаления выбранных карт
+    assert "btn-delete-outstanding" in text
+    assert "deleteOutstandingCards" in text
+
+    # JS содержит обработку полей ответа bulk-delete
+    assert "deleted_count" in text
+    assert "failed_count" in text
+    assert "skipped_count" in text
+
+    # Русские UX-тексты для bulk-delete
+    assert "Удаляем выбранные карты" in text
+    assert "Удалено:" in text
+    assert "Выберите хотя бы одну карту для удаления" in text
+    assert "Не удалось удалить карты" in text
+
+    # Кнопка сбрасывается в finally-блоке (текст кнопки возвращается)
+    delete_fn = text[text.find("async function deleteOutstandingCards") :][:3000]
+    assert "finally" in delete_fn
+    assert "btn.disabled = false" in delete_fn
+
+    # После успешного удаления перезагружаются outstanding cards
+    assert "loadOutstandingCards" in delete_fn
