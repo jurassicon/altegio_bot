@@ -2634,6 +2634,9 @@ async def ops_campaigns_list(request: Request) -> str:
                 pass
         if mode_filter:
             conditions.append(CampaignRun.mode == mode_filter)
+        else:
+            # По умолчанию скрываем preview — они доступны по прямой ссылке
+            conditions.append(CampaignRun.mode != "preview")
         if status_filter:
             conditions.append(CampaignRun.status == status_filter)
         else:
@@ -4038,6 +4041,16 @@ async def ops_campaign_run_detail(run_id: int) -> str:
 </div>
 """
 
+    # Notice for preview runs: visible on direct link, not in the general list
+    preview_notice_block = ""
+    if run.mode == "preview":
+        preview_notice_block = (
+            '<div class="alert alert-light border text-muted small mb-3">'
+            "&#x1F441;&#xFE0F; Это превью — скрыто из общего списка рассылок. "
+            '<a href="/ops/campaigns">Вернуться к списку</a>'
+            "</div>"
+        )
+
     # Recompute button: always available for send-real; blocked for preview
     if run.mode == "send-real":
         recompute_btn = (
@@ -4084,9 +4097,9 @@ async def ops_campaign_run_detail(run_id: int) -> str:
       <dd class="col-sm-9">{_esc(str(run.card_type_id or "—"))}</dd>
       <dt class="col-sm-3">Attribution Window</dt>
       <dd class="col-sm-9">{run.attribution_window_days} days</dd>
-      <dt class="col-sm-3">Source Preview Run</dt>
+      <dt class="col-sm-3">Связанное превью</dt>
       <dd class="col-sm-9">{
-        f'<a href="/ops/campaigns/{run.source_preview_run_id}">{run.source_preview_run_id}</a>'
+        f'<a href="/ops/campaigns/{run.source_preview_run_id}">Открыть превью #{run.source_preview_run_id}</a>'
         if run.source_preview_run_id
         else "—"
     }</dd>
@@ -4277,6 +4290,7 @@ async def ops_campaign_run_detail(run_id: int) -> str:
   <h4>📣 Campaign Run #{run_id}</h4>
   <a href="/ops/campaigns" class="btn btn-sm btn-outline-secondary">← Back</a>
 </div>
+{preview_notice_block}
 {preview_actions_block}
 {error_block}
 {summary_block}
