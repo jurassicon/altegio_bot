@@ -4150,6 +4150,25 @@ async def ops_campaign_run_detail(run_id: int) -> str:
 </div>
 """
 
+    # --- Persistent recompute warning block (from last_recompute meta) ---
+    recompute_warning_block = ""
+    last_recompute = meta.get("last_recompute") or {}
+    lr_failed_count = int(last_recompute.get("booked_after_service_lookup_failed_count") or 0)
+    if lr_failed_count > 0:
+        lr_svc_ids = last_recompute.get("booked_after_service_lookup_failed_service_ids") or []
+        lr_svc_ids_str = _esc(", ".join(str(s) for s in lr_svc_ids)) if lr_svc_ids else "—"
+        lr_rec_count = int(last_recompute.get("booked_after_service_lookup_failed_record_count") or 0)
+        lr_checked_at = last_recompute.get("booked_after_service_lookup_checked_at", "")
+        lr_checked_html = f" (проверено: {_esc(str(lr_checked_at))})" if lr_checked_at else ""
+        recompute_warning_block = f"""
+<div class="alert alert-warning">
+  <strong>&#x26A0; Предупреждение пересчёта:</strong>
+  Последний пересчёт завершился с предупреждениями: часть категорий услуг не удалось проверить.
+  Booked after может быть занижен{lr_checked_html}.<br>
+  <small>Сервисы без категории: {lr_svc_ids_str}. Записей затронуто: {_esc(str(lr_rec_count))}.</small>
+</div>
+"""
+
     # --- Excluded block ---
     excluded_block = _metric_cards(
         [
@@ -4263,6 +4282,7 @@ async def ops_campaign_run_detail(run_id: int) -> str:
 {summary_block}
 {progress_block}
 {delivery_block}
+{recompute_warning_block}
 {loyalty_block}
 {excluded_block}
 {followup_block}
