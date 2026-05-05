@@ -1124,3 +1124,89 @@ async def test_recompute_attribution_counters(
     assert run.replied_count == 1
     assert run.booked_after_count == 1
     assert run.opted_out_after_count == 1
+
+
+@pytest.mark.asyncio
+async def test_recompute_warning_js_present_in_page(
+    http_client: AsyncClient,
+    sample_run: int,
+) -> None:
+    """JS warning handler for service lookup failures is present in the run detail page."""
+    response = await http_client.get(f"/ops/campaigns/{sample_run}")
+    assert response.status_code == 200
+    assert "booked_after_service_lookup_failed_count" in response.text
+    assert "alert-warning" in response.text
+    assert "may be undercounted" in response.text
+
+
+@pytest.mark.asyncio
+async def test_persistent_recompute_warning_shown_when_last_recompute_has_failures(
+    http_client: AsyncClient,
+    session_maker,
+) -> None:
+    """Persistent server-rendered warning appears on page load when last_recompute has failures (Case A)."""
+    now = datetime.now(timezone.utc)
+    async with session_maker() as session:
+        async with session.begin():
+            run = CampaignRun(
+                campaign_code="new_clients_monthly",
+                mode="send-real",
+                company_ids=[758285],
+                period_start=now.replace(day=1, hour=0, minute=0, second=0, microsecond=0),
+                period_end=now,
+                status="completed",
+                followup_enabled=False,
+                meta={
+                    "last_recompute": {
+                        "booked_after_service_lookup_failed_count": 2,
+                        "booked_after_service_lookup_failed_service_ids": [111, 222],
+                        "booked_after_service_lookup_failed_record_count": 3,
+                        "booked_after_service_lookup_checked_at": "2026-05-05T10:00:00+00:00",
+                    }
+                },
+            )
+            session.add(run)
+            await session.flush()
+            run_id = run.id
+
+    response = await http_client.get(f"/ops/campaigns/{run_id}")
+    assert response.status_code == 200
+    assert "alert-warning" in response.text
+    assert "Booked after может быть занижен" in response.text
+    assert "111" in response.text
+    assert "222" in response.text
+    assert "3" in response.text
+
+
+@pytest.mark.asyncio
+async def test_persistent_recompute_warning_absent_when_last_recompute_clean(
+    http_client: AsyncClient,
+    session_maker,
+) -> None:
+    """Persistent warning is NOT shown when last_recompute has no failures (Case B)."""
+    now = datetime.now(timezone.utc)
+    async with session_maker() as session:
+        async with session.begin():
+            run = CampaignRun(
+                campaign_code="new_clients_monthly",
+                mode="send-real",
+                company_ids=[758285],
+                period_start=now.replace(day=1, hour=0, minute=0, second=0, microsecond=0),
+                period_end=now,
+                status="completed",
+                followup_enabled=False,
+                meta={
+                    "last_recompute": {
+                        "booked_after_service_lookup_failed_count": 0,
+                        "booked_after_service_lookup_failed_service_ids": [],
+                        "booked_after_service_lookup_failed_record_count": 0,
+                    }
+                },
+            )
+            session.add(run)
+            await session.flush()
+            run_id = run.id
+
+    response = await http_client.get(f"/ops/campaigns/{run_id}")
+    assert response.status_code == 200
+    assert "Booked after может быть занижен" not in response.text

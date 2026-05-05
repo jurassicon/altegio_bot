@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Literal
+from typing import Any, Literal
 
 from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -27,6 +27,7 @@ from altegio_bot.models.models import (
     OutboxMessage,
     Record,
 )
+from altegio_bot.service_filter import LashRecordFilterResult, filter_lash_record_ids
 from altegio_bot.utils import utcnow
 
 logger = logging.getLogger(__name__)
@@ -1782,36 +1783,54 @@ async def _sync_booked_after_from_altegio_events(
     run: CampaignRun,
     recipients: list[CampaignRecipient],
     outbox_by_recipient: dict[int, "OutboxMessage"],
-) -> None:
+) -> dict[str, Any]:
     """Backfill CampaignRecipient.booked_after_at from AltegioEvent records.
 
-    For each eligible recipient without booked_after_at, finds the first
-    'record/create' AltegioEvent within the per-recipient attribution window
-    that links (via Record) to the same client.
+    Booked-after semantics:
+    A recipient is counted as booked_after only when the client creates a new
+    booking that contains at least one lash service within the attribution
+    window. The metric is based on the booking creation event time, not
+    appointment start. Visit attendance, payment and no-show status are
+    intentionally not checked.
 
     Eligibility (positive send signal required — see _is_booked_after_eligible).
     Attribution window per recipient:
       start = max(run.completed_at, recipient.sent_at)  — never before campaign end
       end   = start + run.attribution_window_days
     Matching priority: Record.client_id → Record.altegio_client_id (fallback).
-    Deleted records (is_deleted=True) are excluded.
-    Legacy NULL is_deleted values are treated as not deleted via COALESCE.
+    Record.is_deleted is NOT filtered: the create event proves the booking was
+    made regardless of later cancellation or deletion status.
     Does nothing if run.completed_at is None.
+
+    Returns a diagnostics dict with keys:
+      lookup_failed_service_ids: set[int] — service IDs where Altegio lookup failed.
+      lookup_failed_record_ids:  set[int] — candidate record IDs excluded due to
+                                            lookup failure (not confirmed non-lash).
+    Lash lookup runs only on records pre-filtered to eligible recipients and their
+    per-recipient attribution windows — unrelated bookings are never checked.
     """
+    _empty: dict[str, Any] = {
+        "lookup_failed_service_ids": set(),
+        "lookup_failed_record_ids": set(),
+    }
+
     if run.completed_at is None:
-        return
+        return _empty
 
     window_days = timedelta(days=run.attribution_window_days)
 
-    # Only positive-send recipients without booked_after_at
-    eligible = [
-        r
-        for r in recipients
-        if r.booked_after_at is None and _is_booked_after_eligible(r, outbox_by_recipient.get(r.id))
-    ]
+    # All positive-send recipients — NOT filtered by booked_after_at.
+    # Full recompute: existing booked_after_at (including stale non-lash attributions)
+    # will be overwritten by Phase 3. Only eligibility gates are checked here.
+    eligible = [r for r in recipients if _is_booked_after_eligible(r, outbox_by_recipient.get(r.id))]
+
+    eligible_ids = {r.id for r in eligible}
+    for r in recipients:
+        if r.id not in eligible_ids:
+            r.booked_after_at = None
 
     if not eligible:
-        return
+        return _empty
 
     company_ids = list({r.company_id for r in eligible})
 
@@ -1840,6 +1859,7 @@ async def _sync_booked_after_from_altegio_events(
     stmt = (
         select(
             AltegioEvent.received_at,
+            Record.id.label("record_id"),
             Record.company_id,
             Record.client_id,
             Record.altegio_client_id,
@@ -1856,26 +1876,69 @@ async def _sync_booked_after_from_altegio_events(
         .where(AltegioEvent.event_status == "create")
         .where(AltegioEvent.received_at > overall_start)
         .where(AltegioEvent.received_at <= overall_end)
-        # Treat legacy NULL is_deleted values as not deleted.
-        .where(func.coalesce(Record.is_deleted, False).is_(False))
+        # is_deleted is intentionally NOT filtered: the create event proves the
+        # booking was made regardless of later cancellation or deletion status.
         .order_by(AltegioEvent.received_at.asc())
     )
 
-    rows = (await session.execute(stmt)).all()
+    raw_rows = (await session.execute(stmt)).all()
 
-    for row in rows:
+    # Phase 1: recipient + per-recipient window filtering.
+    # Only rows belonging to eligible recipients within their exact window are
+    # kept as candidates. Lash lookup is deferred to Phase 2 and will run
+    # only on these candidate record_ids — unrelated bookings are never checked.
+    candidate_rows: list[tuple[CampaignRecipient, Any]] = []
+    for row in raw_rows:
         r: CampaignRecipient | None = None
         if row.client_id is not None:
             r = by_client.get((row.company_id, row.client_id))
         if r is None and row.altegio_client_id is not None:
             r = by_altegio_client.get((row.company_id, int(row.altegio_client_id)))
+        if r is None:
+            continue
+        attr_start = _attr_start(r)
+        attr_end = attr_start + window_days
+        if not (row.received_at > attr_start and row.received_at <= attr_end):
+            continue
+        candidate_rows.append((r, row))
 
-        if r is not None and r.booked_after_at is None:
-            # Per-recipient window check (start may differ from overall_start)
-            attr_start = _attr_start(r)
-            attr_end = attr_start + window_days
-            if row.received_at > attr_start and row.received_at <= attr_end:
-                r.booked_after_at = row.received_at
+    # Phase 2: lash service lookup on candidate record_ids only.
+    # Skipped (no lookups) when there are no candidate rows, but Phase 3 still
+    # runs to clear any stale non-lash booked_after_at on eligible recipients.
+    lash_record_ids: set[int] = set()
+    all_failed_svc_ids: set[int] = set()
+    all_failed_rec_ids: set[int] = set()
+    if candidate_rows:
+        record_ids_by_company: dict[int, set[int]] = {}
+        for _r, row in candidate_rows:
+            record_ids_by_company.setdefault(row.company_id, set()).add(row.record_id)
+
+        for cid, rids in record_ids_by_company.items():
+            result: LashRecordFilterResult = await filter_lash_record_ids(
+                session, company_id=cid, record_ids=list(rids)
+            )
+            lash_record_ids.update(result.lash_record_ids)
+            all_failed_svc_ids.update(result.lookup_failed_service_ids)
+            all_failed_rec_ids.update(result.lookup_failed_record_ids)
+
+    # Derive first confirmed-lash event per eligible recipient.
+    # candidate_rows already ordered by received_at ASC — first match wins.
+    first_lash_by_recipient: dict[int, datetime] = {}
+    for r, row in candidate_rows:
+        if row.record_id in lash_record_ids and r.id not in first_lash_by_recipient:
+            first_lash_by_recipient[r.id] = row.received_at
+
+    # Phase 3: full recompute — set or clear booked_after_at for every eligible
+    # recipient. Stale non-lash attributions are corrected: if no confirmed lash
+    # booking exists the value becomes None. Lookup failures also result in None
+    # (undercount + explicit diagnostics is preferable to stale overcount).
+    for r in eligible:
+        r.booked_after_at = first_lash_by_recipient.get(r.id)
+
+    return {
+        "lookup_failed_service_ids": all_failed_svc_ids,
+        "lookup_failed_record_ids": all_failed_rec_ids,
+    }
 
 
 def _sync_recipient_statuses(
@@ -2007,7 +2070,26 @@ async def recompute_campaign_run_stats(
     _backfill_recipient_read_at(recipients, outbox_by_recipient)
 
     # Step 4b: backfill booked_after_at from AltegioEvent record/create events
-    await _sync_booked_after_from_altegio_events(session, run, recipients, outbox_by_recipient)
+    booked_after_diags = await _sync_booked_after_from_altegio_events(session, run, recipients, outbox_by_recipient)
+    failed_svc_ids: set[int] = booked_after_diags.get("lookup_failed_service_ids", set())
+    failed_rec_ids: set[int] = booked_after_diags.get("lookup_failed_record_ids", set())
+    # Always write last_recompute so a successful recompute clears stale failure data.
+    meta = dict(run.meta or {})
+    meta["last_recompute"] = {
+        "booked_after_service_lookup_failed_count": len(failed_svc_ids),
+        "booked_after_service_lookup_failed_service_ids": sorted(failed_svc_ids),
+        "booked_after_service_lookup_failed_record_count": len(failed_rec_ids),
+        "booked_after_service_lookup_failed_record_ids": sorted(failed_rec_ids),
+        "booked_after_service_lookup_checked_at": utcnow().isoformat(),
+    }
+    run.meta = meta
+    if failed_svc_ids:
+        logger.warning(
+            "recompute run_id=%d: %d service lookup failure(s) service_ids=%s",
+            run_id,
+            len(failed_svc_ids),
+            sorted(failed_svc_ids),
+        )
 
     # Step 5: compute outbox_status_counts from resolved map (Python, no SQL)
     outbox_status_counts: dict[str, int] = {}
@@ -2058,6 +2140,10 @@ async def recompute_campaign_run_stats(
         "cards_issued_count": run.cards_issued_count,
         "cards_deleted_count": run.cards_deleted_count,
         "cleanup_failed_count": run.cleanup_failed_count,
+        "booked_after_service_lookup_failed_count": len(failed_svc_ids),
+        "booked_after_service_lookup_failed_service_ids": sorted(failed_svc_ids),
+        "booked_after_service_lookup_failed_record_count": len(failed_rec_ids),
+        "booked_after_service_lookup_failed_record_ids": sorted(failed_rec_ids),
     }
 
 
