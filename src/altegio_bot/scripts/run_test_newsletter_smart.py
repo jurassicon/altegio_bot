@@ -48,6 +48,7 @@ from altegio_bot.db import SessionLocal
 from altegio_bot.meta_templates import (
     NEWSLETTER_FOLLOWUP_TEMPLATE,
     NEWSLETTER_MONTHLY_TEMPLATE,
+    build_template_params,
     requires_image_header,
 )
 from altegio_bot.models.models import OutboxMessage, SmartTestRun
@@ -71,6 +72,35 @@ _LOYALTY_CARD_PREFIX = "Kundenkarte #"
 _PASS_FOR_DELIVERED: frozenset[str] = frozenset({"delivered", "read"})
 _PASS_FOR_SENT: frozenset[str] = frozenset({"sent", "delivered", "read"})
 _FAIL_STATUS = "failed"
+
+
+# ---------------------------------------------------------------------------
+# Template parameter helpers
+# ---------------------------------------------------------------------------
+
+
+def _build_smart_template_params(
+    template_name: str,
+    *,
+    client_name: str,
+    booking_link: str,
+    loyalty_card_text: str,
+) -> list[str]:
+    """Build the correct positional params for *template_name* using the shared registry.
+
+    Delegates to ``build_template_params`` so the smart-test script always uses
+    the same param order as the production outbox_worker — preventing silently
+    sending 3 params to a 2-param template (or vice-versa).
+
+    Returns an empty list for unknown template names; callers should treat that
+    as a configuration error and abort before making any Meta API call.
+    """
+    ctx = {
+        "client_name": client_name,
+        "booking_link": booking_link,
+        "loyalty_card_text": loyalty_card_text,
+    }
+    return build_template_params(template_name, ctx)
 
 
 # ---------------------------------------------------------------------------
@@ -561,7 +591,20 @@ async def run_smart_test(
     # -----------------------------------------------------------------------
     # D) Send WhatsApp template message
     # -----------------------------------------------------------------------
-    template_params = [client_name, booking_link, loyalty_card_text]
+    template_params = _build_smart_template_params(
+        template_name,
+        client_name=client_name,
+        booking_link=booking_link,
+        loyalty_card_text=loyalty_card_text,
+    )
+    if not template_params:
+        logger.error(
+            "FAIL: unsupported or unknown template parameters for template=%r. "
+            "Add a build_template_params branch in meta_templates.py for this template.",
+            template_name,
+        )
+        await loyalty.aclose()
+        return 2
     provider_message_id: str | None = None
 
     try:
@@ -807,7 +850,7 @@ async def main() -> None:
     )
     parser.add_argument(
         "--template",
-        default="kitilash_ka_newsletter_new_clients_monthly_v1",
+        default=NEWSLETTER_MONTHLY_TEMPLATE,
     )
     parser.add_argument(
         "--expect-status",

@@ -8,6 +8,7 @@ import respx
 
 from altegio_bot.meta_templates import NEWSLETTER_FOLLOWUP_TEMPLATE, NEWSLETTER_MONTHLY_TEMPLATE
 from altegio_bot.scripts.run_test_newsletter_smart import (
+    _build_smart_template_params,
     _evaluate_outcome,
     _gen_card_number,
     _send_template_direct,
@@ -322,3 +323,83 @@ async def test_run_smart_test_fails_fast_when_followup_header_url_missing(monkey
     )
 
     assert exit_code == 2, f"Expected exit_code=2 (fail-fast), got {exit_code}"
+
+
+# ---------------------------------------------------------------------------
+# _build_smart_template_params — param count by template type
+# ---------------------------------------------------------------------------
+
+_PARAMS_KW = {
+    "client_name": "Anna",
+    "booking_link": "https://booking.link/",
+    "loyalty_card_text": "Kundenkarte #001",
+}
+
+
+def test_build_smart_template_params_monthly_has_three_params() -> None:
+    """Monthly template requires 3 params: client_name, booking_link, loyalty_card_text."""
+    params = _build_smart_template_params(NEWSLETTER_MONTHLY_TEMPLATE, **_PARAMS_KW)
+    assert len(params) == 3, f"Expected 3 params for monthly, got {len(params)}: {params}"
+    assert params[0] == "Anna"
+    assert params[1] == "https://booking.link/"
+    assert params[2] == "Kundenkarte #001"
+
+
+def test_build_smart_template_params_followup_has_two_params() -> None:
+    """Followup template requires only 2 params: client_name, booking_link (no card text)."""
+    params = _build_smart_template_params(NEWSLETTER_FOLLOWUP_TEMPLATE, **_PARAMS_KW)
+    assert len(params) == 2, f"Expected 2 params for followup, got {len(params)}: {params}"
+    assert params[0] == "Anna"
+    assert params[1] == "https://booking.link/"
+    assert "Kundenkarte #001" not in params, "loyalty_card_text must NOT appear in followup params"
+
+
+def test_build_smart_template_params_unknown_template_returns_empty() -> None:
+    """Unknown template name must return [] — caller must treat this as a config error."""
+    params = _build_smart_template_params("unknown_template_xyz", **_PARAMS_KW)
+    assert params == [], f"Expected [] for unknown template, got {params}"
+
+
+# ---------------------------------------------------------------------------
+# _send_template_direct — followup with header uses exactly 2 body params
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_send_template_direct_followup_with_header_uses_two_body_params() -> None:
+    """Followup template with header: payload must have HEADER + BODY with 2 params."""
+    header_url = "https://cdn.example.com/followup_header.jpg"
+    captured: list[dict] = []
+
+    with respx.mock:
+
+        async def _handler(request: httpx.Request) -> httpx.Response:
+            import json as _json
+
+            captured.append(_json.loads(request.content))
+            return httpx.Response(200, json={"messages": [{"id": "wamid.followup"}]})
+
+        respx.post(_SEND_URL).mock(side_effect=_handler)
+
+        await _send_template_direct(
+            phone_e164="+491234567890",
+            template_name=NEWSLETTER_FOLLOWUP_TEMPLATE,
+            language="de",
+            params=["Anna", "https://booking.link/"],
+            access_token=_ACCESS_TOKEN,
+            graph_url=_GRAPH_URL,
+            api_version=_API_VERSION,
+            phone_number_id=_PHONE_NUMBER_ID,
+            header_image_url=header_url,
+        )
+
+    assert len(captured) == 1
+    components = captured[0]["template"]["components"]
+    assert len(components) == 2, f"Expected HEADER + BODY, got {len(components)}"
+    assert components[0]["type"] == "header"
+    assert components[0]["parameters"][0]["image"]["link"] == header_url
+    assert components[1]["type"] == "body"
+    body_params = components[1]["parameters"]
+    assert len(body_params) == 2, f"Followup BODY must have 2 params, got {len(body_params)}: {body_params}"
+    assert body_params[0]["text"] == "Anna"
+    assert body_params[1]["text"] == "https://booking.link/"
