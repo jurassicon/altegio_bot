@@ -276,6 +276,9 @@ class _FakeSession:
     async def execute(self, stmt: Any) -> _FakeScalarResult:
         return _FakeScalarResult()
 
+    async def get(self, model: Any, pk: Any) -> None:
+        return None
+
 
 def _base_patches(
     monkeypatch: Any,
@@ -425,7 +428,8 @@ def test_marketing_job_suppressed_when_131026_threshold_reached(
     job_type: str,
 ) -> None:
     """Маркетинговый job сохраняет pre-send suppression при repeated 131026."""
-    job = _FakeJob(id=1, company_id=758285, job_type=job_type)
+    _payload = {"campaign_recipient_id": 99999} if job_type == "newsletter_new_clients_followup" else {}
+    job = _FakeJob(id=1, company_id=758285, job_type=job_type, payload=_payload)
     record = _record_for_job_type(job_type)
     count_mock = _base_patches(monkeypatch, job=job, n_failures=2, record=record)
     _patch_marketing_guards(monkeypatch)
@@ -488,7 +492,12 @@ def test_ops_suppressed_row_has_expected_fields(monkeypatch: Any) -> None:
     - _error_cell() checks error.startswith('suppressed_131026') for badge
     - row_class is set to 'suppressed' for CSS highlight
     """
-    job = _FakeJob(id=5, company_id=758285, job_type="newsletter_new_clients_followup")
+    job = _FakeJob(
+        id=5,
+        company_id=758285,
+        job_type="newsletter_new_clients_followup",
+        payload={"campaign_recipient_id": 99999},
+    )
     _base_patches(monkeypatch, job=job, n_failures=2)
     session = _FakeSession()
     monkeypatch.setattr(ow, "safe_send", AsyncMock(return_value=("x", None)))

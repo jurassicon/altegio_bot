@@ -224,6 +224,12 @@ class _FakeSession:
     def add(self, obj: Any) -> None:
         self.added.append(obj)
 
+    async def get(self, model: Any, pk: Any) -> None:
+        return None
+
+    async def flush(self) -> None:
+        pass
+
 
 @pytest.mark.asyncio
 async def test_outbox_worker_injects_loyalty_card_text_for_newsletter(monkeypatch: Any) -> None:
@@ -480,6 +486,7 @@ async def test_crm_only_followup_newsletter_uses_contact_name_as_param1(monkeypa
             "kind": FOLLOWUP_JOB_TYPE,
             "contact_name": "Hana Novak",
             "phone_e164": "+491777000111",
+            "campaign_recipient_id": 99999,
         },
     )
     session = _FakeSession()
@@ -775,6 +782,7 @@ async def test_outbox_worker_fails_fast_when_followup_header_url_missing(monkeyp
             "kind": FOLLOWUP_JOB_TYPE,
             "contact_name": "Test User",
             "phone_e164": "+491111222444",
+            "campaign_recipient_id": 99999,
         },
     )
     session = _FakeSession()
@@ -857,6 +865,7 @@ async def test_outbox_worker_passes_header_url_for_followup(monkeypatch: Any) ->
             "kind": FOLLOWUP_JOB_TYPE,
             "contact_name": "Test User",
             "phone_e164": "+491111222666",
+            "campaign_recipient_id": 99999,
         },
     )
     session = _FakeSession()

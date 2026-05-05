@@ -81,6 +81,12 @@ class _FakeSession:
             setattr(obj, "id", self._pk)
         self.added.append(obj)
 
+    async def get(self, model: Any, pk: Any) -> None:
+        return None
+
+    async def flush(self) -> None:
+        pass
+
 
 def _make_render_result(body: str = "Hallo Anna! Karte: 123") -> tuple:
     """Return (body, sender_id, lang, msg_ctx) — same shape as _render_message."""
@@ -338,6 +344,7 @@ async def test_followup_local_client_passes_company_id(monkeypatch: Any) -> None
         payload={
             "kind": "newsletter_new_clients_followup",
             "template_name": "newsletter_new_clients_followup",
+            "campaign_recipient_id": 99999,
         },
     )
     client = _FakeClient(id=77, phone_e164="+4915288800099", display_name="Elena Kaiser")

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 from unittest.mock import AsyncMock
@@ -28,6 +28,7 @@ class FakeJob:
     attempts: int = 0
     max_attempts: int = 5
     locked_at: datetime | None = None
+    payload: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -44,6 +45,9 @@ class FakeSession:
     def add(self, obj: Any) -> None:
         self.added.append(obj)
 
+    async def get(self, model: Any, pk: Any) -> None:
+        return None
+
 
 @pytest.mark.parametrize("job_type", ow.MARKETING_JOB_TYPES)
 def test_outbox_skips_marketing_when_opted_out(monkeypatch: Any, job_type: str) -> None:
@@ -57,6 +61,7 @@ def test_outbox_skips_marketing_when_opted_out(monkeypatch: Any, job_type: str) 
         run_at=fixed_now,
         record_id=None,
         client_id=1,
+        payload={"campaign_recipient_id": 99999} if job_type == "newsletter_new_clients_followup" else {},
     )
 
     async def fake_load_job(session: Any, job_id: int) -> Any:

@@ -143,6 +143,9 @@ class _FakeSession:
     def add(self, obj: Any) -> None:
         self.added.append(obj)
 
+    async def get(self, model: Any, pk: Any) -> None:
+        return None
+
 
 def _base_render_ctx(client_name: str = "Anna") -> dict:
     return {
@@ -298,6 +301,7 @@ async def test_followup_wrong_param_count_fails_locally(monkeypatch: Any) -> Non
             "kind": FOLLOWUP_JOB,
             "contact_name": "Hana Novak",
             "phone_e164": "+491777000111",
+            "campaign_recipient_id": 99999,
         },
     )
     session = _FakeSession()
