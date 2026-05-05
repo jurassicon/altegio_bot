@@ -1412,8 +1412,12 @@ async def test_campaign_new_page_has_outstanding_cards_status_container(
     assert response.status_code == 200
     text = response.text
 
-    # Контейнер для результата операции удаления
-    assert "outstanding-delete-result" in text
+    # outstanding-delete-result стоит ДО outstanding-cards-section (P1)
+    idx_result = text.find('id="outstanding-delete-result"')
+    idx_section = text.find('id="outstanding-cards-section"')
+    assert idx_result != -1, "outstanding-delete-result не найден в HTML"
+    assert idx_section != -1, "outstanding-cards-section не найден в HTML"
+    assert idx_result < idx_section, "outstanding-delete-result должен быть расположен перед outstanding-cards-section"
 
     # Кнопка удаления выбранных карт
     assert "btn-delete-outstanding" in text
@@ -1424,15 +1428,23 @@ async def test_campaign_new_page_has_outstanding_cards_status_container(
     assert "failed_count" in text
     assert "skipped_count" in text
 
+    # Используется f.card_id (с fallback на f.loyalty_card_id) — P2
+    assert "f.card_id" in text
+
+    # Экранирование detail и exception — P3
+    delete_fn = text[text.find("async function deleteOutstandingCards") :][:3000]
+    assert "escHtml(String(detail))" in delete_fn
+    assert "escHtml(String(e))" in delete_fn
+
     # Русские UX-тексты для bulk-delete
     assert "Удаляем выбранные карты" in text
     assert "Удалено:" in text
     assert "Выберите хотя бы одну карту для удаления" in text
     assert "Не удалось удалить карты" in text
+    assert "Нет карт для удаления" in text
 
-    # Кнопка сбрасывается в finally-блоке (текст кнопки возвращается)
-    delete_fn = text[text.find("async function deleteOutstandingCards") :][:3000]
-    assert "finally" in delete_fn
+    # Кнопка disabled до конца reload (нет finally, сброс явный в каждом пути) — P4
+    assert "finally" not in delete_fn
     assert "btn.disabled = false" in delete_fn
 
     # После успешного удаления перезагружаются outstanding cards

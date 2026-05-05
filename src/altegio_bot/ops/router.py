@@ -2977,6 +2977,7 @@ async def ops_new_clients_campaign_page(request: Request) -> str:
 </div>
 
 <!-- ========== КАРТЫ ПРОШЛЫХ ПЕРИОДОВ ========== -->
+<div id="outstanding-delete-result" class="mb-2"></div>
 <div id="outstanding-cards-section" class="card mb-3 border-warning d-none">
   <div class="card-header fw-bold d-flex justify-content-between align-items-center">
     <span>🗑️ Карты лояльности прошлых периодов</span>
@@ -2996,7 +2997,6 @@ async def ops_new_clients_campaign_page(request: Request) -> str:
         🗑️ Удалить выбранные
       </button>
     </div>
-    <div id="outstanding-delete-result" class="mt-2"></div>
   </div>
 </div>
 
@@ -3902,16 +3902,18 @@ async function deleteOutstandingCards() {{
     if (!resp.ok) {{
       let detail = resp.statusText;
       try {{ const err = await resp.json(); detail = err.detail || detail; }} catch (_) {{}}
-      setAlert("outstanding-delete-result", "danger", "Не удалось удалить карты. " + detail);
+      setAlert("outstanding-delete-result", "danger",
+        "Не удалось удалить карты. " + escHtml(String(detail)));
+      btn.disabled = false;
+      btn.textContent = "🗑️ Удалить выбранные";
       return;
     }}
     data = await resp.json();
   }} catch (e) {{
-    setAlert("outstanding-delete-result", "danger", "Ошибка запроса: " + e);
-    return;
-  }} finally {{
+    setAlert("outstanding-delete-result", "danger", "Ошибка запроса: " + escHtml(String(e)));
     btn.disabled = false;
     btn.textContent = "🗑️ Удалить выбранные";
+    return;
   }}
 
   const msg = "Удалено: " + data.deleted_count
@@ -3921,7 +3923,8 @@ async function deleteOutstandingCards() {{
   let alertMsg = escHtml(msg);
   if (data.failed_count > 0) {{
     const failDetails = (data.failed || []).map(function(f) {{
-      return "card_id=" + escHtml(String(f.loyalty_card_id))
+      const cardId = f.card_id || f.loyalty_card_id || "";
+      return "card_id=" + escHtml(String(cardId))
         + " recipient=" + escHtml(String(f.recipient_id))
         + ": " + escHtml(String(f.error));
     }}).join("; ");
@@ -3937,6 +3940,9 @@ async function deleteOutstandingCards() {{
         alertMsg + "<br><small>Нет карт для удаления.</small>");
     }}
   }}
+
+  btn.disabled = false;
+  btn.textContent = "🗑️ Удалить выбранные";
 }}
 </script>
 """
