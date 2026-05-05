@@ -4,7 +4,7 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from sqlalchemy import and_, select, update
+from sqlalchemy import and_, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.campaigns.runner import FOLLOWUP_JOB_TYPE
@@ -372,6 +372,9 @@ async def _find_record_create_event(
     Joins AltegioEvent with Record to match by client identity.
     Primary match: Record.client_id == recipient.client_id.
     Fallback: Record.altegio_client_id == recipient.altegio_client_id (when client_id is None).
+
+    is_deleted is intentionally NOT filtered: a record created after the campaign but later
+    cancelled/deleted still means the marketing goal was achieved — follow-up must not be sent.
     """
     if recipient.client_id is not None:
         client_cond = Record.client_id == recipient.client_id
@@ -391,7 +394,6 @@ async def _find_record_create_event(
         .where(AltegioEvent.resource == "record")
         .where(AltegioEvent.event_status == "create")
         .where(AltegioEvent.received_at > attribution_start)
-        .where(Record.is_deleted.is_(False))
         .where(client_cond)
         .order_by(AltegioEvent.received_at.asc())
         .limit(1)
@@ -417,7 +419,7 @@ async def _has_future_record(
         select(Record.id)
         .where(Record.company_id == company_id)
         .where(Record.starts_at > now)
-        .where(Record.is_deleted.is_(False))
+        .where(func.coalesce(Record.is_deleted, False).is_(False))
         .where(client_cond)
         .limit(1)
     )
@@ -478,15 +480,28 @@ async def check_followup_final_eligibility(
         )
 
     # 3.2 — current opt-out
+    # Primary: look up by local client_id.
+    # Fallback: CRM-only recipients (client_id=None) — look up by phone+company.
     if recipient.client_id is not None:
-        client = await session.get(Client, recipient.client_id)
-        if client is not None and client.wa_opted_out:
-            return FollowupFinalEligibilityResult(
-                eligible=False,
-                skip_reason="Follow-up skipped: client has opted out",
-                followup_status="skipped_opted_out",
-                booked_after_at=None,
-            )
+        opt_client = await session.get(Client, recipient.client_id)
+    elif recipient.phone_e164:
+        opt_result = await session.execute(
+            select(Client)
+            .where(Client.company_id == recipient.company_id)
+            .where(Client.phone_e164 == recipient.phone_e164)
+            .limit(1)
+        )
+        opt_client = opt_result.scalar_one_or_none()
+    else:
+        opt_client = None
+
+    if opt_client is not None and opt_client.wa_opted_out:
+        return FollowupFinalEligibilityResult(
+            eligible=False,
+            skip_reason="Follow-up skipped: client has opted out",
+            followup_status="skipped_opted_out",
+            booked_after_at=None,
+        )
 
     # Without any client identifier we cannot query records or events.
     has_client_id = recipient.client_id is not None
