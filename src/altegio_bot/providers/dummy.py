@@ -62,15 +62,17 @@ class DummyProvider(WhatsAppProvider):
         fallback_text: str = "",
         *,
         contact_name: str | None = None,
+        header_image_url: str | None = None,
     ) -> str:
         provider_message_id = f"dummy-tpl-{uuid4()}"
         logger.info(
-            "Dummy send_template sender_id=%s phone=%s template=%s lang=%s params=%s msg_id=%s",
+            "Dummy send_template sender_id=%s phone=%s template=%s lang=%s params=%s header=%s msg_id=%s",
             sender_id,
             phone_e164,
             template_name,
             language,
             params,
+            header_image_url,
             provider_message_id,
         )
         return provider_message_id
@@ -113,12 +115,17 @@ async def safe_send_template(
     company_id: int = 0,
     staff_id: int | None = None,
     contact_name: str | None = None,
+    header_image_url: str | None = None,
 ) -> tuple[str | None, str | None]:
     if not _real_send_allowed(provider):
         return None, "Real send disabled"
 
     try:
-        kwargs: dict[str, object] = {"fallback_text": fallback_text, "contact_name": contact_name}
+        kwargs: dict[str, object] = {
+            "fallback_text": fallback_text,
+            "contact_name": contact_name,
+            "header_image_url": header_image_url,
+        }
         if _supports_mirror(provider):
             kwargs["company_id"] = company_id
             kwargs["staff_id"] = staff_id

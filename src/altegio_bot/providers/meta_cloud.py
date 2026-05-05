@@ -134,6 +134,7 @@ class MetaCloudProvider(WhatsAppProvider):
         fallback_text: str = "",
         *,
         contact_name: str | None = None,
+        header_image_url: str | None = None,
     ) -> str:
         """Send an approved Meta template message."""
         if not self._allow_real_send:
@@ -141,6 +142,21 @@ class MetaCloudProvider(WhatsAppProvider):
 
         phone_number_id = await self._get_phone_number_id(sender_id)
         to_number = _strip_plus(phone_e164)
+
+        components: list[dict[str, Any]] = []
+        if header_image_url:
+            components.append(
+                {
+                    "type": "header",
+                    "parameters": [{"type": "image", "image": {"link": header_image_url}}],
+                }
+            )
+        components.append(
+            {
+                "type": "body",
+                "parameters": [{"type": "text", "text": p} for p in params],
+            }
+        )
 
         url = f"{self._graph_url}/{self._api_version}/{phone_number_id}/messages"
         payload: dict[str, Any] = {
@@ -150,12 +166,7 @@ class MetaCloudProvider(WhatsAppProvider):
             "template": {
                 "name": template_name,
                 "language": {"code": language},
-                "components": [
-                    {
-                        "type": "body",
-                        "parameters": [{"type": "text", "text": p} for p in params],
-                    }
-                ],
+                "components": components,
             },
         }
 

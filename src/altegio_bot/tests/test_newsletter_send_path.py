@@ -38,7 +38,14 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 import altegio_bot.workers.outbox_worker as ow
-from altegio_bot.meta_templates import build_template_params, resolve_meta_template
+from altegio_bot.meta_templates import (
+    NEWSLETTER_FOLLOWUP_TEMPLATE,
+    NEWSLETTER_IMAGE_HEADER_TEMPLATES,
+    NEWSLETTER_MONTHLY_TEMPLATE,
+    build_template_params,
+    requires_image_header,
+    resolve_meta_template,
+)
 from altegio_bot.ops.campaigns_api import normalize_meta_template_name
 
 KA = 758285
@@ -276,6 +283,7 @@ async def test_outbox_worker_injects_loyalty_card_text_for_newsletter(monkeypatc
 
     # use_template = True (template mode)
     monkeypatch.setattr(ow.settings, "whatsapp_send_mode", "template")
+    monkeypatch.setattr(ow.settings, "meta_newsletter_monthly_header_image_url", "https://cdn.example.com/h.jpg")
 
     # Provide phone via payload (CRM-only client path)
     job.payload["phone_e164"] = "+491234567890"
@@ -344,6 +352,7 @@ async def test_outbox_worker_newsletter_ra_uses_v1_template(monkeypatch: Any) ->
 
     monkeypatch.setattr(ow, "safe_send_template", _fake_safe_send_template)
     monkeypatch.setattr(ow.settings, "whatsapp_send_mode", "template")
+    monkeypatch.setattr(ow.settings, "meta_newsletter_monthly_header_image_url", "https://cdn.example.com/h.jpg")
 
     provider = MagicMock()
     await ow._run_job_logic(session, job, provider=provider)  # type: ignore[arg-type]
@@ -437,6 +446,7 @@ async def test_crm_only_monthly_newsletter_uses_contact_name_as_param1(monkeypat
 
     monkeypatch.setattr(ow, "safe_send_template", _fake_send_template)
     monkeypatch.setattr(ow.settings, "whatsapp_send_mode", "template")
+    monkeypatch.setattr(ow.settings, "meta_newsletter_monthly_header_image_url", "https://cdn.example.com/h.jpg")
 
     provider = MagicMock()
     await ow._run_job_logic(session, job, provider=provider)  # type: ignore[arg-type]
@@ -491,6 +501,7 @@ async def test_crm_only_followup_newsletter_uses_contact_name_as_param1(monkeypa
 
     monkeypatch.setattr(ow, "safe_send_template", _fake_send_template)
     monkeypatch.setattr(ow.settings, "whatsapp_send_mode", "template")
+    monkeypatch.setattr(ow.settings, "meta_newsletter_followup_header_image_url", "https://cdn.example.com/h.jpg")
 
     provider = MagicMock()
     await ow._run_job_logic(session, job, provider=provider)  # type: ignore[arg-type]
@@ -547,6 +558,7 @@ async def test_local_client_monthly_newsletter_uses_display_name_not_payload(mon
 
     monkeypatch.setattr(ow, "safe_send_template", _fake_send_template)
     monkeypatch.setattr(ow.settings, "whatsapp_send_mode", "template")
+    monkeypatch.setattr(ow.settings, "meta_newsletter_monthly_header_image_url", "https://cdn.example.com/h.jpg")
 
     provider = MagicMock()
     await ow._run_job_logic(session, job, provider=provider)  # type: ignore[arg-type]
@@ -607,6 +619,8 @@ async def test_crm_only_no_contact_name_fails_preflight(monkeypatch: Any) -> Non
 
     monkeypatch.setattr(ow, "safe_send_template", _fake_send_template)
     monkeypatch.setattr(ow.settings, "whatsapp_send_mode", "template")
+    # Header URL is set so the header check passes; preflight catches empty client_name.
+    monkeypatch.setattr(ow.settings, "meta_newsletter_monthly_header_image_url", "https://cdn.example.com/h.jpg")
 
     provider = MagicMock()
     await ow._run_job_logic(session, job, provider=provider)  # type: ignore[arg-type]
@@ -619,3 +633,318 @@ async def test_crm_only_no_contact_name_fails_preflight(monkeypatch: Any) -> Non
     assert "Local template validation failed" in job.last_error, (
         f"last_error must indicate local validation failure, got: {job.last_error!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# 7. Image header support — requires_image_header() and NEWSLETTER_IMAGE_HEADER_TEMPLATES
+# ---------------------------------------------------------------------------
+
+
+def test_requires_image_header_true_for_monthly() -> None:
+    assert requires_image_header(NEWSLETTER_MONTHLY_TEMPLATE) is True
+
+
+def test_requires_image_header_true_for_followup() -> None:
+    assert requires_image_header(NEWSLETTER_FOLLOWUP_TEMPLATE) is True
+
+
+def test_requires_image_header_false_for_other_templates() -> None:
+    for name in (
+        "kitilash_ka_record_created_v1",
+        "kitilash_ka_reminder_24h_v1",
+        "kitilash_ka_review_3d_v1",
+        "kitilash_ka_repeat_10d_v1",
+        "kitilash_ka_comeback_3d_v1",
+    ):
+        assert requires_image_header(name) is False, f"requires_image_header({name!r}) must be False"
+
+
+def test_newsletter_image_header_templates_contains_both() -> None:
+    assert NEWSLETTER_MONTHLY_TEMPLATE in NEWSLETTER_IMAGE_HEADER_TEMPLATES
+    assert NEWSLETTER_FOLLOWUP_TEMPLATE in NEWSLETTER_IMAGE_HEADER_TEMPLATES
+    assert len(NEWSLETTER_IMAGE_HEADER_TEMPLATES) == 2
+
+
+# ---------------------------------------------------------------------------
+# 8. outbox_worker fails fast when header URL not configured
+# ---------------------------------------------------------------------------
+
+_HEADER_URL = "https://cdn.example.com/newsletter_header.jpg"
+
+
+def _base_patches(monkeypatch: Any) -> None:
+    monkeypatch.setattr(ow, "_find_success_outbox", AsyncMock(return_value=None))
+    monkeypatch.setattr(ow, "_find_existing_outbox", AsyncMock(return_value=None))
+    monkeypatch.setattr(ow, "_load_record", AsyncMock(return_value=None))
+    monkeypatch.setattr(ow, "_load_client", AsyncMock(return_value=None))
+    monkeypatch.setattr(ow, "_apply_rate_limit", AsyncMock(return_value=None))
+    monkeypatch.setattr(ow, "_count_131026_failures", AsyncMock(return_value=0))
+    monkeypatch.setattr(ow.settings, "whatsapp_send_mode", "template")
+
+
+async def _fake_render(session: Any, *, company_id: int, template_code: str, record: Any, client: Any) -> tuple:
+    ctx = {
+        "client_name": "Test User",
+        "booking_link": "https://n813709.alteg.io/",
+        "loyalty_card_text": "Kundenkarte #0000000000000001",
+        "sender_id": 1,
+        "sender_code": "default",
+        "staff_name": "",
+        "date": "",
+        "time": "",
+        "services": "",
+        "primary_service": "",
+        "total_cost": "0.00",
+        "short_link": "",
+        "unsubscribe_link": "",
+        "pre_appointment_notes": "",
+    }
+    return "Hallo {{1}}, ...", 1, "de", ctx
+
+
+@pytest.mark.asyncio
+async def test_outbox_worker_fails_fast_when_monthly_header_url_missing(monkeypatch: Any) -> None:
+    """Worker must fail the job immediately when NEWSLETTER_MONTHLY header URL is not set."""
+    send_calls: list[Any] = []
+
+    job = _FakeJob(
+        id=9001,
+        company_id=KA,
+        job_type=JOB_TYPE,
+        payload={
+            "kind": JOB_TYPE,
+            "contact_name": "Test User",
+            "loyalty_card_text": "Kundenkarte #0000000000000001",
+            "phone_e164": "+491111222333",
+        },
+    )
+    session = _FakeSession()
+    _base_patches(monkeypatch)
+    monkeypatch.setattr(ow, "_render_message", _fake_render)
+    monkeypatch.setattr(ow.settings, "meta_newsletter_monthly_header_image_url", "")
+
+    async def _fake_send_template(  # noqa: E501
+        provider: Any, sender_id: int, phone: str, template_name: str, language: str, params: list, **kw: Any
+    ) -> tuple:
+        send_calls.append(True)
+        return "wamid.fake", None
+
+    monkeypatch.setattr(ow, "safe_send_template", _fake_send_template)
+
+    provider = MagicMock()
+    await ow._run_job_logic(session, job, provider=provider)  # type: ignore[arg-type]
+
+    assert len(send_calls) == 0, "safe_send_template must NOT be called when header URL is missing"
+    assert job.status == "failed", f"Expected job.status='failed', got {job.status!r}"
+    assert job.last_error is not None
+    assert "header" in job.last_error.lower(), f"last_error must mention 'header', got: {job.last_error!r}"
+
+
+@pytest.mark.asyncio
+async def test_outbox_worker_fails_fast_when_followup_header_url_missing(monkeypatch: Any) -> None:
+    """Worker must fail followup newsletter job when followup header URL is not set."""
+    send_calls: list[Any] = []
+
+    job = _FakeJob(
+        id=9002,
+        company_id=KA,
+        job_type=FOLLOWUP_JOB_TYPE,
+        payload={
+            "kind": FOLLOWUP_JOB_TYPE,
+            "contact_name": "Test User",
+            "phone_e164": "+491111222444",
+        },
+    )
+    session = _FakeSession()
+    _base_patches(monkeypatch)
+    monkeypatch.setattr(ow, "_render_message", _fake_render)
+    monkeypatch.setattr(ow.settings, "meta_newsletter_followup_header_image_url", "")
+
+    async def _fake_send_template(  # noqa: E501
+        provider: Any, sender_id: int, phone: str, template_name: str, language: str, params: list, **kw: Any
+    ) -> tuple:
+        send_calls.append(True)
+        return "wamid.fake", None
+
+    monkeypatch.setattr(ow, "safe_send_template", _fake_send_template)
+
+    provider = MagicMock()
+    await ow._run_job_logic(session, job, provider=provider)  # type: ignore[arg-type]
+
+    assert len(send_calls) == 0, "safe_send_template must NOT be called when header URL is missing"
+    assert job.status == "failed"
+    assert job.last_error is not None
+    assert "header" in job.last_error.lower()
+
+
+# ---------------------------------------------------------------------------
+# 9. outbox_worker passes header_image_url to safe_send_template when configured
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_outbox_worker_passes_header_url_for_monthly(monkeypatch: Any) -> None:
+    """Worker must pass header_image_url kwarg to safe_send_template for monthly newsletter."""
+    captured_kw: list[dict] = []
+
+    job = _FakeJob(
+        id=9003,
+        company_id=KA,
+        job_type=JOB_TYPE,
+        payload={
+            "kind": JOB_TYPE,
+            "contact_name": "Test User",
+            "loyalty_card_text": "Kundenkarte #0000000000000002",
+            "phone_e164": "+491111222555",
+        },
+    )
+    session = _FakeSession()
+    _base_patches(monkeypatch)
+    monkeypatch.setattr(ow, "_render_message", _fake_render)
+    monkeypatch.setattr(ow.settings, "meta_newsletter_monthly_header_image_url", _HEADER_URL)
+
+    async def _fake_send_template(  # noqa: E501
+        provider: Any, sender_id: int, phone: str, template_name: str, language: str, params: list, **kw: Any
+    ) -> tuple:
+        captured_kw.append(dict(kw))
+        return "wamid.fake9003", None
+
+    monkeypatch.setattr(ow, "safe_send_template", _fake_send_template)
+
+    provider = MagicMock()
+    await ow._run_job_logic(session, job, provider=provider)  # type: ignore[arg-type]
+
+    assert job.status == "done", f"Expected done, got {job.status!r} error={job.last_error!r}"
+    assert len(captured_kw) == 1
+    assert captured_kw[0].get("header_image_url") == _HEADER_URL, (
+        f"header_image_url must be {_HEADER_URL!r}, got {captured_kw[0].get('header_image_url')!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_outbox_worker_passes_header_url_for_followup(monkeypatch: Any) -> None:
+    """Worker must pass header_image_url kwarg to safe_send_template for followup newsletter."""
+    captured_kw: list[dict] = []
+    followup_header = "https://cdn.example.com/followup_header.jpg"
+
+    job = _FakeJob(
+        id=9004,
+        company_id=KA,
+        job_type=FOLLOWUP_JOB_TYPE,
+        payload={
+            "kind": FOLLOWUP_JOB_TYPE,
+            "contact_name": "Test User",
+            "phone_e164": "+491111222666",
+        },
+    )
+    session = _FakeSession()
+    _base_patches(monkeypatch)
+    monkeypatch.setattr(ow, "_render_message", _fake_render)
+    monkeypatch.setattr(ow.settings, "meta_newsletter_followup_header_image_url", followup_header)
+
+    async def _fake_send_template(  # noqa: E501
+        provider: Any, sender_id: int, phone: str, template_name: str, language: str, params: list, **kw: Any
+    ) -> tuple:
+        captured_kw.append(dict(kw))
+        return "wamid.fake9004", None
+
+    monkeypatch.setattr(ow, "safe_send_template", _fake_send_template)
+
+    provider = MagicMock()
+    await ow._run_job_logic(session, job, provider=provider)  # type: ignore[arg-type]
+
+    assert job.status == "done", f"Expected done, got {job.status!r} error={job.last_error!r}"
+    assert len(captured_kw) == 1
+    assert captured_kw[0].get("header_image_url") == followup_header
+
+
+# ---------------------------------------------------------------------------
+# 10. MetaCloudProvider.send_template() builds HEADER component
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_meta_cloud_send_template_includes_header_component_when_url_set() -> None:
+    """When header_image_url is provided, payload components must start with HEADER."""
+    from altegio_bot.providers.meta_cloud import MetaCloudProvider
+
+    captured_payload: list[dict] = []
+
+    provider = MetaCloudProvider.__new__(MetaCloudProvider)
+    provider._access_token = "test-token"
+    provider._api_version = "v20.0"
+    provider._graph_url = "https://graph.facebook.com"
+    provider._allow_real_send = True
+    provider._sender_cache = {1: "12345678901"}
+
+    class FakeResp:
+        status_code = 200
+
+        def json(self) -> dict:
+            return {"messages": [{"id": "wamid.testHEADER"}]}
+
+    class FakeClient:
+        async def post(self, url: str, headers: dict, json: dict) -> FakeResp:
+            captured_payload.append(json)
+            return FakeResp()
+
+    provider._client = FakeClient()  # type: ignore[assignment]
+
+    await provider.send_template(
+        sender_id=1,
+        phone_e164="+491234567890",
+        template_name=NEWSLETTER_MONTHLY_TEMPLATE,
+        language="de",
+        params=["Anna", "https://booking.link/", "Kundenkarte #001"],
+        header_image_url=_HEADER_URL,
+    )
+
+    assert len(captured_payload) == 1
+    components = captured_payload[0]["template"]["components"]
+    assert len(components) == 2, f"Expected 2 components (HEADER + BODY), got {len(components)}"
+    assert components[0]["type"] == "header"
+    assert components[0]["parameters"][0]["type"] == "image"
+    assert components[0]["parameters"][0]["image"]["link"] == _HEADER_URL
+    assert components[1]["type"] == "body"
+
+
+@pytest.mark.asyncio
+async def test_meta_cloud_send_template_omits_header_component_when_url_none() -> None:
+    """When header_image_url is None, payload must have only BODY component."""
+    from altegio_bot.providers.meta_cloud import MetaCloudProvider
+
+    captured_payload: list[dict] = []
+
+    provider = MetaCloudProvider.__new__(MetaCloudProvider)
+    provider._access_token = "test-token"
+    provider._api_version = "v20.0"
+    provider._graph_url = "https://graph.facebook.com"
+    provider._allow_real_send = True
+    provider._sender_cache = {1: "12345678901"}
+
+    class FakeResp:
+        status_code = 200
+
+        def json(self) -> dict:
+            return {"messages": [{"id": "wamid.testNOHEADER"}]}
+
+    class FakeClient:
+        async def post(self, url: str, headers: dict, json: dict) -> FakeResp:
+            captured_payload.append(json)
+            return FakeResp()
+
+    provider._client = FakeClient()  # type: ignore[assignment]
+
+    await provider.send_template(
+        sender_id=1,
+        phone_e164="+491234567890",
+        template_name="kitilash_ka_record_created_v1",
+        language="de",
+        params=["Anna", "Tanja", "10.02.2026", "14:00", "Service", "60.00", "https://link"],
+        header_image_url=None,
+    )
+
+    assert len(captured_payload) == 1
+    components = captured_payload[0]["template"]["components"]
+    assert len(components) == 1, f"Expected 1 component (BODY only), got {len(components)}"
+    assert components[0]["type"] == "body"

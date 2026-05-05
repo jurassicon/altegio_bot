@@ -211,6 +211,7 @@ async def test_monthly_empty_client_name_fails_locally(monkeypatch: Any) -> None
 
     monkeypatch.setattr(ow, "safe_send_template", _fake_send)
     monkeypatch.setattr(ow.settings, "whatsapp_send_mode", "template")
+    monkeypatch.setattr(ow.settings, "meta_newsletter_monthly_header_image_url", "https://cdn.example.com/h.jpg")
 
     await ow._run_job_logic(session, job, provider=MagicMock())  # type: ignore[arg-type]
 
@@ -269,6 +270,7 @@ async def test_monthly_wrong_param_count_fails_locally(monkeypatch: Any) -> None
 
     monkeypatch.setattr(ow, "safe_send_template", _fake_send)
     monkeypatch.setattr(ow.settings, "whatsapp_send_mode", "template")
+    monkeypatch.setattr(ow.settings, "meta_newsletter_monthly_header_image_url", "https://cdn.example.com/h.jpg")
 
     await ow._run_job_logic(session, job, provider=MagicMock())  # type: ignore[arg-type]
 
@@ -319,6 +321,7 @@ async def test_followup_wrong_param_count_fails_locally(monkeypatch: Any) -> Non
 
     monkeypatch.setattr(ow, "safe_send_template", _fake_send)
     monkeypatch.setattr(ow.settings, "whatsapp_send_mode", "template")
+    monkeypatch.setattr(ow.settings, "meta_newsletter_followup_header_image_url", "https://cdn.example.com/h.jpg")
 
     await ow._run_job_logic(session, job, provider=MagicMock())  # type: ignore[arg-type]
 
@@ -364,6 +367,7 @@ async def test_valid_monthly_template_calls_send(monkeypatch: Any) -> None:
 
     monkeypatch.setattr(ow, "safe_send_template", _fake_send)
     monkeypatch.setattr(ow.settings, "whatsapp_send_mode", "template")
+    monkeypatch.setattr(ow.settings, "meta_newsletter_monthly_header_image_url", "https://cdn.example.com/h.jpg")
 
     await ow._run_job_logic(session, job, provider=MagicMock())  # type: ignore[arg-type]
 

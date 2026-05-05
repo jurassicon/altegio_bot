@@ -26,9 +26,12 @@ from altegio_bot.message_planner import (
     MAX_VISITS_FOR_REVIEW,
 )
 from altegio_bot.meta_templates import (
+    NEWSLETTER_FOLLOWUP_TEMPLATE,
+    NEWSLETTER_MONTHLY_TEMPLATE,
     TEMPLATE_LANGUAGE,
     UNIVERSAL_JOB_TYPES,
     build_template_params,
+    requires_image_header,
     resolve_meta_template,
 )
 from altegio_bot.models.models import (
@@ -1149,6 +1152,30 @@ async def _run_job_logic(
             return
         template_params = build_template_params(meta_template_name, msg_ctx)
 
+        # Resolve image header URL for newsletter templates before preflight so
+        # a missing URL fails fast with a clear error (no blank-header send).
+        header_image_url: str | None = None
+        if requires_image_header(meta_template_name):
+            if meta_template_name == NEWSLETTER_MONTHLY_TEMPLATE:
+                header_image_url = settings.meta_newsletter_monthly_header_image_url or None
+            elif meta_template_name == NEWSLETTER_FOLLOWUP_TEMPLATE:
+                header_image_url = settings.meta_newsletter_followup_header_image_url or None
+            if not header_image_url:
+                err_msg = (
+                    f"Newsletter image header URL not configured for template={meta_template_name}. "
+                    "Set META_NEWSLETTER_MONTHLY_HEADER_IMAGE_URL or "
+                    "META_NEWSLETTER_FOLLOWUP_HEADER_IMAGE_URL in .env."
+                )
+                logger.error(
+                    "Missing header image URL template=%s job_id=%s",
+                    meta_template_name,
+                    job.id,
+                )
+                job.status = "failed"
+                job.locked_at = None
+                job.last_error = err_msg
+                return
+
         preflight_err = validate_template_params(meta_template_name, template_params)
         if preflight_err is not None:
             logger.error(
@@ -1214,6 +1241,7 @@ async def _run_job_logic(
             fallback_text=final_body,
             contact_name=contact_name,
             company_id=job.company_id,
+            header_image_url=header_image_url,
         )
         send_meta: dict[str, Any] = {
             "send_type": "template",
@@ -1221,6 +1249,8 @@ async def _run_job_logic(
             "params": template_params,
             "lang": TEMPLATE_LANGUAGE,
         }
+        if header_image_url:
+            send_meta["header_image_url"] = header_image_url
     else:
         msg_id, err = await safe_send(
             provider=provider,

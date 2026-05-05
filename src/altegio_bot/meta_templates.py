@@ -28,6 +28,17 @@ logger = logging.getLogger(__name__)
 # Language code sent with every template request.
 TEMPLATE_LANGUAGE = "de"
 
+# Canonical newsletter template names (both KA and RA map to these).
+NEWSLETTER_MONTHLY_TEMPLATE = "kitilash_ka_newsletter_new_clients_monthly_v1"
+NEWSLETTER_FOLLOWUP_TEMPLATE = "kitilash_ka_newsletter_new_clients_followup_v1"
+
+# Templates that have an IMAGE HEADER component in Meta WABA.
+# The worker must supply a header_image_url when sending these; if the URL is
+# missing from settings the job is failed immediately (no silent blank send).
+NEWSLETTER_IMAGE_HEADER_TEMPLATES: frozenset[str] = frozenset(
+    {NEWSLETTER_MONTHLY_TEMPLATE, NEWSLETTER_FOLLOWUP_TEMPLATE}
+)
+
 # Job types whose templates have NO address footer and are therefore
 # shared across all branches (canonical ka_* is used for everyone).
 UNIVERSAL_JOB_TYPES: frozenset[str] = frozenset(
@@ -129,6 +140,11 @@ def resolve_meta_template(
     return name
 
 
+def requires_image_header(template_name: str) -> bool:
+    """Return True when *template_name* has an IMAGE HEADER component in Meta WABA."""
+    return template_name in NEWSLETTER_IMAGE_HEADER_TEMPLATES
+
+
 def build_template_params(
     template_name: str,
     ctx: dict[str, Any],
@@ -216,14 +232,14 @@ def build_template_params(
             ctx.get("booking_link", ""),
         ]
 
-    if n == "kitilash_ka_newsletter_new_clients_monthly_v1":
+    if n == NEWSLETTER_MONTHLY_TEMPLATE:
         return [
             ctx.get("client_name", ""),
             ctx.get("booking_link", ""),
             ctx.get("loyalty_card_text", ""),
         ]
 
-    if n == "kitilash_ka_newsletter_new_clients_followup_v1":
+    if n == NEWSLETTER_FOLLOWUP_TEMPLATE:
         return [
             ctx.get("client_name", ""),
             ctx.get("booking_link", ""),
