@@ -24,5 +24,6 @@ class WhatsAppProvider(Protocol):
         fallback_text: str = "",
         *,
         contact_name: str | None = None,
+        header_image_url: str | None = None,
     ) -> str:
         pass

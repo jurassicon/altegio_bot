@@ -152,6 +152,7 @@ async def test_campaign_monthly_local_client_passes_company_id(monkeypatch: Any)
 
     monkeypatch.setattr(ow, "safe_send_template", _fake_send_template)
     monkeypatch.setattr(ow, "safe_send", AsyncMock(return_value=("msg-001", None)))
+    monkeypatch.setattr(ow.settings, "meta_newsletter_monthly_header_image_url", "https://cdn.example.com/h.jpg")
 
     await ow.process_job_in_session(session, 1, provider=MagicMock())
 
@@ -199,6 +200,7 @@ async def test_campaign_monthly_crm_only_phone_from_payload(monkeypatch: Any) ->
 
     monkeypatch.setattr(ow, "safe_send_template", _fake_send_template)
     monkeypatch.setattr(ow, "safe_send", AsyncMock(return_value=("msg-crm-001", None)))
+    monkeypatch.setattr(ow.settings, "meta_newsletter_monthly_header_image_url", "https://cdn.example.com/h.jpg")
 
     await ow.process_job_in_session(session, 2, provider=MagicMock())
 
@@ -356,6 +358,7 @@ async def test_followup_local_client_passes_company_id(monkeypatch: Any) -> None
 
     monkeypatch.setattr(ow, "safe_send_template", _fake_send_template)
     monkeypatch.setattr(ow, "safe_send", AsyncMock(return_value=("msg-fu-001", None)))
+    monkeypatch.setattr(ow.settings, "meta_newsletter_followup_header_image_url", "https://cdn.example.com/h.jpg")
 
     await ow.process_job_in_session(session, 5, provider=MagicMock())
 

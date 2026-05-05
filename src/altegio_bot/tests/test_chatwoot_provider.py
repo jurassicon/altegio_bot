@@ -34,8 +34,9 @@ class _FakeMetaProvider:
         fallback_text: str = "",
         *,
         contact_name: str | None = None,
+        header_image_url: str | None = None,
     ) -> str:
-        self.templates.append((sender_id, phone_e164, template_name, language, params, fallback_text))
+        self.templates.append((sender_id, phone_e164, template_name, language, params, fallback_text, header_image_url))
         return f"meta-tpl-{uuid4()}"
 
 
@@ -150,3 +151,55 @@ async def test_send_propagates_contact_name(monkeypatch: pytest.MonkeyPatch) -> 
     await provider.send(1, "+49123", "Hello", contact_name="Anna Müller")
     await asyncio.sleep(0.05)
     assert captured_names == ["Anna Müller"]
+
+
+@pytest.mark.asyncio
+async def test_send_template_forwards_header_image_url_to_primary() -> None:
+    """header_image_url must be forwarded to the primary provider, not dropped."""
+    meta = _FakeMetaProvider()
+    cw = _FakeChatwootClient()
+    provider = ChatwootHybridProvider(primary=meta, chatwoot=cw)  # type: ignore[arg-type]
+
+    header_url = "https://cdn.example.com/newsletter_header.jpg"
+    msg_id = await provider.send_template(
+        1,
+        "+49123",
+        "kitilash_ka_newsletter_new_clients_monthly_v1",
+        "de",
+        ["Anna", "https://booking.link/", "Kundenkarte #001"],
+        "Fallback text",
+        header_image_url=header_url,
+    )
+
+    assert msg_id.startswith("meta-tpl-")
+    assert len(meta.templates) == 1
+    # The 7th element in the recorded tuple is header_image_url
+    recorded_header = meta.templates[0][6]
+    assert recorded_header == header_url, (
+        f"primary.send_template must receive header_image_url={header_url!r}, got {recorded_header!r}"
+    )
+    await asyncio.sleep(0.05)
+
+
+@pytest.mark.asyncio
+async def test_send_template_none_header_image_url_not_forwarded_as_string() -> None:
+    """When header_image_url is None (no header template), primary still gets None."""
+    meta = _FakeMetaProvider()
+    cw = _FakeChatwootClient()
+    provider = ChatwootHybridProvider(primary=meta, chatwoot=cw)  # type: ignore[arg-type]
+
+    await provider.send_template(
+        1,
+        "+49123",
+        "kitilash_ka_record_created_v1",
+        "de",
+        ["Anna", "Tanja", "10.02.2026", "14:00", "Service", "60.00", "https://link"],
+        header_image_url=None,
+    )
+
+    assert len(meta.templates) == 1
+    recorded_header = meta.templates[0][6]
+    assert recorded_header is None, (
+        f"primary.send_template must get header_image_url=None for non-header templates, got {recorded_header!r}"
+    )
+    await asyncio.sleep(0.05)

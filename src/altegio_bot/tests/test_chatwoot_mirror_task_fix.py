@@ -345,6 +345,7 @@ async def test_safe_send_template_passes_mirror_kwargs() -> None:
             company_id: int = 0,
             staff_id: int | None = None,
             contact_name: str | None = None,
+            header_image_url: str | None = None,
         ) -> str:
             received["company_id"] = company_id
             received["staff_id"] = staff_id

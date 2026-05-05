@@ -107,5 +107,11 @@ class Settings(BaseSettings):
     # If non-empty and inbox_id not found — relay is fail-closed.
     chatwoot_inbox_company_map: str = "{}"
 
+    # Publicly accessible image URLs for newsletter template IMAGE HEADER components.
+    # Meta Cloud API requires a permanent URL it can fetch and cache at send time.
+    # Leave empty → worker fails the job fast (no silent blank-header send).
+    meta_newsletter_monthly_header_image_url: str = ""
+    meta_newsletter_followup_header_image_url: str = ""
+
 
 settings = Settings()

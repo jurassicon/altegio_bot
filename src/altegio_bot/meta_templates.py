@@ -28,6 +28,17 @@ logger = logging.getLogger(__name__)
 # Language code sent with every template request.
 TEMPLATE_LANGUAGE = "de"
 
+# Canonical newsletter template names (both KA and RA map to these).
+NEWSLETTER_MONTHLY_TEMPLATE = "kitilash_ka_newsletter_new_clients_monthly_v1"
+NEWSLETTER_FOLLOWUP_TEMPLATE = "kitilash_ka_newsletter_new_clients_followup_v1"
+
+# Templates that have an IMAGE HEADER component in Meta WABA.
+# The worker must supply a header_image_url when sending these; if the URL is
+# missing from settings the job is failed immediately (no silent blank send).
+NEWSLETTER_IMAGE_HEADER_TEMPLATES: frozenset[str] = frozenset(
+    {NEWSLETTER_MONTHLY_TEMPLATE, NEWSLETTER_FOLLOWUP_TEMPLATE}
+)
+
 # Job types whose templates have NO address footer and are therefore
 # shared across all branches (canonical ka_* is used for everyone).
 UNIVERSAL_JOB_TYPES: frozenset[str] = frozenset(
@@ -58,8 +69,8 @@ META_TEMPLATE_MAP: dict[tuple[int, str], str] = {
     (_KA, "review_3d"): "kitilash_ka_review_3d_v1",
     (_KA, "repeat_10d"): "kitilash_ka_repeat_10d_v1",
     (_KA, "comeback_3d"): "kitilash_ka_comeback_3d_v1",
-    (_KA, "newsletter_new_clients_monthly"): "kitilash_ka_newsletter_new_clients_monthly_v1",
-    (_KA, "newsletter_new_clients_followup"): "kitilash_ka_newsletter_new_clients_followup_v1",
+    (_KA, "newsletter_new_clients_monthly"): NEWSLETTER_MONTHLY_TEMPLATE,
+    (_KA, "newsletter_new_clients_followup"): NEWSLETTER_FOLLOWUP_TEMPLATE,
     # --- Rastatt ---
     # ra_record_created_v1 exists; others fall back to ka_* templates
     (_RA, "record_created"): "kitilash_ra_record_created_v1",
@@ -70,8 +81,8 @@ META_TEMPLATE_MAP: dict[tuple[int, str], str] = {
     (_RA, "review_3d"): "kitilash_ra_review_3d_v1",
     (_RA, "repeat_10d"): "kitilash_ka_repeat_10d_v1",
     (_RA, "comeback_3d"): "kitilash_ka_comeback_3d_v1",
-    (_RA, "newsletter_new_clients_monthly"): "kitilash_ka_newsletter_new_clients_monthly_v1",
-    (_RA, "newsletter_new_clients_followup"): "kitilash_ka_newsletter_new_clients_followup_v1",
+    (_RA, "newsletter_new_clients_monthly"): NEWSLETTER_MONTHLY_TEMPLATE,
+    (_RA, "newsletter_new_clients_followup"): NEWSLETTER_FOLLOWUP_TEMPLATE,
 }
 
 # Karlsruhe new-client variant for record_created
@@ -127,6 +138,11 @@ def resolve_meta_template(
         )
 
     return name
+
+
+def requires_image_header(template_name: str) -> bool:
+    """Return True when *template_name* has an IMAGE HEADER component in Meta WABA."""
+    return template_name in NEWSLETTER_IMAGE_HEADER_TEMPLATES
 
 
 def build_template_params(
@@ -216,14 +232,14 @@ def build_template_params(
             ctx.get("booking_link", ""),
         ]
 
-    if n == "kitilash_ka_newsletter_new_clients_monthly_v1":
+    if n == NEWSLETTER_MONTHLY_TEMPLATE:
         return [
             ctx.get("client_name", ""),
             ctx.get("booking_link", ""),
             ctx.get("loyalty_card_text", ""),
         ]
 
-    if n == "kitilash_ka_newsletter_new_clients_followup_v1":
+    if n == NEWSLETTER_FOLLOWUP_TEMPLATE:
         return [
             ctx.get("client_name", ""),
             ctx.get("booking_link", ""),

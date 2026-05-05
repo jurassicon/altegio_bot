@@ -92,10 +92,17 @@ class ChatwootHybridProvider:
         company_id: int = 0,
         staff_id: int | None = None,
         contact_name: str | None = None,
+        header_image_url: str | None = None,
     ) -> str:
         # PRIMARY – must succeed (отправка в Meta игнорирует fallback_text)
         msg_id = await self._primary.send_template(
-            sender_id, phone_e164, template_name, language, params, fallback_text
+            sender_id,
+            phone_e164,
+            template_name,
+            language,
+            params,
+            fallback_text,
+            header_image_url=header_image_url,
         )
 
         # SECONDARY – best-effort (Отправляем в Chatwoot красивый сгенерированный текст)

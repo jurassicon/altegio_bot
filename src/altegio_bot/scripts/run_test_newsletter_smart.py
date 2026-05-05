@@ -12,6 +12,11 @@ Exit codes:
   0 = PASS
   2 = FAIL
 
+Newsletter templates with IMAGE HEADER require these env vars to be set::
+
+    META_NEWSLETTER_MONTHLY_HEADER_IMAGE_URL=https://...
+    META_NEWSLETTER_FOLLOWUP_HEADER_IMAGE_URL=https://...
+
 Usage::
 
     python -m altegio_bot.scripts.run_test_newsletter_smart \\
@@ -40,6 +45,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.altegio_loyalty import AltegioLoyaltyClient
 from altegio_bot.db import SessionLocal
+from altegio_bot.meta_templates import (
+    NEWSLETTER_FOLLOWUP_TEMPLATE,
+    NEWSLETTER_MONTHLY_TEMPLATE,
+    build_template_params,
+    requires_image_header,
+)
 from altegio_bot.models.models import OutboxMessage, SmartTestRun
 from altegio_bot.settings import settings
 from altegio_bot.utils import utcnow
@@ -61,6 +72,35 @@ _LOYALTY_CARD_PREFIX = "Kundenkarte #"
 _PASS_FOR_DELIVERED: frozenset[str] = frozenset({"delivered", "read"})
 _PASS_FOR_SENT: frozenset[str] = frozenset({"sent", "delivered", "read"})
 _FAIL_STATUS = "failed"
+
+
+# ---------------------------------------------------------------------------
+# Template parameter helpers
+# ---------------------------------------------------------------------------
+
+
+def _build_smart_template_params(
+    template_name: str,
+    *,
+    client_name: str,
+    booking_link: str,
+    loyalty_card_text: str,
+) -> list[str]:
+    """Build the correct positional params for *template_name* using the shared registry.
+
+    Delegates to ``build_template_params`` so the smart-test script always uses
+    the same param order as the production outbox_worker — preventing silently
+    sending 3 params to a 2-param template (or vice-versa).
+
+    Returns an empty list for unknown template names; callers should treat that
+    as a configuration error and abort before making any Meta API call.
+    """
+    ctx = {
+        "client_name": client_name,
+        "booking_link": booking_link,
+        "loyalty_card_text": loyalty_card_text,
+    }
+    return build_template_params(template_name, ctx)
 
 
 # ---------------------------------------------------------------------------
@@ -191,10 +231,27 @@ async def _send_template_direct(
     graph_url: str,
     api_version: str,
     phone_number_id: str,
+    header_image_url: str | None = None,
 ) -> str:
     """Send a Meta WhatsApp template message directly, returning the message id."""
     to_number = phone_e164.lstrip("+").strip()
     url = f"{graph_url.rstrip('/')}/{api_version}/{phone_number_id}/messages"
+
+    components: list[dict[str, Any]] = []
+    if header_image_url:
+        components.append(
+            {
+                "type": "header",
+                "parameters": [{"type": "image", "image": {"link": header_image_url}}],
+            }
+        )
+    components.append(
+        {
+            "type": "body",
+            "parameters": [{"type": "text", "text": p} for p in params],
+        }
+    )
+
     payload: dict[str, Any] = {
         "messaging_product": "whatsapp",
         "to": to_number,
@@ -202,12 +259,7 @@ async def _send_template_direct(
         "template": {
             "name": template_name,
             "language": {"code": language},
-            "components": [
-                {
-                    "type": "body",
-                    "parameters": [{"type": "text", "text": p} for p in params],
-                }
-            ],
+            "components": components,
         },
     }
     headers = {"Authorization": f"Bearer {access_token}"}
@@ -397,6 +449,23 @@ async def run_smart_test(
         logger.error("FAIL: META_WA_PHONE_NUMBER_ID is not set")
         return 2
 
+    # Resolve header image URL before issuing the loyalty card so we fail fast
+    # before any side effects when the template needs a header but URL is missing.
+    header_image_url: str | None = None
+    if requires_image_header(template_name):
+        if template_name == NEWSLETTER_MONTHLY_TEMPLATE:
+            header_image_url = settings.meta_newsletter_monthly_header_image_url.strip() or None
+        elif template_name == NEWSLETTER_FOLLOWUP_TEMPLATE:
+            header_image_url = settings.meta_newsletter_followup_header_image_url.strip() or None
+        if not header_image_url:
+            logger.error(
+                "FAIL: Template %r requires image header but image URL is not configured. "
+                "Set META_NEWSLETTER_MONTHLY_HEADER_IMAGE_URL or "
+                "META_NEWSLETTER_FOLLOWUP_HEADER_IMAGE_URL in .env.",
+                template_name,
+            )
+            return 2
+
     ok, err_msg = await check_meta_template(
         template_name,
         access_token=access_token,
@@ -407,6 +476,20 @@ async def run_smart_test(
     )
     if not ok:
         logger.error("FAIL (template check): %s", err_msg)
+        return 2
+
+    probe_params = _build_smart_template_params(
+        template_name,
+        client_name=client_name,
+        booking_link=booking_link,
+        loyalty_card_text="Kundenkarte #0000000000000000",
+    )
+    if not probe_params:
+        logger.error(
+            "FAIL: unsupported or unknown template parameters for template=%r. "
+            "Add a build_template_params branch in meta_templates.py for this template.",
+            template_name,
+        )
         return 2
 
     # -----------------------------------------------------------------------
@@ -495,6 +578,13 @@ async def run_smart_test(
     run_record: SmartTestRun | None = None
     async with SessionLocal() as session:
         async with session.begin():
+            run_meta: dict[str, Any] = {
+                "booking_link": booking_link,
+                "client_name": client_name,
+                "expect_status": expect_status,
+            }
+            if header_image_url:
+                run_meta["header_image_url"] = header_image_url
             run_record = SmartTestRun(
                 test_code=TEST_CODE,
                 phone_e164=phone_e164,
@@ -505,11 +595,7 @@ async def run_smart_test(
                 loyalty_card_type_id=resolved_type_id,
                 template_name=template_name,
                 outcome="pending",
-                meta={
-                    "booking_link": booking_link,
-                    "client_name": client_name,
-                    "expect_status": expect_status,
-                },
+                meta=run_meta,
             )
             session.add(run_record)
             await session.flush()
@@ -519,7 +605,20 @@ async def run_smart_test(
     # -----------------------------------------------------------------------
     # D) Send WhatsApp template message
     # -----------------------------------------------------------------------
-    template_params = [client_name, booking_link, loyalty_card_text]
+    template_params = _build_smart_template_params(
+        template_name,
+        client_name=client_name,
+        booking_link=booking_link,
+        loyalty_card_text=loyalty_card_text,
+    )
+    if not template_params:
+        logger.error(
+            "FAIL: unsupported or unknown template parameters for template=%r. "
+            "Add a build_template_params branch in meta_templates.py for this template.",
+            template_name,
+        )
+        await loyalty.aclose()
+        return 2
     provider_message_id: str | None = None
 
     try:
@@ -532,6 +631,7 @@ async def run_smart_test(
             graph_url=graph_url,
             api_version=api_version,
             phone_number_id=phone_number_id,
+            header_image_url=header_image_url,
         )
         logger.info("Message sent: provider_message_id=%s", provider_message_id)
     except Exception as exc:
@@ -560,6 +660,14 @@ async def run_smart_test(
             if rec is not None:
                 rec.provider_message_id = provider_message_id
 
+            outbox_meta: dict[str, Any] = {
+                "send_type": "template",
+                "template": template_name,
+                "params": template_params,
+                "test_code": TEST_CODE,
+            }
+            if header_image_url:
+                outbox_meta["header_image_url"] = header_image_url
             outbox = OutboxMessage(
                 company_id=company_id,
                 phone_e164=phone_e164,
@@ -570,12 +678,7 @@ async def run_smart_test(
                 provider_message_id=provider_message_id,
                 scheduled_at=utcnow(),
                 sent_at=utcnow(),
-                meta={
-                    "send_type": "template",
-                    "template": template_name,
-                    "params": template_params,
-                    "test_code": TEST_CODE,
-                },
+                meta=outbox_meta,
             )
             session.add(outbox)
 
@@ -761,7 +864,7 @@ async def main() -> None:
     )
     parser.add_argument(
         "--template",
-        default="kitilash_ka_newsletter_new_clients_monthly_v1",
+        default=NEWSLETTER_MONTHLY_TEMPLATE,
     )
     parser.add_argument(
         "--expect-status",
