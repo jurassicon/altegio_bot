@@ -1365,3 +1365,4 @@ async def test_send_real_without_preview_shows_no_empty_preview_block(
     response = await http_client.get(f"/ops/campaigns/{run_id}")
     assert response.status_code == 200
     assert "Открыть превью" not in response.text
+    assert "Связанное превью" not in response.text

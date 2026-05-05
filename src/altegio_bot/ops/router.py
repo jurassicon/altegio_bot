@@ -4097,12 +4097,13 @@ async def ops_campaign_run_detail(run_id: int) -> str:
       <dd class="col-sm-9">{_esc(str(run.card_type_id or "—"))}</dd>
       <dt class="col-sm-3">Attribution Window</dt>
       <dd class="col-sm-9">{run.attribution_window_days} days</dd>
-      <dt class="col-sm-3">Связанное превью</dt>
-      <dd class="col-sm-9">{
-        f'<a href="/ops/campaigns/{run.source_preview_run_id}">Открыть превью #{run.source_preview_run_id}</a>'
+{
+        f'<dt class="col-sm-3">Связанное превью</dt>'
+        f'<dd class="col-sm-9"><a href="/ops/campaigns/{run.source_preview_run_id}">'
+        f"Открыть превью #{run.source_preview_run_id}</a></dd>"
         if run.source_preview_run_id
-        else "—"
-    }</dd>
+        else ""
+    }
     </dl>
   </div>
 </div>
