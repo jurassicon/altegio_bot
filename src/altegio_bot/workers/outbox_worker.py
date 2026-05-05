@@ -15,8 +15,10 @@ from altegio_bot.altegio_records import (
     client_has_future_appointments,
     count_attended_client_visits,
 )
+from altegio_bot.campaigns.followup import check_followup_final_eligibility
 from altegio_bot.campaigns.runner import (
     CAMPAIGN_EXECUTION_JOB_TYPE,
+    FOLLOWUP_JOB_TYPE,
     recompute_campaign_run_stats,
 )
 from altegio_bot.db import SessionLocal
@@ -36,6 +38,7 @@ from altegio_bot.meta_templates import (
 )
 from altegio_bot.models.models import (
     CampaignRecipient,
+    CampaignRun,
     Client,
     ContactRateLimit,
     MessageJob,
@@ -876,6 +879,33 @@ async def _run_job_logic(
         return
 
     client = await _load_client(session, job, record)
+
+    # Follow-up final eligibility guard: re-check current recipient/client state
+    # before the actual send.  Catches changes that happened during the 14-day
+    # delay between job creation and delivery (read, booking, opt-out, future record).
+    if job.job_type == FOLLOWUP_JOB_TYPE:
+        _fu_payload = getattr(job, "payload", None) or {}
+        _fu_recipient_id = _fu_payload.get("campaign_recipient_id")
+        _fu_run_id = _fu_payload.get("campaign_run_id")
+        if _fu_recipient_id is not None:
+            _fu_recipient = await session.get(CampaignRecipient, int(_fu_recipient_id))
+            _fu_run = await session.get(CampaignRun, int(_fu_run_id)) if _fu_run_id is not None else None
+            if _fu_recipient is not None:
+                _guard = await check_followup_final_eligibility(session, _fu_recipient, _fu_run, utcnow())
+                if not _guard.eligible:
+                    if _guard.booked_after_at is not None and _fu_recipient.booked_after_at is None:
+                        _fu_recipient.booked_after_at = _guard.booked_after_at
+                    _fu_recipient.followup_status = _guard.followup_status or "followup_skipped"
+                    job.status = "canceled"
+                    job.locked_at = None
+                    job.last_error = _guard.skip_reason
+                    logger.info(
+                        "followup guard skipped job_id=%s recipient_id=%s reason=%r",
+                        job.id,
+                        _fu_recipient_id,
+                        _guard.skip_reason,
+                    )
+                    return None
 
     if client is not None:
         opted_out = bool(getattr(client, "wa_opted_out", False))
