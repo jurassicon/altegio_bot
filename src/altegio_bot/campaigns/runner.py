@@ -1608,18 +1608,108 @@ _OUTBOX_TO_RECIPIENT_STATUS: dict[str, str] = {
 }
 
 
+async def _sync_recipients_to_latest_successful_outbox(
+    session: AsyncSession,
+    recipients: list[CampaignRecipient],
+) -> int:
+    """Relink recipients whose outbox_message_id points to a non-successful row.
+
+    For each non-skipped recipient with a message_job_id, finds the best
+    successful OutboxMessage for that job (status in {sent, delivered, read}),
+    picking the one with the highest delivery rank (ties broken by highest id).
+
+    Recompute trusts outbox status as the source of truth.  A failed outbox is
+    never considered successful even if it carries a provider_message_id.
+    provider_message_id is NOT required — some flows have status='sent' without
+    one (e.g. the outbox worker has not yet written it back).
+
+    If the recipient is already linked to that outbox → no-op (idempotent).
+    Outbox FK fields (outbox_message_id, provider_message_id, sent_at) are
+    always updated to the best outbox.  Status is only advanced, never
+    downgraded (a 'read' recipient stays 'read' even if best is 'delivered').
+
+    Returns the count of recipients actually relinked.
+    """
+    job_ids = {r.message_job_id for r in recipients if r.status != "skipped" and r.message_job_id is not None}
+    if not job_ids:
+        return 0
+
+    stmt = (
+        select(OutboxMessage)
+        .where(OutboxMessage.job_id.in_(job_ids))
+        .where(OutboxMessage.status.in_(_PROVIDER_ACCEPTED))
+        .order_by(OutboxMessage.job_id, OutboxMessage.id.desc())
+    )
+    rows = (await session.execute(stmt)).scalars().all()
+
+    # For each job pick the best: highest delivery rank, ties by highest id.
+    best_by_job: dict[int, OutboxMessage] = {}
+    for ob in rows:
+        jid = ob.job_id
+        if jid is None:
+            continue
+        if jid not in best_by_job:
+            best_by_job[jid] = ob  # desc order ⟹ first seen = highest id
+        else:
+            existing_rank = _OUTBOX_STATUS_RANK.get(best_by_job[jid].status, 0)
+            new_rank = _OUTBOX_STATUS_RANK.get(ob.status, 0)
+            if new_rank > existing_rank:
+                best_by_job[jid] = ob
+
+    if not best_by_job:
+        return 0
+
+    relinked = 0
+    for r in recipients:
+        if r.status == "skipped" or r.message_job_id is None:
+            continue
+
+        best = best_by_job.get(r.message_job_id)
+        if best is None:
+            continue  # no successful outbox for this job
+
+        if r.outbox_message_id == best.id:
+            continue  # already linked to the best → idempotent
+
+        # Always relink FK fields to the best successful outbox.
+        r.outbox_message_id = best.id
+        r.provider_message_id = best.provider_message_id
+        if best.sent_at is not None:
+            r.sent_at = best.sent_at
+
+        # Advance recipient status only when best outbox implies a higher rank.
+        # Never downgrade: a 'read' recipient stays 'read' even if best is 'delivered'.
+        best_target = _OUTBOX_TO_RECIPIENT_STATUS.get(best.status)
+        if best_target is not None:
+            current_rank = _RECIPIENT_STATUS_RANK.get(r.status, 0)
+            target_rank = _RECIPIENT_STATUS_RANK.get(best_target, 0)
+            if target_rank > current_rank:
+                r.status = best_target
+
+        relinked += 1
+
+    return relinked
+
+
 async def _resolve_outbox_for_recipients(
     session: AsyncSession,
     recipients: list[CampaignRecipient],
+    *,
+    successful_only_fallback: bool = False,
 ) -> dict[int, "OutboxMessage"]:
     """Return {recipient.id -> best OutboxMessage} for all recipients.
 
     Two-pass lookup:
     1. Direct: recipients that already have outbox_message_id set.
-    2. Fallback: recipients with outbox_message_id=None but message_job_id
-       set — resolved via OutboxMessage.job_id.  The "best" row per job is
-       the one with the highest _OUTBOX_STATUS_RANK (most advanced delivery
-       state).  Ties are broken by highest id (most recent row).
+    2. Fallback: non-skipped recipients with outbox_message_id=None but
+       message_job_id set — resolved via OutboxMessage.job_id.  The "best"
+       row per job is the one with the highest _OUTBOX_STATUS_RANK (most
+       advanced delivery state).  Ties are broken by highest id.
+
+    When *successful_only_fallback* is True, Pass 2 only considers outboxes
+    with status in _PROVIDER_ACCEPTED (sent / delivered / read).
+    Use this in recompute to avoid backfilling failed outbox rows.
+    provider_message_id is NOT required — status alone is the criterion.
     """
     result: dict[int, OutboxMessage] = {}
 
@@ -1637,15 +1727,18 @@ async def _resolve_outbox_for_recipients(
 
     # --- Pass 2: fallback via message_job_id ---
     needs_job_lookup = [
-        r for r in recipients if r.id not in result and r.outbox_message_id is None and r.message_job_id is not None
+        r
+        for r in recipients
+        if r.id not in result and r.outbox_message_id is None and r.message_job_id is not None and r.status != "skipped"
     ]
     if needs_job_lookup:
         job_ids = list({r.message_job_id for r in needs_job_lookup})
-        stmt = (
-            select(OutboxMessage)
-            .where(OutboxMessage.job_id.in_(job_ids))
-            .order_by(OutboxMessage.job_id, OutboxMessage.id.desc())
-        )
+        stmt = select(OutboxMessage).where(OutboxMessage.job_id.in_(job_ids))
+        if successful_only_fallback:
+            # Only consider outboxes with a successful status — do NOT require
+            # provider_message_id here, some flows have status='sent' without one.
+            stmt = stmt.where(OutboxMessage.status.in_(_PROVIDER_ACCEPTED))
+        stmt = stmt.order_by(OutboxMessage.job_id, OutboxMessage.id.desc())
         all_outboxes = (await session.execute(stmt)).scalars().all()
 
         # For each job_id pick the row with the highest delivery rank.
@@ -2057,8 +2150,17 @@ async def recompute_campaign_run_stats(
     r_stmt = select(CampaignRecipient).where(CampaignRecipient.campaign_run_id == run_id)
     recipients = list((await session.execute(r_stmt)).scalars().all())
 
-    # Step 2: resolve best outbox per recipient (direct + job_id fallback)
-    outbox_by_recipient = await _resolve_outbox_for_recipients(session, recipients)
+    # Step 1a: relink recipients whose outbox_message_id points to a failed row
+    # to the latest successful OutboxMessage for their message_job_id.
+    # Must run before _resolve_outbox_for_recipients so Pass 1 picks up the
+    # corrected outbox_message_id.
+    relinked_count = await _sync_recipients_to_latest_successful_outbox(session, recipients)
+    if relinked_count:
+        logger.info("recompute relinked campaign recipients run_id=%d count=%d", run_id, relinked_count)
+
+    # Step 2: resolve best outbox per recipient (direct + job_id fallback).
+    # successful_only_fallback=True: Pass 2 never backfills failed outbox rows.
+    outbox_by_recipient = await _resolve_outbox_for_recipients(session, recipients, successful_only_fallback=True)
 
     # Step 3: backfill missing outbox links (in-memory + persisted on commit)
     _backfill_recipient_links(recipients, outbox_by_recipient)
@@ -2140,6 +2242,7 @@ async def recompute_campaign_run_stats(
         "cards_issued_count": run.cards_issued_count,
         "cards_deleted_count": run.cards_deleted_count,
         "cleanup_failed_count": run.cleanup_failed_count,
+        "relinked_recipients_count": relinked_count,
         "booked_after_service_lookup_failed_count": len(failed_svc_ids),
         "booked_after_service_lookup_failed_service_ids": sorted(failed_svc_ids),
         "booked_after_service_lookup_failed_record_count": len(failed_rec_ids),
