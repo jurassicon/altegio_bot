@@ -953,3 +953,483 @@ async def test_outbox_worker_followup_run_not_found_does_not_send(
 
     provider.send_template.assert_not_called()
     provider.send.assert_not_called()
+
+
+# ==========================================================================
+# Live Altegio guard for follow-up jobs
+# ==========================================================================
+#
+# A. DB guard fires (recipient read) → live check NOT called, provider NOT called
+# B. Eligible in DB + Altegio has future record → canceled, skipped_future_record
+# C. Eligible in DB + no future Altegio record → provider called (send path reached)
+# D. Altegio API error → retry with delay progression (1m/5m/25m/1h)
+# E. max_attempts exhausted → job failed
+# F. Non-followup job → live check NOT called
+# G. DB guard fires (booked_after) → live check NOT called
+# ==========================================================================
+
+
+@pytest.mark.asyncio
+async def test_live_altegio_guard_not_called_when_db_guard_fires_read(
+    ow_session,
+    session_maker,
+    monkeypatch,
+) -> None:
+    """A. DB guard fires (recipient read) → live Altegio check not called, provider not called."""
+    live_check = AsyncMock()
+    monkeypatch.setattr(ow, "client_has_any_future_record", live_check)
+
+    async with session_maker() as session:
+        async with session.begin():
+            run = _make_run(session)
+            client = _make_client(session)
+            await session.flush()
+            recipient = _make_recipient(session, run.id, client.id, status="read", read_at=NOW - timedelta(days=1))
+            await session.flush()
+            recipient_id = recipient.id
+
+            job = _make_followup_job(session, run_id=run.id, recipient_id=recipient.id, client_id=client.id)
+            await session.flush()
+            job_id = job.id
+
+    provider = MagicMock()
+    provider.send_template = AsyncMock()
+    provider.send = AsyncMock()
+
+    await _lock_job(session_maker, job_id)
+
+    async with session_maker() as session:
+        async with session.begin():
+            await ow.process_job_in_session(session, job_id, provider=provider)
+
+    async with session_maker() as session:
+        db_job = await session.get(MessageJob, job_id)
+        db_recipient = await session.get(CampaignRecipient, recipient_id)
+
+    live_check.assert_not_called()
+    provider.send_template.assert_not_called()
+    provider.send.assert_not_called()
+    assert db_job.status == "canceled"
+    assert db_recipient.followup_status == "skipped_read"
+
+
+@pytest.mark.asyncio
+async def test_live_altegio_guard_cancels_when_future_record_found(
+    ow_session,
+    session_maker,
+    monkeypatch,
+) -> None:
+    """B. Eligible in DB + Altegio API has future record → canceled, skipped_future_record."""
+    monkeypatch.setattr(ow, "client_has_any_future_record", AsyncMock(return_value=True))
+
+    async with session_maker() as session:
+        async with session.begin():
+            run = _make_run(session)
+            client = _make_client(session)
+            await session.flush()
+            recipient = _make_recipient(session, run.id, client.id, status="delivered")
+            await session.flush()
+            recipient_id = recipient.id
+
+            job = _make_followup_job(session, run_id=run.id, recipient_id=recipient.id, client_id=client.id)
+            await session.flush()
+            recipient.followup_message_job_id = job.id
+            job_id = job.id
+
+    provider = MagicMock()
+    provider.send_template = AsyncMock()
+    provider.send = AsyncMock()
+
+    await _lock_job(session_maker, job_id)
+
+    async with session_maker() as session:
+        async with session.begin():
+            await ow.process_job_in_session(session, job_id, provider=provider)
+
+    async with session_maker() as session:
+        db_job = await session.get(MessageJob, job_id)
+        db_recipient = await session.get(CampaignRecipient, recipient_id)
+
+    assert db_job.status == "canceled"
+    assert db_job.last_error is not None
+    assert "future Altegio record" in db_job.last_error
+    assert db_recipient.followup_status == "skipped_future_record"
+    assert db_recipient.followup_message_job_id is None
+    provider.send_template.assert_not_called()
+    provider.send.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_live_altegio_guard_passes_when_no_future_record(
+    ow_session,
+    session_maker,
+    monkeypatch,
+) -> None:
+    """C. Eligible in DB + no future Altegio record → send path reached (provider called)."""
+    monkeypatch.setattr(ow, "client_has_any_future_record", AsyncMock(return_value=False))
+    monkeypatch.setattr(ow.settings, "whatsapp_send_mode", "text")
+    monkeypatch.setattr(ow.settings, "wa_131026_suppression_enabled", False)
+    monkeypatch.setattr(ow, "_apply_rate_limit", AsyncMock(return_value=None))
+
+    send_mock = AsyncMock(return_value=("wamid.live-guard-c-001", None))
+    monkeypatch.setattr(ow, "safe_send", send_mock)
+
+    async def _fake_render(session, *, company_id, template_code, record, client):
+        return ("Hallo Test!", None, "de", {"client_name": "Test"})
+
+    monkeypatch.setattr(ow, "_render_message", _fake_render)
+
+    async with session_maker() as session:
+        async with session.begin():
+            run = _make_run(session)
+            client = _make_client(session)
+            await session.flush()
+            recipient = _make_recipient(session, run.id, client.id, status="delivered")
+            await session.flush()
+
+            job = _make_followup_job(session, run_id=run.id, recipient_id=recipient.id, client_id=client.id)
+            await session.flush()
+            job_id = job.id
+
+    await _lock_job(session_maker, job_id)
+
+    async with session_maker() as session:
+        async with session.begin():
+            await ow.process_job_in_session(session, job_id, provider=MagicMock())
+
+    async with session_maker() as session:
+        db_job = await session.get(MessageJob, job_id)
+
+    assert "future Altegio record" not in (db_job.last_error or "")
+    send_mock.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_live_altegio_guard_retries_on_api_error(
+    ow_session,
+    session_maker,
+    monkeypatch,
+) -> None:
+    """D. Altegio API error → job requeued with 1-minute delay on first failure."""
+    import httpx
+
+    async def _api_error(*_a, **_kw):
+        raise httpx.ConnectError("connection refused")
+
+    monkeypatch.setattr(ow, "client_has_any_future_record", _api_error)
+    monkeypatch.setattr(ow, "utcnow", lambda: NOW)
+
+    async with session_maker() as session:
+        async with session.begin():
+            run = _make_run(session)
+            client = _make_client(session)
+            await session.flush()
+            recipient = _make_recipient(session, run.id, client.id, status="delivered")
+            await session.flush()
+
+            job = _make_followup_job(session, run_id=run.id, recipient_id=recipient.id, client_id=client.id)
+            await session.flush()
+            job_id = job.id
+
+    await _lock_job(session_maker, job_id)
+
+    async with session_maker() as session:
+        async with session.begin():
+            await ow.process_job_in_session(session, job_id, provider=MagicMock())
+
+    async with session_maker() as session:
+        db_job = await session.get(MessageJob, job_id)
+
+    assert db_job.status == "queued"
+    assert db_job.attempts == 0
+    assert (db_job.payload or {}).get(ow._FOLLOWUP_LIVE_GUARD_ATTEMPTS_KEY) == 1
+    assert db_job.run_at is not None
+    assert abs((db_job.run_at - (NOW + timedelta(seconds=60))).total_seconds()) < 5
+    assert "Follow-up delayed" in (db_job.last_error or "")
+
+
+@pytest.mark.asyncio
+async def test_live_altegio_guard_fails_after_max_attempts(
+    ow_session,
+    session_maker,
+    monkeypatch,
+) -> None:
+    """E. max_attempts exhausted after repeated Altegio errors → job permanently failed."""
+    import httpx
+
+    async def _api_error(*_a, **_kw):
+        raise httpx.ConnectError("network down")
+
+    monkeypatch.setattr(ow, "client_has_any_future_record", _api_error)
+
+    async with session_maker() as session:
+        async with session.begin():
+            run = _make_run(session)
+            client = _make_client(session)
+            await session.flush()
+            recipient = _make_recipient(session, run.id, client.id, status="delivered")
+            await session.flush()
+
+            pre_attempts = ow.MAX_FOLLOWUP_LIVE_GUARD_ATTEMPTS - 1
+            job = _make_followup_job(session, run_id=run.id, recipient_id=recipient.id, client_id=client.id)
+            job.payload = {**job.payload, ow._FOLLOWUP_LIVE_GUARD_ATTEMPTS_KEY: pre_attempts}
+            await session.flush()
+            job_id = job.id
+
+    await _lock_job(session_maker, job_id)
+
+    async with session_maker() as session:
+        async with session.begin():
+            await ow.process_job_in_session(session, job_id, provider=MagicMock())
+
+    async with session_maker() as session:
+        db_job = await session.get(MessageJob, job_id)
+
+    assert db_job.status == "failed"
+    assert db_job.attempts == 0
+    assert (db_job.payload or {}).get(ow._FOLLOWUP_LIVE_GUARD_ATTEMPTS_KEY) == ow.MAX_FOLLOWUP_LIVE_GUARD_ATTEMPTS
+    assert "max attempts" in (db_job.last_error or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_live_altegio_guard_not_called_for_non_followup_job(
+    ow_session,
+    session_maker,
+    monkeypatch,
+) -> None:
+    """F. Non-followup job type → live Altegio check not called."""
+    from altegio_bot.models.models import Record as _Record
+
+    live_check = AsyncMock()
+    monkeypatch.setattr(ow, "client_has_any_future_record", live_check)
+    monkeypatch.setattr(ow, "client_has_future_appointments", AsyncMock(return_value=False))
+    monkeypatch.setattr(ow.settings, "whatsapp_send_mode", "text")
+    monkeypatch.setattr(ow.settings, "wa_131026_suppression_enabled", False)
+    monkeypatch.setattr(ow, "_apply_rate_limit", AsyncMock(return_value=None))
+    monkeypatch.setattr(ow, "safe_send", AsyncMock(return_value=("wamid.f-001", None)))
+
+    async def _fake_render(session, *, company_id, template_code, record, client):
+        return ("msg", None, "de", {})
+
+    monkeypatch.setattr(ow, "_render_message", _fake_render)
+
+    async with session_maker() as session:
+        async with session.begin():
+            client = Client(
+                company_id=COMPANY,
+                altegio_client_id=99001,
+                phone_e164=PHONE,
+                display_name="Test",
+                raw={},
+                wa_opted_out=False,
+            )
+            session.add(client)
+            await session.flush()
+
+            record = _Record(
+                company_id=COMPANY,
+                altegio_record_id=5001,
+                client_id=client.id,
+                altegio_client_id=99001,
+                starts_at=NOW - timedelta(days=10),
+                attendance=1,
+                visit_attendance=0,
+                is_deleted=False,
+                raw={},
+            )
+            session.add(record)
+            await session.flush()
+
+            job = MessageJob(
+                company_id=COMPANY,
+                client_id=client.id,
+                record_id=record.id,
+                job_type="repeat_10d",
+                run_at=NOW,
+                status="queued",
+                attempts=0,
+                max_attempts=5,
+                dedupe_key="live-guard-f-repeat10d-001",
+                payload={},
+            )
+            session.add(job)
+            await session.flush()
+            job_id = job.id
+
+    await _lock_job(session_maker, job_id)
+
+    async with session_maker() as session:
+        async with session.begin():
+            await ow.process_job_in_session(session, job_id, provider=MagicMock())
+
+    live_check.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_live_altegio_guard_not_called_when_db_guard_fires_booked(
+    ow_session,
+    session_maker,
+    monkeypatch,
+) -> None:
+    """G. DB guard fires (recipient booked_after_at set) → live Altegio check not called."""
+    live_check = AsyncMock()
+    monkeypatch.setattr(ow, "client_has_any_future_record", live_check)
+
+    async with session_maker() as session:
+        async with session.begin():
+            run = _make_run(session)
+            client = _make_client(session)
+            await session.flush()
+            recipient = _make_recipient(
+                session,
+                run.id,
+                client.id,
+                status="booked_after_campaign",
+                booked_after_at=NOW - timedelta(days=3),
+            )
+            await session.flush()
+            recipient_id = recipient.id
+
+            job = _make_followup_job(session, run_id=run.id, recipient_id=recipient.id, client_id=client.id)
+            await session.flush()
+            job_id = job.id
+
+    provider = MagicMock()
+    provider.send_template = AsyncMock()
+    provider.send = AsyncMock()
+
+    await _lock_job(session_maker, job_id)
+
+    async with session_maker() as session:
+        async with session.begin():
+            await ow.process_job_in_session(session, job_id, provider=provider)
+
+    async with session_maker() as session:
+        db_job = await session.get(MessageJob, job_id)
+        db_recipient = await session.get(CampaignRecipient, recipient_id)
+
+    live_check.assert_not_called()
+    provider.send_template.assert_not_called()
+    provider.send.assert_not_called()
+    assert db_job.status == "canceled"
+    assert db_recipient.followup_status == "skipped_booked_after"
+
+
+# ---------------------------------------------------------------------------
+# H. Live guard fails closed when altegio_client_id is missing from both
+#    CampaignRecipient and Client (fail-closed safety fix)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_live_altegio_guard_fails_closed_without_altegio_client_id(
+    ow_session,
+    session_maker,
+    monkeypatch,
+) -> None:
+    """H. No altegio_client_id on recipient or client → job fails permanently (fail-closed)."""
+    live_check = AsyncMock()
+    monkeypatch.setattr(ow, "client_has_any_future_record", live_check)
+
+    async with session_maker() as session:
+        async with session.begin():
+            run = _make_run(session)
+            await session.flush()
+            # CRM-only: no client row, so _load_client returns None
+            recipient = _make_recipient(session, run.id, client_id=None, status="delivered")
+            await session.flush()
+            # Override the helper's default of 99001 — make it truly None
+            recipient.altegio_client_id = None
+            await session.flush()
+            recipient_id = recipient.id
+
+            job = _make_followup_job(session, run_id=run.id, recipient_id=recipient.id, client_id=None)
+            await session.flush()
+            job_id = job.id
+            # Simulate the link that execute_followup sets in production.
+            recipient.followup_message_job_id = job_id
+
+    provider = MagicMock()
+    provider.send_template = AsyncMock()
+    provider.send = AsyncMock()
+
+    await _lock_job(session_maker, job_id)
+
+    async with session_maker() as session:
+        async with session.begin():
+            await ow.process_job_in_session(session, job_id, provider=provider)
+
+    async with session_maker() as session:
+        db_job = await session.get(MessageJob, job_id)
+        db_recipient = await session.get(CampaignRecipient, recipient_id)
+
+    live_check.assert_not_called()
+    provider.send_template.assert_not_called()
+    provider.send.assert_not_called()
+    assert db_job.status == "failed"
+    assert db_job.last_error is not None
+    assert "missing Altegio client id" in db_job.last_error
+    assert db_recipient.followup_status == "followup_failed"
+    assert db_recipient.followup_message_job_id == job_id
+
+
+# ---------------------------------------------------------------------------
+# I. Live guard falls back to client.altegio_client_id when recipient has None
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_live_altegio_guard_uses_client_altegio_id_fallback(
+    ow_session,
+    session_maker,
+    monkeypatch,
+) -> None:
+    """I. recipient.altegio_client_id=None + client.altegio_client_id=99001 → guard uses client id."""
+    captured_calls: list[int] = []
+
+    async def _live_check(*, company_id: int, altegio_client_id: int, **_kw):
+        captured_calls.append(altegio_client_id)
+        return False  # no future record → send path continues
+
+    monkeypatch.setattr(ow, "client_has_any_future_record", _live_check)
+    monkeypatch.setattr(ow.settings, "whatsapp_send_mode", "text")
+    monkeypatch.setattr(ow.settings, "wa_131026_suppression_enabled", False)
+    monkeypatch.setattr(ow, "_apply_rate_limit", AsyncMock(return_value=None))
+
+    send_mock = AsyncMock(return_value=("wamid.fallback-i-001", None))
+    monkeypatch.setattr(ow, "safe_send", send_mock)
+
+    async def _fake_render(session, *, company_id, template_code, record, client):
+        return ("Hallo Test!", None, "de", {"client_name": "Test"})
+
+    monkeypatch.setattr(ow, "_render_message", _fake_render)
+
+    async with session_maker() as session:
+        async with session.begin():
+            run = _make_run(session)
+            # _make_client always sets altegio_client_id=99001
+            client = _make_client(session)
+            await session.flush()
+            recipient = _make_recipient(session, run.id, client.id, status="delivered")
+            await session.flush()
+            # Nullify recipient's altegio_client_id to force fallback to client row
+            recipient.altegio_client_id = None
+            await session.flush()
+
+            job = _make_followup_job(session, run_id=run.id, recipient_id=recipient.id, client_id=client.id)
+            await session.flush()
+            job_id = job.id
+
+    await _lock_job(session_maker, job_id)
+
+    async with session_maker() as session:
+        async with session.begin():
+            await ow.process_job_in_session(session, job_id, provider=MagicMock())
+
+    async with session_maker() as session:
+        db_job = await session.get(MessageJob, job_id)
+
+    assert captured_calls == [99001], f"Expected live guard called with 99001, got {captured_calls}"
+    send_mock.assert_awaited()
+    assert "future Altegio record" not in (db_job.last_error or "")
+    assert "missing Altegio client id" not in (db_job.last_error or "")

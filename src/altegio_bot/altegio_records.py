@@ -241,6 +241,59 @@ async def count_attended_client_visits(
     return total
 
 
+async def client_has_any_future_record(
+    *,
+    company_id: int,
+    altegio_client_id: int,
+    now_dt: datetime | None = None,
+    timeout_sec: float = 15.0,
+) -> bool:
+    """Return True when the client has any non-deleted future record (any booking status).
+
+    Unlike client_has_future_appointments, this does NOT exclude cancelled
+    appointments (confirmed == 0).  Used by the follow-up live guard to be
+    maximally conservative — any non-deleted future record blocks the follow-up.
+
+    Records with no date fields at all (draft/placeholder rows) are silently
+    skipped, matching the behaviour of the local ``_has_future_record`` query
+    which requires ``starts_at > now``.
+
+    Raises:
+        AmbiguousRecordError: when a non-deleted record has non-empty but
+            unparseable date fields.  Callers must treat this as a transient
+            error and requeue the job rather than sending.
+        httpx.HTTPError: on network or HTTP errors.
+    """
+    current_dt = now_dt or datetime.now(timezone.utc)
+
+    async for rec in _iter_client_records(
+        company_id=company_id,
+        altegio_client_id=altegio_client_id,
+        timeout_sec=timeout_sec,
+    ):
+        if bool(rec.get("deleted")):
+            continue
+
+        raw_date = rec.get("date")
+        raw_datetime = rec.get("datetime")
+        starts_at = _parse_record_starts_at(rec)
+
+        if starts_at is None:
+            if raw_date or raw_datetime:
+                # Non-empty but unparseable date on a non-deleted record — be conservative.
+                raise AmbiguousRecordError(
+                    f"record id={rec.get('id')!r}: non-deleted record with unparseable"
+                    f" start time (date={raw_date!r}, datetime={raw_datetime!r})"
+                )
+            # No date at all (draft/placeholder) — cannot determine if future; skip.
+            continue
+
+        if starts_at > current_dt:
+            return True
+
+    return False
+
+
 async def client_has_future_appointments(
     *,
     company_id: int,

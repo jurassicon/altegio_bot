@@ -12,6 +12,7 @@ from sqlalchemy import or_, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.altegio_records import (
+    client_has_any_future_record,
     client_has_future_appointments,
     count_attended_client_visits,
 )
@@ -93,6 +94,12 @@ _TOKEN_EXPIRED = False
 # real WhatsApp send attempts. This prevents transient Altegio API outages from
 # consuming the send-attempt budget.
 MAX_API_GUARD_ATTEMPTS = 5
+
+# Separate counter for the follow-up live Altegio guard stored in job.payload.
+# Independent from _api_guard_attempts (which serves review_3d / repeat_10d / comeback_3d)
+# and from job.attempts (which counts actual WhatsApp send attempts).
+_FOLLOWUP_LIVE_GUARD_ATTEMPTS_KEY = "_followup_live_guard_attempts"
+MAX_FOLLOWUP_LIVE_GUARD_ATTEMPTS = 10
 
 COMEBACK_3D_MISSING_SOURCE_REASON = "Skipped: source record missing for comeback_3d"
 
@@ -263,6 +270,46 @@ def _handle_api_guard_error(job: MessageJob, exc: Exception) -> None:
     job.locked_at = None
     job.run_at = utcnow() + timedelta(seconds=delay)
     job.last_error = f"Altegio API error: {exc}"
+
+
+def _followup_live_guard_delay_seconds(attempt: int) -> int:
+    """Retry delay for the follow-up live Altegio guard: 1 min / 5 min / 25 min / 1 h+."""
+    if attempt <= 1:
+        return 60
+    if attempt == 2:
+        return 300
+    if attempt == 3:
+        return 1500
+    return 3600
+
+
+def _get_followup_live_guard_attempts(job: MessageJob) -> int:
+    """Return the current follow-up live guard retry count from job.payload."""
+    return int((getattr(job, "payload", None) or {}).get(_FOLLOWUP_LIVE_GUARD_ATTEMPTS_KEY, 0))
+
+
+def _handle_followup_live_guard_error(job: MessageJob, exc: Exception) -> None:
+    """Increment the follow-up live guard counter and requeue or permanently fail the job.
+
+    Uses a dedicated payload counter so transient Altegio outages do not consume
+    the job.attempts budget (which is reserved for real WhatsApp send attempts).
+    """
+    payload = dict(getattr(job, "payload", None) or {})
+    count = int(payload.get(_FOLLOWUP_LIVE_GUARD_ATTEMPTS_KEY, 0)) + 1
+    payload[_FOLLOWUP_LIVE_GUARD_ATTEMPTS_KEY] = count
+    job.payload = payload
+
+    if count >= MAX_FOLLOWUP_LIVE_GUARD_ATTEMPTS:
+        job.status = "failed"
+        job.locked_at = None
+        job.last_error = f"Follow-up delayed: Altegio future-record check failed (max attempts): {exc}"
+        return
+
+    delay = _followup_live_guard_delay_seconds(count)
+    job.status = "queued"
+    job.locked_at = None
+    job.run_at = utcnow() + timedelta(seconds=delay)
+    job.last_error = f"Follow-up delayed: Altegio future-record check failed: {exc}"
 
 
 def _fmt_money(value: Decimal | None) -> str:
@@ -948,6 +995,59 @@ async def _run_job_logic(
                 job.id,
                 _fu_recipient_id,
                 _guard.skip_reason,
+            )
+            return None
+
+        # Live Altegio guard: check for any non-deleted future record.
+        # Only runs when the local DB guard passes — no API call for already-ineligible recipients.
+        # altegio_client_id is taken from the recipient row (denormalised); falls back to the
+        # already-loaded client row for older jobs where it was not stored on the recipient.
+        _fu_altegio_cid: int | None = getattr(_fu_recipient, "altegio_client_id", None)
+        if _fu_altegio_cid is None and client is not None:
+            _fu_altegio_cid = getattr(client, "altegio_client_id", None)
+
+        if _fu_altegio_cid is None:
+            # Cannot perform the live future-record check without an Altegio client id.
+            # Fail permanently rather than silently skipping the guard (fail-closed).
+            job.status = "failed"
+            job.locked_at = None
+            job.last_error = "Follow-up failed: missing Altegio client id for live future-record check"
+            _fu_recipient.followup_status = "followup_failed"
+            # Keep followup_message_job_id pointing at this job for audit trail.
+            logger.error(
+                "followup live guard: no altegio_client_id job_id=%s recipient_id=%s — failing job",
+                job.id,
+                _fu_recipient_id,
+            )
+            return None
+
+        try:
+            _fu_has_future = await client_has_any_future_record(
+                company_id=job.company_id,
+                altegio_client_id=int(_fu_altegio_cid),
+            )
+        except Exception as exc:
+            logger.warning(
+                "followup live guard: Altegio API failed job_id=%s altegio_client_id=%s attempt=%d: %s",
+                job.id,
+                _fu_altegio_cid,
+                _get_followup_live_guard_attempts(job) + 1,
+                exc,
+            )
+            _handle_followup_live_guard_error(job, exc)
+            return None
+
+        if _fu_has_future:
+            _fu_recipient.followup_status = "skipped_future_record"
+            _fu_recipient.followup_message_job_id = None
+            job.status = "canceled"
+            job.locked_at = None
+            job.last_error = "Follow-up skipped: future Altegio record exists"
+            logger.info(
+                "followup live guard: future record found job_id=%s recipient_id=%s altegio_client_id=%s",
+                job.id,
+                _fu_recipient_id,
+                _fu_altegio_cid,
             )
             return None
 

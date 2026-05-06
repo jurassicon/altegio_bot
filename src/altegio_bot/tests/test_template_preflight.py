@@ -154,7 +154,7 @@ class _FakeSession:
                 booked_after_at=None,
                 client_id=None,
                 phone_e164=None,
-                altegio_client_id=None,
+                altegio_client_id=99001,
                 company_id=0,
                 sent_at=None,
                 outbox_message_id=None,
@@ -165,6 +165,14 @@ class _FakeSession:
 
             return SimpleNamespace(completed_at=datetime(2025, 1, 1, tzinfo=timezone.utc))
         return None
+
+    async def execute(self, stmt: Any) -> Any:
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            scalar_one_or_none=lambda: None,
+            scalars=lambda: SimpleNamespace(first=lambda: None, all=lambda: []),
+        )
 
 
 def _base_render_ctx(client_name: str = "Anna") -> dict:
@@ -193,6 +201,7 @@ def _patch_common(monkeypatch: Any) -> None:
     monkeypatch.setattr(ow, "_load_client", AsyncMock(return_value=None))
     monkeypatch.setattr(ow, "_apply_rate_limit", AsyncMock(return_value=None))
     monkeypatch.setattr(ow, "_count_131026_failures", AsyncMock(return_value=0))
+    monkeypatch.setattr(ow, "client_has_any_future_record", AsyncMock(return_value=False))
 
 
 # ---------------------------------------------------------------------------

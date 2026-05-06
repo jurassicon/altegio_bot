@@ -68,6 +68,7 @@ class _FakeClient:
     display_name: str = "Anna Müller"
     phone_e164: str | None = "+491234567890"
     wa_opted_out: bool = False
+    altegio_client_id: int = 99001
 
 
 class _FakeSession:
@@ -92,7 +93,7 @@ class _FakeSession:
                 booked_after_at=None,
                 client_id=None,
                 phone_e164=None,
-                altegio_client_id=None,
+                altegio_client_id=99001,
                 company_id=0,
                 sent_at=None,
                 outbox_message_id=None,
@@ -103,6 +104,14 @@ class _FakeSession:
 
             return SimpleNamespace(completed_at=datetime(2025, 1, 1, tzinfo=timezone.utc))
         return None
+
+    async def execute(self, stmt: Any) -> Any:
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            scalar_one_or_none=lambda: None,
+            scalars=lambda: SimpleNamespace(first=lambda: None, all=lambda: []),
+        )
 
     async def flush(self) -> None:
         pass
@@ -377,6 +386,7 @@ async def test_followup_local_client_passes_company_id(monkeypatch: Any) -> None
     _patch_rate_limit_ok(monkeypatch)
     _patch_render(monkeypatch, "Elena, wir vermissen dich!")
     monkeypatch.setattr(ow, "_load_client", AsyncMock(return_value=client))
+    monkeypatch.setattr(ow, "client_has_any_future_record", AsyncMock(return_value=False))
 
     captured: list[dict] = []
 
