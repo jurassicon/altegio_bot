@@ -2116,6 +2116,67 @@ def _recompute_stats_from_db(
     )
 
 
+async def _cancel_stale_queued_followup_jobs(
+    session: AsyncSession,
+    run_id: int,
+    recipients: list[CampaignRecipient],
+) -> int:
+    """Cancel queued follow-up jobs whose recipients became ineligible after recompute.
+
+    Must run after status/attribution sync so statuses reflect current reality.
+    Idempotent: already-canceled/done/failed jobs are skipped; a second call
+    cancels 0 additional jobs.
+
+    Returns the number of jobs canceled in this call.
+    """
+    # Index: followup_message_job_id → recipient (only followup_queued rows)
+    job_id_to_recipient: dict[int, CampaignRecipient] = {
+        r.followup_message_job_id: r
+        for r in recipients
+        if r.followup_message_job_id is not None and r.followup_status == "followup_queued"
+    }
+    if not job_id_to_recipient:
+        return 0
+
+    stmt = (
+        select(MessageJob)
+        .where(MessageJob.job_type == FOLLOWUP_JOB_TYPE)
+        .where(MessageJob.status == "queued")
+        .where(MessageJob.payload["campaign_run_id"].as_integer() == run_id)
+    )
+    jobs = list((await session.execute(stmt)).scalars().all())
+
+    canceled = 0
+    for job in jobs:
+        recipient = job_id_to_recipient.get(job.id)
+        if recipient is None:
+            continue
+
+        if recipient.read_at is not None or recipient.status in ("read", "replied"):
+            skip_reason = "skipped_read"
+            last_error = "Follow-up canceled by recompute: recipient became read"
+        elif recipient.booked_after_at is not None or recipient.status == "booked_after_campaign":
+            skip_reason = "skipped_booked_after"
+            last_error = "Follow-up canceled by recompute: recipient booked after campaign"
+        else:
+            continue
+
+        job.status = "canceled"
+        job.locked_at = None
+        job.last_error = last_error
+        recipient.followup_status = skip_reason
+        recipient.followup_message_job_id = None
+        canceled += 1
+
+    if canceled:
+        logger.info(
+            "recompute canceled stale queued follow-up jobs run_id=%d count=%d",
+            run_id,
+            canceled,
+        )
+    return canceled
+
+
 async def recompute_campaign_run_stats(
     session: AsyncSession,
     run_id: int,
@@ -2136,6 +2197,7 @@ async def recompute_campaign_run_stats(
     4. Sync CampaignRecipient.status forward from outbox state (Variant A).
     4a. Backfill CampaignRecipient.read_at from outbox meta when status='read'.
     4b. Backfill CampaignRecipient.booked_after_at from AltegioEvent records.
+    4c. Cancel queued follow-up jobs for recipients that became ineligible.
     5. Compute outbox_status_counts in Python from the resolved map.
     6. Recompute all CampaignRun aggregate counters.
 
@@ -2193,6 +2255,9 @@ async def recompute_campaign_run_stats(
             sorted(failed_svc_ids),
         )
 
+    # Step 4c: cancel queued follow-up jobs for recipients that became ineligible
+    canceled_followup_count = await _cancel_stale_queued_followup_jobs(session, run_id, recipients)
+
     # Step 5: compute outbox_status_counts from resolved map (Python, no SQL)
     outbox_status_counts: dict[str, int] = {}
     for ob in outbox_by_recipient.values():
@@ -2243,6 +2308,7 @@ async def recompute_campaign_run_stats(
         "cards_deleted_count": run.cards_deleted_count,
         "cleanup_failed_count": run.cleanup_failed_count,
         "relinked_recipients_count": relinked_count,
+        "canceled_stale_followup_jobs_count": canceled_followup_count,
         "booked_after_service_lookup_failed_count": len(failed_svc_ids),
         "booked_after_service_lookup_failed_service_ids": sorted(failed_svc_ids),
         "booked_after_service_lookup_failed_record_count": len(failed_rec_ids),
