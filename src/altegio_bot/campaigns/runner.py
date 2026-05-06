@@ -1732,9 +1732,9 @@ async def _resolve_outbox_for_recipients(
         job_ids = list({r.message_job_id for r in needs_job_lookup})
         stmt = select(OutboxMessage).where(OutboxMessage.job_id.in_(job_ids))
         if successful_only_fallback:
-            stmt = stmt.where(OutboxMessage.status.in_(_PROVIDER_ACCEPTED)).where(
-                OutboxMessage.provider_message_id.isnot(None)
-            )
+            # Only consider outboxes with a successful status — do NOT require
+            # provider_message_id here, some flows have status='sent' without one.
+            stmt = stmt.where(OutboxMessage.status.in_(_PROVIDER_ACCEPTED))
         stmt = stmt.order_by(OutboxMessage.job_id, OutboxMessage.id.desc())
         all_outboxes = (await session.execute(stmt)).scalars().all()
 
