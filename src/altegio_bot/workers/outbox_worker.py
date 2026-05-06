@@ -1006,36 +1006,48 @@ async def _run_job_logic(
         if _fu_altegio_cid is None and client is not None:
             _fu_altegio_cid = getattr(client, "altegio_client_id", None)
 
-        if _fu_altegio_cid is not None:
-            try:
-                _fu_has_future = await client_has_any_future_record(
-                    company_id=job.company_id,
-                    altegio_client_id=int(_fu_altegio_cid),
-                )
-            except Exception as exc:
-                logger.warning(
-                    "followup live guard: Altegio API failed job_id=%s altegio_client_id=%s attempt=%d: %s",
-                    job.id,
-                    _fu_altegio_cid,
-                    _get_followup_live_guard_attempts(job) + 1,
-                    exc,
-                )
-                _handle_followup_live_guard_error(job, exc)
-                return None
+        if _fu_altegio_cid is None:
+            # Cannot perform the live future-record check without an Altegio client id.
+            # Fail permanently rather than silently skipping the guard (fail-closed).
+            job.status = "failed"
+            job.locked_at = None
+            job.last_error = "Follow-up failed: missing Altegio client id for live future-record check"
+            logger.error(
+                "followup live guard: no altegio_client_id job_id=%s recipient_id=%s — failing job",
+                job.id,
+                _fu_recipient_id,
+            )
+            return None
 
-            if _fu_has_future:
-                _fu_recipient.followup_status = "skipped_future_record"
-                _fu_recipient.followup_message_job_id = None
-                job.status = "canceled"
-                job.locked_at = None
-                job.last_error = "Follow-up skipped: future Altegio record exists"
-                logger.info(
-                    "followup live guard: future record found job_id=%s recipient_id=%s altegio_client_id=%s",
-                    job.id,
-                    _fu_recipient_id,
-                    _fu_altegio_cid,
-                )
-                return None
+        try:
+            _fu_has_future = await client_has_any_future_record(
+                company_id=job.company_id,
+                altegio_client_id=int(_fu_altegio_cid),
+            )
+        except Exception as exc:
+            logger.warning(
+                "followup live guard: Altegio API failed job_id=%s altegio_client_id=%s attempt=%d: %s",
+                job.id,
+                _fu_altegio_cid,
+                _get_followup_live_guard_attempts(job) + 1,
+                exc,
+            )
+            _handle_followup_live_guard_error(job, exc)
+            return None
+
+        if _fu_has_future:
+            _fu_recipient.followup_status = "skipped_future_record"
+            _fu_recipient.followup_message_job_id = None
+            job.status = "canceled"
+            job.locked_at = None
+            job.last_error = "Follow-up skipped: future Altegio record exists"
+            logger.info(
+                "followup live guard: future record found job_id=%s recipient_id=%s altegio_client_id=%s",
+                job.id,
+                _fu_recipient_id,
+                _fu_altegio_cid,
+            )
+            return None
 
     if client is not None:
         opted_out = bool(getattr(client, "wa_opted_out", False))
