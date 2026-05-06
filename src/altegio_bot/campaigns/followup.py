@@ -1,18 +1,30 @@
 from __future__ import annotations
 
 import logging
-from datetime import timedelta
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 
-from sqlalchemy import select, update
+from sqlalchemy import and_, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.campaigns.runner import FOLLOWUP_JOB_TYPE
 from altegio_bot.db import SessionLocal
 from altegio_bot.message_planner import add_job, make_dedupe_key
-from altegio_bot.models.models import CampaignRecipient, CampaignRun, MessageJob
+from altegio_bot.models.models import AltegioEvent, CampaignRecipient, CampaignRun, Client, MessageJob, Record
 from altegio_bot.utils import utcnow
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class FollowupFinalEligibilityResult:
+    """Result of the final eligibility check before a follow-up is sent."""
+
+    eligible: bool
+    skip_reason: str | None
+    followup_status: str | None
+    booked_after_at: datetime | None
+
 
 # Статусы, которые означают «сообщение прочитано или позже» для follow-up политик.
 _READ_OR_LATER_STATUSES: frozenset[str] = frozenset({"read", "replied", "booked_after_campaign"})
@@ -346,6 +358,215 @@ async def execute_followup(run_id: int) -> dict:
         stats,
     )
     return stats
+
+
+async def _find_record_create_event(
+    session: AsyncSession,
+    *,
+    recipient: CampaignRecipient,
+    company_id: int,
+    attribution_start: datetime,
+) -> datetime | None:
+    """Return received_at of the earliest 'record create' AltegioEvent after attribution_start.
+
+    Joins AltegioEvent with Record to match by client identity.
+    Primary match: Record.client_id == recipient.client_id.
+    Fallback: Record.altegio_client_id == recipient.altegio_client_id (when client_id is None).
+
+    is_deleted is intentionally NOT filtered: a record created after the campaign but later
+    cancelled/deleted still means the marketing goal was achieved — follow-up must not be sent.
+    """
+    if recipient.client_id is not None:
+        client_cond = Record.client_id == recipient.client_id
+    else:
+        client_cond = Record.altegio_client_id == recipient.altegio_client_id
+
+    stmt = (
+        select(AltegioEvent.received_at)
+        .join(
+            Record,
+            and_(
+                Record.altegio_record_id == AltegioEvent.resource_id,
+                Record.company_id == company_id,
+            ),
+        )
+        .where(AltegioEvent.company_id == company_id)
+        .where(AltegioEvent.resource == "record")
+        .where(AltegioEvent.event_status == "create")
+        .where(AltegioEvent.received_at > attribution_start)
+        .where(client_cond)
+        .order_by(AltegioEvent.received_at.asc())
+        .limit(1)
+    )
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none()
+
+
+async def _has_future_record(
+    session: AsyncSession,
+    *,
+    recipient: CampaignRecipient,
+    company_id: int,
+    now: datetime,
+) -> bool:
+    """Return True if the client has at least one non-deleted future record."""
+    if recipient.client_id is not None:
+        client_cond = Record.client_id == recipient.client_id
+    else:
+        client_cond = Record.altegio_client_id == recipient.altegio_client_id
+
+    stmt = (
+        select(Record.id)
+        .where(Record.company_id == company_id)
+        .where(Record.starts_at > now)
+        .where(func.coalesce(Record.is_deleted, False).is_(False))
+        .where(client_cond)
+        .limit(1)
+    )
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none() is not None
+
+
+async def check_followup_final_eligibility(
+    session: AsyncSession,
+    recipient: CampaignRecipient,
+    run: CampaignRun | None,
+    now: datetime,
+) -> FollowupFinalEligibilityResult:
+    """Final eligibility guard before a follow-up message is sent.
+
+    Called at actual send time (outbox_worker) to catch state changes that occurred
+    between job creation (execute_followup) and actual delivery — typically 14 days.
+
+    Checks in order:
+      3.1  recipient status / read_at / booked_after_at
+      3.2  current opt-out state
+      3.3  new record create event after the original campaign (AltegioEvent)
+      3.4  any non-deleted future record already booked
+
+    Returns FollowupFinalEligibilityResult(eligible=True) when safe to send.
+    Eligible=False includes a followup_status string to persist on the recipient
+    and a human-readable skip_reason for job.last_error.
+    """
+    # 3.1 — status / attribution timestamps
+    if recipient.status in _READ_OR_LATER_STATUSES:
+        if recipient.status == "booked_after_campaign":
+            fs = "skipped_booked_after"
+            reason = "Follow-up skipped: recipient already booked after campaign"
+        else:
+            fs = "skipped_read"
+            reason = "Follow-up skipped: recipient already read or replied to original campaign"
+        return FollowupFinalEligibilityResult(
+            eligible=False,
+            skip_reason=reason,
+            followup_status=fs,
+            booked_after_at=recipient.booked_after_at,
+        )
+
+    if recipient.read_at is not None:
+        return FollowupFinalEligibilityResult(
+            eligible=False,
+            skip_reason="Follow-up skipped: recipient already read original campaign",
+            followup_status="skipped_read",
+            booked_after_at=None,
+        )
+
+    if recipient.booked_after_at is not None:
+        return FollowupFinalEligibilityResult(
+            eligible=False,
+            skip_reason="Follow-up skipped: recipient already booked after campaign",
+            followup_status="skipped_booked_after",
+            booked_after_at=recipient.booked_after_at,
+        )
+
+    # 3.2 — current opt-out
+    # Primary: look up by local client_id.
+    # Fallback 1: client_id set but Client row missing (stale ref) or client_id=None → phone lookup.
+    # Fallback 2: still None → altegio_client_id lookup.
+    opt_client: Client | None = None
+    if recipient.client_id is not None:
+        opt_client = await session.get(Client, recipient.client_id)
+    if opt_client is None and recipient.phone_e164:
+        opt_result = await session.execute(
+            select(Client)
+            .where(Client.company_id == recipient.company_id)
+            .where(Client.phone_e164 == recipient.phone_e164)
+            .limit(1)
+        )
+        opt_client = opt_result.scalar_one_or_none()
+    if opt_client is None and recipient.altegio_client_id is not None:
+        opt_result = await session.execute(
+            select(Client)
+            .where(Client.company_id == recipient.company_id)
+            .where(Client.altegio_client_id == recipient.altegio_client_id)
+            .limit(1)
+        )
+        opt_client = opt_result.scalar_one_or_none()
+
+    if opt_client is not None and opt_client.wa_opted_out:
+        return FollowupFinalEligibilityResult(
+            eligible=False,
+            skip_reason="Follow-up skipped: client has opted out",
+            followup_status="skipped_opted_out",
+            booked_after_at=None,
+        )
+
+    # Without any client identifier we cannot query records or events.
+    has_client_id = recipient.client_id is not None
+    has_altegio_id = recipient.altegio_client_id is not None
+    if not has_client_id and not has_altegio_id:
+        return FollowupFinalEligibilityResult(
+            eligible=True,
+            skip_reason=None,
+            followup_status=None,
+            booked_after_at=None,
+        )
+
+    # Attribution start: max(run.completed_at, recipient.sent_at).
+    attribution_start: datetime | None = None
+    if run is not None and run.completed_at is not None:
+        attribution_start = run.completed_at
+    if recipient.sent_at is not None:
+        if attribution_start is None or recipient.sent_at > attribution_start:
+            attribution_start = recipient.sent_at
+
+    # 3.3 — AltegioEvent record create after campaign
+    if attribution_start is not None:
+        evt_at = await _find_record_create_event(
+            session,
+            recipient=recipient,
+            company_id=recipient.company_id,
+            attribution_start=attribution_start,
+        )
+        if evt_at is not None:
+            return FollowupFinalEligibilityResult(
+                eligible=False,
+                skip_reason="Follow-up skipped: client booked after campaign",
+                followup_status="skipped_booked_after",
+                booked_after_at=evt_at,
+            )
+
+    # 3.4 — future record already booked
+    has_future = await _has_future_record(
+        session,
+        recipient=recipient,
+        company_id=recipient.company_id,
+        now=now,
+    )
+    if has_future:
+        return FollowupFinalEligibilityResult(
+            eligible=False,
+            skip_reason="Follow-up skipped: client has future record",
+            followup_status="skipped_future_record",
+            booked_after_at=None,
+        )
+
+    return FollowupFinalEligibilityResult(
+        eligible=True,
+        skip_reason=None,
+        followup_status=None,
+        booked_after_at=None,
+    )
 
 
 def followup_run_at(run: CampaignRun) -> str | None:

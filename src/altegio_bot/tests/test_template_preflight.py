@@ -143,6 +143,29 @@ class _FakeSession:
     def add(self, obj: Any) -> None:
         self.added.append(obj)
 
+    async def get(self, model: Any, pk: Any) -> Any:
+        from types import SimpleNamespace
+
+        name = getattr(model, "__name__", "")
+        if name == "CampaignRecipient":
+            return SimpleNamespace(
+                status="delivered",
+                read_at=None,
+                booked_after_at=None,
+                client_id=None,
+                phone_e164=None,
+                altegio_client_id=None,
+                company_id=0,
+                sent_at=None,
+                outbox_message_id=None,
+                provider_message_id=None,
+            )
+        if name == "CampaignRun":
+            from datetime import datetime, timezone
+
+            return SimpleNamespace(completed_at=datetime(2025, 1, 1, tzinfo=timezone.utc))
+        return None
+
 
 def _base_render_ctx(client_name: str = "Anna") -> dict:
     return {
@@ -298,6 +321,8 @@ async def test_followup_wrong_param_count_fails_locally(monkeypatch: Any) -> Non
             "kind": FOLLOWUP_JOB,
             "contact_name": "Hana Novak",
             "phone_e164": "+491777000111",
+            "campaign_recipient_id": 99999,
+            "campaign_run_id": 88888,
         },
     )
     session = _FakeSession()
