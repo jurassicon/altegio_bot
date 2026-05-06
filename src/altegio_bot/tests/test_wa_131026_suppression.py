@@ -276,6 +276,9 @@ class _FakeSession:
     async def execute(self, stmt: Any) -> _FakeScalarResult:
         return _FakeScalarResult()
 
+    async def flush(self) -> None:
+        pass
+
     async def get(self, model: Any, pk: Any) -> Any:
         from types import SimpleNamespace
 
@@ -568,3 +571,64 @@ def test_operator_relay_not_in_outbox_worker_path(monkeypatch: Any) -> None:
     _run(ow.process_job_in_session(_FakeSession(), 10, provider=object()))
 
     assert call_count[0] == 0, "_count_131026_failures must not be called when job returns early"
+
+
+# ---------------------------------------------------------------------------
+# Guard order tests: 131026 suppression vs live Altegio guard for follow-up
+# ---------------------------------------------------------------------------
+
+
+def test_followup_131026_suppression_skips_live_altegio_guard(monkeypatch: Any) -> None:
+    """131026 threshold reached → job suppressed before live Altegio guard is called.
+
+    Guard order for newsletter_new_clients_followup must be:
+      DB guard → 131026 suppression → live Altegio guard
+    When 131026 fires, client_has_any_future_record must NOT be called.
+    """
+    job = _FakeJob(
+        id=20,
+        company_id=758285,
+        job_type="newsletter_new_clients_followup",
+        payload={"campaign_recipient_id": 99999, "campaign_run_id": 88888},
+    )
+    _base_patches(monkeypatch, job=job, n_failures=2)
+    live_guard_mock = AsyncMock()
+    monkeypatch.setattr(ow, "client_has_any_future_record", live_guard_mock)
+    monkeypatch.setattr(ow, "safe_send", AsyncMock(return_value=("x", None)))
+    monkeypatch.setattr(ow, "safe_send_template", AsyncMock(return_value=("x", None)))
+
+    session = _FakeSession()
+    _run(ow.process_job_in_session(session, 20, provider=object()))
+
+    live_guard_mock.assert_not_called()
+    assert job.status == "canceled"
+    assert job.last_error is not None
+    assert job.last_error.startswith("suppressed_131026")
+    assert len(session.added) == 1
+    assert session.added[0].status == "canceled"
+
+
+def test_followup_live_guard_runs_when_131026_below_threshold(monkeypatch: Any) -> None:
+    """131026 failures below threshold → live Altegio guard is reached and called.
+
+    Guard order for newsletter_new_clients_followup:
+      DB guard → (131026 not fired) → live Altegio guard → send.
+    """
+    job = _FakeJob(
+        id=21,
+        company_id=758285,
+        job_type="newsletter_new_clients_followup",
+        payload={"campaign_recipient_id": 99999, "campaign_run_id": 88888},
+    )
+    _base_patches(monkeypatch, job=job, n_failures=1)  # below threshold of 2
+    live_guard_mock = AsyncMock(return_value=False)  # no future record → allow send
+    monkeypatch.setattr(ow, "client_has_any_future_record", live_guard_mock)
+    send_mock = _patch_text_send_path(monkeypatch)
+
+    session = _FakeSession()
+    _run(ow.process_job_in_session(session, 21, provider=object()))
+
+    live_guard_mock.assert_awaited_once()
+    send_mock.assert_awaited_once()
+    assert job.status == "done"
+    assert "suppressed_131026" not in (job.last_error or "")

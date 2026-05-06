@@ -927,9 +927,15 @@ async def _run_job_logic(
 
     client = await _load_client(session, job, record)
 
-    # Follow-up final eligibility guard: re-check current recipient/client state
-    # before the actual send.  Catches changes that happened during the 14-day
-    # delay between job creation and delivery (read, booking, opt-out, future record).
+    # Follow-up final eligibility guard (DB phase): re-check current recipient/client state
+    # before the actual send.  Catches changes that happened during the 14-day delay between
+    # job creation and delivery (read, booking, opt-out).
+    # NOTE: the live Altegio future-record check runs AFTER the 131026 suppression guard so
+    # that a locally known-undeliverable phone short-circuits before we hit an external API.
+    _fu_recipient: CampaignRecipient | None = None
+    _fu_recipient_id: int | None = None
+    _fu_altegio_cid: int | None = None
+
     if job.job_type == FOLLOWUP_JOB_TYPE:
         _fu_payload = getattr(job, "payload", None) or {}
         _fu_recipient_id = _fu_payload.get("campaign_recipient_id")
@@ -998,58 +1004,11 @@ async def _run_job_logic(
             )
             return None
 
-        # Live Altegio guard: check for any non-deleted future record.
-        # Only runs when the local DB guard passes — no API call for already-ineligible recipients.
-        # altegio_client_id is taken from the recipient row (denormalised); falls back to the
-        # already-loaded client row for older jobs where it was not stored on the recipient.
-        _fu_altegio_cid: int | None = getattr(_fu_recipient, "altegio_client_id", None)
+        # Resolve altegio_client_id now (recipient row first, then loaded client row as fallback).
+        # The actual live API call happens after the 131026 suppression check below.
+        _fu_altegio_cid = getattr(_fu_recipient, "altegio_client_id", None)
         if _fu_altegio_cid is None and client is not None:
             _fu_altegio_cid = getattr(client, "altegio_client_id", None)
-
-        if _fu_altegio_cid is None:
-            # Cannot perform the live future-record check without an Altegio client id.
-            # Fail permanently rather than silently skipping the guard (fail-closed).
-            job.status = "failed"
-            job.locked_at = None
-            job.last_error = "Follow-up failed: missing Altegio client id for live future-record check"
-            _fu_recipient.followup_status = "followup_failed"
-            # Keep followup_message_job_id pointing at this job for audit trail.
-            logger.error(
-                "followup live guard: no altegio_client_id job_id=%s recipient_id=%s — failing job",
-                job.id,
-                _fu_recipient_id,
-            )
-            return None
-
-        try:
-            _fu_has_future = await client_has_any_future_record(
-                company_id=job.company_id,
-                altegio_client_id=int(_fu_altegio_cid),
-            )
-        except Exception as exc:
-            logger.warning(
-                "followup live guard: Altegio API failed job_id=%s altegio_client_id=%s attempt=%d: %s",
-                job.id,
-                _fu_altegio_cid,
-                _get_followup_live_guard_attempts(job) + 1,
-                exc,
-            )
-            _handle_followup_live_guard_error(job, exc)
-            return None
-
-        if _fu_has_future:
-            _fu_recipient.followup_status = "skipped_future_record"
-            _fu_recipient.followup_message_job_id = None
-            job.status = "canceled"
-            job.locked_at = None
-            job.last_error = "Follow-up skipped: future Altegio record exists"
-            logger.info(
-                "followup live guard: future record found job_id=%s recipient_id=%s altegio_client_id=%s",
-                job.id,
-                _fu_recipient_id,
-                _fu_altegio_cid,
-            )
-            return None
 
     if client is not None:
         opted_out = bool(getattr(client, "wa_opted_out", False))
@@ -1282,6 +1241,58 @@ async def _run_job_logic(
                 _wd,
             )
             return
+
+    # Live Altegio guard (follow-up only): check for any non-deleted future record.
+    # Runs here — AFTER the 131026 suppression guard — so a locally known-undeliverable
+    # phone short-circuits before we call an external API.
+    # Only reached when the DB guard passed (recipient eligible) and 131026 did not fire.
+    if job.job_type == FOLLOWUP_JOB_TYPE:
+        if _fu_altegio_cid is None:
+            # Cannot perform the live future-record check without an Altegio client id.
+            # Fail permanently rather than silently skipping the guard (fail-closed).
+            job.status = "failed"
+            job.locked_at = None
+            job.last_error = "Follow-up failed: missing Altegio client id for live future-record check"
+            assert _fu_recipient is not None  # always set when job_type == FOLLOWUP_JOB_TYPE
+            _fu_recipient.followup_status = "followup_failed"
+            # Keep followup_message_job_id pointing at this job for audit trail.
+            logger.error(
+                "followup live guard: no altegio_client_id job_id=%s recipient_id=%s — failing job",
+                job.id,
+                _fu_recipient_id,
+            )
+            return None
+
+        try:
+            _fu_has_future = await client_has_any_future_record(
+                company_id=job.company_id,
+                altegio_client_id=int(_fu_altegio_cid),
+            )
+        except Exception as exc:
+            logger.warning(
+                "followup live guard: Altegio API failed job_id=%s altegio_client_id=%s attempt=%d: %s",
+                job.id,
+                _fu_altegio_cid,
+                _get_followup_live_guard_attempts(job) + 1,
+                exc,
+            )
+            _handle_followup_live_guard_error(job, exc)
+            return None
+
+        if _fu_has_future:
+            assert _fu_recipient is not None
+            _fu_recipient.followup_status = "skipped_future_record"
+            _fu_recipient.followup_message_job_id = None
+            job.status = "canceled"
+            job.locked_at = None
+            job.last_error = "Follow-up skipped: future Altegio record exists"
+            logger.info(
+                "followup live guard: future record found job_id=%s recipient_id=%s altegio_client_id=%s",
+                job.id,
+                _fu_recipient_id,
+                _fu_altegio_cid,
+            )
+            return None
 
     delay_until = await _apply_rate_limit(session, phone)
     if delay_until is not None:
