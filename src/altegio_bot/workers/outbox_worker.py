@@ -1012,6 +1012,8 @@ async def _run_job_logic(
             job.status = "failed"
             job.locked_at = None
             job.last_error = "Follow-up failed: missing Altegio client id for live future-record check"
+            _fu_recipient.followup_status = "followup_failed"
+            # Keep followup_message_job_id pointing at this job for audit trail.
             logger.error(
                 "followup live guard: no altegio_client_id job_id=%s recipient_id=%s — failing job",
                 job.id,

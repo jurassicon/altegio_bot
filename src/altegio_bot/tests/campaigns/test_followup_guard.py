@@ -1346,6 +1346,8 @@ async def test_live_altegio_guard_fails_closed_without_altegio_client_id(
             job = _make_followup_job(session, run_id=run.id, recipient_id=recipient.id, client_id=None)
             await session.flush()
             job_id = job.id
+            # Simulate the link that execute_followup sets in production.
+            recipient.followup_message_job_id = job_id
 
     provider = MagicMock()
     provider.send_template = AsyncMock()
@@ -1367,8 +1369,8 @@ async def test_live_altegio_guard_fails_closed_without_altegio_client_id(
     assert db_job.status == "failed"
     assert db_job.last_error is not None
     assert "missing Altegio client id" in db_job.last_error
-    # recipient followup_status should remain unchanged (not yet written by guard)
-    assert db_recipient.followup_status == "followup_planned"
+    assert db_recipient.followup_status == "followup_failed"
+    assert db_recipient.followup_message_job_id == job_id
 
 
 # ---------------------------------------------------------------------------
