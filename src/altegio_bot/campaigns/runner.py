@@ -1608,6 +1608,90 @@ _OUTBOX_TO_RECIPIENT_STATUS: dict[str, str] = {
 }
 
 
+async def _sync_recipients_to_latest_successful_outbox(
+    session: AsyncSession,
+    recipients: list[CampaignRecipient],
+) -> int:
+    """Relink recipients whose outbox_message_id points to a non-successful row.
+
+    For each non-skipped recipient with a message_job_id, finds the best
+    successful OutboxMessage for that job (status in {sent, delivered, read}
+    AND provider_message_id IS NOT NULL), picking the one with the highest
+    delivery rank (ties broken by highest id).
+
+    If the recipient is already linked to that outbox → no-op (idempotent).
+    If the best successful outbox would downgrade the recipient's current
+    delivery rank → skipped (read is never downgraded to delivered/sent).
+
+    Also advances recipient.status and backfills sent_at from the best outbox.
+
+    Returns the count of recipients actually relinked.
+    """
+    job_ids = {r.message_job_id for r in recipients if r.status != "skipped" and r.message_job_id is not None}
+    if not job_ids:
+        return 0
+
+    stmt = (
+        select(OutboxMessage)
+        .where(OutboxMessage.job_id.in_(job_ids))
+        .where(OutboxMessage.status.in_(_PROVIDER_ACCEPTED))
+        .where(OutboxMessage.provider_message_id.isnot(None))
+        .order_by(OutboxMessage.job_id, OutboxMessage.id.desc())
+    )
+    rows = (await session.execute(stmt)).scalars().all()
+
+    # For each job pick the best: highest delivery rank, ties by highest id.
+    best_by_job: dict[int, OutboxMessage] = {}
+    for ob in rows:
+        jid = ob.job_id
+        if jid is None:
+            continue
+        if jid not in best_by_job:
+            best_by_job[jid] = ob  # desc order ⟹ first seen = highest id
+        else:
+            existing_rank = _OUTBOX_STATUS_RANK.get(best_by_job[jid].status, 0)
+            new_rank = _OUTBOX_STATUS_RANK.get(ob.status, 0)
+            if new_rank > existing_rank:
+                best_by_job[jid] = ob
+
+    if not best_by_job:
+        return 0
+
+    relinked = 0
+    for r in recipients:
+        if r.status == "skipped" or r.message_job_id is None:
+            continue
+
+        best = best_by_job.get(r.message_job_id)
+        if best is None:
+            continue  # no successful outbox for this job
+
+        if r.outbox_message_id == best.id:
+            continue  # already linked to the best → idempotent
+
+        # Don't downgrade: if the best outbox's implied recipient status is
+        # lower than the recipient's current status, skip.
+        best_target = _OUTBOX_TO_RECIPIENT_STATUS.get(best.status)
+        if best_target is not None:
+            if _RECIPIENT_STATUS_RANK.get(best_target, 0) < _RECIPIENT_STATUS_RANK.get(r.status, 0):
+                continue
+
+        # Relink
+        r.outbox_message_id = best.id
+        r.provider_message_id = best.provider_message_id
+        if best.sent_at is not None:
+            r.sent_at = best.sent_at
+
+        # Advance recipient status (never downgrade — guarded above).
+        if best_target is not None:
+            if _RECIPIENT_STATUS_RANK.get(best_target, 0) > _RECIPIENT_STATUS_RANK.get(r.status, 0):
+                r.status = best_target
+
+        relinked += 1
+
+    return relinked
+
+
 async def _resolve_outbox_for_recipients(
     session: AsyncSession,
     recipients: list[CampaignRecipient],
@@ -2057,6 +2141,14 @@ async def recompute_campaign_run_stats(
     r_stmt = select(CampaignRecipient).where(CampaignRecipient.campaign_run_id == run_id)
     recipients = list((await session.execute(r_stmt)).scalars().all())
 
+    # Step 1a: relink recipients whose outbox_message_id points to a failed row
+    # to the latest successful OutboxMessage for their message_job_id.
+    # Must run before _resolve_outbox_for_recipients so Pass 1 picks up the
+    # corrected outbox_message_id.
+    relinked_count = await _sync_recipients_to_latest_successful_outbox(session, recipients)
+    if relinked_count:
+        logger.info("recompute relinked campaign recipients run_id=%d count=%d", run_id, relinked_count)
+
     # Step 2: resolve best outbox per recipient (direct + job_id fallback)
     outbox_by_recipient = await _resolve_outbox_for_recipients(session, recipients)
 
@@ -2140,6 +2232,7 @@ async def recompute_campaign_run_stats(
         "cards_issued_count": run.cards_issued_count,
         "cards_deleted_count": run.cards_deleted_count,
         "cleanup_failed_count": run.cleanup_failed_count,
+        "relinked_recipients_count": relinked_count,
         "booked_after_service_lookup_failed_count": len(failed_svc_ids),
         "booked_after_service_lookup_failed_service_ids": sorted(failed_svc_ids),
         "booked_after_service_lookup_failed_record_count": len(failed_rec_ids),

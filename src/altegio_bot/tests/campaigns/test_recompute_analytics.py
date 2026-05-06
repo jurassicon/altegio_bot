@@ -3787,3 +3787,365 @@ async def test_last_recompute_meta_cleared_on_clean_recompute(session_maker, mon
     assert lr2["booked_after_service_lookup_failed_count"] == 0
     assert lr2["booked_after_service_lookup_failed_service_ids"] == []
     assert summary2["booked_after_count"] == 1, "lash booking now resolves correctly"
+
+
+# ==========================================================================
+# Relink to latest successful outbox (Run #21 production fix)
+# ==========================================================================
+#
+# A. Recipient linked to failed outbox; latest successful is delivered
+#    → recompute relinks; delivered_count updates.
+# B. Recipient linked to failed outbox; latest successful is read
+#    → recompute relinks; read_count updates.
+# C. Recipient already linked to the latest successful outbox
+#    → idempotent; relink count 0.
+# D. Skipped recipient
+#    → not relinked.
+# E. No successful outbox exists
+#    → not relinked.
+# F. Outbox with provider_message_id but status='failed'
+#    → not considered successful; not relinked.
+# G. Multiple successful outboxes for one job
+#    → latest by id wins (highest delivery rank, ties by id).
+# ==========================================================================
+
+_RELINK_COMPANY = 758285
+_RELINK_PHONE = "+4915100000099"
+_RELINK_SENT_AT = _COMPLETED_AT
+
+
+def _make_relink_job(session, *, run_id: int, dedupe: str) -> MessageJob:
+    job = MessageJob(
+        company_id=_RELINK_COMPANY,
+        job_type="newsletter_new_clients_monthly",
+        run_at=_RELINK_SENT_AT,
+        status="done",
+        dedupe_key=dedupe,
+        payload={"campaign_run_id": run_id},
+    )
+    session.add(job)
+    return job
+
+
+def _make_relink_outbox(
+    session,
+    *,
+    job_id: int,
+    status: str,
+    provider_message_id: str | None = "wamid.relink001",
+    sent_at: datetime | None = None,
+) -> OutboxMessage:
+    ob = OutboxMessage(
+        company_id=_RELINK_COMPANY,
+        phone_e164=_RELINK_PHONE,
+        template_code="newsletter_new_clients_monthly",
+        language="de",
+        body="Relink test",
+        status=status,
+        scheduled_at=_RELINK_SENT_AT,
+        provider_message_id=provider_message_id,
+        sent_at=sent_at or _RELINK_SENT_AT,
+        job_id=job_id,
+        meta={},
+    )
+    session.add(ob)
+    return ob
+
+
+def _make_relink_recipient(
+    session,
+    *,
+    run_id: int,
+    job_id: int | None,
+    outbox_id: int | None,
+    status: str = "queued",
+    provider_message_id: str | None = None,
+) -> CampaignRecipient:
+    r = CampaignRecipient(
+        campaign_run_id=run_id,
+        company_id=_RELINK_COMPANY,
+        phone_e164=_RELINK_PHONE,
+        display_name="Relink Client",
+        status=status,
+        message_job_id=job_id,
+        outbox_message_id=outbox_id,
+        provider_message_id=provider_message_id,
+        sent_at=_RELINK_SENT_AT if outbox_id else None,
+        meta={},
+    )
+    session.add(r)
+    return r
+
+
+@pytest.mark.asyncio
+async def test_relink_to_latest_successful_outbox_delivered(session_maker) -> None:
+    """A. Recipient linked to failed outbox; latest successful is 'delivered'.
+    Recompute relinks recipient to delivered outbox; delivered_count == 1.
+    """
+    run_id = await _make_run(session_maker)
+
+    async with session_maker() as session:
+        async with session.begin():
+            job = _make_relink_job(session, run_id=run_id, dedupe="relink-a-job")
+            await session.flush()
+
+            failed_ob = _make_relink_outbox(session, job_id=job.id, status="failed", provider_message_id=None)
+            delivered_ob = _make_relink_outbox(
+                session, job_id=job.id, status="delivered", provider_message_id="wamid.a-delivered"
+            )
+            await session.flush()
+
+            recipient = _make_relink_recipient(
+                session,
+                run_id=run_id,
+                job_id=job.id,
+                outbox_id=failed_ob.id,
+                provider_message_id=None,
+            )
+            await session.flush()
+            recipient_id = recipient.id
+            delivered_ob_id = delivered_ob.id
+
+    async with session_maker() as session:
+        async with session.begin():
+            summary = await recompute_campaign_run_stats(session, run_id)
+
+    async with session_maker() as session:
+        run = await session.get(CampaignRun, run_id)
+        recip = await session.get(CampaignRecipient, recipient_id)
+
+    assert summary["relinked_recipients_count"] == 1
+    assert recip.outbox_message_id == delivered_ob_id
+    assert recip.provider_message_id == "wamid.a-delivered"
+    assert recip.status == "delivered"
+    assert run.delivered_count == 1
+    assert run.read_count == 0
+
+
+@pytest.mark.asyncio
+async def test_relink_to_latest_successful_outbox_read(session_maker) -> None:
+    """B. Recipient linked to failed outbox; latest successful is 'read'.
+    Recompute relinks to read outbox; read_count == 1.
+    """
+    run_id = await _make_run(session_maker)
+
+    async with session_maker() as session:
+        async with session.begin():
+            job = _make_relink_job(session, run_id=run_id, dedupe="relink-b-job")
+            await session.flush()
+
+            failed_ob = _make_relink_outbox(session, job_id=job.id, status="failed", provider_message_id=None)
+            read_ob = _make_relink_outbox(
+                session,
+                job_id=job.id,
+                status="read",
+                provider_message_id="wamid.b-read",
+            )
+            await session.flush()
+
+            recipient = _make_relink_recipient(session, run_id=run_id, job_id=job.id, outbox_id=failed_ob.id)
+            await session.flush()
+            recipient_id = recipient.id
+            read_ob_id = read_ob.id
+
+    async with session_maker() as session:
+        async with session.begin():
+            summary = await recompute_campaign_run_stats(session, run_id)
+
+    async with session_maker() as session:
+        run = await session.get(CampaignRun, run_id)
+        recip = await session.get(CampaignRecipient, recipient_id)
+
+    assert summary["relinked_recipients_count"] == 1
+    assert recip.outbox_message_id == read_ob_id
+    assert recip.provider_message_id == "wamid.b-read"
+    assert recip.status == "read"
+    assert run.read_count == 1
+
+
+@pytest.mark.asyncio
+async def test_relink_idempotent_when_already_on_successful_outbox(session_maker) -> None:
+    """C. Recipient already linked to the latest successful outbox.
+    Second recompute makes no changes; relinked_recipients_count == 0.
+    """
+    run_id = await _make_run(session_maker)
+
+    async with session_maker() as session:
+        async with session.begin():
+            job = _make_relink_job(session, run_id=run_id, dedupe="relink-c-job")
+            await session.flush()
+
+            delivered_ob = _make_relink_outbox(
+                session,
+                job_id=job.id,
+                status="delivered",
+                provider_message_id="wamid.c-delivered",
+            )
+            await session.flush()
+
+            _make_relink_recipient(
+                session,
+                run_id=run_id,
+                job_id=job.id,
+                outbox_id=delivered_ob.id,
+                provider_message_id="wamid.c-delivered",
+                status="delivered",
+            )
+            await session.flush()
+
+    async with session_maker() as session:
+        async with session.begin():
+            summary = await recompute_campaign_run_stats(session, run_id)
+
+    assert summary["relinked_recipients_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_relink_skips_skipped_recipient(session_maker) -> None:
+    """D. Skipped recipient is never relinked even if a successful outbox exists."""
+    run_id = await _make_run(session_maker)
+
+    async with session_maker() as session:
+        async with session.begin():
+            job = _make_relink_job(session, run_id=run_id, dedupe="relink-d-job")
+            await session.flush()
+
+            _make_relink_outbox(session, job_id=job.id, status="delivered", provider_message_id="wamid.d")
+            await session.flush()
+
+            recipient = _make_relink_recipient(
+                session,
+                run_id=run_id,
+                job_id=job.id,
+                outbox_id=None,
+                status="skipped",
+            )
+            await session.flush()
+            recipient_id = recipient.id
+
+    async with session_maker() as session:
+        async with session.begin():
+            summary = await recompute_campaign_run_stats(session, run_id)
+
+    async with session_maker() as session:
+        recip = await session.get(CampaignRecipient, recipient_id)
+
+    assert summary["relinked_recipients_count"] == 0
+    assert recip.outbox_message_id is None
+    assert recip.status == "skipped"
+
+
+@pytest.mark.asyncio
+async def test_relink_no_successful_outbox(session_maker) -> None:
+    """E. No successful outbox exists for this job → recipient not touched."""
+    run_id = await _make_run(session_maker)
+
+    async with session_maker() as session:
+        async with session.begin():
+            job = _make_relink_job(session, run_id=run_id, dedupe="relink-e-job")
+            await session.flush()
+
+            _make_relink_outbox(
+                session,
+                job_id=job.id,
+                status="failed",
+                provider_message_id=None,
+            )
+            await session.flush()
+
+            recipient = _make_relink_recipient(session, run_id=run_id, job_id=job.id, outbox_id=None)
+            await session.flush()
+            recipient_id = recipient.id
+
+    async with session_maker() as session:
+        async with session.begin():
+            summary = await recompute_campaign_run_stats(session, run_id)
+
+    async with session_maker() as session:
+        recip = await session.get(CampaignRecipient, recipient_id)
+
+    assert summary["relinked_recipients_count"] == 0
+    assert recip.outbox_message_id is None
+
+
+@pytest.mark.asyncio
+async def test_relink_failed_with_provider_message_id_not_successful(session_maker) -> None:
+    """F. Outbox with provider_message_id but status='failed' is not considered successful."""
+    run_id = await _make_run(session_maker)
+
+    async with session_maker() as session:
+        async with session.begin():
+            job = _make_relink_job(session, run_id=run_id, dedupe="relink-f-job")
+            await session.flush()
+
+            # Has provider_message_id but status is failed → must NOT qualify
+            _make_relink_outbox(
+                session,
+                job_id=job.id,
+                status="failed",
+                provider_message_id="wamid.f-has-id-but-failed",
+            )
+            await session.flush()
+
+            recipient = _make_relink_recipient(session, run_id=run_id, job_id=job.id, outbox_id=None)
+            await session.flush()
+            recipient_id = recipient.id
+
+    async with session_maker() as session:
+        async with session.begin():
+            summary = await recompute_campaign_run_stats(session, run_id)
+
+    async with session_maker() as session:
+        recip = await session.get(CampaignRecipient, recipient_id)
+
+    assert summary["relinked_recipients_count"] == 0
+    assert recip.outbox_message_id is None
+
+
+@pytest.mark.asyncio
+async def test_relink_multiple_successful_outboxes_latest_id_wins(session_maker) -> None:
+    """G. Multiple successful outboxes for one job → highest delivery rank wins,
+    ties broken by highest id (latest read outbox takes precedence over older delivered).
+    """
+    run_id = await _make_run(session_maker)
+
+    async with session_maker() as session:
+        async with session.begin():
+            job = _make_relink_job(session, run_id=run_id, dedupe="relink-g-job")
+            await session.flush()
+
+            failed_ob = _make_relink_outbox(session, job_id=job.id, status="failed", provider_message_id=None)
+            _make_relink_outbox(
+                session,
+                job_id=job.id,
+                status="delivered",
+                provider_message_id="wamid.g-delivered",
+            )
+            # read outbox has highest id AND highest delivery rank → must win
+            read_ob = _make_relink_outbox(
+                session,
+                job_id=job.id,
+                status="read",
+                provider_message_id="wamid.g-read",
+            )
+            await session.flush()
+
+            recipient = _make_relink_recipient(session, run_id=run_id, job_id=job.id, outbox_id=failed_ob.id)
+            await session.flush()
+            recipient_id = recipient.id
+            read_ob_id = read_ob.id
+
+    async with session_maker() as session:
+        async with session.begin():
+            summary = await recompute_campaign_run_stats(session, run_id)
+
+    async with session_maker() as session:
+        run = await session.get(CampaignRun, run_id)
+        recip = await session.get(CampaignRecipient, recipient_id)
+
+    assert summary["relinked_recipients_count"] == 1
+    assert recip.outbox_message_id == read_ob_id, "read outbox must win"
+    assert recip.provider_message_id == "wamid.g-read"
+    assert recip.status == "read"
+    assert run.read_count == 1
+    assert run.delivered_count == 0  # read is not double-counted as delivered
