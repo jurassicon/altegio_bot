@@ -41,6 +41,31 @@ _TERMINAL_FOLLOWUP_STATUSES: frozenset[str] = frozenset(
     }
 )
 
+# Only these original-send statuses qualify for a follow-up.
+# provider_message_id alone is not sufficient proof of a successful send —
+# failed/excluded rows may carry a provider_message_id or sent_at.
+_POSITIVE_ORIGINAL_SEND_STATUSES: frozenset[str] = frozenset(
+    {
+        "provider_accepted",
+        "sent",
+        "delivered",
+        # read / replied / booked_after_campaign are caught before we reach
+        # this check, so they do not need to be listed here.
+    }
+)
+
+# excluded_reason values that indicate a hard send failure.
+# Defensive belt-and-suspenders: a recipient could theoretically have
+# status='delivered' with a stale excluded_reason from a previous state.
+_HARD_FAILURE_EXCLUDED_REASONS: frozenset[str] = frozenset(
+    {
+        "provider_error",
+        "delivery_failed",
+        "card_issue_failed",
+        "cleanup_failed",
+    }
+)
+
 
 @dataclass
 class _RecipientRow:
@@ -69,6 +94,7 @@ class RepairStats:
     skipped_future_record: int = 0
     skipped_opted_out: int = 0
     skipped_existing_job: int = 0
+    skipped_not_sent: int = 0
     skipped_missing_send: int = 0
     skipped_other: int = 0
     rows: list[_RecipientRow] = field(default_factory=list)
@@ -174,6 +200,34 @@ async def schedule_followups(
                     stats.skipped_missing_send += 1
                     stats.rows.append(
                         _make_row(recipient, decision="skip", run_at=None, reason="no_provider_message_id")
+                    )
+                    continue
+
+                # Require a positive original-send status.  provider_message_id
+                # alone is not proof of success — failed rows can carry one.
+                if recipient.status not in _POSITIVE_ORIGINAL_SEND_STATUSES:
+                    stats.skipped_not_sent += 1
+                    stats.rows.append(
+                        _make_row(
+                            recipient,
+                            decision="skip",
+                            run_at=None,
+                            reason=f"non_positive_status:{recipient.status}",
+                        )
+                    )
+                    continue
+
+                # Belt-and-suspenders: block hard-failure excluded_reasons even
+                # when the status field looks positive.
+                if recipient.excluded_reason in _HARD_FAILURE_EXCLUDED_REASONS:
+                    stats.skipped_not_sent += 1
+                    stats.rows.append(
+                        _make_row(
+                            recipient,
+                            decision="skip",
+                            run_at=None,
+                            reason=f"hard_failure_excluded_reason:{recipient.excluded_reason}",
+                        )
                     )
                     continue
 
@@ -326,6 +380,7 @@ def _print_summary(stats: RepairStats) -> None:
     print(f"  skipped_booked_after  : {stats.skipped_booked_after}")
     print(f"  skipped_future_record : {stats.skipped_future_record}")
     print(f"  skipped_opted_out     : {stats.skipped_opted_out}")
+    print(f"  skipped_not_sent      : {stats.skipped_not_sent}")
     print(f"  skipped_existing_job  : {stats.skipped_existing_job}")
     print(f"  skipped_missing_send  : {stats.skipped_missing_send}")
     print(f"  skipped_other         : {stats.skipped_other}")

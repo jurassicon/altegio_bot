@@ -14,6 +14,12 @@ Coverage:
   K. --apply writes followup_status for skipped booked/future recipient
   L. Anna-like case: delivered/unread + record create-event after sent_at + future record;
      no job created; on --apply recipient gets followup_status and booked_after_at.
+
+P2 hardening (status allow-list + time freeze):
+  M. failed recipient with provider_message_id is not scheduled
+  N. cleanup_failed recipient is not scheduled
+  O. provider_accepted recipient can be scheduled
+  P. excluded_reason=provider_error blocks scheduling
 """
 
 from __future__ import annotations
@@ -23,6 +29,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from sqlalchemy import func, select
 
+import altegio_bot.scripts.repair_schedule_campaign_followups as repair
 from altegio_bot.campaigns.runner import FOLLOWUP_JOB_TYPE
 from altegio_bot.models.models import (
     AltegioEvent,
@@ -44,6 +51,18 @@ SENT_AT = NOW - timedelta(days=20)
 COMPLETED_AT = NOW - timedelta(days=20)
 DELAY_DAYS = 14
 EXPECTED_RUN_AT = SENT_AT + timedelta(days=DELAY_DAYS)
+
+
+# ---------------------------------------------------------------------------
+# Time freeze: patch repair.utcnow so all tests use a fixed 'now'.
+# Without this, tests that rely on future records (starts_at=NOW+N days)
+# become flaky once wall-clock time overtakes the fixed NOW.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def freeze_repair_now(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(repair, "utcnow", lambda: NOW)
 
 
 # ---------------------------------------------------------------------------
@@ -697,3 +716,126 @@ async def test_anna_like_case_apply_sets_status_and_booked_after_at(session_make
     if db_recipient.followup_status == "skipped_booked_after":
         assert db_recipient.booked_after_at is not None
         assert abs((db_recipient.booked_after_at - event_received_at).total_seconds()) < 2
+
+
+# ---------------------------------------------------------------------------
+# M. failed recipient with provider_message_id is not scheduled (P2-1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_failed_recipient_status_is_not_scheduled(session_maker) -> None:
+    """status='failed' must be blocked even when provider_message_id and sent_at are set."""
+    async with session_maker() as session:
+        async with session.begin():
+            run = _make_run(session)
+            client = _make_client(session)
+            await session.flush()
+            _make_recipient(
+                session,
+                run.id,
+                client.id,
+                status="failed",
+                provider_message_id="wamid.failed-test",
+                sent_at=SENT_AT,
+            )
+            await session.flush()
+            run_id = run.id
+
+    stats = await schedule_followups(run_id, dry_run=True, session_factory=session_maker)
+
+    assert stats.candidates == 0
+    assert stats.skipped_not_sent >= 1
+    skip_rows = [r for r in stats.rows if r.decision == "skip"]
+    assert any("non_positive_status" in (r.reason or "") for r in skip_rows)
+
+
+# ---------------------------------------------------------------------------
+# N. cleanup_failed recipient is not scheduled (P2-1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cleanup_failed_recipient_status_is_not_scheduled(session_maker) -> None:
+    """status='cleanup_failed' must be blocked regardless of provider_message_id."""
+    async with session_maker() as session:
+        async with session.begin():
+            run = _make_run(session)
+            client = _make_client(session)
+            await session.flush()
+            _make_recipient(
+                session,
+                run.id,
+                client.id,
+                status="cleanup_failed",
+                provider_message_id="wamid.cleanup-test",
+                sent_at=SENT_AT,
+            )
+            await session.flush()
+            run_id = run.id
+
+    stats = await schedule_followups(run_id, dry_run=True, session_factory=session_maker)
+
+    assert stats.candidates == 0
+    assert stats.skipped_not_sent >= 1
+
+
+# ---------------------------------------------------------------------------
+# O. provider_accepted recipient can be scheduled (P2-1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_provider_accepted_recipient_can_be_scheduled(session_maker) -> None:
+    """status='provider_accepted' is in the allow-list → should reach candidates."""
+    async with session_maker() as session:
+        async with session.begin():
+            run = _make_run(session)
+            client = _make_client(session)
+            await session.flush()
+            _make_recipient(
+                session,
+                run.id,
+                client.id,
+                status="provider_accepted",
+                provider_message_id="wamid.pa-test",
+                sent_at=SENT_AT,
+            )
+            await session.flush()
+            run_id = run.id
+
+    stats = await schedule_followups(run_id, dry_run=True, session_factory=session_maker)
+
+    assert stats.candidates == 1
+    assert stats.skipped_not_sent == 0
+
+
+# ---------------------------------------------------------------------------
+# P. excluded_reason=provider_error blocks scheduling even with positive status (P2-1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_excluded_reason_hard_failure_is_not_scheduled(session_maker) -> None:
+    """excluded_reason='provider_error' must be blocked even if status='delivered'."""
+    async with session_maker() as session:
+        async with session.begin():
+            run = _make_run(session)
+            client = _make_client(session)
+            await session.flush()
+            _make_recipient(
+                session,
+                run.id,
+                client.id,
+                status="delivered",
+                provider_message_id="wamid.excluded-test",
+                sent_at=SENT_AT,
+                excluded_reason="provider_error",
+            )
+            await session.flush()
+            run_id = run.id
+
+    stats = await schedule_followups(run_id, dry_run=True, session_factory=session_maker)
+
+    assert stats.candidates == 0
+    assert stats.skipped_not_sent >= 1
