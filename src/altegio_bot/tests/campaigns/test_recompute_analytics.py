@@ -4383,3 +4383,299 @@ async def test_relink_from_failed_to_sent_without_provider_message_id(session_ma
     assert recip.outbox_message_id == sent_ob_id, "must relink to sent outbox"
     assert recip.provider_message_id is None
     assert recip.status == "provider_accepted"
+
+
+# ==========================================================================
+# Cancel stale queued follow-up jobs on recompute
+# ==========================================================================
+#
+# 1. queued follow-up + recipient became read  → job canceled, skipped_read
+# 2. queued follow-up + recipient booked_after_at → job canceled, skipped_booked_after
+# 3. queued follow-up + still delivered/unread → job stays queued
+# 4. done follow-up + recipient read → not touched
+# 5. other campaign run follow-up → not touched
+# 6. idempotency: second recompute cancels 0 more jobs
+# 7. summary contains canceled_stale_followup_jobs_count
+# ==========================================================================
+
+_FOLLOWUP_COMPANY = 758285
+_FOLLOWUP_PHONE_BASE = "+4915100000"
+
+
+def _make_followup_job(session, *, run_id: int, dedupe: str, status: str = "queued") -> MessageJob:
+    job = MessageJob(
+        company_id=_FOLLOWUP_COMPANY,
+        job_type="newsletter_new_clients_followup",
+        run_at=_COMPLETED_AT + timedelta(days=14),
+        status=status,
+        dedupe_key=dedupe,
+        payload={"campaign_run_id": run_id},
+    )
+    session.add(job)
+    return job
+
+
+def _make_followup_recipient(
+    session,
+    *,
+    run_id: int,
+    job_id: int,
+    phone: str,
+    status: str = "delivered",
+    read_at: datetime | None = None,
+    booked_after_at: datetime | None = None,
+    followup_status: str = "followup_queued",
+) -> CampaignRecipient:
+    r = CampaignRecipient(
+        campaign_run_id=run_id,
+        company_id=_FOLLOWUP_COMPANY,
+        phone_e164=phone,
+        display_name="Followup Test",
+        status=status,
+        sent_at=_COMPLETED_AT,
+        read_at=read_at,
+        booked_after_at=booked_after_at,
+        followup_status=followup_status,
+        followup_message_job_id=job_id,
+    )
+    session.add(r)
+    return r
+
+
+@pytest.mark.asyncio
+async def test_cancel_stale_followup_recipient_became_read(session_maker) -> None:
+    """1. Queued follow-up + recipient.read_at set → job canceled, recipient skipped_read."""
+    run_id = await _make_run(session_maker)
+
+    async with session_maker() as session:
+        async with session.begin():
+            job = _make_followup_job(session, run_id=run_id, dedupe="stale-fu-read-001")
+            await session.flush()
+            job_id = job.id
+
+            recipient = _make_followup_recipient(
+                session,
+                run_id=run_id,
+                job_id=job_id,
+                phone=f"{_FOLLOWUP_PHONE_BASE}801",
+                status="read",
+                read_at=_COMPLETED_AT + timedelta(days=2),
+            )
+            await session.flush()
+            recipient_id = recipient.id
+
+    async with session_maker() as session:
+        async with session.begin():
+            summary = await recompute_campaign_run_stats(session, run_id)
+
+    async with session_maker() as session:
+        job_after = await session.get(MessageJob, job_id)
+        recip_after = await session.get(CampaignRecipient, recipient_id)
+
+    assert summary["canceled_stale_followup_jobs_count"] == 1
+    assert job_after.status == "canceled"
+    assert job_after.locked_at is None
+    assert "became read" in job_after.last_error
+    assert recip_after.followup_status == "skipped_read"
+    assert recip_after.followup_message_job_id is None
+
+
+@pytest.mark.asyncio
+async def test_cancel_stale_followup_recipient_booked_after(session_maker) -> None:
+    """2. Queued follow-up + recipient.booked_after_at set → job canceled, skipped_booked_after."""
+    run_id = await _make_run(session_maker)
+
+    async with session_maker() as session:
+        async with session.begin():
+            job = _make_followup_job(session, run_id=run_id, dedupe="stale-fu-booked-001")
+            await session.flush()
+            job_id = job.id
+
+            recipient = _make_followup_recipient(
+                session,
+                run_id=run_id,
+                job_id=job_id,
+                phone=f"{_FOLLOWUP_PHONE_BASE}802",
+                status="booked_after_campaign",
+                booked_after_at=_COMPLETED_AT + timedelta(days=3),
+            )
+            await session.flush()
+            recipient_id = recipient.id
+
+    async with session_maker() as session:
+        async with session.begin():
+            summary = await recompute_campaign_run_stats(session, run_id)
+
+    async with session_maker() as session:
+        job_after = await session.get(MessageJob, job_id)
+        recip_after = await session.get(CampaignRecipient, recipient_id)
+
+    assert summary["canceled_stale_followup_jobs_count"] == 1
+    assert job_after.status == "canceled"
+    assert job_after.locked_at is None
+    assert "booked after campaign" in job_after.last_error
+    assert recip_after.followup_status == "skipped_booked_after"
+    assert recip_after.followup_message_job_id is None
+
+
+@pytest.mark.asyncio
+async def test_cancel_stale_followup_still_eligible_stays_queued(session_maker) -> None:
+    """3. Queued follow-up + recipient still delivered/unread → job stays queued."""
+    run_id = await _make_run(session_maker)
+
+    async with session_maker() as session:
+        async with session.begin():
+            job = _make_followup_job(session, run_id=run_id, dedupe="stale-fu-eligible-001")
+            await session.flush()
+            job_id = job.id
+
+            _make_followup_recipient(
+                session,
+                run_id=run_id,
+                job_id=job_id,
+                phone=f"{_FOLLOWUP_PHONE_BASE}803",
+                status="delivered",
+                read_at=None,
+                booked_after_at=None,
+            )
+            await session.flush()
+
+    async with session_maker() as session:
+        async with session.begin():
+            summary = await recompute_campaign_run_stats(session, run_id)
+
+    async with session_maker() as session:
+        job_after = await session.get(MessageJob, job_id)
+
+    assert summary["canceled_stale_followup_jobs_count"] == 0
+    assert job_after.status == "queued"
+
+
+@pytest.mark.asyncio
+async def test_cancel_stale_followup_done_job_not_touched(session_maker) -> None:
+    """4. Done follow-up + recipient read → done job not modified."""
+    run_id = await _make_run(session_maker)
+
+    async with session_maker() as session:
+        async with session.begin():
+            job = _make_followup_job(session, run_id=run_id, dedupe="stale-fu-done-001", status="done")
+            await session.flush()
+            job_id = job.id
+
+            _make_followup_recipient(
+                session,
+                run_id=run_id,
+                job_id=job_id,
+                phone=f"{_FOLLOWUP_PHONE_BASE}804",
+                status="read",
+                read_at=_COMPLETED_AT + timedelta(days=2),
+                followup_status="followup_queued",
+            )
+            await session.flush()
+
+    async with session_maker() as session:
+        async with session.begin():
+            summary = await recompute_campaign_run_stats(session, run_id)
+
+    async with session_maker() as session:
+        job_after = await session.get(MessageJob, job_id)
+
+    assert summary["canceled_stale_followup_jobs_count"] == 0
+    assert job_after.status == "done", "done follow-up must not be modified"
+
+
+@pytest.mark.asyncio
+async def test_cancel_stale_followup_other_run_not_touched(session_maker) -> None:
+    """5. Queued follow-up from a different campaign run → not touched."""
+    run_id = await _make_run(session_maker)
+    other_run_id = await _make_run(session_maker)
+
+    async with session_maker() as session:
+        async with session.begin():
+            # Job belongs to other_run_id
+            job = MessageJob(
+                company_id=_FOLLOWUP_COMPANY,
+                job_type="newsletter_new_clients_followup",
+                run_at=_COMPLETED_AT + timedelta(days=14),
+                status="queued",
+                dedupe_key="stale-fu-other-run-001",
+                payload={"campaign_run_id": other_run_id},
+            )
+            session.add(job)
+            await session.flush()
+            job_id = job.id
+
+            # Recipient belongs to other_run_id and is read
+            other_recip = CampaignRecipient(
+                campaign_run_id=other_run_id,
+                company_id=_FOLLOWUP_COMPANY,
+                phone_e164=f"{_FOLLOWUP_PHONE_BASE}805",
+                display_name="Other Run",
+                status="read",
+                sent_at=_COMPLETED_AT,
+                read_at=_COMPLETED_AT + timedelta(days=1),
+                followup_status="followup_queued",
+                followup_message_job_id=job_id,
+            )
+            session.add(other_recip)
+            await session.flush()
+
+    # Recompute run_id (not other_run_id)
+    async with session_maker() as session:
+        async with session.begin():
+            summary = await recompute_campaign_run_stats(session, run_id)
+
+    async with session_maker() as session:
+        job_after = await session.get(MessageJob, job_id)
+
+    assert summary["canceled_stale_followup_jobs_count"] == 0
+    assert job_after.status == "queued", "other run's follow-up must not be touched"
+
+
+@pytest.mark.asyncio
+async def test_cancel_stale_followup_idempotent(session_maker) -> None:
+    """6. Second recompute after cancellation returns canceled count 0."""
+    run_id = await _make_run(session_maker)
+
+    async with session_maker() as session:
+        async with session.begin():
+            job = _make_followup_job(session, run_id=run_id, dedupe="stale-fu-idem-001")
+            await session.flush()
+            job_id = job.id
+
+            _make_followup_recipient(
+                session,
+                run_id=run_id,
+                job_id=job_id,
+                phone=f"{_FOLLOWUP_PHONE_BASE}806",
+                status="read",
+                read_at=_COMPLETED_AT + timedelta(days=2),
+            )
+            await session.flush()
+
+    # First recompute: cancels the job
+    async with session_maker() as session:
+        async with session.begin():
+            summary1 = await recompute_campaign_run_stats(session, run_id)
+
+    assert summary1["canceled_stale_followup_jobs_count"] == 1
+
+    # Second recompute: nothing left to cancel
+    async with session_maker() as session:
+        async with session.begin():
+            summary2 = await recompute_campaign_run_stats(session, run_id)
+
+    assert summary2["canceled_stale_followup_jobs_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_recompute_summary_contains_canceled_stale_followup_count(session_maker) -> None:
+    """7. Summary always contains canceled_stale_followup_jobs_count (even when 0)."""
+    run_id = await _make_run(session_maker)
+
+    async with session_maker() as session:
+        async with session.begin():
+            summary = await recompute_campaign_run_stats(session, run_id)
+
+    assert "canceled_stale_followup_jobs_count" in summary
+    assert summary["canceled_stale_followup_jobs_count"] == 0
