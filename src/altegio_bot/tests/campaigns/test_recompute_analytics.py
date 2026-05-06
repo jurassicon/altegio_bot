@@ -4284,3 +4284,102 @@ async def test_recompute_fallback_can_backfill_successful_outbox(session_maker) 
     assert recip.provider_message_id == "wamid.j-delivered"
     assert recip.status == "delivered"
     assert run.delivered_count == 1
+
+
+@pytest.mark.asyncio
+async def test_recompute_fallback_can_backfill_sent_without_provider_message_id(session_maker) -> None:
+    """K. Recipient has outbox_message_id=None; outbox status='sent', provider_message_id=None.
+    provider_message_id is NOT a requirement — status alone determines success.
+    After recompute: outbox_message_id is set and status advanced to 'provider_accepted'.
+    """
+    run_id = await _make_run(session_maker)
+
+    async with session_maker() as session:
+        async with session.begin():
+            job = _make_relink_job(session, run_id=run_id, dedupe="relink-k-job")
+            await session.flush()
+
+            sent_ob = _make_relink_outbox(
+                session,
+                job_id=job.id,
+                status="sent",
+                provider_message_id=None,
+            )
+            await session.flush()
+
+            recipient = _make_relink_recipient(
+                session,
+                run_id=run_id,
+                job_id=job.id,
+                outbox_id=None,
+                status="queued",
+            )
+            await session.flush()
+            recipient_id = recipient.id
+            sent_ob_id = sent_ob.id
+
+    async with session_maker() as session:
+        async with session.begin():
+            summary = await recompute_campaign_run_stats(session, run_id)
+
+    async with session_maker() as session:
+        recip = await session.get(CampaignRecipient, recipient_id)
+
+    assert summary["relinked_recipients_count"] == 1
+    assert recip.outbox_message_id == sent_ob_id
+    assert recip.provider_message_id is None
+    assert recip.status == "provider_accepted"
+
+
+@pytest.mark.asyncio
+async def test_relink_from_failed_to_sent_without_provider_message_id(session_maker) -> None:
+    """L. Stale failed-link scenario with a sent outbox that has no provider_message_id.
+
+    Setup:
+    - recipient.outbox_message_id → failed outbox
+    - same job has a later outbox: status='sent', provider_message_id=None
+    Expected:
+    - _sync relinks recipient to the sent outbox
+    - recipient.provider_message_id remains None (the outbox has none)
+    - summary['relinked_recipients_count'] == 1
+    This test catches the divergence between _sync and fallback criteria.
+    """
+    run_id = await _make_run(session_maker)
+
+    async with session_maker() as session:
+        async with session.begin():
+            job = _make_relink_job(session, run_id=run_id, dedupe="relink-l-job")
+            await session.flush()
+
+            failed_ob = _make_relink_outbox(session, job_id=job.id, status="failed", provider_message_id=None)
+            sent_ob = _make_relink_outbox(
+                session,
+                job_id=job.id,
+                status="sent",
+                provider_message_id=None,
+            )
+            await session.flush()
+
+            recipient = _make_relink_recipient(
+                session,
+                run_id=run_id,
+                job_id=job.id,
+                outbox_id=failed_ob.id,
+                status="queued",
+                provider_message_id=None,
+            )
+            await session.flush()
+            recipient_id = recipient.id
+            sent_ob_id = sent_ob.id
+
+    async with session_maker() as session:
+        async with session.begin():
+            summary = await recompute_campaign_run_stats(session, run_id)
+
+    async with session_maker() as session:
+        recip = await session.get(CampaignRecipient, recipient_id)
+
+    assert summary["relinked_recipients_count"] == 1, "stale failed link must be fixed"
+    assert recip.outbox_message_id == sent_ob_id, "must relink to sent outbox"
+    assert recip.provider_message_id is None
+    assert recip.status == "provider_accepted"

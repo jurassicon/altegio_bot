@@ -1615,15 +1615,18 @@ async def _sync_recipients_to_latest_successful_outbox(
     """Relink recipients whose outbox_message_id points to a non-successful row.
 
     For each non-skipped recipient with a message_job_id, finds the best
-    successful OutboxMessage for that job (status in {sent, delivered, read}
-    AND provider_message_id IS NOT NULL), picking the one with the highest
-    delivery rank (ties broken by highest id).
+    successful OutboxMessage for that job (status in {sent, delivered, read}),
+    picking the one with the highest delivery rank (ties broken by highest id).
+
+    Recompute trusts outbox status as the source of truth.  A failed outbox is
+    never considered successful even if it carries a provider_message_id.
+    provider_message_id is NOT required — some flows have status='sent' without
+    one (e.g. the outbox worker has not yet written it back).
 
     If the recipient is already linked to that outbox → no-op (idempotent).
-    If the best successful outbox would downgrade the recipient's current
-    delivery rank → skipped (read is never downgraded to delivered/sent).
-
-    Also advances recipient.status and backfills sent_at from the best outbox.
+    Outbox FK fields (outbox_message_id, provider_message_id, sent_at) are
+    always updated to the best outbox.  Status is only advanced, never
+    downgraded (a 'read' recipient stays 'read' even if best is 'delivered').
 
     Returns the count of recipients actually relinked.
     """
@@ -1635,7 +1638,6 @@ async def _sync_recipients_to_latest_successful_outbox(
         select(OutboxMessage)
         .where(OutboxMessage.job_id.in_(job_ids))
         .where(OutboxMessage.status.in_(_PROVIDER_ACCEPTED))
-        .where(OutboxMessage.provider_message_id.isnot(None))
         .order_by(OutboxMessage.job_id, OutboxMessage.id.desc())
     )
     rows = (await session.execute(stmt)).scalars().all()
@@ -1705,8 +1707,9 @@ async def _resolve_outbox_for_recipients(
        advanced delivery state).  Ties are broken by highest id.
 
     When *successful_only_fallback* is True, Pass 2 only considers outboxes
-    with status in _PROVIDER_ACCEPTED and a non-null provider_message_id.
+    with status in _PROVIDER_ACCEPTED (sent / delivered / read).
     Use this in recompute to avoid backfilling failed outbox rows.
+    provider_message_id is NOT required — status alone is the criterion.
     """
     result: dict[int, OutboxMessage] = {}
 
