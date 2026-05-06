@@ -4148,4 +4148,139 @@ async def test_relink_multiple_successful_outboxes_latest_id_wins(session_maker)
     assert recip.provider_message_id == "wamid.g-read"
     assert recip.status == "read"
     assert run.read_count == 1
-    assert run.delivered_count == 0  # read is not double-counted as delivered
+    assert run.delivered_count == 1  # _DELIVERED includes 'read' (cumulative funnel)
+
+
+@pytest.mark.asyncio
+async def test_relink_preserves_read_status_but_updates_outbox_link(session_maker) -> None:
+    """H. Recipient status='read' but outbox_message_id points to a failed row.
+    A successful 'delivered' outbox exists for the same job.
+    After recompute: outbox_message_id relinked to delivered outbox; status stays 'read'.
+    """
+    run_id = await _make_run(session_maker)
+
+    async with session_maker() as session:
+        async with session.begin():
+            job = _make_relink_job(session, run_id=run_id, dedupe="relink-h-job")
+            await session.flush()
+
+            failed_ob = _make_relink_outbox(session, job_id=job.id, status="failed", provider_message_id=None)
+            delivered_ob = _make_relink_outbox(
+                session,
+                job_id=job.id,
+                status="delivered",
+                provider_message_id="wamid.h-delivered",
+            )
+            await session.flush()
+
+            recipient = _make_relink_recipient(
+                session,
+                run_id=run_id,
+                job_id=job.id,
+                outbox_id=failed_ob.id,
+                status="read",
+                provider_message_id=None,
+            )
+            await session.flush()
+            recipient_id = recipient.id
+            delivered_ob_id = delivered_ob.id
+
+    async with session_maker() as session:
+        async with session.begin():
+            summary = await recompute_campaign_run_stats(session, run_id)
+
+    async with session_maker() as session:
+        recip = await session.get(CampaignRecipient, recipient_id)
+
+    assert summary["relinked_recipients_count"] == 1
+    assert recip.outbox_message_id == delivered_ob_id, "FK relinked even when status not advanced"
+    assert recip.provider_message_id == "wamid.h-delivered"
+    assert recip.status == "read", "read must not be downgraded to delivered"
+
+
+@pytest.mark.asyncio
+async def test_recompute_fallback_does_not_backfill_failed_outbox(session_maker) -> None:
+    """I. Recipient has outbox_message_id=None and the only outbox is failed.
+    After recompute: outbox_message_id stays None — failed rows must not be backfilled.
+    """
+    run_id = await _make_run(session_maker)
+
+    async with session_maker() as session:
+        async with session.begin():
+            job = _make_relink_job(session, run_id=run_id, dedupe="relink-i-job")
+            await session.flush()
+
+            _make_relink_outbox(
+                session,
+                job_id=job.id,
+                status="failed",
+                provider_message_id="wamid.i-failed",
+            )
+            await session.flush()
+
+            recipient = _make_relink_recipient(
+                session,
+                run_id=run_id,
+                job_id=job.id,
+                outbox_id=None,
+                status="queued",
+            )
+            await session.flush()
+            recipient_id = recipient.id
+
+    async with session_maker() as session:
+        async with session.begin():
+            summary = await recompute_campaign_run_stats(session, run_id)
+
+    async with session_maker() as session:
+        recip = await session.get(CampaignRecipient, recipient_id)
+
+    assert summary["relinked_recipients_count"] == 0
+    assert recip.outbox_message_id is None, "failed outbox must never be backfilled"
+    assert recip.provider_message_id is None
+
+
+@pytest.mark.asyncio
+async def test_recompute_fallback_can_backfill_successful_outbox(session_maker) -> None:
+    """J. Recipient has outbox_message_id=None and a successful 'delivered' outbox exists.
+    After recompute: outbox_message_id is set and status advanced to 'delivered'.
+    """
+    run_id = await _make_run(session_maker)
+
+    async with session_maker() as session:
+        async with session.begin():
+            job = _make_relink_job(session, run_id=run_id, dedupe="relink-j-job")
+            await session.flush()
+
+            delivered_ob = _make_relink_outbox(
+                session,
+                job_id=job.id,
+                status="delivered",
+                provider_message_id="wamid.j-delivered",
+            )
+            await session.flush()
+
+            recipient = _make_relink_recipient(
+                session,
+                run_id=run_id,
+                job_id=job.id,
+                outbox_id=None,
+                status="queued",
+            )
+            await session.flush()
+            recipient_id = recipient.id
+            delivered_ob_id = delivered_ob.id
+
+    async with session_maker() as session:
+        async with session.begin():
+            summary = await recompute_campaign_run_stats(session, run_id)
+
+    async with session_maker() as session:
+        run = await session.get(CampaignRun, run_id)
+        recip = await session.get(CampaignRecipient, recipient_id)
+
+    assert summary["relinked_recipients_count"] == 1
+    assert recip.outbox_message_id == delivered_ob_id
+    assert recip.provider_message_id == "wamid.j-delivered"
+    assert recip.status == "delivered"
+    assert run.delivered_count == 1
