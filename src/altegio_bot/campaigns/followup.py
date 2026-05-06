@@ -481,10 +481,12 @@ async def check_followup_final_eligibility(
 
     # 3.2 — current opt-out
     # Primary: look up by local client_id.
-    # Fallback: CRM-only recipients (client_id=None) — look up by phone+company.
+    # Fallback 1: client_id set but Client row missing (stale ref) or client_id=None → phone lookup.
+    # Fallback 2: still None → altegio_client_id lookup.
+    opt_client: Client | None = None
     if recipient.client_id is not None:
         opt_client = await session.get(Client, recipient.client_id)
-    elif recipient.phone_e164:
+    if opt_client is None and recipient.phone_e164:
         opt_result = await session.execute(
             select(Client)
             .where(Client.company_id == recipient.company_id)
@@ -492,8 +494,14 @@ async def check_followup_final_eligibility(
             .limit(1)
         )
         opt_client = opt_result.scalar_one_or_none()
-    else:
-        opt_client = None
+    if opt_client is None and recipient.altegio_client_id is not None:
+        opt_result = await session.execute(
+            select(Client)
+            .where(Client.company_id == recipient.company_id)
+            .where(Client.altegio_client_id == recipient.altegio_client_id)
+            .limit(1)
+        )
+        opt_client = opt_result.scalar_one_or_none()
 
     if opt_client is not None and opt_client.wa_opted_out:
         return FollowupFinalEligibilityResult(

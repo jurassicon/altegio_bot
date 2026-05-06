@@ -81,7 +81,27 @@ class _FakeSession:
             setattr(obj, "id", self._pk)
         self.added.append(obj)
 
-    async def get(self, model: Any, pk: Any) -> None:
+    async def get(self, model: Any, pk: Any) -> Any:
+        from types import SimpleNamespace
+
+        name = getattr(model, "__name__", "")
+        if name == "CampaignRecipient":
+            return SimpleNamespace(
+                status="delivered",
+                read_at=None,
+                booked_after_at=None,
+                client_id=None,
+                phone_e164=None,
+                altegio_client_id=None,
+                company_id=0,
+                sent_at=None,
+                outbox_message_id=None,
+                provider_message_id=None,
+            )
+        if name == "CampaignRun":
+            from datetime import datetime, timezone
+
+            return SimpleNamespace(completed_at=datetime(2025, 1, 1, tzinfo=timezone.utc))
         return None
 
     async def flush(self) -> None:
@@ -345,6 +365,7 @@ async def test_followup_local_client_passes_company_id(monkeypatch: Any) -> None
             "kind": "newsletter_new_clients_followup",
             "template_name": "newsletter_new_clients_followup",
             "campaign_recipient_id": 99999,
+            "campaign_run_id": 88888,
         },
     )
     client = _FakeClient(id=77, phone_e164="+4915288800099", display_name="Elena Kaiser")

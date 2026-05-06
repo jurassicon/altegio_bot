@@ -276,7 +276,27 @@ class _FakeSession:
     async def execute(self, stmt: Any) -> _FakeScalarResult:
         return _FakeScalarResult()
 
-    async def get(self, model: Any, pk: Any) -> None:
+    async def get(self, model: Any, pk: Any) -> Any:
+        from types import SimpleNamespace
+
+        name = getattr(model, "__name__", "")
+        if name == "CampaignRecipient":
+            return SimpleNamespace(
+                status="delivered",
+                read_at=None,
+                booked_after_at=None,
+                client_id=None,
+                phone_e164=None,
+                altegio_client_id=None,
+                company_id=0,
+                sent_at=None,
+                outbox_message_id=None,
+                provider_message_id=None,
+            )
+        if name == "CampaignRun":
+            from datetime import datetime, timezone
+
+            return SimpleNamespace(completed_at=datetime(2025, 1, 1, tzinfo=timezone.utc))
         return None
 
 
@@ -428,7 +448,11 @@ def test_marketing_job_suppressed_when_131026_threshold_reached(
     job_type: str,
 ) -> None:
     """Маркетинговый job сохраняет pre-send suppression при repeated 131026."""
-    _payload = {"campaign_recipient_id": 99999} if job_type == "newsletter_new_clients_followup" else {}
+    _payload = (
+        {"campaign_recipient_id": 99999, "campaign_run_id": 88888}
+        if job_type == "newsletter_new_clients_followup"
+        else {}
+    )
     job = _FakeJob(id=1, company_id=758285, job_type=job_type, payload=_payload)
     record = _record_for_job_type(job_type)
     count_mock = _base_patches(monkeypatch, job=job, n_failures=2, record=record)
@@ -496,7 +520,7 @@ def test_ops_suppressed_row_has_expected_fields(monkeypatch: Any) -> None:
         id=5,
         company_id=758285,
         job_type="newsletter_new_clients_followup",
-        payload={"campaign_recipient_id": 99999},
+        payload={"campaign_recipient_id": 99999, "campaign_run_id": 88888},
     )
     _base_patches(monkeypatch, job=job, n_failures=2)
     session = _FakeSession()

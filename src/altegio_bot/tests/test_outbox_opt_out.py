@@ -45,7 +45,27 @@ class FakeSession:
     def add(self, obj: Any) -> None:
         self.added.append(obj)
 
-    async def get(self, model: Any, pk: Any) -> None:
+    async def get(self, model: Any, pk: Any) -> Any:
+        from types import SimpleNamespace
+
+        name = getattr(model, "__name__", "")
+        if name == "CampaignRecipient":
+            return SimpleNamespace(
+                status="delivered",
+                read_at=None,
+                booked_after_at=None,
+                client_id=None,
+                phone_e164=None,
+                altegio_client_id=None,
+                company_id=0,
+                sent_at=None,
+                outbox_message_id=None,
+                provider_message_id=None,
+            )
+        if name == "CampaignRun":
+            from datetime import datetime, timezone
+
+            return SimpleNamespace(completed_at=datetime(2025, 1, 1, tzinfo=timezone.utc))
         return None
 
 
@@ -61,7 +81,11 @@ def test_outbox_skips_marketing_when_opted_out(monkeypatch: Any, job_type: str) 
         run_at=fixed_now,
         record_id=None,
         client_id=1,
-        payload={"campaign_recipient_id": 99999} if job_type == "newsletter_new_clients_followup" else {},
+        payload=(
+            {"campaign_recipient_id": 99999, "campaign_run_id": 88888}
+            if job_type == "newsletter_new_clients_followup"
+            else {}
+        ),
     )
 
     async def fake_load_job(session: Any, job_id: int) -> Any:

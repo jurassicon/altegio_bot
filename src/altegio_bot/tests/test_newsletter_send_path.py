@@ -224,7 +224,27 @@ class _FakeSession:
     def add(self, obj: Any) -> None:
         self.added.append(obj)
 
-    async def get(self, model: Any, pk: Any) -> None:
+    async def get(self, model: Any, pk: Any) -> Any:
+        from types import SimpleNamespace
+
+        name = getattr(model, "__name__", "")
+        if name == "CampaignRecipient":
+            return SimpleNamespace(
+                status="delivered",
+                read_at=None,
+                booked_after_at=None,
+                client_id=None,
+                phone_e164=None,
+                altegio_client_id=None,
+                company_id=0,
+                sent_at=None,
+                outbox_message_id=None,
+                provider_message_id=None,
+            )
+        if name == "CampaignRun":
+            from datetime import datetime, timezone
+
+            return SimpleNamespace(completed_at=datetime(2025, 1, 1, tzinfo=timezone.utc))
         return None
 
     async def flush(self) -> None:
@@ -487,6 +507,7 @@ async def test_crm_only_followup_newsletter_uses_contact_name_as_param1(monkeypa
             "contact_name": "Hana Novak",
             "phone_e164": "+491777000111",
             "campaign_recipient_id": 99999,
+            "campaign_run_id": 88888,
         },
     )
     session = _FakeSession()
@@ -783,6 +804,7 @@ async def test_outbox_worker_fails_fast_when_followup_header_url_missing(monkeyp
             "contact_name": "Test User",
             "phone_e164": "+491111222444",
             "campaign_recipient_id": 99999,
+            "campaign_run_id": 88888,
         },
     )
     session = _FakeSession()
@@ -866,6 +888,7 @@ async def test_outbox_worker_passes_header_url_for_followup(monkeypatch: Any) ->
             "contact_name": "Test User",
             "phone_e164": "+491111222666",
             "campaign_recipient_id": 99999,
+            "campaign_run_id": 88888,
         },
     )
     session = _FakeSession()
