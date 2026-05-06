@@ -36,6 +36,7 @@ class FakeClient:
     id: int
     phone_e164: str | None = "+491234567890"
     wa_opted_out: bool = True
+    altegio_client_id: int = 99001
 
 
 class FakeSession:
@@ -56,7 +57,7 @@ class FakeSession:
                 booked_after_at=None,
                 client_id=None,
                 phone_e164=None,
-                altegio_client_id=None,
+                altegio_client_id=99001,
                 company_id=0,
                 sent_at=None,
                 outbox_message_id=None,
@@ -67,6 +68,14 @@ class FakeSession:
 
             return SimpleNamespace(completed_at=datetime(2025, 1, 1, tzinfo=timezone.utc))
         return None
+
+    async def execute(self, stmt: Any) -> Any:
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            scalar_one_or_none=lambda: None,
+            scalars=lambda: SimpleNamespace(first=lambda: None, all=lambda: []),
+        )
 
 
 @pytest.mark.parametrize("job_type", ow.MARKETING_JOB_TYPES)
@@ -104,6 +113,7 @@ def test_outbox_skips_marketing_when_opted_out(monkeypatch: Any, job_type: str) 
     monkeypatch.setattr(ow, "_find_success_outbox", fake_find_success)
     monkeypatch.setattr(ow, "_load_record", fake_load_record)
     monkeypatch.setattr(ow, "_load_client", fake_load_client)
+    monkeypatch.setattr(ow, "client_has_any_future_record", AsyncMock(return_value=False))
     safe_send = AsyncMock()
     safe_send_template = AsyncMock()
     monkeypatch.setattr(ow, "safe_send", safe_send)

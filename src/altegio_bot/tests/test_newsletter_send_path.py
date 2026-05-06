@@ -235,7 +235,7 @@ class _FakeSession:
                 booked_after_at=None,
                 client_id=None,
                 phone_e164=None,
-                altegio_client_id=None,
+                altegio_client_id=99001,
                 company_id=0,
                 sent_at=None,
                 outbox_message_id=None,
@@ -246,6 +246,17 @@ class _FakeSession:
 
             return SimpleNamespace(completed_at=datetime(2025, 1, 1, tzinfo=timezone.utc))
         return None
+
+    async def execute(self, stmt: Any) -> Any:
+        from types import SimpleNamespace
+
+        # Return an empty result for all queries — lets check_followup_final_eligibility
+        # run to completion (no opt-out client, no AltegioEvent, no local Record found).
+        result = SimpleNamespace(
+            scalar_one_or_none=lambda: None,
+            scalars=lambda: SimpleNamespace(first=lambda: None, all=lambda: []),
+        )
+        return result
 
     async def flush(self) -> None:
         pass
@@ -518,6 +529,7 @@ async def test_crm_only_followup_newsletter_uses_contact_name_as_param1(monkeypa
     monkeypatch.setattr(ow, "_load_client", AsyncMock(return_value=None))
     monkeypatch.setattr(ow, "_apply_rate_limit", AsyncMock(return_value=None))
     monkeypatch.setattr(ow, "_count_131026_failures", AsyncMock(return_value=0))
+    monkeypatch.setattr(ow, "client_has_any_future_record", AsyncMock(return_value=False))
 
     async def _fake_render(session, *, company_id, template_code, record, client):
         return "Hallo {{1}}, ...", 1, "de", _make_render_ctx(client_name="")
@@ -729,6 +741,7 @@ def _base_patches(monkeypatch: Any) -> None:
     monkeypatch.setattr(ow, "_load_client", AsyncMock(return_value=None))
     monkeypatch.setattr(ow, "_apply_rate_limit", AsyncMock(return_value=None))
     monkeypatch.setattr(ow, "_count_131026_failures", AsyncMock(return_value=0))
+    monkeypatch.setattr(ow, "client_has_any_future_record", AsyncMock(return_value=False))
     monkeypatch.setattr(ow.settings, "whatsapp_send_mode", "template")
 
 
