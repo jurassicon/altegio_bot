@@ -250,6 +250,11 @@ async def handle_promo_info_command(
     No PromoLead is created.  The reply makes no promise of automatic
     discount assignment.  An OutboxMessage audit row is created on success.
     """
+    if company_id is None:
+        logger.warning("promo_info: missing company_id phone=%s sender_id=%s", phone_e164, sender_id)
+        event.error = "promo_info: missing company_id"
+        return
+
     cfg = settings
     reply = _PROMO_INFO_TEXT.format(booking_url=cfg.promo_booking_url)
     now = _utcnow()
@@ -272,7 +277,7 @@ async def handle_promo_info_command(
 
     session.add(
         OutboxMessage(
-            company_id=company_id or 0,
+            company_id=company_id,
             client_id=None,
             record_id=None,
             job_id=None,
@@ -341,6 +346,11 @@ async def handle_promo_command(
     Sends a free-form WhatsApp text reply (NOT a Meta template).
     Creates an OutboxMessage audit row on success.
     """
+    if company_id is None:
+        logger.warning("promo_lead: missing company_id phone=%s sender_id=%s", phone_e164, sender_id)
+        event.error = "promo_lead: missing company_id"
+        return
+
     now = _utcnow()
     cfg = settings
     discount_amount = Decimal(str(cfg.promo_discount_amount))
@@ -364,8 +374,13 @@ async def handle_promo_command(
             reply = build_reply_already_issued(lead.expires_at, cfg.promo_booking_url)
             template_code = "wa_promo_lead_already_issued"
 
+    elif lead is not None and lead.status == "rejected_not_new":
+        # Client was already rejected; resend the rejection reply.
+        reply = build_reply_rejected_not_new()
+        template_code = "wa_promo_lead_rejected_not_new"
+
     elif lead is not None:
-        # Terminal / rejected state — strict policy: do not re-issue.
+        # Other terminal states: expired, cancelled, apply_failed, rejected_service_not_allowed.
         reply = build_reply_expired()
         template_code = "wa_promo_lead_expired"
 
@@ -373,7 +388,7 @@ async def handle_promo_command(
         # ── 2. No existing lead: build candidate ─────────────────────────────
         if await _has_prior_visits(session, phone_e164):
             candidate = PromoLead(
-                company_id=company_id or 0,
+                company_id=company_id,
                 phone_e164=phone_e164,
                 campaign_name=cfg.promo_campaign_name,
                 secret_code=text[:64],
@@ -387,7 +402,7 @@ async def handle_promo_command(
         else:
             expires_at = compute_expires_at(now, cfg.promo_validity_mode, cfg.promo_validity_days)
             candidate = PromoLead(
-                company_id=company_id or 0,
+                company_id=company_id,
                 phone_e164=phone_e164,
                 campaign_name=cfg.promo_campaign_name,
                 secret_code=text[:64],
@@ -477,7 +492,7 @@ async def handle_promo_command(
     # ── 6. Audit OutboxMessage ───────────────────────────────────────────────
     session.add(
         OutboxMessage(
-            company_id=company_id or 0,
+            company_id=company_id,
             client_id=None,
             record_id=None,
             job_id=None,

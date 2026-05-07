@@ -21,6 +21,8 @@ Covers:
 18. promo_lead_funnel_enabled=True creates PromoLead on secret word.
 19. Concurrent race: savepoint detects duplicate, sends already-active reply.
 20. Send failure after lead persist marks meta.reply_sent=False, no OutboxMessage.
+21. Existing rejected_not_new lead → resend rejection reply (not expired).
+22. company_id=None → fail-closed: no PromoLead, no OutboxMessage, event.error set.
 """
 
 from __future__ import annotations
@@ -1024,3 +1026,110 @@ async def test_send_failure_after_persist_marks_meta(session_maker) -> None:
     assert meta.get("reply_sent") is False
     assert "downstream timeout" in (meta.get("reply_send_error") or "")
     assert not outboxes, "No OutboxMessage must be created when send fails"
+
+
+# ---------------------------------------------------------------------------
+# 21. Existing rejected_not_new lead → resend rejection reply (not expired)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_repeat_promo_keyword_after_rejected_not_new_sends_rejection_reply(session_maker) -> None:
+    provider = _CaptureProvider()
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _setup_sender(session, sender_id=316)
+
+            now = _utcnow()
+            session.add(
+                PromoLead(
+                    company_id=1,
+                    phone_e164=PHONE_E164,
+                    campaign_name=CAMPAIGN,
+                    secret_code="aktion",
+                    discount_amount=Decimal("15"),
+                    discount_type="fixed",
+                    status="rejected_not_new",
+                    reject_reason="has_prior_visits",
+                    issued_at=now,
+                    expires_at=now,
+                )
+            )
+
+            evt = WhatsAppEvent(
+                dedupe_key="wa:promo-rejected-repeat-21",
+                status="received",
+                error=None,
+                query={},
+                headers={},
+                payload=_inbound_payload(PHONE_NUMBER_ID, FROM_PHONE, "aktion"),
+            )
+            session.add(evt)
+            await session.flush()
+
+            with patch(
+                "altegio_bot.workers.whatsapp_inbox_worker.ChatwootClient",
+                return_value=_FakeCW(),
+            ):
+                await handle_event(session, evt, provider)
+
+    assert provider.sent
+    _sid, _phone, sent_text = provider.sent[0]
+    assert "Neukunden" in sent_text, "Reply must explain the new-client restriction"
+    assert "abgelaufen" not in sent_text, "Must not send the 'expired' reply for rejected_not_new"
+    assert evt.error is None
+
+    async with session_maker() as s:
+        outbox = (
+            await s.execute(
+                select(OutboxMessage).where(OutboxMessage.template_code == "wa_promo_lead_rejected_not_new")
+            )
+        ).scalar_one_or_none()
+
+    assert outbox is not None, "OutboxMessage must use wa_promo_lead_rejected_not_new template"
+
+
+# ---------------------------------------------------------------------------
+# 22. company_id=None → fail-closed: no PromoLead, no OutboxMessage, event.error
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_none_company_id_fails_closed_no_lead_no_outbox(session_maker) -> None:
+    from altegio_bot.workers.promo_lead_handler import handle_promo_command
+
+    provider = _CaptureProvider()
+
+    async with session_maker() as session:
+        async with session.begin():
+            evt = WhatsAppEvent(
+                dedupe_key="wa:promo-nocompany-22",
+                status="received",
+                error=None,
+                query={},
+                headers={},
+                payload=_inbound_payload(PHONE_NUMBER_ID, FROM_PHONE, "aktion"),
+            )
+            session.add(evt)
+            await session.flush()
+
+            await handle_promo_command(
+                session=session,
+                event=evt,
+                phone_e164=PHONE_E164,
+                text="aktion",
+                sender_id=317,
+                company_id=None,
+                provider=provider,
+            )
+
+    assert evt.error is not None, "event.error must be set when company_id is None"
+    assert not provider.sent, "No reply must be sent when company_id is None"
+
+    async with session_maker() as s:
+        leads = (await s.execute(select(PromoLead).where(PromoLead.phone_e164 == PHONE_E164))).scalars().all()
+        outboxes = (await s.execute(select(OutboxMessage))).scalars().all()
+
+    assert not leads, "No PromoLead must be created when company_id is None"
+    assert not outboxes, "No OutboxMessage must be created when company_id is None"
