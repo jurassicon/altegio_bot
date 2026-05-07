@@ -442,11 +442,7 @@ async def handle_promo_command(
                 template_code = "wa_promo_lead_issued"
         else:
             # Race lost: reply based on the winner we just re-read.
-            if (
-                lead is not None
-                and lead.status in ("issued", "booked", "applied")
-                and lead.expires_at > now
-            ):
+            if lead is not None and lead.status in ("issued", "booked", "applied") and lead.expires_at > now:
                 reply = build_reply_already_issued(lead.expires_at, cfg.promo_booking_url)
                 template_code = "wa_promo_lead_already_issued"
             else:

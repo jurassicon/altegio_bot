@@ -971,9 +971,9 @@ async def test_race_condition_savepoint_recovers_to_already_active(session_maker
     # OutboxMessage audit row must be created for the reply that was actually sent.
     async with session_maker() as s:
         outboxes = (await s.execute(select(OutboxMessage))).scalars().all()
-    assert any(
-        o.template_code == "wa_promo_lead_already_issued" for o in outboxes
-    ), "OutboxMessage for already-issued reply must be created"
+    assert any(o.template_code == "wa_promo_lead_already_issued" for o in outboxes), (
+        "OutboxMessage for already-issued reply must be created"
+    )
 
 
 # ---------------------------------------------------------------------------
