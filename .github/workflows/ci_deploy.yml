@@ -214,24 +214,19 @@ jobs:
 
             # Credentials come from inside the container (docker compose injected them from .env).
             # This is more reliable than sourcing .env in the remote shell.
-            IS_FRESH=false
             docker compose exec -T postgres sh -lc '
               psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT 1"
-            ' >/dev/null 2>&1 || IS_FRESH=true
+            ' >/dev/null
 
-            if [ "$IS_FRESH" = "true" ]; then
-              echo "ℹ️ Database does not exist yet — fresh deployment, skipping backup."
-            else
-              docker compose exec -T postgres sh -lc '
-                pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc
-              ' > "$DUMP_FILE"
+            docker compose exec -T postgres sh -lc '
+              pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc
+            ' > "$DUMP_FILE"
 
-              test -s "$DUMP_FILE" || {
-                echo "❌ Pre-deploy dump is empty — aborting."
-                exit 1
-              }
-              echo "✅ Backup created: $DUMP_FILE"
-            fi
+            test -s "$DUMP_FILE" || {
+              echo "❌ Pre-deploy dump is empty — aborting."
+              exit 1
+            }
+            echo "✅ Backup created: $DUMP_FILE"
 
             echo "⚙️ Applying DB Migrations..."
             docker compose --profile ops run --rm --no-deps migrate
