@@ -6,6 +6,7 @@ from decimal import Decimal
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    CheckConstraint,
     DateTime,
     ForeignKey,
     Index,
@@ -887,3 +888,131 @@ class CampaignRecipient(Base):
     meta: Mapped[dict] = mapped_column(JSONB, default=dict)
 
     run: Mapped["CampaignRun"] = relationship(back_populates="recipients")
+
+
+# ---------------------------------------------------------------------------
+# Promo / secret-word funnel
+# ---------------------------------------------------------------------------
+
+#: Full set of allowed PromoLead statuses.
+#: All values are defined here so future PRs can advance the lifecycle
+#: without schema changes.
+PROMO_LEAD_STATUSES: frozenset[str] = frozenset(
+    {
+        "issued",  # discount linked, awaiting booking
+        "booked",  # client booked after receiving discount
+        "applied",  # discount reserved against the booking
+        "used",  # discount applied to the completed visit
+        "expired",  # validity period elapsed without booking
+        "cancelled",  # manually cancelled
+        "rejected_not_new",  # client already has prior visits
+        "rejected_service_not_allowed",  # service not eligible
+        "apply_failed",  # discount application to visit failed
+    }
+)
+
+
+_PROMO_STATUS_CHECK = "status IN ({})".format(
+    ", ".join(
+        f"'{s}'"
+        for s in (
+            "issued",
+            "booked",
+            "applied",
+            "used",
+            "expired",
+            "cancelled",
+            "rejected_not_new",
+            "rejected_service_not_allowed",
+            "apply_failed",
+        )
+    )
+)
+
+
+class PromoLead(Base):
+    """WhatsApp secret-word promo lead.
+
+    Created when a client sends a known secret word (e.g. 'aktion') via
+    WhatsApp.  Tracks the lifecycle of a personal discount offer from first
+    contact through booking and eventual discount application.
+
+    This PR implements: issued, expired, rejected_not_new.
+    Future PRs will advance through: booked, applied, used, cancelled,
+    apply_failed, rejected_service_not_allowed.
+    """
+
+    __tablename__ = "promo_leads"
+    __table_args__ = (
+        # One active lead per phone + campaign enforced at DB level.
+        UniqueConstraint("phone_e164", "campaign_name", name="uq_promo_leads_phone_campaign"),
+        CheckConstraint(_PROMO_STATUS_CHECK, name="ck_promo_leads_status"),
+        CheckConstraint("discount_type IN ('fixed', 'percent')", name="ck_promo_leads_discount_type"),
+        Index("ix_promo_leads_status_expires", "status", "expires_at"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+
+    # Company / location context (filled from WhatsAppSender at creation time)
+    company_id: Mapped[int] = mapped_column(Integer, index=True)
+    location_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    # Client identification
+    phone_e164: Mapped[str] = mapped_column(String(32), index=True)
+    altegio_client_id: Mapped[int | None] = mapped_column(BigInteger, index=True, nullable=True)
+
+    # Campaign / offer
+    campaign_name: Mapped[str] = mapped_column(String(128), index=True)
+    secret_code: Mapped[str] = mapped_column(String(64))
+
+    discount_amount: Mapped[Decimal] = mapped_column(Numeric(10, 2))
+    # 'fixed' (Euro) | 'percent'
+    discount_type: Mapped[str] = mapped_column(String(32))
+
+    # See PROMO_LEAD_STATUSES for the full lifecycle.
+    status: Mapped[str] = mapped_column(
+        String(64),
+        index=True,
+        server_default=text("'issued'"),
+    )
+    reject_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Core timestamps
+    issued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+    # Attribution timestamps (filled as lifecycle advances in future PRs)
+    booked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # Altegio loyalty integration (future PRs — not set in this PR)
+    loyalty_card_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    loyalty_card_number: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    card_type_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    discount_program_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    # Altegio booking attribution (future PRs)
+    # record_id = local FK; altegio_record_id = external Altegio identifier
+    record_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey("records.id", ondelete="SET NULL"),
+        index=True,
+        nullable=True,
+    )
+    altegio_record_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    visit_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        index=True,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    meta: Mapped[dict] = mapped_column(JSONB, default=dict)

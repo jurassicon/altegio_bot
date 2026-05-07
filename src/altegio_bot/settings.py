@@ -107,6 +107,28 @@ class Settings(BaseSettings):
     # If non-empty and inbox_id not found — relay is fail-closed.
     chatwoot_inbox_company_map: str = "{}"
 
+    # ---------------------------------------------------------------------------
+    # WhatsApp promo / secret-word funnel
+    # ---------------------------------------------------------------------------
+    # Comma-separated secret words that trigger the promo flow.
+    # Matched after normalisation: strip, lowercase, punctuation removed.
+    promo_secret_words: str = "aktion,angebot,rabatt"
+    # Internal campaign identifier stored on every PromoLead row.
+    promo_campaign_name: str = "welcome_discount"
+    # Discount value shown to the customer.
+    promo_discount_amount: float = 15.0
+    # 'fixed' (Euro) | 'percent'
+    promo_discount_type: str = "fixed"
+    # Expiration mode: 'issued_plus_days' | 'calendar_month'
+    promo_validity_mode: str = "issued_plus_days"
+    promo_validity_days: int = 30
+    # Online booking URL included in every promo reply.
+    promo_booking_url: str = "https://n813709.alteg.io/"
+    # Gate for the full promo lead funnel (PromoLead creation + loyalty API).
+    # Default False: sends a safe informational reply only, no DB lead row.
+    # Enable only after loyalty API integration is production-ready.
+    promo_lead_funnel_enabled: bool = False
+
     # Publicly accessible image URLs for newsletter template IMAGE HEADER components.
     # Meta Cloud API requires a permanent URL it can fetch and cache at send time.
     # Leave empty → worker fails the job fast (no silent blank-header send).

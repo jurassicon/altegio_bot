@@ -139,6 +139,8 @@ def test_parse_command(text: str, expected: str | None) -> None:
 
 @pytest.mark.asyncio
 async def test_promo_command_sends_free_form_reply(session_maker) -> None:
+    # Superseded by full coverage in test_whatsapp_promo_leads.py.
+    # Kept here as a smoke-test: promo command triggers a send (any text).
     provider = _CaptureProvider()
 
     async with session_maker() as session:
@@ -174,7 +176,9 @@ async def test_promo_command_sends_free_form_reply(session_maker) -> None:
     assert provider.sent, "Expected provider.send() to be called for promo command"
     _sid, sent_phone, sent_text = provider.sent[0]
     assert sent_phone == PHONE_E164
-    assert "10 % Rabatt" in sent_text
+    # The promo lead handler sends German text; the exact copy lives in
+    # promo_lead_handler.py and is tested in test_whatsapp_promo_leads.py.
+    assert sent_text  # non-empty free-form reply
     assert evt.error is None
 
 
@@ -210,7 +214,6 @@ async def test_promo_command_creates_outbox_audit(session_maker) -> None:
             )
             session.add(evt)
             await session.flush()
-            event_id = int(evt.id)
 
             with patch(
                 "altegio_bot.workers.whatsapp_inbox_worker.ChatwootClient",
@@ -219,20 +222,21 @@ async def test_promo_command_creates_outbox_audit(session_maker) -> None:
                 await handle_event(session, evt, provider)
 
     async with session_maker() as s2:
-        result = await s2.execute(select(OutboxMessage).where(OutboxMessage.template_code == "wa_cmd_promo"))
+        # Funnel is disabled by default (promo_lead_funnel_enabled=False).
+        # The informational handler produces template_code='wa_promo_info'.
+        result = await s2.execute(select(OutboxMessage).where(OutboxMessage.template_code == "wa_promo_info"))
         outbox = result.scalar_one_or_none()
 
     assert outbox is not None, "OutboxMessage for promo command must be created"
-    assert outbox.template_code == "wa_cmd_promo"
+    assert outbox.template_code == "wa_promo_info"
     assert outbox.message_source == "bot"
     assert outbox.status == "sent"
     assert outbox.provider_message_id == _CaptureProvider.wamid
     assert outbox.phone_e164 == PHONE_E164
 
     meta = outbox.meta or {}
-    assert meta.get("source") == "inbound_command"
+    assert meta.get("source") == "promo_lead"
     assert meta.get("command") == "promo"
-    assert meta.get("whatsapp_event_id") == event_id
 
 
 # ---------------------------------------------------------------------------

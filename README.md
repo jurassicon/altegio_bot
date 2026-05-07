@@ -62,8 +62,15 @@ docker compose up -d
 
 ### Migrations
 
+Local check (no `.env` required):
 ```bash
-docker exec -i altegio-api alembic upgrade head
+uv run alembic heads      # must show exactly one head
+```
+
+Via Docker (production-style, reads `.env`):
+```bash
+docker compose up -d postgres
+docker compose --profile ops run --rm migrate
 ```
 
 ## Testing
@@ -416,7 +423,7 @@ set +a
 ### DB Migration
 
 ```bash
-docker exec -i altegio-api alembic upgrade head
+docker compose --profile ops run --rm migrate
 ```
 
 This adds the `chatwoot_conversation_id` column to `whatsapp_events`.

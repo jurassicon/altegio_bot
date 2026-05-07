@@ -25,6 +25,10 @@ from altegio_bot.perf import perf_log
 from altegio_bot.providers.base import WhatsAppProvider
 from altegio_bot.providers.dummy import safe_send
 from altegio_bot.settings import settings
+from altegio_bot.workers.promo_lead_handler import (
+    handle_promo_command,
+    handle_promo_info_command,
+)
 
 logger = logging.getLogger("whatsapp_inbox_worker")
 
@@ -53,18 +57,9 @@ START_KEYWORDS = {
     "prijava",
 }
 
-PROMO_KEYWORDS = {
-    "aktion",
-    "angebot",
-    "rabatt",
-}
-
-PROMO_REPLY_TEXT = (
-    "Hallo 💙\n"
-    "Unsere aktuelle Aktion: 10 % Rabatt für neue Kundinnen auf ausgewählte Leistungen.\n\n"
-    "Sie können Ihren Termin hier buchen:\n"
-    "https://n813709.alteg.io/\n\n"
-    "Wenn Sie Fragen haben, schreiben Sie uns einfach hier in WhatsApp."
+# Derived from settings so the word list is configurable without code changes.
+PROMO_KEYWORDS: frozenset[str] = frozenset(
+    w.strip().lower() for w in settings.promo_secret_words.split(",") if w.strip()
 )
 
 # Rank used to ensure OutboxMessage.status never regresses.
@@ -393,9 +388,6 @@ async def _cancel_marketing_jobs(
 def _ack_text(cmd: str) -> str:
     if cmd == "stop":
         return "Sie haben sich von Marketing-Nachrichten abgemeldet. Um wieder zu abonnieren, senden Sie START."
-
-    if cmd == "promo":
-        return PROMO_REPLY_TEXT
 
     return "Sie sind wieder angemeldet und erhalten Marketing-Nachrichten. Um sich abzumelden, senden Sie STOP."
 
@@ -832,17 +824,41 @@ async def handle_event(
         event.error = None
         return
 
-    # Promo commands: guard against bot-reply loops on Chatwoot-origin events.
-    # STOP/START retain their current behaviour (opt-out must be honoured
-    # regardless of origin); promo is purely informational and must not echo
-    # back into Chatwoot.
-    if cmd == "promo" and _is_chatwoot_origin(event, payload):
-        logger.debug(
-            "Skipping promo command for chatwoot-origin event dedupe_key=%s phone=%s",
-            event.dedupe_key,
-            phone_e164,
-        )
-        event.error = None
+    # ── Promo lead funnel ────────────────────────────────────────────────────
+    # Chatwoot-origin events are skipped to prevent bot-reply loops.
+    # STOP/START always proceed regardless of origin (opt-out must be honoured).
+    if cmd == "promo":
+        if _is_chatwoot_origin(event, payload):
+            logger.debug(
+                "Skipping promo command for chatwoot-origin event dedupe_key=%s phone=%s",
+                event.dedupe_key,
+                phone_e164,
+            )
+            event.error = None
+            return
+        if sender_id is None:
+            event.error = "No sender found for incoming phone_number_id"
+            return
+        if settings.promo_lead_funnel_enabled:
+            await handle_promo_command(
+                session=session,
+                event=event,
+                phone_e164=phone_e164,
+                text=text,
+                sender_id=sender_id,
+                company_id=company_id,
+                provider=provider,
+            )
+        else:
+            await handle_promo_info_command(
+                session=session,
+                event=event,
+                phone_e164=phone_e164,
+                text=text,
+                sender_id=sender_id,
+                company_id=company_id,
+                provider=provider,
+            )
         return
 
     if cmd in ("stop", "start"):
