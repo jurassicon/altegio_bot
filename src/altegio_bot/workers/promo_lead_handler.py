@@ -328,12 +328,15 @@ async def handle_promo_command(
             → mark expired after send, reply 'expired'.
     2c. Lead exists but is already closed (expired/cancelled/rejected_*)
             → reply 'expired', no new lead.
-    3.  No lead exists:
-        a. Local check finds prior visits → rejected_not_new lead + reply.
-        b. No prior visits found → issued lead + reply with discount info.
-
-    The free-form reply is SENT before any new PromoLead row is persisted.
-    This ensures a failed send leaves no stale active lead behind.
+    3.  No lead exists: build candidate, persist via savepoint.
+        Savepoint won → build reply from persisted lead.
+        Savepoint lost (UniqueConstraint race) → savepoint auto-rolled back;
+            outer transaction stays clean; re-read winner; send already-active reply.
+    4.  Send free-form WhatsApp reply.
+    5.  Send failure for a newly persisted lead: mark meta.reply_sent=False,
+            meta.reply_send_error; set event.error; no OutboxMessage.
+    6.  Send success: mark meta.reply_sent=True; create OutboxMessage audit row.
+    7.  Mark expired lead status after successful send.
 
     Sends a free-form WhatsApp text reply (NOT a Meta template).
     Creates an OutboxMessage audit row on success.
@@ -345,9 +348,10 @@ async def handle_promo_command(
     # ── 1. Look up most recent lead ──────────────────────────────────────────
     lead = await _find_any_lead(session, phone_e164, cfg.promo_campaign_name)
 
-    # Determine reply and any deferred mutations.
     new_lead: PromoLead | None = None
     mark_lead_expired: bool = False
+    reply: str
+    template_code: str
 
     if lead is not None and lead.status in ("issued", "booked", "applied"):
         if lead.expires_at <= now:
@@ -366,9 +370,9 @@ async def handle_promo_command(
         template_code = "wa_promo_lead_expired"
 
     else:
-        # ── 2. New lead: eligibility check ───────────────────────────────────
+        # ── 2. No existing lead: build candidate ─────────────────────────────
         if await _has_prior_visits(session, phone_e164):
-            new_lead = PromoLead(
+            candidate = PromoLead(
                 company_id=company_id or 0,
                 phone_e164=phone_e164,
                 campaign_name=cfg.promo_campaign_name,
@@ -380,11 +384,9 @@ async def handle_promo_command(
                 issued_at=now,
                 expires_at=now,
             )
-            reply = build_reply_rejected_not_new()
-            template_code = "wa_promo_lead_rejected_not_new"
         else:
             expires_at = compute_expires_at(now, cfg.promo_validity_mode, cfg.promo_validity_days)
-            new_lead = PromoLead(
+            candidate = PromoLead(
                 company_id=company_id or 0,
                 phone_e164=phone_e164,
                 campaign_name=cfg.promo_campaign_name,
@@ -395,10 +397,48 @@ async def handle_promo_command(
                 issued_at=now,
                 expires_at=expires_at,
             )
-            reply = build_reply_issued(expires_at, cfg.promo_booking_url, discount_amount, cfg.promo_discount_type)
-            template_code = "wa_promo_lead_issued"
 
-    # ── 3. Send free-form reply FIRST (before any DB mutations for new leads)
+        # ── 3. Persist via savepoint — safe concurrent-insert handling ────────
+        try:
+            async with session.begin_nested():
+                session.add(candidate)
+                await session.flush()
+            # Savepoint committed: we won the race.
+            new_lead = candidate
+        except IntegrityError:
+            # UniqueConstraint violation: a concurrent worker won the race.
+            # The savepoint is auto-rolled back; the outer transaction is clean.
+            logger.warning(
+                "promo_lead: concurrent insert race phone=%s campaign=%s — reading winner",
+                phone_e164,
+                cfg.promo_campaign_name,
+            )
+            lead = await _find_any_lead(session, phone_e164, cfg.promo_campaign_name)
+
+        # Determine reply from the actual DB outcome.
+        if new_lead is not None:
+            if new_lead.status == "rejected_not_new":
+                reply = build_reply_rejected_not_new()
+                template_code = "wa_promo_lead_rejected_not_new"
+            else:
+                reply = build_reply_issued(
+                    new_lead.expires_at, cfg.promo_booking_url, discount_amount, cfg.promo_discount_type
+                )
+                template_code = "wa_promo_lead_issued"
+        else:
+            # Race lost: reply based on the winner we just re-read.
+            if (
+                lead is not None
+                and lead.status in ("issued", "booked", "applied")
+                and lead.expires_at > now
+            ):
+                reply = build_reply_already_issued(lead.expires_at, cfg.promo_booking_url)
+                template_code = "wa_promo_lead_already_issued"
+            else:
+                reply = build_reply_expired()
+                template_code = "wa_promo_lead_expired"
+
+    # ── 4. Send free-form reply ──────────────────────────────────────────────
     logger.info(
         "promo_lead: phone=%s template=%s campaign=%s event_id=%s",
         phone_e164,
@@ -421,29 +461,20 @@ async def handle_promo_command(
             sender_id,
             err,
         )
+        if new_lead is not None:
+            # Lead persisted but reply not delivered — mark for ops awareness / retry.
+            new_lead.meta = {**(new_lead.meta or {}), "reply_sent": False, "reply_send_error": str(err)}
         event.error = f"promo_lead: send failed: {err}"
         return
 
-    # ── 4. Persist mutations only after successful send ──────────────────────
-    if new_lead is not None:
-        try:
-            session.add(new_lead)
-            await session.flush()
-        except IntegrityError:
-            # Concurrent insert won the race; the customer already received our
-            # reply so we just log and skip the duplicate persist.
-            logger.warning(
-                "promo_lead: concurrent insert race phone=%s campaign=%s — skipping duplicate",
-                phone_e164,
-                cfg.promo_campaign_name,
-            )
-            event.error = "promo_lead: concurrent insert race condition"
-            return
-
+    # ── 5. Post-send mutations ───────────────────────────────────────────────
     if mark_lead_expired:
         lead.status = "expired"
 
-    # ── 5. Audit OutboxMessage ───────────────────────────────────────────────
+    if new_lead is not None:
+        new_lead.meta = {**(new_lead.meta or {}), "reply_sent": True}
+
+    # ── 6. Audit OutboxMessage ───────────────────────────────────────────────
     session.add(
         OutboxMessage(
             company_id=company_id or 0,

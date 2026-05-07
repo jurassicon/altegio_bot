@@ -1,7 +1,7 @@
 """add promo_leads table
 
 Revision ID: a3b4c5d6e7f8
-Revises: a2b3c4d5e6f7
+Revises: a2b3c4d5e6f7, f8e7d6c5b4a3
 Create Date: 2026-05-07 00:00:00.000000
 
 Adds the promo_leads table that tracks WhatsApp secret-word promo leads.
@@ -47,7 +47,7 @@ def upgrade() -> None:
         "promo_leads",
         sa.Column("id", sa.BigInteger(), autoincrement=True, nullable=False),
         # Company / location context
-        sa.Column("company_id", sa.BigInteger(), nullable=False, server_default="0"),
+        sa.Column("company_id", sa.Integer(), nullable=False),
         sa.Column("location_id", sa.BigInteger(), nullable=True),
         # Client identification
         sa.Column("phone_e164", sa.String(32), nullable=False),

@@ -14,11 +14,13 @@ Covers:
 11. All allowed PROMO_LEAD_STATUSES are defined in the model.
 12. rejected_not_new: local prior-visit check creates rejected lead (attendance=1).
 13. PromoLead stores company_id from sender.
-14. Send failure does not leave an issued PromoLead behind.
+14. Send failure persists PromoLead with meta.reply_sent=False, no OutboxMessage.
 15. Prior visit with attendance=0 and visit_attendance=1 → rejected_not_new.
 16. calendar_month customer display shows the last valid day, not the boundary.
 17. promo_lead_funnel_enabled=False sends safe info reply, creates no PromoLead.
 18. promo_lead_funnel_enabled=True creates PromoLead on secret word.
+19. Concurrent race: savepoint detects duplicate, sends already-active reply.
+20. Send failure after lead persist marks meta.reply_sent=False, no OutboxMessage.
 """
 
 from __future__ import annotations
@@ -667,12 +669,12 @@ async def test_promo_lead_stores_company_id(session_maker) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 14. Send failure does not leave an issued PromoLead behind
+# 14. Send failure persists PromoLead with meta.reply_sent=False, no OutboxMessage
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_send_failure_leaves_no_promo_lead(session_maker) -> None:
+async def test_send_failure_marks_lead_reply_not_sent(session_maker) -> None:
     class _FailProvider(WhatsAppProvider):
         async def send(self, sender_id, phone_e164, text, contact_name=None) -> str:
             raise RuntimeError("network error")
@@ -708,7 +710,11 @@ async def test_send_failure_leaves_no_promo_lead(session_maker) -> None:
             await s.execute(select(OutboxMessage).where(OutboxMessage.template_code == "wa_promo_lead_issued"))
         ).scalar_one_or_none()
 
-    assert not leads, "No PromoLead must be created when send fails"
+    assert len(leads) == 1, "PromoLead must be persisted even when send fails"
+    lead = leads[0]
+    assert lead.meta is not None
+    assert lead.meta.get("reply_sent") is False, "meta.reply_sent must be False on send failure"
+    assert lead.meta.get("reply_send_error") is not None, "meta.reply_send_error must capture the error"
     assert outbox is None, "No OutboxMessage must be created when send fails"
 
 
@@ -869,3 +875,152 @@ async def test_funnel_enabled_creates_promo_lead(session_maker) -> None:
     assert lead is not None, "PromoLead must be created when funnel is enabled"
     assert lead.status == "issued"
     assert evt.error is None
+
+
+# ---------------------------------------------------------------------------
+# 19. Concurrent race: savepoint detects duplicate, sends already-active reply
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_race_condition_savepoint_recovers_to_already_active(session_maker) -> None:
+    """Simulate a concurrent winner: _find_any_lead returns None on first call,
+    but the savepoint insert hits UniqueConstraint (pre-committed winner).
+    The code must recover: rollback savepoint, re-read winner, send already-active
+    reply, commit outer transaction cleanly.
+    """
+    import altegio_bot.workers.promo_lead_handler as _handler
+
+    now = _utcnow()
+
+    # Step 1: Pre-commit the winner lead and the WhatsAppSender.
+    async with session_maker() as pre:
+        async with pre.begin():
+            pre.add(
+                WhatsAppSender(
+                    id=314,
+                    company_id=1,
+                    sender_code="default",
+                    phone_number_id=PHONE_NUMBER_ID,
+                    display_phone="+49",
+                    is_active=True,
+                )
+            )
+            pre.add(
+                PromoLead(
+                    company_id=1,
+                    phone_e164=PHONE_E164,
+                    campaign_name=CAMPAIGN,
+                    secret_code="aktion",
+                    discount_amount=Decimal("15"),
+                    discount_type="fixed",
+                    status="issued",
+                    issued_at=now,
+                    expires_at=now + timedelta(days=30),
+                )
+            )
+
+    # Step 2: Patch _find_any_lead to return None on first call (race window),
+    #         then call the real implementation on subsequent calls.
+    original_find = _handler._find_any_lead
+    call_count = 0
+
+    async def _patched_find(sess, phone, campaign):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return None
+        return await original_find(sess, phone, campaign)
+
+    provider = _CaptureProvider()
+
+    async with session_maker() as session:
+        async with session.begin():
+            evt = WhatsAppEvent(
+                dedupe_key="wa:promo-race-19",
+                status="received",
+                error=None,
+                query={},
+                headers={},
+                payload=_inbound_payload(PHONE_NUMBER_ID, FROM_PHONE, "aktion"),
+            )
+            session.add(evt)
+            await session.flush()
+
+            with patch("altegio_bot.workers.promo_lead_handler._find_any_lead", _patched_find):
+                with patch(
+                    "altegio_bot.workers.whatsapp_inbox_worker.ChatwootClient",
+                    return_value=_FakeCW(),
+                ):
+                    await handle_event(session, evt, provider)
+
+    # Outer transaction must commit cleanly — no error.
+    assert evt.error is None, "Outer transaction must commit after race recovery"
+
+    # Exactly one lead must exist (the pre-committed winner).
+    async with session_maker() as s:
+        leads = (await s.execute(select(PromoLead).where(PromoLead.phone_e164 == PHONE_E164))).scalars().all()
+    assert len(leads) == 1, "Only the pre-committed winner must exist"
+
+    # Already-active reply must have been sent.
+    assert len(provider.sent) == 1
+    assert "bereits aktiv" in provider.sent[0][2], "Already-active reply must be sent after race recovery"
+
+    # OutboxMessage audit row must be created for the reply that was actually sent.
+    async with session_maker() as s:
+        outboxes = (await s.execute(select(OutboxMessage))).scalars().all()
+    assert any(
+        o.template_code == "wa_promo_lead_already_issued" for o in outboxes
+    ), "OutboxMessage for already-issued reply must be created"
+
+
+# ---------------------------------------------------------------------------
+# 20. Send failure after lead persist: meta.reply_sent=False, no OutboxMessage
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_send_failure_after_persist_marks_meta(session_maker) -> None:
+    """Lead is persisted via savepoint, then send fails.
+    PromoLead must remain with meta.reply_sent=False and the error string.
+    No OutboxMessage must be created.
+    """
+
+    class _FailProvider(WhatsAppProvider):
+        async def send(self, sender_id, phone_e164, text, contact_name=None) -> str:
+            raise RuntimeError("downstream timeout")
+
+    provider = _FailProvider()
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _setup_sender(session, sender_id=315)
+
+            evt = WhatsAppEvent(
+                dedupe_key="wa:promo-sendpost-20",
+                status="received",
+                error=None,
+                query={},
+                headers={},
+                payload=_inbound_payload(PHONE_NUMBER_ID, FROM_PHONE, "aktion"),
+            )
+            session.add(evt)
+            await session.flush()
+
+            with patch(
+                "altegio_bot.workers.whatsapp_inbox_worker.ChatwootClient",
+                return_value=_FakeCW(),
+            ):
+                await handle_event(session, evt, provider)
+
+    assert evt.error is not None
+
+    async with session_maker() as s:
+        leads = (await s.execute(select(PromoLead).where(PromoLead.phone_e164 == PHONE_E164))).scalars().all()
+        outboxes = (await s.execute(select(OutboxMessage))).scalars().all()
+
+    assert len(leads) == 1, "PromoLead must be persisted despite send failure"
+    meta = leads[0].meta or {}
+    assert meta.get("reply_sent") is False
+    assert "downstream timeout" in (meta.get("reply_send_error") or "")
+    assert not outboxes, "No OutboxMessage must be created when send fails"
