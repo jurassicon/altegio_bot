@@ -12,7 +12,13 @@ Covers:
 9.  STOP/START behaviour still works after promo funnel added.
 10. Chatwoot-origin promo event does not create a PromoLead or send a reply.
 11. All allowed PROMO_LEAD_STATUSES are defined in the model.
-12. rejected_not_new: local prior-visit check creates rejected lead.
+12. rejected_not_new: local prior-visit check creates rejected lead (attendance=1).
+13. PromoLead stores company_id from sender.
+14. Send failure does not leave an issued PromoLead behind.
+15. Prior visit with attendance=0 and visit_attendance=1 → rejected_not_new.
+16. calendar_month customer display shows the last valid day, not the boundary.
+17. promo_lead_funnel_enabled=False sends safe info reply, creates no PromoLead.
+18. promo_lead_funnel_enabled=True creates PromoLead on secret word.
 """
 
 from __future__ import annotations
@@ -35,8 +41,21 @@ from altegio_bot.models.models import (
     WhatsAppSender,
 )
 from altegio_bot.providers.base import WhatsAppProvider
+from altegio_bot.settings import settings
 from altegio_bot.workers.promo_lead_handler import compute_expires_at
 from altegio_bot.workers.whatsapp_inbox_worker import handle_event
+
+# ---------------------------------------------------------------------------
+# Autouse fixture: enable funnel for all tests in this module
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _enable_promo_funnel():
+    """All tests here exercise the full funnel (promo_lead_funnel_enabled=True)."""
+    with patch.object(settings, "promo_lead_funnel_enabled", True):
+        yield
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -105,11 +124,11 @@ def _inbound_payload(phone_number_id: str, from_phone: str, text: str) -> dict[s
     }
 
 
-async def _setup_sender(session, *, sender_id: int = 301) -> None:
+async def _setup_sender(session, *, sender_id: int = 301, company_id: int = 1) -> None:
     session.add(
         WhatsAppSender(
             id=sender_id,
-            company_id=1,
+            company_id=company_id,
             sender_code="default",
             phone_number_id=PHONE_NUMBER_ID,
             display_phone="+49",
@@ -309,6 +328,7 @@ async def test_already_active_lead_sends_already_issued_text(session_maker) -> N
             now = _utcnow()
             session.add(
                 PromoLead(
+                    company_id=1,
                     phone_e164=PHONE_E164,
                     campaign_name=CAMPAIGN,
                     secret_code="aktion",
@@ -359,6 +379,7 @@ async def test_expired_lead_is_marked_expired(session_maker) -> None:
 
             session.add(
                 PromoLead(
+                    company_id=1,
                     phone_e164=PHONE_E164,
                     campaign_name=CAMPAIGN,
                     secret_code="aktion",
@@ -549,7 +570,7 @@ def test_promo_lead_statuses_complete() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 12. rejected_not_new: prior-visit check creates rejected lead
+# 12. rejected_not_new: attendance=1 creates rejected lead
 # ---------------------------------------------------------------------------
 
 
@@ -559,16 +580,7 @@ async def test_rejected_not_new_when_client_has_prior_visit(session_maker) -> No
 
     async with session_maker() as session:
         async with session.begin():
-            session.add(
-                WhatsAppSender(
-                    id=307,
-                    company_id=1,
-                    sender_code="default",
-                    phone_number_id=PHONE_NUMBER_ID,
-                    display_phone="+49",
-                    is_active=True,
-                )
-            )
+            await _setup_sender(session, sender_id=307)
 
             # Client id=1 has phone "+10000000001" (seeded).
             # Add a Record for that client that shows attendance=1 (visited).
@@ -579,12 +591,11 @@ async def test_rejected_not_new_when_client_has_prior_visit(session_maker) -> No
                     client_id=1,
                     altegio_client_id=1,
                     is_deleted=False,
-                    attendance=1,  # attended
+                    attendance=1,
                     raw={},
                 )
             )
 
-            # Send promo from the same phone as Client id=1.
             prior_visit_phone = "10000000001"
             prior_visit_e164 = "+10000000001"
             evt = WhatsAppEvent(
@@ -615,3 +626,246 @@ async def test_rejected_not_new_when_client_has_prior_visit(session_maker) -> No
     assert provider.sent
     _sid, _phone, sent_text = provider.sent[0]
     assert "Neukunden" in sent_text
+
+
+# ---------------------------------------------------------------------------
+# 13. PromoLead stores company_id from sender
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_promo_lead_stores_company_id(session_maker) -> None:
+    provider = _CaptureProvider()
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _setup_sender(session, sender_id=309, company_id=42)
+
+            evt = WhatsAppEvent(
+                dedupe_key="wa:promo-company-13",
+                status="received",
+                error=None,
+                query={},
+                headers={},
+                payload=_inbound_payload(PHONE_NUMBER_ID, FROM_PHONE, "aktion"),
+            )
+            session.add(evt)
+            await session.flush()
+
+            with patch(
+                "altegio_bot.workers.whatsapp_inbox_worker.ChatwootClient",
+                return_value=_FakeCW(),
+            ):
+                await handle_event(session, evt, provider)
+
+    async with session_maker() as s:
+        result = await s.execute(select(PromoLead).where(PromoLead.phone_e164 == PHONE_E164))
+        lead = result.scalar_one_or_none()
+
+    assert lead is not None
+    assert lead.company_id == 42
+
+
+# ---------------------------------------------------------------------------
+# 14. Send failure does not leave an issued PromoLead behind
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_send_failure_leaves_no_promo_lead(session_maker) -> None:
+    class _FailProvider(WhatsAppProvider):
+        async def send(self, sender_id, phone_e164, text, contact_name=None) -> str:
+            raise RuntimeError("network error")
+
+    provider = _FailProvider()
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _setup_sender(session, sender_id=310)
+
+            evt = WhatsAppEvent(
+                dedupe_key="wa:promo-sendfail-14",
+                status="received",
+                error=None,
+                query={},
+                headers={},
+                payload=_inbound_payload(PHONE_NUMBER_ID, FROM_PHONE, "aktion"),
+            )
+            session.add(evt)
+            await session.flush()
+
+            with patch(
+                "altegio_bot.workers.whatsapp_inbox_worker.ChatwootClient",
+                return_value=_FakeCW(),
+            ):
+                await handle_event(session, evt, provider)
+
+    assert evt.error is not None, "event.error must be set on send failure"
+
+    async with session_maker() as s:
+        leads = (await s.execute(select(PromoLead).where(PromoLead.phone_e164 == PHONE_E164))).scalars().all()
+        outbox = (
+            await s.execute(select(OutboxMessage).where(OutboxMessage.template_code == "wa_promo_lead_issued"))
+        ).scalar_one_or_none()
+
+    assert not leads, "No PromoLead must be created when send fails"
+    assert outbox is None, "No OutboxMessage must be created when send fails"
+
+
+# ---------------------------------------------------------------------------
+# 15. Prior visit with attendance=0 and visit_attendance=1 → rejected_not_new
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_rejected_not_new_when_visit_attendance_is_one(session_maker) -> None:
+    provider = _CaptureProvider()
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _setup_sender(session, sender_id=311)
+
+            # attendance=0 but visit_attendance=1 — must also be treated as prior visit.
+            session.add(
+                Record(
+                    company_id=1,
+                    altegio_record_id=9902,
+                    client_id=1,
+                    altegio_client_id=1,
+                    is_deleted=False,
+                    attendance=0,
+                    visit_attendance=1,
+                    raw={},
+                )
+            )
+
+            prior_phone = "10000000001"
+            prior_e164 = "+10000000001"
+            evt = WhatsAppEvent(
+                dedupe_key="wa:promo-visit-att-15",
+                status="received",
+                error=None,
+                query={},
+                headers={},
+                payload=_inbound_payload(PHONE_NUMBER_ID, prior_phone, "aktion"),
+            )
+            session.add(evt)
+            await session.flush()
+
+            with patch(
+                "altegio_bot.workers.whatsapp_inbox_worker.ChatwootClient",
+                return_value=_FakeCW(),
+            ):
+                await handle_event(session, evt, provider)
+
+    async with session_maker() as s:
+        result = await s.execute(select(PromoLead).where(PromoLead.phone_e164 == prior_e164))
+        lead = result.scalar_one_or_none()
+
+    assert lead is not None
+    assert lead.status == "rejected_not_new", "attendance=0 + visit_attendance=1 must still trigger rejected_not_new"
+
+
+# ---------------------------------------------------------------------------
+# 16. calendar_month display shows the last valid day (not the boundary)
+# ---------------------------------------------------------------------------
+
+
+def test_calendar_month_display_shows_last_valid_day() -> None:
+    from altegio_bot.workers.promo_lead_handler import build_reply_issued
+
+    # Technical boundary: 2026-06-01 00:00:00 UTC
+    expires_at = datetime(2026, 6, 1, 0, 0, 0, tzinfo=timezone.utc)
+    reply = build_reply_issued(
+        expires_at=expires_at,
+        booking_url="https://example.com/",
+        discount_amount=Decimal("15"),
+        discount_type="fixed",
+    )
+    assert "31.05.2026" in reply, "Customer text must show last valid day, not boundary date"
+    assert "01.06.2026" not in reply, "Boundary date must not appear in customer text"
+
+
+def test_issued_plus_days_display_shows_exact_date() -> None:
+    from altegio_bot.workers.promo_lead_handler import build_reply_issued
+
+    # issued_plus_days: expires at 15:00 UTC, not midnight — no day subtraction.
+    expires_at = datetime(2026, 6, 6, 15, 0, 0, tzinfo=timezone.utc)
+    reply = build_reply_issued(
+        expires_at=expires_at,
+        booking_url="https://example.com/",
+        discount_amount=Decimal("15"),
+        discount_type="fixed",
+    )
+    assert "06.06.2026" in reply
+
+
+# ---------------------------------------------------------------------------
+# 17. promo_lead_funnel_enabled=False → safe info reply, no PromoLead
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_funnel_disabled_sends_info_reply_no_lead(session_maker) -> None:
+    provider = _CaptureProvider()
+
+    # Override the autouse fixture: disable funnel explicitly for this test.
+    with patch.object(settings, "promo_lead_funnel_enabled", False):
+        async with session_maker() as session:
+            async with session.begin():
+                await _setup_sender(session, sender_id=312)
+
+                evt = WhatsAppEvent(
+                    dedupe_key="wa:promo-disabled-17",
+                    status="received",
+                    error=None,
+                    query={},
+                    headers={},
+                    payload=_inbound_payload(PHONE_NUMBER_ID, FROM_PHONE, "aktion"),
+                )
+                session.add(evt)
+                await session.flush()
+
+                with patch(
+                    "altegio_bot.workers.whatsapp_inbox_worker.ChatwootClient",
+                    return_value=_FakeCW(),
+                ):
+                    await handle_event(session, evt, provider)
+
+    assert provider.sent, "Info reply must be sent even when funnel is disabled"
+    _sid, sent_phone, sent_text = provider.sent[0]
+    assert sent_phone == PHONE_E164
+    assert sent_text, "Sent text must be non-empty"
+    # Must NOT make the discount-is-linked promise
+    assert "verknüpft" not in sent_text
+    assert evt.error is None
+
+    async with session_maker() as s:
+        leads = (await s.execute(select(PromoLead).where(PromoLead.phone_e164 == PHONE_E164))).scalars().all()
+        outbox = (
+            await s.execute(select(OutboxMessage).where(OutboxMessage.template_code == "wa_promo_info"))
+        ).scalar_one_or_none()
+
+    assert not leads, "No PromoLead must be created when funnel is disabled"
+    assert outbox is not None, "OutboxMessage with template_code=wa_promo_info must be created"
+    assert outbox.message_source == "bot"
+    assert outbox.meta.get("source") == "promo_lead"
+
+
+# ---------------------------------------------------------------------------
+# 18. promo_lead_funnel_enabled=True → PromoLead created on secret word
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_funnel_enabled_creates_promo_lead(session_maker) -> None:
+    # The autouse fixture already enables the funnel; this test is explicit.
+    provider, evt = await _fire_promo(session_maker, "rabatt")
+
+    async with session_maker() as s:
+        result = await s.execute(select(PromoLead).where(PromoLead.phone_e164 == PHONE_E164))
+        lead = result.scalar_one_or_none()
+
+    assert lead is not None, "PromoLead must be created when funnel is enabled"
+    assert lead.status == "issued"
+    assert evt.error is None

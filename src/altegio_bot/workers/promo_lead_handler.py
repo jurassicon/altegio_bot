@@ -25,7 +25,8 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.models.models import Client, OutboxMessage, PromoLead, Record
@@ -37,6 +38,18 @@ if TYPE_CHECKING:
     from altegio_bot.models.models import WhatsAppEvent
 
 logger = logging.getLogger("promo_lead_handler")
+
+
+# ---------------------------------------------------------------------------
+# Safe informational reply (promo_lead_funnel_enabled = False)
+# ---------------------------------------------------------------------------
+
+_PROMO_INFO_TEXT = (
+    "Danke für Ihr Interesse! 🎁\n\n"
+    "Diese Aktion richtet sich an Neukunden beim ersten Besuch.\n\n"
+    "Bitte buchen Sie Ihren Termin online – wir freuen uns auf Sie.\n\n"
+    "Termin buchen:\n{booking_url}"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -61,6 +74,8 @@ def compute_expires_at(
     mode='calendar_month':
         expires_at = midnight UTC on the first day of the next calendar month.
         e.g. issued 2026-05-07 → expires 2026-06-01 00:00:00 UTC.
+        Customer display shows the last valid day (31.05.2026), not the
+        exclusive boundary.
     """
     if mode == "calendar_month":
         year = issued_at.year
@@ -102,6 +117,19 @@ def _format_discount(amount: Decimal, discount_type: str) -> str:
 
 
 def _expires_display(expires_at: datetime) -> str:
+    """Return display date string for customer-facing expiry.
+
+    calendar_month boundaries fall on day=1 at midnight UTC.
+    Show the last valid day (day before the exclusive boundary).
+    """
+    if (
+        expires_at.day == 1
+        and expires_at.hour == 0
+        and expires_at.minute == 0
+        and expires_at.second == 0
+        and expires_at.microsecond == 0
+    ):
+        expires_at = expires_at - timedelta(days=1)
     return expires_at.strftime("%d.%m.%Y")
 
 
@@ -186,6 +214,9 @@ async def _has_prior_visits(session: AsyncSession, phone_e164: str) -> bool:
     Uses only locally synced records (Client + Record tables).  This may
     miss visits that have not yet been synced from Altegio.  A full Altegio
     CRM API check is deferred to a future PR.
+
+    An attended visit is indicated by attendance == 1 OR visit_attendance == 1,
+    matching the same predicate used elsewhere in the project.
     """
     variants = _phone_variants(phone_e164)
     stmt = (
@@ -193,7 +224,7 @@ async def _has_prior_visits(session: AsyncSession, phone_e164: str) -> bool:
         .join(Client, Client.id == Record.client_id)
         .where(Client.phone_e164.in_(variants))
         .where(Record.is_deleted.is_(False))
-        .where(Record.attendance > 0)
+        .where(or_(Record.attendance == 1, Record.visit_attendance == 1))
         .limit(1)
     )
     result = await session.execute(stmt)
@@ -201,7 +232,80 @@ async def _has_prior_visits(session: AsyncSession, phone_e164: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Main handler
+# Informational handler (funnel disabled)
+# ---------------------------------------------------------------------------
+
+
+async def handle_promo_info_command(
+    session: AsyncSession,
+    event: "WhatsAppEvent",
+    phone_e164: str,
+    text: str,
+    sender_id: int,
+    company_id: int | None,
+    provider: WhatsAppProvider,
+) -> None:
+    """Send a safe informational promo reply when the funnel is disabled.
+
+    No PromoLead is created.  The reply makes no promise of automatic
+    discount assignment.  An OutboxMessage audit row is created on success.
+    """
+    cfg = settings
+    reply = _PROMO_INFO_TEXT.format(booking_url=cfg.promo_booking_url)
+    now = _utcnow()
+
+    msg_id, err = await safe_send(
+        provider=provider,
+        sender_id=sender_id,
+        phone=phone_e164,
+        text=reply,
+    )
+    if err is not None:
+        logger.warning(
+            "promo_info: send failed phone=%s sender_id=%s err=%s",
+            phone_e164,
+            sender_id,
+            err,
+        )
+        event.error = f"promo_info: send failed: {err}"
+        return
+
+    session.add(
+        OutboxMessage(
+            company_id=company_id or 0,
+            client_id=None,
+            record_id=None,
+            job_id=None,
+            sender_id=sender_id,
+            phone_e164=phone_e164,
+            template_code="wa_promo_info",
+            language="de",
+            body=reply,
+            status="sent",
+            provider_message_id=msg_id,
+            scheduled_at=now,
+            sent_at=now,
+            message_source="bot",
+            meta={
+                "source": "promo_lead",
+                "command": "promo",
+                "inbound_text": text,
+                "whatsapp_event_id": event.id,
+                "campaign_name": cfg.promo_campaign_name,
+            },
+        )
+    )
+    event.error = None
+    logger.info(
+        "promo_info: sent phone=%s sender_id=%s msg_id=%s",
+        phone_e164,
+        sender_id,
+        msg_id,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Main funnel handler (funnel enabled)
 # ---------------------------------------------------------------------------
 
 
@@ -221,12 +325,15 @@ async def handle_promo_command(
     2a. Lead is active (issued/booked/applied) AND not expired
             → reply 'already active', no new lead.
     2b. Lead is active AND past expires_at
-            → mark expired, reply 'expired', no new lead (strict policy).
+            → mark expired after send, reply 'expired'.
     2c. Lead exists but is already closed (expired/cancelled/rejected_*)
             → reply 'expired', no new lead.
     3.  No lead exists:
         a. Local check finds prior visits → rejected_not_new lead + reply.
         b. No prior visits found → issued lead + reply with discount info.
+
+    The free-form reply is SENT before any new PromoLead row is persisted.
+    This ensures a failed send leaves no stale active lead behind.
 
     Sends a free-form WhatsApp text reply (NOT a Meta template).
     Creates an OutboxMessage audit row on success.
@@ -238,10 +345,14 @@ async def handle_promo_command(
     # ── 1. Look up most recent lead ──────────────────────────────────────────
     lead = await _find_any_lead(session, phone_e164, cfg.promo_campaign_name)
 
+    # Determine reply and any deferred mutations.
+    new_lead: PromoLead | None = None
+    mark_lead_expired: bool = False
+
     if lead is not None and lead.status in ("issued", "booked", "applied"):
         if lead.expires_at <= now:
-            # Active status but validity elapsed → mark expired.
-            lead.status = "expired"
+            # Active status but validity elapsed → will mark expired after send.
+            mark_lead_expired = True
             reply = build_reply_expired()
             template_code = "wa_promo_lead_expired"
         else:
@@ -250,48 +361,44 @@ async def handle_promo_command(
             template_code = "wa_promo_lead_already_issued"
 
     elif lead is not None:
-        # Lead is already in a terminal / rejected state.
-        # Strict policy: do not re-issue within the same campaign this PR.
+        # Terminal / rejected state — strict policy: do not re-issue.
         reply = build_reply_expired()
         template_code = "wa_promo_lead_expired"
 
     else:
         # ── 2. New lead: eligibility check ───────────────────────────────────
-        # NOTE: local-only data; may miss Altegio history not yet synced.
         if await _has_prior_visits(session, phone_e164):
-            session.add(
-                PromoLead(
-                    phone_e164=phone_e164,
-                    campaign_name=cfg.promo_campaign_name,
-                    secret_code=text[:64],
-                    discount_amount=discount_amount,
-                    discount_type=cfg.promo_discount_type,
-                    status="rejected_not_new",
-                    reject_reason="has_prior_visits",
-                    issued_at=now,
-                    expires_at=now,
-                )
+            new_lead = PromoLead(
+                company_id=company_id or 0,
+                phone_e164=phone_e164,
+                campaign_name=cfg.promo_campaign_name,
+                secret_code=text[:64],
+                discount_amount=discount_amount,
+                discount_type=cfg.promo_discount_type,
+                status="rejected_not_new",
+                reject_reason="has_prior_visits",
+                issued_at=now,
+                expires_at=now,
             )
             reply = build_reply_rejected_not_new()
             template_code = "wa_promo_lead_rejected_not_new"
         else:
             expires_at = compute_expires_at(now, cfg.promo_validity_mode, cfg.promo_validity_days)
-            session.add(
-                PromoLead(
-                    phone_e164=phone_e164,
-                    campaign_name=cfg.promo_campaign_name,
-                    secret_code=text[:64],
-                    discount_amount=discount_amount,
-                    discount_type=cfg.promo_discount_type,
-                    status="issued",
-                    issued_at=now,
-                    expires_at=expires_at,
-                )
+            new_lead = PromoLead(
+                company_id=company_id or 0,
+                phone_e164=phone_e164,
+                campaign_name=cfg.promo_campaign_name,
+                secret_code=text[:64],
+                discount_amount=discount_amount,
+                discount_type=cfg.promo_discount_type,
+                status="issued",
+                issued_at=now,
+                expires_at=expires_at,
             )
             reply = build_reply_issued(expires_at, cfg.promo_booking_url, discount_amount, cfg.promo_discount_type)
             template_code = "wa_promo_lead_issued"
 
-    # ── 3. Send free-form reply ──────────────────────────────────────────────
+    # ── 3. Send free-form reply FIRST (before any DB mutations for new leads)
     logger.info(
         "promo_lead: phone=%s template=%s campaign=%s event_id=%s",
         phone_e164,
@@ -317,7 +424,26 @@ async def handle_promo_command(
         event.error = f"promo_lead: send failed: {err}"
         return
 
-    # ── 4. Audit OutboxMessage ───────────────────────────────────────────────
+    # ── 4. Persist mutations only after successful send ──────────────────────
+    if new_lead is not None:
+        try:
+            session.add(new_lead)
+            await session.flush()
+        except IntegrityError:
+            # Concurrent insert won the race; the customer already received our
+            # reply so we just log and skip the duplicate persist.
+            logger.warning(
+                "promo_lead: concurrent insert race phone=%s campaign=%s — skipping duplicate",
+                phone_e164,
+                cfg.promo_campaign_name,
+            )
+            event.error = "promo_lead: concurrent insert race condition"
+            return
+
+    if mark_lead_expired:
+        lead.status = "expired"
+
+    # ── 5. Audit OutboxMessage ───────────────────────────────────────────────
     session.add(
         OutboxMessage(
             company_id=company_id or 0,

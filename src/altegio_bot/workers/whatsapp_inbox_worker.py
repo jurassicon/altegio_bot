@@ -25,7 +25,10 @@ from altegio_bot.perf import perf_log
 from altegio_bot.providers.base import WhatsAppProvider
 from altegio_bot.providers.dummy import safe_send
 from altegio_bot.settings import settings
-from altegio_bot.workers.promo_lead_handler import handle_promo_command
+from altegio_bot.workers.promo_lead_handler import (
+    handle_promo_command,
+    handle_promo_info_command,
+)
 
 logger = logging.getLogger("whatsapp_inbox_worker")
 
@@ -836,15 +839,26 @@ async def handle_event(
         if sender_id is None:
             event.error = "No sender found for incoming phone_number_id"
             return
-        await handle_promo_command(
-            session=session,
-            event=event,
-            phone_e164=phone_e164,
-            text=text,
-            sender_id=sender_id,
-            company_id=company_id,
-            provider=provider,
-        )
+        if settings.promo_lead_funnel_enabled:
+            await handle_promo_command(
+                session=session,
+                event=event,
+                phone_e164=phone_e164,
+                text=text,
+                sender_id=sender_id,
+                company_id=company_id,
+                provider=provider,
+            )
+        else:
+            await handle_promo_info_command(
+                session=session,
+                event=event,
+                phone_e164=phone_e164,
+                text=text,
+                sender_id=sender_id,
+                company_id=company_id,
+                provider=provider,
+            )
         return
 
     if cmd in ("stop", "start"):

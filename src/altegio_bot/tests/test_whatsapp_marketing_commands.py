@@ -222,13 +222,13 @@ async def test_promo_command_creates_outbox_audit(session_maker) -> None:
                 await handle_event(session, evt, provider)
 
     async with session_maker() as s2:
-        # template_code is now 'wa_promo_lead_issued' (set by promo_lead_handler).
-        # Full field assertions live in test_whatsapp_promo_leads.py.
-        result = await s2.execute(select(OutboxMessage).where(OutboxMessage.template_code == "wa_promo_lead_issued"))
+        # Funnel is disabled by default (promo_lead_funnel_enabled=False).
+        # The informational handler produces template_code='wa_promo_info'.
+        result = await s2.execute(select(OutboxMessage).where(OutboxMessage.template_code == "wa_promo_info"))
         outbox = result.scalar_one_or_none()
 
     assert outbox is not None, "OutboxMessage for promo command must be created"
-    assert outbox.template_code == "wa_promo_lead_issued"
+    assert outbox.template_code == "wa_promo_info"
     assert outbox.message_source == "bot"
     assert outbox.status == "sent"
     assert outbox.provider_message_id == _CaptureProvider.wamid

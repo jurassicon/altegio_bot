@@ -6,6 +6,7 @@ from decimal import Decimal
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    CheckConstraint,
     DateTime,
     ForeignKey,
     Index,
@@ -911,6 +912,24 @@ PROMO_LEAD_STATUSES: frozenset[str] = frozenset(
 )
 
 
+_PROMO_STATUS_CHECK = "status IN ({})".format(
+    ", ".join(
+        f"'{s}'"
+        for s in (
+            "issued",
+            "booked",
+            "applied",
+            "used",
+            "expired",
+            "cancelled",
+            "rejected_not_new",
+            "rejected_service_not_allowed",
+            "apply_failed",
+        )
+    )
+)
+
+
 class PromoLead(Base):
     """WhatsApp secret-word promo lead.
 
@@ -925,11 +944,18 @@ class PromoLead(Base):
 
     __tablename__ = "promo_leads"
     __table_args__ = (
-        Index("ix_promo_leads_phone_campaign", "phone_e164", "campaign_name"),
+        # One active lead per phone + campaign enforced at DB level.
+        UniqueConstraint("phone_e164", "campaign_name", name="uq_promo_leads_phone_campaign"),
+        CheckConstraint(_PROMO_STATUS_CHECK, name="ck_promo_leads_status"),
+        CheckConstraint("discount_type IN ('fixed', 'percent')", name="ck_promo_leads_discount_type"),
         Index("ix_promo_leads_status_expires", "status", "expires_at"),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+
+    # Company / location context (filled from WhatsAppSender at creation time)
+    company_id: Mapped[int] = mapped_column(Integer, index=True)
+    location_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     # Client identification
     phone_e164: Mapped[str] = mapped_column(String(32), index=True)
@@ -968,12 +994,14 @@ class PromoLead(Base):
     discount_program_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     # Altegio booking attribution (future PRs)
+    # record_id = local FK; altegio_record_id = external Altegio identifier
     record_id: Mapped[int | None] = mapped_column(
         BigInteger,
         ForeignKey("records.id", ondelete="SET NULL"),
         index=True,
         nullable=True,
     )
+    altegio_record_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     visit_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(

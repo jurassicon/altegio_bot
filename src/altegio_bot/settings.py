@@ -124,6 +124,10 @@ class Settings(BaseSettings):
     promo_validity_days: int = 30
     # Online booking URL included in every promo reply.
     promo_booking_url: str = "https://n813709.alteg.io/"
+    # Gate for the full promo lead funnel (PromoLead creation + loyalty API).
+    # Default False: sends a safe informational reply only, no DB lead row.
+    # Enable only after loyalty API integration is production-ready.
+    promo_lead_funnel_enabled: bool = False
 
     # Publicly accessible image URLs for newsletter template IMAGE HEADER components.
     # Meta Cloud API requires a permanent URL it can fetch and cache at send time.
