@@ -4439,15 +4439,15 @@ async function recomputeStats(runId) {{
           'Booked-after count may be undercounted. ' +
           'Failed services: ' + svcIds + '. ' +
           'Failed records: ' + recCount + '. ' +
-          '<a href="">Обновите страницу</a> чтобы увидеть актуальные значения.' +
+          'Обновление страницы…' +
           '</div>';
       }} else {{
         el.innerHTML =
           '<div class="alert alert-success">' +
-          'Статистика пересчитана. ' +
-          '<a href="">Обновите страницу</a> чтобы увидеть актуальные значения.' +
+          'Статистика пересчитана. Обновление страницы…' +
           '</div>';
       }}
+      setTimeout(() => location.reload(), 800);
     }} else {{
       el.innerHTML =
         '<div class="alert alert-danger">Ошибка: ' +
