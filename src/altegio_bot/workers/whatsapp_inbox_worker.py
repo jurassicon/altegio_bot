@@ -53,6 +53,20 @@ START_KEYWORDS = {
     "prijava",
 }
 
+PROMO_KEYWORDS = {
+    "aktion",
+    "angebot",
+    "rabatt",
+}
+
+PROMO_REPLY_TEXT = (
+    "Hallo 💙\n"
+    "Unsere aktuelle Aktion: 10 % Rabatt für neue Kundinnen auf ausgewählte Leistungen.\n\n"
+    "Sie können Ihren Termin hier buchen:\n"
+    "https://n813709.alteg.io/\n\n"
+    "Wenn Sie Fragen haben, schreiben Sie uns einfach hier in WhatsApp."
+)
+
 # Rank used to ensure OutboxMessage.status never regresses.
 # A new status is applied only when its rank exceeds the current rank.
 # 'failed' has rank 0 so it only applies when outbox is still in
@@ -129,6 +143,9 @@ def _parse_command(text: str) -> str | None:
 
     if first in START_KEYWORDS:
         return "start"
+
+    if first in PROMO_KEYWORDS:
+        return "promo"
 
     return None
 
@@ -376,6 +393,9 @@ async def _cancel_marketing_jobs(
 def _ack_text(cmd: str) -> str:
     if cmd == "stop":
         return "Sie haben sich von Marketing-Nachrichten abgemeldet. Um wieder zu abonnieren, senden Sie START."
+
+    if cmd == "promo":
+        return PROMO_REPLY_TEXT
 
     return "Sie sind wieder angemeldet und erhalten Marketing-Nachrichten. Um sich abzumelden, senden Sie STOP."
 
@@ -812,30 +832,53 @@ async def handle_event(
         event.error = None
         return
 
-    reason = f"wa:{cmd}"
-    opted_out = cmd == "stop"
+    # Promo commands: guard against bot-reply loops on Chatwoot-origin events.
+    # STOP/START retain their current behaviour (opt-out must be honoured
+    # regardless of origin); promo is purely informational and must not echo
+    # back into Chatwoot.
+    if cmd == "promo" and _is_chatwoot_origin(event, payload):
+        logger.debug(
+            "Skipping promo command for chatwoot-origin event dedupe_key=%s phone=%s",
+            event.dedupe_key,
+            phone_e164,
+        )
+        event.error = None
+        return
 
-    affected = await _set_opt_out(
-        session,
-        phone_e164=phone_e164,
-        opted_out=opted_out,
-        reason=reason,
-    )
+    if cmd in ("stop", "start"):
+        reason = f"wa:{cmd}"
+        opted_out = cmd == "stop"
 
-    canceled = 0
-    if opted_out:
-        canceled = await _cancel_marketing_jobs(session, phone_e164=phone_e164)
+        affected = await _set_opt_out(
+            session,
+            phone_e164=phone_e164,
+            opted_out=opted_out,
+            reason=reason,
+        )
 
-    logger.info(
-        "wa_cmd=%s phone=%s sender_phone_number_id=%s sender_id=%s clients_updated=%s jobs_canceled=%s event_id=%s",
-        cmd,
-        phone_e164,
-        phone_number_id,
-        sender_id,
-        affected,
-        canceled,
-        event.id,
-    )
+        canceled = 0
+        if opted_out:
+            canceled = await _cancel_marketing_jobs(session, phone_e164=phone_e164)
+
+        logger.info(
+            "wa_cmd=%s phone=%s sender_phone_number_id=%s sender_id=%s clients_updated=%s jobs_canceled=%s event_id=%s",
+            cmd,
+            phone_e164,
+            phone_number_id,
+            sender_id,
+            affected,
+            canceled,
+            event.id,
+        )
+    else:
+        logger.info(
+            "wa_cmd=%s phone=%s sender_phone_number_id=%s sender_id=%s event_id=%s",
+            cmd,
+            phone_e164,
+            phone_number_id,
+            sender_id,
+            event.id,
+        )
 
     if sender_id is None:
         event.error = "No sender found for incoming phone_number_id"
@@ -858,6 +901,32 @@ async def handle_event(
         )
         event.error = f"Ack send failed: {err}"
         return
+
+    now = utcnow()
+    session.add(
+        OutboxMessage(
+            company_id=company_id,
+            client_id=None,
+            record_id=None,
+            job_id=None,
+            sender_id=sender_id,
+            phone_e164=phone_e164,
+            template_code=f"wa_cmd_{cmd}",
+            language="de",
+            body=ack,
+            status="sent",
+            provider_message_id=msg_id,
+            scheduled_at=now,
+            sent_at=now,
+            message_source="bot",
+            meta={
+                "source": "inbound_command",
+                "command": cmd,
+                "inbound_text": text,
+                "whatsapp_event_id": event.id,
+            },
+        )
+    )
 
     event.error = None
     logger.info(
