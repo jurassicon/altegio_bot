@@ -179,6 +179,9 @@ jobs:
             echo "🔨 Building new images (without starting containers)..."
             docker compose build
 
+            echo "🟢 Starting infrastructure services..."
+            docker compose up -d postgres redis
+
             echo "⏳ Waiting for Postgres to be healthy..."
             MAX_ATTEMPTS=60
             ATTEMPTS=0
@@ -203,31 +206,35 @@ jobs:
                 exit 1
             fi
 
+            # Postgres is confirmed healthy from this point on.
+            # Backup is a mandatory gate before migrations — any failure here stops the deploy.
             echo "💾 Creating pre-deploy database backup..."
             mkdir -p /opt/altegio_bot/backups
             DUMP_FILE="/opt/altegio_bot/backups/altegio_before_deploy_$(date -u +%Y%m%dT%H%M%SZ).dump"
 
-            if docker compose exec -T postgres psql \
-              -U "${POSTGRES_USER:-altegio}" \
-              -d "${POSTGRES_DB:-altegio_bot}" \
-              -c "SELECT 1" >/dev/null 2>&1; then
+            # Credentials come from inside the container (docker compose injected them from .env).
+            # This is more reliable than sourcing .env in the remote shell.
+            IS_FRESH=false
+            docker compose exec -T postgres sh -lc '
+              psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT 1"
+            ' >/dev/null 2>&1 || IS_FRESH=true
 
-              docker compose exec -T postgres pg_dump \
-                -U "${POSTGRES_USER:-altegio}" \
-                -d "${POSTGRES_DB:-altegio_bot}" \
-                -Fc > "$DUMP_FILE"
+            if [ "$IS_FRESH" = "true" ]; then
+              echo "ℹ️ Database does not exist yet — fresh deployment, skipping backup."
+            else
+              docker compose exec -T postgres sh -lc '
+                pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc
+              ' > "$DUMP_FILE"
 
               test -s "$DUMP_FILE" || {
-                echo "❌ Pre-deploy dump is empty"
+                echo "❌ Pre-deploy dump is empty — aborting."
                 exit 1
               }
               echo "✅ Backup created: $DUMP_FILE"
-            else
-              echo "ℹ️ Fresh deployment or DB unavailable — skipping backup."
             fi
 
             echo "⚙️ Applying DB Migrations..."
-            docker compose --profile ops run --rm migrate
+            docker compose --profile ops run --rm --no-deps migrate
 
             echo "🚀 Starting updated containers..."
             docker compose up -d --remove-orphans
