@@ -267,9 +267,11 @@ docker exec -i altegio-api /app/.venv/bin/python \
 
 ### 🗑️ Manual cleanup of expired promo loyalty cards
 
-Deletes Altegio loyalty cards for expired promo leads (`status` in `issued/booked/applied`,
-`expires_at <= now`). Only touches cards created by the promo funnel (`meta.loyalty_card_issued=True`).
-The script is **idempotent** — rows with `meta.promo_card_deleted_at` already set are skipped.
+Deletes Altegio loyalty cards for expired promo leads (`status='issued'`, `expires_at <= now`).
+Only touches cards created by the promo funnel (`meta.loyalty_card_issued=True`).
+Leads with `status='booked'` or `'applied'` are intentionally excluded — their card deletion
+policy is out of scope for this script.
+The script is **idempotent** — rows with `meta.promo_card_deleted_at` already set are excluded by the SQL query.
 
 **Local:**
 ```bash

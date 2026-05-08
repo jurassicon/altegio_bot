@@ -2,15 +2,18 @@
 
 Covers:
 1.  Expired issued PromoLead with card → delete_card called, status=expired, meta set.
-2.  Not-expired PromoLead → delete_card not called, status unchanged.
-3.  Already deleted (meta.promo_card_deleted_at set) → skip, delete_card not called.
+2.  Not-expired PromoLead → not fetched, delete_card not called.
+3.  Already deleted (meta.promo_card_deleted_at set) → excluded by SQL, not fetched.
 4.  delete_card failure → status unchanged, meta.promo_card_delete_result='failed', retryable.
-5.  status='used' PromoLead → skipped, delete_card not called.
-6.  status='cancelled' PromoLead → skipped, delete_card not called.
+4b. Failed lead (no promo_card_deleted_at) → retried on next run.
+5.  status='used' PromoLead → not fetched, delete_card not called.
+6.  status='cancelled' PromoLead → not fetched, delete_card not called.
+6b. status='booked' PromoLead → not fetched, delete_card not called.
+6c. status='applied' PromoLead → not fetched, delete_card not called.
 7.  PromoLead without loyalty_card_id → not fetched, delete_card not called.
 8.  PromoLead without location_id → not fetched, delete_card not called.
-9.  meta.loyalty_card_issued is not True → skipped, delete_card not called.
-10. limit parameter caps the number of processed rows.
+9.  meta.loyalty_card_issued is not True → excluded by SQL, not fetched.
+10. limit parameter caps actionable rows; already-processed rows do not block it.
 """
 
 from __future__ import annotations
@@ -125,12 +128,12 @@ async def test_not_expired_lead_skipped(session_maker) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 3. Already deleted (promo_card_deleted_at set) → skipped
+# 3. Already deleted (promo_card_deleted_at set) → excluded by SQL guard
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_already_deleted_is_skipped(session_maker) -> None:
+async def test_already_deleted_is_excluded_by_sql(session_maker) -> None:
     already_deleted_meta = {
         "loyalty_card_issued": True,
         "promo_card_deleted_at": "2026-04-01T00:00:00+00:00",
@@ -147,8 +150,8 @@ async def test_already_deleted_is_skipped(session_maker) -> None:
                 result = await cleanup_expired_promo_loyalty_cards(session, now=_NOW)
 
     mock_client.delete_card.assert_not_awaited()
-    assert result.found == 1
-    assert result.skipped == 1
+    assert result.found == 0
+    assert result.skipped == 0
     assert result.deleted == 0
 
 
@@ -211,7 +214,7 @@ async def test_failed_lead_is_retryable(session_maker) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 5. status='used' → not fetched by SQL (not in cleanup statuses)
+# 5. status='used' → not fetched by SQL
 # ---------------------------------------------------------------------------
 
 
@@ -251,6 +254,50 @@ async def test_cancelled_lead_not_processed(session_maker) -> None:
     mock_client.delete_card.assert_not_awaited()
     assert result.found == 0
     assert lead.status == "cancelled"
+
+
+# ---------------------------------------------------------------------------
+# 6b. status='booked' → not fetched by SQL (client already has a booking)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_booked_lead_not_processed(session_maker) -> None:
+    async with session_maker() as session:
+        async with session.begin():
+            lead = _lead(status="booked")
+            session.add(lead)
+            await session.flush()
+
+            with _mock_loyalty() as mock_client:
+                result = await cleanup_expired_promo_loyalty_cards(session, now=_NOW)
+
+    mock_client.delete_card.assert_not_awaited()
+    assert result.found == 0
+    assert result.deleted == 0
+    assert lead.status == "booked"
+
+
+# ---------------------------------------------------------------------------
+# 6c. status='applied' → not fetched by SQL (discount already linked to booking)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_applied_lead_not_processed(session_maker) -> None:
+    async with session_maker() as session:
+        async with session.begin():
+            lead = _lead(status="applied")
+            session.add(lead)
+            await session.flush()
+
+            with _mock_loyalty() as mock_client:
+                result = await cleanup_expired_promo_loyalty_cards(session, now=_NOW)
+
+    mock_client.delete_card.assert_not_awaited()
+    assert result.found == 0
+    assert result.deleted == 0
+    assert lead.status == "applied"
 
 
 # ---------------------------------------------------------------------------
@@ -294,12 +341,12 @@ async def test_lead_without_location_id_not_processed(session_maker) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 9. meta.loyalty_card_issued is not True → skipped (Python guard)
+# 9. meta.loyalty_card_issued is not True → excluded by SQL guard
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_loyalty_card_issued_not_true_skipped(session_maker) -> None:
+async def test_loyalty_card_issued_not_true_excluded_by_sql(session_maker) -> None:
     async with session_maker() as session:
         async with session.begin():
             # Covers both missing key and explicit False
@@ -312,13 +359,12 @@ async def test_loyalty_card_issued_not_true_skipped(session_maker) -> None:
                 result = await cleanup_expired_promo_loyalty_cards(session, now=_NOW)
 
     mock_client.delete_card.assert_not_awaited()
-    assert result.found == 2
-    assert result.skipped == 2
+    assert result.found == 0
     assert result.deleted == 0
 
 
 # ---------------------------------------------------------------------------
-# 10. limit caps the number of rows processed
+# 10. limit caps actionable rows; already-processed rows do not block it
 # ---------------------------------------------------------------------------
 
 
@@ -338,3 +384,36 @@ async def test_limit_caps_processed_rows(session_maker) -> None:
     assert mock_client.delete_card.await_count == 3, "Only limit=3 rows must be processed"
     assert result.found == 3
     assert result.deleted == 3
+
+
+@pytest.mark.asyncio
+async def test_already_processed_rows_do_not_block_limit(session_maker) -> None:
+    """SQL guards ensure already-deleted rows are never fetched, so limit=1 still
+    reaches the one eligible row even when older rows exist but are processed."""
+    earlier = datetime(2024, 6, 1, tzinfo=_UTC)
+    later = datetime(2024, 12, 1, tzinfo=_UTC)
+
+    already_deleted_meta = {
+        "loyalty_card_issued": True,
+        "promo_card_deleted_at": "2026-03-01T00:00:00+00:00",
+        "promo_card_delete_result": "deleted",
+    }
+    non_promo_meta = {"loyalty_card_issued": False}
+
+    async with session_maker() as session:
+        async with session.begin():
+            # Two older rows that would have blocked cleanup under the old Python guard
+            session.add(_lead(phone="+49200000001", expires_at=earlier, meta=already_deleted_meta))
+            session.add(_lead(phone="+49200000002", expires_at=earlier, meta=non_promo_meta))
+            # One eligible row with a later (but still expired) expires_at
+            eligible = _lead(phone="+49200000003", expires_at=later)
+            session.add(eligible)
+            await session.flush()
+
+            with _mock_loyalty() as mock_client:
+                result = await cleanup_expired_promo_loyalty_cards(session, now=_NOW, limit=1)
+
+    mock_client.delete_card.assert_awaited_once()
+    assert result.found == 1
+    assert result.deleted == 1
+    assert eligible.status == "expired"

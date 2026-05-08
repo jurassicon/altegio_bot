@@ -1,12 +1,15 @@
 """Cleanup of expired promo loyalty cards via Altegio API.
 
 Selects PromoLead rows that are eligible for card deletion:
+  - status == 'issued'  (leads that expired without ever booking)
   - expires_at <= now (UTC)
-  - status in ('issued', 'booked', 'applied')
   - loyalty_card_id IS NOT NULL
   - location_id IS NOT NULL
-  - meta.loyalty_card_issued == True   (only promo-flow cards)
-  - meta.promo_card_deleted_at absent  (idempotency guard)
+  - meta->>'loyalty_card_issued' == 'true'   (only promo-flow cards)
+  - meta->>'promo_card_deleted_at' IS NULL   (idempotency guard)
+
+All guards are applied in SQL so that `limit` reliably caps actionable rows
+and already-processed rows cannot permanently crowd them out.
 
 Per-row behaviour
 -----------------
@@ -26,9 +29,11 @@ Failure (delete_card raised):
 
 Out of scope
 ------------
-- status='used'    — deletion policy TBD
+- status='booked'    — client already has a booking; deletion policy TBD
+- status='applied'   — discount already linked to a booking; deletion policy TBD
+- status='used'      — deletion policy TBD
 - status='cancelled' — TODO: separate decision
-- Non-promo cards  — only rows with meta.loyalty_card_issued=True are touched
+- Non-promo cards    — only rows with meta.loyalty_card_issued=True are touched
 """
 
 from __future__ import annotations
@@ -45,8 +50,6 @@ from altegio_bot.models.models import PromoLead
 
 logger = logging.getLogger(__name__)
 
-_CLEANUP_STATUSES = ("issued", "booked", "applied")
-
 
 @dataclass
 class PromoLoyaltyCleanupResult:
@@ -62,10 +65,19 @@ async def cleanup_expired_promo_loyalty_cards(
     now: datetime | None = None,
     limit: int = 100,
 ) -> PromoLoyaltyCleanupResult:
-    """Delete Altegio loyalty cards for expired promo leads.
+    """Delete Altegio loyalty cards for expired promo leads with status='issued'.
 
-    Idempotent: rows with meta.promo_card_deleted_at already set are skipped.
-    Only processes rows created by the promo funnel (meta.loyalty_card_issued=True).
+    Only touches leads that expired without a booking (status='issued').
+    Leads with status 'booked', 'applied', or 'used' are intentionally excluded —
+    their card deletion policy is defined separately.
+
+    All eligibility guards (including JSONB meta checks) are applied in SQL so
+    that `limit` reliably caps actionable rows and already-processed rows cannot
+    permanently crowd them out.
+
+    Idempotent: rows with meta->>'promo_card_deleted_at' already set are excluded
+    by the query. Failed rows (result='failed') are retried on the next run because
+    promo_card_deleted_at is only written on success.
 
     The caller is responsible for committing the session after this returns.
 
@@ -77,10 +89,12 @@ async def cleanup_expired_promo_loyalty_cards(
     stmt = (
         select(PromoLead)
         .where(
+            PromoLead.status == "issued",
             PromoLead.expires_at <= now,
-            PromoLead.status.in_(_CLEANUP_STATUSES),
             PromoLead.loyalty_card_id.is_not(None),
             PromoLead.location_id.is_not(None),
+            PromoLead.meta["loyalty_card_issued"].astext == "true",
+            PromoLead.meta["promo_card_deleted_at"].astext.is_(None),
         )
         .order_by(PromoLead.expires_at)
         .limit(limit)
@@ -93,23 +107,6 @@ async def cleanup_expired_promo_loyalty_cards(
         for lead in rows:
             result.found += 1
             meta = lead.meta or {}
-
-            if meta.get("loyalty_card_issued") is not True:
-                logger.debug(
-                    "promo_cleanup: skip lead_id=%d — loyalty_card_issued not True",
-                    lead.id,
-                )
-                result.skipped += 1
-                continue
-
-            if meta.get("promo_card_deleted_at") is not None:
-                logger.debug(
-                    "promo_cleanup: skip lead_id=%d — already deleted at %s",
-                    lead.id,
-                    meta["promo_card_deleted_at"],
-                )
-                result.skipped += 1
-                continue
 
             try:
                 card_id = int(lead.loyalty_card_id)  # type: ignore[arg-type]
