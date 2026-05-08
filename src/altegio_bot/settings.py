@@ -129,6 +129,22 @@ class Settings(BaseSettings):
     # Enable only after loyalty API integration is production-ready.
     promo_lead_funnel_enabled: bool = False
 
+    # ---------------------------------------------------------------------------
+    # Promo loyalty card issuance (requires promo_lead_funnel_enabled=True)
+    # ---------------------------------------------------------------------------
+    # Altegio card type ID to assign to promo loyalty cards.
+    promo_loyalty_card_type_id: str = ""
+    # Altegio discount program ID stored on the PromoLead for future visit apply.
+    promo_discount_program_id: str = ""
+    # JSON mapping company_id (str) → location_id (int).
+    # Example: PROMO_LOCATION_ID_BY_COMPANY={"1": 12345, "42": 67890}
+    promo_location_id_by_company: str = "{}"
+    # Gate for loyalty card issuance via Altegio API.
+    # Default False: PromoLead created but no Altegio loyalty card issued.
+    # Requires promo_lead_funnel_enabled=True and all promo_loyalty_* settings set.
+    # TODO: enable only after verifying Altegio client/card endpoint paths.
+    promo_issue_loyalty_card_enabled: bool = False
+
     # Publicly accessible image URLs for newsletter template IMAGE HEADER components.
     # Meta Cloud API requires a permanent URL it can fetch and cache at send time.
     # Leave empty → worker fails the job fast (no silent blank-header send).
