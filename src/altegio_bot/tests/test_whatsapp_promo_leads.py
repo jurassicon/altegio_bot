@@ -1133,3 +1133,77 @@ async def test_none_company_id_fails_closed_no_lead_no_outbox(session_maker) -> 
 
     assert not leads, "No PromoLead must be created when company_id is None"
     assert not outboxes, "No OutboxMessage must be created when company_id is None"
+
+
+# ---------------------------------------------------------------------------
+# 23. rejected_not_new reply includes referral suggestion and booking URL
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_rejected_not_new_reply_contains_referral_text(session_maker) -> None:
+    """Existing client gets the referral-scenario reply with booking URL."""
+    provider = _CaptureProvider()
+    prior_visit_phone = "10000000001"
+    prior_visit_e164 = "+10000000001"
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _setup_sender(session, sender_id=323)
+
+            # Client id=1 (phone "+10000000001") gets a prior visit record.
+            session.add(
+                Record(
+                    company_id=1,
+                    altegio_record_id=9923,
+                    client_id=1,
+                    altegio_client_id=1,
+                    is_deleted=False,
+                    attendance=1,
+                    raw={},
+                )
+            )
+            await session.flush()
+
+            evt = WhatsAppEvent(
+                dedupe_key="wa:promo-referral-23",
+                status="received",
+                error=None,
+                query={},
+                headers={},
+                payload=_inbound_payload(PHONE_NUMBER_ID, prior_visit_phone, "aktion"),
+            )
+            session.add(evt)
+            await session.flush()
+
+            with patch(
+                "altegio_bot.workers.whatsapp_inbox_worker.ChatwootClient",
+                return_value=_FakeCW(),
+            ):
+                await handle_event(session, evt, provider)
+
+    assert provider.sent, "Referral reply must be sent"
+    _sid, _phone, sent_text = provider.sent[0]
+
+    assert "Neukunden" in sent_text, "Must mention new-client restriction"
+    assert "weiterempfehlen" in sent_text, "Must include referral suggestion"
+    assert "WhatsApp-Nummer" in sent_text, "Must explain the phone-number requirement"
+    assert "https://n813709.alteg.io/" in sent_text, "Must include booking URL"
+    assert "abgelaufen" not in sent_text, "Must not send the expired reply"
+    assert evt.error is None
+
+    async with session_maker() as s:
+        lead = (await s.execute(select(PromoLead).where(PromoLead.phone_e164 == prior_visit_e164))).scalar_one_or_none()
+
+    assert lead is not None
+    assert lead.status == "rejected_not_new"
+    assert lead.loyalty_card_id is None, "No card must be issued for rejected_not_new"
+
+    async with session_maker() as s:
+        outbox = (
+            await s.execute(
+                select(OutboxMessage).where(OutboxMessage.template_code == "wa_promo_lead_rejected_not_new")
+            )
+        ).scalar_one_or_none()
+
+    assert outbox is not None, "OutboxMessage must use wa_promo_lead_rejected_not_new"
