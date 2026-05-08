@@ -138,6 +138,7 @@ async def test_no_failures_returns_zero(session_maker: Any) -> None:
 @pytest.mark.asyncio
 async def test_sent_outbox_with_failed_webhook_counted(
     session_maker: Any,
+    monkeypatch: Any,
 ) -> None:
     """Real production case: om.status='sent' + webhook failed+131026.
 
@@ -145,6 +146,7 @@ async def test_sent_outbox_with_failed_webhook_counted(
     The delivery failure only lives in whatsapp_events.
     _count_131026_failures must count this without checking om.status.
     """
+    monkeypatch.setattr(ow, "utcnow", lambda: NOW)
     async with session_maker() as session:
         async with session.begin():
             wamid = f"{WAMID_BASE}-prod"
@@ -158,8 +160,10 @@ async def test_sent_outbox_with_failed_webhook_counted(
 @pytest.mark.asyncio
 async def test_repeated_131026_within_window_counted(
     session_maker: Any,
+    monkeypatch: Any,
 ) -> None:
     """2 linked 131026 webhook events within window -> count >= 2."""
+    monkeypatch.setattr(ow, "utcnow", lambda: NOW)
     async with session_maker() as session:
         async with session.begin():
             for i in range(2):
@@ -174,8 +178,10 @@ async def test_repeated_131026_within_window_counted(
 @pytest.mark.asyncio
 async def test_other_error_code_not_counted(
     session_maker: Any,
+    monkeypatch: Any,
 ) -> None:
     """Code 131047 does NOT count toward 131026 suppression."""
+    monkeypatch.setattr(ow, "utcnow", lambda: NOW)
     async with session_maker() as session:
         async with session.begin():
             wamid = f"{WAMID_BASE}-other"
@@ -189,8 +195,10 @@ async def test_other_error_code_not_counted(
 @pytest.mark.asyncio
 async def test_old_failures_outside_window_not_counted(
     session_maker: Any,
+    monkeypatch: Any,
 ) -> None:
     """131026 failures older than window_days are NOT counted."""
+    monkeypatch.setattr(ow, "utcnow", lambda: NOW)
     old_sent_at = NOW - timedelta(days=20)
     async with session_maker() as session:
         async with session.begin():
@@ -206,12 +214,14 @@ async def test_old_failures_outside_window_not_counted(
 @pytest.mark.asyncio
 async def test_outbox_without_webhook_not_counted(
     session_maker: Any,
+    monkeypatch: Any,
 ) -> None:
     """Outbox row with no matching whatsapp_events entry -> not counted.
 
     Just having an outbox row for this phone is not enough;
     a 131026 webhook event must exist.
     """
+    monkeypatch.setattr(ow, "utcnow", lambda: NOW)
     async with session_maker() as session:
         async with session.begin():
             wamid = f"{WAMID_BASE}-no-event"
