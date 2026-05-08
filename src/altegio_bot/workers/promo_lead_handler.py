@@ -11,7 +11,6 @@ This PR (first promo funnel PR) implements:
   - Creating OutboxMessage audit rows.
 
 NOT in this PR (deferred to future PRs):
-  - Altegio loyalty card API (issuing / applying discount programs).
   - Full Altegio CRM API history check for new-client validation.
   - Applying the discount to a record/visit_id.
   - Ops dashboard metrics for PromoLead.
@@ -19,6 +18,7 @@ NOT in this PR (deferred to future PRs):
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from datetime import datetime, timedelta, timezone
@@ -30,6 +30,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.models.models import Client, OutboxMessage, PromoLead, Record
+from altegio_bot.promo_loyalty import AltegioLoyaltyError, issue_promo_loyalty_card
 from altegio_bot.providers.base import WhatsAppProvider
 from altegio_bot.providers.dummy import safe_send
 from altegio_bot.settings import settings
@@ -171,12 +172,42 @@ def build_reply_expired() -> str:
     )
 
 
+def build_reply_issued_with_card(
+    expires_at: datetime,
+    booking_url: str,
+    discount_amount: Decimal,
+    discount_type: str,
+    card_number: str,
+) -> str:
+    discount = _format_discount(discount_amount, discount_type)
+    exp = _expires_display(expires_at)
+    return (
+        f"Super! 🎁\n\n"
+        f"Wir haben Ihren persönlichen Rabatt von {discount} für den ersten Besuch "
+        f"mit Ihrer WhatsApp-Nummer verknüpft.\n\n"
+        f"Ihre Rabattkarte: #{card_number}\n\n"
+        f"Wichtig: In der Online-Buchung werden die regulären Preise angezeigt. "
+        f"Nach Ihrer Buchung erkennt unser System Ihre Nummer automatisch und "
+        f"ordnet den Rabatt Ihrem ersten Besuch zu.\n\n"
+        f"Der Rabatt gilt nur für Neukunden und ist bis {exp} gültig.\n\n"
+        f"Termin buchen:\n{booking_url}"
+    )
+
+
 def build_reply_rejected_not_new() -> str:
     return (
         "Danke für Ihre Nachricht 💙\n\n"
         "Diese Aktion gilt nur für Neukunden beim ersten Besuch.\n"
         "Wir helfen Ihnen aber gerne, einen passenden Termin oder eine aktuelle "
         "Aktion zu finden."
+    )
+
+
+def build_reply_loyalty_card_failed() -> str:
+    return (
+        "Danke für Ihre Nachricht 💙\n\n"
+        "Wir prüfen Ihre Aktion gerade manuell.\n"
+        "Bitte schreiben Sie uns kurz, wenn Sie sofort einen Termin buchen möchten."
     )
 
 
@@ -310,6 +341,105 @@ async def handle_promo_info_command(
 
 
 # ---------------------------------------------------------------------------
+# Loyalty card issuance helper
+# ---------------------------------------------------------------------------
+
+
+async def _attempt_loyalty_card_issue(
+    event: "WhatsAppEvent",
+    lead: PromoLead,
+    *,
+    phone_e164: str,
+    company_id: int,
+) -> bool:
+    """Attempt to issue an Altegio loyalty card for a newly issued PromoLead.
+
+    Validates required settings before making any API call (fail-closed).
+    Updates lead fields and meta on success.
+    Sets event.error and lead.meta.loyalty_card_issued=False on any failure.
+
+    Returns True if card was issued, False otherwise.
+    """
+    cfg = settings
+
+    if not cfg.promo_loyalty_card_api_verified:
+        err = "promo_loyalty: promo_loyalty_card_api_verified=False — card issuance blocked"
+        lead.meta = {**(lead.meta or {}), "loyalty_card_issued": False, "loyalty_card_error": err}
+        event.error = err
+        logger.warning(
+            "promo_loyalty: card issuance blocked (promo_loyalty_card_api_verified=False) phone=%s",
+            phone_e164,
+        )
+        return False
+
+    if not cfg.promo_loyalty_card_type_id:
+        err = "promo_loyalty: missing promo_loyalty_card_type_id"
+        lead.meta = {**(lead.meta or {}), "loyalty_card_issued": False, "loyalty_card_error": err}
+        event.error = err
+        logger.warning("promo_loyalty: missing promo_loyalty_card_type_id phone=%s", phone_e164)
+        return False
+
+    if not cfg.promo_discount_program_id:
+        err = "promo_loyalty: missing promo_discount_program_id"
+        lead.meta = {**(lead.meta or {}), "loyalty_card_issued": False, "loyalty_card_error": err}
+        event.error = err
+        logger.warning("promo_loyalty: missing promo_discount_program_id phone=%s", phone_e164)
+        return False
+
+    try:
+        location_map: dict = json.loads(cfg.promo_location_id_by_company or "{}")
+    except (ValueError, TypeError) as exc:
+        err = f"promo_loyalty: invalid promo_location_id_by_company JSON: {exc}"
+        lead.meta = {**(lead.meta or {}), "loyalty_card_issued": False, "loyalty_card_error": err}
+        event.error = err
+        return False
+
+    location_id_raw = location_map.get(str(company_id))
+    if not location_id_raw:
+        err = f"promo_loyalty: no location_id for company_id={company_id}"
+        lead.meta = {**(lead.meta or {}), "loyalty_card_issued": False, "loyalty_card_error": err}
+        event.error = err
+        logger.warning("promo_loyalty: no location_id for company_id=%s", company_id)
+        return False
+
+    try:
+        location_id = int(location_id_raw)
+    except (ValueError, TypeError) as exc:
+        err = f"promo_loyalty: invalid location_id for company_id={company_id}: {exc}"
+        lead.meta = {**(lead.meta or {}), "loyalty_card_issued": False, "loyalty_card_error": err}
+        event.error = err
+        return False
+
+    try:
+        result = await issue_promo_loyalty_card(
+            phone_e164=phone_e164,
+            location_id=location_id,
+            card_type_id=cfg.promo_loyalty_card_type_id,
+        )
+    except AltegioLoyaltyError as exc:
+        err_str = str(exc)
+        lead.meta = {**(lead.meta or {}), "loyalty_card_issued": False, "loyalty_card_error": err_str}
+        event.error = f"promo_loyalty: {err_str}"
+        logger.warning("promo_loyalty: card issue failed phone=%s: %s", phone_e164, exc)
+        return False
+
+    lead.altegio_client_id = result.altegio_client_id
+    lead.loyalty_card_id = result.loyalty_card_id
+    lead.loyalty_card_number = result.loyalty_card_number
+    lead.card_type_id = result.card_type_id
+    lead.discount_program_id = cfg.promo_discount_program_id
+    lead.location_id = location_id
+    lead.meta = {**(lead.meta or {}), "loyalty_card_issued": True}
+    logger.info(
+        "promo_loyalty: card issued card_id=%s card_number=%s phone=%s",
+        result.loyalty_card_id,
+        result.loyalty_card_number,
+        phone_e164,
+    )
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Main funnel handler (funnel enabled)
 # ---------------------------------------------------------------------------
 
@@ -359,7 +489,9 @@ async def handle_promo_command(
     lead = await _find_any_lead(session, phone_e164, cfg.promo_campaign_name)
 
     new_lead: PromoLead | None = None
+    repair_lead: PromoLead | None = None
     mark_lead_expired: bool = False
+    card_issue_failed: bool = False
     reply: str
     template_code: str
 
@@ -369,6 +501,34 @@ async def handle_promo_command(
             mark_lead_expired = True
             reply = build_reply_expired()
             template_code = "wa_promo_lead_expired"
+        elif cfg.promo_issue_loyalty_card_enabled and lead.loyalty_card_number:
+            # Card already issued — resend with card number.
+            # Set repair_lead so post-send meta update clears card_message_pending.
+            repair_lead = lead
+            reply = build_reply_issued_with_card(
+                lead.expires_at,
+                cfg.promo_booking_url,
+                lead.discount_amount,
+                lead.discount_type,
+                lead.loyalty_card_number,
+            )
+            template_code = "wa_promo_loyalty_card_issued"
+        elif cfg.promo_issue_loyalty_card_enabled and not lead.loyalty_card_id and lead.status == "issued":
+            # Repair path: card was never issued for this lead — attempt now.
+            repair_lead = lead
+            if await _attempt_loyalty_card_issue(event, lead, phone_e164=phone_e164, company_id=company_id):
+                reply = build_reply_issued_with_card(
+                    lead.expires_at,
+                    cfg.promo_booking_url,
+                    lead.discount_amount,
+                    lead.discount_type,
+                    lead.loyalty_card_number,
+                )
+                template_code = "wa_promo_loyalty_card_issued"
+            else:
+                card_issue_failed = True
+                reply = build_reply_loyalty_card_failed()
+                template_code = "wa_promo_loyalty_card_issue_failed"
         else:
             # Still active → resend confirmation.
             reply = build_reply_already_issued(lead.expires_at, cfg.promo_booking_url)
@@ -430,11 +590,33 @@ async def handle_promo_command(
             )
             lead = await _find_any_lead(session, phone_e164, cfg.promo_campaign_name)
 
+        # ── Attempt loyalty card issuance for new issued leads ────────────────
+        if new_lead is not None and new_lead.status == "issued" and cfg.promo_issue_loyalty_card_enabled:
+            if not await _attempt_loyalty_card_issue(
+                event,
+                new_lead,
+                phone_e164=phone_e164,
+                company_id=company_id,
+            ):
+                card_issue_failed = True
+
         # Determine reply from the actual DB outcome.
         if new_lead is not None:
             if new_lead.status == "rejected_not_new":
                 reply = build_reply_rejected_not_new()
                 template_code = "wa_promo_lead_rejected_not_new"
+            elif not card_issue_failed and cfg.promo_issue_loyalty_card_enabled and new_lead.loyalty_card_number:
+                reply = build_reply_issued_with_card(
+                    new_lead.expires_at,
+                    cfg.promo_booking_url,
+                    discount_amount,
+                    cfg.promo_discount_type,
+                    new_lead.loyalty_card_number,
+                )
+                template_code = "wa_promo_loyalty_card_issued"
+            elif card_issue_failed:
+                reply = build_reply_loyalty_card_failed()
+                template_code = "wa_promo_loyalty_card_issue_failed"
             else:
                 reply = build_reply_issued(
                     new_lead.expires_at, cfg.promo_booking_url, discount_amount, cfg.promo_discount_type
@@ -472,9 +654,13 @@ async def handle_promo_command(
             sender_id,
             err,
         )
-        if new_lead is not None:
-            # Lead persisted but reply not delivered — mark for ops awareness / retry.
-            new_lead.meta = {**(new_lead.meta or {}), "reply_sent": False, "reply_send_error": str(err)}
+        lead_to_update = new_lead or repair_lead
+        if lead_to_update is not None:
+            meta_update: dict = {"reply_sent": False, "reply_send_error": str(err)}
+            if lead_to_update.loyalty_card_id:
+                # Card was issued but message delivery failed — flag for ops retry.
+                meta_update["card_message_pending"] = True
+            lead_to_update.meta = {**(lead_to_update.meta or {}), **meta_update}
         event.error = f"promo_lead: send failed: {err}"
         return
 
@@ -482,8 +668,12 @@ async def handle_promo_command(
     if mark_lead_expired:
         lead.status = "expired"
 
-    if new_lead is not None:
-        new_lead.meta = {**(new_lead.meta or {}), "reply_sent": True}
+    lead_to_update = new_lead or repair_lead
+    if lead_to_update is not None:
+        meta_after = {**(lead_to_update.meta or {}), "reply_sent": True}
+        if meta_after.get("card_message_pending"):
+            meta_after["card_message_pending"] = False
+        lead_to_update.meta = meta_after
 
     # ── 6. Audit OutboxMessage ───────────────────────────────────────────────
     session.add(
@@ -512,7 +702,8 @@ async def handle_promo_command(
         )
     )
 
-    event.error = None
+    if not card_issue_failed:
+        event.error = None
     logger.info(
         "promo_lead: sent phone=%s sender_id=%s msg_id=%s template=%s",
         phone_e164,

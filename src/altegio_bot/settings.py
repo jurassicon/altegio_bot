@@ -129,6 +129,37 @@ class Settings(BaseSettings):
     # Enable only after loyalty API integration is production-ready.
     promo_lead_funnel_enabled: bool = False
 
+    # ---------------------------------------------------------------------------
+    # Promo loyalty card issuance (requires promo_lead_funnel_enabled=True)
+    # ---------------------------------------------------------------------------
+    # Altegio card type ID to assign to promo loyalty cards.
+    promo_loyalty_card_type_id: str = ""
+    # Altegio discount program ID stored on the PromoLead for future visit apply.
+    promo_discount_program_id: str = ""
+    # JSON mapping company_id (str) → location_id (int).
+    # Example: PROMO_LOCATION_ID_BY_COMPANY={"1": 12345, "42": 67890}
+    promo_location_id_by_company: str = "{}"
+    # Gate for loyalty card issuance via Altegio API.
+    # Default False: PromoLead created but no Altegio loyalty card issued.
+    # Requires promo_lead_funnel_enabled=True and all promo_loyalty_* settings set.
+    promo_issue_loyalty_card_enabled: bool = False
+    # Smoke-test gate for the confirmed card issuance endpoint:
+    #   POST /loyalty/cards/{location_id}  (response: id, number)
+    # Default False: _attempt_loyalty_card_issue() is blocked until True.
+    # Set True only after a successful smoke test against a real Altegio account
+    # in a non-production environment.
+    # This flag is SEPARATE from promo_altegio_client_api_verified, which guards
+    # the unconfirmed client lookup/create endpoints.
+    promo_loyalty_card_api_verified: bool = False
+    # Gate for the UNCONFIRMED client lookup/create endpoints:
+    #   GET  /clients/{company_id}?phone=...
+    #   POST /clients/{company_id}
+    # Default False: get_or_create_altegio_client() raises before making any HTTP
+    # call until this is explicitly set True.
+    # Set True only after manually verifying endpoint shape and payload in a
+    # non-production environment.
+    promo_altegio_client_api_verified: bool = False
+
     # Publicly accessible image URLs for newsletter template IMAGE HEADER components.
     # Meta Cloud API requires a permanent URL it can fetch and cache at send time.
     # Leave empty → worker fails the job fast (no silent blank-header send).
