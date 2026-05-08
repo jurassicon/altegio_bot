@@ -11,7 +11,6 @@ This PR (first promo funnel PR) implements:
   - Creating OutboxMessage audit rows.
 
 NOT in this PR (deferred to future PRs):
-  - Altegio loyalty card API (issuing / applying discount programs).
   - Full Altegio CRM API history check for new-client validation.
   - Applying the discount to a record/visit_id.
   - Ops dashboard metrics for PromoLead.
@@ -204,6 +203,14 @@ def build_reply_rejected_not_new() -> str:
     )
 
 
+def build_reply_loyalty_card_failed() -> str:
+    return (
+        "Danke für Ihre Nachricht 💙\n\n"
+        "Wir prüfen Ihre Aktion gerade manuell.\n"
+        "Bitte schreiben Sie uns kurz, wenn Sie sofort einen Termin buchen möchten."
+    )
+
+
 # ---------------------------------------------------------------------------
 # DB helpers
 # ---------------------------------------------------------------------------
@@ -355,6 +362,16 @@ async def _attempt_loyalty_card_issue(
     """
     cfg = settings
 
+    if not cfg.promo_altegio_client_api_verified:
+        err = "promo_loyalty: promo_altegio_client_api_verified=False — card issuance blocked"
+        lead.meta = {**(lead.meta or {}), "loyalty_card_issued": False, "loyalty_card_error": err}
+        event.error = err
+        logger.warning(
+            "promo_loyalty: card issuance blocked (promo_altegio_client_api_verified=False) phone=%s",
+            phone_e164,
+        )
+        return False
+
     if not cfg.promo_loyalty_card_type_id:
         err = "promo_loyalty: missing promo_loyalty_card_type_id"
         lead.meta = {**(lead.meta or {}), "loyalty_card_issued": False, "loyalty_card_error": err}
@@ -395,7 +412,6 @@ async def _attempt_loyalty_card_issue(
 
     try:
         result = await issue_promo_loyalty_card(
-            company_id=company_id,
             phone_e164=phone_e164,
             location_id=location_id,
             card_type_id=cfg.promo_loyalty_card_type_id,
@@ -473,6 +489,7 @@ async def handle_promo_command(
     lead = await _find_any_lead(session, phone_e164, cfg.promo_campaign_name)
 
     new_lead: PromoLead | None = None
+    repair_lead: PromoLead | None = None
     mark_lead_expired: bool = False
     card_issue_failed: bool = False
     reply: str
@@ -484,6 +501,32 @@ async def handle_promo_command(
             mark_lead_expired = True
             reply = build_reply_expired()
             template_code = "wa_promo_lead_expired"
+        elif cfg.promo_issue_loyalty_card_enabled and lead.loyalty_card_number:
+            # Card already issued — resend with card number.
+            reply = build_reply_issued_with_card(
+                lead.expires_at,
+                cfg.promo_booking_url,
+                lead.discount_amount,
+                lead.discount_type,
+                lead.loyalty_card_number,
+            )
+            template_code = "wa_promo_loyalty_card_issued"
+        elif cfg.promo_issue_loyalty_card_enabled and not lead.loyalty_card_id and lead.status == "issued":
+            # Repair path: card was never issued for this lead — attempt now.
+            repair_lead = lead
+            if await _attempt_loyalty_card_issue(event, lead, phone_e164=phone_e164, company_id=company_id):
+                reply = build_reply_issued_with_card(
+                    lead.expires_at,
+                    cfg.promo_booking_url,
+                    lead.discount_amount,
+                    lead.discount_type,
+                    lead.loyalty_card_number,
+                )
+                template_code = "wa_promo_loyalty_card_issued"
+            else:
+                card_issue_failed = True
+                reply = build_reply_loyalty_card_failed()
+                template_code = "wa_promo_loyalty_card_issue_failed"
         else:
             # Still active → resend confirmation.
             reply = build_reply_already_issued(lead.expires_at, cfg.promo_booking_url)
@@ -569,6 +612,9 @@ async def handle_promo_command(
                     new_lead.loyalty_card_number,
                 )
                 template_code = "wa_promo_loyalty_card_issued"
+            elif card_issue_failed:
+                reply = build_reply_loyalty_card_failed()
+                template_code = "wa_promo_loyalty_card_issue_failed"
             else:
                 reply = build_reply_issued(
                     new_lead.expires_at, cfg.promo_booking_url, discount_amount, cfg.promo_discount_type
@@ -606,9 +652,13 @@ async def handle_promo_command(
             sender_id,
             err,
         )
-        if new_lead is not None:
-            # Lead persisted but reply not delivered — mark for ops awareness / retry.
-            new_lead.meta = {**(new_lead.meta or {}), "reply_sent": False, "reply_send_error": str(err)}
+        lead_to_update = new_lead or repair_lead
+        if lead_to_update is not None:
+            meta_update: dict = {"reply_sent": False, "reply_send_error": str(err)}
+            if lead_to_update.loyalty_card_id:
+                # Card was issued but message delivery failed — flag for ops retry.
+                meta_update["card_message_pending"] = True
+            lead_to_update.meta = {**(lead_to_update.meta or {}), **meta_update}
         event.error = f"promo_lead: send failed: {err}"
         return
 
@@ -616,8 +666,9 @@ async def handle_promo_command(
     if mark_lead_expired:
         lead.status = "expired"
 
-    if new_lead is not None:
-        new_lead.meta = {**(new_lead.meta or {}), "reply_sent": True}
+    lead_to_update = new_lead or repair_lead
+    if lead_to_update is not None:
+        lead_to_update.meta = {**(lead_to_update.meta or {}), "reply_sent": True}
 
     # ── 6. Audit OutboxMessage ───────────────────────────────────────────────
     session.add(

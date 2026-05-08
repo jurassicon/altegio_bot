@@ -1,19 +1,28 @@
 """Altegio promo loyalty card issuance for WhatsApp promo leads.
 
-Orchestrates: find-or-create Altegio client → issue loyalty card.
-Reuses AltegioLoyaltyClient from altegio_loyalty for card HTTP transport.
+Confirmed Altegio API endpoints (verified from OpenAPI spec):
+  POST   /loyalty/cards/{location_id}           — Issue a loyalty card
+  DELETE /loyalty/cards/{location_id}/{card_id} — Delete a loyalty card
+  GET    /loyalty/card_types/salon/{location_id} — List card types at location
 
-TODO: endpoint paths for client lookup/creation are assumed from Altegio
-REST conventions — verify against Altegio API docs before enabling
-promo_issue_loyalty_card_enabled=True in production:
-  - GET  {base}/clients/{company_id}?phone={digits}&count=1  — find client
-  - POST {base}/clients/{company_id}  {"phone": digits, "name": ""}    — create
+Response field note (confirmed from spec):
+  - Card ID is returned as 'id' (int32), NOT 'card_id' or 'loyalty_card_id'.
+  - Card number is returned as 'number' (str), NOT 'loyalty_card_number'.
+  - Card type is returned as 'type_id' (int32).
+  - Response does NOT include client_id.
+
+Unconfirmed endpoints — NOT used in issue_promo_loyalty_card():
+  GET  {base}/clients/{company_id}?phone=...  — find client by phone
+  POST {base}/clients/{company_id}             — create client
+  These require promo_altegio_client_api_verified=True to be called at all.
+  See get_or_create_altegio_client() which is kept for future use.
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 
 import httpx
 
@@ -30,10 +39,12 @@ class AltegioLoyaltyError(Exception):
 
 @dataclass
 class LoyaltyCardResult:
-    altegio_client_id: int
     loyalty_card_id: str
     loyalty_card_number: str
     card_type_id: str
+    # Not returned by card issuance endpoint; None until a confirmed client
+    # lookup path is available and promo_altegio_client_api_verified=True.
+    altegio_client_id: int | None = field(default=None)
 
 
 def _headers() -> dict[str, str]:
@@ -42,6 +53,17 @@ def _headers() -> dict[str, str]:
         "Accept": settings.altegio_api_accept,
         "Content-Type": "application/json",
     }
+
+
+def _phone_digits(phone_e164: str) -> str:
+    """Strip all non-digit characters from a phone string.
+
+    Raises AltegioLoyaltyError if the result is empty.
+    """
+    digits = re.sub(r"\D+", "", phone_e164)
+    if not digits:
+        raise AltegioLoyaltyError(f"invalid phone_e164, no digits found: {phone_e164!r}")
+    return digits
 
 
 async def get_or_create_altegio_client(
@@ -54,14 +76,17 @@ async def get_or_create_altegio_client(
 
     Returns altegio_client_id.
 
-    TODO: verify exact endpoint and phone param format against Altegio API docs.
-    Current assumptions:
+    REQUIRES promo_altegio_client_api_verified=True before calling.
+    Endpoint paths are assumed from Altegio REST conventions and have NOT been
+    verified against the loyalty API OpenAPI spec.
+
+    TODO: verify exact endpoint and payload with Altegio API docs:
       GET  {base}/clients/{company_id}?phone={digits}&count=1
       POST {base}/clients/{company_id}  {"phone": digits, "name": ""}
     """
     base = settings.altegio_api_base_url.rstrip("/")
     url = f"{base}/clients/{company_id}"
-    phone_digits = phone_e164.lstrip("+")
+    phone_digits = _phone_digits(phone_e164)
 
     try:
         resp = await http_client.get(
@@ -70,9 +95,13 @@ async def get_or_create_altegio_client(
             params={"phone": phone_digits, "count": 1},
         )
         resp.raise_for_status()
-        data = resp.json()
     except httpx.HTTPError as exc:
         raise AltegioLoyaltyError(f"client lookup failed company={company_id}: {exc}") from exc
+
+    try:
+        data = resp.json()
+    except Exception as exc:
+        raise AltegioLoyaltyError(f"client lookup returned invalid JSON: company={company_id}: {exc}") from exc
 
     items: list = []
     if isinstance(data, dict):
@@ -80,6 +109,10 @@ async def get_or_create_altegio_client(
         items = raw if isinstance(raw, list) else []
     elif isinstance(data, list):
         items = data
+    else:
+        raise AltegioLoyaltyError(
+            f"client lookup returned unexpected shape {type(data).__name__}: company={company_id}"
+        )
 
     if items:
         first = items[0] if items else {}
@@ -102,14 +135,23 @@ async def get_or_create_altegio_client(
             json={"phone": phone_digits, "name": ""},
         )
         resp.raise_for_status()
-        data = resp.json()
     except httpx.HTTPError as exc:
         raise AltegioLoyaltyError(f"client create failed company={company_id}: {exc}") from exc
+
+    try:
+        data = resp.json()
+    except Exception as exc:
+        raise AltegioLoyaltyError(f"client create returned invalid JSON: company={company_id}: {exc}") from exc
 
     created: dict = {}
     if isinstance(data, dict):
         inner = data.get("data")
         created = inner if isinstance(inner, dict) else data
+    elif not isinstance(data, dict):
+        raise AltegioLoyaltyError(
+            f"client create returned unexpected shape {type(data).__name__}: company={company_id}"
+        )
+
     if isinstance(created, dict):
         client_id = created.get("id")
         if isinstance(client_id, int) and client_id > 0:
@@ -125,29 +167,22 @@ async def get_or_create_altegio_client(
 
 async def issue_promo_loyalty_card(
     *,
-    company_id: int,
     phone_e164: str,
     location_id: int,
     card_type_id: str,
 ) -> LoyaltyCardResult:
-    """Find or create Altegio client, then issue a loyalty card.
+    """Issue a loyalty card via confirmed Altegio API endpoint.
 
-    Creates and manages internal HTTP clients.
+    Uses POST /loyalty/cards/{location_id} (confirmed from OpenAPI spec).
+    Does NOT call client lookup/creation endpoints (unconfirmed).
+    altegio_client_id is NOT returned by this endpoint — stays None.
 
     Returns LoyaltyCardResult on success.
     Raises AltegioLoyaltyError on any failure.
-
-    TODO: verify POST /loyalty/cards/{location_id} payload with Altegio API docs.
     """
-    async with httpx.AsyncClient(timeout=20.0) as http_client:
-        altegio_client_id = await get_or_create_altegio_client(
-            http_client,
-            company_id=company_id,
-            phone_e164=phone_e164,
-        )
-
+    digits = _phone_digits(phone_e164)
+    phone_int = int(digits)
     card_number = make_card_number(phone_e164)
-    phone_int = int(phone_e164.lstrip("+"))
 
     loyalty = AltegioLoyaltyClient()
     try:
@@ -162,8 +197,12 @@ async def issue_promo_loyalty_card(
     finally:
         await loyalty.aclose()
 
+    if not isinstance(card, dict):
+        raise AltegioLoyaltyError(f"card issuance returned unexpected type {type(card).__name__}: {card!r}")
+
     issued_id = str(card.get("id") or card.get("loyalty_card_id") or "")
-    issued_number = str(card.get("loyalty_card_number") or card_number)
+    # Confirmed field name from API spec is 'number'; fallback covers older compat.
+    issued_number = str(card.get("number") or card.get("loyalty_card_number") or card_number)
 
     if not issued_id:
         raise AltegioLoyaltyError(f"card issuance returned no id: location={location_id} resp={card!r}")
@@ -176,8 +215,8 @@ async def issue_promo_loyalty_card(
         location_id,
     )
     return LoyaltyCardResult(
-        altegio_client_id=altegio_client_id,
         loyalty_card_id=issued_id,
         loyalty_card_number=issued_number,
         card_type_id=card_type_id,
+        altegio_client_id=None,
     )

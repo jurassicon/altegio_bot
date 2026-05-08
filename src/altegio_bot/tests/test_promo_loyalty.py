@@ -15,6 +15,9 @@ Covers:
 
 from __future__ import annotations
 
+import contextlib
+from datetime import datetime, timezone
+from decimal import Decimal as D
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
@@ -159,12 +162,22 @@ def _loyalty_settings_ctx(**overrides):
     """Patch all required loyalty settings for tests that enable card issuance."""
     defaults = {
         "promo_issue_loyalty_card_enabled": True,
+        "promo_altegio_client_api_verified": True,
         "promo_loyalty_card_type_id": "ct_001",
         "promo_discount_program_id": "dp_001",
         "promo_location_id_by_company": '{"1": 9001}',
     }
     defaults.update(overrides)
-    return [patch.object(settings, k, v) for k, v in defaults.items()]
+    patches = [patch.object(settings, k, v) for k, v in defaults.items()]
+
+    @contextlib.contextmanager
+    def _stack():
+        with contextlib.ExitStack() as stack:
+            for p in patches:
+                stack.enter_context(p)
+            yield
+
+    return _stack()
 
 
 # ---------------------------------------------------------------------------
@@ -201,9 +214,8 @@ async def test_loyalty_card_disabled_no_api_call(session_maker) -> None:
 async def test_loyalty_card_issue_success(session_maker) -> None:
     mock_issue = AsyncMock(return_value=_MOCK_CARD)
 
-    patches = _loyalty_settings_ctx()
     with patch("altegio_bot.workers.promo_lead_handler.issue_promo_loyalty_card", mock_issue):
-        with patches[0], patches[1], patches[2], patches[3]:
+        with _loyalty_settings_ctx():
             provider, evt = await _fire_promo(session_maker, "aktion", dedupe_suffix="-24")
 
     mock_issue.assert_called_once()
@@ -248,9 +260,8 @@ async def test_loyalty_card_issue_success(session_maker) -> None:
 async def test_loyalty_card_api_failure(session_maker) -> None:
     mock_issue = AsyncMock(side_effect=AltegioLoyaltyError("Altegio 500"))
 
-    patches = _loyalty_settings_ctx()
     with patch("altegio_bot.workers.promo_lead_handler.issue_promo_loyalty_card", mock_issue):
-        with patches[0], patches[1], patches[2], patches[3]:
+        with _loyalty_settings_ctx():
             provider, evt = await _fire_promo(session_maker, "aktion", dedupe_suffix="-25")
 
     assert evt.error is not None, "event.error must be set on card API failure"
@@ -273,10 +284,20 @@ async def test_loyalty_card_api_failure(session_maker) -> None:
 
     assert card_outbox is None, "Card-success OutboxMessage must not be created on API failure"
 
-    # Basic reply is still sent (without card number)
-    assert provider.sent, "Basic promo reply must still be sent on card failure"
+    # Neutral manual-check reply sent — NOT the "Rabatt verknüpft" promise text
+    assert provider.sent, "Neutral reply must be sent on card failure"
     sent_text = provider.sent[0][2]
     assert "0049160998877660" not in sent_text, "Card number must not appear in failure reply"
+    assert "manuell" in sent_text, "Neutral manual-check reply expected on card failure"
+
+    # Failure OutboxMessage created with failure template code
+    async with session_maker() as s:
+        fail_outbox = (
+            await s.execute(
+                select(OutboxMessage).where(OutboxMessage.template_code == "wa_promo_loyalty_card_issue_failed")
+            )
+        ).scalar_one_or_none()
+    assert fail_outbox is not None, "Failure OutboxMessage must be created on card API failure"
 
 
 # ---------------------------------------------------------------------------
@@ -288,9 +309,8 @@ async def test_loyalty_card_api_failure(session_maker) -> None:
 async def test_missing_card_type_id_fails_closed(session_maker) -> None:
     mock_issue = AsyncMock(side_effect=RuntimeError("must not be called"))
 
-    patches = _loyalty_settings_ctx(promo_loyalty_card_type_id="")
     with patch("altegio_bot.workers.promo_lead_handler.issue_promo_loyalty_card", mock_issue):
-        with patches[0], patches[1], patches[2], patches[3]:
+        with _loyalty_settings_ctx(promo_loyalty_card_type_id=""):
             provider, evt = await _fire_promo(session_maker, "aktion", dedupe_suffix="-26")
 
     mock_issue.assert_not_called()
@@ -314,9 +334,8 @@ async def test_missing_card_type_id_fails_closed(session_maker) -> None:
 async def test_missing_discount_program_id_fails_closed(session_maker) -> None:
     mock_issue = AsyncMock(side_effect=RuntimeError("must not be called"))
 
-    patches = _loyalty_settings_ctx(promo_discount_program_id="")
     with patch("altegio_bot.workers.promo_lead_handler.issue_promo_loyalty_card", mock_issue):
-        with patches[0], patches[1], patches[2], patches[3]:
+        with _loyalty_settings_ctx(promo_discount_program_id=""):
             provider, evt = await _fire_promo(session_maker, "aktion", dedupe_suffix="-27")
 
     mock_issue.assert_not_called()
@@ -340,9 +359,8 @@ async def test_missing_location_mapping_fails_closed(session_maker) -> None:
     mock_issue = AsyncMock(side_effect=RuntimeError("must not be called"))
 
     # company_id=1 is used in test, but mapping is empty → no location_id found
-    patches = _loyalty_settings_ctx(promo_location_id_by_company="{}")
     with patch("altegio_bot.workers.promo_lead_handler.issue_promo_loyalty_card", mock_issue):
-        with patches[0], patches[1], patches[2], patches[3]:
+        with _loyalty_settings_ctx(promo_location_id_by_company="{}"):
             provider, evt = await _fire_promo(session_maker, "aktion", dedupe_suffix="-28")
 
     mock_issue.assert_not_called()
@@ -368,9 +386,8 @@ async def test_rejected_not_new_skips_card_issuance(session_maker) -> None:
 
     mock_issue = AsyncMock(side_effect=RuntimeError("must not be called"))
 
-    patches = _loyalty_settings_ctx()
     with patch("altegio_bot.workers.promo_lead_handler.issue_promo_loyalty_card", mock_issue):
-        with patches[0], patches[1], patches[2], patches[3]:
+        with _loyalty_settings_ctx():
             provider = _CaptureProvider()
 
             async with session_maker() as session:
@@ -416,3 +433,226 @@ async def test_rejected_not_new_skips_card_issuance(session_maker) -> None:
     assert lead is not None
     assert lead.status == "rejected_not_new"
     assert lead.loyalty_card_id is None
+
+
+# ---------------------------------------------------------------------------
+# 30. promo_altegio_client_api_verified=False — card issuance blocked
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_client_api_not_verified_blocks_issuance(session_maker) -> None:
+    mock_issue = AsyncMock(side_effect=RuntimeError("must not be called"))
+
+    with patch("altegio_bot.workers.promo_lead_handler.issue_promo_loyalty_card", mock_issue):
+        with _loyalty_settings_ctx(promo_altegio_client_api_verified=False):
+            provider, evt = await _fire_promo(session_maker, "aktion", dedupe_suffix="-30")
+
+    mock_issue.assert_not_called()
+    assert evt.error is not None, "event.error must be set when client API not verified"
+    assert "promo_altegio_client_api_verified" in (evt.error or "")
+
+    # Neutral reply sent (not the card-number reply, not the promise text)
+    assert provider.sent, "Neutral reply must be sent"
+    sent_text = provider.sent[0][2]
+    assert "manuell" in sent_text, "Neutral manual-check reply expected"
+
+    async with session_maker() as s:
+        lead = (await s.execute(select(PromoLead).where(PromoLead.phone_e164 == PHONE_E164))).scalar_one_or_none()
+
+    assert lead is not None
+    meta = lead.meta or {}
+    assert meta.get("loyalty_card_issued") is False
+
+
+# ---------------------------------------------------------------------------
+# 31. Card issued + WhatsApp send fails → card_message_pending=True, card data preserved
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_card_issued_send_failure_sets_pending(session_maker) -> None:
+    mock_issue = AsyncMock(return_value=_MOCK_CARD)
+
+    class _FailProvider(WhatsAppProvider):
+        async def send(self, sender_id: int, phone_e164: str, text: str, contact_name: str | None = None) -> str:
+            raise RuntimeError("network down")
+
+    with patch("altegio_bot.workers.promo_lead_handler.issue_promo_loyalty_card", mock_issue):
+        with _loyalty_settings_ctx():
+            provider = _FailProvider()
+
+            async with session_maker() as session:
+                async with session.begin():
+                    await _setup_sender(session, sender_id=431, company_id=1)
+
+                    evt = WhatsAppEvent(
+                        dedupe_key="wa:loyalty-send-fail-31",
+                        status="received",
+                        error=None,
+                        query={},
+                        headers={},
+                        payload=_inbound_payload(PHONE_NUMBER_ID, FROM_PHONE, "aktion"),
+                    )
+                    session.add(evt)
+                    await session.flush()
+
+                    with patch(
+                        "altegio_bot.workers.whatsapp_inbox_worker.ChatwootClient",
+                        return_value=_FakeCW(),
+                    ):
+                        await handle_event(session, evt, provider)
+
+    mock_issue.assert_called_once()
+    assert evt.error is not None, "event.error must be set on send failure"
+
+    async with session_maker() as s:
+        lead = (await s.execute(select(PromoLead).where(PromoLead.phone_e164 == PHONE_E164))).scalar_one_or_none()
+
+    assert lead is not None
+    assert lead.loyalty_card_id == "card_555", "Card data must be preserved despite send failure"
+    assert lead.loyalty_card_number == "0049160998877660"
+    meta = lead.meta or {}
+    assert meta.get("card_message_pending") is True, "card_message_pending must be True"
+    assert meta.get("reply_sent") is False
+
+
+# ---------------------------------------------------------------------------
+# 32. Retry after send failure (card_message_pending) → card-number reply resent
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_retry_sends_card_number_reply(session_maker) -> None:
+    """On second secret-word trigger, if card already issued, resend card-number reply."""
+    mock_issue = AsyncMock(side_effect=RuntimeError("must not be called on retry"))
+
+    retry_phone = "4916011223344"
+    retry_phone_e164 = f"+{retry_phone}"
+
+    with patch("altegio_bot.workers.promo_lead_handler.issue_promo_loyalty_card", mock_issue):
+        with _loyalty_settings_ctx():
+            provider = _CaptureProvider()
+
+            async with session_maker() as session:
+                async with session.begin():
+                    await _setup_sender(session, sender_id=432, company_id=1)
+
+                    # Pre-existing issued lead with card already in DB
+                    _utc = timezone.utc
+                    existing_lead = PromoLead(
+                        company_id=1,
+                        phone_e164=retry_phone_e164,
+                        campaign_name="welcome_discount",
+                        secret_code="aktion",
+                        discount_amount=D("15"),
+                        discount_type="fixed",
+                        status="issued",
+                        loyalty_card_id="card_999",
+                        loyalty_card_number="0049160112233440",
+                        card_type_id="ct_001",
+                        discount_program_id="dp_001",
+                        location_id=9001,
+                        issued_at=datetime(2026, 1, 1, tzinfo=_utc),
+                        expires_at=datetime(2027, 1, 1, tzinfo=_utc),
+                        meta={"card_message_pending": True, "reply_sent": False},
+                    )
+                    session.add(existing_lead)
+                    await session.flush()
+
+                    evt = WhatsAppEvent(
+                        dedupe_key="wa:loyalty-retry-32",
+                        status="received",
+                        error=None,
+                        query={},
+                        headers={},
+                        payload=_inbound_payload(PHONE_NUMBER_ID, retry_phone, "aktion"),
+                    )
+                    session.add(evt)
+                    await session.flush()
+
+                    with patch(
+                        "altegio_bot.workers.whatsapp_inbox_worker.ChatwootClient",
+                        return_value=_FakeCW(),
+                    ):
+                        await handle_event(session, evt, provider)
+
+    mock_issue.assert_not_called()
+    assert evt.error is None
+
+    assert provider.sent, "Reply must be sent on retry"
+    sent_text = provider.sent[0][2]
+    assert "0049160112233440" in sent_text, "Card number must appear in retry reply"
+
+
+# ---------------------------------------------------------------------------
+# 33. Repair path: existing issued lead without card → card issued on retry
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_repair_path_issues_card_for_existing_lead(session_maker) -> None:
+    """Existing issued lead with no card → card issued and card-number reply sent."""
+    mock_issue = AsyncMock(return_value=_MOCK_CARD)
+
+    repair_phone = "4916055667788"
+    repair_phone_e164 = f"+{repair_phone}"
+
+    with patch("altegio_bot.workers.promo_lead_handler.issue_promo_loyalty_card", mock_issue):
+        with _loyalty_settings_ctx():
+            provider = _CaptureProvider()
+
+            async with session_maker() as session:
+                async with session.begin():
+                    await _setup_sender(session, sender_id=433, company_id=1)
+
+                    _utc = timezone.utc
+                    existing_lead = PromoLead(
+                        company_id=1,
+                        phone_e164=repair_phone_e164,
+                        campaign_name="welcome_discount",
+                        secret_code="aktion",
+                        discount_amount=D("15"),
+                        discount_type="fixed",
+                        status="issued",
+                        loyalty_card_id=None,
+                        loyalty_card_number=None,
+                        issued_at=datetime(2026, 1, 1, tzinfo=_utc),
+                        expires_at=datetime(2027, 1, 1, tzinfo=_utc),
+                    )
+                    session.add(existing_lead)
+                    await session.flush()
+
+                    evt = WhatsAppEvent(
+                        dedupe_key="wa:loyalty-repair-33",
+                        status="received",
+                        error=None,
+                        query={},
+                        headers={},
+                        payload=_inbound_payload(PHONE_NUMBER_ID, repair_phone, "aktion"),
+                    )
+                    session.add(evt)
+                    await session.flush()
+
+                    with patch(
+                        "altegio_bot.workers.whatsapp_inbox_worker.ChatwootClient",
+                        return_value=_FakeCW(),
+                    ):
+                        await handle_event(session, evt, provider)
+
+    mock_issue.assert_called_once()
+    assert evt.error is None
+
+    async with session_maker() as s:
+        stmt = select(PromoLead).where(PromoLead.phone_e164 == repair_phone_e164)
+        lead = (await s.execute(stmt)).scalar_one_or_none()
+
+    assert lead is not None
+    assert lead.loyalty_card_id == "card_555", "Card ID must be saved on repair"
+    assert lead.loyalty_card_number == "0049160998877660"
+    meta = lead.meta or {}
+    assert meta.get("loyalty_card_issued") is True
+
+    assert provider.sent, "Card-number reply must be sent after repair"
+    sent_text = provider.sent[0][2]
+    assert "0049160998877660" in sent_text, "Card number must appear in repair reply"

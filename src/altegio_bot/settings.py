@@ -142,8 +142,15 @@ class Settings(BaseSettings):
     # Gate for loyalty card issuance via Altegio API.
     # Default False: PromoLead created but no Altegio loyalty card issued.
     # Requires promo_lead_funnel_enabled=True and all promo_loyalty_* settings set.
-    # TODO: enable only after verifying Altegio client/card endpoint paths.
     promo_issue_loyalty_card_enabled: bool = False
+    # Second gate: Altegio client-lookup/create endpoints are unconfirmed.
+    # Default False: card issuance is blocked until this is set True.
+    # Set True only after manually verifying GET/POST /clients/{company_id}
+    # endpoint shape in a non-production environment.
+    # Confirmed endpoints that do NOT require this flag:
+    #   POST   /loyalty/cards/{location_id}         — issue card (response: id, number)
+    #   DELETE /loyalty/cards/{location_id}/{card_id}
+    promo_altegio_client_api_verified: bool = False
 
     # Publicly accessible image URLs for newsletter template IMAGE HEADER components.
     # Meta Cloud API requires a permanent URL it can fetch and cache at send time.
