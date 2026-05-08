@@ -4,18 +4,22 @@ Covers:
 1.  Feature disabled (promo_apply_discount_enabled=False) — API not called, status unchanged.
 2.  API not verified (promo_apply_discount_api_verified=False) — API not called,
     meta.discount_apply_error set, status remains booked.
-3.  No active PromoLead — no API call, no OutboxMessage.
+3.  No active PromoLead — no API call.
 4.  Expired PromoLead — no API call (excluded by SQL query).
-5.  Active issued lead + allowed service + verified API → applied, OutboxMessage created.
+5.  Active issued lead + allowed service + verified API → applied, no OutboxMessage
+    (customer notification is out of scope for this implementation).
 6.  Active lead without loyalty_card_id — not found by SQL, no API call.
 7.  Active lead but service not in allowlist — no API call, meta.apply_skip_reason set.
-8.  API failure — status='apply_failed', meta.discount_apply_error set, no OutboxMessage.
-9.  Duplicate webhook (already applied) — no second API call, no duplicate OutboxMessage.
+8.  API failure — status='apply_failed', meta.discount_apply_error set.
+9.  Already-applied lead — finder excludes it (status not in issued/booked), no API call.
 10. Old client edge: prior attended visit (excluding current) → skip discount.
-11. Direct wrapper: success response → PromoDiscountApplyResult(applied=True).
-12. Direct wrapper: HTTP error → PromoDiscountApplyError.
-13. Direct wrapper: invalid JSON → PromoDiscountApplyError.
-14. Direct wrapper: unexpected response shape → PromoDiscountApplyError.
+11. company_id isolation: same phone, two companies — only matching company lead used.
+12. Update webhook: inbox_worker does not call try_apply_promo_discount.
+13. Direct wrapper: api_verified=False → PromoDiscountApplyError, no HTTP call.
+14. Direct wrapper: success response → PromoDiscountApplyResult(applied=True).
+15. Direct wrapper: HTTP error → PromoDiscountApplyError.
+16. Direct wrapper: invalid JSON → PromoDiscountApplyError.
+17. Direct wrapper: unexpected response shape → PromoDiscountApplyError.
 """
 
 from __future__ import annotations
@@ -109,6 +113,7 @@ async def _seed_service(session, *, record_id: int = 200, service_id: int = _ALL
 def _make_lead(
     *,
     phone: str = _PHONE,
+    company_id: int = _COMPANY,
     status: str = "issued",
     expires_at: datetime = _FUTURE,
     loyalty_card_id: str | None = _CARD_ID,
@@ -117,7 +122,7 @@ def _make_lead(
     meta: dict | None = None,
 ) -> PromoLead:
     return PromoLead(
-        company_id=_COMPANY,
+        company_id=company_id,
         phone_e164=phone,
         campaign_name="welcome_discount",
         secret_code="aktion",
@@ -277,12 +282,12 @@ async def test_expired_lead_excluded(session_maker) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 5. Happy path: applied + OutboxMessage created
+# 5. Happy path: applied, no OutboxMessage (customer notification out of scope)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_happy_path_applies_discount_and_creates_outbox(session_maker) -> None:
+async def test_happy_path_applies_discount(session_maker) -> None:
     mock_api = AsyncMock(return_value=PromoDiscountApplyResult(applied=True, raw={"success": True}))
 
     async with session_maker() as session:
@@ -316,18 +321,14 @@ async def test_happy_path_applies_discount_and_creates_outbox(session_maker) -> 
     assert meta.get("discount_apply_altegio_record_id") == 777
     assert meta.get("discount_apply_card_id") == int(_CARD_ID)
     assert meta.get("discount_apply_program_id") == _PROGRAM_ID
+    assert meta.get("customer_notification") == "out_of_scope"
 
     async with session_maker() as s:
         outbox = (
             await s.execute(select(OutboxMessage).where(OutboxMessage.template_code == "wa_promo_discount_applied"))
         ).scalar_one_or_none()
 
-    assert outbox is not None
-    assert outbox.phone_e164 == _PHONE
-    assert outbox.status == "queued"
-    assert outbox.message_source == "bot"
-    assert "Neukundenrabatt" in outbox.body
-    assert "Gute Nachricht" in outbox.body
+    assert outbox is None, "OutboxMessage must not be created (customer notification is out of scope)"
 
 
 # ---------------------------------------------------------------------------
@@ -390,7 +391,7 @@ async def test_service_not_allowed_skips_discount(session_maker) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 8. API failure → status='apply_failed', no OutboxMessage
+# 8. API failure → status='apply_failed'
 # ---------------------------------------------------------------------------
 
 
@@ -422,22 +423,16 @@ async def test_api_failure_sets_apply_failed(session_maker) -> None:
     assert "Altegio 503" in (meta.get("discount_apply_error") or "")
     assert meta.get("discount_apply_attempted_at") is not None
 
-    async with session_maker() as s:
-        outbox = (
-            await s.execute(select(OutboxMessage).where(OutboxMessage.template_code == "wa_promo_discount_applied"))
-        ).scalar_one_or_none()
-
-    assert outbox is None, "No OutboxMessage must be created when API fails"
-
 
 # ---------------------------------------------------------------------------
-# 9. Duplicate webhook → no second API call, no duplicate OutboxMessage
+# 9. Already-applied lead → finder excludes it, no API call
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_duplicate_webhook_idempotent(session_maker) -> None:
-    mock_api = AsyncMock(return_value=PromoDiscountApplyResult(applied=True, raw={"success": True}))
+async def test_already_applied_lead_skipped(session_maker) -> None:
+    """An already-applied lead is excluded by the SQL query (status not in issued/booked)."""
+    mock_api = AsyncMock(side_effect=RuntimeError("must not be called"))
 
     async with session_maker() as session:
         async with session.begin():
@@ -455,12 +450,6 @@ async def test_duplicate_webhook_idempotent(session_maker) -> None:
             session.add(lead)
             await session.flush()
 
-            # First call (already applied)
-            with patch("altegio_bot.promo_discount_apply.apply_promo_discount_to_visit", mock_api):
-                with _base_settings_ctx():
-                    await try_apply_promo_discount(session, record, _COMPANY)
-
-            # Second call (same record, same lead)
             with patch("altegio_bot.promo_discount_apply.apply_promo_discount_to_visit", mock_api):
                 with _base_settings_ctx():
                     await try_apply_promo_discount(session, record, _COMPANY)
@@ -468,13 +457,9 @@ async def test_duplicate_webhook_idempotent(session_maker) -> None:
     mock_api.assert_not_called()
 
     async with session_maker() as s:
-        outboxes = (
-            (await s.execute(select(OutboxMessage).where(OutboxMessage.template_code == "wa_promo_discount_applied")))
-            .scalars()
-            .all()
-        )
-
-    assert len(outboxes) == 0, "No OutboxMessage must be created for already-applied lead"
+        lead = (await s.execute(select(PromoLead).where(PromoLead.phone_e164 == _PHONE))).scalar_one_or_none()
+    assert lead is not None
+    assert lead.status == "applied"  # unchanged
 
 
 # ---------------------------------------------------------------------------
@@ -526,8 +511,103 @@ async def test_prior_attended_visit_skips_discount(session_maker) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 11–14. Direct wrapper unit tests
+# 11. company_id isolation: lead for company 1 is not matched for company 2
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_company_id_isolation_wrong_company_not_matched(session_maker) -> None:
+    """A PromoLead for company 1 must not be picked up by a booking for company 2."""
+    mock_api = AsyncMock(side_effect=RuntimeError("must not be called"))
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_client(session)
+            record = await _seed_record(session, altegio_record_id=600)
+            await _seed_service(session)
+            lead = _make_lead()  # company_id=_COMPANY=1
+            session.add(lead)
+            await session.flush()
+
+            with patch("altegio_bot.promo_discount_apply.apply_promo_discount_to_visit", mock_api):
+                with _base_settings_ctx():
+                    # Passing company_id=2 — must NOT match the company_id=1 lead
+                    await try_apply_promo_discount(session, record, 2)
+
+    mock_api.assert_not_called()
+
+    async with session_maker() as s:
+        lead = (await s.execute(select(PromoLead).where(PromoLead.phone_e164 == _PHONE))).scalar_one_or_none()
+    assert lead is not None
+    assert lead.status == "issued"  # untouched
+
+
+# ---------------------------------------------------------------------------
+# 12. Update webhook: inbox_worker does not call try_apply_promo_discount
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_update_webhook_skips_promo_apply() -> None:
+    """inbox_worker.handle_event with event_status='update' must not call try_apply_promo_discount."""
+    from altegio_bot.workers.inbox_worker import handle_event
+
+    mock_try_apply = AsyncMock()
+    session = AsyncMock()
+
+    event = MagicMock()
+    event.company_id = _COMPANY
+    event.resource = "record"
+    event.event_status = "update"
+    event.resource_id = None
+    event.payload = {
+        "data": {
+            "id": 42,
+            "client": {"id": 100, "display_name": "Test", "phone": _PHONE},
+            "services": [{"id": _ALLOWED_SERVICE, "title": "Test", "cost_to_pay": 50}],
+            "date": "2026-05-08 12:00:00",
+            "staff_id": 5,
+        }
+    }
+
+    mock_record = MagicMock()
+    mock_record.id = 200
+    mock_record.company_id = _COMPANY
+    mock_record.is_deleted = False
+
+    with (
+        patch("altegio_bot.workers.inbox_worker.upsert_client", new=AsyncMock(return_value=100)),
+        patch("altegio_bot.workers.inbox_worker.upsert_record", new=AsyncMock(return_value=200)),
+        patch("altegio_bot.workers.inbox_worker.replace_record_services", new=AsyncMock()),
+        patch("altegio_bot.workers.inbox_worker.record_has_allowed_service", new=AsyncMock(return_value=True)),
+        patch("altegio_bot.workers.inbox_worker.plan_jobs_for_record_event", new=AsyncMock()),
+        patch("altegio_bot.workers.inbox_worker.try_apply_promo_discount", mock_try_apply),
+    ):
+        session.get = AsyncMock(return_value=mock_record)
+        await handle_event(session, event)
+
+    mock_try_apply.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# 13–17. Direct wrapper unit tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_wrapper_api_not_verified_raises() -> None:
+    """apply_promo_discount_to_visit raises PromoDiscountApplyError when api_verified=False."""
+    with patch("httpx.AsyncClient") as mock_client_cls:
+        with patch.object(settings, "promo_apply_discount_api_verified", False):
+            with pytest.raises(PromoDiscountApplyError, match="api_verified"):
+                await apply_promo_discount_to_visit(
+                    location_id=9001,
+                    card_id=555,
+                    program_id=1,
+                    record_id=777,
+                )
+
+    mock_client_cls.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -544,12 +624,13 @@ async def test_wrapper_success_response() -> None:
         mock_client.post = AsyncMock(return_value=mock_response)
         mock_client_cls.return_value = mock_client
 
-        result = await apply_promo_discount_to_visit(
-            location_id=9001,
-            card_id=555,
-            program_id=1,
-            record_id=777,
-        )
+        with patch.object(settings, "promo_apply_discount_api_verified", True):
+            result = await apply_promo_discount_to_visit(
+                location_id=9001,
+                card_id=555,
+                program_id=1,
+                record_id=777,
+            )
 
     assert result.applied is True
     assert result.raw == {"success": True, "id": 42}
@@ -565,13 +646,14 @@ async def test_wrapper_http_error_raises() -> None:
         mock_client.post = AsyncMock(side_effect=httpx.ConnectError("connection refused"))
         mock_client_cls.return_value = mock_client
 
-        with pytest.raises(PromoDiscountApplyError, match="HTTP error"):
-            await apply_promo_discount_to_visit(
-                location_id=9001,
-                card_id=555,
-                program_id=1,
-                record_id=777,
-            )
+        with patch.object(settings, "promo_apply_discount_api_verified", True):
+            with pytest.raises(PromoDiscountApplyError, match="HTTP error"):
+                await apply_promo_discount_to_visit(
+                    location_id=9001,
+                    card_id=555,
+                    program_id=1,
+                    record_id=777,
+                )
 
 
 @pytest.mark.asyncio
@@ -588,13 +670,14 @@ async def test_wrapper_invalid_json_raises() -> None:
         mock_client.post = AsyncMock(return_value=mock_response)
         mock_client_cls.return_value = mock_client
 
-        with pytest.raises(PromoDiscountApplyError, match="invalid JSON"):
-            await apply_promo_discount_to_visit(
-                location_id=9001,
-                card_id=555,
-                program_id=1,
-                record_id=777,
-            )
+        with patch.object(settings, "promo_apply_discount_api_verified", True):
+            with pytest.raises(PromoDiscountApplyError, match="invalid JSON"):
+                await apply_promo_discount_to_visit(
+                    location_id=9001,
+                    card_id=555,
+                    program_id=1,
+                    record_id=777,
+                )
 
 
 @pytest.mark.asyncio
@@ -611,10 +694,11 @@ async def test_wrapper_unexpected_shape_raises() -> None:
         mock_client.post = AsyncMock(return_value=mock_response)
         mock_client_cls.return_value = mock_client
 
-        with pytest.raises(PromoDiscountApplyError, match="unexpected response shape"):
-            await apply_promo_discount_to_visit(
-                location_id=9001,
-                card_id=555,
-                program_id=1,
-                record_id=777,
-            )
+        with patch.object(settings, "promo_apply_discount_api_verified", True):
+            with pytest.raises(PromoDiscountApplyError, match="unexpected response shape"):
+                await apply_promo_discount_to_visit(
+                    location_id=9001,
+                    card_id=555,
+                    program_id=1,
+                    record_id=777,
+                )

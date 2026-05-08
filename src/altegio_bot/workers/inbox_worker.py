@@ -390,10 +390,11 @@ async def handle_event(session: AsyncSession, event: AltegioEvent) -> None:
         record_obj = await session.get(Record, record_pk)
 
         if record_obj is not None and event_status is not None:
-            # Promo discount apply runs for create/update events with its own
-            # service allowlist, independently of the lash-service filter below.
+            # Promo discount apply runs on create events only. Update webhooks are
+            # intentionally skipped to avoid applying promo to bookings that existed
+            # before the promo was issued.
             normalized_status = _normalize_event_status(event_status)
-            if normalized_status in ("create", "update") and not record_obj.is_deleted:
+            if normalized_status == "create" and not record_obj.is_deleted:
                 await try_apply_promo_discount(session, record_obj, int(company_id))
 
             allowed = await record_has_allowed_service(

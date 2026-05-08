@@ -25,7 +25,7 @@ import httpx
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from altegio_bot.models.models import Client, OutboxMessage, PromoLead, Record, RecordService
+from altegio_bot.models.models import Client, PromoLead, Record, RecordService
 from altegio_bot.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -71,6 +71,11 @@ async def apply_promo_discount_to_visit(
 
     Raises PromoDiscountApplyError on HTTP, network, JSON, or shape failures.
     """
+    if not settings.promo_apply_discount_api_verified:
+        raise PromoDiscountApplyError(
+            "apply_promo_discount_api_verified=False — API call blocked until endpoint is verified"
+        )
+
     base = settings.altegio_api_base_url.rstrip("/")
     url = f"{base}/visit/loyalty/apply_discount_program/{location_id}/{card_id}/{program_id}"
 
@@ -125,12 +130,14 @@ def get_promo_allowed_service_ids() -> set[int]:
 async def find_applicable_promo_lead_for_record(
     session: AsyncSession,
     *,
+    company_id: int,
     phone_e164: str,
     now: datetime,
 ) -> PromoLead | None:
     """Return the most recent active PromoLead eligible for discount application.
 
     Filters:
+    - company_id matches the booking company (prevents cross-location mismatch)
     - phone_e164 matches the booking client
     - campaign_name == settings.promo_campaign_name
     - status in ('issued', 'booked')
@@ -147,6 +154,7 @@ async def find_applicable_promo_lead_for_record(
     campaign = settings.promo_campaign_name
     stmt = (
         select(PromoLead)
+        .where(PromoLead.company_id == company_id)
         .where(PromoLead.phone_e164 == phone_e164)
         .where(PromoLead.campaign_name == campaign)
         .where(PromoLead.status.in_(["issued", "booked"]))
@@ -194,25 +202,17 @@ async def _get_record_service_ids(session: AsyncSession, record_pk: int) -> set[
     return set(result.scalars().all())
 
 
-def _build_discount_applied_reply() -> str:
-    return (
-        "Gute Nachricht 🎁\n\n"
-        "Ihr Neukundenrabatt wurde Ihrer Buchung zugeordnet.\n\n"
-        "Bitte beachten Sie: In der Online-Buchung und in der ersten Bestätigung\n"
-        "können noch reguläre Preise angezeigt werden. Unser Team sieht den Rabatt\n"
-        "in Ihrer Buchung.\n\n"
-        "Wir freuen uns auf Ihren Besuch 💙"
-    )
-
-
 async def try_apply_promo_discount(
     session: AsyncSession,
     record: Record,
     company_id: int,
 ) -> None:
-    """Attempt to apply a promo discount to a newly booked Altegio visit.
+    """Attempt to apply a promo discount to a newly created Altegio visit.
 
-    Called from inbox_worker.handle_event after a record create/update webhook.
+    Called from inbox_worker.handle_event on record create webhooks only.
+    Update webhooks are intentionally ignored to avoid applying promo to
+    bookings created before the promo was issued.
+
     Fail-closed: controlled failures are recorded in PromoLead.meta and do not
     propagate as exceptions. Unexpected exceptions propagate to the caller so
     the event can be retried.
@@ -220,15 +220,15 @@ async def try_apply_promo_discount(
     Flow:
     1. Feature gate check (promo_apply_discount_enabled).
     2. Resolve client phone from record.
-    3. Find matching PromoLead.
-    4. Idempotency guard (already applied to this record).
-    5. Service allowlist check (promo_allowed_service_ids).
-    6. New-client guard (no prior attended visits, local DB only).
-    7. Transition issued → booked (booking confirmed).
-    8. API gate check (promo_apply_discount_api_verified).
-    9. Call Altegio apply_discount_program API.
-    10. Update PromoLead status → applied.
-    11. Create OutboxMessage for customer reply.
+    3. Find matching PromoLead (filtered by company_id + phone).
+    4. Service allowlist check (promo_allowed_service_ids).
+    5. New-client guard (no prior attended visits, local DB only).
+    6. Transition issued → booked (booking confirmed).
+    7. API gate check (promo_apply_discount_api_verified).
+    8. Call Altegio apply_discount_program API.
+    9. Update PromoLead status → applied.
+
+    Customer notification is out of scope for this implementation.
     """
     cfg = settings
 
@@ -249,6 +249,7 @@ async def try_apply_promo_discount(
     # ── 3. Find matching PromoLead ────────────────────────────────────────────
     lead = await find_applicable_promo_lead_for_record(
         session,
+        company_id=company_id,
         phone_e164=phone_e164,
         now=now,
     )
@@ -257,24 +258,7 @@ async def try_apply_promo_discount(
 
     meta = lead.meta or {}
 
-    # ── 4. Idempotency guard ──────────────────────────────────────────────────
-    if lead.status == "applied":
-        if meta.get("discount_apply_altegio_record_id") == record.altegio_record_id:
-            logger.info(
-                "promo_discount: skip duplicate webhook record=%s lead_id=%s (already applied)",
-                record.altegio_record_id,
-                lead.id,
-            )
-            return
-        if meta.get("discount_applied_at"):
-            logger.info(
-                "promo_discount: skip lead_id=%s already applied at %s",
-                lead.id,
-                meta.get("discount_applied_at"),
-            )
-            return
-
-    # ── 5. Service allowlist check ────────────────────────────────────────────
+    # ── 4. Service allowlist check ────────────────────────────────────────────
     allowed_service_ids = get_promo_allowed_service_ids()
     if not allowed_service_ids:
         err = "promo_allowed_service_ids empty — discount not applied automatically"
@@ -289,7 +273,7 @@ async def try_apply_promo_discount(
         logger.info("promo_discount: skip lead_id=%s service not allowed", lead.id)
         return
 
-    # ── 6. New-client guard ───────────────────────────────────────────────────
+    # ── 5. New-client guard ───────────────────────────────────────────────────
     # TODO: This check uses local DB only and may miss visits not yet synced
     # from Altegio. A full CRM API history check is deferred to a future PR.
     if await _has_prior_attended_visits(session, phone_e164, exclude_record_id=record.id):
@@ -298,7 +282,7 @@ async def try_apply_promo_discount(
         logger.info("promo_discount: skip lead_id=%s prior visited client", lead.id)
         return
 
-    # ── 7. Transition issued → booked ─────────────────────────────────────────
+    # ── 6. Transition issued → booked ─────────────────────────────────────────
     if lead.status == "issued":
         meta = {
             **meta,
@@ -316,7 +300,7 @@ async def try_apply_promo_discount(
             record.id,
         )
 
-    # ── 8. API gate ───────────────────────────────────────────────────────────
+    # ── 7. API gate ───────────────────────────────────────────────────────────
     if not cfg.promo_apply_discount_api_verified:
         err = "promo_apply_discount_api_verified=False — discount apply blocked until endpoint is verified"
         lead.meta = {
@@ -327,7 +311,7 @@ async def try_apply_promo_discount(
         logger.warning("promo_discount: api not verified, blocking apply for lead_id=%s", lead.id)
         return
 
-    # ── 9. Validate required fields ───────────────────────────────────────────
+    # ── 8. Validate required fields ───────────────────────────────────────────
     location_id = lead.location_id
     card_id_raw = lead.loyalty_card_id
     program_id_raw = lead.discount_program_id
@@ -363,7 +347,7 @@ async def try_apply_promo_discount(
 
     program_id: int | str = program_id_raw
 
-    # ── 10. Call Altegio API ──────────────────────────────────────────────────
+    # ── 9. Call Altegio API ───────────────────────────────────────────────────
     try:
         api_result = await apply_promo_discount_to_visit(
             location_id=location_id,
@@ -382,7 +366,7 @@ async def try_apply_promo_discount(
         logger.warning("promo_discount: API failed lead_id=%s: %s", lead.id, exc)
         return
 
-    # ── 11. Update PromoLead → applied ─────────────────────────────────────────
+    # ── 10. Update PromoLead → applied ────────────────────────────────────────
     lead.status = "applied"
     lead.applied_at = now
     lead.record_id = record.id
@@ -396,37 +380,11 @@ async def try_apply_promo_discount(
         "discount_apply_location_id": location_id,
         "discount_apply_card_id": card_id,
         "discount_apply_program_id": program_id,
+        "customer_notification": "out_of_scope",
     }
     logger.info(
         "promo_discount: applied lead_id=%s record_id=%s card_id=%s",
         lead.id,
         record.id,
         card_id,
-    )
-
-    # ── 12. Queue customer WhatsApp reply ──────────────────────────────────────
-    body = _build_discount_applied_reply()
-    session.add(
-        OutboxMessage(
-            company_id=company_id,
-            client_id=record.client_id,
-            record_id=record.id,
-            job_id=None,
-            sender_id=None,
-            phone_e164=phone_e164,
-            template_code="wa_promo_discount_applied",
-            language="de",
-            body=body,
-            status="queued",
-            provider_message_id=None,
-            scheduled_at=now,
-            sent_at=None,
-            message_source="bot",
-            meta={
-                "source": "promo_discount_apply",
-                "lead_id": lead.id,
-                "record_id": record.id,
-                "altegio_record_id": record.altegio_record_id,
-            },
-        )
     )
