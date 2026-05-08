@@ -162,7 +162,7 @@ def _loyalty_settings_ctx(**overrides):
     """Patch all required loyalty settings for tests that enable card issuance."""
     defaults = {
         "promo_issue_loyalty_card_enabled": True,
-        "promo_altegio_client_api_verified": True,
+        "promo_loyalty_card_api_verified": True,
         "promo_loyalty_card_type_id": "ct_001",
         "promo_discount_program_id": "dp_001",
         "promo_location_id_by_company": '{"1": 9001}',
@@ -441,16 +441,17 @@ async def test_rejected_not_new_skips_card_issuance(session_maker) -> None:
 
 
 @pytest.mark.asyncio
-async def test_client_api_not_verified_blocks_issuance(session_maker) -> None:
+async def test_card_api_not_verified_blocks_issuance(session_maker) -> None:
+    """promo_loyalty_card_api_verified=False → card issuance blocked, neutral reply."""
     mock_issue = AsyncMock(side_effect=RuntimeError("must not be called"))
 
     with patch("altegio_bot.workers.promo_lead_handler.issue_promo_loyalty_card", mock_issue):
-        with _loyalty_settings_ctx(promo_altegio_client_api_verified=False):
+        with _loyalty_settings_ctx(promo_loyalty_card_api_verified=False):
             provider, evt = await _fire_promo(session_maker, "aktion", dedupe_suffix="-30")
 
     mock_issue.assert_not_called()
-    assert evt.error is not None, "event.error must be set when client API not verified"
-    assert "promo_altegio_client_api_verified" in (evt.error or "")
+    assert evt.error is not None, "event.error must be set when card API not verified"
+    assert "promo_loyalty_card_api_verified" in (evt.error or "")
 
     # Neutral reply sent (not the card-number reply, not the promise text)
     assert provider.sent, "Neutral reply must be sent"
@@ -463,6 +464,30 @@ async def test_client_api_not_verified_blocks_issuance(session_maker) -> None:
     assert lead is not None
     meta = lead.meta or {}
     assert meta.get("loyalty_card_issued") is False
+
+
+# ---------------------------------------------------------------------------
+# 30b. card_api_verified=True, client_api_verified=False → card issuance NOT blocked
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_card_api_verified_ignores_client_api_flag(session_maker) -> None:
+    """Card issuance path uses promo_loyalty_card_api_verified, not client API flag."""
+    mock_issue = AsyncMock(return_value=_MOCK_CARD)
+
+    with patch("altegio_bot.workers.promo_lead_handler.issue_promo_loyalty_card", mock_issue):
+        # promo_loyalty_card_api_verified=True (default in _loyalty_settings_ctx)
+        # promo_altegio_client_api_verified=False (explicit — must NOT block card issuance)
+        with _loyalty_settings_ctx(promo_altegio_client_api_verified=False):
+            provider, evt = await _fire_promo(session_maker, "aktion", dedupe_suffix="-30b")
+
+    mock_issue.assert_called_once(), "issue_promo_loyalty_card must be called"
+    assert evt.error is None
+
+    assert provider.sent, "Card-number reply must be sent"
+    sent_text = provider.sent[0][2]
+    assert "0049160998877660" in sent_text, "Card number must appear in reply"
 
 
 # ---------------------------------------------------------------------------
@@ -584,6 +609,15 @@ async def test_retry_sends_card_number_reply(session_maker) -> None:
     sent_text = provider.sent[0][2]
     assert "0049160112233440" in sent_text, "Card number must appear in retry reply"
 
+    async with session_maker() as s:
+        stmt = select(PromoLead).where(PromoLead.phone_e164 == retry_phone_e164)
+        lead = (await s.execute(stmt)).scalar_one_or_none()
+
+    assert lead is not None
+    meta = lead.meta or {}
+    assert meta.get("reply_sent") is True, "reply_sent must be True after successful resend"
+    assert not meta.get("card_message_pending"), "card_message_pending must be cleared after successful resend"
+
 
 # ---------------------------------------------------------------------------
 # 33. Repair path: existing issued lead without card → card issued on retry
@@ -656,3 +690,71 @@ async def test_repair_path_issues_card_for_existing_lead(session_maker) -> None:
     assert provider.sent, "Card-number reply must be sent after repair"
     sent_text = provider.sent[0][2]
     assert "0049160998877660" in sent_text, "Card number must appear in repair reply"
+
+
+# ---------------------------------------------------------------------------
+# Direct unit tests for promo_loyalty.py
+# ---------------------------------------------------------------------------
+
+
+def test_phone_digits_raises_on_non_digits() -> None:
+    from altegio_bot.promo_loyalty import AltegioLoyaltyError, _phone_digits
+
+    with pytest.raises(AltegioLoyaltyError, match="no digits found"):
+        _phone_digits("abc")
+
+    with pytest.raises(AltegioLoyaltyError, match="no digits found"):
+        _phone_digits("")
+
+
+@pytest.mark.asyncio
+async def test_issue_promo_loyalty_card_non_dict_response() -> None:
+    """Non-dict response from AltegioLoyaltyClient → AltegioLoyaltyError."""
+    from altegio_bot.promo_loyalty import AltegioLoyaltyError, issue_promo_loyalty_card
+
+    with patch("altegio_bot.promo_loyalty.AltegioLoyaltyClient") as MockClient:
+        instance = MockClient.return_value
+        instance.issue_card = AsyncMock(return_value="not-a-dict")
+        instance.aclose = AsyncMock()
+
+        with pytest.raises(AltegioLoyaltyError, match="unexpected type"):
+            await issue_promo_loyalty_card(
+                phone_e164="+4916099887766",
+                location_id=9001,
+                card_type_id="ct_001",
+            )
+
+
+@pytest.mark.asyncio
+async def test_issue_promo_loyalty_card_missing_id() -> None:
+    """Dict response without id field → AltegioLoyaltyError."""
+    from altegio_bot.promo_loyalty import AltegioLoyaltyError, issue_promo_loyalty_card
+
+    with patch("altegio_bot.promo_loyalty.AltegioLoyaltyClient") as MockClient:
+        instance = MockClient.return_value
+        instance.issue_card = AsyncMock(return_value={"number": "0049160998877660"})
+        instance.aclose = AsyncMock()
+
+        with pytest.raises(AltegioLoyaltyError, match="no id"):
+            await issue_promo_loyalty_card(
+                phone_e164="+4916099887766",
+                location_id=9001,
+                card_type_id="ct_001",
+            )
+
+
+@pytest.mark.asyncio
+async def test_get_or_create_altegio_client_blocked_when_unverified() -> None:
+    """get_or_create_altegio_client raises immediately when promo_altegio_client_api_verified=False."""
+    import httpx
+
+    from altegio_bot.promo_loyalty import AltegioLoyaltyError, get_or_create_altegio_client
+
+    with patch.object(settings, "promo_altegio_client_api_verified", False):
+        async with httpx.AsyncClient() as client:
+            with pytest.raises(AltegioLoyaltyError, match="promo_altegio_client_api_verified=False"):
+                await get_or_create_altegio_client(
+                    client,
+                    company_id=1,
+                    phone_e164="+4916099887766",
+                )

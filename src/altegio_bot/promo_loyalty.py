@@ -14,8 +14,11 @@ Response field note (confirmed from spec):
 Unconfirmed endpoints — NOT used in issue_promo_loyalty_card():
   GET  {base}/clients/{company_id}?phone=...  — find client by phone
   POST {base}/clients/{company_id}             — create client
-  These require promo_altegio_client_api_verified=True to be called at all.
-  See get_or_create_altegio_client() which is kept for future use.
+  These require promo_altegio_client_api_verified=True.
+  get_or_create_altegio_client() enforces this at call time and raises
+  AltegioLoyaltyError if the flag is False.
+
+Card issuance endpoint requires promo_loyalty_card_api_verified=True (separate flag).
 """
 
 from __future__ import annotations
@@ -77,6 +80,8 @@ async def get_or_create_altegio_client(
     Returns altegio_client_id.
 
     REQUIRES promo_altegio_client_api_verified=True before calling.
+    Raises AltegioLoyaltyError immediately if the flag is False.
+
     Endpoint paths are assumed from Altegio REST conventions and have NOT been
     verified against the loyalty API OpenAPI spec.
 
@@ -84,6 +89,12 @@ async def get_or_create_altegio_client(
       GET  {base}/clients/{company_id}?phone={digits}&count=1
       POST {base}/clients/{company_id}  {"phone": digits, "name": ""}
     """
+    if not settings.promo_altegio_client_api_verified:
+        raise AltegioLoyaltyError(
+            "get_or_create_altegio_client: promo_altegio_client_api_verified=False"
+            " — client API endpoints not verified, refusing to call"
+        )
+
     base = settings.altegio_api_base_url.rstrip("/")
     url = f"{base}/clients/{company_id}"
     phone_digits = _phone_digits(phone_e164)

@@ -143,13 +143,21 @@ class Settings(BaseSettings):
     # Default False: PromoLead created but no Altegio loyalty card issued.
     # Requires promo_lead_funnel_enabled=True and all promo_loyalty_* settings set.
     promo_issue_loyalty_card_enabled: bool = False
-    # Second gate: Altegio client-lookup/create endpoints are unconfirmed.
-    # Default False: card issuance is blocked until this is set True.
-    # Set True only after manually verifying GET/POST /clients/{company_id}
-    # endpoint shape in a non-production environment.
-    # Confirmed endpoints that do NOT require this flag:
-    #   POST   /loyalty/cards/{location_id}         — issue card (response: id, number)
-    #   DELETE /loyalty/cards/{location_id}/{card_id}
+    # Smoke-test gate for the confirmed card issuance endpoint:
+    #   POST /loyalty/cards/{location_id}  (response: id, number)
+    # Default False: _attempt_loyalty_card_issue() is blocked until True.
+    # Set True only after a successful smoke test against a real Altegio account
+    # in a non-production environment.
+    # This flag is SEPARATE from promo_altegio_client_api_verified, which guards
+    # the unconfirmed client lookup/create endpoints.
+    promo_loyalty_card_api_verified: bool = False
+    # Gate for the UNCONFIRMED client lookup/create endpoints:
+    #   GET  /clients/{company_id}?phone=...
+    #   POST /clients/{company_id}
+    # Default False: get_or_create_altegio_client() raises before making any HTTP
+    # call until this is explicitly set True.
+    # Set True only after manually verifying endpoint shape and payload in a
+    # non-production environment.
     promo_altegio_client_api_verified: bool = False
 
     # Publicly accessible image URLs for newsletter template IMAGE HEADER components.

@@ -362,12 +362,12 @@ async def _attempt_loyalty_card_issue(
     """
     cfg = settings
 
-    if not cfg.promo_altegio_client_api_verified:
-        err = "promo_loyalty: promo_altegio_client_api_verified=False — card issuance blocked"
+    if not cfg.promo_loyalty_card_api_verified:
+        err = "promo_loyalty: promo_loyalty_card_api_verified=False — card issuance blocked"
         lead.meta = {**(lead.meta or {}), "loyalty_card_issued": False, "loyalty_card_error": err}
         event.error = err
         logger.warning(
-            "promo_loyalty: card issuance blocked (promo_altegio_client_api_verified=False) phone=%s",
+            "promo_loyalty: card issuance blocked (promo_loyalty_card_api_verified=False) phone=%s",
             phone_e164,
         )
         return False
@@ -503,6 +503,8 @@ async def handle_promo_command(
             template_code = "wa_promo_lead_expired"
         elif cfg.promo_issue_loyalty_card_enabled and lead.loyalty_card_number:
             # Card already issued — resend with card number.
+            # Set repair_lead so post-send meta update clears card_message_pending.
+            repair_lead = lead
             reply = build_reply_issued_with_card(
                 lead.expires_at,
                 cfg.promo_booking_url,
@@ -668,7 +670,10 @@ async def handle_promo_command(
 
     lead_to_update = new_lead or repair_lead
     if lead_to_update is not None:
-        lead_to_update.meta = {**(lead_to_update.meta or {}), "reply_sent": True}
+        meta_after = {**(lead_to_update.meta or {}), "reply_sent": True}
+        if meta_after.get("card_message_pending"):
+            meta_after["card_message_pending"] = False
+        lead_to_update.meta = meta_after
 
     # ── 6. Audit OutboxMessage ───────────────────────────────────────────────
     session.add(
