@@ -265,6 +265,28 @@ docker exec -i altegio-api /app/.venv/bin/python \
   --limit 10  # Limit to the first 10 recipients
 ```
 
+### 🗑️ Manual cleanup of expired promo loyalty cards
+
+Deletes Altegio loyalty cards for expired promo leads (`status='issued'`, `expires_at <= now`).
+Only touches cards created by the promo funnel (`meta.loyalty_card_issued=True`).
+Leads with `status='booked'` or `'applied'` are intentionally excluded — their card deletion
+policy is out of scope for this script.
+The script is **idempotent** — rows with `meta.promo_card_deleted_at` already set are excluded by the SQL query.
+
+**Local:**
+```bash
+uv run python -m altegio_bot.scripts.cleanup_expired_promo_cards
+```
+
+**Docker:**
+```bash
+docker compose exec -T altegio-api python -m altegio_bot.scripts.cleanup_expired_promo_cards
+```
+
+Exit codes: `0` — all eligible cards deleted (or nothing to do); `1` — one or more deletions failed.
+
+> **Note:** Scheduler/cron integration is intentionally out of scope — run manually or wire to your own job scheduler.
+
 ## Project Structure
 
 ```

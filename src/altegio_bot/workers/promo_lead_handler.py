@@ -194,12 +194,15 @@ def build_reply_issued_with_card(
     )
 
 
-def build_reply_rejected_not_new() -> str:
+def build_reply_rejected_not_new(booking_url: str) -> str:
     return (
         "Danke für Ihre Nachricht 💙\n\n"
-        "Diese Aktion gilt nur für Neukunden beim ersten Besuch.\n"
-        "Wir helfen Ihnen aber gerne, einen passenden Termin oder eine aktuelle "
-        "Aktion zu finden."
+        "Diese Aktion gilt nur für Neukunden beim ersten Besuch.\n\n"
+        "Sie können den Rabatt aber gerne weiterempfehlen:\n"
+        "Die neue Kundin soll uns das Aktionswort einfach direkt von ihrer eigenen "
+        "WhatsApp-Nummer schreiben. Dann können wir den Rabatt korrekt mit ihrer "
+        "Buchung verknüpfen.\n\n"
+        f"Termin buchen:\n{booking_url}"
     )
 
 
@@ -536,7 +539,7 @@ async def handle_promo_command(
 
     elif lead is not None and lead.status == "rejected_not_new":
         # Client was already rejected; resend the rejection reply.
-        reply = build_reply_rejected_not_new()
+        reply = build_reply_rejected_not_new(cfg.promo_booking_url)
         template_code = "wa_promo_lead_rejected_not_new"
 
     elif lead is not None:
@@ -603,7 +606,7 @@ async def handle_promo_command(
         # Determine reply from the actual DB outcome.
         if new_lead is not None:
             if new_lead.status == "rejected_not_new":
-                reply = build_reply_rejected_not_new()
+                reply = build_reply_rejected_not_new(cfg.promo_booking_url)
                 template_code = "wa_promo_lead_rejected_not_new"
             elif not card_issue_failed and cfg.promo_issue_loyalty_card_enabled and new_lead.loyalty_card_number:
                 reply = build_reply_issued_with_card(
