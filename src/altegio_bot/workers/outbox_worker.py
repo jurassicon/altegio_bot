@@ -45,6 +45,7 @@ from altegio_bot.models.models import (
     MessageJob,
     MessageTemplate,
     OutboxMessage,
+    PromoLead,
     Record,
     RecordService,
 )
@@ -1322,6 +1323,8 @@ async def _run_job_logic(
             job.locked_at = None
             job.last_error = "promo_discount_applied: no active sender for company"
             return None
+
+        _pd_promo_lead_id = _pd_payload.get("promo_lead_id")
         contact_name = client.display_name if client else None
         msg_id, err = await safe_send(
             provider=provider,
@@ -1333,6 +1336,7 @@ async def _run_job_logic(
         )
         _pd_now = utcnow()
         _pd_send_meta: dict[str, Any] = {"send_type": "text"}
+
         if err is not None:
             session.add(
                 OutboxMessage(
@@ -1359,39 +1363,98 @@ async def _run_job_logic(
                 job.locked_at = None
                 job.run_at = _pd_now + timedelta(seconds=TOKEN_EXPIRED_RETRY_SECONDS)
                 job.last_error = f"Send blocked: {err}"
+            elif _pd_attempts >= max_attempts:
+                job.status = "failed"
+                job.locked_at = None
+                job.last_error = f"Send failed: {err}"
+                if _pd_promo_lead_id is not None:
+                    try:
+                        _pd_lead = await session.get(PromoLead, int(_pd_promo_lead_id))
+                        if _pd_lead is not None:
+                            _pd_lead.meta = {
+                                **(_pd_lead.meta or {}),
+                                "customer_notification": "failed",
+                                "customer_notification_failed_at": _pd_now.isoformat(),
+                                "customer_notification_error": err,
+                            }
+                        else:
+                            logger.warning(
+                                "promo_discount_applied: PromoLead not found promo_lead_id=%s job_id=%s",
+                                _pd_promo_lead_id,
+                                job.id,
+                            )
+                    except Exception as exc:
+                        logger.warning(
+                            "promo_discount_applied: could not update PromoLead meta job_id=%s: %s",
+                            job.id,
+                            exc,
+                        )
             else:
                 job.last_error = f"Send failed: {err}"
-                if _pd_attempts >= max_attempts:
-                    job.status = "failed"
-                    job.locked_at = None
-                else:
-                    job.status = "queued"
-                    job.locked_at = None
-                    job.run_at = _pd_now + timedelta(seconds=_retry_delay_seconds(_pd_attempts))
+                job.status = "queued"
+                job.locked_at = None
+                job.run_at = _pd_now + timedelta(seconds=_retry_delay_seconds(_pd_attempts))
+                if _pd_promo_lead_id is not None:
+                    try:
+                        _pd_lead = await session.get(PromoLead, int(_pd_promo_lead_id))
+                        if _pd_lead is not None:
+                            _pd_lead.meta = {
+                                **(_pd_lead.meta or {}),
+                                "customer_notification_last_error": err,
+                            }
+                    except Exception as exc:
+                        logger.warning(
+                            "promo_discount_applied: could not update PromoLead meta job_id=%s: %s",
+                            job.id,
+                            exc,
+                        )
             return None
-        session.add(
-            OutboxMessage(
-                company_id=job.company_id,
-                client_id=(client.id if client else None),
-                record_id=(record.id if record else None),
-                job_id=job.id,
-                sender_id=_pd_sender_id,
-                phone_e164=phone,
-                template_code=job.job_type,
-                language="de",
-                body=_pd_body,
-                status="sent",
-                error=None,
-                provider_message_id=msg_id,
-                scheduled_at=job.run_at,
-                sent_at=_pd_now,
-                meta=_pd_send_meta,
-            )
+
+        out = OutboxMessage(
+            company_id=job.company_id,
+            client_id=(client.id if client else None),
+            record_id=(record.id if record else None),
+            job_id=job.id,
+            sender_id=_pd_sender_id,
+            phone_e164=phone,
+            template_code=job.job_type,
+            language="de",
+            body=_pd_body,
+            status="sent",
+            error=None,
+            provider_message_id=msg_id,
+            scheduled_at=job.run_at,
+            sent_at=_pd_now,
+            meta=_pd_send_meta,
         )
+        session.add(out)
         job.status = "done"
         job.locked_at = None
         job.last_error = None
         logger.info("promo_discount_applied: sent job_id=%s phone=%s", job.id, phone)
+
+        if _pd_promo_lead_id is not None:
+            try:
+                _pd_lead = await session.get(PromoLead, int(_pd_promo_lead_id))
+                if _pd_lead is not None:
+                    _pd_lead.meta = {
+                        **(_pd_lead.meta or {}),
+                        "customer_notification": "sent",
+                        "customer_notification_sent_at": _pd_now.isoformat(),
+                        "customer_notification_provider_message_id": msg_id,
+                    }
+                else:
+                    logger.warning(
+                        "promo_discount_applied: PromoLead not found promo_lead_id=%s job_id=%s",
+                        _pd_promo_lead_id,
+                        job.id,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "promo_discount_applied: could not update PromoLead meta job_id=%s: %s",
+                    job.id,
+                    exc,
+                )
         return None
 
     try:

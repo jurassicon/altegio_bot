@@ -102,6 +102,12 @@ async def apply_promo_discount_to_visit(
             f"apply_discount_program unexpected response shape {type(data).__name__}: {data!r}"
         )
 
+    if data.get("success") is not True:
+        raise PromoDiscountApplyError(
+            f"apply_discount_program unsuccessful response:"
+            f" location={location_id} card={card_id} program={program_id}: {data!r}"
+        )
+
     return PromoDiscountApplyResult(applied=True, raw=data)
 
 
@@ -127,16 +133,87 @@ def get_promo_allowed_service_ids() -> set[int]:
     return result
 
 
-def _build_notification_body(discount_amount, discount_type: str) -> str:
-    try:
-        amt = int(discount_amount) if int(discount_amount) == discount_amount else float(discount_amount)
-    except (TypeError, ValueError, OverflowError):
-        amt = discount_amount
-    suffix = " %" if discount_type == "percent" else " €"
+def _build_notification_body() -> str:
     return (
-        f"Gute Neuigkeit! 🎉\n\n"
-        f"Ihr Neukunden-Rabatt von {amt}{suffix} wurde erfolgreich auf Ihren Besuch angewendet.\n\n"
-        f"Der Rabatt wird bei der Abrechnung berücksichtigt."
+        "Gute Nachricht 🎁\n\n"
+        "Ihr Neukundenrabatt wurde Ihrer Buchung zugeordnet.\n\n"
+        "Bitte beachten Sie: In der Online-Buchung und in der ersten Bestätigung "
+        "können noch reguläre Preise angezeigt werden. Unser Team sieht den Rabatt "
+        "in Ihrer Buchung.\n\n"
+        "Wir freuen uns auf Ihren Besuch 💙"
+    )
+
+
+async def _ensure_promo_discount_notification_job(
+    session: AsyncSession,
+    lead: PromoLead,
+    client: Client,
+    record: Record,
+    phone_e164: str,
+    now: datetime,
+) -> None:
+    """Idempotent: create or find the customer notification MessageJob for this lead.
+
+    Reads existing job by dedupe_key before inserting to prevent duplicate-key errors
+    on webhook retries where the Altegio apply already succeeded.
+
+    Writes to lead.meta (without overwriting existing apply metadata):
+      customer_notification          = 'queued'
+      customer_notification_job_id   = <job.id>
+      customer_notification_created_at = <now ISO>
+      customer_notification_dedupe_key = <dedupe_key>
+    """
+    dedupe_key = f"promo_discount_applied:{lead.id}"
+
+    existing = (
+        await session.execute(select(MessageJob).where(MessageJob.dedupe_key == dedupe_key))
+    ).scalar_one_or_none()
+
+    current_meta = lead.meta or {}
+
+    if existing is not None:
+        lead.meta = {
+            **current_meta,
+            "customer_notification": "queued",
+            "customer_notification_job_id": existing.id,
+            "customer_notification_created_at": now.isoformat(),
+            "customer_notification_dedupe_key": dedupe_key,
+        }
+        logger.info(
+            "promo_discount: notification job already exists job_id=%s lead_id=%s",
+            existing.id,
+            lead.id,
+        )
+        return
+
+    notification_body = _build_notification_body()
+    job = MessageJob(
+        company_id=lead.company_id,
+        client_id=client.id,
+        record_id=record.id,
+        job_type="promo_discount_applied",
+        run_at=now,
+        dedupe_key=dedupe_key,
+        payload={
+            "body": notification_body,
+            "phone_e164": phone_e164,
+            "promo_lead_id": lead.id,
+        },
+    )
+    session.add(job)
+    await session.flush()
+
+    lead.meta = {
+        **current_meta,
+        "customer_notification": "queued",
+        "customer_notification_job_id": job.id,
+        "customer_notification_created_at": now.isoformat(),
+        "customer_notification_dedupe_key": dedupe_key,
+    }
+    logger.info(
+        "promo_discount: queued notification job_id=%s lead_id=%s",
+        job.id,
+        lead.id,
     )
 
 
@@ -392,25 +469,9 @@ async def try_apply_promo_discount(
         "discount_apply_location_id": location_id,
         "discount_apply_card_id": card_id,
         "discount_apply_program_id": program_id,
-        "customer_notification": "queued",
     }
 
-    notification_body = _build_notification_body(lead.discount_amount, lead.discount_type)
-    session.add(
-        MessageJob(
-            company_id=lead.company_id,
-            client_id=client.id,
-            record_id=record.id,
-            job_type="promo_discount_applied",
-            run_at=now,
-            dedupe_key=f"promo_discount_applied:{lead.id}",
-            payload={
-                "body": notification_body,
-                "phone_e164": phone_e164,
-                "promo_lead_id": lead.id,
-            },
-        )
-    )
+    await _ensure_promo_discount_notification_job(session, lead, client, record, phone_e164, now)
     logger.info(
         "promo_discount: applied lead_id=%s record_id=%s card_id=%s",
         lead.id,
