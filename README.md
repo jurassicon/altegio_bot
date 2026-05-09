@@ -513,6 +513,40 @@ The cleanup script (`scripts/cleanup_expired_promo_cards.py`) only processes
 `booked`, `applied`, or `used` are intentionally excluded — their card
 lifecycle is managed separately.
 
+### Finding a promo discount smoke-test candidate
+
+`scripts/find_promo_discount_smoke_candidate.py` is a **read-only** helper that
+queries the local DB for a PromoLead with all required IDs and a linked booking,
+then prints the dry-run command for `smoke_apply_promo_discount.py`.
+
+The script makes **no Altegio API calls**, applies **no discount**, and writes
+**nothing** to the database. It does not require `PROMO_APPLY_DISCOUNT_ENABLED`
+or `PROMO_APPLY_DISCOUNT_API_VERIFIED` to be set.
+
+```bash
+# Find candidates (all companies)
+docker compose exec -T altegio-api python -m altegio_bot.scripts.find_promo_discount_smoke_candidate
+
+# Filter by company or phone
+docker compose exec -T altegio-api python -m altegio_bot.scripts.find_promo_discount_smoke_candidate \
+  --company-id 1 --phone +49...
+```
+
+**The `--yes-apply` command is intentionally not printed.** `Record` has no
+`created_at` column, so the helper cannot prove that a booking was created
+*after* the promo lead was issued. A booking that predates the promo would
+receive an unintended discount.
+
+Before constructing a `--yes-apply` command, manually verify in Altegio:
+1. The booking belongs to the promo client.
+2. The booking was created *after* the promo lead `issued_at`.
+3. The booked service is eligible for the promo (the helper prints allowlist diagnostics).
+
+The output includes:
+- the dry-run command (safe — no API call);
+- a service allowlist diagnostic (`allowed_service_match=yes/no/not_configured`);
+- an explanation of why the real apply command is omitted.
+
 ### Manual smoke test for promo discount application
 
 The endpoint (`POST /visit/loyalty/apply_discount_program/…`) is marked as
