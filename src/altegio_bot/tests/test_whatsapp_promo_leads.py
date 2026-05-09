@@ -30,14 +30,16 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from sqlalchemy import select
 
+from altegio_bot.altegio_records import AltegioNewClientCheckError
 from altegio_bot.models.models import (
     PROMO_LEAD_STATUSES,
     Client,
+    MessageJob,
     OutboxMessage,
     PromoLead,
     Record,
@@ -57,7 +59,10 @@ from altegio_bot.workers.whatsapp_inbox_worker import handle_event
 @pytest.fixture(autouse=True)
 def _enable_promo_funnel():
     """All tests here exercise the full funnel (promo_lead_funnel_enabled=True)."""
-    with patch.object(settings, "promo_lead_funnel_enabled", True):
+    with (
+        patch.object(settings, "promo_lead_funnel_enabled", True),
+        patch.object(settings, "promo_check_new_client_in_altegio", False),
+    ):
         yield
 
 
@@ -69,6 +74,7 @@ PHONE_NUMBER_ID = "PNID_PROMO_LEAD"
 FROM_PHONE = "4916000000099"
 PHONE_E164 = "+4916000000099"
 CAMPAIGN = "welcome_discount"  # must match settings default
+PROMO_LOCATION_MAP = '{"1": 9001}'
 
 
 class _CaptureProvider(WhatsAppProvider):
@@ -1207,3 +1213,482 @@ async def test_rejected_not_new_reply_contains_referral_text(session_maker) -> N
         ).scalar_one_or_none()
 
     assert outbox is not None, "OutboxMessage must use wa_promo_lead_rejected_not_new"
+
+
+# ---------------------------------------------------------------------------
+# 24. External Altegio new-client check disabled → no API call
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_external_new_client_check_flag_false_does_not_call_altegio(session_maker) -> None:
+    check_mock = AsyncMock(side_effect=AssertionError("external check must not be called"))
+
+    with patch(
+        "altegio_bot.workers.promo_lead_handler.check_client_has_any_altegio_record",
+        check_mock,
+    ):
+        await _fire_promo(session_maker, "aktion")
+
+    check_mock.assert_not_called()
+
+    async with session_maker() as s:
+        lead = (await s.execute(select(PromoLead).where(PromoLead.phone_e164 == PHONE_E164))).scalar_one_or_none()
+
+    assert lead is not None
+    assert lead.status == "issued"
+    assert (lead.meta or {}).get("altegio_new_client_check") == "disabled"
+
+
+# ---------------------------------------------------------------------------
+# 25. External Altegio check enabled + no records → issue as before
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_external_new_client_check_no_records_issues_lead(session_maker) -> None:
+    check_mock = AsyncMock(return_value=False)
+
+    with (
+        patch.object(settings, "promo_check_new_client_in_altegio", True),
+        patch.object(settings, "promo_location_id_by_company", PROMO_LOCATION_MAP),
+        patch(
+            "altegio_bot.workers.promo_lead_handler.check_client_has_any_altegio_record",
+            check_mock,
+        ),
+    ):
+        provider, evt = await _fire_promo(session_maker, "aktion")
+
+    check_mock.assert_awaited_once_with(phone_e164=PHONE_E164, location_id=9001)
+    assert provider.sent
+    assert "verknüpft" in provider.sent[0][2]
+    assert evt.error is None
+
+    async with session_maker() as s:
+        lead = (await s.execute(select(PromoLead).where(PromoLead.phone_e164 == PHONE_E164))).scalar_one_or_none()
+
+    assert lead is not None
+    assert lead.status == "issued"
+    assert (lead.meta or {}).get("altegio_new_client_check") == "no_records"
+
+
+# ---------------------------------------------------------------------------
+# 26. External Altegio check enabled + any record → rejected_not_new
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_external_new_client_check_records_found_rejects_without_card_or_job(session_maker) -> None:
+    check_mock = AsyncMock(return_value=True)
+    card_mock = AsyncMock()
+
+    with (
+        patch.object(settings, "promo_check_new_client_in_altegio", True),
+        patch.object(settings, "promo_location_id_by_company", PROMO_LOCATION_MAP),
+        patch.object(settings, "promo_issue_loyalty_card_enabled", True),
+        patch(
+            "altegio_bot.workers.promo_lead_handler.check_client_has_any_altegio_record",
+            check_mock,
+        ),
+        patch("altegio_bot.workers.promo_lead_handler.issue_promo_loyalty_card", card_mock),
+    ):
+        provider, evt = await _fire_promo(session_maker, "aktion")
+
+    check_mock.assert_awaited_once_with(phone_e164=PHONE_E164, location_id=9001)
+    card_mock.assert_not_called()
+    assert provider.sent
+    assert "Neukunden" in provider.sent[0][2]
+    assert evt.error is None
+
+    async with session_maker() as s:
+        leads = (await s.execute(select(PromoLead).where(PromoLead.phone_e164 == PHONE_E164))).scalars().all()
+        issued_lead = (
+            await s.execute(select(PromoLead).where(PromoLead.phone_e164 == PHONE_E164, PromoLead.status == "issued"))
+        ).scalar_one_or_none()
+        jobs = (await s.execute(select(MessageJob))).scalars().all()
+
+    assert len(leads) == 1
+    lead = leads[0]
+    assert lead.status == "rejected_not_new"
+    assert lead.reject_reason == "has_altegio_records"
+    assert lead.loyalty_card_id is None
+    assert (lead.meta or {}).get("altegio_new_client_check") == "records_found"
+    assert issued_lead is None
+    assert jobs == []
+
+
+# ---------------------------------------------------------------------------
+# 27. External Altegio check enabled + API error → neutral manual-check reply
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_external_new_client_check_error_fails_closed_with_manual_reply(session_maker) -> None:
+    check_mock = AsyncMock(side_effect=AltegioNewClientCheckError("promo new-client check HTTP 503: location_id=9001"))
+    card_mock = AsyncMock()
+
+    with (
+        patch.object(settings, "promo_check_new_client_in_altegio", True),
+        patch.object(settings, "promo_location_id_by_company", PROMO_LOCATION_MAP),
+        patch.object(settings, "promo_issue_loyalty_card_enabled", True),
+        patch(
+            "altegio_bot.workers.promo_lead_handler.check_client_has_any_altegio_record",
+            check_mock,
+        ),
+        patch("altegio_bot.workers.promo_lead_handler.issue_promo_loyalty_card", card_mock),
+    ):
+        provider, evt = await _fire_promo(session_maker, "aktion")
+
+    check_mock.assert_awaited_once_with(phone_e164=PHONE_E164, location_id=9001)
+    card_mock.assert_not_called()
+    assert provider.sent
+    sent_text = provider.sent[0][2]
+    assert "Unser Team meldet sich" in sent_text
+    assert "verknüpft" not in sent_text
+    assert evt.error is None
+
+    async with session_maker() as s:
+        lead = (await s.execute(select(PromoLead).where(PromoLead.phone_e164 == PHONE_E164))).scalar_one_or_none()
+        outbox = (
+            await s.execute(select(OutboxMessage).where(OutboxMessage.template_code == "wa_promo_lead_manual_check"))
+        ).scalar_one_or_none()
+        jobs = (await s.execute(select(MessageJob))).scalars().all()
+
+    assert lead is not None
+    assert lead.status == "cancelled"
+    assert lead.reject_reason == "altegio_new_client_check_failed"
+    assert lead.loyalty_card_id is None
+    assert "HTTP 503" in (lead.meta or {}).get("altegio_new_client_check_error", "")
+    assert (lead.meta or {}).get("reply_sent") is True
+    assert outbox is not None
+    assert jobs == []
+
+
+# ---------------------------------------------------------------------------
+# 28. Missing promo location mapping → neutral manual-check reply
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_external_new_client_check_missing_location_mapping_fails_closed(session_maker) -> None:
+    check_mock = AsyncMock(return_value=False)
+    card_mock = AsyncMock()
+
+    with (
+        patch.object(settings, "promo_check_new_client_in_altegio", True),
+        patch.object(settings, "promo_location_id_by_company", "{}"),
+        patch.object(settings, "promo_issue_loyalty_card_enabled", True),
+        patch(
+            "altegio_bot.workers.promo_lead_handler.check_client_has_any_altegio_record",
+            check_mock,
+        ),
+        patch("altegio_bot.workers.promo_lead_handler.issue_promo_loyalty_card", card_mock),
+    ):
+        provider, evt = await _fire_promo(session_maker, "aktion")
+
+    check_mock.assert_not_called()
+    card_mock.assert_not_called()
+    assert provider.sent
+    sent_text = provider.sent[0][2]
+    assert "Unser Team meldet sich" in sent_text
+    assert "verknüpft" not in sent_text
+    assert evt.error is None
+
+    async with session_maker() as s:
+        lead = (await s.execute(select(PromoLead).where(PromoLead.phone_e164 == PHONE_E164))).scalar_one_or_none()
+        outbox = (
+            await s.execute(select(OutboxMessage).where(OutboxMessage.template_code == "wa_promo_lead_manual_check"))
+        ).scalar_one_or_none()
+        jobs = (await s.execute(select(MessageJob))).scalars().all()
+
+    assert lead is not None
+    assert lead.status == "cancelled"
+    assert lead.reject_reason == "altegio_new_client_check_failed"
+    assert lead.loyalty_card_id is None
+    assert "missing promo location_id for company_id=1" in (lead.meta or {}).get("altegio_new_client_check_error", "")
+    assert outbox is not None
+    assert jobs == []
+
+
+# ---------------------------------------------------------------------------
+# 29. Invalid promo location mapping JSON → neutral manual-check reply
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_external_new_client_check_invalid_location_mapping_fails_closed(session_maker) -> None:
+    check_mock = AsyncMock(return_value=False)
+    card_mock = AsyncMock()
+
+    with (
+        patch.object(settings, "promo_check_new_client_in_altegio", True),
+        patch.object(settings, "promo_location_id_by_company", "{not-json"),
+        patch.object(settings, "promo_issue_loyalty_card_enabled", True),
+        patch(
+            "altegio_bot.workers.promo_lead_handler.check_client_has_any_altegio_record",
+            check_mock,
+        ),
+        patch("altegio_bot.workers.promo_lead_handler.issue_promo_loyalty_card", card_mock),
+    ):
+        provider, evt = await _fire_promo(session_maker, "aktion")
+
+    check_mock.assert_not_called()
+    card_mock.assert_not_called()
+    assert provider.sent
+    assert "Unser Team meldet sich" in provider.sent[0][2]
+    assert evt.error is None
+
+    async with session_maker() as s:
+        lead = (await s.execute(select(PromoLead).where(PromoLead.phone_e164 == PHONE_E164))).scalar_one_or_none()
+
+    assert lead is not None
+    assert lead.status == "cancelled"
+    assert lead.reject_reason == "altegio_new_client_check_failed"
+    assert "invalid promo_location_id_by_company JSON" in (lead.meta or {}).get("altegio_new_client_check_error", "")
+
+
+# ---------------------------------------------------------------------------
+# 30. Repeat after rejected_not_new ignores external check and card issuance
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_repeat_rejected_not_new_with_external_flag_does_not_issue_or_recheck(session_maker) -> None:
+    provider = _CaptureProvider()
+    check_mock = AsyncMock(return_value=False)
+    card_attempt_mock = AsyncMock(return_value=True)
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _setup_sender(session, sender_id=324)
+
+            now = _utcnow()
+            session.add(
+                PromoLead(
+                    company_id=1,
+                    phone_e164=PHONE_E164,
+                    campaign_name=CAMPAIGN,
+                    secret_code="aktion",
+                    discount_amount=Decimal("15"),
+                    discount_type="fixed",
+                    status="rejected_not_new",
+                    reject_reason="has_altegio_records",
+                    issued_at=now,
+                    expires_at=now,
+                )
+            )
+
+            evt = WhatsAppEvent(
+                dedupe_key="wa:promo-rejected-repeat-external-28",
+                status="received",
+                error=None,
+                query={},
+                headers={},
+                payload=_inbound_payload(PHONE_NUMBER_ID, FROM_PHONE, "aktion"),
+            )
+            session.add(evt)
+            await session.flush()
+
+            with (
+                patch.object(settings, "promo_check_new_client_in_altegio", True),
+                patch.object(settings, "promo_issue_loyalty_card_enabled", True),
+                patch(
+                    "altegio_bot.workers.promo_lead_handler.check_client_has_any_altegio_record",
+                    check_mock,
+                ),
+                patch(
+                    "altegio_bot.workers.promo_lead_handler._attempt_loyalty_card_issue",
+                    card_attempt_mock,
+                ),
+                patch(
+                    "altegio_bot.workers.whatsapp_inbox_worker.ChatwootClient",
+                    return_value=_FakeCW(),
+                ),
+            ):
+                await handle_event(session, evt, provider)
+
+    check_mock.assert_not_called()
+    card_attempt_mock.assert_not_called()
+    assert provider.sent
+    assert "Neukunden" in provider.sent[0][2]
+    assert evt.error is None
+
+    async with session_maker() as s:
+        issued_lead = (
+            await s.execute(select(PromoLead).where(PromoLead.phone_e164 == PHONE_E164, PromoLead.status == "issued"))
+        ).scalar_one_or_none()
+
+    assert issued_lead is None
+
+
+# ---------------------------------------------------------------------------
+# 31. Existing cancelled manual-check lead sends manual-check reply
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_existing_cancelled_manual_check_lead_sends_manual_check_reply(session_maker) -> None:
+    provider = _CaptureProvider()
+    now = _utcnow()
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _setup_sender(session, sender_id=326)
+
+            session.add(
+                PromoLead(
+                    company_id=1,
+                    phone_e164=PHONE_E164,
+                    campaign_name=CAMPAIGN,
+                    secret_code="aktion",
+                    discount_amount=Decimal("15"),
+                    discount_type="fixed",
+                    status="cancelled",
+                    reject_reason="altegio_new_client_check_failed",
+                    issued_at=now,
+                    expires_at=now,
+                )
+            )
+
+            evt = WhatsAppEvent(
+                dedupe_key="wa:promo-cancelled-manual-check-31",
+                status="received",
+                error=None,
+                query={},
+                headers={},
+                payload=_inbound_payload(PHONE_NUMBER_ID, FROM_PHONE, "aktion"),
+            )
+            session.add(evt)
+            await session.flush()
+
+            with patch(
+                "altegio_bot.workers.whatsapp_inbox_worker.ChatwootClient",
+                return_value=_FakeCW(),
+            ):
+                await handle_event(session, evt, provider)
+
+    assert provider.sent
+    assert "Unser Team meldet sich" in provider.sent[0][2]
+    assert evt.error is None
+
+
+# ---------------------------------------------------------------------------
+# 32. Issued lead with manual-check reject_reason still sends active reply
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_existing_issued_lead_with_manual_check_reject_reason_sends_active_reply(session_maker) -> None:
+    provider = _CaptureProvider()
+    now = _utcnow()
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _setup_sender(session, sender_id=327)
+
+            session.add(
+                PromoLead(
+                    company_id=1,
+                    phone_e164=PHONE_E164,
+                    campaign_name=CAMPAIGN,
+                    secret_code="aktion",
+                    discount_amount=Decimal("15"),
+                    discount_type="fixed",
+                    status="issued",
+                    reject_reason="altegio_new_client_check_failed",
+                    issued_at=now,
+                    expires_at=now + timedelta(days=30),
+                )
+            )
+
+            evt = WhatsAppEvent(
+                dedupe_key="wa:promo-issued-manual-check-reason-32",
+                status="received",
+                error=None,
+                query={},
+                headers={},
+                payload=_inbound_payload(PHONE_NUMBER_ID, FROM_PHONE, "aktion"),
+            )
+            session.add(evt)
+            await session.flush()
+
+            with patch(
+                "altegio_bot.workers.whatsapp_inbox_worker.ChatwootClient",
+                return_value=_FakeCW(),
+            ):
+                await handle_event(session, evt, provider)
+
+    assert provider.sent
+    assert "bereits aktiv" in provider.sent[0][2]
+    assert "Unser Team meldet sich" not in provider.sent[0][2]
+    assert evt.error is None
+
+
+# ---------------------------------------------------------------------------
+# 33. Existing active card lead is not revoked by external check
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_existing_active_card_lead_with_external_flag_does_not_recheck_or_revoke(session_maker) -> None:
+    provider = _CaptureProvider()
+    check_mock = AsyncMock(return_value=True)
+    now = _utcnow()
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _setup_sender(session, sender_id=325)
+
+            session.add(
+                PromoLead(
+                    company_id=1,
+                    phone_e164=PHONE_E164,
+                    campaign_name=CAMPAIGN,
+                    secret_code="aktion",
+                    discount_amount=Decimal("15"),
+                    discount_type="fixed",
+                    status="issued",
+                    issued_at=now,
+                    expires_at=now + timedelta(days=30),
+                    loyalty_card_id="card-1",
+                    loyalty_card_number="991600000099",
+                )
+            )
+
+            evt = WhatsAppEvent(
+                dedupe_key="wa:promo-active-card-external-29",
+                status="received",
+                error=None,
+                query={},
+                headers={},
+                payload=_inbound_payload(PHONE_NUMBER_ID, FROM_PHONE, "aktion"),
+            )
+            session.add(evt)
+            await session.flush()
+
+            with (
+                patch.object(settings, "promo_check_new_client_in_altegio", True),
+                patch.object(settings, "promo_issue_loyalty_card_enabled", True),
+                patch(
+                    "altegio_bot.workers.promo_lead_handler.check_client_has_any_altegio_record",
+                    check_mock,
+                ),
+                patch(
+                    "altegio_bot.workers.whatsapp_inbox_worker.ChatwootClient",
+                    return_value=_FakeCW(),
+                ),
+            ):
+                await handle_event(session, evt, provider)
+
+    check_mock.assert_not_called()
+    assert provider.sent
+    assert "Rabattkarte" in provider.sent[0][2]
+    assert "991600000099" in provider.sent[0][2]
+    assert evt.error is None
+
+    async with session_maker() as s:
+        lead = (await s.execute(select(PromoLead).where(PromoLead.phone_e164 == PHONE_E164))).scalar_one_or_none()
+
+    assert lead is not None
+    assert lead.status == "issued"
+    assert lead.loyalty_card_id == "card-1"

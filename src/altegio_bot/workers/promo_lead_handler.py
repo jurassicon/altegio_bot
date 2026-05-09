@@ -1,20 +1,4 @@
-"""WhatsApp promo lead handler.
-
-Manages the PromoLead lifecycle triggered by secret-word WhatsApp messages.
-
-This PR (first promo funnel PR) implements:
-  - Creating a PromoLead with status 'issued'.
-  - Detecting and resending 'already active' replies.
-  - Marking expired leads and replying with an expiry message.
-  - Local-only 'not new client' check → status 'rejected_not_new'.
-  - Sending free-form WhatsApp text replies (NOT Meta templates).
-  - Creating OutboxMessage audit rows.
-
-NOT in this PR (deferred to future PRs):
-  - Full Altegio CRM API history check for new-client validation.
-  - Applying the discount to a record/visit_id.
-  - Ops dashboard metrics for PromoLead.
-"""
+"""WhatsApp promo lead handler for the secret-word discount funnel."""
 
 from __future__ import annotations
 
@@ -29,6 +13,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from altegio_bot.altegio_records import AltegioNewClientCheckError, check_client_has_any_altegio_record
 from altegio_bot.models.models import Client, OutboxMessage, PromoLead, Record
 from altegio_bot.promo_loyalty import AltegioLoyaltyError, issue_promo_loyalty_card
 from altegio_bot.providers.base import WhatsAppProvider
@@ -214,6 +199,14 @@ def build_reply_loyalty_card_failed() -> str:
     )
 
 
+def build_reply_new_client_check_failed() -> str:
+    return (
+        "Danke für Ihre Nachricht 💙\n\n"
+        "Wir prüfen kurz, ob der Neukundenrabatt für Ihre Nummer verfügbar ist.\n"
+        "Unser Team meldet sich bei Ihnen."
+    )
+
+
 # ---------------------------------------------------------------------------
 # DB helpers
 # ---------------------------------------------------------------------------
@@ -245,9 +238,10 @@ async def _find_any_lead(
 async def _has_prior_visits(session: AsyncSession, phone_e164: str) -> bool:
     """Return True if this phone has at least one attended visit locally.
 
-    Uses only locally synced records (Client + Record tables).  This may
-    miss visits that have not yet been synced from Altegio.  A full Altegio
-    CRM API check is deferred to a future PR.
+    Uses only locally synced records (Client + Record tables), so it may miss
+    visits that have not yet been synced from Altegio.  The optional external
+    CRM history check is handled separately by
+    PROMO_CHECK_NEW_CLIENT_IN_ALTEGIO.
 
     An attended visit is indicated by attendance == 1 OR visit_attendance == 1,
     matching the same predicate used elsewhere in the project.
@@ -263,6 +257,62 @@ async def _has_prior_visits(session: AsyncSession, phone_e164: str) -> bool:
     )
     result = await session.execute(stmt)
     return result.scalar_one_or_none() is not None
+
+
+def _resolve_promo_location_id_for_company(company_id: int) -> int:
+    try:
+        location_map = json.loads(settings.promo_location_id_by_company or "{}")
+    except (TypeError, ValueError) as exc:
+        raise AltegioNewClientCheckError(f"invalid promo_location_id_by_company JSON: {exc}") from exc
+
+    if not isinstance(location_map, dict):
+        raise AltegioNewClientCheckError("invalid promo_location_id_by_company JSON: expected object")
+
+    location_id_raw = location_map.get(str(company_id))
+    if location_id_raw in (None, ""):
+        raise AltegioNewClientCheckError(f"missing promo location_id for company_id={company_id}")
+
+    try:
+        location_id = int(location_id_raw)
+    except (TypeError, ValueError) as exc:
+        raise AltegioNewClientCheckError(
+            f"invalid promo location_id for company_id={company_id}: {location_id_raw!r}"
+        ) from exc
+
+    if location_id <= 0:
+        raise AltegioNewClientCheckError(f"invalid promo location_id for company_id={company_id}: {location_id}")
+
+    return location_id
+
+
+def _build_new_client_check_failed_lead(
+    *,
+    company_id: int,
+    phone_e164: str,
+    campaign_name: str,
+    secret_code: str,
+    discount_amount: Decimal,
+    discount_type: str,
+    now: datetime,
+    error: str,
+) -> PromoLead:
+    return PromoLead(
+        company_id=company_id,
+        phone_e164=phone_e164,
+        campaign_name=campaign_name,
+        secret_code=secret_code[:64],
+        discount_amount=discount_amount,
+        discount_type=discount_type,
+        status="cancelled",
+        reject_reason="altegio_new_client_check_failed",
+        issued_at=now,
+        expires_at=now,
+        meta={
+            "altegio_new_client_check": "error",
+            "altegio_new_client_check_error": error,
+            "altegio_new_client_check_failed_at": now.isoformat(),
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -390,27 +440,12 @@ async def _attempt_loyalty_card_issue(
         return False
 
     try:
-        location_map: dict = json.loads(cfg.promo_location_id_by_company or "{}")
-    except (ValueError, TypeError) as exc:
-        err = f"promo_loyalty: invalid promo_location_id_by_company JSON: {exc}"
+        location_id = _resolve_promo_location_id_for_company(company_id)
+    except AltegioNewClientCheckError as exc:
+        err = f"promo_loyalty: {exc}"
         lead.meta = {**(lead.meta or {}), "loyalty_card_issued": False, "loyalty_card_error": err}
         event.error = err
-        return False
-
-    location_id_raw = location_map.get(str(company_id))
-    if not location_id_raw:
-        err = f"promo_loyalty: no location_id for company_id={company_id}"
-        lead.meta = {**(lead.meta or {}), "loyalty_card_issued": False, "loyalty_card_error": err}
-        event.error = err
-        logger.warning("promo_loyalty: no location_id for company_id=%s", company_id)
-        return False
-
-    try:
-        location_id = int(location_id_raw)
-    except (ValueError, TypeError) as exc:
-        err = f"promo_loyalty: invalid location_id for company_id={company_id}: {exc}"
-        lead.meta = {**(lead.meta or {}), "loyalty_card_issued": False, "loyalty_card_error": err}
-        event.error = err
+        logger.warning("promo_loyalty: location_id resolution failed phone=%s: %s", phone_e164, exc)
         return False
 
     try:
@@ -542,6 +577,11 @@ async def handle_promo_command(
         reply = build_reply_rejected_not_new(cfg.promo_booking_url)
         template_code = "wa_promo_lead_rejected_not_new"
 
+    elif lead is not None and lead.status == "cancelled" and lead.reject_reason == "altegio_new_client_check_failed":
+        # External eligibility check failed earlier; keep the conversation in manual-review mode.
+        reply = build_reply_new_client_check_failed()
+        template_code = "wa_promo_lead_manual_check"
+
     elif lead is not None:
         # Other terminal states: expired, cancelled, apply_failed, rejected_service_not_allowed.
         reply = build_reply_expired()
@@ -562,6 +602,60 @@ async def handle_promo_command(
                 issued_at=now,
                 expires_at=now,
             )
+        elif cfg.promo_check_new_client_in_altegio:
+            try:
+                location_id = _resolve_promo_location_id_for_company(company_id)
+                has_altegio_records = await check_client_has_any_altegio_record(
+                    phone_e164=phone_e164,
+                    location_id=location_id,
+                )
+            except AltegioNewClientCheckError as exc:
+                err = str(exc)
+                logger.warning(
+                    "promo_lead: Altegio new-client check failed phone=%s company_id=%s: %s",
+                    phone_e164,
+                    company_id,
+                    err,
+                )
+                candidate = _build_new_client_check_failed_lead(
+                    company_id=company_id,
+                    phone_e164=phone_e164,
+                    campaign_name=cfg.promo_campaign_name,
+                    secret_code=text,
+                    discount_amount=discount_amount,
+                    discount_type=cfg.promo_discount_type,
+                    now=now,
+                    error=err,
+                )
+            else:
+                if has_altegio_records:
+                    candidate = PromoLead(
+                        company_id=company_id,
+                        phone_e164=phone_e164,
+                        campaign_name=cfg.promo_campaign_name,
+                        secret_code=text[:64],
+                        discount_amount=discount_amount,
+                        discount_type=cfg.promo_discount_type,
+                        status="rejected_not_new",
+                        reject_reason="has_altegio_records",
+                        issued_at=now,
+                        expires_at=now,
+                        meta={"altegio_new_client_check": "records_found"},
+                    )
+                else:
+                    expires_at = compute_expires_at(now, cfg.promo_validity_mode, cfg.promo_validity_days)
+                    candidate = PromoLead(
+                        company_id=company_id,
+                        phone_e164=phone_e164,
+                        campaign_name=cfg.promo_campaign_name,
+                        secret_code=text[:64],
+                        discount_amount=discount_amount,
+                        discount_type=cfg.promo_discount_type,
+                        status="issued",
+                        issued_at=now,
+                        expires_at=expires_at,
+                        meta={"altegio_new_client_check": "no_records"},
+                    )
         else:
             expires_at = compute_expires_at(now, cfg.promo_validity_mode, cfg.promo_validity_days)
             candidate = PromoLead(
@@ -574,6 +668,7 @@ async def handle_promo_command(
                 status="issued",
                 issued_at=now,
                 expires_at=expires_at,
+                meta={"altegio_new_client_check": "disabled"},
             )
 
         # ── 3. Persist via savepoint — safe concurrent-insert handling ────────
@@ -608,6 +703,9 @@ async def handle_promo_command(
             if new_lead.status == "rejected_not_new":
                 reply = build_reply_rejected_not_new(cfg.promo_booking_url)
                 template_code = "wa_promo_lead_rejected_not_new"
+            elif new_lead.status == "cancelled" and new_lead.reject_reason == "altegio_new_client_check_failed":
+                reply = build_reply_new_client_check_failed()
+                template_code = "wa_promo_lead_manual_check"
             elif not card_issue_failed and cfg.promo_issue_loyalty_card_enabled and new_lead.loyalty_card_number:
                 reply = build_reply_issued_with_card(
                     new_lead.expires_at,
@@ -630,6 +728,16 @@ async def handle_promo_command(
             if lead is not None and lead.status in ("issued", "booked", "applied") and lead.expires_at > now:
                 reply = build_reply_already_issued(lead.expires_at, cfg.promo_booking_url)
                 template_code = "wa_promo_lead_already_issued"
+            elif lead is not None and lead.status == "rejected_not_new":
+                reply = build_reply_rejected_not_new(cfg.promo_booking_url)
+                template_code = "wa_promo_lead_rejected_not_new"
+            elif (
+                lead is not None
+                and lead.status == "cancelled"
+                and lead.reject_reason == "altegio_new_client_check_failed"
+            ):
+                reply = build_reply_new_client_check_failed()
+                template_code = "wa_promo_lead_manual_check"
             else:
                 reply = build_reply_expired()
                 template_code = "wa_promo_lead_expired"

@@ -128,6 +128,10 @@ class Settings(BaseSettings):
     # Default False: sends a safe informational reply only, no DB lead row.
     # Enable only after loyalty API integration is production-ready.
     promo_lead_funnel_enabled: bool = False
+    # Optional external new-client eligibility check via Altegio CRM history.
+    # Default False: keep local-only behaviour and make no Altegio API call.
+    # When True, any Altegio visit/record for the WhatsApp phone blocks issuance.
+    promo_check_new_client_in_altegio: bool = False
 
     # ---------------------------------------------------------------------------
     # Promo loyalty card issuance (requires promo_lead_funnel_enabled=True)
