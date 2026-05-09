@@ -523,25 +523,52 @@ concurrent inserts are protected via savepoint (`begin_nested`) with
 Note: the online booking form and the first confirmation email may still show
 regular prices. The discount is visible to staff in the Altegio CRM.
 
-**New-client eligibility note:** the current implementation checks only the local
-DB for prior attended visits. A future PR must verify new-client eligibility
-through a full Altegio CRM records check. If a client has any record in Altegio
-(attended, no-show, cancelled, non-attended) the promo should be rejected.
-Deleted records need separate API verification.
+**New-client eligibility check:** by default the promo funnel keeps the existing
+local-only check for prior attended visits and makes no extra Altegio API call.
+Set `PROMO_CHECK_NEW_CLIENT_IN_ALTEGIO=true` to run an external Altegio history
+check before issuing a new promo lead or loyalty card.
+
+When enabled, the funnel calls the documented phone-based history endpoint
+`POST /company/{location_id}/clients/visits/search` with `client_phone`. Any
+returned visit/record makes the client not eligible for this promo:
+`PromoLead.status='rejected_not_new'`, no loyalty card is issued, and the client
+receives the soft Neukunden rejection reply. The request sends no attendance or
+payment filters, so cancelled, no-show, waiting, confirmed, attended, paid, and
+unpaid records count when Altegio returns them.
+
+If the external check fails, the funnel fails closed: no discount promise is
+sent, no loyalty card is issued, and the `PromoLead.meta` stores
+`altegio_new_client_check_error` for manual follow-up. The customer receives a
+neutral manual-check reply.
+
+Deleted-record semantics depend on Altegio API behaviour. If this endpoint
+returns explicitly deleted records, the promo check treats them as evidence that
+the client is not new. If Altegio omits deleted records from this endpoint, that
+case remains invisible to the bot and should be verified with a real API smoke
+test before changing business policy.
+
+Existing active `issued` / `booked` / `applied` leads are not revoked by this
+check. A repeat secret word for an already issued lead only resends the existing
+active/card reply; retroactive cleanup is out of scope.
 
 **Out of scope for the current implementation:**
 - Retry worker for `apply_failed` leads
 - Customer notification on apply failure
 - Meta paid templates for promo notification
-- Full Altegio CRM history check for new-client validation
+- Changing existing issued leads retroactively
 - Enabling production flags without a completed smoke test
 
-**The Altegio endpoint is UNCONFIRMED** (source: developer discussion, not OpenAPI
-spec). Both feature gates must be explicitly enabled after verification.
+**The discount-apply Altegio endpoint is UNCONFIRMED** (source: developer
+discussion, not OpenAPI spec). Both discount-apply feature gates must be
+explicitly enabled after verification.
 
 ### Required environment variables
 
 ```bash
+# Optional new-client CRM history check for WhatsApp promo leads.
+# Default false keeps local-only behaviour and makes no Altegio API call.
+PROMO_CHECK_NEW_CLIENT_IN_ALTEGIO=false
+
 # Master gate — enable only after API is verified and smoke-tested
 PROMO_APPLY_DISCOUNT_ENABLED=true
 

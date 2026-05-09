@@ -19,6 +19,7 @@ Authorization: Bearer {partner_token},{user_token}
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import AsyncIterator
 from datetime import datetime, timezone
 from typing import Any
@@ -48,6 +49,10 @@ class AmbiguousRecordError(Exception):
     """
 
 
+class AltegioNewClientCheckError(Exception):
+    """Raised when the promo new-client CRM history check cannot be trusted."""
+
+
 def _auth_header() -> str:
     return f"Bearer {settings.altegio_partner_token},{settings.altegio_user_token}"
 
@@ -75,6 +80,65 @@ def _extract_records_data(payload: Any) -> list[dict[str, Any]]:
         rows.append(rec)
 
     return rows
+
+
+def _phone_digits(phone_e164: str) -> str:
+    digits = re.sub(r"\D+", "", phone_e164)
+    if not digits:
+        raise AltegioNewClientCheckError("invalid phone_e164: no digits found")
+    return digits
+
+
+def _extract_visit_search_records(payload: Any) -> list[dict[str, Any]]:
+    """Extract rows from POST /company/{location_id}/clients/visits/search.
+
+    Confirmed docs shape is {"data": {"records": [...]}}.  A list in "data"
+    is accepted as a compatibility fallback because older Altegio endpoints
+    in this project use that shape.
+    """
+    if not isinstance(payload, dict):
+        raise AltegioNewClientCheckError(
+            f"promo new-client check returned unexpected payload type {type(payload).__name__}"
+        )
+
+    data = payload.get("data")
+    if isinstance(data, dict):
+        records = data.get("records")
+    elif isinstance(data, list):
+        records = data
+    else:
+        raise AltegioNewClientCheckError(f"promo new-client check returned unexpected data type {type(data).__name__}")
+
+    if not isinstance(records, list):
+        raise AltegioNewClientCheckError(
+            f"promo new-client check returned unexpected records type {type(records).__name__}"
+        )
+
+    rows: list[dict[str, Any]] = []
+    for rec in records:
+        if not isinstance(rec, dict):
+            raise AltegioNewClientCheckError(
+                f"promo new-client check returned unexpected record type {type(rec).__name__}"
+            )
+        rows.append(rec)
+
+    return rows
+
+
+def _extract_positive_meta_count(payload: Any) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    meta = payload.get("meta")
+    if not isinstance(meta, dict):
+        return False
+    for key in ("total_count", "count"):
+        value = meta.get(key)
+        try:
+            if value is not None and int(value) > 0:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
 
 
 def _parse_record_starts_at(record_data: dict[str, Any]) -> datetime | None:
@@ -239,6 +303,59 @@ async def count_attended_client_visits(
             total += 1
 
     return total
+
+
+async def check_client_has_any_altegio_record(
+    phone_e164: str,
+    company_id: int,
+    timeout_sec: float = 15.0,
+) -> bool:
+    """Return True if Altegio CRM has any visit/record for this phone.
+
+    Uses the documented phone-based history endpoint:
+      POST /company/{location_id}/clients/visits/search
+
+    The request deliberately sends no attendance or payment filters, so cancelled,
+    no-show, waiting, confirmed, attended, unpaid, and paid visits all count when
+    Altegio returns them.  If Altegio returns explicitly deleted rows, they also
+    count as "not new" for the promo.  If Altegio omits deleted rows entirely,
+    that API behaviour is outside this wrapper's visibility.
+
+    Raises:
+        AltegioNewClientCheckError: on network, HTTP, JSON, or response-shape
+            errors. Callers must not treat such failures as "no records".
+    """
+    phone_digits = _phone_digits(phone_e164)
+    base = settings.altegio_api_base_url.rstrip("/")
+    url = f"{base}/company/{company_id}/clients/visits/search"
+    payload: dict[str, Any] = {
+        "client_id": None,
+        "client_phone": phone_digits,
+        "from": None,
+        "to": None,
+        "payment_statuses": [],
+        "attendance": None,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout_sec) as client:
+            resp = await client.post(url, headers=_headers(), json=payload)
+            resp.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        status = exc.response.status_code
+        raise AltegioNewClientCheckError(f"promo new-client check HTTP {status}: company={company_id}") from exc
+    except httpx.HTTPError as exc:
+        raise AltegioNewClientCheckError(f"promo new-client check network error: company={company_id}: {exc}") from exc
+
+    try:
+        response_payload = resp.json()
+    except Exception as exc:
+        raise AltegioNewClientCheckError(
+            f"promo new-client check returned invalid JSON: company={company_id}: {exc}"
+        ) from exc
+
+    records = _extract_visit_search_records(response_payload)
+    return bool(records) or _extract_positive_meta_count(response_payload)
 
 
 async def client_has_any_future_record(
