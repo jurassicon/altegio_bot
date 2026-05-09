@@ -517,7 +517,7 @@ lifecycle is managed separately.
 
 `scripts/find_promo_discount_smoke_candidate.py` is a **read-only** helper that
 queries the local DB for a PromoLead with all required IDs and a linked booking,
-then prints ready-to-copy commands for `smoke_apply_promo_discount.py`.
+then prints the dry-run command for `smoke_apply_promo_discount.py`.
 
 The script makes **no Altegio API calls**, applies **no discount**, and writes
 **nothing** to the database. It does not require `PROMO_APPLY_DISCOUNT_ENABLED`
@@ -532,13 +532,20 @@ docker compose exec -T altegio-api python -m altegio_bot.scripts.find_promo_disc
   --company-id 1 --phone +49...
 ```
 
-The output includes a dry-run command and a clearly labelled real-apply command
-(with a `DO NOT RUN UNTIL YOU VERIFIED THE IDS` warning). Use the dry-run
-command first to confirm the IDs look correct, then proceed to
-`smoke_apply_promo_discount.py --yes-apply` only after manual verification.
+**The `--yes-apply` command is intentionally not printed.** `Record` has no
+`created_at` column, so the helper cannot prove that a booking was created
+*after* the promo lead was issued. A booking that predates the promo would
+receive an unintended discount.
 
-**Note:** `Record` has no `created_at` column — a record may technically predate
-the promo issuance. Always verify the appointment date before running a real apply.
+Before constructing a `--yes-apply` command, manually verify in Altegio:
+1. The booking belongs to the promo client.
+2. The booking was created *after* the promo lead `issued_at`.
+3. The booked service is eligible for the promo (the helper prints allowlist diagnostics).
+
+The output includes:
+- the dry-run command (safe — no API call);
+- a service allowlist diagnostic (`allowed_service_match=yes/no/not_configured`);
+- an explanation of why the real apply command is omitted.
 
 ### Manual smoke test for promo discount application
 

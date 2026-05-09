@@ -10,7 +10,10 @@ Usage (local):
 Usage (Docker):
     docker compose exec -T altegio-api python -m altegio_bot.scripts.find_promo_discount_smoke_candidate
 
-The script prints ready-to-run commands for smoke_apply_promo_discount.py.
+The script prints the dry-run command for smoke_apply_promo_discount.py.
+The --yes-apply command is intentionally NOT printed: Record has no created_at,
+so the helper cannot prove a booking was created after the promo lead.
+
 It does not apply any discount and does not require PROMO_APPLY_DISCOUNT_ENABLED
 or PROMO_APPLY_DISCOUNT_API_VERIFIED to be set.
 
@@ -31,12 +34,17 @@ from typing import TYPE_CHECKING
 from sqlalchemy import select
 
 from altegio_bot.models.models import Client, PromoLead, Record, RecordService
+from altegio_bot.promo_discount_apply import get_promo_allowed_service_ids
 from altegio_bot.settings import settings
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
     from sqlalchemy.ext.asyncio import AsyncSession
+
+_PAGE_SIZE_MIN = 30
+_MAX_SCAN_MULTIPLIER = 20
+_MAX_SCAN_ABS = 200
 
 
 def _utcnow() -> datetime:
@@ -73,12 +81,20 @@ async def find_smoke_candidates(
     altegio_record_id is located via the Client phone. Leads without a matching
     Record are excluded.
 
+    Uses a paginated scan with a hard cap of max(limit*20, 200) rows so that
+    leads without matching Records near the top of the result set do not hide
+    valid candidates further down.
+
     NOTE: Record has no created_at column. The record may predate the promo
-    issuance. Verify the IDs manually before running with --yes-apply.
+    issuance. Callers must not construct --yes-apply commands without manual
+    verification in Altegio.
 
     Read-only: no DB writes, no Altegio API calls.
     """
-    stmt = (
+    page_size = max(limit * 3, _PAGE_SIZE_MIN)
+    max_scanned = max(limit * _MAX_SCAN_MULTIPLIER, _MAX_SCAN_ABS)
+
+    base_stmt = (
         select(PromoLead)
         .where(PromoLead.campaign_name == campaign_name)
         .where(PromoLead.status.in_(["issued", "booked"]))
@@ -89,40 +105,50 @@ async def find_smoke_candidates(
         .where(PromoLead.meta["loyalty_card_issued"].astext == "true")
         .where(PromoLead.meta["promo_card_deleted_at"].astext.is_(None))
         .order_by(PromoLead.created_at.desc())
-        .limit(limit * 3)
     )
 
     if company_id is not None:
-        stmt = stmt.where(PromoLead.company_id == company_id)
+        base_stmt = base_stmt.where(PromoLead.company_id == company_id)
     if phone is not None:
-        stmt = stmt.where(PromoLead.phone_e164 == phone)
-
-    leads = list((await session.execute(stmt)).scalars().all())
+        base_stmt = base_stmt.where(PromoLead.phone_e164 == phone)
 
     candidates: list[SmokeCandidate] = []
-    for lead in leads:
-        if len(candidates) >= limit:
+    offset = 0
+    total_scanned = 0
+
+    while len(candidates) < limit and total_scanned < max_scanned:
+        leads = list((await session.execute(base_stmt.limit(page_size).offset(offset))).scalars().all())
+        if not leads:
             break
 
-        record_stmt = (
-            select(Record)
-            .join(Client, Client.id == Record.client_id)
-            .where(Client.phone_e164 == lead.phone_e164)
-            .where(Client.company_id == lead.company_id)
-            .where(Record.company_id == lead.company_id)
-            .where(Record.is_deleted.is_(False))
-            .where(Record.altegio_record_id.is_not(None))
-            .order_by(Record.starts_at.desc())
-            .limit(1)
-        )
-        record = (await session.execute(record_stmt)).scalar_one_or_none()
-        if record is None:
-            continue
+        for lead in leads:
+            if len(candidates) >= limit or total_scanned >= max_scanned:
+                break
+            total_scanned += 1
 
-        svc_stmt = select(RecordService).where(RecordService.record_id == record.id)
-        services = list((await session.execute(svc_stmt)).scalars().all())
+            record_stmt = (
+                select(Record)
+                .join(Client, Client.id == Record.client_id)
+                .where(Client.phone_e164 == lead.phone_e164)
+                .where(Client.company_id == lead.company_id)
+                .where(Record.company_id == lead.company_id)
+                .where(Record.is_deleted.is_(False))
+                .where(Record.altegio_record_id.is_not(None))
+                .order_by(Record.starts_at.desc())
+                .limit(1)
+            )
+            record = (await session.execute(record_stmt)).scalar_one_or_none()
+            if record is None:
+                continue
 
-        candidates.append(SmokeCandidate(lead=lead, record=record, services=services))
+            svc_stmt = select(RecordService).where(RecordService.record_id == record.id)
+            services = list((await session.execute(svc_stmt)).scalars().all())
+
+            candidates.append(SmokeCandidate(lead=lead, record=record, services=services))
+
+        if len(leads) < page_size:
+            break
+        offset += len(leads)
 
     return candidates
 
@@ -138,23 +164,14 @@ def _dry_run_cmd(c: SmokeCandidate) -> str:
     )
 
 
-def _real_cmd(c: SmokeCandidate) -> str:
-    return (
-        "docker compose exec -T -e PROMO_APPLY_DISCOUNT_API_VERIFIED=true altegio-api"
-        " python -m altegio_bot.scripts.smoke_apply_promo_discount"
-        f" --location-id {c.lead.location_id}"
-        f" --card-id {c.lead.loyalty_card_id}"
-        f" --program-id {c.lead.discount_program_id}"
-        f" --record-id {c.record.altegio_record_id}"
-        " --yes-apply"
-    )
-
-
 def _print_candidate(c: SmokeCandidate, index: int) -> None:
     lead = c.lead
     record = c.record
     services_str = ", ".join(f"{s.service_id}:{s.title or '?'}" for s in c.services) if c.services else "(none)"
     starts_at_str = record.starts_at.isoformat() if record.starts_at else "(none)"
+
+    allowed_ids = get_promo_allowed_service_ids()
+    candidate_service_ids = {s.service_id for s in c.services}
 
     print(f"--- Candidate {index} ---")
     print(f"promo_lead_id={lead.id}")
@@ -170,16 +187,33 @@ def _print_candidate(c: SmokeCandidate, index: int) -> None:
     print(f"altegio_record_id={record.altegio_record_id}")
     print(f"record_starts_at={starts_at_str}")
     print(f"services={services_str}")
-    print(
-        "WARNING: Record.created_at is not available — the record may predate "
-        "promo issuance. Verify the IDs before running with --yes-apply."
-    )
+    print(f"allowed_service_ids={sorted(allowed_ids) if allowed_ids else '(not_configured)'}")
+    print(f"candidate_service_ids={sorted(candidate_service_ids) if candidate_service_ids else '(none)'}")
+
+    if not allowed_ids:
+        print("allowed_service_match=not_configured")
+        print("WARNING: PROMO_ALLOWED_SERVICE_IDS is empty — automatic apply would skip this record.")
+    elif candidate_service_ids & allowed_ids:
+        print("allowed_service_match=yes")
+    else:
+        print("allowed_service_match=no")
+        print("WARNING: This record has no services from PROMO_ALLOWED_SERVICE_IDS.")
+
     print()
     print("DRY-RUN COMMAND (no API call):")
     print(_dry_run_cmd(c))
     print()
-    print("REAL APPLY COMMAND — DO NOT RUN UNTIL YOU VERIFIED THE IDS:")
-    print(_real_cmd(c))
+    print("REAL APPLY COMMAND is intentionally not printed.")
+    print()
+    print(
+        "Reason:\n"
+        "Record.created_at is not available, so this helper cannot prove that the\n"
+        "booking was created after the promo lead.\n"
+        "\n"
+        "Manually verify in Altegio that this booking was created after the promo\n"
+        "lead was issued before running smoke_apply_promo_discount.py with the\n"
+        "apply flag."
+    )
     print()
 
 
