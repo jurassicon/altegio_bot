@@ -611,6 +611,63 @@ The cleanup script (`scripts/cleanup_expired_promo_cards.py`) only processes
 `booked`, `applied`, or `used` are intentionally excluded — their card
 lifecycle is managed separately.
 
+### Manual smoke test for promo new-client check
+
+`scripts/smoke_promo_new_client_check.py` is a **read-only** script for manually
+verifying the `POST /company/{location_id}/clients/visits/search` endpoint before
+enabling `PROMO_CHECK_NEW_CLIENT_IN_ALTEGIO=true` in production.
+
+**The script is read-only:** it makes no DB writes, creates no `PromoLead`,
+sends no WhatsApp message, issues no loyalty card, and does not modify any
+Altegio records. It only calls the Altegio visit-search endpoint and reports
+the boolean result.
+
+**This script does not enable `PROMO_CHECK_NEW_CLIENT_IN_ALTEGIO`** and does
+not affect the automatic promo funnel in any way.
+
+#### Run locally
+
+```bash
+uv run python -m altegio_bot.scripts.smoke_promo_new_client_check \
+  --location-id 9001 \
+  --phone +491234567890
+```
+
+#### Run on server
+
+```bash
+docker compose exec -T altegio-api \
+  python -m altegio_bot.scripts.smoke_promo_new_client_check \
+  --location-id 9001 \
+  --phone +491234567890
+```
+
+#### Expected output
+
+```
+Promo new-client check smoke test
+location_id=9001
+phone=+491234567890
+has_any_altegio_record=false   # or true
+```
+
+Exit code `0` for both found and not-found results; exit code `1` on API error.
+
+#### Before enabling `PROMO_CHECK_NEW_CLIENT_IN_ALTEGIO=true`
+
+Verify all of the following with a real API call:
+
+1. A phone with **no prior visits** returns `has_any_altegio_record=false`.
+2. A phone with **at least one prior visit** (any status: cancelled, no-show,
+   attended, waiting) returns `has_any_altegio_record=true`.
+3. The `--location-id` matches the value in `PROMO_LOCATION_ID_BY_COMPANY` for
+   the target company.
+4. No `AltegioNewClientCheckError` is reported (exit code 0).
+
+The script reports a boolean result only. To inspect the raw response shape,
+use the Altegio developer console or a tool such as `curl` / Postman against
+the same endpoint with the same authorization header.
+
 ### Finding a promo discount smoke-test candidate
 
 `scripts/find_promo_discount_smoke_candidate.py` is a **read-only** helper that
