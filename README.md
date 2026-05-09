@@ -456,3 +456,59 @@ This adds the `chatwoot_conversation_id` column to `whatsapp_events`.
 |---------|-----------|
 | `CHATWOOT_ENABLED=false` (default) | Exactly as before — Meta direct |
 | `CHATWOOT_ENABLED=true` + `WHATSAPP_PROVIDER=chatwoot_hybrid` | Dual-write enabled |
+
+## Promo discount application to visits
+
+When a new client books an appointment after receiving a secret-word promo, the
+system can automatically apply a loyalty discount program to that booking via
+Altegio API.
+
+**Disabled by default.** Enable only after a successful smoke test.
+
+### How it works
+
+1. Client sends secret word via WhatsApp → `PromoLead` created, loyalty card issued.
+2. Client books via online booking URL.
+3. Altegio sends a **record create** webhook.
+4. `inbox_worker` processes the webhook and calls `try_apply_promo_discount`.
+5. The function matches the booking to the client's active `PromoLead` by company_id
+   and phone number.
+6. If the service is in the allowlist, the discount program is applied via Altegio API.
+7. `PromoLead.status` advances: `issued → booked → applied`.
+
+**Update webhooks are intentionally ignored.** Only create webhooks trigger promo
+discount apply, to avoid accidentally applying a promo to a booking that was made
+before the promo was issued.
+
+**Customer notification is out of scope** for this implementation. After a successful
+apply, `PromoLead.meta.customer_notification` is set to `"out_of_scope"` as an
+explicit marker. Notification delivery is deferred to a future PR.
+
+Note: the online booking form and the first confirmation email may still show
+regular prices. The discount is visible to staff in the Altegio CRM.
+
+**The Altegio endpoint is UNCONFIRMED** (source: developer discussion, not OpenAPI
+spec). Both feature gates must be explicitly enabled after verification.
+
+### Required environment variables
+
+```bash
+# Master gate — enable only after API is verified and smoke-tested
+PROMO_APPLY_DISCOUNT_ENABLED=true
+
+# Endpoint verification gate — set True only after confirming the
+# POST /visit/loyalty/apply_discount_program/{location_id}/{card_id}/{program_id}
+# endpoint against Altegio API docs and completing a smoke test
+PROMO_APPLY_DISCOUNT_API_VERIFIED=true
+
+# Comma-separated Altegio service IDs eligible for the promo discount.
+# If empty, discount is never applied automatically (fail-closed).
+PROMO_ALLOWED_SERVICE_IDS=12345,67890
+```
+
+### Lifecycle after cleanup
+
+The cleanup script (`scripts/cleanup_expired_promo_cards.py`) only processes
+`status='issued'` leads that expired without booking. Leads with status
+`booked`, `applied`, or `used` are intentionally excluded — their card
+lifecycle is managed separately.

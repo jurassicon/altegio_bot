@@ -160,6 +160,23 @@ class Settings(BaseSettings):
     # non-production environment.
     promo_altegio_client_api_verified: bool = False
 
+    # ---------------------------------------------------------------------------
+    # Promo discount application to visits (requires promo_lead_funnel_enabled=True)
+    # ---------------------------------------------------------------------------
+    # Master gate. Default False: no discount is applied to bookings.
+    # Enable only after promo_apply_discount_api_verified is also True.
+    promo_apply_discount_enabled: bool = False
+    # Smoke-test gate for the UNCONFIRMED Altegio endpoint:
+    #   POST /visit/loyalty/apply_discount_program/{location_id}/{card_id}/{program_id}
+    # Default False: API call is blocked even when promo_apply_discount_enabled=True.
+    # Set True only after confirming the endpoint shape against Altegio API docs
+    # and completing a smoke test in a non-production environment.
+    promo_apply_discount_api_verified: bool = False
+    # Comma-separated Altegio service IDs eligible for the promo discount.
+    # If empty: discount is never applied automatically (fail-closed).
+    # Example: PROMO_ALLOWED_SERVICE_IDS=12345,67890
+    promo_allowed_service_ids: str = ""
+
     # Publicly accessible image URLs for newsletter template IMAGE HEADER components.
     # Meta Cloud API requires a permanent URL it can fetch and cache at send time.
     # Leave empty → worker fails the job fast (no silent blank-header send).

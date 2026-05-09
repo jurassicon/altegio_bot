@@ -16,6 +16,7 @@ from altegio_bot.db import SessionLocal
 from altegio_bot.message_planner import plan_jobs_for_record_event
 from altegio_bot.models.models import AltegioEvent, Client, Record, RecordService
 from altegio_bot.perf import perf_log
+from altegio_bot.promo_discount_apply import try_apply_promo_discount
 from altegio_bot.service_filter import record_has_allowed_service
 
 logger = logging.getLogger("inbox_worker")
@@ -389,6 +390,13 @@ async def handle_event(session: AsyncSession, event: AltegioEvent) -> None:
         record_obj = await session.get(Record, record_pk)
 
         if record_obj is not None and event_status is not None:
+            # Promo discount apply runs on create events only. Update webhooks are
+            # intentionally skipped to avoid applying promo to bookings that existed
+            # before the promo was issued.
+            normalized_status = _normalize_event_status(event_status)
+            if normalized_status == "create" and not record_obj.is_deleted:
+                await try_apply_promo_discount(session, record_obj, int(company_id))
+
             allowed = await record_has_allowed_service(
                 session=session,
                 company_id=int(record_obj.company_id),
