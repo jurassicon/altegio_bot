@@ -6,8 +6,12 @@ Covers:
     meta.discount_apply_error set, status remains booked.
 3.  No active PromoLead — no API call.
 4.  Expired PromoLead — no API call (excluded by SQL query).
-5.  Active issued lead + allowed service + verified API → applied, no OutboxMessage
-    (customer notification is out of scope for this implementation).
+5.  Active issued lead + allowed service + verified API → applied, MessageJob queued
+    for customer WhatsApp notification; lead.meta stores job_id and dedupe_key.
+18. Direct wrapper: success=false response → PromoDiscountApplyError.
+19. Direct wrapper: no success key in response → PromoDiscountApplyError.
+20. try_apply with API returning success=false: lead.status=apply_failed, no MessageJob.
+21. Idempotent notification: _ensure called twice for same lead → one MessageJob.
 6.  Active lead without loyalty_card_id — not found by SQL, no API call.
 7.  Active lead but service not in allowlist — no API call, meta.apply_skip_reason set.
 8.  API failure — status='apply_failed', meta.discount_apply_error set.
@@ -20,6 +24,11 @@ Covers:
 15. Direct wrapper: HTTP error → PromoDiscountApplyError.
 16. Direct wrapper: invalid JSON → PromoDiscountApplyError.
 17. Direct wrapper: unexpected response shape → PromoDiscountApplyError.
+22. Missing booking_created_at (None) → skip, apply_skip_reason set.
+23. booking_created_at before lead.issued_at → skip, predates promo lead.
+24. booking_created_at after lead.issued_at → apply proceeds normally.
+25. Booked lead bound to different record → finder returns None, no API call.
+26. Booked lead with same record → retry allowed, apply proceeds.
 """
 
 from __future__ import annotations
@@ -32,7 +41,7 @@ import httpx
 import pytest
 from sqlalchemy import select
 
-from altegio_bot.models.models import Client, OutboxMessage, PromoLead, Record, RecordService
+from altegio_bot.models.models import Client, MessageJob, PromoLead, Record, RecordService
 from altegio_bot.promo_discount_apply import (
     PromoDiscountApplyError,
     PromoDiscountApplyResult,
@@ -212,7 +221,7 @@ async def test_api_not_verified_blocks_call(session_maker) -> None:
 
             with patch("altegio_bot.promo_discount_apply.apply_promo_discount_to_visit", mock_api):
                 with _base_settings_ctx(promo_apply_discount_api_verified=False):
-                    await try_apply_promo_discount(session, record, _COMPANY)
+                    await try_apply_promo_discount(session, record, _COMPANY, booking_created_at=_NOW)
 
     mock_api.assert_not_called()
 
@@ -282,7 +291,7 @@ async def test_expired_lead_excluded(session_maker) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 5. Happy path: applied, no OutboxMessage (customer notification out of scope)
+# 5. Happy path: applied, MessageJob queued for customer notification
 # ---------------------------------------------------------------------------
 
 
@@ -301,7 +310,7 @@ async def test_happy_path_applies_discount(session_maker) -> None:
 
             with patch("altegio_bot.promo_discount_apply.apply_promo_discount_to_visit", mock_api):
                 with _base_settings_ctx():
-                    await try_apply_promo_discount(session, record, _COMPANY)
+                    await try_apply_promo_discount(session, record, _COMPANY, booking_created_at=_NOW)
 
     mock_api.assert_called_once_with(
         location_id=_LOCATION,
@@ -321,14 +330,20 @@ async def test_happy_path_applies_discount(session_maker) -> None:
     assert meta.get("discount_apply_altegio_record_id") == 777
     assert meta.get("discount_apply_card_id") == int(_CARD_ID)
     assert meta.get("discount_apply_program_id") == _PROGRAM_ID
-    assert meta.get("customer_notification") == "out_of_scope"
+    assert meta.get("customer_notification") == "queued"
+    assert meta.get("customer_notification_job_id") is not None
+    assert meta.get("customer_notification_created_at") is not None
+    assert meta.get("customer_notification_dedupe_key", "").startswith("promo_discount_applied:")
 
     async with session_maker() as s:
-        outbox = (
-            await s.execute(select(OutboxMessage).where(OutboxMessage.template_code == "wa_promo_discount_applied"))
+        job = (
+            await s.execute(select(MessageJob).where(MessageJob.job_type == "promo_discount_applied"))
         ).scalar_one_or_none()
 
-    assert outbox is None, "OutboxMessage must not be created (customer notification is out of scope)"
+    assert job is not None
+    assert job.client_id == 100
+    assert job.dedupe_key.startswith("promo_discount_applied:")
+    assert job.id == meta.get("customer_notification_job_id")
 
 
 # ---------------------------------------------------------------------------
@@ -376,7 +391,7 @@ async def test_service_not_allowed_skips_discount(session_maker) -> None:
 
             with patch("altegio_bot.promo_discount_apply.apply_promo_discount_to_visit", mock_api):
                 with _base_settings_ctx():
-                    await try_apply_promo_discount(session, record, _COMPANY)
+                    await try_apply_promo_discount(session, record, _COMPANY, booking_created_at=_NOW)
 
     mock_api.assert_not_called()
 
@@ -410,7 +425,7 @@ async def test_api_failure_sets_apply_failed(session_maker) -> None:
 
             with patch("altegio_bot.promo_discount_apply.apply_promo_discount_to_visit", mock_api):
                 with _base_settings_ctx():
-                    await try_apply_promo_discount(session, record, _COMPANY)
+                    await try_apply_promo_discount(session, record, _COMPANY, booking_created_at=_NOW)
 
     mock_api.assert_called_once()
 
@@ -498,7 +513,7 @@ async def test_prior_attended_visit_skips_discount(session_maker) -> None:
 
             with patch("altegio_bot.promo_discount_apply.apply_promo_discount_to_visit", mock_api):
                 with _base_settings_ctx():
-                    await try_apply_promo_discount(session, current_record, _COMPANY)
+                    await try_apply_promo_discount(session, current_record, _COMPANY, booking_created_at=_NOW)
 
     mock_api.assert_not_called()
 
@@ -702,3 +717,352 @@ async def test_wrapper_unexpected_shape_raises() -> None:
                     program_id=1,
                     record_id=777,
                 )
+
+
+# ---------------------------------------------------------------------------
+# 18. Wrapper: success=false → PromoDiscountApplyError
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_wrapper_success_false_raises_error() -> None:
+    """Altegio response with success=false → PromoDiscountApplyError (fail-closed)."""
+    mock_response = MagicMock()
+    mock_response.raise_for_status = MagicMock()
+    mock_response.json.return_value = {"success": False, "error": "card already used"}
+
+    with patch("httpx.AsyncClient") as mock_client_cls:
+        mock_client = AsyncMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=None)
+        mock_client.post = AsyncMock(return_value=mock_response)
+        mock_client_cls.return_value = mock_client
+
+        with patch.object(settings, "promo_apply_discount_api_verified", True):
+            with pytest.raises(PromoDiscountApplyError, match="unsuccessful response"):
+                await apply_promo_discount_to_visit(
+                    location_id=9001,
+                    card_id=555,
+                    program_id=1,
+                    record_id=777,
+                )
+
+
+# ---------------------------------------------------------------------------
+# 19. Wrapper: no success key → PromoDiscountApplyError
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_wrapper_no_success_key_raises_error() -> None:
+    """Altegio response without 'success' key → PromoDiscountApplyError (fail-closed)."""
+    mock_response = MagicMock()
+    mock_response.raise_for_status = MagicMock()
+    mock_response.json.return_value = {"data": {"id": 42}}
+
+    with patch("httpx.AsyncClient") as mock_client_cls:
+        mock_client = AsyncMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=None)
+        mock_client.post = AsyncMock(return_value=mock_response)
+        mock_client_cls.return_value = mock_client
+
+        with patch.object(settings, "promo_apply_discount_api_verified", True):
+            with pytest.raises(PromoDiscountApplyError, match="unsuccessful response"):
+                await apply_promo_discount_to_visit(
+                    location_id=9001,
+                    card_id=555,
+                    program_id=1,
+                    record_id=777,
+                )
+
+
+# ---------------------------------------------------------------------------
+# 20. try_apply with API returning success=false → apply_failed, no MessageJob
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_apply_failed_when_api_returns_success_false(session_maker) -> None:
+    """When Altegio returns success=false, lead→apply_failed and no MessageJob created."""
+    mock_api = AsyncMock(side_effect=PromoDiscountApplyError("unsuccessful response: success=false"))
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_client(session)
+            record = await _seed_record(session, altegio_record_id=888)
+            await _seed_service(session)
+            lead = _make_lead()
+            session.add(lead)
+            await session.flush()
+
+            with patch("altegio_bot.promo_discount_apply.apply_promo_discount_to_visit", mock_api):
+                with _base_settings_ctx():
+                    await try_apply_promo_discount(session, record, _COMPANY, booking_created_at=_NOW)
+
+    async with session_maker() as s:
+        lead = (await s.execute(select(PromoLead).where(PromoLead.phone_e164 == _PHONE))).scalar_one()
+        job = (
+            await s.execute(select(MessageJob).where(MessageJob.job_type == "promo_discount_applied"))
+        ).scalar_one_or_none()
+
+    assert lead.status == "apply_failed"
+    meta = lead.meta or {}
+    assert "discount_apply_error" in meta
+    assert "unsuccessful response" in meta["discount_apply_error"]
+    assert job is None
+
+
+# ---------------------------------------------------------------------------
+# 21. Idempotent notification: _ensure called twice → one MessageJob
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_ensure_notification_job_idempotent(session_maker) -> None:
+    """_ensure_promo_discount_notification_job is idempotent: calling twice creates one job."""
+    from datetime import timezone
+
+    from altegio_bot.promo_discount_apply import _ensure_promo_discount_notification_job
+
+    _now = datetime(2026, 5, 9, 12, 0, 0, tzinfo=timezone.utc)
+
+    async with session_maker() as session:
+        async with session.begin():
+            client = await _seed_client(session)
+            record = await _seed_record(session)
+            lead = _make_lead()
+            session.add(lead)
+            await session.flush()
+
+            await _ensure_promo_discount_notification_job(session, lead, client, record, _PHONE, _now)
+            first_job_id = lead.meta.get("customer_notification_job_id")
+
+            await _ensure_promo_discount_notification_job(session, lead, client, record, _PHONE, _now)
+            second_job_id = lead.meta.get("customer_notification_job_id")
+
+    assert first_job_id is not None
+    assert second_job_id == first_job_id
+
+    async with session_maker() as s:
+        jobs = list(
+            (await s.execute(select(MessageJob).where(MessageJob.job_type == "promo_discount_applied"))).scalars().all()
+        )
+    assert len(jobs) == 1
+
+
+# ---------------------------------------------------------------------------
+# 22. Missing booking_created_at → fail-closed, apply_skip_reason set
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_missing_booking_timestamp_skips_apply(session_maker) -> None:
+    """None booking_created_at → skip (fail-closed), no API call, apply_skip_reason set."""
+    mock_api = AsyncMock(side_effect=RuntimeError("must not be called"))
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_client(session)
+            record = await _seed_record(session)
+            await _seed_service(session)
+            lead = _make_lead()
+            session.add(lead)
+            await session.flush()
+
+            with patch("altegio_bot.promo_discount_apply.apply_promo_discount_to_visit", mock_api):
+                with _base_settings_ctx():
+                    await try_apply_promo_discount(session, record, _COMPANY, booking_created_at=None)
+
+    mock_api.assert_not_called()
+
+    async with session_maker() as s:
+        lead = (await s.execute(select(PromoLead).where(PromoLead.phone_e164 == _PHONE))).scalar_one_or_none()
+        job = (
+            await s.execute(select(MessageJob).where(MessageJob.job_type == "promo_discount_applied"))
+        ).scalar_one_or_none()
+
+    assert lead is not None
+    assert lead.status == "issued"
+    assert "missing booking created timestamp" in (lead.meta or {}).get("apply_skip_reason", "")
+    assert job is None
+
+
+# ---------------------------------------------------------------------------
+# 23. booking_created_at before lead.issued_at → skip, predates promo
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_booking_predates_promo_skips_apply(session_maker) -> None:
+    """booking_created_at before lead.issued_at → skip, meta records both timestamps."""
+    mock_api = AsyncMock(side_effect=RuntimeError("must not be called"))
+
+    promo_issued_at = datetime(2026, 5, 8, 12, 0, 0, tzinfo=_UTC)
+    booking_ts = datetime(2026, 5, 8, 11, 0, 0, tzinfo=_UTC)  # 1 hour before promo issued
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_client(session)
+            record = await _seed_record(session)
+            await _seed_service(session)
+            lead = PromoLead(
+                company_id=_COMPANY,
+                phone_e164=_PHONE,
+                campaign_name="welcome_discount",
+                secret_code="aktion",
+                discount_amount=Decimal("15"),
+                discount_type="fixed",
+                status="issued",
+                issued_at=promo_issued_at,
+                expires_at=_FUTURE,
+                loyalty_card_id=_CARD_ID,
+                location_id=_LOCATION,
+                discount_program_id=_PROGRAM_ID,
+                meta={"loyalty_card_issued": True},
+            )
+            session.add(lead)
+            await session.flush()
+
+            with patch("altegio_bot.promo_discount_apply.apply_promo_discount_to_visit", mock_api):
+                with _base_settings_ctx():
+                    await try_apply_promo_discount(session, record, _COMPANY, booking_created_at=booking_ts)
+
+    mock_api.assert_not_called()
+
+    async with session_maker() as s:
+        lead = (await s.execute(select(PromoLead).where(PromoLead.phone_e164 == _PHONE))).scalar_one_or_none()
+        job = (
+            await s.execute(select(MessageJob).where(MessageJob.job_type == "promo_discount_applied"))
+        ).scalar_one_or_none()
+
+    assert lead is not None
+    assert lead.status == "issued"
+    meta = lead.meta or {}
+    assert "predates promo lead" in meta.get("apply_skip_reason", "")
+    assert meta.get("booking_created_at") is not None
+    assert meta.get("promo_issued_at") is not None
+    assert job is None
+
+
+# ---------------------------------------------------------------------------
+# 24. booking_created_at after lead.issued_at → apply proceeds
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_booking_after_promo_proceeds(session_maker) -> None:
+    """booking_created_at after lead.issued_at → timestamp guard passes, apply succeeds."""
+    mock_api = AsyncMock(return_value=PromoDiscountApplyResult(applied=True, raw={"success": True}))
+
+    promo_issued_at = datetime(2026, 5, 8, 12, 0, 0, tzinfo=_UTC)
+    booking_ts = datetime(2026, 5, 8, 12, 1, 0, tzinfo=_UTC)  # 1 minute after promo issued
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_client(session)
+            record = await _seed_record(session, altegio_record_id=555)
+            await _seed_service(session)
+            lead = PromoLead(
+                company_id=_COMPANY,
+                phone_e164=_PHONE,
+                campaign_name="welcome_discount",
+                secret_code="aktion",
+                discount_amount=Decimal("15"),
+                discount_type="fixed",
+                status="issued",
+                issued_at=promo_issued_at,
+                expires_at=_FUTURE,
+                loyalty_card_id=_CARD_ID,
+                location_id=_LOCATION,
+                discount_program_id=_PROGRAM_ID,
+                meta={"loyalty_card_issued": True},
+            )
+            session.add(lead)
+            await session.flush()
+
+            with patch("altegio_bot.promo_discount_apply.apply_promo_discount_to_visit", mock_api):
+                with _base_settings_ctx():
+                    await try_apply_promo_discount(session, record, _COMPANY, booking_created_at=booking_ts)
+
+    mock_api.assert_called_once()
+
+    async with session_maker() as s:
+        lead = (await s.execute(select(PromoLead).where(PromoLead.phone_e164 == _PHONE))).scalar_one_or_none()
+
+    assert lead is not None
+    assert lead.status == "applied"
+
+
+# ---------------------------------------------------------------------------
+# 25. Booked lead bound to different record → skip, no API call
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_booked_lead_different_record_skips(session_maker) -> None:
+    """A booked lead already bound to old_record must not be rebound to current_record."""
+    mock_api = AsyncMock(side_effect=RuntimeError("must not be called"))
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_client(session)
+            old_record = await _seed_record(session, record_id=300, altegio_record_id=3001)
+            current_record = await _seed_record(session, record_id=400, altegio_record_id=4001)
+            await _seed_service(session, record_id=400)
+            lead = _make_lead(status="booked")
+            lead.record_id = old_record.id
+            lead.altegio_record_id = old_record.altegio_record_id
+            session.add(lead)
+            await session.flush()
+
+            with patch("altegio_bot.promo_discount_apply.apply_promo_discount_to_visit", mock_api):
+                with _base_settings_ctx():
+                    await try_apply_promo_discount(session, current_record, _COMPANY, booking_created_at=_NOW)
+
+    mock_api.assert_not_called()
+
+    async with session_maker() as s:
+        lead = (await s.execute(select(PromoLead).where(PromoLead.phone_e164 == _PHONE))).scalar_one_or_none()
+        job = (
+            await s.execute(select(MessageJob).where(MessageJob.job_type == "promo_discount_applied"))
+        ).scalar_one_or_none()
+
+    assert lead is not None
+    assert lead.status == "booked"
+    assert lead.record_id == 300  # unchanged
+    assert job is None
+
+
+# ---------------------------------------------------------------------------
+# 26. Booked lead same record → retry allowed, apply proceeds
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_booked_lead_same_record_retry_allowed(session_maker) -> None:
+    """A booked lead with same record_id is eligible for retry → apply proceeds."""
+    mock_api = AsyncMock(return_value=PromoDiscountApplyResult(applied=True, raw={"success": True}))
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_client(session)
+            record = await _seed_record(session, altegio_record_id=777)
+            await _seed_service(session)
+            lead = _make_lead(status="booked")
+            lead.record_id = record.id
+            lead.altegio_record_id = record.altegio_record_id
+            session.add(lead)
+            await session.flush()
+
+            with patch("altegio_bot.promo_discount_apply.apply_promo_discount_to_visit", mock_api):
+                with _base_settings_ctx():
+                    await try_apply_promo_discount(session, record, _COMPANY, booking_created_at=_NOW)
+
+    mock_api.assert_called_once()
+
+    async with session_maker() as s:
+        lead = (await s.execute(select(PromoLead).where(PromoLead.phone_e164 == _PHONE))).scalar_one_or_none()
+
+    assert lead is not None
+    assert lead.status == "applied"

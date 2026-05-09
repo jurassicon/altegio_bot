@@ -475,17 +475,66 @@ Altegio API.
    and phone number.
 6. If the service is in the allowlist, the discount program is applied via Altegio API.
 7. `PromoLead.status` advances: `issued → booked → applied`.
+8. A `MessageJob` is queued; `outbox_worker` sends the client a German WhatsApp confirmation.
 
 **Update webhooks are intentionally ignored.** Only create webhooks trigger promo
 discount apply, to avoid accidentally applying a promo to a booking that was made
 before the promo was issued.
 
-**Customer notification is out of scope** for this implementation. After a successful
-apply, `PromoLead.meta.customer_notification` is set to `"out_of_scope"` as an
-explicit marker. Notification delivery is deferred to a future PR.
+**Booking created timestamp guard:** automatic apply requires a confirmed
+`booking_created_at` — the actual time the booking was created in Altegio, not
+the time the webhook was received by the bot. Altegio record create webhooks
+currently do not include a confirmed booking creation timestamp (no `created_at`,
+`create_date`, or `datetime_created` field has been observed). The
+`extract_booking_created_at` helper therefore returns `None` (fail-closed), and
+`try_apply_promo_discount` skips the apply with
+`PromoLead.meta.apply_skip_reason = 'missing booking created timestamp'`.
+
+`event.received_at` is an audit timestamp that records when our bot received the
+webhook. It must not be used as the booking creation time: a delayed or
+backfilled create webhook for a booking that predates the promo could arrive
+after `PromoLead.issued_at`, making `received_at >= issued_at` true while the
+booking itself predates the promo. When a confirmed `booking_created_at` field
+becomes available in the Altegio API, update `extract_booking_created_at` to
+extract it and this guard will start gating on the actual creation time.
+
+**Booked-lead rebinding guard:** a `PromoLead` with `status='booked'` is only
+eligible for retry against the same stored record (`lead.record_id == record.id`
+or `lead.altegio_record_id == record.altegio_record_id`). A booked lead bound to
+a different booking is silently skipped so the original attribution is never
+overwritten.
+
+**Customer notification:** after a successful apply, a `MessageJob` with
+`job_type='promo_discount_applied'` is queued for immediate delivery. The
+`outbox_worker` sends a free-form German WhatsApp message confirming the discount
+to the client. `MessageJob.dedupe_key` prevents duplicate jobs on webhook retries;
+concurrent inserts are protected via savepoint (`begin_nested`) with
+`IntegrityError` recovery. Delivery status is reconciled in `PromoLead.meta`:
+
+| Event | `customer_notification` |
+|---|---|
+| MessageJob created | `queued` |
+| outbox_worker: sent | `sent` |
+| outbox_worker: final failure | `failed` |
+| outbox_worker: no active sender | `failed` |
+| outbox_worker: missing body | `failed` |
+| outbox_worker: retryable failure | `queued` (+ `customer_notification_last_error`) |
 
 Note: the online booking form and the first confirmation email may still show
 regular prices. The discount is visible to staff in the Altegio CRM.
+
+**New-client eligibility note:** the current implementation checks only the local
+DB for prior attended visits. A future PR must verify new-client eligibility
+through a full Altegio CRM records check. If a client has any record in Altegio
+(attended, no-show, cancelled, non-attended) the promo should be rejected.
+Deleted records need separate API verification.
+
+**Out of scope for the current implementation:**
+- Retry worker for `apply_failed` leads
+- Customer notification on apply failure
+- Meta paid templates for promo notification
+- Full Altegio CRM history check for new-client validation
+- Enabling production flags without a completed smoke test
 
 **The Altegio endpoint is UNCONFIRMED** (source: developer discussion, not OpenAPI
 spec). Both feature gates must be explicitly enabled after verification.

@@ -45,6 +45,7 @@ from altegio_bot.models.models import (
     MessageJob,
     MessageTemplate,
     OutboxMessage,
+    PromoLead,
     Record,
     RecordService,
 )
@@ -834,6 +835,56 @@ async def _count_131026_failures(
     return result.scalar_one()
 
 
+async def _update_promo_lead_notification_meta(
+    session: AsyncSession,
+    promo_lead_id: Any,
+    status: str,
+    *,
+    error: str | None = None,
+    provider_message_id: str | None = None,
+    now: datetime,
+    job_id: int,
+) -> None:
+    """Best-effort update of PromoLead.meta notification status. Never raises."""
+    if promo_lead_id is None:
+        return
+    try:
+        lead = await session.get(PromoLead, int(promo_lead_id))
+        if lead is None:
+            logger.warning(
+                "promo_discount_applied: PromoLead not found promo_lead_id=%s job_id=%s",
+                promo_lead_id,
+                job_id,
+            )
+            return
+        meta = lead.meta or {}
+        if status == "sent":
+            lead.meta = {
+                **meta,
+                "customer_notification": "sent",
+                "customer_notification_sent_at": now.isoformat(),
+                "customer_notification_provider_message_id": provider_message_id,
+            }
+        elif status == "failed":
+            update: dict[str, Any] = {
+                **meta,
+                "customer_notification": "failed",
+                "customer_notification_failed_at": now.isoformat(),
+            }
+            if error is not None:
+                update["customer_notification_error"] = error
+            lead.meta = update
+        elif status == "retrying":
+            if error is not None:
+                lead.meta = {**meta, "customer_notification_last_error": error}
+    except Exception as exc:
+        logger.warning(
+            "promo_discount_applied: could not update PromoLead meta job_id=%s: %s",
+            job_id,
+            exc,
+        )
+
+
 async def process_job_in_session(
     session: AsyncSession,
     job_id: int,
@@ -1300,6 +1351,145 @@ async def _run_job_logic(
         job.locked_at = None
         job.run_at = delay_until
         return
+
+    # ── promo_discount_applied: free-form text, no MessageTemplate or Meta template ──
+    if job.job_type == "promo_discount_applied":
+        _pd_payload = getattr(job, "payload", None) or {}
+        _pd_promo_lead_id = _pd_payload.get("promo_lead_id")  # extracted early for reconciliation
+        _pd_body = _pd_payload.get("body", "")
+        if not _pd_body:
+            job.status = "failed"
+            job.locked_at = None
+            job.last_error = "promo_discount_applied: missing body in payload"
+            _pd_now = utcnow()
+            await _update_promo_lead_notification_meta(
+                session,
+                _pd_promo_lead_id,
+                "failed",
+                error=job.last_error,
+                now=_pd_now,
+                job_id=job.id,
+            )
+            return None
+        _pd_attempts = getattr(job, "attempts", 0) + 1
+        setattr(job, "attempts", _pd_attempts)
+        _pd_sender_id = await pick_sender_id(
+            session=session,
+            company_id=job.company_id,
+            sender_code="default",
+        )
+        if _pd_sender_id is None:
+            job.status = "failed"
+            job.locked_at = None
+            job.last_error = "promo_discount_applied: no active sender for company"
+            _pd_now = utcnow()
+            await _update_promo_lead_notification_meta(
+                session,
+                _pd_promo_lead_id,
+                "failed",
+                error=job.last_error,
+                now=_pd_now,
+                job_id=job.id,
+            )
+            return None
+
+        contact_name = client.display_name if client else None
+        msg_id, err = await safe_send(
+            provider=provider,
+            sender_id=_pd_sender_id,
+            phone=phone,
+            text=_pd_body,
+            contact_name=contact_name,
+            company_id=job.company_id,
+        )
+        _pd_now = utcnow()
+        _pd_send_meta: dict[str, Any] = {"send_type": "text"}
+
+        if err is not None:
+            session.add(
+                OutboxMessage(
+                    company_id=job.company_id,
+                    client_id=(client.id if client else None),
+                    record_id=(record.id if record else None),
+                    job_id=job.id,
+                    sender_id=_pd_sender_id,
+                    phone_e164=phone,
+                    template_code=job.job_type,
+                    language="de",
+                    body=_pd_body,
+                    status="failed",
+                    error=err,
+                    provider_message_id=msg_id,
+                    scheduled_at=job.run_at,
+                    sent_at=_pd_now,
+                    meta=_pd_send_meta,
+                )
+            )
+            if _is_token_expired_error(err):
+                _mark_token_expired()
+                job.status = "queued"
+                job.locked_at = None
+                job.run_at = _pd_now + timedelta(seconds=TOKEN_EXPIRED_RETRY_SECONDS)
+                job.last_error = f"Send blocked: {err}"
+            elif _pd_attempts >= max_attempts:
+                job.status = "failed"
+                job.locked_at = None
+                job.last_error = f"Send failed: {err}"
+                await _update_promo_lead_notification_meta(
+                    session,
+                    _pd_promo_lead_id,
+                    "failed",
+                    error=err,
+                    now=_pd_now,
+                    job_id=job.id,
+                )
+            else:
+                job.last_error = f"Send failed: {err}"
+                job.status = "queued"
+                job.locked_at = None
+                job.run_at = _pd_now + timedelta(seconds=_retry_delay_seconds(_pd_attempts))
+                await _update_promo_lead_notification_meta(
+                    session,
+                    _pd_promo_lead_id,
+                    "retrying",
+                    error=err,
+                    now=_pd_now,
+                    job_id=job.id,
+                )
+            return None
+
+        out = OutboxMessage(
+            company_id=job.company_id,
+            client_id=(client.id if client else None),
+            record_id=(record.id if record else None),
+            job_id=job.id,
+            sender_id=_pd_sender_id,
+            phone_e164=phone,
+            template_code=job.job_type,
+            language="de",
+            body=_pd_body,
+            status="sent",
+            error=None,
+            provider_message_id=msg_id,
+            scheduled_at=job.run_at,
+            sent_at=_pd_now,
+            meta=_pd_send_meta,
+        )
+        session.add(out)
+        job.status = "done"
+        job.locked_at = None
+        job.last_error = None
+        logger.info("promo_discount_applied: sent job_id=%s phone=%s", job.id, phone)
+
+        await _update_promo_lead_notification_meta(
+            session,
+            _pd_promo_lead_id,
+            "sent",
+            provider_message_id=msg_id,
+            now=_pd_now,
+            job_id=job.id,
+        )
+        return None
 
     try:
         body, sender_id, lang, msg_ctx = await _render_message(
