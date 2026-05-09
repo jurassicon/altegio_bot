@@ -37,7 +37,7 @@ def _single_page(records: list[dict]) -> dict:
     return {"data": records}
 
 
-def _visit_search(records: list[dict], *, total_count: int | None = None) -> dict:
+def _visit_search(records: list[dict], *, total_count: object | None = None) -> dict:
     payload = {"data": {"records": records}}
     if total_count is not None:
         payload["meta"] = {"total_count": total_count}
@@ -56,7 +56,7 @@ async def test_check_client_has_any_altegio_record_returns_true_for_any_record(
 ) -> None:
     _mock_settings(monkeypatch)
 
-    route = respx.post(f"{_BASE}/company/1/clients/visits/search").mock(
+    route = respx.post(f"{_BASE}/company/9001/clients/visits/search").mock(
         return_value=httpx.Response(
             200,
             json=_visit_search([{"id": 10, "deleted": True}], total_count=1),
@@ -65,17 +65,19 @@ async def test_check_client_has_any_altegio_record_returns_true_for_any_record(
 
     has_records = await records_mod.check_client_has_any_altegio_record(
         phone_e164="+49 (160) 000-0099",
-        company_id=1,
+        location_id=9001,
     )
 
     assert has_records is True
     assert route.called
     request = route.calls[0].request
-    assert request.url.path == "/api/v1/company/1/clients/visits/search"
+    assert request.url.path == "/api/v1/company/9001/clients/visits/search"
     request_payload = json.loads(request.content)
-    assert request_payload["client_phone"] == "491600000099"
-    assert request_payload["attendance"] is None
-    assert request_payload["payment_statuses"] == []
+    assert request_payload == {
+        "client_phone": "491600000099",
+        "payment_statuses": [],
+    }
+    assert all(value is not None for value in request_payload.values())
 
 
 @pytest.mark.asyncio
@@ -85,16 +87,71 @@ async def test_check_client_has_any_altegio_record_returns_false_for_empty_recor
 ) -> None:
     _mock_settings(monkeypatch)
 
-    respx.post(f"{_BASE}/company/1/clients/visits/search").mock(
+    respx.post(f"{_BASE}/company/9001/clients/visits/search").mock(
         return_value=httpx.Response(200, json=_visit_search([], total_count=0))
     )
 
     has_records = await records_mod.check_client_has_any_altegio_record(
         phone_e164="+491600000099",
-        company_id=1,
+        location_id=9001,
     )
 
     assert has_records is False
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_check_client_has_any_altegio_record_returns_true_for_positive_meta_count(
+    monkeypatch,
+) -> None:
+    _mock_settings(monkeypatch)
+
+    respx.post(f"{_BASE}/company/9001/clients/visits/search").mock(
+        return_value=httpx.Response(200, json=_visit_search([], total_count=1))
+    )
+
+    has_records = await records_mod.check_client_has_any_altegio_record(
+        phone_e164="+491600000099",
+        location_id=9001,
+    )
+
+    assert has_records is True
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_check_client_has_any_altegio_record_raises_for_broken_meta_count(
+    monkeypatch,
+) -> None:
+    _mock_settings(monkeypatch)
+
+    respx.post(f"{_BASE}/company/9001/clients/visits/search").mock(
+        return_value=httpx.Response(200, json=_visit_search([], total_count="broken"))
+    )
+
+    with pytest.raises(AltegioNewClientCheckError, match="invalid meta.total_count"):
+        await records_mod.check_client_has_any_altegio_record(
+            phone_e164="+491600000099",
+            location_id=9001,
+        )
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_check_client_has_any_altegio_record_raises_for_broken_meta_even_with_records(
+    monkeypatch,
+) -> None:
+    _mock_settings(monkeypatch)
+
+    respx.post(f"{_BASE}/company/9001/clients/visits/search").mock(
+        return_value=httpx.Response(200, json=_visit_search([{"id": 10}], total_count="broken"))
+    )
+
+    with pytest.raises(AltegioNewClientCheckError, match="invalid meta.total_count"):
+        await records_mod.check_client_has_any_altegio_record(
+            phone_e164="+491600000099",
+            location_id=9001,
+        )
 
 
 @pytest.mark.asyncio
@@ -104,14 +161,14 @@ async def test_check_client_has_any_altegio_record_raises_for_malformed_response
 ) -> None:
     _mock_settings(monkeypatch)
 
-    respx.post(f"{_BASE}/company/1/clients/visits/search").mock(
+    respx.post(f"{_BASE}/company/9001/clients/visits/search").mock(
         return_value=httpx.Response(200, json={"data": {"records": {"id": 10}}})
     )
 
     with pytest.raises(AltegioNewClientCheckError, match="records type dict"):
         await records_mod.check_client_has_any_altegio_record(
             phone_e164="+491600000099",
-            company_id=1,
+            location_id=9001,
         )
 
 
@@ -122,18 +179,19 @@ async def test_check_client_has_any_altegio_record_wraps_http_error_without_toke
 ) -> None:
     _mock_settings(monkeypatch)
 
-    respx.post(f"{_BASE}/company/1/clients/visits/search").mock(
+    respx.post(f"{_BASE}/company/9001/clients/visits/search").mock(
         return_value=httpx.Response(500, json={"error": "boom"})
     )
 
     with pytest.raises(AltegioNewClientCheckError) as exc_info:
         await records_mod.check_client_has_any_altegio_record(
             phone_e164="+491600000099",
-            company_id=1,
+            location_id=9001,
         )
 
     error_text = str(exc_info.value)
     assert "HTTP 500" in error_text
+    assert "location_id=9001" in error_text
     assert "partner-token" not in error_text
     assert "user-token" not in error_text
 

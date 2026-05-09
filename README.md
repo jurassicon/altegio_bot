@@ -529,17 +529,26 @@ Set `PROMO_CHECK_NEW_CLIENT_IN_ALTEGIO=true` to run an external Altegio history
 check before issuing a new promo lead or loyalty card.
 
 When enabled, the funnel calls the documented phone-based history endpoint
-`POST /company/{location_id}/clients/visits/search` with `client_phone`. Any
-returned visit/record makes the client not eligible for this promo:
+`POST /company/{location_id}/clients/visits/search` with `client_phone`.
+`location_id` is resolved from `PROMO_LOCATION_ID_BY_COMPANY`; `company_id` is
+not used as the path parameter. Missing or invalid mapping fails closed before
+any Altegio API call. Any returned visit/record makes the client not eligible for this promo:
 `PromoLead.status='rejected_not_new'`, no loyalty card is issued, and the client
-receives the soft Neukunden rejection reply. The request sends no attendance or
-payment filters, so cancelled, no-show, waiting, confirmed, attended, paid, and
-unpaid records count when Altegio returns them.
+receives the soft Neukunden rejection reply. The request sends only
+`client_phone` and `payment_statuses=[]`, with no explicit `null` filters, so
+cancelled, no-show, waiting, confirmed, attended, paid, and unpaid records count
+when Altegio returns them.
 
 If the external check fails, the funnel fails closed: no discount promise is
 sent, no loyalty card is issued, and the `PromoLead.meta` stores
 `altegio_new_client_check_error` for manual follow-up. The customer receives a
-neutral manual-check reply.
+neutral manual-check reply. There is no automatic retry for
+`altegio_new_client_check_failed`; ops/manual follow-up is required until a
+future retry or manual reset flow exists.
+
+For newly issued leads where the external check is disabled,
+`PromoLead.meta.altegio_new_client_check = 'disabled'`. When enabled and no
+records are found, the value is `no_records`.
 
 Deleted-record semantics depend on Altegio API behaviour. If this endpoint
 returns explicitly deleted records, the promo check treats them as evidence that
@@ -555,6 +564,7 @@ active/card reply; retroactive cleanup is out of scope.
 - Retry worker for `apply_failed` leads
 - Customer notification on apply failure
 - Meta paid templates for promo notification
+- Automatic retry/manual reset for `altegio_new_client_check_failed`
 - Changing existing issued leads retroactively
 - Enabling production flags without a completed smoke test
 
@@ -567,7 +577,12 @@ explicitly enabled after verification.
 ```bash
 # Optional new-client CRM history check for WhatsApp promo leads.
 # Default false keeps local-only behaviour and makes no Altegio API call.
+# If true, PROMO_LOCATION_ID_BY_COMPANY must map company_id to Altegio location_id.
 PROMO_CHECK_NEW_CLIENT_IN_ALTEGIO=false
+
+# Required when PROMO_CHECK_NEW_CLIENT_IN_ALTEGIO=true.
+# JSON mapping company_id (str) → Altegio location_id (int).
+PROMO_LOCATION_ID_BY_COMPANY={"1":9001}
 
 # Master gate — enable only after API is verified and smoke-tested
 PROMO_APPLY_DISCOUNT_ENABLED=true

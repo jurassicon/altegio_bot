@@ -74,6 +74,7 @@ PHONE_NUMBER_ID = "PNID_PROMO_LEAD"
 FROM_PHONE = "4916000000099"
 PHONE_E164 = "+4916000000099"
 CAMPAIGN = "welcome_discount"  # must match settings default
+PROMO_LOCATION_MAP = '{"1": 9001}'
 
 
 class _CaptureProvider(WhatsAppProvider):
@@ -1236,6 +1237,7 @@ async def test_external_new_client_check_flag_false_does_not_call_altegio(sessio
 
     assert lead is not None
     assert lead.status == "issued"
+    assert (lead.meta or {}).get("altegio_new_client_check") == "disabled"
 
 
 # ---------------------------------------------------------------------------
@@ -1249,6 +1251,7 @@ async def test_external_new_client_check_no_records_issues_lead(session_maker) -
 
     with (
         patch.object(settings, "promo_check_new_client_in_altegio", True),
+        patch.object(settings, "promo_location_id_by_company", PROMO_LOCATION_MAP),
         patch(
             "altegio_bot.workers.promo_lead_handler.check_client_has_any_altegio_record",
             check_mock,
@@ -1256,7 +1259,7 @@ async def test_external_new_client_check_no_records_issues_lead(session_maker) -
     ):
         provider, evt = await _fire_promo(session_maker, "aktion")
 
-    check_mock.assert_awaited_once_with(phone_e164=PHONE_E164, company_id=1)
+    check_mock.assert_awaited_once_with(phone_e164=PHONE_E164, location_id=9001)
     assert provider.sent
     assert "verknüpft" in provider.sent[0][2]
     assert evt.error is None
@@ -1281,6 +1284,7 @@ async def test_external_new_client_check_records_found_rejects_without_card_or_j
 
     with (
         patch.object(settings, "promo_check_new_client_in_altegio", True),
+        patch.object(settings, "promo_location_id_by_company", PROMO_LOCATION_MAP),
         patch.object(settings, "promo_issue_loyalty_card_enabled", True),
         patch(
             "altegio_bot.workers.promo_lead_handler.check_client_has_any_altegio_record",
@@ -1290,7 +1294,7 @@ async def test_external_new_client_check_records_found_rejects_without_card_or_j
     ):
         provider, evt = await _fire_promo(session_maker, "aktion")
 
-    check_mock.assert_awaited_once_with(phone_e164=PHONE_E164, company_id=1)
+    check_mock.assert_awaited_once_with(phone_e164=PHONE_E164, location_id=9001)
     card_mock.assert_not_called()
     assert provider.sent
     assert "Neukunden" in provider.sent[0][2]
@@ -1320,11 +1324,12 @@ async def test_external_new_client_check_records_found_rejects_without_card_or_j
 
 @pytest.mark.asyncio
 async def test_external_new_client_check_error_fails_closed_with_manual_reply(session_maker) -> None:
-    check_mock = AsyncMock(side_effect=AltegioNewClientCheckError("promo new-client check HTTP 503: company=1"))
+    check_mock = AsyncMock(side_effect=AltegioNewClientCheckError("promo new-client check HTTP 503: location_id=9001"))
     card_mock = AsyncMock()
 
     with (
         patch.object(settings, "promo_check_new_client_in_altegio", True),
+        patch.object(settings, "promo_location_id_by_company", PROMO_LOCATION_MAP),
         patch.object(settings, "promo_issue_loyalty_card_enabled", True),
         patch(
             "altegio_bot.workers.promo_lead_handler.check_client_has_any_altegio_record",
@@ -1334,7 +1339,7 @@ async def test_external_new_client_check_error_fails_closed_with_manual_reply(se
     ):
         provider, evt = await _fire_promo(session_maker, "aktion")
 
-    check_mock.assert_awaited_once_with(phone_e164=PHONE_E164, company_id=1)
+    check_mock.assert_awaited_once_with(phone_e164=PHONE_E164, location_id=9001)
     card_mock.assert_not_called()
     assert provider.sent
     sent_text = provider.sent[0][2]
@@ -1360,7 +1365,90 @@ async def test_external_new_client_check_error_fails_closed_with_manual_reply(se
 
 
 # ---------------------------------------------------------------------------
-# 28. Repeat after rejected_not_new ignores external check and card issuance
+# 28. Missing promo location mapping → neutral manual-check reply
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_external_new_client_check_missing_location_mapping_fails_closed(session_maker) -> None:
+    check_mock = AsyncMock(return_value=False)
+    card_mock = AsyncMock()
+
+    with (
+        patch.object(settings, "promo_check_new_client_in_altegio", True),
+        patch.object(settings, "promo_location_id_by_company", "{}"),
+        patch.object(settings, "promo_issue_loyalty_card_enabled", True),
+        patch(
+            "altegio_bot.workers.promo_lead_handler.check_client_has_any_altegio_record",
+            check_mock,
+        ),
+        patch("altegio_bot.workers.promo_lead_handler.issue_promo_loyalty_card", card_mock),
+    ):
+        provider, evt = await _fire_promo(session_maker, "aktion")
+
+    check_mock.assert_not_called()
+    card_mock.assert_not_called()
+    assert provider.sent
+    sent_text = provider.sent[0][2]
+    assert "Unser Team meldet sich" in sent_text
+    assert "verknüpft" not in sent_text
+    assert evt.error is None
+
+    async with session_maker() as s:
+        lead = (await s.execute(select(PromoLead).where(PromoLead.phone_e164 == PHONE_E164))).scalar_one_or_none()
+        outbox = (
+            await s.execute(select(OutboxMessage).where(OutboxMessage.template_code == "wa_promo_lead_manual_check"))
+        ).scalar_one_or_none()
+        jobs = (await s.execute(select(MessageJob))).scalars().all()
+
+    assert lead is not None
+    assert lead.status == "cancelled"
+    assert lead.reject_reason == "altegio_new_client_check_failed"
+    assert lead.loyalty_card_id is None
+    assert "missing promo location_id for company_id=1" in (lead.meta or {}).get("altegio_new_client_check_error", "")
+    assert outbox is not None
+    assert jobs == []
+
+
+# ---------------------------------------------------------------------------
+# 29. Invalid promo location mapping JSON → neutral manual-check reply
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_external_new_client_check_invalid_location_mapping_fails_closed(session_maker) -> None:
+    check_mock = AsyncMock(return_value=False)
+    card_mock = AsyncMock()
+
+    with (
+        patch.object(settings, "promo_check_new_client_in_altegio", True),
+        patch.object(settings, "promo_location_id_by_company", "{not-json"),
+        patch.object(settings, "promo_issue_loyalty_card_enabled", True),
+        patch(
+            "altegio_bot.workers.promo_lead_handler.check_client_has_any_altegio_record",
+            check_mock,
+        ),
+        patch("altegio_bot.workers.promo_lead_handler.issue_promo_loyalty_card", card_mock),
+    ):
+        provider, evt = await _fire_promo(session_maker, "aktion")
+
+    check_mock.assert_not_called()
+    card_mock.assert_not_called()
+    assert provider.sent
+    assert "Unser Team meldet sich" in provider.sent[0][2]
+    assert evt.error is None
+
+    async with session_maker() as s:
+        lead = (await s.execute(select(PromoLead).where(PromoLead.phone_e164 == PHONE_E164))).scalar_one_or_none()
+
+    assert lead is not None
+    assert lead.status == "cancelled"
+    assert lead.reject_reason == "altegio_new_client_check_failed"
+    assert "invalid promo_location_id_by_company JSON" in (lead.meta or {}).get("altegio_new_client_check_error", "")
+
+
+# ---------------------------------------------------------------------------
+# 30. Repeat after rejected_not_new ignores external check and card issuance
 # ---------------------------------------------------------------------------
 
 
@@ -1434,7 +1522,7 @@ async def test_repeat_rejected_not_new_with_external_flag_does_not_issue_or_rech
 
 
 # ---------------------------------------------------------------------------
-# 29. Existing active card lead is not revoked by external check
+# 31. Existing active card lead is not revoked by external check
 # ---------------------------------------------------------------------------
 
 
@@ -1457,6 +1545,7 @@ async def test_existing_active_card_lead_with_external_flag_does_not_recheck_or_
                     discount_amount=Decimal("15"),
                     discount_type="fixed",
                     status="issued",
+                    reject_reason="altegio_new_client_check_failed",
                     issued_at=now,
                     expires_at=now + timedelta(days=30),
                     loyalty_card_id="card-1",
@@ -1493,6 +1582,7 @@ async def test_existing_active_card_lead_with_external_flag_does_not_recheck_or_
     assert provider.sent
     assert "Rabattkarte" in provider.sent[0][2]
     assert "991600000099" in provider.sent[0][2]
+    assert "Unser Team meldet sich" not in provider.sent[0][2]
     assert evt.error is None
 
     async with session_maker() as s:

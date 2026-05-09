@@ -92,9 +92,8 @@ def _phone_digits(phone_e164: str) -> str:
 def _extract_visit_search_records(payload: Any) -> list[dict[str, Any]]:
     """Extract rows from POST /company/{location_id}/clients/visits/search.
 
-    Confirmed docs shape is {"data": {"records": [...]}}.  A list in "data"
-    is accepted as a compatibility fallback because older Altegio endpoints
-    in this project use that shape.
+    Confirmed docs shape is {"data": {"records": [...]}}.  Unexpected
+    shapes fail closed because this check gates promo eligibility.
     """
     if not isinstance(payload, dict):
         raise AltegioNewClientCheckError(
@@ -102,13 +101,10 @@ def _extract_visit_search_records(payload: Any) -> list[dict[str, Any]]:
         )
 
     data = payload.get("data")
-    if isinstance(data, dict):
-        records = data.get("records")
-    elif isinstance(data, list):
-        records = data
-    else:
+    if not isinstance(data, dict):
         raise AltegioNewClientCheckError(f"promo new-client check returned unexpected data type {type(data).__name__}")
 
+    records = data.get("records")
     if not isinstance(records, list):
         raise AltegioNewClientCheckError(
             f"promo new-client check returned unexpected records type {type(records).__name__}"
@@ -132,12 +128,17 @@ def _extract_positive_meta_count(payload: Any) -> bool:
     if not isinstance(meta, dict):
         return False
     for key in ("total_count", "count"):
+        if key not in meta:
+            continue
         value = meta.get(key)
         try:
-            if value is not None and int(value) > 0:
-                return True
-        except (TypeError, ValueError):
-            continue
+            count = int(value)
+        except (TypeError, ValueError) as exc:
+            raise AltegioNewClientCheckError(f"promo new-client check returned invalid meta.{key}: {value!r}") from exc
+        if count < 0:
+            raise AltegioNewClientCheckError(f"promo new-client check returned negative meta.{key}: {count}")
+        if count > 0:
+            return True
     return False
 
 
@@ -307,7 +308,7 @@ async def count_attended_client_visits(
 
 async def check_client_has_any_altegio_record(
     phone_e164: str,
-    company_id: int,
+    location_id: int,
     timeout_sec: float = 15.0,
 ) -> bool:
     """Return True if Altegio CRM has any visit/record for this phone.
@@ -327,14 +328,10 @@ async def check_client_has_any_altegio_record(
     """
     phone_digits = _phone_digits(phone_e164)
     base = settings.altegio_api_base_url.rstrip("/")
-    url = f"{base}/company/{company_id}/clients/visits/search"
+    url = f"{base}/company/{location_id}/clients/visits/search"
     payload: dict[str, Any] = {
-        "client_id": None,
         "client_phone": phone_digits,
-        "from": None,
-        "to": None,
         "payment_statuses": [],
-        "attendance": None,
     }
 
     try:
@@ -343,19 +340,21 @@ async def check_client_has_any_altegio_record(
             resp.raise_for_status()
     except httpx.HTTPStatusError as exc:
         status = exc.response.status_code
-        raise AltegioNewClientCheckError(f"promo new-client check HTTP {status}: company={company_id}") from exc
+        raise AltegioNewClientCheckError(f"promo new-client check HTTP {status}: location_id={location_id}") from exc
     except httpx.HTTPError as exc:
-        raise AltegioNewClientCheckError(f"promo new-client check network error: company={company_id}: {exc}") from exc
+        raise AltegioNewClientCheckError(
+            f"promo new-client check network error: location_id={location_id}: {exc}"
+        ) from exc
 
     try:
         response_payload = resp.json()
     except Exception as exc:
         raise AltegioNewClientCheckError(
-            f"promo new-client check returned invalid JSON: company={company_id}: {exc}"
+            f"promo new-client check returned invalid JSON: location_id={location_id}: {exc}"
         ) from exc
 
     records = _extract_visit_search_records(response_payload)
-    return bool(records) or _extract_positive_meta_count(response_payload)
+    return _extract_positive_meta_count(response_payload) or bool(records)
 
 
 async def client_has_any_future_record(
