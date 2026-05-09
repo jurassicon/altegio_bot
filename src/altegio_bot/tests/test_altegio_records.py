@@ -138,7 +138,7 @@ async def test_check_client_has_any_altegio_record_raises_for_broken_meta_count(
 
 @pytest.mark.asyncio
 @respx.mock
-async def test_check_client_has_any_altegio_record_raises_for_broken_meta_even_with_records(
+async def test_check_client_has_any_altegio_record_returns_true_for_records_even_with_broken_meta(
     monkeypatch,
 ) -> None:
     _mock_settings(monkeypatch)
@@ -147,11 +147,12 @@ async def test_check_client_has_any_altegio_record_raises_for_broken_meta_even_w
         return_value=httpx.Response(200, json=_visit_search([{"id": 10}], total_count="broken"))
     )
 
-    with pytest.raises(AltegioNewClientCheckError, match="invalid meta.total_count"):
-        await records_mod.check_client_has_any_altegio_record(
-            phone_e164="+491600000099",
-            location_id=9001,
-        )
+    has_records = await records_mod.check_client_has_any_altegio_record(
+        phone_e164="+491600000099",
+        location_id=9001,
+    )
+
+    assert has_records is True
 
 
 @pytest.mark.asyncio

@@ -1522,7 +1522,110 @@ async def test_repeat_rejected_not_new_with_external_flag_does_not_issue_or_rech
 
 
 # ---------------------------------------------------------------------------
-# 31. Existing active card lead is not revoked by external check
+# 31. Existing cancelled manual-check lead sends manual-check reply
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_existing_cancelled_manual_check_lead_sends_manual_check_reply(session_maker) -> None:
+    provider = _CaptureProvider()
+    now = _utcnow()
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _setup_sender(session, sender_id=326)
+
+            session.add(
+                PromoLead(
+                    company_id=1,
+                    phone_e164=PHONE_E164,
+                    campaign_name=CAMPAIGN,
+                    secret_code="aktion",
+                    discount_amount=Decimal("15"),
+                    discount_type="fixed",
+                    status="cancelled",
+                    reject_reason="altegio_new_client_check_failed",
+                    issued_at=now,
+                    expires_at=now,
+                )
+            )
+
+            evt = WhatsAppEvent(
+                dedupe_key="wa:promo-cancelled-manual-check-31",
+                status="received",
+                error=None,
+                query={},
+                headers={},
+                payload=_inbound_payload(PHONE_NUMBER_ID, FROM_PHONE, "aktion"),
+            )
+            session.add(evt)
+            await session.flush()
+
+            with patch(
+                "altegio_bot.workers.whatsapp_inbox_worker.ChatwootClient",
+                return_value=_FakeCW(),
+            ):
+                await handle_event(session, evt, provider)
+
+    assert provider.sent
+    assert "Unser Team meldet sich" in provider.sent[0][2]
+    assert evt.error is None
+
+
+# ---------------------------------------------------------------------------
+# 32. Issued lead with manual-check reject_reason still sends active reply
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_existing_issued_lead_with_manual_check_reject_reason_sends_active_reply(session_maker) -> None:
+    provider = _CaptureProvider()
+    now = _utcnow()
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _setup_sender(session, sender_id=327)
+
+            session.add(
+                PromoLead(
+                    company_id=1,
+                    phone_e164=PHONE_E164,
+                    campaign_name=CAMPAIGN,
+                    secret_code="aktion",
+                    discount_amount=Decimal("15"),
+                    discount_type="fixed",
+                    status="issued",
+                    reject_reason="altegio_new_client_check_failed",
+                    issued_at=now,
+                    expires_at=now + timedelta(days=30),
+                )
+            )
+
+            evt = WhatsAppEvent(
+                dedupe_key="wa:promo-issued-manual-check-reason-32",
+                status="received",
+                error=None,
+                query={},
+                headers={},
+                payload=_inbound_payload(PHONE_NUMBER_ID, FROM_PHONE, "aktion"),
+            )
+            session.add(evt)
+            await session.flush()
+
+            with patch(
+                "altegio_bot.workers.whatsapp_inbox_worker.ChatwootClient",
+                return_value=_FakeCW(),
+            ):
+                await handle_event(session, evt, provider)
+
+    assert provider.sent
+    assert "bereits aktiv" in provider.sent[0][2]
+    assert "Unser Team meldet sich" not in provider.sent[0][2]
+    assert evt.error is None
+
+
+# ---------------------------------------------------------------------------
+# 33. Existing active card lead is not revoked by external check
 # ---------------------------------------------------------------------------
 
 
@@ -1545,7 +1648,6 @@ async def test_existing_active_card_lead_with_external_flag_does_not_recheck_or_
                     discount_amount=Decimal("15"),
                     discount_type="fixed",
                     status="issued",
-                    reject_reason="altegio_new_client_check_failed",
                     issued_at=now,
                     expires_at=now + timedelta(days=30),
                     loyalty_card_id="card-1",
@@ -1582,7 +1684,6 @@ async def test_existing_active_card_lead_with_external_flag_does_not_recheck_or_
     assert provider.sent
     assert "Rabattkarte" in provider.sent[0][2]
     assert "991600000099" in provider.sent[0][2]
-    assert "Unser Team meldet sich" not in provider.sent[0][2]
     assert evt.error is None
 
     async with session_maker() as s:

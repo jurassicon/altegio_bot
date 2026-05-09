@@ -440,27 +440,12 @@ async def _attempt_loyalty_card_issue(
         return False
 
     try:
-        location_map: dict = json.loads(cfg.promo_location_id_by_company or "{}")
-    except (ValueError, TypeError) as exc:
-        err = f"promo_loyalty: invalid promo_location_id_by_company JSON: {exc}"
+        location_id = _resolve_promo_location_id_for_company(company_id)
+    except AltegioNewClientCheckError as exc:
+        err = f"promo_loyalty: {exc}"
         lead.meta = {**(lead.meta or {}), "loyalty_card_issued": False, "loyalty_card_error": err}
         event.error = err
-        return False
-
-    location_id_raw = location_map.get(str(company_id))
-    if not location_id_raw:
-        err = f"promo_loyalty: no location_id for company_id={company_id}"
-        lead.meta = {**(lead.meta or {}), "loyalty_card_issued": False, "loyalty_card_error": err}
-        event.error = err
-        logger.warning("promo_loyalty: no location_id for company_id=%s", company_id)
-        return False
-
-    try:
-        location_id = int(location_id_raw)
-    except (ValueError, TypeError) as exc:
-        err = f"promo_loyalty: invalid location_id for company_id={company_id}: {exc}"
-        lead.meta = {**(lead.meta or {}), "loyalty_card_issued": False, "loyalty_card_error": err}
-        event.error = err
+        logger.warning("promo_loyalty: location_id resolution failed phone=%s: %s", phone_e164, exc)
         return False
 
     try:
@@ -636,7 +621,7 @@ async def handle_promo_command(
                     company_id=company_id,
                     phone_e164=phone_e164,
                     campaign_name=cfg.promo_campaign_name,
-                    secret_code=text[:64],
+                    secret_code=text,
                     discount_amount=discount_amount,
                     discount_type=cfg.promo_discount_type,
                     now=now,

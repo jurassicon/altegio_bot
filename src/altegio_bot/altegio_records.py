@@ -354,7 +354,9 @@ async def check_client_has_any_altegio_record(
         ) from exc
 
     records = _extract_visit_search_records(response_payload)
-    return _extract_positive_meta_count(response_payload) or bool(records)
+    if records:
+        return True
+    return _extract_positive_meta_count(response_payload)
 
 
 async def client_has_any_future_record(
