@@ -512,3 +512,68 @@ The cleanup script (`scripts/cleanup_expired_promo_cards.py`) only processes
 `status='issued'` leads that expired without booking. Leads with status
 `booked`, `applied`, or `used` are intentionally excluded — their card
 lifecycle is managed separately.
+
+### Manual smoke test for promo discount application
+
+The endpoint (`POST /visit/loyalty/apply_discount_program/…`) is marked as
+**UNCONFIRMED** — it must be verified against real Altegio data before enabling
+the automatic webhook flow.
+
+Use `scripts/smoke_apply_promo_discount.py` to test the endpoint on a single
+known visit without touching any production booking logic.
+
+**The script is dry-run by default — no API call is made without `--yes-apply`.**
+
+#### Before running with `--yes-apply`
+
+Set in environment:
+
+```bash
+PROMO_APPLY_DISCOUNT_API_VERIFIED=true
+```
+
+`PROMO_APPLY_DISCOUNT_ENABLED` is **not** required for the manual smoke script
+and does not affect the automatic webhook flow.
+
+#### Run locally (dry-run)
+
+```bash
+uv run python -m altegio_bot.scripts.smoke_apply_promo_discount \
+  --location-id 123 \
+  --card-id 456 \
+  --program-id 789 \
+  --record-id 111
+```
+
+#### Run on server (dry-run)
+
+```bash
+docker compose exec -T altegio-api python -m altegio_bot.scripts.smoke_apply_promo_discount \
+  --location-id 123 \
+  --card-id 456 \
+  --program-id 789 \
+  --record-id 111
+```
+
+#### Real API call (requires `--yes-apply`)
+
+```bash
+PROMO_APPLY_DISCOUNT_API_VERIFIED=true \
+uv run python -m altegio_bot.scripts.smoke_apply_promo_discount \
+  --location-id 123 \
+  --card-id 456 \
+  --program-id 789 \
+  --record-id 111 \
+  --yes-apply
+```
+
+#### After a successful smoke test
+
+Once the endpoint shape is confirmed, enable the automatic webhook flow as a
+separate decision:
+
+```bash
+PROMO_APPLY_DISCOUNT_ENABLED=true
+PROMO_APPLY_DISCOUNT_API_VERIFIED=true
+PROMO_ALLOWED_SERVICE_IDS=12345,67890
+```
