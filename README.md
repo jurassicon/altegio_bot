@@ -523,6 +523,13 @@ concurrent inserts are protected via savepoint (`begin_nested`) with
 Note: the online booking form and the first confirmation email may still show
 regular prices. The discount is visible to staff in the Altegio CRM.
 
+**Old-client referral reply:** clients who are not eligible as Neukunden receive
+a soft rejection reply with a plain `https://wa.me/?text=...` share link. The
+shared text tells a friend to send the promo keyword directly from her own
+WhatsApp number, so the discount can be linked to her booking correctly.
+The share text uses the currently matched promo keyword and current promo
+discount settings, not stored audit values from an older rejected lead.
+
 **New-client eligibility check:** by default the promo funnel keeps the existing
 local-only check for prior attended visits and makes no extra Altegio API call.
 Set `PROMO_CHECK_NEW_CLIENT_IN_ALTEGIO=true` to run an external Altegio history

@@ -8,6 +8,7 @@ import re
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import TYPE_CHECKING
+from urllib.parse import quote
 
 from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
@@ -36,6 +37,7 @@ _PROMO_INFO_TEXT = (
     "Bitte buchen Sie Ihren Termin online – wir freuen uns auf Sie.\n\n"
     "Termin buchen:\n{booking_url}"
 )
+_PROMO_REFERRAL_BRAND_NAME = "KitiLash"
 
 
 # ---------------------------------------------------------------------------
@@ -100,6 +102,60 @@ def _format_discount(amount: Decimal, discount_type: str) -> str:
     if discount_type == "percent":
         return f"{amt} %"
     return f"{amt} €"
+
+
+def _format_secret_code(secret_code: str) -> str:
+    code = secret_code.strip()[:64]
+    if not code:
+        return "Aktionswort"
+    if code.islower():
+        return code[:1].upper() + code[1:]
+    return code
+
+
+def _normalize_promo_text(raw: str | None) -> str:
+    if not raw:
+        return ""
+
+    text = raw.strip().lower()
+    text = re.sub(r"\s+", " ", text)
+    return text.strip(" \t\n\r.,!?:;\"'()[]{}")
+
+
+def _configured_promo_keywords() -> frozenset[str]:
+    return frozenset(keyword.strip().lower() for keyword in settings.promo_secret_words.split(",") if keyword.strip())
+
+
+def _extract_promo_keyword(text: str) -> str:
+    normalized = _normalize_promo_text(text)
+    if not normalized:
+        return ""
+
+    first_token = normalized.split(" ", 1)[0][:64]
+    if first_token in _configured_promo_keywords():
+        return first_token
+    return first_token
+
+
+def _build_referral_share_url(
+    *,
+    booking_url: str,
+    secret_code: str,
+    discount_amount: Decimal,
+    discount_type: str,
+) -> str:
+    discount = _format_discount(discount_amount, discount_type)
+    display_code = _format_secret_code(secret_code)
+    share_text = (
+        "Hallo 💙\n\n"
+        f"Ich habe eine Aktion bei {_PROMO_REFERRAL_BRAND_NAME} gefunden:\n"
+        f"Neukunden erhalten {discount} Rabatt beim ersten Besuch.\n\n"
+        f"Schreib {_PROMO_REFERRAL_BRAND_NAME} einfach das Aktionswort: {display_code}\n\n"
+        "Dann kann der Rabatt direkt mit deiner WhatsApp-Nummer verknüpft werden.\n\n"
+        "Termin buchen:\n"
+        f"{booking_url}"
+    )
+    return f"https://wa.me/?text={quote(share_text, safe='')}"
 
 
 def _expires_display(expires_at: datetime) -> str:
@@ -179,7 +235,19 @@ def build_reply_issued_with_card(
     )
 
 
-def build_reply_rejected_not_new(booking_url: str) -> str:
+def build_reply_rejected_not_new(
+    booking_url: str,
+    secret_code: str,
+    discount_amount: Decimal,
+    discount_type: str,
+) -> str:
+    display_code = _format_secret_code(secret_code)
+    share_url = _build_referral_share_url(
+        booking_url=booking_url,
+        secret_code=display_code,
+        discount_amount=discount_amount,
+        discount_type=discount_type,
+    )
     return (
         "Danke für Ihre Nachricht 💙\n\n"
         "Diese Aktion gilt nur für Neukunden beim ersten Besuch.\n\n"
@@ -187,6 +255,8 @@ def build_reply_rejected_not_new(booking_url: str) -> str:
         "Die neue Kundin soll uns das Aktionswort einfach direkt von ihrer eigenen "
         "WhatsApp-Nummer schreiben. Dann können wir den Rabatt korrekt mit ihrer "
         "Buchung verknüpfen.\n\n"
+        f"Aktionswort: {display_code}\n\n"
+        f"Freundin einladen:\n{share_url}\n\n"
         f"Termin buchen:\n{booking_url}"
     )
 
@@ -522,6 +592,7 @@ async def handle_promo_command(
     now = _utcnow()
     cfg = settings
     discount_amount = Decimal(str(cfg.promo_discount_amount))
+    promo_keyword = _extract_promo_keyword(text)
 
     # ── 1. Look up most recent lead ──────────────────────────────────────────
     lead = await _find_any_lead(session, phone_e164, cfg.promo_campaign_name)
@@ -574,7 +645,12 @@ async def handle_promo_command(
 
     elif lead is not None and lead.status == "rejected_not_new":
         # Client was already rejected; resend the rejection reply.
-        reply = build_reply_rejected_not_new(cfg.promo_booking_url)
+        reply = build_reply_rejected_not_new(
+            cfg.promo_booking_url,
+            promo_keyword,
+            discount_amount,
+            cfg.promo_discount_type,
+        )
         template_code = "wa_promo_lead_rejected_not_new"
 
     elif lead is not None and lead.status == "cancelled" and lead.reject_reason == "altegio_new_client_check_failed":
@@ -594,7 +670,7 @@ async def handle_promo_command(
                 company_id=company_id,
                 phone_e164=phone_e164,
                 campaign_name=cfg.promo_campaign_name,
-                secret_code=text[:64],
+                secret_code=promo_keyword,
                 discount_amount=discount_amount,
                 discount_type=cfg.promo_discount_type,
                 status="rejected_not_new",
@@ -633,7 +709,7 @@ async def handle_promo_command(
                         company_id=company_id,
                         phone_e164=phone_e164,
                         campaign_name=cfg.promo_campaign_name,
-                        secret_code=text[:64],
+                        secret_code=promo_keyword,
                         discount_amount=discount_amount,
                         discount_type=cfg.promo_discount_type,
                         status="rejected_not_new",
@@ -701,7 +777,12 @@ async def handle_promo_command(
         # Determine reply from the actual DB outcome.
         if new_lead is not None:
             if new_lead.status == "rejected_not_new":
-                reply = build_reply_rejected_not_new(cfg.promo_booking_url)
+                reply = build_reply_rejected_not_new(
+                    cfg.promo_booking_url,
+                    promo_keyword,
+                    discount_amount,
+                    cfg.promo_discount_type,
+                )
                 template_code = "wa_promo_lead_rejected_not_new"
             elif new_lead.status == "cancelled" and new_lead.reject_reason == "altegio_new_client_check_failed":
                 reply = build_reply_new_client_check_failed()
@@ -729,7 +810,12 @@ async def handle_promo_command(
                 reply = build_reply_already_issued(lead.expires_at, cfg.promo_booking_url)
                 template_code = "wa_promo_lead_already_issued"
             elif lead is not None and lead.status == "rejected_not_new":
-                reply = build_reply_rejected_not_new(cfg.promo_booking_url)
+                reply = build_reply_rejected_not_new(
+                    cfg.promo_booking_url,
+                    promo_keyword,
+                    discount_amount,
+                    cfg.promo_discount_type,
+                )
                 template_code = "wa_promo_lead_rejected_not_new"
             elif (
                 lead is not None
