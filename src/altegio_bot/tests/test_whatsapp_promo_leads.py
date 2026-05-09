@@ -31,6 +31,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 from unittest.mock import AsyncMock, patch
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 from sqlalchemy import select
@@ -104,6 +105,25 @@ class _FakeCW:
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _extract_share_url(reply_text: str) -> str:
+    for line in reply_text.splitlines():
+        if line.startswith("https://wa.me/?text="):
+            return line
+    raise AssertionError("Reply must include a wa.me share URL")
+
+
+def _decode_share_text(reply_text: str) -> tuple[str, str]:
+    share_url = _extract_share_url(reply_text)
+    parsed = urlparse(share_url)
+    assert parsed.scheme == "https"
+    assert parsed.netloc == "wa.me"
+    assert parsed.path == "/"
+    assert "\n" not in parsed.query
+    assert "%0A" in parsed.query
+    query = parse_qs(parsed.query)
+    return share_url, query["text"][0]
 
 
 def _inbound_payload(phone_number_id: str, from_phone: str, text: str) -> dict[str, Any]:
@@ -370,6 +390,8 @@ async def test_already_active_lead_sends_already_issued_text(session_maker) -> N
     assert provider.sent
     _sid, sent_phone, sent_text = provider.sent[0]
     assert "bereits aktiv" in sent_text
+    assert "Freundin einladen" not in sent_text
+    assert "https://wa.me/?text=" not in sent_text
     assert evt.error is None
 
 
@@ -1083,6 +1105,12 @@ async def test_repeat_promo_keyword_after_rejected_not_new_sends_rejection_reply
     assert provider.sent
     _sid, _phone, sent_text = provider.sent[0]
     assert "Neukunden" in sent_text, "Reply must explain the new-client restriction"
+    assert "Freundin einladen" in sent_text
+    share_url, share_text = _decode_share_text(sent_text)
+    assert share_url.startswith("https://wa.me/?text=")
+    assert "Aktionswort: Aktion" in sent_text
+    assert "Aktionswort: Aktion" in share_text
+    assert "https://n813709.alteg.io/" in share_text
     assert "abgelaufen" not in sent_text, "Must not send the 'expired' reply for rejected_not_new"
     assert evt.error is None
 
@@ -1092,8 +1120,12 @@ async def test_repeat_promo_keyword_after_rejected_not_new_sends_rejection_reply
                 select(OutboxMessage).where(OutboxMessage.template_code == "wa_promo_lead_rejected_not_new")
             )
         ).scalar_one_or_none()
+        issued_lead = (
+            await s.execute(select(PromoLead).where(PromoLead.phone_e164 == PHONE_E164, PromoLead.status == "issued"))
+        ).scalar_one_or_none()
 
     assert outbox is not None, "OutboxMessage must use wa_promo_lead_rejected_not_new template"
+    assert issued_lead is None
 
 
 # ---------------------------------------------------------------------------
@@ -1194,6 +1226,18 @@ async def test_rejected_not_new_reply_contains_referral_text(session_maker) -> N
     assert "Neukunden" in sent_text, "Must mention new-client restriction"
     assert "weiterempfehlen" in sent_text, "Must include referral suggestion"
     assert "WhatsApp-Nummer" in sent_text, "Must explain the phone-number requirement"
+    assert "Aktionswort: Aktion" in sent_text
+    assert "Freundin einladen" in sent_text
+    share_url, share_text = _decode_share_text(sent_text)
+    encoded_query = urlparse(share_url).query
+    assert "%0A" in encoded_query
+    assert "\n" not in encoded_query
+    assert "Aktionswort%3A%20Aktion" in encoded_query
+    assert "https%3A%2F%2Fn813709.alteg.io%2F" in encoded_query
+    assert "KitiLash" in share_text
+    assert "Neukunden erhalten 15 € Rabatt beim ersten Besuch." in share_text
+    assert "Aktionswort: Aktion" in share_text
+    assert "https://n813709.alteg.io/" in share_text
     assert "https://n813709.alteg.io/" in sent_text, "Must include booking URL"
     assert "abgelaufen" not in sent_text, "Must not send the expired reply"
     assert evt.error is None
@@ -1297,7 +1341,11 @@ async def test_external_new_client_check_records_found_rejects_without_card_or_j
     check_mock.assert_awaited_once_with(phone_e164=PHONE_E164, location_id=9001)
     card_mock.assert_not_called()
     assert provider.sent
-    assert "Neukunden" in provider.sent[0][2]
+    sent_text = provider.sent[0][2]
+    assert "Neukunden" in sent_text
+    assert "Freundin einladen" in sent_text
+    _share_url, share_text = _decode_share_text(sent_text)
+    assert "Aktionswort: Aktion" in share_text
     assert evt.error is None
 
     async with session_maker() as s:
@@ -1510,7 +1558,11 @@ async def test_repeat_rejected_not_new_with_external_flag_does_not_issue_or_rech
     check_mock.assert_not_called()
     card_attempt_mock.assert_not_called()
     assert provider.sent
-    assert "Neukunden" in provider.sent[0][2]
+    sent_text = provider.sent[0][2]
+    assert "Neukunden" in sent_text
+    assert "Freundin einladen" in sent_text
+    _share_url, share_text = _decode_share_text(sent_text)
+    assert "Aktionswort: Aktion" in share_text
     assert evt.error is None
 
     async with session_maker() as s:
@@ -1684,6 +1736,8 @@ async def test_existing_active_card_lead_with_external_flag_does_not_recheck_or_
     assert provider.sent
     assert "Rabattkarte" in provider.sent[0][2]
     assert "991600000099" in provider.sent[0][2]
+    assert "Freundin einladen" not in provider.sent[0][2]
+    assert "https://wa.me/?text=" not in provider.sent[0][2]
     assert evt.error is None
 
     async with session_maker() as s:
