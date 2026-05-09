@@ -113,6 +113,30 @@ def _format_secret_code(secret_code: str) -> str:
     return code
 
 
+def _normalize_promo_text(raw: str | None) -> str:
+    if not raw:
+        return ""
+
+    text = raw.strip().lower()
+    text = re.sub(r"\s+", " ", text)
+    return text.strip(" \t\n\r.,!?:;\"'()[]{}")
+
+
+def _configured_promo_keywords() -> frozenset[str]:
+    return frozenset(keyword.strip().lower() for keyword in settings.promo_secret_words.split(",") if keyword.strip())
+
+
+def _extract_promo_keyword(text: str) -> str:
+    normalized = _normalize_promo_text(text)
+    if not normalized:
+        return ""
+
+    first_token = normalized.split(" ", 1)[0][:64]
+    if first_token in _configured_promo_keywords():
+        return first_token
+    return first_token
+
+
 def _build_referral_share_url(
     *,
     booking_url: str,
@@ -568,6 +592,7 @@ async def handle_promo_command(
     now = _utcnow()
     cfg = settings
     discount_amount = Decimal(str(cfg.promo_discount_amount))
+    promo_keyword = _extract_promo_keyword(text)
 
     # ── 1. Look up most recent lead ──────────────────────────────────────────
     lead = await _find_any_lead(session, phone_e164, cfg.promo_campaign_name)
@@ -622,9 +647,9 @@ async def handle_promo_command(
         # Client was already rejected; resend the rejection reply.
         reply = build_reply_rejected_not_new(
             cfg.promo_booking_url,
-            lead.secret_code or text,
-            lead.discount_amount,
-            lead.discount_type,
+            promo_keyword,
+            discount_amount,
+            cfg.promo_discount_type,
         )
         template_code = "wa_promo_lead_rejected_not_new"
 
@@ -645,7 +670,7 @@ async def handle_promo_command(
                 company_id=company_id,
                 phone_e164=phone_e164,
                 campaign_name=cfg.promo_campaign_name,
-                secret_code=text[:64],
+                secret_code=promo_keyword,
                 discount_amount=discount_amount,
                 discount_type=cfg.promo_discount_type,
                 status="rejected_not_new",
@@ -684,7 +709,7 @@ async def handle_promo_command(
                         company_id=company_id,
                         phone_e164=phone_e164,
                         campaign_name=cfg.promo_campaign_name,
-                        secret_code=text[:64],
+                        secret_code=promo_keyword,
                         discount_amount=discount_amount,
                         discount_type=cfg.promo_discount_type,
                         status="rejected_not_new",
@@ -754,9 +779,9 @@ async def handle_promo_command(
             if new_lead.status == "rejected_not_new":
                 reply = build_reply_rejected_not_new(
                     cfg.promo_booking_url,
-                    new_lead.secret_code,
-                    new_lead.discount_amount,
-                    new_lead.discount_type,
+                    promo_keyword,
+                    discount_amount,
+                    cfg.promo_discount_type,
                 )
                 template_code = "wa_promo_lead_rejected_not_new"
             elif new_lead.status == "cancelled" and new_lead.reject_reason == "altegio_new_client_check_failed":
@@ -787,9 +812,9 @@ async def handle_promo_command(
             elif lead is not None and lead.status == "rejected_not_new":
                 reply = build_reply_rejected_not_new(
                     cfg.promo_booking_url,
-                    lead.secret_code or text,
-                    lead.discount_amount,
-                    lead.discount_type,
+                    promo_keyword,
+                    discount_amount,
+                    cfg.promo_discount_type,
                 )
                 template_code = "wa_promo_lead_rejected_not_new"
             elif (

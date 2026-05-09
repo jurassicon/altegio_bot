@@ -23,6 +23,7 @@ from altegio_bot.models.models import (
     WhatsAppSender,
 )
 from altegio_bot.providers.base import WhatsAppProvider
+from altegio_bot.settings import settings
 from altegio_bot.workers.whatsapp_inbox_worker import (
     _parse_command,
     handle_event,
@@ -112,6 +113,8 @@ def _inbound_payload(phone_number_id: str, from_phone: str, text: str) -> dict[s
         ("AKTION", "promo"),
         (" Aktion! ", "promo"),
         ("aktion!", "promo"),
+        ("aktion bitte", "promo"),
+        ("aktion\nbitte", "promo"),
         ("  Aktion  ", "promo"),
         ("angebot", "promo"),
         ("ANGEBOT", "promo"),
@@ -130,6 +133,12 @@ def _inbound_payload(phone_number_id: str, from_phone: str, text: str) -> dict[s
 )
 def test_parse_command(text: str, expected: str | None) -> None:
     assert _parse_command(text) == expected
+
+
+def test_parse_command_uses_current_promo_secret_words() -> None:
+    with patch.object(settings, "promo_secret_words", "neukunde"):
+        assert _parse_command("neukunde bitte") == "promo"
+        assert _parse_command("aktion") is None
 
 
 # ---------------------------------------------------------------------------

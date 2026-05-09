@@ -196,6 +196,53 @@ async def _fire_promo(session_maker, text: str = "aktion") -> tuple[_CaptureProv
     return provider, evt
 
 
+async def _fire_prior_visit_promo(
+    session_maker,
+    text: str,
+    *,
+    sender_id: int,
+    dedupe_key: str,
+    altegio_record_id: int,
+) -> tuple[_CaptureProvider, WhatsAppEvent, str]:
+    provider = _CaptureProvider()
+    prior_visit_phone = "10000000001"
+    prior_visit_e164 = "+10000000001"
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _setup_sender(session, sender_id=sender_id)
+            session.add(
+                Record(
+                    company_id=1,
+                    altegio_record_id=altegio_record_id,
+                    client_id=1,
+                    altegio_client_id=1,
+                    is_deleted=False,
+                    attendance=1,
+                    raw={},
+                )
+            )
+
+            evt = WhatsAppEvent(
+                dedupe_key=dedupe_key,
+                status="received",
+                error=None,
+                query={},
+                headers={},
+                payload=_inbound_payload(PHONE_NUMBER_ID, prior_visit_phone, text),
+            )
+            session.add(evt)
+            await session.flush()
+
+            with patch(
+                "altegio_bot.workers.whatsapp_inbox_worker.ChatwootClient",
+                return_value=_FakeCW(),
+            ):
+                await handle_event(session, evt, provider)
+
+    return provider, evt, prior_visit_e164
+
+
 # ---------------------------------------------------------------------------
 # 1. Secret word creates PromoLead with status='issued'
 # ---------------------------------------------------------------------------
@@ -1128,6 +1175,109 @@ async def test_repeat_promo_keyword_after_rejected_not_new_sends_rejection_reply
     assert issued_lead is None
 
 
+@pytest.mark.asyncio
+async def test_repeat_rejected_not_new_uses_current_discount_settings(session_maker) -> None:
+    provider = _CaptureProvider()
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _setup_sender(session, sender_id=330)
+
+            now = _utcnow()
+            session.add(
+                PromoLead(
+                    company_id=1,
+                    phone_e164=PHONE_E164,
+                    campaign_name=CAMPAIGN,
+                    secret_code="aktion",
+                    discount_amount=Decimal("15"),
+                    discount_type="fixed",
+                    status="rejected_not_new",
+                    reject_reason="has_prior_visits",
+                    issued_at=now,
+                    expires_at=now,
+                )
+            )
+
+            evt = WhatsAppEvent(
+                dedupe_key="wa:promo-rejected-repeat-current-discount",
+                status="received",
+                error=None,
+                query={},
+                headers={},
+                payload=_inbound_payload(PHONE_NUMBER_ID, FROM_PHONE, "aktion"),
+            )
+            session.add(evt)
+            await session.flush()
+
+            with (
+                patch.object(settings, "promo_discount_amount", 10.0),
+                patch.object(settings, "promo_discount_type", "percent"),
+                patch(
+                    "altegio_bot.workers.whatsapp_inbox_worker.ChatwootClient",
+                    return_value=_FakeCW(),
+                ),
+            ):
+                await handle_event(session, evt, provider)
+
+    assert provider.sent
+    _share_url, share_text = _decode_share_text(provider.sent[0][2])
+    assert "Neukunden erhalten 10 % Rabatt beim ersten Besuch." in share_text
+    assert "Neukunden erhalten 15 € Rabatt beim ersten Besuch." not in share_text
+    assert evt.error is None
+
+
+@pytest.mark.asyncio
+async def test_repeat_rejected_not_new_uses_current_keyword_not_stored_secret(session_maker) -> None:
+    provider = _CaptureProvider()
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _setup_sender(session, sender_id=331)
+
+            now = _utcnow()
+            session.add(
+                PromoLead(
+                    company_id=1,
+                    phone_e164=PHONE_E164,
+                    campaign_name=CAMPAIGN,
+                    secret_code="oldword",
+                    discount_amount=Decimal("15"),
+                    discount_type="fixed",
+                    status="rejected_not_new",
+                    reject_reason="has_prior_visits",
+                    issued_at=now,
+                    expires_at=now,
+                )
+            )
+
+            evt = WhatsAppEvent(
+                dedupe_key="wa:promo-rejected-repeat-current-keyword",
+                status="received",
+                error=None,
+                query={},
+                headers={},
+                payload=_inbound_payload(PHONE_NUMBER_ID, FROM_PHONE, "aktion"),
+            )
+            session.add(evt)
+            await session.flush()
+
+            with patch(
+                "altegio_bot.workers.whatsapp_inbox_worker.ChatwootClient",
+                return_value=_FakeCW(),
+            ):
+                await handle_event(session, evt, provider)
+
+    assert provider.sent
+    sent_text = provider.sent[0][2]
+    _share_url, share_text = _decode_share_text(sent_text)
+    assert "Aktionswort: Aktion" in sent_text
+    assert "Aktionswort: Aktion" in share_text
+    assert "oldword" not in sent_text
+    assert "oldword" not in share_text
+    assert evt.error is None
+
+
 # ---------------------------------------------------------------------------
 # 22. company_id=None → fail-closed: no PromoLead, no OutboxMessage, event.error
 # ---------------------------------------------------------------------------
@@ -1257,6 +1407,54 @@ async def test_rejected_not_new_reply_contains_referral_text(session_maker) -> N
         ).scalar_one_or_none()
 
     assert outbox is not None, "OutboxMessage must use wa_promo_lead_rejected_not_new"
+
+
+@pytest.mark.asyncio
+async def test_rejected_not_new_extra_words_use_matched_keyword_in_share(session_maker) -> None:
+    provider, evt, prior_visit_e164 = await _fire_prior_visit_promo(
+        session_maker,
+        "aktion bitte",
+        sender_id=328,
+        dedupe_key="wa:promo-referral-extra-words",
+        altegio_record_id=9928,
+    )
+
+    assert provider.sent
+    sent_text = provider.sent[0][2]
+    _share_url, share_text = _decode_share_text(sent_text)
+    assert "Aktionswort: Aktion" in sent_text
+    assert "Aktionswort: Aktion" in share_text
+    assert "Aktionswort: aktion bitte" not in sent_text
+    assert "aktion bitte" not in share_text
+    assert evt.error is None
+
+    async with session_maker() as s:
+        lead = (await s.execute(select(PromoLead).where(PromoLead.phone_e164 == prior_visit_e164))).scalar_one_or_none()
+
+    assert lead is not None
+    assert lead.status == "rejected_not_new"
+    assert lead.secret_code == "aktion"
+
+
+@pytest.mark.asyncio
+async def test_rejected_not_new_newline_text_uses_matched_keyword_in_share(session_maker) -> None:
+    provider, evt, _prior_visit_e164 = await _fire_prior_visit_promo(
+        session_maker,
+        "aktion\nbitte",
+        sender_id=329,
+        dedupe_key="wa:promo-referral-newline",
+        altegio_record_id=9929,
+    )
+
+    assert provider.sent
+    sent_text = provider.sent[0][2]
+    share_url, share_text = _decode_share_text(sent_text)
+    encoded_query = urlparse(share_url).query
+    assert "Aktionswort%3A%20Aktion" in encoded_query
+    assert "aktion%0Abitte" not in encoded_query
+    assert "Aktionswort: Aktion" in share_text
+    assert "aktion\nbitte" not in share_text
+    assert evt.error is None
 
 
 # ---------------------------------------------------------------------------
@@ -1540,6 +1738,8 @@ async def test_repeat_rejected_not_new_with_external_flag_does_not_issue_or_rech
             with (
                 patch.object(settings, "promo_check_new_client_in_altegio", True),
                 patch.object(settings, "promo_issue_loyalty_card_enabled", True),
+                patch.object(settings, "promo_discount_amount", 10.0),
+                patch.object(settings, "promo_discount_type", "percent"),
                 patch(
                     "altegio_bot.workers.promo_lead_handler.check_client_has_any_altegio_record",
                     check_mock,
@@ -1721,6 +1921,8 @@ async def test_existing_active_card_lead_with_external_flag_does_not_recheck_or_
             with (
                 patch.object(settings, "promo_check_new_client_in_altegio", True),
                 patch.object(settings, "promo_issue_loyalty_card_enabled", True),
+                patch.object(settings, "promo_discount_amount", 10.0),
+                patch.object(settings, "promo_discount_type", "percent"),
                 patch(
                     "altegio_bot.workers.promo_lead_handler.check_client_has_any_altegio_record",
                     check_mock,
@@ -1735,6 +1937,8 @@ async def test_existing_active_card_lead_with_external_flag_does_not_recheck_or_
     check_mock.assert_not_called()
     assert provider.sent
     assert "Rabattkarte" in provider.sent[0][2]
+    assert "Rabatt von 15 €" in provider.sent[0][2]
+    assert "Rabatt von 10 %" not in provider.sent[0][2]
     assert "991600000099" in provider.sent[0][2]
     assert "Freundin einladen" not in provider.sent[0][2]
     assert "https://wa.me/?text=" not in provider.sent[0][2]

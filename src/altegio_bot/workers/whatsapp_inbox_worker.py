@@ -57,10 +57,13 @@ START_KEYWORDS = {
     "prijava",
 }
 
+
+def _promo_keywords() -> frozenset[str]:
+    return frozenset(word.strip().lower() for word in settings.promo_secret_words.split(",") if word.strip())
+
+
 # Derived from settings so the word list is configurable without code changes.
-PROMO_KEYWORDS: frozenset[str] = frozenset(
-    w.strip().lower() for w in settings.promo_secret_words.split(",") if w.strip()
-)
+PROMO_KEYWORDS: frozenset[str] = _promo_keywords()
 
 # Rank used to ensure OutboxMessage.status never regresses.
 # A new status is applied only when its rank exceeds the current rank.
@@ -139,7 +142,7 @@ def _parse_command(text: str) -> str | None:
     if first in START_KEYWORDS:
         return "start"
 
-    if first in PROMO_KEYWORDS:
+    if first in _promo_keywords():
         return "promo"
 
     return None
