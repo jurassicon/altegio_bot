@@ -395,7 +395,12 @@ async def handle_event(session: AsyncSession, event: AltegioEvent) -> None:
             # before the promo was issued.
             normalized_status = _normalize_event_status(event_status)
             if normalized_status == "create" and not record_obj.is_deleted:
-                await try_apply_promo_discount(session, record_obj, int(company_id))
+                await try_apply_promo_discount(
+                    session,
+                    record_obj,
+                    int(company_id),
+                    booking_event_received_at=event.received_at,
+                )
 
             allowed = await record_has_allowed_service(
                 session=session,

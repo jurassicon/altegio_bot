@@ -481,14 +481,50 @@ Altegio API.
 discount apply, to avoid accidentally applying a promo to a booking that was made
 before the promo was issued.
 
+**Booking create event timestamp guard:** the create webhook's `received_at`
+timestamp must be greater than or equal to `PromoLead.issued_at`. If the
+timestamp is missing or earlier than the promo issuance time (delayed/backfilled
+event for a pre-promo booking), the apply is skipped and
+`PromoLead.meta.apply_skip_reason` is recorded. This prevents applying a discount
+to a booking that predates the promo campaign.
+
+**Booked-lead rebinding guard:** a `PromoLead` with `status='booked'` is only
+eligible for retry against the same stored record (`lead.record_id == record.id`
+or `lead.altegio_record_id == record.altegio_record_id`). A booked lead bound to
+a different booking is silently skipped so the original attribution is never
+overwritten.
+
 **Customer notification:** after a successful apply, a `MessageJob` with
 `job_type='promo_discount_applied'` is queued for immediate delivery. The
 `outbox_worker` sends a free-form German WhatsApp message confirming the discount
-to the client. `PromoLead.meta.customer_notification` is set to `"queued"`.
-The `MessageJob.dedupe_key` prevents duplicate jobs on repeated webhooks.
+to the client. `MessageJob.dedupe_key` prevents duplicate jobs on webhook retries;
+concurrent inserts are protected via savepoint (`begin_nested`) with
+`IntegrityError` recovery. Delivery status is reconciled in `PromoLead.meta`:
+
+| Event | `customer_notification` |
+|---|---|
+| MessageJob created | `queued` |
+| outbox_worker: sent | `sent` |
+| outbox_worker: final failure | `failed` |
+| outbox_worker: no active sender | `failed` |
+| outbox_worker: missing body | `failed` |
+| outbox_worker: retryable failure | `queued` (+ `customer_notification_last_error`) |
 
 Note: the online booking form and the first confirmation email may still show
 regular prices. The discount is visible to staff in the Altegio CRM.
+
+**New-client eligibility note:** the current implementation checks only the local
+DB for prior attended visits. A future PR must verify new-client eligibility
+through a full Altegio CRM records check. If a client has any record in Altegio
+(attended, no-show, cancelled, non-attended) the promo should be rejected.
+Deleted records need separate API verification.
+
+**Out of scope for the current implementation:**
+- Retry worker for `apply_failed` leads
+- Customer notification on apply failure
+- Meta paid templates for promo notification
+- Full Altegio CRM history check for new-client validation
+- Enabling production flags without a completed smoke test
 
 **The Altegio endpoint is UNCONFIRMED** (source: developer discussion, not OpenAPI
 spec). Both feature gates must be explicitly enabled after verification.

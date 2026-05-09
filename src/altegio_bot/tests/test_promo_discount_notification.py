@@ -19,6 +19,12 @@ Covers:
     records customer_notification_last_error.
 13. outbox_worker_missing_promo_lead_id_does_not_break_send: no promo_lead_id in payload
     → send succeeds, job.status='done'.
+14. ensure_notification_job_race_recovery: concurrent IntegrityError → recover, meta
+    points to existing job.
+15. outbox_worker_no_sender_reconciles_lead: no active sender → job='failed',
+    PromoLead.meta.customer_notification='failed'.
+16. outbox_worker_missing_body_reconciles_lead: missing body → job='failed',
+    PromoLead.meta.customer_notification='failed'.
 """
 
 from __future__ import annotations
@@ -179,7 +185,14 @@ class FakeClient:
 @dataclass
 class FakePromoLead:
     id: int
+    company_id: int = _COMPANY
     meta: dict = field(default_factory=dict)
+
+
+@dataclass
+class FakeRecord:
+    id: int
+    altegio_record_id: int | None = None
 
 
 class FakeSession:
@@ -257,7 +270,7 @@ async def test_notification_job_created_on_apply(session_maker) -> None:
 
             with patch("altegio_bot.promo_discount_apply.apply_promo_discount_to_visit", mock_api):
                 with _base_settings_ctx():
-                    await try_apply_promo_discount(session, record, _COMPANY)
+                    await try_apply_promo_discount(session, record, _COMPANY, booking_event_received_at=_NOW)
 
     async with session_maker() as s:
         job = (
@@ -297,7 +310,7 @@ async def test_notification_meta_fields(session_maker) -> None:
 
             with patch("altegio_bot.promo_discount_apply.apply_promo_discount_to_visit", mock_api):
                 with _base_settings_ctx():
-                    await try_apply_promo_discount(session, record, _COMPANY)
+                    await try_apply_promo_discount(session, record, _COMPANY, booking_event_received_at=_NOW)
 
     async with session_maker() as s:
         lead = (await s.execute(select(PromoLead).where(PromoLead.id == lead_id))).scalar_one()
@@ -330,7 +343,7 @@ async def test_notification_job_not_created_when_api_not_verified(session_maker)
 
             with patch("altegio_bot.promo_discount_apply.apply_promo_discount_to_visit", mock_api):
                 with _base_settings_ctx(promo_apply_discount_api_verified=False):
-                    await try_apply_promo_discount(session, record, _COMPANY)
+                    await try_apply_promo_discount(session, record, _COMPANY, booking_event_received_at=_NOW)
 
     async with session_maker() as s:
         job = (
@@ -359,7 +372,7 @@ async def test_notification_job_not_created_when_service_not_allowed(session_mak
 
             with patch("altegio_bot.promo_discount_apply.apply_promo_discount_to_visit", mock_api):
                 with _base_settings_ctx():
-                    await try_apply_promo_discount(session, record, _COMPANY)
+                    await try_apply_promo_discount(session, record, _COMPANY, booking_event_received_at=_NOW)
 
     async with session_maker() as s:
         job = (
@@ -685,3 +698,138 @@ def test_outbox_worker_missing_promo_lead_id_does_not_break_send(monkeypatch: An
     assert job.status == "done"
     assert len(session.added) == 1
     assert session.added[0].status == "sent"
+
+
+# ---------------------------------------------------------------------------
+# 14. _ensure race recovery: IntegrityError → re-read existing, meta updated
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_ensure_notification_job_race_recovery() -> None:
+    """Concurrent IntegrityError on insert → helper recovers and points meta to existing job."""
+    from sqlalchemy.exc import IntegrityError as SAIntegrityError
+
+    from altegio_bot.promo_discount_apply import _ensure_promo_discount_notification_job
+
+    EXISTING_JOB_ID = 77
+
+    class _RaceSession:
+        """First SELECT returns None; flush inside begin_nested raises IntegrityError;
+        second SELECT (recovery) returns the existing job."""
+
+        def __init__(self) -> None:
+            self._executions = 0
+
+        def add(self, obj: Any) -> None:
+            pass
+
+        async def execute(self, stmt: Any) -> Any:
+            from unittest.mock import MagicMock
+
+            self._executions += 1
+            result = MagicMock()
+            if self._executions == 1:
+                result.scalar_one_or_none.return_value = None
+            else:
+                fake_job = MagicMock()
+                fake_job.id = EXISTING_JOB_ID
+                result.scalar_one_or_none.return_value = fake_job
+            return result
+
+        async def flush(self) -> None:
+            raise SAIntegrityError(None, None, Exception("unique constraint violation"))
+
+        class _Savepoint:
+            async def __aenter__(self) -> "Any":
+                return self
+
+            async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> bool:
+                return False  # never suppress; let IntegrityError propagate to except block
+
+        def begin_nested(self) -> "_Savepoint":
+            return self._Savepoint()
+
+    lead = FakePromoLead(id=5, meta={"loyalty_card_issued": True})
+    fake_client = FakeClient(id=100)
+    fake_record = FakeRecord(id=200)
+
+    await _ensure_promo_discount_notification_job(
+        _RaceSession(),
+        lead,
+        fake_client,
+        fake_record,
+        _PHONE,
+        _NOW,  # type: ignore[arg-type]
+    )
+
+    assert lead.meta.get("customer_notification") == "queued"
+    assert lead.meta.get("customer_notification_job_id") == EXISTING_JOB_ID
+
+
+# ---------------------------------------------------------------------------
+# 15. no active sender reconciles PromoLead.meta → 'failed'
+# ---------------------------------------------------------------------------
+
+
+def test_outbox_worker_no_sender_reconciles_lead(monkeypatch: Any) -> None:
+    fake_lead = FakePromoLead(id=200, meta={"customer_notification": "queued"})
+    job = FakeJob(
+        id=15,
+        company_id=_COMPANY,
+        job_type="promo_discount_applied",
+        status="queued",
+        run_at=_NOW,
+        client_id=100,
+        payload={"body": _BODY, "phone_e164": _PHONE, "promo_lead_id": 200},
+    )
+    client = FakeClient(id=100, phone_e164=_PHONE)
+
+    _patch_common(monkeypatch, job=job, client=client)
+
+    async def fake_pick_sender_id(session: Any, company_id: int, sender_code: str) -> None:
+        return None
+
+    async def fake_safe_send(**kwargs: Any) -> tuple:
+        raise AssertionError("safe_send must not be called")
+
+    monkeypatch.setattr(ow, "pick_sender_id", fake_pick_sender_id)
+    monkeypatch.setattr(ow, "safe_send", fake_safe_send)
+
+    session = FakeSession(promo_lead=fake_lead)
+    _run(ow.process_job_in_session(session, 15, provider=object()))  # type: ignore
+
+    assert job.status == "failed"
+    assert "no active sender" in (job.last_error or "")
+    assert fake_lead.meta.get("customer_notification") == "failed"
+    assert fake_lead.meta.get("customer_notification_failed_at") is not None
+    assert "no active sender" in (fake_lead.meta.get("customer_notification_error") or "")
+
+
+# ---------------------------------------------------------------------------
+# 16. missing body reconciles PromoLead.meta → 'failed'
+# ---------------------------------------------------------------------------
+
+
+def test_outbox_worker_missing_body_reconciles_lead(monkeypatch: Any) -> None:
+    fake_lead = FakePromoLead(id=201, meta={"customer_notification": "queued"})
+    job = FakeJob(
+        id=16,
+        company_id=_COMPANY,
+        job_type="promo_discount_applied",
+        status="queued",
+        run_at=_NOW,
+        client_id=100,
+        payload={"phone_e164": _PHONE, "promo_lead_id": 201},  # body intentionally missing
+    )
+    client = FakeClient(id=100, phone_e164=_PHONE)
+
+    _patch_common(monkeypatch, job=job, client=client)
+
+    session = FakeSession(promo_lead=fake_lead)
+    _run(ow.process_job_in_session(session, 16, provider=object()))  # type: ignore
+
+    assert job.status == "failed"
+    assert "missing body" in (job.last_error or "")
+    assert fake_lead.meta.get("customer_notification") == "failed"
+    assert fake_lead.meta.get("customer_notification_failed_at") is not None
