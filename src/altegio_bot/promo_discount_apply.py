@@ -25,7 +25,7 @@ import httpx
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from altegio_bot.models.models import Client, PromoLead, Record, RecordService
+from altegio_bot.models.models import Client, MessageJob, PromoLead, Record, RecordService
 from altegio_bot.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -125,6 +125,19 @@ def get_promo_allowed_service_ids() -> set[int]:
             except ValueError:
                 logger.warning("promo_discount: invalid service_id in promo_allowed_service_ids: %r", part)
     return result
+
+
+def _build_notification_body(discount_amount, discount_type: str) -> str:
+    try:
+        amt = int(discount_amount) if int(discount_amount) == discount_amount else float(discount_amount)
+    except (TypeError, ValueError, OverflowError):
+        amt = discount_amount
+    suffix = " %" if discount_type == "percent" else " €"
+    return (
+        f"Gute Neuigkeit! 🎉\n\n"
+        f"Ihr Neukunden-Rabatt von {amt}{suffix} wurde erfolgreich auf Ihren Besuch angewendet.\n\n"
+        f"Der Rabatt wird bei der Abrechnung berücksichtigt."
+    )
 
 
 async def find_applicable_promo_lead_for_record(
@@ -227,8 +240,7 @@ async def try_apply_promo_discount(
     7. API gate check (promo_apply_discount_api_verified).
     8. Call Altegio apply_discount_program API.
     9. Update PromoLead status → applied.
-
-    Customer notification is out of scope for this implementation.
+    10. Queue a customer WhatsApp notification (MessageJob, job_type='promo_discount_applied').
     """
     cfg = settings
 
@@ -380,8 +392,25 @@ async def try_apply_promo_discount(
         "discount_apply_location_id": location_id,
         "discount_apply_card_id": card_id,
         "discount_apply_program_id": program_id,
-        "customer_notification": "out_of_scope",
+        "customer_notification": "queued",
     }
+
+    notification_body = _build_notification_body(lead.discount_amount, lead.discount_type)
+    session.add(
+        MessageJob(
+            company_id=lead.company_id,
+            client_id=client.id,
+            record_id=record.id,
+            job_type="promo_discount_applied",
+            run_at=now,
+            dedupe_key=f"promo_discount_applied:{lead.id}",
+            payload={
+                "body": notification_body,
+                "phone_e164": phone_e164,
+                "promo_lead_id": lead.id,
+            },
+        )
+    )
     logger.info(
         "promo_discount: applied lead_id=%s record_id=%s card_id=%s",
         lead.id,

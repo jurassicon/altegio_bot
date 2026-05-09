@@ -475,14 +475,17 @@ Altegio API.
    and phone number.
 6. If the service is in the allowlist, the discount program is applied via Altegio API.
 7. `PromoLead.status` advances: `issued → booked → applied`.
+8. A `MessageJob` is queued; `outbox_worker` sends the client a German WhatsApp confirmation.
 
 **Update webhooks are intentionally ignored.** Only create webhooks trigger promo
 discount apply, to avoid accidentally applying a promo to a booking that was made
 before the promo was issued.
 
-**Customer notification is out of scope** for this implementation. After a successful
-apply, `PromoLead.meta.customer_notification` is set to `"out_of_scope"` as an
-explicit marker. Notification delivery is deferred to a future PR.
+**Customer notification:** after a successful apply, a `MessageJob` with
+`job_type='promo_discount_applied'` is queued for immediate delivery. The
+`outbox_worker` sends a free-form German WhatsApp message confirming the discount
+to the client. `PromoLead.meta.customer_notification` is set to `"queued"`.
+The `MessageJob.dedupe_key` prevents duplicate jobs on repeated webhooks.
 
 Note: the online booking form and the first confirmation email may still show
 regular prices. The discount is visible to staff in the Altegio CRM.

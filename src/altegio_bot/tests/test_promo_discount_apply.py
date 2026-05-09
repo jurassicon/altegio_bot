@@ -6,8 +6,8 @@ Covers:
     meta.discount_apply_error set, status remains booked.
 3.  No active PromoLead — no API call.
 4.  Expired PromoLead — no API call (excluded by SQL query).
-5.  Active issued lead + allowed service + verified API → applied, no OutboxMessage
-    (customer notification is out of scope for this implementation).
+5.  Active issued lead + allowed service + verified API → applied, MessageJob queued
+    for customer WhatsApp notification.
 6.  Active lead without loyalty_card_id — not found by SQL, no API call.
 7.  Active lead but service not in allowlist — no API call, meta.apply_skip_reason set.
 8.  API failure — status='apply_failed', meta.discount_apply_error set.
@@ -32,7 +32,7 @@ import httpx
 import pytest
 from sqlalchemy import select
 
-from altegio_bot.models.models import Client, OutboxMessage, PromoLead, Record, RecordService
+from altegio_bot.models.models import Client, MessageJob, PromoLead, Record, RecordService
 from altegio_bot.promo_discount_apply import (
     PromoDiscountApplyError,
     PromoDiscountApplyResult,
@@ -282,7 +282,7 @@ async def test_expired_lead_excluded(session_maker) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 5. Happy path: applied, no OutboxMessage (customer notification out of scope)
+# 5. Happy path: applied, MessageJob queued for customer notification
 # ---------------------------------------------------------------------------
 
 
@@ -321,14 +321,16 @@ async def test_happy_path_applies_discount(session_maker) -> None:
     assert meta.get("discount_apply_altegio_record_id") == 777
     assert meta.get("discount_apply_card_id") == int(_CARD_ID)
     assert meta.get("discount_apply_program_id") == _PROGRAM_ID
-    assert meta.get("customer_notification") == "out_of_scope"
+    assert meta.get("customer_notification") == "queued"
 
     async with session_maker() as s:
-        outbox = (
-            await s.execute(select(OutboxMessage).where(OutboxMessage.template_code == "wa_promo_discount_applied"))
+        job = (
+            await s.execute(select(MessageJob).where(MessageJob.job_type == "promo_discount_applied"))
         ).scalar_one_or_none()
 
-    assert outbox is None, "OutboxMessage must not be created (customer notification is out of scope)"
+    assert job is not None
+    assert job.client_id == 100
+    assert job.dedupe_key.startswith("promo_discount_applied:")
 
 
 # ---------------------------------------------------------------------------

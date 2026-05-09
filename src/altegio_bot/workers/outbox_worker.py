@@ -1301,6 +1301,99 @@ async def _run_job_logic(
         job.run_at = delay_until
         return
 
+    # ── promo_discount_applied: free-form text, no MessageTemplate or Meta template ──
+    if job.job_type == "promo_discount_applied":
+        _pd_payload = getattr(job, "payload", None) or {}
+        _pd_body = _pd_payload.get("body", "")
+        if not _pd_body:
+            job.status = "failed"
+            job.locked_at = None
+            job.last_error = "promo_discount_applied: missing body in payload"
+            return None
+        _pd_attempts = getattr(job, "attempts", 0) + 1
+        setattr(job, "attempts", _pd_attempts)
+        _pd_sender_id = await pick_sender_id(
+            session=session,
+            company_id=job.company_id,
+            sender_code="default",
+        )
+        if _pd_sender_id is None:
+            job.status = "failed"
+            job.locked_at = None
+            job.last_error = "promo_discount_applied: no active sender for company"
+            return None
+        contact_name = client.display_name if client else None
+        msg_id, err = await safe_send(
+            provider=provider,
+            sender_id=_pd_sender_id,
+            phone=phone,
+            text=_pd_body,
+            contact_name=contact_name,
+            company_id=job.company_id,
+        )
+        _pd_now = utcnow()
+        _pd_send_meta: dict[str, Any] = {"send_type": "text"}
+        if err is not None:
+            session.add(
+                OutboxMessage(
+                    company_id=job.company_id,
+                    client_id=(client.id if client else None),
+                    record_id=(record.id if record else None),
+                    job_id=job.id,
+                    sender_id=_pd_sender_id,
+                    phone_e164=phone,
+                    template_code=job.job_type,
+                    language="de",
+                    body=_pd_body,
+                    status="failed",
+                    error=err,
+                    provider_message_id=msg_id,
+                    scheduled_at=job.run_at,
+                    sent_at=_pd_now,
+                    meta=_pd_send_meta,
+                )
+            )
+            if _is_token_expired_error(err):
+                _mark_token_expired()
+                job.status = "queued"
+                job.locked_at = None
+                job.run_at = _pd_now + timedelta(seconds=TOKEN_EXPIRED_RETRY_SECONDS)
+                job.last_error = f"Send blocked: {err}"
+            else:
+                job.last_error = f"Send failed: {err}"
+                if _pd_attempts >= max_attempts:
+                    job.status = "failed"
+                    job.locked_at = None
+                else:
+                    job.status = "queued"
+                    job.locked_at = None
+                    job.run_at = _pd_now + timedelta(seconds=_retry_delay_seconds(_pd_attempts))
+            return None
+        session.add(
+            OutboxMessage(
+                company_id=job.company_id,
+                client_id=(client.id if client else None),
+                record_id=(record.id if record else None),
+                job_id=job.id,
+                sender_id=_pd_sender_id,
+                phone_e164=phone,
+                template_code=job.job_type,
+                language="de",
+                body=_pd_body,
+                status="sent",
+                error=None,
+                provider_message_id=msg_id,
+                scheduled_at=job.run_at,
+                sent_at=_pd_now,
+                meta=_pd_send_meta,
+            )
+        )
+        job.status = "done"
+        job.locked_at = None
+        job.last_error = None
+        logger.info("promo_discount_applied: sent job_id=%s phone=%s", job.id, phone)
+        return None
+
     try:
         body, sender_id, lang, msg_ctx = await _render_message(
             session=session,
