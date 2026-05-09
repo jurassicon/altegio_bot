@@ -481,12 +481,22 @@ Altegio API.
 discount apply, to avoid accidentally applying a promo to a booking that was made
 before the promo was issued.
 
-**Booking create event timestamp guard:** the create webhook's `received_at`
-timestamp must be greater than or equal to `PromoLead.issued_at`. If the
-timestamp is missing or earlier than the promo issuance time (delayed/backfilled
-event for a pre-promo booking), the apply is skipped and
-`PromoLead.meta.apply_skip_reason` is recorded. This prevents applying a discount
-to a booking that predates the promo campaign.
+**Booking created timestamp guard:** automatic apply requires a confirmed
+`booking_created_at` — the actual time the booking was created in Altegio, not
+the time the webhook was received by the bot. Altegio record create webhooks
+currently do not include a confirmed booking creation timestamp (no `created_at`,
+`create_date`, or `datetime_created` field has been observed). The
+`extract_booking_created_at` helper therefore returns `None` (fail-closed), and
+`try_apply_promo_discount` skips the apply with
+`PromoLead.meta.apply_skip_reason = 'missing booking created timestamp'`.
+
+`event.received_at` is an audit timestamp that records when our bot received the
+webhook. It must not be used as the booking creation time: a delayed or
+backfilled create webhook for a booking that predates the promo could arrive
+after `PromoLead.issued_at`, making `received_at >= issued_at` true while the
+booking itself predates the promo. When a confirmed `booking_created_at` field
+becomes available in the Altegio API, update `extract_booking_created_at` to
+extract it and this guard will start gating on the actual creation time.
 
 **Booked-lead rebinding guard:** a `PromoLead` with `status='booked'` is only
 eligible for retry against the same stored record (`lead.record_id == record.id`

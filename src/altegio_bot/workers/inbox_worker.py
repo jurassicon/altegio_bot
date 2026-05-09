@@ -137,6 +137,23 @@ def _parse_starts_at(record_data: dict[str, Any]) -> datetime | None:
     return None
 
 
+def extract_booking_created_at(record_data: dict[str, Any]) -> datetime | None:
+    """Return the confirmed booking creation timestamp from an Altegio record payload.
+
+    Altegio record create webhooks do not include a confirmed booking creation
+    timestamp. Fields present in the payload are:
+    - ``date`` / ``datetime``: appointment *start* time, not booking creation time.
+    - ``last_change_date``: last modification time, not creation time.
+
+    No field named ``created_at``, ``create_date``, or ``datetime_created`` has
+    been observed or confirmed in production Altegio record webhooks.
+
+    Returns None (fail-closed) until a confirmed field is documented in the
+    Altegio OpenAPI spec and observed in live payloads.
+    """
+    return None
+
+
 def sum_total_cost(services: list[dict[str, Any]]) -> Decimal | None:
     total = Decimal("0")
     any_found = False
@@ -399,7 +416,7 @@ async def handle_event(session: AsyncSession, event: AltegioEvent) -> None:
                     session,
                     record_obj,
                     int(company_id),
-                    booking_event_received_at=event.received_at,
+                    booking_created_at=extract_booking_created_at(data),
                 )
 
             allowed = await record_has_allowed_service(

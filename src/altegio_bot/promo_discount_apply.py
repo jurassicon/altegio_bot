@@ -348,7 +348,7 @@ async def try_apply_promo_discount(
     record: Record,
     company_id: int,
     *,
-    booking_event_received_at: datetime | None = None,
+    booking_created_at: datetime | None = None,
 ) -> None:
     """Attempt to apply a promo discount to a newly created Altegio visit.
 
@@ -356,9 +356,10 @@ async def try_apply_promo_discount(
     Update webhooks are intentionally ignored to avoid applying promo to
     bookings created before the promo was issued.
 
-    booking_event_received_at must be the time the create webhook was received.
-    If None or earlier than PromoLead.issued_at, the discount is skipped (fail-closed)
-    to prevent applying a promo to a booking that predates the promo campaign.
+    booking_created_at must be the confirmed booking creation time from the Altegio
+    record payload (not the webhook received time). If None or earlier than
+    PromoLead.issued_at, the discount is skipped (fail-closed) to prevent applying
+    a promo to a booking that predates the promo campaign.
 
     Fail-closed: controlled failures are recorded in PromoLead.meta and do not
     propagate as exceptions. Unexpected exceptions propagate to the caller so
@@ -368,7 +369,7 @@ async def try_apply_promo_discount(
     1. Feature gate check (promo_apply_discount_enabled).
     2. Resolve client phone from record.
     3. Find matching PromoLead (filtered by company_id + phone).
-    3b. Booking event timestamp guard (booking must postdate the promo issuance).
+    3b. Booking created timestamp guard (booking must postdate the promo issuance).
     4. Service allowlist check (promo_allowed_service_ids).
     5. New-client guard (no prior attended visits, local DB only).
     6. Transition issued → booked (booking confirmed).
@@ -406,21 +407,22 @@ async def try_apply_promo_discount(
 
     meta = lead.meta or {}
 
-    # ── 3b. Booking event timestamp guard ─────────────────────────────────────
-    # Fail-closed: a missing or pre-promo timestamp means the create event may be
-    # delayed/backfilled for a booking that predates this promo campaign.
-    if booking_event_received_at is None:
-        err = "missing booking create event timestamp"
+    # ── 3b. Booking created timestamp guard ───────────────────────────────────
+    # Fail-closed: a missing or pre-promo timestamp means the booking may predate
+    # this promo campaign. Altegio webhooks currently provide no confirmed booking
+    # creation timestamp, so this guard always skips until one is available.
+    if booking_created_at is None:
+        err = "missing booking created timestamp"
         lead.meta = {**meta, "apply_skip_reason": err}
         logger.info("promo_discount: skip lead_id=%s %s", lead.id, err)
         return
 
-    if booking_event_received_at < lead.issued_at:
-        err = "booking create event predates promo lead"
+    if booking_created_at < lead.issued_at:
+        err = "booking predates promo lead"
         lead.meta = {
             **meta,
             "apply_skip_reason": err,
-            "booking_event_received_at": booking_event_received_at.isoformat(),
+            "booking_created_at": booking_created_at.isoformat(),
             "promo_issued_at": lead.issued_at.isoformat(),
         }
         logger.info("promo_discount: skip lead_id=%s %s", lead.id, err)

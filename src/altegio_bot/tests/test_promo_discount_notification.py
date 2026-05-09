@@ -270,7 +270,7 @@ async def test_notification_job_created_on_apply(session_maker) -> None:
 
             with patch("altegio_bot.promo_discount_apply.apply_promo_discount_to_visit", mock_api):
                 with _base_settings_ctx():
-                    await try_apply_promo_discount(session, record, _COMPANY, booking_event_received_at=_NOW)
+                    await try_apply_promo_discount(session, record, _COMPANY, booking_created_at=_NOW)
 
     async with session_maker() as s:
         job = (
@@ -310,7 +310,7 @@ async def test_notification_meta_fields(session_maker) -> None:
 
             with patch("altegio_bot.promo_discount_apply.apply_promo_discount_to_visit", mock_api):
                 with _base_settings_ctx():
-                    await try_apply_promo_discount(session, record, _COMPANY, booking_event_received_at=_NOW)
+                    await try_apply_promo_discount(session, record, _COMPANY, booking_created_at=_NOW)
 
     async with session_maker() as s:
         lead = (await s.execute(select(PromoLead).where(PromoLead.id == lead_id))).scalar_one()
@@ -343,7 +343,7 @@ async def test_notification_job_not_created_when_api_not_verified(session_maker)
 
             with patch("altegio_bot.promo_discount_apply.apply_promo_discount_to_visit", mock_api):
                 with _base_settings_ctx(promo_apply_discount_api_verified=False):
-                    await try_apply_promo_discount(session, record, _COMPANY, booking_event_received_at=_NOW)
+                    await try_apply_promo_discount(session, record, _COMPANY, booking_created_at=_NOW)
 
     async with session_maker() as s:
         job = (
@@ -372,7 +372,7 @@ async def test_notification_job_not_created_when_service_not_allowed(session_mak
 
             with patch("altegio_bot.promo_discount_apply.apply_promo_discount_to_visit", mock_api):
                 with _base_settings_ctx():
-                    await try_apply_promo_discount(session, record, _COMPANY, booking_event_received_at=_NOW)
+                    await try_apply_promo_discount(session, record, _COMPANY, booking_created_at=_NOW)
 
     async with session_maker() as s:
         job = (
