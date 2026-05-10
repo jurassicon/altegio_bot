@@ -9,7 +9,7 @@ import pytest
 import respx
 
 from altegio_bot import altegio_records as records_mod
-from altegio_bot.altegio_records import AltegioNewClientCheckError, AmbiguousRecordError
+from altegio_bot.altegio_records import AltegioNewClientCheckError, AltegioRecordResearchError, AmbiguousRecordError
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -42,6 +42,57 @@ def _visit_search(records: list[dict], *, total_count: object | None = None) -> 
     if total_count is not None:
         payload["meta"] = {"total_count": total_count}
     return payload
+
+
+# ---------------------------------------------------------------------------
+# fetch_record_details_for_booking_created_at_research — read-only research
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_fetch_record_details_for_booking_created_at_research_uses_location_id_and_record_id(
+    monkeypatch,
+) -> None:
+    _mock_settings(monkeypatch)
+
+    route = respx.get(f"{_BASE}/record/9001/123456789").mock(
+        return_value=httpx.Response(200, json={"success": True, "data": {"id": 123456789}})
+    )
+
+    data = await records_mod.fetch_record_details_for_booking_created_at_research(
+        location_id=9001,
+        record_id=123456789,
+    )
+
+    assert data == {"id": 123456789}
+    assert route.called
+    request = route.calls[0].request
+    assert request.url.path == "/api/v1/record/9001/123456789"
+    assert request.headers["Authorization"] == "Bearer partner-token,user-token"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_fetch_record_details_for_booking_created_at_research_wraps_http_error_without_token_leak(
+    monkeypatch,
+) -> None:
+    _mock_settings(monkeypatch)
+
+    respx.get(f"{_BASE}/record/9001/123456789").mock(return_value=httpx.Response(500, json={"error": "boom"}))
+
+    with pytest.raises(AltegioRecordResearchError) as exc_info:
+        await records_mod.fetch_record_details_for_booking_created_at_research(
+            location_id=9001,
+            record_id=123456789,
+        )
+
+    error_text = str(exc_info.value)
+    assert "HTTP 500" in error_text
+    assert "location_id=9001" in error_text
+    assert "record_id=123456789" in error_text
+    assert "partner-token" not in error_text
+    assert "user-token" not in error_text
 
 
 # ---------------------------------------------------------------------------

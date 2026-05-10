@@ -1,7 +1,8 @@
 """Altegio Records API client.
 
-Endpoint used:
+Endpoints used:
   GET /records/{company_id}
+  GET /record/{location_id}/{record_id}  (read-only research helper)
 
 A visit is counted as attended when ``attendance == 1`` or
 ``visit_attendance == 1`` in the API response. This corresponds to
@@ -53,6 +54,10 @@ class AltegioNewClientCheckError(Exception):
     """Raised when the promo new-client CRM history check cannot be trusted."""
 
 
+class AltegioRecordResearchError(Exception):
+    """Raised when read-only booking-created-at research cannot fetch a record."""
+
+
 def _auth_header() -> str:
     return f"Bearer {settings.altegio_partner_token},{settings.altegio_user_token}"
 
@@ -87,6 +92,14 @@ def _phone_digits(phone_e164: str) -> str:
     if not digits:
         raise AltegioNewClientCheckError("invalid phone_e164: no digits found")
     return digits
+
+
+def _sanitize_altegio_error(message: str) -> str:
+    sanitized = message
+    for token in (settings.altegio_partner_token, settings.altegio_user_token):
+        if token:
+            sanitized = sanitized.replace(token, "[redacted]")
+    return sanitized
 
 
 def _extract_visit_search_records(payload: Any) -> list[dict[str, Any]]:
@@ -357,6 +370,62 @@ async def check_client_has_any_altegio_record(
     if records:
         return True
     return _extract_positive_meta_count(response_payload)
+
+
+async def fetch_record_details_for_booking_created_at_research(
+    *,
+    location_id: int,
+    record_id: int,
+    timeout_sec: float = 15.0,
+) -> dict[str, Any]:
+    """Fetch a single Altegio appointment for read-only timestamp research.
+
+    Uses the documented read-only appointment endpoint:
+      GET /record/{location_id}/{record_id}
+
+    The function returns only the ``data`` object from the response and does
+    not mutate Altegio, the local DB, PromoLead, loyalty cards, or WhatsApp.
+    """
+    base = settings.altegio_api_base_url.rstrip("/")
+    url = f"{base}/record/{location_id}/{record_id}"
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout_sec) as client:
+            resp = await client.get(url, headers=_headers())
+            resp.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        status = exc.response.status_code
+        raise AltegioRecordResearchError(
+            f"booking created-at research HTTP {status}: location_id={location_id} record_id={record_id}"
+        ) from exc
+    except httpx.HTTPError as exc:
+        err = _sanitize_altegio_error(str(exc))
+        raise AltegioRecordResearchError(
+            f"booking created-at research network error: location_id={location_id} record_id={record_id}: {err}"
+        ) from exc
+
+    try:
+        payload = resp.json()
+    except Exception as exc:
+        err = _sanitize_altegio_error(str(exc))
+        raise AltegioRecordResearchError(
+            f"booking created-at research returned invalid JSON: location_id={location_id} record_id={record_id}: {err}"
+        ) from exc
+
+    if not isinstance(payload, dict):
+        raise AltegioRecordResearchError(
+            f"booking created-at research returned unexpected payload type {type(payload).__name__}: "
+            f"location_id={location_id} record_id={record_id}"
+        )
+
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        raise AltegioRecordResearchError(
+            f"booking created-at research returned unexpected data type {type(data).__name__}: "
+            f"location_id={location_id} record_id={record_id}"
+        )
+
+    return data
 
 
 async def client_has_any_future_record(

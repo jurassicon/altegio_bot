@@ -702,6 +702,53 @@ The output includes:
 - a service allowlist diagnostic (`allowed_service_match=yes/no/not_configured`);
 - an explanation of why the real apply command is omitted.
 
+### Manual research for booking_created_at
+
+`scripts/research_booking_created_at.py` is a **read-only** helper for checking
+which timestamp fields Altegio returns for one appointment via
+`GET /record/{location_id}/{record_id}`. It exists because automatic promo
+apply must compare `PromoLead.issued_at` with the actual time the client created
+the booking in Altegio.
+
+Do **not** use `event.received_at` as `booking_created_at`: it is only the time
+our bot received the webhook. A delayed or backfilled webhook can arrive after a
+promo lead was issued even when the booking itself was created earlier.
+
+The script makes no DB writes, creates no `PromoLead`, sends no WhatsApp
+message, issues no loyalty card, applies no discount, and does not modify any
+Altegio record.
+
+#### Run locally
+
+```bash
+uv run --env-file .env python -m altegio_bot.scripts.research_booking_created_at \
+  --location-id 9001 \
+  --record-id 123456789
+```
+
+#### Run in Docker
+
+```bash
+docker compose exec -T altegio-api \
+  python -m altegio_bot.scripts.research_booking_created_at \
+  --location-id 9001 \
+  --record-id 123456789
+```
+
+#### Interpreting output
+
+The script prints a sanitized timestamp summary:
+- `date` / `datetime` are appointment start fields, not booking creation time.
+- `last_change_date` / `last_change_at` are last-change fields and are not
+  reliable as creation time.
+- `created_at`, `create_date`, and `datetime_created` are printed as candidate
+  fields when present, but remain untrusted for automatic apply in this PR.
+
+`confirmed_booking_created_at=<none>` and `safe_for_auto_apply=false` mean the
+automatic promo apply guard must stay fail-closed. Only a future PR should mark a
+field as trusted after manual verification against real Altegio data and update
+the production `extract_booking_created_at()` logic.
+
 ### Manual smoke test for promo discount application
 
 The endpoint (`POST /visit/loyalty/apply_discount_program/…`) is marked as
