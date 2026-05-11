@@ -296,6 +296,27 @@ def build_reply_checking_still_in_progress() -> str:
     )
 
 
+def build_reply_repeat_applied() -> str:
+    """Idempotent reply when the customer re-sends the secret word after their
+    promo discount has already been applied to a booking (lead.status='applied').
+
+    No booking link: the discount has already been matched to their first visit.
+    """
+    return "Ihr Rabatt wurde bereits Ihrer Buchung zugeordnet ✅\n\nWir freuen uns auf Ihren Besuch 💙"
+
+
+def build_reply_repeat_booked_manual() -> str:
+    """Idempotent reply when the customer re-sends the secret word and their
+    discount is reserved for a booking pending manual team review
+    (lead.status='booked', meta.manual_review_required=True).
+    """
+    return (
+        "Ihr Rabatt ist für Ihre Buchung reserviert ✅\n\n"
+        "Unser Team prüft die Zuordnung und wendet ihn für Sie an.\n"
+        "Bei Fragen schreiben Sie uns gern."
+    )
+
+
 # ---------------------------------------------------------------------------
 # DB helpers
 # ---------------------------------------------------------------------------
@@ -909,6 +930,15 @@ async def handle_promo_command(
             mark_lead_expired = True
             reply = build_reply_expired()
             template_code = "wa_promo_lead_expired"
+        elif lead.status == "applied":
+            # Discount already applied to a booking — idempotent repeat reply.
+            # Do not re-send card or booking link; the job is done.
+            reply = build_reply_repeat_applied()
+            template_code = "wa_promo_lead_repeat_applied"
+        elif lead.status == "booked" and (lead.meta or {}).get("manual_review_required"):
+            # Booking exists, manual team review pending — idempotent repeat reply.
+            reply = build_reply_repeat_booked_manual()
+            template_code = "wa_promo_lead_repeat_booked_manual"
         elif cfg.promo_issue_loyalty_card_enabled and lead.loyalty_card_number:
             # Card already issued — resend with card number.
             # Set repair_lead so post-send meta update clears card_message_pending.
@@ -938,7 +968,7 @@ async def handle_promo_command(
                 reply = build_reply_loyalty_card_failed()
                 template_code = "wa_promo_loyalty_card_issue_failed"
         else:
-            # Still active → resend confirmation.
+            # Still active (issued / booked mid-state) → resend linked-discount confirmation.
             reply = build_reply_already_issued(lead.expires_at, cfg.promo_booking_url)
             template_code = "wa_promo_lead_already_issued"
 

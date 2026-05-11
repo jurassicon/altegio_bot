@@ -23,6 +23,11 @@ Covers:
 20. Send failure after lead persist marks meta.reply_sent=False, no OutboxMessage.
 21. Existing rejected_not_new lead → resend rejection reply (not expired).
 22. company_id=None → fail-closed: no PromoLead, no OutboxMessage, event.error set.
+Idempotent repeat-keyword replies (status-differentiated):
+R1. Repeat keyword with status='applied' → "already applied" text, no new lead/card/job.
+R2. Repeat keyword with status='booked'+manual_review_required → "reserved" text, no new lead.
+R3. Repeat keyword with status='pending_check' → "still checking" text, no new job.
+R4. Repeat keyword with status='issued' (already issued, no card) → already-issued text (regression).
 """
 
 from __future__ import annotations
@@ -2649,3 +2654,281 @@ async def test_existing_rejected_lead_with_async_flag_does_not_create_pending_or
 
     assert lead.status == "rejected_not_new"
     assert jobs == []
+
+
+# ---------------------------------------------------------------------------
+# R1–R4: Idempotent repeat-keyword replies (status-differentiated)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_repeat_keyword_applied_lead_sends_applied_text(session_maker) -> None:
+    """R1: Customer re-sends the secret word when their discount is already applied
+    to a booking (lead.status='applied') → sends 'Buchung zugeordnet' text,
+    no new PromoLead created, no new promo_eligibility_check job, status unchanged.
+    """
+    provider = _CaptureProvider()
+    now = _utcnow()
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _setup_sender(session, sender_id=350)
+            session.add(
+                PromoLead(
+                    company_id=1,
+                    phone_e164=PHONE_E164,
+                    campaign_name=CAMPAIGN,
+                    secret_code="aktion",
+                    discount_amount=Decimal("15"),
+                    discount_type="fixed",
+                    status="applied",
+                    issued_at=now - timedelta(days=5),
+                    expires_at=now + timedelta(days=25),
+                    meta={
+                        "loyalty_card_issued": True,
+                        "discount_apply_method": "record_price_override",
+                    },
+                )
+            )
+            evt = WhatsAppEvent(
+                dedupe_key="wa:promo-repeat-applied-r1",
+                status="received",
+                error=None,
+                query={},
+                headers={},
+                payload=_inbound_payload(PHONE_NUMBER_ID, FROM_PHONE, "aktion"),
+            )
+            session.add(evt)
+            await session.flush()
+
+            with patch(
+                "altegio_bot.workers.whatsapp_inbox_worker.ChatwootClient",
+                return_value=_FakeCW(),
+            ):
+                await handle_event(session, evt, provider)
+
+    assert provider.sent
+    _sid, _phone, sent_text = provider.sent[0]
+    assert "Buchung zugeordnet" in sent_text
+    assert "freuen" in sent_text.lower()
+    # No booking link — the discount is already applied
+    assert "n813709" not in sent_text
+    # No rejection / sharing link
+    assert "https://wa.me/?text=" not in sent_text
+    assert evt.error is None
+
+    async with session_maker() as s:
+        leads = (await s.execute(select(PromoLead).where(PromoLead.phone_e164 == PHONE_E164))).scalars().all()
+        jobs = (
+            (await s.execute(select(MessageJob).where(MessageJob.job_type == "promo_eligibility_check")))
+            .scalars()
+            .all()
+        )
+
+    assert len(leads) == 1  # no new lead created
+    assert leads[0].status == "applied"  # status unchanged
+    assert jobs == []  # no new eligibility job
+
+
+@pytest.mark.asyncio
+async def test_repeat_keyword_booked_manual_review_sends_reserved_text(session_maker) -> None:
+    """R2: Customer re-sends the secret word when their discount is reserved for
+    a booking pending manual team review (lead.status='booked', manual_review_required=True)
+    → sends 'reserviert' text, no new PromoLead, status unchanged.
+    """
+    provider = _CaptureProvider()
+    now = _utcnow()
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _setup_sender(session, sender_id=351)
+            session.add(
+                PromoLead(
+                    company_id=1,
+                    phone_e164=PHONE_E164,
+                    campaign_name=CAMPAIGN,
+                    secret_code="aktion",
+                    discount_amount=Decimal("15"),
+                    discount_type="fixed",
+                    status="booked",
+                    issued_at=now - timedelta(days=3),
+                    expires_at=now + timedelta(days=27),
+                    meta={
+                        "loyalty_card_issued": True,
+                        "manual_review_required": True,
+                        "discount_apply_skip_reason": "multiple_records_same_day",
+                    },
+                )
+            )
+            evt = WhatsAppEvent(
+                dedupe_key="wa:promo-repeat-booked-manual-r2",
+                status="received",
+                error=None,
+                query={},
+                headers={},
+                payload=_inbound_payload(PHONE_NUMBER_ID, FROM_PHONE, "aktion"),
+            )
+            session.add(evt)
+            await session.flush()
+
+            with patch(
+                "altegio_bot.workers.whatsapp_inbox_worker.ChatwootClient",
+                return_value=_FakeCW(),
+            ):
+                await handle_event(session, evt, provider)
+
+    assert provider.sent
+    _sid, _phone, sent_text = provider.sent[0]
+    assert "reserviert" in sent_text
+    assert "Team" in sent_text
+    # No referral / rejection text
+    assert "https://wa.me/?text=" not in sent_text
+    assert "gilt nur für Neukunden" not in sent_text
+    assert evt.error is None
+
+    async with session_maker() as s:
+        leads = (await s.execute(select(PromoLead).where(PromoLead.phone_e164 == PHONE_E164))).scalars().all()
+        jobs = (
+            (await s.execute(select(MessageJob).where(MessageJob.job_type == "promo_eligibility_check")))
+            .scalars()
+            .all()
+        )
+
+    assert len(leads) == 1  # no new lead
+    assert leads[0].status == "booked"  # status unchanged
+    assert jobs == []  # no new eligibility job
+
+
+@pytest.mark.asyncio
+async def test_repeat_keyword_pending_check_sends_still_in_progress_no_new_job(session_maker) -> None:
+    """R3: Customer re-sends the secret word while async eligibility check is still
+    pending (lead.status='pending_check') → sends 'noch prüfen' text, no new
+    promo_eligibility_check job created, one lead only.
+    """
+    provider = _CaptureProvider()
+    now = _utcnow()
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _setup_sender(session, sender_id=352)
+            lead_row = PromoLead(
+                company_id=1,
+                phone_e164=PHONE_E164,
+                campaign_name=CAMPAIGN,
+                secret_code="aktion",
+                discount_amount=Decimal("15"),
+                discount_type="fixed",
+                status="pending_check",
+                issued_at=now,
+                expires_at=now + timedelta(days=30),
+                meta={"promo_check": "pending", "altegio_new_client_check": "pending"},
+            )
+            session.add(lead_row)
+            await session.flush()
+            # The existing job for this lead
+            session.add(
+                MessageJob(
+                    company_id=1,
+                    record_id=None,
+                    client_id=None,
+                    job_type="promo_eligibility_check",
+                    run_at=now,
+                    dedupe_key=f"promo_eligibility_check:{lead_row.id}",
+                    payload={"promo_lead_id": lead_row.id},
+                )
+            )
+
+            evt = WhatsAppEvent(
+                dedupe_key="wa:promo-repeat-pending-r3",
+                status="received",
+                error=None,
+                query={},
+                headers={},
+                payload=_inbound_payload(PHONE_NUMBER_ID, FROM_PHONE, "aktion"),
+            )
+            session.add(evt)
+            await session.flush()
+
+            with patch(
+                "altegio_bot.workers.whatsapp_inbox_worker.ChatwootClient",
+                return_value=_FakeCW(),
+            ):
+                await handle_event(session, evt, provider)
+
+    assert provider.sent
+    _sid, _phone, sent_text = provider.sent[0]
+    assert "prüfen" in sent_text.lower()
+    assert "Rückmeldung" in sent_text
+    # No booking link or rejection
+    assert "https://wa.me/?text=" not in sent_text
+    assert evt.error is None
+
+    async with session_maker() as s:
+        leads = (await s.execute(select(PromoLead).where(PromoLead.phone_e164 == PHONE_E164))).scalars().all()
+        jobs = (
+            (await s.execute(select(MessageJob).where(MessageJob.job_type == "promo_eligibility_check")))
+            .scalars()
+            .all()
+        )
+
+    assert len(leads) == 1
+    assert leads[0].status == "pending_check"
+    assert len(jobs) == 1  # no duplicate job; original job untouched
+
+
+@pytest.mark.asyncio
+async def test_repeat_keyword_issued_still_sends_already_issued_text(session_maker) -> None:
+    """R4 (regression): Customer re-sends the secret word with status='issued' (no card,
+    no card-enabled setting) → still sends 'bereits aktiv / verknüpft' text, not the
+    'applied' or 'reserved' texts. No new lead.
+    """
+    provider = _CaptureProvider()
+    now = _utcnow()
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _setup_sender(session, sender_id=353)
+            session.add(
+                PromoLead(
+                    company_id=1,
+                    phone_e164=PHONE_E164,
+                    campaign_name=CAMPAIGN,
+                    secret_code="aktion",
+                    discount_amount=Decimal("15"),
+                    discount_type="fixed",
+                    status="issued",
+                    issued_at=now,
+                    expires_at=now + timedelta(days=30),
+                    meta={"loyalty_card_issued": True},
+                )
+            )
+            evt = WhatsAppEvent(
+                dedupe_key="wa:promo-repeat-issued-r4",
+                status="received",
+                error=None,
+                query={},
+                headers={},
+                payload=_inbound_payload(PHONE_NUMBER_ID, FROM_PHONE, "aktion"),
+            )
+            session.add(evt)
+            await session.flush()
+
+            with patch(
+                "altegio_bot.workers.whatsapp_inbox_worker.ChatwootClient",
+                return_value=_FakeCW(),
+            ):
+                await handle_event(session, evt, provider)
+
+    assert provider.sent
+    _sid, _phone, sent_text = provider.sent[0]
+    # Must use already-issued text — NOT applied or reserved texts
+    assert "bereits aktiv" in sent_text or "verknüpft" in sent_text
+    assert "Buchung zugeordnet" not in sent_text
+    assert "reserviert" not in sent_text
+    assert evt.error is None
+
+    async with session_maker() as s:
+        leads = (await s.execute(select(PromoLead).where(PromoLead.phone_e164 == PHONE_E164))).scalars().all()
+
+    assert len(leads) == 1
+    assert leads[0].status == "issued"
