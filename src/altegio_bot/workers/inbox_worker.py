@@ -513,19 +513,27 @@ async def handle_event(session: AsyncSession, event: AltegioEvent) -> None:
             # before the promo was issued.
             normalized_status = _normalize_event_status(event_status)
             if normalized_status == "create" and not record_obj.is_deleted:
-                booking_created_at = None
+                booking_created_at_resolver = None
                 if settings.promo_apply_discount_enabled:
-                    booking_created_at = await resolve_booking_created_at_for_record_create(
-                        company_id=int(company_id),
-                        record_data=data,
-                        record=record_obj,
-                    )
+                    company_id_int = int(company_id)
+
+                    async def booking_created_at_resolver(
+                        *,
+                        _company_id: int = company_id_int,
+                        _record_data: dict[str, Any] = data,
+                        _record: Record = record_obj,
+                    ) -> datetime | None:
+                        return await resolve_booking_created_at_for_record_create(
+                            company_id=_company_id,
+                            record_data=_record_data,
+                            record=_record,
+                        )
 
                 await try_apply_promo_discount(
                     session,
                     record_obj,
                     int(company_id),
-                    booking_created_at=booking_created_at,
+                    booking_created_at_resolver=booking_created_at_resolver,
                 )
 
             allowed = await record_has_allowed_service(

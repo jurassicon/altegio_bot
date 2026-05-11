@@ -508,12 +508,20 @@ before the promo was issued.
 
 **Booking created timestamp guard:** automatic apply requires a confirmed
 `booking_created_at` - the actual time the booking was created in Altegio, not
-the time the webhook was received by the bot. `inbox_worker` resolves it in two
-steps: first from trusted creation fields in the record create webhook payload
-(`create_date`, `created_at`, `datetime_created`), then via read-only
+the time the webhook was received by the bot. The lookup is lazy: `inbox_worker`
+passes a resolver into `try_apply_promo_discount`, and that resolver is called
+only after local candidate checks pass. Those checks are: apply feature enabled,
+record has a local client with phone, matching active `issued`/`booked`
+`PromoLead` exists, the service allowlist is configured and intersects the
+record services, and the local prior-attended-visit guard passes.
+
+If those cheap checks pass, the resolver first reads trusted creation fields
+from the record create webhook payload (`create_date`, `created_at`,
+`datetime_created`), then falls back to read-only
 `GET /record/{location_id}/{record_id}` and the same trusted fields from the
 Altegio record details response. `location_id` is taken from the payload when
-present, otherwise from `PROMO_LOCATION_ID_BY_COMPANY`.
+present, otherwise from `PROMO_LOCATION_ID_BY_COMPANY`. If the cheap checks do
+not pass, `GET /record` is not called.
 
 If the timestamp cannot be confirmed, the resolver returns `None` and
 `try_apply_promo_discount` skips the apply with
@@ -705,8 +713,9 @@ docker compose exec -T altegio-api python -m altegio_bot.scripts.find_promo_disc
 6. Run the printed dry-run command. It must not call Altegio.
 7. Manually verify in Altegio that the booking belongs to the test number, was
    created after `PromoLead.issued_at`, and uses an allowed service. The
-   production resolver checks `create_date`/`created_at`/`datetime_created` from
-   the webhook payload or read-only `GET /record`.
+   production resolver checks `create_date`/`created_at`/`datetime_created`
+   lazily from the webhook payload or read-only `GET /record` only after the
+   booking has passed local promo candidate checks.
 8. Run the real single-record smoke only with explicit API verification:
 
 ```bash

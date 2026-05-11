@@ -425,7 +425,34 @@ class TestHandleEventPromoBookingCreatedAt:
         event.payload = {"data": payload_data}
         return event
 
-    async def test_create_payload_create_date_passed_to_try_apply(self):
+    async def test_create_with_apply_disabled_does_not_create_expensive_resolver(self):
+        event = self._make_create_event()
+        session = AsyncMock()
+        record = MagicMock(id=99, company_id=758285, altegio_record_id=123456789, is_deleted=False)
+        try_apply = AsyncMock()
+        fetch_mock = AsyncMock(side_effect=AssertionError("GET /record must not be called"))
+        resolver = AsyncMock(side_effect=AssertionError("resolver must not be called"))
+
+        with (
+            patch("altegio_bot.workers.inbox_worker.upsert_client", new=AsyncMock(return_value=7)),
+            patch("altegio_bot.workers.inbox_worker.upsert_record", new=AsyncMock(return_value=99)),
+            patch("altegio_bot.workers.inbox_worker.replace_record_services", new=AsyncMock()),
+            patch("altegio_bot.workers.inbox_worker.record_has_allowed_service", new=AsyncMock(return_value=True)),
+            patch("altegio_bot.workers.inbox_worker.plan_jobs_for_record_event", new=AsyncMock()),
+            patch("altegio_bot.workers.inbox_worker.fetch_record_details_for_booking_created_at", fetch_mock),
+            patch("altegio_bot.workers.inbox_worker.resolve_booking_created_at_for_record_create", resolver),
+            patch("altegio_bot.workers.inbox_worker.try_apply_promo_discount", try_apply),
+            patch.object(settings, "promo_apply_discount_enabled", False),
+        ):
+            session.get = AsyncMock(return_value=record)
+            await handle_event(session, event)
+
+        resolver.assert_not_called()
+        fetch_mock.assert_not_called()
+        try_apply.assert_awaited_once()
+        assert try_apply.await_args.kwargs["booking_created_at_resolver"] is None
+
+    async def test_create_payload_create_date_passes_lazy_resolver_to_try_apply(self):
         event = self._make_create_event({"create_date": "2026-05-10 14:22:00"})
         session = AsyncMock()
         record = MagicMock(id=99, company_id=758285, altegio_record_id=123456789, is_deleted=False)
@@ -447,9 +474,12 @@ class TestHandleEventPromoBookingCreatedAt:
 
         fetch_mock.assert_not_called()
         try_apply.assert_awaited_once()
-        assert try_apply.await_args.kwargs["booking_created_at"] == datetime(2026, 5, 10, 12, 22, tzinfo=timezone.utc)
+        resolver = try_apply.await_args.kwargs["booking_created_at_resolver"]
+        assert resolver is not None
+        assert await resolver() == datetime(2026, 5, 10, 12, 22, tzinfo=timezone.utc)
+        fetch_mock.assert_not_called()
 
-    async def test_create_missing_payload_timestamp_uses_get_record_create_date(self):
+    async def test_create_missing_payload_timestamp_passes_lazy_get_record_resolver(self):
         event = self._make_create_event()
         session = AsyncMock()
         record = MagicMock(id=99, company_id=758285, altegio_record_id=123456789, is_deleted=False)
@@ -470,5 +500,8 @@ class TestHandleEventPromoBookingCreatedAt:
             session.get = AsyncMock(return_value=record)
             await handle_event(session, event)
 
-        fetch_mock.assert_awaited_once_with(location_id=758285, record_id=123456789)
-        assert try_apply.await_args.kwargs["booking_created_at"] == datetime(2026, 5, 10, 12, 22, tzinfo=timezone.utc)
+            fetch_mock.assert_not_called()
+            resolver = try_apply.await_args.kwargs["booking_created_at_resolver"]
+            assert resolver is not None
+            assert await resolver() == datetime(2026, 5, 10, 12, 22, tzinfo=timezone.utc)
+            fetch_mock.assert_awaited_once_with(location_id=758285, record_id=123456789)

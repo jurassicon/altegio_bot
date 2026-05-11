@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -349,6 +350,7 @@ async def try_apply_promo_discount(
     company_id: int,
     *,
     booking_created_at: datetime | None = None,
+    booking_created_at_resolver: Callable[[], Awaitable[datetime | None]] | None = None,
 ) -> None:
     """Attempt to apply a promo discount to a newly created Altegio visit.
 
@@ -356,10 +358,13 @@ async def try_apply_promo_discount(
     Update webhooks are intentionally ignored to avoid applying promo to
     bookings created before the promo was issued.
 
-    booking_created_at must be the confirmed booking creation time from the Altegio
-    record payload (not the webhook received time). If None or earlier than
-    PromoLead.issued_at, the discount is skipped (fail-closed) to prevent applying
-    a promo to a booking that predates the promo campaign.
+    booking_created_at must be the confirmed booking creation time from Altegio
+    (not the webhook received time). If it is not supplied directly,
+    booking_created_at_resolver may be provided; it is called lazily only after
+    local PromoLead, service allowlist, and prior-visit checks pass. If the
+    timestamp is still None or earlier than PromoLead.issued_at, the discount is
+    skipped (fail-closed) to prevent applying a promo to a booking that predates
+    the promo campaign.
 
     Fail-closed: controlled failures are recorded in PromoLead.meta and do not
     propagate as exceptions. Unexpected exceptions propagate to the caller so
@@ -369,14 +374,14 @@ async def try_apply_promo_discount(
     1. Feature gate check (promo_apply_discount_enabled).
     2. Resolve client phone from record.
     3. Find matching PromoLead (filtered by company_id + phone).
-    3b. Booking created timestamp guard (booking must postdate the promo issuance).
     4. Service allowlist check (promo_allowed_service_ids).
     5. New-client guard (no prior attended visits, local DB only).
-    6. Transition issued → booked (booking confirmed).
-    7. API gate check (promo_apply_discount_api_verified).
-    8. Call Altegio apply_discount_program API.
-    9. Update PromoLead status → applied.
-    10. Queue a customer WhatsApp notification (MessageJob, job_type='promo_discount_applied').
+    6. Resolve booking_created_at lazily and guard that it postdates promo issuance.
+    7. Transition issued → booked (booking confirmed).
+    8. API gate check (promo_apply_discount_api_verified).
+    9. Call Altegio apply_discount_program API.
+    10. Update PromoLead status → applied.
+    11. Queue a customer WhatsApp notification (MessageJob, job_type='promo_discount_applied').
     """
     cfg = settings
 
@@ -407,27 +412,6 @@ async def try_apply_promo_discount(
 
     meta = lead.meta or {}
 
-    # ── 3b. Booking created timestamp guard ───────────────────────────────────
-    # Fail-closed: a missing or pre-promo timestamp means the booking may predate
-    # this promo campaign. Altegio webhooks currently provide no confirmed booking
-    # creation timestamp, so this guard always skips until one is available.
-    if booking_created_at is None:
-        err = "missing booking created timestamp"
-        lead.meta = {**meta, "apply_skip_reason": err}
-        logger.info("promo_discount: skip lead_id=%s %s", lead.id, err)
-        return
-
-    if booking_created_at < lead.issued_at:
-        err = "booking predates promo lead"
-        lead.meta = {
-            **meta,
-            "apply_skip_reason": err,
-            "booking_created_at": booking_created_at.isoformat(),
-            "promo_issued_at": lead.issued_at.isoformat(),
-        }
-        logger.info("promo_discount: skip lead_id=%s %s", lead.id, err)
-        return
-
     # ── 4. Service allowlist check ────────────────────────────────────────────
     allowed_service_ids = get_promo_allowed_service_ids()
     if not allowed_service_ids:
@@ -452,7 +436,30 @@ async def try_apply_promo_discount(
         logger.info("promo_discount: skip lead_id=%s prior visited client", lead.id)
         return
 
-    # ── 6. Transition issued → booked ─────────────────────────────────────────
+    # ── 6. Booking created timestamp guard ────────────────────────────────────
+    # Resolve only after cheap local checks. A missing or pre-promo timestamp
+    # means the booking may predate this promo campaign, so apply stays blocked.
+    if booking_created_at is None and booking_created_at_resolver is not None:
+        booking_created_at = await booking_created_at_resolver()
+
+    if booking_created_at is None:
+        err = "missing booking created timestamp"
+        lead.meta = {**meta, "apply_skip_reason": err}
+        logger.info("promo_discount: skip lead_id=%s %s", lead.id, err)
+        return
+
+    if booking_created_at < lead.issued_at:
+        err = "booking predates promo lead"
+        lead.meta = {
+            **meta,
+            "apply_skip_reason": err,
+            "booking_created_at": booking_created_at.isoformat(),
+            "promo_issued_at": lead.issued_at.isoformat(),
+        }
+        logger.info("promo_discount: skip lead_id=%s %s", lead.id, err)
+        return
+
+    # ── 7. Transition issued → booked ─────────────────────────────────────────
     if lead.status == "issued":
         meta = {
             **meta,
@@ -470,7 +477,7 @@ async def try_apply_promo_discount(
             record.id,
         )
 
-    # ── 7. API gate ───────────────────────────────────────────────────────────
+    # ── 8. API gate ───────────────────────────────────────────────────────────
     if not cfg.promo_apply_discount_api_verified:
         err = "promo_apply_discount_api_verified=False — discount apply blocked until endpoint is verified"
         lead.meta = {
@@ -481,7 +488,7 @@ async def try_apply_promo_discount(
         logger.warning("promo_discount: api not verified, blocking apply for lead_id=%s", lead.id)
         return
 
-    # ── 8. Validate required fields ───────────────────────────────────────────
+    # ── 9. Validate required fields ───────────────────────────────────────────
     location_id = lead.location_id
     card_id_raw = lead.loyalty_card_id
     program_id_raw = lead.discount_program_id
@@ -517,7 +524,7 @@ async def try_apply_promo_discount(
 
     program_id: int | str = program_id_raw
 
-    # ── 9. Call Altegio API ───────────────────────────────────────────────────
+    # ── 10. Call Altegio API ──────────────────────────────────────────────────
     try:
         api_result = await apply_promo_discount_to_visit(
             location_id=location_id,
@@ -536,7 +543,7 @@ async def try_apply_promo_discount(
         logger.warning("promo_discount: API failed lead_id=%s: %s", lead.id, exc)
         return
 
-    # ── 10. Update PromoLead → applied ────────────────────────────────────────
+    # ── 11. Update PromoLead → applied ────────────────────────────────────────
     lead.status = "applied"
     lead.applied_at = now
     lead.record_id = record.id
