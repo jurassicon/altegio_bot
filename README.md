@@ -530,6 +530,33 @@ WhatsApp number, so the discount can be linked to her booking correctly.
 The share text uses the currently matched promo keyword and current promo
 discount settings, not stored audit values from an older rejected lead.
 
+**Async promo eligibility check:** by default
+`PROMO_ASYNC_ELIGIBILITY_CHECK_ENABLED=false`, so the current immediate MVP-1
+flow stays unchanged. When enabled, a first promo keyword with no existing lead
+creates `PromoLead.status='pending_check'`, sends an immediate checking reply,
+and queues `MessageJob.job_type='promo_eligibility_check'`. The background
+worker makes the final eligibility decision and then sends the issued/card,
+soft-rejection, or manual-check reply. The interim reply does not promise a
+discount or issue a loyalty card. The initial checking reply is still sent
+synchronously from the webhook handler; only the final eligibility decision is
+handled by `MessageJob`.
+
+`pending_check` remains pending until the final reply is successfully sent. If
+the final send fails, the job is retried according to the normal send-attempt
+budget and the customer still has a pending promo check. If a loyalty card is
+issued but that final card reply fails, the card fields stay on the pending lead,
+`PromoLead.meta.promo_check_card_reply_pending=true`, and retries reuse the
+stored card number instead of issuing a second card.
+
+When local prior-visit history already proves the client is not new, the async
+job skips the external Altegio lookup and records
+`PromoLead.meta.altegio_new_client_check='skipped_local_rejection'` after the
+soft-rejection reply is sent.
+
+External Altegio history lookup is still controlled separately by
+`PROMO_CHECK_NEW_CLIENT_IN_ALTEGIO`. Current production should keep that flag
+false until the `clients/visits/search` HTTP 403 permission issue is resolved.
+
 **New-client eligibility check:** by default the promo funnel keeps the existing
 local-only check for prior attended visits and makes no extra Altegio API call.
 Set `PROMO_CHECK_NEW_CLIENT_IN_ALTEGIO=true` to run an external Altegio history
@@ -571,7 +598,12 @@ active/card reply; retroactive cleanup is out of scope.
 - Retry worker for `apply_failed` leads
 - Customer notification on apply failure
 - Meta paid templates for promo notification
+- Fixing Altegio 403 permissions for the external history endpoint
+- Enabling `PROMO_CHECK_NEW_CLIENT_IN_ALTEGIO` in production
 - Automatic retry/manual reset for `altegio_new_client_check_failed`
+- Moving the initial checking reply into Outbox
+- Cleanup or Ops reset for stuck old `pending_check` leads
+- Retry flow for cancelled technical eligibility checks
 - Changing existing issued leads retroactively
 - Enabling production flags without a completed smoke test
 
@@ -582,6 +614,11 @@ explicitly enabled after verification.
 ### Required environment variables
 
 ```bash
+# Optional async promo eligibility flow.
+# Default false keeps the immediate MVP-1 promo reply flow.
+# If true, a pending_check PromoLead is created and MessageJob handles the final reply.
+PROMO_ASYNC_ELIGIBILITY_CHECK_ENABLED=false
+
 # Optional new-client CRM history check for WhatsApp promo leads.
 # Default false keeps local-only behaviour and makes no Altegio API call.
 # If true, PROMO_LOCATION_ID_BY_COMPANY must map company_id to Altegio location_id.

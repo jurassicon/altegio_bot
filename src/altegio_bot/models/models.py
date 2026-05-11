@@ -900,6 +900,7 @@ class CampaignRecipient(Base):
 PROMO_LEAD_STATUSES: frozenset[str] = frozenset(
     {
         "issued",  # discount linked, awaiting booking
+        "pending_check",  # eligibility check queued, no discount promised yet
         "booked",  # client booked after receiving discount
         "applied",  # discount reserved against the booking
         "used",  # discount applied to the completed visit
@@ -917,6 +918,7 @@ _PROMO_STATUS_CHECK = "status IN ({})".format(
         f"'{s}'"
         for s in (
             "issued",
+            "pending_check",
             "booked",
             "applied",
             "used",
@@ -935,11 +937,7 @@ class PromoLead(Base):
 
     Created when a client sends a known secret word (e.g. 'aktion') via
     WhatsApp.  Tracks the lifecycle of a personal discount offer from first
-    contact through booking and eventual discount application.
-
-    This PR implements: issued, expired, rejected_not_new.
-    Future PRs will advance through: booked, applied, used, cancelled,
-    apply_failed, rejected_service_not_allowed.
+    contact through eligibility checks, booking, and discount application.
     """
 
     __tablename__ = "promo_leads"

@@ -55,6 +55,10 @@ from altegio_bot.providers.dummy import safe_send, safe_send_template
 from altegio_bot.settings import settings
 from altegio_bot.template_validation import validate_template_params
 from altegio_bot.whatsapp_routing import pick_sender_code_for_record, pick_sender_id
+from altegio_bot.workers.promo_lead_handler import (
+    PROMO_ELIGIBILITY_CHECK_JOB_TYPE,
+    process_promo_eligibility_check_job,
+)
 
 logger = logging.getLogger("outbox_worker")
 
@@ -968,6 +972,10 @@ async def _run_job_logic(
         job.locked_at = None
         job.last_error = "Max attempts reached"
         return
+
+    if job.job_type == PROMO_ELIGIBILITY_CHECK_JOB_TYPE:
+        await process_promo_eligibility_check_job(session, job, provider)
+        return None
 
     record = await _load_record(session, job)
     if _record_is_in_past(record, job_type=job.job_type):

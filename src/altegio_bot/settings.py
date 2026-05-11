@@ -132,6 +132,9 @@ class Settings(BaseSettings):
     # Default False: keep local-only behaviour and make no Altegio API call.
     # When True, any Altegio visit/record for the WhatsApp phone blocks issuance.
     promo_check_new_client_in_altegio: bool = False
+    # Optional async promo eligibility flow.
+    # Default False keeps the current sync MVP-1 promo lead behaviour.
+    promo_async_eligibility_check_enabled: bool = False
 
     # ---------------------------------------------------------------------------
     # Promo loyalty card issuance (requires promo_lead_funnel_enabled=True)
