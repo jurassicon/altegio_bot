@@ -251,6 +251,7 @@ async def find_applicable_promo_lead_for_record(
     now: datetime,
     record: Record,
     for_update: bool = False,
+    expected_lead_id: int | None = None,
 ) -> PromoLead | None:
     """Return the most recent active PromoLead eligible for discount application.
 
@@ -273,6 +274,7 @@ async def find_applicable_promo_lead_for_record(
       re-attributing the promo to a different booking.
 
     for_update=True locks and refreshes the row for post-I/O revalidation.
+    expected_lead_id restricts revalidation to the same candidate found before I/O.
     """
     if not phone_e164:
         return None
@@ -293,6 +295,9 @@ async def find_applicable_promo_lead_for_record(
         .order_by(PromoLead.created_at.desc())
         .limit(1)
     )
+
+    if expected_lead_id is not None:
+        stmt = stmt.where(PromoLead.id == expected_lead_id)
 
     if for_update:
         stmt = stmt.with_for_update().execution_options(populate_existing=True)
@@ -383,7 +388,8 @@ async def try_apply_promo_discount(
     3. Find matching PromoLead (filtered by company_id + phone).
     4. Service allowlist check (promo_allowed_service_ids).
     5. New-client guard (no prior attended visits, local DB only).
-    6. Resolve booking_created_at lazily, revalidate/lock PromoLead, then guard timestamp.
+    6. Resolve booking_created_at lazily, revalidate/lock the same PromoLead,
+       re-run mutable local guards, then guard timestamp.
     7. Transition issued → booked (booking confirmed).
     8. API gate check (promo_apply_discount_api_verified).
     9. Call Altegio apply_discount_program API.
@@ -406,6 +412,35 @@ async def try_apply_promo_discount(
 
     phone_e164 = client.phone_e164
 
+    async def _passes_mutable_local_guards(current_lead: PromoLead) -> bool:
+        current_meta = current_lead.meta or {}
+
+        # Service allowlist check. This is intentionally re-run after any
+        # awaited timestamp lookup because local record services can change.
+        allowed_service_ids = get_promo_allowed_service_ids()
+        if not allowed_service_ids:
+            err = "promo_allowed_service_ids empty — discount not applied automatically"
+            current_lead.meta = {**current_meta, "apply_error": err, "apply_skip_reason": err}
+            logger.info("promo_discount: skip lead_id=%s %s", current_lead.id, err)
+            return False
+
+        record_service_ids = await _get_record_service_ids(session, record.id)
+        if not record_service_ids.intersection(allowed_service_ids):
+            err = f"no allowed service in record: record_services={record_service_ids} allowed={allowed_service_ids}"
+            current_lead.meta = {**current_meta, "apply_error": err, "apply_skip_reason": err}
+            logger.info("promo_discount: skip lead_id=%s service not allowed", current_lead.id)
+            return False
+
+        # New-client guard. This is local DB only and is also re-run after
+        # timestamp lookup because another sync can add attended visits.
+        if await _has_prior_attended_visits(session, phone_e164, exclude_record_id=record.id):
+            err = "client has prior attended visits — discount not applied"
+            current_lead.meta = {**current_meta, "apply_error": err, "apply_skip_reason": err}
+            logger.info("promo_discount: skip lead_id=%s prior visited client", current_lead.id)
+            return False
+
+        return True
+
     # ── 3. Find matching PromoLead ────────────────────────────────────────────
     lead = await find_applicable_promo_lead_for_record(
         session,
@@ -419,29 +454,13 @@ async def try_apply_promo_discount(
 
     meta = lead.meta or {}
 
-    # ── 4. Service allowlist check ────────────────────────────────────────────
-    allowed_service_ids = get_promo_allowed_service_ids()
-    if not allowed_service_ids:
-        err = "promo_allowed_service_ids empty — discount not applied automatically"
-        lead.meta = {**meta, "apply_error": err, "apply_skip_reason": err}
-        logger.info("promo_discount: skip lead_id=%s %s", lead.id, err)
+    # ── 4–5. Mutable local guards ─────────────────────────────────────────────
+    # TODO: The prior-visit check uses local DB only and may miss visits not yet
+    # synced from Altegio. A full CRM API history check is deferred to a future PR.
+    if not await _passes_mutable_local_guards(lead):
         return
 
-    record_service_ids = await _get_record_service_ids(session, record.id)
-    if not record_service_ids.intersection(allowed_service_ids):
-        err = f"no allowed service in record: record_services={record_service_ids} allowed={allowed_service_ids}"
-        lead.meta = {**meta, "apply_error": err, "apply_skip_reason": err}
-        logger.info("promo_discount: skip lead_id=%s service not allowed", lead.id)
-        return
-
-    # ── 5. New-client guard ───────────────────────────────────────────────────
-    # TODO: This check uses local DB only and may miss visits not yet synced
-    # from Altegio. A full CRM API history check is deferred to a future PR.
-    if await _has_prior_attended_visits(session, phone_e164, exclude_record_id=record.id):
-        err = "client has prior attended visits — discount not applied"
-        lead.meta = {**meta, "apply_error": err, "apply_skip_reason": err}
-        logger.info("promo_discount: skip lead_id=%s prior visited client", lead.id)
-        return
+    candidate_lead_id = lead.id
 
     # ── 6. Booking created timestamp guard ────────────────────────────────────
     # Resolve only after cheap local checks. A missing or pre-promo timestamp
@@ -456,12 +475,15 @@ async def try_apply_promo_discount(
             now=now,
             record=record,
             for_update=True,
+            expected_lead_id=candidate_lead_id,
         )
         if lead is None:
             logger.info(
                 "promo_discount: lead no longer applicable after booking_created_at lookup record_id=%s",
                 record.id,
             )
+            return
+        if not await _passes_mutable_local_guards(lead):
             return
         meta = lead.meta or {}
 
