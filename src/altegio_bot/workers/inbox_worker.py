@@ -22,7 +22,7 @@ from altegio_bot.db import SessionLocal
 from altegio_bot.message_planner import plan_jobs_for_record_event
 from altegio_bot.models.models import AltegioEvent, Client, Record, RecordService
 from altegio_bot.perf import perf_log
-from altegio_bot.promo_discount_apply import try_apply_promo_discount
+from altegio_bot.promo_discount_apply import should_suppress_promo_origin_record_update, try_apply_promo_discount
 from altegio_bot.service_filter import record_has_allowed_service
 from altegio_bot.settings import settings
 
@@ -535,6 +535,19 @@ async def handle_event(session: AsyncSession, event: AltegioEvent) -> None:
                     int(company_id),
                     booking_created_at_resolver=booking_created_at_resolver,
                 )
+
+            # Suppress plan_jobs for record_updated webhooks triggered by our own
+            # promo price-override PUT. The suppression applies only within a
+            # 5-minute window after the PUT (promo_record_put_at in PromoLead.meta)
+            # so that legitimate future edits to the same record are not silenced.
+            if normalized_status == "update" and await should_suppress_promo_origin_record_update(
+                session, record_obj, event
+            ):
+                logger.info(
+                    "promo_discount: suppress plan_jobs for promo-origin record_updated record_id=%s",
+                    record_obj.id,
+                )
+                return
 
             allowed = await record_has_allowed_service(
                 session=session,

@@ -134,6 +134,7 @@ def _base_settings_ctx(**overrides):
         "promo_apply_discount_enabled": True,
         "promo_apply_discount_api_verified": True,
         "promo_allowed_service_ids": str(_ALLOWED_SERVICE),
+        "promo_apply_mode": "loyalty_program",  # keep notification tests on legacy path
     }
     defaults.update(overrides)
     patches = [patch.object(settings, k, v) for k, v in defaults.items()]

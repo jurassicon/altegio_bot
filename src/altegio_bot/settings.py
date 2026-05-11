@@ -173,16 +173,36 @@ class Settings(BaseSettings):
     # Master gate. Default False: no discount is applied to bookings.
     # Enable only after promo_apply_discount_api_verified is also True.
     promo_apply_discount_enabled: bool = False
-    # Smoke-test gate for the UNCONFIRMED Altegio endpoint:
-    #   POST /visit/loyalty/apply_discount_program/{location_id}/{card_id}/{program_id}
+    # Smoke-test gate for discount-apply API calls.
     # Default False: API call is blocked even when promo_apply_discount_enabled=True.
-    # Set True only after confirming the endpoint shape against Altegio API docs
-    # and completing a smoke test in a non-production environment.
+    # Set True only after completing a smoke test in a non-production environment.
+    #
+    # record_price_override mode: gates PUT /record (smoke-tested May 2026 ✓).
+    # loyalty_program mode:       gates POST /visit/loyalty/apply_discount_program
+    #                             (UNCONFIRMED endpoint — source: developer discussion).
     promo_apply_discount_api_verified: bool = False
     # Comma-separated Altegio service IDs eligible for the promo discount.
     # If empty: discount is never applied automatically (fail-closed).
     # Example: PROMO_ALLOWED_SERVICE_IDS=12345,67890
     promo_allowed_service_ids: str = ""
+    # Discount-apply implementation mode.
+    # 'record_price_override': PUT /record to change service price directly.
+    #   This is the confirmed-working approach (smoke-tested May 2026).
+    # 'loyalty_program': legacy POST /visit/loyalty/apply_discount_program endpoint
+    #   (kept for backward compatibility with existing tests and smoke scripts).
+    # Any other value raises ValueError at startup.
+    promo_apply_mode: str = "record_price_override"
+
+    @field_validator("promo_apply_mode")
+    @classmethod
+    def validate_promo_apply_mode(cls, v: str) -> str:
+        allowed = {"record_price_override", "loyalty_program"}
+        if v not in allowed:
+            raise ValueError(
+                f"promo_apply_mode must be one of {sorted(allowed)!r}, got {v!r}. "
+                "Check the PROMO_APPLY_MODE environment variable."
+            )
+        return v
 
     # Publicly accessible image URLs for newsletter template IMAGE HEADER components.
     # Meta Cloud API requires a permanent URL it can fetch and cache at send time.

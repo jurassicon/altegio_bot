@@ -4,7 +4,10 @@ from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
 
+import pytest
+
 from altegio_bot.altegio_records import AltegioRecordResearchError
+from altegio_bot.promo_discount_apply import is_promo_origin_comment
 from altegio_bot.settings import settings
 from altegio_bot.workers.inbox_worker import (
     _normalize_phone,
@@ -337,7 +340,7 @@ class TestHandleEventVisitAttendance:
             patch("altegio_bot.workers.inbox_worker.plan_jobs_for_record_event", new=AsyncMock()) as mock_plan,
             patch("altegio_bot.workers.inbox_worker.resolve_booking_created_at_for_record_create", new=AsyncMock()),
         ):
-            session.get = AsyncMock(return_value=MagicMock(id=99, company_id=123))
+            session.get = AsyncMock(return_value=MagicMock(id=99, company_id=123, comment=None))
             await handle_event(session, event)
             return mock_plan.called
 
@@ -378,7 +381,7 @@ class TestHandleEventVisitAttendance:
             patch("altegio_bot.workers.inbox_worker.plan_jobs_for_record_event", new=AsyncMock()) as mock_plan,
             patch("altegio_bot.workers.inbox_worker.resolve_booking_created_at_for_record_create", new=AsyncMock()),
         ):
-            session.get = AsyncMock(return_value=MagicMock(id=99, company_id=123))
+            session.get = AsyncMock(return_value=MagicMock(id=99, company_id=123, comment=None))
             await handle_event(session, event)
 
         mock_plan.assert_awaited_once()
@@ -398,7 +401,7 @@ class TestHandleEventVisitAttendance:
             patch("altegio_bot.workers.inbox_worker.resolve_booking_created_at_for_record_create", resolver),
             patch.object(settings, "promo_apply_discount_enabled", True),
         ):
-            session.get = AsyncMock(return_value=MagicMock(id=99, company_id=123, is_deleted=False))
+            session.get = AsyncMock(return_value=MagicMock(id=99, company_id=123, is_deleted=False, comment=None))
             await handle_event(session, event)
 
         resolver.assert_not_called()
@@ -505,3 +508,161 @@ class TestHandleEventPromoBookingCreatedAt:
             assert resolver is not None
             assert await resolver() == datetime(2026, 5, 10, 12, 22, tzinfo=timezone.utc)
             fetch_mock.assert_awaited_once_with(location_id=758285, record_id=123456789)
+
+
+# =============================================================================
+# Tests D, E, F — promo origin comment suppression for record_updated events
+# =============================================================================
+
+_PHONE = "+4916099887766"
+_COMPANY = 1
+_ALLOWED_SERVICE = 12345
+
+
+def _make_update_event(*, comment: str | None) -> MagicMock:
+    """Build a fake record_updated AltegioEvent for suppression tests."""
+    event = MagicMock()
+    event.id = 1
+    event.company_id = _COMPANY
+    event.resource = "record"
+    event.event_status = "update"
+    event.resource_id = None
+    event.received_at = datetime(2026, 5, 8, 20, 0, 0, tzinfo=timezone.utc)
+    event.payload = {
+        "data": {
+            "id": 424242,
+            "client": {"id": 100, "display_name": "Test", "phone": _PHONE},
+            "services": [{"id": _ALLOWED_SERVICE, "title": "Test", "cost_to_pay": 50}],
+            "date": "2026-05-08 12:00:00",
+            "staff_id": 5,
+            "comment": comment,
+            "visit_attendance": 0,
+        }
+    }
+    return event
+
+
+def _make_mock_record(*, comment: str | None) -> MagicMock:
+    record = MagicMock()
+    record.id = 99
+    record.company_id = _COMPANY
+    record.is_deleted = False
+    record.comment = comment
+    return record
+
+
+# Unit tests for is_promo_origin_comment helper
+
+
+class TestIsPromoOriginComment:
+    def test_none_returns_false(self):
+        assert is_promo_origin_comment(None) is False
+
+    def test_empty_string_returns_false(self):
+        assert is_promo_origin_comment("") is False
+
+    def test_no_marker_returns_false(self):
+        assert is_promo_origin_comment("Normal appointment note") is False
+
+    def test_simple_marker_detected(self):
+        assert is_promo_origin_comment("[PromoLead:42]") is True
+
+    def test_manual_marker_detected(self):
+        assert is_promo_origin_comment("Some note\n[PromoLead:42:manual]") is True
+
+    def test_marker_mid_text_detected(self):
+        assert is_promo_origin_comment("Text before [PromoLead:999] text after") is True
+
+    def test_partial_marker_not_detected(self):
+        assert is_promo_origin_comment("[PromoLead:]") is False
+
+    def test_wrong_format_not_detected(self):
+        assert is_promo_origin_comment("PromoLead:42") is False
+
+
+# Integration tests: handle_event suppression on record_updated
+
+
+@pytest.mark.asyncio
+async def test_record_updated_simple_promo_marker_suppresses_plan_jobs() -> None:
+    """
+    D. record_updated event whose comment contains [PromoLead:<id>] (simple marker)
+    must NOT call plan_jobs_for_record_event when suppress helper returns True.
+    The suppress helper itself is tested separately (TestShouldSuppressPromoOrigin*).
+    """
+    event = _make_update_event(comment="Note\n[PromoLead:42]")
+    session = AsyncMock()
+    mock_record = _make_mock_record(comment="Note\n[PromoLead:42]")
+    mock_plan = AsyncMock()
+    suppress_mock = AsyncMock(return_value=True)
+
+    with (
+        patch("altegio_bot.workers.inbox_worker.upsert_client", new=AsyncMock(return_value=100)),
+        patch("altegio_bot.workers.inbox_worker.upsert_record", new=AsyncMock(return_value=99)),
+        patch("altegio_bot.workers.inbox_worker.replace_record_services", new=AsyncMock()),
+        patch("altegio_bot.workers.inbox_worker.plan_jobs_for_record_event", mock_plan),
+        patch("altegio_bot.workers.inbox_worker.should_suppress_promo_origin_record_update", suppress_mock),
+    ):
+        session.get = AsyncMock(return_value=mock_record)
+        await handle_event(session, event)
+
+    suppress_mock.assert_awaited_once()
+    mock_plan.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_record_updated_manual_promo_marker_suppresses_plan_jobs() -> None:
+    """
+    E. record_updated event whose comment contains [PromoLead:<id>:manual] (manual marker)
+    must NOT call plan_jobs_for_record_event when suppress helper returns True.
+    """
+    comment = "Promo welcome_discount: Neukundenrabatt reserviert.\n[PromoLead:55:manual]"
+    event = _make_update_event(comment=comment)
+    session = AsyncMock()
+    mock_record = _make_mock_record(comment=comment)
+    mock_plan = AsyncMock()
+    suppress_mock = AsyncMock(return_value=True)
+
+    with (
+        patch("altegio_bot.workers.inbox_worker.upsert_client", new=AsyncMock(return_value=100)),
+        patch("altegio_bot.workers.inbox_worker.upsert_record", new=AsyncMock(return_value=99)),
+        patch("altegio_bot.workers.inbox_worker.replace_record_services", new=AsyncMock()),
+        patch("altegio_bot.workers.inbox_worker.plan_jobs_for_record_event", mock_plan),
+        patch("altegio_bot.workers.inbox_worker.should_suppress_promo_origin_record_update", suppress_mock),
+    ):
+        session.get = AsyncMock(return_value=mock_record)
+        await handle_event(session, event)
+
+    suppress_mock.assert_awaited_once()
+    mock_plan.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_record_updated_no_promo_marker_calls_plan_jobs() -> None:
+    """
+    F. record_updated event with a normal comment (no promo marker) must call
+    plan_jobs_for_record_event normally when suppress helper returns False.
+    """
+    comment = "Normale Buchungsnotiz"
+    event = _make_update_event(comment=comment)
+    session = AsyncMock()
+    mock_record = _make_mock_record(comment=comment)
+    mock_plan = AsyncMock()
+    suppress_mock = AsyncMock(return_value=False)
+
+    with (
+        patch("altegio_bot.workers.inbox_worker.upsert_client", new=AsyncMock(return_value=100)),
+        patch("altegio_bot.workers.inbox_worker.upsert_record", new=AsyncMock(return_value=99)),
+        patch("altegio_bot.workers.inbox_worker.replace_record_services", new=AsyncMock()),
+        patch(
+            "altegio_bot.workers.inbox_worker.record_has_allowed_service",
+            new=AsyncMock(return_value=True),
+        ),
+        patch("altegio_bot.workers.inbox_worker.plan_jobs_for_record_event", mock_plan),
+        patch("altegio_bot.workers.inbox_worker.should_suppress_promo_origin_record_update", suppress_mock),
+    ):
+        session.get = AsyncMock(return_value=mock_record)
+        await handle_event(session, event)
+
+    suppress_mock.assert_awaited_once()
+    mock_plan.assert_awaited_once()
