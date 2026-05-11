@@ -173,11 +173,13 @@ class Settings(BaseSettings):
     # Master gate. Default False: no discount is applied to bookings.
     # Enable only after promo_apply_discount_api_verified is also True.
     promo_apply_discount_enabled: bool = False
-    # Smoke-test gate for the UNCONFIRMED Altegio endpoint:
-    #   POST /visit/loyalty/apply_discount_program/{location_id}/{card_id}/{program_id}
+    # Smoke-test gate for discount-apply API calls.
     # Default False: API call is blocked even when promo_apply_discount_enabled=True.
-    # Set True only after confirming the endpoint shape against Altegio API docs
-    # and completing a smoke test in a non-production environment.
+    # Set True only after completing a smoke test in a non-production environment.
+    #
+    # record_price_override mode: gates PUT /record (smoke-tested May 2026 ✓).
+    # loyalty_program mode:       gates POST /visit/loyalty/apply_discount_program
+    #                             (UNCONFIRMED endpoint — source: developer discussion).
     promo_apply_discount_api_verified: bool = False
     # Comma-separated Altegio service IDs eligible for the promo discount.
     # If empty: discount is never applied automatically (fail-closed).

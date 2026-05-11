@@ -111,14 +111,33 @@ def normalize_record_client_for_put(record_data: dict[str, Any]) -> dict[str, An
     name, and email are needed and accepted by the PUT endpoint.  Sending
     extra fields (id, display_name, …) has caused 422 errors in some Altegio
     account configurations.
+
+    Empty-string values are excluded alongside None so that a blank email or
+    phone from the GET response does not overwrite a field that Altegio treats
+    as absent.
     """
     client = record_data.get("client") or {}
     result: dict[str, Any] = {}
     for field in ("phone", "name", "email"):
         value = client.get(field)
-        if value is not None:
+        if value not in (None, ""):
             result[field] = value
     return result
+
+
+def _value_or_zero(value: object) -> float:
+    """Return ``float(value)`` if *value* is not None, else 0.0.
+
+    Avoids the ``or 0`` anti-pattern where a legitimate zero price (free
+    service) would silently fall through the truthiness check and be
+    replaced by 0 from the ``or`` branch rather than preserved as-is.
+    """
+    if value is None:
+        return 0.0
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def build_minimal_service_for_put(
@@ -135,14 +154,21 @@ def build_minimal_service_for_put(
     (title, cost_to_pay, manual_cost, cost_per_unit, assistants, amount, …)
     are stripped to avoid PUT 422 errors on certain Altegio configurations.
 
+    Altegio PUT /record field semantics:
+      cost        — final charged price in EUR (after discount applied)
+      first_cost  — original list price in EUR before discount
+      discount    — discount amount in EUR (NOT a percentage)
+
     Pass override_* kwargs to change specific price fields from the source
     service; omitted overrides fall back to the source service values.
+    ``_value_or_zero`` is used instead of ``or 0`` so that a legitimate zero
+    price is preserved rather than silently replaced via truthiness.
     """
     return {
         "id": svc["id"],
-        "first_cost": override_first_cost if override_first_cost is not None else (svc.get("first_cost") or 0),
-        "discount": override_discount if override_discount is not None else (svc.get("discount") or 0),
-        "cost": override_cost if override_cost is not None else (svc.get("cost") or 0),
+        "first_cost": override_first_cost if override_first_cost is not None else _value_or_zero(svc.get("first_cost")),
+        "discount": override_discount if override_discount is not None else _value_or_zero(svc.get("discount")),
+        "cost": override_cost if override_cost is not None else _value_or_zero(svc.get("cost")),
     }
 
 

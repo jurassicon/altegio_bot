@@ -175,6 +175,35 @@ def is_promo_origin_comment(comment: str | None) -> bool:
     return bool(_PROMO_MARKER_RE.search(comment))
 
 
+def parse_promo_marker(comment: str | None) -> dict[str, object] | None:
+    """Parse a promo marker from a comment string.
+
+    Returns ``{'lead_id': int, 'kind': str}`` or ``None`` if no marker found.
+
+    ``kind`` is ``'simple'`` for ``[PromoLead:<id>]`` and ``'manual'`` for
+    ``[PromoLead:<id>:manual]``.  Unknown suffixes are passed through as-is
+    so callers can treat unrecognised kinds as fail-closed.
+
+    Used by ``_apply_via_record_price_override`` to distinguish between:
+    - Our own marker (same lead_id) → recover lead state, skip re-PUT.
+    - A different lead's marker → fail-closed (apply_failed).
+    """
+    if not comment:
+        return None
+    m = _PROMO_MARKER_RE.search(comment)
+    if not m:
+        return None
+    marker = m.group()
+    inner = marker[len("[PromoLead:"):-1]  # strips "[PromoLead:" prefix and "]" suffix
+    parts = inner.split(":")
+    try:
+        lead_id = int(parts[0])
+    except (ValueError, IndexError):
+        return None
+    kind = parts[1] if len(parts) > 1 else "simple"
+    return {"lead_id": lead_id, "kind": kind}
+
+
 async def should_suppress_promo_origin_record_update(
     session: AsyncSession,
     record: Record,
@@ -193,11 +222,19 @@ async def should_suppress_promo_origin_record_update(
       marker in ``record.comment``, load the matching PromoLead, verify it owns
       this altegio_record_id, then check the PUT timestamp in meta.
 
+      Note: if the marker belongs to a *different* PromoLead (wrong
+      ``altegio_record_id`` or unknown lead) the fast path returns False
+      immediately — it does NOT fall through to the slow path, because a
+      cross-lead marker indicates a state mismatch that deserves human review,
+      not silent suppression.
+
     Slow path (no comment marker):
       Scan PromoLeads by altegio_record_id for any that have a
       ``promo_record_put_at`` within the suppression window.  Covers the edge
       case where Altegio's record_updated webhook is delivered before our own
-      DB write of the comment is visible to the record sync.
+      DB write of the comment is visible to the record sync.  Each candidate
+      is additionally checked for ``promo_record_put_altegio_record_id`` and
+      ``promo_record_put_kind`` to guard against stale or mismatched metadata.
 
     Never suppresses updates that arrive AFTER the 5-minute window, so future
     legitimate edits to a promo-annotated record are not silenced.
@@ -252,6 +289,8 @@ async def should_suppress_promo_origin_record_update(
                 pass
 
     # ── Slow path: scan leads by altegio_record_id ───────────────────────────
+    # Limit to 5 candidates: one promo per record is the normal case; a small
+    # cap avoids a full-table scan while still covering rare retry scenarios.
     stmt = (
         select(PromoLead)
         .where(PromoLead.altegio_record_id == record.altegio_record_id)
@@ -263,8 +302,19 @@ async def should_suppress_promo_origin_record_update(
 
     window_start = event_received_at - timedelta(seconds=_SUPPRESS_WINDOW_SEC)
     for candidate in candidates:
-        put_at_str = (candidate.meta or {}).get("promo_record_put_at")
+        cmeta = candidate.meta or {}
+        put_at_str = cmeta.get("promo_record_put_at")
         if not put_at_str:
+            continue
+        # Guard: the stored altegio_record_id in meta must match the current
+        # record's altegio_record_id so we do not suppress based on stale
+        # metadata from a prior record association.
+        stored_altegio_id = cmeta.get("promo_record_put_altegio_record_id")
+        if stored_altegio_id is not None and stored_altegio_id != record.altegio_record_id:
+            continue
+        # Guard: promo_record_put_kind must be present (ensures the meta was
+        # written by the current code path, not an older schema version).
+        if not cmeta.get("promo_record_put_kind"):
             continue
         try:
             promo_put_at = datetime.fromisoformat(put_at_str)
@@ -439,9 +489,35 @@ async def _apply_via_record_price_override(
         logger.warning("promo_discount: missing fields lead_id=%s %s", lead.id, err)
         return
 
-    # ── Idempotency: local comment check (no API call) ────────────────────────
-    if is_promo_origin_comment(record.comment):
-        logger.info("promo_discount: promo marker in local comment, skip PUT lead_id=%s", lead.id)
+    # ── Idempotency / recovery: local comment check (no API call) ────────────
+    # If the record already carries a promo marker we distinguish two cases:
+    #   • Our own lead's marker → recover lead state without re-PUT (idempotent).
+    #   • A different lead's marker → fail-closed to avoid double-discount.
+    parsed_local = parse_promo_marker(record.comment)
+    if parsed_local is not None:
+        marker_lead_id = int(parsed_local["lead_id"])
+        if marker_lead_id == lead.id:
+            kind = str(parsed_local["kind"])
+            if kind == "simple":
+                lead.status = "applied"
+                lead.applied_at = lead.applied_at or now
+                lead.record_id = record.id
+                lead.altegio_record_id = altegio_record_id
+                await _ensure_promo_discount_notification_job(session, lead, client, record, phone_e164, now)
+            else:
+                lead.status = "booked"
+                lead.record_id = record.id
+                lead.altegio_record_id = altegio_record_id
+            logger.info(
+                "promo_discount: this lead's marker in local comment, recovered lead_id=%s kind=%s",
+                lead.id,
+                kind,
+            )
+        else:
+            err = f"promo marker in local comment belongs to different lead_id={marker_lead_id}"
+            lead.status = "apply_failed"
+            lead.meta = {**meta, "discount_apply_error": err, "discount_apply_attempted_at": now.isoformat()}
+            logger.warning("promo_discount: %s lead_id=%s", err, lead.id)
         return
 
     # ── Attendance guard: do not price-override attended / completed records ──
@@ -478,10 +554,32 @@ async def _apply_via_record_price_override(
         logger.warning("promo_discount: GET /record failed lead_id=%s: %s", lead.id, exc)
         return
 
-    # ── Idempotency: fresh Altegio comment check ──────────────────────────────
-    if is_promo_origin_comment(altegio_data.get("comment")):
-        logger.info("promo_discount: promo marker in Altegio comment, skip PUT lead_id=%s", lead.id)
-        lead.meta = {**meta, "apply_skip_reason": "promo_marker_already_in_altegio_comment"}
+    # ── Idempotency / recovery: fresh Altegio comment check ──────────────────
+    parsed_altegio = parse_promo_marker(altegio_data.get("comment"))
+    if parsed_altegio is not None:
+        marker_lead_id = int(parsed_altegio["lead_id"])
+        if marker_lead_id == lead.id:
+            kind = str(parsed_altegio["kind"])
+            if kind == "simple":
+                lead.status = "applied"
+                lead.applied_at = lead.applied_at or now
+                lead.record_id = record.id
+                lead.altegio_record_id = altegio_record_id
+                await _ensure_promo_discount_notification_job(session, lead, client, record, phone_e164, now)
+            else:
+                lead.status = "booked"
+                lead.record_id = record.id
+                lead.altegio_record_id = altegio_record_id
+            logger.info(
+                "promo_discount: this lead's marker in Altegio comment, recovered lead_id=%s kind=%s",
+                lead.id,
+                kind,
+            )
+        else:
+            err = f"promo marker in Altegio comment belongs to different lead_id={marker_lead_id}"
+            lead.status = "apply_failed"
+            lead.meta = {**meta, "discount_apply_error": err, "discount_apply_attempted_at": now.isoformat()}
+            logger.warning("promo_discount: %s lead_id=%s", err, lead.id)
         return
 
     # ── Attendance re-check against fresh Altegio data ───────────────────────
@@ -495,6 +593,49 @@ async def _apply_via_record_price_override(
 
     existing_comment = altegio_data.get("comment") or ""
     altegio_services = altegio_data.get("services") or []
+
+    # ── Re-run mutable guards against fresh local + Altegio data (P1.1) ───────
+    # Between the first guard run and the GET, the local DB or Altegio itself
+    # may have changed (concurrent booking, service edit, sync lag).  Re-running
+    # ensures the simple/complex decision is based on the most current state.
+    record_service_ids = await _get_record_service_ids(session, record.id)
+    matching_service_ids = record_service_ids.intersection(allowed_service_ids)
+    same_day_count = await _count_same_day_records_for_client(
+        session,
+        client_id=record.client_id,
+        company_id=record.company_id,
+        reference_starts_at=record.starts_at,
+    )
+
+    # Cross-check: which allowed services appear in the *fresh Altegio* services
+    # list?  If Altegio's view diverges from local (late sync, concurrent edit),
+    # we fail-closed rather than applying a discount to the wrong service.
+    fresh_allowed_service_ids: set[int] = set()
+    for svc in altegio_services:
+        if not isinstance(svc, dict):
+            continue
+        svc_id = parse_service_id(svc.get("id"))
+        if svc_id is not None and svc_id in allowed_service_ids:
+            fresh_allowed_service_ids.add(svc_id)
+
+    if not fresh_allowed_service_ids:
+        err = "no allowed service in fresh Altegio record services (fail-closed)"
+        lead.status = "apply_failed"
+        lead.meta = {**meta, "discount_apply_error": err, "discount_apply_attempted_at": now.isoformat()}
+        logger.warning("promo_discount: no allowed service in fresh Altegio record lead_id=%s", lead.id)
+        return
+
+    # Simple case requires all four conditions simultaneously:
+    #   1. Exactly one same-day record for this client (local DB, fresh).
+    #   2. Exactly one allowed service in the local record (fresh).
+    #   3. Exactly one allowed service in the fresh Altegio record.
+    #   4. Local and Altegio agree on which service it is.
+    is_simple = (
+        same_day_count == 1
+        and len(matching_service_ids) == 1
+        and len(fresh_allowed_service_ids) == 1
+        and matching_service_ids == fresh_allowed_service_ids
+    )
 
     if is_simple:
         # ── Simple case: automatic price override ─────────────────────────────
@@ -553,6 +694,11 @@ async def _apply_via_record_price_override(
             logger.warning("promo_discount: PUT /record failed lead_id=%s: %s", lead.id, exc)
             return
 
+        # Capture timestamp immediately after the PUT so the suppression window
+        # starts from when Altegio actually processed the request, not when we
+        # entered this function (which may be seconds earlier after DB queries).
+        put_at = _utcnow()
+
         # Extract Altegio-computed discount percentage (percentage, not our € amount)
         returned_discount: float | None = None
         put_data = put_result.get("data") or {}
@@ -580,7 +726,9 @@ async def _apply_via_record_price_override(
             "discount_apply_attempted_at": now.isoformat(),
             # Suppression window metadata: used by inbox_worker to decide whether
             # to suppress the record_updated echo webhook from this PUT.
-            "promo_record_put_at": now.isoformat(),
+            # put_at is captured after the successful PUT (not now) so the window
+            # starts as close to the Altegio processing time as possible.
+            "promo_record_put_at": put_at.isoformat(),
             "promo_record_put_marker": f"[PromoLead:{lead.id}]",
             "promo_record_put_record_id": record.id,
             "promo_record_put_altegio_record_id": altegio_record_id,
@@ -622,6 +770,9 @@ async def _apply_via_record_price_override(
             logger.warning("promo_discount: complex PUT /record failed lead_id=%s: %s", lead.id, exc)
             return
 
+        # Capture timestamp immediately after PUT (see simple-case comment above).
+        put_at = _utcnow()
+
         lead.status = "booked"
         lead.record_id = record.id
         lead.altegio_record_id = record.altegio_record_id
@@ -632,7 +783,7 @@ async def _apply_via_record_price_override(
             "discount_apply_attempted_at": now.isoformat(),
             # Suppression window metadata: used by inbox_worker to decide whether
             # to suppress the record_updated echo webhook from this PUT.
-            "promo_record_put_at": now.isoformat(),
+            "promo_record_put_at": put_at.isoformat(),
             "promo_record_put_marker": f"[PromoLead:{lead.id}:manual]",
             "promo_record_put_record_id": record.id,
             "promo_record_put_altegio_record_id": altegio_record_id,
