@@ -112,16 +112,27 @@ def normalize_record_client_for_put(record_data: dict[str, Any]) -> dict[str, An
     extra fields (id, display_name, …) has caused 422 errors in some Altegio
     account configurations.
 
-    Empty-string values are excluded alongside None so that a blank email or
-    phone from the GET response does not overwrite a field that Altegio treats
-    as absent.
+    Field policy (matches smoke-tested PUT payload, May 2026):
+      phone  — included only when truthy; empty string treated as absent.
+      email  — included only when truthy; empty string treated as absent.
+      name   — always included (Altegio requires this field); falls back to
+               ``display_name`` when ``name`` is empty/absent, then to ``""``
+               so the PUT never sends a missing ``name`` key.
     """
     client = record_data.get("client") or {}
     result: dict[str, Any] = {}
-    for field in ("phone", "name", "email"):
-        value = client.get(field)
-        if value not in (None, ""):
-            result[field] = value
+
+    phone = client.get("phone")
+    if phone:
+        result["phone"] = phone
+
+    # name falls back to display_name to restore smoke-tested payload behaviour
+    result["name"] = client.get("name") or client.get("display_name") or ""
+
+    email = client.get("email")
+    if email:
+        result["email"] = email
+
     return result
 
 
@@ -195,7 +206,7 @@ def _build_put_payload(
         "client": normalize_record_client_for_put(record_data),
         "save_if_busy": record_data.get("save_if_busy", 1),
         "datetime": record_data.get("datetime", ""),
-        "seance_length": record_data.get("seance_length"),
+        "seance_length": record_data.get("seance_length") or record_data.get("length"),
         "send_sms": False,
         "comment": new_comment,
         "sms_remain_hours": record_data.get("sms_remain_hours"),
