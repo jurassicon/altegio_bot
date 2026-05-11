@@ -97,6 +97,25 @@ class _CaptureProvider(WhatsAppProvider):
         return self.wamid
 
 
+class _FailingCaptureProvider(_CaptureProvider):
+    def __init__(self, *, failures: int = 1, error: str = "downstream timeout") -> None:
+        super().__init__()
+        self.failures_remaining = failures
+        self.error = error
+
+    async def send(
+        self,
+        sender_id: int,
+        phone_e164: str,
+        text: str,
+        contact_name: str | None = None,
+    ) -> str:
+        if self.failures_remaining > 0:
+            self.failures_remaining -= 1
+            raise RuntimeError(self.error)
+        return await super().send(sender_id, phone_e164, text, contact_name)
+
+
 class _FakeCW:
     async def log_incoming_message(self, phone: str, text: str, contact_name: str | None = None) -> None:
         pass
@@ -2019,11 +2038,7 @@ async def test_async_flag_true_new_keyword_creates_pending_and_job_without_card(
     assert len(jobs) == 1
     job = jobs[0]
     assert job.dedupe_key == f"promo_eligibility_check:{lead.id}"
-    assert job.payload["promo_lead_id"] == lead.id
-    assert job.payload["phone_e164"] == PHONE_E164
-    assert job.payload["company_id"] == 1
-    assert job.payload["campaign_name"] == CAMPAIGN
-    assert job.payload["secret_code"] == "aktion"
+    assert job.payload == {"promo_lead_id": lead.id}
 
 
 @pytest.mark.asyncio
@@ -2160,6 +2175,8 @@ async def test_async_worker_local_old_client_rejects_not_new(session_maker) -> N
     assert refreshed_lead.status == "rejected_not_new"
     assert refreshed_lead.reject_reason == "has_prior_visits"
     assert refreshed_lead.loyalty_card_id is None
+    assert (refreshed_lead.meta or {}).get("promo_check") == "done"
+    assert (refreshed_lead.meta or {}).get("altegio_new_client_check") == "skipped_local_rejection"
     assert refreshed_job is not None
     assert refreshed_job.status == "done"
 
@@ -2244,6 +2261,282 @@ async def test_async_worker_external_error_fails_closed_manual_check(session_mak
     assert "HTTP 403" in (refreshed_lead.meta or {}).get("promo_check_error", "")
     assert refreshed_job is not None
     assert refreshed_job.status == "done"
+
+
+@pytest.mark.asyncio
+async def test_async_eligible_final_send_failure_keeps_lead_pending_and_requeues(session_maker) -> None:
+    _provider, lead, job = await _create_async_pending_from_keyword(session_maker)
+    failing_provider = _FailingCaptureProvider(error="final reply timeout")
+
+    async with session_maker() as session:
+        async with session.begin():
+            await ow.process_job_in_session(session, job.id, failing_provider)
+
+    assert failing_provider.sent == []
+
+    async with session_maker() as s:
+        refreshed_lead = await s.get(PromoLead, lead.id)
+        refreshed_job = await s.get(MessageJob, job.id)
+        outbox = (await s.execute(select(OutboxMessage).where(OutboxMessage.job_id == job.id))).scalar_one_or_none()
+
+    assert refreshed_lead is not None
+    assert refreshed_lead.status == "pending_check"
+    assert refreshed_lead.reject_reason is None
+    assert (refreshed_lead.meta or {}).get("promo_check") == "pending"
+    assert (refreshed_lead.meta or {}).get("promo_check_final_reply_sent") is False
+    assert "final reply timeout" in (refreshed_lead.meta or {}).get("promo_check_final_reply_error", "")
+    assert refreshed_job is not None
+    assert refreshed_job.status == "queued"
+    assert refreshed_job.attempts == 1
+    assert "send failed" in (refreshed_job.last_error or "")
+    assert outbox is not None
+    assert outbox.status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_async_local_old_client_final_send_failure_keeps_lead_pending(session_maker) -> None:
+    with patch.object(settings, "promo_async_eligibility_check_enabled", True):
+        _provider, _evt, prior_visit_e164 = await _fire_prior_visit_promo(
+            session_maker,
+            "aktion",
+            sender_id=344,
+            dedupe_key="wa:promo-async-old-local-send-failure",
+            altegio_record_id=9944,
+        )
+
+    async with session_maker() as s:
+        lead = (await s.execute(select(PromoLead).where(PromoLead.phone_e164 == prior_visit_e164))).scalar_one()
+        job = (await s.execute(select(MessageJob).where(MessageJob.job_type == "promo_eligibility_check"))).scalar_one()
+
+    failing_provider = _FailingCaptureProvider(error="reject send timeout")
+    async with session_maker() as session:
+        async with session.begin():
+            await ow.process_job_in_session(session, job.id, failing_provider)
+
+    async with session_maker() as s:
+        refreshed_lead = await s.get(PromoLead, lead.id)
+        refreshed_job = await s.get(MessageJob, job.id)
+
+    assert refreshed_lead is not None
+    assert refreshed_lead.status == "pending_check"
+    assert refreshed_lead.reject_reason is None
+    assert (refreshed_lead.meta or {}).get("promo_check") == "pending"
+    assert (refreshed_lead.meta or {}).get("altegio_new_client_check") == "pending"
+    assert (refreshed_lead.meta or {}).get("promo_check_final_reply_sent") is False
+    assert refreshed_job is not None
+    assert refreshed_job.status == "queued"
+
+
+@pytest.mark.asyncio
+async def test_async_external_error_final_send_failure_keeps_lead_pending(session_maker) -> None:
+    _provider, lead, job = await _create_async_pending_from_keyword(session_maker)
+    check_mock = AsyncMock(side_effect=AltegioNewClientCheckError("promo new-client check HTTP 403: location_id=9001"))
+    failing_provider = _FailingCaptureProvider(error="manual-check send timeout")
+
+    async with session_maker() as session:
+        async with session.begin():
+            with (
+                patch.object(settings, "promo_check_new_client_in_altegio", True),
+                patch.object(settings, "promo_location_id_by_company", PROMO_LOCATION_MAP),
+                patch(
+                    "altegio_bot.workers.promo_lead_handler.check_client_has_any_altegio_record",
+                    check_mock,
+                ),
+            ):
+                await ow.process_job_in_session(session, job.id, failing_provider)
+
+    check_mock.assert_awaited_once_with(phone_e164=PHONE_E164, location_id=9001)
+
+    async with session_maker() as s:
+        refreshed_lead = await s.get(PromoLead, lead.id)
+        refreshed_job = await s.get(MessageJob, job.id)
+
+    assert refreshed_lead is not None
+    assert refreshed_lead.status == "pending_check"
+    assert refreshed_lead.reject_reason is None
+    assert (refreshed_lead.meta or {}).get("promo_check") == "pending"
+    assert (refreshed_lead.meta or {}).get("promo_check_final_reply_sent") is False
+    assert "manual-check send timeout" in (refreshed_lead.meta or {}).get("promo_check_final_reply_error", "")
+    assert refreshed_job is not None
+    assert refreshed_job.status == "queued"
+
+
+@pytest.mark.asyncio
+async def test_async_no_active_sender_keeps_lead_pending(session_maker) -> None:
+    _provider, lead, job = await _create_async_pending_from_keyword(session_maker)
+
+    async with session_maker() as session:
+        async with session.begin():
+            sender = await session.get(WhatsAppSender, 301)
+            assert sender is not None
+            sender.is_active = False
+
+    final_provider = _CaptureProvider()
+    async with session_maker() as session:
+        async with session.begin():
+            await ow.process_job_in_session(session, job.id, final_provider)
+
+    assert final_provider.sent == []
+
+    async with session_maker() as s:
+        refreshed_lead = await s.get(PromoLead, lead.id)
+        refreshed_job = await s.get(MessageJob, job.id)
+        outbox = (await s.execute(select(OutboxMessage).where(OutboxMessage.job_id == job.id))).scalar_one_or_none()
+
+    assert refreshed_lead is not None
+    assert refreshed_lead.status == "pending_check"
+    assert (refreshed_lead.meta or {}).get("promo_check_final_reply_sent") is False
+    assert "no active sender" in (refreshed_lead.meta or {}).get("promo_check_final_reply_error", "")
+    assert refreshed_job is not None
+    assert refreshed_job.status == "failed"
+    assert refreshed_job.attempts == 0
+    assert "no active sender" in (refreshed_job.last_error or "")
+    assert outbox is None
+
+
+@pytest.mark.asyncio
+async def test_async_card_issued_final_send_failure_retries_without_second_card(session_maker) -> None:
+    _provider, lead, job = await _create_async_pending_from_keyword(session_maker)
+
+    async def _issue_card(_event, lead_obj, *, phone_e164, company_id):
+        lead_obj.loyalty_card_id = "card-async-1"
+        lead_obj.loyalty_card_number = "LC-ASYNC-1"
+        lead_obj.card_type_id = "type-async"
+        lead_obj.discount_program_id = "program-async"
+        lead_obj.location_id = 9001
+        lead_obj.meta = {**(lead_obj.meta or {}), "loyalty_card_issued": True}
+        return True
+
+    issue_mock = AsyncMock(side_effect=_issue_card)
+    failing_provider = _FailingCaptureProvider(error="card reply timeout")
+
+    with (
+        patch.object(settings, "promo_issue_loyalty_card_enabled", True),
+        patch("altegio_bot.workers.promo_lead_handler._attempt_loyalty_card_issue", issue_mock),
+    ):
+        async with session_maker() as session:
+            async with session.begin():
+                await ow.process_job_in_session(session, job.id, failing_provider)
+
+        async with session_maker() as s:
+            after_failure_lead = await s.get(PromoLead, lead.id)
+            after_failure_job = await s.get(MessageJob, job.id)
+
+        assert after_failure_lead is not None
+        assert after_failure_lead.status == "pending_check"
+        assert after_failure_lead.loyalty_card_id == "card-async-1"
+        assert after_failure_lead.loyalty_card_number == "LC-ASYNC-1"
+        assert (after_failure_lead.meta or {}).get("loyalty_card_issued") is True
+        assert (after_failure_lead.meta or {}).get("promo_check_card_reply_pending") is True
+        assert (after_failure_lead.meta or {}).get("promo_check_final_reply_sent") is False
+        assert after_failure_job is not None
+        assert after_failure_job.status == "queued"
+
+        async with session_maker() as session:
+            async with session.begin():
+                await ow.process_job_in_session(session, job.id, failing_provider)
+
+    issue_mock.assert_awaited_once()
+    assert len(failing_provider.sent) == 1
+    assert "Ihre Rabattkarte: #LC-ASYNC-1" in failing_provider.sent[0][2]
+
+    async with session_maker() as s:
+        refreshed_lead = await s.get(PromoLead, lead.id)
+        refreshed_job = await s.get(MessageJob, job.id)
+
+    assert refreshed_lead is not None
+    assert refreshed_lead.status == "issued"
+    assert refreshed_lead.loyalty_card_id == "card-async-1"
+    assert refreshed_lead.loyalty_card_number == "LC-ASYNC-1"
+    assert (refreshed_lead.meta or {}).get("promo_check") == "done"
+    assert (refreshed_lead.meta or {}).get("promo_check_card_reply_pending") is False
+    assert (refreshed_lead.meta or {}).get("promo_check_final_reply_sent") is True
+    assert refreshed_job is not None
+    assert refreshed_job.status == "done"
+
+
+@pytest.mark.asyncio
+async def test_async_pending_race_loser_sends_still_in_progress_without_duplicate_job(session_maker) -> None:
+    import altegio_bot.workers.promo_lead_handler as _handler
+
+    now = _utcnow()
+    async with session_maker() as pre:
+        async with pre.begin():
+            await _setup_sender(pre, sender_id=345)
+            winner = PromoLead(
+                company_id=1,
+                phone_e164=PHONE_E164,
+                campaign_name=CAMPAIGN,
+                secret_code="aktion",
+                discount_amount=Decimal("15"),
+                discount_type="fixed",
+                status="pending_check",
+                issued_at=now,
+                expires_at=now + timedelta(days=30),
+                meta={"promo_check": "pending", "altegio_new_client_check": "pending"},
+            )
+            pre.add(winner)
+            await pre.flush()
+            pre.add(
+                MessageJob(
+                    company_id=1,
+                    record_id=None,
+                    client_id=None,
+                    job_type="promo_eligibility_check",
+                    run_at=now,
+                    dedupe_key=f"promo_eligibility_check:{winner.id}",
+                    payload={"promo_lead_id": winner.id},
+                )
+            )
+
+    original_find = _handler._find_any_lead
+    call_count = 0
+
+    async def _patched_find(sess, phone, campaign):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return None
+        return await original_find(sess, phone, campaign)
+
+    provider = _CaptureProvider()
+    async with session_maker() as session:
+        async with session.begin():
+            evt = WhatsAppEvent(
+                dedupe_key="wa:promo-async-pending-race",
+                status="received",
+                error=None,
+                query={},
+                headers={},
+                payload=_inbound_payload(PHONE_NUMBER_ID, FROM_PHONE, "aktion"),
+            )
+            session.add(evt)
+            await session.flush()
+
+            with (
+                patch.object(settings, "promo_async_eligibility_check_enabled", True),
+                patch("altegio_bot.workers.promo_lead_handler._find_any_lead", _patched_find),
+                patch(
+                    "altegio_bot.workers.whatsapp_inbox_worker.ChatwootClient",
+                    return_value=_FakeCW(),
+                ),
+            ):
+                await handle_event(session, evt, provider)
+
+    assert len(provider.sent) == 1
+    assert "prüfen den Neukundenrabatt" in provider.sent[0][2]
+
+    async with session_maker() as s:
+        leads = (await s.execute(select(PromoLead).where(PromoLead.phone_e164 == PHONE_E164))).scalars().all()
+        jobs = (
+            (await s.execute(select(MessageJob).where(MessageJob.job_type == "promo_eligibility_check")))
+            .scalars()
+            .all()
+        )
+
+    assert len(leads) == 1
+    assert leads[0].status == "pending_check"
+    assert len(jobs) == 1
 
 
 @pytest.mark.asyncio

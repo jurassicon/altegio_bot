@@ -537,7 +537,21 @@ creates `PromoLead.status='pending_check'`, sends an immediate checking reply,
 and queues `MessageJob.job_type='promo_eligibility_check'`. The background
 worker makes the final eligibility decision and then sends the issued/card,
 soft-rejection, or manual-check reply. The interim reply does not promise a
-discount or issue a loyalty card.
+discount or issue a loyalty card. The initial checking reply is still sent
+synchronously from the webhook handler; only the final eligibility decision is
+handled by `MessageJob`.
+
+`pending_check` remains pending until the final reply is successfully sent. If
+the final send fails, the job is retried according to the normal send-attempt
+budget and the customer still has a pending promo check. If a loyalty card is
+issued but that final card reply fails, the card fields stay on the pending lead,
+`PromoLead.meta.promo_check_card_reply_pending=true`, and retries reuse the
+stored card number instead of issuing a second card.
+
+When local prior-visit history already proves the client is not new, the async
+job skips the external Altegio lookup and records
+`PromoLead.meta.altegio_new_client_check='skipped_local_rejection'` after the
+soft-rejection reply is sent.
 
 External Altegio history lookup is still controlled separately by
 `PROMO_CHECK_NEW_CLIENT_IN_ALTEGIO`. Current production should keep that flag
@@ -587,6 +601,9 @@ active/card reply; retroactive cleanup is out of scope.
 - Fixing Altegio 403 permissions for the external history endpoint
 - Enabling `PROMO_CHECK_NEW_CLIENT_IN_ALTEGIO` in production
 - Automatic retry/manual reset for `altegio_new_client_check_failed`
+- Moving the initial checking reply into Outbox
+- Cleanup or Ops reset for stuck old `pending_check` leads
+- Retry flow for cancelled technical eligibility checks
 - Changing existing issued leads retroactively
 - Enabling production flags without a completed smoke test
 

@@ -412,14 +412,14 @@ def _build_promo_eligibility_check_job(lead: PromoLead, *, now: datetime) -> Mes
         job_type=PROMO_ELIGIBILITY_CHECK_JOB_TYPE,
         run_at=now,
         dedupe_key=f"{PROMO_ELIGIBILITY_CHECK_JOB_TYPE}:{lead.id}",
-        payload={
-            "promo_lead_id": lead.id,
-            "phone_e164": lead.phone_e164,
-            "company_id": lead.company_id,
-            "campaign_name": lead.campaign_name,
-            "secret_code": lead.secret_code,
-        },
+        payload={"promo_lead_id": lead.id},
     )
+
+
+def _promo_retry_delay_seconds(attempt: int) -> int:
+    base = 30
+    delay = base * (2 ** (attempt - 1))
+    return min(delay, 15 * 60)
 
 
 def _mark_promo_check_done(lead: PromoLead, *, now: datetime, extra: dict | None = None) -> None:
@@ -641,23 +641,29 @@ async def process_promo_eligibility_check_job(
 
     cfg = settings
     phone_e164 = lead.phone_e164
-    discount_amount = Decimal(str(cfg.promo_discount_amount))
-    discount_type = cfg.promo_discount_type
-    template_code: str
-    reply: str
+    discount_amount = lead.discount_amount
+    discount_type = lead.discount_type
+    decision_status: str
+    decision_reject_reason: str | None = None
+    decision_meta: dict[str, str] = {}
+    decision_error: str | None = None
     card_issue_failed = False
 
-    if await _has_prior_visits(session, phone_e164):
-        lead.status = "rejected_not_new"
-        lead.reject_reason = "has_prior_visits"
-        _mark_promo_check_done(lead, now=now)
-        reply = build_reply_rejected_not_new(
-            cfg.promo_booking_url,
-            lead.secret_code,
-            discount_amount,
-            discount_type,
-        )
-        template_code = "wa_promo_lead_rejected_not_new"
+    if lead.loyalty_card_id and lead.loyalty_card_number:
+        decision_status = "issued"
+        discount_amount = lead.discount_amount
+        discount_type = lead.discount_type
+        decision_meta = {
+            "altegio_new_client_check": (
+                (lead.meta or {}).get("altegio_new_client_check")
+                if (lead.meta or {}).get("altegio_new_client_check") not in (None, "pending")
+                else ("no_records" if cfg.promo_check_new_client_in_altegio else "disabled")
+            )
+        }
+    elif await _has_prior_visits(session, phone_e164):
+        decision_status = "rejected_not_new"
+        decision_reject_reason = "has_prior_visits"
+        decision_meta = {"altegio_new_client_check": "skipped_local_rejection"}
     else:
         try:
             if cfg.promo_check_new_client_in_altegio:
@@ -669,68 +675,19 @@ async def process_promo_eligibility_check_job(
             else:
                 has_altegio_records = False
         except AltegioNewClientCheckError as exc:
-            err = str(exc)
-            lead.status = "cancelled"
-            lead.reject_reason = "altegio_new_client_check_failed"
-            _mark_promo_check_failed(lead, now=now, error=err)
-            reply = build_reply_new_client_check_failed()
-            template_code = "wa_promo_lead_manual_check"
+            decision_status = "cancelled"
+            decision_reject_reason = "altegio_new_client_check_failed"
+            decision_error = str(exc)
         else:
             if has_altegio_records:
-                lead.status = "rejected_not_new"
-                lead.reject_reason = "has_altegio_records"
-                _mark_promo_check_done(
-                    lead,
-                    now=now,
-                    extra={"altegio_new_client_check": "records_found"},
-                )
-                reply = build_reply_rejected_not_new(
-                    cfg.promo_booking_url,
-                    lead.secret_code,
-                    discount_amount,
-                    discount_type,
-                )
-                template_code = "wa_promo_lead_rejected_not_new"
+                decision_status = "rejected_not_new"
+                decision_reject_reason = "has_altegio_records"
+                decision_meta = {"altegio_new_client_check": "records_found"}
             else:
-                lead.status = "issued"
-                lead.discount_amount = discount_amount
-                lead.discount_type = discount_type
-                _mark_promo_check_done(
-                    lead,
-                    now=now,
-                    extra={
-                        "altegio_new_client_check": (
-                            "no_records" if cfg.promo_check_new_client_in_altegio else "disabled"
-                        )
-                    },
-                )
-                if cfg.promo_issue_loyalty_card_enabled:
-                    if await _attempt_loyalty_card_issue(
-                        None,
-                        lead,
-                        phone_e164=phone_e164,
-                        company_id=lead.company_id,
-                    ):
-                        reply = build_reply_issued_with_card(
-                            lead.expires_at,
-                            cfg.promo_booking_url,
-                            discount_amount,
-                            discount_type,
-                            lead.loyalty_card_number,
-                        )
-                        template_code = "wa_promo_loyalty_card_issued"
-                    else:
-                        card_issue_failed = True
-                        reply = build_reply_loyalty_card_failed()
-                        template_code = "wa_promo_loyalty_card_issue_failed"
-                else:
-                    reply = build_reply_issued(
-                        lead.expires_at,
-                        cfg.promo_booking_url,
-                        discount_amount,
-                        discount_type,
-                    )
-                    template_code = "wa_promo_lead_issued"
+                decision_status = "issued"
+                decision_meta = {
+                    "altegio_new_client_check": "no_records" if cfg.promo_check_new_client_in_altegio else "disabled"
+                }
 
     sender_id = await pick_sender_id(
         session=session,
@@ -747,6 +704,55 @@ async def process_promo_eligibility_check_job(
             "promo_check_final_reply_error": job.last_error,
         }
         return
+
+    if decision_status == "issued":
+        if cfg.promo_issue_loyalty_card_enabled:
+            if lead.loyalty_card_id and lead.loyalty_card_number:
+                reply = build_reply_issued_with_card(
+                    lead.expires_at,
+                    cfg.promo_booking_url,
+                    discount_amount,
+                    discount_type,
+                    lead.loyalty_card_number,
+                )
+                template_code = "wa_promo_loyalty_card_issued"
+            elif await _attempt_loyalty_card_issue(
+                None,
+                lead,
+                phone_e164=phone_e164,
+                company_id=lead.company_id,
+            ):
+                reply = build_reply_issued_with_card(
+                    lead.expires_at,
+                    cfg.promo_booking_url,
+                    discount_amount,
+                    discount_type,
+                    lead.loyalty_card_number,
+                )
+                template_code = "wa_promo_loyalty_card_issued"
+            else:
+                card_issue_failed = True
+                reply = build_reply_loyalty_card_failed()
+                template_code = "wa_promo_loyalty_card_issue_failed"
+        else:
+            reply = build_reply_issued(
+                lead.expires_at,
+                cfg.promo_booking_url,
+                discount_amount,
+                discount_type,
+            )
+            template_code = "wa_promo_lead_issued"
+    elif decision_status == "rejected_not_new":
+        reply = build_reply_rejected_not_new(
+            cfg.promo_booking_url,
+            lead.secret_code,
+            discount_amount,
+            discount_type,
+        )
+        template_code = "wa_promo_lead_rejected_not_new"
+    else:
+        reply = build_reply_new_client_check_failed()
+        template_code = "wa_promo_lead_manual_check"
 
     attempts = getattr(job, "attempts", 0) + 1
     job.attempts = attempts
@@ -778,15 +784,30 @@ async def process_promo_eligibility_check_job(
                 meta={"source": PROMO_ELIGIBILITY_CHECK_JOB_TYPE, "promo_lead_id": lead.id},
             )
         )
-        job.status = "failed"
+        max_attempts = getattr(job, "max_attempts", 5) or 5
+        if attempts >= max_attempts:
+            job.status = "failed"
+        else:
+            job.status = "queued"
+            job.run_at = now + timedelta(seconds=_promo_retry_delay_seconds(attempts))
         job.locked_at = None
         job.last_error = f"promo_eligibility_check: send failed: {err}"
-        lead.meta = {
+        meta_after_failure = {
             **(lead.meta or {}),
             "promo_check_final_reply_sent": False,
             "promo_check_final_reply_error": err,
         }
+        if lead.loyalty_card_id and lead.loyalty_card_number:
+            meta_after_failure["promo_check_card_reply_pending"] = True
+        lead.meta = meta_after_failure
         return
+
+    lead.status = decision_status
+    lead.reject_reason = decision_reject_reason
+    if decision_status == "cancelled":
+        _mark_promo_check_failed(lead, now=now, error=decision_error or "promo eligibility check failed")
+    else:
+        _mark_promo_check_done(lead, now=now, extra=decision_meta)
 
     session.add(
         OutboxMessage(
@@ -812,11 +833,14 @@ async def process_promo_eligibility_check_job(
             },
         )
     )
-    lead.meta = {
+    meta_after_success = {
         **(lead.meta or {}),
         "promo_check_final_reply_sent": True,
         "promo_check_final_reply_provider_message_id": msg_id,
     }
+    if lead.loyalty_card_id and lead.loyalty_card_number:
+        meta_after_success["promo_check_card_reply_pending"] = False
+    lead.meta = meta_after_success
     job.status = "done"
     job.locked_at = None
     job.last_error = None
