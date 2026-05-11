@@ -10,23 +10,20 @@ from typing import Any
 
 from altegio_bot.altegio_records import (
     AltegioRecordResearchError,
+    extract_booking_created_at_from_record_details,
     fetch_record_details_for_booking_created_at_research,
 )
 from altegio_bot.settings import settings
 
 _TIMESTAMP_FIELDS: tuple[tuple[str, str], ...] = (
-    ("created_at", "candidate only, NOT trusted for auto-apply yet"),
-    ("create_date", "candidate only, NOT trusted for auto-apply yet"),
-    ("datetime_created", "candidate only, NOT trusted for auto-apply yet"),
+    ("created_at", "trusted booking creation timestamp"),
+    ("create_date", "trusted booking creation timestamp"),
+    ("datetime_created", "trusted booking creation timestamp"),
     ("date", "appointment start, NOT booking created_at"),
     ("datetime", "appointment start, NOT booking created_at"),
     ("last_change_date", "last change, NOT reliable created_at"),
     ("last_change_at", "last change, NOT reliable created_at"),
 )
-
-# No field is trusted by production logic in this PR. Keep this empty until a
-# field is verified against real Altegio data and business approval.
-_TRUSTED_BOOKING_CREATED_AT_FIELDS: frozenset[str] = frozenset()
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -77,11 +74,8 @@ def _format_field_value(record: Mapping[str, Any], field: str, note: str) -> str
 
 
 def _confirmed_booking_created_at(record: Mapping[str, Any]) -> str | None:
-    for field in _TRUSTED_BOOKING_CREATED_AT_FIELDS:
-        value = record.get(field)
-        if value:
-            return str(value)
-    return None
+    parsed = extract_booking_created_at_from_record_details(dict(record))
+    return parsed.isoformat() if parsed is not None else None
 
 
 def build_timestamp_summary(

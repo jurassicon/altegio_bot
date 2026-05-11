@@ -34,6 +34,7 @@ logger = logging.getLogger(__name__)
 
 _PAGE_SIZE = 200
 _ALTEGIO_LOCAL_TZ = ZoneInfo("Europe/Belgrade")
+_BOOKING_CREATED_AT_FIELDS = ("create_date", "created_at", "datetime_created")
 
 
 class AmbiguousRecordError(Exception):
@@ -193,6 +194,63 @@ def _parse_record_starts_at(record_data: dict[str, Any]) -> datetime | None:
             raw_date,
             raw_datetime,
         )
+
+    return None
+
+
+def _parse_altegio_datetime(value: Any) -> datetime | None:
+    """Parse an Altegio timestamp as an aware UTC datetime.
+
+    Naive values are interpreted as Europe/Belgrade local wall-clock time,
+    matching the local Altegio salon timezone used elsewhere in the project.
+    Aware values are normalized to UTC.
+    """
+    if isinstance(value, datetime):
+        dt = value
+    elif isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return None
+
+        if len(raw) >= 5 and raw[-5] in "+-" and raw[-3] != ":":
+            raw = raw[:-2] + ":" + raw[-2:]
+
+        try:
+            dt = datetime.fromisoformat(raw)
+        except ValueError:
+            try:
+                dt = datetime.fromisoformat(raw.replace(" ", "T"))
+            except ValueError:
+                return None
+    else:
+        return None
+
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=_ALTEGIO_LOCAL_TZ)
+
+    return dt.astimezone(timezone.utc)
+
+
+def extract_booking_created_at_from_record_details(record_data: dict[str, Any]) -> datetime | None:
+    """Return a trusted booking creation timestamp from Altegio record data.
+
+    Only dedicated creation fields are accepted. Appointment start fields
+    (``date`` / ``datetime``), last-change fields, and webhook received time are
+    intentionally ignored.
+    """
+    for field in _BOOKING_CREATED_AT_FIELDS:
+        value = record_data.get(field)
+        parsed = _parse_altegio_datetime(value)
+        if parsed is not None:
+            return parsed
+
+        if value:
+            logger.warning(
+                "record id=%s: could not parse booking creation field %s=%r",
+                record_data.get("id"),
+                field,
+                value,
+            )
 
     return None
 
@@ -372,13 +430,13 @@ async def check_client_has_any_altegio_record(
     return _extract_positive_meta_count(response_payload)
 
 
-async def fetch_record_details_for_booking_created_at_research(
+async def fetch_record_details_for_booking_created_at(
     *,
     location_id: int,
     record_id: int,
     timeout_sec: float = 15.0,
 ) -> dict[str, Any]:
-    """Fetch a single Altegio appointment for read-only timestamp research.
+    """Fetch a single Altegio appointment for read-only booking timestamp lookup.
 
     Uses the documented read-only appointment endpoint:
       GET /record/{location_id}/{record_id}
@@ -426,6 +484,20 @@ async def fetch_record_details_for_booking_created_at_research(
         )
 
     return data
+
+
+async def fetch_record_details_for_booking_created_at_research(
+    *,
+    location_id: int,
+    record_id: int,
+    timeout_sec: float = 15.0,
+) -> dict[str, Any]:
+    """Backward-compatible wrapper for the manual research CLI."""
+    return await fetch_record_details_for_booking_created_at(
+        location_id=location_id,
+        record_id=record_id,
+        timeout_sec=timeout_sec,
+    )
 
 
 async def client_has_any_future_record(

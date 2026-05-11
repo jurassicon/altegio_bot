@@ -56,7 +56,7 @@ def test_appointment_and_last_change_fields_are_not_reliable(capsys: pytest.Capt
     assert "safe_for_auto_apply=false" in out
 
 
-def test_created_at_candidate_is_reported_but_not_trusted(capsys: pytest.CaptureFixture[str]) -> None:
+def test_created_at_field_is_reported_and_trusted(capsys: pytest.CaptureFixture[str]) -> None:
     fetch_mock = AsyncMock(return_value={"created_at": "2026-05-10T14:22:00+02:00"})
 
     with patch.object(script, "fetch_record_details_for_booking_created_at_research", fetch_mock):
@@ -64,9 +64,9 @@ def test_created_at_candidate_is_reported_but_not_trusted(capsys: pytest.Capture
 
     out = capsys.readouterr().out
     assert code == 0
-    assert "created_at: 2026-05-10T14:22:00+02:00  # candidate only, NOT trusted for auto-apply yet" in out
-    assert "confirmed_booking_created_at=<none>" in out
-    assert "safe_for_auto_apply=false" in out
+    assert "created_at: 2026-05-10T14:22:00+02:00  # trusted booking creation timestamp" in out
+    assert "confirmed_booking_created_at=2026-05-10T12:22:00+00:00" in out
+    assert "safe_for_auto_apply=true" in out
 
 
 def test_api_error_returns_one_and_redacts_tokens(capsys: pytest.CaptureFixture[str]) -> None:

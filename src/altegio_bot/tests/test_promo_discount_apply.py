@@ -39,7 +39,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from altegio_bot.models.models import Client, MessageJob, PromoLead, Record, RecordService
 from altegio_bot.promo_discount_apply import (
@@ -244,6 +244,7 @@ async def test_api_not_verified_blocks_call(session_maker) -> None:
 @pytest.mark.asyncio
 async def test_no_active_lead_no_api_call(session_maker) -> None:
     mock_api = AsyncMock(side_effect=RuntimeError("must not be called"))
+    resolver = AsyncMock(side_effect=AssertionError("booking_created_at_resolver must not be called"))
 
     async with session_maker() as session:
         async with session.begin():
@@ -254,9 +255,15 @@ async def test_no_active_lead_no_api_call(session_maker) -> None:
 
             with patch("altegio_bot.promo_discount_apply.apply_promo_discount_to_visit", mock_api):
                 with _base_settings_ctx():
-                    await try_apply_promo_discount(session, record, _COMPANY)
+                    await try_apply_promo_discount(
+                        session,
+                        record,
+                        _COMPANY,
+                        booking_created_at_resolver=resolver,
+                    )
 
     mock_api.assert_not_called()
+    resolver.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -268,6 +275,7 @@ async def test_no_active_lead_no_api_call(session_maker) -> None:
 async def test_expired_lead_excluded(session_maker) -> None:
     past = datetime(2020, 1, 1, tzinfo=_UTC)
     mock_api = AsyncMock(side_effect=RuntimeError("must not be called"))
+    resolver = AsyncMock(side_effect=AssertionError("booking_created_at_resolver must not be called"))
 
     async with session_maker() as session:
         async with session.begin():
@@ -280,9 +288,15 @@ async def test_expired_lead_excluded(session_maker) -> None:
 
             with patch("altegio_bot.promo_discount_apply.apply_promo_discount_to_visit", mock_api):
                 with _base_settings_ctx():
-                    await try_apply_promo_discount(session, record, _COMPANY)
+                    await try_apply_promo_discount(
+                        session,
+                        record,
+                        _COMPANY,
+                        booking_created_at_resolver=resolver,
+                    )
 
     mock_api.assert_not_called()
+    resolver.assert_not_called()
 
     async with session_maker() as s:
         lead = (await s.execute(select(PromoLead).where(PromoLead.phone_e164 == _PHONE))).scalar_one_or_none()
@@ -299,6 +313,7 @@ async def test_expired_lead_excluded(session_maker) -> None:
 @pytest.mark.parametrize("status", ["rejected_not_new", "pending_check"])
 async def test_ineligible_lead_status_excluded(session_maker, status: str) -> None:
     mock_api = AsyncMock(side_effect=RuntimeError("must not be called"))
+    resolver = AsyncMock(side_effect=AssertionError("booking_created_at_resolver must not be called"))
 
     async with session_maker() as session:
         async with session.begin():
@@ -311,9 +326,15 @@ async def test_ineligible_lead_status_excluded(session_maker, status: str) -> No
 
             with patch("altegio_bot.promo_discount_apply.apply_promo_discount_to_visit", mock_api):
                 with _base_settings_ctx():
-                    await try_apply_promo_discount(session, record, _COMPANY, booking_created_at=_NOW)
+                    await try_apply_promo_discount(
+                        session,
+                        record,
+                        _COMPANY,
+                        booking_created_at_resolver=resolver,
+                    )
 
     mock_api.assert_not_called()
+    resolver.assert_not_called()
 
     async with session_maker() as s:
         lead = (await s.execute(select(PromoLead).where(PromoLead.phone_e164 == _PHONE))).scalar_one_or_none()
@@ -386,6 +407,7 @@ async def test_happy_path_applies_discount(session_maker) -> None:
 @pytest.mark.asyncio
 async def test_lead_without_card_id_excluded(session_maker) -> None:
     mock_api = AsyncMock(side_effect=RuntimeError("must not be called"))
+    resolver = AsyncMock(side_effect=AssertionError("booking_created_at_resolver must not be called"))
 
     async with session_maker() as session:
         async with session.begin():
@@ -398,9 +420,15 @@ async def test_lead_without_card_id_excluded(session_maker) -> None:
 
             with patch("altegio_bot.promo_discount_apply.apply_promo_discount_to_visit", mock_api):
                 with _base_settings_ctx():
-                    await try_apply_promo_discount(session, record, _COMPANY)
+                    await try_apply_promo_discount(
+                        session,
+                        record,
+                        _COMPANY,
+                        booking_created_at_resolver=resolver,
+                    )
 
     mock_api.assert_not_called()
+    resolver.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -411,6 +439,7 @@ async def test_lead_without_card_id_excluded(session_maker) -> None:
 @pytest.mark.asyncio
 async def test_service_not_allowed_skips_discount(session_maker) -> None:
     mock_api = AsyncMock(side_effect=RuntimeError("must not be called"))
+    resolver = AsyncMock(side_effect=AssertionError("booking_created_at_resolver must not be called"))
 
     async with session_maker() as session:
         async with session.begin():
@@ -423,9 +452,15 @@ async def test_service_not_allowed_skips_discount(session_maker) -> None:
 
             with patch("altegio_bot.promo_discount_apply.apply_promo_discount_to_visit", mock_api):
                 with _base_settings_ctx():
-                    await try_apply_promo_discount(session, record, _COMPANY, booking_created_at=_NOW)
+                    await try_apply_promo_discount(
+                        session,
+                        record,
+                        _COMPANY,
+                        booking_created_at_resolver=resolver,
+                    )
 
     mock_api.assert_not_called()
+    resolver.assert_not_called()
 
     async with session_maker() as s:
         lead = (await s.execute(select(PromoLead).where(PromoLead.phone_e164 == _PHONE))).scalar_one_or_none()
@@ -518,6 +553,7 @@ async def test_already_applied_lead_skipped(session_maker) -> None:
 async def test_prior_attended_visit_skips_discount(session_maker) -> None:
     """Client has a prior attended visit (different record) → discount not applied."""
     mock_api = AsyncMock(side_effect=RuntimeError("must not be called"))
+    resolver = AsyncMock(side_effect=AssertionError("booking_created_at_resolver must not be called"))
 
     other_phone = "+10000000001"  # client seeded in conftest with id=1
 
@@ -545,9 +581,15 @@ async def test_prior_attended_visit_skips_discount(session_maker) -> None:
 
             with patch("altegio_bot.promo_discount_apply.apply_promo_discount_to_visit", mock_api):
                 with _base_settings_ctx():
-                    await try_apply_promo_discount(session, current_record, _COMPANY, booking_created_at=_NOW)
+                    await try_apply_promo_discount(
+                        session,
+                        current_record,
+                        _COMPANY,
+                        booking_created_at_resolver=resolver,
+                    )
 
     mock_api.assert_not_called()
+    resolver.assert_not_called()
 
     async with session_maker() as s:
         lead = (await s.execute(select(PromoLead).where(PromoLead.phone_e164 == other_phone))).scalar_one_or_none()
@@ -622,6 +664,8 @@ async def test_update_webhook_skips_promo_apply() -> None:
     mock_record.company_id = _COMPANY
     mock_record.is_deleted = False
 
+    mock_resolver = AsyncMock(side_effect=RuntimeError("must not be called"))
+
     with (
         patch("altegio_bot.workers.inbox_worker.upsert_client", new=AsyncMock(return_value=100)),
         patch("altegio_bot.workers.inbox_worker.upsert_record", new=AsyncMock(return_value=200)),
@@ -629,11 +673,118 @@ async def test_update_webhook_skips_promo_apply() -> None:
         patch("altegio_bot.workers.inbox_worker.record_has_allowed_service", new=AsyncMock(return_value=True)),
         patch("altegio_bot.workers.inbox_worker.plan_jobs_for_record_event", new=AsyncMock()),
         patch("altegio_bot.workers.inbox_worker.try_apply_promo_discount", mock_try_apply),
+        patch("altegio_bot.workers.inbox_worker.resolve_booking_created_at_for_record_create", mock_resolver),
+        patch.object(settings, "promo_apply_discount_enabled", True),
     ):
         session.get = AsyncMock(return_value=mock_record)
         await handle_event(session, event)
 
     mock_try_apply.assert_not_called()
+    mock_resolver.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# 12b. Record create timestamp lookup failures fail closed
+# ---------------------------------------------------------------------------
+
+
+def _make_record_create_event(*, create_date: str | None = None) -> MagicMock:
+    event = MagicMock()
+    event.id = 1
+    event.company_id = _COMPANY
+    event.resource = "record"
+    event.event_status = "create"
+    event.resource_id = None
+    event.received_at = datetime(2026, 5, 8, 20, 0, 0, tzinfo=_UTC)
+    data = {
+        "id": 424242,
+        "client": {"id": 100, "display_name": "Test", "phone": _PHONE},
+        "services": [{"id": _ALLOWED_SERVICE, "title": "Test", "cost_to_pay": 50}],
+        "date": "2026-05-20 12:00:00",
+        "staff_id": 5,
+    }
+    if create_date is not None:
+        data["create_date"] = create_date
+    event.payload = {"data": data}
+    return event
+
+
+@pytest.mark.asyncio
+async def test_record_create_get_record_http_error_skips_apply_without_notification(session_maker) -> None:
+    from altegio_bot.altegio_records import AltegioRecordResearchError
+    from altegio_bot.workers.inbox_worker import handle_event
+
+    mock_api = AsyncMock(side_effect=RuntimeError("must not be called"))
+    fetch_mock = AsyncMock(side_effect=AltegioRecordResearchError("HTTP 500: location_id=9001 record_id=424242"))
+
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(_make_lead())
+            await session.flush()
+
+            with (
+                patch("altegio_bot.promo_discount_apply.apply_promo_discount_to_visit", mock_api),
+                patch("altegio_bot.workers.inbox_worker.fetch_record_details_for_booking_created_at", fetch_mock),
+                patch("altegio_bot.workers.inbox_worker.record_has_allowed_service", new=AsyncMock(return_value=True)),
+                patch("altegio_bot.workers.inbox_worker.plan_jobs_for_record_event", new=AsyncMock()),
+                patch.object(settings, "promo_location_id_by_company", f'{{"{_COMPANY}": {_LOCATION}}}'),
+                _base_settings_ctx(),
+            ):
+                await handle_event(session, _make_record_create_event())
+
+    fetch_mock.assert_awaited_once_with(location_id=_LOCATION, record_id=424242)
+    mock_api.assert_not_called()
+
+    async with session_maker() as s:
+        lead = (await s.execute(select(PromoLead).where(PromoLead.phone_e164 == _PHONE))).scalar_one()
+        job = (
+            await s.execute(select(MessageJob).where(MessageJob.job_type == "promo_discount_applied"))
+        ).scalar_one_or_none()
+
+    assert lead.status == "issued"
+    assert "missing booking created timestamp" in (lead.meta or {}).get("apply_skip_reason", "")
+    assert job is None
+
+
+@pytest.mark.asyncio
+async def test_record_create_get_record_create_date_after_promo_applies(session_maker) -> None:
+    from altegio_bot.workers.inbox_worker import handle_event
+
+    mock_api = AsyncMock(return_value=PromoDiscountApplyResult(applied=True, raw={"success": True}))
+    fetch_mock = AsyncMock(return_value={"id": 424242, "create_date": "2026-05-08 14:05:00"})
+
+    issued_at = datetime(2026, 5, 8, 12, 0, 0, tzinfo=_UTC)
+
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(_make_lead(status="issued"))
+            await session.flush()
+            lead = (await session.execute(select(PromoLead).where(PromoLead.phone_e164 == _PHONE))).scalar_one()
+            lead.issued_at = issued_at
+
+            with (
+                patch("altegio_bot.promo_discount_apply.apply_promo_discount_to_visit", mock_api),
+                patch("altegio_bot.workers.inbox_worker.fetch_record_details_for_booking_created_at", fetch_mock),
+                patch("altegio_bot.workers.inbox_worker.record_has_allowed_service", new=AsyncMock(return_value=True)),
+                patch("altegio_bot.workers.inbox_worker.plan_jobs_for_record_event", new=AsyncMock()),
+                patch.object(settings, "promo_location_id_by_company", f'{{"{_COMPANY}": {_LOCATION}}}'),
+                _base_settings_ctx(),
+            ):
+                await handle_event(session, _make_record_create_event())
+
+    mock_api.assert_called_once_with(
+        location_id=_LOCATION,
+        card_id=int(_CARD_ID),
+        program_id=_PROGRAM_ID,
+        record_id=424242,
+    )
+
+    async with session_maker() as s:
+        lead = (await s.execute(select(PromoLead).where(PromoLead.phone_e164 == _PHONE))).scalar_one()
+        job = (await s.execute(select(MessageJob).where(MessageJob.job_type == "promo_discount_applied"))).scalar_one()
+
+    assert lead.status == "applied"
+    assert job.payload["phone_e164"] == _PHONE
 
 
 # ---------------------------------------------------------------------------
@@ -920,6 +1071,44 @@ async def test_missing_booking_timestamp_skips_apply(session_maker) -> None:
     assert job is None
 
 
+@pytest.mark.asyncio
+async def test_lazy_resolver_returns_none_skips_apply(session_maker) -> None:
+    mock_api = AsyncMock(side_effect=RuntimeError("must not be called"))
+    resolver = AsyncMock(return_value=None)
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_client(session)
+            record = await _seed_record(session)
+            await _seed_service(session)
+            lead = _make_lead()
+            session.add(lead)
+            await session.flush()
+
+            with patch("altegio_bot.promo_discount_apply.apply_promo_discount_to_visit", mock_api):
+                with _base_settings_ctx():
+                    await try_apply_promo_discount(
+                        session,
+                        record,
+                        _COMPANY,
+                        booking_created_at_resolver=resolver,
+                    )
+
+    resolver.assert_awaited_once()
+    mock_api.assert_not_called()
+
+    async with session_maker() as s:
+        lead = (await s.execute(select(PromoLead).where(PromoLead.phone_e164 == _PHONE))).scalar_one_or_none()
+        job = (
+            await s.execute(select(MessageJob).where(MessageJob.job_type == "promo_discount_applied"))
+        ).scalar_one_or_none()
+
+    assert lead is not None
+    assert lead.status == "issued"
+    assert "missing booking created timestamp" in (lead.meta or {}).get("apply_skip_reason", "")
+    assert job is None
+
+
 # ---------------------------------------------------------------------------
 # 23. booking_created_at before lead.issued_at → skip, predates promo
 # ---------------------------------------------------------------------------
@@ -1026,6 +1215,327 @@ async def test_booking_after_promo_proceeds(session_maker) -> None:
     assert lead.status == "applied"
 
 
+@pytest.mark.asyncio
+async def test_lazy_resolver_after_local_checks_applies_discount(session_maker) -> None:
+    mock_api = AsyncMock(return_value=PromoDiscountApplyResult(applied=True, raw={"success": True}))
+    resolver = AsyncMock(return_value=datetime(2026, 5, 8, 12, 1, 0, tzinfo=_UTC))
+
+    promo_issued_at = datetime(2026, 5, 8, 12, 0, 0, tzinfo=_UTC)
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_client(session)
+            record = await _seed_record(session, altegio_record_id=555)
+            await _seed_service(session)
+            lead = _make_lead()
+            lead.issued_at = promo_issued_at
+            session.add(lead)
+            await session.flush()
+
+            with patch("altegio_bot.promo_discount_apply.apply_promo_discount_to_visit", mock_api):
+                with _base_settings_ctx():
+                    await try_apply_promo_discount(
+                        session,
+                        record,
+                        _COMPANY,
+                        booking_created_at_resolver=resolver,
+                    )
+
+    resolver.assert_awaited_once()
+    mock_api.assert_called_once_with(
+        location_id=_LOCATION,
+        card_id=int(_CARD_ID),
+        program_id=_PROGRAM_ID,
+        record_id=555,
+    )
+
+    async with session_maker() as s:
+        lead = (await s.execute(select(PromoLead).where(PromoLead.phone_e164 == _PHONE))).scalar_one()
+        job = (await s.execute(select(MessageJob).where(MessageJob.job_type == "promo_discount_applied"))).scalar_one()
+
+    assert lead.status == "applied"
+    assert job.payload["phone_e164"] == _PHONE
+
+
+@pytest.mark.asyncio
+async def test_race_lead_becomes_applied_during_lazy_resolver_skips_apply(session_maker) -> None:
+    mock_api = AsyncMock(side_effect=RuntimeError("must not be called"))
+    booking_ts = datetime(2026, 5, 8, 12, 1, 0, tzinfo=_UTC)
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_client(session)
+            record = await _seed_record(session, altegio_record_id=555)
+            await _seed_service(session)
+            lead = _make_lead()
+            session.add(lead)
+            await session.flush()
+            lead_id = lead.id
+
+            async def resolver() -> datetime:
+                await session.execute(
+                    update(PromoLead)
+                    .where(PromoLead.id == lead_id)
+                    .values(status="applied")
+                    .execution_options(synchronize_session=False)
+                )
+                await session.flush()
+                return booking_ts
+
+            with patch("altegio_bot.promo_discount_apply.apply_promo_discount_to_visit", mock_api):
+                with _base_settings_ctx():
+                    await try_apply_promo_discount(
+                        session,
+                        record,
+                        _COMPANY,
+                        booking_created_at_resolver=resolver,
+                    )
+
+    mock_api.assert_not_called()
+
+    async with session_maker() as s:
+        lead = (await s.execute(select(PromoLead).where(PromoLead.phone_e164 == _PHONE))).scalar_one()
+        job = (
+            await s.execute(select(MessageJob).where(MessageJob.job_type == "promo_discount_applied"))
+        ).scalar_one_or_none()
+
+    assert lead.status == "applied"
+    assert job is None
+
+
+@pytest.mark.asyncio
+async def test_race_lead_becomes_booked_for_other_record_during_lazy_resolver_skips_apply(session_maker) -> None:
+    mock_api = AsyncMock(side_effect=RuntimeError("must not be called"))
+    booking_ts = datetime(2026, 5, 8, 12, 1, 0, tzinfo=_UTC)
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_client(session)
+            current_record = await _seed_record(session, record_id=200, altegio_record_id=555)
+            other_record = await _seed_record(session, record_id=300, altegio_record_id=777)
+            await _seed_service(session, record_id=current_record.id)
+            lead = _make_lead()
+            session.add(lead)
+            await session.flush()
+            lead_id = lead.id
+
+            async def resolver() -> datetime:
+                await session.execute(
+                    update(PromoLead)
+                    .where(PromoLead.id == lead_id)
+                    .values(
+                        status="booked",
+                        record_id=other_record.id,
+                        altegio_record_id=other_record.altegio_record_id,
+                    )
+                    .execution_options(synchronize_session=False)
+                )
+                await session.flush()
+                return booking_ts
+
+            with patch("altegio_bot.promo_discount_apply.apply_promo_discount_to_visit", mock_api):
+                with _base_settings_ctx():
+                    await try_apply_promo_discount(
+                        session,
+                        current_record,
+                        _COMPANY,
+                        booking_created_at_resolver=resolver,
+                    )
+
+    mock_api.assert_not_called()
+
+    async with session_maker() as s:
+        lead = (await s.execute(select(PromoLead).where(PromoLead.phone_e164 == _PHONE))).scalar_one()
+        job = (
+            await s.execute(select(MessageJob).where(MessageJob.job_type == "promo_discount_applied"))
+        ).scalar_one_or_none()
+
+    assert lead.status == "booked"
+    assert lead.record_id == 300
+    assert lead.altegio_record_id == 777
+    assert job is None
+
+
+@pytest.mark.asyncio
+async def test_revalidation_does_not_switch_to_new_lead_after_lazy_resolver(session_maker) -> None:
+    mock_api = AsyncMock(side_effect=RuntimeError("must not be called"))
+    booking_ts = datetime(2026, 5, 8, 12, 1, 0, tzinfo=_UTC)
+    replacement_ids: list[int] = []
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_client(session)
+            record = await _seed_record(session, altegio_record_id=555)
+            await _seed_service(session)
+            lead = _make_lead()
+            session.add(lead)
+            await session.flush()
+            initial_lead_id = lead.id
+
+            async def resolver() -> datetime:
+                await session.execute(
+                    update(PromoLead)
+                    .where(PromoLead.id == initial_lead_id)
+                    .values(status="cancelled", campaign_name="welcome_discount_superseded")
+                    .execution_options(synchronize_session=False)
+                )
+                replacement = _make_lead()
+                session.add(replacement)
+                await session.flush()
+                replacement_ids.append(replacement.id)
+                return booking_ts
+
+            with patch("altegio_bot.promo_discount_apply.apply_promo_discount_to_visit", mock_api):
+                with _base_settings_ctx():
+                    await try_apply_promo_discount(
+                        session,
+                        record,
+                        _COMPANY,
+                        booking_created_at_resolver=resolver,
+                    )
+
+    mock_api.assert_not_called()
+
+    async with session_maker() as s:
+        initial_lead = await s.get(PromoLead, initial_lead_id)
+        replacement_lead = await s.get(PromoLead, replacement_ids[0])
+        job = (
+            await s.execute(select(MessageJob).where(MessageJob.job_type == "promo_discount_applied"))
+        ).scalar_one_or_none()
+
+    assert initial_lead is not None
+    assert initial_lead.status == "cancelled"
+    assert initial_lead.campaign_name == "welcome_discount_superseded"
+    assert replacement_lead is not None
+    assert replacement_lead.status == "issued"
+    assert job is None
+
+
+@pytest.mark.asyncio
+async def test_prior_attended_visit_appears_during_lazy_resolver_skips_apply(session_maker) -> None:
+    mock_api = AsyncMock(side_effect=RuntimeError("must not be called"))
+    booking_ts = datetime(2026, 5, 8, 12, 1, 0, tzinfo=_UTC)
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_client(session)
+            record = await _seed_record(session, record_id=200, altegio_record_id=555)
+            await _seed_service(session, record_id=record.id)
+            lead = _make_lead()
+            session.add(lead)
+            await session.flush()
+
+            async def resolver() -> datetime:
+                await _seed_record(
+                    session,
+                    record_id=300,
+                    altegio_record_id=777,
+                    client_id=100,
+                    attendance=1,
+                )
+                return booking_ts
+
+            with patch("altegio_bot.promo_discount_apply.apply_promo_discount_to_visit", mock_api):
+                with _base_settings_ctx():
+                    await try_apply_promo_discount(
+                        session,
+                        record,
+                        _COMPANY,
+                        booking_created_at_resolver=resolver,
+                    )
+
+    mock_api.assert_not_called()
+
+    async with session_maker() as s:
+        lead = (await s.execute(select(PromoLead).where(PromoLead.phone_e164 == _PHONE))).scalar_one()
+        job = (
+            await s.execute(select(MessageJob).where(MessageJob.job_type == "promo_discount_applied"))
+        ).scalar_one_or_none()
+
+    assert lead.status == "issued"
+    assert "prior attended visits" in (lead.meta or {}).get("apply_skip_reason", "")
+    assert job is None
+
+
+@pytest.mark.asyncio
+async def test_service_becomes_disallowed_during_lazy_resolver_skips_apply(session_maker) -> None:
+    mock_api = AsyncMock(side_effect=RuntimeError("must not be called"))
+    booking_ts = datetime(2026, 5, 8, 12, 1, 0, tzinfo=_UTC)
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_client(session)
+            record = await _seed_record(session, altegio_record_id=555)
+            await _seed_service(session, record_id=record.id, service_id=_ALLOWED_SERVICE)
+            lead = _make_lead()
+            session.add(lead)
+            await session.flush()
+
+            async def resolver() -> datetime:
+                await session.execute(
+                    update(RecordService)
+                    .where(RecordService.record_id == record.id)
+                    .values(service_id=_OTHER_SERVICE)
+                    .execution_options(synchronize_session=False)
+                )
+                await session.flush()
+                return booking_ts
+
+            with patch("altegio_bot.promo_discount_apply.apply_promo_discount_to_visit", mock_api):
+                with _base_settings_ctx():
+                    await try_apply_promo_discount(
+                        session,
+                        record,
+                        _COMPANY,
+                        booking_created_at_resolver=resolver,
+                    )
+
+    mock_api.assert_not_called()
+
+    async with session_maker() as s:
+        lead = (await s.execute(select(PromoLead).where(PromoLead.phone_e164 == _PHONE))).scalar_one()
+        job = (
+            await s.execute(select(MessageJob).where(MessageJob.job_type == "promo_discount_applied"))
+        ).scalar_one_or_none()
+
+    assert lead.status == "issued"
+    assert "no allowed service" in (lead.meta or {}).get("apply_skip_reason", "")
+    assert job is None
+
+
+@pytest.mark.asyncio
+async def test_explicit_booking_timestamp_does_not_call_lazy_resolver(session_maker) -> None:
+    mock_api = AsyncMock(return_value=PromoDiscountApplyResult(applied=True, raw={"success": True}))
+    resolver = AsyncMock(side_effect=AssertionError("booking_created_at_resolver must not be called"))
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_client(session)
+            record = await _seed_record(session, altegio_record_id=555)
+            await _seed_service(session)
+            lead = _make_lead()
+            session.add(lead)
+            await session.flush()
+
+            with patch("altegio_bot.promo_discount_apply.apply_promo_discount_to_visit", mock_api):
+                with _base_settings_ctx():
+                    await try_apply_promo_discount(
+                        session,
+                        record,
+                        _COMPANY,
+                        booking_created_at=_NOW,
+                        booking_created_at_resolver=resolver,
+                    )
+
+    resolver.assert_not_called()
+    mock_api.assert_called_once()
+
+    async with session_maker() as s:
+        lead = (await s.execute(select(PromoLead).where(PromoLead.phone_e164 == _PHONE))).scalar_one()
+
+    assert lead.status == "applied"
+
+
 # ---------------------------------------------------------------------------
 # 25. Booked lead bound to different record → skip, no API call
 # ---------------------------------------------------------------------------
@@ -1091,6 +1601,41 @@ async def test_booked_lead_same_record_retry_allowed(session_maker) -> None:
                 with _base_settings_ctx():
                     await try_apply_promo_discount(session, record, _COMPANY, booking_created_at=_NOW)
 
+    mock_api.assert_called_once()
+
+    async with session_maker() as s:
+        lead = (await s.execute(select(PromoLead).where(PromoLead.phone_e164 == _PHONE))).scalar_one_or_none()
+
+    assert lead is not None
+    assert lead.status == "applied"
+
+
+@pytest.mark.asyncio
+async def test_booked_lead_same_record_retry_allowed_after_lazy_resolver(session_maker) -> None:
+    mock_api = AsyncMock(return_value=PromoDiscountApplyResult(applied=True, raw={"success": True}))
+    resolver = AsyncMock(return_value=_NOW)
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_client(session)
+            record = await _seed_record(session, altegio_record_id=777)
+            await _seed_service(session)
+            lead = _make_lead(status="booked")
+            lead.record_id = record.id
+            lead.altegio_record_id = record.altegio_record_id
+            session.add(lead)
+            await session.flush()
+
+            with patch("altegio_bot.promo_discount_apply.apply_promo_discount_to_visit", mock_api):
+                with _base_settings_ctx():
+                    await try_apply_promo_discount(
+                        session,
+                        record,
+                        _COMPANY,
+                        booking_created_at_resolver=resolver,
+                    )
+
+    resolver.assert_awaited_once()
     mock_api.assert_called_once()
 
     async with session_maker() as s:
