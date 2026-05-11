@@ -291,6 +291,38 @@ async def test_expired_lead_excluded(session_maker) -> None:
 
 
 # ---------------------------------------------------------------------------
+# 4b. Ineligible PromoLead statuses → excluded by SQL, no API call
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["rejected_not_new", "pending_check"])
+async def test_ineligible_lead_status_excluded(session_maker, status: str) -> None:
+    mock_api = AsyncMock(side_effect=RuntimeError("must not be called"))
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_client(session)
+            record = await _seed_record(session)
+            await _seed_service(session)
+            lead = _make_lead(status=status)
+            session.add(lead)
+            await session.flush()
+
+            with patch("altegio_bot.promo_discount_apply.apply_promo_discount_to_visit", mock_api):
+                with _base_settings_ctx():
+                    await try_apply_promo_discount(session, record, _COMPANY, booking_created_at=_NOW)
+
+    mock_api.assert_not_called()
+
+    async with session_maker() as s:
+        lead = (await s.execute(select(PromoLead).where(PromoLead.phone_e164 == _PHONE))).scalar_one_or_none()
+
+    assert lead is not None
+    assert lead.status == status
+
+
+# ---------------------------------------------------------------------------
 # 5. Happy path: applied, MessageJob queued for customer notification
 # ---------------------------------------------------------------------------
 

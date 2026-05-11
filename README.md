@@ -457,25 +457,50 @@ This adds the `chatwoot_conversation_id` column to `whatsapp_events`.
 | `CHATWOOT_ENABLED=false` (default) | Exactly as before — Meta direct |
 | `CHATWOOT_ENABLED=true` + `WHATSAPP_PROVIDER=chatwoot_hybrid` | Dual-write enabled |
 
-## Promo discount application to visits
+## MVP-3: controlled promo discount apply rollout
 
-When a new client books an appointment after receiving a secret-word promo, the
-system can automatically apply a loyalty discount program to that booking via
-Altegio API.
+MVP-2 is already enough to issue the discount right: a secret word can create a
+new-client `PromoLead.status='issued'` and issue/store the Altegio loyalty card.
+It does **not** safely apply the discount to a visit by itself.
 
-**Disabled by default.** Enable only after a successful smoke test.
+MVP-3 adds a controlled automatic apply path after an Altegio **record create**
+webhook. It is disabled by default and must stay disabled on normal production
+traffic until the apply endpoint, payload, booking timestamp source, and customer
+notification flow have been smoke-tested on an owner-controlled test number.
+
+**Explicit warning:** do not test this on real clients. Use only test numbers
+owned by the business/operator. Before a smoke test, clean up only test rows
+scoped by `phone_e164` and `campaign_name`; do not run broad promo cleanup SQL.
 
 ### How it works
 
-1. Client sends secret word via WhatsApp → `PromoLead` created, loyalty card issued.
+1. Client sends secret word via WhatsApp -> `PromoLead` created, loyalty card issued.
 2. Client books via online booking URL.
 3. Altegio sends a **record create** webhook.
 4. `inbox_worker` processes the webhook and calls `try_apply_promo_discount`.
 5. The function matches the booking to the client's active `PromoLead` by company_id
    and phone number.
-6. If the service is in the allowlist, the discount program is applied via Altegio API.
-7. `PromoLead.status` advances: `issued → booked → applied`.
-8. A `MessageJob` is queued; `outbox_worker` sends the client a German WhatsApp confirmation.
+6. `rejected_not_new`, `pending_check`, `applied`, expired, missing-card, and
+   wrong-company leads are ignored.
+7. The booking creation timestamp must be after `PromoLead.issued_at`.
+8. The record must contain at least one service from `PROMO_ALLOWED_SERVICE_IDS`.
+9. If both apply gates are enabled, the discount program is applied via Altegio API.
+10. `PromoLead.status` advances: `issued -> booked -> applied`.
+11. A `MessageJob` is queued; `outbox_worker` sends the client a German WhatsApp confirmation.
+
+The apply HTTP call is:
+
+```text
+POST /visit/loyalty/apply_discount_program/{location_id}/{card_id}/{program_id}
+body: {"record_id": <altegio_record_id>}
+```
+
+`location_id`, `card_id`, and `program_id` come from the issued `PromoLead`;
+`record_id` is the external `Record.altegio_record_id` from the webhook-synced
+booking. The response is treated as success only when the JSON body is an object
+with `success: true`. `success: false`, missing `success`, invalid JSON, and HTTP
+or network errors all fail closed: `PromoLead.status='apply_failed'`, error
+metadata is stored, and no customer "discount applied" notification is queued.
 
 **Update webhooks are intentionally ignored.** Only create webhooks trigger promo
 discount apply, to avoid accidentally applying a promo to a booking that was made
@@ -554,8 +579,9 @@ job skips the external Altegio lookup and records
 soft-rejection reply is sent.
 
 External Altegio history lookup is still controlled separately by
-`PROMO_CHECK_NEW_CLIENT_IN_ALTEGIO`. Current production should keep that flag
-false until the `clients/visits/search` HTTP 403 permission issue is resolved.
+`PROMO_CHECK_NEW_CLIENT_IN_ALTEGIO`. Enable it only after the
+`clients/visits/search` endpoint has been smoke-tested for the target
+`PROMO_LOCATION_ID_BY_COMPANY` mapping.
 
 **New-client eligibility check:** by default the promo funnel keeps the existing
 local-only check for prior attended visits and makes no extra Altegio API call.
@@ -598,8 +624,6 @@ active/card reply; retroactive cleanup is out of scope.
 - Retry worker for `apply_failed` leads
 - Customer notification on apply failure
 - Meta paid templates for promo notification
-- Fixing Altegio 403 permissions for the external history endpoint
-- Enabling `PROMO_CHECK_NEW_CLIENT_IN_ALTEGIO` in production
 - Automatic retry/manual reset for `altegio_new_client_check_failed`
 - Moving the initial checking reply into Outbox
 - Cleanup or Ops reset for stuck old `pending_check` leads
@@ -614,6 +638,9 @@ explicitly enabled after verification.
 ### Required environment variables
 
 ```bash
+# Promo funnel must already be enabled for MVP-2 issuance.
+PROMO_LEAD_FUNNEL_ENABLED=true
+
 # Optional async promo eligibility flow.
 # Default false keeps the immediate MVP-1 promo reply flow.
 # If true, a pending_check PromoLead is created and MessageJob handles the final reply.
@@ -628,17 +655,100 @@ PROMO_CHECK_NEW_CLIENT_IN_ALTEGIO=false
 # JSON mapping company_id (str) → Altegio location_id (int).
 PROMO_LOCATION_ID_BY_COMPANY={"1":9001}
 
-# Master gate — enable only after API is verified and smoke-tested
-PROMO_APPLY_DISCOUNT_ENABLED=true
+# Master gate. Default false: automatic apply is impossible.
+PROMO_APPLY_DISCOUNT_ENABLED=false
 
 # Endpoint verification gate — set True only after confirming the
 # POST /visit/loyalty/apply_discount_program/{location_id}/{card_id}/{program_id}
 # endpoint against Altegio API docs and completing a smoke test
-PROMO_APPLY_DISCOUNT_API_VERIFIED=true
+PROMO_APPLY_DISCOUNT_API_VERIFIED=false
 
 # Comma-separated Altegio service IDs eligible for the promo discount.
 # If empty, discount is never applied automatically (fail-closed).
 PROMO_ALLOWED_SERVICE_IDS=12345,67890
+```
+
+Production automatic apply is impossible unless both of these are explicitly
+enabled together:
+
+```bash
+PROMO_APPLY_DISCOUNT_ENABLED=true
+PROMO_APPLY_DISCOUNT_API_VERIFIED=true
+```
+
+Do not enable them immediately for production traffic. The endpoint is still
+marked unconfirmed in code, applying a discount changes Altegio CRM state, a
+successful apply triggers a customer WhatsApp notification, and the automatic
+webhook path currently stays fail-closed until a confirmed booking-created
+timestamp field is available.
+
+### Controlled smoke plan
+
+1. Use an owner-controlled test WhatsApp number and the target campaign, for
+   example `PROMO_CAMPAIGN_NAME=sommer_2026`. Do not use a real client.
+2. If cleanup is needed, first inspect and then delete only test rows scoped by
+   `phone_e164` and `campaign_name`. Clean related `message_jobs` and
+   `outbox_messages` only through the test `PromoLead` ids / test phone.
+3. Send the secret word from the test number and confirm a new-client
+   `PromoLead.status='issued'` exists with `loyalty_card_id`, `location_id`,
+   and `discount_program_id`.
+4. Create the test booking in Altegio using an allowed service id.
+5. Find a candidate:
+
+```bash
+docker compose exec -T altegio-api python -m altegio_bot.scripts.find_promo_discount_smoke_candidate \
+  --campaign-name sommer_2026 --phone +49...
+```
+
+6. Run the printed dry-run command. It must not call Altegio.
+7. Manually verify in Altegio that the booking belongs to the test number, was
+   created after `PromoLead.issued_at`, and uses an allowed service.
+8. Run the real single-record smoke only with explicit API verification:
+
+```bash
+PROMO_APPLY_DISCOUNT_API_VERIFIED=true \
+uv run python -m altegio_bot.scripts.smoke_apply_promo_discount \
+  --location-id 123 \
+  --card-id 456 \
+  --program-id 789 \
+  --record-id 111 \
+  --yes-apply
+```
+
+9. Verify `PromoLead`:
+
+```sql
+SELECT id, status, applied_at, record_id, altegio_record_id, meta
+FROM promo_leads
+WHERE phone_e164 = '+49...' AND campaign_name = 'sommer_2026'
+ORDER BY id DESC;
+```
+
+10. Verify the notification job:
+
+```sql
+SELECT id, status, dedupe_key, payload, last_error
+FROM message_jobs
+WHERE job_type = 'promo_discount_applied'
+  AND payload->>'phone_e164' = '+49...'
+ORDER BY id DESC;
+```
+
+11. Verify the outbound message:
+
+```sql
+SELECT id, status, provider_message_id, error, sent_at
+FROM outbox_messages
+WHERE phone_e164 = '+49...'
+ORDER BY id DESC
+LIMIT 20;
+```
+
+12. To disable automatic apply again, set:
+
+```bash
+PROMO_APPLY_DISCOUNT_ENABLED=false
+PROMO_APPLY_DISCOUNT_API_VERIFIED=false
 ```
 
 ### Lifecycle after cleanup
