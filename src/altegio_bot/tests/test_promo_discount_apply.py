@@ -2200,3 +2200,755 @@ async def test_price_override_discount_calculation_stores_correct_meta(session_m
     returned = meta.get("altegio_returned_discount")
     assert returned is not None
     assert abs(returned - round(15.0 / 140.0 * 100, 4)) < 0.01
+
+
+# =============================================================================
+# P2.2: Settings validator — promo_apply_mode
+# =============================================================================
+
+
+class TestPromoApplyModeValidator:
+    """@field_validator('promo_apply_mode') accepts the two valid values and
+    rejects typos at startup."""
+
+    def test_record_price_override_valid(self) -> None:
+        from pydantic import ValidationError
+
+        from altegio_bot.settings import Settings
+
+        try:
+            s = Settings(
+                database_url="postgresql://localhost/test",
+                altegio_webhook_secret="x",
+                promo_apply_mode="record_price_override",
+            )
+            assert s.promo_apply_mode == "record_price_override"
+        except ValidationError:
+            pytest.fail("record_price_override should be a valid promo_apply_mode")
+
+    def test_loyalty_program_valid(self) -> None:
+        from pydantic import ValidationError
+
+        from altegio_bot.settings import Settings
+
+        try:
+            s = Settings(
+                database_url="postgresql://localhost/test",
+                altegio_webhook_secret="x",
+                promo_apply_mode="loyalty_program",
+            )
+            assert s.promo_apply_mode == "loyalty_program"
+        except ValidationError:
+            pytest.fail("loyalty_program should be a valid promo_apply_mode")
+
+    def test_typo_raises_validation_error(self) -> None:
+        from pydantic import ValidationError
+
+        from altegio_bot.settings import Settings
+
+        with pytest.raises(ValidationError, match="promo_apply_mode"):
+            Settings(
+                database_url="postgresql://localhost/test",
+                altegio_webhook_secret="x",
+                promo_apply_mode="record_price_overide",  # typo — one 'r' missing
+            )
+
+
+# =============================================================================
+# P2.1: get_service_cost_for_discount — cost=0 must NOT fall through to manual_cost
+# =============================================================================
+
+
+class TestGetServiceCostForDiscount:
+    """Verifies that cost=0 is treated as a valid price (not a fallback sentinel)."""
+
+    def test_cost_zero_does_not_fall_through(self) -> None:
+        """cost=0, manual_cost=100 → original_cost 0 (not 100), new_cost 0."""
+        from altegio_bot.promo_discount_apply import get_service_cost_for_discount
+
+        result = get_service_cost_for_discount({"cost": 0, "manual_cost": 100.0})
+        assert result == 0.0
+
+    def test_cost_none_uses_manual_cost(self) -> None:
+        from altegio_bot.promo_discount_apply import get_service_cost_for_discount
+
+        result = get_service_cost_for_discount({"cost": None, "manual_cost": 80.0})
+        assert result == 80.0
+
+    def test_both_absent_returns_zero(self) -> None:
+        from altegio_bot.promo_discount_apply import get_service_cost_for_discount
+
+        assert get_service_cost_for_discount({}) == 0.0
+
+    def test_positive_cost_returned_directly(self) -> None:
+        from altegio_bot.promo_discount_apply import get_service_cost_for_discount
+
+        result = get_service_cost_for_discount({"cost": 140.0, "manual_cost": 999.0})
+        assert result == 140.0
+
+
+@pytest.mark.asyncio
+async def test_price_override_zero_cost_service_new_cost_is_zero(session_maker) -> None:
+    """cost=0 on a service → new_cost=max(0, 0-15)=0 (not negative, not using manual_cost).
+
+    This verifies get_service_cost_for_discount is wired correctly in the apply path.
+    """
+    mock_get = AsyncMock(
+        return_value=_make_altegio_get_data(cost=0.0)  # cost=0 — free service
+    )
+    mock_put = AsyncMock(return_value={"success": True, "data": {}})
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_client(session)
+            record = await _seed_record(
+                session,
+                record_id=200,
+                altegio_record_id=_ALTEGIO_RECORD_ID_PO,
+                starts_at=_STARTS_AT,
+            )
+            await _seed_service(session)
+            lead = _make_lead()
+            session.add(lead)
+            await session.flush()
+
+            with (
+                patch("altegio_bot.promo_discount_apply.fetch_altegio_record_for_update", mock_get),
+                patch(
+                    "altegio_bot.promo_discount_apply.update_altegio_record_price_and_comment",
+                    mock_put,
+                ),
+                _base_settings_ctx(
+                    promo_apply_mode="record_price_override",
+                    promo_discount_amount=_DISCOUNT_AMOUNT,
+                ),
+            ):
+                await try_apply_promo_discount(session, record, _COMPANY, booking_created_at=_NOW)
+
+    put_kwargs = mock_put.call_args.kwargs
+    new_svcs = put_kwargs["new_services"]
+    assert new_svcs[0]["cost"] == 0.0  # max(0, 0-15) = 0, not negative
+
+
+# =============================================================================
+# P1.1: Minimal PUT payload — service fields and client fields
+# =============================================================================
+
+
+class TestBuildMinimalServiceForPut:
+    """build_minimal_service_for_put strips all non-essential fields."""
+
+    def test_strips_extra_fields(self) -> None:
+        from altegio_bot.altegio_record_update import build_minimal_service_for_put
+
+        svc = {
+            "id": 12345,
+            "title": "Wimpern",
+            "cost": 140.0,
+            "first_cost": 140.0,
+            "discount": 0,
+            "manual_cost": 140.0,
+            "cost_to_pay": 140.0,
+            "cost_per_unit": 140.0,
+            "assistants": [],
+            "amount": 1,
+        }
+        result = build_minimal_service_for_put(svc)
+        assert set(result.keys()) == {"id", "first_cost", "discount", "cost"}
+        assert result["id"] == 12345
+        assert result["cost"] == 140.0
+        assert result["first_cost"] == 140.0
+        assert result["discount"] == 0
+
+    def test_override_all_price_fields(self) -> None:
+        from altegio_bot.altegio_record_update import build_minimal_service_for_put
+
+        svc = {"id": 12345, "cost": 140.0, "first_cost": 140.0, "discount": 0}
+        result = build_minimal_service_for_put(
+            svc, override_cost=125.0, override_first_cost=140.0, override_discount=15.0
+        )
+        assert result == {"id": 12345, "cost": 125.0, "first_cost": 140.0, "discount": 15.0}
+
+
+class TestNormalizeRecordClientForPut:
+    """normalize_record_client_for_put keeps only phone, name, email."""
+
+    def test_strips_extra_client_fields(self) -> None:
+        from altegio_bot.altegio_record_update import normalize_record_client_for_put
+
+        record_data = {
+            "client": {
+                "id": 50,
+                "display_name": "Test User",
+                "phone": "+49160123456",
+                "name": "Test",
+                "email": "test@example.com",
+                "some_extra": "should not appear",
+            }
+        }
+        result = normalize_record_client_for_put(record_data)
+        assert set(result.keys()) == {"phone", "name", "email"}
+        assert result["phone"] == "+49160123456"
+        assert result["email"] == "test@example.com"
+
+    def test_missing_client_returns_empty_dict(self) -> None:
+        from altegio_bot.altegio_record_update import normalize_record_client_for_put
+
+        assert normalize_record_client_for_put({}) == {}
+
+    def test_none_values_skipped(self) -> None:
+        from altegio_bot.altegio_record_update import normalize_record_client_for_put
+
+        record_data = {"client": {"phone": "+49160123456", "name": None, "email": None}}
+        result = normalize_record_client_for_put(record_data)
+        assert result == {"phone": "+49160123456"}
+
+
+@pytest.mark.asyncio
+async def test_price_override_simple_put_payload_minimal_fields(session_maker) -> None:
+    """Simple apply: PUT new_services must contain only id/first_cost/discount/cost.
+
+    Extra fields (title, manual_cost, cost_to_pay, amount, assistants, …) must
+    be stripped before the PUT request is built.
+    """
+    rich_altegio_data = _make_altegio_get_data()
+    # Inject extra fields that should be stripped
+    rich_altegio_data["services"][0].update(
+        {
+            "title": "Wimpern",
+            "manual_cost": _COST_ORIGINAL,
+            "cost_to_pay": _COST_ORIGINAL,
+            "cost_per_unit": _COST_ORIGINAL,
+            "assistants": [],
+            "amount": 1,
+        }
+    )
+    mock_get = AsyncMock(return_value=rich_altegio_data)
+    mock_put = AsyncMock(return_value=_make_put_response())
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_client(session)
+            record = await _seed_record(
+                session,
+                record_id=200,
+                altegio_record_id=_ALTEGIO_RECORD_ID_PO,
+                starts_at=_STARTS_AT,
+            )
+            await _seed_service(session)
+            lead = _make_lead()
+            session.add(lead)
+            await session.flush()
+
+            with (
+                patch("altegio_bot.promo_discount_apply.fetch_altegio_record_for_update", mock_get),
+                patch(
+                    "altegio_bot.promo_discount_apply.update_altegio_record_price_and_comment",
+                    mock_put,
+                ),
+                _base_settings_ctx(
+                    promo_apply_mode="record_price_override",
+                    promo_discount_amount=_DISCOUNT_AMOUNT,
+                ),
+            ):
+                await try_apply_promo_discount(session, record, _COMPANY, booking_created_at=_NOW)
+
+    mock_put.assert_awaited_once()
+    put_kwargs = mock_put.call_args.kwargs
+    new_svcs = put_kwargs["new_services"]
+    assert len(new_svcs) == 1
+    target_svc = new_svcs[0]
+    # Only the four minimal fields should be present
+    assert set(target_svc.keys()) == {"id", "first_cost", "discount", "cost"}
+    # Correct overridden values
+    assert target_svc["cost"] == _COST_DISCOUNTED
+    assert target_svc["first_cost"] == _COST_ORIGINAL
+    assert target_svc["discount"] == _DISCOUNT_AMOUNT
+
+
+# =============================================================================
+# P2.4: SQL-level day filter in _count_same_day_records_for_client
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_same_day_count_excludes_yesterday_and_tomorrow(session_maker) -> None:
+    """Records on adjacent days must NOT be counted as same-day."""
+    from datetime import timedelta
+
+    from altegio_bot.promo_discount_apply import _count_same_day_records_for_client
+
+    today = _STARTS_AT  # 2026-05-08 10:00 UTC
+    yesterday = today - timedelta(days=1)
+    tomorrow = today + timedelta(days=1)
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_client(session)
+            # Today
+            await _seed_record(session, record_id=200, altegio_record_id=2001, starts_at=today)
+            # Yesterday — must NOT be counted
+            await _seed_record(session, record_id=201, altegio_record_id=2002, starts_at=yesterday)
+            # Tomorrow — must NOT be counted
+            await _seed_record(session, record_id=202, altegio_record_id=2003, starts_at=tomorrow)
+
+            count = await _count_same_day_records_for_client(
+                session,
+                client_id=100,
+                company_id=_COMPANY,
+                reference_starts_at=today,
+            )
+    assert count == 1
+
+
+@pytest.mark.asyncio
+async def test_same_day_count_two_records_on_same_day(session_maker) -> None:
+    """Two records on the same local calendar day → count == 2."""
+    from altegio_bot.promo_discount_apply import _count_same_day_records_for_client
+
+    morning = _STARTS_AT  # 2026-05-08 10:00 UTC
+    afternoon = datetime(2026, 5, 8, 14, 0, 0, tzinfo=_UTC)
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_client(session)
+            await _seed_record(session, record_id=200, altegio_record_id=2001, starts_at=morning)
+            await _seed_record(session, record_id=201, altegio_record_id=2002, starts_at=afternoon)
+
+            count = await _count_same_day_records_for_client(
+                session,
+                client_id=100,
+                company_id=_COMPANY,
+                reference_starts_at=morning,
+            )
+    assert count == 2
+
+
+# =============================================================================
+# P2.5: String service id in fresh Altegio data → still matches int allowlist
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_price_override_string_service_id_in_altegio_matches_int_allowlist(session_maker) -> None:
+    """Altegio GET returns service id as a string — must still match int allowlist entry."""
+    altegio_data = _make_altegio_get_data()
+    # Override service id to be a string (Altegio quirk)
+    altegio_data["services"][0]["id"] = str(_ALLOWED_SERVICE)
+
+    mock_get = AsyncMock(return_value=altegio_data)
+    mock_put = AsyncMock(return_value=_make_put_response())
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_client(session)
+            record = await _seed_record(
+                session,
+                record_id=200,
+                altegio_record_id=_ALTEGIO_RECORD_ID_PO,
+                starts_at=_STARTS_AT,
+            )
+            await _seed_service(session)
+            lead = _make_lead()
+            session.add(lead)
+            await session.flush()
+
+            with (
+                patch("altegio_bot.promo_discount_apply.fetch_altegio_record_for_update", mock_get),
+                patch(
+                    "altegio_bot.promo_discount_apply.update_altegio_record_price_and_comment",
+                    mock_put,
+                ),
+                _base_settings_ctx(
+                    promo_apply_mode="record_price_override",
+                    promo_discount_amount=_DISCOUNT_AMOUNT,
+                ),
+            ):
+                await try_apply_promo_discount(session, record, _COMPANY, booking_created_at=_NOW)
+
+    # String id must not prevent the simple apply from succeeding
+    mock_put.assert_awaited_once()
+
+    async with session_maker() as s:
+        lead = (await s.execute(select(PromoLead).where(PromoLead.phone_e164 == _PHONE))).scalar_one()
+    assert lead.status == "applied"
+
+
+# =============================================================================
+# P2.6: Missing error-path tests for record_price_override mode
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_price_override_get_record_fails_sets_apply_failed(session_maker) -> None:
+    """GET /record raises AltegioRecordUpdateError → lead→apply_failed, no PUT, no notification."""
+    from altegio_bot.altegio_record_update import AltegioRecordUpdateError
+
+    mock_get = AsyncMock(side_effect=AltegioRecordUpdateError("GET /record HTTP 404"))
+    mock_put = AsyncMock(side_effect=AssertionError("PUT must not be called"))
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_client(session)
+            record = await _seed_record(
+                session,
+                record_id=200,
+                altegio_record_id=_ALTEGIO_RECORD_ID_PO,
+                starts_at=_STARTS_AT,
+            )
+            await _seed_service(session)
+            lead = _make_lead()
+            session.add(lead)
+            await session.flush()
+
+            with (
+                patch("altegio_bot.promo_discount_apply.fetch_altegio_record_for_update", mock_get),
+                patch(
+                    "altegio_bot.promo_discount_apply.update_altegio_record_price_and_comment",
+                    mock_put,
+                ),
+                _base_settings_ctx(promo_apply_mode="record_price_override"),
+            ):
+                await try_apply_promo_discount(session, record, _COMPANY, booking_created_at=_NOW)
+
+    mock_put.assert_not_called()
+
+    async with session_maker() as s:
+        lead = (await s.execute(select(PromoLead).where(PromoLead.phone_e164 == _PHONE))).scalar_one()
+        job = (
+            await s.execute(select(MessageJob).where(MessageJob.job_type == "promo_discount_applied"))
+        ).scalar_one_or_none()
+
+    assert lead.status == "apply_failed"
+    meta = lead.meta or {}
+    assert "GET /record HTTP 404" in (meta.get("discount_apply_error") or "")
+    assert meta.get("discount_apply_attempted_at") is not None
+    assert job is None
+
+
+@pytest.mark.asyncio
+async def test_price_override_fresh_altegio_attendance_skips_override(session_maker) -> None:
+    """Fresh Altegio data has attendance=1 (but local record has attendance=0) → skip PUT."""
+    mock_get = AsyncMock(return_value=_make_altegio_get_data(attendance=1))  # fresh attended
+    mock_put = AsyncMock(side_effect=AssertionError("PUT must not be called"))
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_client(session)
+            record = await _seed_record(
+                session,
+                record_id=200,
+                altegio_record_id=_ALTEGIO_RECORD_ID_PO,
+                starts_at=_STARTS_AT,
+                attendance=0,  # local record: not yet attended
+            )
+            await _seed_service(session)
+            lead = _make_lead()
+            session.add(lead)
+            await session.flush()
+
+            with (
+                patch("altegio_bot.promo_discount_apply.fetch_altegio_record_for_update", mock_get),
+                patch(
+                    "altegio_bot.promo_discount_apply.update_altegio_record_price_and_comment",
+                    mock_put,
+                ),
+                _base_settings_ctx(promo_apply_mode="record_price_override"),
+            ):
+                await try_apply_promo_discount(session, record, _COMPANY, booking_created_at=_NOW)
+
+    mock_put.assert_not_called()
+
+    async with session_maker() as s:
+        lead = (await s.execute(select(PromoLead).where(PromoLead.phone_e164 == _PHONE))).scalar_one()
+
+    assert lead.status == "booked"  # issued→booked before the GET; skip sets apply_skip_reason
+    meta = lead.meta or {}
+    assert "already attended" in (meta.get("apply_skip_reason") or "")
+
+
+@pytest.mark.asyncio
+async def test_price_override_target_service_missing_in_altegio_sets_apply_failed(session_maker) -> None:
+    """Allowed service not present in fresh Altegio services → lead→apply_failed."""
+    # Altegio returns a *different* service id than the one in the allowlist
+    mock_get = AsyncMock(return_value=_make_altegio_get_data(service_id=_OTHER_SERVICE))
+    mock_put = AsyncMock(side_effect=AssertionError("PUT must not be called"))
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_client(session)
+            record = await _seed_record(
+                session,
+                record_id=200,
+                altegio_record_id=_ALTEGIO_RECORD_ID_PO,
+                starts_at=_STARTS_AT,
+            )
+            await _seed_service(session)  # local record has _ALLOWED_SERVICE
+            lead = _make_lead()
+            session.add(lead)
+            await session.flush()
+
+            with (
+                patch("altegio_bot.promo_discount_apply.fetch_altegio_record_for_update", mock_get),
+                patch(
+                    "altegio_bot.promo_discount_apply.update_altegio_record_price_and_comment",
+                    mock_put,
+                ),
+                _base_settings_ctx(promo_apply_mode="record_price_override"),
+            ):
+                await try_apply_promo_discount(session, record, _COMPANY, booking_created_at=_NOW)
+
+    mock_put.assert_not_called()
+
+    async with session_maker() as s:
+        lead = (await s.execute(select(PromoLead).where(PromoLead.phone_e164 == _PHONE))).scalar_one()
+        job = (
+            await s.execute(select(MessageJob).where(MessageJob.job_type == "promo_discount_applied"))
+        ).scalar_one_or_none()
+
+    assert lead.status == "apply_failed"
+    meta = lead.meta or {}
+    assert "not found" in (meta.get("discount_apply_error") or "")
+    assert job is None
+
+
+# =============================================================================
+# P1.2: should_suppress_promo_origin_record_update — suppression window tests
+# =============================================================================
+
+_SUPPRESS_ALTEGIO_RECORD_ID = 7777
+_SUPPRESS_LEAD_ID_PLACEHOLDER = 0  # replaced by actual lead.id at runtime
+
+
+def _make_suppress_event(*, received_at: datetime) -> MagicMock:
+    """Build a fake AltegioEvent with an explicit received_at for suppression tests."""
+    event = MagicMock()
+    event.received_at = received_at
+    return event
+
+
+@pytest.mark.asyncio
+async def test_suppress_immediate_marker_in_window(session_maker) -> None:
+    """Marker in comment + promo_record_put_at within 5 min → suppressed (fast path)."""
+    from altegio_bot.promo_discount_apply import should_suppress_promo_origin_record_update
+
+    put_at = datetime(2026, 5, 8, 20, 0, 0, tzinfo=_UTC)
+    received_at = datetime(2026, 5, 8, 20, 2, 0, tzinfo=_UTC)  # 2 min after PUT
+
+    async with session_maker() as session:
+        async with session.begin():
+            lead = _make_lead(status="applied")
+            lead.altegio_record_id = _SUPPRESS_ALTEGIO_RECORD_ID
+            lead.meta = {
+                "loyalty_card_issued": True,
+                "promo_record_put_at": put_at.isoformat(),
+                "promo_record_put_altegio_record_id": _SUPPRESS_ALTEGIO_RECORD_ID,
+                "promo_record_put_kind": "simple",
+            }
+            session.add(lead)
+            await session.flush()
+            lead_id = lead.id
+
+            # Record has the simple marker in its comment
+            record = MagicMock()
+            record.id = 200
+            record.altegio_record_id = _SUPPRESS_ALTEGIO_RECORD_ID
+            record.comment = f"Promo note\n[PromoLead:{lead_id}]"
+
+            event = _make_suppress_event(received_at=received_at)
+
+            result = await should_suppress_promo_origin_record_update(session, record, event)
+
+    assert result is True
+
+
+@pytest.mark.asyncio
+async def test_suppress_scan_path_no_comment_in_window(session_maker) -> None:
+    """No comment marker but PromoLead with matching altegio_record_id + fresh put_at → suppressed (slow path)."""
+    from altegio_bot.promo_discount_apply import should_suppress_promo_origin_record_update
+
+    put_at = datetime(2026, 5, 8, 20, 0, 0, tzinfo=_UTC)
+    received_at = datetime(2026, 5, 8, 20, 3, 0, tzinfo=_UTC)  # 3 min after PUT
+
+    async with session_maker() as session:
+        async with session.begin():
+            lead = _make_lead(status="applied")
+            lead.altegio_record_id = _SUPPRESS_ALTEGIO_RECORD_ID
+            lead.meta = {
+                "loyalty_card_issued": True,
+                "promo_record_put_at": put_at.isoformat(),
+                "promo_record_put_altegio_record_id": _SUPPRESS_ALTEGIO_RECORD_ID,
+                "promo_record_put_kind": "simple",
+            }
+            session.add(lead)
+            await session.flush()
+
+            # Record has NO comment (slow path)
+            record = MagicMock()
+            record.id = 200
+            record.altegio_record_id = _SUPPRESS_ALTEGIO_RECORD_ID
+            record.comment = None
+
+            event = _make_suppress_event(received_at=received_at)
+
+            result = await should_suppress_promo_origin_record_update(session, record, event)
+
+    assert result is True
+
+
+@pytest.mark.asyncio
+async def test_suppress_outside_window_not_suppressed(session_maker) -> None:
+    """Marker in comment but received_at more than 5 min after put_at → NOT suppressed."""
+    from altegio_bot.promo_discount_apply import should_suppress_promo_origin_record_update
+
+    put_at = datetime(2026, 5, 8, 20, 0, 0, tzinfo=_UTC)
+    received_at = datetime(2026, 5, 8, 20, 10, 0, tzinfo=_UTC)  # 10 min after → outside window
+
+    async with session_maker() as session:
+        async with session.begin():
+            lead = _make_lead(status="applied")
+            lead.altegio_record_id = _SUPPRESS_ALTEGIO_RECORD_ID
+            lead.meta = {
+                "loyalty_card_issued": True,
+                "promo_record_put_at": put_at.isoformat(),
+                "promo_record_put_altegio_record_id": _SUPPRESS_ALTEGIO_RECORD_ID,
+            }
+            session.add(lead)
+            await session.flush()
+            lead_id = lead.id
+
+            record = MagicMock()
+            record.id = 200
+            record.altegio_record_id = _SUPPRESS_ALTEGIO_RECORD_ID
+            record.comment = f"Note\n[PromoLead:{lead_id}]"
+
+            event = _make_suppress_event(received_at=received_at)
+
+            result = await should_suppress_promo_origin_record_update(session, record, event)
+
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_suppress_no_marker_no_meta_not_suppressed(session_maker) -> None:
+    """No marker in comment and no PromoLead with promo_record_put_at → NOT suppressed."""
+    from altegio_bot.promo_discount_apply import should_suppress_promo_origin_record_update
+
+    received_at = datetime(2026, 5, 8, 20, 0, 0, tzinfo=_UTC)
+
+    async with session_maker() as session:
+        async with session.begin():
+            # A lead exists but has no promo_record_put_at in meta
+            lead = _make_lead(status="applied")
+            lead.altegio_record_id = _SUPPRESS_ALTEGIO_RECORD_ID
+            lead.meta = {"loyalty_card_issued": True}  # no promo_record_put_at
+            session.add(lead)
+            await session.flush()
+
+            record = MagicMock()
+            record.id = 200
+            record.altegio_record_id = _SUPPRESS_ALTEGIO_RECORD_ID
+            record.comment = "Normal edit by salon staff"  # no promo marker
+
+            event = _make_suppress_event(received_at=received_at)
+
+            result = await should_suppress_promo_origin_record_update(session, record, event)
+
+    assert result is False
+
+
+# =============================================================================
+# P1.2: meta stored after successful PUT — promo_record_put_* fields
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_price_override_simple_stores_promo_record_put_meta(session_maker) -> None:
+    """Simple apply stores promo_record_put_at, _marker, _record_id, _altegio_record_id, _kind in meta."""
+    mock_get = AsyncMock(return_value=_make_altegio_get_data())
+    mock_put = AsyncMock(return_value=_make_put_response())
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_client(session)
+            record = await _seed_record(
+                session,
+                record_id=200,
+                altegio_record_id=_ALTEGIO_RECORD_ID_PO,
+                starts_at=_STARTS_AT,
+            )
+            await _seed_service(session)
+            lead = _make_lead()
+            session.add(lead)
+            await session.flush()
+
+            with (
+                patch("altegio_bot.promo_discount_apply.fetch_altegio_record_for_update", mock_get),
+                patch(
+                    "altegio_bot.promo_discount_apply.update_altegio_record_price_and_comment",
+                    mock_put,
+                ),
+                _base_settings_ctx(promo_apply_mode="record_price_override"),
+            ):
+                await try_apply_promo_discount(session, record, _COMPANY, booking_created_at=_NOW)
+
+    async with session_maker() as s:
+        lead = (await s.execute(select(PromoLead).where(PromoLead.phone_e164 == _PHONE))).scalar_one()
+
+    assert lead.status == "applied"
+    meta = lead.meta or {}
+    assert meta.get("promo_record_put_at") is not None
+    assert meta.get("promo_record_put_kind") == "simple"
+    assert meta.get("promo_record_put_altegio_record_id") == _ALTEGIO_RECORD_ID_PO
+    assert meta.get("promo_record_put_record_id") == 200
+    lead_id = lead.id
+    assert meta.get("promo_record_put_marker") == f"[PromoLead:{lead_id}]"
+
+
+@pytest.mark.asyncio
+async def test_price_override_complex_stores_promo_record_put_meta(session_maker) -> None:
+    """Complex (manual) case stores promo_record_put_kind='manual' and manual marker in meta."""
+    mock_get = AsyncMock(return_value=_make_altegio_get_data())
+    mock_put = AsyncMock(return_value={"success": True, "data": {}})
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_client(session)
+            record = await _seed_record(
+                session,
+                record_id=200,
+                altegio_record_id=_ALTEGIO_RECORD_ID_PO,
+                starts_at=_STARTS_AT,
+            )
+            # Second record same day → complex case
+            await _seed_record(
+                session,
+                record_id=201,
+                altegio_record_id=8888,
+                client_id=100,
+                starts_at=_STARTS_AT,
+            )
+            await _seed_service(session)
+            lead = _make_lead()
+            session.add(lead)
+            await session.flush()
+
+            with (
+                patch("altegio_bot.promo_discount_apply.fetch_altegio_record_for_update", mock_get),
+                patch(
+                    "altegio_bot.promo_discount_apply.update_altegio_record_price_and_comment",
+                    mock_put,
+                ),
+                _base_settings_ctx(promo_apply_mode="record_price_override"),
+            ):
+                await try_apply_promo_discount(session, record, _COMPANY, booking_created_at=_NOW)
+
+    async with session_maker() as s:
+        lead = (await s.execute(select(PromoLead).where(PromoLead.phone_e164 == _PHONE))).scalar_one()
+
+    assert lead.status == "booked"
+    meta = lead.meta or {}
+    assert meta.get("promo_record_put_at") is not None
+    assert meta.get("promo_record_put_kind") == "manual"
+    lead_id = lead.id
+    assert meta.get("promo_record_put_marker") == f"[PromoLead:{lead_id}:manual]"

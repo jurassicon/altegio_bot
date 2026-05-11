@@ -186,10 +186,21 @@ class Settings(BaseSettings):
     # Discount-apply implementation mode.
     # 'record_price_override': PUT /record to change service price directly.
     #   This is the confirmed-working approach (smoke-tested May 2026).
-    #   The old loyalty discount program endpoint is NOT used for automatic apply.
-    # Any other value falls back to the legacy loyalty-program endpoint path
-    # (kept for backward compatibility with existing tests and manual smoke scripts).
+    # 'loyalty_program': legacy POST /visit/loyalty/apply_discount_program endpoint
+    #   (kept for backward compatibility with existing tests and smoke scripts).
+    # Any other value raises ValueError at startup.
     promo_apply_mode: str = "record_price_override"
+
+    @field_validator("promo_apply_mode")
+    @classmethod
+    def validate_promo_apply_mode(cls, v: str) -> str:
+        allowed = {"record_price_override", "loyalty_program"}
+        if v not in allowed:
+            raise ValueError(
+                f"promo_apply_mode must be one of {sorted(allowed)!r}, got {v!r}. "
+                "Check the PROMO_APPLY_MODE environment variable."
+            )
+        return v
 
     # Publicly accessible image URLs for newsletter template IMAGE HEADER components.
     # Meta Cloud API requires a permanent URL it can fetch and cache at send time.

@@ -104,6 +104,48 @@ async def fetch_altegio_record_for_update(
     return data
 
 
+def normalize_record_client_for_put(record_data: dict[str, Any]) -> dict[str, Any]:
+    """Extract only the client fields required by Altegio PUT /record.
+
+    The full client object from GET contains many extra fields; only phone,
+    name, and email are needed and accepted by the PUT endpoint.  Sending
+    extra fields (id, display_name, …) has caused 422 errors in some Altegio
+    account configurations.
+    """
+    client = record_data.get("client") or {}
+    result: dict[str, Any] = {}
+    for field in ("phone", "name", "email"):
+        value = client.get(field)
+        if value is not None:
+            result[field] = value
+    return result
+
+
+def build_minimal_service_for_put(
+    svc: dict[str, Any],
+    *,
+    override_cost: float | None = None,
+    override_first_cost: float | None = None,
+    override_discount: float | None = None,
+) -> dict[str, Any]:
+    """Build a minimal service dict for Altegio PUT /record.
+
+    Only id, first_cost, discount, and cost are included — the confirmed
+    minimal structure from smoke testing (May 2026).  Extra fields
+    (title, cost_to_pay, manual_cost, cost_per_unit, assistants, amount, …)
+    are stripped to avoid PUT 422 errors on certain Altegio configurations.
+
+    Pass override_* kwargs to change specific price fields from the source
+    service; omitted overrides fall back to the source service values.
+    """
+    return {
+        "id": svc["id"],
+        "first_cost": override_first_cost if override_first_cost is not None else (svc.get("first_cost") or 0),
+        "discount": override_discount if override_discount is not None else (svc.get("discount") or 0),
+        "cost": override_cost if override_cost is not None else (svc.get("cost") or 0),
+    }
+
+
 def _build_put_payload(
     record_data: dict[str, Any],
     *,
@@ -124,7 +166,7 @@ def _build_put_payload(
     return {
         "staff_id": staff_id,
         "services": new_services,
-        "client": record_data.get("client") or {},
+        "client": normalize_record_client_for_put(record_data),
         "save_if_busy": record_data.get("save_if_busy", 1),
         "datetime": record_data.get("datetime", ""),
         "seance_length": record_data.get("seance_length"),

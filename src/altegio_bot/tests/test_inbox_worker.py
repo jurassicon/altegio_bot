@@ -587,22 +587,26 @@ class TestIsPromoOriginComment:
 async def test_record_updated_simple_promo_marker_suppresses_plan_jobs() -> None:
     """
     D. record_updated event whose comment contains [PromoLead:<id>] (simple marker)
-    must NOT call plan_jobs_for_record_event — this is our own promo PUT.
+    must NOT call plan_jobs_for_record_event when suppress helper returns True.
+    The suppress helper itself is tested separately (TestShouldSuppressPromoOrigin*).
     """
     event = _make_update_event(comment="Note\n[PromoLead:42]")
     session = AsyncMock()
     mock_record = _make_mock_record(comment="Note\n[PromoLead:42]")
     mock_plan = AsyncMock()
+    suppress_mock = AsyncMock(return_value=True)
 
     with (
         patch("altegio_bot.workers.inbox_worker.upsert_client", new=AsyncMock(return_value=100)),
         patch("altegio_bot.workers.inbox_worker.upsert_record", new=AsyncMock(return_value=99)),
         patch("altegio_bot.workers.inbox_worker.replace_record_services", new=AsyncMock()),
         patch("altegio_bot.workers.inbox_worker.plan_jobs_for_record_event", mock_plan),
+        patch("altegio_bot.workers.inbox_worker.should_suppress_promo_origin_record_update", suppress_mock),
     ):
         session.get = AsyncMock(return_value=mock_record)
         await handle_event(session, event)
 
+    suppress_mock.assert_awaited_once()
     mock_plan.assert_not_called()
 
 
@@ -610,23 +614,26 @@ async def test_record_updated_simple_promo_marker_suppresses_plan_jobs() -> None
 async def test_record_updated_manual_promo_marker_suppresses_plan_jobs() -> None:
     """
     E. record_updated event whose comment contains [PromoLead:<id>:manual] (manual marker)
-    must NOT call plan_jobs_for_record_event — this is our own promo complex-case PUT.
+    must NOT call plan_jobs_for_record_event when suppress helper returns True.
     """
     comment = "Promo welcome_discount: Neukundenrabatt reserviert.\n[PromoLead:55:manual]"
     event = _make_update_event(comment=comment)
     session = AsyncMock()
     mock_record = _make_mock_record(comment=comment)
     mock_plan = AsyncMock()
+    suppress_mock = AsyncMock(return_value=True)
 
     with (
         patch("altegio_bot.workers.inbox_worker.upsert_client", new=AsyncMock(return_value=100)),
         patch("altegio_bot.workers.inbox_worker.upsert_record", new=AsyncMock(return_value=99)),
         patch("altegio_bot.workers.inbox_worker.replace_record_services", new=AsyncMock()),
         patch("altegio_bot.workers.inbox_worker.plan_jobs_for_record_event", mock_plan),
+        patch("altegio_bot.workers.inbox_worker.should_suppress_promo_origin_record_update", suppress_mock),
     ):
         session.get = AsyncMock(return_value=mock_record)
         await handle_event(session, event)
 
+    suppress_mock.assert_awaited_once()
     mock_plan.assert_not_called()
 
 
@@ -634,13 +641,14 @@ async def test_record_updated_manual_promo_marker_suppresses_plan_jobs() -> None
 async def test_record_updated_no_promo_marker_calls_plan_jobs() -> None:
     """
     F. record_updated event with a normal comment (no promo marker) must call
-    plan_jobs_for_record_event normally — no suppression applied.
+    plan_jobs_for_record_event normally when suppress helper returns False.
     """
     comment = "Normale Buchungsnotiz"
     event = _make_update_event(comment=comment)
     session = AsyncMock()
     mock_record = _make_mock_record(comment=comment)
     mock_plan = AsyncMock()
+    suppress_mock = AsyncMock(return_value=False)
 
     with (
         patch("altegio_bot.workers.inbox_worker.upsert_client", new=AsyncMock(return_value=100)),
@@ -651,8 +659,10 @@ async def test_record_updated_no_promo_marker_calls_plan_jobs() -> None:
             new=AsyncMock(return_value=True),
         ),
         patch("altegio_bot.workers.inbox_worker.plan_jobs_for_record_event", mock_plan),
+        patch("altegio_bot.workers.inbox_worker.should_suppress_promo_origin_record_update", suppress_mock),
     ):
         session.get = AsyncMock(return_value=mock_record)
         await handle_event(session, event)
 
+    suppress_mock.assert_awaited_once()
     mock_plan.assert_awaited_once()

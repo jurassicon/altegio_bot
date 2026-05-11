@@ -27,21 +27,22 @@ import logging
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import httpx
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError as SAIntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.altegio_record_update import (
     AltegioRecordUpdateError,
+    build_minimal_service_for_put,
     fetch_altegio_record_for_update,
     update_altegio_record_price_and_comment,
 )
 from altegio_bot.models.models import Client, MessageJob, PromoLead, Record, RecordService
-from altegio_bot.settings import settings
+from altegio_bot.settings import Settings, settings
 
 _LOCAL_TZ = ZoneInfo("Europe/Belgrade")
 
@@ -49,6 +50,10 @@ _LOCAL_TZ = ZoneInfo("Europe/Belgrade")
 #   [PromoLead:<id>]         — simple automatic price override
 #   [PromoLead:<id>:manual]  — complex manual-review annotation
 _PROMO_MARKER_RE = re.compile(r"\[PromoLead:\d+(?::\w+)?\]")
+
+# record_updated webhooks triggered by our own promo PUT are suppressed for this
+# many seconds after the PUT timestamp stored in PromoLead.meta.
+_SUPPRESS_WINDOW_SEC = 300  # 5 minutes
 
 logger = logging.getLogger(__name__)
 
@@ -170,6 +175,153 @@ def is_promo_origin_comment(comment: str | None) -> bool:
     return bool(_PROMO_MARKER_RE.search(comment))
 
 
+async def should_suppress_promo_origin_record_update(
+    session: AsyncSession,
+    record: Record,
+    event: object,
+) -> bool:
+    """Return True if this record_updated webhook should be suppressed as a promo-PUT echo.
+
+    Called from inbox_worker on every record ``update`` webhook.  Returns True only
+    when a PromoLead that triggered a price-override PUT for this record is found and
+    the webhook arrived within the 5-minute suppression window.
+
+    Two look-up paths:
+
+    Fast path (comment has marker):
+      Parse the lead_id from the ``[PromoLead:<id>]`` or ``[PromoLead:<id>:manual]``
+      marker in ``record.comment``, load the matching PromoLead, verify it owns
+      this altegio_record_id, then check the PUT timestamp in meta.
+
+    Slow path (no comment marker):
+      Scan PromoLeads by altegio_record_id for any that have a
+      ``promo_record_put_at`` within the suppression window.  Covers the edge
+      case where Altegio's record_updated webhook is delivered before our own
+      DB write of the comment is visible to the record sync.
+
+    Never suppresses updates that arrive AFTER the 5-minute window, so future
+    legitimate edits to a promo-annotated record are not silenced.
+    """
+    if not record.altegio_record_id:
+        return False
+
+    event_received_at = getattr(event, "received_at", None)
+    if not isinstance(event_received_at, datetime):
+        return False
+
+    # Normalise to UTC for consistent arithmetic
+    if event_received_at.tzinfo is None:
+        event_received_at = event_received_at.replace(tzinfo=timezone.utc)
+    else:
+        event_received_at = event_received_at.astimezone(timezone.utc)
+
+    # ── Fast path: extract lead_id from promo marker in comment ──────────────
+    comment = record.comment
+    if comment:
+        m = _PROMO_MARKER_RE.search(comment)
+        if m:
+            # "[PromoLead:42]" → inner="42"   "[PromoLead:42:manual]" → inner="42:manual"
+            marker = m.group()
+            inner = marker[len("[PromoLead:"):-1]
+            lead_id_str = inner.split(":")[0]
+            try:
+                lead_id = int(lead_id_str)
+                fast_lead = await session.get(PromoLead, lead_id)
+                if fast_lead is not None and fast_lead.altegio_record_id == record.altegio_record_id:
+                    put_at_str = (fast_lead.meta or {}).get("promo_record_put_at")
+                    if put_at_str:
+                        try:
+                            promo_put_at = datetime.fromisoformat(put_at_str)
+                            if promo_put_at.tzinfo is None:
+                                promo_put_at = promo_put_at.replace(tzinfo=timezone.utc)
+                            delta = (event_received_at - promo_put_at).total_seconds()
+                            if 0 <= delta <= _SUPPRESS_WINDOW_SEC:
+                                logger.info(
+                                    "promo_discount: suppress record_updated (marker path) "
+                                    "record_id=%s lead_id=%s delta=%.0fs",
+                                    record.id,
+                                    fast_lead.id,
+                                    delta,
+                                )
+                                return True
+                        except (ValueError, TypeError):
+                            pass
+                # Lead found via marker but outside window (or wrong record) → do NOT suppress
+                return False
+            except (ValueError, TypeError):
+                pass
+
+    # ── Slow path: scan leads by altegio_record_id ───────────────────────────
+    stmt = (
+        select(PromoLead)
+        .where(PromoLead.altegio_record_id == record.altegio_record_id)
+        .where(PromoLead.meta["promo_record_put_at"].astext.is_not(None))
+        .limit(5)
+    )
+    result = await session.execute(stmt)
+    candidates = result.scalars().all()
+
+    window_start = event_received_at - timedelta(seconds=_SUPPRESS_WINDOW_SEC)
+    for candidate in candidates:
+        put_at_str = (candidate.meta or {}).get("promo_record_put_at")
+        if not put_at_str:
+            continue
+        try:
+            promo_put_at = datetime.fromisoformat(put_at_str)
+            if promo_put_at.tzinfo is None:
+                promo_put_at = promo_put_at.replace(tzinfo=timezone.utc)
+            if window_start <= promo_put_at <= event_received_at:
+                logger.info(
+                    "promo_discount: suppress record_updated (scan path) "
+                    "record_id=%s lead_id=%s",
+                    record.id,
+                    candidate.id,
+                )
+                return True
+        except (ValueError, TypeError):
+            continue
+
+    return False
+
+
+def get_service_cost_for_discount(service: dict) -> float:
+    """Return the effective service cost for discount calculation.
+
+    Priority: ``cost`` field first (if not None), then ``manual_cost``, else 0.0.
+    A cost of 0 is a valid price (free service) — it is NOT treated as 'unknown'.
+    This prevents the ``or``-chaining bug where a zero cost silently falls through
+    to ``manual_cost`` and produces a misleading original price.
+    """
+    cost = service.get("cost")
+    if cost is not None:
+        try:
+            return float(cost)
+        except (TypeError, ValueError):
+            pass
+    manual_cost = service.get("manual_cost")
+    if manual_cost is not None:
+        try:
+            return float(manual_cost)
+        except (TypeError, ValueError):
+            pass
+    return 0.0
+
+
+def parse_service_id(value: object) -> int | None:
+    """Coerce a service ``id`` value (int or str) to int; return None on failure.
+
+    Altegio sometimes returns service ids as strings in GET responses even when
+    the allowlist is configured with integers.  This coercion ensures a string
+    ``"12345"`` matches the integer ``12345`` from ``promo_allowed_service_ids``.
+    """
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 async def _count_same_day_records_for_client(
     session: AsyncSession,
     *,
@@ -188,25 +340,25 @@ async def _count_same_day_records_for_client(
     if client_id is None or reference_starts_at is None:
         return 2  # unknown → force complex/manual case (fail-closed)
 
-    reference_date = reference_starts_at.astimezone(_LOCAL_TZ).date()
+    # Compute day boundaries in local time, then convert to UTC for SQL comparison.
+    reference_local = reference_starts_at.astimezone(_LOCAL_TZ)
+    local_date = reference_local.date()
+    day_start_local = datetime(local_date.year, local_date.month, local_date.day, tzinfo=_LOCAL_TZ)
+    day_end_local = day_start_local + timedelta(days=1)
+    day_start_utc = day_start_local.astimezone(timezone.utc)
+    day_end_utc = day_end_local.astimezone(timezone.utc)
 
     stmt = (
-        select(Record.id, Record.starts_at)
+        select(func.count())
+        .select_from(Record)
         .where(Record.client_id == client_id)
         .where(Record.company_id == company_id)
         .where(Record.is_deleted.is_(False))
+        .where(Record.starts_at >= day_start_utc)
+        .where(Record.starts_at < day_end_utc)
     )
     result = await session.execute(stmt)
-    rows = result.all()
-
-    count = 0
-    for _, starts_at in rows:
-        if starts_at is None:
-            continue
-        if starts_at.astimezone(_LOCAL_TZ).date() == reference_date:
-            count += 1
-
-    return count
+    return int(result.scalar_one())
 
 
 def _build_simple_apply_comment(
@@ -256,7 +408,7 @@ async def _apply_via_record_price_override(
     client: Client,
     phone_e164: str,
     now: datetime,
-    cfg: object,
+    cfg: Settings,
 ) -> None:
     """Apply promo discount by modifying the service price on the Altegio record.
 
@@ -350,7 +502,7 @@ async def _apply_via_record_price_override(
 
         target_svc: dict | None = None
         for svc in altegio_services:
-            if isinstance(svc, dict) and svc.get("id") == service_id:
+            if isinstance(svc, dict) and parse_service_id(svc.get("id")) == service_id:
                 target_svc = svc
                 break
 
@@ -361,23 +513,25 @@ async def _apply_via_record_price_override(
             logger.warning("promo_discount: service missing in Altegio record lead_id=%s", lead.id)
             return
 
-        try:
-            original_cost = float(target_svc.get("cost") or target_svc.get("manual_cost") or 0)
-        except (TypeError, ValueError):
-            original_cost = 0.0
-
-        discount_amount = float(cfg.promo_discount_amount)  # type: ignore[union-attr]
+        original_cost = get_service_cost_for_discount(target_svc)
+        discount_amount = float(cfg.promo_discount_amount)
         new_cost = max(0.0, original_cost - discount_amount)
 
         new_services: list[dict] = []
         for svc in altegio_services:
-            if isinstance(svc, dict) and svc.get("id") == service_id:
-                modified = dict(svc)
-                modified["first_cost"] = original_cost
-                modified["cost"] = new_cost
-                new_services.append(modified)
+            if not isinstance(svc, dict):
+                continue
+            if parse_service_id(svc.get("id")) == service_id:
+                new_services.append(
+                    build_minimal_service_for_put(
+                        svc,
+                        override_cost=new_cost,
+                        override_first_cost=original_cost,
+                        override_discount=discount_amount,
+                    )
+                )
             else:
-                new_services.append(svc)
+                new_services.append(build_minimal_service_for_put(svc))
 
         append_note = _build_simple_apply_comment(
             lead, original_cost=original_cost, new_cost=new_cost, discount_amount=discount_amount
@@ -424,6 +578,13 @@ async def _apply_via_record_price_override(
             "discount_amount": discount_amount,
             "altegio_record_update_status": "success",
             "discount_apply_attempted_at": now.isoformat(),
+            # Suppression window metadata: used by inbox_worker to decide whether
+            # to suppress the record_updated echo webhook from this PUT.
+            "promo_record_put_at": now.isoformat(),
+            "promo_record_put_marker": f"[PromoLead:{lead.id}]",
+            "promo_record_put_record_id": record.id,
+            "promo_record_put_altegio_record_id": altegio_record_id,
+            "promo_record_put_kind": "simple",
             **({"altegio_returned_discount": returned_discount} if returned_discount is not None else {}),
         }
 
@@ -443,12 +604,15 @@ async def _apply_via_record_price_override(
         append_note = _build_manual_review_comment(lead)
         new_comment = (existing_comment + "\n" + append_note).strip() if existing_comment else append_note
 
+        complex_services = [
+            build_minimal_service_for_put(svc) for svc in altegio_services if isinstance(svc, dict)
+        ]
         try:
             await update_altegio_record_price_and_comment(
                 location_id=location_id,
                 record_id=altegio_record_id,
                 record_data=altegio_data,
-                new_services=list(altegio_services),
+                new_services=complex_services,
                 new_comment=new_comment,
             )
         except AltegioRecordUpdateError as exc:
@@ -466,6 +630,13 @@ async def _apply_via_record_price_override(
             "manual_review_required": True,
             "discount_apply_skip_reason": skip_reason,
             "discount_apply_attempted_at": now.isoformat(),
+            # Suppression window metadata: used by inbox_worker to decide whether
+            # to suppress the record_updated echo webhook from this PUT.
+            "promo_record_put_at": now.isoformat(),
+            "promo_record_put_marker": f"[PromoLead:{lead.id}:manual]",
+            "promo_record_put_record_id": record.id,
+            "promo_record_put_altegio_record_id": altegio_record_id,
+            "promo_record_put_kind": "manual",
         }
         logger.info(
             "promo_discount: complex case, manual review required lead_id=%s skip_reason=%s",
