@@ -49,6 +49,7 @@ from altegio_bot.models.models import (
 )
 from altegio_bot.providers.base import WhatsAppProvider
 from altegio_bot.settings import settings
+from altegio_bot.workers import outbox_worker as ow
 from altegio_bot.workers.promo_lead_handler import compute_expires_at
 from altegio_bot.workers.whatsapp_inbox_worker import handle_event
 
@@ -63,6 +64,7 @@ def _enable_promo_funnel():
     with (
         patch.object(settings, "promo_lead_funnel_enabled", True),
         patch.object(settings, "promo_check_new_client_in_altegio", False),
+        patch.object(settings, "promo_async_eligibility_check_enabled", False),
     ):
         yield
 
@@ -636,6 +638,7 @@ async def test_chatwoot_origin_promo_no_lead_no_reply(session_maker) -> None:
 def test_promo_lead_statuses_complete() -> None:
     required = {
         "issued",
+        "pending_check",
         "booked",
         "applied",
         "used",
@@ -1950,3 +1953,406 @@ async def test_existing_active_card_lead_with_external_flag_does_not_recheck_or_
     assert lead is not None
     assert lead.status == "issued"
     assert lead.loyalty_card_id == "card-1"
+
+
+# ---------------------------------------------------------------------------
+# 34. Async eligibility check flow
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_async_flag_false_keeps_sync_issued_flow_without_eligibility_job(session_maker) -> None:
+    provider, evt = await _fire_promo(session_maker, "aktion")
+
+    assert provider.sent
+    assert "verknüpft" in provider.sent[0][2]
+    assert "prüfen kurz" not in provider.sent[0][2]
+    assert evt.error is None
+
+    async with session_maker() as s:
+        lead = (await s.execute(select(PromoLead).where(PromoLead.phone_e164 == PHONE_E164))).scalar_one_or_none()
+        jobs = (
+            (await s.execute(select(MessageJob).where(MessageJob.job_type == "promo_eligibility_check")))
+            .scalars()
+            .all()
+        )
+
+    assert lead is not None
+    assert lead.status == "issued"
+    assert jobs == []
+
+
+@pytest.mark.asyncio
+async def test_async_flag_true_new_keyword_creates_pending_and_job_without_card(session_maker) -> None:
+    card_attempt_mock = AsyncMock(return_value=True)
+
+    with (
+        patch.object(settings, "promo_async_eligibility_check_enabled", True),
+        patch.object(settings, "promo_issue_loyalty_card_enabled", True),
+        patch(
+            "altegio_bot.workers.promo_lead_handler._attempt_loyalty_card_issue",
+            card_attempt_mock,
+        ),
+    ):
+        provider, evt = await _fire_promo(session_maker, "aktion")
+
+    card_attempt_mock.assert_not_called()
+    assert provider.sent
+    sent_text = provider.sent[0][2]
+    assert "Wir prüfen kurz" in sent_text
+    assert "Rabatt gilt nur für Neukunden" in sent_text
+    assert "verknüpft" not in sent_text
+    assert evt.error is None
+
+    async with session_maker() as s:
+        lead = (await s.execute(select(PromoLead).where(PromoLead.phone_e164 == PHONE_E164))).scalar_one_or_none()
+        jobs = (
+            (await s.execute(select(MessageJob).where(MessageJob.job_type == "promo_eligibility_check")))
+            .scalars()
+            .all()
+        )
+
+    assert lead is not None
+    assert lead.status == "pending_check"
+    assert lead.loyalty_card_id is None
+    assert (lead.meta or {}).get("promo_check") == "pending"
+    assert len(jobs) == 1
+    job = jobs[0]
+    assert job.dedupe_key == f"promo_eligibility_check:{lead.id}"
+    assert job.payload["promo_lead_id"] == lead.id
+    assert job.payload["phone_e164"] == PHONE_E164
+    assert job.payload["company_id"] == 1
+    assert job.payload["campaign_name"] == CAMPAIGN
+    assert job.payload["secret_code"] == "aktion"
+
+
+@pytest.mark.asyncio
+async def test_async_repeat_keyword_while_pending_does_not_duplicate_job(session_maker) -> None:
+    provider = _CaptureProvider()
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _setup_sender(session, sender_id=340)
+
+            evt1 = WhatsAppEvent(
+                dedupe_key="wa:promo-async-pending-1",
+                status="received",
+                error=None,
+                query={},
+                headers={},
+                payload=_inbound_payload(PHONE_NUMBER_ID, FROM_PHONE, "aktion"),
+            )
+            session.add(evt1)
+            await session.flush()
+
+            with (
+                patch.object(settings, "promo_async_eligibility_check_enabled", True),
+                patch(
+                    "altegio_bot.workers.whatsapp_inbox_worker.ChatwootClient",
+                    return_value=_FakeCW(),
+                ),
+            ):
+                await handle_event(session, evt1, provider)
+
+            evt2 = WhatsAppEvent(
+                dedupe_key="wa:promo-async-pending-2",
+                status="received",
+                error=None,
+                query={},
+                headers={},
+                payload=_inbound_payload(PHONE_NUMBER_ID, FROM_PHONE, "aktion"),
+            )
+            session.add(evt2)
+            await session.flush()
+
+            with (
+                patch.object(settings, "promo_async_eligibility_check_enabled", True),
+                patch(
+                    "altegio_bot.workers.whatsapp_inbox_worker.ChatwootClient",
+                    return_value=_FakeCW(),
+                ),
+            ):
+                await handle_event(session, evt2, provider)
+
+    assert len(provider.sent) == 2
+    assert "Wir prüfen kurz" in provider.sent[0][2]
+    assert "prüfen den Neukundenrabatt" in provider.sent[1][2]
+
+    async with session_maker() as s:
+        leads = (await s.execute(select(PromoLead).where(PromoLead.phone_e164 == PHONE_E164))).scalars().all()
+        jobs = (
+            (await s.execute(select(MessageJob).where(MessageJob.job_type == "promo_eligibility_check")))
+            .scalars()
+            .all()
+        )
+
+    assert len(leads) == 1
+    assert leads[0].status == "pending_check"
+    assert len(jobs) == 1
+    assert jobs[0].dedupe_key == f"promo_eligibility_check:{leads[0].id}"
+
+
+async def _create_async_pending_from_keyword(session_maker) -> tuple[_CaptureProvider, PromoLead, MessageJob]:
+    with patch.object(settings, "promo_async_eligibility_check_enabled", True):
+        provider, _evt = await _fire_promo(session_maker, "aktion")
+
+    async with session_maker() as s:
+        lead = (await s.execute(select(PromoLead).where(PromoLead.phone_e164 == PHONE_E164))).scalar_one()
+        job = (await s.execute(select(MessageJob).where(MessageJob.job_type == "promo_eligibility_check"))).scalar_one()
+
+    return provider, lead, job
+
+
+@pytest.mark.asyncio
+async def test_async_worker_local_eligible_issues_and_sends_final_reply(session_maker) -> None:
+    provider, lead, job = await _create_async_pending_from_keyword(session_maker)
+
+    async with session_maker() as session:
+        async with session.begin():
+            await ow.process_job_in_session(session, job.id, provider)
+
+    assert len(provider.sent) == 2
+    assert "Super" in provider.sent[1][2]
+    assert "verknüpft" in provider.sent[1][2]
+
+    async with session_maker() as s:
+        refreshed_lead = await s.get(PromoLead, lead.id)
+        refreshed_job = await s.get(MessageJob, job.id)
+        outbox = (await s.execute(select(OutboxMessage).where(OutboxMessage.job_id == job.id))).scalar_one_or_none()
+
+    assert refreshed_lead is not None
+    assert refreshed_lead.status == "issued"
+    assert (refreshed_lead.meta or {}).get("promo_check") == "done"
+    assert refreshed_job is not None
+    assert refreshed_job.status == "done"
+    assert outbox is not None
+    assert outbox.template_code == "wa_promo_lead_issued"
+
+
+@pytest.mark.asyncio
+async def test_async_worker_local_old_client_rejects_not_new(session_maker) -> None:
+    with patch.object(settings, "promo_async_eligibility_check_enabled", True):
+        provider, _evt, prior_visit_e164 = await _fire_prior_visit_promo(
+            session_maker,
+            "aktion",
+            sender_id=341,
+            dedupe_key="wa:promo-async-old-local",
+            altegio_record_id=9941,
+        )
+
+    async with session_maker() as s:
+        lead = (await s.execute(select(PromoLead).where(PromoLead.phone_e164 == prior_visit_e164))).scalar_one()
+        job = (await s.execute(select(MessageJob).where(MessageJob.job_type == "promo_eligibility_check"))).scalar_one()
+
+    async with session_maker() as session:
+        async with session.begin():
+            await ow.process_job_in_session(session, job.id, provider)
+
+    assert len(provider.sent) == 2
+    assert "Diese Aktion gilt nur für Neukunden" in provider.sent[1][2]
+    assert "https://wa.me/?text=" in provider.sent[1][2]
+
+    async with session_maker() as s:
+        refreshed_lead = await s.get(PromoLead, lead.id)
+        refreshed_job = await s.get(MessageJob, job.id)
+
+    assert refreshed_lead is not None
+    assert refreshed_lead.status == "rejected_not_new"
+    assert refreshed_lead.reject_reason == "has_prior_visits"
+    assert refreshed_lead.loyalty_card_id is None
+    assert refreshed_job is not None
+    assert refreshed_job.status == "done"
+
+
+@pytest.mark.asyncio
+async def test_async_worker_external_records_found_rejects_without_card(session_maker) -> None:
+    provider, lead, job = await _create_async_pending_from_keyword(session_maker)
+    check_mock = AsyncMock(return_value=True)
+    card_attempt_mock = AsyncMock(return_value=True)
+
+    async with session_maker() as session:
+        async with session.begin():
+            with (
+                patch.object(settings, "promo_check_new_client_in_altegio", True),
+                patch.object(settings, "promo_location_id_by_company", PROMO_LOCATION_MAP),
+                patch.object(settings, "promo_issue_loyalty_card_enabled", True),
+                patch(
+                    "altegio_bot.workers.promo_lead_handler.check_client_has_any_altegio_record",
+                    check_mock,
+                ),
+                patch(
+                    "altegio_bot.workers.promo_lead_handler._attempt_loyalty_card_issue",
+                    card_attempt_mock,
+                ),
+            ):
+                await ow.process_job_in_session(session, job.id, provider)
+
+    check_mock.assert_awaited_once_with(phone_e164=PHONE_E164, location_id=9001)
+    card_attempt_mock.assert_not_called()
+    assert "Diese Aktion gilt nur für Neukunden" in provider.sent[1][2]
+
+    async with session_maker() as s:
+        refreshed_lead = await s.get(PromoLead, lead.id)
+        refreshed_job = await s.get(MessageJob, job.id)
+
+    assert refreshed_lead is not None
+    assert refreshed_lead.status == "rejected_not_new"
+    assert refreshed_lead.reject_reason == "has_altegio_records"
+    assert refreshed_lead.loyalty_card_id is None
+    assert (refreshed_lead.meta or {}).get("altegio_new_client_check") == "records_found"
+    assert refreshed_job is not None
+    assert refreshed_job.status == "done"
+
+
+@pytest.mark.asyncio
+async def test_async_worker_external_error_fails_closed_manual_check(session_maker) -> None:
+    provider, lead, job = await _create_async_pending_from_keyword(session_maker)
+    check_mock = AsyncMock(side_effect=AltegioNewClientCheckError("promo new-client check HTTP 403: location_id=9001"))
+    card_attempt_mock = AsyncMock(return_value=True)
+
+    async with session_maker() as session:
+        async with session.begin():
+            with (
+                patch.object(settings, "promo_check_new_client_in_altegio", True),
+                patch.object(settings, "promo_location_id_by_company", PROMO_LOCATION_MAP),
+                patch.object(settings, "promo_issue_loyalty_card_enabled", True),
+                patch(
+                    "altegio_bot.workers.promo_lead_handler.check_client_has_any_altegio_record",
+                    check_mock,
+                ),
+                patch(
+                    "altegio_bot.workers.promo_lead_handler._attempt_loyalty_card_issue",
+                    card_attempt_mock,
+                ),
+            ):
+                await ow.process_job_in_session(session, job.id, provider)
+
+    check_mock.assert_awaited_once_with(phone_e164=PHONE_E164, location_id=9001)
+    card_attempt_mock.assert_not_called()
+    assert "Unser Team meldet sich" in provider.sent[1][2]
+    assert "verknüpft" not in provider.sent[1][2]
+
+    async with session_maker() as s:
+        refreshed_lead = await s.get(PromoLead, lead.id)
+        refreshed_job = await s.get(MessageJob, job.id)
+
+    assert refreshed_lead is not None
+    assert refreshed_lead.status == "cancelled"
+    assert refreshed_lead.reject_reason == "altegio_new_client_check_failed"
+    assert refreshed_lead.loyalty_card_id is None
+    assert (refreshed_lead.meta or {}).get("promo_check") == "failed"
+    assert "HTTP 403" in (refreshed_lead.meta or {}).get("promo_check_error", "")
+    assert refreshed_job is not None
+    assert refreshed_job.status == "done"
+
+
+@pytest.mark.asyncio
+async def test_existing_issued_lead_with_async_flag_does_not_create_pending_or_job(session_maker) -> None:
+    provider = _CaptureProvider()
+    now = _utcnow()
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _setup_sender(session, sender_id=342)
+            session.add(
+                PromoLead(
+                    company_id=1,
+                    phone_e164=PHONE_E164,
+                    campaign_name=CAMPAIGN,
+                    secret_code="aktion",
+                    discount_amount=Decimal("15"),
+                    discount_type="fixed",
+                    status="issued",
+                    issued_at=now,
+                    expires_at=now + timedelta(days=30),
+                )
+            )
+            evt = WhatsAppEvent(
+                dedupe_key="wa:promo-async-existing-issued",
+                status="received",
+                error=None,
+                query={},
+                headers={},
+                payload=_inbound_payload(PHONE_NUMBER_ID, FROM_PHONE, "aktion"),
+            )
+            session.add(evt)
+            await session.flush()
+            with (
+                patch.object(settings, "promo_async_eligibility_check_enabled", True),
+                patch(
+                    "altegio_bot.workers.whatsapp_inbox_worker.ChatwootClient",
+                    return_value=_FakeCW(),
+                ),
+            ):
+                await handle_event(session, evt, provider)
+
+    assert provider.sent
+    assert "bereits aktiv" in provider.sent[0][2]
+
+    async with session_maker() as s:
+        jobs = (
+            (await s.execute(select(MessageJob).where(MessageJob.job_type == "promo_eligibility_check")))
+            .scalars()
+            .all()
+        )
+        lead = (await s.execute(select(PromoLead).where(PromoLead.phone_e164 == PHONE_E164))).scalar_one()
+
+    assert lead.status == "issued"
+    assert jobs == []
+
+
+@pytest.mark.asyncio
+async def test_existing_rejected_lead_with_async_flag_does_not_create_pending_or_job(session_maker) -> None:
+    provider = _CaptureProvider()
+    now = _utcnow()
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _setup_sender(session, sender_id=343)
+            session.add(
+                PromoLead(
+                    company_id=1,
+                    phone_e164=PHONE_E164,
+                    campaign_name=CAMPAIGN,
+                    secret_code="aktion",
+                    discount_amount=Decimal("15"),
+                    discount_type="fixed",
+                    status="rejected_not_new",
+                    reject_reason="has_prior_visits",
+                    issued_at=now,
+                    expires_at=now,
+                )
+            )
+            evt = WhatsAppEvent(
+                dedupe_key="wa:promo-async-existing-rejected",
+                status="received",
+                error=None,
+                query={},
+                headers={},
+                payload=_inbound_payload(PHONE_NUMBER_ID, FROM_PHONE, "aktion"),
+            )
+            session.add(evt)
+            await session.flush()
+            with (
+                patch.object(settings, "promo_async_eligibility_check_enabled", True),
+                patch(
+                    "altegio_bot.workers.whatsapp_inbox_worker.ChatwootClient",
+                    return_value=_FakeCW(),
+                ),
+            ):
+                await handle_event(session, evt, provider)
+
+    assert provider.sent
+    assert "Diese Aktion gilt nur für Neukunden" in provider.sent[0][2]
+    assert "https://wa.me/?text=" in provider.sent[0][2]
+
+    async with session_maker() as s:
+        jobs = (
+            (await s.execute(select(MessageJob).where(MessageJob.job_type == "promo_eligibility_check")))
+            .scalars()
+            .all()
+        )
+        lead = (await s.execute(select(PromoLead).where(PromoLead.phone_e164 == PHONE_E164))).scalar_one()
+
+    assert lead.status == "rejected_not_new"
+    assert jobs == []
