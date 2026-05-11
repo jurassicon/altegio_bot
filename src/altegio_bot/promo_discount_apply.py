@@ -250,6 +250,7 @@ async def find_applicable_promo_lead_for_record(
     phone_e164: str,
     now: datetime,
     record: Record,
+    for_update: bool = False,
 ) -> PromoLead | None:
     """Return the most recent active PromoLead eligible for discount application.
 
@@ -270,6 +271,8 @@ async def find_applicable_promo_lead_for_record(
       booking (lead.record_id == record.id OR lead.altegio_record_id == record.altegio_record_id).
     - A booked lead bound to a different record is silently skipped to prevent
       re-attributing the promo to a different booking.
+
+    for_update=True locks and refreshes the row for post-I/O revalidation.
     """
     if not phone_e164:
         return None
@@ -290,6 +293,10 @@ async def find_applicable_promo_lead_for_record(
         .order_by(PromoLead.created_at.desc())
         .limit(1)
     )
+
+    if for_update:
+        stmt = stmt.with_for_update().execution_options(populate_existing=True)
+
     result = await session.execute(stmt)
     lead = result.scalar_one_or_none()
 
@@ -376,7 +383,7 @@ async def try_apply_promo_discount(
     3. Find matching PromoLead (filtered by company_id + phone).
     4. Service allowlist check (promo_allowed_service_ids).
     5. New-client guard (no prior attended visits, local DB only).
-    6. Resolve booking_created_at lazily and guard that it postdates promo issuance.
+    6. Resolve booking_created_at lazily, revalidate/lock PromoLead, then guard timestamp.
     7. Transition issued → booked (booking confirmed).
     8. API gate check (promo_apply_discount_api_verified).
     9. Call Altegio apply_discount_program API.
@@ -441,6 +448,22 @@ async def try_apply_promo_discount(
     # means the booking may predate this promo campaign, so apply stays blocked.
     if booking_created_at is None and booking_created_at_resolver is not None:
         booking_created_at = await booking_created_at_resolver()
+        now = _utcnow()
+        lead = await find_applicable_promo_lead_for_record(
+            session,
+            company_id=company_id,
+            phone_e164=phone_e164,
+            now=now,
+            record=record,
+            for_update=True,
+        )
+        if lead is None:
+            logger.info(
+                "promo_discount: lead no longer applicable after booking_created_at lookup record_id=%s",
+                record.id,
+            )
+            return
+        meta = lead.meta or {}
 
     if booking_created_at is None:
         err = "missing booking created timestamp"

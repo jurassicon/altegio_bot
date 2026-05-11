@@ -523,6 +523,13 @@ Altegio record details response. `location_id` is taken from the payload when
 present, otherwise from `PROMO_LOCATION_ID_BY_COMPANY`. If the cheap checks do
 not pass, `GET /record` is not called.
 
+After the resolver returns, `try_apply_promo_discount` re-reads the `PromoLead`
+with `SELECT FOR UPDATE` and refreshes the ORM row before checking the timestamp
+or calling the external apply endpoint. If another worker changed the lead while
+`GET /record` was in flight (for example bound it to another booking, marked it
+`applied`, or deleted the promo card), the revalidation returns no applicable
+lead and the apply attempt stops without a customer notification.
+
 If the timestamp cannot be confirmed, the resolver returns `None` and
 `try_apply_promo_discount` skips the apply with
 `PromoLead.meta.apply_skip_reason = 'missing booking created timestamp'`.
