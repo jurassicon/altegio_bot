@@ -45,13 +45,13 @@ def _visit_search(records: list[dict], *, total_count: object | None = None) -> 
 
 
 # ---------------------------------------------------------------------------
-# fetch_record_details_for_booking_created_at_research — read-only research
+# booking_created_at helpers — read-only record details lookup and parsing
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 @respx.mock
-async def test_fetch_record_details_for_booking_created_at_research_uses_location_id_and_record_id(
+async def test_fetch_record_details_for_booking_created_at_uses_location_id_and_record_id(
     monkeypatch,
 ) -> None:
     _mock_settings(monkeypatch)
@@ -60,7 +60,7 @@ async def test_fetch_record_details_for_booking_created_at_research_uses_locatio
         return_value=httpx.Response(200, json={"success": True, "data": {"id": 123456789}})
     )
 
-    data = await records_mod.fetch_record_details_for_booking_created_at_research(
+    data = await records_mod.fetch_record_details_for_booking_created_at(
         location_id=9001,
         record_id=123456789,
     )
@@ -74,7 +74,7 @@ async def test_fetch_record_details_for_booking_created_at_research_uses_locatio
 
 @pytest.mark.asyncio
 @respx.mock
-async def test_fetch_record_details_for_booking_created_at_research_wraps_http_error_without_token_leak(
+async def test_fetch_record_details_for_booking_created_at_wraps_http_error_without_token_leak(
     monkeypatch,
 ) -> None:
     _mock_settings(monkeypatch)
@@ -82,7 +82,7 @@ async def test_fetch_record_details_for_booking_created_at_research_wraps_http_e
     respx.get(f"{_BASE}/record/9001/123456789").mock(return_value=httpx.Response(500, json={"error": "boom"}))
 
     with pytest.raises(AltegioRecordResearchError) as exc_info:
-        await records_mod.fetch_record_details_for_booking_created_at_research(
+        await records_mod.fetch_record_details_for_booking_created_at(
             location_id=9001,
             record_id=123456789,
         )
@@ -93,6 +93,32 @@ async def test_fetch_record_details_for_booking_created_at_research_wraps_http_e
     assert "record_id=123456789" in error_text
     assert "partner-token" not in error_text
     assert "user-token" not in error_text
+
+
+def test_extract_booking_created_at_from_record_details_uses_create_date() -> None:
+    dt = records_mod.extract_booking_created_at_from_record_details(
+        {
+            "id": 123456789,
+            "create_date": "2026-05-10 14:22:00",
+            "date": "2026-05-20 12:00:00",
+            "last_change_date": "2026-05-11 09:00:00",
+        }
+    )
+
+    assert dt == datetime(2026, 5, 10, 12, 22, tzinfo=timezone.utc)
+
+
+def test_extract_booking_created_at_from_record_details_ignores_non_creation_fields() -> None:
+    dt = records_mod.extract_booking_created_at_from_record_details(
+        {
+            "id": 123456789,
+            "date": "2026-05-20 12:00:00",
+            "datetime": "2026-05-20T12:00:00+02:00",
+            "last_change_date": "2026-05-11 09:00:00",
+        }
+    )
+
+    assert dt is None
 
 
 # ---------------------------------------------------------------------------

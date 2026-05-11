@@ -507,21 +507,23 @@ discount apply, to avoid accidentally applying a promo to a booking that was mad
 before the promo was issued.
 
 **Booking created timestamp guard:** automatic apply requires a confirmed
-`booking_created_at` — the actual time the booking was created in Altegio, not
-the time the webhook was received by the bot. Altegio record create webhooks
-currently do not include a confirmed booking creation timestamp (no `created_at`,
-`create_date`, or `datetime_created` field has been observed). The
-`extract_booking_created_at` helper therefore returns `None` (fail-closed), and
+`booking_created_at` - the actual time the booking was created in Altegio, not
+the time the webhook was received by the bot. `inbox_worker` resolves it in two
+steps: first from trusted creation fields in the record create webhook payload
+(`create_date`, `created_at`, `datetime_created`), then via read-only
+`GET /record/{location_id}/{record_id}` and the same trusted fields from the
+Altegio record details response. `location_id` is taken from the payload when
+present, otherwise from `PROMO_LOCATION_ID_BY_COMPANY`.
+
+If the timestamp cannot be confirmed, the resolver returns `None` and
 `try_apply_promo_discount` skips the apply with
 `PromoLead.meta.apply_skip_reason = 'missing booking created timestamp'`.
 
 `event.received_at` is an audit timestamp that records when our bot received the
-webhook. It must not be used as the booking creation time: a delayed or
+webhook. It is never used as the booking creation time: a delayed or
 backfilled create webhook for a booking that predates the promo could arrive
 after `PromoLead.issued_at`, making `received_at >= issued_at` true while the
-booking itself predates the promo. When a confirmed `booking_created_at` field
-becomes available in the Altegio API, update `extract_booking_created_at` to
-extract it and this guard will start gating on the actual creation time.
+booking itself predates the promo.
 
 **Booked-lead rebinding guard:** a `PromoLead` with `status='booked'` is only
 eligible for retry against the same stored record (`lead.record_id == record.id`
@@ -679,8 +681,8 @@ PROMO_APPLY_DISCOUNT_API_VERIFIED=true
 Do not enable them immediately for production traffic. The endpoint is still
 marked unconfirmed in code, applying a discount changes Altegio CRM state, a
 successful apply triggers a customer WhatsApp notification, and the automatic
-webhook path currently stays fail-closed until a confirmed booking-created
-timestamp field is available.
+webhook path stays fail-closed whenever a confirmed booking-created timestamp
+cannot be resolved from the webhook payload or read-only `GET /record`.
 
 ### Controlled smoke plan
 
@@ -702,7 +704,9 @@ docker compose exec -T altegio-api python -m altegio_bot.scripts.find_promo_disc
 
 6. Run the printed dry-run command. It must not call Altegio.
 7. Manually verify in Altegio that the booking belongs to the test number, was
-   created after `PromoLead.issued_at`, and uses an allowed service.
+   created after `PromoLead.issued_at`, and uses an allowed service. The
+   production resolver checks `create_date`/`created_at`/`datetime_created` from
+   the webhook payload or read-only `GET /record`.
 8. Run the real single-record smoke only with explicit API verification:
 
 ```bash
@@ -834,10 +838,12 @@ docker compose exec -T altegio-api python -m altegio_bot.scripts.find_promo_disc
   --company-id 1 --phone +49...
 ```
 
-**The `--yes-apply` command is intentionally not printed.** `Record` has no
-`created_at` column, so the helper cannot prove that a booking was created
-*after* the promo lead was issued. A booking that predates the promo would
-receive an unintended discount.
+**The `--yes-apply` command is intentionally not printed.** The local `Record`
+table has no trusted booking-created column, so this helper cannot prove that a
+booking was created *after* the promo lead was issued. Use Altegio UI or the
+read-only `GET /record` research helper to confirm the booking creation time
+before any real smoke apply. A booking that predates the promo would receive an
+unintended discount.
 
 Before constructing a `--yes-apply` command, manually verify in Altegio:
 1. The booking belongs to the promo client.
@@ -888,13 +894,13 @@ The script prints a sanitized timestamp summary:
 - `date` / `datetime` are appointment start fields, not booking creation time.
 - `last_change_date` / `last_change_at` are last-change fields and are not
   reliable as creation time.
-- `created_at`, `create_date`, and `datetime_created` are printed as candidate
-  fields when present, but remain untrusted for automatic apply in this PR.
+- `created_at`, `create_date`, and `datetime_created` are trusted booking
+  creation fields when present and parseable.
 
 `confirmed_booking_created_at=<none>` and `safe_for_auto_apply=false` mean the
-automatic promo apply guard must stay fail-closed. Only a future PR should mark a
-field as trusted after manual verification against real Altegio data and update
-the production `extract_booking_created_at()` logic.
+automatic promo apply guard stays fail-closed for that record. The production
+webhook path applies the same rule: no confirmed creation timestamp means no
+automatic discount apply.
 
 ### Manual smoke test for promo discount application
 

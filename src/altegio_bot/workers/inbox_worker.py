@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 from datetime import datetime, timedelta, timezone
@@ -12,12 +13,18 @@ from sqlalchemy import delete, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from altegio_bot.altegio_records import (
+    AltegioRecordResearchError,
+    extract_booking_created_at_from_record_details,
+    fetch_record_details_for_booking_created_at,
+)
 from altegio_bot.db import SessionLocal
 from altegio_bot.message_planner import plan_jobs_for_record_event
 from altegio_bot.models.models import AltegioEvent, Client, Record, RecordService
 from altegio_bot.perf import perf_log
 from altegio_bot.promo_discount_apply import try_apply_promo_discount
 from altegio_bot.service_filter import record_has_allowed_service
+from altegio_bot.settings import settings
 
 logger = logging.getLogger("inbox_worker")
 TZ = ZoneInfo("Europe/Belgrade")
@@ -140,18 +147,112 @@ def _parse_starts_at(record_data: dict[str, Any]) -> datetime | None:
 def extract_booking_created_at(record_data: dict[str, Any]) -> datetime | None:
     """Return the confirmed booking creation timestamp from an Altegio record payload.
 
-    Altegio record create webhooks do not include a confirmed booking creation
-    timestamp. Fields present in the payload are:
-    - ``date`` / ``datetime``: appointment *start* time, not booking creation time.
-    - ``last_change_date``: last modification time, not creation time.
+    Only dedicated creation timestamp fields are accepted:
+    - ``create_date``
+    - ``created_at``
+    - ``datetime_created``
 
-    No field named ``created_at``, ``create_date``, or ``datetime_created`` has
-    been observed or confirmed in production Altegio record webhooks.
-
-    Returns None (fail-closed) until a confirmed field is documented in the
-    Altegio OpenAPI spec and observed in live payloads.
+    ``date`` / ``datetime`` are appointment start fields, and
+    ``last_change_date`` is a mutation timestamp; they are deliberately ignored.
+    The webhook ``received_at`` audit timestamp is also never used here.
     """
-    return None
+    return extract_booking_created_at_from_record_details(record_data)
+
+
+def _resolve_location_id_for_booking_created_at(
+    *,
+    company_id: int,
+    record_data: dict[str, Any],
+) -> int | None:
+    for field in ("location_id", "salon_id"):
+        value = record_data.get(field)
+        if value is None:
+            continue
+        try:
+            location_id = int(value)
+        except (TypeError, ValueError):
+            logger.warning("booking_created_at: invalid %s=%r in record payload", field, value)
+            return None
+        if location_id > 0:
+            return location_id
+
+    try:
+        location_map = json.loads(settings.promo_location_id_by_company or "{}")
+    except json.JSONDecodeError as exc:
+        logger.warning("booking_created_at: invalid promo_location_id_by_company JSON: %s", exc)
+        return None
+
+    if not isinstance(location_map, dict):
+        logger.warning("booking_created_at: invalid promo_location_id_by_company JSON: expected object")
+        return None
+
+    raw_location_id = location_map.get(str(company_id))
+    if raw_location_id is None:
+        logger.info("booking_created_at: no location_id mapping for company_id=%s", company_id)
+        return None
+
+    try:
+        location_id = int(raw_location_id)
+    except (TypeError, ValueError):
+        logger.warning(
+            "booking_created_at: invalid location_id mapping for company_id=%s: %r",
+            company_id,
+            raw_location_id,
+        )
+        return None
+
+    return location_id if location_id > 0 else None
+
+
+async def resolve_booking_created_at_for_record_create(
+    *,
+    company_id: int,
+    record_data: dict[str, Any],
+    record: Record,
+) -> datetime | None:
+    """Resolve booking creation time for a record-create webhook.
+
+    Source order:
+    1. Dedicated creation field in the webhook payload.
+    2. Read-only Altegio GET /record/{location_id}/{record_id}, parsed from the
+       same trusted creation fields.
+
+    Returns None on any uncertainty so promo apply remains fail-closed. This
+    helper never falls back to webhook received_at.
+    """
+    from_payload = extract_booking_created_at(record_data)
+    if from_payload is not None:
+        return from_payload
+
+    location_id = _resolve_location_id_for_booking_created_at(
+        company_id=company_id,
+        record_data=record_data,
+    )
+    if location_id is None:
+        return None
+
+    raw_record_id = record.altegio_record_id or record_data.get("id")
+    try:
+        altegio_record_id = int(raw_record_id)
+    except (TypeError, ValueError):
+        logger.warning("booking_created_at: invalid altegio_record_id=%r", raw_record_id)
+        return None
+
+    try:
+        details = await fetch_record_details_for_booking_created_at(
+            location_id=location_id,
+            record_id=altegio_record_id,
+        )
+    except AltegioRecordResearchError as exc:
+        logger.warning(
+            "booking_created_at: GET /record failed location_id=%s record_id=%s: %s",
+            location_id,
+            altegio_record_id,
+            exc,
+        )
+        return None
+
+    return extract_booking_created_at(details)
 
 
 def sum_total_cost(services: list[dict[str, Any]]) -> Decimal | None:
@@ -412,11 +513,19 @@ async def handle_event(session: AsyncSession, event: AltegioEvent) -> None:
             # before the promo was issued.
             normalized_status = _normalize_event_status(event_status)
             if normalized_status == "create" and not record_obj.is_deleted:
+                booking_created_at = None
+                if settings.promo_apply_discount_enabled:
+                    booking_created_at = await resolve_booking_created_at_for_record_create(
+                        company_id=int(company_id),
+                        record_data=data,
+                        record=record_obj,
+                    )
+
                 await try_apply_promo_discount(
                     session,
                     record_obj,
                     int(company_id),
-                    booking_created_at=extract_booking_created_at(data),
+                    booking_created_at=booking_created_at,
                 )
 
             allowed = await record_has_allowed_service(

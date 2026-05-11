@@ -622,6 +622,8 @@ async def test_update_webhook_skips_promo_apply() -> None:
     mock_record.company_id = _COMPANY
     mock_record.is_deleted = False
 
+    mock_resolver = AsyncMock(side_effect=RuntimeError("must not be called"))
+
     with (
         patch("altegio_bot.workers.inbox_worker.upsert_client", new=AsyncMock(return_value=100)),
         patch("altegio_bot.workers.inbox_worker.upsert_record", new=AsyncMock(return_value=200)),
@@ -629,11 +631,118 @@ async def test_update_webhook_skips_promo_apply() -> None:
         patch("altegio_bot.workers.inbox_worker.record_has_allowed_service", new=AsyncMock(return_value=True)),
         patch("altegio_bot.workers.inbox_worker.plan_jobs_for_record_event", new=AsyncMock()),
         patch("altegio_bot.workers.inbox_worker.try_apply_promo_discount", mock_try_apply),
+        patch("altegio_bot.workers.inbox_worker.resolve_booking_created_at_for_record_create", mock_resolver),
+        patch.object(settings, "promo_apply_discount_enabled", True),
     ):
         session.get = AsyncMock(return_value=mock_record)
         await handle_event(session, event)
 
     mock_try_apply.assert_not_called()
+    mock_resolver.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# 12b. Record create timestamp lookup failures fail closed
+# ---------------------------------------------------------------------------
+
+
+def _make_record_create_event(*, create_date: str | None = None) -> MagicMock:
+    event = MagicMock()
+    event.id = 1
+    event.company_id = _COMPANY
+    event.resource = "record"
+    event.event_status = "create"
+    event.resource_id = None
+    event.received_at = datetime(2026, 5, 8, 20, 0, 0, tzinfo=_UTC)
+    data = {
+        "id": 424242,
+        "client": {"id": 100, "display_name": "Test", "phone": _PHONE},
+        "services": [{"id": _ALLOWED_SERVICE, "title": "Test", "cost_to_pay": 50}],
+        "date": "2026-05-20 12:00:00",
+        "staff_id": 5,
+    }
+    if create_date is not None:
+        data["create_date"] = create_date
+    event.payload = {"data": data}
+    return event
+
+
+@pytest.mark.asyncio
+async def test_record_create_get_record_http_error_skips_apply_without_notification(session_maker) -> None:
+    from altegio_bot.altegio_records import AltegioRecordResearchError
+    from altegio_bot.workers.inbox_worker import handle_event
+
+    mock_api = AsyncMock(side_effect=RuntimeError("must not be called"))
+    fetch_mock = AsyncMock(side_effect=AltegioRecordResearchError("HTTP 500: location_id=9001 record_id=424242"))
+
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(_make_lead())
+            await session.flush()
+
+            with (
+                patch("altegio_bot.promo_discount_apply.apply_promo_discount_to_visit", mock_api),
+                patch("altegio_bot.workers.inbox_worker.fetch_record_details_for_booking_created_at", fetch_mock),
+                patch("altegio_bot.workers.inbox_worker.record_has_allowed_service", new=AsyncMock(return_value=True)),
+                patch("altegio_bot.workers.inbox_worker.plan_jobs_for_record_event", new=AsyncMock()),
+                patch.object(settings, "promo_location_id_by_company", f'{{"{_COMPANY}": {_LOCATION}}}'),
+                _base_settings_ctx(),
+            ):
+                await handle_event(session, _make_record_create_event())
+
+    fetch_mock.assert_awaited_once_with(location_id=_LOCATION, record_id=424242)
+    mock_api.assert_not_called()
+
+    async with session_maker() as s:
+        lead = (await s.execute(select(PromoLead).where(PromoLead.phone_e164 == _PHONE))).scalar_one()
+        job = (
+            await s.execute(select(MessageJob).where(MessageJob.job_type == "promo_discount_applied"))
+        ).scalar_one_or_none()
+
+    assert lead.status == "issued"
+    assert "missing booking created timestamp" in (lead.meta or {}).get("apply_skip_reason", "")
+    assert job is None
+
+
+@pytest.mark.asyncio
+async def test_record_create_get_record_create_date_after_promo_applies(session_maker) -> None:
+    from altegio_bot.workers.inbox_worker import handle_event
+
+    mock_api = AsyncMock(return_value=PromoDiscountApplyResult(applied=True, raw={"success": True}))
+    fetch_mock = AsyncMock(return_value={"id": 424242, "create_date": "2026-05-08 14:05:00"})
+
+    issued_at = datetime(2026, 5, 8, 12, 0, 0, tzinfo=_UTC)
+
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(_make_lead(status="issued"))
+            await session.flush()
+            lead = (await session.execute(select(PromoLead).where(PromoLead.phone_e164 == _PHONE))).scalar_one()
+            lead.issued_at = issued_at
+
+            with (
+                patch("altegio_bot.promo_discount_apply.apply_promo_discount_to_visit", mock_api),
+                patch("altegio_bot.workers.inbox_worker.fetch_record_details_for_booking_created_at", fetch_mock),
+                patch("altegio_bot.workers.inbox_worker.record_has_allowed_service", new=AsyncMock(return_value=True)),
+                patch("altegio_bot.workers.inbox_worker.plan_jobs_for_record_event", new=AsyncMock()),
+                patch.object(settings, "promo_location_id_by_company", f'{{"{_COMPANY}": {_LOCATION}}}'),
+                _base_settings_ctx(),
+            ):
+                await handle_event(session, _make_record_create_event())
+
+    mock_api.assert_called_once_with(
+        location_id=_LOCATION,
+        card_id=int(_CARD_ID),
+        program_id=_PROGRAM_ID,
+        record_id=424242,
+    )
+
+    async with session_maker() as s:
+        lead = (await s.execute(select(PromoLead).where(PromoLead.phone_e164 == _PHONE))).scalar_one()
+        job = (await s.execute(select(MessageJob).where(MessageJob.job_type == "promo_discount_applied"))).scalar_one()
+
+    assert lead.status == "applied"
+    assert job.payload["phone_e164"] == _PHONE
 
 
 # ---------------------------------------------------------------------------
