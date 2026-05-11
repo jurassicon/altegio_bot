@@ -22,7 +22,7 @@ from altegio_bot.db import SessionLocal
 from altegio_bot.message_planner import plan_jobs_for_record_event
 from altegio_bot.models.models import AltegioEvent, Client, Record, RecordService
 from altegio_bot.perf import perf_log
-from altegio_bot.promo_discount_apply import try_apply_promo_discount
+from altegio_bot.promo_discount_apply import is_promo_origin_comment, try_apply_promo_discount
 from altegio_bot.service_filter import record_has_allowed_service
 from altegio_bot.settings import settings
 
@@ -535,6 +535,19 @@ async def handle_event(session: AsyncSession, event: AltegioEvent) -> None:
                     int(company_id),
                     booking_created_at_resolver=booking_created_at_resolver,
                 )
+
+            # Suppress plan_jobs for record_updated events triggered by our own
+            # promo price-override PUT. These carry a [PromoLead:<id>] or
+            # [PromoLead:<id>:manual] marker written by
+            # _apply_via_record_price_override. Treating this as a normal
+            # update would queue a booking-change notification to the customer
+            # for a bot-triggered write.
+            if normalized_status == "update" and is_promo_origin_comment(record_obj.comment):
+                logger.info(
+                    "promo_discount: suppress plan_jobs for promo-origin record_updated record_id=%s",
+                    record_obj.id,
+                )
+                return
 
             allowed = await record_has_allowed_service(
                 session=session,

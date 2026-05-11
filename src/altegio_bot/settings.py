@@ -183,6 +183,13 @@ class Settings(BaseSettings):
     # If empty: discount is never applied automatically (fail-closed).
     # Example: PROMO_ALLOWED_SERVICE_IDS=12345,67890
     promo_allowed_service_ids: str = ""
+    # Discount-apply implementation mode.
+    # 'record_price_override': PUT /record to change service price directly.
+    #   This is the confirmed-working approach (smoke-tested May 2026).
+    #   The old loyalty discount program endpoint is NOT used for automatic apply.
+    # Any other value falls back to the legacy loyalty-program endpoint path
+    # (kept for backward compatibility with existing tests and manual smoke scripts).
+    promo_apply_mode: str = "record_price_override"
 
     # Publicly accessible image URLs for newsletter template IMAGE HEADER components.
     # Meta Cloud API requires a permanent URL it can fetch and cache at send time.

@@ -484,27 +484,60 @@ scoped by `phone_e164` and `campaign_name`; do not run broad promo cleanup SQL.
    wrong-company leads are ignored.
 7. The booking creation timestamp must be after `PromoLead.issued_at`.
 8. The record must contain at least one service from `PROMO_ALLOWED_SERVICE_IDS`.
-9. If both apply gates are enabled, the discount program is applied via Altegio API.
-10. `PromoLead.status` advances: `issued -> booked -> applied`.
-11. A `MessageJob` is queued; `outbox_worker` sends the client a German WhatsApp confirmation.
+9. The apply mode is selected by `PROMO_APPLY_MODE` (default: `record_price_override`).
+10. `PromoLead.status` advances: `issued -> booked -> applied` (simple) or `issued -> booked` with
+    `manual_review_required=True` (complex).
+11. On a successful simple apply a `MessageJob` is queued; `outbox_worker` sends the client a
+    German WhatsApp confirmation.
 
-The apply HTTP call is:
+**Apply modes**
+
+`record_price_override` *(default, confirmed working — smoke-tested May 2026)*:
+
+1. `GET /record/{location_id}/{record_id}` — fetch the fresh appointment.
+2. Determine *simple* or *complex* case:
+   - **Simple** — exactly 1 record for this client on this local calendar day **and** exactly 1
+     allowed service in the record. Price override applied automatically:
+     `new_cost = max(0, original_cost - PROMO_DISCOUNT_AMOUNT)`. A single
+     `PUT /record/{location_id}/{record_id}` writes the modified services list and an audit comment
+     ending with `[PromoLead:<id>]`. `PromoLead.status → applied`, notification queued.
+   - **Complex** — multiple same-day records **or** multiple allowed services. Only an admin
+     annotation comment ending with `[PromoLead:<id>:manual]` is written via PUT; prices are
+     unchanged. `PromoLead.status → booked`, `meta.manual_review_required=True`, no notification.
+3. The PUT payload is built verbatim from the GET response (Altegio requires a full payload).
+   `send_sms` is always forced `false` to prevent an Altegio SMS for this bot-triggered update.
+4. Idempotency: if the record comment already contains a promo marker (`[PromoLead:…]` or
+   `[PromoLead:…:manual]`), the function returns without a second PUT.
+5. Attendance guard: if the local record **or** the fresh Altegio record has `attendance=1`, the
+   price override is skipped.
+
+`PROMO_APPLY_MODE` set to any other value falls back to the **legacy loyalty-program path**
+(kept for backward compatibility with direct-wrapper tests and smoke scripts):
 
 ```text
 POST /visit/loyalty/apply_discount_program/{location_id}/{card_id}/{program_id}
 body: {"record_id": <altegio_record_id>}
 ```
 
-`location_id`, `card_id`, and `program_id` come from the issued `PromoLead`;
-`record_id` is the external `Record.altegio_record_id` from the webhook-synced
-booking. The response is treated as success only when the JSON body is an object
-with `success: true`. `success: false`, missing `success`, invalid JSON, and HTTP
-or network errors all fail closed: `PromoLead.status='apply_failed'`, error
-metadata is stored, and no customer "discount applied" notification is queued.
+This endpoint is **UNCONFIRMED** (source: developer discussion, not OpenAPI spec) and returned
+422 errors in smoke testing. It is **not** used for automatic apply in production.
+
+**Discount value (record_price_override):** the price is reduced by `PROMO_DISCOUNT_AMOUNT` euros
+(`promo_discount_type=fixed`). Altegio computes its own `service.discount` percentage from the
+prices and returns it in the PUT response; this value is stored in
+`PromoLead.meta.altegio_returned_discount` for audit purposes but is **not** the € amount used
+to compute `new_cost`.
 
 **Update webhooks are intentionally ignored.** Only create webhooks trigger promo
 discount apply, to avoid accidentally applying a promo to a booking that was made
 before the promo was issued.
+
+**record_updated webhook suppression:** after a successful `PUT /record`, Altegio sends a
+`record_updated` webhook back to the bot. Without suppression, this would queue a booking-change
+notification to the customer. `inbox_worker` detects our own PUTs by checking whether the record
+comment contains a promo marker (`is_promo_origin_comment`). If the marker is found and the event
+is `record_updated`, `plan_jobs_for_record_event` is **not** called and the event is silently
+consumed.
 
 **Booking created timestamp guard:** automatic apply requires a confirmed
 `booking_created_at` - the actual time the booking was created in Altegio, not
@@ -651,9 +684,11 @@ active/card reply; retroactive cleanup is out of scope.
 - Changing existing issued leads retroactively
 - Enabling production flags without a completed smoke test
 
-**The discount-apply Altegio endpoint is UNCONFIRMED** (source: developer
-discussion, not OpenAPI spec). Both discount-apply feature gates must be
-explicitly enabled after verification.
+**The default apply mode (`record_price_override`) uses confirmed endpoints** —
+`GET /record` and `PUT /record` — smoke-tested May 2026. The legacy
+loyalty-program endpoint is UNCONFIRMED (source: developer discussion, not OpenAPI
+spec) and is NOT used in production. Both discount-apply feature gates must be
+explicitly enabled after verification regardless of mode.
 
 ### Required environment variables
 
@@ -678,14 +713,19 @@ PROMO_LOCATION_ID_BY_COMPANY={"1":9001}
 # Master gate. Default false: automatic apply is impossible.
 PROMO_APPLY_DISCOUNT_ENABLED=false
 
-# Endpoint verification gate — set True only after confirming the
-# POST /visit/loyalty/apply_discount_program/{location_id}/{card_id}/{program_id}
-# endpoint against Altegio API docs and completing a smoke test
+# Endpoint verification gate — set True only after completing a smoke test.
+# For record_price_override mode this guards the PUT /record endpoint.
+# For the legacy loyalty-program mode this guards the UNCONFIRMED POST endpoint.
 PROMO_APPLY_DISCOUNT_API_VERIFIED=false
 
 # Comma-separated Altegio service IDs eligible for the promo discount.
 # If empty, discount is never applied automatically (fail-closed).
 PROMO_ALLOWED_SERVICE_IDS=12345,67890
+
+# Apply implementation mode (default: record_price_override).
+# record_price_override: PUT /record to change service price directly (confirmed working).
+# Any other value falls back to the legacy loyalty-program endpoint (not used in production).
+PROMO_APPLY_MODE=record_price_override
 ```
 
 Production automatic apply is impossible unless both of these are explicitly
