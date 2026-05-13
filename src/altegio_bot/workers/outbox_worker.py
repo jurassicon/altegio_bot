@@ -1806,6 +1806,8 @@ async def _run_job_logic(
         job_id=job.id,
         job_type=job.job_type,
         company_id=job.company_id,
+        phone_e164=phone,
+        template_code=job.job_type,
         outbox_status="sent",
     ):
         now_sent = utcnow()

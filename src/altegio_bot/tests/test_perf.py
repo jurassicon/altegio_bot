@@ -560,6 +560,60 @@ def test_outbox_perf_regular_failed_send_insert_outbox(
     assert any(r["outbox_status"] == "failed" for r in ins_recs)
 
 
+def test_outbox_perf_regular_success_insert_outbox_fields(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Regular send success emits outbox.insert_outbox with phone_e164 and template_code."""
+    monkeypatch.setenv("PERF_LOGGING_ENABLED", "true")
+    monkeypatch.setattr(ow.settings, "whatsapp_send_mode", "text")
+
+    job = _FakeJob(job_type="record_updated")
+    client = _FakeClient()
+
+    async def fake_load_job(session: Any, job_id: int) -> Any:
+        return job
+
+    async def fake_find_success(session: Any, job_id: int) -> Any:
+        return None
+
+    async def fake_load_record(session: Any, job_obj: Any) -> Any:
+        return None
+
+    async def fake_load_client(session: Any, job_obj: Any, record: Any) -> Any:
+        return client
+
+    async def fake_apply_rl(session: Any, phone: str) -> Any:
+        return None
+
+    async def fake_render(*args: Any, **kwargs: Any) -> Any:
+        return ("TEXT", 42, "de", {"client_name": "", "sender_id": 42, "sender_code": "default"})
+
+    async def fake_safe_send(*args: Any, **kwargs: Any) -> tuple:
+        return ("msg-ok", None)
+
+    monkeypatch.setattr(ow, "_load_job", fake_load_job)
+    monkeypatch.setattr(ow, "_find_success_outbox", fake_find_success)
+    monkeypatch.setattr(ow, "_load_record", fake_load_record)
+    monkeypatch.setattr(ow, "_load_client", fake_load_client)
+    monkeypatch.setattr(ow, "_apply_rate_limit", fake_apply_rl)
+    monkeypatch.setattr(ow, "_render_message", fake_render)
+    monkeypatch.setattr(ow, "safe_send", fake_safe_send)
+    monkeypatch.setattr(ow, "safe_send_template", fake_safe_send)
+
+    with caplog.at_level(logging.INFO, logger="altegio_bot.perf"):
+        _run(ow.process_job_in_session(_FakeSession(), 1, provider=object()))
+
+    ins_recs = [
+        json.loads(r.message) for r in caplog.records if json.loads(r.message)["operation"] == "outbox.insert_outbox"
+    ]
+    assert ins_recs, "outbox.insert_outbox not emitted"
+    sent = next((r for r in ins_recs if r.get("outbox_status") == "sent"), None)
+    assert sent is not None, "no outbox.insert_outbox with outbox_status=sent"
+    assert "phone_e164" in sent
+    assert "template_code" in sent
+
+
 def test_is_chatwoot_origin_none_value() -> None:
     """'_chatwoot' key with None value still counts as chatwoot origin."""
     from altegio_bot.workers.whatsapp_inbox_worker import _is_chatwoot_origin
