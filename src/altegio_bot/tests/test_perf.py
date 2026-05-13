@@ -149,8 +149,8 @@ def test_outbox_perf_outcome_done(
     with caplog.at_level(logging.INFO, logger="altegio_bot.perf"):
         _run(ow.process_job_in_session(_FakeSession(), 1, provider=object()))
 
-    assert len(caplog.records) == 1
-    rec = json.loads(caplog.records[0].message)
+    all_recs = [json.loads(r.message) for r in caplog.records]
+    rec = next(r for r in all_recs if r["operation"] == "process_job")
     assert rec["outcome"] == "done"
     assert rec["job_id"] == 1
     assert rec["company_id"] == 758285
@@ -178,9 +178,43 @@ def test_outbox_perf_outcome_canceled(
     with caplog.at_level(logging.INFO, logger="altegio_bot.perf"):
         _run(ow.process_job_in_session(_FakeSession(), 1, provider=object()))
 
-    assert len(caplog.records) == 1
-    rec = json.loads(caplog.records[0].message)
+    all_recs = [json.loads(r.message) for r in caplog.records]
+    rec = next(r for r in all_recs if r["operation"] == "process_job")
     assert rec["outcome"] == "canceled"
+
+
+def test_outbox_perf_nested_load_job(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """outbox.load_job nested perf log is emitted alongside the top-level process_job log."""
+    monkeypatch.setenv("PERF_LOGGING_ENABLED", "true")
+
+    job = _FakeJob()
+
+    async def fake_load_job(session: Any, job_id: int) -> Any:
+        return job
+
+    async def fake_run_logic(session: Any, job_obj: Any, provider: Any) -> None:
+        job_obj.status = "done"
+
+    monkeypatch.setattr(ow, "_load_job", fake_load_job)
+    monkeypatch.setattr(ow, "_run_job_logic", fake_run_logic)
+
+    with caplog.at_level(logging.INFO, logger="altegio_bot.perf"):
+        _run(ow.process_job_in_session(_FakeSession(), 1, provider=object()))
+
+    operations = {json.loads(r.message)["operation"] for r in caplog.records}
+    assert "process_job" in operations
+    assert "outbox.load_job" in operations
+
+    load_job_rec = next(
+        json.loads(r.message) for r in caplog.records if json.loads(r.message)["operation"] == "outbox.load_job"
+    )
+    assert load_job_rec["job_id"] == 1
+    assert load_job_rec["component"] == "outbox_worker"
+    assert load_job_rec["job_type"] == "review_3d"
+    assert load_job_rec["company_id"] == 758285
 
 
 def test_outbox_perf_no_outcome_when_job_missing(
@@ -198,8 +232,8 @@ def test_outbox_perf_no_outcome_when_job_missing(
     with caplog.at_level(logging.INFO, logger="altegio_bot.perf"):
         _run(ow.process_job_in_session(_FakeSession(), 99, provider=object()))
 
-    assert len(caplog.records) == 1
-    rec = json.loads(caplog.records[0].message)
+    all_recs = [json.loads(r.message) for r in caplog.records]
+    rec = next(r for r in all_recs if r["operation"] == "process_job")
     assert "outcome" not in rec
     assert rec["job_id"] == 99
 

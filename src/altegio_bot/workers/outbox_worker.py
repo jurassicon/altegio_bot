@@ -911,7 +911,10 @@ async def _process_job_in_session_inner(
     provider: WhatsAppProvider,
     ctx: dict[str, Any],
 ) -> int | None:
-    job = await _load_job(session, job_id)
+    with perf_log("outbox_worker", "outbox.load_job", job_id=job_id) as _lj_ctx:
+        job = await _load_job(session, job_id)
+        if job is not None:
+            _lj_ctx.update(job_type=job.job_type, company_id=job.company_id)
     if job is None:
         return None
 
@@ -977,14 +980,28 @@ async def _run_job_logic(
         await process_promo_eligibility_check_job(session, job, provider)
         return None
 
-    record = await _load_record(session, job)
+    with perf_log(
+        "outbox_worker",
+        "outbox.load_record",
+        job_id=job.id,
+        job_type=job.job_type,
+        company_id=job.company_id,
+    ):
+        record = await _load_record(session, job)
     if _record_is_in_past(record, job_type=job.job_type):
         job.status = "canceled"
         job.locked_at = None
         job.last_error = "Skipped: record starts_at is in the past"
         return
 
-    client = await _load_client(session, job, record)
+    with perf_log(
+        "outbox_worker",
+        "outbox.load_client",
+        job_id=job.id,
+        job_type=job.job_type,
+        company_id=job.company_id,
+    ):
+        client = await _load_client(session, job, record)
 
     # Follow-up final eligibility guard (DB phase): re-check current recipient/client state
     # before the actual send.  Catches changes that happened during the 14-day delay between
@@ -1353,7 +1370,18 @@ async def _run_job_logic(
             )
             return None
 
-    delay_until = await _apply_rate_limit(session, phone)
+    with perf_log(
+        "outbox_worker",
+        "outbox.apply_rate_limit",
+        job_id=job.id,
+        job_type=job.job_type,
+        company_id=job.company_id,
+        phone_e164=phone,
+    ) as _rl_ctx:
+        delay_until = await _apply_rate_limit(session, phone)
+        _rl_ctx.update(delayed=delay_until is not None)
+        if delay_until is not None:
+            _rl_ctx.update(next_allowed_at=delay_until.isoformat())
     if delay_until is not None:
         job.status = "queued"
         job.locked_at = None
@@ -1500,13 +1528,23 @@ async def _run_job_logic(
         return None
 
     try:
-        body, sender_id, lang, msg_ctx = await _render_message(
-            session=session,
+        with perf_log(
+            "outbox_worker",
+            "outbox.render_message",
+            job_id=job.id,
+            job_type=job.job_type,
             company_id=job.company_id,
             template_code=job.job_type,
-            record=record,
-            client=client,
-        )
+            record_id=getattr(record, "id", None),
+            client_id=getattr(client, "id", None),
+        ):
+            body, sender_id, lang, msg_ctx = await _render_message(
+                session=session,
+                company_id=job.company_id,
+                template_code=job.job_type,
+                record=record,
+                client=client,
+            )
     except Exception as exc:
         job.status = "failed"
         job.locked_at = None
@@ -1629,38 +1667,52 @@ async def _run_job_logic(
         except Exception:
             pass
 
-    if use_template:
-        assert meta_template_name is not None
-        msg_id, err = await safe_send_template(
-            provider=provider,
-            sender_id=sender_id,
-            phone=phone,
-            template_name=meta_template_name,
-            language=TEMPLATE_LANGUAGE,
-            params=template_params,
-            fallback_text=final_body,
-            contact_name=contact_name,
-            company_id=job.company_id,
-            header_image_url=header_image_url,
-        )
-        send_meta: dict[str, Any] = {
-            "send_type": "template",
-            "template": meta_template_name,
-            "params": template_params,
-            "lang": TEMPLATE_LANGUAGE,
-        }
-        if header_image_url:
-            send_meta["header_image_url"] = header_image_url
-    else:
-        msg_id, err = await safe_send(
-            provider=provider,
-            sender_id=sender_id,
-            phone=phone,
-            text=final_body,
-            contact_name=contact_name,
-            company_id=job.company_id,
-        )
-        send_meta = {"send_type": "text"}
+    with perf_log(
+        "outbox_worker",
+        "outbox.meta_send",
+        job_id=job.id,
+        job_type=job.job_type,
+        company_id=job.company_id,
+        sender_id=sender_id,
+        phone_e164=phone,
+        template_code=job.job_type,
+        send_mode=send_mode,
+    ) as _ms_ctx:
+        if use_template:
+            assert meta_template_name is not None
+            msg_id, err = await safe_send_template(
+                provider=provider,
+                sender_id=sender_id,
+                phone=phone,
+                template_name=meta_template_name,
+                language=TEMPLATE_LANGUAGE,
+                params=template_params,
+                fallback_text=final_body,
+                contact_name=contact_name,
+                company_id=job.company_id,
+                header_image_url=header_image_url,
+            )
+            send_meta: dict[str, Any] = {
+                "send_type": "template",
+                "template": meta_template_name,
+                "params": template_params,
+                "lang": TEMPLATE_LANGUAGE,
+            }
+            if header_image_url:
+                send_meta["header_image_url"] = header_image_url
+        else:
+            msg_id, err = await safe_send(
+                provider=provider,
+                sender_id=sender_id,
+                phone=phone,
+                text=final_body,
+                contact_name=contact_name,
+                company_id=job.company_id,
+            )
+            send_meta = {"send_type": "text"}
+        _ms_ctx.update(provider_message_id=msg_id)
+        if err is not None:
+            _ms_ctx.update(send_error=err)
 
     if err is not None:
         out = OutboxMessage(
@@ -1704,39 +1756,45 @@ async def _run_job_logic(
         job.run_at = utcnow() + timedelta(seconds=delay)
         return
 
-    now_sent = utcnow()
-    out = OutboxMessage(
-        company_id=job.company_id,
-        client_id=(client.id if client else None),
-        record_id=(record.id if record else None),
+    with perf_log(
+        "outbox_worker",
+        "outbox.insert_outbox",
         job_id=job.id,
-        sender_id=sender_id,
-        phone_e164=phone,
-        template_code=job.job_type,
-        language=lang,
-        body=final_body,
-        status="sent",
-        error=None,
-        provider_message_id=msg_id,
-        scheduled_at=job.run_at,
-        sent_at=now_sent,
-        meta=send_meta,
-    )
-    session.add(out)
-
-    # Backfill CampaignRecipient → OutboxMessage link if this is a campaign
-    # job.  Flush first so out.id is populated by the RETURNING clause.
-    campaign_recipient_id = _job_payload.get("campaign_recipient_id")
-    if campaign_recipient_id is not None:
-        await session.flush()
-        recipient = await session.get(CampaignRecipient, int(campaign_recipient_id))
-        if recipient is not None:
-            if recipient.outbox_message_id is None:
-                recipient.outbox_message_id = out.id
-            if recipient.provider_message_id is None and msg_id:
-                recipient.provider_message_id = msg_id
-            if recipient.sent_at is None:
-                recipient.sent_at = now_sent
+        job_type=job.job_type,
+        company_id=job.company_id,
+    ):
+        now_sent = utcnow()
+        out = OutboxMessage(
+            company_id=job.company_id,
+            client_id=(client.id if client else None),
+            record_id=(record.id if record else None),
+            job_id=job.id,
+            sender_id=sender_id,
+            phone_e164=phone,
+            template_code=job.job_type,
+            language=lang,
+            body=final_body,
+            status="sent",
+            error=None,
+            provider_message_id=msg_id,
+            scheduled_at=job.run_at,
+            sent_at=now_sent,
+            meta=send_meta,
+        )
+        session.add(out)
+        # Backfill CampaignRecipient → OutboxMessage link if this is a campaign
+        # job.  Flush first so out.id is populated by the RETURNING clause.
+        campaign_recipient_id = _job_payload.get("campaign_recipient_id")
+        if campaign_recipient_id is not None:
+            await session.flush()
+            recipient = await session.get(CampaignRecipient, int(campaign_recipient_id))
+            if recipient is not None:
+                if recipient.outbox_message_id is None:
+                    recipient.outbox_message_id = out.id
+                if recipient.provider_message_id is None and msg_id:
+                    recipient.provider_message_id = msg_id
+                if recipient.sent_at is None:
+                    recipient.sent_at = now_sent
 
     job.status = "done"
     job.locked_at = None
