@@ -1430,37 +1430,61 @@ async def _run_job_logic(
             return None
 
         contact_name = client.display_name if client else None
-        msg_id, err = await safe_send(
-            provider=provider,
-            sender_id=_pd_sender_id,
-            phone=phone,
-            text=_pd_body,
-            contact_name=contact_name,
+        with perf_log(
+            "outbox_worker",
+            "outbox.meta_send",
+            job_id=job.id,
+            job_type=job.job_type,
             company_id=job.company_id,
-        )
+            sender_id=_pd_sender_id,
+            phone_e164=phone,
+            template_code=job.job_type,
+            send_mode="text",
+        ) as _pd_ms_ctx:
+            msg_id, err = await safe_send(
+                provider=provider,
+                sender_id=_pd_sender_id,
+                phone=phone,
+                text=_pd_body,
+                contact_name=contact_name,
+                company_id=job.company_id,
+            )
+            _pd_ms_ctx.update(provider_message_id=msg_id)
+            if err is not None:
+                _pd_ms_ctx.update(send_error=err)
         _pd_now = utcnow()
         _pd_send_meta: dict[str, Any] = {"send_type": "text"}
 
         if err is not None:
-            session.add(
-                OutboxMessage(
-                    company_id=job.company_id,
-                    client_id=(client.id if client else None),
-                    record_id=(record.id if record else None),
-                    job_id=job.id,
-                    sender_id=_pd_sender_id,
-                    phone_e164=phone,
-                    template_code=job.job_type,
-                    language="de",
-                    body=_pd_body,
-                    status="failed",
-                    error=err,
-                    provider_message_id=msg_id,
-                    scheduled_at=job.run_at,
-                    sent_at=_pd_now,
-                    meta=_pd_send_meta,
+            with perf_log(
+                "outbox_worker",
+                "outbox.insert_outbox",
+                job_id=job.id,
+                job_type=job.job_type,
+                company_id=job.company_id,
+                phone_e164=phone,
+                template_code=job.job_type,
+                outbox_status="failed",
+            ):
+                session.add(
+                    OutboxMessage(
+                        company_id=job.company_id,
+                        client_id=(client.id if client else None),
+                        record_id=(record.id if record else None),
+                        job_id=job.id,
+                        sender_id=_pd_sender_id,
+                        phone_e164=phone,
+                        template_code=job.job_type,
+                        language="de",
+                        body=_pd_body,
+                        status="failed",
+                        error=err,
+                        provider_message_id=msg_id,
+                        scheduled_at=job.run_at,
+                        sent_at=_pd_now,
+                        meta=_pd_send_meta,
+                    )
                 )
-            )
             if _is_token_expired_error(err):
                 _mark_token_expired()
                 job.status = "queued"
@@ -1494,24 +1518,34 @@ async def _run_job_logic(
                 )
             return None
 
-        out = OutboxMessage(
-            company_id=job.company_id,
-            client_id=(client.id if client else None),
-            record_id=(record.id if record else None),
+        with perf_log(
+            "outbox_worker",
+            "outbox.insert_outbox",
             job_id=job.id,
-            sender_id=_pd_sender_id,
+            job_type=job.job_type,
+            company_id=job.company_id,
             phone_e164=phone,
             template_code=job.job_type,
-            language="de",
-            body=_pd_body,
-            status="sent",
-            error=None,
-            provider_message_id=msg_id,
-            scheduled_at=job.run_at,
-            sent_at=_pd_now,
-            meta=_pd_send_meta,
-        )
-        session.add(out)
+            outbox_status="sent",
+        ):
+            out = OutboxMessage(
+                company_id=job.company_id,
+                client_id=(client.id if client else None),
+                record_id=(record.id if record else None),
+                job_id=job.id,
+                sender_id=_pd_sender_id,
+                phone_e164=phone,
+                template_code=job.job_type,
+                language="de",
+                body=_pd_body,
+                status="sent",
+                error=None,
+                provider_message_id=msg_id,
+                scheduled_at=job.run_at,
+                sent_at=_pd_now,
+                meta=_pd_send_meta,
+            )
+            session.add(out)
         job.status = "done"
         job.locked_at = None
         job.last_error = None
@@ -1715,24 +1749,34 @@ async def _run_job_logic(
             _ms_ctx.update(send_error=err)
 
     if err is not None:
-        out = OutboxMessage(
-            company_id=job.company_id,
-            client_id=(client.id if client else None),
-            record_id=(record.id if record else None),
+        with perf_log(
+            "outbox_worker",
+            "outbox.insert_outbox",
             job_id=job.id,
-            sender_id=sender_id,
+            job_type=job.job_type,
+            company_id=job.company_id,
             phone_e164=phone,
             template_code=job.job_type,
-            language=lang,
-            body=final_body,
-            status="failed",
-            error=err,
-            provider_message_id=msg_id,
-            scheduled_at=job.run_at,
-            sent_at=utcnow(),
-            meta=send_meta,
-        )
-        session.add(out)
+            outbox_status="failed",
+        ):
+            out = OutboxMessage(
+                company_id=job.company_id,
+                client_id=(client.id if client else None),
+                record_id=(record.id if record else None),
+                job_id=job.id,
+                sender_id=sender_id,
+                phone_e164=phone,
+                template_code=job.job_type,
+                language=lang,
+                body=final_body,
+                status="failed",
+                error=err,
+                provider_message_id=msg_id,
+                scheduled_at=job.run_at,
+                sent_at=utcnow(),
+                meta=send_meta,
+            )
+            session.add(out)
 
         if _is_token_expired_error(err):
             _mark_token_expired()
@@ -1762,6 +1806,7 @@ async def _run_job_logic(
         job_id=job.id,
         job_type=job.job_type,
         company_id=job.company_id,
+        outbox_status="sent",
     ):
         now_sent = utcnow()
         out = OutboxMessage(
