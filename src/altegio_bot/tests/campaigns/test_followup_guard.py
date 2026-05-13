@@ -535,10 +535,12 @@ async def test_outbox_worker_followup_future_record_does_not_send(
             await session.flush()
             job_id = job.id
 
+            # Use a far-future date so the DB guard (_has_future_record uses
+            # utcnow()) keeps this record in the future as real time advances.
             _make_record(
                 session,
                 client_id=client.id,
-                starts_at=NOW + timedelta(days=7),
+                starts_at=NOW + timedelta(days=365),
                 is_deleted=False,
             )
             await session.flush()
