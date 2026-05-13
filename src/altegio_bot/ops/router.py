@@ -126,17 +126,39 @@ def _status_badge(status: str | None) -> str:
 
 _FOLLOWUP_ELIGIBLE_STATUSES_HTML = frozenset({"queued", "provider_accepted", "delivered"})
 
+_FOLLOWUP_STATUS_SKIP_REASON: dict[str, str] = {
+    "skipped_booked_after": "booked_after",
+    "skipped_read": "read",
+    "skipped_replied": "replied",
+    "skipped_opted_out": "opted_out",
+    "skipped_future_record": "future_record",
+    "followup_skipped": "skipped",
+}
+
+_FUNNEL_TABLE_LIMIT = 200
+
 
 def _fu_reason(r: CampaignRecipient) -> str:
-    """Priority: booked_after > replied > read > queued > eligible (mirrors campaigns_api)."""
+    """Priority: booked_after > replied > read > queued/planned/processing > skipped/failed > eligible."""
     if r.booked_after_at is not None or r.status == "booked_after_campaign":
         return "booked_after"
     if r.replied_at is not None or r.status == "replied":
         return "replied"
     if r.read_at is not None or r.status == "read":
         return "read"
-    if r.followup_status == "followup_queued":
+    fs = r.followup_status
+    if fs == "followup_queued":
         return "queued"
+    if fs == "followup_planned":
+        return "planned"
+    if fs == "followup_processing":
+        return "processing"
+    if fs in _FOLLOWUP_STATUS_SKIP_REASON:
+        return _FOLLOWUP_STATUS_SKIP_REASON[fs]
+    if fs == "followup_failed":
+        return "failed"
+    if fs is not None:
+        return f"followup_status:{fs}"
     if r.status not in _FOLLOWUP_ELIGIBLE_STATUSES_HTML or r.excluded_reason is not None:
         return "not eligible"
     return "eligible"
@@ -4047,14 +4069,15 @@ async def ops_campaign_run_detail(run_id: int) -> str:
 
         # Funnel recipients (sent pipeline + any with followup_status set)
         _funnel_statuses = ["queued", "provider_accepted", "delivered", "read", "replied", "booked_after_campaign"]
+        _funnel_where = (
+            CampaignRecipient.campaign_run_id == run_id,
+            CampaignRecipient.status.in_(_funnel_statuses) | CampaignRecipient.followup_status.is_not(None),
+        )
+        funnel_total: int = (
+            await session.scalar(select(func.count()).select_from(CampaignRecipient).where(*_funnel_where))
+        ) or 0
         funnel_stmt = (
-            select(CampaignRecipient)
-            .where(
-                CampaignRecipient.campaign_run_id == run_id,
-                CampaignRecipient.status.in_(_funnel_statuses) | CampaignRecipient.followup_status.is_not(None),
-            )
-            .order_by(CampaignRecipient.id)
-            .limit(200)
+            select(CampaignRecipient).where(*_funnel_where).order_by(CampaignRecipient.id).limit(_FUNNEL_TABLE_LIMIT)
         )
         funnel_recipients = list((await session.execute(funnel_stmt)).scalars().all())
 
@@ -4416,9 +4439,14 @@ async def ops_campaign_run_detail(run_id: int) -> str:
                     job_cell,
                 ]
             )
+        _funnel_header = (
+            f"👥 Funnel contacts (showing first {_FUNNEL_TABLE_LIMIT} of {funnel_total})"
+            if funnel_total > _FUNNEL_TABLE_LIMIT
+            else f"👥 Funnel contacts ({funnel_total})"
+        )
         funnel_block = f"""
 <div class="card mb-3">
-  <div class="card-header">👥 Funnel contacts ({len(funnel_recipients)})</div>
+  <div class="card-header">{_funnel_header}</div>
   <div class="card-body p-0">
     {_table(funnel_cols, funnel_rows)}
   </div>

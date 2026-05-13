@@ -1641,3 +1641,63 @@ async def test_page_has_navbar_fallback_js(http_client: AsyncClient) -> None:
     assert "window.bootstrap" in text
     assert "aria-expanded" in text
     assert "navmenu" in text
+
+
+# ---------------------------------------------------------------------------
+# Funnel contacts: truncation header
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_funnel_header_no_truncation(
+    http_client: AsyncClient,
+    run_with_followup_recipients: int,
+) -> None:
+    """When funnel total <= 200, header shows plain count without 'showing first'."""
+    run_id = run_with_followup_recipients
+    response = await http_client.get(f"/ops/campaigns/{run_id}")
+    assert response.status_code == 200
+    text = response.text
+    assert "Funnel contacts (3)" in text
+    assert "showing first" not in text
+
+
+@pytest.mark.asyncio
+async def test_funnel_header_truncation_shown(
+    http_client: AsyncClient,
+    session_maker,
+) -> None:
+    """When funnel total > 200, header shows 'showing first 200 of TOTAL'."""
+    now = datetime.now(timezone.utc)
+    async with session_maker() as session:
+        async with session.begin():
+            run = CampaignRun(
+                campaign_code="new_clients_monthly",
+                mode="send-real",
+                company_ids=[758285],
+                period_start=now.replace(day=1, hour=0, minute=0, second=0, microsecond=0),
+                period_end=now,
+                status="completed",
+                followup_enabled=True,
+                meta={},
+            )
+            session.add(run)
+            await session.flush()
+            run_id = run.id
+
+            for i in range(201):
+                session.add(
+                    CampaignRecipient(
+                        campaign_run_id=run_id,
+                        company_id=758285,
+                        altegio_client_id=i + 1,
+                        phone_e164=f"+4915100{i:04d}",
+                        display_name=f"Client {i}",
+                        status="delivered",
+                    )
+                )
+
+    response = await http_client.get(f"/ops/campaigns/{run_id}")
+    assert response.status_code == 200
+    text = response.text
+    assert "showing first 200 of 201" in text
