@@ -17,10 +17,10 @@ from fastapi import APIRouter, Depends, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from sqlalchemy import func, select, text
 
-from altegio_bot.campaigns.reports import monthly_dashboard
+from altegio_bot.campaigns.reports import monthly_dashboard, run_report
 from altegio_bot.db import SessionLocal
 from altegio_bot.meta_templates import META_TEMPLATE_MAP
-from altegio_bot.models.models import CampaignRecipient, CampaignRun
+from altegio_bot.models.models import CampaignRecipient, CampaignRun, MessageJob, OutboxMessage
 from altegio_bot.settings import settings
 
 from .auth import (
@@ -124,12 +124,31 @@ def _status_badge(status: str | None) -> str:
     return f'<span class="badge bg-{color}">{_esc(status)}</span>'
 
 
+_FOLLOWUP_ELIGIBLE_STATUSES_HTML = frozenset({"queued", "provider_accepted", "delivered"})
+
+
+def _fu_reason(r: CampaignRecipient) -> str:
+    """Priority: booked_after > replied > read > queued > eligible (mirrors campaigns_api)."""
+    if r.booked_after_at is not None or r.status == "booked_after_campaign":
+        return "booked_after"
+    if r.replied_at is not None or r.status == "replied":
+        return "replied"
+    if r.read_at is not None or r.status == "read":
+        return "read"
+    if r.followup_status == "followup_queued":
+        return "queued"
+    if r.status not in _FOLLOWUP_ELIGIBLE_STATUSES_HTML or r.excluded_reason is not None:
+        return "not eligible"
+    return "eligible"
+
+
 _NAV = """
 <nav class="navbar navbar-expand-lg navbar-dark bg-dark mb-4">
   <div class="container-fluid">
     <a class="navbar-brand fw-bold" href="/ops/monitoring">🤖 Ops</a>
     <button class="navbar-toggler" type="button"
-            data-bs-toggle="collapse" data-bs-target="#navmenu">
+            data-bs-toggle="collapse" data-bs-target="#navmenu"
+            aria-controls="navmenu" aria-expanded="false" aria-label="Toggle navigation">
       <span class="navbar-toggler-icon"></span>
     </button>
     <div class="collapse navbar-collapse" id="navmenu">
@@ -189,6 +208,19 @@ def _page(title: str, body: str) -> str:
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"
   integrity="sha384-YvpcrYf0tY3lHB60NNkmXc4s9bIOgUxi8T/jzmYLqgTB2YNVN4VcNXyG3KvFnuD"
   crossorigin="anonymous"></script>
+<script>
+(function () {{
+  if (typeof window.bootstrap !== "undefined") return;
+  var btn = document.querySelector(".navbar-toggler");
+  var menu = document.getElementById("navmenu");
+  if (!btn || !menu) return;
+  btn.addEventListener("click", function () {{
+    var expanded = btn.getAttribute("aria-expanded") === "true";
+    menu.classList.toggle("show", !expanded);
+    btn.setAttribute("aria-expanded", String(!expanded));
+  }});
+}})();
+</script>
 </body>
 </html>"""
 
@@ -4006,6 +4038,48 @@ async def ops_campaign_run_detail(run_id: int) -> str:
             )
             used_as_source = int(src_count or 0) > 0
 
+        # Follow-up eligibility aggregation
+        try:
+            report = await run_report(session, run_id)
+            followup_eligibility = report.get("followup_eligibility", {})
+        except Exception:
+            followup_eligibility = {}
+
+        # Funnel recipients (sent pipeline + any with followup_status set)
+        _funnel_statuses = ["queued", "provider_accepted", "delivered", "read", "replied", "booked_after_campaign"]
+        funnel_stmt = (
+            select(CampaignRecipient)
+            .where(
+                CampaignRecipient.campaign_run_id == run_id,
+                CampaignRecipient.status.in_(_funnel_statuses) | CampaignRecipient.followup_status.is_not(None),
+            )
+            .order_by(CampaignRecipient.id)
+            .limit(200)
+        )
+        funnel_recipients = list((await session.execute(funnel_stmt)).scalars().all())
+
+        # Batch-load outbox statuses
+        outbox_ids = [r.outbox_message_id for r in funnel_recipients if r.outbox_message_id]
+        outbox_status_map: dict[int, str] = {}
+        if outbox_ids:
+            ob_rows = (
+                await session.execute(
+                    select(OutboxMessage.id, OutboxMessage.status).where(OutboxMessage.id.in_(outbox_ids))
+                )
+            ).all()
+            outbox_status_map = {row.id: row.status for row in ob_rows}
+
+        # Batch-load followup job info
+        job_ids = [r.followup_message_job_id for r in funnel_recipients if r.followup_message_job_id]
+        job_info_map: dict[int, tuple[str, datetime | None]] = {}
+        if job_ids:
+            job_rows = (
+                await session.execute(
+                    select(MessageJob.id, MessageJob.status, MessageJob.run_at).where(MessageJob.id.in_(job_ids))
+                )
+            ).all()
+            job_info_map = {row.id: (row.status, row.run_at) for row in job_rows}
+
     meta = run.meta or {}
     last_error = meta.get("last_error")
 
@@ -4274,6 +4348,83 @@ async def ops_campaign_run_detail(run_id: int) -> str:
 </div>
 """
 
+    # --- Follow-up eligibility block ---
+    followup_eligibility_block = ""
+    if followup_eligibility:
+        fe = followup_eligibility
+        followup_eligibility_block = f"""
+<div class="card mb-3">
+  <div class="card-header">📊 Follow-up eligibility</div>
+  <div class="card-body">
+    {
+            _metric_cards(
+                [
+                    ("Eligible now", fe.get("eligible_now", 0), "success"),
+                    ("Queued", fe.get("followup_queued", 0), "primary"),
+                    ("Skipped read", fe.get("skipped_read", 0), "info"),
+                    ("Skipped booked", fe.get("skipped_booked_after", 0), "success"),
+                    ("Skipped replied", fe.get("skipped_replied", 0), "success"),
+                    ("Pending", fe.get("pending_unprocessed", 0), "secondary"),
+                ]
+            )
+        }
+  </div>
+</div>
+"""
+
+    # --- Funnel contacts table ---
+    funnel_block = ""
+    if funnel_recipients:
+        funnel_cols = [
+            "ID",
+            "Name",
+            "Phone",
+            "Status",
+            "Outbox",
+            "FU reason",
+            "FU status",
+            "Read at",
+            "Replied at",
+            "Booked at",
+            "FU job",
+            "Job status / run_at",
+        ]
+        funnel_rows = []
+        for r in funnel_recipients:
+            ob_status = outbox_status_map.get(r.outbox_message_id or 0, "")
+            job_status, job_run_at = job_info_map.get(r.followup_message_job_id or 0, ("", None))
+            job_cell = ""
+            if r.followup_message_job_id:
+                job_cell = (
+                    f"{_esc(str(r.followup_message_job_id))} "
+                    f"{_status_badge(job_status)} "
+                    f"{_esc(_fmt_dt(job_run_at, tz))}"
+                )
+            funnel_rows.append(
+                [
+                    _esc(str(r.id)),
+                    _esc(r.display_name or ""),
+                    _esc(r.phone_e164 or ""),
+                    _status_badge(r.status),
+                    _status_badge(ob_status),
+                    _esc(_fu_reason(r)),
+                    _esc(r.followup_status or ""),
+                    _esc(_fmt_dt(r.read_at, tz)),
+                    _esc(_fmt_dt(r.replied_at, tz)),
+                    _esc(_fmt_dt(r.booked_after_at, tz)),
+                    _esc(str(r.followup_message_job_id) if r.followup_message_job_id else ""),
+                    job_cell,
+                ]
+            )
+        funnel_block = f"""
+<div class="card mb-3">
+  <div class="card-header">👥 Funnel contacts ({len(funnel_recipients)})</div>
+  <div class="card-body p-0">
+    {_table(funnel_cols, funnel_rows)}
+  </div>
+</div>
+"""
+
     # --- Auto-followup block ---
     followup_auto_keys = (
         "followup_auto_status",
@@ -4351,6 +4502,8 @@ async def ops_campaign_run_detail(run_id: int) -> str:
 {loyalty_block}
 {excluded_block}
 {followup_block}
+{followup_eligibility_block}
+{funnel_block}
 {auto_followup_block}
 {recipients_summary}
 <div id="detail-alert" class="mt-3"></div>
