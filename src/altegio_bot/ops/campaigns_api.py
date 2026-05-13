@@ -2170,6 +2170,24 @@ def _run_detail(run: CampaignRun, *, used_as_source: bool = False) -> dict[str, 
     return base
 
 
+_FOLLOWUP_ELIGIBLE_STATUSES = frozenset({"queued", "provider_accepted", "delivered"})
+
+
+def _followup_reason(r: CampaignRecipient) -> str | None:
+    """Вычислить причину статуса follow-up для отображения в UI."""
+    if r.booked_after_at is not None:
+        return "booked_after"
+    if r.replied_at is not None:
+        return "replied"
+    if r.read_at is not None:
+        return "read"
+    if r.followup_status == "followup_queued":
+        return "queued"
+    if r.status not in _FOLLOWUP_ELIGIBLE_STATUSES or r.excluded_reason is not None:
+        return "not eligible"
+    return None
+
+
 def _recipient_dict(r: CampaignRecipient) -> dict[str, Any]:
     """Словарь для одного CampaignRecipient."""
     return {
@@ -2213,6 +2231,7 @@ def _recipient_dict(r: CampaignRecipient) -> dict[str, Any]:
         "followup": {
             "followup_status": r.followup_status,
             "followup_sent_at": _iso(r.followup_sent_at),
+            "followup_reason": _followup_reason(r),
         },
         "created_at": _iso(r.created_at),
     }

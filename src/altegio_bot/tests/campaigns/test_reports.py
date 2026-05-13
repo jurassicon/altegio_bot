@@ -374,3 +374,180 @@ async def test_monthly_dashboard_exposes_summary_and_by_company(
     assert company_row["queued_count"] == 5
     assert company_row["cards_issued_count"] == 2
     assert company_row["cards_deleted_count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Тесты followup_eligibility в run_report
+# ---------------------------------------------------------------------------
+
+
+def _make_recipient(run: CampaignRun, *, suffix: str, **kw) -> CampaignRecipient:
+    defaults = dict(
+        campaign_run_id=run.id,
+        company_id=COMPANY,
+        phone_e164=f"+49111{suffix}",
+        status="delivered",
+    )
+    defaults.update(kw)
+    return CampaignRecipient(**defaults)
+
+
+@pytest.mark.asyncio
+async def test_followup_eligibility_delivered_no_skip(session_maker) -> None:
+    """delivered + no read/reply/booked + no excluded_reason → eligible_now += 1."""
+    async with session_maker() as session:
+        async with session.begin():
+            run = _make_run(session, mode="send-real")
+            await session.flush()
+            session.add(_make_recipient(run, suffix="0001", status="delivered"))
+
+        report = await run_report(session, run.id)
+
+    elig = report["followup_eligibility"]
+    assert elig["eligible_now"] == 1
+    assert elig["followup_queued"] == 0
+    assert elig["skipped_read"] == 0
+    assert elig["skipped_booked_after"] == 0
+    assert elig["skipped_replied"] == 0
+    assert elig["pending_unprocessed"] == 0
+
+
+@pytest.mark.asyncio
+async def test_followup_eligibility_booked_after(session_maker) -> None:
+    """delivered + booked_after_at IS NOT NULL → skipped_booked_after, даже если followup_status=NULL."""
+    from datetime import datetime, timezone
+
+    booked_ts = datetime(2026, 2, 1, tzinfo=timezone.utc)
+    async with session_maker() as session:
+        async with session.begin():
+            run = _make_run(session, mode="send-real")
+            await session.flush()
+            session.add(
+                _make_recipient(
+                    run,
+                    suffix="0002",
+                    status="delivered",
+                    booked_after_at=booked_ts,
+                    followup_status=None,
+                )
+            )
+
+        report = await run_report(session, run.id)
+
+    elig = report["followup_eligibility"]
+    assert elig["skipped_booked_after"] == 1
+    assert elig["eligible_now"] == 0
+
+
+@pytest.mark.asyncio
+async def test_followup_eligibility_read(session_maker) -> None:
+    """read_at IS NOT NULL → skipped_read += 1."""
+    from datetime import datetime, timezone
+
+    read_ts = datetime(2026, 2, 1, tzinfo=timezone.utc)
+    async with session_maker() as session:
+        async with session.begin():
+            run = _make_run(session, mode="send-real")
+            await session.flush()
+            session.add(_make_recipient(run, suffix="0003", status="delivered", read_at=read_ts))
+
+        report = await run_report(session, run.id)
+
+    elig = report["followup_eligibility"]
+    assert elig["skipped_read"] == 1
+    assert elig["eligible_now"] == 0
+
+
+@pytest.mark.asyncio
+async def test_followup_eligibility_queued(session_maker) -> None:
+    """followup_status='followup_queued' → followup_queued += 1, не в eligible_now."""
+    async with session_maker() as session:
+        async with session.begin():
+            run = _make_run(session, mode="send-real")
+            await session.flush()
+            session.add(
+                _make_recipient(
+                    run,
+                    suffix="0004",
+                    status="delivered",
+                    followup_status="followup_queued",
+                )
+            )
+
+        report = await run_report(session, run.id)
+
+    elig = report["followup_eligibility"]
+    assert elig["followup_queued"] == 1
+    assert elig["eligible_now"] == 0
+
+
+@pytest.mark.asyncio
+async def test_followup_eligibility_booked_after_with_null_followup_status(session_maker) -> None:
+    """booked_after_at IS NOT NULL + followup_status=NULL → skipped_booked_after, а не eligible_now."""
+    from datetime import datetime, timezone
+
+    booked_ts = datetime(2026, 2, 5, tzinfo=timezone.utc)
+    async with session_maker() as session:
+        async with session.begin():
+            run = _make_run(session, mode="send-real")
+            await session.flush()
+            # Этот получатель уже забукировал, followup_status ещё не проставлен.
+            # Должен считаться как skipped_booked_after, а не eligible_now.
+            session.add(
+                _make_recipient(
+                    run,
+                    suffix="0005",
+                    status="delivered",
+                    booked_after_at=booked_ts,
+                    followup_status=None,
+                )
+            )
+
+        report = await run_report(session, run.id)
+
+    elig = report["followup_eligibility"]
+    assert elig["skipped_booked_after"] == 1, (
+        f"Ожидали skipped_booked_after=1, получили {elig['skipped_booked_after']}"
+    )
+    assert elig["eligible_now"] == 0, (
+        f"booked recipient не должен быть в eligible_now, получили {elig['eligible_now']}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_followup_eligibility_mixed(session_maker) -> None:
+    """Смешанный сценарий: 1 eligible + 1 booked + 1 queued → корректные счётчики."""
+    from datetime import datetime, timezone
+
+    booked_ts = datetime(2026, 2, 10, tzinfo=timezone.utc)
+    async with session_maker() as session:
+        async with session.begin():
+            run = _make_run(session, mode="send-real")
+            await session.flush()
+            session.add(_make_recipient(run, suffix="1001", status="delivered"))
+            session.add(
+                _make_recipient(
+                    run,
+                    suffix="1002",
+                    status="delivered",
+                    booked_after_at=booked_ts,
+                )
+            )
+            session.add(
+                _make_recipient(
+                    run,
+                    suffix="1003",
+                    status="delivered",
+                    followup_status="followup_queued",
+                )
+            )
+
+        report = await run_report(session, run.id)
+
+    elig = report["followup_eligibility"]
+    assert elig["eligible_now"] == 1
+    assert elig["skipped_booked_after"] == 1
+    assert elig["followup_queued"] == 1
+    assert elig["skipped_read"] == 0
+    assert elig["skipped_replied"] == 0
+    assert elig["pending_unprocessed"] == 0
