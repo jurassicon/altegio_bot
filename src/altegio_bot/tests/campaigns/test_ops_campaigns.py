@@ -132,6 +132,7 @@ async def test_ops_campaign_run_detail_returns_200(
     assert "Loyalty" in response.text
     assert "Excluded" in response.text
     assert "Follow-up" in response.text
+    assert "Follow-up eligibility" in response.text
 
 
 @pytest.mark.asyncio
@@ -1499,3 +1500,204 @@ async def test_campaign_new_page_clears_outstanding_delete_result_on_company_cha
     change_block = text[text.find("companySelect.addEventListener") :][:800]
     assert "outstanding-delete-result" in change_block
     assert "innerHTML" in change_block
+
+
+# ---------------------------------------------------------------------------
+# Follow-up eligibility block on run detail page
+# ---------------------------------------------------------------------------
+
+
+@pytest_asyncio.fixture
+async def run_with_followup_recipients(session_maker) -> int:
+    """Run with followup enabled + recipients in various funnel states."""
+    now = datetime.now(timezone.utc)
+    async with session_maker() as session:
+        async with session.begin():
+            run = CampaignRun(
+                campaign_code="new_clients_monthly",
+                mode="send-real",
+                company_ids=[758285],
+                period_start=now.replace(day=1, hour=0, minute=0, second=0, microsecond=0),
+                period_end=now,
+                status="completed",
+                followup_enabled=True,
+                followup_delay_days=3,
+                followup_policy="read_only",
+                meta={},
+            )
+            session.add(run)
+            await session.flush()
+            run_id = run.id
+
+            # Eligible now — delivered, no events, no followup_status
+            session.add(
+                CampaignRecipient(
+                    campaign_run_id=run_id,
+                    company_id=758285,
+                    altegio_client_id=1,
+                    phone_e164="+49151000001",
+                    display_name="Eligible Client",
+                    status="delivered",
+                )
+            )
+            # Skipped read — status='read'
+            session.add(
+                CampaignRecipient(
+                    campaign_run_id=run_id,
+                    company_id=758285,
+                    altegio_client_id=2,
+                    phone_e164="+49151000002",
+                    display_name="Read Client",
+                    status="read",
+                )
+            )
+            # Skipped booked — booked_after_at set
+            session.add(
+                CampaignRecipient(
+                    campaign_run_id=run_id,
+                    company_id=758285,
+                    altegio_client_id=3,
+                    phone_e164="+49151000003",
+                    display_name="Booked Client",
+                    status="delivered",
+                    booked_after_at=now,
+                )
+            )
+
+    return run_id
+
+
+@pytest.mark.asyncio
+async def test_run_detail_followup_eligibility_block_present(
+    http_client: AsyncClient,
+    run_with_followup_recipients: int,
+) -> None:
+    """Follow-up eligibility block appears on run detail page."""
+    run_id = run_with_followup_recipients
+    response = await http_client.get(f"/ops/campaigns/{run_id}")
+    assert response.status_code == 200
+    text = response.text
+    assert "Follow-up eligibility" in text
+    assert "Eligible now" in text
+    assert "Skipped read" in text
+    assert "Skipped booked" in text
+
+
+@pytest.mark.asyncio
+async def test_run_detail_funnel_contacts_table_present(
+    http_client: AsyncClient,
+    run_with_followup_recipients: int,
+) -> None:
+    """Funnel contacts table shows sent-pipeline recipients."""
+    run_id = run_with_followup_recipients
+    response = await http_client.get(f"/ops/campaigns/{run_id}")
+    assert response.status_code == 200
+    text = response.text
+    assert "Funnel contacts" in text
+    assert "Eligible Client" in text
+    assert "Read Client" in text
+    assert "Booked Client" in text
+    assert "FU reason" in text
+
+
+@pytest.mark.asyncio
+async def test_run_detail_funnel_shows_fu_reason(
+    http_client: AsyncClient,
+    run_with_followup_recipients: int,
+) -> None:
+    """Funnel table shows correct follow-up reason per recipient."""
+    run_id = run_with_followup_recipients
+    response = await http_client.get(f"/ops/campaigns/{run_id}")
+    assert response.status_code == 200
+    text = response.text
+    assert "eligible" in text
+    assert "read" in text
+    assert "booked_after" in text
+
+
+# ---------------------------------------------------------------------------
+# Navbar: aria attributes and fallback JS
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_navbar_has_aria_attributes(http_client: AsyncClient) -> None:
+    """Navbar toggler button has aria-controls, aria-expanded, aria-label."""
+    response = await http_client.get("/ops/campaigns")
+    assert response.status_code == 200
+    text = response.text
+    assert 'aria-controls="navmenu"' in text
+    assert 'aria-expanded="false"' in text
+    assert 'aria-label="Toggle navigation"' in text
+
+
+@pytest.mark.asyncio
+async def test_page_has_navbar_fallback_js(http_client: AsyncClient) -> None:
+    """Page HTML contains fallback navbar JS that works without Bootstrap."""
+    response = await http_client.get("/ops/campaigns")
+    assert response.status_code == 200
+    text = response.text
+    assert "navbar-toggler" in text
+    assert "window.bootstrap" in text
+    assert "aria-expanded" in text
+    assert "navmenu" in text
+
+
+# ---------------------------------------------------------------------------
+# Funnel contacts: truncation header
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_funnel_header_no_truncation(
+    http_client: AsyncClient,
+    run_with_followup_recipients: int,
+) -> None:
+    """When funnel total <= 200, header shows plain count without 'showing first'."""
+    run_id = run_with_followup_recipients
+    response = await http_client.get(f"/ops/campaigns/{run_id}")
+    assert response.status_code == 200
+    text = response.text
+    assert "Funnel contacts (3)" in text
+    assert "showing first" not in text
+
+
+@pytest.mark.asyncio
+async def test_funnel_header_truncation_shown(
+    http_client: AsyncClient,
+    session_maker,
+) -> None:
+    """When funnel total > 200, header shows 'showing first 200 of TOTAL'."""
+    now = datetime.now(timezone.utc)
+    async with session_maker() as session:
+        async with session.begin():
+            run = CampaignRun(
+                campaign_code="new_clients_monthly",
+                mode="send-real",
+                company_ids=[758285],
+                period_start=now.replace(day=1, hour=0, minute=0, second=0, microsecond=0),
+                period_end=now,
+                status="completed",
+                followup_enabled=True,
+                meta={},
+            )
+            session.add(run)
+            await session.flush()
+            run_id = run.id
+
+            for i in range(201):
+                session.add(
+                    CampaignRecipient(
+                        campaign_run_id=run_id,
+                        company_id=758285,
+                        altegio_client_id=i + 1,
+                        phone_e164=f"+4915100{i:04d}",
+                        display_name=f"Client {i}",
+                        status="delivered",
+                    )
+                )
+
+    response = await http_client.get(f"/ops/campaigns/{run_id}")
+    assert response.status_code == 200
+    text = response.text
+    assert "showing first 200 of 201" in text
