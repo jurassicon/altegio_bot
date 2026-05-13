@@ -2174,12 +2174,16 @@ _FOLLOWUP_ELIGIBLE_STATUSES = frozenset({"queued", "provider_accepted", "deliver
 
 
 def _followup_reason(r: CampaignRecipient) -> str | None:
-    """Вычислить причину статуса follow-up для отображения в UI."""
-    if r.booked_after_at is not None:
+    """Вычислить причину статуса follow-up для отображения в UI.
+
+    Приоритет: booked_after > replied > read > queued > not eligible.
+    Статус поля проверяется наряду с timestamp-полями — зеркалирует логику followup.py.
+    """
+    if r.booked_after_at is not None or r.status == "booked_after_campaign":
         return "booked_after"
-    if r.replied_at is not None:
+    if r.replied_at is not None or r.status == "replied":
         return "replied"
-    if r.read_at is not None:
+    if r.read_at is not None or r.status == "read":
         return "read"
     if r.followup_status == "followup_queued":
         return "queued"

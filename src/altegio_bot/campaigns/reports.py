@@ -20,7 +20,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import and_, func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.models.models import CampaignRecipient, CampaignRun, OutboxMessage
@@ -181,34 +181,60 @@ async def _fetch_attribution(session: AsyncSession, run_id: int) -> dict[str, An
     ).where(CampaignRecipient.campaign_run_id == run_id)
     attr_row = (await session.execute(attr_stmt)).one()
 
-    # Follow-up eligibility breakdown
-    _ELIGIBLE_STATUSES = ["queued", "provider_accepted", "delivered"]
+    # Follow-up eligibility breakdown.
+    # Mirrors the logic in campaigns/followup.py: skipped if status OR timestamp
+    # indicates read/replied/booked.  Buckets are mutually exclusive with priority:
+    #   booked_after > replied > read > queued/pending > eligible
+    _is_booked = or_(
+        CampaignRecipient.booked_after_at.is_not(None),
+        CampaignRecipient.status == "booked_after_campaign",
+    )
+    _is_replied = or_(
+        CampaignRecipient.replied_at.is_not(None),
+        CampaignRecipient.status == "replied",
+    )
+    _is_read = or_(
+        CampaignRecipient.read_at.is_not(None),
+        CampaignRecipient.status == "read",
+    )
+    _FOLLOWUP_ELIGIBLE_STATUSES_LIST = ["queued", "provider_accepted", "delivered"]
+
     elig_stmt = select(
-        func.count(CampaignRecipient.id).filter(
+        func.count(CampaignRecipient.id).filter(_is_booked).label("skipped_booked_after"),
+        func.count(CampaignRecipient.id).filter(and_(_is_replied, ~_is_booked)).label("skipped_replied"),
+        func.count(CampaignRecipient.id).filter(and_(_is_read, ~_is_booked, ~_is_replied)).label("skipped_read"),
+        func.count(CampaignRecipient.id)
+        .filter(
             and_(
-                CampaignRecipient.status.in_(_ELIGIBLE_STATUSES),
-                CampaignRecipient.read_at.is_(None),
-                CampaignRecipient.replied_at.is_(None),
-                CampaignRecipient.booked_after_at.is_(None),
+                CampaignRecipient.followup_status == "followup_queued",
+                ~_is_booked,
+                ~_is_replied,
+                ~_is_read,
+            )
+        )
+        .label("followup_queued"),
+        func.count(CampaignRecipient.id)
+        .filter(
+            and_(
+                CampaignRecipient.followup_status.in_(["followup_planned", "followup_processing"]),
+                ~_is_booked,
+                ~_is_replied,
+                ~_is_read,
+            )
+        )
+        .label("pending_unprocessed"),
+        func.count(CampaignRecipient.id)
+        .filter(
+            and_(
+                CampaignRecipient.status.in_(_FOLLOWUP_ELIGIBLE_STATUSES_LIST),
+                ~_is_booked,
+                ~_is_replied,
+                ~_is_read,
                 CampaignRecipient.excluded_reason.is_(None),
                 CampaignRecipient.followup_status.is_(None),
             )
-        ).label("eligible_now"),
-        func.count(CampaignRecipient.id).filter(
-            CampaignRecipient.followup_status == "followup_queued"
-        ).label("followup_queued"),
-        func.count(CampaignRecipient.id).filter(
-            CampaignRecipient.read_at.is_not(None)
-        ).label("skipped_read"),
-        func.count(CampaignRecipient.id).filter(
-            CampaignRecipient.booked_after_at.is_not(None)
-        ).label("skipped_booked_after"),
-        func.count(CampaignRecipient.id).filter(
-            CampaignRecipient.replied_at.is_not(None)
-        ).label("skipped_replied"),
-        func.count(CampaignRecipient.id).filter(
-            CampaignRecipient.followup_status.in_(["followup_planned", "followup_processing"])
-        ).label("pending_unprocessed"),
+        )
+        .label("eligible_now"),
     ).where(CampaignRecipient.campaign_run_id == run_id)
     elig_row = (await session.execute(elig_stmt)).one()
 
