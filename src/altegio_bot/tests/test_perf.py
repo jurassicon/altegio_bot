@@ -104,9 +104,21 @@ class _FakeJob:
     last_error: str | None = None
     attempts: int = 0
     max_attempts: int = 5
+    payload: dict = field(default_factory=dict)
+
+
+@dataclass
+class _FakeClient:
+    id: int = 5
+    phone_e164: str = "+491234567890"
+    display_name: str = "Test"
+    wa_opted_out: bool = False
 
 
 class _FakeSession:
+    def __init__(self) -> None:
+        self.added: list[Any] = []
+
     def begin(self) -> Any:
         class _CM:
             async def __aenter__(self_) -> None:
@@ -117,11 +129,20 @@ class _FakeSession:
 
         return _CM()
 
+    def add(self, obj: Any) -> None:
+        self.added.append(obj)
+
     async def execute(self, *_: Any, **__: Any) -> Any:
         class _R:
             rowcount = 0
 
         return _R()
+
+    async def flush(self) -> None:
+        pass
+
+    async def get(self, *_: Any, **__: Any) -> Any:
+        return None
 
 
 def _run(coro: Any) -> Any:
@@ -149,8 +170,8 @@ def test_outbox_perf_outcome_done(
     with caplog.at_level(logging.INFO, logger="altegio_bot.perf"):
         _run(ow.process_job_in_session(_FakeSession(), 1, provider=object()))
 
-    assert len(caplog.records) == 1
-    rec = json.loads(caplog.records[0].message)
+    all_recs = [json.loads(r.message) for r in caplog.records]
+    rec = next(r for r in all_recs if r["operation"] == "process_job")
     assert rec["outcome"] == "done"
     assert rec["job_id"] == 1
     assert rec["company_id"] == 758285
@@ -178,9 +199,43 @@ def test_outbox_perf_outcome_canceled(
     with caplog.at_level(logging.INFO, logger="altegio_bot.perf"):
         _run(ow.process_job_in_session(_FakeSession(), 1, provider=object()))
 
-    assert len(caplog.records) == 1
-    rec = json.loads(caplog.records[0].message)
+    all_recs = [json.loads(r.message) for r in caplog.records]
+    rec = next(r for r in all_recs if r["operation"] == "process_job")
     assert rec["outcome"] == "canceled"
+
+
+def test_outbox_perf_nested_load_job(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """outbox.load_job nested perf log is emitted alongside the top-level process_job log."""
+    monkeypatch.setenv("PERF_LOGGING_ENABLED", "true")
+
+    job = _FakeJob()
+
+    async def fake_load_job(session: Any, job_id: int) -> Any:
+        return job
+
+    async def fake_run_logic(session: Any, job_obj: Any, provider: Any) -> None:
+        job_obj.status = "done"
+
+    monkeypatch.setattr(ow, "_load_job", fake_load_job)
+    monkeypatch.setattr(ow, "_run_job_logic", fake_run_logic)
+
+    with caplog.at_level(logging.INFO, logger="altegio_bot.perf"):
+        _run(ow.process_job_in_session(_FakeSession(), 1, provider=object()))
+
+    operations = {json.loads(r.message)["operation"] for r in caplog.records}
+    assert "process_job" in operations
+    assert "outbox.load_job" in operations
+
+    load_job_rec = next(
+        json.loads(r.message) for r in caplog.records if json.loads(r.message)["operation"] == "outbox.load_job"
+    )
+    assert load_job_rec["job_id"] == 1
+    assert load_job_rec["component"] == "outbox_worker"
+    assert load_job_rec["job_type"] == "review_3d"
+    assert load_job_rec["company_id"] == 758285
 
 
 def test_outbox_perf_no_outcome_when_job_missing(
@@ -198,8 +253,8 @@ def test_outbox_perf_no_outcome_when_job_missing(
     with caplog.at_level(logging.INFO, logger="altegio_bot.perf"):
         _run(ow.process_job_in_session(_FakeSession(), 99, provider=object()))
 
-    assert len(caplog.records) == 1
-    rec = json.loads(caplog.records[0].message)
+    all_recs = [json.loads(r.message) for r in caplog.records]
+    rec = next(r for r in all_recs if r["operation"] == "process_job")
     assert "outcome" not in rec
     assert rec["job_id"] == 99
 
@@ -324,6 +379,239 @@ def test_wa_inbox_perf_chatwoot_origin(
     assert len(caplog.records) == 1
     rec = json.loads(caplog.records[0].message)
     assert rec["origin"] == "chatwoot"
+
+
+# ---------------------------------------------------------------------------
+# outbox_worker: promo_discount_applied perf coverage
+# ---------------------------------------------------------------------------
+
+
+def test_outbox_perf_promo_meta_send_and_insert_sent(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """promo_discount_applied success path emits outbox.meta_send and outbox.insert_outbox(outbox_status=sent)."""
+    monkeypatch.setenv("PERF_LOGGING_ENABLED", "true")
+
+    job = _FakeJob(
+        job_type="promo_discount_applied",
+        payload={"body": "Hello perf", "phone_e164": "+491234567890"},
+    )
+
+    async def fake_load_job(session: Any, job_id: int) -> Any:
+        return job
+
+    async def fake_find_success(session: Any, job_id: int) -> Any:
+        return None
+
+    async def fake_load_record(session: Any, job_obj: Any) -> Any:
+        return None
+
+    async def fake_load_client(session: Any, job_obj: Any, record: Any) -> Any:
+        return None
+
+    async def fake_apply_rl(session: Any, phone: str) -> Any:
+        return None
+
+    async def fake_pick_sender_id(session: Any, company_id: int, sender_code: str) -> int:
+        return 42
+
+    async def fake_safe_send(**kwargs: Any) -> tuple:
+        return ("msg-perf-001", None)
+
+    monkeypatch.setattr(ow, "_load_job", fake_load_job)
+    monkeypatch.setattr(ow, "_find_success_outbox", fake_find_success)
+    monkeypatch.setattr(ow, "_load_record", fake_load_record)
+    monkeypatch.setattr(ow, "_load_client", fake_load_client)
+    monkeypatch.setattr(ow, "_apply_rate_limit", fake_apply_rl)
+    monkeypatch.setattr(ow, "pick_sender_id", fake_pick_sender_id)
+    monkeypatch.setattr(ow, "safe_send", fake_safe_send)
+
+    with caplog.at_level(logging.INFO, logger="altegio_bot.perf"):
+        _run(ow.process_job_in_session(_FakeSession(), 1, provider=object()))
+
+    ops = {json.loads(r.message)["operation"] for r in caplog.records}
+    assert "outbox.meta_send" in ops
+    assert "outbox.insert_outbox" in ops
+
+    ms_rec = next(
+        json.loads(r.message) for r in caplog.records if json.loads(r.message)["operation"] == "outbox.meta_send"
+    )
+    assert ms_rec["template_code"] == "promo_discount_applied"
+    assert ms_rec["provider_message_id"] == "msg-perf-001"
+    assert "send_error" not in ms_rec
+
+    ins_rec = next(
+        json.loads(r.message) for r in caplog.records if json.loads(r.message)["operation"] == "outbox.insert_outbox"
+    )
+    assert ins_rec["outbox_status"] == "sent"
+
+
+def test_outbox_perf_promo_insert_failed(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """promo_discount_applied failed send emits outbox.meta_send(send_error) and outbox.insert_outbox(status=failed)."""
+    monkeypatch.setenv("PERF_LOGGING_ENABLED", "true")
+
+    job = _FakeJob(
+        job_type="promo_discount_applied",
+        attempts=4,
+        max_attempts=5,
+        payload={"body": "Hello perf", "phone_e164": "+491234567890"},
+    )
+
+    async def fake_load_job(session: Any, job_id: int) -> Any:
+        return job
+
+    async def fake_find_success(session: Any, job_id: int) -> Any:
+        return None
+
+    async def fake_load_record(session: Any, job_obj: Any) -> Any:
+        return None
+
+    async def fake_load_client(session: Any, job_obj: Any, record: Any) -> Any:
+        return None
+
+    async def fake_apply_rl(session: Any, phone: str) -> Any:
+        return None
+
+    async def fake_pick_sender_id(session: Any, company_id: int, sender_code: str) -> int:
+        return 42
+
+    async def fake_safe_send(**kwargs: Any) -> tuple:
+        return (None, "provider error")
+
+    monkeypatch.setattr(ow, "_load_job", fake_load_job)
+    monkeypatch.setattr(ow, "_find_success_outbox", fake_find_success)
+    monkeypatch.setattr(ow, "_load_record", fake_load_record)
+    monkeypatch.setattr(ow, "_load_client", fake_load_client)
+    monkeypatch.setattr(ow, "_apply_rate_limit", fake_apply_rl)
+    monkeypatch.setattr(ow, "pick_sender_id", fake_pick_sender_id)
+    monkeypatch.setattr(ow, "safe_send", fake_safe_send)
+
+    with caplog.at_level(logging.INFO, logger="altegio_bot.perf"):
+        _run(ow.process_job_in_session(_FakeSession(), 1, provider=object()))
+
+    ops = {json.loads(r.message)["operation"] for r in caplog.records}
+    assert "outbox.meta_send" in ops
+    assert "outbox.insert_outbox" in ops
+
+    ms_rec = next(
+        json.loads(r.message) for r in caplog.records if json.loads(r.message)["operation"] == "outbox.meta_send"
+    )
+    assert ms_rec.get("send_error") == "provider error"
+
+    ins_recs = [
+        json.loads(r.message) for r in caplog.records if json.loads(r.message)["operation"] == "outbox.insert_outbox"
+    ]
+    assert any(r["outbox_status"] == "failed" for r in ins_recs)
+
+
+def test_outbox_perf_regular_failed_send_insert_outbox(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Regular send path (err is not None) emits outbox.insert_outbox(outbox_status=failed)."""
+    monkeypatch.setenv("PERF_LOGGING_ENABLED", "true")
+    monkeypatch.setattr(ow.settings, "whatsapp_send_mode", "text")
+
+    job = _FakeJob(job_type="record_updated")
+
+    async def fake_load_job(session: Any, job_id: int) -> Any:
+        return job
+
+    async def fake_find_success(session: Any, job_id: int) -> Any:
+        return None
+
+    async def fake_load_record(session: Any, job_obj: Any) -> Any:
+        return None
+
+    async def fake_load_client(session: Any, job_obj: Any, record: Any) -> Any:
+        return _FakeClient()
+
+    async def fake_apply_rl(session: Any, phone: str) -> Any:
+        return None
+
+    async def fake_render(*args: Any, **kwargs: Any) -> Any:
+        return ("TEXT", 42, "de", {"client_name": "", "sender_id": 42, "sender_code": "default"})
+
+    async def fake_safe_send(*args: Any, **kwargs: Any) -> tuple:
+        return ("msg-fail", "provider error")
+
+    monkeypatch.setattr(ow, "_load_job", fake_load_job)
+    monkeypatch.setattr(ow, "_find_success_outbox", fake_find_success)
+    monkeypatch.setattr(ow, "_load_record", fake_load_record)
+    monkeypatch.setattr(ow, "_load_client", fake_load_client)
+    monkeypatch.setattr(ow, "_apply_rate_limit", fake_apply_rl)
+    monkeypatch.setattr(ow, "_render_message", fake_render)
+    monkeypatch.setattr(ow, "safe_send", fake_safe_send)
+    monkeypatch.setattr(ow, "safe_send_template", fake_safe_send)
+
+    with caplog.at_level(logging.INFO, logger="altegio_bot.perf"):
+        _run(ow.process_job_in_session(_FakeSession(), 1, provider=object()))
+
+    ops = {json.loads(r.message)["operation"] for r in caplog.records}
+    assert "outbox.insert_outbox" in ops
+
+    ins_recs = [
+        json.loads(r.message) for r in caplog.records if json.loads(r.message)["operation"] == "outbox.insert_outbox"
+    ]
+    assert any(r["outbox_status"] == "failed" for r in ins_recs)
+
+
+def test_outbox_perf_regular_success_insert_outbox_fields(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Regular send success emits outbox.insert_outbox with phone_e164 and template_code."""
+    monkeypatch.setenv("PERF_LOGGING_ENABLED", "true")
+    monkeypatch.setattr(ow.settings, "whatsapp_send_mode", "text")
+
+    job = _FakeJob(job_type="record_updated")
+    client = _FakeClient()
+
+    async def fake_load_job(session: Any, job_id: int) -> Any:
+        return job
+
+    async def fake_find_success(session: Any, job_id: int) -> Any:
+        return None
+
+    async def fake_load_record(session: Any, job_obj: Any) -> Any:
+        return None
+
+    async def fake_load_client(session: Any, job_obj: Any, record: Any) -> Any:
+        return client
+
+    async def fake_apply_rl(session: Any, phone: str) -> Any:
+        return None
+
+    async def fake_render(*args: Any, **kwargs: Any) -> Any:
+        return ("TEXT", 42, "de", {"client_name": "", "sender_id": 42, "sender_code": "default"})
+
+    async def fake_safe_send(*args: Any, **kwargs: Any) -> tuple:
+        return ("msg-ok", None)
+
+    monkeypatch.setattr(ow, "_load_job", fake_load_job)
+    monkeypatch.setattr(ow, "_find_success_outbox", fake_find_success)
+    monkeypatch.setattr(ow, "_load_record", fake_load_record)
+    monkeypatch.setattr(ow, "_load_client", fake_load_client)
+    monkeypatch.setattr(ow, "_apply_rate_limit", fake_apply_rl)
+    monkeypatch.setattr(ow, "_render_message", fake_render)
+    monkeypatch.setattr(ow, "safe_send", fake_safe_send)
+    monkeypatch.setattr(ow, "safe_send_template", fake_safe_send)
+
+    with caplog.at_level(logging.INFO, logger="altegio_bot.perf"):
+        _run(ow.process_job_in_session(_FakeSession(), 1, provider=object()))
+
+    ins_recs = [
+        json.loads(r.message) for r in caplog.records if json.loads(r.message)["operation"] == "outbox.insert_outbox"
+    ]
+    assert ins_recs, "outbox.insert_outbox not emitted"
+    sent = next((r for r in ins_recs if r.get("outbox_status") == "sent"), None)
+    assert sent is not None, "no outbox.insert_outbox with outbox_status=sent"
+    assert "phone_e164" in sent
+    assert "template_code" in sent
 
 
 def test_is_chatwoot_origin_none_value() -> None:
