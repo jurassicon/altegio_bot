@@ -193,6 +193,20 @@ class Settings(BaseSettings):
     # Any other value raises ValueError at startup.
     promo_apply_mode: str = "record_price_override"
 
+    # ---------------------------------------------------------------------------
+    # Network-aware promo lead application
+    # ---------------------------------------------------------------------------
+    # When True: if no same-company PromoLead is found for a booking, search for
+    # an active lead across all companies listed in promo_network_company_ids.
+    # Default False: preserves the existing same-company-only behaviour.
+    promo_network_apply_enabled: bool = False
+    # Comma-separated list of Altegio company IDs allowed for cross-company apply.
+    # Both the lead's company and the record's company must be in this list.
+    # If empty while promo_network_apply_enabled=True: cross-company apply is
+    # fail-closed (no discount applied).
+    # Example: PROMO_NETWORK_COMPANY_IDS=758285,1271200
+    promo_network_company_ids: str = ""
+
     @field_validator("promo_apply_mode")
     @classmethod
     def validate_promo_apply_mode(cls, v: str) -> str:
