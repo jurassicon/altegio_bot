@@ -23,6 +23,7 @@ Confirmed Altegio endpoints used elsewhere in this project (NOT this module):
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from collections.abc import Awaitable, Callable
@@ -41,7 +42,9 @@ from altegio_bot.altegio_record_update import (
     fetch_altegio_record_for_update,
     update_altegio_record_price_and_comment,
 )
+from altegio_bot.altegio_records import extract_booking_created_at_from_record_details
 from altegio_bot.models.models import Client, MessageJob, PromoLead, Record, RecordService
+from altegio_bot.perf import perf_log
 from altegio_bot.settings import Settings, settings
 
 _LOCAL_TZ = ZoneInfo("Europe/Belgrade")
@@ -158,6 +161,208 @@ def get_promo_allowed_service_ids() -> set[int]:
             except ValueError:
                 logger.warning("promo_discount: invalid service_id in promo_allowed_service_ids: %r", part)
     return result
+
+
+def get_promo_network_company_ids() -> set[int]:
+    """Parse promo_network_company_ids into a set of int IDs.
+
+    Fail-closed on any invalid value: logs a warning and returns an empty
+    set so cross-company apply is blocked rather than silently allowed.
+    """
+    raw = (settings.promo_network_company_ids or "").strip()
+    if not raw:
+        return set()
+    result: set[int] = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            result.add(int(part))
+        except ValueError:
+            logger.warning(
+                "promo_discount: invalid company_id in promo_network_company_ids: %r — fail-closed",
+                part,
+            )
+            return set()
+    return result
+
+
+def _get_location_id_for_company(company_id: int) -> int | None:
+    """Look up location_id for company_id from promo_location_id_by_company."""
+    try:
+        loc_map = json.loads(settings.promo_location_id_by_company or "{}")
+    except Exception:
+        logger.warning(
+            "promo_discount: invalid JSON in promo_location_id_by_company — fail-closed",
+        )
+        return None
+    val = loc_map.get(str(company_id))
+    if val is None:
+        logger.warning(
+            "promo_discount: no location_id configured for company_id=%d in promo_location_id_by_company",
+            company_id,
+        )
+        return None
+    # bool must be checked before int because bool is a subclass of int.
+    if isinstance(val, bool):
+        logger.warning(
+            "promo_discount: invalid location_id %r (boolean not allowed)"
+            " for company_id=%d in promo_location_id_by_company",
+            val,
+            company_id,
+        )
+        return None
+    if isinstance(val, int):
+        if val <= 0:
+            logger.warning(
+                "promo_discount: invalid location_id %d (must be > 0)"
+                " for company_id=%d in promo_location_id_by_company",
+                val,
+                company_id,
+            )
+            return None
+        return val
+    if isinstance(val, str):
+        try:
+            parsed = int(val)
+        except ValueError:
+            logger.warning(
+                "promo_discount: invalid location_id value %r for company_id=%d in promo_location_id_by_company",
+                val,
+                company_id,
+            )
+            return None
+        if parsed <= 0:
+            logger.warning(
+                "promo_discount: invalid location_id %d (must be > 0)"
+                " for company_id=%d in promo_location_id_by_company",
+                parsed,
+                company_id,
+            )
+            return None
+        return parsed
+    logger.warning(
+        "promo_discount: unexpected location_id type %s for company_id=%d in promo_location_id_by_company",
+        type(val).__name__,
+        company_id,
+    )
+    return None
+
+
+def _get_company_bindings(lead: PromoLead) -> dict:
+    """Return the company_bindings dict from lead.meta, or an empty dict."""
+    meta = lead.meta or {}
+    bindings = meta.get("company_bindings")
+    return bindings if isinstance(bindings, dict) else {}
+
+
+def _set_company_binding(
+    lead: PromoLead,
+    company_id: int,
+    data: dict,
+) -> None:
+    """Write or update a per-company binding entry in lead.meta."""
+    meta = lead.meta or {}
+    bindings = meta.get("company_bindings")
+    if not isinstance(bindings, dict):
+        bindings = {}
+    bindings[str(company_id)] = data
+    lead.meta = {**meta, "company_bindings": bindings}
+
+
+async def ensure_promo_binding_for_record_company(
+    lead: PromoLead,
+    *,
+    company_id: int,
+    phone_e164: str,
+    now: datetime,
+) -> None:
+    """Ensure a per-company binding for company_id exists in lead.meta.
+
+    No-op if the binding already exists.  Attempts client and loyalty card
+    provisioning according to settings, recording errors in meta without
+    blocking record_price_override apply (fail-open for non-critical steps).
+
+    For loyalty_program mode a missing card binding IS a hard block; callers
+    are responsible for checking promo_apply_mode before proceeding.
+    """
+    company_id_str = str(company_id)
+    if company_id_str in _get_company_bindings(lead):
+        return
+
+    binding: dict = {
+        "source": "network_apply",
+        "created_at": now.isoformat(),
+    }
+
+    location_id = _get_location_id_for_company(company_id)
+    if location_id is not None:
+        binding["location_id"] = location_id
+
+    # Client provisioning — gated by promo_altegio_client_api_verified
+    if settings.promo_altegio_client_api_verified:
+        try:
+            from altegio_bot.promo_loyalty import get_or_create_altegio_client
+
+            async with httpx.AsyncClient(timeout=20.0) as _http:
+                client_id = await get_or_create_altegio_client(
+                    _http,
+                    company_id=company_id,
+                    phone_e164=phone_e164,
+                )
+            binding["altegio_client_id"] = client_id
+        except Exception as exc:
+            binding["altegio_client_error"] = str(exc)
+            logger.warning(
+                "promo_discount: client provisioning failed company=%d lead_id=%s: %s",
+                company_id,
+                lead.id,
+                exc,
+            )
+    else:
+        binding["client_provisioning_skipped"] = "promo_altegio_client_api_verified=False"
+
+    # Loyalty card provisioning — gated by promo_issue_loyalty_card_enabled
+    if settings.promo_issue_loyalty_card_enabled:
+        loc_id = binding.get("location_id")
+        card_type_id = settings.promo_loyalty_card_type_id
+        if loc_id and card_type_id:
+            if settings.promo_loyalty_card_api_verified:
+                try:
+                    from altegio_bot.promo_loyalty import (
+                        issue_promo_loyalty_card,
+                    )
+
+                    card = await issue_promo_loyalty_card(
+                        phone_e164=phone_e164,
+                        location_id=int(loc_id),
+                        card_type_id=card_type_id,
+                    )
+                    binding["loyalty_card_id"] = card.loyalty_card_id
+                    binding["loyalty_card_number"] = card.loyalty_card_number
+                    binding["card_type_id"] = card.card_type_id
+                    if card.altegio_client_id is not None:
+                        binding["altegio_client_id"] = card.altegio_client_id
+                except Exception as exc:
+                    binding["loyalty_card_error"] = str(exc)
+                    logger.warning(
+                        "promo_discount: loyalty card failed company=%d lead_id=%s: %s",
+                        company_id,
+                        lead.id,
+                        exc,
+                    )
+            else:
+                binding["loyalty_card_skipped"] = "promo_loyalty_card_api_verified=False"
+        else:
+            binding["loyalty_card_skipped"] = f"missing location_id={loc_id} or card_type_id={card_type_id!r}"
+
+    _set_company_binding(lead, company_id, binding)
+    logger.info(
+        "promo_discount: company binding set company=%d lead_id=%s",
+        company_id,
+        lead.id,
+    )
 
 
 def is_promo_origin_comment(comment: str | None) -> bool:
@@ -543,6 +748,8 @@ async def _apply_via_record_price_override(
     phone_e164: str,
     now: datetime,
     cfg: Settings,
+    *,
+    effective_location_id: int | None = None,
 ) -> None:
     """Apply promo discount by modifying the service price on the Altegio record.
 
@@ -560,10 +767,15 @@ async def _apply_via_record_price_override(
 
     Both cases are idempotent: if the record comment already contains a promo
     marker the function returns without a second PUT.
+
+    effective_location_id overrides lead.location_id for cross-company apply
+    (the record's company may use a different Altegio location than the
+    company where the PromoLead was originally issued).
     """
     meta = lead.meta or {}
 
-    location_id = lead.location_id
+    # Use caller-supplied location for cross-company, fall back to lead field.
+    location_id = effective_location_id if effective_location_id is not None else lead.location_id
     altegio_record_id = record.altegio_record_id
 
     if not location_id or not altegio_record_id:
@@ -914,6 +1126,8 @@ async def _ensure_promo_discount_notification_job(
 
     current_meta = lead.meta or {}
 
+    notification_company_id = record.company_id
+
     if existing is not None:
         lead.meta = {
             **current_meta,
@@ -921,6 +1135,7 @@ async def _ensure_promo_discount_notification_job(
             "customer_notification_job_id": existing.id,
             "customer_notification_created_at": now.isoformat(),
             "customer_notification_dedupe_key": dedupe_key,
+            "customer_notification_company_id": notification_company_id,
         }
         logger.info(
             "promo_discount: notification job already exists job_id=%s lead_id=%s",
@@ -934,7 +1149,7 @@ async def _ensure_promo_discount_notification_job(
     try:
         async with session.begin_nested():
             job = MessageJob(
-                company_id=lead.company_id,
+                company_id=notification_company_id,
                 client_id=client.id,
                 record_id=record.id,
                 job_type="promo_discount_applied",
@@ -962,6 +1177,7 @@ async def _ensure_promo_discount_notification_job(
             "customer_notification_job_id": existing.id,
             "customer_notification_created_at": now.isoformat(),
             "customer_notification_dedupe_key": dedupe_key,
+            "customer_notification_company_id": notification_company_id,
         }
         logger.warning(
             "promo_discount: concurrent insert detected, using existing job_id=%s lead_id=%s",
@@ -976,12 +1192,24 @@ async def _ensure_promo_discount_notification_job(
         "customer_notification_job_id": job.id,
         "customer_notification_created_at": now.isoformat(),
         "customer_notification_dedupe_key": dedupe_key,
+        "customer_notification_company_id": notification_company_id,
     }
     logger.info(
         "promo_discount: queued notification job_id=%s lead_id=%s",
         job.id,
         lead.id,
     )
+
+
+def _lead_same_record(lead: PromoLead, record: Record) -> bool:
+    """Return True if lead is bound to the same Altegio record as record."""
+    by_pk = lead.record_id is not None and record.id is not None and lead.record_id == record.id
+    by_altegio_id = (
+        lead.altegio_record_id is not None
+        and record.altegio_record_id is not None
+        and lead.altegio_record_id == record.altegio_record_id
+    )
+    return by_pk or by_altegio_id
 
 
 async def find_applicable_promo_lead_for_record(
@@ -994,33 +1222,34 @@ async def find_applicable_promo_lead_for_record(
     for_update: bool = False,
     expected_lead_id: int | None = None,
 ) -> PromoLead | None:
-    """Return the most recent active PromoLead eligible for discount application.
+    """Return an active PromoLead eligible for discount application.
 
-    Filters:
-    - company_id matches the booking company (prevents cross-location mismatch)
-    - phone_e164 matches the booking client
-    - campaign_name == settings.promo_campaign_name
-    - status in ('issued', 'booked')
-    - expires_at > now
-    - loyalty_card_id IS NOT NULL
-    - location_id IS NOT NULL
-    - discount_program_id IS NOT NULL
-    - meta.loyalty_card_issued == true
-    - meta.promo_card_deleted_at IS NULL (card not yet cleaned up)
+    Step 1 — same-company lookup (unchanged behaviour):
+      Filters: company_id, phone_e164, campaign_name, status in ('issued',
+      'booked'), not expired, loyalty_card_id/location_id/discount_program_id
+      not null, meta.loyalty_card_issued==true, meta.promo_card_deleted_at
+      null.  Returns the lead if found and the booked-lead guard passes.
 
-    Booked-lead rebinding guard:
-    - A booked lead is only returned when it references the same record as the current
-      booking (lead.record_id == record.id OR lead.altegio_record_id == record.altegio_record_id).
-    - A booked lead bound to a different record is silently skipped to prevent
-      re-attributing the promo to a different booking.
+    Step 2 — network-mode cross-company lookup (promo_network_apply_enabled):
+      If step 1 finds nothing and the setting is True, searches across all
+      company IDs listed in promo_network_company_ids.  Requires both
+      lead.company_id and record.company_id to be in the allowed set.
+      Fail-closed when multiple candidates are found.
+
+    Booked-lead rebinding guard (both steps):
+      A lead in status 'booked' is returned only when it is already bound to
+      the same record (by record_id or altegio_record_id).  A booked lead
+      bound to a different record is silently skipped.
 
     for_update=True locks and refreshes the row for post-I/O revalidation.
-    expected_lead_id restricts revalidation to the same candidate found before I/O.
+    expected_lead_id pins revalidation to the exact candidate found before I/O.
     """
     if not phone_e164:
         return None
 
     campaign = settings.promo_campaign_name
+
+    # ── Step 1: same-company lookup ───────────────────────────────────────────
     stmt = (
         select(PromoLead)
         .where(PromoLead.company_id == company_id)
@@ -1036,10 +1265,8 @@ async def find_applicable_promo_lead_for_record(
         .order_by(PromoLead.created_at.desc())
         .limit(1)
     )
-
     if expected_lead_id is not None:
         stmt = stmt.where(PromoLead.id == expected_lead_id)
-
     if for_update:
         stmt = stmt.with_for_update().execution_options(populate_existing=True)
 
@@ -1047,12 +1274,7 @@ async def find_applicable_promo_lead_for_record(
     lead = result.scalar_one_or_none()
 
     if lead is not None and lead.status == "booked":
-        same_record = (lead.record_id is not None and record.id is not None and lead.record_id == record.id) or (
-            lead.altegio_record_id is not None
-            and record.altegio_record_id is not None
-            and lead.altegio_record_id == record.altegio_record_id
-        )
-        if not same_record:
+        if not _lead_same_record(lead, record):
             logger.warning(
                 "promo_discount: booked lead_id=%s bound to record_id=%s/%s, skipping current record_id=%s/%s",
                 lead.id,
@@ -1061,9 +1283,86 @@ async def find_applicable_promo_lead_for_record(
                 record.id,
                 record.altegio_record_id,
             )
+            lead = None
+
+    if lead is not None:
+        return lead
+
+    # ── Step 2: network-mode cross-company lookup ─────────────────────────────
+    if not settings.promo_network_apply_enabled:
+        return None
+
+    network_ids = get_promo_network_company_ids()
+    if not network_ids:
+        logger.warning(
+            "promo_discount: promo_network_apply_enabled=True but promo_network_company_ids is empty — fail-closed",
+        )
+        return None
+
+    if company_id not in network_ids:
+        logger.info(
+            "promo_discount: record company_id=%d not in network_ids=%s — skipping cross-company lookup",
+            company_id,
+            network_ids,
+        )
+        return None
+
+    cross_stmt = (
+        select(PromoLead)
+        .where(PromoLead.company_id.in_(network_ids))
+        .where(PromoLead.company_id != company_id)  # never return same-company
+        .where(PromoLead.phone_e164 == phone_e164)
+        .where(PromoLead.campaign_name == campaign)
+        .where(PromoLead.status.in_(["issued", "booked"]))
+        .where(PromoLead.expires_at > now)
+        .where(PromoLead.loyalty_card_id.is_not(None))
+        .where(PromoLead.location_id.is_not(None))
+        .where(PromoLead.discount_program_id.is_not(None))
+        .where(PromoLead.meta["loyalty_card_issued"].astext == "true")
+        .where(PromoLead.meta["promo_card_deleted_at"].astext.is_(None))
+    )
+    if expected_lead_id is not None:
+        cross_stmt = cross_stmt.where(PromoLead.id == expected_lead_id)
+    if for_update:
+        cross_stmt = cross_stmt.with_for_update().execution_options(populate_existing=True)
+
+    result = await session.execute(cross_stmt)
+    candidates = list(result.scalars().all())
+
+    if not candidates:
+        return None
+
+    if len(candidates) > 1:
+        logger.warning(
+            "promo_discount: %d active leads in network mode for phone=%s campaign=%s — fail-closed",
+            len(candidates),
+            phone_e164,
+            campaign,
+        )
+        return None
+
+    candidate = candidates[0]
+
+    if candidate.status == "booked":
+        if not _lead_same_record(candidate, record):
+            logger.warning(
+                "promo_discount: booked lead_id=%s bound to record_id=%s/%s,"
+                " skipping current record_id=%s/%s (network)",
+                candidate.id,
+                candidate.record_id,
+                candidate.altegio_record_id,
+                record.id,
+                record.altegio_record_id,
+            )
             return None
 
-    return lead
+    logger.info(
+        "promo_discount: cross-company lead found lead_id=%s lead.company_id=%d record.company_id=%d",
+        candidate.id,
+        candidate.company_id,
+        company_id,
+    )
+    return candidate
 
 
 async def _has_prior_attended_visits(
@@ -1104,6 +1403,7 @@ async def try_apply_promo_discount(
     *,
     booking_created_at: datetime | None = None,
     booking_created_at_resolver: Callable[[], Awaitable[datetime | None]] | None = None,
+    allow_existing_booking_before_promo: bool = False,
 ) -> None:
     """Attempt to apply a promo discount to a newly created Altegio visit.
 
@@ -1233,21 +1533,86 @@ async def try_apply_promo_discount(
         meta = lead.meta or {}
 
     if booking_created_at is None:
-        err = "missing booking created timestamp"
-        lead.meta = {**meta, "apply_skip_reason": err}
-        logger.info("promo_discount: skip lead_id=%s %s", lead.id, err)
-        return
-
-    if booking_created_at < lead.issued_at:
-        err = "booking predates promo lead"
-        lead.meta = {
+        if not allow_existing_booking_before_promo:
+            err = "missing booking created timestamp"
+            lead.meta = {**meta, "apply_skip_reason": err}
+            logger.info("promo_discount: skip lead_id=%s %s", lead.id, err)
+            return
+        # Explicit existing-booking flow: raw timestamp unavailable, proceed without date guard.
+        meta = {**meta, "booking_created_at_missing": True}
+        lead.meta = meta
+    elif booking_created_at < lead.issued_at:
+        if not allow_existing_booking_before_promo:
+            err = "booking predates promo lead"
+            lead.meta = {
+                **meta,
+                "apply_skip_reason": err,
+                "booking_created_at": booking_created_at.isoformat(),
+                "promo_issued_at": lead.issued_at.isoformat(),
+            }
+            logger.info("promo_discount: skip lead_id=%s %s", lead.id, err)
+            return
+        meta = {
             **meta,
-            "apply_skip_reason": err,
+            "booking_created_before_promo_allowed": True,
             "booking_created_at": booking_created_at.isoformat(),
             "promo_issued_at": lead.issued_at.isoformat(),
         }
-        logger.info("promo_discount: skip lead_id=%s %s", lead.id, err)
-        return
+        lead.meta = meta
+
+    # ── 7-pre. Cross-company gate checks (before state transition) ───────────
+    # For cross-company leads, validate location_id and the API gate BEFORE
+    # issuing the issued → booked transition.  This prevents a lead from
+    # becoming 'booked' due to a failed attempt when the apply is impossible.
+    # Same-company leads skip this block (is_cross_company=False) and continue
+    # with unchanged behaviour through steps 7 and 8.
+    is_cross_company = lead.company_id != company_id
+    effective_location_id: int | None = None
+
+    if is_cross_company:
+        # Only record_price_override is supported for cross-company apply.
+        # Check first — cheapest gate, no external calls or lookups.
+        if cfg.promo_apply_mode != "record_price_override":
+            err = (
+                f"cross-company apply not supported for"
+                f" promo_apply_mode={cfg.promo_apply_mode!r}"
+                " — only 'record_price_override' is supported"
+            )
+            lead.meta = {
+                **meta,
+                "discount_apply_error": err,
+                "discount_apply_attempted_at": now.isoformat(),
+            }
+            logger.warning(
+                "promo_discount: unsupported mode %r for cross-company apply lead_id=%s",
+                cfg.promo_apply_mode,
+                lead.id,
+            )
+            return  # lead stays 'issued'
+
+        effective_location_id = _get_location_id_for_company(company_id)
+        if effective_location_id is None:
+            err = (
+                f"cross-company apply: no location_id for"
+                f" record company_id={company_id}"
+                " in promo_location_id_by_company — fail-closed"
+            )
+            lead.meta = {**meta, "apply_skip_reason": err}
+            logger.warning("promo_discount: %s lead_id=%s", err, lead.id)
+            return  # lead stays 'issued'
+
+        if not cfg.promo_apply_discount_api_verified:
+            err = "promo_apply_discount_api_verified=False — cross-company discount apply blocked"
+            lead.meta = {
+                **meta,
+                "discount_apply_error": err,
+                "discount_apply_attempted_at": now.isoformat(),
+            }
+            logger.warning(
+                "promo_discount: api not verified, blocking cross-company apply for lead_id=%s",
+                lead.id,
+            )
+            return  # lead stays 'issued'
 
     # ── 7. Transition issued → booked ─────────────────────────────────────────
     if lead.status == "issued":
@@ -1267,7 +1632,29 @@ async def try_apply_promo_discount(
             record.id,
         )
 
-    # ── 8. API gate ───────────────────────────────────────────────────────────
+    # ── 7b. Cross-company binding (external calls, after API gate) ────────────
+    # ensure_promo_binding_for_record_company may call get_or_create_altegio_client
+    # or issue_promo_loyalty_card — only reached after the API gate passed above.
+    if is_cross_company:
+        await ensure_promo_binding_for_record_company(
+            lead,
+            company_id=company_id,
+            phone_e164=phone_e164,
+            now=now,
+        )
+        meta = lead.meta or {}
+        meta = {
+            **meta,
+            "network_apply": {
+                "source_company_id": lead.company_id,
+                "applied_company_id": company_id,
+                "cross_company": True,
+            },
+        }
+        lead.meta = meta
+
+    # ── 8. API gate (same-company path) ───────────────────────────────────────
+    # Cross-company already checked at step 7-pre; this covers same-company.
     if not cfg.promo_apply_discount_api_verified:
         err = "promo_apply_discount_api_verified=False — discount apply blocked until endpoint is verified"
         lead.meta = {
@@ -1275,15 +1662,43 @@ async def try_apply_promo_discount(
             "discount_apply_error": err,
             "discount_apply_attempted_at": now.isoformat(),
         }
-        logger.warning("promo_discount: api not verified, blocking apply for lead_id=%s", lead.id)
+        logger.warning(
+            "promo_discount: api not verified, blocking apply for lead_id=%s",
+            lead.id,
+        )
         return
 
     # ── 9. Route by apply mode ────────────────────────────────────────────────
     if cfg.promo_apply_mode == "record_price_override":
-        await _apply_via_record_price_override(session, record, lead, client, phone_e164, now, cfg)
+        await _apply_via_record_price_override(
+            session,
+            record,
+            lead,
+            client,
+            phone_e164,
+            now,
+            cfg,
+            effective_location_id=effective_location_id,
+        )
         return
 
     # ── Legacy loyalty-program path ───────────────────────────────────────────
+    # Cross-company apply is not supported here: the lead's loyalty card and
+    # location belong to the source company, not the record's company.
+    if is_cross_company:
+        err = (
+            f"cross-company apply not supported in loyalty_program mode:"
+            f" lead.company_id={lead.company_id}"
+            f" record.company_id={company_id}"
+        )
+        lead.status = "apply_failed"
+        lead.meta = {
+            **meta,
+            "discount_apply_error": err,
+            "discount_apply_attempted_at": now.isoformat(),
+        }
+        logger.warning("promo_discount: %s lead_id=%s", err, lead.id)
+        return
     # ── 10. Validate required fields ─────────────────────────────────────────
     location_id = lead.location_id
     card_id_raw = lead.loyalty_card_id
@@ -1362,3 +1777,244 @@ async def try_apply_promo_discount(
         record.id,
         card_id,
     )
+
+
+async def process_promo_apply_existing_booking_job(
+    session: AsyncSession,
+    job: MessageJob,
+) -> None:
+    """Apply promo discount to a pre-existing future booking.
+
+    Called from outbox_worker for promo_apply_existing_booking jobs.
+    Searches local DB only (no external Altegio API calls) during candidate
+    selection, then calls try_apply_promo_discount for the chosen record.
+
+    Candidate selection:
+      - Fetches up to 50 future non-attended records for this phone.
+      - Filters to those with at least one allowed service (eligible).
+      - Picks the earliest eligible record (by starts_at).
+      - If multiple eligible records share the earliest starts_at → ambiguous → fail-closed.
+
+    Kill switch (promo_apply_existing_booking_enabled=False at execution time):
+      Marks job done immediately, records disabled_by_kill_switch in lead.meta.
+      Does NOT requeue — this is a hard stop, not a temporary gate.
+
+    Defers (status=queued, run_at+10min) when apply rollout gates are disabled,
+    rather than silently marking done and losing the opportunity.
+    """
+    with perf_log("promo_discount", "promo_apply_existing_booking.total", job_id=job.id) as _total_ctx:
+        now = _utcnow()
+        payload = job.payload or {}
+        promo_lead_id = payload.get("promo_lead_id")
+
+        if promo_lead_id is None:
+            job.status = "failed"
+            job.locked_at = None
+            job.last_error = "promo_apply_existing_booking: missing promo_lead_id"
+            return
+
+        stmt = select(PromoLead).where(PromoLead.id == int(promo_lead_id)).with_for_update()
+        result = await session.execute(stmt)
+        lead = result.scalar_one_or_none()
+
+        if lead is None:
+            job.status = "failed"
+            job.locked_at = None
+            job.last_error = f"promo_apply_existing_booking: PromoLead not found id={promo_lead_id}"
+            return
+
+        if lead.status != "issued":
+            job.status = "done"
+            job.locked_at = None
+            job.last_error = None
+            return
+
+        if lead.expires_at <= now:
+            job.status = "done"
+            job.locked_at = None
+            job.last_error = None
+            return
+
+        cfg = settings
+
+        # ── Kill switch: hard stop for already-created jobs ───────────────────
+        # Checked before rollout gates: kill switch → done (not queued).
+        # Rollout gates (below) defer — kill switch does not.
+        if not cfg.promo_apply_existing_booking_enabled:
+            lead.meta = {
+                **(lead.meta or {}),
+                "existing_booking_apply_result": "disabled_by_kill_switch",
+                "existing_booking_apply_skip_reason": "promo_apply_existing_booking_enabled=False",
+                "existing_booking_apply_checked_at": now.isoformat(),
+            }
+            job.status = "done"
+            job.locked_at = None
+            job.last_error = None
+            logger.info(
+                "promo_apply_existing_booking: kill switch active, marking done job_id=%s lead_id=%s",
+                job.id,
+                lead.id,
+            )
+            return
+
+        # ── Rollout gates: defer instead of silently dropping ─────────────────
+        if not cfg.promo_apply_discount_enabled:
+            job.status = "queued"
+            job.locked_at = None
+            job.run_at = now + timedelta(minutes=10)
+            logger.info(
+                "promo_apply_existing_booking: promo_apply_discount_enabled=False, deferring job_id=%s",
+                job.id,
+            )
+            return
+
+        if not cfg.promo_apply_discount_api_verified:
+            job.status = "queued"
+            job.locked_at = None
+            job.run_at = now + timedelta(minutes=10)
+            logger.info(
+                "promo_apply_existing_booking: promo_apply_discount_api_verified=False, deferring job_id=%s",
+                job.id,
+            )
+            return
+
+        # Fail-closed: empty allowlist means no automatic apply.
+        allowed_service_ids = get_promo_allowed_service_ids()
+        if not allowed_service_ids:
+            lead.meta = {**(lead.meta or {}), "existing_booking_skip_reason": "service_allowlist_empty"}
+            job.status = "done"
+            job.locked_at = None
+            job.last_error = None
+            return
+
+        phone_e164 = lead.phone_e164
+        variants = _phone_variants(phone_e164)
+
+        # Determine company scope: same-company by default, network if enabled.
+        if cfg.promo_network_apply_enabled:
+            network_ids = get_promo_network_company_ids()
+            if network_ids and lead.company_id in network_ids:
+                company_filter = Record.company_id.in_(network_ids)
+            else:
+                company_filter = Record.company_id == lead.company_id
+        else:
+            company_filter = Record.company_id == lead.company_id
+
+        # ── Find candidates ────────────────────────────────────────────────────
+        seen_count = 0
+        eligible_count = 0
+        candidate: Record | None = None
+        with perf_log("promo_discount", "promo_apply_existing_booking.find_candidates", job_id=job.id) as _fc_ctx:
+            cand_stmt = (
+                select(Record)
+                .join(Client, Client.id == Record.client_id)
+                .where(Client.phone_e164.in_(variants))
+                .where(company_filter)
+                .where(Record.is_deleted.is_(False))
+                .where(Record.starts_at > now)
+                .where(or_(Record.attendance.is_(None), Record.attendance != 1))
+                .where(or_(Record.visit_attendance.is_(None), Record.visit_attendance != 1))
+                .order_by(Record.starts_at.asc(), Record.id.asc())
+                .limit(50)
+            )
+            result = await session.execute(cand_stmt)
+            seen_records = list(result.scalars().all())
+            seen_count = len(seen_records)
+            _fc_ctx["seen_records"] = seen_count
+            _total_ctx["seen_records"] = seen_count
+
+            if not seen_records:
+                lead.meta = {**(lead.meta or {}), "existing_booking_skip_reason": "no_future_booking"}
+                job.status = "done"
+                job.locked_at = None
+                job.last_error = None
+                return
+
+            # Filter: keep only records that have at least one allowed service (eligible).
+            eligible: list[Record] = []
+            for rec in seen_records:
+                service_ids = await _get_record_service_ids(session, rec.id)
+                if service_ids.intersection(allowed_service_ids):
+                    eligible.append(rec)
+
+            eligible_count = len(eligible)
+            _fc_ctx["eligible_records"] = eligible_count
+            _total_ctx["eligible_records"] = eligible_count
+
+            if not eligible:
+                lead.meta = {
+                    **(lead.meta or {}),
+                    "existing_booking_skip_reason": "service_not_allowed",
+                    "existing_booking_seen_records": seen_count,
+                }
+                job.status = "done"
+                job.locked_at = None
+                job.last_error = None
+                return
+
+            # Ambiguity: multiple eligible records sharing the earliest starts_at → fail-closed.
+            earliest_starts_at = eligible[0].starts_at
+            top_eligible = [r for r in eligible if r.starts_at == earliest_starts_at]
+
+            if len(top_eligible) > 1:
+                candidate_ids = [r.id for r in top_eligible]
+                lead.meta = {
+                    **(lead.meta or {}),
+                    "existing_booking_skip_reason": "ambiguous_candidates",
+                    "existing_booking_seen_records": seen_count,
+                    "existing_booking_eligible_records": eligible_count,
+                    "existing_booking_candidate_ids": candidate_ids,
+                }
+                job.status = "done"
+                job.locked_at = None
+                job.last_error = "promo_apply_existing_booking: ambiguous eligible candidates (same starts_at)"
+                return
+
+            candidate = top_eligible[0]
+
+        booking_created_at = extract_booking_created_at_from_record_details(candidate.raw or {})
+
+        # ── Apply discount ─────────────────────────────────────────────────────
+        lead_status_before = lead.status
+        result_label = "unknown"
+        with perf_log("promo_discount", "promo_apply_existing_booking.apply", job_id=job.id) as _ap_ctx:
+            _ap_ctx["record_id"] = candidate.id
+            _ap_ctx["booking_created_at_missing"] = booking_created_at is None
+
+            await try_apply_promo_discount(
+                session,
+                candidate,
+                candidate.company_id,
+                booking_created_at=booking_created_at,
+                allow_existing_booking_before_promo=True,
+            )
+
+            # ── Outcome tracking ───────────────────────────────────────────────
+            lead_status_after = lead.status
+            if lead_status_after == "applied":
+                result_label = "applied"
+            elif lead_status_after == "booked":
+                result_label = "booked_manual_review"
+            elif lead_status_after == "apply_failed":
+                result_label = "apply_failed"
+            elif lead_status_after == lead_status_before:
+                result_label = "skipped"
+            else:
+                result_label = f"status_changed:{lead_status_before}->{lead_status_after}"
+
+            _ap_ctx["result"] = result_label
+            _total_ctx["result"] = result_label
+
+        lead.meta = {
+            **(lead.meta or {}),
+            "existing_booking_apply_result": result_label,
+            "existing_booking_apply_record_id": candidate.id,
+            "existing_booking_apply_altegio_record_id": candidate.altegio_record_id,
+            "existing_booking_seen_records": seen_count,
+            "existing_booking_eligible_records": eligible_count,
+            "existing_booking_candidate_ids": [candidate.id],
+        }
+
+        job.status = "done"
+        job.locked_at = None
+        job.last_error = None

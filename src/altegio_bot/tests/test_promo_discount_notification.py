@@ -194,6 +194,7 @@ class FakePromoLead:
 class FakeRecord:
     id: int
     altegio_record_id: int | None = None
+    company_id: int = _COMPANY
 
 
 class FakeSession:
@@ -834,3 +835,1164 @@ def test_outbox_worker_missing_body_reconciles_lead(monkeypatch: Any) -> None:
     assert "missing body" in (job.last_error or "")
     assert fake_lead.meta.get("customer_notification") == "failed"
     assert fake_lead.meta.get("customer_notification_failed_at") is not None
+
+
+# ===========================================================================
+# Network-aware promo lead application tests (cross-company apply)
+#
+# Tests N1–N10 cover the network-aware behavior introduced for the Yasmine
+# production incident: PromoLead issued in company 1271200, booking created
+# in company 758285 (Karlsruhe).
+# ===========================================================================
+
+# --- Constants ---------------------------------------------------------------
+
+_COMPANY_SRC = 1271200  # company where the PromoLead was originally issued
+_COMPANY_DST = 758285  # company where the booking record was created
+_LOCATION_DST = 9002  # Altegio location_id for _COMPANY_DST
+_CROSS_PHONE = "+4915777903655"  # Yasmine's phone (different from _PHONE)
+_CROSS_ALTEGIO_REC_ID = 8888
+_NETWORK_IDS = f"{_COMPANY_SRC},{_COMPANY_DST}"
+_NETWORK_LOC_MAP = f'{{"{_COMPANY_DST}": {_LOCATION_DST}}}'
+
+# Fake Altegio GET /record response used by price-override path mocks.
+_FAKE_ALTEGIO_RECORD: dict = {
+    "id": _CROSS_ALTEGIO_REC_ID,
+    "attendance": 0,
+    "visit_attendance": 0,
+    "comment": "",
+    "services": [{"id": _ALLOWED_SERVICE, "cost": 100.0, "manual_cost": 100.0}],
+}
+
+
+# --- Helpers -----------------------------------------------------------------
+
+
+def _network_settings_ctx(**overrides):
+    """Settings context for cross-company tests (record_price_override mode)."""
+    import contextlib
+
+    defaults = {
+        "promo_apply_discount_enabled": True,
+        "promo_apply_discount_api_verified": True,
+        "promo_allowed_service_ids": str(_ALLOWED_SERVICE),
+        "promo_apply_mode": "record_price_override",
+        "promo_network_apply_enabled": True,
+        "promo_network_company_ids": _NETWORK_IDS,
+        "promo_location_id_by_company": _NETWORK_LOC_MAP,
+        "promo_altegio_client_api_verified": False,
+        "promo_issue_loyalty_card_enabled": False,
+    }
+    defaults.update(overrides)
+    patches = [patch.object(settings, k, v) for k, v in defaults.items()]
+
+    @contextlib.contextmanager
+    def _ctx():
+        import contextlib as _cl
+
+        with _cl.ExitStack() as stack:
+            for p in patches:
+                stack.enter_context(p)
+            yield
+
+    return _ctx()
+
+
+async def _seed_cross_client(session, *, client_id: int = 300, phone: str = _CROSS_PHONE) -> Client:
+    c = Client(
+        id=client_id,
+        company_id=_COMPANY_DST,
+        altegio_client_id=client_id,
+        phone_e164=phone,
+        display_name="Yasmine",
+        raw={},
+    )
+    session.add(c)
+    await session.flush()
+    return c
+
+
+async def _seed_cross_record(
+    session,
+    *,
+    record_id: int = 400,
+    client_id: int = 300,
+    altegio_record_id: int = _CROSS_ALTEGIO_REC_ID,
+) -> Record:
+    r = Record(
+        id=record_id,
+        company_id=_COMPANY_DST,
+        altegio_record_id=altegio_record_id,
+        client_id=client_id,
+        altegio_client_id=client_id,
+        is_deleted=False,
+        starts_at=_NOW,
+        raw={},
+    )
+    session.add(r)
+    await session.flush()
+    return r
+
+
+def _make_cross_lead(**overrides) -> PromoLead:
+    kwargs = dict(
+        company_id=_COMPANY_SRC,
+        phone_e164=_CROSS_PHONE,
+        campaign_name="welcome_discount",
+        secret_code="sommer",
+        discount_amount=Decimal("15"),
+        discount_type="fixed",
+        status="issued",
+        issued_at=datetime(2026, 1, 1, tzinfo=_UTC),
+        expires_at=_FUTURE,
+        loyalty_card_id="cross_card_001",
+        loyalty_card_number="1234",
+        location_id=_LOCATION,  # source-company location
+        discount_program_id="dp_cross",
+        meta={"loyalty_card_issued": True},
+    )
+    kwargs.update(overrides)
+    return PromoLead(**kwargs)
+
+
+# --- N1. Yasmine regression: cross-company lead applied ----------------------
+
+
+@pytest.mark.asyncio
+async def test_network_cross_company_lead_applied(session_maker) -> None:
+    """N1 (Yasmine regression): lead in 1271200, record in 758285, both in network list
+    → lead found cross-company, applied, meta.network_apply.cross_company=True, job created.
+    """
+    mock_fetch = AsyncMock(return_value=_FAKE_ALTEGIO_RECORD)
+    mock_put = AsyncMock(return_value={"data": {"services": []}})
+
+    lead_id: int | None = None
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_cross_client(session)
+            record = await _seed_cross_record(session)
+            session.add(
+                RecordService(
+                    record_id=record.id,
+                    service_id=_ALLOWED_SERVICE,
+                    title="Lash",
+                    raw={},
+                )
+            )
+            lead = _make_cross_lead()
+            session.add(lead)
+            await session.flush()
+            lead_id = lead.id
+
+            with (
+                patch(
+                    "altegio_bot.promo_discount_apply.fetch_altegio_record_for_update",
+                    mock_fetch,
+                ),
+                patch(
+                    "altegio_bot.promo_discount_apply.update_altegio_record_price_and_comment",
+                    mock_put,
+                ),
+                _network_settings_ctx(),
+            ):
+                await try_apply_promo_discount(
+                    session,
+                    record,
+                    _COMPANY_DST,
+                    booking_created_at=_NOW,
+                )
+
+    async with session_maker() as s:
+        lead = (await s.execute(select(PromoLead).where(PromoLead.id == lead_id))).scalar_one()
+        job = (
+            await s.execute(select(MessageJob).where(MessageJob.job_type == "promo_discount_applied"))
+        ).scalar_one_or_none()
+
+    meta = lead.meta or {}
+    network_apply = meta.get("network_apply", {})
+
+    assert lead.status in ("applied", "booked"), f"expected applied or booked, got {lead.status!r}"
+    assert lead.record_id == record.id
+    assert lead.altegio_record_id == _CROSS_ALTEGIO_REC_ID
+    assert network_apply.get("cross_company") is True
+    assert network_apply.get("source_company_id") == _COMPANY_SRC
+    assert network_apply.get("applied_company_id") == _COMPANY_DST
+    # Notification job created (simple case: 1 same-day record, 1 service)
+    assert job is not None, "promo_discount_applied job must be created"
+    # job.company_id must match the record's company (758285), not the lead's (1271200)
+    assert job.company_id == _COMPANY_DST
+
+    async with session_maker() as s:
+        leads = (await s.execute(select(PromoLead))).scalars().all()
+    assert len(leads) == 1, f"expected 1 PromoLead, got {len(leads)}"
+
+
+# --- N2. Cross-company disabled → no apply -----------------------------------
+
+
+@pytest.mark.asyncio
+async def test_network_disabled_cross_company_not_applied(session_maker) -> None:
+    """N2: promo_network_apply_enabled=False → lead in 1271200 not found for
+    record in 758285.  Status stays 'issued', no notification job.
+    """
+    mock_fetch = AsyncMock(side_effect=RuntimeError("must not call fetch"))
+    mock_put = AsyncMock(side_effect=RuntimeError("must not call PUT"))
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_cross_client(session)
+            record = await _seed_cross_record(session)
+            session.add(
+                RecordService(
+                    record_id=record.id,
+                    service_id=_ALLOWED_SERVICE,
+                    title="Lash",
+                    raw={},
+                )
+            )
+            lead = _make_cross_lead()
+            session.add(lead)
+            await session.flush()
+
+            with (
+                patch(
+                    "altegio_bot.promo_discount_apply.fetch_altegio_record_for_update",
+                    mock_fetch,
+                ),
+                patch(
+                    "altegio_bot.promo_discount_apply.update_altegio_record_price_and_comment",
+                    mock_put,
+                ),
+                _network_settings_ctx(promo_network_apply_enabled=False),
+            ):
+                await try_apply_promo_discount(
+                    session,
+                    record,
+                    _COMPANY_DST,
+                    booking_created_at=_NOW,
+                )
+
+    async with session_maker() as s:
+        lead_db = (await s.execute(select(PromoLead))).scalar_one()
+        job = (
+            await s.execute(select(MessageJob).where(MessageJob.job_type == "promo_discount_applied"))
+        ).scalar_one_or_none()
+
+    assert lead_db.status == "issued"
+    assert job is None
+
+
+# --- N3. Same-company behavior unchanged when network mode on ----------------
+
+
+@pytest.mark.asyncio
+async def test_network_same_company_behavior_unchanged(session_maker) -> None:
+    """N3: same-company lead is still found and applied even when network mode enabled."""
+    mock_api = AsyncMock(return_value=PromoDiscountApplyResult(applied=True, raw={"success": True}))
+
+    lead_id: int | None = None
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_client(session)
+            record = await _seed_record(session, altegio_record_id=777)
+            await _seed_service(session)
+            lead = _make_lead()
+            session.add(lead)
+            await session.flush()
+            lead_id = lead.id
+
+            with patch(
+                "altegio_bot.promo_discount_apply.apply_promo_discount_to_visit",
+                mock_api,
+            ):
+                with _base_settings_ctx(
+                    promo_network_apply_enabled=True,
+                    promo_network_company_ids=str(_COMPANY),
+                ):
+                    await try_apply_promo_discount(session, record, _COMPANY, booking_created_at=_NOW)
+
+    async with session_maker() as s:
+        lead = (await s.execute(select(PromoLead).where(PromoLead.id == lead_id))).scalar_one()
+
+    assert lead.status == "applied"
+
+
+# --- N4. Record company not in allowed network list --------------------------
+
+
+@pytest.mark.asyncio
+async def test_network_record_company_not_in_allowed_list(session_maker) -> None:
+    """N4: record.company_id absent from promo_network_company_ids → apply skipped."""
+    mock_fetch = AsyncMock(side_effect=RuntimeError("must not call fetch"))
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_cross_client(session)
+            record = await _seed_cross_record(session)
+            session.add(
+                RecordService(
+                    record_id=record.id,
+                    service_id=_ALLOWED_SERVICE,
+                    title="Lash",
+                    raw={},
+                )
+            )
+            lead = _make_cross_lead()
+            session.add(lead)
+            await session.flush()
+
+            # _COMPANY_DST (758285) intentionally absent
+            with (
+                patch(
+                    "altegio_bot.promo_discount_apply.fetch_altegio_record_for_update",
+                    mock_fetch,
+                ),
+                _network_settings_ctx(promo_network_company_ids=str(_COMPANY_SRC)),
+            ):
+                await try_apply_promo_discount(
+                    session,
+                    record,
+                    _COMPANY_DST,
+                    booking_created_at=_NOW,
+                )
+
+    async with session_maker() as s:
+        lead_db = (await s.execute(select(PromoLead))).scalar_one()
+        job = (
+            await s.execute(select(MessageJob).where(MessageJob.job_type == "promo_discount_applied"))
+        ).scalar_one_or_none()
+
+    assert lead_db.status == "issued"
+    assert job is None
+
+
+# --- N5. Multiple active leads → fail-closed (unit test via mock session) ----
+
+
+def test_network_multiple_candidates_fail_closed() -> None:
+    """N5: multiple active leads in network scope → fail-closed, returns None."""
+    from unittest.mock import MagicMock
+
+    from altegio_bot.promo_discount_apply import find_applicable_promo_lead_for_record
+
+    lead1 = MagicMock(spec=PromoLead)
+    lead1.id = 10
+    lead1.company_id = _COMPANY_SRC
+    lead1.status = "issued"
+
+    lead2 = MagicMock(spec=PromoLead)
+    lead2.id = 11
+    lead2.company_id = _COMPANY_DST
+    lead2.status = "issued"
+
+    _call_n: dict = {"n": 0}
+
+    class _ScalarResult:
+        def __init__(self, items: list) -> None:
+            self._items = items
+
+        def scalar_one_or_none(self) -> None:
+            return None
+
+        def scalars(self) -> "_ScalarResult":
+            return self
+
+        def all(self) -> list:
+            return self._items
+
+    class _FakeSession:
+        async def execute(self, _stmt: object) -> _ScalarResult:
+            _call_n["n"] += 1
+            # First execute = same-company query → empty
+            # Second execute = cross-company query → two candidates
+            return _ScalarResult([] if _call_n["n"] == 1 else [lead1, lead2])
+
+    record = MagicMock(spec=Record)
+    record.id = 200
+    record.altegio_record_id = _CROSS_ALTEGIO_REC_ID
+
+    with (
+        patch.object(settings, "promo_network_apply_enabled", True),
+        patch.object(settings, "promo_network_company_ids", _NETWORK_IDS),
+    ):
+        result = _run(
+            find_applicable_promo_lead_for_record(
+                _FakeSession(),  # type: ignore[arg-type]
+                company_id=_COMPANY_DST,
+                phone_e164=_CROSS_PHONE,
+                now=_NOW,
+                record=record,
+            )
+        )
+
+    assert result is None, "must fail-closed when multiple candidates found"
+
+
+# --- N6. Booked lead already bound to a different record ---------------------
+
+
+@pytest.mark.asyncio
+async def test_network_booked_lead_different_record_skipped(
+    session_maker,
+) -> None:
+    """N6: booked cross-company lead bound to record 8888, current record 8889 → skipped."""
+    mock_fetch = AsyncMock(side_effect=RuntimeError("must not call fetch"))
+
+    _other_altegio_id = 8889
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_cross_client(session)
+            record = await _seed_cross_record(
+                session,
+                record_id=401,
+                altegio_record_id=_other_altegio_id,
+            )
+            session.add(
+                RecordService(
+                    record_id=record.id,
+                    service_id=_ALLOWED_SERVICE,
+                    title="Lash",
+                    raw={},
+                )
+            )
+            # Lead already booked to a DIFFERENT altegio_record_id (8888 ≠ 8889).
+            # record_id=None so no FK constraint fires; the mismatch is on
+            # altegio_record_id alone.
+            lead = _make_cross_lead(
+                status="booked",
+                altegio_record_id=_CROSS_ALTEGIO_REC_ID,  # 8888 ≠ 8889
+            )
+            session.add(lead)
+            await session.flush()
+
+            with (
+                patch(
+                    "altegio_bot.promo_discount_apply.fetch_altegio_record_for_update",
+                    mock_fetch,
+                ),
+                _network_settings_ctx(),
+            ):
+                await try_apply_promo_discount(
+                    session,
+                    record,
+                    _COMPANY_DST,
+                    booking_created_at=_NOW,
+                )
+
+    async with session_maker() as s:
+        lead_db = (await s.execute(select(PromoLead))).scalar_one()
+        job = (
+            await s.execute(select(MessageJob).where(MessageJob.job_type == "promo_discount_applied"))
+        ).scalar_one_or_none()
+
+    assert lead_db.status == "booked"
+    assert job is None
+
+
+# --- N7. Service not allowed even in network mode ----------------------------
+
+
+@pytest.mark.asyncio
+async def test_network_service_not_allowed_skipped(session_maker) -> None:
+    """N7: cross-company lead found, but record service not in allowlist → no apply."""
+    mock_fetch = AsyncMock(side_effect=RuntimeError("must not call fetch"))
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_cross_client(session)
+            record = await _seed_cross_record(session)
+            session.add(
+                RecordService(
+                    record_id=record.id,
+                    service_id=_OTHER_SERVICE,  # not in allowlist
+                    title="Other",
+                    raw={},
+                )
+            )
+            lead = _make_cross_lead()
+            session.add(lead)
+            await session.flush()
+
+            with (
+                patch(
+                    "altegio_bot.promo_discount_apply.fetch_altegio_record_for_update",
+                    mock_fetch,
+                ),
+                _network_settings_ctx(),
+            ):
+                await try_apply_promo_discount(
+                    session,
+                    record,
+                    _COMPANY_DST,
+                    booking_created_at=_NOW,
+                )
+
+    async with session_maker() as s:
+        lead_db = (await s.execute(select(PromoLead))).scalar_one()
+
+    assert lead_db.status == "issued"
+
+
+# --- N8. Booking predates promo lead -----------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_network_booking_predates_promo_skipped(session_maker) -> None:
+    """N8: booking_created_at before lead.issued_at → apply skipped."""
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_cross_client(session)
+            record = await _seed_cross_record(session)
+            session.add(
+                RecordService(
+                    record_id=record.id,
+                    service_id=_ALLOWED_SERVICE,
+                    title="Lash",
+                    raw={},
+                )
+            )
+            # issued_at is AFTER _NOW → booking predates promo
+            lead = _make_cross_lead(issued_at=datetime(2026, 6, 1, tzinfo=_UTC))
+            session.add(lead)
+            await session.flush()
+
+            with _network_settings_ctx():
+                await try_apply_promo_discount(
+                    session,
+                    record,
+                    _COMPANY_DST,
+                    booking_created_at=_NOW,
+                )
+
+    async with session_maker() as s:
+        lead_db = (await s.execute(select(PromoLead))).scalar_one()
+
+    assert lead_db.status == "issued"
+    assert (lead_db.meta or {}).get("apply_skip_reason") == "booking predates promo lead"
+
+
+# --- N9. Client provisioning: not verified → skipped; verified → called ------
+
+
+@pytest.mark.asyncio
+async def test_network_client_provisioning_not_called_when_not_verified(
+    session_maker,
+) -> None:
+    """N9a: promo_altegio_client_api_verified=False → client API not called,
+    binding records client_provisioning_skipped.
+    """
+    mock_fetch = AsyncMock(return_value=_FAKE_ALTEGIO_RECORD)
+    mock_put = AsyncMock(return_value={"data": {"services": []}})
+    mock_client_api = AsyncMock(side_effect=RuntimeError("must not call client API"))
+
+    lead_id: int | None = None
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_cross_client(session)
+            record = await _seed_cross_record(session)
+            session.add(
+                RecordService(
+                    record_id=record.id,
+                    service_id=_ALLOWED_SERVICE,
+                    title="Lash",
+                    raw={},
+                )
+            )
+            lead = _make_cross_lead()
+            session.add(lead)
+            await session.flush()
+            lead_id = lead.id
+
+            with (
+                patch(
+                    "altegio_bot.promo_discount_apply.fetch_altegio_record_for_update",
+                    mock_fetch,
+                ),
+                patch(
+                    "altegio_bot.promo_discount_apply.update_altegio_record_price_and_comment",
+                    mock_put,
+                ),
+                patch(
+                    "altegio_bot.promo_loyalty.get_or_create_altegio_client",
+                    mock_client_api,
+                ),
+                _network_settings_ctx(promo_altegio_client_api_verified=False),
+            ):
+                await try_apply_promo_discount(
+                    session,
+                    record,
+                    _COMPANY_DST,
+                    booking_created_at=_NOW,
+                )
+
+    mock_client_api.assert_not_called()
+
+    async with session_maker() as s:
+        lead = (await s.execute(select(PromoLead).where(PromoLead.id == lead_id))).scalar_one()
+
+    bindings = (lead.meta or {}).get("company_bindings", {})
+    binding = bindings.get(str(_COMPANY_DST), {})
+    assert binding.get("client_provisioning_skipped") == ("promo_altegio_client_api_verified=False")
+
+
+@pytest.mark.asyncio
+async def test_network_client_provisioning_called_when_verified(
+    session_maker,
+) -> None:
+    """N9b: promo_altegio_client_api_verified=True → helper called for record company,
+    altegio_client_id stored in company_bindings.
+    """
+    mock_fetch = AsyncMock(return_value=_FAKE_ALTEGIO_RECORD)
+    mock_put = AsyncMock(return_value={"data": {"services": []}})
+    mock_client_api = AsyncMock(return_value=182334954)
+
+    lead_id: int | None = None
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_cross_client(session)
+            record = await _seed_cross_record(session)
+            session.add(
+                RecordService(
+                    record_id=record.id,
+                    service_id=_ALLOWED_SERVICE,
+                    title="Lash",
+                    raw={},
+                )
+            )
+            lead = _make_cross_lead()
+            session.add(lead)
+            await session.flush()
+            lead_id = lead.id
+
+            with (
+                patch(
+                    "altegio_bot.promo_discount_apply.fetch_altegio_record_for_update",
+                    mock_fetch,
+                ),
+                patch(
+                    "altegio_bot.promo_discount_apply.update_altegio_record_price_and_comment",
+                    mock_put,
+                ),
+                patch(
+                    "altegio_bot.promo_loyalty.get_or_create_altegio_client",
+                    mock_client_api,
+                ),
+                _network_settings_ctx(promo_altegio_client_api_verified=True),
+            ):
+                await try_apply_promo_discount(
+                    session,
+                    record,
+                    _COMPANY_DST,
+                    booking_created_at=_NOW,
+                )
+
+    async with session_maker() as s:
+        lead = (await s.execute(select(PromoLead).where(PromoLead.id == lead_id))).scalar_one()
+
+    bindings = (lead.meta or {}).get("company_bindings", {})
+    binding = bindings.get(str(_COMPANY_DST), {})
+    assert binding.get("altegio_client_id") == 182334954
+
+
+# --- N10. Loyalty card provisioning ------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_network_loyalty_card_not_reissued_if_binding_exists(
+    session_maker,
+) -> None:
+    """N10a: company_bindings already has an entry → loyalty card not re-issued."""
+    mock_fetch = AsyncMock(return_value=_FAKE_ALTEGIO_RECORD)
+    mock_put = AsyncMock(return_value={"data": {"services": []}})
+    mock_card = AsyncMock(side_effect=RuntimeError("must not re-issue card"))
+
+    existing_bindings = {
+        str(_COMPANY_DST): {
+            "altegio_client_id": 182334954,
+            "loyalty_card_id": "existing_card",
+            "loyalty_card_number": "1234",
+            "location_id": _LOCATION_DST,
+            "source": "network_apply",
+        }
+    }
+
+    lead_id: int | None = None
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_cross_client(session)
+            record = await _seed_cross_record(session)
+            session.add(
+                RecordService(
+                    record_id=record.id,
+                    service_id=_ALLOWED_SERVICE,
+                    title="Lash",
+                    raw={},
+                )
+            )
+            lead = _make_cross_lead(
+                meta={
+                    "loyalty_card_issued": True,
+                    "company_bindings": existing_bindings,
+                }
+            )
+            session.add(lead)
+            await session.flush()
+            lead_id = lead.id
+
+            with (
+                patch(
+                    "altegio_bot.promo_discount_apply.fetch_altegio_record_for_update",
+                    mock_fetch,
+                ),
+                patch(
+                    "altegio_bot.promo_discount_apply.update_altegio_record_price_and_comment",
+                    mock_put,
+                ),
+                patch(
+                    "altegio_bot.promo_loyalty.issue_promo_loyalty_card",
+                    mock_card,
+                ),
+                _network_settings_ctx(
+                    promo_issue_loyalty_card_enabled=True,
+                    promo_loyalty_card_api_verified=True,
+                    promo_loyalty_card_type_id="ctype_001",
+                ),
+            ):
+                await try_apply_promo_discount(
+                    session,
+                    record,
+                    _COMPANY_DST,
+                    booking_created_at=_NOW,
+                )
+
+    mock_card.assert_not_called()
+
+    async with session_maker() as s:
+        lead = (await s.execute(select(PromoLead).where(PromoLead.id == lead_id))).scalar_one()
+
+    # Binding must still have the original data (not overwritten)
+    bindings = (lead.meta or {}).get("company_bindings", {})
+    assert bindings.get(str(_COMPANY_DST), {}).get("loyalty_card_id") == ("existing_card")
+
+
+@pytest.mark.asyncio
+async def test_network_loyalty_card_provisioned_when_enabled(
+    session_maker,
+) -> None:
+    """N10b: no existing binding + card issuance enabled → mock called, card stored."""
+    from altegio_bot.promo_loyalty import LoyaltyCardResult
+
+    mock_fetch = AsyncMock(return_value=_FAKE_ALTEGIO_RECORD)
+    mock_put = AsyncMock(return_value={"data": {"services": []}})
+    mock_card = AsyncMock(
+        return_value=LoyaltyCardResult(
+            loyalty_card_id="new_card_001",
+            loyalty_card_number="9999",
+            card_type_id="ctype_001",
+        )
+    )
+
+    lead_id: int | None = None
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_cross_client(session)
+            record = await _seed_cross_record(session)
+            session.add(
+                RecordService(
+                    record_id=record.id,
+                    service_id=_ALLOWED_SERVICE,
+                    title="Lash",
+                    raw={},
+                )
+            )
+            lead = _make_cross_lead()
+            session.add(lead)
+            await session.flush()
+            lead_id = lead.id
+
+            with (
+                patch(
+                    "altegio_bot.promo_discount_apply.fetch_altegio_record_for_update",
+                    mock_fetch,
+                ),
+                patch(
+                    "altegio_bot.promo_discount_apply.update_altegio_record_price_and_comment",
+                    mock_put,
+                ),
+                patch(
+                    "altegio_bot.promo_loyalty.issue_promo_loyalty_card",
+                    mock_card,
+                ),
+                _network_settings_ctx(
+                    promo_altegio_client_api_verified=False,
+                    promo_issue_loyalty_card_enabled=True,
+                    promo_loyalty_card_api_verified=True,
+                    promo_loyalty_card_type_id="ctype_001",
+                ),
+            ):
+                await try_apply_promo_discount(
+                    session,
+                    record,
+                    _COMPANY_DST,
+                    booking_created_at=_NOW,
+                )
+
+    mock_card.assert_called_once()
+
+    async with session_maker() as s:
+        lead = (await s.execute(select(PromoLead).where(PromoLead.id == lead_id))).scalar_one()
+
+    bindings = (lead.meta or {}).get("company_bindings", {})
+    binding = bindings.get(str(_COMPANY_DST), {})
+    assert binding.get("loyalty_card_id") == "new_card_001"
+    assert binding.get("loyalty_card_number") == "9999"
+
+
+# --- A+B. Same-company incomplete lead must not apply via network fallback ----
+
+
+@pytest.mark.asyncio
+async def test_network_incomplete_same_company_lead_not_applied(
+    session_maker,
+) -> None:
+    """A+B: same-company lead with incomplete eligibility must not be applied
+    via network fallback (promo_network_apply_enabled=True).
+
+    A: verifies end-to-end: lead stays 'issued', no notification job.
+    B: verifies the network fallback excludes the record's own company_id
+       so the same-company candidate cannot slip through even if same-company
+       lookup misses it due to incomplete eligibility fields.
+    """
+    mock_fetch = AsyncMock(side_effect=RuntimeError("must not call fetch"))
+    mock_put = AsyncMock(side_effect=RuntimeError("must not call PUT"))
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_cross_client(session)
+            record = await _seed_cross_record(session)
+            session.add(
+                RecordService(
+                    record_id=record.id,
+                    service_id=_ALLOWED_SERVICE,
+                    title="Lash",
+                    raw={},
+                )
+            )
+            # Same company as record (_COMPANY_DST=758285) but missing loyalty_card_id.
+            # Step 1 (same-company lookup) fails: loyalty_card_id IS NULL filter.
+            # Step 2 (network fallback) must not find it: company_id != company_id
+            # filter and eligibility filters both exclude it.
+            lead = _make_cross_lead(
+                company_id=_COMPANY_DST,
+                loyalty_card_id=None,
+            )
+            session.add(lead)
+            await session.flush()
+
+            with (
+                patch(
+                    "altegio_bot.promo_discount_apply.fetch_altegio_record_for_update",
+                    mock_fetch,
+                ),
+                patch(
+                    "altegio_bot.promo_discount_apply.update_altegio_record_price_and_comment",
+                    mock_put,
+                ),
+                _network_settings_ctx(),
+            ):
+                await try_apply_promo_discount(
+                    session,
+                    record,
+                    _COMPANY_DST,
+                    booking_created_at=_NOW,
+                )
+
+    async with session_maker() as s:
+        lead_db = (await s.execute(select(PromoLead))).scalar_one()
+        job = (
+            await s.execute(select(MessageJob).where(MessageJob.job_type == "promo_discount_applied"))
+        ).scalar_one_or_none()
+
+    assert lead_db.status == "issued"
+    assert job is None
+
+
+# --- C. No external side effects when promo_apply_discount_api_verified=False -
+
+
+@pytest.mark.asyncio
+async def test_network_no_side_effects_when_api_not_verified(
+    session_maker,
+) -> None:
+    """C: promo_apply_discount_api_verified=False → no external Altegio API calls
+    and the cross-company lead does NOT transition to 'booked'.
+
+    The cross-company API gate is checked BEFORE the issued→booked transition,
+    so a failed gate leaves the lead in 'issued' status without any side effects.
+    """
+    mock_get_client = AsyncMock(side_effect=RuntimeError("must not call client API"))
+    mock_issue_card = AsyncMock(side_effect=RuntimeError("must not call card API"))
+    mock_fetch = AsyncMock(side_effect=RuntimeError("must not call fetch"))
+    mock_put = AsyncMock(side_effect=RuntimeError("must not call PUT"))
+
+    lead_id: int | None = None
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_cross_client(session)
+            record = await _seed_cross_record(session)
+            session.add(
+                RecordService(
+                    record_id=record.id,
+                    service_id=_ALLOWED_SERVICE,
+                    title="Lash",
+                    raw={},
+                )
+            )
+            lead = _make_cross_lead()
+            session.add(lead)
+            await session.flush()
+            lead_id = lead.id
+
+            with (
+                patch(
+                    "altegio_bot.promo_discount_apply.fetch_altegio_record_for_update",
+                    mock_fetch,
+                ),
+                patch(
+                    "altegio_bot.promo_discount_apply.update_altegio_record_price_and_comment",
+                    mock_put,
+                ),
+                patch(
+                    "altegio_bot.promo_loyalty.get_or_create_altegio_client",
+                    mock_get_client,
+                ),
+                patch(
+                    "altegio_bot.promo_loyalty.issue_promo_loyalty_card",
+                    mock_issue_card,
+                ),
+                _network_settings_ctx(
+                    promo_apply_discount_api_verified=False,
+                    promo_altegio_client_api_verified=True,
+                    promo_issue_loyalty_card_enabled=True,
+                    promo_loyalty_card_api_verified=True,
+                ),
+            ):
+                await try_apply_promo_discount(
+                    session,
+                    record,
+                    _COMPANY_DST,
+                    booking_created_at=_NOW,
+                )
+
+    mock_get_client.assert_not_called()
+    mock_issue_card.assert_not_called()
+    mock_fetch.assert_not_called()
+    mock_put.assert_not_called()
+
+    async with session_maker() as s:
+        lead_db = (await s.execute(select(PromoLead).where(PromoLead.id == lead_id))).scalar_one()
+        job = (
+            await s.execute(select(MessageJob).where(MessageJob.job_type == "promo_discount_applied"))
+        ).scalar_one_or_none()
+
+    assert lead_db.status == "issued", (
+        f"cross-company lead must stay 'issued' when api_verified=False, got {lead_db.status!r}"
+    )
+    assert job is None
+
+
+# --- D. Cross-company notification job uses record.company_id ----------------
+
+
+@pytest.mark.asyncio
+async def test_network_notification_job_uses_record_company_id(
+    session_maker,
+) -> None:
+    """D: promo_discount_applied MessageJob.company_id equals record.company_id
+    (758285), not lead.company_id (1271200), for cross-company apply.
+    lead.meta.customer_notification_company_id is also 758285.
+    """
+    mock_fetch = AsyncMock(return_value=_FAKE_ALTEGIO_RECORD)
+    mock_put = AsyncMock(return_value={"data": {"services": []}})
+
+    lead_id: int | None = None
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_cross_client(session)
+            record = await _seed_cross_record(session)
+            session.add(
+                RecordService(
+                    record_id=record.id,
+                    service_id=_ALLOWED_SERVICE,
+                    title="Lash",
+                    raw={},
+                )
+            )
+            lead = _make_cross_lead()
+            session.add(lead)
+            await session.flush()
+            lead_id = lead.id
+
+            with (
+                patch(
+                    "altegio_bot.promo_discount_apply.fetch_altegio_record_for_update",
+                    mock_fetch,
+                ),
+                patch(
+                    "altegio_bot.promo_discount_apply.update_altegio_record_price_and_comment",
+                    mock_put,
+                ),
+                _network_settings_ctx(),
+            ):
+                await try_apply_promo_discount(
+                    session,
+                    record,
+                    _COMPANY_DST,
+                    booking_created_at=_NOW,
+                )
+
+    async with session_maker() as s:
+        lead_db = (await s.execute(select(PromoLead).where(PromoLead.id == lead_id))).scalar_one()
+        job = (
+            await s.execute(select(MessageJob).where(MessageJob.job_type == "promo_discount_applied"))
+        ).scalar_one_or_none()
+
+    assert job is not None, "promo_discount_applied job must be created"
+    assert job.company_id == _COMPANY_DST, (
+        f"job.company_id must be record's company ({_COMPANY_DST}), not lead's ({_COMPANY_SRC}), got {job.company_id}"
+    )
+    meta = lead_db.meta or {}
+    assert meta.get("customer_notification_company_id") == _COMPANY_DST
+
+
+# --- E1. Cross-company loyalty_program mode blocked before side effects -------
+
+
+@pytest.mark.asyncio
+async def test_network_loyalty_program_mode_blocked_before_side_effects(
+    session_maker,
+) -> None:
+    """E1: cross-company apply with promo_apply_mode='loyalty_program' must be
+    blocked at Step 7-pre before any external Altegio API calls.
+    Lead must stay 'issued' with discount_apply_error recorded in meta.
+    """
+    mock_get_client = AsyncMock(side_effect=RuntimeError("must not call client API"))
+    mock_issue_card = AsyncMock(side_effect=RuntimeError("must not call card API"))
+    mock_fetch = AsyncMock(side_effect=RuntimeError("must not call fetch"))
+    mock_put = AsyncMock(side_effect=RuntimeError("must not call PUT"))
+    mock_apply = AsyncMock(side_effect=RuntimeError("must not call apply_discount"))
+
+    lead_id: int | None = None
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_cross_client(session)
+            record = await _seed_cross_record(session)
+            session.add(
+                RecordService(
+                    record_id=record.id,
+                    service_id=_ALLOWED_SERVICE,
+                    title="Lash",
+                    raw={},
+                )
+            )
+            lead = _make_cross_lead()
+            session.add(lead)
+            await session.flush()
+            lead_id = lead.id
+
+            with (
+                patch(
+                    "altegio_bot.promo_discount_apply.fetch_altegio_record_for_update",
+                    mock_fetch,
+                ),
+                patch(
+                    "altegio_bot.promo_discount_apply.update_altegio_record_price_and_comment",
+                    mock_put,
+                ),
+                patch(
+                    "altegio_bot.promo_discount_apply.apply_promo_discount_to_visit",
+                    mock_apply,
+                ),
+                patch(
+                    "altegio_bot.promo_loyalty.get_or_create_altegio_client",
+                    mock_get_client,
+                ),
+                patch(
+                    "altegio_bot.promo_loyalty.issue_promo_loyalty_card",
+                    mock_issue_card,
+                ),
+                _network_settings_ctx(
+                    promo_apply_mode="loyalty_program",
+                    promo_apply_discount_api_verified=True,
+                    promo_altegio_client_api_verified=True,
+                    promo_issue_loyalty_card_enabled=True,
+                    promo_loyalty_card_api_verified=True,
+                ),
+            ):
+                await try_apply_promo_discount(
+                    session,
+                    record,
+                    _COMPANY_DST,
+                    booking_created_at=_NOW,
+                )
+
+    mock_get_client.assert_not_called()
+    mock_issue_card.assert_not_called()
+    mock_fetch.assert_not_called()
+    mock_put.assert_not_called()
+    mock_apply.assert_not_called()
+
+    async with session_maker() as s:
+        lead_db = (await s.execute(select(PromoLead).where(PromoLead.id == lead_id))).scalar_one()
+        job = (
+            await s.execute(select(MessageJob).where(MessageJob.job_type == "promo_discount_applied"))
+        ).scalar_one_or_none()
+
+    assert lead_db.status == "issued", f"cross-company+loyalty_program lead must stay 'issued', got {lead_db.status!r}"
+    assert (lead_db.meta or {}).get("discount_apply_error") is not None
+    assert job is None
+
+
+# --- E2-E4. _get_location_id_for_company validation --------------------------
+
+
+def test_get_location_id_rejects_bool() -> None:
+    """E2: JSON boolean values must be rejected as invalid location_id."""
+    from altegio_bot.promo_discount_apply import _get_location_id_for_company
+
+    with patch.object(settings, "promo_location_id_by_company", '{"758285": true}'):
+        assert _get_location_id_for_company(758285) is None
+
+    with patch.object(settings, "promo_location_id_by_company", '{"758285": false}'):
+        assert _get_location_id_for_company(758285) is None
+
+
+def test_get_location_id_rejects_non_positive() -> None:
+    """E3: zero and negative location_id values must be rejected."""
+    from altegio_bot.promo_discount_apply import _get_location_id_for_company
+
+    for bad in ('{"758285": 0}', '{"758285": -1}', '{"758285": "0"}', '{"758285": "-1"}'):
+        with patch.object(settings, "promo_location_id_by_company", bad):
+            result = _get_location_id_for_company(758285)
+            assert result is None, f"expected None for {bad!r}, got {result!r}"
+
+
+def test_get_location_id_accepts_valid_values() -> None:
+    """E4: valid positive int and string location_id values must be accepted."""
+    from altegio_bot.promo_discount_apply import _get_location_id_for_company
+
+    with patch.object(settings, "promo_location_id_by_company", '{"758285": 9002}'):
+        assert _get_location_id_for_company(758285) == 9002
+
+    with patch.object(settings, "promo_location_id_by_company", '{"758285": "9002"}'):
+        assert _get_location_id_for_company(758285) == 9002

@@ -50,12 +50,14 @@ from altegio_bot.models.models import (
     RecordService,
 )
 from altegio_bot.perf import perf_log
+from altegio_bot.promo_discount_apply import process_promo_apply_existing_booking_job
 from altegio_bot.providers.base import WhatsAppProvider
 from altegio_bot.providers.dummy import safe_send, safe_send_template
 from altegio_bot.settings import settings
 from altegio_bot.template_validation import validate_template_params
 from altegio_bot.whatsapp_routing import pick_sender_code_for_record, pick_sender_id
 from altegio_bot.workers.promo_lead_handler import (
+    PROMO_APPLY_EXISTING_BOOKING_JOB_TYPE,
     PROMO_ELIGIBILITY_CHECK_JOB_TYPE,
     process_promo_eligibility_check_job,
 )
@@ -978,6 +980,10 @@ async def _run_job_logic(
 
     if job.job_type == PROMO_ELIGIBILITY_CHECK_JOB_TYPE:
         await process_promo_eligibility_check_job(session, job, provider)
+        return None
+
+    if job.job_type == PROMO_APPLY_EXISTING_BOOKING_JOB_TYPE:
+        await process_promo_apply_existing_booking_job(session, job)
         return None
 
     with perf_log(

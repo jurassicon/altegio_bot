@@ -192,6 +192,24 @@ class Settings(BaseSettings):
     #   (kept for backward compatibility with existing tests and smoke scripts).
     # Any other value raises ValueError at startup.
     promo_apply_mode: str = "record_price_override"
+    # Gate for the existing-booking apply automation.
+    # Default False: promo_apply_existing_booking jobs are never created.
+    # Requires promo_apply_discount_enabled=True to have any effect when True.
+    promo_apply_existing_booking_enabled: bool = False
+
+    # ---------------------------------------------------------------------------
+    # Network-aware promo lead application
+    # ---------------------------------------------------------------------------
+    # When True: if no same-company PromoLead is found for a booking, search for
+    # an active lead across all companies listed in promo_network_company_ids.
+    # Default False: preserves the existing same-company-only behaviour.
+    promo_network_apply_enabled: bool = False
+    # Comma-separated list of Altegio company IDs allowed for cross-company apply.
+    # Both the lead's company and the record's company must be in this list.
+    # If empty while promo_network_apply_enabled=True: cross-company apply is
+    # fail-closed (no discount applied).
+    # Example: PROMO_NETWORK_COMPANY_IDS=758285,1271200
+    promo_network_company_ids: str = ""
 
     @field_validator("promo_apply_mode")
     @classmethod
@@ -203,6 +221,12 @@ class Settings(BaseSettings):
                 "Check the PROMO_APPLY_MODE environment variable."
             )
         return v
+
+    # Human-readable list of services eligible for the promo discount.
+    # Shown in issued/already-issued WhatsApp replies to guide the customer.
+    # Leave empty → service block omitted (backward-compatible).
+    # Example: PROMO_ALLOWED_SERVICES_DISPLAY_TEXT=Haarschnitt, Coloration, Keratin
+    promo_allowed_services_display_text: str = ""
 
     # Publicly accessible image URLs for newsletter template IMAGE HEADER components.
     # Meta Cloud API requires a permanent URL it can fetch and cache at send time.
