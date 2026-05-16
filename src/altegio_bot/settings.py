@@ -218,6 +218,12 @@ class Settings(BaseSettings):
             )
         return v
 
+    # Human-readable list of services eligible for the promo discount.
+    # Shown in issued/already-issued WhatsApp replies to guide the customer.
+    # Leave empty → service block omitted (backward-compatible).
+    # Example: PROMO_ALLOWED_SERVICES_DISPLAY_TEXT=Haarschnitt, Coloration, Keratin
+    promo_allowed_services_display_text: str = ""
+
     # Publicly accessible image URLs for newsletter template IMAGE HEADER components.
     # Meta Cloud API requires a permanent URL it can fetch and cache at send time.
     # Leave empty → worker fails the job fast (no silent blank-header send).

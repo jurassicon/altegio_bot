@@ -27,6 +27,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("promo_lead_handler")
 PROMO_ELIGIBILITY_CHECK_JOB_TYPE = "promo_eligibility_check"
+PROMO_APPLY_EXISTING_BOOKING_JOB_TYPE = "promo_apply_existing_booking"
 
 
 # ---------------------------------------------------------------------------
@@ -96,6 +97,14 @@ def compute_expires_at(
 # ---------------------------------------------------------------------------
 # Reply builders (German customer-facing text)
 # ---------------------------------------------------------------------------
+
+
+def _build_services_block() -> str:
+    """Return the eligible-services paragraph for issued replies, or '' if not configured."""
+    text = settings.promo_allowed_services_display_text.strip()
+    if not text:
+        return ""
+    return f"Der Rabatt gilt für folgende Leistungen:\n{text}\n\n"
 
 
 def _format_discount(amount: Decimal, discount_type: str) -> str:
@@ -193,6 +202,7 @@ def build_reply_issued(
         f"Nach Ihrer Buchung erkennt unser System Ihre Nummer automatisch und "
         f"ordnet den Rabatt Ihrem ersten Besuch zu.\n\n"
         f"Der Rabatt gilt nur für Neukunden und ist bis {exp} gültig.\n\n"
+        f"{_build_services_block()}"
         f"Termin buchen:\n{booking_url}"
     )
 
@@ -204,6 +214,7 @@ def build_reply_already_issued(expires_at: datetime, booking_url: str) -> str:
         f"Er ist mit Ihrer WhatsApp-Nummer verknüpft und gilt bis {exp}.\n\n"
         f"In der Online-Buchung werden die regulären Preise angezeigt. "
         f"Nach Ihrer Buchung ordnen wir den Rabatt automatisch Ihrem ersten Besuch zu.\n\n"
+        f"{_build_services_block()}"
         f"Termin buchen:\n{booking_url}"
     )
 
@@ -233,6 +244,7 @@ def build_reply_issued_with_card(
         f"Nach Ihrer Buchung erkennt unser System Ihre Nummer automatisch und "
         f"ordnet den Rabatt Ihrem ersten Besuch zu.\n\n"
         f"Der Rabatt gilt nur für Neukunden und ist bis {exp} gültig.\n\n"
+        f"{_build_services_block()}"
         f"Termin buchen:\n{booking_url}"
     )
 
@@ -435,6 +447,42 @@ def _build_promo_eligibility_check_job(lead: PromoLead, *, now: datetime) -> Mes
         dedupe_key=f"{PROMO_ELIGIBILITY_CHECK_JOB_TYPE}:{lead.id}",
         payload={"promo_lead_id": lead.id},
     )
+
+
+async def _ensure_promo_apply_existing_booking_job(
+    session: AsyncSession,
+    lead: PromoLead,
+    now: datetime,
+) -> None:
+    """Idempotent: create a promo_apply_existing_booking job for a newly issued lead.
+
+    Searches for a pre-existing future booking after the lead is issued.
+    Uses a savepoint to handle concurrent creation safely.
+    """
+    dedupe_key = f"{PROMO_APPLY_EXISTING_BOOKING_JOB_TYPE}:{lead.id}"
+
+    existing = (
+        await session.execute(select(MessageJob).where(MessageJob.dedupe_key == dedupe_key))
+    ).scalar_one_or_none()
+    if existing is not None:
+        return
+
+    try:
+        async with session.begin_nested():
+            job = MessageJob(
+                company_id=lead.company_id,
+                record_id=None,
+                client_id=None,
+                job_type=PROMO_APPLY_EXISTING_BOOKING_JOB_TYPE,
+                run_at=now,
+                dedupe_key=dedupe_key,
+                max_attempts=3,
+                payload={"promo_lead_id": lead.id},
+            )
+            session.add(job)
+            await session.flush()
+    except IntegrityError:
+        pass
 
 
 def _promo_retry_delay_seconds(attempt: int) -> int:
@@ -830,6 +878,9 @@ async def process_promo_eligibility_check_job(
     else:
         _mark_promo_check_done(lead, now=now, extra=decision_meta)
 
+    if decision_status == "issued" and not card_issue_failed:
+        await _ensure_promo_apply_existing_booking_job(session, lead, now)
+
     session.add(
         OutboxMessage(
             company_id=lead.company_id,
@@ -1127,6 +1178,10 @@ async def handle_promo_command(
                 company_id=company_id,
             ):
                 card_issue_failed = True
+
+        # ── Enqueue existing-booking job for new issued leads ─────────────────
+        if new_lead is not None and new_lead.status == "issued" and not card_issue_failed:
+            await _ensure_promo_apply_existing_booking_job(session, new_lead, now)
 
         # Determine reply from the actual DB outcome.
         if new_lead is not None:
