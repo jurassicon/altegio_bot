@@ -1872,3 +1872,127 @@ async def test_network_notification_job_uses_record_company_id(
     )
     meta = lead_db.meta or {}
     assert meta.get("customer_notification_company_id") == _COMPANY_DST
+
+
+# --- E1. Cross-company loyalty_program mode blocked before side effects -------
+
+
+@pytest.mark.asyncio
+async def test_network_loyalty_program_mode_blocked_before_side_effects(
+    session_maker,
+) -> None:
+    """E1: cross-company apply with promo_apply_mode='loyalty_program' must be
+    blocked at Step 7-pre before any external Altegio API calls.
+    Lead must stay 'issued' with discount_apply_error recorded in meta.
+    """
+    mock_get_client = AsyncMock(side_effect=RuntimeError("must not call client API"))
+    mock_issue_card = AsyncMock(side_effect=RuntimeError("must not call card API"))
+    mock_fetch = AsyncMock(side_effect=RuntimeError("must not call fetch"))
+    mock_put = AsyncMock(side_effect=RuntimeError("must not call PUT"))
+    mock_apply = AsyncMock(side_effect=RuntimeError("must not call apply_discount"))
+
+    lead_id: int | None = None
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_cross_client(session)
+            record = await _seed_cross_record(session)
+            session.add(
+                RecordService(
+                    record_id=record.id,
+                    service_id=_ALLOWED_SERVICE,
+                    title="Lash",
+                    raw={},
+                )
+            )
+            lead = _make_cross_lead()
+            session.add(lead)
+            await session.flush()
+            lead_id = lead.id
+
+            with (
+                patch(
+                    "altegio_bot.promo_discount_apply.fetch_altegio_record_for_update",
+                    mock_fetch,
+                ),
+                patch(
+                    "altegio_bot.promo_discount_apply.update_altegio_record_price_and_comment",
+                    mock_put,
+                ),
+                patch(
+                    "altegio_bot.promo_discount_apply.apply_promo_discount_to_visit",
+                    mock_apply,
+                ),
+                patch(
+                    "altegio_bot.promo_loyalty.get_or_create_altegio_client",
+                    mock_get_client,
+                ),
+                patch(
+                    "altegio_bot.promo_loyalty.issue_promo_loyalty_card",
+                    mock_issue_card,
+                ),
+                _network_settings_ctx(
+                    promo_apply_mode="loyalty_program",
+                    promo_apply_discount_api_verified=True,
+                    promo_altegio_client_api_verified=True,
+                    promo_issue_loyalty_card_enabled=True,
+                    promo_loyalty_card_api_verified=True,
+                ),
+            ):
+                await try_apply_promo_discount(
+                    session,
+                    record,
+                    _COMPANY_DST,
+                    booking_created_at=_NOW,
+                )
+
+    mock_get_client.assert_not_called()
+    mock_issue_card.assert_not_called()
+    mock_fetch.assert_not_called()
+    mock_put.assert_not_called()
+    mock_apply.assert_not_called()
+
+    async with session_maker() as s:
+        lead_db = (await s.execute(select(PromoLead).where(PromoLead.id == lead_id))).scalar_one()
+        job = (
+            await s.execute(select(MessageJob).where(MessageJob.job_type == "promo_discount_applied"))
+        ).scalar_one_or_none()
+
+    assert lead_db.status == "issued", f"cross-company+loyalty_program lead must stay 'issued', got {lead_db.status!r}"
+    assert (lead_db.meta or {}).get("discount_apply_error") is not None
+    assert job is None
+
+
+# --- E2-E4. _get_location_id_for_company validation --------------------------
+
+
+def test_get_location_id_rejects_bool() -> None:
+    """E2: JSON boolean values must be rejected as invalid location_id."""
+    from altegio_bot.promo_discount_apply import _get_location_id_for_company
+
+    with patch.object(settings, "promo_location_id_by_company", '{"758285": true}'):
+        assert _get_location_id_for_company(758285) is None
+
+    with patch.object(settings, "promo_location_id_by_company", '{"758285": false}'):
+        assert _get_location_id_for_company(758285) is None
+
+
+def test_get_location_id_rejects_non_positive() -> None:
+    """E3: zero and negative location_id values must be rejected."""
+    from altegio_bot.promo_discount_apply import _get_location_id_for_company
+
+    for bad in ('{"758285": 0}', '{"758285": -1}', '{"758285": "0"}', '{"758285": "-1"}'):
+        with patch.object(settings, "promo_location_id_by_company", bad):
+            result = _get_location_id_for_company(758285)
+            assert result is None, f"expected None for {bad!r}, got {result!r}"
+
+
+def test_get_location_id_accepts_valid_values() -> None:
+    """E4: valid positive int and string location_id values must be accepted."""
+    from altegio_bot.promo_discount_apply import _get_location_id_for_company
+
+    with patch.object(settings, "promo_location_id_by_company", '{"758285": 9002}'):
+        assert _get_location_id_for_company(758285) == 9002
+
+    with patch.object(settings, "promo_location_id_by_company", '{"758285": "9002"}'):
+        assert _get_location_id_for_company(758285) == 9002

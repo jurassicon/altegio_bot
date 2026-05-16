@@ -202,11 +202,28 @@ def _get_location_id_for_company(company_id: int) -> int | None:
             company_id,
         )
         return None
+    # bool must be checked before int because bool is a subclass of int.
+    if isinstance(val, bool):
+        logger.warning(
+            "promo_discount: invalid location_id %r (boolean not allowed)"
+            " for company_id=%d in promo_location_id_by_company",
+            val,
+            company_id,
+        )
+        return None
     if isinstance(val, int):
+        if val <= 0:
+            logger.warning(
+                "promo_discount: invalid location_id %d (must be > 0)"
+                " for company_id=%d in promo_location_id_by_company",
+                val,
+                company_id,
+            )
+            return None
         return val
     if isinstance(val, str):
         try:
-            return int(val)
+            parsed = int(val)
         except ValueError:
             logger.warning(
                 "promo_discount: invalid location_id value %r for company_id=%d in promo_location_id_by_company",
@@ -214,6 +231,15 @@ def _get_location_id_for_company(company_id: int) -> int | None:
                 company_id,
             )
             return None
+        if parsed <= 0:
+            logger.warning(
+                "promo_discount: invalid location_id %d (must be > 0)"
+                " for company_id=%d in promo_location_id_by_company",
+                parsed,
+                company_id,
+            )
+            return None
+        return parsed
     logger.warning(
         "promo_discount: unexpected location_id type %s for company_id=%d in promo_location_id_by_company",
         type(val).__name__,
@@ -1530,6 +1556,26 @@ async def try_apply_promo_discount(
     effective_location_id: int | None = None
 
     if is_cross_company:
+        # Only record_price_override is supported for cross-company apply.
+        # Check first — cheapest gate, no external calls or lookups.
+        if cfg.promo_apply_mode != "record_price_override":
+            err = (
+                f"cross-company apply not supported for"
+                f" promo_apply_mode={cfg.promo_apply_mode!r}"
+                " — only 'record_price_override' is supported"
+            )
+            lead.meta = {
+                **meta,
+                "discount_apply_error": err,
+                "discount_apply_attempted_at": now.isoformat(),
+            }
+            logger.warning(
+                "promo_discount: unsupported mode %r for cross-company apply lead_id=%s",
+                cfg.promo_apply_mode,
+                lead.id,
+            )
+            return  # lead stays 'issued'
+
         effective_location_id = _get_location_id_for_company(company_id)
         if effective_location_id is None:
             err = (
