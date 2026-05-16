@@ -191,15 +191,34 @@ def _get_location_id_for_company(company_id: int) -> int | None:
     try:
         loc_map = json.loads(settings.promo_location_id_by_company or "{}")
     except Exception:
+        logger.warning(
+            "promo_discount: invalid JSON in promo_location_id_by_company — fail-closed",
+        )
         return None
     val = loc_map.get(str(company_id))
+    if val is None:
+        logger.warning(
+            "promo_discount: no location_id configured for company_id=%d in promo_location_id_by_company",
+            company_id,
+        )
+        return None
     if isinstance(val, int):
         return val
     if isinstance(val, str):
         try:
             return int(val)
         except ValueError:
+            logger.warning(
+                "promo_discount: invalid location_id value %r for company_id=%d in promo_location_id_by_company",
+                val,
+                company_id,
+            )
             return None
+    logger.warning(
+        "promo_discount: unexpected location_id type %s for company_id=%d in promo_location_id_by_company",
+        type(val).__name__,
+        company_id,
+    )
     return None
 
 
@@ -1079,6 +1098,8 @@ async def _ensure_promo_discount_notification_job(
 
     current_meta = lead.meta or {}
 
+    notification_company_id = record.company_id
+
     if existing is not None:
         lead.meta = {
             **current_meta,
@@ -1086,6 +1107,7 @@ async def _ensure_promo_discount_notification_job(
             "customer_notification_job_id": existing.id,
             "customer_notification_created_at": now.isoformat(),
             "customer_notification_dedupe_key": dedupe_key,
+            "customer_notification_company_id": notification_company_id,
         }
         logger.info(
             "promo_discount: notification job already exists job_id=%s lead_id=%s",
@@ -1099,7 +1121,7 @@ async def _ensure_promo_discount_notification_job(
     try:
         async with session.begin_nested():
             job = MessageJob(
-                company_id=lead.company_id,
+                company_id=notification_company_id,
                 client_id=client.id,
                 record_id=record.id,
                 job_type="promo_discount_applied",
@@ -1127,6 +1149,7 @@ async def _ensure_promo_discount_notification_job(
             "customer_notification_job_id": existing.id,
             "customer_notification_created_at": now.isoformat(),
             "customer_notification_dedupe_key": dedupe_key,
+            "customer_notification_company_id": notification_company_id,
         }
         logger.warning(
             "promo_discount: concurrent insert detected, using existing job_id=%s lead_id=%s",
@@ -1141,6 +1164,7 @@ async def _ensure_promo_discount_notification_job(
         "customer_notification_job_id": job.id,
         "customer_notification_created_at": now.isoformat(),
         "customer_notification_dedupe_key": dedupe_key,
+        "customer_notification_company_id": notification_company_id,
     }
     logger.info(
         "promo_discount: queued notification job_id=%s lead_id=%s",
@@ -1258,10 +1282,15 @@ async def find_applicable_promo_lead_for_record(
     cross_stmt = (
         select(PromoLead)
         .where(PromoLead.company_id.in_(network_ids))
+        .where(PromoLead.company_id != company_id)  # never return same-company
         .where(PromoLead.phone_e164 == phone_e164)
         .where(PromoLead.campaign_name == campaign)
         .where(PromoLead.status.in_(["issued", "booked"]))
         .where(PromoLead.expires_at > now)
+        .where(PromoLead.loyalty_card_id.is_not(None))
+        .where(PromoLead.location_id.is_not(None))
+        .where(PromoLead.discount_program_id.is_not(None))
+        .where(PromoLead.meta["loyalty_card_issued"].astext == "true")
         .where(PromoLead.meta["promo_card_deleted_at"].astext.is_(None))
     )
     if expected_lead_id is not None:
@@ -1491,6 +1520,40 @@ async def try_apply_promo_discount(
         logger.info("promo_discount: skip lead_id=%s %s", lead.id, err)
         return
 
+    # ── 7-pre. Cross-company gate checks (before state transition) ───────────
+    # For cross-company leads, validate location_id and the API gate BEFORE
+    # issuing the issued → booked transition.  This prevents a lead from
+    # becoming 'booked' due to a failed attempt when the apply is impossible.
+    # Same-company leads skip this block (is_cross_company=False) and continue
+    # with unchanged behaviour through steps 7 and 8.
+    is_cross_company = lead.company_id != company_id
+    effective_location_id: int | None = None
+
+    if is_cross_company:
+        effective_location_id = _get_location_id_for_company(company_id)
+        if effective_location_id is None:
+            err = (
+                f"cross-company apply: no location_id for"
+                f" record company_id={company_id}"
+                " in promo_location_id_by_company — fail-closed"
+            )
+            lead.meta = {**meta, "apply_skip_reason": err}
+            logger.warning("promo_discount: %s lead_id=%s", err, lead.id)
+            return  # lead stays 'issued'
+
+        if not cfg.promo_apply_discount_api_verified:
+            err = "promo_apply_discount_api_verified=False — cross-company discount apply blocked"
+            lead.meta = {
+                **meta,
+                "discount_apply_error": err,
+                "discount_apply_attempted_at": now.isoformat(),
+            }
+            logger.warning(
+                "promo_discount: api not verified, blocking cross-company apply for lead_id=%s",
+                lead.id,
+            )
+            return  # lead stays 'issued'
+
     # ── 7. Transition issued → booked ─────────────────────────────────────────
     if lead.status == "issued":
         meta = {
@@ -1509,25 +1572,10 @@ async def try_apply_promo_discount(
             record.id,
         )
 
-    # ── 7b. Cross-company binding ─────────────────────────────────────────────
-    # When the PromoLead belongs to a different company than the booking record,
-    # resolve the effective location_id for the record's company and set up the
-    # per-company client/card binding before touching the Altegio API.
-    is_cross_company = lead.company_id != company_id
-    effective_location_id: int | None = None
-
+    # ── 7b. Cross-company binding (external calls, after API gate) ────────────
+    # ensure_promo_binding_for_record_company may call get_or_create_altegio_client
+    # or issue_promo_loyalty_card — only reached after the API gate passed above.
     if is_cross_company:
-        effective_location_id = _get_location_id_for_company(company_id)
-        if effective_location_id is None:
-            err = (
-                f"cross-company apply: no location_id for"
-                f" record company_id={company_id}"
-                " in promo_location_id_by_company — fail-closed"
-            )
-            lead.meta = {**meta, "apply_skip_reason": err}
-            logger.warning("promo_discount: %s lead_id=%s", err, lead.id)
-            return
-
         await ensure_promo_binding_for_record_company(
             lead,
             company_id=company_id,
@@ -1545,7 +1593,8 @@ async def try_apply_promo_discount(
         }
         lead.meta = meta
 
-    # ── 8. API gate ───────────────────────────────────────────────────────────
+    # ── 8. API gate (same-company path) ───────────────────────────────────────
+    # Cross-company already checked at step 7-pre; this covers same-company.
     if not cfg.promo_apply_discount_api_verified:
         err = "promo_apply_discount_api_verified=False — discount apply blocked until endpoint is verified"
         lead.meta = {
