@@ -16,6 +16,8 @@ F.  process_promo_apply_existing_booking_job:
           booking_created_before_promo_allowed=True in meta.
       F2. First record has non-allowed service, second has allowed → second chosen.
       F3. Missing raw timestamp → booking_created_at_missing=True in meta, still applied.
+      F4. datetime_created field parsed by canonical parser; predates promo → applied.
+      F5. Naive timestamp in create_date → canonical Belgrade tz (not UTC) applied.
 G.  No future booking → done, meta.existing_booking_skip_reason='no_future_booking'.
 H.  Future booking but service not allowed → done, no Altegio API calls.
 I.  Ambiguous candidates:
@@ -28,8 +30,10 @@ J.  _ensure_promo_apply_existing_booking_job is idempotent: two calls → one jo
 K.  process_promo_apply_existing_booking_job skips non-issued/expired leads.
     Defers (status='queued') when promo_apply_discount_enabled=False or
     promo_apply_discount_api_verified=False.
+    Kill switch (promo_apply_existing_booking_enabled=False at execution) → done, not queued.
 L.  handle_promo_command does not call Altegio record-search or PUT APIs — job
     is created without proactively searching for existing bookings.
+M.  After apply, meta includes existing_booking_apply_altegio_record_id.
 """
 
 from __future__ import annotations
@@ -714,7 +718,7 @@ async def test_promo_apply_existing_booking_missing_raw_timestamp(session_maker)
     async with session_maker() as session:
         async with session.begin():
             await _seed_client(session)
-            # raw={} → no timestamp fields → _get_booking_created_at_from_record returns None
+            # raw={} → no timestamp fields → canonical parser returns None
             await _seed_record(session, starts_at=_STARTS_AT, raw={})
             await _seed_service(session)
 
@@ -1150,3 +1154,202 @@ async def test_handle_promo_command_no_altegio_record_api_for_existing_booking(
 
     assert len(jobs) == 1, "promo_apply_existing_booking job must be created"
     assert jobs[0].max_attempts == 3
+
+
+# =============================================================================
+# K (kill switch). promo_apply_existing_booking_enabled=False at execution → done
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_promo_apply_existing_booking_kill_switch_at_execution(session_maker) -> None:
+    """Kill switch: flag=False at execution time → job done (not queued), no API calls."""
+    fetch_mock = AsyncMock()
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_client(session)
+            await _seed_record(session, starts_at=datetime(2099, 1, 1, tzinfo=_UTC))
+            await _seed_service(session)
+
+            lead = _make_lead()
+            session.add(lead)
+            await session.flush()
+
+            job = _make_existing_booking_job(lead.id)
+            session.add(job)
+            await session.flush()
+
+            with (
+                patch.object(settings, "promo_apply_existing_booking_enabled", False),
+                patch(
+                    "altegio_bot.promo_discount_apply.fetch_altegio_record_for_update",
+                    fetch_mock,
+                ),
+            ):
+                await process_promo_apply_existing_booking_job(session, job)
+
+            lead_id = lead.id
+
+    async with session_maker() as s:
+        refreshed_lead = await s.get(PromoLead, lead_id)
+
+    fetch_mock.assert_not_called()
+    assert job.status == "done", "kill switch must mark job done, not queued"
+    assert job.locked_at is None
+    assert refreshed_lead is not None
+    meta = refreshed_lead.meta or {}
+    assert meta.get("existing_booking_apply_result") == "disabled_by_kill_switch"
+    assert meta.get("existing_booking_apply_skip_reason") == "promo_apply_existing_booking_enabled=False"
+    assert "existing_booking_apply_checked_at" in meta
+
+
+# =============================================================================
+# F4/F5. Canonical parser: datetime_created field; naive timestamp → Belgrade tz
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_promo_apply_existing_booking_datetime_created_field(session_maker) -> None:
+    """Test F4: datetime_created field parsed by canonical parser; predates promo → applied."""
+    raw_ts = {"datetime_created": _F_BOOKING_CREATED_AT.isoformat()}
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_client(session)
+            await _seed_record(session, starts_at=_F_STARTS_AT, raw=raw_ts)
+            await _seed_service(session)
+
+            lead = _make_lead(issued_at=_F_ISSUED_AT, expires_at=_F_EXPIRES_AT)
+            session.add(lead)
+            await session.flush()
+
+            job = _make_existing_booking_job(lead.id)
+            session.add(job)
+            await session.flush()
+
+            with (
+                _base_settings_ctx(),
+                patch(
+                    "altegio_bot.promo_discount_apply.fetch_altegio_record_for_update",
+                    AsyncMock(return_value=_FAKE_ALTEGIO_RECORD),
+                ),
+                patch(
+                    "altegio_bot.promo_discount_apply.update_altegio_record_price_and_comment",
+                    AsyncMock(return_value=_FAKE_PUT_RESULT),
+                ),
+            ):
+                await process_promo_apply_existing_booking_job(session, job)
+
+            lead_id = lead.id
+
+    async with session_maker() as s:
+        refreshed_lead = await s.get(PromoLead, lead_id)
+
+    assert job.status == "done"
+    assert refreshed_lead is not None
+    assert refreshed_lead.status == "applied"
+    meta = refreshed_lead.meta or {}
+    assert meta.get("booking_created_before_promo_allowed") is True
+    assert meta.get("existing_booking_apply_result") == "applied"
+
+
+@pytest.mark.asyncio
+async def test_promo_apply_existing_booking_naive_timestamp_canonical_tz(session_maker) -> None:
+    """Test F5: naive timestamp in create_date → canonical Belgrade tz applied (not UTC)."""
+    from altegio_bot.altegio_records import extract_booking_created_at_from_record_details
+
+    # Naive — no tzinfo.  Canonical localises to Europe/Belgrade (UTC+2 in April),
+    # the old local parser incorrectly used UTC.  The difference is 2 hours.
+    raw_ts = {"create_date": "2099-04-01T10:00:00"}
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_client(session)
+            await _seed_record(session, starts_at=_F_STARTS_AT, raw=raw_ts)
+            await _seed_service(session)
+
+            lead = _make_lead(issued_at=_F_ISSUED_AT, expires_at=_F_EXPIRES_AT)
+            session.add(lead)
+            await session.flush()
+
+            job = _make_existing_booking_job(lead.id)
+            session.add(job)
+            await session.flush()
+
+            with (
+                _base_settings_ctx(),
+                patch(
+                    "altegio_bot.promo_discount_apply.fetch_altegio_record_for_update",
+                    AsyncMock(return_value=_FAKE_ALTEGIO_RECORD),
+                ),
+                patch(
+                    "altegio_bot.promo_discount_apply.update_altegio_record_price_and_comment",
+                    AsyncMock(return_value=_FAKE_PUT_RESULT),
+                ),
+            ):
+                await process_promo_apply_existing_booking_job(session, job)
+
+            lead_id = lead.id
+
+    async with session_maker() as s:
+        refreshed_lead = await s.get(PromoLead, lead_id)
+
+    assert refreshed_lead is not None
+    meta = refreshed_lead.meta or {}
+    # meta["booking_created_at"] is set by try_apply_promo_discount when the booking
+    # predates the promo (allow_existing_booking_before_promo=True path).
+    expected_dt = extract_booking_created_at_from_record_details(raw_ts)
+    assert expected_dt is not None, "canonical parser must parse the naive timestamp"
+    assert meta.get("booking_created_at") == expected_dt.isoformat()
+    assert meta.get("booking_created_before_promo_allowed") is True
+
+
+# =============================================================================
+# M. existing_booking_apply_altegio_record_id in meta after apply
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_promo_apply_existing_booking_altegio_record_id_in_meta(session_maker) -> None:
+    """Test M: after apply, meta includes existing_booking_apply_altegio_record_id."""
+    _STARTS_AT = datetime(2099, 5, 1, tzinfo=_UTC)
+    _ALTEGIO_RECORD_ID = 8001
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_client(session)
+            await _seed_record(session, altegio_record_id=_ALTEGIO_RECORD_ID, starts_at=_STARTS_AT)
+            await _seed_service(session)
+
+            lead = _make_lead(expires_at=_F_EXPIRES_AT)
+            session.add(lead)
+            await session.flush()
+
+            job = _make_existing_booking_job(lead.id)
+            session.add(job)
+            await session.flush()
+
+            with (
+                _base_settings_ctx(),
+                patch(
+                    "altegio_bot.promo_discount_apply.fetch_altegio_record_for_update",
+                    AsyncMock(return_value=_FAKE_ALTEGIO_RECORD),
+                ),
+                patch(
+                    "altegio_bot.promo_discount_apply.update_altegio_record_price_and_comment",
+                    AsyncMock(return_value=_FAKE_PUT_RESULT),
+                ),
+            ):
+                await process_promo_apply_existing_booking_job(session, job)
+
+            lead_id = lead.id
+
+    async with session_maker() as s:
+        refreshed_lead = await s.get(PromoLead, lead_id)
+
+    assert job.status == "done"
+    assert refreshed_lead is not None
+    meta = refreshed_lead.meta or {}
+    assert meta.get("existing_booking_apply_altegio_record_id") == _ALTEGIO_RECORD_ID
+    assert meta.get("existing_booking_apply_result") == "applied"

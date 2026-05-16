@@ -42,6 +42,7 @@ from altegio_bot.altegio_record_update import (
     fetch_altegio_record_for_update,
     update_altegio_record_price_and_comment,
 )
+from altegio_bot.altegio_records import extract_booking_created_at_from_record_details
 from altegio_bot.models.models import Client, MessageJob, PromoLead, Record, RecordService
 from altegio_bot.perf import perf_log
 from altegio_bot.settings import Settings, settings
@@ -56,9 +57,6 @@ _PROMO_MARKER_RE = re.compile(r"\[PromoLead:\d+(?::\w+)?\]")
 # record_updated webhooks triggered by our own promo PUT are suppressed for this
 # many seconds after the PUT timestamp stored in PromoLead.meta.
 _SUPPRESS_WINDOW_SEC = 300  # 5 minutes
-
-# Ordered list of raw field names that may contain the booking creation timestamp.
-_RAW_TS_FIELDS = ("create_date", "created_at", "booking_created_at", "date_create")
 
 logger = logging.getLogger(__name__)
 
@@ -75,27 +73,6 @@ class PromoDiscountApplyResult:
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
-
-
-def _get_booking_created_at_from_record(record: Record) -> datetime | None:
-    """Extract booking creation timestamp from record.raw.
-
-    Tries fields in order: create_date, created_at, booking_created_at, date_create.
-    Returns a UTC-aware datetime or None if none found or unparseable.
-    """
-    raw = record.raw or {}
-    for field in _RAW_TS_FIELDS:
-        val = raw.get(field)
-        if not val:
-            continue
-        try:
-            dt = datetime.fromisoformat(str(val))
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return dt.astimezone(timezone.utc)
-        except (ValueError, TypeError):
-            continue
-    return None
 
 
 def _auth_header() -> str:
@@ -1818,7 +1795,11 @@ async def process_promo_apply_existing_booking_job(
       - Picks the earliest eligible record (by starts_at).
       - If multiple eligible records share the earliest starts_at → ambiguous → fail-closed.
 
-    Defers (status=queued, run_at+10min) when apply gates are disabled,
+    Kill switch (promo_apply_existing_booking_enabled=False at execution time):
+      Marks job done immediately, records disabled_by_kill_switch in lead.meta.
+      Does NOT requeue — this is a hard stop, not a temporary gate.
+
+    Defers (status=queued, run_at+10min) when apply rollout gates are disabled,
     rather than silently marking done and losing the opportunity.
     """
     with perf_log("promo_discount", "promo_apply_existing_booking.total", job_id=job.id) as _total_ctx:
@@ -1854,8 +1835,29 @@ async def process_promo_apply_existing_booking_job(
             job.last_error = None
             return
 
-        # ── Gate checks: defer instead of silently dropping ───────────────────
         cfg = settings
+
+        # ── Kill switch: hard stop for already-created jobs ───────────────────
+        # Checked before rollout gates: kill switch → done (not queued).
+        # Rollout gates (below) defer — kill switch does not.
+        if not cfg.promo_apply_existing_booking_enabled:
+            lead.meta = {
+                **(lead.meta or {}),
+                "existing_booking_apply_result": "disabled_by_kill_switch",
+                "existing_booking_apply_skip_reason": "promo_apply_existing_booking_enabled=False",
+                "existing_booking_apply_checked_at": now.isoformat(),
+            }
+            job.status = "done"
+            job.locked_at = None
+            job.last_error = None
+            logger.info(
+                "promo_apply_existing_booking: kill switch active, marking done job_id=%s lead_id=%s",
+                job.id,
+                lead.id,
+            )
+            return
+
+        # ── Rollout gates: defer instead of silently dropping ─────────────────
         if not cfg.promo_apply_discount_enabled:
             job.status = "queued"
             job.locked_at = None
@@ -1899,6 +1901,9 @@ async def process_promo_apply_existing_booking_job(
             company_filter = Record.company_id == lead.company_id
 
         # ── Find candidates ────────────────────────────────────────────────────
+        seen_count = 0
+        eligible_count = 0
+        candidate: Record | None = None
         with perf_log("promo_discount", "promo_apply_existing_booking.find_candidates", job_id=job.id) as _fc_ctx:
             cand_stmt = (
                 select(Record)
@@ -1914,63 +1919,64 @@ async def process_promo_apply_existing_booking_job(
             )
             result = await session.execute(cand_stmt)
             seen_records = list(result.scalars().all())
+            seen_count = len(seen_records)
+            _fc_ctx["seen_records"] = seen_count
+            _total_ctx["seen_records"] = seen_count
 
-        seen_count = len(seen_records)
-        _fc_ctx["seen_records"] = seen_count
-        _total_ctx["seen_records"] = seen_count
+            if not seen_records:
+                lead.meta = {**(lead.meta or {}), "existing_booking_skip_reason": "no_future_booking"}
+                job.status = "done"
+                job.locked_at = None
+                job.last_error = None
+                return
 
-        if not seen_records:
-            lead.meta = {**(lead.meta or {}), "existing_booking_skip_reason": "no_future_booking"}
-            job.status = "done"
-            job.locked_at = None
-            job.last_error = None
-            return
+            # Filter: keep only records that have at least one allowed service (eligible).
+            eligible: list[Record] = []
+            for rec in seen_records:
+                service_ids = await _get_record_service_ids(session, rec.id)
+                if service_ids.intersection(allowed_service_ids):
+                    eligible.append(rec)
 
-        # Filter: keep only records that have at least one allowed service (eligible).
-        eligible: list[Record] = []
-        for rec in seen_records:
-            service_ids = await _get_record_service_ids(session, rec.id)
-            if service_ids.intersection(allowed_service_ids):
-                eligible.append(rec)
+            eligible_count = len(eligible)
+            _fc_ctx["eligible_records"] = eligible_count
+            _total_ctx["eligible_records"] = eligible_count
 
-        eligible_count = len(eligible)
-        _fc_ctx["eligible_records"] = eligible_count
-        _total_ctx["eligible_records"] = eligible_count
+            if not eligible:
+                lead.meta = {
+                    **(lead.meta or {}),
+                    "existing_booking_skip_reason": "service_not_allowed",
+                    "existing_booking_seen_records": seen_count,
+                }
+                job.status = "done"
+                job.locked_at = None
+                job.last_error = None
+                return
 
-        if not eligible:
-            lead.meta = {
-                **(lead.meta or {}),
-                "existing_booking_skip_reason": "service_not_allowed",
-                "existing_booking_seen_records": seen_count,
-            }
-            job.status = "done"
-            job.locked_at = None
-            job.last_error = None
-            return
+            # Ambiguity: multiple eligible records sharing the earliest starts_at → fail-closed.
+            earliest_starts_at = eligible[0].starts_at
+            top_eligible = [r for r in eligible if r.starts_at == earliest_starts_at]
 
-        # Ambiguity: multiple eligible records sharing the earliest starts_at → fail-closed.
-        earliest_starts_at = eligible[0].starts_at
-        top_eligible = [r for r in eligible if r.starts_at == earliest_starts_at]
+            if len(top_eligible) > 1:
+                candidate_ids = [r.id for r in top_eligible]
+                lead.meta = {
+                    **(lead.meta or {}),
+                    "existing_booking_skip_reason": "ambiguous_candidates",
+                    "existing_booking_seen_records": seen_count,
+                    "existing_booking_eligible_records": eligible_count,
+                    "existing_booking_candidate_ids": candidate_ids,
+                }
+                job.status = "done"
+                job.locked_at = None
+                job.last_error = "promo_apply_existing_booking: ambiguous eligible candidates (same starts_at)"
+                return
 
-        if len(top_eligible) > 1:
-            candidate_ids = [r.id for r in top_eligible]
-            lead.meta = {
-                **(lead.meta or {}),
-                "existing_booking_skip_reason": "ambiguous_candidates",
-                "existing_booking_seen_records": seen_count,
-                "existing_booking_eligible_records": eligible_count,
-                "existing_booking_candidate_ids": candidate_ids,
-            }
-            job.status = "done"
-            job.locked_at = None
-            job.last_error = "promo_apply_existing_booking: ambiguous eligible candidates (same starts_at)"
-            return
+            candidate = top_eligible[0]
 
-        candidate = top_eligible[0]
-        booking_created_at = _get_booking_created_at_from_record(candidate)
+        booking_created_at = extract_booking_created_at_from_record_details(candidate.raw or {})
 
         # ── Apply discount ─────────────────────────────────────────────────────
         lead_status_before = lead.status
+        result_label = "unknown"
         with perf_log("promo_discount", "promo_apply_existing_booking.apply", job_id=job.id) as _ap_ctx:
             _ap_ctx["record_id"] = candidate.id
             _ap_ctx["booking_created_at_missing"] = booking_created_at is None
@@ -1983,26 +1989,27 @@ async def process_promo_apply_existing_booking_job(
                 allow_existing_booking_before_promo=True,
             )
 
-        # ── Outcome tracking ───────────────────────────────────────────────────
-        lead_status_after = lead.status
-        if lead_status_after == "applied":
-            result_label = "applied"
-        elif lead_status_after == "booked":
-            result_label = "booked_manual_review"
-        elif lead_status_after == "apply_failed":
-            result_label = "apply_failed"
-        elif lead_status_after == lead_status_before:
-            result_label = "skipped"
-        else:
-            result_label = f"status_changed:{lead_status_before}->{lead_status_after}"
+            # ── Outcome tracking ───────────────────────────────────────────────
+            lead_status_after = lead.status
+            if lead_status_after == "applied":
+                result_label = "applied"
+            elif lead_status_after == "booked":
+                result_label = "booked_manual_review"
+            elif lead_status_after == "apply_failed":
+                result_label = "apply_failed"
+            elif lead_status_after == lead_status_before:
+                result_label = "skipped"
+            else:
+                result_label = f"status_changed:{lead_status_before}->{lead_status_after}"
 
-        _ap_ctx["result"] = result_label
-        _total_ctx["result"] = result_label
+            _ap_ctx["result"] = result_label
+            _total_ctx["result"] = result_label
 
         lead.meta = {
             **(lead.meta or {}),
             "existing_booking_apply_result": result_label,
             "existing_booking_apply_record_id": candidate.id,
+            "existing_booking_apply_altegio_record_id": candidate.altegio_record_id,
             "existing_booking_seen_records": seen_count,
             "existing_booking_eligible_records": eligible_count,
             "existing_booking_candidate_ids": [candidate.id],
