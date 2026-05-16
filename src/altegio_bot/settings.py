@@ -192,6 +192,10 @@ class Settings(BaseSettings):
     #   (kept for backward compatibility with existing tests and smoke scripts).
     # Any other value raises ValueError at startup.
     promo_apply_mode: str = "record_price_override"
+    # Gate for the existing-booking apply automation.
+    # Default False: promo_apply_existing_booking jobs are never created.
+    # Requires promo_apply_discount_enabled=True to have any effect when True.
+    promo_apply_existing_booking_enabled: bool = False
 
     # ---------------------------------------------------------------------------
     # Network-aware promo lead application

@@ -43,6 +43,7 @@ from altegio_bot.altegio_record_update import (
     update_altegio_record_price_and_comment,
 )
 from altegio_bot.models.models import Client, MessageJob, PromoLead, Record, RecordService
+from altegio_bot.perf import perf_log
 from altegio_bot.settings import Settings, settings
 
 _LOCAL_TZ = ZoneInfo("Europe/Belgrade")
@@ -55,6 +56,9 @@ _PROMO_MARKER_RE = re.compile(r"\[PromoLead:\d+(?::\w+)?\]")
 # record_updated webhooks triggered by our own promo PUT are suppressed for this
 # many seconds after the PUT timestamp stored in PromoLead.meta.
 _SUPPRESS_WINDOW_SEC = 300  # 5 minutes
+
+# Ordered list of raw field names that may contain the booking creation timestamp.
+_RAW_TS_FIELDS = ("create_date", "created_at", "booking_created_at", "date_create")
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +75,27 @@ class PromoDiscountApplyResult:
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _get_booking_created_at_from_record(record: Record) -> datetime | None:
+    """Extract booking creation timestamp from record.raw.
+
+    Tries fields in order: create_date, created_at, booking_created_at, date_create.
+    Returns a UTC-aware datetime or None if none found or unparseable.
+    """
+    raw = record.raw or {}
+    for field in _RAW_TS_FIELDS:
+        val = raw.get(field)
+        if not val:
+            continue
+        try:
+            dt = datetime.fromisoformat(str(val))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except (ValueError, TypeError):
+            continue
+    return None
 
 
 def _auth_header() -> str:
@@ -1531,12 +1556,15 @@ async def try_apply_promo_discount(
         meta = lead.meta or {}
 
     if booking_created_at is None:
-        err = "missing booking created timestamp"
-        lead.meta = {**meta, "apply_skip_reason": err}
-        logger.info("promo_discount: skip lead_id=%s %s", lead.id, err)
-        return
-
-    if booking_created_at < lead.issued_at:
+        if not allow_existing_booking_before_promo:
+            err = "missing booking created timestamp"
+            lead.meta = {**meta, "apply_skip_reason": err}
+            logger.info("promo_discount: skip lead_id=%s %s", lead.id, err)
+            return
+        # Explicit existing-booking flow: raw timestamp unavailable, proceed without date guard.
+        meta = {**meta, "booking_created_at_missing": True}
+        lead.meta = meta
+    elif booking_created_at < lead.issued_at:
         if not allow_existing_booking_before_promo:
             err = "booking predates promo lead"
             lead.meta = {
@@ -1781,118 +1809,205 @@ async def process_promo_apply_existing_booking_job(
     """Apply promo discount to a pre-existing future booking.
 
     Called from outbox_worker for promo_apply_existing_booking jobs.
-    Searches local DB only (no external Altegio API calls) for the first
-    future non-attended record matching this phone, then attempts to apply
-    the promo discount.
+    Searches local DB only (no external Altegio API calls) during candidate
+    selection, then calls try_apply_promo_discount for the chosen record.
 
-    The booking may predate the promo issuance; allow_existing_booking_before_promo
-    is passed to try_apply_promo_discount to permit this case.
+    Candidate selection:
+      - Fetches up to 50 future non-attended records for this phone.
+      - Filters to those with at least one allowed service (eligible).
+      - Picks the earliest eligible record (by starts_at).
+      - If multiple eligible records share the earliest starts_at → ambiguous → fail-closed.
+
+    Defers (status=queued, run_at+10min) when apply gates are disabled,
+    rather than silently marking done and losing the opportunity.
     """
-    now = _utcnow()
-    payload = job.payload or {}
-    promo_lead_id = payload.get("promo_lead_id")
+    with perf_log("promo_discount", "promo_apply_existing_booking.total", job_id=job.id) as _total_ctx:
+        now = _utcnow()
+        payload = job.payload or {}
+        promo_lead_id = payload.get("promo_lead_id")
 
-    if promo_lead_id is None:
-        job.status = "failed"
-        job.locked_at = None
-        job.last_error = "promo_apply_existing_booking: missing promo_lead_id"
-        return
+        if promo_lead_id is None:
+            job.status = "failed"
+            job.locked_at = None
+            job.last_error = "promo_apply_existing_booking: missing promo_lead_id"
+            return
 
-    stmt = select(PromoLead).where(PromoLead.id == int(promo_lead_id)).with_for_update()
-    result = await session.execute(stmt)
-    lead = result.scalar_one_or_none()
+        stmt = select(PromoLead).where(PromoLead.id == int(promo_lead_id)).with_for_update()
+        result = await session.execute(stmt)
+        lead = result.scalar_one_or_none()
 
-    if lead is None:
-        job.status = "failed"
-        job.locked_at = None
-        job.last_error = f"promo_apply_existing_booking: PromoLead not found id={promo_lead_id}"
-        return
+        if lead is None:
+            job.status = "failed"
+            job.locked_at = None
+            job.last_error = f"promo_apply_existing_booking: PromoLead not found id={promo_lead_id}"
+            return
 
-    if lead.status != "issued":
-        job.status = "done"
-        job.locked_at = None
-        job.last_error = None
-        return
+        if lead.status != "issued":
+            job.status = "done"
+            job.locked_at = None
+            job.last_error = None
+            return
 
-    if lead.expires_at <= now:
-        job.status = "done"
-        job.locked_at = None
-        job.last_error = None
-        return
+        if lead.expires_at <= now:
+            job.status = "done"
+            job.locked_at = None
+            job.last_error = None
+            return
 
-    phone_e164 = lead.phone_e164
-    variants = _phone_variants(phone_e164)
+        # ── Gate checks: defer instead of silently dropping ───────────────────
+        cfg = settings
+        if not cfg.promo_apply_discount_enabled:
+            job.status = "queued"
+            job.locked_at = None
+            job.run_at = now + timedelta(minutes=10)
+            logger.info(
+                "promo_apply_existing_booking: promo_apply_discount_enabled=False, deferring job_id=%s",
+                job.id,
+            )
+            return
 
-    # Determine company scope: same-company by default, network if enabled.
-    cfg = settings
-    if cfg.promo_network_apply_enabled:
-        network_ids = get_promo_network_company_ids()
-        if network_ids and lead.company_id in network_ids:
-            company_filter = Record.company_id.in_(network_ids)
+        if not cfg.promo_apply_discount_api_verified:
+            job.status = "queued"
+            job.locked_at = None
+            job.run_at = now + timedelta(minutes=10)
+            logger.info(
+                "promo_apply_existing_booking: promo_apply_discount_api_verified=False, deferring job_id=%s",
+                job.id,
+            )
+            return
+
+        # Fail-closed: empty allowlist means no automatic apply.
+        allowed_service_ids = get_promo_allowed_service_ids()
+        if not allowed_service_ids:
+            lead.meta = {**(lead.meta or {}), "existing_booking_skip_reason": "service_allowlist_empty"}
+            job.status = "done"
+            job.locked_at = None
+            job.last_error = None
+            return
+
+        phone_e164 = lead.phone_e164
+        variants = _phone_variants(phone_e164)
+
+        # Determine company scope: same-company by default, network if enabled.
+        if cfg.promo_network_apply_enabled:
+            network_ids = get_promo_network_company_ids()
+            if network_ids and lead.company_id in network_ids:
+                company_filter = Record.company_id.in_(network_ids)
+            else:
+                company_filter = Record.company_id == lead.company_id
         else:
             company_filter = Record.company_id == lead.company_id
-    else:
-        company_filter = Record.company_id == lead.company_id
 
-    # Find the first two future non-attended records to detect ambiguity.
-    # LIMIT 2: if two records share the same earliest starts_at → ambiguous → fail-closed.
-    cand_stmt = (
-        select(Record)
-        .join(Client, Client.id == Record.client_id)
-        .where(Client.phone_e164.in_(variants))
-        .where(company_filter)
-        .where(Record.is_deleted.is_(False))
-        .where(Record.starts_at > now)
-        .where(or_(Record.attendance.is_(None), Record.attendance != 1))
-        .where(or_(Record.visit_attendance.is_(None), Record.visit_attendance != 1))
-        .order_by(Record.starts_at.asc(), Record.id.asc())
-        .limit(2)
-    )
-    result = await session.execute(cand_stmt)
-    candidates = list(result.scalars().all())
+        # ── Find candidates ────────────────────────────────────────────────────
+        with perf_log("promo_discount", "promo_apply_existing_booking.find_candidates", job_id=job.id) as _fc_ctx:
+            cand_stmt = (
+                select(Record)
+                .join(Client, Client.id == Record.client_id)
+                .where(Client.phone_e164.in_(variants))
+                .where(company_filter)
+                .where(Record.is_deleted.is_(False))
+                .where(Record.starts_at > now)
+                .where(or_(Record.attendance.is_(None), Record.attendance != 1))
+                .where(or_(Record.visit_attendance.is_(None), Record.visit_attendance != 1))
+                .order_by(Record.starts_at.asc(), Record.id.asc())
+                .limit(50)
+            )
+            result = await session.execute(cand_stmt)
+            seen_records = list(result.scalars().all())
 
-    if not candidates:
-        lead.meta = {**(lead.meta or {}), "existing_booking_skip_reason": "no_future_booking"}
+        seen_count = len(seen_records)
+        _fc_ctx["seen_records"] = seen_count
+        _total_ctx["seen_records"] = seen_count
+
+        if not seen_records:
+            lead.meta = {**(lead.meta or {}), "existing_booking_skip_reason": "no_future_booking"}
+            job.status = "done"
+            job.locked_at = None
+            job.last_error = None
+            return
+
+        # Filter: keep only records that have at least one allowed service (eligible).
+        eligible: list[Record] = []
+        for rec in seen_records:
+            service_ids = await _get_record_service_ids(session, rec.id)
+            if service_ids.intersection(allowed_service_ids):
+                eligible.append(rec)
+
+        eligible_count = len(eligible)
+        _fc_ctx["eligible_records"] = eligible_count
+        _total_ctx["eligible_records"] = eligible_count
+
+        if not eligible:
+            lead.meta = {
+                **(lead.meta or {}),
+                "existing_booking_skip_reason": "service_not_allowed",
+                "existing_booking_seen_records": seen_count,
+            }
+            job.status = "done"
+            job.locked_at = None
+            job.last_error = None
+            return
+
+        # Ambiguity: multiple eligible records sharing the earliest starts_at → fail-closed.
+        earliest_starts_at = eligible[0].starts_at
+        top_eligible = [r for r in eligible if r.starts_at == earliest_starts_at]
+
+        if len(top_eligible) > 1:
+            candidate_ids = [r.id for r in top_eligible]
+            lead.meta = {
+                **(lead.meta or {}),
+                "existing_booking_skip_reason": "ambiguous_candidates",
+                "existing_booking_seen_records": seen_count,
+                "existing_booking_eligible_records": eligible_count,
+                "existing_booking_candidate_ids": candidate_ids,
+            }
+            job.status = "done"
+            job.locked_at = None
+            job.last_error = "promo_apply_existing_booking: ambiguous eligible candidates (same starts_at)"
+            return
+
+        candidate = top_eligible[0]
+        booking_created_at = _get_booking_created_at_from_record(candidate)
+
+        # ── Apply discount ─────────────────────────────────────────────────────
+        lead_status_before = lead.status
+        with perf_log("promo_discount", "promo_apply_existing_booking.apply", job_id=job.id) as _ap_ctx:
+            _ap_ctx["record_id"] = candidate.id
+            _ap_ctx["booking_created_at_missing"] = booking_created_at is None
+
+            await try_apply_promo_discount(
+                session,
+                candidate,
+                candidate.company_id,
+                booking_created_at=booking_created_at,
+                allow_existing_booking_before_promo=True,
+            )
+
+        # ── Outcome tracking ───────────────────────────────────────────────────
+        lead_status_after = lead.status
+        if lead_status_after == "applied":
+            result_label = "applied"
+        elif lead_status_after == "booked":
+            result_label = "booked_manual_review"
+        elif lead_status_after == "apply_failed":
+            result_label = "apply_failed"
+        elif lead_status_after == lead_status_before:
+            result_label = "skipped"
+        else:
+            result_label = f"status_changed:{lead_status_before}->{lead_status_after}"
+
+        _ap_ctx["result"] = result_label
+        _total_ctx["result"] = result_label
+
+        lead.meta = {
+            **(lead.meta or {}),
+            "existing_booking_apply_result": result_label,
+            "existing_booking_apply_record_id": candidate.id,
+            "existing_booking_seen_records": seen_count,
+            "existing_booking_eligible_records": eligible_count,
+            "existing_booking_candidate_ids": [candidate.id],
+        }
+
         job.status = "done"
         job.locked_at = None
         job.last_error = None
-        return
-
-    if len(candidates) == 2 and candidates[0].starts_at == candidates[1].starts_at:
-        lead.meta = {**(lead.meta or {}), "existing_booking_skip_reason": "ambiguous_candidates"}
-        job.status = "done"
-        job.locked_at = None
-        job.last_error = "promo_apply_existing_booking: ambiguous candidates (same starts_at)"
-        return
-
-    candidate = candidates[0]
-
-    # Fail-closed: empty allowlist means no automatic apply.
-    allowed_service_ids = get_promo_allowed_service_ids()
-    if not allowed_service_ids:
-        lead.meta = {**(lead.meta or {}), "existing_booking_skip_reason": "service_allowlist_empty"}
-        job.status = "done"
-        job.locked_at = None
-        job.last_error = None
-        return
-
-    record_service_ids = await _get_record_service_ids(session, candidate.id)
-    if not record_service_ids.intersection(allowed_service_ids):
-        lead.meta = {**(lead.meta or {}), "existing_booking_skip_reason": "service_not_allowed"}
-        job.status = "done"
-        job.locked_at = None
-        job.last_error = None
-        return
-
-    # Apply — allow existing bookings regardless of whether they predate the promo.
-    await try_apply_promo_discount(
-        session,
-        candidate,
-        candidate.company_id,
-        booking_created_at=candidate.starts_at,
-        allow_existing_booking_before_promo=True,
-    )
-
-    job.status = "done"
-    job.locked_at = None
-    job.last_error = None

@@ -104,7 +104,11 @@ def _build_services_block() -> str:
     text = settings.promo_allowed_services_display_text.strip()
     if not text:
         return ""
-    return f"Der Rabatt gilt für folgende Leistungen:\n{text}\n\n"
+    return (
+        f"Bitte buchen Sie für diese Aktion eine der folgenden Leistungen:\n"
+        f"{text}\n\n"
+        f"Nur bei diesen Leistungen kann der Rabatt automatisch zugeordnet werden.\n\n"
+    )
 
 
 def _format_discount(amount: Decimal, discount_type: str) -> str:
@@ -456,17 +460,29 @@ async def _ensure_promo_apply_existing_booking_job(
 ) -> None:
     """Idempotent: create a promo_apply_existing_booking job for a newly issued lead.
 
-    Searches for a pre-existing future booking after the lead is issued.
+    No-op when promo_apply_existing_booking_enabled=False.
     Uses a savepoint to handle concurrent creation safely.
+    Writes job_id, queued_at, and dedupe_key into lead.meta on success.
     """
+    if not settings.promo_apply_existing_booking_enabled:
+        return
+
     dedupe_key = f"{PROMO_APPLY_EXISTING_BOOKING_JOB_TYPE}:{lead.id}"
 
     existing = (
         await session.execute(select(MessageJob).where(MessageJob.dedupe_key == dedupe_key))
     ).scalar_one_or_none()
     if existing is not None:
+        lead.meta = {
+            **(lead.meta or {}),
+            "existing_booking_job_queued": True,
+            "existing_booking_job_id": existing.id,
+            "existing_booking_job_queued_at": now.isoformat(),
+            "existing_booking_job_dedupe_key": dedupe_key,
+        }
         return
 
+    job: MessageJob | None = None
     try:
         async with session.begin_nested():
             job = MessageJob(
@@ -482,7 +498,18 @@ async def _ensure_promo_apply_existing_booking_job(
             session.add(job)
             await session.flush()
     except IntegrityError:
-        pass
+        job = (
+            await session.execute(select(MessageJob).where(MessageJob.dedupe_key == dedupe_key))
+        ).scalar_one_or_none()
+
+    if job is not None:
+        lead.meta = {
+            **(lead.meta or {}),
+            "existing_booking_job_queued": True,
+            "existing_booking_job_id": job.id,
+            "existing_booking_job_queued_at": now.isoformat(),
+            "existing_booking_job_dedupe_key": dedupe_key,
+        }
 
 
 def _promo_retry_delay_seconds(attempt: int) -> int:
@@ -1179,10 +1206,6 @@ async def handle_promo_command(
             ):
                 card_issue_failed = True
 
-        # ── Enqueue existing-booking job for new issued leads ─────────────────
-        if new_lead is not None and new_lead.status == "issued" and not card_issue_failed:
-            await _ensure_promo_apply_existing_booking_job(session, new_lead, now)
-
         # Determine reply from the actual DB outcome.
         if new_lead is not None:
             if new_lead.status == "pending_check":
@@ -1286,6 +1309,10 @@ async def handle_promo_command(
         if meta_after.get("card_message_pending"):
             meta_after["card_message_pending"] = False
         lead_to_update.meta = meta_after
+
+    # Enqueue existing-booking job only after successful send.
+    if new_lead is not None and new_lead.status == "issued" and not card_issue_failed:
+        await _ensure_promo_apply_existing_booking_job(session, new_lead, now)
 
     # ── 6. Audit OutboxMessage ───────────────────────────────────────────────
     session.add(

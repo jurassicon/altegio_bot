@@ -1,21 +1,33 @@
 """Tests: promo service block in replies and promo_apply_existing_booking job.
 
 Covers:
-A.  build_reply_issued_with_card() includes service block when setting is non-empty.
+A.  build_reply_issued_with_card() includes service block (new German text).
 B.  Empty promo_allowed_services_display_text → no service block in any issued reply.
 C.  build_reply_issued() and build_reply_already_issued() also include the block.
-D.  handle_promo_command() creates promo_apply_existing_booking job for new issued lead.
-E.  process_promo_eligibility_check_job() creates job after decision_status='issued'.
-F.  process_promo_apply_existing_booking_job: existing booking predating promo,
-    allowed service → discount applied (allow_existing_booking_before_promo flag).
-G.  process_promo_apply_existing_booking_job: no future booking → done,
-    meta.existing_booking_skip_reason='no_future_booking'.
-H.  process_promo_apply_existing_booking_job: future booking but service not allowed
-    → done, no Altegio API calls.
-I.  process_promo_apply_existing_booking_job: ambiguous candidates (same starts_at)
-    → fail-closed, meta.existing_booking_skip_reason='ambiguous_candidates'.
-J.  _ensure_promo_apply_existing_booking_job is idempotent: two calls → one job.
-K.  process_promo_apply_existing_booking_job skips non-issued leads (applied/booked/expired).
+D.  handle_promo_command():
+      D1. Creates promo_apply_existing_booking job for new issued lead (gate=True, send OK).
+      D2. Does NOT create job when promo_apply_existing_booking_enabled=False.
+      D3. Does NOT create job when safe_send fails.
+E.  process_promo_eligibility_check_job():
+      E1. Creates job after decision_status='issued' (gate=True, send OK).
+      E2. Does NOT create job when send fails.
+F.  process_promo_apply_existing_booking_job:
+      F1. Booking predating promo, raw timestamp used → applied,
+          booking_created_before_promo_allowed=True in meta.
+      F2. First record has non-allowed service, second has allowed → second chosen.
+      F3. Missing raw timestamp → booking_created_at_missing=True in meta, still applied.
+G.  No future booking → done, meta.existing_booking_skip_reason='no_future_booking'.
+H.  Future booking but service not allowed → done, no Altegio API calls.
+I.  Ambiguous candidates:
+      I1. Two eligible records with same starts_at → fail-closed,
+          meta.existing_booking_skip_reason='ambiguous_candidates'.
+      I2. Two records with same starts_at but only one is eligible (other has wrong
+          service) → not ambiguous, eligible one chosen.
+J.  _ensure_promo_apply_existing_booking_job is idempotent: two calls → one job;
+    lead.meta receives job_id, queued_at, dedupe_key.
+K.  process_promo_apply_existing_booking_job skips non-issued/expired leads.
+    Defers (status='queued') when promo_apply_discount_enabled=False or
+    promo_apply_discount_api_verified=False.
 L.  handle_promo_command does not call Altegio record-search or PUT APIs — job
     is created without proactively searching for existing bookings.
 """
@@ -79,6 +91,7 @@ def _enable_promo_funnel():
         patch.object(settings, "promo_check_new_client_in_altegio", False),
         patch.object(settings, "promo_async_eligibility_check_enabled", False),
         patch.object(settings, "promo_allowed_services_display_text", ""),
+        patch.object(settings, "promo_apply_existing_booking_enabled", True),
     ):
         yield
 
@@ -92,6 +105,16 @@ class _CaptureProvider:
     async def send(self, sender_id, phone_e164, text, contact_name=None):
         self.sent.append((sender_id, phone_e164, text))
         return self.wamid
+
+    async def send_template(self, *args, **kwargs):
+        pass
+
+
+class _FailingProvider:
+    """Provider that always raises on send — simulates delivery failure."""
+
+    async def send(self, sender_id, phone_e164, text, contact_name=None):
+        raise RuntimeError("simulated send failure")
 
     async def send_template(self, *args, **kwargs):
         pass
@@ -171,6 +194,7 @@ async def _seed_record(
     attendance: int | None = None,
     visit_attendance: int | None = None,
     company_id: int = _COMPANY,
+    raw: dict | None = None,
 ) -> Record:
     r = Record(
         id=record_id,
@@ -182,7 +206,7 @@ async def _seed_record(
         starts_at=starts_at,
         attendance=attendance,
         visit_attendance=visit_attendance,
-        raw={},
+        raw=raw if raw is not None else {},
     )
     session.add(r)
     await session.flush()
@@ -261,13 +285,22 @@ def _make_existing_booking_job(lead_id: int, *, job_id: int = 500) -> MessageJob
     )
 
 
+_FAKE_ALTEGIO_RECORD = {
+    "attendance": 0,
+    "visit_attendance": 0,
+    "services": [{"id": _ALLOWED_SERVICE, "cost": 100.0, "manual_cost": None}],
+    "comment": "",
+}
+_FAKE_PUT_RESULT = {"data": {"services": [{"id": _ALLOWED_SERVICE, "discount": 15.0}]}}
+
+
 # =============================================================================
-# A. Service block in build_reply_issued_with_card
+# A. Service block — new German text
 # =============================================================================
 
 
 def test_service_block_in_issued_with_card_reply() -> None:
-    """Test A: build_reply_issued_with_card includes service block when setting is set."""
+    """Test A: build_reply_issued_with_card includes new German service block text."""
     expires_at = datetime(2026, 6, 30, tzinfo=_UTC)
     with patch.object(settings, "promo_allowed_services_display_text", "Haarschnitt, Coloration"):
         reply = build_reply_issued_with_card(
@@ -277,10 +310,11 @@ def test_service_block_in_issued_with_card_reply() -> None:
             "fixed",
             "CARD42",
         )
-    assert "Der Rabatt gilt für folgende Leistungen:" in reply
+    assert "Bitte buchen Sie für diese Aktion eine der folgenden Leistungen:" in reply
     assert "Haarschnitt, Coloration" in reply
+    assert "Nur bei diesen Leistungen kann der Rabatt automatisch zugeordnet werden." in reply
     # Block must appear before the booking link.
-    assert reply.index("Leistungen:") < reply.index("Termin buchen:")
+    assert reply.index("Nur bei diesen Leistungen") < reply.index("Termin buchen:")
 
 
 # =============================================================================
@@ -298,7 +332,8 @@ def test_no_service_block_when_setting_empty() -> None:
     ):
         with patch.object(settings, "promo_allowed_services_display_text", ""):
             reply = fn()
-        assert "Leistungen" not in reply
+        assert "Bitte buchen Sie für diese Aktion" not in reply
+        assert "Nur bei diesen Leistungen" not in reply
 
 
 def test_no_service_block_when_setting_whitespace_only() -> None:
@@ -306,7 +341,7 @@ def test_no_service_block_when_setting_whitespace_only() -> None:
     expires_at = datetime(2026, 6, 30, tzinfo=_UTC)
     with patch.object(settings, "promo_allowed_services_display_text", "   \t  "):
         reply = build_reply_issued(expires_at, "https://example.com", Decimal("15"), "fixed")
-    assert "Leistungen" not in reply
+    assert "Bitte buchen Sie für diese Aktion" not in reply
 
 
 # =============================================================================
@@ -315,7 +350,7 @@ def test_no_service_block_when_setting_whitespace_only() -> None:
 
 
 def test_service_block_in_issued_and_already_issued_replies() -> None:
-    """Test C: service block appears in build_reply_issued and build_reply_already_issued."""
+    """Test C: service block (new German text) appears in both issued reply builders."""
     expires_at = datetime(2026, 6, 30, tzinfo=_UTC)
     services_text = "Haarschnitt, Keratin"
     with patch.object(settings, "promo_allowed_services_display_text", services_text):
@@ -323,19 +358,20 @@ def test_service_block_in_issued_and_already_issued_replies() -> None:
         r_already = build_reply_already_issued(expires_at, "https://example.com")
 
     for reply in (r_issued, r_already):
-        assert "Der Rabatt gilt für folgende Leistungen:" in reply
+        assert "Bitte buchen Sie für diese Aktion eine der folgenden Leistungen:" in reply
         assert services_text in reply
-        assert reply.index("Leistungen:") < reply.index("Termin buchen:")
+        assert "Nur bei diesen Leistungen kann der Rabatt automatisch zugeordnet werden." in reply
+        assert reply.index("Nur bei diesen Leistungen") < reply.index("Termin buchen:")
 
 
 # =============================================================================
-# D. handle_promo_command creates promo_apply_existing_booking job
+# D. handle_promo_command: job creation, gate, send failure
 # =============================================================================
 
 
 @pytest.mark.asyncio
 async def test_handle_promo_command_creates_existing_booking_job(session_maker) -> None:
-    """Test D: handle_promo_command enqueues promo_apply_existing_booking for new issued lead."""
+    """Test D1: handle_promo_command enqueues promo_apply_existing_booking for new issued lead."""
     provider = _CaptureProvider()
 
     async with session_maker() as session:
@@ -343,7 +379,7 @@ async def test_handle_promo_command_creates_existing_booking_job(session_maker) 
             await _setup_sender(session)
 
             evt = WhatsAppEvent(
-                dedupe_key="wa:existing-booking-D-1",
+                dedupe_key="wa:existing-booking-D1",
                 status="received",
                 error=None,
                 query={},
@@ -374,26 +410,104 @@ async def test_handle_promo_command_creates_existing_booking_job(session_maker) 
     assert job.payload.get("promo_lead_id") == lead.id
     assert job.dedupe_key == f"{PROMO_APPLY_EXISTING_BOOKING_JOB_TYPE}:{lead.id}"
     assert job.max_attempts == 3
+    # Richer meta written to lead
+    meta = lead.meta or {}
+    assert meta.get("existing_booking_job_queued") is True
+    assert meta.get("existing_booking_job_id") == job.id
+    assert "existing_booking_job_queued_at" in meta
+
+
+@pytest.mark.asyncio
+async def test_handle_promo_command_no_job_when_gate_disabled(session_maker) -> None:
+    """Test D2: gate=False → promo_apply_existing_booking job NOT created."""
+    provider = _CaptureProvider()
+
+    with patch.object(settings, "promo_apply_existing_booking_enabled", False):
+        async with session_maker() as session:
+            async with session.begin():
+                await _setup_sender(session, sender_id=402)
+
+                evt = WhatsAppEvent(
+                    dedupe_key="wa:existing-booking-D2",
+                    status="received",
+                    error=None,
+                    query={},
+                    headers={},
+                    payload=_inbound_payload(PHONE_NUMBER_ID, FROM_PHONE, "aktion"),
+                )
+                session.add(evt)
+                await session.flush()
+
+                with patch(
+                    "altegio_bot.workers.whatsapp_inbox_worker.ChatwootClient",
+                    return_value=_FakeCW(),
+                ):
+                    await handle_event(session, evt, provider)
+
+    async with session_maker() as s:
+        jobs = list(
+            (await s.execute(select(MessageJob).where(MessageJob.job_type == PROMO_APPLY_EXISTING_BOOKING_JOB_TYPE)))
+            .scalars()
+            .all()
+        )
+
+    assert len(jobs) == 0, "gate disabled: no promo_apply_existing_booking job must be created"
+
+
+@pytest.mark.asyncio
+async def test_handle_promo_command_no_job_on_send_failure(session_maker) -> None:
+    """Test D3: send fails → promo_apply_existing_booking job NOT created."""
+    provider = _FailingProvider()
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _setup_sender(session, sender_id=403)
+
+            evt = WhatsAppEvent(
+                dedupe_key="wa:existing-booking-D3",
+                status="received",
+                error=None,
+                query={},
+                headers={},
+                payload=_inbound_payload(PHONE_NUMBER_ID, FROM_PHONE, "aktion"),
+            )
+            session.add(evt)
+            await session.flush()
+
+            with patch(
+                "altegio_bot.workers.whatsapp_inbox_worker.ChatwootClient",
+                return_value=_FakeCW(),
+            ):
+                await handle_event(session, evt, provider)
+
+    async with session_maker() as s:
+        jobs = list(
+            (await s.execute(select(MessageJob).where(MessageJob.job_type == PROMO_APPLY_EXISTING_BOOKING_JOB_TYPE)))
+            .scalars()
+            .all()
+        )
+
+    assert len(jobs) == 0, "send failed: job must NOT be created before successful send"
 
 
 # =============================================================================
-# E. process_promo_eligibility_check_job creates job after decision_status='issued'
+# E. process_promo_eligibility_check_job: job creation, send failure
 # =============================================================================
 
 
 @pytest.mark.asyncio
 async def test_eligibility_check_job_creates_existing_booking_job(session_maker) -> None:
-    """Test E: process_promo_eligibility_check_job enqueues existing-booking job on 'issued'."""
+    """Test E1: process_promo_eligibility_check_job enqueues existing-booking job on 'issued'."""
     provider = _CaptureProvider()
 
     # Step 1: fire promo with async eligibility check enabled → creates pending_check lead + job.
     with patch.object(settings, "promo_async_eligibility_check_enabled", True):
         async with session_maker() as session:
             async with session.begin():
-                await _setup_sender(session)
+                await _setup_sender(session, sender_id=404)
 
                 evt = WhatsAppEvent(
-                    dedupe_key="wa:existing-booking-E-1",
+                    dedupe_key="wa:existing-booking-E1",
                     status="received",
                     error=None,
                     query={},
@@ -434,28 +548,82 @@ async def test_eligibility_check_job_creates_existing_booking_job(session_maker)
     assert refreshed_lead.status == "issued"
     assert len(eb_jobs) == 1, "exactly one promo_apply_existing_booking job must be created"
     assert eb_jobs[0].payload.get("promo_lead_id") == lead.id
-
-
-# =============================================================================
-# F. Existing booking before promo → applied (allow_existing_booking_before_promo)
-# =============================================================================
+    # Richer meta
+    meta = refreshed_lead.meta or {}
+    assert meta.get("existing_booking_job_queued") is True
 
 
 @pytest.mark.asyncio
-async def test_promo_apply_existing_booking_applies_discount(session_maker) -> None:
-    """Test F: booking starts_at predates promo issued_at, allowed service → applied."""
-    # Set issued_at far in the future so starts_at (which is also in the future
-    # but earlier) is before issued_at — exercising the promo timestamp guard bypass.
-    _ISSUED_AT = datetime(2099, 6, 1, 0, 0, tzinfo=_UTC)
-    _STARTS_AT = datetime(2099, 5, 1, 0, 0, tzinfo=_UTC)  # future but < issued_at
+async def test_eligibility_check_job_no_existing_booking_job_on_send_failure(session_maker) -> None:
+    """Test E2: eligibility check send fails → existing-booking job NOT created."""
+    provider = _FailingProvider()
+
+    with patch.object(settings, "promo_async_eligibility_check_enabled", True):
+        async with session_maker() as session:
+            async with session.begin():
+                await _setup_sender(session, sender_id=405)
+
+                evt = WhatsAppEvent(
+                    dedupe_key="wa:existing-booking-E2",
+                    status="received",
+                    error=None,
+                    query={},
+                    headers={},
+                    payload=_inbound_payload(PHONE_NUMBER_ID, FROM_PHONE, "aktion"),
+                )
+                session.add(evt)
+                await session.flush()
+
+                # Inbound send (checking status) uses _CaptureProvider so it succeeds.
+                with patch(
+                    "altegio_bot.workers.whatsapp_inbox_worker.ChatwootClient",
+                    return_value=_FakeCW(),
+                ):
+                    await handle_event(session, evt, _CaptureProvider())
+
+    async with session_maker() as s:
+        elig_job = (
+            await s.execute(select(MessageJob).where(MessageJob.job_type == PROMO_ELIGIBILITY_CHECK_JOB_TYPE))
+        ).scalar_one()
+
+    # Process eligibility job with a failing provider → send fails → no existing-booking job.
+    async with session_maker() as session:
+        async with session.begin():
+            await ow.process_job_in_session(session, elig_job.id, provider)
+
+    async with session_maker() as s:
+        eb_jobs = list(
+            (await s.execute(select(MessageJob).where(MessageJob.job_type == PROMO_APPLY_EXISTING_BOOKING_JOB_TYPE)))
+            .scalars()
+            .all()
+        )
+
+    assert len(eb_jobs) == 0, "send failed: existing-booking job must NOT be created"
+
+
+# =============================================================================
+# F. process_promo_apply_existing_booking_job: timestamp and service selection
+# =============================================================================
+
+# Fixed timestamps for F tests — all in the far future for clarity.
+_F_BOOKING_CREATED_AT = datetime(2099, 4, 1, 0, 0, tzinfo=_UTC)  # booking created
+_F_ISSUED_AT = datetime(2099, 6, 1, 0, 0, tzinfo=_UTC)  # promo issued (after booking)
+_F_STARTS_AT = datetime(2099, 7, 1, 0, 0, tzinfo=_UTC)  # appointment (future)
+_F_EXPIRES_AT = datetime(2199, 1, 1, tzinfo=_UTC)
+
+
+@pytest.mark.asyncio
+async def test_promo_apply_existing_booking_raw_timestamp_predates_promo(session_maker) -> None:
+    """Test F1: raw create_date used; predates promo issued_at; allow flag → applied."""
+    raw_ts = {"create_date": _F_BOOKING_CREATED_AT.isoformat()}
 
     async with session_maker() as session:
         async with session.begin():
             await _seed_client(session)
-            await _seed_record(session, starts_at=_STARTS_AT)
+            await _seed_record(session, starts_at=_F_STARTS_AT, raw=raw_ts)
             await _seed_service(session)
 
-            lead = _make_lead(issued_at=_ISSUED_AT, expires_at=datetime(2199, 1, 1, tzinfo=_UTC))
+            lead = _make_lead(issued_at=_F_ISSUED_AT, expires_at=_F_EXPIRES_AT)
             session.add(lead)
             await session.flush()
 
@@ -463,23 +631,15 @@ async def test_promo_apply_existing_booking_applies_discount(session_maker) -> N
             session.add(job)
             await session.flush()
 
-            fake_altegio_record = {
-                "attendance": 0,
-                "visit_attendance": 0,
-                "services": [{"id": _ALLOWED_SERVICE, "cost": 100.0, "manual_cost": None}],
-                "comment": "",
-            }
-            fake_put_result = {"data": {"services": [{"id": _ALLOWED_SERVICE, "discount": 15.0}]}}
-
             with (
                 _base_settings_ctx(),
                 patch(
                     "altegio_bot.promo_discount_apply.fetch_altegio_record_for_update",
-                    AsyncMock(return_value=fake_altegio_record),
+                    AsyncMock(return_value=_FAKE_ALTEGIO_RECORD),
                 ),
                 patch(
                     "altegio_bot.promo_discount_apply.update_altegio_record_price_and_comment",
-                    AsyncMock(return_value=fake_put_result),
+                    AsyncMock(return_value=_FAKE_PUT_RESULT),
                 ),
             ):
                 await process_promo_apply_existing_booking_job(session, job)
@@ -494,6 +654,102 @@ async def test_promo_apply_existing_booking_applies_discount(session_maker) -> N
     assert refreshed_lead.status == "applied"
     meta = refreshed_lead.meta or {}
     assert meta.get("booking_created_before_promo_allowed") is True
+    assert meta.get("existing_booking_apply_result") == "applied"
+    assert meta.get("existing_booking_apply_record_id") == 300
+
+
+@pytest.mark.asyncio
+async def test_promo_apply_existing_booking_first_not_allowed_second_allowed(session_maker) -> None:
+    """Test F2: first future record has wrong service; second has allowed → second chosen."""
+    _STARTS_AT_1 = datetime(2099, 5, 1, tzinfo=_UTC)  # earlier, non-allowed service
+    _STARTS_AT_2 = datetime(2099, 8, 1, tzinfo=_UTC)  # later, allowed service
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_client(session)
+            await _seed_record(session, record_id=301, altegio_record_id=8001, starts_at=_STARTS_AT_1)
+            await _seed_service(session, record_id=301, service_id=_OTHER_SERVICE)
+            await _seed_record(session, record_id=302, altegio_record_id=8002, starts_at=_STARTS_AT_2)
+            await _seed_service(session, record_id=302, service_id=_ALLOWED_SERVICE)
+
+            lead = _make_lead(expires_at=_F_EXPIRES_AT)
+            session.add(lead)
+            await session.flush()
+
+            job = _make_existing_booking_job(lead.id)
+            session.add(job)
+            await session.flush()
+
+            with (
+                _base_settings_ctx(),
+                patch(
+                    "altegio_bot.promo_discount_apply.fetch_altegio_record_for_update",
+                    AsyncMock(return_value=_FAKE_ALTEGIO_RECORD),
+                ),
+                patch(
+                    "altegio_bot.promo_discount_apply.update_altegio_record_price_and_comment",
+                    AsyncMock(return_value=_FAKE_PUT_RESULT),
+                ),
+            ):
+                await process_promo_apply_existing_booking_job(session, job)
+
+            lead_id = lead.id
+
+    async with session_maker() as s:
+        refreshed_lead = await s.get(PromoLead, lead_id)
+
+    assert job.status == "done"
+    assert refreshed_lead is not None
+    meta = refreshed_lead.meta or {}
+    # Second record (302) must have been selected, not the first (301).
+    assert meta.get("existing_booking_apply_record_id") == 302
+    assert meta.get("existing_booking_apply_result") == "applied"
+
+
+@pytest.mark.asyncio
+async def test_promo_apply_existing_booking_missing_raw_timestamp(session_maker) -> None:
+    """Test F3: no timestamp in record.raw → booking_created_at_missing=True, still applied."""
+    _STARTS_AT = datetime(2099, 5, 1, tzinfo=_UTC)
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_client(session)
+            # raw={} → no timestamp fields → _get_booking_created_at_from_record returns None
+            await _seed_record(session, starts_at=_STARTS_AT, raw={})
+            await _seed_service(session)
+
+            lead = _make_lead(expires_at=_F_EXPIRES_AT)
+            session.add(lead)
+            await session.flush()
+
+            job = _make_existing_booking_job(lead.id)
+            session.add(job)
+            await session.flush()
+
+            with (
+                _base_settings_ctx(),
+                patch(
+                    "altegio_bot.promo_discount_apply.fetch_altegio_record_for_update",
+                    AsyncMock(return_value=_FAKE_ALTEGIO_RECORD),
+                ),
+                patch(
+                    "altegio_bot.promo_discount_apply.update_altegio_record_price_and_comment",
+                    AsyncMock(return_value=_FAKE_PUT_RESULT),
+                ),
+            ):
+                await process_promo_apply_existing_booking_job(session, job)
+
+            lead_id = lead.id
+
+    async with session_maker() as s:
+        refreshed_lead = await s.get(PromoLead, lead_id)
+
+    assert job.status == "done"
+    assert refreshed_lead is not None
+    meta = refreshed_lead.meta or {}
+    # try_apply_promo_discount must have set booking_created_at_missing=True.
+    assert meta.get("booking_created_at_missing") is True
+    assert meta.get("existing_booking_apply_result") == "applied"
 
 
 # =============================================================================
@@ -539,7 +795,7 @@ async def test_promo_apply_existing_booking_no_future_record(session_maker) -> N
 @pytest.mark.asyncio
 async def test_promo_apply_existing_booking_service_not_allowed(session_maker) -> None:
     """Test H: future record exists but service not in allowlist → skip, no API call."""
-    _STARTS_AT = _NOW + timedelta(days=7)
+    _STARTS_AT = datetime(2099, 5, 1, tzinfo=_UTC)
 
     fetch_mock = AsyncMock()
 
@@ -580,19 +836,19 @@ async def test_promo_apply_existing_booking_service_not_allowed(session_maker) -
 
 
 # =============================================================================
-# I. Ambiguous candidates (same starts_at) → fail-closed
+# I. Ambiguous candidates / only one eligible
 # =============================================================================
 
 
 @pytest.mark.asyncio
-async def test_promo_apply_existing_booking_ambiguous_candidates(session_maker) -> None:
-    """Test I: two future records with identical starts_at → ambiguous → fail-closed."""
-    _STARTS_AT = _NOW + timedelta(days=5)
+async def test_promo_apply_existing_booking_ambiguous_eligible_candidates(session_maker) -> None:
+    """Test I1: two eligible records with identical starts_at → ambiguous → fail-closed."""
+    _STARTS_AT = datetime(2099, 5, 1, tzinfo=_UTC)
 
     async with session_maker() as session:
         async with session.begin():
             await _seed_client(session)
-            # Two records with the same starts_at.
+            # Both records have the allowed service and the same starts_at.
             await _seed_record(session, record_id=301, altegio_record_id=8001, starts_at=_STARTS_AT)
             await _seed_service(session, record_id=301, service_id=_ALLOWED_SERVICE)
             await _seed_record(session, record_id=302, altegio_record_id=8002, starts_at=_STARTS_AT)
@@ -619,10 +875,61 @@ async def test_promo_apply_existing_booking_ambiguous_candidates(session_maker) 
     assert refreshed_lead.status == "issued"
     meta = refreshed_lead.meta or {}
     assert meta.get("existing_booking_skip_reason") == "ambiguous_candidates"
+    assert meta.get("existing_booking_eligible_records") == 2
+
+
+@pytest.mark.asyncio
+async def test_promo_apply_existing_booking_one_eligible_same_starts_at(session_maker) -> None:
+    """Test I2: two records with same starts_at; only one is eligible → not ambiguous."""
+    _STARTS_AT = datetime(2099, 5, 1, tzinfo=_UTC)
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_client(session)
+            # First record: non-allowed service (not eligible).
+            await _seed_record(session, record_id=301, altegio_record_id=8001, starts_at=_STARTS_AT)
+            await _seed_service(session, record_id=301, service_id=_OTHER_SERVICE)
+            # Second record: allowed service (eligible), same starts_at.
+            await _seed_record(session, record_id=302, altegio_record_id=8002, starts_at=_STARTS_AT)
+            await _seed_service(session, record_id=302, service_id=_ALLOWED_SERVICE)
+
+            lead = _make_lead()
+            session.add(lead)
+            await session.flush()
+
+            job = _make_existing_booking_job(lead.id)
+            session.add(job)
+            await session.flush()
+
+            with (
+                _base_settings_ctx(),
+                patch(
+                    "altegio_bot.promo_discount_apply.fetch_altegio_record_for_update",
+                    AsyncMock(return_value=_FAKE_ALTEGIO_RECORD),
+                ),
+                patch(
+                    "altegio_bot.promo_discount_apply.update_altegio_record_price_and_comment",
+                    AsyncMock(return_value=_FAKE_PUT_RESULT),
+                ),
+            ):
+                await process_promo_apply_existing_booking_job(session, job)
+
+            lead_id = lead.id
+
+    async with session_maker() as s:
+        refreshed_lead = await s.get(PromoLead, lead_id)
+
+    assert job.status == "done"
+    assert refreshed_lead is not None
+    meta = refreshed_lead.meta or {}
+    # Not ambiguous — only record 302 was eligible.
+    assert meta.get("existing_booking_skip_reason") is None
+    assert meta.get("existing_booking_apply_record_id") == 302
+    assert meta.get("existing_booking_eligible_records") == 1
 
 
 # =============================================================================
-# J. Idempotency: two enqueue calls → one job
+# J. Idempotency: two enqueue calls → one job; richer meta
 # =============================================================================
 
 
@@ -639,19 +946,28 @@ async def test_ensure_existing_booking_job_idempotent(session_maker) -> None:
             await _ensure_promo_apply_existing_booking_job(session, lead, now)
             await _ensure_promo_apply_existing_booking_job(session, lead, now)
 
+            lead_id = lead.id
+
     async with session_maker() as s:
         jobs = list(
             (await s.execute(select(MessageJob).where(MessageJob.job_type == PROMO_APPLY_EXISTING_BOOKING_JOB_TYPE)))
             .scalars()
             .all()
         )
+        refreshed_lead = await s.get(PromoLead, lead_id)
 
     assert len(jobs) == 1, "idempotent: only one job must be created"
     assert jobs[0].max_attempts == 3
+    # Richer meta must be set on the lead.
+    meta = refreshed_lead.meta or {}
+    assert meta.get("existing_booking_job_queued") is True
+    assert meta.get("existing_booking_job_id") == jobs[0].id
+    assert "existing_booking_job_queued_at" in meta
+    assert "existing_booking_job_dedupe_key" in meta
 
 
 # =============================================================================
-# K. Job skipped for non-issued leads
+# K. Non-issued leads → done; expired → done; defer when gates disabled
 # =============================================================================
 
 
@@ -661,7 +977,6 @@ async def test_ensure_existing_booking_job_idempotent(session_maker) -> None:
     [
         ("applied", {"applied_at": _NOW}),
         ("booked", {}),
-        ("expired", {}),
         ("rejected_not_new", {"reject_reason": "has_prior_visits"}),
     ],
 )
@@ -696,13 +1011,13 @@ async def test_promo_apply_existing_booking_skips_non_issued_leads(
 
 @pytest.mark.asyncio
 async def test_promo_apply_existing_booking_skips_expired_lead(session_maker) -> None:
-    """Test K (expired variant): expired lead → job done, no record search."""
+    """Test K (expired variant): issued lead past expires_at → job done, no record search."""
     fetch_mock = AsyncMock()
 
     async with session_maker() as session:
         async with session.begin():
             await _seed_client(session)
-            await _seed_record(session, starts_at=_NOW + timedelta(days=7))
+            await _seed_record(session, starts_at=datetime(2099, 1, 1, tzinfo=_UTC))
 
             # Lead is 'issued' but already past expires_at.
             lead = _make_lead(status="issued", expires_at=_NOW - timedelta(days=1))
@@ -723,6 +1038,59 @@ async def test_promo_apply_existing_booking_skips_expired_lead(session_maker) ->
     assert job.status == "done"
 
 
+@pytest.mark.asyncio
+async def test_promo_apply_existing_booking_defer_when_apply_disabled(session_maker) -> None:
+    """Test K (defer): promo_apply_discount_enabled=False → job deferred, not done."""
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_client(session)
+            await _seed_record(session, starts_at=datetime(2099, 1, 1, tzinfo=_UTC))
+            await _seed_service(session)
+
+            lead = _make_lead()
+            session.add(lead)
+            await session.flush()
+
+            job = _make_existing_booking_job(lead.id)
+            session.add(job)
+            await session.flush()
+
+            with patch.object(settings, "promo_apply_discount_enabled", False):
+                await process_promo_apply_existing_booking_job(session, job)
+
+    assert job.status == "queued", "must defer, not mark done"
+    assert job.locked_at is None
+    assert job.run_at is not None
+
+
+@pytest.mark.asyncio
+async def test_promo_apply_existing_booking_defer_when_api_not_verified(session_maker) -> None:
+    """Test K (defer): promo_apply_discount_api_verified=False → job deferred, not done."""
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_client(session)
+            await _seed_record(session, starts_at=datetime(2099, 1, 1, tzinfo=_UTC))
+            await _seed_service(session)
+
+            lead = _make_lead()
+            session.add(lead)
+            await session.flush()
+
+            job = _make_existing_booking_job(lead.id)
+            session.add(job)
+            await session.flush()
+
+            with (
+                patch.object(settings, "promo_apply_discount_enabled", True),
+                patch.object(settings, "promo_apply_discount_api_verified", False),
+            ):
+                await process_promo_apply_existing_booking_job(session, job)
+
+    assert job.status == "queued", "must defer, not mark done"
+    assert job.locked_at is None
+    assert job.run_at is not None
+
+
 # =============================================================================
 # L. handle_promo_command does not call Altegio record-search APIs
 # =============================================================================
@@ -739,7 +1107,7 @@ async def test_handle_promo_command_no_altegio_record_api_for_existing_booking(
 
     async with session_maker() as session:
         async with session.begin():
-            await _setup_sender(session)
+            await _setup_sender(session, sender_id=406)
 
             evt = WhatsAppEvent(
                 dedupe_key="wa:existing-booking-L-1",
