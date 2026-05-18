@@ -276,6 +276,7 @@ async def _ingest_operator_outgoing(
             "chatwoot_inbox_id": chatwoot_inbox_id,
             "agent_name": sender.get("name", ""),
             "agent_id": sender.get("id"),
+            "contact_name": contact.get("name"),
         },
     }
 

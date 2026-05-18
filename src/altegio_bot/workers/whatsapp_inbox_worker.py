@@ -23,8 +23,9 @@ from altegio_bot.models.models import (
 )
 from altegio_bot.perf import perf_log
 from altegio_bot.providers.base import WhatsAppProvider
-from altegio_bot.providers.dummy import safe_send
+from altegio_bot.providers.dummy import safe_send, safe_send_template
 from altegio_bot.settings import settings
+from altegio_bot.whatsapp_window import is_whatsapp_customer_window_open, normalize_phone
 from altegio_bot.workers.promo_lead_handler import (
     handle_promo_command,
     handle_promo_info_command,
@@ -606,6 +607,14 @@ async def _handle_operator_relay(
 ) -> None:
     """Send operator reply from Chatwoot through Meta API.
 
+    Always checks the 24h Meta customer service window before sending:
+    - Window open → sends free-form text.
+    - Window closed + private_note_only (default) → blocks the Meta send,
+      creates a canceled OutboxMessage, and adds a Chatwoot private note to
+      alert the operator that the message was not delivered.
+    - Window closed + reopen_template → sends an approved Meta template and
+      adds a Chatwoot private note with the original text.
+
     Creates an OutboxMessage with message_source='operator' so subsequent
     Meta delivery/read webhooks can be matched to this canonical record.
 
@@ -613,7 +622,8 @@ async def _handle_operator_relay(
     is True (checked in handle_event).
     """
     relay = payload.get("_chatwoot_operator_relay") or {}
-    phone_e164 = relay.get("recipient_phone")
+    raw_phone = relay.get("recipient_phone")
+    phone_e164 = normalize_phone(raw_phone)
     text = relay.get("text", "")
     conversation_id = relay.get("conversation_id")
     chatwoot_message_id = relay.get("message_id")
@@ -621,13 +631,23 @@ async def _handle_operator_relay(
     chatwoot_inbox_id = relay.get("chatwoot_inbox_id")
     agent_name = relay.get("agent_name", "")
 
-    if not phone_e164 or not text:
+    if phone_e164 is None:
         logger.warning(
-            "operator_relay: missing recipient_phone or text conv_id=%s msg_id=%s — skipping",
+            "operator_relay: invalid recipient_phone=%r conv_id=%s msg_id=%s — skipping",
+            raw_phone,
             conversation_id,
             chatwoot_message_id,
         )
-        event.error = "operator_relay: missing recipient_phone or text"
+        event.error = "operator_relay: invalid recipient_phone"
+        return
+
+    if not text:
+        logger.warning(
+            "operator_relay: missing text conv_id=%s msg_id=%s — skipping",
+            conversation_id,
+            chatwoot_message_id,
+        )
+        event.error = "operator_relay: missing text"
         return
 
     company_id_hint, hint_err = _company_hint_from_inbox(chatwoot_inbox_id)
@@ -673,30 +693,254 @@ async def _handle_operator_relay(
     # Use the primary (Meta) transport directly — the operator's message is
     # already visible in Chatwoot, so mirroring it back would create a duplicate.
     meta_provider = getattr(provider, "_primary", provider)
-    wamid, err = await safe_send(
+    now = utcnow()
+    mode = settings.chatwoot_operator_closed_window_mode
+
+    # ── Always check the 24h customer service window ──────────────────────
+    window_open, last_inbound_at = await is_whatsapp_customer_window_open(session, phone_e164, now)
+    hours_since: float = (now - last_inbound_at).total_seconds() / 3600 if last_inbound_at else -1.0
+    logger.info(
+        "operator_relay: window_check phone=%s conv_id=%s msg_id=%s "
+        "window_open=%s last_inbound_at=%s hours_since=%.1f mode=%s",
+        phone_e164,
+        conversation_id,
+        chatwoot_message_id,
+        window_open,
+        last_inbound_at.isoformat() if last_inbound_at else None,
+        hours_since,
+        mode,
+    )
+
+    last_inbound_iso: str | None = last_inbound_at.isoformat() if last_inbound_at else None
+
+    # ── Branch: window open → send as free-form text ──────────────────────
+    if window_open:
+        logger.info(
+            "operator_relay: direct text sent (window open) phone=%s conv_id=%s mode=%s",
+            phone_e164,
+            conversation_id,
+            mode,
+        )
+
+        wamid, err = await safe_send(
+            provider=meta_provider,
+            sender_id=sender_id,
+            phone=phone_e164,
+            text=text,
+            company_id=company_id,
+        )
+
+        if err is not None:
+            logger.warning(
+                "operator_relay: send failed phone=%s sender_id=%s err=%s",
+                phone_e164,
+                sender_id,
+                err,
+            )
+            event.error = f"operator_relay: send failed: {err}"
+            return
+
+        logger.info(
+            "operator_relay: sent phone=%s wamid=%s sender_id=%s company_id=%s",
+            phone_e164,
+            wamid,
+            sender_id,
+            company_id,
+        )
+
+        now = utcnow()
+        outbox = OutboxMessage(
+            company_id=company_id,
+            client_id=None,
+            record_id=None,
+            job_id=None,
+            sender_id=sender_id,
+            phone_e164=phone_e164,
+            template_code="operator_relay",
+            language="de",
+            body=text,
+            status="sent",
+            provider_message_id=wamid,
+            scheduled_at=now,
+            sent_at=now,
+            message_source="operator",
+            meta={
+                "chatwoot_conversation_id": conversation_id,
+                "chatwoot_message_id": chatwoot_message_id,
+                "agent_name": agent_name,
+                "send_type": "text",
+                "wa_window_open": True,
+                "last_meta_inbound_at": last_inbound_iso,
+                "closed_window_mode": mode,
+            },
+        )
+        session.add(outbox)
+        await session.flush()
+
+        logger.info(
+            "operator_relay: outbox created outbox_id=%s wamid=%s phone=%s company_id=%s",
+            outbox.id,
+            wamid,
+            phone_e164,
+            company_id,
+        )
+        return
+
+    # ── Branch: window closed + mode=private_note_only ────────────────────
+    if mode == "private_note_only":
+        logger.info(
+            "operator_relay: window closed, mode=private_note_only → blocking send phone=%s conv_id=%s",
+            phone_e164,
+            conversation_id,
+        )
+
+        now = utcnow()
+        outbox = OutboxMessage(
+            company_id=company_id,
+            client_id=None,
+            record_id=None,
+            job_id=None,
+            sender_id=sender_id,
+            phone_e164=phone_e164,
+            template_code="operator_relay",
+            language="de",
+            body=text,
+            status="canceled",
+            provider_message_id=None,
+            scheduled_at=now,
+            sent_at=None,
+            message_source="operator",
+            meta={
+                "send_type": "none",
+                "attempted_send_type": "text",
+                "wa_window_open": False,
+                "last_meta_inbound_at": last_inbound_iso,
+                "closed_window_mode": mode,
+                "cancel_reason": "customer_service_window_closed",
+                "chatwoot_conversation_id": conversation_id,
+                "chatwoot_message_id": chatwoot_message_id,
+                "agent_name": agent_name,
+            },
+        )
+        session.add(outbox)
+        await session.flush()
+
+        logger.info(
+            "operator_relay: canceled outbox created outbox_id=%s phone=%s company_id=%s",
+            outbox.id,
+            phone_e164,
+            company_id,
+        )
+
+        if settings.chatwoot_operator_reopen_private_note_enabled and conversation_id:
+            private_note = (
+                "⚠️ Das 24h-WhatsApp-Fenster ist geschlossen."
+                " Die Nachricht wurde nicht an WhatsApp zugestellt.\n"
+                "Bitte warte, bis der Kunde erneut schreibt, oder wende dich direkt an ihn.\n\n"
+                f'Originalnachricht:\n"{text}"'
+            )
+            cw = ChatwootClient()
+            try:
+                await cw.send_message(
+                    conversation_id,
+                    private_note,
+                    message_type="outgoing",
+                    private=True,
+                )
+                logger.info(
+                    "operator_relay: closed-window note sent conv_id=%s",
+                    conversation_id,
+                )
+                outbox.meta = {**outbox.meta, "private_note_status": "sent"}
+            except Exception as exc:
+                logger.warning(
+                    "operator_relay: closed-window note failed conv_id=%s err=%s",
+                    conversation_id,
+                    exc,
+                )
+                outbox.meta = {
+                    **outbox.meta,
+                    "private_note_status": "failed",
+                    "private_note_error": str(exc),
+                }
+                outbox.error = f"private note failed: {exc}"
+                event.error = f"operator_relay: private note failed: {exc}"
+            finally:
+                await cw.aclose()
+        else:
+            outbox.meta = {**outbox.meta, "private_note_status": "disabled"}
+        return
+
+    # ── Branch: window closed + mode=reopen_template ──────────────────────
+    logger.info(
+        "operator_relay: direct text skipped (window closed) phone=%s conv_id=%s — sending reopen template",
+        phone_e164,
+        conversation_id,
+    )
+
+    template_name = settings.chatwoot_operator_reopen_template_name
+    language = settings.chatwoot_operator_reopen_template_language
+    param_mode = settings.chatwoot_operator_reopen_template_param_mode
+
+    contact_name = relay.get("contact_name") or phone_e164 or "Kunde"
+    params: list[str] = []
+    if param_mode == "contact_name":
+        params = [contact_name]
+
+    wamid, err = await safe_send_template(
         provider=meta_provider,
         sender_id=sender_id,
         phone=phone_e164,
-        text=text,
+        template_name=template_name,
+        language=language,
+        params=params,
         company_id=company_id,
     )
 
     if err is not None:
         logger.warning(
-            "operator_relay: send failed phone=%s sender_id=%s err=%s",
+            "operator_relay: reopen template failed phone=%s sender_id=%s template=%s err=%s",
             phone_e164,
             sender_id,
+            template_name,
             err,
         )
-        event.error = f"operator_relay: send failed: {err}"
+        event.error = f"operator_relay: reopen template failed: {err}"
+
+        if settings.chatwoot_operator_reopen_private_note_enabled and conversation_id:
+            failure_note = (
+                "❌ Die Vorlage zum Wiederöffnen des WhatsApp-Dialogs konnte nicht gesendet"
+                " werden. Die ursprüngliche Nachricht wurde nicht an WhatsApp zugestellt."
+            )
+            cw = ChatwootClient()
+            try:
+                await cw.send_message(
+                    conversation_id,
+                    failure_note,
+                    message_type="outgoing",
+                    private=True,
+                )
+                logger.info(
+                    "operator_relay: failure note sent conv_id=%s",
+                    conversation_id,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "operator_relay: failure note failed conv_id=%s err=%s",
+                    conversation_id,
+                    exc,
+                )
+            finally:
+                await cw.aclose()
         return
 
     logger.info(
-        "operator_relay: sent phone=%s wamid=%s sender_id=%s company_id=%s",
+        "operator_relay: reopen template sent phone=%s wamid=%s template=%s lang=%s conv_id=%s",
         phone_e164,
         wamid,
-        sender_id,
-        company_id,
+        template_name,
+        language,
+        conversation_id,
     )
 
     now = utcnow()
@@ -707,8 +951,8 @@ async def _handle_operator_relay(
         job_id=None,
         sender_id=sender_id,
         phone_e164=phone_e164,
-        template_code="operator_relay",
-        language="de",
+        template_code="operator_reopen_template",
+        language=language,
         body=text,
         status="sent",
         provider_message_id=wamid,
@@ -716,21 +960,57 @@ async def _handle_operator_relay(
         sent_at=now,
         message_source="operator",
         meta={
+            "send_type": "template",
+            "template": template_name,
+            "template_language": language,
+            "original_operator_text": text,
             "chatwoot_conversation_id": conversation_id,
             "chatwoot_message_id": chatwoot_message_id,
             "agent_name": agent_name,
+            "wa_window_open": False,
+            "last_meta_inbound_at": last_inbound_iso,
+            "reopen_reason": "customer_service_window_closed",
+            "closed_window_mode": mode,
         },
     )
     session.add(outbox)
     await session.flush()
 
     logger.info(
-        "operator_relay: outbox created outbox_id=%s wamid=%s phone=%s company_id=%s",
+        "operator_relay: reopen outbox created outbox_id=%s wamid=%s phone=%s company_id=%s",
         outbox.id,
         wamid,
         phone_e164,
         company_id,
     )
+
+    if settings.chatwoot_operator_reopen_private_note_enabled and conversation_id:
+        private_note = (
+            "⚠️ Das 24h-WhatsApp-Fenster war geschlossen. Die ursprüngliche Nachricht"
+            " wurde nicht direkt gesendet. Stattdessen wurde eine Vorlage gesendet, damit"
+            " der Kunde den Dialog wieder öffnen kann.\n\n"
+            f'Originalnachricht:\n"{text}"'
+        )
+        cw = ChatwootClient()
+        try:
+            await cw.send_message(
+                conversation_id,
+                private_note,
+                message_type="outgoing",
+                private=True,
+            )
+            logger.info(
+                "operator_relay: private note sent conv_id=%s",
+                conversation_id,
+            )
+        except Exception as exc:
+            logger.warning(
+                "operator_relay: private note failed conv_id=%s err=%s",
+                conversation_id,
+                exc,
+            )
+        finally:
+            await cw.aclose()
 
 
 async def handle_event(

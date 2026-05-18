@@ -1,4 +1,4 @@
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -106,6 +106,69 @@ class Settings(BaseSettings):
     # If empty (default) — routing falls back to phone_number_id only.
     # If non-empty and inbox_id not found — relay is fail-closed.
     chatwoot_inbox_company_map: str = "{}"
+
+    # ---------------------------------------------------------------------------
+    # Operator relay closed-window mode (24h WhatsApp customer service window)
+    # ---------------------------------------------------------------------------
+    # Controls behaviour when the 24h Meta customer service window is closed.
+    #
+    # private_note_only (default) — blocks the Meta send, adds a Chatwoot private
+    #   note to the operator, and creates a canceled OutboxMessage for audit.
+    #   Safe default: no risk of violating Meta's session rules.
+    #
+    # reopen_template — sends an approved Meta template instead of the free-form
+    #   text, allowing the operator to re-engage. Requires REOPEN_TEMPLATE_NAME.
+    chatwoot_operator_closed_window_mode: str = "private_note_only"
+    # Name of the approved Meta template to send when mode=reopen_template.
+    # Must be non-empty when chatwoot_operator_closed_window_mode=reopen_template.
+    chatwoot_operator_reopen_template_name: str = ""
+    chatwoot_operator_reopen_template_language: str = "de"
+    # Controls which params are sent to the template.
+    # none         — params = []
+    # contact_name — params = [contact_name]
+    chatwoot_operator_reopen_template_param_mode: str = "contact_name"
+    # When True, adds a private Chatwoot note explaining the window was closed
+    # and the original message was not delivered directly.
+    chatwoot_operator_reopen_private_note_enabled: bool = True
+
+    @field_validator("chatwoot_operator_closed_window_mode")
+    @classmethod
+    def validate_closed_window_mode(cls, v: str) -> str:
+        allowed = {"private_note_only", "reopen_template"}
+        if v not in allowed:
+            raise ValueError(
+                f"chatwoot_operator_closed_window_mode must be one of "
+                f"{sorted(allowed)!r}, got {v!r}. "
+                "Check CHATWOOT_OPERATOR_CLOSED_WINDOW_MODE."
+            )
+        return v
+
+    @field_validator("chatwoot_operator_reopen_template_param_mode")
+    @classmethod
+    def validate_reopen_param_mode(cls, v: str) -> str:
+        allowed = {"none", "contact_name"}
+        if v not in allowed:
+            raise ValueError(
+                f"chatwoot_operator_reopen_template_param_mode must be one of "
+                f"{sorted(allowed)!r}, got {v!r}. "
+                "Check CHATWOOT_OPERATOR_REOPEN_TEMPLATE_PARAM_MODE."
+            )
+        return v
+
+    @model_validator(mode="after")
+    def validate_reopen_template_config(self) -> "Settings":
+        if self.chatwoot_operator_closed_window_mode == "reopen_template":
+            if not self.chatwoot_operator_reopen_template_name:
+                raise ValueError(
+                    "CHATWOOT_OPERATOR_REOPEN_TEMPLATE_NAME must be non-empty "
+                    "when CHATWOOT_OPERATOR_CLOSED_WINDOW_MODE=reopen_template"
+                )
+            if not self.chatwoot_operator_reopen_template_language:
+                raise ValueError(
+                    "CHATWOOT_OPERATOR_REOPEN_TEMPLATE_LANGUAGE must be non-empty "
+                    "when CHATWOOT_OPERATOR_CLOSED_WINDOW_MODE=reopen_template"
+                )
+        return self
 
     # ---------------------------------------------------------------------------
     # WhatsApp promo / secret-word funnel
