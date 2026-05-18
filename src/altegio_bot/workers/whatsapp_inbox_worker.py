@@ -1107,18 +1107,19 @@ async def handle_event(
         event.error = None
         return
 
+    # Guard: Chatwoot-origin mirror events must not execute inbound commands.
+    # The original Meta-origin event already handled the command; processing
+    # its Chatwoot mirror causes duplicate acks and double opt-outs.
+    if _is_chatwoot_origin(event, payload):
+        logger.info(
+            "Skipping inbound command handling for Chatwoot-origin event id=%s dedupe_key=%s",
+            event.id,
+            event.dedupe_key,
+        )
+        return
+
     # ── Promo lead funnel ────────────────────────────────────────────────────
-    # Chatwoot-origin events are skipped to prevent bot-reply loops.
-    # STOP/START always proceed regardless of origin (opt-out must be honoured).
     if cmd == "promo":
-        if _is_chatwoot_origin(event, payload):
-            logger.debug(
-                "Skipping promo command for chatwoot-origin event dedupe_key=%s phone=%s",
-                event.dedupe_key,
-                phone_e164,
-            )
-            event.error = None
-            return
         if sender_id is None:
             event.error = "No sender found for incoming phone_number_id"
             return
