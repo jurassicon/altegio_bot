@@ -234,5 +234,33 @@ class Settings(BaseSettings):
     meta_newsletter_monthly_header_image_url: str = ""
     meta_newsletter_followup_header_image_url: str = ""
 
+    # ---------------------------------------------------------------------------
+    # Worker polling intervals
+    # ---------------------------------------------------------------------------
+    # How long each worker sleeps (in seconds) when no events/jobs are found.
+    # Valid range: 0.05 – 60.0.  Override via env to reduce latency in prod:
+    #   INBOX_WORKER_POLL_SEC=0.2
+    #   OUTBOX_WORKER_POLL_SEC=0.2
+    #   WHATSAPP_INBOX_WORKER_POLL_SEC=0.5
+    inbox_worker_poll_sec: float = 1.0
+    outbox_worker_poll_sec: float = 1.0
+    whatsapp_inbox_worker_poll_sec: float = 1.0
+
+    @field_validator(
+        "inbox_worker_poll_sec",
+        "outbox_worker_poll_sec",
+        "whatsapp_inbox_worker_poll_sec",
+    )
+    @classmethod
+    def validate_worker_poll_sec(cls, v: float) -> float:
+        if v < 0.05 or v > 60.0:
+            raise ValueError(
+                f"Worker poll_sec must be >= 0.05 and <= 60.0, "
+                f"got {v}. Check INBOX_WORKER_POLL_SEC, "
+                f"OUTBOX_WORKER_POLL_SEC, or "
+                f"WHATSAPP_INBOX_WORKER_POLL_SEC."
+            )
+        return v
+
 
 settings = Settings()
