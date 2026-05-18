@@ -11,7 +11,13 @@ Covers:
  8. Events from a different phone don't count.
  9. Events older than 26h excluded (performance guard / time-bound query).
 10. Phone normalization: caller without '+' matches inbound with '+'.
-11. Settings validation: invalid closed_window_mode, invalid param_mode,
+11. Meta message timestamp: message ts used for window, not received_at.
+12. Delayed/redelivered webhook: old msg.timestamp closes window even with
+    fresh received_at.
+13. Stale redelivered webhook doesn't hide a newer valid inbound.
+14. Missing timestamp falls back to event.received_at.
+15. Future timestamp is ignored (not fallen back to).
+16. Settings validation: invalid closed_window_mode, invalid param_mode,
     reopen_template + empty name, defaults.
 """
 
@@ -38,23 +44,34 @@ OTHER_PHONE = "+49999888777"
 NOW = datetime.now(timezone.utc)
 
 
-def _meta_inbound_payload(phone: str, text: str = "Hallo") -> dict[str, Any]:
-    """Minimal Meta-origin inbound payload from the given phone."""
+def _meta_inbound_payload(
+    phone: str,
+    text: str = "Hallo",
+    *,
+    msg_timestamp: datetime | None = None,
+) -> dict[str, Any]:
+    """Minimal Meta-origin inbound payload from the given phone.
+
+    When msg_timestamp is None (default), the 'timestamp' key is omitted from
+    the message dict, causing the window helper to fall back to
+    event.received_at.  Pass an explicit msg_timestamp to exercise the
+    Meta-timestamp path.
+    """
+    msg: dict[str, Any] = {
+        "from": phone,
+        "type": "text",
+        "text": {"body": text},
+        "id": "wamid.TEST",
+    }
+    if msg_timestamp is not None:
+        msg["timestamp"] = str(int(msg_timestamp.timestamp()))
     return {
         "entry": [
             {
                 "changes": [
                     {
                         "value": {
-                            "messages": [
-                                {
-                                    "from": phone,
-                                    "type": "text",
-                                    "text": {"body": text},
-                                    "id": "wamid.TEST",
-                                    "timestamp": "1700000000",
-                                }
-                            ],
+                            "messages": [msg],
                             "metadata": {"phone_number_id": "PNID_WIN_TEST"},
                         }
                     }
@@ -302,7 +319,7 @@ async def test_phone_normalization_caller_without_plus(session_maker) -> None:
                 )
             )
 
-        # Query without '+' — _norm_phone normalises it to "+49111222333".
+        # Query without '+' — normalize_phone normalises it to "+49111222333".
         last_inbound = await get_last_meta_inbound_at(session, "49111222333", NOW)
 
     assert last_inbound is not None
@@ -314,6 +331,119 @@ async def test_phone_normalization_invalid_phone_returns_none(session_maker) -> 
     async with session_maker() as session:
         last_inbound = await get_last_meta_inbound_at(session, "", NOW)
 
+    assert last_inbound is None
+
+
+# ---------------------------------------------------------------------------
+# Tests: Meta message timestamp (P3)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_message_timestamp_within_1h_opens_window(session_maker) -> None:
+    """Meta msg.timestamp 1h ago opens window, independent of received_at."""
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(
+                _make_event(
+                    received_at=NOW,  # server received now
+                    payload=_meta_inbound_payload(PHONE, msg_timestamp=NOW - timedelta(hours=1)),
+                    dedupe_key="meta:ts:1h",
+                )
+            )
+
+        window_open, last_inbound = await is_whatsapp_customer_window_open(session, PHONE, NOW)
+
+    assert window_open is True
+    assert last_inbound is not None
+
+
+@pytest.mark.asyncio
+async def test_delayed_old_webhook_does_not_open_window(session_maker) -> None:
+    """Fresh received_at but old msg.timestamp (25h) → window closed."""
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(
+                _make_event(
+                    received_at=NOW,  # fresh server receipt
+                    payload=_meta_inbound_payload(PHONE, msg_timestamp=NOW - timedelta(hours=25)),
+                    dedupe_key="meta:ts:delayed:25h",
+                )
+            )
+
+        window_open, last_inbound = await is_whatsapp_customer_window_open(session, PHONE, NOW)
+
+    assert window_open is False
+    # last_inbound is still returned — it's the parsed 25h-old message timestamp.
+    assert last_inbound is not None
+
+
+@pytest.mark.asyncio
+async def test_redelivered_stale_webhook_does_not_hide_newer_inbound(session_maker) -> None:
+    """Redelivered stale webhook (received now, ts=25h ago) must not shadow a
+    genuinely recent inbound (received 2h ago, ts=2h ago)."""
+    async with session_maker() as session:
+        async with session.begin():
+            # Stale webhook: received_at=now, msg.timestamp=25h ago.
+            session.add(
+                _make_event(
+                    received_at=NOW,
+                    payload=_meta_inbound_payload(PHONE, msg_timestamp=NOW - timedelta(hours=25)),
+                    dedupe_key="meta:ts:stale",
+                )
+            )
+            # Recent inbound: received_at=2h ago, msg.timestamp=2h ago.
+            session.add(
+                _make_event(
+                    received_at=NOW - timedelta(hours=2),
+                    payload=_meta_inbound_payload(PHONE, msg_timestamp=NOW - timedelta(hours=2)),
+                    dedupe_key="meta:ts:recent:2h",
+                )
+            )
+
+        window_open, last_inbound = await is_whatsapp_customer_window_open(session, PHONE, NOW)
+
+    assert window_open is True
+    assert last_inbound is not None
+    # last_inbound should be close to NOW - 2h, not the stale 25h timestamp.
+    assert (NOW - last_inbound) < timedelta(hours=3)
+
+
+@pytest.mark.asyncio
+async def test_missing_timestamp_falls_back_to_received_at(session_maker) -> None:
+    """When msg.timestamp is absent, event.received_at is used as fallback."""
+    async with session_maker() as session:
+        async with session.begin():
+            # No msg_timestamp → 'timestamp' key omitted → fallback to received_at.
+            session.add(
+                _make_event(
+                    received_at=NOW - timedelta(hours=1),
+                    payload=_meta_inbound_payload(PHONE),  # no msg_timestamp
+                    dedupe_key="meta:ts:missing",
+                )
+            )
+
+        window_open, _ = await is_whatsapp_customer_window_open(session, PHONE, NOW)
+
+    assert window_open is True
+
+
+@pytest.mark.asyncio
+async def test_future_timestamp_is_ignored(session_maker) -> None:
+    """Future msg.timestamp is skipped — does not open window and is not fallen back to."""
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(
+                _make_event(
+                    received_at=NOW - timedelta(hours=1),
+                    payload=_meta_inbound_payload(PHONE, msg_timestamp=NOW + timedelta(hours=1)),
+                    dedupe_key="meta:ts:future",
+                )
+            )
+
+        window_open, last_inbound = await is_whatsapp_customer_window_open(session, PHONE, NOW)
+
+    assert window_open is False
     assert last_inbound is None
 
 

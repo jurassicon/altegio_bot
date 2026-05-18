@@ -25,7 +25,7 @@ from altegio_bot.perf import perf_log
 from altegio_bot.providers.base import WhatsAppProvider
 from altegio_bot.providers.dummy import safe_send, safe_send_template
 from altegio_bot.settings import settings
-from altegio_bot.whatsapp_window import is_whatsapp_customer_window_open
+from altegio_bot.whatsapp_window import is_whatsapp_customer_window_open, normalize_phone
 from altegio_bot.workers.promo_lead_handler import (
     handle_promo_command,
     handle_promo_info_command,
@@ -607,11 +607,13 @@ async def _handle_operator_relay(
 ) -> None:
     """Send operator reply from Chatwoot through Meta API.
 
-    When chatwoot_operator_reopen_template_enabled=True, checks whether the
-    24h WhatsApp customer service window is open before sending:
-    - Window open (or feature disabled): sends free-form text as before.
-    - Window closed: sends an approved reopen template and adds a private
-      Chatwoot note explaining the original message was not sent directly.
+    Always checks the 24h Meta customer service window before sending:
+    - Window open → sends free-form text.
+    - Window closed + private_note_only (default) → blocks the Meta send,
+      creates a canceled OutboxMessage, and adds a Chatwoot private note to
+      alert the operator that the message was not delivered.
+    - Window closed + reopen_template → sends an approved Meta template and
+      adds a Chatwoot private note with the original text.
 
     Creates an OutboxMessage with message_source='operator' so subsequent
     Meta delivery/read webhooks can be matched to this canonical record.
@@ -620,7 +622,8 @@ async def _handle_operator_relay(
     is True (checked in handle_event).
     """
     relay = payload.get("_chatwoot_operator_relay") or {}
-    phone_e164 = relay.get("recipient_phone")
+    raw_phone = relay.get("recipient_phone")
+    phone_e164 = normalize_phone(raw_phone)
     text = relay.get("text", "")
     conversation_id = relay.get("conversation_id")
     chatwoot_message_id = relay.get("message_id")
@@ -628,13 +631,23 @@ async def _handle_operator_relay(
     chatwoot_inbox_id = relay.get("chatwoot_inbox_id")
     agent_name = relay.get("agent_name", "")
 
-    if not phone_e164 or not text:
+    if phone_e164 is None:
         logger.warning(
-            "operator_relay: missing recipient_phone or text conv_id=%s msg_id=%s — skipping",
+            "operator_relay: invalid recipient_phone=%r conv_id=%s msg_id=%s — skipping",
+            raw_phone,
             conversation_id,
             chatwoot_message_id,
         )
-        event.error = "operator_relay: missing recipient_phone or text"
+        event.error = "operator_relay: invalid recipient_phone"
+        return
+
+    if not text:
+        logger.warning(
+            "operator_relay: missing text conv_id=%s msg_id=%s — skipping",
+            conversation_id,
+            chatwoot_message_id,
+        )
+        event.error = "operator_relay: missing text"
         return
 
     company_id_hint, hint_err = _company_hint_from_inbox(chatwoot_inbox_id)
@@ -798,7 +811,8 @@ async def _handle_operator_relay(
             sent_at=None,
             message_source="operator",
             meta={
-                "send_type": "text",
+                "send_type": "none",
+                "attempted_send_type": "text",
                 "wa_window_open": False,
                 "last_meta_inbound_at": last_inbound_iso,
                 "closed_window_mode": mode,
@@ -837,14 +851,24 @@ async def _handle_operator_relay(
                     "operator_relay: closed-window note sent conv_id=%s",
                     conversation_id,
                 )
+                outbox.meta = {**outbox.meta, "private_note_status": "sent"}
             except Exception as exc:
                 logger.warning(
                     "operator_relay: closed-window note failed conv_id=%s err=%s",
                     conversation_id,
                     exc,
                 )
+                outbox.meta = {
+                    **outbox.meta,
+                    "private_note_status": "failed",
+                    "private_note_error": str(exc),
+                }
+                outbox.error = f"private note failed: {exc}"
+                event.error = f"operator_relay: private note failed: {exc}"
             finally:
                 await cw.aclose()
+        else:
+            outbox.meta = {**outbox.meta, "private_note_status": "disabled"}
         return
 
     # ── Branch: window closed + mode=reopen_template ──────────────────────
