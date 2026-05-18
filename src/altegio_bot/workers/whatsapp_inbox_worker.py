@@ -989,15 +989,23 @@ async def process_one_event(
                 ctx.update(outcome=event.status)
 
 
+def _resolve_poll_sec(
+    explicit: float | None,
+    settings_value: float,
+) -> float:
+    return settings_value if explicit is None else explicit
+
+
 async def run_loop(
     provider: WhatsAppProvider,
     batch_size: int = 50,
-    poll_sec: float = 1.0,
+    poll_sec: float | None = None,
 ) -> None:
+    effective_poll_sec = _resolve_poll_sec(poll_sec, settings.whatsapp_inbox_worker_poll_sec)
     logger.info(
         "WhatsApp inbox worker started. batch_size=%s poll=%ss",
         batch_size,
-        poll_sec,
+        effective_poll_sec,
     )
 
     while True:
@@ -1009,7 +1017,7 @@ async def run_loop(
                 event_ids = [int(e.id) for e in events]
 
         if not event_ids:
-            await asyncio.sleep(poll_sec)
+            await asyncio.sleep(effective_poll_sec)
             continue
 
         for eid in event_ids:

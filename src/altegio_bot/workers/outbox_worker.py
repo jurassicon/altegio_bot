@@ -1928,16 +1928,28 @@ async def process_job(
             await _try_recompute_campaign_run_stats(campaign_run_id)
 
 
+def _resolve_poll_sec(
+    explicit: float | None,
+    settings_value: float,
+) -> float:
+    return settings_value if explicit is None else explicit
+
+
 async def run_loop(
     provider: WhatsAppProvider,
     batch_size: int = 50,
-    poll_sec: float = 1.0,
+    poll_sec: float | None = None,
 ) -> None:
+    effective_poll_sec = _resolve_poll_sec(poll_sec, settings.outbox_worker_poll_sec)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    logger.info("Outbox worker started")
+    logger.info(
+        "Outbox worker started. batch_size=%s poll=%ss",
+        batch_size,
+        effective_poll_sec,
+    )
 
     while True:
         async with SessionLocal() as session:
@@ -1957,7 +1969,7 @@ async def run_loop(
                 job_ids = [j.id for j in jobs]
 
         if not job_ids:
-            await asyncio.sleep(poll_sec)
+            await asyncio.sleep(effective_poll_sec)
             continue
 
         # Collect campaign run_ids across the whole cycle so that
