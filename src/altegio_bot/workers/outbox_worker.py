@@ -56,6 +56,7 @@ from altegio_bot.providers.dummy import safe_send, safe_send_template
 from altegio_bot.settings import settings
 from altegio_bot.template_validation import validate_template_params
 from altegio_bot.whatsapp_routing import pick_sender_code_for_record, pick_sender_id
+from altegio_bot.whatsapp_window import is_whatsapp_customer_window_open
 from altegio_bot.workers.promo_lead_handler import (
     PROMO_APPLY_EXISTING_BOOKING_JOB_TYPE,
     PROMO_ELIGIBILITY_CHECK_JOB_TYPE,
@@ -794,6 +795,35 @@ async def _load_job(
 def _is_token_expired_error(err: str) -> bool:
     low = err.lower()
     return "access token" in low and "expired" in low
+
+
+def _is_text_window_policy_error(err: str) -> bool:
+    """Return True for deterministic Meta policy/window errors.
+
+    Only these errors trigger automatic template fallback after a failed text
+    send inside an open 24h window.  Ambiguous errors (timeouts, 5xx, unknown)
+    return False — the caller preserves normal retry behaviour to avoid
+    duplicate-send risk when the text may have been accepted but the response
+    was lost.
+    """
+    low = err.lower()
+    return any(
+        marker in low
+        for marker in (
+            "131047",
+            "24 hour",
+            "24-hour",
+            "outside the allowed window",
+            "customer service window",
+            "re-engagement message",
+        )
+    )
+
+
+def _get_24h_whitelist() -> frozenset[str]:
+    """Return the set of job types eligible for text-inside-24h routing."""
+    raw = settings.bot_template_text_inside_24h_job_types
+    return frozenset(t.strip() for t in raw.split(",") if t.strip())
 
 
 async def _count_131026_failures(
@@ -1707,6 +1737,199 @@ async def _run_job_logic(
         except Exception:
             pass
 
+    # ── Bot text-inside-24h routing ───────────────────────────────────────────
+    # Decision is made here at send time (not at job-creation time) so that a
+    # window that opened after the job was planned is always honoured.
+    _24h_eligible = (
+        settings.bot_template_text_inside_24h_enabled
+        and use_template
+        and job.job_type in _get_24h_whitelist()
+        and bool(final_body.strip())
+    )
+    _wa_window_open: bool | None = None
+    _last_inbound_at: datetime | None = None
+    _text_send_error: str | None = None
+    _use_template_fallback = False
+
+    if _24h_eligible:
+        with perf_log(
+            "outbox_worker",
+            "outbox.wa_window_check",
+            job_id=job.id,
+            job_type=job.job_type,
+            company_id=job.company_id,
+            phone_e164=phone,
+        ) as _wc_ctx:
+            _wa_window_open, _last_inbound_at = await is_whatsapp_customer_window_open(
+                session=session,
+                phone_e164=phone,
+                now=utcnow(),
+            )
+            _wc_ctx.update(window_open=_wa_window_open)
+        logger.info(
+            "wa_window_check job_id=%s job_type=%s company_id=%s phone_e164=%s window_open=%s last_inbound_at=%s",
+            job.id,
+            job.job_type,
+            job.company_id,
+            phone,
+            _wa_window_open,
+            _last_inbound_at.isoformat() if _last_inbound_at else None,
+        )
+
+        if _wa_window_open:
+            with perf_log(
+                "outbox_worker",
+                "outbox.text_inside_24h_send",
+                job_id=job.id,
+                job_type=job.job_type,
+                company_id=job.company_id,
+                sender_id=sender_id,
+                phone_e164=phone,
+            ) as _ts_ctx:
+                _text_msg_id, _text_err = await safe_send(
+                    provider=provider,
+                    sender_id=sender_id,
+                    phone=phone,
+                    text=final_body,
+                    contact_name=contact_name,
+                    company_id=job.company_id,
+                )
+                _ts_ctx.update(provider_message_id=_text_msg_id)
+                if _text_err is not None:
+                    _ts_ctx.update(send_error=_text_err)
+
+            if _text_err is None:
+                # Text send succeeded — record and return early.
+                logger.info(
+                    "text_inside_24h: sent as text job_id=%s job_type=%s "
+                    "company_id=%s phone_e164=%s provider_message_id=%s",
+                    job.id,
+                    job.job_type,
+                    job.company_id,
+                    phone,
+                    _text_msg_id,
+                )
+                _now_sent = utcnow()
+                _last_inbound_iso = _last_inbound_at.isoformat() if _last_inbound_at else None
+                with perf_log(
+                    "outbox_worker",
+                    "outbox.insert_outbox",
+                    job_id=job.id,
+                    job_type=job.job_type,
+                    company_id=job.company_id,
+                    phone_e164=phone,
+                    template_code=job.job_type,
+                    outbox_status="sent",
+                ):
+                    _text_out = OutboxMessage(
+                        company_id=job.company_id,
+                        client_id=(client.id if client else None),
+                        record_id=(record.id if record else None),
+                        job_id=job.id,
+                        sender_id=sender_id,
+                        phone_e164=phone,
+                        template_code=job.job_type,
+                        language=lang,
+                        body=final_body,
+                        status="sent",
+                        error=None,
+                        provider_message_id=_text_msg_id,
+                        scheduled_at=job.run_at,
+                        sent_at=_now_sent,
+                        meta={
+                            "send_type": "text",
+                            "original_send_type": "template",
+                            "text_inside_24h": True,
+                            "original_template": meta_template_name,
+                            "original_template_language": TEMPLATE_LANGUAGE,
+                            "original_template_params": template_params,
+                            "wa_window_open": True,
+                            "last_meta_inbound_at": _last_inbound_iso,
+                            "route_reason": "customer_service_window_open",
+                        },
+                    )
+                    session.add(_text_out)
+                job.status = "done"
+                job.locked_at = None
+                job.last_error = None
+                _campaign_run_id = _job_payload.get("campaign_run_id")
+                return int(_campaign_run_id) if _campaign_run_id is not None else None
+
+            # Text send failed — decide whether to fall back or preserve retry behaviour.
+            _text_send_error = _text_err
+            if settings.bot_template_text_inside_24h_fallback_enabled and _is_text_window_policy_error(_text_err):
+                # Deterministic policy error: fall back to template send below.
+                _use_template_fallback = True
+                logger.info(
+                    "text_inside_24h: policy error, falling back to template job_id=%s job_type=%s err=%r",
+                    job.id,
+                    job.job_type,
+                    _text_err,
+                )
+            else:
+                # Ambiguous error (timeout, 5xx, unknown): do NOT send template —
+                # the text may have been accepted but the response was lost.
+                logger.warning(
+                    "text_inside_24h: ambiguous error, no automatic fallback job_id=%s job_type=%s err=%r",
+                    job.id,
+                    job.job_type,
+                    _text_err,
+                )
+                _last_inbound_iso = _last_inbound_at.isoformat() if _last_inbound_at else None
+                with perf_log(
+                    "outbox_worker",
+                    "outbox.insert_outbox",
+                    job_id=job.id,
+                    job_type=job.job_type,
+                    company_id=job.company_id,
+                    phone_e164=phone,
+                    template_code=job.job_type,
+                    outbox_status="failed",
+                ):
+                    session.add(
+                        OutboxMessage(
+                            company_id=job.company_id,
+                            client_id=(client.id if client else None),
+                            record_id=(record.id if record else None),
+                            job_id=job.id,
+                            sender_id=sender_id,
+                            phone_e164=phone,
+                            template_code=job.job_type,
+                            language=lang,
+                            body=final_body,
+                            status="failed",
+                            error=_text_err,
+                            provider_message_id=None,
+                            scheduled_at=job.run_at,
+                            sent_at=utcnow(),
+                            meta={
+                                "send_type": "text",
+                                "text_inside_24h": True,
+                                "wa_window_open": True,
+                                "last_meta_inbound_at": _last_inbound_iso,
+                                "route_reason": "customer_service_window_open",
+                            },
+                        )
+                    )
+                if _is_token_expired_error(_text_err):
+                    _mark_token_expired()
+                    job.status = "queued"
+                    job.locked_at = None
+                    job.run_at = utcnow() + timedelta(seconds=TOKEN_EXPIRED_RETRY_SECONDS)
+                    job.last_error = f"Send blocked: {_text_err}"
+                    return None
+                job.last_error = f"Send failed: {_text_err}"
+                if attempts >= max_attempts:
+                    job.status = "failed"
+                    job.locked_at = None
+                    return None
+                delay = _retry_delay_seconds(attempts)
+                job.status = "queued"
+                job.locked_at = None
+                job.run_at = utcnow() + timedelta(seconds=delay)
+                return None
+
+    # ── Regular template send (or template fallback after policy error) ────────
     with perf_log(
         "outbox_worker",
         "outbox.meta_send",
@@ -1720,26 +1943,68 @@ async def _run_job_logic(
     ) as _ms_ctx:
         if use_template:
             assert meta_template_name is not None
-            msg_id, err = await safe_send_template(
-                provider=provider,
-                sender_id=sender_id,
-                phone=phone,
-                template_name=meta_template_name,
-                language=TEMPLATE_LANGUAGE,
-                params=template_params,
-                fallback_text=final_body,
-                contact_name=contact_name,
-                company_id=job.company_id,
-                header_image_url=header_image_url,
-            )
+            if _use_template_fallback:
+                with perf_log(
+                    "outbox_worker",
+                    "outbox.template_fallback",
+                    job_id=job.id,
+                    job_type=job.job_type,
+                    company_id=job.company_id,
+                    sender_id=sender_id,
+                    phone_e164=phone,
+                    text_send_error=_text_send_error,
+                ) as _fb_ctx:
+                    msg_id, err = await safe_send_template(
+                        provider=provider,
+                        sender_id=sender_id,
+                        phone=phone,
+                        template_name=meta_template_name,
+                        language=TEMPLATE_LANGUAGE,
+                        params=template_params,
+                        fallback_text=final_body,
+                        contact_name=contact_name,
+                        company_id=job.company_id,
+                        header_image_url=header_image_url,
+                    )
+                    _fb_ctx.update(provider_message_id=msg_id)
+                    if err is not None:
+                        _fb_ctx.update(send_error=err)
+            else:
+                msg_id, err = await safe_send_template(
+                    provider=provider,
+                    sender_id=sender_id,
+                    phone=phone,
+                    template_name=meta_template_name,
+                    language=TEMPLATE_LANGUAGE,
+                    params=template_params,
+                    fallback_text=final_body,
+                    contact_name=contact_name,
+                    company_id=job.company_id,
+                    header_image_url=header_image_url,
+                )
             send_meta: dict[str, Any] = {
-                "send_type": "template",
+                "send_type": "template_fallback" if _use_template_fallback else "template",
                 "template": meta_template_name,
                 "params": template_params,
                 "lang": TEMPLATE_LANGUAGE,
             }
             if header_image_url:
                 send_meta["header_image_url"] = header_image_url
+            if _24h_eligible:
+                _last_inbound_iso = _last_inbound_at.isoformat() if _last_inbound_at else None
+                send_meta["text_inside_24h_eligible"] = True
+                send_meta["wa_window_open"] = bool(_wa_window_open)
+                send_meta["last_meta_inbound_at"] = _last_inbound_iso
+                send_meta["original_template"] = meta_template_name
+                send_meta["original_template_language"] = TEMPLATE_LANGUAGE
+                if _use_template_fallback:
+                    send_meta["text_inside_24h"] = True
+                    send_meta["text_send_error"] = _text_send_error
+                    send_meta["fallback_reason"] = "text_send_failed"
+                    send_meta["route_reason"] = "text_send_policy_error_fallback"
+                else:
+                    send_meta["text_inside_24h"] = False
+                    send_meta["route_reason"] = "customer_service_window_closed"
         else:
             msg_id, err = await safe_send(
                 provider=provider,
