@@ -16,6 +16,10 @@ Covers all required scenarios:
 11. Session-aware: private_note_only + window closed → blocks send, private note, canceled outbox.
 12. Session-aware: reopen_template + window closed → sends template.
 13. Session-aware: reopen template send failure handling.
+14. P1: recipient_phone without '+' is normalized before send.
+15. P1: recipient_phone with spaces is normalized before send.
+16. P1: invalid recipient_phone sets event.error and skips send.
+17. P2: private note failure surfaced in event.error / outbox.error / meta.
 """
 
 from __future__ import annotations
@@ -208,7 +212,6 @@ def _meta_inbound_event(
                                         "type": "text",
                                         "text": {"body": "x"},
                                         "id": f"wamid.{dedupe_key}",
-                                        "timestamp": "1700000000",
                                     }
                                 ],
                                 "metadata": {"phone_number_id": "PNID_WIN_HELPER"},
@@ -1909,6 +1912,9 @@ async def test_private_note_only_window_closed(session_maker, monkeypatch) -> No
     assert ob.meta["wa_window_open"] is False
     assert ob.meta["cancel_reason"] == "customer_service_window_closed"
     assert ob.meta["agent_name"] == "Klaus"
+    assert ob.meta.get("send_type") == "none"
+    assert ob.meta.get("attempted_send_type") == "text"
+    assert ob.meta.get("private_note_status") == "sent"
 
 
 @pytest.mark.asyncio
@@ -2077,3 +2083,245 @@ async def test_reopen_template_send_failure_sets_error(session_maker, monkeypatc
     async with session_maker() as session:
         result = await session.execute(select(OutboxMessage).where(OutboxMessage.phone_e164 == "+49111222003"))
         assert result.scalar_one_or_none() is None
+
+
+# ---------------------------------------------------------------------------
+# Tests: P1 — phone normalization in operator relay
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_relay_phone_without_plus_normalized(session_maker, monkeypatch) -> None:
+    """recipient_phone without leading '+' is normalized; send uses E.164 form."""
+    monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
+    provider = _FakeProvider(wamid="wamid.NORM_NOPLUS")
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _make_sender(session, sender_id=400, company_id=1, phone_number_id="PNID_NORM1")
+            # Inbound event has phone WITH '+'.
+            _meta_inbound_event(session, phone="+49111222333", dedupe_key="meta:inbound:norm1:001")
+
+            evt = WhatsAppEvent(
+                dedupe_key="chatwoot_out:5000:6000",
+                status="received",
+                error=None,
+                query={},
+                headers={},
+                payload=_operator_relay_payload(
+                    recipient_phone="49111222333",  # no leading +
+                    phone_number_id="PNID_NORM1",
+                    conversation_id=5000,
+                    message_id=6000,
+                ),
+                chatwoot_conversation_id=5000,
+            )
+            session.add(evt)
+            await session.flush()
+
+            from altegio_bot.settings import settings as _s
+
+            orig_relay = _s.chatwoot_operator_relay_enabled
+            _s.chatwoot_operator_relay_enabled = True
+            try:
+                await handle_event(session, evt, provider)
+            finally:
+                _s.chatwoot_operator_relay_enabled = orig_relay
+
+    assert len(provider.sent) == 1
+    assert provider.sent[0]["phone_e164"] == "+49111222333"
+
+    async with session_maker() as session:
+        result = await session.execute(
+            select(OutboxMessage).where(OutboxMessage.provider_message_id == "wamid.NORM_NOPLUS")
+        )
+        ob = result.scalar_one_or_none()
+    assert ob is not None
+    assert ob.phone_e164 == "+49111222333"
+
+
+@pytest.mark.asyncio
+async def test_relay_phone_with_spaces_normalized(session_maker, monkeypatch) -> None:
+    """recipient_phone with spaces is normalized to compact E.164 before send."""
+    monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
+    provider = _FakeProvider(wamid="wamid.NORM_SPACES")
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _make_sender(session, sender_id=401, company_id=1, phone_number_id="PNID_NORM2")
+            _meta_inbound_event(session, phone="+49111222333", dedupe_key="meta:inbound:norm2:001")
+
+            evt = WhatsAppEvent(
+                dedupe_key="chatwoot_out:5100:6100",
+                status="received",
+                error=None,
+                query={},
+                headers={},
+                payload=_operator_relay_payload(
+                    recipient_phone="+49 111 222 333",  # spaces
+                    phone_number_id="PNID_NORM2",
+                    conversation_id=5100,
+                    message_id=6100,
+                ),
+                chatwoot_conversation_id=5100,
+            )
+            session.add(evt)
+            await session.flush()
+
+            from altegio_bot.settings import settings as _s
+
+            orig_relay = _s.chatwoot_operator_relay_enabled
+            _s.chatwoot_operator_relay_enabled = True
+            try:
+                await handle_event(session, evt, provider)
+            finally:
+                _s.chatwoot_operator_relay_enabled = orig_relay
+
+    assert len(provider.sent) == 1
+    assert provider.sent[0]["phone_e164"] == "+49111222333"
+
+    async with session_maker() as session:
+        result = await session.execute(
+            select(OutboxMessage).where(OutboxMessage.provider_message_id == "wamid.NORM_SPACES")
+        )
+        ob = result.scalar_one_or_none()
+    assert ob is not None
+    assert ob.phone_e164 == "+49111222333"
+
+
+@pytest.mark.asyncio
+async def test_relay_invalid_phone_sets_error(session_maker, monkeypatch) -> None:
+    """recipient_phone='abc' (no digits) → event.error set, no send, no OutboxMessage."""
+    monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
+    provider = _FakeProvider(wamid="wamid.SHOULD_NOT_APPEAR_BADPHONE")
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _make_sender(session, sender_id=402, company_id=1, phone_number_id="PNID_NORM3")
+
+            evt = WhatsAppEvent(
+                dedupe_key="chatwoot_out:5200:6200",
+                status="received",
+                error=None,
+                query={},
+                headers={},
+                payload=_operator_relay_payload(
+                    recipient_phone="abc",  # invalid — no digits
+                    phone_number_id="PNID_NORM3",
+                    conversation_id=5200,
+                    message_id=6200,
+                ),
+                chatwoot_conversation_id=5200,
+            )
+            session.add(evt)
+            await session.flush()
+            evt_id = evt.id
+
+            from altegio_bot.settings import settings as _s
+
+            orig_relay = _s.chatwoot_operator_relay_enabled
+            _s.chatwoot_operator_relay_enabled = True
+            try:
+                await handle_event(session, evt, provider)
+            finally:
+                _s.chatwoot_operator_relay_enabled = orig_relay
+
+    assert len(provider.sent) == 0
+    assert len(provider.templates_sent) == 0
+
+    async with session_maker() as session:
+        reloaded = await session.get(WhatsAppEvent, evt_id)
+    assert reloaded is not None
+    assert reloaded.error is not None
+    assert "invalid recipient_phone" in reloaded.error
+
+    async with session_maker() as session:
+        result = await session.execute(
+            select(OutboxMessage).where(OutboxMessage.provider_message_id == "wamid.SHOULD_NOT_APPEAR_BADPHONE")
+        )
+        assert result.scalar_one_or_none() is None
+
+
+# ---------------------------------------------------------------------------
+# Test: P2 — private note failure surfaced in error fields
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_private_note_only_note_failure_surfaced(session_maker, monkeypatch) -> None:
+    """private_note_only + window closed + note send raises → error surfaced in event, outbox, meta."""
+    monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
+    provider = _FakeProvider(wamid="wamid.SHOULD_NOT_APPEAR_NOTE_FAIL")
+
+    mock_cw_class = MagicMock()
+    mock_cw = MagicMock()
+    mock_cw.send_message = AsyncMock(side_effect=RuntimeError("chatwoot unavailable"))
+    mock_cw.aclose = AsyncMock(return_value=None)
+    mock_cw_class.return_value = mock_cw
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _make_sender(session, sender_id=500, company_id=1, phone_number_id="PNID_NOTE_FAIL")
+
+            # No inbound events → window closed.
+            evt = WhatsAppEvent(
+                dedupe_key="chatwoot_out:7000:8000",
+                status="received",
+                error=None,
+                query={},
+                headers={},
+                payload=_operator_relay_payload(
+                    recipient_phone="+49777000001",
+                    text="Note will fail",
+                    phone_number_id="PNID_NOTE_FAIL",
+                    conversation_id=7000,
+                    message_id=8000,
+                    agent_name="Fail",
+                ),
+                chatwoot_conversation_id=7000,
+            )
+            session.add(evt)
+            await session.flush()
+            evt_id = evt.id
+
+            from altegio_bot.settings import settings as _s
+
+            orig_relay = _s.chatwoot_operator_relay_enabled
+            orig_mode = _s.chatwoot_operator_closed_window_mode
+            orig_note = _s.chatwoot_operator_reopen_private_note_enabled
+            _s.chatwoot_operator_relay_enabled = True
+            _s.chatwoot_operator_closed_window_mode = "private_note_only"
+            _s.chatwoot_operator_reopen_private_note_enabled = True
+            try:
+                with patch(
+                    "altegio_bot.workers.whatsapp_inbox_worker.ChatwootClient",
+                    mock_cw_class,
+                ):
+                    await handle_event(session, evt, provider)
+            finally:
+                _s.chatwoot_operator_relay_enabled = orig_relay
+                _s.chatwoot_operator_closed_window_mode = orig_mode
+                _s.chatwoot_operator_reopen_private_note_enabled = orig_note
+
+    # Must NOT have sent anything to Meta.
+    assert len(provider.sent) == 0
+    assert len(provider.templates_sent) == 0
+
+    # event.error must mention the private note failure.
+    async with session_maker() as session:
+        reloaded = await session.get(WhatsAppEvent, evt_id)
+    assert reloaded is not None
+    assert reloaded.error is not None
+    assert "private note failed" in reloaded.error
+
+    # Canceled OutboxMessage must exist with failure metadata.
+    async with session_maker() as session:
+        result = await session.execute(select(OutboxMessage).where(OutboxMessage.phone_e164 == "+49777000001"))
+        ob = result.scalar_one_or_none()
+
+    assert ob is not None
+    assert ob.status == "canceled"
+    assert ob.error is not None
+    assert "private note failed" in ob.error
+    assert ob.meta.get("private_note_status") == "failed"
+    assert ob.meta.get("private_note_error") is not None
