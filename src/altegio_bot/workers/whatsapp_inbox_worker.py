@@ -681,35 +681,33 @@ async def _handle_operator_relay(
     # already visible in Chatwoot, so mirroring it back would create a duplicate.
     meta_provider = getattr(provider, "_primary", provider)
     now = utcnow()
+    mode = settings.chatwoot_operator_closed_window_mode
 
-    # ── 24h window check (only when reopen template feature is enabled) ──
-    window_open: bool = True
-    last_inbound_at: datetime | None = None
-
-    if settings.chatwoot_operator_reopen_template_enabled:
-        window_open, last_inbound_at = await is_whatsapp_customer_window_open(session, phone_e164, now)
-        hours_since: float = (now - last_inbound_at).total_seconds() / 3600 if last_inbound_at else -1.0
-        logger.info(
-            "operator_relay: window_check phone=%s conv_id=%s msg_id=%s "
-            "window_open=%s last_inbound_at=%s hours_since=%.1f",
-            phone_e164,
-            conversation_id,
-            chatwoot_message_id,
-            window_open,
-            last_inbound_at.isoformat() if last_inbound_at else None,
-            hours_since,
-        )
+    # ── Always check the 24h customer service window ──────────────────────
+    window_open, last_inbound_at = await is_whatsapp_customer_window_open(session, phone_e164, now)
+    hours_since: float = (now - last_inbound_at).total_seconds() / 3600 if last_inbound_at else -1.0
+    logger.info(
+        "operator_relay: window_check phone=%s conv_id=%s msg_id=%s "
+        "window_open=%s last_inbound_at=%s hours_since=%.1f mode=%s",
+        phone_e164,
+        conversation_id,
+        chatwoot_message_id,
+        window_open,
+        last_inbound_at.isoformat() if last_inbound_at else None,
+        hours_since,
+        mode,
+    )
 
     last_inbound_iso: str | None = last_inbound_at.isoformat() if last_inbound_at else None
 
-    # ── Branch: feature disabled or window open → send as free-form text ─
-    if not settings.chatwoot_operator_reopen_template_enabled or window_open:
-        if settings.chatwoot_operator_reopen_template_enabled:
-            logger.info(
-                "operator_relay: direct text sent (window open) phone=%s conv_id=%s",
-                phone_e164,
-                conversation_id,
-            )
+    # ── Branch: window open → send as free-form text ──────────────────────
+    if window_open:
+        logger.info(
+            "operator_relay: direct text sent (window open) phone=%s conv_id=%s mode=%s",
+            phone_e164,
+            conversation_id,
+            mode,
+        )
 
         wamid, err = await safe_send(
             provider=meta_provider,
@@ -758,8 +756,9 @@ async def _handle_operator_relay(
                 "chatwoot_message_id": chatwoot_message_id,
                 "agent_name": agent_name,
                 "send_type": "text",
-                "wa_window_open": window_open,
+                "wa_window_open": True,
                 "last_meta_inbound_at": last_inbound_iso,
+                "closed_window_mode": mode,
             },
         )
         session.add(outbox)
@@ -774,7 +773,81 @@ async def _handle_operator_relay(
         )
         return
 
-    # ── Branch: window closed + feature enabled → send reopen template ──
+    # ── Branch: window closed + mode=private_note_only ────────────────────
+    if mode == "private_note_only":
+        logger.info(
+            "operator_relay: window closed, mode=private_note_only → blocking send phone=%s conv_id=%s",
+            phone_e164,
+            conversation_id,
+        )
+
+        now = utcnow()
+        outbox = OutboxMessage(
+            company_id=company_id,
+            client_id=None,
+            record_id=None,
+            job_id=None,
+            sender_id=sender_id,
+            phone_e164=phone_e164,
+            template_code="operator_relay",
+            language="de",
+            body=text,
+            status="canceled",
+            provider_message_id=None,
+            scheduled_at=now,
+            sent_at=None,
+            message_source="operator",
+            meta={
+                "send_type": "text",
+                "wa_window_open": False,
+                "last_meta_inbound_at": last_inbound_iso,
+                "closed_window_mode": mode,
+                "cancel_reason": "customer_service_window_closed",
+                "chatwoot_conversation_id": conversation_id,
+                "chatwoot_message_id": chatwoot_message_id,
+                "agent_name": agent_name,
+            },
+        )
+        session.add(outbox)
+        await session.flush()
+
+        logger.info(
+            "operator_relay: canceled outbox created outbox_id=%s phone=%s company_id=%s",
+            outbox.id,
+            phone_e164,
+            company_id,
+        )
+
+        if settings.chatwoot_operator_reopen_private_note_enabled and conversation_id:
+            private_note = (
+                "⚠️ Das 24h-WhatsApp-Fenster ist geschlossen."
+                " Die Nachricht wurde nicht an WhatsApp zugestellt.\n"
+                "Bitte warte, bis der Kunde erneut schreibt, oder wende dich direkt an ihn.\n\n"
+                f'Originalnachricht:\n"{text}"'
+            )
+            cw = ChatwootClient()
+            try:
+                await cw.send_message(
+                    conversation_id,
+                    private_note,
+                    message_type="outgoing",
+                    private=True,
+                )
+                logger.info(
+                    "operator_relay: closed-window note sent conv_id=%s",
+                    conversation_id,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "operator_relay: closed-window note failed conv_id=%s err=%s",
+                    conversation_id,
+                    exc,
+                )
+            finally:
+                await cw.aclose()
+        return
+
+    # ── Branch: window closed + mode=reopen_template ──────────────────────
     logger.info(
         "operator_relay: direct text skipped (window closed) phone=%s conv_id=%s — sending reopen template",
         phone_e164,
@@ -789,8 +862,6 @@ async def _handle_operator_relay(
     params: list[str] = []
     if param_mode == "contact_name":
         params = [contact_name]
-    elif param_mode == "contact_and_business":
-        params = [contact_name, ""]
 
     wamid, err = await safe_send_template(
         provider=meta_provider,
@@ -875,6 +946,7 @@ async def _handle_operator_relay(
             "wa_window_open": False,
             "last_meta_inbound_at": last_inbound_iso,
             "reopen_reason": "customer_service_window_closed",
+            "closed_window_mode": mode,
         },
     )
     session.add(outbox)

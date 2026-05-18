@@ -73,6 +73,10 @@ async def get_last_meta_inbound_at(
     'chatwoot:', payload contains '_chatwoot' or '_chatwoot_operator_relay',
     or chatwoot_conversation_id is not None).
     """
+    target_phone = _norm_phone(phone_e164)
+    if target_phone is None:
+        return None
+
     cutoff = before - timedelta(hours=_QUERY_LOOKBACK_HOURS)
 
     stmt = (
@@ -89,7 +93,7 @@ async def get_last_meta_inbound_at(
     events = list(res.scalars().all())
 
     for event in events:
-        if _payload_has_inbound_from(event.payload or {}, phone_e164):
+        if _payload_has_inbound_from(event.payload or {}, target_phone):
             return event.received_at
 
     return None

@@ -10,7 +10,9 @@ Covers:
  7. Operator relay events excluded.
  8. Events from a different phone don't count.
  9. Events older than 26h excluded (performance guard / time-bound query).
-10. Settings validation: invalid param_mode, enabled + empty name, defaults.
+10. Phone normalization: caller without '+' matches inbound with '+'.
+11. Settings validation: invalid closed_window_mode, invalid param_mode,
+    reopen_template + empty name, defaults.
 """
 
 from __future__ import annotations
@@ -283,6 +285,39 @@ async def test_inbound_from_different_phone_not_counted(session_maker) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Tests: phone normalization
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_phone_normalization_caller_without_plus(session_maker) -> None:
+    """Query phone without '+' must match inbound whose 'from' has '+'."""
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(
+                _make_event(
+                    received_at=NOW - timedelta(hours=1),
+                    payload=_meta_inbound_payload("+49111222333"),  # 'from' has '+'
+                    dedupe_key="meta:norm:no_plus",
+                )
+            )
+
+        # Query without '+' — _norm_phone normalises it to "+49111222333".
+        last_inbound = await get_last_meta_inbound_at(session, "49111222333", NOW)
+
+    assert last_inbound is not None
+
+
+@pytest.mark.asyncio
+async def test_phone_normalization_invalid_phone_returns_none(session_maker) -> None:
+    """get_last_meta_inbound_at returns None immediately for an empty phone."""
+    async with session_maker() as session:
+        last_inbound = await get_last_meta_inbound_at(session, "", NOW)
+
+    assert last_inbound is None
+
+
+# ---------------------------------------------------------------------------
 # Test: performance guard (26h lookback)
 # ---------------------------------------------------------------------------
 
@@ -328,6 +363,36 @@ async def test_event_at_exactly_26h_cutoff_is_included(session_maker) -> None:
 # Tests: settings validation
 # ---------------------------------------------------------------------------
 
+_REOPEN_ENV_NAMES = (
+    "CHATWOOT_OPERATOR_CLOSED_WINDOW_MODE",
+    "CHATWOOT_OPERATOR_REOPEN_TEMPLATE_NAME",
+    "CHATWOOT_OPERATOR_REOPEN_TEMPLATE_LANGUAGE",
+    "CHATWOOT_OPERATOR_REOPEN_TEMPLATE_PARAM_MODE",
+    "CHATWOOT_OPERATOR_REOPEN_PRIVATE_NOTE_ENABLED",
+)
+
+_SETTINGS_BASE = {
+    "database_url": "sqlite+aiosqlite:///:memory:",
+    "altegio_webhook_secret": "test",
+}
+
+
+def _clear_reopen_env(monkeypatch) -> None:
+    for name in _REOPEN_ENV_NAMES:
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_settings_invalid_closed_window_mode(monkeypatch) -> None:
+    """Invalid closed_window_mode raises ValidationError."""
+    from pydantic import ValidationError
+
+    from altegio_bot.settings import Settings
+
+    _clear_reopen_env(monkeypatch)
+    monkeypatch.setenv("CHATWOOT_OPERATOR_CLOSED_WINDOW_MODE", "bad_mode")
+    with pytest.raises(ValidationError, match="closed_window_mode"):
+        Settings(_env_file=None, **_SETTINGS_BASE)
+
 
 def test_settings_invalid_param_mode(monkeypatch) -> None:
     """Invalid param_mode raises a ValidationError at settings construction."""
@@ -335,39 +400,63 @@ def test_settings_invalid_param_mode(monkeypatch) -> None:
 
     from altegio_bot.settings import Settings
 
+    _clear_reopen_env(monkeypatch)
     monkeypatch.setenv("CHATWOOT_OPERATOR_REOPEN_TEMPLATE_PARAM_MODE", "bad_mode")
     with pytest.raises(ValidationError, match="param_mode"):
-        Settings()
+        Settings(_env_file=None, **_SETTINGS_BASE)
 
 
-def test_settings_enabled_with_empty_template_name(monkeypatch) -> None:
-    """Enabling reopen template without a template name raises ValidationError."""
+def test_settings_reopen_template_mode_with_empty_name(monkeypatch) -> None:
+    """mode=reopen_template without a template name raises ValidationError."""
     from pydantic import ValidationError
 
     from altegio_bot.settings import Settings
 
-    monkeypatch.setenv("CHATWOOT_OPERATOR_REOPEN_TEMPLATE_ENABLED", "true")
+    _clear_reopen_env(monkeypatch)
+    monkeypatch.setenv("CHATWOOT_OPERATOR_CLOSED_WINDOW_MODE", "reopen_template")
     monkeypatch.setenv("CHATWOOT_OPERATOR_REOPEN_TEMPLATE_NAME", "")
     with pytest.raises(ValidationError, match="TEMPLATE_NAME"):
-        Settings()
+        Settings(_env_file=None, **_SETTINGS_BASE)
 
 
-def test_settings_defaults_preserve_backward_compat() -> None:
-    """Default settings keep reopen template disabled (backward compatible)."""
+def test_settings_defaults_preserve_backward_compat(monkeypatch) -> None:
+    """Default settings use private_note_only (safe, backward compatible)."""
     from altegio_bot.settings import Settings
 
-    s = Settings()
-    assert s.chatwoot_operator_reopen_template_enabled is False
+    _clear_reopen_env(monkeypatch)
+    s = Settings(_env_file=None, **_SETTINGS_BASE)
+    assert s.chatwoot_operator_closed_window_mode == "private_note_only"
     assert s.chatwoot_operator_reopen_template_name == ""
     assert s.chatwoot_operator_reopen_template_language == "de"
     assert s.chatwoot_operator_reopen_template_param_mode == "contact_name"
     assert s.chatwoot_operator_reopen_private_note_enabled is True
 
 
-def test_settings_valid_param_modes() -> None:
+def test_settings_valid_closed_window_modes(monkeypatch) -> None:
+    """All allowed closed_window_mode values are accepted without error."""
+    from altegio_bot.settings import Settings
+
+    for mode in ("private_note_only",):
+        _clear_reopen_env(monkeypatch)
+        s = Settings(_env_file=None, chatwoot_operator_closed_window_mode=mode, **_SETTINGS_BASE)
+        assert s.chatwoot_operator_closed_window_mode == mode
+
+    # reopen_template requires a template name.
+    _clear_reopen_env(monkeypatch)
+    s = Settings(
+        _env_file=None,
+        chatwoot_operator_closed_window_mode="reopen_template",
+        chatwoot_operator_reopen_template_name="my_template",
+        **_SETTINGS_BASE,
+    )
+    assert s.chatwoot_operator_closed_window_mode == "reopen_template"
+
+
+def test_settings_valid_param_modes(monkeypatch) -> None:
     """All allowed param_mode values are accepted without error."""
     from altegio_bot.settings import Settings
 
-    for mode in ("none", "contact_name", "contact_and_business"):
-        s = Settings(chatwoot_operator_reopen_template_param_mode=mode)
+    for mode in ("none", "contact_name"):
+        _clear_reopen_env(monkeypatch)
+        s = Settings(_env_file=None, chatwoot_operator_reopen_template_param_mode=mode, **_SETTINGS_BASE)
         assert s.chatwoot_operator_reopen_template_param_mode == mode

@@ -11,10 +11,11 @@ Covers all required scenarios:
  7. Idempotency / duplicate webhook handling.
  8. Migration compatibility: OutboxMessage inserts without message_source
     succeed (server_default='bot') and existing rows read back correctly.
- 9. Session-aware operator relay: feature disabled preserves current behavior.
-10. Session-aware: feature enabled + window open → sends text.
-11. Session-aware: feature enabled + window closed → sends reopen template.
-12. Session-aware: reopen template send failure handling.
+ 9. Session-aware: default mode (private_note_only) + window open → sends text.
+10. Session-aware: window open + any mode → sends text.
+11. Session-aware: private_note_only + window closed → blocks send, private note, canceled outbox.
+12. Session-aware: reopen_template + window closed → sends template.
+13. Session-aware: reopen template send failure handling.
 """
 
 from __future__ import annotations
@@ -180,6 +181,49 @@ async def _make_sender(
     return sender
 
 
+def _meta_inbound_event(
+    session: Any,
+    *,
+    phone: str,
+    dedupe_key: str,
+    hours_ago: float = 1.0,
+) -> WhatsAppEvent:
+    """Create and add a Meta-origin inbound event that opens the 24h window."""
+    now = datetime.now(timezone.utc)
+    evt = WhatsAppEvent(
+        dedupe_key=dedupe_key,
+        received_at=now - timedelta(hours=hours_ago),
+        status="processed",
+        query={},
+        headers={},
+        payload={
+            "entry": [
+                {
+                    "changes": [
+                        {
+                            "value": {
+                                "messages": [
+                                    {
+                                        "from": phone,
+                                        "type": "text",
+                                        "text": {"body": "x"},
+                                        "id": f"wamid.{dedupe_key}",
+                                        "timestamp": "1700000000",
+                                    }
+                                ],
+                                "metadata": {"phone_number_id": "PNID_WIN_HELPER"},
+                            }
+                        }
+                    ]
+                }
+            ]
+        },
+        chatwoot_conversation_id=None,
+    )
+    session.add(evt)
+    return evt
+
+
 # ---------------------------------------------------------------------------
 # Test 1: operator outgoing message MUST be sent to Meta
 # ---------------------------------------------------------------------------
@@ -196,6 +240,7 @@ async def test_operator_outgoing_sent_to_meta(session_maker, monkeypatch) -> Non
     async with session_maker() as session:
         async with session.begin():
             await _make_sender(session, phone_number_id="PNID_OP")
+            _meta_inbound_event(session, phone="+49111222333", dedupe_key="meta:inbound:op:001")
 
             evt = WhatsAppEvent(
                 dedupe_key="chatwoot_out:10:20",
@@ -472,6 +517,7 @@ async def test_operator_relay_outbox_persisted(session_maker, monkeypatch) -> No
     async with session_maker() as session:
         async with session.begin():
             await _make_sender(session, sender_id=3, company_id=2, phone_number_id="PNID_OP2")
+            _meta_inbound_event(session, phone="+49777888999", dedupe_key="meta:inbound:op2:001")
 
             evt = WhatsAppEvent(
                 dedupe_key="chatwoot_out:30:40",
@@ -1178,6 +1224,7 @@ async def test_relay_same_company_multi_sender_sends_successfully(session_maker,
                 )
             )
 
+            _meta_inbound_event(session, phone="+49111222333", dedupe_key="meta:inbound:sc3:001")
             evt = WhatsAppEvent(
                 dedupe_key="chatwoot_out:600:700",
                 status="received",
@@ -1239,6 +1286,7 @@ async def test_operator_relay_send_failure(session_maker, monkeypatch) -> None:
                     is_active=True,
                 )
             )
+            _meta_inbound_event(session, phone="+49900100200", dedupe_key="meta:inbound:err:001")
             evt = WhatsAppEvent(
                 dedupe_key="chatwoot_out:900:1000",
                 status="received",
@@ -1378,6 +1426,7 @@ async def test_operator_relay_no_chatwoot_mirror(session_maker, monkeypatch) -> 
     async with session_maker() as session:
         async with session.begin():
             await _make_sender(session, sender_id=200, company_id=1, phone_number_id="PNID_NM")
+            _meta_inbound_event(session, phone="+49500600700", dedupe_key="meta:inbound:nm:001")
 
             evt = WhatsAppEvent(
                 dedupe_key="chatwoot_out:500:600",
@@ -1479,6 +1528,7 @@ async def test_relay_with_inbox_company_map(session_maker, monkeypatch) -> None:
                 )
             )
 
+            _meta_inbound_event(session, phone="+49123000000", dedupe_key="meta:inbound:map:001")
             relay_payload: dict[str, Any] = {
                 "_chatwoot_operator_relay": {
                     "recipient_phone": "+49123000000",
@@ -1669,43 +1719,17 @@ async def test_relay_ambiguous_without_map_still_blocks(
 # ---------------------------------------------------------------------------
 
 
-def _meta_inbound_payload_for(phone: str) -> dict[str, Any]:
-    """Minimal Meta-origin inbound payload from the given phone."""
-    return {
-        "entry": [
-            {
-                "changes": [
-                    {
-                        "value": {
-                            "messages": [
-                                {
-                                    "from": phone,
-                                    "type": "text",
-                                    "text": {"body": "Hallo"},
-                                    "id": "wamid.INBOUND_META",
-                                    "timestamp": "1700000000",
-                                }
-                            ],
-                            "metadata": {"phone_number_id": "PNID_RELAY"},
-                        }
-                    }
-                ]
-            }
-        ]
-    }
-
-
 @pytest.mark.asyncio
-async def test_feature_disabled_sends_text_even_when_window_closed(session_maker, monkeypatch) -> None:
-    """Feature disabled: relay always sends text regardless of window state."""
+async def test_private_note_only_window_open_sends_text(session_maker, monkeypatch) -> None:
+    """Default mode (private_note_only) + window open → sends free-form text."""
     monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
-    provider = _FakeProvider(wamid="wamid.FEAT_DISABLED")
+    provider = _FakeProvider(wamid="wamid.PNO_OPEN")
 
     async with session_maker() as session:
         async with session.begin():
             await _make_sender(session, sender_id=300, company_id=1, phone_number_id="PNID_FD")
+            _meta_inbound_event(session, phone="+49300400500", dedupe_key="meta:inbound:pno:open")
 
-            # No inbound events → window would be closed if feature were enabled.
             evt = WhatsAppEvent(
                 dedupe_key="chatwoot_out:3000:4000",
                 status="received",
@@ -1726,14 +1750,11 @@ async def test_feature_disabled_sends_text_even_when_window_closed(session_maker
             from altegio_bot.settings import settings as _s
 
             orig_relay = _s.chatwoot_operator_relay_enabled
-            orig_reopen = _s.chatwoot_operator_reopen_template_enabled
             _s.chatwoot_operator_relay_enabled = True
-            _s.chatwoot_operator_reopen_template_enabled = False
             try:
                 await handle_event(session, evt, provider)
             finally:
                 _s.chatwoot_operator_relay_enabled = orig_relay
-                _s.chatwoot_operator_reopen_template_enabled = orig_reopen
 
     # Must send text, must NOT send template.
     assert len(provider.sent) == 1
@@ -1741,7 +1762,7 @@ async def test_feature_disabled_sends_text_even_when_window_closed(session_maker
 
     async with session_maker() as session:
         result = await session.execute(
-            select(OutboxMessage).where(OutboxMessage.provider_message_id == "wamid.FEAT_DISABLED")
+            select(OutboxMessage).where(OutboxMessage.provider_message_id == "wamid.PNO_OPEN")
         )
         ob = result.scalar_one_or_none()
 
@@ -1749,31 +1770,19 @@ async def test_feature_disabled_sends_text_even_when_window_closed(session_maker
     assert ob.template_code == "operator_relay"
     assert ob.message_source == "operator"
     assert ob.meta.get("send_type") == "text"
+    assert ob.meta.get("wa_window_open") is True
 
 
 @pytest.mark.asyncio
-async def test_feature_enabled_window_open_sends_text(session_maker, monkeypatch) -> None:
-    """Feature enabled + window open → sends free-form text."""
+async def test_reopen_mode_window_open_sends_text(session_maker, monkeypatch) -> None:
+    """mode=reopen_template + window open → sends free-form text (not template)."""
     monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
     provider = _FakeProvider(wamid="wamid.WIN_OPEN")
 
     async with session_maker() as session:
         async with session.begin():
             await _make_sender(session, sender_id=301, company_id=1, phone_number_id="PNID_WO")
-
-            # Insert Meta-origin inbound from the same phone 1h ago → window open.
-            now = datetime.now(timezone.utc)
-            session.add(
-                WhatsAppEvent(
-                    dedupe_key="meta:inbound:wo:001",
-                    received_at=now - timedelta(hours=1),
-                    status="processed",
-                    query={},
-                    headers={},
-                    payload=_meta_inbound_payload_for("+49111222001"),
-                    chatwoot_conversation_id=None,
-                )
-            )
+            _meta_inbound_event(session, phone="+49111222001", dedupe_key="meta:inbound:wo:001")
 
             evt = WhatsAppEvent(
                 dedupe_key="chatwoot_out:3100:4100",
@@ -1795,16 +1804,16 @@ async def test_feature_enabled_window_open_sends_text(session_maker, monkeypatch
             from altegio_bot.settings import settings as _s
 
             orig_relay = _s.chatwoot_operator_relay_enabled
-            orig_reopen = _s.chatwoot_operator_reopen_template_enabled
+            orig_mode = _s.chatwoot_operator_closed_window_mode
             orig_name = _s.chatwoot_operator_reopen_template_name
             _s.chatwoot_operator_relay_enabled = True
-            _s.chatwoot_operator_reopen_template_enabled = True
+            _s.chatwoot_operator_closed_window_mode = "reopen_template"
             _s.chatwoot_operator_reopen_template_name = "test_reopen_tpl"
             try:
                 await handle_event(session, evt, provider)
             finally:
                 _s.chatwoot_operator_relay_enabled = orig_relay
-                _s.chatwoot_operator_reopen_template_enabled = orig_reopen
+                _s.chatwoot_operator_closed_window_mode = orig_mode
                 _s.chatwoot_operator_reopen_template_name = orig_name
 
     assert len(provider.sent) == 1
@@ -1824,8 +1833,87 @@ async def test_feature_enabled_window_open_sends_text(session_maker, monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_feature_enabled_window_closed_sends_reopen_template(session_maker, monkeypatch) -> None:
-    """Feature enabled + no inbound in 24h → sends reopen template, not text."""
+async def test_private_note_only_window_closed(session_maker, monkeypatch) -> None:
+    """Default mode (private_note_only) + window closed → blocks send, private note, canceled outbox."""
+    monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
+    provider = _FakeProvider(wamid="wamid.SHOULD_NOT_APPEAR_PNO")
+
+    mock_cw_class = MagicMock()
+    mock_cw = MagicMock()
+    mock_cw.send_message = AsyncMock(return_value=99)
+    mock_cw.aclose = AsyncMock(return_value=None)
+    mock_cw_class.return_value = mock_cw
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _make_sender(session, sender_id=303, company_id=1, phone_number_id="PNID_PNO")
+
+            # No inbound events → window closed.
+            evt = WhatsAppEvent(
+                dedupe_key="chatwoot_out:3400:4400",
+                status="received",
+                error=None,
+                query={},
+                headers={},
+                payload=_operator_relay_payload(
+                    recipient_phone="+49111222004",
+                    text="Ihr Termin morgen um 11 Uhr",
+                    phone_number_id="PNID_PNO",
+                    conversation_id=3400,
+                    message_id=4400,
+                    agent_name="Klaus",
+                ),
+                chatwoot_conversation_id=3400,
+            )
+            session.add(evt)
+            await session.flush()
+
+            from altegio_bot.settings import settings as _s
+
+            orig_relay = _s.chatwoot_operator_relay_enabled
+            orig_mode = _s.chatwoot_operator_closed_window_mode
+            orig_note = _s.chatwoot_operator_reopen_private_note_enabled
+            _s.chatwoot_operator_relay_enabled = True
+            _s.chatwoot_operator_closed_window_mode = "private_note_only"
+            _s.chatwoot_operator_reopen_private_note_enabled = True
+            try:
+                with patch(
+                    "altegio_bot.workers.whatsapp_inbox_worker.ChatwootClient",
+                    mock_cw_class,
+                ):
+                    await handle_event(session, evt, provider)
+            finally:
+                _s.chatwoot_operator_relay_enabled = orig_relay
+                _s.chatwoot_operator_closed_window_mode = orig_mode
+                _s.chatwoot_operator_reopen_private_note_enabled = orig_note
+
+    # Must NOT have sent anything to Meta.
+    assert len(provider.sent) == 0
+    assert len(provider.templates_sent) == 0
+
+    # Private note must have been sent to Chatwoot.
+    mock_cw.send_message.assert_called_once()
+    assert mock_cw.send_message.call_args.kwargs.get("private") is True
+
+    # OutboxMessage created with status='canceled'.
+    async with session_maker() as session:
+        result = await session.execute(select(OutboxMessage).where(OutboxMessage.phone_e164 == "+49111222004"))
+        ob = result.scalar_one_or_none()
+
+    assert ob is not None
+    assert ob.template_code == "operator_relay"
+    assert ob.status == "canceled"
+    assert ob.message_source == "operator"
+    assert ob.body == "Ihr Termin morgen um 11 Uhr"
+    assert ob.provider_message_id is None
+    assert ob.meta["wa_window_open"] is False
+    assert ob.meta["cancel_reason"] == "customer_service_window_closed"
+    assert ob.meta["agent_name"] == "Klaus"
+
+
+@pytest.mark.asyncio
+async def test_reopen_template_window_closed(session_maker, monkeypatch) -> None:
+    """mode=reopen_template + window closed → sends reopen template, not text."""
     monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
     provider = _FakeProvider(wamid="wamid.REOPEN_TPL")
 
@@ -1862,11 +1950,11 @@ async def test_feature_enabled_window_closed_sends_reopen_template(session_maker
             from altegio_bot.settings import settings as _s
 
             orig_relay = _s.chatwoot_operator_relay_enabled
-            orig_reopen = _s.chatwoot_operator_reopen_template_enabled
+            orig_mode = _s.chatwoot_operator_closed_window_mode
             orig_name = _s.chatwoot_operator_reopen_template_name
             orig_note = _s.chatwoot_operator_reopen_private_note_enabled
             _s.chatwoot_operator_relay_enabled = True
-            _s.chatwoot_operator_reopen_template_enabled = True
+            _s.chatwoot_operator_closed_window_mode = "reopen_template"
             _s.chatwoot_operator_reopen_template_name = "kitilash_reopen"
             _s.chatwoot_operator_reopen_private_note_enabled = True
             try:
@@ -1877,7 +1965,7 @@ async def test_feature_enabled_window_closed_sends_reopen_template(session_maker
                     await handle_event(session, evt, provider)
             finally:
                 _s.chatwoot_operator_relay_enabled = orig_relay
-                _s.chatwoot_operator_reopen_template_enabled = orig_reopen
+                _s.chatwoot_operator_closed_window_mode = orig_mode
                 _s.chatwoot_operator_reopen_template_name = orig_name
                 _s.chatwoot_operator_reopen_private_note_enabled = orig_note
 
@@ -1889,8 +1977,7 @@ async def test_feature_enabled_window_closed_sends_reopen_template(session_maker
 
     # Private note must have been sent to Chatwoot.
     mock_cw.send_message.assert_called_once()
-    call_kwargs = mock_cw.send_message.call_args
-    assert call_kwargs.kwargs.get("private") is True
+    assert mock_cw.send_message.call_args.kwargs.get("private") is True
 
     # OutboxMessage must reflect template send, not text.
     async with session_maker() as session:
@@ -1957,11 +2044,11 @@ async def test_reopen_template_send_failure_sets_error(session_maker, monkeypatc
             from altegio_bot.settings import settings as _s
 
             orig_relay = _s.chatwoot_operator_relay_enabled
-            orig_reopen = _s.chatwoot_operator_reopen_template_enabled
+            orig_mode = _s.chatwoot_operator_closed_window_mode
             orig_name = _s.chatwoot_operator_reopen_template_name
             orig_note = _s.chatwoot_operator_reopen_private_note_enabled
             _s.chatwoot_operator_relay_enabled = True
-            _s.chatwoot_operator_reopen_template_enabled = True
+            _s.chatwoot_operator_closed_window_mode = "reopen_template"
             _s.chatwoot_operator_reopen_template_name = "kitilash_reopen"
             _s.chatwoot_operator_reopen_private_note_enabled = True
             try:
@@ -1972,7 +2059,7 @@ async def test_reopen_template_send_failure_sets_error(session_maker, monkeypatc
                     await handle_event(session, evt, provider)
             finally:
                 _s.chatwoot_operator_relay_enabled = orig_relay
-                _s.chatwoot_operator_reopen_template_enabled = orig_reopen
+                _s.chatwoot_operator_closed_window_mode = orig_mode
                 _s.chatwoot_operator_reopen_template_name = orig_name
                 _s.chatwoot_operator_reopen_private_note_enabled = orig_note
 
