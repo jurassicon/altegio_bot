@@ -48,6 +48,7 @@ from altegio_bot.models.models import (
     PromoLead,
     Record,
     RecordService,
+    WhatsAppSender,
 )
 from altegio_bot.perf import perf_log
 from altegio_bot.promo_discount_apply import process_promo_apply_existing_booking_job
@@ -1748,33 +1749,81 @@ async def _run_job_logic(
     )
     _wa_window_open: bool | None = None
     _last_inbound_at: datetime | None = None
+    _wa_window_check_error: str | None = None
     _text_send_error: str | None = None
     _use_template_fallback = False
 
     if _24h_eligible:
-        with perf_log(
-            "outbox_worker",
-            "outbox.wa_window_check",
-            job_id=job.id,
-            job_type=job.job_type,
-            company_id=job.company_id,
-            phone_e164=phone,
-        ) as _wc_ctx:
-            _wa_window_open, _last_inbound_at = await is_whatsapp_customer_window_open(
-                session=session,
-                phone_e164=phone,
-                now=utcnow(),
+        # Resolve sender phone_number_id so we only count inbound events from
+        # the same WhatsApp sender number, preventing a false-open from a
+        # customer message delivered to a different WA number in the same system.
+        _sender_phone_number_id: str | None = None
+        try:
+            _sender_obj = await session.get(WhatsAppSender, sender_id)
+            if _sender_obj is not None:
+                _sender_phone_number_id = _sender_obj.phone_number_id
+            else:
+                logger.warning(
+                    "wa_window_check: WhatsAppSender id=%s not found, skipping 24h text routing job_id=%s",
+                    sender_id,
+                    job.id,
+                )
+                _wa_window_open = False
+                _wa_window_check_error = f"sender_not_found:id={sender_id}"
+        except Exception as exc:
+            logger.warning(
+                "wa_window_check: sender lookup failed job_id=%s sender_id=%s: %s",
+                job.id,
+                sender_id,
+                exc,
             )
-            _wc_ctx.update(window_open=_wa_window_open)
-        logger.info(
-            "wa_window_check job_id=%s job_type=%s company_id=%s phone_e164=%s window_open=%s last_inbound_at=%s",
-            job.id,
-            job.job_type,
-            job.company_id,
-            phone,
-            _wa_window_open,
-            _last_inbound_at.isoformat() if _last_inbound_at else None,
-        )
+            _wa_window_open = False
+            _wa_window_check_error = f"sender_lookup_failed:{exc}"
+
+        if _wa_window_open is None:
+            # Sender loaded OK — perform the actual window check.
+            # Wrapped in try/except: this feature is an optimization and must
+            # never block critical appointment notifications.  On any failure,
+            # fail open to the legacy template path.
+            try:
+                with perf_log(
+                    "outbox_worker",
+                    "outbox.wa_window_check",
+                    job_id=job.id,
+                    job_type=job.job_type,
+                    company_id=job.company_id,
+                    phone_e164=phone,
+                ) as _wc_ctx:
+                    _wa_window_open, _last_inbound_at = await is_whatsapp_customer_window_open(
+                        session=session,
+                        phone_e164=phone,
+                        now=utcnow(),
+                        phone_number_id=_sender_phone_number_id,
+                    )
+                    _wc_ctx.update(window_open=_wa_window_open)
+                logger.info(
+                    "wa_window_check job_id=%s job_type=%s company_id=%s "
+                    "phone_e164=%s window_open=%s last_inbound_at=%s",
+                    job.id,
+                    job.job_type,
+                    job.company_id,
+                    phone,
+                    _wa_window_open,
+                    _last_inbound_at.isoformat() if _last_inbound_at else None,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "wa_window_check: failed, falling back to template "
+                    "job_id=%s job_type=%s company_id=%s phone_e164=%s: %s",
+                    job.id,
+                    job.job_type,
+                    job.company_id,
+                    phone,
+                    exc,
+                )
+                _wa_window_open = False
+                _last_inbound_at = None
+                _wa_window_check_error = str(exc)
 
         if _wa_window_open:
             with perf_log(
@@ -1840,6 +1889,7 @@ async def _run_job_logic(
                             "send_type": "text",
                             "original_send_type": "template",
                             "text_inside_24h": True,
+                            "text_inside_24h_eligible": True,
                             "original_template": meta_template_name,
                             "original_template_language": TEMPLATE_LANGUAGE,
                             "original_template_params": template_params,
@@ -1997,7 +2047,11 @@ async def _run_job_logic(
                 send_meta["last_meta_inbound_at"] = _last_inbound_iso
                 send_meta["original_template"] = meta_template_name
                 send_meta["original_template_language"] = TEMPLATE_LANGUAGE
-                if _use_template_fallback:
+                if _wa_window_check_error:
+                    send_meta["text_inside_24h"] = False
+                    send_meta["wa_window_check_error"] = _wa_window_check_error
+                    send_meta["route_reason"] = "wa_window_check_failed"
+                elif _use_template_fallback:
                     send_meta["text_inside_24h"] = True
                     send_meta["text_send_error"] = _text_send_error
                     send_meta["fallback_reason"] = "text_send_failed"

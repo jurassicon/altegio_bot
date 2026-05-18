@@ -19,6 +19,8 @@ Covers:
 15. Future timestamp is ignored (not fallen back to).
 16. Settings validation: invalid closed_window_mode, invalid param_mode,
     reopen_template + empty name, defaults.
+17. phone_number_id filtering: inbound on PNID_A doesn't open window for PNID_B;
+    no filter matches both.
 """
 
 from __future__ import annotations
@@ -590,3 +592,107 @@ def test_settings_valid_param_modes(monkeypatch) -> None:
         _clear_reopen_env(monkeypatch)
         s = Settings(_env_file=None, chatwoot_operator_reopen_template_param_mode=mode, **_SETTINGS_BASE)
         assert s.chatwoot_operator_reopen_template_param_mode == mode
+
+
+# ---------------------------------------------------------------------------
+# Tests: phone_number_id filtering (P5 — cross-sender isolation)
+# ---------------------------------------------------------------------------
+
+PNID_A = "PNID_SENDER_A"
+PNID_B = "PNID_SENDER_B"
+
+
+def _meta_inbound_payload_with_pnid(
+    phone: str,
+    phone_number_id: str,
+) -> dict:
+    """Meta-origin inbound payload with an explicit phone_number_id."""
+    return {
+        "entry": [
+            {
+                "changes": [
+                    {
+                        "value": {
+                            "messages": [
+                                {
+                                    "from": phone,
+                                    "type": "text",
+                                    "text": {"body": "Hi"},
+                                    "id": f"wamid.{phone_number_id}",
+                                    "timestamp": str(int(NOW.timestamp()) - 3600),
+                                }
+                            ],
+                            "metadata": {"phone_number_id": phone_number_id},
+                        }
+                    }
+                ]
+            }
+        ]
+    }
+
+
+@pytest.mark.asyncio
+async def test_phone_number_id_filter_matches_correct_sender(session_maker) -> None:
+    """Inbound on PNID_A opens window for PNID_A filter, not for PNID_B."""
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(
+                _make_event(
+                    received_at=NOW - timedelta(hours=1),
+                    payload=_meta_inbound_payload_with_pnid(PHONE, PNID_A),
+                    dedupe_key="pnid:filter:a",
+                )
+            )
+
+        open_a, _ = await is_whatsapp_customer_window_open(session, PHONE, NOW, phone_number_id=PNID_A)
+        open_b, _ = await is_whatsapp_customer_window_open(session, PHONE, NOW, phone_number_id=PNID_B)
+
+    assert open_a is True, "Window must be open when filtering by the correct PNID"
+    assert open_b is False, "Window must be closed when filtering by a different PNID"
+
+
+@pytest.mark.asyncio
+async def test_phone_number_id_none_matches_all_senders(session_maker) -> None:
+    """No phone_number_id filter: both PNID_A and PNID_B events are counted."""
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(
+                _make_event(
+                    received_at=NOW - timedelta(hours=2),
+                    payload=_meta_inbound_payload_with_pnid(PHONE, PNID_A),
+                    dedupe_key="pnid:nofilter:a",
+                )
+            )
+            session.add(
+                _make_event(
+                    received_at=NOW - timedelta(hours=3),
+                    payload=_meta_inbound_payload_with_pnid(PHONE, PNID_B),
+                    dedupe_key="pnid:nofilter:b",
+                )
+            )
+
+        open_no_filter, last = await is_whatsapp_customer_window_open(session, PHONE, NOW, phone_number_id=None)
+
+    assert open_no_filter is True, "Unfiltered check should match events from any PNID"
+    assert last is not None
+
+
+@pytest.mark.asyncio
+async def test_phone_number_id_unknown_pnid_returns_closed(session_maker) -> None:
+    """Filtering by PNID with no matching events → window closed."""
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(
+                _make_event(
+                    received_at=NOW - timedelta(hours=1),
+                    payload=_meta_inbound_payload_with_pnid(PHONE, PNID_A),
+                    dedupe_key="pnid:unknown:a",
+                )
+            )
+
+        open_c, last = await is_whatsapp_customer_window_open(
+            session, PHONE, NOW, phone_number_id="PNID_DOES_NOT_EXIST"
+        )
+
+    assert open_c is False
+    assert last is None

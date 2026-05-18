@@ -1,6 +1,20 @@
 from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# Hard allowlist of job types that may be routed to text inside the 24h window.
+# This must only contain appointment / service notification types — never campaign
+# or marketing job types — because the text-success path returns early before the
+# shared campaign post-send backfill logic that runs at the bottom of _run_job_logic.
+BOT_TEXT_INSIDE_24H_ALLOWED_JOB_TYPES: frozenset[str] = frozenset(
+    {
+        "record_created",
+        "record_updated",
+        "record_canceled",
+        "reminder_24h",
+        "reminder_2h",
+    }
+)
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -317,13 +331,21 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_bot_text_inside_24h_config(self) -> "Settings":
-        if self.bot_template_text_inside_24h_enabled:
-            tokens = [t.strip() for t in self.bot_template_text_inside_24h_job_types.split(",") if t.strip()]
-            if not tokens:
-                raise ValueError(
-                    "BOT_TEMPLATE_TEXT_INSIDE_24H_JOB_TYPES must be non-empty "
-                    "when BOT_TEMPLATE_TEXT_INSIDE_24H_ENABLED=true"
-                )
+        tokens = [t.strip() for t in self.bot_template_text_inside_24h_job_types.split(",") if t.strip()]
+        if self.bot_template_text_inside_24h_enabled and not tokens:
+            raise ValueError(
+                "BOT_TEMPLATE_TEXT_INSIDE_24H_JOB_TYPES must be non-empty "
+                "when BOT_TEMPLATE_TEXT_INSIDE_24H_ENABLED=true"
+            )
+        # Hard allowlist — validate always so misconfiguration is caught before rollout,
+        # regardless of whether the feature is currently enabled.
+        unsupported = set(tokens) - BOT_TEXT_INSIDE_24H_ALLOWED_JOB_TYPES
+        if unsupported:
+            raise ValueError(
+                f"BOT_TEMPLATE_TEXT_INSIDE_24H_JOB_TYPES contains unsupported job types: "
+                f"{sorted(unsupported)!r}. "
+                f"Allowed: {sorted(BOT_TEXT_INSIDE_24H_ALLOWED_JOB_TYPES)!r}"
+            )
         return self
 
     # ---------------------------------------------------------------------------

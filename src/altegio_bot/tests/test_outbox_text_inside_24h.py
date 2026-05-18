@@ -10,8 +10,10 @@ Covers:
  7. Feature enabled + open window + text policy error + fallback enabled → template_fallback.
  8. Feature enabled + open window + ambiguous text error → no fallback, retry.
  9. Feature enabled + open window + empty rendered body → template, no text.
-10. Settings validation: defaults, env parsing, empty whitelist rejection, space trimming.
+10. Settings validation: defaults, env parsing, empty whitelist rejection, space trimming,
+    hard-allowlist (unsupported type raises even when feature is disabled).
 11. Regression: existing outbox_process_job tests still pass.
+12. P1: window-check exception → fail-open → template sent (never blocks notifications).
 """
 
 from __future__ import annotations
@@ -68,6 +70,12 @@ class FakeRecord:
     short_link: str = ""
 
 
+@dataclass
+class FakeSender:
+    id: int = 123
+    phone_number_id: str = "PNID_TEST"
+
+
 class FakeOutbox:
     def __init__(self, **kwargs: Any) -> None:
         for key, value in kwargs.items():
@@ -84,6 +92,12 @@ class FakeSession:
             self._pk += 1
             setattr(obj, "id", self._pk)
         self.added.append(obj)
+
+    async def get(self, model: type, pk: Any) -> Any:
+        """Return a FakeSender for WhatsAppSender lookups; None otherwise."""
+        if getattr(model, "__name__", None) == "WhatsAppSender":
+            return FakeSender(id=pk)
+        return None
 
 
 # A complete render context so that preflight validation passes for
@@ -261,6 +275,7 @@ def test_eligible_job_open_window_sends_text(monkeypatch: Any) -> None:
     meta = out.meta
     assert meta["send_type"] == "text"
     assert meta["text_inside_24h"] is True
+    assert meta["text_inside_24h_eligible"] is True
     assert meta["wa_window_open"] is True
     assert meta["original_send_type"] == "template"
     assert meta["route_reason"] == "customer_service_window_open"
@@ -828,3 +843,84 @@ def test_get_24h_whitelist_reflects_settings(monkeypatch: Any) -> None:
     assert "reminder_24h" in wl
     assert "reminder_2h" not in wl
     assert "repeat_10d" not in wl
+
+
+# ---------------------------------------------------------------------------
+# Test 14 — P1: window-check exception → fail-open → template sent
+# ---------------------------------------------------------------------------
+
+
+def test_window_check_exception_fails_open_to_template(monkeypatch: Any) -> None:
+    """is_whatsapp_customer_window_open raises → fail-open → template, never blocks."""
+    job = FakeJob(
+        id=14,
+        company_id=758285,
+        job_type="reminder_2h",
+        status="queued",
+        run_at=NOW,
+    )
+    _patch_base(monkeypatch, job)
+    _enable_feature(monkeypatch)
+
+    async def _window_raises(*a: Any, **kw: Any) -> None:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(ow, "is_whatsapp_customer_window_open", _window_raises)
+
+    text_called = []
+    template_called = []
+
+    async def _fake_text(*a: Any, **kw: Any) -> Any:
+        text_called.append(True)
+        return ("txt-id", None)
+
+    async def _fake_template(*a: Any, **kw: Any) -> Any:
+        template_called.append(True)
+        return ("tpl-failopen-id", None)
+
+    monkeypatch.setattr(ow, "safe_send", _fake_text)
+    monkeypatch.setattr(ow, "safe_send_template", _fake_template)
+
+    session = FakeSession()
+    run(ow.process_job_in_session(session, 14, provider=object()))  # type: ignore
+
+    assert job.status == "done", f"Expected done, got {job.status}: {job.last_error}"
+    assert not text_called, "safe_send (text) must not be called after window-check failure"
+    assert template_called, "safe_send_template must be called (fail-open)"
+
+    out = session.added[0]
+    assert out.status == "sent"
+    meta = out.meta
+    assert meta["send_type"] == "template"
+    assert meta["text_inside_24h"] is False
+    assert meta["route_reason"] == "wa_window_check_failed"
+    assert "boom" in meta["wa_window_check_error"]
+
+
+# ---------------------------------------------------------------------------
+# Test 15 — P3: hard allowlist validation rejects unsupported job types
+# ---------------------------------------------------------------------------
+
+
+def test_settings_unsupported_job_type_enabled_raises() -> None:
+    """enabled=True, job_types with non-allowlist type → ValueError."""
+    with pytest.raises((ValueError, Exception)):
+        Settings(  # type: ignore[call-arg]
+            _env_file=None,
+            database_url="postgresql+asyncpg://x/y",
+            altegio_webhook_secret="s",
+            bot_template_text_inside_24h_enabled=True,
+            bot_template_text_inside_24h_job_types="reminder_2h,repeat_10d",
+        )
+
+
+def test_settings_disabled_unsupported_job_type_still_raises() -> None:
+    """enabled=False, job_types with non-allowlist type → ValueError (always validated)."""
+    with pytest.raises((ValueError, Exception)):
+        Settings(  # type: ignore[call-arg]
+            _env_file=None,
+            database_url="postgresql+asyncpg://x/y",
+            altegio_webhook_secret="s",
+            bot_template_text_inside_24h_enabled=False,
+            bot_template_text_inside_24h_job_types="repeat_10d",
+        )
