@@ -5,8 +5,10 @@ Scenarios:
      (to prevent the feedback loop).
   2. A real Meta-origin event MUST call ChatwootClient.log_incoming_message
      (existing behaviour is preserved).
-  3. A Chatwoot-origin event with a stop/start command must still process the
-     command (opt-out logic must not be skipped by the loop guard).
+  3. A Chatwoot-origin event with a stop/start command must NOT process the
+     command — it is a Chatwoot mirror of a Meta event that already handled
+     the command.  Processing the mirror causes duplicate acks and double
+     opt-outs (real-world incident: customer +4915207156150, events 4971/4972).
 """
 
 from __future__ import annotations
@@ -158,9 +160,9 @@ async def test_real_wa_event_calls_log_incoming_message(session_maker) -> None:
 
 
 @pytest.mark.asyncio
-async def test_chatwoot_origin_stop_command_still_opts_out(session_maker) -> None:
-    """A chatwoot-origin STOP event must not call log_incoming_message, but must
-    still set wa_opted_out=True on the matching client record."""
+async def test_chatwoot_origin_stop_command_skipped(session_maker) -> None:
+    """A Chatwoot-origin STOP event must not call log_incoming_message and must
+    NOT process the command — the mirror must not duplicate the opt-out or ack."""
     provider = _NoOpProvider()
     phone = "+49555000111"
 
@@ -196,6 +198,7 @@ async def test_chatwoot_origin_stop_command_still_opts_out(session_maker) -> Non
             )
             session.add(evt)
             await session.flush()
+            evt_id = evt.id
 
             mock_class, mock_instance = _mock_chatwoot_client()
             with patch(
@@ -209,4 +212,10 @@ async def test_chatwoot_origin_stop_command_still_opts_out(session_maker) -> Non
 
     mock_instance.log_incoming_message.assert_not_called()
     assert client is not None
-    assert client.wa_opted_out is True
+    # Command must NOT have been executed — wa_opted_out stays False.
+    assert client.wa_opted_out is False
+
+    async with session_maker() as session:
+        reloaded = await session.get(WhatsAppEvent, evt_id)
+    assert reloaded is not None
+    assert reloaded.error is None

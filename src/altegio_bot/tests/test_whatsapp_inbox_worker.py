@@ -1,0 +1,393 @@
+"""Tests for Chatwoot-origin mirror event guard in whatsapp_inbox_worker.
+
+Real-world case: customer +4915207156150 sent STOP, which produced:
+  event_id=4971  dedupe_key=wa:...           origin=meta    body=STOP
+  event_id=4972  dedupe_key=chatwoot:395:3388 origin=chatwoot body=STOP
+
+Both were processed as wa_cmd=stop, sending the ack twice.
+
+Fix: Chatwoot-origin events must not execute inbound commands.
+
+Covers:
+ 1. Meta-origin STOP → command executed, ack sent, OutboxMessage created.
+ 2. Chatwoot-origin mirrored STOP → command skipped, no ack, no OutboxMessage.
+ 3. Real-world sequence: exactly one wa_cmd_stop OutboxMessage total.
+ 4. Operator relay (Chatwoot-origin with _chatwoot_operator_relay) → still sent.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+from typing import Any
+
+import pytest
+from sqlalchemy import select
+
+from altegio_bot.models.models import Client, OutboxMessage, WhatsAppEvent, WhatsAppSender
+from altegio_bot.providers.base import WhatsAppProvider
+from altegio_bot.workers.whatsapp_inbox_worker import handle_event
+
+
+class _CaptureProvider(WhatsAppProvider):
+    def __init__(self) -> None:
+        self.sent: list[dict[str, Any]] = []
+
+    async def send(
+        self,
+        sender_id: int,
+        phone_e164: str,
+        text: str,
+        *,
+        contact_name: str | None = None,
+    ) -> str:
+        self.sent.append({"sender_id": sender_id, "phone_e164": phone_e164, "text": text})
+        return "wamid.CAPTURE"
+
+    async def send_template(self, *args: Any, **kwargs: Any) -> str:
+        return "wamid.CAPTURE_TPL"
+
+
+def _meta_stop_payload(phone_number_id: str, from_phone: str) -> dict[str, Any]:
+    """Standard Meta-origin STOP payload — no _chatwoot key."""
+    return {
+        "entry": [
+            {
+                "changes": [
+                    {
+                        "value": {
+                            "metadata": {"phone_number_id": phone_number_id},
+                            "messages": [
+                                {
+                                    "from": from_phone,
+                                    "type": "text",
+                                    "text": {"body": "STOP"},
+                                    "id": "wamid.META_STOP",
+                                }
+                            ],
+                        }
+                    }
+                ]
+            }
+        ]
+    }
+
+
+def _chatwoot_mirror_stop_payload(
+    phone_number_id: str,
+    from_phone: str,
+    *,
+    conversation_id: int = 395,
+    message_id: int = 3388,
+) -> dict[str, Any]:
+    """Chatwoot-mirrored STOP payload — same message, but _chatwoot marker present."""
+    return {
+        "entry": [
+            {
+                "changes": [
+                    {
+                        "value": {
+                            "metadata": {"phone_number_id": phone_number_id},
+                            "messages": [
+                                {
+                                    "from": from_phone,
+                                    "type": "text",
+                                    "text": {"body": "STOP"},
+                                    "id": "cw-msg-001",
+                                }
+                            ],
+                        }
+                    }
+                ]
+            }
+        ],
+        "_chatwoot": {
+            "conversation_id": conversation_id,
+            "message_id": message_id,
+            "account_id": 1,
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# Test 1: Meta-origin STOP executes the command
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_meta_origin_stop_executes_command(session_maker, monkeypatch) -> None:
+    """Meta-origin STOP: ack sent, wa_cmd_stop OutboxMessage created."""
+    monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
+    provider = _CaptureProvider()
+    phone = "+4915207156150"
+
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(
+                Client(
+                    company_id=1,
+                    altegio_client_id=9001,
+                    display_name="Seren",
+                    phone_e164=phone,
+                    raw={},
+                )
+            )
+            session.add(
+                WhatsAppSender(
+                    id=900,
+                    company_id=1,
+                    sender_code="default",
+                    phone_number_id="PNID_META_STOP",
+                    display_phone="+49",
+                    is_active=True,
+                )
+            )
+            evt = WhatsAppEvent(
+                dedupe_key="wa:meta:stop:001",
+                status="received",
+                error=None,
+                query={},
+                headers={},
+                payload=_meta_stop_payload("PNID_META_STOP", "4915207156150"),
+                chatwoot_conversation_id=None,
+            )
+            session.add(evt)
+            await session.flush()
+
+            await handle_event(session, evt, provider)
+
+    assert len(provider.sent) == 1
+    assert provider.sent[0]["phone_e164"] == phone
+    assert "abgemeldet" in provider.sent[0]["text"].lower()
+
+    async with session_maker() as session:
+        result = await session.execute(select(OutboxMessage).where(OutboxMessage.template_code == "wa_cmd_stop"))
+        assert result.scalar_one_or_none() is not None
+
+
+# ---------------------------------------------------------------------------
+# Test 2: Chatwoot-origin mirrored STOP is silently skipped
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_chatwoot_mirror_stop_skips_command(session_maker, monkeypatch) -> None:
+    """Chatwoot-mirror STOP: no ack, no OutboxMessage, event processed without error."""
+    monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
+    provider = _CaptureProvider()
+    phone = "+4915207156151"
+
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(
+                Client(
+                    company_id=1,
+                    altegio_client_id=9002,
+                    display_name="Seren Mirror",
+                    phone_e164=phone,
+                    raw={},
+                )
+            )
+            session.add(
+                WhatsAppSender(
+                    id=901,
+                    company_id=1,
+                    sender_code="default",
+                    phone_number_id="PNID_CW_MIRROR",
+                    display_phone="+49",
+                    is_active=True,
+                )
+            )
+            # Matches real-world event_id=4972.
+            evt = WhatsAppEvent(
+                dedupe_key="chatwoot:395:3388",
+                status="received",
+                error=None,
+                query={},
+                headers={},
+                payload=_chatwoot_mirror_stop_payload("PNID_CW_MIRROR", "4915207156151"),
+                chatwoot_conversation_id=395,
+            )
+            session.add(evt)
+            await session.flush()
+            evt_id = evt.id
+
+            await handle_event(session, evt, provider)
+
+    assert len(provider.sent) == 0
+
+    async with session_maker() as session:
+        result = await session.execute(select(OutboxMessage).where(OutboxMessage.template_code == "wa_cmd_stop"))
+        assert result.scalar_one_or_none() is None
+
+    async with session_maker() as session:
+        reloaded = await session.get(WhatsAppEvent, evt_id)
+    assert reloaded is not None
+    assert reloaded.error is None
+
+
+# ---------------------------------------------------------------------------
+# Test 3: Real-world sequence — exactly one OutboxMessage total
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_meta_stop_then_chatwoot_mirror_creates_single_outbox(session_maker, monkeypatch) -> None:
+    """Meta STOP (event 4971) then Chatwoot mirror (event 4972) → exactly one wa_cmd_stop."""
+    monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
+    provider = _CaptureProvider()
+    phone = "+4915207156152"
+
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(
+                Client(
+                    company_id=1,
+                    altegio_client_id=9003,
+                    display_name="Seren Seq",
+                    phone_e164=phone,
+                    raw={},
+                )
+            )
+            session.add(
+                WhatsAppSender(
+                    id=902,
+                    company_id=1,
+                    sender_code="default",
+                    phone_number_id="PNID_SEQ",
+                    display_phone="+49",
+                    is_active=True,
+                )
+            )
+            # event_id=4971 equivalent: real Meta-origin STOP
+            meta_evt = WhatsAppEvent(
+                dedupe_key="wa:meta:stop:seq",
+                status="received",
+                error=None,
+                query={},
+                headers={},
+                payload=_meta_stop_payload("PNID_SEQ", "4915207156152"),
+                chatwoot_conversation_id=None,
+            )
+            session.add(meta_evt)
+            # event_id=4972 equivalent: Chatwoot mirror of the same STOP
+            mirror_evt = WhatsAppEvent(
+                dedupe_key="chatwoot:395:3389",
+                status="received",
+                error=None,
+                query={},
+                headers={},
+                payload=_chatwoot_mirror_stop_payload(
+                    "PNID_SEQ", "4915207156152", conversation_id=395, message_id=3389
+                ),
+                chatwoot_conversation_id=395,
+            )
+            session.add(mirror_evt)
+            await session.flush()
+
+            await handle_event(session, meta_evt, provider)
+            await handle_event(session, mirror_evt, provider)
+
+    # Only one ack sent (from the Meta event).
+    assert len(provider.sent) == 1
+
+    # Only one wa_cmd_stop OutboxMessage.
+    async with session_maker() as session:
+        result = await session.execute(select(OutboxMessage).where(OutboxMessage.template_code == "wa_cmd_stop"))
+        rows = result.scalars().all()
+    assert len(rows) == 1
+
+
+# ---------------------------------------------------------------------------
+# Test 4: Operator relay (Chatwoot-origin) is NOT blocked by the guard
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_operator_relay_not_blocked_by_chatwoot_guard(session_maker, monkeypatch) -> None:
+    """Operator relay must still be sent even though it's Chatwoot-origin.
+
+    The relay check (section 0) runs before the Chatwoot-origin guard
+    (section 2), so relay events are handled correctly and never dropped.
+    """
+    monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
+    provider = _CaptureProvider()
+    phone = "+4915207156153"
+
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(
+                WhatsAppSender(
+                    id=903,
+                    company_id=1,
+                    sender_code="default",
+                    phone_number_id="PNID_RELAY_GUARD",
+                    display_phone="+49",
+                    is_active=True,
+                )
+            )
+            # Inbound window event so the 24h customer service window is open.
+            now = datetime.now(timezone.utc)
+            session.add(
+                WhatsAppEvent(
+                    dedupe_key="wa:inbound:relay:guard",
+                    received_at=now - timedelta(hours=1),
+                    status="processed",
+                    query={},
+                    headers={},
+                    payload={
+                        "entry": [
+                            {
+                                "changes": [
+                                    {
+                                        "value": {
+                                            "messages": [
+                                                {
+                                                    "from": "4915207156153",
+                                                    "type": "text",
+                                                    "text": {"body": "Hallo"},
+                                                    "id": "wamid.win",
+                                                }
+                                            ],
+                                            "metadata": {"phone_number_id": "PNID_RELAY_GUARD"},
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    chatwoot_conversation_id=None,
+                )
+            )
+            relay_evt = WhatsAppEvent(
+                dedupe_key="chatwoot_out:6000:7000",
+                status="received",
+                error=None,
+                query={},
+                headers={},
+                payload={
+                    "_chatwoot_operator_relay": {
+                        "recipient_phone": phone,
+                        "text": "Hallo von Operator",
+                        "conversation_id": 6000,
+                        "message_id": 7000,
+                        "phone_number_id": "PNID_RELAY_GUARD",
+                        "agent_name": "Test",
+                        "agent_id": 1,
+                    }
+                },
+                chatwoot_conversation_id=6000,
+            )
+            session.add(relay_evt)
+            await session.flush()
+
+            from altegio_bot.settings import settings as _s
+
+            orig = _s.chatwoot_operator_relay_enabled
+            _s.chatwoot_operator_relay_enabled = True
+            try:
+                await handle_event(session, relay_evt, provider)
+            finally:
+                _s.chatwoot_operator_relay_enabled = orig
+
+    assert len(provider.sent) == 1
+    assert provider.sent[0]["phone_e164"] == phone
