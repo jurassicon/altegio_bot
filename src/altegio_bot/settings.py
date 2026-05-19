@@ -1,6 +1,20 @@
 from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# Hard allowlist of job types that may be routed to text inside the 24h window.
+# This must only contain appointment / service notification types — never campaign
+# or marketing job types — because the text-success path returns early before the
+# shared campaign post-send backfill logic that runs at the bottom of _run_job_logic.
+BOT_TEXT_INSIDE_24H_ALLOWED_JOB_TYPES: frozenset[str] = frozenset(
+    {
+        "record_created",
+        "record_updated",
+        "record_canceled",
+        "reminder_24h",
+        "reminder_2h",
+    }
+)
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -296,6 +310,43 @@ class Settings(BaseSettings):
     # Leave empty → worker fails the job fast (no silent blank-header send).
     meta_newsletter_monthly_header_image_url: str = ""
     meta_newsletter_followup_header_image_url: str = ""
+
+    # ---------------------------------------------------------------------------
+    # Bot templates: send text inside open 24h WhatsApp customer window
+    # ---------------------------------------------------------------------------
+    # When enabled, bot notifications of whitelisted job types are sent as
+    # free-form text if the customer wrote within the last 24 hours.
+    # Otherwise Meta templates are used as before.
+    # Default False — safe: no behaviour change until explicitly enabled.
+    bot_template_text_inside_24h_enabled: bool = False
+    # Comma-separated job types eligible for text-inside-24h routing.
+    # Must be non-empty when bot_template_text_inside_24h_enabled=True.
+    bot_template_text_inside_24h_job_types: str = (
+        "record_created,record_updated,record_canceled,reminder_24h,reminder_2h"
+    )
+    # When True: if the text send fails with a deterministic Meta policy/window
+    # error, fall back to the original Meta template automatically.
+    # When False: no automatic fallback — use normal retry behaviour.
+    bot_template_text_inside_24h_fallback_enabled: bool = True
+
+    @model_validator(mode="after")
+    def validate_bot_text_inside_24h_config(self) -> "Settings":
+        tokens = [t.strip() for t in self.bot_template_text_inside_24h_job_types.split(",") if t.strip()]
+        if self.bot_template_text_inside_24h_enabled and not tokens:
+            raise ValueError(
+                "BOT_TEMPLATE_TEXT_INSIDE_24H_JOB_TYPES must be non-empty "
+                "when BOT_TEMPLATE_TEXT_INSIDE_24H_ENABLED=true"
+            )
+        # Hard allowlist — validate always so misconfiguration is caught before rollout,
+        # regardless of whether the feature is currently enabled.
+        unsupported = set(tokens) - BOT_TEXT_INSIDE_24H_ALLOWED_JOB_TYPES
+        if unsupported:
+            raise ValueError(
+                f"BOT_TEMPLATE_TEXT_INSIDE_24H_JOB_TYPES contains unsupported job types: "
+                f"{sorted(unsupported)!r}. "
+                f"Allowed: {sorted(BOT_TEXT_INSIDE_24H_ALLOWED_JOB_TYPES)!r}"
+            )
+        return self
 
     # ---------------------------------------------------------------------------
     # Worker polling intervals

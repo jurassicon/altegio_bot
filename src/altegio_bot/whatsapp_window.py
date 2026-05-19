@@ -58,6 +58,7 @@ def _extract_meta_inbound_times(
     target_phone: str,
     fallback_received_at: datetime,
     before: datetime,
+    phone_number_id: str | None = None,
 ) -> list[datetime]:
     """Return effective inbound times from payload for target_phone.
 
@@ -66,6 +67,11 @@ def _extract_meta_inbound_times(
     - If valid and not in the future (> before), use it as the candidate time.
     - If the timestamp is missing or unparseable, fall back to fallback_received_at.
     - Future timestamps are skipped entirely — not fallen back to.
+
+    When phone_number_id is given, only messages whose enclosing
+    value.metadata.phone_number_id matches are considered.  This prevents a
+    customer inbound on one WhatsApp sender number from incorrectly opening
+    the window for a job sent from a different sender number.
 
     Returns timezone-aware UTC datetimes.
     """
@@ -79,6 +85,10 @@ def _extract_meta_inbound_times(
             value = change.get("value") or {}
             if not isinstance(value, dict):
                 continue
+            if phone_number_id is not None:
+                meta_pnid = (value.get("metadata") or {}).get("phone_number_id")
+                if meta_pnid != phone_number_id:
+                    continue
             for msg in value.get("messages") or []:
                 if not isinstance(msg, dict):
                     continue
@@ -107,6 +117,7 @@ async def get_last_meta_inbound_at(
     session: AsyncSession,
     phone_e164: str,
     before: datetime,
+    phone_number_id: str | None = None,
 ) -> datetime | None:
     """Return the most recent effective inbound time for phone_e164.
 
@@ -116,6 +127,9 @@ async def get_last_meta_inbound_at(
     Only considers events whose received_at is within the last 26 hours
     before `before` (performance guard).  Excludes all Chatwoot-origin events
     (dedupe_key prefix, payload markers, or chatwoot_conversation_id set).
+
+    When phone_number_id is given, only messages from that WhatsApp sender
+    number are counted.  Pass None to match any sender (backward-compatible).
 
     If several candidate times exist across multiple events or messages, returns
     the maximum (most recent) that is <= before.
@@ -150,6 +164,7 @@ async def get_last_meta_inbound_at(
             target_phone,
             fallback_received_at=fallback,
             before=before,
+            phone_number_id=phone_number_id,
         )
         all_candidates.extend(candidates)
 
@@ -163,6 +178,7 @@ async def is_whatsapp_customer_window_open(
     session: AsyncSession,
     phone_e164: str,
     now: datetime,
+    phone_number_id: str | None = None,
 ) -> tuple[bool, datetime | None]:
     """Return (window_open, last_meta_inbound_at).
 
@@ -170,8 +186,12 @@ async def is_whatsapp_customer_window_open(
     within the last 24 hours (inclusive boundary: exactly 24 h counts as open).
     The inbound time is based on the Meta message timestamp, not server
     received_at — see get_last_meta_inbound_at for details.
+
+    When phone_number_id is given, only inbound messages addressed to that
+    WhatsApp sender number are counted.  Pass None for phone-only matching
+    (backward-compatible behaviour).
     """
-    last_inbound = await get_last_meta_inbound_at(session, phone_e164, before=now)
+    last_inbound = await get_last_meta_inbound_at(session, phone_e164, before=now, phone_number_id=phone_number_id)
     if last_inbound is None:
         return False, None
 
