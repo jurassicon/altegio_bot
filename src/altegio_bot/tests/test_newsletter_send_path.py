@@ -501,11 +501,13 @@ async def test_crm_only_monthly_newsletter_uses_contact_name_as_param1(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_crm_only_followup_newsletter_uses_contact_name_as_param1(monkeypatch: Any) -> None:
-    """CRM-only followup newsletter: template param #1 also comes from payload.contact_name.
+async def test_crm_only_followup_newsletter_sends_with_empty_params(monkeypatch: Any) -> None:
+    """CRM-only followup newsletter: static-body template sends with params=[].
 
-    The followup template has 2 params [client_name, booking_link].
-    The same fallback logic must apply so followup does not send an empty first param.
+    The followup template (kitilash_ka_newsletter_new_clients_followup_v1) has a
+    static body with no {{N}} placeholders.  Meta returns 400 #132000 if any body
+    params are passed.  After the fix, build_template_params returns [] and the
+    worker must call safe_send_template with an empty params list.
     """
     captured_params: list[list[str]] = []
 
@@ -548,10 +550,12 @@ async def test_crm_only_followup_newsletter_uses_contact_name_as_param1(monkeypa
     await ow._run_job_logic(session, job, provider=provider)  # type: ignore[arg-type]
 
     assert job.status == "done", f"Expected job.status='done', got {job.status!r} last_error={job.last_error!r}"
-    assert len(captured_params) == 1
+    assert len(captured_params) == 1, "safe_send_template must be called exactly once"
     params = captured_params[0]
-    assert len(params) == 2, f"Followup v1 template expects 2 params, got {len(params)}: {params}"
-    assert params[0] == "Hana Novak", f"Template param #1 must be payload.contact_name='Hana Novak', got {params[0]!r}"
+    assert params == [], (
+        f"Followup static-body template must send params=[], got {params!r}. "
+        "If non-empty, Meta returns 400 #132000 (Number of parameters does not match)."
+    )
 
 
 @pytest.mark.asyncio
@@ -1015,3 +1019,152 @@ async def test_meta_cloud_send_template_omits_header_component_when_url_none() -
     components = captured_payload[0]["template"]["components"]
     assert len(components) == 1, f"Expected 1 component (BODY only), got {len(components)}"
     assert components[0]["type"] == "body"
+
+
+# ---------------------------------------------------------------------------
+# 11. MetaCloudProvider: static-body template (params=[]) → HEADER only, no BODY
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_meta_cloud_send_template_header_only_when_params_empty() -> None:
+    """params=[] + header_image_url → payload.components contains HEADER only, no BODY."""
+    from altegio_bot.providers.meta_cloud import MetaCloudProvider
+
+    captured_payload: list[dict] = []
+
+    provider = MetaCloudProvider.__new__(MetaCloudProvider)
+    provider._access_token = "test-token"
+    provider._api_version = "v20.0"
+    provider._graph_url = "https://graph.facebook.com"
+    provider._allow_real_send = True
+    provider._sender_cache = {1: "12345678901"}
+
+    class FakeResp:
+        status_code = 200
+
+        def json(self) -> dict:
+            return {"messages": [{"id": "wamid.testHEADER_ONLY"}]}
+
+    class FakeClient:
+        async def post(self, url: str, headers: dict, json: dict) -> FakeResp:
+            captured_payload.append(json)
+            return FakeResp()
+
+    provider._client = FakeClient()  # type: ignore[assignment]
+
+    await provider.send_template(
+        sender_id=1,
+        phone_e164="+491234567890",
+        template_name=NEWSLETTER_FOLLOWUP_TEMPLATE,
+        language="de",
+        params=[],
+        header_image_url="https://api.kitilash.com/static/newsletters/newsletter_new_clients_followup_v1.jpg",
+    )
+
+    assert len(captured_payload) == 1
+    tmpl = captured_payload[0]["template"]
+    components = tmpl.get("components", [])
+    assert len(components) == 1, f"Expected 1 component (HEADER only), got {len(components)}: {components}"
+    assert components[0]["type"] == "header", f"Expected HEADER, got {components[0]['type']!r}"
+    body_components = [c for c in components if c["type"] == "body"]
+    assert body_components == [], "BODY component must not be present when params=[]"
+
+
+@pytest.mark.asyncio
+async def test_meta_cloud_send_template_header_and_body_when_params_present() -> None:
+    """params=['A'] + header_image_url → payload.components contains HEADER and BODY."""
+    from altegio_bot.providers.meta_cloud import MetaCloudProvider
+
+    captured_payload: list[dict] = []
+
+    provider = MetaCloudProvider.__new__(MetaCloudProvider)
+    provider._access_token = "test-token"
+    provider._api_version = "v20.0"
+    provider._graph_url = "https://graph.facebook.com"
+    provider._allow_real_send = True
+    provider._sender_cache = {1: "12345678901"}
+
+    class FakeResp:
+        status_code = 200
+
+        def json(self) -> dict:
+            return {"messages": [{"id": "wamid.testHEADER_BODY"}]}
+
+    class FakeClient:
+        async def post(self, url: str, headers: dict, json: dict) -> FakeResp:
+            captured_payload.append(json)
+            return FakeResp()
+
+    provider._client = FakeClient()  # type: ignore[assignment]
+
+    await provider.send_template(
+        sender_id=1,
+        phone_e164="+491234567890",
+        template_name=NEWSLETTER_MONTHLY_TEMPLATE,
+        language="de",
+        params=["Anna"],
+        header_image_url="https://example.com/header.jpg",
+    )
+
+    assert len(captured_payload) == 1
+    components = captured_payload[0]["template"]["components"]
+    assert len(components) == 2, f"Expected 2 components (HEADER + BODY), got {len(components)}"
+    assert components[0]["type"] == "header"
+    assert components[1]["type"] == "body"
+    assert components[1]["parameters"][0]["text"] == "Anna"
+
+
+# ---------------------------------------------------------------------------
+# 12. Outbox meta for newsletter_new_clients_followup after fix
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_outbox_followup_meta_has_empty_params_and_header_url(monkeypatch: Any) -> None:
+    """newsletter_new_clients_followup: OutboxMessage.meta stores params=[] and header_image_url."""
+    followup_header = "https://api.kitilash.com/static/newsletters/newsletter_new_clients_followup_v1.jpg"
+
+    job = _FakeJob(
+        id=3657,
+        company_id=KA,
+        job_type=FOLLOWUP_JOB_TYPE,
+        payload={
+            "kind": FOLLOWUP_JOB_TYPE,
+            "contact_name": "Chiara",
+            "phone_e164": "+49111222333",
+            "campaign_recipient_id": 2410,
+            "campaign_run_id": 21,
+        },
+    )
+    session = _FakeSession()
+
+    _base_patches(monkeypatch)
+    monkeypatch.setattr(ow, "_render_message", _fake_render)
+    monkeypatch.setattr(ow.settings, "meta_newsletter_followup_header_image_url", followup_header)
+
+    async def _fake_send_template(
+        provider: Any, sender_id: int, phone: str, template_name: str, language: str, params: list, **kw: Any
+    ) -> tuple:
+        return "wamid.job3657", None
+
+    monkeypatch.setattr(ow, "safe_send_template", _fake_send_template)
+
+    provider = MagicMock()
+    await ow._run_job_logic(session, job, provider=provider)  # type: ignore[arg-type]
+
+    assert job.status == "done", f"Expected done, got {job.status!r} error={job.last_error!r}"
+    assert len(session.added) >= 1, "OutboxMessage must be created"
+
+    outbox = session.added[-1]
+    meta = outbox.meta
+    assert meta["template"] == NEWSLETTER_FOLLOWUP_TEMPLATE, (
+        f"meta['template'] must be {NEWSLETTER_FOLLOWUP_TEMPLATE!r}, got {meta.get('template')!r}"
+    )
+    assert meta["params"] == [], (
+        f"meta['params'] must be [] after fix, got {meta.get('params')!r}. "
+        "Non-empty params caused the original job 3657 failure (Meta 400 #132000)."
+    )
+    assert meta.get("header_image_url") == followup_header, (
+        f"meta['header_image_url'] must be {followup_header!r}, got {meta.get('header_image_url')!r}"
+    )

@@ -53,6 +53,7 @@ from altegio_bot.meta_templates import (
 )
 from altegio_bot.models.models import OutboxMessage, SmartTestRun
 from altegio_bot.settings import settings
+from altegio_bot.template_validation import validate_template_params
 from altegio_bot.utils import utcnow
 
 logger = logging.getLogger("smart_test")
@@ -245,22 +246,25 @@ async def _send_template_direct(
                 "parameters": [{"type": "image", "image": {"link": header_image_url}}],
             }
         )
-    components.append(
-        {
-            "type": "body",
-            "parameters": [{"type": "text", "text": p} for p in params],
-        }
-    )
+    if params:
+        components.append(
+            {
+                "type": "body",
+                "parameters": [{"type": "text", "text": p} for p in params],
+            }
+        )
 
+    template_payload: dict[str, Any] = {
+        "name": template_name,
+        "language": {"code": language},
+    }
+    if components:
+        template_payload["components"] = components
     payload: dict[str, Any] = {
         "messaging_product": "whatsapp",
         "to": to_number,
         "type": "template",
-        "template": {
-            "name": template_name,
-            "language": {"code": language},
-            "components": components,
-        },
+        "template": template_payload,
     }
     headers = {"Authorization": f"Bearer {access_token}"}
     async with httpx.AsyncClient(timeout=30.0) as client:
@@ -484,7 +488,7 @@ async def run_smart_test(
         booking_link=booking_link,
         loyalty_card_text="Kundenkarte #0000000000000000",
     )
-    if not probe_params:
+    if validate_template_params(template_name, probe_params) is not None:
         logger.error(
             "FAIL: unsupported or unknown template parameters for template=%r. "
             "Add a build_template_params branch in meta_templates.py for this template.",
@@ -611,7 +615,7 @@ async def run_smart_test(
         booking_link=booking_link,
         loyalty_card_text=loyalty_card_text,
     )
-    if not template_params:
+    if validate_template_params(template_name, template_params) is not None:
         logger.error(
             "FAIL: unsupported or unknown template parameters for template=%r. "
             "Add a build_template_params branch in meta_templates.py for this template.",

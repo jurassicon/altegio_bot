@@ -798,6 +798,25 @@ def _is_token_expired_error(err: str) -> bool:
     return "access token" in low and "expired" in low
 
 
+def _is_permanent_meta_template_error(err: str) -> bool:
+    """Return True for permanent Meta template validation errors (HTTP 400).
+
+    These errors indicate a mis-configured template call; retrying will never succeed.
+    """
+    low = err.lower()
+    return any(
+        marker in low
+        for marker in (
+            "status=400",
+            "#132000",
+            "number of parameters does not match",
+            "does not match the expected number of params",
+            "required parameter is missing",
+            "template does not exist",
+        )
+    )
+
+
 def _is_text_window_policy_error(err: str) -> bool:
     """Return True for deterministic Meta policy/window errors.
 
@@ -2112,6 +2131,11 @@ async def _run_job_logic(
             return
 
         job.last_error = f"Send failed: {err}"
+
+        if use_template and _is_permanent_meta_template_error(err):
+            job.status = "failed"
+            job.locked_at = None
+            return
 
         max_attempts = getattr(job, "max_attempts", 5)
         if attempts >= max_attempts:

@@ -105,8 +105,8 @@ _TEMPLATE_RULES: dict[str, _TemplateRule] = {
         ["client_name", "booking_link", "loyalty_card_text"],
     ),
     "kitilash_ka_newsletter_new_clients_followup_v1": (
-        2,
-        ["client_name", "booking_link"],
+        0,
+        [],
     ),
 }
 
@@ -118,21 +118,26 @@ def validate_template_params(
     """Return an error string if *params* fail validation, else ``None``.
 
     Checks performed:
-    1. Param list is non-empty (catches unknown template → build returned []).
-    2. Param count matches the registered expected count (if template is
-       in ``_TEMPLATE_RULES``).
-    3. Every param value is a non-empty string (catches missing/None values).
+    1. If the template is registered with expected_count=0 (static body, no
+       variables): params must be empty — any non-empty list is an error.
+    2. For templates with expected_count>0: param list must be non-empty
+       (catches unknown template → build returned []).
+    3. Param count matches the registered expected count.
+    4. Every param value is a non-empty string (catches missing/None values).
 
     Error messages use the format:
       ``Local template validation failed: <reason>``
     so callers can distinguish local failures from Meta API errors.
     """
-    if not params:
-        return f"{_PREFIX}: no params built for template {template_name!r} — template may be unrecognised"
-
     rule = _TEMPLATE_RULES.get(template_name)
     if rule is not None:
         expected_count, param_names = rule
+        if expected_count == 0:
+            if params:
+                return f"{_PREFIX}: expected {expected_count} params, got {len(params)}"
+            return None
+        if not params:
+            return f"{_PREFIX}: no params built for template {template_name!r} — template may be unrecognised"
         if len(params) != expected_count:
             return f"{_PREFIX}: expected {expected_count} params, got {len(params)}"
         for i, val in enumerate(params):
@@ -141,6 +146,8 @@ def validate_template_params(
                 return f"{_PREFIX}: missing required param #{i + 1} {label}"
     else:
         # Generic fallback for templates not explicitly registered.
+        if not params:
+            return f"{_PREFIX}: no params built for template {template_name!r} — template may be unrecognised"
         for i, val in enumerate(params):
             if not val:
                 return f"{_PREFIX}: missing required param #{i + 1}"

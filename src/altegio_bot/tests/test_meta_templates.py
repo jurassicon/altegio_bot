@@ -264,6 +264,18 @@ def test_params_newsletter_v1_no_card() -> None:
     assert params == ["Anna", "https://booking.link/", ""]
 
 
+def test_params_newsletter_followup_returns_empty() -> None:
+    """NEWSLETTER_FOLLOWUP_TEMPLATE has static body (no variables) — must return []."""
+    params = build_template_params("kitilash_ka_newsletter_new_clients_followup_v1", _CTX)
+    assert params == []
+
+
+def test_params_newsletter_followup_empty_ctx_returns_empty() -> None:
+    """build_template_params returns [] for followup regardless of ctx content."""
+    params = build_template_params("kitilash_ka_newsletter_new_clients_followup_v1", {})
+    assert params == []
+
+
 def test_params_unknown_template_returns_empty() -> None:
     params = build_template_params("unknown_template_xyz", _CTX)
     assert params == []

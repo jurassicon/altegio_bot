@@ -72,14 +72,14 @@ def test_validate_monthly_wrong_param_count_returns_error() -> None:
 
 
 def test_validate_followup_wrong_param_count_returns_error() -> None:
-    """Followup template with 3 params instead of 2 → error."""
+    """Followup template expects 0 params (static body); any params → error."""
     err = validate_template_params(
         FOLLOWUP,
         ["Anna", "https://n813709.alteg.io/", "extra"],
     )
     assert err is not None
     assert "Local template validation failed" in err
-    assert "2" in err
+    assert "0" in err
     assert "3" in err
 
 
@@ -93,12 +93,23 @@ def test_validate_monthly_valid_params_returns_none() -> None:
 
 
 def test_validate_followup_valid_params_returns_none() -> None:
-    """Followup template with correct 2 non-empty params → None (pass)."""
-    err = validate_template_params(
-        FOLLOWUP,
-        ["Hans", "https://n813709.alteg.io/"],
-    )
+    """Followup template has static body (0 params expected) → [] passes."""
+    err = validate_template_params(FOLLOWUP, [])
     assert err is None
+
+
+def test_validate_followup_one_param_returns_error() -> None:
+    """Followup expects 0 params; 1 param → error."""
+    err = validate_template_params(FOLLOWUP, ["Chiara"])
+    assert err is not None
+    assert "Local template validation failed" in err
+
+
+def test_validate_followup_two_params_returns_error() -> None:
+    """Followup expects 0 params; 2 params (the old broken send) → error."""
+    err = validate_template_params(FOLLOWUP, ["Chiara", "https://n813709.alteg.io/"])
+    assert err is not None
+    assert "Local template validation failed" in err
 
 
 def test_validate_empty_param_list_returns_error() -> None:

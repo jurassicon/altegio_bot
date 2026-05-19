@@ -391,13 +391,13 @@ def test_build_smart_template_params_monthly_has_three_params() -> None:
     assert params[2] == "Kundenkarte #001"
 
 
-def test_build_smart_template_params_followup_has_two_params() -> None:
-    """Followup template requires only 2 params: client_name, booking_link (no card text)."""
+def test_build_smart_template_params_followup_returns_empty() -> None:
+    """Followup template has static body (no variables) — must return []."""
     params = _build_smart_template_params(NEWSLETTER_FOLLOWUP_TEMPLATE, **_PARAMS_KW)
-    assert len(params) == 2, f"Expected 2 params for followup, got {len(params)}: {params}"
-    assert params[0] == "Anna"
-    assert params[1] == "https://booking.link/"
-    assert "Kundenkarte #001" not in params, "loyalty_card_text must NOT appear in followup params"
+    assert params == [], (
+        f"Expected [] for followup (static body, no params), got {params!r}. "
+        "Sending non-empty params causes Meta 400 #132000."
+    )
 
 
 def test_build_smart_template_params_unknown_template_returns_empty() -> None:
@@ -412,8 +412,8 @@ def test_build_smart_template_params_unknown_template_returns_empty() -> None:
 
 
 @pytest.mark.asyncio
-async def test_send_template_direct_followup_with_header_uses_two_body_params() -> None:
-    """Followup template with header: payload must have HEADER + BODY with 2 params."""
+async def test_send_template_direct_followup_with_header_uses_no_body_params() -> None:
+    """Followup template (static body): payload must have HEADER only, no BODY component."""
     header_url = "https://cdn.example.com/followup_header.jpg"
     captured: list[dict] = []
 
@@ -431,7 +431,7 @@ async def test_send_template_direct_followup_with_header_uses_two_body_params() 
             phone_e164="+491234567890",
             template_name=NEWSLETTER_FOLLOWUP_TEMPLATE,
             language="de",
-            params=["Anna", "https://booking.link/"],
+            params=[],
             access_token=_ACCESS_TOKEN,
             graph_url=_GRAPH_URL,
             api_version=_API_VERSION,
@@ -441,11 +441,10 @@ async def test_send_template_direct_followup_with_header_uses_two_body_params() 
 
     assert len(captured) == 1
     components = captured[0]["template"]["components"]
-    assert len(components) == 2, f"Expected HEADER + BODY, got {len(components)}"
+    assert len(components) == 1, (
+        f"Expected HEADER only (no BODY for static template), got {len(components)}: {components}"
+    )
     assert components[0]["type"] == "header"
     assert components[0]["parameters"][0]["image"]["link"] == header_url
-    assert components[1]["type"] == "body"
-    body_params = components[1]["parameters"]
-    assert len(body_params) == 2, f"Followup BODY must have 2 params, got {len(body_params)}: {body_params}"
-    assert body_params[0]["text"] == "Anna"
-    assert body_params[1]["text"] == "https://booking.link/"
+    body_components = [c for c in components if c.get("type") == "body"]
+    assert body_components == [], "BODY must not appear when params=[]"

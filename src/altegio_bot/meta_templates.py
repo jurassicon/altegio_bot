@@ -240,10 +240,7 @@ def build_template_params(
         ]
 
     if n == NEWSLETTER_FOLLOWUP_TEMPLATE:
-        return [
-            ctx.get("client_name", ""),
-            ctx.get("booking_link", ""),
-        ]
+        return []
 
     logger.warning("build_template_params: unknown template_name=%s", template_name)
     return []
