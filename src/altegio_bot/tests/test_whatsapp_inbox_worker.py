@@ -23,9 +23,9 @@ from typing import Any
 import pytest
 from sqlalchemy import select
 
-from altegio_bot.models.models import Client, OutboxMessage, WhatsAppEvent, WhatsAppSender
+from altegio_bot.models.models import CampaignRecipient, CampaignRun, Client, OutboxMessage, WhatsAppEvent, WhatsAppSender
 from altegio_bot.providers.base import WhatsAppProvider
-from altegio_bot.workers.whatsapp_inbox_worker import handle_event
+from altegio_bot.workers.whatsapp_inbox_worker import _apply_status_updates, handle_event
 
 
 class _CaptureProvider(WhatsAppProvider):
@@ -391,3 +391,95 @@ async def test_operator_relay_not_blocked_by_chatwoot_guard(session_maker, monke
 
     assert len(provider.sent) == 1
     assert provider.sent[0]["phone_e164"] == phone
+
+
+# ---------------------------------------------------------------------------
+# Test 5: _apply_status_updates resolves campaign_run_id via followup_outbox_id
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_apply_status_updates_resolves_run_id_via_followup_outbox_id(
+    session_maker,
+) -> None:
+    """Delivery status for a follow-up OutboxMessage must resolve campaign_run_id.
+
+    CampaignRecipient links the follow-up message via followup_outbox_id
+    (not outbox_message_id), so _apply_status_updates must query both columns.
+    """
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+
+    async with session_maker() as session:
+        async with session.begin():
+            run = CampaignRun(
+                campaign_code="new_clients_monthly",
+                mode="send-real",
+                status="completed",
+                company_ids=[758285],
+                location_id=1,
+                period_start=datetime(2026, 1, 1, tzinfo=timezone.utc),
+                period_end=datetime(2026, 2, 1, tzinfo=timezone.utc),
+                followup_enabled=True,
+                followup_delay_days=14,
+                followup_policy="unread_only",
+                followup_template_name="newsletter_new_clients_followup",
+                completed_at=now,
+                meta={},
+            )
+            session.add(run)
+            await session.flush()
+
+            fu_outbox = OutboxMessage(
+                company_id=758285,
+                record_id=None,
+                client_id=None,
+                job_id=None,
+                sender_id=None,
+                phone_e164="+49111222333",
+                template_code="newsletter_new_clients_followup",
+                language="de",
+                body="Follow-up text",
+                status="sent",
+                error=None,
+                provider_message_id="wamid.FOLLOWUP-TEST-001",
+                scheduled_at=now,
+                sent_at=now,
+                meta={},
+            )
+            session.add(fu_outbox)
+            await session.flush()
+
+            recipient = CampaignRecipient(
+                campaign_run_id=run.id,
+                company_id=758285,
+                altegio_client_id=9001,
+                phone_e164="+49111222333",
+                followup_status="queued",
+                followup_outbox_id=fu_outbox.id,
+                followup_sent_at=now,
+                status="sent",
+            )
+            session.add(recipient)
+            await session.flush()
+
+            run_id = run.id
+
+    async with session_maker() as session:
+        async with session.begin():
+            resolved = await _apply_status_updates(
+                session,
+                [
+                    {
+                        "wamid": "wamid.FOLLOWUP-TEST-001",
+                        "status": "delivered",
+                        "timestamp": "1234567890",
+                        "raw": {},
+                    }
+                ],
+            )
+
+    assert run_id in resolved, (
+        f"campaign_run_id={run_id} must be resolved via followup_outbox_id; got {resolved}"
+    )

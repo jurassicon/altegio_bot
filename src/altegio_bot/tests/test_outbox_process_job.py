@@ -849,7 +849,7 @@ def test_monthly_campaign_job_backfills_primary_fields_on_success(monkeypatch: A
 
 
 def test_followup_job_sends_normally_without_campaign_recipient_id(monkeypatch: Any) -> None:
-    """Follow-up job with no campaign_recipient_id: send completes, no crash, no backfill."""
+    """Follow-up job with no campaign_recipient_id: job canceled (fail-closed), no send."""
     fixed_now = datetime(2026, 5, 19, 10, 0, tzinfo=timezone.utc)
     monkeypatch.setattr(ow, "utcnow", lambda: fixed_now)
 
@@ -869,13 +869,14 @@ def test_followup_job_sends_normally_without_campaign_recipient_id(monkeypatch: 
 
     run(ow.process_job_in_session(session, 3700, provider=object()))  # type: ignore
 
-    # Job must complete the send despite missing recipient id.
-    assert job.status == "done", f"Expected done, got {job.status!r} last_error={job.last_error!r}"
-    assert len(session.added) == 1  # OutboxMessage added
+    assert job.status == "canceled", f"Expected canceled, got {job.status!r}"
+    assert job.last_error is not None
+    assert "campaign_recipient_id" in job.last_error
+    assert session.added == []  # no OutboxMessage
 
 
 def test_followup_job_sends_normally_when_recipient_not_found(monkeypatch: Any) -> None:
-    """Follow-up job where recipient_id is in payload but not in DB: send completes, warning only."""
+    """Follow-up job where recipient_id is in payload but not in DB: job canceled (fail-closed)."""
     fixed_now = datetime(2026, 5, 19, 10, 0, tzinfo=timezone.utc)
     monkeypatch.setattr(ow, "utcnow", lambda: fixed_now)
 
@@ -900,6 +901,105 @@ def test_followup_job_sends_normally_when_recipient_not_found(monkeypatch: Any) 
 
     run(ow.process_job_in_session(session, 3800, provider=object()))  # type: ignore
 
-    # Job must complete the send despite recipient not found.
-    assert job.status == "done", f"Expected done, got {job.status!r} last_error={job.last_error!r}"
-    assert len(session.added) == 1  # OutboxMessage added
+    assert job.status == "canceled", f"Expected canceled, got {job.status!r}"
+    assert job.last_error is not None
+    assert "campaign_recipient_id" in job.last_error
+    assert session.added == []  # no OutboxMessage
+
+
+# ---------------------------------------------------------------------------
+# _backfill_campaign_recipient_after_send helper unit tests
+# ---------------------------------------------------------------------------
+
+
+def test_backfill_helper_sets_followup_fields(monkeypatch: Any) -> None:
+    """Helper sets followup_* fields and never touches primary fields."""
+    fixed_now = datetime(2026, 5, 19, 10, 0, tzinfo=timezone.utc)
+    recipient = FakeCampaignRecipient(id=100)
+    session = _FollowupFakeSession(get_map={("CampaignRecipient", 100): recipient})
+
+    run(
+        ow._backfill_campaign_recipient_after_send(
+            session=session,
+            job_type=FOLLOWUP_JOB_TYPE,
+            job_id=9999,
+            payload={"campaign_recipient_id": 100},
+            outbox_id=42,
+            now_sent=fixed_now,
+            provider_message_id="fu-msg-id",
+        )
+    )
+
+    assert recipient.followup_outbox_id == 42
+    assert recipient.followup_sent_at == fixed_now
+    assert recipient.followup_status == "sent"
+    # Primary fields must not be touched.
+    assert recipient.outbox_message_id == 555
+    assert recipient.provider_message_id == "existing-msg-id"
+    assert recipient.sent_at == datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+
+def test_backfill_helper_does_not_downgrade_delivered_status(monkeypatch: Any) -> None:
+    """Helper must not downgrade followup_status from 'delivered' to 'sent'."""
+    fixed_now = datetime(2026, 5, 19, 10, 0, tzinfo=timezone.utc)
+    recipient = FakeCampaignRecipient(id=200)
+    recipient.followup_status = "delivered"
+    session = _FollowupFakeSession(get_map={("CampaignRecipient", 200): recipient})
+
+    run(
+        ow._backfill_campaign_recipient_after_send(
+            session=session,
+            job_type=FOLLOWUP_JOB_TYPE,
+            job_id=9999,
+            payload={"campaign_recipient_id": 200},
+            outbox_id=43,
+            now_sent=fixed_now,
+        )
+    )
+
+    assert recipient.followup_status == "delivered"  # not downgraded
+
+
+def test_backfill_helper_sets_primary_fields_for_monthly_job(monkeypatch: Any) -> None:
+    """Helper sets primary fields for non-followup job type."""
+    fixed_now = datetime(2026, 5, 19, 10, 0, tzinfo=timezone.utc)
+    recipient = FakeCampaignRecipientEmpty(id=300)
+    session = _FollowupFakeSession(get_map={("CampaignRecipient", 300): recipient})
+
+    run(
+        ow._backfill_campaign_recipient_after_send(
+            session=session,
+            job_type=MONTHLY_JOB_TYPE,
+            job_id=9999,
+            payload={"campaign_recipient_id": 300},
+            outbox_id=44,
+            now_sent=fixed_now,
+            provider_message_id="monthly-msg-id",
+        )
+    )
+
+    assert recipient.outbox_message_id == 44
+    assert recipient.provider_message_id == "monthly-msg-id"
+    assert recipient.sent_at == fixed_now
+    # Follow-up fields must not be touched.
+    assert recipient.followup_outbox_id is None
+    assert recipient.followup_sent_at is None
+
+
+def test_backfill_helper_noop_when_no_campaign_recipient_id() -> None:
+    """Helper returns early and does nothing when campaign_recipient_id is absent."""
+    fixed_now = datetime(2026, 5, 19, 10, 0, tzinfo=timezone.utc)
+    session = _FollowupFakeSession()
+
+    run(
+        ow._backfill_campaign_recipient_after_send(
+            session=session,
+            job_type=MONTHLY_JOB_TYPE,
+            job_id=9999,
+            payload={},
+            outbox_id=45,
+            now_sent=fixed_now,
+        )
+    )
+
+    assert session.added == []

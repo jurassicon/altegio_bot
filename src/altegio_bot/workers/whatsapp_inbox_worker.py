@@ -7,7 +7,7 @@ import re
 from datetime import datetime, timezone
 from typing import Any, Sequence
 
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.campaigns.runner import recompute_campaign_run_stats
@@ -589,10 +589,15 @@ async def _apply_status_updates(
     if not updated_outbox_ids:
         return []
 
-    # Resolve campaign_run_ids linked to the updated outbox messages.
+    # Resolve campaign_run_ids linked to the updated outbox messages (primary or follow-up).
     cr_stmt = (
         select(CampaignRecipient.campaign_run_id)
-        .where(CampaignRecipient.outbox_message_id.in_(updated_outbox_ids))
+        .where(
+            or_(
+                CampaignRecipient.outbox_message_id.in_(updated_outbox_ids),
+                CampaignRecipient.followup_outbox_id.in_(updated_outbox_ids),
+            )
+        )
         .distinct()
     )
     cr_res = await session.execute(cr_stmt)
