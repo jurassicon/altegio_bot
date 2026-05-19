@@ -23,7 +23,14 @@ from typing import Any
 import pytest
 from sqlalchemy import select
 
-from altegio_bot.models.models import CampaignRecipient, CampaignRun, Client, OutboxMessage, WhatsAppEvent, WhatsAppSender
+from altegio_bot.models.models import (
+    CampaignRecipient,
+    CampaignRun,
+    Client,
+    OutboxMessage,
+    WhatsAppEvent,
+    WhatsAppSender,
+)
 from altegio_bot.providers.base import WhatsAppProvider
 from altegio_bot.workers.whatsapp_inbox_worker import _apply_status_updates, handle_event
 
