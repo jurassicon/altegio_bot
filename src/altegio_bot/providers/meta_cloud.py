@@ -151,23 +151,26 @@ class MetaCloudProvider(WhatsAppProvider):
                     "parameters": [{"type": "image", "image": {"link": header_image_url}}],
                 }
             )
-        components.append(
-            {
-                "type": "body",
-                "parameters": [{"type": "text", "text": p} for p in params],
-            }
-        )
+        if params:
+            components.append(
+                {
+                    "type": "body",
+                    "parameters": [{"type": "text", "text": p} for p in params],
+                }
+            )
 
         url = f"{self._graph_url}/{self._api_version}/{phone_number_id}/messages"
+        template_payload: dict[str, Any] = {
+            "name": template_name,
+            "language": {"code": language},
+        }
+        if components:
+            template_payload["components"] = components
         payload: dict[str, Any] = {
             "messaging_product": "whatsapp",
             "to": to_number,
             "type": "template",
-            "template": {
-                "name": template_name,
-                "language": {"code": language},
-                "components": components,
-            },
+            "template": template_payload,
         }
 
         res = await self._client.post(url, headers=self._headers(), json=payload)
