@@ -807,12 +807,13 @@ def _is_permanent_meta_template_error(err: str) -> bool:
     return any(
         marker in low
         for marker in (
-            "status=400",
             "#132000",
             "number of parameters does not match",
             "does not match the expected number of params",
             "required parameter is missing",
             "template does not exist",
+            "template name does not exist",
+            "does not exist in the translation",
         )
     )
 

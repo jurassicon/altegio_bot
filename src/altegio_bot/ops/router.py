@@ -2983,7 +2983,7 @@ _NC_COMPANY_TEMPLATES: dict[int, str] = {
 # Follow-up шаблон по умолчанию (универсальный для обоих филиалов)
 _NC_FOLLOWUP_JOB_TYPE = "newsletter_new_clients_followup"
 _NC_FOLLOWUP_DEFAULT_TEMPLATE = "kitilash_ka_newsletter_new_clients_followup_v1"
-_NC_FOLLOWUP_PARAMS = ["{{1}} — имя клиента", "{{2}} — ссылка для записи"]
+_NC_FOLLOWUP_PARAMS: list[str] = []  # static body — no template variables
 
 # Маппинг company_id → follow-up template name (сейчас универсальный)
 _NC_COMPANY_FOLLOWUP_TEMPLATES: dict[int, str] = {
@@ -3022,7 +3022,11 @@ async def ops_new_clients_campaign_page(request: Request) -> str:
 
     # Параметры шаблона
     template_params_html = "".join(f"<li><code>{_esc(p)}</code></li>" for p in _NC_TEMPLATE_PARAMS)
-    followup_params_html = "".join(f"<li><code>{_esc(p)}</code></li>" for p in _NC_FOLLOWUP_PARAMS)
+    followup_params_html = (
+        "".join(f"<li><code>{_esc(p)}</code></li>" for p in _NC_FOLLOWUP_PARAMS)
+        if _NC_FOLLOWUP_PARAMS
+        else '<li><em class="text-muted">статическое тело — переменных нет</em></li>'
+    )
 
     body = f"""
 <div class="d-flex justify-content-between align-items-center mb-3">

@@ -1701,3 +1701,21 @@ async def test_funnel_header_truncation_shown(
     assert response.status_code == 200
     text = response.text
     assert "showing first 200 of 201" in text
+
+
+# ---------------------------------------------------------------------------
+# Follow-up template params display — static body (no variables)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_ops_new_clients_page_followup_static_body_label(http_client: AsyncClient) -> None:
+    """Follow-up шаблон имеет статическое тело — UI должен показывать лейбл вместо переменных."""
+    response = await http_client.get("/ops/campaigns/new-clients")
+    assert response.status_code == 200
+    text = response.text
+    # The follow-up block is rendered
+    assert "newsletter_new_clients_followup" in text
+    # The static-body fallback label is present (rendered because _NC_FOLLOWUP_PARAMS is empty)
+    assert "статическое тело" in text
+    assert "переменных нет" in text

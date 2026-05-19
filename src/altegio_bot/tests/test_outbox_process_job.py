@@ -585,3 +585,51 @@ def test_process_job_sends_text_when_mode_is_text(
     assert out.status == "sent"
     assert out.provider_message_id == "msg-text"
     assert out.meta == {"send_type": "text"}
+
+
+# ---------------------------------------------------------------------------
+# _is_permanent_meta_template_error
+# ---------------------------------------------------------------------------
+
+
+def test_permanent_error_132000_code() -> None:
+    assert ow._is_permanent_meta_template_error(
+        "Meta send_template failed status=400 body=(#132000) Number of parameters does not match"
+    )
+
+
+def test_permanent_error_number_of_parameters_phrase() -> None:
+    assert ow._is_permanent_meta_template_error("number of parameters does not match the required count")
+
+
+def test_permanent_error_does_not_match_expected() -> None:
+    assert ow._is_permanent_meta_template_error("does not match the expected number of params for this template")
+
+
+def test_permanent_error_required_parameter_missing() -> None:
+    assert ow._is_permanent_meta_template_error("required parameter is missing in the request")
+
+
+def test_permanent_error_template_does_not_exist() -> None:
+    assert ow._is_permanent_meta_template_error("template does not exist in the system")
+
+
+def test_permanent_error_template_name_does_not_exist() -> None:
+    assert ow._is_permanent_meta_template_error("template name does not exist")
+
+
+def test_permanent_error_does_not_exist_in_translation() -> None:
+    assert ow._is_permanent_meta_template_error("does not exist in the translation for this language")
+
+
+def test_permanent_error_status_400_alone_is_not_permanent() -> None:
+    """Generic HTTP 400 (without specific Meta error) must NOT be treated as permanent."""
+    assert not ow._is_permanent_meta_template_error("status=400 unknown error")
+
+
+def test_permanent_error_500_is_not_permanent() -> None:
+    assert not ow._is_permanent_meta_template_error("status=500 internal server error")
+
+
+def test_permanent_error_empty_string_is_not_permanent() -> None:
+    assert not ow._is_permanent_meta_template_error("")
