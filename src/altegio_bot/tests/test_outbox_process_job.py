@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from typing import Any
 
 from altegio_bot.workers import outbox_worker as ow
@@ -24,6 +25,7 @@ class FakeJob:
     last_error: str | None = None
     attempts: int = 0
     max_attempts: int = 5
+    payload: dict | None = None
 
 
 @dataclass
@@ -633,3 +635,271 @@ def test_permanent_error_500_is_not_permanent() -> None:
 
 def test_permanent_error_empty_string_is_not_permanent() -> None:
     assert not ow._is_permanent_meta_template_error("")
+
+
+# ---------------------------------------------------------------------------
+# Campaign follow-up recipient backfill tests
+# ---------------------------------------------------------------------------
+
+KA_COMPANY = 758285
+FOLLOWUP_JOB_TYPE = "newsletter_new_clients_followup"
+MONTHLY_JOB_TYPE = "newsletter_new_clients_monthly"
+
+
+@dataclass
+class FakeCampaignRecipient:
+    id: int = 0
+    altegio_client_id: int | None = 9001
+    followup_outbox_id: int | None = None
+    followup_sent_at: datetime | None = None
+    followup_status: str | None = "queued"
+    # Primary campaign fields pre-populated to verify they are NOT overwritten.
+    outbox_message_id: int | None = 555
+    provider_message_id: str | None = "existing-msg-id"
+    sent_at: datetime | None = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    booked_after_at: datetime | None = None
+
+
+@dataclass
+class FakeCampaignRecipientEmpty:
+    """Recipient for monthly test — primary fields not yet set."""
+
+    id: int = 0
+    altegio_client_id: int | None = None
+    followup_outbox_id: int | None = None
+    followup_sent_at: datetime | None = None
+    followup_status: str | None = None
+    outbox_message_id: int | None = None
+    provider_message_id: str | None = None
+    sent_at: datetime | None = None
+    booked_after_at: datetime | None = None
+
+
+class _FollowupFakeSession:
+    """FakeSession with async get/flush/execute for follow-up backfill tests."""
+
+    def __init__(self, *, get_map: dict | None = None) -> None:
+        self.added: list[Any] = []
+        self._pk = 0
+        self._get_map: dict = get_map or {}
+
+    def add(self, obj: Any) -> None:
+        if not hasattr(obj, "id") or getattr(obj, "id", None) is None:
+            self._pk += 1
+            obj.id = self._pk
+        self.added.append(obj)
+
+    async def flush(self) -> None:
+        pass
+
+    async def get(self, cls: Any, pk: Any) -> Any:
+        return self._get_map.get((cls.__name__, pk))
+
+    async def execute(self, _stmt: Any) -> Any:
+        return SimpleNamespace(
+            scalar_one_or_none=lambda: None,
+            scalars=lambda: SimpleNamespace(first=lambda: None, all=lambda: []),
+        )
+
+
+def _patch_followup_common(
+    monkeypatch: Any,
+    *,
+    job: Any,
+    followup_eligible: bool = True,
+    has_future_record: bool = False,
+) -> None:
+    """Patch all outbox_worker dependencies common to follow-up job tests."""
+
+    async def _fake_load_job(_session: Any, _job_id: int) -> Any:
+        return job
+
+    monkeypatch.setattr(ow, "_load_job", _fake_load_job)
+    monkeypatch.setattr(ow, "_find_success_outbox", lambda *a, **kw: _async_ret(None))
+    monkeypatch.setattr(ow, "_find_existing_outbox", lambda *a, **kw: _async_ret(None))
+    monkeypatch.setattr(ow, "_count_131026_failures", lambda *a, **kw: _async_ret(0))
+    monkeypatch.setattr(ow, "_load_record", lambda *a, **kw: _async_ret(None))
+    monkeypatch.setattr(ow, "_load_client", lambda *a, **kw: _async_ret(None))
+    monkeypatch.setattr(ow, "_apply_rate_limit", lambda *a, **kw: _async_ret(None))
+    monkeypatch.setattr(ow, "_render_message", lambda *a, **kw: _async_ret(("", 1, "de", {})))
+
+    guard_result = SimpleNamespace(
+        eligible=followup_eligible,
+        booked_after_at=None,
+        followup_status=None,
+        skip_reason=None,
+    )
+    monkeypatch.setattr(ow, "check_followup_final_eligibility", lambda *a, **kw: _async_ret(guard_result))
+    monkeypatch.setattr(
+        ow,
+        "client_has_any_future_record",
+        lambda *a, **kw: _async_ret(has_future_record),
+    )
+    monkeypatch.setattr(ow, "safe_send_template", lambda *a, **kw: _async_ret(("msg-fu", None)))
+    monkeypatch.setattr(ow, "safe_send", lambda *a, **kw: _async_ret(("msg-fu", None)))
+    monkeypatch.setattr(ow, "OutboxMessage", FakeOutbox)
+    monkeypatch.setattr(ow.settings, "meta_newsletter_followup_header_image_url", "https://cdn.example.com/fu.jpg")
+    monkeypatch.setattr(ow.settings, "meta_newsletter_monthly_header_image_url", "https://cdn.example.com/m.jpg")
+
+
+async def _async_ret(val: Any) -> Any:
+    return val
+
+
+def test_followup_job_backfills_followup_fields_on_success(monkeypatch: Any) -> None:
+    """newsletter_new_clients_followup: followup_outbox_id/sent_at/status set; primary fields untouched."""
+    fixed_now = datetime(2026, 5, 19, 10, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(ow, "utcnow", lambda: fixed_now)
+
+    recipient = FakeCampaignRecipient(id=100, altegio_client_id=9001)
+    run_obj = SimpleNamespace(completed_at=datetime(2026, 1, 1, tzinfo=timezone.utc))
+
+    session = _FollowupFakeSession(
+        get_map={
+            ("CampaignRecipient", 100): recipient,
+            ("CampaignRun", 200): run_obj,
+        }
+    )
+
+    job = FakeJob(
+        id=3657,
+        company_id=KA_COMPANY,
+        job_type=FOLLOWUP_JOB_TYPE,
+        status="queued",
+        run_at=fixed_now,
+        payload={
+            "campaign_recipient_id": 100,
+            "campaign_run_id": 200,
+            "phone_e164": "+4917684571576",
+            "contact_name": "Anna",
+        },
+    )
+
+    _patch_followup_common(monkeypatch, job=job)
+
+    run(ow.process_job_in_session(session, 3657, provider=object()))  # type: ignore
+
+    assert job.status == "done", f"Expected done, got {job.status!r} last_error={job.last_error!r}"
+    assert len(session.added) == 1
+    out = session.added[0]
+
+    # Follow-up fields must be set.
+    assert recipient.followup_outbox_id == out.id, "followup_outbox_id must be set to out.id"
+    assert recipient.followup_sent_at == fixed_now, "followup_sent_at must be set"
+    assert recipient.followup_status == "sent", "followup_status must be 'sent'"
+
+    # Primary campaign fields must NOT be overwritten.
+    assert recipient.outbox_message_id == 555, "outbox_message_id must not be overwritten"
+    assert recipient.provider_message_id == "existing-msg-id", "provider_message_id must not be overwritten"
+    assert recipient.sent_at == datetime(2026, 1, 1, tzinfo=timezone.utc), "sent_at must not be overwritten"
+
+
+def test_monthly_campaign_job_backfills_primary_fields_on_success(monkeypatch: Any) -> None:
+    """newsletter_new_clients_monthly: primary fields set; followup fields not touched."""
+    fixed_now = datetime(2026, 5, 19, 10, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(ow, "utcnow", lambda: fixed_now)
+
+    recipient = FakeCampaignRecipientEmpty(id=101)
+
+    session = _FollowupFakeSession(
+        get_map={
+            ("CampaignRecipient", 101): recipient,
+        }
+    )
+
+    job = FakeJob(
+        id=4000,
+        company_id=KA_COMPANY,
+        job_type=MONTHLY_JOB_TYPE,
+        status="queued",
+        run_at=fixed_now,
+        payload={
+            "campaign_recipient_id": 101,
+            "campaign_run_id": 201,
+            "phone_e164": "+4917684571576",
+            "contact_name": "Anna",
+            "loyalty_card_text": "Kundenkarte #001",
+        },
+    )
+
+    _patch_followup_common(monkeypatch, job=job)
+    # Monthly template needs booking_link to pass preflight validation (3 params).
+    monkeypatch.setattr(
+        ow,
+        "_render_message",
+        lambda *a, **kw: _async_ret(
+            ("", 1, "de", {"client_name": "Anna", "booking_link": "https://n813709.alteg.io/"})
+        ),
+    )
+
+    run(ow.process_job_in_session(session, 4000, provider=object()))  # type: ignore
+
+    assert job.status == "done", f"Expected done, got {job.status!r} last_error={job.last_error!r}"
+    assert len(session.added) == 1
+    out = session.added[0]
+
+    # Primary fields must be set.
+    assert recipient.outbox_message_id == out.id, "outbox_message_id must be set"
+    assert recipient.sent_at == fixed_now, "sent_at must be set"
+
+    # Follow-up fields must NOT be touched.
+    assert recipient.followup_outbox_id is None, "followup_outbox_id must not be set"
+    assert recipient.followup_sent_at is None, "followup_sent_at must not be set"
+    assert recipient.followup_status is None, "followup_status must not be set"
+
+
+def test_followup_job_sends_normally_without_campaign_recipient_id(monkeypatch: Any) -> None:
+    """Follow-up job with no campaign_recipient_id: send completes, no crash, no backfill."""
+    fixed_now = datetime(2026, 5, 19, 10, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(ow, "utcnow", lambda: fixed_now)
+
+    session = _FollowupFakeSession()
+
+    job = FakeJob(
+        id=3700,
+        company_id=KA_COMPANY,
+        job_type=FOLLOWUP_JOB_TYPE,
+        status="queued",
+        run_at=fixed_now,
+        # Deliberately missing campaign_recipient_id.
+        payload={"phone_e164": "+4917684571576", "contact_name": "Anna"},
+    )
+
+    _patch_followup_common(monkeypatch, job=job)
+
+    run(ow.process_job_in_session(session, 3700, provider=object()))  # type: ignore
+
+    # Job must complete the send despite missing recipient id.
+    assert job.status == "done", f"Expected done, got {job.status!r} last_error={job.last_error!r}"
+    assert len(session.added) == 1  # OutboxMessage added
+
+
+def test_followup_job_sends_normally_when_recipient_not_found(monkeypatch: Any) -> None:
+    """Follow-up job where recipient_id is in payload but not in DB: send completes, warning only."""
+    fixed_now = datetime(2026, 5, 19, 10, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(ow, "utcnow", lambda: fixed_now)
+
+    # session.get(CampaignRecipient, 999) returns None → not found.
+    session = _FollowupFakeSession(get_map={("CampaignRecipient", 999): None})
+
+    job = FakeJob(
+        id=3800,
+        company_id=KA_COMPANY,
+        job_type=FOLLOWUP_JOB_TYPE,
+        status="queued",
+        run_at=fixed_now,
+        payload={
+            "campaign_recipient_id": 999,
+            "campaign_run_id": 200,
+            "phone_e164": "+4917684571576",
+            "contact_name": "Anna",
+        },
+    )
+
+    _patch_followup_common(monkeypatch, job=job)
+
+    run(ow.process_job_in_session(session, 3800, provider=object()))  # type: ignore
+
+    # Job must complete the send despite recipient not found.
+    assert job.status == "done", f"Expected done, got {job.status!r} last_error={job.last_error!r}"
+    assert len(session.added) == 1  # OutboxMessage added

@@ -1074,74 +1074,66 @@ async def _run_job_logic(
         _fu_recipient_id = _fu_payload.get("campaign_recipient_id")
         _fu_run_id = _fu_payload.get("campaign_run_id")
 
-        # Fail-closed: every followup job must reference a valid recipient.
         if _fu_recipient_id is None:
-            job.status = "canceled"
-            job.locked_at = None
-            job.last_error = "Follow-up skipped: missing campaign_recipient_id"
+            # No recipient id in payload: skip eligibility guard and backfill, still send.
             logger.warning(
-                "followup job without campaign_recipient_id job_id=%s — canceled (fail-closed)",
+                "followup job without campaign_recipient_id job_id=%s — skipping eligibility guard and backfill",
                 job.id,
             )
-            return None
+        else:
+            _fu_recipient = await session.get(CampaignRecipient, int(_fu_recipient_id))
+            if _fu_recipient is None:
+                # Recipient not found: skip eligibility guard and backfill, still send.
+                logger.warning(
+                    "followup job: recipient_id=%s not found job_id=%s — skipping eligibility guard and backfill",
+                    _fu_recipient_id,
+                    job.id,
+                )
+            else:
+                # Fail-closed: campaign_run_id is mandatory; attribution_start is unreliable without it.
+                if _fu_run_id is None:
+                    job.status = "canceled"
+                    job.locked_at = None
+                    job.last_error = "Follow-up skipped: missing campaign_run_id"
+                    logger.warning(
+                        "followup job without campaign_run_id job_id=%s — canceled (fail-closed)",
+                        job.id,
+                    )
+                    return None
 
-        _fu_recipient = await session.get(CampaignRecipient, int(_fu_recipient_id))
-        # Fail-closed: recipient referenced in payload must exist in DB.
-        if _fu_recipient is None:
-            job.status = "canceled"
-            job.locked_at = None
-            job.last_error = f"Follow-up skipped: campaign_recipient_id={_fu_recipient_id} not found"
-            logger.warning(
-                "followup job: recipient_id=%s not found job_id=%s — canceled (fail-closed)",
-                _fu_recipient_id,
-                job.id,
-            )
-            return None
+                _fu_run = await session.get(CampaignRun, int(_fu_run_id))
+                if _fu_run is None:
+                    job.status = "canceled"
+                    job.locked_at = None
+                    job.last_error = f"Follow-up skipped: campaign_run_id={_fu_run_id} not found"
+                    logger.warning(
+                        "followup job: run_id=%s not found job_id=%s — canceled (fail-closed)",
+                        _fu_run_id,
+                        job.id,
+                    )
+                    return None
 
-        # Fail-closed: campaign_run_id is mandatory; attribution_start is unreliable without it.
-        if _fu_run_id is None:
-            job.status = "canceled"
-            job.locked_at = None
-            job.last_error = "Follow-up skipped: missing campaign_run_id"
-            logger.warning(
-                "followup job without campaign_run_id job_id=%s — canceled (fail-closed)",
-                job.id,
-            )
-            return None
+                _guard = await check_followup_final_eligibility(session, _fu_recipient, _fu_run, utcnow())
+                if not _guard.eligible:
+                    if _guard.booked_after_at is not None and _fu_recipient.booked_after_at is None:
+                        _fu_recipient.booked_after_at = _guard.booked_after_at
+                    _fu_recipient.followup_status = _guard.followup_status or "followup_skipped"
+                    job.status = "canceled"
+                    job.locked_at = None
+                    job.last_error = _guard.skip_reason
+                    logger.info(
+                        "followup guard skipped job_id=%s recipient_id=%s reason=%r",
+                        job.id,
+                        _fu_recipient_id,
+                        _guard.skip_reason,
+                    )
+                    return None
 
-        _fu_run = await session.get(CampaignRun, int(_fu_run_id))
-        if _fu_run is None:
-            job.status = "canceled"
-            job.locked_at = None
-            job.last_error = f"Follow-up skipped: campaign_run_id={_fu_run_id} not found"
-            logger.warning(
-                "followup job: run_id=%s not found job_id=%s — canceled (fail-closed)",
-                _fu_run_id,
-                job.id,
-            )
-            return None
-
-        _guard = await check_followup_final_eligibility(session, _fu_recipient, _fu_run, utcnow())
-        if not _guard.eligible:
-            if _guard.booked_after_at is not None and _fu_recipient.booked_after_at is None:
-                _fu_recipient.booked_after_at = _guard.booked_after_at
-            _fu_recipient.followup_status = _guard.followup_status or "followup_skipped"
-            job.status = "canceled"
-            job.locked_at = None
-            job.last_error = _guard.skip_reason
-            logger.info(
-                "followup guard skipped job_id=%s recipient_id=%s reason=%r",
-                job.id,
-                _fu_recipient_id,
-                _guard.skip_reason,
-            )
-            return None
-
-        # Resolve altegio_client_id now (recipient row first, then loaded client row as fallback).
-        # The actual live API call happens after the 131026 suppression check below.
-        _fu_altegio_cid = getattr(_fu_recipient, "altegio_client_id", None)
-        if _fu_altegio_cid is None and client is not None:
-            _fu_altegio_cid = getattr(client, "altegio_client_id", None)
+                # Resolve altegio_client_id (recipient row first, then loaded client row as fallback).
+                # The actual live API call happens after the 131026 suppression check below.
+                _fu_altegio_cid = getattr(_fu_recipient, "altegio_client_id", None)
+                if _fu_altegio_cid is None and client is not None:
+                    _fu_altegio_cid = getattr(client, "altegio_client_id", None)
 
     if client is not None:
         opted_out = bool(getattr(client, "wa_opted_out", False))
@@ -1379,14 +1371,13 @@ async def _run_job_logic(
     # Runs here — AFTER the 131026 suppression guard — so a locally known-undeliverable
     # phone short-circuits before we call an external API.
     # Only reached when the DB guard passed (recipient eligible) and 131026 did not fire.
-    if job.job_type == FOLLOWUP_JOB_TYPE:
+    if job.job_type == FOLLOWUP_JOB_TYPE and _fu_recipient is not None:
         if _fu_altegio_cid is None:
             # Cannot perform the live future-record check without an Altegio client id.
             # Fail permanently rather than silently skipping the guard (fail-closed).
             job.status = "failed"
             job.locked_at = None
             job.last_error = "Follow-up failed: missing Altegio client id for live future-record check"
-            assert _fu_recipient is not None  # always set when job_type == FOLLOWUP_JOB_TYPE
             _fu_recipient.followup_status = "followup_failed"
             # Keep followup_message_job_id pointing at this job for audit trail.
             logger.error(
@@ -1413,7 +1404,6 @@ async def _run_job_logic(
             return None
 
         if _fu_has_future:
-            assert _fu_recipient is not None
             _fu_recipient.followup_status = "skipped_future_record"
             _fu_recipient.followup_message_job_id = None
             job.status = "canceled"
@@ -2179,19 +2169,35 @@ async def _run_job_logic(
             meta=send_meta,
         )
         session.add(out)
-        # Backfill CampaignRecipient → OutboxMessage link if this is a campaign
-        # job.  Flush first so out.id is populated by the RETURNING clause.
+        # Backfill CampaignRecipient fields after a successful send.
+        # Flush first so out.id is populated by the RETURNING clause.
         campaign_recipient_id = _job_payload.get("campaign_recipient_id")
         if campaign_recipient_id is not None:
             await session.flush()
             recipient = await session.get(CampaignRecipient, int(campaign_recipient_id))
             if recipient is not None:
-                if recipient.outbox_message_id is None:
-                    recipient.outbox_message_id = out.id
-                if recipient.provider_message_id is None and msg_id:
-                    recipient.provider_message_id = msg_id
-                if recipient.sent_at is None:
-                    recipient.sent_at = now_sent
+                if job.job_type == FOLLOWUP_JOB_TYPE:
+                    # Follow-up send: update follow-up tracking fields only.
+                    # Do NOT overwrite primary campaign fields (outbox_message_id,
+                    # provider_message_id, sent_at) — those belong to the original
+                    # monthly campaign message.
+                    recipient.followup_outbox_id = out.id
+                    recipient.followup_sent_at = now_sent
+                    recipient.followup_status = "sent"
+                else:
+                    # Primary campaign send: update primary tracking fields.
+                    if recipient.outbox_message_id is None:
+                        recipient.outbox_message_id = out.id
+                    if recipient.provider_message_id is None and msg_id:
+                        recipient.provider_message_id = msg_id
+                    if recipient.sent_at is None:
+                        recipient.sent_at = now_sent
+            else:
+                logger.warning(
+                    "campaign backfill: recipient_id=%s not found job_id=%s — skipping",
+                    campaign_recipient_id,
+                    job.id,
+                )
 
     job.status = "done"
     job.locked_at = None

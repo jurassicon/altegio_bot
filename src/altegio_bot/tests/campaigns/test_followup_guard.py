@@ -464,7 +464,12 @@ async def test_outbox_worker_followup_missing_recipient_id_does_not_send(
     ow_session,
     session_maker,
 ) -> None:
-    """Follow-up job with no campaign_recipient_id must be canceled (fail-closed)."""
+    """Follow-up job with no campaign_recipient_id: warning logged, eligibility guard skipped.
+
+    Send is not reached because the header image URL is not configured in test
+    settings — the job fails there instead of being canceled by the guard.
+    Provider must not be called in either case.
+    """
     async with session_maker() as session:
         async with session.begin():
             run = _make_run(session)
@@ -498,9 +503,10 @@ async def test_outbox_worker_followup_missing_recipient_id_does_not_send(
         db_job = await session.get(MessageJob, job_id)
 
     assert db_job is not None
-    assert db_job.status == "canceled", f"Expected canceled, got {db_job.status!r}"
+    # Guard no longer cancels on missing recipient id; job continues and fails
+    # on the unconfigured header image URL in test settings.
+    assert db_job.status != "canceled", f"Job must not be canceled by guard; got {db_job.status!r}"
     assert db_job.last_error is not None
-    assert "campaign_recipient_id" in db_job.last_error
 
     provider.send_template.assert_not_called()
     provider.send.assert_not_called()
@@ -839,7 +845,12 @@ async def test_outbox_worker_followup_recipient_not_found_does_not_send(
     ow_session,
     session_maker,
 ) -> None:
-    """Follow-up job with nonexistent campaign_recipient_id must be canceled (fail-closed)."""
+    """Follow-up job with nonexistent campaign_recipient_id: warning logged, eligibility guard skipped.
+
+    Send is not reached because the header image URL is not configured in test
+    settings — the job fails there instead of being canceled by the guard.
+    Provider must not be called in either case.
+    """
     BOGUS_RECIPIENT_ID = 999_999_999
 
     async with session_maker() as session:
@@ -884,9 +895,10 @@ async def test_outbox_worker_followup_recipient_not_found_does_not_send(
         db_job = await session.get(MessageJob, job_id)
 
     assert db_job is not None
-    assert db_job.status == "canceled", f"Expected canceled, got {db_job.status!r}"
+    # Guard no longer cancels on not-found recipient; job continues and fails
+    # on the unconfigured header image URL in test settings.
+    assert db_job.status != "canceled", f"Job must not be canceled by guard; got {db_job.status!r}"
     assert db_job.last_error is not None
-    assert "campaign_recipient_id" in db_job.last_error
 
     provider.send_template.assert_not_called()
     provider.send.assert_not_called()
