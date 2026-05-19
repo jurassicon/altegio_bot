@@ -942,6 +942,22 @@ async def _update_promo_lead_notification_meta(
         )
 
 
+def _parse_int_payload_id(value: Any, field_name: str) -> tuple[int | None, str | None]:
+    """Parse a job-payload field expected to be an integer id.
+
+    Returns ``(int_value, None)`` on success.
+    Returns ``(None, None)`` when *value* is ``None`` (field absent).
+    Returns ``(None, error_str)`` when *value* is non-``None`` but cannot be
+    coerced to int (malformed).
+    """
+    if value is None:
+        return None, None
+    try:
+        return int(value), None
+    except (ValueError, TypeError):
+        return None, f"Follow-up skipped: invalid {field_name}={value!r}"
+
+
 async def _backfill_campaign_recipient_after_send(
     session: AsyncSession,
     job_type: str,
@@ -955,7 +971,15 @@ async def _backfill_campaign_recipient_after_send(
     campaign_recipient_id = payload.get("campaign_recipient_id")
     if campaign_recipient_id is None:
         return
-    recipient = await session.get(CampaignRecipient, int(campaign_recipient_id))
+    _rcid_int, _rcid_err = _parse_int_payload_id(campaign_recipient_id, "campaign_recipient_id")
+    if _rcid_err is not None:
+        logger.warning(
+            "campaign backfill: %s job_id=%s — skipping",
+            _rcid_err,
+            job_id,
+        )
+        return
+    recipient = await session.get(CampaignRecipient, _rcid_int)
     if recipient is None:
         logger.warning(
             "campaign backfill: recipient_id=%s not found job_id=%s — skipping",
@@ -1119,7 +1143,19 @@ async def _run_job_logic(
             )
             return None
 
-        _fu_recipient = await session.get(CampaignRecipient, int(_fu_recipient_id))
+        _fu_recipient_id_int, _fu_rid_err = _parse_int_payload_id(_fu_recipient_id, "campaign_recipient_id")
+        if _fu_rid_err is not None:
+            job.status = "canceled"
+            job.locked_at = None
+            job.last_error = _fu_rid_err
+            logger.warning(
+                "followup job: %s job_id=%s — canceled (fail-closed)",
+                _fu_rid_err,
+                job.id,
+            )
+            return None
+
+        _fu_recipient = await session.get(CampaignRecipient, _fu_recipient_id_int)
         if _fu_recipient is None:
             job.status = "canceled"
             job.locked_at = None
@@ -1142,7 +1178,19 @@ async def _run_job_logic(
             )
             return None
 
-        _fu_run = await session.get(CampaignRun, int(_fu_run_id))
+        _fu_run_id_int, _fu_ruid_err = _parse_int_payload_id(_fu_run_id, "campaign_run_id")
+        if _fu_ruid_err is not None:
+            job.status = "canceled"
+            job.locked_at = None
+            job.last_error = _fu_ruid_err
+            logger.warning(
+                "followup job: %s job_id=%s — canceled (fail-closed)",
+                _fu_ruid_err,
+                job.id,
+            )
+            return None
+
+        _fu_run = await session.get(CampaignRun, _fu_run_id_int)
         if _fu_run is None:
             job.status = "canceled"
             job.locked_at = None

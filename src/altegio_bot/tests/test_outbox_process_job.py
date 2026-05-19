@@ -1003,3 +1003,85 @@ def test_backfill_helper_noop_when_no_campaign_recipient_id() -> None:
     )
 
     assert session.added == []
+
+
+# ---------------------------------------------------------------------------
+# P3 — safe integer parsing: malformed campaign_recipient_id / campaign_run_id
+# ---------------------------------------------------------------------------
+
+
+def test_followup_job_invalid_campaign_recipient_id_cancels(monkeypatch: Any) -> None:
+    """Malformed campaign_recipient_id='abc' → job canceled, no send."""
+    fixed_now = datetime(2026, 5, 19, 10, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(ow, "utcnow", lambda: fixed_now)
+
+    session = _FollowupFakeSession()
+
+    job = FakeJob(
+        id=3901,
+        company_id=KA_COMPANY,
+        job_type=FOLLOWUP_JOB_TYPE,
+        status="queued",
+        run_at=fixed_now,
+        payload={"campaign_recipient_id": "abc", "campaign_run_id": 200, "phone_e164": "+49111"},
+    )
+
+    _patch_followup_common(monkeypatch, job=job)
+
+    run(ow.process_job_in_session(session, 3901, provider=object()))  # type: ignore
+
+    assert job.status == "canceled", f"Expected canceled, got {job.status!r}"
+    assert job.last_error is not None
+    assert "invalid campaign_recipient_id" in job.last_error
+    assert session.added == []  # no OutboxMessage
+
+
+def test_followup_job_invalid_campaign_run_id_cancels(monkeypatch: Any) -> None:
+    """Malformed campaign_run_id='abc' with valid recipient → job canceled, no send."""
+    fixed_now = datetime(2026, 5, 19, 10, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(ow, "utcnow", lambda: fixed_now)
+
+    recipient = FakeCampaignRecipient(id=100)
+
+    session = _FollowupFakeSession(get_map={("CampaignRecipient", 100): recipient})
+
+    job = FakeJob(
+        id=3902,
+        company_id=KA_COMPANY,
+        job_type=FOLLOWUP_JOB_TYPE,
+        status="queued",
+        run_at=fixed_now,
+        payload={
+            "campaign_recipient_id": 100,
+            "campaign_run_id": "abc",
+            "phone_e164": "+49111",
+        },
+    )
+
+    _patch_followup_common(monkeypatch, job=job)
+
+    run(ow.process_job_in_session(session, 3902, provider=object()))  # type: ignore
+
+    assert job.status == "canceled", f"Expected canceled, got {job.status!r}"
+    assert job.last_error is not None
+    assert "invalid campaign_run_id" in job.last_error
+    assert session.added == []  # no OutboxMessage
+
+
+def test_backfill_helper_invalid_campaign_recipient_id_does_not_raise(monkeypatch: Any) -> None:
+    """_backfill_campaign_recipient_after_send with 'abc' id must log and return, not crash."""
+    fixed_now = datetime(2026, 5, 19, 10, 0, tzinfo=timezone.utc)
+    session = _FollowupFakeSession()
+
+    run(
+        ow._backfill_campaign_recipient_after_send(
+            session=session,
+            job_type=MONTHLY_JOB_TYPE,
+            job_id=9999,
+            payload={"campaign_recipient_id": "abc"},
+            outbox_id=46,
+            now_sent=fixed_now,
+        )
+    )
+
+    assert session.added == []
