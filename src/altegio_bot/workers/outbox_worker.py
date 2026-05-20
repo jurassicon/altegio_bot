@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
@@ -942,6 +943,85 @@ async def _update_promo_lead_notification_meta(
         )
 
 
+_ID_RE = re.compile(r"^\d+$")
+
+
+def _parse_int_payload_id(value: Any, field_name: str) -> tuple[int | None, str | None]:
+    """Parse a job-payload field expected to be a positive integer id.
+
+    Returns ``(int_value, None)`` on success.
+    Returns ``(None, None)`` when *value* is ``None`` (field absent).
+    Returns ``(None, error_str)`` when *value* is present but invalid.
+
+    Accepted: positive ``int`` (not ``bool``), digit-only ``str`` (``'1'``,
+    ``'42'``, ``'001'``).  Rejected: ``bool``, ``float``, empty / signed /
+    decimal string, ``list``, ``dict``, ``0``, ``'0'``.
+    """
+    if value is None:
+        return None, None
+
+    if isinstance(value, bool):
+        return None, f"Follow-up skipped: invalid {field_name}={value!r}"
+
+    if isinstance(value, int):
+        if value <= 0:
+            return None, f"Follow-up skipped: invalid {field_name}={value!r}"
+        return value, None
+
+    if isinstance(value, str):
+        if not _ID_RE.fullmatch(value):
+            return None, f"Follow-up skipped: invalid {field_name}={value!r}"
+        parsed = int(value)
+        if parsed <= 0:
+            return None, f"Follow-up skipped: invalid {field_name}={value!r}"
+        return parsed, None
+
+    return None, f"Follow-up skipped: invalid {field_name}={value!r}"
+
+
+async def _backfill_campaign_recipient_after_send(
+    session: AsyncSession,
+    job_type: str,
+    job_id: int,
+    payload: dict[str, Any],
+    outbox_id: int,
+    now_sent: datetime,
+    provider_message_id: str | None = None,
+) -> None:
+    """Update CampaignRecipient tracking fields after a successful send."""
+    campaign_recipient_id = payload.get("campaign_recipient_id")
+    if campaign_recipient_id is None:
+        return
+    _rcid_int, _rcid_err = _parse_int_payload_id(campaign_recipient_id, "campaign_recipient_id")
+    if _rcid_err is not None:
+        logger.warning(
+            "campaign backfill: %s job_id=%s — skipping",
+            _rcid_err,
+            job_id,
+        )
+        return
+    recipient = await session.get(CampaignRecipient, _rcid_int)
+    if recipient is None:
+        logger.warning(
+            "campaign backfill: recipient_id=%s not found job_id=%s — skipping",
+            campaign_recipient_id,
+            job_id,
+        )
+        return
+    if job_type == FOLLOWUP_JOB_TYPE:
+        recipient.followup_outbox_id = outbox_id
+        recipient.followup_sent_at = now_sent
+        if getattr(recipient, "followup_status", None) not in {"delivered", "read"}:
+            recipient.followup_status = "sent"
+    else:
+        if recipient.outbox_message_id is None:
+            recipient.outbox_message_id = outbox_id
+        if recipient.provider_message_id is None and provider_message_id:
+            recipient.provider_message_id = provider_message_id
+        if recipient.sent_at is None:
+            recipient.sent_at = now_sent
+
+
 async def process_job_in_session(
     session: AsyncSession,
     job_id: int,
@@ -1074,7 +1154,6 @@ async def _run_job_logic(
         _fu_recipient_id = _fu_payload.get("campaign_recipient_id")
         _fu_run_id = _fu_payload.get("campaign_run_id")
 
-        # Fail-closed: every followup job must reference a valid recipient.
         if _fu_recipient_id is None:
             job.status = "canceled"
             job.locked_at = None
@@ -1085,8 +1164,19 @@ async def _run_job_logic(
             )
             return None
 
-        _fu_recipient = await session.get(CampaignRecipient, int(_fu_recipient_id))
-        # Fail-closed: recipient referenced in payload must exist in DB.
+        _fu_recipient_id_int, _fu_rid_err = _parse_int_payload_id(_fu_recipient_id, "campaign_recipient_id")
+        if _fu_rid_err is not None:
+            job.status = "canceled"
+            job.locked_at = None
+            job.last_error = _fu_rid_err
+            logger.warning(
+                "followup job: %s job_id=%s — canceled (fail-closed)",
+                _fu_rid_err,
+                job.id,
+            )
+            return None
+
+        _fu_recipient = await session.get(CampaignRecipient, _fu_recipient_id_int)
         if _fu_recipient is None:
             job.status = "canceled"
             job.locked_at = None
@@ -1109,7 +1199,19 @@ async def _run_job_logic(
             )
             return None
 
-        _fu_run = await session.get(CampaignRun, int(_fu_run_id))
+        _fu_run_id_int, _fu_ruid_err = _parse_int_payload_id(_fu_run_id, "campaign_run_id")
+        if _fu_ruid_err is not None:
+            job.status = "canceled"
+            job.locked_at = None
+            job.last_error = _fu_ruid_err
+            logger.warning(
+                "followup job: %s job_id=%s — canceled (fail-closed)",
+                _fu_ruid_err,
+                job.id,
+            )
+            return None
+
+        _fu_run = await session.get(CampaignRun, _fu_run_id_int)
         if _fu_run is None:
             job.status = "canceled"
             job.locked_at = None
@@ -1137,7 +1239,7 @@ async def _run_job_logic(
             )
             return None
 
-        # Resolve altegio_client_id now (recipient row first, then loaded client row as fallback).
+        # Resolve altegio_client_id (recipient row first, then loaded client row as fallback).
         # The actual live API call happens after the 131026 suppression check below.
         _fu_altegio_cid = getattr(_fu_recipient, "altegio_client_id", None)
         if _fu_altegio_cid is None and client is not None:
@@ -1386,7 +1488,6 @@ async def _run_job_logic(
             job.status = "failed"
             job.locked_at = None
             job.last_error = "Follow-up failed: missing Altegio client id for live future-record check"
-            assert _fu_recipient is not None  # always set when job_type == FOLLOWUP_JOB_TYPE
             _fu_recipient.followup_status = "followup_failed"
             # Keep followup_message_job_id pointing at this job for audit trail.
             logger.error(
@@ -1413,7 +1514,6 @@ async def _run_job_logic(
             return None
 
         if _fu_has_future:
-            assert _fu_recipient is not None
             _fu_recipient.followup_status = "skipped_future_record"
             _fu_recipient.followup_message_job_id = None
             job.status = "canceled"
@@ -1919,6 +2019,17 @@ async def _run_job_logic(
                         },
                     )
                     session.add(_text_out)
+                if _job_payload.get("campaign_recipient_id") is not None:
+                    await session.flush()
+                await _backfill_campaign_recipient_after_send(
+                    session=session,
+                    job_type=job.job_type,
+                    job_id=job.id,
+                    payload=_job_payload,
+                    outbox_id=_text_out.id,
+                    now_sent=_now_sent,
+                    provider_message_id=_text_msg_id,
+                )
                 job.status = "done"
                 job.locked_at = None
                 job.last_error = None
@@ -2179,19 +2290,17 @@ async def _run_job_logic(
             meta=send_meta,
         )
         session.add(out)
-        # Backfill CampaignRecipient → OutboxMessage link if this is a campaign
-        # job.  Flush first so out.id is populated by the RETURNING clause.
-        campaign_recipient_id = _job_payload.get("campaign_recipient_id")
-        if campaign_recipient_id is not None:
+        if _job_payload.get("campaign_recipient_id") is not None:
             await session.flush()
-            recipient = await session.get(CampaignRecipient, int(campaign_recipient_id))
-            if recipient is not None:
-                if recipient.outbox_message_id is None:
-                    recipient.outbox_message_id = out.id
-                if recipient.provider_message_id is None and msg_id:
-                    recipient.provider_message_id = msg_id
-                if recipient.sent_at is None:
-                    recipient.sent_at = now_sent
+        await _backfill_campaign_recipient_after_send(
+            session=session,
+            job_type=job.job_type,
+            job_id=job.id,
+            payload=_job_payload,
+            outbox_id=out.id,
+            now_sent=now_sent,
+            provider_message_id=msg_id,
+        )
 
     job.status = "done"
     job.locked_at = None

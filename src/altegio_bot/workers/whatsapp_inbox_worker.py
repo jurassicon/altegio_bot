@@ -7,7 +7,7 @@ import re
 from datetime import datetime, timezone
 from typing import Any, Sequence
 
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.campaigns.runner import recompute_campaign_run_stats
@@ -540,6 +540,7 @@ async def _apply_status_updates(
             outbox_by_wamid[ob.provider_message_id] = ob
 
     updated_outbox_ids: list[int] = []
+    outbox_id_to_new_status: dict[int, str] = {}
 
     for upd in status_updates:
         wamid = upd["wamid"]
@@ -585,14 +586,36 @@ async def _apply_status_updates(
         ob.meta = meta
 
         updated_outbox_ids.append(int(ob.id))
+        outbox_id_to_new_status[int(ob.id)] = new_status
 
     if not updated_outbox_ids:
         return []
 
-    # Resolve campaign_run_ids linked to the updated outbox messages.
+    # Advance followup_status on CampaignRecipient rows linked via followup_outbox_id.
+    # Uses the same no-downgrade rule: read > delivered > sent.
+    fu_status_ids = [oid for oid, st in outbox_id_to_new_status.items() if st in {"delivered", "read"}]
+    if fu_status_ids:
+        fu_stmt = select(CampaignRecipient).where(CampaignRecipient.followup_outbox_id.in_(fu_status_ids))
+        fu_res = await session.execute(fu_stmt)
+        for recipient in fu_res.scalars().all():
+            fu_oid = recipient.followup_outbox_id
+            if fu_oid is None:
+                continue
+            new_followup = outbox_id_to_new_status.get(int(fu_oid))
+            if new_followup == "read":
+                recipient.followup_status = "read"
+            elif new_followup == "delivered" and recipient.followup_status != "read":
+                recipient.followup_status = "delivered"
+
+    # Resolve campaign_run_ids linked to the updated outbox messages (primary or follow-up).
     cr_stmt = (
         select(CampaignRecipient.campaign_run_id)
-        .where(CampaignRecipient.outbox_message_id.in_(updated_outbox_ids))
+        .where(
+            or_(
+                CampaignRecipient.outbox_message_id.in_(updated_outbox_ids),
+                CampaignRecipient.followup_outbox_id.in_(updated_outbox_ids),
+            )
+        )
         .distinct()
     )
     cr_res = await session.execute(cr_stmt)
