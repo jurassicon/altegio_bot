@@ -228,6 +228,21 @@ jobs:
             }
             echo "✅ Backup created: $DUMP_FILE"
 
+            BACKUP_DIR="/opt/altegio_bot/backups"
+            KEEP_BACKUPS=10
+
+            echo "🧹 Rotating pre-deploy database backups..."
+            echo "Keeping latest ${KEEP_BACKUPS} backups"
+
+            ls -1t "${BACKUP_DIR}"/altegio_before_deploy_*.dump 2>/dev/null \
+              | tail -n +"$((KEEP_BACKUPS + 1))" \
+              | xargs -r rm -v --
+
+            echo "Current backup count:"
+            find "${BACKUP_DIR}" -maxdepth 1 -type f \
+              -name 'altegio_before_deploy_*.dump' \
+              | wc -l
+
             echo "⚙️ Applying DB Migrations..."
             docker compose --profile ops run --rm --no-deps migrate
 
