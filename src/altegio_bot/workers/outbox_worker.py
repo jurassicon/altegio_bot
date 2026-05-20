@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
@@ -942,20 +943,40 @@ async def _update_promo_lead_notification_meta(
         )
 
 
+_ID_RE = re.compile(r"^\d+$")
+
+
 def _parse_int_payload_id(value: Any, field_name: str) -> tuple[int | None, str | None]:
-    """Parse a job-payload field expected to be an integer id.
+    """Parse a job-payload field expected to be a positive integer id.
 
     Returns ``(int_value, None)`` on success.
     Returns ``(None, None)`` when *value* is ``None`` (field absent).
-    Returns ``(None, error_str)`` when *value* is non-``None`` but cannot be
-    coerced to int (malformed).
+    Returns ``(None, error_str)`` when *value* is present but invalid.
+
+    Accepted: positive ``int`` (not ``bool``), digit-only ``str`` (``'1'``,
+    ``'42'``, ``'001'``).  Rejected: ``bool``, ``float``, empty / signed /
+    decimal string, ``list``, ``dict``, ``0``, ``'0'``.
     """
     if value is None:
         return None, None
-    try:
-        return int(value), None
-    except (ValueError, TypeError):
+
+    if isinstance(value, bool):
         return None, f"Follow-up skipped: invalid {field_name}={value!r}"
+
+    if isinstance(value, int):
+        if value <= 0:
+            return None, f"Follow-up skipped: invalid {field_name}={value!r}"
+        return value, None
+
+    if isinstance(value, str):
+        if not _ID_RE.fullmatch(value):
+            return None, f"Follow-up skipped: invalid {field_name}={value!r}"
+        parsed = int(value)
+        if parsed <= 0:
+            return None, f"Follow-up skipped: invalid {field_name}={value!r}"
+        return parsed, None
+
+    return None, f"Follow-up skipped: invalid {field_name}={value!r}"
 
 
 async def _backfill_campaign_recipient_after_send(

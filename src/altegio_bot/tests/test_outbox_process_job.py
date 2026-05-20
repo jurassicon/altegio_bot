@@ -1085,3 +1085,267 @@ def test_backfill_helper_invalid_campaign_recipient_id_does_not_raise(monkeypatc
     )
 
     assert session.added == []
+
+
+# ---------------------------------------------------------------------------
+# _parse_int_payload_id unit tests
+# ---------------------------------------------------------------------------
+
+
+def _pid(value: Any) -> tuple[int | None, str | None]:
+    return ow._parse_int_payload_id(value, "test_field")
+
+
+# Valid inputs
+
+
+def test_parse_int_payload_id_valid_int() -> None:
+    assert _pid(1) == (1, None)
+
+
+def test_parse_int_payload_id_valid_large_int() -> None:
+    assert _pid(42) == (42, None)
+
+
+def test_parse_int_payload_id_valid_digit_string() -> None:
+    assert _pid("1") == (1, None)
+
+
+def test_parse_int_payload_id_valid_digit_string_large() -> None:
+    assert _pid("42") == (42, None)
+
+
+def test_parse_int_payload_id_valid_zero_padded_string() -> None:
+    assert _pid("001") == (1, None)
+
+
+# Missing
+
+
+def test_parse_int_payload_id_none_returns_none_none() -> None:
+    assert _pid(None) == (None, None)
+
+
+# Invalid — must return (None, error_str)
+
+
+def test_parse_int_payload_id_rejects_true() -> None:
+    v, err = _pid(True)
+    assert v is None
+    assert err is not None and "test_field" in err
+
+
+def test_parse_int_payload_id_rejects_false() -> None:
+    v, err = _pid(False)
+    assert v is None
+    assert err is not None
+
+
+def test_parse_int_payload_id_rejects_float_exact() -> None:
+    v, err = _pid(1.0)
+    assert v is None
+    assert err is not None
+
+
+def test_parse_int_payload_id_rejects_float_inexact() -> None:
+    v, err = _pid(1.5)
+    assert v is None
+    assert err is not None
+
+
+def test_parse_int_payload_id_rejects_decimal_string() -> None:
+    v, err = _pid("1.0")
+    assert v is None
+    assert err is not None
+
+
+def test_parse_int_payload_id_rejects_signed_plus() -> None:
+    v, err = _pid("+1")
+    assert v is None
+    assert err is not None
+
+
+def test_parse_int_payload_id_rejects_signed_minus() -> None:
+    v, err = _pid("-1")
+    assert v is None
+    assert err is not None
+
+
+def test_parse_int_payload_id_rejects_whitespace_padded() -> None:
+    v, err = _pid(" 1 ")
+    assert v is None
+    assert err is not None
+
+
+def test_parse_int_payload_id_rejects_empty_string() -> None:
+    v, err = _pid("")
+    assert v is None
+    assert err is not None
+
+
+def test_parse_int_payload_id_rejects_alpha_string() -> None:
+    v, err = _pid("abc")
+    assert v is None
+    assert err is not None
+
+
+def test_parse_int_payload_id_rejects_list() -> None:
+    v, err = _pid([])
+    assert v is None
+    assert err is not None
+
+
+def test_parse_int_payload_id_rejects_dict() -> None:
+    v, err = _pid({})
+    assert v is None
+    assert err is not None
+
+
+def test_parse_int_payload_id_rejects_zero_int() -> None:
+    v, err = _pid(0)
+    assert v is None
+    assert err is not None
+
+
+def test_parse_int_payload_id_rejects_zero_string() -> None:
+    v, err = _pid("0")
+    assert v is None
+    assert err is not None
+
+
+# ---------------------------------------------------------------------------
+# Guard behavior: bool / float ids cancel the job
+# ---------------------------------------------------------------------------
+
+
+def test_followup_job_bool_campaign_recipient_id_cancels(monkeypatch: Any) -> None:
+    """campaign_recipient_id=True must cancel the job (bool is not a valid id)."""
+    fixed_now = datetime(2026, 5, 19, 10, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(ow, "utcnow", lambda: fixed_now)
+    session = _FollowupFakeSession()
+
+    job = FakeJob(
+        id=3903,
+        company_id=KA_COMPANY,
+        job_type=FOLLOWUP_JOB_TYPE,
+        status="queued",
+        run_at=fixed_now,
+        payload={"campaign_recipient_id": True, "campaign_run_id": 200, "phone_e164": "+49111"},
+    )
+    _patch_followup_common(monkeypatch, job=job)
+    run(ow.process_job_in_session(session, 3903, provider=object()))  # type: ignore
+
+    assert job.status == "canceled"
+    assert job.last_error is not None and "invalid campaign_recipient_id" in job.last_error
+    assert session.added == []
+
+
+def test_followup_job_float_campaign_recipient_id_cancels(monkeypatch: Any) -> None:
+    """campaign_recipient_id=1.5 must cancel the job (float is not a valid id)."""
+    fixed_now = datetime(2026, 5, 19, 10, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(ow, "utcnow", lambda: fixed_now)
+    session = _FollowupFakeSession()
+
+    job = FakeJob(
+        id=3904,
+        company_id=KA_COMPANY,
+        job_type=FOLLOWUP_JOB_TYPE,
+        status="queued",
+        run_at=fixed_now,
+        payload={"campaign_recipient_id": 1.5, "campaign_run_id": 200, "phone_e164": "+49111"},
+    )
+    _patch_followup_common(monkeypatch, job=job)
+    run(ow.process_job_in_session(session, 3904, provider=object()))  # type: ignore
+
+    assert job.status == "canceled"
+    assert job.last_error is not None and "invalid campaign_recipient_id" in job.last_error
+    assert session.added == []
+
+
+def test_followup_job_bool_campaign_run_id_cancels(monkeypatch: Any) -> None:
+    """campaign_run_id=True with valid recipient must cancel the job."""
+    fixed_now = datetime(2026, 5, 19, 10, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(ow, "utcnow", lambda: fixed_now)
+    recipient = FakeCampaignRecipient(id=100)
+    session = _FollowupFakeSession(get_map={("CampaignRecipient", 100): recipient})
+
+    job = FakeJob(
+        id=3905,
+        company_id=KA_COMPANY,
+        job_type=FOLLOWUP_JOB_TYPE,
+        status="queued",
+        run_at=fixed_now,
+        payload={"campaign_recipient_id": 100, "campaign_run_id": True, "phone_e164": "+49111"},
+    )
+    _patch_followup_common(monkeypatch, job=job)
+    run(ow.process_job_in_session(session, 3905, provider=object()))  # type: ignore
+
+    assert job.status == "canceled"
+    assert job.last_error is not None and "invalid campaign_run_id" in job.last_error
+    assert session.added == []
+
+
+def test_followup_job_float_campaign_run_id_cancels(monkeypatch: Any) -> None:
+    """campaign_run_id=1.5 with valid recipient must cancel the job."""
+    fixed_now = datetime(2026, 5, 19, 10, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(ow, "utcnow", lambda: fixed_now)
+    recipient = FakeCampaignRecipient(id=100)
+    session = _FollowupFakeSession(get_map={("CampaignRecipient", 100): recipient})
+
+    job = FakeJob(
+        id=3906,
+        company_id=KA_COMPANY,
+        job_type=FOLLOWUP_JOB_TYPE,
+        status="queued",
+        run_at=fixed_now,
+        payload={"campaign_recipient_id": 100, "campaign_run_id": 1.5, "phone_e164": "+49111"},
+    )
+    _patch_followup_common(monkeypatch, job=job)
+    run(ow.process_job_in_session(session, 3906, provider=object()))  # type: ignore
+
+    assert job.status == "canceled"
+    assert job.last_error is not None and "invalid campaign_run_id" in job.last_error
+    assert session.added == []
+
+
+# ---------------------------------------------------------------------------
+# Backfill helper: bool / float ids must not raise
+# ---------------------------------------------------------------------------
+
+
+def test_backfill_helper_bool_id_does_not_raise() -> None:
+    """_backfill_campaign_recipient_after_send with True id must silently no-op."""
+    fixed_now = datetime(2026, 5, 19, 10, 0, tzinfo=timezone.utc)
+    session = _FollowupFakeSession()
+
+    run(
+        ow._backfill_campaign_recipient_after_send(
+            session=session,
+            job_type=MONTHLY_JOB_TYPE,
+            job_id=9999,
+            payload={"campaign_recipient_id": True},
+            outbox_id=47,
+            now_sent=fixed_now,
+        )
+    )
+
+    assert session.added == []
+
+
+def test_backfill_helper_float_id_does_not_raise() -> None:
+    """_backfill_campaign_recipient_after_send with 1.5 id must silently no-op."""
+    fixed_now = datetime(2026, 5, 19, 10, 0, tzinfo=timezone.utc)
+    session = _FollowupFakeSession()
+
+    run(
+        ow._backfill_campaign_recipient_after_send(
+            session=session,
+            job_type=MONTHLY_JOB_TYPE,
+            job_id=9999,
+            payload={"campaign_recipient_id": 1.5},
+            outbox_id=48,
+            now_sent=fixed_now,
+        )
+    )
+
+    assert session.added == []
