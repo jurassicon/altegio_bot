@@ -88,6 +88,32 @@ def _normalize_event_status(value: str | None) -> str | None:
     return None
 
 
+def _parse_deleted_flag(value: Any) -> bool:
+    """Parse Altegio's deleted flag without treating arbitrary values as true."""
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        if value == 1:
+            return True
+        if value == 0:
+            return False
+        logger.warning("record deleted flag has unknown value: %r", value)
+        return False
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in ("1", "true", "yes", "y", "deleted"):
+            return True
+        if normalized in ("", "0", "false", "no", "n"):
+            return False
+        logger.warning("record deleted flag has unknown value: %r", value)
+        return False
+
+    logger.warning("record deleted flag has unknown value: %r", value)
+    return False
+
+
 def _as_utc(dt: datetime) -> datetime:
     if dt.tzinfo is None:
         return dt.replace(tzinfo=timezone.utc)
@@ -271,6 +297,190 @@ def sum_total_cost(services: list[dict[str, Any]]) -> Decimal | None:
     return total if any_found else None
 
 
+def _normalize_service_amount(value: Any) -> tuple[int | None, bool]:
+    """Return (normalized_int, True) for valid amounts, (None, False) if malformed.
+
+    Accepts None, int, or numeric strings ('1', '01', '1.0').
+    Returns (None, False) for non-numeric strings, lists, dicts, etc.
+    """
+    if value is None:
+        return None, True
+    if isinstance(value, bool):
+        return None, False
+    if isinstance(value, int):
+        return value, True
+    if isinstance(value, str):
+        v = value.strip()
+        if not v:
+            return None, True
+        try:
+            d = Decimal(v)
+            i = int(d)
+            if d == Decimal(i):
+                return i, True
+            return None, False
+        except Exception:
+            return None, False
+    return None, False
+
+
+async def _load_existing_record_snapshot(
+    session: AsyncSession,
+    company_id: int,
+    altegio_record_id: int,
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    """Return pre-upsert snapshot as plain dicts — no ORM objects in identity map.
+
+    Using explicit column selects avoids loading a Record ORM instance before
+    the Core INSERT … ON CONFLICT statement, which would leave a stale entry
+    in SQLAlchemy's identity map and cause session.get(Record, pk) to return
+    old data after the upsert.
+    """
+    res = await session.execute(
+        select(
+            Record.id,
+            Record.altegio_record_id,
+            Record.altegio_client_id,
+            Record.starts_at,
+            Record.staff_id,
+            Record.staff_name,
+            Record.short_link,
+            Record.total_cost,
+            Record.is_deleted,
+        )
+        .where(Record.company_id == company_id)
+        .where(Record.altegio_record_id == altegio_record_id)
+    )
+    row = res.one_or_none()
+    if row is None:
+        return None, []
+    rec_snap: dict[str, Any] = {
+        "id": row.id,
+        "altegio_record_id": row.altegio_record_id,
+        "altegio_client_id": row.altegio_client_id,
+        "starts_at": row.starts_at,
+        "staff_id": row.staff_id,
+        "staff_name": row.staff_name,
+        "short_link": row.short_link,
+        "total_cost": row.total_cost,
+        "is_deleted": row.is_deleted,
+    }
+    svcs_res = await session.execute(
+        select(
+            RecordService.service_id,
+            RecordService.title,
+            RecordService.amount,
+            RecordService.cost_to_pay,
+        ).where(RecordService.record_id == row.id)
+    )
+    return rec_snap, [
+        {
+            "service_id": r.service_id,
+            "title": r.title,
+            "amount": r.amount,
+            "cost_to_pay": r.cost_to_pay,
+        }
+        for r in svcs_res.all()
+    ]
+
+
+def _is_noop_update(
+    existing_record_snapshot: dict[str, Any],
+    existing_service_snapshots: list[dict[str, Any]],
+    record_data: dict[str, Any],
+) -> bool:
+    """Return True when the incoming update payload is client-visibly identical.
+
+    Conservative: returns False (process normally) when services are absent,
+    when client/deletion state changes, or when any visible field differs.
+    """
+    services_raw = record_data.get("services")
+    if services_raw is None:
+        return False
+
+    # deletion state
+    if _parse_deleted_flag(record_data.get("deleted")):
+        return False
+    if bool(existing_record_snapshot.get("is_deleted")):
+        return False
+
+    # altegio_client_id
+    client_data = record_data.get("client") or {}
+    raw_cid = client_data.get("id")
+    incoming_cid = int(raw_cid) if raw_cid is not None else None
+    if incoming_cid != existing_record_snapshot.get("altegio_client_id"):
+        return False
+
+    # starts_at
+    incoming_starts_at = _parse_starts_at(record_data)
+    existing_starts_at = existing_record_snapshot.get("starts_at")
+    if (incoming_starts_at is None) != (existing_starts_at is None):
+        return False
+    if incoming_starts_at is not None and existing_starts_at is not None:
+        inc = incoming_starts_at.replace(microsecond=0)
+        exi = _as_utc(existing_starts_at).replace(microsecond=0)
+        if inc != exi:
+            return False
+
+    # staff_id
+    staff_data = record_data.get("staff") or {}
+    raw_staff_id = record_data.get("staff_id") or staff_data.get("id")
+    staff_id_val = int(raw_staff_id) if raw_staff_id is not None else None
+    if staff_id_val != existing_record_snapshot.get("staff_id"):
+        return False
+
+    # staff_name
+    if staff_data.get("name") != existing_record_snapshot.get("staff_name"):
+        return False
+
+    # short_link
+    if record_data.get("short_link") != existing_record_snapshot.get("short_link"):
+        return False
+
+    # services (sorted by service_id for stable comparison)
+    inc_svcs = []
+    for s in services_raw:
+        if s.get("id") is None:
+            continue
+        amt, valid = _normalize_service_amount(s.get("amount"))
+        if not valid:
+            return False
+        inc_svcs.append(
+            (
+                int(s["id"]),
+                s.get("title"),
+                amt,
+                (Decimal(str(s["cost_to_pay"])) if s.get("cost_to_pay") is not None else None),
+            )
+        )
+    inc_svcs.sort(key=lambda x: x[0])
+
+    exi_svcs = []
+    for s in existing_service_snapshots:
+        amt, valid = _normalize_service_amount(s.get("amount"))
+        if not valid:
+            return False
+        exi_svcs.append(
+            (
+                s["service_id"],
+                s.get("title"),
+                amt,
+                s.get("cost_to_pay"),
+            )
+        )
+    exi_svcs.sort(key=lambda x: x[0])
+
+    if inc_svcs != exi_svcs:
+        return False
+
+    # total_cost
+    incoming_total = sum_total_cost(services_raw)
+    if incoming_total != existing_record_snapshot.get("total_cost"):
+        return False
+
+    return True
+
+
 async def upsert_client(
     session: AsyncSession,
     company_id: int,
@@ -334,8 +544,8 @@ async def upsert_record(
     services = record_data.get("services") or []
     total_cost = sum_total_cost(services)
 
-    is_deleted = bool(record_data.get("deleted"))
-    if payload_event_status == "delete":
+    is_deleted = _parse_deleted_flag(record_data.get("deleted"))
+    if _normalize_event_status(payload_event_status) == "delete":
         is_deleted = True
 
     last_change_at = parse_dt(record_data.get("last_change_date"))
@@ -481,6 +691,27 @@ async def handle_event(session: AsyncSession, event: AltegioEvent) -> None:
         if client_data.get("id") is not None:
             client_pk = await upsert_client(session, int(company_id), client_data)
 
+        # When Altegio sends event_status='update' but data.deleted is truthy,
+        # reclassify for downstream job planning so the cancellation/comeback
+        # flow runs instead of the reschedule/record_updated flow.
+        _norm_event_status = _normalize_event_status(event_status)
+        deleted_flag = _parse_deleted_flag(data.get("deleted"))
+        if _norm_event_status == "update" and deleted_flag:
+            effective_status: str | None = "delete"
+        else:
+            effective_status = event_status
+
+        # No-op update detection: load existing record before upsert mutates DB.
+        _before_snap: dict[str, Any] | None = None
+        _before_svc_snaps: list[dict[str, Any]] = []
+        _raw_altegio_id = data.get("id")
+        if _norm_event_status == "update" and _raw_altegio_id is not None:
+            _before_snap, _before_svc_snaps = await _load_existing_record_snapshot(
+                session,
+                int(company_id),
+                int(_raw_altegio_id),
+            )
+
         record_pk = await upsert_record(
             session=session,
             company_id=int(company_id),
@@ -495,7 +726,7 @@ async def handle_event(session: AsyncSession, event: AltegioEvent) -> None:
         # Пропускаем события смены статуса визита (visit_attendance).
         # Альтеджио присылает update с visit_attendance != 0 когда клиент отмечен как
         # пришедший (1) или не пришедший (-1). Такие события не требуют создания job'ов.
-        if event_status == "update":
+        if effective_status == "update":
             visit_attendance = data.get("visit_attendance")
             if visit_attendance is not None and int(visit_attendance) != 0:
                 logger.info(
@@ -511,7 +742,7 @@ async def handle_event(session: AsyncSession, event: AltegioEvent) -> None:
             # Promo discount apply runs on create events only. Update webhooks are
             # intentionally skipped to avoid applying promo to bookings that existed
             # before the promo was issued.
-            normalized_status = _normalize_event_status(event_status)
+            normalized_status = _normalize_event_status(effective_status)
             if normalized_status == "create" and not record_obj.is_deleted:
                 booking_created_at_resolver = None
                 if settings.promo_apply_discount_enabled:
@@ -562,12 +793,23 @@ async def handle_event(session: AsyncSession, event: AltegioEvent) -> None:
                 )
                 return
 
+            if (
+                normalized_status == "update"
+                and _before_snap is not None
+                and _is_noop_update(_before_snap, _before_svc_snaps, data)
+            ):
+                logger.info(
+                    "Skip no-op record update: record_id=%s",
+                    record_pk,
+                )
+                return
+
             await plan_jobs_for_record_event(
                 session=session,
                 company_id=int(record_obj.company_id),
                 record_id=int(record_obj.id),
-                status=str(event_status),
-                source_cancelled_at=_resolve_source_cancelled_at(event, payload, event_status),
+                status=str(effective_status),
+                source_cancelled_at=_resolve_source_cancelled_at(event, payload, effective_status),
             )
 
         return

@@ -298,7 +298,10 @@ async def plan_jobs_for_record_event(
                 client_id=record_obj.client_id,
                 job_type=REMINDER_24H,
                 run_at=run_at_24h,
-                payload={"kind": REMINDER_24H},
+                payload={
+                    "kind": REMINDER_24H,
+                    "record_starts_at": _as_utc(starts_at).isoformat(),
+                },
             )
 
         delta = starts_at - now
@@ -312,7 +315,10 @@ async def plan_jobs_for_record_event(
                     client_id=record_obj.client_id,
                     job_type=REMINDER_2H,
                     run_at=run_at_2h,
-                    payload={"kind": REMINDER_2H},
+                    payload={
+                        "kind": REMINDER_2H,
+                        "record_starts_at": _as_utc(starts_at).isoformat(),
+                    },
                 )
 
     opted_out = bool(getattr(client_obj, "wa_opted_out", False))

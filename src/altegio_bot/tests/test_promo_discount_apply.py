@@ -681,6 +681,10 @@ async def test_update_webhook_skips_promo_apply() -> None:
         patch("altegio_bot.workers.inbox_worker.upsert_client", new=AsyncMock(return_value=100)),
         patch("altegio_bot.workers.inbox_worker.upsert_record", new=AsyncMock(return_value=200)),
         patch("altegio_bot.workers.inbox_worker.replace_record_services", new=AsyncMock()),
+        patch(
+            "altegio_bot.workers.inbox_worker._load_existing_record_snapshot",
+            new=AsyncMock(return_value=(None, [])),
+        ),
         patch("altegio_bot.workers.inbox_worker.record_has_allowed_service", new=AsyncMock(return_value=True)),
         patch("altegio_bot.workers.inbox_worker.plan_jobs_for_record_event", new=AsyncMock()),
         patch("altegio_bot.workers.inbox_worker.try_apply_promo_discount", mock_try_apply),
