@@ -150,6 +150,7 @@ _COMEBACK_3D_CANCELLED_AT_PAYLOAD_KEYS = (
 )
 
 STALE_PROCESSING_MINUTES = 10
+_REMINDER_STALE_TOLERANCE_SECONDS = 60
 
 DEFAULT_LANGUAGE_BY_COMPANY = {
     758285: "de",
@@ -462,6 +463,52 @@ def _parse_payload_datetime(value: Any) -> datetime | None:
         return _as_utc(datetime.fromisoformat(raw.replace("Z", "+00:00")))
     except ValueError:
         return None
+
+
+def _check_reminder_stale(
+    job: MessageJob,
+    record: Record | None,
+) -> tuple[bool, str | None]:
+    """Return (True, reason) when a reminder job is stale after reschedule.
+
+    New jobs carry an immutable ``record_starts_at`` in payload.  Legacy
+    jobs (without the field) fall back to ``job.run_at + offset``.
+    Both paths use a 60-second tolerance to absorb microsecond noise.
+    """
+    if record is None or record.starts_at is None:
+        return False, None
+
+    current_utc = _as_utc(record.starts_at)
+    payload = getattr(job, 'payload', None) or {}
+    raw_starts_at = payload.get('record_starts_at')
+
+    if raw_starts_at is not None:
+        payload_dt = _parse_payload_datetime(raw_starts_at)
+        if payload_dt is None:
+            return True, 'Skipped: malformed reminder record_starts_at'
+        delta = abs((payload_dt - current_utc).total_seconds())
+        if delta > _REMINDER_STALE_TOLERANCE_SECONDS:
+            return True, 'Skipped: stale reminder after record reschedule'
+        return False, None
+
+    # Legacy fallback: estimate expected starts_at from job.run_at + offset.
+    run_at = getattr(job, 'run_at', None)
+    if run_at is None:
+        return False, None
+
+    run_at_utc = _as_utc(run_at)
+    if job.job_type == 'reminder_24h':
+        expected = run_at_utc + timedelta(hours=24)
+    else:
+        expected = run_at_utc + timedelta(hours=2)
+
+    delta = abs((expected - current_utc).total_seconds())
+    if delta > _REMINDER_STALE_TOLERANCE_SECONDS:
+        return (
+            True,
+            'Skipped: stale legacy reminder after record reschedule',
+        )
+    return False, None
 
 
 def _resolve_comeback_cancelled_at(job: MessageJob, record: Record | None) -> datetime | None:
@@ -1130,6 +1177,14 @@ async def _run_job_logic(
         job.locked_at = None
         job.last_error = "Skipped: record starts_at is in the past"
         return
+
+    if job.job_type in ('reminder_24h', 'reminder_2h'):
+        _stale, _stale_err = _check_reminder_stale(job, record)
+        if _stale:
+            job.status = 'canceled'
+            job.locked_at = None
+            job.last_error = _stale_err
+            return
 
     with perf_log(
         "outbox_worker",

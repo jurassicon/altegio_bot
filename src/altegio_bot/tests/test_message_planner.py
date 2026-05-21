@@ -7,7 +7,7 @@ import pytest
 from sqlalchemy import select
 
 from altegio_bot import message_planner as planner_mod
-from altegio_bot.message_planner import plan_jobs_for_record_event
+from altegio_bot.message_planner import REMINDER_24H, REMINDER_2H, plan_jobs_for_record_event
 from altegio_bot.models.models import MessageJob, Record
 from altegio_bot.workers.outbox_worker import utcnow
 
@@ -258,3 +258,105 @@ async def test_delete_cancels_future_jobs_and_schedules_canceled_and_comeback(
         comeback = [j for j in jobs if j.job_type == "comeback_3d"][0]
         assert comeback.run_at == cancelled_at + timedelta(days=3)
         assert comeback.payload["source_cancelled_at"] == cancelled_at.isoformat()
+
+
+# ---------------------------------------------------------------------------
+# Part 1 & 2 — reminder payloads must include immutable record_starts_at
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_reminder_24h_payload_includes_record_starts_at(session_maker):
+    """reminder_24h payload must carry record_starts_at ISO string."""
+    now = utcnow()
+    starts_at = now + timedelta(hours=25)
+
+    async with session_maker() as session:
+        async with session.begin():
+            record = Record(
+                company_id=1,
+                altegio_record_id=200,
+                client_id=10,
+                staff_name="Staff",
+                starts_at=starts_at,
+            )
+            session.add(record)
+            await session.flush()
+
+            await plan_jobs_for_record_event(
+                session,
+                company_id=record.company_id,
+                record_id=record.id,
+                event_status="create",
+            )
+
+        jobs = (
+            await session.execute(
+                select(MessageJob).order_by(MessageJob.id.asc())
+            )
+        ).scalars().all()
+
+        reminder_24h = next(j for j in jobs if j.job_type == REMINDER_24H)
+        assert 'record_starts_at' in reminder_24h.payload, (
+            'reminder_24h payload must include record_starts_at'
+        )
+        # Parsed back, must be within 2 seconds of actual starts_at.
+        from datetime import datetime as _dt
+        parsed = _dt.fromisoformat(reminder_24h.payload['record_starts_at'])
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        delta = abs(
+            (parsed.astimezone(timezone.utc) - starts_at.astimezone(timezone.utc))
+            .total_seconds()
+        )
+        assert delta < 2, (
+            f'record_starts_at mismatch: {parsed!r} vs {starts_at!r}'
+        )
+
+
+@pytest.mark.asyncio
+async def test_reminder_2h_payload_includes_record_starts_at(session_maker):
+    """reminder_2h payload must carry record_starts_at ISO string."""
+    now = utcnow()
+    starts_at = now + timedelta(hours=25)
+
+    async with session_maker() as session:
+        async with session.begin():
+            record = Record(
+                company_id=1,
+                altegio_record_id=201,
+                client_id=10,
+                staff_name="Staff",
+                starts_at=starts_at,
+            )
+            session.add(record)
+            await session.flush()
+
+            await plan_jobs_for_record_event(
+                session,
+                company_id=record.company_id,
+                record_id=record.id,
+                event_status="create",
+            )
+
+        jobs = (
+            await session.execute(
+                select(MessageJob).order_by(MessageJob.id.asc())
+            )
+        ).scalars().all()
+
+        reminder_2h = next(j for j in jobs if j.job_type == REMINDER_2H)
+        assert 'record_starts_at' in reminder_2h.payload, (
+            'reminder_2h payload must include record_starts_at'
+        )
+        from datetime import datetime as _dt
+        parsed = _dt.fromisoformat(reminder_2h.payload['record_starts_at'])
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        delta = abs(
+            (parsed.astimezone(timezone.utc) - starts_at.astimezone(timezone.utc))
+            .total_seconds()
+        )
+        assert delta < 2, (
+            f'record_starts_at mismatch: {parsed!r} vs {starts_at!r}'
+        )

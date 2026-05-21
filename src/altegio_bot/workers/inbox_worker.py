@@ -271,6 +271,101 @@ def sum_total_cost(services: list[dict[str, Any]]) -> Decimal | None:
     return total if any_found else None
 
 
+async def _load_existing_record_and_services(
+    session: AsyncSession,
+    company_id: int,
+    altegio_record_id: int,
+) -> tuple[Record | None, list[RecordService]]:
+    """Load existing Record + services before upsert (for no-op detection)."""
+    res = await session.execute(
+        select(Record)
+        .where(Record.company_id == company_id)
+        .where(Record.altegio_record_id == altegio_record_id)
+    )
+    rec = res.scalar_one_or_none()
+    if rec is None:
+        return None, []
+    svcs_res = await session.execute(
+        select(RecordService).where(RecordService.record_id == rec.id)
+    )
+    return rec, list(svcs_res.scalars().all())
+
+
+def _is_noop_update(
+    existing_record: Record,
+    existing_services: list[RecordService],
+    record_data: dict[str, Any],
+) -> bool:
+    """Return True when the incoming update payload is client-visibly identical.
+
+    Conservative: returns False (process normally) if services are absent
+    from the payload or when any visible field differs.
+    """
+    services_raw = record_data.get('services')
+    if services_raw is None:
+        return False
+
+    # starts_at
+    incoming_starts_at = _parse_starts_at(record_data)
+    if (incoming_starts_at is None) != (existing_record.starts_at is None):
+        return False
+    if incoming_starts_at is not None and existing_record.starts_at is not None:
+        inc = incoming_starts_at.replace(microsecond=0)
+        exi = _as_utc(existing_record.starts_at).replace(microsecond=0)
+        if inc != exi:
+            return False
+
+    # staff_id
+    staff_data = record_data.get('staff') or {}
+    raw_staff_id = record_data.get('staff_id') or staff_data.get('id')
+    staff_id_val = int(raw_staff_id) if raw_staff_id is not None else None
+    if staff_id_val != existing_record.staff_id:
+        return False
+
+    # staff_name
+    if staff_data.get('name') != existing_record.staff_name:
+        return False
+
+    # short_link
+    if record_data.get('short_link') != existing_record.short_link:
+        return False
+
+    # services (sorted by service_id for stable comparison)
+    inc_svcs = sorted(
+        [
+            (
+                int(s['id']),
+                s.get('title'),
+                s.get('amount'),
+                (
+                    Decimal(str(s['cost_to_pay']))
+                    if s.get('cost_to_pay') is not None
+                    else None
+                ),
+            )
+            for s in services_raw
+            if s.get('id') is not None
+        ],
+        key=lambda x: x[0],
+    )
+    exi_svcs = sorted(
+        [
+            (s.service_id, s.title, s.amount, s.cost_to_pay)
+            for s in existing_services
+        ],
+        key=lambda x: x[0],
+    )
+    if inc_svcs != exi_svcs:
+        return False
+
+    # total_cost
+    incoming_total = sum_total_cost(services_raw)
+    if incoming_total != existing_record.total_cost:
+        return False
+
+    return True
+
+
 async def upsert_client(
     session: AsyncSession,
     company_id: int,
@@ -481,6 +576,22 @@ async def handle_event(session: AsyncSession, event: AltegioEvent) -> None:
         if client_data.get("id") is not None:
             client_pk = await upsert_client(session, int(company_id), client_data)
 
+        # No-op update detection: load existing record before upsert mutates DB.
+        _before_rec: Record | None = None
+        _before_svcs: list[RecordService] = []
+        _raw_altegio_id = data.get("id")
+        if (
+            _normalize_event_status(event_status) == "update"
+            and _raw_altegio_id is not None
+        ):
+            _before_rec, _before_svcs = (
+                await _load_existing_record_and_services(
+                    session,
+                    int(company_id),
+                    int(_raw_altegio_id),
+                )
+            )
+
         record_pk = await upsert_record(
             session=session,
             company_id=int(company_id),
@@ -559,6 +670,17 @@ async def handle_event(session: AsyncSession, event: AltegioEvent) -> None:
                     "Ignore record_id=%s company_id=%s (not lashes services)",
                     record_obj.id,
                     record_obj.company_id,
+                )
+                return
+
+            if (
+                normalized_status == "update"
+                and _before_rec is not None
+                and _is_noop_update(_before_rec, _before_svcs, data)
+            ):
+                logger.info(
+                    "Skip no-op record update: record_id=%s",
+                    record_pk,
                 )
                 return
 
