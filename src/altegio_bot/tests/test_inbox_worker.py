@@ -13,10 +13,12 @@ from altegio_bot.settings import settings
 from altegio_bot.workers.inbox_worker import (
     _is_noop_update,
     _normalize_phone,
+    _parse_deleted_flag,
     _parse_starts_at,
     handle_event,
     parse_dt,
     resolve_booking_created_at_for_record_create,
+    upsert_record,
 )
 
 
@@ -219,6 +221,47 @@ class TestNormalizePhone:
 
     def test_whitespace_only_returns_none(self):
         assert _normalize_phone("   ") is None
+
+
+class TestParseDeletedFlag:
+    """Tests for safe parsing of Altegio's record deleted flag."""
+
+    @pytest.mark.parametrize(
+        "value",
+        [True, 1, "1", "true", "True", "TRUE", "yes", "y", "deleted"],
+    )
+    def test_true_values(self, value: object) -> None:
+        assert _parse_deleted_flag(value) is True
+
+    @pytest.mark.parametrize(
+        "value",
+        [None, False, 0, "0", "false", "False", "FALSE", "no", "n", "", "   "],
+    )
+    def test_false_values(self, caplog: pytest.LogCaptureFixture, value: object) -> None:
+        caplog.set_level("WARNING", logger="inbox_worker")
+
+        assert _parse_deleted_flag(value) is False
+        assert "record deleted flag has unknown value:" not in caplog.text
+
+    @pytest.mark.parametrize("value", ["unexpected", [], {}])
+    def test_unknown_values_return_false_and_warn(
+        self,
+        caplog: pytest.LogCaptureFixture,
+        value: object,
+    ) -> None:
+        caplog.set_level("WARNING", logger="inbox_worker")
+
+        assert _parse_deleted_flag(value) is False
+        assert "record deleted flag has unknown value:" in caplog.text
+
+    def test_object_value_returns_false_and_warn(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        caplog.set_level("WARNING", logger="inbox_worker")
+
+        assert _parse_deleted_flag(object()) is False
+        assert "record deleted flag has unknown value:" in caplog.text
 
 
 class TestBookingCreatedAtResolver:
@@ -1044,6 +1087,18 @@ class TestIsNoopUpdate:
         data["deleted"] = True
         assert not _is_noop_update(self._make_rec(), [self._make_svc()], data)
 
+    @pytest.mark.parametrize("value", ["true", 1])
+    def test_incoming_deleted_true_like_not_noop(self, value: object) -> None:
+        data = self._base_data()
+        data["deleted"] = value
+        assert not _is_noop_update(self._make_rec(), [self._make_svc()], data)
+
+    @pytest.mark.parametrize("value", ["false", "0", False, 0])
+    def test_incoming_deleted_false_like_is_noop(self, value: object) -> None:
+        data = self._base_data()
+        data["deleted"] = value
+        assert _is_noop_update(self._make_rec(), [self._make_svc()], data)
+
     def test_existing_is_deleted_not_noop(self) -> None:
         rec = self._make_rec(is_deleted=True)
         assert not _is_noop_update(rec, [self._make_svc()], self._base_data())
@@ -1127,6 +1182,77 @@ def _it_make_event(
         data.update(data_overrides)
     event.payload = {"data": data}
     return event
+
+
+def _it_to_date_str(starts_at: datetime) -> str:
+    return starts_at.astimezone(ZoneInfo("Europe/Belgrade")).strftime("%Y-%m-%d %H:%M:%S")
+
+
+async def _it_seed_record_with_jobs(session_maker, starts_at: datetime) -> int:
+    import altegio_bot.message_planner as planner_mod
+    from altegio_bot.message_planner import plan_jobs_for_record_event as real_plan_jobs
+    from altegio_bot.models.models import Record, RecordService
+
+    record_id: int = -1
+    async with session_maker() as session:
+        async with session.begin():
+            record = Record(
+                company_id=_IT_COMPANY_ID,
+                altegio_record_id=_IT_ALTEGIO_RECORD_ID,
+                client_id=10,
+                altegio_client_id=_IT_ALTEGIO_CLIENT_ID,
+                staff_id=_IT_STAFF_ID,
+                staff_name=_IT_STAFF_NAME,
+                short_link=_IT_SHORT_LINK,
+                starts_at=starts_at,
+                is_deleted=False,
+                total_cost=Decimal("80"),
+                raw={},
+            )
+            session.add(record)
+            await session.flush()
+            record_id = record.id
+            session.add(
+                RecordService(
+                    record_id=record_id,
+                    service_id=_IT_SERVICE_ID,
+                    title="Wimpernverlängerung",
+                    amount=1,
+                    cost_to_pay=Decimal("80"),
+                    raw={},
+                )
+            )
+            with patch.object(
+                planner_mod,
+                "count_attended_client_visits",
+                AsyncMock(return_value=1),
+            ):
+                await real_plan_jobs(
+                    session,
+                    company_id=_IT_COMPANY_ID,
+                    record_id=record_id,
+                    event_status="create",
+                )
+    return record_id
+
+
+async def _it_get_record_and_jobs(session_maker, record_id: int):
+    from sqlalchemy import select as sa_select
+
+    from altegio_bot.models.models import MessageJob, Record
+
+    async with session_maker() as session:
+        record = await session.get(Record, record_id)
+        jobs = (
+            (
+                await session.execute(
+                    sa_select(MessageJob).where(MessageJob.record_id == record_id).order_by(MessageJob.id.asc())
+                )
+            )
+            .scalars()
+            .all()
+        )
+    return record, jobs
 
 
 @pytest.mark.asyncio
@@ -1522,3 +1648,168 @@ async def test_integration_deleted_true_routes_as_cancellation(session_maker) ->
     assert "comeback_3d" in queued_types, f"comeback_3d must be queued for deleted record. Queued: {queued_types}"
     # Previous system jobs (created by the "create" event above) must be canceled
     assert len(canceled_types) > 0, f"Old queued jobs must be canceled by delete flow. Canceled: {canceled_types}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("deleted_value", ["true", 1])
+async def test_integration_deleted_true_like_routes_as_cancellation(
+    session_maker,
+    deleted_value: object,
+) -> None:
+    import altegio_bot.message_planner as planner_mod
+
+    now = datetime.now(timezone.utc)
+    starts_at = (now + timedelta(hours=25)).replace(microsecond=0)
+    record_id = await _it_seed_record_with_jobs(session_maker, starts_at)
+
+    event = _it_make_event(
+        "update",
+        _it_to_date_str(starts_at),
+        data_overrides={"deleted": deleted_value},
+    )
+    with (
+        patch.object(
+            planner_mod,
+            "count_attended_client_visits",
+            AsyncMock(return_value=1),
+        ),
+        patch(
+            "altegio_bot.workers.inbox_worker.record_has_allowed_service",
+            AsyncMock(return_value=True),
+        ),
+        patch(
+            "altegio_bot.workers.inbox_worker.should_suppress_promo_origin_record_update",
+            AsyncMock(return_value=False),
+        ),
+    ):
+        async with session_maker() as session:
+            async with session.begin():
+                await handle_event(session, event)
+
+    record, jobs = await _it_get_record_and_jobs(session_maker, record_id)
+    assert record is not None
+    queued_types = {j.job_type for j in jobs if j.status == "queued"}
+
+    assert record.is_deleted is True
+    assert "record_canceled" in queued_types
+    assert "record_updated" not in queued_types
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("deleted_value", ["false", "0", False, 0])
+async def test_integration_deleted_false_like_remains_noop_update(
+    session_maker,
+    deleted_value: object,
+) -> None:
+    import altegio_bot.message_planner as planner_mod
+
+    now = datetime.now(timezone.utc)
+    starts_at = (now + timedelta(hours=25)).replace(microsecond=0)
+    record_id = await _it_seed_record_with_jobs(session_maker, starts_at)
+    _, initial_jobs = await _it_get_record_and_jobs(session_maker, record_id)
+    initial_queued = {j.job_type for j in initial_jobs if j.status == "queued"}
+
+    event = _it_make_event(
+        "update",
+        _it_to_date_str(starts_at),
+        data_overrides={"deleted": deleted_value},
+    )
+    with (
+        patch.object(
+            planner_mod,
+            "count_attended_client_visits",
+            AsyncMock(return_value=1),
+        ),
+        patch(
+            "altegio_bot.workers.inbox_worker.record_has_allowed_service",
+            AsyncMock(return_value=True),
+        ),
+        patch(
+            "altegio_bot.workers.inbox_worker.should_suppress_promo_origin_record_update",
+            AsyncMock(return_value=False),
+        ),
+    ):
+        async with session_maker() as session:
+            async with session.begin():
+                await handle_event(session, event)
+
+    record, final_jobs = await _it_get_record_and_jobs(session_maker, record_id)
+    assert record is not None
+    final_queued = {j.job_type for j in final_jobs if j.status == "queued"}
+    canceled = [j for j in final_jobs if j.status == "canceled"]
+
+    assert record.is_deleted is False
+    assert final_queued == initial_queued
+    assert canceled == []
+    assert "record_canceled" not in final_queued
+    assert "record_updated" not in final_queued
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("deleted_value", "expected"),
+    [
+        ("false", False),
+        ("0", False),
+        ("true", True),
+        (1, True),
+    ],
+)
+async def test_upsert_record_stores_is_deleted_from_safe_parser(
+    session_maker,
+    deleted_value: object,
+    expected: bool,
+) -> None:
+    from altegio_bot.models.models import Record
+
+    record_data = {
+        "id": _IT_ALTEGIO_RECORD_ID,
+        "client": {"id": _IT_ALTEGIO_CLIENT_ID},
+        "date": _it_to_date_str(datetime.now(timezone.utc) + timedelta(hours=25)),
+        "deleted": deleted_value,
+    }
+
+    async with session_maker() as session:
+        async with session.begin():
+            record_id = await upsert_record(
+                session=session,
+                company_id=_IT_COMPANY_ID,
+                payload_event_status="update",
+                record_data=record_data,
+                client_pk=10,
+            )
+            record = await session.get(Record, record_id)
+
+    assert record is not None
+    assert record.is_deleted is expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("deleted_value", ["false", None])
+async def test_upsert_record_delete_status_forces_is_deleted_true(
+    session_maker,
+    deleted_value: object,
+) -> None:
+    from altegio_bot.models.models import Record
+
+    record_data = {
+        "id": _IT_ALTEGIO_RECORD_ID,
+        "client": {"id": _IT_ALTEGIO_CLIENT_ID},
+        "date": _it_to_date_str(datetime.now(timezone.utc) + timedelta(hours=25)),
+    }
+    if deleted_value is not None:
+        record_data["deleted"] = deleted_value
+
+    async with session_maker() as session:
+        async with session.begin():
+            record_id = await upsert_record(
+                session=session,
+                company_id=_IT_COMPANY_ID,
+                payload_event_status="delete",
+                record_data=record_data,
+                client_pk=10,
+            )
+            record = await session.get(Record, record_id)
+
+    assert record is not None
+    assert record.is_deleted is True

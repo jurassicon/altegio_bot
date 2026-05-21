@@ -88,6 +88,32 @@ def _normalize_event_status(value: str | None) -> str | None:
     return None
 
 
+def _parse_deleted_flag(value: Any) -> bool:
+    """Parse Altegio's deleted flag without treating arbitrary values as true."""
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        if value == 1:
+            return True
+        if value == 0:
+            return False
+        logger.warning("record deleted flag has unknown value: %r", value)
+        return False
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in ("1", "true", "yes", "y", "deleted"):
+            return True
+        if normalized in ("", "0", "false", "no", "n"):
+            return False
+        logger.warning("record deleted flag has unknown value: %r", value)
+        return False
+
+    logger.warning("record deleted flag has unknown value: %r", value)
+    return False
+
+
 def _as_utc(dt: datetime) -> datetime:
     if dt.tzinfo is None:
         return dt.replace(tzinfo=timezone.utc)
@@ -373,7 +399,7 @@ def _is_noop_update(
         return False
 
     # deletion state
-    if bool(record_data.get("deleted")):
+    if _parse_deleted_flag(record_data.get("deleted")):
         return False
     if bool(existing_record_snapshot.get("is_deleted")):
         return False
@@ -518,8 +544,8 @@ async def upsert_record(
     services = record_data.get("services") or []
     total_cost = sum_total_cost(services)
 
-    is_deleted = bool(record_data.get("deleted"))
-    if payload_event_status == "delete":
+    is_deleted = _parse_deleted_flag(record_data.get("deleted"))
+    if _normalize_event_status(payload_event_status) == "delete":
         is_deleted = True
 
     last_change_at = parse_dt(record_data.get("last_change_date"))
@@ -669,9 +695,11 @@ async def handle_event(session: AsyncSession, event: AltegioEvent) -> None:
         # reclassify for downstream job planning so the cancellation/comeback
         # flow runs instead of the reschedule/record_updated flow.
         _norm_event_status = _normalize_event_status(event_status)
-        effective_status: str | None = (
-            "delete" if _norm_event_status == "update" and bool(data.get("deleted")) else event_status
-        )
+        deleted_flag = _parse_deleted_flag(data.get("deleted"))
+        if _norm_event_status == "update" and deleted_flag:
+            effective_status: str | None = "delete"
+        else:
+            effective_status = event_status
 
         # No-op update detection: load existing record before upsert mutates DB.
         _before_snap: dict[str, Any] | None = None
