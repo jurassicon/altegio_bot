@@ -271,43 +271,128 @@ def sum_total_cost(services: list[dict[str, Any]]) -> Decimal | None:
     return total if any_found else None
 
 
-async def _load_existing_record_and_services(
+def _normalize_service_amount(value: Any) -> tuple[int | None, bool]:
+    """Return (normalized_int, True) for valid amounts, (None, False) if malformed.
+
+    Accepts None, int, or numeric strings ('1', '01', '1.0').
+    Returns (None, False) for non-numeric strings, lists, dicts, etc.
+    """
+    if value is None:
+        return None, True
+    if isinstance(value, bool):
+        return None, False
+    if isinstance(value, int):
+        return value, True
+    if isinstance(value, str):
+        v = value.strip()
+        if not v:
+            return None, True
+        try:
+            d = Decimal(v)
+            i = int(d)
+            if d == Decimal(i):
+                return i, True
+            return None, False
+        except Exception:
+            return None, False
+    return None, False
+
+
+async def _load_existing_record_snapshot(
     session: AsyncSession,
     company_id: int,
     altegio_record_id: int,
-) -> tuple[Record | None, list[RecordService]]:
-    """Load existing Record + services before upsert (for no-op detection)."""
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    """Return pre-upsert snapshot as plain dicts — no ORM objects in identity map.
+
+    Using explicit column selects avoids loading a Record ORM instance before
+    the Core INSERT … ON CONFLICT statement, which would leave a stale entry
+    in SQLAlchemy's identity map and cause session.get(Record, pk) to return
+    old data after the upsert.
+    """
     res = await session.execute(
-        select(Record).where(Record.company_id == company_id).where(Record.altegio_record_id == altegio_record_id)
+        select(
+            Record.id,
+            Record.altegio_record_id,
+            Record.altegio_client_id,
+            Record.starts_at,
+            Record.staff_id,
+            Record.staff_name,
+            Record.short_link,
+            Record.total_cost,
+            Record.is_deleted,
+        )
+        .where(Record.company_id == company_id)
+        .where(Record.altegio_record_id == altegio_record_id)
     )
-    rec = res.scalar_one_or_none()
-    if rec is None:
+    row = res.one_or_none()
+    if row is None:
         return None, []
-    svcs_res = await session.execute(select(RecordService).where(RecordService.record_id == rec.id))
-    return rec, list(svcs_res.scalars().all())
+    rec_snap: dict[str, Any] = {
+        "id": row.id,
+        "altegio_record_id": row.altegio_record_id,
+        "altegio_client_id": row.altegio_client_id,
+        "starts_at": row.starts_at,
+        "staff_id": row.staff_id,
+        "staff_name": row.staff_name,
+        "short_link": row.short_link,
+        "total_cost": row.total_cost,
+        "is_deleted": row.is_deleted,
+    }
+    svcs_res = await session.execute(
+        select(
+            RecordService.service_id,
+            RecordService.title,
+            RecordService.amount,
+            RecordService.cost_to_pay,
+        ).where(RecordService.record_id == row.id)
+    )
+    return rec_snap, [
+        {
+            "service_id": r.service_id,
+            "title": r.title,
+            "amount": r.amount,
+            "cost_to_pay": r.cost_to_pay,
+        }
+        for r in svcs_res.all()
+    ]
 
 
 def _is_noop_update(
-    existing_record: Record,
-    existing_services: list[RecordService],
+    existing_record_snapshot: dict[str, Any],
+    existing_service_snapshots: list[dict[str, Any]],
     record_data: dict[str, Any],
 ) -> bool:
     """Return True when the incoming update payload is client-visibly identical.
 
-    Conservative: returns False (process normally) if services are absent
-    from the payload or when any visible field differs.
+    Conservative: returns False (process normally) when services are absent,
+    when client/deletion state changes, or when any visible field differs.
     """
     services_raw = record_data.get("services")
     if services_raw is None:
         return False
 
+    # deletion state
+    if bool(record_data.get("deleted")):
+        return False
+    if bool(existing_record_snapshot.get("is_deleted")):
+        return False
+
+    # altegio_client_id
+    client_data = record_data.get("client") or {}
+    raw_cid = client_data.get("id")
+    incoming_cid = int(raw_cid) if raw_cid is not None else None
+    if incoming_cid != existing_record_snapshot.get("altegio_client_id"):
+        return False
+
     # starts_at
     incoming_starts_at = _parse_starts_at(record_data)
-    if (incoming_starts_at is None) != (existing_record.starts_at is None):
+    existing_starts_at = existing_record_snapshot.get("starts_at")
+    if (incoming_starts_at is None) != (existing_starts_at is None):
         return False
-    if incoming_starts_at is not None and existing_record.starts_at is not None:
+    if incoming_starts_at is not None and existing_starts_at is not None:
         inc = incoming_starts_at.replace(microsecond=0)
-        exi = _as_utc(existing_record.starts_at).replace(microsecond=0)
+        exi = _as_utc(existing_starts_at).replace(microsecond=0)
         if inc != exi:
             return False
 
@@ -315,41 +400,56 @@ def _is_noop_update(
     staff_data = record_data.get("staff") or {}
     raw_staff_id = record_data.get("staff_id") or staff_data.get("id")
     staff_id_val = int(raw_staff_id) if raw_staff_id is not None else None
-    if staff_id_val != existing_record.staff_id:
+    if staff_id_val != existing_record_snapshot.get("staff_id"):
         return False
 
     # staff_name
-    if staff_data.get("name") != existing_record.staff_name:
+    if staff_data.get("name") != existing_record_snapshot.get("staff_name"):
         return False
 
     # short_link
-    if record_data.get("short_link") != existing_record.short_link:
+    if record_data.get("short_link") != existing_record_snapshot.get("short_link"):
         return False
 
     # services (sorted by service_id for stable comparison)
-    inc_svcs = sorted(
-        [
+    inc_svcs = []
+    for s in services_raw:
+        if s.get("id") is None:
+            continue
+        amt, valid = _normalize_service_amount(s.get("amount"))
+        if not valid:
+            return False
+        inc_svcs.append(
             (
                 int(s["id"]),
                 s.get("title"),
-                s.get("amount"),
+                amt,
                 (Decimal(str(s["cost_to_pay"])) if s.get("cost_to_pay") is not None else None),
             )
-            for s in services_raw
-            if s.get("id") is not None
-        ],
-        key=lambda x: x[0],
-    )
-    exi_svcs = sorted(
-        [(s.service_id, s.title, s.amount, s.cost_to_pay) for s in existing_services],
-        key=lambda x: x[0],
-    )
+        )
+    inc_svcs.sort(key=lambda x: x[0])
+
+    exi_svcs = []
+    for s in existing_service_snapshots:
+        amt, valid = _normalize_service_amount(s.get("amount"))
+        if not valid:
+            return False
+        exi_svcs.append(
+            (
+                s["service_id"],
+                s.get("title"),
+                amt,
+                s.get("cost_to_pay"),
+            )
+        )
+    exi_svcs.sort(key=lambda x: x[0])
+
     if inc_svcs != exi_svcs:
         return False
 
     # total_cost
     incoming_total = sum_total_cost(services_raw)
-    if incoming_total != existing_record.total_cost:
+    if incoming_total != existing_record_snapshot.get("total_cost"):
         return False
 
     return True
@@ -566,11 +666,11 @@ async def handle_event(session: AsyncSession, event: AltegioEvent) -> None:
             client_pk = await upsert_client(session, int(company_id), client_data)
 
         # No-op update detection: load existing record before upsert mutates DB.
-        _before_rec: Record | None = None
-        _before_svcs: list[RecordService] = []
+        _before_snap: dict[str, Any] | None = None
+        _before_svc_snaps: list[dict[str, Any]] = []
         _raw_altegio_id = data.get("id")
         if _normalize_event_status(event_status) == "update" and _raw_altegio_id is not None:
-            _before_rec, _before_svcs = await _load_existing_record_and_services(
+            _before_snap, _before_svc_snaps = await _load_existing_record_snapshot(
                 session,
                 int(company_id),
                 int(_raw_altegio_id),
@@ -659,8 +759,8 @@ async def handle_event(session: AsyncSession, event: AltegioEvent) -> None:
 
             if (
                 normalized_status == "update"
-                and _before_rec is not None
-                and _is_noop_update(_before_rec, _before_svcs, data)
+                and _before_snap is not None
+                and _is_noop_update(_before_snap, _before_svc_snaps, data)
             ):
                 logger.info(
                     "Skip no-op record update: record_id=%s",

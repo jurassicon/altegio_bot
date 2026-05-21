@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
 
@@ -338,7 +339,7 @@ class TestHandleEventVisitAttendance:
             patch("altegio_bot.workers.inbox_worker.upsert_record", new=AsyncMock(return_value=99)),
             patch("altegio_bot.workers.inbox_worker.replace_record_services", new=AsyncMock()),
             patch(
-                "altegio_bot.workers.inbox_worker._load_existing_record_and_services",
+                "altegio_bot.workers.inbox_worker._load_existing_record_snapshot",
                 new=AsyncMock(return_value=(None, [])),
             ),
             patch("altegio_bot.workers.inbox_worker.record_has_allowed_service", new=AsyncMock(return_value=True)),
@@ -402,7 +403,7 @@ class TestHandleEventVisitAttendance:
             patch("altegio_bot.workers.inbox_worker.upsert_record", new=AsyncMock(return_value=99)),
             patch("altegio_bot.workers.inbox_worker.replace_record_services", new=AsyncMock()),
             patch(
-                "altegio_bot.workers.inbox_worker._load_existing_record_and_services",
+                "altegio_bot.workers.inbox_worker._load_existing_record_snapshot",
                 new=AsyncMock(return_value=(None, [])),
             ),
             patch("altegio_bot.workers.inbox_worker.record_has_allowed_service", new=AsyncMock(return_value=True)),
@@ -610,7 +611,7 @@ async def test_record_updated_simple_promo_marker_suppresses_plan_jobs() -> None
         patch("altegio_bot.workers.inbox_worker.upsert_record", new=AsyncMock(return_value=99)),
         patch("altegio_bot.workers.inbox_worker.replace_record_services", new=AsyncMock()),
         patch(
-            "altegio_bot.workers.inbox_worker._load_existing_record_and_services",
+            "altegio_bot.workers.inbox_worker._load_existing_record_snapshot",
             new=AsyncMock(return_value=(None, [])),
         ),
         patch("altegio_bot.workers.inbox_worker.plan_jobs_for_record_event", mock_plan),
@@ -641,7 +642,7 @@ async def test_record_updated_manual_promo_marker_suppresses_plan_jobs() -> None
         patch("altegio_bot.workers.inbox_worker.upsert_record", new=AsyncMock(return_value=99)),
         patch("altegio_bot.workers.inbox_worker.replace_record_services", new=AsyncMock()),
         patch(
-            "altegio_bot.workers.inbox_worker._load_existing_record_and_services",
+            "altegio_bot.workers.inbox_worker._load_existing_record_snapshot",
             new=AsyncMock(return_value=(None, [])),
         ),
         patch("altegio_bot.workers.inbox_worker.plan_jobs_for_record_event", mock_plan),
@@ -672,7 +673,7 @@ async def test_record_updated_no_promo_marker_calls_plan_jobs() -> None:
         patch("altegio_bot.workers.inbox_worker.upsert_record", new=AsyncMock(return_value=99)),
         patch("altegio_bot.workers.inbox_worker.replace_record_services", new=AsyncMock()),
         patch(
-            "altegio_bot.workers.inbox_worker._load_existing_record_and_services",
+            "altegio_bot.workers.inbox_worker._load_existing_record_snapshot",
             new=AsyncMock(return_value=(None, [])),
         ),
         patch(
@@ -739,37 +740,33 @@ def _make_noop_event(data_overrides: dict | None = None) -> MagicMock:
     return event
 
 
-def _make_existing_record() -> MagicMock:
+def _make_existing_record() -> dict:
+    from datetime import datetime as _dt
     from zoneinfo import ZoneInfo
 
     TZ = ZoneInfo("Europe/Belgrade")
-    from datetime import datetime as _dt
-
     naive = _dt(2026, 6, 10, 10, 30, 0)
     starts_at_utc = naive.replace(tzinfo=TZ).astimezone(timezone.utc)
+    return {
+        "id": 999,
+        "altegio_record_id": _NP_RECORD_ID,
+        "altegio_client_id": _NP_CLIENT_ID,
+        "starts_at": starts_at_utc,
+        "staff_id": _NP_STAFF_ID,
+        "staff_name": _NP_STAFF_NAME,
+        "short_link": _NP_SHORT_LINK,
+        "total_cost": Decimal("80"),
+        "is_deleted": False,
+    }
 
-    rec = MagicMock()
-    rec.id = 999
-    rec.company_id = _NP_COMPANY
-    rec.altegio_record_id = _NP_RECORD_ID
-    rec.starts_at = starts_at_utc
-    rec.staff_id = _NP_STAFF_ID
-    rec.staff_name = _NP_STAFF_NAME
-    rec.short_link = _NP_SHORT_LINK
-    rec.total_cost = None  # sum_total_cost will compute from services
-    rec.is_deleted = False
-    return rec
 
-
-def _make_existing_service() -> MagicMock:
-    from decimal import Decimal
-
-    svc = MagicMock()
-    svc.service_id = _NP_SERVICE_ID
-    svc.title = "Wimpernverlängerung"
-    svc.amount = 1
-    svc.cost_to_pay = Decimal("80")
-    return svc
+def _make_existing_service() -> dict:
+    return {
+        "service_id": _NP_SERVICE_ID,
+        "title": "Wimpernverlängerung",
+        "amount": 1,
+        "cost_to_pay": Decimal("80"),
+    }
 
 
 async def _noop_handle(
@@ -808,7 +805,7 @@ async def _noop_handle(
             new=AsyncMock(),
         ),
         patch(
-            "altegio_bot.workers.inbox_worker._load_existing_record_and_services",
+            "altegio_bot.workers.inbox_worker._load_existing_record_snapshot",
             mock_load,
         ),
         patch(
@@ -834,10 +831,6 @@ async def test_noop_update_same_snapshot_skips_plan_jobs() -> None:
     """No-op update: identical visible snapshot → plan_jobs NOT called."""
     event = _make_noop_event()
     existing_rec = _make_existing_record()
-    # total_cost must match sum_total_cost(services)
-    from decimal import Decimal
-
-    existing_rec.total_cost = Decimal("80")
     existing_svcs = [_make_existing_service()]
 
     plan_called, _ = await _noop_handle(event, existing_rec, existing_svcs)
@@ -847,12 +840,8 @@ async def test_noop_update_same_snapshot_skips_plan_jobs() -> None:
 @pytest.mark.asyncio
 async def test_noop_update_date_change_calls_plan_jobs() -> None:
     """Real starts_at change → plan_jobs IS called."""
-    # Change the date to a different time
     event = _make_noop_event({"date": "2026-06-11 10:30:00"})  # 1 day later
     existing_rec = _make_existing_record()
-    from decimal import Decimal
-
-    existing_rec.total_cost = Decimal("80")
     existing_svcs = [_make_existing_service()]
 
     plan_called, _ = await _noop_handle(event, existing_rec, existing_svcs)
@@ -869,9 +858,6 @@ async def test_noop_update_staff_change_calls_plan_jobs() -> None:
         }
     )
     existing_rec = _make_existing_record()
-    from decimal import Decimal
-
-    existing_rec.total_cost = Decimal("80")
     existing_svcs = [_make_existing_service()]
 
     plan_called, _ = await _noop_handle(event, existing_rec, existing_svcs)
@@ -894,9 +880,6 @@ async def test_noop_update_services_change_calls_plan_jobs() -> None:
         }
     )
     existing_rec = _make_existing_record()
-    from decimal import Decimal
-
-    existing_rec.total_cost = Decimal("80")
     existing_svcs = [_make_existing_service()]
 
     plan_called, _ = await _noop_handle(event, existing_rec, existing_svcs)
@@ -919,9 +902,6 @@ async def test_noop_update_total_cost_change_calls_plan_jobs() -> None:
         }
     )
     existing_rec = _make_existing_record()
-    from decimal import Decimal
-
-    existing_rec.total_cost = Decimal("80")
     existing_svcs = [_make_existing_service()]
 
     plan_called, _ = await _noop_handle(event, existing_rec, existing_svcs)
@@ -932,7 +912,6 @@ async def test_noop_update_total_cost_change_calls_plan_jobs() -> None:
 async def test_noop_update_missing_existing_record_processes_normally() -> None:
     """No existing record on update → process normally, not a no-op."""
     event = _make_noop_event()
-    # existing_rec=None means record was not in DB before this event
     plan_called, _ = await _noop_handle(event, None, [])
     assert plan_called, "must process normally when no existing record"
 
@@ -942,9 +921,6 @@ async def test_visit_attendance_update_still_skipped() -> None:
     """visit_attendance-only skip is preserved regardless of no-op guard."""
     event = _make_noop_event({"visit_attendance": 1})
     existing_rec = _make_existing_record()
-    from decimal import Decimal
-
-    existing_rec.total_cost = Decimal("80")
     existing_svcs = [_make_existing_service()]
 
     plan_called, _ = await _noop_handle(event, existing_rec, existing_svcs)
@@ -959,40 +935,39 @@ async def test_visit_attendance_update_still_skipped() -> None:
 class TestIsNoopUpdate:
     """Unit tests for _is_noop_update helper."""
 
-    def _make_rec(self, **overrides: object) -> MagicMock:
+    def _make_rec(self, **overrides: object) -> dict:
         from datetime import datetime as _dt
-        from decimal import Decimal
         from zoneinfo import ZoneInfo
 
         TZ = ZoneInfo("Europe/Belgrade")
         naive = _dt(2026, 6, 10, 10, 30, 0)
         starts_at_utc = naive.replace(tzinfo=TZ).astimezone(timezone.utc)
-
-        rec = MagicMock()
-        rec.starts_at = starts_at_utc
-        rec.staff_id = _NP_STAFF_ID
-        rec.staff_name = _NP_STAFF_NAME
-        rec.short_link = _NP_SHORT_LINK
-        rec.total_cost = Decimal("80")
-        for k, v in overrides.items():
-            setattr(rec, k, v)
+        rec: dict = {
+            "altegio_client_id": _NP_CLIENT_ID,
+            "starts_at": starts_at_utc,
+            "staff_id": _NP_STAFF_ID,
+            "staff_name": _NP_STAFF_NAME,
+            "short_link": _NP_SHORT_LINK,
+            "total_cost": Decimal("80"),
+            "is_deleted": False,
+        }
+        rec.update(overrides)
         return rec
 
-    def _make_svc(self, **overrides: object) -> MagicMock:
-        from decimal import Decimal
-
-        svc = MagicMock()
-        svc.service_id = _NP_SERVICE_ID
-        svc.title = "Wimpernverlängerung"
-        svc.amount = 1
-        svc.cost_to_pay = Decimal("80")
-        for k, v in overrides.items():
-            setattr(svc, k, v)
+    def _make_svc(self, **overrides: object) -> dict:
+        svc: dict = {
+            "service_id": _NP_SERVICE_ID,
+            "title": "Wimpernverlängerung",
+            "amount": 1,
+            "cost_to_pay": Decimal("80"),
+        }
+        svc.update(overrides)
         return svc
 
     def _base_data(self) -> dict:
         return {
             "id": _NP_RECORD_ID,
+            "client": {"id": _NP_CLIENT_ID},
             "staff_id": _NP_STAFF_ID,
             "staff": {"id": _NP_STAFF_ID, "name": _NP_STAFF_NAME},
             "short_link": _NP_SHORT_LINK,
@@ -1056,3 +1031,414 @@ class TestIsNoopUpdate:
         data = self._base_data()
         data["services"] = []
         assert _is_noop_update(rec, [], data)
+
+    # --- Part 3: client / deletion checks ---
+
+    def test_client_change_not_noop(self) -> None:
+        data = self._base_data()
+        data["client"] = {"id": 9999}  # different altegio_client_id
+        assert not _is_noop_update(self._make_rec(), [self._make_svc()], data)
+
+    def test_incoming_deleted_true_not_noop(self) -> None:
+        data = self._base_data()
+        data["deleted"] = True
+        assert not _is_noop_update(self._make_rec(), [self._make_svc()], data)
+
+    def test_existing_is_deleted_not_noop(self) -> None:
+        rec = self._make_rec(is_deleted=True)
+        assert not _is_noop_update(rec, [self._make_svc()], self._base_data())
+
+    # --- Part 4: amount normalization ---
+
+    def test_amount_string_one_equals_int_one_is_noop(self) -> None:
+        """amount='1' in incoming, amount=1 in DB → no-op."""
+        data = self._base_data()
+        data["services"][0]["amount"] = "1"
+        assert _is_noop_update(self._make_rec(), [self._make_svc()], data)
+
+    def test_amount_string_zero_padded_equals_int_is_noop(self) -> None:
+        """amount='01' → normalized to 1 → no-op when DB has 1."""
+        data = self._base_data()
+        data["services"][0]["amount"] = "01"
+        assert _is_noop_update(self._make_rec(), [self._make_svc()], data)
+
+    def test_malformed_amount_incoming_not_noop(self) -> None:
+        """amount='abc' in incoming → _is_noop_update returns False, no crash."""
+        data = self._base_data()
+        data["services"][0]["amount"] = "abc"
+        assert not _is_noop_update(self._make_rec(), [self._make_svc()], data)
+
+    def test_malformed_amount_list_not_noop(self) -> None:
+        """amount=[1] (list) in incoming → False, no crash."""
+        data = self._base_data()
+        data["services"][0]["amount"] = [1]
+        assert not _is_noop_update(self._make_rec(), [self._make_svc()], data)
+
+
+# =============================================================================
+# Part 6 — Integration tests (real DB session)
+# =============================================================================
+
+_IT_COMPANY_ID = 1
+_IT_ALTEGIO_RECORD_ID = 600001
+_IT_ALTEGIO_CLIENT_ID = 10  # pre-seeded by conftest (company_id=1, altegio_client_id=10)
+_IT_ALTEGIO_CLIENT_ID_2 = 1  # second pre-seeded client (company_id=1, altegio_client_id=1)
+_IT_STAFF_ID = 5
+_IT_STAFF_NAME = "Tanja"
+_IT_SHORT_LINK = "https://alteg.io/it"
+_IT_SERVICE_ID = 9001
+
+
+def _it_make_event(
+    event_status: str,
+    date_str: str,
+    altegio_client_id: int = _IT_ALTEGIO_CLIENT_ID,
+    data_overrides: dict | None = None,
+) -> MagicMock:
+    event = MagicMock()
+    event.id = 900
+    event.company_id = _IT_COMPANY_ID
+    event.resource = "record"
+    event.event_status = event_status
+    event.resource_id = _IT_ALTEGIO_RECORD_ID
+    event.received_at = datetime(2026, 6, 9, 12, 0, tzinfo=timezone.utc)
+    data: dict = {
+        "id": _IT_ALTEGIO_RECORD_ID,
+        "client": {
+            "id": altegio_client_id,
+            "display_name": "It Client",
+            "phone": "+491234567890",
+        },
+        "staff_id": _IT_STAFF_ID,
+        "staff": {"id": _IT_STAFF_ID, "name": _IT_STAFF_NAME},
+        "short_link": _IT_SHORT_LINK,
+        "date": date_str,
+        "services": [
+            {
+                "id": _IT_SERVICE_ID,
+                "title": "Wimpernverlängerung",
+                "amount": 1,
+                "cost_to_pay": 80,
+            }
+        ],
+        "visit_attendance": 0,
+    }
+    if data_overrides:
+        data.update(data_overrides)
+    event.payload = {"data": data}
+    return event
+
+
+@pytest.mark.asyncio
+async def test_integration_reschedule_is_not_noop(session_maker) -> None:
+    """Update with changed starts_at must cancel old jobs and create new ones.
+
+    Also validates the identity map fix: _load_existing_record_snapshot uses
+    column selects (no ORM objects in identity map), so session.get after the
+    Core upsert returns fresh DB data.
+    """
+    from sqlalchemy import select as sa_select
+
+    import altegio_bot.message_planner as planner_mod
+    from altegio_bot.message_planner import plan_jobs_for_record_event as real_plan_jobs
+    from altegio_bot.models.models import MessageJob, Record, RecordService
+
+    _IT_TZ = ZoneInfo("Europe/Belgrade")
+    now = datetime.now(timezone.utc)
+    starts_at_v1 = (now + timedelta(hours=25)).replace(microsecond=0)
+    starts_at_v2 = (now + timedelta(hours=26)).replace(microsecond=0)
+
+    def _to_date_str(dt: datetime) -> str:
+        return dt.astimezone(_IT_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+    # 1. Create record + service + initial reminder jobs
+    record_id: int = -1
+    async with session_maker() as session:
+        async with session.begin():
+            record = Record(
+                company_id=_IT_COMPANY_ID,
+                altegio_record_id=_IT_ALTEGIO_RECORD_ID,
+                client_id=10,
+                altegio_client_id=_IT_ALTEGIO_CLIENT_ID,
+                staff_id=_IT_STAFF_ID,
+                staff_name=_IT_STAFF_NAME,
+                short_link=_IT_SHORT_LINK,
+                starts_at=starts_at_v1,
+                is_deleted=False,
+                total_cost=Decimal("80"),
+                raw={},
+            )
+            session.add(record)
+            await session.flush()
+            record_id = record.id
+            session.add(
+                RecordService(
+                    record_id=record_id,
+                    service_id=_IT_SERVICE_ID,
+                    title="Wimpernverlängerung",
+                    amount=1,
+                    cost_to_pay=Decimal("80"),
+                    raw={},
+                )
+            )
+            with patch.object(planner_mod, "count_attended_client_visits", AsyncMock(return_value=1)):
+                await real_plan_jobs(
+                    session,
+                    company_id=_IT_COMPANY_ID,
+                    record_id=record_id,
+                    event_status="create",
+                )
+
+    # 2. Call handle_event with new starts_at (reschedule — not a no-op)
+    event = _it_make_event("update", _to_date_str(starts_at_v2))
+    with (
+        patch.object(planner_mod, "count_attended_client_visits", AsyncMock(return_value=1)),
+        patch("altegio_bot.workers.inbox_worker.record_has_allowed_service", AsyncMock(return_value=True)),
+        patch(
+            "altegio_bot.workers.inbox_worker.should_suppress_promo_origin_record_update",
+            AsyncMock(return_value=False),
+        ),
+    ):
+        async with session_maker() as session:
+            async with session.begin():
+                await handle_event(session, event)
+
+    # 3. Old jobs must be canceled; record_updated must be queued
+    async with session_maker() as session:
+        all_jobs = (
+            (
+                await session.execute(
+                    sa_select(MessageJob).where(MessageJob.record_id == record_id).order_by(MessageJob.id.asc())
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    canceled_types = {j.job_type for j in all_jobs if j.status == "canceled"}
+    queued_types = {j.job_type for j in all_jobs if j.status == "queued"}
+
+    assert len(canceled_types) > 0, (
+        f"Old jobs must be canceled after reschedule. All: {[(j.job_type, j.status) for j in all_jobs]}"
+    )
+    assert "record_updated" in queued_types, f"record_updated must be queued after reschedule. Queued: {queued_types}"
+
+
+@pytest.mark.asyncio
+async def test_integration_noop_update_leaves_jobs_unchanged(session_maker) -> None:
+    """Identical update payload must not trigger plan_jobs (no-op guard)."""
+    from sqlalchemy import select as sa_select
+
+    import altegio_bot.message_planner as planner_mod
+    from altegio_bot.message_planner import plan_jobs_for_record_event as real_plan_jobs
+    from altegio_bot.models.models import MessageJob, Record, RecordService
+
+    _IT_TZ = ZoneInfo("Europe/Belgrade")
+    now = datetime.now(timezone.utc)
+    starts_at = (now + timedelta(hours=25)).replace(microsecond=0)
+    date_str = starts_at.astimezone(_IT_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+    # 1. Create record + service + initial jobs
+    record_id: int = -1
+    async with session_maker() as session:
+        async with session.begin():
+            record = Record(
+                company_id=_IT_COMPANY_ID,
+                altegio_record_id=_IT_ALTEGIO_RECORD_ID,
+                client_id=10,
+                altegio_client_id=_IT_ALTEGIO_CLIENT_ID,
+                staff_id=_IT_STAFF_ID,
+                staff_name=_IT_STAFF_NAME,
+                short_link=_IT_SHORT_LINK,
+                starts_at=starts_at,
+                is_deleted=False,
+                total_cost=Decimal("80"),
+                raw={},
+            )
+            session.add(record)
+            await session.flush()
+            record_id = record.id
+            session.add(
+                RecordService(
+                    record_id=record_id,
+                    service_id=_IT_SERVICE_ID,
+                    title="Wimpernverlängerung",
+                    amount=1,
+                    cost_to_pay=Decimal("80"),
+                    raw={},
+                )
+            )
+            with patch.object(planner_mod, "count_attended_client_visits", AsyncMock(return_value=1)):
+                await real_plan_jobs(
+                    session,
+                    company_id=_IT_COMPANY_ID,
+                    record_id=record_id,
+                    event_status="create",
+                )
+
+    # Capture initial queued job types
+    async with session_maker() as session:
+        initial_jobs = (
+            (await session.execute(sa_select(MessageJob).where(MessageJob.record_id == record_id))).scalars().all()
+        )
+    initial_queued = {j.job_type for j in initial_jobs if j.status == "queued"}
+
+    # 2. Call handle_event with IDENTICAL data (no-op)
+    event = _it_make_event("update", date_str)
+    with (
+        patch.object(planner_mod, "count_attended_client_visits", AsyncMock(return_value=1)),
+        patch("altegio_bot.workers.inbox_worker.record_has_allowed_service", AsyncMock(return_value=True)),
+        patch(
+            "altegio_bot.workers.inbox_worker.should_suppress_promo_origin_record_update",
+            AsyncMock(return_value=False),
+        ),
+    ):
+        async with session_maker() as session:
+            async with session.begin():
+                await handle_event(session, event)
+
+    # 3. Jobs must be unchanged: nothing canceled, no new jobs
+    async with session_maker() as session:
+        final_jobs = (
+            (await session.execute(sa_select(MessageJob).where(MessageJob.record_id == record_id))).scalars().all()
+        )
+
+    canceled = [j for j in final_jobs if j.status == "canceled"]
+    final_queued = {j.job_type for j in final_jobs if j.status == "queued"}
+
+    assert canceled == [], f"No-op update must not cancel any jobs. Canceled: {[j.job_type for j in canceled]}"
+    assert final_queued == initial_queued, (
+        f"Queued job set must be unchanged after no-op update. Before: {initial_queued}  After: {final_queued}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_integration_client_change_is_not_noop(session_maker) -> None:
+    """altegio_client_id change must not be treated as a no-op."""
+    from sqlalchemy import select as sa_select
+
+    import altegio_bot.message_planner as planner_mod
+    from altegio_bot.models.models import MessageJob, Record, RecordService
+
+    _IT_TZ = ZoneInfo("Europe/Belgrade")
+    now = datetime.now(timezone.utc)
+    starts_at = (now + timedelta(hours=25)).replace(microsecond=0)
+    date_str = starts_at.astimezone(_IT_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+    # 1. Create record with altegio_client_id = _IT_ALTEGIO_CLIENT_ID (10)
+    record_id: int = -1
+    async with session_maker() as session:
+        async with session.begin():
+            record = Record(
+                company_id=_IT_COMPANY_ID,
+                altegio_record_id=_IT_ALTEGIO_RECORD_ID,
+                client_id=10,
+                altegio_client_id=_IT_ALTEGIO_CLIENT_ID,
+                staff_id=_IT_STAFF_ID,
+                staff_name=_IT_STAFF_NAME,
+                short_link=_IT_SHORT_LINK,
+                starts_at=starts_at,
+                is_deleted=False,
+                total_cost=Decimal("80"),
+                raw={},
+            )
+            session.add(record)
+            await session.flush()
+            record_id = record.id
+            session.add(
+                RecordService(
+                    record_id=record_id,
+                    service_id=_IT_SERVICE_ID,
+                    title="Wimpernverlängerung",
+                    amount=1,
+                    cost_to_pay=Decimal("80"),
+                    raw={},
+                )
+            )
+
+    # 2. Update with different altegio_client_id — must NOT be a no-op
+    event = _it_make_event("update", date_str, altegio_client_id=_IT_ALTEGIO_CLIENT_ID_2)
+    with (
+        patch.object(planner_mod, "count_attended_client_visits", AsyncMock(return_value=1)),
+        patch("altegio_bot.workers.inbox_worker.record_has_allowed_service", AsyncMock(return_value=True)),
+        patch(
+            "altegio_bot.workers.inbox_worker.should_suppress_promo_origin_record_update",
+            AsyncMock(return_value=False),
+        ),
+    ):
+        async with session_maker() as session:
+            async with session.begin():
+                await handle_event(session, event)
+
+    # 3. plan_jobs must have been called → record_updated job exists
+    async with session_maker() as session:
+        jobs = (await session.execute(sa_select(MessageJob).where(MessageJob.record_id == record_id))).scalars().all()
+
+    queued_types = {j.job_type for j in jobs if j.status == "queued"}
+    assert "record_updated" in queued_types, f"plan_jobs must be called on client change. Queued: {queued_types}"
+
+
+@pytest.mark.asyncio
+async def test_integration_deleted_true_is_not_noop(session_maker) -> None:
+    """Incoming deleted=True must not be treated as a no-op."""
+    from sqlalchemy import select as sa_select
+
+    import altegio_bot.message_planner as planner_mod
+    from altegio_bot.models.models import MessageJob, Record, RecordService
+
+    _IT_TZ = ZoneInfo("Europe/Belgrade")
+    now = datetime.now(timezone.utc)
+    starts_at = (now + timedelta(hours=25)).replace(microsecond=0)
+    date_str = starts_at.astimezone(_IT_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+    # 1. Create a non-deleted record
+    record_id: int = -1
+    async with session_maker() as session:
+        async with session.begin():
+            record = Record(
+                company_id=_IT_COMPANY_ID,
+                altegio_record_id=_IT_ALTEGIO_RECORD_ID,
+                client_id=10,
+                altegio_client_id=_IT_ALTEGIO_CLIENT_ID,
+                staff_id=_IT_STAFF_ID,
+                staff_name=_IT_STAFF_NAME,
+                short_link=_IT_SHORT_LINK,
+                starts_at=starts_at,
+                is_deleted=False,
+                total_cost=Decimal("80"),
+                raw={},
+            )
+            session.add(record)
+            await session.flush()
+            record_id = record.id
+            session.add(
+                RecordService(
+                    record_id=record_id,
+                    service_id=_IT_SERVICE_ID,
+                    title="Wimpernverlängerung",
+                    amount=1,
+                    cost_to_pay=Decimal("80"),
+                    raw={},
+                )
+            )
+
+    # 2. Update event with deleted=True — must NOT be a no-op
+    event = _it_make_event("update", date_str, data_overrides={"deleted": True})
+    with (
+        patch.object(planner_mod, "count_attended_client_visits", AsyncMock(return_value=1)),
+        patch("altegio_bot.workers.inbox_worker.record_has_allowed_service", AsyncMock(return_value=True)),
+        patch(
+            "altegio_bot.workers.inbox_worker.should_suppress_promo_origin_record_update",
+            AsyncMock(return_value=False),
+        ),
+    ):
+        async with session_maker() as session:
+            async with session.begin():
+                await handle_event(session, event)
+
+    # 3. plan_jobs must have been called → record_updated job exists
+    async with session_maker() as session:
+        jobs = (await session.execute(sa_select(MessageJob).where(MessageJob.record_id == record_id))).scalars().all()
+
+    queued_types = {j.job_type for j in jobs if j.status == "queued"}
+    assert "record_updated" in queued_types, f"plan_jobs must be called when deleted=True. Queued: {queued_types}"

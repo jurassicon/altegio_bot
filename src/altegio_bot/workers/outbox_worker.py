@@ -491,9 +491,22 @@ def _check_reminder_stale(
             return True, "Skipped: stale reminder after record reschedule"
         return False, None
 
-    # Legacy fallback: estimate expected starts_at from job.run_at + offset.
+    # Legacy fallback: no record_starts_at in payload.
+    # run_at may have been shifted by rate-limit/retry, so only cancel when
+    # the job is pristine (never retried, no prior error).
     run_at = getattr(job, "run_at", None)
     if run_at is None:
+        return False, None
+
+    attempts = getattr(job, "attempts", 0) or 0
+    last_error = getattr(job, "last_error", None)
+    if attempts > 0 or last_error is not None:
+        logger.warning(
+            "legacy reminder without record_starts_at cannot be safely"
+            " stale-checked after retry/rate-limit job_id=%s attempts=%s",
+            getattr(job, "id", None),
+            attempts,
+        )
         return False, None
 
     run_at_utc = _as_utc(run_at)

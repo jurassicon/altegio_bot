@@ -1644,6 +1644,67 @@ def test_reminder_legacy_stale_2h_cancels(monkeypatch: Any) -> None:
     assert session.added == []
 
 
+def test_legacy_reminder_not_canceled_when_retried(monkeypatch: Any) -> None:
+    """Legacy reminder with attempts > 0 must NOT be canceled despite stale run_at.
+
+    After a rate-limit delay or retry, job.run_at may be shifted from its
+    original schedule.  The guard cannot distinguish "shifted by rate-limit"
+    from "shifted by reschedule" without a payload snapshot, so it allows the
+    job through rather than silently dropping a legitimate retry.
+    """
+    starts_at_original = datetime(2026, 6, 1, 10, 0, tzinfo=timezone.utc)
+    starts_at_current = datetime(2026, 6, 1, 14, 0, tzinfo=timezone.utc)  # looks stale
+    run_at = starts_at_original - timedelta(hours=24)
+    job = FakeJob(
+        id=505,
+        company_id=758285,
+        job_type="reminder_24h",
+        status="queued",
+        run_at=run_at,
+        record_id=10,
+        client_id=1,
+        attempts=1,  # previously attempted — guard must not fire
+        payload={"kind": "reminder_24h"},  # no record_starts_at (legacy)
+    )
+    record = FakeRecord(id=10, company_id=758285, starts_at=starts_at_current)
+
+    _reminder_guard_patches(monkeypatch, job, record)
+
+    send_called: list[bool] = []
+
+    async def fake_load_client(session: Any, job_obj: Any, rec: Any) -> Any:
+        return FakeClient(id=1, phone_e164="+491234567890")
+
+    async def fake_apply_rl(session: Any, phone: str) -> Any:
+        return None
+
+    async def fake_render(*args: Any, **kwargs: Any) -> Any:
+        return ("TEXT", 123, "de", _RECORD_UPDATED_CTX)
+
+    async def fake_safe_send(*args: Any, **kwargs: Any) -> Any:
+        send_called.append(True)
+        return ("msg-retried", None)
+
+    fixed_now = datetime(2026, 5, 31, 10, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(ow, "_load_client", fake_load_client)
+    monkeypatch.setattr(ow, "_apply_rate_limit", fake_apply_rl)
+    monkeypatch.setattr(ow, "_render_message", fake_render)
+    monkeypatch.setattr(ow, "safe_send", fake_safe_send)
+    monkeypatch.setattr(ow, "safe_send_template", fake_safe_send)
+    monkeypatch.setattr(ow, "utcnow", lambda: fixed_now)
+    monkeypatch.setattr(ow, "OutboxMessage", FakeOutbox)
+
+    session = FakeSession()
+    run(ow.process_job_in_session(session, 505, provider=object()))  # type: ignore
+
+    assert job.status != "canceled", (
+        f"Legacy reminder with attempts>0 must not be canceled by stale guard: "
+        f"status={job.status!r} last_error={job.last_error!r}"
+    )
+    assert "stale" not in (job.last_error or ""), "stale guard must not fire for retried jobs"
+    assert send_called, "provider must be called when guard allows through"
+
+
 def test_reminder_shifted_run_at_with_valid_payload_passes(monkeypatch: Any) -> None:
     """Payload record_starts_at == current starts_at even when run_at is shifted.
 
