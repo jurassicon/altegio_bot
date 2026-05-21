@@ -1223,6 +1223,54 @@ async def test_integration_reschedule_is_not_noop(session_maker) -> None:
     )
     assert "record_updated" in queued_types, f"record_updated must be queued after reschedule. Queued: {queued_types}"
 
+    # 4. Record.starts_at must reflect new V2 time
+    async with session_maker() as session:
+        updated_record = await session.get(Record, record_id)
+    assert updated_record is not None
+    assert updated_record.starts_at.astimezone(timezone.utc).replace(microsecond=0) == starts_at_v2, (
+        f"Record.starts_at must be updated to V2={starts_at_v2!r}, got {updated_record.starts_at!r}"
+    )
+
+    # 5. New reminders must have run_at derived from starts_at_v2 and carry
+    #    payload['record_starts_at'] pointing at the same new time.
+    new_24h = next((j for j in all_jobs if j.job_type == "reminder_24h" and j.status == "queued"), None)
+    new_2h = next((j for j in all_jobs if j.job_type == "reminder_2h" and j.status == "queued"), None)
+    assert new_24h is not None, f"New reminder_24h must be queued. Queued: {queued_types}"
+    assert new_2h is not None, f"New reminder_2h must be queued. Queued: {queued_types}"
+
+    expected_run_24h = starts_at_v2 - timedelta(hours=24)
+    expected_run_2h = starts_at_v2 - timedelta(hours=2)
+    assert new_24h.run_at.astimezone(timezone.utc).replace(microsecond=0) == expected_run_24h, (
+        f"reminder_24h.run_at={new_24h.run_at!r} expected {expected_run_24h!r}"
+    )
+    assert new_2h.run_at.astimezone(timezone.utc).replace(microsecond=0) == expected_run_2h, (
+        f"reminder_2h.run_at={new_2h.run_at!r} expected {expected_run_2h!r}"
+    )
+
+    # payload['record_starts_at'] must round-trip to starts_at_v2
+    for job, label in ((new_24h, "reminder_24h"), (new_2h, "reminder_2h")):
+        raw = job.payload.get("record_starts_at")
+        assert raw is not None, f"{label} payload missing record_starts_at"
+        parsed = datetime.fromisoformat(raw)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        delta = abs((parsed.astimezone(timezone.utc) - starts_at_v2).total_seconds())
+        assert delta < 2, f"{label} payload record_starts_at {raw!r} != starts_at_v2 {starts_at_v2!r}"
+
+    # No reminder with an old V1-derived run_at must remain queued
+    old_run_24h = (starts_at_v1 - timedelta(hours=24)).replace(microsecond=0)
+    old_run_2h = (starts_at_v1 - timedelta(hours=2)).replace(microsecond=0)
+    stale_queued = [
+        j
+        for j in all_jobs
+        if j.status == "queued"
+        and j.job_type in ("reminder_24h", "reminder_2h")
+        and j.run_at.astimezone(timezone.utc).replace(microsecond=0) in {old_run_24h, old_run_2h}
+    ]
+    assert stale_queued == [], (
+        f"Old-run_at reminders must not remain queued: {[(j.job_type, j.run_at) for j in stale_queued]}"
+    )
+
 
 @pytest.mark.asyncio
 async def test_integration_noop_update_leaves_jobs_unchanged(session_maker) -> None:
@@ -1379,11 +1427,16 @@ async def test_integration_client_change_is_not_noop(session_maker) -> None:
 
 
 @pytest.mark.asyncio
-async def test_integration_deleted_true_is_not_noop(session_maker) -> None:
-    """Incoming deleted=True must not be treated as a no-op."""
+async def test_integration_deleted_true_routes_as_cancellation(session_maker) -> None:
+    """event_status='update' + data.deleted=True must route through the delete/cancellation flow.
+
+    Expected: record_canceled and comeback_3d are queued; record_updated is absent;
+    previously queued system jobs are canceled with the delete reason.
+    """
     from sqlalchemy import select as sa_select
 
     import altegio_bot.message_planner as planner_mod
+    from altegio_bot.message_planner import plan_jobs_for_record_event as real_plan_jobs
     from altegio_bot.models.models import MessageJob, Record, RecordService
 
     _IT_TZ = ZoneInfo("Europe/Belgrade")
@@ -1391,7 +1444,7 @@ async def test_integration_deleted_true_is_not_noop(session_maker) -> None:
     starts_at = (now + timedelta(hours=25)).replace(microsecond=0)
     date_str = starts_at.astimezone(_IT_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
-    # 1. Create a non-deleted record
+    # 1. Create a non-deleted record with initial queued system jobs
     record_id: int = -1
     async with session_maker() as session:
         async with session.begin():
@@ -1421,8 +1474,15 @@ async def test_integration_deleted_true_is_not_noop(session_maker) -> None:
                     raw={},
                 )
             )
+            with patch.object(planner_mod, "count_attended_client_visits", AsyncMock(return_value=1)):
+                await real_plan_jobs(
+                    session,
+                    company_id=_IT_COMPANY_ID,
+                    record_id=record_id,
+                    event_status="create",
+                )
 
-    # 2. Update event with deleted=True — must NOT be a no-op
+    # 2. event_status='update' + deleted=True → must route as delete
     event = _it_make_event("update", date_str, data_overrides={"deleted": True})
     with (
         patch.object(planner_mod, "count_attended_client_visits", AsyncMock(return_value=1)),
@@ -1436,9 +1496,29 @@ async def test_integration_deleted_true_is_not_noop(session_maker) -> None:
             async with session.begin():
                 await handle_event(session, event)
 
-    # 3. plan_jobs must have been called → record_updated job exists
+    # 3. Verify cancellation flow ran, not reschedule flow
     async with session_maker() as session:
-        jobs = (await session.execute(sa_select(MessageJob).where(MessageJob.record_id == record_id))).scalars().all()
+        jobs = (
+            (
+                await session.execute(
+                    sa_select(MessageJob).where(MessageJob.record_id == record_id).order_by(MessageJob.id.asc())
+                )
+            )
+            .scalars()
+            .all()
+        )
 
     queued_types = {j.job_type for j in jobs if j.status == "queued"}
-    assert "record_updated" in queued_types, f"plan_jobs must be called when deleted=True. Queued: {queued_types}"
+    canceled_types = {j.job_type for j in jobs if j.status == "canceled"}
+
+    # Cancellation flow creates record_canceled (not record_updated)
+    assert "record_canceled" in queued_types, (
+        f"record_canceled must be queued when update+deleted=True. Queued: {queued_types}"
+    )
+    assert "record_updated" not in queued_types, (
+        f"record_updated must NOT exist when update+deleted=True routes as delete. Queued: {queued_types}"
+    )
+    # comeback_3d is scheduled for deleted records (client not opted-out)
+    assert "comeback_3d" in queued_types, f"comeback_3d must be queued for deleted record. Queued: {queued_types}"
+    # Previous system jobs (created by the "create" event above) must be canceled
+    assert len(canceled_types) > 0, f"Old queued jobs must be canceled by delete flow. Canceled: {canceled_types}"

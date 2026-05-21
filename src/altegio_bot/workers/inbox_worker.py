@@ -665,11 +665,19 @@ async def handle_event(session: AsyncSession, event: AltegioEvent) -> None:
         if client_data.get("id") is not None:
             client_pk = await upsert_client(session, int(company_id), client_data)
 
+        # When Altegio sends event_status='update' but data.deleted is truthy,
+        # reclassify for downstream job planning so the cancellation/comeback
+        # flow runs instead of the reschedule/record_updated flow.
+        _norm_event_status = _normalize_event_status(event_status)
+        effective_status: str | None = (
+            "delete" if _norm_event_status == "update" and bool(data.get("deleted")) else event_status
+        )
+
         # No-op update detection: load existing record before upsert mutates DB.
         _before_snap: dict[str, Any] | None = None
         _before_svc_snaps: list[dict[str, Any]] = []
         _raw_altegio_id = data.get("id")
-        if _normalize_event_status(event_status) == "update" and _raw_altegio_id is not None:
+        if _norm_event_status == "update" and _raw_altegio_id is not None:
             _before_snap, _before_svc_snaps = await _load_existing_record_snapshot(
                 session,
                 int(company_id),
@@ -690,7 +698,7 @@ async def handle_event(session: AsyncSession, event: AltegioEvent) -> None:
         # Пропускаем события смены статуса визита (visit_attendance).
         # Альтеджио присылает update с visit_attendance != 0 когда клиент отмечен как
         # пришедший (1) или не пришедший (-1). Такие события не требуют создания job'ов.
-        if event_status == "update":
+        if effective_status == "update":
             visit_attendance = data.get("visit_attendance")
             if visit_attendance is not None and int(visit_attendance) != 0:
                 logger.info(
@@ -706,7 +714,7 @@ async def handle_event(session: AsyncSession, event: AltegioEvent) -> None:
             # Promo discount apply runs on create events only. Update webhooks are
             # intentionally skipped to avoid applying promo to bookings that existed
             # before the promo was issued.
-            normalized_status = _normalize_event_status(event_status)
+            normalized_status = _normalize_event_status(effective_status)
             if normalized_status == "create" and not record_obj.is_deleted:
                 booking_created_at_resolver = None
                 if settings.promo_apply_discount_enabled:
@@ -772,8 +780,8 @@ async def handle_event(session: AsyncSession, event: AltegioEvent) -> None:
                 session=session,
                 company_id=int(record_obj.company_id),
                 record_id=int(record_obj.id),
-                status=str(event_status),
-                source_cancelled_at=_resolve_source_cancelled_at(event, payload, event_status),
+                status=str(effective_status),
+                source_cancelled_at=_resolve_source_cancelled_at(event, payload, effective_status),
             )
 
         return
