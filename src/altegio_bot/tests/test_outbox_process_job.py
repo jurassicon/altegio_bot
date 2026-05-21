@@ -1364,16 +1364,16 @@ def _make_reminder_job(
 ) -> FakeJob:
     """Build a FakeJob for reminder guard tests."""
     if run_at is None:
-        offset = timedelta(hours=24) if job_type == 'reminder_24h' else timedelta(hours=2)
+        offset = timedelta(hours=24) if job_type == "reminder_24h" else timedelta(hours=2)
         run_at = starts_at - offset
-    payload: dict = {'kind': job_type}
+    payload: dict = {"kind": job_type}
     if payload_extra is not None:
         payload.update(payload_extra)
     return FakeJob(
         id=500,
         company_id=758285,
         job_type=job_type,
-        status='queued',
+        status="queued",
         run_at=run_at,
         record_id=10,
         client_id=1,
@@ -1383,17 +1383,18 @@ def _make_reminder_job(
 
 def _reminder_guard_patches(monkeypatch: Any, job: Any, record: Any) -> None:
     """Patch all outbox_worker dependencies for reminder guard tests."""
+
     async def fake_load_job(session: Any, job_id: int) -> Any:
         return job
 
     async def fake_load_record(session: Any, job_obj: Any) -> Any:
         return record
 
-    monkeypatch.setattr(ow, '_load_job', fake_load_job)
-    monkeypatch.setattr(ow, '_find_success_outbox', lambda *a, **kw: _asc_ret(None))
-    monkeypatch.setattr(ow, '_find_existing_outbox', lambda *a, **kw: _asc_ret(None))
-    monkeypatch.setattr(ow, '_count_131026_failures', lambda *a, **kw: _asc_ret(0))
-    monkeypatch.setattr(ow, '_load_record', fake_load_record)
+    monkeypatch.setattr(ow, "_load_job", fake_load_job)
+    monkeypatch.setattr(ow, "_find_success_outbox", lambda *a, **kw: _asc_ret(None))
+    monkeypatch.setattr(ow, "_find_existing_outbox", lambda *a, **kw: _asc_ret(None))
+    monkeypatch.setattr(ow, "_count_131026_failures", lambda *a, **kw: _asc_ret(0))
+    monkeypatch.setattr(ow, "_load_record", fake_load_record)
 
 
 async def _asc_ret(val: Any) -> Any:
@@ -1404,9 +1405,9 @@ def test_reminder_24h_valid_payload_passes_guard(monkeypatch: Any) -> None:
     """reminder_24h: payload record_starts_at == current starts_at → guard passes."""
     starts_at = datetime(2026, 6, 1, 10, 0, tzinfo=timezone.utc)
     job = _make_reminder_job(
-        'reminder_24h',
+        "reminder_24h",
         starts_at,
-        payload_extra={'record_starts_at': starts_at.isoformat()},
+        payload_extra={"record_starts_at": starts_at.isoformat()},
     )
     record = FakeRecord(id=10, company_id=758285, starts_at=starts_at)
 
@@ -1415,32 +1416,32 @@ def test_reminder_24h_valid_payload_passes_guard(monkeypatch: Any) -> None:
     send_called: list[bool] = []
 
     async def fake_load_client(session: Any, job_obj: Any, rec: Any) -> Any:
-        return FakeClient(id=1, phone_e164='+491234567890')
+        return FakeClient(id=1, phone_e164="+491234567890")
 
     async def fake_apply_rl(session: Any, phone: str) -> Any:
         return None
 
     async def fake_render(*args: Any, **kwargs: Any) -> Any:
-        return ('TEXT', 123, 'de', _RECORD_UPDATED_CTX)
+        return ("TEXT", 123, "de", _RECORD_UPDATED_CTX)
 
     async def fake_safe_send(*args: Any, **kwargs: Any) -> Any:
         send_called.append(True)
-        return ('msg-ok', None)
+        return ("msg-ok", None)
 
     fixed_now = datetime(2026, 5, 31, 10, 0, tzinfo=timezone.utc)
-    monkeypatch.setattr(ow, '_load_client', fake_load_client)
-    monkeypatch.setattr(ow, '_apply_rate_limit', fake_apply_rl)
-    monkeypatch.setattr(ow, '_render_message', fake_render)
-    monkeypatch.setattr(ow, 'safe_send', fake_safe_send)
-    monkeypatch.setattr(ow, 'safe_send_template', fake_safe_send)
-    monkeypatch.setattr(ow, 'utcnow', lambda: fixed_now)
-    monkeypatch.setattr(ow, 'OutboxMessage', FakeOutbox)
+    monkeypatch.setattr(ow, "_load_client", fake_load_client)
+    monkeypatch.setattr(ow, "_apply_rate_limit", fake_apply_rl)
+    monkeypatch.setattr(ow, "_render_message", fake_render)
+    monkeypatch.setattr(ow, "safe_send", fake_safe_send)
+    monkeypatch.setattr(ow, "safe_send_template", fake_safe_send)
+    monkeypatch.setattr(ow, "utcnow", lambda: fixed_now)
+    monkeypatch.setattr(ow, "OutboxMessage", FakeOutbox)
 
     session = FakeSession()
     run(ow.process_job_in_session(session, 500, provider=object()))  # type: ignore
 
-    assert job.status == 'done', f'Expected done, got {job.status!r}: {job.last_error!r}'
-    assert send_called, 'provider must be called for valid reminder'
+    assert job.status == "done", f"Expected done, got {job.status!r}: {job.last_error!r}"
+    assert send_called, "provider must be called for valid reminder"
 
 
 def test_reminder_24h_stale_payload_cancels(monkeypatch: Any) -> None:
@@ -1448,9 +1449,9 @@ def test_reminder_24h_stale_payload_cancels(monkeypatch: Any) -> None:
     starts_at_old = datetime(2026, 6, 1, 10, 0, tzinfo=timezone.utc)
     starts_at_new = datetime(2026, 6, 2, 10, 0, tzinfo=timezone.utc)
     job = _make_reminder_job(
-        'reminder_24h',
+        "reminder_24h",
         starts_at_old,
-        payload_extra={'record_starts_at': starts_at_old.isoformat()},
+        payload_extra={"record_starts_at": starts_at_old.isoformat()},
         run_at=starts_at_old - timedelta(hours=24),
     )
     # record has been rescheduled to starts_at_new
@@ -1459,16 +1460,16 @@ def test_reminder_24h_stale_payload_cancels(monkeypatch: Any) -> None:
     _reminder_guard_patches(monkeypatch, job, record)
 
     async def fake_safe_send(*args: Any, **kwargs: Any) -> Any:
-        raise AssertionError('provider must not be called for stale reminder')
+        raise AssertionError("provider must not be called for stale reminder")
 
-    monkeypatch.setattr(ow, 'safe_send', fake_safe_send)
-    monkeypatch.setattr(ow, 'safe_send_template', fake_safe_send)
+    monkeypatch.setattr(ow, "safe_send", fake_safe_send)
+    monkeypatch.setattr(ow, "safe_send_template", fake_safe_send)
 
     session = FakeSession()
     run(ow.process_job_in_session(session, 500, provider=object()))  # type: ignore
 
-    assert job.status == 'canceled'
-    assert job.last_error == 'Skipped: stale reminder after record reschedule'
+    assert job.status == "canceled"
+    assert job.last_error == "Skipped: stale reminder after record reschedule"
     assert job.locked_at is None
     assert session.added == []
 
@@ -1478,9 +1479,9 @@ def test_reminder_2h_stale_payload_cancels(monkeypatch: Any) -> None:
     starts_at_old = datetime(2026, 6, 1, 10, 0, tzinfo=timezone.utc)
     starts_at_new = datetime(2026, 6, 1, 15, 0, tzinfo=timezone.utc)
     job = _make_reminder_job(
-        'reminder_2h',
+        "reminder_2h",
         starts_at_old,
-        payload_extra={'record_starts_at': starts_at_old.isoformat()},
+        payload_extra={"record_starts_at": starts_at_old.isoformat()},
         run_at=starts_at_old - timedelta(hours=2),
     )
     record = FakeRecord(id=10, company_id=758285, starts_at=starts_at_new)
@@ -1488,16 +1489,16 @@ def test_reminder_2h_stale_payload_cancels(monkeypatch: Any) -> None:
     _reminder_guard_patches(monkeypatch, job, record)
 
     async def fake_safe_send(*args: Any, **kwargs: Any) -> Any:
-        raise AssertionError('provider must not be called')
+        raise AssertionError("provider must not be called")
 
-    monkeypatch.setattr(ow, 'safe_send', fake_safe_send)
-    monkeypatch.setattr(ow, 'safe_send_template', fake_safe_send)
+    monkeypatch.setattr(ow, "safe_send", fake_safe_send)
+    monkeypatch.setattr(ow, "safe_send_template", fake_safe_send)
 
     session = FakeSession()
     run(ow.process_job_in_session(session, 500, provider=object()))  # type: ignore
 
-    assert job.status == 'canceled'
-    assert job.last_error == 'Skipped: stale reminder after record reschedule'
+    assert job.status == "canceled"
+    assert job.last_error == "Skipped: stale reminder after record reschedule"
     assert session.added == []
 
 
@@ -1505,25 +1506,25 @@ def test_reminder_malformed_record_starts_at_cancels(monkeypatch: Any) -> None:
     """reminder_24h: unparseable record_starts_at → canceled, no crash."""
     starts_at = datetime(2026, 6, 1, 10, 0, tzinfo=timezone.utc)
     job = _make_reminder_job(
-        'reminder_24h',
+        "reminder_24h",
         starts_at,
-        payload_extra={'record_starts_at': 'not-a-date'},
+        payload_extra={"record_starts_at": "not-a-date"},
     )
     record = FakeRecord(id=10, company_id=758285, starts_at=starts_at)
 
     _reminder_guard_patches(monkeypatch, job, record)
 
     async def fake_safe_send(*args: Any, **kwargs: Any) -> Any:
-        raise AssertionError('provider must not be called')
+        raise AssertionError("provider must not be called")
 
-    monkeypatch.setattr(ow, 'safe_send', fake_safe_send)
-    monkeypatch.setattr(ow, 'safe_send_template', fake_safe_send)
+    monkeypatch.setattr(ow, "safe_send", fake_safe_send)
+    monkeypatch.setattr(ow, "safe_send_template", fake_safe_send)
 
     session = FakeSession()
     run(ow.process_job_in_session(session, 500, provider=object()))  # type: ignore
 
-    assert job.status == 'canceled'
-    assert job.last_error == 'Skipped: malformed reminder record_starts_at'
+    assert job.status == "canceled"
+    assert job.last_error == "Skipped: malformed reminder record_starts_at"
     assert session.added == []
 
 
@@ -1535,12 +1536,12 @@ def test_reminder_legacy_valid_24h_passes_guard(monkeypatch: Any) -> None:
     job = FakeJob(
         id=501,
         company_id=758285,
-        job_type='reminder_24h',
-        status='queued',
+        job_type="reminder_24h",
+        status="queued",
         run_at=run_at,
         record_id=10,
         client_id=1,
-        payload={'kind': 'reminder_24h'},
+        payload={"kind": "reminder_24h"},
     )
     record = FakeRecord(id=10, company_id=758285, starts_at=starts_at)
 
@@ -1549,32 +1550,32 @@ def test_reminder_legacy_valid_24h_passes_guard(monkeypatch: Any) -> None:
     send_called: list[bool] = []
 
     async def fake_load_client(session: Any, job_obj: Any, rec: Any) -> Any:
-        return FakeClient(id=1, phone_e164='+491234567890')
+        return FakeClient(id=1, phone_e164="+491234567890")
 
     async def fake_apply_rl(session: Any, phone: str) -> Any:
         return None
 
     async def fake_render(*args: Any, **kwargs: Any) -> Any:
-        return ('TEXT', 123, 'de', _RECORD_UPDATED_CTX)
+        return ("TEXT", 123, "de", _RECORD_UPDATED_CTX)
 
     async def fake_safe_send(*args: Any, **kwargs: Any) -> Any:
         send_called.append(True)
-        return ('msg-legacy-ok', None)
+        return ("msg-legacy-ok", None)
 
     fixed_now = datetime(2026, 5, 31, 9, 0, tzinfo=timezone.utc)
-    monkeypatch.setattr(ow, '_load_client', fake_load_client)
-    monkeypatch.setattr(ow, '_apply_rate_limit', fake_apply_rl)
-    monkeypatch.setattr(ow, '_render_message', fake_render)
-    monkeypatch.setattr(ow, 'safe_send', fake_safe_send)
-    monkeypatch.setattr(ow, 'safe_send_template', fake_safe_send)
-    monkeypatch.setattr(ow, 'utcnow', lambda: fixed_now)
-    monkeypatch.setattr(ow, 'OutboxMessage', FakeOutbox)
+    monkeypatch.setattr(ow, "_load_client", fake_load_client)
+    monkeypatch.setattr(ow, "_apply_rate_limit", fake_apply_rl)
+    monkeypatch.setattr(ow, "_render_message", fake_render)
+    monkeypatch.setattr(ow, "safe_send", fake_safe_send)
+    monkeypatch.setattr(ow, "safe_send_template", fake_safe_send)
+    monkeypatch.setattr(ow, "utcnow", lambda: fixed_now)
+    monkeypatch.setattr(ow, "OutboxMessage", FakeOutbox)
 
     session = FakeSession()
     run(ow.process_job_in_session(session, 501, provider=object()))  # type: ignore
 
-    assert job.status == 'done', f'Expected done: {job.last_error!r}'
-    assert send_called, 'provider must be called for valid legacy reminder'
+    assert job.status == "done", f"Expected done: {job.last_error!r}"
+    assert send_called, "provider must be called for valid legacy reminder"
 
 
 def test_reminder_legacy_stale_24h_cancels(monkeypatch: Any) -> None:
@@ -1585,28 +1586,28 @@ def test_reminder_legacy_stale_24h_cancels(monkeypatch: Any) -> None:
     job = FakeJob(
         id=502,
         company_id=758285,
-        job_type='reminder_24h',
-        status='queued',
+        job_type="reminder_24h",
+        status="queued",
         run_at=run_at,
         record_id=10,
         client_id=1,
-        payload={'kind': 'reminder_24h'},
+        payload={"kind": "reminder_24h"},
     )
     record = FakeRecord(id=10, company_id=758285, starts_at=starts_at_current)
 
     _reminder_guard_patches(monkeypatch, job, record)
 
     async def fake_safe_send(*args: Any, **kwargs: Any) -> Any:
-        raise AssertionError('provider must not be called')
+        raise AssertionError("provider must not be called")
 
-    monkeypatch.setattr(ow, 'safe_send', fake_safe_send)
-    monkeypatch.setattr(ow, 'safe_send_template', fake_safe_send)
+    monkeypatch.setattr(ow, "safe_send", fake_safe_send)
+    monkeypatch.setattr(ow, "safe_send_template", fake_safe_send)
 
     session = FakeSession()
     run(ow.process_job_in_session(session, 502, provider=object()))  # type: ignore
 
-    assert job.status == 'canceled'
-    assert job.last_error == 'Skipped: stale legacy reminder after record reschedule'
+    assert job.status == "canceled"
+    assert job.last_error == "Skipped: stale legacy reminder after record reschedule"
     assert session.added == []
 
 
@@ -1618,28 +1619,28 @@ def test_reminder_legacy_stale_2h_cancels(monkeypatch: Any) -> None:
     job = FakeJob(
         id=503,
         company_id=758285,
-        job_type='reminder_2h',
-        status='queued',
+        job_type="reminder_2h",
+        status="queued",
         run_at=run_at,
         record_id=10,
         client_id=1,
-        payload={'kind': 'reminder_2h'},
+        payload={"kind": "reminder_2h"},
     )
     record = FakeRecord(id=10, company_id=758285, starts_at=starts_at_current)
 
     _reminder_guard_patches(monkeypatch, job, record)
 
     async def fake_safe_send(*args: Any, **kwargs: Any) -> Any:
-        raise AssertionError('provider must not be called')
+        raise AssertionError("provider must not be called")
 
-    monkeypatch.setattr(ow, 'safe_send', fake_safe_send)
-    monkeypatch.setattr(ow, 'safe_send_template', fake_safe_send)
+    monkeypatch.setattr(ow, "safe_send", fake_safe_send)
+    monkeypatch.setattr(ow, "safe_send_template", fake_safe_send)
 
     session = FakeSession()
     run(ow.process_job_in_session(session, 503, provider=object()))  # type: ignore
 
-    assert job.status == 'canceled'
-    assert job.last_error == 'Skipped: stale legacy reminder after record reschedule'
+    assert job.status == "canceled"
+    assert job.last_error == "Skipped: stale legacy reminder after record reschedule"
     assert session.added == []
 
 
@@ -1656,14 +1657,14 @@ def test_reminder_shifted_run_at_with_valid_payload_passes(monkeypatch: Any) -> 
     job = FakeJob(
         id=504,
         company_id=758285,
-        job_type='reminder_24h',
-        status='queued',
+        job_type="reminder_24h",
+        status="queued",
         run_at=run_at_shifted,
         record_id=10,
         client_id=1,
         payload={
-            'kind': 'reminder_24h',
-            'record_starts_at': starts_at.isoformat(),  # immutable snapshot
+            "kind": "reminder_24h",
+            "record_starts_at": starts_at.isoformat(),  # immutable snapshot
         },
     )
     record = FakeRecord(id=10, company_id=758285, starts_at=starts_at)
@@ -1673,31 +1674,29 @@ def test_reminder_shifted_run_at_with_valid_payload_passes(monkeypatch: Any) -> 
     send_called: list[bool] = []
 
     async def fake_load_client(session: Any, job_obj: Any, rec: Any) -> Any:
-        return FakeClient(id=1, phone_e164='+491234567890')
+        return FakeClient(id=1, phone_e164="+491234567890")
 
     async def fake_apply_rl(session: Any, phone: str) -> Any:
         return None
 
     async def fake_render(*args: Any, **kwargs: Any) -> Any:
-        return ('TEXT', 123, 'de', _RECORD_UPDATED_CTX)
+        return ("TEXT", 123, "de", _RECORD_UPDATED_CTX)
 
     async def fake_safe_send(*args: Any, **kwargs: Any) -> Any:
         send_called.append(True)
-        return ('msg-shifted', None)
+        return ("msg-shifted", None)
 
     fixed_now = datetime(2026, 5, 31, 10, 30, tzinfo=timezone.utc)
-    monkeypatch.setattr(ow, '_load_client', fake_load_client)
-    monkeypatch.setattr(ow, '_apply_rate_limit', fake_apply_rl)
-    monkeypatch.setattr(ow, '_render_message', fake_render)
-    monkeypatch.setattr(ow, 'safe_send', fake_safe_send)
-    monkeypatch.setattr(ow, 'safe_send_template', fake_safe_send)
-    monkeypatch.setattr(ow, 'utcnow', lambda: fixed_now)
-    monkeypatch.setattr(ow, 'OutboxMessage', FakeOutbox)
+    monkeypatch.setattr(ow, "_load_client", fake_load_client)
+    monkeypatch.setattr(ow, "_apply_rate_limit", fake_apply_rl)
+    monkeypatch.setattr(ow, "_render_message", fake_render)
+    monkeypatch.setattr(ow, "safe_send", fake_safe_send)
+    monkeypatch.setattr(ow, "safe_send_template", fake_safe_send)
+    monkeypatch.setattr(ow, "utcnow", lambda: fixed_now)
+    monkeypatch.setattr(ow, "OutboxMessage", FakeOutbox)
 
     session = FakeSession()
     run(ow.process_job_in_session(session, 504, provider=object()))  # type: ignore
 
-    assert job.status == 'done', (
-        f'Shifted run_at must not make valid reminder stale: {job.last_error!r}'
-    )
-    assert send_called, 'provider must be called'
+    assert job.status == "done", f"Shifted run_at must not make valid reminder stale: {job.last_error!r}"
+    assert send_called, "provider must be called"

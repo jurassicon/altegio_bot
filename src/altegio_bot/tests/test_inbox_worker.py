@@ -337,7 +337,10 @@ class TestHandleEventVisitAttendance:
             patch("altegio_bot.workers.inbox_worker.upsert_client", new=AsyncMock(return_value=7)),
             patch("altegio_bot.workers.inbox_worker.upsert_record", new=AsyncMock(return_value=99)),
             patch("altegio_bot.workers.inbox_worker.replace_record_services", new=AsyncMock()),
-            patch("altegio_bot.workers.inbox_worker._load_existing_record_and_services", new=AsyncMock(return_value=(None, []))),
+            patch(
+                "altegio_bot.workers.inbox_worker._load_existing_record_and_services",
+                new=AsyncMock(return_value=(None, [])),
+            ),
             patch("altegio_bot.workers.inbox_worker.record_has_allowed_service", new=AsyncMock(return_value=True)),
             patch("altegio_bot.workers.inbox_worker.plan_jobs_for_record_event", new=AsyncMock()) as mock_plan,
             patch("altegio_bot.workers.inbox_worker.resolve_booking_created_at_for_record_create", new=AsyncMock()),
@@ -398,7 +401,10 @@ class TestHandleEventVisitAttendance:
             patch("altegio_bot.workers.inbox_worker.upsert_client", new=AsyncMock(return_value=7)),
             patch("altegio_bot.workers.inbox_worker.upsert_record", new=AsyncMock(return_value=99)),
             patch("altegio_bot.workers.inbox_worker.replace_record_services", new=AsyncMock()),
-            patch("altegio_bot.workers.inbox_worker._load_existing_record_and_services", new=AsyncMock(return_value=(None, []))),
+            patch(
+                "altegio_bot.workers.inbox_worker._load_existing_record_and_services",
+                new=AsyncMock(return_value=(None, [])),
+            ),
             patch("altegio_bot.workers.inbox_worker.record_has_allowed_service", new=AsyncMock(return_value=True)),
             patch("altegio_bot.workers.inbox_worker.plan_jobs_for_record_event", new=AsyncMock()),
             patch("altegio_bot.workers.inbox_worker.resolve_booking_created_at_for_record_create", resolver),
@@ -603,7 +609,10 @@ async def test_record_updated_simple_promo_marker_suppresses_plan_jobs() -> None
         patch("altegio_bot.workers.inbox_worker.upsert_client", new=AsyncMock(return_value=100)),
         patch("altegio_bot.workers.inbox_worker.upsert_record", new=AsyncMock(return_value=99)),
         patch("altegio_bot.workers.inbox_worker.replace_record_services", new=AsyncMock()),
-        patch("altegio_bot.workers.inbox_worker._load_existing_record_and_services", new=AsyncMock(return_value=(None, []))),
+        patch(
+            "altegio_bot.workers.inbox_worker._load_existing_record_and_services",
+            new=AsyncMock(return_value=(None, [])),
+        ),
         patch("altegio_bot.workers.inbox_worker.plan_jobs_for_record_event", mock_plan),
         patch("altegio_bot.workers.inbox_worker.should_suppress_promo_origin_record_update", suppress_mock),
     ):
@@ -631,7 +640,10 @@ async def test_record_updated_manual_promo_marker_suppresses_plan_jobs() -> None
         patch("altegio_bot.workers.inbox_worker.upsert_client", new=AsyncMock(return_value=100)),
         patch("altegio_bot.workers.inbox_worker.upsert_record", new=AsyncMock(return_value=99)),
         patch("altegio_bot.workers.inbox_worker.replace_record_services", new=AsyncMock()),
-        patch("altegio_bot.workers.inbox_worker._load_existing_record_and_services", new=AsyncMock(return_value=(None, []))),
+        patch(
+            "altegio_bot.workers.inbox_worker._load_existing_record_and_services",
+            new=AsyncMock(return_value=(None, [])),
+        ),
         patch("altegio_bot.workers.inbox_worker.plan_jobs_for_record_event", mock_plan),
         patch("altegio_bot.workers.inbox_worker.should_suppress_promo_origin_record_update", suppress_mock),
     ):
@@ -659,7 +671,10 @@ async def test_record_updated_no_promo_marker_calls_plan_jobs() -> None:
         patch("altegio_bot.workers.inbox_worker.upsert_client", new=AsyncMock(return_value=100)),
         patch("altegio_bot.workers.inbox_worker.upsert_record", new=AsyncMock(return_value=99)),
         patch("altegio_bot.workers.inbox_worker.replace_record_services", new=AsyncMock()),
-        patch("altegio_bot.workers.inbox_worker._load_existing_record_and_services", new=AsyncMock(return_value=(None, []))),
+        patch(
+            "altegio_bot.workers.inbox_worker._load_existing_record_and_services",
+            new=AsyncMock(return_value=(None, [])),
+        ),
         patch(
             "altegio_bot.workers.inbox_worker.record_has_allowed_service",
             new=AsyncMock(return_value=True),
@@ -826,7 +841,7 @@ async def test_noop_update_same_snapshot_skips_plan_jobs() -> None:
     existing_svcs = [_make_existing_service()]
 
     plan_called, _ = await _noop_handle(event, existing_rec, existing_svcs)
-    assert not plan_called, 'plan_jobs must NOT be called for no-op update'
+    assert not plan_called, "plan_jobs must NOT be called for no-op update"
 
 
 @pytest.mark.asyncio
@@ -841,16 +856,18 @@ async def test_noop_update_date_change_calls_plan_jobs() -> None:
     existing_svcs = [_make_existing_service()]
 
     plan_called, _ = await _noop_handle(event, existing_rec, existing_svcs)
-    assert plan_called, 'plan_jobs must be called when starts_at changes'
+    assert plan_called, "plan_jobs must be called when starts_at changes"
 
 
 @pytest.mark.asyncio
 async def test_noop_update_staff_change_calls_plan_jobs() -> None:
     """Real staff change → plan_jobs IS called."""
-    event = _make_noop_event({
-        "staff_id": 99,
-        "staff": {"id": 99, "name": "New Staff"},
-    })
+    event = _make_noop_event(
+        {
+            "staff_id": 99,
+            "staff": {"id": 99, "name": "New Staff"},
+        }
+    )
     existing_rec = _make_existing_record()
     from decimal import Decimal
 
@@ -858,22 +875,24 @@ async def test_noop_update_staff_change_calls_plan_jobs() -> None:
     existing_svcs = [_make_existing_service()]
 
     plan_called, _ = await _noop_handle(event, existing_rec, existing_svcs)
-    assert plan_called, 'plan_jobs must be called when staff changes'
+    assert plan_called, "plan_jobs must be called when staff changes"
 
 
 @pytest.mark.asyncio
 async def test_noop_update_services_change_calls_plan_jobs() -> None:
     """Real service change → plan_jobs IS called."""
-    event = _make_noop_event({
-        "services": [
-            {
-                "id": 9002,  # different service_id
-                "title": "Anderer Service",
-                "amount": 1,
-                "cost_to_pay": 80,
-            }
-        ]
-    })
+    event = _make_noop_event(
+        {
+            "services": [
+                {
+                    "id": 9002,  # different service_id
+                    "title": "Anderer Service",
+                    "amount": 1,
+                    "cost_to_pay": 80,
+                }
+            ]
+        }
+    )
     existing_rec = _make_existing_record()
     from decimal import Decimal
 
@@ -881,22 +900,24 @@ async def test_noop_update_services_change_calls_plan_jobs() -> None:
     existing_svcs = [_make_existing_service()]
 
     plan_called, _ = await _noop_handle(event, existing_rec, existing_svcs)
-    assert plan_called, 'plan_jobs must be called when services change'
+    assert plan_called, "plan_jobs must be called when services change"
 
 
 @pytest.mark.asyncio
 async def test_noop_update_total_cost_change_calls_plan_jobs() -> None:
     """Real cost change → plan_jobs IS called."""
-    event = _make_noop_event({
-        "services": [
-            {
-                "id": _NP_SERVICE_ID,
-                "title": "Wimpernverlängerung",
-                "amount": 1,
-                "cost_to_pay": 100,  # changed from 80 to 100
-            }
-        ]
-    })
+    event = _make_noop_event(
+        {
+            "services": [
+                {
+                    "id": _NP_SERVICE_ID,
+                    "title": "Wimpernverlängerung",
+                    "amount": 1,
+                    "cost_to_pay": 100,  # changed from 80 to 100
+                }
+            ]
+        }
+    )
     existing_rec = _make_existing_record()
     from decimal import Decimal
 
@@ -904,7 +925,7 @@ async def test_noop_update_total_cost_change_calls_plan_jobs() -> None:
     existing_svcs = [_make_existing_service()]
 
     plan_called, _ = await _noop_handle(event, existing_rec, existing_svcs)
-    assert plan_called, 'plan_jobs must be called when cost changes'
+    assert plan_called, "plan_jobs must be called when cost changes"
 
 
 @pytest.mark.asyncio
@@ -913,7 +934,7 @@ async def test_noop_update_missing_existing_record_processes_normally() -> None:
     event = _make_noop_event()
     # existing_rec=None means record was not in DB before this event
     plan_called, _ = await _noop_handle(event, None, [])
-    assert plan_called, 'must process normally when no existing record'
+    assert plan_called, "must process normally when no existing record"
 
 
 @pytest.mark.asyncio
@@ -927,7 +948,7 @@ async def test_visit_attendance_update_still_skipped() -> None:
     existing_svcs = [_make_existing_service()]
 
     plan_called, _ = await _noop_handle(event, existing_rec, existing_svcs)
-    assert not plan_called, 'visit_attendance skip must remain'
+    assert not plan_called, "visit_attendance skip must remain"
 
 
 # ---------------------------------------------------------------------------
@@ -939,9 +960,9 @@ class TestIsNoopUpdate:
     """Unit tests for _is_noop_update helper."""
 
     def _make_rec(self, **overrides: object) -> MagicMock:
+        from datetime import datetime as _dt
         from decimal import Decimal
         from zoneinfo import ZoneInfo
-        from datetime import datetime as _dt
 
         TZ = ZoneInfo("Europe/Belgrade")
         naive = _dt(2026, 6, 10, 10, 30, 0)
@@ -1022,9 +1043,7 @@ class TestIsNoopUpdate:
 
     def test_service_added_not_noop(self) -> None:
         data = self._base_data()
-        data["services"].append(
-            {"id": 9999, "title": "Extra", "amount": 1, "cost_to_pay": 20}
-        )
+        data["services"].append({"id": 9999, "title": "Extra", "amount": 1, "cost_to_pay": 20})
         assert not _is_noop_update(self._make_rec(), [self._make_svc()], data)
 
     def test_service_removed_not_noop(self) -> None:
@@ -1033,8 +1052,6 @@ class TestIsNoopUpdate:
         assert not _is_noop_update(self._make_rec(), [self._make_svc()], data)
 
     def test_empty_existing_services_same_incoming_empty_is_noop(self) -> None:
-        from decimal import Decimal
-
         rec = self._make_rec(total_cost=None)
         data = self._base_data()
         data["services"] = []
