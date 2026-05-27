@@ -1041,6 +1041,49 @@ def _parse_int_payload_id(value: Any, field_name: str) -> tuple[int | None, str 
     return None, f"Follow-up skipped: invalid {field_name}={value!r}"
 
 
+def _parse_positive_int_id(value: Any, field_name: str) -> tuple[int | None, str | None]:
+    """Strict positive-int parser for any job-payload id field.
+
+    Context-neutral variant of ``_parse_int_payload_id`` — same contract
+    and same rejection rules, but with a generic error prefix suitable for
+    handlers other than follow-up campaign jobs.
+
+    Returns ``(int_value, None)`` on success.
+    Returns ``(None, None)`` when *value* is ``None`` (field absent).
+    Returns ``(None, error_str)`` when *value* is present but invalid.
+
+    Accepted: positive ``int`` (not ``bool``), digit-only ``str``
+    (e.g. ``'1'``, ``'42'``, ``'001'``).
+    Rejected: ``bool``, ``float``, ``0``, negative int, ``''``,
+    strings with whitespace / signs / decimal points, ``list``, ``dict``.
+
+    Note: ``bool`` is checked *before* ``int`` because ``bool`` is a
+    subclass of ``int`` in Python — ``isinstance(True, int)`` is ``True``.
+    Without the explicit guard ``int(True) == 1``, allowing a boolean
+    payload to silently resolve to id 1.
+    """
+    if value is None:
+        return None, None
+
+    if isinstance(value, bool):
+        return None, f"invalid {field_name}={value!r}: bool not accepted as id"
+
+    if isinstance(value, int):
+        if value <= 0:
+            return None, f"invalid {field_name}={value!r}: must be positive"
+        return value, None
+
+    if isinstance(value, str):
+        if not _ID_RE.fullmatch(value):
+            return None, f"invalid {field_name}={value!r}: must be digit-only string"
+        parsed = int(value)
+        if parsed <= 0:
+            return None, f"invalid {field_name}={value!r}: must be positive"
+        return parsed, None
+
+    return None, f"invalid {field_name}={value!r}: unsupported type {type(value).__name__!r}"
+
+
 async def _backfill_campaign_recipient_after_send(
     session: AsyncSession,
     job_type: str,
@@ -1131,24 +1174,17 @@ async def _process_promo_card_booking_reminder(
     now = utcnow()
     payload = getattr(job, "payload", None) or {}
 
-    # Fix 5: safe payload parsing
+    # Fix 5 (strict): reject bool/float/whitespace-padded strings that
+    # bare int() would silently accept (int(True)==1, int(1.5)==1, int(' 1 ')==1).
     raw_id = payload.get("promo_lead_id")
-    promo_lead_id: int | None = None
-    if raw_id is not None:
-        try:
-            promo_lead_id = int(raw_id)
-            if promo_lead_id <= 0:
-                raise ValueError("non-positive")
-        except (TypeError, ValueError):
-            job.status = "failed"
-            job.locked_at = None
-            job.last_error = f"promo_card_booking_reminder: invalid promo_lead_id={raw_id!r}"
-            return
-
+    promo_lead_id, _id_err = _parse_positive_int_id(raw_id, "promo_lead_id")
     if promo_lead_id is None:
         job.status = "failed"
         job.locked_at = None
-        job.last_error = "promo_card_booking_reminder: missing promo_lead_id in payload"
+        if _id_err is not None:
+            job.last_error = f"promo_card_booking_reminder: invalid promo_lead_id={raw_id!r}"
+        else:
+            job.last_error = "promo_card_booking_reminder: missing promo_lead_id in payload"
         return
 
     lead = await session.get(PromoLead, promo_lead_id)

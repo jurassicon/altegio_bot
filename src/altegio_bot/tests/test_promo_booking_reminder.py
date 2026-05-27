@@ -24,6 +24,9 @@ Coverage (per spec):
 21. success: OutboxMessage.body is non-empty and contains key strings (Fix 7)
 22. success: PromoLead.meta contains sent_at / outbox_id / provider_id / template (Fix 8)
 23. expiry display uses promo funnel calendar-month boundary logic (Fix 9)
+24. _parse_positive_int_id unit: accepted / rejected cases (Fix 5 strict)
+25. bool/float rejected even when PromoLead with matching int() value exists (Fix 5 strict)
+26. digit-string id '001' resolves to the matching lead (Fix 5 strict)
 """
 
 from __future__ import annotations
@@ -466,15 +469,36 @@ async def test_apply_idempotent_no_duplicate_no_meta_corruption(session_maker):
 @pytest.mark.parametrize(
     "bad_payload",
     [
+        # missing key
         {},
+        # explicit None
         {"promo_lead_id": None},
+        # non-digit string
         {"promo_lead_id": "abc"},
+        # bool — must NOT be coerced via int(True)==1
         {"promo_lead_id": True},
+        {"promo_lead_id": False},
+        # non-positive int
         {"promo_lead_id": -1},
+        {"promo_lead_id": 0},
+        # float — must NOT be coerced via int(1.5)==1
+        {"promo_lead_id": 1.5},
+        # string with decimal point
+        {"promo_lead_id": "1.0"},
+        # string with leading/trailing whitespace (int(' 1 ')==1 in plain Python)
+        {"promo_lead_id": " 1 "},
+        # signed string
+        {"promo_lead_id": "+1"},
+        {"promo_lead_id": "-1"},
+        # zero digit string
+        {"promo_lead_id": "0"},
+        # unsupported container types
+        {"promo_lead_id": []},
+        {"promo_lead_id": {}},
     ],
 )
 async def test_handler_invalid_payload_does_not_crash(session_maker, bad_payload):
-    """Invalid or missing promo_lead_id fails job without raising (Fix 5)."""
+    """Invalid or missing promo_lead_id: job fails, provider never called (Fix 5)."""
     async with session_maker() as session:
         async with session.begin():
             await _seed_sender(session)
@@ -875,3 +899,130 @@ async def test_handler_expiry_display_calendar_month_boundary(session_maker):
     assert len(provider.calls) == 1
     # param[1] = expires_at_display — must be 30.06.2026, not 01.07.2026
     assert provider.calls[0]["params"][1] == "30.06.2026"
+
+
+# ===========================================================================
+# _parse_positive_int_id — unit tests (Fix 5 strict)
+# ===========================================================================
+
+
+@pytest.mark.parametrize(
+    "value,expected_id,expect_error",
+    [
+        # ---- accepted ----
+        (1, 1, False),
+        (42, 42, False),
+        ("1", 1, False),
+        ("42", 42, False),
+        ("001", 1, False),  # digit-only with leading zeros → valid
+        # ---- rejected: bool (subclass of int, must be caught before int check) ----
+        (True, None, True),
+        (False, None, True),
+        # ---- rejected: non-positive int ----
+        (0, None, True),
+        (-1, None, True),
+        # ---- rejected: float ----
+        (1.0, None, True),
+        (1.5, None, True),
+        # ---- rejected: strings that bare int() would accept ----
+        ("1.0", None, True),
+        (" 1 ", None, True),
+        ("+1", None, True),
+        ("-1", None, True),
+        ("0", None, True),
+        ("", None, True),
+        ("abc", None, True),
+        # ---- rejected: containers ----
+        ([], None, True),
+        ({}, None, True),
+        # ---- absent (None) — not an error, just missing ----
+        (None, None, False),
+    ],
+)
+def test_parse_positive_int_id_unit(value, expected_id, expect_error):
+    """_parse_positive_int_id accepts/rejects values per strict rules (Fix 5 strict)."""
+    from altegio_bot.workers.outbox_worker import _parse_positive_int_id
+
+    result_id, error = _parse_positive_int_id(value, "test_field")
+
+    assert result_id == expected_id, f"value={value!r}: expected id {expected_id}, got {result_id}"
+    if expect_error:
+        assert error is not None, f"value={value!r}: expected an error string, got None"
+    else:
+        assert error is None, f"value={value!r}: expected no error, got {error!r}"
+
+
+@pytest.mark.asyncio
+async def test_handler_bool_and_float_rejected_not_treated_as_id(session_maker):
+    """bool/float payload fails before DB lookup — they are NOT silently cast to int.
+
+    Regression guard: bare ``int(True) == 1`` and ``int(1.5) == 1`` would
+    load a PromoLead with id=1 if one exists.  The strict helper rejects
+    them at the type-check level so PromoLead is never queried.
+    """
+    async with session_maker() as session:
+        async with session.begin():
+            # Seed a lead — its auto-assigned id is the first candidate a
+            # buggy int(True)/int(1.5) resolution would wrongly load.
+            lead = _make_lead()
+            session.add(lead)
+            await session.flush()
+            await _seed_sender(session)
+
+    for bad_value in (True, False, 1.5, 1.0):
+        provider = _OkProvider()
+        async with session_maker() as session:
+            async with session.begin():
+                job = MessageJob(
+                    company_id=_COMPANY,
+                    job_type=PROMO_CARD_BOOKING_REMINDER_JOB_TYPE,
+                    run_at=_NOW,
+                    dedupe_key=f"{PROMO_CARD_BOOKING_REMINDER_JOB_TYPE}:strict:{id(bad_value)}{bad_value}",
+                    max_attempts=3,
+                    payload={"promo_lead_id": bad_value},
+                )
+                session.add(job)
+                await session.flush()
+                await _run_handler(session, job, provider)
+
+        assert job.status == "failed", f"Expected 'failed' for promo_lead_id={bad_value!r}, got {job.status!r}"
+        assert len(provider.calls) == 0, f"Provider must not be called for promo_lead_id={bad_value!r}"
+
+
+@pytest.mark.asyncio
+async def test_handler_digit_string_id_resolves_correct_lead(session_maker):
+    """A zero-padded digit-string id (e.g. '001') resolves to the matching PromoLead.
+
+    This verifies that valid digit-only strings are accepted by the strict
+    parser and that the handler proceeds to send the template normally.
+    """
+    async with session_maker() as session:
+        async with session.begin():
+            lead = _make_lead(expires_at=datetime(2026, 6, 25, 12, 0, 0, tzinfo=_UTC))
+            session.add(lead)
+            await session.flush()
+            lead_id = lead.id
+            await _seed_sender(session)
+
+    provider = _OkProvider()
+
+    async with session_maker() as session:
+        async with session.begin():
+            # Zero-pad to at least 3 digits so we always test the leading-zero path.
+            str_id = str(lead_id).zfill(3)  # e.g. lead_id=1 → '001', lead_id=42 → '042'
+            job = MessageJob(
+                company_id=_COMPANY,
+                job_type=PROMO_CARD_BOOKING_REMINDER_JOB_TYPE,
+                run_at=_NOW,
+                dedupe_key=f"{PROMO_CARD_BOOKING_REMINDER_JOB_TYPE}:str_id:{lead_id}",
+                max_attempts=3,
+                payload={"promo_lead_id": str_id},
+            )
+            session.add(job)
+            await session.flush()
+
+            with patch("altegio_bot.workers.outbox_worker._apply_rate_limit", new=AsyncMock(return_value=None)):
+                await _run_handler(session, job, provider)
+
+    assert job.status == "done", f"Expected 'done' for digit-string id {str_id!r}, got {job.status!r}"
+    assert len(provider.calls) == 1
