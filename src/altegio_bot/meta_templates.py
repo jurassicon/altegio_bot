@@ -32,6 +32,9 @@ TEMPLATE_LANGUAGE = "de"
 NEWSLETTER_MONTHLY_TEMPLATE = "kitilash_ka_newsletter_new_clients_monthly_v1"
 NEWSLETTER_FOLLOWUP_TEMPLATE = "kitilash_ka_newsletter_new_clients_followup_v1"
 
+# Promo card booking reminder (universal — no address footer).
+PROMO_CARD_BOOKING_REMINDER_TEMPLATE = "kitilash_ka_promo_card_booking_reminder_v1"
+
 # Templates that have an IMAGE HEADER component in Meta WABA.
 # The worker must supply a header_image_url when sending these; if the URL is
 # missing from settings the job is failed immediately (no silent blank send).
@@ -48,6 +51,7 @@ UNIVERSAL_JOB_TYPES: frozenset[str] = frozenset(
         "comeback_3d",
         "newsletter_new_clients_monthly",
         "newsletter_new_clients_followup",
+        "promo_card_booking_reminder",
     }
 )
 
@@ -71,6 +75,7 @@ META_TEMPLATE_MAP: dict[tuple[int, str], str] = {
     (_KA, "comeback_3d"): "kitilash_ka_comeback_3d_v1",
     (_KA, "newsletter_new_clients_monthly"): NEWSLETTER_MONTHLY_TEMPLATE,
     (_KA, "newsletter_new_clients_followup"): NEWSLETTER_FOLLOWUP_TEMPLATE,
+    (_KA, "promo_card_booking_reminder"): PROMO_CARD_BOOKING_REMINDER_TEMPLATE,
     # --- Rastatt ---
     # ra_record_created_v1 exists; others fall back to ka_* templates
     (_RA, "record_created"): "kitilash_ra_record_created_v1",
@@ -83,6 +88,7 @@ META_TEMPLATE_MAP: dict[tuple[int, str], str] = {
     (_RA, "comeback_3d"): "kitilash_ka_comeback_3d_v1",
     (_RA, "newsletter_new_clients_monthly"): NEWSLETTER_MONTHLY_TEMPLATE,
     (_RA, "newsletter_new_clients_followup"): NEWSLETTER_FOLLOWUP_TEMPLATE,
+    (_RA, "promo_card_booking_reminder"): PROMO_CARD_BOOKING_REMINDER_TEMPLATE,
 }
 
 # Karlsruhe new-client variant for record_created
@@ -241,6 +247,13 @@ def build_template_params(
 
     if n == NEWSLETTER_FOLLOWUP_TEMPLATE:
         return []
+
+    if n == PROMO_CARD_BOOKING_REMINDER_TEMPLATE:
+        return [
+            ctx.get("discount_amount", ""),
+            ctx.get("expires_at_display", ""),
+            ctx.get("booking_link", ""),
+        ]
 
     logger.warning("build_template_params: unknown template_name=%s", template_name)
     return []
