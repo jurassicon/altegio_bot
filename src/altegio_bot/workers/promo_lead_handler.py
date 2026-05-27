@@ -28,6 +28,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger("promo_lead_handler")
 PROMO_ELIGIBILITY_CHECK_JOB_TYPE = "promo_eligibility_check"
 PROMO_APPLY_EXISTING_BOOKING_JOB_TYPE = "promo_apply_existing_booking"
+PROMO_CARD_BOOKING_REMINDER_JOB_TYPE = "promo_card_booking_reminder"
 
 
 # ---------------------------------------------------------------------------

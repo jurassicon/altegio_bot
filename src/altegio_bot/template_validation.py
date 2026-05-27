@@ -108,6 +108,11 @@ _TEMPLATE_RULES: dict[str, _TemplateRule] = {
         0,
         [],
     ),
+    # --- promo ---
+    "kitilash_ka_promo_card_booking_reminder_v1": (
+        3,
+        ["discount_amount", "expires_at", "booking_link"],
+    ),
 }
 
 

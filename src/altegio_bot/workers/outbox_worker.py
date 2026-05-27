@@ -61,6 +61,7 @@ from altegio_bot.whatsapp_routing import pick_sender_code_for_record, pick_sende
 from altegio_bot.whatsapp_window import is_whatsapp_customer_window_open
 from altegio_bot.workers.promo_lead_handler import (
     PROMO_APPLY_EXISTING_BOOKING_JOB_TYPE,
+    PROMO_CARD_BOOKING_REMINDER_JOB_TYPE,
     PROMO_ELIGIBILITY_CHECK_JOB_TYPE,
     process_promo_eligibility_check_job,
 )
@@ -92,6 +93,7 @@ WA_131026_SUPPRESSIBLE_JOB_TYPES: tuple[str, ...] = (
     "comeback_3d",
     "newsletter_new_clients_monthly",
     "newsletter_new_clients_followup",
+    "promo_card_booking_reminder",
 )
 
 TOKEN_EXPIRED_RETRY_SECONDS = 60
@@ -1082,6 +1084,349 @@ async def _backfill_campaign_recipient_after_send(
             recipient.sent_at = now_sent
 
 
+def _phone_digits(phone: str | None) -> str:
+    """Return only digits from *phone* for normalized comparison."""
+    if not phone:
+        return ""
+    return "".join(c for c in phone if c.isdigit())
+
+
+_PROMO_REMINDER_BODY_TEMPLATE = (
+    "Hallo 😊\n\n"
+    "Ihre Sommer-Aktion ist aktiviert, aber wir sehen noch keinen passenden Termin für den Rabatt.\n\n"
+    "Bitte buchen Sie rechtzeitig, damit Ihr Rabatt von {discount_amount}€ nicht verfällt.\n\n"
+    "Gültig bis: {expires_at_display}\n"
+    "Termin buchen: {booking_link}\n\n"
+    "Liebe Grüße\n"
+    "KitiLash\n\n"
+    "Antworten Sie mit STOP, um keine Marketing-Nachrichten mehr zu erhalten."
+)
+
+
+def _render_promo_reminder_body(
+    discount_amount: str,
+    expires_at_display: str,
+    booking_link: str,
+) -> str:
+    return _PROMO_REMINDER_BODY_TEMPLATE.format(
+        discount_amount=discount_amount,
+        expires_at_display=expires_at_display,
+        booking_link=booking_link,
+    )
+
+
+async def _process_promo_card_booking_reminder(
+    session: AsyncSession,
+    job: MessageJob,
+    provider: WhatsAppProvider,
+) -> None:
+    """Send promo card booking reminder via Meta WhatsApp template.
+
+    Full eligibility re-check is performed before the send to cancel stale jobs.
+    Includes 131026 suppression, normalized opt-out, and active-card validation.
+    """
+    from altegio_bot.meta_templates import PROMO_CARD_BOOKING_REMINDER_TEMPLATE
+    from altegio_bot.workers.promo_lead_handler import _expires_display
+
+    now = utcnow()
+    payload = getattr(job, "payload", None) or {}
+
+    # Fix 5: safe payload parsing
+    raw_id = payload.get("promo_lead_id")
+    promo_lead_id: int | None = None
+    if raw_id is not None:
+        try:
+            promo_lead_id = int(raw_id)
+            if promo_lead_id <= 0:
+                raise ValueError("non-positive")
+        except (TypeError, ValueError):
+            job.status = "failed"
+            job.locked_at = None
+            job.last_error = f"promo_card_booking_reminder: invalid promo_lead_id={raw_id!r}"
+            return
+
+    if promo_lead_id is None:
+        job.status = "failed"
+        job.locked_at = None
+        job.last_error = "promo_card_booking_reminder: missing promo_lead_id in payload"
+        return
+
+    lead = await session.get(PromoLead, promo_lead_id)
+    if lead is None:
+        job.status = "failed"
+        job.locked_at = None
+        job.last_error = f"promo_card_booking_reminder: PromoLead {promo_lead_id} not found"
+        return
+
+    # Fix 2: full eligibility re-check before send
+    def _cancel(reason: str) -> None:
+        job.status = "canceled"
+        job.locked_at = None
+        job.last_error = reason
+
+    if lead.status != "issued":
+        _cancel("promo_card_booking_reminder: lead no longer issued")
+        logger.info("promo_card_booking_reminder: cancelling job_id=%s lead status=%s", job.id, lead.status)
+        return
+
+    if lead.issued_at is None:
+        _cancel("promo_card_booking_reminder: lead no longer issued")
+        return
+
+    if lead.expires_at is None or lead.expires_at <= now:
+        _cancel("promo_card_booking_reminder: promo lead expired")
+        return
+
+    if lead.applied_at is not None:
+        _cancel("promo_card_booking_reminder: lead already applied")
+        return
+
+    if lead.used_at is not None:
+        _cancel("promo_card_booking_reminder: lead already applied")
+        return
+
+    if lead.cancelled_at is not None:
+        _cancel("promo_card_booking_reminder: lead no longer issued")
+        return
+
+    # Fix 2: active-card check
+    lead_meta = lead.meta or {}
+    if (
+        not lead.loyalty_card_id
+        or not lead.loyalty_card_number
+        or not lead.location_id
+        or not lead.discount_program_id
+        or str(lead_meta.get("loyalty_card_issued", "")).lower() != "true"
+        or str(lead_meta.get("card_issue_failed", "")).lower() == "true"
+    ):
+        _cancel("promo_card_booking_reminder: active loyalty card missing")
+        return
+
+    if lead_meta.get("booking_reminder_sent_at"):
+        _cancel("promo_card_booking_reminder: booking reminder already sent")
+        return
+
+    if lead_meta.get("manual_review_required"):
+        _cancel("promo_card_booking_reminder: manual review required")
+        return
+
+    phone = lead.phone_e164
+
+    # Fix 4: normalized opt-out check — any Client row with matching digits
+    phone_digits = _phone_digits(phone)
+    opted_out_rows = (await session.execute(select(Client).where(Client.wa_opted_out.is_(True)))).scalars().all()
+    if any(_phone_digits(c.phone_e164) == phone_digits for c in opted_out_rows):
+        _cancel("promo_card_booking_reminder: phone opted out")
+        logger.info("promo_card_booking_reminder: opted-out job_id=%s phone=%s", job.id, phone)
+        return
+
+    delay_until = await _apply_rate_limit(session, phone)
+    if delay_until is not None:
+        job.status = "queued"
+        job.locked_at = None
+        job.run_at = delay_until
+        return
+
+    sender_id = await pick_sender_id(session=session, company_id=lead.company_id, sender_code="default")
+    if sender_id is None:
+        job.status = "failed"
+        job.locked_at = None
+        job.last_error = "promo_card_booking_reminder: no active sender for company"
+        return
+
+    # Fix 3: 131026 suppression
+    if settings.wa_131026_suppression_enabled:
+        n_fail = await _count_131026_failures(
+            session,
+            phone,
+            settings.wa_131026_suppression_window_days,
+        )
+        if n_fail >= settings.wa_131026_suppression_threshold:
+            _wd = settings.wa_131026_suppression_window_days
+            reason = f"suppressed_131026: repeated undeliverable ({n_fail} in {_wd}d)"
+            session.add(
+                OutboxMessage(
+                    company_id=lead.company_id,
+                    client_id=None,
+                    record_id=None,
+                    job_id=job.id,
+                    sender_id=None,
+                    phone_e164=phone,
+                    template_code=PROMO_CARD_BOOKING_REMINDER_JOB_TYPE,
+                    language=TEMPLATE_LANGUAGE,
+                    body="",
+                    status="canceled",
+                    error=reason,
+                    provider_message_id=None,
+                    scheduled_at=job.run_at,
+                    sent_at=now,
+                    meta={
+                        "suppression_code": "131026",
+                        "threshold": settings.wa_131026_suppression_threshold,
+                        "window_days": _wd,
+                        "matched_failures": n_fail,
+                        "source": "promo_booking_reminder",
+                        "promo_lead_id": promo_lead_id,
+                    },
+                    message_source="bot",
+                )
+            )
+            job.status = "canceled"
+            job.locked_at = None
+            job.last_error = reason
+            logger.info(
+                "Suppressed 131026 job_id=%s phone=%s failures=%d window=%dd",
+                job.id,
+                phone,
+                n_fail,
+                _wd,
+            )
+            return
+
+    template_name = PROMO_CARD_BOOKING_REMINDER_TEMPLATE
+    booking_link = BOOKING_LINKS.get(lead.company_id, settings.promo_booking_url)
+    # Fix 9: use promo funnel expiry display logic
+    discount_amount = str(int(lead.discount_amount)) if lead.discount_amount else ""
+    expires_at_display = _expires_display(lead.expires_at)
+    template_params = [discount_amount, expires_at_display, booking_link]
+
+    # Fix 7: rendered body for ops visibility
+    body = _render_promo_reminder_body(discount_amount, expires_at_display, booking_link)
+
+    preflight_err = validate_template_params(template_name, template_params)
+    if preflight_err is not None:
+        session.add(
+            OutboxMessage(
+                company_id=lead.company_id,
+                client_id=None,
+                record_id=None,
+                job_id=job.id,
+                sender_id=sender_id,
+                phone_e164=phone,
+                template_code=PROMO_CARD_BOOKING_REMINDER_JOB_TYPE,
+                language=TEMPLATE_LANGUAGE,
+                body=body,
+                status="failed",
+                error=preflight_err,
+                provider_message_id=None,
+                scheduled_at=job.run_at,
+                sent_at=now,
+                meta={
+                    "send_type": "template",
+                    "template": template_name,
+                    "params": template_params,
+                    "validation": "local_preflight_failure",
+                    "source": "promo_booking_reminder",
+                    "promo_lead_id": promo_lead_id,
+                },
+                message_source="bot",
+            )
+        )
+        job.status = "failed"
+        job.locked_at = None
+        job.last_error = preflight_err
+        return
+
+    attempts = getattr(job, "attempts", 0) + 1
+    setattr(job, "attempts", attempts)
+
+    msg_id, err = await safe_send_template(
+        provider=provider,
+        sender_id=sender_id,
+        phone=phone,
+        template_name=template_name,
+        language=TEMPLATE_LANGUAGE,
+        params=template_params,
+        company_id=lead.company_id,
+    )
+
+    out_meta_base: dict[str, Any] = {
+        "send_type": "template",
+        "template": template_name,
+        "params": template_params,
+        "source": "promo_booking_reminder",
+        "promo_lead_id": promo_lead_id,
+    }
+
+    if err is not None:
+        session.add(
+            OutboxMessage(
+                company_id=lead.company_id,
+                client_id=None,
+                record_id=None,
+                job_id=job.id,
+                sender_id=sender_id,
+                phone_e164=phone,
+                template_code=PROMO_CARD_BOOKING_REMINDER_JOB_TYPE,
+                language=TEMPLATE_LANGUAGE,
+                body=body,
+                status="failed",
+                error=err,
+                provider_message_id=msg_id,
+                scheduled_at=job.run_at,
+                sent_at=now,
+                meta=out_meta_base,
+                message_source="bot",
+            )
+        )
+        max_attempts = getattr(job, "max_attempts", 5)
+        if _is_token_expired_error(err):
+            _mark_token_expired()
+            job.status = "queued"
+            job.locked_at = None
+            job.run_at = now + timedelta(seconds=TOKEN_EXPIRED_RETRY_SECONDS)
+            job.last_error = f"Send blocked: {err}"
+        elif _is_permanent_meta_template_error(err) or attempts >= max_attempts:
+            job.status = "failed"
+            job.locked_at = None
+            job.last_error = f"Send failed: {err}"
+        else:
+            job.status = "queued"
+            job.locked_at = None
+            job.run_at = now + timedelta(seconds=_retry_delay_seconds(attempts))
+            job.last_error = f"Send failed: {err}"
+        return
+
+    out = OutboxMessage(
+        company_id=lead.company_id,
+        client_id=None,
+        record_id=None,
+        job_id=job.id,
+        sender_id=sender_id,
+        phone_e164=phone,
+        template_code=PROMO_CARD_BOOKING_REMINDER_JOB_TYPE,
+        language=TEMPLATE_LANGUAGE,
+        body=body,
+        status="sent",
+        error=None,
+        provider_message_id=msg_id,
+        scheduled_at=job.run_at,
+        sent_at=now,
+        meta=out_meta_base,
+        message_source="bot",
+    )
+    session.add(out)
+    await session.flush()
+
+    # Fix 8: rich meta on success
+    lead.meta = {
+        **lead_meta,
+        "booking_reminder_sent_at": now.isoformat(),
+        "booking_reminder_outbox_id": out.id,
+        "booking_reminder_provider_message_id": msg_id,
+        "booking_reminder_template": template_name,
+    }
+    job.status = "done"
+    job.locked_at = None
+    job.last_error = None
+    logger.info(
+        "promo_card_booking_reminder: sent job_id=%s phone=%s outbox_id=%s",
+        job.id,
+        phone,
+        out.id,
+    )
+
+
 async def process_job_in_session(
     session: AsyncSession,
     job_id: int,
@@ -1175,6 +1520,10 @@ async def _run_job_logic(
 
     if job.job_type == PROMO_APPLY_EXISTING_BOOKING_JOB_TYPE:
         await process_promo_apply_existing_booking_job(session, job)
+        return None
+
+    if job.job_type == PROMO_CARD_BOOKING_REMINDER_JOB_TYPE:
+        await _process_promo_card_booking_reminder(session, job, provider)
         return None
 
     with perf_log(
