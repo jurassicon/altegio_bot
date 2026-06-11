@@ -723,18 +723,30 @@ def test_models_have_reply_context_columns() -> None:
     assert ob_cols["chatwoot_conversation_id"].nullable
 
 
-def _load_migration():
-    path = (
-        Path(__file__).resolve().parents[3]
-        / "alembic"
-        / "versions"
-        / "c9d0e1f2a3b4_add_chatwoot_reply_context_columns.py"
-    )
-    spec = importlib.util.spec_from_file_location("reply_context_migration", path)
+_VERSIONS_DIR = Path(__file__).resolve().parents[3] / "alembic" / "versions"
+
+
+def _load_migration_module(filename: str, mod_name: str):
+    path = _VERSIONS_DIR / filename
+    spec = importlib.util.spec_from_file_location(mod_name, path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module, path
+
+
+def _load_migration():
+    return _load_migration_module(
+        "c9d0e1f2a3b4_add_chatwoot_reply_context_columns.py",
+        "reply_context_migration",
+    )
+
+
+def _load_index_migration():
+    return _load_migration_module(
+        "d0e1f2a3b4c5_add_reply_context_lookup_index.py",
+        "reply_context_index_migration",
+    )
 
 
 def test_migration_revision_chain() -> None:
@@ -754,9 +766,31 @@ def test_migration_is_idempotent_style() -> None:
     assert 'bind.dialect.name != "postgresql"' in source
 
 
-def test_migration_declares_reply_context_composite_index() -> None:
-    """Composite index for the hot reply-target lookup is created and dropped."""
+def test_columns_migration_does_not_own_composite_index() -> None:
+    """The columns migration must NOT manage the composite lookup index.
+
+    It moved to the dedicated follow-up migration so it is applied even in
+    environments where c9d0e1f2a3b4 was already applied in-place.
+    """
     _, path = _load_migration()
+    source = path.read_text()
+    assert "ix_outbox_messages_reply_context_lookup" not in source
+    # Single-column indexes still belong here.
+    assert "ix_outbox_messages_chatwoot_conversation_id" in source
+    assert "ix_outbox_messages_chatwoot_message_id" in source
+
+
+def test_index_migration_revision_chain() -> None:
+    module, _ = _load_index_migration()
+    assert module.revision == "d0e1f2a3b4c5"
+    assert module.down_revision == "c9d0e1f2a3b4"
+    assert module.branch_labels is None
+    assert module.depends_on is None
+
+
+def test_index_migration_declares_reply_context_composite_index() -> None:
+    """The follow-up migration creates and drops only the composite index."""
+    _, path = _load_index_migration()
     source = path.read_text()
 
     upgrade_src, downgrade_src = source.split("def downgrade")
@@ -766,12 +800,23 @@ def test_migration_declares_reply_context_composite_index() -> None:
     assert "provider_message_id, phone_e164, message_source, created_at DESC, id DESC" in upgrade_src
     assert "WHERE provider_message_id IS NOT NULL" in upgrade_src
 
-    # Dropped idempotently in downgrade, before the columns it depends on.
+    # Dropped idempotently in downgrade.
     assert "DROP INDEX IF EXISTS ix_outbox_messages_reply_context_lookup" in downgrade_src
-    drop_idx = downgrade_src.index("DROP INDEX IF EXISTS ix_outbox_messages_reply_context_lookup")
-    drop_col = downgrade_src.index("DROP COLUMN IF EXISTS chatwoot_message_id")
-    assert drop_idx < drop_col
 
-    # Pre-existing single-column indexes must NOT be removed.
-    assert "ix_outbox_messages_chatwoot_conversation_id" in upgrade_src
-    assert "ix_outbox_messages_chatwoot_message_id" in upgrade_src
+    # The follow-up migration must not touch columns or single-column indexes.
+    assert "DROP COLUMN" not in source
+    assert "ADD COLUMN" not in source
+    assert "ix_outbox_messages_chatwoot_conversation_id" not in source
+    assert "ix_outbox_messages_chatwoot_message_id" not in source
+
+
+def test_single_alembic_head() -> None:
+    """The follow-up migration must leave exactly one Alembic head."""
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    cfg = Config(str(Path(__file__).resolve().parents[3] / "alembic.ini"))
+    cfg.set_main_option("script_location", str(Path(__file__).resolve().parents[3] / "alembic"))
+    script = ScriptDirectory.from_config(cfg)
+    heads = list(script.get_heads())
+    assert heads == ["d0e1f2a3b4c5"], f"Expected single head d0e1f2a3b4c5, got {heads}"
