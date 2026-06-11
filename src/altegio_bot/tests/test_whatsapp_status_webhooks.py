@@ -577,13 +577,24 @@ async def test_inbound_message_still_forwarded_to_chatwoot(
     logged: list[str] = []
 
     class _FakeCW:
-        async def log_incoming_message(
+        async def get_or_create_incoming_conversation(
             self,
             phone: str,
-            text: str,
             contact_name: str | None = None,
-        ) -> None:
-            logged.append(text)
+        ) -> int:
+            return 20
+
+        async def send_message(
+            self,
+            conversation_id: int,
+            content: str,
+            *,
+            message_type: str = "outgoing",
+            private: bool = False,
+            content_attributes: dict | None = None,
+        ) -> int:
+            logged.append(content)
+            return 200
 
         async def aclose(self) -> None:
             pass

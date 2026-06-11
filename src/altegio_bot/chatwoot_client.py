@@ -240,8 +240,15 @@ class ChatwootClient:
         *,
         message_type: str = "outgoing",
         private: bool = False,
+        content_attributes: dict[str, Any] | None = None,
     ) -> int:
-        """Post a message to a conversation. Returns the message ID."""
+        """Post a message to a conversation. Returns the message ID.
+
+        ``content_attributes`` is forwarded verbatim to Chatwoot when provided
+        (used for native reply rendering via ``in_reply_to`` /
+        ``in_reply_to_external_id``).  It is omitted entirely when ``None`` so
+        existing behavior is unchanged.
+        """
         url = self._api(f"/conversations/{conversation_id}/messages")
 
         # Формируем тело без поля private
@@ -249,6 +256,9 @@ class ChatwootClient:
             "content": content,
             "message_type": message_type,
         }
+
+        if content_attributes is not None:
+            body["content_attributes"] = content_attributes
 
         # Chatwoot выдает 422, если отправить поле private для входящих сообщений,
         # поэтому добавляем его ТОЛЬКО для исходящих/заметок.
@@ -292,36 +302,58 @@ class ChatwootClient:
         except Exception:
             return False
 
+    async def get_or_create_incoming_conversation(
+        self,
+        phone_e164: str,
+        *,
+        contact_name: str | None = None,
+    ) -> int:
+        """Resolve the conversation an inbound message would land in.
+
+        Returns the conversation id WITHOUT posting a message, so the caller
+        can decide whether a native ``in_reply_to`` target lives in this same
+        conversation before sending.  Mirrors the contact/conversation
+        resolution that :meth:`log_incoming_message` performs.
+        """
+        contact_id = await self.get_or_create_contact(
+            phone_e164,
+            name=contact_name,
+        )
+        return await self.get_or_create_conversation(contact_id)
+
     async def log_incoming_message(
         self,
         phone_e164: str,
         content: str,
         *,
         contact_name: str | None = None,
+        content_attributes: dict[str, Any] | None = None,
     ) -> tuple[int, int]:
         """Log an incoming message from a customer.
 
         Returns (conversation_id, chatwoot_message_id).
         Best-effort: callers should catch all exceptions.
 
+        ``content_attributes`` (when provided) is forwarded so a WhatsApp
+        reply can render as a native Chatwoot reply (``in_reply_to``).
+
         No wa.me deeplink is appended — the client already has WhatsApp open
         and the link would only add noise to the conversation view.
         """
-        contact_id = await self.get_or_create_contact(
+        conversation_id = await self.get_or_create_incoming_conversation(
             phone_e164,
-            name=contact_name,
+            contact_name=contact_name,
         )
-        conversation_id = await self.get_or_create_conversation(contact_id)
 
         message_id = await self.send_message(
             conversation_id,
             content,
             message_type="incoming",
+            content_attributes=content_attributes,
         )
         logger.info(
-            "chatwoot: incoming logged phone=%s contact_id=%s conversation_id=%s message_id=%s",
+            "chatwoot: incoming logged phone=%s conversation_id=%s message_id=%s",
             phone_e164,
-            contact_id,
             conversation_id,
             message_id,
         )

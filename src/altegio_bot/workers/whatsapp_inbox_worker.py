@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import re
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Sequence
 
@@ -98,6 +99,31 @@ def _norm_phone(raw: str | None) -> str | None:
     return f"+{digits}"
 
 
+def _normalize_reply_context_id(value: Any) -> str | None:
+    """Normalize a WhatsApp ``context.id`` into a non-empty string or ``None``.
+
+    Meta sends the replied-to wamid as a string, but a malformed/spoofed
+    webhook could carry a non-string (int, dict, …) or whitespace.  Anything
+    that is not a non-empty string becomes ``None`` so it never reaches a
+    String-column lookup.
+    """
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value or None
+
+
+def _coerce_chatwoot_id(value: Any) -> int | None:
+    """Coerce a Chatwoot numeric id (int or digit string) to int, else None."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return None
+
+
 def _norm_text(raw: str | None) -> str:
     if not raw:
         return ""
@@ -164,15 +190,40 @@ def _is_chatwoot_origin(event: WhatsAppEvent, payload: dict[str, Any]) -> bool:
     """Return True if this event originated from Chatwoot (not from Meta directly).
 
     Prevents an infinite loop:
-    Chatwoot webhook -> WhatsAppEvent -> worker -> log_incoming_message -> Chatwoot webhook -> ...
+    Chatwoot webhook -> WhatsAppEvent -> worker -> forward to Chatwoot -> Chatwoot webhook -> ...
+
+    Origin is decided ONLY by markers the Chatwoot webhook itself stamps: the
+    "_chatwoot" payload key and the "chatwoot:" dedupe_key prefix.
+    ``chatwoot_conversation_id`` is deliberately NOT an origin signal: it is a
+    source-only marker, while forwarding a real Meta inbound records its
+    destination separately (``forwarded_chatwoot_conversation_id``), so a Meta
+    event must never flip into "chatwoot-origin" after being forwarded.
     """
     if "_chatwoot" in payload:
         return True
     if isinstance(event.dedupe_key, str) and event.dedupe_key.startswith("chatwoot:"):
         return True
-    if event.chatwoot_conversation_id is not None:
-        return True
     return False
+
+
+def _event_origin_for_metrics(event: WhatsAppEvent, payload: dict[str, Any]) -> str:
+    """Classify an event's origin for observability (metrics/log context only).
+
+    This is intentionally SEPARATE from :func:`_is_chatwoot_origin`, which
+    governs inbound loop prevention and must stay True only for the
+    "_chatwoot" payload marker and the "chatwoot:" dedupe_key prefix.
+
+    Operator relay events ("_chatwoot_operator_relay" payload, "chatwoot_out:"
+    dedupe_key) are Chatwoot-authored but are NOT inbound-loop chatwoot-origin,
+    so without a dedicated bucket they would be mislabeled "meta".  They get
+    their own label here to remove that observability noise; classification
+    has no effect on delivery or loop-prevention behavior.
+    """
+    if _is_operator_relay(payload):
+        return "chatwoot_operator_relay"
+    if _is_chatwoot_origin(event, payload):
+        return "chatwoot"
+    return "meta"
 
 
 async def _pick_sender(
@@ -448,12 +499,20 @@ def _extract_actions(payload: dict[str, Any]) -> list[dict[str, Any]]:
                 if phone is None:
                     continue
 
+                # Native WhatsApp reply: context.id is the wamid of the
+                # message the client replied to.
+                context = msg.get("context")
+                if not isinstance(context, dict):
+                    context = {}
+
                 actions.append(
                     {
                         "cmd": cmd,
                         "phone_e164": phone,
                         "phone_number_id": phone_number_id,
                         "text": text,
+                        "reply_to_provider_message_id": _normalize_reply_context_id(context.get("id")),
+                        "whatsapp_message_id": _normalize_reply_context_id(msg.get("id")),
                     }
                 )
 
@@ -622,6 +681,179 @@ async def _apply_status_updates(
     return [int(r) for r in cr_res.scalars().all()]
 
 
+@dataclass(frozen=True)
+class ReplyContextTarget:
+    """Resolved native-reply mapping for an inbound WhatsApp reply.
+
+    ``chatwoot_message_id`` / ``chatwoot_conversation_id`` point at the
+    operator message the client replied to; ``body`` is its display text,
+    used only for the visible fallback quote when no native id is usable.
+    """
+
+    chatwoot_message_id: int | None
+    chatwoot_conversation_id: int | None
+    body: str | None
+
+
+async def _get_reply_context_target(
+    session: AsyncSession,
+    provider_message_id: str | None,
+    *,
+    phone_e164: str | None,
+) -> ReplyContextTarget | None:
+    """Resolve a replied-to wamid to a prior operator-relay OutboxMessage.
+
+    Scoped to ``phone_e164`` as defense-in-depth so a malformed/spoofed
+    ``context.id`` can never resolve to another client's message.  PR1 covers
+    replies to operator messages only (``message_source='operator'``);
+    bot/campaign messages are not reply targets.  Returns ``None`` on a miss.
+    """
+    if not provider_message_id or not phone_e164:
+        return None
+
+    stmt = (
+        select(
+            OutboxMessage.chatwoot_message_id,
+            OutboxMessage.chatwoot_conversation_id,
+            OutboxMessage.body,
+        )
+        .where(OutboxMessage.provider_message_id == provider_message_id)
+        .where(OutboxMessage.phone_e164 == phone_e164)
+        .where(OutboxMessage.message_source == "operator")
+        .order_by(OutboxMessage.created_at.desc(), OutboxMessage.id.desc())
+        .limit(1)
+    )
+    res = await session.execute(stmt)
+    row = res.first()
+    if row is None:
+        return None
+    return ReplyContextTarget(
+        chatwoot_message_id=row[0],
+        chatwoot_conversation_id=row[1],
+        body=row[2],
+    )
+
+
+_QUOTE_MAX_CHARS = 300
+
+
+def _format_reply_context_prefix(quoted_body: str | None) -> str:
+    """Build the visible quote prefix shown above a WhatsApp reply in Chatwoot.
+
+    Used only when no safe native ``in_reply_to`` mapping is available
+    (missing target, no chatwoot_message_id, or a cross-conversation target),
+    so the operator still sees that the client used a reply.
+    """
+    if not quoted_body:
+        return "↩️ Ответ на сообщение в WhatsApp"
+    if quoted_body == "[image]":
+        return "↩️ Ответ на изображение"
+    quoted = quoted_body
+    if len(quoted) > _QUOTE_MAX_CHARS:
+        quoted = quoted[:_QUOTE_MAX_CHARS].rstrip() + "…"
+    return f"↩️ Ответ на сообщение:\n«{quoted}»"
+
+
+async def _forward_text_to_chatwoot(
+    session: AsyncSession,
+    event: WhatsAppEvent,
+    *,
+    phone_e164: str,
+    text: str,
+    reply_to_provider_message_id: str | None = None,
+) -> None:
+    """Forward an inbound Meta-origin text to Chatwoot, native-reply first.
+
+    Resolves the destination conversation BEFORE posting so a native
+    ``in_reply_to`` is attached only when the replied-to operator message
+    lives in that same conversation; otherwise a visible quote prefix is
+    used.  Records the destination in ``forwarded_chatwoot_conversation_id``
+    — never in ``chatwoot_conversation_id``, which stays a Chatwoot-origin
+    source marker.
+    """
+    variants = _phone_variants(phone_e164)
+    stmt = (
+        select(Client.display_name)
+        .where(Client.phone_e164.in_(variants))
+        .where(Client.display_name.is_not(None))
+        .limit(1)
+    )
+    res = await session.execute(stmt)
+    client_name = res.scalar_one_or_none()
+
+    cw = ChatwootClient()
+    try:
+        conversation_id = await cw.get_or_create_incoming_conversation(
+            phone_e164,
+            contact_name=client_name,
+        )
+
+        content = text
+        content_attributes: dict[str, Any] | None = None
+        if reply_to_provider_message_id:
+            target = await _get_reply_context_target(
+                session,
+                reply_to_provider_message_id,
+                phone_e164=phone_e164,
+            )
+            native_ok = (
+                target is not None
+                and target.chatwoot_message_id is not None
+                and target.chatwoot_conversation_id == conversation_id
+            )
+            if native_ok:
+                content_attributes = {
+                    "in_reply_to": target.chatwoot_message_id,
+                    "in_reply_to_external_id": reply_to_provider_message_id,
+                }
+            else:
+                if (
+                    target is not None
+                    and target.chatwoot_message_id is not None
+                    and target.chatwoot_conversation_id != conversation_id
+                ):
+                    logger.info(
+                        "reply_context: skipping native mapping, conversation differs "
+                        "target_conversation_id=%s destination_conversation_id=%s",
+                        target.chatwoot_conversation_id,
+                        conversation_id,
+                    )
+                quoted_body = target.body if target is not None else None
+                prefix = _format_reply_context_prefix(quoted_body)
+                content = f"{prefix}\n\n{text}"
+
+        message_id = await cw.send_message(
+            conversation_id,
+            content,
+            message_type="incoming",
+            content_attributes=content_attributes,
+        )
+    except Exception as exc:
+        # Keep the persisted error free of URLs/tokens/response bodies.
+        safe_error = f"chatwoot forward failed: {type(exc).__name__}"
+        event.error = safe_error
+        logger.warning(
+            "chatwoot: forward failed phone=%s %s",
+            phone_e164,
+            type(exc).__name__,
+        )
+        raise RuntimeError(safe_error) from None
+    finally:
+        await cw.aclose()
+
+    event.forwarded_chatwoot_conversation_id = conversation_id
+    event.chatwoot_message_id = message_id
+    event.error = None
+    logger.info(
+        "Forwarded incoming message to Chatwoot phone=%s name=%s conversation_id=%s message_id=%s native_reply=%s",
+        phone_e164,
+        client_name,
+        conversation_id,
+        message_id,
+        content_attributes is not None,
+    )
+
+
 async def _handle_operator_relay(
     session: AsyncSession,
     event: WhatsAppEvent,
@@ -653,6 +885,11 @@ async def _handle_operator_relay(
     phone_number_id = relay.get("phone_number_id")
     chatwoot_inbox_id = relay.get("chatwoot_inbox_id")
     agent_name = relay.get("agent_name", "")
+
+    # Indexed copies for the native-reply lookup (kept in meta as-is for
+    # backward compatibility).  Non-numeric values degrade to None.
+    cw_conversation_id = _coerce_chatwoot_id(conversation_id)
+    cw_message_id = _coerce_chatwoot_id(chatwoot_message_id)
 
     if phone_e164 is None:
         logger.warning(
@@ -787,6 +1024,8 @@ async def _handle_operator_relay(
             scheduled_at=now,
             sent_at=now,
             message_source="operator",
+            chatwoot_conversation_id=cw_conversation_id,
+            chatwoot_message_id=cw_message_id,
             meta={
                 "chatwoot_conversation_id": conversation_id,
                 "chatwoot_message_id": chatwoot_message_id,
@@ -833,6 +1072,8 @@ async def _handle_operator_relay(
             scheduled_at=now,
             sent_at=None,
             message_source="operator",
+            chatwoot_conversation_id=cw_conversation_id,
+            chatwoot_message_id=cw_message_id,
             meta={
                 "send_type": "none",
                 "attempted_send_type": "text",
@@ -982,6 +1223,8 @@ async def _handle_operator_relay(
         scheduled_at=now,
         sent_at=now,
         message_source="operator",
+        chatwoot_conversation_id=cw_conversation_id,
+        chatwoot_message_id=cw_message_id,
         meta={
             "send_type": "template",
             "template": template_name,
@@ -1090,41 +1333,32 @@ async def handle_event(
     phone_e164 = str(action["phone_e164"])
     phone_number_id = action.get("phone_number_id")
     text = action.get("text", "")
+    reply_to_provider_message_id = action.get("reply_to_provider_message_id")
 
     sender_id, company_id = await _pick_sender(session, phone_number_id)
-    if text:
-        if _is_chatwoot_origin(event, payload):
+
+    chatwoot_origin = _is_chatwoot_origin(event, payload)
+
+    # Audit: keep the inbound wamid of real Meta-origin messages.  Chatwoot
+    # mirrors carry a synthetic Chatwoot message id there, so they are skipped.
+    if not chatwoot_origin and action.get("whatsapp_message_id"):
+        event.whatsapp_message_id = action["whatsapp_message_id"]
+
+    if text and cmd is None:
+        if chatwoot_origin:
             logger.debug(
                 "Skipping Chatwoot log for chatwoot-origin event dedupe_key=%s phone=%s",
                 event.dedupe_key,
                 phone_e164,
             )
         else:
-            # 1. Ищем имя клиента в нашей базе данных.
-            variants = _phone_variants(phone_e164)
-            stmt = (
-                select(Client.display_name)
-                .where(Client.phone_e164.in_(variants))
-                .where(Client.display_name.is_not(None))
-                .limit(1)
+            await _forward_text_to_chatwoot(
+                session,
+                event,
+                phone_e164=phone_e164,
+                text=text,
+                reply_to_provider_message_id=reply_to_provider_message_id,
             )
-            res = await session.execute(stmt)
-            client_name = res.scalar_one_or_none()
-
-            # 2. Передаем найденное имя в Chatwoot.
-            cw = ChatwootClient()
-            try:
-                await cw.log_incoming_message(phone_e164, text, contact_name=client_name)
-                logger.info("Forwarded incoming message to Chatwoot phone=%s name=%s", phone_e164, client_name)
-            except Exception as exc:
-                logger.warning(
-                    "chatwoot: forward failed phone=%s %s: %s",
-                    phone_e164,
-                    type(exc).__name__,
-                    exc,
-                )
-            finally:
-                await cw.aclose()
 
     if cmd is None:
         event.error = None
@@ -1133,7 +1367,7 @@ async def handle_event(
     # Guard: Chatwoot-origin mirror events must not execute inbound commands.
     # The original Meta-origin event already handled the command; processing
     # its Chatwoot mirror causes duplicate acks and double opt-outs.
-    if _is_chatwoot_origin(event, payload):
+    if chatwoot_origin:
         logger.info(
             "Skipping inbound command handling for Chatwoot-origin event id=%s dedupe_key=%s",
             event.id,
@@ -1277,7 +1511,7 @@ async def process_one_event(
                     company_id=event.company_id,
                     dedupe_key=event.dedupe_key,
                     chatwoot_conversation_id=event.chatwoot_conversation_id,
-                    origin="chatwoot" if _is_chatwoot_origin(event, event.payload or {}) else "meta",
+                    origin=_event_origin_for_metrics(event, event.payload or {}),
                 )
 
                 try:

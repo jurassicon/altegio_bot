@@ -564,6 +564,9 @@ async def test_operator_relay_outbox_persisted(session_maker, monkeypatch) -> No
     assert outbox.status == "sent"
     assert outbox.meta.get("agent_name") == "Boris"
     assert outbox.meta.get("chatwoot_conversation_id") == 30
+    # Indexed copies for the native-reply lookup (PR1).
+    assert outbox.chatwoot_conversation_id == 30
+    assert outbox.chatwoot_message_id == 40
 
 
 # ---------------------------------------------------------------------------

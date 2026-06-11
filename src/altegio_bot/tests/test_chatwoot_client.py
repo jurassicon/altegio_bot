@@ -143,6 +143,113 @@ async def test_send_message(client: ChatwootClient) -> None:
 
 @respx.mock
 @pytest.mark.asyncio
+async def test_send_message_includes_content_attributes(client: ChatwootClient) -> None:
+    """content_attributes must be forwarded verbatim when provided."""
+    route = respx.post("https://chatwoot.example.com/api/v1/accounts/1/conversations/15/messages").mock(
+        return_value=httpx.Response(200, json={"id": 102, "content": "Reply"})
+    )
+
+    attrs = {"in_reply_to": 7644, "in_reply_to_external_id": "wamid.X"}
+    msg_id = await client.send_message(
+        15,
+        "Reply",
+        message_type="incoming",
+        content_attributes=attrs,
+    )
+    assert msg_id == 102
+
+    body = json.loads(route.calls[0].request.content)
+    assert body["content_attributes"] == attrs
+    assert body["message_type"] == "incoming"
+    # private must never be sent for incoming messages (Chatwoot 422).
+    assert "private" not in body
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_send_message_without_content_attributes_omits_key(client: ChatwootClient) -> None:
+    """The content_attributes key must be absent when not provided."""
+    route = respx.post("https://chatwoot.example.com/api/v1/accounts/1/conversations/15/messages").mock(
+        return_value=httpx.Response(200, json={"id": 103, "content": "Plain"})
+    )
+
+    await client.send_message(15, "Plain", message_type="incoming")
+
+    body = json.loads(route.calls[0].request.content)
+    assert "content_attributes" not in body
+    assert "private" not in body
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_send_message_outgoing_keeps_private_with_content_attributes(client: ChatwootClient) -> None:
+    """For outgoing messages private is still sent alongside content_attributes."""
+    route = respx.post("https://chatwoot.example.com/api/v1/accounts/1/conversations/15/messages").mock(
+        return_value=httpx.Response(200, json={"id": 104, "content": "Note"})
+    )
+
+    await client.send_message(
+        15,
+        "Note",
+        message_type="outgoing",
+        private=True,
+        content_attributes={"in_reply_to": 1},
+    )
+
+    body = json.loads(route.calls[0].request.content)
+    assert body["private"] is True
+    assert body["content_attributes"] == {"in_reply_to": 1}
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_get_or_create_incoming_conversation_does_not_post_message(
+    client: ChatwootClient,
+) -> None:
+    """Must resolve contact + conversation without posting any message."""
+    respx.get("https://chatwoot.example.com/api/v1/accounts/1/contacts/search").mock(
+        return_value=httpx.Response(200, json={"payload": [{"id": 5, "phone_number": "+49111222333"}]})
+    )
+    respx.get("https://chatwoot.example.com/api/v1/accounts/1/contacts/5/conversations").mock(
+        return_value=httpx.Response(200, json={"payload": [{"id": 20, "inbox_id": 2, "status": "open"}]})
+    )
+    post_route = respx.post("https://chatwoot.example.com/api/v1/accounts/1/conversations/20/messages").mock(
+        return_value=httpx.Response(200, json={"id": 999})
+    )
+
+    conv_id = await client.get_or_create_incoming_conversation("+49111222333")
+    assert conv_id == 20
+    assert not post_route.called
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_log_incoming_message_passes_content_attributes(client: ChatwootClient) -> None:
+    """log_incoming_message must forward content_attributes to send_message."""
+    respx.get("https://chatwoot.example.com/api/v1/accounts/1/contacts/search").mock(
+        return_value=httpx.Response(200, json={"payload": [{"id": 5, "phone_number": "+49111222333"}]})
+    )
+    respx.get("https://chatwoot.example.com/api/v1/accounts/1/contacts/5/conversations").mock(
+        return_value=httpx.Response(200, json={"payload": [{"id": 20, "inbox_id": 2, "status": "open"}]})
+    )
+    route = respx.post("https://chatwoot.example.com/api/v1/accounts/1/conversations/20/messages").mock(
+        return_value=httpx.Response(200, json={"id": 201, "content": "Hi"})
+    )
+
+    attrs = {"in_reply_to": 7644, "in_reply_to_external_id": "wamid.X"}
+    conv_id, msg_id = await client.log_incoming_message(
+        "+49111222333",
+        "Hi",
+        content_attributes=attrs,
+    )
+    assert (conv_id, msg_id) == (20, 201)
+
+    body = json.loads(route.calls[0].request.content)
+    assert body["content_attributes"] == attrs
+
+
+@respx.mock
+@pytest.mark.asyncio
 async def test_log_incoming_message(client: ChatwootClient) -> None:
     """log_incoming_message should create contact, conversation, and message."""
     respx.get("https://chatwoot.example.com/api/v1/accounts/1/contacts/search").mock(

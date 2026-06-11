@@ -1464,6 +1464,9 @@ def test_reminder_24h_stale_payload_cancels(monkeypatch: Any) -> None:
 
     monkeypatch.setattr(ow, "safe_send", fake_safe_send)
     monkeypatch.setattr(ow, "safe_send_template", fake_safe_send)
+    # Freeze "now" before the record start so the past-record guard does not
+    # cancel the job before the stale-payload check runs.
+    monkeypatch.setattr(ow, "utcnow", lambda: datetime(2026, 5, 31, 10, 0, tzinfo=timezone.utc))
 
     session = FakeSession()
     run(ow.process_job_in_session(session, 500, provider=object()))  # type: ignore
@@ -1493,6 +1496,9 @@ def test_reminder_2h_stale_payload_cancels(monkeypatch: Any) -> None:
 
     monkeypatch.setattr(ow, "safe_send", fake_safe_send)
     monkeypatch.setattr(ow, "safe_send_template", fake_safe_send)
+    # Freeze "now" before the record start so the past-record guard does not
+    # cancel the job before the stale-payload check runs.
+    monkeypatch.setattr(ow, "utcnow", lambda: datetime(2026, 5, 31, 10, 0, tzinfo=timezone.utc))
 
     session = FakeSession()
     run(ow.process_job_in_session(session, 500, provider=object()))  # type: ignore
@@ -1519,6 +1525,9 @@ def test_reminder_malformed_record_starts_at_cancels(monkeypatch: Any) -> None:
 
     monkeypatch.setattr(ow, "safe_send", fake_safe_send)
     monkeypatch.setattr(ow, "safe_send_template", fake_safe_send)
+    # Freeze "now" before the record start so the past-record guard does not
+    # cancel the job before the malformed-payload check runs.
+    monkeypatch.setattr(ow, "utcnow", lambda: datetime(2026, 5, 31, 10, 0, tzinfo=timezone.utc))
 
     session = FakeSession()
     run(ow.process_job_in_session(session, 500, provider=object()))  # type: ignore
@@ -1602,6 +1611,9 @@ def test_reminder_legacy_stale_24h_cancels(monkeypatch: Any) -> None:
 
     monkeypatch.setattr(ow, "safe_send", fake_safe_send)
     monkeypatch.setattr(ow, "safe_send_template", fake_safe_send)
+    # Freeze "now" before the record start so the past-record guard does not
+    # cancel the job before the legacy stale-check runs.
+    monkeypatch.setattr(ow, "utcnow", lambda: datetime(2026, 5, 31, 10, 0, tzinfo=timezone.utc))
 
     session = FakeSession()
     run(ow.process_job_in_session(session, 502, provider=object()))  # type: ignore
@@ -1635,6 +1647,9 @@ def test_reminder_legacy_stale_2h_cancels(monkeypatch: Any) -> None:
 
     monkeypatch.setattr(ow, "safe_send", fake_safe_send)
     monkeypatch.setattr(ow, "safe_send_template", fake_safe_send)
+    # Freeze "now" before the record start so the past-record guard does not
+    # cancel the job before the legacy stale-check runs.
+    monkeypatch.setattr(ow, "utcnow", lambda: datetime(2026, 5, 31, 10, 0, tzinfo=timezone.utc))
 
     session = FakeSession()
     run(ow.process_job_in_session(session, 503, provider=object()))  # type: ignore

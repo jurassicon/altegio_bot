@@ -78,6 +78,17 @@ def _verify_signature(body: bytes, signature: str | None) -> bool:
     return False
 
 
+def _coerce_int(value: object) -> int | None:
+    """Coerce a Chatwoot numeric id (int or digit string) to int, else None."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return None
+
+
 def _parse_timestamp(raw: object) -> int:
     """Return Unix timestamp (seconds) from a Chatwoot created_at value."""
     try:
@@ -223,6 +234,7 @@ async def _ingest_incoming(
         dedupe_key=dedupe_key,
         normalized_payload=normalized_payload,
         chatwoot_conversation_id=chatwoot_conversation_id,
+        chatwoot_message_id=_coerce_int(chatwoot_message_id),
         log_ctx={
             "conv_id": chatwoot_conversation_id,
             "msg_id": chatwoot_message_id,
@@ -295,6 +307,7 @@ async def _ingest_operator_outgoing(
         dedupe_key=dedupe_key,
         normalized_payload=normalized_payload,
         chatwoot_conversation_id=chatwoot_conversation_id,
+        chatwoot_message_id=_coerce_int(chatwoot_message_id),
         log_ctx={
             "conv_id": chatwoot_conversation_id,
             "msg_id": chatwoot_message_id,
@@ -309,6 +322,7 @@ async def _store_event(
     dedupe_key: str,
     normalized_payload: dict,
     chatwoot_conversation_id: int | None,
+    chatwoot_message_id: int | None = None,
     log_ctx: dict,
 ) -> JSONResponse:
     """Persist a WhatsAppEvent row, handling duplicate dedupe_key gracefully."""
@@ -323,6 +337,7 @@ async def _store_event(
                     headers=_safe_headers(request),
                     payload=normalized_payload,
                     chatwoot_conversation_id=chatwoot_conversation_id,
+                    chatwoot_message_id=chatwoot_message_id,
                 )
                 session.add(event)
                 await session.flush()

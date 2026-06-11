@@ -70,7 +70,9 @@ def _chatwoot_payload(phone_number_id: str, from_phone: str, text: str, conv_id:
 def _mock_chatwoot_client() -> tuple[MagicMock, MagicMock]:
     """Return (mock_class, mock_instance) for ChatwootClient."""
     mock_instance = MagicMock()
-    mock_instance.log_incoming_message = AsyncMock(return_value=None)
+    mock_instance.log_incoming_message = AsyncMock(return_value=(20, 200))
+    mock_instance.get_or_create_incoming_conversation = AsyncMock(return_value=20)
+    mock_instance.send_message = AsyncMock(return_value=200)
     mock_instance.aclose = AsyncMock(return_value=None)
     mock_class = MagicMock(return_value=mock_instance)
     return mock_class, mock_instance
@@ -114,10 +116,12 @@ async def test_chatwoot_origin_does_not_call_log_incoming_message(session_maker)
                 await handle_event(session, evt, provider)
 
     mock_instance.log_incoming_message.assert_not_called()
+    mock_instance.get_or_create_incoming_conversation.assert_not_called()
+    mock_instance.send_message.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_real_wa_event_calls_log_incoming_message(session_maker) -> None:
+async def test_real_wa_event_forwarded_to_chatwoot(session_maker) -> None:
     """A real Meta-origin event must be forwarded to Chatwoot as before."""
     provider = _NoOpProvider()
     phone = "+49987654321"
@@ -154,9 +158,19 @@ async def test_real_wa_event_calls_log_incoming_message(session_maker) -> None:
             ):
                 await handle_event(session, evt, provider)
 
-    mock_instance.log_incoming_message.assert_called_once()
-    call_kwargs = mock_instance.log_incoming_message.call_args
-    assert call_kwargs.args[0] == phone or call_kwargs.kwargs.get("phone") == phone
+    mock_instance.get_or_create_incoming_conversation.assert_called_once()
+    conv_call = mock_instance.get_or_create_incoming_conversation.call_args
+    assert conv_call.args[0] == phone or conv_call.kwargs.get("phone_e164") == phone
+
+    mock_instance.send_message.assert_called_once()
+    send_call = mock_instance.send_message.call_args
+    assert send_call.kwargs.get("message_type") == "incoming"
+    assert "Hello from Meta" in (send_call.args[1] if len(send_call.args) > 1 else send_call.kwargs.get("content"))
+
+    # Destination is recorded separately from the source marker.
+    assert evt.forwarded_chatwoot_conversation_id == 20
+    assert evt.chatwoot_message_id == 200
+    assert evt.chatwoot_conversation_id is None
 
 
 @pytest.mark.asyncio
@@ -211,6 +225,7 @@ async def test_chatwoot_origin_stop_command_skipped(session_maker) -> None:
             client = await session.scalar(select(Client).where(Client.phone_e164 == phone))
 
     mock_instance.log_incoming_message.assert_not_called()
+    mock_instance.send_message.assert_not_called()
     assert client is not None
     # Command must NOT have been executed — wa_opted_out stays False.
     assert client.wa_opted_out is False
