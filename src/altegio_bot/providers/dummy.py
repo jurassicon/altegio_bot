@@ -41,14 +41,16 @@ class DummyProvider(WhatsAppProvider):
         text: str,
         *,
         contact_name: str | None = None,
+        reply_to_provider_message_id: str | None = None,
     ) -> str:
         provider_message_id = f"dummy-{uuid4()}"
         logger.info(
-            "Dummy send sender_id=%s phone=%s text_len=%s msg_id=%s",
+            "Dummy send sender_id=%s phone=%s text_len=%s msg_id=%s reply_context=%s",
             sender_id,
             phone_e164,
             len(text),
             provider_message_id,
+            bool(reply_to_provider_message_id),
         )
         return provider_message_id
 
@@ -87,12 +89,15 @@ async def safe_send(
     company_id: int = 0,
     staff_id: int | None = None,
     contact_name: str | None = None,
+    reply_to_provider_message_id: str | None = None,
 ) -> tuple[str | None, str | None]:
     if not _real_send_allowed(provider):
         return None, "Real send disabled"
 
     try:
         kwargs: dict[str, object] = {"contact_name": contact_name}
+        if isinstance(reply_to_provider_message_id, str) and reply_to_provider_message_id.strip():
+            kwargs["reply_to_provider_message_id"] = reply_to_provider_message_id.strip()
         if _supports_mirror(provider):
             kwargs["company_id"] = company_id
             kwargs["staff_id"] = staff_id
