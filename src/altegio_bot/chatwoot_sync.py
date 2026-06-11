@@ -18,6 +18,8 @@ from typing import Any
 
 import httpx
 
+from altegio_bot.chatwoot_client import forwarded_proto_header
+
 logger = logging.getLogger(__name__)
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -49,10 +51,12 @@ def _build_base_url(chatwoot_base_url: str, chatwoot_account_id: int) -> str:
 
 
 def _auth_headers(chatwoot_api_token: str) -> dict[str, str]:
-    return {
+    headers = {
         "api_access_token": chatwoot_api_token,
         "Content-Type": "application/json",
     }
+    headers.update(forwarded_proto_header())
+    return headers
 
 
 async def _get_messages(

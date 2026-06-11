@@ -109,6 +109,15 @@ class Settings(BaseSettings):
     chatwoot_account_id: int = 0
     chatwoot_webhook_secret: str = ""
 
+    # Optional X-Forwarded-Proto value for outgoing Chatwoot API calls.
+    # Empty (default) — header is not sent, behaviour unchanged.
+    # "https" — required for verified internal Docker routes (e.g.
+    # CHATWOOT_BASE_URL=http://rails:3000): Rails answers 301 to plain
+    # internal HTTP without this header. Allowed values: "http", "https".
+    # Invalid values never add the header (warning is logged instead),
+    # so a typo cannot change request semantics.
+    chatwoot_api_forwarded_proto: str = ""
+
     # Meta-first cutover: route Chatwoot operator replies through
     # altegio_bot → Meta instead of relying on Chatwoot WhatsApp inbox.
     # Default False (safe). Enable only after verifying no double-send risk.

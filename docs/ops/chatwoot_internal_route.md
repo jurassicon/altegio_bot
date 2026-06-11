@@ -127,20 +127,57 @@ $COMPOSE exec -T altegio-outbox-worker /app/.venv/bin/python \
 
 $COMPOSE exec -T altegio-outbox-worker /app/.venv/bin/python \
   -m altegio_bot.scripts.probe_chatwoot_latency \
-  --base-url http://chatwoot_rails_1:3000 \
-  --query "+490000000000"
+  --base-url "http://rails:3000" \
+  --forwarded-proto https \
+  --requests 15 \
+  --query "+381638400431"
 ```
 
 A candidate passes when all requests return HTTP 200 and latency is below
 the public baseline. If every internal candidate fails, stop here — the
 public URL stays in place and nothing is broken.
 
-## 8. Update production `.env` (only after probes pass)
+## 8. Internal route requires X-Forwarded-Proto
+
+Production diagnostics (June 2026) after attaching the workers to
+`chatwoot_default`: internal DNS works (`rails` → 172.19.0.4,
+`chatwoot_rails_1` → 172.19.0.4), but plain internal HTTP is redirected by
+Rails because it enforces HTTPS:
+
+```text
+http://rails:3000 plain                                  -> 301
+http://chatwoot_rails_1:3000 plain                       -> 301
+http://rails:3000 + X-Forwarded-Proto: https             -> 200
+http://chatwoot_rails_1:3000 + X-Forwarded-Proto: https  -> 200
+```
+
+A `Host` header is not needed — `X-Forwarded-Proto: https` alone is enough
+for a 200. This is exactly what the reverse proxy adds on the public route.
+
+`altegio_bot` supports this via the opt-in env var
+`CHATWOOT_API_FORWARDED_PROTO`. When set to `https`, every outgoing Chatwoot
+API request (and only Chatwoot API requests) carries
+`X-Forwarded-Proto: https`. Empty (default) — no header, behaviour
+unchanged. Invalid values are ignored with a warning. Chatwoot's own
+`FRONTEND_URL` is not involved and must not be changed.
+
+Recommended production env after verification:
+
+```env
+CHATWOOT_BASE_URL=http://rails:3000
+CHATWOOT_API_FORWARDED_PROTO=https
+```
+
+But only after the probe in step 7 returns `200x15` for that exact
+combination.
+
+## 9. Update production `.env` (only after probes pass)
 
 Manually edit `/opt/altegio_bot/.env`:
 
 ```env
 CHATWOOT_BASE_URL=http://<verified-host>:3000
+CHATWOOT_API_FORWARDED_PROTO=https
 ```
 
 Then recreate only the app containers with the same compose file set:
@@ -154,27 +191,32 @@ $COMPOSE up -d \
   altegio-campaign-worker
 ```
 
-## 9. Runtime env verification
+## 10. Runtime env verification
 
 ```bash
-$COMPOSE exec -T altegio-outbox-worker sh -lc 'echo "CHATWOOT_BASE_URL=$CHATWOOT_BASE_URL"'
+$COMPOSE exec -T altegio-outbox-worker sh -lc \
+  'echo "CHATWOOT_BASE_URL=$CHATWOOT_BASE_URL"; echo "CHATWOOT_API_FORWARDED_PROTO=$CHATWOOT_API_FORWARDED_PROTO"'
 ```
 
-Must print the new internal URL.
+Must print the new internal URL and `https`.
 
-## 10. Latency before/after
+## 11. Latency before/after
 
-Re-run the same 15-request probe from step 7 against the now-active base URL
-(no `--base-url` flag = read from env) and compare with the recorded public
-baseline (avg=0.146s, median=0.113s, max=0.456s):
+Re-run the same 15-request probe from step 7 against the now-active runtime
+env (no `--base-url` and no `--forwarded-proto` flags = both read from env)
+and compare with the recorded public baseline (avg=0.146s, median=0.113s,
+max=0.456s; re-measured June 2026: avg=0.053s, median=0.042s):
 
 ```bash
 $COMPOSE exec -T altegio-outbox-worker /app/.venv/bin/python \
   -m altegio_bot.scripts.probe_chatwoot_latency \
-  --query "+490000000000"
+  --requests 15 \
+  --query "+381638400431"
 ```
 
-## 11. Functional smoke tests
+The probe prints `forwarded_proto=https` when the env var is active.
+
+## 12. Functional smoke tests
 
 After the switch, verify end to end:
 
@@ -190,15 +232,17 @@ $COMPOSE logs --since 15m altegio-api altegio-outbox-worker \
   altegio-inbox-worker altegio-whatsapp-inbox-worker | grep -iE "traceback|error" | head
 ```
 
-## 12. Rollback
+## 13. Rollback
 
-Set the public URL back in `/opt/altegio_bot/.env`:
+Set the public URL back in `/opt/altegio_bot/.env` and clear the forwarded
+proto (the header is harmless on the public route, but keep rollback exact):
 
 ```env
 CHATWOOT_BASE_URL=https://chatwoot.kitilash.com
+CHATWOOT_API_FORWARDED_PROTO=
 ```
 
-Recreate only the app containers (same compose file set as in step 8).
+Recreate only the app containers (same compose file set as in step 9).
 Do not touch Chatwoot containers, database or volumes. If needed, the
 network attachment itself can also be dropped by running `up -d` with only
 `-f docker-compose.yml` — but that is not required for rollback; the public

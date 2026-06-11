@@ -19,6 +19,43 @@ from altegio_bot.settings import settings
 
 logger = logging.getLogger(__name__)
 
+_ALLOWED_FORWARDED_PROTOS = ("http", "https")
+
+
+def normalize_forwarded_proto(value: str | None) -> str | None:
+    """Validate a CHATWOOT_API_FORWARDED_PROTO value.
+
+    Returns "http"/"https" (trimmed, lower-cased) or None when the header
+    must not be sent. Invalid values are ignored with a warning so a typo
+    can never silently change request semantics.
+    """
+    if value is None:
+        return None
+    cleaned = value.strip().lower()
+    if not cleaned:
+        return None
+    if cleaned in _ALLOWED_FORWARDED_PROTOS:
+        return cleaned
+    logger.warning(
+        "chatwoot: ignoring invalid CHATWOOT_API_FORWARDED_PROTO=%r (expected 'http' or 'https')",
+        value,
+    )
+    return None
+
+
+def forwarded_proto_header(value: str | None = None) -> dict[str, str]:
+    """Optional X-Forwarded-Proto header for Chatwoot API requests.
+
+    Reads settings.chatwoot_api_forwarded_proto unless an explicit value is
+    given. Returns {} when the feature is off — callers can always merge the
+    result into their existing headers.
+    """
+    raw = value if value is not None else settings.chatwoot_api_forwarded_proto
+    proto = normalize_forwarded_proto(raw)
+    if proto:
+        return {"X-Forwarded-Proto": proto}
+    return {}
+
 
 def append_wa_deeplink(text: str, phone_e164: str | None) -> str:
     """Append a WhatsApp deeplink footer to a Chatwoot message body.
@@ -60,21 +97,30 @@ class ChatwootClient:
         account_id: int | None = None,
         inbox_id: int | None = None,
         timeout_sec: float = 15.0,
+        forwarded_proto: str | None = None,
     ) -> None:
         self._base_url = (base_url or settings.chatwoot_base_url).rstrip("/")
         self._api_token = api_token or settings.chatwoot_api_token
         self._account_id = account_id if account_id is not None else settings.chatwoot_account_id
         self._inbox_id = inbox_id if inbox_id is not None else settings.chatwoot_inbox_id
+        # Normalize once: an invalid value warns a single time per client,
+        # not on every request.
+        self._forwarded_proto = normalize_forwarded_proto(
+            forwarded_proto if forwarded_proto is not None else settings.chatwoot_api_forwarded_proto
+        )
         self._client = httpx.AsyncClient(timeout=timeout_sec)
 
     async def aclose(self) -> None:
         await self._client.aclose()
 
     def _headers(self) -> dict[str, str]:
-        return {
+        headers = {
             "api_access_token": self._api_token,
             "Content-Type": "application/json",
         }
+        if self._forwarded_proto:
+            headers["X-Forwarded-Proto"] = self._forwarded_proto
+        return headers
 
     def _api(self, path: str) -> str:
         return f"{self._base_url}/api/v1/accounts/{self._account_id}{path}"

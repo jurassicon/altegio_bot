@@ -7,8 +7,10 @@ public Chatwoot URL against internal Docker route candidates.
 
 Reads CHATWOOT_BASE_URL, CHATWOOT_ACCOUNT_ID and CHATWOOT_API_TOKEN from the
 environment; --base-url overrides the env URL for probing candidates without
-touching .env. GET-only: no Chatwoot mutations, no production writes. The
-API token is never printed.
+touching .env. Internal Docker routes (e.g. http://rails:3000) answer 301 to
+plain HTTP — pass --forwarded-proto https (or set CHATWOOT_API_FORWARDED_PROTO)
+to send the X-Forwarded-Proto header and get a real 200. GET-only: no Chatwoot
+mutations, no production writes. The API token is never printed.
 """
 
 from __future__ import annotations
@@ -21,6 +23,8 @@ import time
 from collections import Counter
 
 import httpx
+
+from altegio_bot.chatwoot_client import normalize_forwarded_proto
 
 DEFAULT_REQUESTS = 15
 DEFAULT_TIMEOUT_SEC = 10.0
@@ -53,6 +57,14 @@ def _build_parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_TIMEOUT_SEC,
         help=f"per-request timeout in seconds (default: {DEFAULT_TIMEOUT_SEC})",
+    )
+    parser.add_argument(
+        "--forwarded-proto",
+        default=None,
+        help=(
+            "send X-Forwarded-Proto with this value (http/https); "
+            "default: CHATWOOT_API_FORWARDED_PROTO from env, empty = no header"
+        ),
     )
     return parser
 
@@ -89,8 +101,18 @@ async def _run(args: argparse.Namespace) -> int:
         print("ERROR: CHATWOOT_API_TOKEN is not set")
         return 2
 
+    # CLI flag wins over env; both go through the same validation as the
+    # production client (invalid value → no header, warning logged).
+    forwarded_proto = normalize_forwarded_proto(
+        args.forwarded_proto if args.forwarded_proto is not None else os.getenv("CHATWOOT_API_FORWARDED_PROTO")
+    )
+    headers = {"api_access_token": api_token}
+    if forwarded_proto:
+        headers["X-Forwarded-Proto"] = forwarded_proto
+
     url = f"{base_url}/api/v1/accounts/{account_id}/contacts/search"
     print(f"base_url={base_url}")
+    print(f"forwarded_proto={forwarded_proto or '<none>'}")
     print(f"requests={args.requests} timeout={args.timeout}s query={args.query}")
 
     durations: list[float] = []
@@ -101,7 +123,7 @@ async def _run(args: argparse.Namespace) -> int:
             try:
                 res = await client.get(
                     url,
-                    headers={"api_access_token": api_token},
+                    headers=headers,
                     params={"q": args.query},
                 )
             except httpx.HTTPError as exc:

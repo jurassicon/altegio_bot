@@ -9,6 +9,7 @@ from typing import Any
 import httpx
 from sqlalchemy import func, select, update
 
+from altegio_bot.chatwoot_client import forwarded_proto_header
 from altegio_bot.db import SessionLocal
 from altegio_bot.models.models import (
     Client,
@@ -344,7 +345,7 @@ async def _process_chatwoot(
         return stats
 
     base_url = settings.chatwoot_base_url.rstrip("/")
-    headers = {"api_access_token": settings.chatwoot_api_token}
+    headers = {"api_access_token": settings.chatwoot_api_token, **forwarded_proto_header()}
 
     async with httpx.AsyncClient(timeout=30.0) as http:
         for phone_no_plus in phones_without_plus:

@@ -8,7 +8,12 @@ import httpx
 import pytest
 import respx
 
-from altegio_bot.chatwoot_client import ChatwootClient, append_wa_deeplink
+from altegio_bot.chatwoot_client import (
+    ChatwootClient,
+    append_wa_deeplink,
+    forwarded_proto_header,
+    normalize_forwarded_proto,
+)
 
 # ---------------------------------------------------------------------------
 # append_wa_deeplink – unit tests
@@ -531,3 +536,142 @@ async def test_mirror_outbound_messages_api_error_keeps_deeplink(
 
     sent = json.loads(post_route.calls[0].request.content)
     assert "https://wa.me/4917630316130" in sent["content"]
+
+
+# ---------------------------------------------------------------------------
+# X-Forwarded-Proto opt-in header (CHATWOOT_API_FORWARDED_PROTO)
+# ---------------------------------------------------------------------------
+
+
+def _client_with_proto(forwarded_proto: str | None) -> ChatwootClient:
+    return ChatwootClient(
+        base_url="https://chatwoot.example.com",
+        api_token="test-token",
+        account_id=1,
+        inbox_id=2,
+        forwarded_proto=forwarded_proto,
+    )
+
+
+def test_headers_no_forwarded_proto_by_default(client: ChatwootClient) -> None:
+    """Default client (settings empty) must not send X-Forwarded-Proto."""
+    headers = client._headers()
+    assert "X-Forwarded-Proto" not in headers
+    assert headers["api_access_token"] == "test-token"
+    assert headers["Content-Type"] == "application/json"
+
+
+def test_headers_forwarded_proto_https() -> None:
+    headers = _client_with_proto("https")._headers()
+    assert headers["X-Forwarded-Proto"] == "https"
+    # Existing headers must be preserved, not overwritten.
+    assert headers["api_access_token"] == "test-token"
+    assert headers["Content-Type"] == "application/json"
+
+
+def test_headers_forwarded_proto_http_allowed() -> None:
+    headers = _client_with_proto("http")._headers()
+    assert headers["X-Forwarded-Proto"] == "http"
+
+
+def test_headers_forwarded_proto_trimmed_and_lowered() -> None:
+    headers = _client_with_proto(" HTTPS ")._headers()
+    assert headers["X-Forwarded-Proto"] == "https"
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_headers_forwarded_proto_blank_means_no_header(blank: str) -> None:
+    headers = _client_with_proto(blank)._headers()
+    assert "X-Forwarded-Proto" not in headers
+
+
+def test_headers_forwarded_proto_invalid_no_header_and_warns(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level("WARNING", logger="altegio_bot.chatwoot_client"):
+        headers = _client_with_proto("ftp")._headers()
+    assert "X-Forwarded-Proto" not in headers
+    assert "CHATWOOT_API_FORWARDED_PROTO" in caplog.text
+
+
+def test_client_reads_forwarded_proto_from_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Without an explicit kwarg the client falls back to settings."""
+    from altegio_bot import settings as settings_module
+
+    monkeypatch.setattr(settings_module.settings, "chatwoot_api_forwarded_proto", "https")
+    client = ChatwootClient(
+        base_url="https://chatwoot.example.com",
+        api_token="test-token",
+        account_id=1,
+        inbox_id=2,
+    )
+    assert client._headers()["X-Forwarded-Proto"] == "https"
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_contact_search_request_carries_forwarded_proto() -> None:
+    """The actual outgoing HTTP request must carry the opt-in header."""
+    route = respx.get("https://chatwoot.example.com/api/v1/accounts/1/contacts/search").mock(
+        return_value=httpx.Response(200, json={"payload": []})
+    )
+    respx.post("https://chatwoot.example.com/api/v1/accounts/1/contacts").mock(
+        return_value=httpx.Response(200, json={"payload": {"contact": {"id": 7}}})
+    )
+
+    await _client_with_proto("https").get_or_create_contact("+49123456789")
+
+    request = route.calls[0].request
+    assert request.headers["X-Forwarded-Proto"] == "https"
+    assert request.headers["api_access_token"] == "test-token"
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_contact_search_request_has_no_forwarded_proto_by_default(
+    client: ChatwootClient,
+) -> None:
+    """Default behaviour on the wire is unchanged: no X-Forwarded-Proto."""
+    route = respx.get("https://chatwoot.example.com/api/v1/accounts/1/contacts/search").mock(
+        return_value=httpx.Response(
+            200,
+            json={"payload": [{"id": 42, "phone_number": "+49123456789", "name": "Test"}]},
+        )
+    )
+
+    await client.get_or_create_contact("+49123456789")
+
+    assert "X-Forwarded-Proto" not in route.calls[0].request.headers
+
+
+# ---------------------------------------------------------------------------
+# normalize_forwarded_proto / forwarded_proto_header – shared helpers
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, None),
+        ("", None),
+        ("   ", None),
+        ("https", "https"),
+        ("http", "http"),
+        (" https ", "https"),
+        ("HTTPS", "https"),
+        ("ftp", None),
+        ("https://chatwoot.example.com", None),
+    ],
+)
+def test_normalize_forwarded_proto(value: str | None, expected: str | None) -> None:
+    assert normalize_forwarded_proto(value) == expected
+
+
+def test_forwarded_proto_header_from_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    from altegio_bot import settings as settings_module
+
+    monkeypatch.setattr(settings_module.settings, "chatwoot_api_forwarded_proto", "https")
+    assert forwarded_proto_header() == {"X-Forwarded-Proto": "https"}
+
+    monkeypatch.setattr(settings_module.settings, "chatwoot_api_forwarded_proto", "")
+    assert forwarded_proto_header() == {}

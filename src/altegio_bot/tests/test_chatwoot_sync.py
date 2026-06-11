@@ -169,3 +169,30 @@ async def test_message_payload_as_direct_list():
     result = await _call()
 
     assert result is True
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# _auth_headers — опциональный X-Forwarded-Proto (CHATWOOT_API_FORWARDED_PROTO)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def test_auth_headers_no_forwarded_proto_by_default() -> None:
+    """По умолчанию (settings пустой) заголовок не добавляется."""
+    from altegio_bot.chatwoot_sync import _auth_headers
+
+    headers = _auth_headers(TOKEN)
+    assert "X-Forwarded-Proto" not in headers
+    assert headers["api_access_token"] == TOKEN
+    assert headers["Content-Type"] == "application/json"
+
+
+def test_auth_headers_forwarded_proto_from_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    """CHATWOOT_API_FORWARDED_PROTO=https добавляет заголовок, не трогая остальные."""
+    from altegio_bot import settings as settings_module
+    from altegio_bot.chatwoot_sync import _auth_headers
+
+    monkeypatch.setattr(settings_module.settings, "chatwoot_api_forwarded_proto", "https")
+    headers = _auth_headers(TOKEN)
+    assert headers["X-Forwarded-Proto"] == "https"
+    assert headers["api_access_token"] == TOKEN
+    assert headers["Content-Type"] == "application/json"
