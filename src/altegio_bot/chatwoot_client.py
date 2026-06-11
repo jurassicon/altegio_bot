@@ -15,6 +15,7 @@ from typing import Any
 
 import httpx
 
+from altegio_bot.chatwoot_headers import normalize_forwarded_proto
 from altegio_bot.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -60,21 +61,30 @@ class ChatwootClient:
         account_id: int | None = None,
         inbox_id: int | None = None,
         timeout_sec: float = 15.0,
+        forwarded_proto: str | None = None,
     ) -> None:
         self._base_url = (base_url or settings.chatwoot_base_url).rstrip("/")
         self._api_token = api_token or settings.chatwoot_api_token
         self._account_id = account_id if account_id is not None else settings.chatwoot_account_id
         self._inbox_id = inbox_id if inbox_id is not None else settings.chatwoot_inbox_id
+        # Normalize once: an invalid value warns a single time per client,
+        # not on every request.
+        self._forwarded_proto = normalize_forwarded_proto(
+            forwarded_proto if forwarded_proto is not None else settings.chatwoot_api_forwarded_proto
+        )
         self._client = httpx.AsyncClient(timeout=timeout_sec)
 
     async def aclose(self) -> None:
         await self._client.aclose()
 
     def _headers(self) -> dict[str, str]:
-        return {
+        headers = {
             "api_access_token": self._api_token,
             "Content-Type": "application/json",
         }
+        if self._forwarded_proto:
+            headers["X-Forwarded-Proto"] = self._forwarded_proto
+        return headers
 
     def _api(self, path: str) -> str:
         return f"{self._base_url}/api/v1/accounts/{self._account_id}{path}"

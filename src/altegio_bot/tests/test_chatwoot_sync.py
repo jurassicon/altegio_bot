@@ -169,3 +169,56 @@ async def test_message_payload_as_direct_list():
     result = await _call()
 
     assert result is True
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# _auth_headers — опциональный X-Forwarded-Proto (CHATWOOT_API_FORWARDED_PROTO)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def test_auth_headers_no_forwarded_proto_by_default() -> None:
+    """Без параметра заголовок не добавляется."""
+    from altegio_bot.chatwoot_sync import _auth_headers
+
+    headers = _auth_headers(TOKEN)
+    assert "X-Forwarded-Proto" not in headers
+    assert headers["api_access_token"] == TOKEN
+    assert headers["Content-Type"] == "application/json"
+
+
+def test_auth_headers_forwarded_proto_explicit() -> None:
+    """Явный chatwoot_api_forwarded_proto добавляет заголовок, не трогая остальные."""
+    from altegio_bot.chatwoot_sync import _auth_headers
+
+    headers = _auth_headers(TOKEN, "https")
+    assert headers["X-Forwarded-Proto"] == "https"
+    assert headers["api_access_token"] == TOKEN
+    assert headers["Content-Type"] == "application/json"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Clean-env regression (P2): import chatwoot_sync не должен требовать app env
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def test_chatwoot_sync_imports_without_full_app_env(tmp_path) -> None:
+    """Цепочка chatwoot_sync -> chatwoot_client -> Settings() должна отсутствовать.
+
+    Раньше импорт падал в clean env на missing DATABASE_URL /
+    ALTEGIO_WEBHOOK_SECRET, потому что header helpers жили в
+    chatwoot_client, который на import создаёт Settings().
+    """
+    import os
+    import subprocess
+    import sys
+
+    result = subprocess.run(
+        [sys.executable, "-c", "import altegio_bot.chatwoot_sync"],
+        env={"PATH": os.environ.get("PATH", "")},
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "DATABASE_URL" not in result.stderr
