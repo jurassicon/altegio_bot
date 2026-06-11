@@ -1,0 +1,49 @@
+# Optional override: attach altegio_bot app services to the Chatwoot Docker
+# network so CHATWOOT_BASE_URL can point at an internal host instead of the
+# public URL (skips public DNS/TLS/reverse-proxy hairpin).
+#
+# This file is OPT-IN. Default `docker compose up` must keep working without
+# it and without any Chatwoot network present. Never add this file to the
+# default compose invocation on dev machines.
+#
+# Usage (production, see docs/ops/chatwoot_internal_route.md):
+#   docker compose -p altegio_bot \
+#     -f docker-compose.yml -f docker-compose.chatwoot-internal.yml up -d
+#
+# The external network name defaults to `chatwoot_default` (the network name
+# of the production Chatwoot compose project). Override via env if needed:
+#   CHATWOOT_INTERNAL_NETWORK=<actual-network-name>
+#
+# Only app services that call the Chatwoot API are attached. `postgres`,
+# `redis` and `migrate` stay on the project default network only.
+
+services:
+  altegio-api:
+    networks:
+      - default
+      - chatwoot_internal
+
+  altegio-inbox-worker:
+    networks:
+      - default
+      - chatwoot_internal
+
+  altegio-outbox-worker:
+    networks:
+      - default
+      - chatwoot_internal
+
+  altegio-whatsapp-inbox-worker:
+    networks:
+      - default
+      - chatwoot_internal
+
+  altegio-campaign-worker:
+    networks:
+      - default
+      - chatwoot_internal
+
+networks:
+  chatwoot_internal:
+    external: true
+    name: ${CHATWOOT_INTERNAL_NETWORK:-chatwoot_default}
