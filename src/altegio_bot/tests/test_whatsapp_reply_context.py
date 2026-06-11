@@ -29,10 +29,12 @@ from altegio_bot.models.models import (
 from altegio_bot.providers.base import WhatsAppProvider
 from altegio_bot.workers.whatsapp_inbox_worker import (
     ReplyContextTarget,
+    _event_origin_for_metrics,
     _extract_actions,
     _format_reply_context_prefix,
     _get_reply_context_target,
     _is_chatwoot_origin,
+    _is_operator_relay,
     _normalize_reply_context_id,
     handle_event,
 )
@@ -572,6 +574,135 @@ def test_origin_forwarded_conversation_id_is_not_a_signal() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Observability origin classification (separate from loop-prevention origin)
+# ---------------------------------------------------------------------------
+
+
+def _operator_relay_payload(text: str = "Wir erwarten Sie.") -> dict[str, Any]:
+    return {
+        "_chatwoot_operator_relay": {
+            "recipient_phone": PHONE_E164,
+            "text": text,
+            "conversation_id": 30,
+            "message_id": 40,
+            "phone_number_id": PHONE_NUMBER_ID,
+            "chatwoot_inbox_id": 1,
+            "agent_name": "Boris",
+        }
+    }
+
+
+def test_operator_relay_event_is_not_chatwoot_origin() -> None:
+    """Loop-prevention semantics: operator relay must NOT be chatwoot-origin."""
+    evt = _make_event(_operator_relay_payload(), dedupe_key="chatwoot_out:30:40")
+    assert _is_operator_relay(evt.payload) is True
+    assert _is_chatwoot_origin(evt, evt.payload) is False
+
+
+def test_metrics_origin_operator_relay() -> None:
+    """Operator relay gets its own metrics label, not the noisy 'meta'."""
+    evt = _make_event(_operator_relay_payload(), dedupe_key="chatwoot_out:30:40")
+    assert _event_origin_for_metrics(evt, evt.payload) == "chatwoot_operator_relay"
+
+
+def test_metrics_origin_chatwoot() -> None:
+    evt = _make_event({"_chatwoot": {"conversation_id": 1}}, dedupe_key="chatwoot:1:2")
+    assert _event_origin_for_metrics(evt, evt.payload) == "chatwoot"
+
+
+def test_metrics_origin_meta() -> None:
+    evt = _make_event(_meta_payload("Hi"), dedupe_key="wa:meta-3")
+    evt.chatwoot_conversation_id = 42  # source-only marker, not an origin signal
+    assert _event_origin_for_metrics(evt, evt.payload) == "meta"
+
+
+@pytest.mark.asyncio
+async def test_operator_relay_runs_before_inbound_and_not_forwarded(session_maker) -> None:
+    """Operator relay path runs first and is never forwarded back as inbound.
+
+    Delivery: the operator text is sent to Meta (one provider.send) and an
+    OutboxMessage(message_source='operator') is created.  It must NOT be
+    forwarded into Chatwoot as inbound customer text.
+    """
+    from altegio_bot.settings import settings as _s
+
+    provider = _CaptureProvider()
+
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(
+                WhatsAppSender(
+                    company_id=1,
+                    sender_code="default",
+                    phone_number_id=PHONE_NUMBER_ID,
+                    display_phone="+49",
+                    is_active=True,
+                )
+            )
+            # Recent customer inbound opens the 24h window so the relay sends
+            # the operator text directly (instead of the closed-window note).
+            # No msg timestamp → the window falls back to received_at (1h ago).
+            session.add(
+                WhatsAppEvent(
+                    dedupe_key="wa:win-open-relay",
+                    received_at=datetime.now(timezone.utc) - timedelta(hours=1),
+                    status="processed",
+                    query={},
+                    headers={},
+                    payload={
+                        "entry": [
+                            {
+                                "changes": [
+                                    {
+                                        "value": {
+                                            "metadata": {"phone_number_id": PHONE_NUMBER_ID},
+                                            "messages": [
+                                                {
+                                                    "from": FROM_PHONE,
+                                                    "type": "text",
+                                                    "text": {"body": "Hallo"},
+                                                    "id": "wamid.WINOPEN",
+                                                }
+                                            ],
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                )
+            )
+            evt = _make_event(_operator_relay_payload("Bis morgen"), dedupe_key="chatwoot_out:30:40")
+            session.add(evt)
+            await session.flush()
+
+            mock_cls, mock_inst = _mock_chatwoot_client()
+            original = _s.chatwoot_operator_relay_enabled
+            _s.chatwoot_operator_relay_enabled = True
+            try:
+                with patch(
+                    "altegio_bot.workers.whatsapp_inbox_worker.ChatwootClient",
+                    mock_cls,
+                ):
+                    await handle_event(session, evt, provider)
+            finally:
+                _s.chatwoot_operator_relay_enabled = original
+
+        async with session.begin():
+            outbox = await session.scalar(select(OutboxMessage).where(OutboxMessage.message_source == "operator"))
+
+    # Sent to Meta exactly once as the operator's text.
+    assert provider.sent
+    assert provider.sent[0][2] == "Bis morgen"
+    assert outbox is not None
+    assert outbox.chatwoot_conversation_id == 30
+    assert outbox.chatwoot_message_id == 40
+    # Never forwarded back into Chatwoot as inbound customer text.
+    mock_inst.get_or_create_incoming_conversation.assert_not_called()
+    mock_inst.send_message.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # Schema / migration
 # ---------------------------------------------------------------------------
 
@@ -621,3 +752,26 @@ def test_migration_is_idempotent_style() -> None:
     assert "DROP COLUMN IF EXISTS" in source
     # Backfill must stay PostgreSQL-only.
     assert 'bind.dialect.name != "postgresql"' in source
+
+
+def test_migration_declares_reply_context_composite_index() -> None:
+    """Composite index for the hot reply-target lookup is created and dropped."""
+    _, path = _load_migration()
+    source = path.read_text()
+
+    upgrade_src, downgrade_src = source.split("def downgrade")
+
+    # Created idempotently in upgrade with the exact name and mandatory filters.
+    assert "CREATE INDEX IF NOT EXISTS ix_outbox_messages_reply_context_lookup" in upgrade_src
+    assert "provider_message_id, phone_e164, message_source, created_at DESC, id DESC" in upgrade_src
+    assert "WHERE provider_message_id IS NOT NULL" in upgrade_src
+
+    # Dropped idempotently in downgrade, before the columns it depends on.
+    assert "DROP INDEX IF EXISTS ix_outbox_messages_reply_context_lookup" in downgrade_src
+    drop_idx = downgrade_src.index("DROP INDEX IF EXISTS ix_outbox_messages_reply_context_lookup")
+    drop_col = downgrade_src.index("DROP COLUMN IF EXISTS chatwoot_message_id")
+    assert drop_idx < drop_col
+
+    # Pre-existing single-column indexes must NOT be removed.
+    assert "ix_outbox_messages_chatwoot_conversation_id" in upgrade_src
+    assert "ix_outbox_messages_chatwoot_message_id" in upgrade_src

@@ -206,6 +206,26 @@ def _is_chatwoot_origin(event: WhatsAppEvent, payload: dict[str, Any]) -> bool:
     return False
 
 
+def _event_origin_for_metrics(event: WhatsAppEvent, payload: dict[str, Any]) -> str:
+    """Classify an event's origin for observability (metrics/log context only).
+
+    This is intentionally SEPARATE from :func:`_is_chatwoot_origin`, which
+    governs inbound loop prevention and must stay True only for the
+    "_chatwoot" payload marker and the "chatwoot:" dedupe_key prefix.
+
+    Operator relay events ("_chatwoot_operator_relay" payload, "chatwoot_out:"
+    dedupe_key) are Chatwoot-authored but are NOT inbound-loop chatwoot-origin,
+    so without a dedicated bucket they would be mislabeled "meta".  They get
+    their own label here to remove that observability noise; classification
+    has no effect on delivery or loop-prevention behavior.
+    """
+    if _is_operator_relay(payload):
+        return "chatwoot_operator_relay"
+    if _is_chatwoot_origin(event, payload):
+        return "chatwoot"
+    return "meta"
+
+
 async def _pick_sender(
     session: AsyncSession,
     phone_number_id: str | None,
@@ -1491,7 +1511,7 @@ async def process_one_event(
                     company_id=event.company_id,
                     dedupe_key=event.dedupe_key,
                     chatwoot_conversation_id=event.chatwoot_conversation_id,
-                    origin="chatwoot" if _is_chatwoot_origin(event, event.payload or {}) else "meta",
+                    origin=_event_origin_for_metrics(event, event.payload or {}),
                 )
 
                 try:

@@ -47,8 +47,7 @@ def upgrade() -> None:
     op.execute(sa.text("ALTER TABLE whatsapp_events ADD COLUMN IF NOT EXISTS chatwoot_message_id BIGINT"))
     op.execute(
         sa.text(
-            "CREATE INDEX IF NOT EXISTS ix_whatsapp_events_chatwoot_message_id "
-            "ON whatsapp_events (chatwoot_message_id)"
+            "CREATE INDEX IF NOT EXISTS ix_whatsapp_events_chatwoot_message_id ON whatsapp_events (chatwoot_message_id)"
         )
     )
     op.execute(
@@ -63,8 +62,7 @@ def upgrade() -> None:
     op.execute(sa.text("ALTER TABLE whatsapp_events ADD COLUMN IF NOT EXISTS whatsapp_message_id VARCHAR(128)"))
     op.execute(
         sa.text(
-            "CREATE INDEX IF NOT EXISTS ix_whatsapp_events_whatsapp_message_id "
-            "ON whatsapp_events (whatsapp_message_id)"
+            "CREATE INDEX IF NOT EXISTS ix_whatsapp_events_whatsapp_message_id ON whatsapp_events (whatsapp_message_id)"
         )
     )
 
@@ -79,8 +77,22 @@ def upgrade() -> None:
     op.execute(sa.text("ALTER TABLE outbox_messages ADD COLUMN IF NOT EXISTS chatwoot_message_id BIGINT"))
     op.execute(
         sa.text(
-            "CREATE INDEX IF NOT EXISTS ix_outbox_messages_chatwoot_message_id "
-            "ON outbox_messages (chatwoot_message_id)"
+            "CREATE INDEX IF NOT EXISTS ix_outbox_messages_chatwoot_message_id ON outbox_messages (chatwoot_message_id)"
+        )
+    )
+
+    # Composite index for the hot reply-target lookup in
+    # whatsapp_inbox_worker._get_reply_context_target, which filters by
+    # (provider_message_id, phone_e164, message_source='operator') and orders
+    # by (created_at DESC, id DESC).  Partial on provider_message_id so it only
+    # covers rows that can ever be a reply target.  The single-column indexes
+    # above are kept for other access paths.
+    op.execute(
+        sa.text(
+            "CREATE INDEX IF NOT EXISTS ix_outbox_messages_reply_context_lookup "
+            "ON outbox_messages ("
+            "provider_message_id, phone_e164, message_source, created_at DESC, id DESC"
+            ") WHERE provider_message_id IS NOT NULL"
         )
     )
 
@@ -120,6 +132,7 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    op.execute(sa.text("DROP INDEX IF EXISTS ix_outbox_messages_reply_context_lookup"))
     op.execute(sa.text("DROP INDEX IF EXISTS ix_outbox_messages_chatwoot_message_id"))
     op.execute(sa.text("ALTER TABLE outbox_messages DROP COLUMN IF EXISTS chatwoot_message_id"))
     op.execute(sa.text("DROP INDEX IF EXISTS ix_outbox_messages_chatwoot_conversation_id"))
