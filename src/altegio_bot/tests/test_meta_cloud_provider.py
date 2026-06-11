@@ -71,6 +71,7 @@ async def test_meta_cloud_send_without_reply_context_omits_context() -> None:
     assert payload["type"] == "text"
     assert payload["to"] == "491234567890"
     assert payload["text"]["body"] == "Hello"
+    assert payload["text"]["preview_url"] is False
 
 
 @pytest.mark.asyncio
@@ -98,6 +99,7 @@ async def test_meta_cloud_send_with_reply_context_adds_context_message_id() -> N
     assert payload["type"] == "text"
     assert payload["to"] == "491234567890"
     assert payload["text"]["body"] == "Hello back"
+    assert payload["text"]["preview_url"] is False
 
 
 @pytest.mark.asyncio
