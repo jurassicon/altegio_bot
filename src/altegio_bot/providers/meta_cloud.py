@@ -76,6 +76,7 @@ class MetaCloudProvider(WhatsAppProvider):
         text: str,
         *,
         contact_name: str | None = None,
+        reply_to_provider_message_id: str | None = None,
     ) -> str:
         if not self._allow_real_send:
             raise RuntimeError("Real send disabled (set ALLOW_REAL_SEND=1)")
@@ -93,6 +94,10 @@ class MetaCloudProvider(WhatsAppProvider):
                 "preview_url": False,
             },
         }
+        if isinstance(reply_to_provider_message_id, str) and reply_to_provider_message_id.strip():
+            payload["context"] = {
+                "message_id": reply_to_provider_message_id.strip(),
+            }
 
         res = await self._client.post(url, headers=self._headers(), json=payload)
 

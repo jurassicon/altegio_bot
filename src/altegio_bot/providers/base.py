@@ -11,6 +11,7 @@ class WhatsAppProvider(Protocol):
         text: str,
         *,
         contact_name: str | None = None,
+        reply_to_provider_message_id: str | None = None,
     ) -> str:
         pass
 

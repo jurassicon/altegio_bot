@@ -62,12 +62,14 @@ class _FakeProvider(WhatsAppProvider):
         text: str,
         *,
         contact_name: str | None = None,
+        reply_to_provider_message_id: str | None = None,
     ) -> str:
         self.sent.append(
             {
                 "sender_id": sender_id,
                 "phone_e164": phone_e164,
                 "text": text,
+                "reply_to_provider_message_id": reply_to_provider_message_id,
             }
         )
         return self.wamid
@@ -113,19 +115,24 @@ def _operator_relay_payload(
     message_id: int = 20,
     phone_number_id: str = "PNID_OP",
     agent_name: str = "Anna",
+    reply_to_chatwoot_message_id: int | None = None,
+    content_attributes: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Payload as produced by _ingest_operator_outgoing in chatwoot.py."""
-    return {
-        "_chatwoot_operator_relay": {
-            "recipient_phone": recipient_phone,
-            "text": text,
-            "conversation_id": conversation_id,
-            "message_id": message_id,
-            "phone_number_id": phone_number_id,
-            "agent_name": agent_name,
-            "agent_id": 5,
-        },
+    relay: dict[str, Any] = {
+        "recipient_phone": recipient_phone,
+        "text": text,
+        "conversation_id": conversation_id,
+        "message_id": message_id,
+        "phone_number_id": phone_number_id,
+        "agent_name": agent_name,
+        "agent_id": 5,
     }
+    if reply_to_chatwoot_message_id is not None:
+        relay["reply_to_chatwoot_message_id"] = reply_to_chatwoot_message_id
+    if content_attributes is not None:
+        relay["content_attributes"] = content_attributes
+    return {"_chatwoot_operator_relay": relay}
 
 
 def _customer_incoming_payload(
@@ -222,6 +229,53 @@ def _meta_inbound_event(
             ]
         },
         chatwoot_conversation_id=None,
+    )
+    session.add(evt)
+    return evt
+
+
+def _forwarded_inbound_event(
+    session: Any,
+    *,
+    phone: str,
+    dedupe_key: str = "wa:reply-context:inbound",
+    chatwoot_message_id: int = 4960,
+    chatwoot_conversation_id: int = 230,
+    whatsapp_message_id: str = "wamid.INBOUND",
+    hours_ago: float = 1.0,
+) -> WhatsAppEvent:
+    """Create a Meta-origin inbound event already forwarded to Chatwoot."""
+    now = datetime.now(timezone.utc)
+    evt = WhatsAppEvent(
+        dedupe_key=dedupe_key,
+        received_at=now - timedelta(hours=hours_ago),
+        status="processed",
+        query={},
+        headers={},
+        payload={
+            "entry": [
+                {
+                    "changes": [
+                        {
+                            "value": {
+                                "messages": [
+                                    {
+                                        "from": phone,
+                                        "type": "text",
+                                        "text": {"body": "Message test"},
+                                        "id": whatsapp_message_id,
+                                    }
+                                ],
+                                "metadata": {"phone_number_id": "PNID_REPLY_CTX"},
+                            }
+                        }
+                    ]
+                }
+            ]
+        },
+        chatwoot_message_id=chatwoot_message_id,
+        forwarded_chatwoot_conversation_id=chatwoot_conversation_id,
+        whatsapp_message_id=whatsapp_message_id,
     )
     session.add(evt)
     return evt
@@ -1839,6 +1893,263 @@ async def test_reopen_mode_window_open_sends_text(session_maker, monkeypatch) ->
 
 
 @pytest.mark.asyncio
+async def test_operator_reply_to_inbound_uses_native_whatsapp_context(session_maker, monkeypatch) -> None:
+    """Chatwoot Reply to inbound customer message sends Meta context.message_id."""
+    monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
+    provider = _FakeProvider(wamid="wamid.OP_REPLY_NEW")
+    phone = "+381638400431"
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _make_sender(session, sender_id=700, company_id=1, phone_number_id="PNID_REPLY_CTX")
+            _forwarded_inbound_event(
+                session,
+                phone="381638400431",
+                dedupe_key="wa:reply-context:inbound:happy",
+                chatwoot_message_id=4960,
+                chatwoot_conversation_id=230,
+                whatsapp_message_id="wamid.INBOUND",
+            )
+
+            evt = WhatsAppEvent(
+                dedupe_key="chatwoot_out:230:4961",
+                status="received",
+                error=None,
+                query={},
+                headers={},
+                payload=_operator_relay_payload(
+                    recipient_phone=phone,
+                    text="Reply from Chatwoot",
+                    conversation_id=230,
+                    message_id=4961,
+                    phone_number_id="PNID_REPLY_CTX",
+                    reply_to_chatwoot_message_id=4960,
+                    content_attributes={"in_reply_to": 4960},
+                ),
+                chatwoot_conversation_id=230,
+            )
+            session.add(evt)
+            await session.flush()
+
+            from altegio_bot.settings import settings as _s
+
+            orig_relay = _s.chatwoot_operator_relay_enabled
+            _s.chatwoot_operator_relay_enabled = True
+            try:
+                await handle_event(session, evt, provider)
+            finally:
+                _s.chatwoot_operator_relay_enabled = orig_relay
+
+    assert len(provider.sent) == 1
+    assert provider.sent[0]["reply_to_provider_message_id"] == "wamid.INBOUND"
+
+    async with session_maker() as session:
+        outbox = await session.scalar(
+            select(OutboxMessage).where(OutboxMessage.provider_message_id == "wamid.OP_REPLY_NEW")
+        )
+
+    assert outbox is not None
+    assert outbox.provider_message_id == "wamid.OP_REPLY_NEW"
+    assert outbox.chatwoot_message_id == 4961
+    assert outbox.meta["reply_to_chatwoot_message_id"] == 4960
+    assert outbox.meta["reply_to_provider_message_id"] == "wamid.INBOUND"
+    assert outbox.meta["reply_context_source"] == "whatsapp_event"
+    assert outbox.meta["reply_context_native"] is True
+    assert outbox.meta["content_attributes"] == {"in_reply_to": 4960}
+
+
+@pytest.mark.asyncio
+async def test_operator_reply_to_previous_operator_message_uses_outbox_context(
+    session_maker,
+    monkeypatch,
+) -> None:
+    """Chatwoot Reply to a prior operator message resolves via OutboxMessage."""
+    monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
+    provider = _FakeProvider(wamid="wamid.OP_SECOND")
+    phone = "+381638400431"
+    now = datetime.now(timezone.utc)
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _make_sender(session, sender_id=701, company_id=1, phone_number_id="PNID_REPLY_CTX_OP")
+            _meta_inbound_event(session, phone=phone, dedupe_key="wa:reply-context:window:operator")
+            session.add(
+                OutboxMessage(
+                    company_id=1,
+                    sender_id=701,
+                    phone_e164=phone,
+                    template_code="operator_relay",
+                    language="de",
+                    body="First operator message",
+                    status="sent",
+                    provider_message_id="wamid.OPERATOR",
+                    scheduled_at=now,
+                    sent_at=now,
+                    message_source="operator",
+                    chatwoot_conversation_id=230,
+                    chatwoot_message_id=4964,
+                    meta={},
+                )
+            )
+
+            evt = WhatsAppEvent(
+                dedupe_key="chatwoot_out:230:4965",
+                status="received",
+                error=None,
+                query={},
+                headers={},
+                payload=_operator_relay_payload(
+                    recipient_phone=phone,
+                    text="Second operator message",
+                    conversation_id=230,
+                    message_id=4965,
+                    phone_number_id="PNID_REPLY_CTX_OP",
+                    reply_to_chatwoot_message_id=4964,
+                    content_attributes={"in_reply_to": "4964"},
+                ),
+                chatwoot_conversation_id=230,
+            )
+            session.add(evt)
+            await session.flush()
+
+            from altegio_bot.settings import settings as _s
+
+            orig_relay = _s.chatwoot_operator_relay_enabled
+            _s.chatwoot_operator_relay_enabled = True
+            try:
+                await handle_event(session, evt, provider)
+            finally:
+                _s.chatwoot_operator_relay_enabled = orig_relay
+
+    assert len(provider.sent) == 1
+    assert provider.sent[0]["reply_to_provider_message_id"] == "wamid.OPERATOR"
+
+    async with session_maker() as session:
+        outbox = await session.scalar(
+            select(OutboxMessage).where(OutboxMessage.provider_message_id == "wamid.OP_SECOND")
+        )
+
+    assert outbox is not None
+    assert outbox.meta["reply_to_chatwoot_message_id"] == 4964
+    assert outbox.meta["reply_to_provider_message_id"] == "wamid.OPERATOR"
+    assert outbox.meta["reply_context_source"] == "outbox_operator"
+    assert outbox.meta["reply_context_native"] is True
+
+
+@pytest.mark.asyncio
+async def test_operator_reply_missing_mapping_sends_plain_text(session_maker, monkeypatch) -> None:
+    """Missing Chatwoot→wamid mapping must not block operator relay."""
+    monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
+    provider = _FakeProvider(wamid="wamid.OP_PLAIN_MISSING")
+    phone = "+381638400431"
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _make_sender(session, sender_id=702, company_id=1, phone_number_id="PNID_REPLY_CTX_MISS")
+            _meta_inbound_event(session, phone=phone, dedupe_key="wa:reply-context:window:missing")
+
+            evt = WhatsAppEvent(
+                dedupe_key="chatwoot_out:230:4970",
+                status="received",
+                error=None,
+                query={},
+                headers={},
+                payload=_operator_relay_payload(
+                    recipient_phone=phone,
+                    conversation_id=230,
+                    message_id=4970,
+                    phone_number_id="PNID_REPLY_CTX_MISS",
+                    reply_to_chatwoot_message_id=9999,
+                ),
+                chatwoot_conversation_id=230,
+            )
+            session.add(evt)
+            await session.flush()
+
+            from altegio_bot.settings import settings as _s
+
+            orig_relay = _s.chatwoot_operator_relay_enabled
+            _s.chatwoot_operator_relay_enabled = True
+            try:
+                await handle_event(session, evt, provider)
+            finally:
+                _s.chatwoot_operator_relay_enabled = orig_relay
+
+    assert len(provider.sent) == 1
+    assert provider.sent[0]["reply_to_provider_message_id"] is None
+
+    async with session_maker() as session:
+        outbox = await session.scalar(
+            select(OutboxMessage).where(OutboxMessage.provider_message_id == "wamid.OP_PLAIN_MISSING")
+        )
+
+    assert outbox is not None
+    assert outbox.meta["reply_to_chatwoot_message_id"] == 9999
+    assert outbox.meta["reply_to_provider_message_id"] is None
+    assert outbox.meta["reply_context_source"] is None
+    assert outbox.meta["reply_context_native"] is False
+
+
+@pytest.mark.asyncio
+async def test_operator_reply_cross_conversation_sends_plain_text(session_maker, monkeypatch) -> None:
+    """A mapping in another Chatwoot conversation must not become Meta context."""
+    monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
+    provider = _FakeProvider(wamid="wamid.OP_PLAIN_CROSS")
+    phone = "+381638400431"
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _make_sender(session, sender_id=703, company_id=1, phone_number_id="PNID_REPLY_CTX_CROSS")
+            _forwarded_inbound_event(
+                session,
+                phone=phone,
+                dedupe_key="wa:reply-context:inbound:cross",
+                chatwoot_message_id=4960,
+                chatwoot_conversation_id=999,
+                whatsapp_message_id="wamid.OTHER_CONV",
+            )
+
+            evt = WhatsAppEvent(
+                dedupe_key="chatwoot_out:230:4971",
+                status="received",
+                error=None,
+                query={},
+                headers={},
+                payload=_operator_relay_payload(
+                    recipient_phone=phone,
+                    conversation_id=230,
+                    message_id=4971,
+                    phone_number_id="PNID_REPLY_CTX_CROSS",
+                    reply_to_chatwoot_message_id=4960,
+                ),
+                chatwoot_conversation_id=230,
+            )
+            session.add(evt)
+            await session.flush()
+
+            from altegio_bot.settings import settings as _s
+
+            orig_relay = _s.chatwoot_operator_relay_enabled
+            _s.chatwoot_operator_relay_enabled = True
+            try:
+                await handle_event(session, evt, provider)
+            finally:
+                _s.chatwoot_operator_relay_enabled = orig_relay
+
+    assert len(provider.sent) == 1
+    assert provider.sent[0]["reply_to_provider_message_id"] is None
+
+    async with session_maker() as session:
+        outbox = await session.scalar(
+            select(OutboxMessage).where(OutboxMessage.provider_message_id == "wamid.OP_PLAIN_CROSS")
+        )
+
+    assert outbox is not None
+    assert outbox.meta["reply_context_native"] is False
+    assert outbox.meta["reply_to_provider_message_id"] is None
+
+
+@pytest.mark.asyncio
 async def test_private_note_only_window_closed(session_maker, monkeypatch) -> None:
     """Default mode (private_note_only) + window closed → blocks send, private note, canceled outbox."""
     monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
@@ -1868,6 +2179,8 @@ async def test_private_note_only_window_closed(session_maker, monkeypatch) -> No
                     conversation_id=3400,
                     message_id=4400,
                     agent_name="Klaus",
+                    reply_to_chatwoot_message_id=4960,
+                    content_attributes={"in_reply_to": 4960},
                 ),
                 chatwoot_conversation_id=3400,
             )
@@ -1918,6 +2231,9 @@ async def test_private_note_only_window_closed(session_maker, monkeypatch) -> No
     assert ob.meta.get("send_type") == "none"
     assert ob.meta.get("attempted_send_type") == "text"
     assert ob.meta.get("private_note_status") == "sent"
+    assert ob.meta.get("reply_to_chatwoot_message_id") == 4960
+    assert ob.meta.get("reply_to_provider_message_id") is None
+    assert ob.meta.get("reply_context_native") is False
 
 
 @pytest.mark.asyncio
@@ -1950,6 +2266,8 @@ async def test_reopen_template_window_closed(session_maker, monkeypatch) -> None
                     conversation_id=3200,
                     message_id=4200,
                     agent_name="Maria",
+                    reply_to_chatwoot_message_id=4960,
+                    content_attributes={"in_reply_to": 4960},
                 ),
                 chatwoot_conversation_id=3200,
             )
@@ -2005,6 +2323,9 @@ async def test_reopen_template_window_closed(session_maker, monkeypatch) -> None
     assert ob.meta["wa_window_open"] is False
     assert ob.meta["reopen_reason"] == "customer_service_window_closed"
     assert ob.meta["agent_name"] == "Maria"
+    assert ob.meta["reply_to_chatwoot_message_id"] == 4960
+    assert ob.meta["reply_to_provider_message_id"] is None
+    assert ob.meta["reply_context_native"] is False
 
 
 @pytest.mark.asyncio

@@ -69,9 +69,18 @@ class ChatwootHybridProvider:
         company_id: int = 0,
         staff_id: int | None = None,
         contact_name: str | None = None,
+        reply_to_provider_message_id: str | None = None,
     ) -> str:
         # PRIMARY – must succeed (Отправка напрямую в Meta)
-        msg_id = await self._primary.send(sender_id, phone_e164, text)
+        kwargs: dict[str, object] = {}
+        if isinstance(reply_to_provider_message_id, str) and reply_to_provider_message_id.strip():
+            kwargs["reply_to_provider_message_id"] = reply_to_provider_message_id.strip()
+        msg_id = await self._primary.send(
+            sender_id,
+            phone_e164,
+            text,
+            **kwargs,
+        )
 
         # SECONDARY – best-effort (Логируем в Chatwoot как ПРИВАТНУЮ ЗАМЕТКУ)
         self._schedule_mirror(

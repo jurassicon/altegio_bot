@@ -384,6 +384,29 @@ def _phone_variants(phone_e164: str) -> list[str]:
     return [v for v in variants if v]
 
 
+def _payload_message_from_matches_phone(payload: dict[str, Any], phone_e164: str) -> bool:
+    expected_digits = re.sub(r"\D+", "", phone_e164)
+    if not expected_digits:
+        return False
+
+    for entry in payload.get("entry") or []:
+        if not isinstance(entry, dict):
+            continue
+        for change in entry.get("changes") or []:
+            if not isinstance(change, dict):
+                continue
+            value = change.get("value") or {}
+            if not isinstance(value, dict):
+                continue
+            for msg in value.get("messages") or []:
+                if not isinstance(msg, dict):
+                    continue
+                from_digits = re.sub(r"\D+", "", str(msg.get("from") or ""))
+                if from_digits == expected_digits:
+                    return True
+    return False
+
+
 async def _set_opt_out(
     session: AsyncSession,
     *,
@@ -695,6 +718,12 @@ class ReplyContextTarget:
     body: str | None
 
 
+@dataclass(frozen=True)
+class WhatsAppReplyContextTarget:
+    provider_message_id: str
+    source: str
+
+
 async def _get_reply_context_target(
     session: AsyncSession,
     provider_message_id: str | None,
@@ -732,6 +761,67 @@ async def _get_reply_context_target(
         chatwoot_conversation_id=row[1],
         body=row[2],
     )
+
+
+async def _get_whatsapp_reply_context_target(
+    session: AsyncSession,
+    chatwoot_message_id: int | None,
+    *,
+    chatwoot_conversation_id: int | None,
+    phone_e164: str | None,
+) -> WhatsAppReplyContextTarget | None:
+    """Resolve a Chatwoot Reply target to a WhatsApp wamid for Meta context.
+
+    Source A is a real inbound WhatsAppEvent that PR1 forwarded into the same
+    Chatwoot conversation.  Source B is a previous human operator OutboxMessage
+    in the same conversation.  Both are phone-scoped defense-in-depth checks.
+    """
+    if not chatwoot_message_id or not chatwoot_conversation_id or not phone_e164:
+        return None
+
+    event_stmt = (
+        select(WhatsAppEvent)
+        .where(WhatsAppEvent.chatwoot_message_id == chatwoot_message_id)
+        .where(WhatsAppEvent.forwarded_chatwoot_conversation_id == chatwoot_conversation_id)
+        .where(WhatsAppEvent.whatsapp_message_id.is_not(None))
+        .where(WhatsAppEvent.whatsapp_message_id != "")
+        .where(WhatsAppEvent.dedupe_key.like("wa:%"))
+        .order_by(WhatsAppEvent.received_at.desc(), WhatsAppEvent.id.desc())
+        .limit(20)
+    )
+    event_res = await session.execute(event_stmt)
+    for candidate in event_res.scalars().all():
+        candidate_payload = candidate.payload or {}
+        if not isinstance(candidate_payload, dict):
+            continue
+        if _payload_message_from_matches_phone(candidate_payload, phone_e164):
+            provider_message_id = _normalize_reply_context_id(candidate.whatsapp_message_id)
+            if provider_message_id:
+                return WhatsAppReplyContextTarget(
+                    provider_message_id=provider_message_id,
+                    source="whatsapp_event",
+                )
+
+    outbox_stmt = (
+        select(OutboxMessage.provider_message_id)
+        .where(OutboxMessage.chatwoot_message_id == chatwoot_message_id)
+        .where(OutboxMessage.chatwoot_conversation_id == chatwoot_conversation_id)
+        .where(OutboxMessage.phone_e164 == phone_e164)
+        .where(OutboxMessage.message_source == "operator")
+        .where(OutboxMessage.provider_message_id.is_not(None))
+        .where(OutboxMessage.provider_message_id != "")
+        .order_by(OutboxMessage.created_at.desc(), OutboxMessage.id.desc())
+        .limit(1)
+    )
+    outbox_res = await session.execute(outbox_stmt)
+    provider_message_id = _normalize_reply_context_id(outbox_res.scalar_one_or_none())
+    if provider_message_id:
+        return WhatsAppReplyContextTarget(
+            provider_message_id=provider_message_id,
+            source="outbox_operator",
+        )
+
+    return None
 
 
 _QUOTE_MAX_CHARS = 300
@@ -885,11 +975,23 @@ async def _handle_operator_relay(
     phone_number_id = relay.get("phone_number_id")
     chatwoot_inbox_id = relay.get("chatwoot_inbox_id")
     agent_name = relay.get("agent_name", "")
+    content_attributes = relay.get("content_attributes") or {}
+    if not isinstance(content_attributes, dict):
+        content_attributes = {}
 
     # Indexed copies for the native-reply lookup (kept in meta as-is for
     # backward compatibility).  Non-numeric values degrade to None.
     cw_conversation_id = _coerce_chatwoot_id(conversation_id)
     cw_message_id = _coerce_chatwoot_id(chatwoot_message_id)
+    reply_to_chatwoot_message_id = _coerce_chatwoot_id(relay.get("reply_to_chatwoot_message_id"))
+    reply_context_audit: dict[str, Any] = {
+        "reply_to_chatwoot_message_id": reply_to_chatwoot_message_id,
+        "reply_to_provider_message_id": None,
+        "reply_context_source": None,
+        "reply_context_native": False,
+    }
+    if content_attributes:
+        reply_context_audit["content_attributes"] = content_attributes
 
     if phone_e164 is None:
         logger.warning(
@@ -975,6 +1077,37 @@ async def _handle_operator_relay(
 
     # ── Branch: window open → send as free-form text ──────────────────────
     if window_open:
+        reply_to_provider_message_id: str | None = None
+        if reply_to_chatwoot_message_id is not None:
+            target = await _get_whatsapp_reply_context_target(
+                session,
+                reply_to_chatwoot_message_id,
+                chatwoot_conversation_id=cw_conversation_id,
+                phone_e164=phone_e164,
+            )
+            if target is not None:
+                reply_to_provider_message_id = target.provider_message_id
+                reply_context_audit.update(
+                    {
+                        "reply_to_provider_message_id": target.provider_message_id,
+                        "reply_context_source": target.source,
+                        "reply_context_native": True,
+                    }
+                )
+                logger.info(
+                    "operator_relay: native reply context resolved conv_id=%s msg_id=%s source=%s",
+                    conversation_id,
+                    chatwoot_message_id,
+                    target.source,
+                )
+            else:
+                logger.info(
+                    "operator_relay: native reply context target not found conv_id=%s msg_id=%s reply_to=%s",
+                    conversation_id,
+                    chatwoot_message_id,
+                    reply_to_chatwoot_message_id,
+                )
+
         logger.info(
             "operator_relay: direct text sent (window open) phone=%s conv_id=%s mode=%s",
             phone_e164,
@@ -988,6 +1121,7 @@ async def _handle_operator_relay(
             phone=phone_e164,
             text=text,
             company_id=company_id,
+            reply_to_provider_message_id=reply_to_provider_message_id,
         )
 
         if err is not None:
@@ -1034,6 +1168,7 @@ async def _handle_operator_relay(
                 "wa_window_open": True,
                 "last_meta_inbound_at": last_inbound_iso,
                 "closed_window_mode": mode,
+                **reply_context_audit,
             },
         )
         session.add(outbox)
@@ -1084,6 +1219,7 @@ async def _handle_operator_relay(
                 "chatwoot_conversation_id": conversation_id,
                 "chatwoot_message_id": chatwoot_message_id,
                 "agent_name": agent_name,
+                **reply_context_audit,
             },
         )
         session.add(outbox)
@@ -1237,6 +1373,7 @@ async def _handle_operator_relay(
             "last_meta_inbound_at": last_inbound_iso,
             "reopen_reason": "customer_service_window_closed",
             "closed_window_mode": mode,
+            **reply_context_audit,
         },
     )
     session.add(outbox)

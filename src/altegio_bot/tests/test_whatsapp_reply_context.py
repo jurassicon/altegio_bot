@@ -29,10 +29,12 @@ from altegio_bot.models.models import (
 from altegio_bot.providers.base import WhatsAppProvider
 from altegio_bot.workers.whatsapp_inbox_worker import (
     ReplyContextTarget,
+    WhatsAppReplyContextTarget,
     _event_origin_for_metrics,
     _extract_actions,
     _format_reply_context_prefix,
     _get_reply_context_target,
+    _get_whatsapp_reply_context_target,
     _is_chatwoot_origin,
     _is_operator_relay,
     _normalize_reply_context_id,
@@ -142,6 +144,31 @@ def _make_event(payload: dict[str, Any], dedupe_key: str = "wa:reply-test") -> W
         query={},
         headers={},
         payload=payload,
+    )
+
+
+def _forwarded_whatsapp_event(
+    *,
+    dedupe_key: str = "wa:forwarded-reply-target",
+    from_phone: str = FROM_PHONE,
+    chatwoot_message_id: int | None = 4960,
+    chatwoot_conversation_id: int | None = 230,
+    whatsapp_message_id: str | None = "wamid.INBOUND",
+) -> WhatsAppEvent:
+    return WhatsAppEvent(
+        dedupe_key=dedupe_key,
+        status="processed",
+        error=None,
+        query={},
+        headers={},
+        payload=_meta_payload(
+            "Message test",
+            from_phone=from_phone,
+            wamid=whatsapp_message_id or "wamid.MISSING_COLUMN",
+        ),
+        chatwoot_message_id=chatwoot_message_id,
+        forwarded_chatwoot_conversation_id=chatwoot_conversation_id,
+        whatsapp_message_id=whatsapp_message_id,
     )
 
 
@@ -320,6 +347,147 @@ async def test_reply_target_newest_row_wins(session_maker) -> None:
     assert target is not None
     assert target.chatwoot_message_id == 2
     assert target.body == "new"
+
+
+# ---------------------------------------------------------------------------
+# _get_whatsapp_reply_context_target (Chatwoot Reply → WhatsApp wamid)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_whatsapp_reply_target_finds_inbound_event(session_maker) -> None:
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(_forwarded_whatsapp_event())
+
+        target = await _get_whatsapp_reply_context_target(
+            session,
+            4960,
+            chatwoot_conversation_id=230,
+            phone_e164=PHONE_E164,
+        )
+
+    assert target == WhatsAppReplyContextTarget(
+        provider_message_id="wamid.INBOUND",
+        source="whatsapp_event",
+    )
+
+
+@pytest.mark.asyncio
+async def test_whatsapp_reply_target_wrong_conversation_returns_none(session_maker) -> None:
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(_forwarded_whatsapp_event(chatwoot_conversation_id=999))
+
+        target = await _get_whatsapp_reply_context_target(
+            session,
+            4960,
+            chatwoot_conversation_id=230,
+            phone_e164=PHONE_E164,
+        )
+
+    assert target is None
+
+
+@pytest.mark.asyncio
+async def test_whatsapp_reply_target_wrong_phone_returns_none(session_maker) -> None:
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(_forwarded_whatsapp_event(from_phone="49000000000"))
+
+        target = await _get_whatsapp_reply_context_target(
+            session,
+            4960,
+            chatwoot_conversation_id=230,
+            phone_e164=PHONE_E164,
+        )
+
+    assert target is None
+
+
+@pytest.mark.asyncio
+async def test_whatsapp_reply_target_missing_whatsapp_message_id_returns_none(session_maker) -> None:
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(_forwarded_whatsapp_event(whatsapp_message_id=None))
+
+        target = await _get_whatsapp_reply_context_target(
+            session,
+            4960,
+            chatwoot_conversation_id=230,
+            phone_e164=PHONE_E164,
+        )
+
+    assert target is None
+
+
+@pytest.mark.asyncio
+async def test_whatsapp_reply_target_chatwoot_origin_event_not_matched(session_maker) -> None:
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(
+                _forwarded_whatsapp_event(
+                    dedupe_key="chatwoot:230:4960",
+                    whatsapp_message_id="wamid.CHATWOOT_MIRROR",
+                )
+            )
+
+        target = await _get_whatsapp_reply_context_target(
+            session,
+            4960,
+            chatwoot_conversation_id=230,
+            phone_e164=PHONE_E164,
+        )
+
+    assert target is None
+
+
+@pytest.mark.asyncio
+async def test_whatsapp_reply_target_finds_previous_operator_outbox(session_maker) -> None:
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(
+                _operator_outbox(
+                    wamid="wamid.OPERATOR",
+                    chatwoot_message_id=4964,
+                    chatwoot_conversation_id=230,
+                )
+            )
+
+        target = await _get_whatsapp_reply_context_target(
+            session,
+            4964,
+            chatwoot_conversation_id=230,
+            phone_e164=PHONE_E164,
+        )
+
+    assert target == WhatsAppReplyContextTarget(
+        provider_message_id="wamid.OPERATOR",
+        source="outbox_operator",
+    )
+
+
+@pytest.mark.asyncio
+async def test_whatsapp_reply_target_bot_outbox_not_matched(session_maker) -> None:
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(
+                _operator_outbox(
+                    wamid="wamid.BOT",
+                    chatwoot_message_id=4964,
+                    chatwoot_conversation_id=230,
+                    message_source="bot",
+                )
+            )
+
+        target = await _get_whatsapp_reply_context_target(
+            session,
+            4964,
+            chatwoot_conversation_id=230,
+            phone_e164=PHONE_E164,
+        )
+
+    assert target is None
 
 
 # ---------------------------------------------------------------------------

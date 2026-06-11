@@ -262,6 +262,10 @@ async def _ingest_operator_outgoing(
     chatwoot_conversation_id = conversation.get("id")
     chatwoot_inbox_id = conversation.get("inbox_id")
     text = payload.get("content", "")
+    content_attributes = payload.get("content_attributes") or {}
+    if not isinstance(content_attributes, dict):
+        content_attributes = {}
+    reply_to_chatwoot_message_id = _coerce_int(content_attributes.get("in_reply_to"))
 
     # Recipient phone is the contact (customer) in the conversation.
     recipient_phone = contact.get("phone_number")
@@ -289,6 +293,8 @@ async def _ingest_operator_outgoing(
             "agent_name": sender.get("name", ""),
             "agent_id": sender.get("id"),
             "contact_name": contact.get("name"),
+            "content_attributes": content_attributes,
+            "reply_to_chatwoot_message_id": reply_to_chatwoot_message_id,
         },
     }
 
