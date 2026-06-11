@@ -494,6 +494,21 @@ class OutboxMessage(Base):
         server_default=text("'bot'"),
     )
 
+    # Chatwoot ids of the operator message this row relays (also kept in meta
+    # for backward compatibility).  Indexed so an inbound WhatsApp reply
+    # (messages[0].context.id == provider_message_id) can resolve its native
+    # Chatwoot reply target.
+    chatwoot_conversation_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        nullable=True,
+        index=True,
+    )
+    chatwoot_message_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        nullable=True,
+        index=True,
+    )
+
 
 class ContactRateLimit(Base):
     __tablename__ = "contact_rate_limits"
@@ -615,10 +630,40 @@ class WhatsAppEvent(Base):
     headers: Mapped[dict] = mapped_column(JSONB, default=dict)
     payload: Mapped[dict] = mapped_column(JSONB, default=dict)
 
-    # Chatwoot conversation that originated this event (set when webhook comes
-    # from Chatwoot instead of Meta directly)
+    # SOURCE Chatwoot conversation that originated this event (set only when
+    # the webhook comes from Chatwoot instead of Meta directly).  Never holds
+    # the destination conversation of a forwarded Meta-origin message — that
+    # lives in forwarded_chatwoot_conversation_id below.
     chatwoot_conversation_id: Mapped[int | None] = mapped_column(
         BigInteger,
+        nullable=True,
+        index=True,
+    )
+
+    # Chatwoot Message.id linked to this event:
+    # - Chatwoot-origin events: id of the source Chatwoot message;
+    # - Meta-origin events: id of the message created in Chatwoot when the
+    #   inbound text was forwarded there.
+    chatwoot_message_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        nullable=True,
+        index=True,
+    )
+
+    # DESTINATION Chatwoot conversation a Meta-origin inbound message was
+    # forwarded to.  Kept separate from chatwoot_conversation_id (source
+    # marker) so forwarding never flips a Meta event into "chatwoot-origin".
+    forwarded_chatwoot_conversation_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        nullable=True,
+        index=True,
+    )
+
+    # Meta wamid of the inbound message (payload messages[0].id).  Audit and
+    # future native-reply mapping; NOT the Chatwoot message id and NOT a
+    # replacement for dedupe_key.
+    whatsapp_message_id: Mapped[str | None] = mapped_column(
+        String(128),
         nullable=True,
         index=True,
     )

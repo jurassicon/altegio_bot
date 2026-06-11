@@ -77,6 +77,52 @@ async def test_incoming_message_saved(session_maker) -> None:
 
 
 @pytest.mark.asyncio
+async def test_incoming_message_stores_source_markers(session_maker) -> None:
+    """Incoming webhook must store source conversation AND message ids."""
+    import altegio_bot.webhooks.chatwoot as cw_module
+    from altegio_bot.main import app
+
+    original_session_local = cw_module.SessionLocal
+
+    try:
+        cw_module.SessionLocal = session_maker  # type: ignore[assignment]
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as tc:
+            payload = _cw_payload(
+                phone="+49123456780",
+                content="Hi",
+                conversation_id=88,
+                message_id=555,
+            )
+            resp = await tc.post(
+                "/webhook/chatwoot",
+                content=json.dumps(payload),
+                headers={"Content-Type": "application/json"},
+            )
+            assert resp.status_code == 200
+
+        async with session_maker() as session:
+            from sqlalchemy import select
+
+            from altegio_bot.models.models import WhatsAppEvent
+
+            stmt = select(WhatsAppEvent).where(WhatsAppEvent.dedupe_key == "chatwoot:88:555")
+            event = (await session.execute(stmt)).scalar_one_or_none()
+
+        assert event is not None
+        assert "_chatwoot" in event.payload
+        # Source markers for a Chatwoot-origin event.
+        assert event.chatwoot_conversation_id == 88
+        assert event.chatwoot_message_id == 555
+        # Destination fields stay empty — this event was not forwarded anywhere.
+        assert event.forwarded_chatwoot_conversation_id is None
+        assert event.whatsapp_message_id is None
+
+    finally:
+        cw_module.SessionLocal = original_session_local
+
+
+@pytest.mark.asyncio
 async def test_outgoing_message_skipped(session_maker) -> None:
     """Outgoing messages from the bot should be skipped."""
     import altegio_bot.webhooks.chatwoot as cw_module
