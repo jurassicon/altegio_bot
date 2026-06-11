@@ -117,7 +117,9 @@ recreate, service aliases do not.
 
 Probe the current public URL first (sanity check), then each internal
 candidate that resolved in step 6. Uses the real token from the container
-env; the token is never printed.
+env; the token is never printed. Replace `<known-test-phone-e164>` with a
+known test phone in E.164 format — do not put real client numbers in docs
+or shell history.
 
 ```bash
 # Public baseline + each resolved candidate:
@@ -130,7 +132,7 @@ $COMPOSE exec -T altegio-outbox-worker /app/.venv/bin/python \
   --base-url "http://rails:3000" \
   --forwarded-proto https \
   --requests 15 \
-  --query "+381638400431"
+  --query "<known-test-phone-e164>"
 ```
 
 A candidate passes when all requests return HTTP 200 and latency is below
@@ -211,7 +213,7 @@ max=0.456s; re-measured June 2026: avg=0.053s, median=0.042s):
 $COMPOSE exec -T altegio-outbox-worker /app/.venv/bin/python \
   -m altegio_bot.scripts.probe_chatwoot_latency \
   --requests 15 \
-  --query "+381638400431"
+  --query "<known-test-phone-e164>"
 ```
 
 The probe prints `forwarded_proto=https` when the env var is active.

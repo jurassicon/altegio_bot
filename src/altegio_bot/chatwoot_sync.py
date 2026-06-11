@@ -18,7 +18,7 @@ from typing import Any
 
 import httpx
 
-from altegio_bot.chatwoot_client import forwarded_proto_header
+from altegio_bot.chatwoot_headers import forwarded_proto_header
 
 logger = logging.getLogger(__name__)
 
@@ -50,12 +50,15 @@ def _build_base_url(chatwoot_base_url: str, chatwoot_account_id: int) -> str:
     return f"{chatwoot_base_url.rstrip('/')}/api/v1/accounts/{chatwoot_account_id}"
 
 
-def _auth_headers(chatwoot_api_token: str) -> dict[str, str]:
+def _auth_headers(
+    chatwoot_api_token: str,
+    chatwoot_api_forwarded_proto: str | None = None,
+) -> dict[str, str]:
     headers = {
         "api_access_token": chatwoot_api_token,
         "Content-Type": "application/json",
     }
-    headers.update(forwarded_proto_header())
+    headers.update(forwarded_proto_header(chatwoot_api_forwarded_proto))
     return headers
 
 
@@ -205,6 +208,7 @@ async def sync_beautiful_message_to_chatwoot(
     conversation_id: int,
     wamid: str,
     formatted_text: str,
+    chatwoot_api_forwarded_proto: str | None = None,
 ) -> bool:
     """Заменяет сырое шаблонное сообщение в Chatwoot на красиво отформатированный текст.
 
@@ -222,6 +226,10 @@ async def sync_beautiful_message_to_chatwoot(
         conversation_id:      ID беседы в Chatwoot.
         wamid:                ID сообщения Meta (messages[0].id), напр. "wamid.xxx".
         formatted_text:       Готовый красивый текст для замены.
+        chatwoot_api_forwarded_proto:
+                              Значение X-Forwarded-Proto для internal Docker
+                              route (settings.chatwoot_api_forwarded_proto).
+                              None/пусто — заголовок не отправляется.
 
     Возвращает:
         True  — всё прошло успешно (удалили + создали).
@@ -239,7 +247,7 @@ async def sync_beautiful_message_to_chatwoot(
         await asyncio.sleep(delay)
 
         base = _build_base_url(chatwoot_base_url, chatwoot_account_id)
-        headers = _auth_headers(chatwoot_api_token)
+        headers = _auth_headers(chatwoot_api_token, chatwoot_api_forwarded_proto)
 
         async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT_SEC) as client:
             # ── Шаг 2 + 3: получаем список сообщений и ищем наш wamid ──

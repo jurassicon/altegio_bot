@@ -8,12 +8,7 @@ import httpx
 import pytest
 import respx
 
-from altegio_bot.chatwoot_client import (
-    ChatwootClient,
-    append_wa_deeplink,
-    forwarded_proto_header,
-    normalize_forwarded_proto,
-)
+from altegio_bot.chatwoot_client import ChatwootClient, append_wa_deeplink
 
 # ---------------------------------------------------------------------------
 # append_wa_deeplink – unit tests
@@ -588,7 +583,7 @@ def test_headers_forwarded_proto_blank_means_no_header(blank: str) -> None:
 def test_headers_forwarded_proto_invalid_no_header_and_warns(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    with caplog.at_level("WARNING", logger="altegio_bot.chatwoot_client"):
+    with caplog.at_level("WARNING", logger="altegio_bot.chatwoot_headers"):
         headers = _client_with_proto("ftp")._headers()
     assert "X-Forwarded-Proto" not in headers
     assert "CHATWOOT_API_FORWARDED_PROTO" in caplog.text
@@ -642,36 +637,3 @@ async def test_contact_search_request_has_no_forwarded_proto_by_default(
     await client.get_or_create_contact("+49123456789")
 
     assert "X-Forwarded-Proto" not in route.calls[0].request.headers
-
-
-# ---------------------------------------------------------------------------
-# normalize_forwarded_proto / forwarded_proto_header – shared helpers
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    ("value", "expected"),
-    [
-        (None, None),
-        ("", None),
-        ("   ", None),
-        ("https", "https"),
-        ("http", "http"),
-        (" https ", "https"),
-        ("HTTPS", "https"),
-        ("ftp", None),
-        ("https://chatwoot.example.com", None),
-    ],
-)
-def test_normalize_forwarded_proto(value: str | None, expected: str | None) -> None:
-    assert normalize_forwarded_proto(value) == expected
-
-
-def test_forwarded_proto_header_from_settings(monkeypatch: pytest.MonkeyPatch) -> None:
-    from altegio_bot import settings as settings_module
-
-    monkeypatch.setattr(settings_module.settings, "chatwoot_api_forwarded_proto", "https")
-    assert forwarded_proto_header() == {"X-Forwarded-Proto": "https"}
-
-    monkeypatch.setattr(settings_module.settings, "chatwoot_api_forwarded_proto", "")
-    assert forwarded_proto_header() == {}

@@ -9,6 +9,8 @@ Covers (offline only, no real Chatwoot):
 5. Missing env (base URL / account id / token) → exit 2, token never printed.
 6. X-Forwarded-Proto: --forwarded-proto / env add the header, CLI wins over
    env, default sends no header, token never printed (respx, no real HTTP).
+7. Clean-env regression: the probe runs with only CHATWOOT_* env set —
+   importing it must not instantiate Settings() (no DATABASE_URL needed).
 """
 
 from __future__ import annotations
@@ -209,3 +211,44 @@ async def test_probe_invalid_forwarded_proto_sends_no_header(capsys, monkeypatch
     assert exit_code == 0
     assert "X-Forwarded-Proto" not in route.calls[0].request.headers
     assert "forwarded_proto=<none>" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# 7. Clean-env regression (P2): probe must run without full app env
+# ---------------------------------------------------------------------------
+
+
+def test_probe_runs_in_clean_env_without_app_settings(tmp_path) -> None:
+    """Reproduction of the review finding:
+
+    env -i CHATWOOT_BASE_URL=... CHATWOOT_ACCOUNT_ID=... CHATWOOT_API_TOKEN=...
+        CHATWOOT_API_FORWARDED_PROTO=https \\
+        python -m altegio_bot.scripts.probe_chatwoot_latency --help
+
+    used to crash on import because chatwoot_client instantiates Settings(),
+    which requires unrelated app env (DATABASE_URL, ALTEGIO_WEBHOOK_SECRET).
+    cwd is a tmp dir so pydantic cannot pick up the repo's local .env file.
+    --help exits before any HTTP request is made.
+    """
+    import os
+    import subprocess
+    import sys
+
+    result = subprocess.run(
+        [sys.executable, "-m", "altegio_bot.scripts.probe_chatwoot_latency", "--help"],
+        env={
+            "PATH": os.environ.get("PATH", ""),
+            "CHATWOOT_BASE_URL": "https://chatwoot.example.com",
+            "CHATWOOT_ACCOUNT_ID": "2",
+            "CHATWOOT_API_TOKEN": "test-token",
+            "CHATWOOT_API_FORWARDED_PROTO": "https",
+        },
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "usage" in result.stdout.lower()
+    assert "DATABASE_URL" not in result.stderr
+    assert "ALTEGIO_WEBHOOK_SECRET" not in result.stderr

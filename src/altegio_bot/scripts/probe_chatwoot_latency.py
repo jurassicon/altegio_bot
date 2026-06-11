@@ -24,7 +24,7 @@ from collections import Counter
 
 import httpx
 
-from altegio_bot.chatwoot_client import normalize_forwarded_proto
+from altegio_bot.chatwoot_headers import normalize_forwarded_proto
 
 DEFAULT_REQUESTS = 15
 DEFAULT_TIMEOUT_SEC = 10.0
