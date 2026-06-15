@@ -615,6 +615,76 @@ def test_open_window_ambiguous_text_error_closes_circuit_no_fallback(monkeypatch
     assert session.added == []
 
 
+@pytest.mark.parametrize(
+    "err",
+    [
+        "{'code': 2, 'is_transient': True}",
+        '{"code":2,"is_transient":true}',
+        "Meta send failed status=429 code=None is_transient=None",
+        "Meta send failed status=500 code=None is_transient=None",
+        "Meta send failed status=502 code=None is_transient=None",
+        "Meta send failed status=503 code=None is_transient=None",
+        "Meta send failed status=504 code=None is_transient=None",
+        "Connection timeout: upstream unreachable",
+    ],
+)
+def test_transient_provider_error_detection(err: str) -> None:
+    assert ow._is_transient_provider_error(err) is True
+
+
+@pytest.mark.parametrize(
+    "err",
+    [
+        "Meta send_template failed status=400 code=132000 is_transient=false message=template validation error",
+        "Meta send failed status=400 code=190 is_transient=false message=access token expired",
+        "Meta text send failed: outside customer service window code=131047",
+    ],
+)
+def test_permanent_provider_errors_do_not_close_circuit(err: str) -> None:
+    assert ow._is_transient_provider_error(err) is False
+
+
+def test_transient_provider_error_closes_circuit_requeues_without_failed_outbox(monkeypatch: Any) -> None:
+    job = FakeJob(
+        id=82,
+        company_id=758285,
+        job_type="record_created",
+        status="queued",
+        run_at=NOW,
+        attempts=1,
+        max_attempts=5,
+    )
+    _patch_base(monkeypatch, job)
+    monkeypatch.setattr(ow.settings, "whatsapp_send_mode", "template")
+
+    async def _load_record(session: Any, job_obj: Any) -> Any:
+        return FakeRecord(id=10, company_id=job.company_id, starts_at=NOW + timedelta(hours=3))
+
+    async def _send_template(*a: Any, **kw: Any) -> Any:
+        return (None, "Meta send_template failed status=503 code=2 is_transient=true fbtrace_id=TRACE")
+
+    close_calls: list[dict[str, Any]] = []
+
+    async def _close_circuit(**kwargs: Any) -> None:
+        close_calls.append(kwargs)
+
+    monkeypatch.setattr(ow, "_load_record", _load_record)
+    monkeypatch.setattr(ow, "safe_send_template", _send_template)
+    monkeypatch.setattr(ow.meta_circuit, "close_meta_circuit", _close_circuit)
+
+    session = FakeSession()
+    run(ow.process_job_in_session(session, 82, provider=object()))  # type: ignore
+
+    assert job.status == "queued"
+    assert job.attempts == 1
+    assert "Meta circuit closed" in (job.last_error or "")
+    assert close_calls
+    assert close_calls[0]["reason"] == "transient_send_error"
+    assert close_calls[0]["error_kind"] == "http"
+    assert close_calls[0]["error_code"] == "503"
+    assert session.added == []
+
+
 def test_closed_circuit_skips_send_rate_limit_and_attempts(monkeypatch: Any) -> None:
     job = FakeJob(
         id=80,
@@ -683,6 +753,37 @@ def test_closed_circuit_cancels_when_deadline_exceeded(monkeypatch: Any) -> None
     assert job.status == "canceled"
     assert job.attempts == 0
     assert job.last_error == "Retry deadline exceeded for record_created"
+
+
+def test_delivery_retry_malformed_original_outbox_id_cancels_before_send(monkeypatch: Any) -> None:
+    job = FakeJob(
+        id=83,
+        company_id=758285,
+        job_type="record_created",
+        status="queued",
+        run_at=NOW,
+        payload={"kind": "delivery_failed_retry", "delivery_retry_of_outbox_id": "bad"},
+    )
+    _patch_base(monkeypatch, job)
+    send_calls: list[str] = []
+
+    async def _load_record(session: Any, job_obj: Any) -> Any:
+        return FakeRecord(id=10, company_id=job.company_id, starts_at=NOW + timedelta(hours=3))
+
+    async def _send_template(*a: Any, **kw: Any) -> Any:
+        send_calls.append("template")
+        return ("wamid", None)
+
+    monkeypatch.setattr(ow, "_load_record", _load_record)
+    monkeypatch.setattr(ow, "safe_send_template", _send_template)
+
+    session = FakeSession()
+    run(ow.process_job_in_session(session, 83, provider=object()))  # type: ignore
+
+    assert job.status == "canceled"
+    assert job.last_error == "Canceled: invalid delivery_retry_of_outbox_id"
+    assert send_calls == []
+    assert session.added == []
 
 
 def test_retry_deadline_policy_for_service_jobs() -> None:

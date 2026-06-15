@@ -12,7 +12,8 @@ Covers:
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
@@ -29,6 +30,7 @@ from altegio_bot.models.models import (
     WhatsAppSender,
 )
 from altegio_bot.providers.base import WhatsAppProvider
+from altegio_bot.workers import outbox_worker as ow
 from altegio_bot.workers.whatsapp_inbox_worker import (
     _apply_status_updates,
     _extract_status_updates,
@@ -540,7 +542,7 @@ async def test_sent_callback_advances_from_queued(session_maker) -> None:
             ]
             run_ids = await _apply_status_updates(session, updates)
 
-    assert run_ids != [] or True  # campaign recompute may or may not be triggered
+    assert run_ids != []
 
     async with session_maker() as session:
         ob = await session.get(OutboxMessage, outbox_id)
@@ -627,14 +629,41 @@ async def test_failed_131026_marks_failed_without_retry(session_maker) -> None:
 
 
 @pytest.mark.asyncio
-async def test_failed_code_10_schedules_service_delivery_retry(session_maker) -> None:
+async def test_failed_code_10_permission_marks_failed_without_retry(session_maker) -> None:
     _, _, outbox_id = await _setup_service_outbox(session_maker, job_type="record_created")
     payload = _failed_status_payload(PHONE_NUMBER_ID, WAMID, code=10, title="Permission")
 
     async with session_maker() as session:
         async with session.begin():
             evt = WhatsAppEvent(
-                dedupe_key="wa:failed-code-10",
+                dedupe_key="wa:failed-code-10-permission",
+                status="received",
+                payload=payload,
+                query={},
+                headers={},
+            )
+            session.add(evt)
+            await session.flush()
+            await handle_event(session, evt, _NullProvider())
+
+    async with session_maker() as session:
+        ob = await session.get(OutboxMessage, outbox_id)
+        assert ob is not None
+        assert ob.status == "failed"
+        stmt = select(MessageJob).where(MessageJob.dedupe_key == f"delivery_retry:{outbox_id}:1")
+        retry = (await session.execute(stmt)).scalar_one_or_none()
+        assert retry is None
+
+
+@pytest.mark.asyncio
+async def test_failed_transient_code_schedules_service_delivery_retry(session_maker) -> None:
+    _, _, outbox_id = await _setup_service_outbox(session_maker, job_type="record_created")
+    payload = _failed_status_payload(PHONE_NUMBER_ID, WAMID, code=131000, title="Temporary failure")
+
+    async with session_maker() as session:
+        async with session.begin():
+            evt = WhatsAppEvent(
+                dedupe_key="wa:failed-transient-131000",
                 status="received",
                 payload=payload,
                 query={},
@@ -662,13 +691,13 @@ async def test_failed_code_10_schedules_service_delivery_retry(session_maker) ->
 @pytest.mark.asyncio
 async def test_duplicate_failed_webhook_dedupes_retry_job(session_maker) -> None:
     _, _, outbox_id = await _setup_service_outbox(session_maker, job_type="record_created")
-    payload = _failed_status_payload(PHONE_NUMBER_ID, WAMID, code=10)
+    payload = _failed_status_payload(PHONE_NUMBER_ID, WAMID, code=131000, title="Temporary failure")
 
     for idx in range(2):
         async with session_maker() as session:
             async with session.begin():
                 evt = WhatsAppEvent(
-                    dedupe_key=f"wa:failed-code-10-dupe-{idx}",
+                    dedupe_key=f"wa:failed-131000-dupe-{idx}",
                     status="received",
                     payload=payload,
                     query={},
@@ -726,7 +755,7 @@ async def test_late_failed_after_delivered_does_not_downgrade_or_retry(session_m
         job_type="record_created",
         outbox_status="delivered",
     )
-    payload = _failed_status_payload(PHONE_NUMBER_ID, WAMID, code=10)
+    payload = _failed_status_payload(PHONE_NUMBER_ID, WAMID, code=131000, title="Temporary failure")
 
     async with session_maker() as session:
         async with session.begin():
@@ -742,6 +771,81 @@ async def test_late_failed_after_delivered_does_not_downgrade_or_retry(session_m
         assert (ob.meta or {})["stale_failed_after_success"] is True
         stmt = select(MessageJob).where(MessageJob.dedupe_key.like(f"delivery_retry:{outbox_id}:%"))
         assert list((await session.execute(stmt)).scalars().all()) == []
+
+
+@pytest.mark.asyncio
+async def test_marketing_failed_delivery_does_not_auto_retry(session_maker) -> None:
+    _, _, outbox_id = await _setup_service_outbox(session_maker, job_type="review_3d")
+    payload = _failed_status_payload(PHONE_NUMBER_ID, WAMID, code=131000, title="Temporary failure")
+
+    async with session_maker() as session:
+        async with session.begin():
+            evt = WhatsAppEvent(dedupe_key="wa:marketing-failed-no-retry", status="received", payload=payload)
+            session.add(evt)
+            await session.flush()
+            await handle_event(session, evt, _NullProvider())
+
+    async with session_maker() as session:
+        ob = await session.get(OutboxMessage, outbox_id)
+        assert ob is not None
+        assert ob.status == "failed"
+        stmt = select(MessageJob).where(MessageJob.dedupe_key.like(f"delivery_retry:{outbox_id}:%"))
+        assert list((await session.execute(stmt)).scalars().all()) == []
+
+
+@pytest.mark.asyncio
+async def test_delivery_retry_presend_guard_cancels_when_chain_already_succeeded(session_maker) -> None:
+    record_id, _, outbox_id = await _setup_service_outbox(
+        session_maker,
+        job_type="record_created",
+        outbox_status="delivered",
+    )
+
+    async with session_maker() as session:
+        record = await session.get(Record, record_id)
+        job = SimpleNamespace(
+            job_type="record_created",
+            run_at=_utcnow(),
+            payload={"kind": "delivery_failed_retry", "delivery_retry_of_outbox_id": outbox_id},
+        )
+
+        reason = await ow._delivery_retry_presend_guard(session, job, record)
+
+    assert reason == "Canceled: delivery retry chain already succeeded"
+
+
+@pytest.mark.asyncio
+async def test_delivery_retry_presend_guard_cancels_when_original_missing(session_maker) -> None:
+    async with session_maker() as session:
+        job = SimpleNamespace(
+            job_type="record_created",
+            run_at=_utcnow(),
+            payload={"kind": "delivery_failed_retry", "delivery_retry_of_outbox_id": 999999},
+        )
+
+        reason = await ow._delivery_retry_presend_guard(session, job, None)
+
+    assert reason == "Retry deadline exceeded or original outbox missing for delivery retry"
+
+
+@pytest.mark.asyncio
+async def test_delivery_retry_presend_guard_cancels_when_deadline_passed(session_maker) -> None:
+    record_id, _, outbox_id = await _setup_service_outbox(session_maker, job_type="record_created")
+
+    async with session_maker() as session:
+        async with session.begin():
+            record = await session.get(Record, record_id)
+            assert record is not None
+            record.starts_at = _utcnow() - timedelta(days=1)
+            job = SimpleNamespace(
+                job_type="record_created",
+                run_at=_utcnow() - timedelta(days=1),
+                payload={"kind": "delivery_failed_retry", "delivery_retry_of_outbox_id": outbox_id},
+            )
+
+            reason = await ow._delivery_retry_presend_guard(session, job, record)
+
+    assert reason == "Retry deadline exceeded for record_created"
 
 
 @pytest.mark.asyncio

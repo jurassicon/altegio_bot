@@ -81,6 +81,7 @@ class Settings(BaseSettings):
     meta_circuit_probe_max_delay_seconds: int = 1800
     meta_circuit_pause_requeue_delay_seconds: int = 300
     meta_circuit_probe_timeout_seconds: int = 10
+    meta_circuit_probe_lease_seconds: int = 60
 
     outbox_delivery_retry_enabled: bool = True
 

@@ -35,6 +35,7 @@ from sqlalchemy import select
 
 from altegio_bot.models.models import OutboxMessage, WhatsAppEvent, WhatsAppSender
 from altegio_bot.providers.base import WhatsAppProvider
+from altegio_bot.services import meta_circuit as mc
 from altegio_bot.workers.whatsapp_inbox_worker import (
     _apply_status_updates,
     _is_operator_relay,
@@ -621,6 +622,130 @@ async def test_operator_relay_outbox_persisted(session_maker, monkeypatch) -> No
     # Indexed copies for the native-reply lookup (PR1).
     assert outbox.chatwoot_conversation_id == 30
     assert outbox.chatwoot_message_id == 40
+
+
+@pytest.mark.asyncio
+async def test_operator_relay_circuit_closed_window_open_cancels_without_meta_send(session_maker) -> None:
+    """Closed Meta circuit pauses operator relay before free-form text send."""
+    await mc.close_meta_circuit(
+        session_factory=session_maker,
+        reason="transient_send_error",
+        error_kind="http",
+        error_code="503",
+        next_probe_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+    )
+    provider = _FakeProvider(wamid="wamid.SHOULD_NOT_SEND")
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _make_sender(session, sender_id=33, company_id=2, phone_number_id="PNID_CIRCUIT")
+            _meta_inbound_event(session, phone="+49123450001", dedupe_key="meta:inbound:circuit-open-window")
+            evt = WhatsAppEvent(
+                dedupe_key="chatwoot_out:circuit:open",
+                status="received",
+                error=None,
+                query={},
+                headers={},
+                payload=_operator_relay_payload(
+                    recipient_phone="+49123450001",
+                    text="Pause this operator message",
+                    conversation_id=330,
+                    message_id=440,
+                    phone_number_id="PNID_CIRCUIT",
+                ),
+                chatwoot_conversation_id=330,
+            )
+            session.add(evt)
+            await session.flush()
+
+            from altegio_bot.settings import settings as _s
+
+            orig_relay = _s.chatwoot_operator_relay_enabled
+            orig_note = _s.chatwoot_operator_reopen_private_note_enabled
+            _s.chatwoot_operator_relay_enabled = True
+            _s.chatwoot_operator_reopen_private_note_enabled = False
+            try:
+                await handle_event(session, evt, provider)
+            finally:
+                _s.chatwoot_operator_relay_enabled = orig_relay
+                _s.chatwoot_operator_reopen_private_note_enabled = orig_note
+
+    assert provider.sent == []
+    assert provider.templates_sent == []
+
+    async with session_maker() as session:
+        outbox = (
+            await session.execute(select(OutboxMessage).where(OutboxMessage.chatwoot_conversation_id == 330))
+        ).scalar_one()
+        assert outbox.status == "canceled"
+        assert outbox.provider_message_id is None
+        assert outbox.error == "Meta circuit closed: operator relay paused"
+        assert outbox.meta["cancel_reason"] == "meta_circuit_closed"
+        assert outbox.meta["attempted_send_type"] == "text"
+
+
+@pytest.mark.asyncio
+async def test_operator_relay_circuit_closed_reopen_template_cancels_without_meta_send(session_maker) -> None:
+    """Closed Meta circuit pauses operator relay before reopen-template send."""
+    await mc.close_meta_circuit(
+        session_factory=session_maker,
+        reason="transient_send_error",
+        error_kind="http",
+        error_code="503",
+        next_probe_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+    )
+    provider = _FakeProvider(wamid="wamid.SHOULD_NOT_TEMPLATE")
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _make_sender(session, sender_id=34, company_id=2, phone_number_id="PNID_CIRCUIT_TEMPLATE")
+            evt = WhatsAppEvent(
+                dedupe_key="chatwoot_out:circuit:template",
+                status="received",
+                error=None,
+                query={},
+                headers={},
+                payload=_operator_relay_payload(
+                    recipient_phone="+49123450002",
+                    text="Pause template",
+                    conversation_id=331,
+                    message_id=441,
+                    phone_number_id="PNID_CIRCUIT_TEMPLATE",
+                ),
+                chatwoot_conversation_id=331,
+            )
+            session.add(evt)
+            await session.flush()
+
+            from altegio_bot.settings import settings as _s
+
+            orig_relay = _s.chatwoot_operator_relay_enabled
+            orig_mode = _s.chatwoot_operator_closed_window_mode
+            orig_name = _s.chatwoot_operator_reopen_template_name
+            orig_note = _s.chatwoot_operator_reopen_private_note_enabled
+            _s.chatwoot_operator_relay_enabled = True
+            _s.chatwoot_operator_closed_window_mode = "reopen_template"
+            _s.chatwoot_operator_reopen_template_name = "test_reopen_tpl"
+            _s.chatwoot_operator_reopen_private_note_enabled = False
+            try:
+                await handle_event(session, evt, provider)
+            finally:
+                _s.chatwoot_operator_relay_enabled = orig_relay
+                _s.chatwoot_operator_closed_window_mode = orig_mode
+                _s.chatwoot_operator_reopen_template_name = orig_name
+                _s.chatwoot_operator_reopen_private_note_enabled = orig_note
+
+    assert provider.sent == []
+    assert provider.templates_sent == []
+
+    async with session_maker() as session:
+        outbox = (
+            await session.execute(select(OutboxMessage).where(OutboxMessage.chatwoot_conversation_id == 331))
+        ).scalar_one()
+        assert outbox.status == "canceled"
+        assert outbox.meta["cancel_reason"] == "meta_circuit_closed"
+        assert outbox.meta["attempted_send_type"] == "template"
+        assert outbox.meta["template"] == "test_reopen_tpl"
 
 
 # ---------------------------------------------------------------------------

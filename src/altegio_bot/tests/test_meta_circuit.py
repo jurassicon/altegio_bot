@@ -26,6 +26,8 @@ async def test_default_state_is_open(session_maker: Any) -> None:
     state = await mc.get_meta_circuit_state(session_factory=session_maker)
     assert state.state == "open"
     assert state.sends_paused is False
+    assert state.probe_token is None
+    assert state.probe_lease_until is None
     assert await mc.should_pause_meta_sends(session_factory=session_maker) is False
     assert await _row_count(session_maker) == 1
 
@@ -78,7 +80,7 @@ async def test_open_meta_circuit_resets_probe_fields(session_maker: Any) -> None
 
 @pytest.mark.asyncio
 async def test_mark_probing_only_when_not_open(session_maker: Any) -> None:
-    await mc.mark_meta_circuit_probing(session_factory=session_maker)
+    assert await mc.mark_meta_circuit_probing(session_factory=session_maker) is None
     assert (await mc.get_meta_circuit_state(session_factory=session_maker)).state == "open"
 
     await mc.close_meta_circuit(
@@ -86,10 +88,15 @@ async def test_mark_probing_only_when_not_open(session_maker: Any) -> None:
         reason="transient_send_error",
         error_kind="http",
         error_code="503",
-        next_probe_at=_probe_at(),
+        next_probe_at=_probe_at(-1),
     )
-    await mc.mark_meta_circuit_probing(session_factory=session_maker)
-    assert (await mc.get_meta_circuit_state(session_factory=session_maker)).state == "half_open"
+    token = await mc.mark_meta_circuit_probing(session_factory=session_maker)
+    state = await mc.get_meta_circuit_state(session_factory=session_maker)
+    assert token is not None
+    assert state.state == "half_open"
+    assert state.probe_token == token
+    assert state.probe_started_at is not None
+    assert state.probe_lease_until is not None
 
 
 @pytest.mark.asyncio
@@ -117,6 +124,91 @@ async def test_probe_failed_increments_attempts(session_maker: Any) -> None:
     assert n2 == 2
     assert state.state == "closed"
     assert state.probe_attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_active_probe_lease_blocks_second_probe(session_maker: Any) -> None:
+    await mc.close_meta_circuit(
+        session_factory=session_maker,
+        reason="transient_send_error",
+        error_kind="http",
+        error_code="503",
+        next_probe_at=mc._utcnow() - timedelta(seconds=1),
+    )
+
+    token = await mc.mark_meta_circuit_probing(session_factory=session_maker)
+    second = await mc.mark_meta_circuit_probing(session_factory=session_maker)
+
+    assert token is not None
+    assert second is None
+    state = await mc.get_meta_circuit_state(session_factory=session_maker)
+    assert state.state == "half_open"
+    assert state.probe_token == token
+
+
+@pytest.mark.asyncio
+async def test_expired_probe_lease_can_be_acquired_again(session_maker: Any) -> None:
+    await mc.close_meta_circuit(
+        session_factory=session_maker,
+        reason="transient_send_error",
+        error_kind="http",
+        error_code="503",
+        next_probe_at=mc._utcnow() - timedelta(seconds=1),
+    )
+    first = await mc.mark_meta_circuit_probing(session_factory=session_maker)
+    assert first is not None
+
+    async with session_maker() as session:
+        async with session.begin():
+            row = (await session.execute(select(MetaCircuitBreaker))).scalar_one()
+            row.probe_lease_until = mc._utcnow() - timedelta(seconds=1)
+
+    second = await mc.mark_meta_circuit_probing(session_factory=session_maker)
+
+    assert second is not None
+    assert second != first
+    state = await mc.get_meta_circuit_state(session_factory=session_maker)
+    assert state.probe_token == second
+
+
+@pytest.mark.asyncio
+async def test_stale_probe_results_are_noop(session_maker: Any) -> None:
+    await mc.close_meta_circuit(
+        session_factory=session_maker,
+        reason="transient_send_error",
+        error_kind="http",
+        error_code="503",
+        next_probe_at=mc._utcnow() - timedelta(seconds=1),
+    )
+    token = await mc.mark_meta_circuit_probing(session_factory=session_maker)
+    assert token is not None
+
+    assert await mc.open_meta_circuit(session_factory=session_maker, probe_token="wrong-token") is False
+    assert (await mc.get_meta_circuit_state(session_factory=session_maker)).state == "half_open"
+
+    assert (
+        await mc.mark_meta_circuit_probe_failed(
+            session_factory=session_maker,
+            reason="probe_failed",
+            next_probe_at=_probe_at(600),
+            probe_token="wrong-token",
+        )
+        == 0
+    )
+    state = await mc.get_meta_circuit_state(session_factory=session_maker)
+    assert state.state == "half_open"
+    assert state.probe_token == token
+
+    assert await mc.open_meta_circuit(session_factory=session_maker, probe_token=token) is True
+    await mc.mark_meta_circuit_probe_failed(
+        session_factory=session_maker,
+        reason="late_probe_failed",
+        next_probe_at=_probe_at(600),
+        probe_token=token,
+    )
+    state = await mc.get_meta_circuit_state(session_factory=session_maker)
+    assert state.state == "open"
+    assert state.probe_attempts == 0
 
 
 @pytest.mark.asyncio

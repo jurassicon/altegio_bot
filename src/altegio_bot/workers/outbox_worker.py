@@ -107,9 +107,9 @@ _DEADLINE_ALREADY_PASSED = datetime(1970, 1, 1, tzinfo=timezone.utc)
 _MARKETING_TRANSIENT_RETRY_CAP = timedelta(hours=24)
 _ORIGINAL_RUN_AT_KEY = "_original_run_at"
 
-_TRANSIENT_HTTP_STATUS_RE = re.compile(r"status=(429|500|502|503|504)\b")
-_TRANSIENT_META_CODE_RE = re.compile(r'(?:"code"\s*:\s*2|\bcode=2)\b')
-_TRANSIENT_FLAG_RE = re.compile(r'(?:"is_transient"\s*:\s*true|\bis_transient=true)')
+_TRANSIENT_HTTP_STATUS_RE = re.compile(r"\bstatus(?:_code)?=(429|500|502|503|504)\b")
+_TRANSIENT_META_CODE_RE = re.compile(r"""(?:(?:"code"|'code')\s*:\s*["']?2["']?|\bcode=2\b)""")
+_TRANSIENT_FLAG_RE = re.compile(r"""(?:(?:"is_transient"|'is_transient')\s*:\s*true|\bis_transient=true\b)""")
 _TRANSIENT_NETWORK_HINTS = (
     "timeout",
     "timed out",
@@ -895,7 +895,7 @@ async def _load_job(
 
 def _is_token_expired_error(err: str) -> bool:
     low = err.lower()
-    return "access token" in low and "expired" in low
+    return ("access token" in low and "expired" in low) or "code=190" in low
 
 
 def _is_permanent_meta_template_error(err: str) -> bool:
@@ -914,6 +914,14 @@ def _is_permanent_meta_template_error(err: str) -> bool:
             "template does not exist",
             "template name does not exist",
             "does not exist in the translation",
+            "template validation error",
+            "code=132000",
+            "code=132001",
+            "code=132005",
+            "code=132007",
+            "code=132012",
+            "code=132015",
+            "code=132016",
         )
     )
 
@@ -1111,7 +1119,7 @@ async def _delivery_retry_presend_guard(
     try:
         original_outbox_id = int(payload["delivery_retry_of_outbox_id"])
     except (KeyError, TypeError, ValueError):
-        return None
+        return "Canceled: invalid delivery_retry_of_outbox_id"
 
     if await _delivery_retry_chain_has_success(session, original_outbox_id):
         return "Canceled: delivery retry chain already succeeded"

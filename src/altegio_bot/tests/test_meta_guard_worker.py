@@ -107,6 +107,7 @@ async def test_due_successful_probe_opens_circuit(session_maker: Any) -> None:
     assert provider.metadata_calls == ["PHONE_NUM_ID"]
     state = await mc.get_meta_circuit_state(session_factory=session_maker)
     assert state.state == "open"
+    assert state.probe_token is None
 
 
 @pytest.mark.asyncio
@@ -145,6 +146,20 @@ async def test_missing_active_sender_stays_closed(session_maker: Any) -> None:
     assert result == "stayed_closed"
     assert provider.metadata_calls == []
     assert (await mc.get_meta_circuit_state(session_factory=session_maker)).state == "closed"
+
+
+@pytest.mark.asyncio
+async def test_active_probe_lease_returns_probe_in_progress(session_maker: Any) -> None:
+    await _seed_sender(session_maker)
+    await _close_circuit_due_now(session_maker)
+    token = await mc.mark_meta_circuit_probing(session_factory=session_maker)
+    assert token is not None
+    provider = FakeProvider(available=True)
+
+    result = await guard.tick(provider, session_factory=session_maker)
+
+    assert result == "probe_in_progress"
+    assert provider.metadata_calls == []
 
 
 @pytest.mark.asyncio

@@ -553,6 +553,9 @@ class MetaCircuitBreaker(Base):
         onupdate=func.now(),
     )
     next_probe_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    probe_token: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    probe_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    probe_lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     probe_attempts: Mapped[int] = mapped_column(
         Integer,
         nullable=False,

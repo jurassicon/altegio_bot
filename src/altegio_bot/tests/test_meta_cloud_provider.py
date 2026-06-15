@@ -14,7 +14,7 @@ from typing import Any
 import pytest
 
 from altegio_bot.providers.dummy import DummyProvider, safe_send
-from altegio_bot.providers.meta_cloud import MetaCloudProvider
+from altegio_bot.providers.meta_cloud import MetaCloudError, MetaCloudProvider
 
 
 class _FakeResp:
@@ -424,7 +424,7 @@ async def test_meta_cloud_check_metadata_error_is_safe() -> None:
 
     provider._client = _FakeClient()  # type: ignore[assignment]
 
-    with pytest.raises(RuntimeError) as exc:
+    with pytest.raises(MetaCloudError) as exc:
         await provider.check_metadata("PNID")
 
     message = str(exc.value)
@@ -432,6 +432,83 @@ async def test_meta_cloud_check_metadata_error_is_safe() -> None:
     assert "code=2" in message
     assert "secret-token" not in message
     assert "full response body" not in message
+
+
+@pytest.mark.asyncio
+async def test_meta_cloud_send_error_preserves_safe_transient_fields() -> None:
+    provider = MetaCloudProvider.__new__(MetaCloudProvider)
+    provider._access_token = "secret-token"
+    provider._api_version = "v21.0"
+    provider._graph_url = "https://graph.facebook.com"
+    provider._allow_real_send = True
+    provider._sender_cache = {1: "PNID"}
+
+    class _FakeClient:
+        async def post(self, *args: Any, **kwargs: Any) -> _FakeResp:
+            return _FakeResp(
+                status_code=503,
+                data={
+                    "error": {
+                        "code": 2,
+                        "is_transient": True,
+                        "message": "secret-token body=Hello customer phone=+49123",
+                        "fbtrace_id": "FBTRACE_SAFE",
+                    }
+                },
+            )
+
+    provider._client = _FakeClient()  # type: ignore[assignment]
+
+    with pytest.raises(MetaCloudError) as exc:
+        await provider.send(1, "+491234567890", "Hello customer")
+
+    err = exc.value
+    message = str(err)
+    assert err.status_code == 503
+    assert err.meta_code == "2"
+    assert err.is_transient is True
+    assert "status=503" in message
+    assert "code=2" in message
+    assert "is_transient=true" in message
+    assert "FBTRACE_SAFE" in message
+    assert "secret-token" not in message
+    assert "Hello customer" not in message
+    assert "+49123" not in message
+
+
+@pytest.mark.asyncio
+async def test_meta_cloud_send_template_validation_error_is_sanitized() -> None:
+    provider = MetaCloudProvider.__new__(MetaCloudProvider)
+    provider._access_token = "secret-token"
+    provider._api_version = "v21.0"
+    provider._graph_url = "https://graph.facebook.com"
+    provider._allow_real_send = True
+    provider._sender_cache = {1: "PNID"}
+
+    class _FakeClient:
+        async def post(self, *args: Any, **kwargs: Any) -> _FakeResp:
+            return _FakeResp(
+                status_code=400,
+                data={
+                    "error": {
+                        "code": 132000,
+                        "message": "Number of parameters does not match: secret-token param=Anna",
+                    }
+                },
+            )
+
+    provider._client = _FakeClient()  # type: ignore[assignment]
+
+    with pytest.raises(MetaCloudError) as exc:
+        await provider.send_template(1, "+491234567890", "tpl_name", "de", ["Anna"], "body")
+
+    message = str(exc.value)
+    assert "status=400" in message
+    assert "code=132000" in message
+    assert "template validation error" in message
+    assert "secret-token" not in message
+    assert "Anna" not in message
+    assert "tpl_name" not in message
 
 
 @pytest.mark.asyncio

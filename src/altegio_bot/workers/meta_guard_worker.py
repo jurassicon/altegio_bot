@@ -114,7 +114,11 @@ async def tick(
     if state.next_probe_at is not None and now < state.next_probe_at:
         return "waiting"
 
-    await mark_meta_circuit_probing(session_factory=session_factory)
+    probe_token = await mark_meta_circuit_probing(session_factory=session_factory)
+    if probe_token is None:
+        refreshed = await get_meta_circuit_state(session_factory=session_factory)
+        return "probe_in_progress" if refreshed.state == "half_open" else "waiting"
+
     phone_number_id = await _resolve_probe_phone_number_id(session_factory=session_factory)
     provider_cls = type(provider).__name__
     result = await _probe_meta(
@@ -124,7 +128,14 @@ async def tick(
     )
 
     if result.ok:
-        await open_meta_circuit(session_factory=session_factory, reason="probe_succeeded")
+        opened = await open_meta_circuit(
+            session_factory=session_factory,
+            reason="probe_succeeded",
+            probe_token=probe_token,
+        )
+        if not opened:
+            logger.warning("meta guard: stale successful probe ignored provider=%s", provider_cls)
+            return "probe_stale"
         logger.warning(
             "meta guard: probe succeeded provider=%s phone_number_id=%s",
             provider_cls,
@@ -134,15 +145,19 @@ async def tick(
 
     attempt = int(state.probe_attempts or 0) + 1
     delay = _probe_backoff_seconds(attempt)
-    await mark_meta_circuit_probe_failed(
+    failed_attempt = await mark_meta_circuit_probe_failed(
         reason=f"probe_failed:{result.error_kind}" if result.error_kind else "probe_failed",
         next_probe_at=utcnow() + timedelta(seconds=delay),
+        probe_token=probe_token,
         session_factory=session_factory,
     )
+    if failed_attempt == 0:
+        logger.warning("meta guard: stale failed probe ignored provider=%s", provider_cls)
+        return "probe_stale"
     logger.warning(
         "meta guard: probe failed probe_attempt=%s delay_seconds=%s error_kind=%s "
         "error_code=%s provider=%s phone_number_id=%s",
-        attempt,
+        failed_attempt,
         delay,
         result.error_kind,
         result.error_code,

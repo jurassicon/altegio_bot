@@ -28,6 +28,7 @@ from altegio_bot.models.models import (
 from altegio_bot.perf import perf_log
 from altegio_bot.providers.base import WhatsAppProvider
 from altegio_bot.providers.dummy import safe_send, safe_send_template
+from altegio_bot.services import meta_circuit
 from altegio_bot.settings import settings
 from altegio_bot.whatsapp_window import is_whatsapp_customer_window_open, normalize_phone
 from altegio_bot.workers.promo_lead_handler import (
@@ -79,7 +80,6 @@ _PERMANENT_DELIVERY_ERROR_CODES = {
 }
 _TRANSIENT_DELIVERY_ERROR_CODES = {
     0,
-    10,
     131000,
     131016,
     131056,
@@ -92,6 +92,31 @@ _PERMANENT_DELIVERY_FAILURE_KEYWORDS = (
     "recipient has blocked",
     "opted out",
     "unsubscribed",
+)
+_PERMANENT_DELIVERY_CODE_10_KEYWORDS = (
+    "permission",
+    "auth",
+    "access",
+    "config",
+    "credential",
+    "token",
+    "oauth",
+    "unauthorized",
+    "forbidden",
+    "permanent",
+)
+_TRANSIENT_DELIVERY_FAILURE_KEYWORDS = (
+    "transient",
+    "temporary",
+    "temporarily",
+    "rate",
+    "throttle",
+    "throttled",
+    "timeout",
+    "timed out",
+    "try again",
+    "unavailable",
+    "overloaded",
 )
 
 STOP_KEYWORDS = {
@@ -646,6 +671,7 @@ def _extract_statuses(payload: dict[str, Any]) -> list[dict[str, Any]]:
                         "phone_number_id": phone_number_id,
                         "error_code": first_error.get("code"),
                         "error_title": first_error.get("title"),
+                        "error_message": first_error.get("message"),
                         "error_details": error_data.get("details"),
                     }
                 )
@@ -663,15 +689,27 @@ def _classify_delivery_failure(status: dict[str, Any]) -> str:
     except (TypeError, ValueError):
         code_int = None
 
+    title = str(status.get("error_title") or "").lower()
+    message = str(status.get("error_message") or "").lower()
+    details = str(status.get("error_details") or "").lower()
+    combined = " ".join(part for part in (title, message, details) if part)
+
+    if code_int == 10:
+        if any(kw in combined for kw in _PERMANENT_DELIVERY_CODE_10_KEYWORDS):
+            return "permanent"
+        if any(kw in combined for kw in _TRANSIENT_DELIVERY_FAILURE_KEYWORDS):
+            return "retryable"
+        return "permanent"
+
     if code_int in _TRANSIENT_DELIVERY_ERROR_CODES:
         return "retryable"
     if code_int in _PERMANENT_DELIVERY_ERROR_CODES:
         return "permanent"
 
-    title = str(status.get("error_title") or "").lower()
-    details = str(status.get("error_details") or "").lower()
-    if any(kw in title or kw in details for kw in _PERMANENT_DELIVERY_FAILURE_KEYWORDS):
+    if any(kw in combined for kw in _PERMANENT_DELIVERY_FAILURE_KEYWORDS):
         return "permanent"
+    if any(kw in combined for kw in _TRANSIENT_DELIVERY_FAILURE_KEYWORDS):
+        return "retryable"
 
     return "unknown_retryable_bounded"
 
@@ -1499,6 +1537,86 @@ async def _handle_operator_relay(
 
     last_inbound_iso: str | None = last_inbound_at.isoformat() if last_inbound_at else None
 
+    async def _pause_for_meta_circuit(attempted_send_type: str, template_name: str | None = None) -> bool:
+        if not settings.meta_circuit_breaker_enabled:
+            return False
+        if not await meta_circuit.should_pause_meta_sends(session=session):
+            return False
+
+        now_paused = utcnow()
+        meta = {
+            "send_type": "none",
+            "attempted_send_type": attempted_send_type,
+            "wa_window_open": window_open,
+            "last_meta_inbound_at": last_inbound_iso,
+            "closed_window_mode": mode,
+            "cancel_reason": "meta_circuit_closed",
+            "chatwoot_conversation_id": conversation_id,
+            "chatwoot_message_id": chatwoot_message_id,
+            "agent_name": agent_name,
+            **reply_context_audit,
+        }
+        if template_name:
+            meta["template"] = template_name
+
+        outbox = OutboxMessage(
+            company_id=company_id,
+            client_id=None,
+            record_id=None,
+            job_id=None,
+            sender_id=sender_id,
+            phone_e164=phone_e164,
+            template_code="operator_relay",
+            language="de",
+            body=text,
+            status="canceled",
+            provider_message_id=None,
+            scheduled_at=now_paused,
+            sent_at=None,
+            message_source="operator",
+            chatwoot_conversation_id=cw_conversation_id,
+            chatwoot_message_id=cw_message_id,
+            error="Meta circuit closed: operator relay paused",
+            meta=meta,
+        )
+        session.add(outbox)
+        await session.flush()
+        event.error = "operator_relay: Meta circuit closed"
+        logger.warning(
+            "operator_relay: Meta circuit closed; paused conv_id=%s msg_id=%s outbox_id=%s company_id=%s",
+            conversation_id,
+            chatwoot_message_id,
+            outbox.id,
+            company_id,
+        )
+
+        if settings.chatwoot_operator_reopen_private_note_enabled and conversation_id:
+            private_note = (
+                "Meta/WhatsApp ist voruebergehend nicht erreichbar. "
+                "Die Operator-Nachricht wurde nicht an WhatsApp gesendet."
+            )
+            cw = ChatwootClient()
+            try:
+                await cw.send_message(
+                    conversation_id,
+                    private_note,
+                    message_type="outgoing",
+                    private=True,
+                )
+                outbox.meta = {**outbox.meta, "private_note_status": "sent"}
+            except Exception as exc:
+                logger.warning(
+                    "operator_relay: circuit pause note failed conv_id=%s err=%s",
+                    conversation_id,
+                    exc,
+                )
+                outbox.meta = {**outbox.meta, "private_note_status": "failed"}
+            finally:
+                await cw.aclose()
+        else:
+            outbox.meta = {**outbox.meta, "private_note_status": "disabled"}
+        return True
+
     # ── Branch: window open → send as free-form text ──────────────────────
     if window_open:
         reply_to_provider_message_id: str | None = None
@@ -1538,6 +1656,9 @@ async def _handle_operator_relay(
             conversation_id,
             mode,
         )
+
+        if await _pause_for_meta_circuit("text"):
+            return
 
         wamid, err = await safe_send(
             provider=meta_provider,
@@ -1710,6 +1831,9 @@ async def _handle_operator_relay(
     params: list[str] = []
     if param_mode == "contact_name":
         params = [contact_name]
+
+    if await _pause_for_meta_circuit("template", template_name=template_name):
+        return
 
     wamid, err = await safe_send_template(
         provider=meta_provider,

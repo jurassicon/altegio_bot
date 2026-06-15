@@ -81,6 +81,12 @@ instead of burning attempts or writing failed outbox rows. The `altegio-meta-gua
 probes Meta with a safe phone-number metadata GET request and returns the circuit to `open` after a
 successful probe. The app never stops or starts Docker containers from application code.
 
+The guard probe intentionally does not send a customer WhatsApp message. It only reads phone-number
+metadata, so it can occasionally succeed before Meta's `/messages` endpoint is fully healthy. If the
+first real send still gets a transient Meta/network error, the outbox worker closes the circuit again
+and requeues without consuming the send-attempt budget. This is a production-safe compromise: recovery
+checks avoid duplicate customer messages, while real sends remain protected by the circuit.
+
 Production deploy order:
 
 ```bash

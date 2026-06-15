@@ -14,8 +14,9 @@ stop business messaging. Write failures are logged and ignored.
 from __future__ import annotations
 
 import logging
+import secrets
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Literal
 
 from sqlalchemy import select
@@ -23,6 +24,7 @@ from sqlalchemy.exc import IntegrityError
 
 from altegio_bot.db import SessionLocal
 from altegio_bot.models.models import MetaCircuitBreaker
+from altegio_bot.settings import settings
 
 logger = logging.getLogger("meta_circuit")
 
@@ -42,6 +44,9 @@ class MetaCircuitState:
     closed_at: datetime | None
     updated_at: datetime
     next_probe_at: datetime | None
+    probe_token: str | None
+    probe_started_at: datetime | None
+    probe_lease_until: datetime | None
     probe_attempts: int
     last_error_kind: str | None
     last_error_code: str | None
@@ -60,6 +65,9 @@ def _default_state() -> MetaCircuitState:
         closed_at=None,
         updated_at=now,
         next_probe_at=None,
+        probe_token=None,
+        probe_started_at=None,
+        probe_lease_until=None,
         probe_attempts=0,
         last_error_kind=None,
         last_error_code=None,
@@ -74,6 +82,9 @@ def _to_state(row: MetaCircuitBreaker) -> MetaCircuitState:
         closed_at=row.closed_at,
         updated_at=row.updated_at,
         next_probe_at=row.next_probe_at,
+        probe_token=row.probe_token,
+        probe_started_at=row.probe_started_at,
+        probe_lease_until=row.probe_lease_until,
         probe_attempts=int(row.probe_attempts or 0),
         last_error_kind=row.last_error_kind,
         last_error_code=row.last_error_code,
@@ -82,6 +93,18 @@ def _to_state(row: MetaCircuitBreaker) -> MetaCircuitState:
 
 def _session_factory(session_factory: Callable[..., Any] | None) -> Callable[..., Any]:
     return session_factory if session_factory is not None else SessionLocal
+
+
+def _new_probe_token() -> str:
+    return secrets.token_hex(16)
+
+
+def _as_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 async def _get_or_create_row(session: Any, scope: str) -> MetaCircuitBreaker:
@@ -182,6 +205,9 @@ async def close_meta_circuit(
                 row.last_error_kind = error_kind
                 row.last_error_code = error_code
                 row.next_probe_at = next_probe_at
+                row.probe_token = None
+                row.probe_started_at = None
+                row.probe_lease_until = None
                 row.updated_at = now
                 if not already_closed:
                     row.closed_at = now
@@ -208,53 +234,75 @@ async def close_meta_circuit(
 async def open_meta_circuit(
     *,
     reason: str = "probe_succeeded",
+    probe_token: str | None = None,
     session_factory: Callable[..., Any] | None = None,
     scope: str = DEFAULT_SCOPE,
-) -> None:
+) -> bool:
     factory = _session_factory(session_factory)
     now = _utcnow()
     try:
         async with factory() as session:
             async with session.begin():
                 row = await _get_or_create_row(session, scope)
+                if probe_token is not None and (row.state != "half_open" or row.probe_token != probe_token):
+                    return False
                 row.state = "open"
                 row.reason = reason
                 row.opened_at = now
                 row.next_probe_at = None
+                row.probe_token = None
+                row.probe_started_at = None
+                row.probe_lease_until = None
                 row.probe_attempts = 0
                 row.last_error_kind = None
                 row.last_error_code = None
                 row.updated_at = now
     except Exception:
         logger.warning("meta circuit open failed; ignored scope=%s reason=%s", scope, reason)
-        return
+        return False
 
     logger.warning("meta circuit open scope=%s reason=%s", scope, reason)
+    return True
 
 
 async def mark_meta_circuit_probing(
     *,
     session_factory: Callable[..., Any] | None = None,
     scope: str = DEFAULT_SCOPE,
-) -> None:
+) -> str | None:
     factory = _session_factory(session_factory)
     now = _utcnow()
+    lease_until = now + timedelta(seconds=max(1, int(settings.meta_circuit_probe_lease_seconds)))
+    token = _new_probe_token()
     try:
         async with factory() as session:
             async with session.begin():
                 row = await _get_or_create_row(session, scope)
                 if row.state == "open":
-                    return
+                    return None
+                next_probe_at = _as_utc(row.next_probe_at)
+                if row.state == "closed" and next_probe_at is not None and now < next_probe_at:
+                    return None
+                probe_lease_until = _as_utc(row.probe_lease_until)
+                if row.state == "half_open" and probe_lease_until is not None:
+                    if now < probe_lease_until:
+                        return None
                 row.state = "half_open"
+                row.probe_token = token
+                row.probe_started_at = now
+                row.probe_lease_until = lease_until
                 row.updated_at = now
     except Exception:
         logger.warning("meta circuit probing mark failed; ignored scope=%s", scope)
+        return None
+    return token
 
 
 async def mark_meta_circuit_probe_failed(
     *,
     reason: str,
     next_probe_at: datetime,
+    probe_token: str | None = None,
     session_factory: Callable[..., Any] | None = None,
     scope: str = DEFAULT_SCOPE,
 ) -> int:
@@ -265,11 +313,16 @@ async def mark_meta_circuit_probe_failed(
         async with factory() as session:
             async with session.begin():
                 row = await _get_or_create_row(session, scope)
+                if probe_token is not None and (row.state != "half_open" or row.probe_token != probe_token):
+                    return 0
                 attempts = int(row.probe_attempts or 0) + 1
                 row.state = "closed"
                 row.reason = reason
                 row.probe_attempts = attempts
                 row.next_probe_at = next_probe_at
+                row.probe_token = None
+                row.probe_started_at = None
+                row.probe_lease_until = None
                 row.updated_at = now
     except Exception:
         logger.warning("meta circuit probe failure mark failed; ignored scope=%s", scope)

@@ -987,4 +987,4 @@ def test_single_alembic_head() -> None:
     cfg.set_main_option("script_location", str(Path(__file__).resolve().parents[3] / "alembic"))
     script = ScriptDirectory.from_config(cfg)
     heads = list(script.get_heads())
-    assert heads == ["d8f6e4c2b1a0"], f"Expected single head d8f6e4c2b1a0, got {heads}"
+    assert heads == ["e9a7c6b5d4f3"], f"Expected single head e9a7c6b5d4f3, got {heads}"
