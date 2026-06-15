@@ -1,3 +1,5 @@
+from typing import Any
+
 from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -67,6 +69,32 @@ class Settings(BaseSettings):
     # text:     always use free-form text (dev/testing only)
     # auto:     templates for business-initiated, text for conversational
     whatsapp_send_mode: str = "auto"
+
+    # Meta circuit breaker outage fallback.
+    # closed means Meta sends are paused; open means sends are allowed.
+    # The guard worker opens the circuit only after a successful Meta metadata
+    # probe. Delivery retry below is separate and only handles WhatsApp
+    # status=failed webhooks after Meta already accepted a message.
+    meta_circuit_breaker_enabled: bool = True
+    meta_circuit_probe_initial_delay_seconds: int = 300
+    meta_circuit_probe_backoff_seconds: list[int] = [300, 600, 900, 1800]
+    meta_circuit_probe_max_delay_seconds: int = 1800
+    meta_circuit_pause_requeue_delay_seconds: int = 300
+    meta_circuit_probe_timeout_seconds: int = 10
+
+    outbox_delivery_retry_enabled: bool = True
+
+    @field_validator("meta_circuit_probe_backoff_seconds", mode="before")
+    @classmethod
+    def parse_meta_circuit_probe_backoff_seconds(cls, v: Any) -> list[int] | Any:
+        if isinstance(v, str):
+            raw = v.strip()
+            if not raw:
+                return []
+            if raw.startswith("["):
+                return v
+            return [int(part.strip()) for part in raw.split(",") if part.strip()]
+        return v
 
     # Minutes after which a "processing" job is considered stuck
     ops_stuck_minutes: int = 15

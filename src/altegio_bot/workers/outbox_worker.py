@@ -55,6 +55,7 @@ from altegio_bot.perf import perf_log
 from altegio_bot.promo_discount_apply import process_promo_apply_existing_booking_job
 from altegio_bot.providers.base import WhatsAppProvider
 from altegio_bot.providers.dummy import safe_send, safe_send_template
+from altegio_bot.services import meta_circuit
 from altegio_bot.settings import settings
 from altegio_bot.template_validation import validate_template_params
 from altegio_bot.whatsapp_routing import pick_sender_code_for_record, pick_sender_id
@@ -85,6 +86,42 @@ MARKETING_JOB_TYPES = (
     "comeback_3d",
     "newsletter_new_clients_monthly",
     "newsletter_new_clients_followup",
+)
+
+MARKETING_TRANSIENT_CAP_JOB_TYPES = (
+    *MARKETING_JOB_TYPES,
+    "promo_card_booking_reminder",
+    FOLLOWUP_JOB_TYPE,
+)
+
+DELIVERY_DEADLINE_JOB_TYPES = (
+    "record_created",
+    "record_updated",
+    "record_canceled",
+    "reminder_24h",
+    "reminder_2h",
+)
+
+_DELIVERED_READ_STATUSES = ("delivered", "read")
+_DEADLINE_ALREADY_PASSED = datetime(1970, 1, 1, tzinfo=timezone.utc)
+_MARKETING_TRANSIENT_RETRY_CAP = timedelta(hours=24)
+_ORIGINAL_RUN_AT_KEY = "_original_run_at"
+
+_TRANSIENT_HTTP_STATUS_RE = re.compile(r"status=(429|500|502|503|504)\b")
+_TRANSIENT_META_CODE_RE = re.compile(r'(?:"code"\s*:\s*2|\bcode=2)\b')
+_TRANSIENT_FLAG_RE = re.compile(r'(?:"is_transient"\s*:\s*true|\bis_transient=true)')
+_TRANSIENT_NETWORK_HINTS = (
+    "timeout",
+    "timed out",
+    "connection error",
+    "connect error",
+    "connecterror",
+    "connection reset",
+    "connection refused",
+    "connection aborted",
+    "network is unreachable",
+    "temporarily unavailable",
+    "temporary failure",
 )
 
 WA_131026_SUPPRESSIBLE_JOB_TYPES: tuple[str, ...] = (
@@ -904,6 +941,246 @@ def _is_text_window_policy_error(err: str) -> bool:
     )
 
 
+def _is_transient_provider_error(err: str) -> bool:
+    if _is_token_expired_error(err):
+        return False
+    if _is_permanent_meta_template_error(err) or _is_text_window_policy_error(err):
+        return False
+
+    low = err.lower()
+    if _TRANSIENT_HTTP_STATUS_RE.search(low):
+        return True
+    if _TRANSIENT_FLAG_RE.search(low):
+        return True
+    if _TRANSIENT_META_CODE_RE.search(low):
+        return True
+    return any(hint in low for hint in _TRANSIENT_NETWORK_HINTS)
+
+
+def _transient_error_reason(err: str) -> tuple[str, str | None]:
+    low = err.lower()
+    m = _TRANSIENT_HTTP_STATUS_RE.search(low)
+    if m:
+        return "http", m.group(1)
+    if _TRANSIENT_FLAG_RE.search(low):
+        return "is_transient", None
+    if _TRANSIENT_META_CODE_RE.search(low):
+        return "meta_code", "2"
+    return "network", None
+
+
+def _decrement_send_attempt(job: MessageJob) -> None:
+    job.attempts = max(0, int(getattr(job, "attempts", 0) or 0) - 1)
+
+
+def _is_delivery_retry_job(job: MessageJob) -> bool:
+    payload = getattr(job, "payload", None) or {}
+    return payload.get("kind") == "delivery_failed_retry" and payload.get("delivery_retry_of_outbox_id") is not None
+
+
+def _original_run_at(job: MessageJob) -> datetime | None:
+    payload = getattr(job, "payload", None) or {}
+    parsed = _parse_payload_datetime(payload.get(_ORIGINAL_RUN_AT_KEY))
+    if parsed is not None:
+        return parsed
+    run_at = getattr(job, "run_at", None)
+    if run_at is None:
+        return None
+    return _as_utc(run_at)
+
+
+def _anchor_run_at(job: MessageJob, original_outbox: OutboxMessage | None) -> datetime | None:
+    if original_outbox is not None and original_outbox.scheduled_at is not None:
+        return _as_utc(original_outbox.scheduled_at)
+    return _original_run_at(job)
+
+
+def _retry_deadline_at(
+    job: MessageJob,
+    record: Record | None,
+    *,
+    original_outbox: OutboxMessage | None = None,
+) -> datetime | None:
+    job_type = getattr(job, "job_type", None)
+
+    if job_type in MARKETING_TRANSIENT_CAP_JOB_TYPES:
+        anchor = _anchor_run_at(job, original_outbox)
+        return anchor + _MARKETING_TRANSIENT_RETRY_CAP if anchor is not None else None
+
+    if job_type not in DELIVERY_DEADLINE_JOB_TYPES:
+        return None
+
+    starts_at = None
+    if record is not None and record.starts_at is not None:
+        starts_at = _as_utc(record.starts_at)
+    if starts_at is None:
+        return _DEADLINE_ALREADY_PASSED
+
+    if job_type in ("record_created", "record_updated"):
+        return starts_at - timedelta(minutes=30)
+    if job_type == "record_canceled":
+        return starts_at - timedelta(minutes=15)
+    if job_type == "reminder_2h":
+        return starts_at - timedelta(minutes=15)
+    if job_type == "reminder_24h":
+        deadline = starts_at - timedelta(hours=3)
+        anchor = _anchor_run_at(job, original_outbox)
+        if anchor is not None:
+            deadline = min(deadline, anchor + timedelta(hours=6))
+        return deadline
+
+    return None
+
+
+def _schedule_retry_or_cancel(
+    job: MessageJob,
+    record: Record | None,
+    delay_seconds: int,
+    reason: str,
+    *,
+    original_outbox: OutboxMessage | None = None,
+) -> bool:
+    payload = dict(getattr(job, "payload", None) or {})
+    if _ORIGINAL_RUN_AT_KEY not in payload and getattr(job, "run_at", None) is not None:
+        payload[_ORIGINAL_RUN_AT_KEY] = _as_utc(job.run_at).isoformat()
+        job.payload = payload
+
+    next_run_at = utcnow() + timedelta(seconds=delay_seconds)
+    deadline = _retry_deadline_at(job, record, original_outbox=original_outbox)
+    if deadline is not None and next_run_at > deadline:
+        job.status = "canceled"
+        job.locked_at = None
+        job.updated_at = utcnow()
+        job.last_error = f"Retry deadline exceeded for {job.job_type}"
+        return False
+
+    job.status = "queued"
+    job.run_at = next_run_at
+    job.locked_at = None
+    job.updated_at = utcnow()
+    job.last_error = reason
+    return True
+
+
+def _deadline_passed_for_send(job: MessageJob, record: Record | None) -> bool:
+    if job.job_type not in DELIVERY_DEADLINE_JOB_TYPES:
+        return False
+    payload = getattr(job, "payload", None) or {}
+    if _ORIGINAL_RUN_AT_KEY not in payload:
+        return False
+    deadline = _retry_deadline_at(job, record)
+    if deadline is None or deadline == _DEADLINE_ALREADY_PASSED:
+        return False
+    return utcnow() > deadline
+
+
+async def _delivery_retry_chain_has_success(
+    session: AsyncSession,
+    original_outbox_id: int,
+) -> bool:
+    orig_stmt = (
+        select(OutboxMessage.id)
+        .where(OutboxMessage.id == original_outbox_id)
+        .where(OutboxMessage.status.in_(_DELIVERED_READ_STATUSES))
+        .limit(1)
+    )
+    if (await session.execute(orig_stmt)).scalar_one_or_none() is not None:
+        return True
+
+    prefix = f"delivery_retry:{original_outbox_id}:"
+    job_ids_stmt = select(MessageJob.id).where(MessageJob.dedupe_key.like(prefix + "%"))
+    job_ids = [int(x) for x in (await session.execute(job_ids_stmt)).scalars().all()]
+    if not job_ids:
+        return False
+
+    retry_stmt = (
+        select(OutboxMessage.id)
+        .where(OutboxMessage.job_id.in_(job_ids))
+        .where(OutboxMessage.status.in_(_DELIVERED_READ_STATUSES))
+        .limit(1)
+    )
+    return (await session.execute(retry_stmt)).scalar_one_or_none() is not None
+
+
+async def _delivery_retry_presend_guard(
+    session: AsyncSession,
+    job: MessageJob,
+    record: Record | None,
+) -> str | None:
+    payload = getattr(job, "payload", None) or {}
+    try:
+        original_outbox_id = int(payload["delivery_retry_of_outbox_id"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+    if await _delivery_retry_chain_has_success(session, original_outbox_id):
+        return "Canceled: delivery retry chain already succeeded"
+
+    original_outbox = await session.get(OutboxMessage, original_outbox_id)
+    if original_outbox is None:
+        return "Retry deadline exceeded or original outbox missing for delivery retry"
+
+    deadline = _retry_deadline_at(job, record, original_outbox=original_outbox)
+    if deadline is not None and utcnow() > deadline:
+        return f"Retry deadline exceeded for {job.job_type}"
+    return None
+
+
+async def _pause_for_closed_meta_circuit(session: AsyncSession, job: MessageJob, record: Record | None) -> bool:
+    if not settings.meta_circuit_breaker_enabled:
+        return False
+    if not await meta_circuit.should_pause_meta_sends(session=session):
+        return False
+
+    requeued = _schedule_retry_or_cancel(
+        job,
+        record,
+        settings.meta_circuit_pause_requeue_delay_seconds,
+        "Meta circuit closed: send paused until Meta recovers",
+    )
+    logger.info(
+        "Meta circuit closed; %s job_id=%s job_type=%s record_id=%s company_id=%s delay_seconds=%s",
+        "requeued" if requeued else "canceled",
+        job.id,
+        job.job_type,
+        job.record_id,
+        job.company_id,
+        settings.meta_circuit_pause_requeue_delay_seconds,
+    )
+    return True
+
+
+async def _handle_transient_meta_error(
+    job: MessageJob,
+    record: Record | None,
+    err: str,
+) -> None:
+    error_kind, error_code = _transient_error_reason(err)
+    await meta_circuit.close_meta_circuit(
+        reason="transient_send_error",
+        error_kind=error_kind,
+        error_code=error_code,
+        next_probe_at=utcnow() + timedelta(seconds=settings.meta_circuit_probe_initial_delay_seconds),
+    )
+    requeued = _schedule_retry_or_cancel(
+        job,
+        record,
+        settings.meta_circuit_pause_requeue_delay_seconds,
+        "Meta circuit closed: send paused until Meta recovers",
+    )
+    logger.warning(
+        "Transient Meta error closed circuit; %s job_id=%s job_type=%s record_id=%s "
+        "company_id=%s error_kind=%s error_code=%s",
+        "requeued" if requeued else "canceled",
+        job.id,
+        job.job_type,
+        job.record_id,
+        job.company_id,
+        error_kind,
+        error_code,
+    )
+
+
 def _get_24h_whitelist() -> frozenset[str]:
     """Return the set of job types eligible for text-inside-24h routing."""
     raw = settings.bot_template_text_inside_24h_job_types
@@ -1256,6 +1533,9 @@ async def _process_promo_card_booking_reminder(
         logger.info("promo_card_booking_reminder: opted-out job_id=%s phone=%s", job.id, phone)
         return
 
+    if await _pause_for_closed_meta_circuit(session, job, None):
+        return
+
     delay_until = await _apply_rate_limit(session, phone)
     if delay_until is not None:
         job.status = "queued"
@@ -1385,6 +1665,11 @@ async def _process_promo_card_booking_reminder(
     }
 
     if err is not None:
+        if settings.meta_circuit_breaker_enabled and _is_transient_provider_error(err):
+            _decrement_send_attempt(job)
+            await _handle_transient_meta_error(job, None, err)
+            return
+
         session.add(
             OutboxMessage(
                 company_id=lead.company_id,
@@ -1582,6 +1867,22 @@ async def _run_job_logic(
             job.status = "canceled"
             job.locked_at = None
             job.last_error = _stale_err
+            return
+
+    if _deadline_passed_for_send(job, record):
+        job.status = "canceled"
+        job.locked_at = None
+        job.updated_at = utcnow()
+        job.last_error = f"Retry deadline exceeded for {job.job_type}"
+        return
+
+    if _is_delivery_retry_job(job):
+        guard_reason = await _delivery_retry_presend_guard(session, job, record)
+        if guard_reason is not None:
+            job.status = "canceled"
+            job.locked_at = None
+            job.updated_at = utcnow()
+            job.last_error = guard_reason
             return
 
     with perf_log(
@@ -1980,6 +2281,9 @@ async def _run_job_logic(
             )
             return None
 
+    if await _pause_for_closed_meta_circuit(session, job, record):
+        return None
+
     with perf_log(
         "outbox_worker",
         "outbox.apply_rate_limit",
@@ -2066,6 +2370,19 @@ async def _run_job_logic(
         _pd_send_meta: dict[str, Any] = {"send_type": "text"}
 
         if err is not None:
+            if settings.meta_circuit_breaker_enabled and _is_transient_provider_error(err):
+                _decrement_send_attempt(job)
+                await _handle_transient_meta_error(job, record, err)
+                await _update_promo_lead_notification_meta(
+                    session,
+                    _pd_promo_lead_id,
+                    "retrying",
+                    error="Meta circuit closed: send paused until Meta recovers",
+                    now=_pd_now,
+                    job_id=job.id,
+                )
+                return None
+
             with perf_log(
                 "outbox_worker",
                 "outbox.insert_outbox",
@@ -2509,6 +2826,11 @@ async def _run_job_logic(
                     job.job_type,
                     _text_err,
                 )
+                if settings.meta_circuit_breaker_enabled and _is_transient_provider_error(_text_err):
+                    _decrement_send_attempt(job)
+                    await _handle_transient_meta_error(job, record, _text_err)
+                    return None
+
                 _last_inbound_iso = _last_inbound_at.isoformat() if _last_inbound_at else None
                 with perf_log(
                     "outbox_worker",
@@ -2657,7 +2979,20 @@ async def _run_job_logic(
         if err is not None:
             _ms_ctx.update(send_error=err)
 
+    if _is_delivery_retry_job(job):
+        retry_payload = getattr(job, "payload", None) or {}
+        send_meta["delivery_retry"] = True
+        send_meta["delivery_retry_of_outbox_id"] = retry_payload.get("delivery_retry_of_outbox_id")
+        send_meta["delivery_retry_attempt"] = retry_payload.get("delivery_retry_attempt")
+        send_meta["delivery_retry_reason"] = "original_delivery_failed"
+        send_meta["original_provider_message_id"] = retry_payload.get("delivery_retry_of_provider_message_id")
+
     if err is not None:
+        if settings.meta_circuit_breaker_enabled and _is_transient_provider_error(err):
+            _decrement_send_attempt(job)
+            await _handle_transient_meta_error(job, record, err)
+            return
+
         with perf_log(
             "outbox_worker",
             "outbox.insert_outbox",

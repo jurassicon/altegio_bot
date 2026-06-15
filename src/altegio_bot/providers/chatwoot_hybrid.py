@@ -60,6 +60,12 @@ class ChatwootHybridProvider:
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
 
+    async def check_metadata(self, phone_number_id: str, *, timeout: float | None = None) -> None:
+        check = getattr(self._primary, "check_metadata", None)
+        if check is None:
+            raise RuntimeError(f"primary provider {type(self._primary).__name__} does not support check_metadata")
+        await check(phone_number_id, timeout=timeout)
+
     async def send(
         self,
         sender_id: int,

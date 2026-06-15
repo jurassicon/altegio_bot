@@ -256,7 +256,7 @@ def test_run_campaign_worker_calls_run_loop(monkeypatch: Any) -> None:
     monkeypatch.setattr(cw, "run_loop", _fake_run_loop)
     monkeypatch.setattr(entrypoint, "run_loop", _fake_run_loop)
 
-    asyncio.get_event_loop().run_until_complete(entrypoint.main())
+    asyncio.run(entrypoint.main())
 
     assert calls == ["run_loop"], f"expected run_loop to be called once, got {calls}"
 

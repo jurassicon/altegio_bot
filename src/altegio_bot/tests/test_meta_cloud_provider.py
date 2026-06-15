@@ -20,10 +20,14 @@ from altegio_bot.providers.meta_cloud import MetaCloudProvider
 class _FakeResp:
     status_code = 200
 
-    def __init__(self, wamid: str = "wamid.SENT") -> None:
+    def __init__(self, wamid: str = "wamid.SENT", data: dict[str, Any] | None = None, status_code: int = 200) -> None:
         self._wamid = wamid
+        self.status_code = status_code
+        self._data = data
 
     def json(self) -> dict[str, Any]:
+        if self._data is not None:
+            return self._data
         return {"messages": [{"id": self._wamid}]}
 
 
@@ -363,3 +367,95 @@ async def test_hybrid_without_reply_context_unchanged() -> None:
     assert primary_calls[0]["reply_to_provider_message_id"] is None
     assert len(mirror_calls) == 1
     assert mirror_calls[0]["content"] == "Plain"
+
+
+# ---------------------------------------------------------------------------
+# Metadata probe
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_meta_cloud_check_metadata_hits_safe_endpoint() -> None:
+    calls: list[dict[str, Any]] = []
+    provider = MetaCloudProvider.__new__(MetaCloudProvider)
+    provider._access_token = "test-token"
+    provider._api_version = "v21.0"
+    provider._graph_url = "https://graph.facebook.com"
+
+    class _FakeClient:
+        async def get(
+            self,
+            url: str,
+            *,
+            headers: dict[str, str],
+            params: dict[str, str],
+            timeout: float | None = None,
+        ) -> _FakeResp:
+            calls.append({"url": url, "headers": headers, "params": params, "timeout": timeout})
+            return _FakeResp(data={"id": "PNID"})
+
+    provider._client = _FakeClient()  # type: ignore[assignment]
+
+    await provider.check_metadata("PNID", timeout=7.5)
+
+    assert calls == [
+        {
+            "url": "https://graph.facebook.com/v21.0/PNID",
+            "headers": {"Authorization": "Bearer test-token"},
+            "params": {"fields": "id,display_phone_number,verified_name"},
+            "timeout": 7.5,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_meta_cloud_check_metadata_error_is_safe() -> None:
+    provider = MetaCloudProvider.__new__(MetaCloudProvider)
+    provider._access_token = "secret-token"
+    provider._api_version = "v21.0"
+    provider._graph_url = "https://graph.facebook.com"
+
+    class _FakeClient:
+        async def get(self, *args: Any, **kwargs: Any) -> _FakeResp:
+            return _FakeResp(
+                status_code=500,
+                data={"error": {"code": 2, "message": "secret-token full response body"}},
+            )
+
+    provider._client = _FakeClient()  # type: ignore[assignment]
+
+    with pytest.raises(RuntimeError) as exc:
+        await provider.check_metadata("PNID")
+
+    message = str(exc.value)
+    assert "status=500" in message
+    assert "code=2" in message
+    assert "secret-token" not in message
+    assert "full response body" not in message
+
+
+@pytest.mark.asyncio
+async def test_hybrid_check_metadata_delegates_to_primary() -> None:
+    from altegio_bot.providers.chatwoot_hybrid import ChatwootHybridProvider
+
+    calls: list[tuple[str, float | None]] = []
+
+    class _Primary:
+        async def check_metadata(self, phone_number_id: str, *, timeout: float | None = None) -> None:
+            calls.append((phone_number_id, timeout))
+
+        async def aclose(self) -> None:
+            return None
+
+    class _Chatwoot:
+        async def aclose(self) -> None:
+            return None
+
+    provider = ChatwootHybridProvider(
+        primary=_Primary(),  # type: ignore[arg-type]
+        chatwoot=_Chatwoot(),  # type: ignore[arg-type]
+    )
+
+    await provider.check_metadata("PNID", timeout=3.0)
+
+    assert calls == [("PNID", 3.0)]

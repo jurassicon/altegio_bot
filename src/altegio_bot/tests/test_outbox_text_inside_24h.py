@@ -140,6 +140,9 @@ def _patch_base(monkeypatch: Any, job: FakeJob) -> None:
     async def _fake_apply_rl(session: Any, phone: str) -> Any:
         return None
 
+    async def _fake_circuit_open(*args: Any, **kwargs: Any) -> bool:
+        return False
+
     async def _fake_render(*args: Any, **kwargs: Any) -> Any:
         return ("Reminder text body", 123, "de", _REMINDER_2H_CTX)
 
@@ -150,6 +153,7 @@ def _patch_base(monkeypatch: Any, job: FakeJob) -> None:
     monkeypatch.setattr(ow, "_load_record", _fake_load_record)
     monkeypatch.setattr(ow, "_load_client", _fake_load_client)
     monkeypatch.setattr(ow, "_apply_rate_limit", _fake_apply_rl)
+    monkeypatch.setattr(ow.meta_circuit, "should_pause_meta_sends", _fake_circuit_open)
     monkeypatch.setattr(ow, "_render_message", _fake_render)
     monkeypatch.setattr(ow, "utcnow", lambda: NOW)
     monkeypatch.setattr(ow, "OutboxMessage", FakeOutbox)
@@ -565,8 +569,8 @@ def test_open_window_text_policy_error_falls_back_to_template(monkeypatch: Any) 
 # ---------------------------------------------------------------------------
 
 
-def test_open_window_ambiguous_text_error_no_fallback(monkeypatch: Any) -> None:
-    """Ambiguous text error (timeout, etc.) → no template fallback, job retries."""
+def test_open_window_ambiguous_text_error_closes_circuit_no_fallback(monkeypatch: Any) -> None:
+    """Ambiguous transient text error closes circuit; no template fallback or failed spam."""
     job = FakeJob(
         id=8,
         company_id=758285,
@@ -590,22 +594,122 @@ def test_open_window_ambiguous_text_error_no_fallback(monkeypatch: Any) -> None:
         template_called.append(True)
         return ("tpl-id", None)
 
+    transient_errors: list[str] = []
+
+    async def _fake_transient(job_obj: Any, record: Any, err: str) -> None:
+        transient_errors.append(err)
+        job_obj.status = "queued"
+        job_obj.locked_at = None
+        job_obj.last_error = "Meta circuit closed: send paused until Meta recovers"
+
     monkeypatch.setattr(ow, "safe_send", _fake_text)
     monkeypatch.setattr(ow, "safe_send_template", _fake_template)
+    monkeypatch.setattr(ow, "_handle_transient_meta_error", _fake_transient)
 
     session = FakeSession()
     run(ow.process_job_in_session(session, 8, provider=object()))  # type: ignore
 
-    # Job must be requeued (not failed, not done) to preserve retry budget.
     assert job.status == "queued", f"Expected queued, got {job.status}"
     assert not template_called, "Template must NOT be sent after ambiguous error"
+    assert transient_errors == ["Connection timeout: upstream unreachable"]
+    assert session.added == []
 
-    # A failed OutboxMessage must be recorded (audit trail).
-    assert len(session.added) == 1
-    out = session.added[0]
-    assert out.status == "failed"
-    assert out.meta["send_type"] == "text"
-    assert out.meta["text_inside_24h"] is True
+
+def test_closed_circuit_skips_send_rate_limit_and_attempts(monkeypatch: Any) -> None:
+    job = FakeJob(
+        id=80,
+        company_id=758285,
+        job_type="record_created",
+        status="queued",
+        run_at=NOW,
+    )
+    _patch_base(monkeypatch, job)
+
+    async def _load_record(session: Any, job_obj: Any) -> Any:
+        return FakeRecord(id=10, company_id=job.company_id, starts_at=NOW + timedelta(hours=3))
+
+    rate_limit_calls: list[str] = []
+    send_calls: list[str] = []
+
+    async def _apply_rl(session: Any, phone: str) -> Any:
+        rate_limit_calls.append(phone)
+        return None
+
+    async def _send_template(*a: Any, **kw: Any) -> Any:
+        send_calls.append("template")
+        return ("wamid", None)
+
+    async def _paused(*a: Any, **kw: Any) -> bool:
+        return True
+
+    monkeypatch.setattr(ow, "_load_record", _load_record)
+    monkeypatch.setattr(ow, "_apply_rate_limit", _apply_rl)
+    monkeypatch.setattr(ow, "safe_send_template", _send_template)
+    monkeypatch.setattr(ow.meta_circuit, "should_pause_meta_sends", _paused)
+
+    session = FakeSession()
+    run(ow.process_job_in_session(session, 80, provider=object()))  # type: ignore
+
+    assert job.status == "queued"
+    assert job.attempts == 0
+    assert "Meta circuit closed" in (job.last_error or "")
+    assert rate_limit_calls == []
+    assert send_calls == []
+    assert session.added == []
+
+
+def test_closed_circuit_cancels_when_deadline_exceeded(monkeypatch: Any) -> None:
+    job = FakeJob(
+        id=81,
+        company_id=758285,
+        job_type="record_created",
+        status="queued",
+        run_at=NOW,
+    )
+    _patch_base(monkeypatch, job)
+
+    async def _load_record(session: Any, job_obj: Any) -> Any:
+        return FakeRecord(id=10, company_id=job.company_id, starts_at=NOW + timedelta(minutes=10))
+
+    async def _paused(*a: Any, **kw: Any) -> bool:
+        return True
+
+    monkeypatch.setattr(ow, "_load_record", _load_record)
+    monkeypatch.setattr(ow.meta_circuit, "should_pause_meta_sends", _paused)
+
+    session = FakeSession()
+    run(ow.process_job_in_session(session, 81, provider=object()))  # type: ignore
+
+    assert job.status == "canceled"
+    assert job.attempts == 0
+    assert job.last_error == "Retry deadline exceeded for record_created"
+
+
+def test_retry_deadline_policy_for_service_jobs() -> None:
+    starts = NOW + timedelta(hours=5)
+    record = FakeRecord(id=10, company_id=1, starts_at=starts)
+
+    created = FakeJob(id=90, company_id=1, job_type="record_created", status="queued", run_at=NOW)
+    updated = FakeJob(id=91, company_id=1, job_type="record_updated", status="queued", run_at=NOW)
+    canceled = FakeJob(id=92, company_id=1, job_type="record_canceled", status="queued", run_at=NOW)
+    rem_2h = FakeJob(id=93, company_id=1, job_type="reminder_2h", status="queued", run_at=NOW)
+    rem_24h = FakeJob(id=94, company_id=1, job_type="reminder_24h", status="queued", run_at=NOW)
+
+    assert ow._retry_deadline_at(created, record) == starts - timedelta(minutes=30)
+    assert ow._retry_deadline_at(updated, record) == starts - timedelta(minutes=30)
+    assert ow._retry_deadline_at(canceled, record) == starts - timedelta(minutes=15)
+    assert ow._retry_deadline_at(rem_2h, record) == starts - timedelta(minutes=15)
+    assert ow._retry_deadline_at(rem_24h, record) == min(starts - timedelta(hours=3), NOW + timedelta(hours=6))
+
+
+def test_fresh_first_attempt_is_not_canceled_by_deadline_guard() -> None:
+    job = FakeJob(id=95, company_id=1, job_type="reminder_2h", status="queued", run_at=NOW)
+    record = FakeRecord(id=10, company_id=1, starts_at=NOW - timedelta(minutes=1))
+
+    assert ow._deadline_passed_for_send(job, record) is False
+
+    job.payload = {ow._ORIGINAL_RUN_AT_KEY: (NOW - timedelta(hours=1)).isoformat()}
+    assert ow._deadline_passed_for_send(job, record) is True
 
 
 # ---------------------------------------------------------------------------

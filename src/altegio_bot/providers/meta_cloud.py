@@ -69,6 +69,27 @@ class MetaCloudProvider(WhatsAppProvider):
     def _headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self._access_token}"}
 
+    async def check_metadata(self, phone_number_id: str, *, timeout: float | None = None) -> None:
+        """Read phone-number metadata as a safe Meta availability probe."""
+        url = f"{self._graph_url}/{self._api_version}/{phone_number_id}"
+        params = {"fields": "id,display_phone_number,verified_name"}
+        res = await self._client.get(
+            url,
+            headers=self._headers(),
+            params=params,
+            timeout=timeout,
+        )
+
+        if res.status_code >= 400:
+            data: dict[str, Any] = {}
+            try:
+                data = res.json()
+            except Exception:
+                data = {}
+            err = data.get("error") if isinstance(data, dict) else None
+            code = err.get("code") if isinstance(err, dict) else None
+            raise RuntimeError(f"Meta metadata probe failed status={res.status_code} code={code}")
+
     async def send(
         self,
         sender_id: int,
