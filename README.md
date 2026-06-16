@@ -459,6 +459,16 @@ Incoming (Customer → Bot via Chatwoot):
   Else → do nothing (admin replies manually)
 ```
 
+WhatsApp reactions (`messages[].type == "reaction"`) are mirrored into Chatwoot as
+incoming messages so operators see that the client reacted. A native Chatwoot
+reply (`content_attributes.in_reply_to`) is attached only when the reacted-to
+message has a real Chatwoot message id in the same conversation; automatic
+outbox-message targets get a visible fallback line (e.g.
+`👍 Реакция на отправленное сообщение WhatsApp (reminder_24h)`), and a removed
+reaction shows `Реакция удалена в WhatsApp`. Reactions never trigger commands,
+opt-out, or any send back to WhatsApp. Historical reactions processed before this
+change are not backfilled.
+
 ### Configuration
 
 Add to your `.env`:

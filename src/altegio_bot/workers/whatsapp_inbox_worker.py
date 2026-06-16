@@ -605,6 +605,32 @@ def _extract_actions(payload: dict[str, Any]) -> list[dict[str, Any]]:
                 if phone is None:
                     continue
 
+                # Inbound reaction: a first-class action, not free text.  Meta
+                # sends type="reaction" with reaction.emoji (empty when the
+                # client removes the reaction) and reaction.message_id (the
+                # wamid of the reacted-to message).  Handled before any text /
+                # command logic so an emoji never flows into STOP/START/promo.
+                if msg.get("type") == "reaction":
+                    reaction = msg.get("reaction")
+                    if not isinstance(reaction, dict):
+                        reaction = {}
+                    emoji = reaction.get("emoji")
+                    actions.append(
+                        {
+                            "kind": "reaction",
+                            "cmd": None,
+                            "phone_e164": phone,
+                            "phone_number_id": phone_number_id,
+                            "text": emoji or "",
+                            "reaction_emoji": emoji,
+                            "reaction_target_provider_message_id": _normalize_reply_context_id(
+                                reaction.get("message_id")
+                            ),
+                            "whatsapp_message_id": _normalize_reply_context_id(msg.get("id")),
+                        }
+                    )
+                    continue
+
                 # Native WhatsApp reply: context.id is the wamid of the
                 # message the client replied to.
                 context = msg.get("context")
@@ -1410,6 +1436,280 @@ async def _forward_text_to_chatwoot(
     )
 
 
+@dataclass(frozen=True)
+class ReactionTarget:
+    """The message an inbound WhatsApp reaction points at.
+
+    ``kind`` decides how the reaction is rendered in Chatwoot:
+    ``chatwoot_agent_message`` and ``inbound_whatsapp_event`` carry a real
+    Chatwoot message id (native reply candidate); ``outbox_message`` is an
+    automatic bot/outbox send without a Chatwoot message id (visible fallback);
+    ``unknown`` is a safe fallback when nothing matched.
+    """
+
+    kind: str
+    provider_message_id: str | None = None
+    chatwoot_conversation_id: int | None = None
+    chatwoot_message_id: int | None = None
+    outbox_id: int | None = None
+    outbox_template_code: str | None = None
+    outbox_record_id: int | None = None
+    body_preview: str | None = None
+
+
+async def _resolve_reaction_target(
+    session: AsyncSession,
+    reaction_target_provider_message_id: str | None,
+    *,
+    phone_e164: str | None,
+) -> ReactionTarget:
+    """Resolve the reacted-to wamid to its stored message, phone-scoped.
+
+    Resolution order (altegio_bot has no separate agent-message table — operator
+    replies are OutboxMessage rows carrying a Chatwoot message id):
+
+    1. OutboxMessage with a real ``chatwoot_message_id`` (operator/agent message,
+       native reply candidate) matched by ``provider_message_id`` AND phone.
+    2. Prior inbound WhatsAppEvent forwarded to Chatwoot, matched by
+       ``whatsapp_message_id`` AND payload sender phone.
+    3. Automatic OutboxMessage (no Chatwoot message id) matched by
+       ``provider_message_id`` AND phone — visible fallback only.
+    4. Unknown fallback.
+
+    OutboxMessage.provider_message_id is indexed but not unique, so the lookup is
+    always phone-scoped; without a phone we never fall back to an unsafe
+    provider_message_id-only OutboxMessage match.
+    """
+    if not reaction_target_provider_message_id:
+        return ReactionTarget(kind="unknown")
+
+    variants = _phone_variants(phone_e164) if phone_e164 else None
+
+    # 1. Operator/agent OutboxMessage that carries a real Chatwoot message id.
+    if variants:
+        agent_stmt = (
+            select(
+                OutboxMessage.id,
+                OutboxMessage.chatwoot_message_id,
+                OutboxMessage.chatwoot_conversation_id,
+                OutboxMessage.template_code,
+                OutboxMessage.record_id,
+                OutboxMessage.body,
+            )
+            .where(OutboxMessage.provider_message_id == reaction_target_provider_message_id)
+            .where(OutboxMessage.phone_e164.in_(variants))
+            .where(OutboxMessage.chatwoot_message_id.is_not(None))
+            .where(OutboxMessage.chatwoot_conversation_id.is_not(None))
+            .order_by(OutboxMessage.created_at.desc(), OutboxMessage.id.desc())
+            .limit(1)
+        )
+        row = (await session.execute(agent_stmt)).first()
+        if row is not None:
+            return ReactionTarget(
+                kind="chatwoot_agent_message",
+                provider_message_id=reaction_target_provider_message_id,
+                chatwoot_message_id=row[1],
+                chatwoot_conversation_id=row[2],
+                outbox_id=row[0],
+                outbox_template_code=row[3],
+                outbox_record_id=row[4],
+                body_preview=row[5],
+            )
+
+    # 2. Prior inbound WhatsAppEvent that was forwarded to Chatwoot.
+    event_stmt = (
+        select(WhatsAppEvent)
+        .where(WhatsAppEvent.whatsapp_message_id == reaction_target_provider_message_id)
+        .where(WhatsAppEvent.chatwoot_message_id.is_not(None))
+        .where(WhatsAppEvent.forwarded_chatwoot_conversation_id.is_not(None))
+        .order_by(WhatsAppEvent.received_at.desc(), WhatsAppEvent.id.desc())
+        .limit(20)
+    )
+    for candidate in (await session.execute(event_stmt)).scalars().all():
+        cand_payload = candidate.payload or {}
+        if not isinstance(cand_payload, dict):
+            continue
+        if not phone_e164:
+            continue
+        if not _payload_message_from_matches_phone(cand_payload, phone_e164):
+            continue
+        return ReactionTarget(
+            kind="inbound_whatsapp_event",
+            provider_message_id=reaction_target_provider_message_id,
+            chatwoot_message_id=candidate.chatwoot_message_id,
+            chatwoot_conversation_id=candidate.forwarded_chatwoot_conversation_id,
+        )
+
+    # 3. Automatic OutboxMessage without a Chatwoot message id (fallback only).
+    if variants:
+        outbox_stmt = (
+            select(
+                OutboxMessage.id,
+                OutboxMessage.template_code,
+                OutboxMessage.record_id,
+                OutboxMessage.body,
+            )
+            .where(OutboxMessage.provider_message_id == reaction_target_provider_message_id)
+            .where(OutboxMessage.phone_e164.in_(variants))
+            .order_by(OutboxMessage.created_at.desc(), OutboxMessage.id.desc())
+            .limit(1)
+        )
+        row = (await session.execute(outbox_stmt)).first()
+        if row is not None:
+            return ReactionTarget(
+                kind="outbox_message",
+                provider_message_id=reaction_target_provider_message_id,
+                outbox_id=row[0],
+                outbox_template_code=row[1],
+                outbox_record_id=row[2],
+                body_preview=row[3],
+            )
+
+    # 4. Unknown fallback.
+    return ReactionTarget(
+        kind="unknown",
+        provider_message_id=reaction_target_provider_message_id,
+    )
+
+
+def _reaction_display_text(emoji: str | None, target: ReactionTarget, *, native_ok: bool) -> str:
+    """Visible Chatwoot text for an inbound reaction.
+
+    Native reply targets show the bare emoji (Chatwoot attaches it to the
+    original message); other targets show a descriptive line so the operator
+    sees the reaction even without native rendering.
+    """
+    if not emoji:
+        return "Реакция удалена в WhatsApp"
+    if native_ok:
+        return emoji
+    if target.kind == "outbox_message":
+        if target.outbox_template_code:
+            return f"{emoji} Реакция на отправленное сообщение WhatsApp ({target.outbox_template_code})"
+        return f"{emoji} Реакция на отправленное сообщение WhatsApp"
+    return f"{emoji} Реакция на сообщение в WhatsApp"
+
+
+def _reaction_content_attributes(
+    *,
+    target: ReactionTarget,
+    reaction_emoji: str | None,
+    reaction_target_provider_message_id: str | None,
+    whatsapp_message_id: str | None,
+    destination_conversation_id: int,
+) -> dict[str, Any]:
+    """Build safe Chatwoot content_attributes for an inbound reaction.
+
+    Native ``in_reply_to`` is set only when the target carries a real Chatwoot
+    message id that lives in the destination conversation; a cross-conversation
+    target is flagged instead.  No PII / tokens / raw webhook are stored.
+    """
+    attrs: dict[str, Any] = {
+        "whatsapp_event_type": "reaction",
+        "whatsapp_reaction_emoji": reaction_emoji,
+        "whatsapp_reaction_target_provider_message_id": reaction_target_provider_message_id,
+        "whatsapp_reaction_message_id": whatsapp_message_id,
+        "whatsapp_reaction_target_kind": target.kind,
+    }
+
+    if target.chatwoot_message_id is not None:
+        if target.chatwoot_conversation_id == destination_conversation_id:
+            attrs["in_reply_to"] = target.chatwoot_message_id
+            attrs["in_reply_to_external_id"] = reaction_target_provider_message_id
+        else:
+            attrs["whatsapp_reaction_target_conversation_mismatch"] = True
+
+    if target.kind == "outbox_message":
+        attrs["whatsapp_reaction_target_outbox_id"] = target.outbox_id
+        attrs["whatsapp_reaction_target_template_code"] = target.outbox_template_code
+        attrs["whatsapp_reaction_target_record_id"] = target.outbox_record_id
+
+    return attrs
+
+
+async def _forward_reaction_to_chatwoot(
+    session: AsyncSession,
+    event: WhatsAppEvent,
+    *,
+    phone_e164: str,
+    reaction_emoji: str | None,
+    reaction_target_provider_message_id: str | None,
+    whatsapp_message_id: str | None,
+) -> int | None:
+    """Mirror an inbound WhatsApp reaction into Chatwoot as an incoming message.
+
+    Inbound-only: nothing is ever sent back to WhatsApp.  Native reply is used
+    only when the reacted-to message has a Chatwoot message id in the same
+    conversation; otherwise a visible fallback message is posted.
+    """
+    variants = _phone_variants(phone_e164)
+    stmt = (
+        select(Client.display_name)
+        .where(Client.phone_e164.in_(variants))
+        .where(Client.display_name.is_not(None))
+        .limit(1)
+    )
+    res = await session.execute(stmt)
+    client_name = res.scalar_one_or_none()
+
+    cw = ChatwootClient()
+    try:
+        conversation_id = await cw.get_or_create_incoming_conversation(
+            phone_e164,
+            contact_name=client_name,
+        )
+
+        target = await _resolve_reaction_target(
+            session,
+            reaction_target_provider_message_id,
+            phone_e164=phone_e164,
+        )
+        native_ok = target.chatwoot_message_id is not None and target.chatwoot_conversation_id == conversation_id
+        content = _reaction_display_text(reaction_emoji, target, native_ok=native_ok)
+        content_attributes = _reaction_content_attributes(
+            target=target,
+            reaction_emoji=reaction_emoji,
+            reaction_target_provider_message_id=reaction_target_provider_message_id,
+            whatsapp_message_id=whatsapp_message_id,
+            destination_conversation_id=conversation_id,
+        )
+
+        message_id = await cw.send_message(
+            conversation_id,
+            content,
+            message_type="incoming",
+            content_attributes=content_attributes,
+        )
+    except Exception as exc:
+        # Keep the persisted error free of URLs/tokens/response bodies.
+        safe_error = f"Incoming reaction forwarding failed: {type(exc).__name__}"
+        event.error = safe_error
+        logger.warning(
+            "chatwoot: reaction forward failed phone=%s %s",
+            phone_e164,
+            type(exc).__name__,
+        )
+        raise RuntimeError(safe_error) from None
+    finally:
+        await cw.aclose()
+
+    event.forwarded_chatwoot_conversation_id = conversation_id
+    event.chatwoot_message_id = message_id
+    if whatsapp_message_id:
+        event.whatsapp_message_id = whatsapp_message_id
+    event.error = None
+    logger.info(
+        "Forwarded WhatsApp reaction to Chatwoot phone=%s conversation_id=%s message_id=%s "
+        "target_kind=%s native_reply=%s",
+        phone_e164,
+        conversation_id,
+        message_id,
+        target.kind,
+        native_ok,
+    )
+    return message_id
+
+
 # Safe placeholder bodies for canceled operator-relay audit rows. The operator's
 # original message text is intentionally never stored on these audit rows.
 _OPERATOR_RELAY_CIRCUIT_CLOSED_BODY = "[operator relay canceled: Meta circuit closed]"
@@ -2147,6 +2447,28 @@ async def handle_event(
     # mirrors carry a synthetic Chatwoot message id there, so they are skipped.
     if not chatwoot_origin and action.get("whatsapp_message_id"):
         event.whatsapp_message_id = action["whatsapp_message_id"]
+
+    # Inbound reaction: mirror to Chatwoot and stop.  Must run before any
+    # text/command/opt-out/promo/LLM logic so an emoji never triggers them, and
+    # never sends anything back to WhatsApp.  Status webhooks above already ran.
+    if action.get("kind") == "reaction":
+        if chatwoot_origin:
+            logger.info(
+                "Skipping Chatwoot mirror for chatwoot-origin reaction event id=%s dedupe_key=%s",
+                event.id,
+                event.dedupe_key,
+            )
+            event.error = None
+            return
+        await _forward_reaction_to_chatwoot(
+            session,
+            event,
+            phone_e164=phone_e164,
+            reaction_emoji=action.get("reaction_emoji"),
+            reaction_target_provider_message_id=action.get("reaction_target_provider_message_id"),
+            whatsapp_message_id=action.get("whatsapp_message_id"),
+        )
+        return
 
     if text and cmd is None:
         if chatwoot_origin:
