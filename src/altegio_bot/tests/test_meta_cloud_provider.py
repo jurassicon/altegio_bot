@@ -14,16 +14,20 @@ from typing import Any
 import pytest
 
 from altegio_bot.providers.dummy import DummyProvider, safe_send
-from altegio_bot.providers.meta_cloud import MetaCloudProvider
+from altegio_bot.providers.meta_cloud import MetaCloudError, MetaCloudProvider
 
 
 class _FakeResp:
     status_code = 200
 
-    def __init__(self, wamid: str = "wamid.SENT") -> None:
+    def __init__(self, wamid: str = "wamid.SENT", data: dict[str, Any] | None = None, status_code: int = 200) -> None:
         self._wamid = wamid
+        self.status_code = status_code
+        self._data = data
 
     def json(self) -> dict[str, Any]:
+        if self._data is not None:
+            return self._data
         return {"messages": [{"id": self._wamid}]}
 
 
@@ -363,3 +367,267 @@ async def test_hybrid_without_reply_context_unchanged() -> None:
     assert primary_calls[0]["reply_to_provider_message_id"] is None
     assert len(mirror_calls) == 1
     assert mirror_calls[0]["content"] == "Plain"
+
+
+# ---------------------------------------------------------------------------
+# Metadata probe
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_meta_cloud_check_metadata_hits_safe_endpoint() -> None:
+    calls: list[dict[str, Any]] = []
+    provider = MetaCloudProvider.__new__(MetaCloudProvider)
+    provider._access_token = "test-token"
+    provider._api_version = "v21.0"
+    provider._graph_url = "https://graph.facebook.com"
+
+    class _FakeClient:
+        async def get(
+            self,
+            url: str,
+            *,
+            headers: dict[str, str],
+            params: dict[str, str],
+            timeout: float | None = None,
+        ) -> _FakeResp:
+            calls.append({"url": url, "headers": headers, "params": params, "timeout": timeout})
+            return _FakeResp(data={"id": "PNID"})
+
+    provider._client = _FakeClient()  # type: ignore[assignment]
+
+    await provider.check_metadata("PNID", timeout=7.5)
+
+    assert calls == [
+        {
+            "url": "https://graph.facebook.com/v21.0/PNID",
+            "headers": {"Authorization": "Bearer test-token"},
+            "params": {"fields": "id,display_phone_number,verified_name"},
+            "timeout": 7.5,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_meta_cloud_check_metadata_error_is_safe() -> None:
+    provider = MetaCloudProvider.__new__(MetaCloudProvider)
+    provider._access_token = "secret-token"
+    provider._api_version = "v21.0"
+    provider._graph_url = "https://graph.facebook.com"
+
+    class _FakeClient:
+        async def get(self, *args: Any, **kwargs: Any) -> _FakeResp:
+            return _FakeResp(
+                status_code=500,
+                data={"error": {"code": 2, "message": "secret-token full response body"}},
+            )
+
+    provider._client = _FakeClient()  # type: ignore[assignment]
+
+    with pytest.raises(MetaCloudError) as exc:
+        await provider.check_metadata("PNID")
+
+    message = str(exc.value)
+    assert "status=500" in message
+    assert "code=2" in message
+    assert "secret-token" not in message
+    assert "full response body" not in message
+
+
+@pytest.mark.asyncio
+async def test_meta_cloud_send_error_preserves_safe_transient_fields() -> None:
+    provider = MetaCloudProvider.__new__(MetaCloudProvider)
+    provider._access_token = "secret-token"
+    provider._api_version = "v21.0"
+    provider._graph_url = "https://graph.facebook.com"
+    provider._allow_real_send = True
+    provider._sender_cache = {1: "PNID"}
+
+    class _FakeClient:
+        async def post(self, *args: Any, **kwargs: Any) -> _FakeResp:
+            return _FakeResp(
+                status_code=503,
+                data={
+                    "error": {
+                        "code": 2,
+                        "is_transient": True,
+                        "message": "secret-token body=Hello customer phone=+49123",
+                        "fbtrace_id": "FBTRACE_SAFE",
+                    }
+                },
+            )
+
+    provider._client = _FakeClient()  # type: ignore[assignment]
+
+    with pytest.raises(MetaCloudError) as exc:
+        await provider.send(1, "+491234567890", "Hello customer")
+
+    err = exc.value
+    message = str(err)
+    assert err.status_code == 503
+    assert err.meta_code == "2"
+    assert err.is_transient is True
+    assert "status=503" in message
+    assert "code=2" in message
+    assert "is_transient=true" in message
+    assert "FBTRACE_SAFE" in message
+    assert "secret-token" not in message
+    assert "Hello customer" not in message
+    assert "+49123" not in message
+
+
+@pytest.mark.asyncio
+async def test_meta_cloud_send_template_validation_error_is_sanitized() -> None:
+    provider = MetaCloudProvider.__new__(MetaCloudProvider)
+    provider._access_token = "secret-token"
+    provider._api_version = "v21.0"
+    provider._graph_url = "https://graph.facebook.com"
+    provider._allow_real_send = True
+    provider._sender_cache = {1: "PNID"}
+
+    class _FakeClient:
+        async def post(self, *args: Any, **kwargs: Any) -> _FakeResp:
+            return _FakeResp(
+                status_code=400,
+                data={
+                    "error": {
+                        "code": 132000,
+                        "message": "Number of parameters does not match: secret-token param=Anna",
+                    }
+                },
+            )
+
+    provider._client = _FakeClient()  # type: ignore[assignment]
+
+    with pytest.raises(MetaCloudError) as exc:
+        await provider.send_template(1, "+491234567890", "tpl_name", "de", ["Anna"], "body")
+
+    message = str(exc.value)
+    assert "status=400" in message
+    assert "code=132000" in message
+    assert "template validation error" in message
+    assert "secret-token" not in message
+    assert "Anna" not in message
+    assert "tpl_name" not in message
+
+
+@pytest.mark.asyncio
+async def test_hybrid_check_metadata_delegates_to_primary() -> None:
+    from altegio_bot.providers.chatwoot_hybrid import ChatwootHybridProvider
+
+    calls: list[tuple[str, float | None]] = []
+
+    class _Primary:
+        async def check_metadata(self, phone_number_id: str, *, timeout: float | None = None) -> None:
+            calls.append((phone_number_id, timeout))
+
+        async def aclose(self) -> None:
+            return None
+
+    class _Chatwoot:
+        async def aclose(self) -> None:
+            return None
+
+    provider = ChatwootHybridProvider(
+        primary=_Primary(),  # type: ignore[arg-type]
+        chatwoot=_Chatwoot(),  # type: ignore[arg-type]
+    )
+
+    await provider.check_metadata("PNID", timeout=3.0)
+
+    assert calls == [("PNID", 3.0)]
+
+
+# ---------------------------------------------------------------------------
+# Shared error classifier: structured MetaCloudError fields + string fallback
+# ---------------------------------------------------------------------------
+
+
+def test_classifier_uses_structured_metacloud_error_fields() -> None:
+    """A MetaCloudError exposes status_code/meta_code/is_transient; the shared
+    classifier consumes them directly without re-parsing the string."""
+    from altegio_bot.services.meta_error_classifier import (
+        is_transient_provider_error,
+        transient_error_reason,
+    )
+
+    http = MetaCloudError("send", status_code=503, meta_code=None, is_transient=None)
+    assert is_transient_provider_error(http) is True
+    assert transient_error_reason(http) == ("http", "503")
+
+    flagged = MetaCloudError("send", status_code=400, meta_code=None, is_transient=True)
+    assert is_transient_provider_error(flagged) is True
+    assert transient_error_reason(flagged) == ("is_transient", None)
+
+    code2 = MetaCloudError("send", status_code=400, meta_code="2", is_transient=None)
+    assert is_transient_provider_error(code2) is True
+    assert transient_error_reason(code2) == ("meta_code", "2")
+
+
+def test_classifier_token_expired_metacloud_error_is_permanent() -> None:
+    """Token expiry is permanent even if Meta also marks is_transient=true."""
+    from altegio_bot.services.meta_error_classifier import is_transient_provider_error
+
+    err = MetaCloudError(
+        "send",
+        status_code=401,
+        meta_code="190",
+        is_transient=True,
+        safe_message="access token expired",
+    )
+    assert is_transient_provider_error(err) is False
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # operator relay receives string errors from safe_send / safe_send_template,
+        # so the string fallback must cover all transient signal forms.
+        "{'code': 2, 'is_transient': True}",
+        '{"code":2,"is_transient":true}',
+        "Meta send failed status=500",
+        "Meta send failed status_code=500",
+        "Meta send failed status=400 code=2",
+        "Meta send failed status=400 is_transient=true",
+    ],
+)
+def test_classifier_string_fallback_matches_dict_json_and_status(text: str) -> None:
+    """Stored/legacy string errors keep working via the regex fallback.
+
+    The classifier accepts both structured exceptions (MetaCloudError) and
+    sanitized string errors; this pins the string path used by operator relay.
+    """
+    from altegio_bot.services.meta_error_classifier import is_transient_provider_error
+
+    assert is_transient_provider_error(text) is True
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        # code 2 is the only transient code in this family; 200/230/270 are
+        # success/other codes and must NOT be matched as transient.
+        ('{"code":200}', False),
+        ('{"code":230}', False),
+        ('{"code":270}', False),
+        ('{"code":2}', True),
+        ("{'code': 200}", False),
+        ("{'code': 2}", True),
+        ('{"code": 2, "is_transient": true}', True),
+        ("{'code': 2, 'is_transient': True}", True),
+        ("code=200", False),
+        ("code=2", True),
+        ('"code":2', True),
+        ('"code": 2', True),
+    ],
+)
+def test_classifier_code_2_not_confused_with_2xx(text: str, expected: bool) -> None:
+    """The transient Meta code 2 regex must not match code 200/230/270.
+
+    A raw JSON/dict body containing ``"code":200`` previously matched the
+    ``code:2`` alternative because of the optional surrounding quotes; the
+    ``(?!\\d)`` guard now prevents that false positive.
+    """
+    from altegio_bot.services.meta_error_classifier import is_transient_provider_error
+
+    assert is_transient_provider_error(text) is expected

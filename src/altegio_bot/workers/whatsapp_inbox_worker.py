@@ -5,10 +5,12 @@ import json
 import logging
 import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from typing import Any, Sequence
 
 from sqlalchemy import or_, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.campaigns.runner import recompute_campaign_run_stats
@@ -19,12 +21,18 @@ from altegio_bot.models.models import (
     Client,
     MessageJob,
     OutboxMessage,
+    Record,
     WhatsAppEvent,
     WhatsAppSender,
 )
 from altegio_bot.perf import perf_log
 from altegio_bot.providers.base import WhatsAppProvider
 from altegio_bot.providers.dummy import safe_send, safe_send_template
+from altegio_bot.services import meta_circuit
+from altegio_bot.services.meta_error_classifier import (
+    is_transient_provider_error,
+    transient_error_reason,
+)
 from altegio_bot.settings import settings
 from altegio_bot.whatsapp_window import is_whatsapp_customer_window_open, normalize_phone
 from altegio_bot.workers.promo_lead_handler import (
@@ -38,6 +46,81 @@ MARKETING_JOB_TYPES = (
     "review_3d",
     "repeat_10d",
     "comeback_3d",
+)
+
+DELIVERY_RETRY_JOB_TYPES = (
+    "record_created",
+    "record_updated",
+    "record_canceled",
+    "reminder_24h",
+    "reminder_2h",
+)
+
+_DELIVERY_RETRY_DEDUPE_PREFIX = "delivery_retry:"
+_DELIVERY_RETRY_DELAYS_SECONDS = (
+    10 * 60,
+    30 * 60,
+    2 * 60 * 60,
+    6 * 60 * 60,
+)
+_DELIVERY_RETRY_MAX_ATTEMPTS = 4
+_DELIVERY_STATUS_ORDER = {"sent": 0, "delivered": 1, "read": 2}
+_SUCCESSFUL_DELIVERY_STATUSES = ("delivered", "read")
+
+_PERMANENT_DELIVERY_ERROR_CODES = {
+    131026,
+    131051,
+    131008,
+    131009,
+    100,
+    33,
+    132000,
+    132001,
+    132005,
+    132007,
+    132012,
+    132015,
+    132016,
+}
+_TRANSIENT_DELIVERY_ERROR_CODES = {
+    0,
+    131000,
+    131016,
+    131056,
+}
+_PERMANENT_DELIVERY_FAILURE_KEYWORDS = (
+    "not a whatsapp user",
+    "not registered on whatsapp",
+    "invalid recipient",
+    "invalid phone",
+    "recipient has blocked",
+    "opted out",
+    "unsubscribed",
+)
+_PERMANENT_DELIVERY_CODE_10_KEYWORDS = (
+    "permission",
+    "auth",
+    "access",
+    "config",
+    "credential",
+    "token",
+    "oauth",
+    "unauthorized",
+    "forbidden",
+    "permanent",
+)
+_TRANSIENT_DELIVERY_FAILURE_KEYWORDS = (
+    "transient",
+    "temporary",
+    "temporarily",
+    "rate",
+    "throttle",
+    "throttled",
+    "timeout",
+    "timed out",
+    "try again",
+    "unavailable",
+    "overloaded",
 )
 
 STOP_KEYWORDS = {
@@ -542,6 +625,220 @@ def _extract_actions(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return actions
 
 
+def _delivery_retry_delay_seconds(attempt: int) -> int:
+    if attempt < 1:
+        attempt = 1
+    if attempt > len(_DELIVERY_RETRY_DELAYS_SECONDS):
+        return _DELIVERY_RETRY_DELAYS_SECONDS[-1]
+    return _DELIVERY_RETRY_DELAYS_SECONDS[attempt - 1]
+
+
+def _extract_statuses(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    statuses: list[dict[str, Any]] = []
+
+    for entry in payload.get("entry") or []:
+        if not isinstance(entry, dict):
+            continue
+        for change in entry.get("changes") or []:
+            if not isinstance(change, dict):
+                continue
+            value = change.get("value") or {}
+            if not isinstance(value, dict):
+                continue
+            metadata = value.get("metadata") or {}
+            if not isinstance(metadata, dict):
+                metadata = {}
+            phone_number_id = metadata.get("phone_number_id")
+
+            for st in value.get("statuses") or []:
+                if not isinstance(st, dict):
+                    continue
+                wamid = st.get("id")
+                status = str(st.get("status") or "").strip().lower()
+                if not isinstance(wamid, str) or not wamid.strip() or status not in _WA_HANDLED_STATUSES:
+                    continue
+
+                errors = st.get("errors")
+                first_error: dict[str, Any] = {}
+                if isinstance(errors, list) and errors and isinstance(errors[0], dict):
+                    first_error = errors[0]
+                error_data = first_error.get("error_data")
+                if not isinstance(error_data, dict):
+                    error_data = {}
+
+                statuses.append(
+                    {
+                        "provider_message_id": wamid.strip(),
+                        "status": status,
+                        "timestamp": st.get("timestamp"),
+                        "recipient_id": st.get("recipient_id"),
+                        "phone_number_id": phone_number_id,
+                        "error_code": first_error.get("code"),
+                        "error_title": first_error.get("title"),
+                        "error_message": first_error.get("message"),
+                        "error_details": error_data.get("details"),
+                    }
+                )
+
+    return statuses
+
+
+def _classify_delivery_failure(status: dict[str, Any]) -> str:
+    if not status.get("provider_message_id"):
+        return "permanent"
+
+    code = status.get("error_code")
+    try:
+        code_int: int | None = int(code) if code is not None else None
+    except (TypeError, ValueError):
+        code_int = None
+
+    title = str(status.get("error_title") or "").lower()
+    message = str(status.get("error_message") or "").lower()
+    details = str(status.get("error_details") or "").lower()
+    combined = " ".join(part for part in (title, message, details) if part)
+
+    if code_int == 10:
+        if any(kw in combined for kw in _PERMANENT_DELIVERY_CODE_10_KEYWORDS):
+            return "permanent"
+        if any(kw in combined for kw in _TRANSIENT_DELIVERY_FAILURE_KEYWORDS):
+            return "retryable"
+        return "permanent"
+
+    if code_int in _TRANSIENT_DELIVERY_ERROR_CODES:
+        return "retryable"
+    if code_int in _PERMANENT_DELIVERY_ERROR_CODES:
+        return "permanent"
+
+    if any(kw in combined for kw in _PERMANENT_DELIVERY_FAILURE_KEYWORDS):
+        return "permanent"
+    if any(kw in combined for kw in _TRANSIENT_DELIVERY_FAILURE_KEYWORDS):
+        return "retryable"
+
+    return "unknown_retryable_bounded"
+
+
+def _is_retryable_delivery_failure(status: dict[str, Any]) -> bool:
+    return _classify_delivery_failure(status) != "permanent"
+
+
+def _sanitize_delivery_detail(value: Any, limit: int = 300) -> str | None:
+    if value is None:
+        return None
+    text = " ".join(str(value).split())
+    if not text:
+        return None
+    if len(text) > limit:
+        text = text[:limit] + "..."
+    return text
+
+
+def _mark_outbox_delivery_failed(outbox: OutboxMessage, status: dict[str, Any], reason: str) -> None:
+    code = status.get("error_code")
+    title = status.get("error_title")
+    details = _sanitize_delivery_detail(status.get("error_details"))
+    provider_message_id = status.get("provider_message_id")
+
+    outbox.status = "failed"
+    bits = " ".join(
+        bit for bit in (f"code={code}" if code is not None else "", f"title={title}" if title else "") if bit
+    )
+    outbox.error = f"WA delivery failed {bits}".strip()
+
+    meta = dict(outbox.meta or {})
+    meta["delivery_failed"] = True
+    meta["delivery_failed_at"] = utcnow().isoformat()
+    meta["delivery_failed_code"] = code
+    meta["delivery_failed_title"] = title
+    meta["delivery_failed_details"] = details
+    meta["delivery_failed_provider_message_id"] = provider_message_id
+    meta["delivery_failed_reason"] = reason
+    outbox.meta = meta
+
+
+def _mark_stale_failed_after_success(outbox: OutboxMessage, status: dict[str, Any]) -> None:
+    meta = dict(outbox.meta or {})
+    meta["stale_failed_after_success"] = True
+    meta["stale_failed_code"] = status.get("error_code")
+    meta["stale_failed_title"] = status.get("error_title")
+    meta["stale_failed_at"] = utcnow().isoformat()
+    outbox.meta = meta
+
+
+def _delivery_retry_chain_original_outbox_id(outbox: OutboxMessage) -> int:
+    meta = outbox.meta or {}
+    raw = meta.get("delivery_retry_of_outbox_id")
+    if raw is not None:
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            pass
+    return int(outbox.id)
+
+
+async def _find_outbox_by_provider_message_id(
+    session: AsyncSession,
+    provider_message_id: str,
+) -> OutboxMessage | None:
+    stmt = (
+        select(OutboxMessage)
+        .where(OutboxMessage.provider_message_id == provider_message_id)
+        .order_by(OutboxMessage.id.desc())
+        .limit(1)
+    )
+    return (await session.execute(stmt)).scalars().first()
+
+
+async def _should_ignore_failed_after_success(session: AsyncSession, outbox: OutboxMessage) -> bool:
+    if outbox.status in _SUCCESSFUL_DELIVERY_STATUSES:
+        return True
+
+    from altegio_bot.workers.outbox_worker import _delivery_retry_chain_has_success
+
+    return await _delivery_retry_chain_has_success(session, _delivery_retry_chain_original_outbox_id(outbox))
+
+
+async def _cancel_queued_delivery_retry_jobs_for_chain(
+    session: AsyncSession,
+    original_outbox_id: int,
+    reason: str,
+) -> int:
+    prefix = f"{_DELIVERY_RETRY_DEDUPE_PREFIX}{original_outbox_id}:"
+    stmt = (
+        update(MessageJob)
+        .where(MessageJob.status == "queued")
+        .where(MessageJob.dedupe_key.like(prefix + "%"))
+        .values(status="canceled", locked_at=None, updated_at=utcnow(), last_error=reason)
+    )
+    res = await session.execute(stmt)
+    return int(getattr(res, "rowcount", 0) or 0)
+
+
+async def _select_message_job_by_dedupe(session: AsyncSession, dedupe_key: str) -> MessageJob | None:
+    stmt = select(MessageJob).where(MessageJob.dedupe_key == dedupe_key).limit(1)
+    return (await session.execute(stmt)).scalars().first()
+
+
+async def _create_delivery_retry_job_idempotent(
+    session: AsyncSession,
+    *,
+    dedupe_key: str,
+    **fields: Any,
+) -> MessageJob | None:
+    existing = await _select_message_job_by_dedupe(session, dedupe_key)
+    if existing is not None:
+        return existing
+
+    job = MessageJob(dedupe_key=dedupe_key, **fields)
+    try:
+        async with session.begin_nested():
+            session.add(job)
+            await session.flush()
+    except IntegrityError:
+        return await _select_message_job_by_dedupe(session, dedupe_key)
+    return job
+
+
 def _extract_status_updates(
     payload: dict[str, Any],
 ) -> list[dict[str, Any]]:
@@ -590,106 +887,13 @@ def _extract_status_updates(
     return updates
 
 
-async def _apply_status_updates(
+async def _campaign_run_ids_for_outbox_ids(
     session: AsyncSession,
-    status_updates: list[dict[str, Any]],
+    updated_outbox_ids: list[int],
 ) -> list[int]:
-    """Apply Meta delivery status webhooks to OutboxMessage rows.
-
-    Looks up each wamid via provider_message_id, advances status
-    monotonically (no regression), and stores the raw payload in meta.
-
-    Returns distinct campaign_run_id values for affected OutboxMessage
-    rows that are linked to a CampaignRecipient — so the caller can
-    trigger recompute_campaign_run_stats for each run.
-    """
-    if not status_updates:
-        return []
-
-    wamids = [u["wamid"] for u in status_updates]
-
-    logger.info(
-        "status_webhook: processing %d update(s) wamids=%s",
-        len(status_updates),
-        wamids,
-    )
-
-    stmt = select(OutboxMessage).where(OutboxMessage.provider_message_id.in_(wamids))
-    res = await session.execute(stmt)
-    outbox_by_wamid: dict[str, OutboxMessage] = {}
-    for ob in res.scalars().all():
-        if ob.provider_message_id:
-            outbox_by_wamid[ob.provider_message_id] = ob
-
-    updated_outbox_ids: list[int] = []
-    outbox_id_to_new_status: dict[int, str] = {}
-
-    for upd in status_updates:
-        wamid = upd["wamid"]
-        new_status = upd["status"]
-        ob = outbox_by_wamid.get(wamid)
-        if ob is None:
-            logger.info(
-                "status_webhook: no OutboxMessage matched wamid=%s status=%s",
-                wamid,
-                new_status,
-            )
-            continue
-
-        current_rank = _WA_STATUS_RANK.get(ob.status, 0)
-        new_rank = _WA_STATUS_RANK.get(new_status, 0)
-
-        if new_rank <= current_rank:
-            logger.debug(
-                "status_webhook: no-op (no-regression) outbox_id=%s wamid=%s current=%s new=%s",
-                ob.id,
-                wamid,
-                ob.status,
-                new_status,
-            )
-            continue
-
-        logger.info(
-            "status_webhook: advancing outbox_id=%s wamid=%s %s -> %s",
-            ob.id,
-            wamid,
-            ob.status,
-            new_status,
-        )
-
-        ob.status = new_status
-
-        # Persist timestamp and raw payload in meta for audit.
-        meta = dict(ob.meta or {})
-        meta[f"wa_status_{new_status}"] = {
-            "timestamp": upd.get("timestamp"),
-            "raw": upd.get("raw"),
-        }
-        ob.meta = meta
-
-        updated_outbox_ids.append(int(ob.id))
-        outbox_id_to_new_status[int(ob.id)] = new_status
-
     if not updated_outbox_ids:
         return []
 
-    # Advance followup_status on CampaignRecipient rows linked via followup_outbox_id.
-    # Uses the same no-downgrade rule: read > delivered > sent.
-    fu_status_ids = [oid for oid, st in outbox_id_to_new_status.items() if st in {"delivered", "read"}]
-    if fu_status_ids:
-        fu_stmt = select(CampaignRecipient).where(CampaignRecipient.followup_outbox_id.in_(fu_status_ids))
-        fu_res = await session.execute(fu_stmt)
-        for recipient in fu_res.scalars().all():
-            fu_oid = recipient.followup_outbox_id
-            if fu_oid is None:
-                continue
-            new_followup = outbox_id_to_new_status.get(int(fu_oid))
-            if new_followup == "read":
-                recipient.followup_status = "read"
-            elif new_followup == "delivered" and recipient.followup_status != "read":
-                recipient.followup_status = "delivered"
-
-    # Resolve campaign_run_ids linked to the updated outbox messages (primary or follow-up).
     cr_stmt = (
         select(CampaignRecipient.campaign_run_id)
         .where(
@@ -702,6 +906,268 @@ async def _apply_status_updates(
     )
     cr_res = await session.execute(cr_stmt)
     return [int(r) for r in cr_res.scalars().all()]
+
+
+async def _advance_followup_statuses(
+    session: AsyncSession,
+    outbox_id_to_new_status: dict[int, str],
+) -> None:
+    fu_status_ids = [oid for oid, st in outbox_id_to_new_status.items() if st in {"delivered", "read"}]
+    if not fu_status_ids:
+        return
+
+    fu_stmt = select(CampaignRecipient).where(CampaignRecipient.followup_outbox_id.in_(fu_status_ids))
+    fu_res = await session.execute(fu_stmt)
+    for recipient in fu_res.scalars().all():
+        fu_oid = recipient.followup_outbox_id
+        if fu_oid is None:
+            continue
+        new_followup = outbox_id_to_new_status.get(int(fu_oid))
+        if new_followup == "read":
+            recipient.followup_status = "read"
+        elif new_followup == "delivered" and recipient.followup_status != "read":
+            recipient.followup_status = "delivered"
+
+
+async def _handle_delivery_statuses(
+    session: AsyncSession,
+    event: WhatsAppEvent | None,
+    statuses: list[dict[str, Any]],
+) -> list[int]:
+    updated_outbox_ids: list[int] = []
+    outbox_id_to_new_status: dict[int, str] = {}
+
+    for status in statuses:
+        kind = status["status"]
+        provider_message_id = status["provider_message_id"]
+        outbox = await _find_outbox_by_provider_message_id(session, provider_message_id)
+        if outbox is None:
+            logger.info(
+                "status_webhook: no OutboxMessage matched provider_message_id=%s status=%s",
+                provider_message_id,
+                kind,
+            )
+            continue
+
+        if kind == "failed":
+            if await _should_ignore_failed_after_success(session, outbox):
+                _mark_stale_failed_after_success(outbox, status)
+                continue
+            _mark_outbox_delivery_failed(outbox, status, "whatsapp_delivery_failed")
+            updated_outbox_ids.append(int(outbox.id))
+            outbox_id_to_new_status[int(outbox.id)] = "failed"
+            await _handle_failed_delivery_status(session, event, status, outbox=outbox)
+            continue
+
+        if kind not in {"sent", "delivered", "read"}:
+            continue
+
+        current_rank = _WA_STATUS_RANK.get(outbox.status, 0)
+        if outbox.status == "failed" and kind in _SUCCESSFUL_DELIVERY_STATUSES:
+            current_rank = -1
+        new_rank = _WA_STATUS_RANK.get(kind, 0)
+        if new_rank <= current_rank:
+            continue
+
+        if outbox.status == "failed":
+            outbox.error = None
+            recovered_meta = dict(outbox.meta or {})
+            recovered_meta["delivery_failed"] = False
+            recovered_meta["delivery_recovered_to"] = kind
+            recovered_meta["delivery_recovered_at"] = utcnow().isoformat()
+            outbox.meta = recovered_meta
+
+        outbox.status = kind
+        meta = dict(outbox.meta or {})
+        meta[f"wa_status_{kind}"] = {"timestamp": status.get("timestamp")}
+        outbox.meta = meta
+        updated_outbox_ids.append(int(outbox.id))
+        outbox_id_to_new_status[int(outbox.id)] = kind
+
+        if kind in _SUCCESSFUL_DELIVERY_STATUSES:
+            original_outbox_id = _delivery_retry_chain_original_outbox_id(outbox)
+            canceled = await _cancel_queued_delivery_retry_jobs_for_chain(
+                session,
+                original_outbox_id,
+                "Canceled: original delivery later succeeded",
+            )
+            if canceled:
+                logger.info(
+                    "Canceled queued delivery retries original_outbox_id=%s canceled_count=%s status=%s",
+                    original_outbox_id,
+                    canceled,
+                    kind,
+                )
+
+    await _advance_followup_statuses(session, outbox_id_to_new_status)
+    return await _campaign_run_ids_for_outbox_ids(session, updated_outbox_ids)
+
+
+async def _apply_status_updates(
+    session: AsyncSession,
+    status_updates: list[dict[str, Any]],
+) -> list[int]:
+    if not status_updates:
+        return []
+
+    statuses = [
+        {
+            "provider_message_id": str(update["wamid"]),
+            "status": str(update["status"]).strip().lower(),
+            "timestamp": update.get("timestamp"),
+            "recipient_id": None,
+            "phone_number_id": None,
+            "error_code": None,
+            "error_title": None,
+            "error_details": None,
+        }
+        for update in status_updates
+        if update.get("wamid") and update.get("status")
+    ]
+    return await _handle_delivery_statuses(session, None, statuses)
+
+
+async def _handle_failed_delivery_status(
+    session: AsyncSession,
+    event: WhatsAppEvent | None,
+    status: dict[str, Any],
+    *,
+    outbox: OutboxMessage | None,
+) -> None:
+    provider_message_id = str(status["provider_message_id"])
+    if outbox is None:
+        return
+    if not settings.outbox_delivery_retry_enabled:
+        return
+
+    job_type = outbox.template_code
+    if job_type not in DELIVERY_RETRY_JOB_TYPES:
+        return
+    if not _is_retryable_delivery_failure(status):
+        return
+
+    meta = outbox.meta or {}
+    original_outbox_id = int(outbox.id)
+    attempt_number = 1
+    if meta.get("delivery_retry_of_outbox_id") is not None:
+        try:
+            original_outbox_id = int(meta["delivery_retry_of_outbox_id"])
+            attempt_number = int(meta.get("delivery_retry_attempt") or 0) + 1
+        except (TypeError, ValueError):
+            original_outbox_id = int(outbox.id)
+            attempt_number = 1
+
+    dedupe_prefix = f"{_DELIVERY_RETRY_DEDUPE_PREFIX}{original_outbox_id}:"
+    rows = (
+        await session.execute(
+            select(MessageJob.id, MessageJob.dedupe_key).where(MessageJob.dedupe_key.like(dedupe_prefix + "%"))
+        )
+    ).all()
+    existing_job_ids: list[int] = []
+    existing_attempts: set[int] = set()
+    for job_id, dedupe_key in rows:
+        existing_job_ids.append(int(job_id))
+        suffix = str(dedupe_key).rsplit(":", 1)[-1]
+        try:
+            existing_attempts.add(int(suffix))
+        except ValueError:
+            continue
+
+    if attempt_number in existing_attempts:
+        return
+    if attempt_number > _DELIVERY_RETRY_MAX_ATTEMPTS or len(existing_attempts) >= _DELIVERY_RETRY_MAX_ATTEMPTS:
+        if event is not None:
+            event.error = f"Delivery retry limit reached for outbox_id={original_outbox_id}"
+        return
+
+    if existing_job_ids:
+        delivered = (
+            await session.execute(
+                select(OutboxMessage.id)
+                .where(OutboxMessage.job_id.in_(existing_job_ids))
+                .where(OutboxMessage.status.in_(_SUCCESSFUL_DELIVERY_STATUSES))
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if delivered is not None:
+            return
+
+    anchor_outbox = outbox
+    if original_outbox_id != int(outbox.id):
+        original = await session.get(OutboxMessage, original_outbox_id)
+        if original is None:
+            skip_meta = dict(outbox.meta or {})
+            skip_meta["delivery_retry_skipped"] = True
+            skip_meta["delivery_retry_skip_reason"] = "original_outbox_missing"
+            skip_meta["delivery_retry_original_outbox_id"] = original_outbox_id
+            outbox.meta = skip_meta
+            return
+        anchor_outbox = original
+
+    record: Record | None = None
+    if anchor_outbox.record_id is not None:
+        record = await session.get(Record, anchor_outbox.record_id)
+
+    delay = _delivery_retry_delay_seconds(attempt_number)
+    next_run_at = utcnow() + timedelta(seconds=delay)
+
+    from altegio_bot.workers.outbox_worker import _ORIGINAL_RUN_AT_KEY, _retry_deadline_at
+
+    job_like = SimpleNamespace(job_type=job_type, run_at=anchor_outbox.scheduled_at, payload={})
+    deadline = _retry_deadline_at(job_like, record, original_outbox=anchor_outbox)
+    if deadline is not None and next_run_at > deadline:
+        return
+
+    payload: dict[str, Any] = {
+        "kind": "delivery_failed_retry",
+        "delivery_retry_of_outbox_id": original_outbox_id,
+        "delivery_retry_of_provider_message_id": provider_message_id,
+        "delivery_retry_attempt": attempt_number,
+        "delivery_retry_error_code": status.get("error_code"),
+        "delivery_retry_error_title": status.get("error_title"),
+        "delivery_retry_error_details": _sanitize_delivery_detail(status.get("error_details")),
+        "delivery_retry_original_outbox_id": original_outbox_id,
+    }
+    anchor_scheduled = anchor_outbox.scheduled_at
+    if anchor_scheduled is not None:
+        if anchor_scheduled.tzinfo is None:
+            anchor_scheduled = anchor_scheduled.replace(tzinfo=timezone.utc)
+        payload[_ORIGINAL_RUN_AT_KEY] = anchor_scheduled.isoformat()
+        payload["delivery_retry_original_scheduled_at"] = anchor_scheduled.isoformat()
+
+    record_starts_at = getattr(record, "starts_at", None) if record is not None else None
+    if job_type in ("reminder_24h", "reminder_2h") and record_starts_at is not None:
+        if record_starts_at.tzinfo is None:
+            record_starts_at = record_starts_at.replace(tzinfo=timezone.utc)
+        payload["record_starts_at"] = record_starts_at.isoformat()
+
+    original_job = None
+    if anchor_outbox.job_id is not None:
+        original_job = await session.get(MessageJob, anchor_outbox.job_id)
+    max_attempts = int(getattr(original_job, "max_attempts", 5) or 5)
+
+    dedupe_key = f"{_DELIVERY_RETRY_DEDUPE_PREFIX}{original_outbox_id}:{attempt_number}"
+    created = await _create_delivery_retry_job_idempotent(
+        session,
+        dedupe_key=dedupe_key,
+        company_id=anchor_outbox.company_id,
+        record_id=anchor_outbox.record_id,
+        client_id=anchor_outbox.client_id,
+        job_type=job_type,
+        status="queued",
+        run_at=next_run_at,
+        attempts=0,
+        max_attempts=max_attempts,
+        payload=payload,
+    )
+    logger.warning(
+        "Scheduled delivery retry original_outbox_id=%s attempt=%s delay_seconds=%s dedupe_key=%s created=%s",
+        original_outbox_id,
+        attempt_number,
+        delay,
+        dedupe_key,
+        created is not None,
+    )
 
 
 @dataclass(frozen=True)
@@ -944,6 +1410,12 @@ async def _forward_text_to_chatwoot(
     )
 
 
+# Safe placeholder bodies for canceled operator-relay audit rows. The operator's
+# original message text is intentionally never stored on these audit rows.
+_OPERATOR_RELAY_CIRCUIT_CLOSED_BODY = "[operator relay canceled: Meta circuit closed]"
+_OPERATOR_RELAY_TRANSIENT_BODY = "[operator relay canceled: Meta transient send error]"
+
+
 async def _handle_operator_relay(
     session: AsyncSession,
     event: WhatsAppEvent,
@@ -1075,6 +1547,191 @@ async def _handle_operator_relay(
 
     last_inbound_iso: str | None = last_inbound_at.isoformat() if last_inbound_at else None
 
+    async def _add_canceled_operator_relay_outbox(
+        *,
+        attempted_send_type: str,
+        cancel_reason: str,
+        body: str,
+        error: str,
+        circuit_action: str,
+        error_kind: str | None = None,
+        error_code: str | None = None,
+        extra_meta: dict[str, Any] | None = None,
+    ) -> OutboxMessage:
+        """Build, persist and return a canceled operator-relay audit row.
+
+        Single constructor for both Meta-circuit cancel paths so the safe
+        placeholder body and the row skeleton can never diverge. The
+        helper-controlled ``body``, ``error`` and base circuit ``meta`` do not
+        include the operator message text, raw Meta response, tokens, or
+        template params. ``extra_meta`` is caller-controlled and may include
+        legacy relay audit fields (e.g. ``agent_name``, reply-context audit) for
+        compatibility, so callers must keep it intentionally scoped and must not
+        put raw Meta body, tokens, operator message text, or template params
+        into it.
+        """
+        meta: dict[str, Any] = {
+            "send_type": "none",
+            "attempted_send_type": attempted_send_type,
+            "cancel_reason": cancel_reason,
+            "circuit_action": circuit_action,
+            "circuit_state": "closed",
+            "event_id": getattr(event, "id", None),
+            "provider": type(meta_provider).__name__,
+            "phone_number_id": phone_number_id,
+        }
+        if error_kind is not None:
+            meta["error_kind"] = error_kind
+        if error_code is not None:
+            meta["error_code"] = error_code
+        if extra_meta:
+            meta.update(extra_meta)
+
+        outbox = OutboxMessage(
+            company_id=company_id,
+            client_id=None,
+            record_id=None,
+            job_id=None,
+            sender_id=sender_id,
+            phone_e164=phone_e164,
+            template_code="operator_relay",
+            language="de",
+            body=body,
+            status="canceled",
+            provider_message_id=None,
+            scheduled_at=utcnow(),
+            sent_at=None,
+            message_source="operator",
+            chatwoot_conversation_id=cw_conversation_id,
+            chatwoot_message_id=cw_message_id,
+            error=error,
+            meta=meta,
+        )
+        session.add(outbox)
+        await session.flush()
+        return outbox
+
+    async def _pause_for_meta_circuit(attempted_send_type: str, template_name: str | None = None) -> bool:
+        if not settings.meta_circuit_breaker_enabled:
+            return False
+        if not await meta_circuit.should_pause_meta_sends(session=session):
+            return False
+
+        extra_meta: dict[str, Any] = {
+            "wa_window_open": window_open,
+            "last_meta_inbound_at": last_inbound_iso,
+            "closed_window_mode": mode,
+            "chatwoot_conversation_id": conversation_id,
+            "chatwoot_message_id": chatwoot_message_id,
+            "agent_name": agent_name,
+            **reply_context_audit,
+        }
+        if template_name:
+            extra_meta["template"] = template_name
+
+        outbox = await _add_canceled_operator_relay_outbox(
+            attempted_send_type=attempted_send_type,
+            cancel_reason="meta_circuit_closed",
+            body=_OPERATOR_RELAY_CIRCUIT_CLOSED_BODY,
+            error="Meta circuit closed: operator relay paused",
+            circuit_action="already_closed",
+            extra_meta=extra_meta,
+        )
+        event.error = "operator_relay: Meta circuit closed"
+        logger.warning(
+            "operator_relay: Meta circuit closed; paused conv_id=%s msg_id=%s outbox_id=%s company_id=%s",
+            conversation_id,
+            chatwoot_message_id,
+            outbox.id,
+            company_id,
+        )
+
+        await _send_circuit_pause_note(outbox)
+        return True
+
+    async def _send_circuit_pause_note(outbox: OutboxMessage) -> None:
+        """Add the operator-facing 'Meta unavailable' Chatwoot private note.
+
+        Static, PII-free text; records private_note_status on the outbox meta.
+        Shared by the pre-send pause path and the transient-error close path.
+        """
+        if settings.chatwoot_operator_reopen_private_note_enabled and conversation_id:
+            private_note = (
+                "Meta/WhatsApp ist voruebergehend nicht erreichbar. "
+                "Die Operator-Nachricht wurde nicht an WhatsApp gesendet."
+            )
+            cw = ChatwootClient()
+            try:
+                await cw.send_message(
+                    conversation_id,
+                    private_note,
+                    message_type="outgoing",
+                    private=True,
+                )
+                outbox.meta = {**outbox.meta, "private_note_status": "sent"}
+            except Exception as exc:
+                logger.warning(
+                    "operator_relay: circuit pause note failed conv_id=%s err=%s",
+                    conversation_id,
+                    exc,
+                )
+                outbox.meta = {**outbox.meta, "private_note_status": "failed"}
+            finally:
+                await cw.aclose()
+        else:
+            outbox.meta = {**outbox.meta, "private_note_status": "disabled"}
+
+    async def _close_circuit_on_transient_send_error(attempted_send_type: str, err: str) -> bool:
+        """Close the Meta circuit when an operator-relay send fails transiently.
+
+        Returns True when the error was transient and fully handled here: the
+        global circuit is closed, a canceled audit OutboxMessage is written, and
+        the operator is notified. Returns False for permanent/token-expired
+        errors so the caller keeps its existing permanent-failure handling.
+
+        Makes no additional Meta calls and never triggers template fallback.
+        Audit fields and logs are restricted to non-PII data (event/outbox ids,
+        company, provider class, phone_number_id, circuit state, error kind/code).
+        """
+        if not settings.meta_circuit_breaker_enabled:
+            return False
+        if not is_transient_provider_error(err):
+            return False
+
+        error_kind, error_code = transient_error_reason(err)
+        await meta_circuit.close_meta_circuit(
+            reason="operator_relay_transient_send_error",
+            error_kind=error_kind,
+            error_code=error_code,
+            next_probe_at=utcnow() + timedelta(seconds=settings.meta_circuit_probe_initial_delay_seconds),
+        )
+
+        outbox = await _add_canceled_operator_relay_outbox(
+            attempted_send_type=attempted_send_type,
+            cancel_reason="meta_transient_send_error",
+            body=_OPERATOR_RELAY_TRANSIENT_BODY,
+            error="Meta transient error: operator relay paused and circuit closed",
+            circuit_action="closed",
+            error_kind=error_kind,
+            error_code=error_code,
+        )
+        event.error = "operator_relay: Meta transient error, circuit closed"
+        logger.warning(
+            "operator_relay: transient Meta error closed circuit; canceled "
+            "conv_id=%s msg_id=%s outbox_id=%s company_id=%s provider=%s "
+            "phone_number_id=%s error_kind=%s error_code=%s",
+            conversation_id,
+            chatwoot_message_id,
+            outbox.id,
+            company_id,
+            type(meta_provider).__name__,
+            phone_number_id,
+            error_kind,
+            error_code,
+        )
+        await _send_circuit_pause_note(outbox)
+        return True
+
     # ── Branch: window open → send as free-form text ──────────────────────
     if window_open:
         reply_to_provider_message_id: str | None = None
@@ -1115,6 +1772,9 @@ async def _handle_operator_relay(
             mode,
         )
 
+        if await _pause_for_meta_circuit("text"):
+            return
+
         wamid, err = await safe_send(
             provider=meta_provider,
             sender_id=sender_id,
@@ -1125,6 +1785,8 @@ async def _handle_operator_relay(
         )
 
         if err is not None:
+            if await _close_circuit_on_transient_send_error("text", err):
+                return
             logger.warning(
                 "operator_relay: send failed phone=%s sender_id=%s err=%s",
                 phone_e164,
@@ -1287,6 +1949,9 @@ async def _handle_operator_relay(
     if param_mode == "contact_name":
         params = [contact_name]
 
+    if await _pause_for_meta_circuit("template", template_name=template_name):
+        return
+
     wamid, err = await safe_send_template(
         provider=meta_provider,
         sender_id=sender_id,
@@ -1298,6 +1963,8 @@ async def _handle_operator_relay(
     )
 
     if err is not None:
+        if await _close_circuit_on_transient_send_error("template", err):
+            return
         logger.warning(
             "operator_relay: reopen template failed phone=%s sender_id=%s template=%s err=%s",
             phone_e164,
@@ -1437,17 +2104,19 @@ async def handle_event(
             event.error = "operator_relay: disabled by chatwoot_operator_relay_enabled"
         return
 
+    chatwoot_origin = _is_chatwoot_origin(event, payload)
+
     # ------------------------------------------------------------------ #
     # 1. Delivery status webhooks (value.statuses)                        #
     # ------------------------------------------------------------------ #
-    status_updates = _extract_status_updates(payload)
-    if status_updates:
+    statuses = [] if chatwoot_origin else _extract_statuses(payload)
+    if statuses:
         logger.info(
             "status_webhook: received %d status update(s) event_id=%s",
-            len(status_updates),
+            len(statuses),
             event.id,
         )
-        run_ids = await _apply_status_updates(session, status_updates)
+        run_ids = await _handle_delivery_statuses(session, event, statuses)
         for run_id in run_ids:
             try:
                 await recompute_campaign_run_stats(session, run_id)
@@ -1473,8 +2142,6 @@ async def handle_event(
     reply_to_provider_message_id = action.get("reply_to_provider_message_id")
 
     sender_id, company_id = await _pick_sender(session, phone_number_id)
-
-    chatwoot_origin = _is_chatwoot_origin(event, payload)
 
     # Audit: keep the inbound wamid of real Meta-origin messages.  Chatwoot
     # mirrors carry a synthetic Chatwoot message id there, so they are skipped.

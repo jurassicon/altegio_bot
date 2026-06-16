@@ -73,6 +73,56 @@ docker compose up -d postgres
 docker compose --profile ops run --rm migrate
 ```
 
+### Meta Circuit Breaker And Delivery Retry
+
+Transient Meta Cloud API outages are guarded by a global, fail-open circuit breaker stored in
+`meta_circuit_breaker`. While the circuit state is `closed`, outbox sends are paused and requeued
+instead of burning attempts or writing failed outbox rows. The `altegio-meta-guard-worker` service
+probes Meta with a safe phone-number metadata GET request and returns the circuit to `open` after a
+successful probe. The app never stops or starts Docker containers from application code.
+
+The guard probe intentionally does not send a customer WhatsApp message. It only reads phone-number
+metadata, so it can occasionally succeed before Meta's `/messages` endpoint is fully healthy. If the
+first real send still gets a transient Meta/network error, the outbox worker closes the circuit again
+and requeues without consuming the send-attempt budget. This is a production-safe compromise: recovery
+checks avoid duplicate customer messages, while real sends remain protected by the circuit.
+
+Production deploy order:
+
+```bash
+docker compose -p altegio_bot build altegio-api altegio-inbox-worker altegio-outbox-worker altegio-whatsapp-inbox-worker altegio-campaign-worker altegio-meta-guard-worker migrate
+docker compose -p altegio_bot --profile ops run --rm migrate
+docker compose -p altegio_bot up -d altegio-api altegio-inbox-worker altegio-outbox-worker altegio-whatsapp-inbox-worker altegio-campaign-worker altegio-meta-guard-worker
+```
+
+Operational checks:
+
+```bash
+docker compose -p altegio_bot ps altegio-meta-guard-worker
+docker compose -p altegio_bot logs --tail=100 altegio-meta-guard-worker
+docker compose -p altegio_bot exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c '\d meta_circuit_breaker'
+docker compose -p altegio_bot exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c 'select scope, state, reason, next_probe_at, probe_attempts from meta_circuit_breaker;'
+```
+
+There are two retry paths:
+
+- Send-time Meta or network failures pause outbound sends through the circuit and requeue eligible
+  jobs with deadline-aware delays. Marketing-style jobs use a 24 hour retry cap; service and
+  reminder jobs use the booking/reminder deadline.
+- WhatsApp `failed` delivery webhooks can create `delivery_failed_retry` jobs for service and
+  pre-appointment messages only. Marketing, campaign, newsletter, promo, and follow-up sends are
+  excluded from this delivery-failure retry chain.
+
+Operator relay messages are human-driven Chatwoot messages and are not auto-retried. When the Meta
+circuit is closed, or a transient Meta send error closes it, the relay writes a canceled audit row
+with a non-PII placeholder body and sends a static private note to the operator. The original
+operator message is not copied into the canceled audit row, error, or circuit metadata; the operator
+can still see their original Chatwoot message in the conversation and resend it manually after
+recovery.
+
+Current scope: the circuit is global and the guard probes the first active WhatsApp sender. A
+per-sender circuit can be added later if Meta outages need to be isolated by phone-number id.
+
 ## Testing
 
 ### 🧪 Loyalty Card Creation Testing

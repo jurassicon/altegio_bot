@@ -17,6 +17,84 @@ def _strip_plus(phone_e164: str) -> str:
     return phone_e164.lstrip("+").strip()
 
 
+class MetaCloudError(RuntimeError):
+    """Safe Meta Cloud API error with structured, non-PII fields."""
+
+    def __init__(
+        self,
+        action: str,
+        *,
+        status_code: int | None,
+        meta_code: str | None,
+        is_transient: bool | None,
+        safe_message: str | None = None,
+        fbtrace_id: str | None = None,
+    ) -> None:
+        self.action = action
+        self.status_code = status_code
+        self.meta_code = meta_code
+        self.is_transient = is_transient
+        self.safe_message = safe_message
+        self.fbtrace_id = fbtrace_id
+        super().__init__(self.__str__())
+
+    def __str__(self) -> str:
+        bits = [
+            f"Meta {self.action} failed",
+            f"status={self.status_code}" if self.status_code is not None else "status=None",
+            f"code={self.meta_code}" if self.meta_code is not None else "code=None",
+            f"is_transient={str(self.is_transient).lower()}" if self.is_transient is not None else "is_transient=None",
+        ]
+        if self.safe_message:
+            bits.append(f"message={self.safe_message}")
+        if self.fbtrace_id:
+            bits.append(f"fbtrace_id={self.fbtrace_id}")
+        return " ".join(bits)
+
+
+def _safe_meta_message_marker(err: dict[str, Any]) -> str | None:
+    message = str(err.get("message") or "").lower()
+    title = str(err.get("title") or "").strip()
+    error_type = str(err.get("type") or "").strip()
+
+    if "access token" in message and "expired" in message:
+        return "access token expired"
+    if any(
+        marker in message
+        for marker in (
+            "number of parameters does not match",
+            "does not match the expected number of params",
+            "required parameter is missing",
+            "template does not exist",
+            "template name does not exist",
+            "does not exist in the translation",
+        )
+    ):
+        return "template validation error"
+    if title:
+        return title[:80]
+    if error_type:
+        return error_type[:80]
+    return None
+
+
+def _meta_error_from_response(action: str, response: Any, data: dict[str, Any]) -> MetaCloudError:
+    err = data.get("error") if isinstance(data, dict) else None
+    if not isinstance(err, dict):
+        err = {}
+    meta_code = err.get("code")
+    is_transient = err.get("is_transient")
+    fbtrace_id = err.get("fbtrace_id")
+    return MetaCloudError(
+        action,
+        status_code=getattr(response, "status_code", None),
+        meta_code=str(meta_code) if meta_code is not None else None,
+        is_transient=bool(is_transient) if isinstance(is_transient, bool) else None,
+        safe_message=_safe_meta_message_marker(err),
+        fbtrace_id=str(fbtrace_id)[:80] if fbtrace_id else None,
+    )
+
+
 class MetaCloudProvider(WhatsAppProvider):
     def __init__(
         self,
@@ -69,6 +147,25 @@ class MetaCloudProvider(WhatsAppProvider):
     def _headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self._access_token}"}
 
+    async def check_metadata(self, phone_number_id: str, *, timeout: float | None = None) -> None:
+        """Read phone-number metadata as a safe Meta availability probe."""
+        url = f"{self._graph_url}/{self._api_version}/{phone_number_id}"
+        params = {"fields": "id,display_phone_number,verified_name"}
+        res = await self._client.get(
+            url,
+            headers=self._headers(),
+            params=params,
+            timeout=timeout,
+        )
+
+        if res.status_code >= 400:
+            data: dict[str, Any] = {}
+            try:
+                data = res.json()
+            except Exception:
+                data = {}
+            raise _meta_error_from_response("metadata probe", res, data)
+
     async def send(
         self,
         sender_id: int,
@@ -108,11 +205,7 @@ class MetaCloudProvider(WhatsAppProvider):
             data = {}
 
         if res.status_code >= 400:
-            err = data.get("error") if isinstance(data, dict) else None
-            msg = None
-            if isinstance(err, dict):
-                msg = err.get("message")
-            raise RuntimeError(f"Meta send failed status={res.status_code} body={msg or data}")
+            raise _meta_error_from_response("send", res, data)
 
         messages = data.get("messages") if isinstance(data, dict) else None
         if isinstance(messages, list) and messages:
@@ -187,13 +280,7 @@ class MetaCloudProvider(WhatsAppProvider):
             data = {}
 
         if res.status_code >= 400:
-            err = data.get("error") if isinstance(data, dict) else None
-            msg = None
-            if isinstance(err, dict):
-                msg = err.get("message")
-            raise RuntimeError(
-                f"Meta send_template failed status={res.status_code} template={template_name} body={msg or data}"
-            )
+            raise _meta_error_from_response("send_template", res, data)
 
         messages = data.get("messages") if isinstance(data, dict) else None
         if isinstance(messages, list) and messages:

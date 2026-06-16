@@ -525,6 +525,47 @@ class ContactRateLimit(Base):
     )
 
 
+class MetaCircuitBreaker(Base):
+    """Global Meta send circuit state, one row per scope.
+
+    Shared by outbox workers and the meta guard worker through Postgres.
+    State names are intentionally inverted compared with the classic breaker:
+    open means sends are allowed, closed means sends are paused, and half_open
+    means a recovery probe is in progress.
+    """
+
+    __tablename__ = "meta_circuit_breaker"
+
+    scope: Mapped[str] = mapped_column(String(64), primary_key=True)
+    state: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        default="open",
+        server_default=text("'open'"),
+    )
+    reason: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    opened_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+    next_probe_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    probe_token: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    probe_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    probe_lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    probe_attempts: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default=text("0"),
+    )
+    last_error_kind: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    last_error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+
 class WhatsAppSender(Base):
     __tablename__ = "whatsapp_senders"
 
