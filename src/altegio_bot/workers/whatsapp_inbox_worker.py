@@ -29,6 +29,10 @@ from altegio_bot.perf import perf_log
 from altegio_bot.providers.base import WhatsAppProvider
 from altegio_bot.providers.dummy import safe_send, safe_send_template
 from altegio_bot.services import meta_circuit
+from altegio_bot.services.meta_error_classifier import (
+    is_transient_provider_error,
+    transient_error_reason,
+)
 from altegio_bot.settings import settings
 from altegio_bot.whatsapp_window import is_whatsapp_customer_window_open, normalize_phone
 from altegio_bot.workers.promo_lead_handler import (
@@ -1590,6 +1594,15 @@ async def _handle_operator_relay(
             company_id,
         )
 
+        await _send_circuit_pause_note(outbox)
+        return True
+
+    async def _send_circuit_pause_note(outbox: OutboxMessage) -> None:
+        """Add the operator-facing 'Meta unavailable' Chatwoot private note.
+
+        Static, PII-free text; records private_note_status on the outbox meta.
+        Shared by the pre-send pause path and the transient-error close path.
+        """
         if settings.chatwoot_operator_reopen_private_note_enabled and conversation_id:
             private_note = (
                 "Meta/WhatsApp ist voruebergehend nicht erreichbar. "
@@ -1615,6 +1628,82 @@ async def _handle_operator_relay(
                 await cw.aclose()
         else:
             outbox.meta = {**outbox.meta, "private_note_status": "disabled"}
+
+    async def _close_circuit_on_transient_send_error(attempted_send_type: str, err: str) -> bool:
+        """Close the Meta circuit when an operator-relay send fails transiently.
+
+        Returns True when the error was transient and fully handled here: the
+        global circuit is closed, a canceled audit OutboxMessage is written, and
+        the operator is notified. Returns False for permanent/token-expired
+        errors so the caller keeps its existing permanent-failure handling.
+
+        Makes no additional Meta calls and never triggers template fallback.
+        Audit fields and logs are restricted to non-PII data (event/outbox ids,
+        company, provider class, phone_number_id, circuit state, error kind/code).
+        """
+        if not settings.meta_circuit_breaker_enabled:
+            return False
+        if not is_transient_provider_error(err):
+            return False
+
+        error_kind, error_code = transient_error_reason(err)
+        await meta_circuit.close_meta_circuit(
+            reason="operator_relay_transient_send_error",
+            error_kind=error_kind,
+            error_code=error_code,
+            next_probe_at=utcnow() + timedelta(seconds=settings.meta_circuit_probe_initial_delay_seconds),
+        )
+
+        now_closed = utcnow()
+        meta = {
+            "send_type": "none",
+            "attempted_send_type": attempted_send_type,
+            "cancel_reason": "meta_transient_send_error",
+            "circuit_action": "closed",
+            "circuit_state": "closed",
+            "event_id": getattr(event, "id", None),
+            "provider": type(meta_provider).__name__,
+            "phone_number_id": phone_number_id,
+            "error_kind": error_kind,
+            "error_code": error_code,
+        }
+        outbox = OutboxMessage(
+            company_id=company_id,
+            client_id=None,
+            record_id=None,
+            job_id=None,
+            sender_id=sender_id,
+            phone_e164=phone_e164,
+            template_code="operator_relay",
+            language="de",
+            body=text,
+            status="canceled",
+            provider_message_id=None,
+            scheduled_at=now_closed,
+            sent_at=None,
+            message_source="operator",
+            chatwoot_conversation_id=cw_conversation_id,
+            chatwoot_message_id=cw_message_id,
+            error="Meta transient error: operator relay paused and circuit closed",
+            meta=meta,
+        )
+        session.add(outbox)
+        await session.flush()
+        event.error = "operator_relay: Meta transient error, circuit closed"
+        logger.warning(
+            "operator_relay: transient Meta error closed circuit; canceled "
+            "conv_id=%s msg_id=%s outbox_id=%s company_id=%s provider=%s "
+            "phone_number_id=%s error_kind=%s error_code=%s",
+            conversation_id,
+            chatwoot_message_id,
+            outbox.id,
+            company_id,
+            type(meta_provider).__name__,
+            phone_number_id,
+            error_kind,
+            error_code,
+        )
+        await _send_circuit_pause_note(outbox)
         return True
 
     # ── Branch: window open → send as free-form text ──────────────────────
@@ -1670,6 +1759,8 @@ async def _handle_operator_relay(
         )
 
         if err is not None:
+            if await _close_circuit_on_transient_send_error("text", err):
+                return
             logger.warning(
                 "operator_relay: send failed phone=%s sender_id=%s err=%s",
                 phone_e164,
@@ -1846,6 +1937,8 @@ async def _handle_operator_relay(
     )
 
     if err is not None:
+        if await _close_circuit_on_transient_send_error("template", err):
+            return
         logger.warning(
             "operator_relay: reopen template failed phone=%s sender_id=%s template=%s err=%s",
             phone_e164,

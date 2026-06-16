@@ -656,6 +656,126 @@ async def test_failed_code_10_permission_marks_failed_without_retry(session_make
 
 
 @pytest.mark.asyncio
+async def test_failed_code_10_ambiguous_wording_stays_permanent(session_maker) -> None:
+    """code=10 with BOTH a transient ('temporarily') and permanent ('access')
+    hint stays permanent.
+
+    This pins the intended wording trade-off: for code=10, permanent keywords
+    take precedence over transient ones, so an ambiguous failure is never
+    auto-retried (fail-safe against silently retrying a real permission/auth
+    problem).
+    """
+    _, _, outbox_id = await _setup_service_outbox(session_maker, job_type="record_created")
+    payload = _failed_status_payload(
+        PHONE_NUMBER_ID,
+        WAMID,
+        code=10,
+        title="Service temporarily unavailable",
+        details="access restricted for this number",
+    )
+
+    async with session_maker() as session:
+        async with session.begin():
+            evt = WhatsAppEvent(
+                dedupe_key="wa:failed-code-10-ambiguous",
+                status="received",
+                payload=payload,
+                query={},
+                headers={},
+            )
+            session.add(evt)
+            await session.flush()
+            await handle_event(session, evt, _NullProvider())
+
+    async with session_maker() as session:
+        ob = await session.get(OutboxMessage, outbox_id)
+        assert ob is not None
+        assert ob.status == "failed"
+        stmt = select(MessageJob).where(MessageJob.dedupe_key == f"delivery_retry:{outbox_id}:1")
+        retry = (await session.execute(stmt)).scalar_one_or_none()
+        assert retry is None
+
+
+@pytest.mark.asyncio
+async def test_failed_code_10_unknown_wording_defaults_permanent(session_maker) -> None:
+    """code=10 with no permanent and no transient hint defaults to permanent.
+
+    code=10 is no longer unconditionally retryable; absent an explicit transient
+    hint it is treated as permanent (no delivery retry).
+    """
+    _, _, outbox_id = await _setup_service_outbox(session_maker, job_type="record_created")
+    payload = _failed_status_payload(
+        PHONE_NUMBER_ID,
+        WAMID,
+        code=10,
+        title="Generic delivery failure",
+        details="unspecified",
+    )
+
+    async with session_maker() as session:
+        async with session.begin():
+            evt = WhatsAppEvent(
+                dedupe_key="wa:failed-code-10-unknown",
+                status="received",
+                payload=payload,
+                query={},
+                headers={},
+            )
+            session.add(evt)
+            await session.flush()
+            await handle_event(session, evt, _NullProvider())
+
+    async with session_maker() as session:
+        ob = await session.get(OutboxMessage, outbox_id)
+        assert ob is not None
+        assert ob.status == "failed"
+        stmt = select(MessageJob).where(MessageJob.dedupe_key == f"delivery_retry:{outbox_id}:1")
+        retry = (await session.execute(stmt)).scalar_one_or_none()
+        assert retry is None
+
+
+@pytest.mark.asyncio
+async def test_failed_code_10_transient_only_wording_retries(session_maker) -> None:
+    """code=10 with ONLY a transient hint (no permission/auth/access wording)
+    is the explicit escape hatch and schedules a delivery retry.
+
+    This documents that the permanent-by-default for code=10 can still be
+    overridden by an unambiguous transient signal.
+    """
+    _, _, outbox_id = await _setup_service_outbox(session_maker, job_type="record_created")
+    payload = _failed_status_payload(
+        PHONE_NUMBER_ID,
+        WAMID,
+        code=10,
+        title="Please try again later",
+        details="service temporarily overloaded",
+    )
+
+    async with session_maker() as session:
+        async with session.begin():
+            evt = WhatsAppEvent(
+                dedupe_key="wa:failed-code-10-transient",
+                status="received",
+                payload=payload,
+                query={},
+                headers={},
+            )
+            session.add(evt)
+            await session.flush()
+            await handle_event(session, evt, _NullProvider())
+
+    async with session_maker() as session:
+        ob = await session.get(OutboxMessage, outbox_id)
+        assert ob is not None
+        assert ob.status == "failed"
+        stmt = select(MessageJob).where(MessageJob.dedupe_key == f"delivery_retry:{outbox_id}:1")
+        retry = (await session.execute(stmt)).scalar_one_or_none()
+        assert retry is not None
+        assert retry.status == "queued"
+        assert retry.payload["delivery_retry_of_outbox_id"] == outbox_id
+
+
+@pytest.mark.asyncio
 async def test_failed_transient_code_schedules_service_delivery_retry(session_maker) -> None:
     _, _, outbox_id = await _setup_service_outbox(session_maker, job_type="record_created")
     payload = _failed_status_payload(PHONE_NUMBER_ID, WAMID, code=131000, title="Temporary failure")

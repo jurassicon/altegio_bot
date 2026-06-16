@@ -33,6 +33,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
 
+import altegio_bot.workers.whatsapp_inbox_worker as wiw
 from altegio_bot.models.models import OutboxMessage, WhatsAppEvent, WhatsAppSender
 from altegio_bot.providers.base import WhatsAppProvider
 from altegio_bot.services import meta_circuit as mc
@@ -2774,3 +2775,303 @@ async def test_private_note_only_note_failure_surfaced(session_maker, monkeypatc
     assert "private note failed" in ob.error
     assert ob.meta.get("private_note_status") == "failed"
     assert ob.meta.get("private_note_error") is not None
+
+
+# ---------------------------------------------------------------------------
+# P1: operator relay closes the Meta circuit on the first transient send error
+# ---------------------------------------------------------------------------
+
+
+class _TransientSendErrorProvider(WhatsAppProvider):
+    """Provider that records the attempt, then fails with a fixed error string.
+
+    Used to simulate Meta/network errors surfaced by ``safe_send`` /
+    ``safe_send_template`` (which return ``str(exc)`` as the error).
+    """
+
+    def __init__(self, err_message: str) -> None:
+        self.err_message = err_message
+        self.sent: list[dict[str, Any]] = []
+        self.templates_sent: list[dict[str, Any]] = []
+
+    async def send(
+        self,
+        sender_id: int,
+        phone_e164: str,
+        text: str,
+        *,
+        contact_name: str | None = None,
+        reply_to_provider_message_id: str | None = None,
+    ) -> str:
+        self.sent.append({"phone_e164": phone_e164})
+        raise RuntimeError(self.err_message)
+
+    async def send_template(
+        self,
+        sender_id: int,
+        phone_e164: str,
+        template_name: str,
+        language: str,
+        params: list[str],
+        fallback_text: str = "",
+        *,
+        contact_name: str | None = None,
+        header_image_url: str | None = None,
+    ) -> str:
+        self.templates_sent.append({"template_name": template_name})
+        raise RuntimeError(self.err_message)
+
+
+def _patch_circuit_close_to_test_db(monkeypatch, session_maker) -> None:
+    """Route the worker's circuit close through the test DB session factory.
+
+    The worker calls ``meta_circuit.close_meta_circuit()`` with no factory (the
+    global ``SessionLocal``). In tests we redirect it to the function-scoped
+    ``session_maker`` so the real circuit state lands in the test database and
+    can be asserted end-to-end. The original function is captured first to
+    avoid recursing into the patched name.
+    """
+    real_close = mc.close_meta_circuit
+
+    async def _close_via_test_db(**kwargs: Any) -> None:
+        await real_close(session_factory=session_maker, **kwargs)
+
+    monkeypatch.setattr(wiw.meta_circuit, "close_meta_circuit", _close_via_test_db)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "err_message, expected_kind, expected_code",
+    [
+        ("Meta send failed status=500", "http", "500"),
+        ("Meta send failed status=400 code=2", "meta_code", "2"),
+        ("Meta send failed status=400 is_transient=true", "is_transient", None),
+    ],
+)
+async def test_operator_relay_text_transient_error_closes_circuit(
+    session_maker,
+    monkeypatch,
+    err_message: str,
+    expected_kind: str,
+    expected_code: str | None,
+) -> None:
+    """Window-open text send returns a transient error → circuit closes.
+
+    The send is attempted once, no template fallback runs, the circuit is
+    closed with a safe reason, and a PII-free canceled audit row is written.
+    """
+    monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
+    _patch_circuit_close_to_test_db(monkeypatch, session_maker)
+
+    provider = _TransientSendErrorProvider(err_message)
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _make_sender(session, sender_id=300, company_id=7, phone_number_id="PNID_TRANSIENT")
+            _meta_inbound_event(session, phone="+49321000111", dedupe_key="meta:inbound:transient:text")
+            evt = WhatsAppEvent(
+                dedupe_key="chatwoot_out:transient:text",
+                status="received",
+                error=None,
+                query={},
+                headers={},
+                payload=_operator_relay_payload(
+                    recipient_phone="+49321000111",
+                    text="Transient please",
+                    conversation_id=7010,
+                    message_id=7020,
+                    phone_number_id="PNID_TRANSIENT",
+                ),
+                chatwoot_conversation_id=7010,
+            )
+            session.add(evt)
+            await session.flush()
+
+            from altegio_bot.settings import settings as _s
+
+            orig_relay = _s.chatwoot_operator_relay_enabled
+            orig_cb = _s.meta_circuit_breaker_enabled
+            orig_note = _s.chatwoot_operator_reopen_private_note_enabled
+            _s.chatwoot_operator_relay_enabled = True
+            _s.meta_circuit_breaker_enabled = True
+            _s.chatwoot_operator_reopen_private_note_enabled = False
+            try:
+                await handle_event(session, evt, provider)
+            finally:
+                _s.chatwoot_operator_relay_enabled = orig_relay
+                _s.meta_circuit_breaker_enabled = orig_cb
+                _s.chatwoot_operator_reopen_private_note_enabled = orig_note
+
+    # The send was attempted exactly once; no template fallback.
+    assert len(provider.sent) == 1
+    assert provider.templates_sent == []
+
+    # The circuit is now closed with the safe operator-relay reason.
+    state = await mc.get_meta_circuit_state(session_factory=session_maker)
+    assert state.state == "closed"
+    assert state.reason == "operator_relay_transient_send_error"
+    assert state.last_error_kind == expected_kind
+    assert state.last_error_code == expected_code
+
+    # A canceled, PII-free audit row was written.
+    async with session_maker() as session:
+        outbox = (
+            await session.execute(select(OutboxMessage).where(OutboxMessage.chatwoot_conversation_id == 7010))
+        ).scalar_one()
+    assert outbox.status == "canceled"
+    assert outbox.provider_message_id is None
+    assert outbox.error == "Meta transient error: operator relay paused and circuit closed"
+    assert outbox.meta["cancel_reason"] == "meta_transient_send_error"
+    assert outbox.meta["attempted_send_type"] == "text"
+    assert outbox.meta["circuit_state"] == "closed"
+    assert outbox.meta["error_kind"] == expected_kind
+    assert outbox.meta["error_code"] == expected_code
+    assert outbox.meta["phone_number_id"] == "PNID_TRANSIENT"
+    # No PII leaked into the audit metadata.
+    assert "agent_name" not in outbox.meta
+    assert "reply_to_chatwoot_message_id" not in outbox.meta
+    assert "content_attributes" not in outbox.meta
+
+
+@pytest.mark.asyncio
+async def test_operator_relay_template_transient_error_closes_circuit(session_maker, monkeypatch) -> None:
+    """Window-closed reopen-template send returns a transient error → circuit closes."""
+    monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
+    _patch_circuit_close_to_test_db(monkeypatch, session_maker)
+
+    provider = _TransientSendErrorProvider("Meta send_template failed status=503")
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _make_sender(session, sender_id=301, company_id=8, phone_number_id="PNID_TRANSIENT_TPL")
+            # No inbound event → 24h window closed → reopen-template branch.
+            evt = WhatsAppEvent(
+                dedupe_key="chatwoot_out:transient:template",
+                status="received",
+                error=None,
+                query={},
+                headers={},
+                payload=_operator_relay_payload(
+                    recipient_phone="+49321000222",
+                    text="Transient template please",
+                    conversation_id=7011,
+                    message_id=7021,
+                    phone_number_id="PNID_TRANSIENT_TPL",
+                ),
+                chatwoot_conversation_id=7011,
+            )
+            session.add(evt)
+            await session.flush()
+
+            from altegio_bot.settings import settings as _s
+
+            orig_relay = _s.chatwoot_operator_relay_enabled
+            orig_cb = _s.meta_circuit_breaker_enabled
+            orig_mode = _s.chatwoot_operator_closed_window_mode
+            orig_name = _s.chatwoot_operator_reopen_template_name
+            orig_note = _s.chatwoot_operator_reopen_private_note_enabled
+            _s.chatwoot_operator_relay_enabled = True
+            _s.meta_circuit_breaker_enabled = True
+            _s.chatwoot_operator_closed_window_mode = "reopen_template"
+            _s.chatwoot_operator_reopen_template_name = "test_reopen_tpl"
+            _s.chatwoot_operator_reopen_private_note_enabled = False
+            try:
+                await handle_event(session, evt, provider)
+            finally:
+                _s.chatwoot_operator_relay_enabled = orig_relay
+                _s.meta_circuit_breaker_enabled = orig_cb
+                _s.chatwoot_operator_closed_window_mode = orig_mode
+                _s.chatwoot_operator_reopen_template_name = orig_name
+                _s.chatwoot_operator_reopen_private_note_enabled = orig_note
+
+    # The template send was attempted once; no free-form text send.
+    assert len(provider.templates_sent) == 1
+    assert provider.sent == []
+
+    state = await mc.get_meta_circuit_state(session_factory=session_maker)
+    assert state.state == "closed"
+    assert state.reason == "operator_relay_transient_send_error"
+    assert state.last_error_kind == "http"
+    assert state.last_error_code == "503"
+
+    async with session_maker() as session:
+        outbox = (
+            await session.execute(select(OutboxMessage).where(OutboxMessage.chatwoot_conversation_id == 7011))
+        ).scalar_one()
+    assert outbox.status == "canceled"
+    assert outbox.error == "Meta transient error: operator relay paused and circuit closed"
+    assert outbox.meta["attempted_send_type"] == "template"
+    assert outbox.meta["circuit_state"] == "closed"
+    # Template params/name must not leak into the safe audit.
+    assert "template" not in outbox.meta
+    assert "attempted_template" not in outbox.meta
+
+
+@pytest.mark.asyncio
+async def test_operator_relay_permanent_error_does_not_close_circuit(session_maker, monkeypatch) -> None:
+    """A permanent (token-expired) send error must NOT close the circuit.
+
+    The existing permanent-failure path runs instead: event.error is set and no
+    audit OutboxMessage is created.
+    """
+    monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
+
+    close_calls: list[dict[str, Any]] = []
+
+    async def _record_close(**kwargs: Any) -> None:
+        close_calls.append(kwargs)
+
+    monkeypatch.setattr(wiw.meta_circuit, "close_meta_circuit", _record_close)
+
+    # Token-expired is permanent: code=190 / "access token expired".
+    provider = _TransientSendErrorProvider("Meta send failed status=401 code=190 access token expired")
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _make_sender(session, sender_id=302, company_id=9, phone_number_id="PNID_PERMANENT")
+            _meta_inbound_event(session, phone="+49321000333", dedupe_key="meta:inbound:permanent:text")
+            evt = WhatsAppEvent(
+                dedupe_key="chatwoot_out:permanent:text",
+                status="received",
+                error=None,
+                query={},
+                headers={},
+                payload=_operator_relay_payload(
+                    recipient_phone="+49321000333",
+                    text="Permanent error",
+                    conversation_id=7012,
+                    message_id=7022,
+                    phone_number_id="PNID_PERMANENT",
+                ),
+                chatwoot_conversation_id=7012,
+            )
+            session.add(evt)
+            await session.flush()
+            evt_id = evt.id
+
+            from altegio_bot.settings import settings as _s
+
+            orig_relay = _s.chatwoot_operator_relay_enabled
+            orig_cb = _s.meta_circuit_breaker_enabled
+            _s.chatwoot_operator_relay_enabled = True
+            _s.meta_circuit_breaker_enabled = True
+            try:
+                await handle_event(session, evt, provider)
+            finally:
+                _s.chatwoot_operator_relay_enabled = orig_relay
+                _s.meta_circuit_breaker_enabled = orig_cb
+
+    # Circuit close was never invoked.
+    assert close_calls == []
+
+    # Existing permanent-failure behaviour preserved.
+    async with session_maker() as session:
+        reloaded = await session.get(WhatsAppEvent, evt_id)
+    assert reloaded is not None
+    assert reloaded.error is not None
+    assert "send failed" in reloaded.error
+
+    # No audit OutboxMessage was created for the permanent error.
+    async with session_maker() as session:
+        result = await session.execute(select(OutboxMessage).where(OutboxMessage.chatwoot_conversation_id == 7012))
+        assert result.scalar_one_or_none() is None

@@ -536,3 +536,59 @@ async def test_hybrid_check_metadata_delegates_to_primary() -> None:
     await provider.check_metadata("PNID", timeout=3.0)
 
     assert calls == [("PNID", 3.0)]
+
+
+# ---------------------------------------------------------------------------
+# Shared error classifier: structured MetaCloudError fields + string fallback
+# ---------------------------------------------------------------------------
+
+
+def test_classifier_uses_structured_metacloud_error_fields() -> None:
+    """A MetaCloudError exposes status_code/meta_code/is_transient; the shared
+    classifier consumes them directly without re-parsing the string."""
+    from altegio_bot.services.meta_error_classifier import (
+        is_transient_provider_error,
+        transient_error_reason,
+    )
+
+    http = MetaCloudError("send", status_code=503, meta_code=None, is_transient=None)
+    assert is_transient_provider_error(http) is True
+    assert transient_error_reason(http) == ("http", "503")
+
+    flagged = MetaCloudError("send", status_code=400, meta_code=None, is_transient=True)
+    assert is_transient_provider_error(flagged) is True
+    assert transient_error_reason(flagged) == ("is_transient", None)
+
+    code2 = MetaCloudError("send", status_code=400, meta_code="2", is_transient=None)
+    assert is_transient_provider_error(code2) is True
+    assert transient_error_reason(code2) == ("meta_code", "2")
+
+
+def test_classifier_token_expired_metacloud_error_is_permanent() -> None:
+    """Token expiry is permanent even if Meta also marks is_transient=true."""
+    from altegio_bot.services.meta_error_classifier import is_transient_provider_error
+
+    err = MetaCloudError(
+        "send",
+        status_code=401,
+        meta_code="190",
+        is_transient=True,
+        safe_message="access token expired",
+    )
+    assert is_transient_provider_error(err) is False
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "{'code': 2, 'is_transient': True}",
+        '{"code":2,"is_transient":true}',
+        "Meta send failed status=500",
+        "Meta send failed status_code=500",
+    ],
+)
+def test_classifier_string_fallback_matches_dict_json_and_status(text: str) -> None:
+    """Stored/legacy string errors keep working via the regex fallback."""
+    from altegio_bot.services.meta_error_classifier import is_transient_provider_error
+
+    assert is_transient_provider_error(text) is True

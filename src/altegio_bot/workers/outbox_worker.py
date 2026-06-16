@@ -56,6 +56,13 @@ from altegio_bot.promo_discount_apply import process_promo_apply_existing_bookin
 from altegio_bot.providers.base import WhatsAppProvider
 from altegio_bot.providers.dummy import safe_send, safe_send_template
 from altegio_bot.services import meta_circuit
+from altegio_bot.services.meta_error_classifier import (
+    is_permanent_meta_template_error,
+    is_text_window_policy_error,
+    is_token_expired_error,
+    is_transient_provider_error,
+    transient_error_reason,
+)
 from altegio_bot.settings import settings
 from altegio_bot.template_validation import validate_template_params
 from altegio_bot.whatsapp_routing import pick_sender_code_for_record, pick_sender_id
@@ -106,23 +113,6 @@ _DELIVERED_READ_STATUSES = ("delivered", "read")
 _DEADLINE_ALREADY_PASSED = datetime(1970, 1, 1, tzinfo=timezone.utc)
 _MARKETING_TRANSIENT_RETRY_CAP = timedelta(hours=24)
 _ORIGINAL_RUN_AT_KEY = "_original_run_at"
-
-_TRANSIENT_HTTP_STATUS_RE = re.compile(r"\bstatus(?:_code)?=(429|500|502|503|504)\b")
-_TRANSIENT_META_CODE_RE = re.compile(r"""(?:(?:"code"|'code')\s*:\s*["']?2["']?|\bcode=2\b)""")
-_TRANSIENT_FLAG_RE = re.compile(r"""(?:(?:"is_transient"|'is_transient')\s*:\s*true|\bis_transient=true\b)""")
-_TRANSIENT_NETWORK_HINTS = (
-    "timeout",
-    "timed out",
-    "connection error",
-    "connect error",
-    "connecterror",
-    "connection reset",
-    "connection refused",
-    "connection aborted",
-    "network is unreachable",
-    "temporarily unavailable",
-    "temporary failure",
-)
 
 WA_131026_SUPPRESSIBLE_JOB_TYPES: tuple[str, ...] = (
     "review_3d",
@@ -893,88 +883,13 @@ async def _load_job(
     return None
 
 
-def _is_token_expired_error(err: str) -> bool:
-    low = err.lower()
-    return ("access token" in low and "expired" in low) or "code=190" in low
-
-
-def _is_permanent_meta_template_error(err: str) -> bool:
-    """Return True for permanent Meta template validation errors (HTTP 400).
-
-    These errors indicate a mis-configured template call; retrying will never succeed.
-    """
-    low = err.lower()
-    return any(
-        marker in low
-        for marker in (
-            "#132000",
-            "number of parameters does not match",
-            "does not match the expected number of params",
-            "required parameter is missing",
-            "template does not exist",
-            "template name does not exist",
-            "does not exist in the translation",
-            "template validation error",
-            "code=132000",
-            "code=132001",
-            "code=132005",
-            "code=132007",
-            "code=132012",
-            "code=132015",
-            "code=132016",
-        )
-    )
-
-
-def _is_text_window_policy_error(err: str) -> bool:
-    """Return True for deterministic Meta policy/window errors.
-
-    Only these errors trigger automatic template fallback after a failed text
-    send inside an open 24h window.  Ambiguous errors (timeouts, 5xx, unknown)
-    return False — the caller preserves normal retry behaviour to avoid
-    duplicate-send risk when the text may have been accepted but the response
-    was lost.
-    """
-    low = err.lower()
-    return any(
-        marker in low
-        for marker in (
-            "131047",
-            "24 hour",
-            "24-hour",
-            "outside the allowed window",
-            "customer service window",
-            "re-engagement message",
-        )
-    )
-
-
-def _is_transient_provider_error(err: str) -> bool:
-    if _is_token_expired_error(err):
-        return False
-    if _is_permanent_meta_template_error(err) or _is_text_window_policy_error(err):
-        return False
-
-    low = err.lower()
-    if _TRANSIENT_HTTP_STATUS_RE.search(low):
-        return True
-    if _TRANSIENT_FLAG_RE.search(low):
-        return True
-    if _TRANSIENT_META_CODE_RE.search(low):
-        return True
-    return any(hint in low for hint in _TRANSIENT_NETWORK_HINTS)
-
-
-def _transient_error_reason(err: str) -> tuple[str, str | None]:
-    low = err.lower()
-    m = _TRANSIENT_HTTP_STATUS_RE.search(low)
-    if m:
-        return "http", m.group(1)
-    if _TRANSIENT_FLAG_RE.search(low):
-        return "is_transient", None
-    if _TRANSIENT_META_CODE_RE.search(low):
-        return "meta_code", "2"
-    return "network", None
+# Backwards-compatible private aliases for the shared error classifier.
+# Internal call sites and tests reference these underscore names.
+_is_token_expired_error = is_token_expired_error
+_is_permanent_meta_template_error = is_permanent_meta_template_error
+_is_text_window_policy_error = is_text_window_policy_error
+_is_transient_provider_error = is_transient_provider_error
+_transient_error_reason = transient_error_reason
 
 
 def _decrement_send_attempt(job: MessageJob) -> None:
