@@ -1561,10 +1561,14 @@ async def _handle_operator_relay(
         """Build, persist and return a canceled operator-relay audit row.
 
         Single constructor for both Meta-circuit cancel paths so the safe
-        placeholder body and the row skeleton can never diverge. The operator's
-        message text is never written to the audit row — ``body``, ``error`` and
-        ``meta`` are PII-free; the original text only reaches the operator via
-        the Chatwoot private note.
+        placeholder body and the row skeleton can never diverge. The
+        helper-controlled ``body``, ``error`` and base circuit ``meta`` do not
+        include the operator message text, raw Meta response, tokens, or
+        template params. ``extra_meta`` is caller-controlled and may include
+        legacy relay audit fields (e.g. ``agent_name``, reply-context audit) for
+        compatibility, so callers must keep it intentionally scoped and must not
+        put raw Meta body, tokens, operator message text, or template params
+        into it.
         """
         meta: dict[str, Any] = {
             "send_type": "none",
