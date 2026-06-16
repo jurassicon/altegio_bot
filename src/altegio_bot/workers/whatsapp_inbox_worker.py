@@ -1410,6 +1410,12 @@ async def _forward_text_to_chatwoot(
     )
 
 
+# Safe placeholder bodies for canceled operator-relay audit rows. The operator's
+# original message text is intentionally never stored on these audit rows.
+_OPERATOR_RELAY_CIRCUIT_CLOSED_BODY = "[operator relay canceled: Meta circuit closed]"
+_OPERATOR_RELAY_TRANSIENT_BODY = "[operator relay canceled: Meta transient send error]"
+
+
 async def _handle_operator_relay(
     session: AsyncSession,
     event: WhatsAppEvent,
@@ -1541,27 +1547,41 @@ async def _handle_operator_relay(
 
     last_inbound_iso: str | None = last_inbound_at.isoformat() if last_inbound_at else None
 
-    async def _pause_for_meta_circuit(attempted_send_type: str, template_name: str | None = None) -> bool:
-        if not settings.meta_circuit_breaker_enabled:
-            return False
-        if not await meta_circuit.should_pause_meta_sends(session=session):
-            return False
+    async def _add_canceled_operator_relay_outbox(
+        *,
+        attempted_send_type: str,
+        cancel_reason: str,
+        body: str,
+        error: str,
+        circuit_action: str,
+        error_kind: str | None = None,
+        error_code: str | None = None,
+        extra_meta: dict[str, Any] | None = None,
+    ) -> OutboxMessage:
+        """Build, persist and return a canceled operator-relay audit row.
 
-        now_paused = utcnow()
-        meta = {
+        Single constructor for both Meta-circuit cancel paths so the safe
+        placeholder body and the row skeleton can never diverge. The operator's
+        message text is never written to the audit row — ``body``, ``error`` and
+        ``meta`` are PII-free; the original text only reaches the operator via
+        the Chatwoot private note.
+        """
+        meta: dict[str, Any] = {
             "send_type": "none",
             "attempted_send_type": attempted_send_type,
-            "wa_window_open": window_open,
-            "last_meta_inbound_at": last_inbound_iso,
-            "closed_window_mode": mode,
-            "cancel_reason": "meta_circuit_closed",
-            "chatwoot_conversation_id": conversation_id,
-            "chatwoot_message_id": chatwoot_message_id,
-            "agent_name": agent_name,
-            **reply_context_audit,
+            "cancel_reason": cancel_reason,
+            "circuit_action": circuit_action,
+            "circuit_state": "closed",
+            "event_id": getattr(event, "id", None),
+            "provider": type(meta_provider).__name__,
+            "phone_number_id": phone_number_id,
         }
-        if template_name:
-            meta["template"] = template_name
+        if error_kind is not None:
+            meta["error_kind"] = error_kind
+        if error_code is not None:
+            meta["error_code"] = error_code
+        if extra_meta:
+            meta.update(extra_meta)
 
         outbox = OutboxMessage(
             company_id=company_id,
@@ -1572,19 +1592,47 @@ async def _handle_operator_relay(
             phone_e164=phone_e164,
             template_code="operator_relay",
             language="de",
-            body=text,
+            body=body,
             status="canceled",
             provider_message_id=None,
-            scheduled_at=now_paused,
+            scheduled_at=utcnow(),
             sent_at=None,
             message_source="operator",
             chatwoot_conversation_id=cw_conversation_id,
             chatwoot_message_id=cw_message_id,
-            error="Meta circuit closed: operator relay paused",
+            error=error,
             meta=meta,
         )
         session.add(outbox)
         await session.flush()
+        return outbox
+
+    async def _pause_for_meta_circuit(attempted_send_type: str, template_name: str | None = None) -> bool:
+        if not settings.meta_circuit_breaker_enabled:
+            return False
+        if not await meta_circuit.should_pause_meta_sends(session=session):
+            return False
+
+        extra_meta: dict[str, Any] = {
+            "wa_window_open": window_open,
+            "last_meta_inbound_at": last_inbound_iso,
+            "closed_window_mode": mode,
+            "chatwoot_conversation_id": conversation_id,
+            "chatwoot_message_id": chatwoot_message_id,
+            "agent_name": agent_name,
+            **reply_context_audit,
+        }
+        if template_name:
+            extra_meta["template"] = template_name
+
+        outbox = await _add_canceled_operator_relay_outbox(
+            attempted_send_type=attempted_send_type,
+            cancel_reason="meta_circuit_closed",
+            body=_OPERATOR_RELAY_CIRCUIT_CLOSED_BODY,
+            error="Meta circuit closed: operator relay paused",
+            circuit_action="already_closed",
+            extra_meta=extra_meta,
+        )
         event.error = "operator_relay: Meta circuit closed"
         logger.warning(
             "operator_relay: Meta circuit closed; paused conv_id=%s msg_id=%s outbox_id=%s company_id=%s",
@@ -1654,41 +1702,15 @@ async def _handle_operator_relay(
             next_probe_at=utcnow() + timedelta(seconds=settings.meta_circuit_probe_initial_delay_seconds),
         )
 
-        now_closed = utcnow()
-        meta = {
-            "send_type": "none",
-            "attempted_send_type": attempted_send_type,
-            "cancel_reason": "meta_transient_send_error",
-            "circuit_action": "closed",
-            "circuit_state": "closed",
-            "event_id": getattr(event, "id", None),
-            "provider": type(meta_provider).__name__,
-            "phone_number_id": phone_number_id,
-            "error_kind": error_kind,
-            "error_code": error_code,
-        }
-        outbox = OutboxMessage(
-            company_id=company_id,
-            client_id=None,
-            record_id=None,
-            job_id=None,
-            sender_id=sender_id,
-            phone_e164=phone_e164,
-            template_code="operator_relay",
-            language="de",
-            body=text,
-            status="canceled",
-            provider_message_id=None,
-            scheduled_at=now_closed,
-            sent_at=None,
-            message_source="operator",
-            chatwoot_conversation_id=cw_conversation_id,
-            chatwoot_message_id=cw_message_id,
+        outbox = await _add_canceled_operator_relay_outbox(
+            attempted_send_type=attempted_send_type,
+            cancel_reason="meta_transient_send_error",
+            body=_OPERATOR_RELAY_TRANSIENT_BODY,
             error="Meta transient error: operator relay paused and circuit closed",
-            meta=meta,
+            circuit_action="closed",
+            error_kind=error_kind,
+            error_code=error_code,
         )
-        session.add(outbox)
-        await session.flush()
         event.error = "operator_relay: Meta transient error, circuit closed"
         logger.warning(
             "operator_relay: transient Meta error closed circuit; canceled "

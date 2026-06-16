@@ -581,14 +581,53 @@ def test_classifier_token_expired_metacloud_error_is_permanent() -> None:
 @pytest.mark.parametrize(
     "text",
     [
+        # operator relay receives string errors from safe_send / safe_send_template,
+        # so the string fallback must cover all transient signal forms.
         "{'code': 2, 'is_transient': True}",
         '{"code":2,"is_transient":true}',
         "Meta send failed status=500",
         "Meta send failed status_code=500",
+        "Meta send failed status=400 code=2",
+        "Meta send failed status=400 is_transient=true",
     ],
 )
 def test_classifier_string_fallback_matches_dict_json_and_status(text: str) -> None:
-    """Stored/legacy string errors keep working via the regex fallback."""
+    """Stored/legacy string errors keep working via the regex fallback.
+
+    The classifier accepts both structured exceptions (MetaCloudError) and
+    sanitized string errors; this pins the string path used by operator relay.
+    """
     from altegio_bot.services.meta_error_classifier import is_transient_provider_error
 
     assert is_transient_provider_error(text) is True
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        # code 2 is the only transient code in this family; 200/230/270 are
+        # success/other codes and must NOT be matched as transient.
+        ('{"code":200}', False),
+        ('{"code":230}', False),
+        ('{"code":270}', False),
+        ('{"code":2}', True),
+        ("{'code': 200}", False),
+        ("{'code': 2}", True),
+        ('{"code": 2, "is_transient": true}', True),
+        ("{'code': 2, 'is_transient': True}", True),
+        ("code=200", False),
+        ("code=2", True),
+        ('"code":2', True),
+        ('"code": 2', True),
+    ],
+)
+def test_classifier_code_2_not_confused_with_2xx(text: str, expected: bool) -> None:
+    """The transient Meta code 2 regex must not match code 200/230/270.
+
+    A raw JSON/dict body containing ``"code":200`` previously matched the
+    ``code:2`` alternative because of the optional surrounding quotes; the
+    ``(?!\\d)`` guard now prevents that false positive.
+    """
+    from altegio_bot.services.meta_error_classifier import is_transient_provider_error
+
+    assert is_transient_provider_error(text) is expected

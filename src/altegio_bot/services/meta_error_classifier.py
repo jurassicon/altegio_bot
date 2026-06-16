@@ -28,7 +28,10 @@ _TRANSIENT_HTTP_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
 # (``status=500``/``status_code=500``, ``code=2``, ``is_transient=true``) and
 # Python-dict / JSON reprs of a raw Meta error body.
 _TRANSIENT_HTTP_STATUS_RE = re.compile(r"\bstatus(?:_code)?=(429|500|502|503|504)\b")
-_TRANSIENT_META_CODE_RE = re.compile(r"""(?:(?:"code"|'code')\s*:\s*["']?2["']?|\bcode=2\b)""")
+# The ``(?!\d)`` guard prevents ``"code":200`` / ``"code":230`` / ``"code":270``
+# from matching the transient Meta code 2 when the classifier is handed a raw
+# JSON/dict body instead of the sanitized ``code=2`` string form.
+_TRANSIENT_META_CODE_RE = re.compile(r"""(?:(?:"code"|'code')\s*:\s*["']?2["']?(?!\d)|\bcode=2\b)""")
 _TRANSIENT_FLAG_RE = re.compile(r"""(?:(?:"is_transient"|'is_transient')\s*:\s*true|\bis_transient=true\b)""")
 _TRANSIENT_NETWORK_HINTS = (
     "timeout",

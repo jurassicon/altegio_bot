@@ -113,6 +113,15 @@ There are two retry paths:
   pre-appointment messages only. Marketing, campaign, newsletter, promo, and follow-up sends are
   excluded from this delivery-failure retry chain.
 
+Operator relay is intentionally not auto-retried. Unlike outbox jobs, an operator relay message is
+a human-driven Chatwoot reply, so it is never automatically re-delivered later. If the circuit is
+already `closed` before the send, or if the operator relay is the first sender to hit a transient
+Meta/network error (which closes the circuit), the relay writes a safe canceled audit
+`OutboxMessage` and posts a Chatwoot private note telling the operator the message was not delivered.
+The operator resends manually once Meta recovers. The canceled audit row stores a non-PII placeholder
+body (not the operator's text); the original text is only surfaced to the operator via the private
+note.
+
 Current scope: the circuit is global and the guard probes the first active WhatsApp sender. A
 per-sender circuit can be added later if Meta outages need to be isolated by phone-number id.
 

@@ -683,6 +683,11 @@ async def test_operator_relay_circuit_closed_window_open_cancels_without_meta_se
         assert outbox.error == "Meta circuit closed: operator relay paused"
         assert outbox.meta["cancel_reason"] == "meta_circuit_closed"
         assert outbox.meta["attempted_send_type"] == "text"
+        # The operator's text must never be stored on the audit row.
+        assert outbox.body == "[operator relay canceled: Meta circuit closed]"
+        assert outbox.body != "Pause this operator message"
+        assert "Pause this operator message" not in (outbox.error or "")
+        assert "Pause this operator message" not in json.dumps(outbox.meta)
 
 
 @pytest.mark.asyncio
@@ -747,6 +752,11 @@ async def test_operator_relay_circuit_closed_reopen_template_cancels_without_met
         assert outbox.meta["cancel_reason"] == "meta_circuit_closed"
         assert outbox.meta["attempted_send_type"] == "template"
         assert outbox.meta["template"] == "test_reopen_tpl"
+        # The operator's text must never be stored on the audit row.
+        assert outbox.body == "[operator relay canceled: Meta circuit closed]"
+        assert outbox.body != "Pause template"
+        assert "Pause template" not in (outbox.error or "")
+        assert "Pause template" not in json.dumps(outbox.meta)
 
 
 # ---------------------------------------------------------------------------
@@ -2925,12 +2935,18 @@ async def test_operator_relay_text_transient_error_closes_circuit(
     assert outbox.meta["attempted_send_type"] == "text"
     assert outbox.meta["circuit_state"] == "closed"
     assert outbox.meta["error_kind"] == expected_kind
-    assert outbox.meta["error_code"] == expected_code
+    # error_code is omitted from meta when None (is_transient/network kinds).
+    assert outbox.meta.get("error_code") == expected_code
     assert outbox.meta["phone_number_id"] == "PNID_TRANSIENT"
     # No PII leaked into the audit metadata.
     assert "agent_name" not in outbox.meta
     assert "reply_to_chatwoot_message_id" not in outbox.meta
     assert "content_attributes" not in outbox.meta
+    # The operator's text must never be stored on the audit row.
+    assert outbox.body == "[operator relay canceled: Meta transient send error]"
+    assert outbox.body != "Transient please"
+    assert "Transient please" not in (outbox.error or "")
+    assert "Transient please" not in json.dumps(outbox.meta)
 
 
 @pytest.mark.asyncio
@@ -3005,6 +3021,11 @@ async def test_operator_relay_template_transient_error_closes_circuit(session_ma
     # Template params/name must not leak into the safe audit.
     assert "template" not in outbox.meta
     assert "attempted_template" not in outbox.meta
+    # The operator's text must never be stored on the audit row.
+    assert outbox.body == "[operator relay canceled: Meta transient send error]"
+    assert outbox.body != "Transient template please"
+    assert "Transient template please" not in (outbox.error or "")
+    assert "Transient template please" not in json.dumps(outbox.meta)
 
 
 @pytest.mark.asyncio
