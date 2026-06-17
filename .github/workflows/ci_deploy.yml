@@ -252,8 +252,18 @@ jobs:
             $COMPOSE up -d --remove-orphans
 
             echo "🔎 Verifying Chatwoot internal network..."
-            CHATWOOT_NETWORK="${CHATWOOT_INTERNAL_NETWORK:-chatwoot_default}"
+            # Resolve the network name the override actually uses. Docker Compose
+            # applies .env here, so this stays correct even when
+            # CHATWOOT_INTERNAL_NETWORK is set only in .env and not exported in
+            # this SSH shell.
+            CHATWOOT_NETWORK="$($COMPOSE config --format json | python3 -c 'import json, sys; print(json.load(sys.stdin)["networks"]["chatwoot_internal"]["name"])')"
 
+            if [ -z "$CHATWOOT_NETWORK" ]; then
+              echo "❌ Failed to resolve chatwoot_internal network name from docker compose config"
+              exit 1
+            fi
+
+            echo "Resolved Chatwoot network: $CHATWOOT_NETWORK"
             docker network inspect "$CHATWOOT_NETWORK" >/dev/null
 
             WA_CONTAINER=$(docker ps \
@@ -270,12 +280,31 @@ jobs:
             docker inspect -f '{{json .NetworkSettings.Networks}}' "$WA_CONTAINER" \
               | grep -q "\"${CHATWOOT_NETWORK}\"" || {
                 echo "❌ $WA_CONTAINER is not attached to ${CHATWOOT_NETWORK}"
-                docker inspect -f '{{json .NetworkSettings.Networks}}' "$WA_CONTAINER"
+                docker inspect -f '{{json .NetworkSettings.Networks}}' "$WA_CONTAINER" | python3 -m json.tool || true
                 exit 1
               }
 
             echo "🔎 Verifying Chatwoot internal DNS..."
-            $COMPOSE exec -T altegio-whatsapp-inbox-worker sh -lc 'getent hosts rails >/dev/null'
+            # Resolve the Chatwoot host from the app's own settings so this check
+            # follows CHATWOOT_BASE_URL instead of a hardcoded hostname.
+            $COMPOSE exec -T altegio-whatsapp-inbox-worker sh -lc '
+            CHATWOOT_HOST=$(/app/.venv/bin/python - <<'"'"'PY'"'"'
+            from urllib.parse import urlparse
+            from altegio_bot.settings import settings
+
+            host = urlparse(settings.chatwoot_base_url).hostname
+            if not host:
+                raise SystemExit("CHATWOOT_BASE_URL host is empty")
+            print(host)
+            PY
+            )
+
+            echo "Resolved Chatwoot host: $CHATWOOT_HOST"
+            getent hosts "$CHATWOOT_HOST" >/dev/null || {
+              echo "❌ Cannot resolve Chatwoot host inside altegio-whatsapp-inbox-worker: $CHATWOOT_HOST"
+              exit 1
+            }
+            '
 
             echo "✅ Chatwoot internal route verified"
 
