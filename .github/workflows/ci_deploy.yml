@@ -251,46 +251,7 @@ jobs:
             echo "🚀 Starting updated containers..."
             $COMPOSE up -d --remove-orphans
 
-            echo "🔎 Verifying Chatwoot internal network..."
-            # Resolve the network name the override actually uses. Docker Compose
-            # applies .env here, so this stays correct even when
-            # CHATWOOT_INTERNAL_NETWORK is set only in .env and not exported in
-            # this SSH shell. No host Python/jq: the deploy host is only
-            # guaranteed to have Docker/Git and normal POSIX tools, so parse the
-            # rendered compose config with awk.
-            CHATWOOT_NETWORK="$($COMPOSE config | awk '
-              /^networks:/ {
-                in_networks = 1
-                next
-              }
-
-              in_networks && /^[^[:space:]]/ {
-                in_networks = 0
-                in_chatwoot = 0
-              }
-
-              in_networks && /^  chatwoot_internal:/ {
-                in_chatwoot = 1
-                next
-              }
-
-              in_chatwoot && /^  [^[:space:]][^:]*:/ {
-                in_chatwoot = 0
-              }
-
-              in_chatwoot && /^[[:space:]]+name:/ {
-                print $2
-                exit
-              }
-            ' | tr -d "\"'\''")"
-
-            if [ -z "$CHATWOOT_NETWORK" ]; then
-              echo "❌ Failed to resolve chatwoot_internal network name from docker compose config"
-              exit 1
-            fi
-
-            echo "Resolved Chatwoot network: $CHATWOOT_NETWORK"
-            docker network inspect "$CHATWOOT_NETWORK" >/dev/null
+            echo "🔎 Verifying Chatwoot internal route..."
 
             WA_CONTAINER=$(docker ps \
               --filter "label=com.docker.compose.project=altegio_bot" \
@@ -303,13 +264,65 @@ jobs:
               exit 1
             fi
 
-            docker inspect -f '{{json .NetworkSettings.Networks}}' "$WA_CONTAINER" \
-              | grep -Fq "\"${CHATWOOT_NETWORK}\"" || {
-                echo "❌ $WA_CONTAINER is not attached to ${CHATWOOT_NETWORK}"
-                echo "Container networks:"
-                docker inspect -f '{{range $name, $_ := .NetworkSettings.Networks}}{{println $name}}{{end}}' "$WA_CONTAINER" || true
+            echo "🔎 Resolving Chatwoot internal network from Docker Compose config..."
+            # Docker Compose applies .env while rendering config. Parse the JSON
+            # inside an app container so the deploy host needs no extra tools.
+            CHATWOOT_NETWORK="$($COMPOSE config --format json | $COMPOSE exec -T altegio-whatsapp-inbox-worker /app/.venv/bin/python -c '
+            import json
+            import sys
+
+            config = json.load(sys.stdin)
+            try:
+                name = config["networks"]["chatwoot_internal"]["name"]
+            except KeyError as exc:
+                raise SystemExit(f"chatwoot_internal network name is missing from compose config: {exc}")
+
+            if not name:
+                raise SystemExit("chatwoot_internal network name is empty")
+
+            print(name)
+            ')"
+
+            if [ -z "$CHATWOOT_NETWORK" ]; then
+              echo "❌ Failed to resolve chatwoot_internal network name from docker compose config"
+              exit 1
+            fi
+
+            echo "Resolved Chatwoot network: $CHATWOOT_NETWORK"
+            docker network inspect "$CHATWOOT_NETWORK" >/dev/null
+
+            echo "🔎 Verifying app containers are attached to Chatwoot network..."
+
+            CHATWOOT_SERVICES="
+            altegio-api
+            altegio-inbox-worker
+            altegio-outbox-worker
+            altegio-whatsapp-inbox-worker
+            altegio-campaign-worker
+            "
+
+            for SERVICE in $CHATWOOT_SERVICES; do
+              CONTAINER=$(docker ps \
+                --filter "label=com.docker.compose.project=altegio_bot" \
+                --filter "label=com.docker.compose.service=${SERVICE}" \
+                --format "{{.Names}}" \
+                | head -n 1)
+
+              if [ -z "$CONTAINER" ]; then
+                echo "❌ ${SERVICE} container not found"
                 exit 1
-              }
+              fi
+
+              docker inspect -f '{{json .NetworkSettings.Networks}}' "$CONTAINER" \
+                | grep -Fq "\"${CHATWOOT_NETWORK}\"" || {
+                  echo "❌ ${CONTAINER} (${SERVICE}) is not attached to ${CHATWOOT_NETWORK}"
+                  echo "Container networks:"
+                  docker inspect -f '{{range $name, $_ := .NetworkSettings.Networks}}{{println $name}}{{end}}' "$CONTAINER" || true
+                  exit 1
+                }
+
+              echo "✅ ${SERVICE} attached to ${CHATWOOT_NETWORK}"
+            done
 
             echo "🔎 Verifying Chatwoot internal DNS..."
             # Resolve the Chatwoot host from the app's own settings so this check
