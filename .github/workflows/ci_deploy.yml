@@ -255,8 +255,34 @@ jobs:
             # Resolve the network name the override actually uses. Docker Compose
             # applies .env here, so this stays correct even when
             # CHATWOOT_INTERNAL_NETWORK is set only in .env and not exported in
-            # this SSH shell.
-            CHATWOOT_NETWORK="$($COMPOSE config --format json | python3 -c 'import json, sys; print(json.load(sys.stdin)["networks"]["chatwoot_internal"]["name"])')"
+            # this SSH shell. No host Python/jq: the deploy host is only
+            # guaranteed to have Docker/Git and normal POSIX tools, so parse the
+            # rendered compose config with awk.
+            CHATWOOT_NETWORK="$($COMPOSE config | awk '
+              /^networks:/ {
+                in_networks = 1
+                next
+              }
+
+              in_networks && /^[^[:space:]]/ {
+                in_networks = 0
+                in_chatwoot = 0
+              }
+
+              in_networks && /^  chatwoot_internal:/ {
+                in_chatwoot = 1
+                next
+              }
+
+              in_chatwoot && /^  [^[:space:]][^:]*:/ {
+                in_chatwoot = 0
+              }
+
+              in_chatwoot && /^[[:space:]]+name:/ {
+                print $2
+                exit
+              }
+            ' | tr -d "\"'\''")"
 
             if [ -z "$CHATWOOT_NETWORK" ]; then
               echo "❌ Failed to resolve chatwoot_internal network name from docker compose config"
@@ -278,9 +304,10 @@ jobs:
             fi
 
             docker inspect -f '{{json .NetworkSettings.Networks}}' "$WA_CONTAINER" \
-              | grep -q "\"${CHATWOOT_NETWORK}\"" || {
+              | grep -Fq "\"${CHATWOOT_NETWORK}\"" || {
                 echo "❌ $WA_CONTAINER is not attached to ${CHATWOOT_NETWORK}"
-                docker inspect -f '{{json .NetworkSettings.Networks}}' "$WA_CONTAINER" | python3 -m json.tool || true
+                echo "Container networks:"
+                docker inspect -f '{{range $name, $_ := .NetworkSettings.Networks}}{{println $name}}{{end}}' "$WA_CONTAINER" || true
                 exit 1
               }
 
