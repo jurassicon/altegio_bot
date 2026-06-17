@@ -172,15 +172,17 @@ jobs:
 
             cd /opt/altegio_bot
 
+            COMPOSE="docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml"
+
             echo "📦 Fetching new code..."
             git fetch origin main
             git reset --hard origin/main
 
             echo "🔨 Building new images (without starting containers)..."
-            docker compose build
+            $COMPOSE build
 
             echo "🟢 Starting infrastructure services..."
-            docker compose up -d postgres redis
+            $COMPOSE up -d postgres redis
 
             echo "⏳ Waiting for Postgres to be healthy..."
             MAX_ATTEMPTS=60
@@ -214,11 +216,11 @@ jobs:
 
             # Credentials come from inside the container (docker compose injected them from .env).
             # This is more reliable than sourcing .env in the remote shell.
-            docker compose exec -T postgres sh -lc '
+            $COMPOSE exec -T postgres sh -lc '
               psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT 1"
             ' >/dev/null
 
-            docker compose exec -T postgres sh -lc '
+            $COMPOSE exec -T postgres sh -lc '
               pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc
             ' > "$DUMP_FILE"
 
@@ -244,16 +246,44 @@ jobs:
               | wc -l
 
             echo "⚙️ Applying DB Migrations..."
-            docker compose --profile ops run --rm --no-deps migrate
+            $COMPOSE --profile ops run --rm --no-deps migrate
 
             echo "🚀 Starting updated containers..."
-            docker compose up -d --remove-orphans
+            $COMPOSE up -d --remove-orphans
+
+            echo "🔎 Verifying Chatwoot internal network..."
+            CHATWOOT_NETWORK="${CHATWOOT_INTERNAL_NETWORK:-chatwoot_default}"
+
+            docker network inspect "$CHATWOOT_NETWORK" >/dev/null
+
+            WA_CONTAINER=$(docker ps \
+              --filter "label=com.docker.compose.project=altegio_bot" \
+              --filter "label=com.docker.compose.service=altegio-whatsapp-inbox-worker" \
+              --format "{{.Names}}" \
+              | head -n 1)
+
+            if [ -z "$WA_CONTAINER" ]; then
+              echo "❌ altegio-whatsapp-inbox-worker container not found"
+              exit 1
+            fi
+
+            docker inspect -f '{{json .NetworkSettings.Networks}}' "$WA_CONTAINER" \
+              | grep -q "\"${CHATWOOT_NETWORK}\"" || {
+                echo "❌ $WA_CONTAINER is not attached to ${CHATWOOT_NETWORK}"
+                docker inspect -f '{{json .NetworkSettings.Networks}}' "$WA_CONTAINER"
+                exit 1
+              }
+
+            echo "🔎 Verifying Chatwoot internal DNS..."
+            $COMPOSE exec -T altegio-whatsapp-inbox-worker sh -lc 'getent hosts rails >/dev/null'
+
+            echo "✅ Chatwoot internal route verified"
 
             echo "🧹 Aggressive cleanup of unused images..."
             docker image prune -af
 
             echo "✅ Done! Containers status:"
-            docker compose ps
+            $COMPOSE ps
 
   notify:
     name: Telegram Notification
