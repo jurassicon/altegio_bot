@@ -459,6 +459,22 @@ Incoming (Customer → Bot via Chatwoot):
   Else → do nothing (admin replies manually)
 ```
 
+WhatsApp reactions (`messages[].type == "reaction"`) are mirrored into Chatwoot as
+incoming messages so operators see that the client reacted. A native Chatwoot
+reply (`content_attributes.in_reply_to`) is attached only when the reacted-to
+message has a real Chatwoot message id in the same conversation; automatic
+outbox-message targets get a visible fallback line (e.g.
+`👍 Реакция на отправленное сообщение WhatsApp (reminder_24h)`), and a removed
+reaction shows `Реакция удалена в WhatsApp`. Reactions never trigger commands,
+opt-out, or any send back to WhatsApp. Reactions are handled going forward;
+historical reactions processed before this change are not backfilled.
+
+Known limitation (pre-existing, not specific to reactions): the inbox worker
+processes only the first extracted inbound action per webhook event, so a single
+webhook batching multiple `messages[]` (e.g. a text and a reaction together) has
+only its first action handled. Delivery `statuses[]` are processed independently
+and are not affected by this.
+
 ### Configuration
 
 Add to your `.env`:
