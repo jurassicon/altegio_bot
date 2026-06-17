@@ -172,15 +172,17 @@ jobs:
 
             cd /opt/altegio_bot
 
+            COMPOSE="docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml"
+
             echo "📦 Fetching new code..."
             git fetch origin main
             git reset --hard origin/main
 
             echo "🔨 Building new images (without starting containers)..."
-            docker compose build
+            $COMPOSE build
 
             echo "🟢 Starting infrastructure services..."
-            docker compose up -d postgres redis
+            $COMPOSE up -d postgres redis
 
             echo "⏳ Waiting for Postgres to be healthy..."
             MAX_ATTEMPTS=60
@@ -214,11 +216,11 @@ jobs:
 
             # Credentials come from inside the container (docker compose injected them from .env).
             # This is more reliable than sourcing .env in the remote shell.
-            docker compose exec -T postgres sh -lc '
+            $COMPOSE exec -T postgres sh -lc '
               psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT 1"
             ' >/dev/null
 
-            docker compose exec -T postgres sh -lc '
+            $COMPOSE exec -T postgres sh -lc '
               pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc
             ' > "$DUMP_FILE"
 
@@ -244,16 +246,113 @@ jobs:
               | wc -l
 
             echo "⚙️ Applying DB Migrations..."
-            docker compose --profile ops run --rm --no-deps migrate
+            $COMPOSE --profile ops run --rm --no-deps migrate
 
             echo "🚀 Starting updated containers..."
-            docker compose up -d --remove-orphans
+            $COMPOSE up -d --remove-orphans
+
+            echo "🔎 Verifying Chatwoot internal route..."
+
+            WA_CONTAINER=$(docker ps \
+              --filter "label=com.docker.compose.project=altegio_bot" \
+              --filter "label=com.docker.compose.service=altegio-whatsapp-inbox-worker" \
+              --format "{{.Names}}" \
+              | head -n 1)
+
+            if [ -z "$WA_CONTAINER" ]; then
+              echo "❌ altegio-whatsapp-inbox-worker container not found"
+              exit 1
+            fi
+
+            echo "🔎 Resolving Chatwoot internal network from Docker Compose config..."
+            # Docker Compose applies .env while rendering config. Parse the JSON
+            # inside an app container so the deploy host needs no extra tools.
+            CHATWOOT_NETWORK="$($COMPOSE config --format json | $COMPOSE exec -T altegio-whatsapp-inbox-worker /app/.venv/bin/python -c '
+            import json
+            import sys
+
+            config = json.load(sys.stdin)
+            try:
+                name = config["networks"]["chatwoot_internal"]["name"]
+            except KeyError as exc:
+                raise SystemExit(f"chatwoot_internal network name is missing from compose config: {exc}")
+
+            if not name:
+                raise SystemExit("chatwoot_internal network name is empty")
+
+            print(name)
+            ')"
+
+            if [ -z "$CHATWOOT_NETWORK" ]; then
+              echo "❌ Failed to resolve chatwoot_internal network name from docker compose config"
+              exit 1
+            fi
+
+            echo "Resolved Chatwoot network: $CHATWOOT_NETWORK"
+            docker network inspect "$CHATWOOT_NETWORK" >/dev/null
+
+            echo "🔎 Verifying app containers are attached to Chatwoot network..."
+
+            CHATWOOT_SERVICES="
+            altegio-api
+            altegio-inbox-worker
+            altegio-outbox-worker
+            altegio-whatsapp-inbox-worker
+            altegio-campaign-worker
+            "
+
+            for SERVICE in $CHATWOOT_SERVICES; do
+              CONTAINER=$(docker ps \
+                --filter "label=com.docker.compose.project=altegio_bot" \
+                --filter "label=com.docker.compose.service=${SERVICE}" \
+                --format "{{.Names}}" \
+                | head -n 1)
+
+              if [ -z "$CONTAINER" ]; then
+                echo "❌ ${SERVICE} container not found"
+                exit 1
+              fi
+
+              docker inspect -f '{{json .NetworkSettings.Networks}}' "$CONTAINER" \
+                | grep -Fq "\"${CHATWOOT_NETWORK}\"" || {
+                  echo "❌ ${CONTAINER} (${SERVICE}) is not attached to ${CHATWOOT_NETWORK}"
+                  echo "Container networks:"
+                  docker inspect -f '{{range $name, $_ := .NetworkSettings.Networks}}{{println $name}}{{end}}' "$CONTAINER" || true
+                  exit 1
+                }
+
+              echo "✅ ${SERVICE} attached to ${CHATWOOT_NETWORK}"
+            done
+
+            echo "🔎 Verifying Chatwoot internal DNS..."
+            # Resolve the Chatwoot host from the app's own settings so this check
+            # follows CHATWOOT_BASE_URL instead of a hardcoded hostname.
+            $COMPOSE exec -T altegio-whatsapp-inbox-worker sh -lc '
+            CHATWOOT_HOST=$(/app/.venv/bin/python - <<'"'"'PY'"'"'
+            from urllib.parse import urlparse
+            from altegio_bot.settings import settings
+
+            host = urlparse(settings.chatwoot_base_url).hostname
+            if not host:
+                raise SystemExit("CHATWOOT_BASE_URL host is empty")
+            print(host)
+            PY
+            )
+
+            echo "Resolved Chatwoot host: $CHATWOOT_HOST"
+            getent hosts "$CHATWOOT_HOST" >/dev/null || {
+              echo "❌ Cannot resolve Chatwoot host inside altegio-whatsapp-inbox-worker: $CHATWOOT_HOST"
+              exit 1
+            }
+            '
+
+            echo "✅ Chatwoot internal route verified"
 
             echo "🧹 Aggressive cleanup of unused images..."
             docker image prune -af
 
             echo "✅ Done! Containers status:"
-            docker compose ps
+            $COMPOSE ps
 
   notify:
     name: Telegram Notification
