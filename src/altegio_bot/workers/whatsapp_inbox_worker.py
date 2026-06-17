@@ -1468,12 +1468,14 @@ async def _resolve_reaction_target(
     Resolution order (altegio_bot has no separate agent-message table — operator
     replies are OutboxMessage rows carrying a Chatwoot message id):
 
-    1. OutboxMessage with a real ``chatwoot_message_id`` (operator/agent message,
-       native reply candidate) matched by ``provider_message_id`` AND phone.
-    2. Prior inbound WhatsAppEvent forwarded to Chatwoot, matched by
+    1. Operator OutboxMessage (``message_source='operator'``) with a real
+       ``chatwoot_message_id`` (agent message, native reply candidate) matched by
+       ``provider_message_id`` AND phone.  Bot/automatic rows are excluded here
+       so they can never become a native ``chatwoot_agent_message`` target.
+    2. Prior Meta-origin inbound WhatsAppEvent forwarded to Chatwoot, matched by
        ``whatsapp_message_id`` AND payload sender phone.
-    3. Automatic OutboxMessage (no Chatwoot message id) matched by
-       ``provider_message_id`` AND phone — visible fallback only.
+    3. Automatic OutboxMessage (any source) matched by ``provider_message_id``
+       AND phone — visible fallback only, no native reply.
     4. Unknown fallback.
 
     OutboxMessage.provider_message_id is indexed but not unique, so the lookup is
@@ -1498,6 +1500,7 @@ async def _resolve_reaction_target(
             )
             .where(OutboxMessage.provider_message_id == reaction_target_provider_message_id)
             .where(OutboxMessage.phone_e164.in_(variants))
+            .where(OutboxMessage.message_source == "operator")
             .where(OutboxMessage.chatwoot_message_id.is_not(None))
             .where(OutboxMessage.chatwoot_conversation_id.is_not(None))
             .order_by(OutboxMessage.created_at.desc(), OutboxMessage.id.desc())
@@ -1516,12 +1519,15 @@ async def _resolve_reaction_target(
                 body_preview=row[5],
             )
 
-    # 2. Prior inbound WhatsAppEvent that was forwarded to Chatwoot.
+    # 2. Prior Meta-origin inbound WhatsAppEvent that was forwarded to Chatwoot.
+    #    The dedupe_key filter keeps this to real Meta inbound events (consistent
+    #    with the reply-context lookup) and never matches Chatwoot-origin events.
     event_stmt = (
         select(WhatsAppEvent)
         .where(WhatsAppEvent.whatsapp_message_id == reaction_target_provider_message_id)
         .where(WhatsAppEvent.chatwoot_message_id.is_not(None))
         .where(WhatsAppEvent.forwarded_chatwoot_conversation_id.is_not(None))
+        .where(WhatsAppEvent.dedupe_key.like("wa:%"))
         .order_by(WhatsAppEvent.received_at.desc(), WhatsAppEvent.id.desc())
         .limit(20)
     )
@@ -1695,8 +1701,8 @@ async def _forward_reaction_to_chatwoot(
 
     event.forwarded_chatwoot_conversation_id = conversation_id
     event.chatwoot_message_id = message_id
-    if whatsapp_message_id:
-        event.whatsapp_message_id = whatsapp_message_id
+    # event.whatsapp_message_id is already stamped by the inbound action audit
+    # path in handle_event (the reaction wamid), so it is not re-set here.
     event.error = None
     logger.info(
         "Forwarded WhatsApp reaction to Chatwoot phone=%s conversation_id=%s message_id=%s "

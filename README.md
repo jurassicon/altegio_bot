@@ -466,8 +466,14 @@ message has a real Chatwoot message id in the same conversation; automatic
 outbox-message targets get a visible fallback line (e.g.
 `👍 Реакция на отправленное сообщение WhatsApp (reminder_24h)`), and a removed
 reaction shows `Реакция удалена в WhatsApp`. Reactions never trigger commands,
-opt-out, or any send back to WhatsApp. Historical reactions processed before this
-change are not backfilled.
+opt-out, or any send back to WhatsApp. Reactions are handled going forward;
+historical reactions processed before this change are not backfilled.
+
+Known limitation (pre-existing, not specific to reactions): the inbox worker
+processes only the first extracted inbound action per webhook event, so a single
+webhook batching multiple `messages[]` (e.g. a text and a reaction together) has
+only its first action handled. Delivery `statuses[]` are processed independently
+and are not affected by this.
 
 ### Configuration
 

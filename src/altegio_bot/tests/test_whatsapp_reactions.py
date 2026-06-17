@@ -134,9 +134,10 @@ def _prior_inbound_event(
     chatwoot_message_id: int | None = 456,
     forwarded_chatwoot_conversation_id: int | None = DEST_CONVERSATION_ID,
     from_phone: str = FROM_PHONE,
+    dedupe_key: str | None = None,
 ) -> WhatsAppEvent:
     return WhatsAppEvent(
-        dedupe_key=f"wa:prior-inbound:{whatsapp_message_id}",
+        dedupe_key=dedupe_key or f"wa:prior-inbound:{whatsapp_message_id}",
         status="processed",
         error=None,
         query={},
@@ -562,3 +563,85 @@ async def test_reaction_native_target_cross_conversation_falls_back_without_in_r
     assert "in_reply_to" not in attrs
     assert attrs["whatsapp_reaction_target_conversation_mismatch"] is True
     assert attrs["whatsapp_reaction_target_kind"] == "chatwoot_agent_message"
+
+
+# ---------------------------------------------------------------------------
+# 15. native agent target requires message_source="operator" (Fix 1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_reaction_bot_outbox_with_chatwoot_ids_is_not_native_agent_target(session_maker) -> None:
+    """A bot/automatic OutboxMessage that happens to carry Chatwoot ids must NOT
+    become a native chatwoot_agent_message; it degrades to the outbox fallback."""
+    evt, cw = await _run_reaction(
+        session_maker,
+        payload=_reaction_payload(),
+        seeds=lambda s: s.add(
+            _outbox(
+                message_source="bot",
+                template_code="reminder_24h",
+                chatwoot_message_id=999,
+                chatwoot_conversation_id=DEST_CONVERSATION_ID,
+            )
+        ),
+    )
+
+    call = cw.send_message.call_args
+    assert call.args[1] == "👍 Реакция на отправленное сообщение WhatsApp (reminder_24h)"
+    attrs = call.kwargs["content_attributes"]
+    assert attrs["whatsapp_reaction_target_kind"] == "outbox_message"
+    assert attrs["whatsapp_reaction_target_outbox_id"] is not None
+    assert attrs["whatsapp_reaction_target_template_code"] == "reminder_24h"
+    assert "in_reply_to" not in attrs
+
+
+@pytest.mark.asyncio
+async def test_resolve_reaction_target_bot_row_is_not_native(session_maker) -> None:
+    """Resolver unit check: a bot row carrying Chatwoot ids resolves to
+    outbox_message (never native) because step 1 requires message_source=operator.
+
+    (The operator-positive path is covered by the integration tests above.)
+    """
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(
+                _outbox(
+                    message_source="bot",
+                    template_code="reminder_24h",
+                    chatwoot_message_id=321,
+                    chatwoot_conversation_id=DEST_CONVERSATION_ID,
+                )
+            )
+            await session.flush()
+            bot_target = await _resolve_reaction_target(session, TARGET_WAMID, phone_e164=PHONE_E164)
+    assert bot_target.kind == "outbox_message"
+    assert bot_target.chatwoot_message_id is None
+
+
+# ---------------------------------------------------------------------------
+# 16. prior inbound event must be Meta-origin (wa:%) (Fix 2)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_reaction_prior_inbound_event_must_be_meta_origin(session_maker) -> None:
+    """A WhatsAppEvent matching by wamid/phone/Chatwoot ids but with a
+    chatwoot-origin dedupe_key must NOT resolve as inbound_whatsapp_event."""
+    evt, cw = await _run_reaction(
+        session_maker,
+        payload=_reaction_payload(),
+        seeds=lambda s: s.add(
+            _prior_inbound_event(
+                chatwoot_message_id=456,
+                forwarded_chatwoot_conversation_id=DEST_CONVERSATION_ID,
+                dedupe_key="chatwoot:99:1",
+            )
+        ),
+    )
+
+    call = cw.send_message.call_args
+    assert call.args[1] == "👍 Реакция на сообщение в WhatsApp"
+    attrs = call.kwargs["content_attributes"]
+    assert attrs["whatsapp_reaction_target_kind"] == "unknown"
+    assert "in_reply_to" not in attrs
