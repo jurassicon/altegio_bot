@@ -614,6 +614,77 @@ async def test_followup_worker_writes_skipped_and_failed_counts_to_meta(
 
 
 # ---------------------------------------------------------------------------
+# Тест 16: Run #23 regression — due run с пустым followup_auto_status
+# claimable, и worker планирует только реальных кандидатов.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run23_like_due_run_claimable_and_processed(
+    worker_session,
+    session_maker,
+) -> None:
+    """Регрессия Run #23: due send-real run с пустым followup_auto_status.
+
+    - попадает в _claim_due_runs (claimable_now);
+    - worker помечает meta status=completed с корректными счётчиками;
+    - планируются только unread/non-booked pipeline получатели;
+    - read/booked получают skip-статусы и не получают follow-up job.
+    """
+    now = datetime.now(timezone.utc)
+    async with session_maker() as session:
+        async with session.begin():
+            run = _make_run(
+                session,
+                followup_policy="unread_or_not_booked",
+                followup_delay_days=14,
+                completed_at=now - timedelta(days=15),
+                meta={},  # followup_auto_status пустой
+            )
+            await session.flush()
+            run_id = run.id
+            eligible = _make_recipient(session, run_id, status="delivered")
+            read = _make_recipient(
+                session, run_id, status="read", read_at=now, phone_e164="+10000000002"
+            )
+            booked = _make_recipient(
+                session, run_id, status="delivered", booked_after_at=now, phone_e164="+10000000003"
+            )
+            await session.flush()
+            eligible_id, read_id, booked_id = eligible.id, read.id, booked.id
+
+    # 1. Claimable now (empty followup_auto_status).
+    async with session_maker() as session:
+        async with session.begin():
+            claimed = await _claim_due_runs(session)
+    assert run_id in claimed
+
+    # 2. Worker processes the run end-to-end.
+    await process_run(run_id)
+
+    async with session_maker() as session:
+        run = await session.get(CampaignRun, run_id)
+        r_eligible = await session.get(CampaignRecipient, eligible_id)
+        r_read = await session.get(CampaignRecipient, read_id)
+        r_booked = await session.get(CampaignRecipient, booked_id)
+
+    meta = run.meta or {}
+    assert meta.get("followup_auto_status") == "completed"
+    assert meta.get("followup_auto_planned_count") == 1
+    assert meta.get("followup_auto_queued_count") == 1
+    assert meta.get("followup_auto_failed_count") == 0
+    assert "followup_auto_skipped_count" in meta
+
+    assert r_eligible.followup_status == "followup_queued"
+    assert r_eligible.followup_message_job_id is not None
+    # Read/booked recipients are never queued for follow-up.
+    assert r_read.followup_status == "skipped_read"
+    assert r_read.followup_message_job_id is None
+    assert r_booked.followup_status == "skipped_booked_after"
+    assert r_booked.followup_message_job_id is None
+
+
+# ---------------------------------------------------------------------------
 # Тест 15: run без followup_policy не забирается _claim_due_runs
 # ---------------------------------------------------------------------------
 

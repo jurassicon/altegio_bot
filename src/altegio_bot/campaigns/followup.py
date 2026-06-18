@@ -26,6 +26,41 @@ class FollowupFinalEligibilityResult:
     booked_after_at: datetime | None
 
 
+@dataclass
+class FollowupPlanEligibilityResult:
+    """Result of the plan-time follow-up candidate classification.
+
+    eligible:        True if the recipient should be planned for follow-up.
+    reason:          Machine-readable classification reason (см. _PLAN_REASONS).
+    followup_status: followup_status to persist for non-eligible recipients
+                     that have no excluded_reason (None → leave untouched /
+                     fall back to followup_skipped).
+    """
+
+    eligible: bool
+    reason: str
+    followup_status: str | None
+
+
+# Политики follow-up.
+_POLICY_UNREAD_ONLY = "unread_only"
+_POLICY_UNREAD_OR_NOT_BOOKED = "unread_or_not_booked"
+
+# Возможные значения FollowupPlanEligibilityResult.reason.
+_PLAN_REASONS: frozenset[str] = frozenset(
+    {
+        "eligible",
+        "read",
+        "replied",
+        "booked_after",
+        "skipped",
+        "hard_failure",
+        "excluded",
+        "not_sent_pipeline",
+        "unknown_policy",
+    }
+)
+
 # Статусы, которые означают «сообщение прочитано или позже» для follow-up политик.
 _READ_OR_LATER_STATUSES: frozenset[str] = frozenset({"read", "replied", "booked_after_campaign"})
 
@@ -59,32 +94,68 @@ _SENT_PIPELINE_STATUSES = {
 _FOLLOWUP_PROCESSING = "followup_processing"
 
 
+def classify_followup_candidate(
+    recipient: CampaignRecipient,
+    policy: str,
+) -> FollowupPlanEligibilityResult:
+    """Классифицировать получателя для plan-time follow-up.
+
+    Единый источник истины для plan_followup, execute_followup re-evaluate и
+    Ops UI: получатель планируется на follow-up, только если он по-прежнему
+    выглядит как реальный кандидат (в pipeline доставки, не прочитал, не
+    ответил, не записался, не исключён). Любое из условий, которые позже
+    отсечёт финальный guard check_followup_final_eligibility(), должно отсекать
+    кандидата уже здесь — иначе создаются follow-up job'ы, которые гарантированно
+    будут skipped перед отправкой.
+
+    Семантика политик:
+      - unread_or_not_booked / unread_only: оба планируют только тех, кто
+        находится в pipeline доставки (queued / provider_accepted / delivered),
+        не прочитал, не ответил и не записался. Read-but-not-booked получатели
+        НЕ планируются, потому что финальный guard всё равно их пропустит.
+    """
+    if policy not in (_POLICY_UNREAD_ONLY, _POLICY_UNREAD_OR_NOT_BOOKED):
+        logger.warning("Unknown followup_policy=%s", policy)
+        return FollowupPlanEligibilityResult(False, "unknown_policy", None)
+
+    # Жёсткие отказы: повреждённые / невалидные получатели follow-up не получают.
+    if recipient.status in _HARD_FAILURE_STATUSES:
+        return FollowupPlanEligibilityResult(False, "hard_failure", "followup_skipped")
+    if recipient.excluded_reason in _HARD_FAILURE_REASONS:
+        # excluded_reason уже фиксирует причину — followup_status не трогаем.
+        return FollowupPlanEligibilityResult(False, "hard_failure", None)
+
+    # Исключённые на этапе сегментации.
+    if recipient.status == "skipped":
+        return FollowupPlanEligibilityResult(False, "skipped", "followup_skipped")
+    if recipient.excluded_reason is not None:
+        return FollowupPlanEligibilityResult(False, "excluded", None)
+
+    # Не участвовал в send-real (не в pipeline доставки).
+    if recipient.status not in _SENT_PIPELINE_STATUSES:
+        return FollowupPlanEligibilityResult(False, "not_sent_pipeline", "followup_skipped")
+
+    # Маркетинговая цель уже достигнута / клиент среагировал.
+    # Приоритет: booked_after > replied > read (совпадает с финальным guard'ом).
+    if recipient.status == "booked_after_campaign" or recipient.booked_after_at is not None:
+        return FollowupPlanEligibilityResult(False, "booked_after", "skipped_booked_after")
+    if recipient.status == "replied" or recipient.replied_at is not None:
+        return FollowupPlanEligibilityResult(False, "replied", "skipped_replied")
+    if recipient.status == "read" or recipient.read_at is not None:
+        return FollowupPlanEligibilityResult(False, "read", "skipped_read")
+
+    return FollowupPlanEligibilityResult(True, "eligible", None)
+
+
 def _is_eligible_for_followup(
     recipient: CampaignRecipient,
     policy: str,
 ) -> bool:
-    """Проверить, нужно ли отправить follow-up этому получателю."""
-    if recipient.status in _HARD_FAILURE_STATUSES:
-        return False
-    if recipient.excluded_reason in _HARD_FAILURE_REASONS:
-        return False
+    """Проверить, нужно ли отправить follow-up этому получателю.
 
-    if recipient.status == "skipped":
-        return False
-
-    if recipient.status not in _SENT_PIPELINE_STATUSES:
-        return False
-
-    if policy == "unread_only":
-        is_read = recipient.read_at is not None or recipient.status in _READ_OR_LATER_STATUSES
-        return not is_read
-
-    if policy == "unread_or_not_booked":
-        is_read = recipient.read_at is not None or recipient.status in _READ_OR_LATER_STATUSES
-        return not is_read or recipient.booked_after_at is None
-
-    logger.warning("Unknown followup_policy=%s", policy)
-    return False
+    Тонкая обёртка над classify_followup_candidate() для обратной совместимости.
+    """
+    return classify_followup_candidate(recipient, policy).eligible
 
 
 async def plan_followup(session: AsyncSession, run_id: int) -> int:
@@ -141,11 +212,15 @@ async def plan_followup(session: AsyncSession, run_id: int) -> int:
         if recipient.followup_status is not None:
             continue
 
-        if _is_eligible_for_followup(recipient, run.followup_policy):
+        result = classify_followup_candidate(recipient, run.followup_policy)
+        if result.eligible:
             recipient.followup_status = "followup_planned"
             count += 1
         elif recipient.excluded_reason is None:
-            recipient.followup_status = "followup_skipped"
+            # Более конкретный skip-статус (skipped_read / skipped_replied /
+            # skipped_booked_after), если классификатор его вернул; иначе
+            # обобщённый followup_skipped (как было раньше).
+            recipient.followup_status = result.followup_status or "followup_skipped"
 
     await session.flush()
     logger.info("plan_followup run_id=%d planned=%d", run_id, count)
@@ -258,8 +333,9 @@ async def execute_followup(run_id: int) -> dict:
                         # но ошибка re-evaluate подхватит и вернёт в planned.
                         raise RuntimeError(f"recipient_id={recipient_id} not found after claim")
 
-                    if not _is_eligible_for_followup(fresh, policy):
-                        fresh.followup_status = "followup_skipped"
+                    reeval = classify_followup_candidate(fresh, policy)
+                    if not reeval.eligible:
+                        fresh.followup_status = reeval.followup_status or "followup_skipped"
                         stats["skipped"] += 1
                         continue
 

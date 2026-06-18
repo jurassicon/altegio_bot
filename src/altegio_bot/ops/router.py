@@ -17,11 +17,14 @@ from fastapi import APIRouter, Depends, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from sqlalchemy import func, select, text
 
+from altegio_bot.campaigns.followup import classify_followup_candidate, followup_run_at
 from altegio_bot.campaigns.reports import monthly_dashboard, run_report
 from altegio_bot.db import SessionLocal
 from altegio_bot.meta_templates import META_TEMPLATE_MAP
 from altegio_bot.models.models import CampaignRecipient, CampaignRun, MessageJob, OutboxMessage
 from altegio_bot.settings import settings
+from altegio_bot.utils import utcnow
+from altegio_bot.workers.followup_worker import STALE_PROCESSING_MINUTES
 
 from .auth import (
     SESSION_COOKIE,
@@ -162,6 +165,38 @@ def _fu_reason(r: CampaignRecipient) -> str:
     if r.status not in _FOLLOWUP_ELIGIBLE_STATUSES_HTML or r.excluded_reason is not None:
         return "not eligible"
     return "eligible"
+
+
+def _parse_meta_dt(value: Any) -> datetime | None:
+    """Parse an ISO timestamp stored in run.meta into an aware datetime."""
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value))
+    except (ValueError, TypeError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _followup_candidate_priority(r: CampaignRecipient, policy: str | None) -> int:
+    """Sort priority for the Follow-up candidates table (lower = shown first).
+
+    0 eligible · 1 planned/processing/queued · 2 failed · 3 skipped · 4 other.
+    """
+    fs = r.followup_status
+    if fs in ("followup_planned", "followup_processing", "followup_queued"):
+        return 1
+    if fs == "followup_failed":
+        return 2
+    if fs is not None:
+        # any skipped_* / followup_skipped status
+        return 3
+    # No followup_status yet — classify against the run policy.
+    if policy and classify_followup_candidate(r, policy).eligible:
+        return 0
+    return 4
 
 
 _NAV = """
@@ -4356,10 +4391,54 @@ async def ops_campaign_run_detail(run_id: int) -> str:
 </div>
 """
 
-    # --- Followup block ---
+    # --- Follow-up schedule / auto-run block ---
+    # Single card that answers: when is follow-up due, why hasn't it run yet,
+    # and what did the auto-worker do. This is what makes a stuck run obvious.
+    now = utcnow()
+    fa_status = meta.get("followup_auto_status") or ""
+    due_at_iso = followup_run_at(run)
+    due_at = _parse_meta_dt(due_at_iso)
+    fa_started_at = _parse_meta_dt(meta.get("followup_auto_started_at"))
+
+    # Derive a human schedule status independent of the raw auto status.
+    warning_badge = ""
+    if not run.followup_enabled:
+        schedule_status = "disabled"
+        status_color = "secondary"
+    elif fa_status == "completed":
+        schedule_status = "completed"
+        status_color = "success"
+    elif fa_status == "failed":
+        schedule_status = "failed"
+        status_color = "danger"
+    elif fa_status == "processing":
+        if fa_started_at is not None and now - fa_started_at > timedelta(minutes=STALE_PROCESSING_MINUTES):
+            schedule_status = "stale processing"
+            status_color = "danger"
+        else:
+            schedule_status = "processing"
+            status_color = "primary"
+    elif due_at is None:
+        schedule_status = "no schedule"
+        status_color = "secondary"
+    elif now < due_at:
+        schedule_status = "not due yet"
+        status_color = "info"
+    else:
+        # Due, but followup_auto_status is empty → worker has not processed it.
+        # This is exactly the Run #23 situation.
+        schedule_status = "due now"
+        status_color = "warning"
+        warning_badge = '<span class="badge bg-warning text-dark ms-2">⚠ Due now, not processed yet</span>'
+
+    status_html = f'<span class="badge bg-{status_color}">{_esc(schedule_status)}</span>{warning_badge}'
+
+    fa_error = meta.get("followup_auto_last_error", "")
+    fa_error_html = f'<span class="text-danger">{_esc(fa_error)}</span>' if fa_error else "—"
+
     followup_block = f"""
 <div class="card mb-3">
-  <div class="card-header">🔁 Follow-up</div>
+  <div class="card-header">🔁 Follow-up schedule / auto-run</div>
   <div class="card-body">
     <dl class="row mb-0">
       <dt class="col-sm-3">Enabled</dt>
@@ -4370,6 +4449,31 @@ async def ops_campaign_run_detail(run_id: int) -> str:
       <dd class="col-sm-9">{_esc(run.followup_policy or "—")}</dd>
       <dt class="col-sm-3">Template</dt>
       <dd class="col-sm-9">{_esc(run.followup_template_name or "—")}</dd>
+      <dt class="col-sm-3">Completed at</dt>
+      <dd class="col-sm-9">{_esc(_fmt_dt(run.completed_at, tz)) or "—"}</dd>
+      <dt class="col-sm-3">Follow-up due at</dt>
+      <dd class="col-sm-9">{_esc(_fmt_dt(due_at, tz)) or "—"}</dd>
+      <dt class="col-sm-3">Current app time</dt>
+      <dd class="col-sm-9">{_esc(_fmt_dt(now, tz))}</dd>
+      <dt class="col-sm-3">Status</dt>
+      <dd class="col-sm-9">{status_html}</dd>
+      <dt class="col-sm-3">Auto status (run.meta)</dt>
+      <dd class="col-sm-9">{_esc(fa_status) or "—"}</dd>
+      <dt class="col-sm-3">Auto started</dt>
+      <dd class="col-sm-9">{_esc(str(meta.get("followup_auto_started_at") or "—"))}</dd>
+      <dt class="col-sm-3">Auto completed</dt>
+      <dd class="col-sm-9">{_esc(str(meta.get("followup_auto_completed_at") or "—"))}</dd>
+      <dt class="col-sm-3">Planned / Queued / Skipped / Failed</dt>
+      <dd class="col-sm-9">
+        {meta.get("followup_auto_planned_count", 0)} /
+        {meta.get("followup_auto_queued_count", 0)} /
+        {meta.get("followup_auto_skipped_count", 0)} /
+        {meta.get("followup_auto_failed_count", 0)}
+      </dd>
+      <dt class="col-sm-3">Auto last error</dt>
+      <dd class="col-sm-9">{fa_error_html}</dd>
+      <dt class="col-sm-3">Recovered</dt>
+      <dd class="col-sm-9">{_esc(str(meta.get("followup_auto_recovered") or "No"))}</dd>
     </dl>
   </div>
 </div>
@@ -4457,48 +4561,71 @@ async def ops_campaign_run_detail(run_id: int) -> str:
 </div>
 """
 
-    # --- Auto-followup block ---
-    followup_auto_keys = (
-        "followup_auto_status",
-        "followup_auto_started_at",
-        "followup_auto_completed_at",
-        "followup_auto_last_error",
-        "followup_auto_planned_count",
-        "followup_auto_queued_count",
-        "followup_auto_skipped_count",
-        "followup_auto_failed_count",
-        "followup_auto_recovered",
-        "followup_auto_recovered_at",
-    )
-    has_auto_followup = any(k in meta for k in followup_auto_keys)
-    auto_followup_block = ""
-    if has_auto_followup:
-        fa_status = meta.get("followup_auto_status", "")
-        fa_error = meta.get("followup_auto_last_error", "")
-        fa_error_html = f'<span class="text-danger">{_esc(fa_error)}</span>' if fa_error else "—"
-        auto_followup_block = f"""
+    # --- Follow-up candidates table ---
+    # Candidate-focused view: who would receive follow-up if processed now,
+    # who would not, and why. Reuses the funnel recipients (sent pipeline +
+    # anyone with a followup_status) but sorts them by candidate priority so the
+    # operator does not have to infer eligibility from the mixed funnel table.
+    candidates_block = ""
+    if funnel_recipients:
+        sorted_candidates = sorted(
+            funnel_recipients,
+            key=lambda r: (_followup_candidate_priority(r, run.followup_policy), r.id),
+        )
+        cand_cols = [
+            "ID",
+            "Name",
+            "Phone",
+            "Campaign status",
+            "Outbox",
+            "FU reason",
+            "Read at",
+            "Replied at",
+            "Booked at",
+            "FU status",
+            "FU job",
+            "FU outbox",
+            "FU sent at",
+        ]
+        cand_rows = []
+        cand_row_classes = []
+        _priority_row_class = {0: "table-success", 1: "table-primary", 2: "table-danger", 3: "table-warning"}
+        for r in sorted_candidates:
+            ob_status = outbox_status_map.get(r.outbox_message_id or 0, "")
+            cand_rows.append(
+                [
+                    _esc(str(r.id)),
+                    _esc(r.display_name or ""),
+                    _esc(r.phone_e164 or ""),
+                    _status_badge(r.status),
+                    _status_badge(ob_status),
+                    _esc(_fu_reason(r)),
+                    _esc(_fmt_dt(r.read_at, tz)),
+                    _esc(_fmt_dt(r.replied_at, tz)),
+                    _esc(_fmt_dt(r.booked_after_at, tz)),
+                    _esc(r.followup_status or ""),
+                    _esc(str(r.followup_message_job_id) if r.followup_message_job_id else ""),
+                    _esc(str(r.followup_outbox_id) if r.followup_outbox_id else ""),
+                    _esc(_fmt_dt(r.followup_sent_at, tz)),
+                ]
+            )
+            cand_row_classes.append(
+                _priority_row_class.get(_followup_candidate_priority(r, run.followup_policy), "")
+            )
+        _cand_header = (
+            f"🎯 Follow-up candidates (showing first {_FUNNEL_TABLE_LIMIT} of {funnel_total})"
+            if funnel_total > _FUNNEL_TABLE_LIMIT
+            else f"🎯 Follow-up candidates ({funnel_total})"
+        )
+        candidates_block = f"""
 <div class="card mb-3">
-  <div class="card-header">⚙️ Auto Follow-up</div>
-  <div class="card-body">
-    <dl class="row mb-0">
-      <dt class="col-sm-3">Status</dt>
-      <dd class="col-sm-9">{_campaign_status_badge(fa_status) or _esc(fa_status)}</dd>
-      <dt class="col-sm-3">Started</dt>
-      <dd class="col-sm-9">{_esc(str(meta.get("followup_auto_started_at") or "—"))}</dd>
-      <dt class="col-sm-3">Completed</dt>
-      <dd class="col-sm-9">{_esc(str(meta.get("followup_auto_completed_at") or "—"))}</dd>
-      <dt class="col-sm-3">Planned / Queued / Skipped / Failed</dt>
-      <dd class="col-sm-9">
-        {meta.get("followup_auto_planned_count", 0)} /
-        {meta.get("followup_auto_queued_count", 0)} /
-        {meta.get("followup_auto_skipped_count", 0)} /
-        {meta.get("followup_auto_failed_count", 0)}
-      </dd>
-      <dt class="col-sm-3">Last Error</dt>
-      <dd class="col-sm-9">{fa_error_html}</dd>
-      <dt class="col-sm-3">Recovered</dt>
-      <dd class="col-sm-9">{_esc(str(meta.get("followup_auto_recovered") or "No"))}</dd>
-    </dl>
+  <div class="card-header">{_cand_header}</div>
+  <div class="card-body p-0">
+    <div class="px-3 pt-2 text-muted small">
+      Sorted: eligible first, then planned / processing / queued, then failed, then skipped.
+      "eligible" = would be queued for sending if the follow-up worker ran now.
+    </div>
+    {_table(cand_cols, cand_rows, cand_row_classes)}
   </div>
 </div>
 """
@@ -4535,8 +4662,8 @@ async def ops_campaign_run_detail(run_id: int) -> str:
 {excluded_block}
 {followup_block}
 {followup_eligibility_block}
+{candidates_block}
 {funnel_block}
-{auto_followup_block}
 {recipients_summary}
 <div id="detail-alert" class="mt-3"></div>
 <script>

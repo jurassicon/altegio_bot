@@ -251,6 +251,24 @@ jobs:
             echo "🚀 Starting updated containers..."
             $COMPOSE up -d --remove-orphans
 
+            # The follow-up worker is NOT attached to the Chatwoot network (it only
+            # claims due campaign runs and creates MessageJob rows — no Chatwoot API
+            # calls), so it is verified here for liveness instead of in the Chatwoot
+            # attachment check below.
+            echo "🔎 Verifying follow-up worker is running..."
+            FOLLOWUP_CONTAINER=$(docker ps \
+              --filter "label=com.docker.compose.project=altegio_bot" \
+              --filter "label=com.docker.compose.service=altegio-followup-worker" \
+              --filter "status=running" \
+              --format "{{.Names}}" \
+              | head -n 1)
+
+            if [ -z "$FOLLOWUP_CONTAINER" ]; then
+              echo "❌ altegio-followup-worker container is not running"
+              exit 1
+            fi
+            echo "✅ altegio-followup-worker running ($FOLLOWUP_CONTAINER)"
+
             echo "🔎 Verifying Chatwoot internal route..."
 
             WA_CONTAINER=$(docker ps \

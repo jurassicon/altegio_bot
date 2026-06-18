@@ -719,16 +719,25 @@ def test_followup_unread_or_not_booked_excludes_when_both_read_and_booked() -> N
     assert _is_eligible_for_followup(r, "unread_or_not_booked") is False
 
 
-def test_followup_unread_or_not_booked_includes_when_not_read() -> None:
-    """unread_or_not_booked: not read (even if booked) → eligible."""
+def test_followup_unread_or_not_booked_excludes_when_booked_even_if_unread() -> None:
+    """unread_or_not_booked: booked_after_at set → NOT eligible.
+
+    Even if unread, a recipient who already booked is skipped by the final
+    guard, so plan_followup must not plan them either.
+    """
     r = _make_recipient(status="provider_accepted", read_at=None, booked_after_at=_NOW)
-    assert _is_eligible_for_followup(r, "unread_or_not_booked") is True
+    assert _is_eligible_for_followup(r, "unread_or_not_booked") is False
 
 
-def test_followup_unread_or_not_booked_includes_when_read_but_not_booked() -> None:
-    """unread_or_not_booked: read but not booked → eligible."""
+def test_followup_unread_or_not_booked_excludes_when_read_but_not_booked() -> None:
+    """unread_or_not_booked: read but not booked → NOT eligible.
+
+    Regression for the Run #23 mismatch: read recipients are skipped by the
+    final guard and treated as non-candidates by the UI, so they must not be
+    planned for follow-up.
+    """
     r = _make_recipient(status="read", read_at=_NOW, booked_after_at=None)
-    assert _is_eligible_for_followup(r, "unread_or_not_booked") is True
+    assert _is_eligible_for_followup(r, "unread_or_not_booked") is False
 
 
 # ---------------------------------------------------------------------------
@@ -1850,15 +1859,15 @@ def test_followup_unread_or_not_booked_excludes_replied_with_booking() -> None:
     assert _is_eligible_for_followup(r, "unread_or_not_booked") is False
 
 
-def test_followup_unread_or_not_booked_eligible_when_booked_after_campaign_no_booking() -> None:
-    """unread_or_not_booked: status='booked_after_campaign' + booked_after_at=None.
+def test_followup_unread_or_not_booked_excludes_booked_after_campaign_status_no_timestamp() -> None:
+    """unread_or_not_booked: status='booked_after_campaign' + booked_after_at=None → NOT eligible.
 
-    Business rule: status may be set before booked_after_at is backfilled.
-    In that edge case, booked_after_at=None means 'not booked yet in our DB',
-    so the recipient is still eligible per the not-booked branch.
+    The status alone signals the marketing goal is met (the final guard skips
+    booked_after_campaign by status), so plan_followup must not plan it even
+    before booked_after_at is backfilled.
     """
     r = _make_recipient(status="booked_after_campaign", read_at=None, booked_after_at=None)
-    assert _is_eligible_for_followup(r, "unread_or_not_booked") is True
+    assert _is_eligible_for_followup(r, "unread_or_not_booked") is False
 
 
 # ---------------------------------------------------------------------------

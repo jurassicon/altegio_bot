@@ -1708,6 +1708,194 @@ async def test_funnel_header_truncation_shown(
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Follow-up schedule / auto-run card + candidates table (Run #23 visibility)
+# ---------------------------------------------------------------------------
+
+
+@pytest_asyncio.fixture
+async def due_unprocessed_run(session_maker) -> int:
+    """Reproduce Run #23: due send-real run, empty followup_auto_status.
+
+    Recipients: one eligible (delivered, unread) and one read (skipped).
+    """
+    from datetime import timedelta
+
+    now = datetime.now(timezone.utc)
+    async with session_maker() as session:
+        async with session.begin():
+            run = CampaignRun(
+                campaign_code="new_clients_monthly",
+                mode="send-real",
+                company_ids=[758285],
+                period_start=now.replace(day=1, hour=0, minute=0, second=0, microsecond=0),
+                period_end=now,
+                status="completed",
+                followup_enabled=True,
+                followup_delay_days=14,
+                followup_policy="unread_or_not_booked",
+                followup_template_name="kitilash_ka_newsletter_new_clients_followup_v1",
+                completed_at=now - timedelta(days=15),  # due (15 > 14)
+                meta={},  # followup_auto_status empty → not processed yet
+            )
+            session.add(run)
+            await session.flush()
+            run_id = run.id
+
+            session.add(
+                CampaignRecipient(
+                    campaign_run_id=run_id,
+                    company_id=758285,
+                    altegio_client_id=1,
+                    phone_e164="+49151000001",
+                    display_name="Eligible Candidate",
+                    status="delivered",
+                )
+            )
+            session.add(
+                CampaignRecipient(
+                    campaign_run_id=run_id,
+                    company_id=758285,
+                    altegio_client_id=2,
+                    phone_e164="+49151000002",
+                    display_name="Read Candidate",
+                    status="read",
+                    read_at=now,
+                )
+            )
+
+    return run_id
+
+
+@pytest.mark.asyncio
+async def test_run_detail_shows_followup_schedule_card(
+    http_client: AsyncClient,
+    due_unprocessed_run: int,
+) -> None:
+    """Run detail page renders the Follow-up schedule / auto-run card with due date."""
+    response = await http_client.get(f"/ops/campaigns/{due_unprocessed_run}")
+    assert response.status_code == 200
+    text = response.text
+    assert "Follow-up schedule / auto-run" in text
+    assert "Follow-up due at" in text
+    assert "Auto status (run.meta)" in text
+    assert "Current app time" in text
+
+
+@pytest.mark.asyncio
+async def test_run_detail_warns_when_due_not_processed(
+    http_client: AsyncClient,
+    due_unprocessed_run: int,
+) -> None:
+    """Due run with empty followup_auto_status shows the warning badge."""
+    response = await http_client.get(f"/ops/campaigns/{due_unprocessed_run}")
+    assert response.status_code == 200
+    text = response.text
+    assert "Due now, not processed yet" in text
+
+
+@pytest.mark.asyncio
+async def test_run_detail_shows_candidates_table(
+    http_client: AsyncClient,
+    due_unprocessed_run: int,
+) -> None:
+    """Dedicated Follow-up candidates section lists candidates with FU reason."""
+    response = await http_client.get(f"/ops/campaigns/{due_unprocessed_run}")
+    assert response.status_code == 200
+    text = response.text
+    assert "Follow-up candidates" in text
+    # Eligible recipient is visible and marked eligible.
+    assert "Eligible Candidate" in text
+    assert "eligible" in text
+    # Read recipient is visible and marked read (not eligible).
+    assert "Read Candidate" in text
+    assert "read" in text
+    # FU outbox / FU sent at columns present.
+    assert "FU outbox" in text
+    assert "FU sent at" in text
+
+
+@pytest.mark.asyncio
+async def test_run_detail_not_due_status(
+    http_client: AsyncClient,
+    session_maker,
+) -> None:
+    """Run whose follow-up delay has not elapsed shows 'not due yet', no warning."""
+    from datetime import timedelta
+
+    now = datetime.now(timezone.utc)
+    async with session_maker() as session:
+        async with session.begin():
+            run = CampaignRun(
+                campaign_code="new_clients_monthly",
+                mode="send-real",
+                company_ids=[758285],
+                period_start=now.replace(day=1, hour=0, minute=0, second=0, microsecond=0),
+                period_end=now,
+                status="completed",
+                followup_enabled=True,
+                followup_delay_days=14,
+                followup_policy="unread_or_not_booked",
+                followup_template_name="kitilash_ka_newsletter_new_clients_followup_v1",
+                completed_at=now - timedelta(days=1),  # not yet due
+                meta={},
+            )
+            session.add(run)
+            await session.flush()
+            run_id = run.id
+
+    response = await http_client.get(f"/ops/campaigns/{run_id}")
+    assert response.status_code == 200
+    text = response.text
+    assert "not due yet" in text
+    assert "Due now, not processed yet" not in text
+
+
+@pytest.mark.asyncio
+async def test_run_detail_shows_auto_completed_counts(
+    http_client: AsyncClient,
+    session_maker,
+) -> None:
+    """When the worker has run, the card shows completed status and counts."""
+    from datetime import timedelta
+
+    now = datetime.now(timezone.utc)
+    async with session_maker() as session:
+        async with session.begin():
+            run = CampaignRun(
+                campaign_code="new_clients_monthly",
+                mode="send-real",
+                company_ids=[758285],
+                period_start=now.replace(day=1, hour=0, minute=0, second=0, microsecond=0),
+                period_end=now,
+                status="completed",
+                followup_enabled=True,
+                followup_delay_days=14,
+                followup_policy="unread_or_not_booked",
+                followup_template_name="kitilash_ka_newsletter_new_clients_followup_v1",
+                completed_at=now - timedelta(days=15),
+                meta={
+                    "followup_auto_status": "completed",
+                    "followup_auto_started_at": (now - timedelta(minutes=2)).isoformat(),
+                    "followup_auto_completed_at": now.isoformat(),
+                    "followup_auto_planned_count": 3,
+                    "followup_auto_queued_count": 3,
+                    "followup_auto_skipped_count": 2,
+                    "followup_auto_failed_count": 0,
+                },
+            )
+            session.add(run)
+            await session.flush()
+            run_id = run.id
+
+    response = await http_client.get(f"/ops/campaigns/{run_id}")
+    assert response.status_code == 200
+    text = response.text
+    # Status badge derived as completed, not the stuck warning.
+    assert "Due now, not processed yet" not in text
+    assert "Planned / Queued / Skipped / Failed" in text
+
+
 @pytest.mark.asyncio
 async def test_ops_new_clients_page_followup_static_body_label(http_client: AsyncClient) -> None:
     """Follow-up шаблон имеет статическое тело — UI должен показывать лейбл вместо переменных."""
