@@ -4,7 +4,7 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from sqlalchemy import and_, func, select, update
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.campaigns.runner import FOLLOWUP_JOB_TYPE
@@ -121,6 +121,51 @@ async def count_followup_skipped(session: AsyncSession, run_id: int) -> int:
         .where(CampaignRecipient.followup_status.in_(FOLLOWUP_SKIP_STATUSES))
     )
     return int(result or 0)
+
+
+async def existing_followup_work_counts(session: AsyncSession, run_id: int) -> dict[str, int]:
+    """Diagnostic counts of pre-existing follow-up work for a run.
+
+    Used by the auto worker's first-deploy safety gate to detect runs that were
+    already (partially) processed — manually by an operator or by historical
+    jobs created before the worker existed — so it does not duplicate sends.
+
+    A run is considered already-processed when any count is > 0:
+      * recipients with any follow-up field set
+        (followup_status / followup_message_job_id / followup_outbox_id /
+        followup_sent_at);
+      * MessageJob rows of type FOLLOWUP_JOB_TYPE referencing this run.
+    """
+    recipients_count = await session.scalar(
+        select(func.count())
+        .select_from(CampaignRecipient)
+        .where(CampaignRecipient.campaign_run_id == run_id)
+        .where(
+            or_(
+                CampaignRecipient.followup_status.is_not(None),
+                CampaignRecipient.followup_message_job_id.is_not(None),
+                CampaignRecipient.followup_outbox_id.is_not(None),
+                CampaignRecipient.followup_sent_at.is_not(None),
+            )
+        )
+    )
+    outbox_count = await session.scalar(
+        select(func.count())
+        .select_from(CampaignRecipient)
+        .where(CampaignRecipient.campaign_run_id == run_id)
+        .where(CampaignRecipient.followup_outbox_id.is_not(None))
+    )
+    jobs_count = await session.scalar(
+        select(func.count())
+        .select_from(MessageJob)
+        .where(MessageJob.job_type == FOLLOWUP_JOB_TYPE)
+        .where(MessageJob.payload["campaign_run_id"].astext == str(run_id))
+    )
+    return {
+        "existing_followup_recipients_count": int(recipients_count or 0),
+        "existing_followup_outbox_count": int(outbox_count or 0),
+        "existing_followup_jobs_count": int(jobs_count or 0),
+    }
 
 
 def classify_followup_candidate(

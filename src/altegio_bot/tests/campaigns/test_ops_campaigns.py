@@ -1794,6 +1794,76 @@ async def test_run_detail_warns_when_due_not_processed(
     assert "Due now, not processed yet" in text
 
 
+async def _make_terminal_skip_run(session_maker, auto_status: str, skip_reason: str) -> int:
+    """A due run stamped with a terminal auto skip status (worker safety gate)."""
+    from datetime import timedelta
+
+    now = datetime.now(timezone.utc)
+    async with session_maker() as session:
+        async with session.begin():
+            run = CampaignRun(
+                campaign_code="new_clients_monthly",
+                mode="send-real",
+                company_ids=[758285],
+                period_start=now.replace(day=1, hour=0, minute=0, second=0, microsecond=0),
+                period_end=now,
+                status="completed",
+                followup_enabled=True,
+                followup_delay_days=14,
+                followup_policy="unread_or_not_booked",
+                followup_template_name="kitilash_ka_newsletter_new_clients_followup_v1",
+                completed_at=now - timedelta(days=40),
+                meta={
+                    "followup_auto_status": auto_status,
+                    "followup_auto_started_at": now.isoformat(),
+                    "followup_auto_completed_at": now.isoformat(),
+                    "followup_auto_last_error": None,
+                    "followup_auto_skip_reason": skip_reason,
+                    "followup_auto_planned_count": 0,
+                    "followup_auto_queued_count": 0,
+                    "followup_auto_skipped_count": 0,
+                    "followup_auto_failed_count": 0,
+                },
+            )
+            session.add(run)
+            await session.flush()
+            return run.id
+
+
+@pytest.mark.asyncio
+async def test_run_detail_skipped_historical_status(http_client: AsyncClient, session_maker) -> None:
+    """skipped_historical renders clearly and suppresses the due-now warning."""
+    run_id = await _make_terminal_skip_run(
+        session_maker,
+        "skipped_historical",
+        "followup_due_at is older than auto-follow-up safety window",
+    )
+    response = await http_client.get(f"/ops/campaigns/{run_id}")
+    assert response.status_code == 200
+    text = response.text
+    assert "skipped (historical)" in text
+    assert "skipped_historical" in text  # raw auto status row
+    assert "older than auto-follow-up safety window" in text  # skip reason row
+    assert "Due now, not processed yet" not in text
+
+
+@pytest.mark.asyncio
+async def test_run_detail_skipped_already_processed_status(http_client: AsyncClient, session_maker) -> None:
+    """skipped_already_processed renders clearly and suppresses the due-now warning."""
+    run_id = await _make_terminal_skip_run(
+        session_maker,
+        "skipped_already_processed",
+        "Run already has follow-up work; auto worker skipped to avoid duplicate sends",
+    )
+    response = await http_client.get(f"/ops/campaigns/{run_id}")
+    assert response.status_code == 200
+    text = response.text
+    assert "skipped (already processed)" in text
+    assert "skipped_already_processed" in text  # raw auto status row
+    assert "auto worker skipped to avoid duplicate sends" in text  # skip reason row
+    assert "Due now, not processed yet" not in text
+
+
 @pytest.mark.asyncio
 async def test_run_detail_shows_candidates_table(
     http_client: AsyncClient,

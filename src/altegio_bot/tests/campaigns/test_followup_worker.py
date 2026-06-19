@@ -32,15 +32,16 @@ from datetime import datetime, timedelta, timezone
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import func, select
 
 import altegio_bot.campaigns.followup as followup_module
 import altegio_bot.campaigns.runner as runner_module
 import altegio_bot.ops.campaigns_api as campaigns_api_module
 import altegio_bot.workers.followup_worker as followup_worker_module
 from altegio_bot.campaigns.followup import plan_followup
-from altegio_bot.campaigns.runner import execute_queued_send_real
+from altegio_bot.campaigns.runner import FOLLOWUP_JOB_TYPE, execute_queued_send_real
 from altegio_bot.main import app
-from altegio_bot.models.models import CampaignRecipient, CampaignRun
+from altegio_bot.models.models import CampaignRecipient, CampaignRun, MessageJob
 from altegio_bot.ops.auth import require_ops_auth
 from altegio_bot.workers.followup_worker import (
     STALE_PROCESSING_MINUTES,
@@ -706,3 +707,291 @@ async def test_run_without_followup_policy_not_claimed(
             claimed = await _claim_due_runs(session)
 
     assert run_id not in claimed
+
+
+# ---------------------------------------------------------------------------
+# First-deploy safety gate: historical age skip + already-processed skip
+# ---------------------------------------------------------------------------
+
+
+async def _count_followup_jobs(session_maker, run_id: int) -> int:
+    async with session_maker() as session:
+        return int(
+            await session.scalar(
+                select(func.count())
+                .select_from(MessageJob)
+                .where(MessageJob.job_type == FOLLOWUP_JOB_TYPE)
+                .where(MessageJob.payload["campaign_run_id"].astext == str(run_id))
+            )
+            or 0
+        )
+
+
+def _add_followup_job(session, run_id: int, *, status: str = "done", dedupe: str) -> MessageJob:
+    job = MessageJob(
+        company_id=COMPANY,
+        job_type=FOLLOWUP_JOB_TYPE,
+        run_at=datetime.now(timezone.utc),
+        status=status,
+        dedupe_key=dedupe,
+        payload={"campaign_run_id": run_id, "kind": FOLLOWUP_JOB_TYPE},
+    )
+    session.add(job)
+    return job
+
+
+@pytest.mark.asyncio
+async def test_historical_due_run_skipped_no_jobs(worker_session, session_maker) -> None:
+    """Run whose due_at is older than the safety window → skipped_historical, no jobs."""
+    now = datetime.now(timezone.utc)
+    async with session_maker() as session:
+        async with session.begin():
+            # completed 40 days ago, delay 14 → due_at ≈ now-26d, older than 7d window
+            run = _make_run(
+                session,
+                followup_delay_days=14,
+                completed_at=now - timedelta(days=40),
+                followup_policy="unread_or_not_booked",
+            )
+            await session.flush()
+            run_id = run.id
+            recipient = _make_recipient(session, run_id, status="delivered")
+            await session.flush()
+            recipient_id = recipient.id
+
+    await process_run(run_id)
+
+    async with session_maker() as session:
+        run = await session.get(CampaignRun, run_id)
+        r = await session.get(CampaignRecipient, recipient_id)
+
+    meta = run.meta or {}
+    assert meta.get("followup_auto_status") == "skipped_historical"
+    assert meta.get("followup_auto_skip_reason")
+    assert meta.get("followup_auto_due_at")
+    assert meta.get("followup_auto_max_due_age_days") == 7
+    assert meta.get("followup_auto_queued_count") == 0
+    # Eligible recipient is left untouched — no follow-up planned/sent.
+    assert r.followup_status is None
+    assert r.followup_message_job_id is None
+    assert await _count_followup_jobs(session_maker, run_id) == 0
+
+
+@pytest.mark.asyncio
+async def test_already_processed_run_skipped_via_existing_jobs(worker_session, session_maker) -> None:
+    """Run with pre-existing follow-up jobs → skipped_already_processed, no new jobs.
+
+    Also a historical run: proves already-processed is checked BEFORE age skip.
+    """
+    now = datetime.now(timezone.utc)
+    async with session_maker() as session:
+        async with session.begin():
+            run = _make_run(
+                session,
+                followup_delay_days=14,
+                completed_at=now - timedelta(days=40),  # also historical
+                followup_policy="unread_or_not_booked",
+            )
+            await session.flush()
+            run_id = run.id
+            _make_recipient(session, run_id, status="delivered")
+            _add_followup_job(session, run_id, status="done", dedupe=f"existing-fu-{run_id}-1")
+            _add_followup_job(session, run_id, status="canceled", dedupe=f"existing-fu-{run_id}-2")
+            await session.flush()
+
+    jobs_before = await _count_followup_jobs(session_maker, run_id)
+
+    await process_run(run_id)
+
+    async with session_maker() as session:
+        run = await session.get(CampaignRun, run_id)
+
+    meta = run.meta or {}
+    assert meta.get("followup_auto_status") == "skipped_already_processed"
+    assert meta.get("existing_followup_jobs_count") == 2
+    assert meta.get("followup_auto_queued_count") == 0
+    # No new jobs created.
+    assert await _count_followup_jobs(session_maker, run_id) == jobs_before == 2
+
+
+@pytest.mark.asyncio
+async def test_already_processed_run_skipped_via_recipient_fields(worker_session, session_maker) -> None:
+    """Recent run whose recipient already carries follow-up state → skipped_already_processed."""
+    now = datetime.now(timezone.utc)
+    async with session_maker() as session:
+        async with session.begin():
+            run = _make_run(
+                session,
+                followup_delay_days=14,
+                completed_at=now - timedelta(days=15),  # recent
+                followup_policy="unread_or_not_booked",
+            )
+            await session.flush()
+            run_id = run.id
+            # Operator already planned this recipient.
+            _make_recipient(session, run_id, status="delivered", followup_status="followup_planned")
+            await session.flush()
+
+    await process_run(run_id)
+
+    async with session_maker() as session:
+        run = await session.get(CampaignRun, run_id)
+
+    meta = run.meta or {}
+    assert meta.get("followup_auto_status") == "skipped_already_processed"
+    assert meta.get("existing_followup_recipients_count") == 1
+    assert await _count_followup_jobs(session_maker, run_id) == 0
+
+
+@pytest.mark.asyncio
+async def test_recent_due_run_processed_normally(worker_session, session_maker) -> None:
+    """Recent due run with one eligible recipient → completed, queued=1, one job."""
+    now = datetime.now(timezone.utc)
+    async with session_maker() as session:
+        async with session.begin():
+            run = _make_run(
+                session,
+                followup_delay_days=14,
+                completed_at=now - timedelta(days=15),
+                followup_policy="unread_or_not_booked",
+            )
+            await session.flush()
+            run_id = run.id
+            recipient = _make_recipient(session, run_id, status="delivered")
+            await session.flush()
+            recipient_id = recipient.id
+
+    await process_run(run_id)
+
+    async with session_maker() as session:
+        run = await session.get(CampaignRun, run_id)
+        r = await session.get(CampaignRecipient, recipient_id)
+
+    meta = run.meta or {}
+    assert meta.get("followup_auto_status") == "completed"
+    assert meta.get("followup_auto_planned_count") == 1
+    assert meta.get("followup_auto_queued_count") == 1
+    assert r.followup_status == "followup_queued"
+    assert await _count_followup_jobs(session_maker, run_id) == 1
+
+
+@pytest.mark.asyncio
+async def test_recent_due_run_zero_eligible_processed_no_jobs(worker_session, session_maker) -> None:
+    """Recent due run with a read recipient → completed, 0 queued, no jobs (Run #25 shape)."""
+    now = datetime.now(timezone.utc)
+    async with session_maker() as session:
+        async with session.begin():
+            run = _make_run(
+                session,
+                followup_delay_days=14,
+                completed_at=now - timedelta(days=15),
+                followup_policy="unread_or_not_booked",
+            )
+            await session.flush()
+            run_id = run.id
+            recipient = _make_recipient(session, run_id, status="read", read_at=now - timedelta(days=10))
+            await session.flush()
+            recipient_id = recipient.id
+
+    await process_run(run_id)
+
+    async with session_maker() as session:
+        run = await session.get(CampaignRun, run_id)
+        r = await session.get(CampaignRecipient, recipient_id)
+
+    meta = run.meta or {}
+    assert meta.get("followup_auto_status") == "completed"
+    assert meta.get("followup_auto_planned_count") == 0
+    assert meta.get("followup_auto_queued_count") == 0
+    assert meta.get("followup_auto_skipped_count") == 1
+    assert r.followup_status == "skipped_read"
+    assert await _count_followup_jobs(session_maker, run_id) == 0
+
+
+@pytest.mark.asyncio
+async def test_mixed_batch_one_cycle_safety(worker_session, session_maker) -> None:
+    """One polling cycle over a historical + already-processed + 2 recent runs."""
+    now = datetime.now(timezone.utc)
+    async with session_maker() as session:
+        async with session.begin():
+            hist = _make_run(
+                session, followup_delay_days=14, completed_at=now - timedelta(days=40),
+                followup_policy="unread_or_not_booked",
+            )
+            processed = _make_run(
+                session, followup_delay_days=14, completed_at=now - timedelta(days=40),
+                followup_policy="unread_or_not_booked",
+            )
+            recent_elig = _make_run(
+                session, followup_delay_days=14, completed_at=now - timedelta(days=15),
+                followup_policy="unread_or_not_booked",
+            )
+            recent_zero = _make_run(
+                session, followup_delay_days=14, completed_at=now - timedelta(days=15),
+                followup_policy="unread_or_not_booked",
+            )
+            await session.flush()
+            hist_id, processed_id = hist.id, processed.id
+            recent_elig_id, recent_zero_id = recent_elig.id, recent_zero.id
+
+            _make_recipient(session, hist_id, status="delivered")
+            _make_recipient(session, processed_id, status="delivered")
+            _add_followup_job(session, processed_id, status="done", dedupe=f"mixed-existing-{processed_id}")
+            _make_recipient(session, recent_elig_id, status="delivered")
+            _make_recipient(session, recent_zero_id, status="read", read_at=now - timedelta(days=10))
+            await session.flush()
+
+    # One polling cycle: claim (batch 5) then process each claimed run.
+    async with session_maker() as session:
+        async with session.begin():
+            claimed = await _claim_due_runs(session)
+    assert set(claimed) == {hist_id, processed_id, recent_elig_id, recent_zero_id}
+    for rid in claimed:
+        await process_run(rid)
+
+    async with session_maker() as session:
+        hist_run = await session.get(CampaignRun, hist_id)
+        processed_run = await session.get(CampaignRun, processed_id)
+        recent_elig_run = await session.get(CampaignRun, recent_elig_id)
+        recent_zero_run = await session.get(CampaignRun, recent_zero_id)
+
+    assert (hist_run.meta or {}).get("followup_auto_status") == "skipped_historical"
+    assert (processed_run.meta or {}).get("followup_auto_status") == "skipped_already_processed"
+    assert (recent_elig_run.meta or {}).get("followup_auto_status") == "completed"
+    assert (recent_elig_run.meta or {}).get("followup_auto_queued_count") == 1
+    assert (recent_zero_run.meta or {}).get("followup_auto_status") == "completed"
+    assert (recent_zero_run.meta or {}).get("followup_auto_queued_count") == 0
+
+    # No duplicate jobs: historical=0, processed keeps its 1, recent_elig=1, recent_zero=0
+    assert await _count_followup_jobs(session_maker, hist_id) == 0
+    assert await _count_followup_jobs(session_maker, processed_id) == 1
+    assert await _count_followup_jobs(session_maker, recent_elig_id) == 1
+    assert await _count_followup_jobs(session_maker, recent_zero_id) == 0
+
+
+@pytest.mark.asyncio
+async def test_settings_override_max_due_age(worker_session, session_maker, monkeypatch) -> None:
+    """Worker respects an overridden auto_followup_max_due_age_days."""
+    now = datetime.now(timezone.utc)
+    async with session_maker() as session:
+        async with session.begin():
+            # due_at ≈ now-3d: NOT historical at default 7, but historical at 1.
+            run = _make_run(
+                session, followup_delay_days=14, completed_at=now - timedelta(days=17),
+                followup_policy="unread_or_not_booked",
+            )
+            await session.flush()
+            run_id = run.id
+            _make_recipient(session, run_id, status="delivered")
+            await session.flush()
+
+    monkeypatch.setattr(followup_worker_module.settings, "auto_followup_max_due_age_days", 1)
+
+    await process_run(run_id)
+
+    async with session_maker() as session:
+        run = await session.get(CampaignRun, run_id)
+
+    meta = run.meta or {}
+    assert meta.get("followup_auto_status") == "skipped_historical"
+    assert meta.get("followup_auto_max_due_age_days") == 1

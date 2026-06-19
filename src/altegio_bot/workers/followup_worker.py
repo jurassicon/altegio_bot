@@ -6,6 +6,7 @@
 
 Состояние хранится в run.meta (без миграций):
   followup_auto_status:        "processing" | "completed" | "failed"
+                               | "skipped_historical" | "skipped_already_processed"
   followup_auto_started_at:    ISO timestamp начала (или последнего reclaim)
   followup_auto_completed_at:  ISO timestamp успешного завершения
   followup_auto_last_error:    строка ошибки (только при "failed")
@@ -33,20 +34,41 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import and_, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from altegio_bot.campaigns.followup import count_followup_skipped, execute_followup, plan_followup
+from altegio_bot.campaigns.followup import (
+    count_followup_skipped,
+    execute_followup,
+    existing_followup_work_counts,
+    plan_followup,
+)
 from altegio_bot.campaigns.runner import CAMPAIGN_CODE
 from altegio_bot.db import SessionLocal
 from altegio_bot.models.models import CampaignRun
+from altegio_bot.settings import settings
 from altegio_bot.utils import utcnow
 
 logger = logging.getLogger("followup_worker")
 
 STALE_PROCESSING_MINUTES = 30
+
+# Terminal, non-claimable auto statuses set by the first-deploy safety gate.
+# Both keep followup_auto_status non-null so the run is never re-claimed.
+AUTO_STATUS_SKIPPED_HISTORICAL = "skipped_historical"
+AUTO_STATUS_SKIPPED_ALREADY_PROCESSED = "skipped_already_processed"
+
+
+def _followup_due_at(run: CampaignRun) -> datetime | None:
+    """followup_due_at = completed_at + followup_delay_days (aware), or None."""
+    if run.completed_at is None or run.followup_delay_days is None:
+        return None
+    completed = run.completed_at
+    if completed.tzinfo is None:
+        completed = completed.replace(tzinfo=timezone.utc)
+    return completed + timedelta(days=run.followup_delay_days)
 
 
 async def _claim_due_runs(session: AsyncSession, *, limit: int = 5) -> list[int]:
@@ -145,6 +167,86 @@ async def process_run(run_id: int) -> None:
     logger.info("followup_worker: processing run_id=%d", run_id)
 
     try:
+        now = utcnow()
+
+        # --- First-deploy safety gate ---------------------------------------
+        # Protects the first production rollout from auto-sending historical
+        # backlog and from duplicating already-processed follow-up work.
+        # Skipped for stale-recovery reclaims (followup_auto_recovered): those
+        # runs were already claimed under the gate and their recipients carry
+        # legitimate in-flight follow-up state that plan/execute must recover.
+        # Order matters: already-processed is checked BEFORE the historical age
+        # skip so a run with existing jobs gets the more accurate terminal status.
+        async with SessionLocal() as session:
+            async with session.begin():
+                run = await session.get(CampaignRun, run_id)
+                if run is None:
+                    logger.warning("followup_worker: run_id=%d not found before processing", run_id)
+                    return
+                meta = dict(run.meta or {})
+                is_recovery = bool(meta.get("followup_auto_recovered"))
+
+                if not is_recovery:
+                    # 1. Already has follow-up work (manual ops run or historical
+                    #    jobs created before the worker existed) → do not touch.
+                    counts = await existing_followup_work_counts(session, run_id)
+                    if counts["existing_followup_recipients_count"] or counts["existing_followup_jobs_count"]:
+                        meta.update(
+                            {
+                                "followup_auto_status": AUTO_STATUS_SKIPPED_ALREADY_PROCESSED,
+                                "followup_auto_started_at": now.isoformat(),
+                                "followup_auto_completed_at": now.isoformat(),
+                                "followup_auto_last_error": None,
+                                "followup_auto_skip_reason": (
+                                    "Run already has follow-up work; auto worker skipped to avoid duplicate sends"
+                                ),
+                                "followup_auto_planned_count": 0,
+                                "followup_auto_queued_count": 0,
+                                "followup_auto_skipped_count": 0,
+                                "followup_auto_failed_count": 0,
+                                **counts,
+                            }
+                        )
+                        run.meta = meta
+                        logger.warning(
+                            "followup_worker: run_id=%d already has follow-up work %s → %s",
+                            run_id,
+                            counts,
+                            AUTO_STATUS_SKIPPED_ALREADY_PROCESSED,
+                        )
+                        return
+
+                    # 2. Historical due run, too old for safe auto backfill.
+                    due_at = _followup_due_at(run)
+                    max_age = settings.auto_followup_max_due_age_days
+                    if due_at is not None and due_at < now - timedelta(days=max_age):
+                        meta.update(
+                            {
+                                "followup_auto_status": AUTO_STATUS_SKIPPED_HISTORICAL,
+                                "followup_auto_started_at": now.isoformat(),
+                                "followup_auto_completed_at": now.isoformat(),
+                                "followup_auto_last_error": None,
+                                "followup_auto_skip_reason": (
+                                    "followup_due_at is older than auto-follow-up safety window"
+                                ),
+                                "followup_auto_due_at": due_at.isoformat(),
+                                "followup_auto_max_due_age_days": max_age,
+                                "followup_auto_planned_count": 0,
+                                "followup_auto_queued_count": 0,
+                                "followup_auto_skipped_count": 0,
+                                "followup_auto_failed_count": 0,
+                            }
+                        )
+                        run.meta = meta
+                        logger.warning(
+                            "followup_worker: run_id=%d due_at=%s older than %d days → %s",
+                            run_id,
+                            due_at.isoformat(),
+                            max_age,
+                            AUTO_STATUS_SKIPPED_HISTORICAL,
+                        )
+                        return
+
         # 1. Планируем: помечаем eligible получателей как followup_planned
         async with SessionLocal() as session:
             async with session.begin():

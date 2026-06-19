@@ -4515,6 +4515,14 @@ async def ops_campaign_run_detail(run_id: int) -> str:
     elif fa_status == "completed":
         schedule_status = "completed"
         status_color = "success"
+    elif fa_status == "skipped_historical":
+        # Terminal: auto worker refused to backfill a too-old due run.
+        schedule_status = "skipped (historical)"
+        status_color = "secondary"
+    elif fa_status == "skipped_already_processed":
+        # Terminal: run already had follow-up work; auto worker skipped it.
+        schedule_status = "skipped (already processed)"
+        status_color = "secondary"
     elif fa_status == "failed":
         schedule_status = "failed"
         status_color = "danger"
@@ -4543,6 +4551,13 @@ async def ops_campaign_run_detail(run_id: int) -> str:
     fa_error = meta.get("followup_auto_last_error", "")
     fa_error_html = f'<span class="text-danger">{_esc(fa_error)}</span>' if fa_error else "—"
 
+    fa_skip_reason = meta.get("followup_auto_skip_reason")
+    skip_reason_row = (
+        f'<dt class="col-sm-3">Auto skip reason</dt><dd class="col-sm-9">{_esc(fa_skip_reason)}</dd>'
+        if fa_skip_reason
+        else ""
+    )
+
     followup_block = f"""
 <div class="card mb-3">
   <div class="card-header">🔁 Follow-up schedule / auto-run</div>
@@ -4566,6 +4581,7 @@ async def ops_campaign_run_detail(run_id: int) -> str:
       <dd class="col-sm-9">{status_html}</dd>
       <dt class="col-sm-3">Auto status (run.meta)</dt>
       <dd class="col-sm-9">{_esc(fa_status) or "—"}</dd>
+      {skip_reason_row}
       <dt class="col-sm-3">Auto started</dt>
       <dd class="col-sm-9">{_esc(str(meta.get("followup_auto_started_at") or "—"))}</dd>
       <dt class="col-sm-3">Auto completed</dt>
