@@ -103,6 +103,7 @@ def _make_recipient(
     *,
     status: str = "queued",
     read_at: datetime | None = None,
+    replied_at: datetime | None = None,
     booked_after_at: datetime | None = None,
     sent_at: datetime | None = None,
     altegio_client_id: int | None = None,
@@ -117,6 +118,7 @@ def _make_recipient(
         display_name="Test Client",
         status=status,
         read_at=read_at,
+        replied_at=replied_at,
         booked_after_at=booked_after_at,
         sent_at=sent_at or CAMPAIGN_SENT_AT,
         followup_status="followup_planned",
@@ -280,6 +282,86 @@ async def test_followup_guard_skips_read_at(session_maker) -> None:
 
     assert result.eligible is False
     assert result.followup_status == "skipped_read"
+
+
+# ---------------------------------------------------------------------------
+# 2b. replied_at is not None → skipped_replied (guard must match classifier)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_followup_guard_skips_replied_at(session_maker) -> None:
+    """replied_at set blocks follow-up even when status is still 'delivered'."""
+    async with session_maker() as session:
+        async with session.begin():
+            run = _make_run(session)
+            client = _make_client(session)
+            await session.flush()
+            recipient = _make_recipient(
+                session,
+                run.id,
+                client.id,
+                status="delivered",
+                replied_at=NOW - timedelta(days=1),
+            )
+            await session.flush()
+
+            result = await check_followup_final_eligibility(session, recipient, run, NOW)
+
+    assert result.eligible is False
+    assert result.followup_status == "skipped_replied"
+    assert result.skip_reason is not None
+    assert "replied" in result.skip_reason.lower()
+
+
+@pytest.mark.asyncio
+async def test_outbox_worker_followup_replied_does_not_send(
+    ow_session,
+    session_maker,
+) -> None:
+    """A queued follow-up job is canceled if replied_at appears before send."""
+    async with session_maker() as session:
+        async with session.begin():
+            run = _make_run(session)
+            client = _make_client(session)
+            await session.flush()
+            recipient = _make_recipient(
+                session,
+                run.id,
+                client.id,
+                status="delivered",
+                replied_at=NOW - timedelta(days=1),
+            )
+            await session.flush()
+            recipient_id = recipient.id
+
+            job = _make_followup_job(
+                session,
+                run_id=run.id,
+                recipient_id=recipient.id,
+                client_id=client.id,
+            )
+            await session.flush()
+            job_id = job.id
+
+    provider = MagicMock()
+    provider.send_template = AsyncMock()
+
+    await _lock_job(session_maker, job_id)
+
+    async with session_maker() as session:
+        async with session.begin():
+            await ow.process_job_in_session(session, job_id, provider=provider)
+
+    async with session_maker() as session:
+        db_job = await session.get(MessageJob, job_id)
+        db_recipient = await session.get(CampaignRecipient, recipient_id)
+
+    assert db_job is not None
+    assert db_job.status == "canceled"
+    assert db_recipient is not None
+    assert db_recipient.followup_status == "skipped_replied"
+    provider.send_template.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -750,6 +832,7 @@ async def test_followup_guard_skips_opt_out_by_phone_when_client_id_stale() -> N
     recipient = SimpleNamespace(
         status="delivered",
         read_at=None,
+        replied_at=None,
         booked_after_at=None,
         client_id=999999,  # nonexistent in DB
         phone_e164=PHONE,

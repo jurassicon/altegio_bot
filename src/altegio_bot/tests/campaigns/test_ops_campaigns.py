@@ -13,7 +13,7 @@ from sqlalchemy import select
 import altegio_bot.ops.campaigns_api as campaigns_api_module
 import altegio_bot.ops.router as ops_router_module
 from altegio_bot.main import app
-from altegio_bot.models.models import CampaignRecipient, CampaignRun, MessageJob
+from altegio_bot.models.models import CampaignRecipient, CampaignRun, Client, MessageJob, Record
 from altegio_bot.ops.auth import require_ops_auth
 
 
@@ -1894,6 +1894,205 @@ async def test_run_detail_shows_auto_completed_counts(
     # Status badge derived as completed, not the stuck warning.
     assert "Due now, not processed yet" not in text
     assert "Planned / Queued / Skipped / Failed" in text
+
+
+# ---------------------------------------------------------------------------
+# Follow-up candidate sorting: delivery statuses are not "skipped" (P3)
+# ---------------------------------------------------------------------------
+
+
+def _bare_recipient(**kw) -> CampaignRecipient:
+    defaults = dict(
+        campaign_run_id=1,
+        company_id=758285,
+        status="delivered",
+        excluded_reason=None,
+        read_at=None,
+        replied_at=None,
+        booked_after_at=None,
+        followup_status=None,
+    )
+    defaults.update(kw)
+    return CampaignRecipient(**defaults)
+
+
+@pytest.mark.parametrize("fs", ["sent", "provider_accepted", "delivered", "read"])
+def test_candidate_priority_delivery_statuses_not_skipped(fs: str) -> None:
+    """Follow-up delivery statuses get the delivery bucket (2), never the skip bucket (4)."""
+    from altegio_bot.ops.router import _followup_candidate_view
+
+    priority, _reason = _followup_candidate_view(_bare_recipient(followup_status=fs), "unread_or_not_booked")
+    assert priority == 2, f"{fs} must be a delivery status, not skipped"
+
+
+@pytest.mark.parametrize(
+    "fs",
+    [
+        "followup_skipped",
+        "skipped_read",
+        "skipped_replied",
+        "skipped_booked_after",
+        "skipped_opted_out",
+        "skipped_future_record",
+        "canceled",
+    ],
+)
+def test_candidate_priority_skip_statuses_in_skip_bucket(fs: str) -> None:
+    """Skip / cancel statuses stay in the skip bucket (4)."""
+    from altegio_bot.ops.router import _followup_candidate_view
+
+    priority, _reason = _followup_candidate_view(_bare_recipient(followup_status=fs), "unread_or_not_booked")
+    assert priority == 4
+
+
+def test_candidate_priority_planned_and_failed_buckets() -> None:
+    from altegio_bot.ops.router import _followup_candidate_view
+
+    for fs in ("followup_planned", "followup_processing", "followup_queued"):
+        assert _followup_candidate_view(_bare_recipient(followup_status=fs), "unread_only")[0] == 1
+    assert _followup_candidate_view(_bare_recipient(followup_status="followup_failed"), "unread_only")[0] == 3
+
+
+def test_candidate_priority_eligible_bucket_local_fallback() -> None:
+    """Unread/delivered with no followup_status and no preview → eligible (bucket 0)."""
+    from altegio_bot.ops.router import _followup_candidate_view
+
+    priority, reason = _followup_candidate_view(_bare_recipient(), "unread_or_not_booked")
+    assert priority == 0
+    assert reason == "eligible"
+
+
+@pytest.mark.asyncio
+async def test_candidate_table_legend_mentions_delivery_statuses(
+    http_client: AsyncClient,
+    due_unprocessed_run: int,
+) -> None:
+    """The candidate table legend reflects the delivery-aware sort order."""
+    response = await http_client.get(f"/ops/campaigns/{due_unprocessed_run}")
+    assert response.status_code == 200
+    assert "sent/delivered/read" in response.text
+
+
+# ---------------------------------------------------------------------------
+# Ops "eligible now" uses final-guard semantics (P4)
+# ---------------------------------------------------------------------------
+
+
+@pytest_asyncio.fixture
+async def run_with_guard_sensitive_candidates(session_maker) -> int:
+    """Run with eligible / opted-out / future-record recipients (no followup_status)."""
+    from datetime import timedelta
+
+    now = datetime.now(timezone.utc)
+    async with session_maker() as session:
+        async with session.begin():
+            run = CampaignRun(
+                campaign_code="new_clients_monthly",
+                mode="send-real",
+                company_ids=[758285],
+                period_start=now.replace(day=1, hour=0, minute=0, second=0, microsecond=0),
+                period_end=now,
+                status="completed",
+                followup_enabled=True,
+                followup_delay_days=14,
+                followup_policy="unread_or_not_booked",
+                followup_template_name="kitilash_ka_newsletter_new_clients_followup_v1",
+                completed_at=now - timedelta(days=20),
+                meta={},
+            )
+            session.add(run)
+            await session.flush()
+            run_id = run.id
+
+            ok = Client(
+                company_id=758285,
+                altegio_client_id=5001,
+                phone_e164="+49500000001",
+                display_name="Clean",
+                raw={},
+                wa_opted_out=False,
+            )
+            opted = Client(
+                company_id=758285,
+                altegio_client_id=5002,
+                phone_e164="+49500000002",
+                display_name="OptedOut",
+                raw={},
+                wa_opted_out=True,
+            )
+            fut = Client(
+                company_id=758285,
+                altegio_client_id=5003,
+                phone_e164="+49500000003",
+                display_name="Future",
+                raw={},
+                wa_opted_out=False,
+            )
+            session.add_all([ok, opted, fut])
+            await session.flush()
+
+            for cid, aid, phone, name in (
+                (ok.id, 5001, "+49500000001", "Eligible Now Client"),
+                (opted.id, 5002, "+49500000002", "Opted Out Client"),
+                (fut.id, 5003, "+49500000003", "Future Record Client"),
+            ):
+                session.add(
+                    CampaignRecipient(
+                        campaign_run_id=run_id,
+                        company_id=758285,
+                        client_id=cid,
+                        altegio_client_id=aid,
+                        phone_e164=phone,
+                        display_name=name,
+                        status="delivered",
+                        sent_at=now - timedelta(days=20),
+                    )
+                )
+
+            # Future active record for the "Future" client.
+            session.add(
+                Record(
+                    company_id=758285,
+                    altegio_record_id=6003,
+                    client_id=fut.id,
+                    altegio_client_id=5003,
+                    starts_at=now + timedelta(days=365),
+                    is_deleted=False,
+                    raw={},
+                )
+            )
+
+    return run_id
+
+
+def _candidate_section(html: str) -> str:
+    """Slice out just the Follow-up candidates card (it precedes Funnel contacts)."""
+    start = html.index("🎯 Follow-up candidates")
+    end = html.index("👥 Funnel contacts") if "👥 Funnel contacts" in html else len(html)
+    return html[start:end]
+
+
+@pytest.mark.asyncio
+async def test_candidate_eligible_now_reflects_final_guard(
+    http_client: AsyncClient,
+    run_with_guard_sensitive_candidates: int,
+) -> None:
+    """Opt-out / future-record recipients must not show as eligible; clean one does."""
+    response = await http_client.get(f"/ops/campaigns/{run_with_guard_sensitive_candidates}")
+    assert response.status_code == 200
+    section = _candidate_section(response.text)
+
+    # All three appear in the candidate table.
+    assert "Eligible Now Client" in section
+    assert "Opted Out Client" in section
+    assert "Future Record Client" in section
+
+    # Final-guard preview reclassifies opt-out / future-record as skips,
+    # surfacing their real reasons instead of "eligible".
+    assert "opted_out" in section
+    assert "future_record" in section
+    # The clean recipient is still shown as eligible.
+    assert "eligible" in section
 
 
 @pytest.mark.asyncio

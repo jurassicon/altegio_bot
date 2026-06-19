@@ -17,7 +17,12 @@ from fastapi import APIRouter, Depends, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from sqlalchemy import func, select, text
 
-from altegio_bot.campaigns.followup import classify_followup_candidate, followup_run_at
+from altegio_bot.campaigns.followup import (
+    FollowupFinalEligibilityResult,
+    check_followup_final_eligibility,
+    classify_followup_candidate,
+    followup_run_at,
+)
 from altegio_bot.campaigns.reports import monthly_dashboard, run_report
 from altegio_bot.db import SessionLocal
 from altegio_bot.meta_templates import META_TEMPLATE_MAP
@@ -180,23 +185,75 @@ def _parse_meta_dt(value: Any) -> datetime | None:
     return dt
 
 
-def _followup_candidate_priority(r: CampaignRecipient, policy: str | None) -> int:
-    """Sort priority for the Follow-up candidates table (lower = shown first).
+# Follow-up delivery statuses written by the outbox worker once a follow-up is
+# actually being sent. These are real delivery states, NOT skips.
+_FOLLOWUP_DELIVERY_STATUSES = frozenset({"sent", "provider_accepted", "delivered", "read"})
 
-    0 eligible · 1 planned/processing/queued · 2 failed · 3 skipped · 4 other.
+# Terminal skip / cancel follow-up statuses.
+_FOLLOWUP_SKIPPED_STATUSES = frozenset(
+    {
+        "followup_skipped",
+        "skipped_read",
+        "skipped_replied",
+        "skipped_booked_after",
+        "skipped_opted_out",
+        "skipped_future_record",
+        "canceled",
+    }
+)
+
+# Bootstrap table row class per candidate priority bucket.
+_CANDIDATE_ROW_CLASS = {
+    0: "table-success",  # eligible now
+    1: "table-primary",  # planned / processing / queued
+    2: "table-info",  # follow-up delivery in progress / delivered / read
+    3: "table-danger",  # failed
+    4: "table-warning",  # skipped / canceled
+    5: "",  # other / unknown
+}
+
+
+def _followup_candidate_view(
+    r: CampaignRecipient,
+    policy: str | None,
+    final_preview: dict[int, FollowupFinalEligibilityResult] | None = None,
+) -> tuple[int, str]:
+    """Return (sort_priority, fu_reason) for a Follow-up candidates row.
+
+    Priority buckets (lower = shown first):
+      0 eligible now
+      1 follow-up planned / processing / queued
+      2 follow-up delivery (sent / provider_accepted / delivered / read)
+      3 follow-up failed
+      4 skipped / canceled
+      5 other / unknown
+
+    "eligible now" uses final-guard semantics when ``final_preview`` provides a
+    precomputed check_followup_final_eligibility() result for this recipient;
+    otherwise it falls back to the cheap local classifier.
     """
     fs = r.followup_status
-    if fs in ("followup_planned", "followup_processing", "followup_queued"):
-        return 1
-    if fs == "followup_failed":
-        return 2
     if fs is not None:
-        # any skipped_* / followup_skipped status
-        return 3
-    # No followup_status yet — classify against the run policy.
+        if fs in ("followup_planned", "followup_processing", "followup_queued"):
+            return 1, _fu_reason(r)
+        if fs in _FOLLOWUP_DELIVERY_STATUSES:
+            return 2, f"followup_{fs}"
+        if fs == "followup_failed":
+            return 3, "failed"
+        if fs in _FOLLOWUP_SKIPPED_STATUSES:
+            return 4, _fu_reason(r)
+        return 5, _fu_reason(r)
+
+    # No followup_status yet — local pre-check + (optional) final-guard preview.
+    prev = (final_preview or {}).get(r.id)
+    if prev is not None:
+        if prev.eligible:
+            return 0, "eligible"
+        reason = _FOLLOWUP_STATUS_SKIP_REASON.get(prev.followup_status or "", prev.followup_status or "skipped")
+        return 4, reason
     if policy and classify_followup_candidate(r, policy).eligible:
-        return 0
-    return 4
+        return 0, "eligible"
+    return 4, _fu_reason(r)
 
 
 _NAV = """
@@ -4142,6 +4199,31 @@ async def ops_campaign_run_detail(run_id: int) -> str:
             ).all()
             job_info_map = {row.id: (row.status, row.run_at) for row in job_rows}
 
+        # Final-guard preview for displayed candidates (read-only).
+        # For rows with no followup_status that pass the cheap local classifier,
+        # run the real check_followup_final_eligibility() so the "eligible now"
+        # column honestly reflects opt-out / future-record / post-campaign
+        # booking state — the same semantics plan_followup/execute_followup use.
+        # Bounded to the displayed funnel set (<= _FUNNEL_TABLE_LIMIT rows).
+        candidate_now = utcnow()
+        final_preview: dict[int, FollowupFinalEligibilityResult] = {}
+        if run.followup_policy:
+            for _r in funnel_recipients:
+                if _r.followup_status is not None:
+                    continue
+                if not classify_followup_candidate(_r, run.followup_policy).eligible:
+                    continue
+                try:
+                    final_preview[_r.id] = await check_followup_final_eligibility(
+                        session=session,
+                        recipient=_r,
+                        run=run,
+                        now=candidate_now,
+                    )
+                except Exception:
+                    # Preview is best-effort: never break the page on a guard error.
+                    continue
+
     meta = run.meta or {}
     last_error = meta.get("last_error")
 
@@ -4568,9 +4650,12 @@ async def ops_campaign_run_detail(run_id: int) -> str:
     # operator does not have to infer eligibility from the mixed funnel table.
     candidates_block = ""
     if funnel_recipients:
+        # Precompute (priority, reason) per recipient using the final-guard
+        # preview so sorting, FU reason and eligible/skip display all agree.
+        cand_views = {r.id: _followup_candidate_view(r, run.followup_policy, final_preview) for r in funnel_recipients}
         sorted_candidates = sorted(
             funnel_recipients,
-            key=lambda r: (_followup_candidate_priority(r, run.followup_policy), r.id),
+            key=lambda r: (cand_views[r.id][0], r.id),
         )
         cand_cols = [
             "ID",
@@ -4589,9 +4674,9 @@ async def ops_campaign_run_detail(run_id: int) -> str:
         ]
         cand_rows = []
         cand_row_classes = []
-        _priority_row_class = {0: "table-success", 1: "table-primary", 2: "table-danger", 3: "table-warning"}
         for r in sorted_candidates:
             ob_status = outbox_status_map.get(r.outbox_message_id or 0, "")
+            priority, fu_reason = cand_views[r.id]
             cand_rows.append(
                 [
                     _esc(str(r.id)),
@@ -4599,7 +4684,7 @@ async def ops_campaign_run_detail(run_id: int) -> str:
                     _esc(r.phone_e164 or ""),
                     _status_badge(r.status),
                     _status_badge(ob_status),
-                    _esc(_fu_reason(r)),
+                    _esc(fu_reason),
                     _esc(_fmt_dt(r.read_at, tz)),
                     _esc(_fmt_dt(r.replied_at, tz)),
                     _esc(_fmt_dt(r.booked_after_at, tz)),
@@ -4609,9 +4694,7 @@ async def ops_campaign_run_detail(run_id: int) -> str:
                     _esc(_fmt_dt(r.followup_sent_at, tz)),
                 ]
             )
-            cand_row_classes.append(
-                _priority_row_class.get(_followup_candidate_priority(r, run.followup_policy), "")
-            )
+            cand_row_classes.append(_CANDIDATE_ROW_CLASS.get(priority, ""))
         _cand_header = (
             f"🎯 Follow-up candidates (showing first {_FUNNEL_TABLE_LIMIT} of {funnel_total})"
             if funnel_total > _FUNNEL_TABLE_LIMIT
@@ -4622,8 +4705,9 @@ async def ops_campaign_run_detail(run_id: int) -> str:
   <div class="card-header">{_cand_header}</div>
   <div class="card-body p-0">
     <div class="px-3 pt-2 text-muted small">
-      Sorted: eligible first, then planned / processing / queued, then failed, then skipped.
-      "eligible" = would be queued for sending if the follow-up worker ran now.
+      Sorted: eligible first, then planned/queued, then sent/delivered/read, then failed, then skipped.
+      "eligible" = would be queued for sending if the follow-up worker ran now (opt-out, future
+      bookings and post-campaign records are already accounted for).
     </div>
     {_table(cand_cols, cand_rows, cand_row_classes)}
   </div>

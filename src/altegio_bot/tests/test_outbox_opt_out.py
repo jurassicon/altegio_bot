@@ -54,6 +54,7 @@ class FakeSession:
             return SimpleNamespace(
                 status="delivered",
                 read_at=None,
+                replied_at=None,
                 booked_after_at=None,
                 client_id=None,
                 phone_e164=None,

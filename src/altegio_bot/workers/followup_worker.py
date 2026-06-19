@@ -38,7 +38,7 @@ from datetime import timedelta
 from sqlalchemy import and_, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from altegio_bot.campaigns.followup import execute_followup, plan_followup
+from altegio_bot.campaigns.followup import count_followup_skipped, execute_followup, plan_followup
 from altegio_bot.campaigns.runner import CAMPAIGN_CODE
 from altegio_bot.db import SessionLocal
 from altegio_bot.models.models import CampaignRun
@@ -159,7 +159,6 @@ async def process_run(run_id: int) -> None:
         # 2. Выполняем: создаём MessageJob для каждого followup_planned получателя
         stats = await execute_followup(run_id)
         queued_count = stats.get("queued", 0)
-        skipped_count = stats.get("skipped", 0)
         failed_count = stats.get("failed", 0)
 
         logger.info(
@@ -167,6 +166,13 @@ async def process_run(run_id: int) -> None:
             run_id,
             stats,
         )
+
+        # Skipped count из БД: включает и plan-time skips (локальный pre-check +
+        # финальный guard в plan_followup — opt-out / future record / booking
+        # event), и execute-time skips. stats["skipped"] покрывает только
+        # последние, поэтому считаем терминальные skip-статусы напрямую.
+        async with SessionLocal() as session:
+            skipped_count = await count_followup_skipped(session, run_id)
 
         # 3. Записываем успех (сохраняем recovery-поля, если они есть)
         async with SessionLocal() as session:
