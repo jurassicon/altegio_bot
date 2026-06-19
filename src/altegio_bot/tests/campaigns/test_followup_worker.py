@@ -995,3 +995,210 @@ async def test_settings_override_max_due_age(worker_session, session_maker, monk
     meta = run.meta or {}
     assert meta.get("followup_auto_status") == "skipped_historical"
     assert meta.get("followup_auto_max_due_age_days") == 1
+
+
+# ---------------------------------------------------------------------------
+# Crash window: worker dies between batch claim and the safety gate.
+# followup_auto_recovered alone must NOT bypass the gate — only the durable
+# followup_auto_safety_gate_passed marker does.
+# ---------------------------------------------------------------------------
+
+
+def _recovered_meta(*, safety_passed: bool = False) -> dict:
+    """Meta of a run reclaimed from stale 'processing' (worker crashed)."""
+    meta = {
+        "followup_auto_status": "processing",
+        "followup_auto_started_at": _stale_ts(),
+        "followup_auto_recovered": True,
+        "followup_auto_recovered_at": _stale_ts(),
+    }
+    if safety_passed:
+        meta["followup_auto_safety_gate_passed"] = True
+        meta["followup_auto_safety_gate_passed_at"] = _stale_ts()
+        meta["followup_auto_safety_checked_at"] = _stale_ts()
+    return meta
+
+
+@pytest.mark.asyncio
+async def test_recovered_historical_without_safety_marker_still_skipped(worker_session, session_maker) -> None:
+    """Crash before gate: recovered historical run must still become skipped_historical."""
+    now = datetime.now(timezone.utc)
+    async with session_maker() as session:
+        async with session.begin():
+            run = _make_run(
+                session,
+                followup_delay_days=14,
+                completed_at=now - timedelta(days=40),
+                followup_policy="unread_or_not_booked",
+                meta=_recovered_meta(),  # recovered=true, NO safety marker
+            )
+            await session.flush()
+            run_id = run.id
+            recipient = _make_recipient(session, run_id, status="delivered")
+            await session.flush()
+            recipient_id = recipient.id
+
+    await process_run(run_id)
+
+    async with session_maker() as session:
+        run = await session.get(CampaignRun, run_id)
+        r = await session.get(CampaignRecipient, recipient_id)
+
+    meta = run.meta or {}
+    assert meta.get("followup_auto_status") == "skipped_historical"
+    assert r.followup_status is None
+    assert r.followup_message_job_id is None
+    assert await _count_followup_jobs(session_maker, run_id) == 0
+
+
+@pytest.mark.asyncio
+async def test_recovered_already_processed_without_safety_marker_still_skipped(
+    worker_session, session_maker
+) -> None:
+    """Crash before gate: recovered run with existing jobs → skipped_already_processed."""
+    now = datetime.now(timezone.utc)
+    async with session_maker() as session:
+        async with session.begin():
+            run = _make_run(
+                session,
+                followup_delay_days=14,
+                completed_at=now - timedelta(days=40),
+                followup_policy="unread_or_not_booked",
+                meta=_recovered_meta(),
+            )
+            await session.flush()
+            run_id = run.id
+            _make_recipient(session, run_id, status="delivered")
+            _add_followup_job(session, run_id, status="done", dedupe=f"rec-existing-{run_id}")
+            await session.flush()
+
+    await process_run(run_id)
+
+    async with session_maker() as session:
+        run = await session.get(CampaignRun, run_id)
+
+    meta = run.meta or {}
+    assert meta.get("followup_auto_status") == "skipped_already_processed"
+    assert meta.get("existing_followup_jobs_count") == 1
+    assert await _count_followup_jobs(session_maker, run_id) == 1
+
+
+@pytest.mark.asyncio
+async def test_recovered_recent_without_safety_marker_runs_gate_then_processes(
+    worker_session, session_maker
+) -> None:
+    """Crash before gate: recovered recent run passes the gate, persists marker, completes."""
+    now = datetime.now(timezone.utc)
+    async with session_maker() as session:
+        async with session.begin():
+            run = _make_run(
+                session,
+                followup_delay_days=14,
+                completed_at=now - timedelta(days=15),
+                followup_policy="unread_or_not_booked",
+                meta=_recovered_meta(),
+            )
+            await session.flush()
+            run_id = run.id
+            recipient = _make_recipient(session, run_id, status="delivered")
+            await session.flush()
+            recipient_id = recipient.id
+
+    await process_run(run_id)
+
+    async with session_maker() as session:
+        run = await session.get(CampaignRun, run_id)
+        r = await session.get(CampaignRecipient, recipient_id)
+
+    meta = run.meta or {}
+    assert meta.get("followup_auto_status") == "completed"
+    assert meta.get("followup_auto_safety_gate_passed") is True
+    assert meta.get("followup_auto_safety_gate_passed_at")
+    assert meta.get("followup_auto_queued_count") == 1
+    assert r.followup_status == "followup_queued"
+    assert await _count_followup_jobs(session_maker, run_id) == 1
+
+
+@pytest.mark.asyncio
+async def test_recovery_after_safety_marker_resumes_without_skip(worker_session, session_maker) -> None:
+    """Recovery with safety marker present: in-flight partial work is resumed, not skipped."""
+    now = datetime.now(timezone.utc)
+    async with session_maker() as session:
+        async with session.begin():
+            run = _make_run(
+                session,
+                followup_delay_days=14,
+                completed_at=now - timedelta(days=15),
+                followup_policy="unread_or_not_booked",
+                meta=_recovered_meta(safety_passed=True),
+            )
+            await session.flush()
+            run_id = run.id
+            # Partial work from the crashed run: recipient already planned.
+            recipient = _make_recipient(session, run_id, status="delivered", followup_status="followup_planned")
+            await session.flush()
+            recipient_id = recipient.id
+
+    await process_run(run_id)
+
+    async with session_maker() as session:
+        run = await session.get(CampaignRun, run_id)
+        r = await session.get(CampaignRecipient, recipient_id)
+
+    meta = run.meta or {}
+    # Must NOT be reclassified as already_processed: the gate is skipped and the
+    # in-flight planned recipient is executed normally.
+    assert meta.get("followup_auto_status") == "completed"
+    assert meta.get("followup_auto_queued_count") == 1
+    assert r.followup_status == "followup_queued"
+    assert await _count_followup_jobs(session_maker, run_id) == 1
+
+
+@pytest.mark.asyncio
+async def test_mixed_batch_crash_recovery_regression(worker_session, session_maker) -> None:
+    """Batch claimed, only some processed, rest recovered next cycle without safety marker.
+
+    Recovered historical/already-processed runs must still be skipped; recovered
+    recent run must still process normally.
+    """
+    now = datetime.now(timezone.utc)
+    async with session_maker() as session:
+        async with session.begin():
+            hist = _make_run(
+                session, followup_delay_days=14, completed_at=now - timedelta(days=40),
+                followup_policy="unread_or_not_booked", meta=_recovered_meta(),
+            )
+            processed = _make_run(
+                session, followup_delay_days=14, completed_at=now - timedelta(days=40),
+                followup_policy="unread_or_not_booked", meta=_recovered_meta(),
+            )
+            recent = _make_run(
+                session, followup_delay_days=14, completed_at=now - timedelta(days=15),
+                followup_policy="unread_or_not_booked", meta=_recovered_meta(),
+            )
+            await session.flush()
+            hist_id, processed_id, recent_id = hist.id, processed.id, recent.id
+
+            _make_recipient(session, hist_id, status="delivered")
+            _make_recipient(session, processed_id, status="delivered")
+            _add_followup_job(session, processed_id, status="done", dedupe=f"mixrec-existing-{processed_id}")
+            _make_recipient(session, recent_id, status="delivered")
+            await session.flush()
+
+    # Recovery cycle: process each recovered run directly.
+    for rid in (hist_id, processed_id, recent_id):
+        await process_run(rid)
+
+    async with session_maker() as session:
+        hist_run = await session.get(CampaignRun, hist_id)
+        processed_run = await session.get(CampaignRun, processed_id)
+        recent_run = await session.get(CampaignRun, recent_id)
+
+    assert (hist_run.meta or {}).get("followup_auto_status") == "skipped_historical"
+    assert (processed_run.meta or {}).get("followup_auto_status") == "skipped_already_processed"
+    assert (recent_run.meta or {}).get("followup_auto_status") == "completed"
+    assert (recent_run.meta or {}).get("followup_auto_queued_count") == 1
+
+    assert await _count_followup_jobs(session_maker, hist_id) == 0
+    assert await _count_followup_jobs(session_maker, processed_id) == 1
+    assert await _count_followup_jobs(session_maker, recent_id) == 1

@@ -17,6 +17,14 @@
   followup_auto_recovered:     true — если run был reclaim-нут из stale processing
   followup_auto_recovered_at:  ISO timestamp reclaim-а
 
+First-deploy safety gate (durable marker, см. process_run):
+  followup_auto_safety_gate_passed:    true — gate уже пройден для этого run
+  followup_auto_safety_gate_passed_at: ISO timestamp прохождения gate
+  followup_auto_safety_checked_at:     ISO timestamp последней проверки gate
+  followup_auto_skip_reason:           причина terminal-skip (historical / already_processed)
+followup_auto_recovered сам по себе НЕ обходит gate: при крэше между claim и
+gate stale-recovery обязан повторно прогнать gate (иначе historical backfill).
+
 Политика ошибок:
   - Ошибка одного run не обрывает worker.
   - После ошибки статус = "failed", авто-retry не делается.
@@ -172,9 +180,17 @@ async def process_run(run_id: int) -> None:
         # --- First-deploy safety gate ---------------------------------------
         # Protects the first production rollout from auto-sending historical
         # backlog and from duplicating already-processed follow-up work.
-        # Skipped for stale-recovery reclaims (followup_auto_recovered): those
-        # runs were already claimed under the gate and their recipients carry
-        # legitimate in-flight follow-up state that plan/execute must recover.
+        #
+        # Durability against the crash-between-claim-and-process window:
+        # the gate is gated on a DURABLE marker followup_auto_safety_gate_passed,
+        # NOT on followup_auto_recovered. _claim_due_runs() sets
+        # followup_auto_recovered=true on stale reclaims, but that alone must not
+        # bypass the gate — otherwise a worker that crashed after claim but before
+        # the gate would let a recovered historical run slip into plan/execute.
+        # The marker is set only after the gate passes and is committed (this
+        # transaction block) BEFORE plan/execute. So:
+        #   * crash BEFORE gate → no marker → recovery re-runs the gate;
+        #   * crash DURING/after plan/execute → marker present → recovery resumes.
         # Order matters: already-processed is checked BEFORE the historical age
         # skip so a run with existing jobs gets the more accurate terminal status.
         async with SessionLocal() as session:
@@ -184,9 +200,9 @@ async def process_run(run_id: int) -> None:
                     logger.warning("followup_worker: run_id=%d not found before processing", run_id)
                     return
                 meta = dict(run.meta or {})
-                is_recovery = bool(meta.get("followup_auto_recovered"))
+                safety_passed = meta.get("followup_auto_safety_gate_passed") is True
 
-                if not is_recovery:
+                if not safety_passed:
                     # 1. Already has follow-up work (manual ops run or historical
                     #    jobs created before the worker existed) → do not touch.
                     counts = await existing_followup_work_counts(session, run_id)
@@ -209,10 +225,10 @@ async def process_run(run_id: int) -> None:
                         )
                         run.meta = meta
                         logger.warning(
-                            "followup_worker: run_id=%d already has follow-up work %s → %s",
+                            "followup_worker: run_id=%d safety=%s %s",
                             run_id,
-                            counts,
                             AUTO_STATUS_SKIPPED_ALREADY_PROCESSED,
+                            counts,
                         )
                         return
 
@@ -239,13 +255,30 @@ async def process_run(run_id: int) -> None:
                         )
                         run.meta = meta
                         logger.warning(
-                            "followup_worker: run_id=%d due_at=%s older than %d days → %s",
+                            "followup_worker: run_id=%d safety=%s due_at=%s older than %d days",
                             run_id,
+                            AUTO_STATUS_SKIPPED_HISTORICAL,
                             due_at.isoformat(),
                             max_age,
-                            AUTO_STATUS_SKIPPED_HISTORICAL,
                         )
                         return
+
+                    # 3. Gate passed → persist the durable marker. Committed when
+                    #    this transaction block exits, BEFORE plan/execute below.
+                    meta["followup_auto_safety_checked_at"] = now.isoformat()
+                    meta["followup_auto_safety_gate_passed"] = True
+                    meta["followup_auto_safety_gate_passed_at"] = now.isoformat()
+                    run.meta = meta
+                    logger.info("followup_worker: run_id=%d safety=passed", run_id)
+                else:
+                    # Stale recovery after the gate already passed: legitimate
+                    # in-flight run — resume normal plan/execute recovery, never
+                    # reclassify its own partial work as already-processed.
+                    logger.info(
+                        "followup_worker: run_id=%d safety=already_passed recovery=%s",
+                        run_id,
+                        bool(meta.get("followup_auto_recovered")),
+                    )
 
         # 1. Планируем: помечаем eligible получателей как followup_planned
         async with SessionLocal() as session:
