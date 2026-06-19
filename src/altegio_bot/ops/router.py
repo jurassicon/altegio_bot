@@ -7,6 +7,7 @@ All routes on `router` are protected by require_ops_auth.
 from __future__ import annotations
 
 import json
+import logging
 import re
 import secrets
 from datetime import datetime, timedelta, timezone
@@ -38,6 +39,8 @@ from .auth import (
     make_session_token,
     require_ops_auth,
 )
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/ops", dependencies=[Depends(require_ops_auth)])
 
@@ -202,6 +205,10 @@ _FOLLOWUP_SKIPPED_STATUSES = frozenset(
     }
 )
 
+# Sentinel followup_status used only for the read-only Ops candidate preview when
+# check_followup_final_eligibility() raises. Never persisted to the DB.
+_GUARD_PREVIEW_ERROR = "guard_preview_error"
+
 # Bootstrap table row class per candidate priority bucket.
 _CANDIDATE_ROW_CLASS = {
     0: "table-success",  # eligible now
@@ -209,7 +216,7 @@ _CANDIDATE_ROW_CLASS = {
     2: "table-info",  # follow-up delivery in progress / delivered / read
     3: "table-danger",  # failed
     4: "table-warning",  # skipped / canceled
-    5: "",  # other / unknown
+    5: "table-warning",  # other / unknown / guard_preview_error
 }
 
 
@@ -249,6 +256,10 @@ def _followup_candidate_view(
     if prev is not None:
         if prev.eligible:
             return 0, "eligible"
+        # Final-guard preview could not be computed for this row. Never show it
+        # as eligible — surface the error and sort it away from real candidates.
+        if prev.followup_status == _GUARD_PREVIEW_ERROR:
+            return 5, _GUARD_PREVIEW_ERROR
         reason = _FOLLOWUP_STATUS_SKIP_REASON.get(prev.followup_status or "", prev.followup_status or "skipped")
         return 4, reason
     if policy and classify_followup_candidate(r, policy).eligible:
@@ -4221,8 +4232,22 @@ async def ops_campaign_run_detail(run_id: int) -> str:
                         now=candidate_now,
                     )
                 except Exception:
-                    # Preview is best-effort: never break the page on a guard error.
-                    continue
+                    # Never break the page on a guard error — but do NOT silently
+                    # fall back to the local classifier (which could show this row
+                    # as "eligible"). Mark it as a non-eligible preview error so the
+                    # UI is honest. Sending logic stays protected by the worker /
+                    # outbox final guard regardless of this read-only preview.
+                    logger.exception(
+                        "followup candidate guard preview failed run_id=%s recipient_id=%s",
+                        run_id,
+                        _r.id,
+                    )
+                    final_preview[_r.id] = FollowupFinalEligibilityResult(
+                        eligible=False,
+                        skip_reason="Follow-up eligibility preview could not be computed",
+                        followup_status=_GUARD_PREVIEW_ERROR,
+                        booked_after_at=None,
+                    )
 
     meta = run.meta or {}
     last_error = meta.get("last_error")
@@ -4708,6 +4733,8 @@ async def ops_campaign_run_detail(run_id: int) -> str:
       Sorted: eligible first, then planned/queued, then sent/delivered/read, then failed, then skipped.
       "eligible" = would be queued for sending if the follow-up worker ran now (opt-out, future
       bookings and post-campaign records are already accounted for).
+      "guard_preview_error" means the UI could not compute the final-eligibility preview for that
+      row; sending logic remains protected by the worker / outbox final guard.
     </div>
     {_table(cand_cols, cand_rows, cand_row_classes)}
   </div>

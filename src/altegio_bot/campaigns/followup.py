@@ -605,13 +605,26 @@ async def check_followup_final_eligibility(
     and a human-readable skip_reason for job.last_error.
     """
     # 3.1 — status / attribution timestamps
+    # 'replied' is part of _READ_OR_LATER_STATUSES but must map to skipped_replied
+    # (not skipped_read), matching classify_followup_candidate(). Handle it
+    # explicitly before the generic read-or-later branch. This matters for legacy
+    # / already-queued follow-up jobs that hit the outbox guard directly with
+    # status='replied' and replied_at=None.
+    if recipient.status == "replied":
+        return FollowupFinalEligibilityResult(
+            eligible=False,
+            skip_reason="Follow-up skipped: recipient already replied to original campaign",
+            followup_status="skipped_replied",
+            booked_after_at=recipient.booked_after_at,
+        )
+
     if recipient.status in _READ_OR_LATER_STATUSES:
         if recipient.status == "booked_after_campaign":
             fs = "skipped_booked_after"
             reason = "Follow-up skipped: recipient already booked after campaign"
         else:
             fs = "skipped_read"
-            reason = "Follow-up skipped: recipient already read or replied to original campaign"
+            reason = "Follow-up skipped: recipient already read original campaign"
         return FollowupFinalEligibilityResult(
             eligible=False,
             skip_reason=reason,

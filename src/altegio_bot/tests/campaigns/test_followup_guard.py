@@ -365,6 +365,119 @@ async def test_outbox_worker_followup_replied_does_not_send(
 
 
 # ---------------------------------------------------------------------------
+# 2c. status == 'replied' but replied_at is None → skipped_replied (not skipped_read)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_followup_guard_status_replied_without_replied_at(session_maker) -> None:
+    """status='replied' maps to skipped_replied even when replied_at is None.
+
+    Regression: 'replied' is in _READ_OR_LATER_STATUSES, so the generic branch
+    previously returned skipped_read for these recipients.
+    """
+    async with session_maker() as session:
+        async with session.begin():
+            run = _make_run(session)
+            client = _make_client(session, wa_opted_out=False)
+            await session.flush()
+            recipient = _make_recipient(
+                session,
+                run.id,
+                client.id,
+                status="replied",
+                read_at=None,
+                replied_at=None,
+                booked_after_at=None,
+            )
+            await session.flush()
+
+            result = await check_followup_final_eligibility(session, recipient, run, NOW)
+
+    assert result.eligible is False
+    assert result.followup_status == "skipped_replied"
+    assert result.followup_status != "skipped_read"
+    assert result.skip_reason is not None
+    assert "replied" in result.skip_reason.lower()
+
+
+@pytest.mark.asyncio
+async def test_outbox_worker_status_replied_without_replied_at_persists_skipped_replied(
+    ow_session,
+    session_maker,
+) -> None:
+    """Legacy/already-queued follow-up job with status='replied', replied_at=None.
+
+    Outbox final guard must cancel the send and persist skipped_replied
+    (not skipped_read), and never call the provider.
+    """
+    async with session_maker() as session:
+        async with session.begin():
+            run = _make_run(session)
+            client = _make_client(session)
+            await session.flush()
+            recipient = _make_recipient(
+                session,
+                run.id,
+                client.id,
+                status="replied",
+                read_at=None,
+                replied_at=None,
+                booked_after_at=None,
+            )
+            await session.flush()
+            recipient_id = recipient.id
+
+            job = _make_followup_job(
+                session,
+                run_id=run.id,
+                recipient_id=recipient.id,
+                client_id=client.id,
+            )
+            await session.flush()
+            job_id = job.id
+
+    provider = MagicMock()
+    provider.send_template = AsyncMock()
+
+    await _lock_job(session_maker, job_id)
+
+    async with session_maker() as session:
+        async with session.begin():
+            await ow.process_job_in_session(session, job_id, provider=provider)
+
+    async with session_maker() as session:
+        db_job = await session.get(MessageJob, job_id)
+        db_recipient = await session.get(CampaignRecipient, recipient_id)
+
+    assert db_job is not None
+    assert db_job.status == "canceled"
+    assert db_recipient is not None
+    assert db_recipient.followup_status == "skipped_replied"
+    provider.send_template.assert_not_called()
+
+
+def test_classifier_and_guard_agree_on_replied_status() -> None:
+    """classify_followup_candidate and final guard both yield skipped_replied."""
+    from altegio_bot.campaigns.followup import classify_followup_candidate
+
+    r = CampaignRecipient(
+        campaign_run_id=1,
+        company_id=COMPANY,
+        status="replied",
+        excluded_reason=None,
+        read_at=None,
+        replied_at=None,
+        booked_after_at=None,
+        followup_status=None,
+    )
+    result = classify_followup_candidate(r, "unread_or_not_booked")
+    assert result.eligible is False
+    assert result.reason == "replied"
+    assert result.followup_status == "skipped_replied"
+
+
+# ---------------------------------------------------------------------------
 # 3. booked_after_at is not None → skipped_booked_after
 # ---------------------------------------------------------------------------
 

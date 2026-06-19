@@ -2096,6 +2096,91 @@ async def test_candidate_eligible_now_reflects_final_guard(
 
 
 @pytest.mark.asyncio
+async def test_candidate_guard_preview_error_not_eligible(
+    http_client: AsyncClient,
+    session_maker,
+    monkeypatch,
+) -> None:
+    """If final-guard preview raises for a row, it must not render as eligible."""
+    from datetime import timedelta
+
+    import altegio_bot.ops.router as ops_router_module
+    from altegio_bot.campaigns.followup import FollowupFinalEligibilityResult
+
+    now = datetime.now(timezone.utc)
+    async with session_maker() as session:
+        async with session.begin():
+            run = CampaignRun(
+                campaign_code="new_clients_monthly",
+                mode="send-real",
+                company_ids=[758285],
+                period_start=now.replace(day=1, hour=0, minute=0, second=0, microsecond=0),
+                period_end=now,
+                status="completed",
+                followup_enabled=True,
+                followup_delay_days=14,
+                followup_policy="unread_or_not_booked",
+                followup_template_name="kitilash_ka_newsletter_new_clients_followup_v1",
+                completed_at=now - timedelta(days=20),
+                meta={},
+            )
+            session.add(run)
+            await session.flush()
+            run_id = run.id
+
+            good = CampaignRecipient(
+                campaign_run_id=run_id,
+                company_id=758285,
+                altegio_client_id=7001,
+                phone_e164="+49700000001",
+                display_name="Good Client",
+                status="delivered",
+            )
+            boom = CampaignRecipient(
+                campaign_run_id=run_id,
+                company_id=758285,
+                altegio_client_id=7002,
+                phone_e164="+49700000002",
+                display_name="Boom Client",
+                status="delivered",
+            )
+            session.add_all([good, boom])
+            await session.flush()
+            good_id, boom_id = good.id, boom.id
+
+    # Final-guard preview raises only for "Boom Client".
+    async def fake_guard(*, session, recipient, run, now):  # noqa: A002 - mirror real kwargs
+        if recipient.display_name == "Boom Client":
+            raise RuntimeError("simulated guard preview failure")
+        return FollowupFinalEligibilityResult(
+            eligible=True,
+            skip_reason=None,
+            followup_status=None,
+            booked_after_at=None,
+        )
+
+    monkeypatch.setattr(ops_router_module, "check_followup_final_eligibility", fake_guard)
+
+    response = await http_client.get(f"/ops/campaigns/{run_id}")
+    assert response.status_code == 200
+    section = _candidate_section(response.text)
+
+    assert "Good Client" in section
+    assert "Boom Client" in section
+    # The errored row surfaces guard_preview_error, not eligible.
+    assert "guard_preview_error" in section
+    # Eligible (Good) is sorted before the preview-error row (Boom).
+    assert section.index("Good Client") < section.index("Boom Client")
+
+    # Preview must not mutate the DB: both recipients keep followup_status NULL.
+    async with session_maker() as session:
+        g = await session.get(CampaignRecipient, good_id)
+        b = await session.get(CampaignRecipient, boom_id)
+    assert g.followup_status is None
+    assert b.followup_status is None
+
+
+@pytest.mark.asyncio
 async def test_ops_new_clients_page_followup_static_body_label(http_client: AsyncClient) -> None:
     """Follow-up шаблон имеет статическое тело — UI должен показывать лейбл вместо переменных."""
     response = await http_client.get("/ops/campaigns/new-clients")
