@@ -604,13 +604,24 @@ async def check_followup_final_eligibility(
     Eligible=False includes a followup_status string to persist on the recipient
     and a human-readable skip_reason for job.last_error.
     """
-    # 3.1 — status / attribution timestamps
-    # 'replied' is part of _READ_OR_LATER_STATUSES but must map to skipped_replied
-    # (not skipped_read), matching classify_followup_candidate(). Handle it
-    # explicitly before the generic read-or-later branch. This matters for legacy
-    # / already-queued follow-up jobs that hit the outbox guard directly with
-    # status='replied' and replied_at=None.
-    if recipient.status == "replied":
+    # 3.1 — status / attribution timestamps.
+    # Priority must match classify_followup_candidate() and reports:
+    #   booked_after > replied > read.
+    # Each branch checks both the status and the attribution timestamp so the
+    # order holds for mixed states (e.g. status='replied' + booked_after_at set
+    # must resolve to skipped_booked_after) and for legacy / already-queued
+    # follow-up jobs that hit the outbox guard directly. _READ_OR_LATER_STATUSES
+    # still contains 'replied'/'booked_after_campaign', but those are caught by
+    # the explicit branches above, so the read branch only handles 'read'.
+    if recipient.status == "booked_after_campaign" or recipient.booked_after_at is not None:
+        return FollowupFinalEligibilityResult(
+            eligible=False,
+            skip_reason="Follow-up skipped: recipient booked after original campaign",
+            followup_status="skipped_booked_after",
+            booked_after_at=recipient.booked_after_at,
+        )
+
+    if recipient.status == "replied" or recipient.replied_at is not None:
         return FollowupFinalEligibilityResult(
             eligible=False,
             skip_reason="Follow-up skipped: recipient already replied to original campaign",
@@ -618,44 +629,11 @@ async def check_followup_final_eligibility(
             booked_after_at=recipient.booked_after_at,
         )
 
-    if recipient.status in _READ_OR_LATER_STATUSES:
-        if recipient.status == "booked_after_campaign":
-            fs = "skipped_booked_after"
-            reason = "Follow-up skipped: recipient already booked after campaign"
-        else:
-            fs = "skipped_read"
-            reason = "Follow-up skipped: recipient already read original campaign"
-        return FollowupFinalEligibilityResult(
-            eligible=False,
-            skip_reason=reason,
-            followup_status=fs,
-            booked_after_at=recipient.booked_after_at,
-        )
-
-    if recipient.read_at is not None:
+    if recipient.status in _READ_OR_LATER_STATUSES or recipient.read_at is not None:
         return FollowupFinalEligibilityResult(
             eligible=False,
             skip_reason="Follow-up skipped: recipient already read original campaign",
             followup_status="skipped_read",
-            booked_after_at=None,
-        )
-
-    # replied_at may be set while status is still 'delivered' (status update lags
-    # behind the attribution timestamp). The plan-time classifier already treats
-    # replied_at as a skip reason, so the final guard must match.
-    if recipient.replied_at is not None:
-        return FollowupFinalEligibilityResult(
-            eligible=False,
-            skip_reason="Follow-up skipped: recipient already replied to original campaign",
-            followup_status="skipped_replied",
-            booked_after_at=None,
-        )
-
-    if recipient.booked_after_at is not None:
-        return FollowupFinalEligibilityResult(
-            eligible=False,
-            skip_reason="Follow-up skipped: recipient already booked after campaign",
-            followup_status="skipped_booked_after",
             booked_after_at=recipient.booked_after_at,
         )
 

@@ -508,6 +508,187 @@ async def test_followup_guard_skips_existing_booked_after_at(session_maker) -> N
 
 
 # ---------------------------------------------------------------------------
+# 3b. Reason priority: booked_after > replied > read (match classifier/reports)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_followup_guard_priority_replied_status_with_booked_after(session_maker) -> None:
+    """Mixed state status='replied' + booked_after_at set → skipped_booked_after."""
+    booked_ts = NOW - timedelta(days=4)
+    async with session_maker() as session:
+        async with session.begin():
+            run = _make_run(session)
+            client = _make_client(session)
+            await session.flush()
+            recipient = _make_recipient(
+                session,
+                run.id,
+                client.id,
+                status="replied",
+                replied_at=None,
+                read_at=None,
+                booked_after_at=booked_ts,
+            )
+            await session.flush()
+
+            result = await check_followup_final_eligibility(session, recipient, run, NOW)
+
+    assert result.eligible is False
+    assert result.followup_status == "skipped_booked_after"
+    assert result.followup_status not in ("skipped_replied", "skipped_read")
+    assert result.skip_reason is not None
+    assert "booked" in result.skip_reason.lower()
+    assert result.booked_after_at == booked_ts
+
+
+@pytest.mark.asyncio
+async def test_followup_guard_priority_replied_without_booking(session_maker) -> None:
+    """status='replied' + no booking + no replied_at → skipped_replied (2ccb72a preserved)."""
+    async with session_maker() as session:
+        async with session.begin():
+            run = _make_run(session)
+            client = _make_client(session)
+            await session.flush()
+            recipient = _make_recipient(
+                session,
+                run.id,
+                client.id,
+                status="replied",
+                replied_at=None,
+                read_at=None,
+                booked_after_at=None,
+            )
+            await session.flush()
+
+            result = await check_followup_final_eligibility(session, recipient, run, NOW)
+
+    assert result.eligible is False
+    assert result.followup_status == "skipped_replied"
+
+
+@pytest.mark.asyncio
+async def test_followup_guard_priority_read_only(session_maker) -> None:
+    """status='read' + no booking + no replied → skipped_read."""
+    async with session_maker() as session:
+        async with session.begin():
+            run = _make_run(session)
+            client = _make_client(session)
+            await session.flush()
+            recipient = _make_recipient(
+                session,
+                run.id,
+                client.id,
+                status="read",
+                read_at=NOW - timedelta(days=2),
+                replied_at=None,
+                booked_after_at=None,
+            )
+            await session.flush()
+
+            result = await check_followup_final_eligibility(session, recipient, run, NOW)
+
+    assert result.eligible is False
+    assert result.followup_status == "skipped_read"
+
+
+@pytest.mark.asyncio
+async def test_classifier_and_guard_agree_on_replied_plus_booked(session_maker) -> None:
+    """classify_followup_candidate and the final guard agree on the mixed state."""
+    from altegio_bot.campaigns.followup import classify_followup_candidate
+
+    booked_ts = NOW - timedelta(days=4)
+    classifier = classify_followup_candidate(
+        CampaignRecipient(
+            campaign_run_id=1,
+            company_id=COMPANY,
+            status="replied",
+            excluded_reason=None,
+            read_at=None,
+            replied_at=None,
+            booked_after_at=booked_ts,
+            followup_status=None,
+        ),
+        "unread_or_not_booked",
+    )
+    assert classifier.followup_status == "skipped_booked_after"
+
+    async with session_maker() as session:
+        async with session.begin():
+            run = _make_run(session)
+            client = _make_client(session)
+            await session.flush()
+            recipient = _make_recipient(
+                session,
+                run.id,
+                client.id,
+                status="replied",
+                replied_at=None,
+                read_at=None,
+                booked_after_at=booked_ts,
+            )
+            await session.flush()
+            guard = await check_followup_final_eligibility(session, recipient, run, NOW)
+
+    assert guard.followup_status == "skipped_booked_after"
+    assert guard.followup_status == classifier.followup_status
+
+
+@pytest.mark.asyncio
+async def test_outbox_worker_replied_plus_booked_persists_skipped_booked_after(
+    ow_session,
+    session_maker,
+) -> None:
+    """Legacy queued job: status='replied' + booked_after_at set → skipped_booked_after."""
+    booked_ts = NOW - timedelta(days=4)
+    async with session_maker() as session:
+        async with session.begin():
+            run = _make_run(session)
+            client = _make_client(session)
+            await session.flush()
+            recipient = _make_recipient(
+                session,
+                run.id,
+                client.id,
+                status="replied",
+                replied_at=None,
+                read_at=None,
+                booked_after_at=booked_ts,
+            )
+            await session.flush()
+            recipient_id = recipient.id
+
+            job = _make_followup_job(
+                session,
+                run_id=run.id,
+                recipient_id=recipient.id,
+                client_id=client.id,
+            )
+            await session.flush()
+            job_id = job.id
+
+    provider = MagicMock()
+    provider.send_template = AsyncMock()
+
+    await _lock_job(session_maker, job_id)
+
+    async with session_maker() as session:
+        async with session.begin():
+            await ow.process_job_in_session(session, job_id, provider=provider)
+
+    async with session_maker() as session:
+        db_job = await session.get(MessageJob, job_id)
+        db_recipient = await session.get(CampaignRecipient, recipient_id)
+
+    assert db_job is not None
+    assert db_job.status == "canceled"
+    assert db_recipient is not None
+    assert db_recipient.followup_status == "skipped_booked_after"
+    assert db_recipient.followup_status not in ("skipped_replied", "skipped_read")
+    provider.send_template.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # 4. P1 regression: record create event EVEN IF RECORD IS DELETED → skip
 # ---------------------------------------------------------------------------
 
