@@ -643,3 +643,98 @@ def test_followup_live_guard_runs_when_131026_below_threshold(monkeypatch: Any) 
     send_mock.assert_awaited_once()
     assert job.status == "done"
     assert "suppressed_131026" not in (job.last_error or "")
+
+
+# ---------------------------------------------------------------------------
+# Stricter marketing suppression: _marketing_suppression_reason (real DB)
+# ---------------------------------------------------------------------------
+
+
+async def _insert_suppressed_outbox(
+    session: Any,
+    *,
+    code: str,
+    phone: str = PHONE,
+    sent_at: datetime = NOW,
+) -> None:
+    """Insert a previous canceled suppression row (suppressed_131026 / 131049)."""
+    session.add(
+        OutboxMessage(
+            company_id=1,
+            phone_e164=phone,
+            template_code="newsletter_new_clients_followup",
+            language="de",
+            body="",
+            status="canceled",
+            error=f"suppressed_{code}: previous",
+            provider_message_id=None,
+            scheduled_at=sent_at,
+            sent_at=sent_at,
+            message_source="bot",
+            meta={"suppression_code": code},
+        )
+    )
+    await session.flush()
+
+
+@pytest.mark.asyncio
+async def test_marketing_suppression_none_without_history(session_maker: Any, monkeypatch: Any) -> None:
+    monkeypatch.setattr(ow, "utcnow", lambda: NOW)
+    async with session_maker() as session:
+        async with session.begin():
+            reason = await ow._marketing_suppression_reason(session, PHONE, 90)
+    assert reason is None
+
+
+@pytest.mark.asyncio
+async def test_marketing_suppression_real_131026_failure(session_maker: Any, monkeypatch: Any) -> None:
+    """A single prior 131026 delivery failure suppresses marketing follow-up."""
+    monkeypatch.setattr(ow, "utcnow", lambda: NOW)
+    async with session_maker() as session:
+        async with session.begin():
+            wamid = f"{WAMID_BASE}-mkt26"
+            await _insert_outbox(session, wamid=wamid, status="sent")
+            await _insert_wa_event(session, wamid=wamid, code=131026)
+            reason = await ow._marketing_suppression_reason(session, PHONE, 90)
+    assert reason is not None
+    assert reason.startswith("suppressed_131026")
+
+
+@pytest.mark.asyncio
+async def test_marketing_suppression_prior_suppressed_row(session_maker: Any, monkeypatch: Any) -> None:
+    """A previous suppressed_131026 canceled row suppresses marketing follow-up."""
+    monkeypatch.setattr(ow, "utcnow", lambda: NOW)
+    async with session_maker() as session:
+        async with session.begin():
+            await _insert_suppressed_outbox(session, code="131026")
+            reason = await ow._marketing_suppression_reason(session, PHONE, 90)
+    assert reason is not None
+    assert reason.startswith("suppressed_131026")
+
+
+@pytest.mark.asyncio
+async def test_marketing_suppression_real_131049_failure(session_maker: Any, monkeypatch: Any) -> None:
+    """A prior 131049 ecosystem-engagement failure suppresses marketing follow-up."""
+    monkeypatch.setattr(ow, "utcnow", lambda: NOW)
+    async with session_maker() as session:
+        async with session.begin():
+            wamid = f"{WAMID_BASE}-mkt49"
+            await _insert_outbox(session, wamid=wamid, status="sent")
+            await _insert_wa_event(session, wamid=wamid, code=131049)
+            reason = await ow._marketing_suppression_reason(session, PHONE, 90)
+    assert reason is not None
+    assert reason.startswith("suppressed_131049")
+
+
+@pytest.mark.asyncio
+async def test_marketing_suppression_outside_cooldown_not_counted(session_maker: Any, monkeypatch: Any) -> None:
+    """A 131026 failure older than the cooldown window does not suppress."""
+    monkeypatch.setattr(ow, "utcnow", lambda: NOW)
+    old = NOW - timedelta(days=120)
+    async with session_maker() as session:
+        async with session.begin():
+            wamid = f"{WAMID_BASE}-mktold"
+            await _insert_outbox(session, wamid=wamid, status="sent", sent_at=old)
+            await _insert_wa_event(session, wamid=wamid, code=131026)
+            reason = await ow._marketing_suppression_reason(session, PHONE, 90)
+    assert reason is None

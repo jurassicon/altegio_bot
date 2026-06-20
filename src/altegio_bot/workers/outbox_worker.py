@@ -1155,6 +1155,97 @@ async def _count_131026_failures(
     return result.scalar_one()
 
 
+async def _marketing_suppression_reason(
+    session: AsyncSession,
+    phone: str,
+    cooldown_days: int,
+) -> str | None:
+    """Stricter suppression for marketing/follow-up jobs.
+
+    Returns a 'suppressed_131026' / 'suppressed_131049' reason string if the phone
+    has ANY undeliverable/suppression history within ``cooldown_days``:
+      * a 131026 or 131049 WhatsApp delivery-failure webhook on a bot message;
+      * a previous canceled outbox row stamped suppressed_131026 / suppressed_131049.
+
+    A single occurrence is enough (conservative for marketing). Best-effort: never
+    raises (returns None on error) so a query problem cannot block the send
+    pipeline — the transactional 131026 threshold guard and the live Altegio guard
+    still apply.
+    """
+    try:
+        window_start = utcnow() - timedelta(days=cooldown_days)
+        codes: set[str] = set()
+
+        fail_rows = await session.execute(
+            text(
+                "SELECT DISTINCT (we.payload #>> "
+                "  '{entry,0,changes,0,value,statuses,0,errors,0,code}') AS code "
+                "FROM outbox_messages om "
+                "JOIN whatsapp_events we ON "
+                "  we.payload #>> '{entry,0,changes,0,value,statuses,0,id}' "
+                "    = om.provider_message_id "
+                "WHERE om.phone_e164 = :phone "
+                "  AND om.sent_at >= :ws "
+                "  AND om.provider_message_id IS NOT NULL "
+                "  AND om.message_source = 'bot' "
+                "  AND we.payload #>> '{entry,0,changes,0,value,statuses,0,status}' "
+                "      = 'failed' "
+                "  AND (we.payload #>> '{entry,0,changes,0,value,statuses,0,errors,0,code}') "
+                "      IN ('131026', '131049')"
+            ),
+            {"phone": phone, "ws": window_start},
+        )
+        for row in fail_rows:
+            if row[0]:
+                codes.add(str(row[0]))
+
+        supp_rows = await session.execute(
+            text(
+                "SELECT meta ->> 'suppression_code' AS code, error "
+                "FROM outbox_messages "
+                "WHERE phone_e164 = :phone "
+                "  AND status = 'canceled' "
+                "  AND sent_at >= :ws "
+                "  AND ( (meta ->> 'suppression_code') IN ('131026', '131049') "
+                "        OR error LIKE 'suppressed_131026%' "
+                "        OR error LIKE 'suppressed_131049%' )"
+            ),
+            {"phone": phone, "ws": window_start},
+        )
+        for code, error in supp_rows:
+            blob = f"{code or ''} {error or ''}"
+            if "131049" in blob:
+                codes.add("131049")
+            if "131026" in blob:
+                codes.add("131026")
+
+        if "131026" in codes:
+            return "suppressed_131026: previous marketing undeliverable/suppression"
+        if "131049" in codes:
+            return "suppressed_131049: previous ecosystem engagement failure"
+        return None
+    except Exception as exc:  # pragma: no cover - defensive, never block the pipeline
+        logger.warning("marketing suppression check failed phone=%s: %s", phone, exc)
+        return None
+
+
+async def _mark_followup_recipient_suppressed(
+    session: AsyncSession,
+    job: Any,
+    status: str,
+) -> None:
+    """Persist a suppression followup_status on the follow-up recipient (Ops visibility)."""
+    try:
+        rid = (job.payload or {}).get("campaign_recipient_id")
+        if rid is None:
+            return
+        recipient = await session.get(CampaignRecipient, int(rid))
+        if recipient is not None:
+            recipient.followup_status = status
+    except Exception:  # pragma: no cover - best-effort
+        return
+
+
 async def _update_promo_lead_notification_meta(
     session: AsyncSession,
     promo_lead_id: Any,
@@ -2151,6 +2242,54 @@ async def _run_job_logic(
                 phone,
                 n_fail,
                 _wd,
+            )
+            return
+
+    # Stricter marketing suppression (broader than the 131026 threshold above):
+    # ANY prior 131026/131049 failure OR prior suppressed_* row within the longer
+    # marketing cooldown blocks marketing/follow-up sends. Scoped to
+    # MARKETING_JOB_TYPES — transactional reminders keep the threshold rule only.
+    if settings.marketing_suppression_enabled and job.job_type in MARKETING_JOB_TYPES:
+        supp_reason = await _marketing_suppression_reason(
+            session,
+            phone,
+            settings.marketing_suppression_cooldown_days,
+        )
+        if supp_reason:
+            supp_code = "131049" if "131049" in supp_reason else "131026"
+            out = OutboxMessage(
+                company_id=job.company_id,
+                client_id=(client.id if client else None),
+                record_id=(record.id if record else None),
+                job_id=job.id,
+                sender_id=None,
+                phone_e164=phone,
+                template_code=job.job_type,
+                language=DEFAULT_LANGUAGE,
+                body="",
+                status="canceled",
+                error=supp_reason,
+                provider_message_id=None,
+                scheduled_at=job.run_at,
+                sent_at=utcnow(),
+                meta={
+                    "suppression_code": supp_code,
+                    "marketing_suppression": True,
+                    "cooldown_days": settings.marketing_suppression_cooldown_days,
+                },
+            )
+            session.add(out)
+            job.status = "canceled"
+            job.locked_at = None
+            job.last_error = supp_reason
+            if job.job_type == FOLLOWUP_JOB_TYPE:
+                await _mark_followup_recipient_suppressed(session, job, f"suppressed_{supp_code}")
+            logger.info(
+                "Marketing-suppressed job_id=%s phone=%s code=%s cooldown=%dd",
+                job.id,
+                phone,
+                supp_code,
+                settings.marketing_suppression_cooldown_days,
             )
             return
 

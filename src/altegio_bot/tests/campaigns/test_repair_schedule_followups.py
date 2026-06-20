@@ -781,13 +781,13 @@ async def test_cleanup_failed_recipient_status_is_not_scheduled(session_maker) -
 
 
 # ---------------------------------------------------------------------------
-# O. provider_accepted recipient can be scheduled (P2-1)
+# O. provider_accepted recipient is NOT scheduled (original delivery required)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_provider_accepted_recipient_can_be_scheduled(session_maker) -> None:
-    """status='provider_accepted' is in the allow-list → should reach candidates."""
+async def test_provider_accepted_recipient_not_scheduled(session_maker) -> None:
+    """status='provider_accepted' does not prove delivery → skipped, not a candidate."""
     async with session_maker() as session:
         async with session.begin():
             run = _make_run(session)
@@ -806,8 +806,8 @@ async def test_provider_accepted_recipient_can_be_scheduled(session_maker) -> No
 
     stats = await schedule_followups(run_id, dry_run=True, session_factory=session_maker)
 
-    assert stats.candidates == 1
-    assert stats.skipped_not_sent == 0
+    assert stats.candidates == 0
+    assert stats.skipped_not_sent == 1
 
 
 # ---------------------------------------------------------------------------

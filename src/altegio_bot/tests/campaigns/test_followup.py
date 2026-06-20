@@ -44,8 +44,8 @@ def _recipient(**kw) -> CampaignRecipient:
 
 
 def test_unread_only_eligible_when_no_read_at() -> None:
-    """При unread_only клиент без read_at должен получить follow-up."""
-    r = _recipient(status="queued", read_at=None)
+    """При unread_only доставленный клиент без read_at должен получить follow-up."""
+    r = _recipient(status="delivered", read_at=None)
     assert _is_eligible_for_followup(r, "unread_only") is True
 
 
@@ -136,7 +136,7 @@ def test_replied_status_not_planned() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Pipeline доставки → eligible
+# Original delivery required → only status="delivered" is eligible
 # ---------------------------------------------------------------------------
 
 
@@ -145,14 +145,22 @@ def test_delivered_unread_eligible() -> None:
     assert classify_followup_candidate(r, "unread_or_not_booked").eligible is True
 
 
-def test_provider_accepted_unread_eligible() -> None:
+def test_provider_accepted_not_delivered_not_eligible() -> None:
+    """provider_accepted does not prove original delivery → not eligible."""
     r = _recipient(status="provider_accepted")
-    assert classify_followup_candidate(r, "unread_or_not_booked").eligible is True
+    result = classify_followup_candidate(r, "unread_or_not_booked")
+    assert result.eligible is False
+    assert result.reason == "not_delivered"
+    assert result.followup_status == "skipped_not_delivered"
 
 
-def test_queued_unread_eligible() -> None:
+def test_queued_not_delivered_not_eligible() -> None:
+    """queued does not prove original delivery → not eligible."""
     r = _recipient(status="queued")
-    assert classify_followup_candidate(r, "unread_or_not_booked").eligible is True
+    result = classify_followup_candidate(r, "unread_or_not_booked")
+    assert result.eligible is False
+    assert result.reason == "not_delivered"
+    assert result.followup_status == "skipped_not_delivered"
 
 
 # ---------------------------------------------------------------------------

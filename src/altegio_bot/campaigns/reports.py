@@ -197,7 +197,9 @@ async def _fetch_attribution(session: AsyncSession, run_id: int) -> dict[str, An
         CampaignRecipient.read_at.is_not(None),
         CampaignRecipient.status == "read",
     )
-    _FOLLOWUP_ELIGIBLE_STATUSES_LIST = ["queued", "provider_accepted", "delivered"]
+    # Follow-up requires proven original delivery: only status == "delivered"
+    # counts as eligible. queued / provider_accepted / sent are NOT eligible.
+    _FOLLOWUP_ELIGIBLE_STATUSES_LIST = ["delivered"]
 
     elig_stmt = select(
         func.count(CampaignRecipient.id).filter(_is_booked).label("skipped_booked_after"),

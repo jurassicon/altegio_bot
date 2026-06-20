@@ -2261,3 +2261,59 @@ async def test_ops_new_clients_page_followup_static_body_label(http_client: Asyn
     # The static-body fallback label is present (rendered because _NC_FOLLOWUP_PARAMS is empty)
     assert "статическое тело" in text
     assert "переменных нет" in text
+
+
+@pytest.mark.asyncio
+async def test_candidate_table_marks_non_delivered(http_client: AsyncClient, session_maker) -> None:
+    """Candidate table shows not_delivered for provider_accepted/queued, eligible for delivered."""
+    from datetime import timedelta
+
+    now = datetime.now(timezone.utc)
+    async with session_maker() as session:
+        async with session.begin():
+            run = CampaignRun(
+                campaign_code="new_clients_monthly",
+                mode="send-real",
+                company_ids=[758285],
+                period_start=now.replace(day=1, hour=0, minute=0, second=0, microsecond=0),
+                period_end=now,
+                status="completed",
+                followup_enabled=True,
+                followup_delay_days=14,
+                followup_policy="unread_or_not_booked",
+                followup_template_name="kitilash_ka_newsletter_new_clients_followup_v1",
+                completed_at=now - timedelta(days=20),
+                meta={},
+            )
+            session.add(run)
+            await session.flush()
+            run_id = run.id
+
+            for status, aid, phone, name in (
+                ("delivered", 9001, "+49900000001", "Delivered Eligible"),
+                ("provider_accepted", 9002, "+49900000002", "Provider Accepted Row"),
+                ("queued", 9003, "+49900000003", "Queued Row"),
+            ):
+                session.add(
+                    CampaignRecipient(
+                        campaign_run_id=run_id,
+                        company_id=758285,
+                        altegio_client_id=aid,
+                        phone_e164=phone,
+                        display_name=name,
+                        status=status,
+                        sent_at=now - timedelta(days=20),
+                    )
+                )
+
+    response = await http_client.get(f"/ops/campaigns/{run_id}")
+    assert response.status_code == 200
+    section = _candidate_section(response.text)
+
+    assert "Delivered Eligible" in section
+    assert "Provider Accepted Row" in section
+    assert "Queued Row" in section
+    # provider_accepted / queued surface as not_delivered, not eligible.
+    assert "not_delivered" in section
+    # The delivered recipient is still shown as eligible.
+    assert "eligible" in section

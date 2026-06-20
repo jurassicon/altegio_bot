@@ -53,6 +53,7 @@ _PLAN_REASONS: frozenset[str] = frozenset(
         "read",
         "replied",
         "booked_after",
+        "not_delivered",
         "skipped",
         "hard_failure",
         "excluded",
@@ -60,6 +61,10 @@ _PLAN_REASONS: frozenset[str] = frozenset(
         "unknown_policy",
     }
 )
+
+# Подтверждённая (не отменённая) запись: campaigns.segment.CONFIRMED_FLAG.
+# confirmed == 1 означает «бронь активна / не отменена».
+_CONFIRMED_FLAG = 1
 
 # Статусы, которые означают «сообщение прочитано или позже» для follow-up политик.
 _READ_OR_LATER_STATUSES: frozenset[str] = frozenset({"read", "replied", "booked_after_campaign"})
@@ -103,6 +108,10 @@ FOLLOWUP_SKIP_STATUSES: frozenset[str] = frozenset(
         "skipped_booked_after",
         "skipped_opted_out",
         "skipped_future_record",
+        "skipped_not_delivered",
+        # Marketing suppression statuses written by the outbox worker at send time.
+        "suppressed_131026",
+        "suppressed_131049",
     }
 )
 
@@ -189,9 +198,9 @@ def classify_followup_candidate(
 
     Семантика политик:
       - unread_or_not_booked / unread_only: оба считают кандидатом только тех,
-        кто находится в pipeline доставки (queued / provider_accepted /
-        delivered), не прочитал, не ответил и не записался. Read-but-not-booked
-        получатели кандидатами не считаются.
+        чья оригинальная рассылка реально доставлена (status == "delivered"),
+        кто не прочитал, не ответил и не записался. queued / provider_accepted /
+        sent (доставка не доказана) и read-but-not-booked кандидатами не считаются.
     """
     if policy not in (_POLICY_UNREAD_ONLY, _POLICY_UNREAD_OR_NOT_BOOKED):
         logger.warning("Unknown followup_policy=%s", policy)
@@ -222,6 +231,13 @@ def classify_followup_candidate(
         return FollowupPlanEligibilityResult(False, "replied", "skipped_replied")
     if recipient.status == "read" or recipient.read_at is not None:
         return FollowupPlanEligibilityResult(False, "read", "skipped_read")
+
+    # Требуем доказанную доставку оригинальной рассылки. На этом шаге статус ∈
+    # {queued, provider_accepted, delivered}. Follow-up имеет смысл только если
+    # оригинал реально дошёл — queued / provider_accepted / sent НЕ считаются
+    # доставкой (Run #23: 9 из 11 получателей не были delivered).
+    if recipient.status != "delivered":
+        return FollowupPlanEligibilityResult(False, "not_delivered", "skipped_not_delivered")
 
     return FollowupPlanEligibilityResult(True, "eligible", None)
 
@@ -628,6 +644,42 @@ async def _has_future_record(
     return result.scalar_one_or_none() is not None
 
 
+async def _has_confirmed_record_since(
+    session: AsyncSession,
+    *,
+    recipient: CampaignRecipient,
+    company_id: int,
+    since: datetime,
+) -> bool:
+    """True if the client has a confirmed, non-deleted record starting at/after ``since``.
+
+    "Confirmed" reuses the canonical campaigns/segment flag (confirmed == 1 =
+    active / not cancelled). ``since`` is the campaign attribution start
+    (max(run.completed_at, recipient.sent_at)), so the client's ORIGINAL
+    campaign-period visit (which started before the campaign completed) does NOT
+    match — only an active booking/visit from the campaign onward does. This
+    catches clients who already re-engaged (booked or attended again) even when
+    the appointment is no longer in the future, which _has_future_record misses.
+    """
+    if recipient.client_id is not None:
+        client_cond = Record.client_id == recipient.client_id
+    else:
+        client_cond = Record.altegio_client_id == recipient.altegio_client_id
+
+    stmt = (
+        select(Record.id)
+        .where(Record.company_id == company_id)
+        .where(func.coalesce(Record.is_deleted, False).is_(False))
+        .where(Record.confirmed == _CONFIRMED_FLAG)
+        .where(Record.starts_at.is_not(None))
+        .where(Record.starts_at >= since)
+        .where(client_cond)
+        .limit(1)
+    )
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none() is not None
+
+
 async def check_followup_final_eligibility(
     session: AsyncSession,
     recipient: CampaignRecipient,
@@ -640,10 +692,12 @@ async def check_followup_final_eligibility(
     between job creation (execute_followup) and actual delivery — typically 14 days.
 
     Checks in order:
-      3.1  recipient status / read_at / booked_after_at
-      3.2  current opt-out state
-      3.3  new record create event after the original campaign (AltegioEvent)
-      3.4  any non-deleted future record already booked
+      3.1   recipient status / read_at / replied_at / booked_after_at
+      3.1b  original delivery required (status must be "delivered")
+      3.2   current opt-out state
+      3.3   new record create event after the original campaign (AltegioEvent)
+      3.3b  confirmed, non-deleted record in/after the attribution window
+      3.4   any non-deleted future record already booked
 
     Returns FollowupFinalEligibilityResult(eligible=True) when safe to send.
     Eligible=False includes a followup_status string to persist on the recipient
@@ -680,6 +734,19 @@ async def check_followup_final_eligibility(
             skip_reason="Follow-up skipped: recipient already read original campaign",
             followup_status="skipped_read",
             booked_after_at=recipient.booked_after_at,
+        )
+
+    # 3.1b — require proven original delivery. Only status == "delivered" proves
+    # the original campaign message reached the client. queued / provider_accepted
+    # / sent (and any other non-delivered state, e.g. a canceled original job)
+    # must NOT receive follow-up — this rejects legacy/already-queued follow-up
+    # jobs for non-delivered recipients before they are sent.
+    if recipient.status != "delivered":
+        return FollowupFinalEligibilityResult(
+            eligible=False,
+            skip_reason="Follow-up skipped: original campaign message was not delivered",
+            followup_status="skipped_not_delivered",
+            booked_after_at=None,
         )
 
     # 3.2 — current opt-out
@@ -747,6 +814,24 @@ async def check_followup_final_eligibility(
                 skip_reason="Follow-up skipped: client booked after campaign",
                 followup_status="skipped_booked_after",
                 booked_after_at=evt_at,
+            )
+
+        # 3.3b — confirmed, non-deleted record in/after the attribution window.
+        # Stronger than 3.4 (future-only): also catches confirmed bookings/visits
+        # that already happened between campaign completion and now. The client
+        # is already booked/served, so a "new client" follow-up is inappropriate.
+        has_confirmed = await _has_confirmed_record_since(
+            session,
+            recipient=recipient,
+            company_id=recipient.company_id,
+            since=attribution_start,
+        )
+        if has_confirmed:
+            return FollowupFinalEligibilityResult(
+                eligible=False,
+                skip_reason=("Follow-up skipped: client already has a confirmed record in the attribution window"),
+                followup_status="skipped_booked_after",
+                booked_after_at=None,
             )
 
     # 3.4 — future record already booked

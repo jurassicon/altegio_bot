@@ -41,18 +41,11 @@ _TERMINAL_FOLLOWUP_STATUSES: frozenset[str] = frozenset(
     }
 )
 
-# Only these original-send statuses qualify for a follow-up.
-# provider_message_id alone is not sufficient proof of a successful send —
-# failed/excluded rows may carry a provider_message_id or sent_at.
-_POSITIVE_ORIGINAL_SEND_STATUSES: frozenset[str] = frozenset(
-    {
-        "provider_accepted",
-        "sent",
-        "delivered",
-        # read / replied / booked_after_campaign are caught before we reach
-        # this check, so they do not need to be listed here.
-    }
-)
+# Follow-up requires PROVEN original delivery. Only status='delivered' qualifies.
+# queued / provider_accepted / sent do not prove the original message reached the
+# client (Run #23 audit), and provider_message_id alone is not proof of delivery.
+# read / replied / booked_after_campaign are caught before we reach this check.
+_POSITIVE_ORIGINAL_SEND_STATUSES: frozenset[str] = frozenset({"delivered"})
 
 # excluded_reason values that indicate a hard send failure.
 # Defensive belt-and-suspenders: a recipient could theoretically have
@@ -294,6 +287,8 @@ async def schedule_followups(
                         stats.skipped_opted_out += 1
                     elif fs == "skipped_future_record":
                         stats.skipped_future_record += 1
+                    elif fs == "skipped_not_delivered":
+                        stats.skipped_not_sent += 1
                     else:
                         stats.skipped_other += 1
                     print(f"  SKIP recipient_id={recipient.id} reason={reason!r}")
