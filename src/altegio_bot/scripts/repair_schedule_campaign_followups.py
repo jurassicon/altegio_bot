@@ -20,7 +20,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from altegio_bot.campaigns.followup import (
-    _READ_OR_LATER_STATUSES,
+    FOLLOWUP_SKIP_STATUSES,
     check_followup_final_eligibility,
 )
 from altegio_bot.campaigns.runner import FOLLOWUP_JOB_TYPE
@@ -28,31 +28,30 @@ from altegio_bot.db import SessionLocal
 from altegio_bot.models.models import CampaignRecipient, CampaignRun, MessageJob
 from altegio_bot.utils import utcnow
 
-_TERMINAL_FOLLOWUP_STATUSES: frozenset[str] = frozenset(
-    {
-        "followup_queued",
-        "followup_sent",
-        "followup_skipped",
-        "followup_canceled",
-        "skipped_read",
-        "skipped_booked_after",
-        "skipped_opted_out",
-        "skipped_future_record",
-    }
-)
+# Terminal follow-up statuses that must NOT be rescheduled. Synced with the
+# canonical follow-up skip statuses (incl. skipped_replied / skipped_not_delivered
+# / suppressed_131026 / suppressed_131049) plus the queued/processing and
+# delivery states a follow-up can reach. Avoids a stale hand-maintained list.
+_TERMINAL_FOLLOWUP_STATUSES: frozenset[str] = FOLLOWUP_SKIP_STATUSES | {
+    # in-flight / done follow-up pipeline
+    "followup_planned",
+    "followup_processing",
+    "followup_queued",
+    "followup_sent",
+    "followup_failed",
+    "followup_canceled",
+    # follow-up delivery states written by the outbox worker
+    "sent",
+    "delivered",
+    "read",
+    "canceled",
+}
 
-# Only these original-send statuses qualify for a follow-up.
-# provider_message_id alone is not sufficient proof of a successful send —
-# failed/excluded rows may carry a provider_message_id or sent_at.
-_POSITIVE_ORIGINAL_SEND_STATUSES: frozenset[str] = frozenset(
-    {
-        "provider_accepted",
-        "sent",
-        "delivered",
-        # read / replied / booked_after_campaign are caught before we reach
-        # this check, so they do not need to be listed here.
-    }
-)
+# Follow-up requires PROVEN original delivery. Only status='delivered' qualifies.
+# queued / provider_accepted / sent do not prove the original message reached the
+# client (Run #23 audit), and provider_message_id alone is not proof of delivery.
+# read / replied / booked_after_campaign are caught before we reach this check.
+_POSITIVE_ORIGINAL_SEND_STATUSES: frozenset[str] = frozenset({"delivered"})
 
 # excluded_reason values that indicate a hard send failure.
 # Defensive belt-and-suspenders: a recipient could theoretically have
@@ -90,6 +89,7 @@ class RepairStats:
     candidates: int = 0
     created: int = 0
     skipped_read: int = 0
+    skipped_replied: int = 0
     skipped_booked_after: int = 0
     skipped_future_record: int = 0
     skipped_opted_out: int = 0
@@ -181,19 +181,36 @@ async def schedule_followups(
                 # Recipient was in the send pipeline.
                 stats.sent_recipients += 1
 
-                if recipient.status in _READ_OR_LATER_STATUSES:
-                    stats.skipped_read += 1
-                    stats.rows.append(_make_row(recipient, decision="skip", run_at=None, reason="read_or_later_status"))
+                # Terminal follow-up status (skip/suppression/delivery/in-flight) →
+                # never reschedule, regardless of original-send status. Checked first
+                # so suppressed_131026 / skipped_not_delivered etc. are respected.
+                if recipient.followup_status in _TERMINAL_FOLLOWUP_STATUSES:
+                    stats.skipped_existing_job += 1
+                    stats.rows.append(
+                        _make_row(
+                            recipient,
+                            decision="skip",
+                            run_at=None,
+                            reason=f"terminal_followup_status:{recipient.followup_status}",
+                        )
+                    )
                     continue
 
-                if recipient.read_at is not None:
-                    stats.skipped_read += 1
-                    stats.rows.append(_make_row(recipient, decision="skip", run_at=None, reason="read_at_set"))
-                    continue
-
-                if recipient.booked_after_at is not None:
+                # Priority must match the main follow-up logic and the final guard:
+                #   booked_after > replied > read.
+                if recipient.status == "booked_after_campaign" or recipient.booked_after_at is not None:
                     stats.skipped_booked_after += 1
-                    stats.rows.append(_make_row(recipient, decision="skip", run_at=None, reason="booked_after_at_set"))
+                    stats.rows.append(_make_row(recipient, decision="skip", run_at=None, reason="booked_after"))
+                    continue
+
+                if recipient.status == "replied" or recipient.replied_at is not None:
+                    stats.skipped_replied += 1
+                    stats.rows.append(_make_row(recipient, decision="skip", run_at=None, reason="replied"))
+                    continue
+
+                if recipient.status == "read" or recipient.read_at is not None:
+                    stats.skipped_read += 1
+                    stats.rows.append(_make_row(recipient, decision="skip", run_at=None, reason="read"))
                     continue
 
                 if recipient.provider_message_id is None:
@@ -203,8 +220,9 @@ async def schedule_followups(
                     )
                     continue
 
-                # Require a positive original-send status.  provider_message_id
-                # alone is not proof of success — failed rows can carry one.
+                # Require PROVEN original delivery (status == "delivered").
+                # provider_message_id alone is not proof — queued / provider_accepted
+                # / sent / canceled originals are not delivered.
                 if recipient.status not in _POSITIVE_ORIGINAL_SEND_STATUSES:
                     stats.skipped_not_sent += 1
                     stats.rows.append(
@@ -212,7 +230,7 @@ async def schedule_followups(
                             recipient,
                             decision="skip",
                             run_at=None,
-                            reason=f"non_positive_status:{recipient.status}",
+                            reason=f"not_delivered:{recipient.status}",
                         )
                     )
                     continue
@@ -234,18 +252,6 @@ async def schedule_followups(
                 if recipient.followup_message_job_id is not None:
                     stats.skipped_existing_job += 1
                     stats.rows.append(_make_row(recipient, decision="skip", run_at=None, reason="followup_job_id_set"))
-                    continue
-
-                if recipient.followup_status in _TERMINAL_FOLLOWUP_STATUSES:
-                    stats.skipped_existing_job += 1
-                    stats.rows.append(
-                        _make_row(
-                            recipient,
-                            decision="skip",
-                            run_at=None,
-                            reason=f"terminal_followup_status:{recipient.followup_status}",
-                        )
-                    )
                     continue
 
                 # --- Dedupe: check for an existing MessageJob by payload ---
@@ -288,12 +294,16 @@ async def schedule_followups(
                     fs = eligibility.followup_status
                     if fs == "skipped_read":
                         stats.skipped_read += 1
+                    elif fs == "skipped_replied":
+                        stats.skipped_replied += 1
                     elif fs == "skipped_booked_after":
                         stats.skipped_booked_after += 1
                     elif fs == "skipped_opted_out":
                         stats.skipped_opted_out += 1
                     elif fs == "skipped_future_record":
                         stats.skipped_future_record += 1
+                    elif fs == "skipped_not_delivered":
+                        stats.skipped_not_sent += 1
                     else:
                         stats.skipped_other += 1
                     print(f"  SKIP recipient_id={recipient.id} reason={reason!r}")
@@ -377,6 +387,7 @@ def _print_summary(stats: RepairStats) -> None:
     print(f"  candidates            : {stats.candidates}")
     print(f"  created               : {stats.created}")
     print(f"  skipped_read          : {stats.skipped_read}")
+    print(f"  skipped_replied       : {stats.skipped_replied}")
     print(f"  skipped_booked_after  : {stats.skipped_booked_after}")
     print(f"  skipped_future_record : {stats.skipped_future_record}")
     print(f"  skipped_opted_out     : {stats.skipped_opted_out}")

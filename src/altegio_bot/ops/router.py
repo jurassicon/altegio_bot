@@ -135,7 +135,8 @@ def _status_badge(status: str | None) -> str:
     return f'<span class="badge bg-{color}">{_esc(status)}</span>'
 
 
-_FOLLOWUP_ELIGIBLE_STATUSES_HTML = frozenset({"queued", "provider_accepted", "delivered"})
+# Follow-up requires proven original delivery: only "delivered" can be eligible.
+_FOLLOWUP_ELIGIBLE_STATUSES_HTML = frozenset({"delivered"})
 
 _FOLLOWUP_STATUS_SKIP_REASON: dict[str, str] = {
     "skipped_booked_after": "booked_after",
@@ -143,6 +144,9 @@ _FOLLOWUP_STATUS_SKIP_REASON: dict[str, str] = {
     "skipped_replied": "replied",
     "skipped_opted_out": "opted_out",
     "skipped_future_record": "future_record",
+    "skipped_not_delivered": "not_delivered",
+    "suppressed_131026": "suppressed_131026",
+    "suppressed_131049": "suppressed_131049",
     "followup_skipped": "skipped",
 }
 
@@ -170,8 +174,12 @@ def _fu_reason(r: CampaignRecipient) -> str:
         return "failed"
     if fs is not None:
         return f"followup_status:{fs}"
-    if r.status not in _FOLLOWUP_ELIGIBLE_STATUSES_HTML or r.excluded_reason is not None:
+    if r.excluded_reason is not None:
         return "not eligible"
+    # No follow-up status yet: require proven original delivery. queued /
+    # provider_accepted / sent → original delivery not proven → not_delivered.
+    if r.status not in _FOLLOWUP_ELIGIBLE_STATUSES_HTML:
+        return "not_delivered"
     return "eligible"
 
 
@@ -201,6 +209,9 @@ _FOLLOWUP_SKIPPED_STATUSES = frozenset(
         "skipped_booked_after",
         "skipped_opted_out",
         "skipped_future_record",
+        "skipped_not_delivered",
+        "suppressed_131026",
+        "suppressed_131049",
         "canceled",
     }
 )

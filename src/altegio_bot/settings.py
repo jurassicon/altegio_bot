@@ -114,6 +114,17 @@ class Settings(BaseSettings):
     wa_131026_suppression_threshold: int = 2
     wa_131026_suppression_window_days: int = 14
 
+    # Stricter marketing/follow-up suppression. On top of the transactional
+    # 131026 threshold above, marketing job types (MARKETING_JOB_TYPES in the
+    # outbox worker, incl. newsletter_new_clients_followup) are suppressed if the
+    # phone has ANY undeliverable/suppression history within a longer cooldown:
+    #   * a 131026 or 131049 WhatsApp delivery failure;
+    #   * a previous suppressed_131026 / suppressed_131049 canceled outbox row.
+    # A single prior occurrence is enough (conservative). Transactional reminders
+    # keep the 14-day threshold rule above. Override: MARKETING_SUPPRESSION_*.
+    marketing_suppression_enabled: bool = True
+    marketing_suppression_cooldown_days: int = 90
+
     # Максимальное число параллельных CRM-запросов при сегментации кампании.
     # Защищает от перегрузки Altegio API. Переопределяется через env:
     #   CAMPAIGN_CRM_MAX_CONCURRENCY=8

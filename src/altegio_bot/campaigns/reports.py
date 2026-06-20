@@ -188,6 +188,12 @@ async def _fetch_attribution(session: AsyncSession, run_id: int) -> dict[str, An
     _is_booked = or_(
         CampaignRecipient.booked_after_at.is_not(None),
         CampaignRecipient.status == "booked_after_campaign",
+        # Hardening: the final guard may persist followup_status="skipped_booked_after"
+        # for returned-after-period skips. Count those as booked even if a
+        # historical row has no booked_after_at timestamp. coalesce keeps the
+        # comparison FALSE (not NULL) for the common followup_status IS NULL case,
+        # so SQL three-valued logic does not poison the surrounding OR/NOT.
+        func.coalesce(CampaignRecipient.followup_status, "") == "skipped_booked_after",
     )
     _is_replied = or_(
         CampaignRecipient.replied_at.is_not(None),
@@ -197,7 +203,9 @@ async def _fetch_attribution(session: AsyncSession, run_id: int) -> dict[str, An
         CampaignRecipient.read_at.is_not(None),
         CampaignRecipient.status == "read",
     )
-    _FOLLOWUP_ELIGIBLE_STATUSES_LIST = ["queued", "provider_accepted", "delivered"]
+    # Follow-up requires proven original delivery: only status == "delivered"
+    # counts as eligible. queued / provider_accepted / sent are NOT eligible.
+    _FOLLOWUP_ELIGIBLE_STATUSES_LIST = ["delivered"]
 
     elig_stmt = select(
         func.count(CampaignRecipient.id).filter(_is_booked).label("skipped_booked_after"),

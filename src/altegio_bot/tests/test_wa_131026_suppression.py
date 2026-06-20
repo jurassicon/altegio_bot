@@ -310,7 +310,7 @@ class _FakeSession:
         if name == "CampaignRun":
             from datetime import datetime, timezone
 
-            return SimpleNamespace(completed_at=datetime(2025, 1, 1, tzinfo=timezone.utc))
+            return SimpleNamespace(completed_at=datetime(2025, 1, 1, tzinfo=timezone.utc), period_end=None)
         return None
 
 
@@ -619,6 +619,104 @@ def test_followup_131026_suppression_skips_live_altegio_guard(monkeypatch: Any) 
     assert session.added[0].status == "canceled"
 
 
+def test_followup_threshold_suppression_marks_recipient_suppressed_131026(monkeypatch: Any) -> None:
+    """P2-1: the old 131026 threshold path sets followup_status=suppressed_131026.
+
+    A follow-up canceled by the threshold guard must not stay followup_queued.
+    """
+    from types import SimpleNamespace
+
+    recipient = SimpleNamespace(
+        status="delivered",
+        read_at=None,
+        replied_at=None,
+        booked_after_at=None,
+        client_id=None,
+        altegio_client_id=None,
+        company_id=758285,
+        phone_e164=None,
+        sent_at=None,
+        outbox_message_id=None,
+        provider_message_id=None,
+        followup_status="followup_queued",
+    )
+
+    class _RecordingSession(_FakeSession):
+        async def get(self, model: Any, pk: Any) -> Any:
+            if getattr(model, "__name__", "") == "CampaignRecipient":
+                return recipient
+            return await super().get(model, pk)
+
+    job = _FakeJob(
+        id=30,
+        company_id=758285,
+        job_type="newsletter_new_clients_followup",
+        payload={"campaign_recipient_id": 7, "campaign_run_id": 8},
+    )
+    _base_patches(monkeypatch, job=job, n_failures=2)
+    monkeypatch.setattr(ow, "client_has_any_future_record", AsyncMock(return_value=False))
+    monkeypatch.setattr(ow, "safe_send", AsyncMock(return_value=("x", None)))
+    monkeypatch.setattr(ow, "safe_send_template", AsyncMock(return_value=("x", None)))
+
+    session = _RecordingSession()
+    _run(ow.process_job_in_session(session, 30, provider=object()))
+
+    assert job.status == "canceled"
+    assert job.last_error.startswith("suppressed_131026")
+    # Recipient terminal state updated — not left as followup_queued.
+    assert recipient.followup_status == "suppressed_131026"
+
+
+@pytest.mark.asyncio
+async def test_mark_followup_recipient_suppressed_sets_status(session_maker: Any) -> None:
+    """_mark_followup_recipient_suppressed persists the suppression followup_status."""
+    from types import SimpleNamespace
+
+    from altegio_bot.models.models import CampaignRecipient, CampaignRun
+
+    now = datetime(2026, 4, 1, tzinfo=UTC)
+    async with session_maker() as session:
+        async with session.begin():
+            run = CampaignRun(
+                campaign_code="new_clients_monthly",
+                mode="send-real",
+                company_ids=[1],
+                period_start=now,
+                period_end=now,
+                status="completed",
+                meta={},
+            )
+            session.add(run)
+            await session.flush()
+            recipient = CampaignRecipient(
+                campaign_run_id=run.id,
+                company_id=1,
+                phone_e164=PHONE,
+                status="delivered",
+                followup_status="followup_queued",
+            )
+            session.add(recipient)
+            await session.flush()
+            rid = recipient.id
+
+            job = SimpleNamespace(payload={"campaign_recipient_id": rid})
+            await ow._mark_followup_recipient_suppressed(session, job, "suppressed_131026")
+
+        refreshed = await session.get(CampaignRecipient, rid)
+    assert refreshed.followup_status == "suppressed_131026"
+
+
+def test_promo_card_booking_reminder_not_in_marketing_job_types() -> None:
+    """P3 decision lock: promo_card_booking_reminder stays on the 14-day threshold.
+
+    It is a single lifecycle nudge on a separate send path, not a recurring
+    marketing campaign, so it is intentionally excluded from the 90-day marketing
+    suppression (MARKETING_JOB_TYPES) but keeps 131026 threshold suppression.
+    """
+    assert "promo_card_booking_reminder" not in ow.MARKETING_JOB_TYPES
+    assert "promo_card_booking_reminder" in ow.WA_131026_SUPPRESSIBLE_JOB_TYPES
+
+
 def test_followup_live_guard_runs_when_131026_below_threshold(monkeypatch: Any) -> None:
     """131026 failures below threshold → live Altegio guard is reached and called.
 
@@ -643,3 +741,98 @@ def test_followup_live_guard_runs_when_131026_below_threshold(monkeypatch: Any) 
     send_mock.assert_awaited_once()
     assert job.status == "done"
     assert "suppressed_131026" not in (job.last_error or "")
+
+
+# ---------------------------------------------------------------------------
+# Stricter marketing suppression: _marketing_suppression_reason (real DB)
+# ---------------------------------------------------------------------------
+
+
+async def _insert_suppressed_outbox(
+    session: Any,
+    *,
+    code: str,
+    phone: str = PHONE,
+    sent_at: datetime = NOW,
+) -> None:
+    """Insert a previous canceled suppression row (suppressed_131026 / 131049)."""
+    session.add(
+        OutboxMessage(
+            company_id=1,
+            phone_e164=phone,
+            template_code="newsletter_new_clients_followup",
+            language="de",
+            body="",
+            status="canceled",
+            error=f"suppressed_{code}: previous",
+            provider_message_id=None,
+            scheduled_at=sent_at,
+            sent_at=sent_at,
+            message_source="bot",
+            meta={"suppression_code": code},
+        )
+    )
+    await session.flush()
+
+
+@pytest.mark.asyncio
+async def test_marketing_suppression_none_without_history(session_maker: Any, monkeypatch: Any) -> None:
+    monkeypatch.setattr(ow, "utcnow", lambda: NOW)
+    async with session_maker() as session:
+        async with session.begin():
+            reason = await ow._marketing_suppression_reason(session, PHONE, 90)
+    assert reason is None
+
+
+@pytest.mark.asyncio
+async def test_marketing_suppression_real_131026_failure(session_maker: Any, monkeypatch: Any) -> None:
+    """A single prior 131026 delivery failure suppresses marketing follow-up."""
+    monkeypatch.setattr(ow, "utcnow", lambda: NOW)
+    async with session_maker() as session:
+        async with session.begin():
+            wamid = f"{WAMID_BASE}-mkt26"
+            await _insert_outbox(session, wamid=wamid, status="sent")
+            await _insert_wa_event(session, wamid=wamid, code=131026)
+            reason = await ow._marketing_suppression_reason(session, PHONE, 90)
+    assert reason is not None
+    assert reason.startswith("suppressed_131026")
+
+
+@pytest.mark.asyncio
+async def test_marketing_suppression_prior_suppressed_row(session_maker: Any, monkeypatch: Any) -> None:
+    """A previous suppressed_131026 canceled row suppresses marketing follow-up."""
+    monkeypatch.setattr(ow, "utcnow", lambda: NOW)
+    async with session_maker() as session:
+        async with session.begin():
+            await _insert_suppressed_outbox(session, code="131026")
+            reason = await ow._marketing_suppression_reason(session, PHONE, 90)
+    assert reason is not None
+    assert reason.startswith("suppressed_131026")
+
+
+@pytest.mark.asyncio
+async def test_marketing_suppression_real_131049_failure(session_maker: Any, monkeypatch: Any) -> None:
+    """A prior 131049 ecosystem-engagement failure suppresses marketing follow-up."""
+    monkeypatch.setattr(ow, "utcnow", lambda: NOW)
+    async with session_maker() as session:
+        async with session.begin():
+            wamid = f"{WAMID_BASE}-mkt49"
+            await _insert_outbox(session, wamid=wamid, status="sent")
+            await _insert_wa_event(session, wamid=wamid, code=131049)
+            reason = await ow._marketing_suppression_reason(session, PHONE, 90)
+    assert reason is not None
+    assert reason.startswith("suppressed_131049")
+
+
+@pytest.mark.asyncio
+async def test_marketing_suppression_outside_cooldown_not_counted(session_maker: Any, monkeypatch: Any) -> None:
+    """A 131026 failure older than the cooldown window does not suppress."""
+    monkeypatch.setattr(ow, "utcnow", lambda: NOW)
+    old = NOW - timedelta(days=120)
+    async with session_maker() as session:
+        async with session.begin():
+            wamid = f"{WAMID_BASE}-mktold"
+            await _insert_outbox(session, wamid=wamid, status="sent", sent_at=old)
+            await _insert_wa_event(session, wamid=wamid, code=131026)
+            reason = await ow._marketing_suppression_reason(session, PHONE, 90)
+    assert reason is None

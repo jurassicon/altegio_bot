@@ -747,7 +747,7 @@ async def test_failed_recipient_status_is_not_scheduled(session_maker) -> None:
     assert stats.candidates == 0
     assert stats.skipped_not_sent >= 1
     skip_rows = [r for r in stats.rows if r.decision == "skip"]
-    assert any("non_positive_status" in (r.reason or "") for r in skip_rows)
+    assert any("not_delivered" in (r.reason or "") for r in skip_rows)
 
 
 # ---------------------------------------------------------------------------
@@ -781,13 +781,13 @@ async def test_cleanup_failed_recipient_status_is_not_scheduled(session_maker) -
 
 
 # ---------------------------------------------------------------------------
-# O. provider_accepted recipient can be scheduled (P2-1)
+# O. provider_accepted recipient is NOT scheduled (original delivery required)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_provider_accepted_recipient_can_be_scheduled(session_maker) -> None:
-    """status='provider_accepted' is in the allow-list → should reach candidates."""
+async def test_provider_accepted_recipient_not_scheduled(session_maker) -> None:
+    """status='provider_accepted' does not prove delivery → skipped, not a candidate."""
     async with session_maker() as session:
         async with session.begin():
             run = _make_run(session)
@@ -806,8 +806,8 @@ async def test_provider_accepted_recipient_can_be_scheduled(session_maker) -> No
 
     stats = await schedule_followups(run_id, dry_run=True, session_factory=session_maker)
 
-    assert stats.candidates == 1
-    assert stats.skipped_not_sent == 0
+    assert stats.candidates == 0
+    assert stats.skipped_not_sent == 1
 
 
 # ---------------------------------------------------------------------------
@@ -839,3 +839,126 @@ async def test_excluded_reason_hard_failure_is_not_scheduled(session_maker) -> N
 
     assert stats.candidates == 0
     assert stats.skipped_not_sent >= 1
+
+
+# ---------------------------------------------------------------------------
+# Q. New terminal follow-up statuses are not rescheduled (P2-4)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "followup_status",
+    [
+        "skipped_not_delivered",
+        "suppressed_131026",
+        "suppressed_131049",
+        "skipped_replied",
+        "sent",
+        "delivered",
+        "read",
+        "followup_queued",
+    ],
+)
+@pytest.mark.asyncio
+async def test_terminal_followup_status_not_rescheduled(session_maker, followup_status: str) -> None:
+    """Recipients with a terminal follow-up status are never rescheduled."""
+    async with session_maker() as session:
+        async with session.begin():
+            run = _make_run(session)
+            client = _make_client(session)
+            await session.flush()
+            _make_recipient(
+                session,
+                run.id,
+                client.id,
+                status="delivered",
+                followup_status=followup_status,
+            )
+            await session.flush()
+            run_id = run.id
+
+    stats = await schedule_followups(run_id, dry_run=True, session_factory=session_maker)
+
+    assert stats.candidates == 0
+    assert stats.skipped_existing_job >= 1
+
+
+@pytest.mark.asyncio
+async def test_repair_replied_status_counts_as_skipped_replied(session_maker) -> None:
+    """status='replied' → skipped_replied (not skipped_read)."""
+    async with session_maker() as session:
+        async with session.begin():
+            run = _make_run(session)
+            client = _make_client(session)
+            await session.flush()
+            _make_recipient(session, run.id, client.id, status="replied")
+            await session.flush()
+            run_id = run.id
+
+    stats = await schedule_followups(run_id, dry_run=True, session_factory=session_maker)
+
+    assert stats.candidates == 0
+    assert stats.skipped_replied == 1
+    assert stats.skipped_read == 0
+
+
+@pytest.mark.asyncio
+async def test_repair_booked_after_campaign_status_counts_as_booked(session_maker) -> None:
+    """status='booked_after_campaign' → skipped_booked_after (not skipped_read)."""
+    async with session_maker() as session:
+        async with session.begin():
+            run = _make_run(session)
+            client = _make_client(session)
+            await session.flush()
+            _make_recipient(session, run.id, client.id, status="booked_after_campaign")
+            await session.flush()
+            run_id = run.id
+
+    stats = await schedule_followups(run_id, dry_run=True, session_factory=session_maker)
+
+    assert stats.candidates == 0
+    assert stats.skipped_booked_after == 1
+    assert stats.skipped_read == 0
+
+
+@pytest.mark.parametrize("status", ["provider_accepted", "queued"])
+@pytest.mark.asyncio
+async def test_repair_non_delivered_status_not_scheduled(session_maker, status: str) -> None:
+    """provider_accepted / queued original statuses are not scheduled (delivery required)."""
+    async with session_maker() as session:
+        async with session.begin():
+            run = _make_run(session)
+            client = _make_client(session)
+            await session.flush()
+            _make_recipient(
+                session,
+                run.id,
+                client.id,
+                status=status,
+                provider_message_id="wamid.nd-test",
+                sent_at=SENT_AT,
+            )
+            await session.flush()
+            run_id = run.id
+
+    stats = await schedule_followups(run_id, dry_run=True, session_factory=session_maker)
+
+    assert stats.candidates == 0
+    assert stats.skipped_not_sent >= 1
+
+
+@pytest.mark.asyncio
+async def test_repair_clean_delivered_recipient_scheduled(session_maker) -> None:
+    """A clean delivered recipient is still a candidate for the repair script."""
+    async with session_maker() as session:
+        async with session.begin():
+            run = _make_run(session)
+            client = _make_client(session)
+            await session.flush()
+            _make_recipient(session, run.id, client.id, status="delivered")
+            await session.flush()
+            run_id = run.id
+
+    stats = await schedule_followups(run_id, dry_run=True, session_factory=session_maker)
+
+    assert stats.candidates == 1

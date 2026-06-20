@@ -104,7 +104,9 @@ def _make_recipient(session, run_id: int, **kw) -> CampaignRecipient:
         company_id=COMPANY,
         client_id=CLIENT_ID,
         phone_e164=PHONE,
-        status="queued",
+        # Follow-up requires proven original delivery; "delivered" is the clean
+        # eligible baseline for worker tests.
+        status="delivered",
         followup_status=None,
         read_at=None,
     )

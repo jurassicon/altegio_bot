@@ -691,7 +691,9 @@ def _make_recipient(**kw: Any) -> CampaignRecipient:
     defaults: dict[str, Any] = dict(
         campaign_run_id=1,
         company_id=758285,
-        status="provider_accepted",
+        # Follow-up now requires proven original delivery; "delivered" is the
+        # clean eligible baseline for these classifier tests.
+        status="delivered",
         excluded_reason=None,
         read_at=None,
         booked_after_at=None,
@@ -708,8 +710,8 @@ def test_followup_unread_only_excludes_recipient_with_read_at() -> None:
 
 
 def test_followup_unread_only_includes_recipient_without_read_at() -> None:
-    """unread_only: recipient without read_at IS eligible."""
-    r = _make_recipient(status="provider_accepted", read_at=None)
+    """unread_only: delivered recipient without read_at IS eligible."""
+    r = _make_recipient(status="delivered", read_at=None)
     assert _is_eligible_for_followup(r, "unread_only") is True
 
 
