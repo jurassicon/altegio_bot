@@ -738,8 +738,8 @@ async def test_followup_guard_delivered_clean_eligible(session_maker) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 3d. Strengthened booking guard: confirmed, non-deleted record in attribution
-# window → skipped_booked_after.
+# 3d. Canonical returned-after-period guard: ANY non-deleted record in
+# [period_end, now) → skipped_booked_after.
 # ---------------------------------------------------------------------------
 
 

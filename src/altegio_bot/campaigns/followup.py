@@ -654,7 +654,7 @@ async def _find_returned_after_period_record_at(
     (campaigns/segment.py + campaigns/altegio_crm.classify_crm_records):
     ANY non-deleted record with starts_at >= period_end means the client already
     returned — record status / confirmed flag are intentionally NOT filtered
-    (only deleted/cancelled records are excluded). Service filtering is likewise
+    (only records marked deleted are excluded). Service filtering is likewise
     not applied at this stage, matching count_after_period in the segmentation.
 
     ``boundary`` is run.period_end when available (so a record on June 1 still
@@ -700,7 +700,18 @@ async def check_followup_final_eligibility(
       3.1b  original delivery required (status must be "delivered")
       3.2   current opt-out state
       3.3   new record create event after the original campaign (AltegioEvent)
-      3.3b  confirmed, non-deleted record in/after the attribution window
+      3.3b  Canonical returned-after-period guard:
+            for new_clients_monthly-style attribution, skip if the client has
+            ANY non-deleted record in [period_end, now). This mirrors the
+            canonical segmentation rule: a non-deleted record after the
+            campaign period means the client returned/booked/was served and
+            must not receive follow-up.
+
+            If period_end is unavailable, fall back to the attribution start
+            boundary used by the guard.
+
+            Future records are intentionally handled by the later future-record
+            guard and keep the distinct skipped_future_record status.
       3.4   any non-deleted future record already booked
 
     Returns FollowupFinalEligibilityResult(eligible=True) when safe to send.
@@ -820,11 +831,12 @@ async def check_followup_final_eligibility(
                 booked_after_at=evt_at,
             )
 
-    # 3.3b — returned after the campaign PERIOD (canonical new_clients_monthly rule).
+    # 3.3b — canonical returned-after-period guard.
     # Boundary is run.period_end when available (a record on June 1 still counts
     # for a May campaign completed on June 2), else the attribution start. ANY
-    # non-deleted record at/after the boundary blocks follow-up — matching
-    # segment.classify_crm_records' count_after_period (status-agnostic). The
+    # non-deleted record in [boundary, now) blocks follow-up — matching
+    # segment.classify_crm_records' count_after_period (status-agnostic). Future
+    # records are handled by the next guard and keep skipped_future_record. The
     # matched timestamp is returned so plan_followup backfills booked_after_at.
     returned_boundary: datetime | None = None
     if run is not None and run.period_end is not None:
