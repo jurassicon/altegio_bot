@@ -645,9 +645,7 @@ async def test_run23_like_due_run_claimable_and_processed(
             await session.flush()
             run_id = run.id
             eligible = _make_recipient(session, run_id, status="delivered")
-            read = _make_recipient(
-                session, run_id, status="read", read_at=now, phone_e164="+10000000002"
-            )
+            read = _make_recipient(session, run_id, status="read", read_at=now, phone_e164="+10000000002")
             booked = _make_recipient(
                 session, run_id, status="delivered", booked_after_at=now, phone_e164="+10000000003"
             )
@@ -915,19 +913,27 @@ async def test_mixed_batch_one_cycle_safety(worker_session, session_maker) -> No
     async with session_maker() as session:
         async with session.begin():
             hist = _make_run(
-                session, followup_delay_days=14, completed_at=now - timedelta(days=40),
+                session,
+                followup_delay_days=14,
+                completed_at=now - timedelta(days=40),
                 followup_policy="unread_or_not_booked",
             )
             processed = _make_run(
-                session, followup_delay_days=14, completed_at=now - timedelta(days=40),
+                session,
+                followup_delay_days=14,
+                completed_at=now - timedelta(days=40),
                 followup_policy="unread_or_not_booked",
             )
             recent_elig = _make_run(
-                session, followup_delay_days=14, completed_at=now - timedelta(days=15),
+                session,
+                followup_delay_days=14,
+                completed_at=now - timedelta(days=15),
                 followup_policy="unread_or_not_booked",
             )
             recent_zero = _make_run(
-                session, followup_delay_days=14, completed_at=now - timedelta(days=15),
+                session,
+                followup_delay_days=14,
+                completed_at=now - timedelta(days=15),
                 followup_policy="unread_or_not_booked",
             )
             await session.flush()
@@ -977,7 +983,9 @@ async def test_settings_override_max_due_age(worker_session, session_maker, monk
         async with session.begin():
             # due_at ≈ now-3d: NOT historical at default 7, but historical at 1.
             run = _make_run(
-                session, followup_delay_days=14, completed_at=now - timedelta(days=17),
+                session,
+                followup_delay_days=14,
+                completed_at=now - timedelta(days=17),
                 followup_policy="unread_or_not_booked",
             )
             await session.flush()
@@ -1052,9 +1060,7 @@ async def test_recovered_historical_without_safety_marker_still_skipped(worker_s
 
 
 @pytest.mark.asyncio
-async def test_recovered_already_processed_without_safety_marker_still_skipped(
-    worker_session, session_maker
-) -> None:
+async def test_recovered_already_processed_without_safety_marker_still_skipped(worker_session, session_maker) -> None:
     """Crash before gate: recovered run with existing jobs → skipped_already_processed."""
     now = datetime.now(timezone.utc)
     async with session_maker() as session:
@@ -1084,9 +1090,7 @@ async def test_recovered_already_processed_without_safety_marker_still_skipped(
 
 
 @pytest.mark.asyncio
-async def test_recovered_recent_without_safety_marker_runs_gate_then_processes(
-    worker_session, session_maker
-) -> None:
+async def test_recovered_recent_without_safety_marker_runs_gate_then_processes(worker_session, session_maker) -> None:
     """Crash before gate: recovered recent run passes the gate, persists marker, completes."""
     now = datetime.now(timezone.utc)
     async with session_maker() as session:
@@ -1165,16 +1169,25 @@ async def test_mixed_batch_crash_recovery_regression(worker_session, session_mak
     async with session_maker() as session:
         async with session.begin():
             hist = _make_run(
-                session, followup_delay_days=14, completed_at=now - timedelta(days=40),
-                followup_policy="unread_or_not_booked", meta=_recovered_meta(),
+                session,
+                followup_delay_days=14,
+                completed_at=now - timedelta(days=40),
+                followup_policy="unread_or_not_booked",
+                meta=_recovered_meta(),
             )
             processed = _make_run(
-                session, followup_delay_days=14, completed_at=now - timedelta(days=40),
-                followup_policy="unread_or_not_booked", meta=_recovered_meta(),
+                session,
+                followup_delay_days=14,
+                completed_at=now - timedelta(days=40),
+                followup_policy="unread_or_not_booked",
+                meta=_recovered_meta(),
             )
             recent = _make_run(
-                session, followup_delay_days=14, completed_at=now - timedelta(days=15),
-                followup_policy="unread_or_not_booked", meta=_recovered_meta(),
+                session,
+                followup_delay_days=14,
+                completed_at=now - timedelta(days=15),
+                followup_policy="unread_or_not_booked",
+                meta=_recovered_meta(),
             )
             await session.flush()
             hist_id, processed_id, recent_id = hist.id, processed.id, recent.id

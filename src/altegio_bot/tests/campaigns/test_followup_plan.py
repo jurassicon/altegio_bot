@@ -93,10 +93,7 @@ async def test_plan_followup_plans_only_real_candidates(patched_followup, sessio
     assert planned == 3, "only the 3 unread/non-booked pipeline recipients are planned"
 
     async with session_maker() as session:
-        recips = {
-            label: await session.get(CampaignRecipient, rid)
-            for label, rid in ids.items()
-        }
+        recips = {label: await session.get(CampaignRecipient, rid) for label, rid in ids.items()}
 
     assert recips["delivered"].followup_status == "followup_planned"
     assert recips["provider_accepted"].followup_status == "followup_planned"
@@ -120,14 +117,11 @@ async def test_execute_followup_queues_only_planned(patched_followup, session_ma
     assert stats["failed"] == 0
 
     async with session_maker() as session:
-        recips = {
-            label: await session.get(CampaignRecipient, rid)
-            for label, rid in ids.items()
-        }
+        recips = {label: await session.get(CampaignRecipient, rid) for label, rid in ids.items()}
         # All follow-up jobs must reference only the planned (eligible) recipients.
         jobs = (
-            await session.execute(select(MessageJob).where(MessageJob.job_type == FOLLOWUP_JOB_TYPE))
-        ).scalars().all()
+            (await session.execute(select(MessageJob).where(MessageJob.job_type == FOLLOWUP_JOB_TYPE))).scalars().all()
+        )
 
     planned_ids = {ids["delivered"], ids["provider_accepted"], ids["queued"]}
     skipped_ids = {ids["read"], ids["booked"]}

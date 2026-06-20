@@ -69,9 +69,7 @@ def test_followup_worker_not_on_chatwoot_network() -> None:
         pytest.skip("no chatwoot-internal override file")
     config = yaml.safe_load(_COMPOSE_CHATWOOT.read_text())
     services = config.get("services", {})
-    assert _SERVICE not in services, (
-        f"{_SERVICE} must NOT be attached to the Chatwoot internal network"
-    )
+    assert _SERVICE not in services, f"{_SERVICE} must NOT be attached to the Chatwoot internal network"
 
 
 def test_entrypoint_calls_worker_run_loop() -> None:
