@@ -62,10 +62,6 @@ _PLAN_REASONS: frozenset[str] = frozenset(
     }
 )
 
-# Подтверждённая (не отменённая) запись: campaigns.segment.CONFIRMED_FLAG.
-# confirmed == 1 означает «бронь активна / не отменена».
-_CONFIRMED_FLAG = 1
-
 # Статусы, которые означают «сообщение прочитано или позже» для follow-up политик.
 _READ_OR_LATER_STATUSES: frozenset[str] = frozenset({"read", "replied", "booked_after_campaign"})
 
@@ -644,22 +640,29 @@ async def _has_future_record(
     return result.scalar_one_or_none() is not None
 
 
-async def _has_confirmed_record_since(
+async def _find_returned_after_period_record_at(
     session: AsyncSession,
     *,
     recipient: CampaignRecipient,
     company_id: int,
-    since: datetime,
-) -> bool:
-    """True if the client has a confirmed, non-deleted record starting at/after ``since``.
+    boundary: datetime,
+    before: datetime,
+) -> datetime | None:
+    """Return starts_at of the earliest non-deleted record in ``[boundary, before)``.
 
-    "Confirmed" reuses the canonical campaigns/segment flag (confirmed == 1 =
-    active / not cancelled). ``since`` is the campaign attribution start
-    (max(run.completed_at, recipient.sent_at)), so the client's ORIGINAL
-    campaign-period visit (which started before the campaign completed) does NOT
-    match — only an active booking/visit from the campaign onward does. This
-    catches clients who already re-engaged (booked or attended again) even when
-    the appointment is no longer in the future, which _has_future_record misses.
+    Mirrors the canonical new_clients_monthly "returned after period" rule
+    (campaigns/segment.py + campaigns/altegio_crm.classify_crm_records):
+    ANY non-deleted record with starts_at >= period_end means the client already
+    returned — record status / confirmed flag are intentionally NOT filtered
+    (only deleted/cancelled records are excluded). Service filtering is likewise
+    not applied at this stage, matching count_after_period in the segmentation.
+
+    ``boundary`` is run.period_end when available (so a record on June 1 still
+    counts for a May campaign completed on June 2), else the attribution start.
+    The client's ORIGINAL in-period visit (starts_at < period_end) does not match.
+    The upper bound ``before`` (= now) excludes still-future records, which keep
+    their dedicated skipped_future_record status in the next check.
+    Returns the matched timestamp so callers can persist it as booked_after_at.
     """
     if recipient.client_id is not None:
         client_cond = Record.client_id == recipient.client_id
@@ -667,17 +670,18 @@ async def _has_confirmed_record_since(
         client_cond = Record.altegio_client_id == recipient.altegio_client_id
 
     stmt = (
-        select(Record.id)
+        select(Record.starts_at)
         .where(Record.company_id == company_id)
         .where(func.coalesce(Record.is_deleted, False).is_(False))
-        .where(Record.confirmed == _CONFIRMED_FLAG)
         .where(Record.starts_at.is_not(None))
-        .where(Record.starts_at >= since)
+        .where(Record.starts_at >= boundary)
+        .where(Record.starts_at < before)
         .where(client_cond)
+        .order_by(Record.starts_at.asc())
         .limit(1)
     )
     result = await session.execute(stmt)
-    return result.scalar_one_or_none() is not None
+    return result.scalar_one_or_none()
 
 
 async def check_followup_final_eligibility(
@@ -816,22 +820,31 @@ async def check_followup_final_eligibility(
                 booked_after_at=evt_at,
             )
 
-        # 3.3b — confirmed, non-deleted record in/after the attribution window.
-        # Stronger than 3.4 (future-only): also catches confirmed bookings/visits
-        # that already happened between campaign completion and now. The client
-        # is already booked/served, so a "new client" follow-up is inappropriate.
-        has_confirmed = await _has_confirmed_record_since(
+    # 3.3b — returned after the campaign PERIOD (canonical new_clients_monthly rule).
+    # Boundary is run.period_end when available (a record on June 1 still counts
+    # for a May campaign completed on June 2), else the attribution start. ANY
+    # non-deleted record at/after the boundary blocks follow-up — matching
+    # segment.classify_crm_records' count_after_period (status-agnostic). The
+    # matched timestamp is returned so plan_followup backfills booked_after_at.
+    returned_boundary: datetime | None = None
+    if run is not None and run.period_end is not None:
+        returned_boundary = run.period_end
+    elif attribution_start is not None:
+        returned_boundary = attribution_start
+    if returned_boundary is not None:
+        returned_at = await _find_returned_after_period_record_at(
             session,
             recipient=recipient,
             company_id=recipient.company_id,
-            since=attribution_start,
+            boundary=returned_boundary,
+            before=now,
         )
-        if has_confirmed:
+        if returned_at is not None:
             return FollowupFinalEligibilityResult(
                 eligible=False,
-                skip_reason=("Follow-up skipped: client already has a confirmed record in the attribution window"),
+                skip_reason="Follow-up skipped: client already returned after the campaign period",
                 followup_status="skipped_booked_after",
-                booked_after_at=None,
+                booked_after_at=returned_at,
             )
 
     # 3.4 — future record already booked

@@ -14,8 +14,9 @@ from sqlalchemy import select
 
 import altegio_bot.campaigns.followup as followup_module
 from altegio_bot.campaigns.followup import execute_followup, plan_followup
+from altegio_bot.campaigns.reports import run_report
 from altegio_bot.campaigns.runner import FOLLOWUP_JOB_TYPE
-from altegio_bot.models.models import CampaignRecipient, CampaignRun, MessageJob
+from altegio_bot.models.models import CampaignRecipient, CampaignRun, MessageJob, Record
 
 COMPANY = 758285
 PERIOD_START = datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -221,3 +222,110 @@ async def test_run23_shape_only_delivered_considered(patched_followup, session_m
     job_recipient_ids = {row.payload.get("campaign_recipient_id") for row in jobs}
     assert job_recipient_ids == set(delivered_ids)
     assert job_recipient_ids.isdisjoint(set(other_ids))
+
+
+@pytest.mark.asyncio
+async def test_plan_backfills_booked_after_at_for_returned_record(patched_followup, session_maker) -> None:
+    """plan_followup persists booked_after_at + skipped_booked_after for a returned record.
+
+    P2-2: the returned-after-period guard returns the matched timestamp, so the
+    recipient is reportable under "Skipped booked".
+    """
+    now = datetime.now(timezone.utc)
+    period_start = now - timedelta(days=60)
+    period_end = now - timedelta(days=40)
+    returned_at = now - timedelta(days=30)  # after period_end, before now
+
+    async with session_maker() as session:
+        async with session.begin():
+            run = CampaignRun(
+                campaign_code="new_clients_monthly",
+                mode="send-real",
+                company_ids=[COMPANY],
+                period_start=period_start,
+                period_end=period_end,
+                status="completed",
+                followup_enabled=True,
+                followup_delay_days=14,
+                followup_policy="unread_or_not_booked",
+                followup_template_name=TEMPLATE,
+                completed_at=now - timedelta(days=15),
+                meta={},
+            )
+            session.add(run)
+            await session.flush()
+            run_id = run.id
+
+            recipient = CampaignRecipient(
+                campaign_run_id=run_id,
+                company_id=COMPANY,
+                client_id=1,
+                altegio_client_id=1,
+                phone_e164="+10000000001",
+                status="delivered",
+                followup_status=None,
+            )
+            session.add(recipient)
+            session.add(
+                Record(
+                    company_id=COMPANY,
+                    altegio_record_id=4242,
+                    client_id=1,
+                    altegio_client_id=1,
+                    starts_at=returned_at,
+                    is_deleted=False,
+                    raw={},
+                )
+            )
+            await session.flush()
+            recipient_id = recipient.id
+
+    async with session_maker() as session:
+        async with session.begin():
+            planned = await plan_followup(session, run_id)
+    assert planned == 0, "returned-after-period recipient is not planned"
+
+    async with session_maker() as session:
+        r = await session.get(CampaignRecipient, recipient_id)
+        report = await run_report(session, run_id)
+
+    assert r.followup_status == "skipped_booked_after"
+    assert r.booked_after_at == returned_at  # backfilled from the matched record
+    # Reports count it under "Skipped booked".
+    assert report["followup_eligibility"]["skipped_booked_after"] == 1
+
+
+@pytest.mark.asyncio
+async def test_reports_count_skipped_booked_after_without_timestamp(session_maker) -> None:
+    """Historical row: followup_status='skipped_booked_after', booked_after_at=NULL is booked."""
+    async with session_maker() as session:
+        async with session.begin():
+            run = CampaignRun(
+                campaign_code="new_clients_monthly",
+                mode="send-real",
+                company_ids=[COMPANY],
+                period_start=PERIOD_START,
+                period_end=PERIOD_END,
+                status="completed",
+                followup_enabled=True,
+                meta={},
+            )
+            session.add(run)
+            await session.flush()
+            run_id = run.id
+            session.add(
+                CampaignRecipient(
+                    campaign_run_id=run_id,
+                    company_id=COMPANY,
+                    altegio_client_id=2,
+                    phone_e164="+10000000002",
+                    status="delivered",
+                    followup_status="skipped_booked_after",
+                    booked_after_at=None,
+                )
+            )
+
+    async with session_maker() as session:
+        report = await run_report(session, run_id)
+
+    assert report["followup_eligibility"]["skipped_booked_after"] == 1

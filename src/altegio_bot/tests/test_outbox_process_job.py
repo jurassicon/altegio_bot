@@ -752,7 +752,7 @@ def test_followup_job_backfills_followup_fields_on_success(monkeypatch: Any) -> 
     monkeypatch.setattr(ow, "utcnow", lambda: fixed_now)
 
     recipient = FakeCampaignRecipient(id=100, altegio_client_id=9001)
-    run_obj = SimpleNamespace(completed_at=datetime(2026, 1, 1, tzinfo=timezone.utc))
+    run_obj = SimpleNamespace(completed_at=datetime(2026, 1, 1, tzinfo=timezone.utc), period_end=None)
 
     session = _FollowupFakeSession(
         get_map={

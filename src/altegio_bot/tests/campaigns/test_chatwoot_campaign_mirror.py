@@ -103,7 +103,7 @@ class _FakeSession:
         if name == "CampaignRun":
             from datetime import datetime, timezone
 
-            return SimpleNamespace(completed_at=datetime(2025, 1, 1, tzinfo=timezone.utc))
+            return SimpleNamespace(completed_at=datetime(2025, 1, 1, tzinfo=timezone.utc), period_end=None)
         return None
 
     async def execute(self, stmt: Any) -> Any:

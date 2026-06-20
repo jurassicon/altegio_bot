@@ -87,6 +87,16 @@ PRE_APPOINTMENT_JOB_TYPES = (
     "reminder_2h",
 )
 
+# Recurring marketing campaign job types subject to the stricter 90-day
+# suppression (any prior 131026/131049 failure or suppressed_* row blocks the
+# next send). Repeatedly hitting a known-undeliverable number across recurring
+# blasts is wasteful and risky for the WABA.
+#
+# promo_card_booking_reminder is intentionally NOT here: it is a single
+# lifecycle nudge tied to one issued promo card (not a recurring campaign) and
+# it runs on a SEPARATE send path (_process_promo_card_booking_reminder) which
+# never reaches the _run_job_logic 90-day marketing block. It keeps the standard
+# 14-day 131026 threshold guard via WA_131026_SUPPRESSIBLE_JOB_TYPES below.
 MARKETING_JOB_TYPES = (
     "review_3d",
     "repeat_10d",
@@ -2236,6 +2246,12 @@ async def _run_job_logic(
             job.status = "canceled"
             job.locked_at = None
             job.last_error = reason
+            # Keep follow-up recipient terminal state consistent with the marketing
+            # suppression branch below: a follow-up canceled here must become
+            # suppressed_131026, not stay followup_queued (Ops/reports/repair rely
+            # on the terminal followup_status).
+            if job.job_type == FOLLOWUP_JOB_TYPE:
+                await _mark_followup_recipient_suppressed(session, job, "suppressed_131026")
             logger.info(
                 "Suppressed 131026 job_id=%s phone=%s failures=%d window=%dd",
                 job.id,

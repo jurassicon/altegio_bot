@@ -744,21 +744,24 @@ async def test_followup_guard_delivered_clean_eligible(session_maker) -> None:
 
 
 @pytest.mark.asyncio
-async def test_followup_guard_confirmed_record_in_window_skips(session_maker) -> None:
-    """Confirmed, non-deleted record starting after the campaign → booked/served."""
+async def test_followup_guard_returned_after_period_blocks(session_maker) -> None:
+    """Non-deleted record at/after period_end (already in the past) → skipped_booked_after.
+
+    Canonical new_clients_monthly returned-after-period rule; the matched record
+    timestamp is propagated to booked_after_at.
+    """
+    returned_at = PERIOD_END + timedelta(days=10)  # after period, before NOW
     async with session_maker() as session:
         async with session.begin():
-            run = _make_run(session)  # completed_at = CAMPAIGN_COMPLETED_AT (NOW-15d)
+            run = _make_run(session)
             client = _make_client(session)
             await session.flush()
             recipient = _make_recipient(session, run.id, client.id, status="delivered")
-            # Confirmed, non-deleted record that started after the campaign but
-            # is already in the past (so the future-record check would miss it).
             _make_record(
                 session,
                 client_id=client.id,
                 altegio_record_id=9101,
-                starts_at=NOW - timedelta(days=2),
+                starts_at=returned_at,
                 is_deleted=False,
                 confirmed=1,
             )
@@ -767,11 +770,20 @@ async def test_followup_guard_confirmed_record_in_window_skips(session_maker) ->
 
     assert result.eligible is False
     assert result.followup_status == "skipped_booked_after"
+    assert result.booked_after_at == returned_at
 
 
 @pytest.mark.asyncio
-async def test_followup_guard_deleted_confirmed_record_does_not_block(session_maker) -> None:
-    """A deleted confirmed record must NOT block follow-up."""
+async def test_followup_guard_record_between_period_end_and_completed_at_blocks(session_maker) -> None:
+    """Production case: record between period_end and run.completed_at blocks follow-up.
+
+    A May campaign (period_end) completed in June: a June-1 record sits before
+    completed_at but after period_end and must still block (the run.completed_at
+    boundary would miss it).
+    """
+    # _make_run: period_end=PERIOD_END (2026-02-01), completed_at=NOW-15d (2026-04-20).
+    between = PERIOD_END + timedelta(days=30)  # 2026-03-03, before completed_at
+    assert between < CAMPAIGN_COMPLETED_AT
     async with session_maker() as session:
         async with session.begin():
             run = _make_run(session)
@@ -782,19 +794,20 @@ async def test_followup_guard_deleted_confirmed_record_does_not_block(session_ma
                 session,
                 client_id=client.id,
                 altegio_record_id=9102,
-                starts_at=NOW - timedelta(days=2),
-                is_deleted=True,
-                confirmed=1,
+                starts_at=between,
+                is_deleted=False,
             )
             await session.flush()
             result = await check_followup_final_eligibility(session, recipient, run, NOW)
 
-    assert result.eligible is True
+    assert result.eligible is False
+    assert result.followup_status == "skipped_booked_after"
+    assert result.booked_after_at == between
 
 
 @pytest.mark.asyncio
-async def test_followup_guard_unconfirmed_record_does_not_block(session_maker) -> None:
-    """An unconfirmed (cancelled) record must NOT block follow-up."""
+async def test_followup_guard_unconfirmed_record_after_period_blocks(session_maker) -> None:
+    """Canonical rule is status-agnostic: an unconfirmed non-deleted record blocks."""
     async with session_maker() as session:
         async with session.begin():
             run = _make_run(session)
@@ -805,9 +818,32 @@ async def test_followup_guard_unconfirmed_record_does_not_block(session_maker) -
                 session,
                 client_id=client.id,
                 altegio_record_id=9103,
-                starts_at=NOW - timedelta(days=2),
+                starts_at=PERIOD_END + timedelta(days=5),
                 is_deleted=False,
                 confirmed=0,
+            )
+            await session.flush()
+            result = await check_followup_final_eligibility(session, recipient, run, NOW)
+
+    assert result.eligible is False
+    assert result.followup_status == "skipped_booked_after"
+
+
+@pytest.mark.asyncio
+async def test_followup_guard_deleted_record_after_period_does_not_block(session_maker) -> None:
+    """A deleted record after the period must NOT block follow-up."""
+    async with session_maker() as session:
+        async with session.begin():
+            run = _make_run(session)
+            client = _make_client(session)
+            await session.flush()
+            recipient = _make_recipient(session, run.id, client.id, status="delivered")
+            _make_record(
+                session,
+                client_id=client.id,
+                altegio_record_id=9104,
+                starts_at=PERIOD_END + timedelta(days=5),
+                is_deleted=True,
             )
             await session.flush()
             result = await check_followup_final_eligibility(session, recipient, run, NOW)
@@ -816,23 +852,45 @@ async def test_followup_guard_unconfirmed_record_does_not_block(session_maker) -
 
 
 @pytest.mark.asyncio
-async def test_followup_guard_confirmed_record_before_campaign_does_not_block(session_maker) -> None:
-    """The client's original pre-campaign visit must NOT block follow-up."""
+async def test_followup_guard_in_period_visit_does_not_block(session_maker) -> None:
+    """The client's original in-period visit (starts_at < period_end) does NOT block."""
     async with session_maker() as session:
         async with session.begin():
             run = _make_run(session)
             client = _make_client(session)
             await session.flush()
             recipient = _make_recipient(session, run.id, client.id, status="delivered")
-            # Confirmed record that started well BEFORE the campaign completed
-            # (the original new-client visit) → outside the attribution window.
             _make_record(
                 session,
                 client_id=client.id,
-                altegio_record_id=9104,
-                starts_at=CAMPAIGN_COMPLETED_AT - timedelta(days=20),
+                altegio_record_id=9105,
+                starts_at=PERIOD_START + timedelta(days=5),  # inside the period
                 is_deleted=False,
                 confirmed=1,
+            )
+            await session.flush()
+            result = await check_followup_final_eligibility(session, recipient, run, NOW)
+
+    assert result.eligible is True
+
+
+@pytest.mark.asyncio
+async def test_followup_guard_other_client_record_does_not_block(session_maker) -> None:
+    """A returned-after-period record for a DIFFERENT client must NOT block."""
+    async with session_maker() as session:
+        async with session.begin():
+            run = _make_run(session)
+            client = _make_client(session)
+            await session.flush()
+            recipient = _make_recipient(session, run.id, client.id, status="delivered")
+            # Record belongs to an unrelated client (different client_id + altegio id).
+            _make_record(
+                session,
+                client_id=None,
+                altegio_client_id=88888,
+                altegio_record_id=9106,
+                starts_at=PERIOD_END + timedelta(days=5),
+                is_deleted=False,
             )
             await session.flush()
             result = await check_followup_final_eligibility(session, recipient, run, NOW)
@@ -1299,7 +1357,7 @@ async def test_followup_guard_skips_opt_out_by_phone_when_client_id_stale() -> N
 
     session.execute = _fake_execute
 
-    run = SimpleNamespace(completed_at=CAMPAIGN_COMPLETED_AT)
+    run = SimpleNamespace(completed_at=CAMPAIGN_COMPLETED_AT, period_end=None)
 
     result = await check_followup_final_eligibility(session, recipient, run, NOW)
 
