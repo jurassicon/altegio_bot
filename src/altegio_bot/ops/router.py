@@ -7,6 +7,7 @@ All routes on `router` are protected by require_ops_auth.
 from __future__ import annotations
 
 import json
+import logging
 import re
 import secrets
 from datetime import datetime, timedelta, timezone
@@ -17,11 +18,19 @@ from fastapi import APIRouter, Depends, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from sqlalchemy import func, select, text
 
+from altegio_bot.campaigns.followup import (
+    FollowupFinalEligibilityResult,
+    check_followup_final_eligibility,
+    classify_followup_candidate,
+    followup_run_at,
+)
 from altegio_bot.campaigns.reports import monthly_dashboard, run_report
 from altegio_bot.db import SessionLocal
 from altegio_bot.meta_templates import META_TEMPLATE_MAP
 from altegio_bot.models.models import CampaignRecipient, CampaignRun, MessageJob, OutboxMessage
 from altegio_bot.settings import settings
+from altegio_bot.utils import utcnow
+from altegio_bot.workers.followup_worker import STALE_PROCESSING_MINUTES
 
 from .auth import (
     SESSION_COOKIE,
@@ -30,6 +39,8 @@ from .auth import (
     make_session_token,
     require_ops_auth,
 )
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/ops", dependencies=[Depends(require_ops_auth)])
 
@@ -162,6 +173,98 @@ def _fu_reason(r: CampaignRecipient) -> str:
     if r.status not in _FOLLOWUP_ELIGIBLE_STATUSES_HTML or r.excluded_reason is not None:
         return "not eligible"
     return "eligible"
+
+
+def _parse_meta_dt(value: Any) -> datetime | None:
+    """Parse an ISO timestamp stored in run.meta into an aware datetime."""
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value))
+    except (ValueError, TypeError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+# Follow-up delivery statuses written by the outbox worker once a follow-up is
+# actually being sent. These are real delivery states, NOT skips.
+_FOLLOWUP_DELIVERY_STATUSES = frozenset({"sent", "provider_accepted", "delivered", "read"})
+
+# Terminal skip / cancel follow-up statuses.
+_FOLLOWUP_SKIPPED_STATUSES = frozenset(
+    {
+        "followup_skipped",
+        "skipped_read",
+        "skipped_replied",
+        "skipped_booked_after",
+        "skipped_opted_out",
+        "skipped_future_record",
+        "canceled",
+    }
+)
+
+# Sentinel followup_status used only for the read-only Ops candidate preview when
+# check_followup_final_eligibility() raises. Never persisted to the DB.
+_GUARD_PREVIEW_ERROR = "guard_preview_error"
+
+# Bootstrap table row class per candidate priority bucket.
+_CANDIDATE_ROW_CLASS = {
+    0: "table-success",  # eligible now
+    1: "table-primary",  # planned / processing / queued
+    2: "table-info",  # follow-up delivery in progress / delivered / read
+    3: "table-danger",  # failed
+    4: "table-warning",  # skipped / canceled
+    5: "table-warning",  # other / unknown / guard_preview_error
+}
+
+
+def _followup_candidate_view(
+    r: CampaignRecipient,
+    policy: str | None,
+    final_preview: dict[int, FollowupFinalEligibilityResult] | None = None,
+) -> tuple[int, str]:
+    """Return (sort_priority, fu_reason) for a Follow-up candidates row.
+
+    Priority buckets (lower = shown first):
+      0 eligible now
+      1 follow-up planned / processing / queued
+      2 follow-up delivery (sent / provider_accepted / delivered / read)
+      3 follow-up failed
+      4 skipped / canceled
+      5 other / unknown
+
+    "eligible now" uses final-guard semantics when ``final_preview`` provides a
+    precomputed check_followup_final_eligibility() result for this recipient;
+    otherwise it falls back to the cheap local classifier.
+    """
+    fs = r.followup_status
+    if fs is not None:
+        if fs in ("followup_planned", "followup_processing", "followup_queued"):
+            return 1, _fu_reason(r)
+        if fs in _FOLLOWUP_DELIVERY_STATUSES:
+            return 2, f"followup_{fs}"
+        if fs == "followup_failed":
+            return 3, "failed"
+        if fs in _FOLLOWUP_SKIPPED_STATUSES:
+            return 4, _fu_reason(r)
+        return 5, _fu_reason(r)
+
+    # No followup_status yet — local pre-check + (optional) final-guard preview.
+    prev = (final_preview or {}).get(r.id)
+    if prev is not None:
+        if prev.eligible:
+            return 0, "eligible"
+        # Final-guard preview could not be computed for this row. Never show it
+        # as eligible — surface the error and sort it away from real candidates.
+        if prev.followup_status == _GUARD_PREVIEW_ERROR:
+            return 5, _GUARD_PREVIEW_ERROR
+        reason = _FOLLOWUP_STATUS_SKIP_REASON.get(prev.followup_status or "", prev.followup_status or "skipped")
+        return 4, reason
+    if policy and classify_followup_candidate(r, policy).eligible:
+        return 0, "eligible"
+    return 4, _fu_reason(r)
 
 
 _NAV = """
@@ -4107,6 +4210,45 @@ async def ops_campaign_run_detail(run_id: int) -> str:
             ).all()
             job_info_map = {row.id: (row.status, row.run_at) for row in job_rows}
 
+        # Final-guard preview for displayed candidates (read-only).
+        # For rows with no followup_status that pass the cheap local classifier,
+        # run the real check_followup_final_eligibility() so the "eligible now"
+        # column honestly reflects opt-out / future-record / post-campaign
+        # booking state — the same semantics plan_followup/execute_followup use.
+        # Bounded to the displayed funnel set (<= _FUNNEL_TABLE_LIMIT rows).
+        candidate_now = utcnow()
+        final_preview: dict[int, FollowupFinalEligibilityResult] = {}
+        if run.followup_policy:
+            for _r in funnel_recipients:
+                if _r.followup_status is not None:
+                    continue
+                if not classify_followup_candidate(_r, run.followup_policy).eligible:
+                    continue
+                try:
+                    final_preview[_r.id] = await check_followup_final_eligibility(
+                        session=session,
+                        recipient=_r,
+                        run=run,
+                        now=candidate_now,
+                    )
+                except Exception:
+                    # Never break the page on a guard error — but do NOT silently
+                    # fall back to the local classifier (which could show this row
+                    # as "eligible"). Mark it as a non-eligible preview error so the
+                    # UI is honest. Sending logic stays protected by the worker /
+                    # outbox final guard regardless of this read-only preview.
+                    logger.exception(
+                        "followup candidate guard preview failed run_id=%s recipient_id=%s",
+                        run_id,
+                        _r.id,
+                    )
+                    final_preview[_r.id] = FollowupFinalEligibilityResult(
+                        eligible=False,
+                        skip_reason="Follow-up eligibility preview could not be computed",
+                        followup_status=_GUARD_PREVIEW_ERROR,
+                        booked_after_at=None,
+                    )
+
     meta = run.meta or {}
     last_error = meta.get("last_error")
 
@@ -4356,10 +4498,69 @@ async def ops_campaign_run_detail(run_id: int) -> str:
 </div>
 """
 
-    # --- Followup block ---
+    # --- Follow-up schedule / auto-run block ---
+    # Single card that answers: when is follow-up due, why hasn't it run yet,
+    # and what did the auto-worker do. This is what makes a stuck run obvious.
+    now = utcnow()
+    fa_status = meta.get("followup_auto_status") or ""
+    due_at_iso = followup_run_at(run)
+    due_at = _parse_meta_dt(due_at_iso)
+    fa_started_at = _parse_meta_dt(meta.get("followup_auto_started_at"))
+
+    # Derive a human schedule status independent of the raw auto status.
+    warning_badge = ""
+    if not run.followup_enabled:
+        schedule_status = "disabled"
+        status_color = "secondary"
+    elif fa_status == "completed":
+        schedule_status = "completed"
+        status_color = "success"
+    elif fa_status == "skipped_historical":
+        # Terminal: auto worker refused to backfill a too-old due run.
+        schedule_status = "skipped (historical)"
+        status_color = "secondary"
+    elif fa_status == "skipped_already_processed":
+        # Terminal: run already had follow-up work; auto worker skipped it.
+        schedule_status = "skipped (already processed)"
+        status_color = "secondary"
+    elif fa_status == "failed":
+        schedule_status = "failed"
+        status_color = "danger"
+    elif fa_status == "processing":
+        if fa_started_at is not None and now - fa_started_at > timedelta(minutes=STALE_PROCESSING_MINUTES):
+            schedule_status = "stale processing"
+            status_color = "danger"
+        else:
+            schedule_status = "processing"
+            status_color = "primary"
+    elif due_at is None:
+        schedule_status = "no schedule"
+        status_color = "secondary"
+    elif now < due_at:
+        schedule_status = "not due yet"
+        status_color = "info"
+    else:
+        # Due, but followup_auto_status is empty → worker has not processed it.
+        # This is exactly the Run #23 situation.
+        schedule_status = "due now"
+        status_color = "warning"
+        warning_badge = '<span class="badge bg-warning text-dark ms-2">⚠ Due now, not processed yet</span>'
+
+    status_html = f'<span class="badge bg-{status_color}">{_esc(schedule_status)}</span>{warning_badge}'
+
+    fa_error = meta.get("followup_auto_last_error", "")
+    fa_error_html = f'<span class="text-danger">{_esc(fa_error)}</span>' if fa_error else "—"
+
+    fa_skip_reason = meta.get("followup_auto_skip_reason")
+    skip_reason_row = (
+        f'<dt class="col-sm-3">Auto skip reason</dt><dd class="col-sm-9">{_esc(fa_skip_reason)}</dd>'
+        if fa_skip_reason
+        else ""
+    )
+
     followup_block = f"""
 <div class="card mb-3">
-  <div class="card-header">🔁 Follow-up</div>
+  <div class="card-header">🔁 Follow-up schedule / auto-run</div>
   <div class="card-body">
     <dl class="row mb-0">
       <dt class="col-sm-3">Enabled</dt>
@@ -4370,6 +4571,32 @@ async def ops_campaign_run_detail(run_id: int) -> str:
       <dd class="col-sm-9">{_esc(run.followup_policy or "—")}</dd>
       <dt class="col-sm-3">Template</dt>
       <dd class="col-sm-9">{_esc(run.followup_template_name or "—")}</dd>
+      <dt class="col-sm-3">Completed at</dt>
+      <dd class="col-sm-9">{_esc(_fmt_dt(run.completed_at, tz)) or "—"}</dd>
+      <dt class="col-sm-3">Follow-up due at</dt>
+      <dd class="col-sm-9">{_esc(_fmt_dt(due_at, tz)) or "—"}</dd>
+      <dt class="col-sm-3">Current app time</dt>
+      <dd class="col-sm-9">{_esc(_fmt_dt(now, tz))}</dd>
+      <dt class="col-sm-3">Status</dt>
+      <dd class="col-sm-9">{status_html}</dd>
+      <dt class="col-sm-3">Auto status (run.meta)</dt>
+      <dd class="col-sm-9">{_esc(fa_status) or "—"}</dd>
+      {skip_reason_row}
+      <dt class="col-sm-3">Auto started</dt>
+      <dd class="col-sm-9">{_esc(str(meta.get("followup_auto_started_at") or "—"))}</dd>
+      <dt class="col-sm-3">Auto completed</dt>
+      <dd class="col-sm-9">{_esc(str(meta.get("followup_auto_completed_at") or "—"))}</dd>
+      <dt class="col-sm-3">Planned / Queued / Skipped / Failed</dt>
+      <dd class="col-sm-9">
+        {meta.get("followup_auto_planned_count", 0)} /
+        {meta.get("followup_auto_queued_count", 0)} /
+        {meta.get("followup_auto_skipped_count", 0)} /
+        {meta.get("followup_auto_failed_count", 0)}
+      </dd>
+      <dt class="col-sm-3">Auto last error</dt>
+      <dd class="col-sm-9">{fa_error_html}</dd>
+      <dt class="col-sm-3">Recovered</dt>
+      <dd class="col-sm-9">{_esc(str(meta.get("followup_auto_recovered") or "No"))}</dd>
     </dl>
   </div>
 </div>
@@ -4457,48 +4684,75 @@ async def ops_campaign_run_detail(run_id: int) -> str:
 </div>
 """
 
-    # --- Auto-followup block ---
-    followup_auto_keys = (
-        "followup_auto_status",
-        "followup_auto_started_at",
-        "followup_auto_completed_at",
-        "followup_auto_last_error",
-        "followup_auto_planned_count",
-        "followup_auto_queued_count",
-        "followup_auto_skipped_count",
-        "followup_auto_failed_count",
-        "followup_auto_recovered",
-        "followup_auto_recovered_at",
-    )
-    has_auto_followup = any(k in meta for k in followup_auto_keys)
-    auto_followup_block = ""
-    if has_auto_followup:
-        fa_status = meta.get("followup_auto_status", "")
-        fa_error = meta.get("followup_auto_last_error", "")
-        fa_error_html = f'<span class="text-danger">{_esc(fa_error)}</span>' if fa_error else "—"
-        auto_followup_block = f"""
+    # --- Follow-up candidates table ---
+    # Candidate-focused view: who would receive follow-up if processed now,
+    # who would not, and why. Reuses the funnel recipients (sent pipeline +
+    # anyone with a followup_status) but sorts them by candidate priority so the
+    # operator does not have to infer eligibility from the mixed funnel table.
+    candidates_block = ""
+    if funnel_recipients:
+        # Precompute (priority, reason) per recipient using the final-guard
+        # preview so sorting, FU reason and eligible/skip display all agree.
+        cand_views = {r.id: _followup_candidate_view(r, run.followup_policy, final_preview) for r in funnel_recipients}
+        sorted_candidates = sorted(
+            funnel_recipients,
+            key=lambda r: (cand_views[r.id][0], r.id),
+        )
+        cand_cols = [
+            "ID",
+            "Name",
+            "Phone",
+            "Campaign status",
+            "Outbox",
+            "FU reason",
+            "Read at",
+            "Replied at",
+            "Booked at",
+            "FU status",
+            "FU job",
+            "FU outbox",
+            "FU sent at",
+        ]
+        cand_rows = []
+        cand_row_classes = []
+        for r in sorted_candidates:
+            ob_status = outbox_status_map.get(r.outbox_message_id or 0, "")
+            priority, fu_reason = cand_views[r.id]
+            cand_rows.append(
+                [
+                    _esc(str(r.id)),
+                    _esc(r.display_name or ""),
+                    _esc(r.phone_e164 or ""),
+                    _status_badge(r.status),
+                    _status_badge(ob_status),
+                    _esc(fu_reason),
+                    _esc(_fmt_dt(r.read_at, tz)),
+                    _esc(_fmt_dt(r.replied_at, tz)),
+                    _esc(_fmt_dt(r.booked_after_at, tz)),
+                    _esc(r.followup_status or ""),
+                    _esc(str(r.followup_message_job_id) if r.followup_message_job_id else ""),
+                    _esc(str(r.followup_outbox_id) if r.followup_outbox_id else ""),
+                    _esc(_fmt_dt(r.followup_sent_at, tz)),
+                ]
+            )
+            cand_row_classes.append(_CANDIDATE_ROW_CLASS.get(priority, ""))
+        _cand_header = (
+            f"🎯 Follow-up candidates (showing first {_FUNNEL_TABLE_LIMIT} of {funnel_total})"
+            if funnel_total > _FUNNEL_TABLE_LIMIT
+            else f"🎯 Follow-up candidates ({funnel_total})"
+        )
+        candidates_block = f"""
 <div class="card mb-3">
-  <div class="card-header">⚙️ Auto Follow-up</div>
-  <div class="card-body">
-    <dl class="row mb-0">
-      <dt class="col-sm-3">Status</dt>
-      <dd class="col-sm-9">{_campaign_status_badge(fa_status) or _esc(fa_status)}</dd>
-      <dt class="col-sm-3">Started</dt>
-      <dd class="col-sm-9">{_esc(str(meta.get("followup_auto_started_at") or "—"))}</dd>
-      <dt class="col-sm-3">Completed</dt>
-      <dd class="col-sm-9">{_esc(str(meta.get("followup_auto_completed_at") or "—"))}</dd>
-      <dt class="col-sm-3">Planned / Queued / Skipped / Failed</dt>
-      <dd class="col-sm-9">
-        {meta.get("followup_auto_planned_count", 0)} /
-        {meta.get("followup_auto_queued_count", 0)} /
-        {meta.get("followup_auto_skipped_count", 0)} /
-        {meta.get("followup_auto_failed_count", 0)}
-      </dd>
-      <dt class="col-sm-3">Last Error</dt>
-      <dd class="col-sm-9">{fa_error_html}</dd>
-      <dt class="col-sm-3">Recovered</dt>
-      <dd class="col-sm-9">{_esc(str(meta.get("followup_auto_recovered") or "No"))}</dd>
-    </dl>
+  <div class="card-header">{_cand_header}</div>
+  <div class="card-body p-0">
+    <div class="px-3 pt-2 text-muted small">
+      Sorted: eligible first, then planned/queued, then sent/delivered/read, then failed, then skipped.
+      "eligible" = would be queued for sending if the follow-up worker ran now (opt-out, future
+      bookings and post-campaign records are already accounted for).
+      "guard_preview_error" means the UI could not compute the final-eligibility preview for that
+      row; sending logic remains protected by the worker / outbox final guard.
+    </div>
+    {_table(cand_cols, cand_rows, cand_row_classes)}
   </div>
 </div>
 """
@@ -4535,8 +4789,8 @@ async def ops_campaign_run_detail(run_id: int) -> str:
 {excluded_block}
 {followup_block}
 {followup_eligibility_block}
+{candidates_block}
 {funnel_block}
-{auto_followup_block}
 {recipients_summary}
 <div id="detail-alert" class="mt-3"></div>
 <script>

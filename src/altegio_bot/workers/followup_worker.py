@@ -6,6 +6,7 @@
 
 Состояние хранится в run.meta (без миграций):
   followup_auto_status:        "processing" | "completed" | "failed"
+                               | "skipped_historical" | "skipped_already_processed"
   followup_auto_started_at:    ISO timestamp начала (или последнего reclaim)
   followup_auto_completed_at:  ISO timestamp успешного завершения
   followup_auto_last_error:    строка ошибки (только при "failed")
@@ -15,6 +16,14 @@
   followup_auto_failed_count:  int
   followup_auto_recovered:     true — если run был reclaim-нут из stale processing
   followup_auto_recovered_at:  ISO timestamp reclaim-а
+
+First-deploy safety gate (durable marker, см. process_run):
+  followup_auto_safety_gate_passed:    true — gate уже пройден для этого run
+  followup_auto_safety_gate_passed_at: ISO timestamp прохождения gate
+  followup_auto_safety_checked_at:     ISO timestamp последней проверки gate
+  followup_auto_skip_reason:           причина terminal-skip (historical / already_processed)
+followup_auto_recovered сам по себе НЕ обходит gate: при крэше между claim и
+gate stale-recovery обязан повторно прогнать gate (иначе historical backfill).
 
 Политика ошибок:
   - Ошибка одного run не обрывает worker.
@@ -33,20 +42,41 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import and_, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from altegio_bot.campaigns.followup import execute_followup, plan_followup
+from altegio_bot.campaigns.followup import (
+    count_followup_skipped,
+    execute_followup,
+    existing_followup_work_counts,
+    plan_followup,
+)
 from altegio_bot.campaigns.runner import CAMPAIGN_CODE
 from altegio_bot.db import SessionLocal
 from altegio_bot.models.models import CampaignRun
+from altegio_bot.settings import settings
 from altegio_bot.utils import utcnow
 
 logger = logging.getLogger("followup_worker")
 
 STALE_PROCESSING_MINUTES = 30
+
+# Terminal, non-claimable auto statuses set by the first-deploy safety gate.
+# Both keep followup_auto_status non-null so the run is never re-claimed.
+AUTO_STATUS_SKIPPED_HISTORICAL = "skipped_historical"
+AUTO_STATUS_SKIPPED_ALREADY_PROCESSED = "skipped_already_processed"
+
+
+def _followup_due_at(run: CampaignRun) -> datetime | None:
+    """followup_due_at = completed_at + followup_delay_days (aware), or None."""
+    if run.completed_at is None or run.followup_delay_days is None:
+        return None
+    completed = run.completed_at
+    if completed.tzinfo is None:
+        completed = completed.replace(tzinfo=timezone.utc)
+    return completed + timedelta(days=run.followup_delay_days)
 
 
 async def _claim_due_runs(session: AsyncSession, *, limit: int = 5) -> list[int]:
@@ -145,6 +175,111 @@ async def process_run(run_id: int) -> None:
     logger.info("followup_worker: processing run_id=%d", run_id)
 
     try:
+        now = utcnow()
+
+        # --- First-deploy safety gate ---------------------------------------
+        # Protects the first production rollout from auto-sending historical
+        # backlog and from duplicating already-processed follow-up work.
+        #
+        # Durability against the crash-between-claim-and-process window:
+        # the gate is gated on a DURABLE marker followup_auto_safety_gate_passed,
+        # NOT on followup_auto_recovered. _claim_due_runs() sets
+        # followup_auto_recovered=true on stale reclaims, but that alone must not
+        # bypass the gate — otherwise a worker that crashed after claim but before
+        # the gate would let a recovered historical run slip into plan/execute.
+        # The marker is set only after the gate passes and is committed (this
+        # transaction block) BEFORE plan/execute. So:
+        #   * crash BEFORE gate → no marker → recovery re-runs the gate;
+        #   * crash DURING/after plan/execute → marker present → recovery resumes.
+        # Order matters: already-processed is checked BEFORE the historical age
+        # skip so a run with existing jobs gets the more accurate terminal status.
+        async with SessionLocal() as session:
+            async with session.begin():
+                run = await session.get(CampaignRun, run_id)
+                if run is None:
+                    logger.warning("followup_worker: run_id=%d not found before processing", run_id)
+                    return
+                meta = dict(run.meta or {})
+                safety_passed = meta.get("followup_auto_safety_gate_passed") is True
+
+                if not safety_passed:
+                    # 1. Already has follow-up work (manual ops run or historical
+                    #    jobs created before the worker existed) → do not touch.
+                    counts = await existing_followup_work_counts(session, run_id)
+                    if counts["existing_followup_recipients_count"] or counts["existing_followup_jobs_count"]:
+                        meta.update(
+                            {
+                                "followup_auto_status": AUTO_STATUS_SKIPPED_ALREADY_PROCESSED,
+                                "followup_auto_started_at": now.isoformat(),
+                                "followup_auto_completed_at": now.isoformat(),
+                                "followup_auto_last_error": None,
+                                "followup_auto_skip_reason": (
+                                    "Run already has follow-up work; auto worker skipped to avoid duplicate sends"
+                                ),
+                                "followup_auto_planned_count": 0,
+                                "followup_auto_queued_count": 0,
+                                "followup_auto_skipped_count": 0,
+                                "followup_auto_failed_count": 0,
+                                **counts,
+                            }
+                        )
+                        run.meta = meta
+                        logger.warning(
+                            "followup_worker: run_id=%d safety=%s %s",
+                            run_id,
+                            AUTO_STATUS_SKIPPED_ALREADY_PROCESSED,
+                            counts,
+                        )
+                        return
+
+                    # 2. Historical due run, too old for safe auto backfill.
+                    due_at = _followup_due_at(run)
+                    max_age = settings.auto_followup_max_due_age_days
+                    if due_at is not None and due_at < now - timedelta(days=max_age):
+                        meta.update(
+                            {
+                                "followup_auto_status": AUTO_STATUS_SKIPPED_HISTORICAL,
+                                "followup_auto_started_at": now.isoformat(),
+                                "followup_auto_completed_at": now.isoformat(),
+                                "followup_auto_last_error": None,
+                                "followup_auto_skip_reason": (
+                                    "followup_due_at is older than auto-follow-up safety window"
+                                ),
+                                "followup_auto_due_at": due_at.isoformat(),
+                                "followup_auto_max_due_age_days": max_age,
+                                "followup_auto_planned_count": 0,
+                                "followup_auto_queued_count": 0,
+                                "followup_auto_skipped_count": 0,
+                                "followup_auto_failed_count": 0,
+                            }
+                        )
+                        run.meta = meta
+                        logger.warning(
+                            "followup_worker: run_id=%d safety=%s due_at=%s older than %d days",
+                            run_id,
+                            AUTO_STATUS_SKIPPED_HISTORICAL,
+                            due_at.isoformat(),
+                            max_age,
+                        )
+                        return
+
+                    # 3. Gate passed → persist the durable marker. Committed when
+                    #    this transaction block exits, BEFORE plan/execute below.
+                    meta["followup_auto_safety_checked_at"] = now.isoformat()
+                    meta["followup_auto_safety_gate_passed"] = True
+                    meta["followup_auto_safety_gate_passed_at"] = now.isoformat()
+                    run.meta = meta
+                    logger.info("followup_worker: run_id=%d safety=passed", run_id)
+                else:
+                    # Stale recovery after the gate already passed: legitimate
+                    # in-flight run — resume normal plan/execute recovery, never
+                    # reclassify its own partial work as already-processed.
+                    logger.info(
+                        "followup_worker: run_id=%d safety=already_passed recovery=%s",
+                        run_id,
+                        bool(meta.get("followup_auto_recovered")),
+                    )
+
         # 1. Планируем: помечаем eligible получателей как followup_planned
         async with SessionLocal() as session:
             async with session.begin():
@@ -159,7 +294,6 @@ async def process_run(run_id: int) -> None:
         # 2. Выполняем: создаём MessageJob для каждого followup_planned получателя
         stats = await execute_followup(run_id)
         queued_count = stats.get("queued", 0)
-        skipped_count = stats.get("skipped", 0)
         failed_count = stats.get("failed", 0)
 
         logger.info(
@@ -167,6 +301,13 @@ async def process_run(run_id: int) -> None:
             run_id,
             stats,
         )
+
+        # Skipped count из БД: включает и plan-time skips (локальный pre-check +
+        # финальный guard в plan_followup — opt-out / future record / booking
+        # event), и execute-time skips. stats["skipped"] покрывает только
+        # последние, поэтому считаем терминальные skip-статусы напрямую.
+        async with SessionLocal() as session:
+            skipped_count = await count_followup_skipped(session, run_id)
 
         # 3. Записываем успех (сохраняем recovery-поля, если они есть)
         async with SessionLocal() as session:

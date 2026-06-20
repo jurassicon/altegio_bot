@@ -130,6 +130,15 @@ class Settings(BaseSettings):
             )
         return v
 
+    # Auto-follow-up historical safety window (worker-only).
+    # The automatic follow-up worker must not backfill very old due runs after
+    # first deployment. If a run's followup_due_at (= completed_at +
+    # followup_delay_days) is older than this many days, the worker stamps it
+    # `skipped_historical` instead of planning/sending.
+    # Manual /followup/plan and /followup/run-now endpoints are NOT affected.
+    # Override via env: AUTO_FOLLOWUP_MAX_DUE_AGE_DAYS=7
+    auto_followup_max_due_age_days: int = 7
+
     # Chatwoot integration
     chatwoot_enabled: bool = True
     chatwoot_base_url: str = ""

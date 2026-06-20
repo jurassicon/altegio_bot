@@ -4,7 +4,7 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from sqlalchemy import and_, func, select, update
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.campaigns.runner import FOLLOWUP_JOB_TYPE
@@ -25,6 +25,41 @@ class FollowupFinalEligibilityResult:
     followup_status: str | None
     booked_after_at: datetime | None
 
+
+@dataclass
+class FollowupPlanEligibilityResult:
+    """Result of the plan-time follow-up candidate classification.
+
+    eligible:        True if the recipient should be planned for follow-up.
+    reason:          Machine-readable classification reason (см. _PLAN_REASONS).
+    followup_status: followup_status to persist for non-eligible recipients
+                     that have no excluded_reason (None → leave untouched /
+                     fall back to followup_skipped).
+    """
+
+    eligible: bool
+    reason: str
+    followup_status: str | None
+
+
+# Политики follow-up.
+_POLICY_UNREAD_ONLY = "unread_only"
+_POLICY_UNREAD_OR_NOT_BOOKED = "unread_or_not_booked"
+
+# Возможные значения FollowupPlanEligibilityResult.reason.
+_PLAN_REASONS: frozenset[str] = frozenset(
+    {
+        "eligible",
+        "read",
+        "replied",
+        "booked_after",
+        "skipped",
+        "hard_failure",
+        "excluded",
+        "not_sent_pipeline",
+        "unknown_policy",
+    }
+)
 
 # Статусы, которые означают «сообщение прочитано или позже» для follow-up политик.
 _READ_OR_LATER_STATUSES: frozenset[str] = frozenset({"read", "replied", "booked_after_campaign"})
@@ -58,33 +93,148 @@ _SENT_PIPELINE_STATUSES = {
 # не забрали одного и того же получателя одновременно.
 _FOLLOWUP_PROCESSING = "followup_processing"
 
+# Терминальные skip-статусы follow-up (выставляются plan/execute/final-guard).
+# Используются для подсчёта «сколько получателей пропущено» в worker meta.
+FOLLOWUP_SKIP_STATUSES: frozenset[str] = frozenset(
+    {
+        "followup_skipped",
+        "skipped_read",
+        "skipped_replied",
+        "skipped_booked_after",
+        "skipped_opted_out",
+        "skipped_future_record",
+    }
+)
+
+
+async def count_followup_skipped(session: AsyncSession, run_id: int) -> int:
+    """Сколько получателей run'а сейчас в терминальном skip-статусе follow-up.
+
+    Включает как plan-time skips (локальный pre-check + финальный guard в
+    plan_followup), так и execute-time skips — все они заканчиваются в одном из
+    FOLLOWUP_SKIP_STATUSES.
+    """
+    result = await session.scalar(
+        select(func.count())
+        .select_from(CampaignRecipient)
+        .where(CampaignRecipient.campaign_run_id == run_id)
+        .where(CampaignRecipient.followup_status.in_(FOLLOWUP_SKIP_STATUSES))
+    )
+    return int(result or 0)
+
+
+async def existing_followup_work_counts(session: AsyncSession, run_id: int) -> dict[str, int]:
+    """Diagnostic counts of pre-existing follow-up work for a run.
+
+    Used by the auto worker's first-deploy safety gate to detect runs that were
+    already (partially) processed — manually by an operator or by historical
+    jobs created before the worker existed — so it does not duplicate sends.
+
+    A run is considered already-processed when any count is > 0:
+      * recipients with any follow-up field set
+        (followup_status / followup_message_job_id / followup_outbox_id /
+        followup_sent_at);
+      * MessageJob rows of type FOLLOWUP_JOB_TYPE referencing this run.
+    """
+    recipients_count = await session.scalar(
+        select(func.count())
+        .select_from(CampaignRecipient)
+        .where(CampaignRecipient.campaign_run_id == run_id)
+        .where(
+            or_(
+                CampaignRecipient.followup_status.is_not(None),
+                CampaignRecipient.followup_message_job_id.is_not(None),
+                CampaignRecipient.followup_outbox_id.is_not(None),
+                CampaignRecipient.followup_sent_at.is_not(None),
+            )
+        )
+    )
+    outbox_count = await session.scalar(
+        select(func.count())
+        .select_from(CampaignRecipient)
+        .where(CampaignRecipient.campaign_run_id == run_id)
+        .where(CampaignRecipient.followup_outbox_id.is_not(None))
+    )
+    jobs_count = await session.scalar(
+        select(func.count())
+        .select_from(MessageJob)
+        .where(MessageJob.job_type == FOLLOWUP_JOB_TYPE)
+        .where(MessageJob.payload["campaign_run_id"].astext == str(run_id))
+    )
+    return {
+        "existing_followup_recipients_count": int(recipients_count or 0),
+        "existing_followup_outbox_count": int(outbox_count or 0),
+        "existing_followup_jobs_count": int(jobs_count or 0),
+    }
+
+
+def classify_followup_candidate(
+    recipient: CampaignRecipient,
+    policy: str,
+) -> FollowupPlanEligibilityResult:
+    """Дешёвый локальный pre-check кандидата на follow-up (только поля строки).
+
+    Это НЕ полный эквивалент check_followup_final_eligibility(): здесь
+    проверяются только локальные поля CampaignRecipient (status, read_at,
+    replied_at, booked_after_at, excluded_reason, sent pipeline). Финальный
+    guard дополнительно смотрит актуальный opt-out клиента, события создания
+    записи в Altegio после кампании и будущие записи — это требует обращений к
+    БД и вызывается отдельно.
+
+    Использование: быстрый отсев заведомо неподходящих получателей до запроса
+    к БД. Перед фактическим планированием / созданием MessageJob вызывающий код
+    (plan_followup, execute_followup) ДОЛЖЕН дополнительно прогнать
+    check_followup_final_eligibility(), чтобы соблюсти инвариант
+    «не планируем то, что финальный guard всё равно пропустит».
+
+    Семантика политик:
+      - unread_or_not_booked / unread_only: оба считают кандидатом только тех,
+        кто находится в pipeline доставки (queued / provider_accepted /
+        delivered), не прочитал, не ответил и не записался. Read-but-not-booked
+        получатели кандидатами не считаются.
+    """
+    if policy not in (_POLICY_UNREAD_ONLY, _POLICY_UNREAD_OR_NOT_BOOKED):
+        logger.warning("Unknown followup_policy=%s", policy)
+        return FollowupPlanEligibilityResult(False, "unknown_policy", None)
+
+    # Жёсткие отказы: повреждённые / невалидные получатели follow-up не получают.
+    if recipient.status in _HARD_FAILURE_STATUSES:
+        return FollowupPlanEligibilityResult(False, "hard_failure", "followup_skipped")
+    if recipient.excluded_reason in _HARD_FAILURE_REASONS:
+        # excluded_reason уже фиксирует причину — followup_status не трогаем.
+        return FollowupPlanEligibilityResult(False, "hard_failure", None)
+
+    # Исключённые на этапе сегментации.
+    if recipient.status == "skipped":
+        return FollowupPlanEligibilityResult(False, "skipped", "followup_skipped")
+    if recipient.excluded_reason is not None:
+        return FollowupPlanEligibilityResult(False, "excluded", None)
+
+    # Не участвовал в send-real (не в pipeline доставки).
+    if recipient.status not in _SENT_PIPELINE_STATUSES:
+        return FollowupPlanEligibilityResult(False, "not_sent_pipeline", "followup_skipped")
+
+    # Маркетинговая цель уже достигнута / клиент среагировал.
+    # Приоритет: booked_after > replied > read (совпадает с финальным guard'ом).
+    if recipient.status == "booked_after_campaign" or recipient.booked_after_at is not None:
+        return FollowupPlanEligibilityResult(False, "booked_after", "skipped_booked_after")
+    if recipient.status == "replied" or recipient.replied_at is not None:
+        return FollowupPlanEligibilityResult(False, "replied", "skipped_replied")
+    if recipient.status == "read" or recipient.read_at is not None:
+        return FollowupPlanEligibilityResult(False, "read", "skipped_read")
+
+    return FollowupPlanEligibilityResult(True, "eligible", None)
+
 
 def _is_eligible_for_followup(
     recipient: CampaignRecipient,
     policy: str,
 ) -> bool:
-    """Проверить, нужно ли отправить follow-up этому получателю."""
-    if recipient.status in _HARD_FAILURE_STATUSES:
-        return False
-    if recipient.excluded_reason in _HARD_FAILURE_REASONS:
-        return False
+    """Проверить, нужно ли отправить follow-up этому получателю.
 
-    if recipient.status == "skipped":
-        return False
-
-    if recipient.status not in _SENT_PIPELINE_STATUSES:
-        return False
-
-    if policy == "unread_only":
-        is_read = recipient.read_at is not None or recipient.status in _READ_OR_LATER_STATUSES
-        return not is_read
-
-    if policy == "unread_or_not_booked":
-        is_read = recipient.read_at is not None or recipient.status in _READ_OR_LATER_STATUSES
-        return not is_read or recipient.booked_after_at is None
-
-    logger.warning("Unknown followup_policy=%s", policy)
-    return False
+    Тонкая обёртка над classify_followup_candidate() для обратной совместимости.
+    """
+    return classify_followup_candidate(recipient, policy).eligible
 
 
 async def plan_followup(session: AsyncSession, run_id: int) -> int:
@@ -133,6 +283,10 @@ async def plan_followup(session: AsyncSession, run_id: int) -> int:
     stmt = select(CampaignRecipient).where(CampaignRecipient.campaign_run_id == run_id).with_for_update()
     recipients = (await session.execute(stmt)).scalars().all()
 
+    # Стабильное «сейчас» на весь run, чтобы проверка будущих записей в
+    # финальном guard была согласованной для всех получателей.
+    now = utcnow()
+
     count = 0
     for recipient in recipients:
         # Идемпотентность: если статус уже выставлен — не трогаем.
@@ -141,11 +295,35 @@ async def plan_followup(session: AsyncSession, run_id: int) -> int:
         if recipient.followup_status is not None:
             continue
 
-        if _is_eligible_for_followup(recipient, run.followup_policy):
+        # Шаг 1. Дешёвый локальный pre-check.
+        result = classify_followup_candidate(recipient, run.followup_policy)
+        if not result.eligible:
+            if recipient.excluded_reason is None:
+                # Более конкретный skip-статус (skipped_read / skipped_replied /
+                # skipped_booked_after), если классификатор его вернул; иначе
+                # обобщённый followup_skipped (как было раньше).
+                recipient.followup_status = result.followup_status or "followup_skipped"
+            continue
+
+        # Шаг 2. Полный финальный guard: opt-out, события записи после кампании,
+        # будущие записи. Не планируем то, что guard всё равно пропустит — иначе
+        # followup_auto_planned_count завышается, а worker создаёт job'ы,
+        # которые outbox-guard потом отменит.
+        final = await check_followup_final_eligibility(
+            session=session,
+            recipient=recipient,
+            run=run,
+            now=now,
+        )
+        if final.eligible:
             recipient.followup_status = "followup_planned"
             count += 1
-        elif recipient.excluded_reason is None:
-            recipient.followup_status = "followup_skipped"
+        else:
+            # Зафиксировать booked_after_at из guard (если он его вычислил по
+            # событию Altegio), как это делает outbox-guard.
+            if final.booked_after_at is not None and recipient.booked_after_at is None:
+                recipient.booked_after_at = final.booked_after_at
+            recipient.followup_status = final.followup_status or "followup_skipped"
 
     await session.flush()
     logger.info("plan_followup run_id=%d planned=%d", run_id, count)
@@ -193,6 +371,10 @@ async def execute_followup(run_id: int) -> dict:
         "skipped": 0,
         "failed": 0,
     }
+
+    # Стабильное «сейчас» на весь запуск для согласованной проверки будущих
+    # записей в финальном guard.
+    now = utcnow()
 
     async with SessionLocal() as session:
         stmt = (
@@ -258,8 +440,27 @@ async def execute_followup(run_id: int) -> dict:
                         # но ошибка re-evaluate подхватит и вернёт в planned.
                         raise RuntimeError(f"recipient_id={recipient_id} not found after claim")
 
-                    if not _is_eligible_for_followup(fresh, policy):
-                        fresh.followup_status = "followup_skipped"
+                    # Дешёвый локальный pre-check.
+                    reeval = classify_followup_candidate(fresh, policy)
+                    if not reeval.eligible:
+                        fresh.followup_status = reeval.followup_status or "followup_skipped"
+                        stats["skipped"] += 1
+                        continue
+
+                    # Полный финальный guard: opt-out / события записи после
+                    # кампании / будущие записи. Job создаётся только если guard
+                    # говорит eligible — иначе помечаем skip и job не ставим.
+                    fresh_run = await session.get(CampaignRun, run_id)
+                    final = await check_followup_final_eligibility(
+                        session=session,
+                        recipient=fresh,
+                        run=fresh_run,
+                        now=now,
+                    )
+                    if not final.eligible:
+                        if final.booked_after_at is not None and fresh.booked_after_at is None:
+                            fresh.booked_after_at = final.booked_after_at
+                        fresh.followup_status = final.followup_status or "followup_skipped"
                         stats["skipped"] += 1
                         continue
 
@@ -448,34 +649,36 @@ async def check_followup_final_eligibility(
     Eligible=False includes a followup_status string to persist on the recipient
     and a human-readable skip_reason for job.last_error.
     """
-    # 3.1 — status / attribution timestamps
-    if recipient.status in _READ_OR_LATER_STATUSES:
-        if recipient.status == "booked_after_campaign":
-            fs = "skipped_booked_after"
-            reason = "Follow-up skipped: recipient already booked after campaign"
-        else:
-            fs = "skipped_read"
-            reason = "Follow-up skipped: recipient already read or replied to original campaign"
+    # 3.1 — status / attribution timestamps.
+    # Priority must match classify_followup_candidate() and reports:
+    #   booked_after > replied > read.
+    # Each branch checks both the status and the attribution timestamp so the
+    # order holds for mixed states (e.g. status='replied' + booked_after_at set
+    # must resolve to skipped_booked_after) and for legacy / already-queued
+    # follow-up jobs that hit the outbox guard directly. _READ_OR_LATER_STATUSES
+    # still contains 'replied'/'booked_after_campaign', but those are caught by
+    # the explicit branches above, so the read branch only handles 'read'.
+    if recipient.status == "booked_after_campaign" or recipient.booked_after_at is not None:
         return FollowupFinalEligibilityResult(
             eligible=False,
-            skip_reason=reason,
-            followup_status=fs,
+            skip_reason="Follow-up skipped: recipient booked after original campaign",
+            followup_status="skipped_booked_after",
             booked_after_at=recipient.booked_after_at,
         )
 
-    if recipient.read_at is not None:
+    if recipient.status == "replied" or recipient.replied_at is not None:
+        return FollowupFinalEligibilityResult(
+            eligible=False,
+            skip_reason="Follow-up skipped: recipient already replied to original campaign",
+            followup_status="skipped_replied",
+            booked_after_at=recipient.booked_after_at,
+        )
+
+    if recipient.status in _READ_OR_LATER_STATUSES or recipient.read_at is not None:
         return FollowupFinalEligibilityResult(
             eligible=False,
             skip_reason="Follow-up skipped: recipient already read original campaign",
             followup_status="skipped_read",
-            booked_after_at=None,
-        )
-
-    if recipient.booked_after_at is not None:
-        return FollowupFinalEligibilityResult(
-            eligible=False,
-            skip_reason="Follow-up skipped: recipient already booked after campaign",
-            followup_status="skipped_booked_after",
             booked_after_at=recipient.booked_after_at,
         )
 

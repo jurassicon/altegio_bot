@@ -13,7 +13,7 @@ from sqlalchemy import select
 import altegio_bot.ops.campaigns_api as campaigns_api_module
 import altegio_bot.ops.router as ops_router_module
 from altegio_bot.main import app
-from altegio_bot.models.models import CampaignRecipient, CampaignRun, MessageJob
+from altegio_bot.models.models import CampaignRecipient, CampaignRun, Client, MessageJob, Record
 from altegio_bot.ops.auth import require_ops_auth
 
 
@@ -1706,6 +1706,548 @@ async def test_funnel_header_truncation_shown(
 # ---------------------------------------------------------------------------
 # Follow-up template params display — static body (no variables)
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Follow-up schedule / auto-run card + candidates table (Run #23 visibility)
+# ---------------------------------------------------------------------------
+
+
+@pytest_asyncio.fixture
+async def due_unprocessed_run(session_maker) -> int:
+    """Reproduce Run #23: due send-real run, empty followup_auto_status.
+
+    Recipients: one eligible (delivered, unread) and one read (skipped).
+    """
+    from datetime import timedelta
+
+    now = datetime.now(timezone.utc)
+    async with session_maker() as session:
+        async with session.begin():
+            run = CampaignRun(
+                campaign_code="new_clients_monthly",
+                mode="send-real",
+                company_ids=[758285],
+                period_start=now.replace(day=1, hour=0, minute=0, second=0, microsecond=0),
+                period_end=now,
+                status="completed",
+                followup_enabled=True,
+                followup_delay_days=14,
+                followup_policy="unread_or_not_booked",
+                followup_template_name="kitilash_ka_newsletter_new_clients_followup_v1",
+                completed_at=now - timedelta(days=15),  # due (15 > 14)
+                meta={},  # followup_auto_status empty → not processed yet
+            )
+            session.add(run)
+            await session.flush()
+            run_id = run.id
+
+            session.add(
+                CampaignRecipient(
+                    campaign_run_id=run_id,
+                    company_id=758285,
+                    altegio_client_id=1,
+                    phone_e164="+49151000001",
+                    display_name="Eligible Candidate",
+                    status="delivered",
+                )
+            )
+            session.add(
+                CampaignRecipient(
+                    campaign_run_id=run_id,
+                    company_id=758285,
+                    altegio_client_id=2,
+                    phone_e164="+49151000002",
+                    display_name="Read Candidate",
+                    status="read",
+                    read_at=now,
+                )
+            )
+
+    return run_id
+
+
+@pytest.mark.asyncio
+async def test_run_detail_shows_followup_schedule_card(
+    http_client: AsyncClient,
+    due_unprocessed_run: int,
+) -> None:
+    """Run detail page renders the Follow-up schedule / auto-run card with due date."""
+    response = await http_client.get(f"/ops/campaigns/{due_unprocessed_run}")
+    assert response.status_code == 200
+    text = response.text
+    assert "Follow-up schedule / auto-run" in text
+    assert "Follow-up due at" in text
+    assert "Auto status (run.meta)" in text
+    assert "Current app time" in text
+
+
+@pytest.mark.asyncio
+async def test_run_detail_warns_when_due_not_processed(
+    http_client: AsyncClient,
+    due_unprocessed_run: int,
+) -> None:
+    """Due run with empty followup_auto_status shows the warning badge."""
+    response = await http_client.get(f"/ops/campaigns/{due_unprocessed_run}")
+    assert response.status_code == 200
+    text = response.text
+    assert "Due now, not processed yet" in text
+
+
+async def _make_terminal_skip_run(session_maker, auto_status: str, skip_reason: str) -> int:
+    """A due run stamped with a terminal auto skip status (worker safety gate)."""
+    from datetime import timedelta
+
+    now = datetime.now(timezone.utc)
+    async with session_maker() as session:
+        async with session.begin():
+            run = CampaignRun(
+                campaign_code="new_clients_monthly",
+                mode="send-real",
+                company_ids=[758285],
+                period_start=now.replace(day=1, hour=0, minute=0, second=0, microsecond=0),
+                period_end=now,
+                status="completed",
+                followup_enabled=True,
+                followup_delay_days=14,
+                followup_policy="unread_or_not_booked",
+                followup_template_name="kitilash_ka_newsletter_new_clients_followup_v1",
+                completed_at=now - timedelta(days=40),
+                meta={
+                    "followup_auto_status": auto_status,
+                    "followup_auto_started_at": now.isoformat(),
+                    "followup_auto_completed_at": now.isoformat(),
+                    "followup_auto_last_error": None,
+                    "followup_auto_skip_reason": skip_reason,
+                    "followup_auto_planned_count": 0,
+                    "followup_auto_queued_count": 0,
+                    "followup_auto_skipped_count": 0,
+                    "followup_auto_failed_count": 0,
+                },
+            )
+            session.add(run)
+            await session.flush()
+            return run.id
+
+
+@pytest.mark.asyncio
+async def test_run_detail_skipped_historical_status(http_client: AsyncClient, session_maker) -> None:
+    """skipped_historical renders clearly and suppresses the due-now warning."""
+    run_id = await _make_terminal_skip_run(
+        session_maker,
+        "skipped_historical",
+        "followup_due_at is older than auto-follow-up safety window",
+    )
+    response = await http_client.get(f"/ops/campaigns/{run_id}")
+    assert response.status_code == 200
+    text = response.text
+    assert "skipped (historical)" in text
+    assert "skipped_historical" in text  # raw auto status row
+    assert "older than auto-follow-up safety window" in text  # skip reason row
+    assert "Due now, not processed yet" not in text
+
+
+@pytest.mark.asyncio
+async def test_run_detail_skipped_already_processed_status(http_client: AsyncClient, session_maker) -> None:
+    """skipped_already_processed renders clearly and suppresses the due-now warning."""
+    run_id = await _make_terminal_skip_run(
+        session_maker,
+        "skipped_already_processed",
+        "Run already has follow-up work; auto worker skipped to avoid duplicate sends",
+    )
+    response = await http_client.get(f"/ops/campaigns/{run_id}")
+    assert response.status_code == 200
+    text = response.text
+    assert "skipped (already processed)" in text
+    assert "skipped_already_processed" in text  # raw auto status row
+    assert "auto worker skipped to avoid duplicate sends" in text  # skip reason row
+    assert "Due now, not processed yet" not in text
+
+
+@pytest.mark.asyncio
+async def test_run_detail_shows_candidates_table(
+    http_client: AsyncClient,
+    due_unprocessed_run: int,
+) -> None:
+    """Dedicated Follow-up candidates section lists candidates with FU reason."""
+    response = await http_client.get(f"/ops/campaigns/{due_unprocessed_run}")
+    assert response.status_code == 200
+    text = response.text
+    assert "Follow-up candidates" in text
+    # Eligible recipient is visible and marked eligible.
+    assert "Eligible Candidate" in text
+    assert "eligible" in text
+    # Read recipient is visible and marked read (not eligible).
+    assert "Read Candidate" in text
+    assert "read" in text
+    # FU outbox / FU sent at columns present.
+    assert "FU outbox" in text
+    assert "FU sent at" in text
+
+
+@pytest.mark.asyncio
+async def test_run_detail_not_due_status(
+    http_client: AsyncClient,
+    session_maker,
+) -> None:
+    """Run whose follow-up delay has not elapsed shows 'not due yet', no warning."""
+    from datetime import timedelta
+
+    now = datetime.now(timezone.utc)
+    async with session_maker() as session:
+        async with session.begin():
+            run = CampaignRun(
+                campaign_code="new_clients_monthly",
+                mode="send-real",
+                company_ids=[758285],
+                period_start=now.replace(day=1, hour=0, minute=0, second=0, microsecond=0),
+                period_end=now,
+                status="completed",
+                followup_enabled=True,
+                followup_delay_days=14,
+                followup_policy="unread_or_not_booked",
+                followup_template_name="kitilash_ka_newsletter_new_clients_followup_v1",
+                completed_at=now - timedelta(days=1),  # not yet due
+                meta={},
+            )
+            session.add(run)
+            await session.flush()
+            run_id = run.id
+
+    response = await http_client.get(f"/ops/campaigns/{run_id}")
+    assert response.status_code == 200
+    text = response.text
+    assert "not due yet" in text
+    assert "Due now, not processed yet" not in text
+
+
+@pytest.mark.asyncio
+async def test_run_detail_shows_auto_completed_counts(
+    http_client: AsyncClient,
+    session_maker,
+) -> None:
+    """When the worker has run, the card shows completed status and counts."""
+    from datetime import timedelta
+
+    now = datetime.now(timezone.utc)
+    async with session_maker() as session:
+        async with session.begin():
+            run = CampaignRun(
+                campaign_code="new_clients_monthly",
+                mode="send-real",
+                company_ids=[758285],
+                period_start=now.replace(day=1, hour=0, minute=0, second=0, microsecond=0),
+                period_end=now,
+                status="completed",
+                followup_enabled=True,
+                followup_delay_days=14,
+                followup_policy="unread_or_not_booked",
+                followup_template_name="kitilash_ka_newsletter_new_clients_followup_v1",
+                completed_at=now - timedelta(days=15),
+                meta={
+                    "followup_auto_status": "completed",
+                    "followup_auto_started_at": (now - timedelta(minutes=2)).isoformat(),
+                    "followup_auto_completed_at": now.isoformat(),
+                    "followup_auto_planned_count": 3,
+                    "followup_auto_queued_count": 3,
+                    "followup_auto_skipped_count": 2,
+                    "followup_auto_failed_count": 0,
+                },
+            )
+            session.add(run)
+            await session.flush()
+            run_id = run.id
+
+    response = await http_client.get(f"/ops/campaigns/{run_id}")
+    assert response.status_code == 200
+    text = response.text
+    # Status badge derived as completed, not the stuck warning.
+    assert "Due now, not processed yet" not in text
+    assert "Planned / Queued / Skipped / Failed" in text
+
+
+# ---------------------------------------------------------------------------
+# Follow-up candidate sorting: delivery statuses are not "skipped" (P3)
+# ---------------------------------------------------------------------------
+
+
+def _bare_recipient(**kw) -> CampaignRecipient:
+    defaults = dict(
+        campaign_run_id=1,
+        company_id=758285,
+        status="delivered",
+        excluded_reason=None,
+        read_at=None,
+        replied_at=None,
+        booked_after_at=None,
+        followup_status=None,
+    )
+    defaults.update(kw)
+    return CampaignRecipient(**defaults)
+
+
+@pytest.mark.parametrize("fs", ["sent", "provider_accepted", "delivered", "read"])
+def test_candidate_priority_delivery_statuses_not_skipped(fs: str) -> None:
+    """Follow-up delivery statuses get the delivery bucket (2), never the skip bucket (4)."""
+    from altegio_bot.ops.router import _followup_candidate_view
+
+    priority, _reason = _followup_candidate_view(_bare_recipient(followup_status=fs), "unread_or_not_booked")
+    assert priority == 2, f"{fs} must be a delivery status, not skipped"
+
+
+@pytest.mark.parametrize(
+    "fs",
+    [
+        "followup_skipped",
+        "skipped_read",
+        "skipped_replied",
+        "skipped_booked_after",
+        "skipped_opted_out",
+        "skipped_future_record",
+        "canceled",
+    ],
+)
+def test_candidate_priority_skip_statuses_in_skip_bucket(fs: str) -> None:
+    """Skip / cancel statuses stay in the skip bucket (4)."""
+    from altegio_bot.ops.router import _followup_candidate_view
+
+    priority, _reason = _followup_candidate_view(_bare_recipient(followup_status=fs), "unread_or_not_booked")
+    assert priority == 4
+
+
+def test_candidate_priority_planned_and_failed_buckets() -> None:
+    from altegio_bot.ops.router import _followup_candidate_view
+
+    for fs in ("followup_planned", "followup_processing", "followup_queued"):
+        assert _followup_candidate_view(_bare_recipient(followup_status=fs), "unread_only")[0] == 1
+    assert _followup_candidate_view(_bare_recipient(followup_status="followup_failed"), "unread_only")[0] == 3
+
+
+def test_candidate_priority_eligible_bucket_local_fallback() -> None:
+    """Unread/delivered with no followup_status and no preview → eligible (bucket 0)."""
+    from altegio_bot.ops.router import _followup_candidate_view
+
+    priority, reason = _followup_candidate_view(_bare_recipient(), "unread_or_not_booked")
+    assert priority == 0
+    assert reason == "eligible"
+
+
+@pytest.mark.asyncio
+async def test_candidate_table_legend_mentions_delivery_statuses(
+    http_client: AsyncClient,
+    due_unprocessed_run: int,
+) -> None:
+    """The candidate table legend reflects the delivery-aware sort order."""
+    response = await http_client.get(f"/ops/campaigns/{due_unprocessed_run}")
+    assert response.status_code == 200
+    assert "sent/delivered/read" in response.text
+
+
+# ---------------------------------------------------------------------------
+# Ops "eligible now" uses final-guard semantics (P4)
+# ---------------------------------------------------------------------------
+
+
+@pytest_asyncio.fixture
+async def run_with_guard_sensitive_candidates(session_maker) -> int:
+    """Run with eligible / opted-out / future-record recipients (no followup_status)."""
+    from datetime import timedelta
+
+    now = datetime.now(timezone.utc)
+    async with session_maker() as session:
+        async with session.begin():
+            run = CampaignRun(
+                campaign_code="new_clients_monthly",
+                mode="send-real",
+                company_ids=[758285],
+                period_start=now.replace(day=1, hour=0, minute=0, second=0, microsecond=0),
+                period_end=now,
+                status="completed",
+                followup_enabled=True,
+                followup_delay_days=14,
+                followup_policy="unread_or_not_booked",
+                followup_template_name="kitilash_ka_newsletter_new_clients_followup_v1",
+                completed_at=now - timedelta(days=20),
+                meta={},
+            )
+            session.add(run)
+            await session.flush()
+            run_id = run.id
+
+            ok = Client(
+                company_id=758285,
+                altegio_client_id=5001,
+                phone_e164="+49500000001",
+                display_name="Clean",
+                raw={},
+                wa_opted_out=False,
+            )
+            opted = Client(
+                company_id=758285,
+                altegio_client_id=5002,
+                phone_e164="+49500000002",
+                display_name="OptedOut",
+                raw={},
+                wa_opted_out=True,
+            )
+            fut = Client(
+                company_id=758285,
+                altegio_client_id=5003,
+                phone_e164="+49500000003",
+                display_name="Future",
+                raw={},
+                wa_opted_out=False,
+            )
+            session.add_all([ok, opted, fut])
+            await session.flush()
+
+            for cid, aid, phone, name in (
+                (ok.id, 5001, "+49500000001", "Eligible Now Client"),
+                (opted.id, 5002, "+49500000002", "Opted Out Client"),
+                (fut.id, 5003, "+49500000003", "Future Record Client"),
+            ):
+                session.add(
+                    CampaignRecipient(
+                        campaign_run_id=run_id,
+                        company_id=758285,
+                        client_id=cid,
+                        altegio_client_id=aid,
+                        phone_e164=phone,
+                        display_name=name,
+                        status="delivered",
+                        sent_at=now - timedelta(days=20),
+                    )
+                )
+
+            # Future active record for the "Future" client.
+            session.add(
+                Record(
+                    company_id=758285,
+                    altegio_record_id=6003,
+                    client_id=fut.id,
+                    altegio_client_id=5003,
+                    starts_at=now + timedelta(days=365),
+                    is_deleted=False,
+                    raw={},
+                )
+            )
+
+    return run_id
+
+
+def _candidate_section(html: str) -> str:
+    """Slice out just the Follow-up candidates card (it precedes Funnel contacts)."""
+    start = html.index("🎯 Follow-up candidates")
+    end = html.index("👥 Funnel contacts") if "👥 Funnel contacts" in html else len(html)
+    return html[start:end]
+
+
+@pytest.mark.asyncio
+async def test_candidate_eligible_now_reflects_final_guard(
+    http_client: AsyncClient,
+    run_with_guard_sensitive_candidates: int,
+) -> None:
+    """Opt-out / future-record recipients must not show as eligible; clean one does."""
+    response = await http_client.get(f"/ops/campaigns/{run_with_guard_sensitive_candidates}")
+    assert response.status_code == 200
+    section = _candidate_section(response.text)
+
+    # All three appear in the candidate table.
+    assert "Eligible Now Client" in section
+    assert "Opted Out Client" in section
+    assert "Future Record Client" in section
+
+    # Final-guard preview reclassifies opt-out / future-record as skips,
+    # surfacing their real reasons instead of "eligible".
+    assert "opted_out" in section
+    assert "future_record" in section
+    # The clean recipient is still shown as eligible.
+    assert "eligible" in section
+
+
+@pytest.mark.asyncio
+async def test_candidate_guard_preview_error_not_eligible(
+    http_client: AsyncClient,
+    session_maker,
+    monkeypatch,
+) -> None:
+    """If final-guard preview raises for a row, it must not render as eligible."""
+    from datetime import timedelta
+
+    import altegio_bot.ops.router as ops_router_module
+    from altegio_bot.campaigns.followup import FollowupFinalEligibilityResult
+
+    now = datetime.now(timezone.utc)
+    async with session_maker() as session:
+        async with session.begin():
+            run = CampaignRun(
+                campaign_code="new_clients_monthly",
+                mode="send-real",
+                company_ids=[758285],
+                period_start=now.replace(day=1, hour=0, minute=0, second=0, microsecond=0),
+                period_end=now,
+                status="completed",
+                followup_enabled=True,
+                followup_delay_days=14,
+                followup_policy="unread_or_not_booked",
+                followup_template_name="kitilash_ka_newsletter_new_clients_followup_v1",
+                completed_at=now - timedelta(days=20),
+                meta={},
+            )
+            session.add(run)
+            await session.flush()
+            run_id = run.id
+
+            good = CampaignRecipient(
+                campaign_run_id=run_id,
+                company_id=758285,
+                altegio_client_id=7001,
+                phone_e164="+49700000001",
+                display_name="Good Client",
+                status="delivered",
+            )
+            boom = CampaignRecipient(
+                campaign_run_id=run_id,
+                company_id=758285,
+                altegio_client_id=7002,
+                phone_e164="+49700000002",
+                display_name="Boom Client",
+                status="delivered",
+            )
+            session.add_all([good, boom])
+            await session.flush()
+            good_id, boom_id = good.id, boom.id
+
+    # Final-guard preview raises only for "Boom Client".
+    async def fake_guard(*, session, recipient, run, now):  # noqa: A002 - mirror real kwargs
+        if recipient.display_name == "Boom Client":
+            raise RuntimeError("simulated guard preview failure")
+        return FollowupFinalEligibilityResult(
+            eligible=True,
+            skip_reason=None,
+            followup_status=None,
+            booked_after_at=None,
+        )
+
+    monkeypatch.setattr(ops_router_module, "check_followup_final_eligibility", fake_guard)
+
+    response = await http_client.get(f"/ops/campaigns/{run_id}")
+    assert response.status_code == 200
+    section = _candidate_section(response.text)
+
+    assert "Good Client" in section
+    assert "Boom Client" in section
+    # The errored row surfaces guard_preview_error, not eligible.
+    assert "guard_preview_error" in section
+    # Eligible (Good) is sorted before the preview-error row (Boom).
+    assert section.index("Good Client") < section.index("Boom Client")
+
+    # Preview must not mutate the DB: both recipients keep followup_status NULL.
+    async with session_maker() as session:
+        g = await session.get(CampaignRecipient, good_id)
+        b = await session.get(CampaignRecipient, boom_id)
+    assert g.followup_status is None
+    assert b.followup_status is None
 
 
 @pytest.mark.asyncio

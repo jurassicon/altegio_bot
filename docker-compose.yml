@@ -89,6 +89,17 @@ services:
         condition: service_started
     command: ["/app/.venv/bin/python", "-m", "altegio_bot.scripts.run_campaign_worker"]
 
+  altegio-followup-worker:
+    build: .
+    restart: always
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    command: ["/app/.venv/bin/python", "-m", "altegio_bot.scripts.run_followup_worker"]
+
   # Migration runner — not started by default `docker compose up -d`.
   # Run explicitly: docker compose --profile ops run --rm migrate
   migrate:
