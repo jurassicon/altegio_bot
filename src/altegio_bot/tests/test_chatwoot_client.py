@@ -663,6 +663,23 @@ def _reset_chatwoot_db_engine_state(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(cc, "_chatwoot_db_runtime_error_count", 0, raising=False)
 
 
+@pytest.fixture(autouse=True)
+def disable_chatwoot_db_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Disable Chatwoot DB persistence for every test in this module by default.
+
+    Pins ``settings.chatwoot_db_url`` to empty and resets the module-level engine
+    / runtime-failure globals before each test, so HTTP-payload tests stay
+    deterministic and environment-independent even when the surrounding
+    environment (local/CI) has a real ``CHATWOOT_DB_URL`` set. DB-specific tests
+    opt in explicitly by monkeypatching ``cc.settings.chatwoot_db_url`` (and,
+    where relevant, ``cc._get_chatwoot_db_engine``) after this fixture runs.
+    """
+    import altegio_bot.chatwoot_client as cc
+
+    monkeypatch.setattr(cc.settings, "chatwoot_db_url", "", raising=False)
+    _reset_chatwoot_db_engine_state(monkeypatch)
+
+
 class _FakeConn:
     """Records executed statements; optionally raises to simulate a DB failure."""
 
@@ -904,12 +921,16 @@ async def test_persist_native_content_attributes_executes_idempotent_update(
     assert "WHERE id = :message_id" in sql
 
 
+@respx.mock
 @pytest.mark.asyncio
 async def test_empty_chatwoot_db_url_is_noop(
     client: ChatwootClient,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Empty chatwoot_db_url → safe no-op, no engine created, no raise."""
+    """Empty chatwoot_db_url → silent DEBUG no-op: id returned, no engine, no log spam."""
+    import logging
+
     import altegio_bot.chatwoot_client as cc
 
     _reset_chatwoot_db_engine_state(monkeypatch)
@@ -917,11 +938,23 @@ async def test_empty_chatwoot_db_url_is_noop(
 
     created: list[object] = []
     monkeypatch.setattr(cc, "create_async_engine", lambda *a, **k: created.append((a, k)))
+    respx.post("https://chatwoot.example.com/api/v1/accounts/1/conversations/15/messages").mock(
+        return_value=httpx.Response(200, json={"id": 920, "content": "Hi"})
+    )
 
-    await client._persist_native_content_attributes(8201, 15, {"in_reply_to": 8179})
+    # Drive it through the real send path several times: an unconfigured URL must
+    # never spam WARNING/INFO on every native reply/reaction send.
+    with caplog.at_level(logging.INFO, logger="altegio_bot.chatwoot_client"):
+        for _ in range(3):
+            msg_id = await client.send_message(
+                15, "Hi", message_type="incoming", content_attributes={"in_reply_to": 8179}
+            )
 
+    assert msg_id == 920
     assert created == []
     assert cc._get_chatwoot_db_engine() is None
+    # No WARNING/INFO records — DEBUG-only no-op is acceptable.
+    assert [r for r in caplog.records if r.levelno >= logging.INFO] == []
 
 
 @respx.mock
@@ -944,12 +977,16 @@ async def test_malformed_chatwoot_db_url_is_no_raise_and_safe(
     )
 
     with caplog.at_level(logging.WARNING, logger="altegio_bot.chatwoot_client"):
+        # Two sends with the same bad URL: a single WARNING (no per-send spam).
         msg_id = await client.send_message(15, "Hi", message_type="incoming", content_attributes={"in_reply_to": 7})
+        await client.send_message(15, "Hi2", message_type="incoming", content_attributes={"in_reply_to": 8})
 
     assert msg_id == 913
-    warning_text = "\n".join(record.message for record in caplog.records)
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    warning_text = "\n".join(r.message for r in warnings)
+    # A malformed *configured* URL still surfaces a WARNING, emitted once per URL.
     assert "normalization disabled" in warning_text
-    assert "normalization skipped" in warning_text
+    assert len(warnings) == 1
     # Log safety: never leak the DSN / password / host.
     assert bad_url not in warning_text
     assert "super-secret" not in warning_text

@@ -494,7 +494,12 @@ class ChatwootClient:
         object via a direct, idempotent UPDATE against the Chatwoot database.
 
         Guarantees:
-        - No-op + WARNING when ``settings.chatwoot_db_url`` is unconfigured.
+        - Silent DEBUG no-op when ``settings.chatwoot_db_url`` is empty: an
+          unconfigured URL is the documented "disabled" state, so it must never
+          emit WARNING/INFO (would spam on every native reply/reaction in
+          Meta-direct / local environments).
+        - A *malformed* configured URL still surfaces a single WARNING (emitted
+          once per URL by :func:`_get_chatwoot_db_engine`), never the URL itself.
         - Idempotent: only rewrites rows still stored as a JSON string; real
           objects and NULLs are untouched, so re-runs do nothing.
         - Never raises: any failure is logged and swallowed so message creation
@@ -506,6 +511,12 @@ class ChatwootClient:
         the content_attributes values (keys only).
         """
         url = _chatwoot_db_url()
+        if not url:
+            # Documented safe no-op: DB normalization is disabled. DEBUG only so
+            # Meta-direct / local / not-yet-configured deploys do not spam a
+            # WARNING on every native reply/reaction send.
+            logger.debug("chatwoot: content_attributes normalization disabled: chatwoot_db_url not configured")
+            return
         try:
             if _chatwoot_db_runtime_failure_active(url):
                 logger.debug(
@@ -518,9 +529,12 @@ class ChatwootClient:
                 return
             engine = _get_chatwoot_db_engine()
             if engine is None:
-                logger.warning(
-                    "chatwoot: content_attributes normalization skipped: chatwoot_db_url "
-                    "not configured or unavailable (message_id=%s conversation_id=%s)",
+                # Malformed/error URL: _get_chatwoot_db_engine already logged a
+                # single WARNING for this URL (and stays silent on repeats), so
+                # keep this per-send line at DEBUG to avoid warning spam.
+                logger.debug(
+                    "chatwoot: content_attributes normalization skipped: chatwoot_db_url unavailable "
+                    "message_id=%s conversation_id=%s",
                     message_id,
                     conversation_id,
                 )
