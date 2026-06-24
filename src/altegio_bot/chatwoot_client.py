@@ -657,7 +657,9 @@ class ChatwootClient:
             message_type="incoming",
             content_attributes=content_attributes,
         )
-        logger.info(
+        # DEBUG, not INFO: normal per-message path, fires for every inbound
+        # WhatsApp message (incl. native reply/reaction) — must not add noise.
+        logger.debug(
             "chatwoot: incoming logged phone=%s conversation_id=%s message_id=%s",
             phone_e164,
             conversation_id,
@@ -695,7 +697,9 @@ class ChatwootClient:
                 message_type="outgoing",
                 private=True,
             )
-            logger.info(
+            # DEBUG, not INFO: normal per-message mirroring. Failures below stay
+            # at logger.exception.
+            logger.debug(
                 "Chatwoot mirror note posted msg_id=%s conv=%s phone=%s",
                 msg_id,
                 conversation_id,

@@ -329,7 +329,7 @@ async def test_log_incoming_message_logs_success(
     client: ChatwootClient,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """log_incoming_message should emit INFO with phone/ids on success."""
+    """log_incoming_message success path is DEBUG-only: phone/ids logged, no INFO/WARNING."""
     respx.get("https://chatwoot.example.com/api/v1/accounts/1/contacts/search").mock(
         return_value=httpx.Response(200, json={"payload": [{"id": 5, "phone_number": "+49111222333"}]})
     )
@@ -342,14 +342,46 @@ async def test_log_incoming_message_logs_success(
 
     import logging
 
-    with caplog.at_level(logging.INFO, logger="altegio_bot.chatwoot_client"):
+    with caplog.at_level(logging.DEBUG, logger="altegio_bot.chatwoot_client"):
         conv_id, msg_id = await client.log_incoming_message("+49111222333", "Hi")
 
     assert conv_id == 20
     assert msg_id == 200
+    # Normal per-message path must not add INFO/WARNING noise.
+    assert [r for r in caplog.records if r.levelno >= logging.INFO] == []
+    # The success line is still emitted, at DEBUG, with phone/ids.
+    incoming_debug = [r for r in caplog.records if "incoming logged" in r.message]
+    assert incoming_debug and all(r.levelno == logging.DEBUG for r in incoming_debug)
     assert "+49111222333" in caplog.text
     assert "20" in caplog.text
     assert "200" in caplog.text
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_mirror_outbound_as_note_logs_success(
+    client: ChatwootClient,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """mirror_outbound_as_note success path is DEBUG-only: no INFO/WARNING."""
+    _mock_contact_and_conv("+49111222333", 5, 20)
+    # No prior inbound from client.
+    _mock_messages(20, [])
+    post_route = respx.post("https://chatwoot.example.com/api/v1/accounts/1/conversations/20/messages").mock(
+        return_value=httpx.Response(200, json={"id": 300, "content": "Note"})
+    )
+
+    import logging
+
+    with caplog.at_level(logging.DEBUG, logger="altegio_bot.chatwoot_client"):
+        await client.mirror_outbound_as_note("+49111222333", "Note")
+
+    assert post_route.called
+    # Normal per-message mirroring must not add INFO/WARNING noise.
+    assert [r for r in caplog.records if r.levelno >= logging.INFO] == []
+    # The success line is still emitted, at DEBUG.
+    mirror_debug = [r for r in caplog.records if "mirror note posted" in r.message]
+    assert mirror_debug and all(r.levelno == logging.DEBUG for r in mirror_debug)
 
 
 @respx.mock
