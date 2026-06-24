@@ -47,3 +47,11 @@ project_tree.txt
 alembic/**/__pycache__/
 alembic/**/*.py[cod]
 test.db
+/CLAUDE.md
+
+# Graphify local knowledge graph / assistant tooling
+graphify-out/
+GRAPH_REPORT.md
+CLAUDE.md
+.claude/
+.graphify/

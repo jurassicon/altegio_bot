@@ -167,6 +167,29 @@ class Settings(BaseSettings):
     # so a typo cannot change request semantics.
     chatwoot_api_forwarded_proto: str = ""
 
+    # Direct SQLAlchemy (asyncpg) URL for the *Chatwoot* Postgres database.
+    # Optional: leave empty (default) to safely disable content_attributes
+    # normalization — an empty value is a no-op, never an error.
+    #
+    # This URL points at the Chatwoot DB, NOT the altegio_bot application DB.
+    # In production it may be an external/managed Postgres host, not the docker
+    # service. A direct UPDATE is used here only because Chatwoot's REST
+    # create-message endpoint persists ``content_attributes`` as a JSON *string*
+    # even when the HTTP body is a nested JSON object, which leaves native reply
+    # context unusable (``content_attributes ->> 'in_reply_to'`` is NULL). When
+    # set, a best-effort post-create UPDATE rewrites that single message's column
+    # to a real JSON object.
+    #
+    # Timeouts stay deliberately low: this path is best-effort and must never
+    # slow down or block WhatsApp forwarding.
+    # Example:
+    #   postgresql+asyncpg://postgres:<password>@<chatwoot-pg-host>:5432/chatwoot
+    chatwoot_db_url: str = ""
+    chatwoot_db_connect_timeout_seconds: float = 1.0
+    chatwoot_db_pool_timeout_seconds: float = 1.0
+    chatwoot_db_runtime_failure_cooldown_seconds: float = 30.0
+    chatwoot_db_runtime_failure_threshold: int = 3
+
     # Meta-first cutover: route Chatwoot operator replies through
     # altegio_bot → Meta instead of relying on Chatwoot WhatsApp inbox.
     # Default False (safe). Enable only after verifying no double-send risk.
