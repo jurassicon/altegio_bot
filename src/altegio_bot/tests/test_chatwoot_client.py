@@ -893,8 +893,11 @@ async def test_send_message_returns_id_when_db_normalization_fails(
 async def test_persist_native_content_attributes_executes_idempotent_update(
     client: ChatwootClient,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """When configured, it runs the guarded UPDATE for exactly the given message id."""
+    import logging
+
     import altegio_bot.chatwoot_client as cc
 
     _reset_chatwoot_db_engine_state(monkeypatch)
@@ -907,7 +910,8 @@ async def test_persist_native_content_attributes_executes_idempotent_update(
     recorder: list[tuple[str, object]] = []
     monkeypatch.setattr(cc, "_get_chatwoot_db_engine", lambda: _FakeEngine(recorder))
 
-    await client._persist_native_content_attributes(8200, 15, {"in_reply_to": 8179})
+    with caplog.at_level(logging.DEBUG, logger="altegio_bot.chatwoot_client"):
+        await client._persist_native_content_attributes(8200, 15, {"in_reply_to": 8179})
 
     assert len(recorder) == 1
     sql, params = recorder[0]
@@ -919,6 +923,11 @@ async def test_persist_native_content_attributes_executes_idempotent_update(
     assert "'string'" in sql
     assert ":message_id" in sql
     assert "WHERE id = :message_id" in sql
+    # Success on a configured + healthy DB must stay quiet: DEBUG only, never
+    # INFO/WARNING, so normal native reply/reaction traffic does not add noise.
+    assert [r for r in caplog.records if r.levelno >= logging.INFO] == []
+    success_debug = [r for r in caplog.records if "normalized to JSON object" in r.message]
+    assert success_debug and all(r.levelno == logging.DEBUG for r in success_debug)
 
 
 @respx.mock
@@ -959,12 +968,18 @@ async def test_empty_chatwoot_db_url_is_noop(
 
 @respx.mock
 @pytest.mark.asyncio
-async def test_malformed_chatwoot_db_url_is_no_raise_and_safe(
+async def test_malformed_chatwoot_db_url_engine_creation_error_is_no_raise_and_safe(
     client: ChatwootClient,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A malformed chatwoot_db_url must not turn a successful POST into a failure."""
+    """A malformed chatwoot_db_url must not turn a successful POST into a failure.
+
+    Scope: this covers *synchronous* create_async_engine failures (e.g. an invalid
+    SQLAlchemy dialect / malformed URL). A syntactically valid but unreachable URL
+    (bad host/password) fails at connect time and is covered by the runtime
+    failure/cooldown tests below.
+    """
     import logging
 
     import altegio_bot.chatwoot_client as cc

@@ -569,7 +569,10 @@ class ChatwootClient:
                 )
             return
         _clear_chatwoot_db_runtime_failure(url)
-        logger.info(
+        # DEBUG, not INFO: a configured + healthy Chatwoot DB normalizes on every
+        # native reply/reaction, so successful normal operation must not add log
+        # noise. Keys only — never the content_attributes values, never the DSN.
+        logger.debug(
             "chatwoot: content_attributes normalized to JSON object message_id=%s conversation_id=%s keys=%s",
             message_id,
             conversation_id,
