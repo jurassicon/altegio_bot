@@ -136,6 +136,31 @@ def _operator_outbox(
     return ob
 
 
+def _bot_outbox(
+    *,
+    wamid: str = "wamid.BOT1",
+    phone_e164: str = PHONE_E164,
+    chatwoot_message_id: int | None = None,
+    chatwoot_conversation_id: int | None = None,
+    body: str = "Напоминание: запись завтра в 10:00",
+    created_at: datetime | None = None,
+) -> OutboxMessage:
+    """A bot/automation OutboxMessage (``message_source='bot'``).
+
+    Defaults mirror real bot rows: no native ``chatwoot_message_id`` (only
+    operator relays populate it), so replies fall back to a visible body quote.
+    """
+    return _operator_outbox(
+        wamid=wamid,
+        phone_e164=phone_e164,
+        chatwoot_message_id=chatwoot_message_id,
+        chatwoot_conversation_id=chatwoot_conversation_id,
+        body=body,
+        message_source="bot",
+        created_at=created_at,
+    )
+
+
 def _make_event(payload: dict[str, Any], dedupe_key: str = "wa:reply-test") -> WhatsAppEvent:
     return WhatsAppEvent(
         dedupe_key=dedupe_key,
@@ -295,14 +320,39 @@ async def test_reply_target_wrong_phone_returns_none(session_maker) -> None:
 
 
 @pytest.mark.asyncio
-async def test_reply_target_bot_source_not_matched(session_maker) -> None:
+async def test_reply_target_bot_source_found(session_maker) -> None:
+    """PR2: a reply to a bot/automation message now resolves as a fallback target.
+
+    (Before PR2 this returned None because the resolver only matched
+    ``message_source='operator'``.)
+    """
     async with session_maker() as session:
         async with session.begin():
-            session.add(_operator_outbox(message_source="bot"))
+            session.add(_bot_outbox(wamid="wamid.OP1", body="Напоминание о записи"))
 
         target = await _get_reply_context_target(session, "wamid.OP1", phone_e164=PHONE_E164)
 
-    assert target is None
+    assert target is not None
+    assert target.kind == "bot_outbox_message"
+    assert target.body == "Напоминание о записи"
+    # Bot rows carry no native id → fallback quote only.
+    assert target.chatwoot_message_id is None
+
+
+@pytest.mark.asyncio
+async def test_operator_takes_priority_over_bot(session_maker) -> None:
+    """Both operator and bot rows share the wamid → operator wins (resolver step 1)."""
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(_bot_outbox(wamid="wamid.OP1", body="bot body"))
+            session.add(_operator_outbox(wamid="wamid.OP1", body="operator body", chatwoot_message_id=7644))
+
+        target = await _get_reply_context_target(session, "wamid.OP1", phone_e164=PHONE_E164)
+
+    assert target is not None
+    assert target.kind == "operator"
+    assert target.body == "operator body"
+    assert target.chatwoot_message_id == 7644
 
 
 @pytest.mark.asyncio
@@ -611,6 +661,92 @@ async def test_old_row_without_native_id_quotes_body(session_maker) -> None:
     call = cw.send_message.call_args
     assert call.kwargs["content_attributes"] is None
     assert call.args[1].startswith("↩️ Ответ на сообщение:\n«Старое сообщение»")
+
+
+@pytest.mark.asyncio
+async def test_bot_message_reply_falls_back_to_quote(session_maker) -> None:
+    """PR2: client replies to a bot message (no native id) → visible body quote."""
+    evt, cw = await _run_forward(
+        session_maker,
+        payload=_meta_payload("Подтверждаю", context_id="wamid.BOT1"),
+        outbox=_bot_outbox(wamid="wamid.BOT1", body="Напоминание: запись завтра в 10:00"),
+        destination_conversation_id=277,
+    )
+
+    call = cw.send_message.call_args
+    assert call.kwargs["content_attributes"] is None
+    content = call.args[1]
+    assert content.startswith("↩️ Ответ на сообщение:\n«Напоминание: запись завтра в 10:00»")
+    assert content.endswith("Подтверждаю")
+    assert evt.forwarded_chatwoot_conversation_id == 277
+    assert evt.error is None
+
+
+@pytest.mark.asyncio
+async def test_bot_message_reply_native_when_same_conversation(session_maker) -> None:
+    """PR2: a bot row carrying a native id in the destination conversation → native reply."""
+    evt, cw = await _run_forward(
+        session_maker,
+        payload=_meta_payload("Ок", wamid="wamid.REPLYBOT", context_id="wamid.BOT1"),
+        outbox=_bot_outbox(
+            wamid="wamid.BOT1",
+            chatwoot_message_id=456,
+            chatwoot_conversation_id=277,
+        ),
+        destination_conversation_id=277,
+    )
+
+    call = cw.send_message.call_args
+    assert call.args[1] == "Ок"
+    assert call.kwargs["content_attributes"] == {
+        "in_reply_to": 456,
+        "in_reply_to_external_id": "wamid.BOT1",
+    }
+    assert evt.forwarded_chatwoot_conversation_id == 277
+    assert evt.error is None
+
+
+@pytest.mark.asyncio
+async def test_bot_reply_cross_conversation_fallback(session_maker) -> None:
+    """PR2: a bot target in another conversation → fallback quote, never native."""
+    evt, cw = await _run_forward(
+        session_maker,
+        payload=_meta_payload("Спасибо", context_id="wamid.BOT1"),
+        outbox=_bot_outbox(
+            wamid="wamid.BOT1",
+            chatwoot_message_id=456,
+            chatwoot_conversation_id=100,
+            body="Акция действует до пятницы",
+        ),
+        destination_conversation_id=277,
+    )
+
+    call = cw.send_message.call_args
+    assert call.kwargs["content_attributes"] is None
+    content = call.args[1]
+    assert content.startswith("↩️ Ответ на сообщение:\n«Акция действует до пятницы»")
+    assert content.endswith("Спасибо")
+    assert evt.forwarded_chatwoot_conversation_id == 277
+
+
+@pytest.mark.asyncio
+async def test_bot_reply_wrong_phone_not_found(session_maker) -> None:
+    """PR2: a bot row for a different phone must not resolve (cross-customer guard)."""
+    evt, cw = await _run_forward(
+        session_maker,
+        payload=_meta_payload("Ответ", context_id="wamid.BOT1"),
+        outbox=_bot_outbox(
+            wamid="wamid.BOT1",
+            phone_e164="+49000000000",
+            body="Чужое сообщение",
+        ),
+        destination_conversation_id=277,
+    )
+
+    call = cw.send_message.call_args
+    assert call.kwargs["content_attributes"] is None
+    assert call.args[1] == "↩️ Ответ на сообщение в WhatsApp\n\nОтвет"
+    assert evt.error is None
 
 
 @pytest.mark.asyncio

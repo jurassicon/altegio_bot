@@ -1198,16 +1198,24 @@ async def _handle_failed_delivery_status(
 
 @dataclass(frozen=True)
 class ReplyContextTarget:
-    """Resolved native-reply mapping for an inbound WhatsApp reply.
+    """Resolved reply target for an inbound WhatsApp reply.
 
-    ``chatwoot_message_id`` / ``chatwoot_conversation_id`` point at the
-    operator message the client replied to; ``body`` is its display text,
-    used only for the visible fallback quote when no native id is usable.
+    ``chatwoot_message_id`` / ``chatwoot_conversation_id`` point at the prior
+    message the client replied to; ``body`` is its display text, used for the
+    visible fallback quote when no native id is usable.  ``kind`` records which
+    prior message matched:
+
+    - ``"operator"`` — a relayed human-operator message; may carry a native
+      ``chatwoot_message_id`` (native ``in_reply_to`` candidate).
+    - ``"bot_outbox_message"`` — an automation/campaign send.  In practice these
+      rows have no ``chatwoot_message_id`` (it is only populated for operator
+      relays), so they render as a visible fallback quote of ``body``.
     """
 
     chatwoot_message_id: int | None
     chatwoot_conversation_id: int | None
     body: str | None
+    kind: str = "operator"
 
 
 @dataclass(frozen=True)
@@ -1222,17 +1230,24 @@ async def _get_reply_context_target(
     *,
     phone_e164: str | None,
 ) -> ReplyContextTarget | None:
-    """Resolve a replied-to wamid to a prior operator-relay OutboxMessage.
+    """Resolve a replied-to wamid to the prior OutboxMessage the client answered.
 
     Scoped to ``phone_e164`` as defense-in-depth so a malformed/spoofed
-    ``context.id`` can never resolve to another client's message.  PR1 covers
-    replies to operator messages only (``message_source='operator'``);
-    bot/campaign messages are not reply targets.  Returns ``None`` on a miss.
+    ``context.id`` can never resolve to another client's message.  Two-step
+    lookup, operator first (operator always wins when both match the same wamid):
+
+    1. operator-relay row (``message_source='operator'``) — may carry a native
+       ``chatwoot_message_id``; returned with ``kind='operator'``.
+    2. bot/automation row (``message_source != 'operator'``) — typically has no
+       native id, so it drives the visible fallback quote from ``body``;
+       returned with ``kind='bot_outbox_message'``.
+
+    Returns ``None`` on a miss.
     """
     if not provider_message_id or not phone_e164:
         return None
 
-    stmt = (
+    operator_stmt = (
         select(
             OutboxMessage.chatwoot_message_id,
             OutboxMessage.chatwoot_conversation_id,
@@ -1244,15 +1259,39 @@ async def _get_reply_context_target(
         .order_by(OutboxMessage.created_at.desc(), OutboxMessage.id.desc())
         .limit(1)
     )
-    res = await session.execute(stmt)
-    row = res.first()
-    if row is None:
-        return None
-    return ReplyContextTarget(
-        chatwoot_message_id=row[0],
-        chatwoot_conversation_id=row[1],
-        body=row[2],
+    row = (await session.execute(operator_stmt)).first()
+    if row is not None:
+        return ReplyContextTarget(
+            chatwoot_message_id=row[0],
+            chatwoot_conversation_id=row[1],
+            body=row[2],
+            kind="operator",
+        )
+
+    # PR2: a reply to a bot/automation message. These rows have no native
+    # chatwoot_message_id, so the caller renders a visible fallback quote of body.
+    bot_stmt = (
+        select(
+            OutboxMessage.chatwoot_message_id,
+            OutboxMessage.chatwoot_conversation_id,
+            OutboxMessage.body,
+        )
+        .where(OutboxMessage.provider_message_id == provider_message_id)
+        .where(OutboxMessage.phone_e164 == phone_e164)
+        .where(OutboxMessage.message_source != "operator")
+        .order_by(OutboxMessage.created_at.desc(), OutboxMessage.id.desc())
+        .limit(1)
     )
+    row = (await session.execute(bot_stmt)).first()
+    if row is not None:
+        return ReplyContextTarget(
+            chatwoot_message_id=row[0],
+            chatwoot_conversation_id=row[1],
+            body=row[2],
+            kind="bot_outbox_message",
+        )
+
+    return None
 
 
 async def _get_whatsapp_reply_context_target(
