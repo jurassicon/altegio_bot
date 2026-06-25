@@ -52,7 +52,7 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-async def _fetch_eligible_leads(session):  # type: ignore[no-untyped-def]
+async def _fetch_eligible_leads(session, *, now: datetime | None = None):  # type: ignore[no-untyped-def]
     """Return PromoLead rows eligible for a booking reminder.
 
     Applies all active-card guards in SQL (loyalty_card_id, loyalty_card_number,
@@ -64,14 +64,14 @@ async def _fetch_eligible_leads(session):  # type: ignore[no-untyped-def]
 
     from altegio_bot.models.models import Client, PromoLead
 
-    now = datetime.now(timezone.utc)
+    effective_now = now or datetime.now(timezone.utc)
 
     stmt = (
         select(PromoLead)
         .where(PromoLead.campaign_name == CAMPAIGN_NAME)
         .where(PromoLead.status == "issued")
         .where(PromoLead.issued_at.is_not(None))
-        .where(PromoLead.expires_at > now)
+        .where(PromoLead.expires_at > effective_now)
         .where(PromoLead.applied_at.is_(None))
         .where(PromoLead.used_at.is_(None))
         .where(PromoLead.cancelled_at.is_(None))

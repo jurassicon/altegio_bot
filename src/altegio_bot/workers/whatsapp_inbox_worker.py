@@ -1386,11 +1386,12 @@ async def _forward_text_to_chatwoot(
     """Forward an inbound Meta-origin text to Chatwoot, native-reply first.
 
     Resolves the destination conversation BEFORE posting so a native
-    ``in_reply_to`` is attached only when the replied-to operator message
-    lives in that same conversation; otherwise a visible quote prefix is
-    used.  Records the destination in ``forwarded_chatwoot_conversation_id``
-    — never in ``chatwoot_conversation_id``, which stays a Chatwoot-origin
-    source marker.
+    ``in_reply_to`` is attached only when the replied-to prior message has a
+    Chatwoot message id in that same conversation. Prior bot/automation
+    OutboxMessage rows usually do not have a native Chatwoot id, so they fall
+    back to a visible quote prefix. Records the destination in
+    ``forwarded_chatwoot_conversation_id`` — never in
+    ``chatwoot_conversation_id``, which stays a Chatwoot-origin source marker.
     """
     variants = _phone_variants(phone_e164)
     stmt = (
