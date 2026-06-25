@@ -190,7 +190,7 @@ async def main() -> int:
 
     async with SessionLocal() as session:
         async with session.begin():
-            eligible = await _fetch_eligible_leads(session)
+            eligible = await _fetch_eligible_leads(session, now=now)
 
             print(f"Eligible leads: {len(eligible)}")
             for lead in eligible:
