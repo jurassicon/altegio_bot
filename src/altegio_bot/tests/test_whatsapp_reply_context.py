@@ -328,9 +328,9 @@ async def test_reply_target_bot_source_found(session_maker) -> None:
     """
     async with session_maker() as session:
         async with session.begin():
-            session.add(_bot_outbox(wamid="wamid.OP1", body="Напоминание о записи"))
+            session.add(_bot_outbox(wamid="wamid.BOT.SOURCE_FOUND", body="Напоминание о записи"))
 
-        target = await _get_reply_context_target(session, "wamid.OP1", phone_e164=PHONE_E164)
+        target = await _get_reply_context_target(session, "wamid.BOT.SOURCE_FOUND", phone_e164=PHONE_E164)
 
     assert target is not None
     assert target.kind == "bot_outbox_message"
@@ -344,10 +344,12 @@ async def test_operator_takes_priority_over_bot(session_maker) -> None:
     """Both operator and bot rows share the wamid → operator wins (resolver step 1)."""
     async with session_maker() as session:
         async with session.begin():
-            session.add(_bot_outbox(wamid="wamid.OP1", body="bot body"))
-            session.add(_operator_outbox(wamid="wamid.OP1", body="operator body", chatwoot_message_id=7644))
+            session.add(_bot_outbox(wamid="wamid.OPERATOR_PRIORITY", body="bot body"))
+            session.add(
+                _operator_outbox(wamid="wamid.OPERATOR_PRIORITY", body="operator body", chatwoot_message_id=7644)
+            )
 
-        target = await _get_reply_context_target(session, "wamid.OP1", phone_e164=PHONE_E164)
+        target = await _get_reply_context_target(session, "wamid.OPERATOR_PRIORITY", phone_e164=PHONE_E164)
 
     assert target is not None
     assert target.kind == "operator"
@@ -664,14 +666,22 @@ async def test_old_row_without_native_id_quotes_body(session_maker) -> None:
 
 
 @pytest.mark.asyncio
-async def test_bot_message_reply_falls_back_to_quote(session_maker) -> None:
-    """PR2: client replies to a bot message (no native id) → visible body quote."""
-    evt, cw = await _run_forward(
-        session_maker,
-        payload=_meta_payload("Подтверждаю", context_id="wamid.BOT1"),
-        outbox=_bot_outbox(wamid="wamid.BOT1", body="Напоминание: запись завтра в 10:00"),
-        destination_conversation_id=277,
-    )
+async def test_bot_message_reply_falls_back_to_quote(session_maker, caplog) -> None:
+    """PR2: client replies to a bot message (no native id) → visible body quote.
+
+    Also proves the PR2 follow-up: the bot fallback path emits the reply-context
+    resolution at DEBUG with ``target_kind=bot_outbox_message`` and does not
+    change ``content_attributes``.
+    """
+    import logging
+
+    with caplog.at_level(logging.DEBUG, logger="whatsapp_inbox_worker"):
+        evt, cw = await _run_forward(
+            session_maker,
+            payload=_meta_payload("Подтверждаю", context_id="wamid.BOT.FALLBACK"),
+            outbox=_bot_outbox(wamid="wamid.BOT.FALLBACK", body="Напоминание: запись завтра в 10:00"),
+            destination_conversation_id=277,
+        )
 
     call = cw.send_message.call_args
     assert call.kwargs["content_attributes"] is None
@@ -681,29 +691,45 @@ async def test_bot_message_reply_falls_back_to_quote(session_maker) -> None:
     assert evt.forwarded_chatwoot_conversation_id == 277
     assert evt.error is None
 
+    # Observability: kind surfaces at DEBUG, safe technical fields only (no body).
+    resolved = [r for r in caplog.records if "reply_context: resolved" in r.getMessage()]
+    assert resolved, "expected a reply_context resolution DEBUG log"
+    assert all(r.levelno == logging.DEBUG for r in resolved)
+    assert any("target_kind=bot_outbox_message" in r.getMessage() for r in resolved)
+    assert any("native_reply=False" in r.getMessage() for r in resolved)
+    assert all("Напоминание" not in r.getMessage() for r in resolved)
+
 
 @pytest.mark.asyncio
-async def test_bot_message_reply_native_when_same_conversation(session_maker) -> None:
+async def test_bot_message_reply_native_when_same_conversation(session_maker, caplog) -> None:
     """PR2: a bot row carrying a native id in the destination conversation → native reply."""
-    evt, cw = await _run_forward(
-        session_maker,
-        payload=_meta_payload("Ок", wamid="wamid.REPLYBOT", context_id="wamid.BOT1"),
-        outbox=_bot_outbox(
-            wamid="wamid.BOT1",
-            chatwoot_message_id=456,
-            chatwoot_conversation_id=277,
-        ),
-        destination_conversation_id=277,
-    )
+    import logging
+
+    with caplog.at_level(logging.DEBUG, logger="whatsapp_inbox_worker"):
+        evt, cw = await _run_forward(
+            session_maker,
+            payload=_meta_payload("Ок", wamid="wamid.REPLYBOT", context_id="wamid.BOT.NATIVE"),
+            outbox=_bot_outbox(
+                wamid="wamid.BOT.NATIVE",
+                chatwoot_message_id=456,
+                chatwoot_conversation_id=277,
+            ),
+            destination_conversation_id=277,
+        )
 
     call = cw.send_message.call_args
     assert call.args[1] == "Ок"
     assert call.kwargs["content_attributes"] == {
         "in_reply_to": 456,
-        "in_reply_to_external_id": "wamid.BOT1",
+        "in_reply_to_external_id": "wamid.BOT.NATIVE",
     }
     assert evt.forwarded_chatwoot_conversation_id == 277
     assert evt.error is None
+
+    # Native path is observable at DEBUG too: native_reply=True.
+    resolved = [r for r in caplog.records if "reply_context: resolved" in r.getMessage()]
+    assert resolved and all(r.levelno == logging.DEBUG for r in resolved)
+    assert any("native_reply=True" in r.getMessage() for r in resolved)
 
 
 @pytest.mark.asyncio
@@ -711,9 +737,9 @@ async def test_bot_reply_cross_conversation_fallback(session_maker) -> None:
     """PR2: a bot target in another conversation → fallback quote, never native."""
     evt, cw = await _run_forward(
         session_maker,
-        payload=_meta_payload("Спасибо", context_id="wamid.BOT1"),
+        payload=_meta_payload("Спасибо", context_id="wamid.BOT.CROSS_CONV"),
         outbox=_bot_outbox(
-            wamid="wamid.BOT1",
+            wamid="wamid.BOT.CROSS_CONV",
             chatwoot_message_id=456,
             chatwoot_conversation_id=100,
             body="Акция действует до пятницы",
@@ -734,9 +760,9 @@ async def test_bot_reply_wrong_phone_not_found(session_maker) -> None:
     """PR2: a bot row for a different phone must not resolve (cross-customer guard)."""
     evt, cw = await _run_forward(
         session_maker,
-        payload=_meta_payload("Ответ", context_id="wamid.BOT1"),
+        payload=_meta_payload("Ответ", context_id="wamid.BOT.WRONG_PHONE"),
         outbox=_bot_outbox(
-            wamid="wamid.BOT1",
+            wamid="wamid.BOT.WRONG_PHONE",
             phone_e164="+49000000000",
             body="Чужое сообщение",
         ),
@@ -747,6 +773,25 @@ async def test_bot_reply_wrong_phone_not_found(session_maker) -> None:
     assert call.kwargs["content_attributes"] is None
     assert call.args[1] == "↩️ Ответ на сообщение в WhatsApp\n\nОтвет"
     assert evt.error is None
+
+
+@pytest.mark.asyncio
+async def test_reply_context_debug_log_when_target_missing(session_maker, caplog) -> None:
+    """PR2 follow-up: an unresolved context.id logs target-not-found at DEBUG."""
+    import logging
+
+    with caplog.at_level(logging.DEBUG, logger="whatsapp_inbox_worker"):
+        evt, cw = await _run_forward(
+            session_maker,
+            payload=_meta_payload("Алло", context_id="wamid.MISSING_DEBUG"),
+            outbox=None,
+        )
+
+    assert cw.send_message.call_args.kwargs["content_attributes"] is None
+    assert evt.error is None
+    not_found = [r for r in caplog.records if "reply_context: target not found" in r.getMessage()]
+    assert not_found, "expected a target-not-found DEBUG log"
+    assert all(r.levelno == logging.DEBUG for r in not_found)
 
 
 @pytest.mark.asyncio

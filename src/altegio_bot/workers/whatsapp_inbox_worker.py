@@ -1443,6 +1443,26 @@ async def _forward_text_to_chatwoot(
                 prefix = _format_reply_context_prefix(quoted_body)
                 content = f"{prefix}\n\n{text}"
 
+            # Low-noise observability for reply-context resolution. Safe technical
+            # fields only — never body/content/tokens/URLs/payload.
+            if target is not None:
+                logger.debug(
+                    "reply_context: resolved target_found=True target_kind=%s has_native_id=%s "
+                    "conversation_matches=%s native_reply=%s destination_conversation_id=%s "
+                    "target_conversation_id=%s",
+                    target.kind,
+                    target.chatwoot_message_id is not None,
+                    target.chatwoot_conversation_id == conversation_id,
+                    native_ok,
+                    conversation_id,
+                    target.chatwoot_conversation_id,
+                )
+            else:
+                logger.debug(
+                    "reply_context: target not found native_reply=False destination_conversation_id=%s",
+                    conversation_id,
+                )
+
         message_id = await cw.send_message(
             conversation_id,
             content,
