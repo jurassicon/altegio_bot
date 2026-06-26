@@ -1355,7 +1355,22 @@ async def _get_whatsapp_reply_context_target(
     return None
 
 
-_QUOTE_MAX_CHARS = 300
+# Visible fallback quotes show a short, single-line preview of the replied-to
+# message (like native messengers), so a long bot/automation body does not flood
+# the Chatwoot bubble.
+_REPLY_CONTEXT_QUOTE_PREVIEW_MAX_CHARS = 100
+
+
+def _shorten_reply_context_quote(body: str, max_chars: int = _REPLY_CONTEXT_QUOTE_PREVIEW_MAX_CHARS) -> str:
+    """Collapse whitespace and truncate a quoted body to a short preview.
+
+    Trims, collapses any internal whitespace/newlines to single spaces, and
+    truncates to ``max_chars`` with a trailing ``…`` only when truncation happens.
+    """
+    preview = re.sub(r"\s+", " ", body.strip())
+    if len(preview) <= max_chars:
+        return preview
+    return preview[:max_chars].rstrip() + "…"
 
 
 def _format_reply_context_prefix(quoted_body: str | None) -> str:
@@ -1364,17 +1379,15 @@ def _format_reply_context_prefix(quoted_body: str | None) -> str:
     Used for every inbound WhatsApp reply that carries context, regardless of
     whether native ``content_attributes`` are also sent through the Chatwoot API,
     so the operator always sees the replied-to message in the body. When
-    ``quoted_body`` is missing it returns a generic reply marker. This helper only
-    formats visible body text; it does not decide native-vs-API metadata.
+    ``quoted_body`` is missing it returns a generic reply marker; otherwise the
+    body is rendered as a short single-line preview. This helper only formats
+    visible body text; it does not decide native-vs-API metadata.
     """
     if not quoted_body:
         return "↩️ Ответ на сообщение в WhatsApp"
     if quoted_body == "[image]":
         return "↩️ Ответ на изображение"
-    quoted = quoted_body
-    if len(quoted) > _QUOTE_MAX_CHARS:
-        quoted = quoted[:_QUOTE_MAX_CHARS].rstrip() + "…"
-    return f"↩️ Ответ на сообщение:\n«{quoted}»"
+    return f"↩️ Ответ на сообщение:\n«{_shorten_reply_context_quote(quoted_body)}»"
 
 
 async def _forward_text_to_chatwoot(

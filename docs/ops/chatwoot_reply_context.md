@@ -22,6 +22,9 @@ to the Chatwoot database.
   - bot/automation targets without a native Chatwoot id,
   - cross-conversation targets,
   - missing targets.
+- Visible fallback quotes intentionally show a shortened, single-line preview
+  (~100 chars) of the replied-to message, so replies to long bot/automation
+  messages stay readable and closer to native messenger behavior.
 
 ### `always` (safety fallback)
 

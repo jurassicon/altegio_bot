@@ -38,6 +38,7 @@ from altegio_bot.workers.whatsapp_inbox_worker import (
     _is_chatwoot_origin,
     _is_operator_relay,
     _normalize_reply_context_id,
+    _shorten_reply_context_quote,
     handle_event,
 )
 
@@ -285,7 +286,40 @@ def test_prefix_truncates_long_body() -> None:
     long_body = "x" * 500
     result = _format_reply_context_prefix(long_body)
     assert result.endswith("…»")
-    assert len(result) < 350
+    # Preview is capped at ~100 chars (+ ellipsis), not the full 300+ body.
+    assert result == "↩️ Ответ на сообщение:\n«" + "x" * 100 + "…»"
+
+
+def test_prefix_collapses_multiline_body() -> None:
+    body = "Hallo!\n\nDatum: 29.06.2026\nZeit:   14:00"
+    assert _format_reply_context_prefix(body) == "↩️ Ответ на сообщение:\n«Hallo! Datum: 29.06.2026 Zeit: 14:00»"
+
+
+# ---------------------------------------------------------------------------
+# _shorten_reply_context_quote
+# ---------------------------------------------------------------------------
+
+
+def test_shorten_quote_short_body_unchanged() -> None:
+    assert _shorten_reply_context_quote("На 9:00?") == "На 9:00?"
+
+
+def test_shorten_quote_collapses_internal_whitespace() -> None:
+    assert _shorten_reply_context_quote("  Hallo!\n\nDatum:\t14:00  ") == "Hallo! Datum: 14:00"
+
+
+def test_shorten_quote_truncates_with_ellipsis_only_when_needed() -> None:
+    exactly_100 = "y" * 100
+    assert _shorten_reply_context_quote(exactly_100) == exactly_100  # no ellipsis at the boundary
+
+    long_body = "y" * 250
+    shortened = _shorten_reply_context_quote(long_body)
+    assert shortened == "y" * 100 + "…"
+    assert len(shortened) == 101
+
+
+def test_shorten_quote_respects_custom_max_chars() -> None:
+    assert _shorten_reply_context_quote("abcdef", max_chars=3) == "abc…"
 
 
 # ---------------------------------------------------------------------------
@@ -715,6 +749,34 @@ async def test_bot_message_reply_falls_back_to_quote(session_maker, caplog) -> N
     assert any("native_reply=False" in r.getMessage() for r in resolved)
     assert any("visible_quote=True" in r.getMessage() for r in resolved)
     assert all("Напоминание" not in r.getMessage() for r in resolved)
+
+
+@pytest.mark.asyncio
+async def test_bot_message_reply_long_body_quote_is_shortened(session_maker) -> None:
+    """A long multi-line bot body is shown as a short single-line preview, not the full body."""
+    long_body = (
+        "Hallo Юрий Тестov! Ihr Termin wurde storniert.\n\n"
+        "Datum: 29.06.2026\nZeit: 14:00\nService:\nMascara Effekt — 120.00€\n"
+        "Bitte buchen Sie einen neuen Termin über unsere App oder telefonisch."
+    )
+    evt, cw = await _run_forward(
+        session_maker,
+        payload=_meta_payload("Этот термин тестовый", context_id="wamid.BOT.LONG"),
+        outbox=_bot_outbox(wamid="wamid.BOT.LONG", body=long_body),
+        destination_conversation_id=277,
+    )
+
+    call = cw.send_message.call_args
+    assert call.kwargs["content_attributes"] is None
+    content = call.args[1]
+    expected_preview = _shorten_reply_context_quote(long_body)
+    assert content == f"↩️ Ответ на сообщение:\n«{expected_preview}»\n\nЭтот термин тестовый"
+    # End-to-end: the quote is genuinely truncated and single-line; the long tail
+    # of the bot body never reaches the Chatwoot bubble.
+    assert expected_preview.endswith("…")
+    assert "\n" not in expected_preview
+    assert "telefonisch" not in content
+    assert evt.error is None
 
 
 @pytest.mark.asyncio
