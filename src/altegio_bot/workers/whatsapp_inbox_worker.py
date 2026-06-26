@@ -1361,9 +1361,11 @@ _QUOTE_MAX_CHARS = 300
 def _format_reply_context_prefix(quoted_body: str | None) -> str:
     """Build the visible quote prefix shown above a WhatsApp reply in Chatwoot.
 
-    Used only when no safe native ``in_reply_to`` mapping is available
-    (missing target, no chatwoot_message_id, or a cross-conversation target),
-    so the operator still sees that the client used a reply.
+    Used for every inbound WhatsApp reply that carries context, regardless of
+    whether native ``content_attributes`` are also sent through the Chatwoot API,
+    so the operator always sees the replied-to message in the body. When
+    ``quoted_body`` is missing it returns a generic reply marker. This helper only
+    formats visible body text; it does not decide native-vs-API metadata.
     """
     if not quoted_body:
         return "↩️ Ответ на сообщение в WhatsApp"
@@ -1455,12 +1457,12 @@ async def _forward_text_to_chatwoot(
             content = f"{_format_reply_context_prefix(quoted_body)}\n\n{text}"
 
             # Low-noise observability for reply-context resolution. Safe technical
-            # fields only — never body/content/tokens/URLs/payload. A visible
-            # fallback_quote is always added here, independent of native_reply.
+            # fields only — never body/content/tokens/URLs/payload. A visible_quote
+            # is always added here, independent of native_reply.
             if target is not None:
                 logger.debug(
                     "reply_context: resolved target_found=True target_kind=%s has_native_id=%s "
-                    "conversation_matches=%s native_reply=%s fallback_quote=True "
+                    "conversation_matches=%s native_reply=%s visible_quote=True "
                     "destination_conversation_id=%s target_conversation_id=%s",
                     target.kind,
                     target.chatwoot_message_id is not None,
@@ -1471,7 +1473,7 @@ async def _forward_text_to_chatwoot(
                 )
             else:
                 logger.debug(
-                    "reply_context: target not found native_reply=False fallback_quote=True "
+                    "reply_context: target not found native_reply=False visible_quote=True "
                     "destination_conversation_id=%s",
                     conversation_id,
                 )

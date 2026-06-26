@@ -702,7 +702,7 @@ async def test_bot_message_reply_falls_back_to_quote(session_maker, caplog) -> N
     assert all(r.levelno == logging.DEBUG for r in resolved)
     assert any("target_kind=bot_outbox_message" in r.getMessage() for r in resolved)
     assert any("native_reply=False" in r.getMessage() for r in resolved)
-    assert any("fallback_quote=True" in r.getMessage() for r in resolved)
+    assert any("visible_quote=True" in r.getMessage() for r in resolved)
     assert all("Напоминание" not in r.getMessage() for r in resolved)
 
 
@@ -739,7 +739,7 @@ async def test_bot_message_reply_native_when_same_conversation(session_maker, ca
     resolved = [r for r in caplog.records if "reply_context: resolved" in r.getMessage()]
     assert resolved and all(r.levelno == logging.DEBUG for r in resolved)
     assert any("native_reply=True" in r.getMessage() for r in resolved)
-    assert any("fallback_quote=True" in r.getMessage() for r in resolved)
+    assert any("visible_quote=True" in r.getMessage() for r in resolved)
 
 
 @pytest.mark.asyncio
@@ -806,7 +806,7 @@ async def test_reply_context_debug_log_when_target_missing(session_maker, caplog
     assert not_found, "expected a target-not-found DEBUG log"
     assert all(r.levelno == logging.DEBUG for r in not_found)
     assert any("native_reply=False" in r.getMessage() for r in not_found)
-    assert any("fallback_quote=True" in r.getMessage() for r in not_found)
+    assert any("visible_quote=True" in r.getMessage() for r in not_found)
 
 
 @pytest.mark.asyncio
