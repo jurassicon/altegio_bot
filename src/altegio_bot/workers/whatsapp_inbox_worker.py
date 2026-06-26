@@ -1355,7 +1355,22 @@ async def _get_whatsapp_reply_context_target(
     return None
 
 
-_QUOTE_MAX_CHARS = 300
+# Visible fallback quotes show a short, single-line preview of the replied-to
+# message (like native messengers), so a long bot/automation body does not flood
+# the Chatwoot bubble.
+_REPLY_CONTEXT_QUOTE_PREVIEW_MAX_CHARS = 100
+
+
+def _shorten_reply_context_quote(body: str, max_chars: int = _REPLY_CONTEXT_QUOTE_PREVIEW_MAX_CHARS) -> str:
+    """Collapse whitespace and truncate a quoted body to a short preview.
+
+    Trims, collapses any internal whitespace/newlines to single spaces, and
+    truncates to ``max_chars`` with a trailing ``…`` only when truncation happens.
+    """
+    preview = re.sub(r"\s+", " ", body.strip())
+    if len(preview) <= max_chars:
+        return preview
+    return preview[:max_chars].rstrip() + "…"
 
 
 def _format_reply_context_prefix(quoted_body: str | None) -> str:
@@ -1364,17 +1379,15 @@ def _format_reply_context_prefix(quoted_body: str | None) -> str:
     Used for every inbound WhatsApp reply that carries context, regardless of
     whether native ``content_attributes`` are also sent through the Chatwoot API,
     so the operator always sees the replied-to message in the body. When
-    ``quoted_body`` is missing it returns a generic reply marker. This helper only
-    formats visible body text; it does not decide native-vs-API metadata.
+    ``quoted_body`` is missing it returns a generic reply marker; otherwise the
+    body is rendered as a short single-line preview. This helper only formats
+    visible body text; it does not decide native-vs-API metadata.
     """
     if not quoted_body:
         return "↩️ Ответ на сообщение в WhatsApp"
     if quoted_body == "[image]":
         return "↩️ Ответ на изображение"
-    quoted = quoted_body
-    if len(quoted) > _QUOTE_MAX_CHARS:
-        quoted = quoted[:_QUOTE_MAX_CHARS].rstrip() + "…"
-    return f"↩️ Ответ на сообщение:\n«{quoted}»"
+    return f"↩️ Ответ на сообщение:\n«{_shorten_reply_context_quote(quoted_body)}»"
 
 
 async def _forward_text_to_chatwoot(
@@ -1385,20 +1398,22 @@ async def _forward_text_to_chatwoot(
     text: str,
     reply_to_provider_message_id: str | None = None,
 ) -> None:
-    """Forward an inbound Meta-origin text to Chatwoot with visible reply context.
+    """Forward an inbound Meta-origin text to Chatwoot with reply context.
 
-    For any inbound reply that carries context, a visible quote of the replied-to
-    message is ALWAYS prepended to the message body, so the operator sees the
-    context regardless of how Chatwoot stores or renders ``content_attributes``.
+    When a WhatsApp reply carries context, the worker tries to resolve the
+    replied-to message. For same-conversation targets with a Chatwoot message id,
+    native ``in_reply_to`` metadata is sent through the Chatwoot REST API. In the
+    default ``fallback_only`` mode the message body stays clean and Chatwoot
+    renders the native reply preview.
 
-    Native ``in_reply_to`` metadata is additionally sent through the Chatwoot REST
-    API (best-effort only) when the replied-to prior message has a Chatwoot
-    message id in this same destination conversation. It is never relied upon for
-    visibility and ``altegio_bot`` never writes Chatwoot's database. Prior
-    bot/automation OutboxMessage rows usually have no native Chatwoot id, so they
-    use the visible quote only. Records the destination in
-    ``forwarded_chatwoot_conversation_id`` — never in ``chatwoot_conversation_id``,
-    which stays a Chatwoot-origin source marker.
+    Visible body quotes are added only when native metadata is unavailable/unsafe
+    (bot or automation target without a native Chatwoot id, cross-conversation
+    target, missing target), or when ``CHATWOOT_REPLY_CONTEXT_VISIBLE_QUOTE_MODE``
+    is set to ``always``. Visible quotes use a shortened single-line preview.
+
+    ``altegio_bot`` never writes to Chatwoot's database. Records the destination
+    in ``forwarded_chatwoot_conversation_id`` — never in
+    ``chatwoot_conversation_id``, which stays a Chatwoot-origin source marker.
     """
     variants = _phone_variants(phone_e164)
     stmt = (
