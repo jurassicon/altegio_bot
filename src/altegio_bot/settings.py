@@ -171,7 +171,10 @@ class Settings(BaseSettings):
     # Chatwoot message body, in addition to the native reply metadata sent via API.
     # fallback_only (default) — rely on Chatwoot's native reply UI when native
     #   metadata is sent (same-conversation target with a Chatwoot message id);
-    #   add the visible quote only in fallback cases (bot/cross-conversation/missing).
+    #   add the visible quote only in fallback cases: bot/automation targets
+    #   without a native Chatwoot id, cross-conversation targets, and missing
+    #   targets. (A bot/automation row that does carry a native id in the same
+    #   conversation is native, not fallback.)
     # always — always add a visible body quote, even when native metadata is sent.
     chatwoot_reply_context_visible_quote_mode: str = "fallback_only"
 
