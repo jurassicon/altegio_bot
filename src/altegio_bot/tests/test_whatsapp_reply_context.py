@@ -587,35 +587,46 @@ async def _run_forward(
 
 
 @pytest.mark.asyncio
-async def test_native_reply_same_conversation(session_maker) -> None:
-    """Reply target in the destination conversation → native in_reply_to AND visible quote."""
-    evt, cw = await _run_forward(
-        session_maker,
-        payload=_meta_payload("Вот это время", wamid="wamid.REPLY1", context_id="wamid.OP1"),
-        outbox=_operator_outbox(chatwoot_message_id=7644, chatwoot_conversation_id=277),
-        destination_conversation_id=277,
-    )
+async def test_native_reply_same_conversation(session_maker, monkeypatch, caplog) -> None:
+    """Native same-conversation reply (fallback_only): API metadata only, no visible quote."""
+    import logging
+
+    import altegio_bot.workers.whatsapp_inbox_worker as wiw
+
+    monkeypatch.setattr(wiw.settings, "chatwoot_reply_context_visible_quote_mode", "fallback_only")
+
+    with caplog.at_level(logging.DEBUG, logger="whatsapp_inbox_worker"):
+        evt, cw = await _run_forward(
+            session_maker,
+            payload=_meta_payload("Вот это время", wamid="wamid.REPLY1", context_id="wamid.OP1"),
+            outbox=_operator_outbox(chatwoot_message_id=7644, chatwoot_conversation_id=277),
+            destination_conversation_id=277,
+        )
 
     cw.send_message.assert_called_once()
     call = cw.send_message.call_args
     assert call.args[0] == 277
-    # Native metadata is still sent through the API...
+    # Native metadata is sent through the API...
     assert call.kwargs["message_type"] == "incoming"
     assert call.kwargs["content_attributes"] == {
         "in_reply_to": 7644,
         "in_reply_to_external_id": "wamid.OP1",
     }
-    # ...and a visible quote is always prepended so the operator sees the context
-    # even if Chatwoot does not render content_attributes.
+    # ...and the body is only the client text: Chatwoot renders the native reply
+    # preview, so no duplicated visible quote in the default fallback_only mode.
     content = call.args[1]
-    assert content.startswith("↩️ Ответ на сообщение:\n«На 9:00?»")
-    assert content.endswith("Вот это время")
+    assert content == "Вот это время"
+    assert "↩️ Ответ на сообщение" not in content
 
     assert evt.forwarded_chatwoot_conversation_id == 277
     assert evt.chatwoot_message_id == 9001
     assert evt.chatwoot_conversation_id is None
     assert evt.whatsapp_message_id == "wamid.REPLY1"
     assert evt.error is None
+
+    resolved = [r for r in caplog.records if "reply_context: resolved" in r.getMessage()]
+    assert resolved and all(r.levelno == logging.DEBUG for r in resolved)
+    assert any("native_reply=True visible_quote=False" in r.getMessage() for r in resolved)
 
 
 @pytest.mark.asyncio
@@ -707,9 +718,13 @@ async def test_bot_message_reply_falls_back_to_quote(session_maker, caplog) -> N
 
 
 @pytest.mark.asyncio
-async def test_bot_message_reply_native_when_same_conversation(session_maker, caplog) -> None:
-    """PR2: a bot row carrying a native id in the destination conversation → native reply."""
+async def test_bot_message_reply_native_when_same_conversation(session_maker, monkeypatch, caplog) -> None:
+    """A bot row with a native id in the destination conversation → native reply, no quote (fallback_only)."""
     import logging
+
+    import altegio_bot.workers.whatsapp_inbox_worker as wiw
+
+    monkeypatch.setattr(wiw.settings, "chatwoot_reply_context_visible_quote_mode", "fallback_only")
 
     with caplog.at_level(logging.DEBUG, logger="whatsapp_inbox_worker"):
         evt, cw = await _run_forward(
@@ -724,22 +739,55 @@ async def test_bot_message_reply_native_when_same_conversation(session_maker, ca
         )
 
     call = cw.send_message.call_args
-    # Native metadata is sent, and the visible quote is still prepended.
+    # Native metadata is sent; no duplicated visible quote in fallback_only mode.
     assert call.kwargs["content_attributes"] == {
         "in_reply_to": 456,
         "in_reply_to_external_id": "wamid.BOT.NATIVE",
     }
     content = call.args[1]
-    assert content.startswith("↩️ Ответ на сообщение:\n«Напоминание: запись завтра в 10:00»")
-    assert content.endswith("Ок")
+    assert content == "Ок"
+    assert "↩️ Ответ на сообщение" not in content
     assert evt.forwarded_chatwoot_conversation_id == 277
     assert evt.error is None
 
-    # Native path is observable at DEBUG too: native_reply=True with a visible quote.
     resolved = [r for r in caplog.records if "reply_context: resolved" in r.getMessage()]
     assert resolved and all(r.levelno == logging.DEBUG for r in resolved)
-    assert any("native_reply=True" in r.getMessage() for r in resolved)
-    assert any("visible_quote=True" in r.getMessage() for r in resolved)
+    assert any("native_reply=True visible_quote=False" in r.getMessage() for r in resolved)
+
+
+@pytest.mark.asyncio
+async def test_native_reply_same_conversation_always_mode_keeps_visible_quote(
+    session_maker, monkeypatch, caplog
+) -> None:
+    """Mode 'always': native reply still sends API metadata AND prepends the visible quote."""
+    import logging
+
+    import altegio_bot.workers.whatsapp_inbox_worker as wiw
+
+    monkeypatch.setattr(wiw.settings, "chatwoot_reply_context_visible_quote_mode", "always")
+
+    with caplog.at_level(logging.DEBUG, logger="whatsapp_inbox_worker"):
+        evt, cw = await _run_forward(
+            session_maker,
+            payload=_meta_payload("Вот это время", wamid="wamid.REPLY1", context_id="wamid.OP1"),
+            outbox=_operator_outbox(chatwoot_message_id=7644, chatwoot_conversation_id=277),
+            destination_conversation_id=277,
+        )
+
+    call = cw.send_message.call_args
+    assert call.kwargs["content_attributes"] == {
+        "in_reply_to": 7644,
+        "in_reply_to_external_id": "wamid.OP1",
+    }
+    content = call.args[1]
+    assert content.startswith("↩️ Ответ на сообщение:\n«На 9:00?»")
+    assert content.endswith("Вот это время")
+    assert evt.forwarded_chatwoot_conversation_id == 277
+    assert evt.error is None
+
+    resolved = [r for r in caplog.records if "reply_context: resolved" in r.getMessage()]
+    assert resolved and all(r.levelno == logging.DEBUG for r in resolved)
+    assert any("native_reply=True visible_quote=True" in r.getMessage() for r in resolved)
 
 
 @pytest.mark.asyncio
