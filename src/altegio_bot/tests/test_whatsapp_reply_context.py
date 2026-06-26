@@ -588,7 +588,7 @@ async def _run_forward(
 
 @pytest.mark.asyncio
 async def test_native_reply_same_conversation(session_maker) -> None:
-    """Reply target in the destination conversation → native in_reply_to."""
+    """Reply target in the destination conversation → native in_reply_to AND visible quote."""
     evt, cw = await _run_forward(
         session_maker,
         payload=_meta_payload("Вот это время", wamid="wamid.REPLY1", context_id="wamid.OP1"),
@@ -599,12 +599,17 @@ async def test_native_reply_same_conversation(session_maker) -> None:
     cw.send_message.assert_called_once()
     call = cw.send_message.call_args
     assert call.args[0] == 277
-    assert call.args[1] == "Вот это время"
+    # Native metadata is still sent through the API...
     assert call.kwargs["message_type"] == "incoming"
     assert call.kwargs["content_attributes"] == {
         "in_reply_to": 7644,
         "in_reply_to_external_id": "wamid.OP1",
     }
+    # ...and a visible quote is always prepended so the operator sees the context
+    # even if Chatwoot does not render content_attributes.
+    content = call.args[1]
+    assert content.startswith("↩️ Ответ на сообщение:\n«На 9:00?»")
+    assert content.endswith("Вот это время")
 
     assert evt.forwarded_chatwoot_conversation_id == 277
     assert evt.chatwoot_message_id == 9001
@@ -697,6 +702,7 @@ async def test_bot_message_reply_falls_back_to_quote(session_maker, caplog) -> N
     assert all(r.levelno == logging.DEBUG for r in resolved)
     assert any("target_kind=bot_outbox_message" in r.getMessage() for r in resolved)
     assert any("native_reply=False" in r.getMessage() for r in resolved)
+    assert any("fallback_quote=True" in r.getMessage() for r in resolved)
     assert all("Напоминание" not in r.getMessage() for r in resolved)
 
 
@@ -718,18 +724,22 @@ async def test_bot_message_reply_native_when_same_conversation(session_maker, ca
         )
 
     call = cw.send_message.call_args
-    assert call.args[1] == "Ок"
+    # Native metadata is sent, and the visible quote is still prepended.
     assert call.kwargs["content_attributes"] == {
         "in_reply_to": 456,
         "in_reply_to_external_id": "wamid.BOT.NATIVE",
     }
+    content = call.args[1]
+    assert content.startswith("↩️ Ответ на сообщение:\n«Напоминание: запись завтра в 10:00»")
+    assert content.endswith("Ок")
     assert evt.forwarded_chatwoot_conversation_id == 277
     assert evt.error is None
 
-    # Native path is observable at DEBUG too: native_reply=True.
+    # Native path is observable at DEBUG too: native_reply=True with a visible quote.
     resolved = [r for r in caplog.records if "reply_context: resolved" in r.getMessage()]
     assert resolved and all(r.levelno == logging.DEBUG for r in resolved)
     assert any("native_reply=True" in r.getMessage() for r in resolved)
+    assert any("fallback_quote=True" in r.getMessage() for r in resolved)
 
 
 @pytest.mark.asyncio
@@ -787,11 +797,16 @@ async def test_reply_context_debug_log_when_target_missing(session_maker, caplog
             outbox=None,
         )
 
-    assert cw.send_message.call_args.kwargs["content_attributes"] is None
+    # Generic visible fallback, no fake native metadata.
+    call = cw.send_message.call_args
+    assert call.kwargs["content_attributes"] is None
+    assert call.args[1] == "↩️ Ответ на сообщение в WhatsApp\n\nАлло"
     assert evt.error is None
     not_found = [r for r in caplog.records if "reply_context: target not found" in r.getMessage()]
     assert not_found, "expected a target-not-found DEBUG log"
     assert all(r.levelno == logging.DEBUG for r in not_found)
+    assert any("native_reply=False" in r.getMessage() for r in not_found)
+    assert any("fallback_quote=True" in r.getMessage() for r in not_found)
 
 
 @pytest.mark.asyncio

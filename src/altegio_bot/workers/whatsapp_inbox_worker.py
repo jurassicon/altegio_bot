@@ -1383,15 +1383,20 @@ async def _forward_text_to_chatwoot(
     text: str,
     reply_to_provider_message_id: str | None = None,
 ) -> None:
-    """Forward an inbound Meta-origin text to Chatwoot, native-reply first.
+    """Forward an inbound Meta-origin text to Chatwoot with visible reply context.
 
-    Resolves the destination conversation BEFORE posting so a native
-    ``in_reply_to`` is attached only when the replied-to prior message has a
-    Chatwoot message id in that same conversation. Prior bot/automation
-    OutboxMessage rows usually do not have a native Chatwoot id, so they fall
-    back to a visible quote prefix. Records the destination in
-    ``forwarded_chatwoot_conversation_id`` — never in
-    ``chatwoot_conversation_id``, which stays a Chatwoot-origin source marker.
+    For any inbound reply that carries context, a visible quote of the replied-to
+    message is ALWAYS prepended to the message body, so the operator sees the
+    context regardless of how Chatwoot stores or renders ``content_attributes``.
+
+    Native ``in_reply_to`` metadata is additionally sent through the Chatwoot REST
+    API (best-effort only) when the replied-to prior message has a Chatwoot
+    message id in this same destination conversation. It is never relied upon for
+    visibility and ``altegio_bot`` never writes Chatwoot's database. Prior
+    bot/automation OutboxMessage rows usually have no native Chatwoot id, so they
+    use the visible quote only. Records the destination in
+    ``forwarded_chatwoot_conversation_id`` — never in ``chatwoot_conversation_id``,
+    which stays a Chatwoot-origin source marker.
     """
     variants = _phone_variants(phone_e164)
     stmt = (
@@ -1424,33 +1429,39 @@ async def _forward_text_to_chatwoot(
                 and target.chatwoot_conversation_id == conversation_id
             )
             if native_ok:
+                # Best-effort native metadata through the API only; never relied
+                # upon for visibility and never written to Chatwoot's database.
                 content_attributes = {
                     "in_reply_to": target.chatwoot_message_id,
                     "in_reply_to_external_id": reply_to_provider_message_id,
                 }
-            else:
-                if (
-                    target is not None
-                    and target.chatwoot_message_id is not None
-                    and target.chatwoot_conversation_id != conversation_id
-                ):
-                    logger.info(
-                        "reply_context: skipping native mapping, conversation differs "
-                        "target_conversation_id=%s destination_conversation_id=%s",
-                        target.chatwoot_conversation_id,
-                        conversation_id,
-                    )
-                quoted_body = target.body if target is not None else None
-                prefix = _format_reply_context_prefix(quoted_body)
-                content = f"{prefix}\n\n{text}"
+            elif (
+                target is not None
+                and target.chatwoot_message_id is not None
+                and target.chatwoot_conversation_id != conversation_id
+            ):
+                logger.info(
+                    "reply_context: skipping native mapping, conversation differs "
+                    "target_conversation_id=%s destination_conversation_id=%s",
+                    target.chatwoot_conversation_id,
+                    conversation_id,
+                )
+
+            # Always prepend a visible quote for inbound replies with context so
+            # the operator sees the replied-to message regardless of whether native
+            # content_attributes were sent or how Chatwoot renders them. Uses the
+            # target body when known, otherwise a generic reply marker.
+            quoted_body = target.body if target is not None else None
+            content = f"{_format_reply_context_prefix(quoted_body)}\n\n{text}"
 
             # Low-noise observability for reply-context resolution. Safe technical
-            # fields only — never body/content/tokens/URLs/payload.
+            # fields only — never body/content/tokens/URLs/payload. A visible
+            # fallback_quote is always added here, independent of native_reply.
             if target is not None:
                 logger.debug(
                     "reply_context: resolved target_found=True target_kind=%s has_native_id=%s "
-                    "conversation_matches=%s native_reply=%s destination_conversation_id=%s "
-                    "target_conversation_id=%s",
+                    "conversation_matches=%s native_reply=%s fallback_quote=True "
+                    "destination_conversation_id=%s target_conversation_id=%s",
                     target.kind,
                     target.chatwoot_message_id is not None,
                     target.chatwoot_conversation_id == conversation_id,
@@ -1460,7 +1471,8 @@ async def _forward_text_to_chatwoot(
                 )
             else:
                 logger.debug(
-                    "reply_context: target not found native_reply=False destination_conversation_id=%s",
+                    "reply_context: target not found native_reply=False fallback_quote=True "
+                    "destination_conversation_id=%s",
                     conversation_id,
                 )
 
