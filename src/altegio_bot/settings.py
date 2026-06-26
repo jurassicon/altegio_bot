@@ -167,6 +167,17 @@ class Settings(BaseSettings):
     # so a typo cannot change request semantics.
     chatwoot_api_forwarded_proto: str = ""
 
+    # Controls whether an inbound WhatsApp reply gets a visible text quote in the
+    # Chatwoot message body, in addition to the native reply metadata sent via API.
+    # fallback_only (default) — rely on Chatwoot's native reply UI when native
+    #   metadata is sent (same-conversation target with a Chatwoot message id);
+    #   add the visible quote only in fallback cases: bot/automation targets
+    #   without a native Chatwoot id, cross-conversation targets, and missing
+    #   targets. (A bot/automation row that does carry a native id in the same
+    #   conversation is native, not fallback.)
+    # always — always add a visible body quote, even when native metadata is sent.
+    chatwoot_reply_context_visible_quote_mode: str = "fallback_only"
+
     # Meta-first cutover: route Chatwoot operator replies through
     # altegio_bot → Meta instead of relying on Chatwoot WhatsApp inbox.
     # Default False (safe). Enable only after verifying no double-send risk.
@@ -202,6 +213,18 @@ class Settings(BaseSettings):
     # When True, adds a private Chatwoot note explaining the window was closed
     # and the original message was not delivered directly.
     chatwoot_operator_reopen_private_note_enabled: bool = True
+
+    @field_validator("chatwoot_reply_context_visible_quote_mode")
+    @classmethod
+    def validate_reply_context_visible_quote_mode(cls, v: str) -> str:
+        allowed = {"fallback_only", "always"}
+        if v not in allowed:
+            raise ValueError(
+                f"chatwoot_reply_context_visible_quote_mode must be one of "
+                f"{sorted(allowed)!r}, got {v!r}. "
+                "Check CHATWOOT_REPLY_CONTEXT_VISIBLE_QUOTE_MODE."
+            )
+        return v
 
     @field_validator("chatwoot_operator_closed_window_mode")
     @classmethod

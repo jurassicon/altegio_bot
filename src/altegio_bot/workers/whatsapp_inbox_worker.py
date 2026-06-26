@@ -1449,32 +1449,36 @@ async def _forward_text_to_chatwoot(
                     conversation_id,
                 )
 
-            # Always prepend a visible quote for inbound replies with context so
-            # the operator sees the replied-to message regardless of whether native
-            # content_attributes were sent or how Chatwoot renders them. Uses the
+            # Add a visible body quote for every reply with context EXCEPT a native
+            # same-conversation reply in the default fallback_only mode: there
+            # Chatwoot renders its own native reply preview, so a body quote would
+            # duplicate it. Mode "always" keeps the quote unconditionally. Uses the
             # target body when known, otherwise a generic reply marker.
-            quoted_body = target.body if target is not None else None
-            content = f"{_format_reply_context_prefix(quoted_body)}\n\n{text}"
+            add_visible_quote = not native_ok or settings.chatwoot_reply_context_visible_quote_mode == "always"
+            if add_visible_quote:
+                quoted_body = target.body if target is not None else None
+                content = f"{_format_reply_context_prefix(quoted_body)}\n\n{text}"
 
             # Low-noise observability for reply-context resolution. Safe technical
-            # fields only — never body/content/tokens/URLs/payload. A visible_quote
-            # is always added here, independent of native_reply.
+            # fields only — never body/content/tokens/URLs/payload.
             if target is not None:
                 logger.debug(
                     "reply_context: resolved target_found=True target_kind=%s has_native_id=%s "
-                    "conversation_matches=%s native_reply=%s visible_quote=True "
+                    "conversation_matches=%s native_reply=%s visible_quote=%s "
                     "destination_conversation_id=%s target_conversation_id=%s",
                     target.kind,
                     target.chatwoot_message_id is not None,
                     target.chatwoot_conversation_id == conversation_id,
                     native_ok,
+                    add_visible_quote,
                     conversation_id,
                     target.chatwoot_conversation_id,
                 )
             else:
                 logger.debug(
-                    "reply_context: target not found native_reply=False visible_quote=True "
+                    "reply_context: target not found native_reply=False visible_quote=%s "
                     "destination_conversation_id=%s",
+                    add_visible_quote,
                     conversation_id,
                 )
 
