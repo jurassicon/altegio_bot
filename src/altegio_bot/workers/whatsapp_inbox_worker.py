@@ -1198,16 +1198,24 @@ async def _handle_failed_delivery_status(
 
 @dataclass(frozen=True)
 class ReplyContextTarget:
-    """Resolved native-reply mapping for an inbound WhatsApp reply.
+    """Resolved reply target for an inbound WhatsApp reply.
 
-    ``chatwoot_message_id`` / ``chatwoot_conversation_id`` point at the
-    operator message the client replied to; ``body`` is its display text,
-    used only for the visible fallback quote when no native id is usable.
+    ``chatwoot_message_id`` / ``chatwoot_conversation_id`` point at the prior
+    message the client replied to; ``body`` is its display text, used for the
+    visible fallback quote when no native id is usable.  ``kind`` records which
+    prior message matched:
+
+    - ``"operator"`` — a relayed human-operator message; may carry a native
+      ``chatwoot_message_id`` (native ``in_reply_to`` candidate).
+    - ``"bot_outbox_message"`` — an automation/campaign send.  In practice these
+      rows have no ``chatwoot_message_id`` (it is only populated for operator
+      relays), so they render as a visible fallback quote of ``body``.
     """
 
     chatwoot_message_id: int | None
     chatwoot_conversation_id: int | None
     body: str | None
+    kind: str = "operator"
 
 
 @dataclass(frozen=True)
@@ -1222,17 +1230,24 @@ async def _get_reply_context_target(
     *,
     phone_e164: str | None,
 ) -> ReplyContextTarget | None:
-    """Resolve a replied-to wamid to a prior operator-relay OutboxMessage.
+    """Resolve a replied-to wamid to the prior OutboxMessage the client answered.
 
     Scoped to ``phone_e164`` as defense-in-depth so a malformed/spoofed
-    ``context.id`` can never resolve to another client's message.  PR1 covers
-    replies to operator messages only (``message_source='operator'``);
-    bot/campaign messages are not reply targets.  Returns ``None`` on a miss.
+    ``context.id`` can never resolve to another client's message.  Two-step
+    lookup, operator first (operator always wins when both match the same wamid):
+
+    1. operator-relay row (``message_source='operator'``) — may carry a native
+       ``chatwoot_message_id``; returned with ``kind='operator'``.
+    2. bot/automation row (``message_source != 'operator'``) — typically has no
+       native id, so it drives the visible fallback quote from ``body``;
+       returned with ``kind='bot_outbox_message'``.
+
+    Returns ``None`` on a miss.
     """
     if not provider_message_id or not phone_e164:
         return None
 
-    stmt = (
+    operator_stmt = (
         select(
             OutboxMessage.chatwoot_message_id,
             OutboxMessage.chatwoot_conversation_id,
@@ -1244,15 +1259,39 @@ async def _get_reply_context_target(
         .order_by(OutboxMessage.created_at.desc(), OutboxMessage.id.desc())
         .limit(1)
     )
-    res = await session.execute(stmt)
-    row = res.first()
-    if row is None:
-        return None
-    return ReplyContextTarget(
-        chatwoot_message_id=row[0],
-        chatwoot_conversation_id=row[1],
-        body=row[2],
+    row = (await session.execute(operator_stmt)).first()
+    if row is not None:
+        return ReplyContextTarget(
+            chatwoot_message_id=row[0],
+            chatwoot_conversation_id=row[1],
+            body=row[2],
+            kind="operator",
+        )
+
+    # PR2: a reply to a bot/automation message. These rows have no native
+    # chatwoot_message_id, so the caller renders a visible fallback quote of body.
+    bot_stmt = (
+        select(
+            OutboxMessage.chatwoot_message_id,
+            OutboxMessage.chatwoot_conversation_id,
+            OutboxMessage.body,
+        )
+        .where(OutboxMessage.provider_message_id == provider_message_id)
+        .where(OutboxMessage.phone_e164 == phone_e164)
+        .where(OutboxMessage.message_source != "operator")
+        .order_by(OutboxMessage.created_at.desc(), OutboxMessage.id.desc())
+        .limit(1)
     )
+    row = (await session.execute(bot_stmt)).first()
+    if row is not None:
+        return ReplyContextTarget(
+            chatwoot_message_id=row[0],
+            chatwoot_conversation_id=row[1],
+            body=row[2],
+            kind="bot_outbox_message",
+        )
+
+    return None
 
 
 async def _get_whatsapp_reply_context_target(
@@ -1322,9 +1361,11 @@ _QUOTE_MAX_CHARS = 300
 def _format_reply_context_prefix(quoted_body: str | None) -> str:
     """Build the visible quote prefix shown above a WhatsApp reply in Chatwoot.
 
-    Used only when no safe native ``in_reply_to`` mapping is available
-    (missing target, no chatwoot_message_id, or a cross-conversation target),
-    so the operator still sees that the client used a reply.
+    Used for every inbound WhatsApp reply that carries context, regardless of
+    whether native ``content_attributes`` are also sent through the Chatwoot API,
+    so the operator always sees the replied-to message in the body. When
+    ``quoted_body`` is missing it returns a generic reply marker. This helper only
+    formats visible body text; it does not decide native-vs-API metadata.
     """
     if not quoted_body:
         return "↩️ Ответ на сообщение в WhatsApp"
@@ -1344,14 +1385,20 @@ async def _forward_text_to_chatwoot(
     text: str,
     reply_to_provider_message_id: str | None = None,
 ) -> None:
-    """Forward an inbound Meta-origin text to Chatwoot, native-reply first.
+    """Forward an inbound Meta-origin text to Chatwoot with visible reply context.
 
-    Resolves the destination conversation BEFORE posting so a native
-    ``in_reply_to`` is attached only when the replied-to operator message
-    lives in that same conversation; otherwise a visible quote prefix is
-    used.  Records the destination in ``forwarded_chatwoot_conversation_id``
-    — never in ``chatwoot_conversation_id``, which stays a Chatwoot-origin
-    source marker.
+    For any inbound reply that carries context, a visible quote of the replied-to
+    message is ALWAYS prepended to the message body, so the operator sees the
+    context regardless of how Chatwoot stores or renders ``content_attributes``.
+
+    Native ``in_reply_to`` metadata is additionally sent through the Chatwoot REST
+    API (best-effort only) when the replied-to prior message has a Chatwoot
+    message id in this same destination conversation. It is never relied upon for
+    visibility and ``altegio_bot`` never writes Chatwoot's database. Prior
+    bot/automation OutboxMessage rows usually have no native Chatwoot id, so they
+    use the visible quote only. Records the destination in
+    ``forwarded_chatwoot_conversation_id`` — never in ``chatwoot_conversation_id``,
+    which stays a Chatwoot-origin source marker.
     """
     variants = _phone_variants(phone_e164)
     stmt = (
@@ -1384,25 +1431,52 @@ async def _forward_text_to_chatwoot(
                 and target.chatwoot_conversation_id == conversation_id
             )
             if native_ok:
+                # Best-effort native metadata through the API only; never relied
+                # upon for visibility and never written to Chatwoot's database.
                 content_attributes = {
                     "in_reply_to": target.chatwoot_message_id,
                     "in_reply_to_external_id": reply_to_provider_message_id,
                 }
+            elif (
+                target is not None
+                and target.chatwoot_message_id is not None
+                and target.chatwoot_conversation_id != conversation_id
+            ):
+                logger.info(
+                    "reply_context: skipping native mapping, conversation differs "
+                    "target_conversation_id=%s destination_conversation_id=%s",
+                    target.chatwoot_conversation_id,
+                    conversation_id,
+                )
+
+            # Always prepend a visible quote for inbound replies with context so
+            # the operator sees the replied-to message regardless of whether native
+            # content_attributes were sent or how Chatwoot renders them. Uses the
+            # target body when known, otherwise a generic reply marker.
+            quoted_body = target.body if target is not None else None
+            content = f"{_format_reply_context_prefix(quoted_body)}\n\n{text}"
+
+            # Low-noise observability for reply-context resolution. Safe technical
+            # fields only — never body/content/tokens/URLs/payload. A visible_quote
+            # is always added here, independent of native_reply.
+            if target is not None:
+                logger.debug(
+                    "reply_context: resolved target_found=True target_kind=%s has_native_id=%s "
+                    "conversation_matches=%s native_reply=%s visible_quote=True "
+                    "destination_conversation_id=%s target_conversation_id=%s",
+                    target.kind,
+                    target.chatwoot_message_id is not None,
+                    target.chatwoot_conversation_id == conversation_id,
+                    native_ok,
+                    conversation_id,
+                    target.chatwoot_conversation_id,
+                )
             else:
-                if (
-                    target is not None
-                    and target.chatwoot_message_id is not None
-                    and target.chatwoot_conversation_id != conversation_id
-                ):
-                    logger.info(
-                        "reply_context: skipping native mapping, conversation differs "
-                        "target_conversation_id=%s destination_conversation_id=%s",
-                        target.chatwoot_conversation_id,
-                        conversation_id,
-                    )
-                quoted_body = target.body if target is not None else None
-                prefix = _format_reply_context_prefix(quoted_body)
-                content = f"{prefix}\n\n{text}"
+                logger.debug(
+                    "reply_context: target not found native_reply=False visible_quote=True "
+                    "destination_conversation_id=%s",
+                    conversation_id,
+                )
 
         message_id = await cw.send_message(
             conversation_id,

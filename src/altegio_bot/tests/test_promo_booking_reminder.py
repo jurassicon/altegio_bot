@@ -159,7 +159,7 @@ class _FailProvider:
 async def _run_fetch(session):
     from altegio_bot.scripts.enqueue_promo_booking_reminders import _fetch_eligible_leads
 
-    return await _fetch_eligible_leads(session)
+    return await _fetch_eligible_leads(session, now=_NOW)
 
 
 async def _run_enqueue(session, lead, now=_NOW):
@@ -171,7 +171,8 @@ async def _run_enqueue(session, lead, now=_NOW):
 async def _run_handler(session, job, provider):
     from altegio_bot.workers.outbox_worker import _process_promo_card_booking_reminder
 
-    return await _process_promo_card_booking_reminder(session, job, provider)
+    with patch("altegio_bot.workers.outbox_worker.utcnow", return_value=_NOW):
+        return await _process_promo_card_booking_reminder(session, job, provider)
 
 
 def _make_job(lead_id: int, *, job_id_hint: int = 1) -> MessageJob:
@@ -295,6 +296,28 @@ async def test_dry_run_excludes_expired_lead(session_maker):
             eligible = await _run_fetch(session)
 
     assert not any(item.id == lead_id for item in eligible)
+
+
+@pytest.mark.asyncio
+async def test_dry_run_expiry_boundary_uses_fixed_clock(session_maker):
+    """Lead is eligible only when expires_at is strictly greater than the fixed clock."""
+    async with session_maker() as session:
+        async with session.begin():
+            active = _make_lead(phone="+4917600000101", expires_at=_NOW + timedelta(seconds=1))
+            expired = _make_lead(phone="+4917600000102", expires_at=_NOW)
+            session.add(active)
+            session.add(expired)
+            await session.flush()
+            active_id = active.id
+            expired_id = expired.id
+
+    async with session_maker() as session:
+        async with session.begin():
+            eligible = await _run_fetch(session)
+
+    ids = {item.id for item in eligible}
+    assert active_id in ids
+    assert expired_id not in ids
 
 
 @pytest.mark.asyncio
