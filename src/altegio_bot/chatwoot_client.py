@@ -12,13 +12,10 @@ from __future__ import annotations
 import json
 import logging
 import re
-import time
 from collections.abc import Mapping
 from typing import Any
 
 import httpx
-from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from altegio_bot.chatwoot_headers import normalize_forwarded_proto
 from altegio_bot.settings import settings
@@ -55,155 +52,12 @@ def _log_and_raise(res: httpx.Response, ctx: str) -> None:
         res.raise_for_status()
 
 
-# ---------------------------------------------------------------------------
-# Post-create content_attributes persistence (Chatwoot DB)
-#
-# Chatwoot's REST create-message endpoint persists ``content_attributes`` as a
-# JSON *string* even when the HTTP body is a nested JSON object, which leaves
-# native reply/reaction context unusable (``content_attributes ->> 'in_reply_to'``
-# is NULL). After a successful create + returned message id, a best-effort,
-# idempotent UPDATE rewrites that single message's column to a real JSON object.
-#
-# Module-level globals (not @lru_cache) so tests can reset state via monkeypatch
-# and runtime can rebuild the engine when ``settings.chatwoot_db_url`` changes.
-# ---------------------------------------------------------------------------
-
-# Lazily-created async engine for the Chatwoot DB, keyed by URL. Stays None until
-# first use with a configured settings.chatwoot_db_url. NEVER log these values
-# directly: they contain a DSN with credentials.
-_chatwoot_db_engine: AsyncEngine | None = None
-_chatwoot_db_engine_url: str | None = None
-_chatwoot_db_engine_error_url: str | None = None
-_chatwoot_db_engine_error_type: str | None = None
-
-# Runtime failure state: a syntactically valid URL can build an engine that then
-# fails later on engine.begin()/execute (dead/unreachable DB). Track consecutive
-# failures per exact URL and arm a short cooldown once a threshold is reached.
-_chatwoot_db_runtime_error_url: str | None = None
-_chatwoot_db_runtime_error_until: float = 0.0
-_chatwoot_db_runtime_error_type: str | None = None
-_chatwoot_db_runtime_error_count: int = 0
-
-
-# Idempotent normalization for a single just-created Chatwoot message: when the
-# create-message endpoint stored content_attributes as a JSON *string*, unwrap it
-# back to a real JSON object so ``content_attributes ->> 'in_reply_to'`` resolves.
-# The ``jsonb_typeof(...) = 'string'`` guard makes re-runs a no-op and leaves real
-# objects and NULLs untouched. The ``::jsonb`` casts make it work whether the
-# Chatwoot column type is json or jsonb (in Irida it was json, so a plain
-# jsonb_typeof(content_attributes) failed — the cast is required).
-_NORMALIZE_CHATWOOT_CONTENT_ATTRIBUTES_SQL = text(
-    "UPDATE messages "
-    "SET content_attributes = ((content_attributes::jsonb) #>> '{}')::jsonb "
-    "WHERE id = :message_id "
-    "AND content_attributes IS NOT NULL "
-    "AND jsonb_typeof(content_attributes::jsonb) = 'string'"
-)
-
-
-def _chatwoot_db_url() -> str:
-    return (settings.chatwoot_db_url or "").strip()
-
-
-def _chatwoot_db_runtime_failure_threshold() -> int:
-    return max(1, int(settings.chatwoot_db_runtime_failure_threshold))
-
-
-def _chatwoot_db_runtime_failure_cooldown_seconds() -> float:
-    return max(0.0, float(settings.chatwoot_db_runtime_failure_cooldown_seconds))
-
-
-def _chatwoot_db_runtime_failure_active(url: str) -> bool:
-    return bool(url and _chatwoot_db_runtime_error_url == url and time.monotonic() < _chatwoot_db_runtime_error_until)
-
-
-def _record_chatwoot_db_runtime_failure(url: str, error_type: str) -> tuple[int, bool]:
-    """Record a consecutive runtime failure for *url*; arm cooldown at threshold.
-
-    Returns (failure_count, cooldown_armed). Failures are counted per exact URL;
-    a URL change resets the counter so the new URL is retried immediately.
-    """
-    global _chatwoot_db_runtime_error_count, _chatwoot_db_runtime_error_type
-    global _chatwoot_db_runtime_error_until, _chatwoot_db_runtime_error_url
-    if not url:
-        return 0, False
-    if _chatwoot_db_runtime_error_url != url:
-        _chatwoot_db_runtime_error_url = url
-        _chatwoot_db_runtime_error_until = 0.0
-        _chatwoot_db_runtime_error_count = 0
-    _chatwoot_db_runtime_error_count += 1
-    _chatwoot_db_runtime_error_type = error_type
-    threshold = _chatwoot_db_runtime_failure_threshold()
-    cooldown_armed = _chatwoot_db_runtime_error_count >= threshold
-    if cooldown_armed:
-        _chatwoot_db_runtime_error_until = time.monotonic() + _chatwoot_db_runtime_failure_cooldown_seconds()
-    return _chatwoot_db_runtime_error_count, cooldown_armed
-
-
-def _clear_chatwoot_db_runtime_failure(url: str) -> None:
-    """Clear runtime failure/cooldown state after a successful normalization."""
-    global _chatwoot_db_runtime_error_count, _chatwoot_db_runtime_error_type
-    global _chatwoot_db_runtime_error_until, _chatwoot_db_runtime_error_url
-    if _chatwoot_db_runtime_error_url != url:
-        return
-    _chatwoot_db_runtime_error_url = None
-    _chatwoot_db_runtime_error_until = 0.0
-    _chatwoot_db_runtime_error_type = None
-    _chatwoot_db_runtime_error_count = 0
-
-
-def _get_chatwoot_db_engine() -> AsyncEngine | None:
-    """Return a cached async engine for the Chatwoot DB, or None when unconfigured.
-
-    Lazy and cached: the engine is created on first use with a configured
-    ``settings.chatwoot_db_url`` and reused while the URL is unchanged. Returns
-    None when the URL is empty (safe no-op) or when it previously failed to build
-    (warned once, then silent until the URL changes). A malformed URL can raise
-    immediately from ``create_async_engine``; that is caught and disables the
-    path without ever logging the URL/credentials.
-    """
-    global _chatwoot_db_engine, _chatwoot_db_engine_url
-    global _chatwoot_db_engine_error_type, _chatwoot_db_engine_error_url
-    url = _chatwoot_db_url()
-    if not url:
-        return None
-    if _chatwoot_db_engine is not None and _chatwoot_db_engine_url == url:
-        return _chatwoot_db_engine
-    if _chatwoot_db_engine_error_url == url:
-        return None
-    # URL is new or changed: (re)build the engine. We intentionally do not dispose
-    # a previous engine here — best-effort fix; URL changes are rare (mainly tests).
-    # TODO: dispose the superseded engine if this ever rotates URLs at runtime.
-    try:
-        _chatwoot_db_engine = create_async_engine(
-            url,
-            pool_pre_ping=True,
-            pool_size=2,
-            max_overflow=2,
-            pool_timeout=settings.chatwoot_db_pool_timeout_seconds,
-            connect_args={"timeout": settings.chatwoot_db_connect_timeout_seconds},
-        )
-    except Exception as exc:  # noqa: BLE001 - best-effort normalization must never break sends
-        _chatwoot_db_engine = None
-        _chatwoot_db_engine_url = None
-        _chatwoot_db_engine_error_url = url
-        _chatwoot_db_engine_error_type = type(exc).__name__
-        logger.warning(
-            "chatwoot: content_attributes normalization disabled: invalid chatwoot_db_url error=%s",
-            _chatwoot_db_engine_error_type,
-        )
-        return None
-    _chatwoot_db_engine_url = url
-    _chatwoot_db_engine_error_url = None
-    _chatwoot_db_engine_error_type = None
-    return _chatwoot_db_engine
-
-
 def _normalize_content_attributes(content_attributes: Any) -> dict[str, Any]:
-    """Return content_attributes as a JSON object (dict) payload for Chatwoot.
+    """Return content_attributes as a JSON object (dict) for the Chatwoot API body.
 
-    Ensures the Python client never sends a JSON *string* and that the post-create
-    persistence hook always receives a dict.
+    Python-side normalization only — the Chatwoot REST API receives a real JSON
+    object, never a JSON *string*. ``altegio_bot`` never touches Chatwoot's own
+    database storage of ``content_attributes``.
 
     - str  → ``json.loads``; a valid JSON object returns a dict, anything else
       (invalid JSON, or valid JSON that is not an object) raises ValueError.
@@ -429,16 +283,15 @@ class ChatwootClient:
     ) -> int:
         """Post a message to a conversation. Returns the message ID.
 
-        ``content_attributes`` is normalized to a JSON object and forwarded to
-        Chatwoot when provided (used for native reply rendering via
-        ``in_reply_to`` / ``in_reply_to_external_id``).  It is omitted entirely
-        when ``None`` so existing behavior is unchanged.
+        ``content_attributes`` is normalized to a JSON object (dict) before the
+        API POST and forwarded to Chatwoot when provided (used for native reply
+        rendering via ``in_reply_to`` / ``in_reply_to_external_id``).  It is
+        omitted entirely when ``None`` so existing behavior is unchanged.
 
-        When ``content_attributes`` is provided, a best-effort post-create
-        normalization (:meth:`_persist_native_content_attributes`) rewrites the
-        just-created message's column in the Chatwoot DB to a real JSON object,
-        because the create endpoint otherwise persists it as a JSON *string*.
-        That step never raises and never blocks delivery.
+        ``altegio_bot`` only sends ``content_attributes`` through the Chatwoot
+        REST API; it never connects to Chatwoot's database and never rewrites how
+        Chatwoot stores ``content_attributes`` afterwards. Success is the created
+        message id from the API response — not any particular DB storage shape.
         """
         url = self._api(f"/conversations/{conversation_id}/messages")
 
@@ -466,118 +319,11 @@ class ChatwootClient:
             raise RuntimeError(f"Chatwoot send_message returned no id: {data}")
         message_id = int(msg_id)
 
-        if normalized_attributes is not None:
-            # The REST create endpoint persists content_attributes as a JSON
-            # string; rewrite this one message's column to a real JSON object so
-            # native reply/reaction context (in_reply_to) is usable. Best-effort:
-            # never raises, never blocks the send.
-            await self._persist_native_content_attributes(
-                message_id,
-                conversation_id,
-                normalized_attributes,
-            )
-
+        # content_attributes are sent through the Chatwoot REST API only. We do
+        # NOT touch Chatwoot's DB afterwards: the current Chatwoot version expects
+        # its own serialized storage format, and rewriting it can break Chatwoot
+        # UI/API rendering. The created message id is the success criterion.
         return message_id
-
-    async def _persist_native_content_attributes(
-        self,
-        message_id: int,
-        conversation_id: int,
-        content_attributes: dict[str, Any],
-    ) -> None:
-        """Best-effort: normalize a just-created message's content_attributes.
-
-        Chatwoot's create-message endpoint persists ``content_attributes`` as a
-        JSON *string* even though we POST a nested JSON object, which leaves
-        native reply context unusable (``content_attributes ->> 'in_reply_to'``
-        is NULL). This rewrites that single message's column to a real JSON
-        object via a direct, idempotent UPDATE against the Chatwoot database.
-
-        Guarantees:
-        - Silent DEBUG no-op when ``settings.chatwoot_db_url`` is empty: an
-          unconfigured URL is the documented "disabled" state, so it must never
-          emit WARNING/INFO (would spam on every native reply/reaction in
-          Meta-direct / local environments).
-        - A *malformed* configured URL still surfaces a single WARNING (emitted
-          once per URL by :func:`_get_chatwoot_db_engine`), never the URL itself.
-        - Idempotent: only rewrites rows still stored as a JSON string; real
-          objects and NULLs are untouched, so re-runs do nothing.
-        - Never raises: any failure is logged and swallowed so message creation
-          and WhatsApp delivery are never affected.
-        - Scoped to exactly one message id — never bulk/historical.
-
-        Uses the *Chatwoot* DB via ``settings.chatwoot_db_url`` — never the
-        altegio_bot application DB session. Never logs the DB URL/credentials or
-        the content_attributes values (keys only).
-        """
-        url = _chatwoot_db_url()
-        if not url:
-            # Documented safe no-op: DB normalization is disabled. DEBUG only so
-            # Meta-direct / local / not-yet-configured deploys do not spam a
-            # WARNING on every native reply/reaction send.
-            logger.debug("chatwoot: content_attributes normalization disabled: chatwoot_db_url not configured")
-            return
-        try:
-            if _chatwoot_db_runtime_failure_active(url):
-                logger.debug(
-                    "chatwoot: content_attributes normalization skipped during temporary DB cooldown "
-                    "message_id=%s conversation_id=%s error=%s",
-                    message_id,
-                    conversation_id,
-                    _chatwoot_db_runtime_error_type or "unknown",
-                )
-                return
-            engine = _get_chatwoot_db_engine()
-            if engine is None:
-                # Malformed/error URL: _get_chatwoot_db_engine already logged a
-                # single WARNING for this URL (and stays silent on repeats), so
-                # keep this per-send line at DEBUG to avoid warning spam.
-                logger.debug(
-                    "chatwoot: content_attributes normalization skipped: chatwoot_db_url unavailable "
-                    "message_id=%s conversation_id=%s",
-                    message_id,
-                    conversation_id,
-                )
-                return
-            async with engine.begin() as conn:
-                await conn.execute(
-                    _NORMALIZE_CHATWOOT_CONTENT_ATTRIBUTES_SQL,
-                    {"message_id": int(message_id)},
-                )
-        except Exception as exc:  # noqa: BLE001 - best-effort, must never break send
-            error_type = type(exc).__name__
-            failure_count, cooldown_armed = _record_chatwoot_db_runtime_failure(url, error_type)
-            if cooldown_armed:
-                logger.warning(
-                    "chatwoot: content_attributes normalization temporarily disabled after repeated DB errors "
-                    "message_id=%s conversation_id=%s error=%s failure_count=%s cooldown_seconds=%s",
-                    message_id,
-                    conversation_id,
-                    error_type,
-                    failure_count,
-                    _chatwoot_db_runtime_failure_cooldown_seconds(),
-                )
-            else:
-                logger.warning(
-                    "chatwoot: content_attributes normalization failed (ignored) "
-                    "message_id=%s conversation_id=%s error=%s failure_count=%s threshold=%s",
-                    message_id,
-                    conversation_id,
-                    error_type,
-                    failure_count,
-                    _chatwoot_db_runtime_failure_threshold(),
-                )
-            return
-        _clear_chatwoot_db_runtime_failure(url)
-        # DEBUG, not INFO: a configured + healthy Chatwoot DB normalizes on every
-        # native reply/reaction, so successful normal operation must not add log
-        # noise. Keys only — never the content_attributes values, never the DSN.
-        logger.debug(
-            "chatwoot: content_attributes normalized to JSON object message_id=%s conversation_id=%s keys=%s",
-            message_id,
-            conversation_id,
-            sorted(content_attributes.keys()),
-        )
 
     async def _conversation_has_inbound(self, conversation_id: int) -> bool:
         """Return True if the conversation has any incoming message from client.
