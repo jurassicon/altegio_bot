@@ -15,12 +15,14 @@ def _settings(**overrides: object) -> Settings:
     values: dict[str, object] = {
         "database_url": "postgresql+asyncpg://user:pass@localhost/test",
         "altegio_webhook_secret": "secret",
+        "_env_file": None,
     }
     values.update(overrides)
     return Settings(**values)  # type: ignore[arg-type]
 
 
-def test_reply_context_visible_quote_mode_default_is_fallback_only() -> None:
+def test_reply_context_visible_quote_mode_default_is_fallback_only(monkeypatch) -> None:
+    monkeypatch.delenv("CHATWOOT_REPLY_CONTEXT_VISIBLE_QUOTE_MODE", raising=False)
     assert _settings().chatwoot_reply_context_visible_quote_mode == "fallback_only"
 
 
