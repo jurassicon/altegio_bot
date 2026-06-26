@@ -322,6 +322,16 @@ def test_shorten_quote_respects_custom_max_chars() -> None:
     assert _shorten_reply_context_quote("abcdef", max_chars=3) == "abc…"
 
 
+def test_shorten_quote_strips_trailing_space_at_truncation_boundary() -> None:
+    body = "a" * 99 + " " + "b" * 50
+    shortened = _shorten_reply_context_quote(body)
+
+    # max_chars is an upper bound. We intentionally strip a trailing boundary
+    # space before adding the ellipsis so the preview does not end with a blank.
+    assert shortened == "a" * 99 + "…"
+    assert len(shortened) == 100
+
+
 # ---------------------------------------------------------------------------
 # _get_reply_context_target (DB lookup)
 # ---------------------------------------------------------------------------

@@ -1398,20 +1398,22 @@ async def _forward_text_to_chatwoot(
     text: str,
     reply_to_provider_message_id: str | None = None,
 ) -> None:
-    """Forward an inbound Meta-origin text to Chatwoot with visible reply context.
+    """Forward an inbound Meta-origin text to Chatwoot with reply context.
 
-    For any inbound reply that carries context, a visible quote of the replied-to
-    message is ALWAYS prepended to the message body, so the operator sees the
-    context regardless of how Chatwoot stores or renders ``content_attributes``.
+    When a WhatsApp reply carries context, the worker tries to resolve the
+    replied-to message. For same-conversation targets with a Chatwoot message id,
+    native ``in_reply_to`` metadata is sent through the Chatwoot REST API. In the
+    default ``fallback_only`` mode the message body stays clean and Chatwoot
+    renders the native reply preview.
 
-    Native ``in_reply_to`` metadata is additionally sent through the Chatwoot REST
-    API (best-effort only) when the replied-to prior message has a Chatwoot
-    message id in this same destination conversation. It is never relied upon for
-    visibility and ``altegio_bot`` never writes Chatwoot's database. Prior
-    bot/automation OutboxMessage rows usually have no native Chatwoot id, so they
-    use the visible quote only. Records the destination in
-    ``forwarded_chatwoot_conversation_id`` — never in ``chatwoot_conversation_id``,
-    which stays a Chatwoot-origin source marker.
+    Visible body quotes are added only when native metadata is unavailable/unsafe
+    (bot or automation target without a native Chatwoot id, cross-conversation
+    target, missing target), or when ``CHATWOOT_REPLY_CONTEXT_VISIBLE_QUOTE_MODE``
+    is set to ``always``. Visible quotes use a shortened single-line preview.
+
+    ``altegio_bot`` never writes to Chatwoot's database. Records the destination
+    in ``forwarded_chatwoot_conversation_id`` — never in
+    ``chatwoot_conversation_id``, which stays a Chatwoot-origin source marker.
     """
     variants = _phone_variants(phone_e164)
     stmt = (
