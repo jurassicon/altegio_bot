@@ -6,6 +6,10 @@ Research-grade capture доставок вебхуков EasyWeek. Каждая 
 уникален, чтобы повторные доставки сохранялись как данные. Индекс по ``status``
 — задел под inbox-воркер PR-4, который будет забирать строки status='captured'.
 
+``body_raw`` (BYTEA) хранит исходные байты доставки, ``payload`` (JSONB) — их
+разбор. Автоматического TTL нет: таблица содержит PII, политика хранения
+ручная (см. docs/easyweek/capture_runbook.md).
+
 Миграция строго аддитивная: чужих таблиц не касается.
 
 Revision ID: 8923be993170
@@ -39,6 +43,11 @@ def upgrade() -> None:
             "auth_via VARCHAR(16), "
             "payload_hash VARCHAR(64), "
             "content_type VARCHAR(128), "
+            # Исходные байты доставки (до 128 КиБ) — источник истины по
+            # содержимому; JSONB ниже это уже разбор. body_size_bytes хранит
+            # полный размер, включая непопавший в лимит хвост.
+            "body_raw BYTEA, "
+            "body_size_bytes BIGINT NOT NULL DEFAULT 0, "
             "body_text TEXT, "
             "body_truncated BOOLEAN NOT NULL DEFAULT false, "
             "query JSONB NOT NULL DEFAULT '{}'::jsonb, "

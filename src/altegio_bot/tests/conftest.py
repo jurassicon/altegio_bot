@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import AsyncGenerator, AsyncIterator
 
+import pytest
 import pytest_asyncio
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
@@ -14,6 +16,18 @@ from sqlalchemy.pool import NullPool
 
 from altegio_bot.models.models import Base, Client
 from altegio_bot.settings import Settings
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _silence_httpx_request_log() -> None:
+    """Keep webhook secrets out of test diagnostics.
+
+    httpx logs every request at INFO as a full URL, and webhook tests carry the
+    shared secret in the query string (``?token=``/``?secret=``). pytest prints
+    captured logs on failure and CI archives them, so that INFO line is a real
+    leak channel — one that no amount of masking inside the app can close.
+    """
+    logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 @pytest_asyncio.fixture(scope="session")

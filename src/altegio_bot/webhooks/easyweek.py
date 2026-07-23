@@ -9,6 +9,9 @@ payload и семантику доставок. Модуль сознатель�
   - URL вебхука полностью под нашим контролем в кабинете EasyWeek, поэтому тип
     события и токен живут в query:
       https://<host>/webhooks/easyweek?event=booking-created&token=<secret>
+    Секрет в query означает, что access-логи НЕ должны писать query string:
+    uvicorn запускается с --no-access-log, а собственный access-лог в main.py
+    пишет только путь (см. docs/easyweek/capture_runbook.md).
   - Аутентификация — только общий секрет через ``hmac.compare_digest``. Пустой
     ``easyweek_webhook_secret`` держит эндпоинт закрытым (403) даже при
     включённом флаге. Выключенная интеграция отвечает 404 (неотличимо от
@@ -16,13 +19,24 @@ payload и семантику доставок. Модуль сознатель�
   - Идемпотентности нет намеренно: каждая доставка (включая ретраи и Resend)
     становится своей строкой. Повторы анализируются по НЕуникальному индексу
     ``payload_hash``.
-  - Любая аутентифицированная доставка — даже с битым/не-JSON телом — получает
-    200 {"ok": true}, иначе EasyWeek засчитает доставку неуспешной и
-    автоматически отключит вебхук.
+  - Источник истины по содержимому — ``body_raw``: до 128 КиБ ИСХОДНЫХ байт.
+    ``payload`` (JSONB) — лишь их разбор, теряющий порядок ключей, пробелы,
+    формат чисел, дубли ключей и невалидный UTF-8.
 
-PII-безопасность: payload, текст тела, заголовки и значения query никогда не
-логируются; чувствительные query-параметры маскируются, а чувствительные
-заголовки выбрасываются до записи строки.
+Контракт кодов ответа:
+  Authenticated deliveries receive 200 after successful durable persistence.
+  Infrastructure persistence failures return 503 so EasyWeek can retry.
+
+То есть проблемы СОДЕРЖИМОГО (не-JSON, NUL, невалидный UTF-8, NaN, слишком
+большое тело) не являются ошибкой: такая доставка приводится к безопасному виду,
+СОХРАНЯЕТСЯ и получает 200. А вот недоступная БД, отсутствующая таблица или
+исчерпание пула — это 503 без записи: durable spool в PR-1 нет, поэтому ответить
+200 по незаписанной строке значило бы потерять доставку безвозвратно.
+
+PII-безопасность: payload, тело, заголовки и значения query никогда не
+логируются — включая ``event_hint``, который приходит из query и не валидируется.
+Чувствительные query-параметры маскируются, а чувствительные заголовки
+выбрасываются до записи строки.
 """
 
 from __future__ import annotations
@@ -31,24 +45,44 @@ import json
 import logging
 
 from fastapi import APIRouter, HTTPException, Request
+from sqlalchemy.exc import SQLAlchemyError
 
 from ..db import SessionLocal
 from ..models.models import EasyWeekEvent
 from ..perf import perf_log
 from ..settings import settings
-from .common import canonical_json_hash, mask_query, safe_headers, token_matches
+from .common import (
+    canonical_json_hash,
+    mask_query,
+    postgres_safe_text,
+    read_bounded_body,
+    safe_headers,
+    token_matches,
+)
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# Порог сырых байт тела до декодирования/парсинга. Данные capture —
-# исследовательские, а не безлимитное хранилище; факт обрезки фиксируется.
+# Порог сырых байт тела. Данные capture — исследовательские, а не безлимитное
+# хранилище; тело читается потоком, поэтому лимит ограничивает и пиковую память,
+# а не только объём записи. Факт превышения фиксируется в body_truncated,
+# фактический размер — в body_size_bytes.
 _MAX_BODY_BYTES = 128 * 1024
 
 # Заголовок-фолбэк для токена, если кастомные параметры EasyWeek окажутся в
 # заголовках, а не в query.
 _TOKEN_HEADER = "X-Altegio-Token"
+
+
+def _text_projection(raw: bytes) -> str:
+    """Postgres-безопасная текстовая проекция сырых байт.
+
+    ``errors="replace"`` чинит невалидный UTF-8, но НЕ трогает NUL (0x00 —
+    валидный UTF-8), который Postgres в TEXT не примет. Исходные байты не
+    теряются: они целиком лежат в ``body_raw``.
+    """
+    return postgres_safe_text(raw.decode("utf-8", errors="replace"))
 
 
 @router.post("/webhooks/easyweek")
@@ -84,61 +118,62 @@ async def easyweek_webhook(request: Request) -> dict[str, bool]:
         # Неверный/отсутствующий токен: отказываем и ничего не сохраняем.
         raise HTTPException(status_code=403, detail="Forbidden")
 
-    # 3) Чтение тела, парсинг и запись под одним perf-спаном. Capture никогда не
-    #    отвечает ошибкой: не-JSON/огромное/глубоко вложенное тело сохраняется
-    #    как текст, а не превращается в 400/500. Спан покрывает
+    # 3) Чтение тела, парсинг и запись под одним perf-спаном. Спан покрывает
     #    чтение+парсинг+хэш+вставку (на больших телах парсинг/хэш доминируют в
     #    латентности) и не логирует значений payload/query/тела.
     with perf_log("webhook", "easyweek_webhook"):
-        raw = await request.body()
+        # Потоковое чтение: в памяти держим максимум лимит + текущий chunk,
+        # независимо от того, сколько прислали.
+        raw, body_size_bytes, body_truncated = await read_bounded_body(request, limit=_MAX_BODY_BYTES)
+
         payload: dict = {}
         payload_hash: str | None = None
         body_text: str | None = None
-        body_truncated = False
 
-        if len(raw) > _MAX_BODY_BYTES:
-            # Слишком большое тело (JSON или нет): обрезаем и НЕ парсим. Это
-            # ограничивает CPU/RAM на произвольно больших или злонамеренных
-            # JSON, но факт крупной доставки всё равно фиксируется.
-            body_truncated = True
-            body_text = raw[:_MAX_BODY_BYTES].decode("utf-8", errors="replace")
+        if body_truncated:
+            # Тело не поместилось в лимит: парсить нечего (обрезанный JSON всё
+            # равно невалиден), а CPU/RAM на произвольно больших и
+            # злонамеренных телах ограничены. Сохраняем префикс и полный размер.
+            body_text = _text_projection(raw)
         else:
             try:
                 parsed = json.loads(raw)
             except (ValueError, TypeError, RecursionError):
-                # Не JSON. RecursionError (подкласс RuntimeError, который
-                # json.loads бросает на глубоко вложенном входе) ловим тоже,
-                # чтобы глубокое тело сохранилось, а не стало 500, который
-                # EasyWeek будет ретраить бесконечно.
-                body_text = raw.decode("utf-8", errors="replace")
+                # Не JSON. UnicodeDecodeError (невалидный UTF-8) — подкласс
+                # ValueError и ловится здесь же. RecursionError (подкласс
+                # RuntimeError, который json.loads бросает на глубоко вложенном
+                # входе) ловим тоже, чтобы глубокое тело сохранилось, а не стало
+                # 500, который EasyWeek будет ретраить бесконечно.
+                body_text = _text_projection(raw)
             else:
                 # Колонка JSONB типизирована как dict: не-dict корень
                 # оборачиваем, чтобы колонка и будущие читатели всегда видели
                 # объект.
                 candidate = parsed if isinstance(parsed, dict) else {"_non_dict_payload": parsed}
                 try:
-                    # strict=True отвергает NaN/Infinity и переполнение
-                    # экспоненты (например 1e1000000 -> inf): Postgres JSONB эти
-                    # токены не принимает, поэтому запись упала бы на commit и
-                    # доставка терялась бы на каждом ретрае. При отказе —
-                    # откат в сырой текст.
+                    # strict=True отвергает всё, что Postgres JSONB не примет:
+                    # NaN/Infinity, переполнение экспоненты, NUL внутри строк и
+                    # ключей, непарные суррогаты. Без этой проверки запись
+                    # упала бы на commit, и доставка терялась бы на каждом
+                    # ретрае. При отказе — откат в текстовую проекцию.
                     payload_hash = canonical_json_hash(candidate, strict=True)
-                except ValueError:
-                    body_text = raw.decode("utf-8", errors="replace")
+                except (ValueError, TypeError, RecursionError):
+                    body_text = _text_projection(raw)
                 else:
                     payload = candidate
 
-        # 4) Запись. Сначала маскируем чувствительные query-значения и
-        #    выбрасываем чувствительные заголовки.
+        # 4) Запись. Маскируем чувствительные query-значения, выбрасываем
+        #    чувствительные заголовки; и то и другое приводится к
+        #    Postgres-безопасному виду внутри хелперов.
         safe_query = mask_query(query)
 
         event_hint = query.get("event")
         if event_hint is not None:
-            event_hint = event_hint[:32]
+            event_hint = postgres_safe_text(event_hint)[:32]
 
         content_type = request.headers.get("content-type")
         if content_type is not None:
-            content_type = content_type[:128]
+            content_type = postgres_safe_text(content_type)[:128]
 
         # status получает значение "captured" из умолчания колонки модели.
         event = EasyWeekEvent(
@@ -146,26 +181,52 @@ async def easyweek_webhook(request: Request) -> dict[str, bool]:
             auth_via=auth_via,
             payload_hash=payload_hash,
             content_type=content_type,
+            body_raw=raw,
+            body_size_bytes=body_size_bytes,
             body_text=body_text,
             body_truncated=body_truncated,
             query=safe_query,
             headers=safe_headers(request, extra_deny={_TOKEN_HEADER.lower()}),
             payload=payload,
         )
-        async with SessionLocal() as session:
-            session.add(event)
-            await session.commit()
-            event_id = event.id
 
-    # Только метаданные строки: ни payload, ни тела, ни заголовков, ни query.
+        try:
+            async with SessionLocal() as session:
+                session.add(event)
+                try:
+                    await session.commit()
+                except SQLAlchemyError:
+                    await session.rollback()
+                    raise
+                event_id = event.id
+        except SQLAlchemyError as exc:
+            # Инфраструктурный отказ, а не дефект содержимого: все контентные
+            # проблемы уже приведены к безопасному виду выше. Логируем только
+            # класс исключения — его текст может содержать SQL-параметры, то
+            # есть payload и PII.
+            logger.error(
+                "easyweek capture persistence failed operation=%s error_type=%s "
+                "auth_via=%s body_truncated=%s body_size_bytes=%s",
+                "easyweek_webhook",
+                type(exc).__name__,
+                auth_via,
+                body_truncated,
+                body_size_bytes,
+            )
+            # 503 (а не 200) — строка не записана, а durable spool в PR-1 нет:
+            # пусть EasyWeek повторит доставку.
+            raise HTTPException(status_code=503, detail="Service Unavailable") from None
+
+    # Только безопасные метаданные строки. event_hint сюда НЕ попадает: это
+    # неотвалидированное значение из query.
     logger.info(
-        "easyweek capture stored id=%s event_hint=%s auth_via=%s body_truncated=%s",
+        "easyweek capture stored id=%s auth_via=%s body_truncated=%s body_size_bytes=%s",
         event_id,
-        event_hint,
         auth_via,
         body_truncated,
+        body_size_bytes,
     )
 
-    # 5) Аутентифицированную доставку всегда подтверждаем, чтобы EasyWeek не
-    #    отключил вебхук.
+    # 5) Доставка надёжно сохранена — подтверждаем, чтобы EasyWeek не отключил
+    #    вебхук за серию неуспешных ответов.
     return {"ok": True}

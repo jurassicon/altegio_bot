@@ -1,0 +1,136 @@
+"""Regression tests for the Altegio webhook endpoint after security hardening.
+
+Two behaviours are pinned here:
+  * the shared secret is compared in constant time and a non-ASCII token must
+    not raise (a raise would surface as 500 and distinguish "wrong secret" from
+    "server error");
+  * the stored ``AltegioEvent.query`` is masked, while authentication and the
+    dedupe key keep using the original unmasked query.
+
+Historical rows written before this change still contain the plaintext secret;
+cleaning them up is a separate operation with a backup, not part of these tests.
+"""
+
+from __future__ import annotations
+
+import json
+from unittest.mock import patch
+
+import pytest
+from httpx import ASGITransport, AsyncClient
+from sqlalchemy import select
+
+import altegio_bot.main as main_module
+from altegio_bot.main import app
+from altegio_bot.models.models import AltegioEvent
+from altegio_bot.settings import settings
+
+SECRET = "altegio-webhook-secret"
+URL = "/webhooks/altegio"
+
+
+def _payload() -> dict:
+    return {
+        "company_id": 1,
+        "resource": "record",
+        "resource_id": 42,
+        "status": "create",
+        "data": {"last_change_date": "2026-07-10T14:00:00+0000"},
+    }
+
+
+async def _rows(session_maker) -> list[AltegioEvent]:
+    async with session_maker() as session:
+        result = await session.execute(select(AltegioEvent).order_by(AltegioEvent.id))
+        return list(result.scalars().all())
+
+
+@pytest.mark.asyncio
+async def test_valid_secret_is_accepted_and_masked_in_storage(session_maker) -> None:
+    payload = _payload()
+
+    with patch.object(settings, "altegio_webhook_secret", SECRET):
+        with patch.object(main_module, "SessionLocal", session_maker):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as tc:
+                resp = await tc.post(
+                    f"{URL}?secret={SECRET}",
+                    content=json.dumps(payload),
+                    headers={"Content-Type": "application/json"},
+                )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True}
+
+    rows = await _rows(session_maker)
+    assert len(rows) == 1
+    # Only the persisted copy is masked; the payload itself is untouched.
+    assert rows[0].query["secret"] == "***"
+    assert rows[0].payload == payload
+    assert rows[0].company_id == 1
+    assert rows[0].resource_id == 42
+
+
+@pytest.mark.asyncio
+async def test_dedupe_still_collapses_identical_deliveries(session_maker) -> None:
+    """Masking must not touch the dedupe key: a repeat still yields one row."""
+    body = json.dumps(_payload())
+
+    with patch.object(settings, "altegio_webhook_secret", SECRET):
+        with patch.object(main_module, "SessionLocal", session_maker):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as tc:
+                for _ in range(2):
+                    resp = await tc.post(
+                        f"{URL}?secret={SECRET}",
+                        content=body,
+                        headers={"Content-Type": "application/json"},
+                    )
+                    assert resp.status_code == 200
+
+    assert len(await _rows(session_maker)) == 1
+
+
+@pytest.mark.asyncio
+async def test_wrong_secret_is_rejected(session_maker) -> None:
+    with patch.object(settings, "altegio_webhook_secret", SECRET):
+        with patch.object(main_module, "SessionLocal", session_maker):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as tc:
+                resp = await tc.post(
+                    f"{URL}?secret=wrong",
+                    content=json.dumps(_payload()),
+                    headers={"Content-Type": "application/json"},
+                )
+
+    assert resp.status_code == 403
+    assert await _rows(session_maker) == []
+
+
+@pytest.mark.asyncio
+async def test_missing_secret_is_rejected(session_maker) -> None:
+    """A None query param must be a plain 403, not an AttributeError-driven 500."""
+    with patch.object(settings, "altegio_webhook_secret", SECRET):
+        with patch.object(main_module, "SessionLocal", session_maker):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as tc:
+                resp = await tc.post(
+                    URL,
+                    content=json.dumps(_payload()),
+                    headers={"Content-Type": "application/json"},
+                )
+
+    assert resp.status_code == 403
+    assert await _rows(session_maker) == []
+
+
+@pytest.mark.asyncio
+async def test_non_ascii_secret_does_not_500(session_maker) -> None:
+    """hmac.compare_digest raises TypeError on non-ASCII str — we compare bytes."""
+    with patch.object(settings, "altegio_webhook_secret", SECRET):
+        with patch.object(main_module, "SessionLocal", session_maker):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as tc:
+                resp = await tc.post(
+                    f"{URL}?secret=пароль",
+                    content=json.dumps(_payload()),
+                    headers={"Content-Type": "application/json"},
+                )
+
+    assert resp.status_code == 403
+    assert await _rows(session_maker) == []

@@ -11,6 +11,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    LargeBinary,
     Numeric,
     String,
     Text,
@@ -108,7 +109,7 @@ class EasyWeekEvent(Base):
     # Жизненный цикл: "captured" -> ... Задел под inbox-воркер PR-4, который
     # будет забирать строки со статусом "captured". Сейчас вебхук пишет только
     # значение по умолчанию. index + server_default повторяют миграцию
-    # a1b2c3d4e5f6, чтобы схема, собранная из модели в тестах, совпадала с прод.
+    # easyweek_events, чтобы схема, собранная из модели в тестах, совпадала с прод.
     status: Mapped[str] = mapped_column(
         String(32),
         default="captured",
@@ -138,7 +139,24 @@ class EasyWeekEvent(Base):
 
     content_type: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
-    # Сырой текст тела — только когда распарсить JSON не удалось. Ограничен 128КБ.
+    # Источник истины по содержимому доставки: до 128 КиБ ИСХОДНЫХ байт, как их
+    # прислал EasyWeek. Заполняется для каждой аутентифицированной доставки,
+    # включая успешно разобранный JSON: JSONB — это уже разбор, он теряет
+    # порядок ключей, пробелы, формат чисел, дубли ключей и невалидный UTF-8.
+    # Nullable, чтобы ручная политика хранения могла обнулить байты, сохранив
+    # метаданные строки.
+    body_raw: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    # Полный размер полученной доставки в байтах — включая ту часть, которая не
+    # попала в body_raw из-за лимита.
+    body_size_bytes: Mapped[int] = mapped_column(
+        BigInteger,
+        default=0,
+        server_default=text("0"),
+    )
+
+    # Текстовая проекция тела для случаев, когда сохранить его как JSONB не
+    # удалось (не JSON, NUL, суррогаты, слишком большое тело). Это удобство для
+    # чтения: байтовый источник истины — body_raw. Ограничена теми же 128 КиБ.
     body_text: Mapped[str | None] = mapped_column(Text, nullable=True)
     body_truncated: Mapped[bool] = mapped_column(
         Boolean,

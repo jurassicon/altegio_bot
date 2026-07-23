@@ -3,10 +3,12 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import time
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
 from sqlalchemy.exc import IntegrityError
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from .db import SessionLocal
 from .models import AltegioEvent
@@ -15,7 +17,7 @@ from .ops.router import login_router as ops_login_router
 from .ops.router import router as ops_router
 from .settings import settings
 from .webhooks.chatwoot import router as chatwoot_router
-from .webhooks.common import safe_headers
+from .webhooks.common import mask_query, safe_headers, token_matches
 from .webhooks.easyweek import router as easyweek_router
 from .webhooks.whatsapp import router as whatsapp_router
 
@@ -23,6 +25,8 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
+
+access_logger = logging.getLogger("altegio_bot.access")
 
 app = FastAPI(title=settings.app_name)
 app.include_router(whatsapp_router)
@@ -33,6 +37,38 @@ app.include_router(campaigns_router)  # protected: /ops/campaigns/ (JSON) — р
 # чтобы точные маршруты JSON API (/runs, /runs/{id}, /dashboard/monthly) имели приоритет
 # перед wildcard HTML-маршрутами (/campaigns/{run_id: int})
 app.include_router(ops_router)  # protected: /ops/ (HTML dashboard)
+
+
+class AccessLogMiddleware(BaseHTTPMiddleware):
+    """Access-лог БЕЗ query string.
+
+    Стандартный access-лог uvicorn пишет полный request target вместе с query, а
+    вебхуки носят секрет именно там (``/webhooks/easyweek?token=...``,
+    ``/webhooks/altegio?secret=...``). Поэтому uvicorn в проде запускается с
+    ``--no-access-log`` (Dockerfile / docker-compose.yml), а наблюдаемость даёт
+    этот middleware: метод, ПУТЬ, статус и длительность — и ничего больше.
+    Reverse proxy обязан быть настроен так же (см.
+    docs/easyweek/capture_runbook.md): без ``$request``, ``$request_uri``, ``$args``.
+    """
+
+    async def dispatch(self, request: Request, call_next):
+        start = time.perf_counter()
+        status_code = 500  # если обработчик упадёт, в лог попадёт именно это
+        try:
+            response = await call_next(request)
+            status_code = response.status_code
+            return response
+        finally:
+            access_logger.info(
+                "%s %s %s %.1fms",
+                request.method,
+                request.url.path,
+                status_code,
+                (time.perf_counter() - start) * 1000,
+            )
+
+
+app.add_middleware(AccessLogMiddleware)
 
 
 def _make_dedupe_key(payload: dict[str, Any], query: dict[str, Any]) -> str:
@@ -70,10 +106,12 @@ async def health() -> dict[str, bool]:
 
 @app.post("/webhooks/altegio")
 async def altegio_webhook(request: Request) -> dict[str, bool]:
-    # 1) проверяем секрет (в логах это query param 'secret')
+    # 1) проверяем секрет (query param 'secret'; в access-лог query не попадает)
     query = dict(request.query_params)
     provided = query.get("secret")
-    if provided != settings.altegio_webhook_secret:
+    # constant-time сравнение вместо `!=`; token_matches кодирует в utf-8, чтобы
+    # не-ASCII секрет не бросал TypeError (это стало бы 500 вместо 403).
+    if provided is None or not token_matches(provided, settings.altegio_webhook_secret):
         raise HTTPException(status_code=403, detail="Invalid webhook secret")
 
     # 2) читаем payload
@@ -91,7 +129,11 @@ async def altegio_webhook(request: Request) -> dict[str, bool]:
         resource=payload.get("resource"),
         resource_id=payload.get("resource_id"),
         event_status=payload.get("status"),
-        query=query,
+        # Маскируем только СОХРАНЯЕМУЮ копию: авторизация выше и _make_dedupe_key
+        # ниже работают с оригинальным query, поэтому дедупликация не меняется.
+        # Исторические строки этой правкой не чинятся — их чистка отдельная
+        # операция с бэкапом.
+        query=mask_query(query),
         headers=safe_headers(request),
         payload=payload,
     )
