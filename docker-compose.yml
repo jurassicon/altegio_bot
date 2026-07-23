@@ -24,7 +24,12 @@ services:
   altegio-api:
     build: .
     restart: always
-    env_file: .env
+    env_file:
+      - .env
+      # Секреты EasyWeek. required: false обязателен — без него отсутствие файла
+      # на сервере уронит деплой всего сервиса.
+      - path: easyweek.env
+        required: false
     ports:
       - "8000:8000"
     depends_on:

@@ -81,6 +81,76 @@ class AltegioEvent(Base):
     payload: Mapped[dict] = mapped_column(JSONB, default=dict)
 
 
+class EasyWeekEvent(Base):
+    """Сырая запись доставки вебхука EasyWeek.
+
+    Research-grade: каждая аутентифицированная доставка — включая ретраи, Resend
+    и не-JSON тела — становится отдельной строкой. Никакой обработки,
+    нормализации и дедупликации. Повторы анализируются через НЕуникальный индекс
+    по ``payload_hash``; unique-констрейнт отсутствует сознательно, чтобы ретраи
+    сохранялись как данные.
+    """
+
+    __tablename__ = "easyweek_events"
+
+    id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        autoincrement=True,
+    )
+
+    received_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        index=True,
+    )
+
+    # Жизненный цикл: "captured" -> ... Задел под inbox-воркер PR-4, который
+    # будет забирать строки со статусом "captured". Сейчас вебхук пишет только
+    # значение по умолчанию. index + server_default повторяют миграцию
+    # a1b2c3d4e5f6, чтобы схема, собранная из модели в тестах, совпадала с прод.
+    status: Mapped[str] = mapped_column(
+        String(32),
+        default="captured",
+        server_default=text("'captured'"),
+        index=True,
+    )
+
+    # Значение query-параметра ?event= в том виде, как оно настроено в URL
+    # вебхука. Валидации имён триггеров на этапе capture нет.
+    event_hint: Mapped[str | None] = mapped_column(
+        String(32),
+        index=True,
+        nullable=True,
+    )
+
+    # Откуда пришёл валидный токен: "query" | "header".
+    auth_via: Mapped[str | None] = mapped_column(String(16), nullable=True)
+
+    # sha256 канонизированного JSON-payload (sort_keys, separators=(",", ":")).
+    # NULL, когда тело не JSON. Индексируется, но НЕ уникален: повторные
+    # доставки делят хэш и сохраняются обе.
+    payload_hash: Mapped[str | None] = mapped_column(
+        String(64),
+        index=True,
+        nullable=True,
+    )
+
+    content_type: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+    # Сырой текст тела — только когда распарсить JSON не удалось. Ограничен 128КБ.
+    body_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    body_truncated: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+        server_default=text("false"),
+    )
+
+    query: Mapped[dict] = mapped_column(JSONB, default=dict)  # секреты замаскированы
+    headers: Mapped[dict] = mapped_column(JSONB, default=dict)  # только безопасные заголовки
+    payload: Mapped[dict] = mapped_column(JSONB, default=dict)  # распарсенный JSON или {}
+
+
 class SmartTestRun(Base):
     """Record of a smart-test execution for idempotency and auditing."""
 

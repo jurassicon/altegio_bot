@@ -13,6 +13,9 @@ env/
 .env
 .env.*
 !.env.example
+# Секреты EasyWeek живут отдельным файлом. Паттерны выше его НЕ покрывают:
+# `easyweek.env` не начинается с `.env`. Трекается только .example-шаблон.
+easyweek.env
 
 # ===== Build / packaging =====
 build/

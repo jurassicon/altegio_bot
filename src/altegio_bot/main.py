@@ -15,6 +15,8 @@ from .ops.router import login_router as ops_login_router
 from .ops.router import router as ops_router
 from .settings import settings
 from .webhooks.chatwoot import router as chatwoot_router
+from .webhooks.common import safe_headers
+from .webhooks.easyweek import router as easyweek_router
 from .webhooks.whatsapp import router as whatsapp_router
 
 logging.basicConfig(
@@ -25,23 +27,12 @@ logging.basicConfig(
 app = FastAPI(title=settings.app_name)
 app.include_router(whatsapp_router)
 app.include_router(chatwoot_router)
+app.include_router(easyweek_router)  # public: POST /webhooks/easyweek (token in query)
 app.include_router(ops_login_router)  # public: /ops/login, /ops/logout
 app.include_router(campaigns_router)  # protected: /ops/campaigns/ (JSON) — регистрируем до ops_router,
 # чтобы точные маршруты JSON API (/runs, /runs/{id}, /dashboard/monthly) имели приоритет
 # перед wildcard HTML-маршрутами (/campaigns/{run_id: int})
 app.include_router(ops_router)  # protected: /ops/ (HTML dashboard)
-
-
-def _safe_headers(request: Request) -> dict[str, str]:
-    # Не сохраняем потенциально чувствительные заголовки
-    deny = {"authorization", "cookie"}
-    out: dict[str, str] = {}
-    for key, value in request.headers.items():
-        low_key = key.lower()
-        if low_key in deny:
-            continue
-        out[key] = value
-    return out
 
 
 def _make_dedupe_key(payload: dict[str, Any], query: dict[str, Any]) -> str:
@@ -101,7 +92,7 @@ async def altegio_webhook(request: Request) -> dict[str, bool]:
         resource_id=payload.get("resource_id"),
         event_status=payload.get("status"),
         query=query,
-        headers=_safe_headers(request),
+        headers=safe_headers(request),
         payload=payload,
     )
 

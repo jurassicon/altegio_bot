@@ -1303,4 +1303,7 @@ def test_single_alembic_head() -> None:
     cfg.set_main_option("script_location", str(Path(__file__).resolve().parents[3] / "alembic"))
     script = ScriptDirectory.from_config(cfg)
     heads = list(script.get_heads())
-    assert heads == ["e9a7c6b5d4f3"], f"Expected single head e9a7c6b5d4f3, got {heads}"
+    # Assert the invariant (one head), not a specific revision id: pinning the id
+    # made every later migration fail this unrelated test. The head moves with
+    # each additive migration; a branch point is what must never happen.
+    assert len(heads) == 1, f"Expected exactly one Alembic head, got {heads}"
