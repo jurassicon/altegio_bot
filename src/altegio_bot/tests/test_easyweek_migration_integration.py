@@ -44,6 +44,29 @@ _HEAD_REVISION = "8705ec49cc73"
 _TEMP_DB_PREFIX = "altegio_migtest_"
 
 
+_REMEDY = (
+    "Grant CREATEDB to the DATABASE_URL role, or point ALTEGIO_MIGTEST_DATABASE_URL at a "
+    "disposable PostgreSQL, e.g.: docker run -d --name ew-mig -e POSTGRES_PASSWORD=postgres "
+    "-p 55433:5432 postgres:16-alpine && "
+    "ALTEGIO_MIGTEST_DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:55433/postgres "
+    "uv run pytest src/altegio_bot/tests/test_easyweek_migration_integration.py"
+)
+
+
+def _unavailable(reason: str) -> None:
+    """Skip locally, but FAIL where the test is declared mandatory.
+
+    Migration compatibility is a CI responsibility: if the disposable database
+    cannot be created there, a green skip would silently retire the only check
+    that proves an early-revision environment gets the raw-body columns. CI sets
+    ALTEGIO_REQUIRE_MIGTEST=1 (a project-specific flag rather than the generic
+    CI=true, so the intent is explicit and greppable).
+    """
+    if os.environ.get("ALTEGIO_REQUIRE_MIGTEST") == "1":
+        pytest.fail(f"Migration integration test is required (ALTEGIO_REQUIRE_MIGTEST=1) but {reason}. {_REMEDY}")
+    pytest.skip(f"{reason}. {_REMEDY}")
+
+
 def _server_url() -> str:
     """URL of the maintenance database on the server that will host the temp DB."""
     base = os.environ.get("ALTEGIO_MIGTEST_DATABASE_URL") or Settings().database_url
@@ -87,21 +110,15 @@ async def temp_db_url():
     try:
         admin = create_async_engine(_server_url(), isolation_level="AUTOCOMMIT")
     except Exception as exc:  # pragma: no cover - configuration problem
-        pytest.skip(f"PostgreSQL not configured for integration tests: {exc}")
+        _unavailable(f"PostgreSQL not configured for integration tests: {type(exc).__name__}: {exc}")
 
     try:
         async with admin.connect() as conn:
             await conn.execute(text(f'CREATE DATABASE "{name}"'))
     except Exception as exc:
         await admin.dispose()
-        pytest.skip(
-            "Cannot create a throwaway database for the Alembic compatibility test: "
-            f"{type(exc).__name__}: {exc}. "
-            "Fix by granting CREATEDB to the DATABASE_URL role, or point "
-            "ALTEGIO_MIGTEST_DATABASE_URL at a disposable PostgreSQL, e.g.: "
-            "docker run -d --name ew-mig -e POSTGRES_PASSWORD=postgres -p 55433:5432 postgres:16-alpine "
-            "&& ALTEGIO_MIGTEST_DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:55433/postgres "
-            "uv run pytest src/altegio_bot/tests/test_easyweek_migration_integration.py"
+        _unavailable(
+            f"Cannot create a throwaway database for the Alembic compatibility test: {type(exc).__name__}: {exc}"
         )
 
     try:

@@ -32,6 +32,9 @@ from altegio_bot.db import SessionLocal
 from altegio_bot.models.models import WhatsAppEvent
 from altegio_bot.settings import settings
 from altegio_bot.webhooks.common import (
+    PG_BIGINT_MAX,
+    PG_BIGINT_MIN,
+    bounded_dedupe_key,
     mask_query,
     postgres_safe_json_value,
     safe_headers,
@@ -85,14 +88,22 @@ def _verify_signature(body: bytes, signature: str | None) -> bool:
 
 
 def _coerce_int(value: object) -> int | None:
-    """Coerce a Chatwoot numeric id (int or digit string) to int, else None."""
+    """Coerce a Chatwoot numeric id (int or digit string) to int, else None.
+
+    The result goes into a BIGINT column, so a value outside the PostgreSQL
+    BIGINT range is rejected too: it would abort the INSERT rather than being
+    silently clamped. The full payload is still persisted as JSONB, so a NULL
+    projection loses nothing.
+    """
     if isinstance(value, bool):
         return None
     if isinstance(value, int):
-        return value
-    if isinstance(value, str) and value.strip().isdigit():
-        return int(value.strip())
-    return None
+        candidate = value
+    elif isinstance(value, str) and value.strip().isdigit():
+        candidate = int(value.strip())
+    else:
+        return None
+    return candidate if PG_BIGINT_MIN <= candidate <= PG_BIGINT_MAX else None
 
 
 def _parse_timestamp(raw: object) -> int:
@@ -127,7 +138,9 @@ async def chatwoot_ingest(request: Request) -> JSONResponse:
     logger.info("chatwoot_webhook: event=%s", safe_log_value(event_type, limit=64))
 
     if event_type != "message_created":
-        return JSONResponse({"ok": True, "skipped": f"event={event_type}"})
+        # Стабильный reason code: отражать sender-controlled значение обратно
+        # клиенту нельзя — оно может быть некодируемым и уронить JSONResponse.
+        return JSONResponse({"ok": True, "skipped": "unsupported_event"})
 
     message_type = payload.get("message_type")
 
@@ -155,7 +168,7 @@ async def chatwoot_ingest(request: Request) -> JSONResponse:
             return JSONResponse({"ok": True, "skipped": "private_note"})
 
         if content_type in _SKIP_CONTENT_TYPES:
-            return JSONResponse({"ok": True, "skipped": f"content_type={content_type}"})
+            return JSONResponse({"ok": True, "skipped": "unsupported_content_type"})
 
         # Only relay if feature flag is on and sender is a human operator.
         if settings.chatwoot_operator_relay_enabled and sender_type in _HUMAN_SENDER_TYPES:
@@ -175,9 +188,11 @@ async def chatwoot_ingest(request: Request) -> JSONResponse:
             safe_log_value(conv_id, limit=32),
             safe_log_value(msg_id, limit=32),
         )
-        return JSONResponse({"ok": True, "skipped": f"message_type={message_type}"})
+        # Covers both "relay flag is off" and "sender is not a human operator"
+        # (e.g. agent_bot). Stable code — never the sender-controlled value.
+        return JSONResponse({"ok": True, "skipped": "outgoing_not_relayed"})
 
-    return JSONResponse({"ok": True, "skipped": f"message_type={message_type}"})
+    return JSONResponse({"ok": True, "skipped": "unsupported_message_type"})
 
 
 async def _ingest_incoming(
@@ -236,13 +251,17 @@ async def _ingest_incoming(
         },
     }
 
-    dedupe_key = f"chatwoot:{chatwoot_conversation_id}:{chatwoot_message_id}"
+    # Составляющие приходят из тела: они могут быть нечисловыми, содержать NUL
+    # или быть длиннее VARCHAR(128). bounded_dedupe_key даёт побайтово тот же
+    # ключ для корректных коротких id и безопасный хэш-хвост для остальных.
+    dedupe_key = bounded_dedupe_key("chatwoot", chatwoot_conversation_id, chatwoot_message_id)
 
     return await _store_event(
         request=request,
         dedupe_key=dedupe_key,
         normalized_payload=normalized_payload,
-        chatwoot_conversation_id=chatwoot_conversation_id,
+        # BIGINT-колонки: невалидный id даёт NULL вместо падения INSERT.
+        chatwoot_conversation_id=_coerce_int(chatwoot_conversation_id),
         chatwoot_message_id=_coerce_int(chatwoot_message_id),
         # Только технические идентификаторы: телефон и текст сообщения — PII и в
         # логи не попадают (сами данные сохраняются в БД, где доступ ограничен).
@@ -307,7 +326,7 @@ async def _ingest_operator_outgoing(
         },
     }
 
-    dedupe_key = f"chatwoot_out:{chatwoot_conversation_id}:{chatwoot_message_id}"
+    dedupe_key = bounded_dedupe_key("chatwoot_out", chatwoot_conversation_id, chatwoot_message_id)
 
     # Ни телефона получателя, ни имени агента — это PII.
     logger.info(
@@ -320,7 +339,7 @@ async def _ingest_operator_outgoing(
         request=request,
         dedupe_key=dedupe_key,
         normalized_payload=normalized_payload,
-        chatwoot_conversation_id=chatwoot_conversation_id,
+        chatwoot_conversation_id=_coerce_int(chatwoot_conversation_id),
         chatwoot_message_id=_coerce_int(chatwoot_message_id),
         log_ctx={
             "conv_id": chatwoot_conversation_id,

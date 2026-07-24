@@ -31,7 +31,13 @@ _META_SIGNATURE_HEADERS = frozenset({"x-hub-signature-256", "x-hub-signature"})
 
 
 def _payload_dedupe_key(payload: dict[str, Any]) -> str:
-    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    # ensure_ascii=True is intentional and load-bearing (it is also the json
+    # default, but stated explicitly so it cannot be "cleaned up" away): it
+    # escapes lone surrogates into ASCII, so .encode("utf-8") below cannot raise
+    # UnicodeEncodeError on hostile webhook content. Do NOT switch this to
+    # canonical_json_hash — that helper uses ensure_ascii=False and a different
+    # historical canonical form, so it would change every existing dedupe key.
+    raw = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
     return f"wa:{digest}"
 
@@ -156,6 +162,12 @@ async def whatsapp_ingest(request: Request) -> Response:
                 session.add(evt)
                 await session.flush()
 
+            # phone_number_id сознательно НЕ возвращается: значение приходит из
+            # тела и может быть некодируемым (непарный суррогат) — тогда
+            # JSONResponse упал бы уже ПОСЛЕ успешного commit, отправитель
+            # получил бы 500, а ретрай попадал бы в ту же ошибку на duplicate-
+            # ветке. Технического ответа ниже достаточно; сам pni сохранён в
+            # payload и в error.
             return JSONResponse(
                 {
                     "ok": True,
@@ -163,7 +175,6 @@ async def whatsapp_ingest(request: Request) -> Response:
                     "ignored": ignored,
                     "id": evt.id,
                     "dedupe_key": dedupe_key,
-                    "phone_number_id": pni,
                 }
             )
 
@@ -181,6 +192,5 @@ async def whatsapp_ingest(request: Request) -> Response:
                     "ignored": ignored,
                     "id": existing_id,
                     "dedupe_key": dedupe_key,
-                    "phone_number_id": pni,
                 }
             )

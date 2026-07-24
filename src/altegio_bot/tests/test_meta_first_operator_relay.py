@@ -497,7 +497,8 @@ async def test_webhook_activity_content_type_skipped(session_maker) -> None:
             )
 
         assert resp.status_code == 200
-        assert resp.json().get("skipped") == "content_type=activity"
+        # Stable reason code instead of echoing the sender-controlled value.
+        assert resp.json().get("skipped") == "unsupported_content_type"
 
     finally:
         cw_module.SessionLocal = original_session_local
@@ -555,7 +556,7 @@ async def test_loop_prevention_bot_outgoing_not_relayed(
         data = resp.json()
         assert resp.status_code == 200
         # Must be skipped — not stored as operator relay.
-        assert data.get("skipped") == "message_type=1"
+        assert data.get("skipped") == "outgoing_not_relayed"
 
     finally:
         cw_module.SessionLocal = original_session_local

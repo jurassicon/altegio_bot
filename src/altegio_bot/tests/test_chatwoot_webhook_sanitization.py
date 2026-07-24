@@ -349,3 +349,172 @@ async def test_dedupe_semantics_unchanged(session_maker, caplog) -> None:
     assert first.json()["duplicate"] is False
     assert second.json()["duplicate"] is True
     assert len(await _rows(session_maker)) == 1
+
+
+# ---------------------------------------------------------------------------
+# Non-finite JSON and malformed scalar ids
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("literal", ["NaN", "Infinity", "-Infinity"])
+@pytest.mark.asyncio
+async def test_non_finite_json_is_persisted_safely(session_maker, literal: str) -> None:
+    body = (
+        '{"event":"message_created","id":5001,"content":"hi","message_type":0,'
+        '"created_at":1234567890,"conversation":{"id":501},'
+        '"sender":{"phone_number":"+4915112345678"},"account":{"id":2},'
+        '"score":' + literal + "}"
+    ).encode()
+
+    resp = await _post_raw(session_maker, body)
+
+    assert resp.status_code == 200
+    rows = await _rows(session_maker)
+    assert len(rows) == 1
+    json.dumps(rows[0].payload, allow_nan=False)
+
+
+@pytest.mark.asyncio
+async def test_non_finite_json_still_passes_hmac(session_maker, monkeypatch) -> None:
+    monkeypatch.setattr(settings, "chatwoot_webhook_secret", "hmac-secret")
+    body = (
+        '{"event":"message_created","id":5001,"content":"hi","message_type":0,'
+        '"created_at":1234567890,"conversation":{"id":501},'
+        '"sender":{"phone_number":"+4915112345678"},"account":{"id":2},'
+        '"score":NaN}'
+    ).encode()
+    signature = hmac.new(b"hmac-secret", body, hashlib.sha256).hexdigest()
+
+    resp = await _post_raw(
+        session_maker,
+        body,
+        headers={"Content-Type": "application/json", "X-Chatwoot-Signature": signature},
+    )
+
+    assert resp.status_code == 200
+    assert len(await _rows(session_maker)) == 1
+
+
+@pytest.mark.asyncio
+async def test_nul_in_message_id_does_not_break_insert(session_maker) -> None:
+    payload = _incoming()
+    payload["id"] = f"x{NUL}y"
+
+    resp = await _post_raw(session_maker, json.dumps(payload).encode())
+
+    assert resp.status_code == 200
+    row = (await _rows(session_maker))[0]
+    # Non-numeric id → NULL BIGINT projection, key still safe and bounded.
+    assert row.chatwoot_message_id is None
+    assert NUL not in row.dedupe_key
+    assert len(row.dedupe_key) <= 128
+
+
+@pytest.mark.asyncio
+async def test_surrogate_in_message_id_does_not_break_insert(session_maker) -> None:
+    payload = _incoming()
+    payload["id"] = f"x{LONE_SURROGATE}y"
+
+    resp = await _post_raw(session_maker, json.dumps(payload).encode())
+
+    assert resp.status_code == 200
+    row = (await _rows(session_maker))[0]
+    row.dedupe_key.encode("utf-8")
+    assert row.chatwoot_message_id is None
+
+
+@pytest.mark.asyncio
+async def test_very_long_message_id_is_bounded(session_maker) -> None:
+    payload = _incoming()
+    payload["id"] = "9" * 500
+
+    resp = await _post_raw(session_maker, json.dumps(payload).encode())
+
+    assert resp.status_code == 200
+    row = (await _rows(session_maker))[0]
+    assert len(row.dedupe_key) <= 128
+
+
+@pytest.mark.asyncio
+async def test_non_numeric_conversation_id_becomes_null(session_maker) -> None:
+    payload = _incoming()
+    payload["conversation"]["id"] = "not-an-integer"
+
+    resp = await _post_raw(session_maker, json.dumps(payload).encode())
+
+    assert resp.status_code == 200
+    row = (await _rows(session_maker))[0]
+    assert row.chatwoot_conversation_id is None
+
+
+@pytest.mark.asyncio
+async def test_out_of_range_ids_become_null(session_maker) -> None:
+    payload = _incoming()
+    payload["conversation"]["id"] = 2**70
+    payload["id"] = 2**70
+
+    resp = await _post_raw(session_maker, json.dumps(payload).encode())
+
+    assert resp.status_code == 200
+    row = (await _rows(session_maker))[0]
+    assert row.chatwoot_conversation_id is None
+    assert row.chatwoot_message_id is None
+
+
+@pytest.mark.asyncio
+async def test_valid_ids_keep_the_historical_dedupe_key(session_maker) -> None:
+    payload = _incoming(conversation_id=99, message_id=1)
+
+    resp = await _post_raw(session_maker, json.dumps(payload).encode())
+
+    assert resp.status_code == 200
+    row = (await _rows(session_maker))[0]
+    assert row.dedupe_key == "chatwoot:99:1"
+    assert row.chatwoot_conversation_id == 99
+    assert row.chatwoot_message_id == 1
+
+
+# ---------------------------------------------------------------------------
+# Responses must never reflect sender-controlled content
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "hostile_event",
+    [LONE_SURROGATE, f"a{NUL}b", "e" * 5000, "some_other_event"],
+)
+@pytest.mark.asyncio
+async def test_unsupported_event_returns_a_stable_reason(session_maker, hostile_event: str) -> None:
+    payload = _incoming()
+    payload["event"] = hostile_event
+
+    resp = await _post_raw(session_maker, json.dumps(payload).encode())
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data == {"ok": True, "skipped": "unsupported_event"}
+    assert hostile_event[:20] not in resp.text
+
+
+@pytest.mark.parametrize("hostile_type", [LONE_SURROGATE, f"a{NUL}b", "t" * 5000, 99])
+@pytest.mark.asyncio
+async def test_unsupported_message_type_returns_a_stable_reason(session_maker, hostile_type) -> None:
+    payload = _incoming()
+    payload["message_type"] = hostile_type
+
+    resp = await _post_raw(session_maker, json.dumps(payload).encode())
+
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True, "skipped": "unsupported_message_type"}
+
+
+@pytest.mark.asyncio
+async def test_unsupported_content_type_returns_a_stable_reason(session_maker, monkeypatch) -> None:
+    monkeypatch.setattr(settings, "chatwoot_operator_relay_enabled", True)
+    payload = _operator_payload()
+    payload["content_type"] = "activity"
+
+    resp = await _post_raw(session_maker, json.dumps(payload).encode())
+
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True, "skipped": "unsupported_content_type"}

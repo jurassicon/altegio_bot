@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import math
 from collections.abc import Iterable
 
 from fastapi import Request
@@ -93,18 +94,37 @@ def postgres_safe_text(value: str) -> str:
 def postgres_safe_json_value(value: object) -> object:
     """Рекурсивно приводит разобранный JSON к виду, который примет Postgres JSONB.
 
-    Строки (и строковые ключи) прогоняются через :func:`postgres_safe_text`;
-    контейнеры обходятся рекурсивно; числа, bool и None остаются как есть.
-    Исходный объект НЕ мутируется — возвращается новая структура, потому что
-    оригинал ещё нужен для дедуп-ключей и уже посчитанных подписей.
+    Контракт: результат ГАРАНТИРОВАННО сериализуется через
+    ``json.dumps(..., allow_nan=False)`` и переживает INSERT в JSONB. Это нужно
+    для сохраняемой проекции payload: тело вебхука контролируется отправителем,
+    ``json.loads`` спокойно принимает и NUL (``\\u0000``), и непарные суррогаты, и
+    нестандартные литералы ``NaN``/``Infinity``/``-Infinity``, а INSERT в JSONB
+    на них падает — то есть один дефектный вебхук иначе превращается в
+    бесконечную серию 500 на каждом ретрае.
 
-    Нужно для сохраняемой проекции payload: тело вебхука контролируется
-    отправителем, ``json.loads`` спокойно принимает и NUL (``\\u0000``), и
-    непарные суррогаты, а INSERT в JSONB на них падает — то есть один дефектный
-    вебхук иначе превращается в бесконечную серию 500 на каждом ретрае.
+    Правила преобразования:
+      * ``str`` (в том числе строковые ключи) → :func:`postgres_safe_text`;
+      * не-finite ``float`` (NaN / ±Infinity) → ``None``. Политика единая для
+        всех эндпоинтов, использующих этот helper: значение недоступно для JSONB,
+        а ``None`` — единственное представление, которое не выдаёт себя за
+        осмысленное число и не ломает читателей колонки;
+      * ``dict``/``list``/``tuple`` — рекурсивно (tuple → list);
+      * ``int``, ``bool``, ``None`` и finite ``float`` — без изменений.
+
+    Исходный объект НЕ мутируется: оригинал ещё нужен для дедуп-ключей и уже
+    посчитанных подписей.
+
+    Родственный :func:`postgres_safe_json_hash` решает ту же задачу иначе — он
+    ОТКЛОНЯЕТ такое значение вместо преобразования. Это осознанное различие:
+    EasyWeek-capture хранит исходные байты в ``body_raw`` и может позволить себе
+    откатиться в текст, а у Altegio/Chatwoot/WhatsApp сырой колонки нет, поэтому
+    единственный способ не потерять доставку — сохранить безопасную проекцию.
     """
     if isinstance(value, str):
         return postgres_safe_text(value)
+    if isinstance(value, float) and not math.isfinite(value):
+        # NaN / Infinity / -Infinity: Postgres JSONB их не принимает.
+        return None
     if isinstance(value, dict):
         return {
             (postgres_safe_text(k) if isinstance(k, str) else k): postgres_safe_json_value(v) for k, v in value.items()
@@ -113,6 +133,67 @@ def postgres_safe_json_value(value: object) -> object:
         # tuple → list: JSON-совместимое представление.
         return [postgres_safe_json_value(item) for item in value]
     return value
+
+
+# Границы целочисленных типов PostgreSQL. Значение вне диапазона не «обрежется»,
+# а уронит INSERT, поэтому проверяем до записи.
+PG_INT_MIN, PG_INT_MAX = -(2**31), 2**31 - 1
+PG_BIGINT_MIN, PG_BIGINT_MAX = -(2**63), 2**63 - 1
+
+
+def optional_int(value: object, *, bigint: bool = True) -> int | None:
+    """Приводит sender-controlled значение к int для числовой колонки, иначе None.
+
+    ``bool`` НЕ считается целым числом (в Python ``True`` — это ``int``, но в
+    колонке ``company_id`` он был бы бессмыслицей). Строка принимается, только
+    если это целое число целиком. Значение вне диапазона колонки отбрасывается:
+    Postgres на нём падает, а доставку терять нельзя — payload всё равно
+    сохраняется целиком в JSONB, поэтому NULL в scalar-проекции ничего не теряет.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        candidate = value
+    elif isinstance(value, str):
+        text = value.strip()
+        try:
+            candidate = int(text)
+        except (TypeError, ValueError):
+            return None
+    else:
+        return None
+
+    low, high = (PG_BIGINT_MIN, PG_BIGINT_MAX) if bigint else (PG_INT_MIN, PG_INT_MAX)
+    return candidate if low <= candidate <= high else None
+
+
+def bounded_text(value: object, *, limit: int) -> str | None:
+    """Postgres-безопасная строковая проекция, обрезанная под длину колонки.
+
+    ``None`` остаётся ``None``; не-строки приводятся к ``str`` (числовой
+    ``resource_id``-подобный ввод не должен ронять запись). Обрезка идёт ПОСЛЕ
+    санитизации, чтобы длина считалась по тому, что реально уедет в колонку.
+    """
+    if value is None:
+        return None
+    text = value if isinstance(value, str) else str(value)
+    return postgres_safe_text(text)[:limit]
+
+
+def bounded_dedupe_key(prefix: str, *parts: object, limit: int = 128) -> str:
+    """Собирает dedupe-ключ, гарантированно помещающийся в ``VARCHAR(128)``.
+
+    Части приводятся к Postgres-безопасному тексту. Если ключ не влезает в
+    колонку (sender-controlled id может быть сколь угодно длинным), хвост
+    заменяется на sha256 — ключ остаётся детерминированным и уникальным, но
+    ограниченным. Для корректных коротких id результат ПОБАЙТОВО совпадает с
+    прежней f-string, поэтому исторические ключи не меняются.
+    """
+    key = ":".join([prefix, *(postgres_safe_text(str(p)) for p in parts)])
+    if len(key) <= limit:
+        return key
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    return f"{prefix}:sha256:{digest}"[:limit]
 
 
 # Маркер, которым помечается обрезанное значение в логах.

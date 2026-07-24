@@ -176,7 +176,9 @@ async def test_outgoing_message_skipped(session_maker) -> None:
             )
             assert resp.status_code == 200
             data = resp.json()
-            assert data.get("skipped") == "message_type=1"
+            # Stable reason code: the response no longer echoes the
+            # sender-controlled message_type back to the caller.
+            assert data.get("skipped") == "outgoing_not_relayed"
 
     finally:
         cw_module.SessionLocal = original_session_local

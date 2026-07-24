@@ -273,6 +273,66 @@ WHERE payload_hash IS NOT NULL GROUP BY 1 HAVING count(*) > 1;
 
 ---
 
+## 4.1. Chatwoot message tracing (расследование конкретной доставки)
+
+Телефон, текст сообщения и имя агента **сознательно удалены** из
+application-логов — это PII, а логи читает и хранит больше людей и систем, чем
+БД. Поэтому расследование доставки теперь двухшаговое.
+
+**Шаг 1 — в логах ищем только технические идентификаторы:**
+
+| Что искать | Пример |
+|---|---|
+| `conv_id` | `conv_id="501"` |
+| `msg_id` | `msg_id="5001"` |
+| `dedupe_key` | `dedupe_key="chatwoot:501:5001"` |
+
+```bash
+docker compose -p altegio_bot logs --tail=500 altegio-api | grep 'conv_id="501"'
+```
+
+**Искать по телефону или тексту сообщения в логах бессмысленно** — их там нет, и
+это не поломка. Отправной точкой служит `conversation_id`/`message_id` из
+интерфейса Chatwoot.
+
+**Шаг 2 — детали берём из БД.** Безопасный запрос без payload:
+
+```sql
+SELECT
+    id,
+    received_at,
+    status,
+    dedupe_key,
+    chatwoot_conversation_id,
+    chatwoot_message_id,
+    error
+FROM whatsapp_events
+WHERE chatwoot_conversation_id = :conv_id
+   OR chatwoot_message_id = :msg_id
+ORDER BY received_at DESC
+LIMIT 20;
+```
+
+Сам payload открывать **отдельным запросом и только при необходимости**,
+пользователем с разрешённым доступом:
+
+```sql
+SELECT payload FROM whatsapp_events WHERE id = :id;
+```
+
+Правила обращения с результатом:
+- `whatsapp_events` содержит PII — доступ ограничивать как к `clients`;
+- не копировать полный payload в тикеты, чаты и скриншоты — переносить только
+  те поля, которые действительно нужны;
+- если нужно поделиться контекстом, ссылаться на `id` строки, а не на её
+  содержимое.
+
+Если scalar-колонка пуста (`chatwoot_conversation_id IS NULL`), значит id в
+доставке был нечисловым или вне диапазона BIGINT — исходное значение при этом
+сохранено в `payload`, искать нужно там.
+
+---
+
 ## 5. Доступ и хранение
 
 Таблица содержит **PII** (телефоны и имена клиентов в сыром payload и в

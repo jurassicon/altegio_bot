@@ -25,6 +25,7 @@ from altegio_bot.settings import settings
 URL = "/webhook/whatsapp"
 APP_SECRET = "meta-app-secret"
 NUL = chr(0)
+LONE_SURROGATE = chr(0xD800)
 
 
 def _meta_payload(text: str = "hello", msg_id: str = "wamid.TEST1") -> dict:
@@ -269,3 +270,153 @@ async def test_verify_rejects_bad_mode() -> None:
         resp = await tc.get(f"{URL}?hub.mode=unsubscribe&hub.challenge=12345")
 
     assert resp.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# Non-finite JSON
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("literal", ["NaN", "Infinity", "-Infinity"])
+@pytest.mark.asyncio
+async def test_non_finite_json_is_persisted_safely(session_maker, literal: str) -> None:
+    body = (
+        '{"object":"whatsapp_business_account","score":' + literal + ","
+        '"entry":[{"id":"WABA1","changes":[{"field":"messages","value":'
+        '{"metadata":{"phone_number_id":"PNI1"},"messages":[]}}]}]}'
+    ).encode()
+
+    resp = await _post(session_maker, body=body, headers={"Content-Type": "application/json"})
+
+    assert resp.status_code == 200
+    rows = await _rows(session_maker)
+    assert len(rows) == 1
+    assert rows[0].payload["score"] is None
+    json.dumps(rows[0].payload, allow_nan=False)
+
+
+@pytest.mark.asyncio
+async def test_non_finite_json_still_passes_signature(session_maker, monkeypatch) -> None:
+    monkeypatch.setattr(settings, "meta_app_secret", APP_SECRET)
+    body = (
+        '{"object":"whatsapp_business_account","score":NaN,'
+        '"entry":[{"id":"WABA1","changes":[{"field":"messages","value":'
+        '{"metadata":{"phone_number_id":"PNI1"},"messages":[]}}]}]}'
+    ).encode()
+
+    resp = await _post(
+        session_maker,
+        body=body,
+        headers={"Content-Type": "application/json", "X-Hub-Signature-256": _sign(body)},
+    )
+
+    assert resp.status_code == 200
+    assert len(await _rows(session_maker)) == 1
+
+
+# ---------------------------------------------------------------------------
+# Responses must serialize regardless of body content
+# ---------------------------------------------------------------------------
+
+
+def _payload_with_pni(pni: str) -> dict:
+    payload = _meta_payload()
+    payload["entry"][0]["changes"][0]["value"]["metadata"]["phone_number_id"] = pni
+    return payload
+
+
+@pytest.mark.parametrize(
+    "hostile_pni",
+    [LONE_SURROGATE, f"a{NUL}b", "9" * 5000, "PNI-normal"],
+)
+@pytest.mark.asyncio
+async def test_response_serializes_with_hostile_phone_number_id(session_maker, hostile_pni: str) -> None:
+    """The raw phone_number_id must never be reflected back into the response.
+
+    Reflecting it meant an un-encodable value produced a 500 AFTER the row was
+    committed, and every retry hit the same failure on the duplicate branch.
+    """
+    body = json.dumps(_payload_with_pni(hostile_pni)).encode()
+
+    resp = await _post(session_maker, body=body, headers={"Content-Type": "application/json"})
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "phone_number_id" not in data
+    assert data["ok"] is True
+    assert len(await _rows(session_maker)) == 1
+
+
+@pytest.mark.asyncio
+async def test_duplicate_response_serializes_with_hostile_phone_number_id(session_maker) -> None:
+    body = json.dumps(_payload_with_pni(LONE_SURROGATE)).encode()
+    headers = {"Content-Type": "application/json"}
+
+    first = await _post(session_maker, body=body, headers=headers)
+    second = await _post(session_maker, body=body, headers=headers)
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert second.json()["duplicate"] is True
+    assert "phone_number_id" not in second.json()
+    assert len(await _rows(session_maker)) == 1
+
+
+@pytest.mark.asyncio
+async def test_ignored_response_serializes_with_hostile_phone_number_id(session_maker, monkeypatch) -> None:
+    """The `ignored` branch also writes pni into the error column."""
+    monkeypatch.setattr(settings, "whatsapp_allowed_phone_number_ids", "ALLOWED_ONLY")
+    body = json.dumps(_payload_with_pni(f"bad{LONE_SURROGATE}")).encode()
+
+    resp = await _post(session_maker, body=body, headers={"Content-Type": "application/json"})
+
+    assert resp.status_code == 200
+    assert resp.json()["ignored"] is True
+    row = (await _rows(session_maker))[0]
+    assert row.status == "ignored"
+    # The error column must be encodable too.
+    (row.error or "").encode("utf-8")
+
+
+# ---------------------------------------------------------------------------
+# ensure_ascii=True is load-bearing for the dedupe key
+# ---------------------------------------------------------------------------
+
+
+def test_dedupe_key_survives_a_lone_surrogate() -> None:
+    payload = _meta_payload()
+    payload["entry"][0]["changes"][0]["value"]["messages"][0]["text"]["body"] = LONE_SURROGATE
+
+    key = wa_module._payload_dedupe_key(payload)
+
+    assert key.startswith("wa:")
+    # Deterministic across calls.
+    assert key == wa_module._payload_dedupe_key(payload)
+
+
+def test_dedupe_key_uses_ensure_ascii_true() -> None:
+    """ensure_ascii=False would raise UnicodeEncodeError on this payload."""
+    payload = _meta_payload()
+    payload["entry"][0]["changes"][0]["value"]["messages"][0]["text"]["body"] = LONE_SURROGATE
+
+    with pytest.raises(UnicodeEncodeError):
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+    wa_module._payload_dedupe_key(payload)  # does not raise
+
+
+@pytest.mark.asyncio
+async def test_lone_surrogate_delivery_dedupes_and_stores_safely(session_maker) -> None:
+    payload = _meta_payload()
+    payload["entry"][0]["changes"][0]["value"]["messages"][0]["text"]["body"] = LONE_SURROGATE
+    body = json.dumps(payload).encode()
+    headers = {"Content-Type": "application/json"}
+
+    first = await _post(session_maker, body=body, headers=headers)
+    second = await _post(session_maker, body=body, headers=headers)
+
+    assert first.json()["duplicate"] is False
+    assert second.json()["duplicate"] is True
+    rows = await _rows(session_maker)
+    assert len(rows) == 1
+    json.dumps(rows[0].payload).encode("utf-8")

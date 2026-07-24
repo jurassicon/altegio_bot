@@ -16,8 +16,10 @@ from .ops.router import router as ops_router
 from .settings import settings
 from .webhooks.chatwoot import router as chatwoot_router
 from .webhooks.common import (
+    bounded_text,
     canonical_json_hash,
     mask_query,
+    optional_int,
     postgres_safe_json_value,
     postgres_safe_text,
     safe_headers,
@@ -167,12 +169,17 @@ async def altegio_webhook(request: Request) -> dict[str, bool]:
     # 3) сохраняем в inbox
     dedupe_key = _make_dedupe_key(payload, query)
 
+    # Scalar-проекции строятся из недоверенного payload, поэтому приводятся под
+    # реальные типы и длины колонок: company_id INTEGER, resource_id BIGINT,
+    # resource/event_status VARCHAR(32). Невалидное значение даёт NULL, а не
+    # падение INSERT — полный payload всё равно сохраняется в JSONB ниже, так
+    # что данные не теряются. Дедуп при этом считается по ОРИГИНАЛУ (выше).
     event = AltegioEvent(
         dedupe_key=dedupe_key,
-        company_id=payload.get("company_id"),
-        resource=payload.get("resource"),
-        resource_id=payload.get("resource_id"),
-        event_status=payload.get("status"),
+        company_id=optional_int(payload.get("company_id"), bigint=False),
+        resource=bounded_text(payload.get("resource"), limit=32),
+        resource_id=optional_int(payload.get("resource_id")),
+        event_status=bounded_text(payload.get("status"), limit=32),
         # Маскируем только СОХРАНЯЕМУЮ копию: авторизация выше и _make_dedupe_key
         # ниже работают с оригинальным query, поэтому дедупликация не меняется.
         # Исторические строки этой правкой не чинятся — их чистка отдельная
