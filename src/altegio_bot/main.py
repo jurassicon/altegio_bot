@@ -8,7 +8,6 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
 from sqlalchemy.exc import IntegrityError
-from starlette.middleware.base import BaseHTTPMiddleware
 
 from .db import SessionLocal
 from .models import AltegioEvent
@@ -39,30 +38,68 @@ app.include_router(campaigns_router)  # protected: /ops/campaigns/ (JSON) — р
 app.include_router(ops_router)  # protected: /ops/ (HTML dashboard)
 
 
-class AccessLogMiddleware(BaseHTTPMiddleware):
-    """Access-лог БЕЗ query string.
+# HTTP-методы, которые вообще может нести ASGI-scope. Метод приходит от клиента,
+# поэтому в лог пишется только из этого белого списка, иначе — "INVALID".
+_KNOWN_METHODS = frozenset({"GET", "HEAD", "POST", "PUT", "DELETE", "CONNECT", "OPTIONS", "TRACE", "PATCH"})
+
+
+def safe_log_path(path: str, *, limit: int = 2048) -> str:
+    """Экранированный и ограниченный по длине путь, пригодный для записи в лог.
+
+    Путь полностью контролируется клиентом и не требует валидного токена, то
+    есть это классический вектор log injection: перевод строки подделал бы
+    отдельную log-строку, ANSI-escape перекрасил бы вывод, а U+2028/U+2029
+    разорвали бы строку в части просмотрщиков. ``json.dumps(ensure_ascii=True)``
+    закрывает всё разом: управляющие байты (``\\n``, ``\\r``, ``\\x1b``) → их
+    ``\\uXXXX``-формы, любой не-ASCII (включая U+2028/U+2029) тоже \\u-экранируется,
+    результат — одна строка в кавычках. Длину режем ДО сериализации.
+    """
+    return json.dumps(path[:limit], ensure_ascii=True)
+
+
+def _safe_log_method(method: str) -> str:
+    return method if method in _KNOWN_METHODS else "INVALID"
+
+
+class AccessLogMiddleware:
+    """Access-лог БЕЗ query string и защищённый от log injection.
 
     Стандартный access-лог uvicorn пишет полный request target вместе с query, а
     вебхуки носят секрет именно там (``/webhooks/easyweek?token=...``,
     ``/webhooks/altegio?secret=...``). Поэтому uvicorn в проде запускается с
     ``--no-access-log`` (Dockerfile / docker-compose.yml), а наблюдаемость даёт
-    этот middleware: метод, ПУТЬ, статус и длительность — и ничего больше.
-    Reverse proxy обязан быть настроен так же (см.
+    этот middleware: метод, экранированный ПУТЬ, статус и длительность — и ничего
+    больше. Reverse proxy обязан быть настроен так же (см.
     docs/easyweek/capture_runbook.md): без ``$request``, ``$request_uri``, ``$args``.
+
+    Чистый ASGI-middleware (а не ``BaseHTTPMiddleware``): нам нужны только метод,
+    путь и статус из scope — оборачивать тело в streaming-обёртку незачем.
     """
 
-    async def dispatch(self, request: Request, call_next):
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
         start = time.perf_counter()
         status_code = 500  # если обработчик упадёт, в лог попадёт именно это
+
+        async def _send(message):
+            nonlocal status_code
+            if message["type"] == "http.response.start":
+                status_code = message["status"]
+            await send(message)
+
         try:
-            response = await call_next(request)
-            status_code = response.status_code
-            return response
+            await self.app(scope, receive, _send)
         finally:
             access_logger.info(
-                "%s %s %s %.1fms",
-                request.method,
-                request.url.path,
+                "method=%s path=%s status=%s duration_ms=%.1f",
+                _safe_log_method(scope.get("method", "")),
+                safe_log_path(scope.get("path", "")),
                 status_code,
                 (time.perf_counter() - start) * 1000,
             )

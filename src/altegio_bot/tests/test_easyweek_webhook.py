@@ -597,7 +597,7 @@ async def test_logs_contain_no_secret_query_or_payload(session_maker, caplog) ->
     # Safe metadata is present, and the access line carries the path without query.
     assert "easyweek capture stored id=" in logged
     assert "auth_via=query" in logged
-    assert "POST /webhooks/easyweek 200" in logged
+    assert 'method=POST path="/webhooks/easyweek" status=200' in logged
     assert "token=" not in logged
 
 

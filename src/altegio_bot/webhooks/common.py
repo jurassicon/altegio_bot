@@ -106,31 +106,50 @@ def contains_nul(value: object) -> bool:
     return False
 
 
-def canonical_json_hash(payload: object, *, strict: bool = False) -> str:
-    """sha256 канонизированного JSON (sort_keys, компактные разделители).
+def _canonical_json(payload: object, *, allow_nan: bool) -> str:
+    """Канонизированный JSON: sort_keys + компактные разделители, без ASCII-escape.
 
-    ``strict=True`` — контракт «это значение переживёт запись в Postgres JSONB».
-    Бросает ``ValueError`` (или его подкласс) на всём, что JSONB не принимает:
-      * NaN / Infinity / переполнение экспоненты — через ``allow_nan=False``;
-      * NUL в строках и ключах — через ``contains_nul``;
-      * непарные суррогаты — через ``UnicodeEncodeError`` на ``encode("utf-8")``
-        (это подкласс ``ValueError``, ловится тем же except).
-    Без strict остаётся чистым хэшированием. Вызывающие, которые сохраняют
-    канонизированный payload в JSONB (а не только хэшируют его), обязаны
-    передавать ``strict=True``: иначе запись упала бы на commit, а доставка
-    терялась бы на каждом ретрае.
+    Единственная точка сериализации для обоих хэшей ниже, чтобы канон-форма (а
+    значит и хэш корректных payload) не могла разойтись между ними.
     """
-    if strict and contains_nul(payload):
-        raise ValueError("payload contains NUL, which PostgreSQL JSONB rejects")
-
-    canon = json.dumps(
+    return json.dumps(
         payload,
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
-        allow_nan=not strict,
+        allow_nan=allow_nan,
     )
-    return hashlib.sha256(canon.encode("utf-8")).hexdigest()
+
+
+def canonical_json_hash(payload: object) -> str:
+    """sha256 канонизированного JSON. Чистое хэширование, без JSONB-гарантий.
+
+    Не проверяет пригодность значения к записи в Postgres: NaN/Infinity
+    сериализуются как есть (``allow_nan=True``). Для payload, который будет
+    сохранён в JSONB, используйте :func:`postgres_safe_json_hash` — он отвергает
+    то, что БД не примет.
+    """
+    return hashlib.sha256(_canonical_json(payload, allow_nan=True).encode("utf-8")).hexdigest()
+
+
+def postgres_safe_json_hash(payload: object) -> str:
+    """sha256 канонизированного JSON с контрактом «переживёт запись в Postgres JSONB».
+
+    Бросает ``ValueError`` (или его подкласс) на всём, что JSONB не принимает,
+    ЕДИНООБРАЗНО — вне зависимости от вида дефекта:
+      * NaN / Infinity / переполнение экспоненты — через ``allow_nan=False``;
+      * NUL в строках и ключах — через ``contains_nul`` (``json.dumps`` экранирует
+        NUL, поэтому проверять сериализованную строку бесполезно);
+      * непарные суррогаты — через ``UnicodeEncodeError`` на ``encode("utf-8")``
+        (это подкласс ``ValueError``).
+    Вызывающие, которые сохраняют канонизированный payload в JSONB, обязаны
+    использовать именно эту функцию: иначе запись упала бы на commit, а доставка
+    терялась бы на каждом ретрае.
+    """
+    if contains_nul(payload):
+        raise ValueError("payload contains NUL, which PostgreSQL JSONB rejects")
+
+    return hashlib.sha256(_canonical_json(payload, allow_nan=False).encode("utf-8")).hexdigest()
 
 
 async def read_bounded_body(request: Request, *, limit: int) -> tuple[bytes, int, bool]:

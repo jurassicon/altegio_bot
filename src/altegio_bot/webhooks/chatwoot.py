@@ -31,10 +31,16 @@ from sqlalchemy.exc import IntegrityError
 from altegio_bot.db import SessionLocal
 from altegio_bot.models.models import WhatsAppEvent
 from altegio_bot.settings import settings
+from altegio_bot.webhooks.common import mask_query, safe_headers
 
 logger = logging.getLogger("chatwoot_webhook")
 
 router = APIRouter()
+
+# Заголовок с HMAC-подписью Chatwoot. Он читается напрямую из живого запроса в
+# chatwoot_ingest (не из сохранённой копии), поэтому его можно и нужно
+# выбрасывать перед записью — в БД подпись не нужна.
+_CHATWOOT_SIGNATURE_HEADER = "x-chatwoot-signature"
 
 # Chatwoot sender types that represent human operators.
 # 'agent_bot' means the message was sent by an automated bot — never relay.
@@ -43,11 +49,6 @@ _HUMAN_SENDER_TYPES = frozenset({"agent", "supervisor", "user"})
 
 # content_type values that are purely internal — never relay to Meta.
 _SKIP_CONTENT_TYPES = frozenset({"activity", "input_select", "input_email"})
-
-
-def _safe_headers(request: Request) -> dict[str, str]:
-    deny = {"authorization", "cookie"}
-    return {k: v for k, v in request.headers.items() if k.lower() not in deny}
 
 
 def _verify_signature(body: bytes, signature: str | None) -> bool:
@@ -339,8 +340,14 @@ async def _store_event(
                     dedupe_key=dedupe_key,
                     status="received",
                     error=None,
-                    query=dict(request.query_params),
-                    headers=_safe_headers(request),
+                    # mask_query/safe_headers — общие хелперы: маскируют
+                    # чувствительные query-значения, выбрасывают authorization,
+                    # cookie и подпись Chatwoot, и приводят метаданные к
+                    # Postgres-безопасному виду (NUL/суррогаты). Санитайзится
+                    # ТОЛЬКО сохраняемая копия — проверка HMAC выше уже прошла по
+                    # живому заголовку.
+                    query=mask_query(dict(request.query_params)),
+                    headers=safe_headers(request, extra_deny={_CHATWOOT_SIGNATURE_HEADER}),
                     payload=normalized_payload,
                     chatwoot_conversation_id=chatwoot_conversation_id,
                     chatwoot_message_id=chatwoot_message_id,

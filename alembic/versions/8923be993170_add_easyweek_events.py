@@ -6,11 +6,17 @@ Research-grade capture доставок вебхуков EasyWeek. Каждая 
 уникален, чтобы повторные доставки сохранялись как данные. Индекс по ``status``
 — задел под inbox-воркер PR-4, который будет забирать строки status='captured'.
 
-``body_raw`` (BYTEA) хранит исходные байты доставки, ``payload`` (JSONB) — их
-разбор. Автоматического TTL нет: таблица содержит PII, политика хранения
-ручная (см. docs/easyweek/capture_runbook.md).
+Автоматического TTL нет: таблица содержит PII, политика хранения ручная (см.
+docs/easyweek/capture_runbook.md).
 
 Миграция строго аддитивная: чужих таблиц не касается.
+
+ВНИМАНИЕ про совместимость: эта ревизия создаёт БАЗОВУЮ таблицу. Колонки
+``body_raw``/``body_size_bytes`` добавляет ОТДЕЛЬНАЯ более поздняя ревизия
+(8705ec49cc73). Их сознательно нет здесь: раньше их дописали прямо в CREATE
+TABLE этого файла, но среда, где ранняя версия ревизии уже была применена,
+никогда не перезапустит её и осталась бы без колонок. Дополнять существующую
+применённую ревизию нельзя — только новой аддитивной.
 
 Revision ID: 8923be993170
 Revises: e9a7c6b5d4f3
@@ -43,11 +49,6 @@ def upgrade() -> None:
             "auth_via VARCHAR(16), "
             "payload_hash VARCHAR(64), "
             "content_type VARCHAR(128), "
-            # Исходные байты доставки (до 128 КиБ) — источник истины по
-            # содержимому; JSONB ниже это уже разбор. body_size_bytes хранит
-            # полный размер, включая непопавший в лимит хвост.
-            "body_raw BYTEA, "
-            "body_size_bytes BIGINT NOT NULL DEFAULT 0, "
             "body_text TEXT, "
             "body_truncated BOOLEAN NOT NULL DEFAULT false, "
             "query JSONB NOT NULL DEFAULT '{}'::jsonb, "

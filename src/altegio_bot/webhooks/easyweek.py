@@ -52,8 +52,8 @@ from ..models.models import EasyWeekEvent
 from ..perf import perf_log
 from ..settings import settings
 from .common import (
-    canonical_json_hash,
     mask_query,
+    postgres_safe_json_hash,
     postgres_safe_text,
     read_bounded_body,
     safe_headers,
@@ -151,12 +151,12 @@ async def easyweek_webhook(request: Request) -> dict[str, bool]:
                 # объект.
                 candidate = parsed if isinstance(parsed, dict) else {"_non_dict_payload": parsed}
                 try:
-                    # strict=True отвергает всё, что Postgres JSONB не примет:
-                    # NaN/Infinity, переполнение экспоненты, NUL внутри строк и
-                    # ключей, непарные суррогаты. Без этой проверки запись
-                    # упала бы на commit, и доставка терялась бы на каждом
-                    # ретрае. При отказе — откат в текстовую проекцию.
-                    payload_hash = canonical_json_hash(candidate, strict=True)
+                    # postgres_safe_json_hash отвергает всё, что Postgres JSONB не
+                    # примет: NaN/Infinity, переполнение экспоненты, NUL внутри
+                    # строк и ключей, непарные суррогаты. Без этой проверки запись
+                    # упала бы на commit, и доставка терялась бы на каждом ретрае.
+                    # При отказе — откат в текстовую проекцию.
+                    payload_hash = postgres_safe_json_hash(candidate)
                 except (ValueError, TypeError, RecursionError):
                     body_text = _text_projection(raw)
                 else:
