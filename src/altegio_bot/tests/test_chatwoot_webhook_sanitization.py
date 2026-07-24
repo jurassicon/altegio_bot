@@ -11,6 +11,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -359,19 +360,74 @@ async def test_dedupe_semantics_unchanged(session_maker, caplog) -> None:
 @pytest.mark.parametrize("literal", ["NaN", "Infinity", "-Infinity"])
 @pytest.mark.asyncio
 async def test_non_finite_json_is_persisted_safely(session_maker, literal: str) -> None:
+    """The non-finite value must sit in a field that reaches the STORED payload.
+
+    A top-level key like `score` is dropped during normalisation, so putting the
+    hostile value there proves nothing about the persistence path. `account.id`
+    is copied into `_chatwoot.account_id`, so it actually reaches JSONB.
+    """
     body = (
         '{"event":"message_created","id":5001,"content":"hi","message_type":0,'
         '"created_at":1234567890,"conversation":{"id":501},'
-        '"sender":{"phone_number":"+4915112345678"},"account":{"id":2},'
-        '"score":' + literal + "}"
+        '"sender":{"phone_number":"+4915112345678"},'
+        '"account":{"id":' + literal + "}}"
     ).encode()
+
+    # Sanity-check the premise: the value really is in the normalised projection
+    # before sanitation, otherwise this test would silently pass on nothing.
+    parsed = json.loads(body)
+    assert not math.isfinite(parsed["account"]["id"])
 
     resp = await _post_raw(session_maker, body)
 
     assert resp.status_code == 200
     rows = await _rows(session_maker)
     assert len(rows) == 1
+    assert rows[0].payload["_chatwoot"]["account_id"] is None
     json.dumps(rows[0].payload, allow_nan=False)
+
+
+@pytest.mark.parametrize("literal", ["NaN", "Infinity", "-Infinity"])
+@pytest.mark.asyncio
+async def test_operator_non_finite_json_is_persisted_safely(session_maker, monkeypatch, literal: str) -> None:
+    """Operator path: `sender.id` and `content_attributes` both reach JSONB."""
+    monkeypatch.setattr(settings, "chatwoot_operator_relay_enabled", True)
+    body = (
+        '{"event":"message_created","id":7001,"content":"reply","message_type":1,'
+        '"private":false,"content_type":"text",'
+        '"content_attributes":{"score":' + literal + "},"
+        '"conversation":{"id":701,"inbox_id":123,'
+        '"meta":{"sender":{"phone_number":"+4915112345678","name":"C"}}},'
+        '"sender":{"type":"agent","name":"A","id":' + literal + '},"account":{"id":2}}'
+    ).encode()
+
+    parsed = json.loads(body)
+    assert not math.isfinite(parsed["sender"]["id"])
+    assert not math.isfinite(parsed["content_attributes"]["score"])
+
+    resp = await _post_raw(session_maker, body)
+
+    assert resp.status_code == 200
+    rows = await _rows(session_maker)
+    assert len(rows) == 1
+    relay = rows[0].payload["_chatwoot_operator_relay"]
+    assert relay["agent_id"] is None
+    assert relay["content_attributes"]["score"] is None
+    json.dumps(rows[0].payload, allow_nan=False)
+
+
+@pytest.mark.asyncio
+async def test_clean_operator_payload_keeps_its_values(session_maker, monkeypatch) -> None:
+    """The sanitiser must not disturb a well-formed payload."""
+    monkeypatch.setattr(settings, "chatwoot_operator_relay_enabled", True)
+
+    resp = await _post_raw(session_maker, json.dumps(_operator_payload()).encode())
+
+    assert resp.status_code == 200
+    relay = (await _rows(session_maker))[0].payload["_chatwoot_operator_relay"]
+    assert relay["agent_id"] == 9
+    assert relay["agent_name"] == "Agent"
+    assert relay["text"] == "reply"
 
 
 @pytest.mark.asyncio
@@ -518,3 +574,227 @@ async def test_unsupported_content_type_returns_a_stable_reason(session_maker, m
 
     assert resp.status_code == 200
     assert resp.json() == {"ok": True, "skipped": "unsupported_content_type"}
+
+
+# ---------------------------------------------------------------------------
+# Structural validation: JSON root and nested containers
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("raw", [b"[]", b'"text"', b"123", b"null", b"[1,2]"])
+@pytest.mark.asyncio
+async def test_non_object_json_root_is_rejected(session_maker, raw: bytes) -> None:
+    resp = await _post_raw(session_maker, raw)
+
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == "JSON payload must be an object"
+    assert await _rows(session_maker) == []
+
+
+@pytest.mark.asyncio
+async def test_bad_signature_wins_over_structural_validation(session_maker, monkeypatch) -> None:
+    """HMAC is checked over the raw bytes first: wrong signature is 403, not 400."""
+    monkeypatch.setattr(settings, "chatwoot_webhook_secret", "hmac-secret")
+
+    resp = await _post_raw(
+        session_maker,
+        b"[]",
+        headers={"Content-Type": "application/json", "X-Chatwoot-Signature": "wrong"},
+    )
+
+    assert resp.status_code == 403
+    assert await _rows(session_maker) == []
+
+
+@pytest.mark.asyncio
+async def test_valid_signature_over_non_object_root_is_400(session_maker, monkeypatch) -> None:
+    monkeypatch.setattr(settings, "chatwoot_webhook_secret", "hmac-secret")
+    body = b"[]"
+    signature = hmac.new(b"hmac-secret", body, hashlib.sha256).hexdigest()
+
+    resp = await _post_raw(
+        session_maker,
+        body,
+        headers={"Content-Type": "application/json", "X-Chatwoot-Signature": signature},
+    )
+
+    assert resp.status_code == 400
+    assert await _rows(session_maker) == []
+
+
+@pytest.mark.parametrize("bad", ["[]", '"bad"', "123"])
+@pytest.mark.asyncio
+async def test_incoming_malformed_sender_container(session_maker, bad: str) -> None:
+    """`sender` is required for the phone: malformed → controlled 400, no 500."""
+    body = (
+        '{"event":"message_created","id":5001,"content":"hi","message_type":0,'
+        '"created_at":1234567890,"conversation":{"id":501},'
+        '"sender":' + bad + ',"account":{"id":2}}'
+    ).encode()
+
+    resp = await _post_raw(session_maker, body)
+
+    assert resp.status_code == 400
+    assert await _rows(session_maker) == []
+
+
+@pytest.mark.parametrize("bad", ["[]", '"bad"', "123"])
+@pytest.mark.asyncio
+async def test_incoming_malformed_conversation_container(session_maker, bad: str) -> None:
+    """`conversation` is optional for storage: malformed → NULL projection, 200."""
+    body = (
+        '{"event":"message_created","id":5001,"content":"hi","message_type":0,'
+        '"created_at":1234567890,"conversation":' + bad + ","
+        '"sender":{"phone_number":"+4915112345678"},"account":{"id":2}}'
+    ).encode()
+
+    resp = await _post_raw(session_maker, body)
+
+    assert resp.status_code == 200
+    row = (await _rows(session_maker))[0]
+    assert row.chatwoot_conversation_id is None
+
+
+@pytest.mark.parametrize("bad", ["[]", '"bad"', "123"])
+@pytest.mark.asyncio
+async def test_incoming_malformed_account_container(session_maker, bad: str) -> None:
+    body = (
+        '{"event":"message_created","id":5001,"content":"hi","message_type":0,'
+        '"created_at":1234567890,"conversation":{"id":501},'
+        '"sender":{"phone_number":"+4915112345678"},"account":' + bad + "}"
+    ).encode()
+
+    resp = await _post_raw(session_maker, body)
+
+    assert resp.status_code == 200
+    row = (await _rows(session_maker))[0]
+    assert row.payload["_chatwoot"]["account_id"] is None
+
+
+@pytest.mark.parametrize("bad", ["[]", '"bad"', "123"])
+@pytest.mark.asyncio
+async def test_operator_malformed_conversation_meta(session_maker, monkeypatch, bad: str) -> None:
+    monkeypatch.setattr(settings, "chatwoot_operator_relay_enabled", True)
+    payload = _operator_payload()
+    body = json.dumps(payload).encode().replace(json.dumps(payload["conversation"]["meta"]).encode(), bad.encode())
+
+    resp = await _post_raw(session_maker, body)
+
+    # No recipient phone can be resolved → controlled skip, never a 500.
+    assert resp.status_code == 200
+    assert resp.json()["skipped"] == "no_recipient_phone"
+
+
+@pytest.mark.parametrize("bad", ["[]", '"bad"', "123"])
+@pytest.mark.asyncio
+async def test_operator_malformed_sender_container(session_maker, monkeypatch, bad: str) -> None:
+    """A malformed `sender` cannot be a human operator → not relayed, no 500."""
+    monkeypatch.setattr(settings, "chatwoot_operator_relay_enabled", True)
+    body = (
+        '{"event":"message_created","id":7001,"content":"reply","message_type":1,'
+        '"private":false,"content_type":"text",'
+        '"conversation":{"id":701,"inbox_id":123,"meta":{"sender":{"phone_number":"+4915112345678"}}},'
+        '"sender":' + bad + ',"account":{"id":2}}'
+    ).encode()
+
+    resp = await _post_raw(session_maker, body)
+
+    assert resp.status_code == 200
+    assert resp.json()["skipped"] == "outgoing_not_relayed"
+
+
+@pytest.mark.parametrize("bad", ["[]", "{}", "123"])
+@pytest.mark.asyncio
+async def test_unhashable_content_type_does_not_raise_typeerror(session_maker, monkeypatch, bad: str) -> None:
+    """`content_type in _SKIP_CONTENT_TYPES` would raise TypeError on a list."""
+    monkeypatch.setattr(settings, "chatwoot_operator_relay_enabled", True)
+    body = (
+        '{"event":"message_created","id":7001,"content":"reply","message_type":1,'
+        '"private":false,"content_type":' + bad + ","
+        '"conversation":{"id":701,"inbox_id":123,"meta":{"sender":{"phone_number":"+4915112345678"}}},'
+        '"sender":{"type":"agent","name":"A","id":9},"account":{"id":2}}'
+    ).encode()
+
+    resp = await _post_raw(session_maker, body)
+
+    assert resp.status_code == 200
+    assert "skipped" in resp.json() or resp.json()["ok"] is True
+
+
+@pytest.mark.parametrize("bad", ["[]", '"bad"', "123"])
+@pytest.mark.asyncio
+async def test_malformed_content_attributes(session_maker, monkeypatch, bad: str) -> None:
+    monkeypatch.setattr(settings, "chatwoot_operator_relay_enabled", True)
+    body = (
+        '{"event":"message_created","id":7001,"content":"reply","message_type":1,'
+        '"private":false,"content_type":"text","content_attributes":' + bad + ","
+        '"conversation":{"id":701,"inbox_id":123,"meta":{"sender":{"phone_number":"+4915112345678"}}},'
+        '"sender":{"type":"agent","name":"A","id":9},"account":{"id":2}}'
+    ).encode()
+
+    resp = await _post_raw(session_maker, body)
+
+    assert resp.status_code == 200
+    assert len(await _rows(session_maker)) == 1
+
+
+# ---------------------------------------------------------------------------
+# Oversized / negative Chatwoot ids
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_5000_digit_message_id_does_not_500(session_maker) -> None:
+    payload = _incoming()
+    payload["id"] = "9" * 5000
+
+    resp = await _post_raw(session_maker, json.dumps(payload).encode())
+
+    assert resp.status_code == 200
+    row = (await _rows(session_maker))[0]
+    assert row.chatwoot_message_id is None
+    assert len(row.dedupe_key) <= 128
+
+
+@pytest.mark.asyncio
+async def test_5000_digit_conversation_id_does_not_500(session_maker) -> None:
+    payload = _incoming()
+    payload["conversation"]["id"] = "9" * 5000
+
+    resp = await _post_raw(session_maker, json.dumps(payload).encode())
+
+    assert resp.status_code == 200
+    row = (await _rows(session_maker))[0]
+    assert row.chatwoot_conversation_id is None
+    assert len(row.dedupe_key) <= 128
+
+
+@pytest.mark.asyncio
+async def test_operator_5000_digit_ids_do_not_500(session_maker, monkeypatch) -> None:
+    monkeypatch.setattr(settings, "chatwoot_operator_relay_enabled", True)
+    payload = _operator_payload()
+    payload["id"] = "9" * 5000
+    payload["conversation"]["id"] = "9" * 5000
+
+    resp = await _post_raw(session_maker, json.dumps(payload).encode())
+
+    assert resp.status_code == 200
+    row = (await _rows(session_maker))[0]
+    assert row.chatwoot_message_id is None
+    assert row.chatwoot_conversation_id is None
+    assert len(row.dedupe_key) <= 128
+
+
+@pytest.mark.parametrize("negative", [-1, "-42"])
+@pytest.mark.asyncio
+async def test_negative_ids_are_rejected_into_null(session_maker, negative) -> None:
+    payload = _incoming()
+    payload["conversation"]["id"] = negative
+    payload["id"] = negative
+
+    resp = await _post_raw(session_maker, json.dumps(payload).encode())
+
+    assert resp.status_code == 200
+    row = (await _rows(session_maker))[0]
+    assert row.chatwoot_conversation_id is None
+    assert row.chatwoot_message_id is None

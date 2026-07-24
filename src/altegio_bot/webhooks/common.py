@@ -91,6 +91,17 @@ def postgres_safe_text(value: str) -> str:
     return safe
 
 
+def mapping_or_empty(value: object) -> dict:
+    """Возвращает ``value``, если это словарь, иначе пустой словарь.
+
+    Вложенные поля тела вебхука типизированы только по договорённости: клиент
+    вправе прислать ``{"conversation": []}`` или ``{"sender": 123}``. Идиома
+    ``payload.get("conversation") or {}`` от этого НЕ защищает — непустой список
+    truthy, и следующий же ``.get()`` падает с AttributeError, то есть 500.
+    """
+    return value if isinstance(value, dict) else {}
+
+
 def postgres_safe_json_value(value: object) -> object:
     """Рекурсивно приводит разобранный JSON к виду, который примет Postgres JSONB.
 
@@ -141,7 +152,7 @@ PG_INT_MIN, PG_INT_MAX = -(2**31), 2**31 - 1
 PG_BIGINT_MIN, PG_BIGINT_MAX = -(2**63), 2**63 - 1
 
 
-def optional_int(value: object, *, bigint: bool = True) -> int | None:
+def optional_int(value: object, *, bigint: bool = True, min_value: int | None = None) -> int | None:
     """Приводит sender-controlled значение к int для числовой колонки, иначе None.
 
     ``bool`` НЕ считается целым числом (в Python ``True`` — это ``int``, но в
@@ -149,22 +160,44 @@ def optional_int(value: object, *, bigint: bool = True) -> int | None:
     если это целое число целиком. Значение вне диапазона колонки отбрасывается:
     Postgres на нём падает, а доставку терять нельзя — payload всё равно
     сохраняется целиком в JSONB, поэтому NULL в scalar-проекции ничего не теряет.
+
+    ``min_value`` поднимает нижнюю границу (см. :func:`optional_chatwoot_id`).
+
+    Преобразование строки обёрнуто в ``try``, а не защищено ``isdigit()``:
+    ``"9" * 5000`` проходит ``isdigit()``, но с Python 3.11 ``int()`` бросает
+    ``ValueError`` из-за лимита на длину десятичной записи — то есть корректно
+    подписанный вебхук снова стал бы необработанным 500.
     """
     if isinstance(value, bool):
         return None
     if isinstance(value, int):
         candidate = value
     elif isinstance(value, str):
-        text = value.strip()
         try:
-            candidate = int(text)
+            candidate = int(value.strip())
         except (TypeError, ValueError):
             return None
     else:
         return None
 
     low, high = (PG_BIGINT_MIN, PG_BIGINT_MAX) if bigint else (PG_INT_MIN, PG_INT_MAX)
+    if min_value is not None:
+        low = max(low, min_value)
     return candidate if low <= candidate <= high else None
+
+
+def optional_chatwoot_id(value: object) -> int | None:
+    """Chatwoot conversation/message id для BIGINT-колонки.
+
+    Chatwoot IDs are intentionally restricted to non-negative BIGINT values.
+    Negative numeric strings are rejected rather than coerced.
+
+    Отдельная обёртка над :func:`optional_int`, потому что общий контракт
+    допускает отрицательные значения (например Altegio ``company_id``), а
+    отрицательный id беседы в Chatwoot смысла не имеет и почти наверняка означает
+    подделанное тело.
+    """
+    return optional_int(value, bigint=True, min_value=0)
 
 
 def bounded_text(value: object, *, limit: int) -> str | None:

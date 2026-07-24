@@ -34,6 +34,7 @@ from altegio_bot.services.meta_error_classifier import (
     transient_error_reason,
 )
 from altegio_bot.settings import settings
+from altegio_bot.webhooks.common import safe_log_value
 from altegio_bot.whatsapp_window import is_whatsapp_customer_window_open, normalize_phone
 from altegio_bot.workers.promo_lead_handler import (
     handle_promo_command,
@@ -1508,8 +1509,8 @@ async def _forward_text_to_chatwoot(
         safe_error = f"chatwoot forward failed: {type(exc).__name__}"
         event.error = safe_error
         logger.warning(
-            "chatwoot: forward failed phone=%s %s",
-            phone_e164,
+            "chatwoot: forward failed event_id=%s %s",
+            event.id,
             type(exc).__name__,
         )
         raise RuntimeError(safe_error) from None
@@ -1519,12 +1520,13 @@ async def _forward_text_to_chatwoot(
     event.forwarded_chatwoot_conversation_id = conversation_id
     event.chatwoot_message_id = message_id
     event.error = None
+    # No phone / client name / message body: see docs/easyweek/capture_runbook.md
+    # §4.1 — tracing goes through these technical ids, details come from the DB.
     logger.info(
-        "Forwarded incoming message to Chatwoot phone=%s name=%s conversation_id=%s message_id=%s native_reply=%s",
-        phone_e164,
-        client_name,
-        conversation_id,
-        message_id,
+        "Forwarded incoming message to Chatwoot event_id=%s conversation_id=%s message_id=%s native_reply=%s",
+        event.id,
+        safe_log_value(conversation_id, limit=32),
+        safe_log_value(message_id, limit=32),
         content_attributes is not None,
     )
 
@@ -1784,8 +1786,8 @@ async def _forward_reaction_to_chatwoot(
         safe_error = f"Incoming reaction forwarding failed: {type(exc).__name__}"
         event.error = safe_error
         logger.warning(
-            "chatwoot: reaction forward failed phone=%s %s",
-            phone_e164,
+            "chatwoot: reaction forward failed event_id=%s %s",
+            event.id,
             type(exc).__name__,
         )
         raise RuntimeError(safe_error) from None
@@ -1798,11 +1800,11 @@ async def _forward_reaction_to_chatwoot(
     # path in handle_event (the reaction wamid), so it is not re-set here.
     event.error = None
     logger.info(
-        "Forwarded WhatsApp reaction to Chatwoot phone=%s conversation_id=%s message_id=%s "
+        "Forwarded WhatsApp reaction to Chatwoot event_id=%s conversation_id=%s message_id=%s "
         "target_kind=%s native_reply=%s",
-        phone_e164,
-        conversation_id,
-        message_id,
+        event.id,
+        safe_log_value(conversation_id, limit=32),
+        safe_log_value(message_id, limit=32),
         target.kind,
         native_ok,
     )
@@ -1865,11 +1867,13 @@ async def _handle_operator_relay(
         reply_context_audit["content_attributes"] = content_attributes
 
     if phone_e164 is None:
+        # The raw value is a customer phone number — never logged, only the fact
+        # that it failed to parse.
         logger.warning(
-            "operator_relay: invalid recipient_phone=%r conv_id=%s msg_id=%s — skipping",
-            raw_phone,
-            conversation_id,
-            chatwoot_message_id,
+            "operator_relay: invalid recipient_phone event_id=%s conv_id=%s msg_id=%s — skipping",
+            event.id,
+            safe_log_value(conversation_id, limit=32),
+            safe_log_value(chatwoot_message_id, limit=32),
         )
         event.error = "operator_relay: invalid recipient_phone"
         return
@@ -1877,8 +1881,8 @@ async def _handle_operator_relay(
     if not text:
         logger.warning(
             "operator_relay: missing text conv_id=%s msg_id=%s — skipping",
-            conversation_id,
-            chatwoot_message_id,
+            safe_log_value(conversation_id, limit=32),
+            safe_log_value(chatwoot_message_id, limit=32),
         )
         event.error = "operator_relay: missing text"
         return
@@ -1887,9 +1891,9 @@ async def _handle_operator_relay(
     if hint_err is not None:
         logger.warning(
             "operator_relay: inbox routing error conv_id=%s msg_id=%s inbox_id=%s: %s",
-            conversation_id,
-            chatwoot_message_id,
-            chatwoot_inbox_id,
+            safe_log_value(conversation_id, limit=32),
+            safe_log_value(chatwoot_message_id, limit=32),
+            safe_log_value(chatwoot_inbox_id, limit=32),
             hint_err,
         )
         event.error = hint_err
@@ -1904,23 +1908,23 @@ async def _handle_operator_relay(
     if routing_err is not None:
         logger.warning(
             "operator_relay: routing blocked conv_id=%s msg_id=%s phone_number_id=%s err=%s",
-            conversation_id,
-            chatwoot_message_id,
-            phone_number_id,
+            safe_log_value(conversation_id, limit=32),
+            safe_log_value(chatwoot_message_id, limit=32),
+            safe_log_value(phone_number_id, limit=32),
             routing_err,
         )
         event.error = routing_err
         return
 
+    # Neither the customer phone nor the agent name: both are PII (runbook §4.1).
     logger.info(
-        "operator_relay: accepted conv_id=%s msg_id=%s phone=%s phone_number_id=%s sender_id=%s company_id=%s agent=%s",
-        conversation_id,
-        chatwoot_message_id,
-        phone_e164,
-        phone_number_id,
+        "operator_relay: accepted event_id=%s conv_id=%s msg_id=%s phone_number_id=%s sender_id=%s company_id=%s",
+        event.id,
+        safe_log_value(conversation_id, limit=32),
+        safe_log_value(chatwoot_message_id, limit=32),
+        safe_log_value(phone_number_id, limit=32),
         sender_id,
         company_id,
-        agent_name,
     )
 
     # Use the primary (Meta) transport directly — the operator's message is
@@ -1933,11 +1937,9 @@ async def _handle_operator_relay(
     window_open, last_inbound_at = await is_whatsapp_customer_window_open(session, phone_e164, now)
     hours_since: float = (now - last_inbound_at).total_seconds() / 3600 if last_inbound_at else -1.0
     logger.info(
-        "operator_relay: window_check phone=%s conv_id=%s msg_id=%s "
-        "window_open=%s last_inbound_at=%s hours_since=%.1f mode=%s",
-        phone_e164,
-        conversation_id,
-        chatwoot_message_id,
+        "operator_relay: window_check conv_id=%s msg_id=%s window_open=%s last_inbound_at=%s hours_since=%.1f mode=%s",
+        safe_log_value(conversation_id, limit=32),
+        safe_log_value(chatwoot_message_id, limit=32),
         window_open,
         last_inbound_at.isoformat() if last_inbound_at else None,
         hours_since,
@@ -2165,9 +2167,8 @@ async def _handle_operator_relay(
                 )
 
         logger.info(
-            "operator_relay: direct text sent (window open) phone=%s conv_id=%s mode=%s",
-            phone_e164,
-            conversation_id,
+            "operator_relay: direct text sent (window open) conv_id=%s mode=%s",
+            safe_log_value(conversation_id, limit=32),
             mode,
         )
 
@@ -2187,8 +2188,7 @@ async def _handle_operator_relay(
             if await _close_circuit_on_transient_send_error("text", err):
                 return
             logger.warning(
-                "operator_relay: send failed phone=%s sender_id=%s err=%s",
-                phone_e164,
+                "operator_relay: send failed sender_id=%s err=%s",
                 sender_id,
                 err,
             )
@@ -2196,8 +2196,7 @@ async def _handle_operator_relay(
             return
 
         logger.info(
-            "operator_relay: sent phone=%s wamid=%s sender_id=%s company_id=%s",
-            phone_e164,
+            "operator_relay: sent wamid=%s sender_id=%s company_id=%s",
             wamid,
             sender_id,
             company_id,
@@ -2236,10 +2235,9 @@ async def _handle_operator_relay(
         await session.flush()
 
         logger.info(
-            "operator_relay: outbox created outbox_id=%s wamid=%s phone=%s company_id=%s",
+            "operator_relay: outbox created outbox_id=%s wamid=%s company_id=%s",
             outbox.id,
             wamid,
-            phone_e164,
             company_id,
         )
         return
@@ -2247,9 +2245,8 @@ async def _handle_operator_relay(
     # ── Branch: window closed + mode=private_note_only ────────────────────
     if mode == "private_note_only":
         logger.info(
-            "operator_relay: window closed, mode=private_note_only → blocking send phone=%s conv_id=%s",
-            phone_e164,
-            conversation_id,
+            "operator_relay: window closed, mode=private_note_only → blocking send conv_id=%s",
+            safe_log_value(conversation_id, limit=32),
         )
 
         now = utcnow()
@@ -2287,9 +2284,8 @@ async def _handle_operator_relay(
         await session.flush()
 
         logger.info(
-            "operator_relay: canceled outbox created outbox_id=%s phone=%s company_id=%s",
+            "operator_relay: canceled outbox created outbox_id=%s company_id=%s",
             outbox.id,
-            phone_e164,
             company_id,
         )
 
@@ -2334,9 +2330,8 @@ async def _handle_operator_relay(
 
     # ── Branch: window closed + mode=reopen_template ──────────────────────
     logger.info(
-        "operator_relay: direct text skipped (window closed) phone=%s conv_id=%s — sending reopen template",
-        phone_e164,
-        conversation_id,
+        "operator_relay: direct text skipped (window closed) conv_id=%s — sending reopen template",
+        safe_log_value(conversation_id, limit=32),
     )
 
     template_name = settings.chatwoot_operator_reopen_template_name
@@ -2365,8 +2360,7 @@ async def _handle_operator_relay(
         if await _close_circuit_on_transient_send_error("template", err):
             return
         logger.warning(
-            "operator_relay: reopen template failed phone=%s sender_id=%s template=%s err=%s",
-            phone_e164,
+            "operator_relay: reopen template failed sender_id=%s template=%s err=%s",
             sender_id,
             template_name,
             err,
@@ -2401,12 +2395,11 @@ async def _handle_operator_relay(
         return
 
     logger.info(
-        "operator_relay: reopen template sent phone=%s wamid=%s template=%s lang=%s conv_id=%s",
-        phone_e164,
+        "operator_relay: reopen template sent wamid=%s template=%s lang=%s conv_id=%s",
         wamid,
         template_name,
         language,
-        conversation_id,
+        safe_log_value(conversation_id, limit=32),
     )
 
     now = utcnow()
@@ -2446,10 +2439,9 @@ async def _handle_operator_relay(
     await session.flush()
 
     logger.info(
-        "operator_relay: reopen outbox created outbox_id=%s wamid=%s phone=%s company_id=%s",
+        "operator_relay: reopen outbox created outbox_id=%s wamid=%s company_id=%s",
         outbox.id,
         wamid,
-        phone_e164,
         company_id,
     )
 
@@ -2572,9 +2564,9 @@ async def handle_event(
     if text and cmd is None:
         if chatwoot_origin:
             logger.debug(
-                "Skipping Chatwoot log for chatwoot-origin event dedupe_key=%s phone=%s",
-                event.dedupe_key,
-                phone_e164,
+                "Skipping Chatwoot log for chatwoot-origin event dedupe_key=%s event_id=%s",
+                safe_log_value(event.dedupe_key, limit=128),
+                event.id,
             )
         else:
             await _forward_text_to_chatwoot(
@@ -2643,10 +2635,9 @@ async def handle_event(
             canceled = await _cancel_marketing_jobs(session, phone_e164=phone_e164)
 
         logger.info(
-            "wa_cmd=%s phone=%s sender_phone_number_id=%s sender_id=%s clients_updated=%s jobs_canceled=%s event_id=%s",
+            "wa_cmd=%s sender_phone_number_id=%s sender_id=%s clients_updated=%s jobs_canceled=%s event_id=%s",
             cmd,
-            phone_e164,
-            phone_number_id,
+            safe_log_value(phone_number_id, limit=32),
             sender_id,
             affected,
             canceled,
@@ -2654,10 +2645,9 @@ async def handle_event(
         )
     else:
         logger.info(
-            "wa_cmd=%s phone=%s sender_phone_number_id=%s sender_id=%s event_id=%s",
+            "wa_cmd=%s sender_phone_number_id=%s sender_id=%s event_id=%s",
             cmd,
-            phone_e164,
-            phone_number_id,
+            safe_log_value(phone_number_id, limit=32),
             sender_id,
             event.id,
         )
@@ -2676,8 +2666,7 @@ async def handle_event(
 
     if err is not None:
         logger.warning(
-            "Ack send failed phone=%s sender_id=%s err=%s",
-            phone_e164,
+            "Ack send failed sender_id=%s err=%s",
             sender_id,
             err,
         )
@@ -2712,10 +2701,9 @@ async def handle_event(
 
     event.error = None
     logger.info(
-        "Ack sent phone=%s sender_id=%s msg_id=%s",
-        phone_e164,
+        "Ack sent sender_id=%s msg_id=%s",
         sender_id,
-        msg_id,
+        safe_log_value(msg_id, limit=64),
     )
 
 

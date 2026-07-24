@@ -420,3 +420,64 @@ async def test_lone_surrogate_delivery_dedupes_and_stores_safely(session_maker) 
     rows = await _rows(session_maker)
     assert len(rows) == 1
     json.dumps(rows[0].payload).encode("utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Structural validation of the JSON root
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("raw", [b"[]", b'"text"', b"123", b"null", b"[1,2]"])
+@pytest.mark.asyncio
+async def test_non_object_json_root_is_rejected(session_maker, raw: bytes) -> None:
+    """Never ack a payload no worker can process.
+
+    Storing it and answering 200 would tell Meta the delivery succeeded, so it
+    would never retry — while the row silently ends up unprocessed.
+    """
+    resp = await _post(session_maker, body=raw, headers={"Content-Type": "application/json"})
+
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == "JSON payload must be an object"
+    assert await _rows(session_maker) == []
+
+
+@pytest.mark.asyncio
+async def test_bad_signature_wins_over_structural_validation(session_maker, monkeypatch) -> None:
+    monkeypatch.setattr(settings, "meta_app_secret", APP_SECRET)
+
+    resp = await _post(
+        session_maker,
+        body=b"[]",
+        headers={"Content-Type": "application/json", "X-Hub-Signature-256": "sha256=deadbeef"},
+    )
+
+    assert resp.status_code == 403
+    assert await _rows(session_maker) == []
+
+
+@pytest.mark.asyncio
+async def test_valid_signature_over_non_object_root_is_400(session_maker, monkeypatch) -> None:
+    monkeypatch.setattr(settings, "meta_app_secret", APP_SECRET)
+    body = b"[]"
+
+    resp = await _post(
+        session_maker,
+        body=body,
+        headers={"Content-Type": "application/json", "X-Hub-Signature-256": _sign(body)},
+    )
+
+    assert resp.status_code == 400
+    assert await _rows(session_maker) == []
+
+
+@pytest.mark.parametrize("bad", ["[]", '"bad"', "123", "null"])
+@pytest.mark.asyncio
+async def test_malformed_nested_meta_structure_does_not_500(session_maker, bad: str) -> None:
+    """A valid object root with a malformed `entry` must still be handled."""
+    body = ('{"object":"whatsapp_business_account","entry":' + bad + "}").encode()
+
+    resp = await _post(session_maker, body=body, headers={"Content-Type": "application/json"})
+
+    assert resp.status_code == 200
+    assert len(await _rows(session_maker)) == 1

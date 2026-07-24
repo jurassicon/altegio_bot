@@ -32,10 +32,10 @@ from altegio_bot.db import SessionLocal
 from altegio_bot.models.models import WhatsAppEvent
 from altegio_bot.settings import settings
 from altegio_bot.webhooks.common import (
-    PG_BIGINT_MAX,
-    PG_BIGINT_MIN,
     bounded_dedupe_key,
+    mapping_or_empty,
     mask_query,
+    optional_chatwoot_id,
     postgres_safe_json_value,
     safe_headers,
     safe_log_value,
@@ -87,25 +87,6 @@ def _verify_signature(body: bytes, signature: str | None) -> bool:
     return False
 
 
-def _coerce_int(value: object) -> int | None:
-    """Coerce a Chatwoot numeric id (int or digit string) to int, else None.
-
-    The result goes into a BIGINT column, so a value outside the PostgreSQL
-    BIGINT range is rejected too: it would abort the INSERT rather than being
-    silently clamped. The full payload is still persisted as JSONB, so a NULL
-    projection loses nothing.
-    """
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        candidate = value
-    elif isinstance(value, str) and value.strip().isdigit():
-        candidate = int(value.strip())
-    else:
-        return None
-    return candidate if PG_BIGINT_MIN <= candidate <= PG_BIGINT_MAX else None
-
-
 def _parse_timestamp(raw: object) -> int:
     """Return Unix timestamp (seconds) from a Chatwoot created_at value."""
     try:
@@ -131,6 +112,12 @@ async def chatwoot_ingest(request: Request) -> JSONResponse:
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
+    # Structural validation runs AFTER the HMAC check above, so a malformed body
+    # still gets 403 (not 400) when the signature is wrong. `[]`/`"text"`/`123`/
+    # `null` parse fine but every branch below treats payload as a mapping.
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="JSON payload must be an object")
+
     event_type = payload.get("event")
     # event приходит из тела и не валидируется до этой строки — экранируем,
     # иначе значение вида "message_created\n2026-.. INFO forged" подделало бы
@@ -155,15 +142,21 @@ async def chatwoot_ingest(request: Request) -> JSONResponse:
     # ------------------------------------------------------------------ #
     if message_type in (1, "outgoing"):
         private = payload.get("private", False)
-        content_type = payload.get("content_type", "text")
-        sender = payload.get("sender") or {}
-        sender_type = sender.get("type", "")
+        # content_type is sender-controlled and used in a set membership test
+        # below; an unhashable value (list/dict) would raise TypeError there.
+        raw_content_type = payload.get("content_type", "text")
+        content_type = raw_content_type if isinstance(raw_content_type, str) else ""
+        sender = mapping_or_empty(payload.get("sender"))
+        # Same reason as content_type: sender_type is used in a set membership
+        # test, so an unhashable value must not reach it.
+        raw_sender_type = sender.get("type", "")
+        sender_type = raw_sender_type if isinstance(raw_sender_type, str) else ""
 
         # Skip private notes and internal activity events — always.
         if private:
             logger.debug(
                 "chatwoot_webhook: skipping private note conv_id=%s",
-                safe_log_value((payload.get("conversation") or {}).get("id"), limit=32),
+                safe_log_value(mapping_or_empty(payload.get("conversation")).get("id"), limit=32),
             )
             return JSONResponse({"ok": True, "skipped": "private_note"})
 
@@ -174,7 +167,7 @@ async def chatwoot_ingest(request: Request) -> JSONResponse:
         if settings.chatwoot_operator_relay_enabled and sender_type in _HUMAN_SENDER_TYPES:
             return await _ingest_operator_outgoing(request, payload)
 
-        conv_id = (payload.get("conversation") or {}).get("id")
+        conv_id = mapping_or_empty(payload.get("conversation")).get("id")
         msg_id = payload.get("id")
         logger.info(
             "chatwoot_webhook: skipping outgoing relay_enabled=%s"
@@ -204,8 +197,8 @@ async def _ingest_incoming(
     The whatsapp_inbox_worker will forward it to Chatwoot while loop
     prevention (_is_chatwoot_origin) ensures it is not re-sent to Meta.
     """
-    conversation = payload.get("conversation") or {}
-    sender = payload.get("sender") or {}
+    conversation = mapping_or_empty(payload.get("conversation"))
+    sender = mapping_or_empty(payload.get("sender"))
 
     phone_e164 = sender.get("phone_number")
     text = payload.get("content", "")
@@ -247,7 +240,7 @@ async def _ingest_incoming(
         "_chatwoot": {
             "conversation_id": chatwoot_conversation_id,
             "message_id": chatwoot_message_id,
-            "account_id": (payload.get("account") or {}).get("id"),
+            "account_id": mapping_or_empty(payload.get("account")).get("id"),
         },
     }
 
@@ -261,8 +254,8 @@ async def _ingest_incoming(
         dedupe_key=dedupe_key,
         normalized_payload=normalized_payload,
         # BIGINT-колонки: невалидный id даёт NULL вместо падения INSERT.
-        chatwoot_conversation_id=_coerce_int(chatwoot_conversation_id),
-        chatwoot_message_id=_coerce_int(chatwoot_message_id),
+        chatwoot_conversation_id=optional_chatwoot_id(chatwoot_conversation_id),
+        chatwoot_message_id=optional_chatwoot_id(chatwoot_message_id),
         # Только технические идентификаторы: телефон и текст сообщения — PII и в
         # логи не попадают (сами данные сохраняются в БД, где доступ ограничен).
         log_ctx={
@@ -281,19 +274,17 @@ async def _ingest_operator_outgoing(
     The whatsapp_inbox_worker will pick this up, send it through Meta API,
     and create an OutboxMessage for canonical delivery lifecycle tracking.
     """
-    conversation = payload.get("conversation") or {}
-    sender = payload.get("sender") or {}
-    conv_meta = conversation.get("meta") or {}
-    contact = conv_meta.get("sender") or {}
+    conversation = mapping_or_empty(payload.get("conversation"))
+    sender = mapping_or_empty(payload.get("sender"))
+    conv_meta = mapping_or_empty(conversation.get("meta"))
+    contact = mapping_or_empty(conv_meta.get("sender"))
 
     chatwoot_message_id = payload.get("id")
     chatwoot_conversation_id = conversation.get("id")
     chatwoot_inbox_id = conversation.get("inbox_id")
     text = payload.get("content", "")
-    content_attributes = payload.get("content_attributes") or {}
-    if not isinstance(content_attributes, dict):
-        content_attributes = {}
-    reply_to_chatwoot_message_id = _coerce_int(content_attributes.get("in_reply_to"))
+    content_attributes = mapping_or_empty(payload.get("content_attributes"))
+    reply_to_chatwoot_message_id = optional_chatwoot_id(content_attributes.get("in_reply_to"))
 
     # Recipient phone is the contact (customer) in the conversation.
     recipient_phone = contact.get("phone_number")
@@ -339,8 +330,8 @@ async def _ingest_operator_outgoing(
         request=request,
         dedupe_key=dedupe_key,
         normalized_payload=normalized_payload,
-        chatwoot_conversation_id=_coerce_int(chatwoot_conversation_id),
-        chatwoot_message_id=_coerce_int(chatwoot_message_id),
+        chatwoot_conversation_id=optional_chatwoot_id(chatwoot_conversation_id),
+        chatwoot_message_id=optional_chatwoot_id(chatwoot_message_id),
         log_ctx={
             "conv_id": chatwoot_conversation_id,
             "msg_id": chatwoot_message_id,

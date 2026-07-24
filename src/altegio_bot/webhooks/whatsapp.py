@@ -115,6 +115,7 @@ async def whatsapp_ingest(request: Request) -> Response:
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
     app_secret = getattr(settings, "meta_app_secret", "")
+
     if app_secret:
         sig = request.headers.get("x-hub-signature-256") or request.headers.get("X-Hub-Signature-256")
         if not _verify_signature(
@@ -124,6 +125,17 @@ async def whatsapp_ingest(request: Request) -> Response:
         ):
             logger.warning("Webhook signature mismatch")
             raise HTTPException(status_code=403, detail="Bad signature")
+
+    # Structural validation deliberately runs AFTER the signature check, so an
+    # unsigned malformed body is still a 403 rather than a 400.
+    #
+    # A non-object root (`[]`, `"text"`, `123`, `null`) parses fine but no worker
+    # can process it. Persisting it and answering 200 would be the worst outcome:
+    # Meta treats the delivery as accepted and never retries, while the row later
+    # ends up failed/processed without anything actually happening — the event is
+    # lost for good. Reject it instead so Meta can retry.
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="JSON payload must be an object")
 
     pni = _extract_phone_number_id(payload)
     allowed = _parse_allowed_phone_number_ids()

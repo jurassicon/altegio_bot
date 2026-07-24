@@ -327,3 +327,49 @@ async def test_valid_payload_scalars_are_preserved(session_maker) -> None:
     assert row.resource_id == 42
     assert row.event_status == "create"
     assert row.dedupe_key == _old_dedupe_key(payload, {"secret": SECRET})
+
+
+# ---------------------------------------------------------------------------
+# Structural validation of the JSON root and nested containers
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("raw", [b"[]", b'"text"', b"123", b"null", b"[1,2]"])
+@pytest.mark.asyncio
+async def test_non_object_json_root_is_rejected(session_maker, raw: bytes) -> None:
+    """Syntactically valid but not a mapping — controlled 400, nothing stored."""
+    resp = await _post_raw(session_maker, raw)
+
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == "JSON payload must be an object"
+    assert await _rows(session_maker) == []
+
+
+@pytest.mark.asyncio
+async def test_non_object_root_still_requires_a_valid_secret(session_maker) -> None:
+    """Auth runs first: a bad secret is 403, not 400."""
+    with patch.object(settings, "altegio_webhook_secret", SECRET):
+        with patch.object(main_module, "SessionLocal", session_maker):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as tc:
+                resp = await tc.post(
+                    f"{URL}?secret=wrong",
+                    content=b"[]",
+                    headers={"Content-Type": "application/json"},
+                )
+
+    assert resp.status_code == 403
+    assert await _rows(session_maker) == []
+
+
+@pytest.mark.parametrize("bad_data", ["[]", '"bad"', "123", "null"])
+@pytest.mark.asyncio
+async def test_malformed_data_container_does_not_500(session_maker, bad_data: str) -> None:
+    """`data` feeds the dedupe key; `or {}` would not save a truthy list."""
+    body = ('{"company_id":1,"resource":"record","resource_id":42,"status":"create","data":' + bad_data + "}").encode()
+
+    resp = await _post_raw(session_maker, body)
+
+    assert resp.status_code == 200
+    rows = await _rows(session_maker)
+    assert len(rows) == 1
+    assert rows[0].company_id == 1

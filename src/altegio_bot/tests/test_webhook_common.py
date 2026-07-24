@@ -18,6 +18,8 @@ from altegio_bot.webhooks.common import (
     bounded_text,
     canonical_json_hash,
     contains_nul,
+    mapping_or_empty,
+    optional_chatwoot_id,
     optional_int,
     postgres_safe_json_hash,
     postgres_safe_json_value,
@@ -191,3 +193,67 @@ def test_bounded_dedupe_key_bounds_hostile_ids() -> None:
 
 def test_bounded_dedupe_key_strips_nul() -> None:
     assert NUL not in bounded_dedupe_key("chatwoot", f"a{NUL}b", 1)
+
+
+# ---------------------------------------------------------------------------
+# mapping_or_empty
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("bad", [[], [1, 2], "text", 123, 1.5, None, True])
+def test_mapping_or_empty_replaces_non_mappings(bad: object) -> None:
+    """`x or {}` is not enough: a non-empty list is truthy and then .get() blows up."""
+    assert mapping_or_empty(bad) == {}
+
+
+def test_mapping_or_empty_passes_through_dicts() -> None:
+    d = {"id": 1}
+    assert mapping_or_empty(d) is d
+    assert mapping_or_empty({}) == {}
+
+
+# ---------------------------------------------------------------------------
+# optional_chatwoot_id: non-negative BIGINT only
+# ---------------------------------------------------------------------------
+
+
+def test_optional_chatwoot_id_accepts_non_negative() -> None:
+    assert optional_chatwoot_id(42) == 42
+    assert optional_chatwoot_id("42") == 42
+    assert optional_chatwoot_id(0) == 0
+    assert optional_chatwoot_id(PG_BIGINT_MAX) == PG_BIGINT_MAX
+
+
+def test_optional_chatwoot_id_rejects_negative() -> None:
+    """Deliberate: a negative Chatwoot id is meaningless, so it is not coerced."""
+    assert optional_chatwoot_id(-42) is None
+    assert optional_chatwoot_id("-42") is None
+
+
+def test_optional_chatwoot_id_rejects_bool_and_garbage() -> None:
+    assert optional_chatwoot_id(True) is None
+    assert optional_chatwoot_id(False) is None
+    assert optional_chatwoot_id("abc") is None
+    assert optional_chatwoot_id(None) is None
+    assert optional_chatwoot_id(1.5) is None
+    assert optional_chatwoot_id({"a": 1}) is None
+    assert optional_chatwoot_id([1]) is None
+
+
+def test_optional_chatwoot_id_survives_a_5000_digit_string() -> None:
+    """isdigit() passes but int() raises ValueError past the decimal limit."""
+    assert optional_chatwoot_id("9" * 5000) is None
+
+
+def test_optional_chatwoot_id_rejects_out_of_range() -> None:
+    assert optional_chatwoot_id(2**70) is None
+    assert optional_chatwoot_id(PG_BIGINT_MAX + 1) is None
+
+
+def test_optional_int_survives_a_5000_digit_string() -> None:
+    assert optional_int("9" * 5000) is None
+
+
+def test_optional_int_min_value_bound() -> None:
+    assert optional_int(-1, min_value=0) is None
+    assert optional_int(0, min_value=0) == 0

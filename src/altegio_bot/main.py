@@ -18,6 +18,7 @@ from .webhooks.chatwoot import router as chatwoot_router
 from .webhooks.common import (
     bounded_text,
     canonical_json_hash,
+    mapping_or_empty,
     mask_query,
     optional_int,
     postgres_safe_json_value,
@@ -126,7 +127,9 @@ def _make_dedupe_key(payload: dict[str, Any], query: dict[str, Any]) -> str:
     resource = payload.get("resource") or payload.get("type")
     resource_id = payload.get("resource_id")
     event_status = payload.get("status")
-    last_change = (payload.get("data") or {}).get("last_change_date")
+    # `data` is sender-controlled: `"data": []` is truthy, so `or {}` would not
+    # protect the .get() below.
+    last_change = mapping_or_empty(payload.get("data")).get("last_change_date")
     secret = query.get("secret") or query.get("userGuid")
 
     main_fields = [company_id, resource, resource_id, event_status]
@@ -165,6 +168,12 @@ async def altegio_webhook(request: Request) -> dict[str, bool]:
         payload = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    # `[]`, `"text"`, `123` и `null` — синтаксически валидный JSON, но весь код
+    # ниже (и воркер) работает с payload как со словарём. Без этой проверки
+    # получили бы необработанный AttributeError/TypeError, то есть 500.
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="JSON payload must be an object")
 
     # 3) сохраняем в inbox
     dedupe_key = _make_dedupe_key(payload, query)
