@@ -90,6 +90,88 @@ def postgres_safe_text(value: str) -> str:
     return safe
 
 
+def postgres_safe_json_value(value: object) -> object:
+    """Рекурсивно приводит разобранный JSON к виду, который примет Postgres JSONB.
+
+    Строки (и строковые ключи) прогоняются через :func:`postgres_safe_text`;
+    контейнеры обходятся рекурсивно; числа, bool и None остаются как есть.
+    Исходный объект НЕ мутируется — возвращается новая структура, потому что
+    оригинал ещё нужен для дедуп-ключей и уже посчитанных подписей.
+
+    Нужно для сохраняемой проекции payload: тело вебхука контролируется
+    отправителем, ``json.loads`` спокойно принимает и NUL (``\\u0000``), и
+    непарные суррогаты, а INSERT в JSONB на них падает — то есть один дефектный
+    вебхук иначе превращается в бесконечную серию 500 на каждом ретрае.
+    """
+    if isinstance(value, str):
+        return postgres_safe_text(value)
+    if isinstance(value, dict):
+        return {
+            (postgres_safe_text(k) if isinstance(k, str) else k): postgres_safe_json_value(v) for k, v in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        # tuple → list: JSON-совместимое представление.
+        return [postgres_safe_json_value(item) for item in value]
+    return value
+
+
+# Маркер, которым помечается обрезанное значение в логах.
+_LOG_TRUNCATION_MARKER = "...<truncated>"
+
+
+def _escape_for_log(value: str, *, limit: int) -> str:
+    """Однострочное экранированное представление, ограниченное ПО ИТОГОВОЙ длине.
+
+    Лимит применяется к экранированному результату, а не к исходной строке:
+    один astral-символ разворачивается в две ``\\uXXXX``-последовательности (12
+    символов), поэтому обрезка входа не давала бы никакой гарантии на размер
+    лога. Сборка идёт посимвольно, чтобы не разрезать escape-последовательность
+    пополам, и результат всегда остаётся синтаксически однозначным.
+    """
+    escaped = json.dumps(value, ensure_ascii=True)
+    if len(escaped) <= limit:
+        return escaped
+
+    # Две кавычки + маркер обрезки должны поместиться в лимит.
+    budget = limit - 2 - len(_LOG_TRUNCATION_MARKER)
+    if budget <= 0:
+        return '"' + _LOG_TRUNCATION_MARKER[: max(limit - 2, 0)] + '"'
+
+    out: list[str] = []
+    used = 0
+    for ch in value:
+        piece = json.dumps(ch, ensure_ascii=True)[1:-1]
+        if used + len(piece) > budget:
+            break
+        out.append(piece)
+        used += len(piece)
+
+    return '"' + "".join(out) + _LOG_TRUNCATION_MARKER + '"'
+
+
+def safe_log_path(path: str, *, limit: int = 2048) -> str:
+    """Экранированный и ограниченный по длине путь, пригодный для записи в лог.
+
+    Путь полностью контролируется клиентом и не требует валидного токена, то
+    есть это классический вектор log injection: перевод строки подделал бы
+    отдельную log-строку, ANSI-escape перекрасил бы вывод, а U+2028/U+2029
+    разорвали бы строку в части просмотрщиков. Экранирование закрывает всё
+    разом; длина ограничена по итоговому результату.
+    """
+    return _escape_for_log(path, limit=limit)
+
+
+def safe_log_value(value: object, *, limit: int = 256) -> str:
+    """То же для произвольного значения, попадающего в application-лог.
+
+    Значения вебхуков (event, content_type, sender_type, id) приходят от
+    отправителя и не валидируются до логирования — их нельзя писать дословно.
+    Helper ничего не раскрывает сверх того, что ему передали: минимизация
+    данных — обязанность вызывающего кода.
+    """
+    return _escape_for_log(value if isinstance(value, str) else str(value), limit=limit)
+
+
 def contains_nul(value: object) -> bool:
     """Рекурсивно ищет NUL в разобранном JSON-значении (ключи и значения).
 

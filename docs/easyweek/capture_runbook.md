@@ -26,6 +26,26 @@ cp easyweek.env.example easyweek.env
 python3 -c "import secrets; print(secrets.token_urlsafe(32))"
 ```
 
+Схему создают ДВЕ ревизии: `8923be993170` (базовая таблица) и `8705ec49cc73`
+(колонки `body_raw`/`body_size_bytes`). Вторая аддитивна и идемпотентна, поэтому
+`upgrade head` чинит и среду, где успели применить только базовую. Совместимость
+покрыта автотестом на одноразовой БД:
+
+```bash
+uv run pytest src/altegio_bot/tests/test_easyweek_migration_integration.py
+```
+
+Тест требует роль с `CREATEDB`. Если у локальной роли её нет, он пропустится с
+подсказкой — тогда прогоните его против одноразового сервера:
+
+```bash
+docker run -d --name ew-mig -e POSTGRES_PASSWORD=postgres -p 55433:5432 postgres:16-alpine
+```
+
+```bash
+ALTEGIO_MIGTEST_DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:55433/postgres uv run pytest src/altegio_bot/tests/test_easyweek_migration_integration.py
+```
+
 Вписать в `easyweek.env` `EASYWEEK_WEBHOOK_SECRET=<секрет>` и
 `EASYWEEK_ENABLED=true`, применить миграцию и пересоздать контейнер:
 

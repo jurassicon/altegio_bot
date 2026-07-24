@@ -14,10 +14,20 @@ from sqlalchemy.exc import IntegrityError
 from altegio_bot.db import SessionLocal
 from altegio_bot.models.models import WhatsAppEvent
 from altegio_bot.settings import settings
+from altegio_bot.webhooks.common import (
+    mask_query,
+    postgres_safe_json_value,
+    safe_headers,
+    safe_log_value,
+)
 
 logger = logging.getLogger("whatsapp_webhook")
 
 router = APIRouter()
+
+# Заголовок с HMAC-подписью Meta. Проверяется по живому запросу до записи,
+# поэтому из сохраняемой копии заголовков его нужно выбросить.
+_META_SIGNATURE_HEADERS = frozenset({"x-hub-signature-256", "x-hub-signature"})
 
 
 def _payload_dedupe_key(payload: dict[str, Any]) -> str:
@@ -98,9 +108,6 @@ async def whatsapp_ingest(request: Request) -> Response:
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
-    query = dict(request.query_params)
-    headers = dict(request.headers)
-
     app_secret = getattr(settings, "meta_app_secret", "")
     if app_secret:
         sig = request.headers.get("x-hub-signature-256") or request.headers.get("X-Hub-Signature-256")
@@ -122,11 +129,19 @@ async def whatsapp_ingest(request: Request) -> Response:
     if pni is not None and allowed and pni not in allowed:
         status = "ignored"
         ignored = True
-        error = f"Ignored: phone_number_id not allowed ({pni})"
-        logger.info("Ignored webhook event phone_number_id=%s", pni)
+        # pni приходит из payload: и в TEXT-колонку error, и в лог он попадает
+        # только приведённым к безопасному виду.
+        error = f"Ignored: phone_number_id not allowed ({safe_log_value(pni, limit=64)})"
+        logger.info("Ignored webhook event phone_number_id=%s", safe_log_value(pni, limit=64))
 
+    # Дедуп-ключ считается по ОРИГИНАЛЬНОМУ payload — санитизация ниже касается
+    # только сохраняемой проекции, поэтому семантика дедупликации не меняется.
     dedupe_key = _payload_dedupe_key(payload)
 
+    # Подпись уже проверена выше по исходным байтам body; теперь можно готовить
+    # безопасную копию metadata: маскируем секреты в query, выбрасываем
+    # authorization/cookie и подпись Meta, приводим строки к Postgres-безопасному
+    # виду (NUL/суррогаты иначе роняют commit).
     async with SessionLocal() as session:
         try:
             async with session.begin():
@@ -134,9 +149,9 @@ async def whatsapp_ingest(request: Request) -> Response:
                     dedupe_key=dedupe_key,
                     status=status,
                     error=error,
-                    query=query,
-                    headers=headers,
-                    payload=payload,
+                    query=mask_query(dict(request.query_params)),
+                    headers=safe_headers(request, extra_deny=_META_SIGNATURE_HEADERS),
+                    payload=postgres_safe_json_value(payload),
                 )
                 session.add(evt)
                 await session.flush()

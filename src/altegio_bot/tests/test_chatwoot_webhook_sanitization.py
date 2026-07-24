@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -23,6 +24,10 @@ from altegio_bot.settings import settings
 from altegio_bot.webhooks.common import safe_headers
 
 URL = "/webhook/chatwoot"
+NUL = chr(0)
+LONE_SURROGATE = chr(0xD800)
+LINE_SEP = chr(0x2028)
+PARA_SEP = chr(0x2029)
 
 
 def _incoming(conversation_id: int = 501, message_id: int = 5001) -> dict:
@@ -176,4 +181,171 @@ async def test_valid_hmac_signature_is_accepted(session_maker, monkeypatch) -> N
         cw_module.SessionLocal = original
 
     assert resp.status_code == 200
+    assert len(await _rows(session_maker)) == 1
+
+
+def _operator_payload(*, agent_name: str = "Agent", contact_name: str = "Customer", text: str = "reply") -> dict:
+    return {
+        "event": "message_created",
+        "id": 7001,
+        "content": text,
+        "message_type": 1,
+        "private": False,
+        "content_type": "text",
+        "conversation": {
+            "id": 701,
+            "inbox_id": 123,
+            "meta": {"sender": {"phone_number": "+4915112345678", "name": contact_name}},
+        },
+        "sender": {"type": "agent", "name": agent_name, "id": 9},
+        "account": {"id": 2},
+    }
+
+
+async def _post_raw(session_maker, body: bytes, headers: dict | None = None):
+    original = cw_module.SessionLocal
+    try:
+        cw_module.SessionLocal = session_maker  # type: ignore[assignment]
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as tc:
+            return await tc.post(URL, content=body, headers=headers or {"Content-Type": "application/json"})
+    finally:
+        cw_module.SessionLocal = original
+
+
+# ---------------------------------------------------------------------------
+# Persisted payload must survive PostgreSQL JSONB
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_customer_content_with_nul_is_stored(session_maker) -> None:
+    """A NUL inside message content passes json.loads but JSONB rejects it."""
+    payload = _incoming()
+    payload["content"] = f"a{NUL}b"
+    body = json.dumps(payload).encode()
+    assert b"\\u0000" in body
+
+    resp = await _post_raw(session_maker, body)
+
+    assert resp.status_code == 200
+    rows = await _rows(session_maker)
+    assert len(rows) == 1
+    stored = json.dumps(rows[0].payload)
+    assert NUL not in stored
+    # Sanitised, not dropped: the surrounding text is still there.
+    text_body = rows[0].payload["entry"][0]["changes"][0]["value"]["messages"][0]["text"]["body"]
+    assert text_body.startswith("a")
+    assert text_body.endswith("b")
+
+
+@pytest.mark.asyncio
+async def test_customer_content_with_nul_still_passes_hmac(session_maker, monkeypatch) -> None:
+    """HMAC is computed over the original body; sanitization is storage-only."""
+    monkeypatch.setattr(settings, "chatwoot_webhook_secret", "hmac-secret")
+    payload = _incoming()
+    payload["content"] = f"x{NUL}y"
+    body = json.dumps(payload).encode()
+    signature = hmac.new(b"hmac-secret", body, hashlib.sha256).hexdigest()
+
+    resp = await _post_raw(
+        session_maker,
+        body,
+        headers={"Content-Type": "application/json", "X-Chatwoot-Signature": signature},
+    )
+
+    assert resp.status_code == 200
+    assert len(await _rows(session_maker)) == 1
+
+
+@pytest.mark.asyncio
+async def test_agent_and_contact_names_with_surrogate_are_stored(session_maker, monkeypatch) -> None:
+    """Lone surrogates in operator metadata must not break the commit."""
+    monkeypatch.setattr(settings, "chatwoot_operator_relay_enabled", True)
+    payload = _operator_payload(
+        agent_name=f"Anna{LONE_SURROGATE}",
+        contact_name=f"Bob{LONE_SURROGATE}",
+    )
+    body = json.dumps(payload).encode()
+
+    resp = await _post_raw(session_maker, body)
+
+    assert resp.status_code == 200
+    rows = await _rows(session_maker)
+    assert len(rows) == 1
+    # Round-trips through JSONB without raising.
+    json.dumps(rows[0].payload).encode("utf-8")
+
+
+@pytest.mark.asyncio
+async def test_clean_payload_is_stored_unchanged(session_maker) -> None:
+    payload = _incoming()
+    payload["content"] = "ganz normaler Text"
+    resp = await _post_raw(session_maker, json.dumps(payload).encode())
+
+    assert resp.status_code == 200
+    row = (await _rows(session_maker))[0]
+    text_body = row.payload["entry"][0]["changes"][0]["value"]["messages"][0]["text"]["body"]
+    assert text_body == "ganz normaler Text"
+
+
+# ---------------------------------------------------------------------------
+# Application log hygiene
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "hostile_event",
+    [
+        "message_created\n2026-07-24 INFO forged",
+        "message_created\rforged",
+        "message_created\x1b[31mred",
+        "message_created" + LINE_SEP + "forged",
+        "message_created" + PARA_SEP + "forged",
+        "m" * 5000,
+    ],
+)
+@pytest.mark.asyncio
+async def test_hostile_event_name_cannot_inject_a_log_line(session_maker, caplog, hostile_event) -> None:
+    payload = _incoming()
+    payload["event"] = hostile_event
+
+    with caplog.at_level(logging.INFO, logger="chatwoot_webhook"):
+        resp = await _post_raw(session_maker, json.dumps(payload).encode())
+
+    assert resp.status_code == 200
+    records = [r for r in caplog.records if r.name == "chatwoot_webhook"]
+    assert len(records) == 1
+    message = records[0].getMessage()
+    for ch in ("\n", "\r", "\x1b", LINE_SEP, PARA_SEP):
+        assert ch not in message
+    # Bounded: a 5000-char event name cannot flood the log.
+    assert len(message) < 300
+
+
+@pytest.mark.asyncio
+async def test_phone_and_message_text_never_reach_the_logs(session_maker, caplog) -> None:
+    payload = _incoming()
+    payload["content"] = "STRENG GEHEIMER KUNDENTEXT"
+    payload["sender"]["phone_number"] = "+4915199999999"
+
+    with caplog.at_level(logging.DEBUG):
+        resp = await _post_raw(session_maker, json.dumps(payload).encode())
+
+    assert resp.status_code == 200
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert "STRENG GEHEIMER KUNDENTEXT" not in logged
+    assert "+4915199999999" not in logged
+    # Technical metadata is still there for diagnostics.
+    assert "conv_id" in logged
+
+
+@pytest.mark.asyncio
+async def test_dedupe_semantics_unchanged(session_maker, caplog) -> None:
+    body = json.dumps(_incoming()).encode()
+
+    first = await _post_raw(session_maker, body)
+    second = await _post_raw(session_maker, body)
+
+    assert first.json()["duplicate"] is False
+    assert second.json()["duplicate"] is True
     assert len(await _rows(session_maker)) == 1

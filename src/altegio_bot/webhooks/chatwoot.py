@@ -31,7 +31,12 @@ from sqlalchemy.exc import IntegrityError
 from altegio_bot.db import SessionLocal
 from altegio_bot.models.models import WhatsAppEvent
 from altegio_bot.settings import settings
-from altegio_bot.webhooks.common import mask_query, safe_headers
+from altegio_bot.webhooks.common import (
+    mask_query,
+    postgres_safe_json_value,
+    safe_headers,
+    safe_log_value,
+)
 
 logger = logging.getLogger("chatwoot_webhook")
 
@@ -116,7 +121,10 @@ async def chatwoot_ingest(request: Request) -> JSONResponse:
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
     event_type = payload.get("event")
-    logger.info("chatwoot_webhook: event=%s", event_type)
+    # event приходит из тела и не валидируется до этой строки — экранируем,
+    # иначе значение вида "message_created\n2026-.. INFO forged" подделало бы
+    # отдельную запись в application-логе.
+    logger.info("chatwoot_webhook: event=%s", safe_log_value(event_type, limit=64))
 
     if event_type != "message_created":
         return JSONResponse({"ok": True, "skipped": f"event={event_type}"})
@@ -142,7 +150,7 @@ async def chatwoot_ingest(request: Request) -> JSONResponse:
         if private:
             logger.debug(
                 "chatwoot_webhook: skipping private note conv_id=%s",
-                (payload.get("conversation") or {}).get("id"),
+                safe_log_value((payload.get("conversation") or {}).get("id"), limit=32),
             )
             return JSONResponse({"ok": True, "skipped": "private_note"})
 
@@ -160,12 +168,12 @@ async def chatwoot_ingest(request: Request) -> JSONResponse:
             " message_type=%s sender_type=%s private=%s"
             " content_type=%s conv_id=%s msg_id=%s",
             settings.chatwoot_operator_relay_enabled,
-            message_type,
-            sender_type,
-            private,
-            content_type,
-            conv_id,
-            msg_id,
+            safe_log_value(message_type, limit=32),
+            safe_log_value(sender_type, limit=32),
+            bool(private),
+            safe_log_value(content_type, limit=32),
+            safe_log_value(conv_id, limit=32),
+            safe_log_value(msg_id, limit=32),
         )
         return JSONResponse({"ok": True, "skipped": f"message_type={message_type}"})
 
@@ -236,11 +244,11 @@ async def _ingest_incoming(
         normalized_payload=normalized_payload,
         chatwoot_conversation_id=chatwoot_conversation_id,
         chatwoot_message_id=_coerce_int(chatwoot_message_id),
+        # Только технические идентификаторы: телефон и текст сообщения — PII и в
+        # логи не попадают (сами данные сохраняются в БД, где доступ ограничен).
         log_ctx={
             "conv_id": chatwoot_conversation_id,
             "msg_id": chatwoot_message_id,
-            "phone": phone_e164,
-            "text": text[:50],
         },
     )
 
@@ -274,8 +282,8 @@ async def _ingest_operator_outgoing(
     if not recipient_phone:
         logger.warning(
             "chatwoot_webhook: operator_outgoing missing recipient phone conv_id=%s msg_id=%s",
-            chatwoot_conversation_id,
-            chatwoot_message_id,
+            safe_log_value(chatwoot_conversation_id, limit=32),
+            safe_log_value(chatwoot_message_id, limit=32),
         )
         # Accept but skip — we cannot route without a phone number.
         return JSONResponse({"ok": True, "skipped": "no_recipient_phone"})
@@ -301,12 +309,11 @@ async def _ingest_operator_outgoing(
 
     dedupe_key = f"chatwoot_out:{chatwoot_conversation_id}:{chatwoot_message_id}"
 
+    # Ни телефона получателя, ни имени агента — это PII.
     logger.info(
-        "chatwoot_webhook: operator_outgoing accepted conv_id=%s msg_id=%s phone=%s agent=%s",
-        chatwoot_conversation_id,
-        chatwoot_message_id,
-        recipient_phone,
-        sender.get("name", ""),
+        "chatwoot_webhook: operator_outgoing accepted conv_id=%s msg_id=%s",
+        safe_log_value(chatwoot_conversation_id, limit=32),
+        safe_log_value(chatwoot_message_id, limit=32),
     )
 
     return await _store_event(
@@ -318,7 +325,6 @@ async def _ingest_operator_outgoing(
         log_ctx={
             "conv_id": chatwoot_conversation_id,
             "msg_id": chatwoot_message_id,
-            "phone": recipient_phone,
         },
     )
 
@@ -348,7 +354,12 @@ async def _store_event(
                     # живому заголовку.
                     query=mask_query(dict(request.query_params)),
                     headers=safe_headers(request, extra_deny={_CHATWOOT_SIGNATURE_HEADER}),
-                    payload=normalized_payload,
+                    # Сохраняемая проекция. Содержимое сообщения, имена агента и
+                    # контакта контролируются отправителем: NUL или непарный
+                    # суррогат внутри них прошёл бы json.loads и проверку HMAC,
+                    # но уронил бы INSERT в JSONB. Подпись уже проверена по
+                    # исходным байтам body, так что менять проекцию безопасно.
+                    payload=postgres_safe_json_value(normalized_payload),
                     chatwoot_conversation_id=chatwoot_conversation_id,
                     chatwoot_message_id=chatwoot_message_id,
                 )
@@ -357,8 +368,8 @@ async def _store_event(
 
                 logger.info(
                     "chatwoot_webhook: saved dedupe_key=%s ctx=%s",
-                    dedupe_key,
-                    log_ctx,
+                    safe_log_value(dedupe_key, limit=128),
+                    safe_log_value(log_ctx, limit=128),
                 )
 
                 return JSONResponse(
@@ -372,7 +383,7 @@ async def _store_event(
 
         except IntegrityError:
             await session.rollback()
-            logger.info("chatwoot_webhook: duplicate dedupe_key=%s", dedupe_key)
+            logger.info("chatwoot_webhook: duplicate dedupe_key=%s", safe_log_value(dedupe_key, limit=128))
             return JSONResponse(
                 {
                     "ok": True,

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 import time
 from typing import Any
@@ -16,7 +15,15 @@ from .ops.router import login_router as ops_login_router
 from .ops.router import router as ops_router
 from .settings import settings
 from .webhooks.chatwoot import router as chatwoot_router
-from .webhooks.common import mask_query, safe_headers, token_matches
+from .webhooks.common import (
+    canonical_json_hash,
+    mask_query,
+    postgres_safe_json_value,
+    postgres_safe_text,
+    safe_headers,
+    safe_log_path,
+    token_matches,
+)
 from .webhooks.easyweek import router as easyweek_router
 from .webhooks.whatsapp import router as whatsapp_router
 
@@ -41,20 +48,6 @@ app.include_router(ops_router)  # protected: /ops/ (HTML dashboard)
 # HTTP-методы, которые вообще может нести ASGI-scope. Метод приходит от клиента,
 # поэтому в лог пишется только из этого белого списка, иначе — "INVALID".
 _KNOWN_METHODS = frozenset({"GET", "HEAD", "POST", "PUT", "DELETE", "CONNECT", "OPTIONS", "TRACE", "PATCH"})
-
-
-def safe_log_path(path: str, *, limit: int = 2048) -> str:
-    """Экранированный и ограниченный по длине путь, пригодный для записи в лог.
-
-    Путь полностью контролируется клиентом и не требует валидного токена, то
-    есть это классический вектор log injection: перевод строки подделал бы
-    отдельную log-строку, ANSI-escape перекрасил бы вывод, а U+2028/U+2029
-    разорвали бы строку в части просмотрщиков. ``json.dumps(ensure_ascii=True)``
-    закрывает всё разом: управляющие байты (``\\n``, ``\\r``, ``\\x1b``) → их
-    ``\\uXXXX``-формы, любой не-ASCII (включая U+2028/U+2029) тоже \\u-экранируется,
-    результат — одна строка в кавычках. Длину режем ДО сериализации.
-    """
-    return json.dumps(path[:limit], ensure_ascii=True)
 
 
 def _safe_log_method(method: str) -> str:
@@ -108,6 +101,20 @@ class AccessLogMiddleware:
 app.add_middleware(AccessLogMiddleware)
 
 
+def _sha256_text(value: str) -> str:
+    """sha256 строки, устойчивый к не кодируемому в UTF-8 содержимому.
+
+    Непарные суррогаты попадают сюда из ``json.loads`` (``"\\ud800"``) и валят
+    ``.encode("utf-8")`` — дефект содержимого стал бы необработанным 500. Для
+    корректных строк путь и хэш не меняются: fallback срабатывает только там,
+    где раньше было исключение.
+    """
+    try:
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()
+    except UnicodeEncodeError:
+        return hashlib.sha256(postgres_safe_text(value).encode("utf-8")).hexdigest()
+
+
 def _make_dedupe_key(payload: dict[str, Any], query: dict[str, Any]) -> str:
     """
     Стабильный ключ, чтобы одинаковый вебхук не обработался дважды.
@@ -122,18 +129,18 @@ def _make_dedupe_key(payload: dict[str, Any], query: dict[str, Any]) -> str:
 
     main_fields = [company_id, resource, resource_id, event_status]
     if any(x is None for x in main_fields):
-        canon = json.dumps(
-            payload,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        digest = hashlib.sha256(canon.encode("utf-8")).hexdigest()
+        # canonical_json_hash даёт ровно ту же канон-форму (ensure_ascii=False,
+        # sort_keys, компактные разделители) и тот же sha256, что прежний
+        # локальный json.dumps — ключи существующих строк не меняются.
+        try:
+            digest = canonical_json_hash(payload)
+        except UnicodeEncodeError:
+            digest = canonical_json_hash(postgres_safe_json_value(payload))
         base = f"fallback:{digest}"
     else:
         base = f"{company_id}:{resource}:{resource_id}:{event_status}:{last_change}:{secret}"
 
-    return hashlib.sha256(base.encode("utf-8")).hexdigest()
+    return _sha256_text(base)
 
 
 @app.get("/health")
@@ -172,7 +179,10 @@ async def altegio_webhook(request: Request) -> dict[str, bool]:
         # операция с бэкапом.
         query=mask_query(query),
         headers=safe_headers(request),
-        payload=payload,
+        # Сохраняемая проекция: NUL/суррогаты в строках payload иначе роняют
+        # INSERT в JSONB. Дедуп-ключ выше посчитан по ОРИГИНАЛУ, поэтому
+        # семантика дедупликации не меняется.
+        payload=postgres_safe_json_value(payload),
     )
 
     async with SessionLocal() as session:

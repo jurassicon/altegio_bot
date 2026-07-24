@@ -14,6 +14,7 @@ import logging
 import pytest
 
 from altegio_bot.main import AccessLogMiddleware, safe_log_path
+from altegio_bot.webhooks.common import safe_log_value
 
 LINE_SEP = chr(0x2028)
 PARA_SEP = chr(0x2029)
@@ -174,3 +175,60 @@ async def test_non_http_scope_is_passed_through() -> None:
 
     await AccessLogMiddleware(_lifespan_app)({"type": "lifespan"}, None, None)
     assert seen["type"] == "lifespan"
+
+
+# ---------------------------------------------------------------------------
+# Honest output limits: the cap applies to the ESCAPED result
+# ---------------------------------------------------------------------------
+
+ASTRAL = chr(0x1F600)  # emoji — two \uXXXX escapes (12 chars) per character
+
+
+def test_ascii_path_under_limit_is_returned_whole() -> None:
+    out = safe_log_path("/webhooks/easyweek")
+    assert out == '"/webhooks/easyweek"'
+    assert "truncated" not in out
+
+
+def test_10000_ascii_chars_respect_the_limit() -> None:
+    out = safe_log_path("/" + "a" * 10_000, limit=2048)
+    assert len(out) <= 2048
+    assert out.endswith('<truncated>"')
+
+
+def test_2048_astral_chars_respect_the_limit() -> None:
+    """Regression: capping the INPUT let 2048 emoji expand to ~24KB of log."""
+    out = safe_log_path("/" + ASTRAL * 2048, limit=2048)
+    assert len(out) <= 2048
+    assert out.isascii()
+    assert out.endswith('<truncated>"')
+
+
+def test_truncation_never_splits_an_escape_sequence() -> None:
+    out = safe_log_path("/" + ASTRAL * 2048, limit=2048)
+    # Strip quotes and the marker, then confirm the remainder is whole escapes.
+    inner = out[1:-1]
+    assert inner.endswith("...<truncated>")
+    body = inner[: -len("...<truncated>")]
+    escapes = body.lstrip("/")
+    assert len(escapes) % 6 == 0  # each \uXXXX is exactly 6 chars
+    assert escapes.count("\\u") == len(escapes) // 6
+
+
+def test_control_characters_are_escaped_within_the_limit() -> None:
+    out = safe_log_path("/x" + "\n\r\x1b" * 1000, limit=256)
+    assert len(out) <= 256
+    for ch in ("\n", "\r", "\x1b"):
+        assert ch not in out
+
+
+def test_safe_log_value_uses_the_same_length_semantics() -> None:
+    out = safe_log_value(ASTRAL * 1000, limit=128)
+    assert len(out) <= 128
+    assert out.isascii()
+    assert out.endswith('<truncated>"')
+
+
+def test_safe_log_value_keeps_short_identifiers_readable() -> None:
+    assert safe_log_value("message_created") == '"message_created"'
+    assert safe_log_value(12345) == '"12345"'
