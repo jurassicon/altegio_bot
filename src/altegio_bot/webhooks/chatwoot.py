@@ -22,6 +22,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException, Request
@@ -88,13 +89,27 @@ def _verify_signature(body: bytes, signature: str | None) -> bool:
 
 
 def _parse_timestamp(raw: object) -> int:
-    """Return Unix timestamp (seconds) from a Chatwoot created_at value."""
+    """Return Unix timestamp (seconds) from a Chatwoot created_at value.
+
+    ``created_at`` is sender-controlled and optional, so anything unusable falls
+    back to ``now`` rather than raising. Non-finite numbers must be rejected
+    BEFORE ``int()``: ``int(float("inf"))`` raises ``OverflowError`` (not caught
+    by ``(ValueError, TypeError)``), which otherwise surfaced as an unhandled
+    500. ``bool`` is excluded so ``True`` is not silently treated as ``1``.
+    """
+    now_ts = int(datetime.now(timezone.utc).timestamp())
     try:
         if isinstance(raw, str):
-            return int(datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp())
-        return int(raw or datetime.now(timezone.utc).timestamp())
-    except (ValueError, TypeError):
-        return int(datetime.now(timezone.utc).timestamp())
+            return int(datetime.fromisoformat(raw.strip().replace("Z", "+00:00")).timestamp())
+        if isinstance(raw, bool):
+            return now_ts
+        if isinstance(raw, (int, float)):
+            if not math.isfinite(raw):
+                return now_ts
+            return int(raw)
+        return now_ts
+    except (ValueError, TypeError, OverflowError):
+        return now_ts
 
 
 @router.post("/webhook/chatwoot")
@@ -206,9 +221,13 @@ async def _ingest_incoming(
     chatwoot_conversation_id = conversation.get("id")
     timestamp_sec = _parse_timestamp(payload.get("created_at"))
 
-    if not phone_e164:
-        logger.warning("chatwoot_webhook: missing phone_number")
-        raise HTTPException(status_code=400, detail="Missing phone_number")
+    # phone_number routes the message and later reaches re.sub in the worker.
+    # `if not phone_e164` alone lets a truthy non-string (e.g. `[]`→no, but `[1]`
+    # or `{"x":1}`) through, so require a non-empty STRING. The raw value is PII,
+    # so it is never logged.
+    if not (isinstance(phone_e164, str) and phone_e164.strip()):
+        logger.warning("chatwoot_webhook: missing or invalid phone_number")
+        raise HTTPException(status_code=400, detail="Missing or invalid phone_number")
 
     if not chatwoot_message_id:
         logger.warning("chatwoot_webhook: missing message id")
@@ -286,10 +305,12 @@ async def _ingest_operator_outgoing(
     content_attributes = mapping_or_empty(payload.get("content_attributes"))
     reply_to_chatwoot_message_id = optional_chatwoot_id(content_attributes.get("in_reply_to"))
 
-    # Recipient phone is the contact (customer) in the conversation.
+    # Recipient phone is the contact (customer) in the conversation. Require a
+    # non-empty string: a truthy non-string would reach the worker and crash
+    # re.sub. The raw value is PII, so it is never logged.
     recipient_phone = contact.get("phone_number")
 
-    if not recipient_phone:
+    if not (isinstance(recipient_phone, str) and recipient_phone.strip()):
         logger.warning(
             "chatwoot_webhook: operator_outgoing missing recipient phone conv_id=%s msg_id=%s",
             safe_log_value(chatwoot_conversation_id, limit=32),

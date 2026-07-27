@@ -102,6 +102,16 @@ def mapping_or_empty(value: object) -> dict:
     return value if isinstance(value, dict) else {}
 
 
+def list_or_empty(value: object) -> list:
+    """Возвращает ``value``, если это список, иначе пустой список.
+
+    ``for x in value or []`` не защищает от truthy не-списка: по ``int`` цикл
+    падает с ``TypeError``, а по строке молча итерирует символы. Строка
+    сознательно НЕ считается последовательностью для этого контракта.
+    """
+    return value if isinstance(value, list) else []
+
+
 def postgres_safe_json_value(value: object) -> object:
     """Рекурсивно приводит разобранный JSON к виду, который примет Postgres JSONB.
 

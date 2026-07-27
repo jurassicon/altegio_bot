@@ -798,3 +798,76 @@ async def test_negative_ids_are_rejected_into_null(session_maker, negative) -> N
     row = (await _rows(session_maker))[0]
     assert row.chatwoot_conversation_id is None
     assert row.chatwoot_message_id is None
+
+
+# ---------------------------------------------------------------------------
+# Phone field must be a non-empty string (it later reaches re.sub in the worker)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("bad_phone", ["[]", "{}", "123", "true", '""', '"   "'])
+@pytest.mark.asyncio
+async def test_incoming_malformed_phone_is_rejected(session_maker, bad_phone: str) -> None:
+    body = (
+        '{"event":"message_created","id":5001,"content":"hi","message_type":0,'
+        '"created_at":1234567890,"conversation":{"id":501},'
+        '"sender":{"phone_number":' + bad_phone + '},"account":{"id":2}}'
+    ).encode()
+
+    resp = await _post_raw(session_maker, body)
+
+    assert resp.status_code == 400
+    assert "phone_number" in resp.json()["detail"]
+    assert await _rows(session_maker) == []
+
+
+@pytest.mark.asyncio
+async def test_incoming_valid_phone_still_works(session_maker) -> None:
+    resp = await _post_raw(session_maker, json.dumps(_incoming()).encode())
+    assert resp.status_code == 200
+    assert len(await _rows(session_maker)) == 1
+
+
+@pytest.mark.parametrize("bad_phone", ["[]", "{}", "123", "true", '""', '"   "'])
+@pytest.mark.asyncio
+async def test_operator_malformed_phone_is_skipped(session_maker, monkeypatch, bad_phone: str) -> None:
+    monkeypatch.setattr(settings, "chatwoot_operator_relay_enabled", True)
+    body = (
+        '{"event":"message_created","id":7001,"content":"reply","message_type":1,'
+        '"private":false,"content_type":"text",'
+        '"conversation":{"id":701,"inbox_id":123,"meta":{"sender":{"phone_number":' + bad_phone + "}}},"
+        '"sender":{"type":"agent","name":"A","id":9},"account":{"id":2}}'
+    ).encode()
+
+    resp = await _post_raw(session_maker, body)
+
+    assert resp.status_code == 200
+    assert resp.json()["skipped"] == "no_recipient_phone"
+    # No relay event is stored — the malformed phone never reaches the worker.
+    assert await _rows(session_maker) == []
+
+
+# ---------------------------------------------------------------------------
+# created_at is optional and must never 500, including non-finite numbers
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("created_at", ["NaN", "Infinity", "-Infinity", "[]", "{}", "true", '"not-a-date"'])
+@pytest.mark.asyncio
+async def test_malformed_created_at_does_not_500(session_maker, created_at: str) -> None:
+    body = (
+        '{"event":"message_created","id":5001,"content":"hi","message_type":0,'
+        '"created_at":' + created_at + ","
+        '"conversation":{"id":501},'
+        '"sender":{"phone_number":"+4915112345678"},"account":{"id":2}}'
+    ).encode()
+
+    resp = await _post_raw(session_maker, body)
+
+    assert resp.status_code == 200
+    row = (await _rows(session_maker))[0]
+    # Timestamp is normalised to a safe integer string reaching JSONB.
+    ts = row.payload["entry"][0]["changes"][0]["value"]["messages"][0]["timestamp"]
+    assert isinstance(ts, str)
+    assert ts.lstrip("-").isdigit()
+    json.dumps(row.payload, allow_nan=False)

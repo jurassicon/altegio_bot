@@ -28,6 +28,7 @@ Usage::
 from __future__ import annotations
 
 import logging
+import math
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -36,6 +37,7 @@ from sqlalchemy import not_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.models.models import WhatsAppEvent
+from altegio_bot.webhooks.common import list_or_empty, mapping_or_empty
 
 logger = logging.getLogger("whatsapp_window")
 
@@ -76,34 +78,40 @@ def _extract_meta_inbound_times(
     Returns timezone-aware UTC datetimes.
     """
     candidates: list[datetime] = []
-    for entry in payload.get("entry") or []:
+    for entry in list_or_empty(payload.get("entry")):
         if not isinstance(entry, dict):
             continue
-        for change in entry.get("changes") or []:
+        for change in list_or_empty(entry.get("changes")):
             if not isinstance(change, dict):
                 continue
             value = change.get("value") or {}
             if not isinstance(value, dict):
                 continue
             if phone_number_id is not None:
-                meta_pnid = (value.get("metadata") or {}).get("phone_number_id")
+                meta_pnid = mapping_or_empty(value.get("metadata")).get("phone_number_id")
                 if meta_pnid != phone_number_id:
                     continue
-            for msg in value.get("messages") or []:
+            for msg in list_or_empty(value.get("messages")):
                 if not isinstance(msg, dict):
                     continue
-                if normalize_phone(msg.get("from")) != target_phone:
+                raw_from = msg.get("from")
+                if not isinstance(raw_from, str) or normalize_phone(raw_from) != target_phone:
                     continue
                 ts_raw = msg.get("timestamp")
                 candidate: datetime
                 if ts_raw:
                     try:
-                        ts_sec = int(ts_raw)
-                        parsed = datetime.fromtimestamp(ts_sec, tz=timezone.utc)
-                        if parsed > before:
-                            continue  # future timestamp — skip, do not fall back
-                        candidate = parsed
-                    except (ValueError, TypeError, OSError):
+                        # OverflowError guards int(float("inf")); the finite check
+                        # keeps a NaN/inf timestamp from reaching int() at all.
+                        if isinstance(ts_raw, float) and not math.isfinite(ts_raw):
+                            candidate = fallback_received_at
+                        else:
+                            ts_sec = int(ts_raw)
+                            parsed = datetime.fromtimestamp(ts_sec, tz=timezone.utc)
+                            if parsed > before:
+                                continue  # future timestamp — skip, do not fall back
+                            candidate = parsed
+                    except (ValueError, TypeError, OSError, OverflowError):
                         candidate = fallback_received_at
                 else:
                     candidate = fallback_received_at

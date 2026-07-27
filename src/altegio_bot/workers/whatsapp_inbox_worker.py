@@ -34,7 +34,12 @@ from altegio_bot.services.meta_error_classifier import (
     transient_error_reason,
 )
 from altegio_bot.settings import settings
-from altegio_bot.webhooks.common import safe_log_value
+from altegio_bot.webhooks.common import (
+    list_or_empty,
+    mapping_or_empty,
+    optional_chatwoot_id,
+    safe_log_value,
+)
 from altegio_bot.whatsapp_window import is_whatsapp_customer_window_open, normalize_phone
 from altegio_bot.workers.promo_lead_handler import (
     handle_promo_command,
@@ -197,17 +202,6 @@ def _normalize_reply_context_id(value: Any) -> str | None:
     return value or None
 
 
-def _coerce_chatwoot_id(value: Any) -> int | None:
-    """Coerce a Chatwoot numeric id (int or digit string) to int, else None."""
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value
-    if isinstance(value, str) and value.strip().isdigit():
-        return int(value.strip())
-    return None
-
-
 def _norm_text(raw: str | None) -> str:
     if not raw:
         return ""
@@ -219,20 +213,23 @@ def _norm_text(raw: str | None) -> str:
 
 
 def _extract_message_text(msg: dict[str, Any]) -> str:
+    # Every nested field is sender-controlled: `msg.get("text") or {}` does not
+    # protect against `"text": []`/`"text": "bad"` (truthy non-dict → .get()
+    # raises). mapping_or_empty degrades any non-dict to "" instead of a crash.
     msg_type = msg.get("type")
 
     if msg_type == "text":
-        text = msg.get("text") or {}
+        text = mapping_or_empty(msg.get("text"))
         return str(text.get("body") or "")
 
     if msg_type == "button":
-        btn = msg.get("button") or {}
+        btn = mapping_or_empty(msg.get("button"))
         return str(btn.get("text") or btn.get("payload") or "")
 
     if msg_type == "interactive":
-        inter = msg.get("interactive") or {}
-        btn_reply = inter.get("button_reply") or {}
-        list_reply = inter.get("list_reply") or {}
+        inter = mapping_or_empty(msg.get("interactive"))
+        btn_reply = mapping_or_empty(inter.get("button_reply"))
+        list_reply = mapping_or_empty(inter.get("list_reply"))
         return str(
             btn_reply.get("title") or btn_reply.get("id") or list_reply.get("title") or list_reply.get("id") or ""
         )
@@ -266,8 +263,12 @@ def _is_operator_relay(payload: dict[str, Any]) -> bool:
     written by the Chatwoot webhook handler.  They must be sent to Meta,
     NOT forwarded back to Chatwoot (that would duplicate the message the
     operator already sees in their own Chatwoot UI).
+
+    Membership alone is not enough: a spoofed ``{"_chatwoot_operator_relay": []}``
+    would route here and then crash on ``relay.get(...)``. Require the marker to
+    be a dict so a malformed one is treated as a non-relay event, not relayed.
     """
-    return "_chatwoot_operator_relay" in payload
+    return isinstance(payload.get("_chatwoot_operator_relay"), dict)
 
 
 def _is_chatwoot_origin(event: WhatsAppEvent, payload: dict[str, Any]) -> bool:
@@ -473,10 +474,10 @@ def _payload_message_from_matches_phone(payload: dict[str, Any], phone_e164: str
     if not expected_digits:
         return False
 
-    for entry in payload.get("entry") or []:
+    for entry in list_or_empty(payload.get("entry")):
         if not isinstance(entry, dict):
             continue
-        for change in entry.get("changes") or []:
+        for change in list_or_empty(entry.get("changes")):
             if not isinstance(change, dict):
                 continue
             value = change.get("value") or {}
@@ -577,11 +578,11 @@ async def lock_next_batch(
 def _extract_actions(payload: dict[str, Any]) -> list[dict[str, Any]]:
     actions: list[dict[str, Any]] = []
 
-    for entry in payload.get("entry") or []:
+    for entry in list_or_empty(payload.get("entry")):
         if not isinstance(entry, dict):
             continue
 
-        for change in entry.get("changes") or []:
+        for change in list_or_empty(entry.get("changes")):
             if not isinstance(change, dict):
                 continue
 
@@ -595,7 +596,7 @@ def _extract_actions(payload: dict[str, Any]) -> list[dict[str, Any]]:
 
             phone_number_id = metadata.get("phone_number_id")
 
-            for msg in value.get("messages") or []:
+            for msg in list_or_empty(value.get("messages")):
                 if not isinstance(msg, dict):
                     continue
 
@@ -663,10 +664,10 @@ def _delivery_retry_delay_seconds(attempt: int) -> int:
 def _extract_statuses(payload: dict[str, Any]) -> list[dict[str, Any]]:
     statuses: list[dict[str, Any]] = []
 
-    for entry in payload.get("entry") or []:
+    for entry in list_or_empty(payload.get("entry")):
         if not isinstance(entry, dict):
             continue
-        for change in entry.get("changes") or []:
+        for change in list_or_empty(entry.get("changes")):
             if not isinstance(change, dict):
                 continue
             value = change.get("value") or {}
@@ -677,7 +678,7 @@ def _extract_statuses(payload: dict[str, Any]) -> list[dict[str, Any]]:
                 metadata = {}
             phone_number_id = metadata.get("phone_number_id")
 
-            for st in value.get("statuses") or []:
+            for st in list_or_empty(value.get("statuses")):
                 if not isinstance(st, dict):
                     continue
                 wamid = st.get("id")
@@ -876,11 +877,11 @@ def _extract_status_updates(
     """
     updates: list[dict[str, Any]] = []
 
-    for entry in payload.get("entry") or []:
+    for entry in list_or_empty(payload.get("entry")):
         if not isinstance(entry, dict):
             continue
 
-        for change in entry.get("changes") or []:
+        for change in list_or_empty(entry.get("changes")):
             if not isinstance(change, dict):
                 continue
 
@@ -888,7 +889,7 @@ def _extract_status_updates(
             if not isinstance(value, dict):
                 continue
 
-            for st in value.get("statuses") or []:
+            for st in list_or_empty(value.get("statuses")):
                 if not isinstance(st, dict):
                     continue
 
@@ -1839,24 +1840,24 @@ async def _handle_operator_relay(
     Guard: this function is only called when chatwoot_operator_relay_enabled
     is True (checked in handle_event).
     """
-    relay = payload.get("_chatwoot_operator_relay") or {}
+    # Defensive even though _is_operator_relay already guarantees a dict: this
+    # keeps the handler safe if it is ever called from another path.
+    relay = mapping_or_empty(payload.get("_chatwoot_operator_relay"))
     raw_phone = relay.get("recipient_phone")
-    phone_e164 = normalize_phone(raw_phone)
+    phone_e164 = normalize_phone(raw_phone) if isinstance(raw_phone, str) else None
     text = relay.get("text", "")
     conversation_id = relay.get("conversation_id")
     chatwoot_message_id = relay.get("message_id")
     phone_number_id = relay.get("phone_number_id")
     chatwoot_inbox_id = relay.get("chatwoot_inbox_id")
     agent_name = relay.get("agent_name", "")
-    content_attributes = relay.get("content_attributes") or {}
-    if not isinstance(content_attributes, dict):
-        content_attributes = {}
+    content_attributes = mapping_or_empty(relay.get("content_attributes"))
 
     # Indexed copies for the native-reply lookup (kept in meta as-is for
     # backward compatibility).  Non-numeric values degrade to None.
-    cw_conversation_id = _coerce_chatwoot_id(conversation_id)
-    cw_message_id = _coerce_chatwoot_id(chatwoot_message_id)
-    reply_to_chatwoot_message_id = _coerce_chatwoot_id(relay.get("reply_to_chatwoot_message_id"))
+    cw_conversation_id = optional_chatwoot_id(conversation_id)
+    cw_message_id = optional_chatwoot_id(chatwoot_message_id)
+    reply_to_chatwoot_message_id = optional_chatwoot_id(relay.get("reply_to_chatwoot_message_id"))
     reply_context_audit: dict[str, Any] = {
         "reply_to_chatwoot_message_id": reply_to_chatwoot_message_id,
         "reply_to_provider_message_id": None,
@@ -2041,8 +2042,8 @@ async def _handle_operator_relay(
         event.error = "operator_relay: Meta circuit closed"
         logger.warning(
             "operator_relay: Meta circuit closed; paused conv_id=%s msg_id=%s outbox_id=%s company_id=%s",
-            conversation_id,
-            chatwoot_message_id,
+            safe_log_value(conversation_id, limit=32),
+            safe_log_value(chatwoot_message_id, limit=32),
             outbox.id,
             company_id,
         )
@@ -2071,10 +2072,12 @@ async def _handle_operator_relay(
                 )
                 outbox.meta = {**outbox.meta, "private_note_status": "sent"}
             except Exception as exc:
+                # The Chatwoot exception may carry a URL/token/response body —
+                # log only its class name.
                 logger.warning(
-                    "operator_relay: circuit pause note failed conv_id=%s err=%s",
-                    conversation_id,
-                    exc,
+                    "operator_relay: circuit pause note failed conv_id=%s error_type=%s",
+                    safe_log_value(conversation_id, limit=32),
+                    type(exc).__name__,
                 )
                 outbox.meta = {**outbox.meta, "private_note_status": "failed"}
             finally:
@@ -2121,12 +2124,12 @@ async def _handle_operator_relay(
             "operator_relay: transient Meta error closed circuit; canceled "
             "conv_id=%s msg_id=%s outbox_id=%s company_id=%s provider=%s "
             "phone_number_id=%s error_kind=%s error_code=%s",
-            conversation_id,
-            chatwoot_message_id,
+            safe_log_value(conversation_id, limit=32),
+            safe_log_value(chatwoot_message_id, limit=32),
             outbox.id,
             company_id,
             type(meta_provider).__name__,
-            phone_number_id,
+            safe_log_value(phone_number_id, limit=32),
             error_kind,
             error_code,
         )
@@ -2154,16 +2157,16 @@ async def _handle_operator_relay(
                 )
                 logger.info(
                     "operator_relay: native reply context resolved conv_id=%s msg_id=%s source=%s",
-                    conversation_id,
-                    chatwoot_message_id,
+                    safe_log_value(conversation_id, limit=32),
+                    safe_log_value(chatwoot_message_id, limit=32),
                     target.source,
                 )
             else:
                 logger.info(
                     "operator_relay: native reply context target not found conv_id=%s msg_id=%s reply_to=%s",
-                    conversation_id,
-                    chatwoot_message_id,
-                    reply_to_chatwoot_message_id,
+                    safe_log_value(conversation_id, limit=32),
+                    safe_log_value(chatwoot_message_id, limit=32),
+                    safe_log_value(reply_to_chatwoot_message_id, limit=32),
                 )
 
         logger.info(
@@ -2187,12 +2190,14 @@ async def _handle_operator_relay(
         if err is not None:
             if await _close_circuit_on_transient_send_error("text", err):
                 return
+            # Permanent failure (transient handled above). The raw provider error
+            # may embed a token/URL/response body, so neither the log nor the
+            # persisted error stores it — only a stable non-PII marker.
             logger.warning(
-                "operator_relay: send failed sender_id=%s err=%s",
+                "operator_relay: send failed sender_id=%s error_kind=permanent",
                 sender_id,
-                err,
             )
-            event.error = f"operator_relay: send failed: {err}"
+            event.error = "operator_relay: send failed (permanent)"
             return
 
         logger.info(
@@ -2306,22 +2311,25 @@ async def _handle_operator_relay(
                 )
                 logger.info(
                     "operator_relay: closed-window note sent conv_id=%s",
-                    conversation_id,
+                    safe_log_value(conversation_id, limit=32),
                 )
                 outbox.meta = {**outbox.meta, "private_note_status": "sent"}
             except Exception as exc:
+                # The Chatwoot exception text can contain a URL/token/response
+                # body — persist and log only its class name.
+                exc_type = type(exc).__name__
                 logger.warning(
-                    "operator_relay: closed-window note failed conv_id=%s err=%s",
-                    conversation_id,
-                    exc,
+                    "operator_relay: closed-window note failed conv_id=%s error_type=%s",
+                    safe_log_value(conversation_id, limit=32),
+                    exc_type,
                 )
                 outbox.meta = {
                     **outbox.meta,
                     "private_note_status": "failed",
-                    "private_note_error": str(exc),
+                    "private_note_error": exc_type,
                 }
-                outbox.error = f"private note failed: {exc}"
-                event.error = f"operator_relay: private note failed: {exc}"
+                outbox.error = f"private note failed: {exc_type}"
+                event.error = f"operator_relay: private note failed: {exc_type}"
             finally:
                 await cw.aclose()
         else:
@@ -2359,13 +2367,14 @@ async def _handle_operator_relay(
     if err is not None:
         if await _close_circuit_on_transient_send_error("template", err):
             return
+        # Permanent template failure (transient handled above): keep the raw
+        # provider error out of the log and the persisted error.
         logger.warning(
-            "operator_relay: reopen template failed sender_id=%s template=%s err=%s",
+            "operator_relay: reopen template failed sender_id=%s template=%s error_kind=permanent",
             sender_id,
-            template_name,
-            err,
+            safe_log_value(template_name, limit=64),
         )
-        event.error = f"operator_relay: reopen template failed: {err}"
+        event.error = "operator_relay: reopen template failed (permanent)"
 
         if settings.chatwoot_operator_reopen_private_note_enabled and conversation_id:
             failure_note = (
@@ -2382,13 +2391,13 @@ async def _handle_operator_relay(
                 )
                 logger.info(
                     "operator_relay: failure note sent conv_id=%s",
-                    conversation_id,
+                    safe_log_value(conversation_id, limit=32),
                 )
             except Exception as exc:
                 logger.warning(
-                    "operator_relay: failure note failed conv_id=%s err=%s",
-                    conversation_id,
-                    exc,
+                    "operator_relay: failure note failed conv_id=%s error_type=%s",
+                    safe_log_value(conversation_id, limit=32),
+                    type(exc).__name__,
                 )
             finally:
                 await cw.aclose()
@@ -2462,13 +2471,13 @@ async def _handle_operator_relay(
             )
             logger.info(
                 "operator_relay: private note sent conv_id=%s",
-                conversation_id,
+                safe_log_value(conversation_id, limit=32),
             )
         except Exception as exc:
             logger.warning(
-                "operator_relay: private note failed conv_id=%s err=%s",
-                conversation_id,
-                exc,
+                "operator_relay: private note failed conv_id=%s error_type=%s",
+                safe_log_value(conversation_id, limit=32),
+                type(exc).__name__,
             )
         finally:
             await cw.aclose()
