@@ -703,10 +703,15 @@ async def test_operator_malformed_sender_container(session_maker, monkeypatch, b
     assert resp.json()["skipped"] == "outgoing_not_relayed"
 
 
-@pytest.mark.parametrize("bad", ["[]", "{}", "123"])
+@pytest.mark.parametrize("bad", ["[]", "{}", "123", "true", "null"])
 @pytest.mark.asyncio
-async def test_unhashable_content_type_does_not_raise_typeerror(session_maker, monkeypatch, bad: str) -> None:
-    """`content_type in _SKIP_CONTENT_TYPES` would raise TypeError on a list."""
+async def test_non_string_content_type_fails_closed(session_maker, monkeypatch, bad: str) -> None:
+    """A non-string content_type must fail CLOSED, not coerce to "" and relay.
+
+    Strict: the exact stable reason, no stored event, and (below) no Meta send.
+    The old assertion `"skipped" in resp or ok` proved nothing — success also
+    returns ok=True.
+    """
     monkeypatch.setattr(settings, "chatwoot_operator_relay_enabled", True)
     body = (
         '{"event":"message_created","id":7001,"content":"reply","message_type":1,'
@@ -718,7 +723,26 @@ async def test_unhashable_content_type_does_not_raise_typeerror(session_maker, m
     resp = await _post_raw(session_maker, body)
 
     assert resp.status_code == 200
-    assert "skipped" in resp.json() or resp.json()["ok"] is True
+    assert resp.json() == {"ok": True, "skipped": "unsupported_content_type"}
+    assert await _rows(session_maker) == []
+
+
+@pytest.mark.asyncio
+async def test_absent_content_type_defaults_to_text_and_relays(session_maker, monkeypatch) -> None:
+    """Absent content_type keeps the documented "text" default (still relayed)."""
+    monkeypatch.setattr(settings, "chatwoot_operator_relay_enabled", True)
+    body = (
+        '{"event":"message_created","id":7001,"content":"reply","message_type":1,'
+        '"private":false,'
+        '"conversation":{"id":701,"inbox_id":123,"meta":{"sender":{"phone_number":"+4915112345678"}}},'
+        '"sender":{"type":"agent","name":"A","id":9},"account":{"id":2}}'
+    ).encode()
+
+    resp = await _post_raw(session_maker, body)
+
+    assert resp.status_code == 200
+    # A relay event is stored (content_type defaulted to a valid "text").
+    assert len(await _rows(session_maker)) == 1
 
 
 @pytest.mark.parametrize("bad", ["[]", '"bad"', "123"])
@@ -805,7 +829,13 @@ async def test_negative_ids_are_rejected_into_null(session_maker, negative) -> N
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("bad_phone", ["[]", "{}", "123", "true", '""', '"   "'])
+# Non-string, empty, AND digitless strings must all be rejected: a digitless
+# string ("abc"/"+"/"---") normalises to None, so accepting it would store an
+# event the worker can never route.
+_MALFORMED_PHONES = ["[]", "{}", "123", "true", "null", '""', '"   "', '"abc"', '"+"', '"---"', '"phone"']
+
+
+@pytest.mark.parametrize("bad_phone", _MALFORMED_PHONES)
 @pytest.mark.asyncio
 async def test_incoming_malformed_phone_is_rejected(session_maker, bad_phone: str) -> None:
     body = (
@@ -822,13 +852,21 @@ async def test_incoming_malformed_phone_is_rejected(session_maker, bad_phone: st
 
 
 @pytest.mark.asyncio
-async def test_incoming_valid_phone_still_works(session_maker) -> None:
-    resp = await _post_raw(session_maker, json.dumps(_incoming()).encode())
+async def test_incoming_valid_phone_is_normalized_before_persistence(session_maker) -> None:
+    payload = _incoming()
+    payload["sender"]["phone_number"] = "+49 151 123-45-67"
+
+    resp = await _post_raw(session_maker, json.dumps(payload).encode())
+
     assert resp.status_code == 200
-    assert len(await _rows(session_maker)) == 1
+    rows = await _rows(session_maker)
+    assert len(rows) == 1
+    # The stored normalized-payload carries the normalized phone, not the raw one.
+    stored_from = rows[0].payload["entry"][0]["changes"][0]["value"]["messages"][0]["from"]
+    assert stored_from == "+491511234567"
 
 
-@pytest.mark.parametrize("bad_phone", ["[]", "{}", "123", "true", '""', '"   "'])
+@pytest.mark.parametrize("bad_phone", _MALFORMED_PHONES)
 @pytest.mark.asyncio
 async def test_operator_malformed_phone_is_skipped(session_maker, monkeypatch, bad_phone: str) -> None:
     monkeypatch.setattr(settings, "chatwoot_operator_relay_enabled", True)

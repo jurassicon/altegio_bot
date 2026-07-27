@@ -18,9 +18,9 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 import altegio_bot.workers.whatsapp_inbox_worker as worker_module
-from altegio_bot.models.models import WhatsAppEvent, WhatsAppSender
+from altegio_bot.models.models import OutboxMessage, WhatsAppEvent, WhatsAppSender
 from altegio_bot.providers.base import WhatsAppProvider
-from altegio_bot.workers.whatsapp_inbox_worker import handle_event
+from altegio_bot.workers.whatsapp_inbox_worker import handle_event, process_one_event
 
 PHONE = "+4915199999999"
 CLIENT_NAME = "PRIVATE CUSTOMER"
@@ -41,7 +41,9 @@ class _CaptureProvider(WhatsAppProvider):
     def __init__(self) -> None:
         self.sent: list[tuple] = []
 
-    async def send(self, sender_id, phone_e164, text, contact_name=None) -> str:
+    async def send(self, sender_id, phone_e164, text, contact_name=None, **kwargs) -> str:
+        # Accept extra kwargs (e.g. reply_to_provider_message_id) that safe_send
+        # forwards when a native reply context is resolved.
         self.sent.append((sender_id, phone_e164, text))
         return self.wamid
 
@@ -261,32 +263,53 @@ _PII_SYMBOLS = frozenset(
 _LOG_METHODS = frozenset({"info", "warning", "error", "exception", "debug"})
 
 
-def _find_logger_pii_references(source: str) -> list[tuple[int, str]]:
-    """Defense-in-depth check for DIRECT use of known PII-bearing symbols in
-    logger arguments. Runtime branch tests remain the primary guarantee.
+# Wrapper calls that provably do NOT disclose their argument's value, so a PII
+# symbol passed to one of them is safe. Everything else (str/repr/normalize_phone/
+# identity/…) is recursed into — those DO reveal the value.
+_SAFE_LOG_WRAPPERS = frozenset({"safe_log_value", "bool", "len", "type"})
 
-    This is deliberately NOT taint analysis. It inspects every positional arg,
-    keyword value, f-string field, attribute, and nested dict/list/tuple of a
-    ``logger.<level>(...)`` call, and flags a bare reference to a PII symbol
-    (``ast.Name.id`` or ``ast.Attribute.attr``). A reference wrapped in ANY call
-    — ``safe_log_value(phone)``, ``bool(phone)``, ``len(text)`` — is treated as
-    sanitised and not flagged, because the guard does not descend into nested
-    calls. That is its known blind spot, accepted on purpose.
+
+def _find_logger_pii_references(source: str) -> list[tuple[int, str]]:
+    """Defense-in-depth check for use of known PII-bearing symbols in logger
+    arguments. This is NOT full taint analysis — runtime branch tests remain the
+    primary guarantee.
+
+    It inspects every positional arg, keyword value, f-string field, attribute,
+    and nested dict/list/tuple of a ``logger.<level>(...)`` call, and flags a
+    reference to a PII symbol (``ast.Name.id`` or ``ast.Attribute.attr``).
+
+    Only an explicit allowlist of wrapper calls is treated as sanitising
+    (``safe_log_value``/``bool``/``len``/``type``). Any other call — including
+    ``str(phone)`` and ``normalize_phone(phone)``, which DO reveal the value — is
+    recursed into, so the argument is still checked.
     """
     import ast
 
     offenders: list[tuple[int, str]] = []
 
+    def _is_safe_wrapper(call: ast.Call) -> bool:
+        return isinstance(call.func, ast.Name) and call.func.id in _SAFE_LOG_WRAPPERS
+
     def _scan(node: ast.AST, lineno: int) -> None:
-        # Do NOT descend into nested calls: a PII symbol handed to another
-        # function (safe_log_value/bool/…) is considered sanitised.
         if isinstance(node, ast.Call):
+            # An allowlisted wrapper hides its argument's value → stop. Any other
+            # call is NOT assumed safe: recurse into its args, keywords and func.
+            if _is_safe_wrapper(node):
+                return
+            for arg in node.args:
+                _scan(arg, lineno)
+            for kw in node.keywords:
+                _scan(kw.value, lineno)
+            _scan(node.func, lineno)
             return
         if isinstance(node, ast.Name) and node.id in _PII_SYMBOLS:
             offenders.append((lineno, node.id))
             return
-        if isinstance(node, ast.Attribute) and node.attr in _PII_SYMBOLS:
-            offenders.append((lineno, node.attr))
+        if isinstance(node, ast.Attribute):
+            if node.attr in _PII_SYMBOLS:
+                offenders.append((lineno, node.attr))
+                return
+            _scan(node.value, lineno)
             return
         for child in ast.iter_child_nodes(node):
             _scan(child, lineno)
@@ -321,10 +344,15 @@ def test_worker_log_calls_never_reference_pii_symbols() -> None:
         'logger.info("%s", phone_e164)',
         'logger.info(f"phone={phone_e164}")',
         'logger.info("%s", client.phone_e164)',
+        'logger.info("%s", str(phone_e164))',
+        'logger.info("%s", normalize_phone(phone_e164))',
+        'logger.info("%s", identity(phone_e164))',
+        'logger.info("%s", repr(text))',
         'logger.info("x", extra={"phone": phone_e164})',
         'logger.info("x", phone=phone_e164)',
         'logger.warning("%s", [agent_name])',
         'logger.info("%s", (recipient_phone,))',
+        'logger.info("%s", {"body": text})',
     ],
 )
 def test_ast_guard_catches_pii(snippet: str) -> None:
@@ -336,14 +364,16 @@ def test_ast_guard_catches_pii(snippet: str) -> None:
     [
         'logger.info("event_id=%s", event.id)',
         'logger.info("phone_present=%s", bool(phone_e164))',
+        'logger.info("text_len=%s", len(text))',
         'logger.info("conv_id=%s", safe_log_value(conversation_id, limit=32))',
+        'logger.info("phone=%s", safe_log_value(phone_e164, limit=32))',
         'logger.info("error_type=%s", type(exc).__name__)',
         'logger.info("company_id=%s", company_id)',
     ],
 )
-def test_ast_guard_allows_safe_calls(snippet: str) -> None:
-    # bool(phone_e164) is intentionally allowed: the value is not disclosed and
-    # the guard does not descend into wrapping calls.
+def test_ast_guard_allows_only_safe_wrappers(snippet: str) -> None:
+    # Only an explicit allowlist is trusted: bool()/len()/type()/safe_log_value()
+    # do not disclose the value. str()/normalize_phone() are NOT trusted (above).
     assert _find_logger_pii_references(snippet) == [], f"guard false-positive: {snippet}"
 
 
@@ -661,3 +691,232 @@ async def test_relay_log_native_target_not_found(session_maker, monkeypatch, cap
 
     blob = _assert_worker_log_clean(caplog)
     assert "native reply context target not found" in blob
+
+
+# ---------------------------------------------------------------------------
+# Additional runtime log branches required by the runbook guarantee
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_relay_log_circuit_pause_note_failure(session_maker, monkeypatch, caplog) -> None:
+    """Circuit paused + the Chatwoot pause-note send raises → class name only."""
+
+    async def _paused(*args, **kwargs):
+        return True
+
+    monkeypatch.setattr(worker_module, "ChatwootClient", _RaisingChatwoot)
+    monkeypatch.setattr(worker_module.meta_circuit, "should_pause_meta_sends", _paused)
+    provider = _CaptureProvider()
+
+    await _run_relay(
+        session_maker,
+        monkeypatch,
+        caplog,
+        provider=provider,
+        sender_id=970,
+        window_open=True,
+        event=_relay_event(_k="pausenote"),
+    )
+
+    blob = _assert_worker_log_clean(caplog)
+    assert "circuit pause note failed" in blob
+    assert "error_type=RuntimeError" in blob
+
+
+@pytest.mark.asyncio
+async def test_relay_log_reopen_template_success_private_note_failure(session_maker, monkeypatch, caplog) -> None:
+    """Reopen template SENT, then the follow-up private note raises → class name."""
+    monkeypatch.setattr(worker_module, "ChatwootClient", _RaisingChatwoot)
+    monkeypatch.setattr(worker_module.settings, "chatwoot_operator_closed_window_mode", "reopen_template")
+    monkeypatch.setattr(worker_module.settings, "chatwoot_operator_reopen_template_name", "reopen_tpl")
+    monkeypatch.setattr(worker_module.settings, "chatwoot_operator_reopen_private_note_enabled", True)
+    provider = _CaptureProvider()  # send_template succeeds
+
+    await _run_relay(
+        session_maker,
+        monkeypatch,
+        caplog,
+        provider=provider,
+        sender_id=971,
+        window_open=False,
+        event=_relay_event(_k="reopen_ok_note_fail"),
+    )
+
+    blob = _assert_worker_log_clean(caplog)
+    assert "reopen template sent" in blob
+    assert "private note failed" in blob
+    assert "error_type=RuntimeError" in blob
+
+
+@pytest.mark.asyncio
+async def test_relay_log_native_reply_target_found(session_maker, monkeypatch, caplog) -> None:
+    """Valid ids + a prior operator outbox → native target resolved log line."""
+    monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
+    monkeypatch.setattr(worker_module.settings, "chatwoot_operator_relay_enabled", True)
+    monkeypatch.setattr(worker_module, "ChatwootClient", _FakeChatwoot)
+    provider = _CaptureProvider()
+    conv_id, msg_id, reply_to = 6001, 7001, 8001
+    pnid = "PNID_NATIVE"
+
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(
+                WhatsAppSender(
+                    id=972,
+                    company_id=1,
+                    sender_code="default",
+                    phone_number_id=pnid,
+                    display_phone="+49",
+                    is_active=True,
+                )
+            )
+            # Flush the sender before the FK-referencing outbox below.
+            await session.flush()
+            # Open window.
+            session.add(
+                WhatsAppEvent(
+                    dedupe_key="wa:inbound:native",
+                    received_at=datetime.now(timezone.utc) - timedelta(hours=1),
+                    status="processed",
+                    query={},
+                    headers={},
+                    payload={
+                        "entry": [
+                            {
+                                "changes": [
+                                    {
+                                        "value": {
+                                            "messages": [
+                                                {
+                                                    "from": PHONE.lstrip("+"),
+                                                    "type": "text",
+                                                    "text": {"body": "hi"},
+                                                    "id": "w1",
+                                                }
+                                            ],
+                                            "metadata": {"phone_number_id": pnid},
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                )
+            )
+            # Prior operator outbox that the reply points at (Source B).
+            session.add(
+                OutboxMessage(
+                    company_id=1,
+                    sender_id=972,
+                    phone_e164=PHONE,
+                    template_code="operator_relay",
+                    language="de",
+                    body="earlier",
+                    status="sent",
+                    provider_message_id="wamid.PRIOR",
+                    scheduled_at=datetime.now(timezone.utc),
+                    sent_at=datetime.now(timezone.utc),
+                    message_source="operator",
+                    chatwoot_conversation_id=conv_id,
+                    chatwoot_message_id=reply_to,
+                )
+            )
+            evt = WhatsAppEvent(
+                dedupe_key="chatwoot_out:native",
+                status="received",
+                error=None,
+                query={},
+                headers={},
+                payload={
+                    "_chatwoot_operator_relay": {
+                        "recipient_phone": PHONE,
+                        "text": MESSAGE_TEXT,
+                        "conversation_id": conv_id,
+                        "message_id": msg_id,
+                        "phone_number_id": pnid,
+                        "reply_to_chatwoot_message_id": reply_to,
+                        "agent_name": AGENT_NAME,
+                    }
+                },
+            )
+            session.add(evt)
+            await session.flush()
+            with caplog.at_level(logging.DEBUG):
+                await handle_event(session, evt, provider)
+
+    assert len(provider.sent) == 1
+    blob = _assert_worker_log_clean(caplog)
+    assert "native reply context resolved" in blob
+
+
+async def _process_event(session_maker, monkeypatch, provider, event) -> WhatsAppEvent:
+    """Insert an event, run the production process_one_event wrapper, reload it."""
+    monkeypatch.setattr(worker_module, "SessionLocal", session_maker)
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(event)
+            await session.flush()
+            event_id = event.id
+    await process_one_event(event_id, provider)
+    async with session_maker() as session:
+        return await session.get(WhatsAppEvent, event_id)
+
+
+@pytest.mark.asyncio
+async def test_incoming_forward_failure_logs_are_clean(session_maker, monkeypatch, caplog) -> None:
+    """WhatsApp → Chatwoot forward failure: only event_id + class name are logged."""
+    monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
+    monkeypatch.setattr(worker_module, "ChatwootClient", _RaisingChatwoot)
+    provider = _CaptureProvider()
+
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(
+                WhatsAppSender(
+                    id=973,
+                    company_id=1,
+                    sender_code="default",
+                    phone_number_id="PNID_FWD_FAIL",
+                    display_phone="+49",
+                    is_active=True,
+                )
+            )
+
+    evt = WhatsAppEvent(
+        dedupe_key="wa:inbound:fwdfail",
+        status="received",
+        error=None,
+        query={},
+        headers={},
+        payload={
+            "entry": [
+                {
+                    "changes": [
+                        {
+                            "value": {
+                                "messages": [
+                                    {
+                                        "from": PHONE.lstrip("+"),
+                                        "type": "text",
+                                        "text": {"body": MESSAGE_TEXT},
+                                        "id": "wamid.fwdfail",
+                                    }
+                                ],
+                                "contacts": [{"profile": {"name": CLIENT_NAME}}],
+                                "metadata": {"phone_number_id": "PNID_FWD_FAIL"},
+                            }
+                        }
+                    ]
+                }
+            ]
+        },
+    )
+
+    with caplog.at_level(logging.DEBUG):
+        reloaded = await _process_event(session_maker, monkeypatch, provider, evt)
+
+    # Forward failure surfaces as a failed event (retryable), not a silent loss.
+    assert reloaded.status == "failed"
+    blob = _assert_worker_log_clean(caplog)
+    assert "forward failed" in blob

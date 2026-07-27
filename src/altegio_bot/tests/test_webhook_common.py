@@ -257,3 +257,53 @@ def test_optional_int_survives_a_5000_digit_string() -> None:
 def test_optional_int_min_value_bound() -> None:
     assert optional_int(-1, min_value=0) is None
     assert optional_int(0, min_value=0) == 0
+
+
+# ---------------------------------------------------------------------------
+# normalize_phone_candidate / nonempty_str
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("+4915112345678", "+4915112345678"),
+        ("+49 151 123-45-67", "+491511234567"),
+        ("0049 151 1234567", "+00491511234567"),
+        ("(030) 12345", "+03012345"),
+        ("15112345678", "+15112345678"),
+    ],
+)
+def test_normalize_phone_candidate_valid(raw: str, expected: str) -> None:
+    from altegio_bot.webhooks.common import normalize_phone_candidate
+
+    assert normalize_phone_candidate(raw) == expected
+
+
+@pytest.mark.parametrize("raw", ["abc", "+", "---", "()", "no phone", "", "   "])
+def test_normalize_phone_candidate_digitless_is_none(raw: str) -> None:
+    from altegio_bot.webhooks.common import normalize_phone_candidate
+
+    assert normalize_phone_candidate(raw) is None
+
+
+@pytest.mark.parametrize("raw", [[], {}, 123, True, False, 1.5, None, ["+49"], {"x": 1}])
+def test_normalize_phone_candidate_non_string_is_none(raw: object) -> None:
+    from altegio_bot.webhooks.common import normalize_phone_candidate
+
+    # Must never raise on a non-string leaf.
+    assert normalize_phone_candidate(raw) is None
+
+
+@pytest.mark.parametrize("raw", ["PNID_1", "  x  "])
+def test_nonempty_str_keeps_value(raw: str) -> None:
+    from altegio_bot.webhooks.common import nonempty_str
+
+    assert nonempty_str(raw) == raw  # not stripped — exact SQL match preserved
+
+
+@pytest.mark.parametrize("raw", ["", "   ", [], {}, 123, True, False, 1.5, None, ["x"]])
+def test_nonempty_str_rejects_non_string_and_blank(raw: object) -> None:
+    from altegio_bot.webhooks.common import nonempty_str
+
+    assert nonempty_str(raw) is None

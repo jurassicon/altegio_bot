@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import logging
 import math
-import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -37,7 +36,7 @@ from sqlalchemy import not_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.models.models import WhatsAppEvent
-from altegio_bot.webhooks.common import list_or_empty, mapping_or_empty
+from altegio_bot.webhooks.common import list_or_empty, mapping_or_empty, normalize_phone_candidate
 
 logger = logging.getLogger("whatsapp_window")
 
@@ -45,14 +44,14 @@ _WINDOW_HOURS = 24
 _QUERY_LOOKBACK_HOURS = 26
 
 
-def normalize_phone(raw: str | None) -> str | None:
-    """Normalize a phone string to E.164 (+digits only). Returns None if invalid."""
-    if not raw:
-        return None
-    digits = re.sub(r"\D+", "", raw)
-    if not digits:
-        return None
-    return f"+{digits}"
+def normalize_phone(raw: object) -> str | None:
+    """Normalize a phone value to E.164 (+digits only). Returns None if invalid.
+
+    Type-safe: delegates to the shared ``normalize_phone_candidate`` so Chatwoot
+    ingress, the worker and this module share one contract. A non-string value
+    (list/dict/int/bool/float/None) degrades to None instead of raising.
+    """
+    return normalize_phone_candidate(raw)
 
 
 def _extract_meta_inbound_times(

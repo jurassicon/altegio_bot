@@ -101,7 +101,9 @@ class _CaptureProvider(WhatsAppProvider):
     def __init__(self) -> None:
         self.sent: list[tuple] = []
 
-    async def send(self, sender_id, phone_e164, text, contact_name=None) -> str:
+    async def send(self, sender_id, phone_e164, text, contact_name=None, **kwargs) -> str:
+        # Accept the optional kwargs safe_send forwards (company_id/staff_id/
+        # reply_to_provider_message_id) so a resolved reply context never crashes.
         self.sent.append((sender_id, phone_e164, text))
         return self.wamid
 
@@ -268,3 +270,309 @@ async def test_malformed_nested_message_does_not_crash_worker(session_maker, mon
 
             # Must not raise despite the malformed containers.
             await handle_event(session, evt, provider)
+
+
+# ---------------------------------------------------------------------------
+# Full lifecycle via the production wrapper process_one_event
+# ---------------------------------------------------------------------------
+
+from sqlalchemy import select  # noqa: E402
+
+from altegio_bot.models.models import OutboxMessage  # noqa: E402
+from altegio_bot.workers.whatsapp_inbox_worker import process_one_event  # noqa: E402
+
+PNID_LC = "PNID_LIFECYCLE"
+PHONE_LC = "+4915207156153"
+
+
+async def _seed_sender_and_window(session_maker, *, sender_id: int) -> None:
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(
+                WhatsAppSender(
+                    id=sender_id,
+                    company_id=1,
+                    sender_code="default",
+                    phone_number_id=PNID_LC,
+                    display_phone="+49",
+                    is_active=True,
+                )
+            )
+            await _add_open_window(session, PHONE_LC, PNID_LC)
+
+
+async def _insert_event(session_maker, payload: dict, *, dedupe_key: str) -> int:
+    async with session_maker() as session:
+        async with session.begin():
+            evt = WhatsAppEvent(
+                dedupe_key=dedupe_key,
+                status="received",
+                error=None,
+                query={},
+                headers={},
+                payload=payload,
+            )
+            session.add(evt)
+            await session.flush()
+            return evt.id
+
+
+async def _reload_event(session_maker, event_id: int) -> WhatsAppEvent:
+    async with session_maker() as session:
+        return await session.get(WhatsAppEvent, event_id)
+
+
+async def _operator_outbox(session_maker):
+    async with session_maker() as session:
+        result = await session.execute(select(OutboxMessage).where(OutboxMessage.template_code == "operator_relay"))
+        return result.scalars().first()
+
+
+@pytest.mark.parametrize("hostile_id", ["9" * 5000, -1, "-42", 2**70, PG_BIGINT_MAX + 1])
+@pytest.mark.asyncio
+async def test_lifecycle_hostile_ids_null_projection(session_maker, monkeypatch, hostile_id) -> None:
+    """process_one_event: hostile ids → NULL Outbox projections, event processed."""
+    monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
+    monkeypatch.setattr(worker_module.settings, "chatwoot_operator_relay_enabled", True)
+    monkeypatch.setattr(worker_module, "ChatwootClient", _FakeChatwoot)
+    monkeypatch.setattr(worker_module, "SessionLocal", session_maker)
+    provider = _CaptureProvider()
+
+    await _seed_sender_and_window(session_maker, sender_id=980)
+    event_id = await _insert_event(
+        session_maker,
+        {
+            "_chatwoot_operator_relay": {
+                "recipient_phone": PHONE_LC,
+                "text": "Hallo",
+                "conversation_id": hostile_id,
+                "message_id": hostile_id,
+                "phone_number_id": PNID_LC,
+                "reply_to_chatwoot_message_id": hostile_id,
+            }
+        },
+        dedupe_key="chatwoot_out:lc:hostile",
+    )
+
+    await process_one_event(event_id, provider)
+
+    event = await _reload_event(session_maker, event_id)
+    assert event.status == "processed"
+    assert event.processed_at is not None
+    assert event.error is None
+    assert len(provider.sent) == 1
+
+    outbox = await _operator_outbox(session_maker)
+    assert outbox is not None
+    assert outbox.chatwoot_conversation_id is None
+    assert outbox.chatwoot_message_id is None
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_valid_ids_are_preserved(session_maker, monkeypatch) -> None:
+    monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
+    monkeypatch.setattr(worker_module.settings, "chatwoot_operator_relay_enabled", True)
+    monkeypatch.setattr(worker_module, "ChatwootClient", _FakeChatwoot)
+    monkeypatch.setattr(worker_module, "SessionLocal", session_maker)
+    provider = _CaptureProvider()
+
+    await _seed_sender_and_window(session_maker, sender_id=981)
+    event_id = await _insert_event(
+        session_maker,
+        {
+            "_chatwoot_operator_relay": {
+                "recipient_phone": PHONE_LC,
+                "text": "Hallo",
+                "conversation_id": 6100,
+                "message_id": 7100,
+                "phone_number_id": PNID_LC,
+            }
+        },
+        dedupe_key="chatwoot_out:lc:valid",
+    )
+
+    await process_one_event(event_id, provider)
+
+    event = await _reload_event(session_maker, event_id)
+    assert event.status == "processed"
+    assert len(provider.sent) == 1
+    outbox = await _operator_outbox(session_maker)
+    assert outbox.chatwoot_conversation_id == 6100
+    assert outbox.chatwoot_message_id == 7100
+
+
+@pytest.mark.parametrize("hostile_from", [{}, [], 123, True, "abc"])
+@pytest.mark.asyncio
+async def test_lifecycle_malformed_from_is_safely_ignored(session_maker, monkeypatch, hostile_from) -> None:
+    """messages[].from of any type → action skipped, event processed, no send."""
+    monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
+    monkeypatch.setattr(worker_module, "ChatwootClient", _FakeChatwoot)
+    monkeypatch.setattr(worker_module, "SessionLocal", session_maker)
+    provider = _CaptureProvider()
+
+    event_id = await _insert_event(
+        session_maker,
+        {
+            "entry": [
+                {
+                    "changes": [
+                        {
+                            "value": {
+                                "messages": [{"from": hostile_from, "type": "text", "text": {"body": "hi"}}],
+                                "metadata": {"phone_number_id": PNID_LC},
+                            }
+                        }
+                    ]
+                }
+            ]
+        },
+        dedupe_key=f"wa:lc:from:{type(hostile_from).__name__}",
+    )
+
+    await process_one_event(event_id, provider)
+
+    event = await _reload_event(session_maker, event_id)
+    assert event.status == "processed"
+    assert event.processed_at is not None
+    assert provider.sent == []
+
+
+@pytest.mark.parametrize("hostile_pnid", [{}, [], True, 123])
+@pytest.mark.asyncio
+async def test_lifecycle_malformed_phone_number_id_no_sql_error(session_maker, monkeypatch, hostile_pnid) -> None:
+    """metadata.phone_number_id of any type → no SQL binding error, event processed."""
+    monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
+    monkeypatch.setattr(worker_module, "ChatwootClient", _FakeChatwoot)
+    monkeypatch.setattr(worker_module, "SessionLocal", session_maker)
+    provider = _CaptureProvider()
+
+    event_id = await _insert_event(
+        session_maker,
+        {
+            "entry": [
+                {
+                    "changes": [
+                        {
+                            "value": {
+                                "messages": [{"from": PHONE_LC.lstrip("+"), "type": "text", "text": {"body": "hi"}}],
+                                "metadata": {"phone_number_id": hostile_pnid},
+                            }
+                        }
+                    ]
+                }
+            ]
+        },
+        dedupe_key=f"wa:lc:pnid:{type(hostile_pnid).__name__}",
+    )
+
+    await process_one_event(event_id, provider)
+
+    event = await _reload_event(session_maker, event_id)
+    assert event.status == "processed"
+    assert provider.sent == []
+
+
+@pytest.mark.parametrize("marker", [[], "bad", 123])
+@pytest.mark.asyncio
+async def test_lifecycle_malformed_operator_marker(session_maker, monkeypatch, marker) -> None:
+    monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
+    monkeypatch.setattr(worker_module.settings, "chatwoot_operator_relay_enabled", True)
+    monkeypatch.setattr(worker_module, "ChatwootClient", _FakeChatwoot)
+    monkeypatch.setattr(worker_module, "SessionLocal", session_maker)
+    provider = _CaptureProvider()
+
+    event_id = await _insert_event(
+        session_maker,
+        {"_chatwoot_operator_relay": marker},
+        dedupe_key=f"wa:lc:marker:{type(marker).__name__}",
+    )
+
+    await process_one_event(event_id, provider)
+
+    event = await _reload_event(session_maker, event_id)
+    assert event.status == "processed"
+    assert provider.sent == []
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_mixed_malformed_reply_context_candidate(session_maker, monkeypatch) -> None:
+    """A reply-context candidate whose payload has messages=123 before a valid
+    entry must not crash the secondary scan; the valid entry is still reached."""
+    monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
+    monkeypatch.setattr(worker_module.settings, "chatwoot_operator_relay_enabled", True)
+    monkeypatch.setattr(worker_module, "ChatwootClient", _FakeChatwoot)
+    monkeypatch.setattr(worker_module, "SessionLocal", session_maker)
+    provider = _CaptureProvider()
+
+    conv_id, msg_id, reply_to = 6200, 7200, 8200
+
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(
+                WhatsAppSender(
+                    id=982,
+                    company_id=1,
+                    sender_code="default",
+                    phone_number_id=PNID_LC,
+                    display_phone="+49",
+                    is_active=True,
+                )
+            )
+            await _add_open_window(session, PHONE_LC, PNID_LC)
+            # Historical candidate matching the reply-context SQL: mixed entries,
+            # malformed messages=123 placed BEFORE the valid entry.
+            session.add(
+                WhatsAppEvent(
+                    dedupe_key="wa:reply:candidate",
+                    received_at=datetime.now(timezone.utc) - timedelta(minutes=30),
+                    status="processed",
+                    query={},
+                    headers={},
+                    chatwoot_message_id=reply_to,
+                    forwarded_chatwoot_conversation_id=conv_id,
+                    whatsapp_message_id="wamid.CANDIDATE",
+                    payload={
+                        "entry": [
+                            {"changes": [{"value": {"messages": 123}}]},
+                            {
+                                "changes": [
+                                    {
+                                        "value": {
+                                            "messages": [
+                                                {
+                                                    "from": PHONE_LC.lstrip("+"),
+                                                    "type": "text",
+                                                    "text": {"body": "orig"},
+                                                    "id": "wamid.CANDIDATE",
+                                                }
+                                            ]
+                                        }
+                                    }
+                                ]
+                            },
+                        ]
+                    },
+                )
+            )
+
+    event_id = await _insert_event(
+        session_maker,
+        {
+            "_chatwoot_operator_relay": {
+                "recipient_phone": PHONE_LC,
+                "text": "reply",
+                "conversation_id": conv_id,
+                "message_id": msg_id,
+                "phone_number_id": PNID_LC,
+                "reply_to_chatwoot_message_id": reply_to,
+            }
+        },
+        dedupe_key="chatwoot_out:reply:mixed",
+    )
+
+    await process_one_event(event_id, provider)
+
+    event = await _reload_event(session_maker, event_id)
+    assert event.status == "processed"
+    assert event.error is None
+    assert len(provider.sent) == 1

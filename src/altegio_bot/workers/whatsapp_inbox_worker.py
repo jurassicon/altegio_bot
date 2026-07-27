@@ -37,6 +37,8 @@ from altegio_bot.settings import settings
 from altegio_bot.webhooks.common import (
     list_or_empty,
     mapping_or_empty,
+    nonempty_str,
+    normalize_phone_candidate,
     optional_chatwoot_id,
     safe_log_value,
 )
@@ -177,15 +179,13 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _norm_phone(raw: str | None) -> str | None:
-    if not raw:
-        return None
+def _norm_phone(raw: object) -> str | None:
+    """Type-safe phone normalisation shared with ingress and window logic.
 
-    digits = re.sub(r"\D+", "", raw)
-    if not digits:
-        return None
-
-    return f"+{digits}"
+    ``raw`` is a sender-controlled leaf (``messages[].from``) and may be any JSON
+    type; a non-string degrades to ``None`` instead of reaching ``re.sub``.
+    """
+    return normalize_phone_candidate(raw)
 
 
 def _normalize_reply_context_id(value: Any) -> str | None:
@@ -313,8 +313,12 @@ def _event_origin_for_metrics(event: WhatsAppEvent, payload: dict[str, Any]) -> 
 
 async def _pick_sender(
     session: AsyncSession,
-    phone_number_id: str | None,
+    phone_number_id: object,
 ) -> tuple[int | None, int | None]:
+    # Only a non-empty string may reach the String-column lookup; a dict/list/
+    # bool/number would make the driver raise on parameter binding. Malformed →
+    # "no sender", so the action is safely ignored (no send).
+    phone_number_id = nonempty_str(phone_number_id)
     if not phone_number_id:
         return None, None
 
@@ -369,7 +373,7 @@ def _company_hint_from_inbox(
 
 async def _resolve_relay_sender(
     session: AsyncSession,
-    phone_number_id: str | None,
+    phone_number_id: object,
     *,
     company_id_hint: int | None = None,
 ) -> tuple[int | None, int | None, str | None]:
@@ -392,6 +396,8 @@ async def _resolve_relay_sender(
         1. prefer sender_code == 'default';
         2. fallback: sender with the lowest id.
     """
+    # A non-string id (dict/list/…) is treated as missing, not bound into SQL.
+    phone_number_id = nonempty_str(phone_number_id)
     if not phone_number_id:
         return None, None, "operator_relay: missing phone_number_id"
 
@@ -470,8 +476,8 @@ def _phone_variants(phone_e164: str) -> list[str]:
 
 
 def _payload_message_from_matches_phone(payload: dict[str, Any], phone_e164: str) -> bool:
-    expected_digits = re.sub(r"\D+", "", phone_e164)
-    if not expected_digits:
+    expected = normalize_phone_candidate(phone_e164)
+    if expected is None:
         return False
 
     for entry in list_or_empty(payload.get("entry")):
@@ -483,11 +489,13 @@ def _payload_message_from_matches_phone(payload: dict[str, Any], phone_e164: str
             value = change.get("value") or {}
             if not isinstance(value, dict):
                 continue
-            for msg in value.get("messages") or []:
+            # list_or_empty (not `or []`): a historical/replay payload with a
+            # truthy non-list messages (e.g. 123) must not crash this secondary
+            # scan, and a valid entry later in the list must still be reached.
+            for msg in list_or_empty(value.get("messages")):
                 if not isinstance(msg, dict):
                     continue
-                from_digits = re.sub(r"\D+", "", str(msg.get("from") or ""))
-                if from_digits == expected_digits:
+                if normalize_phone_candidate(msg.get("from")) == expected:
                     return True
     return False
 
@@ -594,7 +602,10 @@ def _extract_actions(payload: dict[str, Any]) -> list[dict[str, Any]]:
             if not isinstance(metadata, dict):
                 metadata = {}
 
-            phone_number_id = metadata.get("phone_number_id")
+            # Normalise to str|None at the boundary: the action dict flows into
+            # SQL lookups, logs and stored meta, none of which may see a
+            # dict/list/number here.
+            phone_number_id = nonempty_str(metadata.get("phone_number_id"))
 
             for msg in list_or_empty(value.get("messages")):
                 if not isinstance(msg, dict):
@@ -676,7 +687,10 @@ def _extract_statuses(payload: dict[str, Any]) -> list[dict[str, Any]]:
             metadata = value.get("metadata") or {}
             if not isinstance(metadata, dict):
                 metadata = {}
-            phone_number_id = metadata.get("phone_number_id")
+            # Normalise to str|None at the boundary: the action dict flows into
+            # SQL lookups, logs and stored meta, none of which may see a
+            # dict/list/number here.
+            phone_number_id = nonempty_str(metadata.get("phone_number_id"))
 
             for st in list_or_empty(value.get("statuses")):
                 if not isinstance(st, dict):

@@ -36,6 +36,7 @@ from altegio_bot.webhooks.common import (
     bounded_dedupe_key,
     mapping_or_empty,
     mask_query,
+    normalize_phone_candidate,
     optional_chatwoot_id,
     postgres_safe_json_value,
     safe_headers,
@@ -157,10 +158,15 @@ async def chatwoot_ingest(request: Request) -> JSONResponse:
     # ------------------------------------------------------------------ #
     if message_type in (1, "outgoing"):
         private = payload.get("private", False)
-        # content_type is sender-controlled and used in a set membership test
-        # below; an unhashable value (list/dict) would raise TypeError there.
+        # content_type is sender-controlled. Absent → documented default "text".
+        # Present but non-string ([]/{}/123/true/null) must FAIL CLOSED: coercing
+        # it to "" would let it fall through _SKIP_CONTENT_TYPES and a malformed
+        # internal Chatwoot event could then be relayed to Meta as a customer
+        # message. Reject with a stable skip and store nothing.
         raw_content_type = payload.get("content_type", "text")
-        content_type = raw_content_type if isinstance(raw_content_type, str) else ""
+        if not isinstance(raw_content_type, str):
+            return JSONResponse({"ok": True, "skipped": "unsupported_content_type"})
+        content_type = raw_content_type
         sender = mapping_or_empty(payload.get("sender"))
         # Same reason as content_type: sender_type is used in a set membership
         # test, so an unhashable value must not reach it.
@@ -215,17 +221,17 @@ async def _ingest_incoming(
     conversation = mapping_or_empty(payload.get("conversation"))
     sender = mapping_or_empty(payload.get("sender"))
 
-    phone_e164 = sender.get("phone_number")
     text = payload.get("content", "")
     chatwoot_message_id = payload.get("id")
     chatwoot_conversation_id = conversation.get("id")
     timestamp_sec = _parse_timestamp(payload.get("created_at"))
 
-    # phone_number routes the message and later reaches re.sub in the worker.
-    # `if not phone_e164` alone lets a truthy non-string (e.g. `[]`→no, but `[1]`
-    # or `{"x":1}`) through, so require a non-empty STRING. The raw value is PII,
-    # so it is never logged.
-    if not (isinstance(phone_e164, str) and phone_e164.strip()):
+    # Normalise the phone at ingress with the SAME contract the worker uses. A
+    # digitless string ("abc", "+", "---") normalises to None: accepting it would
+    # save an event the worker can never route, so Chatwoot would get a 200 and
+    # never retry. Reject up front instead. The raw value is PII — never logged.
+    phone_e164 = normalize_phone_candidate(sender.get("phone_number"))
+    if phone_e164 is None:
         logger.warning("chatwoot_webhook: missing or invalid phone_number")
         raise HTTPException(status_code=400, detail="Missing or invalid phone_number")
 
@@ -305,12 +311,13 @@ async def _ingest_operator_outgoing(
     content_attributes = mapping_or_empty(payload.get("content_attributes"))
     reply_to_chatwoot_message_id = optional_chatwoot_id(content_attributes.get("in_reply_to"))
 
-    # Recipient phone is the contact (customer) in the conversation. Require a
-    # non-empty string: a truthy non-string would reach the worker and crash
-    # re.sub. The raw value is PII, so it is never logged.
-    recipient_phone = contact.get("phone_number")
+    # Normalise the recipient (customer) phone at ingress with the shared
+    # contract. A digitless/non-string value → None → fail-closed skip: no relay
+    # event is stored and the worker is never handed an unroutable phone. The
+    # raw value is PII, so it is never logged.
+    recipient_phone = normalize_phone_candidate(contact.get("phone_number"))
 
-    if not (isinstance(recipient_phone, str) and recipient_phone.strip()):
+    if recipient_phone is None:
         logger.warning(
             "chatwoot_webhook: operator_outgoing missing recipient phone conv_id=%s msg_id=%s",
             safe_log_value(chatwoot_conversation_id, limit=32),

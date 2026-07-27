@@ -13,9 +13,13 @@ import hashlib
 import hmac
 import json
 import math
+import re
 from collections.abc import Iterable
 
 from fastapi import Request
+
+# Всё, что не цифра — вырезается при нормализации телефона.
+_NON_DIGITS_RE = re.compile(r"\D+")
 
 # Заголовки, которые никогда не попадают в сохранённые строки событий.
 # Эндпоинт может расширить набор через ``extra_deny``.
@@ -110,6 +114,38 @@ def list_or_empty(value: object) -> list:
     сознательно НЕ считается последовательностью для этого контракта.
     """
     return value if isinstance(value, list) else []
+
+
+def normalize_phone_candidate(value: object) -> str | None:
+    """Единый type-safe нормализатор телефона: ``+<цифры>`` или ``None``.
+
+    Общий контракт для Chatwoot ingress, worker и window-логики — чтобы правила
+    не расходились между модулями. Принимает ТОЛЬКО ``str``; всё остальное
+    (``list``/``dict``/``int``/``bool``/``float``/``None``) → ``None`` без
+    исключения. ``bool`` — не строка и не число телефона. Из строки берутся
+    только цифры; если цифр нет (``"abc"``, ``"+"``, ``"---"``) → ``None``, то
+    есть бесцифренная строка НЕ считается телефоном. Исходное значение (PII)
+    здесь не логируется — это забота вызывающего кода.
+    """
+    if not isinstance(value, str):
+        return None
+    digits = _NON_DIGITS_RE.sub("", value)
+    if not digits:
+        return None
+    return f"+{digits}"
+
+
+def nonempty_str(value: object) -> str | None:
+    """Возвращает непустую строку как есть, иначе ``None``.
+
+    Для sender-controlled идентификаторов, уходящих в SQL против String-колонки
+    (например ``metadata.phone_number_id``): ``dict``/``list``/``bool``/число
+    нельзя биндить как строковый параметр — драйвер упал бы. Значение НЕ
+    обрезается, чтобы точное сравнение с сохранённым id не менялось.
+    """
+    if isinstance(value, str) and value.strip():
+        return value
+    return None
 
 
 def postgres_safe_json_value(value: object) -> object:
