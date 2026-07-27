@@ -1142,8 +1142,10 @@ async def test_ambiguous_sender_blocks_relay(session_maker) -> None:
         reloaded = await session.get(WhatsAppEvent, evt_id)
     assert reloaded is not None
     assert reloaded.error is not None
-    assert "ambiguous" in reloaded.error
-    assert "PNID_SHARED" in reloaded.error
+    # Stable reason code only — the sender-controlled phone_number_id must NOT
+    # appear in the persisted error (log injection / data leak).
+    assert reloaded.error == "operator_relay: ambiguous_sender"
+    assert "PNID_SHARED" not in reloaded.error
 
     # No OutboxMessage created.
     async with session_maker() as session:
@@ -1220,8 +1222,8 @@ async def test_resolve_relay_sender_zero(session_maker) -> None:
         sid, cid, err = await _resolve_relay_sender(session, "PNID_NONE")
     assert sid is None
     assert cid is None
-    assert err is not None
-    assert "no active sender" in err
+    assert err == "operator_relay: sender_not_found"
+    assert "PNID_NONE" not in err
 
 
 @pytest.mark.asyncio
@@ -1277,9 +1279,8 @@ async def test_resolve_relay_sender_many(session_maker) -> None:
 
     assert sid is None
     assert cid is None
-    assert err is not None
-    assert "ambiguous" in err
-    assert "PNID_MULTI" in err
+    assert err == "operator_relay: ambiguous_sender"
+    assert "PNID_MULTI" not in err
 
 
 @pytest.mark.asyncio
@@ -1833,8 +1834,9 @@ async def test_relay_inbox_not_in_map_fail_closed(session_maker) -> None:
         reloaded = await session.get(WhatsAppEvent, evt_id)
     assert reloaded is not None
     assert reloaded.error is not None
-    assert "fail-closed" in reloaded.error
-    assert "99" in reloaded.error
+    # Stable reason code; the sender-controlled inbox id must not leak into it.
+    assert reloaded.error == "operator_relay: inbox_mapping_missing"
+    assert "99" not in reloaded.error
 
 
 @pytest.mark.asyncio

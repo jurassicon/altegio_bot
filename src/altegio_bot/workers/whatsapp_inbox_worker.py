@@ -356,17 +356,22 @@ def _company_hint_from_inbox(
     try:
         mapping: dict = json.loads(raw)
     except Exception as exc:
-        return (
-            None,
-            f"operator_relay: invalid CHATWOOT_INBOX_COMPANY_MAP: {exc}",
+        # Never persist/return raw config or exception text (may contain
+        # sensitive config). Log only the exception class.
+        logger.warning(
+            "operator_relay: invalid CHATWOOT_INBOX_COMPANY_MAP error_type=%s",
+            type(exc).__name__,
         )
+        return None, "operator_relay: invalid_inbox_company_map"
 
+    # chatwoot_inbox_id is sender-controlled: keep it out of the returned error.
     key = str(chatwoot_inbox_id)
     if key not in mapping:
-        return (
-            None,
-            f"operator_relay: inbox_id={chatwoot_inbox_id} not found in CHATWOOT_INBOX_COMPANY_MAP — fail-closed",
+        logger.warning(
+            "operator_relay: inbox not in company map inbox_id=%s — fail-closed",
+            safe_log_value(chatwoot_inbox_id, limit=32),
         )
+        return None, "operator_relay: inbox_mapping_missing"
 
     return int(mapping[key]), None
 
@@ -397,36 +402,38 @@ async def _resolve_relay_sender(
         2. fallback: sender with the lowest id.
     """
     # A non-string id (dict/list/…) is treated as missing, not bound into SQL.
-    phone_number_id = nonempty_str(phone_number_id)
-    if not phone_number_id:
-        return None, None, "operator_relay: missing phone_number_id"
+    # Returned errors are STABLE reason codes: the id is sender-controlled and
+    # must never end up in event.error or a raw log line (injection/PII). The raw
+    # id is only ever logged separately, escaped, via safe_log_value.
+    safe_pnid = nonempty_str(phone_number_id)
+    if not safe_pnid:
+        return None, None, "operator_relay: missing_phone_number_id"
 
     stmt = (
         select(WhatsAppSender)
-        .where(WhatsAppSender.phone_number_id == phone_number_id)
+        .where(WhatsAppSender.phone_number_id == safe_pnid)
         .where(WhatsAppSender.is_active.is_(True))
     )
     res = await session.execute(stmt)
     senders = list(res.scalars().all())
 
     if not senders:
-        return (
-            None,
-            None,
-            f"operator_relay: no active sender for phone_number_id={phone_number_id}",
+        logger.warning(
+            "operator_relay: no active sender phone_number_id=%s",
+            safe_log_value(safe_pnid, limit=32),
         )
+        return None, None, "operator_relay: sender_not_found"
 
     # ── Hint path: inbox mapping resolved a specific company ───────────
     if company_id_hint is not None:
         hinted = [s for s in senders if s.company_id == company_id_hint]
         if not hinted:
-            return (
-                None,
-                None,
-                f"operator_relay: no active sender for "
-                f"phone_number_id={phone_number_id} "
-                f"company_id={company_id_hint} (from inbox mapping)",
+            logger.warning(
+                "operator_relay: no active sender in hinted company phone_number_id=%s company_id=%s",
+                safe_log_value(safe_pnid, limit=32),
+                company_id_hint,
             )
+            return None, None, "operator_relay: sender_not_found_for_company"
         default_s = [s for s in hinted if s.sender_code == "default"]
         chosen = (default_s or sorted(hinted, key=lambda s: s.id))[0]
         logger.info(
@@ -441,24 +448,15 @@ async def _resolve_relay_sender(
     distinct_companies = {s.company_id for s in senders}
 
     if len(distinct_companies) > 1:
-        cids = sorted(str(c) for c in distinct_companies)
+        # company_ids come from the DB (not sender-controlled) → safe to log.
+        cids = ",".join(sorted(str(c) for c in distinct_companies))
         logger.warning(
-            "operator_relay: ambiguous sender routing "
-            "phone_number_id=%s matched %d senders "
-            "across %d company_ids=%s — blocking send",
-            phone_number_id,
+            "operator_relay: ambiguous sender routing phone_number_id=%s matched %d senders company_ids=%s — blocking",
+            safe_log_value(safe_pnid, limit=32),
             len(senders),
-            len(distinct_companies),
-            ",".join(cids),
+            cids,
         )
-        return (
-            None,
-            None,
-            f"operator_relay: ambiguous sender routing for "
-            f"phone_number_id={phone_number_id} "
-            f"(matched {len(senders)} senders across "
-            f"company_ids={','.join(cids)})",
-        )
+        return None, None, "operator_relay: ambiguous_sender"
 
     default_senders = [s for s in senders if s.sender_code == "default"]
     chosen = (default_senders or sorted(senders, key=lambda s: s.id))[0]
@@ -1893,7 +1891,11 @@ async def _handle_operator_relay(
         event.error = "operator_relay: invalid recipient_phone"
         return
 
-    if not text:
+    # Historical/replay defense: text may be a non-string ({}/[]/123/True) that
+    # would reach the provider and then crash OutboxMessage.body (TEXT). Require a
+    # non-empty string; otherwise fail closed with a stable marker (no send, no
+    # Outbox). The value itself is message content (PII) — never logged.
+    if not (isinstance(text, str) and text.strip()):
         logger.warning(
             "operator_relay: missing text conv_id=%s msg_id=%s — skipping",
             safe_log_value(conversation_id, limit=32),

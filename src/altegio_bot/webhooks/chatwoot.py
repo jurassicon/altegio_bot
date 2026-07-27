@@ -307,7 +307,13 @@ async def _ingest_operator_outgoing(
     chatwoot_message_id = payload.get("id")
     chatwoot_conversation_id = conversation.get("id")
     chatwoot_inbox_id = conversation.get("inbox_id")
-    text = payload.get("content", "")
+    # content is sender-controlled. A non-string ({}/[]/123/true/null) must FAIL
+    # CLOSED: it would otherwise reach the worker, be passed to the provider, and
+    # then crash OutboxMessage.body (TEXT) — a Meta send with no lifecycle row.
+    raw_content = payload.get("content", "")
+    if raw_content is not None and not isinstance(raw_content, str):
+        return JSONResponse({"ok": True, "skipped": "unsupported_content"})
+    text = raw_content or ""
     content_attributes = mapping_or_empty(payload.get("content_attributes"))
     reply_to_chatwoot_message_id = optional_chatwoot_id(content_attributes.get("in_reply_to"))
 
@@ -326,7 +332,7 @@ async def _ingest_operator_outgoing(
         # Accept but skip — we cannot route without a phone number.
         return JSONResponse({"ok": True, "skipped": "no_recipient_phone"})
 
-    if not text:
+    if not text.strip():
         return JSONResponse({"ok": True, "skipped": "empty_content"})
 
     normalized_payload = {

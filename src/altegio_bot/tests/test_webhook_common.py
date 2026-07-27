@@ -295,6 +295,36 @@ def test_normalize_phone_candidate_non_string_is_none(raw: object) -> None:
     assert normalize_phone_candidate(raw) is None
 
 
+@pytest.mark.parametrize("raw", ["1" * 16, "1" * 40, "+" + "9" * 16])
+def test_normalize_phone_candidate_overlong_is_none(raw: str) -> None:
+    """More than 15 ASCII digits cannot be E.164 and would overflow downstream."""
+    from altegio_bot.webhooks.common import normalize_phone_candidate
+
+    assert normalize_phone_candidate(raw) is None
+
+
+@pytest.mark.parametrize("raw", ["１２３４５", "١٢٣٤٥"])
+def test_normalize_phone_candidate_unicode_digits_are_none(raw: str) -> None:
+    """Only ASCII [0-9] count; a string with no ASCII digits → None."""
+    from altegio_bot.webhooks.common import normalize_phone_candidate
+
+    assert normalize_phone_candidate(raw) is None
+
+
+def test_normalize_phone_candidate_length_boundary() -> None:
+    from altegio_bot.webhooks.common import normalize_phone_candidate
+
+    assert normalize_phone_candidate("1" * 15) == "+" + "1" * 15  # 15 accepted
+    assert normalize_phone_candidate("1" * 16) is None  # 16 rejected
+
+
+def test_normalize_phone_candidate_keeps_ascii_digits_among_unicode() -> None:
+    """ASCII digits mixed with Unicode ones: only the ASCII digits are kept."""
+    from altegio_bot.webhooks.common import normalize_phone_candidate
+
+    assert normalize_phone_candidate("49١٢٣15") == "+4915"
+
+
 @pytest.mark.parametrize("raw", ["PNID_1", "  x  "])
 def test_nonempty_str_keeps_value(raw: str) -> None:
     from altegio_bot.webhooks.common import nonempty_str

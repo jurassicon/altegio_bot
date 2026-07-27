@@ -16,6 +16,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from sqlalchemy import select
 
 import altegio_bot.workers.whatsapp_inbox_worker as worker_module
 from altegio_bot.models.models import OutboxMessage, WhatsAppEvent, WhatsAppSender
@@ -264,9 +265,11 @@ _LOG_METHODS = frozenset({"info", "warning", "error", "exception", "debug"})
 
 
 # Wrapper calls that provably do NOT disclose their argument's value, so a PII
-# symbol passed to one of them is safe. Everything else (str/repr/normalize_phone/
-# identity/…) is recursed into — those DO reveal the value.
-_SAFE_LOG_WRAPPERS = frozenset({"safe_log_value", "bool", "len", "type"})
+# symbol passed to one of them is safe. safe_log_value is NOT here: it escapes
+# log injection but returns the value itself, so safe_log_value(phone_e164) still
+# leaks the phone. Everything else (str/repr/normalize_phone/identity/…) is
+# recursed into — those DO reveal the value.
+_SAFE_LOG_WRAPPERS = frozenset({"bool", "len", "type"})
 
 
 def _find_logger_pii_references(source: str) -> list[tuple[int, str]]:
@@ -278,10 +281,11 @@ def _find_logger_pii_references(source: str) -> list[tuple[int, str]]:
     and nested dict/list/tuple of a ``logger.<level>(...)`` call, and flags a
     reference to a PII symbol (``ast.Name.id`` or ``ast.Attribute.attr``).
 
-    Only an explicit allowlist of wrapper calls is treated as sanitising
-    (``safe_log_value``/``bool``/``len``/``type``). Any other call — including
-    ``str(phone)`` and ``normalize_phone(phone)``, which DO reveal the value — is
-    recursed into, so the argument is still checked.
+    Only an explicit allowlist of value-hiding wrapper calls is trusted
+    (``bool``/``len``/``type``). ``safe_log_value`` is deliberately NOT trusted
+    for PII symbols — it escapes injection but returns the value. Any other call
+    — including ``str(phone)`` and ``normalize_phone(phone)``, which DO reveal the
+    value — is recursed into, so the argument is still checked.
     """
     import ast
 
@@ -345,9 +349,12 @@ def test_worker_log_calls_never_reference_pii_symbols() -> None:
         'logger.info(f"phone={phone_e164}")',
         'logger.info("%s", client.phone_e164)',
         'logger.info("%s", str(phone_e164))',
+        'logger.info("%s", repr(phone_e164))',
         'logger.info("%s", normalize_phone(phone_e164))',
         'logger.info("%s", identity(phone_e164))',
         'logger.info("%s", repr(text))',
+        'logger.info("%s", safe_log_value(phone_e164))',
+        'logger.info("phone=%s", safe_log_value(phone_e164, limit=32))',
         'logger.info("x", extra={"phone": phone_e164})',
         'logger.info("x", phone=phone_e164)',
         'logger.warning("%s", [agent_name])',
@@ -365,15 +372,16 @@ def test_ast_guard_catches_pii(snippet: str) -> None:
         'logger.info("event_id=%s", event.id)',
         'logger.info("phone_present=%s", bool(phone_e164))',
         'logger.info("text_len=%s", len(text))',
+        # safe_log_value is allowed ONLY for non-PII technical ids: here it is
+        # injection-escaping for conversation_id, not PII redaction.
         'logger.info("conv_id=%s", safe_log_value(conversation_id, limit=32))',
-        'logger.info("phone=%s", safe_log_value(phone_e164, limit=32))',
         'logger.info("error_type=%s", type(exc).__name__)',
         'logger.info("company_id=%s", company_id)',
     ],
 )
 def test_ast_guard_allows_only_safe_wrappers(snippet: str) -> None:
-    # Only an explicit allowlist is trusted: bool()/len()/type()/safe_log_value()
-    # do not disclose the value. str()/normalize_phone() are NOT trusted (above).
+    # Only value-hiding wrappers are trusted (bool/len/type). safe_log_value is
+    # trusted here only because conversation_id is not a PII symbol.
     assert _find_logger_pii_references(snippet) == [], f"guard false-positive: {snippet}"
 
 
@@ -920,3 +928,122 @@ async def test_incoming_forward_failure_logs_are_clean(session_maker, monkeypatc
     assert reloaded.status == "failed"
     blob = _assert_worker_log_clean(caplog)
     assert "forward failed" in blob
+
+
+# ---------------------------------------------------------------------------
+# Routing errors: stable reason codes, no raw sender-controlled value, no
+# injection in worker logs or event.error
+# ---------------------------------------------------------------------------
+
+HOSTILE_ROUTING_PNID = "UNKNOWN\n2026 INFO forged"
+HOSTILE_INBOX_ID = "INBOX forged"
+
+
+async def _event_error(session_maker, dedupe_key: str) -> str | None:
+    async with session_maker() as session:
+        result = await session.execute(select(WhatsAppEvent).where(WhatsAppEvent.dedupe_key == dedupe_key))
+        evt = result.scalars().first()
+        return evt.error if evt else None
+
+
+@pytest.mark.asyncio
+async def test_routing_sender_not_found_stable_and_clean(session_maker, monkeypatch, caplog) -> None:
+    provider = _CaptureProvider()
+    monkeypatch.setattr(worker_module, "ChatwootClient", _FakeChatwoot)
+    # The seeded sender (HOSTILE_PNID) does not match the relay's pnid → not found.
+    await _run_relay(
+        session_maker,
+        monkeypatch,
+        caplog,
+        provider=provider,
+        sender_id=980,
+        window_open=True,
+        event=_relay_event(_k="notfound", phone_number_id=HOSTILE_ROUTING_PNID),
+    )
+
+    assert provider.sent == []
+    err = await _event_error(session_maker, "chatwoot_out:branch:notfound")
+    assert err == "operator_relay: sender_not_found"
+    assert "forged" not in err
+    _assert_worker_log_clean(caplog)
+
+
+@pytest.mark.asyncio
+async def test_routing_ambiguous_sender_stable_and_clean(session_maker, monkeypatch, caplog) -> None:
+    monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
+    monkeypatch.setattr(worker_module.settings, "chatwoot_operator_relay_enabled", True)
+    monkeypatch.setattr(worker_module, "ChatwootClient", _FakeChatwoot)
+    provider = _CaptureProvider()
+
+    async with session_maker() as session:
+        async with session.begin():
+            for sid, company in ((990, 11), (991, 22)):
+                session.add(
+                    WhatsAppSender(
+                        id=sid,
+                        company_id=company,
+                        sender_code="x",
+                        phone_number_id=HOSTILE_ROUTING_PNID,
+                        display_phone="+49",
+                        is_active=True,
+                    )
+                )
+            evt = _relay_event(_k="ambig", phone_number_id=HOSTILE_ROUTING_PNID)
+            session.add(evt)
+            await session.flush()
+            with caplog.at_level(logging.DEBUG):
+                await handle_event(session, evt, provider)
+
+    assert provider.sent == []
+    err = await _event_error(session_maker, "chatwoot_out:branch:ambig")
+    assert err == "operator_relay: ambiguous_sender"
+    assert "forged" not in err
+    _assert_worker_log_clean(caplog)
+
+
+@pytest.mark.asyncio
+async def test_routing_inbox_mapping_missing_stable_and_clean(session_maker, monkeypatch, caplog) -> None:
+    provider = _CaptureProvider()
+    monkeypatch.setattr(worker_module, "ChatwootClient", _FakeChatwoot)
+    monkeypatch.setattr(worker_module.settings, "chatwoot_inbox_company_map", '{"8": 758285}')
+
+    await _run_relay(
+        session_maker,
+        monkeypatch,
+        caplog,
+        provider=provider,
+        sender_id=992,
+        window_open=True,
+        event=_relay_event(_k="inboxmiss", chatwoot_inbox_id=HOSTILE_INBOX_ID),
+    )
+
+    assert provider.sent == []
+    err = await _event_error(session_maker, "chatwoot_out:branch:inboxmiss")
+    assert err == "operator_relay: inbox_mapping_missing"
+    assert "forged" not in err
+    _assert_worker_log_clean(caplog)
+
+
+@pytest.mark.asyncio
+async def test_routing_invalid_inbox_map_stable_and_clean(session_maker, monkeypatch, caplog) -> None:
+    provider = _CaptureProvider()
+    monkeypatch.setattr(worker_module, "ChatwootClient", _FakeChatwoot)
+    monkeypatch.setattr(worker_module.settings, "chatwoot_inbox_company_map", "{not valid json")
+
+    await _run_relay(
+        session_maker,
+        monkeypatch,
+        caplog,
+        provider=provider,
+        sender_id=993,
+        window_open=True,
+        event=_relay_event(_k="badmap", chatwoot_inbox_id=42),
+    )
+
+    assert provider.sent == []
+    err = await _event_error(session_maker, "chatwoot_out:branch:badmap")
+    assert err == "operator_relay: invalid_inbox_company_map"
+    blob = _assert_worker_log_clean(caplog)
+    # Only the exception class, never raw config/exception body.
+    assert "error_type=" in blob
+    assert "not valid json" not in blob

@@ -832,7 +832,23 @@ async def test_negative_ids_are_rejected_into_null(session_maker, negative) -> N
 # Non-string, empty, AND digitless strings must all be rejected: a digitless
 # string ("abc"/"+"/"---") normalises to None, so accepting it would store an
 # event the worker can never route.
-_MALFORMED_PHONES = ["[]", "{}", "123", "true", "null", '""', '"   "', '"abc"', '"+"', '"---"', '"phone"']
+_MALFORMED_PHONES = [
+    "[]",
+    "{}",
+    "123",
+    "true",
+    "null",
+    '""',
+    '"   "',
+    '"abc"',
+    '"+"',
+    '"---"',
+    '"phone"',
+    '"' + "1" * 16 + '"',  # 16 ASCII digits — overlong for E.164 / VARCHAR(32)
+    '"' + "1" * 40 + '"',  # grossly overlong
+    '"١٢٣٤٥"',  # Arabic-Indic digits — no ASCII digits
+    '"１２３４５"',  # fullwidth digits — no ASCII digits
+]
 
 
 @pytest.mark.parametrize("bad_phone", _MALFORMED_PHONES)
@@ -909,3 +925,55 @@ async def test_malformed_created_at_does_not_500(session_maker, created_at: str)
     assert isinstance(ts, str)
     assert ts.lstrip("-").isdigit()
     json.dumps(row.payload, allow_nan=False)
+
+
+# ---------------------------------------------------------------------------
+# Operator `content` must be a non-empty string (fail closed otherwise)
+# ---------------------------------------------------------------------------
+
+
+def _operator_body(content_json: str) -> bytes:
+    return (
+        '{"event":"message_created","id":7001,"message_type":1,'
+        '"private":false,"content_type":"text","content":' + content_json + ","
+        '"conversation":{"id":701,"inbox_id":123,"meta":{"sender":{"phone_number":"+4915112345678"}}},'
+        '"sender":{"type":"agent","name":"A","id":9},"account":{"id":2}}'
+    ).encode()
+
+
+@pytest.mark.parametrize("content", ["{}", "[]", "123", "true"])
+@pytest.mark.asyncio
+async def test_non_string_operator_content_fails_closed(session_maker, monkeypatch, content: str) -> None:
+    monkeypatch.setattr(settings, "chatwoot_operator_relay_enabled", True)
+
+    resp = await _post_raw(session_maker, _operator_body(content))
+
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True, "skipped": "unsupported_content"}
+    assert await _rows(session_maker) == []
+
+
+# `null`/absent map to Python None → treated as no content (empty), not a
+# non-string container.
+@pytest.mark.parametrize("content", ['""', '"   "', "null"])
+@pytest.mark.asyncio
+async def test_empty_operator_content_is_skipped(session_maker, monkeypatch, content: str) -> None:
+    monkeypatch.setattr(settings, "chatwoot_operator_relay_enabled", True)
+
+    resp = await _post_raw(session_maker, _operator_body(content))
+
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True, "skipped": "empty_content"}
+    assert await _rows(session_maker) == []
+
+
+@pytest.mark.asyncio
+async def test_valid_operator_content_is_stored(session_maker, monkeypatch) -> None:
+    monkeypatch.setattr(settings, "chatwoot_operator_relay_enabled", True)
+
+    resp = await _post_raw(session_maker, _operator_body('"Hallo Kunde"'))
+
+    assert resp.status_code == 200
+    rows = await _rows(session_maker)
+    assert len(rows) == 1
+    assert rows[0].payload["_chatwoot_operator_relay"]["text"] == "Hallo Kunde"

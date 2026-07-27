@@ -100,11 +100,14 @@ class _CaptureProvider(WhatsAppProvider):
 
     def __init__(self) -> None:
         self.sent: list[tuple] = []
+        self.send_calls: list[dict] = []
 
     async def send(self, sender_id, phone_e164, text, contact_name=None, **kwargs) -> str:
-        # Accept the optional kwargs safe_send forwards (company_id/staff_id/
-        # reply_to_provider_message_id) so a resolved reply context never crashes.
+        # Accept and record the optional kwargs safe_send forwards
+        # (company_id/staff_id/reply_to_provider_message_id) so tests can assert
+        # a resolved reply context reached the provider.
         self.sent.append((sender_id, phone_e164, text))
+        self.send_calls.append({"sender_id": sender_id, "phone_e164": phone_e164, "text": text, "kwargs": kwargs})
         return self.wamid
 
     async def send_template(self, *args, **kwargs) -> str:
@@ -576,3 +579,71 @@ async def test_lifecycle_mixed_malformed_reply_context_candidate(session_maker, 
     assert event.status == "processed"
     assert event.error is None
     assert len(provider.sent) == 1
+
+    # The whole point: the valid entry AFTER the malformed one was reached, so
+    # the native reply target resolved and was forwarded to the provider. A
+    # helper that always returned False would still send — but without this.
+    assert provider.send_calls[0]["kwargs"].get("reply_to_provider_message_id") == "wamid.CANDIDATE"
+
+    outbox = await _operator_outbox(session_maker)
+    assert outbox is not None
+    assert outbox.meta["reply_context_native"] is True
+    assert outbox.meta["reply_context_source"] == "whatsapp_event"
+    assert outbox.meta["reply_to_provider_message_id"] == "wamid.CANDIDATE"
+
+
+# ---------------------------------------------------------------------------
+# Historical/replay defense for overlong phone and non-string content
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("bad_phone", ["1" * 40, "1" * 16, "١٢٣٤٥"])
+@pytest.mark.asyncio
+async def test_lifecycle_overlong_historical_relay(session_maker, monkeypatch, bad_phone) -> None:
+    """A stored relay with an overlong/Unicode phone must not send or Outbox."""
+    monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
+    monkeypatch.setattr(worker_module.settings, "chatwoot_operator_relay_enabled", True)
+    monkeypatch.setattr(worker_module, "ChatwootClient", _FakeChatwoot)
+    monkeypatch.setattr(worker_module, "SessionLocal", session_maker)
+    provider = _CaptureProvider()
+
+    event_id = await _insert_event(
+        session_maker,
+        {"_chatwoot_operator_relay": {"recipient_phone": bad_phone, "text": "Hallo", "phone_number_id": PNID_LC}},
+        dedupe_key=f"chatwoot_out:overlong:{len(bad_phone)}:{bad_phone[:2]}",
+    )
+
+    await process_one_event(event_id, provider)
+
+    event = await _reload_event(session_maker, event_id)
+    assert event.status == "processed"
+    assert event.processed_at is not None
+    assert event.error == "operator_relay: invalid recipient_phone"
+    assert provider.sent == []
+    assert await _operator_outbox(session_maker) is None
+
+
+@pytest.mark.parametrize("bad_text", [{}, [], 123, True])
+@pytest.mark.asyncio
+async def test_lifecycle_non_string_relay_text(session_maker, monkeypatch, bad_text) -> None:
+    """A stored relay whose text is non-string must fail closed (no send/Outbox)."""
+    monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
+    monkeypatch.setattr(worker_module.settings, "chatwoot_operator_relay_enabled", True)
+    monkeypatch.setattr(worker_module, "ChatwootClient", _FakeChatwoot)
+    monkeypatch.setattr(worker_module, "SessionLocal", session_maker)
+    provider = _CaptureProvider()
+
+    await _seed_sender_and_window(session_maker, sender_id=990)
+    event_id = await _insert_event(
+        session_maker,
+        {"_chatwoot_operator_relay": {"recipient_phone": PHONE_LC, "text": bad_text, "phone_number_id": PNID_LC}},
+        dedupe_key=f"chatwoot_out:badtext:{type(bad_text).__name__}",
+    )
+
+    await process_one_event(event_id, provider)
+
+    event = await _reload_event(session_maker, event_id)
+    assert event.status == "processed"
+    assert event.error == "operator_relay: missing text"
+    assert provider.sent == []
+    assert await _operator_outbox(session_maker) is None
