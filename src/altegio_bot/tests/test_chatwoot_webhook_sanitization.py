@@ -848,6 +848,14 @@ _MALFORMED_PHONES = [
     '"' + "1" * 40 + '"',  # grossly overlong
     '"١٢٣٤٥"',  # Arabic-Indic digits — no ASCII digits
     '"１２３４５"',  # fullwidth digits — no ASCII digits
+    '"+49 151 O23 4567"',  # letter O instead of zero (closed grammar)
+    '"+49 151 ext 23"',  # extension text
+    '"4915abc123"',  # embedded letters
+    '"+49☎1511234567"',  # ☎ telephone symbol
+    '"+49\U0001f6421511234567"',  # emoji
+    '"49​1511234567"',  # zero-width space
+    '"49+1511234567"',  # '+' after a digit
+    '"++491511234567"',  # two '+'
 ]
 
 

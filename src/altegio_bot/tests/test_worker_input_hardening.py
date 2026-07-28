@@ -597,10 +597,22 @@ async def test_lifecycle_mixed_malformed_reply_context_candidate(session_maker, 
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("bad_phone", ["1" * 40, "1" * 16, "١٢٣٤٥"])
+@pytest.mark.parametrize(
+    "bad_phone",
+    [
+        "1" * 40,  # overlong
+        "1" * 16,  # 16 digits
+        "١٢٣٤٥",  # unicode-only digits
+        "49١٢٣15",  # mixed unicode/ascii digits
+        "+49 151 O23 4567",  # letter
+        "+49🙂1511234567",  # emoji
+        "49\n1511234567",  # control char
+        "no phone here",  # letters
+    ],
+)
 @pytest.mark.asyncio
 async def test_lifecycle_overlong_historical_relay(session_maker, monkeypatch, bad_phone) -> None:
-    """A stored relay with an overlong/Unicode phone must not send or Outbox."""
+    """A stored relay with a grammar-invalid phone must not send or Outbox."""
     monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
     monkeypatch.setattr(worker_module.settings, "chatwoot_operator_relay_enabled", True)
     monkeypatch.setattr(worker_module, "ChatwootClient", _FakeChatwoot)
@@ -787,3 +799,44 @@ async def test_secret_bearing_map_leaks_nothing(session_maker, monkeypatch, capl
     for forbidden in ("SECRETVAL", "token=", "forged", chr(0x2028), chr(0x2029)):
         assert forbidden not in worker_logs
     assert "SECRETVAL" not in (event.error or "")
+
+
+# ---------------------------------------------------------------------------
+# §13 lifecycle: every shape of invalid inbox->company map fails closed with a
+# single stable, non-sensitive marker (no send, no Outbox) via process_one_event.
+# ---------------------------------------------------------------------------
+
+_HUGE_KEY = '{"' + "1" * 5000 + '": 1}'  # must be rejected WITHOUT calling int()
+
+
+@pytest.mark.parametrize(
+    "label,map_json",
+    [
+        ("dup_raw_key", '{"8": 1, "8": 2}'),  # duplicate JSON key -> object_pairs_hook
+        ("newline_collide_key", '{"8": 1, "8\\n": 2}'),  # match() would collide on int("8\n")
+        ("out_of_range_key", '{"2147483648": 1}'),  # PG_INT_MAX + 1
+        ("huge_key", _HUGE_KEY),  # 5000-digit key: rejected, totality, no int()
+        ("company_not_int", '{"8": "1"}'),  # string company value
+        ("company_bool", '{"8": true}'),  # bool company value
+        ("company_float", '{"8": 1.0}'),  # float company value
+        ("company_out_of_range", '{"8": 2147483648}'),  # PG_INT_MAX + 1
+    ],
+)
+@pytest.mark.asyncio
+async def test_lifecycle_invalid_map_variants_fail_closed(session_maker, monkeypatch, label, map_json):
+    """Any invalid map (bad key OR bad company value) must yield the single stable
+    marker, never send, never Outbox, and never raise (processed, not failed)."""
+    provider, event = await _run_map_relay(
+        session_maker,
+        monkeypatch,
+        inbox_id=8,
+        map_json=map_json,
+        sender_id=950,
+        dedupe=f"chatwoot_out:map:invalidshape:{label}",
+    )
+
+    assert event.status == "processed"
+    assert event.processed_at is not None
+    assert event.error == "operator_relay: invalid_inbox_company_map"
+    assert provider.sent == []
+    assert await _operator_outbox(session_maker) is None

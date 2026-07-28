@@ -20,21 +20,27 @@ from dataclasses import dataclass, field
 from fastapi import Request
 
 # Ключ inbox-company map: канонический положительный decimal без ведущих нулей
-# ("8", "42"), но не "0"/"-1"/"+8"/"8.0"/""/"abc".
-_CANONICAL_POSITIVE_INT_RE = re.compile(r"^[1-9][0-9]*$")
+# ("8", "42"), но не "0"/"-1"/"+8"/"8.0"/""/"abc". БЕЗ якорей — проверяем через
+# ``fullmatch`` (``$`` совпал бы перед завершающим ``\n``, пропустив "8\n").
+_CANONICAL_POSITIVE_INT_RE = re.compile(r"[1-9][0-9]*")
 
 # Границы целочисленных типов PostgreSQL. Значение вне диапазона не «обрежется»,
 # а уронит INSERT, поэтому проверяем до записи.
 PG_INT_MIN, PG_INT_MAX = -(2**31), 2**31 - 1
 PG_BIGINT_MIN, PG_BIGINT_MAX = -(2**63), 2**63 - 1
+# Длина десятичной записи PG_INT_MAX. Ключ длиннее заведомо вне диапазона —
+# отсекаем ДО ``int()`` (Python бросает ValueError на очень длинной строке).
+_PG_INT_MAX_DIGITS = len(str(PG_INT_MAX))
 
-# Всё, что не ASCII-цифра, вырезается при нормализации телефона. Сознательно НЕ
-# ``\D`` (Unicode-режим): он оставил бы арабские/полноширинные цифры (١٢٣, １２３),
-# которые не годятся для Meta/E.164-роутинга.
-_ASCII_NON_DIGITS_RE = re.compile(r"[^0-9]+")
 # E.164 допускает максимум 15 цифр; больше не влезает и в downstream-колонки
 # (OutboxMessage.phone_e164 = VARCHAR(32)) — режем ДО persistence.
 _E164_MAX_DIGITS = 15
+# ЗАКРЫТАЯ грамматика телефона: единственные допустимые символы. Всё остальное
+# (буквы, emoji, ☎, control chars, CR/LF, zero-width, не-ASCII цифры, Unicode-
+# пунктуация) делает строку целиком невалидной — НИКАКОГО удаления «мусора»,
+# иначе "+49 151 O23 4567" превратилось бы в другого получателя. Пробел — только
+# обычный ASCII space; tab/CR/LF сознательно НЕ разрешены (fail closed).
+_ALLOWED_PHONE_CHARS = frozenset("0123456789 +-()./")
 
 # Заголовки, которые никогда не попадают в сохранённые строки событий.
 # Эндпоинт может расширить набор через ``extra_deny``.
@@ -139,25 +145,37 @@ def normalize_phone_candidate(value: object) -> str | None:
     (``list``/``dict``/``int``/``bool``/``float``/``None``) → ``None`` без
     исключения. ``bool`` — не строка и не число телефона.
 
-    Цифрами считаются ТОЛЬКО ASCII ``[0-9]``. Если строка содержит любую
-    Unicode-цифру, не являющуюся ASCII (``١٢٣``, ``１２３``), — вся строка
-    отклоняется (``None``), а НЕ тихо очищается: тихое удаление ``49١٢٣15`` →
-    ``+4915`` превратило бы ввод в другой номер и отправило бы сообщение не тому
-    получателю. Результат обязан помещаться в E.164 — не более 15 цифр; иначе
-    ``None``, а не обрезка (обрезанный номер ушёл бы не туда, а полный не влез бы
-    в downstream-колонки и уронил бы OutboxMessage.flush() уже ПОСЛЕ отправки).
-    Бесцифренная строка (``"abc"``, ``"+"``, ``"---"``) → ``None``. Исходное
-    значение (PII) здесь не логируется — это забота вызывающего кода.
+    ЗАКРЫТАЯ грамматика: допустимы только ASCII-цифры и разделители из
+    :data:`_ALLOWED_PHONE_CHARS` (space ``+ - ( ) . /``). ЛЮБОЙ другой символ
+    (буква, ``O`` вместо ``0``, ``ext``, emoji, ``☎``, control char, CR/LF,
+    zero-width, не-ASCII цифра, Unicode-пунктуация) отклоняет строку ЦЕЛИКОМ.
+    Мусор НЕ вычищается: тихая очистка ``"+49 151 O23 4567"`` → ``"+49151234567"``
+    или ``"49١٢٣15"`` → ``"+4915"`` отправила бы сообщение другому получателю.
+
+    ``+`` допускается не более одного раза и только ДО первой цифры (``"49+15"``
+    и ``"++49"`` невалидны). Нужна минимум одна ASCII-цифра; максимум 15 (E.164 и
+    downstream-колонки) — иначе ``None``, без обрезки. Принимается только ``str``.
+    Исходное значение (PII) здесь не логируется — это забота вызывающего кода.
     """
     if not isinstance(value, str):
         return None
-    # Любая не-ASCII десятичная цифра делает всю строку невалидной (см. docstring).
-    if any(ch.isdigit() and not ch.isascii() for ch in value):
-        return None
-    digits = _ASCII_NON_DIGITS_RE.sub("", value)
+
+    digits: list[str] = []
+    plus_seen = False
+    for ch in value:
+        if ch not in _ALLOWED_PHONE_CHARS:
+            return None  # закрытая грамматика: любой посторонний символ фатален
+        if ch == "+":
+            if plus_seen or digits:
+                return None  # второй '+' или '+' после цифры
+            plus_seen = True
+        elif ch in "0123456789":
+            digits.append(ch)
+        # разделители (space - ( ) . /) допустимы и игнорируются
+
     if not digits or len(digits) > _E164_MAX_DIGITS:
         return None
-    return f"+{digits}"
+    return "+" + "".join(digits)
 
 
 def classify_message_type(value: object) -> str | None:
@@ -206,43 +224,82 @@ class InboxCompanyMap:
     mapping: dict[int, int] = field(default_factory=dict)
 
 
-def parse_chatwoot_inbox_company_map(raw: object) -> InboxCompanyMap:
-    """Централизованный typed-парсер inbox→company конфигурации.
+def _canonical_inbox_key(key: object) -> int | None:
+    """Строгий inbox-ключ → положительный int в диапазоне PG Integer, иначе None.
 
-    Валидация выполняется ОДИН раз здесь, чтобы worker не работал с произвольным
-    результатом ``json.loads``. Правила:
-      * ``""``/``"{}"`` (после strip) → не настроена (fallback разрешён);
-      * не-строка на входе или ошибка JSON → невалидна;
-      * top-level не ``dict`` → невалидна;
-      * ключ — только канонический положительный decimal (``"8"``/``"42"``);
-        ``""``/``"0"``/``"-1"``/``"+8"``/``"8.0"``/``"abc"`` → невалидна;
-      * значение — только ``type(v) is int`` и ``0 < v <= PG_INT_MAX``
-        (``bool``/float/строка/контейнер/``0``/отрицательное/переполнение →
-        невалидна). Никакого ``int(value)`` для произвольных значений.
-    Ни сырой конфиг, ни значения наружу не возвращаются — только флаги и int'ы.
+    ``fullmatch`` (не ``match``!) по всей строке: ``match`` c ``$`` совпал бы
+    перед завершающим ``\\n``, и ``"8\\n"`` прошёл бы как canonical, а затем
+    ``int("8\\n") == 8`` схлопнул бы его с ``"8"`` — прямой wrong-tenant риск.
+    Никакого ``.strip()`` (создал бы новые коллизии). Тотальность: ключ длиннее
+    десятичной записи PG_INT_MAX заведомо вне диапазона — отсекаем ДО ``int()``,
+    иначе Python бросит ``ValueError`` на строке из тысяч цифр.
+    """
+    if not isinstance(key, str) or not _CANONICAL_POSITIVE_INT_RE.fullmatch(key):
+        return None
+    if len(key) > _PG_INT_MAX_DIGITS:
+        return None
+    value = int(key)  # безопасно: канонический decimal ограниченной длины
+    return value if 0 < value <= PG_INT_MAX else None
+
+
+class _DuplicateJSONKey(Exception):
+    """Raised by the object_pairs_hook when a JSON object repeats a key."""
+
+
+def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict:
+    keys = [k for k, _ in pairs]
+    if len(keys) != len(set(keys)):
+        raise _DuplicateJSONKey
+    return dict(pairs)
+
+
+def parse_chatwoot_inbox_company_map(raw: object) -> InboxCompanyMap:
+    """Тотальный ambiguity-safe парсер inbox→company конфигурации.
+
+    Для ЛЮБОГО ``raw`` возвращает :class:`InboxCompanyMap` и НИКОГДА не бросает
+    исключение, не возвращает и не логирует сырой конфиг/значение. Правила:
+      * не-``str`` (в т.ч. уже разобранный объект) → невалидна;
+      * пустая/whitespace строка ИЛИ любой распарсенный пустой JSON-объект
+        (``"{}"``/``"{ }"``/``"{\\n}"``) → НЕ настроена (fallback разрешён);
+      * ошибка JSON / duplicate JSON key / не-``dict`` top-level → невалидна;
+      * ключ — строгий canonical positive int в диапазоне PG Integer
+        (``fullmatch``, без ``.strip()``, длина отсекается до ``int()``);
+      * значение — только ``type(v) is int`` и ``0 < v <= PG_INT_MAX`` (никакого
+        ``int(value)`` для произвольного JSON);
+      * коллизия нормализованного ключа (defense-in-depth) → невалидна.
     """
     if not isinstance(raw, str):
         return InboxCompanyMap(configured=True, valid=False)
 
     stripped = raw.strip()
-    if not stripped or stripped == "{}":
+    if not stripped:
         return InboxCompanyMap(configured=False, valid=True)
 
     try:
-        parsed = json.loads(stripped)
+        parsed = json.loads(stripped, object_pairs_hook=_reject_duplicate_keys)
+    except _DuplicateJSONKey:
+        return InboxCompanyMap(configured=True, valid=False)
     except Exception:
         return InboxCompanyMap(configured=True, valid=False)
 
     if not isinstance(parsed, dict):
         return InboxCompanyMap(configured=True, valid=False)
 
+    # Любой распарсенный пустой объект — независимо от форматирования — означает
+    # «map не настроена» и не должен отключать documented fallback.
+    if not parsed:
+        return InboxCompanyMap(configured=False, valid=True)
+
     mapping: dict[int, int] = {}
     for key, company in parsed.items():
-        if not (isinstance(key, str) and _CANONICAL_POSITIVE_INT_RE.match(key)):
+        inbox_id = _canonical_inbox_key(key)
+        if inbox_id is None:
             return InboxCompanyMap(configured=True, valid=False)
         if type(company) is not int or not (0 < company <= PG_INT_MAX):
             return InboxCompanyMap(configured=True, valid=False)
-        mapping[int(key)] = company
+        if inbox_id in mapping:  # defense-in-depth против коллизий ключей
+            return InboxCompanyMap(configured=True, valid=False)
+        mapping[inbox_id] = company
 
     return InboxCompanyMap(configured=True, valid=True, mapping=mapping)
 

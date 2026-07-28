@@ -451,3 +451,120 @@ def test_inbox_map_non_string_input_is_invalid() -> None:
     m = parse_chatwoot_inbox_company_map({"8": 1})
     assert m.configured is True
     assert m.valid is False
+
+
+# ---------------------------------------------------------------------------
+# Closed phone grammar: no character outside the supported set is ever cleaned
+# ---------------------------------------------------------------------------
+
+_ZWSP = chr(0x200B)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "+49 151 O23 4567",  # letter O instead of zero
+        "+49 151 ext 23",  # extension text
+        "4915abc123",  # letters
+        "+49☎1511234567",  # ☎ telephone symbol
+        "+49\U0001f6421511234567",  # emoji
+        "49" + _ZWSP + "1511234567",  # zero-width space
+        "49\n1511234567",  # LF
+        "49\r1511234567",  # CR
+        "49\t1511234567",  # tab (not an allowed separator)
+        "49+1511234567",  # '+' after a digit
+        "++491511234567",  # two '+'
+        "+49*1511234567",  # '*' not in grammar
+        "+49,1511234567",  # ',' not in grammar
+        "49١٢٣15",  # mixed ASCII + Arabic-Indic digits
+    ],
+)
+def test_normalize_phone_candidate_closed_grammar_rejects(raw: str) -> None:
+    from altegio_bot.webhooks.common import normalize_phone_candidate
+
+    assert normalize_phone_candidate(raw) is None
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("+49/151/1234567", "+491511234567"),
+        ("+49.151.1234567", "+491511234567"),
+        ("+49 (151) 123-45-67", "+491511234567"),
+    ],
+)
+def test_normalize_phone_candidate_allowed_separators(raw: str, expected: str) -> None:
+    from altegio_bot.webhooks.common import normalize_phone_candidate
+
+    assert normalize_phone_candidate(raw) == expected
+
+
+# ---------------------------------------------------------------------------
+# Map parser: duplicate keys, normalized-key collisions, empty-object, totality
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        '{"8": 1, "8": 2}',  # duplicate raw key, different value
+        '{"42": 1, "42": 1}',  # duplicate raw key, same value — still ambiguous
+        '{"8": 1, "8\n": 2}',  # newline-colliding key ("8\n" -> 8 without fullmatch)
+        '{"8": 1, "08": 2}',  # leading-zero key ("08" is invalid AND would collide)
+    ],
+)
+def test_inbox_map_duplicate_and_collision_invalid(raw: str) -> None:
+    from altegio_bot.webhooks.common import parse_chatwoot_inbox_company_map
+
+    m = parse_chatwoot_inbox_company_map(raw)
+    assert m.configured is True
+    assert m.valid is False
+    assert m.mapping == {}
+
+
+@pytest.mark.parametrize("raw", ["{}", "{ }", "{\n}", "{\r\n    }", "{\t}"])
+def test_inbox_map_empty_object_any_formatting_is_unconfigured(raw: str) -> None:
+    from altegio_bot.webhooks.common import parse_chatwoot_inbox_company_map
+
+    m = parse_chatwoot_inbox_company_map(raw)
+    assert m.configured is False
+    assert m.valid is True
+    assert m.mapping == {}
+
+
+def test_inbox_map_key_range_and_totality() -> None:
+    from altegio_bot.webhooks.common import PG_INT_MAX, parse_chatwoot_inbox_company_map
+
+    # str(PG_INT_MAX) accepted; +1 rejected; 5000-digit key rejected WITHOUT raising.
+    ok = parse_chatwoot_inbox_company_map('{"' + str(PG_INT_MAX) + '": 5}')
+    assert ok.valid is True and ok.mapping == {PG_INT_MAX: 5}
+
+    over = parse_chatwoot_inbox_company_map('{"' + str(PG_INT_MAX + 1) + '": 5}')
+    assert over.configured is True and over.valid is False
+
+    huge = parse_chatwoot_inbox_company_map('{"' + "9" * 5000 + '": 5}')
+    assert huge.configured is True and huge.valid is False
+
+
+def test_inbox_map_parser_is_total_on_any_input() -> None:
+    from altegio_bot.webhooks.common import parse_chatwoot_inbox_company_map
+
+    # Must never raise, whatever the input type/shape.
+    for raw in [None, True, False, 42, 1.9, [], {}, {"8": 1}, "42", "1.9", "[1,2]", "not json", '{"8": 1']:
+        m = parse_chatwoot_inbox_company_map(raw)
+        assert isinstance(m.configured, bool) and isinstance(m.valid, bool)
+
+
+def test_inbox_map_trailing_newline_key_rejected_via_fullmatch() -> None:
+    """A single valid-JSON key that is "8" + newline must be rejected by fullmatch.
+
+    (`.match()` with a `$` anchor would accept it and int("8\n") == 8, silently
+    remapping inbox 8.) This isolates the fullmatch requirement from the
+    duplicate-key and collision defenses.
+    """
+    from altegio_bot.webhooks.common import parse_chatwoot_inbox_company_map
+
+    m = parse_chatwoot_inbox_company_map('{"8\\n": 5}')  # JSON source: {"8<LF>": 5}
+    assert m.configured is True
+    assert m.valid is False
+    assert m.mapping == {}
