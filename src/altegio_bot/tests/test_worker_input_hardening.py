@@ -169,6 +169,7 @@ async def test_operator_relay_survives_hostile_ids(session_maker, monkeypatch, h
     monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
     monkeypatch.setattr(worker_module.settings, "chatwoot_operator_relay_enabled", True)
     monkeypatch.setattr(worker_module, "ChatwootClient", _FakeChatwoot)
+    monkeypatch.setattr(worker_module, "SessionLocal", session_maker)
     provider = _CaptureProvider()
     phone = "+4915207156153"
     pnid = "PNID_HARDEN"
@@ -208,8 +209,8 @@ async def test_operator_relay_survives_hostile_ids(session_maker, monkeypatch, h
             await session.flush()
             evt_id = evt.id
 
-            # Must not raise, whatever the id.
-            await handle_event(session, evt, provider)
+    # Must not raise, whatever the id.
+    await process_one_event(evt_id, provider)
 
     # Window was open → free-form text sent. No unhandled exception, no loss.
     assert len(provider.sent) == 1

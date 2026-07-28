@@ -316,7 +316,11 @@ async def test_operator_relay_not_blocked_by_chatwoot_guard(session_maker, monke
     The relay check (section 0) runs before the Chatwoot-origin guard
     (section 2), so relay events are handled correctly and never dropped.
     """
+    import altegio_bot.workers.whatsapp_inbox_worker as wiw
+
     monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
+    monkeypatch.setattr(wiw, "SessionLocal", session_maker)
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_relay_enabled", True)
     provider = _CaptureProvider()
     phone = "+4915207156153"
 
@@ -386,15 +390,9 @@ async def test_operator_relay_not_blocked_by_chatwoot_guard(session_maker, monke
             )
             session.add(relay_evt)
             await session.flush()
+            evt_id = relay_evt.id
 
-            from altegio_bot.settings import settings as _s
-
-            orig = _s.chatwoot_operator_relay_enabled
-            _s.chatwoot_operator_relay_enabled = True
-            try:
-                await handle_event(session, relay_evt, provider)
-            finally:
-                _s.chatwoot_operator_relay_enabled = orig
+    await wiw.process_one_event(evt_id, provider)
 
     assert len(provider.sent) == 1
     assert provider.sent[0]["phone_e164"] == phone

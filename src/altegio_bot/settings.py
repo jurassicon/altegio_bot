@@ -217,6 +217,12 @@ class Settings(BaseSettings):
     # and the original message was not delivered directly.
     chatwoot_operator_reopen_private_note_enabled: bool = True
 
+    # An operator-relay Outbox left in 'sending' longer than this is treated as
+    # a stale/interrupted attempt: recovery moves it to 'unknown' (manual review,
+    # never an automatic resend). Kept generous so a slow-but-live Meta call is
+    # not misclassified; tests lower it to force the stale path.
+    chatwoot_operator_relay_stale_sending_seconds: int = 900
+
     @field_validator("chatwoot_reply_context_visible_quote_mode")
     @classmethod
     def validate_reply_context_visible_quote_mode(cls, v: str) -> str:

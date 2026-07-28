@@ -506,6 +506,15 @@ class OutboxMessage(Base):
             "company_id",
             "created_at",
         ),
+        # DB-level idempotency for operator relay: at most one Outbox intent per
+        # source WhatsAppEvent. Partial so the many historical/bot rows that have
+        # no source event (NULL) are unconstrained and can coexist freely.
+        Index(
+            "uq_outbox_source_whatsapp_event_id",
+            "source_whatsapp_event_id",
+            unique=True,
+            postgresql_where=text("source_whatsapp_event_id IS NOT NULL"),
+        ),
     )
 
     id: Mapped[int] = mapped_column(
@@ -541,9 +550,22 @@ class OutboxMessage(Base):
     language: Mapped[str] = mapped_column(String(8), default="de")
     body: Mapped[str] = mapped_column(Text)
 
-    # queued/sending/sent/delivered/read/failed
+    # Lifecycle: queued → sending → sent/delivered/read | failed | canceled |
+    # unknown. For operator relay the transition queued → sending is committed
+    # (with attempt_started_at) BEFORE the first Meta side effect, so a durable
+    # send intent always exists on disk before the network call. 'unknown' marks
+    # an attempt whose Meta outcome cannot be proven (crash/indeterminate) — it
+    # is never auto-retried and requires manual review.
     status: Mapped[str] = mapped_column(String(32), default="queued", index=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Wall-clock time the queued → sending claim was committed. Distinct from
+    # created_at (a row may sit in 'queued' first) and from sent_at (only set on
+    # confirmed success). Stale-'sending' recovery keys off this timestamp.
+    attempt_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
 
     provider_message_id: Mapped[str | None] = mapped_column(
         String(128),
@@ -595,6 +617,17 @@ class OutboxMessage(Base):
         BigInteger,
         nullable=True,
         index=True,
+    )
+
+    # Operator-relay idempotency anchor: the WhatsAppEvent this row relays.
+    # NULL for every historical row and every non-operator (bot/campaign) send.
+    # Populated for operator relay and covered by the partial unique index above,
+    # so one event can never spawn two send attempts even under concurrency or
+    # crash-replay. SET NULL on event deletion keeps the audit row alive.
+    source_whatsapp_event_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey("whatsapp_events.id", ondelete="SET NULL"),
+        nullable=True,
     )
 
 

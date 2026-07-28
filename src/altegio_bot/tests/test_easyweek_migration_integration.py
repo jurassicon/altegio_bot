@@ -39,7 +39,7 @@ from altegio_bot.settings import Settings
 
 _ROOT = Path(__file__).resolve().parents[3]
 _BASE_REVISION = "8923be993170"
-_HEAD_REVISION = "8705ec49cc73"
+_HEAD_REVISION = "9a1f4c7b2e3d"
 # Guard against ever pointing the DROP at something real.
 _TEMP_DB_PREFIX = "altegio_migtest_"
 

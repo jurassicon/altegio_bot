@@ -100,6 +100,7 @@ async def test_operator_relay_logs_carry_no_pii_or_injection(session_maker, monk
     monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
     monkeypatch.setattr(worker_module.settings, "chatwoot_operator_relay_enabled", True)
     monkeypatch.setattr(worker_module, "ChatwootClient", _FakeChatwoot)
+    monkeypatch.setattr(worker_module, "SessionLocal", session_maker)
     provider = _CaptureProvider()
 
     async with session_maker() as session:
@@ -167,9 +168,10 @@ async def test_operator_relay_logs_carry_no_pii_or_injection(session_maker, monk
             )
             session.add(relay_evt)
             await session.flush()
+            evt_id = relay_evt.id
 
-            with caplog.at_level(logging.DEBUG):
-                await handle_event(session, relay_evt, provider)
+    with caplog.at_level(logging.DEBUG):
+        await process_one_event(evt_id, provider)
 
     blob = _assert_no_pii_and_no_injection(caplog)
     # Technical identifiers stay available for tracing.
@@ -494,6 +496,7 @@ def _relay_event(**relay_overrides) -> WhatsAppEvent:
 
 async def _run_relay(session_maker, monkeypatch, caplog, *, provider, sender_id, window_open, event):
     monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
+    monkeypatch.setattr(worker_module, "SessionLocal", session_maker)
     monkeypatch.setattr(worker_module.settings, "chatwoot_operator_relay_enabled", True)
     async with session_maker() as session:
         async with session.begin():
@@ -540,8 +543,12 @@ async def _run_relay(session_maker, monkeypatch, caplog, *, provider, sender_id,
                 )
             session.add(event)
             await session.flush()
-            with caplog.at_level(logging.DEBUG):
-                await handle_event(session, event, provider)
+            event_id = event.id
+    # Drive the durable pipeline (prepare/claim/execute/finalize) via the
+    # production wrapper so logs reflect the real, committed lifecycle.
+    with caplog.at_level(logging.DEBUG):
+        await process_one_event(event_id, provider)
+    return event_id
 
 
 @pytest.mark.asyncio
@@ -584,7 +591,9 @@ async def test_relay_log_transient_send_failure(session_maker, monkeypatch, capl
     )
 
     blob = _assert_worker_log_clean(caplog)
-    assert "transient Meta error closed circuit" in blob
+    # Transient outcome is ambiguous → durable row 'unknown' (manual review),
+    # circuit closed. The error kind is logged; the raw provider text is not.
+    assert "send outcome unknown" in blob
     assert "error_kind=" in blob
 
 
@@ -628,7 +637,7 @@ async def test_relay_log_closed_window_note_success(session_maker, monkeypatch, 
 
     assert provider.sent == []
     blob = _assert_worker_log_clean(caplog)
-    assert "closed-window note sent" in blob
+    assert "private note sent" in blob
 
 
 @pytest.mark.asyncio
@@ -650,7 +659,7 @@ async def test_relay_log_closed_window_note_failure(session_maker, monkeypatch, 
     )
 
     blob = _assert_worker_log_clean(caplog)
-    assert "closed-window note failed" in blob
+    assert "private note failed" in blob
     assert "error_type=RuntimeError" in blob
     # Persisted error carries only the class name, never the raw exception text.
     assert "SECRETVAL" not in (event.error or "")
@@ -675,10 +684,10 @@ async def test_relay_log_reopen_template_failure_and_failure_note(session_maker,
     )
 
     blob = _assert_worker_log_clean(caplog)
-    assert "reopen template failed" in blob
+    assert "send failed" in blob
     assert "error_kind=permanent" in blob
     # The failure-note Chatwoot send also raised → its class name, no raw text.
-    assert "failure note failed" in blob
+    assert "private note failed" in blob
     assert "error_type=RuntimeError" in blob
 
 
@@ -728,7 +737,7 @@ async def test_relay_log_circuit_pause_note_failure(session_maker, monkeypatch, 
     )
 
     blob = _assert_worker_log_clean(caplog)
-    assert "circuit pause note failed" in blob
+    assert "private note failed" in blob
     assert "error_type=RuntimeError" in blob
 
 
@@ -752,7 +761,7 @@ async def test_relay_log_reopen_template_success_private_note_failure(session_ma
     )
 
     blob = _assert_worker_log_clean(caplog)
-    assert "reopen template sent" in blob
+    assert "template sent" in blob
     assert "private note failed" in blob
     assert "error_type=RuntimeError" in blob
 
@@ -763,6 +772,7 @@ async def test_relay_log_native_reply_target_found(session_maker, monkeypatch, c
     monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
     monkeypatch.setattr(worker_module.settings, "chatwoot_operator_relay_enabled", True)
     monkeypatch.setattr(worker_module, "ChatwootClient", _FakeChatwoot)
+    monkeypatch.setattr(worker_module, "SessionLocal", session_maker)
     provider = _CaptureProvider()
     conv_id, msg_id, reply_to = 6001, 7001, 8001
     pnid = "PNID_NATIVE"
@@ -850,8 +860,10 @@ async def test_relay_log_native_reply_target_found(session_maker, monkeypatch, c
             )
             session.add(evt)
             await session.flush()
-            with caplog.at_level(logging.DEBUG):
-                await handle_event(session, evt, provider)
+            evt_id = evt.id
+
+    with caplog.at_level(logging.DEBUG):
+        await process_one_event(evt_id, provider)
 
     assert len(provider.sent) == 1
     blob = _assert_worker_log_clean(caplog)
@@ -971,6 +983,7 @@ async def test_routing_sender_not_found_stable_and_clean(session_maker, monkeypa
 @pytest.mark.asyncio
 async def test_routing_ambiguous_sender_stable_and_clean(session_maker, monkeypatch, caplog) -> None:
     monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
+    monkeypatch.setattr(worker_module, "SessionLocal", session_maker)
     monkeypatch.setattr(worker_module.settings, "chatwoot_operator_relay_enabled", True)
     monkeypatch.setattr(worker_module, "ChatwootClient", _FakeChatwoot)
     provider = _CaptureProvider()
@@ -991,8 +1004,10 @@ async def test_routing_ambiguous_sender_stable_and_clean(session_maker, monkeypa
             evt = _relay_event(_k="ambig", phone_number_id=HOSTILE_ROUTING_PNID)
             session.add(evt)
             await session.flush()
-            with caplog.at_level(logging.DEBUG):
-                await handle_event(session, evt, provider)
+            evt_id = evt.id
+
+    with caplog.at_level(logging.DEBUG):
+        await process_one_event(evt_id, provider)
 
     assert provider.sent == []
     err = await _event_error(session_maker, "chatwoot_out:branch:ambig")
