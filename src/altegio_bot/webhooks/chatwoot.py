@@ -34,6 +34,7 @@ from altegio_bot.models.models import WhatsAppEvent
 from altegio_bot.settings import settings
 from altegio_bot.webhooks.common import (
     bounded_dedupe_key,
+    classify_message_type,
     mapping_or_empty,
     mask_query,
     normalize_phone_candidate,
@@ -145,19 +146,32 @@ async def chatwoot_ingest(request: Request) -> JSONResponse:
         # клиенту нельзя — оно может быть некодируемым и уронить JSONResponse.
         return JSONResponse({"ok": True, "skipped": "unsupported_event"})
 
-    message_type = payload.get("message_type")
+    # Exact-type discriminator: `message_type in (1, "outgoing")` would match
+    # True (True == 1) and 1.0, letting a boolean/float into the relay path.
+    message_path = classify_message_type(payload.get("message_type"))
+    if message_path is None:
+        return JSONResponse({"ok": True, "skipped": "unsupported_message_type"})
 
     # ------------------------------------------------------------------ #
     # Path 1: incoming customer message                                    #
     # ------------------------------------------------------------------ #
-    if message_type in (0, "incoming"):
+    if message_path == "incoming":
         return await _ingest_incoming(request, payload)
 
     # ------------------------------------------------------------------ #
     # Path 2: outgoing operator message (Meta-first relay)                 #
     # ------------------------------------------------------------------ #
-    if message_type in (1, "outgoing"):
-        private = payload.get("private", False)
+    if message_path == "outgoing":
+        # `private`: absent → documented default False. Present → must be an
+        # exact bool; 0/1/"true"/[]/… must NOT be coerced (truthiness would let
+        # a malformed flag decide whether a private note is relayed to a
+        # customer). Fail closed with a stable reason, store nothing.
+        if "private" in payload:
+            private = payload["private"]
+            if type(private) is not bool:
+                return JSONResponse({"ok": True, "skipped": "invalid_private_flag"})
+        else:
+            private = False
         # content_type is sender-controlled. Absent → documented default "text".
         # Present but non-string ([]/{}/123/true/null) must FAIL CLOSED: coercing
         # it to "" would let it fall through _SKIP_CONTENT_TYPES and a malformed
@@ -192,12 +206,12 @@ async def chatwoot_ingest(request: Request) -> JSONResponse:
         msg_id = payload.get("id")
         logger.info(
             "chatwoot_webhook: skipping outgoing relay_enabled=%s"
-            " message_type=%s sender_type=%s private=%s"
+            " message_path=%s sender_type=%s private=%s"
             " content_type=%s conv_id=%s msg_id=%s",
             settings.chatwoot_operator_relay_enabled,
-            safe_log_value(message_type, limit=32),
+            message_path,
             safe_log_value(sender_type, limit=32),
-            bool(private),
+            private,
             safe_log_value(content_type, limit=32),
             safe_log_value(conv_id, limit=32),
             safe_log_value(msg_id, limit=32),

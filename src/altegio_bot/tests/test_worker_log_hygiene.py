@@ -1007,6 +1007,7 @@ async def test_routing_inbox_mapping_missing_stable_and_clean(session_maker, mon
     monkeypatch.setattr(worker_module, "ChatwootClient", _FakeChatwoot)
     monkeypatch.setattr(worker_module.settings, "chatwoot_inbox_company_map", '{"8": 758285}')
 
+    # A valid but unknown inbox id → mapping_missing (positive_int accepts 99).
     await _run_relay(
         session_maker,
         monkeypatch,
@@ -1014,12 +1015,35 @@ async def test_routing_inbox_mapping_missing_stable_and_clean(session_maker, mon
         provider=provider,
         sender_id=992,
         window_open=True,
-        event=_relay_event(_k="inboxmiss", chatwoot_inbox_id=HOSTILE_INBOX_ID),
+        event=_relay_event(_k="inboxmiss", chatwoot_inbox_id=99),
     )
 
     assert provider.sent == []
     err = await _event_error(session_maker, "chatwoot_out:branch:inboxmiss")
     assert err == "operator_relay: inbox_mapping_missing"
+    _assert_worker_log_clean(caplog)
+
+
+@pytest.mark.asyncio
+async def test_routing_invalid_inbox_id_stable_and_clean(session_maker, monkeypatch, caplog) -> None:
+    """A configured map + hostile non-int inbox id → invalid_inbox_id, no injection."""
+    provider = _CaptureProvider()
+    monkeypatch.setattr(worker_module, "ChatwootClient", _FakeChatwoot)
+    monkeypatch.setattr(worker_module.settings, "chatwoot_inbox_company_map", '{"8": 758285}')
+
+    await _run_relay(
+        session_maker,
+        monkeypatch,
+        caplog,
+        provider=provider,
+        sender_id=994,
+        window_open=True,
+        event=_relay_event(_k="badinbox", chatwoot_inbox_id=HOSTILE_INBOX_ID),
+    )
+
+    assert provider.sent == []
+    err = await _event_error(session_maker, "chatwoot_out:branch:badinbox")
+    assert err == "operator_relay: invalid_inbox_id"
     assert "forged" not in err
     _assert_worker_log_clean(caplog)
 
@@ -1044,6 +1068,5 @@ async def test_routing_invalid_inbox_map_stable_and_clean(session_maker, monkeyp
     err = await _event_error(session_maker, "chatwoot_out:branch:badmap")
     assert err == "operator_relay: invalid_inbox_company_map"
     blob = _assert_worker_log_clean(caplog)
-    # Only the exception class, never raw config/exception body.
-    assert "error_type=" in blob
+    # Raw config / exception body must never appear.
     assert "not valid json" not in blob

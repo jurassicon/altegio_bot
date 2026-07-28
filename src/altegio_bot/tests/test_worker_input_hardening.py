@@ -647,3 +647,143 @@ async def test_lifecycle_non_string_relay_text(session_maker, monkeypatch, bad_t
     assert event.error == "operator_relay: missing text"
     assert provider.sent == []
     assert await _operator_outbox(session_maker) is None
+
+
+# ---------------------------------------------------------------------------
+# Configured inbox-company map routing: no bypass, no provider before resolution
+# ---------------------------------------------------------------------------
+
+import logging  # noqa: E402
+
+_MAP_ONE = '{"8": 1}'  # inbox 8 -> company 1 (matches the seeded sender)
+_MISSING = object()  # sentinel: omit chatwoot_inbox_id entirely
+
+
+async def _run_map_relay(session_maker, monkeypatch, *, inbox_id, map_json, sender_id, dedupe):
+    monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
+    monkeypatch.setattr(worker_module.settings, "chatwoot_operator_relay_enabled", True)
+    monkeypatch.setattr(worker_module.settings, "chatwoot_inbox_company_map", map_json)
+    monkeypatch.setattr(worker_module, "ChatwootClient", _FakeChatwoot)
+    monkeypatch.setattr(worker_module, "SessionLocal", session_maker)
+    provider = _CaptureProvider()
+
+    await _seed_sender_and_window(session_maker, sender_id=sender_id)
+    relay = {"recipient_phone": PHONE_LC, "text": "Hallo", "phone_number_id": PNID_LC}
+    if inbox_id is not _MISSING:
+        relay["chatwoot_inbox_id"] = inbox_id
+    event_id = await _insert_event(session_maker, {"_chatwoot_operator_relay": relay}, dedupe_key=dedupe)
+
+    await process_one_event(event_id, provider)
+    return provider, await _reload_event(session_maker, event_id)
+
+
+@pytest.mark.parametrize(
+    "inbox_id,expected_error",
+    [
+        (_MISSING, "operator_relay: missing_inbox_id"),
+        (None, "operator_relay: missing_inbox_id"),
+        (True, "operator_relay: invalid_inbox_id"),
+        (1.9, "operator_relay: invalid_inbox_id"),
+        ("8", "operator_relay: invalid_inbox_id"),
+        (99, "operator_relay: inbox_mapping_missing"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_configured_map_routing_blocks_before_provider(session_maker, monkeypatch, inbox_id, expected_error):
+    provider, event = await _run_map_relay(
+        session_maker,
+        monkeypatch,
+        inbox_id=inbox_id,
+        map_json=_MAP_ONE,
+        sender_id=940,
+        dedupe=f"chatwoot_out:map:{expected_error[-6:]}:{inbox_id}",
+    )
+
+    assert provider.sent == []
+    assert await _operator_outbox(session_maker) is None
+    assert event.status == "processed"
+    assert event.processed_at is not None
+    assert event.error == expected_error
+
+
+@pytest.mark.asyncio
+async def test_configured_map_missing_inbox_does_not_send_even_with_one_sender(session_maker, monkeypatch):
+    """Critical: a configured map + missing inbox ID must NOT fall back to the
+    single active sender — that would route to the wrong tenant."""
+    provider, event = await _run_map_relay(
+        session_maker,
+        monkeypatch,
+        inbox_id=_MISSING,
+        map_json=_MAP_ONE,
+        sender_id=941,
+        dedupe="chatwoot_out:map:critical",
+    )
+
+    assert provider.sent == []  # exactly one sender exists, still not used
+    assert await _operator_outbox(session_maker) is None
+    assert event.error == "operator_relay: missing_inbox_id"
+
+
+@pytest.mark.asyncio
+async def test_configured_map_valid_inbox_resolves_and_sends(session_maker, monkeypatch):
+    provider, event = await _run_map_relay(
+        session_maker,
+        monkeypatch,
+        inbox_id=8,
+        map_json=_MAP_ONE,
+        sender_id=942,
+        dedupe="chatwoot_out:map:valid",
+    )
+
+    assert len(provider.sent) == 1
+    assert event.error is None
+    assert await _operator_outbox(session_maker) is not None
+
+
+@pytest.mark.asyncio
+async def test_invalid_map_does_not_reach_generic_exception(session_maker, monkeypatch):
+    provider, event = await _run_map_relay(
+        session_maker,
+        monkeypatch,
+        inbox_id=8,
+        map_json="{not valid json",
+        sender_id=943,
+        dedupe="chatwoot_out:map:badjson",
+    )
+
+    assert provider.sent == []
+    assert await _operator_outbox(session_maker) is None
+    assert event.error == "operator_relay: invalid_inbox_company_map"
+
+
+@pytest.mark.parametrize(
+    "secret_map",
+    [
+        # Invalid JSON (literal newline) — rejected before any int() coercion.
+        '{"42": "token=SECRETVAL\nforged"}',
+        # VALID JSON with a non-numeric string value — this is the one that would
+        # reach int() and leak the secret if company validation used int(value).
+        '{"42": "token=SECRETVAL"}',
+    ],
+)
+@pytest.mark.asyncio
+async def test_secret_bearing_map_leaks_nothing(session_maker, monkeypatch, caplog, secret_map):
+    """A secret embedded in the map config must not reach logs or event.error."""
+    with caplog.at_level(logging.DEBUG):
+        provider, event = await _run_map_relay(
+            session_maker,
+            monkeypatch,
+            inbox_id=42,
+            map_json=secret_map,
+            sender_id=944,
+            dedupe=f"chatwoot_out:map:secret:{len(secret_map)}",
+        )
+
+    assert provider.sent == []
+    assert await _operator_outbox(session_maker) is None
+    assert event.error == "operator_relay: invalid_inbox_company_map"
+
+    worker_logs = "\n".join(r.getMessage() for r in caplog.records if r.name == "whatsapp_inbox_worker")
+    for forbidden in ("SECRETVAL", "token=", "forged", chr(0x2028), chr(0x2029)):
+        assert forbidden not in worker_logs
+    assert "SECRETVAL" not in (event.error or "")

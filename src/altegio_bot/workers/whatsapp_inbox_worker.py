@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import re
 from dataclasses import dataclass
@@ -40,6 +39,8 @@ from altegio_bot.webhooks.common import (
     nonempty_str,
     normalize_phone_candidate,
     optional_chatwoot_id,
+    parse_chatwoot_inbox_company_map,
+    positive_int,
     safe_log_value,
 )
 from altegio_bot.whatsapp_window import is_whatsapp_customer_window_open, normalize_phone
@@ -337,43 +338,58 @@ async def _pick_sender(
 
 
 def _company_hint_from_inbox(
-    chatwoot_inbox_id: int | None,
+    chatwoot_inbox_id: object,
 ) -> tuple[int | None, str | None]:
-    """Resolve company_id hint from Chatwoot inbox_id via settings mapping.
+    """Resolve company_id hint from Chatwoot inbox_id via the validated map.
 
-    Returns (company_id, error):
-    - (None, None)  — mapping not configured; fall through to default logic.
-    - (cid,  None)  — inbox found in mapping; use cid as routing hint.
-    - (None, msg)   — mapping configured but inbox absent; fail-closed.
+    Returns (company_id, error) with STABLE, non-sensitive error codes. The
+    inbox-company map is parsed/validated once by
+    :func:`parse_chatwoot_inbox_company_map`; this function never touches a raw
+    ``json.loads`` result.
+
+    Contract:
+    - map not configured ("" / "{}") → (None, None): fall through to the legacy
+      phone_number_id fallback.
+    - map invalid → (None, "invalid_inbox_company_map").
+    - map configured (valid): the inbox_id is MANDATORY and there is NO
+      phone_number_id fallback (that would route to the wrong tenant):
+        * inbox_id absent          → (None, "missing_inbox_id");
+        * inbox_id not a positive int → (None, "invalid_inbox_id");
+        * inbox_id not in the map  → (None, "inbox_mapping_missing");
+        * inbox_id in the map      → (company_id, None).
     """
-    if chatwoot_inbox_id is None:
-        return None, None
+    parsed = parse_chatwoot_inbox_company_map(settings.chatwoot_inbox_company_map)
 
-    raw = settings.chatwoot_inbox_company_map.strip()
-    if not raw or raw == "{}":
-        return None, None  # not configured
+    if not parsed.configured:
+        return None, None  # not configured → legacy fallback allowed
 
-    try:
-        mapping: dict = json.loads(raw)
-    except Exception as exc:
-        # Never persist/return raw config or exception text (may contain
-        # sensitive config). Log only the exception class.
-        logger.warning(
-            "operator_relay: invalid CHATWOOT_INBOX_COMPANY_MAP error_type=%s",
-            type(exc).__name__,
-        )
+    if not parsed.valid:
+        # Never persist/return raw config or exception text.
+        logger.warning("operator_relay: invalid CHATWOOT_INBOX_COMPANY_MAP")
         return None, "operator_relay: invalid_inbox_company_map"
 
-    # chatwoot_inbox_id is sender-controlled: keep it out of the returned error.
-    key = str(chatwoot_inbox_id)
-    if key not in mapping:
+    # Configured map: inbox_id is required and must be a valid positive int. No
+    # fallback to phone_number_id — that could route to the wrong company.
+    if chatwoot_inbox_id is None:
+        return None, "operator_relay: missing_inbox_id"
+
+    inbox_int = positive_int(chatwoot_inbox_id)
+    if inbox_int is None:
+        # inbox_id is sender-controlled: keep it out of the returned error.
+        logger.warning(
+            "operator_relay: invalid inbox_id inbox_id=%s",
+            safe_log_value(chatwoot_inbox_id, limit=32),
+        )
+        return None, "operator_relay: invalid_inbox_id"
+
+    if inbox_int not in parsed.mapping:
         logger.warning(
             "operator_relay: inbox not in company map inbox_id=%s — fail-closed",
             safe_log_value(chatwoot_inbox_id, limit=32),
         )
         return None, "operator_relay: inbox_mapping_missing"
 
-    return int(mapping[key]), None
+    return parsed.mapping[inbox_int], None
 
 
 async def _resolve_relay_sender(

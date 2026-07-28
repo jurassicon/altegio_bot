@@ -15,8 +15,18 @@ import json
 import math
 import re
 from collections.abc import Iterable
+from dataclasses import dataclass, field
 
 from fastapi import Request
+
+# Ключ inbox-company map: канонический положительный decimal без ведущих нулей
+# ("8", "42"), но не "0"/"-1"/"+8"/"8.0"/""/"abc".
+_CANONICAL_POSITIVE_INT_RE = re.compile(r"^[1-9][0-9]*$")
+
+# Границы целочисленных типов PostgreSQL. Значение вне диапазона не «обрежется»,
+# а уронит INSERT, поэтому проверяем до записи.
+PG_INT_MIN, PG_INT_MAX = -(2**31), 2**31 - 1
+PG_BIGINT_MIN, PG_BIGINT_MAX = -(2**63), 2**63 - 1
 
 # Всё, что не ASCII-цифра, вырезается при нормализации телефона. Сознательно НЕ
 # ``\D`` (Unicode-режим): он оставил бы арабские/полноширинные цифры (١٢٣, １２３),
@@ -129,20 +139,112 @@ def normalize_phone_candidate(value: object) -> str | None:
     (``list``/``dict``/``int``/``bool``/``float``/``None``) → ``None`` без
     исключения. ``bool`` — не строка и не число телефона.
 
-    Берутся только ASCII-цифры ``[0-9]``: Unicode-цифры (``١٢٣``, ``１２３``) не
-    годятся для Meta/E.164 и, если в строке нет ASCII-цифр, дают ``None``.
-    Результат обязан помещаться в E.164 — не более 15 цифр; иначе ``None``, а не
-    обрезка (обрезанный номер отправился бы не туда, а полный не влез бы в
-    downstream-колонки и уронил бы OutboxMessage.flush() уже ПОСЛЕ отправки).
+    Цифрами считаются ТОЛЬКО ASCII ``[0-9]``. Если строка содержит любую
+    Unicode-цифру, не являющуюся ASCII (``١٢٣``, ``１２３``), — вся строка
+    отклоняется (``None``), а НЕ тихо очищается: тихое удаление ``49١٢٣15`` →
+    ``+4915`` превратило бы ввод в другой номер и отправило бы сообщение не тому
+    получателю. Результат обязан помещаться в E.164 — не более 15 цифр; иначе
+    ``None``, а не обрезка (обрезанный номер ушёл бы не туда, а полный не влез бы
+    в downstream-колонки и уронил бы OutboxMessage.flush() уже ПОСЛЕ отправки).
     Бесцифренная строка (``"abc"``, ``"+"``, ``"---"``) → ``None``. Исходное
     значение (PII) здесь не логируется — это забота вызывающего кода.
     """
     if not isinstance(value, str):
         return None
+    # Любая не-ASCII десятичная цифра делает всю строку невалидной (см. docstring).
+    if any(ch.isdigit() and not ch.isascii() for ch in value):
+        return None
     digits = _ASCII_NON_DIGITS_RE.sub("", value)
     if not digits or len(digits) > _E164_MAX_DIGITS:
         return None
     return f"+{digits}"
+
+
+def classify_message_type(value: object) -> str | None:
+    """Классифицирует Chatwoot ``message_type`` через ТОЧНЫЕ типы.
+
+    Возвращает ``"incoming"`` | ``"outgoing"`` | ``None`` (неподдерживаемо).
+
+    Сознательно НЕ membership (``value in (1, "outgoing")``): в Python
+    ``True == 1`` и ``1.0 == 1``, поэтому ``True``/``1.0`` протащило бы событие в
+    relay-путь. ``type(value) is int`` исключает ``bool`` (``type(True) is bool``).
+    Не принимаются ``"1"``/``"0"``/``2``/``-1``/контейнеры/``None``/float.
+    """
+    if (type(value) is int and value == 0) or value == "incoming":
+        return "incoming"
+    if (type(value) is int and value == 1) or value == "outgoing":
+        return "outgoing"
+    return None
+
+
+def positive_int(value: object, *, max_value: int = PG_INT_MAX) -> int | None:
+    """Точный положительный int (``0 < v <= max_value``), иначе ``None``.
+
+    ``bool`` НЕ считается int (``type(True) is bool``); строки/float/контейнеры не
+    коэрсятся — сырой sender-controlled JSON нельзя прогонять через ``int()``.
+    Для inbox/company id в tenant-роутинге, где ошибка = чужой company.
+    """
+    if type(value) is int and 0 < value <= max_value:
+        return value
+    return None
+
+
+@dataclass(frozen=True)
+class InboxCompanyMap:
+    """Результат разбора ``CHATWOOT_INBOX_COMPANY_MAP``.
+
+    * ``configured=False`` — карта не настроена (``""``/``"{}"``): разрешён
+      backward-compatible fallback по ``phone_number_id``.
+    * ``configured=True, valid=False`` — синтаксически/семантически невалидная
+      конфигурация: relay блокируется стабильным ``invalid_inbox_company_map``.
+    * ``configured=True, valid=True`` — ``mapping`` содержит только валидные
+      пары ``int inbox_id -> int company_id``.
+    """
+
+    configured: bool
+    valid: bool
+    mapping: dict[int, int] = field(default_factory=dict)
+
+
+def parse_chatwoot_inbox_company_map(raw: object) -> InboxCompanyMap:
+    """Централизованный typed-парсер inbox→company конфигурации.
+
+    Валидация выполняется ОДИН раз здесь, чтобы worker не работал с произвольным
+    результатом ``json.loads``. Правила:
+      * ``""``/``"{}"`` (после strip) → не настроена (fallback разрешён);
+      * не-строка на входе или ошибка JSON → невалидна;
+      * top-level не ``dict`` → невалидна;
+      * ключ — только канонический положительный decimal (``"8"``/``"42"``);
+        ``""``/``"0"``/``"-1"``/``"+8"``/``"8.0"``/``"abc"`` → невалидна;
+      * значение — только ``type(v) is int`` и ``0 < v <= PG_INT_MAX``
+        (``bool``/float/строка/контейнер/``0``/отрицательное/переполнение →
+        невалидна). Никакого ``int(value)`` для произвольных значений.
+    Ни сырой конфиг, ни значения наружу не возвращаются — только флаги и int'ы.
+    """
+    if not isinstance(raw, str):
+        return InboxCompanyMap(configured=True, valid=False)
+
+    stripped = raw.strip()
+    if not stripped or stripped == "{}":
+        return InboxCompanyMap(configured=False, valid=True)
+
+    try:
+        parsed = json.loads(stripped)
+    except Exception:
+        return InboxCompanyMap(configured=True, valid=False)
+
+    if not isinstance(parsed, dict):
+        return InboxCompanyMap(configured=True, valid=False)
+
+    mapping: dict[int, int] = {}
+    for key, company in parsed.items():
+        if not (isinstance(key, str) and _CANONICAL_POSITIVE_INT_RE.match(key)):
+            return InboxCompanyMap(configured=True, valid=False)
+        if type(company) is not int or not (0 < company <= PG_INT_MAX):
+            return InboxCompanyMap(configured=True, valid=False)
+        mapping[int(key)] = company
+
+    return InboxCompanyMap(configured=True, valid=True, mapping=mapping)
 
 
 def nonempty_str(value: object) -> str | None:
@@ -200,12 +302,6 @@ def postgres_safe_json_value(value: object) -> object:
         # tuple → list: JSON-совместимое представление.
         return [postgres_safe_json_value(item) for item in value]
     return value
-
-
-# Границы целочисленных типов PostgreSQL. Значение вне диапазона не «обрежется»,
-# а уронит INSERT, поэтому проверяем до записи.
-PG_INT_MIN, PG_INT_MAX = -(2**31), 2**31 - 1
-PG_BIGINT_MIN, PG_BIGINT_MAX = -(2**63), 2**63 - 1
 
 
 def optional_int(value: object, *, bigint: bool = True, min_value: int | None = None) -> int | None:

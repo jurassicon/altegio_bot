@@ -977,3 +977,86 @@ async def test_valid_operator_content_is_stored(session_maker, monkeypatch) -> N
     rows = await _rows(session_maker)
     assert len(rows) == 1
     assert rows[0].payload["_chatwoot_operator_relay"]["text"] == "Hallo Kunde"
+
+
+# ---------------------------------------------------------------------------
+# Discriminator matrix: message_type and private via exact-type semantics
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "message_type_json",
+    ["true", "false", "1.0", "0.0", "[]", "{}", "null", '"1"', '"0"', "2", "-1"],
+)
+@pytest.mark.asyncio
+async def test_malformed_message_type_is_unsupported(session_maker, message_type_json: str) -> None:
+    """Exact-type: True/1.0/containers/etc. must NOT enter any relay path."""
+    body = (
+        '{"event":"message_created","id":7001,"message_type":' + message_type_json + ","
+        '"conversation":{"id":701},"sender":{"phone_number":"+4915112345678"},"account":{"id":2}}'
+    ).encode()
+
+    resp = await _post_raw(session_maker, body)
+
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True, "skipped": "unsupported_message_type"}
+    assert await _rows(session_maker) == []
+
+
+@pytest.mark.parametrize("message_type_json,expected_stored", [("0", 1), ('"incoming"', 1)])
+@pytest.mark.asyncio
+async def test_valid_incoming_message_type_is_stored(session_maker, message_type_json, expected_stored) -> None:
+    body = (
+        '{"event":"message_created","id":5001,"content":"hi","message_type":' + message_type_json + ","
+        '"created_at":1234567890,"conversation":{"id":501},'
+        '"sender":{"phone_number":"+4915112345678"},"account":{"id":2}}'
+    ).encode()
+
+    resp = await _post_raw(session_maker, body)
+
+    assert resp.status_code == 200
+    assert len(await _rows(session_maker)) == expected_stored
+
+
+@pytest.mark.parametrize(
+    "private_json",
+    ["0", "1", "0.0", "1.0", '""', '"false"', '"true"', "[]", "{}", "null"],
+)
+@pytest.mark.asyncio
+async def test_non_bool_private_is_invalid(session_maker, monkeypatch, private_json: str) -> None:
+    """`private` must be an exact bool; anything else fails closed."""
+    monkeypatch.setattr(settings, "chatwoot_operator_relay_enabled", True)
+    body = (
+        '{"event":"message_created","id":7001,"content":"reply","message_type":1,'
+        '"content_type":"text","private":' + private_json + ","
+        '"conversation":{"id":701,"inbox_id":8,"meta":{"sender":{"phone_number":"+4915112345678"}}},'
+        '"sender":{"type":"agent","name":"A","id":9},"account":{"id":2}}'
+    ).encode()
+
+    resp = await _post_raw(session_maker, body)
+
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True, "skipped": "invalid_private_flag"}
+    assert await _rows(session_maker) == []
+
+
+@pytest.mark.parametrize("private_json,expected_skip", [("true", "private_note"), ("false", None)])
+@pytest.mark.asyncio
+async def test_bool_private_is_accepted(session_maker, monkeypatch, private_json: str, expected_skip) -> None:
+    """Exact bool True → private note skip; False → relayed (stored)."""
+    monkeypatch.setattr(settings, "chatwoot_operator_relay_enabled", True)
+    body = (
+        '{"event":"message_created","id":7001,"content":"reply","message_type":1,'
+        '"content_type":"text","private":' + private_json + ","
+        '"conversation":{"id":701,"inbox_id":8,"meta":{"sender":{"phone_number":"+4915112345678"}}},'
+        '"sender":{"type":"agent","name":"A","id":9},"account":{"id":2}}'
+    ).encode()
+
+    resp = await _post_raw(session_maker, body)
+
+    assert resp.status_code == 200
+    if expected_skip == "private_note":
+        assert resp.json() == {"ok": True, "skipped": "private_note"}
+        assert await _rows(session_maker) == []
+    else:
+        assert len(await _rows(session_maker)) == 1

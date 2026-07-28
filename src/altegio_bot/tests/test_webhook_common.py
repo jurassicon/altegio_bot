@@ -318,11 +318,13 @@ def test_normalize_phone_candidate_length_boundary() -> None:
     assert normalize_phone_candidate("1" * 16) is None  # 16 rejected
 
 
-def test_normalize_phone_candidate_keeps_ascii_digits_among_unicode() -> None:
-    """ASCII digits mixed with Unicode ones: only the ASCII digits are kept."""
+@pytest.mark.parametrize("raw", ["49١٢٣15", "+49١٥١١٢٣４５６７", "+49 151 １２34567"])
+def test_normalize_phone_candidate_mixed_unicode_digits_are_rejected(raw: str) -> None:
+    """A string with ANY non-ASCII decimal digit is rejected whole — silent
+    deletion of "49١٢٣15" → "+4915" would send to a different recipient."""
     from altegio_bot.webhooks.common import normalize_phone_candidate
 
-    assert normalize_phone_candidate("49١٢٣15") == "+4915"
+    assert normalize_phone_candidate(raw) is None
 
 
 @pytest.mark.parametrize("raw", ["PNID_1", "  x  "])
@@ -337,3 +339,115 @@ def test_nonempty_str_rejects_non_string_and_blank(raw: object) -> None:
     from altegio_bot.webhooks.common import nonempty_str
 
     assert nonempty_str(raw) is None
+
+
+# ---------------------------------------------------------------------------
+# classify_message_type / positive_int / parse_chatwoot_inbox_company_map
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (0, "incoming"),
+        (1, "outgoing"),
+        ("incoming", "incoming"),
+        ("outgoing", "outgoing"),
+        (True, None),
+        (False, None),
+        (1.0, None),
+        (0.0, None),
+        ([], None),
+        ({}, None),
+        (None, None),
+        ("1", None),
+        ("0", None),
+        (2, None),
+        (-1, None),
+    ],
+)
+def test_classify_message_type_exact(value: object, expected: str | None) -> None:
+    from altegio_bot.webhooks.common import classify_message_type
+
+    assert classify_message_type(value) == expected
+
+
+@pytest.mark.parametrize("value", [1, 5, 42, 2**31 - 1])
+def test_positive_int_accepts(value: int) -> None:
+    from altegio_bot.webhooks.common import positive_int
+
+    assert positive_int(value) == value
+
+
+@pytest.mark.parametrize("value", [True, False, 1.9, "1", None, [], {}, 0, -7, 2**31])
+def test_positive_int_rejects(value: object) -> None:
+    from altegio_bot.webhooks.common import positive_int
+
+    assert positive_int(value) is None
+
+
+@pytest.mark.parametrize("raw", ["", "   ", "{}"])
+def test_inbox_map_not_configured(raw: str) -> None:
+    from altegio_bot.webhooks.common import parse_chatwoot_inbox_company_map
+
+    m = parse_chatwoot_inbox_company_map(raw)
+    assert m.configured is False
+    assert m.valid is True
+    assert m.mapping == {}
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "null",
+        "42",
+        "1.9",
+        "true",
+        "[]",
+        '"string"',
+        "{not json",
+        '{"42": null}',
+        '{"42": true}',
+        '{"42": false}',
+        '{"42": 1.9}',
+        '{"42": "1"}',
+        '{"42": "token=SECRETVAL"}',
+        '{"42": []}',
+        '{"42": {}}',
+        '{"42": 0}',
+        '{"42": -7}',
+        '{"42": ' + str(2**31) + "}",  # PG_INT_MAX + 1
+        '{"": 7}',
+        '{"0": 7}',
+        '{"-1": 7}',
+        '{"+8": 7}',
+        '{"8.0": 7}',
+        '{"abc": 7}',
+    ],
+)
+def test_inbox_map_invalid(raw: str) -> None:
+    from altegio_bot.webhooks.common import parse_chatwoot_inbox_company_map
+
+    m = parse_chatwoot_inbox_company_map(raw)
+    assert m.configured is True
+    assert m.valid is False
+    assert m.mapping == {}
+
+
+def test_inbox_map_valid() -> None:
+    from altegio_bot.webhooks.common import parse_chatwoot_inbox_company_map
+
+    m = parse_chatwoot_inbox_company_map('{"8": 758285, "42": 1271200}')
+    assert m.configured is True
+    assert m.valid is True
+    assert m.mapping == {8: 758285, 42: 1271200}
+
+
+def test_inbox_map_non_string_input_is_invalid() -> None:
+    from altegio_bot.webhooks.common import parse_chatwoot_inbox_company_map
+
+    # A non-str (e.g. already-parsed object) is a configuration bug → invalid,
+    # never "not configured".
+    m = parse_chatwoot_inbox_company_map({"8": 1})
+    assert m.configured is True
+    assert m.valid is False
