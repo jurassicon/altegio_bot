@@ -462,6 +462,23 @@ class Settings(BaseSettings):
     # держит эндпоинт закрытым (403) даже при easyweek_enabled=true — fail-closed.
     easyweek_webhook_secret: str = ""
 
+    # --- PR-2: read-only Public API v2 (клиент + операторская проба) ----------
+    # Все четыре значения намеренно имеют безопасные пустые/дефолтные значения:
+    # easyweek.env опционален, поэтому его отсутствие НЕ должно ломать импорт
+    # приложения, API-контейнер или Altegio-воркеры. Наличие ключа и slug
+    # проверяется только в момент создания клиента / запуска пробы.
+    #
+    # Bearer-ключ. Никогда не логируется и не попадает в repr/исключения.
+    easyweek_api_key: str = ""
+    # Значение обязательного заголовка ``Workspace``.
+    easyweek_workspace_slug: str = ""
+    # Pinned base URL публичного API v2 (см. INTEGRATION_PLAN §1.1).
+    easyweek_api_base_url: str = "https://my.easyweek.io/api/public/v2"
+    # UUID локации Дурлаха. Пока optional: оператор определяет его read-only
+    # пробой (PR-2) и записывает в production easyweek.env. Numeric location_id
+    # из вебхука его НЕ заменяет (INTEGRATION_PLAN §1.6 п.5).
+    easyweek_location_uuid: str = ""
+
     # ---------------------------------------------------------------------------
     # Worker polling intervals
     # ---------------------------------------------------------------------------
