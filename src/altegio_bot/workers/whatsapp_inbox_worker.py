@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any, Sequence
 
-from sqlalchemy import exists, or_, select, update
+from sqlalchemy import exists, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -259,6 +259,9 @@ def _parse_command(text: str) -> str | None:
     return None
 
 
+_OPERATOR_RELAY_MARKER_KEY = "_chatwoot_operator_relay"
+
+
 def _is_operator_relay(payload: dict[str, Any]) -> bool:
     """Return True if this event is an operator relay from Chatwoot.
 
@@ -271,7 +274,7 @@ def _is_operator_relay(payload: dict[str, Any]) -> bool:
     would route here and then crash on ``relay.get(...)``. Require the marker to
     be a dict so a malformed one is treated as a non-relay event, not relayed.
     """
-    return isinstance(payload.get("_chatwoot_operator_relay"), dict)
+    return isinstance(payload.get(_OPERATOR_RELAY_MARKER_KEY), dict)
 
 
 def _is_chatwoot_origin(event: WhatsAppEvent, payload: dict[str, Any]) -> bool:
@@ -1855,6 +1858,89 @@ _OPERATOR_RELAY_UNKNOWN_NOTE = (
     "bestätigt werden. Bitte prüfe den Chatverlauf, bevor du die Nachricht erneut sendest."
 )
 
+# Deterministic rejection: here the app HAS a confirmed rejection from Meta, so —
+# unlike the unknown note — it may state plainly that the customer did not get it.
+_OPERATOR_RELAY_TEXT_FAILED_NOTE = (
+    "❌ Die WhatsApp-Nachricht konnte nicht gesendet werden.\n"
+    "Bitte prüfe die Kundendaten und kontaktiere den Kunden bei Bedarf auf einem anderen Weg."
+)
+_OPERATOR_RELAY_TEMPLATE_FAILED_NOTE = (
+    "❌ Die Vorlage zum Wiederöffnen des WhatsApp-Dialogs konnte nicht gesendet"
+    " werden. Die ursprüngliche Nachricht wurde nicht an WhatsApp zugestellt."
+)
+_OPERATOR_RELAY_CIRCUIT_PAUSED_NOTE = (
+    "Meta/WhatsApp ist voruebergehend nicht erreichbar. Die Operator-Nachricht wurde nicht an WhatsApp gesendet."
+)
+
+# Note kinds persisted in Outbox.meta['private_note_kind']. The dispatcher builds
+# the final text from the kind plus the row itself, so a note owed before a crash
+# can still be reconstructed exactly after restart.
+_NOTE_KIND_UNKNOWN = "unknown"
+_NOTE_KIND_TEXT_FAILED = "text_failed"
+_NOTE_KIND_TEMPLATE_FAILED = "template_failed"
+_NOTE_KIND_TEMPLATE_SENT = "template_sent"
+_NOTE_KIND_WINDOW_CLOSED = "window_closed"
+_NOTE_KIND_CIRCUIT_PAUSED = "circuit_paused"
+
+# Bounded retry for secondary actions. Chatwoot offers no idempotency key, so a
+# retry after an unconfirmed send may duplicate a note; a duplicate note is far
+# safer than silently losing the manual-review signal, but it must not loop.
+_TERMINAL_ACTION_MAX_ATTEMPTS = 5
+
+# Outbox states from which no further automatic send can happen. Only these carry
+# pending secondary actions for the terminal-action dispatcher.
+_TERMINAL_RELAY_STATUSES = ("sent", "failed", "canceled", "unknown", "delivered", "read")
+
+
+def _relay_note_text(kind: str, row: OutboxMessage) -> str | None:
+    """Rebuild the operator note text from the durable kind + the Outbox row."""
+    if kind == _NOTE_KIND_UNKNOWN:
+        return _OPERATOR_RELAY_UNKNOWN_NOTE
+    if kind == _NOTE_KIND_TEXT_FAILED:
+        return _OPERATOR_RELAY_TEXT_FAILED_NOTE
+    if kind == _NOTE_KIND_TEMPLATE_FAILED:
+        return _OPERATOR_RELAY_TEMPLATE_FAILED_NOTE
+    if kind == _NOTE_KIND_CIRCUIT_PAUSED:
+        return _OPERATOR_RELAY_CIRCUIT_PAUSED_NOTE
+    if kind == _NOTE_KIND_WINDOW_CLOSED:
+        return (
+            "⚠️ Das 24h-WhatsApp-Fenster ist geschlossen."
+            " Die Nachricht wurde nicht an WhatsApp zugestellt.\n"
+            "Bitte warte, bis der Kunde erneut schreibt, oder wende dich direkt an ihn.\n\n"
+            f'Originalnachricht:\n"{row.body}"'
+        )
+    if kind == _NOTE_KIND_TEMPLATE_SENT:
+        return (
+            "⚠️ Das 24h-WhatsApp-Fenster war geschlossen. Die ursprüngliche Nachricht"
+            " wurde nicht direkt gesendet. Stattdessen wurde eine Vorlage gesendet, damit"
+            " der Kunde den Dialog wieder öffnen kann.\n\n"
+            f'Originalnachricht:\n"{row.body}"'
+        )
+    return None
+
+
+def _pending_note_marker(kind: str, conversation_id: Any) -> dict[str, Any]:
+    """Durable marker for a note owed AFTER the terminal state is committed.
+
+    Written inside the same transaction as the terminal status, so a crash before
+    the note is actually delivered still leaves a recoverable record of it.
+    """
+    if not (settings.chatwoot_operator_reopen_private_note_enabled and conversation_id):
+        return {"private_note_kind": kind, "private_note_status": "disabled"}
+    return {"private_note_kind": kind, "private_note_status": "pending", "private_note_attempts": 0}
+
+
+def _pending_circuit_marker(outcome: RelayProviderOutcome) -> dict[str, Any]:
+    """Durable marker for a Meta-circuit close owed after an indeterminate send."""
+    if not (outcome.circuit_transient and settings.meta_circuit_breaker_enabled):
+        return {"circuit_action_status": "not_required"}
+    return {
+        "circuit_action_status": "pending",
+        "circuit_action_attempts": 0,
+        "circuit_error_kind": outcome.error_kind,
+        "circuit_error_code": outcome.error_code,
+    }
+
 
 # ===========================================================================
 # Operator relay: durable, staged send lifecycle
@@ -1901,29 +1987,19 @@ class RelayProviderOutcome:
 
 
 @dataclass(frozen=True)
-class _RelayNote:
-    """A Chatwoot private note owed after a committed DB state change."""
-
-    conversation_id: Any
-    text: str
-    outbox_id: int | None = None
-    surface_event_error: bool = False
-    event_id: int | None = None
-
-
-@dataclass(frozen=True)
 class _PreparedRelay:
     """Result of Stage A.
 
-    ``outbox_id`` set  → a queued row to claim + execute (``send_type`` tells the
+    ``outbox_id`` set → a queued row to claim + execute (``send_type`` tells the
     execute stage which provider call to make). ``outbox_id`` None → terminal:
-    nothing to send (validation error, replay, or a canceled audit row already
-    committed). ``note`` carries any Chatwoot note owed after the commit.
+    nothing to send (validation error, replay, or a committed canceled audit row).
+    ``terminal_outbox_id`` names a committed terminal row whose durable pending
+    secondary actions still have to be dispatched.
     """
 
     outbox_id: int | None = None
     send_type: str | None = None
-    note: _RelayNote | None = None
+    terminal_outbox_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -1944,81 +2020,170 @@ class _ClaimedRelay:
     conversation_id: Any
 
 
-async def _set_outbox_private_note_status(
-    outbox_id: int,
-    status: str,
-    *,
-    error_type: str | None = None,
-    surface_event_id: int | None = None,
-) -> None:
-    """Record the private-note outcome on the audit row in its own short tx.
+async def _run_pending_private_note(row: OutboxMessage) -> dict[str, Any]:
+    """Deliver the note owed by ``row`` and return ONLY its meta updates.
 
-    The Chatwoot note is a SECONDARY side effect: its outcome is stored only in
-    ``meta`` (``private_note_status`` / ``private_note_error`` /
-    ``private_note_updated_at``) and NEVER overwrites the primary WhatsApp
-    lifecycle ``Outbox.error`` (e.g. the delivery-unknown or send-failed marker).
-    ``surface_event_id`` mirrors a failure onto the source event error only for
-    the private_note_only branch, where the note is the primary user-facing
-    result — even there ``Outbox.error`` keeps its original cancel reason.
+    Never raises, never touches the primary lifecycle fields. A Chatwoot exception
+    may carry a URL / token / response body, so only its class name is recorded.
     """
-    async with SessionLocal() as session:
-        async with session.begin():
-            row = await session.get(OutboxMessage, outbox_id)
-            if row is None:
-                return
-            new_meta = {**row.meta, "private_note_status": status, "private_note_updated_at": utcnow().isoformat()}
-            if error_type is not None:
-                new_meta["private_note_error"] = error_type
-            row.meta = new_meta
-            if surface_event_id is not None and error_type is not None:
-                event = await session.get(WhatsAppEvent, surface_event_id)
-                if event is not None:
-                    event.error = f"operator_relay: private note failed: {error_type}"
+    meta = row.meta or {}
+    kind = meta.get("private_note_kind")
+    conversation_id = meta.get("chatwoot_conversation_id")
+    text = _relay_note_text(kind, row) if kind else None
+    attempts = int(meta.get("private_note_attempts") or 0) + 1
+    stamp = {"private_note_attempts": attempts, "private_note_updated_at": utcnow().isoformat()}
 
-
-async def _send_operator_private_note(note: _RelayNote) -> None:
-    """Best-effort Chatwoot private note. Its failure is isolated from the send.
-
-    The Chatwoot exception may carry a URL / token / response body, so only its
-    class name is ever logged or persisted.
-    """
-    if not (settings.chatwoot_operator_reopen_private_note_enabled and note.conversation_id):
-        if note.outbox_id is not None:
-            await _set_outbox_private_note_status(note.outbox_id, "disabled")
-        return
+    if text is None or not conversation_id or not settings.chatwoot_operator_reopen_private_note_enabled:
+        return {**stamp, "private_note_status": "disabled"}
 
     cw = ChatwootClient()
-    status = "sent"
-    err_type: str | None = None
     try:
-        await cw.send_message(
-            note.conversation_id,
-            note.text,
-            message_type="outgoing",
-            private=True,
-        )
+        await cw.send_message(conversation_id, text, message_type="outgoing", private=True)
         logger.info(
-            "operator_relay: private note sent conv_id=%s",
-            safe_log_value(note.conversation_id, limit=32),
+            "operator_relay: private note sent outbox_id=%s kind=%s conv_id=%s",
+            row.id,
+            kind,
+            safe_log_value(conversation_id, limit=32),
         )
+        return {**stamp, "private_note_status": "sent"}
     except Exception as exc:
         err_type = type(exc).__name__
-        status = "failed"
+        exhausted = attempts >= _TERMINAL_ACTION_MAX_ATTEMPTS
         logger.warning(
-            "operator_relay: private note failed conv_id=%s error_type=%s",
-            safe_log_value(note.conversation_id, limit=32),
+            "operator_relay: private note failed outbox_id=%s kind=%s conv_id=%s error_type=%s attempts=%s",
+            row.id,
+            kind,
+            safe_log_value(conversation_id, limit=32),
             err_type,
+            attempts,
         )
+        return {
+            **stamp,
+            "private_note_status": "failed" if exhausted else "pending",
+            "private_note_error": err_type,
+        }
     finally:
         await cw.aclose()
 
-    if note.outbox_id is not None:
-        await _set_outbox_private_note_status(
-            note.outbox_id,
-            status,
-            error_type=err_type,
-            surface_event_id=note.event_id if note.surface_event_error else None,
+
+async def _run_pending_circuit_action(row: OutboxMessage) -> dict[str, Any]:
+    """Close the Meta circuit owed by ``row`` and return ONLY its meta updates.
+
+    Never raises and never calls a Meta *send* — it only records circuit state.
+    """
+    meta = row.meta or {}
+    attempts = int(meta.get("circuit_action_attempts") or 0) + 1
+    stamp = {"circuit_action_attempts": attempts, "circuit_action_updated_at": utcnow().isoformat()}
+    try:
+        await meta_circuit.close_meta_circuit(
+            reason="operator_relay_transient_send_error",
+            error_kind=meta.get("circuit_error_kind"),
+            error_code=meta.get("circuit_error_code"),
+            next_probe_at=utcnow() + timedelta(seconds=settings.meta_circuit_probe_initial_delay_seconds),
         )
+        return {**stamp, "circuit_action_status": "completed"}
+    except Exception as exc:
+        exhausted = attempts >= _TERMINAL_ACTION_MAX_ATTEMPTS
+        logger.error(
+            "operator_relay: circuit action failed outbox_id=%s error_type=%s attempts=%s operation=circuit_close",
+            row.id,
+            type(exc).__name__,
+            attempts,
+        )
+        return {
+            **stamp,
+            "circuit_action_status": "failed" if exhausted else "pending",
+            "circuit_action_error": type(exc).__name__,
+        }
+
+
+async def _dispatch_terminal_actions_for(outbox_id: int) -> None:
+    """Execute the durable pending secondary actions of ONE terminal Outbox row.
+
+    The circuit action and the Chatwoot note are fully independent: each runs in
+    its own guarded step, so a failure of one can never suppress the other. Only
+    ``meta`` markers are updated — the primary ``status`` / ``error`` /
+    ``provider_message_id`` describing the WhatsApp lifecycle are never touched,
+    and no Meta *send* is ever issued from here.
+    """
+    async with SessionLocal() as session:
+        row = await session.get(OutboxMessage, outbox_id)
+        if row is None:
+            return
+        meta = row.meta or {}
+        updates: dict[str, Any] = {}
+
+        if meta.get("circuit_action_status") == "pending":
+            updates.update(await _run_pending_circuit_action(row))
+
+        if meta.get("private_note_status") == "pending":
+            updates.update(await _run_pending_private_note(row))
+
+    if not updates:
+        return
+
+    # Re-read under a short write transaction so the marker update never races
+    # with (or clobbers) a concurrent primary-lifecycle write.
+    async with SessionLocal() as session:
+        async with session.begin():
+            fresh = await session.get(OutboxMessage, outbox_id)
+            if fresh is None:
+                return
+            fresh.meta = {**(fresh.meta or {}), **updates}
+
+            # private_note_only is the one branch where the note IS the primary
+            # user-facing result (no Meta send happens at all), so an established
+            # product contract surfaces its failure on the source event. Even
+            # here Outbox.error keeps the original cancel reason.
+            if (
+                updates.get("private_note_error")
+                and (fresh.meta or {}).get("private_note_kind") == _NOTE_KIND_WINDOW_CLOSED
+                and fresh.source_whatsapp_event_id is not None
+            ):
+                event = await session.get(WhatsAppEvent, fresh.source_whatsapp_event_id)
+                if event is not None:
+                    event.error = f"operator_relay: private note failed: {updates['private_note_error']}"
+
+
+async def dispatch_pending_terminal_actions(*, limit: int | None = None) -> int:
+    """Recover terminal operator rows whose secondary actions never ran.
+
+    A crash between the finalize COMMIT and the side effects would otherwise lose
+    the manual-review signal forever, because terminal rows are not revisited by
+    any other recovery path. Bounded batch; never calls a Meta send.
+    """
+    batch = limit or settings.chatwoot_operator_relay_recovery_batch_size
+    async with SessionLocal() as session:
+        outbox_ids = list(
+            (
+                await session.execute(
+                    select(OutboxMessage.id)
+                    .where(
+                        OutboxMessage.message_source == "operator",
+                        OutboxMessage.status.in_(_TERMINAL_RELAY_STATUSES),
+                        or_(
+                            OutboxMessage.meta["private_note_status"].astext == "pending",
+                            OutboxMessage.meta["circuit_action_status"].astext == "pending",
+                        ),
+                    )
+                    .order_by(OutboxMessage.id.asc())
+                    .limit(batch)
+                )
+            ).scalars()
+        )
+
+    dispatched = 0
+    for outbox_id in outbox_ids:
+        try:
+            await _dispatch_terminal_actions_for(int(outbox_id))
+            dispatched += 1
+        except Exception as exc:
+            logger.error(
+                "operator_relay: terminal action dispatch failed outbox_id=%s error_type=%s operation=dispatch",
+                outbox_id,
+                type(exc).__name__,
+            )
+    return dispatched
 
 
 def _mark_event_processed(event: WhatsAppEvent, error: str | None) -> None:
@@ -2232,6 +2397,10 @@ async def _prepare_operator_relay(event_id: int, provider: WhatsAppProvider) -> 
                 }
                 if attempted == "template":
                     cancel_meta["template"] = settings.chatwoot_operator_reopen_template_name
+                # The owed operator note is recorded durably in the SAME
+                # transaction as the canceled row, so a crash before delivery
+                # still leaves it recoverable.
+                cancel_meta.update(_pending_note_marker(_NOTE_KIND_CIRCUIT_PAUSED, conversation_id))
                 outbox = _new_outbox(
                     template_code="operator_relay",
                     body=_OPERATOR_RELAY_CIRCUIT_CLOSED_BODY,
@@ -2248,15 +2417,7 @@ async def _prepare_operator_relay(event_id: int, provider: WhatsAppProvider) -> 
                     outbox.id,
                     company_id,
                 )
-                note = _RelayNote(
-                    conversation_id=conversation_id,
-                    text=(
-                        "Meta/WhatsApp ist voruebergehend nicht erreichbar. "
-                        "Die Operator-Nachricht wurde nicht an WhatsApp gesendet."
-                    ),
-                    outbox_id=outbox.id,
-                )
-                return _PreparedRelay(outbox_id=None, note=note)
+                return _PreparedRelay(outbox_id=None, terminal_outbox_id=outbox.id)
 
             # ── Window open → durable queued free-form text intent ────────────
             if window_open:
@@ -2337,6 +2498,7 @@ async def _prepare_operator_relay(event_id: int, provider: WhatsAppProvider) -> 
                         "chatwoot_message_id": chatwoot_message_id,
                         "agent_name": agent_name,
                         **reply_context_audit,
+                        **_pending_note_marker(_NOTE_KIND_WINDOW_CLOSED, conversation_id),
                     },
                 )
                 session.add(outbox)
@@ -2347,19 +2509,7 @@ async def _prepare_operator_relay(event_id: int, provider: WhatsAppProvider) -> 
                     outbox.id,
                     company_id,
                 )
-                note = _RelayNote(
-                    conversation_id=conversation_id,
-                    text=(
-                        "⚠️ Das 24h-WhatsApp-Fenster ist geschlossen."
-                        " Die Nachricht wurde nicht an WhatsApp zugestellt.\n"
-                        "Bitte warte, bis der Kunde erneut schreibt, oder wende dich direkt an ihn.\n\n"
-                        f'Originalnachricht:\n"{text}"'
-                    ),
-                    outbox_id=outbox.id,
-                    surface_event_error=True,
-                    event_id=event.id,
-                )
-                return _PreparedRelay(outbox_id=None, note=note)
+                return _PreparedRelay(outbox_id=None, terminal_outbox_id=outbox.id)
 
             # ── Window closed + reopen_template → durable queued template ──────
             template_name = settings.chatwoot_operator_reopen_template_name
@@ -2400,15 +2550,100 @@ async def _prepare_operator_relay(event_id: int, provider: WhatsAppProvider) -> 
             return _PreparedRelay(outbox_id=outbox.id, send_type="template")
 
 
-async def _claim_operator_relay(outbox_id: int, event_id: int) -> _ClaimedRelay | None:
-    """Stage B: atomically transition queued → sending and COMMIT before Meta.
+@dataclass(frozen=True)
+class _ClaimResult:
+    """Outcome of Stage B.
 
-    The conditional ``WHERE status='queued'`` makes the claim safe under
-    concurrency: exactly one worker's UPDATE affects the row, and only that
-    worker receives a non-None result and is allowed to call the provider.
+    ``claimed`` set → this worker owns the single provider attempt.
+    ``canceled_outbox_id`` set → the intent was no longer safe to send and was
+    canceled instead; its durable pending note still has to be dispatched.
+    Both None → another worker owns the attempt (or the row is not claimable).
+    """
+
+    claimed: _ClaimedRelay | None = None
+    canceled_outbox_id: int | None = None
+
+
+# Stable, non-sensitive cancel reasons for an intent that became unsafe between
+# prepare and claim (crash/restart may put hours between the two).
+_CLAIM_BLOCK_REASONS: dict[str, tuple[str, str, str | None]] = {
+    # reason -> (Outbox.error, WhatsAppEvent.error, note kind)
+    "operator_relay_disabled_before_claim": (
+        "operator_relay: canceled (relay disabled before claim)",
+        "operator_relay: canceled (relay disabled before claim)",
+        None,  # the operator switched the feature off deliberately — no note spam
+    ),
+    "meta_circuit_closed_before_claim": (
+        "operator_relay: canceled (Meta circuit closed before claim)",
+        "operator_relay: Meta circuit closed",
+        _NOTE_KIND_CIRCUIT_PAUSED,
+    ),
+    "customer_service_window_closed_before_claim": (
+        "operator_relay: canceled (customer service window closed before claim)",
+        "operator_relay: canceled (customer service window closed before claim)",
+        _NOTE_KIND_WINDOW_CLOSED,
+    ),
+}
+
+
+async def _relay_claim_block_reason(session: AsyncSession, row: OutboxMessage) -> str | None:
+    """Re-check the live send gates for an intent that is about to be claimed.
+
+    A queued intent may have been committed hours ago (crash/restart), so the
+    world it was prepared in can be gone: the relay may have been switched off,
+    the Meta circuit may have closed, and — decisively for a free-form text —
+    the 24h customer service window may have expired, which would make sending
+    it now a Meta policy violation. A closed window is expected and harmless for
+    a committed reopen-template intent, so it is not re-checked there.
+    """
+    if not settings.chatwoot_operator_relay_enabled:
+        return "operator_relay_disabled_before_claim"
+    if settings.meta_circuit_breaker_enabled and await meta_circuit.should_pause_meta_sends(session=session):
+        return "meta_circuit_closed_before_claim"
+    if (row.meta or {}).get("send_type") != "template":
+        window_open, _ = await is_whatsapp_customer_window_open(session, row.phone_e164, utcnow())
+        if not window_open:
+            return "customer_service_window_closed_before_claim"
+    return None
+
+
+async def _claim_operator_relay(outbox_id: int, event_id: int) -> _ClaimResult:
+    """Stage B: revalidate the gates, then atomically claim queued → sending.
+
+    The row is locked FOR UPDATE first, so the gate re-check and the state
+    transition are decided under the same lock — a concurrent worker cannot slip
+    a send in between them. The transition itself keeps its conditional
+    ``WHERE status='queued'`` predicate, so exactly one worker can ever win it.
     """
     async with SessionLocal() as session:
         async with session.begin():
+            locked = (
+                await session.execute(select(OutboxMessage).where(OutboxMessage.id == outbox_id).with_for_update())
+            ).scalar_one_or_none()
+            if locked is None or locked.status != "queued":
+                return _ClaimResult()
+
+            block_reason = await _relay_claim_block_reason(session, locked)
+            if block_reason is not None:
+                outbox_error, event_error, note_kind = _CLAIM_BLOCK_REASONS[block_reason]
+                conversation_id = (locked.meta or {}).get("chatwoot_conversation_id")
+                locked.status = "canceled"
+                locked.error = outbox_error
+                new_meta = {**(locked.meta or {}), "cancel_reason": block_reason}
+                if note_kind is not None:
+                    new_meta.update(_pending_note_marker(note_kind, conversation_id))
+                locked.meta = new_meta
+                event = await session.get(WhatsAppEvent, event_id)
+                if event is not None:
+                    _mark_event_processed(event, event_error)
+                logger.warning(
+                    "operator_relay: queued intent canceled before claim outbox_id=%s event_id=%s reason=%s",
+                    outbox_id,
+                    event_id,
+                    block_reason,
+                )
+                return _ClaimResult(canceled_outbox_id=outbox_id)
+
             now = utcnow()
             claimed_id = (
                 await session.execute(
@@ -2419,7 +2654,7 @@ async def _claim_operator_relay(outbox_id: int, event_id: int) -> _ClaimedRelay 
                 )
             ).scalar_one_or_none()
             if claimed_id is None:
-                return None
+                return _ClaimResult()
 
             row = await session.get(OutboxMessage, outbox_id)
             meta = row.meta or {}
@@ -2445,7 +2680,7 @@ async def _claim_operator_relay(outbox_id: int, event_id: int) -> _ClaimedRelay 
         outbox_id,
         claimed.sender_id,
     )
-    return claimed
+    return _ClaimResult(claimed=claimed)
 
 
 async def _execute_operator_relay(
@@ -2508,6 +2743,12 @@ async def _execute_operator_relay(
 async def _finalize_operator_relay(claimed: _ClaimedRelay, outcome: RelayProviderOutcome) -> bool:
     """Stage D: persist the terminal outcome and source-event state in one tx.
 
+    The durable markers for the secondary actions still owed (Chatwoot note,
+    Meta-circuit close) are written in THIS SAME transaction, so a crash between
+    this COMMIT and the side effects cannot lose the manual-review signal: no
+    other recovery path revisits a terminal row, but the terminal-action
+    dispatcher does.
+
     Returns True when this call actually finalized the row (it was still
     'sending'); False when another path already moved it (finalize must not
     overwrite a recovered 'unknown' with a late 'sent').
@@ -2528,16 +2769,35 @@ async def _finalize_operator_relay(claimed: _ClaimedRelay, outcome: RelayProvide
             ).scalar_one_or_none()
             now = utcnow()
 
+            conversation_id = (row.meta or {}).get("chatwoot_conversation_id")
+            is_template = claimed.send_type == "template"
+
             if outcome.kind == "sent":
                 row.status = "sent"
                 row.provider_message_id = outcome.provider_message_id
                 row.sent_at = now
+                # Only the reopen-template success owes the operator a note; a
+                # plain text send that succeeded needs no explanation.
+                if is_template:
+                    row.meta = {
+                        **(row.meta or {}),
+                        **_pending_note_marker(_NOTE_KIND_TEMPLATE_SENT, conversation_id),
+                    }
                 if event is not None:
                     _mark_event_processed(event, None)
             elif outcome.kind == "failed":
+                # Deterministic rejection: Meta confirmed the customer did NOT get
+                # it. Both paths owe the operator a note — Chatwoot already shows
+                # the agent's message as sent, so without one the operator would
+                # believe it was delivered.
+                note_kind = _NOTE_KIND_TEMPLATE_FAILED if is_template else _NOTE_KIND_TEXT_FAILED
                 row.status = "failed"
                 row.error = "operator_relay: send failed (permanent)"
-                row.meta = {**(row.meta or {}), "error_kind": outcome.error_kind}
+                row.meta = {
+                    **(row.meta or {}),
+                    "error_kind": outcome.error_kind,
+                    **_pending_note_marker(note_kind, conversation_id),
+                }
                 if event is not None:
                     _mark_event_processed(event, "operator_relay: send failed (permanent)")
             else:  # unknown
@@ -2549,6 +2809,8 @@ async def _finalize_operator_relay(claimed: _ClaimedRelay, outcome: RelayProvide
                     "recovery_reason": "indeterminate_send_outcome",
                     "error_kind": outcome.error_kind,
                     "error_code": outcome.error_code,
+                    **_pending_note_marker(_NOTE_KIND_UNKNOWN, conversation_id),
+                    **_pending_circuit_marker(outcome),
                 }
                 if event is not None:
                     _mark_event_processed(event, "operator_relay: delivery outcome unknown")
@@ -2558,9 +2820,10 @@ async def _finalize_operator_relay(claimed: _ClaimedRelay, outcome: RelayProvide
 async def _process_operator_relay_event(event_id: int, provider: WhatsAppProvider) -> None:
     """Drive the full staged relay lifecycle for one event.
 
-    prepare (commit) → claim (commit) → execute (no tx) → finalize (commit),
-    with Chatwoot private notes and any Meta-circuit close performed only after
-    the relevant durable commit.
+    prepare (commit) -> claim (commit) -> execute (no tx) -> finalize (commit),
+    then dispatch the secondary actions that the terminal commit recorded as
+    pending. Those markers are durable, so if this process dies before (or
+    during) the dispatch, production recovery still delivers them.
     """
     # prepare is retried once: the only way the FOR UPDATE serialization can be
     # defeated is a raced insert caught by the unique index, after which a retry
@@ -2574,13 +2837,19 @@ async def _process_operator_relay_event(event_id: int, provider: WhatsAppProvide
     else:
         return
 
-    if prepared.note is not None:
-        await _send_operator_private_note(prepared.note)
+    if prepared.terminal_outbox_id is not None:
+        await _dispatch_terminal_actions_for(prepared.terminal_outbox_id)
 
     if prepared.outbox_id is None:
         return
 
-    claimed = await _claim_operator_relay(prepared.outbox_id, event_id)
+    claim = await _claim_operator_relay(prepared.outbox_id, event_id)
+    if claim.canceled_outbox_id is not None:
+        # The intent was no longer safe to send (flag/circuit/window) and was
+        # canceled instead; its owed operator note is durable and dispatched here.
+        await _dispatch_terminal_actions_for(claim.canceled_outbox_id)
+        return
+    claimed = claim.claimed
     if claimed is None:
         return
 
@@ -2589,11 +2858,12 @@ async def _process_operator_relay_event(event_id: int, provider: WhatsAppProvide
     if not finalized:
         return
 
-    await _relay_post_finalize_side_effects(claimed, outcome)
+    _log_relay_outcome(claimed, outcome)
+    await _dispatch_terminal_actions_for(claimed.outbox_id)
 
 
-async def _relay_post_finalize_side_effects(claimed: _ClaimedRelay, outcome: RelayProviderOutcome) -> None:
-    """Circuit close + Chatwoot notes owed AFTER a committed durable outcome."""
+def _log_relay_outcome(claimed: _ClaimedRelay, outcome: RelayProviderOutcome) -> None:
+    """Operational log for a committed terminal outcome (no PII, no raw error)."""
     if outcome.kind == "sent":
         logger.info(
             "operator_relay: %s sent outbox_id=%s sender_id=%s",
@@ -2601,65 +2871,20 @@ async def _relay_post_finalize_side_effects(claimed: _ClaimedRelay, outcome: Rel
             claimed.outbox_id,
             claimed.sender_id,
         )
-        if claimed.send_type == "template":
-            await _send_operator_private_note(
-                _RelayNote(
-                    conversation_id=claimed.conversation_id,
-                    outbox_id=claimed.outbox_id,
-                    text=(
-                        "⚠️ Das 24h-WhatsApp-Fenster war geschlossen. Die ursprüngliche Nachricht"
-                        " wurde nicht direkt gesendet. Stattdessen wurde eine Vorlage gesendet, damit"
-                        " der Kunde den Dialog wieder öffnen kann.\n\n"
-                        f'Originalnachricht:\n"{claimed.text}"'
-                    ),
-                )
-            )
-        return
-
-    if outcome.kind == "failed":
+    elif outcome.kind == "failed":
         logger.warning(
             "operator_relay: %s send failed outbox_id=%s error_kind=permanent",
             claimed.send_type,
             claimed.outbox_id,
         )
-        if claimed.send_type == "template":
-            await _send_operator_private_note(
-                _RelayNote(
-                    conversation_id=claimed.conversation_id,
-                    outbox_id=claimed.outbox_id,
-                    text=(
-                        "❌ Die Vorlage zum Wiederöffnen des WhatsApp-Dialogs konnte nicht gesendet"
-                        " werden. Die ursprüngliche Nachricht wurde nicht an WhatsApp zugestellt."
-                    ),
-                )
-            )
-        return
-
-    # unknown — indeterminate outcome. Two INDEPENDENT side effects:
-    #   1. Circuit close: only for a transient error with the breaker enabled.
-    #   2. Operator notification: a truthful manual-review note for EVERY unknown,
-    #      regardless of circuit configuration.
-    logger.warning(
-        "operator_relay: %s send outcome unknown outbox_id=%s error_kind=%s error_code=%s — manual review",
-        claimed.send_type,
-        claimed.outbox_id,
-        outcome.error_kind,
-        outcome.error_code,
-    )
-    if outcome.circuit_transient and settings.meta_circuit_breaker_enabled:
-        await meta_circuit.close_meta_circuit(
-            reason="operator_relay_transient_send_error",
-            error_kind=outcome.error_kind,
-            error_code=outcome.error_code,
-            next_probe_at=utcnow() + timedelta(seconds=settings.meta_circuit_probe_initial_delay_seconds),
+    else:
+        logger.warning(
+            "operator_relay: %s send outcome unknown outbox_id=%s error_kind=%s error_code=%s — manual review",
+            claimed.send_type,
+            claimed.outbox_id,
+            outcome.error_kind,
+            outcome.error_code,
         )
-    await _send_operator_private_note(
-        _RelayNote(
-            conversation_id=claimed.conversation_id,
-            text=_OPERATOR_RELAY_UNKNOWN_NOTE,
-            outbox_id=claimed.outbox_id,
-        )
-    )
 
 
 async def recover_stale_operator_relay_sending(
@@ -2693,14 +2918,18 @@ async def recover_stale_operator_relay_sending(
                     )
                 ).scalars()
             )
-            note_targets: list[tuple[int, Any]] = []
+            note_targets: list[int] = []
             for row in rows:
+                conversation_id = (row.meta or {}).get("chatwoot_conversation_id")
                 row.status = "unknown"
                 row.error = "operator_relay: delivery outcome unknown"
+                # The owed manual-review note is recorded durably in the SAME
+                # transaction as the 'unknown' status.
                 row.meta = {
                     **(row.meta or {}),
                     "manual_review_required": True,
                     "recovery_reason": "stale_sending_attempt",
+                    **_pending_note_marker(_NOTE_KIND_UNKNOWN, conversation_id),
                 }
                 if row.source_whatsapp_event_id is not None:
                     event = await session.get(WhatsAppEvent, row.source_whatsapp_event_id)
@@ -2711,17 +2940,11 @@ async def recover_stale_operator_relay_sending(
                     row.id,
                     row.source_whatsapp_event_id,
                 )
-                note_targets.append((row.id, (row.meta or {}).get("chatwoot_conversation_id")))
+                note_targets.append(int(row.id))
                 recovered += 1
 
-    for outbox_id, conversation_id in note_targets:
-        await _send_operator_private_note(
-            _RelayNote(
-                conversation_id=conversation_id,
-                text=_OPERATOR_RELAY_UNKNOWN_NOTE,
-                outbox_id=outbox_id,
-            )
-        )
+    for outbox_id in note_targets:
+        await _dispatch_terminal_actions_for(outbox_id)
 
     return recovered
 
@@ -2733,6 +2956,7 @@ class RecoveryStats:
     recovered_sending: int = 0
     recovered_processing: int = 0
     resumed_queued: int = 0
+    dispatched_actions: int = 0
 
 
 async def recover_stale_processing_events(*, now: datetime | None = None) -> int:
@@ -2743,6 +2967,16 @@ async def recover_stale_processing_events(*, now: datetime | None = None) -> int
     that already have ANY Outbox (queued/sending/terminal) are never touched here
     — those are resumed or recovered by the Outbox-driven paths. Bounded batch,
     ``FOR UPDATE SKIP LOCKED`` so two workers never reset the same event.
+
+    The operator-relay predicate is evaluated IN SQL, before ORDER BY / LIMIT /
+    FOR UPDATE, so older unrelated 'processing' rows can never fill the bounded
+    batch and starve relay recovery (a relay event would then stay 'processing'
+    forever). ``jsonb_typeof(payload->'_chatwoot_operator_relay') = 'object'`` is
+    the exact SQL equivalent of :func:`_is_operator_relay` — the same marker
+    ``process_one_event`` routes on — so the SQL filter and the Python guard can
+    never disagree. The dedupe_key prefix is deliberately NOT used: it is a
+    formatting convention, and ANDing it in would silently skip (and re-starve) a
+    relay event whose key format ever changes.
     """
     now = now or utcnow()
     threshold = now - timedelta(seconds=settings.chatwoot_operator_relay_stale_processing_seconds)
@@ -2754,6 +2988,7 @@ async def recover_stale_processing_events(*, now: datetime | None = None) -> int
             has_outbox = exists(
                 select(OutboxMessage.id).where(OutboxMessage.source_whatsapp_event_id == WhatsAppEvent.id)
             )
+            is_operator_relay_sql = func.jsonb_typeof(WhatsAppEvent.payload[_OPERATOR_RELAY_MARKER_KEY]) == "object"
             rows = list(
                 (
                     await session.execute(
@@ -2762,6 +2997,7 @@ async def recover_stale_processing_events(*, now: datetime | None = None) -> int
                             WhatsAppEvent.status == "processing",
                             WhatsAppEvent.processed_at.is_(None),
                             WhatsAppEvent.received_at < threshold,
+                            is_operator_relay_sql,
                             ~has_outbox,
                         )
                         .order_by(WhatsAppEvent.received_at.asc())
@@ -2771,7 +3007,7 @@ async def recover_stale_processing_events(*, now: datetime | None = None) -> int
                 ).scalars()
             )
             for event in rows:
-                # Only operator-relay events are in scope for this recovery path.
+                # Defense in depth only — the authoritative filter ran in SQL above.
                 if not _is_operator_relay(event.payload or {}):
                     continue
                 event.status = "received"
@@ -2828,11 +3064,12 @@ async def recover_operator_relay_lifecycle(
     *,
     now: datetime | None = None,
 ) -> RecoveryStats:
-    """Run the three independent operator-relay recovery actions (order matters):
+    """Run the four independent operator-relay recovery actions (order matters):
 
       1. stale 'sending' → 'unknown' (never retried);
       2. stale 'processing' without Outbox → 'received' (re-preparable);
-      3. committed 'queued' → resume/claim/send (single provider call).
+      3. committed 'queued' → revalidate gates, then claim/send once;
+      4. terminal rows with pending secondary actions → dispatch them.
 
     Each action is isolated: a failure in one is logged by class name only and
     never prevents the others or crashes the worker.
@@ -2852,13 +3089,24 @@ async def recover_operator_relay_lifecycle(
         stats.resumed_queued = await resume_queued_operator_relay(provider)
     except Exception as exc:
         logger.error("operator_relay: recovery step failed operation=queued_resume error_type=%s", type(exc).__name__)
+    try:
+        # Terminal rows are revisited by no other path, so a crash between the
+        # finalize COMMIT and its side effects would strand the manual-review
+        # signal forever without this step.
+        stats.dispatched_actions = await dispatch_pending_terminal_actions()
+    except Exception as exc:
+        logger.error(
+            "operator_relay: recovery step failed operation=terminal_actions error_type=%s", type(exc).__name__
+        )
 
-    if stats.recovered_sending or stats.recovered_processing or stats.resumed_queued:
+    if stats.recovered_sending or stats.recovered_processing or stats.resumed_queued or stats.dispatched_actions:
         logger.info(
-            "operator_relay: recovery cycle recovered_sending=%s recovered_processing=%s resumed_queued=%s",
+            "operator_relay: recovery cycle recovered_sending=%s recovered_processing=%s "
+            "resumed_queued=%s dispatched_actions=%s",
             stats.recovered_sending,
             stats.recovered_processing,
             stats.resumed_queued,
+            stats.dispatched_actions,
         )
     return stats
 

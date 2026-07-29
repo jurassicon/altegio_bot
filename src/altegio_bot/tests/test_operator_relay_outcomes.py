@@ -11,6 +11,7 @@ Covers:
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -327,10 +328,14 @@ async def test_unknown_note_failure_preserves_primary_error(session_maker, monke
     assert row.status == "unknown"
     # Primary WhatsApp lifecycle error is preserved; the note failure lives in meta.
     assert row.error == "operator_relay: delivery outcome unknown"
-    assert row.meta.get("private_note_status") == "failed"
-    assert row.meta.get("private_note_error") == "RuntimeError"
+    # A first failure stays retryable (bounded attempts), never terminal-by-accident.
+    assert row.meta.get("private_note_status") == "pending"
+    assert row.meta.get("private_note_attempts") == 1
+    assert row.meta.get("private_note_error") == "RuntimeError"  # class name only
     assert row.meta.get("private_note_updated_at") is not None
+    assert row.meta.get("manual_review_required") is True
     assert "SECRET" not in (row.error or "")
+    assert "SECRET" not in json.dumps(row.meta)
 
 
 @pytest.mark.asyncio
@@ -348,5 +353,7 @@ async def test_failed_note_failure_preserves_primary_error(session_maker, monkey
 
     row = await _row(session_maker, event_id)
     assert row.status == "failed"
+    # Permanent-failure marker survives the note failure untouched.
     assert row.error == "operator_relay: send failed (permanent)"
-    assert row.meta.get("private_note_status") == "failed"
+    assert row.meta.get("private_note_status") == "pending"  # retryable, not lost
+    assert row.meta.get("private_note_error") == "RuntimeError"

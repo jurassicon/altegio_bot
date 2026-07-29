@@ -246,7 +246,7 @@ async def test_crash_after_claim_recovers_unknown(session_maker, monkeypatch) ->
 
     await _lock_batch(session_maker)
     prepared = await wiw._prepare_operator_relay(event_id, provider)
-    claimed = await wiw._claim_operator_relay(prepared.outbox_id, event_id)  # committed 'sending' (crash)
+    claimed = (await wiw._claim_operator_relay(prepared.outbox_id, event_id)).claimed  # committed 'sending' (crash)
     assert claimed is not None
     assert len(provider.sent) == 0
 
@@ -372,3 +372,61 @@ async def test_run_poll_cycle_runs_recovery_when_requested(session_maker, monkey
     assert len(provider.sent) == 1
     rows = await _outboxes_for(session_maker, event_id)
     assert len(rows) == 1 and rows[0].status == "sent"
+
+
+# ===========================================================================
+# Starvation: older non-operator 'processing' rows must not fill the batch
+# ===========================================================================
+
+
+async def _insert_non_operator_processing(session_maker, *, dedupe_key: str, age_seconds: float) -> int:
+    """A stale 'processing' event that is NOT an operator relay (no marker)."""
+    now = datetime.now(timezone.utc)
+    async with session_maker() as s:
+        async with s.begin():
+            evt = WhatsAppEvent(
+                dedupe_key=dedupe_key,
+                received_at=now - timedelta(seconds=age_seconds),
+                status="processing",
+                query={},
+                headers={},
+                payload={"entry": [{"changes": [{"value": {"statuses": []}}]}]},
+            )
+            s.add(evt)
+            await s.flush()
+            return int(evt.id)
+
+
+@pytest.mark.asyncio
+async def test_non_operator_rows_do_not_starve_relay_recovery(session_maker, monkeypatch) -> None:
+    """Older non-operator 'processing' rows must not consume the bounded recovery
+    batch and strand a newer operator relay event in 'processing' forever."""
+    _enable(monkeypatch, session_maker)
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_relay_stale_processing_seconds", 300)
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_relay_recovery_batch_size", 2)
+    await _make_sender(session_maker, sender_id=40)
+    await _open_window(session_maker, dedupe_key="win:starve")
+
+    # Two OLDER non-operator stale rows would fill a batch_size=2 batch.
+    a_id = await _insert_non_operator_processing(session_maker, dedupe_key="wa:starve:A", age_seconds=9000)
+    b_id = await _insert_non_operator_processing(session_maker, dedupe_key="wa:starve:B", age_seconds=8000)
+    # A NEWER operator relay event, stale but younger than both.
+    c_id = await _insert_received(
+        session_maker, dedupe_key="chatwoot_out:starve:C", conversation_id=900, age_seconds=600
+    )
+    await _lock_batch(session_maker)  # C: received -> processing
+
+    recovered = await wiw.recover_stale_processing_events()
+
+    assert recovered == 1  # only the operator relay event
+    assert (await _reload_event(session_maker, a_id)).status == "processing"  # untouched
+    assert (await _reload_event(session_maker, b_id)).status == "processing"  # untouched
+    assert (await _reload_event(session_maker, c_id)).status == "received"  # rescued
+
+    # The next production poll actually delivers it, exactly once.
+    provider = _RecordingProvider()
+    await wiw.run_poll_cycle(provider, batch_size=50, run_recovery=False)
+    assert len(provider.sent) == 1
+    rows = await _outboxes_for(session_maker, c_id)
+    assert len(rows) == 1 and rows[0].status == "sent"
+    assert (await _reload_event(session_maker, c_id)).status == "processed"

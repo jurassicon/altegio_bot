@@ -14,8 +14,38 @@ from sqlalchemy.ext.asyncio import (
 )
 from sqlalchemy.pool import NullPool
 
+import altegio_bot.db as app_db
 from altegio_bot.models.models import Base, Client
 from altegio_bot.settings import Settings
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _dispose_global_engine_pool() -> AsyncGenerator[None, None]:
+    """Never let a pooled connection on the GLOBAL app engine outlive its event loop.
+
+    Some production code deliberately uses the module-global ``SessionLocal`` /
+    engine rather than an injected factory — ``meta_circuit.close_meta_circuit()``
+    is the one the operator-relay send-failure paths reach. That global engine uses
+    a normal QueuePool, while pytest-asyncio gives every test its own event loop.
+    So the first test that closes the Meta circuit leaves a live asyncpg connection
+    checked into the global pool, bound to a loop that is closed moments later.
+
+    From then on that connection is poison: when it is next reused, recycled or
+    finalized, asyncpg schedules ``Connection._cancel`` on the dead loop
+    (``protocol.pyx`` -> ``Connection._cancel_current_command``). ``create_task``
+    on a closed loop never runs it, which surfaces as the unraisable
+    ``RuntimeWarning: coroutine 'Connection._cancel' was never awaited`` and, far
+    worse, as order-dependent failures in later, unrelated tests.
+
+    Disposing the global pool at the end of each test closes those connections
+    while their own loop is still running. This is test-infrastructure lifecycle
+    only: no production behaviour, semantics or warning filter is changed, and
+    disposing an already-empty pool is a no-op.
+    """
+    try:
+        yield
+    finally:
+        await app_db.engine.dispose()
 
 
 @pytest.fixture(scope="session", autouse=True)

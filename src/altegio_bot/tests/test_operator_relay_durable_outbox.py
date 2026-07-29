@@ -360,7 +360,7 @@ async def test_crash_after_claim_before_provider_recovers_unknown(session_maker,
     provider = _RecordingProvider()
 
     prepared = await wiw._prepare_operator_relay(event_id, provider)
-    claimed = await wiw._claim_operator_relay(prepared.outbox_id, event_id)
+    claimed = (await wiw._claim_operator_relay(prepared.outbox_id, event_id)).claimed
     assert claimed is not None  # committed 'sending', provider not yet called
     assert len(provider.sent) == 0
 
@@ -396,7 +396,7 @@ async def test_provider_success_then_finalize_failure_keeps_sending(session_make
     provider = _RecordingProvider(wamid="wamid.FINFAIL")
 
     prepared = await wiw._prepare_operator_relay(event_id, provider)
-    claimed = await wiw._claim_operator_relay(prepared.outbox_id, event_id)
+    claimed = (await wiw._claim_operator_relay(prepared.outbox_id, event_id)).claimed
     outcome = await wiw._execute_operator_relay(claimed, provider)
     assert outcome.kind == "sent" and outcome.provider_message_id == "wamid.FINFAIL"
     assert len(provider.sent) == 1

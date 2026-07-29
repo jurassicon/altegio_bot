@@ -2685,7 +2685,9 @@ async def test_private_note_only_note_failure_surfaced(session_maker, monkeypatc
     # must NOT overwrite it; the note outcome lives only in metadata.
     assert ob.error == "operator_relay: canceled (customer service window closed)"
     assert "private note failed" not in (ob.error or "")
-    assert ob.meta.get("private_note_status") == "failed"
+    # Bounded retry: a first failure stays retryable rather than terminal.
+    assert ob.meta.get("private_note_status") == "pending"
+    assert ob.meta.get("private_note_attempts") == 1
     assert ob.meta.get("private_note_error") == "RuntimeError"
     assert ob.meta.get("private_note_updated_at") is not None
 
