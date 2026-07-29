@@ -11,6 +11,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    LargeBinary,
     Numeric,
     String,
     Text,
@@ -79,6 +80,93 @@ class AltegioEvent(Base):
     query: Mapped[dict] = mapped_column(JSONB, default=dict)
     headers: Mapped[dict] = mapped_column(JSONB, default=dict)
     payload: Mapped[dict] = mapped_column(JSONB, default=dict)
+
+
+class EasyWeekEvent(Base):
+    """Сырая запись доставки вебхука EasyWeek.
+
+    Research-grade: каждая аутентифицированная доставка — включая ретраи, Resend
+    и не-JSON тела — становится отдельной строкой. Никакой обработки,
+    нормализации и дедупликации. Повторы анализируются через НЕуникальный индекс
+    по ``payload_hash``; unique-констрейнт отсутствует сознательно, чтобы ретраи
+    сохранялись как данные.
+    """
+
+    __tablename__ = "easyweek_events"
+
+    id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        autoincrement=True,
+    )
+
+    received_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        index=True,
+    )
+
+    # Жизненный цикл: "captured" -> ... Задел под inbox-воркер PR-4, который
+    # будет забирать строки со статусом "captured". Сейчас вебхук пишет только
+    # значение по умолчанию. index + server_default повторяют миграцию
+    # easyweek_events, чтобы схема, собранная из модели в тестах, совпадала с прод.
+    status: Mapped[str] = mapped_column(
+        String(32),
+        default="captured",
+        server_default=text("'captured'"),
+        index=True,
+    )
+
+    # Значение query-параметра ?event= в том виде, как оно настроено в URL
+    # вебхука. Валидации имён триггеров на этапе capture нет.
+    event_hint: Mapped[str | None] = mapped_column(
+        String(32),
+        index=True,
+        nullable=True,
+    )
+
+    # Откуда пришёл валидный токен: "query" | "header".
+    auth_via: Mapped[str | None] = mapped_column(String(16), nullable=True)
+
+    # sha256 канонизированного JSON-payload (sort_keys, separators=(",", ":")).
+    # NULL, когда тело не JSON. Индексируется, но НЕ уникален: повторные
+    # доставки делят хэш и сохраняются обе.
+    payload_hash: Mapped[str | None] = mapped_column(
+        String(64),
+        index=True,
+        nullable=True,
+    )
+
+    content_type: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+    # Источник истины по содержимому доставки: до 128 КиБ ИСХОДНЫХ байт, как их
+    # прислал EasyWeek. Заполняется для каждой аутентифицированной доставки,
+    # включая успешно разобранный JSON: JSONB — это уже разбор, он теряет
+    # порядок ключей, пробелы, формат чисел, дубли ключей и невалидный UTF-8.
+    # Nullable, чтобы ручная политика хранения могла обнулить байты, сохранив
+    # метаданные строки.
+    body_raw: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    # Полный размер полученной доставки в байтах — включая ту часть, которая не
+    # попала в body_raw из-за лимита.
+    body_size_bytes: Mapped[int] = mapped_column(
+        BigInteger,
+        default=0,
+        server_default=text("0"),
+    )
+
+    # Текстовая проекция тела для случаев, когда сохранить его как JSONB не
+    # удалось (не JSON, NUL, суррогаты, слишком большое тело). Это удобство для
+    # чтения: байтовый источник истины — body_raw. Ограничена теми же 128 КиБ.
+    body_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    body_truncated: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+        server_default=text("false"),
+    )
+
+    query: Mapped[dict] = mapped_column(JSONB, default=dict)  # секреты замаскированы
+    headers: Mapped[dict] = mapped_column(JSONB, default=dict)  # только безопасные заголовки
+    payload: Mapped[dict] = mapped_column(JSONB, default=dict)  # распарсенный JSON или {}
 
 
 class SmartTestRun(Base):
@@ -418,6 +506,15 @@ class OutboxMessage(Base):
             "company_id",
             "created_at",
         ),
+        # DB-level idempotency for operator relay: at most one Outbox intent per
+        # source WhatsAppEvent. Partial so the many historical/bot rows that have
+        # no source event (NULL) are unconstrained and can coexist freely.
+        Index(
+            "uq_outbox_source_whatsapp_event_id",
+            "source_whatsapp_event_id",
+            unique=True,
+            postgresql_where=text("source_whatsapp_event_id IS NOT NULL"),
+        ),
     )
 
     id: Mapped[int] = mapped_column(
@@ -453,9 +550,22 @@ class OutboxMessage(Base):
     language: Mapped[str] = mapped_column(String(8), default="de")
     body: Mapped[str] = mapped_column(Text)
 
-    # queued/sending/sent/delivered/read/failed
+    # Lifecycle: queued → sending → sent/delivered/read | failed | canceled |
+    # unknown. For operator relay the transition queued → sending is committed
+    # (with attempt_started_at) BEFORE the first Meta side effect, so a durable
+    # send intent always exists on disk before the network call. 'unknown' marks
+    # an attempt whose Meta outcome cannot be proven (crash/indeterminate) — it
+    # is never auto-retried and requires manual review.
     status: Mapped[str] = mapped_column(String(32), default="queued", index=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Wall-clock time the queued → sending claim was committed. Distinct from
+    # created_at (a row may sit in 'queued' first) and from sent_at (only set on
+    # confirmed success). Stale-'sending' recovery keys off this timestamp.
+    attempt_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
 
     provider_message_id: Mapped[str | None] = mapped_column(
         String(128),
@@ -507,6 +617,17 @@ class OutboxMessage(Base):
         BigInteger,
         nullable=True,
         index=True,
+    )
+
+    # Operator-relay idempotency anchor: the WhatsAppEvent this row relays.
+    # NULL for every historical row and every non-operator (bot/campaign) send.
+    # Populated for operator relay and covered by the partial unique index above,
+    # so one event can never spawn two send attempts even under concurrency or
+    # crash-replay. SET NULL on event deletion keeps the audit row alive.
+    source_whatsapp_event_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey("whatsapp_events.id", ondelete="SET NULL"),
+        nullable=True,
     )
 
 

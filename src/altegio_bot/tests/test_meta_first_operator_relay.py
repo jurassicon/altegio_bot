@@ -291,6 +291,8 @@ def _forwarded_inbound_event(
 @pytest.mark.asyncio
 async def test_operator_outgoing_sent_to_meta(session_maker, monkeypatch) -> None:
     """When relay is enabled, operator message must be sent via provider."""
+    monkeypatch.setattr(wiw, "SessionLocal", session_maker)
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_relay_enabled", True)
     # Ensure safe_send does not short-circuit on WHATSAPP_PROVIDER env var.
     monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
 
@@ -313,14 +315,9 @@ async def test_operator_outgoing_sent_to_meta(session_maker, monkeypatch) -> Non
             session.add(evt)
             await session.flush()
 
-            from altegio_bot.settings import settings as _s
+            evt_id = evt.id
 
-            original = _s.chatwoot_operator_relay_enabled
-            _s.chatwoot_operator_relay_enabled = True
-            try:
-                await handle_event(session, evt, provider)
-            finally:
-                _s.chatwoot_operator_relay_enabled = original
+    await wiw.process_one_event(evt_id, provider)
 
     assert len(provider.sent) == 1
     assert provider.sent[0]["phone_e164"] == "+49111222333"
@@ -497,7 +494,8 @@ async def test_webhook_activity_content_type_skipped(session_maker) -> None:
             )
 
         assert resp.status_code == 200
-        assert resp.json().get("skipped") == "content_type=activity"
+        # Stable reason code instead of echoing the sender-controlled value.
+        assert resp.json().get("skipped") == "unsupported_content_type"
 
     finally:
         cw_module.SessionLocal = original_session_local
@@ -555,7 +553,7 @@ async def test_loop_prevention_bot_outgoing_not_relayed(
         data = resp.json()
         assert resp.status_code == 200
         # Must be skipped — not stored as operator relay.
-        assert data.get("skipped") == "message_type=1"
+        assert data.get("skipped") == "outgoing_not_relayed"
 
     finally:
         cw_module.SessionLocal = original_session_local
@@ -570,6 +568,8 @@ async def test_loop_prevention_bot_outgoing_not_relayed(
 @pytest.mark.asyncio
 async def test_operator_relay_outbox_persisted(session_maker, monkeypatch) -> None:
     """Operator relay must create an OutboxMessage with source='operator'."""
+    monkeypatch.setattr(wiw, "SessionLocal", session_maker)
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_relay_enabled", True)
     monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
     provider = _FakeProvider(wamid="wamid.OP_PERSIST")
 
@@ -597,14 +597,9 @@ async def test_operator_relay_outbox_persisted(session_maker, monkeypatch) -> No
             session.add(evt)
             await session.flush()
 
-            from altegio_bot.settings import settings as _s
+            evt_id = evt.id
 
-            original = _s.chatwoot_operator_relay_enabled
-            _s.chatwoot_operator_relay_enabled = True
-            try:
-                await handle_event(session, evt, provider)
-            finally:
-                _s.chatwoot_operator_relay_enabled = original
+    await wiw.process_one_event(evt_id, provider)
 
     async with session_maker() as session:
         result = await session.execute(
@@ -626,8 +621,12 @@ async def test_operator_relay_outbox_persisted(session_maker, monkeypatch) -> No
 
 
 @pytest.mark.asyncio
-async def test_operator_relay_circuit_closed_window_open_cancels_without_meta_send(session_maker) -> None:
+async def test_operator_relay_circuit_closed_window_open_cancels_without_meta_send(session_maker, monkeypatch) -> None:
     """Closed Meta circuit pauses operator relay before free-form text send."""
+    monkeypatch.setattr(wiw, "SessionLocal", session_maker)
+    monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_relay_enabled", True)
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_reopen_private_note_enabled", False)
     await mc.close_meta_circuit(
         session_factory=session_maker,
         reason="transient_send_error",
@@ -659,17 +658,9 @@ async def test_operator_relay_circuit_closed_window_open_cancels_without_meta_se
             session.add(evt)
             await session.flush()
 
-            from altegio_bot.settings import settings as _s
+            evt_id = evt.id
 
-            orig_relay = _s.chatwoot_operator_relay_enabled
-            orig_note = _s.chatwoot_operator_reopen_private_note_enabled
-            _s.chatwoot_operator_relay_enabled = True
-            _s.chatwoot_operator_reopen_private_note_enabled = False
-            try:
-                await handle_event(session, evt, provider)
-            finally:
-                _s.chatwoot_operator_relay_enabled = orig_relay
-                _s.chatwoot_operator_reopen_private_note_enabled = orig_note
+    await wiw.process_one_event(evt_id, provider)
 
     assert provider.sent == []
     assert provider.templates_sent == []
@@ -691,8 +682,16 @@ async def test_operator_relay_circuit_closed_window_open_cancels_without_meta_se
 
 
 @pytest.mark.asyncio
-async def test_operator_relay_circuit_closed_reopen_template_cancels_without_meta_send(session_maker) -> None:
+async def test_operator_relay_circuit_closed_reopen_template_cancels_without_meta_send(
+    session_maker, monkeypatch
+) -> None:
     """Closed Meta circuit pauses operator relay before reopen-template send."""
+    monkeypatch.setattr(wiw, "SessionLocal", session_maker)
+    monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_relay_enabled", True)
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_closed_window_mode", "reopen_template")
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_reopen_template_name", "test_reopen_tpl")
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_reopen_private_note_enabled", False)
     await mc.close_meta_circuit(
         session_factory=session_maker,
         reason="transient_send_error",
@@ -723,23 +722,9 @@ async def test_operator_relay_circuit_closed_reopen_template_cancels_without_met
             session.add(evt)
             await session.flush()
 
-            from altegio_bot.settings import settings as _s
+            evt_id = evt.id
 
-            orig_relay = _s.chatwoot_operator_relay_enabled
-            orig_mode = _s.chatwoot_operator_closed_window_mode
-            orig_name = _s.chatwoot_operator_reopen_template_name
-            orig_note = _s.chatwoot_operator_reopen_private_note_enabled
-            _s.chatwoot_operator_relay_enabled = True
-            _s.chatwoot_operator_closed_window_mode = "reopen_template"
-            _s.chatwoot_operator_reopen_template_name = "test_reopen_tpl"
-            _s.chatwoot_operator_reopen_private_note_enabled = False
-            try:
-                await handle_event(session, evt, provider)
-            finally:
-                _s.chatwoot_operator_relay_enabled = orig_relay
-                _s.chatwoot_operator_closed_window_mode = orig_mode
-                _s.chatwoot_operator_reopen_template_name = orig_name
-                _s.chatwoot_operator_reopen_private_note_enabled = orig_note
+    await wiw.process_one_event(evt_id, provider)
 
     assert provider.sent == []
     assert provider.templates_sent == []
@@ -1074,12 +1059,15 @@ async def test_webhook_operator_outgoing_accepted(session_maker) -> None:
 
 
 @pytest.mark.asyncio
-async def test_ambiguous_sender_blocks_relay(session_maker) -> None:
+async def test_ambiguous_sender_blocks_relay(session_maker, monkeypatch) -> None:
     """Two active senders for the same phone_number_id → relay blocked.
 
     OutboxMessage must NOT be created and event.error must describe the
     ambiguity so operators can diagnose the misconfiguration.
     """
+    monkeypatch.setattr(wiw, "SessionLocal", session_maker)
+    monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_relay_enabled", True)
     provider = _FakeProvider(wamid="wamid.SHOULD_NOT_APPEAR")
 
     async with session_maker() as session:
@@ -1124,14 +1112,9 @@ async def test_ambiguous_sender_blocks_relay(session_maker) -> None:
             await session.flush()
             evt_id = evt.id
 
-            from altegio_bot.settings import settings as _s
+            evt_id = evt.id
 
-            original = _s.chatwoot_operator_relay_enabled
-            _s.chatwoot_operator_relay_enabled = True
-            try:
-                await handle_event(session, evt, provider)
-            finally:
-                _s.chatwoot_operator_relay_enabled = original
+    await wiw.process_one_event(evt_id, provider)
 
     # Provider must NOT have been called.
     assert len(provider.sent) == 0
@@ -1141,8 +1124,10 @@ async def test_ambiguous_sender_blocks_relay(session_maker) -> None:
         reloaded = await session.get(WhatsAppEvent, evt_id)
     assert reloaded is not None
     assert reloaded.error is not None
-    assert "ambiguous" in reloaded.error
-    assert "PNID_SHARED" in reloaded.error
+    # Stable reason code only — the sender-controlled phone_number_id must NOT
+    # appear in the persisted error (log injection / data leak).
+    assert reloaded.error == "operator_relay: ambiguous_sender"
+    assert "PNID_SHARED" not in reloaded.error
 
     # No OutboxMessage created.
     async with session_maker() as session:
@@ -1153,8 +1138,11 @@ async def test_ambiguous_sender_blocks_relay(session_maker) -> None:
 
 
 @pytest.mark.asyncio
-async def test_ambiguous_sender_no_outbox_created(session_maker) -> None:
+async def test_ambiguous_sender_no_outbox_created(session_maker, monkeypatch) -> None:
     """Verify zero OutboxMessage rows exist after ambiguous relay attempt."""
+    monkeypatch.setattr(wiw, "SessionLocal", session_maker)
+    monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_relay_enabled", True)
     provider = _FakeProvider()
 
     async with session_maker() as session:
@@ -1196,14 +1184,9 @@ async def test_ambiguous_sender_no_outbox_created(session_maker) -> None:
             session.add(evt)
             await session.flush()
 
-            from altegio_bot.settings import settings as _s
+            evt_id = evt.id
 
-            original = _s.chatwoot_operator_relay_enabled
-            _s.chatwoot_operator_relay_enabled = True
-            try:
-                await handle_event(session, evt, provider)
-            finally:
-                _s.chatwoot_operator_relay_enabled = original
+    await wiw.process_one_event(evt_id, provider)
 
     async with session_maker() as session:
         result = await session.execute(select(OutboxMessage).where(OutboxMessage.template_code == "operator_relay"))
@@ -1219,8 +1202,8 @@ async def test_resolve_relay_sender_zero(session_maker) -> None:
         sid, cid, err = await _resolve_relay_sender(session, "PNID_NONE")
     assert sid is None
     assert cid is None
-    assert err is not None
-    assert "no active sender" in err
+    assert err == "operator_relay: sender_not_found"
+    assert "PNID_NONE" not in err
 
 
 @pytest.mark.asyncio
@@ -1276,9 +1259,8 @@ async def test_resolve_relay_sender_many(session_maker) -> None:
 
     assert sid is None
     assert cid is None
-    assert err is not None
-    assert "ambiguous" in err
-    assert "PNID_MULTI" in err
+    assert err == "operator_relay: ambiguous_sender"
+    assert "PNID_MULTI" not in err
 
 
 @pytest.mark.asyncio
@@ -1394,6 +1376,8 @@ async def test_resolve_relay_sender_same_company_no_default_picks_min_id(
 @pytest.mark.asyncio
 async def test_relay_same_company_multi_sender_sends_successfully(session_maker, monkeypatch) -> None:
     """Relay must succeed (not block) when two senders share same company."""
+    monkeypatch.setattr(wiw, "SessionLocal", session_maker)
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_relay_enabled", True)
     monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
     provider = _FakeProvider(wamid="wamid.SAMECOMPANY")
 
@@ -1437,14 +1421,9 @@ async def test_relay_same_company_multi_sender_sends_successfully(session_maker,
             session.add(evt)
             await session.flush()
 
-            from altegio_bot.settings import settings as _s
+            evt_id = evt.id
 
-            original = _s.chatwoot_operator_relay_enabled
-            _s.chatwoot_operator_relay_enabled = True
-            try:
-                await handle_event(session, evt, provider)
-            finally:
-                _s.chatwoot_operator_relay_enabled = original
+    await wiw.process_one_event(evt_id, provider)
 
     # Must have sent exactly once, using the 'default' sender (id=111).
     assert len(provider.sent) == 1
@@ -1466,9 +1445,15 @@ async def test_relay_same_company_multi_sender_sends_successfully(session_maker,
 
 @pytest.mark.asyncio
 async def test_operator_relay_send_failure(session_maker, monkeypatch) -> None:
-    """When provider.send raises, event.error is set, no OutboxMessage created."""
+    """When provider.send raises an arbitrary (non-deterministic) error, the
+    outcome is conservatively 'unknown' (Meta may have accepted it), not 'failed'.
+    The durable row survives and no automatic resend happens."""
     monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
-    provider = _ErrorProvider()
+    monkeypatch.setattr(wiw, "SessionLocal", session_maker)
+    monkeypatch.setattr(wiw.settings, "meta_circuit_breaker_enabled", False)
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_relay_enabled", True)
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_reopen_private_note_enabled", False)
+    provider = _ErrorProvider()  # raises RuntimeError("meta api unavailable") — indeterminate
 
     async with session_maker() as session:
         async with session.begin():
@@ -1501,24 +1486,27 @@ async def test_operator_relay_send_failure(session_maker, monkeypatch) -> None:
             await session.flush()
             evt_id = evt.id
 
-            from altegio_bot.settings import settings as _s
-
-            original = _s.chatwoot_operator_relay_enabled
-            _s.chatwoot_operator_relay_enabled = True
-            try:
-                await handle_event(session, evt, provider)
-            finally:
-                _s.chatwoot_operator_relay_enabled = original
+    await wiw.process_one_event(evt_id, provider)
 
     async with session_maker() as session:
         reloaded = await session.get(WhatsAppEvent, evt_id)
     assert reloaded is not None
-    assert reloaded.error is not None
-    assert "send failed" in reloaded.error
+    assert reloaded.error == "operator_relay: delivery outcome unknown"
 
+    # The durable row survives as 'unknown' with manual-review metadata.
     async with session_maker() as session:
         result = await session.execute(select(OutboxMessage).where(OutboxMessage.phone_e164 == "+49900100200"))
-        assert result.scalar_one_or_none() is None
+        ob = result.scalar_one_or_none()
+    assert ob is not None
+    assert ob.status == "unknown"
+    assert ob.meta.get("manual_review_required") is True
+
+    # No automatic resend on a later run.
+    await wiw.process_one_event(evt_id, provider)
+    async with session_maker() as session:
+        result = await session.execute(select(OutboxMessage).where(OutboxMessage.phone_e164 == "+49900100200"))
+        assert len(list(result.scalars())) == 1
+    assert ob.provider_message_id is None
 
 
 # ---------------------------------------------------------------------------
@@ -1527,10 +1515,13 @@ async def test_operator_relay_send_failure(session_maker, monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_ambiguous_sender_logs_warning(session_maker, caplog) -> None:
+async def test_ambiguous_sender_logs_warning(session_maker, caplog, monkeypatch) -> None:
     """Ambiguous routing must emit a WARNING to whatsapp_inbox_worker logger."""
     import logging
 
+    monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
+    monkeypatch.setattr(wiw, "SessionLocal", session_maker)
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_relay_enabled", True)
     provider = _FakeProvider()
 
     async with session_maker() as session:
@@ -1570,16 +1561,10 @@ async def test_ambiguous_sender_logs_warning(session_maker, caplog) -> None:
             )
             session.add(evt)
             await session.flush()
+            evt_id = evt.id
 
-            from altegio_bot.settings import settings as _s
-
-            original = _s.chatwoot_operator_relay_enabled
-            _s.chatwoot_operator_relay_enabled = True
-            with caplog.at_level(logging.WARNING, logger="whatsapp_inbox_worker"):
-                try:
-                    await handle_event(session, evt, provider)
-                finally:
-                    _s.chatwoot_operator_relay_enabled = original
+    with caplog.at_level(logging.WARNING, logger="whatsapp_inbox_worker"):
+        await wiw.process_one_event(evt_id, provider)
 
     warning_messages = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
     assert any("ambiguous" in m for m in warning_messages), f"expected ambiguous warning, got: {warning_messages}"
@@ -1598,6 +1583,8 @@ async def test_operator_relay_no_chatwoot_mirror(session_maker, monkeypatch) -> 
     """When a ChatwootHybridProvider is passed, operator relay must use _primary
     directly and never call mirror_outbound_as_note, because the operator's
     message is already visible in Chatwoot."""
+    monkeypatch.setattr(wiw, "SessionLocal", session_maker)
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_relay_enabled", True)
     monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
 
     primary = _FakeProvider(wamid="wamid.NO_MIRROR")
@@ -1642,14 +1629,9 @@ async def test_operator_relay_no_chatwoot_mirror(session_maker, monkeypatch) -> 
             session.add(evt)
             await session.flush()
 
-            from altegio_bot.settings import settings as _s
+            evt_id = evt.id
 
-            original = _s.chatwoot_operator_relay_enabled
-            _s.chatwoot_operator_relay_enabled = True
-            try:
-                await handle_event(session, evt, hybrid)  # type: ignore[arg-type]
-            finally:
-                _s.chatwoot_operator_relay_enabled = original
+    await wiw.process_one_event(evt_id, hybrid)
 
     # Must have sent via _primary, not via hybrid.send (which tracks to mirror_calls).
     assert len(primary.sent) == 1, "meta_provider.send must have been called once"
@@ -1698,6 +1680,9 @@ async def test_resolve_relay_sender_with_company_hint(session_maker) -> None:
 @pytest.mark.asyncio
 async def test_relay_with_inbox_company_map(session_maker, monkeypatch) -> None:
     """CHATWOOT_INBOX_COMPANY_MAP disambiguates relay for two company_ids."""
+    monkeypatch.setattr(wiw, "SessionLocal", session_maker)
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_relay_enabled", True)
+    monkeypatch.setattr(wiw.settings, "chatwoot_inbox_company_map", '{"8": 758285, "7": 1271200}')
     monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
     provider = _FakeProvider(wamid="wamid.INBOX_MAP")
 
@@ -1749,17 +1734,9 @@ async def test_relay_with_inbox_company_map(session_maker, monkeypatch) -> None:
             session.add(evt)
             await session.flush()
 
-            from altegio_bot.settings import settings as _s
+            evt_id = evt.id
 
-            orig_relay = _s.chatwoot_operator_relay_enabled
-            orig_map = _s.chatwoot_inbox_company_map
-            _s.chatwoot_operator_relay_enabled = True
-            _s.chatwoot_inbox_company_map = '{"8": 758285, "7": 1271200}'
-            try:
-                await handle_event(session, evt, provider)
-            finally:
-                _s.chatwoot_operator_relay_enabled = orig_relay
-                _s.chatwoot_inbox_company_map = orig_map
+    await wiw.process_one_event(evt_id, provider)
 
     assert len(provider.sent) == 1
     async with session_maker() as session:
@@ -1773,8 +1750,12 @@ async def test_relay_with_inbox_company_map(session_maker, monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_relay_inbox_not_in_map_fail_closed(session_maker) -> None:
+async def test_relay_inbox_not_in_map_fail_closed(session_maker, monkeypatch) -> None:
     """inbox_id present, map configured but inbox_id absent → fail-closed."""
+    monkeypatch.setattr(wiw, "SessionLocal", session_maker)
+    monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_relay_enabled", True)
+    monkeypatch.setattr(wiw.settings, "chatwoot_inbox_company_map", '{"8": 758285}')
     provider = _FakeProvider()
 
     async with session_maker() as session:
@@ -1815,32 +1796,30 @@ async def test_relay_inbox_not_in_map_fail_closed(session_maker) -> None:
             await session.flush()
             evt_id = evt.id
 
-            from altegio_bot.settings import settings as _s
+            evt_id = evt.id
 
-            orig_relay = _s.chatwoot_operator_relay_enabled
-            orig_map = _s.chatwoot_inbox_company_map
-            _s.chatwoot_operator_relay_enabled = True
-            _s.chatwoot_inbox_company_map = '{"8": 758285}'  # 99 absent
-            try:
-                await handle_event(session, evt, provider)
-            finally:
-                _s.chatwoot_operator_relay_enabled = orig_relay
-                _s.chatwoot_inbox_company_map = orig_map
+    await wiw.process_one_event(evt_id, provider)
 
     assert len(provider.sent) == 0
     async with session_maker() as session:
         reloaded = await session.get(WhatsAppEvent, evt_id)
     assert reloaded is not None
     assert reloaded.error is not None
-    assert "fail-closed" in reloaded.error
-    assert "99" in reloaded.error
+    # Stable reason code; the sender-controlled inbox id must not leak into it.
+    assert reloaded.error == "operator_relay: inbox_mapping_missing"
+    assert "99" not in reloaded.error
 
 
 @pytest.mark.asyncio
 async def test_relay_ambiguous_without_map_still_blocks(
     session_maker,
+    monkeypatch,
 ) -> None:
     """Safety guard intact: no map + ambiguous phone_number_id → still blocked."""
+    monkeypatch.setattr(wiw, "SessionLocal", session_maker)
+    monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_relay_enabled", True)
+    monkeypatch.setattr(wiw.settings, "chatwoot_inbox_company_map", "{}")
     provider = _FakeProvider()
 
     async with session_maker() as session:
@@ -1890,17 +1869,9 @@ async def test_relay_ambiguous_without_map_still_blocks(
             await session.flush()
             evt_id = evt.id
 
-            from altegio_bot.settings import settings as _s
+            evt_id = evt.id
 
-            orig_relay = _s.chatwoot_operator_relay_enabled
-            orig_map = _s.chatwoot_inbox_company_map
-            _s.chatwoot_operator_relay_enabled = True
-            _s.chatwoot_inbox_company_map = "{}"  # not configured
-            try:
-                await handle_event(session, evt, provider)
-            finally:
-                _s.chatwoot_operator_relay_enabled = orig_relay
-                _s.chatwoot_inbox_company_map = orig_map
+    await wiw.process_one_event(evt_id, provider)
 
     assert len(provider.sent) == 0
     async with session_maker() as session:
@@ -1918,6 +1889,8 @@ async def test_relay_ambiguous_without_map_still_blocks(
 @pytest.mark.asyncio
 async def test_private_note_only_window_open_sends_text(session_maker, monkeypatch) -> None:
     """Default mode (private_note_only) + window open → sends free-form text."""
+    monkeypatch.setattr(wiw, "SessionLocal", session_maker)
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_relay_enabled", True)
     monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
     provider = _FakeProvider(wamid="wamid.PNO_OPEN")
 
@@ -1943,14 +1916,9 @@ async def test_private_note_only_window_open_sends_text(session_maker, monkeypat
             session.add(evt)
             await session.flush()
 
-            from altegio_bot.settings import settings as _s
+            evt_id = evt.id
 
-            orig_relay = _s.chatwoot_operator_relay_enabled
-            _s.chatwoot_operator_relay_enabled = True
-            try:
-                await handle_event(session, evt, provider)
-            finally:
-                _s.chatwoot_operator_relay_enabled = orig_relay
+    await wiw.process_one_event(evt_id, provider)
 
     # Must send text, must NOT send template.
     assert len(provider.sent) == 1
@@ -1972,6 +1940,10 @@ async def test_private_note_only_window_open_sends_text(session_maker, monkeypat
 @pytest.mark.asyncio
 async def test_reopen_mode_window_open_sends_text(session_maker, monkeypatch) -> None:
     """mode=reopen_template + window open → sends free-form text (not template)."""
+    monkeypatch.setattr(wiw, "SessionLocal", session_maker)
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_relay_enabled", True)
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_closed_window_mode", "reopen_template")
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_reopen_template_name", "test_reopen_tpl")
     monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
     provider = _FakeProvider(wamid="wamid.WIN_OPEN")
 
@@ -1997,20 +1969,9 @@ async def test_reopen_mode_window_open_sends_text(session_maker, monkeypatch) ->
             session.add(evt)
             await session.flush()
 
-            from altegio_bot.settings import settings as _s
+            evt_id = evt.id
 
-            orig_relay = _s.chatwoot_operator_relay_enabled
-            orig_mode = _s.chatwoot_operator_closed_window_mode
-            orig_name = _s.chatwoot_operator_reopen_template_name
-            _s.chatwoot_operator_relay_enabled = True
-            _s.chatwoot_operator_closed_window_mode = "reopen_template"
-            _s.chatwoot_operator_reopen_template_name = "test_reopen_tpl"
-            try:
-                await handle_event(session, evt, provider)
-            finally:
-                _s.chatwoot_operator_relay_enabled = orig_relay
-                _s.chatwoot_operator_closed_window_mode = orig_mode
-                _s.chatwoot_operator_reopen_template_name = orig_name
+    await wiw.process_one_event(evt_id, provider)
 
     assert len(provider.sent) == 1
     assert len(provider.templates_sent) == 0
@@ -2031,6 +1992,8 @@ async def test_reopen_mode_window_open_sends_text(session_maker, monkeypatch) ->
 @pytest.mark.asyncio
 async def test_operator_reply_to_inbound_uses_native_whatsapp_context(session_maker, monkeypatch) -> None:
     """Chatwoot Reply to inbound customer message sends Meta context.message_id."""
+    monkeypatch.setattr(wiw, "SessionLocal", session_maker)
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_relay_enabled", True)
     monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
     provider = _FakeProvider(wamid="wamid.OP_REPLY_NEW")
     phone = "+381638400431"
@@ -2067,14 +2030,9 @@ async def test_operator_reply_to_inbound_uses_native_whatsapp_context(session_ma
             session.add(evt)
             await session.flush()
 
-            from altegio_bot.settings import settings as _s
+            evt_id = evt.id
 
-            orig_relay = _s.chatwoot_operator_relay_enabled
-            _s.chatwoot_operator_relay_enabled = True
-            try:
-                await handle_event(session, evt, provider)
-            finally:
-                _s.chatwoot_operator_relay_enabled = orig_relay
+    await wiw.process_one_event(evt_id, provider)
 
     assert len(provider.sent) == 1
     assert provider.sent[0]["reply_to_provider_message_id"] == "wamid.INBOUND"
@@ -2100,6 +2058,8 @@ async def test_operator_reply_to_previous_operator_message_uses_outbox_context(
     monkeypatch,
 ) -> None:
     """Chatwoot Reply to a prior operator message resolves via OutboxMessage."""
+    monkeypatch.setattr(wiw, "SessionLocal", session_maker)
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_relay_enabled", True)
     monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
     provider = _FakeProvider(wamid="wamid.OP_SECOND")
     phone = "+381638400431"
@@ -2148,14 +2108,9 @@ async def test_operator_reply_to_previous_operator_message_uses_outbox_context(
             session.add(evt)
             await session.flush()
 
-            from altegio_bot.settings import settings as _s
+            evt_id = evt.id
 
-            orig_relay = _s.chatwoot_operator_relay_enabled
-            _s.chatwoot_operator_relay_enabled = True
-            try:
-                await handle_event(session, evt, provider)
-            finally:
-                _s.chatwoot_operator_relay_enabled = orig_relay
+    await wiw.process_one_event(evt_id, provider)
 
     assert len(provider.sent) == 1
     assert provider.sent[0]["reply_to_provider_message_id"] == "wamid.OPERATOR"
@@ -2175,6 +2130,8 @@ async def test_operator_reply_to_previous_operator_message_uses_outbox_context(
 @pytest.mark.asyncio
 async def test_operator_reply_missing_mapping_sends_plain_text(session_maker, monkeypatch) -> None:
     """Missing Chatwoot→wamid mapping must not block operator relay."""
+    monkeypatch.setattr(wiw, "SessionLocal", session_maker)
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_relay_enabled", True)
     monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
     provider = _FakeProvider(wamid="wamid.OP_PLAIN_MISSING")
     phone = "+381638400431"
@@ -2202,14 +2159,9 @@ async def test_operator_reply_missing_mapping_sends_plain_text(session_maker, mo
             session.add(evt)
             await session.flush()
 
-            from altegio_bot.settings import settings as _s
+            evt_id = evt.id
 
-            orig_relay = _s.chatwoot_operator_relay_enabled
-            _s.chatwoot_operator_relay_enabled = True
-            try:
-                await handle_event(session, evt, provider)
-            finally:
-                _s.chatwoot_operator_relay_enabled = orig_relay
+    await wiw.process_one_event(evt_id, provider)
 
     assert len(provider.sent) == 1
     assert provider.sent[0]["reply_to_provider_message_id"] is None
@@ -2229,6 +2181,8 @@ async def test_operator_reply_missing_mapping_sends_plain_text(session_maker, mo
 @pytest.mark.asyncio
 async def test_operator_reply_cross_conversation_sends_plain_text(session_maker, monkeypatch) -> None:
     """A mapping in another Chatwoot conversation must not become Meta context."""
+    monkeypatch.setattr(wiw, "SessionLocal", session_maker)
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_relay_enabled", True)
     monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
     provider = _FakeProvider(wamid="wamid.OP_PLAIN_CROSS")
     phone = "+381638400431"
@@ -2263,14 +2217,9 @@ async def test_operator_reply_cross_conversation_sends_plain_text(session_maker,
             session.add(evt)
             await session.flush()
 
-            from altegio_bot.settings import settings as _s
+            evt_id = evt.id
 
-            orig_relay = _s.chatwoot_operator_relay_enabled
-            _s.chatwoot_operator_relay_enabled = True
-            try:
-                await handle_event(session, evt, provider)
-            finally:
-                _s.chatwoot_operator_relay_enabled = orig_relay
+    await wiw.process_one_event(evt_id, provider)
 
     assert len(provider.sent) == 1
     assert provider.sent[0]["reply_to_provider_message_id"] is None
@@ -2289,6 +2238,10 @@ async def test_operator_reply_cross_conversation_sends_plain_text(session_maker,
 async def test_private_note_only_window_closed(session_maker, monkeypatch) -> None:
     """Default mode (private_note_only) + window closed → blocks send, private note, canceled outbox."""
     monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
+    monkeypatch.setattr(wiw, "SessionLocal", session_maker)
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_relay_enabled", True)
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_closed_window_mode", "private_note_only")
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_reopen_private_note_enabled", True)
     provider = _FakeProvider(wamid="wamid.SHOULD_NOT_APPEAR_PNO")
 
     mock_cw_class = MagicMock()
@@ -2323,24 +2276,10 @@ async def test_private_note_only_window_closed(session_maker, monkeypatch) -> No
             session.add(evt)
             await session.flush()
 
-            from altegio_bot.settings import settings as _s
+            evt_id = evt.id
 
-            orig_relay = _s.chatwoot_operator_relay_enabled
-            orig_mode = _s.chatwoot_operator_closed_window_mode
-            orig_note = _s.chatwoot_operator_reopen_private_note_enabled
-            _s.chatwoot_operator_relay_enabled = True
-            _s.chatwoot_operator_closed_window_mode = "private_note_only"
-            _s.chatwoot_operator_reopen_private_note_enabled = True
-            try:
-                with patch(
-                    "altegio_bot.workers.whatsapp_inbox_worker.ChatwootClient",
-                    mock_cw_class,
-                ):
-                    await handle_event(session, evt, provider)
-            finally:
-                _s.chatwoot_operator_relay_enabled = orig_relay
-                _s.chatwoot_operator_closed_window_mode = orig_mode
-                _s.chatwoot_operator_reopen_private_note_enabled = orig_note
+    with patch("altegio_bot.workers.whatsapp_inbox_worker.ChatwootClient", mock_cw_class):
+        await wiw.process_one_event(evt_id, provider)
 
     # Must NOT have sent anything to Meta.
     assert len(provider.sent) == 0
@@ -2376,6 +2315,11 @@ async def test_private_note_only_window_closed(session_maker, monkeypatch) -> No
 async def test_reopen_template_window_closed(session_maker, monkeypatch) -> None:
     """mode=reopen_template + window closed → sends reopen template, not text."""
     monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
+    monkeypatch.setattr(wiw, "SessionLocal", session_maker)
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_relay_enabled", True)
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_closed_window_mode", "reopen_template")
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_reopen_template_name", "kitilash_reopen")
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_reopen_private_note_enabled", True)
     provider = _FakeProvider(wamid="wamid.REOPEN_TPL")
 
     mock_cw_class = MagicMock()
@@ -2410,27 +2354,10 @@ async def test_reopen_template_window_closed(session_maker, monkeypatch) -> None
             session.add(evt)
             await session.flush()
 
-            from altegio_bot.settings import settings as _s
+            evt_id = evt.id
 
-            orig_relay = _s.chatwoot_operator_relay_enabled
-            orig_mode = _s.chatwoot_operator_closed_window_mode
-            orig_name = _s.chatwoot_operator_reopen_template_name
-            orig_note = _s.chatwoot_operator_reopen_private_note_enabled
-            _s.chatwoot_operator_relay_enabled = True
-            _s.chatwoot_operator_closed_window_mode = "reopen_template"
-            _s.chatwoot_operator_reopen_template_name = "kitilash_reopen"
-            _s.chatwoot_operator_reopen_private_note_enabled = True
-            try:
-                with patch(
-                    "altegio_bot.workers.whatsapp_inbox_worker.ChatwootClient",
-                    mock_cw_class,
-                ):
-                    await handle_event(session, evt, provider)
-            finally:
-                _s.chatwoot_operator_relay_enabled = orig_relay
-                _s.chatwoot_operator_closed_window_mode = orig_mode
-                _s.chatwoot_operator_reopen_template_name = orig_name
-                _s.chatwoot_operator_reopen_private_note_enabled = orig_note
+    with patch("altegio_bot.workers.whatsapp_inbox_worker.ChatwootClient", mock_cw_class):
+        await wiw.process_one_event(evt_id, provider)
 
     # Must NOT have sent text; MUST have sent template.
     assert len(provider.sent) == 0
@@ -2466,8 +2393,15 @@ async def test_reopen_template_window_closed(session_maker, monkeypatch) -> None
 
 @pytest.mark.asyncio
 async def test_reopen_template_send_failure_sets_error(session_maker, monkeypatch) -> None:
-    """When template send fails, event.error is set and no OutboxMessage is created."""
+    """When template send fails permanently, the durable Outbox row is marked
+    'failed' (not deleted) and a stable event error is set; no auto-retry."""
     monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
+    monkeypatch.setattr(wiw, "SessionLocal", session_maker)
+    monkeypatch.setattr(wiw.settings, "meta_circuit_breaker_enabled", False)
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_relay_enabled", True)
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_closed_window_mode", "reopen_template")
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_reopen_template_name", "kitilash_reopen")
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_reopen_private_note_enabled", True)
     provider = _ErrorProvider()
 
     mock_cw_class = MagicMock()
@@ -2507,42 +2441,27 @@ async def test_reopen_template_send_failure_sets_error(session_maker, monkeypatc
             await session.flush()
             evt_id = evt.id
 
-            from altegio_bot.settings import settings as _s
+    with patch("altegio_bot.workers.whatsapp_inbox_worker.ChatwootClient", mock_cw_class):
+        await wiw.process_one_event(evt_id, provider)
 
-            orig_relay = _s.chatwoot_operator_relay_enabled
-            orig_mode = _s.chatwoot_operator_closed_window_mode
-            orig_name = _s.chatwoot_operator_reopen_template_name
-            orig_note = _s.chatwoot_operator_reopen_private_note_enabled
-            _s.chatwoot_operator_relay_enabled = True
-            _s.chatwoot_operator_closed_window_mode = "reopen_template"
-            _s.chatwoot_operator_reopen_template_name = "kitilash_reopen"
-            _s.chatwoot_operator_reopen_private_note_enabled = True
-            try:
-                with patch(
-                    "altegio_bot.workers.whatsapp_inbox_worker.ChatwootClient",
-                    mock_cw_class,
-                ):
-                    await handle_event(session, evt, provider)
-            finally:
-                _s.chatwoot_operator_relay_enabled = orig_relay
-                _s.chatwoot_operator_closed_window_mode = orig_mode
-                _s.chatwoot_operator_reopen_template_name = orig_name
-                _s.chatwoot_operator_reopen_private_note_enabled = orig_note
-
-    # event.error must be set.
+    # An indeterminate template send error is conservatively 'unknown', with a
+    # stable event marker and no automatic resend.
     async with session_maker() as session:
         reloaded = await session.get(WhatsAppEvent, evt_id)
     assert reloaded is not None
-    assert reloaded.error is not None
-    assert "reopen template failed" in reloaded.error
+    assert reloaded.error == "operator_relay: delivery outcome unknown"
 
-    # Failure note must have been attempted in Chatwoot.
+    # A truthful manual-review note must have been sent to Chatwoot.
     mock_cw.send_message.assert_called_once()
 
-    # No successful OutboxMessage should exist.
+    # The durable Outbox row survives as 'unknown' (never a successful 'sent' row).
     async with session_maker() as session:
         result = await session.execute(select(OutboxMessage).where(OutboxMessage.phone_e164 == "+49111222003"))
-        assert result.scalar_one_or_none() is None
+        ob = result.scalar_one_or_none()
+    assert ob is not None
+    assert ob.status == "unknown"
+    assert ob.provider_message_id is None
+    assert ob.meta.get("manual_review_required") is True
 
 
 # ---------------------------------------------------------------------------
@@ -2553,6 +2472,8 @@ async def test_reopen_template_send_failure_sets_error(session_maker, monkeypatc
 @pytest.mark.asyncio
 async def test_relay_phone_without_plus_normalized(session_maker, monkeypatch) -> None:
     """recipient_phone without leading '+' is normalized; send uses E.164 form."""
+    monkeypatch.setattr(wiw, "SessionLocal", session_maker)
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_relay_enabled", True)
     monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
     provider = _FakeProvider(wamid="wamid.NORM_NOPLUS")
 
@@ -2579,14 +2500,9 @@ async def test_relay_phone_without_plus_normalized(session_maker, monkeypatch) -
             session.add(evt)
             await session.flush()
 
-            from altegio_bot.settings import settings as _s
+            evt_id = evt.id
 
-            orig_relay = _s.chatwoot_operator_relay_enabled
-            _s.chatwoot_operator_relay_enabled = True
-            try:
-                await handle_event(session, evt, provider)
-            finally:
-                _s.chatwoot_operator_relay_enabled = orig_relay
+    await wiw.process_one_event(evt_id, provider)
 
     assert len(provider.sent) == 1
     assert provider.sent[0]["phone_e164"] == "+49111222333"
@@ -2603,6 +2519,8 @@ async def test_relay_phone_without_plus_normalized(session_maker, monkeypatch) -
 @pytest.mark.asyncio
 async def test_relay_phone_with_spaces_normalized(session_maker, monkeypatch) -> None:
     """recipient_phone with spaces is normalized to compact E.164 before send."""
+    monkeypatch.setattr(wiw, "SessionLocal", session_maker)
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_relay_enabled", True)
     monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
     provider = _FakeProvider(wamid="wamid.NORM_SPACES")
 
@@ -2628,14 +2546,9 @@ async def test_relay_phone_with_spaces_normalized(session_maker, monkeypatch) ->
             session.add(evt)
             await session.flush()
 
-            from altegio_bot.settings import settings as _s
+            evt_id = evt.id
 
-            orig_relay = _s.chatwoot_operator_relay_enabled
-            _s.chatwoot_operator_relay_enabled = True
-            try:
-                await handle_event(session, evt, provider)
-            finally:
-                _s.chatwoot_operator_relay_enabled = orig_relay
+    await wiw.process_one_event(evt_id, provider)
 
     assert len(provider.sent) == 1
     assert provider.sent[0]["phone_e164"] == "+49111222333"
@@ -2652,6 +2565,8 @@ async def test_relay_phone_with_spaces_normalized(session_maker, monkeypatch) ->
 @pytest.mark.asyncio
 async def test_relay_invalid_phone_sets_error(session_maker, monkeypatch) -> None:
     """recipient_phone='abc' (no digits) → event.error set, no send, no OutboxMessage."""
+    monkeypatch.setattr(wiw, "SessionLocal", session_maker)
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_relay_enabled", True)
     monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
     provider = _FakeProvider(wamid="wamid.SHOULD_NOT_APPEAR_BADPHONE")
 
@@ -2677,14 +2592,9 @@ async def test_relay_invalid_phone_sets_error(session_maker, monkeypatch) -> Non
             await session.flush()
             evt_id = evt.id
 
-            from altegio_bot.settings import settings as _s
+            evt_id = evt.id
 
-            orig_relay = _s.chatwoot_operator_relay_enabled
-            _s.chatwoot_operator_relay_enabled = True
-            try:
-                await handle_event(session, evt, provider)
-            finally:
-                _s.chatwoot_operator_relay_enabled = orig_relay
+    await wiw.process_one_event(evt_id, provider)
 
     assert len(provider.sent) == 0
     assert len(provider.templates_sent) == 0
@@ -2711,6 +2621,10 @@ async def test_relay_invalid_phone_sets_error(session_maker, monkeypatch) -> Non
 async def test_private_note_only_note_failure_surfaced(session_maker, monkeypatch) -> None:
     """private_note_only + window closed + note send raises → error surfaced in event, outbox, meta."""
     monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
+    monkeypatch.setattr(wiw, "SessionLocal", session_maker)
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_relay_enabled", True)
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_closed_window_mode", "private_note_only")
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_reopen_private_note_enabled", True)
     provider = _FakeProvider(wamid="wamid.SHOULD_NOT_APPEAR_NOTE_FAIL")
 
     mock_cw_class = MagicMock()
@@ -2744,24 +2658,10 @@ async def test_private_note_only_note_failure_surfaced(session_maker, monkeypatc
             await session.flush()
             evt_id = evt.id
 
-            from altegio_bot.settings import settings as _s
+            evt_id = evt.id
 
-            orig_relay = _s.chatwoot_operator_relay_enabled
-            orig_mode = _s.chatwoot_operator_closed_window_mode
-            orig_note = _s.chatwoot_operator_reopen_private_note_enabled
-            _s.chatwoot_operator_relay_enabled = True
-            _s.chatwoot_operator_closed_window_mode = "private_note_only"
-            _s.chatwoot_operator_reopen_private_note_enabled = True
-            try:
-                with patch(
-                    "altegio_bot.workers.whatsapp_inbox_worker.ChatwootClient",
-                    mock_cw_class,
-                ):
-                    await handle_event(session, evt, provider)
-            finally:
-                _s.chatwoot_operator_relay_enabled = orig_relay
-                _s.chatwoot_operator_closed_window_mode = orig_mode
-                _s.chatwoot_operator_reopen_private_note_enabled = orig_note
+    with patch("altegio_bot.workers.whatsapp_inbox_worker.ChatwootClient", mock_cw_class):
+        await wiw.process_one_event(evt_id, provider)
 
     # Must NOT have sent anything to Meta.
     assert len(provider.sent) == 0
@@ -2781,10 +2681,15 @@ async def test_private_note_only_note_failure_surfaced(session_maker, monkeypatc
 
     assert ob is not None
     assert ob.status == "canceled"
-    assert ob.error is not None
-    assert "private note failed" in ob.error
-    assert ob.meta.get("private_note_status") == "failed"
-    assert ob.meta.get("private_note_error") is not None
+    # Primary lifecycle error keeps the cancel reason — the private-note failure
+    # must NOT overwrite it; the note outcome lives only in metadata.
+    assert ob.error == "operator_relay: canceled (customer service window closed)"
+    assert "private note failed" not in (ob.error or "")
+    # Bounded retry: a first failure stays retryable rather than terminal.
+    assert ob.meta.get("private_note_status") == "pending"
+    assert ob.meta.get("private_note_attempts") == 1
+    assert ob.meta.get("private_note_error") == "RuntimeError"
+    assert ob.meta.get("private_note_updated_at") is not None
 
 
 # ---------------------------------------------------------------------------
@@ -2867,10 +2772,15 @@ async def test_operator_relay_text_transient_error_closes_circuit(
 ) -> None:
     """Window-open text send returns a transient error → circuit closes.
 
-    The send is attempted once, no template fallback runs, the circuit is
-    closed with a safe reason, and a PII-free canceled audit row is written.
+    The send is attempted once, no template fallback runs, the circuit is closed
+    with a safe reason, and the durable attempt row becomes 'unknown' (ambiguous
+    outcome, manual review) — the transient error cannot prove Meta rejected it.
     """
     monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
+    monkeypatch.setattr(wiw, "SessionLocal", session_maker)
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_relay_enabled", True)
+    monkeypatch.setattr(wiw.settings, "meta_circuit_breaker_enabled", True)
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_reopen_private_note_enabled", False)
     _patch_circuit_close_to_test_db(monkeypatch, session_maker)
 
     provider = _TransientSendErrorProvider(err_message)
@@ -2897,20 +2807,9 @@ async def test_operator_relay_text_transient_error_closes_circuit(
             session.add(evt)
             await session.flush()
 
-            from altegio_bot.settings import settings as _s
+            evt_id = evt.id
 
-            orig_relay = _s.chatwoot_operator_relay_enabled
-            orig_cb = _s.meta_circuit_breaker_enabled
-            orig_note = _s.chatwoot_operator_reopen_private_note_enabled
-            _s.chatwoot_operator_relay_enabled = True
-            _s.meta_circuit_breaker_enabled = True
-            _s.chatwoot_operator_reopen_private_note_enabled = False
-            try:
-                await handle_event(session, evt, provider)
-            finally:
-                _s.chatwoot_operator_relay_enabled = orig_relay
-                _s.meta_circuit_breaker_enabled = orig_cb
-                _s.chatwoot_operator_reopen_private_note_enabled = orig_note
+    await wiw.process_one_event(evt_id, provider)
 
     # The send was attempted exactly once; no template fallback.
     assert len(provider.sent) == 1
@@ -2923,36 +2822,40 @@ async def test_operator_relay_text_transient_error_closes_circuit(
     assert state.last_error_kind == expected_kind
     assert state.last_error_code == expected_code
 
-    # A canceled, PII-free audit row was written.
+    # The durable attempt row is now 'unknown' (ambiguous), not a second canceled
+    # row: a transient error cannot prove Meta rejected the message.
     async with session_maker() as session:
         outbox = (
             await session.execute(select(OutboxMessage).where(OutboxMessage.chatwoot_conversation_id == 7010))
         ).scalar_one()
-    assert outbox.status == "canceled"
+    assert outbox.status == "unknown"
     assert outbox.provider_message_id is None
-    assert outbox.error == "Meta transient error: operator relay paused and circuit closed"
-    assert outbox.meta["cancel_reason"] == "meta_transient_send_error"
-    assert outbox.meta["attempted_send_type"] == "text"
-    assert outbox.meta["circuit_state"] == "closed"
-    assert outbox.meta["error_kind"] == expected_kind
-    # error_code is omitted from meta when None (is_transient/network kinds).
+    assert outbox.error == "operator_relay: delivery outcome unknown"
+    assert outbox.meta.get("manual_review_required") is True
+    assert outbox.meta.get("recovery_reason") == "indeterminate_send_outcome"
+    assert outbox.meta.get("error_kind") == expected_kind
     assert outbox.meta.get("error_code") == expected_code
-    assert outbox.meta["phone_number_id"] == "PNID_TRANSIENT"
-    # No PII leaked into the audit metadata.
-    assert "agent_name" not in outbox.meta
-    assert "reply_to_chatwoot_message_id" not in outbox.meta
-    assert "content_attributes" not in outbox.meta
-    # The operator's text must never be stored on the audit row.
-    assert outbox.body == "[operator relay canceled: Meta transient send error]"
-    assert outbox.body != "Transient please"
-    assert "Transient please" not in (outbox.error or "")
-    assert "Transient please" not in json.dumps(outbox.meta)
+
+    # The source event carries the stable unknown marker (manual review).
+    async with session_maker() as session:
+        reloaded = await session.get(WhatsAppEvent, evt_id)
+    assert reloaded.error == "operator_relay: delivery outcome unknown"
+
+    # The raw provider error text never leaks into the persisted error/meta.
+    assert err_message not in (outbox.error or "")
+    assert err_message not in json.dumps(outbox.meta)
 
 
 @pytest.mark.asyncio
 async def test_operator_relay_template_transient_error_closes_circuit(session_maker, monkeypatch) -> None:
     """Window-closed reopen-template send returns a transient error → circuit closes."""
     monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
+    monkeypatch.setattr(wiw, "SessionLocal", session_maker)
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_relay_enabled", True)
+    monkeypatch.setattr(wiw.settings, "meta_circuit_breaker_enabled", True)
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_closed_window_mode", "reopen_template")
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_reopen_template_name", "test_reopen_tpl")
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_reopen_private_note_enabled", False)
     _patch_circuit_close_to_test_db(monkeypatch, session_maker)
 
     provider = _TransientSendErrorProvider("Meta send_template failed status=503")
@@ -2979,26 +2882,9 @@ async def test_operator_relay_template_transient_error_closes_circuit(session_ma
             session.add(evt)
             await session.flush()
 
-            from altegio_bot.settings import settings as _s
+            evt_id = evt.id
 
-            orig_relay = _s.chatwoot_operator_relay_enabled
-            orig_cb = _s.meta_circuit_breaker_enabled
-            orig_mode = _s.chatwoot_operator_closed_window_mode
-            orig_name = _s.chatwoot_operator_reopen_template_name
-            orig_note = _s.chatwoot_operator_reopen_private_note_enabled
-            _s.chatwoot_operator_relay_enabled = True
-            _s.meta_circuit_breaker_enabled = True
-            _s.chatwoot_operator_closed_window_mode = "reopen_template"
-            _s.chatwoot_operator_reopen_template_name = "test_reopen_tpl"
-            _s.chatwoot_operator_reopen_private_note_enabled = False
-            try:
-                await handle_event(session, evt, provider)
-            finally:
-                _s.chatwoot_operator_relay_enabled = orig_relay
-                _s.meta_circuit_breaker_enabled = orig_cb
-                _s.chatwoot_operator_closed_window_mode = orig_mode
-                _s.chatwoot_operator_reopen_template_name = orig_name
-                _s.chatwoot_operator_reopen_private_note_enabled = orig_note
+    await wiw.process_one_event(evt_id, provider)
 
     # The template send was attempted once; no free-form text send.
     assert len(provider.templates_sent) == 1
@@ -3010,32 +2896,39 @@ async def test_operator_relay_template_transient_error_closes_circuit(session_ma
     assert state.last_error_kind == "http"
     assert state.last_error_code == "503"
 
+    # The durable template attempt row is now 'unknown' (ambiguous outcome).
     async with session_maker() as session:
         outbox = (
             await session.execute(select(OutboxMessage).where(OutboxMessage.chatwoot_conversation_id == 7011))
         ).scalar_one()
-    assert outbox.status == "canceled"
-    assert outbox.error == "Meta transient error: operator relay paused and circuit closed"
-    assert outbox.meta["attempted_send_type"] == "template"
-    assert outbox.meta["circuit_state"] == "closed"
-    # Template params/name must not leak into the safe audit.
-    assert "template" not in outbox.meta
-    assert "attempted_template" not in outbox.meta
-    # The operator's text must never be stored on the audit row.
-    assert outbox.body == "[operator relay canceled: Meta transient send error]"
-    assert outbox.body != "Transient template please"
-    assert "Transient template please" not in (outbox.error or "")
-    assert "Transient template please" not in json.dumps(outbox.meta)
+    assert outbox.status == "unknown"
+    assert outbox.error == "operator_relay: delivery outcome unknown"
+    assert outbox.meta.get("send_type") == "template"
+    assert outbox.meta.get("manual_review_required") is True
+    assert outbox.meta.get("recovery_reason") == "indeterminate_send_outcome"
+    assert outbox.meta.get("error_kind") == "http"
+    assert outbox.meta.get("error_code") == "503"
+
+    async with session_maker() as session:
+        reloaded = await session.get(WhatsAppEvent, evt_id)
+    assert reloaded.error == "operator_relay: delivery outcome unknown"
+
+    # The raw provider error text never leaks into the persisted error/meta.
+    assert "status=503" not in (outbox.error or "")
+    assert "send_template failed" not in json.dumps(outbox.meta)
 
 
 @pytest.mark.asyncio
 async def test_operator_relay_permanent_error_does_not_close_circuit(session_maker, monkeypatch) -> None:
     """A permanent (token-expired) send error must NOT close the circuit.
 
-    The existing permanent-failure path runs instead: event.error is set and no
-    audit OutboxMessage is created.
+    The permanent-failure path runs instead: the durable row is marked 'failed'
+    with a stable event error, and the circuit is left open.
     """
     monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
+    monkeypatch.setattr(wiw, "SessionLocal", session_maker)
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_relay_enabled", True)
+    monkeypatch.setattr(wiw.settings, "meta_circuit_breaker_enabled", True)
 
     close_calls: list[dict[str, Any]] = []
 
@@ -3070,29 +2963,22 @@ async def test_operator_relay_permanent_error_does_not_close_circuit(session_mak
             await session.flush()
             evt_id = evt.id
 
-            from altegio_bot.settings import settings as _s
+            evt_id = evt.id
 
-            orig_relay = _s.chatwoot_operator_relay_enabled
-            orig_cb = _s.meta_circuit_breaker_enabled
-            _s.chatwoot_operator_relay_enabled = True
-            _s.meta_circuit_breaker_enabled = True
-            try:
-                await handle_event(session, evt, provider)
-            finally:
-                _s.chatwoot_operator_relay_enabled = orig_relay
-                _s.meta_circuit_breaker_enabled = orig_cb
+    await wiw.process_one_event(evt_id, provider)
 
-    # Circuit close was never invoked.
+    # Circuit close was never invoked for a permanent error.
     assert close_calls == []
 
-    # Existing permanent-failure behaviour preserved.
+    # Permanent failure: durable row is 'failed' with a stable event error.
     async with session_maker() as session:
         reloaded = await session.get(WhatsAppEvent, evt_id)
     assert reloaded is not None
-    assert reloaded.error is not None
-    assert "send failed" in reloaded.error
+    assert reloaded.error == "operator_relay: send failed (permanent)"
 
-    # No audit OutboxMessage was created for the permanent error.
     async with session_maker() as session:
-        result = await session.execute(select(OutboxMessage).where(OutboxMessage.chatwoot_conversation_id == 7012))
-        assert result.scalar_one_or_none() is None
+        outbox = (
+            await session.execute(select(OutboxMessage).where(OutboxMessage.chatwoot_conversation_id == 7012))
+        ).scalar_one()
+    assert outbox.status == "failed"
+    assert outbox.provider_message_id is None

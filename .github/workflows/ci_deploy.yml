@@ -151,8 +151,17 @@ jobs:
           asyncio.run(main())
           PY
 
+      # Runs first and as its own step so it can never degrade into a green
+      # skip: ALTEGIO_REQUIRE_MIGTEST=1 turns "cannot create the disposable
+      # database" into a failure. It proves an environment that applied only the
+      # early base revision still gets the raw-body columns.
+      - name: Run required EasyWeek migration compatibility test
+        env:
+          ALTEGIO_REQUIRE_MIGTEST: "1"
+        run: uv run pytest -q src/altegio_bot/tests/test_easyweek_migration_integration.py
+
       - name: Run tests
-        run: uv run pytest -q
+        run: uv run pytest -q --ignore=src/altegio_bot/tests/test_easyweek_migration_integration.py
 
   deploy:
     name: Deploy to Server

@@ -1101,14 +1101,18 @@ def test_metrics_origin_meta() -> None:
 
 
 @pytest.mark.asyncio
-async def test_operator_relay_runs_before_inbound_and_not_forwarded(session_maker) -> None:
+async def test_operator_relay_runs_before_inbound_and_not_forwarded(session_maker, monkeypatch) -> None:
     """Operator relay path runs first and is never forwarded back as inbound.
 
     Delivery: the operator text is sent to Meta (one provider.send) and an
     OutboxMessage(message_source='operator') is created.  It must NOT be
     forwarded into Chatwoot as inbound customer text.
     """
-    from altegio_bot.settings import settings as _s
+    import altegio_bot.workers.whatsapp_inbox_worker as wiw
+
+    monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
+    monkeypatch.setattr(wiw, "SessionLocal", session_maker)
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_relay_enabled", True)
 
     provider = _CaptureProvider()
 
@@ -1159,21 +1163,14 @@ async def test_operator_relay_runs_before_inbound_and_not_forwarded(session_make
             evt = _make_event(_operator_relay_payload("Bis morgen"), dedupe_key="chatwoot_out:30:40")
             session.add(evt)
             await session.flush()
+            evt_id = evt.id
 
-            mock_cls, mock_inst = _mock_chatwoot_client()
-            original = _s.chatwoot_operator_relay_enabled
-            _s.chatwoot_operator_relay_enabled = True
-            try:
-                with patch(
-                    "altegio_bot.workers.whatsapp_inbox_worker.ChatwootClient",
-                    mock_cls,
-                ):
-                    await handle_event(session, evt, provider)
-            finally:
-                _s.chatwoot_operator_relay_enabled = original
+    mock_cls, mock_inst = _mock_chatwoot_client()
+    with patch("altegio_bot.workers.whatsapp_inbox_worker.ChatwootClient", mock_cls):
+        await wiw.process_one_event(evt_id, provider)
 
-        async with session.begin():
-            outbox = await session.scalar(select(OutboxMessage).where(OutboxMessage.message_source == "operator"))
+    async with session_maker() as session:
+        outbox = await session.scalar(select(OutboxMessage).where(OutboxMessage.message_source == "operator"))
 
     # Sent to Meta exactly once as the operator's text.
     assert provider.sent
@@ -1303,4 +1300,7 @@ def test_single_alembic_head() -> None:
     cfg.set_main_option("script_location", str(Path(__file__).resolve().parents[3] / "alembic"))
     script = ScriptDirectory.from_config(cfg)
     heads = list(script.get_heads())
-    assert heads == ["e9a7c6b5d4f3"], f"Expected single head e9a7c6b5d4f3, got {heads}"
+    # Assert the invariant (one head), not a specific revision id: pinning the id
+    # made every later migration fail this unrelated test. The head moves with
+    # each additive migration; a branch point is what must never happen.
+    assert len(heads) == 1, f"Expected exactly one Alembic head, got {heads}"

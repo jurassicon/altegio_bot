@@ -22,6 +22,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException, Request
@@ -31,10 +32,26 @@ from sqlalchemy.exc import IntegrityError
 from altegio_bot.db import SessionLocal
 from altegio_bot.models.models import WhatsAppEvent
 from altegio_bot.settings import settings
+from altegio_bot.webhooks.common import (
+    bounded_dedupe_key,
+    classify_message_type,
+    mapping_or_empty,
+    mask_query,
+    normalize_phone_candidate,
+    optional_chatwoot_id,
+    postgres_safe_json_value,
+    safe_headers,
+    safe_log_value,
+)
 
 logger = logging.getLogger("chatwoot_webhook")
 
 router = APIRouter()
+
+# Заголовок с HMAC-подписью Chatwoot. Он читается напрямую из живого запроса в
+# chatwoot_ingest (не из сохранённой копии), поэтому его можно и нужно
+# выбрасывать перед записью — в БД подпись не нужна.
+_CHATWOOT_SIGNATURE_HEADER = "x-chatwoot-signature"
 
 # Chatwoot sender types that represent human operators.
 # 'agent_bot' means the message was sent by an automated bot — never relay.
@@ -43,11 +60,6 @@ _HUMAN_SENDER_TYPES = frozenset({"agent", "supervisor", "user"})
 
 # content_type values that are purely internal — never relay to Meta.
 _SKIP_CONTENT_TYPES = frozenset({"activity", "input_select", "input_email"})
-
-
-def _safe_headers(request: Request) -> dict[str, str]:
-    deny = {"authorization", "cookie"}
-    return {k: v for k, v in request.headers.items() if k.lower() not in deny}
 
 
 def _verify_signature(body: bytes, signature: str | None) -> bool:
@@ -78,25 +90,28 @@ def _verify_signature(body: bytes, signature: str | None) -> bool:
     return False
 
 
-def _coerce_int(value: object) -> int | None:
-    """Coerce a Chatwoot numeric id (int or digit string) to int, else None."""
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value
-    if isinstance(value, str) and value.strip().isdigit():
-        return int(value.strip())
-    return None
-
-
 def _parse_timestamp(raw: object) -> int:
-    """Return Unix timestamp (seconds) from a Chatwoot created_at value."""
+    """Return Unix timestamp (seconds) from a Chatwoot created_at value.
+
+    ``created_at`` is sender-controlled and optional, so anything unusable falls
+    back to ``now`` rather than raising. Non-finite numbers must be rejected
+    BEFORE ``int()``: ``int(float("inf"))`` raises ``OverflowError`` (not caught
+    by ``(ValueError, TypeError)``), which otherwise surfaced as an unhandled
+    500. ``bool`` is excluded so ``True`` is not silently treated as ``1``.
+    """
+    now_ts = int(datetime.now(timezone.utc).timestamp())
     try:
         if isinstance(raw, str):
-            return int(datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp())
-        return int(raw or datetime.now(timezone.utc).timestamp())
-    except (ValueError, TypeError):
-        return int(datetime.now(timezone.utc).timestamp())
+            return int(datetime.fromisoformat(raw.strip().replace("Z", "+00:00")).timestamp())
+        if isinstance(raw, bool):
+            return now_ts
+        if isinstance(raw, (int, float)):
+            if not math.isfinite(raw):
+                return now_ts
+            return int(raw)
+        return now_ts
+    except (ValueError, TypeError, OverflowError):
+        return now_ts
 
 
 @router.post("/webhook/chatwoot")
@@ -114,61 +129,98 @@ async def chatwoot_ingest(request: Request) -> JSONResponse:
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
+    # Structural validation runs AFTER the HMAC check above, so a malformed body
+    # still gets 403 (not 400) when the signature is wrong. `[]`/`"text"`/`123`/
+    # `null` parse fine but every branch below treats payload as a mapping.
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="JSON payload must be an object")
+
     event_type = payload.get("event")
-    logger.info("chatwoot_webhook: event=%s", event_type)
+    # event приходит из тела и не валидируется до этой строки — экранируем,
+    # иначе значение вида "message_created\n2026-.. INFO forged" подделало бы
+    # отдельную запись в application-логе.
+    logger.info("chatwoot_webhook: event=%s", safe_log_value(event_type, limit=64))
 
     if event_type != "message_created":
-        return JSONResponse({"ok": True, "skipped": f"event={event_type}"})
+        # Стабильный reason code: отражать sender-controlled значение обратно
+        # клиенту нельзя — оно может быть некодируемым и уронить JSONResponse.
+        return JSONResponse({"ok": True, "skipped": "unsupported_event"})
 
-    message_type = payload.get("message_type")
+    # Exact-type discriminator: `message_type in (1, "outgoing")` would match
+    # True (True == 1) and 1.0, letting a boolean/float into the relay path.
+    message_path = classify_message_type(payload.get("message_type"))
+    if message_path is None:
+        return JSONResponse({"ok": True, "skipped": "unsupported_message_type"})
 
     # ------------------------------------------------------------------ #
     # Path 1: incoming customer message                                    #
     # ------------------------------------------------------------------ #
-    if message_type in (0, "incoming"):
+    if message_path == "incoming":
         return await _ingest_incoming(request, payload)
 
     # ------------------------------------------------------------------ #
     # Path 2: outgoing operator message (Meta-first relay)                 #
     # ------------------------------------------------------------------ #
-    if message_type in (1, "outgoing"):
-        private = payload.get("private", False)
-        content_type = payload.get("content_type", "text")
-        sender = payload.get("sender") or {}
-        sender_type = sender.get("type", "")
+    if message_path == "outgoing":
+        # `private`: absent → documented default False. Present → must be an
+        # exact bool; 0/1/"true"/[]/… must NOT be coerced (truthiness would let
+        # a malformed flag decide whether a private note is relayed to a
+        # customer). Fail closed with a stable reason, store nothing.
+        if "private" in payload:
+            private = payload["private"]
+            if type(private) is not bool:
+                return JSONResponse({"ok": True, "skipped": "invalid_private_flag"})
+        else:
+            private = False
+        # content_type is sender-controlled. Absent → documented default "text".
+        # Present but non-string ([]/{}/123/true/null) must FAIL CLOSED: coercing
+        # it to "" would let it fall through _SKIP_CONTENT_TYPES and a malformed
+        # internal Chatwoot event could then be relayed to Meta as a customer
+        # message. Reject with a stable skip and store nothing.
+        raw_content_type = payload.get("content_type", "text")
+        if not isinstance(raw_content_type, str):
+            return JSONResponse({"ok": True, "skipped": "unsupported_content_type"})
+        content_type = raw_content_type
+        sender = mapping_or_empty(payload.get("sender"))
+        # Same reason as content_type: sender_type is used in a set membership
+        # test, so an unhashable value must not reach it.
+        raw_sender_type = sender.get("type", "")
+        sender_type = raw_sender_type if isinstance(raw_sender_type, str) else ""
 
         # Skip private notes and internal activity events — always.
         if private:
             logger.debug(
                 "chatwoot_webhook: skipping private note conv_id=%s",
-                (payload.get("conversation") or {}).get("id"),
+                safe_log_value(mapping_or_empty(payload.get("conversation")).get("id"), limit=32),
             )
             return JSONResponse({"ok": True, "skipped": "private_note"})
 
         if content_type in _SKIP_CONTENT_TYPES:
-            return JSONResponse({"ok": True, "skipped": f"content_type={content_type}"})
+            return JSONResponse({"ok": True, "skipped": "unsupported_content_type"})
 
         # Only relay if feature flag is on and sender is a human operator.
         if settings.chatwoot_operator_relay_enabled and sender_type in _HUMAN_SENDER_TYPES:
             return await _ingest_operator_outgoing(request, payload)
 
-        conv_id = (payload.get("conversation") or {}).get("id")
+        conv_id = mapping_or_empty(payload.get("conversation")).get("id")
         msg_id = payload.get("id")
         logger.info(
             "chatwoot_webhook: skipping outgoing relay_enabled=%s"
-            " message_type=%s sender_type=%s private=%s"
+            " message_path=%s sender_type=%s private=%s"
             " content_type=%s conv_id=%s msg_id=%s",
             settings.chatwoot_operator_relay_enabled,
-            message_type,
-            sender_type,
+            message_path,
+            safe_log_value(sender_type, limit=32),
             private,
-            content_type,
-            conv_id,
-            msg_id,
+            safe_log_value(content_type, limit=32),
+            safe_log_value(conv_id, limit=32),
+            safe_log_value(msg_id, limit=32),
         )
-        return JSONResponse({"ok": True, "skipped": f"message_type={message_type}"})
+        # Covers both "relay flag is off" and "sender is not a human operator"
+        # (e.g. agent_bot). Stable code — never the sender-controlled value.
+        return JSONResponse({"ok": True, "skipped": "outgoing_not_relayed"})
 
-    return JSONResponse({"ok": True, "skipped": f"message_type={message_type}"})
+    return JSONResponse({"ok": True, "skipped": "unsupported_message_type"})
 
 
 async def _ingest_incoming(
@@ -180,18 +232,22 @@ async def _ingest_incoming(
     The whatsapp_inbox_worker will forward it to Chatwoot while loop
     prevention (_is_chatwoot_origin) ensures it is not re-sent to Meta.
     """
-    conversation = payload.get("conversation") or {}
-    sender = payload.get("sender") or {}
+    conversation = mapping_or_empty(payload.get("conversation"))
+    sender = mapping_or_empty(payload.get("sender"))
 
-    phone_e164 = sender.get("phone_number")
     text = payload.get("content", "")
     chatwoot_message_id = payload.get("id")
     chatwoot_conversation_id = conversation.get("id")
     timestamp_sec = _parse_timestamp(payload.get("created_at"))
 
-    if not phone_e164:
-        logger.warning("chatwoot_webhook: missing phone_number")
-        raise HTTPException(status_code=400, detail="Missing phone_number")
+    # Normalise the phone at ingress with the SAME contract the worker uses. A
+    # digitless string ("abc", "+", "---") normalises to None: accepting it would
+    # save an event the worker can never route, so Chatwoot would get a 200 and
+    # never retry. Reject up front instead. The raw value is PII — never logged.
+    phone_e164 = normalize_phone_candidate(sender.get("phone_number"))
+    if phone_e164 is None:
+        logger.warning("chatwoot_webhook: missing or invalid phone_number")
+        raise HTTPException(status_code=400, detail="Missing or invalid phone_number")
 
     if not chatwoot_message_id:
         logger.warning("chatwoot_webhook: missing message id")
@@ -223,23 +279,27 @@ async def _ingest_incoming(
         "_chatwoot": {
             "conversation_id": chatwoot_conversation_id,
             "message_id": chatwoot_message_id,
-            "account_id": (payload.get("account") or {}).get("id"),
+            "account_id": mapping_or_empty(payload.get("account")).get("id"),
         },
     }
 
-    dedupe_key = f"chatwoot:{chatwoot_conversation_id}:{chatwoot_message_id}"
+    # Составляющие приходят из тела: они могут быть нечисловыми, содержать NUL
+    # или быть длиннее VARCHAR(128). bounded_dedupe_key даёт побайтово тот же
+    # ключ для корректных коротких id и безопасный хэш-хвост для остальных.
+    dedupe_key = bounded_dedupe_key("chatwoot", chatwoot_conversation_id, chatwoot_message_id)
 
     return await _store_event(
         request=request,
         dedupe_key=dedupe_key,
         normalized_payload=normalized_payload,
-        chatwoot_conversation_id=chatwoot_conversation_id,
-        chatwoot_message_id=_coerce_int(chatwoot_message_id),
+        # BIGINT-колонки: невалидный id даёт NULL вместо падения INSERT.
+        chatwoot_conversation_id=optional_chatwoot_id(chatwoot_conversation_id),
+        chatwoot_message_id=optional_chatwoot_id(chatwoot_message_id),
+        # Только технические идентификаторы: телефон и текст сообщения — PII и в
+        # логи не попадают (сами данные сохраняются в БД, где доступ ограничен).
         log_ctx={
             "conv_id": chatwoot_conversation_id,
             "msg_id": chatwoot_message_id,
-            "phone": phone_e164,
-            "text": text[:50],
         },
     )
 
@@ -253,33 +313,40 @@ async def _ingest_operator_outgoing(
     The whatsapp_inbox_worker will pick this up, send it through Meta API,
     and create an OutboxMessage for canonical delivery lifecycle tracking.
     """
-    conversation = payload.get("conversation") or {}
-    sender = payload.get("sender") or {}
-    conv_meta = conversation.get("meta") or {}
-    contact = conv_meta.get("sender") or {}
+    conversation = mapping_or_empty(payload.get("conversation"))
+    sender = mapping_or_empty(payload.get("sender"))
+    conv_meta = mapping_or_empty(conversation.get("meta"))
+    contact = mapping_or_empty(conv_meta.get("sender"))
 
     chatwoot_message_id = payload.get("id")
     chatwoot_conversation_id = conversation.get("id")
     chatwoot_inbox_id = conversation.get("inbox_id")
-    text = payload.get("content", "")
-    content_attributes = payload.get("content_attributes") or {}
-    if not isinstance(content_attributes, dict):
-        content_attributes = {}
-    reply_to_chatwoot_message_id = _coerce_int(content_attributes.get("in_reply_to"))
+    # content is sender-controlled. A non-string ({}/[]/123/true/null) must FAIL
+    # CLOSED: it would otherwise reach the worker, be passed to the provider, and
+    # then crash OutboxMessage.body (TEXT) — a Meta send with no lifecycle row.
+    raw_content = payload.get("content", "")
+    if raw_content is not None and not isinstance(raw_content, str):
+        return JSONResponse({"ok": True, "skipped": "unsupported_content"})
+    text = raw_content or ""
+    content_attributes = mapping_or_empty(payload.get("content_attributes"))
+    reply_to_chatwoot_message_id = optional_chatwoot_id(content_attributes.get("in_reply_to"))
 
-    # Recipient phone is the contact (customer) in the conversation.
-    recipient_phone = contact.get("phone_number")
+    # Normalise the recipient (customer) phone at ingress with the shared
+    # contract. A digitless/non-string value → None → fail-closed skip: no relay
+    # event is stored and the worker is never handed an unroutable phone. The
+    # raw value is PII, so it is never logged.
+    recipient_phone = normalize_phone_candidate(contact.get("phone_number"))
 
-    if not recipient_phone:
+    if recipient_phone is None:
         logger.warning(
             "chatwoot_webhook: operator_outgoing missing recipient phone conv_id=%s msg_id=%s",
-            chatwoot_conversation_id,
-            chatwoot_message_id,
+            safe_log_value(chatwoot_conversation_id, limit=32),
+            safe_log_value(chatwoot_message_id, limit=32),
         )
         # Accept but skip — we cannot route without a phone number.
         return JSONResponse({"ok": True, "skipped": "no_recipient_phone"})
 
-    if not text:
+    if not text.strip():
         return JSONResponse({"ok": True, "skipped": "empty_content"})
 
     normalized_payload = {
@@ -298,26 +365,24 @@ async def _ingest_operator_outgoing(
         },
     }
 
-    dedupe_key = f"chatwoot_out:{chatwoot_conversation_id}:{chatwoot_message_id}"
+    dedupe_key = bounded_dedupe_key("chatwoot_out", chatwoot_conversation_id, chatwoot_message_id)
 
+    # Ни телефона получателя, ни имени агента — это PII.
     logger.info(
-        "chatwoot_webhook: operator_outgoing accepted conv_id=%s msg_id=%s phone=%s agent=%s",
-        chatwoot_conversation_id,
-        chatwoot_message_id,
-        recipient_phone,
-        sender.get("name", ""),
+        "chatwoot_webhook: operator_outgoing accepted conv_id=%s msg_id=%s",
+        safe_log_value(chatwoot_conversation_id, limit=32),
+        safe_log_value(chatwoot_message_id, limit=32),
     )
 
     return await _store_event(
         request=request,
         dedupe_key=dedupe_key,
         normalized_payload=normalized_payload,
-        chatwoot_conversation_id=chatwoot_conversation_id,
-        chatwoot_message_id=_coerce_int(chatwoot_message_id),
+        chatwoot_conversation_id=optional_chatwoot_id(chatwoot_conversation_id),
+        chatwoot_message_id=optional_chatwoot_id(chatwoot_message_id),
         log_ctx={
             "conv_id": chatwoot_conversation_id,
             "msg_id": chatwoot_message_id,
-            "phone": recipient_phone,
         },
     )
 
@@ -339,9 +404,20 @@ async def _store_event(
                     dedupe_key=dedupe_key,
                     status="received",
                     error=None,
-                    query=dict(request.query_params),
-                    headers=_safe_headers(request),
-                    payload=normalized_payload,
+                    # mask_query/safe_headers — общие хелперы: маскируют
+                    # чувствительные query-значения, выбрасывают authorization,
+                    # cookie и подпись Chatwoot, и приводят метаданные к
+                    # Postgres-безопасному виду (NUL/суррогаты). Санитайзится
+                    # ТОЛЬКО сохраняемая копия — проверка HMAC выше уже прошла по
+                    # живому заголовку.
+                    query=mask_query(dict(request.query_params)),
+                    headers=safe_headers(request, extra_deny={_CHATWOOT_SIGNATURE_HEADER}),
+                    # Сохраняемая проекция. Содержимое сообщения, имена агента и
+                    # контакта контролируются отправителем: NUL или непарный
+                    # суррогат внутри них прошёл бы json.loads и проверку HMAC,
+                    # но уронил бы INSERT в JSONB. Подпись уже проверена по
+                    # исходным байтам body, так что менять проекцию безопасно.
+                    payload=postgres_safe_json_value(normalized_payload),
                     chatwoot_conversation_id=chatwoot_conversation_id,
                     chatwoot_message_id=chatwoot_message_id,
                 )
@@ -350,8 +426,8 @@ async def _store_event(
 
                 logger.info(
                     "chatwoot_webhook: saved dedupe_key=%s ctx=%s",
-                    dedupe_key,
-                    log_ctx,
+                    safe_log_value(dedupe_key, limit=128),
+                    safe_log_value(log_ctx, limit=128),
                 )
 
                 return JSONResponse(
@@ -365,7 +441,7 @@ async def _store_event(
 
         except IntegrityError:
             await session.rollback()
-            logger.info("chatwoot_webhook: duplicate dedupe_key=%s", dedupe_key)
+            logger.info("chatwoot_webhook: duplicate dedupe_key=%s", safe_log_value(dedupe_key, limit=128))
             return JSONResponse(
                 {
                     "ok": True,

@@ -104,7 +104,11 @@ async def safe_send(
         msg_id = await provider.send(sender_id, phone, text, **kwargs)  # type: ignore[call-arg]
         return msg_id, None
     except Exception as exc:
-        logger.exception("send failed: %s", exc)
+        # The raw exception may carry tokens, URLs, response bodies, phone/message
+        # fragments, or injection/control characters — log only its class name.
+        # The raw text is still returned to the caller for in-memory
+        # classification (it must never be logged or persisted downstream).
+        logger.warning("provider send failed error_type=%s", type(exc).__name__)
         return None, str(exc)
 
 
@@ -139,5 +143,7 @@ async def safe_send_template(
         )
         return msg_id, None
     except Exception as exc:
-        logger.exception("send_template failed: %s", exc)
+        # Class name only — the raw exception may leak tokens/URLs/PII/injection.
+        # The raw text is returned for in-memory classification, never logged.
+        logger.warning("provider template send failed error_type=%s", type(exc).__name__)
         return None, str(exc)

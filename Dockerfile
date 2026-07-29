@@ -19,4 +19,7 @@ ENV PATH=/app/.venv/bin:$PATH
 
 EXPOSE 8000
 
-CMD ["/app/.venv/bin/uvicorn", "altegio_bot.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# --no-access-log: стандартный access-лог uvicorn пишет request target вместе с
+# query string, а вебхуки носят секрет именно там (?token= / ?secret=).
+# Наблюдаемость даёт AccessLogMiddleware в main.py — метод, путь, статус, время.
+CMD ["/app/.venv/bin/uvicorn", "altegio_bot.main:app", "--host", "0.0.0.0", "--port", "8000", "--no-access-log"]

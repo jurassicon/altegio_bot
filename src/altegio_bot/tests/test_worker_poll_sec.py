@@ -251,7 +251,13 @@ class TestWhatsAppRunLoopSleepPath:
         monkeypatch.setattr(
             wiw,
             "settings",
-            types.SimpleNamespace(whatsapp_inbox_worker_poll_sec=0.5),
+            types.SimpleNamespace(
+                whatsapp_inbox_worker_poll_sec=0.5,
+                # Large interval → periodic recovery never fires inside the loop,
+                # so the sleep path is reached on the first empty batch. Startup
+                # recovery runs once and is harmlessly isolated by its own guards.
+                chatwoot_operator_relay_recovery_interval_seconds=10_000,
+            ),
         )
         monkeypatch.setattr(wiw, "SessionLocal", _session_local_factory)
 

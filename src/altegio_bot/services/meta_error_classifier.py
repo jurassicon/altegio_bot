@@ -110,6 +110,43 @@ def is_text_window_policy_error(err: ErrorLike) -> bool:
     )
 
 
+# Documented WhatsApp Cloud permanent rejections where the app is confident Meta
+# did NOT accept the message. Deliberately conservative: anything not on this
+# allowlist (or the vetted token/template/window classifiers) is treated as an
+# indeterminate outcome, never a permanent failure.
+_DETERMINISTIC_REJECTION_MARKERS = (
+    "131026",  # message undeliverable (recipient cannot receive on WhatsApp)
+    "131009",  # parameter value is not valid
+    "131008",  # required parameter is missing
+    "message undeliverable",
+    "recipient phone number not in allowed list",  # sandbox allow-list rejection
+    "not a valid whatsapp",
+    "invalid recipient",
+    "permission denied",
+    "does not have permission",
+    "unsupported message type",
+    "unsupported request",
+)
+
+
+def is_deterministic_meta_rejection(err: ErrorLike) -> bool:
+    """Return True only for errors that prove Meta did NOT accept the message.
+
+    Composes the vetted permanent classifiers (token expiry, template validation,
+    24h window policy) with an explicit allowlist of documented permanent
+    rejection markers. Everything else — timeouts, 5xx, connection resets,
+    ``Unexpected Meta response``, JSON decode failures, unknown exceptions — is
+    intentionally NOT deterministic: the send may have been accepted, so the
+    caller must treat it as ``unknown`` rather than ``failed``.
+    """
+    if is_token_expired_error(err):
+        return True
+    if is_permanent_meta_template_error(err) or is_text_window_policy_error(err):
+        return True
+    low = _coerce_error_text(err).lower()
+    return any(marker in low for marker in _DETERMINISTIC_REJECTION_MARKERS)
+
+
 def is_transient_provider_error(err: ErrorLike) -> bool:
     """Return True when a failed Meta send should close the circuit and retry.
 

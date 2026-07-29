@@ -20,7 +20,10 @@ BOT_TEXT_INSIDE_24H_ALLOWED_JOB_TYPES: frozenset[str] = frozenset(
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=".env",
+        # Отсутствующий файл pydantic-settings молча пропускает, поэтому
+        # easyweek.env опционален. Правее — выше приоритет: значения из
+        # easyweek.env перекрывают одноимённые из .env.
+        env_file=(".env", "easyweek.env"),
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
@@ -213,6 +216,26 @@ class Settings(BaseSettings):
     # When True, adds a private Chatwoot note explaining the window was closed
     # and the original message was not delivered directly.
     chatwoot_operator_reopen_private_note_enabled: bool = True
+
+    # An operator-relay Outbox left in 'sending' longer than this is treated as
+    # a stale/interrupted attempt: recovery moves it to 'unknown' (manual review,
+    # never an automatic resend). Kept generous so a slow-but-live Meta call is
+    # not misclassified; tests lower it to force the stale path.
+    chatwoot_operator_relay_stale_sending_seconds: int = 900
+
+    # An operator-relay event stuck in 'processing' with NO Outbox for longer
+    # than this had its durable prepare interrupted before any provider side
+    # effect; recovery returns it to 'received' so the next poll re-prepares it.
+    # Must be > 0 in production so a currently-processing event is never reset.
+    chatwoot_operator_relay_stale_processing_seconds: int = 300
+
+    # Bounded batch size for each operator-relay recovery scan (stale processing,
+    # queued resume, stale sending), so recovery never becomes a tight full scan.
+    chatwoot_operator_relay_recovery_batch_size: int = 50
+
+    # How often the production poll loop runs the operator-relay recovery cycle
+    # (in addition to once at worker startup).
+    chatwoot_operator_relay_recovery_interval_seconds: int = 60
 
     @field_validator("chatwoot_reply_context_visible_quote_mode")
     @classmethod
@@ -428,6 +451,16 @@ class Settings(BaseSettings):
                 f"Allowed: {sorted(BOT_TEXT_INSIDE_24H_ALLOWED_JOB_TYPES)!r}"
             )
         return self
+
+    # ---------------------------------------------------------------------------
+    # EasyWeek integration (PR-1: сырой capture вебхуков, без обработки)
+    # ---------------------------------------------------------------------------
+    # Мастер-флаг поверхности. False (по умолчанию) — POST /webhooks/easyweek
+    # отвечает 404: до go-live эндпоинт неотличим от несуществующего маршрута.
+    easyweek_enabled: bool = False
+    # Общий секрет из query-параметра ?token= в URL вебхука. Пустое значение
+    # держит эндпоинт закрытым (403) даже при easyweek_enabled=true — fail-closed.
+    easyweek_webhook_secret: str = ""
 
     # ---------------------------------------------------------------------------
     # Worker polling intervals

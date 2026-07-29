@@ -24,15 +24,27 @@ services:
   altegio-api:
     build: .
     restart: always
-    env_file: .env
+    env_file:
+      - .env
+      # Секреты EasyWeek. required: false обязателен — без него отсутствие файла
+      # на сервере уронит деплой всего сервиса.
+      - path: easyweek.env
+        required: false
     ports:
-      - "8000:8000"
+      # Порт слушает только loopback: наружу API ходит через host-level reverse
+      # proxy, а публичный bind позволял бы обойти его (и его TLS/лимиты) по
+      # адресу сервера. Если proxy живёт НЕ на этом хосте и не в сети compose —
+      # выставьте API_BIND_HOST=0.0.0.0, иначе он получит connection refused.
+      - "${API_BIND_HOST:-127.0.0.1}:8000:8000"
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_started
-    command: ["/app/.venv/bin/uvicorn", "altegio_bot.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    # --no-access-log: см. Dockerfile — query string с секретом не должна
+    # попадать в access-лог. Путь/статус/время логирует AccessLogMiddleware.
+    command:
+      ["/app/.venv/bin/uvicorn", "altegio_bot.main:app", "--host", "0.0.0.0", "--port", "8000", "--no-access-log"]
 
   altegio-inbox-worker:
     build: .

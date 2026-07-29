@@ -14,14 +14,30 @@ from sqlalchemy.exc import IntegrityError
 from altegio_bot.db import SessionLocal
 from altegio_bot.models.models import WhatsAppEvent
 from altegio_bot.settings import settings
+from altegio_bot.webhooks.common import (
+    mask_query,
+    postgres_safe_json_value,
+    safe_headers,
+    safe_log_value,
+)
 
 logger = logging.getLogger("whatsapp_webhook")
 
 router = APIRouter()
 
+# Заголовок с HMAC-подписью Meta. Проверяется по живому запросу до записи,
+# поэтому из сохраняемой копии заголовков его нужно выбросить.
+_META_SIGNATURE_HEADERS = frozenset({"x-hub-signature-256", "x-hub-signature"})
+
 
 def _payload_dedupe_key(payload: dict[str, Any]) -> str:
-    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    # ensure_ascii=True is intentional and load-bearing (it is also the json
+    # default, but stated explicitly so it cannot be "cleaned up" away): it
+    # escapes lone surrogates into ASCII, so .encode("utf-8") below cannot raise
+    # UnicodeEncodeError on hostile webhook content. Do NOT switch this to
+    # canonical_json_hash — that helper uses ensure_ascii=False and a different
+    # historical canonical form, so it would change every existing dedupe key.
+    raw = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
     return f"wa:{digest}"
 
@@ -98,10 +114,8 @@ async def whatsapp_ingest(request: Request) -> Response:
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
-    query = dict(request.query_params)
-    headers = dict(request.headers)
-
     app_secret = getattr(settings, "meta_app_secret", "")
+
     if app_secret:
         sig = request.headers.get("x-hub-signature-256") or request.headers.get("X-Hub-Signature-256")
         if not _verify_signature(
@@ -111,6 +125,17 @@ async def whatsapp_ingest(request: Request) -> Response:
         ):
             logger.warning("Webhook signature mismatch")
             raise HTTPException(status_code=403, detail="Bad signature")
+
+    # Structural validation deliberately runs AFTER the signature check, so an
+    # unsigned malformed body is still a 403 rather than a 400.
+    #
+    # A non-object root (`[]`, `"text"`, `123`, `null`) parses fine but no worker
+    # can process it. Persisting it and answering 200 would be the worst outcome:
+    # Meta treats the delivery as accepted and never retries, while the row later
+    # ends up failed/processed without anything actually happening — the event is
+    # lost for good. Reject it instead so Meta can retry.
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="JSON payload must be an object")
 
     pni = _extract_phone_number_id(payload)
     allowed = _parse_allowed_phone_number_ids()
@@ -122,11 +147,19 @@ async def whatsapp_ingest(request: Request) -> Response:
     if pni is not None and allowed and pni not in allowed:
         status = "ignored"
         ignored = True
-        error = f"Ignored: phone_number_id not allowed ({pni})"
-        logger.info("Ignored webhook event phone_number_id=%s", pni)
+        # pni приходит из payload: и в TEXT-колонку error, и в лог он попадает
+        # только приведённым к безопасному виду.
+        error = f"Ignored: phone_number_id not allowed ({safe_log_value(pni, limit=64)})"
+        logger.info("Ignored webhook event phone_number_id=%s", safe_log_value(pni, limit=64))
 
+    # Дедуп-ключ считается по ОРИГИНАЛЬНОМУ payload — санитизация ниже касается
+    # только сохраняемой проекции, поэтому семантика дедупликации не меняется.
     dedupe_key = _payload_dedupe_key(payload)
 
+    # Подпись уже проверена выше по исходным байтам body; теперь можно готовить
+    # безопасную копию metadata: маскируем секреты в query, выбрасываем
+    # authorization/cookie и подпись Meta, приводим строки к Postgres-безопасному
+    # виду (NUL/суррогаты иначе роняют commit).
     async with SessionLocal() as session:
         try:
             async with session.begin():
@@ -134,13 +167,19 @@ async def whatsapp_ingest(request: Request) -> Response:
                     dedupe_key=dedupe_key,
                     status=status,
                     error=error,
-                    query=query,
-                    headers=headers,
-                    payload=payload,
+                    query=mask_query(dict(request.query_params)),
+                    headers=safe_headers(request, extra_deny=_META_SIGNATURE_HEADERS),
+                    payload=postgres_safe_json_value(payload),
                 )
                 session.add(evt)
                 await session.flush()
 
+            # phone_number_id сознательно НЕ возвращается: значение приходит из
+            # тела и может быть некодируемым (непарный суррогат) — тогда
+            # JSONResponse упал бы уже ПОСЛЕ успешного commit, отправитель
+            # получил бы 500, а ретрай попадал бы в ту же ошибку на duplicate-
+            # ветке. Технического ответа ниже достаточно; сам pni сохранён в
+            # payload и в error.
             return JSONResponse(
                 {
                     "ok": True,
@@ -148,7 +187,6 @@ async def whatsapp_ingest(request: Request) -> Response:
                     "ignored": ignored,
                     "id": evt.id,
                     "dedupe_key": dedupe_key,
-                    "phone_number_id": pni,
                 }
             )
 
@@ -166,6 +204,5 @@ async def whatsapp_ingest(request: Request) -> Response:
                     "ignored": ignored,
                     "id": existing_id,
                     "dedupe_key": dedupe_key,
-                    "phone_number_id": pni,
                 }
             )
