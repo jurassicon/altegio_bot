@@ -251,13 +251,14 @@ If you need to create a card programmatically without sending a message:
 import asyncio
 from altegio_bot.altegio_loyalty import AltegioLoyaltyClient
 
+
 async def create_card():
     loyalty = AltegioLoyaltyClient()
     try:
         card = await loyalty.issue_card(
             location_id=758285,
-            loyalty_card_number='9926022899999999',  # Unique 16-digit number
-            loyalty_card_type_id='46454',
+            loyalty_card_number="9926022899999999",  # Unique 16-digit number
+            loyalty_card_type_id="46454",
             phone=381638400431,  # Number WITHOUT + sign
         )
         print(f"Card created: {card}")
@@ -265,6 +266,7 @@ async def create_card():
         print(f"Number: {card.get('loyalty_card_number')}")
     finally:
         await loyalty.aclose()
+
 
 asyncio.run(create_card())
 ```

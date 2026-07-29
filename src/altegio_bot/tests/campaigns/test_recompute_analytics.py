@@ -3734,6 +3734,14 @@ async def test_last_recompute_meta_cleared_on_clean_recompute(session_maker, mon
     run_id = await _make_run(session_maker)
     event_at = _COMPLETED_AT + timedelta(days=7)
     svc_id_for_p4 = 44001  # distinct ID; NOT in LRU cache before recompute #1
+    cache_key = (758285, svc_id_for_p4)
+
+    # This test owns both inputs that make the first recompute fail. Keep it
+    # deterministic even when a developer or CI supplies real Altegio tokens,
+    # and do not inherit or leak this process-local cache entry.
+    monkeypatch.delenv("ALTEGIO_PARTNER_TOKEN", raising=False)
+    monkeypatch.delenv("ALTEGIO_USER_TOKEN", raising=False)
+    monkeypatch.delitem(_LRU_CACHE, cache_key, raising=False)
 
     async with session_maker() as session:
         async with session.begin():
@@ -3783,7 +3791,7 @@ async def test_last_recompute_meta_cleared_on_clean_recompute(session_maker, mon
     assert run.meta["last_recompute"]["booked_after_service_lookup_failed_count"] == 1
 
     # Seed the cache so the service resolves as lash on the next recompute
-    _cache_put((758285, svc_id_for_p4), _LASH_CATEGORY_ID)
+    monkeypatch.setitem(_LRU_CACHE, cache_key, _LASH_CATEGORY_ID)
 
     # Recompute #2: cache hit → no failure; meta must be refreshed
     async with session_maker() as session:
