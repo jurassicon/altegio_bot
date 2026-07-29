@@ -1445,13 +1445,15 @@ async def test_relay_same_company_multi_sender_sends_successfully(session_maker,
 
 @pytest.mark.asyncio
 async def test_operator_relay_send_failure(session_maker, monkeypatch) -> None:
-    """When provider.send raises permanently, the durable Outbox row is marked
-    'failed' (not deleted) and a stable event error is set."""
+    """When provider.send raises an arbitrary (non-deterministic) error, the
+    outcome is conservatively 'unknown' (Meta may have accepted it), not 'failed'.
+    The durable row survives and no automatic resend happens."""
     monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
     monkeypatch.setattr(wiw, "SessionLocal", session_maker)
     monkeypatch.setattr(wiw.settings, "meta_circuit_breaker_enabled", False)
     monkeypatch.setattr(wiw.settings, "chatwoot_operator_relay_enabled", True)
-    provider = _ErrorProvider()
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_reopen_private_note_enabled", False)
+    provider = _ErrorProvider()  # raises RuntimeError("meta api unavailable") — indeterminate
 
     async with session_maker() as session:
         async with session.begin():
@@ -1484,21 +1486,26 @@ async def test_operator_relay_send_failure(session_maker, monkeypatch) -> None:
             await session.flush()
             evt_id = evt.id
 
-            evt_id = evt.id
-
     await wiw.process_one_event(evt_id, provider)
 
     async with session_maker() as session:
         reloaded = await session.get(WhatsAppEvent, evt_id)
     assert reloaded is not None
-    assert reloaded.error == "operator_relay: send failed (permanent)"
+    assert reloaded.error == "operator_relay: delivery outcome unknown"
 
-    # The durable row survives as 'failed' (never a successful 'sent' row).
+    # The durable row survives as 'unknown' with manual-review metadata.
     async with session_maker() as session:
         result = await session.execute(select(OutboxMessage).where(OutboxMessage.phone_e164 == "+49900100200"))
         ob = result.scalar_one_or_none()
     assert ob is not None
-    assert ob.status == "failed"
+    assert ob.status == "unknown"
+    assert ob.meta.get("manual_review_required") is True
+
+    # No automatic resend on a later run.
+    await wiw.process_one_event(evt_id, provider)
+    async with session_maker() as session:
+        result = await session.execute(select(OutboxMessage).where(OutboxMessage.phone_e164 == "+49900100200"))
+        assert len(list(result.scalars())) == 1
     assert ob.provider_message_id is None
 
 
@@ -2434,27 +2441,27 @@ async def test_reopen_template_send_failure_sets_error(session_maker, monkeypatc
             await session.flush()
             evt_id = evt.id
 
-            evt_id = evt.id
-
     with patch("altegio_bot.workers.whatsapp_inbox_worker.ChatwootClient", mock_cw_class):
         await wiw.process_one_event(evt_id, provider)
 
-    # A permanent template failure sets a stable event error (no auto-retry).
+    # An indeterminate template send error is conservatively 'unknown', with a
+    # stable event marker and no automatic resend.
     async with session_maker() as session:
         reloaded = await session.get(WhatsAppEvent, evt_id)
     assert reloaded is not None
-    assert reloaded.error == "operator_relay: send failed (permanent)"
+    assert reloaded.error == "operator_relay: delivery outcome unknown"
 
-    # Failure note must have been attempted in Chatwoot.
+    # A truthful manual-review note must have been sent to Chatwoot.
     mock_cw.send_message.assert_called_once()
 
-    # The durable Outbox row survives as 'failed' (never a successful 'sent' row).
+    # The durable Outbox row survives as 'unknown' (never a successful 'sent' row).
     async with session_maker() as session:
         result = await session.execute(select(OutboxMessage).where(OutboxMessage.phone_e164 == "+49111222003"))
         ob = result.scalar_one_or_none()
     assert ob is not None
-    assert ob.status == "failed"
+    assert ob.status == "unknown"
     assert ob.provider_message_id is None
+    assert ob.meta.get("manual_review_required") is True
 
 
 # ---------------------------------------------------------------------------
@@ -2674,10 +2681,13 @@ async def test_private_note_only_note_failure_surfaced(session_maker, monkeypatc
 
     assert ob is not None
     assert ob.status == "canceled"
-    assert ob.error is not None
-    assert "private note failed" in ob.error
+    # Primary lifecycle error keeps the cancel reason — the private-note failure
+    # must NOT overwrite it; the note outcome lives only in metadata.
+    assert ob.error == "operator_relay: canceled (customer service window closed)"
+    assert "private note failed" not in (ob.error or "")
     assert ob.meta.get("private_note_status") == "failed"
-    assert ob.meta.get("private_note_error") is not None
+    assert ob.meta.get("private_note_error") == "RuntimeError"
+    assert ob.meta.get("private_note_updated_at") is not None
 
 
 # ---------------------------------------------------------------------------

@@ -223,6 +223,20 @@ class Settings(BaseSettings):
     # not misclassified; tests lower it to force the stale path.
     chatwoot_operator_relay_stale_sending_seconds: int = 900
 
+    # An operator-relay event stuck in 'processing' with NO Outbox for longer
+    # than this had its durable prepare interrupted before any provider side
+    # effect; recovery returns it to 'received' so the next poll re-prepares it.
+    # Must be > 0 in production so a currently-processing event is never reset.
+    chatwoot_operator_relay_stale_processing_seconds: int = 300
+
+    # Bounded batch size for each operator-relay recovery scan (stale processing,
+    # queued resume, stale sending), so recovery never becomes a tight full scan.
+    chatwoot_operator_relay_recovery_batch_size: int = 50
+
+    # How often the production poll loop runs the operator-relay recovery cycle
+    # (in addition to once at worker startup).
+    chatwoot_operator_relay_recovery_interval_seconds: int = 60
+
     @field_validator("chatwoot_reply_context_visible_quote_mode")
     @classmethod
     def validate_reply_context_visible_quote_mode(cls, v: str) -> str:

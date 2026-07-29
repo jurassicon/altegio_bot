@@ -391,15 +391,17 @@ def test_ast_guard_allows_only_safe_wrappers(snippet: str) -> None:
 # Operator-relay error branches: technical ids escaped, no PII/secret/injection
 # ---------------------------------------------------------------------------
 #
-# Assertions here are scoped to the worker's own logger. `providers.dummy`'s
-# safe_send logs the raw provider error itself — that is the documented
-# remaining-debt path (section 9), out of scope for this change.
+# The worker-scoped helper below asserts the worker's own logger is clean; the
+# global test at the end of this module additionally proves that NO logger —
+# including providers.dummy's safe_send/safe_send_template — leaks the raw
+# provider exception. (The former "out of scope debt" for provider-helper
+# logging is fixed: it now logs only error_type=<class name>.)
 
 _WORKER_LOGGER = "whatsapp_inbox_worker"
 
 HOSTILE_PNID = "PNI" + chr(0x2028) + "forged"
 SECRET_ERR = "token=SECRETVAL https://secret-host/?token=SECRETVAL\nforged status=500"
-PERMANENT_ERR = "invalid template token=SECRETVAL https://secret-host/?t=SECRETVAL\nforged"
+PERMANENT_ERR = "template does not exist token=SECRETVAL https://secret-host/?t=SECRETVAL\nforged"
 
 
 class _RaisingSendProvider(WhatsAppProvider):
@@ -1085,3 +1087,142 @@ async def test_routing_invalid_inbox_map_stable_and_clean(session_maker, monkeyp
     blob = _assert_worker_log_clean(caplog)
     # Raw config / exception body must never appear.
     assert "not valid json" not in blob
+
+
+# ---------------------------------------------------------------------------
+# Global log hygiene: NO logger (incl. providers.dummy) leaks a provider secret
+# ---------------------------------------------------------------------------
+
+# A single provider error string carrying a secret, a URL, a newline-injection,
+# a CR, an ANSI escape, and Unicode line/paragraph separators. It must never
+# surface in ANY captured log record after a text OR a template send.
+_GLOBAL_SECRET_ERR = (
+    "token=SECRETVAL https://secret-host/?token=SECRETVAL\n2026-07-28 INFO forged\r\x1b[31m" + LINE_SEP + PARA_SEP
+)
+
+
+async def _insert_secret_relay(session_maker, *, dedupe_key, conversation_id, recipient) -> int:
+    async with session_maker() as session:
+        async with session.begin():
+            evt = WhatsAppEvent(
+                dedupe_key=dedupe_key,
+                status="received",
+                error=None,
+                query={},
+                headers={},
+                payload={
+                    "_chatwoot_operator_relay": {
+                        "recipient_phone": recipient,
+                        "text": MESSAGE_TEXT,
+                        "conversation_id": conversation_id,
+                        "message_id": conversation_id + 1,
+                        "phone_number_id": "PNID_SECRET",
+                        "agent_name": AGENT_NAME,
+                    }
+                },
+            )
+            session.add(evt)
+            await session.flush()
+            return int(evt.id)
+
+
+@pytest.mark.asyncio
+async def test_provider_secret_never_leaks_in_any_logger(session_maker, monkeypatch, caplog) -> None:
+    """A secret-bearing provider exception must not appear in ANY logger — the
+    worker, the provider helper, or anything else — for text and template sends."""
+    monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
+    monkeypatch.setattr(worker_module, "SessionLocal", session_maker)
+    monkeypatch.setattr(worker_module.settings, "chatwoot_operator_relay_enabled", True)
+    monkeypatch.setattr(worker_module.settings, "chatwoot_operator_closed_window_mode", "reopen_template")
+    monkeypatch.setattr(worker_module.settings, "chatwoot_operator_reopen_template_name", "reopen_tpl")
+    monkeypatch.setattr(worker_module, "ChatwootClient", _FakeChatwoot)  # unknown note → no network secret
+
+    phone_open = "+4915111111111"
+    phone_closed = "+4915122222222"
+    async with session_maker() as session:
+        async with session.begin():
+            # One sender serves both events (same phone_number_id).
+            session.add(
+                WhatsAppSender(
+                    id=990,
+                    company_id=1,
+                    sender_code="default",
+                    phone_number_id="PNID_SECRET",
+                    display_phone="+49",
+                    is_active=True,
+                )
+            )
+            # Open the 24h window for the text recipient only.
+            session.add(
+                WhatsAppEvent(
+                    dedupe_key="wa:inbound:secretleak",
+                    received_at=datetime.now(timezone.utc) - timedelta(hours=1),
+                    status="processed",
+                    query={},
+                    headers={},
+                    payload={
+                        "entry": [
+                            {
+                                "changes": [
+                                    {
+                                        "value": {
+                                            "messages": [
+                                                {
+                                                    "from": phone_open.lstrip("+"),
+                                                    "type": "text",
+                                                    "text": {"body": "hi"},
+                                                    "id": "w1",
+                                                }
+                                            ],
+                                            "metadata": {"phone_number_id": "PNID_SECRET"},
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                )
+            )
+
+    text_event_id = await _insert_secret_relay(
+        session_maker, dedupe_key="chatwoot_out:secretleak:text", conversation_id=6100, recipient=phone_open
+    )
+    tpl_event_id = await _insert_secret_relay(
+        session_maker, dedupe_key="chatwoot_out:secretleak:tpl", conversation_id=6200, recipient=phone_closed
+    )
+
+    with caplog.at_level(logging.DEBUG):
+        # Text path (window open): provider.send raises the secret-bearing error.
+        await process_one_event(text_event_id, _RaisingSendProvider(_GLOBAL_SECRET_ERR))
+        # Template path (window closed): send_template raises the secret-bearing error.
+        await process_one_event(tpl_event_id, _RaisingTemplateProvider(_GLOBAL_SECRET_ERR))
+
+    messages = [r.getMessage() for r in caplog.records]
+    blob = "\n".join(messages)
+
+    # No secret / URL / operator text / customer phone anywhere.
+    for forbidden in ("SECRETVAL", "secret-host", "token=", "https://", MESSAGE_TEXT, PHONE):
+        assert forbidden not in blob, f"leak of {forbidden!r} in a log record"
+
+    # No raw injection bytes turning any record into a forged physical line.
+    for msg in messages:
+        assert "\n" not in msg
+        assert "\r" not in msg
+        assert "\x1b" not in msg
+        assert LINE_SEP not in msg
+        assert PARA_SEP not in msg
+
+    # Positive: the provider helper logged a SAFE structured marker for both paths.
+    provider_logs = [r.getMessage() for r in caplog.records if r.name == "altegio_bot.providers.dummy"]
+    assert any("provider send failed error_type=RuntimeError" in m for m in provider_logs)
+    assert any("provider template send failed error_type=RuntimeError" in m for m in provider_logs)
+
+    # And the test genuinely went through the provider: both rows are 'unknown'.
+    async with session_maker() as session:
+        rows = (
+            await session.execute(
+                select(OutboxMessage).where(OutboxMessage.source_whatsapp_event_id.in_([text_event_id, tpl_event_id]))
+            )
+        ).scalars()
+        statuses = sorted(r.status for r in rows)
+    assert statuses == ["unknown", "unknown"]

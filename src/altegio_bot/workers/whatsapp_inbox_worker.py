@@ -3,12 +3,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any, Sequence
 
-from sqlalchemy import or_, select, update
+from sqlalchemy import exists, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -29,6 +30,7 @@ from altegio_bot.providers.base import WhatsAppProvider
 from altegio_bot.providers.dummy import safe_send, safe_send_template
 from altegio_bot.services import meta_circuit
 from altegio_bot.services.meta_error_classifier import (
+    is_deterministic_meta_rejection,
     is_transient_provider_error,
     transient_error_reason,
 )
@@ -1845,6 +1847,14 @@ async def _forward_reaction_to_chatwoot(
 _OPERATOR_RELAY_CIRCUIT_CLOSED_BODY = "[operator relay canceled: Meta circuit closed]"
 _OPERATOR_RELAY_TRANSIENT_BODY = "[operator relay canceled: Meta transient send error]"
 
+# Canonical operator note for EVERY indeterminate outcome (immediate unknown,
+# stale-sending recovery, crash recovery). It must never claim the message was
+# not sent — an unknown outcome means Meta may have accepted it.
+_OPERATOR_RELAY_UNKNOWN_NOTE = (
+    "Die Zustellung dieser WhatsApp-Nachricht konnte technisch nicht eindeutig "
+    "bestätigt werden. Bitte prüfe den Chatverlauf, bevor du die Nachricht erneut sendest."
+)
+
 
 # ===========================================================================
 # Operator relay: durable, staged send lifecycle
@@ -1943,21 +1953,23 @@ async def _set_outbox_private_note_status(
 ) -> None:
     """Record the private-note outcome on the audit row in its own short tx.
 
-    A note failure never rolls back the durable Outbox and never triggers a Meta
-    retry — only its status/class name is stored. ``surface_event_id`` mirrors a
-    failure onto the source event error for the private_note_only contract.
+    The Chatwoot note is a SECONDARY side effect: its outcome is stored only in
+    ``meta`` (``private_note_status`` / ``private_note_error`` /
+    ``private_note_updated_at``) and NEVER overwrites the primary WhatsApp
+    lifecycle ``Outbox.error`` (e.g. the delivery-unknown or send-failed marker).
+    ``surface_event_id`` mirrors a failure onto the source event error only for
+    the private_note_only branch, where the note is the primary user-facing
+    result — even there ``Outbox.error`` keeps its original cancel reason.
     """
     async with SessionLocal() as session:
         async with session.begin():
             row = await session.get(OutboxMessage, outbox_id)
             if row is None:
                 return
-            new_meta = {**row.meta, "private_note_status": status}
+            new_meta = {**row.meta, "private_note_status": status, "private_note_updated_at": utcnow().isoformat()}
             if error_type is not None:
                 new_meta["private_note_error"] = error_type
             row.meta = new_meta
-            if error_type is not None:
-                row.error = f"private note failed: {error_type}"
             if surface_event_id is not None and error_type is not None:
                 event = await session.get(WhatsAppEvent, surface_event_id)
                 if event is not None:
@@ -2311,6 +2323,9 @@ async def _prepare_operator_relay(event_id: int, provider: WhatsAppProvider) -> 
                     template_code="operator_relay",
                     body=text,
                     status="canceled",
+                    # Primary lifecycle error records the cancel reason; a later
+                    # private-note failure must never overwrite it.
+                    error="operator_relay: canceled (customer service window closed)",
                     meta={
                         "send_type": "none",
                         "attempted_send_type": "text",
@@ -2460,12 +2475,23 @@ async def _execute_operator_relay(
         )
 
     if err is None:
-        return RelayProviderOutcome(kind="sent", provider_message_id=wamid)
+        # A 2xx response with no usable wamid does NOT confirm acceptance — Meta
+        # may have taken the message but we cannot prove it. Treat as unknown.
+        if isinstance(wamid, str) and wamid.strip():
+            return RelayProviderOutcome(kind="sent", provider_message_id=wamid)
+        return RelayProviderOutcome(kind="unknown", error_kind="missing_wamid")
 
-    # A transient/indeterminate error cannot prove Meta rejected the message, so
-    # it is 'unknown' (never a silent success or a false failure). A permanent,
-    # deterministic error is 'failed'. The raw provider error may embed a
-    # token/URL/response body, so it is never logged or persisted.
+    # Pre-request deterministic guard: safe_send refused before any HTTP call, so
+    # Meta definitely did NOT receive the message — this is a real failure, never
+    # an indeterminate post-request outcome.
+    if err == "Real send disabled":
+        return RelayProviderOutcome(kind="failed", error_kind="real_send_disabled")
+
+    # Conservative classification (raw error is never logged or persisted):
+    #   transient network/5xx/rate-limit → unknown (+ circuit close);
+    #   documented deterministic rejection → failed;
+    #   everything else after a possible request → unknown (default).
+    # The absence of a transient marker is NOT proof that Meta rejected the send.
     if is_transient_provider_error(err):
         error_kind, error_code = transient_error_reason(err)
         return RelayProviderOutcome(
@@ -2474,7 +2500,9 @@ async def _execute_operator_relay(
             error_code=error_code,
             circuit_transient=True,
         )
-    return RelayProviderOutcome(kind="failed", error_kind="permanent")
+    if is_deterministic_meta_rejection(err):
+        return RelayProviderOutcome(kind="failed", error_kind="permanent")
+    return RelayProviderOutcome(kind="unknown", error_kind="indeterminate")
 
 
 async def _finalize_operator_relay(claimed: _ClaimedRelay, outcome: RelayProviderOutcome) -> bool:
@@ -2577,6 +2605,7 @@ async def _relay_post_finalize_side_effects(claimed: _ClaimedRelay, outcome: Rel
             await _send_operator_private_note(
                 _RelayNote(
                     conversation_id=claimed.conversation_id,
+                    outbox_id=claimed.outbox_id,
                     text=(
                         "⚠️ Das 24h-WhatsApp-Fenster war geschlossen. Die ursprüngliche Nachricht"
                         " wurde nicht direkt gesendet. Stattdessen wurde eine Vorlage gesendet, damit"
@@ -2597,6 +2626,7 @@ async def _relay_post_finalize_side_effects(claimed: _ClaimedRelay, outcome: Rel
             await _send_operator_private_note(
                 _RelayNote(
                     conversation_id=claimed.conversation_id,
+                    outbox_id=claimed.outbox_id,
                     text=(
                         "❌ Die Vorlage zum Wiederöffnen des WhatsApp-Dialogs konnte nicht gesendet"
                         " werden. Die ursprüngliche Nachricht wurde nicht an WhatsApp zugestellt."
@@ -2605,8 +2635,10 @@ async def _relay_post_finalize_side_effects(claimed: _ClaimedRelay, outcome: Rel
             )
         return
 
-    # unknown — indeterminate outcome. Close the Meta circuit for transient
-    # errors (as the legacy path did) and alert the operator; never retry.
+    # unknown — indeterminate outcome. Two INDEPENDENT side effects:
+    #   1. Circuit close: only for a transient error with the breaker enabled.
+    #   2. Operator notification: a truthful manual-review note for EVERY unknown,
+    #      regardless of circuit configuration.
     logger.warning(
         "operator_relay: %s send outcome unknown outbox_id=%s error_kind=%s error_code=%s — manual review",
         claimed.send_type,
@@ -2621,16 +2653,13 @@ async def _relay_post_finalize_side_effects(claimed: _ClaimedRelay, outcome: Rel
             error_code=outcome.error_code,
             next_probe_at=utcnow() + timedelta(seconds=settings.meta_circuit_probe_initial_delay_seconds),
         )
-        await _send_operator_private_note(
-            _RelayNote(
-                conversation_id=claimed.conversation_id,
-                text=(
-                    "Meta/WhatsApp ist voruebergehend nicht erreichbar. "
-                    "Die Operator-Nachricht wurde nicht an WhatsApp gesendet."
-                ),
-                outbox_id=claimed.outbox_id,
-            )
+    await _send_operator_private_note(
+        _RelayNote(
+            conversation_id=claimed.conversation_id,
+            text=_OPERATOR_RELAY_UNKNOWN_NOTE,
+            outbox_id=claimed.outbox_id,
         )
+    )
 
 
 async def recover_stale_operator_relay_sending(
@@ -2689,15 +2718,149 @@ async def recover_stale_operator_relay_sending(
         await _send_operator_private_note(
             _RelayNote(
                 conversation_id=conversation_id,
-                text=(
-                    "Die Zustellung dieser WhatsApp-Nachricht konnte technisch nicht eindeutig "
-                    "bestätigt werden. Bitte prüfe den Chatverlauf, bevor du die Nachricht erneut sendest."
-                ),
+                text=_OPERATOR_RELAY_UNKNOWN_NOTE,
                 outbox_id=outbox_id,
             )
         )
 
     return recovered
+
+
+@dataclass
+class RecoveryStats:
+    """Counts from one operator-relay recovery cycle (for logs/metrics/tests)."""
+
+    recovered_sending: int = 0
+    recovered_processing: int = 0
+    resumed_queued: int = 0
+
+
+async def recover_stale_processing_events(*, now: datetime | None = None) -> int:
+    """Reset operator events stuck in 'processing' with NO Outbox back to 'received'.
+
+    A 'processing' operator event whose durable prepare never produced an Outbox
+    was interrupted BEFORE any Meta side effect, so it is safe to re-pick. Events
+    that already have ANY Outbox (queued/sending/terminal) are never touched here
+    — those are resumed or recovered by the Outbox-driven paths. Bounded batch,
+    ``FOR UPDATE SKIP LOCKED`` so two workers never reset the same event.
+    """
+    now = now or utcnow()
+    threshold = now - timedelta(seconds=settings.chatwoot_operator_relay_stale_processing_seconds)
+    batch = settings.chatwoot_operator_relay_recovery_batch_size
+    recovered = 0
+
+    async with SessionLocal() as session:
+        async with session.begin():
+            has_outbox = exists(
+                select(OutboxMessage.id).where(OutboxMessage.source_whatsapp_event_id == WhatsAppEvent.id)
+            )
+            rows = list(
+                (
+                    await session.execute(
+                        select(WhatsAppEvent)
+                        .where(
+                            WhatsAppEvent.status == "processing",
+                            WhatsAppEvent.processed_at.is_(None),
+                            WhatsAppEvent.received_at < threshold,
+                            ~has_outbox,
+                        )
+                        .order_by(WhatsAppEvent.received_at.asc())
+                        .limit(batch)
+                        .with_for_update(skip_locked=True)
+                    )
+                ).scalars()
+            )
+            for event in rows:
+                # Only operator-relay events are in scope for this recovery path.
+                if not _is_operator_relay(event.payload or {}):
+                    continue
+                event.status = "received"
+                recovered += 1
+                logger.warning(
+                    "operator_relay: recovered stale processing event without outbox event_id=%s — re-queued",
+                    event.id,
+                )
+    return recovered
+
+
+async def resume_queued_operator_relay(provider: WhatsAppProvider, *, batch_size: int | None = None) -> int:
+    """Resume committed 'queued' operator Outbox rows through the shared pipeline.
+
+    Re-drives ``process_one_event`` for each queued row's source event: prepare
+    sees the existing queued row and returns it for the atomic claim, so no second
+    Outbox is created and only one worker's claim wins the single provider call.
+    Per-row exceptions are isolated (class name only) so one bad row cannot stop
+    the scan or crash the worker.
+    """
+    batch = batch_size or settings.chatwoot_operator_relay_recovery_batch_size
+    async with SessionLocal() as session:
+        event_ids = list(
+            (
+                await session.execute(
+                    select(OutboxMessage.source_whatsapp_event_id)
+                    .where(
+                        OutboxMessage.message_source == "operator",
+                        OutboxMessage.status == "queued",
+                        OutboxMessage.source_whatsapp_event_id.is_not(None),
+                    )
+                    .order_by(OutboxMessage.id.asc())
+                    .limit(batch)
+                )
+            ).scalars()
+        )
+
+    resumed = 0
+    for event_id in event_ids:
+        try:
+            await process_one_event(int(event_id), provider)
+            resumed += 1
+        except Exception as exc:
+            logger.error(
+                "operator_relay: queued resume failed event_id=%s error_type=%s operation=resume_queued",
+                event_id,
+                type(exc).__name__,
+            )
+    return resumed
+
+
+async def recover_operator_relay_lifecycle(
+    provider: WhatsAppProvider,
+    *,
+    now: datetime | None = None,
+) -> RecoveryStats:
+    """Run the three independent operator-relay recovery actions (order matters):
+
+      1. stale 'sending' → 'unknown' (never retried);
+      2. stale 'processing' without Outbox → 'received' (re-preparable);
+      3. committed 'queued' → resume/claim/send (single provider call).
+
+    Each action is isolated: a failure in one is logged by class name only and
+    never prevents the others or crashes the worker.
+    """
+    stats = RecoveryStats()
+    try:
+        stats.recovered_sending = await recover_stale_operator_relay_sending(provider, now=now)
+    except Exception as exc:
+        logger.error("operator_relay: recovery step failed operation=stale_sending error_type=%s", type(exc).__name__)
+    try:
+        stats.recovered_processing = await recover_stale_processing_events(now=now)
+    except Exception as exc:
+        logger.error(
+            "operator_relay: recovery step failed operation=stale_processing error_type=%s", type(exc).__name__
+        )
+    try:
+        stats.resumed_queued = await resume_queued_operator_relay(provider)
+    except Exception as exc:
+        logger.error("operator_relay: recovery step failed operation=queued_resume error_type=%s", type(exc).__name__)
+
+    if stats.recovered_sending or stats.recovered_processing or stats.resumed_queued:
+        logger.info(
+            "operator_relay: recovery cycle recovered_sending=%s recovered_processing=%s resumed_queued=%s",
+            stats.recovered_sending,
+            stats.recovered_processing,
+            stats.resumed_queued,
+        )
+    return stats
 
 
 async def handle_event(
@@ -2991,6 +3154,53 @@ def _resolve_poll_sec(
     return settings_value if explicit is None else explicit
 
 
+@dataclass
+class PollCycleStats:
+    """Outcome of a single production poll iteration (for tests/observability)."""
+
+    recovery: RecoveryStats | None = None
+    processed: int = 0
+    failed: int = 0
+
+
+async def run_poll_cycle(
+    provider: WhatsAppProvider,
+    *,
+    batch_size: int,
+    run_recovery: bool,
+) -> PollCycleStats:
+    """One production poll iteration: optional recovery, then a normal batch.
+
+    Recovery runs first so stale ``sending`` becomes ``unknown`` before anything
+    is re-examined, stale ``processing`` events are re-queued, and committed
+    ``queued`` intents are resumed. Every per-event failure is isolated: one
+    operator relay can never terminate the loop or block later events, and the
+    log carries only the event id, the exception class, and the operation — never
+    the raw exception text.
+    """
+    stats = PollCycleStats()
+    if run_recovery:
+        stats.recovery = await recover_operator_relay_lifecycle(provider)
+
+    async with SessionLocal() as session:
+        async with session.begin():
+            events = await lock_next_batch(session, batch_size)
+            event_ids = [int(e.id) for e in events]
+
+    for eid in event_ids:
+        try:
+            await process_one_event(eid, provider)
+            stats.processed += 1
+        except Exception as exc:
+            stats.failed += 1
+            logger.error(
+                "operator_relay: event processing failed event_id=%s error_type=%s operation=process_one_event",
+                eid,
+                type(exc).__name__,
+            )
+    return stats
+
+
 async def run_loop(
     provider: WhatsAppProvider,
     batch_size: int = 50,
@@ -3003,20 +3213,25 @@ async def run_loop(
         effective_poll_sec,
     )
 
+    # Startup recovery: reclaim anything a previous crash left stranded before
+    # the first normal batch. Never fatal to the worker.
+    try:
+        await recover_operator_relay_lifecycle(provider)
+    except Exception as exc:
+        logger.error("operator_relay: startup recovery failed error_type=%s", type(exc).__name__)
+
+    recovery_interval = settings.chatwoot_operator_relay_recovery_interval_seconds
+    last_recovery = time.monotonic()
+
     while True:
-        event_ids: list[int] = []
+        run_recovery = (time.monotonic() - last_recovery) >= recovery_interval
+        if run_recovery:
+            last_recovery = time.monotonic()
 
-        async with SessionLocal() as session:
-            async with session.begin():
-                events = await lock_next_batch(session, batch_size)
-                event_ids = [int(e.id) for e in events]
+        stats = await run_poll_cycle(provider, batch_size=batch_size, run_recovery=run_recovery)
 
-        if not event_ids:
+        if stats.processed == 0 and stats.failed == 0:
             await asyncio.sleep(effective_poll_sec)
-            continue
-
-        for eid in event_ids:
-            await process_one_event(eid, provider)
 
 
 def main() -> None:

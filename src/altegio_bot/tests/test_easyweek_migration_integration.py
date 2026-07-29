@@ -232,3 +232,137 @@ async def test_migration_compatibility_scenarios(temp_db_url) -> None:
 
     assert set(await _raw_body_columns(temp_db_url)) == {"body_raw", "body_size_bytes"}
     assert _HEAD_REVISION in _alembic_ok("current", db_url=temp_db_url)
+
+
+# ---------------------------------------------------------------------------
+# Operator-relay durable-Outbox schema: the DB-level last line of defence
+# ---------------------------------------------------------------------------
+
+
+async def _exec(db_url: str, sql: str, params: dict | None = None) -> None:
+    engine = create_async_engine(db_url)
+    try:
+        async with engine.begin() as conn:  # begin() commits on success
+            await conn.execute(text(sql), params or {})
+    finally:
+        await engine.dispose()
+
+
+_EVT = (
+    "INSERT INTO whatsapp_events (id, dedupe_key, status, query, headers, payload) "
+    "VALUES (:id, :dk, 'processed', '{}', '{}', '{}')"
+)
+_OB = (
+    "INSERT INTO outbox_messages "
+    "(company_id, phone_e164, template_code, language, body, status, scheduled_at, "
+    " message_source, meta, source_whatsapp_event_id) "
+    "VALUES (1, :phone, 'operator_relay', 'de', 'b', :status, now(), :src, '{}', :sev)"
+)
+
+
+@pytest.mark.asyncio
+async def test_operator_relay_outbox_schema_and_constraints(temp_db_url) -> None:
+    """Real-PostgreSQL proof of the durable-Outbox idempotency schema (§23–24)."""
+    _alembic_ok("upgrade", "head", db_url=temp_db_url)
+
+    # ── columns: types + nullability ──────────────────────────────────────
+    cols = {
+        r[0]: r
+        for r in await _fetch(
+            temp_db_url,
+            "SELECT column_name, data_type, is_nullable FROM information_schema.columns "
+            "WHERE table_name='outbox_messages' "
+            "AND column_name IN ('source_whatsapp_event_id','attempt_started_at')",
+        )
+    }
+    assert cols["source_whatsapp_event_id"][1] == "bigint"
+    assert cols["source_whatsapp_event_id"][2] == "YES"  # nullable for historical/bot rows
+    assert cols["attempt_started_at"][1] == "timestamp with time zone"
+    assert cols["attempt_started_at"][2] == "YES"
+
+    # ── foreign key → whatsapp_events(id), ON DELETE SET NULL ─────────────
+    fk = await _fetch(
+        temp_db_url,
+        "SELECT c.confdeltype, tgt.relname, att.attname "
+        "FROM pg_constraint c "
+        "JOIN pg_class src ON src.oid = c.conrelid "
+        "JOIN pg_class tgt ON tgt.oid = c.confrelid "
+        "JOIN pg_attribute att ON att.attrelid = c.conrelid AND att.attnum = c.conkey[1] "
+        "WHERE c.contype='f' AND src.relname='outbox_messages' AND att.attname='source_whatsapp_event_id'",
+    )
+    assert fk, "FK on source_whatsapp_event_id is missing"
+    # confdeltype is a PostgreSQL "char" → asyncpg returns it as bytes.
+    confdeltype = fk[0][0]
+    if isinstance(confdeltype, bytes):
+        confdeltype = confdeltype.decode()
+    assert confdeltype == "n"  # 'n' == ON DELETE SET NULL
+    assert fk[0][1] == "whatsapp_events"
+
+    # ── partial unique index with the NOT NULL predicate ──────────────────
+    idx = await _fetch(
+        temp_db_url,
+        "SELECT indexdef FROM pg_indexes WHERE indexname='uq_outbox_source_whatsapp_event_id'",
+    )
+    assert idx, "partial unique index is missing"
+    indexdef = idx[0][0]
+    assert "UNIQUE" in indexdef.upper()
+    assert "source_whatsapp_event_id IS NOT NULL" in indexdef
+
+    # ── behavioral: one operator Outbox per source event ──────────────────
+    await _exec(temp_db_url, _EVT, {"id": 90001, "dk": "mig:A"})
+    await _exec(temp_db_url, _EVT, {"id": 90002, "dk": "mig:B"})
+    await _exec(temp_db_url, _OB, {"phone": "+49a", "status": "sent", "src": "operator", "sev": 90001})
+
+    # a second operator Outbox for the SAME source event is rejected
+    with pytest.raises(Exception) as exc_info:
+        await _exec(temp_db_url, _OB, {"phone": "+49a2", "status": "queued", "src": "operator", "sev": 90001})
+    assert "uq_outbox_source_whatsapp_event_id" in str(exc_info.value) or "unique" in str(exc_info.value).lower()
+
+    # several historical/non-operator rows with NULL source are all allowed
+    for i in range(3):
+        await _exec(temp_db_url, _OB, {"phone": f"+49n{i}", "status": "sent", "src": "bot", "sev": None})
+    null_rows = await _fetch(
+        temp_db_url,
+        "SELECT count(*) FROM outbox_messages WHERE source_whatsapp_event_id IS NULL",
+    )
+    assert null_rows[0][0] == 3
+
+    # ON DELETE SET NULL: deleting the event keeps the audit row, nulls the link
+    await _exec(temp_db_url, _OB, {"phone": "+49b", "status": "sent", "src": "operator", "sev": 90002})
+    await _exec(temp_db_url, "DELETE FROM whatsapp_events WHERE id = 90002")
+    kept = await _fetch(
+        temp_db_url,
+        "SELECT source_whatsapp_event_id FROM outbox_messages WHERE phone_e164 = '+49b'",
+    )
+    assert kept and kept[0][0] is None  # row kept, link nulled
+
+    # ── downgrade removes the whole schema addition ───────────────────────
+    _alembic_ok("downgrade", "-1", db_url=temp_db_url)
+    gone = await _fetch(
+        temp_db_url,
+        "SELECT count(*) FROM information_schema.columns WHERE table_name='outbox_messages' "
+        "AND column_name IN ('source_whatsapp_event_id','attempt_started_at')",
+    )
+    assert gone[0][0] == 0
+    assert (
+        await _fetch(
+            temp_db_url, "SELECT count(*) FROM pg_indexes WHERE indexname='uq_outbox_source_whatsapp_event_id'"
+        )
+    )[0][0] == 0
+    assert (
+        await _fetch(
+            temp_db_url,
+            "SELECT count(*) FROM pg_constraint WHERE conname='fk_outbox_source_whatsapp_event_id'",
+        )
+    )[0][0] == 0
+
+    # ── re-upgrade restores everything; still exactly one head ────────────
+    _alembic_ok("upgrade", "head", db_url=temp_db_url)
+    restored = await _fetch(
+        temp_db_url,
+        "SELECT count(*) FROM information_schema.columns WHERE table_name='outbox_messages' "
+        "AND column_name IN ('source_whatsapp_event_id','attempt_started_at')",
+    )
+    assert restored[0][0] == 2
+    heads = _alembic_ok("heads", db_url=temp_db_url)
+    assert heads.count("(head)") == 1
