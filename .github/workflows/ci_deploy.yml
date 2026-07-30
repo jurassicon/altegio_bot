@@ -184,7 +184,10 @@ jobs:
     name: Deploy to Server
     needs: [tests, alembic]
     if: >-
-      github.event_name == 'push' &&
+      (
+        github.event_name == 'push' ||
+        github.event_name == 'workflow_dispatch'
+      ) &&
       github.ref == 'refs/heads/main' &&
       needs.tests.result == 'success' &&
       needs.alembic.result == 'success'

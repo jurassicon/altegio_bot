@@ -19,6 +19,7 @@ from __future__ import annotations
 import re
 import shlex
 from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -33,19 +34,30 @@ MIGRATION_GATE_ENV = "ALTEGIO_REQUIRE_MIGTEST"
 NGINX_SUITE = "src/altegio_bot/tests/test_nginx_webhook_logging_integration.py"
 MIGRATION_SUITE = "src/altegio_bot/tests/test_easyweek_migration_integration.py"
 
+
+@dataclass(frozen=True)
+class _DeployPolicy:
+    events: frozenset[str]
+    ref: str
+    tests_result: str
+    alembic_result: str
+
+
 _REQUIRED_PR_TYPES = {"opened", "synchronize", "reopened"}
-_REQUIRED_DEPLOY_ATOMS = Counter(
-    {
-        ("github.event_name", "push"): 1,
-        ("github.ref", "refs/heads/main"): 1,
-        ("needs.tests.result", "success"): 1,
-        ("needs.alembic.result", "success"): 1,
-    }
+_ALLOWED_DEPLOY_EVENTS = frozenset({"push", "workflow_dispatch"})
+_MAIN_REF = "refs/heads/main"
+_SUCCESS_RESULT = "success"
+_EXPECTED_DEPLOY_POLICY = _DeployPolicy(
+    events=_ALLOWED_DEPLOY_EVENTS,
+    ref=_MAIN_REF,
+    tests_result=_SUCCESS_RESULT,
+    alembic_result=_SUCCESS_RESULT,
 )
 _CONDITION_EQUALITY_RE = re.compile(
     r"""(?P<left>[A-Za-z_][A-Za-z0-9_.]*)\s*==\s*"""
     r"""'(?P<right>[^']+)'"""
 )
+_DEPLOY_ALLOWLIST_RE = re.compile(r"^\(\s*(?P<events>[^()]*)\s*\)\s*&&\s*(?P<gates>[^()]*)$")
 _GITHUB_CONCURRENCY_CONTEXT_RE = re.compile(r"\$\{\{\s*github\.(?P<name>workflow|event_name|ref)\s*\}\}")
 
 
@@ -201,19 +213,23 @@ def _migration_gate_steps() -> list[dict[str, Any]]:
     return [step for step in _steps("tests") if MIGRATION_GATE_ENV in (step.get("env") or {})]
 
 
-def _condition_atoms(condition: Any) -> Counter[tuple[str, str]] | None:
-    """Parse a strict conjunction of equality atoms used by the deploy guard."""
+def _condition_source(condition: Any) -> str | None:
+    """Unwrap and normalise the narrow GitHub condition syntax we accept."""
     if not isinstance(condition, str):
         return None
     source = condition.strip()
     if source.startswith("${{") and source.endswith("}}"):
         source = source[3:-2].strip()
     source = " ".join(source.split())
-    if not source or any(forbidden in source for forbidden in ("||", "#", "(", ")")):
+    if not source or "#" in source:
         return None
+    return source
 
+
+def _equality_atoms(source: str, *, separator: str) -> Counter[tuple[str, str]] | None:
+    """Parse only ``identifier == 'literal'`` atoms separated by one operator."""
     atoms: Counter[tuple[str, str]] = Counter()
-    for raw_atom in source.split("&&"):
+    for raw_atom in source.split(separator):
         atom = raw_atom.strip()
         match = _CONDITION_EQUALITY_RE.fullmatch(atom)
         if match is None:
@@ -222,8 +238,61 @@ def _condition_atoms(condition: Any) -> Counter[tuple[str, str]] | None:
     return atoms
 
 
-def _deploy_condition_is_strict_main_push(condition: Any) -> bool:
-    return _condition_atoms(condition) == _REQUIRED_DEPLOY_ATOMS
+def _parse_deploy_policy(condition: Any) -> _DeployPolicy | None:
+    """Parse only ``(event || event) && ref && tests && alembic``."""
+    source = _condition_source(condition)
+    if source is None:
+        return None
+    match = _DEPLOY_ALLOWLIST_RE.fullmatch(source)
+    if match is None:
+        return None
+    event_atoms = _equality_atoms(match.group("events"), separator="||")
+    gate_atoms = _equality_atoms(match.group("gates"), separator="&&")
+    if event_atoms is None or gate_atoms is None:
+        return None
+    if any(identifier != "github.event_name" or count != 1 for (identifier, _), count in event_atoms.items()):
+        return None
+    if any(count != 1 for count in gate_atoms.values()):
+        return None
+
+    gate_identifiers = [identifier for (identifier, _) in gate_atoms]
+    if len(set(gate_identifiers)) != len(gate_identifiers):
+        return None
+    gate_values = {identifier: value for (identifier, value) in gate_atoms}
+    required_gates = {
+        "github.ref",
+        "needs.tests.result",
+        "needs.alembic.result",
+    }
+    if gate_values.keys() != required_gates:
+        return None
+    return _DeployPolicy(
+        events=frozenset(value for (_, value) in event_atoms),
+        ref=gate_values["github.ref"],
+        tests_result=gate_values["needs.tests.result"],
+        alembic_result=gate_values["needs.alembic.result"],
+    )
+
+
+def _deploy_condition_matches_contract(condition: Any) -> bool:
+    return _parse_deploy_policy(condition) == _EXPECTED_DEPLOY_POLICY
+
+
+def deploy_allowed(
+    *,
+    policy: _DeployPolicy,
+    event_name: str,
+    ref: str,
+    tests_result: str,
+    alembic_result: str,
+) -> bool:
+    """Evaluate an artificial GitHub context against the parsed YAML policy."""
+    return (
+        event_name in policy.events
+        and ref == policy.ref
+        and tests_result == policy.tests_result
+        and alembic_result == policy.alembic_result
+    )
 
 
 def _render_concurrency_group(
@@ -340,9 +409,54 @@ def test_deploy_depends_on_tests_and_alembic() -> None:
     assert {"tests", "alembic"} <= _needs("deploy")
 
 
-def test_deploy_is_only_a_successful_push_to_main() -> None:
+def test_deploy_condition_matches_context_contract() -> None:
     deploy = _jobs()["deploy"]
-    assert _deploy_condition_is_strict_main_push(deploy.get("if"))
+    assert _parse_deploy_policy(deploy.get("if")) == _EXPECTED_DEPLOY_POLICY
+
+
+@pytest.mark.parametrize(
+    (
+        "event_name",
+        "ref",
+        "tests_result",
+        "alembic_result",
+        "expected",
+    ),
+    [
+        ("push", "refs/heads/main", "success", "success", True),
+        ("workflow_dispatch", "refs/heads/main", "success", "success", True),
+        ("pull_request", "refs/pull/123/merge", "success", "success", False),
+        ("pull_request", "refs/heads/main", "success", "success", False),
+        ("push", "refs/heads/feature", "success", "success", False),
+        ("workflow_dispatch", "refs/heads/feature", "success", "success", False),
+        ("workflow_dispatch", "refs/tags/v1", "success", "success", False),
+        ("push", "refs/heads/main", "failure", "success", False),
+        ("workflow_dispatch", "refs/heads/main", "success", "failure", False),
+        ("push", "refs/heads/main", "skipped", "success", False),
+        ("workflow_dispatch", "refs/heads/main", "success", "skipped", False),
+        ("push", "refs/heads/main", "success", "cancelled", False),
+        ("schedule", "refs/heads/main", "success", "success", False),
+    ],
+)
+def test_deploy_context_contract(
+    event_name: str,
+    ref: str,
+    tests_result: str,
+    alembic_result: str,
+    expected: bool,
+) -> None:
+    policy = _parse_deploy_policy(_jobs()["deploy"].get("if"))
+    assert policy is not None
+    assert (
+        deploy_allowed(
+            policy=policy,
+            event_name=event_name,
+            ref=ref,
+            tests_result=tests_result,
+            alembic_result=alembic_result,
+        )
+        is expected
+    )
 
 
 def test_deploy_job_and_step_cannot_be_softened() -> None:
@@ -366,44 +480,96 @@ def test_notify_does_not_run_for_pull_requests() -> None:
     "condition",
     [
         (
-            "github.event_name == 'pull_request' && "
+            "(github.event_name == 'push' || "
+            "github.event_name == 'pull_request') && "
             "github.ref == 'refs/heads/main' && "
             "needs.tests.result == 'success' && "
             "needs.alembic.result == 'success'"
         ),
         (
-            "github.event_name == 'push' && "
+            "(github.event_name == 'push' || "
+            "github.event_name == 'workflow_dispatch') && "
             "github.ref == 'refs/heads/main-feature' && "
             "needs.tests.result == 'success' && "
             "needs.alembic.result == 'success'"
         ),
         (
-            "github.event_name == 'push' || "
-            "github.event_name == 'pull_request' && "
+            "(github.event_name != 'pull_request') && "
             "github.ref == 'refs/heads/main' && "
             "needs.tests.result == 'success' && "
             "needs.alembic.result == 'success'"
         ),
         (
-            "github.event_name == 'pull_request' && "
-            "github.ref == 'refs/heads/feature'\n"
-            "# github.event_name == 'push' && github.ref == 'refs/heads/main' && "
-            "needs.tests.result == 'success' && needs.alembic.result == 'success'"
+            "(github.event_name == 'push' || "
+            "github.event_name == 'workflow_dispatch') && "
+            "github.ref contains 'main' && "
+            "needs.tests.result == 'success' && "
+            "needs.alembic.result == 'success'"
         ),
         (
-            "github.event_name == 'push' && "
-            "contains(github.ref, 'main') && "
+            "(github.event_name == 'push' || "
+            "github.event_name == 'workflow_dispatch') && "
+            "github.ref == 'refs/heads/main' && "
             "needs.tests.result != 'failure' && "
             "needs.alembic.result == 'success'"
         ),
         (
-            'github.event_name == "push" && '
+            "(github.event_name == 'workflow_dispatch') && "
+            "needs.tests.result == 'success' && "
+            "needs.alembic.result == 'success'"
+        ),
+        (
+            "(github.event_name == 'push' || "
+            "github.event_name == 'workflow_dispatch') && "
+            "github.ref == 'refs/heads/feature'\n"
+            "# github.ref == 'refs/heads/main' && "
+            "needs.tests.result == 'success' && "
+            "needs.alembic.result == 'success'"
+        ),
+        (
+            "echo \"(github.event_name == 'push' || "
+            "github.event_name == 'workflow_dispatch') && "
+            "github.ref == 'refs/heads/main' && "
+            "needs.tests.result == 'success' && "
+            "needs.alembic.result == 'success'\""
+        ),
+        (
+            "(github.event_name == 'push') && "
+            "github.ref == 'refs/heads/main' && "
+            "needs.tests.result == 'success' && "
+            "needs.alembic.result == 'success'"
+        ),
+        (
+            "github.event_name == 'push' || "
+            "(github.event_name == 'workflow_dispatch' && "
+            "github.ref == 'refs/heads/main' && "
+            "needs.tests.result == 'success' && "
+            "needs.alembic.result == 'success')"
+        ),
+        (
+            '(github.event_name == "push" || '
+            'github.event_name == "workflow_dispatch") && '
             'github.ref == "refs/heads/main" && '
             'needs.tests.result == "success" && '
             'needs.alembic.result == "success"'
         ),
         (
-            ")github.event_name == 'push'( && "
+            ")github.event_name == 'push' || "
+            "github.event_name == 'workflow_dispatch'( && "
+            "github.ref == 'refs/heads/main' && "
+            "needs.tests.result == 'success' && "
+            "needs.alembic.result == 'success'"
+        ),
+        (
+            "(github.event_name == 'push' || "
+            "github.event_name == 'workflow_dispatch' || "
+            "github.event_name == 'schedule') && "
+            "github.ref == 'refs/heads/main' && "
+            "needs.tests.result == 'success' && "
+            "needs.alembic.result == 'success'"
+        ),
+        (
+            "(github.event_name == 'push' || github.event_name == 'push') && "
             "github.ref == 'refs/heads/main' && "
             "needs.tests.result == 'success' && "
             "needs.alembic.result == 'success'"
@@ -411,17 +577,20 @@ def test_notify_does_not_run_for_pull_requests() -> None:
     ],
 )
 def test_deploy_condition_parser_rejects_unsafe_guards(condition: str) -> None:
-    assert not _deploy_condition_is_strict_main_push(condition)
+    assert not _deploy_condition_matches_contract(condition)
 
 
-def test_deploy_condition_parser_accepts_wrapped_reordered_guard() -> None:
+def test_deploy_condition_parser_accepts_safe_allowlist() -> None:
     condition = """${{
-        needs.alembic.result == 'success' &&
-        github.ref == 'refs/heads/main' &&
-        github.event_name == 'push' &&
+        (
+            github.event_name == 'workflow_dispatch' ||
+            github.event_name == 'push'
+        ) &&
         needs.tests.result == 'success'
+        && github.ref == 'refs/heads/main'
+        && needs.alembic.result == 'success'
     }}"""
-    assert _deploy_condition_is_strict_main_push(condition)
+    assert _deploy_condition_matches_contract(condition)
 
 
 # ===========================================================================
