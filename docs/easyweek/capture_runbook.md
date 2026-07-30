@@ -100,58 +100,153 @@ https://<host>/webhooks/easyweek?event=booking-created&token=<secret>
 > proxy — его конфигурация вне репозитория, и её обязан проверить оператор
 > (2.2). Пока proxy-логи не проверены, считать секрет защищённым нельзя.
 
-### 2.2. Логи reverse proxy — ОБЯЗАТЕЛЬНЫЙ операторский gate до go-live
+### 2.2. Логи reverse proxy — ПОДТВЕРЖДЁННАЯ утечка, обязательный gate до go-live
 
-Nginx/Caddy/Traefik-конфиг живёт вне репозитория, поэтому код за его фактическое
-применение не отвечает. Стандартный nginx `log_format combined` содержит
-`$request` (метод + **полный URI**) — он для этих эндпоинтов недопустим.
+> **Статус: утечка подтверждена на production.** Активная проверка на
+> `api.kitilash.com` показала, что полный request target вебхука (вместе с
+> `token=`) попал в `/var/log/nginx/access.log`. В логах приложения и в
+> `docker logs` маркер отсутствовал — значит проблема именно в host-level Nginx
+> access logging, а не в коде. Пока пункты ниже не выполнены, go-live
+> блокируется, а текущие query-секреты считаются **потенциально раскрытыми**.
 
-Проверить location, через которые идут `/webhooks/easyweek` и `/webhooks/altegio`:
+Nginx-конфиг живёт вне репозитория, поэтому код за его фактическое применение не
+отвечает. Стандартный `log_format combined` содержит `$request` (метод +
+**полный URI вместе с query string**) — для этих эндпоинтов он недопустим.
+
+Чувствительны **все** webhook-маршруты, а не только EasyWeek:
+
+| Маршрут | Секрет в query |
+|---|---|
+| `/webhooks/easyweek` | `?event=<trigger>&token=<secret>` |
+| `/webhooks/altegio` | `?secret=<secret>` (в части вариантов ещё `userGuid`) |
+| `/webhook/whatsapp` | Meta verification: `?hub.mode=…&hub.verify_token=<token>&hub.challenge=…` |
+
+#### Шаг 1. Найти фактически активный конфиг
 
 ```bash
 nginx -T
 ```
 
-В соответствующем access-формате **не должно быть** `$request`, `$request_uri`,
-`$args`. Безопасный формат:
+Найти `server_name api.kitilash.com`, все `access_log`, все `log_format`,
+location'ы webhook-маршрутов и то, наследуется ли глобальный access log.
 
-```nginx
-log_format safe_webhook
-    '$remote_addr status=$status method=$request_method uri=$uri '
-    'bytes=$body_bytes_sent request_time=$request_time';
+#### Шаг 2. Применить безопасный формат
 
-server {
-    location /webhooks/ {
-        access_log /var/log/nginx/webhooks.log safe_webhook;
-        client_max_body_size 1m;
-        client_body_timeout 10s;
-        proxy_pass http://127.0.0.1:8000;
-    }
-}
-```
-
-После правки:
-
-```bash
-nginx -t
-```
-
-Затем **активная проверка утечки**: послать доставку с уникальным маркером
-вместо реального секрета —
+Готовый reference-снипет лежит в репозитории:
 
 ```text
-/webhooks/easyweek?event=booking-created&token=EW_LOG_LEAK_TEST_<random>
+deploy/nginx/kitilash_webhook_safe_logging.conf.example
 ```
 
-и найти этот маркер в:
+В формате запрещены `$request`, `$request_uri`, `$args`, `$query_string`,
+`$is_args`, `$http_referer` и произвольные request-заголовки; используется `$uri`
+(путь без query), а не `$request_uri`. Глобальный access log сайта **не**
+отключается — изменение ограничено webhook-маршрутами.
 
-- Nginx access/error logs;
-- `docker logs` контейнеров proxy и API;
-- journald (`journalctl -u nginx`);
-- централизованном лог-коллекторе, если он есть.
+Перед правкой — backup фактического конфига. После правки:
 
-Маркер не должен обнаружиться **нигде**. Если обнаружился — go-live блокируется
-до исправления формата.
+```bash
+sudo nginx -t
+```
+
+Только при успешном результате (reload, не restart):
+
+```bash
+sudo systemctl reload nginx
+```
+
+Затем убедиться, что webhook-location'ы реально используют новый формат:
+
+```bash
+sudo nginx -T
+```
+
+#### Шаг 3. Активная проверка утечки (обязательна)
+
+Только искусственный маркер, никогда реальный секрет:
+
+```bash
+MARKER="EW_LOG_LEAK_TEST_$(openssl rand -hex 8)"
+```
+
+```bash
+curl -sS -X POST \
+  "https://api.kitilash.com/webhooks/easyweek?event=booking-created&token=${MARKER}" \
+  -H "Content-Type: application/json" \
+  -d '{"probe":"nginx-log-leak-test"}'
+```
+
+Ожидается `403` (маркер — не настоящий секрет). Затем искать маркер:
+
+```bash
+grep -R "$MARKER" /var/log/nginx/ 2>/dev/null
+```
+
+```bash
+journalctl -u nginx --since "15 minutes ago" --no-pager | grep "$MARKER"
+```
+
+```bash
+docker compose -p altegio_bot logs --since 15m 2>&1 | grep "$MARKER"
+```
+
+Маркер не должен найтись **нигде**. Повторить то же для двух остальных
+маршрутов:
+
+```text
+/webhooks/altegio?secret=<marker>
+/webhook/whatsapp?hub.mode=subscribe&hub.verify_token=<marker>&hub.challenge=123
+```
+
+Отдельно проверить новый безопасный лог:
+
+```bash
+tail -n 20 /var/log/nginx/webhooks_access.log
+```
+
+Там должны быть метод, путь, статус, размер ответа и длительность — и не должно
+быть `token=`, `secret=`, `userGuid=`, `hub.verify_token`, символа `?` и query
+string целиком.
+
+**Новый файл конфигурации сам по себе не является исправлением.** Только
+пройденный marker-тест на фактически работающем конфиге доказывает, что query
+string больше не логируется.
+
+#### Шаг 4. Ротация потенциально раскрытых секретов
+
+Порядок важен: **сначала** исправить Nginx и пройти marker-тест, и только потом
+ротировать — иначе новые значения снова попадут в `access.log`.
+
+Ротировать минимум:
+
+```text
+EASYWEEK_WEBHOOK_SECRET
+ALTEGIO_WEBHOOK_SECRET
+```
+
+Дополнительно проверить исторические Nginx-логи на наличие Meta verification URL;
+если там встречался `hub.verify_token` — ротировать и
+`WHATSAPP_WEBHOOK_VERIFY_TOKEN`.
+
+Правила: не печатать реальные секреты в stdout, не вставлять их в PR/issue/commit
+и в shell history, не коммитить `easyweek.env`/`.env`/production-конфиг Nginx,
+генерировать значения криптографически безопасно
+(`python3 -c "import secrets; print(secrets.token_urlsafe(32))"`). Сначала
+обновить production env, затем URL/конфигурацию у провайдера, затем:
+
+```bash
+docker compose -p altegio_bot up -d --force-recreate altegio-api
+```
+
+После ротации проверить: старый EasyWeek token → `403`; старый Altegio secret →
+`403`; новая реальная доставка EasyWeek → `200`; новая реальная доставка Altegio
+→ `200`; новых значений нет в Nginx, journald и Docker logs.
+
+Удаление или очистка старых логов **не заменяет** ротацию: сначала сделать старые
+секреты недействительными.
+
+В отчётах указывать только `found / not found`, `rotated / not rotated`,
+`old token rejected / new delivery accepted` — без самих значений.
 
 ### 2.3. Публикация порта — ОБЯЗАТЕЛЬНЫЙ операторский gate
 

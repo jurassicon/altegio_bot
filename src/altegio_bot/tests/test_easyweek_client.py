@@ -57,6 +57,15 @@ ALL_SENTINELS = (
 # intercepts every request, so no real network call happens.
 BASE = "https://my.easyweek.io/api/public/v2"
 BOOKING_UUID = "123e4567-e89b-12d3-a456-426614174000"
+VALID_UUID = "3f2a1b6c-0d4e-4f8a-9b1c-2d3e4f5a6b7c"
+
+# A minimal location that satisfies the required uuid/name/timezone contract.
+_LOCATION: dict[str, Any] = {"uuid": VALID_UUID, "name": "Durlach", "timezone": "Europe/Berlin"}
+_LOCATION_2: dict[str, Any] = {
+    "uuid": "9c8b7a65-4321-4abc-8def-0123456789ab",
+    "name": "Zweite Filiale",
+    "timezone": "Europe/Berlin",
+}
 
 _BOOKING_WITH_PII: dict[str, Any] = {
     "uuid": BOOKING_UUID,
@@ -232,12 +241,12 @@ async def test_list_locations_issues_single_get_to_locations() -> None:
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen.append(request)
-        return httpx.Response(200, json=[{"uuid": "u1", "name": "Durlach"}])
+        return httpx.Response(200, json=[_LOCATION])
 
     async with _client(handler) as client:
         items = await client.list_locations()
 
-    assert items == [{"uuid": "u1", "name": "Durlach"}]
+    assert items == [_LOCATION]
     assert len(seen) == 1
     assert seen[0].method == "GET"
     assert str(seen[0].url) == f"{BASE}/locations"
@@ -246,10 +255,10 @@ async def test_list_locations_issues_single_get_to_locations() -> None:
 @pytest.mark.asyncio
 async def test_list_locations_accepts_data_envelope() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"data": [{"uuid": "u1"}, {"uuid": "u2"}]})
+        return httpx.Response(200, json={"data": [_LOCATION, _LOCATION_2]})
 
     async with _client(handler) as client:
-        assert await client.list_locations() == [{"uuid": "u1"}, {"uuid": "u2"}]
+        assert await client.list_locations() == [_LOCATION, _LOCATION_2]
 
 
 @pytest.mark.asyncio
@@ -750,15 +759,15 @@ async def test_ping_allows_extra_fields() -> None:
 @pytest.mark.parametrize(
     "body",
     [
-        {"items": [{"uuid": "u1"}]},  # envelope without the documented data key
+        {"items": [_LOCATION]},  # envelope without the documented data key
         {"data": None},
         {"data": "junk"},
         {"data": 7},
-        {"data": {"uuid": "u1"}},  # object where a list is required
-        [{"uuid": "u1"}, "junk"],  # a non-object entry must fail the call
-        [{"uuid": "u1"}, None],
-        [{"uuid": "u1"}, 7],
-        {"data": [{"uuid": "u1"}, "junk"]},
+        {"data": _LOCATION},  # object where a list is required
+        [_LOCATION, "junk"],  # a non-object entry must fail the call
+        [_LOCATION, None],
+        [_LOCATION, 7],
+        {"data": [_LOCATION, "junk"]},
         "not-a-container",
         42,
     ],
@@ -785,7 +794,7 @@ async def test_locations_never_silently_drops_entries() -> None:
     """A malformed entry must fail loudly, not shrink the operator's list."""
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json=[{"uuid": "u1"}, "junk", {"uuid": "u2"}])
+        return httpx.Response(200, json=[_LOCATION, "junk", _LOCATION_2])
 
     async with _client(handler) as client:
         with pytest.raises(EasyWeekProtocolError):
@@ -931,3 +940,135 @@ def test_empty_secret_str_key_still_raises_config_error(monkeypatch) -> None:
     monkeypatch.setattr(settings_module.settings, "easyweek_workspace_slug", SLUG)
     with pytest.raises(EasyWeekConfigError):
         EasyWeekClient(base_url=BASE)
+
+
+# ===========================================================================
+# Strict location contract: uuid + name + timezone are all required
+# ===========================================================================
+
+_MALFORMED_LOCATIONS: list[Any] = [
+    # Missing fields entirely.
+    [{}],
+    [{"name": "Durlach", "timezone": "Europe/Berlin"}],  # no uuid
+    [{"uuid": VALID_UUID, "timezone": "Europe/Berlin"}],  # no name
+    [{"uuid": VALID_UUID, "name": "Durlach"}],  # no timezone
+    # Blank / unusable uuid.
+    [{"uuid": "", "name": "Durlach", "timezone": "Europe/Berlin"}],
+    [{"uuid": "   ", "name": "Durlach", "timezone": "Europe/Berlin"}],
+    [{"uuid": "not-a-uuid", "name": "Durlach", "timezone": "Europe/Berlin"}],
+    # Blank name / timezone.
+    [{"uuid": VALID_UUID, "name": "", "timezone": "Europe/Berlin"}],
+    [{"uuid": VALID_UUID, "name": "   ", "timezone": "Europe/Berlin"}],
+    [{"uuid": VALID_UUID, "name": "Durlach", "timezone": ""}],
+    [{"uuid": VALID_UUID, "name": "Durlach", "timezone": "   "}],
+    # Wrong types.
+    [{"uuid": None, "name": "Durlach", "timezone": "Europe/Berlin"}],
+    [{"uuid": 123, "name": "Durlach", "timezone": "Europe/Berlin"}],
+    [{"uuid": VALID_UUID, "name": None, "timezone": "Europe/Berlin"}],
+    [{"uuid": VALID_UUID, "name": [], "timezone": "Europe/Berlin"}],
+    [{"uuid": VALID_UUID, "name": "Durlach", "timezone": None}],
+    [{"uuid": VALID_UUID, "name": "Durlach", "timezone": {}}],
+    # A uuid carrying extra junk must not slip through.
+    [{"uuid": f"{VALID_UUID}?x=1", "name": "Durlach", "timezone": "Europe/Berlin"}],
+    [{"uuid": "../../etc/passwd", "name": "Durlach", "timezone": "Europe/Berlin"}],
+    # One good entry plus one broken entry must fail the WHOLE response.
+    [_LOCATION, {}],
+    [{}, _LOCATION],
+    # Same, inside the documented envelope.
+    {"data": [_LOCATION, {}]},
+]
+
+
+@pytest.mark.parametrize("body", _MALFORMED_LOCATIONS)
+@pytest.mark.asyncio
+async def test_location_without_required_identity_is_protocol_error(body: Any) -> None:
+    """A location the operator cannot identify or reference is not a location.
+
+    Accepting ``[{}]`` used to make the probe print
+    ``{"uuid": null, "name": null, "timezone": null}`` with ok=true.
+    """
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(200, json=body)
+
+    sleeps = _Sleeps()
+    async with _client(handler, sleep=sleeps) as client:
+        with pytest.raises(EasyWeekProtocolError) as exc_info:
+            await client.list_locations()
+
+    assert exc_info.value.operation == "list_locations"
+    assert calls["n"] == 1  # a malformed 2xx is never retried
+    assert sleeps.delays == []
+
+
+@pytest.mark.asyncio
+async def test_malformed_location_value_never_reaches_logs_or_exception(caplog) -> None:
+    """The offending uuid/name value must not be echoed anywhere."""
+    marker = "SENTINEL_BADLOC_zzz555"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=[{"uuid": marker, "name": marker, "timezone": marker}],
+        )
+
+    with caplog.at_level(logging.DEBUG):
+        async with _client(handler) as client:
+            with pytest.raises(EasyWeekProtocolError) as exc_info:
+                await client.list_locations()
+
+    blob = "\n".join(r.getMessage() for r in caplog.records)
+    assert marker not in blob
+    assert marker not in str(exc_info.value)
+    assert marker not in repr(exc_info.value.safe_summary)
+
+
+@pytest.mark.parametrize(
+    "body,expected",
+    [
+        ([_LOCATION], [_LOCATION]),  # bare list
+        ({"data": [_LOCATION]}, [_LOCATION]),  # documented envelope
+        ([_LOCATION, _LOCATION_2], [_LOCATION, _LOCATION_2]),  # several locations
+        ({"data": [_LOCATION, _LOCATION_2]}, [_LOCATION, _LOCATION_2]),
+    ],
+)
+@pytest.mark.asyncio
+async def test_valid_locations_are_accepted(body: Any, expected: list[dict[str, Any]]) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=body)
+
+    async with _client(handler) as client:
+        assert await client.list_locations() == expected
+
+
+@pytest.mark.asyncio
+async def test_unknown_extra_location_fields_do_not_break_validation() -> None:
+    """Upstream may add fields; only the required three are enforced."""
+    enriched = {
+        **_LOCATION,
+        "address": {"city": "Karlsruhe"},
+        "working_hours": [{"day": 1}],
+        "brand_new_field": "whatever",
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[enriched])
+
+    async with _client(handler) as client:
+        assert await client.list_locations() == [enriched]
+
+
+@pytest.mark.asyncio
+async def test_uppercase_location_uuid_is_accepted_as_is() -> None:
+    """Validation must not rewrite the operator-visible value."""
+    upper = {**_LOCATION, "uuid": VALID_UUID.upper()}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[upper])
+
+    async with _client(handler) as client:
+        items = await client.list_locations()
+
+    assert items[0]["uuid"] == VALID_UUID.upper()

@@ -413,3 +413,65 @@ def test_malformed_booking_envelope_fails_the_probe(monkeypatch, capsys) -> None
     assert json.loads(captured.out)["error"] == "EasyWeekProtocolError"
     assert '"ok": true' not in captured.out
     _assert_no_sentinels(captured.out + captured.err)
+
+
+def test_location_without_identity_fields_fails_the_probe(monkeypatch, capsys) -> None:
+    """`[{}]` used to print uuid/name/timezone as null with ok=true.
+
+    An operator cannot record a UUID from that, so it must be a failed probe.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/ping"):
+            return httpx.Response(200, json={"ping": "pong", "version": "v12.32.3"})
+        return httpx.Response(200, json=[{}])
+
+    _install_client(monkeypatch, handler)
+
+    exit_code = probe.main(["--redact-pii"])
+
+    assert exit_code == probe.EXIT_API_ERROR
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert payload["ok"] is False
+    assert payload["error"] == "EasyWeekProtocolError"
+    assert payload["operation"] == "list_locations"
+    # The old broken output must be gone entirely.
+    assert '"ok": true' not in captured.out
+    assert '"uuid": null' not in captured.out
+    assert '"name": null' not in captured.out
+    assert '"timezone": null' not in captured.out
+
+
+def test_partially_identified_location_fails_the_probe(monkeypatch, capsys) -> None:
+    """One good location plus one malformed entry must not yield a partial list."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/ping"):
+            return httpx.Response(200, json={"ping": "pong"})
+        return httpx.Response(200, json=[_LOCATIONS[0], {"name": "Broken"}])
+
+    _install_client(monkeypatch, handler)
+
+    assert probe.main([]) == probe.EXIT_API_ERROR
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["error"] == "EasyWeekProtocolError"
+    assert '"ok": true' not in captured.out
+    # No partial list may be shown to the operator.
+    assert DURLACH_UUID not in captured.out
+    _assert_no_sentinels(captured.out + captured.err)
+
+
+def test_probe_prints_the_required_identity_fields(monkeypatch, capsys) -> None:
+    """Positive counterpart: valid locations expose exactly what the operator needs."""
+    _install_client(monkeypatch, _ok_handler)
+
+    assert probe.main(["--redact-pii"]) == probe.EXIT_OK
+    captured = capsys.readouterr()
+    items = json.loads(captured.out)["locations"]["items"]
+
+    for item in items:
+        assert isinstance(item["uuid"], str) and item["uuid"].strip()
+        assert isinstance(item["name"], str) and item["name"].strip()
+        assert isinstance(item["timezone"], str) and item["timezone"].strip()
+    _assert_no_sentinels(captured.out + captured.err)

@@ -1,0 +1,116 @@
+# Safe Nginx access logging for webhook routes — REFERENCE EXAMPLE
+#
+# WHY THIS FILE EXISTS
+# --------------------
+# Every webhook this service exposes authenticates with a secret in the QUERY
+# STRING (EasyWeek and Altegio have no HMAC signature; Meta's verification
+# handshake uses hub.verify_token). Nginx's default `combined` format logs
+# `$request`, which is the full request target INCLUDING that query string, so
+# the default configuration writes live webhook secrets into
+# /var/log/nginx/access.log in clear text.
+#
+# The application itself is already clean: uvicorn runs with --no-access-log,
+# AccessLogMiddleware logs only method/path/status/duration, and the stored
+# webhook rows mask the query. The leak is purely at the host-level proxy, so it
+# has to be fixed here.
+#
+# The host Nginx lives outside this repository. This file is the versioned
+# reference so the fix is not silently lost on the next server migration.
+# Copy the relevant pieces into the real site config; do NOT commit the real
+# production config, certificates, IPs or any secret back into the repo.
+#
+# ---------------------------------------------------------------------------
+# 1. http context — declare the safe format once
+# ---------------------------------------------------------------------------
+# Put this in the `http { ... }` block (e.g. /etc/nginx/nginx.conf or a file in
+# /etc/nginx/conf.d/ that is included from `http`).
+#
+# FORBIDDEN in this format — each of these can carry the secret:
+#   $request        full request line, includes the query string
+#   $request_uri    original URI, includes the query string
+#   $args           the query string itself
+#   $query_string   alias of $args
+#   $is_args        leaks whether a query was present (and invites $args nearby)
+#   $http_referer   a referer may echo a previously visited secret-bearing URL
+# Do not log arbitrary request headers here either.
+#
+# We log $uri (normalised path WITHOUT the query), never $request_uri.
+
+log_format kitilash_webhook_safe
+    '$remote_addr [$time_local] '
+    'method=$request_method uri=$uri '
+    'status=$status bytes=$body_bytes_sent '
+    'request_time=$request_time';
+
+# ---------------------------------------------------------------------------
+# 2. server context — apply it to EVERY webhook route
+# ---------------------------------------------------------------------------
+# Inside `server { server_name api.kitilash.com; ... }`.
+#
+# IMPORTANT: an `access_log` directive inside a location REPLACES the inherited
+# one for requests handled by that location, so the request stops going to the
+# site-wide /var/log/nginx/access.log. Verify that with `nginx -T` plus the
+# marker leak test in docs/easyweek/capture_runbook.md — do not assume it.
+#
+# Do NOT disable the site-wide access log: the change must stay scoped to the
+# webhook routes. Keep the existing proxy_pass / TLS / headers / body limits /
+# timeouts exactly as they are.
+
+# EasyWeek capture — ?event=<trigger>&token=<secret>
+location = /webhooks/easyweek {
+    access_log /var/log/nginx/webhooks_access.log kitilash_webhook_safe;
+    proxy_pass http://127.0.0.1:8000;   # keep the value already in production
+    proxy_set_header Host              $host;
+    proxy_set_header X-Real-IP         $remote_addr;
+    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}
+
+# Altegio webhook — ?secret=<secret> (and userGuid in some payload variants)
+location = /webhooks/altegio {
+    access_log /var/log/nginx/webhooks_access.log kitilash_webhook_safe;
+    proxy_pass http://127.0.0.1:8000;
+    proxy_set_header Host              $host;
+    proxy_set_header X-Real-IP         $remote_addr;
+    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}
+
+# Meta/WhatsApp — the GET verification handshake carries hub.verify_token in the
+# query string, so this route is exactly as sensitive as the two above.
+location = /webhook/whatsapp {
+    access_log /var/log/nginx/webhooks_access.log kitilash_webhook_safe;
+    proxy_pass http://127.0.0.1:8000;
+    proxy_set_header Host              $host;
+    proxy_set_header X-Real-IP         $remote_addr;
+    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}
+
+# Catch-all for any CURRENT or FUTURE webhook path, so a route added later does
+# not silently fall back to the default secret-logging format. Exact `location =`
+# blocks above win over this prefix match; this only needs to cover the rest.
+location ^~ /webhook {
+    access_log /var/log/nginx/webhooks_access.log kitilash_webhook_safe;
+    proxy_pass http://127.0.0.1:8000;
+    proxy_set_header Host              $host;
+    proxy_set_header X-Real-IP         $remote_addr;
+    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}
+
+# ---------------------------------------------------------------------------
+# 3. Apply and verify
+# ---------------------------------------------------------------------------
+#   sudo cp /etc/nginx/sites-available/<site> /root/nginx-backup-$(date +%F-%H%M).conf
+#   sudo nginx -t                 # must pass BEFORE reloading
+#   sudo systemctl reload nginx   # reload, not restart
+#   sudo nginx -T | less          # confirm the webhook locations use the safe format
+#
+# Then run the active marker leak test in docs/easyweek/capture_runbook.md.
+# A new config file is NOT proof: only the marker test proves the running
+# configuration stopped logging query strings.
+#
+# Log rotation: add /var/log/nginx/webhooks_access.log to the existing
+# /etc/logrotate.d/nginx entry (or a glob that already covers it) so the new
+# file rotates like the others.

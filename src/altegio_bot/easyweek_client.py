@@ -232,6 +232,42 @@ def _canonical_booking_uuid(value: object) -> str:
     return str(parsed)
 
 
+def _validated_location(item: object) -> dict[str, Any]:
+    """Return *item* if it is a usable location entry, otherwise raise.
+
+    The operator reads this list to pick ``EASYWEEK_LOCATION_UUID`` by hand, so an
+    entry is only usable when it can actually be identified AND referenced. A bare
+    ``{}`` used to pass the "is a dict" check and reach the probe as
+    ``{"uuid": null, "name": null, "timezone": null}`` — an operator could not act
+    on that, and printing it as a success was worse than failing.
+
+    ``uuid`` must parse as a real UUID (which also rules out a value carrying a
+    query, a path traversal or free text), and ``name``/``timezone`` must be
+    non-blank strings so the branch can be recognised. That is the whole contract
+    here: timezone/domain normalization stays with PR-4.
+
+    The offending value is never logged nor put in the error message.
+    """
+    if not isinstance(item, dict):
+        raise EasyWeekProtocolError("locations response contains a non-object entry", operation="list_locations")
+
+    raw_uuid = item.get("uuid")
+    if not isinstance(raw_uuid, str) or not raw_uuid.strip():
+        raise EasyWeekProtocolError("location entry has no usable uuid", operation="list_locations")
+    try:
+        uuid_module.UUID(raw_uuid.strip())
+    except (ValueError, AttributeError, TypeError):
+        raise EasyWeekProtocolError("location entry uuid is not a valid UUID", operation="list_locations") from None
+
+    for field in ("name", "timezone"):
+        value = item.get(field)
+        if not isinstance(value, str) or not value.strip():
+            # The field NAME is a fixed literal; the bad value is never included.
+            raise EasyWeekProtocolError(f"location entry has no usable {field}", operation="list_locations")
+
+    return item
+
+
 def _parse_retry_after(raw: str | None) -> float | None:
     """Parse a ``Retry-After`` delay in seconds, clamped to a safe maximum.
 
@@ -482,7 +518,9 @@ class EasyWeekClient:
 
         Malformed entries are NOT dropped silently: quietly discarding one would
         hide exactly the case where the operator then picks a UUID from an
-        incomplete list. Any non-object entry fails the whole call.
+        incomplete list. Any entry that is not a usable location — see
+        :func:`_validated_location` for the required ``uuid`` / ``name`` /
+        ``timezone`` contract — fails the whole call.
         """
         payload = await self._get_json(_PATH_LOCATIONS, operation="list_locations")
 
@@ -499,12 +537,7 @@ class EasyWeekClient:
 
         if not isinstance(items, list):
             raise EasyWeekProtocolError("locations data is not a JSON list", operation="list_locations")
-        for item in items:
-            if not isinstance(item, dict):
-                raise EasyWeekProtocolError(
-                    "locations response contains a non-object entry", operation="list_locations"
-                )
-        return list(items)
+        return [_validated_location(item) for item in items]
 
     async def get_booking(self, booking_uuid: str) -> dict[str, Any]:
         """``GET /bookings/{uuid}`` — read one booking.
