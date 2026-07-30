@@ -82,6 +82,29 @@ _ALLOWED_LOG_VARIABLES = {
     *_REQUIRED_LOG_VARIABLES,
 }
 
+_WEBHOOK_SELECTOR_CASES = {
+    "webhook-root": ("/webhook", True),
+    "webhook-root-query": ("/webhook?x=1", True),
+    "whatsapp-path": ("/webhook/whatsapp", True),
+    "whatsapp-query": ("/webhook/whatsapp?hub.verify_token=x", True),
+    "webhooks-root": ("/webhooks", True),
+    "webhooks-root-query": ("/webhooks?x=1", True),
+    "easyweek-path": ("/webhooks/easyweek", True),
+    "easyweek-query": (
+        "/webhooks/easyweek?event=booking-created&token=x",
+        True,
+    ),
+    "altegio-query": ("/webhooks/altegio?secret=x", True),
+    "site-root": ("/", False),
+    "health": ("/health", False),
+    "webhook-prefix-collision": ("/webhookevil", False),
+    "webhooks-dash-collision": ("/webhooks-old", False),
+    "webhook-underscore-collision": ("/webhook_backup", False),
+    "nested-webhook": ("/api/webhook", False),
+    "nested-easyweek": ("/api/webhooks/easyweek", False),
+    "internal-destination": ("/internal-handler", False),
+}
+
 
 def _strip_inline_comment(line: str) -> str:
     """Strip an Nginx comment without treating a quoted ``#`` as one."""
@@ -113,13 +136,22 @@ def _active_config(path: Path) -> str:
     return "\n".join(lines)
 
 
+def _variables(text: str) -> list[str]:
+    """Return variables, normalising Nginx ``$name`` and ``${name}`` syntax."""
+    matches = re.finditer(
+        r"\$(?:\{(?P<braced>[A-Za-z0-9_]+)\}|(?P<plain>[A-Za-z0-9_]+))",
+        text,
+    )
+    return [f"${match.group('braced') or match.group('plain')}" for match in matches]
+
+
 def _has_variable(text: str, variable: str) -> bool:
     """Match a whole Nginx variable, not a prefix.
 
     ``$request`` must NOT be reported for ``$request_method`` or ``$request_time``,
     which are exactly the safe variables the format is required to use.
     """
-    return re.search(rf"{re.escape(variable)}(?![A-Za-z0-9_])", text) is not None
+    return variable in _variables(text)
 
 
 def _safe_log_format_body() -> str:
@@ -152,6 +184,31 @@ def _map_body(source: str, input_variable: str, output_variable: str) -> str:
     )
     assert match is not None, f"missing map {input_variable} -> {output_variable}"
     return match.group("body")
+
+
+def _map_entries(body: str) -> list[tuple[str, str]]:
+    """Parse a simple map body into exact selector/result pairs."""
+    entries: list[tuple[str, str]] = []
+    for statement in body.split(";"):
+        tokens = statement.split()
+        if not tokens:
+            continue
+        assert len(tokens) == 2, "map entries must have one selector and one result"
+        entries.append((tokens[0], tokens[1]))
+    return entries
+
+
+def _webhook_selector_pattern() -> str:
+    """Return the single positive regex from the original-request selector."""
+    active = _active_config(LOG_FORMATS_FILE)
+    body = _map_body(active, "$request_uri", "$kitilash_is_webhook")
+    patterns = [
+        selector.removeprefix("~")
+        for selector, result in _map_entries(body)
+        if selector.startswith("~") and result == "1"
+    ]
+    assert len(patterns) == 1, "webhook selector must have one positive regex"
+    return patterns[0]
 
 
 # ===========================================================================
@@ -206,6 +263,19 @@ def test_logging_include_contains_only_logging_directives() -> None:
         assert directive.group(0) in {"access_log", "error_log"}, f"non-logging directive in the include: {statement!r}"
 
 
+def test_logging_include_has_exactly_the_two_safe_statements() -> None:
+    """An additional combined access log would reintroduce the query leak."""
+    statements = [
+        " ".join(statement.split())
+        for statement in _active_config(LOGGING_INCLUDE_FILE).split(";")
+        if statement.strip()
+    ]
+    assert statements == [
+        "access_log /var/log/nginx/webhooks_access.log kitilash_webhook_safe",
+        "error_log /dev/null emerg",
+    ]
+
+
 # ===========================================================================
 # 2. The safe log format keeps the query string out
 # ===========================================================================
@@ -226,7 +296,7 @@ def test_safe_log_format_excludes_query_bearing_variables(variable: str) -> None
 
 def test_safe_log_format_uses_only_allowlisted_variables() -> None:
     """Block arbitrary headers, cookies and future query-bearing variables."""
-    variables = set(re.findall(r"\$[A-Za-z0-9_]+", _safe_log_format_body()))
+    variables = set(_variables(_safe_log_format_body()))
     assert variables == _ALLOWED_LOG_VARIABLES
 
 
@@ -237,6 +307,8 @@ def test_variable_matcher_does_not_confuse_request_with_request_method() -> None
     assert not _has_variable("request_time=$request_time", "$request")
     assert _has_variable("x=$request y", "$request")
     assert not _has_variable("uri=$uri", "$request_uri")
+    assert _has_variable("uri=${request_uri}", "$request_uri")
+    assert not _has_variable("method=${request_method}", "$request")
 
 
 def test_safe_log_format_uses_uri_not_request_uri() -> None:
@@ -270,41 +342,80 @@ def test_include_declares_a_safe_error_log_policy() -> None:
         assert match.group(1) == "/dev/null", f"error_log persists to {match.group(1)!r}"
 
 
+def test_logging_include_never_uses_original_request_uri() -> None:
+    """The secret-bearing request target is only valid as the boolean map input."""
+    assert not _has_variable(
+        _active_config(LOGGING_INCLUDE_FILE),
+        "$request_uri",
+    )
+
+
 def test_log_format_file_declares_the_format_in_http_context() -> None:
     active = _active_config(LOG_FORMATS_FILE)
     assert re.search(r"^\s*log_format\s+kitilash_webhook_safe\b", active, re.MULTILINE)
 
 
+def test_webhook_selector_uses_original_request_uri() -> None:
+    """Rewrites must not move a webhook request back into the combined log."""
+    active = _active_config(LOG_FORMATS_FILE)
+    _map_body(active, "$request_uri", "$kitilash_is_webhook")
+    assert not re.search(
+        r"^\s*map\s+\$uri\s+\$kitilash_is_webhook\b",
+        active,
+        re.MULTILINE,
+    )
+    assert _variables(active).count("$request_uri") == 1
+
+
+def test_webhook_selector_has_exact_path_or_query_boundary() -> None:
+    """Do not match prefix collisions or lose root paths carrying a query."""
+    assert _webhook_selector_pattern() == r"^/webhooks?(?:/|\?|$)"
+
+
+@pytest.mark.parametrize("case_id", _WEBHOOK_SELECTOR_CASES)
+def test_webhook_selector_classification(case_id: str) -> None:
+    """Exercise the Nginx selector regex without echoing request targets."""
+    pattern = _webhook_selector_pattern()
+    request_target, expected = _WEBHOOK_SELECTOR_CASES[case_id]
+    selected = re.search(pattern, request_target) is not None
+    if selected is not expected:
+        pytest.fail("webhook selector case was misclassified", pytrace=False)
+
+
 def test_conditional_logging_selector_is_map_based_and_routing_neutral() -> None:
     """Variant B maps webhooks out of the combined log and into the safe log."""
     active = _active_config(LOG_FORMATS_FILE)
-    webhook_map = _map_body(active, "$uri", "$kitilash_is_webhook")
-    assert re.search(r"^\s*default\s+0\s*;", webhook_map, re.MULTILINE)
-    assert re.search(
-        rf"^\s*{re.escape('~^/webhooks?(?:/|$)')}\s+1\s*;",
-        webhook_map,
-        re.MULTILINE,
-    )
+    webhook_map = _map_body(active, "$request_uri", "$kitilash_is_webhook")
+    assert _map_entries(webhook_map) == [
+        ("default", "0"),
+        ("~^/webhooks?(?:/|\\?|$)", "1"),
+    ]
 
     inverse_map = _map_body(
         active,
         "$kitilash_is_webhook",
         "$kitilash_is_not_webhook",
     )
-    assert re.search(r"^\s*default\s+1\s*;", inverse_map, re.MULTILINE)
-    assert re.search(r"^\s*1\s+0\s*;", inverse_map, re.MULTILINE)
+    assert _map_entries(inverse_map) == [
+        ("default", "1"),
+        ("1", "0"),
+    ]
 
-    instructions = "\n".join(re.sub(r"^\s*# ?", "", line) for line in LOG_FORMATS_FILE.read_text().splitlines())
-    assert re.search(
-        r"access_log\s+/var/log/nginx/access\.log\s+combined\s+"
-        r"if=\$kitilash_is_not_webhook\s*;",
-        instructions,
-    )
-    assert re.search(
-        r"access_log\s+/var/log/nginx/webhooks_access\.log\s+"
-        r"kitilash_webhook_safe\s+if=\$kitilash_is_webhook\s*;",
-        instructions,
-    )
+    reference = LOG_FORMATS_FILE.read_text()
+    example = reference[reference.index("# Then, inside") : reference.index("# CAVEAT:")]
+    uncommented = "\n".join(re.sub(r"^\s*# ?", "", line) for line in example.splitlines())
+    access_logs = [
+        " ".join(match.group(0).split())
+        for match in re.finditer(
+            r"^\s*access_log\b.*?;",
+            uncommented,
+            re.MULTILINE | re.DOTALL,
+        )
+    ]
+    assert access_logs == [
+        ("access_log /var/log/nginx/access.log combined if=$kitilash_is_not_webhook;"),
+        ("access_log /var/log/nginx/webhooks_access.log kitilash_webhook_safe if=$kitilash_is_webhook;"),
+    ]
 
 
 # ===========================================================================
@@ -321,6 +432,35 @@ def test_runbook_requires_inspecting_the_effective_config() -> None:
     assert text.count("nginx -T") >= 2, "the runbook must inspect effective config before and after reload"
     assert "nginx -t" in text, "the runbook must require a config test before reload"
     assert "systemctl reload nginx" in text
+
+
+def test_runbook_distinguishes_selector_input_from_safe_logged_path() -> None:
+    text = re.sub(r"\s+", " ", _runbook())
+    for contract in (
+        "`$uri` изменяется",
+        "`$request_uri` сохраняет исходный",
+        "source для boolean `map`",
+        "`$request_uri` никогда не добавляется в `log_format`",
+        "safe format продолжает логировать текущий безопасный `$uri`",
+    ):
+        assert contract in text
+
+
+def test_runbook_requires_following_every_internal_redirect_destination() -> None:
+    text = re.sub(r"\s+", " ", _runbook())
+    for destination in (
+        "rewrite",
+        "named locations",
+        "`try_files`",
+        "`index`",
+        "`error_page`",
+        "internal redirects",
+        "regex locations",
+    ):
+        assert destination in text
+    assert "access_log ... combined;" in text
+    assert "error_log /var/log/nginx/...;" in text
+    assert "security DoD не выполнен" in text
 
 
 def test_runbook_references_the_split_logging_examples() -> None:
@@ -411,13 +551,36 @@ def test_runbook_describes_isolated_failure_path() -> None:
         assert marker in failure, f"failure-path procedure lost {marker!r}"
 
 
+def test_runbook_describes_internal_redirect_marker_test() -> None:
+    text = _runbook()
+    internal_redirect = text[
+        text.index("Internal-redirect marker test") : text.index("Ротация потенциально раскрытых секретов")
+    ]
+    for marker in (
+        "disposable Nginx container",
+        "тот же `$request_uri` map",
+        "INTERNAL_REDIRECT_MARKER",
+        "/webhooks/easyweek",
+        "/internal-handler",
+        "non-webhook control request",
+        "combined log",
+        "safe webhook log",
+        "uri=/internal-handler",
+        "error log не содержит marker",
+        "удалить disposable container",
+        "not found",
+    ):
+        assert marker in internal_redirect
+
+
 def test_runbook_orders_rotation_after_every_logging_gate() -> None:
     text = _runbook()
     parity_index = text.index("Production route-parity")
     normal_index = text.index("Normal-path marker tests")
     failure_index = text.index("Failure-path marker test")
+    internal_redirect_index = text.index("Internal-redirect marker test")
     rotation_index = text.index("Ротация потенциально раскрытых секретов")
-    assert parity_index < normal_index < failure_index < rotation_index
+    assert parity_index < normal_index < failure_index < internal_redirect_index < rotation_index
 
 
 def test_runbook_forbids_copying_exact_locations_from_reference() -> None:

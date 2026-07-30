@@ -140,12 +140,16 @@ sudo nginx -T
 До любых изменений зафиксировать:
 
 - modifier и path каждого `location`, включая regex locations и rewrite rules;
+- полную цепочку `external URI → initial location → destination(s)` для
+  `rewrite`, `try_files`, `index`, `error_page`, named locations, internal
+  redirects и повторного выбора regex locations;
 - фактический `proxy_pass` и proxy headers;
 - `client_max_body_size` и `client_body_timeout`;
 - proxy connect/read/send timeouts;
 - rate/connection limiting и allow/deny;
 - buffering, retry policy и upstream;
-- все эффективные `access_log` и `error_log`, включая унаследованные.
+- все эффективные `access_log` и `error_log`, включая унаследованные, в
+  начальном location и в каждом достижимом destination.
 
 Нельзя угадывать эту конфигурацию по содержимому репозитория.
 
@@ -166,9 +170,18 @@ Reference **не создаёт маршруты**. Не копировать и
 Не менять modifier/path существующего location, `proxy_pass`, headers, limits,
 timeouts, access restrictions, buffering, retries или upstream.
 
-В формате запрещены `$request`, `$request_uri`, `$args`, `$query_string`,
-`$is_args`, `$http_referer` и произвольные request-заголовки; используется `$uri`
-(путь без query), а не `$request_uri`.
+Selector и safe log format используют разные URI-переменные с разным
+security-контрактом:
+
+- `$uri` изменяется после `rewrite`, `try_files`, `error_page` и других internal
+  redirects. Это текущий нормализованный path без query; safe format продолжает
+  логировать текущий безопасный `$uri` как `uri=$uri`;
+- `$request_uri` сохраняет исходный request URI вместе с query. Он используется
+  только как source для boolean `map`, который выдаёт `0` или `1`;
+- `$request_uri` никогда не добавляется в `log_format`, `access_log` path,
+  headers или diagnostic output. В `log_format kitilash_webhook_safe` по-прежнему
+  запрещены `$request`, `$request_uri`, `$args`, `$query_string`, `$is_args`,
+  `$http_referer` и произвольные request-заголовки.
 
 **Вариант A — отдельные webhook locations уже существуют.** Добавить
 logging-only include непосредственно в каждый из этих существующих блоков.
@@ -182,6 +195,27 @@ generic или exact location. Использовать `map` из http-level re
 проверить вывод `nginx -T`: `access_log` внутри более низкоуровневого location
 отменяет наследование server-level logging. Такой unsafe location исправляется
 отдельно, но его routing directives не меняются.
+
+Первый selector обязан использовать неизменяемый исходный request target:
+
+```nginx
+map $request_uri $kitilash_is_webhook {
+    default                    0;
+    ~^/webhooks?(?:/|\?|$)     1;
+}
+```
+
+Граница `(?:/|\?|$)` классифицирует `/webhook?x=1` и `/webhooks?x=1`, но
+исключает `/webhookevil`, `/webhooks-old`, `/webhook_backup` и вложенный
+`/api/webhooks/easyweek`. После любого internal redirect
+`$kitilash_is_webhook` остаётся boolean `1`; inverse selector оставляет
+`$kitilash_is_not_webhook=0`. Поэтому webhook должен попасть только в safe
+webhook log, а не одновременно в него и в обычный combined log.
+
+Проверить всю цепочку destinations: конечный или named location с собственным
+`access_log ... combined;` переопределит server-level conditional logging и
+снова запишет исходную request line. Если такой override остаётся активным,
+security DoD не выполнен.
 
 Не вставлять logging-only include вслепую в общий `location /`: это изменит
 логирование всего API и подавит request-level error logging для всех маршрутов.
@@ -216,6 +250,11 @@ location нельзя добавлять в репозиторий как уни
 не выполнен. Отсутствие маркера после обычного application-level `403` это не
 опровергает.
 
+Политику нужно проверить во всех достижимых destinations. Конечный location с
+собственным persistent `error_log /var/log/nginx/...;` переопределяет безопасный
+scope и может сохранить исходную request line. В таком случае security DoD не
+выполнен, даже если начальный location использует `/dev/null emerg`.
+
 #### Шаг 4. Проверить конфиг, reload и effective diff
 
 После правки:
@@ -241,6 +280,14 @@ location matching, upstream, headers, body limits, timeouts, rate limiting,
 allow/deny, buffering, retries и rewrite rules. `restart` вместо `reload` не
 использовать, если reload достаточен.
 
+Отдельно подтвердить в effective config:
+
+- source первого map — ровно `$request_uri`, не `$uri`;
+- selector boundary — `(?:/|\?|$)`;
+- safe format по-прежнему содержит `uri=$uri`, но не `$request_uri`;
+- все rewrite/internal-redirect destinations сохранили routing parity;
+- ни один destination не вводит unsafe `access_log` или persistent `error_log`.
+
 #### Шаг 5. Production route-parity до и после изменения
 
 До и после Nginx-изменения выполнить одинаковые проверки:
@@ -265,6 +312,10 @@ WhatsApp wrong verification token → 403
 Также проверить, что `/health` и остальные API routes, проходившие через прежний
 `location /`, продолжают работать. Любое расхождение сначала рассматривается
 как routing regression.
+
+Для каждой реально достижимой ветки `rewrite`, `try_files`, `index`,
+`error_page`, named location и повторного regex matching сравнить конечный
+handler, status, body, headers, timeout, body-size behaviour и upstream.
 
 #### Шаг 6. Normal-path marker tests (обязательны)
 
@@ -357,12 +408,58 @@ grep -R "$FAILURE_MARKER" <temporary-nginx-log-directory>
 временный config и временные logs. Обычный запрос к работающему FastAPI, даже с
 ответом `403`, не засчитывается как failure-path test.
 
-#### Шаг 8. Ротация потенциально раскрытых секретов
+#### Шаг 8. Internal-redirect marker test (обязателен)
+
+Static regex test недостаточен. В disposable Nginx container или временном
+localhost-only instance использовать тот же `$request_uri` map, тот же safe
+format и те же conditional access logs. Тестовый routing существует только в
+одноразовом конфиге и не копируется в production reference.
+
+Сначала отправить non-webhook control request на отдельный тестовый path и
+убедиться, что он появился в combined log. Это доказывает, что отсутствие
+webhook-запроса в combined не вызвано отключённым или неработающим обычным
+логом.
+
+Отправить искусственный marker:
+
+```bash
+INTERNAL_REDIRECT_MARKER="INTERNAL_REDIRECT_LOG_TEST_$(openssl rand -hex 8)"
+```
+
+Исходный запрос должен прийти на:
+
+```text
+/webhooks/easyweek?token=${INTERNAL_REDIRECT_MARKER}
+```
+
+и пройти `rewrite` или другой internal redirect на non-webhook destination:
+
+```text
+/internal-handler
+```
+
+Проверить одновременно:
+
+- текущий `$uri` действительно стал `/internal-handler`;
+- original `$request_uri` сохранил webhook classification;
+- combined log содержит non-webhook control request;
+- combined log вообще не содержит этот webhook request;
+- safe webhook log содержит одну запись с допустимым
+  `uri=/internal-handler`;
+- safe webhook log не содержит marker, `token=`, `?`, `$request_uri` или query;
+- error log не содержит marker;
+- поиск marker по всему временному каталогу возвращает `not found`.
+
+После теста удалить disposable container, config и logs. После применения
+production config повторить marker-проверку для каждой реально существующей
+internal-redirect ветки, не меняя production routing или upstream.
+
+#### Шаг 9. Ротация потенциально раскрытых секретов
 
 Порядок важен: сначала должны пройти `nginx -t`, reload, повторный `nginx -T`,
 route-parity, все normal-path marker tests и изолированный failure-path marker
-test. Только после этого ротировать секреты — иначе новые значения снова могут
-попасть в логи.
+test, а также internal-redirect marker test. Только после этого ротировать
+секреты — иначе новые значения снова могут попасть в логи.
 
 Ротировать минимум:
 

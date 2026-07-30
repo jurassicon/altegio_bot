@@ -41,7 +41,8 @@
 #                   query) and it invites $args to be added next to it
 # Do not log arbitrary request headers either.
 #
-# We log $uri — the normalised path WITHOUT the query — never $request_uri.
+# The safe log_format logs $uri — the current normalised path WITHOUT the query —
+# and never logs $request_uri.
 
 log_format kitilash_webhook_safe
     '$remote_addr [$time_local] '
@@ -56,13 +57,21 @@ log_format kitilash_webhook_safe
 # shared `location /` and there is no separate webhook block to extend. A `map`
 # defines a variable; it does not match, create or reorder any route.
 #
+# Classification must use the immutable original request target. $uri can change
+# after rewrite, try_files, error_page or another internal redirect, which could
+# otherwise reclassify a secret-bearing webhook as an ordinary API request when
+# access logging runs. $request_uri retains the original path and query.
+#
+# $request_uri is safe ONLY as this map source: the map reduces it to boolean 0/1.
+# Never add it to a log_format, access_log path, header or diagnostic output.
+#
 # $kitilash_is_webhook     1 for /webhook and /webhooks paths, else 0
 # $kitilash_is_not_webhook the inverse, so the site-wide log keeps everything
 #                          EXCEPT webhooks (the site log must not be disabled)
 
-map $uri $kitilash_is_webhook {
-    default                 0;
-    ~^/webhooks?(?:/|$)     1;
+map $request_uri $kitilash_is_webhook {
+    default                    0;
+    ~^/webhooks?(?:/|\?|$)     1;
 }
 
 map $kitilash_is_webhook $kitilash_is_not_webhook {
@@ -84,7 +93,9 @@ map $kitilash_is_webhook $kitilash_is_not_webhook {
 # OVERRIDES this server-level one for requests it handles. If such a location
 # already declares its own unsafe access log, server-level conditional logging
 # will NOT fix it — that location has to be corrected on its own, still without
-# touching its routing directives. Confirm with `nginx -T`, never by assumption.
+# touching its routing directives. Follow rewrite, try_files, error_page and all
+# internal-redirect destinations too: a destination location can override both
+# access_log and error_log. Confirm with `nginx -T`, never by assumption.
 #
 # Log rotation: add /var/log/nginx/webhooks_access.log to the existing
 # /etc/logrotate.d/nginx entry (or a glob that already covers it).
