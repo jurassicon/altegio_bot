@@ -1,13 +1,14 @@
 name: CI / Deploy
 
 on:
+  pull_request:
   push:
     branches:
       - main
   workflow_dispatch:
 
 concurrency:
-  group: altegio-bot-main
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -182,7 +183,11 @@ jobs:
   deploy:
     name: Deploy to Server
     needs: [tests, alembic]
-    if: needs.tests.result == 'success' && needs.alembic.result == 'success'
+    if: >-
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      needs.tests.result == 'success' &&
+      needs.alembic.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - name: Deploy to server via SSH
@@ -401,7 +406,12 @@ jobs:
     name: Telegram Notification
     needs: [lint, tests, alembic, deploy]
 
-    if: always()
+    if: >-
+      always() &&
+      (
+        (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+        github.event_name == 'workflow_dispatch'
+      )
     runs-on: ubuntu-latest
     steps:
       - name: Notify via Telegram
