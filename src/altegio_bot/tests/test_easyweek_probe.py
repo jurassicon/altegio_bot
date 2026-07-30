@@ -39,7 +39,9 @@ ALL_SENTINELS = (
     FUTURE_FIELD,
 )
 
-BASE = "https://api.example.test/api/public/v2"
+# Only the canonical EasyWeek origin is accepted now; MockTransport still
+# intercepts every request, so no real network call happens.
+BASE = "https://my.easyweek.io/api/public/v2"
 BOOKING_UUID = "123e4567-e89b-12d3-a456-426614174000"
 DURLACH_UUID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 
@@ -332,3 +334,82 @@ def test_structured_value_under_allowlisted_key_becomes_marker() -> None:
     summary = probe.safe_booking_summary({"uuid": {"nested": CUSTOMER_NAME}})
     assert summary["uuid"] == "<dict omitted>"
     _assert_no_sentinels(json.dumps(summary))
+
+
+def test_empty_locations_list_fails_the_probe(monkeypatch, capsys) -> None:
+    """An empty list means no Durlach UUID can be recorded — that is a FAILED probe.
+
+    Printing ok=true here would tell the operator the key works while leaving the
+    PR-2 DoD (identify the location UUID) silently unmet.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/ping"):
+            return httpx.Response(200, json={"ping": "pong", "version": "v12.32.3"})
+        return httpx.Response(200, json=[])
+
+    _install_client(monkeypatch, handler)
+
+    exit_code = probe.main([])
+
+    assert exit_code == probe.EXIT_API_ERROR
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert payload["ok"] is False
+    assert payload["error"] == "EasyWeekProtocolError"
+    assert payload["operation"] == "list_locations"
+    assert '"ok": true' not in captured.out
+
+
+def test_empty_data_envelope_also_fails_the_probe(monkeypatch, capsys) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/ping"):
+            return httpx.Response(200, json={"ping": "pong"})
+        return httpx.Response(200, json={"data": []})
+
+    _install_client(monkeypatch, handler)
+
+    assert probe.main([]) == probe.EXIT_API_ERROR
+    assert json.loads(capsys.readouterr().out)["ok"] is False
+
+
+def test_ping_without_success_marker_fails_the_probe(monkeypatch, capsys) -> None:
+    """A 200 from the wrong endpoint must not be reported as a working API."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/ping"):
+            return httpx.Response(200, json={"status": "ok"})  # no ping marker
+        return httpx.Response(200, json=_LOCATIONS)  # pragma: no cover
+
+    _install_client(monkeypatch, handler)
+
+    exit_code = probe.main([])
+
+    assert exit_code == probe.EXIT_API_ERROR
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert payload["error"] == "EasyWeekProtocolError"
+    assert payload["operation"] == "ping"
+    assert '"ok": true' not in captured.out
+
+
+def test_malformed_booking_envelope_fails_the_probe(monkeypatch, capsys) -> None:
+    """`data` present but not an object must not fall back to the envelope."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/ping"):
+            return httpx.Response(200, json={"ping": "pong"})
+        if path.endswith("/locations"):
+            return httpx.Response(200, json=_LOCATIONS)
+        return httpx.Response(200, json={"data": None, "leak": ORDER_MARKER})
+
+    _install_client(monkeypatch, handler)
+
+    exit_code = probe.main(["--booking-uuid", BOOKING_UUID])
+
+    assert exit_code == probe.EXIT_API_ERROR
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["error"] == "EasyWeekProtocolError"
+    assert '"ok": true' not in captured.out
+    _assert_no_sentinels(captured.out + captured.err)

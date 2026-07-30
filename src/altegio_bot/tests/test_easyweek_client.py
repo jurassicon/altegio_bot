@@ -18,6 +18,7 @@ import httpx
 import pytest
 
 from altegio_bot.easyweek_client import (
+    CANONICAL_API_BASE_URL,
     EasyWeekAuthError,
     EasyWeekClient,
     EasyWeekConfigError,
@@ -26,6 +27,7 @@ from altegio_bot.easyweek_client import (
     EasyWeekPermanentError,
     EasyWeekProtocolError,
     EasyWeekRetryableError,
+    _is_retryable_status,
     _parse_retry_after,
 )
 
@@ -51,7 +53,9 @@ ALL_SENTINELS = (
     NOTES_MARKER,
 )
 
-BASE = "https://api.example.test/api/public/v2"
+# Only the canonical EasyWeek origin is accepted now; MockTransport still
+# intercepts every request, so no real network call happens.
+BASE = "https://my.easyweek.io/api/public/v2"
 BOOKING_UUID = "123e4567-e89b-12d3-a456-426614174000"
 
 _BOOKING_WITH_PII: dict[str, Any] = {
@@ -135,7 +139,8 @@ def test_importing_the_app_without_easyweek_config_does_not_break() -> None:
         "import altegio_bot.easyweek_client as m;"
         "import altegio_bot.main;"
         "from altegio_bot.settings import settings;"
-        "assert settings.easyweek_api_key == '';"
+        # SecretStr, so the value is only reachable explicitly.
+        "assert settings.easyweek_api_key.get_secret_value() == '';"
         "assert m.EasyWeekClient is not None;"
         "print('import-ok')"
     )
@@ -145,34 +150,58 @@ def test_importing_the_app_without_easyweek_config_does_not_break() -> None:
 
 
 @pytest.mark.parametrize(
-    "raw,expected",
+    "raw",
     [
-        ("https://h/api/public/v2", "https://h/api/public/v2"),
-        ("https://h/api/public/v2/", "https://h/api/public/v2"),
-        ("https://h/api/public/v2///", "https://h/api/public/v2"),
-        ("  https://h/api/public/v2/  ", "https://h/api/public/v2"),
+        "https://my.easyweek.io/api/public/v2",
+        "https://my.easyweek.io/api/public/v2/",
+        "https://my.easyweek.io/api/public/v2///",
+        "  https://my.easyweek.io/api/public/v2/  ",
+        "https://MY.EasyWeek.IO/api/public/v2",  # host comparison is case-insensitive
+        "https://my.easyweek.io:443/api/public/v2",  # explicit default port is fine
     ],
 )
-def test_base_url_is_normalized_without_double_slash(raw: str, expected: str) -> None:
+def test_canonical_base_url_is_accepted_and_normalized(raw: str) -> None:
     client = EasyWeekClient(api_key=KEY, workspace_slug=SLUG, base_url=raw)
-    assert client._base_url == expected
+    assert client._base_url == CANONICAL_API_BASE_URL
 
 
 @pytest.mark.parametrize(
     "bad",
     [
+        # Explicitly required regression cases.
+        "http://my.easyweek.io/api/public/v2",  # plaintext would expose the Bearer key
+        "https://evil.example/api/public/v2",  # third-party host
+        "https://my.easyweek.io/other",  # different path
+        "https://user:password@my.easyweek.io/api/public/v2",
+        "https://my.easyweek.io/api/public/v2?token=x",
+        "https://my.easyweek.io/api/public/v2#fragment",
+        # Additional bypass attempts.
         "",
         "   ",
         "not-a-url",
-        "ftp://h/api",
-        "https://user:pw@h/api",
-        "https://h/api?token=x",
-        "https://h/api#frag",
+        "ftp://my.easyweek.io/api/public/v2",
+        "https://my.easyweek.io:8443/api/public/v2",  # non-default port
+        "https://my.easyweek.io.evil.example/api/public/v2",  # suffix look-alike
+        "https://evil.example/my.easyweek.io/api/public/v2",  # path look-alike
+        "https://my.easyweek.io/api/public/v1",
+        "https://my.easyweek.io/api/public/v2/../admin",
+        "https://my.easyweek.io",  # no path at all
     ],
 )
-def test_invalid_base_url_is_rejected(bad: str) -> None:
+def test_non_canonical_base_url_is_rejected(bad: str) -> None:
     with pytest.raises(EasyWeekConfigError):
         EasyWeekClient(api_key=KEY, workspace_slug=SLUG, base_url=bad)
+
+
+def test_rejected_base_url_is_never_echoed_in_the_error() -> None:
+    """A pasted URL may itself carry a token, so it must not reach the message."""
+    hostile = "https://evil.example/api/public/v2?token=SENTINEL_URLTOKEN_zzz999"
+    with pytest.raises(EasyWeekConfigError) as exc_info:
+        EasyWeekClient(api_key=KEY, workspace_slug=SLUG, base_url=hostile)
+    rendered = str(exc_info.value)
+    assert "SENTINEL_URLTOKEN_zzz999" not in rendered
+    assert hostile not in rendered
+    assert "evil.example" not in rendered
 
 
 # ===========================================================================
@@ -215,12 +244,12 @@ async def test_list_locations_issues_single_get_to_locations() -> None:
 
 
 @pytest.mark.asyncio
-async def test_list_locations_accepts_data_envelope_and_drops_non_objects() -> None:
+async def test_list_locations_accepts_data_envelope() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"data": [{"uuid": "u1"}, "junk", 7, None]})
+        return httpx.Response(200, json={"data": [{"uuid": "u1"}, {"uuid": "u2"}]})
 
     async with _client(handler) as client:
-        assert await client.list_locations() == [{"uuid": "u1"}]
+        assert await client.list_locations() == [{"uuid": "u1"}, {"uuid": "u2"}]
 
 
 @pytest.mark.asyncio
@@ -617,3 +646,288 @@ def test_config_error_text_never_contains_the_key() -> None:
     with pytest.raises(EasyWeekConfigError) as exc_info:
         EasyWeekClient(api_key=KEY, workspace_slug="", base_url=BASE)
     assert KEY not in str(exc_info.value)
+
+
+# ===========================================================================
+# Retryable status classification: 429 + the WHOLE 5xx range
+# ===========================================================================
+
+
+@pytest.mark.parametrize("status", [429, 500, 501, 502, 503, 504, 505, 507, 508, 511, 599])
+def test_status_is_classified_retryable(status: int) -> None:
+    assert _is_retryable_status(status) is True
+
+
+@pytest.mark.parametrize("status", [200, 201, 204, 301, 302, 400, 401, 403, 404, 409, 422, 499, 600])
+def test_status_is_classified_permanent(status: int) -> None:
+    assert _is_retryable_status(status) is False
+
+
+@pytest.mark.parametrize("status", [500, 501, 502, 503, 504, 505, 507, 599])
+@pytest.mark.asyncio
+async def test_every_5xx_is_retried_then_succeeds(status: int) -> None:
+    """No 5xx may be treated as permanent — not even the ones we never enumerated."""
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(status)
+        return httpx.Response(200, json={"ping": "pong"})
+
+    sleeps = _Sleeps()
+    async with _client(handler, sleep=sleeps) as client:
+        assert (await client.ping())["ping"] == "pong"
+
+    assert calls["n"] == 2
+    assert len(sleeps.delays) == 1
+
+
+@pytest.mark.parametrize("status", [500, 501, 502, 503, 504, 505, 507, 599])
+@pytest.mark.asyncio
+async def test_every_5xx_exhausts_into_retryable_error(status: int) -> None:
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(status)
+
+    sleeps = _Sleeps()
+    async with _client(handler, sleep=sleeps, max_attempts=3) as client:
+        with pytest.raises(EasyWeekRetryableError) as exc_info:
+            await client.ping()
+
+    assert calls["n"] == 3  # bounded at three attempts
+    assert exc_info.value.status_code == status
+    assert exc_info.value.retryable is True
+    assert len(sleeps.delays) == 2
+    for delay in sleeps.delays:
+        assert 0.0 <= delay <= 8.0
+
+
+# ===========================================================================
+# Strict shape validation of a malformed 2xx
+# ===========================================================================
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {},  # no ping marker at all
+        {"ping": "nope"},  # wrong value
+        {"ping": 1},  # wrong type
+        {"ping": None},
+        {"version": "v12.32.3"},  # only the optional field
+        {"status": "ok"},  # a different API answering 200
+    ],
+)
+@pytest.mark.asyncio
+async def test_ping_without_the_success_marker_is_protocol_error(body: Any) -> None:
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(200, json=body)
+
+    sleeps = _Sleeps()
+    async with _client(handler, sleep=sleeps) as client:
+        with pytest.raises(EasyWeekProtocolError):
+            await client.ping()
+
+    assert calls["n"] == 1  # a malformed 2xx is never retried
+    assert sleeps.delays == []
+
+
+@pytest.mark.asyncio
+async def test_ping_allows_extra_fields() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"ping": "pong", "version": "v12.32.3", "extra": 1})
+
+    async with _client(handler) as client:
+        assert (await client.ping())["version"] == "v12.32.3"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"items": [{"uuid": "u1"}]},  # envelope without the documented data key
+        {"data": None},
+        {"data": "junk"},
+        {"data": 7},
+        {"data": {"uuid": "u1"}},  # object where a list is required
+        [{"uuid": "u1"}, "junk"],  # a non-object entry must fail the call
+        [{"uuid": "u1"}, None],
+        [{"uuid": "u1"}, 7],
+        {"data": [{"uuid": "u1"}, "junk"]},
+        "not-a-container",
+        42,
+    ],
+)
+@pytest.mark.asyncio
+async def test_malformed_locations_shape_is_protocol_error(body: Any) -> None:
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(200, json=body)
+
+    sleeps = _Sleeps()
+    async with _client(handler, sleep=sleeps) as client:
+        with pytest.raises(EasyWeekProtocolError):
+            await client.list_locations()
+
+    assert calls["n"] == 1
+    assert sleeps.delays == []
+
+
+@pytest.mark.asyncio
+async def test_locations_never_silently_drops_entries() -> None:
+    """A malformed entry must fail loudly, not shrink the operator's list."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[{"uuid": "u1"}, "junk", {"uuid": "u2"}])
+
+    async with _client(handler) as client:
+        with pytest.raises(EasyWeekProtocolError):
+            await client.list_locations()
+
+
+@pytest.mark.asyncio
+async def test_empty_locations_list_is_returned_by_the_client() -> None:
+    """The client itself may legitimately return []; the probe decides policy."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[])
+
+    async with _client(handler) as client:
+        assert await client.list_locations() == []
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"data": None},  # present but null -> must NOT fall back to the envelope
+        {"data": []},
+        {"data": "junk"},
+        {"data": 7},
+        {"data": True},
+        {"uuid": None},  # no usable identifier
+        {"uuid": ""},
+        {"uuid": 123},
+        {},  # arbitrary object is not a booking
+        {"something": "else"},
+        [],
+        "not-an-object",
+    ],
+)
+@pytest.mark.asyncio
+async def test_malformed_booking_shape_is_protocol_error(body: Any) -> None:
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(200, json=body)
+
+    sleeps = _Sleeps()
+    async with _client(handler, sleep=sleeps) as client:
+        with pytest.raises(EasyWeekProtocolError):
+            await client.get_booking(BOOKING_UUID)
+
+    assert calls["n"] == 1
+    assert sleeps.delays == []
+
+
+@pytest.mark.asyncio
+async def test_booking_data_envelope_is_unwrapped() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": _BOOKING_WITH_PII})
+
+    async with _client(handler) as client:
+        booking = await client.get_booking(BOOKING_UUID)
+
+    assert booking["uuid"] == BOOKING_UUID
+
+
+@pytest.mark.asyncio
+async def test_bare_booking_object_is_accepted_when_no_data_key() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_BOOKING_WITH_PII)
+
+    async with _client(handler) as client:
+        assert (await client.get_booking(BOOKING_UUID))["uuid"] == BOOKING_UUID
+
+
+@pytest.mark.asyncio
+async def test_malformed_body_never_reaches_logs_or_exception(caplog) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": None, "leak": BODY_MARKER})
+
+    with caplog.at_level(logging.DEBUG):
+        async with _client(handler) as client:
+            with pytest.raises(EasyWeekProtocolError) as exc_info:
+                await client.get_booking(BOOKING_UUID)
+
+    blob = "\n".join(r.getMessage() for r in caplog.records)
+    assert BODY_MARKER not in blob
+    assert BODY_MARKER not in str(exc_info.value)
+
+
+# ===========================================================================
+# The API key must not be reachable through Settings either
+# ===========================================================================
+
+
+def test_settings_never_expose_the_api_key_in_any_string_form() -> None:
+    """repr(settings) lands in config dumps and tracebacks — a plain str would leak."""
+    from altegio_bot.settings import Settings
+
+    sentinel = "SENTINEL_SETTINGSKEY_zzz888"
+    cfg = Settings(
+        database_url="postgresql+asyncpg://x/y",
+        altegio_webhook_secret="x",
+        easyweek_api_key=sentinel,
+        _env_file=None,
+    )
+
+    for rendered in (repr(cfg), str(cfg), f"{cfg}", repr(cfg.easyweek_api_key), str(cfg.easyweek_api_key)):
+        assert sentinel not in rendered
+
+    # ... while the real value is still retrievable explicitly.
+    assert cfg.easyweek_api_key.get_secret_value() == sentinel
+
+
+@pytest.mark.asyncio
+async def test_secret_str_key_from_settings_still_builds_the_bearer_header(monkeypatch) -> None:
+    """SecretStr must be unwrapped for the header, never stringified into it."""
+    from pydantic import SecretStr
+
+    from altegio_bot import settings as settings_module
+
+    sentinel = "SENTINEL_HEADERKEY_zzz777"
+    monkeypatch.setattr(settings_module.settings, "easyweek_api_key", SecretStr(sentinel))
+    monkeypatch.setattr(settings_module.settings, "easyweek_workspace_slug", SLUG)
+
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={"ping": "pong"})
+
+    client = EasyWeekClient(base_url=BASE, transport=httpx.MockTransport(handler))
+    async with client:
+        await client.ping()
+
+    assert seen[0].headers["Authorization"] == f"Bearer {sentinel}"
+    assert "**" not in seen[0].headers["Authorization"]
+    assert sentinel not in repr(client)
+
+
+def test_empty_secret_str_key_still_raises_config_error(monkeypatch) -> None:
+    from pydantic import SecretStr
+
+    from altegio_bot import settings as settings_module
+
+    monkeypatch.setattr(settings_module.settings, "easyweek_api_key", SecretStr(""))
+    monkeypatch.setattr(settings_module.settings, "easyweek_workspace_slug", SLUG)
+    with pytest.raises(EasyWeekConfigError):
+        EasyWeekClient(base_url=BASE)

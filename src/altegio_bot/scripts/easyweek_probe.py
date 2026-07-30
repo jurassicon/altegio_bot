@@ -36,7 +36,12 @@ import logging
 import sys
 from typing import Any
 
-from altegio_bot.easyweek_client import EasyWeekClient, EasyWeekConfigError, EasyWeekError
+from altegio_bot.easyweek_client import (
+    EasyWeekClient,
+    EasyWeekConfigError,
+    EasyWeekError,
+    EasyWeekProtocolError,
+)
 
 # Exit codes: distinct so a wrapper script can tell a misconfiguration from an
 # API failure without parsing text.
@@ -148,6 +153,13 @@ async def run_probe(booking_uuid: str | None = None) -> dict[str, Any]:
     async with EasyWeekClient() as client:
         ping = await client.ping()
         locations = await client.list_locations()
+
+        # The whole point of this probe is to identify Durlach, so an empty list
+        # is a failed probe, not a successful one with nothing in it. Reporting
+        # ok=true here would let an operator believe the key works and then find
+        # no UUID to record.
+        if not locations:
+            raise EasyWeekProtocolError("no locations are visible to this API key", operation="list_locations")
 
         result: dict[str, Any] = {
             # /ping returns {"ping": "pong", "version": ...} — both safe.

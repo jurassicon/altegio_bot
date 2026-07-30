@@ -1,6 +1,6 @@
 from typing import Any
 
-from pydantic import field_validator, model_validator
+from pydantic import SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Hard allowlist of job types that may be routed to text inside the 24h window.
@@ -468,8 +468,11 @@ class Settings(BaseSettings):
     # приложения, API-контейнер или Altegio-воркеры. Наличие ключа и slug
     # проверяется только в момент создания клиента / запуска пробы.
     #
-    # Bearer-ключ. Никогда не логируется и не попадает в repr/исключения.
-    easyweek_api_key: str = ""
+    # Bearer-ключ. SecretStr, а не str: обычный repr/str модели настроек попадает
+    # в дампы конфигурации, трейсбеки и диагностический вывод, и обычная строка
+    # утекла бы туда целиком. SecretStr печатается как '**********', а реальное
+    # значение достаётся только явным .get_secret_value() в клиенте.
+    easyweek_api_key: SecretStr = SecretStr("")
     # Значение обязательного заголовка ``Workspace``.
     easyweek_workspace_slug: str = ""
     # Pinned base URL публичного API v2 (см. INTEGRATION_PLAN §1.1).

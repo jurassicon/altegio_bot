@@ -45,6 +45,16 @@ _PATH_PING = "ping"
 _PATH_LOCATIONS = "locations"
 _PATH_BOOKINGS = "bookings"
 
+# The ONE origin this client may ever talk to. A misconfigured base URL would
+# otherwise send the Bearer key in clear text or to a third-party host, so the
+# scheme, host, port and path are all pinned rather than merely "looks like a
+# URL" (INTEGRATION_PLAN §1.1).
+_ALLOWED_API_SCHEME = "https"
+_ALLOWED_API_HOST = "my.easyweek.io"
+_ALLOWED_API_PATH = "/api/public/v2"
+_ALLOWED_API_PORTS = (None, 443)
+CANONICAL_API_BASE_URL = f"{_ALLOWED_API_SCHEME}://{_ALLOWED_API_HOST}{_ALLOWED_API_PATH}"
+
 # Bounded retry policy. EasyWeek allows 60 requests/min per key (§1.1), so a
 # short, bounded backoff is enough; unbounded retries would only burn the quota.
 _MAX_ATTEMPTS = 3
@@ -54,9 +64,17 @@ _BACKOFF_MAX_SEC = 8.0
 # header can never park an operator probe (or a worker) for hours.
 _RETRY_AFTER_MAX_SEC = 10.0
 
-_RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
-
 _DEFAULT_TIMEOUT = httpx.Timeout(connect=5.0, read=15.0, write=10.0, pool=5.0)
+
+
+def _is_retryable_status(status: int) -> bool:
+    """Rate limiting plus the WHOLE 5xx range is worth another attempt.
+
+    Deliberately a range test, not a hand-picked allowlist: a server-side status
+    we did not enumerate (505, 507, 599, a proxy's own 5xx) is still a server
+    problem, and treating it as permanent would drop a recoverable request.
+    """
+    return status == 429 or 500 <= status < 600
 
 
 # ---------------------------------------------------------------------------
@@ -142,22 +160,60 @@ class EasyWeekProtocolError(EasyWeekError):
 
 
 def _normalize_base_url(raw: object) -> str:
-    """Validate and normalise the pinned base URL exactly once.
+    """Pin the base URL to the one canonical EasyWeek Public API v2 origin.
 
-    Requires an absolute http(s) URL with a host and rejects credentials, query
-    and fragment, so a misconfigured value can never smuggle a different target
-    or a secret into every request. The trailing slash is stripped so joining a
-    relative path can never produce a double slash.
+    Every request carries the Bearer key, so a configuration slip must not be
+    able to send it in clear text (``http://``) or to a host that merely looks
+    like EasyWeek. Scheme, host, port and path are therefore all checked against
+    fixed values instead of being accepted as "some absolute URL"; only a
+    trailing slash is tolerated and normalised away.
+
+    The rejected value is never echoed into the error: an operator could paste a
+    URL that already carries a token in its query string, and that must not end
+    up in a log or a ticket.
     """
     if not isinstance(raw, str) or not raw.strip():
         raise EasyWeekConfigError("EASYWEEK_API_BASE_URL is not configured")
-    candidate = raw.strip()
-    split = urlsplit(candidate)
-    if split.scheme not in ("http", "https") or not split.hostname:
-        raise EasyWeekConfigError("EASYWEEK_API_BASE_URL must be an absolute http(s) URL")
-    if split.query or split.fragment or split.username or split.password:
-        raise EasyWeekConfigError("EASYWEEK_API_BASE_URL must not carry credentials, query or fragment")
-    return candidate.rstrip("/")
+
+    split = urlsplit(raw.strip())
+
+    if split.scheme != _ALLOWED_API_SCHEME:
+        raise EasyWeekConfigError("EASYWEEK_API_BASE_URL must use https")
+    if split.username or split.password:
+        raise EasyWeekConfigError("EASYWEEK_API_BASE_URL must not carry credentials")
+    if split.query or split.fragment:
+        raise EasyWeekConfigError("EASYWEEK_API_BASE_URL must not carry query or fragment")
+
+    hostname = (split.hostname or "").lower()
+    if hostname != _ALLOWED_API_HOST:
+        raise EasyWeekConfigError("EASYWEEK_API_BASE_URL host is not the expected EasyWeek API host")
+
+    try:
+        port = split.port
+    except ValueError:
+        raise EasyWeekConfigError("EASYWEEK_API_BASE_URL has an invalid port") from None
+    if port not in _ALLOWED_API_PORTS:
+        raise EasyWeekConfigError("EASYWEEK_API_BASE_URL must use the default https port")
+
+    # Only a trailing slash may differ; '/api/public/v2/../x' or any other path
+    # is a different endpoint and is rejected rather than silently resolved.
+    if split.path.rstrip("/") != _ALLOWED_API_PATH:
+        raise EasyWeekConfigError("EASYWEEK_API_BASE_URL path is not the expected EasyWeek API v2 path")
+
+    return CANONICAL_API_BASE_URL
+
+
+def _unwrap_secret(value: object) -> object:
+    """Return the plain string behind a ``SecretStr`` (or the value unchanged).
+
+    Settings store the API key as ``SecretStr`` so it cannot leak through a model
+    repr; the real value is only ever unwrapped here, at the point of building
+    the Authorization header.
+    """
+    getter = getattr(value, "get_secret_value", None)
+    if callable(getter):
+        return getter()
+    return value
 
 
 def _canonical_booking_uuid(value: object) -> str:
@@ -230,8 +286,8 @@ class EasyWeekClient:
         sleep: Callable[[float], Awaitable[None]] | None = None,
         max_attempts: int = _MAX_ATTEMPTS,
     ) -> None:
-        key = api_key if api_key is not None else settings.easyweek_api_key
-        slug = workspace_slug if workspace_slug is not None else settings.easyweek_workspace_slug
+        key = _unwrap_secret(api_key if api_key is not None else settings.easyweek_api_key)
+        slug = _unwrap_secret(workspace_slug if workspace_slug is not None else settings.easyweek_workspace_slug)
         if not (isinstance(key, str) and key.strip()):
             raise EasyWeekConfigError("EASYWEEK_API_KEY is not configured")
         if not (isinstance(slug, str) and slug.strip()):
@@ -366,7 +422,7 @@ class EasyWeekClient:
     @staticmethod
     def _raise_for_permanent_status(status: int, *, operation: str, attempt: int) -> None:
         """Raise the typed permanent error for *status*, or return if retryable."""
-        if status in _RETRYABLE_STATUS_CODES:
+        if _is_retryable_status(status):
             return
         if status in (401, 403):
             raise EasyWeekAuthError(
@@ -401,10 +457,19 @@ class EasyWeekClient:
     # -- public GET-only API ----------------------------------------------
 
     async def ping(self) -> dict[str, Any]:
-        """``GET /ping`` — verify that the API key and workspace slug work."""
+        """``GET /ping`` — verify that the API key and workspace slug work.
+
+        A 200 alone proves nothing: a captive portal, a proxy error page or the
+        wrong endpoint can all answer 200 with arbitrary JSON. The documented
+        success marker ``{"ping": "pong"}`` must actually be present, otherwise
+        the probe would report a healthy API that was never reached. Extra
+        fields (``version``, …) are allowed.
+        """
         payload = await self._get_json(_PATH_PING, operation="ping")
         if not isinstance(payload, dict):
             raise EasyWeekProtocolError("ping response is not a JSON object", operation="ping")
+        if payload.get("ping") != "pong":
+            raise EasyWeekProtocolError("ping response did not confirm the API", operation="ping")
         return payload
 
     async def list_locations(self) -> list[dict[str, Any]]:
@@ -412,27 +477,60 @@ class EasyWeekClient:
 
         One key may legitimately see several locations (§1.6 p.5), which is why
         the operator picks ``EASYWEEK_LOCATION_UUID`` from this list by hand.
-        Accepts both a bare list and a ``{"data": [...]}`` envelope; non-object
-        entries are dropped rather than trusted.
+        A bare list and the documented ``{"data": [...]}`` envelope are both
+        accepted.
+
+        Malformed entries are NOT dropped silently: quietly discarding one would
+        hide exactly the case where the operator then picks a UUID from an
+        incomplete list. Any non-object entry fails the whole call.
         """
         payload = await self._get_json(_PATH_LOCATIONS, operation="list_locations")
-        items: Any = payload
+
         if isinstance(payload, dict):
-            items = payload.get("data")
+            if "data" not in payload:
+                raise EasyWeekProtocolError("locations envelope has no data key", operation="list_locations")
+            items: Any = payload["data"]
+        elif isinstance(payload, list):
+            items = payload
+        else:
+            raise EasyWeekProtocolError(
+                "locations response is neither a list nor a data envelope", operation="list_locations"
+            )
+
         if not isinstance(items, list):
-            raise EasyWeekProtocolError("locations response is not a JSON list", operation="list_locations")
-        return [item for item in items if isinstance(item, dict)]
+            raise EasyWeekProtocolError("locations data is not a JSON list", operation="list_locations")
+        for item in items:
+            if not isinstance(item, dict):
+                raise EasyWeekProtocolError(
+                    "locations response contains a non-object entry", operation="list_locations"
+                )
+        return list(items)
 
     async def get_booking(self, booking_uuid: str) -> dict[str, Any]:
         """``GET /bookings/{uuid}`` — read one booking.
 
         The response contains customer PII, so the caller is responsible for
         projecting only safe fields; this client never logs the body.
+
+        If a ``data`` key is present it MUST hold the booking object — falling
+        back to the outer envelope when ``data`` is null/list/scalar would turn a
+        broken response into a "successfully read" booking. A minimal identity
+        check (a usable ``uuid``) keeps an arbitrary JSON object from passing as
+        a booking; full domain validation belongs to PR-4, not here.
         """
         canonical = _canonical_booking_uuid(booking_uuid)
         payload = await self._get_json(_PATH_BOOKINGS, canonical, operation="get_booking")
-        if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
-            payload = payload["data"]
+
+        if isinstance(payload, dict) and "data" in payload:
+            inner = payload["data"]
+            if not isinstance(inner, dict):
+                raise EasyWeekProtocolError("booking data is not a JSON object", operation="get_booking")
+            payload = inner
+
         if not isinstance(payload, dict):
             raise EasyWeekProtocolError("booking response is not a JSON object", operation="get_booking")
+
+        uid = payload.get("uuid")
+        if not (isinstance(uid, str) and uid.strip()):
+            raise EasyWeekProtocolError("booking response has no usable uuid", operation="get_booking")
         return payload
