@@ -65,13 +65,47 @@ log_format kitilash_webhook_safe
 # $request_uri is safe ONLY as this map source: the map reduces it to boolean 0/1.
 # Never add it to a log_format, access_log path, header or diagnostic output.
 #
-# $kitilash_is_webhook     1 for /webhook and /webhooks paths, else 0
+# TWO selectors, because one is not enough:
+#
+#   1. Canonical path. Catches the request targets that already look like a
+#      webhook: /webhook, /webhooks/easyweek?token=…, and so on.
+#
+#   2. Fail-safe on known secret-bearing query keys. $request_uri is the RAW
+#      target, while Nginx picks the location from the NORMALISED URI. Those two
+#      differ for percent-encoded and dot-segment forms, e.g.
+#          /%77ebhooks/easyweek?token=…
+#          /webhooks%2Feasyweek?token=…
+#          /foo/../webhooks/easyweek?token=…
+#      Such a request can be routed as a webhook while the canonical regex sees
+#      a non-webhook raw path — selector 0, combined log, secret on disk. We do
+#      NOT try to reimplement Nginx URI normalisation in a regex (that is a
+#      losing game); instead we key off the thing that actually makes the request
+#      dangerous: the secret in its query string.
+#
+# The key list is deliberately narrow and matches what this codebase really
+# authenticates with — token (EasyWeek), secret and userGuid (Altegio),
+# hub.verify_token (Meta verification). Do not widen it by guesswork.
+# hub.verify_token needs its own alternative: the "?"/"&" boundary below would
+# not match "…verify_token=", because the character before "token" is ".".
+#
+# INTENTIONAL FALSE POSITIVES: /health?token=… or /other?secret=… also land in
+# the safe webhook log. That is the correct trade: a non-webhook request logged
+# with path+status and no query is harmless, whereas one leaked secret in
+# combined is not recoverable. Boundaries keep this tight — ?notsecret=,
+# ?mytoken=, ?tokenized= and ?hub.verify_token_extra= do NOT match.
+#
+# $kitilash_is_webhook     1 for webhook paths OR any secret-bearing query
 # $kitilash_is_not_webhook the inverse, so the site-wide log keeps everything
-#                          EXCEPT webhooks (the site log must not be disabled)
+#                          EXCEPT those (the site log must not be disabled)
 
 map $request_uri $kitilash_is_webhook {
     default                    0;
+
+    # 1. Canonical webhook paths.
     ~^/webhooks?(?:/|\?|$)     1;
+
+    # 2. Fail-safe: a known secret-bearing query key in any path shape.
+    ~*(?:\?|&)(?:token|secret|userGuid|hub\.verify_token)=     1;
 }
 
 map $kitilash_is_webhook $kitilash_is_not_webhook {

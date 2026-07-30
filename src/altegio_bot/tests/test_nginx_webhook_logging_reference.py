@@ -95,6 +95,33 @@ _WEBHOOK_SELECTOR_CASES = {
         True,
     ),
     "altegio-query": ("/webhooks/altegio?secret=x", True),
+    # --- URI-normalization bypasses: the RAW target does not look like a webhook,
+    # but Nginx routes the NORMALISED URI to one. The secret-query fail-safe is
+    # what keeps these out of the combined log.
+    "percent-encoded-w": ("/%77ebhooks/easyweek?token=x", True),
+    "encoded-slash": ("/webhooks%2Feasyweek?token=x", True),
+    "dot-segment": ("/foo/../webhooks/easyweek?token=x", True),
+    # --- Intentional false positives: a non-webhook path carrying a known secret
+    # key is still safer in the webhook log than in combined.
+    "health-token": ("/health?token=x", True),
+    "other-secret": ("/other?secret=x", True),
+    "other-userguid": ("/other?userGuid=x", True),
+    "other-hub-verify-token": ("/other?hub.verify_token=x", True),
+    # --- Same keys as a non-first query parameter.
+    "trailing-token": ("/other?a=1&token=x", True),
+    "trailing-secret": ("/other?a=1&secret=x", True),
+    "trailing-userguid": ("/other?a=1&userGuid=x", True),
+    "trailing-hub-verify-token": ("/other?a=1&hub.verify_token=x", True),
+    # --- Case-insensitive matching of the key.
+    "uppercase-token-key": ("/other?TOKEN=x", True),
+    "mixed-userguid-key": ("/other?userguid=x", True),
+    # --- Query-parameter boundaries: a longer name is NOT one of our keys.
+    "not-secret-key": ("/other?notsecret=x", False),
+    "my-token-key": ("/other?mytoken=x", False),
+    "tokenized-key": ("/other?tokenized=x", False),
+    "hub-verify-token-extra": ("/other?hub.verify_token_extra=x", False),
+    # A secret-looking VALUE is not a secret-bearing KEY.
+    "secret-as-value": ("/other?foo=secret", False),
     "site-root": ("/", False),
     "health": ("/health", False),
     "webhook-prefix-collision": ("/webhookevil", False),
@@ -198,17 +225,33 @@ def _map_entries(body: str) -> list[tuple[str, str]]:
     return entries
 
 
-def _webhook_selector_pattern() -> str:
-    """Return the single positive regex from the original-request selector."""
+def _webhook_selector_patterns() -> list[tuple[str, bool]]:
+    """Return the positive regexes of the original-request selector.
+
+    Each entry is ``(pattern, case_insensitive)``: Nginx spells a
+    case-insensitive regex ``~*`` and a case-sensitive one ``~``.
+    """
     active = _active_config(LOG_FORMATS_FILE)
     body = _map_body(active, "$request_uri", "$kitilash_is_webhook")
-    patterns = [
-        selector.removeprefix("~")
-        for selector, result in _map_entries(body)
-        if selector.startswith("~") and result == "1"
-    ]
-    assert len(patterns) == 1, "webhook selector must have one positive regex"
-    return patterns[0]
+    patterns: list[tuple[str, bool]] = []
+    for selector, result in _map_entries(body):
+        if result != "1" or not selector.startswith("~"):
+            continue
+        if selector.startswith("~*"):
+            patterns.append((selector[2:], True))
+        else:
+            patterns.append((selector[1:], False))
+    assert patterns, "webhook selector must have at least one positive regex"
+    return patterns
+
+
+def _selector_matches(request_target: str) -> bool:
+    """Evaluate the selector exactly the way Nginx would: first match wins."""
+    for pattern, case_insensitive in _webhook_selector_patterns():
+        flags = re.IGNORECASE if case_insensitive else 0
+        if re.search(pattern, request_target, flags) is not None:
+            return True
+    return False
 
 
 # ===========================================================================
@@ -367,19 +410,26 @@ def test_webhook_selector_uses_original_request_uri() -> None:
     assert _variables(active).count("$request_uri") == 1
 
 
-def test_webhook_selector_has_exact_path_or_query_boundary() -> None:
-    """Do not match prefix collisions or lose root paths carrying a query."""
-    assert _webhook_selector_pattern() == r"^/webhooks?(?:/|\?|$)"
+def test_webhook_selector_declares_canonical_and_failsafe_patterns() -> None:
+    """Both selectors are required: canonical path AND secret-query fail-safe.
+
+    The canonical regex alone missed percent-encoded and dot-segment forms, whose
+    RAW $request_uri does not look like a webhook even though Nginx routes the
+    NORMALISED URI to one.
+    """
+    assert _webhook_selector_patterns() == [
+        (r"^/webhooks?(?:/|\?|$)", False),
+        (r"(?:\?|&)(?:token|secret|userGuid|hub\.verify_token)=", True),
+    ]
 
 
 @pytest.mark.parametrize("case_id", _WEBHOOK_SELECTOR_CASES)
 def test_webhook_selector_classification(case_id: str) -> None:
-    """Exercise the Nginx selector regex without echoing request targets."""
-    pattern = _webhook_selector_pattern()
+    """Exercise the Nginx selector regexes without echoing request targets."""
     request_target, expected = _WEBHOOK_SELECTOR_CASES[case_id]
-    selected = re.search(pattern, request_target) is not None
-    if selected is not expected:
-        pytest.fail("webhook selector case was misclassified", pytrace=False)
+    if _selector_matches(request_target) is not expected:
+        # Never print the target: these carry marker-shaped secrets by design.
+        pytest.fail(f"webhook selector misclassified case_id={case_id!r}", pytrace=False)
 
 
 def test_conditional_logging_selector_is_map_based_and_routing_neutral() -> None:
@@ -389,6 +439,7 @@ def test_conditional_logging_selector_is_map_based_and_routing_neutral() -> None
     assert _map_entries(webhook_map) == [
         ("default", "0"),
         ("~^/webhooks?(?:/|\\?|$)", "1"),
+        ("~*(?:\\?|&)(?:token|secret|userGuid|hub\\.verify_token)=", "1"),
     ]
 
     inverse_map = _map_body(
@@ -613,3 +664,77 @@ def test_runbook_requires_secret_rotation() -> None:
     for secret_name in ("EASYWEEK_WEBHOOK_SECRET", "ALTEGIO_WEBHOOK_SECRET"):
         assert secret_name in text, f"the runbook must require rotating {secret_name}"
     assert "WHATSAPP_WEBHOOK_VERIFY_TOKEN" in text
+
+
+# ===========================================================================
+# 5. $request_uri is confined to the boolean selector
+# ===========================================================================
+
+
+def test_request_uri_is_only_the_map_source() -> None:
+    """The raw target may classify, but must never be recorded anywhere.
+
+    $request_uri carries the secret, so exactly one active occurrence is allowed
+    in the whole reference: the input of the boolean map.
+    """
+    active = _active_config(LOG_FORMATS_FILE)
+    assert _variables(active).count("$request_uri") == 1, (
+        "$request_uri may appear only once, as the selector map source"
+    )
+    assert re.search(
+        r"^\s*map\s+\$request_uri\s+\$kitilash_is_webhook\s*\{",
+        active,
+        re.MULTILINE,
+    ), "the single occurrence must be the map source"
+
+
+def test_request_uri_absent_from_safe_log_format() -> None:
+    assert not _has_variable(_safe_log_format_body(), "$request_uri")
+
+
+def test_request_uri_absent_from_logging_include() -> None:
+    assert not _has_variable(_active_config(LOGGING_INCLUDE_FILE), "$request_uri")
+
+
+@pytest.mark.parametrize("path", [LOG_FORMATS_FILE, LOGGING_INCLUDE_FILE])
+def test_no_access_log_directive_uses_request_uri(path: Path) -> None:
+    """Neither an access_log FORMAT nor its PATH may contain the raw target."""
+    active = _active_config(path)
+    for match in re.finditer(r"^\s*access_log\b[^;]*;", active, re.MULTILINE):
+        statement = match.group(0)
+        assert not _has_variable(statement, "$request_uri")
+        assert not _has_variable(statement, "$request")
+        assert not _has_variable(statement, "$args")
+        assert not _has_variable(statement, "$query_string")
+
+
+def test_commented_conditional_access_log_examples_are_also_clean() -> None:
+    """The Variant B example an operator copies must be safe as written."""
+    reference = LOG_FORMATS_FILE.read_text()
+    example = reference[reference.index("# Then, inside") : reference.index("# CAVEAT:")]
+    uncommented = "\n".join(re.sub(r"^\s*# ?", "", line) for line in example.splitlines())
+    for match in re.finditer(r"^\s*access_log\b[^;]*;", uncommented, re.MULTILINE):
+        statement = match.group(0)
+        for forbidden in ("$request_uri", "$request", "$args", "$query_string"):
+            assert not _has_variable(statement, forbidden), f"example access_log leaks {forbidden}"
+
+
+def test_selector_protects_every_documented_secret_query_key() -> None:
+    """The fail-safe must cover exactly the keys this codebase authenticates with.
+
+    token -> EasyWeek (webhooks/easyweek.py), secret + userGuid -> Altegio
+    (main.py), hub.verify_token -> Meta verification handshake.
+    """
+    for key in ("token", "secret", "userGuid", "hub.verify_token"):
+        assert _selector_matches(f"/anything?{key}=marker"), f"secret key {key!r} is not protected"
+        assert _selector_matches(f"/anything?a=1&{key}=marker"), f"secret key {key!r} unprotected mid-query"
+
+
+def test_runbook_documents_uri_normalization_risk() -> None:
+    """The operator must know raw target != routed URI, and not hand-roll it."""
+    text = _runbook()
+    assert "$request_uri" in text
+    assert "--path-as-is" in text, "the runbook must require a non-normalising client"
+    lowered = text.lower()
+    assert "percent" in lowered or "%77" in text, "percent-encoding risk must be documented"
+    assert "dot" in lowered or "/../" in text, "dot-segment risk must be documented"

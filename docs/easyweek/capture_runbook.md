@@ -183,6 +183,46 @@ security-контрактом:
   запрещены `$request`, `$request_uri`, `$args`, `$query_string`, `$is_args`,
   `$http_referer` и произвольные request-заголовки.
 
+**Raw request target ≠ URI, по которому выбирается location.** `$request_uri` —
+это то, что прислал клиент, а location Nginx выбирает по **нормализованному** URI
+(percent-decoding, свёртка dot segments). Эти две формы расходятся, например:
+
+```text
+/%77ebhooks/easyweek?token=<secret>
+/webhooks%2Feasyweek?token=<secret>
+/foo/../webhooks/easyweek?token=<secret>
+```
+
+Такой запрос может обслуживаться webhook-routing, при том что канонический regex
+по сырому `$request_uri` его webhook'ом не считает → `$kitilash_is_webhook=0` →
+обычный `combined` → `$request` с секретом на диске.
+
+**Не реализовывать нормализацию URI своим regex** — это заведомо неполное
+решение. Вместо этого selector содержит два entry:
+
+1. канонический path (`~^/webhooks?(?:/|\?|$)`);
+2. fail-safe по известным secret-bearing query keys, независимо от формы path:
+   `token`, `secret`, `userGuid`, `hub.verify_token` (case-insensitive, с
+   границами `?`/`&` и обязательным `=`).
+
+Список ключей соответствует тому, чем реально аутентифицируются вебхуки этого
+проекта (`token` — EasyWeek, `secret` и `userGuid` — Altegio, `hub.verify_token` —
+Meta verification). Расширять его без подтверждения в коде/настройках не следует.
+`hub.verify_token` перечислен отдельно: граница `?`/`&` не совпала бы с
+`…verify_token=`, потому что перед `token` стоит точка.
+
+**Намеренные false positives допустимы.** `/health?token=…` или `/other?secret=…`
+тоже уйдут в безопасный webhook-лог. Это верный компромисс: не-webhook запрос,
+записанный с путём и статусом без query, безвреден, а один утёкший секрет в
+`combined` невосстановим. Границы при этом узкие — `?notsecret=`, `?mytoken=`,
+`?tokenized=`, `?hub.verify_token_extra=` и `?foo=secret` не срабатывают.
+
+Статически это зафиксировано в
+`src/altegio_bot/tests/test_nginx_webhook_logging_reference.py`, а фактическое
+поведение Nginx — в
+`src/altegio_bot/tests/test_nginx_webhook_logging_integration.py` (одноразовый
+контейнер, обязательный режим `ALTEGIO_REQUIRE_NGINX_LOGTEST=1`).
+
 **Вариант A — отдельные webhook locations уже существуют.** Добавить
 logging-only include непосредственно в каждый из этих существующих блоков.
 Production diff должен состоять только из logging directives или одной строки
@@ -369,6 +409,36 @@ tail -n 20 /var/log/nginx/webhooks_access.log
 Там должны быть метод, путь, статус, размер ответа и длительность — и не должно
 быть `token=`, `secret=`, `userGuid=`, `hub.verify_token`, символа `?` и query
 string целиком.
+
+#### Шаг 6b. URI-normalization marker tests (обязательны)
+
+Канонических маршрутов недостаточно: нужно проверить формы, где сырой
+`$request_uri` не выглядит webhook'ом, а маршрутизация идёт по нормализованному
+URI. `curl` по умолчанию сам сворачивает путь, поэтому **обязателен**
+`--path-as-is` (или другой клиент, не нормализующий путь до отправки):
+
+```bash
+for RAW in \
+  '/%77ebhooks/easyweek?token=' \
+  '/webhooks%2Feasyweek?token=' \
+  '/foo/../webhooks/easyweek?token=' \
+  '/health?token=' ; do
+  M="NORM_LEAK_TEST_$(openssl rand -hex 8)"
+  curl -sS --path-as-is -o /dev/null -w "%{http_code} ${RAW}\n" \
+    -X POST "https://api.kitilash.com${RAW}${M}" \
+    -H 'Content-Type: application/json' -d '{"probe":"uri-normalization"}'
+  grep -R "$M" /var/log/nginx/ 2>/dev/null && echo "LEAK" || echo "not found"
+done
+```
+
+Зафиксировать **фактический** status и обработчик каждого случая: конкретный build
+Nginx может отклонить какую-то encoded-форму ещё до routing (например `400`). Это
+допустимо — но тогда нельзя утверждать, что случай дошёл до webhook handler; в
+отчёте указывается фактическое поведение. Критерий успеха один и тот же:
+**маркера нет ни в одном логе**, а не конкретный HTTP-код.
+
+Проверять для каждого маркера: `combined` access log, безопасный webhook access
+log, Nginx error logs и весь каталог логов целиком.
 
 Normal-path `403` доказывает только отсутствие утечки на запросе, дошедшем до
 работающего приложения. Он не проверяет Nginx `error_log`.
