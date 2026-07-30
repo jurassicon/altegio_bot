@@ -1,0 +1,52 @@
+# Logging-only include for webhook routes — REFERENCE EXAMPLE
+#
+# This file contains logging directives and NOTHING else. It deliberately does
+# not create, match or modify a route.
+#
+# HOW TO USE IT
+# -------------
+# Insert it inside an ALREADY EXISTING production block that actually serves the
+# webhook, e.g.:
+#
+#     include /etc/nginx/snippets/kitilash_webhook_logging.inc;
+#
+# Rules:
+#   * It never creates a route. Adding a new exact or ^~ block instead would
+#     change which location Nginx selects and would silently drop the real body
+#     limits, timeouts, rate limiting, allow/deny, headers, buffering, retry
+#     policy and upstream that the current block inherits.
+#   * Study the effective configuration FIRST — `nginx -T` — and add this include
+#     to the blocks that genuinely handle /webhooks/easyweek, /webhooks/altegio
+#     and /webhook/whatsapp. The resulting production diff should be logging
+#     directives (or this single include) and nothing else.
+#   * Do NOT drop it blindly into a shared `location /`: that would re-log the
+#     whole API with a webhook-shaped format and would silence request-level
+#     error logging for every route, not just webhooks. In that situation use the
+#     routing-neutral conditional access logging from
+#     kitilash_webhook_log_formats.conf.example, and pick the error_log scope
+#     deliberately (see the runbook).
+#   * The real production config is never copied into this repository, and no
+#     real secret belongs in it.
+#
+# Requires `log_format kitilash_webhook_safe` to be defined in the http context
+# (see kitilash_webhook_log_formats.conf.example).
+
+# Access log: path/status/size/duration only — no $request, $request_uri or $args.
+access_log /var/log/nginx/webhooks_access.log kitilash_webhook_safe;
+
+# Error log: a SAFE access_log is not enough on its own.
+#
+# On upstream connection failure, timeout and some proxy errors Nginx writes the
+# full request line — query string included — into the error log. So an ordinary
+# marker test that ends in an application-level 403 proves nothing about this
+# channel: that request never fails at the proxy layer.
+#
+# The error log format is not configurable, so the only reliable protection is to
+# not persist it for these requests. This deliberately sacrifices Nginx error
+# diagnostics in the selected scope; keep the scope as narrow as the effective
+# production routing safely permits and monitor upstream health separately.
+#
+# Do NOT replace this with a real file such as
+#     error_log /var/log/nginx/webhooks_error.log error;
+# because that file would keep receiving the full request target.
+error_log /dev/null emerg;

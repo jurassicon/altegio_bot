@@ -106,12 +106,17 @@ https://<host>/webhooks/easyweek?event=booking-created&token=<secret>
 > `api.kitilash.com` показала, что полный request target вебхука (вместе с
 > `token=`) попал в `/var/log/nginx/access.log`. В логах приложения и в
 > `docker logs` маркер отсутствовал — значит проблема именно в host-level Nginx
-> access logging, а не в коде. Пока пункты ниже не выполнены, go-live
-> блокируется, а текущие query-секреты считаются **потенциально раскрытыми**.
+> logging, а не в коде. Безопасный `access_log` закрывает только один канал:
+> при upstream connection failure, timeout и некоторых proxy errors Nginx может
+> записать полную request line вместе с query string в `error_log`. Пока оба
+> канала не закрыты и все проверки ниже не выполнены, go-live блокируется, а
+> текущие query-секреты считаются **потенциально раскрытыми**.
 
 Nginx-конфиг живёт вне репозитория, поэтому код за его фактическое применение не
 отвечает. Стандартный `log_format combined` содержит `$request` (метод +
 **полный URI вместе с query string**) — для этих эндпоинтов он недопустим.
+Формат `error_log` не настраивается, поэтому заменить в нём `$request_uri` на
+`$uri` невозможно.
 
 Чувствительны **все** webhook-маршруты, а не только EasyWeek:
 
@@ -121,29 +126,99 @@ Nginx-конфиг живёт вне репозитория, поэтому ко
 | `/webhooks/altegio` | `?secret=<secret>` (в части вариантов ещё `userGuid`) |
 | `/webhook/whatsapp` | Meta verification: `?hub.mode=…&hub.verify_token=<token>&hub.challenge=…` |
 
-#### Шаг 1. Найти фактически активный конфиг
+#### Шаг 1. Сделать backup и описать фактически активный routing
+
+Сначала сделать backup активного production-конфига. Production-конфиг, IP,
+сертификаты и секреты не копировать в репозиторий.
 
 ```bash
-nginx -T
+sudo nginx -T
 ```
 
-Найти `server_name api.kitilash.com`, все `access_log`, все `log_format`,
-location'ы webhook-маршрутов и то, наследуется ли глобальный access log.
+В выводе найти `server_name api.kitilash.com` и фактические блоки, которые
+обслуживают `/webhooks/easyweek`, `/webhooks/altegio` и `/webhook/whatsapp`.
+До любых изменений зафиксировать:
 
-#### Шаг 2. Применить безопасный формат
+- modifier и path каждого `location`, включая regex locations и rewrite rules;
+- фактический `proxy_pass` и proxy headers;
+- `client_max_body_size` и `client_body_timeout`;
+- proxy connect/read/send timeouts;
+- rate/connection limiting и allow/deny;
+- buffering, retry policy и upstream;
+- все эффективные `access_log` и `error_log`, включая унаследованные.
 
-Готовый reference-снипет лежит в репозитории:
+Нельзя угадывать эту конфигурацию по содержимому репозитория.
 
-```text
-deploy/nginx/kitilash_webhook_safe_logging.conf.example
-```
+#### Шаг 2. Выбрать routing-neutral access logging
+
+Versioned reference теперь разделён на две части:
+
+- `deploy/nginx/kitilash_webhook_log_formats.conf.example` — определения для
+  существующего `http` context: безопасный `log_format` и опциональные `map` для
+  conditional logging;
+- `deploy/nginx/kitilash_webhook_logging.inc.example` — только `access_log` и
+  безопасная политика `error_log`; include добавляется исключительно внутрь уже
+  существующего production `location` или `server`, который фактически
+  обслуживает webhook.
+
+Reference **не создаёт маршруты**. Не копировать и не добавлять из него generic
+`location ^~ /webhook`, exact locations или предполагаемый `location /`.
+Не менять modifier/path существующего location, `proxy_pass`, headers, limits,
+timeouts, access restrictions, buffering, retries или upstream.
 
 В формате запрещены `$request`, `$request_uri`, `$args`, `$query_string`,
 `$is_args`, `$http_referer` и произвольные request-заголовки; используется `$uri`
-(путь без query), а не `$request_uri`. Глобальный access log сайта **не**
-отключается — изменение ограничено webhook-маршрутами.
+(путь без query), а не `$request_uri`.
 
-Перед правкой — backup фактического конфига. После правки:
+**Вариант A — отдельные webhook locations уже существуют.** Добавить
+logging-only include непосредственно в каждый из этих существующих блоков.
+Production diff должен состоять только из logging directives или одной строки
+`include`; routing/security directives остаются без изменений.
+
+**Вариант B — все запросы обслуживает общий `location /`.** Не создавать новый
+generic или exact location. Использовать `map` из http-level reference и две
+условные `access_log` на уровне существующего `server`: обычный site log только
+для non-webhook routes и safe log только для webhook routes. Перед применением
+проверить вывод `nginx -T`: `access_log` внутри более низкоуровневого location
+отменяет наследование server-level logging. Такой unsafe location исправляется
+отдельно, но его routing directives не меняются.
+
+Не вставлять logging-only include вслепую в общий `location /`: это изменит
+логирование всего API и подавит request-level error logging для всех маршрутов.
+
+#### Шаг 3. Выбрать безопасный scope для error log
+
+Обычный error log, например
+`error_log /var/log/nginx/webhooks_error.log error;`, небезопасен: при
+proxy-level failure он может сохранить полный request target. Для контекста,
+который обслуживает query-secret webhooks, обязательна политика:
+
+```nginx
+error_log /dev/null emerg;
+```
+
+- Если отдельные webhook locations уже существуют, logging-only include с этой
+  директивой добавляется в них без изменения routing.
+- Если существует только общий `location /`, локально и условно переопределить
+  формат `error_log` по `$uri` нельзя. Оператор должен выбрать одно из двух:
+  подавить request-level error logging на уровне существующего
+  `server_name api.kitilash.com`, если это допустимо для всего API-server; либо
+  сделать production-specific locations только после изучения `nginx -T`.
+
+Во втором случае нужно скопировать всю эффективную routing/security
+конфигурацию прежнего location: body limits, timeouts, rate limiting,
+proxy headers, upstream, buffering/retry policy и access restrictions; отдельно
+проверить regex precedence и доказать route parity. Такой production-specific
+location нельзя добавлять в репозиторий как универсальный reference.
+
+Если server-level suppression неприемлем, а parity отдельного location не
+доказана, безопасный scope для `error_log` не выбран и production security DoD
+не выполнен. Отсутствие маркера после обычного application-level `403` это не
+опровергает.
+
+#### Шаг 4. Проверить конфиг, reload и effective diff
+
+После правки:
 
 ```bash
 sudo nginx -t
@@ -155,48 +230,84 @@ sudo nginx -t
 sudo systemctl reload nginx
 ```
 
-Затем убедиться, что webhook-location'ы реально используют новый формат:
+Затем снова получить effective config:
 
 ```bash
 sudo nginx -T
 ```
 
-#### Шаг 3. Активная проверка утечки (обязательна)
+Сравнить его с зафиксированным на шаге 1: неожиданно не должны измениться
+location matching, upstream, headers, body limits, timeouts, rate limiting,
+allow/deny, buffering, retries и rewrite rules. `restart` вместо `reload` не
+использовать, если reload достаточен.
 
-Только искусственный маркер, никогда реальный секрет:
+#### Шаг 5. Production route-parity до и после изменения
+
+До и после Nginx-изменения выполнить одинаковые проверки:
+
+```text
+GET  /health
+POST /webhooks/easyweek с неправильным token
+POST /webhooks/altegio с неправильным secret
+GET  /webhook/whatsapp с неправильным hub.verify_token
+```
+
+Для каждого запроса сравнить HTTP status, response body contract, headers,
+timeout, body-size behaviour и доступность upstream. Auth-контракт не должен
+измениться:
+
+```text
+EasyWeek wrong token            → 403
+Altegio wrong secret            → 403
+WhatsApp wrong verification token → 403
+```
+
+Также проверить, что `/health` и остальные API routes, проходившие через прежний
+`location /`, продолжают работать. Любое расхождение сначала рассматривается
+как routing regression.
+
+#### Шаг 6. Normal-path marker tests (обязательны)
+
+Использовать три разных искусственных маркера, никогда реальные секреты:
 
 ```bash
-MARKER="EW_LOG_LEAK_TEST_$(openssl rand -hex 8)"
+EW_MARKER="EW_LOG_LEAK_TEST_$(openssl rand -hex 8)"
+ALT_MARKER="ALT_LOG_LEAK_TEST_$(openssl rand -hex 8)"
+WA_MARKER="WA_LOG_LEAK_TEST_$(openssl rand -hex 8)"
 ```
 
 ```bash
-curl -sS -X POST \
-  "https://api.kitilash.com/webhooks/easyweek?event=booking-created&token=${MARKER}" \
+curl -sS -o /dev/null -w '%{http_code}\n' -X POST \
+  "https://api.kitilash.com/webhooks/easyweek?event=booking-created&token=${EW_MARKER}" \
   -H "Content-Type: application/json" \
   -d '{"probe":"nginx-log-leak-test"}'
 ```
 
-Ожидается `403` (маркер — не настоящий секрет). Затем искать маркер:
-
 ```bash
-grep -R "$MARKER" /var/log/nginx/ 2>/dev/null
-```
-
-```bash
-journalctl -u nginx --since "15 minutes ago" --no-pager | grep "$MARKER"
+curl -sS -o /dev/null -w '%{http_code}\n' -X POST \
+  "https://api.kitilash.com/webhooks/altegio?secret=${ALT_MARKER}" \
+  -H "Content-Type: application/json" \
+  -d '{}'
 ```
 
 ```bash
-docker compose -p altegio_bot logs --since 15m 2>&1 | grep "$MARKER"
+curl -sS -o /dev/null -w '%{http_code}\n' \
+  "https://api.kitilash.com/webhook/whatsapp?hub.mode=subscribe&hub.verify_token=${WA_MARKER}&hub.challenge=123"
 ```
 
-Маркер не должен найтись **нигде**. Повторить то же для двух остальных
-маршрутов:
+Каждый запрос должен вернуть `403`. Для каждого маркера выполнить все три
+поиска:
 
-```text
-/webhooks/altegio?secret=<marker>
-/webhook/whatsapp?hub.mode=subscribe&hub.verify_token=<marker>&hub.challenge=123
+```bash
+for MARKER in "$EW_MARKER" "$ALT_MARKER" "$WA_MARKER"; do
+  grep -R "$MARKER" /var/log/nginx/ 2>/dev/null
+  journalctl -u nginx --since "15 minutes ago" --no-pager | grep "$MARKER"
+  docker compose -p altegio_bot logs --since 15m 2>&1 | grep "$MARKER"
+done
 ```
+
+Ожидаемый результат для каждого поиска — `not found`. Отсутствие вывода означает
+успех; значения маркеров в отчёт не копировать.
 
 Отдельно проверить новый безопасный лог:
 
@@ -208,14 +319,50 @@ tail -n 20 /var/log/nginx/webhooks_access.log
 быть `token=`, `secret=`, `userGuid=`, `hub.verify_token`, символа `?` и query
 string целиком.
 
-**Новый файл конфигурации сам по себе не является исправлением.** Только
-пройденный marker-тест на фактически работающем конфиге доказывает, что query
-string больше не логируется.
+Normal-path `403` доказывает только отсутствие утечки на запросе, дошедшем до
+работающего приложения. Он не проверяет Nginx `error_log`.
 
-#### Шаг 4. Ротация потенциально раскрытых секретов
+#### Шаг 7. Failure-path marker test для Nginx error log (обязателен)
 
-Порядок важен: **сначала** исправить Nginx и пройти marker-тест, и только потом
-ротировать — иначе новые значения снова попадут в `access.log`.
+Нельзя останавливать production API, подменять его upstream или ломать реальные
+webhook deliveries. Тест выполнить в изоляции: временный localhost-only Nginx
+server либо disposable Nginx container.
+
+Изолированный конфиг должен использовать тот же
+`kitilash_webhook_safe` log format и тот же logging-only include, направлять
+`/var/log/nginx` в отдельный временный каталог и проксировать только тестовый
+маршрут на заведомо недоступный upstream, например `127.0.0.1:1`. Маркер должен
+быть искусственным:
+
+```bash
+FAILURE_MARKER="FAILURE_LOG_LEAK_TEST_$(openssl rand -hex 8)"
+```
+
+Ожидаемый сценарий:
+
+```text
+request with ?token=${FAILURE_MARKER}
+→ isolated Nginx returns 502
+→ safe access log contains method/path/status, but not the marker
+→ error log contains no marker because error_log is /dev/null emerg
+```
+
+После запроса проверить весь отдельный временный каталог:
+
+```bash
+grep -R "$FAILURE_MARKER" <temporary-nginx-log-directory>
+```
+
+Ожидаемый результат — `not found`. Затем удалить disposable container,
+временный config и временные logs. Обычный запрос к работающему FastAPI, даже с
+ответом `403`, не засчитывается как failure-path test.
+
+#### Шаг 8. Ротация потенциально раскрытых секретов
+
+Порядок важен: сначала должны пройти `nginx -t`, reload, повторный `nginx -T`,
+route-parity, все normal-path marker tests и изолированный failure-path marker
+test. Только после этого ротировать секреты — иначе новые значения снова могут
+попасть в логи.
 
 Ротировать минимум:
 

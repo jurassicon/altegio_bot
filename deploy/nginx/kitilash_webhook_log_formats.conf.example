@@ -1,0 +1,90 @@
+# Safe webhook log format — http-context definitions — REFERENCE EXAMPLE
+#
+# WHY THIS FILE EXISTS
+# --------------------
+# Every webhook this service exposes authenticates with a secret in the QUERY
+# STRING (EasyWeek and Altegio have no HMAC signature; Meta's verification
+# handshake uses hub.verify_token). Nginx's default `combined` format logs
+# $request — the full request line INCLUDING that query string — so the default
+# configuration writes live webhook secrets into /var/log/nginx/access.log in
+# clear text.
+#
+# The application side is already clean: uvicorn runs with --no-access-log,
+# AccessLogMiddleware logs only method/path/status/duration, and stored webhook
+# rows mask the query. The leak is purely at the host-level proxy.
+#
+# WHAT THIS FILE IS NOT
+# ---------------------
+# It contains NO routing. This reference does not know the real configuration of
+# api.kitilash.com, so it must never design routing: a new exact or ^~ location
+# would change which location Nginx selects and would silently stop inheriting
+# the real body limits, timeouts, rate limiting, allow/deny, headers, buffering,
+# retry policy, regex-location precedence, rewrites and upstream. Adjust the
+# EXISTING production blocks instead — see docs/easyweek/capture_runbook.md.
+#
+# The real production config is never copied into this repository, and no real
+# secret, certificate or IP belongs in this file.
+#
+# ---------------------------------------------------------------------------
+# Where this goes
+# ---------------------------------------------------------------------------
+# Into the `http { ... }` context — e.g. a file in /etc/nginx/conf.d/ that is
+# already included from `http`. A log_format may only be declared there.
+#
+# FORBIDDEN inside a webhook log format — each of these carries the secret:
+#   $request        full request line, includes the query string
+#   $request_uri    original URI, includes the query string
+#   $args           the query string itself
+#   $query_string   alias of $args
+#   $http_referer   a referer may echo a previously visited secret-bearing URL
+#   $is_args        no diagnostic value here (webhook routes always have a
+#                   query) and it invites $args to be added next to it
+# Do not log arbitrary request headers either.
+#
+# We log $uri — the normalised path WITHOUT the query — never $request_uri.
+
+log_format kitilash_webhook_safe
+    '$remote_addr [$time_local] '
+    'method=$request_method uri=$uri '
+    'status=$status bytes=$body_bytes_sent '
+    'request_time=$request_time';
+
+# ---------------------------------------------------------------------------
+# Optional: routing-neutral selector for conditional access logging
+# ---------------------------------------------------------------------------
+# Only needed for Variant B in the runbook — when every request is served by one
+# shared `location /` and there is no separate webhook block to extend. A `map`
+# defines a variable; it does not match, create or reorder any route.
+#
+# $kitilash_is_webhook     1 for /webhook and /webhooks paths, else 0
+# $kitilash_is_not_webhook the inverse, so the site-wide log keeps everything
+#                          EXCEPT webhooks (the site log must not be disabled)
+
+map $uri $kitilash_is_webhook {
+    default                 0;
+    ~^/webhooks?(?:/|$)     1;
+}
+
+map $kitilash_is_webhook $kitilash_is_not_webhook {
+    default 1;
+    1       0;
+}
+
+# Then, inside the ALREADY EXISTING `server` block for api.kitilash.com, replace
+# its access_log line with the two conditional ones below. This is logging only —
+# it adds no route and changes no matching:
+#
+#     access_log /var/log/nginx/access.log combined
+#         if=$kitilash_is_not_webhook;
+#
+#     access_log /var/log/nginx/webhooks_access.log kitilash_webhook_safe
+#         if=$kitilash_is_webhook;
+#
+# CAVEAT: an access_log declared inside a more specific existing location
+# OVERRIDES this server-level one for requests it handles. If such a location
+# already declares its own unsafe access log, server-level conditional logging
+# will NOT fix it — that location has to be corrected on its own, still without
+# touching its routing directives. Confirm with `nginx -T`, never by assumption.
+#
+# Log rotation: add /var/log/nginx/webhooks_access.log to the existing
+# /etc/logrotate.d/nginx entry (or a glob that already covers it).
