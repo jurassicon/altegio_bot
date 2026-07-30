@@ -193,35 +193,87 @@ security-контрактом:
 /foo/../webhooks/easyweek?token=<secret>
 ```
 
-Такой запрос может обслуживаться webhook-routing, при том что канонический regex
-по сырому `$request_uri` его webhook'ом не считает → `$kitilash_is_webhook=0` →
-обычный `combined` → `$request` с секретом на диске.
+**Имена query-параметров тоже могут быть percent-encoded.** Их декодирует не
+Nginx, а приложение, поэтому в сыром `$request_uri` может не быть ни webhook-пути,
+ни литерального имени ключа:
 
-**Не реализовывать нормализацию URI своим regex** — это заведомо неполное
-решение. Вместо этого selector содержит два entry:
+```text
+/%77ebhooks/easyweek?to%6ben=<secret>
+/%77ebhooks/easyweek?%74oken=<secret>
+/foo/../webhooks/altegio?sec%72et=<secret>
+/%77ebhook/whatsapp?hub%2Everify_token=<secret>
+```
 
-1. канонический path (`~^/webhooks?(?:/|\?|$)`);
-2. fail-safe по известным secret-bearing query keys, независимо от формы path:
-   `token`, `secret`, `userGuid`, `hub.verify_token` (case-insensitive, с
-   границами `?`/`&` и обязательным `=`).
+Handler получит обычный `token`, `secret` или `hub.verify_token`, а selector по
+списку имён вернул бы `0` → обычный `combined` → `$request` с секретом на диске.
 
-Список ключей соответствует тому, чем реально аутентифицируются вебхуки этого
-проекта (`token` — EasyWeek, `secret` и `userGuid` — Altegio, `hub.verify_token` —
-Meta verification). Расширять его без подтверждения в коде/настройках не следует.
-`hub.verify_token` перечислен отдельно: граница `?`/`&` не совпала бы с
-`…verify_token=`, потому что перед `token` стоит точка.
+**Перечисление имён секретных ключей и вариантов их encoding'а ненадёжно** и
+принципиально не закрывает пространство вариантов. Реализовывать нормализацию URI
+или декодирование query своим regex тоже нельзя. Поэтому selector содержит два
+entry и второй из них не зависит от имён параметров вообще:
 
-**Намеренные false positives допустимы.** `/health?token=…` или `/other?secret=…`
-тоже уйдут в безопасный webhook-лог. Это верный компромисс: не-webhook запрос,
-записанный с путём и статусом без query, безвреден, а один утёкший секрет в
-`combined` невосстановим. Границы при этом узкие — `?notsecret=`, `?mytoken=`,
-`?tokenized=`, `?hub.verify_token_extra=` и `?foo=secret` не срабатывают.
+1. канонический webhook path (`~^/webhooks?(?:/|\?|$)`) — safe log даже без query,
+   чтобы маршрут оставался виден;
+2. **любой** исходный request target с query string (`~\?`).
+
+```nginx
+map $request_uri $kitilash_needs_safe_log {
+    default                    0;
+    ~^/webhooks?(?:/|\?|$)     1;
+    ~\?                        1;
+}
+
+map $kitilash_needs_safe_log $kitilash_can_use_combined_log {
+    default 1;
+    1       0;
+}
+```
+
+Переменные намеренно называются `$kitilash_needs_safe_log` и
+`$kitilash_can_use_combined_log`: контракт теперь шире, чем «это webhook». Имена
+живут только в logging layer (map, условные `access_log`, тесты, runbook) и не
+затрагивают routing или application code.
+
+**Контракт.** Любой запрос с `?` исключается из обычного `combined` и попадает
+только в safe access log, где записывается нормализованный `$uri` без query:
+
+```text
+/health?ordinary=value
+/other?page=2
+/webhooks/easyweek?token=x
+/%77ebhooks/easyweek?to%6ben=x
+/foo/../webhooks/altegio?sec%72et=x
+/%77ebhook/whatsapp?hub%2Everify_token=x
+```
+
+Запросы без query (`/`, `/health`, `/control`, `/api/status`) по-прежнему идут в
+обычный combined log; канонические `/webhook` и `/webhooks` остаются safe и без
+query.
+
+**Это осознанный security trade-off.** Обычный API-запрос с query теряет query в
+access log, но сохраняет method, path, status, bytes и duration. Один утёкший
+секрет в `combined` невосстановим, а неизвестное будущее имя параметра и любое
+его encoding защищены автоматически. Прямое следствие: application/product
+analytics не должны зависеть от query, записанного в Nginx combined log — для
+этого есть логи приложения и БД.
+
+Файл safe-лога намеренно **не переименован**: `webhooks_access.log` уже
+развёрнут, прописан в logrotate и в этом runbook, а переименование было бы чистой
+production-миграцией без выигрыша в безопасности. Читать его имя следует как
+«безопасный access log».
 
 Статически это зафиксировано в
 `src/altegio_bot/tests/test_nginx_webhook_logging_reference.py`, а фактическое
 поведение Nginx — в
 `src/altegio_bot/tests/test_nginx_webhook_logging_integration.py` (одноразовый
-контейнер, обязательный режим `ALTEGIO_REQUIRE_NGINX_LOGTEST=1`).
+контейнер с образом, закреплённым по immutable digest; обязательный режим
+`ALTEGIO_REQUIRE_NGINX_LOGTEST=1`).
+
+**Вариант A сам по себе не даёт этот контракт.** Logging-only include защищает
+только те блоки, в которые он добавлен. Если требуется, чтобы весь API исключал
+query-bearing запросы из `combined`, условные `access_log` из варианта B нужны на
+уровне существующего `server` независимо от того, есть ли отдельные webhook
+locations.
 
 **Вариант A — отдельные webhook locations уже существуют.** Добавить
 logging-only include непосредственно в каждый из этих существующих блоков.
@@ -231,26 +283,27 @@ Production diff должен состоять только из logging directiv
 **Вариант B — все запросы обслуживает общий `location /`.** Не создавать новый
 generic или exact location. Использовать `map` из http-level reference и две
 условные `access_log` на уровне существующего `server`: обычный site log только
-для non-webhook routes и safe log только для webhook routes. Перед применением
-проверить вывод `nginx -T`: `access_log` внутри более низкоуровневого location
-отменяет наследование server-level logging. Такой unsafe location исправляется
-отдельно, но его routing directives не меняются.
-
-Первый selector обязан использовать неизменяемый исходный request target:
+для query-free non-webhook routes и safe log для всего остального. Перед
+применением проверить вывод `nginx -T`: `access_log` внутри более низкоуровневого
+location отменяет наследование server-level logging. Такой unsafe location
+исправляется отдельно, но его routing directives не меняются.
 
 ```nginx
-map $request_uri $kitilash_is_webhook {
-    default                    0;
-    ~^/webhooks?(?:/|\?|$)     1;
-}
+access_log /var/log/nginx/access.log combined
+    if=$kitilash_can_use_combined_log;
+
+access_log /var/log/nginx/webhooks_access.log kitilash_webhook_safe
+    if=$kitilash_needs_safe_log;
 ```
 
-Граница `(?:/|\?|$)` классифицирует `/webhook?x=1` и `/webhooks?x=1`, но
-исключает `/webhookevil`, `/webhooks-old`, `/webhook_backup` и вложенный
-`/api/webhooks/easyweek`. После любого internal redirect
-`$kitilash_is_webhook` остаётся boolean `1`; inverse selector оставляет
-`$kitilash_is_not_webhook=0`. Поэтому webhook должен попасть только в safe
-webhook log, а не одновременно в него и в обычный combined log.
+Selector обязан использовать неизменяемый исходный request target
+(`$request_uri`, а не `$uri`). Граница `(?:/|\?|$)` первого entry классифицирует
+`/webhook` и `/webhooks` вместе с их подпутями, но исключает `/webhookevil`,
+`/webhooks-old`, `/webhook_backup` и вложенный `/api/webhooks/easyweek` — такие
+пути попадут в safe log только если несут query. После любого internal redirect
+`$kitilash_needs_safe_log` остаётся boolean `1`; inverse selector оставляет
+`$kitilash_can_use_combined_log=0`. Поэтому запрос должен попасть только в safe
+log, а не одновременно в него и в обычный combined log.
 
 Проверить всю цепочку destinations: конечный или named location с собственным
 `access_log ... combined;` переопределит server-level conditional logging и
@@ -410,19 +463,23 @@ tail -n 20 /var/log/nginx/webhooks_access.log
 быть `token=`, `secret=`, `userGuid=`, `hub.verify_token`, символа `?` и query
 string целиком.
 
-#### Шаг 6b. URI-normalization marker tests (обязательны)
+#### Шаг 6b. URI-normalization и encoded-query marker tests (обязательны)
 
-Канонических маршрутов недостаточно: нужно проверить формы, где сырой
-`$request_uri` не выглядит webhook'ом, а маршрутизация идёт по нормализованному
-URI. `curl` по умолчанию сам сворачивает путь, поэтому **обязателен**
-`--path-as-is` (или другой клиент, не нормализующий путь до отправки):
+Канонических маршрутов недостаточно. Нужно проверить формы, где сырой
+`$request_uri` не выглядит ни webhook-путём, ни известным secret-ключом, а
+маршрутизация идёт по нормализованному URI и query декодирует приложение. `curl`
+по умолчанию сам сворачивает путь, поэтому **обязателен** `--path-as-is` (или
+другой клиент, не нормализующий путь до отправки):
 
 ```bash
 for RAW in \
-  '/%77ebhooks/easyweek?token=' \
+  '/%77ebhooks/easyweek?to%6ben=' \
+  '/%77ebhooks/easyweek?%74oken=' \
+  '/foo/../webhooks/altegio?sec%72et=' \
+  '/%77ebhook/whatsapp?hub%2Everify_token=' \
   '/webhooks%2Feasyweek?token=' \
   '/foo/../webhooks/easyweek?token=' \
-  '/health?token=' ; do
+  '/health?ordinary=' ; do
   M="NORM_LEAK_TEST_$(openssl rand -hex 8)"
   curl -sS --path-as-is -o /dev/null -w "%{http_code} ${RAW}\n" \
     -X POST "https://api.kitilash.com${RAW}${M}" \
@@ -431,17 +488,56 @@ for RAW in \
 done
 ```
 
+Последний случай (`/health?ordinary=`) — обычный non-webhook запрос с query. Он
+тоже обязан исчезнуть из `combined`: это проверка широкого контракта, а не
+webhook-маршрута.
+
 Зафиксировать **фактический** status и обработчик каждого случая: конкретный build
 Nginx может отклонить какую-то encoded-форму ещё до routing (например `400`). Это
 допустимо — но тогда нельзя утверждать, что случай дошёл до webhook handler; в
 отчёте указывается фактическое поведение. Критерий успеха один и тот же:
-**маркера нет ни в одном логе**, а не конкретный HTTP-код.
+**маркера нет ни в одном логе**, а не конкретный HTTP-код. `curl`, не получивший
+HTTP-ответа, печатает `000` — это транспортная ошибка, а не успешный тест;
+отсутствие маркера в таком случае ничего не доказывает и прогон нужно повторить.
 
-Проверять для каждого маркера: `combined` access log, безопасный webhook access
-log, Nginx error logs и весь каталог логов целиком.
+Проверять для каждого маркера все каналы:
+
+```bash
+grep -R "$M" /var/log/nginx/ 2>/dev/null
+journalctl -u nginx --since "15 minutes ago" --no-pager | grep "$M"
+docker compose -p altegio_bot logs --since 15m 2>&1 | grep "$M"
+```
+
+То есть: `combined` access log, безопасный access log, Nginx error logs,
+journald, Docker logs и весь каталог логов целиком. Ожидаемый результат каждого
+поиска — `not found`. Дополнительно убедиться, что query-bearing запрос
+отсутствует в `combined`, а в safe log присутствует строка с path и статусом без
+query.
 
 Normal-path `403` доказывает только отсутствие утечки на запросе, дошедшем до
 работающего приложения. Он не проверяет Nginx `error_log`.
+
+#### Шаг 6c. Обязательный CI gate (для разработчика)
+
+Disposable Nginx security suite — отдельный обязательный шаг CI, а не часть
+общего прогона. Запускать его нужно явно и в mandatory-режиме, где недоступность
+Docker или образа является ошибкой, а не skip'ом:
+
+```bash
+ALTEGIO_REQUIRE_NGINX_LOGTEST=1 uv run pytest -q src/altegio_bot/tests/test_nginx_webhook_logging_integration.py
+```
+
+Основной application suite запускается отдельно и исключает этот файл, чтобы не
+поднимать контейнер дважды:
+
+```bash
+uv run pytest -q --ignore=src/altegio_bot/tests/test_nginx_webhook_logging_integration.py
+```
+
+Обычный `uv run pytest -q` **не гарантирует** выполнение security integration
+suite: без `ALTEGIO_REQUIRE_NGINX_LOGTEST=1` он тихо skip'нется на машине без
+Docker. Оба шага закреплены в `.github/workflows/ci_deploy.yml` (job `tests`) и
+проверяются тестом `src/altegio_bot/tests/test_ci_workflow_nginx_gate.py`.
 
 #### Шаг 7. Failure-path marker test для Nginx error log (обязателен)
 

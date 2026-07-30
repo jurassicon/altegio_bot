@@ -30,6 +30,16 @@
 #
 # Requires `log_format kitilash_webhook_safe` to be defined in the http context
 # (see kitilash_webhook_log_formats.conf.example).
+#
+# ABOUT THE FILE NAME
+# -------------------
+# The conditional Variant B selector in kitilash_webhook_log_formats.conf.example
+# now routes EVERY query-bearing request into this same safe log, not just
+# webhooks — a raw query key can be percent-encoded, so parameter names cannot be
+# enumerated safely. The path below is deliberately NOT renamed: it is already
+# deployed, referenced by logrotate and by the runbook, and a rename would be a
+# pure production migration with no security value. Read "webhooks_access.log" as
+# "the safe access log".
 
 # Access log: path/status/size/duration only — no $request, $request_uri or $args.
 access_log /var/log/nginx/webhooks_access.log kitilash_webhook_safe;

@@ -160,8 +160,24 @@ jobs:
           ALTEGIO_REQUIRE_MIGTEST: "1"
         run: uv run pytest -q src/altegio_bot/tests/test_easyweek_migration_integration.py
 
+      # Webhook secrets travel in the query string, so the safe-logging selector
+      # is a security control, not a style preference. It is verified against a
+      # real, digest-pinned Nginx because the bypass it closes depends on Nginx's
+      # own URI normalisation. ALTEGIO_REQUIRE_NGINX_LOGTEST=1 turns "Docker or
+      # the image is unavailable" into a failure, so this step can never degrade
+      # into a green skip. It has no continue-on-error and no `if:` guard.
+      - name: Run required Nginx webhook log security tests
+        env:
+          ALTEGIO_REQUIRE_NGINX_LOGTEST: "1"
+        run: uv run pytest -q src/altegio_bot/tests/test_nginx_webhook_logging_integration.py
+
+      # Both Docker-dependent suites above already ran under their own mandatory
+      # gates; re-running them here would only duplicate container work.
       - name: Run tests
-        run: uv run pytest -q --ignore=src/altegio_bot/tests/test_easyweek_migration_integration.py
+        run: |
+          uv run pytest -q \
+            --ignore=src/altegio_bot/tests/test_easyweek_migration_integration.py \
+            --ignore=src/altegio_bot/tests/test_nginx_webhook_logging_integration.py
 
   deploy:
     name: Deploy to Server
