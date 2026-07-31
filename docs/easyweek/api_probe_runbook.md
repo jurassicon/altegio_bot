@@ -99,18 +99,13 @@ Sanitized пример успешного вывода (stdout — только 
 ```json
 {
   "locations": {
-    "count": 2,
+    "count": 1,
     "items": [
       {
-        "address": { "city": "Karlsruhe", "country": "DE", "house": "9", "street": "Pfinztalstr." },
+        "address": { "address_1": "Beispielstr. 1", "apt": null, "city": "Musterstadt", "postal_code": "00000" },
         "name": "Durlach",
         "timezone": "Europe/Berlin",
         "uuid": "00000000-0000-0000-0000-000000000000"
-      },
-      {
-        "name": "Zweite Filiale",
-        "timezone": "Europe/Berlin",
-        "uuid": "11111111-1111-1111-1111-111111111111"
       }
     ]
   },
@@ -118,6 +113,41 @@ Sanitized пример успешного вывода (stdout — только 
   "ping": { "ok": true, "version": "v12.32.3" }
 }
 ```
+
+### 2.1. Форма ответа `GET /locations`
+
+Живой API возвращает `timezone` **объектом**, а не строкой:
+
+```json
+{ "timezone": { "name": "Europe/Berlin", "offset": "+02:00", "short": "CEST" } }
+```
+
+Клиент принимает обе формы: строку и объект. Обязателен только непустой
+`timezone.name`; `offset` и `short` могут отсутствовать, быть `null` или
+измениться на стороне EasyWeek — проба из-за этого не падает. Если пригодного
+`timezone.name` нет, вся выдача `list_locations()` завершается
+`EasyWeekProtocolError`: неполный список показывать оператору нельзя, иначе UUID
+будет выбран по частичным данным.
+
+Проба печатает timezone **только строкой** — IANA-именем:
+
+```json
+{ "timezone": "Europe/Berlin" }
+```
+
+`offset` и `short` в вывод не попадают: для опознания филиала они не нужны и
+только расширяют поверхность вывода.
+
+Адресные поля живого API называются иначе, чем в документированном примере: это
+`address_1`, `apt`, `city`, `postal_code`. Проба поддерживает и их, и прежние
+`country`, `city`, `street`, `house`, `zip_code`, и печатает каждое **под
+исходным именем** — переименование `address_1 → street` было бы доменной
+нормализацией и относится к PR-4.
+
+`position` (вложенный объект, может содержать координаты) намеренно **не
+выводится**, как и `description`, `images`, `opening_hours`, `is_address_hidden`,
+а также пагинационные `links` и `meta`. Список полей — allowlist: новое поле на
+стороне EasyWeek не появится в выводе без явной правки кода.
 
 Пример ошибки — только безопасные метаданные, без тела ответа:
 
@@ -137,8 +167,9 @@ Sanitized пример успешного вывода (stdout — только 
 ## 3. Фиксация UUID Дурлаха
 
 1. Найдите Дурлах в `locations.items`.
-2. Сверьте **name**, **timezone** (ожидается `Europe/Berlin`) и адрес — один ключ
-   видит несколько локаций, поэтому выбор делается глазами, а не «первым в списке».
+2. Сверьте **name**, **timezone** (ожидается строка `Europe/Berlin`) и адрес
+   (`address_1`/`city`/`postal_code` либо legacy-поля) — один ключ видит
+   несколько локаций, поэтому выбор делается глазами, а не «первым в списке».
 3. Впишите UUID в **production** `easyweek.env`:
 
    ```text

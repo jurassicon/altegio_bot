@@ -232,6 +232,27 @@ def _canonical_booking_uuid(value: object) -> str:
     return str(parsed)
 
 
+def _has_usable_timezone(value: object) -> bool:
+    """True when *value* is a timezone this integration can act on.
+
+    The live API returns an object — ``{"name": "...", "offset": "...",
+    "short": "..."}`` — while the documented/legacy shape is a bare IANA string.
+    Both are accepted; anything else is not.
+
+    Only ``name`` is required. ``offset`` and ``short`` are presentation details
+    that EasyWeek may add, drop or change without the branch becoming
+    unidentifiable, so requiring them would turn an upstream cosmetic change into
+    an outage. This is a *shape* check only — the value is neither normalised nor
+    rewritten here; see :meth:`EasyWeekClient.list_locations`.
+    """
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, dict):
+        name = value.get("name")
+        return isinstance(name, str) and bool(name.strip())
+    return False
+
+
 def _validated_location(item: object) -> dict[str, Any]:
     """Return *item* if it is a usable location entry, otherwise raise.
 
@@ -242,9 +263,10 @@ def _validated_location(item: object) -> dict[str, Any]:
     on that, and printing it as a success was worse than failing.
 
     ``uuid`` must parse as a real UUID (which also rules out a value carrying a
-    query, a path traversal or free text), and ``name``/``timezone`` must be
-    non-blank strings so the branch can be recognised. That is the whole contract
-    here: timezone/domain normalization stays with PR-4.
+    query, a path traversal or free text), ``name`` must be a non-blank string,
+    and ``timezone`` must satisfy :func:`_has_usable_timezone`. That is the whole
+    contract here: timezone/domain normalization stays with PR-4, so the entry is
+    returned exactly as received — an object timezone stays an object.
 
     The offending value is never logged nor put in the error message.
     """
@@ -259,11 +281,13 @@ def _validated_location(item: object) -> dict[str, Any]:
     except (ValueError, AttributeError, TypeError):
         raise EasyWeekProtocolError("location entry uuid is not a valid UUID", operation="list_locations") from None
 
-    for field in ("name", "timezone"):
-        value = item.get(field)
-        if not isinstance(value, str) or not value.strip():
-            # The field NAME is a fixed literal; the bad value is never included.
-            raise EasyWeekProtocolError(f"location entry has no usable {field}", operation="list_locations")
+    name = item.get("name")
+    if not isinstance(name, str) or not name.strip():
+        # The field NAME is a fixed literal; the bad value is never included.
+        raise EasyWeekProtocolError("location entry has no usable name", operation="list_locations")
+
+    if not _has_usable_timezone(item.get("timezone")):
+        raise EasyWeekProtocolError("location entry has no usable timezone", operation="list_locations")
 
     return item
 
@@ -521,6 +545,13 @@ class EasyWeekClient:
         incomplete list. Any entry that is not a usable location — see
         :func:`_validated_location` for the required ``uuid`` / ``name`` /
         ``timezone`` contract — fails the whole call.
+
+        Entries are returned verbatim. In particular a live ``timezone`` object is
+        NOT collapsed to its name here: rewriting the transport payload would be
+        domain normalization (PR-4), and it would hide the real API shape from
+        anything reading this list. The operator probe does that projection for
+        display instead. Envelope ``links``/``meta`` are ignored — pagination is
+        out of scope for PR-2.
         """
         payload = await self._get_json(_PATH_LOCATIONS, operation="list_locations")
 

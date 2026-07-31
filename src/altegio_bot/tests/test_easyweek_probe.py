@@ -15,6 +15,7 @@ import json
 from typing import Any
 
 import httpx
+import pytest
 
 import altegio_bot.scripts.easyweek_probe as probe
 from altegio_bot.easyweek_client import EasyWeekClient
@@ -474,4 +475,146 @@ def test_probe_prints_the_required_identity_fields(monkeypatch, capsys) -> None:
         assert isinstance(item["uuid"], str) and item["uuid"].strip()
         assert isinstance(item["name"], str) and item["name"].strip()
         assert isinstance(item["timezone"], str) and item["timezone"].strip()
+    _assert_no_sentinels(captured.out + captured.err)
+
+
+# ===========================================================================
+# The live response shape: object timezone + address_1/postal_code
+# ===========================================================================
+
+# Sanitized copy of what the read-only production probe actually returned. No
+# real UUID, no real address, no credentials.
+_LIVE_LOCATION: dict[str, Any] = {
+    "uuid": DURLACH_UUID,
+    "name": "Durlach",
+    "timezone": {"name": "Europe/Berlin", "offset": "+02:00", "short": "CEST"},
+    "address": {
+        "address_1": "Beispielstr. 1",
+        "apt": None,
+        "city": "Karlsruhe",
+        "postal_code": "76227",
+        "position": {"lat": 0, "lng": 0},
+        "unexpected": "must not leak",
+    },
+    "description": None,
+    "images": None,
+    "is_address_hidden": False,
+    "opening_hours": {},
+}
+
+
+def _live_handler(request: httpx.Request) -> httpx.Response:
+    path = request.url.path
+    if path.endswith("/ping"):
+        return httpx.Response(200, json={"ping": "pong"})
+    if path.endswith("/locations"):
+        return httpx.Response(200, json={"data": [_LIVE_LOCATION], "links": {}, "meta": {}})
+    return httpx.Response(404)  # pragma: no cover
+
+
+def test_object_timezone_projects_to_the_iana_name() -> None:
+    """The live object must print as a plain string, not as a type marker."""
+    summary = probe.safe_location_summary(_LIVE_LOCATION)
+    assert summary["timezone"] == "Europe/Berlin"
+
+
+def test_object_timezone_never_prints_a_dict_marker_or_its_details() -> None:
+    """offset/short add nothing for picking a branch and only widen the output."""
+    blob = json.dumps(probe.safe_location_summary(_LIVE_LOCATION))
+    assert "<dict omitted>" not in blob
+    assert "offset" not in blob
+    assert "short" not in blob
+    assert "+02:00" not in blob
+    assert "CEST" not in blob
+
+
+def test_string_timezone_projection_is_unchanged() -> None:
+    """The documented/legacy shape must keep working exactly as before."""
+    assert probe.safe_location_summary(_LOCATIONS[0])["timezone"] == "Europe/Berlin"
+
+
+@pytest.mark.parametrize(
+    "timezone",
+    [None, {}, {"name": None}, {"name": 123}, {"offset": "+02:00"}, [], 123],
+    ids=["null", "empty-object", "name-null", "name-number", "no-name", "list", "number"],
+)
+def test_unusable_timezone_projects_to_null_not_a_partial_object(timezone: Any) -> None:
+    """The client rejects these, but the projection must not leak either.
+
+    A type marker or a partial object would put unvalidated upstream data on the
+    operator's screen; ``None`` says "nothing usable" without disclosing anything.
+    """
+    summary = probe.safe_location_summary({**_LOCATIONS[0], "timezone": timezone})
+    assert summary["timezone"] is None
+
+
+def test_live_address_shape_projects_only_allowlisted_fields() -> None:
+    """address_1/apt/city/postal_code are printed; position and friends are not."""
+    address = probe.safe_location_summary(_LIVE_LOCATION)["address"]
+    assert set(address) == {"address_1", "apt", "city", "postal_code"}
+    assert address["address_1"] == "Beispielstr. 1"
+    assert address["postal_code"] == "76227"
+    assert address["apt"] is None
+
+    blob = json.dumps(probe.safe_location_summary(_LIVE_LOCATION))
+    for forbidden in ("position", "lat", "lng", "unexpected", "must not leak"):
+        assert forbidden not in blob, f"{forbidden!r} leaked into the address projection"
+
+
+def test_live_address_fields_keep_their_original_names() -> None:
+    """No domain renaming here: address_1 stays address_1 (PR-4 territory)."""
+    address = probe.safe_location_summary(_LIVE_LOCATION)["address"]
+    assert "street" not in address
+    assert "zip_code" not in address
+
+
+def test_legacy_address_fields_are_still_supported() -> None:
+    """The documented country/city/street/house/zip_code shape must not regress."""
+    legacy = {
+        **_LOCATIONS[0],
+        "address": {
+            "country": "DE",
+            "city": "Karlsruhe",
+            "street": "Beispielstr.",
+            "house": "9",
+            "zip_code": "76227",
+        },
+    }
+    address = probe.safe_location_summary(legacy)["address"]
+    assert set(address) == {"country", "city", "street", "house", "zip_code"}
+
+
+def test_live_location_noise_fields_never_reach_the_output() -> None:
+    """description/images/opening_hours/is_address_hidden are not allowlisted."""
+    blob = json.dumps(probe.safe_location_summary(_LIVE_LOCATION))
+    for forbidden in ("description", "images", "opening_hours", "is_address_hidden"):
+        assert forbidden not in blob
+
+
+def test_probe_accepts_the_live_response_end_to_end(monkeypatch, capsys) -> None:
+    """The exact shape that made the production probe fail must now succeed."""
+    _install_client(monkeypatch, _live_handler)
+
+    assert probe.main(["--redact-pii"]) == probe.EXIT_OK
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+
+    assert payload["ok"] is True
+    assert payload["locations"]["count"] == 1
+    item = payload["locations"]["items"][0]
+    assert item["timezone"] == "Europe/Berlin"
+    assert set(item) == {"uuid", "name", "timezone", "address"}
+    assert set(item["address"]) == {"address_1", "apt", "city", "postal_code"}
+
+    for forbidden in (
+        "links",
+        "meta",
+        "position",
+        "lat",
+        "lng",
+        "opening_hours",
+        "is_address_hidden",
+        "<dict omitted>",
+    ):
+        assert forbidden not in captured.out, f"{forbidden!r} leaked into the probe output"
     _assert_no_sentinels(captured.out + captured.err)

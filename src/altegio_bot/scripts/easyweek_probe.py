@@ -63,8 +63,23 @@ _BOOKING_FIELDS = (
     "is_completed",
 )
 # Address sub-fields an operator needs to recognise a branch. Deliberately no
-# free-text/"comment"-style keys, which upstream may use for arbitrary content.
-_ADDRESS_FIELDS = ("country", "city", "street", "house", "zip_code")
+# free-text/"comment"-style keys, which upstream may use for arbitrary content,
+# and deliberately no ``position`` — that is a nested object which may carry
+# coordinates and is not needed to pick a branch UUID.
+#
+# Both spellings are listed because the live API uses ``address_1``/``postal_code``
+# where the documented shape used ``street``/``zip_code``. They are printed under
+# their ORIGINAL names: renaming them here would be domain normalization (PR-4).
+_ADDRESS_FIELDS = (
+    "country",
+    "city",
+    "street",
+    "house",
+    "zip_code",
+    "address_1",
+    "apt",
+    "postal_code",
+)
 
 
 def _safe_scalar(value: Any) -> Any:
@@ -88,9 +103,31 @@ def _safe_address(raw: Any) -> dict[str, Any] | None:
     return address or None
 
 
+def _safe_timezone(raw: Any) -> str | None:
+    """Reduce either timezone shape to the IANA name, or to nothing.
+
+    The live API returns ``{"name": ..., "offset": ..., "short": ...}``; the
+    documented/legacy shape is a bare string. Both must print as a plain string,
+    because ``_safe_scalar`` would otherwise render the object as
+    ``<dict omitted>`` for a perfectly valid response.
+
+    Only the name is projected. ``offset`` and ``short`` add nothing to picking a
+    branch and would only widen the output surface. Anything that is neither a
+    string nor an object with a string ``name`` yields ``None`` rather than a type
+    marker, so an unexpected shape can never print part of itself.
+    """
+    if isinstance(raw, str):
+        return raw
+    if isinstance(raw, dict):
+        name = raw.get("name")
+        return name if isinstance(name, str) else None
+    return None
+
+
 def safe_location_summary(location: dict[str, Any]) -> dict[str, Any]:
     """Allowlisted projection of one ``/locations`` entry."""
     summary: dict[str, Any] = {key: _safe_scalar(location.get(key)) for key in _LOCATION_FIELDS}
+    summary["timezone"] = _safe_timezone(location.get("timezone"))
     address = _safe_address(location.get("address"))
     if address is not None:
         summary["address"] = address
