@@ -245,13 +245,24 @@ jobs:
             # These flags let the trap below know exactly how far the deploy got.
             # The trap is installed before anything is stopped, so every failure
             # path from here on has a defined recovery.
+            # The special flow is ONE-TIME. It is armed only for the exact
+            # revision step below; a repeat deploy, or any later revision, takes
+            # the ordinary migrate-and-roll path and can never reach the
+            # PR-3 downgrade branch.
+            PR3_TRANSITION=0
+            PR3_TRANSITION_STARTED=0
+            PR3_TRANSITION_APPLIED=0
+            CANARY_VERIFIED=0
+            REGULAR_WORKER_VERIFIED=0
             OLD_WORKER_STOPPED=0
-            MIGRATION_APPLIED=0
-            NEW_WORKER_VERIFIED=0
             REVISION_BEFORE=""
+            TARGET_HEAD=""
+            CANARY_ID=""
+            CANARY_IMAGE=""
             PR3_REVISION="c1a7d3f905b2"
             PRE_PR3_REVISION="9a1f4c7b2e3d"
-            CANARY="altegio-inbox-worker-pr3-canary"
+            CANARY_NAME="altegio-inbox-worker-pr3-canary"
+            CONSTRAINT_FAILURES_BEFORE=""
 
             # Reads one scalar over stdin so no SQL quoting has to survive the
             # ssh -> sh -> psql nesting. Credentials stay inside the container.
@@ -266,19 +277,141 @@ jobs:
                 | tr -d '\r' | grep -oE '[0-9a-f]{12}' | head -n 1
             }
 
-            inbox_worker_container() {
-              docker ps \
-                --filter "label=com.docker.compose.project=altegio_bot" \
-                --filter "label=com.docker.compose.service=altegio-inbox-worker" \
-                --filter "status=running" \
-                --format "{{.Names}}" \
-                | head -n 1
+            # Facts about the NEW code's revision graph, straight from Alembic's
+            # ScriptDirectory. String comparison alone cannot tell whether PR-3
+            # is an ancestor of the target head, and a hardcoded head would make
+            # every future revision fail this deploy.
+            alembic_script_facts() {
+              $COMPOSE --profile ops run --rm --no-deps -T -e DB_REVISION="$1" migrate \
+                /app/.venv/bin/python -c '
+            import os
+            from alembic.config import Config
+            from alembic.script import ScriptDirectory
+            pr3 = "c1a7d3f905b2"
+            sd = ScriptDirectory.from_config(Config("/app/alembic.ini"))
+            heads = sd.get_heads()
+            db = (os.environ.get("DB_REVISION") or "").strip()
+            def lineage(rev):
+                if not rev:
+                    return set()
+                try:
+                    return {r.revision for r in sd.iterate_revisions(rev, "base")}
+                except Exception:
+                    return set()
+            head = heads[0] if len(heads) == 1 else ""
+            print("HEAD_COUNT=" + str(len(heads)))
+            print("TARGET_HEAD=" + head)
+            print("PR3_IN_HEAD_LINEAGE=" + ("1" if pr3 in lineage(head) else "0"))
+            print("PR3_IN_DB_LINEAGE=" + ("1" if pr3 in lineage(db) else "0"))
+            ' 2>/dev/null | tr -d '\r'
             }
 
-            remove_canary_if_present() {
-              if docker ps -a --format '{{.Names}}' | grep -Fxq "$CANARY"; then
-                docker rm -f "$CANARY" >/dev/null
+            fact() {
+              printf '%s\n' "$1" | grep -E "^$2=" | head -n 1 | cut -d= -f2-
+            }
+
+            # EXACT id of the regular Compose service container. `docker ps` by
+            # service label would also match the one-off canary, and mistaking
+            # one for the other could leave the system with no inbox worker at
+            # all. `compose ps` excludes one-off containers by design.
+            regular_worker_id() {
+              $COMPOSE ps -q altegio-inbox-worker 2>/dev/null | head -n 1
+            }
+
+            container_field() {
+              docker inspect -f "$2" "$1" 2>/dev/null
+            }
+
+            container_is_running() {
+              [ "$(container_field "$1" '{{.State.Status}}')" = "running" ]
+            }
+
+            any_inbox_worker_running() {
+              RUNNING_REGULAR="$(regular_worker_id)"
+              if [ -n "$RUNNING_REGULAR" ] && container_is_running "$RUNNING_REGULAR"; then
+                return 0
               fi
+              if [ -n "$CANARY_ID" ] && container_is_running "$CANARY_ID"; then
+                return 0
+              fi
+              if docker ps --format '{{.Names}}' | grep -Fxq "$CANARY_NAME"; then
+                return 0
+              fi
+              return 1
+            }
+
+            # Never force-remove the canary: it is a full inbox worker and may have
+            # already moved a batch to `processing`. Killing it would strand those
+            # rows exactly like the legacy worker does.
+            stop_canary_gracefully() {
+              if [ -z "$CANARY_ID" ]; then
+                return 0
+              fi
+              if container_is_running "$CANARY_ID"; then
+                echo "🧹 Draining the canary (up to 300s)..."
+                if ! docker stop -t 300 "$CANARY_ID" >/dev/null; then
+                  echo "❌ Canary did not stop gracefully."
+                  return 1
+                fi
+              fi
+              if container_is_running "$CANARY_ID"; then
+                echo "❌ Canary is still running after the graceful stop."
+                return 1
+              fi
+              return 0
+            }
+
+            processing_count() {
+              psql_scalar "SELECT count(*) FROM altegio_events WHERE status = 'processing';"
+            }
+
+            # Bounded orphan recovery. ONLY rows that were claimed and never
+            # reached a terminal state (`processed_at IS NULL`) go back to
+            # `received`. Claim and processing run in separate transactions, so a
+            # process killed between them commits the claim and rolls back the
+            # work — those rows are unreachable otherwise, because the worker only
+            # ever selects `received`. Payload, timestamps, resource ids and
+            # customer data are untouched, and only a count is logged.
+            #
+            # Guarded by the caller: allowed exclusively inside the one-time PR-3
+            # transition (or its recovery) and only once NO inbox worker runs.
+            recover_orphaned_processing_rows() {
+              if any_inbox_worker_running; then
+                echo "❌ An inbox worker is still running; refusing to touch event statuses."
+                return 1
+              fi
+              RESET_COUNT="$(psql_scalar "WITH reset AS (UPDATE altegio_events SET status = 'received' WHERE status = 'processing' AND processed_at IS NULL RETURNING 1) SELECT count(*) FROM reset;")"
+              echo "♻️ Returned ${RESET_COUNT:-unknown} orphaned event(s) from processing to received."
+              REMAINING="$(processing_count)"
+              if [ "$REMAINING" != "0" ]; then
+                echo "❌ ${REMAINING:-unknown} event(s) still in processing after bounded recovery."
+                echo "❗ Not proceeding; these rows are in an unexpected state."
+                return 1
+              fi
+              echo "✅ No Altegio event left in processing."
+              return 0
+            }
+
+            # Only the four PR-3 constraint names. A bare missing-object phrase would
+            # match unrelated failures and roll the schema back for nothing.
+            constraint_failure_count() {
+              psql_scalar "SELECT count(*) FROM altegio_events WHERE status = 'failed' AND (error LIKE '%uq_clients_company_altegio_id%' OR error LIKE '%uq_records_company_altegio_id%' OR error LIKE '%uq_clients_provider_company_altegio_id%' OR error LIKE '%uq_records_provider_company_altegio_id%');"
+            }
+
+            start_preserved_old_worker() {
+              echo "▶️ Restarting the preserved old inbox worker..."
+              if ! $COMPOSE start altegio-inbox-worker; then
+                echo "❌ Could not start the old inbox worker. Manual intervention required."
+                return 1
+              fi
+              sleep 5
+              RECOVERED_ID="$(regular_worker_id)"
+              if [ -n "$RECOVERED_ID" ] && container_is_running "$RECOVERED_ID"; then
+                echo "✅ Old inbox worker is running again ($RECOVERED_ID)."
+                return 0
+              fi
+              echo "❌ Old inbox worker did not come back up. Manual intervention required."
+              return 1
             }
 
             recover() {
@@ -290,29 +423,58 @@ jobs:
 
               echo "❌ Deploy failed (exit $RECOVER_STATUS). Entering recovery..."
 
-              if [ "$NEW_WORKER_VERIFIED" -eq 1 ]; then
-                # A new-image worker was already proven to run against the new
-                # schema. Rolling the schema back now would break the thing that
-                # works; whole-application rollback is out of PR-3 scope.
-                echo "ℹ️ A new-image inbox worker was already verified on the new schema."
-                echo "ℹ️ NOT rolling back the schema automatically."
+              if [ "$REGULAR_WORKER_VERIFIED" -eq 1 ]; then
+                echo "ℹ️ The regular worker is already verified on the new schema; no schema rollback."
+                if stop_canary_gracefully && [ "$(processing_count)" = "0" ] && [ -n "$CANARY_ID" ]; then
+                  docker rm "$CANARY_ID" >/dev/null
+                  echo "✅ Canary retired."
+                else
+                  echo "ℹ️ Canary left in place; it is a compatible worker."
+                fi
                 echo "❗ Manual investigation required for the failing step."
                 exit "$RECOVER_STATUS"
               fi
 
-              if [ "$OLD_WORKER_STOPPED" -eq 0 ]; then
-                echo "ℹ️ The old inbox worker was never stopped; nothing to recover."
+              if [ "$CANARY_VERIFIED" -eq 1 ]; then
+                echo "ℹ️ The canary is verified and left RUNNING as a temporary compatible inbox worker."
+                echo "ℹ️ NOT rolling back the schema and NOT removing the canary."
+                echo "❗ This is a FAILED deploy. Manual investigation required."
                 exit "$RECOVER_STATUS"
               fi
 
-              # The old container was only STOPPED, never recreated, so it is
-              # still here and still carries the previous image.
+              if [ "$OLD_WORKER_STOPPED" -eq 0 ]; then
+                echo "ℹ️ No inbox worker was ever stopped; nothing to recover."
+                exit "$RECOVER_STATUS"
+              fi
+
+              if [ "$PR3_TRANSITION" -ne 1 ]; then
+                echo "❗ A worker was stopped outside the PR-3 transition. Manual intervention required."
+                exit "$RECOVER_STATUS"
+              fi
+
+              # The old container was only STOPPED, never recreated, so it still
+              # exists and still carries the previous image.
               CURRENT_REVISION="$(alembic_revision)"
               echo "ℹ️ Alembic revision is now: ${CURRENT_REVISION:-unknown}"
+              if [ "$CURRENT_REVISION" = "$PR3_REVISION" ]; then
+                PR3_TRANSITION_APPLIED=1
+              fi
 
-              if [ "$MIGRATION_APPLIED" -eq 1 ] || [ "$CURRENT_REVISION" = "$PR3_REVISION" ]; then
-                echo "🧹 Removing the canary before rolling the schema back..."
-                remove_canary_if_present
+              if ! stop_canary_gracefully; then
+                echo "❗ Canary could not be drained. NOT rolling back and NOT starting the old worker."
+                exit "$RECOVER_STATUS"
+              fi
+
+              if ! recover_orphaned_processing_rows; then
+                echo "❗ NOT rolling back and NOT starting the old worker."
+                exit "$RECOVER_STATUS"
+              fi
+
+              if [ "$PR3_TRANSITION_APPLIED" -eq 1 ]; then
+                if [ "$CURRENT_REVISION" != "$PR3_REVISION" ]; then
+                  echo "❌ Revision is '${CURRENT_REVISION:-unknown}', refusing to downgrade."
+                  exit "$RECOVER_STATUS"
+                fi
                 echo "⏪ Downgrading to exactly $PRE_PR3_REVISION..."
                 if ! $COMPOSE --profile ops run --rm --no-deps migrate alembic downgrade "$PRE_PR3_REVISION"; then
                   echo "❌ Downgrade failed."
@@ -326,26 +488,18 @@ jobs:
                   exit "$RECOVER_STATUS"
                 fi
                 echo "✅ Schema is back on $PRE_PR3_REVISION."
-              elif [ "$CURRENT_REVISION" != "$REVISION_BEFORE" ]; then
-                echo "❌ Revision is '${CURRENT_REVISION:-unknown}', expected the pre-deploy '${REVISION_BEFORE:-unknown}'."
+              elif [ "$CURRENT_REVISION" != "$PRE_PR3_REVISION" ]; then
+                echo "❌ Revision is '${CURRENT_REVISION:-unknown}', expected the pre-transition $PRE_PR3_REVISION."
                 echo "❗ Schema state is unexpected. NOT starting the old worker. Manual intervention required."
                 exit "$RECOVER_STATUS"
               else
-                echo "✅ Migration never applied; schema is still on ${CURRENT_REVISION:-unknown}."
+                echo "✅ Migration never applied; schema is still on $PRE_PR3_REVISION."
               fi
 
-              echo "▶️ Restarting the preserved old inbox worker..."
-              if $COMPOSE start altegio-inbox-worker; then
-                sleep 5
-                RECOVERED_WORKER="$(inbox_worker_container)"
-                if [ -n "$RECOVERED_WORKER" ]; then
-                  echo "✅ Old inbox worker is running again ($RECOVERED_WORKER)."
-                else
-                  echo "❌ Old inbox worker did not come back up. Manual intervention required."
-                fi
-              else
-                echo "❌ Could not start the old inbox worker. Manual intervention required."
+              if [ -n "$CANARY_ID" ]; then
+                docker rm "$CANARY_ID" >/dev/null
               fi
+              start_preserved_old_worker
               exit "$RECOVER_STATUS"
             }
             trap 'recover $?' EXIT
@@ -417,100 +571,220 @@ jobs:
               -name 'altegio_before_deploy_*.dump' \
               | wc -l
 
-            # ── Record the pre-deploy revision ────────────────────────────────
+            # ── Classify this deploy ──────────────────────────────────────────
             REVISION_BEFORE="$(alembic_revision)"
             echo "📌 Alembic revision before migration: ${REVISION_BEFORE:-none}"
 
-            # ── Gracefully drain the OLD inbox worker ─────────────────────────
-            # `stop`, deliberately NOT `down` or `up --force-recreate`: the old
-            # container has to survive so recovery can start it again on the old
-            # schema. SIGTERM makes the worker stop claiming new batches and
-            # finish the one it already moved `received -> processing`.
-            # altegio-api is NOT stopped: webhooks keep arriving and wait as
-            # `received` until the new worker picks them up.
-            echo "🛑 Gracefully stopping the old altegio-inbox-worker (up to 300s to drain)..."
-            $COMPOSE stop -t 300 altegio-inbox-worker
-            OLD_WORKER_STOPPED=1
+            SCRIPT_FACTS="$(alembic_script_facts "$REVISION_BEFORE")"
+            HEAD_COUNT="$(fact "$SCRIPT_FACTS" HEAD_COUNT)"
+            TARGET_HEAD="$(fact "$SCRIPT_FACTS" TARGET_HEAD)"
+            PR3_IN_HEAD_LINEAGE="$(fact "$SCRIPT_FACTS" PR3_IN_HEAD_LINEAGE)"
+            PR3_IN_DB_LINEAGE="$(fact "$SCRIPT_FACTS" PR3_IN_DB_LINEAGE)"
 
-            if [ -n "$(inbox_worker_container)" ]; then
-              echo "❌ altegio-inbox-worker is still running after the graceful stop."
+            if [ "$HEAD_COUNT" != "1" ] || [ -z "$TARGET_HEAD" ]; then
+              echo "❌ Expected exactly one Alembic head, got '${HEAD_COUNT:-unknown}'."
               exit 1
             fi
-            echo "✅ Old inbox worker stopped; altegio-api still accepting webhooks."
+            echo "📌 Target Alembic head from the new code: $TARGET_HEAD"
 
-            # ── Drain verification ────────────────────────────────────────────
-            PROCESSING_COUNT="$(psql_scalar "SELECT count(*) FROM altegio_events WHERE status = 'processing';")"
-            echo "🔎 Altegio events still in processing: ${PROCESSING_COUNT:-unknown}"
-            if [ "$PROCESSING_COUNT" != "0" ]; then
-              echo "❌ Drain incomplete: events remain in processing."
-              echo "❗ Migration NOT applied. Statuses are NOT reset automatically — investigate first."
-              exit 1
+            if [ "$PR3_IN_DB_LINEAGE" = "1" ]; then
+              # PR-3 is already applied — a repeat deploy or any later revision.
+              # The constraint swap has happened once and must never be redone or
+              # rolled back from here.
+              PR3_TRANSITION=0
+              echo "ℹ️ PR-3 schema is already in place; ordinary migration flow."
+            elif [ "$PR3_IN_HEAD_LINEAGE" = "1" ]; then
+              if [ "$REVISION_BEFORE" = "$PRE_PR3_REVISION" ] && [ "$TARGET_HEAD" = "$PR3_REVISION" ]; then
+                PR3_TRANSITION=1
+                echo "🔁 One-time PR-3 transition: $PRE_PR3_REVISION → $PR3_REVISION."
+              else
+                # Applying PR-3 together with other revisions would make the
+                # bounded rollback below ambiguous. Fail before touching schema.
+                echo "❌ This deploy would apply PR-3 ($PR3_REVISION) as part of a multi-revision upgrade"
+                echo "   from '${REVISION_BEFORE:-none}' to '$TARGET_HEAD'."
+                echo "❗ Deploy PR-3 on its own first, then continue. No schema change was made."
+                exit 1
+              fi
+            else
+              PR3_TRANSITION=0
+              echo "ℹ️ PR-3 is not part of this revision graph; ordinary migration flow."
             fi
-            echo "✅ No Altegio event left in processing."
+
+            if [ "$PR3_TRANSITION" -eq 1 ]; then
+              # ── One-time constraint-swap window ─────────────────────────────
+              # A stale canary from an aborted earlier attempt would make every
+              # check below ambiguous, and force-removing it could strand rows.
+              if docker ps -a --format '{{.Names}}' | grep -Fxq "$CANARY_NAME"; then
+                echo "❌ A stale container named $CANARY_NAME already exists."
+                echo "❗ Inspect and retire it by hand before deploying. Nothing was stopped."
+                exit 1
+              fi
+
+              # `stop`, deliberately NOT `down` or `up --force-recreate`: the old
+              # container has to survive so recovery can start it again on the old
+              # schema. altegio-api is NOT stopped — webhooks keep arriving and
+              # wait as `received` until a new worker picks them up.
+              #
+              # This is NOT a graceful drain: the PARENT image has no SIGTERM
+              # handler, so it can be killed between claiming a batch and
+              # finishing it. That is precisely why the bounded orphan recovery
+              # below exists.
+              echo "🛑 Stopping the legacy altegio-inbox-worker (up to 300s)..."
+              $COMPOSE stop -t 300 altegio-inbox-worker
+              OLD_WORKER_STOPPED=1
+              PR3_TRANSITION_STARTED=1
+
+              STOPPED_ID="$(regular_worker_id)"
+              if [ -n "$STOPPED_ID" ] && container_is_running "$STOPPED_ID"; then
+                echo "❌ altegio-inbox-worker is still running after the stop."
+                exit 1
+              fi
+              if any_inbox_worker_running; then
+                echo "❌ An inbox worker is still running after the stop."
+                exit 1
+              fi
+              echo "✅ No inbox worker running; altegio-api still accepting webhooks."
+
+              echo "🔎 Altegio events in processing: $(processing_count)"
+              if ! recover_orphaned_processing_rows; then
+                echo "❗ Migration NOT applied."
+                exit 1
+              fi
+
+              CONSTRAINT_FAILURES_BEFORE="$(constraint_failure_count)"
+              echo "📌 Constraint-related failed events before this deploy: ${CONSTRAINT_FAILURES_BEFORE:-unknown}"
+            fi
 
             # ── Migration ─────────────────────────────────────────────────────
             echo "⚙️ Applying DB Migrations..."
             $COMPOSE --profile ops run --rm --no-deps migrate
-            MIGRATION_APPLIED=1
 
             REVISION_AFTER="$(alembic_revision)"
             echo "📌 Alembic revision after migration: ${REVISION_AFTER:-unknown}"
-            if [ "$REVISION_AFTER" != "$PR3_REVISION" ]; then
-              echo "❌ Expected revision $PR3_REVISION after migration, got '${REVISION_AFTER:-unknown}'."
+            if [ "$REVISION_AFTER" != "$TARGET_HEAD" ]; then
+              echo "❌ Expected revision $TARGET_HEAD after migration, got '${REVISION_AFTER:-unknown}'."
               exit 1
             fi
 
-            # ── Canary: prove a NEW-image worker before touching the old one ──
-            # A one-off container from the new image, using the same service
-            # definition (env, networks) so it is a faithful rehearsal. The old
-            # container stays intact behind it, which is what makes the recovery
-            # path above actually work.
-            echo "🐤 Starting the new-image inbox worker canary..."
-            remove_canary_if_present
-            $COMPOSE run -d --no-deps --name "$CANARY" altegio-inbox-worker
-
-            echo "⏳ Observing the canary..."
-            sleep 30
-
-            CANARY_STATE="$(docker inspect -f '{{.State.Status}}' "$CANARY")"
-            CANARY_RESTARTS="$(docker inspect -f '{{.RestartCount}}' "$CANARY")"
-            if [ "$CANARY_STATE" != "running" ]; then
-              echo "❌ Canary state is '$CANARY_STATE', expected running."
-              exit 1
-            fi
-            if [ "$CANARY_RESTARTS" != "0" ]; then
-              echo "❌ Canary restarted $CANARY_RESTARTS time(s) — crash loop."
-              exit 1
+            # Only a real, completed PR-3 step arms the rollback branch. A no-op
+            # migration on an already-migrated database never does.
+            if [ "$PR3_TRANSITION" -eq 1 ] \
+              && [ "$REVISION_BEFORE" = "$PRE_PR3_REVISION" ] \
+              && [ "$REVISION_AFTER" = "$PR3_REVISION" ] \
+              && [ "$REVISION_AFTER" != "$REVISION_BEFORE" ]; then
+              PR3_TRANSITION_APPLIED=1
             fi
 
-            # Safe metadata only: a count of constraint-shaped failures. Event
-            # payloads, customer data and full error text are never printed.
-            CONSTRAINT_FAILURES="$(psql_scalar "SELECT count(*) FROM altegio_events WHERE status = 'failed' AND processed_at >= now() - interval '30 minutes' AND (error LIKE '%uq_clients_company_altegio_id%' OR error LIKE '%uq_records_company_altegio_id%' OR error LIKE '%uq_clients_provider_company_altegio_id%' OR error LIKE '%uq_records_provider_company_altegio_id%' OR error LIKE '%does not exist%');")"
-            if [ "$CONSTRAINT_FAILURES" != "0" ]; then
-              echo "❌ Constraint-related event failures detected during this deploy."
-              echo "❗ Event payloads and error text are deliberately not printed."
-              exit 1
+            if [ "$PR3_TRANSITION" -eq 1 ]; then
+              # ── Canary: prove a NEW-image worker before touching the old one ─
+              # A one-off container from the new image, using the same service
+              # definition (env, networks). The old container stays intact behind
+              # it, which is what makes the recovery path above actually work.
+              echo "🐤 Starting the new-image inbox worker canary..."
+              CANARY_ID="$($COMPOSE run -d --no-deps --name "$CANARY_NAME" altegio-inbox-worker)"
+              if [ -z "$CANARY_ID" ]; then
+                echo "❌ Could not start the canary."
+                exit 1
+              fi
+
+              echo "⏳ Observing the canary..."
+              sleep 30
+
+              # Everything is checked against the EXACT container id, never a
+              # service-label search that would also match the regular worker.
+              CANARY_STATE="$(container_field "$CANARY_ID" '{{.State.Status}}')"
+              CANARY_RESTARTS="$(container_field "$CANARY_ID" '{{.RestartCount}}')"
+              CANARY_IMAGE="$(container_field "$CANARY_ID" '{{.Image}}')"
+              CANARY_ONEOFF="$(container_field "$CANARY_ID" '{{index .Config.Labels "com.docker.compose.oneoff"}}')"
+              if [ "$CANARY_STATE" != "running" ]; then
+                echo "❌ Canary state is '${CANARY_STATE:-unknown}', expected running."
+                exit 1
+              fi
+              if [ "$CANARY_RESTARTS" != "0" ]; then
+                echo "❌ Canary restarted $CANARY_RESTARTS time(s) — crash loop."
+                exit 1
+              fi
+              if [ -z "$CANARY_IMAGE" ]; then
+                echo "❌ Could not resolve the canary image."
+                exit 1
+              fi
+              if [ "$CANARY_ONEOFF" != "True" ]; then
+                echo "❌ Canary is not a one-off container; refusing to continue."
+                exit 1
+              fi
+
+              # Safe metadata only: counts of constraint-shaped failures, compared
+              # against the baseline taken before the swap. A pre-existing failed
+              # event must never trigger a rollback. No payload, error text,
+              # phone or customer data is ever printed.
+              CONSTRAINT_FAILURES_AFTER="$(constraint_failure_count)"
+              echo "📌 Constraint-related failed events now: ${CONSTRAINT_FAILURES_AFTER:-unknown} (baseline ${CONSTRAINT_FAILURES_BEFORE:-unknown})"
+              if [ "$CONSTRAINT_FAILURES_AFTER" -gt "$CONSTRAINT_FAILURES_BEFORE" ]; then
+                echo "❌ New constraint-related event failures appeared during this deploy."
+                exit 1
+              fi
+
+              CANARY_VERIFIED=1
+              echo "✅ Canary healthy on the new schema; no new constraint-related failures."
+
+              # ── Regular worker, verified by its EXACT Compose container id ───
+              echo "🚀 Recreating the regular altegio-inbox-worker from the new image..."
+              $COMPOSE up -d --force-recreate altegio-inbox-worker
+              sleep 10
+
+              REGULAR_WORKER_IDS="$($COMPOSE ps -q altegio-inbox-worker)"
+              REGULAR_WORKER_COUNT="$(printf '%s\n' "$REGULAR_WORKER_IDS" | grep -c '[0-9a-f]')"
+              REGULAR_WORKER_ID="$(printf '%s\n' "$REGULAR_WORKER_IDS" | head -n 1)"
+              REGULAR_STATE="$(container_field "$REGULAR_WORKER_ID" '{{.State.Status}}')"
+              REGULAR_RESTARTS="$(container_field "$REGULAR_WORKER_ID" '{{.RestartCount}}')"
+              REGULAR_ONEOFF="$(container_field "$REGULAR_WORKER_ID" '{{index .Config.Labels "com.docker.compose.oneoff"}}')"
+              REGULAR_IMAGE="$(container_field "$REGULAR_WORKER_ID" '{{.Image}}')"
+
+              # The canary is left RUNNING on every failure below: it is a
+              # compatible worker and removing it would leave nothing processing.
+              if [ -z "$REGULAR_WORKER_ID" ] || [ "$REGULAR_WORKER_COUNT" != "1" ]; then
+                echo "❌ Expected exactly one regular inbox-worker container, got '${REGULAR_WORKER_COUNT:-0}'."
+                exit 1
+              fi
+              if [ "$REGULAR_WORKER_ID" = "$CANARY_ID" ]; then
+                echo "❌ The regular worker id equals the canary id; refusing to continue."
+                exit 1
+              fi
+              if [ "$REGULAR_ONEOFF" = "True" ]; then
+                echo "❌ The resolved container is a one-off, not the Compose service container."
+                exit 1
+              fi
+              if [ "$REGULAR_STATE" != "running" ]; then
+                echo "❌ The regular inbox worker is '${REGULAR_STATE:-missing}', expected running."
+                exit 1
+              fi
+              if [ "$REGULAR_RESTARTS" != "0" ]; then
+                echo "❌ The regular inbox worker restarted $REGULAR_RESTARTS time(s) — crash loop."
+                exit 1
+              fi
+              if [ "$REGULAR_IMAGE" != "$CANARY_IMAGE" ]; then
+                echo "❌ The regular worker does not run the image this deploy just verified."
+                exit 1
+              fi
+
+              REGULAR_WORKER_VERIFIED=1
+              echo "✅ Regular inbox worker running ($REGULAR_WORKER_ID) on the verified image."
+
+              # ── Retire the canary, gracefully, only now ──────────────────────
+              if ! stop_canary_gracefully; then
+                echo "❗ Canary could not be drained; leaving it in place. Manual intervention required."
+                exit 1
+              fi
+              REMAINING_PROCESSING="$(processing_count)"
+              if [ "$REMAINING_PROCESSING" != "0" ]; then
+                echo "❌ ${REMAINING_PROCESSING:-unknown} event(s) in processing after draining the canary."
+                echo "❗ Not removing the canary. Manual intervention required."
+                exit 1
+              fi
+              docker rm "$CANARY_ID" >/dev/null
+              CANARY_ID=""
+              echo "✅ Canary retired."
             fi
-
-            NEW_WORKER_VERIFIED=1
-            echo "✅ Canary healthy on the new schema; no constraint-related failures."
-
-            # ── Regular new worker, then retire the canary ────────────────────
-            echo "🚀 Recreating the regular altegio-inbox-worker from the new image..."
-            $COMPOSE up -d --force-recreate altegio-inbox-worker
-            sleep 10
-            NEW_WORKER="$(inbox_worker_container)"
-            if [ -z "$NEW_WORKER" ]; then
-              echo "❌ The new altegio-inbox-worker is not running."
-              echo "❗ The canary is left running so events keep being processed."
-              exit 1
-            fi
-            echo "✅ New inbox worker running ($NEW_WORKER)."
-
-            echo "🧹 Gracefully retiring the canary..."
-            docker stop -t 300 "$CANARY" >/dev/null
-            docker rm "$CANARY" >/dev/null
-            echo "✅ Canary removed."
 
             echo "🚀 Starting updated containers..."
             $COMPOSE up -d --remove-orphans

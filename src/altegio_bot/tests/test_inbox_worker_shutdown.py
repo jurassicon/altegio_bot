@@ -16,6 +16,20 @@ That drain is only possible if the worker honours a precise shutdown contract:
 
 These tests drive ``run_loop`` with stubbed database helpers — no PostgreSQL, no
 external API, no real sessions.
+
+SCOPE, stated explicitly so nobody reads more into them than is there:
+
+    These tests prove the behaviour of the NEW worker version. They say nothing
+    about the FIRST PR-3 rollout, where the container being stopped still runs
+    the PARENT image — which has no signal handler at all and can be killed
+    between claiming a batch and finishing it.
+
+    That case is not covered by a signal handler and must not be presented as
+    if it were. The deploy handles it separately, with a bounded orphan
+    recovery: after every inbox worker is confirmed stopped, rows left in
+    ``processing`` with no ``processed_at`` are returned to ``received``, and
+    the migration only runs once that count is zero. See
+    ``test_ci_deploy_order.py`` and ``.github/workflows/ci_deploy.yml``.
 """
 
 from __future__ import annotations
@@ -291,3 +305,19 @@ def test_entrypoint_installs_signal_handlers() -> None:
     assert "stop_event=stop_event" in entrypoint
 
     assert "_run_with_graceful_shutdown" in inspect.getsource(inbox_worker.main)
+
+
+def test_module_documents_that_this_does_not_cover_the_legacy_rollout() -> None:
+    """Guard the caveat itself.
+
+    The new signal handler must never be cited as protection for the parent
+    container, so the limitation stays written down next to the tests that
+    could otherwise be mistaken for covering it.
+    """
+    import altegio_bot.tests.test_inbox_worker_shutdown as module
+
+    docstring = module.__doc__ or ""
+    assert "PARENT image" in docstring
+    assert "bounded orphan" in docstring
+    assert "processed_at" in docstring
+    assert "ci_deploy.yml" in docstring
