@@ -10,8 +10,16 @@ The complementary half is that the general application suite must NOT run the
 same Docker-dependent file again — it already ran under its own gate, and a
 second container round is pure duplication.
 
-These guards read the workflow, so a future edit that quietly drops the step or
-the ``--ignore`` fails here instead of silently weakening the gate.
+This file also pins the push/deploy split: ``lint``/``alembic``/``tests`` must
+run only for pull requests (branch protection already required them to pass
+before merge), ``deploy`` must run straight off ``push``/``workflow_dispatch``
+against ``refs/heads/main`` without re-depending on those jobs, production
+deploys must serialize instead of being cancelled mid-flight, and the Telegram
+notification must live inside ``deploy`` instead of a separate runner.
+
+These guards read the workflow, so a future edit that quietly drops a step,
+re-introduces a duplicate CI run, or softens a gate fails here instead of
+silently weakening the pipeline.
 """
 
 from __future__ import annotations
@@ -39,26 +47,27 @@ MIGRATION_SUITE = "src/altegio_bot/tests/test_easyweek_migration_integration.py"
 class _DeployPolicy:
     events: frozenset[str]
     ref: str
-    tests_result: str
-    alembic_result: str
 
 
 _REQUIRED_PR_TYPES = {"opened", "synchronize", "reopened"}
 _ALLOWED_DEPLOY_EVENTS = frozenset({"push", "workflow_dispatch"})
 _MAIN_REF = "refs/heads/main"
-_SUCCESS_RESULT = "success"
-_EXPECTED_DEPLOY_POLICY = _DeployPolicy(
-    events=_ALLOWED_DEPLOY_EVENTS,
-    ref=_MAIN_REF,
-    tests_result=_SUCCESS_RESULT,
-    alembic_result=_SUCCESS_RESULT,
-)
+_EXPECTED_DEPLOY_POLICY = _DeployPolicy(events=_ALLOWED_DEPLOY_EVENTS, ref=_MAIN_REF)
+_REQUIRED_PR_JOB_IF = "github.event_name == 'pull_request'"
+_REQUIRED_PR_JOB_IF_AFTER_LINT = f"{_REQUIRED_PR_JOB_IF} && needs.lint.result == 'success'"
 _CONDITION_EQUALITY_RE = re.compile(
     r"""(?P<left>[A-Za-z_][A-Za-z0-9_.]*)\s*==\s*"""
     r"""'(?P<right>[^']+)'"""
 )
-_DEPLOY_ALLOWLIST_RE = re.compile(r"^\(\s*(?P<events>[^()]*)\s*\)\s*&&\s*(?P<gates>[^()]*)$")
+_DEPLOY_ALLOWLIST_RE = re.compile(
+    r"^\(\s*(?P<events>[^()]*)\s*\)\s*&&\s*(?P<ref>[A-Za-z_][A-Za-z0-9_.]*\s*==\s*'[^']+')$"
+)
 _GITHUB_CONCURRENCY_CONTEXT_RE = re.compile(r"\$\{\{\s*github\.(?P<name>workflow|event_name|ref)\s*\}\}")
+_GROUP_EXPRESSION_RE = re.compile(
+    r"""^github\.ref\s*==\s*'refs/heads/main'\s*&&\s*"""
+    r"""format\('(?P<main_template>[^']*)',\s*github\.workflow\)\s*\|\|\s*"""
+    r"""format\('(?P<other_template>[^']*)',\s*github\.workflow,\s*github\.event_name,\s*github\.ref\)$"""
+)
 
 
 def _workflow() -> dict[str, Any]:
@@ -107,6 +116,14 @@ def _steps(job_name: str) -> list[dict[str, Any]]:
 
 def _normalized_run(step: dict[str, Any]) -> str:
     return " ".join(str(step.get("run", "")).split())
+
+
+def _ssh_script(step: dict[str, Any]) -> str:
+    return str(step.get("with", {}).get("script", ""))
+
+
+def _step_shell_text(step: dict[str, Any]) -> str:
+    return f"{step.get('run', '')}\n{_ssh_script(step)}"
 
 
 def _needs(job_name: str) -> set[str]:
@@ -239,7 +256,7 @@ def _equality_atoms(source: str, *, separator: str) -> Counter[tuple[str, str]] 
 
 
 def _parse_deploy_policy(condition: Any) -> _DeployPolicy | None:
-    """Parse only ``(event || event) && ref && tests && alembic``."""
+    """Parse only ``(event || event) && ref``."""
     source = _condition_source(condition)
     if source is None:
         return None
@@ -247,30 +264,18 @@ def _parse_deploy_policy(condition: Any) -> _DeployPolicy | None:
     if match is None:
         return None
     event_atoms = _equality_atoms(match.group("events"), separator="||")
-    gate_atoms = _equality_atoms(match.group("gates"), separator="&&")
-    if event_atoms is None or gate_atoms is None:
+    if event_atoms is None:
         return None
     if any(identifier != "github.event_name" or count != 1 for (identifier, _), count in event_atoms.items()):
         return None
-    if any(count != 1 for count in gate_atoms.values()):
+
+    ref_match = _CONDITION_EQUALITY_RE.fullmatch(match.group("ref").strip())
+    if ref_match is None or ref_match.group("left") != "github.ref":
         return None
 
-    gate_identifiers = [identifier for (identifier, _) in gate_atoms]
-    if len(set(gate_identifiers)) != len(gate_identifiers):
-        return None
-    gate_values = {identifier: value for (identifier, value) in gate_atoms}
-    required_gates = {
-        "github.ref",
-        "needs.tests.result",
-        "needs.alembic.result",
-    }
-    if gate_values.keys() != required_gates:
-        return None
     return _DeployPolicy(
         events=frozenset(value for (_, value) in event_atoms),
-        ref=gate_values["github.ref"],
-        tests_result=gate_values["needs.tests.result"],
-        alembic_result=gate_values["needs.alembic.result"],
+        ref=ref_match.group("right"),
     )
 
 
@@ -278,21 +283,9 @@ def _deploy_condition_matches_contract(condition: Any) -> bool:
     return _parse_deploy_policy(condition) == _EXPECTED_DEPLOY_POLICY
 
 
-def deploy_allowed(
-    *,
-    policy: _DeployPolicy,
-    event_name: str,
-    ref: str,
-    tests_result: str,
-    alembic_result: str,
-) -> bool:
+def deploy_allowed(*, policy: _DeployPolicy, event_name: str, ref: str) -> bool:
     """Evaluate an artificial GitHub context against the parsed YAML policy."""
-    return (
-        event_name in policy.events
-        and ref == policy.ref
-        and tests_result == policy.tests_result
-        and alembic_result == policy.alembic_result
-    )
+    return event_name in policy.events and ref == policy.ref
 
 
 def _render_concurrency_group(
@@ -309,6 +302,17 @@ def _render_concurrency_group(
     )
     assert "${{" not in rendered, "concurrency group contains an unsupported expression"
     return rendered
+
+
+def _render_deploy_group(template: Any, *, workflow: str, event_name: str, ref: str) -> str:
+    """Evaluate the narrow ``ref == main ? main-template : other-template`` grammar we emit."""
+    source = _condition_source(template)
+    assert source is not None, "concurrency group must be a non-empty condition"
+    match = _GROUP_EXPRESSION_RE.fullmatch(source)
+    assert match is not None, f"unexpected concurrency group expression shape: {source!r}"
+    if ref == "refs/heads/main":
+        return match.group("main_template").format(workflow)
+    return match.group("other_template").format(workflow, event_name, ref)
 
 
 # ===========================================================================
@@ -358,55 +362,77 @@ def test_trigger_helper_handles_pyyaml_boolean_on_key() -> None:
     assert "push" not in _workflow_triggers({True: boolean_triggers})
 
 
+# ===========================================================================
+# lint / alembic / tests only run for pull requests
+# ===========================================================================
+
+
 @pytest.mark.parametrize("job_name", ["lint", "tests", "alembic"])
-def test_required_jobs_are_available_on_pull_requests(job_name: str) -> None:
+def test_required_jobs_are_not_softened(job_name: str) -> None:
     job = _jobs()[job_name]
-    assert "if" not in job, f"{job_name} has a job guard that can exclude pull requests"
     assert "continue-on-error" not in job, f"{job_name} is advisory instead of required"
 
 
-def test_pull_requests_cannot_cancel_main_or_other_pull_request_runs() -> None:
+def test_lint_runs_only_for_pull_requests() -> None:
+    assert _condition_source(_jobs()["lint"].get("if")) == _REQUIRED_PR_JOB_IF
+
+
+@pytest.mark.parametrize("job_name", ["alembic", "tests"])
+def test_alembic_and_tests_run_only_for_pull_requests_after_successful_lint(job_name: str) -> None:
+    """Event-scoped, but still gated behind a green lint so runners aren't wasted."""
+    assert _needs(job_name) == {"lint"}
+    assert _condition_source(_jobs()[job_name].get("if")) == _REQUIRED_PR_JOB_IF_AFTER_LINT
+
+
+def test_push_and_dispatch_do_not_allocate_runners_for_pr_only_jobs() -> None:
+    """A job-level ``if`` skips the job before a runner is assigned — no checkout, no services."""
+    for job_name in ("lint", "alembic", "tests"):
+        job = _jobs()[job_name]
+        condition = _condition_source(job.get("if"))
+        assert condition is not None
+        assert "github.event_name == 'pull_request'" in condition
+
+
+# ===========================================================================
+# Concurrency: PR runs can be cancelled, production deploys cannot
+# ===========================================================================
+
+
+def test_pull_request_runs_can_still_be_cancelled_by_a_newer_commit() -> None:
     concurrency = _workflow()["concurrency"]
-    assert concurrency["cancel-in-progress"] is True
-    template = concurrency["group"]
-    rendered_groups = {
-        _render_concurrency_group(
-            template,
-            workflow="CI / Deploy",
-            event_name="push",
-            ref="refs/heads/main",
-        ),
-        _render_concurrency_group(
-            template,
-            workflow="CI / Deploy",
-            event_name="pull_request",
-            ref="refs/pull/10/merge",
-        ),
-        _render_concurrency_group(
-            template,
-            workflow="CI / Deploy",
-            event_name="pull_request",
-            ref="refs/pull/11/merge",
-        ),
-        _render_concurrency_group(
-            template,
-            workflow="CI / Deploy",
-            event_name="workflow_dispatch",
-            ref="refs/heads/main",
-        ),
-        _render_concurrency_group(
-            template,
-            workflow="Other workflow",
-            event_name="push",
-            ref="refs/heads/main",
-        ),
-    }
-    assert len(rendered_groups) == 5
+    assert _condition_source(concurrency["cancel-in-progress"]) == "github.ref != 'refs/heads/main'"
 
 
-def test_deploy_depends_on_tests_and_alembic() -> None:
-    """Every security and schema gate must be green before deployment."""
-    assert {"tests", "alembic"} <= _needs("deploy")
+def test_main_deploys_share_one_group_and_are_never_cancelled() -> None:
+    group_template = _workflow()["concurrency"]["group"]
+
+    push_main = _render_deploy_group(group_template, workflow="CI / Deploy", event_name="push", ref="refs/heads/main")
+    dispatch_main = _render_deploy_group(
+        group_template, workflow="CI / Deploy", event_name="workflow_dispatch", ref="refs/heads/main"
+    )
+    pr10 = _render_deploy_group(
+        group_template, workflow="CI / Deploy", event_name="pull_request", ref="refs/pull/10/merge"
+    )
+    pr11 = _render_deploy_group(
+        group_template, workflow="CI / Deploy", event_name="pull_request", ref="refs/pull/11/merge"
+    )
+    other_workflow_push_main = _render_deploy_group(
+        group_template, workflow="Other workflow", event_name="push", ref="refs/heads/main"
+    )
+
+    # Both trigger types that can reach production must serialize in one group.
+    assert push_main == dispatch_main
+    # Different pull requests, and a different workflow, must stay independent.
+    assert len({push_main, pr10, pr11, other_workflow_push_main}) == 4
+
+
+# ===========================================================================
+# deploy no longer re-runs CI, and only targets refs/heads/main
+# ===========================================================================
+
+
+def test_deploy_has_no_needs_on_repeated_ci_jobs() -> None:
+    assert "needs" not in _jobs()["deploy"]
 
 
 def test_deploy_condition_matches_context_contract() -> None:
@@ -415,165 +441,73 @@ def test_deploy_condition_matches_context_contract() -> None:
 
 
 @pytest.mark.parametrize(
-    (
-        "event_name",
-        "ref",
-        "tests_result",
-        "alembic_result",
-        "expected",
-    ),
+    ("event_name", "ref", "expected"),
     [
-        ("push", "refs/heads/main", "success", "success", True),
-        ("workflow_dispatch", "refs/heads/main", "success", "success", True),
-        ("pull_request", "refs/pull/123/merge", "success", "success", False),
-        ("pull_request", "refs/heads/main", "success", "success", False),
-        ("push", "refs/heads/feature", "success", "success", False),
-        ("workflow_dispatch", "refs/heads/feature", "success", "success", False),
-        ("workflow_dispatch", "refs/tags/v1", "success", "success", False),
-        ("push", "refs/heads/main", "failure", "success", False),
-        ("workflow_dispatch", "refs/heads/main", "success", "failure", False),
-        ("push", "refs/heads/main", "skipped", "success", False),
-        ("workflow_dispatch", "refs/heads/main", "success", "skipped", False),
-        ("push", "refs/heads/main", "success", "cancelled", False),
-        ("schedule", "refs/heads/main", "success", "success", False),
+        ("push", "refs/heads/main", True),
+        ("workflow_dispatch", "refs/heads/main", True),
+        ("pull_request", "refs/pull/123/merge", False),
+        ("pull_request", "refs/heads/main", False),
+        ("push", "refs/heads/feature", False),
+        ("workflow_dispatch", "refs/heads/feature", False),
+        ("workflow_dispatch", "refs/tags/v1", False),
+        ("schedule", "refs/heads/main", False),
     ],
 )
-def test_deploy_context_contract(
-    event_name: str,
-    ref: str,
-    tests_result: str,
-    alembic_result: str,
-    expected: bool,
-) -> None:
+def test_deploy_context_contract(event_name: str, ref: str, expected: bool) -> None:
     policy = _parse_deploy_policy(_jobs()["deploy"].get("if"))
     assert policy is not None
-    assert (
-        deploy_allowed(
-            policy=policy,
-            event_name=event_name,
-            ref=ref,
-            tests_result=tests_result,
-            alembic_result=alembic_result,
-        )
-        is expected
-    )
-
-
-def test_deploy_job_and_step_cannot_be_softened() -> None:
-    deploy = _jobs()["deploy"]
-    assert "continue-on-error" not in deploy
-    for step in _steps("deploy"):
-        assert "continue-on-error" not in step
-
-
-def test_notify_does_not_run_for_pull_requests() -> None:
-    condition = " ".join(str(_jobs()["notify"].get("if", "")).split())
-    assert condition == (
-        "always() && ( "
-        "(github.event_name == 'push' && github.ref == 'refs/heads/main') || "
-        "github.event_name == 'workflow_dispatch' "
-        ")"
-    )
+    assert deploy_allowed(policy=policy, event_name=event_name, ref=ref) is expected
 
 
 @pytest.mark.parametrize(
     "condition",
     [
-        (
-            "(github.event_name == 'push' || "
-            "github.event_name == 'pull_request') && "
-            "github.ref == 'refs/heads/main' && "
-            "needs.tests.result == 'success' && "
-            "needs.alembic.result == 'success'"
-        ),
+        ("(github.event_name == 'push' || github.event_name == 'pull_request') && github.ref == 'refs/heads/main'"),
         (
             "(github.event_name == 'push' || "
             "github.event_name == 'workflow_dispatch') && "
-            "github.ref == 'refs/heads/main-feature' && "
-            "needs.tests.result == 'success' && "
-            "needs.alembic.result == 'success'"
+            "github.ref == 'refs/heads/main-feature'"
         ),
-        (
-            "(github.event_name != 'pull_request') && "
-            "github.ref == 'refs/heads/main' && "
-            "needs.tests.result == 'success' && "
-            "needs.alembic.result == 'success'"
-        ),
-        (
-            "(github.event_name == 'push' || "
-            "github.event_name == 'workflow_dispatch') && "
-            "github.ref contains 'main' && "
-            "needs.tests.result == 'success' && "
-            "needs.alembic.result == 'success'"
-        ),
-        (
-            "(github.event_name == 'push' || "
-            "github.event_name == 'workflow_dispatch') && "
-            "github.ref == 'refs/heads/main' && "
-            "needs.tests.result != 'failure' && "
-            "needs.alembic.result == 'success'"
-        ),
+        ("(github.event_name != 'pull_request') && github.ref == 'refs/heads/main'"),
+        ("(github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref contains 'main'"),
         (
             "(github.event_name == 'workflow_dispatch') && "
-            "needs.tests.result == 'success' && "
-            "needs.alembic.result == 'success'"
+            "github.ref == 'refs/heads/main' && "
+            "needs.tests.result == 'success'"
         ),
         (
             "(github.event_name == 'push' || "
             "github.event_name == 'workflow_dispatch') && "
             "github.ref == 'refs/heads/feature'\n"
-            "# github.ref == 'refs/heads/main' && "
-            "needs.tests.result == 'success' && "
-            "needs.alembic.result == 'success'"
+            "# github.ref == 'refs/heads/main'"
         ),
         (
             "echo \"(github.event_name == 'push' || "
             "github.event_name == 'workflow_dispatch') && "
-            "github.ref == 'refs/heads/main' && "
-            "needs.tests.result == 'success' && "
-            "needs.alembic.result == 'success'\""
+            "github.ref == 'refs/heads/main'\""
         ),
-        (
-            "(github.event_name == 'push') && "
-            "github.ref == 'refs/heads/main' && "
-            "needs.tests.result == 'success' && "
-            "needs.alembic.result == 'success'"
-        ),
+        ("(github.event_name == 'push') && github.ref == 'refs/heads/main'"),
         (
             "github.event_name == 'push' || "
-            "(github.event_name == 'workflow_dispatch' && "
-            "github.ref == 'refs/heads/main' && "
-            "needs.tests.result == 'success' && "
-            "needs.alembic.result == 'success')"
+            "(github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')"
         ),
         (
             '(github.event_name == "push" || '
             'github.event_name == "workflow_dispatch") && '
-            'github.ref == "refs/heads/main" && '
-            'needs.tests.result == "success" && '
-            'needs.alembic.result == "success"'
+            'github.ref == "refs/heads/main"'
         ),
         (
             ")github.event_name == 'push' || "
             "github.event_name == 'workflow_dispatch'( && "
-            "github.ref == 'refs/heads/main' && "
-            "needs.tests.result == 'success' && "
-            "needs.alembic.result == 'success'"
+            "github.ref == 'refs/heads/main'"
         ),
         (
             "(github.event_name == 'push' || "
             "github.event_name == 'workflow_dispatch' || "
             "github.event_name == 'schedule') && "
-            "github.ref == 'refs/heads/main' && "
-            "needs.tests.result == 'success' && "
-            "needs.alembic.result == 'success'"
+            "github.ref == 'refs/heads/main'"
         ),
-        (
-            "(github.event_name == 'push' || github.event_name == 'push') && "
-            "github.ref == 'refs/heads/main' && "
-            "needs.tests.result == 'success' && "
-            "needs.alembic.result == 'success'"
-        ),
+        ("(github.event_name == 'push' || github.event_name == 'push') && github.ref == 'refs/heads/main'"),
     ],
 )
 def test_deploy_condition_parser_rejects_unsafe_guards(condition: str) -> None:
@@ -586,11 +520,139 @@ def test_deploy_condition_parser_accepts_safe_allowlist() -> None:
             github.event_name == 'workflow_dispatch' ||
             github.event_name == 'push'
         ) &&
-        needs.tests.result == 'success'
-        && github.ref == 'refs/heads/main'
-        && needs.alembic.result == 'success'
+        github.ref == 'refs/heads/main'
     }}"""
     assert _deploy_condition_matches_contract(condition)
+
+
+def test_deploy_job_and_step_cannot_be_softened() -> None:
+    deploy = _jobs()["deploy"]
+    assert "continue-on-error" not in deploy
+    for step in _steps("deploy"):
+        assert "continue-on-error" not in step
+
+
+# ===========================================================================
+# Deploy pins the exact workflow SHA, not whatever main has drifted to
+# ===========================================================================
+
+
+def test_deploy_resets_to_the_exact_workflow_sha() -> None:
+    script = _ssh_script(_steps("deploy")[0])
+    assert 'git reset --hard "${{ github.sha }}"' in script
+    assert "git reset --hard origin/main" not in script
+
+
+def test_deploy_verifies_the_reset_landed_on_the_expected_sha() -> None:
+    script = _ssh_script(_steps("deploy")[0])
+    assert 'DEPLOYED_SHA="$(git rev-parse HEAD)"' in script
+    assert 'test "$DEPLOYED_SHA" = "${{ github.sha }}"' in script
+
+
+# ===========================================================================
+# Stabilization wait and post-deploy verification
+# ===========================================================================
+
+
+def test_deploy_step_order() -> None:
+    names = [step.get("name") for step in _steps("deploy")]
+    assert names == [
+        "Deploy to server via SSH",
+        "Wait for service stabilization",
+        "Verify deployment on server",
+        "Verify public HTTPS health endpoint",
+        "Notify via Telegram",
+    ]
+
+
+def test_stabilization_wait_is_exactly_sixty_seconds() -> None:
+    wait_step = _steps("deploy")[1]
+    assert _normalized_run(wait_step) == "sleep 60"
+    assert "if" not in wait_step
+    assert "continue-on-error" not in wait_step
+    assert "uses" not in wait_step
+
+
+_EXPECTED_CRITICAL_SERVICES = frozenset(
+    {
+        "postgres",
+        "redis",
+        "altegio-api",
+        "altegio-inbox-worker",
+        "altegio-outbox-worker",
+        "altegio-whatsapp-inbox-worker",
+        "altegio-meta-guard-worker",
+        "altegio-campaign-worker",
+        "altegio-followup-worker",
+    }
+)
+
+
+def _critical_services(script: str) -> frozenset[str]:
+    """Pull the ``CRITICAL_SERVICES="..."`` bash list out of the verification script."""
+    match = re.search(r'CRITICAL_SERVICES="\n(?P<body>.*?)\n"', script, re.DOTALL)
+    assert match is not None, "verification script must define CRITICAL_SERVICES"
+    return frozenset(line.strip() for line in match.group("body").splitlines() if line.strip())
+
+
+def test_server_verification_step_checks_revision_containers_db_and_cache() -> None:
+    step = _steps("deploy")[2]
+    assert step["name"] == "Verify deployment on server"
+    script = _ssh_script(step)
+    assert "set -euo pipefail" in script
+    assert 'test "$DEPLOYED_SHA" = "${{ github.sha }}"' in script
+    assert _critical_services(script) == _EXPECTED_CRITICAL_SERVICES, (
+        "migrate has profile 'ops' and is not a standing service — it must not be in this list"
+    )
+    assert "redis-cli ping" in script
+    assert 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT 1"' in script
+    assert "get_heads" in script
+    assert "get_current_heads" in script
+    assert "http://127.0.0.1:8000/health" in script
+
+
+def test_server_verification_step_never_leaks_secrets() -> None:
+    script = _ssh_script(_steps("deploy")[2])
+    for forbidden in ("cat .env", "source .env", "printenv", "eval ", " env\n", "set -x"):
+        assert forbidden not in script
+
+
+def test_public_health_check_runs_on_the_runner_not_over_ssh() -> None:
+    step = _steps("deploy")[3]
+    assert "uses" not in step, "the public check must run on the GitHub runner, not over SSH"
+    assert step.get("env", {}).get("PUBLIC_HEALTH_URL") == "https://api.kitilash.com/health"
+    run = str(step.get("run", ""))
+    assert "curl -k" not in run
+    assert "--insecure" not in run
+    assert "PUBLIC_HEALTH_URL" in run
+    assert "set -euo pipefail" in run
+
+
+# ===========================================================================
+# Notification moved into the deploy job; no separate runner
+# ===========================================================================
+
+
+def test_no_separate_notify_job() -> None:
+    assert "notify" not in _jobs()
+
+
+def test_telegram_notification_is_the_final_deploy_step_and_always_runs() -> None:
+    telegram_step = _steps("deploy")[-1]
+    assert telegram_step["name"] == "Notify via Telegram"
+    assert str(telegram_step.get("uses", "")).startswith("appleboy/telegram-action")
+    assert _condition_source(telegram_step.get("if")) == "always()"
+    assert "continue-on-error" not in telegram_step
+
+
+def test_telegram_message_reports_repo_branch_sha_status_and_run_url() -> None:
+    telegram_step = _steps("deploy")[-1]
+    message = str(telegram_step["with"]["message"])
+    assert "${{ github.repository }}" in message
+    assert "${{ github.ref_name }}" in message
+    assert "${{ github.sha }}" in message
+    assert "${{ job.status }}" in message
+    assert "${{ github.run_id }}" in message
 
 
 # ===========================================================================

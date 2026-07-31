@@ -8,13 +8,21 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Runs targeting refs/heads/main (push or manual dispatch) share ONE group so a
+  # second main deploy can never start mid-flight and is never cancelled by the
+  # next push — it queues behind the running deploy instead. Everything else
+  # (pull requests, dispatches on other refs) keeps its own per-ref group and can
+  # still be cancelled by a newer commit in the same PR.
+  group: ${{ github.ref == 'refs/heads/main' && format('{0}-production-deploy', github.workflow) || format('{0}-{1}-{2}', github.workflow, github.event_name, github.ref) }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
-  # 1. Проверка стиля кода с помощью Ruff
+  # 1. Проверка стиля кода с помощью Ruff — только на pull request. push в main
+  # и workflow_dispatch деплоят уже проверенный required-checks коммит и не
+  # должны повторно занимать runner под линт.
   lint:
     name: Lint with Ruff
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - name: Check out code
@@ -33,6 +41,7 @@ jobs:
 
   alembic:
     name: Check Alembic migrations
+    if: github.event_name == 'pull_request' && needs.lint.result == 'success'
     runs-on: ubuntu-latest
     needs: lint
     services:
@@ -91,6 +100,7 @@ jobs:
 
   tests:
     name: Run Tests
+    if: github.event_name == 'pull_request' && needs.lint.result == 'success'
     runs-on: ubuntu-latest
     needs: lint
     services:
@@ -182,15 +192,19 @@ jobs:
 
   deploy:
     name: Deploy to Server
-    needs: [tests, alembic]
+    # No `needs: [tests, alembic]` — branch protection already required those
+    # checks to pass before this commit could be merged into main, and this job
+    # only ever runs for main (push or manual dispatch), never for pull
+    # requests. Re-running them here would just duplicate CI that already ran.
+    # SECURITY NOTE: this shortcut is only safe as long as the `main` branch
+    # ruleset keeps "lint" / "alembic" / "tests" as required PR checks and
+    # blocks direct pushes to main.
     if: >-
       (
         github.event_name == 'push' ||
         github.event_name == 'workflow_dispatch'
       ) &&
-      github.ref == 'refs/heads/main' &&
-      needs.tests.result == 'success' &&
-      needs.alembic.result == 'success'
+      github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - name: Deploy to server via SSH
@@ -209,7 +223,14 @@ jobs:
 
             echo "📦 Fetching new code..."
             git fetch origin main
-            git reset --hard origin/main
+            git reset --hard "${{ github.sha }}"
+
+            DEPLOYED_SHA="$(git rev-parse HEAD)"
+            test "$DEPLOYED_SHA" = "${{ github.sha }}" || {
+              echo "❌ Deployed SHA ($DEPLOYED_SHA) does not match workflow SHA (${{ github.sha }})"
+              exit 1
+            }
+            echo "✅ Deployed exact commit: $DEPLOYED_SHA"
 
             echo "🔨 Building new images (without starting containers)..."
             $COMPOSE build
@@ -405,35 +426,256 @@ jobs:
             echo "✅ Done! Containers status:"
             $COMPOSE ps
 
-  notify:
-    name: Telegram Notification
-    needs: [lint, tests, alembic, deploy]
+      - name: Wait for service stabilization
+        run: sleep 60
 
-    if: >-
-      always() &&
-      (
-        (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
-        github.event_name == 'workflow_dispatch'
-      )
-    runs-on: ubuntu-latest
-    steps:
+      - name: Verify deployment on server
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: root
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          port: ${{ secrets.SSH_PORT }}
+          script: |
+            set -euo pipefail
+
+            cd /opt/altegio_bot
+
+            COMPOSE="docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml"
+
+            echo "🔎 Verifying deployed revision..."
+            DEPLOYED_SHA="$(git rev-parse HEAD)"
+            test "$DEPLOYED_SHA" = "${{ github.sha }}" || {
+              echo "❌ Post-deploy revision mismatch: expected ${{ github.sha }}, found $DEPLOYED_SHA"
+              exit 1
+            }
+            echo "✅ Server is on the expected commit: $DEPLOYED_SHA"
+
+            echo "🔎 Verifying critical containers..."
+            CRITICAL_SERVICES="
+            postgres
+            redis
+            altegio-api
+            altegio-inbox-worker
+            altegio-outbox-worker
+            altegio-whatsapp-inbox-worker
+            altegio-meta-guard-worker
+            altegio-campaign-worker
+            altegio-followup-worker
+            "
+
+            for SERVICE in $CRITICAL_SERVICES; do
+              CONTAINER=$(docker ps -a \
+                --filter "label=com.docker.compose.project=altegio_bot" \
+                --filter "label=com.docker.compose.service=${SERVICE}" \
+                --format "{{.Names}}" \
+                | head -n 1)
+
+              if [ -z "$CONTAINER" ]; then
+                echo "❌ ${SERVICE}: no container found"
+                exit 1
+              fi
+
+              STATE=$(docker inspect -f '{{.State.Status}}' "$CONTAINER")
+              HEALTH=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$CONTAINER")
+              RESTARTS=$(docker inspect -f '{{.RestartCount}}' "$CONTAINER")
+
+              echo "service=${SERVICE} container=${CONTAINER} state=${STATE} health=${HEALTH} restarts=${RESTARTS}"
+
+              if [ "$STATE" != "running" ]; then
+                echo "❌ ${SERVICE}: container state is '${STATE}', expected 'running' (possible crash/restart loop)"
+                exit 1
+              fi
+              if [ "$HEALTH" = "unhealthy" ]; then
+                echo "❌ ${SERVICE}: health status is 'unhealthy'"
+                exit 1
+              fi
+            done
+            echo "✅ All critical containers are running"
+
+            echo "🔎 Verifying PostgreSQL..."
+            PG_CONTAINER=$(docker ps \
+              --filter "label=com.docker.compose.project=altegio_bot" \
+              --filter "label=com.docker.compose.service=postgres" \
+              --format "{{.Names}}" \
+              | head -n 1)
+
+            if [ -z "$PG_CONTAINER" ]; then
+              echo "❌ postgres: no running container found"
+              exit 1
+            fi
+
+            PG_HEALTH=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$PG_CONTAINER")
+            if [ "$PG_HEALTH" != "healthy" ]; then
+              echo "❌ postgres: Docker health status is '${PG_HEALTH}', expected 'healthy'"
+              exit 1
+            fi
+
+            $COMPOSE exec -T postgres sh -lc '
+              psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT 1"
+            ' >/dev/null
+            echo "✅ PostgreSQL is healthy and answered SELECT 1"
+
+            echo "🔎 Verifying Redis..."
+            REDIS_PING="$($COMPOSE exec -T redis redis-cli ping | tr -d '\r')"
+            if [ "$REDIS_PING" != "PONG" ]; then
+              echo "❌ redis-cli ping returned '${REDIS_PING}', expected 'PONG'"
+              exit 1
+            fi
+            echo "✅ Redis responded PONG"
+
+            echo "🔎 Verifying Alembic revision (DB heads == code heads)..."
+            $COMPOSE exec -T altegio-api /app/.venv/bin/python - <<'PY'
+            import asyncio
+            import sys
+
+            from sqlalchemy import text
+
+            from alembic.config import Config
+            from alembic.runtime.migration import MigrationContext
+            from alembic.script import ScriptDirectory
+
+            from altegio_bot.db import engine
+
+
+            def _current_heads(sync_connection):
+                return MigrationContext.configure(sync_connection).get_current_heads()
+
+
+            async def main() -> int:
+                config = Config("/app/alembic.ini")
+                script = ScriptDirectory.from_config(config)
+                code_heads = set(script.get_heads())
+
+                async with engine.connect() as connection:
+                    (await connection.execute(text("SELECT 1"))).scalar_one()
+                    db_heads = set(await connection.run_sync(_current_heads))
+
+                await engine.dispose()
+
+                print(f"code_heads={sorted(code_heads)}")
+                print(f"db_heads={sorted(db_heads)}")
+
+                if not code_heads:
+                    print("FAIL: code heads are empty")
+                    return 1
+                if not db_heads:
+                    print("FAIL: database heads are empty")
+                    return 1
+                if code_heads != db_heads:
+                    print("FAIL: database heads do not match code heads")
+                    return 1
+
+                print("OK: database heads match code heads")
+                return 0
+
+
+            sys.exit(asyncio.run(main()))
+            PY
+            echo "✅ Alembic revision verified"
+
+            echo "🔎 Verifying internal API health endpoint..."
+            INTERNAL_HEALTH_BODY="$(mktemp)"
+            trap 'rm -f "$INTERNAL_HEALTH_BODY"' EXIT
+
+            INTERNAL_HTTP_STATUS=$(curl --silent --show-error \
+              --connect-timeout 5 --max-time 10 \
+              -o "$INTERNAL_HEALTH_BODY" -w '%{http_code}' \
+              "http://127.0.0.1:8000/health")
+
+            if [ "$INTERNAL_HTTP_STATUS" != "200" ]; then
+              echo "❌ Internal API returned HTTP ${INTERNAL_HTTP_STATUS}"
+              exit 1
+            fi
+
+            $COMPOSE exec -T altegio-api /app/.venv/bin/python -c '
+            import json
+            import sys
+
+            try:
+                data = json.load(sys.stdin)
+            except Exception:
+                print("FAIL: response body is not valid JSON")
+                sys.exit(1)
+
+            if not isinstance(data, dict) or data.get("ok") is not True:
+                print("FAIL: unexpected response body")
+                sys.exit(1)
+
+            print("OK: internal API healthy")
+            ' < "$INTERNAL_HEALTH_BODY"
+
+            echo "✅ Internal API is healthy"
+
+      - name: Verify public HTTPS health endpoint
+        env:
+          PUBLIC_HEALTH_URL: https://api.kitilash.com/health
+        run: |
+          set -euo pipefail
+
+          MAX_ATTEMPTS=5
+          RETRY_DELAY_SECONDS=5
+          BODY_FILE="$(mktemp)"
+          trap 'rm -f "$BODY_FILE"' EXIT
+
+          attempt=1
+          status="000"
+          while [ "$attempt" -le "$MAX_ATTEMPTS" ]; do
+            status=$(curl --silent --show-error \
+              --connect-timeout 5 --max-time 15 \
+              -o "$BODY_FILE" -w '%{http_code}' \
+              "$PUBLIC_HEALTH_URL" || echo "000")
+
+            if [ "$status" = "200" ]; then
+              break
+            fi
+
+            echo "Attempt ${attempt}/${MAX_ATTEMPTS}: public health endpoint returned status '${status}'"
+            attempt=$((attempt + 1))
+            if [ "$attempt" -le "$MAX_ATTEMPTS" ]; then
+              sleep "$RETRY_DELAY_SECONDS"
+            fi
+          done
+
+          if [ "$status" != "200" ]; then
+            echo "❌ Public HTTPS health endpoint did not return 200 after ${MAX_ATTEMPTS} attempts"
+            exit 1
+          fi
+
+          python3 - "$BODY_FILE" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1]) as fh:
+              try:
+                  data = json.load(fh)
+              except Exception:
+                  print("FAIL: response body is not valid JSON")
+                  raise SystemExit(1)
+
+          if not isinstance(data, dict) or data.get("ok") is not True:
+              print("FAIL: unexpected response body")
+              raise SystemExit(1)
+
+          print("OK: public health endpoint healthy")
+          PY
+
+          echo "✅ Public HTTPS health endpoint is healthy"
+
       - name: Notify via Telegram
+        if: always()
         uses: appleboy/telegram-action@master
         with:
           to: ${{ secrets.TELEGRAM_TO }}
           token: ${{ secrets.TELEGRAM_TOKEN }}
 
           message: |
-            🤖 *AltegioBot CI / Deploy Report*
+            🤖 *AltegioBot Deploy + post-deploy verification*
 
+            *Repository:* `${{ github.repository }}`
             *Branch:* `${{ github.ref_name }}`
             *Commit:* `${{ github.sha }}`
-
-            *Statuses:*
-            🎨 **Lint:** `${{ needs.lint.result }}`
-            🧪 **Tests:** `${{ needs.tests.result }}`
-            🗄️ **Alembic:** `${{ needs.alembic.result }}`
-            🚀 **Deploy:** `${{ needs.deploy.result }}`
+            *Status:* `${{ job.status }}`
 
             *Run details:*
             ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
