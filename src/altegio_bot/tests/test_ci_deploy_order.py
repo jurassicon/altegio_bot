@@ -31,6 +31,14 @@ import yaml
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 WORKFLOW_FILE = _REPO_ROOT / ".github" / "workflows" / "ci_deploy.yml"
 COMPOSE_FILE = _REPO_ROOT / "docker-compose.yml"
+DEPLOY_SCRIPT_FILE = _REPO_ROOT / "scripts" / "deploy_pr3.sh"
+DEPLOY_SCRIPT_PATH = "scripts/deploy_pr3.sh"
+
+# GitHub evaluates a `script:` input as ONE template expression and caps it at
+# this many characters. The full rollout program is several times larger, which
+# is why it lives in its own file: inlining it made the workflow itself invalid,
+# so not even lint or tests could start.
+GITHUB_EXPRESSION_LIMIT = 21000
 
 INBOX_SERVICE = "altegio-inbox-worker"
 PR3_REVISION = "c1a7d3f905b2"
@@ -53,12 +61,21 @@ def _deploy_steps() -> list[dict[str, Any]]:
 
 
 def _deploy_script() -> str:
-    """The SSH script that performs the actual rollout."""
+    """The rollout program itself, now a versioned, directly testable file."""
+    assert DEPLOY_SCRIPT_FILE.is_file(), f"missing deploy script: {DEPLOY_SCRIPT_FILE}"
+    return DEPLOY_SCRIPT_FILE.read_text()
+
+
+def _bootstrap_step() -> dict[str, Any]:
+    """The SSH step that fetches the commit and hands over to the script."""
     for step in _deploy_steps():
-        script = str(step.get("with", {}).get("script", ""))
-        if "$COMPOSE build" in script:
-            return script
-    raise AssertionError("the deploy job has no build/rollout SSH script")
+        if DEPLOY_SCRIPT_PATH in str(step.get("with", {}).get("script", "")):
+            return step
+    raise AssertionError("no deploy step invokes " + DEPLOY_SCRIPT_PATH)
+
+
+def _bootstrap_script() -> str:
+    return str(_bootstrap_step().get("with", {}).get("script", ""))
 
 
 def _index(marker: str) -> int:
@@ -246,7 +263,7 @@ def test_old_worker_is_only_started_after_the_revision_is_confirmed() -> None:
 
 def test_migration_failure_is_not_masked() -> None:
     script = _deploy_script()
-    assert "set -euo pipefail" in script
+    assert "set -Eeuo pipefail" in script
     assert "migrate || " not in script
 
 
@@ -494,7 +511,10 @@ def test_no_mandatory_operation_is_softened() -> None:
 
 def test_existing_deploy_guarantees_are_preserved() -> None:
     script = _deploy_script()
-    assert 'git reset --hard "${{ github.sha }}"' in script
+    # The exact-commit guarantee now spans the bootstrap (which resets to it)
+    # and the script (which re-verifies it before touching anything).
+    assert 'git reset --hard "$DEPLOY_SHA"' in _bootstrap_script()
+    assert 'if [ "$DEPLOYED_SHA" != "$DEPLOY_SHA" ]' in script
     assert "pg_dump" in script
     assert "Pre-deploy dump is empty" in script
     names = [step.get("name") for step in _deploy_steps()]
@@ -776,3 +796,136 @@ def test_clean_canary_exit_short_circuits_the_after_verification_branch() -> Non
     branch = recovery[recovery.index('if [ "$REGULAR_WORKER_VERIFIED" -eq 1 ]') :]
     assert '[ "$CANARY_DRAIN_UNCERTAIN" -eq 0 ] && [ -z "$CANARY_ID" ]' in branch
     assert "Canary already retired cleanly" in branch
+
+
+# ===========================================================================
+# The rollout program lives in a file, not in the workflow
+# ===========================================================================
+
+
+def test_deploy_script_exists_and_is_executable() -> None:
+    import os
+    import stat
+
+    assert DEPLOY_SCRIPT_FILE.is_file(), f"missing {DEPLOY_SCRIPT_PATH}"
+    mode = DEPLOY_SCRIPT_FILE.stat().st_mode
+    assert mode & stat.S_IXUSR, f"{DEPLOY_SCRIPT_PATH} is not executable"
+    assert os.access(DEPLOY_SCRIPT_FILE, os.X_OK)
+
+
+def test_deploy_script_has_a_shebang_and_strict_mode() -> None:
+    text = _deploy_script()
+    assert text.startswith("#!/usr/bin/env bash\n")
+    assert "set -Eeuo pipefail" in text.split("\n\n", 1)[0] or "set -Eeuo pipefail" in text[:2000]
+
+
+def test_workflow_invokes_the_deploy_script() -> None:
+    bootstrap = _bootstrap_script()
+    assert f"exec bash {DEPLOY_SCRIPT_PATH}" in bootstrap
+
+
+def test_inline_bootstrap_is_far_below_the_expression_limit() -> None:
+    """The bug being fixed: an oversized `script:` invalidates the whole file.
+
+    GitHub rejected the workflow outright, so lint, tests, Alembic checks and
+    deploy all stopped running.
+    """
+    bootstrap = _bootstrap_script()
+    assert len(bootstrap) < GITHUB_EXPRESSION_LIMIT // 10, (
+        f"the inline bootstrap is {len(bootstrap)} characters; keep it small"
+    )
+    for step in _deploy_steps():
+        script = str(step.get("with", {}).get("script", ""))
+        assert len(script) < GITHUB_EXPRESSION_LIMIT, f"{step.get('name')!r} has a {len(script)}-character script input"
+
+
+def test_the_rollout_program_is_not_inlined_anywhere_in_the_workflow() -> None:
+    """No step may carry the deploy logic, and it must not be split into
+    several large blocks either.
+    """
+    workflow_text = WORKFLOW_FILE.read_text()
+    for marker in (
+        "PR3_TRANSITION",
+        "stop_canary_and_verify_exit",
+        "recover_orphaned_processing_rows",
+        "constraint_failure_predicate",
+        "alembic downgrade",
+        "verify_container_drained",
+        "trap 'recover",
+        "DEPLOY_BOUNDARY_EPOCH_US",
+    ):
+        assert marker not in workflow_text, f"deploy logic {marker!r} is still inlined in the workflow"
+
+    # NOTE: the separate post-deploy verification step legitimately uses Alembic's
+    # ScriptDirectory for its own smoke check. That step is small and is not the
+    # rollout program, so it is deliberately not covered by the markers above.
+
+
+def test_bootstrap_fetches_the_exact_commit_before_handing_over() -> None:
+    """The script that runs must be the one this deploy is shipping."""
+    bootstrap = _bootstrap_script()
+    fetch = bootstrap.index("git fetch")
+    reset = bootstrap.index('git reset --hard "$DEPLOY_SHA"')
+    handover = bootstrap.index(f"exec bash {DEPLOY_SCRIPT_PATH}")
+    assert fetch < reset < handover
+    assert "set -Eeuo pipefail" in bootstrap
+
+
+def test_deploy_sha_is_passed_as_an_environment_variable() -> None:
+    """Keeping `${{ github.sha }}` out of the script block is what keeps the
+    block from being treated as a template expression at all.
+    """
+    step = _bootstrap_step()
+    assert step.get("env", {}).get("DEPLOY_SHA") == "${{ github.sha }}"
+    assert "DEPLOY_SHA" in str(step.get("with", {}).get("envs", ""))
+    assert "${{" not in _bootstrap_script(), "the bootstrap must contain no workflow expressions"
+    assert "${{" not in _deploy_script(), "the script must contain no workflow expressions"
+
+
+def test_deploy_script_verifies_the_sha_before_any_mutation() -> None:
+    script = _deploy_script()
+    assert 'if [ -z "${DEPLOY_SHA:-}" ]' in script
+    assert 'DEPLOYED_SHA="$(git rev-parse HEAD)"' in script
+    assert 'if [ "$DEPLOYED_SHA" != "$DEPLOY_SHA" ]' in script
+
+    guard = script.index('if [ "$DEPLOYED_SHA" != "$DEPLOY_SHA" ]')
+    for mutation in (
+        "$COMPOSE --profile ops run --rm --no-deps migrate\n",
+        "UPDATE altegio_events",
+        f"$COMPOSE stop -t 300 {INBOX_SERVICE}",
+        "$COMPOSE build",
+    ):
+        assert guard < script.index(mutation), f"{mutation!r} runs before the SHA is verified"
+
+
+def test_deploy_script_is_syntactically_valid_bash() -> None:
+    import subprocess
+
+    result = subprocess.run(["bash", "-n", str(DEPLOY_SCRIPT_FILE)], capture_output=True, text=True)
+    assert result.returncode == 0, f"bash -n failed:\n{result.stderr}"
+
+
+def test_safety_guarantees_survived_the_move() -> None:
+    """A compact spot-check that the extraction dropped nothing.
+
+    The detailed behaviour is asserted by the rest of this module; this is the
+    one test that fails loudly if the script were ever replaced by a stub.
+    """
+    script = _deploy_script()
+    for guarantee in (
+        "PR3_TRANSITION=1",
+        "PR3_TRANSITION_APPLIED=1",
+        "CANARY_VERIFIED=1",
+        "REGULAR_WORKER_VERIFIED=1",
+        "verify_container_drained",
+        "running_inbox_worker_ids",
+        "require_no_inbox_worker_running",
+        "recover_orphaned_processing_rows",
+        "recover_current_deploy_constraint_failures",
+        "constraint_failure_predicate",
+        "DEPLOY_BOUNDARY_EPOCH_US",
+        'alembic downgrade "$PRE_PR3_REVISION"',
+        "trap 'recover $?' EXIT",
+        "clock_timestamp()",
+    ):
+        assert guarantee in script, f"the extraction lost {guarantee!r}"

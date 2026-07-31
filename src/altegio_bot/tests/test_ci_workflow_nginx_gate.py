@@ -538,15 +538,27 @@ def test_deploy_job_and_step_cannot_be_softened() -> None:
 
 
 def test_deploy_resets_to_the_exact_workflow_sha() -> None:
-    script = _ssh_script(_steps("deploy")[0])
-    assert 'git reset --hard "${{ github.sha }}"' in script
+    """The commit is still pinned exactly — now via an env var.
+
+    The rollout program moved to scripts/deploy_pr3.sh because an inline
+    `script:` is one template expression capped at 21000 characters. Keeping
+    `${{ github.sha }}` out of that block is part of the same fix, so the SHA
+    now arrives as DEPLOY_SHA.
+    """
+    step = _steps("deploy")[0]
+    script = _ssh_script(step)
+    assert step.get("env", {}).get("DEPLOY_SHA") == "${{ github.sha }}"
+    assert "DEPLOY_SHA" in str(step.get("with", {}).get("envs", ""))
+    assert 'git reset --hard "$DEPLOY_SHA"' in script
     assert "git reset --hard origin/main" not in script
 
 
 def test_deploy_verifies_the_reset_landed_on_the_expected_sha() -> None:
-    script = _ssh_script(_steps("deploy")[0])
-    assert 'DEPLOYED_SHA="$(git rev-parse HEAD)"' in script
-    assert 'test "$DEPLOYED_SHA" = "${{ github.sha }}"' in script
+    """Verification lives in the script, before anything is mutated."""
+    deploy_script = (_REPO_ROOT / "scripts" / "deploy_pr3.sh").read_text()
+    assert 'DEPLOYED_SHA="$(git rev-parse HEAD)"' in deploy_script
+    assert 'if [ "$DEPLOYED_SHA" != "$DEPLOY_SHA" ]' in deploy_script
+    assert 'if [ -z "${DEPLOY_SHA:-}" ]' in deploy_script
 
 
 # ===========================================================================
