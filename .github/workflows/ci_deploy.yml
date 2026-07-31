@@ -263,6 +263,8 @@ jobs:
             PRE_PR3_REVISION="9a1f4c7b2e3d"
             CANARY_NAME="altegio-inbox-worker-pr3-canary"
             CONSTRAINT_FAILURES_BEFORE=""
+            CANARY_DRAIN_UNCERTAIN=0
+            DEPLOY_BOUNDARY_EPOCH_US=""
 
             # Reads one scalar over stdin so no SQL quoting has to survive the
             # ssh -> sh -> psql nesting. Credentials stay inside the container.
@@ -326,38 +328,104 @@ jobs:
               [ "$(container_field "$1" '{{.State.Status}}')" = "running" ]
             }
 
-            any_inbox_worker_running() {
-              RUNNING_REGULAR="$(regular_worker_id)"
-              if [ -n "$RUNNING_REGULAR" ] && container_is_running "$RUNNING_REGULAR"; then
-                return 0
-              fi
-              if [ -n "$CANARY_ID" ] && container_is_running "$CANARY_ID"; then
-                return 0
-              fi
-              if docker ps --format '{{.Names}}' | grep -Fxq "$CANARY_NAME"; then
-                return 0
-              fi
-              return 1
+            # ANY inbox worker, by Compose label — the regular service container,
+            # the PR-3 canary, and any other one-off an operator may have started
+            # with `docker compose run -d altegio-inbox-worker` under a different
+            # name. Deliberately NOT built from known ids/names: an unknown worker
+            # still holding rows in `processing` must block every status reset.
+            # This is the "is anything running?" question only; regular identity is
+            # answered separately by `regular_worker_id`.
+            running_inbox_worker_ids() {
+              docker ps -q \
+                --filter "label=com.docker.compose.project=altegio_bot" \
+                --filter "label=com.docker.compose.service=altegio-inbox-worker"
             }
 
-            # Never force-remove the canary: it is a full inbox worker and may have
-            # already moved a batch to `processing`. Killing it would strand those
-            # rows exactly like the legacy worker does.
-            stop_canary_gracefully() {
+            any_inbox_worker_running() {
+              [ -n "$(running_inbox_worker_ids)" ]
+            }
+
+            require_no_inbox_worker_running() {
+              if any_inbox_worker_running; then
+                echo "❌ An inbox worker container is still running (Compose label scan)."
+                return 1
+              fi
+              return 0
+            }
+
+            # `docker stop` exits 0 even when the grace period expired and the
+            # container was SIGKILLed, so its exit code proves nothing. Drain is
+            # only established by the container's own final state.
+            verify_container_drained() {
+              VERIFY_ID="$1"
+              VERIFY_LABEL="$2"
+              VERIFY_STATUS="$(container_field "$VERIFY_ID" '{{.State.Status}}')"
+              VERIFY_EXIT="$(container_field "$VERIFY_ID" '{{.State.ExitCode}}')"
+              VERIFY_OOM="$(container_field "$VERIFY_ID" '{{.State.OOMKilled}}')"
+              VERIFY_ERROR="$(container_field "$VERIFY_ID" '{{.State.Error}}')"
+              VERIFY_FINISHED="$(container_field "$VERIFY_ID" '{{.State.FinishedAt}}')"
+              if [ -z "$VERIFY_STATUS" ]; then
+                echo "❌ Cannot read the $VERIFY_LABEL container state; drain is UNCERTAIN."
+                return 1
+              fi
+              if [ "$VERIFY_STATUS" != "exited" ]; then
+                echo "❌ $VERIFY_LABEL is '$VERIFY_STATUS', expected exited; drain is UNCERTAIN."
+                return 1
+              fi
+              if [ "$VERIFY_EXIT" != "0" ]; then
+                # 137 = SIGKILL after the grace period: the worker may have been
+                # cut off mid-batch, leaving claimed rows in `processing`.
+                echo "❌ $VERIFY_LABEL exited with code ${VERIFY_EXIT:-unknown}; drain is UNCERTAIN."
+                return 1
+              fi
+              if [ "$VERIFY_OOM" != "false" ]; then
+                echo "❌ $VERIFY_LABEL was OOM-killed; drain is UNCERTAIN."
+                return 1
+              fi
+              if [ -n "$VERIFY_ERROR" ]; then
+                echo "❌ $VERIFY_LABEL reported a runtime error; drain is UNCERTAIN."
+                return 1
+              fi
+              echo "✅ $VERIFY_LABEL drained cleanly (exit 0, finished ${VERIFY_FINISHED:-unknown})."
+              return 0
+            }
+
+            # Stop ONLY. Removal is a separate decision, because a container that
+            # was killed rather than drained must survive until its rows have been
+            # recovered.
+            stop_canary_and_verify_exit() {
               if [ -z "$CANARY_ID" ]; then
                 return 0
               fi
               if container_is_running "$CANARY_ID"; then
                 echo "🧹 Draining the canary (up to 300s)..."
                 if ! docker stop -t 300 "$CANARY_ID" >/dev/null; then
-                  echo "❌ Canary did not stop gracefully."
+                  echo "❌ docker stop failed for the canary; drain is UNCERTAIN."
+                  CANARY_DRAIN_UNCERTAIN=1
                   return 1
                 fi
               fi
-              if container_is_running "$CANARY_ID"; then
-                echo "❌ Canary is still running after the graceful stop."
+              if ! verify_container_drained "$CANARY_ID" "canary"; then
+                CANARY_DRAIN_UNCERTAIN=1
                 return 1
               fi
+              CANARY_DRAIN_UNCERTAIN=0
+              return 0
+            }
+
+            # Only ever called once the canary is proven to have exited cleanly,
+            # or once its rows have been recovered under a full worker stop.
+            remove_stopped_canary() {
+              if [ -z "$CANARY_ID" ]; then
+                return 0
+              fi
+              if container_is_running "$CANARY_ID"; then
+                echo "❌ Refusing to remove a running canary."
+                return 1
+              fi
+              docker rm "$CANARY_ID" >/dev/null
+              CANARY_ID=""
+              echo "✅ Canary removed."
               return 0
             }
 
@@ -373,11 +441,11 @@ jobs:
             # ever selects `received`. Payload, timestamps, resource ids and
             # customer data are untouched, and only a count is logged.
             #
-            # Guarded by the caller: allowed exclusively inside the one-time PR-3
-            # transition (or its recovery) and only once NO inbox worker runs.
+            # Allowed exclusively inside the one-time PR-3 transition (or its
+            # recovery) and only once NO inbox worker of any kind runs.
             recover_orphaned_processing_rows() {
-              if any_inbox_worker_running; then
-                echo "❌ An inbox worker is still running; refusing to touch event statuses."
+              if ! require_no_inbox_worker_running; then
+                echo "❗ Refusing to touch event statuses."
                 return 1
               fi
               RESET_COUNT="$(psql_scalar "WITH reset AS (UPDATE altegio_events SET status = 'received' WHERE status = 'processing' AND processed_at IS NULL RETURNING 1) SELECT count(*) FROM reset;")"
@@ -392,10 +460,47 @@ jobs:
               return 0
             }
 
-            # Only the four PR-3 constraint names. A bare missing-object phrase would
-            # match unrelated failures and roll the schema back for nothing.
+            # THE single definition of a constraint-swap failure, shared by the
+            # counts and by the requeue so they can never drift apart. It needs
+            # BOTH the missing-object signature AND one of the four PR-3
+            # constraint names: a plain unique violation also mentions the name,
+            # and a bare missing-object phrase also matches unrelated errors.
+            # Bounded to this deploy by a PostgreSQL-side timestamp.
+            constraint_failure_predicate() {
+              printf '%s' "status = 'failed' AND processed_at >= to_timestamp(${DEPLOY_BOUNDARY_EPOCH_US} / 1000000.0) AND error LIKE '%does not exist%' AND (error LIKE '%uq_clients_company_altegio_id%' OR error LIKE '%uq_records_company_altegio_id%' OR error LIKE '%uq_clients_provider_company_altegio_id%' OR error LIKE '%uq_records_provider_company_altegio_id%')"
+            }
+
             constraint_failure_count() {
-              psql_scalar "SELECT count(*) FROM altegio_events WHERE status = 'failed' AND (error LIKE '%uq_clients_company_altegio_id%' OR error LIKE '%uq_records_company_altegio_id%' OR error LIKE '%uq_clients_provider_company_altegio_id%' OR error LIKE '%uq_records_provider_company_altegio_id%');"
+              psql_scalar "SELECT count(*) FROM altegio_events WHERE $(constraint_failure_predicate);"
+            }
+
+            # Returns the events this deploy broke to `received` so the worker
+            # picks them up again. Clears ONLY status/processed_at/error; payload,
+            # received_at, company_id, resource and every other column are left
+            # exactly as they are. Rows failed before the boundary, and failures
+            # that are not constraint-swap failures, are never touched.
+            recover_current_deploy_constraint_failures() {
+              if [ "$PR3_TRANSITION" -ne 1 ]; then
+                echo "❌ Constraint-failure recovery is only valid inside the PR-3 transition."
+                return 1
+              fi
+              if [ -z "$DEPLOY_BOUNDARY_EPOCH_US" ]; then
+                echo "❌ No deploy boundary recorded; refusing to requeue failed events."
+                return 1
+              fi
+              if ! require_no_inbox_worker_running; then
+                echo "❗ Refusing to requeue failed events."
+                return 1
+              fi
+              REQUEUED="$(psql_scalar "WITH reset AS (UPDATE altegio_events SET status = 'received', processed_at = NULL, error = NULL WHERE $(constraint_failure_predicate) RETURNING 1) SELECT count(*) FROM reset;")"
+              echo "♻️ Requeued ${REQUEUED:-unknown} constraint-failed event(s) from this deploy."
+              STILL_FAILED="$(constraint_failure_count)"
+              if [ "$STILL_FAILED" != "0" ]; then
+                echo "❌ ${STILL_FAILED:-unknown} constraint-failed event(s) remain after recovery."
+                return 1
+              fi
+              echo "✅ No constraint-failed event from this deploy remains."
+              return 0
             }
 
             start_preserved_old_worker() {
@@ -424,14 +529,55 @@ jobs:
               echo "❌ Deploy failed (exit $RECOVER_STATUS). Entering recovery..."
 
               if [ "$REGULAR_WORKER_VERIFIED" -eq 1 ]; then
-                echo "ℹ️ The regular worker is already verified on the new schema; no schema rollback."
-                if stop_canary_gracefully && [ "$(processing_count)" = "0" ] && [ -n "$CANARY_ID" ]; then
-                  docker rm "$CANARY_ID" >/dev/null
-                  echo "✅ Canary retired."
-                else
-                  echo "ℹ️ Canary left in place; it is a compatible worker."
+                # The schema and the regular worker already agree, so a downgrade
+                # would break the thing that works. But if the canary was killed
+                # rather than drained it may have stranded rows in `processing`,
+                # and those must still be recovered — on the PR-3 schema.
+                echo "ℹ️ The regular worker is verified on the new schema; NO schema rollback."
+                if [ "$CANARY_DRAIN_UNCERTAIN" -eq 0 ] && [ -z "$CANARY_ID" ]; then
+                  echo "ℹ️ Canary already retired cleanly."
+                  echo "❗ Manual investigation required for the failing step."
+                  exit "$RECOVER_STATUS"
                 fi
-                echo "❗ Manual investigation required for the failing step."
+
+                echo "🛑 Canary drain is uncertain; stopping the regular worker to recover the queue..."
+                if ! $COMPOSE stop -t 300 altegio-inbox-worker; then
+                  echo "❌ Could not stop the regular worker."
+                  echo "❗ No status reset, no canary removal, no rollback. Manual intervention required."
+                  exit "$RECOVER_STATUS"
+                fi
+                STOPPED_REGULAR_ID="$(regular_worker_id)"
+                if [ -n "$STOPPED_REGULAR_ID" ] && ! verify_container_drained "$STOPPED_REGULAR_ID" "regular worker"; then
+                  echo "❗ No status reset, no canary removal, no rollback. Manual intervention required."
+                  exit "$RECOVER_STATUS"
+                fi
+                if ! require_no_inbox_worker_running; then
+                  echo "❗ No status reset, no canary removal, no rollback. Manual intervention required."
+                  exit "$RECOVER_STATUS"
+                fi
+                if ! recover_orphaned_processing_rows || ! recover_current_deploy_constraint_failures; then
+                  echo "❗ Queue recovery failed. Manual intervention required."
+                  exit "$RECOVER_STATUS"
+                fi
+                remove_stopped_canary
+                echo "▶️ Restarting the verified PR-3 regular worker..."
+                if $COMPOSE start altegio-inbox-worker; then
+                  sleep 10
+                  RESTARTED_ID="$(regular_worker_id)"
+                  RESTARTED_ONEOFF="$(container_field "$RESTARTED_ID" '{{index .Config.Labels "com.docker.compose.oneoff"}}')"
+                  RESTARTED_RESTARTS="$(container_field "$RESTARTED_ID" '{{.RestartCount}}')"
+                  RESTARTED_IMAGE="$(container_field "$RESTARTED_ID" '{{.Image}}')"
+                  if [ -n "$RESTARTED_ID" ] && container_is_running "$RESTARTED_ID" \
+                    && [ "$RESTARTED_ONEOFF" != "True" ] && [ "$RESTARTED_RESTARTS" = "0" ] \
+                    && [ "$RESTARTED_IMAGE" = "$CANARY_IMAGE" ]; then
+                    echo "✅ Regular PR-3 worker is running again ($RESTARTED_ID) on the verified image."
+                  else
+                    echo "❌ The regular worker did not come back up correctly. Manual intervention required."
+                  fi
+                else
+                  echo "❌ Could not restart the regular worker. Manual intervention required."
+                fi
+                echo "❗ The rollout required recovery. This is a FAILED deploy."
                 exit "$RECOVER_STATUS"
               fi
 
@@ -460,12 +606,29 @@ jobs:
                 PR3_TRANSITION_APPLIED=1
               fi
 
-              if ! stop_canary_gracefully; then
-                echo "❗ Canary could not be drained. NOT rolling back and NOT starting the old worker."
+              # An uncertain drain is NOT fatal here: the canary is stopped either
+              # way, and the bounded recovery below is exactly what repairs a
+              # SIGKILLed worker's rows. What matters is that nothing is still
+              # running when statuses are touched.
+              stop_canary_and_verify_exit
+              if container_is_running "$CANARY_ID"; then
+                echo "❗ Canary is still running. NOT rolling back and NOT starting the old worker."
+                exit "$RECOVER_STATUS"
+              fi
+
+              if ! require_no_inbox_worker_running; then
+                echo "❗ NOT rolling back and NOT starting the old worker."
                 exit "$RECOVER_STATUS"
               fi
 
               if ! recover_orphaned_processing_rows; then
+                echo "❗ NOT rolling back and NOT starting the old worker."
+                exit "$RECOVER_STATUS"
+              fi
+
+              # Events the swap already broke go back to `received` so the
+              # restarted old worker picks them up. Bounded to this deploy.
+              if [ -n "$DEPLOY_BOUNDARY_EPOCH_US" ] && ! recover_current_deploy_constraint_failures; then
                 echo "❗ NOT rolling back and NOT starting the old worker."
                 exit "$RECOVER_STATUS"
               fi
@@ -496,9 +659,8 @@ jobs:
                 echo "✅ Migration never applied; schema is still on $PRE_PR3_REVISION."
               fi
 
-              if [ -n "$CANARY_ID" ]; then
-                docker rm "$CANARY_ID" >/dev/null
-              fi
+              # Safe to remove now: it is stopped and its rows were recovered.
+              remove_stopped_canary
               start_preserved_old_worker
               exit "$RECOVER_STATUS"
             }
@@ -629,6 +791,23 @@ jobs:
               # handler, so it can be killed between claiming a batch and
               # finishing it. That is precisely why the bounded orphan recovery
               # below exists.
+              # Deploy boundary, read from PostgreSQL rather than the runner host:
+              # it scopes the constraint-failure count and requeue to THIS deploy,
+              # so a pre-existing failed event can neither fail the deploy nor be
+              # rewritten. Microsecond precision, taken before anything is stopped.
+              DEPLOY_BOUNDARY_EPOCH_US="$(psql_scalar "SELECT (extract(epoch FROM clock_timestamp()) * 1000000)::bigint;")"
+              case "$DEPLOY_BOUNDARY_EPOCH_US" in
+                ''|*[!0-9]*)
+                  echo "❌ Could not read a numeric deploy boundary from PostgreSQL."
+                  exit 1
+                  ;;
+              esac
+              if [ "$DEPLOY_BOUNDARY_EPOCH_US" -le 0 ]; then
+                echo "❌ Deploy boundary must be positive."
+                exit 1
+              fi
+              echo "📌 Deploy boundary recorded from PostgreSQL."
+
               echo "🛑 Stopping the legacy altegio-inbox-worker (up to 300s)..."
               $COMPOSE stop -t 300 altegio-inbox-worker
               OLD_WORKER_STOPPED=1
@@ -639,8 +818,11 @@ jobs:
                 echo "❌ altegio-inbox-worker is still running after the stop."
                 exit 1
               fi
-              if any_inbox_worker_running; then
-                echo "❌ An inbox worker is still running after the stop."
+              # Label scan, so an operator's ad-hoc one-off worker under any name
+              # is caught too — it would otherwise keep claiming rows while the
+              # bounded reset below runs.
+              if ! require_no_inbox_worker_running; then
+                echo "❗ Migration NOT applied."
                 exit 1
               fi
               echo "✅ No inbox worker running; altegio-api still accepting webhooks."
@@ -652,7 +834,7 @@ jobs:
               fi
 
               CONSTRAINT_FAILURES_BEFORE="$(constraint_failure_count)"
-              echo "📌 Constraint-related failed events before this deploy: ${CONSTRAINT_FAILURES_BEFORE:-unknown}"
+              echo "📌 Constraint-swap failures since the deploy boundary: ${CONSTRAINT_FAILURES_BEFORE:-unknown}"
             fi
 
             # ── Migration ─────────────────────────────────────────────────────
@@ -771,19 +953,15 @@ jobs:
               echo "✅ Regular inbox worker running ($REGULAR_WORKER_ID) on the verified image."
 
               # ── Retire the canary, gracefully, only now ──────────────────────
-              if ! stop_canary_gracefully; then
-                echo "❗ Canary could not be drained; leaving it in place. Manual intervention required."
+              # Drain is judged from the canary's OWN exit state. A global
+              # `processing` count would be meaningless here: the regular worker
+              # is live and legitimately claiming rows, so it would race with
+              # normal operation instead of proving anything about the canary.
+              if ! stop_canary_and_verify_exit; then
+                echo "❗ Canary drain is uncertain; leaving the container in place for recovery."
                 exit 1
               fi
-              REMAINING_PROCESSING="$(processing_count)"
-              if [ "$REMAINING_PROCESSING" != "0" ]; then
-                echo "❌ ${REMAINING_PROCESSING:-unknown} event(s) in processing after draining the canary."
-                echo "❗ Not removing the canary. Manual intervention required."
-                exit 1
-              fi
-              docker rm "$CANARY_ID" >/dev/null
-              CANARY_ID=""
-              echo "✅ Canary retired."
+              remove_stopped_canary
             fi
 
             echo "🚀 Starting updated containers..."

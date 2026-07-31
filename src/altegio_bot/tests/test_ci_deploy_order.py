@@ -81,13 +81,25 @@ def _main_flow() -> str:
     return _deploy_script()[_index("trap 'recover $?' EXIT") :]
 
 
+def _main_index(marker: str) -> int:
+    """Index inside the main flow only.
+
+    Several statements legitimately appear in both ``recover()`` and the main
+    rollout; ordering assertions must look at the rollout copy.
+    """
+    main = _main_flow()
+    position = main.find(marker)
+    assert position != -1, f"main deploy flow is missing the marker {marker!r}"
+    return position
+
+
 # Ordered phases of the rollout, each identified by a statement that can only
 # belong to that phase and only appears in the main flow.
 _PHASES = (
     ("build", "$COMPOSE build"),
     ("backup", "pg_dump"),
     ("transition classification", 'SCRIPT_FACTS="$(alembic_script_facts "$REVISION_BEFORE")"'),
-    ("legacy worker stop", f"$COMPOSE stop -t 300 {INBOX_SERVICE}"),
+    ("legacy worker stop", 'echo "🛑 Stopping the legacy altegio-inbox-worker'),
     ("constraint-failure baseline", 'CONSTRAINT_FAILURES_BEFORE="$(constraint_failure_count)"'),
     ("migration", "$COMPOSE --profile ops run --rm --no-deps migrate\n"),
     ("canary verification", "CANARY_STATE="),
@@ -219,7 +231,7 @@ def test_downgrade_targets_an_exact_revision_not_a_relative_step() -> None:
 def test_a_verified_regular_worker_blocks_any_rollback() -> None:
     recovery = _recovery_body()
     verified_branch = recovery[recovery.index('if [ "$REGULAR_WORKER_VERIFIED" -eq 1 ]') :]
-    assert "no schema rollback" in verified_branch[:600]
+    assert "NO schema rollback" in verified_branch[:600]
     # The rollback branch is reached only after both verified-flags fall through.
     assert recovery.index('if [ "$REGULAR_WORKER_VERIFIED" -eq 1 ]') < recovery.index("alembic downgrade")
     assert recovery.index('if [ "$CANARY_VERIFIED" -eq 1 ]') < recovery.index("alembic downgrade")
@@ -252,8 +264,8 @@ def test_legacy_stop_is_not_described_as_graceful() -> None:
 
 def test_orphan_reset_order_stop_then_confirm_then_reset_then_migrate() -> None:
     main = _main_flow()
-    stop = main.index(f"$COMPOSE stop -t 300 {INBOX_SERVICE}")
-    confirmed = main.index("if any_inbox_worker_running; then")
+    stop = main.index('echo "🛑 Stopping the legacy altegio-inbox-worker')
+    confirmed = main.index("if ! require_no_inbox_worker_running; then")
     reset = main.index("if ! recover_orphaned_processing_rows; then")
     migration = main.index("$COMPOSE --profile ops run --rm --no-deps migrate\n")
     assert stop < confirmed < reset < migration
@@ -261,10 +273,10 @@ def test_orphan_reset_order_stop_then_confirm_then_reset_then_migrate() -> None:
 
 def test_orphan_reset_is_bounded_and_guarded() -> None:
     script = _deploy_script()
-    body = _between("recover_orphaned_processing_rows() {", "constraint_failure_count() {")
+    body = _between("recover_orphaned_processing_rows() {", "# THE single definition")
     # Refuses while any worker still runs.
-    assert "if any_inbox_worker_running; then" in body
-    assert "refusing to touch event statuses" in body
+    assert "if ! require_no_inbox_worker_running; then" in body
+    assert "Refusing to touch event statuses" in body
     # Only claimed-but-unfinished rows.
     assert "WHERE status = 'processing' AND processed_at IS NULL" in body
     # And it proves the queue is empty afterwards.
@@ -276,15 +288,16 @@ def test_orphan_reset_is_never_an_unconditional_deploy_step() -> None:
     """A blanket reset on every deploy would destroy in-flight work."""
     script = _deploy_script()
     assert "UPDATE altegio_events SET status = 'received' WHERE status = 'processing';" not in script
-    # The only UPDATE is the bounded one inside the helper.
-    assert script.count("UPDATE altegio_events") == 1
+    # Exactly two UPDATEs, both bounded: orphaned processing rows and this
+    # deploy's constraint failures.
+    assert script.count("UPDATE altegio_events") == 2
     main = _main_flow()
     guard = main.index('if [ "$PR3_TRANSITION" -eq 1 ]; then')
     assert guard < main.index("if ! recover_orphaned_processing_rows; then")
 
 
 def test_orphan_reset_logs_only_a_count() -> None:
-    body = _between("recover_orphaned_processing_rows() {", "constraint_failure_count() {")
+    body = _between("recover_orphaned_processing_rows() {", "# THE single definition")
     for forbidden in ("payload", "phone", "customer", "error"):
         assert forbidden not in body, f"the orphan reset mentions {forbidden!r}"
 
@@ -319,10 +332,28 @@ def test_regular_worker_is_verified_by_exact_compose_id() -> None:
     assert 'if [ "$REGULAR_IMAGE" != "$CANARY_IMAGE" ]' in script
 
 
-def test_regular_lookup_never_falls_back_to_a_service_label_search() -> None:
-    """A label search matches the one-off canary too."""
-    script = _deploy_script()
-    assert "label=com.docker.compose.service=altegio-inbox-worker" not in script
+def test_regular_identity_and_all_worker_scan_are_separate_helpers() -> None:
+    """Two different questions, two different mechanisms.
+
+    "Is ANY worker running?" must be a Compose label scan so an operator's
+    ad-hoc one-off is caught. "Which container is THE regular worker?" must be
+    the exact Compose service id, because a label scan would also match the
+    canary and could leave the system with no worker at all.
+    """
+    scan = _between("running_inbox_worker_ids() {", "any_inbox_worker_running() {")
+    assert "docker ps -q" in scan
+    assert "label=com.docker.compose.project=altegio_bot" in scan
+    assert "label=com.docker.compose.service=altegio-inbox-worker" in scan
+
+    identity = _between("regular_worker_id() {", "container_field() {")
+    assert "$COMPOSE ps -q altegio-inbox-worker" in identity
+    assert "docker ps" not in identity, "regular identity must not use a label scan"
+
+    # The all-worker check must not be built from known ids/names only.
+    presence = _between("any_inbox_worker_running() {", "require_no_inbox_worker_running() {")
+    assert "running_inbox_worker_ids" in presence
+    assert "CANARY_NAME" not in presence
+    assert "CANARY_ID" not in presence
 
 
 def test_canary_and_regular_have_separate_verification_flags() -> None:
@@ -336,17 +367,17 @@ def test_canary_and_regular_have_separate_verification_flags() -> None:
 
 def test_canary_is_removed_only_after_the_regular_worker_is_verified() -> None:
     main = _main_flow()
-    assert main.index("REGULAR_WORKER_VERIFIED=1") < main.index('docker rm "$CANARY_ID"')
+    assert main.index("REGULAR_WORKER_VERIFIED=1") < main.index("remove_stopped_canary")
 
 
-def test_canary_is_drained_and_the_queue_checked_before_removal() -> None:
+def test_canary_is_drained_and_verified_before_removal() -> None:
     main = _main_flow()
-    drain = main.index("if ! stop_canary_gracefully; then")
-    queue = main.index('REMAINING_PROCESSING="$(processing_count)"')
-    removal = main.index('docker rm "$CANARY_ID"')
-    assert drain < queue < removal
-    body = _between("stop_canary_gracefully() {", "processing_count() {")
+    drain = main.index("if ! stop_canary_and_verify_exit; then")
+    removal = main.index("remove_stopped_canary")
+    assert drain < removal
+    body = _between("stop_canary_and_verify_exit() {", "# Only ever called once the canary")
     assert 'docker stop -t 300 "$CANARY_ID"' in body
+    assert "verify_container_drained" in body
 
 
 def test_regular_worker_failure_leaves_the_canary_running() -> None:
@@ -380,17 +411,6 @@ def test_constraint_failures_use_a_baseline_not_a_time_window() -> None:
     assert _index('CONSTRAINT_FAILURES_BEFORE="$(constraint_failure_count)"') < _index(
         'CONSTRAINT_FAILURES_AFTER="$(constraint_failure_count)"'
     )
-
-
-def test_constraint_probe_matches_only_the_pr3_constraint_names() -> None:
-    script = _deploy_script()
-    body = _between("constraint_failure_count() {", "start_preserved_old_worker() {")
-    for name in CONSTRAINT_NAMES:
-        assert name in body, f"the probe does not look for {name!r}"
-    # A bare missing-object phrase would match unrelated errors, so the SQL must
-    # never use one on its own.
-    assert "does not exist" not in body
-    assert "LIKE '%does not exist%'" not in script
 
 
 def test_constraint_probe_prints_no_event_content() -> None:
@@ -431,7 +451,8 @@ def test_compose_gives_the_worker_time_to_drain() -> None:
 
 
 def test_recovery_is_declared_before_anything_is_stopped() -> None:
-    assert _index("trap 'recover $?' EXIT") < _index(f"$COMPOSE stop -t 300 {INBOX_SERVICE}")
+    """The trap must exist before the rollout stops the legacy worker."""
+    assert _index("trap 'recover $?' EXIT") < _index('echo "🛑 Stopping the legacy altegio-inbox-worker')
     assert "recover() {" in _deploy_script()
 
 
@@ -481,3 +502,277 @@ def test_existing_deploy_guarantees_are_preserved() -> None:
     assert "Verify deployment on server" in names
     assert "Verify public HTTPS health endpoint" in names
     assert "Notify via Telegram" in names
+
+
+# ===========================================================================
+# Drain verification: `docker stop` exit code proves nothing
+# ===========================================================================
+
+
+def _extract_shell_function(name: str) -> str:
+    """Pull one helper out of the deploy script, dedented to column 0."""
+    script = _deploy_script()
+    start = _index(f"{name}() {{")
+    body = script[start:]
+    end = body.index("\n}\n") + len("\n}\n")
+    return body[:end]
+
+
+def _run_drain_check(**state: str) -> int:
+    """Execute the real ``verify_container_drained`` against a stubbed docker.
+
+    The helper is shell, so the only honest way to pin its semantics is to run
+    it. A fake ``docker`` on PATH answers ``inspect -f`` from *state*.
+    """
+    import os
+    import subprocess
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        stub = Path(tmp) / "docker"
+        stub.write_text(
+            "#!/bin/sh\n"
+            'case "$3" in\n'
+            '  *State.Status*) printf "%s" "$FAKE_STATUS" ;;\n'
+            '  *State.ExitCode*) printf "%s" "$FAKE_EXIT" ;;\n'
+            '  *State.OOMKilled*) printf "%s" "$FAKE_OOM" ;;\n'
+            '  *State.Error*) printf "%s" "$FAKE_ERROR" ;;\n'
+            '  *State.FinishedAt*) printf "%s" "$FAKE_FINISHED" ;;\n'
+            "esac\n"
+            'exit "${FAKE_INSPECT_RC:-0}"\n'
+        )
+        stub.chmod(0o755)
+
+        program = Path(tmp) / "check.sh"
+        program.write_text(
+            _extract_shell_function("container_field")
+            + "\n"
+            + _extract_shell_function("verify_container_drained")
+            + '\nverify_container_drained "cid" "canary"\n'
+        )
+
+        env = dict(os.environ)
+        env["PATH"] = f"{tmp}:{env['PATH']}"
+        env.update(
+            {
+                "FAKE_STATUS": state.get("status", "exited"),
+                "FAKE_EXIT": state.get("exit_code", "0"),
+                "FAKE_OOM": state.get("oom", "false"),
+                "FAKE_ERROR": state.get("error", ""),
+                "FAKE_FINISHED": state.get("finished", "2026-07-31T12:00:00Z"),
+                "FAKE_INSPECT_RC": state.get("inspect_rc", "0"),
+            }
+        )
+        return subprocess.run(["sh", str(program)], env=env, capture_output=True, text=True).returncode
+
+
+@pytest.mark.parametrize(
+    ("state", "accepted"),
+    [
+        ({}, True),  # exited, code 0, no OOM, no error
+        ({"exit_code": "137"}, False),  # SIGKILL after the grace period
+        ({"exit_code": "1"}, False),
+        ({"oom": "true"}, False),
+        ({"error": "oci runtime error"}, False),
+        ({"status": "running"}, False),
+        ({"status": "", "inspect_rc": "1"}, False),  # cannot read the state
+    ],
+    ids=["clean-exit", "sigkill-137", "exit-1", "oom-killed", "runtime-error", "still-running", "inspect-failed"],
+)
+def test_drain_is_judged_from_the_container_exit_state(state: dict[str, str], accepted: bool) -> None:
+    """`docker stop` returns 0 even after SIGKILL, so only the state counts."""
+    assert (_run_drain_check(**state) == 0) is accepted
+
+
+def test_stop_helper_does_not_trust_the_docker_stop_exit_code() -> None:
+    body = _extract_shell_function("stop_canary_and_verify_exit")
+    assert 'docker stop -t 300 "$CANARY_ID"' in body
+    # The state check runs regardless of how `docker stop` exited.
+    assert "verify_container_drained" in body
+    assert "CANARY_DRAIN_UNCERTAIN=1" in body
+
+
+def test_drain_verification_reads_every_required_state_field() -> None:
+    body = _extract_shell_function("verify_container_drained")
+    for field in ("{{.State.Status}}", "{{.State.ExitCode}}", "{{.State.OOMKilled}}", "{{.State.Error}}"):
+        assert field in body, f"drain verification ignores {field}"
+    assert "{{.State.FinishedAt}}" in body
+
+
+def test_uncertain_drain_never_removes_the_container_in_the_success_path() -> None:
+    main = _main_flow()
+    guard = main.index("if ! stop_canary_and_verify_exit; then")
+    removal = main.index("remove_stopped_canary")
+    assert guard < removal
+    # The guard exits before reaching the removal.
+    assert "exit 1" in main[guard:removal]
+    body = _extract_shell_function("remove_stopped_canary")
+    assert "Refusing to remove a running canary" in body
+
+
+# ===========================================================================
+# No global processing race once the regular worker is live
+# ===========================================================================
+
+
+def test_no_global_processing_gate_after_the_regular_worker_is_verified() -> None:
+    """The regular worker legitimately holds rows in `processing`."""
+    main = _main_flow()
+    verified = main.index("REGULAR_WORKER_VERIFIED=1")
+    removal = main.index("remove_stopped_canary")
+    assert "processing_count" not in main[verified:removal]
+    assert "REMAINING_PROCESSING" not in _deploy_script()
+
+
+def test_global_processing_checks_only_happen_with_all_workers_stopped() -> None:
+    """Every `processing_count` call sits behind a full-stop assertion."""
+    script = _deploy_script()
+    # Definition, the pre-migration echo, and the check inside the bounded
+    # recovery helper (which itself refuses while any worker runs).
+    assert script.count("processing_count") == 3
+    helper = _between("recover_orphaned_processing_rows() {", "# THE single definition")
+    assert "require_no_inbox_worker_running" in helper
+    assert 'REMAINING="$(processing_count)"' in helper
+
+
+# ===========================================================================
+# Arbitrary one-off workers
+# ===========================================================================
+
+
+def test_status_resets_are_blocked_by_any_labelled_worker() -> None:
+    """An operator's ad-hoc `compose run` worker must block every reset."""
+    for helper in ("recover_orphaned_processing_rows", "recover_current_deploy_constraint_failures"):
+        body = _extract_shell_function(helper)
+        assert "require_no_inbox_worker_running" in body, f"{helper} can run while a worker is live"
+
+    guard = _extract_shell_function("require_no_inbox_worker_running")
+    assert "any_inbox_worker_running" in guard
+    scan = _extract_shell_function("running_inbox_worker_ids")
+    assert "docker ps -q" in scan
+    assert "--filter" in scan
+
+
+def test_downgrade_is_blocked_while_any_worker_runs() -> None:
+    recovery = _recovery_body()
+    downgrade = recovery.index('alembic downgrade "$PRE_PR3_REVISION"')
+    assert recovery.index("require_no_inbox_worker_running") < downgrade
+    assert recovery.index("recover_orphaned_processing_rows") < downgrade
+
+
+# ===========================================================================
+# Deploy boundary and bounded requeue
+# ===========================================================================
+
+
+def test_deploy_boundary_comes_from_postgresql_and_is_validated() -> None:
+    script = _deploy_script()
+    assert "SELECT (extract(epoch FROM clock_timestamp()) * 1000000)::bigint;" in script
+    assert 'DEPLOY_BOUNDARY_EPOCH_US="$(psql_scalar' in script
+    # Non-empty, numeric, positive.
+    assert "''|*[!0-9]*)" in script
+    assert '[ "$DEPLOY_BOUNDARY_EPOCH_US" -le 0 ]' in script
+    # Taken before the legacy worker is stopped.
+    assert _main_index('DEPLOY_BOUNDARY_EPOCH_US="$(psql_scalar') < _main_index(
+        'echo "🛑 Stopping the legacy altegio-inbox-worker'
+    )
+
+
+def test_constraint_predicate_is_bounded_by_the_deploy_boundary() -> None:
+    predicate = _between("constraint_failure_predicate() {", "constraint_failure_count() {")
+    assert "processed_at >= to_timestamp(${DEPLOY_BOUNDARY_EPOCH_US} / 1000000.0)" in predicate
+    assert "now() - interval" not in _deploy_script()
+
+
+def test_failed_requeue_touches_only_status_processed_at_and_error() -> None:
+    body = _extract_shell_function("recover_current_deploy_constraint_failures")
+    assert "UPDATE altegio_events SET status = 'received', processed_at = NULL, error = NULL" in body
+    # Everything else stays exactly as it is.
+    for untouched in ("payload", "received_at", "company_id", "resource", "dedupe_key"):
+        assert f"{untouched} =" not in body, f"the requeue rewrites {untouched}"
+    # Only `failed` rows, only after the boundary, only swap failures.
+    assert "$(constraint_failure_predicate)" in body
+    # And it proves there is nothing left.
+    assert 'STILL_FAILED="$(constraint_failure_count)"' in body
+    assert 'if [ "$STILL_FAILED" != "0" ]' in body
+
+
+def test_failed_requeue_is_guarded_three_ways() -> None:
+    body = _extract_shell_function("recover_current_deploy_constraint_failures")
+    assert '[ "$PR3_TRANSITION" -ne 1 ]' in body
+    assert '[ -z "$DEPLOY_BOUNDARY_EPOCH_US" ]' in body
+    assert "require_no_inbox_worker_running" in body
+
+
+def test_counts_and_requeue_share_one_predicate() -> None:
+    """They must never drift: a count that matches more than the requeue fixes
+    would fail the deploy over rows nothing recovers.
+    """
+    script = _deploy_script()
+    assert script.count("$(constraint_failure_predicate)") == 2
+    assert script.count("error LIKE '%does not exist%'") == 1
+
+
+# ===========================================================================
+# Recovery matrices
+# ===========================================================================
+
+
+def test_recovery_before_regular_verification_recovers_then_downgrades() -> None:
+    # Scope to the tail of recover(): the two "already verified" branches above
+    # legitimately mention the same helpers.
+    full = _recovery_body()
+    recovery = full[full.index('if [ "$OLD_WORKER_STOPPED" -eq 0 ]') :]
+    order = [
+        "stop_canary_and_verify_exit",
+        "require_no_inbox_worker_running",
+        "recover_orphaned_processing_rows",
+        "recover_current_deploy_constraint_failures",
+        'alembic downgrade "$PRE_PR3_REVISION"',
+        'CURRENT_REVISION" != "$PRE_PR3_REVISION"',
+        "remove_stopped_canary",
+        "start_preserved_old_worker",
+    ]
+    positions = [recovery.index(marker) for marker in order]
+    assert positions == sorted(positions), f"pre-verification recovery is out of order: {order}"
+
+
+def test_recovery_after_regular_verification_repairs_without_downgrading() -> None:
+    recovery = _recovery_body()
+    branch = recovery[
+        recovery.index('if [ "$REGULAR_WORKER_VERIFIED" -eq 1 ]') : recovery.index('if [ "$CANARY_VERIFIED" -eq 1 ]')
+    ]
+    assert "NO schema rollback" in branch
+    assert "alembic downgrade" not in branch, "the after-verification branch must never roll back"
+    order = [
+        "$COMPOSE stop -t 300 altegio-inbox-worker",
+        "verify_container_drained",
+        "require_no_inbox_worker_running",
+        "recover_orphaned_processing_rows",
+        "recover_current_deploy_constraint_failures",
+        "remove_stopped_canary",
+        "$COMPOSE start altegio-inbox-worker",
+    ]
+    positions = [branch.index(marker) for marker in order]
+    assert positions == sorted(positions), "after-verification recovery is out of order"
+    # The restarted worker is re-verified on the same image.
+    assert 'RESTARTED_IMAGE" = "$CANARY_IMAGE' in branch
+    assert 'RESTARTED_ONEOFF" != "True' in branch
+    assert "FAILED deploy" in branch
+
+
+def test_after_verification_recovery_bails_out_if_the_regular_worker_wont_stop() -> None:
+    recovery = _recovery_body()
+    branch = recovery[recovery.index('if [ "$REGULAR_WORKER_VERIFIED" -eq 1 ]') :]
+    bail = branch.index("Could not stop the regular worker")
+    assert "No status reset, no canary removal, no rollback" in branch[bail : bail + 300]
+
+
+def test_clean_canary_exit_short_circuits_the_after_verification_branch() -> None:
+    """A deploy that failed later, with the canary already retired cleanly,
+    must not stop the healthy regular worker for nothing.
+    """
+    recovery = _recovery_body()
+    branch = recovery[recovery.index('if [ "$REGULAR_WORKER_VERIFIED" -eq 1 ]') :]
+    assert '[ "$CANARY_DRAIN_UNCERTAIN" -eq 0 ] && [ -z "$CANARY_ID" ]' in branch
+    assert "Canary already retired cleanly" in branch
