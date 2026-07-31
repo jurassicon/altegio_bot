@@ -503,8 +503,11 @@ async def upsert_client(
             email=client_data.get("email"),
             raw=client_data,
         )
+        # The unique constraint is provider-scoped since PR-3. This INSERT does
+        # not name `provider`, so the column default supplies 'altegio' and the
+        # conflict target still resolves to the existing Altegio row.
         .on_conflict_do_update(
-            constraint="uq_clients_company_altegio_id",
+            constraint="uq_clients_provider_company_altegio_id",
             set_={
                 "phone_e164": phone,
                 "display_name": display_name,
@@ -576,8 +579,10 @@ async def upsert_record(
             last_change_at=last_change_at,
             raw=record_data,
         )
+        # Provider-scoped since PR-3; `provider` falls back to the 'altegio'
+        # column default, so this stays the same upsert it always was.
         .on_conflict_do_update(
-            constraint="uq_records_company_altegio_id",
+            constraint="uq_records_provider_company_altegio_id",
             set_={
                 "client_id": client_pk,
                 "altegio_client_id": client_data.get("id"),

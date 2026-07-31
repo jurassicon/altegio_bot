@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid
 from datetime import datetime
 from decimal import Decimal
 
@@ -20,7 +21,39 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import UUID as PostgresUUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+
+# ---------------------------------------------------------------------------
+# CRM provider scoping
+# ---------------------------------------------------------------------------
+# Rows from different CRMs live side by side in the same tables, so identity is
+# scoped by ``provider`` rather than by ``company_id`` alone: EasyWeek numeric
+# ids (location / booking / customer) share a namespace with Altegio ones and a
+# collision is realistic, not theoretical.
+#
+# Deliberately a plain bounded string with a server default rather than an enum
+# or a CHECK constraint: adding a third CRM later must be a code change, not a
+# migration against a restrictive type.
+PROVIDER_ALTEGIO = "altegio"
+PROVIDER_EASYWEEK = "easyweek"
+
+_PROVIDER_SERVER_DEFAULT = text(f"'{PROVIDER_ALTEGIO}'")
+
+
+def _provider_column() -> Mapped[str]:
+    """The identical ``provider`` column shared by every provider-scoped table.
+
+    Existing Altegio constructors must keep working untouched, so the value is
+    optional in Python (ORM default) and backfilled by the database for any
+    INSERT that does not name it (server default).
+    """
+    return mapped_column(
+        String(32),
+        nullable=False,
+        default=PROVIDER_ALTEGIO,
+        server_default=_PROVIDER_SERVER_DEFAULT,
+    )
 
 
 class Base(DeclarativeBase):
@@ -209,18 +242,19 @@ class SmartTestRun(Base):
 
 class Client(Base):
     """
-    Клиент в контексте филиала (company_id).
-    Уникальность: (company_id, altegio_client_id).
+    Клиент в контексте филиала (provider, company_id).
+    Уникальность: (provider, company_id, altegio_client_id).
     """
 
     __tablename__ = "clients"
     __table_args__ = (
         UniqueConstraint(
+            "provider",
             "company_id",
             "altegio_client_id",
-            name="uq_clients_company_altegio_id",
+            name="uq_clients_provider_company_altegio_id",
         ),
-        Index("ix_clients_company_phone", "company_id", "phone_e164"),
+        Index("ix_clients_provider_company_phone", "provider", "company_id", "phone_e164"),
         Index("ix_clients_wa_opted_out_at", "wa_opted_out", "wa_opted_out_at"),
     )
 
@@ -230,7 +264,10 @@ class Client(Base):
         autoincrement=True,
     )
 
+    provider: Mapped[str] = _provider_column()
     company_id: Mapped[int] = mapped_column(Integer, index=True)
+    # Historically named for Altegio; conceptually the external client id of
+    # whichever provider owns the row (EasyWeek supplies ``:customer_id``).
     altegio_client_id: Mapped[int] = mapped_column(BigInteger, index=True)
 
     phone_e164: Mapped[str | None] = mapped_column(
@@ -265,15 +302,27 @@ class Client(Base):
 class Record(Base):
     """
     Термин/запись в контексте филиала.
-    Уникальность: (company_id, altegio_record_id).
+    Уникальность: (provider, company_id, altegio_record_id).
     """
 
     __tablename__ = "records"
     __table_args__ = (
         UniqueConstraint(
+            "provider",
             "company_id",
             "altegio_record_id",
-            name="uq_records_company_altegio_id",
+            name="uq_records_provider_company_altegio_id",
+        ),
+        # EasyWeek's booking UUID is the authoritative identifier (§1.6.2), so it
+        # must be unique — but ONLY for EasyWeek rows. A partial index keeps the
+        # constraint off every Altegio row (all NULL there) and, because NULLs
+        # are distinct in a unique index, still allows many EasyWeek rows whose
+        # UUID has not been captured yet.
+        Index(
+            "uq_records_easyweek_booking_uuid",
+            "easyweek_booking_uuid",
+            unique=True,
+            postgresql_where=text("provider = 'easyweek' AND easyweek_booking_uuid IS NOT NULL"),
         ),
     )
 
@@ -283,8 +332,24 @@ class Record(Base):
         autoincrement=True,
     )
 
+    provider: Mapped[str] = _provider_column()
     company_id: Mapped[int] = mapped_column(Integer, index=True)
+    # Historically named for Altegio; conceptually the external record id
+    # (EasyWeek supplies the numeric ``:id``).
     altegio_record_id: Mapped[int] = mapped_column(BigInteger, index=True)
+
+    # EasyWeek identity (§1.6.2–3). Both stay NULL for Altegio rows.
+    #
+    # The UUID is the key for ``GET /bookings/{uuid}``. ``booking_hash_id`` is a
+    # bounded STRING, not a BigInteger: the value is the number from the manage
+    # link, and treating it as an integer would assume a purely numeric format
+    # and silently destroy leading zeros. Its only sanctioned use is proving the
+    # provenance of ``short_link`` — a link is never synthesised from it.
+    easyweek_booking_uuid: Mapped[uuid.UUID | None] = mapped_column(
+        PostgresUUID(as_uuid=True),
+        nullable=True,
+    )
+    easyweek_booking_hash_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     client_id: Mapped[int | None] = mapped_column(
         BigInteger,
@@ -377,11 +442,24 @@ class RecordService(Base):
 class MessageTemplate(Base):
     __tablename__ = "message_templates"
 
+    __table_args__ = (
+        # The lookup PR-5 will perform: provider first, so an EasyWeek template
+        # can never be reached through an Altegio-shaped query.
+        Index(
+            "ix_message_templates_provider_company_code_lang",
+            "provider",
+            "company_id",
+            "code",
+            "language",
+        ),
+    )
+
     id: Mapped[int] = mapped_column(
         BigInteger,
         primary_key=True,
         autoincrement=True,
     )
+    provider: Mapped[str] = _provider_column()
     company_id: Mapped[int] = mapped_column(Integer, index=True)
 
     # "record_created", "reminder_24h", ...
@@ -392,6 +470,12 @@ class MessageTemplate(Base):
 
     # Текст шаблона с плейсхолдерами {client_name}, {date}, ...
     body: Mapped[str] = mapped_column(Text)
+
+    # Имя утверждённого Meta-шаблона для этой строки. DB-first замена
+    # глобального хардкода META_TEMPLATE_MAP (§1.6.9): его нельзя расширять
+    # numeric company_id из другой CRM. Резолвом займётся PR-5; здесь только
+    # колонка.
+    meta_template_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
 
@@ -412,7 +496,8 @@ class MessageJob(Base):
     __table_args__ = (
         Index("ix_message_jobs_status_run_at", "status", "run_at"),
         Index(
-            "ix_message_jobs_company_type_status",
+            "ix_message_jobs_provider_company_type_status",
+            "provider",
             "company_id",
             "job_type",
             "status",
@@ -426,6 +511,7 @@ class MessageJob(Base):
         autoincrement=True,
     )
 
+    provider: Mapped[str] = _provider_column()
     company_id: Mapped[int] = mapped_column(Integer, index=True)
     record_id: Mapped[int | None] = mapped_column(
         BigInteger,
@@ -695,6 +781,7 @@ class WhatsAppSender(Base):
         primary_key=True,
         autoincrement=True,
     )
+    provider: Mapped[str] = _provider_column()
     company_id: Mapped[int] = mapped_column(Integer, index=True)
     sender_code: Mapped[str] = mapped_column(String(32), index=True)
 
@@ -705,9 +792,10 @@ class WhatsAppSender(Base):
 
     __table_args__ = (
         UniqueConstraint(
+            "provider",
             "company_id",
             "sender_code",
-            name="uq_whatsapp_senders_company_code",
+            name="uq_whatsapp_senders_provider_company_code",
         ),
     )
 
