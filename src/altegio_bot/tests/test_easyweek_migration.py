@@ -136,22 +136,28 @@ def test_provider_scope_follows_the_operator_relay_revision() -> None:
 def test_provider_column_is_added_to_exactly_the_canonical_five() -> None:
     module = _provider_scope_module()
     assert tuple(module._PROVIDER_TABLES) == _PROVIDER_TABLES
-    assert "ADD COLUMN IF NOT EXISTS provider VARCHAR(32) DEFAULT 'altegio'" in _upgrade_body()
+    body = _upgrade_body()
+    assert "op.add_column(" in body
+    assert 'sa.Column("provider", _PROVIDER_TYPE' in body
 
 
 def test_provider_column_is_backfilled_before_being_made_not_null() -> None:
     """Order matters: SET NOT NULL on unbackfilled rows would abort on prod."""
     body = _upgrade_body()
     backfill = body.index("UPDATE {table} SET provider = 'altegio' WHERE provider IS NULL")
-    not_null = body.index("ALTER COLUMN provider SET NOT NULL")
+    not_null = body.index("nullable=False")
     assert backfill < not_null
 
 
 def test_provider_column_keeps_its_database_default() -> None:
     """Existing Altegio INSERTs never name `provider`; the DB must fill it."""
+    source = _provider_scope_source()
     body = _upgrade_body()
-    assert "ALTER COLUMN provider SET DEFAULT 'altegio'" in body
-    assert "DROP DEFAULT" not in body
+    assert "_PROVIDER_DEFAULT = sa.text(\"'altegio'\")" in source
+    assert "server_default=_PROVIDER_DEFAULT" in body
+    # SET NOT NULL must not drop the default on the way.
+    assert "existing_server_default=_PROVIDER_DEFAULT" in body
+    assert "DROP DEFAULT" not in source
 
 
 def test_provider_column_is_not_a_restrictive_enum_or_check() -> None:
@@ -168,8 +174,8 @@ def test_unique_constraints_become_provider_scoped() -> None:
     assert swaps == set(_UNIQUE_SWAPS)
 
     body = _upgrade_body()
-    assert "DROP CONSTRAINT IF EXISTS {old_name}" in body, "old constraints are not dropped"
-    assert "_add_constraint_if_absent(table, new_name, columns)" in body
+    assert "op.create_unique_constraint(new_name, table, list(columns))" in body
+    assert 'op.drop_constraint(old_name, table, type_="unique")' in body
 
 
 def test_provider_scoped_constraint_columns_lead_with_provider() -> None:
@@ -197,35 +203,37 @@ def test_message_templates_gets_no_invented_unique_constraint() -> None:
 
 def test_easyweek_partial_unique_index_predicate() -> None:
     body = _upgrade_body()
-    assert "CREATE UNIQUE INDEX IF NOT EXISTS uq_records_easyweek_booking_uuid" in body
-    assert "provider = 'easyweek'" in body
-    assert "easyweek_booking_uuid IS NOT NULL" in body
+    source = _provider_scope_source()
+    assert '"uq_records_easyweek_booking_uuid"' in body
+    assert "unique=True" in body
+    assert "postgresql_where=_EASYWEEK_UUID_PREDICATE" in body
+    assert "provider = 'easyweek' AND easyweek_booking_uuid IS NOT NULL" in source
 
 
 def test_easyweek_identity_columns_are_added_with_safe_types() -> None:
     body = _upgrade_body()
-    assert "easyweek_booking_uuid UUID" in body
+    assert 'sa.Column("easyweek_booking_uuid", postgresql.UUID(as_uuid=True)' in body
     # A bounded string, never an integer: the hash may carry leading zeros.
-    assert "easyweek_booking_hash_id VARCHAR(64)" in body
+    assert 'sa.Column("easyweek_booking_hash_id", sa.String(length=64)' in body
     assert "easyweek_booking_hash_id BIGINT" not in body
+    assert "sa.BigInteger" not in body
 
 
 def test_meta_template_name_column_is_added() -> None:
-    assert "meta_template_name VARCHAR(128)" in _upgrade_body()
+    assert 'sa.Column("meta_template_name", sa.String(length=128)' in _upgrade_body()
 
 
 def test_downgrade_is_symmetric_and_non_destructive() -> None:
     down = _downgrade_body()
-    for table in _PROVIDER_TABLES:
-        assert "DROP COLUMN IF EXISTS provider" in down
-        assert table in _provider_scope_source()
-    assert "DROP COLUMN IF EXISTS easyweek_booking_uuid" in down
-    assert "DROP COLUMN IF EXISTS easyweek_booking_hash_id" in down
-    assert "DROP COLUMN IF EXISTS meta_template_name" in down
-    assert "DROP INDEX IF EXISTS uq_records_easyweek_booking_uuid" in down
+    assert 'op.drop_column(table, "provider")' in down
+    assert 'op.drop_column("records", "easyweek_booking_uuid")' in down
+    assert 'op.drop_column("records", "easyweek_booking_hash_id")' in down
+    assert 'op.drop_column("message_templates", "meta_template_name")' in down
+    assert 'op.drop_index("uq_records_easyweek_booking_uuid", table_name="records")' in down
     # Restores what it replaced ...
-    assert "ix_clients_company_phone ON clients (company_id, phone_e164)" in down
-    assert "ix_message_jobs_company_type_status" in down
+    assert '"ix_clients_company_phone", "clients", ["company_id", "phone_e164"]' in down
+    assert '"ix_message_jobs_company_type_status"' in down
+    assert "op.create_unique_constraint(old_name, table, legacy_columns)" in down
     # ... and never touches rows or tables.
     assert "DROP TABLE" not in down
     assert "DELETE FROM" not in down
@@ -238,9 +246,9 @@ def test_downgrade_fails_closed_on_cross_provider_duplicates() -> None:
     down = _downgrade_body()
     assert "_fail_closed_if_cross_provider_duplicates()" in down
     assert "raise RuntimeError" in source
-    # The guard runs before anything is dropped.
+    # The guard runs before anything is dropped, so a refusal changes nothing.
     guard = down.index("_fail_closed_if_cross_provider_duplicates()")
-    first_drop = down.index("DROP INDEX")
+    first_drop = down.index("op.drop_index(")
     assert guard < first_drop
 
 
@@ -316,3 +324,57 @@ def test_upsert_constraint_names_match_the_model_metadata() -> None:
         del table
         assert f'constraint="{new_name}"' in source
         assert f'constraint="{old_name}"' not in source
+
+
+# ---------------------------------------------------------------------------
+# Fail-closed DDL: no name-only existence checks on PR-3 objects
+# ---------------------------------------------------------------------------
+
+
+def test_name_only_existence_helper_is_gone() -> None:
+    """`_add_constraint_if_absent` compared names only.
+
+    It accepted a same-named constraint with different columns, order or type
+    and called drifted production schema "already correct". Removed on purpose.
+    """
+    source = _provider_scope_source()
+    assert "_add_constraint_if_absent" not in source
+
+
+def test_pr3_ddl_uses_plain_alembic_operations() -> None:
+    """Unexpected objects must abort the migration, not be tolerated."""
+    source = _provider_scope_source()
+    for guard in (
+        "ADD COLUMN IF NOT EXISTS",
+        "CREATE INDEX IF NOT EXISTS",
+        "CREATE UNIQUE INDEX IF NOT EXISTS",
+        "DROP CONSTRAINT IF EXISTS",
+        "DROP COLUMN IF EXISTS",
+        "DROP INDEX IF EXISTS",
+        "DO $$",
+    ):
+        assert guard not in source, f"PR-3 DDL still uses the tolerant {guard!r}"
+
+    body = _upgrade_body()
+    for operation in (
+        "op.add_column(",
+        "op.alter_column(",
+        "op.create_unique_constraint(",
+        "op.drop_constraint(",
+        "op.create_index(",
+        "op.drop_index(",
+    ):
+        assert operation in body, f"upgrade does not use {operation}"
+
+
+def test_downgrade_also_uses_plain_alembic_operations() -> None:
+    down = _downgrade_body()
+    for operation in ("op.drop_index(", "op.create_index(", "op.create_unique_constraint(", "op.drop_column("):
+        assert operation in down
+
+
+def test_offline_sql_does_not_pretend_the_duplicate_check_ran() -> None:
+    """`--sql` cannot read the database; the script must say so loudly."""
+    source = _provider_scope_source()
+    assert "as_sql" in source
+    assert "WARNING: NOT VERIFIED" in source

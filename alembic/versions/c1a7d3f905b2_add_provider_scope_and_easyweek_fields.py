@@ -37,6 +37,7 @@ Create Date: 2026-07-31 00:00:00.000000
 from typing import Sequence, Union
 
 import sqlalchemy as sa
+from sqlalchemy.dialects import postgresql
 
 from alembic import op
 
@@ -81,95 +82,94 @@ _UNIQUE_SWAPS = (
 )
 
 
-def _add_constraint_if_absent(table: str, name: str, columns: Sequence[str]) -> None:
-    """PostgreSQL has no ``ADD CONSTRAINT IF NOT EXISTS``; emulate it."""
-    column_list = ", ".join(columns)
-    op.execute(
-        sa.text(
-            f"""
-            DO $$
-            BEGIN
-                IF NOT EXISTS (
-                    SELECT 1 FROM pg_constraint WHERE conname = '{name}'
-                ) THEN
-                    ALTER TABLE {table} ADD CONSTRAINT {name} UNIQUE ({column_list});
-                END IF;
-            END $$;
-            """
-        )
-    )
+_PROVIDER_TYPE = sa.String(length=32)
+_PROVIDER_DEFAULT = sa.text("'altegio'")
+_EASYWEEK_UUID_PREDICATE = sa.text("provider = 'easyweek' AND easyweek_booking_uuid IS NOT NULL")
 
 
 def upgrade() -> None:
-    """Upgrade schema (additive; existing rows are preserved and backfilled)."""
-    # ---------------------------------------------------------------- 1. columns
-    # ADD COLUMN ... DEFAULT on PostgreSQL 11+ does not rewrite the table, so
-    # this stays cheap even on the large tables.
-    for table in _PROVIDER_TABLES:
-        op.execute(sa.text(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS provider VARCHAR(32) DEFAULT 'altegio'"))
+    """Upgrade schema (additive; existing rows are preserved and backfilled).
 
-    op.execute(sa.text("ALTER TABLE records ADD COLUMN IF NOT EXISTS easyweek_booking_uuid UUID"))
-    op.execute(sa.text("ALTER TABLE records ADD COLUMN IF NOT EXISTS easyweek_booking_hash_id VARCHAR(64)"))
-    op.execute(sa.text("ALTER TABLE message_templates ADD COLUMN IF NOT EXISTS meta_template_name VARCHAR(128)"))
+    Every statement is a plain Alembic operation, deliberately WITHOUT
+    ``IF NOT EXISTS`` / ``IF EXISTS``. A name-only existence check would accept
+    a same-named object with different columns, order, type or predicate and
+    call the drifted production schema "already correct". Failing instead is the
+    point: PostgreSQL runs this in one transaction, so an unexpected object
+    aborts the whole migration and leaves the previous schema intact.
+    """
+    # ---------------------------------------------------------------- 1. columns
+    # Added nullable first, with the server default. ADD COLUMN ... DEFAULT on
+    # PostgreSQL 11+ does not rewrite the table, so this stays cheap even on the
+    # large tables.
+    for table in _PROVIDER_TABLES:
+        op.add_column(
+            table,
+            sa.Column("provider", _PROVIDER_TYPE, nullable=True, server_default=_PROVIDER_DEFAULT),
+        )
+
+    op.add_column("records", sa.Column("easyweek_booking_uuid", postgresql.UUID(as_uuid=True), nullable=True))
+    op.add_column("records", sa.Column("easyweek_booking_hash_id", sa.String(length=64), nullable=True))
+    op.add_column("message_templates", sa.Column("meta_template_name", sa.String(length=128), nullable=True))
 
     # --------------------------------------------------------------- 2. backfill
-    # Explicit even though the DEFAULT already filled existing rows: an
-    # environment where the column was added without a default (or by a partial
-    # re-run) must still end up fully populated before SET NOT NULL.
+    # Explicit even though the DEFAULT already filled existing rows: this is the
+    # step the plan requires to be visible, and it must complete before the
+    # column can be made NOT NULL.
     for table in _PROVIDER_TABLES:
         op.execute(sa.text(f"UPDATE {table} SET provider = 'altegio' WHERE provider IS NULL"))
 
     # --------------------------------------------------------------- 3. NOT NULL
+    # `existing_server_default` keeps the default in place: application INSERTs
+    # that never name `provider` (the whole existing Altegio path) must go on
+    # landing as 'altegio'.
     for table in _PROVIDER_TABLES:
-        op.execute(sa.text(f"ALTER TABLE {table} ALTER COLUMN provider SET NOT NULL"))
+        op.alter_column(
+            table,
+            "provider",
+            existing_type=_PROVIDER_TYPE,
+            existing_server_default=_PROVIDER_DEFAULT,
+            nullable=False,
+        )
 
-    # ------------------------------------------- 4. keep the database default
-    # Never dropped: application INSERTs that do not name `provider` (the whole
-    # existing Altegio path) must keep landing as 'altegio'.
-    for table in _PROVIDER_TABLES:
-        op.execute(sa.text(f"ALTER TABLE {table} ALTER COLUMN provider SET DEFAULT 'altegio'"))
-
-    # ------------------------------------------------- 5. provider-scoped uniques
+    # ------------------------------------------------- 4. provider-scoped uniques
     for table, old_name, new_name, columns in _UNIQUE_SWAPS:
-        _add_constraint_if_absent(table, new_name, columns)
-        op.execute(sa.text(f"ALTER TABLE {table} DROP CONSTRAINT IF EXISTS {old_name}"))
+        op.create_unique_constraint(new_name, table, list(columns))
+        op.drop_constraint(old_name, table, type_="unique")
 
-    # ----------------------------------------------------- 6. scoped index rebuild
+    # ----------------------------------------------------- 5. scoped index rebuild
     # Narrow by design: only the composite company_id indexes whose lookup
     # becomes provider-scoped. Single-column indexes are left alone.
-    op.execute(sa.text("DROP INDEX IF EXISTS ix_clients_company_phone"))
-    op.execute(
-        sa.text(
-            "CREATE INDEX IF NOT EXISTS ix_clients_provider_company_phone ON clients (provider, company_id, phone_e164)"
-        )
+    op.drop_index("ix_clients_company_phone", table_name="clients")
+    op.create_index(
+        "ix_clients_provider_company_phone",
+        "clients",
+        ["provider", "company_id", "phone_e164"],
     )
 
-    op.execute(sa.text("DROP INDEX IF EXISTS ix_message_jobs_company_type_status"))
-    op.execute(
-        sa.text(
-            "CREATE INDEX IF NOT EXISTS ix_message_jobs_provider_company_type_status "
-            "ON message_jobs (provider, company_id, job_type, status)"
-        )
+    op.drop_index("ix_message_jobs_company_type_status", table_name="message_jobs")
+    op.create_index(
+        "ix_message_jobs_provider_company_type_status",
+        "message_jobs",
+        ["provider", "company_id", "job_type", "status"],
     )
 
     # New: message_templates had no composite index at all, and PR-5 resolves a
     # template by (provider, company, code, language).
-    op.execute(
-        sa.text(
-            "CREATE INDEX IF NOT EXISTS ix_message_templates_provider_company_code_lang "
-            "ON message_templates (provider, company_id, code, language)"
-        )
+    op.create_index(
+        "ix_message_templates_provider_company_code_lang",
+        "message_templates",
+        ["provider", "company_id", "code", "language"],
     )
 
-    # --------------------------------------- 7. EasyWeek booking UUID uniqueness
+    # --------------------------------------- 6. EasyWeek booking UUID uniqueness
     # Partial: Altegio rows (all NULL) are unconstrained, and several EasyWeek
     # rows may still have no captured UUID because NULLs are distinct here.
-    op.execute(
-        sa.text(
-            "CREATE UNIQUE INDEX IF NOT EXISTS uq_records_easyweek_booking_uuid "
-            "ON records (easyweek_booking_uuid) "
-            "WHERE provider = 'easyweek' AND easyweek_booking_uuid IS NOT NULL"
-        )
+    op.create_index(
+        "uq_records_easyweek_booking_uuid",
+        "records",
+        ["easyweek_booking_uuid"],
+        unique=True,
+        postgresql_where=_EASYWEEK_UUID_PREDICATE,
     )
 
 
@@ -183,12 +183,14 @@ def _fail_closed_if_cross_provider_duplicates() -> None:
     operator needs.
     """
     if op.get_context().as_sql:
-        # Offline (--sql) generation has no database to inspect. Say so instead
-        # of pretending the check passed.
+        # Offline (--sql) generation has no database to inspect, so the guard
+        # CANNOT run. Say that loudly in the generated script rather than
+        # emitting statements that look like a verified downgrade.
         op.execute(
             sa.text(
-                "-- SKIPPED cross-provider duplicate check: offline SQL generation "
-                "cannot read the target database. Verify manually before applying."
+                "-- WARNING: NOT VERIFIED. The cross-provider duplicate check was NOT executed: "
+                "offline SQL generation cannot read the target database. Running this script "
+                "without checking first may fail on the restored unique constraints."
             )
         )
         return
@@ -214,33 +216,36 @@ def _fail_closed_if_cross_provider_duplicates() -> None:
 
 
 def downgrade() -> None:
-    """Downgrade schema (drops only what this revision added; deletes no rows)."""
+    """Downgrade schema (drops only what this revision added; deletes no rows).
+
+    Plain Alembic operations here too: rolling back an object that is not the
+    one this revision created must fail rather than be silently tolerated.
+    """
     # Checked BEFORE anything is dropped, so a refusal leaves the schema intact.
     _fail_closed_if_cross_provider_duplicates()
 
-    op.execute(sa.text("DROP INDEX IF EXISTS uq_records_easyweek_booking_uuid"))
+    op.drop_index("uq_records_easyweek_booking_uuid", table_name="records")
 
-    op.execute(sa.text("DROP INDEX IF EXISTS ix_message_templates_provider_company_code_lang"))
+    op.drop_index("ix_message_templates_provider_company_code_lang", table_name="message_templates")
 
-    op.execute(sa.text("DROP INDEX IF EXISTS ix_message_jobs_provider_company_type_status"))
-    op.execute(
-        sa.text(
-            "CREATE INDEX IF NOT EXISTS ix_message_jobs_company_type_status "
-            "ON message_jobs (company_id, job_type, status)"
-        )
+    op.drop_index("ix_message_jobs_provider_company_type_status", table_name="message_jobs")
+    op.create_index(
+        "ix_message_jobs_company_type_status",
+        "message_jobs",
+        ["company_id", "job_type", "status"],
     )
 
-    op.execute(sa.text("DROP INDEX IF EXISTS ix_clients_provider_company_phone"))
-    op.execute(sa.text("CREATE INDEX IF NOT EXISTS ix_clients_company_phone ON clients (company_id, phone_e164)"))
+    op.drop_index("ix_clients_provider_company_phone", table_name="clients")
+    op.create_index("ix_clients_company_phone", "clients", ["company_id", "phone_e164"])
 
     for table, old_name, new_name, columns in _UNIQUE_SWAPS:
         legacy_columns = [column for column in columns if column != "provider"]
-        _add_constraint_if_absent(table, old_name, legacy_columns)
-        op.execute(sa.text(f"ALTER TABLE {table} DROP CONSTRAINT IF EXISTS {new_name}"))
+        op.create_unique_constraint(old_name, table, legacy_columns)
+        op.drop_constraint(new_name, table, type_="unique")
 
-    op.execute(sa.text("ALTER TABLE message_templates DROP COLUMN IF EXISTS meta_template_name"))
-    op.execute(sa.text("ALTER TABLE records DROP COLUMN IF EXISTS easyweek_booking_hash_id"))
-    op.execute(sa.text("ALTER TABLE records DROP COLUMN IF EXISTS easyweek_booking_uuid"))
+    op.drop_column("message_templates", "meta_template_name")
+    op.drop_column("records", "easyweek_booking_hash_id")
+    op.drop_column("records", "easyweek_booking_uuid")
 
     for table in _PROVIDER_TABLES:
-        op.execute(sa.text(f"ALTER TABLE {table} DROP COLUMN IF EXISTS provider"))
+        op.drop_column(table, "provider")

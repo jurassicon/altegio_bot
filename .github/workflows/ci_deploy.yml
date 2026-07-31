@@ -232,6 +232,124 @@ jobs:
             }
             echo "✅ Deployed exact commit: $DEPLOYED_SHA"
 
+            # ── PR-3 deploy phases ────────────────────────────────────────────
+            # The migration swaps the unique constraints that the RUNNING inbox
+            # worker of the PREVIOUS release pins by name in
+            # `ON CONFLICT ON CONSTRAINT`. If it keeps working across the swap,
+            # any event it processes in that window hits a missing constraint and
+            # is stored as `failed` — and nothing retries a failed event. So the
+            # old worker is drained BEFORE the migration and a new-image worker is
+            # proven AFTER it, while altegio-api keeps accepting webhooks the
+            # whole time (they simply pile up as `received`).
+            #
+            # These flags let the trap below know exactly how far the deploy got.
+            # The trap is installed before anything is stopped, so every failure
+            # path from here on has a defined recovery.
+            OLD_WORKER_STOPPED=0
+            MIGRATION_APPLIED=0
+            NEW_WORKER_VERIFIED=0
+            REVISION_BEFORE=""
+            PR3_REVISION="c1a7d3f905b2"
+            PRE_PR3_REVISION="9a1f4c7b2e3d"
+            CANARY="altegio-inbox-worker-pr3-canary"
+
+            # Reads one scalar over stdin so no SQL quoting has to survive the
+            # ssh -> sh -> psql nesting. Credentials stay inside the container.
+            psql_scalar() {
+              printf '%s\n' "$1" \
+                | $COMPOSE exec -T postgres sh -lc 'psql -tAX -U "$POSTGRES_USER" -d "$POSTGRES_DB" -v ON_ERROR_STOP=1' \
+                | tr -d '[:space:]'
+            }
+
+            alembic_revision() {
+              $COMPOSE --profile ops run --rm --no-deps migrate alembic current 2>/dev/null \
+                | tr -d '\r' | grep -oE '[0-9a-f]{12}' | head -n 1
+            }
+
+            inbox_worker_container() {
+              docker ps \
+                --filter "label=com.docker.compose.project=altegio_bot" \
+                --filter "label=com.docker.compose.service=altegio-inbox-worker" \
+                --filter "status=running" \
+                --format "{{.Names}}" \
+                | head -n 1
+            }
+
+            remove_canary_if_present() {
+              if docker ps -a --format '{{.Names}}' | grep -Fxq "$CANARY"; then
+                docker rm -f "$CANARY" >/dev/null
+              fi
+            }
+
+            recover() {
+              RECOVER_STATUS=$1
+              set +e
+              if [ "$RECOVER_STATUS" -eq 0 ]; then
+                return 0
+              fi
+
+              echo "❌ Deploy failed (exit $RECOVER_STATUS). Entering recovery..."
+
+              if [ "$NEW_WORKER_VERIFIED" -eq 1 ]; then
+                # A new-image worker was already proven to run against the new
+                # schema. Rolling the schema back now would break the thing that
+                # works; whole-application rollback is out of PR-3 scope.
+                echo "ℹ️ A new-image inbox worker was already verified on the new schema."
+                echo "ℹ️ NOT rolling back the schema automatically."
+                echo "❗ Manual investigation required for the failing step."
+                exit "$RECOVER_STATUS"
+              fi
+
+              if [ "$OLD_WORKER_STOPPED" -eq 0 ]; then
+                echo "ℹ️ The old inbox worker was never stopped; nothing to recover."
+                exit "$RECOVER_STATUS"
+              fi
+
+              # The old container was only STOPPED, never recreated, so it is
+              # still here and still carries the previous image.
+              CURRENT_REVISION="$(alembic_revision)"
+              echo "ℹ️ Alembic revision is now: ${CURRENT_REVISION:-unknown}"
+
+              if [ "$MIGRATION_APPLIED" -eq 1 ] || [ "$CURRENT_REVISION" = "$PR3_REVISION" ]; then
+                echo "🧹 Removing the canary before rolling the schema back..."
+                remove_canary_if_present
+                echo "⏪ Downgrading to exactly $PRE_PR3_REVISION..."
+                if ! $COMPOSE --profile ops run --rm --no-deps migrate alembic downgrade "$PRE_PR3_REVISION"; then
+                  echo "❌ Downgrade failed."
+                  echo "❗ NOT starting the old worker against an unknown schema. Manual intervention required."
+                  exit "$RECOVER_STATUS"
+                fi
+                CURRENT_REVISION="$(alembic_revision)"
+                if [ "$CURRENT_REVISION" != "$PRE_PR3_REVISION" ]; then
+                  echo "❌ Revision after downgrade is '${CURRENT_REVISION:-unknown}', expected $PRE_PR3_REVISION."
+                  echo "❗ NOT starting the old worker. Manual intervention required."
+                  exit "$RECOVER_STATUS"
+                fi
+                echo "✅ Schema is back on $PRE_PR3_REVISION."
+              elif [ "$CURRENT_REVISION" != "$REVISION_BEFORE" ]; then
+                echo "❌ Revision is '${CURRENT_REVISION:-unknown}', expected the pre-deploy '${REVISION_BEFORE:-unknown}'."
+                echo "❗ Schema state is unexpected. NOT starting the old worker. Manual intervention required."
+                exit "$RECOVER_STATUS"
+              else
+                echo "✅ Migration never applied; schema is still on ${CURRENT_REVISION:-unknown}."
+              fi
+
+              echo "▶️ Restarting the preserved old inbox worker..."
+              if $COMPOSE start altegio-inbox-worker; then
+                sleep 5
+                RECOVERED_WORKER="$(inbox_worker_container)"
+                if [ -n "$RECOVERED_WORKER" ]; then
+                  echo "✅ Old inbox worker is running again ($RECOVERED_WORKER)."
+                else
+                  echo "❌ Old inbox worker did not come back up. Manual intervention required."
+                fi
+              else
+                echo "❌ Could not start the old inbox worker. Manual intervention required."
+              fi
+              exit "$RECOVER_STATUS"
+            }
+            trap 'recover $?' EXIT
+
             echo "🔨 Building new images (without starting containers)..."
             $COMPOSE build
 
@@ -299,8 +417,100 @@ jobs:
               -name 'altegio_before_deploy_*.dump' \
               | wc -l
 
+            # ── Record the pre-deploy revision ────────────────────────────────
+            REVISION_BEFORE="$(alembic_revision)"
+            echo "📌 Alembic revision before migration: ${REVISION_BEFORE:-none}"
+
+            # ── Gracefully drain the OLD inbox worker ─────────────────────────
+            # `stop`, deliberately NOT `down` or `up --force-recreate`: the old
+            # container has to survive so recovery can start it again on the old
+            # schema. SIGTERM makes the worker stop claiming new batches and
+            # finish the one it already moved `received -> processing`.
+            # altegio-api is NOT stopped: webhooks keep arriving and wait as
+            # `received` until the new worker picks them up.
+            echo "🛑 Gracefully stopping the old altegio-inbox-worker (up to 300s to drain)..."
+            $COMPOSE stop -t 300 altegio-inbox-worker
+            OLD_WORKER_STOPPED=1
+
+            if [ -n "$(inbox_worker_container)" ]; then
+              echo "❌ altegio-inbox-worker is still running after the graceful stop."
+              exit 1
+            fi
+            echo "✅ Old inbox worker stopped; altegio-api still accepting webhooks."
+
+            # ── Drain verification ────────────────────────────────────────────
+            PROCESSING_COUNT="$(psql_scalar "SELECT count(*) FROM altegio_events WHERE status = 'processing';")"
+            echo "🔎 Altegio events still in processing: ${PROCESSING_COUNT:-unknown}"
+            if [ "$PROCESSING_COUNT" != "0" ]; then
+              echo "❌ Drain incomplete: events remain in processing."
+              echo "❗ Migration NOT applied. Statuses are NOT reset automatically — investigate first."
+              exit 1
+            fi
+            echo "✅ No Altegio event left in processing."
+
+            # ── Migration ─────────────────────────────────────────────────────
             echo "⚙️ Applying DB Migrations..."
             $COMPOSE --profile ops run --rm --no-deps migrate
+            MIGRATION_APPLIED=1
+
+            REVISION_AFTER="$(alembic_revision)"
+            echo "📌 Alembic revision after migration: ${REVISION_AFTER:-unknown}"
+            if [ "$REVISION_AFTER" != "$PR3_REVISION" ]; then
+              echo "❌ Expected revision $PR3_REVISION after migration, got '${REVISION_AFTER:-unknown}'."
+              exit 1
+            fi
+
+            # ── Canary: prove a NEW-image worker before touching the old one ──
+            # A one-off container from the new image, using the same service
+            # definition (env, networks) so it is a faithful rehearsal. The old
+            # container stays intact behind it, which is what makes the recovery
+            # path above actually work.
+            echo "🐤 Starting the new-image inbox worker canary..."
+            remove_canary_if_present
+            $COMPOSE run -d --no-deps --name "$CANARY" altegio-inbox-worker
+
+            echo "⏳ Observing the canary..."
+            sleep 30
+
+            CANARY_STATE="$(docker inspect -f '{{.State.Status}}' "$CANARY")"
+            CANARY_RESTARTS="$(docker inspect -f '{{.RestartCount}}' "$CANARY")"
+            if [ "$CANARY_STATE" != "running" ]; then
+              echo "❌ Canary state is '$CANARY_STATE', expected running."
+              exit 1
+            fi
+            if [ "$CANARY_RESTARTS" != "0" ]; then
+              echo "❌ Canary restarted $CANARY_RESTARTS time(s) — crash loop."
+              exit 1
+            fi
+
+            # Safe metadata only: a count of constraint-shaped failures. Event
+            # payloads, customer data and full error text are never printed.
+            CONSTRAINT_FAILURES="$(psql_scalar "SELECT count(*) FROM altegio_events WHERE status = 'failed' AND processed_at >= now() - interval '30 minutes' AND (error LIKE '%uq_clients_company_altegio_id%' OR error LIKE '%uq_records_company_altegio_id%' OR error LIKE '%uq_clients_provider_company_altegio_id%' OR error LIKE '%uq_records_provider_company_altegio_id%' OR error LIKE '%does not exist%');")"
+            if [ "$CONSTRAINT_FAILURES" != "0" ]; then
+              echo "❌ Constraint-related event failures detected during this deploy."
+              echo "❗ Event payloads and error text are deliberately not printed."
+              exit 1
+            fi
+
+            NEW_WORKER_VERIFIED=1
+            echo "✅ Canary healthy on the new schema; no constraint-related failures."
+
+            # ── Regular new worker, then retire the canary ────────────────────
+            echo "🚀 Recreating the regular altegio-inbox-worker from the new image..."
+            $COMPOSE up -d --force-recreate altegio-inbox-worker
+            sleep 10
+            NEW_WORKER="$(inbox_worker_container)"
+            if [ -z "$NEW_WORKER" ]; then
+              echo "❌ The new altegio-inbox-worker is not running."
+              echo "❗ The canary is left running so events keep being processed."
+              exit 1
+            fi
+            echo "✅ New inbox worker running ($NEW_WORKER)."
+
+            echo "🧹 Gracefully retiring the canary..."
+            docker stop -t 300 "$CANARY" >/dev/null
+            docker rm "$CANARY" >/dev/null
+            echo "✅ Canary removed."
 
             echo "🚀 Starting updated containers..."
             $COMPOSE up -d --remove-orphans

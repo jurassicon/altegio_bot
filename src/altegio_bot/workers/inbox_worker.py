@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import re
+import signal
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Sequence
@@ -859,10 +860,42 @@ def _resolve_poll_sec(
     return settings_value if explicit is None else explicit
 
 
+async def _sleep_unless_stopping(delay: float, stop_event: asyncio.Event | None) -> None:
+    """Idle for *delay*, but wake immediately once shutdown is requested.
+
+    A plain ``asyncio.sleep`` would hold the process for a whole polling
+    interval after SIGTERM, which is pure dead time during a deploy window.
+    """
+    if stop_event is None:
+        await asyncio.sleep(delay)
+        return
+    try:
+        await asyncio.wait_for(stop_event.wait(), timeout=delay)
+    except asyncio.TimeoutError:
+        pass
+
+
 async def run_loop(
     batch_size: int = 50,
     poll_sec: float | None = None,
+    stop_event: asyncio.Event | None = None,
 ) -> None:
+    """Claim batches of received events and process them until asked to stop.
+
+    Shutdown contract (relied on by the deploy that swaps the provider-scoped
+    unique constraints):
+
+      * the stop flag is only ever checked BEFORE claiming a new batch, so a
+        batch this process already moved ``received -> processing`` is always
+        finished — it is never abandoned mid-flight;
+      * claimed events are not blindly pushed back to ``received`` and never
+        marked ``failed`` just because a signal arrived;
+      * the idle wait ends as soon as the flag is set instead of burning the
+        remaining polling interval.
+
+    That is what lets the deploy drain this worker to a state where no Altegio
+    event is left in ``processing`` before the migration runs.
+    """
     effective_poll_sec = _resolve_poll_sec(poll_sec, settings.inbox_worker_poll_sec)
     logger.info(
         "Inbox worker started. batch_size=%s poll=%ss",
@@ -871,6 +904,12 @@ async def run_loop(
     )
 
     while True:
+        # Checked here and only here: past this point the batch is ours and has
+        # to be drained.
+        if stop_event is not None and stop_event.is_set():
+            logger.info("Inbox worker shutdown requested; not claiming a new batch.")
+            break
+
         event_ids: list[int] = []
 
         async with SessionLocal() as session:
@@ -879,11 +918,44 @@ async def run_loop(
                 event_ids = [e.id for e in events]
 
         if not event_ids:
-            await asyncio.sleep(effective_poll_sec)
+            await _sleep_unless_stopping(effective_poll_sec, stop_event)
             continue
 
+        # Deliberately NOT interruptible: every id in this list is already
+        # `processing` in the database, so bailing out early would strand rows
+        # that no other worker will pick up.
         for eid in event_ids:
             await process_one_event(eid)
+
+        if stop_event is not None and stop_event.is_set():
+            logger.info("Inbox worker drained %s claimed event(s); exiting.", len(event_ids))
+
+    logger.info("Inbox worker stopped cleanly.")
+
+
+def _install_stop_handlers(stop_event: asyncio.Event) -> None:
+    """Route SIGTERM/SIGINT into *stop_event* instead of killing the process.
+
+    ``docker compose stop`` sends SIGTERM; the default handler would abort the
+    loop wherever it happened to be, leaving the claimed batch in ``processing``.
+    Platforms without ``add_signal_handler`` (or a non-main thread) simply keep
+    the default behaviour.
+    """
+    loop = asyncio.get_running_loop()
+    for signal_name in ("SIGTERM", "SIGINT"):
+        sig = getattr(signal, signal_name, None)
+        if sig is None:
+            continue
+        try:
+            loop.add_signal_handler(sig, stop_event.set)
+        except (NotImplementedError, RuntimeError, ValueError):  # pragma: no cover - platform dependent
+            logger.warning("Cannot install %s handler; graceful drain unavailable.", signal_name)
+
+
+async def _run_with_graceful_shutdown() -> None:
+    stop_event = asyncio.Event()
+    _install_stop_handlers(stop_event)
+    await run_loop(stop_event=stop_event)
 
 
 def main() -> None:
@@ -891,7 +963,7 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    asyncio.run(run_loop())
+    asyncio.run(_run_with_graceful_shutdown())
 
 
 if __name__ == "__main__":

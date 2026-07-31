@@ -240,12 +240,23 @@ async def test_migration_compatibility_scenarios(temp_db_url) -> None:
     # ------------------------------------------- 3. columns already present
     # Simulates an environment that applied the EDITED base revision, which had
     # both columns in its CREATE TABLE: ADD COLUMN IF NOT EXISTS must be a no-op.
+    #
+    # The replay stops at the compatibility revision, which is the ONLY thing
+    # this scenario is about. Going all the way to head would also replay PR-3
+    # against a schema that already carries its objects, and PR-3's DDL is
+    # deliberately fail-closed — it must refuse that, and does (see
+    # test_upgrade_fails_closed_on_unexpected_schema_objects).
     _alembic_ok("stamp", _BASE_REVISION, db_url=temp_db_url)
     assert set(await _raw_body_columns(temp_db_url)) == {"body_raw", "body_size_bytes"}
 
-    _alembic_ok("upgrade", "head", db_url=temp_db_url)
+    _alembic_ok("upgrade", _OPERATOR_RELAY_PARENT, db_url=temp_db_url)
 
     assert set(await _raw_body_columns(temp_db_url)) == {"body_raw", "body_size_bytes"}
+    assert _OPERATOR_RELAY_PARENT in _alembic_ok("current", db_url=temp_db_url)
+
+    # The physical schema is still the full head schema from step 1, so bring
+    # the version table back in line with it.
+    _alembic_ok("stamp", "head", db_url=temp_db_url)
     assert _HEAD_REVISION in _alembic_ok("current", db_url=temp_db_url)
 
 
@@ -650,3 +661,66 @@ async def test_provider_scope_migration_scenarios(temp_db_url) -> None:
         assert "outbox_messages" in report or "promo_leads" in report, (
             f"unexpected model/schema drift after the PR-3 upgrade:\n{report}"
         )
+
+
+@pytest.mark.asyncio
+async def test_upgrade_fails_closed_on_unexpected_schema_objects(temp_db_url) -> None:
+    """A same-named object that is NOT what PR-3 builds must abort the upgrade.
+
+    The migration deliberately dropped its ``IF NOT EXISTS`` guards and its
+    name-only ``_add_constraint_if_absent`` helper. Those would have accepted a
+    drifted production object — a constraint over the wrong columns, an index
+    with the wrong predicate — and silently declared the schema correct. Here
+    the drift is planted on purpose and the upgrade has to refuse it, leaving
+    the previous schema and every row untouched.
+    """
+    _alembic_ok("upgrade", _PRE_PROVIDER_SCOPE_REVISION, db_url=temp_db_url)
+    for statement in _SEED_SQL:
+        await _exec(temp_db_url, statement)
+    before = await _counts(temp_db_url)
+
+    async def assert_untouched(case: str) -> None:
+        """Nothing may have changed: revision, old constraints, or rows."""
+        current = _alembic_ok("current", db_url=temp_db_url)
+        assert _HEAD_REVISION not in current, f"{case}: revision advanced despite the failure"
+        assert _PRE_PROVIDER_SCOPE_REVISION in current, f"{case}: unexpected revision"
+        # The pre-PR-3 constraints survive the rolled-back transaction.
+        assert "uq_clients_company_altegio_id" in await _constraint_names(temp_db_url, "clients")
+        assert "uq_records_company_altegio_id" in await _constraint_names(temp_db_url, "records")
+        # And the provider column was never committed.
+        assert await _column(temp_db_url, "clients", "provider") is None, f"{case}: provider column leaked"
+        assert await _counts(temp_db_url) == before, f"{case}: rows changed"
+
+    # ── A. a constraint with the right NAME but the wrong columns ────────────
+    await _exec(
+        temp_db_url,
+        "ALTER TABLE clients ADD CONSTRAINT uq_clients_provider_company_altegio_id UNIQUE (company_id)",
+    )
+    failed = _run_alembic("upgrade", "head", db_url=temp_db_url)
+    assert failed.returncode != 0, "upgrade accepted a same-named constraint over the wrong columns"
+    await assert_untouched("wrong-column constraint")
+    await _exec(temp_db_url, "ALTER TABLE clients DROP CONSTRAINT uq_clients_provider_company_altegio_id")
+
+    # ── B. an index with the right NAME but the wrong definition ─────────────
+    await _exec(
+        temp_db_url,
+        "CREATE UNIQUE INDEX uq_records_easyweek_booking_uuid ON records (altegio_record_id)",
+    )
+    failed = _run_alembic("upgrade", "head", db_url=temp_db_url)
+    assert failed.returncode != 0, "upgrade accepted a same-named index with the wrong definition"
+    await assert_untouched("wrong-predicate index")
+    await _exec(temp_db_url, "DROP INDEX uq_records_easyweek_booking_uuid")
+
+    # ── C. with the drift removed, the same upgrade succeeds ─────────────────
+    _alembic_ok("upgrade", "head", db_url=temp_db_url)
+    assert _HEAD_REVISION in _alembic_ok("current", db_url=temp_db_url)
+    assert await _counts(temp_db_url) == before
+    for table in _PROVIDER_TABLES:
+        assert await _providers(temp_db_url, table) == ["altegio"], table
+    assert "uq_clients_provider_company_altegio_id" in await _constraint_names(temp_db_url, "clients")
+    assert "uq_clients_company_altegio_id" not in await _constraint_names(temp_db_url, "clients")
+
+    # ── D. and the normal round trip still works afterwards ──────────────────
+    _alembic_ok("downgrade", _PRE_PROVIDER_SCOPE_REVISION, db_url=temp_db_url)
+    _alembic_ok("upgrade", "head", db_url=temp_db_url)
+    assert await _counts(temp_db_url) == before
