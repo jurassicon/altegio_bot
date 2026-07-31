@@ -66,6 +66,13 @@ _LOCATION_2: dict[str, Any] = {
     "name": "Zweite Filiale",
     "timezone": "Europe/Berlin",
 }
+# The shape the live API actually returns: timezone is an OBJECT, not a string.
+# Confirmed by a read-only production probe against GET /locations.
+_LOCATION_TZ_OBJECT: dict[str, Any] = {
+    "uuid": VALID_UUID,
+    "name": "Durlach",
+    "timezone": {"name": "Europe/Berlin", "offset": "+02:00", "short": "CEST"},
+}
 
 _BOOKING_WITH_PII: dict[str, Any] = {
     "uuid": BOOKING_UUID,
@@ -1072,3 +1079,144 @@ async def test_uppercase_location_uuid_is_accepted_as_is() -> None:
         items = await client.list_locations()
 
     assert items[0]["uuid"] == VALID_UUID.upper()
+
+
+# ===========================================================================
+# Timezone: the live object shape and the documented string shape
+# ===========================================================================
+
+
+@pytest.mark.parametrize(
+    "timezone",
+    [
+        "Europe/Berlin",  # documented / legacy string
+        {"name": "Europe/Berlin"},  # live object, name only
+        {"name": "Europe/Berlin", "offset": "+02:00", "short": "CEST"},  # full live object
+        {"name": "Europe/Berlin", "offset": None, "short": None},  # optionals nulled
+        {"name": "Europe/Berlin", "offset": "+02:00", "brand_new": {"x": 1}},  # upstream growth
+    ],
+    ids=["string", "object-name-only", "object-full", "object-null-optionals", "object-extra-field"],
+)
+@pytest.mark.asyncio
+async def test_usable_timezone_shapes_are_accepted(timezone: Any) -> None:
+    """Only ``timezone.name`` is required; offset/short are presentation detail.
+
+    Requiring them would turn a cosmetic upstream change into an outage.
+    """
+    location = {**_LOCATION, "timezone": timezone}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[location])
+
+    async with _client(handler) as client:
+        assert await client.list_locations() == [location]
+
+
+@pytest.mark.asyncio
+async def test_object_timezone_is_returned_verbatim_and_not_normalised() -> None:
+    """The transport layer must not collapse the object to a string.
+
+    Rewriting it here would be domain normalization (PR-4) and would hide the
+    real API shape from every later consumer. Display-time projection belongs to
+    the operator probe.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[_LOCATION_TZ_OBJECT])
+
+    async with _client(handler) as client:
+        items = await client.list_locations()
+
+    assert items[0]["timezone"] == {"name": "Europe/Berlin", "offset": "+02:00", "short": "CEST"}
+    # And the module-level fixture was not mutated in place.
+    assert _LOCATION_TZ_OBJECT["timezone"]["name"] == "Europe/Berlin"
+
+
+@pytest.mark.asyncio
+async def test_live_envelope_with_links_and_meta_returns_only_data() -> None:
+    """The real response carries ``links``/``meta``; PR-2 ignores both."""
+    body = {"data": [_LOCATION_TZ_OBJECT], "links": {"next": None}, "meta": {"total": 1}}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=body)
+
+    async with _client(handler) as client:
+        items = await client.list_locations()
+
+    assert items == [_LOCATION_TZ_OBJECT]
+
+
+_UNUSABLE_TIMEZONES: list[Any] = [
+    None,
+    "",
+    "   ",
+    {},
+    {"name": None},
+    {"name": ""},
+    {"name": "   "},
+    {"name": 123},
+    {"name": {"name": "Europe/Berlin"}},
+    {"offset": "+02:00", "short": "CEST"},  # object without a name at all
+    [],
+    ["Europe/Berlin"],
+    123,
+    True,
+]
+
+
+@pytest.mark.parametrize("timezone", _UNUSABLE_TIMEZONES)
+@pytest.mark.asyncio
+async def test_unusable_timezone_is_protocol_error(timezone: Any) -> None:
+    """Fail closed: an unidentifiable branch must not reach the operator."""
+    location = {**_LOCATION, "timezone": timezone}
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(200, json=[location])
+
+    sleeps = _Sleeps()
+    async with _client(handler, sleep=sleeps) as client:
+        with pytest.raises(EasyWeekProtocolError) as exc_info:
+            await client.list_locations()
+
+    assert exc_info.value.operation == "list_locations"
+    assert calls["n"] == 1  # a malformed 2xx is never retried
+    assert sleeps.delays == []
+    # A fixed literal message: the offending value is never interpolated.
+    assert str(exc_info.value).startswith("location entry has no usable timezone")
+
+
+@pytest.mark.asyncio
+async def test_malformed_timezone_value_never_reaches_logs_or_exception(caplog) -> None:
+    """A bad timezone name must not be echoed into the error or the logs."""
+    marker = "SENTINEL_BADTZ_qqq777"
+    location = {**_LOCATION, "timezone": {"name": "", "short": marker, "offset": marker}}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[location])
+
+    with caplog.at_level(logging.DEBUG):
+        async with _client(handler) as client:
+            with pytest.raises(EasyWeekProtocolError) as exc_info:
+                await client.list_locations()
+
+    blob = "\n".join(r.getMessage() for r in caplog.records)
+    assert marker not in blob
+    assert marker not in str(exc_info.value)
+    assert marker not in repr(exc_info.value.safe_summary)
+
+
+@pytest.mark.asyncio
+async def test_one_bad_timezone_fails_the_whole_list() -> None:
+    """No partial list: the operator must not choose from filtered results."""
+    body = {"data": [_LOCATION_TZ_OBJECT, {**_LOCATION_2, "timezone": {"offset": "+02:00"}}]}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=body)
+
+    async with _client(handler) as client:
+        with pytest.raises(EasyWeekProtocolError) as exc_info:
+            await client.list_locations()
+
+    assert exc_info.value.operation == "list_locations"
