@@ -50,6 +50,13 @@ services:
     build: .
     restart: always
     env_file: .env
+    # SIGTERM asks the worker to stop claiming new batches and to finish the one
+    # it already moved `received -> processing`. The deploy drains this worker
+    # before swapping the provider-scoped unique constraints, so Docker must
+    # wait for that drain instead of killing it and stranding rows in
+    # `processing`. Generous on purpose: a full batch of slow events is rare but
+    # must not be truncated.
+    stop_grace_period: 5m
     depends_on:
       postgres:
         condition: service_healthy

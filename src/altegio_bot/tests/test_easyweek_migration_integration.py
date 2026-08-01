@@ -25,6 +25,7 @@ nor ``PGOPTIONS``, so ``search_path`` cannot be injected into the migration run.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 import uuid
@@ -39,7 +40,21 @@ from altegio_bot.settings import Settings
 
 _ROOT = Path(__file__).resolve().parents[3]
 _BASE_REVISION = "8923be993170"
-_HEAD_REVISION = "9a1f4c7b2e3d"
+_HEAD_REVISION = "c1a7d3f905b2"
+# Named explicitly rather than reached with a relative "-1": once a revision is
+# added on top, "-1" silently stops meaning "undo THIS migration" and the test
+# would assert against the wrong schema.
+_OPERATOR_RELAY_REVISION = "9a1f4c7b2e3d"
+_OPERATOR_RELAY_PARENT = "8705ec49cc73"
+_PRE_PROVIDER_SCOPE_REVISION = _OPERATOR_RELAY_REVISION
+
+_PROVIDER_TABLES = (
+    "clients",
+    "records",
+    "message_templates",
+    "message_jobs",
+    "whatsapp_senders",
+)
 # Guard against ever pointing the DROP at something real.
 _TEMP_DB_PREFIX = "altegio_migtest_"
 
@@ -225,12 +240,23 @@ async def test_migration_compatibility_scenarios(temp_db_url) -> None:
     # ------------------------------------------- 3. columns already present
     # Simulates an environment that applied the EDITED base revision, which had
     # both columns in its CREATE TABLE: ADD COLUMN IF NOT EXISTS must be a no-op.
+    #
+    # The replay stops at the compatibility revision, which is the ONLY thing
+    # this scenario is about. Going all the way to head would also replay PR-3
+    # against a schema that already carries its objects, and PR-3's DDL is
+    # deliberately fail-closed — it must refuse that, and does (see
+    # test_upgrade_fails_closed_on_unexpected_schema_objects).
     _alembic_ok("stamp", _BASE_REVISION, db_url=temp_db_url)
     assert set(await _raw_body_columns(temp_db_url)) == {"body_raw", "body_size_bytes"}
 
-    _alembic_ok("upgrade", "head", db_url=temp_db_url)
+    _alembic_ok("upgrade", _OPERATOR_RELAY_PARENT, db_url=temp_db_url)
 
     assert set(await _raw_body_columns(temp_db_url)) == {"body_raw", "body_size_bytes"}
+    assert _OPERATOR_RELAY_PARENT in _alembic_ok("current", db_url=temp_db_url)
+
+    # The physical schema is still the full head schema from step 1, so bring
+    # the version table back in line with it.
+    _alembic_ok("stamp", "head", db_url=temp_db_url)
     assert _HEAD_REVISION in _alembic_ok("current", db_url=temp_db_url)
 
 
@@ -337,7 +363,10 @@ async def test_operator_relay_outbox_schema_and_constraints(temp_db_url) -> None
     assert kept and kept[0][0] is None  # row kept, link nulled
 
     # ── downgrade removes the whole schema addition ───────────────────────
-    _alembic_ok("downgrade", "-1", db_url=temp_db_url)
+    # Target the operator-relay revision's PARENT by name. A relative "-1" only
+    # undid this migration while it happened to be head; every later revision
+    # would quietly shift what it means.
+    _alembic_ok("downgrade", _OPERATOR_RELAY_PARENT, db_url=temp_db_url)
     gone = await _fetch(
         temp_db_url,
         "SELECT count(*) FROM information_schema.columns WHERE table_name='outbox_messages' "
@@ -366,3 +395,332 @@ async def test_operator_relay_outbox_schema_and_constraints(temp_db_url) -> None
     assert restored[0][0] == 2
     heads = _alembic_ok("heads", db_url=temp_db_url)
     assert heads.count("(head)") == 1
+
+
+# ---------------------------------------------------------------------------
+# PR-3: provider scope + EasyWeek identity, proven on real PostgreSQL
+# ---------------------------------------------------------------------------
+#
+# Structural guards read the migration as text; only a real database can prove
+# that existing rows survive the backfill, that the database default fires for
+# an INSERT that never names `provider`, and that the partial unique index
+# really constrains EasyWeek rows and only those.
+
+# Altegio seed rows written while the schema is still at the pre-PR-3 revision,
+# i.e. before a `provider` column exists at all.
+_SEED_SQL = (
+    "INSERT INTO clients (company_id, altegio_client_id, phone_e164, raw) VALUES (100, 11, '+4900000001', '{}')",
+    "INSERT INTO records (company_id, altegio_record_id, is_deleted, raw) VALUES (100, 21, false, '{}')",
+    "INSERT INTO message_templates (company_id, code, language, body, is_active) "
+    "VALUES (100, 'record_created', 'de', 'hello', true)",
+    "INSERT INTO message_jobs (company_id, job_type, run_at, dedupe_key, payload) "
+    "VALUES (100, 'record_created', now(), 'pr3:seed:1', '{}')",
+    "INSERT INTO whatsapp_senders (company_id, sender_code, phone_number_id, is_active) "
+    "VALUES (100, 'default', 'PNID-1', true)",
+)
+
+
+async def _counts(db_url: str) -> dict[str, int]:
+    counts = {}
+    for table in _PROVIDER_TABLES:
+        rows = await _fetch(db_url, f"SELECT count(*) FROM {table}")
+        counts[table] = rows[0][0]
+    return counts
+
+
+async def _providers(db_url: str, table: str) -> list[str]:
+    return [row[0] for row in await _fetch(db_url, f"SELECT provider FROM {table}")]
+
+
+async def _column(db_url: str, table: str, column: str) -> tuple | None:
+    rows = await _fetch(
+        db_url,
+        "SELECT data_type, is_nullable, column_default, character_maximum_length "
+        "FROM information_schema.columns WHERE table_name = :t AND column_name = :c",
+        {"t": table, "c": column},
+    )
+    return rows[0] if rows else None
+
+
+async def _constraint_names(db_url: str, table: str) -> set[str]:
+    rows = await _fetch(
+        db_url,
+        "SELECT c.conname FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid WHERE t.relname = :t",
+        {"t": table},
+    )
+    return {row[0] for row in rows}
+
+
+async def _index_defs(db_url: str, table: str) -> dict[str, str]:
+    rows = await _fetch(
+        db_url,
+        "SELECT indexname, indexdef FROM pg_indexes WHERE tablename = :t",
+        {"t": table},
+    )
+    return {row[0]: row[1] for row in rows}
+
+
+@pytest.mark.asyncio
+async def test_provider_scope_migration_scenarios(temp_db_url) -> None:
+    """PR-3 upgrade/downgrade behaviour, sequentially on one throwaway database.
+
+    One test on purpose: each stage is the setup for the next, and a database
+    per scenario would multiply the runtime for no extra coverage.
+    """
+    # ═══════════════════════════════════════════════ 1. fresh database → head
+    _alembic_ok("upgrade", "head", db_url=temp_db_url)
+    assert _HEAD_REVISION in _alembic_ok("current", db_url=temp_db_url)
+
+    for table in _PROVIDER_TABLES:
+        data_type, is_nullable, default, max_length = await _column(temp_db_url, table, "provider")
+        assert data_type == "character varying", table
+        assert max_length == 32, table
+        assert is_nullable == "NO", f"{table}.provider must be NOT NULL"
+        assert "altegio" in (default or ""), f"{table}.provider lost its server default"
+
+    # EasyWeek identity columns, with the types the plan requires.
+    booking_uuid = await _column(temp_db_url, "records", "easyweek_booking_uuid")
+    assert booking_uuid[0] == "uuid" and booking_uuid[1] == "YES"
+    hash_id = await _column(temp_db_url, "records", "easyweek_booking_hash_id")
+    # A bounded string, never an integer: the hash can carry leading zeros.
+    assert hash_id[0] == "character varying" and hash_id[3] == 64
+    meta_name = await _column(temp_db_url, "message_templates", "meta_template_name")
+    assert meta_name[0] == "character varying" and meta_name[3] == 128
+
+    # Provider-scoped uniques replaced the old ones outright.
+    assert "uq_clients_provider_company_altegio_id" in await _constraint_names(temp_db_url, "clients")
+    assert "uq_clients_company_altegio_id" not in await _constraint_names(temp_db_url, "clients")
+    assert "uq_records_provider_company_altegio_id" in await _constraint_names(temp_db_url, "records")
+    assert "uq_records_company_altegio_id" not in await _constraint_names(temp_db_url, "records")
+    senders = await _constraint_names(temp_db_url, "whatsapp_senders")
+    assert "uq_whatsapp_senders_provider_company_code" in senders
+    assert "uq_whatsapp_senders_company_code" not in senders
+
+    # The partial unique index and its predicate.
+    record_indexes = await _index_defs(temp_db_url, "records")
+    partial = record_indexes["uq_records_easyweek_booking_uuid"]
+    assert "UNIQUE" in partial.upper()
+    # PostgreSQL echoes the predicate with its own parentheses and ::text casts,
+    # e.g. "WHERE (((provider)::text = 'easyweek'::text) AND ...)".
+    predicate = partial.replace("(", "").replace(")", "").replace("::text", "")
+    assert "provider = 'easyweek'" in predicate
+    assert "easyweek_booking_uuid IS NOT NULL" in predicate
+
+    # Scoped composite indexes swapped; single-column ones preserved.
+    client_indexes = await _index_defs(temp_db_url, "clients")
+    assert "ix_clients_provider_company_phone" in client_indexes
+    assert "ix_clients_company_phone" not in client_indexes
+    assert "ix_clients_company_id" in client_indexes
+    job_indexes = await _index_defs(temp_db_url, "message_jobs")
+    assert "ix_message_jobs_provider_company_type_status" in job_indexes
+    assert "ix_message_jobs_company_type_status" not in job_indexes
+    assert "ix_message_jobs_status_run_at" in job_indexes
+    assert "ix_message_templates_provider_company_code_lang" in await _index_defs(temp_db_url, "message_templates")
+
+    # ═════════════════════════════ 2. previous revision + existing Altegio rows
+    _alembic_ok("downgrade", _PRE_PROVIDER_SCOPE_REVISION, db_url=temp_db_url)
+    assert await _column(temp_db_url, "clients", "provider") is None
+    assert await _column(temp_db_url, "records", "easyweek_booking_uuid") is None
+    assert await _column(temp_db_url, "message_templates", "meta_template_name") is None
+    # The pre-PR-3 objects are genuinely restored, not just dropped.
+    assert "uq_clients_company_altegio_id" in await _constraint_names(temp_db_url, "clients")
+    assert "ix_clients_company_phone" in await _index_defs(temp_db_url, "clients")
+    assert "ix_message_jobs_company_type_status" in await _index_defs(temp_db_url, "message_jobs")
+
+    for statement in _SEED_SQL:
+        await _exec(temp_db_url, statement)
+    seeded = await _counts(temp_db_url)
+    assert all(count == 1 for count in seeded.values()), seeded
+
+    _alembic_ok("upgrade", "head", db_url=temp_db_url)
+
+    # ═════════════════════ 3. every pre-existing row is backfilled as 'altegio'
+    for table in _PROVIDER_TABLES:
+        assert await _providers(temp_db_url, table) == ["altegio"], table
+    assert await _counts(temp_db_url) == seeded, "upgrade must not lose or duplicate rows"
+
+    # ═══════════════ 9. upgrade → downgrade → upgrade keeps Altegio-only rows
+    before = await _counts(temp_db_url)
+    _alembic_ok("downgrade", _PRE_PROVIDER_SCOPE_REVISION, db_url=temp_db_url)
+    _alembic_ok("upgrade", "head", db_url=temp_db_url)
+    assert await _counts(temp_db_url) == before, "a downgrade/upgrade round trip lost rows"
+    for table in _PROVIDER_TABLES:
+        assert await _providers(temp_db_url, table) == ["altegio"], table
+
+    # ═══════════════════════ 4. an INSERT that never names provider gets it anyway
+    await _exec(
+        temp_db_url,
+        "INSERT INTO clients (company_id, altegio_client_id, raw) VALUES (200, 31, '{}')",
+    )
+    default_applied = await _fetch(
+        temp_db_url, "SELECT provider FROM clients WHERE company_id = 200 AND altegio_client_id = 31"
+    )
+    assert default_applied[0][0] == "altegio"
+
+    # ══════════ 5. the same (company_id, external id) is allowed per provider
+    await _exec(
+        temp_db_url,
+        "INSERT INTO clients (provider, company_id, altegio_client_id, raw) VALUES ('easyweek', 200, 31, '{}')",
+    )
+    both = await _fetch(
+        temp_db_url,
+        "SELECT provider FROM clients WHERE company_id = 200 AND altegio_client_id = 31 ORDER BY provider",
+    )
+    assert [row[0] for row in both] == ["altegio", "easyweek"]
+
+    # ═══════════════════ 6. the same key WITHIN one provider is still rejected
+    with pytest.raises(Exception) as exc_info:
+        await _exec(
+            temp_db_url,
+            "INSERT INTO clients (provider, company_id, altegio_client_id, raw) VALUES ('easyweek', 200, 31, '{}')",
+        )
+    assert "uq_clients_provider_company_altegio_id" in str(exc_info.value)
+
+    # ══════════════════ 7. a repeated non-null EasyWeek booking UUID is rejected
+    duplicate_uuid = "11111111-2222-3333-4444-555555555555"
+    await _exec(
+        temp_db_url,
+        "INSERT INTO records (provider, company_id, altegio_record_id, easyweek_booking_uuid, is_deleted, raw) "
+        f"VALUES ('easyweek', 300, 41, '{duplicate_uuid}', false, '{{}}')",
+    )
+    with pytest.raises(Exception) as exc_info:
+        await _exec(
+            temp_db_url,
+            "INSERT INTO records (provider, company_id, altegio_record_id, easyweek_booking_uuid, is_deleted, raw) "
+            f"VALUES ('easyweek', 300, 42, '{duplicate_uuid}', false, '{{}}')",
+        )
+    assert "uq_records_easyweek_booking_uuid" in str(exc_info.value)
+
+    # The index is genuinely provider-scoped: the same UUID on Altegio rows is
+    # outside the predicate, so it is not constrained.
+    for record_id in (43, 44):
+        await _exec(
+            temp_db_url,
+            "INSERT INTO records (provider, company_id, altegio_record_id, easyweek_booking_uuid, is_deleted, raw) "
+            f"VALUES ('altegio', 300, {record_id}, '{duplicate_uuid}', false, '{{}}')",
+        )
+
+    # ══════════════════ 8. several EasyWeek rows with a NULL UUID are allowed
+    for record_id in (51, 52, 53):
+        await _exec(
+            temp_db_url,
+            "INSERT INTO records (provider, company_id, altegio_record_id, is_deleted, raw) "
+            f"VALUES ('easyweek', 300, {record_id}, false, '{{}}')",
+        )
+    null_uuid_rows = await _fetch(
+        temp_db_url,
+        "SELECT count(*) FROM records WHERE provider = 'easyweek' AND easyweek_booking_uuid IS NULL",
+    )
+    assert null_uuid_rows[0][0] == 3
+
+    # ═══════ downgrade now FAILS CLOSED: cross-provider duplicates exist above
+    refused = _run_alembic("downgrade", _PRE_PROVIDER_SCOPE_REVISION, db_url=temp_db_url)
+    assert refused.returncode != 0, "downgrade must refuse to restore an impossible unique constraint"
+    assert "Cannot downgrade" in refused.stdout + refused.stderr
+    # ... and the refusal changed nothing.
+    assert _HEAD_REVISION in _alembic_ok("current", db_url=temp_db_url)
+    assert "uq_clients_provider_company_altegio_id" in await _constraint_names(temp_db_url, "clients")
+
+    # ════════════════════ 10. exactly one head, and no PR-3 model/schema drift
+    assert _alembic_ok("heads", db_url=temp_db_url).count("(head)") == 1
+
+    # `alembic check` autogenerates against the live schema. The repository has
+    # two PRE-EXISTING drift items, both on tables PR-3 never touches:
+    #   * ix_outbox_messages_reply_context_lookup — an expression index created
+    #     only by migration d0e1f2a3b4c5 and never declared in models.py, so
+    #     autogenerate has always reported it as "removed";
+    #   * promo_leads.location_id — Integer in the model, BigInteger in
+    #     migration a3b4c5d6e7f8.
+    # Fixing either would be unrelated refactoring outside this PR, so the
+    # assertion is scoped: PR-3's own objects must produce NO drift.
+    drift = _run_alembic("check", db_url=temp_db_url)
+    report = drift.stdout + drift.stderr
+    operations = [line for line in report.splitlines() if "upgrade operations detected" in line]
+    pr3_objects = (
+        *_PROVIDER_TABLES,
+        "provider",
+        "easyweek_booking_uuid",
+        "easyweek_booking_hash_id",
+        "meta_template_name",
+        "uq_clients_provider_company_altegio_id",
+        "uq_records_provider_company_altegio_id",
+        "uq_whatsapp_senders_provider_company_code",
+        "uq_records_easyweek_booking_uuid",
+        "ix_clients_provider_company_phone",
+        "ix_message_jobs_provider_company_type_status",
+        "ix_message_templates_provider_company_code_lang",
+    )
+    # Whole-identifier matching: a bare "provider" substring would otherwise hit
+    # the unrelated `provider_message_id` column of outbox_messages.
+    for line in operations:
+        for name in pr3_objects:
+            assert not re.search(rf"\b{re.escape(name)}\b", line), (
+                f"PR-3 introduced model/schema drift on {name!r}:\n{line}"
+            )
+    if drift.returncode != 0:
+        assert "outbox_messages" in report or "promo_leads" in report, (
+            f"unexpected model/schema drift after the PR-3 upgrade:\n{report}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_upgrade_fails_closed_on_unexpected_schema_objects(temp_db_url) -> None:
+    """A same-named object that is NOT what PR-3 builds must abort the upgrade.
+
+    The migration deliberately dropped its ``IF NOT EXISTS`` guards and its
+    name-only ``_add_constraint_if_absent`` helper. Those would have accepted a
+    drifted production object — a constraint over the wrong columns, an index
+    with the wrong predicate — and silently declared the schema correct. Here
+    the drift is planted on purpose and the upgrade has to refuse it, leaving
+    the previous schema and every row untouched.
+    """
+    _alembic_ok("upgrade", _PRE_PROVIDER_SCOPE_REVISION, db_url=temp_db_url)
+    for statement in _SEED_SQL:
+        await _exec(temp_db_url, statement)
+    before = await _counts(temp_db_url)
+
+    async def assert_untouched(case: str) -> None:
+        """Nothing may have changed: revision, old constraints, or rows."""
+        current = _alembic_ok("current", db_url=temp_db_url)
+        assert _HEAD_REVISION not in current, f"{case}: revision advanced despite the failure"
+        assert _PRE_PROVIDER_SCOPE_REVISION in current, f"{case}: unexpected revision"
+        # The pre-PR-3 constraints survive the rolled-back transaction.
+        assert "uq_clients_company_altegio_id" in await _constraint_names(temp_db_url, "clients")
+        assert "uq_records_company_altegio_id" in await _constraint_names(temp_db_url, "records")
+        # And the provider column was never committed.
+        assert await _column(temp_db_url, "clients", "provider") is None, f"{case}: provider column leaked"
+        assert await _counts(temp_db_url) == before, f"{case}: rows changed"
+
+    # ── A. a constraint with the right NAME but the wrong columns ────────────
+    await _exec(
+        temp_db_url,
+        "ALTER TABLE clients ADD CONSTRAINT uq_clients_provider_company_altegio_id UNIQUE (company_id)",
+    )
+    failed = _run_alembic("upgrade", "head", db_url=temp_db_url)
+    assert failed.returncode != 0, "upgrade accepted a same-named constraint over the wrong columns"
+    await assert_untouched("wrong-column constraint")
+    await _exec(temp_db_url, "ALTER TABLE clients DROP CONSTRAINT uq_clients_provider_company_altegio_id")
+
+    # ── B. an index with the right NAME but the wrong definition ─────────────
+    await _exec(
+        temp_db_url,
+        "CREATE UNIQUE INDEX uq_records_easyweek_booking_uuid ON records (altegio_record_id)",
+    )
+    failed = _run_alembic("upgrade", "head", db_url=temp_db_url)
+    assert failed.returncode != 0, "upgrade accepted a same-named index with the wrong definition"
+    await assert_untouched("wrong-predicate index")
+    await _exec(temp_db_url, "DROP INDEX uq_records_easyweek_booking_uuid")
+
+    # ── C. with the drift removed, the same upgrade succeeds ─────────────────
+    _alembic_ok("upgrade", "head", db_url=temp_db_url)
+    assert _HEAD_REVISION in _alembic_ok("current", db_url=temp_db_url)
+    assert await _counts(temp_db_url) == before
+    for table in _PROVIDER_TABLES:
+        assert await _providers(temp_db_url, table) == ["altegio"], table
+    assert "uq_clients_provider_company_altegio_id" in await _constraint_names(temp_db_url, "clients")
+    assert "uq_clients_company_altegio_id" not in await _constraint_names(temp_db_url, "clients")
+
+    # ── D. and the normal round trip still works afterwards ──────────────────
+    _alembic_ok("downgrade", _PRE_PROVIDER_SCOPE_REVISION, db_url=temp_db_url)
+    _alembic_ok("upgrade", "head", db_url=temp_db_url)
+    assert await _counts(temp_db_url) == before

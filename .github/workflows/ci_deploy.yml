@@ -209,222 +209,26 @@ jobs:
     steps:
       - name: Deploy to server via SSH
         uses: appleboy/ssh-action@v1.0.3
+        env:
+          DEPLOY_SHA: ${{ github.sha }}
         with:
           host: ${{ secrets.SSH_HOST }}
           username: root
           key: ${{ secrets.DEPLOY_SSH_KEY }}
           port: ${{ secrets.SSH_PORT }}
+          envs: DEPLOY_SHA
+          # Bootstrap only. The rollout itself lives in scripts/deploy_pr3.sh:
+          # `script:` is evaluated as ONE template expression capped at 21000
+          # characters, and the full PR-3 program is far past that — inlining it
+          # made the whole workflow file invalid, so no job could start at all.
+          # Fetch the exact commit FIRST so the script that runs is the one this
+          # deploy is shipping, then hand over.
           script: |
-            set -euo pipefail
-
+            set -Eeuo pipefail
             cd /opt/altegio_bot
-
-            COMPOSE="docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml"
-
-            echo "📦 Fetching new code..."
-            git fetch origin main
-            git reset --hard "${{ github.sha }}"
-
-            DEPLOYED_SHA="$(git rev-parse HEAD)"
-            test "$DEPLOYED_SHA" = "${{ github.sha }}" || {
-              echo "❌ Deployed SHA ($DEPLOYED_SHA) does not match workflow SHA (${{ github.sha }})"
-              exit 1
-            }
-            echo "✅ Deployed exact commit: $DEPLOYED_SHA"
-
-            echo "🔨 Building new images (without starting containers)..."
-            $COMPOSE build
-
-            echo "🟢 Starting infrastructure services..."
-            $COMPOSE up -d postgres redis
-
-            echo "⏳ Waiting for Postgres to be healthy..."
-            MAX_ATTEMPTS=60
-            ATTEMPTS=0
-
-            # Ищем контейнер, который принадлежит сервису postgres.
-            until [ $ATTEMPTS -ge $MAX_ATTEMPTS ]; do
-                # Находим имя контейнера базы данных, как бы он ни назывался
-                DB_CONTAINER=$(docker ps --filter "label=com.docker.compose.service=postgres" --filter "label=com.docker.compose.project=altegio_bot" --format "{{.Names}}" | head -n 1)
-
-                if [ -n "$DB_CONTAINER" ] && [ "$(docker inspect -f '{{.State.Health.Status}}' $DB_CONTAINER)" == "healthy" ]; then
-                    echo "✅ Postgres ($DB_CONTAINER) is ready!"
-                    break
-                fi
-
-                ATTEMPTS=$((ATTEMPTS + 1))
-                echo "... waiting for database ($ATTEMPTS/$MAX_ATTEMPTS) ..."
-                sleep 1
-            done
-
-            if [ $ATTEMPTS -ge $MAX_ATTEMPTS ]; then
-                echo "❌ Timed out waiting for Postgres"
-                exit 1
-            fi
-
-            # Postgres is confirmed healthy from this point on.
-            # Backup is a mandatory gate before migrations — any failure here stops the deploy.
-            echo "💾 Creating pre-deploy database backup..."
-            mkdir -p /opt/altegio_bot/backups
-            DUMP_FILE="/opt/altegio_bot/backups/altegio_before_deploy_$(date -u +%Y%m%dT%H%M%SZ).dump"
-
-            # Credentials come from inside the container (docker compose injected them from .env).
-            # This is more reliable than sourcing .env in the remote shell.
-            $COMPOSE exec -T postgres sh -lc '
-              psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT 1"
-            ' >/dev/null
-
-            $COMPOSE exec -T postgres sh -lc '
-              pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc
-            ' > "$DUMP_FILE"
-
-            test -s "$DUMP_FILE" || {
-              echo "❌ Pre-deploy dump is empty — aborting."
-              exit 1
-            }
-            echo "✅ Backup created: $DUMP_FILE"
-
-            BACKUP_DIR="/opt/altegio_bot/backups"
-            KEEP_BACKUPS=10
-
-            echo "🧹 Rotating pre-deploy database backups..."
-            echo "Keeping latest ${KEEP_BACKUPS} backups"
-
-            ls -1t "${BACKUP_DIR}"/altegio_before_deploy_*.dump 2>/dev/null \
-              | tail -n +"$((KEEP_BACKUPS + 1))" \
-              | xargs -r rm -v --
-
-            echo "Current backup count:"
-            find "${BACKUP_DIR}" -maxdepth 1 -type f \
-              -name 'altegio_before_deploy_*.dump' \
-              | wc -l
-
-            echo "⚙️ Applying DB Migrations..."
-            $COMPOSE --profile ops run --rm --no-deps migrate
-
-            echo "🚀 Starting updated containers..."
-            $COMPOSE up -d --remove-orphans
-
-            # The follow-up worker is NOT attached to the Chatwoot network (it only
-            # claims due campaign runs and creates MessageJob rows — no Chatwoot API
-            # calls), so it is verified here for liveness instead of in the Chatwoot
-            # attachment check below.
-            echo "🔎 Verifying follow-up worker is running..."
-            FOLLOWUP_CONTAINER=$(docker ps \
-              --filter "label=com.docker.compose.project=altegio_bot" \
-              --filter "label=com.docker.compose.service=altegio-followup-worker" \
-              --filter "status=running" \
-              --format "{{.Names}}" \
-              | head -n 1)
-
-            if [ -z "$FOLLOWUP_CONTAINER" ]; then
-              echo "❌ altegio-followup-worker container is not running"
-              exit 1
-            fi
-            echo "✅ altegio-followup-worker running ($FOLLOWUP_CONTAINER)"
-
-            echo "🔎 Verifying Chatwoot internal route..."
-
-            WA_CONTAINER=$(docker ps \
-              --filter "label=com.docker.compose.project=altegio_bot" \
-              --filter "label=com.docker.compose.service=altegio-whatsapp-inbox-worker" \
-              --format "{{.Names}}" \
-              | head -n 1)
-
-            if [ -z "$WA_CONTAINER" ]; then
-              echo "❌ altegio-whatsapp-inbox-worker container not found"
-              exit 1
-            fi
-
-            echo "🔎 Resolving Chatwoot internal network from Docker Compose config..."
-            # Docker Compose applies .env while rendering config. Parse the JSON
-            # inside an app container so the deploy host needs no extra tools.
-            CHATWOOT_NETWORK="$($COMPOSE config --format json | $COMPOSE exec -T altegio-whatsapp-inbox-worker /app/.venv/bin/python -c '
-            import json
-            import sys
-
-            config = json.load(sys.stdin)
-            try:
-                name = config["networks"]["chatwoot_internal"]["name"]
-            except KeyError as exc:
-                raise SystemExit(f"chatwoot_internal network name is missing from compose config: {exc}")
-
-            if not name:
-                raise SystemExit("chatwoot_internal network name is empty")
-
-            print(name)
-            ')"
-
-            if [ -z "$CHATWOOT_NETWORK" ]; then
-              echo "❌ Failed to resolve chatwoot_internal network name from docker compose config"
-              exit 1
-            fi
-
-            echo "Resolved Chatwoot network: $CHATWOOT_NETWORK"
-            docker network inspect "$CHATWOOT_NETWORK" >/dev/null
-
-            echo "🔎 Verifying app containers are attached to Chatwoot network..."
-
-            CHATWOOT_SERVICES="
-            altegio-api
-            altegio-inbox-worker
-            altegio-outbox-worker
-            altegio-whatsapp-inbox-worker
-            altegio-campaign-worker
-            "
-
-            for SERVICE in $CHATWOOT_SERVICES; do
-              CONTAINER=$(docker ps \
-                --filter "label=com.docker.compose.project=altegio_bot" \
-                --filter "label=com.docker.compose.service=${SERVICE}" \
-                --format "{{.Names}}" \
-                | head -n 1)
-
-              if [ -z "$CONTAINER" ]; then
-                echo "❌ ${SERVICE} container not found"
-                exit 1
-              fi
-
-              docker inspect -f '{{json .NetworkSettings.Networks}}' "$CONTAINER" \
-                | grep -Fq "\"${CHATWOOT_NETWORK}\"" || {
-                  echo "❌ ${CONTAINER} (${SERVICE}) is not attached to ${CHATWOOT_NETWORK}"
-                  echo "Container networks:"
-                  docker inspect -f '{{range $name, $_ := .NetworkSettings.Networks}}{{println $name}}{{end}}' "$CONTAINER" || true
-                  exit 1
-                }
-
-              echo "✅ ${SERVICE} attached to ${CHATWOOT_NETWORK}"
-            done
-
-            echo "🔎 Verifying Chatwoot internal DNS..."
-            # Resolve the Chatwoot host from the app's own settings so this check
-            # follows CHATWOOT_BASE_URL instead of a hardcoded hostname.
-            $COMPOSE exec -T altegio-whatsapp-inbox-worker sh -lc '
-            CHATWOOT_HOST=$(/app/.venv/bin/python - <<'"'"'PY'"'"'
-            from urllib.parse import urlparse
-            from altegio_bot.settings import settings
-
-            host = urlparse(settings.chatwoot_base_url).hostname
-            if not host:
-                raise SystemExit("CHATWOOT_BASE_URL host is empty")
-            print(host)
-            PY
-            )
-
-            echo "Resolved Chatwoot host: $CHATWOOT_HOST"
-            getent hosts "$CHATWOOT_HOST" >/dev/null || {
-              echo "❌ Cannot resolve Chatwoot host inside altegio-whatsapp-inbox-worker: $CHATWOOT_HOST"
-              exit 1
-            }
-            '
-
-            echo "✅ Chatwoot internal route verified"
-
-            echo "🧹 Aggressive cleanup of unused images..."
-            docker image prune -af
-
-            echo "✅ Done! Containers status:"
-            $COMPOSE ps
+            git fetch --prune origin
+            git reset --hard "$DEPLOY_SHA"
+            exec bash scripts/deploy_pr3.sh
 
       - name: Wait for service stabilization
         run: sleep 60
