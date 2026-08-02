@@ -8,6 +8,7 @@ container stays inert and quiet until an operator deliberately turns it on.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import inspect
 from pathlib import Path
@@ -282,3 +283,236 @@ def test_worker_installs_signal_handlers() -> None:
     source = inspect.getsource(worker)
     assert "SIGTERM" in source and "SIGINT" in source
     assert "add_signal_handler" in source
+
+
+# ===========================================================================
+# Unexpected errors must not leak PII or kill the worker (review fix 5)
+# ===========================================================================
+
+_PII_PHONE = "+4915112345678"
+_PII_EMAIL = "real.customer@example.com"
+_PII_NAME = "Erika Mustermann"
+
+
+class _FakeDBError(Exception):
+    """Shaped like a SQLAlchemy error: renders the statement WITH parameters."""
+
+    def __str__(self) -> str:
+        return (
+            "(asyncpg.exceptions.DataError) invalid input\n"
+            "[SQL: INSERT INTO clients (phone_e164, email, display_name) VALUES ($1, $2, $3)]\n"
+            f"[parameters: ('{_PII_PHONE}', '{_PII_EMAIL}', '{_PII_NAME}')]"
+        )
+
+
+@pytest.mark.asyncio
+async def test_unexpected_error_logs_no_pii_and_no_traceback(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(settings, "easyweek_processing_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_location_id", 999001, raising=False)
+
+    calls = {"n": 0}
+
+    async def _explode() -> bool:
+        calls["n"] += 1
+        raise _FakeDBError()
+
+    monkeypatch.setattr(worker, "process_one", _explode)
+
+    stop_event = asyncio.Event()
+    with caplog.at_level("DEBUG", logger="easyweek_inbox_worker"):
+        task = asyncio.create_task(worker.run_loop(poll_sec=0.01, stop_event=stop_event))
+        await asyncio.sleep(0.12)
+        stop_event.set()
+        await asyncio.wait_for(task, timeout=3.0)
+
+    assert calls["n"] >= 1, "the loop never reached the failing cycle"
+
+    text = "\n".join(record.getMessage() for record in caplog.records)
+    for secret in (_PII_PHONE, _PII_EMAIL, _PII_NAME, "parameters:", "INSERT INTO clients"):
+        assert secret not in text, f"PII/statement leaked into the log: {secret!r}"
+
+    assert "processing_error" in text, "the failure must still be reported"
+    assert "_FakeDBError" in text, "the exception class name is the safe detail"
+
+    # No traceback was attached to any record.
+    for record in caplog.records:
+        assert record.exc_info is None, "a traceback was logged"
+
+
+@pytest.mark.asyncio
+async def test_worker_survives_a_failing_cycle_and_keeps_going(monkeypatch: pytest.MonkeyPatch) -> None:
+    """One poisoned row must not kill the process or wedge the backlog."""
+    monkeypatch.setattr(settings, "easyweek_processing_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_location_id", 999001, raising=False)
+
+    attempts = {"n": 0}
+
+    async def _fail_then_succeed() -> bool:
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise _FakeDBError()
+        return False
+
+    monkeypatch.setattr(worker, "process_one", _fail_then_succeed)
+    monkeypatch.setattr(worker, "MAX_ERROR_BACKOFF_SEC", 0.02, raising=False)
+
+    stop_event = asyncio.Event()
+    task = asyncio.create_task(worker.run_loop(poll_sec=0.01, stop_event=stop_event))
+    await asyncio.sleep(0.2)
+    stop_event.set()
+    await asyncio.wait_for(task, timeout=3.0)
+
+    assert task.done() and task.exception() is None, "the worker died on a transient error"
+    assert attempts["n"] >= 2, "the worker did not retry after the failure"
+
+
+@pytest.mark.asyncio
+async def test_transient_errors_back_off_instead_of_hot_looping(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A permanently failing row must not spin the loop at full speed."""
+    monkeypatch.setattr(settings, "easyweek_processing_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_location_id", 999001, raising=False)
+
+    attempts = {"n": 0}
+
+    async def _always_fail() -> bool:
+        attempts["n"] += 1
+        raise _FakeDBError()
+
+    monkeypatch.setattr(worker, "process_one", _always_fail)
+
+    stop_event = asyncio.Event()
+    task = asyncio.create_task(worker.run_loop(poll_sec=0.01, stop_event=stop_event))
+    await asyncio.sleep(0.25)
+    stop_event.set()
+    await asyncio.wait_for(task, timeout=5.0)
+
+    # Without backoff a 0.01s poll over 0.25s would burn through far more.
+    assert attempts["n"] <= 8, f"no backoff: {attempts['n']} attempts in 0.25s"
+
+
+@pytest.mark.asyncio
+async def test_shutdown_signals_are_never_swallowed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`except Exception` must not catch CancelledError or SystemExit."""
+    monkeypatch.setattr(settings, "easyweek_processing_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_location_id", 999001, raising=False)
+
+    async def _system_exit() -> bool:
+        raise SystemExit(3)
+
+    monkeypatch.setattr(worker, "process_one", _system_exit)
+
+    with pytest.raises(SystemExit):
+        await worker.run_loop(poll_sec=0.01, stop_event=asyncio.Event())
+
+
+def _worker_statements() -> str:
+    """The worker's executable code, with comments AND docstrings removed.
+
+    Prose describing the ban ("never as text or a traceback") would otherwise
+    satisfy a substring check meant to inspect the statements.
+    """
+    tree = ast.parse(inspect.getsource(worker))
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Module)):
+            if (
+                node.body
+                and isinstance(node.body[0], ast.Expr)
+                and isinstance(node.body[0].value, ast.Constant)
+                and isinstance(node.body[0].value.value, str)
+            ):
+                node.body.pop(0)
+    return ast.unparse(tree)
+
+
+def test_the_worker_never_uses_unsafe_logging_calls() -> None:
+    code = _worker_statements()
+    assert "logger.exception" not in code, "logger.exception attaches a traceback"
+    assert "str(exc)" not in code, "the exception text can contain SQL parameters"
+    assert "traceback" not in code
+    assert "type(exc).__name__" in code, "only the class name is safe to log"
+
+
+def test_the_worker_catches_exception_not_baseexception() -> None:
+    """CancelledError / KeyboardInterrupt / SystemExit must keep propagating."""
+    code = _worker_statements()
+    assert "except Exception" in code
+    assert "except BaseException" not in code
+
+
+# ===========================================================================
+# Production deploy verification (review fix 9)
+# ===========================================================================
+
+WORKFLOW_FILE = _REPO_ROOT / ".github" / "workflows" / "ci_deploy.yml"
+DEPLOY_SCRIPT = _REPO_ROOT / "scripts" / "deploy_pr3.sh"
+
+
+def _verification_script() -> str:
+    workflow = yaml.safe_load(WORKFLOW_FILE.read_text())
+    steps = workflow["jobs"]["deploy"]["steps"]
+    step = next(s for s in steps if s.get("name") == "Verify deployment on server")
+    return str(step["with"]["script"])
+
+
+def test_the_easyweek_worker_is_a_critical_post_deploy_service() -> None:
+    """A standing service that is never verified can die unnoticed."""
+    import re
+
+    script = _verification_script()
+    match = re.search(r'CRITICAL_SERVICES="\n(?P<body>.*?)\n"', script, re.DOTALL)
+    assert match is not None, "CRITICAL_SERVICES is missing from the verification step"
+    services = {line.strip() for line in match.group("body").splitlines() if line.strip()}
+    assert WORKER_SERVICE in services, f"{WORKER_SERVICE} is not verified after deploy"
+
+
+def test_critical_service_check_fails_on_a_non_running_or_unhealthy_container() -> None:
+    script = _verification_script()
+    assert "state=${STATE}" in script or "state=" in script
+    assert 'if [ "$STATE" != "running" ]; then' in script
+    assert 'if [ "$HEALTH" = "unhealthy" ]; then' in script
+    assert "RestartCount" in script, "a restart loop must be visible"
+
+
+def test_every_compose_standing_service_is_verified_after_deploy() -> None:
+    """Guards against the next added worker being forgotten the same way."""
+    import re
+
+    compose = _compose()["services"]
+    standing = {
+        name
+        for name, service in compose.items()
+        # `migrate` has profile `ops` and is a one-shot, not a standing service.
+        if "ops" not in (service.get("profiles") or [])
+    }
+    script = _verification_script()
+    match = re.search(r'CRITICAL_SERVICES="\n(?P<body>.*?)\n"', script, re.DOTALL)
+    assert match is not None
+    verified = {line.strip() for line in match.group("body").splitlines() if line.strip()}
+    assert standing <= verified, f"unverified standing services: {sorted(standing - verified)}"
+
+
+def test_deploy_script_takes_the_ordinary_path_once_pr3_is_applied() -> None:
+    """Production is already on the PR-3 revision, so PR-4 is a normal deploy.
+
+    The one-time constraint-swap window (worker drain, canary, bounded
+    rollback) must NOT re-arm for a deploy that merely adds a later revision.
+    """
+    script = DEPLOY_SCRIPT.read_text()
+    assert 'if [ "$PR3_IN_DB_LINEAGE" = "1" ]; then' in script
+    branch = script.split('if [ "$PR3_IN_DB_LINEAGE" = "1" ]; then', 1)[1].split("elif", 1)[0]
+    assert "PR3_TRANSITION=0" in branch
+    assert "PR3_TRANSITION=1" not in branch
+
+
+def test_deploy_script_keeps_backup_and_revision_verification() -> None:
+    script = DEPLOY_SCRIPT.read_text()
+    assert "pg_dump" in script
+    assert "alembic_revision_facts" in script
+    assert 'test "$DEPLOYED_SHA" = "${{ github.sha }}"' not in script  # that lives in the workflow
+    assert "REVISION_AFTER" in script
+
+
+def test_new_services_are_created_by_the_ordinary_compose_up() -> None:
+    assert "$COMPOSE up -d --remove-orphans" in DEPLOY_SCRIPT.read_text()

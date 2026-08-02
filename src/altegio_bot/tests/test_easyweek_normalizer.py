@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timezone
+from decimal import Decimal
 
 import pytest
 
@@ -492,3 +493,160 @@ def test_rejections_never_leak_payload_values(mutate) -> None:
     ):
         if secret:
             assert secret not in message
+
+
+# ===========================================================================
+# Malformed manage URLs must never raise (review fix 4)
+# ===========================================================================
+
+
+@pytest.mark.parametrize(
+    ("page", "why"),
+    [
+        ("https://eyw.me:bad/r/90000001", "non-numeric port"),
+        ("https://eyw.me:99999/r/90000001", "out-of-range port"),
+        ("https://eyw.me:-1/r/90000001", "negative port"),
+        ("https://[oops/r/90000001", "unterminated bracketed host"),
+        ("https://[::1]:bad/r/90000001", "bracketed host with bad port"),
+        ("https://user:pw@eyw.me:bad/r/90000001", "credentials plus bad port"),
+    ],
+)
+def test_malformed_urls_are_rejected_without_raising(page: str, why: str) -> None:
+    """`SplitResult.port` raises ValueError lazily, at attribute access.
+
+    Letting that escape would bypass the deterministic path entirely and leave
+    the row stuck at the head of the queue.
+    """
+    payload = booking_created()
+    payload["booking_page"] = page
+    link, present = extract_manage_link(payload)
+    assert link is None, f"accepted {why}: {page!r}"
+    assert present is True, why
+
+
+@pytest.mark.parametrize(
+    "page",
+    [
+        "https://eyw.me:bad/r/90000001",
+        "https://[oops/r/90000001",
+        "https://eyw.me:99999/r/90000001",
+    ],
+)
+def test_whole_event_still_normalizes_when_the_link_is_malformed(page: str) -> None:
+    """A bad link clears the link; it must not fail the booking."""
+    payload = booking_created()
+    payload["booking_page"] = page
+    booking = _normalize(payload)
+    assert booking is not None
+    assert booking.manage_link is None
+    assert booking.manage_link_present is True
+
+
+def test_canonical_url_is_still_accepted() -> None:
+    link, present = extract_manage_link(booking_created())
+    assert present is True
+    assert link is not None and link.url == TEST_BOOKING_PAGE
+
+
+# ===========================================================================
+# booking-succeeded shares the common validation (review fix 8)
+# ===========================================================================
+
+
+def test_succeeded_for_our_location_is_ignored_cleanly() -> None:
+    assert _normalize(booking_created(), event_hint="booking-succeeded") is None
+
+
+@pytest.mark.parametrize(
+    ("mutate", "truncated", "expected"),
+    [
+        (lambda p: p.update({"location_id": FOREIGN_LOCATION_ID}), False, NormalizationError.FOREIGN_LOCATION),
+        (lambda p: p.pop("location_id"), False, NormalizationError.INVALID_LOCATION_ID),
+        (lambda p: p.update({"location_id": "999001"}), False, NormalizationError.INVALID_LOCATION_ID),
+        (lambda p: None, True, NormalizationError.TRUNCATED_PAYLOAD),
+    ],
+)
+def test_succeeded_is_not_a_bypass_for_integrity_or_isolation(mutate, truncated: bool, expected: str) -> None:
+    """A foreign or truncated `booking-succeeded` must NOT reach `processed`."""
+    payload = booking_created()
+    mutate(payload)
+    with pytest.raises(NormalizationError) as excinfo:
+        _normalize(payload, event_hint="booking-succeeded", truncated=truncated)
+    assert excinfo.value.code == expected
+
+
+@pytest.mark.parametrize("payload", [None, {}, [], "text"])
+def test_succeeded_with_a_non_object_payload_is_rejected(payload) -> None:
+    with pytest.raises(NormalizationError) as excinfo:
+        _normalize(payload, event_hint="booking-succeeded")
+    assert excinfo.value.code == NormalizationError.INVALID_PAYLOAD
+
+
+def test_succeeded_does_not_require_a_booking_uuid() -> None:
+    """Nothing on the ignore path is keyed by the UUID, so it is not demanded."""
+    payload = booking_created()
+    del payload["uid"]
+    assert _normalize(payload, event_hint="booking-succeeded") is None
+
+
+# ===========================================================================
+# Service and price normalization (review fix 7)
+# ===========================================================================
+
+
+def test_price_comes_from_the_numeric_field_in_minor_units() -> None:
+    booking = _normalize(booking_created())
+    assert booking is not None
+    assert booking.total_cost == Decimal("35.00"), "booking_price_int is cents"
+
+
+def test_localized_price_strings_are_not_used() -> None:
+    payload = booking_created()
+    payload["booking_price"] = "999,99"
+    payload["booking_price_formatted"] = "€999.99"
+    payload["booking_price_float"] = "999.99"
+    booking = _normalize(payload)
+    assert booking is not None
+    assert booking.total_cost == Decimal("35.00")
+
+
+@pytest.mark.parametrize("bad", ["3500", True, None, -1])
+def test_invalid_price_yields_no_total_cost(bad) -> None:
+    payload = booking_created()
+    payload["booking_price_int"] = bad
+    booking = _normalize(payload)
+    assert booking is not None
+    assert booking.total_cost is None
+
+
+def test_service_fields_are_normalized() -> None:
+    booking = _normalize(booking_created())
+    assert booking is not None
+    assert booking.service_id == 5100003
+    assert booking.service_name == "Fixture Service"
+    assert booking.service_quantity == 1
+
+
+# ===========================================================================
+# Present-field tracking drives patch semantics (review fix 6)
+# ===========================================================================
+
+
+def test_absent_fields_are_reported_as_not_carried() -> None:
+    payload = booking_created()
+    for key in ("customer_phone", "customer_email", "booking_date_start", "service_id"):
+        payload.pop(key, None)
+    booking = _normalize(payload)
+    assert booking is not None
+    for field in ("phone_e164", "email", "starts_at", "service_id"):
+        assert not booking.carries(field), f"{field} must not be reported as carried"
+
+
+def test_present_but_empty_is_still_carried() -> None:
+    """An explicit clear is authoritative; only absence preserves."""
+    payload = booking_created()
+    payload["booking_attributes.booking_comment"] = ""
+    booking = _normalize(payload)
+    assert booking is not None
+    assert booking.carries("comment")
+    assert booking.comment is None

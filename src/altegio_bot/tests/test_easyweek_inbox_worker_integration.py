@@ -8,6 +8,7 @@ the guarantee that none of it disturbs the Altegio path.
 from __future__ import annotations
 
 import uuid
+from decimal import Decimal
 from typing import Any
 
 import pytest
@@ -17,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 import altegio_bot.db as app_db
 from altegio_bot.easyweek_normalizer import NormalizationError
-from altegio_bot.models.models import Client, EasyWeekEvent, MessageJob, Record
+from altegio_bot.models.models import Client, EasyWeekEvent, MessageJob, Record, RecordService
 from altegio_bot.settings import settings
 from altegio_bot.tests.easyweek_fixtures import (
     FOREIGN_LOCATION_ID,
@@ -581,3 +582,525 @@ async def test_existing_altegio_jobs_are_untouched(bound_session_local, monkeypa
         )
         assert len(easyweek_jobs) == 1
         assert easyweek_jobs[0].dedupe_key.startswith("easyweek:")
+
+
+# ===========================================================================
+# Stale replay must not resurrect a cancelled booking (review fix 1)
+# ===========================================================================
+
+
+async def test_resend_of_create_after_cancel_does_not_resurrect_the_booking(bound_session_local) -> None:
+    """create -> update -> reschedule -> cancel -> Resend(create).
+
+    The Resend arrives LAST, so arrival order alone would make it look newest.
+    It must not un-delete the booking or restore the original start time.
+    """
+    created = booking_created()
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, created, event_hint="booking-created", payload_hash="h-create")
+            await _capture(session, booking_updated(), event_hint="booking-updated", payload_hash="h-update")
+            await _capture(session, booking_rescheduled(), event_hint="booking-rescheduled", payload_hash="h-resched")
+            await _capture(session, booking_canceled(), event_hint="booking-canceled", payload_hash="h-cancel")
+    assert await _run_until_idle() == 4
+
+    async with bound_session_local() as session:
+        record = (await session.execute(select(Record).where(Record.provider == "easyweek"))).scalars().one()
+        cancelled_start = record.starts_at
+        assert record.is_deleted is True
+
+    # The Resend: byte-identical body, same hash, delivered after the cancel.
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, booking_created_resend(), event_hint="booking-created", payload_hash="h-create")
+    assert await _run_until_idle() == 1
+
+    async with bound_session_local() as session:
+        records = list((await session.execute(select(Record).where(Record.provider == "easyweek"))).scalars().all())
+        assert len(records) == 1, "the Resend created a second Record"
+        record = records[0]
+        assert record.is_deleted is True, "the Resend resurrected a cancelled booking"
+        assert record.starts_at == cancelled_start, "the Resend rolled the time back to the original create"
+
+        clients = list((await session.execute(select(Client).where(Client.provider == "easyweek"))).scalars().all())
+        assert len(clients) == 1
+
+        statuses = list((await session.execute(select(EasyWeekEvent.status))).scalars().all())
+        assert statuses == ["processed"] * 5, "every delivery must still reach a terminal status"
+
+
+async def test_resend_after_cancel_creates_no_duplicate_job(bound_session_local, monkeypatch) -> None:
+    monkeypatch.setattr(settings, "easyweek_notifications_enabled", True, raising=False)
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, booking_created(), event_hint="booking-created", payload_hash="h-create")
+            await _capture(session, booking_canceled(), event_hint="booking-canceled", payload_hash="h-cancel")
+    await _run_until_idle()
+
+    async with bound_session_local() as session:
+        before = sorted((await session.execute(select(MessageJob.job_type))).scalars().all())
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, booking_created_resend(), event_hint="booking-created", payload_hash="h-create")
+    await _run_until_idle()
+
+    async with bound_session_local() as session:
+        after = sorted((await session.execute(select(MessageJob.job_type))).scalars().all())
+    assert after == before == ["record_canceled", "record_created"]
+
+
+async def test_replay_does_not_touch_service_or_client_rows(bound_session_local) -> None:
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, booking_created(), payload_hash="h-create")
+    await _run_until_idle()
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            record = (await session.execute(select(Record).where(Record.provider == "easyweek"))).scalars().one()
+            record.comment = "operator edit"
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, booking_created_resend(), payload_hash="h-create")
+    await _run_until_idle()
+
+    async with bound_session_local() as session:
+        record = (await session.execute(select(Record).where(Record.provider == "easyweek"))).scalars().one()
+        assert record.comment == "operator edit", "the replay re-applied domain writes"
+
+
+# ===========================================================================
+# UUID identity is authoritative (review fix 2)
+# ===========================================================================
+
+
+async def test_a_different_uuid_on_the_same_numeric_id_fails_closed(bound_session_local) -> None:
+    """One booking must never seize the row of another."""
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, booking_created(), payload_hash="h1")
+    await _run_until_idle()
+
+    other = booking_created()
+    other["uid"] = "99999999-2222-4333-8444-555555555555"  # same numeric id
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, other, payload_hash="h2")
+    assert await _run_until_idle() == 1
+
+    async with bound_session_local() as session:
+        records = list((await session.execute(select(Record).where(Record.provider == "easyweek"))).scalars().all())
+        assert len(records) == 1, "a conflicting UUID must not create a second row"
+        assert records[0].easyweek_booking_uuid == uuid.UUID(TEST_BOOKING_UUID), "the original UUID was overwritten"
+        assert records[0].altegio_record_id == TEST_BOOKING_ID
+
+        conflicting = (
+            (await session.execute(select(EasyWeekEvent).where(EasyWeekEvent.payload_hash == "h2"))).scalars().one()
+        )
+        assert conflicting.status == "failed"
+        assert conflicting.error_code == "identity_conflict"
+        assert conflicting.error_code in NormalizationError.ALL_CODES
+
+
+async def test_identity_conflict_leaves_the_original_record_intact(bound_session_local) -> None:
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, booking_created(), payload_hash="h1")
+    await _run_until_idle()
+
+    async with bound_session_local() as session:
+        original = (await session.execute(select(Record).where(Record.provider == "easyweek"))).scalars().one()
+        snapshot = (original.starts_at, original.short_link, original.comment, original.total_cost)
+
+    other = booking_created()
+    other["uid"] = "99999999-2222-4333-8444-555555555555"
+    other["booking_attributes.booking_comment"] = "hijack attempt"
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, other, payload_hash="h2")
+    await _run_until_idle()
+
+    async with bound_session_local() as session:
+        record = (await session.execute(select(Record).where(Record.provider == "easyweek"))).scalars().one()
+        assert (record.starts_at, record.short_link, record.comment, record.total_cost) == snapshot
+
+
+async def test_identity_conflict_does_not_touch_an_altegio_row(bound_session_local) -> None:
+    async with bound_session_local() as session:
+        async with session.begin():
+            session.add(
+                Record(
+                    provider="altegio",
+                    company_id=TEST_LOCATION_ID,
+                    altegio_record_id=TEST_BOOKING_ID,
+                    comment="altegio record",
+                )
+            )
+            await _capture(session, booking_created(), payload_hash="h1")
+    await _run_until_idle()
+
+    async with bound_session_local() as session:
+        altegio = (await session.execute(select(Record).where(Record.provider == "altegio"))).scalars().one()
+        assert altegio.comment == "altegio record"
+        assert altegio.easyweek_booking_uuid is None
+
+
+# ===========================================================================
+# Service and price are persisted (review fix 7)
+# ===========================================================================
+
+
+async def test_create_persists_the_service_and_total_cost(bound_session_local) -> None:
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, booking_created(), payload_hash="h1")
+    await _run_until_idle()
+
+    async with bound_session_local() as session:
+        record = (await session.execute(select(Record).where(Record.provider == "easyweek"))).scalars().one()
+        assert record.total_cost == Decimal("35.00"), "PR-5 templates would render 0.00"
+        services = list(
+            (await session.execute(select(RecordService).where(RecordService.record_id == record.id))).scalars().all()
+        )
+        assert len(services) == 1
+        assert services[0].service_id == 5100003
+        assert services[0].title == "Fixture Service"
+        assert services[0].cost_to_pay == Decimal("35.00")
+
+
+async def test_update_synchronises_a_changed_service_and_price(bound_session_local) -> None:
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, booking_created(), payload_hash="h1")
+    await _run_until_idle()
+
+    changed = booking_updated()
+    changed["service_id"] = 5100099
+    changed["service_name"] = "Different Service"
+    changed["booking_price_int"] = 5000
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, changed, event_hint="booking-updated", payload_hash="h2")
+    await _run_until_idle()
+
+    async with bound_session_local() as session:
+        record = (await session.execute(select(Record).where(Record.provider == "easyweek"))).scalars().one()
+        assert record.total_cost == Decimal("50.00")
+        services = list(
+            (await session.execute(select(RecordService).where(RecordService.record_id == record.id))).scalars().all()
+        )
+        assert len(services) == 1, "the old service row was not replaced"
+        assert services[0].service_id == 5100099
+        assert services[0].title == "Different Service"
+
+
+async def test_resend_does_not_create_a_second_service_row(bound_session_local) -> None:
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, booking_created(), payload_hash="h-create")
+            await _capture(session, booking_created_resend(), payload_hash="h-create")
+    await _run_until_idle()
+
+    async with bound_session_local() as session:
+        services = list((await session.execute(select(RecordService))).scalars().all())
+        assert len(services) == 1
+
+
+async def test_partial_event_without_service_fields_keeps_the_service(bound_session_local) -> None:
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, booking_created(), payload_hash="h1")
+    await _run_until_idle()
+
+    silent = booking_updated()
+    for key in ("service_id", "service_name", "quantity", "booking_price_int"):
+        silent.pop(key, None)
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, silent, event_hint="booking-updated", payload_hash="h2")
+    await _run_until_idle()
+
+    async with bound_session_local() as session:
+        record = (await session.execute(select(Record).where(Record.provider == "easyweek"))).scalars().one()
+        assert record.total_cost == Decimal("35.00"), "a silent delivery blanked the price"
+        services = list((await session.execute(select(RecordService))).scalars().all())
+        assert len(services) == 1, "a silent delivery deleted the known service"
+        assert services[0].title == "Fixture Service"
+
+
+async def test_altegio_record_services_are_untouched(bound_session_local) -> None:
+    async with bound_session_local() as session:
+        async with session.begin():
+            altegio = Record(provider="altegio", company_id=TEST_LOCATION_ID, altegio_record_id=777001)
+            session.add(altegio)
+            await session.flush()
+            session.add(RecordService(record_id=altegio.id, service_id=5100003, title="Altegio Service"))
+            await _capture(session, booking_created(), payload_hash="h1")
+    await _run_until_idle()
+
+    async with bound_session_local() as session:
+        altegio = (await session.execute(select(Record).where(Record.provider == "altegio"))).scalars().one()
+        services = list(
+            (await session.execute(select(RecordService).where(RecordService.record_id == altegio.id))).scalars().all()
+        )
+        assert len(services) == 1
+        assert services[0].title == "Altegio Service"
+
+
+# ===========================================================================
+# Partial deliveries preserve known fields (review fix 6)
+# ===========================================================================
+
+
+async def test_update_without_phone_keeps_the_known_phone(bound_session_local) -> None:
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, booking_created(), payload_hash="h1")
+    await _run_until_idle()
+
+    silent = booking_updated()
+    del silent["customer_phone"]
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, silent, event_hint="booking-updated", payload_hash="h2")
+    await _run_until_idle()
+
+    async with bound_session_local() as session:
+        client = (await session.execute(select(Client).where(Client.provider == "easyweek"))).scalars().one()
+        assert client.phone_e164 == "+49000000000", "a partial delivery blanked the phone"
+
+
+async def test_cancel_without_email_or_name_keeps_them(bound_session_local) -> None:
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, booking_created(), payload_hash="h1")
+    await _run_until_idle()
+
+    silent = booking_canceled()
+    for key in ("customer_email", "customer_full_name", "customer_name", "customer_first_name", "customer_last_name"):
+        silent.pop(key, None)
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, silent, event_hint="booking-canceled", payload_hash="h2")
+    await _run_until_idle()
+
+    async with bound_session_local() as session:
+        client = (await session.execute(select(Client).where(Client.provider == "easyweek"))).scalars().one()
+        assert client.email == "test.person@example.invalid"
+        assert client.display_name == "Test Person"
+
+
+async def test_partial_event_does_not_blank_times_or_staff(bound_session_local) -> None:
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, booking_created(), payload_hash="h1")
+    await _run_until_idle()
+
+    async with bound_session_local() as session:
+        before = (await session.execute(select(Record.starts_at).where(Record.provider == "easyweek"))).scalar_one()
+
+    silent = booking_updated()
+    for key in ("booking_date_start", "booking_date_end", "booking_duration", "users_description", "user_name"):
+        silent.pop(key, None)
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, silent, event_hint="booking-updated", payload_hash="h2")
+    await _run_until_idle()
+
+    async with bound_session_local() as session:
+        record = (await session.execute(select(Record).where(Record.provider == "easyweek"))).scalars().one()
+        assert record.starts_at == before
+        assert record.staff_name == "Fixture Specialist"
+        assert record.duration_sec == 3600
+
+
+# ===========================================================================
+# Deterministic failure is atomic with the claim (review fix 3)
+# ===========================================================================
+
+
+async def test_deterministic_failure_never_releases_the_row_mid_flight(bound_session_local) -> None:
+    """The rejection must not publish the row as `captured` again.
+
+    The old design rolled the outer transaction back and then failed the row in
+    a second transaction. In that window another worker could claim it, process
+    it successfully and mark it `processed` — only to have the first worker
+    overwrite that with `failed`.
+    """
+    bad = booking_created()
+    bad["location_id"] = FOREIGN_LOCATION_ID
+    async with bound_session_local() as session:
+        async with session.begin():
+            event_id = await _capture(session, bad, payload_hash="h1")
+
+    observed: list[str | None] = []
+
+    original_claim = worker.claim_next_event
+
+    async def _claim_and_peek(session):
+        event = await original_claim(session)
+        if event is not None:
+            # A CONCURRENT session must never see this row as claimable while
+            # the first worker still owns it.
+            async with bound_session_local() as other:
+                async with other.begin():
+                    stolen = await original_claim(other)
+                    observed.append(None if stolen is None else "stolen")
+        return event
+
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(worker, "claim_next_event", _claim_and_peek)
+    try:
+        assert await worker.process_one() is True
+    finally:
+        monkey.undo()
+
+    assert observed == [None], "a second worker claimed the row during the rejection"
+
+    async with bound_session_local() as session:
+        event = (await session.execute(select(EasyWeekEvent).where(EasyWeekEvent.id == event_id))).scalars().one()
+        assert event.status == "failed"
+        assert event.error_code == "foreign_location"
+
+
+async def test_a_processed_result_is_never_overwritten_by_a_failure(bound_session_local) -> None:
+    """Two workers, one event: exactly one terminal result, and it stands."""
+    async with bound_session_local() as session:
+        async with session.begin():
+            event_id = await _capture(session, booking_created(), payload_hash="h1")
+
+    assert await worker.process_one() is True
+    assert await worker.process_one() is False, "the event was claimable twice"
+
+    async with bound_session_local() as session:
+        event = (await session.execute(select(EasyWeekEvent).where(EasyWeekEvent.id == event_id))).scalars().one()
+        assert event.status == "processed"
+        assert event.error_code is None
+
+
+async def test_domain_writes_and_event_status_never_disagree(bound_session_local) -> None:
+    """A failed event must leave no Record; a processed one must leave one."""
+    bad = booking_created()
+    bad["location_id"] = FOREIGN_LOCATION_ID
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, bad, payload_hash="h-bad")
+            await _capture(session, booking_created(), payload_hash="h-good")
+    await _run_until_idle()
+
+    async with bound_session_local() as session:
+        rows = {
+            hash_: (status, code)
+            for hash_, status, code in (
+                await session.execute(
+                    select(EasyWeekEvent.payload_hash, EasyWeekEvent.status, EasyWeekEvent.error_code)
+                )
+            ).all()
+        }
+        assert rows["h-bad"] == ("failed", "foreign_location")
+        assert rows["h-good"] == ("processed", None)
+        records, clients, _ = await _counts(session)
+        assert (records, clients) == (1, 1), "the rejected event left partial writes"
+
+
+# ===========================================================================
+# Terminal-state invariants (review fix 11)
+# ===========================================================================
+
+
+async def test_processed_rows_have_a_timestamp_and_no_error_code(bound_session_local) -> None:
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, booking_created(), payload_hash="h1")
+            await _capture(session, booking_created(), event_hint="booking-succeeded", payload_hash="h2")
+    await _run_until_idle()
+
+    async with bound_session_local() as session:
+        for status, processed_at, code in (
+            await session.execute(select(EasyWeekEvent.status, EasyWeekEvent.processed_at, EasyWeekEvent.error_code))
+        ).all():
+            assert status == "processed"
+            assert processed_at is not None
+            assert code is None
+
+
+async def test_failed_rows_have_a_timestamp_and_a_safe_code(bound_session_local) -> None:
+    bad = booking_created()
+    bad["location_id"] = FOREIGN_LOCATION_ID
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, bad, payload_hash="h1")
+    await _run_until_idle()
+
+    async with bound_session_local() as session:
+        status, processed_at, code = (
+            await session.execute(select(EasyWeekEvent.status, EasyWeekEvent.processed_at, EasyWeekEvent.error_code))
+        ).one()
+        assert status == "failed"
+        assert processed_at is not None
+        assert code in NormalizationError.ALL_CODES
+
+
+async def test_captured_rows_after_a_transient_fault_stay_pristine(bound_session_local, monkeypatch) -> None:
+    async def _boom(*args, **kwargs):
+        raise RuntimeError("transient")
+
+    monkeypatch.setattr(worker, "apply_booking", _boom)
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, booking_created(), payload_hash="h1")
+
+    with pytest.raises(RuntimeError):
+        await worker.process_one()
+
+    async with bound_session_local() as session:
+        status, processed_at, code = (
+            await session.execute(select(EasyWeekEvent.status, EasyWeekEvent.processed_at, EasyWeekEvent.error_code))
+        ).one()
+        assert (status, processed_at, code) == ("captured", None, None)
+        assert await _counts(session) == (0, 0, 0)
+
+
+# ===========================================================================
+# booking-succeeded shares validation and isolation (review fix 8)
+# ===========================================================================
+
+
+async def test_succeeded_for_our_location_is_processed_without_side_effects(bound_session_local) -> None:
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, booking_created(), event_hint="booking-succeeded", payload_hash="h1")
+    await _run_until_idle()
+
+    async with bound_session_local() as session:
+        event = (await session.execute(select(EasyWeekEvent))).scalars().one()
+        assert event.status == "processed"
+        assert event.error_code is None
+        assert await _counts(session) == (0, 0, 0)
+
+
+@pytest.mark.parametrize(
+    ("mutate", "truncated", "expected"),
+    [
+        (lambda p: p.update({"location_id": FOREIGN_LOCATION_ID}), False, "foreign_location"),
+        (lambda p: p.clear(), False, "invalid_payload"),
+        (lambda p: None, True, "truncated_payload"),
+        (lambda p: p.pop("location_id"), False, "invalid_location_id"),
+    ],
+)
+async def test_invalid_succeeded_events_fail_closed(bound_session_local, mutate, truncated, expected) -> None:
+    """A foreign or malformed `booking-succeeded` must NOT be marked processed."""
+    payload = booking_created()
+    mutate(payload)
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, payload, event_hint="booking-succeeded", payload_hash="h1", truncated=truncated)
+    await _run_until_idle()
+
+    async with bound_session_local() as session:
+        event = (await session.execute(select(EasyWeekEvent))).scalars().one()
+        assert event.status == "failed"
+        assert event.error_code == expected
+        assert await _counts(session) == (0, 0, 0)

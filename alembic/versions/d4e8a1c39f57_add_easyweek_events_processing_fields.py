@@ -9,13 +9,19 @@ easyweek_inbox_worker:
     отказа. Сознательно НЕ сырой ``str(exception)``: текст исключения драйвера
     или БД содержит SQL-параметры, а с ними телефон, e-mail и имя клиента —
     такой текст в колонке был бы утечкой PII.
+  * индекс ``(status, received_at)`` — воркер забирает строго
+    ``status='captured'`` в порядке поступления.
 
-Строго аддитивная и идемпотентная:
-  * ``IF NOT EXISTS`` делает повторный upgrade no-op;
-  * сырые колонки захвата (``body_raw``, ``body_text``, ``payload``) не
-    затрагиваются — источник истины остаётся прежним;
-  * чужих таблиц не касается;
-  * downgrade снимает ТОЛЬКО две колонки этой ревизии.
+Обычные Alembic-операции, БЕЗ ``IF NOT EXISTS`` / ``IF EXISTS``. Это осознанно:
+защитные варианты принимают объект с правильным ИМЕНЕМ, но неправильным типом
+или определением, и всё равно записывают ревизию как применённую — молчаливый
+schema drift, который потом проявится как ошибка рантайма. Alembic и так не
+выполняет уже применённую ревизию повторно, поэтому идемпотентность на уровне
+DDL здесь не нужна, а fail-closed при дрейфе — нужен.
+
+Строго аддитивная: сырые колонки захвата (``body_raw``, ``body_text``,
+``payload``) не затрагиваются, чужих таблиц не касается, downgrade снимает
+ТОЛЬКО объекты этой ревизии.
 
 Revision ID: d4e8a1c39f57
 Revises: c1a7d3f905b2
@@ -35,24 +41,25 @@ down_revision: Union[str, Sequence[str], None] = "c1a7d3f905b2"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
+_TABLE = "easyweek_events"
+_INDEX = "ix_easyweek_events_status_received_at"
+
 
 def upgrade() -> None:
-    """Upgrade schema (additive, idempotent)."""
-    op.execute(sa.text("ALTER TABLE easyweek_events ADD COLUMN IF NOT EXISTS processed_at TIMESTAMPTZ"))
-    op.execute(sa.text("ALTER TABLE easyweek_events ADD COLUMN IF NOT EXISTS error_code VARCHAR(64)"))
-
-    # The worker claims strictly `status='captured'` oldest-first; this index
-    # keeps that claim cheap once a real backlog exists.
-    op.execute(
-        sa.text(
-            "CREATE INDEX IF NOT EXISTS ix_easyweek_events_status_received_at "
-            "ON easyweek_events (status, received_at)"
-        )
+    """Upgrade schema."""
+    op.add_column(
+        _TABLE,
+        sa.Column("processed_at", sa.DateTime(timezone=True), nullable=True),
     )
+    op.add_column(
+        _TABLE,
+        sa.Column("error_code", sa.String(length=64), nullable=True),
+    )
+    op.create_index(_INDEX, _TABLE, ["status", "received_at"], unique=False)
 
 
 def downgrade() -> None:
     """Downgrade schema — removes ONLY what this revision added."""
-    op.execute(sa.text("DROP INDEX IF EXISTS ix_easyweek_events_status_received_at"))
-    op.execute(sa.text("ALTER TABLE easyweek_events DROP COLUMN IF EXISTS error_code"))
-    op.execute(sa.text("ALTER TABLE easyweek_events DROP COLUMN IF EXISTS processed_at"))
+    op.drop_index(_INDEX, table_name=_TABLE)
+    op.drop_column(_TABLE, "error_code")
+    op.drop_column(_TABLE, "processed_at")

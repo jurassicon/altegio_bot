@@ -179,10 +179,20 @@ def test_pr4_migration_leaves_the_raw_capture_columns_alone() -> None:
         assert untouched not in statements, f"PR-4 must not touch {untouched}"
 
 
-def test_pr4_migration_is_additive_and_idempotent_by_construction() -> None:
+def test_pr4_migration_uses_strict_operations_not_if_not_exists() -> None:
+    """Defensive DDL would accept a same-named object of the WRONG shape.
+
+    `ADD COLUMN IF NOT EXISTS` silently succeeds against a pre-existing column
+    of a different type and still stamps the revision as applied — the drift
+    then surfaces at runtime instead of at deploy time.
+    """
     statements = _migration_statements(PR4_REVISION)
-    assert "ADD COLUMN IF NOT EXISTS" in statements
-    assert statements.count("DROP COLUMN IF EXISTS") == 2, "downgrade must drop exactly the two PR-4 columns"
+    for defensive in ("IF NOT EXISTS", "IF EXISTS"):
+        assert defensive not in statements, f"migration must fail closed on drift, found {defensive!r}"
+    assert "op.add_column" in statements
+    assert "op.create_index" in statements
+    assert statements.count("op.drop_column") == 2, "downgrade must drop exactly the two PR-4 columns"
+    assert "op.drop_index" in statements
 
 
 def test_applied_revisions_are_not_edited() -> None:
@@ -298,3 +308,86 @@ async def test_head_upgrade_on_an_empty_database_reaches_pr4(temp_db_url: str) -
     _alembic_ok("upgrade", "head", db_url=temp_db_url)
     current = _alembic_ok("current", db_url=temp_db_url)
     assert PR4_REVISION in current
+
+
+# ===========================================================================
+# Exact structure, and fail-closed on drift (review fix 10)
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_columns_have_the_exact_expected_types_and_nullability(temp_db_url: str) -> None:
+    _alembic_ok("upgrade", PR4_REVISION, db_url=temp_db_url)
+    rows = await _fetch(
+        temp_db_url,
+        "SELECT column_name, data_type, is_nullable FROM information_schema.columns "
+        "WHERE table_name = 'easyweek_events' AND column_name IN ('processed_at', 'error_code')",
+    )
+    actual = {row[0]: (row[1], row[2]) for row in rows}
+    assert actual == {
+        "processed_at": ("timestamp with time zone", "YES"),
+        "error_code": ("character varying", "YES"),
+    }
+
+    length = await _fetch(
+        temp_db_url,
+        "SELECT character_maximum_length FROM information_schema.columns "
+        "WHERE table_name = 'easyweek_events' AND column_name = 'error_code'",
+    )
+    assert length[0][0] == 64, "error_code must stay bounded at 64"
+
+
+@pytest.mark.asyncio
+async def test_index_covers_exactly_status_then_received_at(temp_db_url: str) -> None:
+    _alembic_ok("upgrade", PR4_REVISION, db_url=temp_db_url)
+    rows = await _fetch(
+        temp_db_url,
+        "SELECT indexdef FROM pg_indexes WHERE tablename = 'easyweek_events' AND indexname = :n",
+        {"n": PR4_INDEX},
+    )
+    assert rows, "the PR-4 index is missing"
+    definition = rows[0][0]
+    assert "(status, received_at)" in definition, f"wrong index columns/order: {definition}"
+    assert "UNIQUE" not in definition.upper()
+
+
+@pytest.mark.asyncio
+async def test_upgrade_fails_closed_on_a_same_named_column_of_the_wrong_type(temp_db_url: str) -> None:
+    """Defensive DDL would ACCEPT this drift and still stamp the revision.
+
+    A pre-existing `error_code` of the wrong type must stop the deploy, not be
+    silently adopted and then blow up at runtime.
+    """
+    _alembic_ok("upgrade", PR3_REVISION, db_url=temp_db_url)
+
+    engine = create_async_engine(temp_db_url)
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(text("ALTER TABLE easyweek_events ADD COLUMN error_code INTEGER"))
+    finally:
+        await engine.dispose()
+
+    failed = _run_alembic("upgrade", PR4_REVISION, db_url=temp_db_url)
+    assert failed.returncode != 0, "upgrade accepted a same-named column of the wrong type"
+
+    current = _alembic_ok("current", db_url=temp_db_url)
+    assert PR4_REVISION not in current, "the revision was stamped despite the drift"
+
+
+@pytest.mark.asyncio
+async def test_upgrade_fails_closed_on_a_same_named_index_with_a_different_definition(temp_db_url: str) -> None:
+    _alembic_ok("upgrade", PR3_REVISION, db_url=temp_db_url)
+
+    engine = create_async_engine(temp_db_url)
+    try:
+        async with engine.begin() as conn:
+            # Same NAME, wrong columns.
+            await conn.execute(text(f"CREATE INDEX {PR4_INDEX} ON easyweek_events (event_hint)"))
+    finally:
+        await engine.dispose()
+
+    failed = _run_alembic("upgrade", PR4_REVISION, db_url=temp_db_url)
+    assert failed.returncode != 0, "upgrade accepted a same-named index with the wrong definition"
+
+    current = _alembic_ok("current", db_url=temp_db_url)
+    assert PR4_REVISION not in current, "the revision was stamped despite the drift"

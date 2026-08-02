@@ -35,6 +35,7 @@ import hashlib
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any, Final
 from urllib.parse import urlsplit
 
@@ -89,6 +90,9 @@ class NormalizationError(Exception):
     FOREIGN_LOCATION: Final = "foreign_location"
     INVALID_DATETIME: Final = "invalid_datetime"
     INVALID_MANAGE_LINK: Final = "invalid_manage_link"
+    # The numeric booking id already belongs to a Record carrying a DIFFERENT
+    # booking UUID. Raised by the worker, not by payload validation.
+    IDENTITY_CONFLICT: Final = "identity_conflict"
 
     ALL_CODES: Final = frozenset(
         {
@@ -102,6 +106,7 @@ class NormalizationError(Exception):
             FOREIGN_LOCATION,
             INVALID_DATETIME,
             INVALID_MANAGE_LINK,
+            IDENTITY_CONFLICT,
         }
     )
 
@@ -139,8 +144,6 @@ class NormalizedBooking:
     email: str | None
     staff_name: str | None
     comment: str | None
-    service_id: int | None
-    service_name: str | None
     # None means "no proven link in this delivery". Whether that clears the
     # stored link or preserves it is decided by ``manage_link_present``.
     manage_link: ManageLink | None
@@ -148,6 +151,23 @@ class NormalizedBooking:
     # with neither field keeps the last proven link; a delivery that carried
     # them but failed validation must not leave a stale link in place.
     manage_link_present: bool
+
+    # --- service / price (PR-5 renders from domain data, not from payload) ---
+    service_id: int | None
+    service_name: str | None
+    service_quantity: int | None
+    # `booking_price_int` is the authoritative JSON number and is in CENTS
+    # (3500 == 35.00). The `booking_price*` string variants are display values.
+    total_cost: Decimal | None
+
+    # Logical names of the fields this delivery actually CARRIED. Patch
+    # semantics: a field absent from a partial delivery must not blank the
+    # value we already know, while a field that is present — including present
+    # and empty — is authoritative for this booking.
+    present_fields: frozenset[str]
+
+    def carries(self, field: str) -> bool:
+        return field in self.present_fields
 
 
 def map_event_hint(event_hint: str | None) -> str:
@@ -174,6 +194,31 @@ def _require_int(value: Any, *, code: str) -> int:
     if isinstance(value, float) and value.is_integer():
         return int(value)
     raise NormalizationError(code)
+
+
+def _optional_int(value: Any) -> int | None:
+    """A JSON number, or None. Never a bool, never a numeric string."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return None
+
+
+def _price_to_decimal(payload: dict[str, Any]) -> Decimal | None:
+    """Booking price as a money Decimal.
+
+    ``booking_price_int`` is the authoritative JSON **number** and is expressed
+    in minor units (3500 == 35.00). The ``booking_price`` / ``_float`` /
+    ``_formatted`` siblings are localized display strings — parsing those would
+    inherit the salon's decimal separator and currency symbol.
+    """
+    cents = _optional_int(payload.get("booking_price_int"))
+    if cents is None or cents < 0:
+        return None
+    return (Decimal(cents) / Decimal(100)).quantize(Decimal("0.01"))
 
 
 def _optional_str(value: Any, *, limit: int | None = None) -> str | None:
@@ -263,26 +308,31 @@ def extract_manage_link(payload: dict[str, Any]) -> tuple[ManageLink | None, boo
     if not page:
         return None, True
 
+    # EVERY component access is inside the guard, not just urlsplit(). Reading
+    # `.port` on "https://eyw.me:bad/r/1" or "https://[oops/r/1" raises
+    # ValueError from urllib itself — lazily, at attribute access. Letting that
+    # escape would turn an untrusted URL into an unexpected exception, skip the
+    # deterministic path entirely, and leave the row stuck at the head of the
+    # queue. Any parse failure is simply an untrusted pair.
     try:
         parts = urlsplit(page)
+        if parts.scheme != MANAGE_LINK_SCHEME:
+            return None, True
+        # `hostname` lowercases and strips the port; comparing it to the bare
+        # host while separately rejecting port/credentials closes the
+        # "https://eyw.me:1234@evil/" family.
+        if parts.hostname != MANAGE_LINK_HOST:
+            return None, True
+        if parts.port is not None or parts.username or parts.password:
+            return None, True
+        if parts.query or parts.fragment:
+            return None, True
+        if not parts.path.startswith(MANAGE_LINK_PREFIX):
+            return None, True
+        url_hash = parts.path[len(MANAGE_LINK_PREFIX) :]
     except ValueError:
         return None, True
 
-    if parts.scheme != MANAGE_LINK_SCHEME:
-        return None, True
-    # `hostname` lowercases and strips the port; comparing it to the bare host
-    # while separately rejecting `port`/credentials closes the
-    # "https://eyw.me:1234@evil/" family.
-    if parts.hostname != MANAGE_LINK_HOST:
-        return None, True
-    if parts.port is not None or parts.username or parts.password:
-        return None, True
-    if parts.query or parts.fragment:
-        return None, True
-    if not parts.path.startswith(MANAGE_LINK_PREFIX):
-        return None, True
-
-    url_hash = parts.path[len(MANAGE_LINK_PREFIX) :]
     if url_hash != hash_id:
         return None, True
 
@@ -325,12 +375,14 @@ def normalize_event(
     Raises :class:`NormalizationError` for every deterministic rejection.
     """
     action = map_event_hint(event_hint)
-    if action == IGNORE:
-        return None
 
-    # A truncated body is not a payload we may reason about: the missing tail
-    # could contain the very fields we validate.
+    # Payload integrity and location isolation are validated for EVERY event,
+    # including the ones we ignore. Returning early for `booking-succeeded`
+    # would hand a `processed` status to a truncated, empty or FOREIGN-location
+    # delivery — a foreign booking must never be recorded as successfully
+    # handled by this bot, whatever its trigger.
     if body_truncated:
+        # The missing tail could contain the very fields we validate.
         raise NormalizationError(NormalizationError.TRUNCATED_PAYLOAD)
     if not isinstance(payload, dict) or not payload:
         raise NormalizationError(NormalizationError.INVALID_PAYLOAD)
@@ -341,6 +393,14 @@ def normalize_event(
     location_id = _require_int(payload.get("location_id"), code=NormalizationError.INVALID_LOCATION_ID)
     if location_id != expected_location_id:
         raise NormalizationError(NormalizationError.FOREIGN_LOCATION)
+
+    if action == IGNORE:
+        # `booking-succeeded` is captured for phase 2 (visits_total / review
+        # guard) and produces no Client, Record or MessageJob. The booking UUID
+        # is deliberately NOT required here: nothing is keyed by it on this
+        # path, so demanding it would fail events we only need to retain.
+        # Integrity and isolation above were still enforced.
+        return None
 
     raw_uid = payload.get("uid")
     if raw_uid is None or (isinstance(raw_uid, str) and not raw_uid.strip()):
@@ -373,13 +433,45 @@ def normalize_event(
             if minutes >= 0:
                 duration_sec = minutes * 60
 
-    service_id: int | None = None
-    raw_service_id = payload.get("service_id")
-    if raw_service_id is not None and not isinstance(raw_service_id, bool):
-        if isinstance(raw_service_id, int) or (isinstance(raw_service_id, float) and raw_service_id.is_integer()):
-            service_id = int(raw_service_id)
+    service_id = _optional_int(payload.get("service_id"))
+    service_quantity = _optional_int(payload.get("quantity"))
+    total_cost = _price_to_decimal(payload)
 
     manage_link, manage_link_present = extract_manage_link(payload)
+
+    # Which logical fields this delivery actually carried. `booking-updated`
+    # legitimately omits fields the salon did not touch, and blanking a known
+    # value because a partial delivery was silent would lose data we already
+    # proved.
+    present_fields = (
+        frozenset(
+            name
+            for name, key in (
+                ("phone_e164", "customer_phone"),
+                ("email", "customer_email"),
+                ("starts_at", "booking_date_start"),
+                ("ends_at", "booking_date_end"),
+                ("duration_sec", "booking_duration"),
+                ("staff_name", "users_description"),
+                ("comment", "booking_attributes.booking_comment"),
+                ("service_id", "service_id"),
+                ("service_name", "service_name"),
+                ("service_quantity", "quantity"),
+                ("total_cost", "booking_price_int"),
+            )
+            if key in payload
+        )
+        | (
+            # display_name is derived from several possible keys.
+            frozenset({"display_name"})
+            if any(
+                key in payload
+                for key in ("customer_full_name", "customer_name", "customer_first_name", "customer_last_name")
+            )
+            else frozenset()
+        )
+        | (frozenset({"staff_name"}) if "user_name" in payload else frozenset())
+    )
 
     return NormalizedBooking(
         action=action,
@@ -396,10 +488,13 @@ def normalize_event(
         staff_name=_optional_str(payload.get("users_description"), limit=256)
         or _optional_str(payload.get("user_name"), limit=256),
         comment=_optional_str(payload.get("booking_attributes.booking_comment")),
-        service_id=service_id,
-        service_name=_optional_str(payload.get("service_name"), limit=256),
         manage_link=manage_link,
         manage_link_present=manage_link_present,
+        service_id=service_id,
+        service_name=_optional_str(payload.get("service_name"), limit=512),
+        service_quantity=service_quantity,
+        total_cost=total_cost,
+        present_fields=present_fields,
     )
 
 

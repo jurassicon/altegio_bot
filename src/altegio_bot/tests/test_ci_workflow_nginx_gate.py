@@ -596,6 +596,9 @@ _EXPECTED_CRITICAL_SERVICES = frozenset(
         "altegio-meta-guard-worker",
         "altegio-campaign-worker",
         "altegio-followup-worker",
+        # PR-4: the EasyWeek normalizer is a standing service and must be
+        # verified after every deploy like any other worker.
+        "altegio-easyweek-inbox-worker",
     }
 )
 

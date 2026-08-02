@@ -74,6 +74,10 @@ EASYWEEK_NOTIFICATIONS_ENABLED=false
 docker compose -p altegio_bot ps altegio-easyweek-inbox-worker
 ```
 
+После деплоя этот сервис входит в обязательные post-deploy проверки workflow
+(`CRITICAL_SERVICES`): он обязан быть `running`, не в restart loop и не
+`unhealthy` — иначе деплой падает.
+
 Ожидается `running`, без restart-цикла. В логе — одна строка о том, что
 обработка выключена, а не поток сообщений.
 
@@ -134,8 +138,26 @@ docker compose -p altegio_bot exec -T postgres sh -lc 'psql -tAX -U "$POSTGRES_U
 docker compose -p altegio_bot exec -T postgres sh -lc 'psql -tAX -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT provider, company_id, easyweek_booking_uuid IS NOT NULL AS has_uuid, easyweek_booking_hash_id IS NOT NULL AS has_hash, short_link IS NOT NULL AS has_link, is_deleted FROM records WHERE provider = '"'"'easyweek'"'"'"'
 ```
 
-Resend не должен был создать вторую доменную строку: две терминальные
-`easyweek_events`, но один Record и один Client.
+Resend не должен был создать вторую доменную строку. **Проверять итоговое
+состояние, а не только количество строк** — совпадения счётчиков недостаточно:
+устаревшая повторная доставка может не создать вторую строку и при этом
+откатить состояние существующей.
+
+```bash
+docker compose -p altegio_bot exec -T postgres sh -lc 'psql -tAX -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT r.easyweek_booking_uuid, r.is_deleted, r.starts_at, r.total_cost FROM records r WHERE r.provider = '"'"'easyweek'"'"'"'
+```
+
+Для записи, прошедшей полный цикл до отмены, ожидается `is_deleted = t` и
+`starts_at`, равное ПОСЛЕДНЕМУ перенесённому времени. Если после Resend
+`is_deleted` стало `f` или время откатилось к исходному создению — это регресс.
+
+Услуга и стоимость должны быть сохранены (их использует PR-5):
+
+```bash
+docker compose -p altegio_bot exec -T postgres sh -lc 'psql -tAX -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT rs.service_id, rs.title, rs.cost_to_pay FROM record_services rs JOIN records r ON r.id = rs.record_id WHERE r.provider = '"'"'easyweek'"'"'"'
+```
+
+Ожидается ровно одна строка на booking с непустыми `title` и `cost_to_pay`.
 
 **Очередь должна остаться пустой:**
 
@@ -211,11 +233,30 @@ Capture продолжает работать, накопление событи
 invalid_event_hint     invalid_payload        truncated_payload
 missing_booking_uuid   invalid_booking_uuid   missing_booking_id
 invalid_location_id    foreign_location       invalid_datetime
-invalid_manage_link
+invalid_manage_link    identity_conflict
 ```
 
-Транзиентная ошибка (недоступность БД и т.п.) НЕ помечает событие `failed`:
-транзакция откатывается целиком, строка остаётся `captured` и будет повторена.
+`identity_conflict` — numeric booking id уже принадлежит Record с ДРУГИМ
+`easyweek_booking_uuid`. Существующая строка не меняется; событие падает
+fail-closed. Это не ошибка деплоя: это защита от захвата чужой записи.
+
+**Транзиентная ошибка** (недоступность БД, сетевой сбой) НЕ помечает событие
+`failed`: транзакция откатывается целиком, строка остаётся `captured` и будет
+повторена. В логе появляется только `processing_error` и имя класса исключения —
+ни текста ошибки, ни SQL-параметров, ни traceback (там были бы телефон, e-mail и
+имя клиента). Повторы идут с экспоненциальным backoff до 30 с, поэтому одна
+постоянно падающая строка не крутит цикл и не блокирует backlog навсегда.
+
+Инварианты терминальных статусов:
+
+| Статус | domain writes | `processed_at` | `error_code` |
+|---|---|---|---|
+| `processed` | применены | заполнен | NULL |
+| `failed` | отсутствуют | заполнен | безопасный код |
+| `captured` | отсутствуют | NULL | NULL |
+
+`processing` после коммита не виден никогда — он существует только внутри
+открытой транзакции.
 
 ---
 
