@@ -115,8 +115,9 @@ def _main_index(marker: str) -> int:
 _PHASES = (
     ("build", "$COMPOSE build"),
     ("backup", "pg_dump"),
+    ("structured revision read", 'REVISION_BEFORE="$(fact "$REVISION_FACTS" REVISION)"'),
+    ("database identity cross-check", 'POSTGRES_DB_IDENTITY="$(postgres_db_identity)"'),
     ("transition classification", 'SCRIPT_FACTS="$(alembic_script_facts "$REVISION_BEFORE")"'),
-    ("phase A catch-up", 'alembic upgrade "$PRE_PR3_REVISION"'),
     ("deploy boundary", 'DEPLOY_BOUNDARY_EPOCH_US="$(psql_scalar'),
     ("legacy worker stop", 'echo "🛑 Stopping the legacy altegio-inbox-worker'),
     ("constraint-failure baseline", 'CONSTRAINT_FAILURES_BEFORE="$(constraint_failure_count)"'),
@@ -180,16 +181,13 @@ def test_transition_matrix_branches_on_lineage_not_only_strings() -> None:
     assert "PR3_TRANSITION=0" in repeat_branch
     assert "PR3_TRANSITION=1" not in repeat_branch
 
-    # 2. The exact one-time step arms the special flow directly.
-    assert 'if [ "$REVISION_BEFORE" = "$PRE_PR3_REVISION" ]; then' in script
+    # 2. The exact one-time step arms the special flow.
+    assert 'if [ "$REVISION_BEFORE" = "$PRE_PR3_REVISION" ] && [ "$TARGET_HEAD" = "$PR3_REVISION" ]; then' in script
 
-    # 3. A database behind the pre-PR-3 revision no longer dead-ends: it takes
-    #    the audited Phase A catch-up, and only an UNAUDITED or unresolvable
-    #    revision is refused outright.
-    assert "PHASE_A_REQUIRED=1" in script
-    refused = _between("is not on the audited pre-PR-3 catch-up path", "PHASE_A_REQUIRED=1")
-    assert "exit 1" in refused
-    assert "No schema change was made" in refused
+    # 3. PR-3 reached as part of a multi-revision upgrade is blocked outright.
+    blocked = _between("would apply PR-3", "One-time constraint-swap window")
+    assert "exit 1" in blocked
+    assert "No schema change was made" in blocked
 
     # 4. PR-3 not in the graph at all → ordinary flow.
     assert script.count("PR3_TRANSITION=0") >= 2
@@ -198,11 +196,14 @@ def test_transition_matrix_branches_on_lineage_not_only_strings() -> None:
 @pytest.mark.parametrize(
     "refusal",
     [
-        "is not on the audited pre-PR-3 catch-up path",
-        "The real migration path does not match the audited one",
-        "is not a known ancestor of",
+        "Bring the database to $PRE_PR3_REVISION first",
         "is no longer a direct child of",
-        "could not resolve the revision recorded in this database",
+        "is not a well-formed Alembic revision id",
+        "are NOT on the same database",
+        "The two revision sources disagree",
+        "not one this code knows",
+        "Alembic heads; exactly one is required",
+        "has no Alembic revision",
     ],
 )
 def test_every_classification_refusal_precedes_any_schema_change(refusal: str) -> None:
