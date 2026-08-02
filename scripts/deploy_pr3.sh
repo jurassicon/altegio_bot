@@ -72,6 +72,9 @@ CONSTRAINT_FAILURES_BEFORE=""
 CANARY_DRAIN_UNCERTAIN=0
 DEPLOY_BOUNDARY_EPOCH_US=""
 
+MIGRATE_DB_IDENTITY=""
+POSTGRES_DB_IDENTITY=""
+
 # Reads one scalar over stdin so no SQL quoting has to survive the
 # ssh -> sh -> psql nesting. Credentials stay inside the container.
 psql_scalar() {
@@ -80,9 +83,131 @@ psql_scalar() {
     | tr -d '[:space:]'
 }
 
-alembic_revision() {
-  $COMPOSE --profile ops run --rm --no-deps migrate alembic current 2>/dev/null \
-    | tr -d '\r' | grep -oE '[0-9a-f]{12}' | head -n 1
+# Exactly 12 lowercase hex characters — the whole value, never a prefix.
+is_revision_id() {
+  case "${1:-}" in
+    "" | *[!0-9a-f]*) return 1 ;;
+  esac
+  [ "${#1}" -eq 12 ]
+}
+
+# THE source of truth for "what revision is this database on".
+#
+# It does NOT parse the human-readable output of `alembic current`. That
+# output mixes revisions with prose ("(head)"), warnings and failure text
+# — "FAILED: Can't locate revision identified by 'deadbeef1234'" — and any
+# 12-hex token scraped out of it looks exactly like a real revision. It
+# also collapses a multi-head database into whichever line came first.
+#
+# Instead this runs INSIDE the migrate container, over the SAME engine and
+# configuration Alembic itself will use for the migration, and emits a
+# machine-readable protocol. It reports the physical database identity in
+# the same breath, so the caller can prove the revision it just read came
+# from the database the migration will actually write to.
+#
+# Nothing sensitive is printed: name, cluster system identifier and OID
+# are emitted, never the password, the DSN or the environment.
+alembic_revision_facts() {
+  $COMPOSE --profile ops run --rm --no-deps -T migrate \
+    /app/.venv/bin/python -c '
+import asyncio
+import sys
+
+from sqlalchemy import text
+
+from alembic.config import Config
+from alembic.script import ScriptDirectory
+from alembic.runtime.migration import MigrationContext
+
+from altegio_bot.db import engine
+from altegio_bot.settings import settings
+
+
+def _db_heads(sync_connection):
+    return MigrationContext.configure(sync_connection).get_current_heads()
+
+
+async def main() -> int:
+    facts = {}
+    try:
+        url = engine.url
+        facts["DRIVER"] = url.drivername or ""
+        facts["HOST"] = url.host or ""
+        facts["PORT"] = str(url.port or "")
+        facts["URL_DATABASE"] = url.database or ""
+
+        async with engine.connect() as connection:
+            row = (
+                await connection.execute(
+                    text(
+                        "SELECT current_database(), "
+                        "(SELECT system_identifier FROM pg_control_system()), "
+                        "(SELECT oid FROM pg_database WHERE datname = current_database())"
+                    )
+                )
+            ).one()
+            facts["DB_NAME"] = str(row[0])
+            facts["DB_SYSTEM_ID"] = str(row[1])
+            facts["DB_OID"] = str(row[2])
+
+            heads = tuple(await connection.run_sync(_db_heads))
+    except Exception as exc:
+        print("REVISION_STATUS=error")
+        print("REVISION_ERROR=" + type(exc).__name__)
+        return 0
+    finally:
+        await engine.dispose()
+
+    script = ScriptDirectory.from_config(Config("/app/alembic.ini"))
+    code_heads = set(script.get_heads())
+
+    if len(heads) > 1:
+        facts["REVISION_STATUS"] = "multiple"
+    elif not heads:
+        facts["REVISION_STATUS"] = "none"
+    else:
+        facts["REVISION_STATUS"] = "ok"
+        facts["REVISION"] = heads[0]
+        try:
+            script.get_revision(heads[0])
+        except Exception:
+            facts["REVISION_STATUS"] = "unknown"
+    facts["DB_HEAD_COUNT"] = str(len(heads))
+    facts["CODE_HEAD_COUNT"] = str(len(code_heads))
+
+    for key in (
+        "REVISION_STATUS",
+        "REVISION",
+        "DB_HEAD_COUNT",
+        "CODE_HEAD_COUNT",
+        "DRIVER",
+        "HOST",
+        "PORT",
+        "URL_DATABASE",
+        "DB_NAME",
+        "DB_SYSTEM_ID",
+        "DB_OID",
+    ):
+        if key in facts:
+            print(key + "=" + facts[key])
+    return 0
+
+
+sys.exit(asyncio.run(main()))
+' 2>/dev/null | tr -d '\r'
+}
+
+# The same three identifiers, read through the postgres container instead
+# of through Alembic. Equality of the triple proves both readers are on
+# one physical database in one cluster.
+postgres_db_identity() {
+  psql_scalar "SELECT current_database() || '|' || (SELECT system_identifier FROM pg_control_system()) || '|' || (SELECT oid FROM pg_database WHERE datname = current_database());"
+}
+
+# Every row of alembic_version, sorted, straight from the postgres
+# container. 'NOTABLE' and 'EMPTY' are distinguishable from a revision.
+postgres_alembic_version() {
+  psql_scalar "SELECT CASE WHEN to_regclass('alembic_version') IS NULL THEN 'NOTABLE' ELSE COALESCE((SELECT string_agg(version_num, ',' ORDER BY version_num) FROM alembic_version), 'EMPTY') END;"
 }
 
 # Facts about the NEW code's revision graph, straight from Alembic's
@@ -107,15 +232,43 @@ def lineage(rev):
     except Exception:
         return set()
 head = heads[0] if len(heads) == 1 else ""
+# The recorded parent of PR-3. The bounded downgrade below only means
+# "undo the constraint swap" while PR-3 is a single step past pre-PR-3.
+pr3_parent = ""
+try:
+    down = sd.get_revision(pr3).down_revision
+except Exception:
+    down = None
+if isinstance(down, str):
+    pr3_parent = down
+elif down:
+    pr3_parent = ",".join(down)
 print("HEAD_COUNT=" + str(len(heads)))
 print("TARGET_HEAD=" + head)
 print("PR3_IN_HEAD_LINEAGE=" + ("1" if pr3 in lineage(head) else "0"))
 print("PR3_IN_DB_LINEAGE=" + ("1" if pr3 in lineage(db) else "0"))
+print("PR3_PARENT=" + pr3_parent)
 ' 2>/dev/null | tr -d '\r'
 }
 
 fact() {
   printf '%s\n' "$1" | grep -E "^$2=" | head -n 1 | cut -d= -f2-
+}
+
+# Thin wrapper for the recovery path, which only needs the id. Returns 1
+# unless the database is on exactly one head that this code recognises, so
+# an unreadable database can never be mistaken for a known revision.
+alembic_revision() {
+  # Distinct variable names: this runs inside recover() too, and must not
+  # overwrite the classification facts the main flow established.
+  RECOVER_REVISION_FACTS="$(alembic_revision_facts)"
+  RECOVER_REVISION_STATUS="$(fact "$RECOVER_REVISION_FACTS" REVISION_STATUS)"
+  RECOVER_REVISION_VALUE="$(fact "$RECOVER_REVISION_FACTS" REVISION)"
+  if [ "$RECOVER_REVISION_STATUS" != "ok" ] || ! is_revision_id "$RECOVER_REVISION_VALUE"; then
+    return 1
+  fi
+  printf '%s' "$RECOVER_REVISION_VALUE"
+  return 0
 }
 
 # EXACT id of the regular Compose service container. `docker ps` by
@@ -444,7 +597,13 @@ recover() {
       echo "❌ Revision is '${CURRENT_REVISION:-unknown}', refusing to downgrade."
       exit "$RECOVER_STATUS"
     fi
-    echo "⏪ Downgrading to exactly $PRE_PR3_REVISION..."
+    # Bounded to the PR-3 constraint swap ONLY. The target is the literal
+    # pre-PR-3 revision, never a relative step and never the revision the
+    # database happened to be on when this deploy started: an audited
+    # Phase A catch-up that already succeeded is additive, compatible with
+    # the old runtime, and stays applied. Production correctly comes to
+    # rest on $PRE_PR3_REVISION after this recovery.
+    echo "⏪ Downgrading to exactly $PRE_PR3_REVISION (PR-3 only; catch-up is preserved)..."
     if ! $COMPOSE --profile ops run --rm --no-deps migrate alembic downgrade "$PRE_PR3_REVISION"; then
       echo "❌ Downgrade failed."
       echo "❗ NOT starting the old worker against an unknown schema. Manual intervention required."
@@ -540,14 +699,101 @@ find "${BACKUP_DIR}" -maxdepth 1 -type f \
   | wc -l
 
 # ── Classify this deploy ──────────────────────────────────────────
-REVISION_BEFORE="$(alembic_revision)"
-echo "📌 Alembic revision before migration: ${REVISION_BEFORE:-none}"
+# The revision is read through the SAME engine and configuration the
+# migration itself will use, and the physical database behind that engine
+# is identified in the same round-trip. Two independent .env values decide
+# which database each side talks to — POSTGRES_DB for the postgres
+# container, DATABASE_URL for Alembic — and nothing in Compose ties them
+# together, so they CAN diverge. When they do, a revision read from one
+# side says nothing about the schema the other side is about to change.
+REVISION_FACTS="$(alembic_revision_facts)"
+REVISION_STATUS="$(fact "$REVISION_FACTS" REVISION_STATUS)"
+REVISION_BEFORE="$(fact "$REVISION_FACTS" REVISION)"
+DB_HEAD_COUNT="$(fact "$REVISION_FACTS" DB_HEAD_COUNT)"
+MIGRATE_DB_NAME="$(fact "$REVISION_FACTS" DB_NAME)"
+MIGRATE_DB_SYSTEM_ID="$(fact "$REVISION_FACTS" DB_SYSTEM_ID)"
+MIGRATE_DB_OID="$(fact "$REVISION_FACTS" DB_OID)"
+
+# Safe components only — never the password, never the whole DSN.
+echo "📌 Migration runner connects as: $(fact "$REVISION_FACTS" DRIVER)://$(fact "$REVISION_FACTS" HOST):$(fact "$REVISION_FACTS" PORT)/$(fact "$REVISION_FACTS" URL_DATABASE)"
+
+case "$REVISION_STATUS" in
+  ok)
+    ;;
+  none)
+    echo "❌ The database the migration runner is connected to has no Alembic revision."
+    echo "❗ A production deploy will not initialise a schema from scratch."
+    echo "❗ Nothing was migrated, stopped or modified."
+    exit 1
+    ;;
+  multiple)
+    echo "❌ The database reports ${DB_HEAD_COUNT:-several} Alembic heads; exactly one is required."
+    echo "❗ Nothing was migrated, stopped or modified."
+    exit 1
+    ;;
+  unknown)
+    echo "❌ The revision recorded in this database is not one this code knows."
+    echo "❗ No upgrade path exists from it. Nothing was migrated, stopped or modified."
+    echo "❗ Investigate the database identity by hand before redeploying."
+    exit 1
+    ;;
+  *)
+    echo "❌ Could not read the Alembic revision from the migration runner."
+    echo "   reason: $(fact "$REVISION_FACTS" REVISION_ERROR)"
+    echo "❗ Nothing was migrated, stopped or modified."
+    exit 1
+    ;;
+esac
+
+# Full-value check: exactly twelve lowercase hex characters. A prefix of a
+# longer string, or an id embedded in prose, is rejected outright.
+if ! is_revision_id "$REVISION_BEFORE"; then
+  echo "❌ '${REVISION_BEFORE:-none}' is not a well-formed Alembic revision id."
+  echo "❗ Nothing was migrated, stopped or modified."
+  exit 1
+fi
+echo "📌 Alembic revision before migration: $REVISION_BEFORE"
+
+# ── Cross-check: one physical database, one revision ──────────────
+# Proves the revision just read describes the database the postgres
+# container — and therefore the backup, the deploy boundary and every
+# queue statement in this script — is working with.
+MIGRATE_DB_IDENTITY="${MIGRATE_DB_NAME}|${MIGRATE_DB_SYSTEM_ID}|${MIGRATE_DB_OID}"
+POSTGRES_DB_IDENTITY="$(postgres_db_identity)"
+
+if [ -z "$MIGRATE_DB_SYSTEM_ID" ] || [ -z "$POSTGRES_DB_IDENTITY" ]; then
+  echo "❌ Could not establish the database identity on both sides."
+  echo "❗ Nothing was migrated, stopped or modified."
+  exit 1
+fi
+if [ "$MIGRATE_DB_IDENTITY" != "$POSTGRES_DB_IDENTITY" ]; then
+  echo "❌ The migration runner and the postgres container are NOT on the same database."
+  echo "   migrate  sees: $MIGRATE_DB_IDENTITY"
+  echo "   postgres sees: $POSTGRES_DB_IDENTITY"
+  echo "   (format: database|cluster_system_identifier|database_oid)"
+  echo "❗ DATABASE_URL and POSTGRES_DB disagree. Nothing was migrated, stopped or modified."
+  exit 1
+fi
+echo "✅ Both readers are on one physical database: $MIGRATE_DB_NAME"
+
+# The same table, read the other way round. Any disagreement here means
+# the two paths resolved differently despite matching identities.
+POSTGRES_REVISION="$(postgres_alembic_version)"
+if [ "$POSTGRES_REVISION" != "$REVISION_BEFORE" ]; then
+  echo "❌ The two revision sources disagree."
+  echo "   migrate  sees: $REVISION_BEFORE"
+  echo "   postgres sees: ${POSTGRES_REVISION:-unreadable}"
+  echo "❗ Nothing was migrated, stopped or modified."
+  exit 1
+fi
+echo "✅ Revision confirmed by a direct read of alembic_version."
 
 SCRIPT_FACTS="$(alembic_script_facts "$REVISION_BEFORE")"
 HEAD_COUNT="$(fact "$SCRIPT_FACTS" HEAD_COUNT)"
 TARGET_HEAD="$(fact "$SCRIPT_FACTS" TARGET_HEAD)"
 PR3_IN_HEAD_LINEAGE="$(fact "$SCRIPT_FACTS" PR3_IN_HEAD_LINEAGE)"
 PR3_IN_DB_LINEAGE="$(fact "$SCRIPT_FACTS" PR3_IN_DB_LINEAGE)"
+PR3_PARENT="$(fact "$SCRIPT_FACTS" PR3_PARENT)"
 
 if [ "$HEAD_COUNT" != "1" ] || [ -z "$TARGET_HEAD" ]; then
   echo "❌ Expected exactly one Alembic head, got '${HEAD_COUNT:-unknown}'."
@@ -562,15 +808,26 @@ if [ "$PR3_IN_DB_LINEAGE" = "1" ]; then
   PR3_TRANSITION=0
   echo "ℹ️ PR-3 schema is already in place; ordinary migration flow."
 elif [ "$PR3_IN_HEAD_LINEAGE" = "1" ]; then
+  # PR-3 must still be exactly one step past the pre-PR-3 revision,
+  # otherwise the bounded downgrade below no longer means what it says.
+  if [ "$PR3_PARENT" != "$PRE_PR3_REVISION" ]; then
+    echo "❌ $PR3_REVISION is no longer a direct child of $PRE_PR3_REVISION"
+    echo "   (its parent is '${PR3_PARENT:-unknown}')."
+    echo "❗ The bounded PR-3 rollback is no longer well defined. No schema change was made."
+    exit 1
+  fi
+
   if [ "$REVISION_BEFORE" = "$PRE_PR3_REVISION" ] && [ "$TARGET_HEAD" = "$PR3_REVISION" ]; then
     PR3_TRANSITION=1
     echo "🔁 One-time PR-3 transition: $PRE_PR3_REVISION → $PR3_REVISION."
   else
-    # Applying PR-3 together with other revisions would make the
-    # bounded rollback below ambiguous. Fail before touching schema.
+    # Applying PR-3 together with other revisions would make the bounded
+    # rollback below ambiguous about how far back to go. Catching a
+    # lagging database up to the pre-PR-3 revision first is a separate,
+    # separately audited change; this deploy refuses instead of guessing.
     echo "❌ This deploy would apply PR-3 ($PR3_REVISION) as part of a multi-revision upgrade"
     echo "   from '${REVISION_BEFORE:-none}' to '$TARGET_HEAD'."
-    echo "❗ Deploy PR-3 on its own first, then continue. No schema change was made."
+    echo "❗ Bring the database to $PRE_PR3_REVISION first. No schema change was made."
     exit 1
   fi
 else
@@ -647,7 +904,10 @@ fi
 echo "⚙️ Applying DB Migrations..."
 $COMPOSE --profile ops run --rm --no-deps migrate
 
-REVISION_AFTER="$(alembic_revision)"
+if ! REVISION_AFTER="$(alembic_revision)"; then
+  echo "❌ Alembic could not resolve the revision after the migration."
+  exit 1
+fi
 echo "📌 Alembic revision after migration: ${REVISION_AFTER:-unknown}"
 if [ "$REVISION_AFTER" != "$TARGET_HEAD" ]; then
   echo "❌ Expected revision $TARGET_HEAD after migration, got '${REVISION_AFTER:-unknown}'."

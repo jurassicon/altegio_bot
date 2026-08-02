@@ -115,7 +115,10 @@ def _main_index(marker: str) -> int:
 _PHASES = (
     ("build", "$COMPOSE build"),
     ("backup", "pg_dump"),
+    ("structured revision read", 'REVISION_BEFORE="$(fact "$REVISION_FACTS" REVISION)"'),
+    ("database identity cross-check", 'POSTGRES_DB_IDENTITY="$(postgres_db_identity)"'),
     ("transition classification", 'SCRIPT_FACTS="$(alembic_script_facts "$REVISION_BEFORE")"'),
+    ("deploy boundary", 'DEPLOY_BOUNDARY_EPOCH_US="$(psql_scalar'),
     ("legacy worker stop", 'echo "🛑 Stopping the legacy altegio-inbox-worker'),
     ("constraint-failure baseline", 'CONSTRAINT_FAILURES_BEFORE="$(constraint_failure_count)"'),
     ("migration", "$COMPOSE --profile ops run --rm --no-deps migrate\n"),
@@ -190,9 +193,22 @@ def test_transition_matrix_branches_on_lineage_not_only_strings() -> None:
     assert script.count("PR3_TRANSITION=0") >= 2
 
 
-def test_the_block_happens_before_any_schema_change() -> None:
-    """The multi-revision refusal must precede the migration."""
-    assert _index("Deploy PR-3 on its own first") < _index("$COMPOSE --profile ops run --rm --no-deps migrate\n")
+@pytest.mark.parametrize(
+    "refusal",
+    [
+        "Bring the database to $PRE_PR3_REVISION first",
+        "is no longer a direct child of",
+        "is not a well-formed Alembic revision id",
+        "are NOT on the same database",
+        "The two revision sources disagree",
+        "not one this code knows",
+        "Alembic heads; exactly one is required",
+        "has no Alembic revision",
+    ],
+)
+def test_every_classification_refusal_precedes_any_schema_change(refusal: str) -> None:
+    """Each fail-closed branch must stop before the migrate step runs."""
+    assert _index(refusal) < _index("$COMPOSE --profile ops run --rm --no-deps migrate\n")
 
 
 def test_special_flow_is_entirely_inside_the_transition_guard() -> None:
