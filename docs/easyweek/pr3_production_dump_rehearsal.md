@@ -232,3 +232,7 @@ production dump rehearsal: RUN
   объектах схемы.
 - `.github/workflows/ci_deploy.yml` — порядок production-деплоя: drain старого
   inbox-worker → проверка `processing` → миграция → canary нового worker.
+- `docs/ops/pr3_deploy.md` — двухфазная модель деплоя: аудированный catch-up
+  Phase A (`… → 9a1f4c7b2e3d`) при работающем старом runtime и окно Phase B
+  (`9a1f4c7b2e3d → c1a7d3f905b2`) с остановленным worker'ом, плюс ожидаемое
+  состояние базы после каждого типа отказа.

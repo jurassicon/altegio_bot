@@ -72,6 +72,30 @@ CONSTRAINT_FAILURES_BEFORE=""
 CANARY_DRAIN_UNCERTAIN=0
 DEPLOY_BOUNDARY_EPOCH_US=""
 
+# ── Phase A: audited pre-PR-3 catch-up ────────────────────────────
+# Production can legitimately sit a few ORDINARY revisions behind the
+# pre-PR-3 revision. Those must be applied on their own, while the
+# legacy runtime keeps working, BEFORE the worker-drained constraint
+# swap — mixing them into the PR-3 step would make the bounded
+# rollback ambiguous about how far back to go.
+#
+# This is the EXACT audited path, oldest → newest, ending at
+# PRE_PR3_REVISION. Every revision in it was reviewed to be:
+#   * additive (ADD COLUMN / CREATE TABLE / CREATE INDEX only),
+#   * idempotent (IF NOT EXISTS, or a guarded DO $$ block),
+#   * readable and writable by the OLD running image, and
+#   * free of any rename/drop of a constraint the old worker pins by
+#     name in `ON CONFLICT ON CONSTRAINT`.
+# The single constraint touched anywhere in this path is the
+# `ck_promo_leads_status` CHECK, which is WIDENED (a value is added to
+# the allowed set), so the old runtime's writes stay valid.
+#
+# A DB revision outside this list is NOT auto-upgraded: the deploy
+# fails closed and asks for a human audit. See docs/ops/pr3_deploy.md.
+PHASE_A_REQUIRED=0
+PHASE_A_APPLIED=0
+AUDITED_CATCHUP_PATH="b7c8d9e0f1a2 c9d0e1f2a3b4 d0e1f2a3b4c5 d8f6e4c2b1a0 e9a7c6b5d4f3 8923be993170 8705ec49cc73 9a1f4c7b2e3d"
+
 # Reads one scalar over stdin so no SQL quoting has to survive the
 # ssh -> sh -> psql nesting. Credentials stay inside the container.
 psql_scalar() {
@@ -80,9 +104,22 @@ psql_scalar() {
     | tr -d '[:space:]'
 }
 
+# Reads the applied revision. `alembic current` prints its FAILURE text
+# to STDOUT — "FAILED: Can't locate revision identified by 'deadbeef1234'"
+# — and that text contains a 12-hex token. Scraping stdout without first
+# checking the exit status therefore echoes an id back out of an ERROR
+# MESSAGE and reports it as if the database were on that revision, which
+# turns "this code cannot resolve the DB revision at all" into a
+# plausible-looking ordinary revision. The status is checked FIRST, and
+# only a bare id on its own line is accepted.
+#
+# Exit status: 0 with the id on stdout, 0 with empty stdout for a database
+# that has no revision yet, 1 when Alembic could not resolve it.
 alembic_revision() {
-  $COMPOSE --profile ops run --rm --no-deps migrate alembic current 2>/dev/null \
-    | tr -d '\r' | grep -oE '[0-9a-f]{12}' | head -n 1
+  ALEMBIC_CURRENT_OUT="$($COMPOSE --profile ops run --rm --no-deps migrate alembic current 2>/dev/null)" || return 1
+  printf '%s' "$ALEMBIC_CURRENT_OUT" | tr -d '\r' \
+    | grep -oE '^[0-9a-f]{12}' | head -n 1
+  return 0
 }
 
 # Facts about the NEW code's revision graph, straight from Alembic's
@@ -96,6 +133,7 @@ import os
 from alembic.config import Config
 from alembic.script import ScriptDirectory
 pr3 = "c1a7d3f905b2"
+pre_pr3 = "9a1f4c7b2e3d"
 sd = ScriptDirectory.from_config(Config("/app/alembic.ini"))
 heads = sd.get_heads()
 db = (os.environ.get("DB_REVISION") or "").strip()
@@ -107,15 +145,82 @@ def lineage(rev):
     except Exception:
         return set()
 head = heads[0] if len(heads) == 1 else ""
+# Is the DB revision a node this code actually knows? An unresolvable id
+# must never be treated as "simply an older revision".
+known = "0"
+if db:
+    try:
+        sd.get_revision(db)
+        known = "1"
+    except Exception:
+        known = "0"
+# The revisions Alembic would really apply to go from the DB revision up
+# to the pre-PR-3 revision, in order. Empty when already there, and empty
+# when no upgrade path exists at all.
+catchup = []
+descendant = "0"
+if known == "1":
+    try:
+        revs = list(sd.iterate_revisions(pre_pr3, db))
+        revs.reverse()
+        catchup = [r.revision for r in revs if r.revision != db]
+        descendant = "1"
+    except Exception:
+        catchup = []
+        descendant = "0"
+pr3_rev = None
+try:
+    pr3_rev = sd.get_revision(pr3)
+except Exception:
+    pr3_rev = None
+pr3_parent = ""
+if pr3_rev is not None:
+    down = pr3_rev.down_revision
+    if isinstance(down, str):
+        pr3_parent = down
+    elif down:
+        pr3_parent = ",".join(down)
 print("HEAD_COUNT=" + str(len(heads)))
 print("TARGET_HEAD=" + head)
 print("PR3_IN_HEAD_LINEAGE=" + ("1" if pr3 in lineage(head) else "0"))
 print("PR3_IN_DB_LINEAGE=" + ("1" if pr3 in lineage(db) else "0"))
+print("DB_REVISION_KNOWN=" + known)
+print("PRE_PR3_IS_DESCENDANT=" + descendant)
+print("PR3_PARENT=" + pr3_parent)
+print("CATCHUP_PATH=" + " ".join(catchup))
 ' 2>/dev/null | tr -d '\r'
 }
 
 fact() {
   printf '%s\n' "$1" | grep -E "^$2=" | head -n 1 | cut -d= -f2-
+}
+
+# The audited revisions that must still be applied to get from $1 up to
+# the end of AUDITED_CATCHUP_PATH, as a space-separated list in order.
+#
+# Prints nothing and returns 1 when $1 is not ON the audited path, or is
+# its final element — both mean "there is no audited catch-up to run from
+# here", and the caller must fail closed rather than invent a path.
+expected_catchup_from() {
+  CATCHUP_FROM="$1"
+  CATCHUP_ACC=""
+  CATCHUP_FOUND=0
+  for AUDITED_REVISION in $AUDITED_CATCHUP_PATH; do
+    if [ "$CATCHUP_FOUND" -eq 1 ]; then
+      if [ -z "$CATCHUP_ACC" ]; then
+        CATCHUP_ACC="$AUDITED_REVISION"
+      else
+        CATCHUP_ACC="$CATCHUP_ACC $AUDITED_REVISION"
+      fi
+    elif [ "$AUDITED_REVISION" = "$CATCHUP_FROM" ]; then
+      CATCHUP_FOUND=1
+    fi
+  done
+  if [ "$CATCHUP_FOUND" -ne 1 ] || [ -z "$CATCHUP_ACC" ]; then
+    return 1
+  fi
+  printf '%s' "$CATCHUP_ACC"
+  return 0
 }
 
 # EXACT id of the regular Compose service container. `docker ps` by
@@ -444,7 +549,13 @@ recover() {
       echo "❌ Revision is '${CURRENT_REVISION:-unknown}', refusing to downgrade."
       exit "$RECOVER_STATUS"
     fi
-    echo "⏪ Downgrading to exactly $PRE_PR3_REVISION..."
+    # Bounded to the PR-3 constraint swap ONLY. The target is the literal
+    # pre-PR-3 revision, never a relative step and never the revision the
+    # database happened to be on when this deploy started: an audited
+    # Phase A catch-up that already succeeded is additive, compatible with
+    # the old runtime, and stays applied. Production correctly comes to
+    # rest on $PRE_PR3_REVISION after this recovery.
+    echo "⏪ Downgrading to exactly $PRE_PR3_REVISION (PR-3 only; catch-up is preserved)..."
     if ! $COMPOSE --profile ops run --rm --no-deps migrate alembic downgrade "$PRE_PR3_REVISION"; then
       echo "❌ Downgrade failed."
       echo "❗ NOT starting the old worker against an unknown schema. Manual intervention required."
@@ -540,7 +651,17 @@ find "${BACKUP_DIR}" -maxdepth 1 -type f \
   | wc -l
 
 # ── Classify this deploy ──────────────────────────────────────────
-REVISION_BEFORE="$(alembic_revision)"
+# A revision the new code cannot resolve is NOT an older revision: no
+# upgrade path can be computed from it, so every later guard would be
+# reasoning about a database it does not understand. Fail closed here,
+# before the schema, the queue or any worker is touched.
+if ! REVISION_BEFORE="$(alembic_revision)"; then
+  echo "❌ Alembic could not resolve the revision recorded in this database."
+  echo "❗ The alembic_version value is not a revision this code knows, so no"
+  echo "   upgrade path exists. Nothing was migrated, stopped or modified."
+  echo "❗ Investigate the database identity by hand before redeploying."
+  exit 1
+fi
 echo "📌 Alembic revision before migration: ${REVISION_BEFORE:-none}"
 
 SCRIPT_FACTS="$(alembic_script_facts "$REVISION_BEFORE")"
@@ -548,6 +669,10 @@ HEAD_COUNT="$(fact "$SCRIPT_FACTS" HEAD_COUNT)"
 TARGET_HEAD="$(fact "$SCRIPT_FACTS" TARGET_HEAD)"
 PR3_IN_HEAD_LINEAGE="$(fact "$SCRIPT_FACTS" PR3_IN_HEAD_LINEAGE)"
 PR3_IN_DB_LINEAGE="$(fact "$SCRIPT_FACTS" PR3_IN_DB_LINEAGE)"
+DB_REVISION_KNOWN="$(fact "$SCRIPT_FACTS" DB_REVISION_KNOWN)"
+PRE_PR3_IS_DESCENDANT="$(fact "$SCRIPT_FACTS" PRE_PR3_IS_DESCENDANT)"
+PR3_PARENT="$(fact "$SCRIPT_FACTS" PR3_PARENT)"
+CATCHUP_PATH="$(fact "$SCRIPT_FACTS" CATCHUP_PATH)"
 
 if [ "$HEAD_COUNT" != "1" ] || [ -z "$TARGET_HEAD" ]; then
   echo "❌ Expected exactly one Alembic head, got '${HEAD_COUNT:-unknown}'."
@@ -562,20 +687,88 @@ if [ "$PR3_IN_DB_LINEAGE" = "1" ]; then
   PR3_TRANSITION=0
   echo "ℹ️ PR-3 schema is already in place; ordinary migration flow."
 elif [ "$PR3_IN_HEAD_LINEAGE" = "1" ]; then
-  if [ "$REVISION_BEFORE" = "$PRE_PR3_REVISION" ] && [ "$TARGET_HEAD" = "$PR3_REVISION" ]; then
+  # PR-3 must still be exactly one step past the pre-PR-3 revision,
+  # otherwise the bounded downgrade below no longer means what it says.
+  if [ "$PR3_PARENT" != "$PRE_PR3_REVISION" ]; then
+    echo "❌ $PR3_REVISION is no longer a direct child of $PRE_PR3_REVISION"
+    echo "   (its parent is '${PR3_PARENT:-unknown}')."
+    echo "❗ The bounded PR-3 rollback is no longer well defined. No schema change was made."
+    exit 1
+  fi
+
+  if [ "$REVISION_BEFORE" = "$PRE_PR3_REVISION" ]; then
     PR3_TRANSITION=1
     echo "🔁 One-time PR-3 transition: $PRE_PR3_REVISION → $PR3_REVISION."
-  else
-    # Applying PR-3 together with other revisions would make the
-    # bounded rollback below ambiguous. Fail before touching schema.
-    echo "❌ This deploy would apply PR-3 ($PR3_REVISION) as part of a multi-revision upgrade"
-    echo "   from '${REVISION_BEFORE:-none}' to '$TARGET_HEAD'."
-    echo "❗ Deploy PR-3 on its own first, then continue. No schema change was made."
+  elif [ "$DB_REVISION_KNOWN" != "1" ] || [ "$PRE_PR3_IS_DESCENDANT" != "1" ]; then
+    echo "❌ '${REVISION_BEFORE:-none}' is not a known ancestor of $PRE_PR3_REVISION."
+    echo "❗ No audited catch-up path exists from here. No schema change was made."
     exit 1
+  else
+    # The database is behind. The catch-up is allowed ONLY when the path
+    # Alembic actually computed is exactly the audited tail — a new,
+    # unreviewed revision inserted into the chain changes this string and
+    # stops the deploy instead of silently applying unaudited DDL.
+    if ! EXPECTED_CATCHUP="$(expected_catchup_from "$REVISION_BEFORE")"; then
+      echo "❌ '${REVISION_BEFORE:-none}' is not on the audited pre-PR-3 catch-up path."
+      echo "❗ Audited path: $AUDITED_CATCHUP_PATH"
+      echo "❗ Audit the missing revisions by hand first. No schema change was made."
+      exit 1
+    fi
+    if [ "$CATCHUP_PATH" != "$EXPECTED_CATCHUP" ]; then
+      echo "❌ The real migration path does not match the audited one."
+      echo "   expected: $EXPECTED_CATCHUP"
+      echo "   actual:   ${CATCHUP_PATH:-none}"
+      echo "❗ A revision was added or reordered since the audit. No schema change was made."
+      exit 1
+    fi
+    PHASE_A_REQUIRED=1
+    echo "🧩 Phase A required: $REVISION_BEFORE → $PRE_PR3_REVISION."
+    echo "   Audited catch-up revisions: $CATCHUP_PATH"
   fi
 else
   PR3_TRANSITION=0
   echo "ℹ️ PR-3 is not part of this revision graph; ordinary migration flow."
+fi
+
+# ── Phase A: audited pre-PR-3 catch-up ────────────────────────────
+# Runs AFTER the backup and BEFORE the deploy boundary, the worker stop
+# and every queue mutation. The legacy inbox worker keeps running and
+# keeps processing events throughout: every revision here is additive
+# and leaves the constraints the old worker pins by name untouched.
+if [ "$PHASE_A_REQUIRED" -eq 1 ]; then
+  echo "🧩 Phase A: applying the audited catch-up up to $PRE_PR3_REVISION..."
+  echo "   The legacy inbox worker stays RUNNING; no event status is touched."
+
+  # Strictly `upgrade <pre-PR-3>`, never `upgrade head`: head is PR-3, and
+  # reaching it here would perform the constraint swap with the old worker
+  # still live — exactly the failure this deploy exists to prevent.
+  if ! $COMPOSE --profile ops run --rm --no-deps migrate alembic upgrade "$PRE_PR3_REVISION"; then
+    echo "❌ Phase A failed."
+    echo "❗ No worker was stopped and no event status was changed."
+    echo "❗ Catch-up migrations are NOT rolled back automatically; they are additive."
+    exit 1
+  fi
+
+  # Re-read from the database rather than assuming the upgrade landed.
+  if ! REVISION_AFTER_CATCHUP="$(alembic_revision)"; then
+    echo "❌ Alembic could not resolve the revision after Phase A."
+    echo "❗ No worker was stopped and no event status was changed."
+    exit 1
+  fi
+  if [ "$REVISION_AFTER_CATCHUP" != "$PRE_PR3_REVISION" ]; then
+    echo "❌ Revision after Phase A is '${REVISION_AFTER_CATCHUP:-unknown}', expected $PRE_PR3_REVISION."
+    echo "❗ No worker was stopped and no event status was changed."
+    exit 1
+  fi
+
+  PHASE_A_APPLIED=1
+  REVISION_BEFORE="$PRE_PR3_REVISION"
+  echo "✅ Phase A complete; database is on $PRE_PR3_REVISION."
+
+  # Only an exact match arms Phase B. The classification is redone from
+  # the freshly read revision, not inherited from before the catch-up.
+  PR3_TRANSITION=1
+  echo "🔁 One-time PR-3 transition: $PRE_PR3_REVISION → $PR3_REVISION."
 fi
 
 if [ "$PR3_TRANSITION" -eq 1 ]; then
@@ -647,7 +840,10 @@ fi
 echo "⚙️ Applying DB Migrations..."
 $COMPOSE --profile ops run --rm --no-deps migrate
 
-REVISION_AFTER="$(alembic_revision)"
+if ! REVISION_AFTER="$(alembic_revision)"; then
+  echo "❌ Alembic could not resolve the revision after the migration."
+  exit 1
+fi
 echo "📌 Alembic revision after migration: ${REVISION_AFTER:-unknown}"
 if [ "$REVISION_AFTER" != "$TARGET_HEAD" ]; then
   echo "❌ Expected revision $TARGET_HEAD after migration, got '${REVISION_AFTER:-unknown}'."
