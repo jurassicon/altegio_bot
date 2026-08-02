@@ -124,8 +124,22 @@ def _downgrade_body() -> str:
     return _provider_scope_source().split("def downgrade")[1]
 
 
-def test_provider_scope_revision_is_the_single_head() -> None:
-    assert _script().get_heads() == [_PROVIDER_SCOPE]
+def test_the_graph_has_exactly_one_head() -> None:
+    """A second head would make `upgrade head` ambiguous."""
+    assert len(_script().get_heads()) == 1
+
+
+def test_provider_scope_revision_is_on_the_path_to_the_head() -> None:
+    """PR-3 must stay in the applied lineage.
+
+    Deliberately not `heads() == [_PROVIDER_SCOPE]`: later PRs legitimately add
+    revisions on top (PR-4 does), and that must not look like PR-3 having been
+    edited out of the chain.
+    """
+    script = _script()
+    head = script.get_heads()[0]
+    lineage = {revision.revision for revision in script.iterate_revisions(head, "base")}
+    assert _PROVIDER_SCOPE in lineage
 
 
 def test_provider_scope_follows_the_operator_relay_revision() -> None:

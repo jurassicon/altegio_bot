@@ -201,6 +201,20 @@ class EasyWeekEvent(Base):
     headers: Mapped[dict] = mapped_column(JSONB, default=dict)  # только безопасные заголовки
     payload: Mapped[dict] = mapped_column(JSONB, default=dict)  # распарсенный JSON или {}
 
+    # --- PR-4 runtime auditability -------------------------------------------
+    # Когда строка достигла терминального статуса (processed/failed). NULL, пока
+    # событие ещё captured.
+    processed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+    # Стабильный безопасный код причины отказа — НЕ str(exception).
+    # Текст исключения драйвера/БД может содержать SQL-параметры, а значит и
+    # телефон, e-mail и имя клиента; такой текст в БД был бы утечкой PII.
+    # Допустимые значения перечислены в easyweek_normalizer.NormalizationError.
+    error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
 
 class SmartTestRun(Base):
     """Record of a smart-test execution for idempotency and auditing."""

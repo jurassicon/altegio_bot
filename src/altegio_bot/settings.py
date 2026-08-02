@@ -482,6 +482,32 @@ class Settings(BaseSettings):
     # из вебхука его НЕ заменяет (INTEGRATION_PLAN §1.6 п.5).
     easyweek_location_uuid: str = ""
 
+    # --- PR-4: normalizer / easyweek_inbox_worker ----------------------------
+    # THREE independent gates, all fail-closed by default. They are separate on
+    # purpose: production already runs with EASYWEEK_ENABLED=true so the capture
+    # endpoint works, and a worker gated on that same flag would start chewing
+    # through the whole captured backlog the moment PR-4 is deployed.
+    #
+    #   easyweek_enabled                -> ONLY the public capture endpoint
+    #   easyweek_processing_enabled     -> ONLY claiming/normalising captured rows
+    #   easyweek_notifications_enabled  -> ONLY creating EasyWeek MessageJob rows
+    #
+    # Turning processing off never turns capture off: deliveries keep being
+    # stored, they simply stay `captured` until processing is enabled again.
+    easyweek_processing_enabled: bool = False
+    # Creating queue-consumable EasyWeek jobs. Production default stays false
+    # until PR-6; with it off the normalizer still keeps Client/Record current.
+    easyweek_notifications_enabled: bool = False
+
+    # Numeric ``:location_id`` of the EasyWeek location this bot owns, and the
+    # ``company_id`` of every EasyWeek row it writes. 0 means "not configured":
+    # with processing enabled and this unset the worker refuses to claim
+    # anything, because it could not tell its own location from a foreign one.
+    # The real production value lives in easyweek.env, never in Python.
+    easyweek_location_id: int = 0
+
+    easyweek_inbox_worker_poll_sec: float = 1.0
+
     # ---------------------------------------------------------------------------
     # Worker polling intervals
     # ---------------------------------------------------------------------------
@@ -498,6 +524,7 @@ class Settings(BaseSettings):
         "inbox_worker_poll_sec",
         "outbox_worker_poll_sec",
         "whatsapp_inbox_worker_poll_sec",
+        "easyweek_inbox_worker_poll_sec",
     )
     @classmethod
     def validate_worker_poll_sec(cls, v: float) -> float:
