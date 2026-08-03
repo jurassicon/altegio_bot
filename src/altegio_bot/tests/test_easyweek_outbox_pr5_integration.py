@@ -29,12 +29,19 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from altegio_bot.campaigns.runner import CAMPAIGN_EXECUTION_JOB_TYPE
+from altegio_bot.easyweek_policy import (
+    EASYWEEK_LIFECYCLE_JOB_TYPES,
+    easyweek_job_type_error,
+    validate_static_booking_page,
+)
 from altegio_bot.meta_templates import (
     META_TEMPLATE_MAP,
     TEMPLATE_LANGUAGE,
@@ -51,11 +58,16 @@ from altegio_bot.models.models import (
     Record,
     RecordService,
     ServiceSenderRule,
+    WhatsAppEvent,
     WhatsAppSender,
 )
+from altegio_bot.providers.base import WhatsAppProvider
 from altegio_bot.settings import settings
 from altegio_bot.whatsapp_routing import pick_sender_id, pick_sender_id_by_code
+from altegio_bot.workers import campaign_worker
+from altegio_bot.workers import easyweek_inbox_worker as eyw_worker
 from altegio_bot.workers import outbox_worker as ow
+from altegio_bot.workers import whatsapp_inbox_worker as wa_worker
 from altegio_bot.workers.outbox_worker import PRE_APPOINTMENT_NOTES_DE
 
 pytestmark = pytest.mark.asyncio
@@ -1964,3 +1976,745 @@ async def test_altegio_new_client_still_gets_its_pre_appointment_notes(
     )
 
     assert ctx["pre_appointment_notes"] == PRE_APPOINTMENT_NOTES_DE
+
+
+# ---------------------------------------------------------------------------
+# 11. Static booking page validation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("https://book.example.com/durlach", "https://book.example.com/durlach"),
+        ("  https://book.example.com/durlach  ", "https://book.example.com/durlach"),
+        ("https://book.example.com/durlach?loc=1", "https://book.example.com/durlach?loc=1"),
+        ("https://book.example.com", "https://book.example.com"),
+    ],
+)
+async def test_valid_static_booking_pages_are_accepted_and_normalized(raw: str, expected: str) -> None:
+    assert validate_static_booking_page(raw) == expected
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "http://book.example.com/durlach",
+        "javascript:alert(1)",
+        "//book.example.com/durlach",
+        "book.example.com/durlach",
+        "https://user:pw@book.example.com/durlach",
+        "https://:pw@book.example.com/durlach",
+        "https://book.example.com/durlach#frag",
+        "https://book.example.com:notaport/durlach",
+        "https://[oops/durlach",
+        "https:///durlach",
+        "",
+        "   ",
+        "\t\n ",
+        "https://book.example.com/dur\nlach",
+        "https://book.example.com/dur\tlach",
+        "https://book.example.com/dur\x00lach",
+        "https://book.example.com/dur lach",
+        "﻿https://book.example.com/durlach",
+        "data:text/html,<h1>x</h1>",
+        "ftp://book.example.com/durlach",
+    ],
+)
+async def test_unsafe_static_booking_pages_are_rejected(raw: str) -> None:
+    assert validate_static_booking_page(raw) is None
+
+
+@pytest.mark.parametrize("raw", [None, 123, b"https://book.example.com/", ["https://x"]])
+async def test_non_string_static_booking_pages_are_rejected(raw: Any) -> None:
+    assert validate_static_booking_page(raw) is None
+
+
+async def test_no_host_allowlist_is_applied() -> None:
+    """PR-6 decides the approved host; guessing one here would block the real value."""
+    assert validate_static_booking_page("https://eyw.me/book") == "https://eyw.me/book"
+    assert validate_static_booking_page("https://any-other-host.example/book") is not None
+
+
+@pytest.mark.parametrize(
+    "bad_static",
+    ["http://book.example.com/x", "javascript:alert(1)", "//book.example.com/x", "https://u:p@book.example.com/x"],
+)
+async def test_invalid_static_page_fails_canceled_locally(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    monkeypatch: pytest.MonkeyPatch,
+    bad_static: str,
+) -> None:
+    """``record_canceled`` has no other link, so an unusable static page is fatal."""
+    monkeypatch.setattr(settings, "easyweek_booking_page_url", bad_static, raising=False)
+    job = await _seed_easyweek_happy_path(
+        db,
+        job_type="record_canceled",
+        meta_template_name=EASYWEEK_CANCELED_TEMPLATE,
+    )
+
+    await _run_job(db, job)
+
+    assert job.status == "failed"
+    assert "missing required param #5" in (job.last_error or "")
+    assert capture.template_calls == []
+    assert capture.text_calls == []
+    assert bad_static not in (job.last_error or "")
+
+
+async def test_invalid_static_page_fails_created_when_manage_link_is_unusable(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "easyweek_booking_page_url", "http://book.example.com/x", raising=False)
+    job = await _seed_easyweek_happy_path(db, short_link=None)
+
+    await _run_job(db, job)
+
+    assert job.status == "failed"
+    assert "missing required param #7" in (job.last_error or "")
+    assert capture.template_calls == []
+
+
+async def test_a_valid_manage_link_survives_an_invalid_static_page(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The static page is a fallback, not a filter — a verified link still wins."""
+    monkeypatch.setattr(settings, "easyweek_booking_page_url", "javascript:alert(1)", raising=False)
+    job = await _seed_easyweek_happy_path(db)
+
+    params = await _run_and_get_params(db, capture, job)
+
+    assert params[6] == VERIFIED_PAGE
+    assert "javascript:" not in "".join(params)
+
+
+# ---------------------------------------------------------------------------
+# 12. Early EasyWeek job-type allowlist
+# ---------------------------------------------------------------------------
+
+_DISALLOWED_EASYWEEK_JOB_TYPES = [
+    "review_3d",
+    "repeat_10d",
+    "comeback_3d",
+    "reminder_24h",
+    "reminder_2h",
+    "promo_eligibility_check",
+    "promo_apply_existing_booking",
+    "promo_card_booking_reminder",
+    "newsletter_new_clients_followup",
+    "newsletter_new_clients_monthly",
+    CAMPAIGN_EXECUTION_JOB_TYPE,
+]
+
+
+@pytest.mark.parametrize("job_type", _DISALLOWED_EASYWEEK_JOB_TYPES)
+async def test_disallowed_easyweek_job_types_fail_terminally_in_the_outbox(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    monkeypatch: pytest.MonkeyPatch,
+    job_type: str,
+) -> None:
+    """No routing, no handler, no Altegio API, no requeue — a terminal failure.
+
+    ``campaign_execution`` is included on purpose: reaching the outbox worker
+    normally requeues it, which for an EasyWeek job would be an infinite loop
+    between two workers that both refuse it.
+    """
+    altegio_api = AsyncMock(side_effect=AssertionError("no Altegio API call for a rejected job"))
+    monkeypatch.setattr(ow, "_process_promo_card_booking_reminder", altegio_api)
+    monkeypatch.setattr(ow, "process_promo_eligibility_check_job", altegio_api)
+    monkeypatch.setattr(ow, "process_promo_apply_existing_booking_job", altegio_api)
+    monkeypatch.setattr(ow, "_load_record", AsyncMock(side_effect=AssertionError("no row load")))
+    monkeypatch.setattr(ow, "_load_client", AsyncMock(side_effect=AssertionError("no row load")))
+
+    client = await _seed_easyweek_client(db)
+    job = await _seed_job(
+        db,
+        provider=PROVIDER_EASYWEEK,
+        company_id=COLLIDING_COMPANY_ID,
+        job_type=job_type,
+        record=None,
+        client=client,
+        dedupe_key=f"eyw-disallowed-{job_type}",
+    )
+
+    await _run_job(db, job)
+
+    assert job.status == "failed"
+    assert job.locked_at is None
+    assert job.last_error == f"EasyWeek job type not enabled in this phase: {job_type}"
+    assert capture.template_calls == []
+    assert capture.text_calls == []
+    assert await _outbox_rows(db, job) == []
+    altegio_api.assert_not_awaited()
+
+
+@pytest.mark.parametrize("job_type", sorted(EASYWEEK_LIFECYCLE_JOB_TYPES))
+async def test_the_three_lifecycle_types_are_allowed(job_type: str) -> None:
+    assert easyweek_job_type_error(PROVIDER_EASYWEEK, job_type) is None
+
+
+@pytest.mark.parametrize("job_type", _DISALLOWED_EASYWEEK_JOB_TYPES)
+async def test_altegio_is_never_blocked_by_the_easyweek_allowlist(job_type: str) -> None:
+    assert easyweek_job_type_error(PROVIDER_ALTEGIO, job_type) is None
+
+
+async def test_the_allowlist_has_exactly_one_definition() -> None:
+    """Two copies of a security boundary drift; the inbox worker re-exports this one."""
+    assert eyw_worker.EASYWEEK_LIFECYCLE_JOB_TYPES is EASYWEEK_LIFECYCLE_JOB_TYPES
+    assert ow.EASYWEEK_LIFECYCLE_JOB_TYPES is EASYWEEK_LIFECYCLE_JOB_TYPES
+    assert EASYWEEK_LIFECYCLE_JOB_TYPES == {"record_created", "record_updated", "record_canceled"}
+
+
+async def test_altegio_campaign_execution_job_is_still_requeued(
+    db: AsyncSession,
+    capture: CaptureProvider,
+) -> None:
+    """The pre-existing hand-off to campaign_worker must survive the new guard."""
+    client, _record = await _seed_altegio_client_and_record(db)
+    job = await _seed_job(
+        db,
+        provider=PROVIDER_ALTEGIO,
+        company_id=COLLIDING_COMPANY_ID,
+        job_type=CAMPAIGN_EXECUTION_JOB_TYPE,
+        record=None,
+        client=client,
+        dedupe_key="alt-campaign-execution-1",
+    )
+
+    await _run_job(db, job)
+
+    assert job.status == "queued"
+    assert job.locked_at is None
+    assert capture.template_calls == []
+
+
+# ---------------------------------------------------------------------------
+# 13. Campaign worker provider guard
+# ---------------------------------------------------------------------------
+
+
+async def test_easyweek_campaign_execution_job_dies_in_the_campaign_worker(
+    db: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The outbox guard does not cover this path — campaign jobs are claimed here."""
+    runner = AsyncMock(side_effect=AssertionError("campaign runner must not be reached"))
+    monkeypatch.setattr(campaign_worker, "execute_queued_send_real", runner)
+
+    client = await _seed_easyweek_client(db)
+    job = await _seed_job(
+        db,
+        provider=PROVIDER_EASYWEEK,
+        company_id=COLLIDING_COMPANY_ID,
+        job_type=CAMPAIGN_EXECUTION_JOB_TYPE,
+        record=None,
+        client=client,
+        dedupe_key="eyw-campaign-execution-1",
+    )
+    job.payload = {"campaign_run_id": 4242}
+    await db.flush()
+
+    await campaign_worker.process_job_in_session(db, job.id)
+    await db.flush()
+    await db.refresh(job)
+
+    assert job.status == "failed"
+    assert job.locked_at is None
+    assert job.last_error == f"EasyWeek job type not enabled in this phase: {CAMPAIGN_EXECUTION_JOB_TYPE}"
+    runner.assert_not_awaited()
+
+
+async def test_altegio_campaign_execution_job_still_reaches_the_runner(
+    db: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[int] = []
+
+    async def _fake_runner(run_id: int) -> None:
+        seen.append(run_id)
+
+    monkeypatch.setattr(campaign_worker, "execute_queued_send_real", _fake_runner)
+
+    client, _record = await _seed_altegio_client_and_record(db)
+    job = await _seed_job(
+        db,
+        provider=PROVIDER_ALTEGIO,
+        company_id=COLLIDING_COMPANY_ID,
+        job_type=CAMPAIGN_EXECUTION_JOB_TYPE,
+        record=None,
+        client=client,
+        dedupe_key="alt-campaign-execution-2",
+    )
+    job.payload = {"campaign_run_id": 4242}
+    await db.flush()
+
+    await campaign_worker.process_job_in_session(db, job.id)
+    await db.flush()
+    await db.refresh(job)
+
+    assert job.status == "done", job.last_error
+    assert seen == [4242]
+
+
+# ---------------------------------------------------------------------------
+# 14. Delivery retry inherits the provider of the chain
+# ---------------------------------------------------------------------------
+
+
+class _NullProvider(WhatsAppProvider):
+    """Satisfies handle_event's signature; sending through it is a test failure."""
+
+    async def send(
+        self,
+        sender_id: int,
+        phone_e164: str,
+        text: str,
+        contact_name: str | None = None,
+    ) -> str:
+        raise AssertionError("the status webhook path must not send anything")
+
+
+def _failed_status_payload(wamid: str, *, code: int = 131000) -> dict[str, Any]:
+    return {
+        "object": "whatsapp_business_account",
+        "entry": [
+            {
+                "id": "WABA",
+                "changes": [
+                    {
+                        "field": "messages",
+                        "value": {
+                            "metadata": {"phone_number_id": "eyw-phone-id"},
+                            "statuses": [
+                                {
+                                    "id": wamid,
+                                    "status": "failed",
+                                    "timestamp": "1700000001",
+                                    "recipient_id": "491700000001",
+                                    "errors": [
+                                        {
+                                            "code": code,
+                                            "title": "Temporary failure",
+                                            "error_data": {"details": "transient provider failure"},
+                                        }
+                                    ],
+                                }
+                            ],
+                        },
+                    }
+                ],
+            }
+        ],
+    }
+
+
+async def _deliver_failed_status(db: AsyncSession, wamid: str, *, dedupe: str) -> None:
+    evt = WhatsAppEvent(
+        dedupe_key=dedupe,
+        status="received",
+        payload=_failed_status_payload(wamid),
+        query={},
+        headers={},
+    )
+    db.add(evt)
+    await db.flush()
+    await wa_worker.handle_event(db, evt, _NullProvider())
+    await db.flush()
+
+
+@pytest.fixture
+def no_contact_rate_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Let a retry send in the same test as its original.
+
+    The first send records a per-phone rate limit, so a retry running seconds
+    later is legitimately deferred in production. These tests are about which
+    PROVIDER the retry sends as, not about pacing.
+    """
+
+    async def _no_delay(session: Any, phone: str) -> None:
+        return None
+
+    monkeypatch.setattr(ow, "_apply_rate_limit", _no_delay)
+
+
+async def _retry_jobs_for(db: AsyncSession, outbox_id: int) -> list[MessageJob]:
+    res = await db.execute(
+        select(MessageJob).where(MessageJob.dedupe_key.like(f"delivery_retry:{outbox_id}:%")).order_by(MessageJob.id)
+    )
+    return list(res.scalars().all())
+
+
+async def test_easyweek_delivery_retry_inherits_easyweek_end_to_end(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    no_contact_rate_limit: None,
+) -> None:
+    """Send → failed callback → retry → send again, all inside EasyWeek.
+
+    A colliding Altegio template and sender exist on the same numeric company for
+    the whole run: if the retry lost its provider, this is exactly what it would
+    pick up.
+    """
+    db.add(
+        _template(
+            provider=PROVIDER_ALTEGIO,
+            company_id=COLLIDING_COMPANY_ID,
+            code="record_created",
+            body="ALTEGIO BODY",
+        )
+    )
+    altegio_sender = _sender(
+        provider=PROVIDER_ALTEGIO,
+        company_id=COLLIDING_COMPANY_ID,
+        phone_number_id="altegio-phone-id",
+    )
+    db.add(altegio_sender)
+    await db.flush()
+
+    job = await _seed_easyweek_happy_path(db)
+    await _run_job(db, job)
+    assert job.status == "done", job.last_error
+
+    rows = await _outbox_rows(db, job)
+    assert len(rows) == 1
+    original_outbox_id = rows[0].id
+    wamid = rows[0].provider_message_id
+    assert wamid is not None
+
+    await _deliver_failed_status(db, wamid, dedupe="wa:eyw-failed-1")
+
+    retries = await _retry_jobs_for(db, original_outbox_id)
+    assert len(retries) == 1
+    retry = retries[0]
+    assert retry.provider == PROVIDER_EASYWEEK
+    assert retry.company_id == job.company_id
+    assert retry.record_id == job.record_id
+    assert retry.client_id == job.client_id
+    assert retry.job_type == "record_created"
+
+    # The retry actually sends, and it sends as EasyWeek.
+    retry.run_at = datetime.now(timezone.utc)
+    await db.flush()
+    capture.template_calls.clear()
+    await _run_job(db, retry)
+
+    assert retry.status == "done", retry.last_error
+    assert len(capture.template_calls) == 1
+    assert capture.template_calls[0]["template_name"] == EASYWEEK_CREATED_TEMPLATE
+    retry_rows = await _outbox_rows(db, retry)
+    assert len(retry_rows) == 1
+    assert retry_rows[0].sender_id != altegio_sender.id
+    sender_res = await db.execute(select(WhatsAppSender).where(WhatsAppSender.id == retry_rows[0].sender_id))
+    assert sender_res.scalar_one().provider == PROVIDER_EASYWEEK
+
+
+async def test_second_attempt_in_the_same_chain_also_stays_easyweek(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    no_contact_rate_limit: None,
+) -> None:
+    job = await _seed_easyweek_happy_path(db)
+    await _run_job(db, job)
+    rows = await _outbox_rows(db, job)
+    original_outbox_id = rows[0].id
+
+    await _deliver_failed_status(db, rows[0].provider_message_id, dedupe="wa:eyw-chain-1")
+    retry = (await _retry_jobs_for(db, original_outbox_id))[0]
+
+    retry.run_at = datetime.now(timezone.utc)
+    await db.flush()
+    await _run_job(db, retry)
+    retry_rows = await _outbox_rows(db, retry)
+    assert len(retry_rows) == 1
+
+    await _deliver_failed_status(db, retry_rows[0].provider_message_id, dedupe="wa:eyw-chain-2")
+
+    chain = await _retry_jobs_for(db, original_outbox_id)
+    assert len(chain) == 2
+    assert {j.provider for j in chain} == {PROVIDER_EASYWEEK}
+    assert chain[1].payload["delivery_retry_attempt"] == 2
+
+
+async def test_altegio_delivery_retry_still_stays_altegio(
+    db: AsyncSession,
+    capture: CaptureProvider,
+) -> None:
+    job = await _seed_altegio_happy_path(db, job_type="record_created")
+    await _run_job(db, job)
+    assert job.status == "done", job.last_error
+
+    rows = await _outbox_rows(db, job)
+    await _deliver_failed_status(db, rows[0].provider_message_id, dedupe="wa:alt-failed-1")
+
+    retries = await _retry_jobs_for(db, rows[0].id)
+    assert len(retries) == 1
+    assert retries[0].provider == PROVIDER_ALTEGIO
+    assert retries[0].job_type == "record_created"
+    assert retries[0].status == "queued"
+
+
+async def _outbox_without_a_usable_job(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    mutate: Any,
+) -> OutboxMessage:
+    """Send an EasyWeek job, then break the link the retry has to prove."""
+    job = await _seed_easyweek_happy_path(db)
+    await _run_job(db, job)
+    rows = await _outbox_rows(db, job)
+    await mutate(job, rows[0])
+    await db.flush()
+    return rows[0]
+
+
+async def test_missing_original_job_refuses_the_retry(
+    db: AsyncSession,
+    capture: CaptureProvider,
+) -> None:
+    async def _detach(job: MessageJob, outbox: OutboxMessage) -> None:
+        outbox.job_id = None
+
+    outbox = await _outbox_without_a_usable_job(db, capture, _detach)
+
+    await _deliver_failed_status(db, outbox.provider_message_id, dedupe="wa:eyw-no-job")
+
+    assert await _retry_jobs_for(db, outbox.id) == []
+    await db.refresh(outbox)
+    assert outbox.meta["delivery_retry_skipped"] is True
+    assert outbox.meta["delivery_retry_skip_reason"] == "original_job_missing"
+
+
+@pytest.mark.parametrize(
+    "field,value,reason",
+    [
+        ("company_id", 999123, "company_mismatch"),
+        ("record_id", None, "record_mismatch"),
+        ("client_id", None, "client_mismatch"),
+        ("job_type", "record_updated", "job_type_mismatch"),
+    ],
+)
+async def test_job_and_anchor_outbox_divergence_refuses_the_retry(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    field: str,
+    value: Any,
+    reason: str,
+) -> None:
+    async def _diverge(job: MessageJob, outbox: OutboxMessage) -> None:
+        setattr(job, field, value)
+
+    outbox = await _outbox_without_a_usable_job(db, capture, _diverge)
+
+    await _deliver_failed_status(db, outbox.provider_message_id, dedupe=f"wa:eyw-diverge-{field}")
+
+    assert await _retry_jobs_for(db, outbox.id) == []
+    await db.refresh(outbox)
+    assert outbox.meta["delivery_retry_skip_reason"] == reason
+
+
+async def test_blank_provider_on_the_original_job_refuses_the_retry(
+    db: AsyncSession,
+    capture: CaptureProvider,
+) -> None:
+    """Provider must be PROVEN, never guessed from the colliding company id."""
+
+    async def _blank(job: MessageJob, outbox: OutboxMessage) -> None:
+        job.provider = "   "
+
+    outbox = await _outbox_without_a_usable_job(db, capture, _blank)
+
+    await _deliver_failed_status(db, outbox.provider_message_id, dedupe="wa:eyw-blank-provider")
+
+    assert await _retry_jobs_for(db, outbox.id) == []
+    await db.refresh(outbox)
+    assert outbox.meta["delivery_retry_skip_reason"] == "original_job_provider_unknown"
+
+
+async def test_easyweek_retry_refused_when_the_record_is_not_easyweek(
+    db: AsyncSession,
+    capture: CaptureProvider,
+) -> None:
+    async def _flip(job: MessageJob, outbox: OutboxMessage) -> None:
+        record = await db.get(Record, job.record_id)
+        record.provider = PROVIDER_ALTEGIO
+
+    outbox = await _outbox_without_a_usable_job(db, capture, _flip)
+
+    await _deliver_failed_status(db, outbox.provider_message_id, dedupe="wa:eyw-foreign-record")
+
+    assert await _retry_jobs_for(db, outbox.id) == []
+    await db.refresh(outbox)
+    assert outbox.meta["delivery_retry_skip_reason"] == "easyweek_retry_record_provider_mismatch"
+
+
+async def test_easyweek_retry_refused_when_the_client_is_not_easyweek(
+    db: AsyncSession,
+    capture: CaptureProvider,
+) -> None:
+    async def _flip(job: MessageJob, outbox: OutboxMessage) -> None:
+        client = await db.get(Client, job.client_id)
+        client.provider = PROVIDER_ALTEGIO
+
+    outbox = await _outbox_without_a_usable_job(db, capture, _flip)
+
+    await _deliver_failed_status(db, outbox.provider_message_id, dedupe="wa:eyw-foreign-client")
+
+    assert await _retry_jobs_for(db, outbox.id) == []
+    await db.refresh(outbox)
+    assert outbox.meta["delivery_retry_skip_reason"] == "easyweek_retry_client_provider_mismatch"
+
+
+async def test_easyweek_retry_refused_when_record_and_client_are_unlinked(
+    db: AsyncSession,
+    capture: CaptureProvider,
+) -> None:
+    async def _unlink(job: MessageJob, outbox: OutboxMessage) -> None:
+        other = Client(
+            provider=PROVIDER_EASYWEEK,
+            company_id=COLLIDING_COMPANY_ID,
+            altegio_client_id=7300055,
+            phone_e164="+491700000055",
+            display_name="Frida",
+            raw={},
+        )
+        db.add(other)
+        await db.flush()
+        job.client_id = other.id
+        outbox.client_id = other.id
+
+    outbox = await _outbox_without_a_usable_job(db, capture, _unlink)
+
+    await _deliver_failed_status(db, outbox.provider_message_id, dedupe="wa:eyw-unlinked")
+
+    assert await _retry_jobs_for(db, outbox.id) == []
+    await db.refresh(outbox)
+    assert outbox.meta["delivery_retry_skip_reason"] == "easyweek_retry_record_client_unlinked"
+
+
+async def test_an_existing_retry_with_the_wrong_provider_is_not_adopted(
+    db: AsyncSession,
+) -> None:
+    """An Altegio row on the dedupe key is refused, not reused.
+
+    Exercised at ``_create_delivery_retry_job_idempotent`` because that is the
+    only place the adoption can happen: a concurrent writer wins the unique
+    index and the loser reads the row back. Returning it would hand an EasyWeek
+    chain a job that renders from Altegio templates and sends from the Altegio
+    number.
+    """
+    client = await _seed_easyweek_client(db)
+    record = await _seed_easyweek_record(db, client)
+    squatter = MessageJob(
+        provider=PROVIDER_ALTEGIO,
+        company_id=COLLIDING_COMPANY_ID,
+        record_id=record.id,
+        client_id=client.id,
+        job_type="record_created",
+        run_at=datetime.now(timezone.utc),
+        status="queued",
+        dedupe_key="delivery_retry:4242:1",
+        payload={},
+    )
+    db.add(squatter)
+    await db.flush()
+
+    expected = {
+        "provider": PROVIDER_EASYWEEK,
+        "company_id": COLLIDING_COMPANY_ID,
+        "record_id": record.id,
+        "client_id": client.id,
+        "job_type": "record_created",
+    }
+    refused = await wa_worker._create_delivery_retry_job_idempotent(
+        db,
+        dedupe_key="delivery_retry:4242:1",
+        status="queued",
+        run_at=datetime.now(timezone.utc),
+        attempts=0,
+        max_attempts=5,
+        payload={},
+        **expected,
+    )
+    assert refused is None
+    assert wa_worker._retry_job_identity_mismatch(squatter, expected) == "provider"
+
+    await db.refresh(squatter)
+    assert squatter.provider == PROVIDER_ALTEGIO, "the existing row must not be mutated"
+
+    # A matching row IS adopted — the guard rejects mismatches, not idempotency.
+    squatter.provider = PROVIDER_EASYWEEK
+    await db.flush()
+    adopted = await wa_worker._create_delivery_retry_job_idempotent(
+        db,
+        dedupe_key="delivery_retry:4242:1",
+        status="queued",
+        run_at=datetime.now(timezone.utc),
+        attempts=0,
+        max_attempts=5,
+        payload={},
+        **expected,
+    )
+    assert adopted is not None
+    assert adopted.id == squatter.id
+
+
+async def test_a_squatting_retry_attempt_number_blocks_a_new_retry(
+    db: AsyncSession,
+    capture: CaptureProvider,
+) -> None:
+    """The outer attempt-number dedupe already refuses to create a second job.
+
+    Fail-closed rather than fail-safe: nothing new is created, and the EasyWeek
+    chain does not silently gain an Altegio job of its own making.
+    """
+    job = await _seed_easyweek_happy_path(db)
+    await _run_job(db, job)
+    rows = await _outbox_rows(db, job)
+    outbox_id = rows[0].id
+
+    squatter = MessageJob(
+        provider=PROVIDER_ALTEGIO,
+        company_id=job.company_id,
+        record_id=job.record_id,
+        client_id=job.client_id,
+        job_type="record_created",
+        run_at=datetime.now(timezone.utc),
+        status="queued",
+        dedupe_key=f"delivery_retry:{outbox_id}:1",
+        payload={},
+    )
+    db.add(squatter)
+    await db.flush()
+
+    await _deliver_failed_status(db, rows[0].provider_message_id, dedupe="wa:eyw-squatter")
+
+    assert len(await _retry_jobs_for(db, outbox_id)) == 1
+    await db.refresh(squatter)
+    assert squatter.provider == PROVIDER_ALTEGIO, "the existing row must not be mutated"
+
+
+async def test_retry_refusal_audit_carries_no_pii(
+    db: AsyncSession,
+    capture: CaptureProvider,
+) -> None:
+    async def _blank(job: MessageJob, outbox: OutboxMessage) -> None:
+        job.provider = ""
+
+    outbox = await _outbox_without_a_usable_job(db, capture, _blank)
+
+    await _deliver_failed_status(db, outbox.provider_message_id, dedupe="wa:eyw-audit-pii")
+
+    await db.refresh(outbox)
+    # The send audit legitimately holds the rendered params from the successful
+    # send; what must stay clean is everything the REFUSAL adds.
+    refusal = {k: v for k, v in (outbox.meta or {}).items() if k.startswith("delivery_retry")}
+    assert refusal["delivery_retry_skipped"] is True
+    audit = str(refusal)
+    for secret in (CLIENT_PHONE, CLIENT_EMAIL, "Anna", "Wimpernverlängerung", BOOKING_HASH):
+        assert secret not in audit

@@ -16,7 +16,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from altegio_bot.campaigns.runner import recompute_campaign_run_stats
 from altegio_bot.chatwoot_client import ChatwootClient
 from altegio_bot.db import SessionLocal
+from altegio_bot.easyweek_policy import EASYWEEK_LIFECYCLE_JOB_TYPES, normalize_provider
 from altegio_bot.models.models import (
+    PROVIDER_EASYWEEK,
     CampaignRecipient,
     Client,
     MessageJob,
@@ -880,6 +882,96 @@ async def _select_message_job_by_dedupe(session: AsyncSession, dedupe_key: str) 
     return (await session.execute(stmt)).scalars().first()
 
 
+# The fields a retry job inherits verbatim from the job it retries. If an
+# already-existing row disagrees on any of them it is not "the same retry" — it
+# is a different job wearing the same dedupe key, and reusing it would let an
+# Altegio row stand in for an EasyWeek chain.
+_RETRY_IDENTITY_FIELDS = ("provider", "company_id", "record_id", "client_id", "job_type")
+
+
+def _retry_job_identity_mismatch(existing: MessageJob, expected: dict[str, Any]) -> str | None:
+    """Name the first identity field an existing retry job disagrees on."""
+    for field in _RETRY_IDENTITY_FIELDS:
+        if field not in expected:
+            continue
+        if getattr(existing, field, None) != expected[field]:
+            return field
+    return None
+
+
+async def _delivery_retry_identity_error(
+    session: AsyncSession,
+    *,
+    anchor_outbox: OutboxMessage,
+    original_job: MessageJob | None,
+    job_type: str,
+) -> str | None:
+    """Prove the retry may be created, and that its provider is knowable.
+
+    The status callback carries no provider. Neither does ``OutboxMessage`` — it
+    has no such column, and PR-5 deliberately does not add one. So the ONLY
+    authoritative source is the ``MessageJob`` that produced the anchor outbox
+    row, and it must be reachable and consistent before anything is created.
+
+    Provider is never inferred from ``company_id`` (the two CRMs share one
+    integer space), from the Record, the Client, the sender or the Meta template
+    name — all of which can look Altegio-shaped for an EasyWeek booking.
+
+    Returns a PII-free reason on refusal, or ``None`` when the retry is safe.
+    """
+    if original_job is None:
+        return "original_job_missing"
+
+    provider = normalize_provider(getattr(original_job, "provider", None), default="")
+    if not provider:
+        return "original_job_provider_unknown"
+
+    if original_job.job_type != job_type:
+        return "job_type_mismatch"
+    if original_job.company_id != anchor_outbox.company_id:
+        return "company_mismatch"
+    if original_job.record_id != anchor_outbox.record_id:
+        return "record_mismatch"
+    if original_job.client_id != anchor_outbox.client_id:
+        return "client_mismatch"
+
+    if provider != PROVIDER_EASYWEEK:
+        return None
+
+    # EasyWeek adds the domain-scope proof the outbox worker performs on a fresh
+    # job. A retry skips job planning entirely, so without this the chain is the
+    # one way an EasyWeek send can reach Meta without ever having been checked.
+    if job_type not in EASYWEEK_LIFECYCLE_JOB_TYPES:
+        return "easyweek_job_type_not_enabled"
+    if original_job.record_id is None or original_job.client_id is None:
+        return "easyweek_retry_missing_domain_rows"
+
+    record = await session.get(Record, original_job.record_id)
+    client = await session.get(Client, original_job.client_id)
+    if record is None or client is None:
+        return "easyweek_retry_domain_rows_missing"
+    if normalize_provider(getattr(record, "provider", None), default="") != PROVIDER_EASYWEEK:
+        return "easyweek_retry_record_provider_mismatch"
+    if normalize_provider(getattr(client, "provider", None), default="") != PROVIDER_EASYWEEK:
+        return "easyweek_retry_client_provider_mismatch"
+    if record.company_id != original_job.company_id:
+        return "easyweek_retry_record_company_mismatch"
+    if client.company_id != original_job.company_id:
+        return "easyweek_retry_client_company_mismatch"
+    if record.client_id != client.id:
+        return "easyweek_retry_record_client_unlinked"
+    return None
+
+
+def _record_retry_skip(outbox: OutboxMessage, reason: str, original_outbox_id: int) -> None:
+    """Audit the refusal on the outbox row. Invariant names only, never values."""
+    skip_meta = dict(outbox.meta or {})
+    skip_meta["delivery_retry_skipped"] = True
+    skip_meta["delivery_retry_skip_reason"] = reason
+    skip_meta["delivery_retry_original_outbox_id"] = original_outbox_id
+    outbox.meta = skip_meta
+
+
 async def _create_delivery_retry_job_idempotent(
     session: AsyncSession,
     *,
@@ -888,6 +980,8 @@ async def _create_delivery_retry_job_idempotent(
 ) -> MessageJob | None:
     existing = await _select_message_job_by_dedupe(session, dedupe_key)
     if existing is not None:
+        if _retry_job_identity_mismatch(existing, fields) is not None:
+            return None
         return existing
 
     job = MessageJob(dedupe_key=dedupe_key, **fields)
@@ -896,7 +990,10 @@ async def _create_delivery_retry_job_idempotent(
             session.add(job)
             await session.flush()
     except IntegrityError:
-        return await _select_message_job_by_dedupe(session, dedupe_key)
+        raced = await _select_message_job_by_dedupe(session, dedupe_key)
+        if raced is not None and _retry_job_identity_mismatch(raced, fields) is not None:
+            return None
+        return raced
     return job
 
 
@@ -1157,13 +1254,37 @@ async def _handle_failed_delivery_status(
     if original_outbox_id != int(outbox.id):
         original = await session.get(OutboxMessage, original_outbox_id)
         if original is None:
-            skip_meta = dict(outbox.meta or {})
-            skip_meta["delivery_retry_skipped"] = True
-            skip_meta["delivery_retry_skip_reason"] = "original_outbox_missing"
-            skip_meta["delivery_retry_original_outbox_id"] = original_outbox_id
-            outbox.meta = skip_meta
+            _record_retry_skip(outbox, "original_outbox_missing", original_outbox_id)
             return
         anchor_outbox = original
+
+    # Resolve the authoritative job for the WHOLE chain — the one that produced
+    # the anchor row, not this callback's outbox — and refuse the retry outright
+    # unless its identity and provider are proven. Done BEFORE the delay, the
+    # deadline and the payload are computed, so a refusal costs nothing and
+    # reaches no external system.
+    original_job: MessageJob | None = None
+    if anchor_outbox.job_id is not None:
+        original_job = await session.get(MessageJob, anchor_outbox.job_id)
+
+    identity_err = await _delivery_retry_identity_error(
+        session,
+        anchor_outbox=anchor_outbox,
+        original_job=original_job,
+        job_type=job_type,
+    )
+    if identity_err is not None:
+        _record_retry_skip(outbox, identity_err, original_outbox_id)
+        logger.warning(
+            "Delivery retry refused: reason=%s original_outbox_id=%s outbox_id=%s",
+            identity_err,
+            original_outbox_id,
+            int(outbox.id),
+        )
+        return
+
+    assert original_job is not None  # guaranteed by _delivery_retry_identity_error
+    retry_provider = normalize_provider(original_job.provider, default="")
 
     record: Record | None = None
     if anchor_outbox.record_id is not None:
@@ -1202,18 +1323,22 @@ async def _handle_failed_delivery_status(
             record_starts_at = record_starts_at.replace(tzinfo=timezone.utc)
         payload["record_starts_at"] = record_starts_at.isoformat()
 
-    original_job = None
-    if anchor_outbox.job_id is not None:
-        original_job = await session.get(MessageJob, anchor_outbox.job_id)
     max_attempts = int(getattr(original_job, "max_attempts", 5) or 5)
 
     dedupe_key = f"{_DELIVERY_RETRY_DEDUPE_PREFIX}{original_outbox_id}:{attempt_number}"
     created = await _create_delivery_retry_job_idempotent(
         session,
         dedupe_key=dedupe_key,
-        company_id=anchor_outbox.company_id,
-        record_id=anchor_outbox.record_id,
-        client_id=anchor_outbox.client_id,
+        # Explicit, from the proven original job. Leaving this to the column
+        # default would silently stamp every EasyWeek retry as Altegio, and the
+        # retry would then load an Altegio template and send from the Altegio
+        # number — the exact cross-tenant leak PR-5 exists to prevent.
+        provider=retry_provider,
+        # Identity comes from the original JOB, already proven equal to the
+        # anchor outbox row above, so the retry cannot drift from the chain.
+        company_id=original_job.company_id,
+        record_id=original_job.record_id,
+        client_id=original_job.client_id,
         job_type=job_type,
         status="queued",
         run_at=next_run_at,
@@ -1221,6 +1346,14 @@ async def _handle_failed_delivery_status(
         max_attempts=max_attempts,
         payload=payload,
     )
+    if created is None:
+        _record_retry_skip(outbox, "existing_retry_identity_mismatch", original_outbox_id)
+        logger.warning(
+            "Delivery retry refused: an existing job for dedupe_key=%s does not match the chain identity",
+            dedupe_key,
+        )
+        return
+
     logger.warning(
         "Scheduled delivery retry original_outbox_id=%s attempt=%s delay_seconds=%s dedupe_key=%s created=%s",
         original_outbox_id,

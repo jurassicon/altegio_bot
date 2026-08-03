@@ -25,6 +25,12 @@ from altegio_bot.campaigns.runner import (
 )
 from altegio_bot.db import SessionLocal
 from altegio_bot.easyweek_normalizer import extract_manage_link
+from altegio_bot.easyweek_policy import (
+    EASYWEEK_LIFECYCLE_JOB_TYPES,
+    easyweek_job_type_error,
+    normalize_provider,
+    validate_static_booking_page,
+)
 from altegio_bot.message_planner import (
     COMEBACK_3D_DELAY,
     COMEBACK_3D_SOURCE_CANCELLED_AT_KEY,
@@ -800,18 +806,6 @@ async def _is_new_client_for_record(
     return prev_id is None
 
 
-# The three codes EasyWeek plans in PR-4. Every strict gate below is scoped to
-# them: reminders, marketing and campaigns are Altegio-only for now and must keep
-# exactly the behaviour they have.
-EASYWEEK_LIFECYCLE_JOB_TYPES: frozenset[str] = frozenset(
-    {
-        "record_created",
-        "record_updated",
-        "record_canceled",
-    }
-)
-
-
 def _easyweek_domain_scope_error(
     job: MessageJob,
     record: Record | None,
@@ -916,10 +910,15 @@ def easyweek_effective_booking_link(record: Record | None, template_code: str) -
     drift, and this is the last gate before a URL reaches a customer. A link is
     never synthesised from the booking UUID, the numeric id or the hash.
 
-    Anything that does not verify falls back to the static page; an empty static
-    page yields "" and the caller fails the job locally.
+    The static page is validated too, by :func:`validate_static_booking_page` —
+    a misconfigured ``EASYWEEK_BOOKING_PAGE_URL`` is just as customer-facing as a
+    forged ``short_link``, and for ``record_canceled`` it is the ONLY link. An
+    unusable value yields "" here, and the caller fails the job locally rather
+    than sending a message with a blank or hostile link.
+
+    Anything that does not verify falls back to the static page.
     """
-    static_page = (settings.easyweek_booking_page_url or "").strip()
+    static_page = validate_static_booking_page(settings.easyweek_booking_page_url) or ""
     if record is None or template_code == "record_canceled":
         return static_page
 
@@ -2023,6 +2022,35 @@ async def _run_job_logic(
     after the transaction commits.  Returns ``None`` for every other
     outcome (non-campaign job, send failure, guard skip, etc.).
     """
+    # The CRM this job belongs to. Read FIRST — before routing, before any row is
+    # loaded, before any external call — and threaded through template loading,
+    # sender routing and Meta-name resolution: every place where an Altegio and an
+    # EasyWeek row could otherwise collide on a numeric company_id. The normalized
+    # read keeps hand-built test jobs and any legacy row without the column on the
+    # Altegio path, exactly as before.
+    job_provider = normalize_provider(getattr(job, "provider", None), default=PROVIDER_ALTEGIO)
+
+    # Phase-1 allowlist, checked before ANYTHING else acts on this job.
+    #
+    # It has to be here rather than deeper down: the campaign branch below
+    # requeues, the promo branches hand the job to their own handlers, and the
+    # marketing paths call the live Altegio API — all of which would have already
+    # happened by the time a later guard ran. An EasyWeek `reminder_24h` has no
+    # template, no Altegio client id and no reason to exist yet; the only correct
+    # outcome is a deterministic terminal failure that nobody retries.
+    job_type_err = easyweek_job_type_error(job_provider, job.job_type)
+    if job_type_err is not None:
+        job.status = "failed"
+        job.locked_at = None
+        job.last_error = job_type_err
+        logger.error(
+            "EasyWeek job type not enabled: job_id=%s company=%s job_type=%s",
+            job.id,
+            job.company_id,
+            job.job_type,
+        )
+        return None
+
     # Safety guard: orchestrator jobs must never reach outbox_worker.
     # _lock_next_jobs() already excludes them, but if somehow an execution job
     # arrives here (e.g. via direct process_job_in_session call), requeue it so
@@ -2035,13 +2063,6 @@ async def _run_job_logic(
         job.status = "queued"
         job.locked_at = None
         return
-
-    # The CRM this job belongs to. Read once, from the row, and threaded through
-    # template loading, sender routing and Meta-name resolution — every place
-    # where an Altegio and an EasyWeek row could otherwise collide on a numeric
-    # company_id. `getattr` with a default keeps hand-built test jobs and any
-    # legacy row without the column on the Altegio path, exactly as before.
-    job_provider = (getattr(job, "provider", None) or PROVIDER_ALTEGIO).strip() or PROVIDER_ALTEGIO
 
     success = await _find_success_outbox(session, job.id)
     if success is not None:
@@ -2826,8 +2847,9 @@ async def _run_job_logic(
     # returned. `body` and `meta_template_name` already come from that row; if
     # the request said `de` while the row was `en`, Meta rejects the send —
     # after the request is spent — for a mismatch we could see locally.
+    _is_easyweek_lifecycle = job_provider == PROVIDER_EASYWEEK and job.job_type in EASYWEEK_LIFECYCLE_JOB_TYPES
     effective_template_language = TEMPLATE_LANGUAGE
-    if job_provider == PROVIDER_EASYWEEK and job.job_type in EASYWEEK_LIFECYCLE_JOB_TYPES:
+    if _is_easyweek_lifecycle:
         effective_template_language = (lang or "").strip()
         if not effective_template_language:
             job.status = "failed"
@@ -2840,6 +2862,19 @@ async def _run_job_logic(
                 job.job_type,
             )
             return
+
+    # The language written to every OutboxMessage row for this job.
+    #
+    # For EasyWeek it is the SAME normalized string Meta was handed, so the audit
+    # trail cannot disagree with what was actually sent — a `lang` of `" de "`
+    # would otherwise be stored raw next to a `de` request, and a later
+    # investigation would be comparing two different-looking values.
+    #
+    # Altegio keeps storing `lang` (which may be a same-company fallback
+    # language) while sending TEMPLATE_LANGUAGE. That divergence is deliberate
+    # and pre-existing: the row records which template TEXT was used, the request
+    # records how the Meta template is registered.
+    outbox_language = effective_template_language if _is_easyweek_lifecycle else lang
 
     _job_payload = getattr(job, "payload", None) or {}
     loyalty_card_text = _job_payload.get("loyalty_card_text", "")
@@ -2947,7 +2982,7 @@ async def _run_job_logic(
                 sender_id=sender_id,
                 phone_e164=phone,
                 template_code=job.job_type,
-                language=lang,
+                language=outbox_language,
                 body=body,
                 status="failed",
                 error=preflight_err,
@@ -3124,7 +3159,7 @@ async def _run_job_logic(
                         sender_id=sender_id,
                         phone_e164=phone,
                         template_code=job.job_type,
-                        language=lang,
+                        language=outbox_language,
                         body=final_body,
                         status="sent",
                         error=None,
@@ -3207,7 +3242,7 @@ async def _run_job_logic(
                             sender_id=sender_id,
                             phone_e164=phone,
                             template_code=job.job_type,
-                            language=lang,
+                            language=outbox_language,
                             body=final_body,
                             status="failed",
                             error=_text_err,
@@ -3367,7 +3402,7 @@ async def _run_job_logic(
                 sender_id=sender_id,
                 phone_e164=phone,
                 template_code=job.job_type,
-                language=lang,
+                language=outbox_language,
                 body=final_body,
                 status="failed",
                 error=err,
@@ -3424,7 +3459,7 @@ async def _run_job_logic(
             sender_id=sender_id,
             phone_e164=phone,
             template_code=job.job_type,
-            language=lang,
+            language=outbox_language,
             body=final_body,
             status="sent",
             error=None,
