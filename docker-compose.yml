@@ -119,6 +119,30 @@ services:
         condition: service_started
     command: ["/app/.venv/bin/python", "-m", "altegio_bot.scripts.run_followup_worker"]
 
+  # EasyWeek normalizer (PR-4). Separate service on purpose: the live Altegio
+  # inbox worker is not touched by this rollout.
+  #
+  # Reads easyweek.env in addition to .env, with required:false so a host
+  # without the file still deploys. The worker stays inert and quiet until
+  # EASYWEEK_PROCESSING_ENABLED=true AND EASYWEEK_LOCATION_ID is set, so
+  # deploying PR-4 does not start chewing through the captured backlog.
+  #
+  # NOTE: `docker compose restart` does NOT re-read env_file — flipping any
+  # EASYWEEK_* flag requires `up -d --force-recreate altegio-easyweek-inbox-worker`.
+  altegio-easyweek-inbox-worker:
+    build: .
+    restart: always
+    env_file:
+      - .env
+      - path: easyweek.env
+        required: false
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    command: ["/app/.venv/bin/python", "-m", "altegio_bot.scripts.run_easyweek_inbox_worker"]
+
   # Migration runner — not started by default `docker compose up -d`.
   # Run explicitly: docker compose --profile ops run --rm migrate
   migrate:

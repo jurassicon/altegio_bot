@@ -266,6 +266,7 @@ jobs:
             altegio-meta-guard-worker
             altegio-campaign-worker
             altegio-followup-worker
+            altegio-easyweek-inbox-worker
             "
 
             for SERVICE in $CRITICAL_SERVICES; do

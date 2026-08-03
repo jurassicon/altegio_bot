@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid
 from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import patch
@@ -684,3 +685,113 @@ async def test_read_bounded_body_empty_stream() -> None:
     assert prefix == b""
     assert total == 0
     assert truncated is False
+
+
+# ===========================================================================
+# Canonical booking UUID at capture (PR-4 causal ordering key)
+# ===========================================================================
+#
+# The column is the ONLY key the inbox worker serialises deliveries on, so it is
+# written here, at capture. Parsing it must never affect whether the delivery is
+# accepted: capture stays research-grade, and an unparsable id simply leaves the
+# column NULL for the worker to reject deterministically later.
+
+_CANONICAL_UUID = uuid.UUID("ac15372d-7422-4fc6-8fcb-b520bbffa669")
+
+
+async def _capture_body(session_maker, body: str) -> EasyWeekEvent:
+    with _capture_env(session_maker):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as tc:
+            resp = await tc.post(
+                f"{URL}?event=booking-created&token={SECRET}",
+                content=body,
+                headers={"Content-Type": "application/json"},
+            )
+    assert resp.status_code == 200, "an authenticated delivery must always be accepted"
+    assert resp.json() == {"ok": True}
+    rows = await _rows(session_maker)
+    assert len(rows) == 1
+    return rows[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "raw_uid",
+    [
+        "ac15372d-7422-4fc6-8fcb-b520bbffa669",
+        "AC15372D-7422-4FC6-8FCB-B520BBFFA669",
+        "  ac15372d-7422-4fc6-8fcb-b520bbffa669  ",
+        "{ac15372d-7422-4fc6-8fcb-b520bbffa669}",
+        "ac15372d74224fc68fcbb520bbffa669",
+        "urn:uuid:ac15372d-7422-4fc6-8fcb-b520bbffa669",
+    ],
+    ids=["canonical", "uppercase", "padded", "braced", "compact", "urn"],
+)
+async def test_every_spelling_captures_the_same_canonical_uuid(session_maker, raw_uid) -> None:
+    """One booking, one ordering key — whatever the textual form."""
+    payload = _payload()
+    payload["uid"] = raw_uid
+    body = json.dumps(payload)
+
+    row = await _capture_body(session_maker, body)
+
+    assert row.booking_uuid == _CANONICAL_UUID
+    # The raw capture is untouched: the column is a derived index key, not a
+    # rewrite of what EasyWeek sent.
+    assert row.payload["uid"] == raw_uid
+    assert row.body_raw == body.encode()
+    assert row.payload_hash is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "uid_value",
+    ["not-a-uuid", "", "   ", 12345, None, ["ac15372d-7422-4fc6-8fcb-b520bbffa669"]],
+    ids=["garbage", "empty", "blank", "number", "null", "list"],
+)
+async def test_an_unusable_uid_still_captures_with_a_null_key(session_maker, uid_value) -> None:
+    """Capture must accept the delivery; the worker rejects it deterministically."""
+    payload = _payload()
+    payload["uid"] = uid_value
+    body = json.dumps(payload)
+
+    row = await _capture_body(session_maker, body)
+
+    assert row.booking_uuid is None
+    assert row.status == "captured"
+    assert row.payload["uid"] == uid_value
+    assert row.body_raw == body.encode()
+    assert row.payload_hash is not None
+
+
+@pytest.mark.asyncio
+async def test_a_missing_uid_captures_with_a_null_key(session_maker) -> None:
+    payload = _payload()
+    payload.pop("uid", None)
+    body = json.dumps(payload)
+
+    row = await _capture_body(session_maker, body)
+
+    assert row.booking_uuid is None
+    assert row.payload_hash is not None
+    assert row.body_raw == body.encode()
+
+
+@pytest.mark.asyncio
+async def test_a_non_object_json_root_captures_with_a_null_key(session_maker) -> None:
+    """The root is wrapped, so there is no `uid` to canonicalise."""
+    body = json.dumps(["ac15372d-7422-4fc6-8fcb-b520bbffa669"])
+
+    row = await _capture_body(session_maker, body)
+
+    assert row.booking_uuid is None
+    assert row.payload == {"_non_dict_payload": ["ac15372d-7422-4fc6-8fcb-b520bbffa669"]}
+
+
+@pytest.mark.asyncio
+async def test_a_non_json_body_captures_with_a_null_key(session_maker) -> None:
+    row = await _capture_body(session_maker, "this is not json")
+
+    assert row.booking_uuid is None
+    assert row.body_text == "this is not json"
+    assert row.payload == {}

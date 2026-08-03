@@ -40,7 +40,25 @@ from altegio_bot.settings import Settings
 
 _ROOT = Path(__file__).resolve().parents[3]
 _BASE_REVISION = "8923be993170"
-_HEAD_REVISION = "c1a7d3f905b2"
+
+
+def _current_head_revision() -> str:
+    """The single head, read from the revision graph rather than hardcoded.
+
+    These assertions mean "``upgrade head`` actually arrived at the head". A
+    literal would silently start naming an OLD revision the moment a later PR
+    adds one on top — exactly the staleness the comment below warns about for
+    relative ``-1`` targets — and the check would then pass for the wrong state.
+    """
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    heads = ScriptDirectory.from_config(Config(str(_ROOT / "alembic.ini"))).get_heads()
+    assert len(heads) == 1, f"expected exactly one Alembic head, got {heads}"
+    return heads[0]
+
+
+_HEAD_REVISION = _current_head_revision()
 # Named explicitly rather than reached with a relative "-1": once a revision is
 # added on top, "-1" silently stops meaning "undo THIS migration" and the test
 # would assert against the wrong schema.
@@ -216,7 +234,21 @@ async def test_migration_compatibility_scenarios(temp_db_url) -> None:
         "SELECT column_name FROM information_schema.columns WHERE table_name = 'easyweek_events'",
     )
     removed = {c[0] for c in before} - {c[0] for c in after}
-    assert removed == {"body_raw", "body_size_bytes"}, f"downgrade removed too much: {removed}"
+    # Everything added to easyweek_events ABOVE _BASE_REVISION, and nothing else:
+    #   8705ec49cc73 (PR-1 follow-up) -> body_raw, body_size_bytes
+    #   d4e8a1c39f57 (PR-4)           -> booking_uuid, processed_at, error_code,
+    #                                    processing_attempts, next_retry_at
+    # The point of the assertion is that the downgrade is scoped — it must not
+    # take the base capture columns with it.
+    assert removed == {
+        "body_raw",
+        "body_size_bytes",
+        "booking_uuid",
+        "processed_at",
+        "error_code",
+        "processing_attempts",
+        "next_retry_at",
+    }, f"downgrade removed too much: {removed}"
 
     remaining_indexes = await _fetch(
         temp_db_url,
