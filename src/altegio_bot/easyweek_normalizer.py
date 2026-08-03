@@ -70,6 +70,23 @@ MANAGE_LINK_PREFIX: Final = "/r/"
 # Mirrors records.easyweek_booking_hash_id (String(64)).
 MAX_BOOKING_HASH_ID_LEN: Final = 64
 
+# ---------------------------------------------------------------------------
+# Domain numeric bounds — the actual PostgreSQL column limits
+# ---------------------------------------------------------------------------
+# A JSON number is unbounded; a PostgreSQL column is not. Passing an oversized
+# integer through would raise DataError at INSERT time, which the worker cannot
+# tell from a transient database fault — so it would be retried forever instead
+# of being rejected once. Every number is therefore range-checked HERE.
+PG_INT_MIN: Final = -2147483648
+PG_INT_MAX: Final = 2147483647
+PG_BIGINT_MIN: Final = -9223372036854775808
+PG_BIGINT_MAX: Final = 9223372036854775807
+
+# Numeric(12, 2): ten integral digits plus two decimals.
+MAX_MONEY: Final = Decimal("9999999999.99")
+# The same ceiling expressed in the minor units the payload actually sends.
+MAX_MONEY_CENTS: Final = 999999999999
+
 
 class NormalizationError(Exception):
     """A deterministic, non-retryable rejection carrying a safe code.
@@ -93,6 +110,11 @@ class NormalizationError(Exception):
     # The numeric booking id already belongs to a Record carrying a DIFFERENT
     # booking UUID. Raised by the worker, not by payload validation.
     IDENTITY_CONFLICT: Final = "identity_conflict"
+    # A number is well-formed JSON but does not fit the domain column it is
+    # destined for. Rejected here, deterministically, rather than surfacing
+    # later as a DataError/InvalidOperation that would look transient and be
+    # retried forever.
+    INVALID_NUMERIC_RANGE: Final = "invalid_numeric_range"
 
     ALL_CODES: Final = frozenset(
         {
@@ -107,6 +129,7 @@ class NormalizationError(Exception):
             INVALID_DATETIME,
             INVALID_MANAGE_LINK,
             IDENTITY_CONFLICT,
+            INVALID_NUMERIC_RANGE,
         }
     )
 
@@ -156,6 +179,10 @@ class NormalizedBooking:
     service_id: int | None
     service_name: str | None
     service_quantity: int | None
+    # Customer-facing description of the WHOLE service set, and how many
+    # services the booking has. Confirmed root fields in the live capture.
+    services_description: str | None
+    services_count: int | None
     # `booking_price_int` is the authoritative JSON number and is in CENTS
     # (3500 == 35.00). The `booking_price*` string variants are display values.
     total_cost: Decimal | None
@@ -180,20 +207,58 @@ def map_event_hint(event_hint: str | None) -> str:
     return action
 
 
-def _require_int(value: Any, *, code: str) -> int:
-    """Accept only a real JSON number (or an exact integral value).
+def _as_exact_int(value: Any) -> int | None:
+    """Return an exact integer, or None when the value is not one.
 
     ``True``/``False`` are rejected: ``bool`` is an ``int`` subclass in Python,
     and a boolean silently becoming id ``1`` would attach a booking to whichever
-    row happens to own that id.
+    row happens to own that id. Numeric strings, NaN, Infinity and non-integral
+    floats are rejected too — EasyWeek sends real JSON numbers for every id.
     """
     if isinstance(value, bool) or value is None:
-        raise NormalizationError(code)
+        return None
     if isinstance(value, int):
         return value
-    if isinstance(value, float) and value.is_integer():
-        return int(value)
-    raise NormalizationError(code)
+    if isinstance(value, float):
+        # NaN and ±Infinity are not integral, so `is_integer()` already
+        # excludes them; the explicit check documents the intent.
+        if value != value or value in (float("inf"), float("-inf")):
+            return None
+        if value.is_integer():
+            return int(value)
+    return None
+
+
+def _require_int(
+    value: Any,
+    *,
+    code: str,
+    minimum: int = PG_BIGINT_MIN,
+    maximum: int = PG_BIGINT_MAX,
+    range_code: str = NormalizationError.INVALID_NUMERIC_RANGE,
+) -> int:
+    """Exact integer within the destination column's range, or a safe rejection.
+
+    ``code`` reports "this is not a number at all"; ``range_code`` reports "it
+    is a number, but it does not fit". Both are fixed identifiers.
+    """
+    number = _as_exact_int(value)
+    if number is None:
+        raise NormalizationError(code)
+    if number < minimum or number > maximum:
+        raise NormalizationError(range_code)
+    return number
+
+
+def _require_positive_id(value: Any, *, code: str, maximum: int = PG_BIGINT_MAX) -> int:
+    """A business identifier: exact, in range, and strictly positive.
+
+    Every id in the confirmed captured payloads (``id``, ``customer_id``,
+    ``location_id``, ``service_id``) is a positive number. A zero or negative
+    id is not something EasyWeek produces, and accepting one would let a
+    malformed delivery address an unrelated row.
+    """
+    return _require_int(value, code=code, minimum=1, maximum=maximum)
 
 
 def _optional_int(value: Any) -> int | None:
@@ -208,17 +273,52 @@ def _optional_int(value: Any) -> int | None:
 
 
 def _price_to_decimal(payload: dict[str, Any]) -> Decimal | None:
-    """Booking price as a money Decimal.
+    """Booking price as a money Decimal, or a deterministic rejection.
 
     ``booking_price_int`` is the authoritative JSON **number** and is expressed
     in minor units (3500 == 35.00). The ``booking_price`` / ``_float`` /
     ``_formatted`` siblings are localized display strings — parsing those would
     inherit the salon's decimal separator and currency symbol.
+
+    The value is range-checked against ``Numeric(12, 2)`` BEFORE the division,
+    so an absurd price is a payload rejection rather than a DataError at INSERT
+    time (which the worker would mistake for a transient fault and retry).
     """
-    cents = _optional_int(payload.get("booking_price_int"))
-    if cents is None or cents < 0:
+    raw = payload.get("booking_price_int")
+    if raw is None:
         return None
+    cents = _as_exact_int(raw)
+    if cents is None:
+        raise NormalizationError(NormalizationError.INVALID_PAYLOAD)
+    if cents < 0:
+        # A negative booking total is not something the confirmed payloads
+        # contain, and it would render as a negative price to the customer.
+        raise NormalizationError(NormalizationError.INVALID_NUMERIC_RANGE)
+    # Bound BEFORE any Decimal arithmetic: quantize() on a 30-digit value
+    # raises decimal.InvalidOperation (the default context carries 28 digits of
+    # precision), which would escape as an unexpected error and be retried
+    # forever instead of rejected once.
+    if cents > MAX_MONEY_CENTS:
+        raise NormalizationError(NormalizationError.INVALID_NUMERIC_RANGE)
     return (Decimal(cents) / Decimal(100)).quantize(Decimal("0.01"))
+
+
+def _optional_bounded_int(
+    payload: dict[str, Any],
+    key: str,
+    *,
+    minimum: int,
+    maximum: int,
+) -> int | None:
+    """Bounded integer for an optional field; absent stays None, bad rejects."""
+    if key not in payload or payload.get(key) is None:
+        return None
+    return _require_int(
+        payload.get(key),
+        code=NormalizationError.INVALID_PAYLOAD,
+        minimum=minimum,
+        maximum=maximum,
+    )
 
 
 def _optional_str(value: Any, *, limit: int | None = None) -> str | None:
@@ -390,7 +490,11 @@ def normalize_event(
     # The operator's configured location decides ownership, never the payload.
     if not isinstance(expected_location_id, int) or expected_location_id <= 0:
         raise NormalizationError(NormalizationError.INVALID_LOCATION_ID)
-    location_id = _require_int(payload.get("location_id"), code=NormalizationError.INVALID_LOCATION_ID)
+    location_id = _require_positive_id(
+        payload.get("location_id"),
+        code=NormalizationError.INVALID_LOCATION_ID,
+        maximum=PG_INT_MAX,  # clients.company_id / records.company_id are INTEGER
+    )
     if location_id != expected_location_id:
         raise NormalizationError(NormalizationError.FOREIGN_LOCATION)
 
@@ -412,29 +516,51 @@ def normalize_event(
     except (ValueError, AttributeError, TypeError):
         raise NormalizationError(NormalizationError.INVALID_BOOKING_UUID) from None
 
-    booking_id = _require_int(payload.get("id"), code=NormalizationError.MISSING_BOOKING_ID)
+    # records.altegio_record_id is BIGINT.
+    booking_id = _require_positive_id(payload.get("id"), code=NormalizationError.MISSING_BOOKING_ID)
 
+    # Presence matters as much as the value: a delivery that omits
+    # `customer_id` must not unlink a client we already resolved (see
+    # `present_fields` below). An explicit null is NOT treated as "unlink" —
+    # the confirmed payloads never send one, so that semantics is unproven.
     customer_id: int | None
     if payload.get("customer_id") is None:
         customer_id = None
     else:
-        customer_id = _require_int(payload.get("customer_id"), code=NormalizationError.INVALID_PAYLOAD)
+        # clients.altegio_client_id is BIGINT.
+        customer_id = _require_positive_id(
+            payload.get("customer_id"),
+            code=NormalizationError.INVALID_PAYLOAD,
+        )
 
     # `booking_date_start` is the machine-readable source of truth; the
     # `*_formatted`, `date` and `time` fields are localized display strings.
     starts_at = parse_iso_utc(payload.get("booking_date_start"), required=False)
     ends_at = parse_iso_utc(payload.get("booking_date_end"), required=False)
 
-    duration_sec: int | None = None
-    raw_duration = payload.get("booking_duration")
-    if raw_duration is not None and not isinstance(raw_duration, bool):
-        if isinstance(raw_duration, int) or (isinstance(raw_duration, float) and raw_duration.is_integer()):
-            minutes = int(raw_duration)
-            if minutes >= 0:
-                duration_sec = minutes * 60
+    # records.duration_sec is INTEGER, and the payload gives MINUTES, so the
+    # minute value is bounded by INT_MAX/60 before multiplying.
+    duration_minutes = _optional_bounded_int(
+        payload,
+        "booking_duration",
+        minimum=0,
+        maximum=PG_INT_MAX // 60,
+    )
+    duration_sec = None if duration_minutes is None else duration_minutes * 60
 
-    service_id = _optional_int(payload.get("service_id"))
-    service_quantity = _optional_int(payload.get("quantity"))
+    # record_services.service_id is INTEGER and is a primary-key component.
+    service_id = (
+        None
+        if payload.get("service_id") is None
+        else _require_positive_id(
+            payload.get("service_id"),
+            code=NormalizationError.INVALID_PAYLOAD,
+            maximum=PG_INT_MAX,
+        )
+    )
+    # record_services.amount is INTEGER.
+    service_quantity = _optional_bounded_int(payload, "quantity", minimum=0, maximum=PG_INT_MAX)
+    services_count = _optional_bounded_int(payload, "services_count", minimum=0, maximum=PG_INT_MAX)
     total_cost = _price_to_decimal(payload)
 
     manage_link, manage_link_present = extract_manage_link(payload)
@@ -457,7 +583,11 @@ def normalize_event(
                 ("service_id", "service_id"),
                 ("service_name", "service_name"),
                 ("service_quantity", "quantity"),
+                ("services_description", "services_description"),
+                ("services_count", "services_count"),
                 ("total_cost", "booking_price_int"),
+                # Presence decides whether the client link may be rewritten.
+                ("customer_id", "customer_id"),
             )
             if key in payload
         )
@@ -493,6 +623,8 @@ def normalize_event(
         service_id=service_id,
         service_name=_optional_str(payload.get("service_name"), limit=512),
         service_quantity=service_quantity,
+        services_description=_optional_str(payload.get("services_description"), limit=512),
+        services_count=services_count,
         total_cost=total_cost,
         present_fields=present_fields,
     )

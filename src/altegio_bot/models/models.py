@@ -215,6 +215,22 @@ class EasyWeekEvent(Base):
     # Допустимые значения перечислены в easyweek_normalizer.NormalizationError.
     error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
+    # --- per-event retry scheduling ------------------------------------------
+    # Без них одна «отравленная» строка навсегда блокирует backlog: claim берёт
+    # старейшую captured строку, поэтому после отката воркер выбирал бы ту же
+    # самую снова и снова. next_retry_at выводит её из выборки на время, и
+    # остальные готовые события обрабатываются.
+    processing_attempts: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default=text("0"),
+    )
+    next_retry_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
 
 class SmartTestRun(Base):
     """Record of a smart-test execution for idempotency and auditing."""

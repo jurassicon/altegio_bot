@@ -196,3 +196,21 @@ def booking_created_full_shape() -> dict[str, Any]:
     payload["nested_object_future"] = {"a": 1, "b": [1, 2, 3]}
     payload["null_future_field"] = None
     return payload
+
+
+def booking_created_multi_service() -> dict[str, Any]:
+    """A booking whose service SET is bigger than the singular fields.
+
+    Shape note: the live capture only ever contained ``services_count == 1``, so
+    the multi-service *values* here are constructed. What is faithful is the
+    field set — ``services_description`` and ``services_count`` are confirmed
+    root fields — and the fact that ``service_name`` names only ONE service
+    while ``services_description`` describes the whole set. That is exactly the
+    case where a singular snapshot would mislead the customer.
+    """
+    payload = _base_payload()
+    payload["services_count"] = 2
+    payload["services_description"] = "Fixture Service, Second Fixture Service"
+    payload["service_name"] = "Fixture Service"
+    payload["booking_price_int"] = 8000
+    return payload

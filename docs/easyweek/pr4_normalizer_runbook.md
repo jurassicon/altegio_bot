@@ -151,6 +151,19 @@ docker compose -p altegio_bot exec -T postgres sh -lc 'psql -tAX -U "$POSTGRES_U
 `starts_at`, равное ПОСЛЕДНЕМУ перенесённому времени. Если после Resend
 `is_deleted` стало `f` или время откатилось к исходному создению — это регресс.
 
+Клиентская связь не должна теряться на частичных доставках: `update`/`cancel`
+без `customer_id` сохраняют и `client_id`, и `altegio_client_id`.
+
+```bash
+docker compose -p altegio_bot exec -T postgres sh -lc 'psql -tAX -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT r.easyweek_booking_uuid, r.client_id IS NOT NULL AS linked, r.altegio_client_id FROM records r WHERE r.provider = '"'"'easyweek'"'"'"'
+```
+
+Отмена терминальна: после `booking-canceled` ни `booking-updated`, ни
+`booking-rescheduled`, ни повторный `booking-created` не снимают `is_deleted`,
+не меняют время/услугу/стоимость/клиента и не создают новых lifecycle job.
+Подтверждённого сигнала «отмена снята» в payload EasyWeek нет, а локализованный
+`booking_status` парсить нельзя — поэтому fail-closed.
+
 Услуга и стоимость должны быть сохранены (их использует PR-5):
 
 ```bash
@@ -158,6 +171,20 @@ docker compose -p altegio_bot exec -T postgres sh -lc 'psql -tAX -U "$POSTGRES_U
 ```
 
 Ожидается ровно одна строка на booking с непустыми `title` и `cost_to_pay`.
+
+`title` берётся из `services_description` (описание ВСЕГО набора услуг), и лишь
+при его отсутствии — из singular `service_name`: для booking с двумя услугами
+одиночное имя вводило бы клиента в заблуждение. `amount` — из `services_count`
+(иначе `quantity`).
+
+`Record.total_cost` и `RecordService.cost_to_pay` обязаны совпадать — цена
+синхронизируется даже когда доставка не содержит `service_id`:
+
+```bash
+docker compose -p altegio_bot exec -T postgres sh -lc 'psql -tAX -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT count(*) FROM records r JOIN record_services rs ON rs.record_id = r.id WHERE r.provider = '"'"'easyweek'"'"' AND r.total_cost IS DISTINCT FROM rs.cost_to_pay"'
+```
+
+Ожидается `0`.
 
 **Очередь должна остаться пустой:**
 
@@ -233,19 +260,56 @@ Capture продолжает работать, накопление событи
 invalid_event_hint     invalid_payload        truncated_payload
 missing_booking_uuid   invalid_booking_uuid   missing_booking_id
 invalid_location_id    foreign_location       invalid_datetime
-invalid_manage_link    identity_conflict
+invalid_manage_link    identity_conflict      invalid_numeric_range
+retry_exhausted
 ```
+
+`invalid_numeric_range` — число синтаксически валидно, но не помещается в
+целевую колонку (booking/customer/location/service id вне BIGINT/INTEGER,
+отрицательный id, стоимость больше `Numeric(12,2)`). Отвергается один раз как
+payload-ошибка, а не превращается в бесконечный retry на DataError.
+
+`identity_conflict` — numeric booking id уже принадлежит Record с ДРУГИМ
+`easyweek_booking_uuid` (или строке, чья принадлежность не доказана —
+`easyweek_booking_uuid IS NULL`). Ни одна строка не меняется.
+
+`retry_exhausted` — карантин после исчерпания попыток (см. §4a).
 
 `identity_conflict` — numeric booking id уже принадлежит Record с ДРУГИМ
 `easyweek_booking_uuid`. Существующая строка не меняется; событие падает
 fail-closed. Это не ошибка деплоя: это защита от захвата чужой записи.
 
+### 4a. Транзиентные ошибки и per-event retry
+
 **Транзиентная ошибка** (недоступность БД, сетевой сбой) НЕ помечает событие
-`failed`: транзакция откатывается целиком, строка остаётся `captured` и будет
-повторена. В логе появляется только `processing_error` и имя класса исключения —
-ни текста ошибки, ни SQL-параметров, ни traceback (там были бы телефон, e-mail и
-имя клиента). Повторы идут с экспоненциальным backoff до 30 с, поэтому одна
-постоянно падающая строка не крутит цикл и не блокирует backlog навсегда.
+`failed`: транзакция откатывается целиком, строка остаётся `captured`.
+
+Важно: глобальный backoff воркера сам по себе НЕ решает head-of-line blocking —
+claim всегда берёт старейшую готовую строку, поэтому «отравленное» событие
+выбиралось бы снова и снова, лишь медленнее. Поэтому расписание **по событию**:
+
+- `processing_attempts` увеличивается на 1;
+- `next_retry_at` = now() + экспоненциальный backoff (5 с → 300 с максимум);
+- claim берёт только строки, у которых `next_retry_at IS NULL OR next_retry_at <= now()`;
+- остальной backlog продолжает обрабатываться, пока строка ждёт;
+- текст исключения нигде не сохраняется.
+
+После 5 неудачных попыток событие уходит в карантин: `failed` +
+`error_code='retry_exhausted'`, `next_retry_at=NULL`. Это фиксированный
+PII-free код: единственная деталь, которой мы располагаем, — текст исключения,
+а он может содержать данные клиента.
+
+В логе — только `processing_error` и имя класса исключения; ни текста ошибки,
+ни SQL-параметров, ни traceback.
+
+Проверить, что backlog не заблокирован:
+
+```bash
+docker compose -p altegio_bot exec -T postgres sh -lc 'psql -tAX -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT status, error_code, processing_attempts, next_retry_at IS NOT NULL AS waiting, count(*) FROM easyweek_events GROUP BY 1,2,3,4 ORDER BY 1,2"'
+```
+
+Тревожный признак — строки `captured` с растущим `processing_attempts` при том,
+что более новые события НЕ переходят в `processed`.
 
 Инварианты терминальных статусов:
 

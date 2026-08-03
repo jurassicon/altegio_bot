@@ -610,13 +610,31 @@ def test_localized_price_strings_are_not_used() -> None:
     assert booking.total_cost == Decimal("35.00")
 
 
-@pytest.mark.parametrize("bad", ["3500", True, None, -1])
-def test_invalid_price_yields_no_total_cost(bad) -> None:
+def test_absent_price_yields_no_total_cost() -> None:
+    """Absent is "unchanged", not an error."""
     payload = booking_created()
-    payload["booking_price_int"] = bad
+    payload["booking_price_int"] = None
     booking = _normalize(payload)
     assert booking is not None
     assert booking.total_cost is None
+
+
+@pytest.mark.parametrize(
+    ("bad", "expected"),
+    [
+        ("3500", NormalizationError.INVALID_PAYLOAD),
+        (True, NormalizationError.INVALID_PAYLOAD),
+        (1.5, NormalizationError.INVALID_PAYLOAD),
+        (-1, NormalizationError.INVALID_NUMERIC_RANGE),
+    ],
+)
+def test_malformed_price_is_a_deterministic_rejection(bad, expected: str) -> None:
+    """Never a silent None: a bad price must be visible, once, as failed."""
+    payload = booking_created()
+    payload["booking_price_int"] = bad
+    with pytest.raises(NormalizationError) as excinfo:
+        _normalize(payload)
+    assert excinfo.value.code == expected
 
 
 def test_service_fields_are_normalized() -> None:

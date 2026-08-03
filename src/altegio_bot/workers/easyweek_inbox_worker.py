@@ -26,9 +26,13 @@ Transaction contract, per event:
   domain writes while KEEPING the claim and its row lock — and commits
   ``failed`` plus a safe ``error_code`` in the same transaction, so the row is
   never republished as ``captured`` in between;
-* a transient/unexpected failure rolls the whole transaction back, so the row
-  stays ``captured`` and is retried after a bounded backoff; its exception is
-  logged as a class name and a fixed code only, never as text or a traceback;
+* a transient/unexpected failure rolls the whole transaction back and then
+  schedules a PER-EVENT retry (``processing_attempts`` + ``next_retry_at``),
+  so the row stays ``captured`` yet stops blocking the queue head — other
+  eligible events keep flowing while it waits. Its exception is logged as a
+  class name and a fixed code only, never as text or a traceback. After
+  ``MAX_PROCESSING_ATTEMPTS`` the row is quarantined as ``failed`` /
+  ``retry_exhausted``;
 * SIGTERM stops the worker from claiming the NEXT event but never interrupts a
   transaction already in flight.
 """
@@ -38,10 +42,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import signal
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -80,6 +84,20 @@ _ACTION_TO_JOB_TYPE = {
 # one poll every 30s rather than a hot loop.
 MAX_ERROR_BACKOFF_SEC = 30.0
 
+# Per-event retry schedule. A transient fault re-queues the row with a
+# next_retry_at in the future so the REST of the backlog keeps moving; the
+# global loop backoff alone cannot do that, because the claim always picks
+# the oldest eligible row and would keep picking the same poisoned one.
+RETRY_BASE_SEC = 5.0
+MAX_RETRY_DELAY_SEC = 300.0
+# After this many transient failures the row is quarantined so it stops
+# consuming attempts forever and becomes visible to the operator.
+MAX_PROCESSING_ATTEMPTS = 5
+# Terminal code for a row that exhausted its retries. Fixed and PII-free —
+# it deliberately does NOT say what went wrong, because the only detail we
+# have is an exception whose text can contain customer data.
+RETRY_EXHAUSTED_CODE = "retry_exhausted"
+
 STATUS_CAPTURED = "captured"
 STATUS_PROCESSING = "processing"
 STATUS_PROCESSED = "processed"
@@ -102,15 +120,24 @@ def processing_is_configured() -> bool:
 
 
 async def claim_next_event(session: AsyncSession) -> EasyWeekEvent | None:
-    """Claim exactly ONE captured row, oldest first.
+    """Claim exactly ONE eligible captured row, oldest first.
 
-    One row per transaction on purpose: a batch would make the rollback story
+    Eligible means ``status='captured'`` AND its retry delay has elapsed. One
+    row per transaction on purpose: a batch would make the rollback story
     ambiguous, because one poisoned row would drag its siblings back to
     ``captured`` along with it.
     """
     stmt = (
         select(EasyWeekEvent)
         .where(EasyWeekEvent.status == STATUS_CAPTURED)
+        # Rows waiting out a retry delay are not eligible yet. This is what
+        # keeps one permanently failing delivery from blocking the queue head.
+        .where(
+            or_(
+                EasyWeekEvent.next_retry_at.is_(None),
+                EasyWeekEvent.next_retry_at <= func.now(),
+            )
+        )
         .order_by(EasyWeekEvent.received_at.asc(), EasyWeekEvent.id.asc())
         .limit(1)
         .with_for_update(skip_locked=True)
@@ -220,141 +247,6 @@ async def upsert_client(session: AsyncSession, booking: NormalizedBooking) -> Cl
     return existing
 
 
-async def upsert_record(
-    session: AsyncSession,
-    booking: NormalizedBooking,
-    client: Client | None,
-) -> Record:
-    """UUID-first, provider-scoped Record upsert.
-
-    The booking UUID — not the numeric id — is the authoritative identity, so
-    the lookup is by UUID first. That is what keeps create/update/rescheduled/
-    cancel collapsing onto ONE row, and what makes a numeric-id collision with
-    an Altegio record harmless.
-    """
-    record = (
-        (
-            await session.execute(
-                select(Record)
-                .where(Record.provider == PROVIDER)
-                .where(Record.easyweek_booking_uuid == booking.booking_uuid)
-                .with_for_update()
-            )
-        )
-        .scalars()
-        .first()
-    )
-
-    if record is None:
-        # STRICTLY UUID-first. There is deliberately NO fallback lookup by
-        # numeric booking id: the numeric id is an attribute, not an identity.
-        # Adopting a row found by numeric id would let one booking seize the
-        # row of another whenever EasyWeek reuses or collides that id, and
-        # would then overwrite its UUID — silently destroying the authoritative
-        # identity of a different booking.
-        clash = (
-            (
-                await session.execute(
-                    select(Record)
-                    .where(Record.provider == PROVIDER)
-                    .where(Record.company_id == booking.company_id)
-                    .where(Record.altegio_record_id == booking.booking_id)
-                    .with_for_update()
-                )
-            )
-            .scalars()
-            .first()
-        )
-        if clash is not None and clash.easyweek_booking_uuid is not None:
-            # The numeric id already belongs to a DIFFERENT booking. Creating a
-            # second row would violate the provider-scoped unique constraint
-            # anyway; fail closed and leave the existing row untouched.
-            raise NormalizationError(NormalizationError.IDENTITY_CONFLICT)
-
-        record = clash
-        if record is None:
-            record = Record(
-                provider=PROVIDER,
-                company_id=booking.company_id,
-                altegio_record_id=booking.booking_id,
-                easyweek_booking_uuid=booking.booking_uuid,
-            )
-            session.add(record)
-        else:
-            # A row with this numeric id but NO UUID yet: it cannot belong to
-            # another booking, so claiming it is safe.
-            record.easyweek_booking_uuid = booking.booking_uuid
-
-    record.altegio_record_id = booking.booking_id
-    record.altegio_client_id = booking.customer_id
-    record.client_id = client.id if client is not None else None
-    record.last_change_at = utcnow()
-
-    # Patch semantics: only fields this delivery carried are written.
-    _patch(record, "starts_at", booking, booking.starts_at)
-    _patch(record, "ends_at", booking, booking.ends_at)
-    _patch(record, "duration_sec", booking, booking.duration_sec)
-    _patch(record, "staff_name", booking, booking.staff_name)
-    _patch(record, "comment", booking, booking.comment)
-    _patch(record, "total_cost", booking, booking.total_cost)
-
-    if booking.action == DELETE:
-        record.is_deleted = True
-    elif record.is_deleted:
-        # Cancel is terminal. A `booking-created` for a booking we already know
-        # to be cancelled can only be a replay of the original creation — the
-        # real "un-cancel" path in EasyWeek is `booking-updated`. Resurrecting
-        # here would revive a cancelled appointment and re-notify the customer.
-        if booking.action != CREATE:
-            record.is_deleted = False
-
-    _apply_manage_link(record, booking)
-    return record
-
-
-async def sync_record_service(session: AsyncSession, record: Record, booking: NormalizedBooking) -> None:
-    """Keep the booking's service row in step with the delivery.
-
-    PR-5 renders templates from DOMAIN data, so the service and its price have
-    to be persisted here or the lifecycle messages would carry an empty service
-    and a 0.00 total.
-
-    ``record_services`` is keyed ``(record_id, service_id)``. That is already
-    provider-safe without a schema change: ``record_id`` points at a row whose
-    ``provider`` is ``easyweek``, so an EasyWeek service id can never collide
-    with an Altegio one — they hang off different records.
-
-    A delivery that does not mention the service leaves the known service
-    alone: the payload carries a single flat ``service_id``/``service_name``
-    pair, not a list, so its absence is "unchanged", never "the booking now has
-    no services".
-    """
-    if not booking.carries("service_id") or booking.service_id is None:
-        return
-
-    existing = list(
-        (await session.execute(select(RecordService).where(RecordService.record_id == record.id))).scalars()
-    )
-
-    for stale in existing:
-        # The payload describes exactly one service; anything else attached to
-        # this booking is from a previous, different service selection.
-        if stale.service_id != booking.service_id:
-            await session.delete(stale)
-
-    current = next((row for row in existing if row.service_id == booking.service_id), None)
-    if current is None:
-        current = RecordService(record_id=record.id, service_id=booking.service_id)
-        session.add(current)
-
-    if booking.carries("service_name"):
-        current.title = booking.service_name
-    if booking.carries("service_quantity"):
-        current.amount = booking.service_quantity
-    if booking.carries("total_cost"):
-        current.cost_to_pay = booking.total_cost
-
-
 def _apply_manage_link(record: Record, booking: NormalizedBooking) -> None:
     """Fail-closed manage link, per INTEGRATION_PLAN §1.6.3.
 
@@ -370,6 +262,191 @@ def _apply_manage_link(record: Record, booking: NormalizedBooking) -> None:
     if booking.manage_link_present:
         record.short_link = None
         record.easyweek_booking_hash_id = None
+
+
+async def resolve_record(session: AsyncSession, booking: NormalizedBooking) -> Record | None:
+    """Resolve the Record this booking owns, or raise ``identity_conflict``.
+
+    The booking UUID is the ONLY identity. The numeric booking id is an
+    attribute that happens to be unique per (provider, company) — it is never
+    used to *find* a row to adopt, because EasyWeek can reuse or collide it and
+    adopting would hand one booking the row of another.
+
+    Both sides are resolved up front, so the conflict is detected BEFORE any
+    write. Writing first and letting the unique constraint object would surface
+    as an IntegrityError, which the worker cannot distinguish from a transient
+    database fault — it would be retried forever instead of failing once.
+
+    Allowed:
+      * no UUID row, no numeric row            -> create;
+      * UUID row, no numeric row               -> adopt the new numeric id;
+      * UUID row that IS the numeric row       -> ordinary update.
+    Everything else is ``identity_conflict``, including a numeric row whose
+    UUID is NULL: its ownership was never proven, so claiming it would be a
+    guess.
+    """
+    by_uuid = (
+        (
+            await session.execute(
+                select(Record)
+                .where(Record.provider == PROVIDER)
+                .where(Record.easyweek_booking_uuid == booking.booking_uuid)
+                .with_for_update()
+            )
+        )
+        .scalars()
+        .first()
+    )
+    by_numeric = (
+        (
+            await session.execute(
+                select(Record)
+                .where(Record.provider == PROVIDER)
+                .where(Record.company_id == booking.company_id)
+                .where(Record.altegio_record_id == booking.booking_id)
+                .with_for_update()
+            )
+        )
+        .scalars()
+        .first()
+    )
+
+    if by_numeric is not None and (by_uuid is None or by_numeric.id != by_uuid.id):
+        # The numeric id belongs to some other row — either a different booking
+        # or a row whose ownership was never established.
+        raise NormalizationError(NormalizationError.IDENTITY_CONFLICT)
+
+    return by_uuid
+
+
+async def upsert_record(
+    session: AsyncSession,
+    booking: NormalizedBooking,
+    client: Client | None,
+    *,
+    client_present: bool,
+) -> Record:
+    """Create or patch the Record for this booking.
+
+    Assumes :func:`resolve_record` already proved the identity is unambiguous.
+    """
+    record = await resolve_record(session, booking)
+
+    if record is None:
+        record = Record(
+            provider=PROVIDER,
+            company_id=booking.company_id,
+            altegio_record_id=booking.booking_id,
+            easyweek_booking_uuid=booking.booking_uuid,
+        )
+        session.add(record)
+
+    record.altegio_record_id = booking.booking_id
+    record.last_change_at = utcnow()
+
+    # Client link follows the SAME presence rule as every other field: a
+    # delivery that does not mention `customer_id` must not unlink a client we
+    # already resolved. An explicit null is not treated as "unlink" — the
+    # confirmed payloads never send one, so that semantics is unproven and
+    # guessing it would silently orphan a booking.
+    if client_present and client is not None:
+        record.altegio_client_id = booking.customer_id
+        record.client_id = client.id
+
+    # Patch semantics: only fields this delivery carried are written.
+    _patch(record, "starts_at", booking, booking.starts_at)
+    _patch(record, "ends_at", booking, booking.ends_at)
+    _patch(record, "duration_sec", booking, booking.duration_sec)
+    _patch(record, "staff_name", booking, booking.staff_name)
+    _patch(record, "comment", booking, booking.comment)
+    _patch(record, "total_cost", booking, booking.total_cost)
+
+    if booking.action == DELETE:
+        record.is_deleted = True
+
+    _apply_manage_link(record, booking)
+    return record
+
+
+def _service_title(booking: NormalizedBooking) -> str | None:
+    """Customer-facing service text.
+
+    ``services_description`` describes the WHOLE set and is the only confirmed
+    field that stays correct for a multi-service booking; the singular
+    ``service_name`` names just one of them and would be misleading. So the
+    description wins whenever it is present, and ``service_name`` is the
+    fallback for the single-service shape the live capture actually contained.
+    """
+    if booking.carries("services_description") and booking.services_description:
+        return booking.services_description
+    if booking.carries("service_name"):
+        return booking.service_name
+    return None
+
+
+async def sync_record_service(session: AsyncSession, record: Record, booking: NormalizedBooking) -> None:
+    """Keep the booking's service snapshot in step with the delivery.
+
+    PR-5 renders templates from DOMAIN data, so the service text and its price
+    have to be persisted here or the lifecycle messages would carry an empty
+    service and a 0.00 total.
+
+    ``record_services`` is keyed ``(record_id, service_id)``. That is already
+    provider-safe without a schema change: ``record_id`` points at a row whose
+    ``provider`` is ``easyweek``, so an EasyWeek service id can never collide
+    with an Altegio one — they hang off different records.
+
+    Canonical mapping (single-row snapshot, matching the current model):
+      * ``title``       <- services_description, else service_name;
+      * ``amount``      <- services_count, else quantity;
+      * ``cost_to_pay`` <- the same value as ``Record.total_cost``.
+
+    The price is synchronised even when the delivery omits ``service_id``, so a
+    price-only edit can never leave a stale ``cost_to_pay`` next to a fresh
+    ``Record.total_cost``. A delivery mentioning no service or price field at
+    all leaves the whole snapshot untouched: the payload carries one flat
+    service, not a list, so silence means "unchanged", never "no services".
+    """
+    touches_service = any(
+        booking.carries(field)
+        for field in ("service_id", "service_name", "services_description", "services_count", "service_quantity")
+    )
+    touches_price = booking.carries("total_cost")
+    if not touches_service and not touches_price:
+        return
+
+    existing = list(
+        (await session.execute(select(RecordService).where(RecordService.record_id == record.id))).scalars()
+    )
+
+    target: RecordService | None
+    if booking.carries("service_id") and booking.service_id is not None:
+        # The payload names exactly one service; anything else attached to this
+        # booking came from a previous, different selection.
+        for stale in existing:
+            if stale.service_id != booking.service_id:
+                await session.delete(stale)
+        target = next((row for row in existing if row.service_id == booking.service_id), None)
+        if target is None:
+            target = RecordService(record_id=record.id, service_id=booking.service_id)
+            session.add(target)
+    else:
+        # No service identity in this delivery. Update the snapshot we already
+        # have; never invent a synthetic service id just to create one.
+        target = existing[0] if len(existing) == 1 else None
+        if target is None:
+            return
+
+    title = _service_title(booking)
+    if title is not None:
+        target.title = title
+    if booking.carries("services_count") and booking.services_count is not None:
+        target.amount = booking.services_count
+    elif booking.carries("service_quantity"):
+        target.amount = booking.service_quantity
+    if touches_price:
+        # Kept identical to Record.total_cost by construction.
+        target.cost_to_pay = booking.total_cost
 
 
 async def plan_lifecycle_job(
@@ -424,15 +501,57 @@ async def plan_lifecycle_job(
     await session.execute(stmt)
 
 
+async def is_cancel_terminal(session: AsyncSession, booking: NormalizedBooking) -> bool:
+    """True when this booking is already cancelled and must stay that way.
+
+    Cancel is TERMINAL in PR-4. The previous rule let any post-cancel
+    update/reschedule clear ``is_deleted``, which silently assumed that such a
+    delivery means "un-cancelled". That contract is not proven: EasyWeek has no
+    confirmed un-cancel trigger, no machine-readable status in the webhook body
+    (``booking_status`` is localized salon-editable prose), and a stale
+    delivery that merely arrived late is indistinguishable from a real edit.
+    Resurrecting a cancelled appointment would re-notify a customer whose
+    booking no longer exists, so the fail-closed reading is the safe one.
+
+    If EasyWeek is later confirmed to emit a real un-cancel signal, that signal
+    — not prose, and not "an update arrived" — is what should reopen this.
+    """
+    if booking.action == DELETE:
+        return False
+    existing = (
+        (
+            await session.execute(
+                select(Record.is_deleted)
+                .where(Record.provider == PROVIDER)
+                .where(Record.easyweek_booking_uuid == booking.booking_uuid)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    return bool(existing)
+
+
 async def apply_booking(
     session: AsyncSession,
     booking: NormalizedBooking,
     *,
     event_hint: str,
     payload_hash: str | None,
-) -> Record:
-    client = await upsert_client(session, booking)
-    record = await upsert_record(session, booking, client)
+) -> Record | None:
+    """Apply one validated delivery. Returns None when it was a no-op.
+
+    Order matters: identity and the cancel guard are settled BEFORE any write,
+    so a conflicting or stale delivery leaves the database exactly as it was.
+    """
+    # A post-cancel delivery changes nothing at all — not the times, not the
+    # service, not the client link — and plans no job.
+    if await is_cancel_terminal(session, booking):
+        return None
+
+    client_present = booking.carries("customer_id")
+    client = await upsert_client(session, booking) if client_present else None
+    record = await upsert_record(session, booking, client, client_present=client_present)
     # Flush so the record has its primary key before services and the job
     # reference it.
     await session.flush()
@@ -490,12 +609,19 @@ async def process_claimed_event(session: AsyncSession, event: EasyWeekEvent) -> 
         )
         return
 
-    await apply_booking(
+    applied = await apply_booking(
         session,
         booking,
         event_hint=str(event_hint),
         payload_hash=payload_hash,
     )
+    if applied is None:
+        logger.info(
+            "easyweek event=%s hint=%s booking_uuid=%s ignored; booking is cancelled",
+            event_id,
+            event_hint,
+            booking.booking_uuid,
+        )
 
     event.status = STATUS_PROCESSED
     event.processed_at = utcnow()
@@ -510,6 +636,68 @@ async def process_claimed_event(session: AsyncSession, event: EasyWeekEvent) -> 
     )
 
 
+def retry_delay_for(attempts: int) -> float:
+    """Bounded exponential backoff before the next attempt at this event."""
+    return min(RETRY_BASE_SEC * (2 ** max(attempts - 1, 0)), MAX_RETRY_DELAY_SEC)
+
+
+async def schedule_retry(event_id: int) -> bool:
+    """Re-queue a transiently failed event, or quarantine it. True if quarantined.
+
+    Runs in its OWN transaction: the caller's transaction was rolled back by the
+    fault, so an attempt counter written there would have been rolled back with
+    it. The lookup is conditional on the row still being ``captured``, so this
+    can never overwrite a terminal status another worker committed meanwhile.
+
+    Nothing about the exception is persisted — only a counter and a timestamp.
+    """
+    async with SessionLocal() as session:
+        async with session.begin():
+            event = (
+                (
+                    await session.execute(
+                        select(EasyWeekEvent)
+                        .where(EasyWeekEvent.id == event_id)
+                        .where(EasyWeekEvent.status == STATUS_CAPTURED)
+                        .with_for_update()
+                    )
+                )
+                .scalars()
+                .first()
+            )
+            if event is None:
+                # Already terminal — do not resurrect it.
+                return False
+
+            attempts = int(event.processing_attempts or 0) + 1
+            event.processing_attempts = attempts
+
+            if attempts >= MAX_PROCESSING_ATTEMPTS:
+                # Quarantine: stop burning attempts forever and surface the row
+                # to the operator under a fixed, PII-free code.
+                event.status = STATUS_FAILED
+                event.processed_at = utcnow()
+                event.error_code = RETRY_EXHAUSTED_CODE
+                event.next_retry_at = None
+                logger.error(
+                    "easyweek event=%s quarantined after %s attempts code=%s",
+                    event_id,
+                    attempts,
+                    RETRY_EXHAUSTED_CODE,
+                )
+                return True
+
+            delay = retry_delay_for(attempts)
+            event.next_retry_at = utcnow() + timedelta(seconds=delay)
+            logger.warning(
+                "easyweek event=%s rescheduled attempt=%s retry_in=%ss",
+                event_id,
+                attempts,
+                int(delay),
+            )
+            return False
+
+
 async def process_one() -> bool:
     """One full claim/process cycle. Returns False when there was nothing to do.
 
@@ -522,33 +710,58 @@ async def process_one() -> bool:
     committing the terminal status together closes that window entirely.
 
     A transient/unexpected failure rolls everything back — including the claim —
-    so the row stays ``captured`` and is retried by a later cycle.
+    and then schedules a PER-EVENT retry, so the row stays ``captured`` but
+    stops blocking the rest of the backlog.
     """
-    async with SessionLocal() as session:
-        async with session.begin():
-            event = await claim_next_event(session)
-            if event is None:
-                return False
-            event_id = int(event.id)
+    transient_event_id: int | None = None
+    try:
+        async with SessionLocal() as session:
+            async with session.begin():
+                event = await claim_next_event(session)
+                if event is None:
+                    return False
+                event_id = int(event.id)
 
-            savepoint = await session.begin_nested()
-            try:
-                await process_claimed_event(session, event)
-            except NormalizationError as exc:
-                # Undo ONLY the domain writes; the claim and the row lock stay.
-                await savepoint.rollback()
-                event = (
-                    (await session.execute(select(EasyWeekEvent).where(EasyWeekEvent.id == event_id))).scalars().one()
-                )
-                event.status = STATUS_FAILED
-                event.processed_at = utcnow()
-                event.error_code = exc.code
-                logger.warning("easyweek event=%s failed code=%s", event_id, exc.code)
+                savepoint = await session.begin_nested()
+                try:
+                    await process_claimed_event(session, event)
+                except NormalizationError as exc:
+                    # Undo ONLY the domain writes; the claim and the row lock stay.
+                    await savepoint.rollback()
+                    event = (
+                        (await session.execute(select(EasyWeekEvent).where(EasyWeekEvent.id == event_id)))
+                        .scalars()
+                        .one()
+                    )
+                    event.status = STATUS_FAILED
+                    event.processed_at = utcnow()
+                    event.error_code = exc.code
+                    logger.warning("easyweek event=%s failed code=%s", event_id, exc.code)
+                    return True
+                except Exception:
+                    # Remember which row it was, then let the WHOLE transaction
+                    # roll back before anything else touches the database.
+                    transient_event_id = event_id
+                    raise
+
+                if savepoint.is_active:
+                    await savepoint.commit()
                 return True
-
-            if savepoint.is_active:
-                await savepoint.commit()
-            return True
+    except Exception as exc:
+        if transient_event_id is None:
+            # The fault was not tied to a claimed row (e.g. the claim itself
+            # could not run). Let the loop's handler deal with it.
+            raise
+        # Safe metadata only: never str(exc), never a traceback. A SQLAlchemy
+        # error renders the statement WITH its bound parameters, which here
+        # means the customer's phone, e-mail, name and comment.
+        logger.error(
+            "easyweek event=%s processing_error type=%s",
+            transient_event_id,
+            type(exc).__name__,
+        )
+        await schedule_retry(transient_event_id)
+        return True
 
 
 async def _sleep_unless_stopping(delay: float, stop_event: asyncio.Event | None) -> None:
@@ -665,14 +878,20 @@ __all__ = [
     "EASYWEEK_LIFECYCLE_JOB_TYPES",
     "PROVIDER",
     "MAX_ERROR_BACKOFF_SEC",
+    "MAX_PROCESSING_ATTEMPTS",
+    "RETRY_EXHAUSTED_CODE",
     "already_applied",
     "apply_booking",
+    "is_cancel_terminal",
     "claim_next_event",
     "main",
     "process_claimed_event",
     "process_one",
     "processing_is_configured",
     "run_loop",
+    "resolve_record",
+    "retry_delay_for",
+    "schedule_retry",
     "sync_record_service",
     "upsert_client",
     "upsert_record",

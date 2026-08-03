@@ -27,8 +27,8 @@ ALEMBIC_INI = _REPO_ROOT / "alembic.ini"
 PR4_REVISION = "d4e8a1c39f57"
 PR3_REVISION = "c1a7d3f905b2"
 
-PR4_COLUMNS = ("processed_at", "error_code")
-PR4_INDEX = "ix_easyweek_events_status_received_at"
+PR4_COLUMNS = ("processed_at", "error_code", "processing_attempts", "next_retry_at")
+PR4_INDEX = "ix_easyweek_events_claim"
 
 _TEMP_DB_PREFIX = "altegio_pr4_migtest_"
 _REMEDY = "Grant CREATEDB to the DATABASE_URL role, or point ALTEGIO_MIGTEST_DATABASE_URL at a disposable PostgreSQL."
@@ -191,7 +191,7 @@ def test_pr4_migration_uses_strict_operations_not_if_not_exists() -> None:
         assert defensive not in statements, f"migration must fail closed on drift, found {defensive!r}"
     assert "op.add_column" in statements
     assert "op.create_index" in statements
-    assert statements.count("op.drop_column") == 2, "downgrade must drop exactly the two PR-4 columns"
+    assert statements.count("op.drop_column") == len(PR4_COLUMNS), "downgrade must drop exactly the PR-4 columns"
     assert "op.drop_index" in statements
 
 
@@ -321,12 +321,15 @@ async def test_columns_have_the_exact_expected_types_and_nullability(temp_db_url
     rows = await _fetch(
         temp_db_url,
         "SELECT column_name, data_type, is_nullable FROM information_schema.columns "
-        "WHERE table_name = 'easyweek_events' AND column_name IN ('processed_at', 'error_code')",
+        "WHERE table_name = 'easyweek_events' AND column_name IN "
+        "('processed_at', 'error_code', 'processing_attempts', 'next_retry_at')",
     )
     actual = {row[0]: (row[1], row[2]) for row in rows}
     assert actual == {
         "processed_at": ("timestamp with time zone", "YES"),
         "error_code": ("character varying", "YES"),
+        "processing_attempts": ("integer", "NO"),
+        "next_retry_at": ("timestamp with time zone", "YES"),
     }
 
     length = await _fetch(
@@ -338,7 +341,7 @@ async def test_columns_have_the_exact_expected_types_and_nullability(temp_db_url
 
 
 @pytest.mark.asyncio
-async def test_index_covers_exactly_status_then_received_at(temp_db_url: str) -> None:
+async def test_claim_index_matches_the_claim_query(temp_db_url: str) -> None:
     _alembic_ok("upgrade", PR4_REVISION, db_url=temp_db_url)
     rows = await _fetch(
         temp_db_url,
@@ -347,7 +350,7 @@ async def test_index_covers_exactly_status_then_received_at(temp_db_url: str) ->
     )
     assert rows, "the PR-4 index is missing"
     definition = rows[0][0]
-    assert "(status, received_at)" in definition, f"wrong index columns/order: {definition}"
+    assert "(status, next_retry_at, received_at, id)" in definition, f"wrong index columns/order: {definition}"
     assert "UNIQUE" not in definition.upper()
 
 
@@ -391,3 +394,40 @@ async def test_upgrade_fails_closed_on_a_same_named_index_with_a_different_defin
 
     current = _alembic_ok("current", db_url=temp_db_url)
     assert PR4_REVISION not in current, "the revision was stamped despite the drift"
+
+
+@pytest.mark.asyncio
+async def test_processing_attempts_defaults_to_zero_and_is_not_null(temp_db_url: str) -> None:
+    """Existing captured rows must become retryable without a backfill step."""
+    _alembic_ok("upgrade", PR4_REVISION, db_url=temp_db_url)
+
+    engine = create_async_engine(temp_db_url)
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "INSERT INTO easyweek_events (status, event_hint, payload, query, headers) "
+                    "VALUES ('captured', 'booking-created', '{}'::jsonb, '{}'::jsonb, '{}'::jsonb)"
+                )
+            )
+    finally:
+        await engine.dispose()
+
+    rows = await _fetch(temp_db_url, "SELECT processing_attempts, next_retry_at FROM easyweek_events")
+    assert rows == [(0, None)]
+
+
+@pytest.mark.asyncio
+async def test_upgrade_fails_closed_on_a_wrong_typed_retry_column(temp_db_url: str) -> None:
+    _alembic_ok("upgrade", PR3_REVISION, db_url=temp_db_url)
+
+    engine = create_async_engine(temp_db_url)
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(text("ALTER TABLE easyweek_events ADD COLUMN processing_attempts TEXT"))
+    finally:
+        await engine.dispose()
+
+    failed = _run_alembic("upgrade", PR4_REVISION, db_url=temp_db_url)
+    assert failed.returncode != 0, "upgrade accepted a same-named column of the wrong type"
+    assert PR4_REVISION not in _alembic_ok("current", db_url=temp_db_url)
