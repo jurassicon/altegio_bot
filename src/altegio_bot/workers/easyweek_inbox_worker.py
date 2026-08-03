@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import signal
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -104,6 +105,34 @@ STATUS_FAILED = "failed"
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def loop_backoff_delay(failures: int, base_sec: float) -> float:
+    """Bounded exponential backoff for the LOOP-level error paths.
+
+    ``min(base * 2**failures, cap)`` looks bounded but is not: the exponent is
+    evaluated BEFORE ``min`` sees it. Around ``failures == 1024`` the product no
+    longer fits a float and raises ``OverflowError`` — inside the very handler
+    that exists to keep the worker alive through a long outage. A dependency
+    down for hours reaches that counter.
+
+    So the exponent is capped FIRST, at the smallest power that already exceeds
+    the ceiling; nothing larger is ever computed. Small counters keep exactly
+    the previous doubling behaviour.
+
+    Always returns a finite delay in ``(0, MAX_ERROR_BACKOFF_SEC]``.
+    """
+    safe_base = base_sec if base_sec > 0 else RETRY_BASE_SEC
+    attempts = max(int(failures), 0)
+    if safe_base >= MAX_ERROR_BACKOFF_SEC:
+        return MAX_ERROR_BACKOFF_SEC
+
+    # The smallest exponent at which `safe_base * 2**exponent` already reaches
+    # the cap. Every larger exponent yields the cap too, so clamp here and the
+    # oversized intermediate is never constructed.
+    max_exponent = math.ceil(math.log2(MAX_ERROR_BACKOFF_SEC / safe_base))
+    exponent = min(attempts, max_exponent)
+    return min(safe_base * (2**exponent), MAX_ERROR_BACKOFF_SEC)
 
 
 def processing_is_configured() -> bool:
@@ -1023,7 +1052,7 @@ async def run_loop(
                     type(exc).__name__,
                     reconcile_failures,
                 )
-                backoff = min(effective_poll_sec * (2**reconcile_failures), MAX_ERROR_BACKOFF_SEC)
+                backoff = loop_backoff_delay(reconcile_failures, effective_poll_sec)
                 await _sleep_unless_stopping(backoff, stop_event)
                 continue
 
@@ -1062,7 +1091,7 @@ async def run_loop(
             # behind it; backing off keeps the process alive and cheap while an
             # operator investigates. The row is NOT marked failed — a transient
             # fault must not become a permanent verdict.
-            backoff = min(effective_poll_sec * (2**consecutive_errors), MAX_ERROR_BACKOFF_SEC)
+            backoff = loop_backoff_delay(consecutive_errors, effective_poll_sec)
             await _sleep_unless_stopping(backoff, stop_event)
             continue
 

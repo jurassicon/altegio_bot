@@ -11,6 +11,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import inspect
+import math
 from pathlib import Path
 
 import pytest
@@ -516,3 +517,107 @@ def test_deploy_script_keeps_backup_and_revision_verification() -> None:
 
 def test_new_services_are_created_by_the_ordinary_compose_up() -> None:
     assert "$COMPOSE up -d --remove-orphans" in DEPLOY_SCRIPT.read_text()
+
+
+# ===========================================================================
+# Loop-level backoff must stay finite for any failure count
+# ===========================================================================
+#
+# `min(base * 2**failures, cap)` evaluates the exponent BEFORE min sees it, so
+# around 1024 the product stops fitting a float and raises OverflowError —
+# inside the handler whose whole job is to keep the worker alive through a long
+# outage.
+
+
+@pytest.mark.parametrize(("failures", "expected"), [(0, 1.0), (1, 2.0), (2, 4.0), (3, 8.0), (4, 16.0)])
+def test_small_failure_counts_keep_the_previous_doubling(failures, expected) -> None:
+    assert worker.loop_backoff_delay(failures, 1.0) == expected
+
+
+def test_the_delay_reaches_and_holds_the_cap() -> None:
+    assert worker.loop_backoff_delay(5, 1.0) == worker.MAX_ERROR_BACKOFF_SEC
+    assert worker.loop_backoff_delay(50, 1.0) == worker.MAX_ERROR_BACKOFF_SEC
+
+
+@pytest.mark.parametrize("failures", [1024, 10_000, 1_000_000])
+def test_a_huge_failure_count_does_not_overflow(failures) -> None:
+    """The exact regression: this used to raise OverflowError."""
+    # Confirm the old expression really would have blown up.
+    with pytest.raises(OverflowError):
+        min(1.0 * (2**failures), worker.MAX_ERROR_BACKOFF_SEC)
+
+    delay = worker.loop_backoff_delay(failures, 1.0)
+    assert math.isfinite(delay)
+    assert 0 < delay <= worker.MAX_ERROR_BACKOFF_SEC
+
+
+@pytest.mark.parametrize("base", [0.01, 0.5, 1.0, 7.5, 29.9, 30.0, 120.0])
+@pytest.mark.parametrize("failures", [0, 1, 7, 64, 4096])
+def test_the_delay_is_always_finite_and_within_bounds(base, failures) -> None:
+    delay = worker.loop_backoff_delay(failures, base)
+    assert math.isfinite(delay)
+    assert 0 < delay <= worker.MAX_ERROR_BACKOFF_SEC
+
+
+def test_a_non_positive_base_falls_back_to_a_sane_one() -> None:
+    for base in (0.0, -1.0):
+        delay = worker.loop_backoff_delay(3, base)
+        assert 0 < delay <= worker.MAX_ERROR_BACKOFF_SEC
+
+
+def test_both_loop_error_paths_use_the_shared_helper() -> None:
+    """Neither handler may keep its own unbounded exponent."""
+    import inspect
+
+    source = inspect.getsource(worker.run_loop)
+    assert source.count("loop_backoff_delay(") == 2
+    assert "2**" not in source, "an unbounded exponent is back in the loop"
+
+
+# ===========================================================================
+# Runbook contract: the candidate count is not a rollout gate
+# ===========================================================================
+
+
+def _runbook() -> str:
+    return (Path(__file__).resolve().parents[3] / "docs" / "easyweek" / "pr4_normalizer_runbook.md").read_text()
+
+
+def test_runbook_does_not_equate_candidate_count_with_repaired() -> None:
+    """`repaired` counts only PARSEABLE ids, so equality was never true.
+
+    A `public-deploy-smoke-<uuid>` row is a JSON string — counted as a candidate
+    — but `uuid.UUID()` cannot parse it, so it is never repaired.
+    """
+    text = _runbook()
+    assert "string-кандидатов" in text
+    assert "repaired <= число string-кандидатов" in text
+    assert "НЕ является gate" in text
+    # The three real gate conditions.
+    assert "easyweek reconcile complete" in text
+    assert "reconcile_error` не повторяется" in text
+
+
+def test_runbook_forbids_unsafe_uuid_casts_and_rival_regexes() -> None:
+    """One source of truth for parsing: Python `uuid.UUID` via the helper."""
+    text = _runbook()
+    assert "(payload->>'uid')::uuid" not in text.replace(
+        "Не пытаться уточнить счётчик небезопасным приведением `(payload->>'uid')::uuid`", ""
+    )
+    assert "canonical_booking_uuid()" in text
+
+
+def test_runbook_documents_the_write_fence_and_rollback_order() -> None:
+    text = _runbook()
+    assert "write fence" in text
+    assert "один контейнер `altegio-api`" in text
+    assert "--force-recreate altegio-api" in text
+    # Rollback: processing off and worker stopped BEFORE the API is rolled back.
+    rollback = text[text.index("#### Rollback API на старый image") :]
+    steps = rollback.index("EASYWEEK_PROCESSING_ENABLED=false")
+    worker_stop = rollback.index("перестал claim")
+    api_rollback = rollback.index("откатывать `altegio-api`")
+    assert steps < worker_stop < api_rollback
+    # The limitation is stated, not glossed over.
+    assert "НЕ поддерживает одновременно" in text
+    assert "rolling API replicas" in text

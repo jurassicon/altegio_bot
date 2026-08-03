@@ -8,6 +8,7 @@ the guarantee that none of it disturbs the Altegio path.
 from __future__ import annotations
 
 import asyncio
+import math
 import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -3071,3 +3072,135 @@ async def test_a_valid_service_id_change_still_works(bound_session_local) -> Non
     assert service_id == 20
     assert total == cost == Decimal("35.00")
     await _assert_price_invariant(bound_session_local)
+
+
+# ===========================================================================
+# Loop-level backoff: the fail-closed loop regression
+# ===========================================================================
+
+
+async def test_a_persistently_failing_reconciliation_never_overflows_or_claims(
+    bound_session_local, monkeypatch
+) -> None:
+    """Fail-closed AND crash-free, however long the outage lasts."""
+    monkeypatch.setattr(settings, "easyweek_processing_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_location_id", TEST_LOCATION_ID, raising=False)
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture_legacy(session, booking_created(), payload_hash="h1")
+
+    claims: list[int] = []
+    delays: list[float] = []
+
+    async def never_called() -> bool:
+        claims.append(1)
+        return False
+
+    async def always_broken(session: AsyncSession) -> int:
+        raise RuntimeError("dependency down")
+
+    real_sleep = worker._sleep_unless_stopping
+
+    async def record_sleep(delay: float, stop_event) -> None:
+        delays.append(delay)
+        await real_sleep(0, stop_event)
+
+    monkeypatch.setattr(worker, "process_one", never_called)
+    monkeypatch.setattr(worker, "reconcile_missing_booking_uuid", always_broken)
+    monkeypatch.setattr(worker, "_sleep_unless_stopping", record_sleep)
+
+    stop_event = asyncio.Event()
+
+    async def stop_soon() -> None:
+        await asyncio.sleep(0.25)
+        stop_event.set()
+
+    # No OverflowError even after many consecutive failures.
+    await asyncio.wait_for(
+        asyncio.gather(worker.run_loop(poll_sec=0.001, stop_event=stop_event), stop_soon()),
+        timeout=15,
+    )
+
+    assert claims == [], "the worker claimed events despite a failing reconciliation"
+    assert delays, "the error path never backed off"
+    assert all(math.isfinite(d) and 0 < d <= worker.MAX_ERROR_BACKOFF_SEC for d in delays)
+
+    async with bound_session_local() as session:
+        row = (await session.execute(select(EasyWeekEvent))).scalars().one()
+        assert row.status == "captured"
+        assert row.booking_uuid is None
+
+
+# ===========================================================================
+# Malformed string UIDs are candidates, not repairable rows
+# ===========================================================================
+
+
+async def test_a_smoke_uid_is_a_candidate_but_is_never_repaired(bound_session_local) -> None:
+    """The real class of value that broke the operator's candidate == repaired check.
+
+    `public-deploy-smoke-<uuid>` is a JSON string, so it is counted by the
+    step-3c candidate query, but `uuid.UUID()` cannot parse it — so it is never
+    repaired. The runbook must not present those two numbers as equal.
+    """
+    smoke = booking_created()
+    smoke["uid"] = f"public-deploy-smoke-{TEST_BOOKING_UUID}"
+    good = booking_created()
+    good["uid"] = "eeeeeeee-1111-4222-8333-444444444444"
+    good["id"] = TEST_BOOKING_ID + 1500
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            smoke_id = await _capture_legacy(session, smoke, payload_hash="h-smoke")
+            good_id = await _capture_legacy(session, good, payload_hash="h-good")
+
+    # Both are string candidates by the step-3c query ...
+    async with bound_session_local() as session:
+        candidates = (
+            await session.execute(
+                select(func.count())
+                .select_from(EasyWeekEvent)
+                .where(EasyWeekEvent.booking_uuid.is_(None))
+                .where(func.jsonb_typeof(EasyWeekEvent.payload["uid"]) == "string")
+            )
+        ).scalar_one()
+    assert candidates == 2
+
+    # ... but only one of them can be repaired.
+    repaired = await _reconcile(bound_session_local)
+    assert repaired == 1, "a malformed string uid must not be counted as repaired"
+    assert repaired < candidates
+
+    async with bound_session_local() as session:
+        rows = {r.id: r for r in (await session.execute(select(EasyWeekEvent))).scalars().all()}
+        assert rows[smoke_id].booking_uuid is None
+        assert rows[good_id].booking_uuid is not None
+        # Raw capture untouched.
+        assert rows[smoke_id].payload["uid"] == smoke["uid"]
+
+    # The smoke row still reaches a safe deterministic failure, and the valid
+    # delivery behind it keeps being processed.
+    await _run_until_idle()
+    async with bound_session_local() as session:
+        rows = {r.id: r for r in (await session.execute(select(EasyWeekEvent))).scalars().all()}
+        assert rows[smoke_id].status == "failed"
+        assert rows[smoke_id].error_code == NormalizationError.INVALID_BOOKING_UUID
+        assert rows[smoke_id].next_retry_at is None
+        assert rows[good_id].status == "processed"
+
+
+async def test_reconciliation_survives_a_batch_of_only_malformed_strings(bound_session_local) -> None:
+    async with bound_session_local() as session:
+        async with session.begin():
+            for index in range(4):
+                payload = booking_created()
+                payload["uid"] = f"public-deploy-smoke-{index}"
+                payload["id"] = TEST_BOOKING_ID + 1600 + index
+                await _capture_legacy(session, payload, payload_hash=f"hs{index}")
+
+    assert await _reconcile(bound_session_local) == 0
+
+    async with bound_session_local() as session:
+        rows = (await session.execute(select(EasyWeekEvent))).scalars().all()
+        assert all(r.booking_uuid is None for r in rows)
