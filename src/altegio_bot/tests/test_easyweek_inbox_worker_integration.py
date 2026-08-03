@@ -8,6 +8,7 @@ the guarantee that none of it disturbs the Altegio path.
 from __future__ import annotations
 
 import uuid
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -1171,33 +1172,115 @@ async def test_retry_delay_grows_and_is_bounded() -> None:
     assert max(delays) <= worker.MAX_RETRY_DELAY_SEC
 
 
-async def test_exhausted_retries_quarantine_the_event(bound_session_local, monkeypatch) -> None:
+async def test_repeated_transient_failures_never_become_terminal(bound_session_local, monkeypatch) -> None:
+    """An UNCLASSIFIED fault must stay recoverable, however many times it fires.
+
+    Turning it into `failed` on attempt count alone would discard a real webhook
+    because PostgreSQL was briefly unreachable or a deploy was mid-flight.
+    """
+
     async def _boom(*args, **kwargs):
-        raise RuntimeError("permanent infrastructure fault")
+        raise RuntimeError("infrastructure outage")
 
     monkeypatch.setattr(worker, "apply_booking", _boom)
     async with bound_session_local() as session:
         async with session.begin():
             event_id = await _capture(session, booking_created(), payload_hash="h1")
 
-    for _ in range(worker.MAX_PROCESSING_ATTEMPTS):
-        # Clear the delay so the next attempt is eligible immediately.
+    delays: list[float] = []
+    for _ in range(8):  # well past the old 5-attempt quarantine threshold
         async with bound_session_local() as session:
             async with session.begin():
-                await session.execute(select(EasyWeekEvent).where(EasyWeekEvent.id == event_id))
                 row = (await session.execute(select(EasyWeekEvent).where(EasyWeekEvent.id == event_id))).scalars().one()
-                if row.status == "captured":
-                    row.next_retry_at = None
-        await worker.process_one()
+                assert row.status == "captured", "an unclassified fault was made terminal"
+                row.next_retry_at = None
+        assert await worker.process_one() is True
+        async with bound_session_local() as session:
+            row = (await session.execute(select(EasyWeekEvent).where(EasyWeekEvent.id == event_id))).scalars().one()
+            delays.append(worker.retry_delay_for(row.processing_attempts))
 
     async with bound_session_local() as session:
         event = (await session.execute(select(EasyWeekEvent).where(EasyWeekEvent.id == event_id))).scalars().one()
-        assert event.status == "failed", "the row was never quarantined"
-        assert event.error_code == worker.RETRY_EXHAUSTED_CODE
+        assert event.status == "captured"
+        assert event.error_code is None
+        assert event.processed_at is None
+        assert event.processing_attempts >= 8
+        assert event.next_retry_at is not None
+        assert await _counts(session) == (0, 0, 0), "a retrying event left domain writes"
+
+    assert delays == sorted(delays), "backoff must be monotonic"
+    assert max(delays) <= worker.MAX_RETRY_DELAY_SEC, "backoff must stay bounded"
+    assert max(delays) == worker.MAX_RETRY_DELAY_SEC, "backoff must actually reach its ceiling"
+
+
+async def test_an_event_recovers_once_the_dependency_is_healthy(bound_session_local, monkeypatch) -> None:
+    """After the fault clears, the event processes exactly once."""
+    real_apply = worker.apply_booking
+    broken = {"yes": True}
+
+    async def _sometimes(session, booking, **kwargs):
+        if broken["yes"]:
+            raise RuntimeError("dependency down")
+        return await real_apply(session, booking, **kwargs)
+
+    monkeypatch.setattr(worker, "apply_booking", _sometimes)
+    async with bound_session_local() as session:
+        async with session.begin():
+            event_id = await _capture(session, booking_created(), payload_hash="h1")
+
+    for _ in range(3):
+        async with bound_session_local() as session:
+            async with session.begin():
+                row = (await session.execute(select(EasyWeekEvent).where(EasyWeekEvent.id == event_id))).scalars().one()
+                row.next_retry_at = None
+        await worker.process_one()
+
+    broken["yes"] = False
+    async with bound_session_local() as session:
+        async with session.begin():
+            row = (await session.execute(select(EasyWeekEvent).where(EasyWeekEvent.id == event_id))).scalars().one()
+            row.next_retry_at = None
+    assert await worker.process_one() is True
+
+    async with bound_session_local() as session:
+        event = (await session.execute(select(EasyWeekEvent).where(EasyWeekEvent.id == event_id))).scalars().one()
+        assert event.status == "processed"
+        assert event.error_code is None
         assert event.processed_at is not None
-        assert event.next_retry_at is None
-        assert event.processing_attempts >= worker.MAX_PROCESSING_ATTEMPTS
-        assert await _counts(session) == (0, 0, 0), "a quarantined event left domain writes"
+        assert event.next_retry_at is None, "a terminal row must not keep a future retry timestamp"
+        # Applied exactly once despite the earlier failures.
+        assert await _counts(session) == (1, 1, 0)
+
+
+async def test_a_stalled_event_does_not_hold_up_other_bookings(bound_session_local, monkeypatch) -> None:
+    other = booking_created()
+    other["uid"] = "77777777-8888-4999-8aaa-bbbbbbbbbbbb"
+    other["id"] = TEST_BOOKING_ID + 77
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, booking_created(), payload_hash="h-stalled")
+            await _capture(session, other, payload_hash="h-other")
+
+    real_apply = worker.apply_booking
+
+    async def _explode_for_the_stalled_one(session, booking, **kwargs):
+        if str(booking.booking_uuid) == TEST_BOOKING_UUID:
+            raise RuntimeError("dependency down")
+        return await real_apply(session, booking, **kwargs)
+
+    monkeypatch.setattr(worker, "apply_booking", _explode_for_the_stalled_one)
+
+    assert await worker.process_one() is True  # stalled one, rescheduled
+    assert await worker.process_one() is True  # the OTHER booking still flows
+
+    async with bound_session_local() as session:
+        rows = {
+            h: status
+            for h, status in (await session.execute(select(EasyWeekEvent.payload_hash, EasyWeekEvent.status))).all()
+        }
+        assert rows["h-stalled"] == "captured"
+        assert rows["h-other"] == "processed"
 
 
 async def test_transient_failure_logs_no_pii(bound_session_local, monkeypatch, caplog) -> None:
@@ -1695,3 +1778,371 @@ async def test_the_pr5_facing_query_returns_a_usable_snapshot(bound_session_loca
     total, title, cost = row
     assert title, "PR-5 would render an empty service"
     assert total == Decimal("35.00") and cost == total, "PR-5 would render 0.00"
+
+
+# ===========================================================================
+# Causal order within one booking UUID (review fix 1)
+# ===========================================================================
+
+
+async def test_a_stalled_earlier_event_holds_back_only_its_own_booking(bound_session_local, monkeypatch) -> None:
+    """The ordering case per-event retry would otherwise break.
+
+    A (early reschedule, UUID X) fails transiently. B (later reschedule, same X)
+    must NOT jump ahead — applying it and then letting A land on top would
+    revert the times. A different booking Y keeps flowing throughout.
+    """
+    early = booking_rescheduled()
+    early["booking_date_start"] = "2026-08-03T12:00:00+0000"
+    early["booking_date_end"] = "2026-08-03T13:00:00+0000"
+
+    later = booking_rescheduled()
+    later["booking_date_start"] = "2026-08-03T16:00:00+0000"
+    later["booking_date_end"] = "2026-08-03T17:00:00+0000"
+
+    unrelated = booking_created()
+    unrelated["uid"] = "aaaaaaaa-1111-4222-8333-444444444444"
+    unrelated["id"] = TEST_BOOKING_ID + 900
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, booking_created(), payload_hash="h-create")
+            await _capture(session, early, event_hint="booking-rescheduled", payload_hash="h-early")
+            await _capture(session, later, event_hint="booking-rescheduled", payload_hash="h-later")
+            await _capture(session, unrelated, payload_hash="h-other")
+
+    fail_early = {"yes": True}
+    real_apply = worker.apply_booking
+
+    async def _fail_the_early_reschedule(session, booking, **kwargs):
+        if fail_early["yes"] and kwargs.get("payload_hash") == "h-early":
+            raise RuntimeError("dependency down")
+        return await real_apply(session, booking, **kwargs)
+
+    monkeypatch.setattr(worker, "apply_booking", _fail_the_early_reschedule)
+
+    # create -> ok; early -> transient, rescheduled; other booking -> ok.
+    assert await _run_until_idle() >= 3
+
+    async with bound_session_local() as session:
+        rows = {
+            h: (status, retry is not None)
+            for h, status, retry in (
+                await session.execute(
+                    select(EasyWeekEvent.payload_hash, EasyWeekEvent.status, EasyWeekEvent.next_retry_at)
+                )
+            ).all()
+        }
+        assert rows["h-create"][0] == "processed"
+        assert rows["h-early"] == ("captured", True), "the early event should be waiting on a retry"
+        assert rows["h-later"][0] == "captured", "the LATER event of the same booking jumped the queue"
+        assert rows["h-other"][0] == "processed", "an unrelated booking was blocked"
+
+        record = (
+            (
+                await session.execute(
+                    select(Record)
+                    .where(Record.provider == "easyweek")
+                    .where(Record.easyweek_booking_uuid == uuid.UUID(TEST_BOOKING_UUID))
+                )
+            )
+            .scalars()
+            .one()
+        )
+        assert record.starts_at == datetime(2026, 8, 3, 10, 0, tzinfo=timezone.utc), (
+            "a later delivery was applied out of order"
+        )
+
+    # The dependency recovers: A applies, then B, and B wins.
+    fail_early["yes"] = False
+    async with bound_session_local() as session:
+        async with session.begin():
+            row = (
+                (await session.execute(select(EasyWeekEvent).where(EasyWeekEvent.payload_hash == "h-early")))
+                .scalars()
+                .one()
+            )
+            row.next_retry_at = None
+    assert await _run_until_idle() == 2
+
+    async with bound_session_local() as session:
+        statuses = set((await session.execute(select(EasyWeekEvent.status))).scalars().all())
+        assert statuses == {"processed"}
+        record = (
+            (
+                await session.execute(
+                    select(Record)
+                    .where(Record.provider == "easyweek")
+                    .where(Record.easyweek_booking_uuid == uuid.UUID(TEST_BOOKING_UUID))
+                )
+            )
+            .scalars()
+            .one()
+        )
+        assert record.starts_at == datetime(2026, 8, 3, 16, 0, tzinfo=timezone.utc), (
+            "final state must be the LAST delivery, not the replayed earlier one"
+        )
+
+
+async def test_a_terminal_predecessor_does_not_block_its_successor(bound_session_local) -> None:
+    """Only non-terminal predecessors hold the line."""
+    bad = booking_created()
+    bad["booking_date_start"] = "garbage"
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, bad, payload_hash="h-bad")
+            await _capture(session, booking_created(), payload_hash="h-good")
+
+    assert await _run_until_idle() == 2
+
+    async with bound_session_local() as session:
+        rows = {
+            h: (status, code)
+            for h, status, code in (
+                await session.execute(
+                    select(EasyWeekEvent.payload_hash, EasyWeekEvent.status, EasyWeekEvent.error_code)
+                )
+            ).all()
+        }
+        assert rows["h-bad"] == ("failed", "invalid_datetime")
+        assert rows["h-good"][0] == "processed", "a failed predecessor blocked its successor"
+
+
+async def test_a_processed_predecessor_does_not_block_either(bound_session_local) -> None:
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, booking_created(), payload_hash="h1")
+            await _capture(session, booking_updated(), event_hint="booking-updated", payload_hash="h2")
+    assert await _run_until_idle() == 2
+
+    async with bound_session_local() as session:
+        statuses = set((await session.execute(select(EasyWeekEvent.status))).scalars().all())
+        assert statuses == {"processed"}
+
+
+async def test_rows_without_a_usable_uid_neither_block_nor_are_blocked(bound_session_local) -> None:
+    """A malformed capture row must not stall well-formed bookings."""
+    async with bound_session_local() as session:
+        async with session.begin():
+            # Oldest row: no `uid` at all.
+            await _capture(session, {"location_id": TEST_LOCATION_ID}, payload_hash="h-nouid")
+            await _capture(session, booking_created(), payload_hash="h-good")
+
+    assert await _run_until_idle() == 2
+
+    async with bound_session_local() as session:
+        rows = {
+            h: status
+            for h, status in (await session.execute(select(EasyWeekEvent.payload_hash, EasyWeekEvent.status))).all()
+        }
+        assert rows["h-nouid"] == "failed", "the malformed row must reach its deterministic failure"
+        assert rows["h-good"] == "processed", "a malformed row blocked a real booking"
+
+
+async def test_two_workers_never_process_one_booking_out_of_order(bound_session_local) -> None:
+    """Concurrent claims: same UUID serialises, different UUIDs run in parallel."""
+    other = booking_created()
+    other["uid"] = "bbbbbbbb-1111-4222-8333-444444444444"
+    other["id"] = TEST_BOOKING_ID + 800
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, booking_created(), payload_hash="h-x1")
+            await _capture(session, booking_updated(), event_hint="booking-updated", payload_hash="h-x2")
+            await _capture(session, other, payload_hash="h-y1")
+
+    # Worker 1 holds the first event of booking X inside an open transaction.
+    async with bound_session_local() as first:
+        async with first.begin():
+            claimed = await worker.claim_next_event(first)
+            assert claimed is not None
+            assert claimed.payload_hash == "h-x1"
+
+            # Worker 2 must NOT be able to take the second event of booking X,
+            # but SHOULD be able to take the unrelated booking Y.
+            async with bound_session_local() as second:
+                async with second.begin():
+                    concurrent = await worker.claim_next_event(second)
+                    assert concurrent is not None, "an unrelated booking was blocked"
+                    assert concurrent.payload_hash == "h-y1", (
+                        f"a second worker claimed {concurrent.payload_hash} out of order"
+                    )
+
+
+# ===========================================================================
+# Identity is validated BEFORE the cancel no-op (review fix 3)
+# ===========================================================================
+
+
+async def test_identity_conflict_wins_over_the_cancel_no_op(bound_session_local, monkeypatch) -> None:
+    """A cancelled UUID must not mask a numeric-id takeover as `processed`."""
+    monkeypatch.setattr(settings, "easyweek_notifications_enabled", True, raising=False)
+
+    # Booking A: created then cancelled, numeric id 100.
+    a_created = booking_created()
+    a_created["id"] = 100
+    a_cancel = booking_canceled()
+    a_cancel["id"] = 100
+
+    # Booking B: active, numeric id 200.
+    b = booking_created()
+    b["uid"] = "cccccccc-1111-4222-8333-444444444444"
+    b["id"] = 200
+    b["customer_id"] = TEST_CUSTOMER_ID + 5
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, a_created, payload_hash="h-a1")
+            await _capture(session, a_cancel, event_hint="booking-canceled", payload_hash="h-a2")
+            await _capture(session, b, payload_hash="h-b1")
+    await _run_until_idle()
+
+    before = await _snapshot(bound_session_local)
+    async with bound_session_local() as session:
+        jobs_before = (
+            await session.execute(select(func.count()).select_from(MessageJob).where(MessageJob.provider == "easyweek"))
+        ).scalar_one()
+        services_before = (await session.execute(select(func.count()).select_from(RecordService))).scalar_one()
+        clients_before = (
+            await session.execute(select(func.count()).select_from(Client).where(Client.provider == "easyweek"))
+        ).scalar_one()
+
+    # Contradictory: UUID A (cancelled) claiming B's numeric id.
+    contradiction = booking_updated()
+    contradiction["id"] = 200
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, contradiction, event_hint="booking-updated", payload_hash="h-conflict")
+    await _run_until_idle()
+
+    async with bound_session_local() as session:
+        event = (
+            (await session.execute(select(EasyWeekEvent).where(EasyWeekEvent.payload_hash == "h-conflict")))
+            .scalars()
+            .one()
+        )
+        assert event.status == "failed", "the cancel guard masked an identity conflict as processed"
+        assert event.error_code == "identity_conflict"
+        assert event.processed_at is not None
+
+        jobs_after = (
+            await session.execute(select(func.count()).select_from(MessageJob).where(MessageJob.provider == "easyweek"))
+        ).scalar_one()
+        services_after = (await session.execute(select(func.count()).select_from(RecordService))).scalar_one()
+        clients_after = (
+            await session.execute(select(func.count()).select_from(Client).where(Client.provider == "easyweek"))
+        ).scalar_one()
+
+    assert await _snapshot(bound_session_local) == before, "both records must be untouched"
+    assert (jobs_after, services_after, clients_after) == (jobs_before, services_before, clients_before)
+
+
+# ===========================================================================
+# Explicit-empty service semantics (review fix 4)
+# ===========================================================================
+
+
+@pytest.mark.parametrize("cleared", ["", None])
+async def test_an_explicitly_cleared_description_clears_the_title(bound_session_local, cleared) -> None:
+    """Present-but-empty is authoritative; the name fallback must not fire."""
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, booking_created(), payload_hash="h1")
+    await _run_until_idle()
+
+    _t, _s, title, _a, _c = await _snapshot_row(bound_session_local)
+    assert title == "Fixture Service"
+
+    cleared_event = booking_updated()
+    cleared_event["services_description"] = cleared
+    cleared_event["service_name"] = cleared
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, cleared_event, event_hint="booking-updated", payload_hash="h2")
+    await _run_until_idle()
+
+    _t, _s, title, _a, _c = await _snapshot_row(bound_session_local)
+    assert title is None, "an explicitly cleared description left a stale title"
+
+
+async def test_a_cleared_description_falls_back_to_a_carried_name(bound_session_local) -> None:
+    """Clearing the SET description while naming one service is not a clear."""
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, booking_created(), payload_hash="h1")
+    await _run_until_idle()
+
+    event = booking_updated()
+    event["services_description"] = ""
+    event["service_name"] = "Single Service"
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, event, event_hint="booking-updated", payload_hash="h2")
+    await _run_until_idle()
+
+    _t, _s, title, _a, _c = await _snapshot_row(bound_session_local)
+    assert title == "Single Service"
+
+
+@pytest.mark.parametrize("cleared", [None, 0])
+async def test_an_explicitly_cleared_count_clears_the_amount(bound_session_local, cleared) -> None:
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, booking_created(), payload_hash="h1")
+    await _run_until_idle()
+
+    event = booking_updated()
+    event["services_count"] = cleared
+    event["quantity"] = cleared
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, event, event_hint="booking-updated", payload_hash="h2")
+    await _run_until_idle()
+
+    _t, _s, _title, amount, _c = await _snapshot_row(bound_session_local)
+    assert amount == (None if cleared is None else 0)
+
+
+async def test_an_explicitly_null_price_clears_both_costs(bound_session_local) -> None:
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, booking_created(), payload_hash="h1")
+    await _run_until_idle()
+
+    event = booking_updated()
+    event["booking_price_int"] = None
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, event, event_hint="booking-updated", payload_hash="h2")
+    await _run_until_idle()
+
+    total, _s, _title, _a, cost = await _snapshot_row(bound_session_local)
+    assert total is None
+    assert cost is None, "Record.total_cost and RecordService.cost_to_pay diverged"
+
+
+async def test_absent_service_fields_still_keep_the_snapshot(bound_session_local) -> None:
+    """The absent/empty distinction must remain, not collapse into one rule."""
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, booking_created(), payload_hash="h1")
+    await _run_until_idle()
+    before = await _snapshot_row(bound_session_local)
+
+    silent = booking_updated()
+    for key in (
+        "service_id",
+        "service_name",
+        "services_description",
+        "services_count",
+        "quantity",
+        "booking_price_int",
+    ):
+        silent.pop(key, None)
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, silent, event_hint="booking-updated", payload_hash="h2")
+    await _run_until_idle()
+
+    assert await _snapshot_row(bound_session_local) == before

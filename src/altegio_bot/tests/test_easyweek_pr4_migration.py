@@ -29,6 +29,7 @@ PR3_REVISION = "c1a7d3f905b2"
 
 PR4_COLUMNS = ("processed_at", "error_code", "processing_attempts", "next_retry_at")
 PR4_INDEX = "ix_easyweek_events_claim"
+PR4_PENDING_INDEX = "ix_easyweek_events_pending_booking"
 
 _TEMP_DB_PREFIX = "altegio_pr4_migtest_"
 _REMEDY = "Grant CREATEDB to the DATABASE_URL role, or point ALTEGIO_MIGTEST_DATABASE_URL at a disposable PostgreSQL."
@@ -240,13 +241,17 @@ async def test_upgrade_downgrade_upgrade_on_a_throwaway_database(temp_db_url: st
     columns = await _columns_of(temp_db_url, "easyweek_events")
     for column in PR4_COLUMNS:
         assert column in columns, f"upgrade did not add {column}"
-    assert PR4_INDEX in await _indexes_of(temp_db_url, "easyweek_events")
+    indexes = await _indexes_of(temp_db_url, "easyweek_events")
+    assert PR4_INDEX in indexes
+    assert PR4_PENDING_INDEX in indexes
 
     _alembic_ok("downgrade", PR3_REVISION, db_url=temp_db_url)
     after_downgrade = await _columns_of(temp_db_url, "easyweek_events")
     for column in PR4_COLUMNS:
         assert column not in after_downgrade, f"downgrade left {column} behind"
-    assert PR4_INDEX not in await _indexes_of(temp_db_url, "easyweek_events")
+    after = await _indexes_of(temp_db_url, "easyweek_events")
+    assert PR4_INDEX not in after
+    assert PR4_PENDING_INDEX not in after
 
     # Re-upgrading must work: a rolled-back deploy has to be retryable.
     _alembic_ok("upgrade", PR4_REVISION, db_url=temp_db_url)
@@ -431,3 +436,62 @@ async def test_upgrade_fails_closed_on_a_wrong_typed_retry_column(temp_db_url: s
     failed = _run_alembic("upgrade", PR4_REVISION, db_url=temp_db_url)
     assert failed.returncode != 0, "upgrade accepted a same-named column of the wrong type"
     assert PR4_REVISION not in _alembic_ok("current", db_url=temp_db_url)
+
+
+@pytest.mark.asyncio
+async def test_pending_booking_index_matches_the_ordering_query(temp_db_url: str) -> None:
+    """The correlated NOT EXISTS needs uid + capture order, on non-terminal rows."""
+    _alembic_ok("upgrade", PR4_REVISION, db_url=temp_db_url)
+    rows = await _fetch(
+        temp_db_url,
+        "SELECT indexdef FROM pg_indexes WHERE tablename = 'easyweek_events' AND indexname = :n",
+        {"n": PR4_PENDING_INDEX},
+    )
+    assert rows, "the per-booking ordering index is missing"
+    definition = rows[0][0]
+    assert "uid" in definition, f"index does not key on the booking uid: {definition}"
+    assert "received_at" in definition and "id" in definition, f"missing capture order: {definition}"
+    assert "WHERE" in definition.upper(), "the index should be partial on non-terminal statuses"
+    for terminal in ("captured", "processing"):
+        assert terminal in definition, f"partial predicate misses {terminal}: {definition}"
+
+
+@pytest.mark.asyncio
+async def test_the_claim_query_runs_against_malformed_payloads(temp_db_url: str) -> None:
+    """`payload ->> 'uid'` must be NULL-safe for every JSONB shape."""
+    _alembic_ok("upgrade", PR4_REVISION, db_url=temp_db_url)
+
+    engine = create_async_engine(temp_db_url)
+    try:
+        async with engine.begin() as conn:
+            for payload in ("'{}'::jsonb", "'[1,2,3]'::jsonb", "'\"text\"'::jsonb", "'42'::jsonb", "'null'::jsonb"):
+                await conn.execute(
+                    text(
+                        "INSERT INTO easyweek_events (status, event_hint, payload, query, headers) "
+                        f"VALUES ('captured', 'booking-created', {payload}, '{{}}'::jsonb, '{{}}'::jsonb)"
+                    )
+                )
+    finally:
+        await engine.dispose()
+
+    # The real eligibility predicate, exercised against those rows.
+    rows = await _fetch(
+        temp_db_url,
+        """
+        SELECT e.id FROM easyweek_events e
+        WHERE e.status = 'captured'
+          AND (e.next_retry_at IS NULL OR e.next_retry_at <= now())
+          AND (
+            (e.payload ->> 'uid') IS NULL
+            OR NOT EXISTS (
+              SELECT 1 FROM easyweek_events p
+              WHERE p.id <> e.id
+                AND p.status IN ('captured', 'processing')
+                AND (p.payload ->> 'uid') = (e.payload ->> 'uid')
+                AND (p.received_at, p.id) < (e.received_at, e.id)
+            )
+          )
+        ORDER BY e.received_at, e.id
+        """,
+    )
+    assert len(rows) == 5, "malformed payloads must stay claimable, not error or stall"

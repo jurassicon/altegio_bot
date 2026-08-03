@@ -20,9 +20,13 @@ per-event retry scheduling, нужные easyweek_inbox_worker:
 глобальный backoff лишь замедлял бы этот цикл, но не пропускал бы вперёд
 остальные события.
 
-Индекс ``ix_easyweek_events_claim`` повторяет реальный claim-запрос:
-``WHERE status = 'captured' AND (next_retry_at IS NULL OR next_retry_at <= now())
-ORDER BY received_at, id``.
+Индексы повторяют реальный claim-запрос:
+
+  * ``ix_easyweek_events_claim`` — ``WHERE status = 'captured' AND
+    (next_retry_at IS NULL OR next_retry_at <= now()) ORDER BY received_at, id``;
+  * ``ix_easyweek_events_pending_booking`` — коррелированный ``NOT EXISTS``,
+    который сериализует доставки ОДНОГО booking UUID: partial по двум
+    нетерминальным статусам, ключ ``(payload ->> 'uid', received_at, id)``.
 
 Обычные Alembic-операции, БЕЗ ``IF NOT EXISTS`` / ``IF EXISTS``. Это осознанно:
 защитные варианты принимают объект с правильным ИМЕНЕМ, но неправильным типом
@@ -55,6 +59,8 @@ depends_on: Union[str, Sequence[str], None] = None
 
 _TABLE = "easyweek_events"
 _CLAIM_INDEX = "ix_easyweek_events_claim"
+# Supports the correlated NOT EXISTS that serialises one booking UUID.
+_PENDING_BOOKING_INDEX = "ix_easyweek_events_pending_booking"
 
 
 def upgrade() -> None:
@@ -87,10 +93,26 @@ def upgrade() -> None:
         ["status", "next_retry_at", "received_at", "id"],
         unique=False,
     )
+    # The claim also has to answer "is there an EARLIER non-terminal delivery
+    # for this same booking?" — a correlated NOT EXISTS keyed on the booking
+    # UUID extracted from the JSONB payload, ordered by capture order. Partial
+    # on the two non-terminal statuses, because terminal rows never block.
+    #
+    # `payload ->> 'uid'` is NULL-safe for every JSONB shape (object without the
+    # key, array, string, number), so a malformed capture row can neither error
+    # the query nor act as a blocker.
+    op.create_index(
+        _PENDING_BOOKING_INDEX,
+        _TABLE,
+        [sa.text("(payload ->> 'uid')"), "received_at", "id"],
+        unique=False,
+        postgresql_where=sa.text("status IN ('captured', 'processing')"),
+    )
 
 
 def downgrade() -> None:
     """Downgrade schema — removes ONLY what this revision added."""
+    op.drop_index(_PENDING_BOOKING_INDEX, table_name=_TABLE)
     op.drop_index(_CLAIM_INDEX, table_name=_TABLE)
     op.drop_column(_TABLE, "next_retry_at")
     op.drop_column(_TABLE, "processing_attempts")

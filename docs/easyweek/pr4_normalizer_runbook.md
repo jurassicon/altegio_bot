@@ -158,6 +158,10 @@ docker compose -p altegio_bot exec -T postgres sh -lc 'psql -tAX -U "$POSTGRES_U
 docker compose -p altegio_bot exec -T postgres sh -lc 'psql -tAX -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT r.easyweek_booking_uuid, r.client_id IS NOT NULL AS linked, r.altegio_client_id FROM records r WHERE r.provider = '"'"'easyweek'"'"'"'
 ```
 
+Identity проверяется ДО cancel-guard: доставка с чужим numeric id получает
+`failed/identity_conflict`, даже если её UUID уже отменён — иначе противоречивое
+событие тихо помечалось бы `processed`.
+
 Отмена терминальна: после `booking-canceled` ни `booking-updated`, ни
 `booking-rescheduled`, ни повторный `booking-created` не снимают `is_deleted`,
 не меняют время/услугу/стоимость/клиента и не создают новых lifecycle job.
@@ -172,8 +176,19 @@ docker compose -p altegio_bot exec -T postgres sh -lc 'psql -tAX -U "$POSTGRES_U
 
 Ожидается ровно одна строка на booking с непустыми `title` и `cost_to_pay`.
 
+Семантика присутствия для service/price полей та же, что и для остальных:
+
+| Поле в доставке | Что происходит |
+|---|---|
+| отсутствует | известное значение сохраняется |
+| присутствует со значением | snapshot обновляется |
+| присутствует пустым (`""` / `null`) | значение **очищается** |
+
+При явной очистке `services_description` fallback на `service_name` НЕ
+срабатывает — иначе осталась бы устаревшая подпись.
+
 `title` берётся из `services_description` (описание ВСЕГО набора услуг), и лишь
-при его отсутствии — из singular `service_name`: для booking с двумя услугами
+при его отсутствии/пустоте — из singular `service_name`: для booking с двумя услугами
 одиночное имя вводило бы клиента в заблуждение. `amount` — из `services_count`
 (иначе `quantity`).
 
@@ -261,7 +276,6 @@ invalid_event_hint     invalid_payload        truncated_payload
 missing_booking_uuid   invalid_booking_uuid   missing_booking_id
 invalid_location_id    foreign_location       invalid_datetime
 invalid_manage_link    identity_conflict      invalid_numeric_range
-retry_exhausted
 ```
 
 `invalid_numeric_range` — число синтаксически валидно, но не помещается в
@@ -273,7 +287,8 @@ payload-ошибка, а не превращается в бесконечный
 `easyweek_booking_uuid` (или строке, чья принадлежность не доказана —
 `easyweek_booking_uuid IS NULL`). Ни одна строка не меняется.
 
-`retry_exhausted` — карантин после исчерпания попыток (см. §4a).
+Неклассифицированные транзиентные ошибки терминального кода НЕ получают —
+см. §4a.
 
 `identity_conflict` — numeric booking id уже принадлежит Record с ДРУГИМ
 `easyweek_booking_uuid`. Существующая строка не меняется; событие падает
@@ -291,13 +306,47 @@ claim всегда берёт старейшую готовую строку, п
 - `processing_attempts` увеличивается на 1;
 - `next_retry_at` = now() + экспоненциальный backoff (5 с → 300 с максимум);
 - claim берёт только строки, у которых `next_retry_at IS NULL OR next_retry_at <= now()`;
-- остальной backlog продолжает обрабатываться, пока строка ждёт;
+- остальной backlog **других booking** продолжает обрабатываться, пока строка ждёт;
 - текст исключения нигде не сохраняется.
 
-После 5 неудачных попыток событие уходит в карантин: `failed` +
-`error_code='retry_exhausted'`, `next_retry_at=NULL`. Это фиксированный
-PII-free код: единственная деталь, которой мы располагаем, — текст исключения,
-а он может содержать данные клиента.
+### 4b. Порядок событий внутри одной booking
+
+Per-event retry сам по себе ломал бы причинный порядок: более ранний
+`reschedule`, упавший транзиентно, уходил бы в ожидание, более новый
+`reschedule` той же записи применялся бы, а затем первый ложился бы сверху и
+откатывал время, услугу и связь с клиентом. `already_applied()` этого не ловит —
+у доставок разные `payload_hash`.
+
+Поэтому claim берёт старейшую готовую строку, **для которой не существует более
+ранней нетерминальной строки с тем же `payload->>'uid'`**. Блокирующими
+считаются `captured` (включая ожидание `next_retry_at`) и `processing`;
+`processed` и `failed` не блокируют.
+
+Сериализация действует **только внутри одной booking** — другие UUID идут
+параллельно. Строки без пригодного `uid` не блокируют никого и сами не
+блокируются: они доходят до своего детерминированного отказа.
+
+Найти booking, который держит очередь:
+
+```bash
+docker compose -p altegio_bot exec -T postgres sh -lc 'psql -tAX -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT payload->>'"'"'uid'"'"' AS booking, min(received_at) AS oldest, count(*) AS pending, max(processing_attempts) AS attempts, min(next_retry_at) AS next_try FROM easyweek_events WHERE status IN ('"'"'captured'"'"','"'"'processing'"'"') GROUP BY 1 ORDER BY oldest LIMIT 20"'
+```
+
+Много `pending` у одной booking при растущем `attempts` означает, что её первое
+событие ждёт восстановления зависимости. Другие booking при этом обязаны
+продолжать переходить в `processed`.
+
+**Событие НЕ становится `failed` по числу попыток.** Неизвестное исключение —
+это чаще всего кратковременная недоступность PostgreSQL, сетевой сбой или
+несовпадение версий во время деплоя. Доказанного классификатора «это навсегда»
+в проекте нет, поэтому событие остаётся `captured` и автоматически
+обрабатывается, как только зависимость починена. Ограничена не живучесть
+события, а нагрузка: задержка растёт до 300 с и дальше остаётся на этом уровне,
+счётчик попыток насыщается.
+
+Реальное расписание задержек (секунды): 5, 10, 20, 40, 80, 160, 300, 300, …
+
+Оператор видит «застрявшее» событие по `processing_attempts` и `next_retry_at`.
 
 В логе — только `processing_error` и имя класса исключения; ни текста ошибки,
 ни SQL-параметров, ни traceback.
@@ -309,7 +358,17 @@ docker compose -p altegio_bot exec -T postgres sh -lc 'psql -tAX -U "$POSTGRES_U
 ```
 
 Тревожный признак — строки `captured` с растущим `processing_attempts` при том,
-что более новые события НЕ переходят в `processed`.
+что события **других** booking НЕ переходят в `processed`. Задержка событий той
+же booking — это норма (см. §4b).
+
+Восстановление после починки зависимости не требует ручных действий: событие
+берётся автоматически по истечении `next_retry_at`. Если нужно ускорить, можно
+обнулить задержку — это единственная безопасная ручная операция, она не трогает
+payload и не меняет статус:
+
+```bash
+docker compose -p altegio_bot exec -T postgres sh -lc 'psql -tAX -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "UPDATE easyweek_events SET next_retry_at = NULL WHERE status = '"'"'captured'"'"' AND next_retry_at IS NOT NULL"'
+```
 
 Инварианты терминальных статусов:
 
