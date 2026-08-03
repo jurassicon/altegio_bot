@@ -68,6 +68,45 @@ EASYWEEK_NOTIFICATIONS_ENABLED=false
 Сделать тестовую доставку из кабинета EasyWeek (Resend любой существующей
 записи) и убедиться, что вебхук получил 200 и в таблице появилась новая строка.
 
+### Шаг 3b — ОБЯЗАТЕЛЬНО: пересоздать `altegio-api` на новом image
+
+```bash
+docker compose -p altegio_bot up -d --force-recreate altegio-api
+```
+
+Почему это отдельный обязательный шаг, а не «оно само при деплое».
+
+Миграция `d4e8a1c39f57` backfill'ит `booking_uuid` только для строк, которые
+существовали в момент её выполнения. Деплой при этом **намеренно не
+останавливает** `altegio-api` — capture должен продолжать принимать вебхуки.
+Значит есть окно: доставка, пришедшая ПОСЛЕ backfill, но ДО пересоздания API,
+записывается **старым** image, который про колонку `booking_uuid` не знает.
+
+Такая строка получает валидный `uid` и `booking_uuid IS NULL`. Для причинного
+порядка она невидима: не блокирует более позднюю доставку той же booking, сама
+не блокируется более ранней, не участвует в canonical replay lookup — и после
+transient retry способна лечь поверх более нового состояния и откатить время,
+service snapshot, стоимость или связь с клиентом.
+
+Проверить, что API уже на новом image:
+
+```bash
+docker compose -p altegio_bot exec -T altegio-api /app/.venv/bin/python -c "from altegio_bot.models.models import EasyWeekEvent; print('booking_uuid' in EasyWeekEvent.__table__.c)"
+```
+
+Ожидается `True`. Пока здесь `False`, включать обработку нельзя.
+
+### Шаг 3c — проверить, что окно закрыто
+
+```bash
+docker compose -p altegio_bot exec -T postgres sh -lc 'psql -tAX -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT count(*) FROM easyweek_events WHERE booking_uuid IS NULL AND jsonb_typeof(payload -> '"'"'uid'"'"') = '"'"'string'"'"'"'
+```
+
+Это строки с валидным на вид `uid`, но без canonical-ключа — ровно те, что
+попали в окно. Их **не нужно** чинить руками: воркер выполняет reconciliation
+сам (см. ниже). Число полезно записать до включения обработки, чтобы потом
+сверить с `repaired=` в логе.
+
 ### Шаг 4 — убедиться, что воркер работает, но backlog не тронут
 
 ```bash
@@ -112,6 +151,29 @@ docker compose -p altegio_bot up -d --force-recreate altegio-easyweek-inbox-work
 ```
 
 Пересоздаётся **только** EasyWeek-воркер. Altegio-сервисы не трогаются.
+
+**Перед первым claim воркер выполняет reconciliation.** Он находит строки с
+`booking_uuid IS NULL`, вычисляет canonical UUID тем же парсером, что capture и
+нормализатор, и записывает **только эту колонку**: payload, body, хэши и статус
+не трогаются. Missing/нестроковые/malformed `uid` остаются `NULL` и доходят до
+своего детерминированного отказа.
+
+Это fail-closed: **пока reconciliation не завершилась успешно, ни одно событие
+не claim'ится**. При ошибке воркер не берёт события, применяет ограниченный
+backoff и пишет в лог только имя класса исключения. Параллельные реплики
+сериализуются PostgreSQL advisory-lock; та, что не получила lock, ждёт, а не
+начинает claim. Обход — keyset-пагинация по `id`, вся таблица в память не
+загружается.
+
+В логе после включения обработки:
+
+```text
+easyweek reconcile complete repaired=<N>
+```
+
+`N` должно совпасть с числом из шага 3c. Если вместо этого повторяется
+`easyweek reconcile_error`, обработка НЕ идёт — это ожидаемое поведение, надо
+чинить причину, а не обходить проверку.
 
 ### Шаг 8 — проверки после включения
 
@@ -304,6 +366,27 @@ docker compose -p altegio_bot exec -T postgres sh -lc 'psql -tAX -U "$POSTGRES_U
 - `{"services_count": 0, "quantity": 1}` → `amount = 0`;
 - singular-поле используется **только** когда whole-set поле отсутствует;
 - оба поля отсутствуют → прежнее значение сохраняется.
+
+**`service_id` в эту таблицу НЕ входит.** Это identity-поле: оно выбирает, к
+какой строке `record_services` относится snapshot, а не является патчируемым
+атрибутом. Explicit-clear семантики у него нет:
+
+| `service_id` в доставке | Поведение |
+|---|---|
+| ключ отсутствует | известная service identity сохраняется |
+| валидный положительный integer | обычная смена услуги |
+| `null`, boolean, строка, `0`, отрицательное, дробное | **детерминированный отказ** |
+
+Отказ — это `failed` + безопасный код (`invalid_payload` для «это вообще не
+число», `invalid_numeric_range` для «число, но вне диапазона» — та же пара кодов,
+что у `id`, `customer_id` и `location_id`) + `next_retry_at = NULL`. Ни `Client`,
+ни `Record`, ни `RecordService`, ни `MessageJob` при этом не меняются.
+
+Почему fail-closed, а не догадка: ни одна захваченная доставка не присылала
+`service_id: null`, поэтому смысл значения не доказан. Молча сохранить старую
+identity (прежнее поведение) означало бы привязать НОВЫЕ title/amount/цену к
+СТАРОМУ `service_id`; удалить snapshot — уничтожить доказанные данные. Отказ
+оставляет строки нетронутыми и делает payload видимым оператору.
 
 ---
 

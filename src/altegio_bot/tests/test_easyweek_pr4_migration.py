@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import uuid
@@ -506,6 +507,14 @@ async def test_the_claim_query_runs_against_malformed_payloads(temp_db_url: str)
 # ===========================================================================
 
 
+def _backfill_batch_size() -> int:
+    """The migration's own batch constant, so tests size themselves from it."""
+    source = Path(ScriptDirectory.from_config(Config(str(ALEMBIC_INI))).get_revision(PR4_REVISION).path).read_text()
+    match = re.search(r"_BACKFILL_BATCH\s*=\s*(\d+)", source)
+    assert match, "the migration no longer defines _BACKFILL_BATCH"
+    return int(match.group(1))
+
+
 async def _exec(db_url: str, sql: str, params: dict | list | None = None) -> None:
     engine = create_async_engine(db_url)
     try:
@@ -657,3 +666,103 @@ async def test_pending_index_is_partial_and_keyed_on_the_canonical_column(temp_d
     assert "received_at" in definition and "id" in definition
     normalised = definition.replace("(", "").replace(")", "").replace("::text", "")
     assert "status = ANY" in normalised or "status IN" in normalised or "captured" in normalised
+
+
+# ===========================================================================
+# The backfill must be bounded-memory and must never stall on a bad row
+# ===========================================================================
+
+
+def test_backfill_uses_keyset_pagination_not_a_full_table_load() -> None:
+    """A research-capture backlog can be large; peak memory must be one batch."""
+    statements = _migration_statements(PR4_REVISION)
+    assert "id > :last_id" in statements, "the scan must be keyset-paginated on id"
+    assert "ORDER BY id LIMIT" in statements
+    assert "OFFSET" not in statements.upper(), "OFFSET re-scans the prefix on every page"
+    # The cursor must advance on every row, valid or not, or one malformed value
+    # would be re-read forever.
+    body = statements[statements.index("def _backfill_booking_uuid") :]
+    assert "last_id = row.id" in body
+    advance = body.index("last_id = row.id")
+    parse = body.index("uuid.UUID(raw.strip())")
+    assert advance < parse, "the cursor must advance before parsing can fail"
+
+
+@pytest.mark.asyncio
+async def test_backfill_spans_multiple_batches_with_malformed_rows_throughout(temp_db_url: str) -> None:
+    """More rows than one batch, with bad values at the start, middle and edge.
+
+    Sized from the migration's own constant so the loop is genuinely exercised:
+    a single-batch dataset would pass even if the keyset scan were broken.
+    """
+    _alembic_ok("upgrade", PR3_REVISION, db_url=temp_db_url)
+
+    batch = _backfill_batch_size()
+    total = batch * 2 + 1  # three batches, the last one partial
+
+    valid = "ac15372d-7422-4fc6-8fcb-b520bbffa669"
+    spellings = [
+        valid,
+        valid.upper(),
+        "{" + valid + "}",
+        valid.replace("-", ""),
+        f"  {valid}  ",
+        f"urn:uuid:{valid}",
+    ]
+    # First row, a middle row, exactly the first batch boundary, and the last row.
+    malformed_ids = {1, batch, batch + 1, total // 2, total}
+
+    rows = []
+    for row_id in range(1, total + 1):
+        if row_id in malformed_ids:
+            payload = {"uid": "not-a-uuid", "id": row_id}
+        else:
+            payload = {"uid": spellings[row_id % len(spellings)], "id": row_id}
+        rows.append({"id": row_id, "payload": json.dumps(payload), "payload_hash": f"h{row_id}"})
+    # Shapes with no string uid at all.
+    rows.append({"id": total + 1, "payload": json.dumps({"id": 1}), "payload_hash": "h-missing"})
+    rows.append({"id": total + 2, "payload": json.dumps({"uid": 999}), "payload_hash": "h-number"})
+
+    await _exec(
+        temp_db_url,
+        "INSERT INTO easyweek_events (id, status, payload, query, headers, body_size_bytes, payload_hash) "
+        "VALUES (:id, 'captured', CAST(:payload AS jsonb), '{}', '{}', 0, :payload_hash)",
+        rows,
+    )
+
+    before = await _fetch(temp_db_url, "SELECT id, status, payload_hash, payload FROM easyweek_events ORDER BY id")
+
+    _alembic_ok("upgrade", PR4_REVISION, db_url=temp_db_url)
+
+    keys = dict(
+        (row[0], row[1])
+        for row in await _fetch(temp_db_url, "SELECT id, booking_uuid FROM easyweek_events ORDER BY id")
+    )
+    for row_id in range(1, total + 1):
+        if row_id in malformed_ids:
+            assert keys[row_id] is None, f"row {row_id} should have stayed NULL"
+        else:
+            assert str(keys[row_id]) == valid, f"row {row_id} was not canonicalised"
+    assert keys[total + 1] is None and keys[total + 2] is None
+
+    after = await _fetch(temp_db_url, "SELECT id, status, payload_hash, payload FROM easyweek_events ORDER BY id")
+    assert after == before, "the backfill changed capture data"
+
+
+@pytest.mark.asyncio
+async def test_backfill_terminates_when_every_row_is_malformed(temp_db_url: str) -> None:
+    """The loop must end even when nothing is ever written."""
+    _alembic_ok("upgrade", PR3_REVISION, db_url=temp_db_url)
+    for row_id in range(1, 21):
+        await _exec(
+            temp_db_url,
+            "INSERT INTO easyweek_events (id, status, payload, query, headers, body_size_bytes) "
+            "VALUES (:id, 'captured', CAST(:payload AS jsonb), '{}', '{}', 0)",
+            {"id": row_id, "payload": json.dumps({"uid": f"bad-{row_id}"})},
+        )
+
+    _alembic_ok("upgrade", PR4_REVISION, db_url=temp_db_url)
+
+    nulls = (await _fetch(temp_db_url, "SELECT count(*) FROM easyweek_events WHERE booking_uuid IS NULL"))[0][0]
+    assert nulls == 20
+    assert (await _fetch(temp_db_url, "SELECT count(*) FROM easyweek_events"))[0][0] == 20

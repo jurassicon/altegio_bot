@@ -577,16 +577,31 @@ def normalize_event(
     )
     duration_sec = None if duration_minutes is None else duration_minutes * 60
 
-    # record_services.service_id is INTEGER and is a primary-key component.
-    service_id = (
-        None
-        if payload.get("service_id") is None
-        else _require_positive_id(
+    # record_services.service_id is INTEGER and is a primary-key COMPONENT: it
+    # selects WHICH service row the snapshot belongs to. It is identity, not a
+    # patchable attribute, so the explicit-clear semantics that apply to title,
+    # amount and price do NOT apply here.
+    #
+    # Absent  -> the known service identity is kept (the delivery said nothing).
+    # Present as a valid positive id -> the normal service change.
+    # Present as null/false/"12"/0/negative -> DETERMINISTIC REJECTION.
+    #
+    # The last case is fail-closed on purpose. No captured payload has ever sent
+    # `service_id: null`, so its meaning is unproven: it could mean "the service
+    # was removed" or it could be an upstream serialisation artefact. Guessing
+    # either way is unsafe — silently keeping the old identity (the previous
+    # behaviour) would attach a NEW title, amount and price to the OLD
+    # service_id, and deleting the snapshot would destroy a proven one. Rejecting
+    # leaves every domain row untouched and makes the payload visible to an
+    # operator instead.
+    if "service_id" not in payload:
+        service_id = None
+    else:
+        service_id = _require_positive_id(
             payload.get("service_id"),
             code=NormalizationError.INVALID_PAYLOAD,
             maximum=PG_INT_MAX,
         )
-    )
     # record_services.amount is INTEGER.
     service_quantity = _optional_bounded_int(payload, "quantity", minimum=0, maximum=PG_INT_MAX)
     services_count = _optional_bounded_int(payload, "services_count", minimum=0, maximum=PG_INT_MAX)

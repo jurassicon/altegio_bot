@@ -7,6 +7,7 @@ the guarantee that none of it disturbs the Altegio path.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -14,7 +15,7 @@ from typing import Any
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 import altegio_bot.db as app_db
@@ -2714,3 +2715,359 @@ async def test_no_terminal_row_ever_looks_like_it_is_waiting(bound_session_local
             )
         ).all()
     assert waiting == [], "a terminal row still carries next_retry_at"
+
+
+# ===========================================================================
+# P1 — the rollout gap between the migration backfill and the new API image
+# ===========================================================================
+#
+# Production applies the migration while the OLD `altegio-api` container is
+# still accepting webhooks. That image has no `booking_uuid` in its model, so a
+# delivery landing after the backfill but before the API is recreated is stored
+# with a valid `uid` and a NULL canonical key — invisible to causal ordering.
+
+
+async def _capture_legacy(session: AsyncSession, payload: dict[str, Any], **kwargs: Any) -> int:
+    """A row exactly as the PRE-PR-4 image would have written it: key NULL."""
+    event_id = await _capture(session, payload, **kwargs)
+    await session.execute(update(EasyWeekEvent).where(EasyWeekEvent.id == event_id).values(booking_uuid=None))
+    return event_id
+
+
+async def _reconcile(bound_session_local) -> int:
+    async with bound_session_local() as session:
+        async with session.begin():
+            return await worker.reconcile_missing_booking_uuid(session)
+
+
+async def test_reconciliation_gives_legacy_rows_the_canonical_key(bound_session_local) -> None:
+    """A legacy row and a later, differently-spelled one must share one key."""
+    later = booking_updated()
+    later["uid"] = TEST_BOOKING_UUID.upper()
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            legacy_id = await _capture_legacy(session, booking_created(), payload_hash="h-legacy")
+            later_id = await _capture(session, later, event_hint="booking-updated", payload_hash="h-later")
+
+    async with bound_session_local() as session:
+        rows = {r.id: r for r in (await session.execute(select(EasyWeekEvent))).scalars().all()}
+        assert rows[legacy_id].booking_uuid is None, "precondition: the legacy row has no key"
+        assert rows[later_id].booking_uuid is not None
+
+    repaired = await _reconcile(bound_session_local)
+    assert repaired == 1
+
+    async with bound_session_local() as session:
+        rows = {r.id: r for r in (await session.execute(select(EasyWeekEvent))).scalars().all()}
+        assert rows[legacy_id].booking_uuid == rows[later_id].booking_uuid, (
+            "the legacy row and the later spelling must land in ONE causal chain"
+        )
+        # Capture data is untouched: exactly one column was written.
+        assert rows[legacy_id].payload == booking_created()
+        assert rows[legacy_id].payload_hash == "h-legacy"
+        assert rows[legacy_id].status == "captured"
+
+
+async def test_a_reconciled_legacy_row_blocks_its_later_sibling(bound_session_local) -> None:
+    """The whole point: after reconciliation the ordering guard sees the row."""
+    later = booking_updated()
+    later["uid"] = "{" + TEST_BOOKING_UUID + "}"
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            legacy_id = await _capture_legacy(session, booking_created(), payload_hash="h-legacy")
+            await _capture(session, later, event_hint="booking-updated", payload_hash="h-later")
+
+    # BEFORE reconciliation the legacy row does not participate in ordering:
+    # the later delivery is claimable even while the legacy one is pending.
+    async with bound_session_local() as session:
+        async with session.begin():
+            unordered = await worker.claim_next_event(session)
+            assert unordered is not None
+            # Roll the claim back so the state is untouched for the real check.
+            await session.rollback()
+
+    await _reconcile(bound_session_local)
+
+    # The legacy row failed transiently and is waiting for its retry window.
+    async with bound_session_local() as session:
+        async with session.begin():
+            row = (await session.execute(select(EasyWeekEvent).where(EasyWeekEvent.id == legacy_id))).scalars().one()
+            row.next_retry_at = worker.utcnow() + timedelta(minutes=5)
+            row.processing_attempts = 1
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            blocked = await worker.claim_next_event(session)
+            assert blocked is None, "the later delivery overtook a reconciled legacy row"
+
+
+async def test_after_recovery_the_later_delivery_wins(bound_session_local) -> None:
+    """Final domain state must reflect the LAST delivery, not the recovered one."""
+    later = booking_updated()
+    later["uid"] = TEST_BOOKING_UUID.upper()
+    later["service_id"] = 909
+    later["services_description"] = "Later set"
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            legacy_id = await _capture_legacy(session, booking_created(), payload_hash="h-legacy")
+            await _capture(session, later, event_hint="booking-updated", payload_hash="h-later")
+
+    await _reconcile(bound_session_local)
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            row = (await session.execute(select(EasyWeekEvent).where(EasyWeekEvent.id == legacy_id))).scalars().one()
+            row.next_retry_at = worker.utcnow() - timedelta(seconds=1)
+            row.processing_attempts = 2
+
+    await _run_until_idle()
+
+    async with bound_session_local() as session:
+        rows = (await session.execute(select(EasyWeekEvent).order_by(EasyWeekEvent.id))).scalars().all()
+        assert [r.status for r in rows] == ["processed", "processed"]
+        assert all(r.next_retry_at is None for r in rows)
+
+    _total, service_id, title, _amount, _cost = await _snapshot_row(bound_session_local)
+    assert service_id == 909
+    assert title == "Later set"
+
+
+async def test_reconciliation_leaves_malformed_rows_null(bound_session_local) -> None:
+    broken = booking_created()
+    broken["uid"] = "not-a-uuid"
+    missing = booking_created()
+    missing.pop("uid", None)
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            broken_id = await _capture_legacy(session, broken, payload_hash="h-broken")
+            missing_id = await _capture_legacy(session, missing, payload_hash="h-missing")
+
+    repaired = await _reconcile(bound_session_local)
+    assert repaired == 0, "nothing parseable, so nothing to repair"
+
+    async with bound_session_local() as session:
+        rows = {r.id: r for r in (await session.execute(select(EasyWeekEvent))).scalars().all()}
+        assert rows[broken_id].booking_uuid is None
+        assert rows[missing_id].booking_uuid is None
+
+    # They still reach their deterministic failure rather than stalling.
+    await _run_until_idle()
+    async with bound_session_local() as session:
+        rows = {r.id: r for r in (await session.execute(select(EasyWeekEvent))).scalars().all()}
+        assert rows[broken_id].status == "failed"
+        assert rows[broken_id].error_code == NormalizationError.INVALID_BOOKING_UUID
+        assert rows[missing_id].status == "failed"
+        assert rows[missing_id].error_code == NormalizationError.MISSING_BOOKING_UUID
+        assert all(r.next_retry_at is None for r in rows.values())
+
+
+async def test_reconciliation_is_idempotent_and_bounded(bound_session_local) -> None:
+    """A second pass finds nothing, and the scan is keyset-paginated."""
+    async with bound_session_local() as session:
+        async with session.begin():
+            for index in range(5):
+                payload = booking_created()
+                payload["uid"] = f"aaaaaaaa-0000-4000-8000-00000000000{index}"
+                payload["id"] = TEST_BOOKING_ID + 1000 + index
+                await _capture_legacy(session, payload, payload_hash=f"h{index}")
+
+    assert await _reconcile(bound_session_local) == 5
+    assert await _reconcile(bound_session_local) == 0
+
+    # The scan must not load the table whole.
+    import inspect
+
+    source = inspect.getsource(worker.reconcile_missing_booking_uuid)
+    assert "EasyWeekEvent.id > last_id" in source or "id > last_id" in source
+    assert ".limit(RECONCILE_BATCH)" in source
+    assert "offset" not in source.lower()
+
+
+async def test_the_loop_refuses_to_claim_until_reconciliation_succeeds(bound_session_local, monkeypatch) -> None:
+    """Fail-closed: a broken reconciliation must not let claiming start."""
+    monkeypatch.setattr(settings, "easyweek_processing_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_location_id", TEST_LOCATION_ID, raising=False)
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture_legacy(session, booking_created(), payload_hash="h1")
+
+    claims: list[int] = []
+
+    async def never_called() -> bool:
+        claims.append(1)
+        return False
+
+    async def boom(session: AsyncSession) -> int:
+        raise RuntimeError("reconciliation unavailable")
+
+    monkeypatch.setattr(worker, "process_one", never_called)
+    monkeypatch.setattr(worker, "reconcile_missing_booking_uuid", boom)
+
+    stop_event = asyncio.Event()
+
+    async def stop_soon() -> None:
+        await asyncio.sleep(0.15)
+        stop_event.set()
+
+    await asyncio.wait_for(
+        asyncio.gather(worker.run_loop(poll_sec=0.01, stop_event=stop_event), stop_soon()),
+        timeout=10,
+    )
+
+    assert claims == [], "the worker claimed events despite a failed reconciliation"
+    # And the row was left exactly as captured.
+    async with bound_session_local() as session:
+        row = (await session.execute(select(EasyWeekEvent))).scalars().one()
+        assert row.status == "captured"
+        assert row.booking_uuid is None
+
+
+async def test_the_loop_reconciles_once_then_claims(bound_session_local, monkeypatch) -> None:
+    monkeypatch.setattr(settings, "easyweek_processing_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_location_id", TEST_LOCATION_ID, raising=False)
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture_legacy(session, booking_created(), payload_hash="h1")
+
+    passes: list[int] = []
+    real_reconcile = worker.reconcile_missing_booking_uuid
+
+    async def counting(session: AsyncSession) -> int:
+        passes.append(1)
+        return await real_reconcile(session)
+
+    monkeypatch.setattr(worker, "reconcile_missing_booking_uuid", counting)
+
+    stop_event = asyncio.Event()
+
+    async def stop_soon() -> None:
+        await asyncio.sleep(0.3)
+        stop_event.set()
+
+    await asyncio.wait_for(
+        asyncio.gather(worker.run_loop(poll_sec=0.01, stop_event=stop_event), stop_soon()),
+        timeout=10,
+    )
+
+    assert len(passes) == 1, f"reconciliation ran {len(passes)} times; it must run once per process"
+    async with bound_session_local() as session:
+        row = (await session.execute(select(EasyWeekEvent))).scalars().one()
+        assert row.booking_uuid is not None
+        assert row.status == "processed"
+
+
+# ===========================================================================
+# P2 — `service_id` is identity and has no explicit-clear semantics
+# ===========================================================================
+
+
+@pytest.mark.parametrize(
+    ("bad_value", "expected_code"),
+    [
+        # "not a number at all" -> invalid_payload
+        (None, NormalizationError.INVALID_PAYLOAD),
+        (True, NormalizationError.INVALID_PAYLOAD),
+        (False, NormalizationError.INVALID_PAYLOAD),
+        ("10", NormalizationError.INVALID_PAYLOAD),
+        ("", NormalizationError.INVALID_PAYLOAD),
+        (1.5, NormalizationError.INVALID_PAYLOAD),
+        # "a number, but out of the column's range" -> invalid_numeric_range.
+        # The same distinction every other id uses (`id`, `customer_id`,
+        # `location_id`); service_id must not invent a different convention.
+        (0, NormalizationError.INVALID_NUMERIC_RANGE),
+        (-1, NormalizationError.INVALID_NUMERIC_RANGE),
+    ],
+    ids=["null", "true", "false", "string", "empty", "fraction", "zero", "negative"],
+)
+async def test_an_unusable_service_id_fails_deterministically(bound_session_local, bad_value, expected_code) -> None:
+    """No captured payload proves what `service_id: null` means, so refuse it.
+
+    Silently keeping the old identity would attach the NEW title, amount and
+    price to the OLD service_id; deleting the snapshot would destroy a proven
+    one. Both are guesses, so the delivery is rejected and nothing is written.
+    """
+    created = booking_created()
+    created["service_id"] = 10
+    created["booking_price_int"] = 3500
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, created, payload_hash="h1")
+    await _run_until_idle()
+
+    before = await _snapshot_row(bound_session_local)
+    async with bound_session_local() as session:
+        service_count_before = len((await session.execute(select(RecordService))).scalars().all())
+
+    event = booking_updated()
+    event["service_id"] = bad_value
+    event["services_description"] = "Should never be applied"
+    event["services_count"] = 9
+    event["booking_price_int"] = 9900
+    async with bound_session_local() as session:
+        async with session.begin():
+            event_id = await _capture(session, event, event_hint="booking-updated", payload_hash="h2")
+    await _run_until_idle()
+
+    async with bound_session_local() as session:
+        row = (await session.execute(select(EasyWeekEvent).where(EasyWeekEvent.id == event_id))).scalars().one()
+        assert row.status == "failed"
+        assert row.error_code == expected_code
+        assert row.next_retry_at is None
+        assert row.processed_at is not None
+
+    # Nothing in the domain moved.
+    assert await _snapshot_row(bound_session_local) == before
+    async with bound_session_local() as session:
+        assert len((await session.execute(select(RecordService))).scalars().all()) == service_count_before
+
+
+async def test_an_absent_service_id_still_preserves_identity(bound_session_local) -> None:
+    created = booking_created()
+    created["service_id"] = 10
+    created["booking_price_int"] = 3500
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, created, payload_hash="h1")
+    await _run_until_idle()
+
+    event = booking_updated()
+    event.pop("service_id", None)
+    event["services_description"] = "Same service, new text"
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, event, event_hint="booking-updated", payload_hash="h2")
+    await _run_until_idle()
+
+    total, service_id, title, _amount, cost = await _snapshot_row(bound_session_local)
+    assert service_id == 10, "an absent service_id must keep the known identity"
+    assert title == "Same service, new text"
+    assert total == cost == Decimal("35.00")
+
+
+async def test_a_valid_service_id_change_still_works(bound_session_local) -> None:
+    created = booking_created()
+    created["service_id"] = 10
+    created["booking_price_int"] = 3500
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, created, payload_hash="h1")
+    await _run_until_idle()
+
+    event = booking_updated()
+    event["service_id"] = 20
+    event.pop("booking_price_int", None)
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, event, event_hint="booking-updated", payload_hash="h2")
+    await _run_until_idle()
+
+    total, service_id, _title, _amount, cost = await _snapshot_row(bound_session_local)
+    assert service_id == 20
+    assert total == cost == Decimal("35.00")
+    await _assert_price_invariant(bound_session_local)

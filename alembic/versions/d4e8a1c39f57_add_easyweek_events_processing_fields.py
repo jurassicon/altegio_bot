@@ -74,9 +74,9 @@ _TABLE = "easyweek_events"
 _CLAIM_INDEX = "ix_easyweek_events_claim"
 # Supports the correlated NOT EXISTS that serialises one booking UUID.
 _PENDING_BOOKING_INDEX = "ix_easyweek_events_pending_booking"
-# Backfill batch size: keeps one statement's parameter list bounded on a large
-# research-capture backlog.
-_BACKFILL_CHUNK = 500
+# Keyset batch size. Bounds BOTH the rows read per round trip and the parameter
+# list of one UPDATE, so peak memory is one batch regardless of backlog size.
+_BACKFILL_BATCH = 500
 
 
 def _backfill_booking_uuid() -> None:
@@ -91,6 +91,11 @@ def _backfill_booking_uuid() -> None:
     Only rows that actually carry a string ``uid`` are examined, and only rows
     whose value parses are written. Malformed and missing ids stay NULL. Status,
     payload, payload_hash and body_raw are never touched.
+
+    Bounded memory by construction: the backlog is walked with keyset pagination
+    on ``id`` (``id > :last_id ORDER BY id LIMIT n``), never loaded whole. The
+    cursor advances on every row it reads — including malformed ones — so one bad
+    value can neither stall nor loop the scan.
     """
     bind = op.get_bind()
     if op.get_context().as_sql:
@@ -104,28 +109,40 @@ def _backfill_booking_uuid() -> None:
         )
         return
 
-    rows = bind.execute(
-        sa.text(
-            f"SELECT id, payload ->> 'uid' AS raw_uid FROM {_TABLE} WHERE jsonb_typeof(payload -> 'uid') = 'string'"
-        )
-    ).all()
+    # Keyset pagination on the primary key: `id > :last_id ORDER BY id LIMIT n`.
+    # No OFFSET (which re-scans the prefix on every page) and no `.all()` over
+    # the whole table — a research-grade capture backlog can be large, and at no
+    # point may more than one batch be resident.
+    select_batch = sa.text(
+        f"SELECT id, payload ->> 'uid' AS raw_uid FROM {_TABLE} "
+        "WHERE id > :last_id AND jsonb_typeof(payload -> 'uid') = 'string' "
+        f"ORDER BY id LIMIT {_BACKFILL_BATCH}"
+    )
+    update_batch = sa.text(f"UPDATE {_TABLE} SET booking_uuid = CAST(:value AS uuid) WHERE id = :row_id")
 
-    updates = []
-    for row in rows:
-        raw = row.raw_uid
-        if not isinstance(raw, str):
-            continue
-        try:
-            updates.append({"row_id": row.id, "value": str(uuid.UUID(raw.strip()))})
-        except (ValueError, AttributeError, TypeError):
-            # Malformed research-capture row: leave NULL, keep the raw capture.
-            continue
+    last_id = 0
+    while True:
+        rows = bind.execute(select_batch, {"last_id": last_id}).all()
+        if not rows:
+            break
 
-    for chunk_start in range(0, len(updates), _BACKFILL_CHUNK):
-        bind.execute(
-            sa.text(f"UPDATE {_TABLE} SET booking_uuid = CAST(:value AS uuid) WHERE id = :row_id"),
-            updates[chunk_start : chunk_start + _BACKFILL_CHUNK],
-        )
+        updates = []
+        for row in rows:
+            # The cursor advances on EVERY row, valid or not. Advancing only on
+            # success would re-read a malformed row forever.
+            last_id = row.id
+            raw = row.raw_uid
+            if not isinstance(raw, str):
+                continue
+            try:
+                updates.append({"row_id": row.id, "value": str(uuid.UUID(raw.strip()))})
+            except (ValueError, AttributeError, TypeError):
+                # Malformed research-capture row: leave NULL, keep the raw
+                # capture, and keep going.
+                continue
+
+        if updates:
+            bind.execute(update_batch, updates)
 
 
 def upgrade() -> None:

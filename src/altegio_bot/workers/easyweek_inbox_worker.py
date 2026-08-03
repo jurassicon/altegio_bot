@@ -45,7 +45,7 @@ import signal
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import func, or_, select, tuple_
+from sqlalchemy import func, or_, select, tuple_, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
@@ -57,6 +57,7 @@ from ..easyweek_normalizer import (
     UPDATE,
     NormalizationError,
     NormalizedBooking,
+    canonical_booking_uuid,
     easyweek_job_dedupe_key,
     normalize_event,
 )
@@ -153,6 +154,83 @@ def mark_failed(event: EasyWeekEvent, code: str) -> None:
     event.processed_at = utcnow()
     event.error_code = code
     event.next_retry_at = None
+
+
+# PostgreSQL advisory-lock key for the reconciliation pass. Two worker replicas
+# starting together must not scan and write the same rows concurrently.
+_RECONCILE_LOCK_KEY = 0x45575F5243  # "EW_RC"
+# Keyset batch size for the reconciliation scan — same bounded-memory contract
+# as the migration backfill: at most one batch resident, never a full table load.
+RECONCILE_BATCH = 500
+
+
+async def reconcile_missing_booking_uuid(session: AsyncSession) -> int:
+    """Fill ``booking_uuid`` for rows captured by an image that did not know it.
+
+    THE rollout gap this closes. Production deploys the migration while the OLD
+    `altegio-api` container is still accepting EasyWeek webhooks, and that image
+    has no ``booking_uuid`` column in its model. So a delivery that lands after
+    the migration's backfill but before the API is recreated is stored with a
+    perfectly valid ``uid`` and a NULL canonical key.
+
+    Such a row is invisible to the causal-ordering guard: it does not block a
+    later delivery of the same booking, it is not blocked by an earlier one, and
+    it is skipped by the canonical replay lookup. After a transient retry it can
+    be applied on top of newer state and revert the booking's times, service
+    snapshot, price or client link — exactly the class of bug the canonical key
+    exists to prevent.
+
+    Deferring this to "turn processing on later" does not fix the row; it only
+    postpones the corruption. So the worker repairs it BEFORE its first claim.
+
+    Contract:
+      * only ``booking_uuid IS NULL`` rows are examined;
+      * the value is computed with the SAME parser as capture and the
+        normalizer, so a reconciled row is indistinguishable from a natively
+        captured one;
+      * missing, non-string and malformed ids stay NULL and go on to their
+        deterministic failure;
+      * payload, body, hashes, status and every other capture field are
+        untouched — this writes exactly one column;
+      * an advisory lock serialises replicas;
+      * bounded memory: keyset pagination on ``id``, never a whole-table load.
+
+    Returns the number of rows given a canonical key.
+    """
+    locked = (await session.execute(select(func.pg_try_advisory_xact_lock(_RECONCILE_LOCK_KEY)))).scalar_one()
+    if not locked:
+        # Another replica is already reconciling. Report "nothing done by me";
+        # the caller will not claim until a pass completes successfully.
+        return -1
+
+    repaired = 0
+    last_id = 0
+    while True:
+        rows = (
+            await session.execute(
+                select(EasyWeekEvent.id, EasyWeekEvent.payload)
+                .where(EasyWeekEvent.booking_uuid.is_(None))
+                .where(EasyWeekEvent.id > last_id)
+                .order_by(EasyWeekEvent.id)
+                .limit(RECONCILE_BATCH)
+            )
+        ).all()
+        if not rows:
+            break
+
+        for row in rows:
+            # Advance on EVERY row, including the ones that stay NULL, so a
+            # malformed delivery can neither stall nor loop the scan.
+            last_id = row.id
+            canonical = canonical_booking_uuid(row.payload)
+            if canonical is None:
+                continue
+            await session.execute(
+                update(EasyWeekEvent).where(EasyWeekEvent.id == row.id).values(booking_uuid=canonical)
+            )
+            repaired += 1
+
+    return repaired
 
 
 async def claim_next_event(session: AsyncSession) -> EasyWeekEvent | None:
@@ -898,6 +976,11 @@ async def run_loop(
     effective_poll_sec = poll_sec if poll_sec is not None else settings.easyweek_inbox_worker_poll_sec
     announced_disabled = False
     consecutive_errors = 0
+    # Nothing may be claimed until one reconciliation pass has SUCCEEDED. See
+    # `reconcile_missing_booking_uuid`: rows captured by the pre-PR-4 API image
+    # carry a NULL canonical key and would silently escape causal ordering.
+    reconciled = False
+    reconcile_failures = 0
 
     logger.info(
         "EasyWeek inbox worker started. processing=%s notifications=%s poll=%ss",
@@ -925,6 +1008,37 @@ async def run_loop(
             continue
 
         announced_disabled = False
+
+        # ── Fail-closed gate: reconcile BEFORE the first claim ───────────────
+        if not reconciled:
+            try:
+                async with SessionLocal() as session:
+                    async with session.begin():
+                        repaired = await reconcile_missing_booking_uuid(session)
+            except Exception as exc:
+                # Same PII rules as everywhere else: class name only.
+                reconcile_failures += 1
+                logger.error(
+                    "easyweek reconcile_error type=%s consecutive=%s; NOT claiming events",
+                    type(exc).__name__,
+                    reconcile_failures,
+                )
+                backoff = min(effective_poll_sec * (2**reconcile_failures), MAX_ERROR_BACKOFF_SEC)
+                await _sleep_unless_stopping(backoff, stop_event)
+                continue
+
+            if repaired < 0:
+                # Another replica holds the lock. Wait rather than claim: its
+                # pass may still be repairing rows this worker would otherwise
+                # process with a NULL ordering key.
+                logger.info("easyweek reconcile in progress on another worker; waiting")
+                await _sleep_unless_stopping(effective_poll_sec, stop_event)
+                continue
+
+            reconciled = True
+            reconcile_failures = 0
+            logger.info("easyweek reconcile complete repaired=%s", repaired)
+
         try:
             did_work = await process_one()
         except Exception as exc:
