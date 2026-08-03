@@ -957,10 +957,21 @@ async def test_delivery_retry_presend_guard_cancels_when_deadline_passed(session
             record = await session.get(Record, record_id)
             assert record is not None
             record.starts_at = _utcnow() - timedelta(days=1)
+            # Identity matches the chain built by _setup_service_outbox, so the
+            # guard reaches the deadline branch this test is about.
             job = SimpleNamespace(
                 job_type="record_created",
+                provider="altegio",
+                company_id=1,
+                record_id=record_id,
+                client_id=1,
+                dedupe_key=f"delivery_retry:{outbox_id}:1",
                 run_at=_utcnow() - timedelta(days=1),
-                payload={"kind": "delivery_failed_retry", "delivery_retry_of_outbox_id": outbox_id},
+                payload={
+                    "kind": "delivery_failed_retry",
+                    "delivery_retry_of_outbox_id": outbox_id,
+                    "delivery_retry_attempt": 1,
+                },
             )
 
             reason = await ow._delivery_retry_presend_guard(session, job, record)

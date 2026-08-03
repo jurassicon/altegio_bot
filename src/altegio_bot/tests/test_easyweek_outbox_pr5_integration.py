@@ -25,6 +25,7 @@ cross-tenant leak waiting for the two spaces to overlap.
 
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -36,7 +37,10 @@ import pytest_asyncio
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+import altegio_bot.db as app_db
 from altegio_bot.campaigns.runner import CAMPAIGN_EXECUTION_JOB_TYPE
+from altegio_bot.delivery_retry_identity import RetryIdentity, resolve_retry_identity
+from altegio_bot.easyweek_normalizer import canonical_booking_uuid
 from altegio_bot.easyweek_policy import (
     EASYWEEK_LIFECYCLE_JOB_TYPES,
     easyweek_job_type_error,
@@ -52,6 +56,7 @@ from altegio_bot.models.models import (
     PROVIDER_ALTEGIO,
     PROVIDER_EASYWEEK,
     Client,
+    EasyWeekEvent,
     MessageJob,
     MessageTemplate,
     OutboxMessage,
@@ -63,6 +68,13 @@ from altegio_bot.models.models import (
 )
 from altegio_bot.providers.base import WhatsAppProvider
 from altegio_bot.settings import settings
+from altegio_bot.tests.easyweek_fixtures import (
+    TEST_LOCATION_ID,
+    booking_canceled,
+    booking_created,
+    booking_rescheduled,
+    booking_updated,
+)
 from altegio_bot.whatsapp_routing import pick_sender_id, pick_sender_id_by_code
 from altegio_bot.workers import campaign_worker
 from altegio_bot.workers import easyweek_inbox_worker as eyw_worker
@@ -2495,7 +2507,6 @@ async def test_missing_original_job_refuses_the_retry(
     [
         ("company_id", 999123, "company_mismatch"),
         ("record_id", None, "record_mismatch"),
-        ("client_id", None, "client_mismatch"),
         ("job_type", "record_updated", "job_type_mismatch"),
     ],
 )
@@ -2570,11 +2581,53 @@ async def test_easyweek_retry_refused_when_the_client_is_not_easyweek(
     assert outbox.meta["delivery_retry_skip_reason"] == "easyweek_retry_client_provider_mismatch"
 
 
-async def test_easyweek_retry_refused_when_record_and_client_are_unlinked(
+async def test_easyweek_retry_refused_when_the_client_is_from_another_company(
     db: AsyncSession,
     capture: CaptureProvider,
 ) -> None:
-    async def _unlink(job: MessageJob, outbox: OutboxMessage) -> None:
+    async def _move(job: MessageJob, outbox: OutboxMessage) -> None:
+        client = await db.get(Client, job.client_id)
+        assert client is not None
+        client.company_id = OTHER_EASYWEEK_COMPANY_ID
+
+    outbox = await _outbox_without_a_usable_job(db, capture, _move)
+
+    await _deliver_failed_status(db, outbox.provider_message_id, dedupe="wa:eyw-foreign-client-company")
+
+    assert await _retry_jobs_for(db, outbox.id) == []
+    await db.refresh(outbox)
+    assert outbox.meta["delivery_retry_skip_reason"] == "easyweek_retry_client_company_mismatch"
+
+
+async def test_easyweek_retry_refused_when_the_record_reference_is_missing(
+    db: AsyncSession,
+    capture: CaptureProvider,
+) -> None:
+    async def _strip(job: MessageJob, outbox: OutboxMessage) -> None:
+        job.record_id = None
+        outbox.record_id = None
+
+    outbox = await _outbox_without_a_usable_job(db, capture, _strip)
+
+    await _deliver_failed_status(db, outbox.provider_message_id, dedupe="wa:eyw-no-record")
+
+    assert await _retry_jobs_for(db, outbox.id) == []
+    await db.refresh(outbox)
+    assert outbox.meta["delivery_retry_skip_reason"] == "easyweek_retry_missing_record"
+
+
+async def test_a_non_null_job_client_that_contradicts_the_record_is_refused(
+    db: AsyncSession,
+    capture: CaptureProvider,
+) -> None:
+    """A job that NAMES a client and names a different one than the record.
+
+    This is a contradiction, not a partial delivery — the fallback in
+    :func:`resolve_retry_identity` only applies when the job names no client at
+    all, so this must stay a hard refusal.
+    """
+
+    async def _contradict(job: MessageJob, outbox: OutboxMessage) -> None:
         other = Client(
             provider=PROVIDER_EASYWEEK,
             company_id=COLLIDING_COMPANY_ID,
@@ -2588,13 +2641,63 @@ async def test_easyweek_retry_refused_when_record_and_client_are_unlinked(
         job.client_id = other.id
         outbox.client_id = other.id
 
-    outbox = await _outbox_without_a_usable_job(db, capture, _unlink)
+    outbox = await _outbox_without_a_usable_job(db, capture, _contradict)
 
-    await _deliver_failed_status(db, outbox.provider_message_id, dedupe="wa:eyw-unlinked")
+    await _deliver_failed_status(db, outbox.provider_message_id, dedupe="wa:eyw-contradicting-client")
 
     assert await _retry_jobs_for(db, outbox.id) == []
     await db.refresh(outbox)
-    assert outbox.meta["delivery_retry_skip_reason"] == "easyweek_retry_record_client_unlinked"
+    assert outbox.meta["delivery_retry_skip_reason"] == "easyweek_retry_job_client_conflicts_with_record"
+
+
+async def test_anchor_outbox_client_that_disagrees_with_the_effective_client_is_refused(
+    db: AsyncSession,
+    capture: CaptureProvider,
+) -> None:
+    """The outbox row must name the client the send actually used."""
+
+    async def _diverge(job: MessageJob, outbox: OutboxMessage) -> None:
+        other = Client(
+            provider=PROVIDER_EASYWEEK,
+            company_id=COLLIDING_COMPANY_ID,
+            altegio_client_id=7300056,
+            phone_e164="+491700000056",
+            display_name="Gerda",
+            raw={},
+        )
+        db.add(other)
+        await db.flush()
+        outbox.client_id = other.id
+
+    outbox = await _outbox_without_a_usable_job(db, capture, _diverge)
+
+    await _deliver_failed_status(db, outbox.provider_message_id, dedupe="wa:eyw-anchor-client")
+
+    assert await _retry_jobs_for(db, outbox.id) == []
+    await db.refresh(outbox)
+    assert outbox.meta["delivery_retry_skip_reason"] == "client_mismatch"
+
+
+async def test_easyweek_retry_refused_when_the_record_has_no_client(
+    db: AsyncSession,
+    capture: CaptureProvider,
+) -> None:
+    """Nothing to fall back to: neither the job nor the record names a client."""
+
+    async def _strip(job: MessageJob, outbox: OutboxMessage) -> None:
+        job.client_id = None
+        record = await db.get(Record, job.record_id)
+        assert record is not None
+        record.client_id = None
+        outbox.client_id = None
+
+    outbox = await _outbox_without_a_usable_job(db, capture, _strip)
+
+    await _deliver_failed_status(db, outbox.provider_message_id, dedupe="wa:eyw-no-client-anywhere")
+
+    assert await _retry_jobs_for(db, outbox.id) == []
+    await db.refresh(outbox)
+    assert outbox.meta["delivery_retry_skip_reason"] == "easyweek_retry_missing_client"
 
 
 async def test_an_existing_retry_with_the_wrong_provider_is_not_adopted(
@@ -2624,44 +2727,60 @@ async def test_an_existing_retry_with_the_wrong_provider_is_not_adopted(
     db.add(squatter)
     await db.flush()
 
-    expected = {
-        "provider": PROVIDER_EASYWEEK,
-        "company_id": COLLIDING_COMPANY_ID,
-        "record_id": record.id,
-        "client_id": client.id,
-        "job_type": "record_created",
-    }
+    identity = RetryIdentity(
+        provider=PROVIDER_EASYWEEK,
+        company_id=COLLIDING_COMPANY_ID,
+        record_id=record.id,
+        client_id=client.id,
+        job_type="record_created",
+    )
+    assert identity.mismatch_field(squatter) == "provider"
+
     refused = await wa_worker._create_delivery_retry_job_idempotent(
         db,
         dedupe_key="delivery_retry:4242:1",
+        identity=identity,
         status="queued",
         run_at=datetime.now(timezone.utc),
         attempts=0,
         max_attempts=5,
         payload={},
-        **expected,
     )
     assert refused is None
-    assert wa_worker._retry_job_identity_mismatch(squatter, expected) == "provider"
 
+    await db.flush()
     await db.refresh(squatter)
     assert squatter.provider == PROVIDER_ALTEGIO, "the existing row must not be mutated"
+    assert squatter.status == "canceled", "a racing mismatched winner must not remain sendable"
+    assert squatter.locked_at is None
 
-    # A matching row IS adopted — the guard rejects mismatches, not idempotency.
-    squatter.provider = PROVIDER_EASYWEEK
+    # A different, matching row IS adopted — the guard rejects mismatches, not
+    # idempotency. The terminal conflicting row above remains historical.
+    matching = MessageJob(
+        **identity.as_job_fields(),
+        run_at=datetime.now(timezone.utc),
+        status="queued",
+        dedupe_key="delivery_retry:4242:2",
+        payload={
+            "kind": "delivery_failed_retry",
+            "delivery_retry_of_outbox_id": 4242,
+            "delivery_retry_attempt": 2,
+        },
+    )
+    db.add(matching)
     await db.flush()
     adopted = await wa_worker._create_delivery_retry_job_idempotent(
         db,
-        dedupe_key="delivery_retry:4242:1",
+        dedupe_key="delivery_retry:4242:2",
+        identity=identity,
         status="queued",
         run_at=datetime.now(timezone.utc),
         attempts=0,
         max_attempts=5,
         payload={},
-        **expected,
     )
     assert adopted is not None
-    assert adopted.id == squatter.id
+    assert adopted.id == matching.id
 
 
 async def test_a_squatting_retry_attempt_number_blocks_a_new_retry(
@@ -2718,3 +2837,656 @@ async def test_retry_refusal_audit_carries_no_pii(
     audit = str(refusal)
     for secret in (CLIENT_PHONE, CLIENT_EMAIL, "Anna", "Wimpernverlängerung", BOOKING_HASH):
         assert secret not in audit
+
+
+# ---------------------------------------------------------------------------
+# 15. Partial planner state: MessageJob.client_id IS NULL
+# ---------------------------------------------------------------------------
+#
+# PR-4 supports partial deliveries on purpose. A booking-updated or
+# booking-canceled payload that carries no `customer_id` leaves the already
+# known `Record.client_id` alone, and the planner then creates a job with
+# `client_id = NULL` because THAT delivery carried no Client. The outbox worker
+# resolves the client through the record, so the send succeeds and the outbox
+# row names the real client — which is why comparing `job.client_id` to
+# `outbox.client_id` directly used to reject the whole booking on retry.
+
+
+@pytest_asyncio.fixture
+async def easyweek_inbox(
+    session_maker: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> async_sessionmaker[AsyncSession]:
+    """Run the real PR-4 normalizer against the test database.
+
+    ``easyweek_notifications_enabled`` is turned on HERE only: these tests need
+    the planner to actually emit jobs. The production default stays False, and
+    no message leaves the process — every send goes through the capture provider.
+    """
+    monkeypatch.setattr(app_db, "SessionLocal", session_maker, raising=False)
+    monkeypatch.setattr(eyw_worker, "SessionLocal", session_maker, raising=False)
+    monkeypatch.setattr(settings, "easyweek_processing_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_notifications_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_location_id", TEST_LOCATION_ID, raising=False)
+    return session_maker
+
+
+async def _capture_and_process(
+    session_maker: async_sessionmaker[AsyncSession],
+    payload: dict[str, Any],
+    *,
+    event_hint: str,
+    payload_hash: str,
+) -> None:
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(
+                EasyWeekEvent(
+                    status="captured",
+                    event_hint=event_hint,
+                    auth_via="query",
+                    payload_hash=payload_hash,
+                    payload=payload,
+                    body_truncated=False,
+                    booking_uuid=canonical_booking_uuid(payload),
+                )
+            )
+    for _ in range(20):
+        if not await eyw_worker.process_one():
+            break
+
+
+def _future_booking(payload: dict[str, Any]) -> dict[str, Any]:
+    """Move the fixture appointment ahead of the test clock.
+
+    The delivery-retry deadline for ``record_created``/``record_updated`` is
+    ``starts_at - 30 min``; the shared fixtures are pinned to a fixed date, so a
+    run after it would legitimately refuse the retry and the test would be
+    measuring the calendar rather than the identity rules.
+    """
+    start = datetime.now(timezone.utc) + timedelta(days=30)
+    end = start + timedelta(hours=1)
+    payload["booking_date_start"] = start.strftime("%Y-%m-%dT%H:%M:%S+0000")
+    payload["booking_date_end"] = end.strftime("%Y-%m-%dT%H:%M:%S+0000")
+    payload["booking_date_start_tz"] = start.strftime("%Y-%m-%dT%H:%M:%S+0000")
+    return payload
+
+
+def _partial_payload(builder: Any, *, explicit_null: bool = False) -> dict[str, Any]:
+    """A follow-up delivery that says nothing about the customer."""
+    payload = _future_booking(builder())
+    if explicit_null:
+        payload["customer_id"] = None
+    else:
+        payload.pop("customer_id", None)
+    return payload
+
+
+async def _seed_colliding_altegio_rows(db: AsyncSession, *, code: str) -> WhatsAppSender:
+    """An Altegio template and sender on the same numeric company id."""
+    db.add(
+        _template(
+            provider=PROVIDER_ALTEGIO,
+            company_id=TEST_LOCATION_ID,
+            code=code,
+            body="ALTEGIO BODY",
+        )
+    )
+    altegio_sender = _sender(
+        provider=PROVIDER_ALTEGIO,
+        company_id=TEST_LOCATION_ID,
+        phone_number_id="altegio-phone-id",
+    )
+    db.add(altegio_sender)
+    await db.flush()
+    return altegio_sender
+
+
+async def _job_by_type(db: AsyncSession, job_type: str) -> MessageJob:
+    res = await db.execute(
+        select(MessageJob)
+        .where(MessageJob.provider == PROVIDER_EASYWEEK)
+        .where(MessageJob.job_type == job_type)
+        .order_by(MessageJob.id)
+    )
+    jobs = list(res.scalars().all())
+    assert len(jobs) == 1, f"expected exactly one {job_type} job, got {len(jobs)}"
+    return jobs[0]
+
+
+@pytest.mark.parametrize(
+    "job_type,event_hint,builder,meta_name",
+    [
+        ("record_updated", "booking-updated", booking_updated, EASYWEEK_UPDATED_TEMPLATE),
+        ("record_updated", "booking-rescheduled", booking_rescheduled, EASYWEEK_UPDATED_TEMPLATE),
+        ("record_canceled", "booking-canceled", booking_canceled, EASYWEEK_CANCELED_TEMPLATE),
+    ],
+)
+@pytest.mark.parametrize("explicit_null", [False, True])
+async def test_partial_job_without_a_client_sends_and_retries_as_easyweek(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    easyweek_inbox: async_sessionmaker[AsyncSession],
+    no_contact_rate_limit: None,
+    job_type: str,
+    event_hint: str,
+    builder: Any,
+    meta_name: str,
+    explicit_null: bool,
+) -> None:
+    await _capture_and_process(
+        easyweek_inbox,
+        _future_booking(booking_created()),
+        event_hint="booking-created",
+        payload_hash="h-1",
+    )
+    await _capture_and_process(
+        easyweek_inbox,
+        _partial_payload(builder, explicit_null=explicit_null),
+        event_hint=event_hint,
+        payload_hash="h-2",
+    )
+
+    # 3. The record keeps its client; 4. the new job carries none.
+    record = (await db.execute(select(Record).where(Record.provider == PROVIDER_EASYWEEK))).scalars().one()
+    client = (await db.execute(select(Client).where(Client.provider == PROVIDER_EASYWEEK))).scalars().one()
+    assert record.client_id == client.id, "a partial delivery must not unlink the client"
+
+    job = await _job_by_type(db, job_type)
+    assert job.client_id is None, "the delivery carried no Client, so the job names none"
+
+    altegio_sender = await _seed_colliding_altegio_rows(db, code=job_type)
+    db.add(
+        _template(
+            provider=PROVIDER_EASYWEEK,
+            company_id=TEST_LOCATION_ID,
+            code=job_type,
+            language="de",
+            meta_template_name=meta_name,
+        )
+    )
+    easyweek_sender = _sender(
+        provider=PROVIDER_EASYWEEK,
+        company_id=TEST_LOCATION_ID,
+        phone_number_id="eyw-phone-id",
+    )
+    db.add(easyweek_sender)
+    await db.flush()
+
+    # 5. The first send succeeds and records the REAL client.
+    await _run_job(db, job)
+    assert job.status == "done", job.last_error
+    rows = await _outbox_rows(db, job)
+    assert len(rows) == 1
+    assert rows[0].client_id == client.id
+    assert rows[0].sender_id == easyweek_sender.id
+
+    # 6-7. A retryable failure produces an EasyWeek retry with the effective client.
+    await _deliver_failed_status(db, rows[0].provider_message_id, dedupe=f"wa:partial-{job_type}-{explicit_null}")
+    retries = await _retry_jobs_for(db, rows[0].id)
+    assert len(retries) == 1, "a partial job must not lose its retry"
+    retry = retries[0]
+    assert retry.provider == PROVIDER_EASYWEEK
+    assert retry.client_id == client.id, "the proven effective client is materialized on the retry"
+    assert retry.company_id == job.company_id
+    assert retry.record_id == record.id
+    assert retry.job_type == job_type
+
+    # 8-9. The retry sends, and it sends as EasyWeek.
+    retry.run_at = datetime.now(timezone.utc)
+    await db.flush()
+    capture.template_calls.clear()
+    await _run_job(db, retry)
+
+    assert retry.status == "done", retry.last_error
+    assert len(capture.template_calls) == 1
+    call = capture.template_calls[0]
+    assert call["template_name"] == meta_name
+    assert call["language"] == "de"
+    retry_rows = await _outbox_rows(db, retry)
+    assert retry_rows[0].sender_id == easyweek_sender.id
+    assert retry_rows[0].sender_id != altegio_sender.id
+    assert retry_rows[0].language == "de"
+    assert retry_rows[0].client_id == client.id
+
+
+async def test_a_partial_job_still_passes_the_resolver_directly(
+    db: AsyncSession,
+    capture: CaptureProvider,
+) -> None:
+    """Unit-level restatement: NULL job client resolves through the record."""
+    job = await _seed_easyweek_happy_path(db)
+    await _run_job(db, job)
+    rows = await _outbox_rows(db, job)
+    record_client_id = job.client_id
+    job.client_id = None
+    await db.flush()
+
+    resolution = await resolve_retry_identity(
+        db,
+        anchor_outbox=rows[0],
+        original_job=job,
+        job_type="record_created",
+    )
+
+    assert resolution.error is None
+    assert resolution.identity is not None
+    assert resolution.identity.client_id == record_client_id
+    assert resolution.identity.provider == PROVIDER_EASYWEEK
+
+
+# ---------------------------------------------------------------------------
+# 16. A conflicting job on a taken attempt is neutralized, not left sendable
+# ---------------------------------------------------------------------------
+
+
+async def _seed_conflicting_altegio_retry(
+    db: AsyncSession,
+    *,
+    job: MessageJob,
+    outbox_id: int,
+    payload: dict[str, Any] | None = None,
+    status: str = "queued",
+) -> MessageJob:
+    """The exact row the old early-return left behind.
+
+    Provider says Altegio, record and client point at EasyWeek domain rows, and
+    the numeric company id collides — so a send would load the Altegio template
+    and use the Altegio number for an EasyWeek customer.
+    """
+    conflicting = MessageJob(
+        provider=PROVIDER_ALTEGIO,
+        company_id=job.company_id,
+        record_id=job.record_id,
+        client_id=job.client_id,
+        job_type=job.job_type,
+        run_at=datetime.now(timezone.utc),
+        status=status,
+        dedupe_key=f"delivery_retry:{outbox_id}:1",
+        payload=payload
+        if payload is not None
+        else {
+            "kind": "delivery_failed_retry",
+            "delivery_retry_of_outbox_id": outbox_id,
+            "delivery_retry_attempt": 1,
+        },
+    )
+    db.add(conflicting)
+    await db.flush()
+    return conflicting
+
+
+async def test_conflicting_attempt_is_neutralized_by_the_callback(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    db.add(
+        _template(
+            provider=PROVIDER_ALTEGIO,
+            company_id=COLLIDING_COMPANY_ID,
+            code="record_created",
+            body="ALTEGIO BODY",
+        )
+    )
+    db.add(
+        _sender(
+            provider=PROVIDER_ALTEGIO,
+            company_id=COLLIDING_COMPANY_ID,
+            phone_number_id="altegio-phone-id",
+        )
+    )
+    await db.flush()
+
+    job = await _seed_easyweek_happy_path(db)
+    await _run_job(db, job)
+    assert job.status == "done", job.last_error
+    rows = await _outbox_rows(db, job)
+    outbox_id = rows[0].id
+
+    conflicting = await _seed_conflicting_altegio_retry(db, job=job, outbox_id=outbox_id)
+    capture.template_calls.clear()
+    capture.text_calls.clear()
+    caplog.set_level(logging.INFO)
+    caplog.clear()
+
+    await _deliver_failed_status(db, rows[0].provider_message_id, dedupe="wa:conflict-attempt")
+
+    await db.refresh(conflicting)
+    # Terminal, unlocked, and out of every claim query.
+    assert conflicting.status == "canceled"
+    assert conflicting.locked_at is None
+    assert "provider" in (conflicting.last_error or "")
+    # Not repaired: its provenance is unproven, so nothing about it is rewritten.
+    assert conflicting.provider == PROVIDER_ALTEGIO
+    assert conflicting.record_id == job.record_id
+    assert conflicting.client_id == job.client_id
+
+    # No second job on a globally unique dedupe key.
+    assert [j.id for j in await _retry_jobs_for(db, outbox_id)] == [conflicting.id]
+
+    # Stale recovery must not resurrect it.
+    requeued = await ow._requeue_stale_processing_jobs(db)
+    await db.refresh(conflicting)
+    assert conflicting.status == "canceled"
+    assert requeued == 0
+
+    await db.refresh(rows[0])
+    refusal = {k: v for k, v in (rows[0].meta or {}).items() if k.startswith("delivery_retry")}
+    assert refusal["delivery_retry_skip_reason"] == "conflicting_retry_provider"
+    audit = str(refusal)
+    for secret in (CLIENT_PHONE, CLIENT_EMAIL, "Anna", "Wimpernverlängerung", BOOKING_HASH, VERIFIED_PAGE):
+        assert secret not in audit
+
+    # Running the exact terminal row after callback repair still cannot reach
+    # template lookup, sender routing or either provider call.
+    await _run_job(db, conflicting)
+    assert capture.template_calls == []
+    assert capture.text_calls == []
+    assert await _outbox_rows(db, conflicting) == []
+    assert "altegio-phone-id" not in caplog.text
+    for secret in (CLIENT_PHONE, CLIENT_EMAIL, "Anna", "Wimpernverlängerung", BOOKING_HASH, VERIFIED_PAGE):
+        assert secret not in caplog.text
+
+
+async def test_a_neutralized_conflicting_job_cannot_send_through_the_outbox(
+    db: AsyncSession,
+    capture: CaptureProvider,
+) -> None:
+    """Second line of defence: even forced back to queued, it must not send."""
+    altegio_sender = _sender(
+        provider=PROVIDER_ALTEGIO,
+        company_id=COLLIDING_COMPANY_ID,
+        phone_number_id="altegio-phone-id",
+    )
+    db.add(altegio_sender)
+    db.add(
+        _template(
+            provider=PROVIDER_ALTEGIO,
+            company_id=COLLIDING_COMPANY_ID,
+            code="record_created",
+            body="ALTEGIO BODY {{1}}",
+        )
+    )
+    await db.flush()
+
+    job = await _seed_easyweek_happy_path(db)
+    await _run_job(db, job)
+    rows = await _outbox_rows(db, job)
+    conflicting = await _seed_conflicting_altegio_retry(db, job=job, outbox_id=rows[0].id)
+    capture.template_calls.clear()
+    capture.text_calls.clear()
+
+    await _run_job(db, conflicting)
+
+    assert conflicting.status == "canceled"
+    assert conflicting.locked_at is None
+    assert "does not match the proven chain identity" in (conflicting.last_error or "")
+    assert capture.template_calls == []
+    assert capture.text_calls == []
+    assert await _outbox_rows(db, conflicting) == []
+    err = conflicting.last_error or ""
+    for secret in (CLIENT_PHONE, CLIENT_EMAIL, "Anna", "Wimpernverlängerung", BOOKING_HASH, VERIFIED_PAGE):
+        assert secret not in err
+
+
+async def test_stale_recovery_terminally_rejects_a_wrong_provider_retry(
+    db: AsyncSession,
+    capture: CaptureProvider,
+) -> None:
+    """Recovery must not make a legacy cross-provider retry sendable again."""
+    job = await _seed_easyweek_happy_path(db)
+    await _run_job(db, job)
+    rows = await _outbox_rows(db, job)
+    legacy = await _seed_conflicting_altegio_retry(
+        db,
+        job=job,
+        outbox_id=rows[0].id,
+        status="processing",
+    )
+    legacy.locked_at = datetime.now(timezone.utc) - timedelta(hours=1)
+    await db.flush()
+    capture.template_calls.clear()
+    capture.text_calls.clear()
+
+    recovered = await ow._requeue_stale_processing_jobs(db)
+
+    await db.flush()
+    await db.refresh(legacy)
+    assert recovered == 0
+    assert legacy.status == "canceled"
+    assert legacy.locked_at is None
+    assert "provider" in (legacy.last_error or "")
+
+    # Even a direct invocation after recovery remains local and produces no send.
+    await _run_job(db, legacy)
+    assert capture.template_calls == []
+    assert capture.text_calls == []
+    assert await _outbox_rows(db, legacy) == []
+
+
+async def test_stale_recovery_requeues_a_proven_easyweek_retry(
+    db: AsyncSession,
+    capture: CaptureProvider,
+) -> None:
+    """The stale guard is selective: a valid retry keeps normal recovery."""
+    job = await _seed_easyweek_happy_path(db)
+    await _run_job(db, job)
+    rows = await _outbox_rows(db, job)
+    await _deliver_failed_status(db, rows[0].provider_message_id, dedupe="wa:valid-stale-retry")
+    retry = (await _retry_jobs_for(db, rows[0].id))[0]
+    retry.status = "processing"
+    retry.locked_at = datetime.now(timezone.utc) - timedelta(hours=1)
+    await db.flush()
+
+    recovered = await ow._requeue_stale_processing_jobs(db)
+
+    await db.flush()
+    await db.refresh(retry)
+    assert recovered == 1
+    assert retry.status == "queued"
+    assert retry.locked_at is None
+    assert retry.last_error == "Recovered: stale processing job"
+
+
+async def test_a_well_formed_retry_payload_with_the_wrong_provider_never_sends(
+    db: AsyncSession,
+    capture: CaptureProvider,
+) -> None:
+    """The presend guard must not depend on the callback repair.
+
+    This is the row an older build could have written: the payload is perfectly
+    well formed, and only ``provider`` is wrong.
+    """
+    db.add(
+        _sender(
+            provider=PROVIDER_ALTEGIO,
+            company_id=COLLIDING_COMPANY_ID,
+            phone_number_id="altegio-phone-id",
+        )
+    )
+    db.add(
+        _template(
+            provider=PROVIDER_ALTEGIO,
+            company_id=COLLIDING_COMPANY_ID,
+            code="record_created",
+            body="ALTEGIO BODY {{1}}",
+        )
+    )
+    await db.flush()
+
+    job = await _seed_easyweek_happy_path(db)
+    await _run_job(db, job)
+    rows = await _outbox_rows(db, job)
+
+    legacy = await _seed_conflicting_altegio_retry(
+        db,
+        job=job,
+        outbox_id=rows[0].id,
+        payload={
+            "kind": "delivery_failed_retry",
+            "delivery_retry_of_outbox_id": rows[0].id,
+            "delivery_retry_attempt": 1,
+            "delivery_retry_original_outbox_id": rows[0].id,
+        },
+    )
+    capture.template_calls.clear()
+
+    await _run_job(db, legacy)
+
+    assert legacy.status == "canceled"
+    assert (legacy.last_error or "").startswith("Canceled: delivery retry provider")
+    assert capture.template_calls == []
+    assert capture.text_calls == []
+
+
+async def test_a_malformed_retry_namespace_job_never_sends(
+    db: AsyncSession,
+    capture: CaptureProvider,
+) -> None:
+    """A row parked in the reserved namespace with no chain payload."""
+    job = await _seed_easyweek_happy_path(db)
+    await _run_job(db, job)
+    rows = await _outbox_rows(db, job)
+
+    malformed = await _seed_conflicting_altegio_retry(db, job=job, outbox_id=rows[0].id, payload={})
+    capture.template_calls.clear()
+
+    await _run_job(db, malformed)
+
+    assert malformed.status == "canceled"
+    assert malformed.locked_at is None
+    assert "invalid delivery_retry_of_outbox_id" in (malformed.last_error or "")
+    assert capture.template_calls == []
+    assert capture.text_calls == []
+    assert await _outbox_rows(db, malformed) == []
+
+
+async def test_a_retry_payload_outside_the_reserved_namespace_never_sends(
+    db: AsyncSession,
+    capture: CaptureProvider,
+) -> None:
+    """A retry payload cannot bypass chain idempotency with an ordinary key."""
+    job = await _seed_easyweek_happy_path(db)
+    await _run_job(db, job)
+    rows = await _outbox_rows(db, job)
+    retry = MessageJob(
+        provider=PROVIDER_EASYWEEK,
+        company_id=job.company_id,
+        record_id=job.record_id,
+        client_id=job.client_id,
+        job_type=job.job_type,
+        run_at=datetime.now(timezone.utc),
+        status="queued",
+        dedupe_key="ordinary-job-key",
+        payload={
+            "kind": "delivery_failed_retry",
+            "delivery_retry_of_outbox_id": rows[0].id,
+            "delivery_retry_attempt": 1,
+        },
+    )
+    db.add(retry)
+    await db.flush()
+    capture.template_calls.clear()
+    capture.text_calls.clear()
+
+    await _run_job(db, retry)
+
+    assert retry.status == "canceled"
+    assert "delivery_retry_dedupe_namespace_missing" in (retry.last_error or "")
+    assert capture.template_calls == []
+    assert capture.text_calls == []
+    assert await _outbox_rows(db, retry) == []
+
+
+@pytest.mark.parametrize(
+    "payload_change,error_fragment",
+    [
+        ({"delivery_retry_attempt": 2}, "delivery_retry_attempt_mismatch"),
+        ({"delivery_retry_of_outbox_id": 999999999}, "delivery_retry_outbox_reference_mismatch"),
+    ],
+)
+async def test_retry_namespace_and_payload_must_name_the_same_chain_and_attempt(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    payload_change: dict[str, int],
+    error_fragment: str,
+) -> None:
+    """A syntactically plausible payload cannot disagree with its reserved key."""
+    job = await _seed_easyweek_happy_path(db)
+    await _run_job(db, job)
+    rows = await _outbox_rows(db, job)
+    payload = {
+        "kind": "delivery_failed_retry",
+        "delivery_retry_of_outbox_id": rows[0].id,
+        "delivery_retry_attempt": 1,
+        "delivery_retry_original_outbox_id": rows[0].id,
+    }
+    payload.update(payload_change)
+    retry = MessageJob(
+        provider=PROVIDER_EASYWEEK,
+        company_id=job.company_id,
+        record_id=job.record_id,
+        client_id=job.client_id,
+        job_type=job.job_type,
+        run_at=datetime.now(timezone.utc),
+        status="queued",
+        dedupe_key=f"delivery_retry:{rows[0].id}:1",
+        payload=payload,
+    )
+    db.add(retry)
+    await db.flush()
+    capture.template_calls.clear()
+    capture.text_calls.clear()
+
+    await _run_job(db, retry)
+
+    assert retry.status == "canceled"
+    assert error_fragment in (retry.last_error or "")
+    assert capture.template_calls == []
+    assert capture.text_calls == []
+    assert await _outbox_rows(db, retry) == []
+
+
+async def test_a_terminal_historical_conflicting_job_is_left_alone(
+    db: AsyncSession,
+    capture: CaptureProvider,
+) -> None:
+    """A row that already finished is evidence, not something to rewrite."""
+    job = await _seed_easyweek_happy_path(db)
+    await _run_job(db, job)
+    rows = await _outbox_rows(db, job)
+
+    historical = await _seed_conflicting_altegio_retry(db, job=job, outbox_id=rows[0].id, status="done")
+    historical.last_error = None
+    await db.flush()
+
+    await _deliver_failed_status(db, rows[0].provider_message_id, dedupe="wa:conflict-historical")
+
+    await db.refresh(historical)
+    assert historical.status == "done", "a terminal job must not be reopened or rewritten"
+    assert historical.last_error is None
+    assert [j.id for j in await _retry_jobs_for(db, rows[0].id)] == [historical.id]
+
+
+async def test_a_matching_existing_retry_stays_idempotent(
+    db: AsyncSession,
+    capture: CaptureProvider,
+) -> None:
+    """The same callback twice must not restart or duplicate the retry."""
+    job = await _seed_easyweek_happy_path(db)
+    await _run_job(db, job)
+    rows = await _outbox_rows(db, job)
+
+    await _deliver_failed_status(db, rows[0].provider_message_id, dedupe="wa:idempotent-1")
+    first = (await _retry_jobs_for(db, rows[0].id))[0]
+    first_run_at = first.run_at
+
+    await _deliver_failed_status(db, rows[0].provider_message_id, dedupe="wa:idempotent-2")
+
+    retries = await _retry_jobs_for(db, rows[0].id)
+    assert len(retries) == 1
+    await db.refresh(first)
+    assert first.status == "queued"
+    assert first.run_at == first_run_at, "an idempotent repeat must not reschedule the retry"
+    assert first.provider == PROVIDER_EASYWEEK

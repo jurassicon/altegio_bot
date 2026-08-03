@@ -24,6 +24,12 @@ from altegio_bot.campaigns.runner import (
     recompute_campaign_run_stats,
 )
 from altegio_bot.db import SessionLocal
+from altegio_bot.delivery_retry_identity import (
+    DELIVERY_RETRY_DEDUPE_PREFIX,
+    is_delivery_retry_dedupe_key,
+    resolve_retry_identity,
+    resolve_retry_reference,
+)
 from altegio_bot.easyweek_normalizer import extract_manage_link
 from altegio_bot.easyweek_policy import (
     EASYWEEK_LIFECYCLE_JOB_TYPES,
@@ -437,19 +443,39 @@ async def _requeue_stale_processing_jobs(session: AsyncSession) -> int:
     cutoff = utcnow() - timedelta(minutes=STALE_PROCESSING_MINUTES)
 
     stmt = (
-        update(MessageJob)
+        select(MessageJob)
         .where(MessageJob.status == "processing")
         .where(MessageJob.locked_at.is_not(None))
         .where(MessageJob.locked_at < cutoff)
-        .values(
-            status="queued",
-            locked_at=None,
-            run_at=utcnow(),
-            last_error="Recovered: stale processing job",
-        )
+        .order_by(MessageJob.id.asc())
+        .with_for_update(skip_locked=True)
     )
-    res = await session.execute(stmt)
-    return int(getattr(res, "rowcount", 0) or 0)
+    jobs = list((await session.execute(stmt)).scalars().all())
+
+    recovered = 0
+    now = utcnow()
+    for job in jobs:
+        # A stale legacy retry is not trusted merely because it once reached
+        # `processing`. Re-prove it before making it sendable again; otherwise
+        # recovery would undo the presend safety boundary on every worker boot.
+        if _is_delivery_retry_job(job):
+            record = await _load_record(session, job)
+            guard_reason = await _delivery_retry_presend_guard(session, job, record)
+            if guard_reason is not None:
+                job.status = "canceled"
+                job.locked_at = None
+                job.updated_at = now
+                job.last_error = guard_reason
+                continue
+
+        job.status = "queued"
+        job.locked_at = None
+        job.run_at = now
+        job.updated_at = now
+        job.last_error = "Recovered: stale processing job"
+        recovered += 1
+
+    return recovered
 
 
 async def _apply_rate_limit(
@@ -1104,8 +1130,17 @@ def _decrement_send_attempt(job: MessageJob) -> None:
 
 
 def _is_delivery_retry_job(job: MessageJob) -> bool:
+    """True when the job CLAIMS to be a delivery retry, by payload or by namespace.
+
+    The dedupe-key namespace counts on its own. A row parked on
+    ``delivery_retry:<id>:<n>`` with a payload that does not describe a chain
+    used to slip past this check entirely and be processed as an ordinary job —
+    which is precisely the row that has no proven provenance and must not send.
+    """
     payload = getattr(job, "payload", None) or {}
-    return payload.get("kind") == "delivery_failed_retry" and payload.get("delivery_retry_of_outbox_id") is not None
+    if payload.get("kind") == "delivery_failed_retry" and payload.get("delivery_retry_of_outbox_id") is not None:
+        return True
+    return is_delivery_retry_dedupe_key(getattr(job, "dedupe_key", None))
 
 
 def _original_run_at(job: MessageJob) -> datetime | None:
@@ -1217,7 +1252,7 @@ async def _delivery_retry_chain_has_success(
     if (await session.execute(orig_stmt)).scalar_one_or_none() is not None:
         return True
 
-    prefix = f"delivery_retry:{original_outbox_id}:"
+    prefix = f"{DELIVERY_RETRY_DEDUPE_PREFIX}{original_outbox_id}:"
     job_ids_stmt = select(MessageJob.id).where(MessageJob.dedupe_key.like(prefix + "%"))
     job_ids = [int(x) for x in (await session.execute(job_ids_stmt)).scalars().all()]
     if not job_ids:
@@ -1237,11 +1272,22 @@ async def _delivery_retry_presend_guard(
     job: MessageJob,
     record: Record | None,
 ) -> str | None:
-    payload = getattr(job, "payload", None) or {}
-    try:
-        original_outbox_id = int(payload["delivery_retry_of_outbox_id"])
-    except (KeyError, TypeError, ValueError):
-        return "Canceled: invalid delivery_retry_of_outbox_id"
+    """Re-prove a retry job's chain before it is allowed to send.
+
+    Independent of the callback that created it, and on purpose: this guard has
+    to hold for a row the callback never wrote — one left behind by an older
+    buggy build, hand-inserted, or restored from a backup. A well-formed retry
+    payload carrying ``provider='altegio'`` on an EasyWeek chain is exactly the
+    shape that must not survive to a send, and the callback repair alone cannot
+    see it.
+
+    Runs before the template lookup, the sender routing, the rate limit and any
+    Meta or text call.
+    """
+    reference = resolve_retry_reference(job)
+    if reference.reference is None:
+        return f"Canceled: {reference.error or 'delivery_retry_reference_unproven'}"
+    original_outbox_id = reference.reference.original_outbox_id
 
     if await _delivery_retry_chain_has_success(session, original_outbox_id):
         return "Canceled: delivery retry chain already succeeded"
@@ -1249,6 +1295,23 @@ async def _delivery_retry_presend_guard(
     original_outbox = await session.get(OutboxMessage, original_outbox_id)
     if original_outbox is None:
         return "Retry deadline exceeded or original outbox missing for delivery retry"
+
+    original_job: MessageJob | None = None
+    if original_outbox.job_id is not None:
+        original_job = await session.get(MessageJob, original_outbox.job_id)
+
+    resolution = await resolve_retry_identity(
+        session,
+        anchor_outbox=original_outbox,
+        original_job=original_job,
+        job_type=job.job_type,
+    )
+    if resolution.identity is None:
+        return f"Canceled: delivery retry identity unproven ({resolution.error})"
+
+    mismatch = resolution.identity.mismatch_field(job)
+    if mismatch is not None:
+        return f"Canceled: delivery retry {mismatch} does not match the proven chain identity"
 
     deadline = _retry_deadline_at(job, record, original_outbox=original_outbox)
     if deadline is not None and utcnow() > deadline:
