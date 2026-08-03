@@ -47,6 +47,23 @@ fail-closed: он не берёт события, потому что не см�
 > `docker compose restart` **не** перечитывает `env_file`. После правки любого
 > флага нужен `up -d --force-recreate <сервис>`.
 
+`easyweek.env` читают ДВА сервиса, и оба — с `required: false`, чтобы
+Altegio-only хост без этого файла продолжал разворачиваться:
+
+* `altegio-easyweek-inbox-worker` — нормализатор (PR-4);
+* `altegio-outbox-worker` — общий outbox, он рендерит EasyWeek lifecycle jobs и
+  читает `EASYWEEK_BOOKING_PAGE_URL` и `EASYWEEK_DEFAULT_LANGUAGE` (PR-5).
+
+Поэтому после правки booking URL или языка нужен именно:
+
+```bash
+docker compose -p altegio_bot up -d --force-recreate altegio-outbox-worker
+```
+
+Обычный `restart altegio-outbox-worker` оставит контейнер со старыми
+значениями, и это молчаливый режим отказа: пустой `EASYWEEK_BOOKING_PAGE_URL`
+роняет lifecycle-job локально, а устаревший язык уйдёт в Meta.
+
 ---
 
 ## 2. Безопасный порядок включения

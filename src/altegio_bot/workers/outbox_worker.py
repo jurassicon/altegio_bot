@@ -800,6 +800,107 @@ async def _is_new_client_for_record(
     return prev_id is None
 
 
+# The three codes EasyWeek plans in PR-4. Every strict gate below is scoped to
+# them: reminders, marketing and campaigns are Altegio-only for now and must keep
+# exactly the behaviour they have.
+EASYWEEK_LIFECYCLE_JOB_TYPES: frozenset[str] = frozenset(
+    {
+        "record_created",
+        "record_updated",
+        "record_canceled",
+    }
+)
+
+
+def _easyweek_domain_scope_error(
+    job: MessageJob,
+    record: Record | None,
+    client: Client | None,
+    *,
+    provider: str,
+) -> str | None:
+    """Prove the loaded Record and Client really belong to this EasyWeek job.
+
+    ``record_id`` and ``client_id`` are plain BIGINTs into tables that hold BOTH
+    CRMs' rows. A job pointing at the wrong id — a mis-planned job, an id reused
+    after a restore, a hand-edited row — would render an Altegio customer's
+    appointment into an EasyWeek message and send it from the EasyWeek number.
+    Nothing downstream re-checks this: ``_render_message`` trusts the objects it
+    is handed, and the provider predicates added in PR-5 bound the TEMPLATE and
+    the SENDER, not the domain rows.
+
+    ``RecordService`` has no provider column of its own — it is scoped only
+    through ``record_id``. So proving the Record here is exactly what makes the
+    service snapshot read later trustworthy.
+
+    Returns a reason on mismatch, ``None`` when the trio is consistent. The
+    reason names the broken invariant and never the values behind it: the
+    offending row belongs to another tenant, and this string is written to
+    ``job.last_error`` and to the log.
+    """
+    if record is None:
+        return "EasyWeek lifecycle job has no record"
+    if client is None:
+        return "EasyWeek lifecycle job has no client"
+    if record.provider != provider:
+        return "Record belongs to a different provider than the job"
+    if client.provider != provider:
+        return "Client belongs to a different provider than the job"
+    if record.company_id != job.company_id:
+        return "Record belongs to a different company than the job"
+    if client.company_id != job.company_id:
+        return "Client belongs to a different company than the job"
+    if record.client_id is None:
+        return "Record has no client"
+    if job.client_id is not None and job.client_id != record.client_id:
+        return "Job client_id does not match record client_id"
+    if client.id != record.client_id:
+        return "Loaded client is not the record's client"
+    return None
+
+
+def _easyweek_service_snapshot_error(
+    record: Record,
+    services: list[RecordService],
+) -> str | None:
+    """Refuse to invent a service name or a price the booking does not have.
+
+    PR-4 deliberately keeps three states apart: a real ``Decimal("0.00")``, an
+    unknown ``NULL``, and an authoritative clear. Rendering flattens all of them
+    — ``f"{svc.title}"`` turns ``None`` into the literal string ``"None"`` and
+    ``_fmt_money(None)`` turns an unknown price into ``0.00`` — and the preflight
+    then waves both through, because they are non-empty strings. A customer would
+    read "None — 0.00€" for a booking whose price nobody knows.
+
+    So for EasyWeek lifecycle v1 the contract is fail-closed: render only a
+    snapshot that is complete and self-consistent. ``Decimal("0.00")`` stays a
+    perfectly valid price — this rejects UNKNOWN, not zero.
+
+    The single-row shape is PR-4's, not an assumption: the payload carries one
+    flat service, and ``_sync_service_snapshot`` deletes any row whose
+    ``service_id`` the delivery did not name.
+
+    Reasons carry no title and no amount — an inconsistent snapshot may hold
+    another tenant's data, and this string reaches ``job.last_error``.
+    """
+    if len(services) != 1:
+        return f"EasyWeek service snapshot must hold exactly one service, found {len(services)}"
+
+    svc = services[0]
+    if svc.title is None or not svc.title.strip():
+        return "EasyWeek service snapshot has no service title"
+    if svc.cost_to_pay is None:
+        return "EasyWeek service snapshot has no price"
+    if record.total_cost is None:
+        return "EasyWeek record has no total_cost"
+    if record.total_cost != svc.cost_to_pay:
+        # PR-4 keeps these identical by construction, so a divergence means the
+        # snapshot was written by something else — guessing which one is right
+        # would be inventing a price.
+        return "EasyWeek record total_cost and service cost_to_pay disagree"
+    return None
+
+
 def easyweek_effective_booking_link(record: Record | None, template_code: str) -> str:
     """The ONLY link an EasyWeek lifecycle message may carry.
 
@@ -870,6 +971,13 @@ async def _render_message(
         svc_res = await session.execute(svc_stmt)
         services = list(svc_res.scalars().all())
 
+        if is_easyweek and template_code in EASYWEEK_LIFECYCLE_JOB_TYPES:
+            # BEFORE the loop below, which is what would flatten an unknown
+            # title into "None" and an unknown price into "0.00".
+            snapshot_err = _easyweek_service_snapshot_error(record, services)
+            if snapshot_err is not None:
+                raise ValueError(snapshot_err)
+
         if services:
             primary_service = services[0].title or ""
 
@@ -911,7 +1019,11 @@ async def _render_message(
         raise ValueError(f"No active sender for provider={provider} company={company_id} code={sender_code}")
 
     pre_appointment_notes = ""
-    if template_code == "record_created" and record is not None and used_lang == "de":
+    # PRE_APPOINTMENT_NOTES_DE is KitiLash/Altegio copy — lash-extension prep
+    # instructions written for that salon. It has no business being appended to
+    # another CRM's booking confirmation, and PR-5 does not invent an EasyWeek
+    # equivalent: an empty string is the honest value until someone writes one.
+    if not is_easyweek and template_code == "record_created" and record is not None and used_lang == "de":
         is_new = await _is_new_client_for_record(
             session=session,
             company_id=company_id,
@@ -2011,6 +2123,25 @@ async def _run_job_logic(
     ):
         client = await _load_client(session, job, record)
 
+    # Everything after this point — the phone, the body, the params, the Meta
+    # call — treats `record` and `client` as belonging to this job. For EasyWeek
+    # that has to be PROVEN, not assumed, and proven here: this is the last
+    # point at which no customer-facing value has been built yet.
+    if job_provider == PROVIDER_EASYWEEK and job.job_type in EASYWEEK_LIFECYCLE_JOB_TYPES:
+        scope_err = _easyweek_domain_scope_error(job, record, client, provider=job_provider)
+        if scope_err is not None:
+            job.status = "failed"
+            job.locked_at = None
+            job.last_error = f"EasyWeek domain scope violation: {scope_err}"
+            logger.error(
+                "EasyWeek domain scope violation: %s job_id=%s company=%s code=%s",
+                scope_err,
+                job.id,
+                job.company_id,
+                job.job_type,
+            )
+            return None
+
     # Follow-up final eligibility guard (DB phase): re-check current recipient/client state
     # before the actual send.  Catches changes that happened during the 14-day delay between
     # job creation and delivery (read, booking, opt-out).
@@ -2684,6 +2815,32 @@ async def _run_job_logic(
         job.last_error = f"Template render error: {exc}"
         return
 
+    # The language Meta is actually told the template is in.
+    #
+    # For Altegio this stays the global TEMPLATE_LANGUAGE: every approved
+    # kitilash_* template is registered in `de`, and `lang` may legitimately
+    # differ from it after a same-company fallback without meaning the Meta
+    # template changed. Nothing about that policy moves here.
+    #
+    # For EasyWeek it must be the language of the row `_load_template` actually
+    # returned. `body` and `meta_template_name` already come from that row; if
+    # the request said `de` while the row was `en`, Meta rejects the send —
+    # after the request is spent — for a mismatch we could see locally.
+    effective_template_language = TEMPLATE_LANGUAGE
+    if job_provider == PROVIDER_EASYWEEK and job.job_type in EASYWEEK_LIFECYCLE_JOB_TYPES:
+        effective_template_language = (lang or "").strip()
+        if not effective_template_language:
+            job.status = "failed"
+            job.locked_at = None
+            job.last_error = f"EasyWeek template has no language: company={job.company_id} code={job.job_type}"
+            logger.error(
+                "EasyWeek template row has a blank language; failing job_id=%s company=%s code=%s",
+                job.id,
+                job.company_id,
+                job.job_type,
+            )
+            return
+
     _job_payload = getattr(job, "payload", None) or {}
     loyalty_card_text = _job_payload.get("loyalty_card_text", "")
 
@@ -2801,7 +2958,7 @@ async def _run_job_logic(
                     "send_type": "template",
                     "template": meta_template_name,
                     "params": template_params,
-                    "lang": TEMPLATE_LANGUAGE,
+                    "lang": effective_template_language,
                     "validation": "local_preflight_failure",
                 },
             )
@@ -2980,7 +3137,7 @@ async def _run_job_logic(
                             "text_inside_24h": True,
                             "text_inside_24h_eligible": True,
                             "original_template": meta_template_name,
-                            "original_template_language": TEMPLATE_LANGUAGE,
+                            "original_template_language": effective_template_language,
                             "original_template_params": template_params,
                             "wa_window_open": True,
                             "last_meta_inbound_at": _last_inbound_iso,
@@ -3114,7 +3271,7 @@ async def _run_job_logic(
                         sender_id=sender_id,
                         phone=phone,
                         template_name=meta_template_name,
-                        language=TEMPLATE_LANGUAGE,
+                        language=effective_template_language,
                         params=template_params,
                         fallback_text=final_body,
                         contact_name=contact_name,
@@ -3130,7 +3287,7 @@ async def _run_job_logic(
                     sender_id=sender_id,
                     phone=phone,
                     template_name=meta_template_name,
-                    language=TEMPLATE_LANGUAGE,
+                    language=effective_template_language,
                     params=template_params,
                     fallback_text=final_body,
                     contact_name=contact_name,
@@ -3141,7 +3298,7 @@ async def _run_job_logic(
                 "send_type": "template_fallback" if _use_template_fallback else "template",
                 "template": meta_template_name,
                 "params": template_params,
-                "lang": TEMPLATE_LANGUAGE,
+                "lang": effective_template_language,
             }
             if header_image_url:
                 send_meta["header_image_url"] = header_image_url
@@ -3151,7 +3308,7 @@ async def _run_job_logic(
                 send_meta["wa_window_open"] = bool(_wa_window_open)
                 send_meta["last_meta_inbound_at"] = _last_inbound_iso
                 send_meta["original_template"] = meta_template_name
-                send_meta["original_template_language"] = TEMPLATE_LANGUAGE
+                send_meta["original_template_language"] = effective_template_language
                 if _wa_window_check_error:
                     send_meta["text_inside_24h"] = False
                     send_meta["wa_window_check_error"] = _wa_window_check_error

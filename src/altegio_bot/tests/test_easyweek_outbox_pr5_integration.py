@@ -35,7 +35,12 @@ import pytest_asyncio
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from altegio_bot.meta_templates import META_TEMPLATE_MAP, resolve_meta_template
+from altegio_bot.meta_templates import (
+    META_TEMPLATE_MAP,
+    TEMPLATE_LANGUAGE,
+    build_lifecycle_template_params,
+    resolve_meta_template,
+)
 from altegio_bot.models.models import (
     PROVIDER_ALTEGIO,
     PROVIDER_EASYWEEK,
@@ -51,6 +56,7 @@ from altegio_bot.models.models import (
 from altegio_bot.settings import settings
 from altegio_bot.whatsapp_routing import pick_sender_id, pick_sender_id_by_code
 from altegio_bot.workers import outbox_worker as ow
+from altegio_bot.workers.outbox_worker import PRE_APPOINTMENT_NOTES_DE
 
 pytestmark = pytest.mark.asyncio
 
@@ -72,6 +78,10 @@ EASYWEEK_CANCELED_TEMPLATE = "eyw_zzz_canceled_v9"
 # Never asserted *into* an outgoing message — only asserted ABSENT from errors.
 CLIENT_PHONE = "+491700000001"
 CLIENT_EMAIL = "anna.pii@example.invalid"
+
+# Distinguishes "caller said nothing" from "caller said None", which is the whole
+# point of the PR-4 price semantics these fixtures have to be able to express.
+_UNSET: Any = object()
 
 
 # ---------------------------------------------------------------------------
@@ -192,18 +202,36 @@ async def _seed_easyweek_record(
     short_link: str | None = VERIFIED_PAGE,
     booking_hash_id: str | None = BOOKING_HASH,
     starts_at: datetime | None = None,
-    services: tuple[tuple[int, str, str], ...] = ((11, "Wimpernverlängerung", "60.00"),),
+    services: tuple[tuple[int, str | None, str | None], ...] = ((11, "Wimpernverlängerung", "60.00"),),
+    total_cost: str | None = _UNSET,
+    provider: str = PROVIDER_EASYWEEK,
 ) -> Record:
+    """Seed a record whose snapshot obeys PR-4's price invariant by default.
+
+    ``Record.total_cost`` and ``RecordService.cost_to_pay`` are the same
+    booking-level number in PR-4, so the default mirrors the single service's
+    cost. Tests that want an inconsistent or unknown snapshot pass ``total_cost``
+    explicitly (``None`` for unknown).
+    """
+    if total_cost is _UNSET:
+        first_cost = services[0][2] if services else None
+        resolved_total = Decimal(first_cost) if first_cost is not None else None
+    else:
+        resolved_total = Decimal(total_cost) if total_cost is not None else None
+
     record = Record(
-        provider=PROVIDER_EASYWEEK,
+        provider=provider,
         company_id=company_id,
         altegio_record_id=4200001,
-        easyweek_booking_uuid=uuid.UUID("11111111-2222-4333-8444-555555555555"),
+        easyweek_booking_uuid=(
+            uuid.UUID("11111111-2222-4333-8444-555555555555") if provider == PROVIDER_EASYWEEK else None
+        ),
         easyweek_booking_hash_id=booking_hash_id,
         client_id=client.id,
         staff_name="Tanja",
         starts_at=starts_at or (datetime.now(timezone.utc) + timedelta(days=3)),
         short_link=short_link,
+        total_cost=resolved_total,
         raw={},
     )
     db.add(record)
@@ -214,7 +242,7 @@ async def _seed_easyweek_record(
                 record_id=record.id,
                 service_id=service_id,
                 title=title,
-                cost_to_pay=Decimal(cost),
+                cost_to_pay=Decimal(cost) if cost is not None else None,
                 raw={},
             )
         )
@@ -267,7 +295,9 @@ async def _seed_easyweek_happy_path(
     meta_template_name: str | None = EASYWEEK_CREATED_TEMPLATE,
     short_link: str | None = VERIFIED_PAGE,
     booking_hash_id: str | None = BOOKING_HASH,
-    services: tuple[tuple[int, str, str], ...] = ((11, "Wimpernverlängerung", "60.00"),),
+    services: tuple[tuple[int, str | None, str | None], ...] = ((11, "Wimpernverlängerung", "60.00"),),
+    total_cost: str | None = _UNSET,
+    language: str = "de",
     with_sender: bool = True,
 ) -> MessageJob:
     """Everything an EasyWeek lifecycle job needs to reach the provider."""
@@ -278,12 +308,14 @@ async def _seed_easyweek_happy_path(
         short_link=short_link,
         booking_hash_id=booking_hash_id,
         services=services,
+        total_cost=total_cost,
     )
     db.add(
         _template(
             provider=PROVIDER_EASYWEEK,
             company_id=COLLIDING_COMPANY_ID,
             code=job_type,
+            language=language,
             meta_template_name=meta_template_name,
         )
     )
@@ -304,6 +336,107 @@ async def _seed_easyweek_happy_path(
         record=record,
         client=client,
         dedupe_key=f"eyw-{job_type}-1",
+    )
+
+
+ALTEGIO_SHORT_LINK = "https://n1234567.yclients.com/record/1"
+
+
+async def _seed_altegio_client_and_record(
+    db: AsyncSession,
+    *,
+    service_title: str | None = "Schnitt",
+    service_cost: str | None = "40.00",
+    total_cost: str | None = "40.00",
+) -> tuple[Client, Record]:
+    client = Client(
+        provider=PROVIDER_ALTEGIO,
+        company_id=COLLIDING_COMPANY_ID,
+        altegio_client_id=555001,
+        phone_e164="+491700000002",
+        display_name="Berta",
+        raw={},
+    )
+    db.add(client)
+    await db.flush()
+    record = Record(
+        provider=PROVIDER_ALTEGIO,
+        company_id=COLLIDING_COMPANY_ID,
+        altegio_record_id=555002,
+        client_id=client.id,
+        staff_name="Tanja",
+        starts_at=datetime.now(timezone.utc) + timedelta(days=3),
+        short_link=ALTEGIO_SHORT_LINK,
+        total_cost=Decimal(total_cost) if total_cost is not None else None,
+        raw={},
+    )
+    db.add(record)
+    await db.flush()
+    db.add(
+        RecordService(
+            record_id=record.id,
+            service_id=21,
+            title=service_title,
+            cost_to_pay=Decimal(service_cost) if service_cost is not None else None,
+            raw={},
+        )
+    )
+    await db.flush()
+    return client, record
+
+
+async def _seed_altegio_happy_path(
+    db: AsyncSession,
+    *,
+    job_type: str = "record_updated",
+    service_title: str | None = "Schnitt",
+    service_cost: str | None = "40.00",
+    total_cost: str | None = "40.00",
+    mismatched_client: bool = False,
+) -> MessageJob:
+    """A working Altegio job — the control group for every EasyWeek gate.
+
+    ``mismatched_client`` points ``job.client_id`` at a different Altegio client
+    than ``record.client_id``. That is a hard failure under the EasyWeek scope
+    gate and must stay a normal send here.
+    """
+    client, record = await _seed_altegio_client_and_record(
+        db,
+        service_title=service_title,
+        service_cost=service_cost,
+        total_cost=total_cost,
+    )
+    job_client = client
+    if mismatched_client:
+        job_client = Client(
+            provider=PROVIDER_ALTEGIO,
+            company_id=COLLIDING_COMPANY_ID,
+            altegio_client_id=555099,
+            phone_e164="+491700000099",
+            display_name="Elke",
+            raw={},
+        )
+        db.add(job_client)
+        await db.flush()
+    db.add(
+        _template(
+            provider=PROVIDER_ALTEGIO,
+            company_id=COLLIDING_COMPANY_ID,
+            code=job_type,
+            body="ALTEGIO BODY",
+            meta_template_name=None,
+        )
+    )
+    db.add(_sender(provider=PROVIDER_ALTEGIO, company_id=COLLIDING_COMPANY_ID, phone_number_id="altegio-phone-id"))
+    await db.flush()
+    return await _seed_job(
+        db,
+        provider=PROVIDER_ALTEGIO,
+        company_id=COLLIDING_COMPANY_ID,
+        job_type=job_type,
+        record=record,
+        client=job_client,
+        dedupe_key=f"alt-{job_type}-1",
     )
 
 
@@ -812,21 +945,31 @@ async def test_record_canceled_builds_five_params_with_the_static_page(
     assert len(params) == 5
 
 
-async def test_multi_service_list_is_flattened_into_one_parameter(
-    db: AsyncSession,
-    capture: CaptureProvider,
-) -> None:
-    """Meta rejects a newline inside a parameter, so the list is joined."""
-    job = await _seed_easyweek_happy_path(
-        db,
-        services=((11, "Wimpernverlängerung", "60.00"), (12, "Auffüllen", "25.50")),
-    )
+async def test_multi_line_services_are_flattened_into_one_parameter() -> None:
+    """Meta rejects a newline inside a parameter, so the list is joined.
 
-    params = await _run_and_get_params(db, capture, job)
+    Exercised at the builder, because a multi-ROW EasyWeek snapshot is itself
+    rejected upstream (see ``test_multi_row_service_snapshot_fails_closed``):
+    PR-4 stores one flat service per booking. The normalisation still has to
+    hold — ``services`` is assembled as newline-separated text, and Altegio
+    genuinely produces several lines.
+    """
+    params = build_lifecycle_template_params(
+        "record_created",
+        {
+            "client_name": "Anna Müller",
+            "staff_name": "Tanja",
+            "date": "14.09.2026",
+            "time": "10:30",
+            "services": "Wimpernverlängerung — 60.00€\nAuffüllen — 25.50€",
+            "total_cost": "85.50",
+            "booking_link": STATIC_BOOKING_PAGE,
+        },
+    )
 
     assert params[4] == "Wimpernverlängerung — 60.00€, Auffüllen — 25.50€"
     assert "\n" not in params[4]
-    assert params[5] == "85.50"
+    assert len(params) == 7
 
 
 async def test_wrong_arity_is_caught_locally_and_never_sent(
@@ -1181,49 +1324,7 @@ async def test_altegio_job_still_uses_the_hardcoded_meta_name(
     capture: CaptureProvider,
 ) -> None:
     """No ``meta_template_name`` on the row — the Altegio path must not need one."""
-    client = Client(
-        provider=PROVIDER_ALTEGIO,
-        company_id=COLLIDING_COMPANY_ID,
-        altegio_client_id=555001,
-        phone_e164="+491700000002",
-        display_name="Berta",
-        raw={},
-    )
-    db.add(client)
-    await db.flush()
-    record = Record(
-        provider=PROVIDER_ALTEGIO,
-        company_id=COLLIDING_COMPANY_ID,
-        altegio_record_id=555002,
-        client_id=client.id,
-        staff_name="Tanja",
-        starts_at=datetime.now(timezone.utc) + timedelta(days=3),
-        short_link="https://n1234567.yclients.com/record/1",
-        raw={},
-    )
-    db.add(record)
-    await db.flush()
-    db.add(RecordService(record_id=record.id, service_id=21, title="Schnitt", cost_to_pay=Decimal("40.00"), raw={}))
-    db.add(
-        _template(
-            provider=PROVIDER_ALTEGIO,
-            company_id=COLLIDING_COMPANY_ID,
-            code="record_updated",
-            body="ALTEGIO BODY",
-            meta_template_name=None,
-        )
-    )
-    db.add(_sender(provider=PROVIDER_ALTEGIO, company_id=COLLIDING_COMPANY_ID, phone_number_id="altegio-phone-id"))
-    await db.flush()
-    job = await _seed_job(
-        db,
-        provider=PROVIDER_ALTEGIO,
-        company_id=COLLIDING_COMPANY_ID,
-        job_type="record_updated",
-        record=record,
-        client=client,
-        dedupe_key="alt-updated-1",
-    )
+    job = await _seed_altegio_happy_path(db)
 
     await _run_job(db, job)
 
@@ -1235,7 +1336,7 @@ async def test_altegio_job_still_uses_the_hardcoded_meta_name(
     # Altegio keeps its own positional contract: the 7th param is the raw
     # Altegio short_link, untouched by the EasyWeek link rules.
     assert len(call["params"]) == 7
-    assert call["params"][6] == "https://n1234567.yclients.com/record/1"
+    assert call["params"][6] == ALTEGIO_SHORT_LINK
 
 
 async def test_altegio_sender_lookup_is_unchanged_when_provider_is_not_passed(db: AsyncSession) -> None:
@@ -1279,3 +1380,587 @@ async def test_altegio_job_without_provider_column_value_stays_on_the_altegio_pa
     await db.refresh(job)
 
     assert job.provider == PROVIDER_ALTEGIO
+
+
+# ---------------------------------------------------------------------------
+# 7. Domain scope — the Record and Client must belong to the job
+# ---------------------------------------------------------------------------
+
+
+async def _seed_easyweek_template_and_sender(db: AsyncSession, *, job_type: str = "record_created") -> None:
+    db.add(
+        _template(
+            provider=PROVIDER_EASYWEEK,
+            company_id=COLLIDING_COMPANY_ID,
+            code=job_type,
+            meta_template_name=EASYWEEK_CREATED_TEMPLATE,
+        )
+    )
+    db.add(_sender(provider=PROVIDER_EASYWEEK, company_id=COLLIDING_COMPANY_ID, phone_number_id="eyw-phone-id"))
+    await db.flush()
+
+
+def _assert_scope_failure(job: MessageJob, capture: CaptureProvider) -> None:
+    """Terminal local failure, no provider call, and nothing identifying in it."""
+    assert job.status == "failed"
+    assert job.locked_at is None
+    err = job.last_error or ""
+    assert "EasyWeek domain scope violation" in err
+    assert capture.template_calls == []
+    assert capture.text_calls == []
+    for secret in (CLIENT_PHONE, CLIENT_EMAIL, "Anna", "Berta", "Tanja", "Wimpernverlängerung", BOOKING_HASH):
+        assert secret not in err
+
+
+async def test_easyweek_job_pointing_at_an_altegio_record_fails_closed(
+    db: AsyncSession,
+    capture: CaptureProvider,
+) -> None:
+    client = await _seed_easyweek_client(db)
+    record = await _seed_easyweek_record(db, client, provider=PROVIDER_ALTEGIO)
+    await _seed_easyweek_template_and_sender(db)
+    job = await _seed_job(
+        db,
+        provider=PROVIDER_EASYWEEK,
+        company_id=COLLIDING_COMPANY_ID,
+        job_type="record_created",
+        record=record,
+        client=client,
+        dedupe_key="eyw-scope-altegio-record",
+    )
+
+    await _run_job(db, job)
+
+    _assert_scope_failure(job, capture)
+    assert "provider" in (job.last_error or "")
+
+
+async def test_easyweek_job_pointing_at_another_locations_record_fails_closed(
+    db: AsyncSession,
+    capture: CaptureProvider,
+) -> None:
+    client = await _seed_easyweek_client(db)
+    record = await _seed_easyweek_record(db, client, company_id=OTHER_EASYWEEK_COMPANY_ID)
+    await _seed_easyweek_template_and_sender(db)
+    job = await _seed_job(
+        db,
+        provider=PROVIDER_EASYWEEK,
+        company_id=COLLIDING_COMPANY_ID,
+        job_type="record_created",
+        record=record,
+        client=client,
+        dedupe_key="eyw-scope-other-location-record",
+    )
+
+    await _run_job(db, job)
+
+    _assert_scope_failure(job, capture)
+    assert "company" in (job.last_error or "")
+
+
+async def test_easyweek_job_pointing_at_an_altegio_client_fails_closed(
+    db: AsyncSession,
+    capture: CaptureProvider,
+) -> None:
+    altegio_client = Client(
+        provider=PROVIDER_ALTEGIO,
+        company_id=COLLIDING_COMPANY_ID,
+        altegio_client_id=555010,
+        phone_e164=CLIENT_PHONE,
+        display_name="Berta",
+        raw={},
+    )
+    db.add(altegio_client)
+    await db.flush()
+    record = await _seed_easyweek_record(db, altegio_client)
+    await _seed_easyweek_template_and_sender(db)
+    job = await _seed_job(
+        db,
+        provider=PROVIDER_EASYWEEK,
+        company_id=COLLIDING_COMPANY_ID,
+        job_type="record_created",
+        record=record,
+        client=altegio_client,
+        dedupe_key="eyw-scope-altegio-client",
+    )
+
+    await _run_job(db, job)
+
+    _assert_scope_failure(job, capture)
+
+
+async def test_easyweek_record_whose_client_is_another_providers_fails_closed(
+    db: AsyncSession,
+    capture: CaptureProvider,
+) -> None:
+    """The job names no client, so it is resolved from the record — still checked."""
+    altegio_client = Client(
+        provider=PROVIDER_ALTEGIO,
+        company_id=COLLIDING_COMPANY_ID,
+        altegio_client_id=555011,
+        phone_e164=CLIENT_PHONE,
+        display_name="Berta",
+        raw={},
+    )
+    db.add(altegio_client)
+    await db.flush()
+    record = await _seed_easyweek_record(db, altegio_client)
+    await _seed_easyweek_template_and_sender(db)
+    job = await _seed_job(
+        db,
+        provider=PROVIDER_EASYWEEK,
+        company_id=COLLIDING_COMPANY_ID,
+        job_type="record_created",
+        record=record,
+        client=None,
+        dedupe_key="eyw-scope-record-foreign-client",
+    )
+
+    await _run_job(db, job)
+
+    _assert_scope_failure(job, capture)
+
+
+async def test_mismatched_job_and_record_client_ids_fail_closed(
+    db: AsyncSession,
+    capture: CaptureProvider,
+) -> None:
+    record_client = await _seed_easyweek_client(db)
+    other_client = Client(
+        provider=PROVIDER_EASYWEEK,
+        company_id=COLLIDING_COMPANY_ID,
+        altegio_client_id=7300003,
+        phone_e164="+491700000009",
+        display_name="Clara",
+        raw={},
+    )
+    db.add(other_client)
+    await db.flush()
+    record = await _seed_easyweek_record(db, record_client)
+    await _seed_easyweek_template_and_sender(db)
+    job = await _seed_job(
+        db,
+        provider=PROVIDER_EASYWEEK,
+        company_id=COLLIDING_COMPANY_ID,
+        job_type="record_created",
+        record=record,
+        client=other_client,
+        dedupe_key="eyw-scope-client-id-mismatch",
+    )
+
+    await _run_job(db, job)
+
+    _assert_scope_failure(job, capture)
+    assert "client_id" in (job.last_error or "")
+
+
+async def test_client_from_another_company_fails_closed(
+    db: AsyncSession,
+    capture: CaptureProvider,
+) -> None:
+    foreign_client = Client(
+        provider=PROVIDER_EASYWEEK,
+        company_id=OTHER_EASYWEEK_COMPANY_ID,
+        altegio_client_id=7300004,
+        phone_e164=CLIENT_PHONE,
+        display_name="Dora",
+        raw={},
+    )
+    db.add(foreign_client)
+    await db.flush()
+    record = await _seed_easyweek_record(db, foreign_client)
+    await _seed_easyweek_template_and_sender(db)
+    job = await _seed_job(
+        db,
+        provider=PROVIDER_EASYWEEK,
+        company_id=COLLIDING_COMPANY_ID,
+        job_type="record_created",
+        record=record,
+        client=foreign_client,
+        dedupe_key="eyw-scope-foreign-company-client",
+    )
+
+    await _run_job(db, job)
+
+    _assert_scope_failure(job, capture)
+
+
+async def test_easyweek_lifecycle_job_without_a_record_fails_closed(
+    db: AsyncSession,
+    capture: CaptureProvider,
+) -> None:
+    client = await _seed_easyweek_client(db)
+    await _seed_easyweek_template_and_sender(db)
+    job = await _seed_job(
+        db,
+        provider=PROVIDER_EASYWEEK,
+        company_id=COLLIDING_COMPANY_ID,
+        job_type="record_created",
+        record=None,
+        client=client,
+        dedupe_key="eyw-scope-no-record",
+    )
+
+    await _run_job(db, job)
+
+    _assert_scope_failure(job, capture)
+
+
+async def test_altegio_job_is_untouched_by_the_easyweek_scope_gate(
+    db: AsyncSession,
+    capture: CaptureProvider,
+) -> None:
+    """An Altegio job whose client_id differs from the record's still sends.
+
+    The gate is deliberately EasyWeek-lifecycle-only. Altegio has always allowed
+    a job to name a client other than the record's, and tightening that here
+    would silently cancel live traffic this PR never set out to touch.
+    """
+    job = await _seed_altegio_happy_path(db, mismatched_client=True)
+
+    await _run_job(db, job)
+
+    assert job.status == "done", job.last_error
+    assert len(capture.template_calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# 8. Service snapshot — never invent a name or a price
+# ---------------------------------------------------------------------------
+
+
+def _assert_snapshot_failure(job: MessageJob, capture: CaptureProvider, fragment: str) -> None:
+    assert job.status == "failed"
+    err = job.last_error or ""
+    assert fragment in err
+    assert capture.template_calls == []
+    assert capture.text_calls == []
+    assert "None" not in err
+    assert "0.00" not in err
+
+
+async def test_unknown_service_title_fails_closed_instead_of_rendering_none(
+    db: AsyncSession,
+    capture: CaptureProvider,
+) -> None:
+    job = await _seed_easyweek_happy_path(db, services=((11, None, "60.00"),))
+
+    await _run_job(db, job)
+
+    _assert_snapshot_failure(job, capture, "no service title")
+
+
+@pytest.mark.parametrize("blank_title", ["", "   ", "\t\n "])
+async def test_blank_service_title_fails_closed(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    blank_title: str,
+) -> None:
+    job = await _seed_easyweek_happy_path(db, services=((11, blank_title, "60.00"),))
+
+    await _run_job(db, job)
+
+    _assert_snapshot_failure(job, capture, "no service title")
+
+
+async def test_unknown_price_fails_closed_instead_of_rendering_zero(
+    db: AsyncSession,
+    capture: CaptureProvider,
+) -> None:
+    """``NULL`` is "nobody knows", not "free" — 0.00 would be a lie."""
+    job = await _seed_easyweek_happy_path(db, services=((11, "Wimpernverlängerung", None),), total_cost="60.00")
+
+    await _run_job(db, job)
+
+    _assert_snapshot_failure(job, capture, "no price")
+
+
+async def test_unknown_title_and_price_together_fail_closed(
+    db: AsyncSession,
+    capture: CaptureProvider,
+) -> None:
+    job = await _seed_easyweek_happy_path(db, services=((11, None, None),), total_cost=None)
+
+    await _run_job(db, job)
+
+    _assert_snapshot_failure(job, capture, "EasyWeek service snapshot")
+
+
+async def test_unknown_record_total_cost_fails_closed(
+    db: AsyncSession,
+    capture: CaptureProvider,
+) -> None:
+    job = await _seed_easyweek_happy_path(db, total_cost=None)
+
+    await _run_job(db, job)
+
+    _assert_snapshot_failure(job, capture, "no total_cost")
+
+
+async def test_divergent_record_total_and_service_cost_fail_closed(
+    db: AsyncSession,
+    capture: CaptureProvider,
+) -> None:
+    """PR-4 keeps them identical; a divergence means somebody else wrote one."""
+    job = await _seed_easyweek_happy_path(
+        db,
+        services=((11, "Wimpernverlängerung", "60.00"),),
+        total_cost="35.00",
+    )
+
+    await _run_job(db, job)
+
+    _assert_snapshot_failure(job, capture, "disagree")
+
+
+async def test_multi_row_service_snapshot_fails_closed(
+    db: AsyncSession,
+    capture: CaptureProvider,
+) -> None:
+    """PR-4 stores one flat service per booking; two rows means stale state."""
+    job = await _seed_easyweek_happy_path(
+        db,
+        services=((11, "Wimpernverlängerung", "60.00"), (12, "Auffüllen", "25.50")),
+        total_cost="60.00",
+    )
+
+    await _run_job(db, job)
+
+    _assert_snapshot_failure(job, capture, "exactly one service")
+
+
+async def test_a_real_zero_price_is_a_valid_snapshot(
+    db: AsyncSession,
+    capture: CaptureProvider,
+) -> None:
+    """The gate rejects UNKNOWN, not zero — a free service must still send."""
+    job = await _seed_easyweek_happy_path(db, services=((11, "Probetermin", "0.00"),), total_cost="0.00")
+
+    params = await _run_and_get_params(db, capture, job)
+
+    assert params[4] == "Probetermin — 0.00€"
+    assert params[5] == "0.00"
+
+
+async def test_a_known_consistent_snapshot_sends(db: AsyncSession, capture: CaptureProvider) -> None:
+    job = await _seed_easyweek_happy_path(db)
+
+    params = await _run_and_get_params(db, capture, job)
+
+    assert params[4] == "Wimpernverlängerung — 60.00€"
+    assert params[5] == "60.00"
+    assert "None" not in params
+
+
+async def test_altegio_keeps_its_lenient_service_formatting(
+    db: AsyncSession,
+    capture: CaptureProvider,
+) -> None:
+    """The strict snapshot contract is EasyWeek-only; Altegio policy is unchanged."""
+    job = await _seed_altegio_happy_path(db, service_title=None, service_cost=None, total_cost=None)
+
+    await _run_job(db, job)
+
+    assert job.status == "done", job.last_error
+    assert len(capture.template_calls) == 1
+    assert capture.template_calls[0]["params"][4] == "None — 0.00€"
+
+
+# ---------------------------------------------------------------------------
+# 9. Effective Meta language — the language of the row actually used
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("db_language", ["de", "en"])
+async def test_meta_language_matches_the_selected_db_row(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    monkeypatch: pytest.MonkeyPatch,
+    db_language: str,
+) -> None:
+    monkeypatch.setattr(settings, "easyweek_default_language", db_language, raising=False)
+    job = await _seed_easyweek_happy_path(db, language=db_language)
+
+    await _run_job(db, job)
+
+    assert job.status == "done", job.last_error
+    assert capture.template_calls[0]["language"] == db_language
+    rows = await _outbox_rows(db, job)
+    assert rows[0].language == db_language
+    assert rows[0].meta["lang"] == db_language
+
+
+async def test_language_fallback_sends_the_row_language_not_the_requested_one(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Requested ``en``, only a ``de`` row exists — Meta must be told ``de``.
+
+    Telling Meta ``en`` here is a guaranteed rejection: the body and the
+    template name came from the ``de`` row.
+    """
+    monkeypatch.setattr(settings, "easyweek_default_language", "en", raising=False)
+    job = await _seed_easyweek_happy_path(db, language="de")
+
+    await _run_job(db, job)
+
+    assert job.status == "done", job.last_error
+    assert capture.template_calls[0]["language"] == "de"
+    rows = await _outbox_rows(db, job)
+    assert rows[0].language == "de"
+    assert rows[0].meta["lang"] == "de"
+
+
+async def test_preflight_audit_records_the_row_language(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "easyweek_default_language", "en", raising=False)
+    monkeypatch.setattr(ow, "build_lifecycle_template_params", lambda code, ctx: ["a", "b", "c"])
+    job = await _seed_easyweek_happy_path(db, language="en")
+
+    await _run_job(db, job)
+
+    assert job.status == "failed"
+    rows = await _outbox_rows(db, job)
+    assert rows[0].meta["lang"] == "en"
+    assert rows[0].meta["validation"] == "local_preflight_failure"
+    assert capture.template_calls == []
+
+
+async def test_template_fallback_after_a_window_policy_error_uses_the_row_language(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The 24h text route fails with a policy error; the template retry must not
+    silently revert to the global ``de``."""
+    monkeypatch.setattr(settings, "easyweek_default_language", "en", raising=False)
+    _enable_text_inside_24h(monkeypatch, window_open=True)
+
+    async def _policy_error_text(*args: Any, **kwargs: Any) -> tuple[None, str]:
+        capture.text_calls.append(dict(kwargs))
+        return None, "131047: Re-engagement message outside the allowed window"
+
+    monkeypatch.setattr(ow, "safe_send", _policy_error_text)
+    job = await _seed_easyweek_happy_path(db, language="en")
+
+    await _run_job(db, job)
+
+    assert job.status == "done", job.last_error
+    assert len(capture.text_calls) == 1
+    assert len(capture.template_calls) == 1
+    assert capture.template_calls[0]["language"] == "en"
+    rows = await _outbox_rows(db, job)
+    assert rows[0].meta["original_template_language"] == "en"
+
+
+async def test_altegio_still_sends_the_global_template_language(
+    db: AsyncSession,
+    capture: CaptureProvider,
+) -> None:
+    job = await _seed_altegio_happy_path(db)
+
+    await _run_job(db, job)
+
+    assert job.status == "done", job.last_error
+    assert capture.template_calls[0]["language"] == TEMPLATE_LANGUAGE
+    assert TEMPLATE_LANGUAGE == "de"
+    rows = await _outbox_rows(db, job)
+    assert rows[0].meta["lang"] == TEMPLATE_LANGUAGE
+
+
+# ---------------------------------------------------------------------------
+# 10. Altegio pre-appointment notes stay out of EasyWeek
+# ---------------------------------------------------------------------------
+
+
+def _enable_text_inside_24h(monkeypatch: pytest.MonkeyPatch, *, window_open: bool) -> None:
+    monkeypatch.setattr(settings, "bot_template_text_inside_24h_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "bot_template_text_inside_24h_fallback_enabled", True, raising=False)
+
+    async def _fake_window(**kwargs: Any) -> tuple[bool, datetime | None]:
+        return window_open, datetime.now(timezone.utc) if window_open else None
+
+    monkeypatch.setattr(ow, "is_whatsapp_customer_window_open", _fake_window)
+
+
+async def test_new_easyweek_client_gets_no_altegio_pre_appointment_notes(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """First-ever booking, German template, open window → text route.
+
+    This is exactly the shape that triggers ``PRE_APPOINTMENT_NOTES_DE`` on
+    Altegio, and the text route is where a body actually reaches the customer
+    verbatim. The notes are KitiLash lash-prep copy — EasyWeek must not carry it.
+    """
+    _enable_text_inside_24h(monkeypatch, window_open=True)
+    job = await _seed_easyweek_happy_path(db, language="de")
+    # A first booking: no earlier record exists for this client.
+    tmpl_res = await db.execute(select(MessageTemplate).where(MessageTemplate.provider == PROVIDER_EASYWEEK))
+    tmpl_res.scalars().one().body = "Hallo {{1}}, Termin am {{3}} um {{4}}.{pre_appointment_notes}"
+    await db.flush()
+
+    await _run_job(db, job)
+
+    assert job.status == "done", job.last_error
+    assert len(capture.text_calls) == 1
+    body = capture.text_calls[0]["text"]
+    assert PRE_APPOINTMENT_NOTES_DE not in body
+    assert "Anna Müller" in body, "the template still rendered normally"
+    rows = await _outbox_rows(db, job)
+    assert PRE_APPOINTMENT_NOTES_DE not in (rows[0].body or "")
+
+
+async def test_easyweek_render_context_has_empty_pre_appointment_notes(
+    db: AsyncSession,
+    capture: CaptureProvider,
+) -> None:
+    client = await _seed_easyweek_client(db)
+    record = await _seed_easyweek_record(db, client)
+    await _seed_easyweek_template_and_sender(db)
+
+    _body, _sender_id, _lang, ctx = await ow._render_message(
+        db,
+        company_id=COLLIDING_COMPANY_ID,
+        template_code="record_created",
+        record=record,
+        client=client,
+        provider=PROVIDER_EASYWEEK,
+    )
+
+    assert ctx["pre_appointment_notes"] == ""
+    assert capture.template_calls == []
+
+
+async def test_altegio_new_client_still_gets_its_pre_appointment_notes(
+    db: AsyncSession,
+    capture: CaptureProvider,
+) -> None:
+    """The Altegio behaviour this PR must not disturb."""
+    client, record = await _seed_altegio_client_and_record(db)
+    db.add(
+        _template(
+            provider=PROVIDER_ALTEGIO,
+            company_id=COLLIDING_COMPANY_ID,
+            code="record_created",
+            body="ALTEGIO BODY",
+        )
+    )
+    db.add(_sender(provider=PROVIDER_ALTEGIO, company_id=COLLIDING_COMPANY_ID, phone_number_id="altegio-phone-id"))
+    await db.flush()
+
+    _body, _sender_id, _lang, ctx = await ow._render_message(
+        db,
+        company_id=COLLIDING_COMPANY_ID,
+        template_code="record_created",
+        record=record,
+        client=client,
+        provider=PROVIDER_ALTEGIO,
+    )
+
+    assert ctx["pre_appointment_notes"] == PRE_APPOINTMENT_NOTES_DE
