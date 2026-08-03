@@ -24,6 +24,7 @@ from altegio_bot.campaigns.runner import (
     recompute_campaign_run_stats,
 )
 from altegio_bot.db import SessionLocal
+from altegio_bot.easyweek_normalizer import extract_manage_link
 from altegio_bot.message_planner import (
     COMEBACK_3D_DELAY,
     COMEBACK_3D_SOURCE_CANCELLED_AT_KEY,
@@ -34,11 +35,14 @@ from altegio_bot.meta_templates import (
     NEWSLETTER_MONTHLY_TEMPLATE,
     TEMPLATE_LANGUAGE,
     UNIVERSAL_JOB_TYPES,
+    build_lifecycle_template_params,
     build_template_params,
     requires_image_header,
     resolve_meta_template,
 )
 from altegio_bot.models.models import (
+    PROVIDER_ALTEGIO,
+    PROVIDER_EASYWEEK,
     CampaignRecipient,
     CampaignRun,
     Client,
@@ -64,7 +68,7 @@ from altegio_bot.services.meta_error_classifier import (
     transient_error_reason,
 )
 from altegio_bot.settings import settings
-from altegio_bot.template_validation import validate_template_params
+from altegio_bot.template_validation import validate_lifecycle_template_params, validate_template_params
 from altegio_bot.whatsapp_routing import pick_sender_code_for_record, pick_sender_id
 from altegio_bot.whatsapp_window import is_whatsapp_customer_window_open
 from altegio_bot.workers.promo_lead_handler import (
@@ -617,10 +621,23 @@ async def _load_template(
     company_id: int,
     template_code: str,
     language: str,
+    provider: str = PROVIDER_ALTEGIO,
 ) -> tuple[MessageTemplate | None, str]:
-    """Look up the active MessageTemplate for *company_id* / *template_code*.
+    """Look up the active MessageTemplate for *provider* / *company_id* / *code*.
 
-    Lookup order (deterministic, always order_by id ASC where no unique match):
+    ``provider`` bounds EVERY phase below, including the cross-company fallback.
+    EasyWeek's ``company_id`` is the numeric EasyWeek ``:location_id`` and shares
+    an integer space with Altegio company ids, so a provider-blind query could
+    serve an Altegio body — with an Altegio address footer — to an EasyWeek
+    customer. The column has a server default of ``'altegio'``, but a default is
+    not a filter: it only decides what NEW rows get, so the predicate is explicit.
+
+    For EasyWeek there is deliberately NO cross-company phase at all (see below).
+
+    Lookup order — every step is ``order_by(id ASC).limit(1)``. Nothing enforces
+    one row per (provider, company_id, code, language), so without the explicit
+    order the winner would be whatever the planner returned first and could
+    change between two runs over identical data.
 
     Phase 1 — company-specific rows (always executed):
       1. company_id + code + requested language  (exact)
@@ -650,19 +667,20 @@ async def _load_template(
     # ------------------------------------------------------------------
     base = (
         select(MessageTemplate)
+        .where(MessageTemplate.provider == provider)
         .where(MessageTemplate.company_id == company_id)
         .where(MessageTemplate.code == template_code)
         .where(MessageTemplate.is_active.is_(True))
     )
 
-    stmt = base.where(MessageTemplate.language == language).limit(1)
+    stmt = base.where(MessageTemplate.language == language).order_by(MessageTemplate.id.asc()).limit(1)
     res = await session.execute(stmt)
     tmpl = res.scalar_one_or_none()
     if tmpl is not None:
         return tmpl, language
 
     if language != DEFAULT_LANGUAGE:
-        stmt = base.where(MessageTemplate.language == DEFAULT_LANGUAGE).limit(1)
+        stmt = base.where(MessageTemplate.language == DEFAULT_LANGUAGE).order_by(MessageTemplate.id.asc()).limit(1)
         res = await session.execute(stmt)
         tmpl = res.scalar_one_or_none()
         if tmpl is not None:
@@ -679,11 +697,20 @@ async def _load_template(
     # Branch-specific codes (record_*, reminder_*) intentionally skip this
     # to prevent accidentally serving the wrong branch's address footer.
     # ------------------------------------------------------------------
+    # EasyWeek has exactly ONE location, so "another company's row" can only be a
+    # different tenant — never a legitimate shared template. There is no
+    # cross-company phase for it at any code.
+    if provider != PROVIDER_ALTEGIO:
+        return None, language
+
     if template_code not in UNIVERSAL_JOB_TYPES:
         return None, language
 
     cross = (
-        select(MessageTemplate).where(MessageTemplate.code == template_code).where(MessageTemplate.is_active.is_(True))
+        select(MessageTemplate)
+        .where(MessageTemplate.provider == provider)
+        .where(MessageTemplate.code == template_code)
+        .where(MessageTemplate.is_active.is_(True))
     )
 
     stmt = cross.where(MessageTemplate.language == language).order_by(MessageTemplate.id.asc()).limit(1)
@@ -773,6 +800,39 @@ async def _is_new_client_for_record(
     return prev_id is None
 
 
+def easyweek_effective_booking_link(record: Record | None, template_code: str) -> str:
+    """The ONLY link an EasyWeek lifecycle message may carry.
+
+    ``record_canceled`` always gets the static booking page, even when a
+    verified manage link exists: the call to action after a cancellation is
+    "book again", and pointing the customer at the management page of a booking
+    that no longer exists is both useless and confusing.
+
+    ``record_created`` / ``record_updated`` may use ``Record.short_link``, but
+    only after the stored pair is re-verified HERE, at send time, by the very
+    same validator the normalizer used — :func:`extract_manage_link`. Re-using it
+    rather than re-implementing a check is the point: a second, looser copy would
+    drift, and this is the last gate before a URL reaches a customer. A link is
+    never synthesised from the booking UUID, the numeric id or the hash.
+
+    Anything that does not verify falls back to the static page; an empty static
+    page yields "" and the caller fails the job locally.
+    """
+    static_page = (settings.easyweek_booking_page_url or "").strip()
+    if record is None or template_code == "record_canceled":
+        return static_page
+
+    link, _present = extract_manage_link(
+        {
+            "booking_page": record.short_link,
+            "booking_hash_id": record.easyweek_booking_hash_id,
+        }
+    )
+    if link is None:
+        return static_page
+    return link.url
+
+
 async def _render_message(
     session: AsyncSession,
     *,
@@ -780,17 +840,24 @@ async def _render_message(
     template_code: str,
     record: Record | None,
     client: Client | None,
+    provider: str = PROVIDER_ALTEGIO,
 ) -> tuple[str, int, str, dict[str, Any]]:
-    language = _pick_language(company_id, client)
+    is_easyweek = provider == PROVIDER_EASYWEEK
+    language = (
+        (settings.easyweek_default_language or DEFAULT_LANGUAGE).strip() or DEFAULT_LANGUAGE
+        if is_easyweek
+        else _pick_language(company_id, client)
+    )
 
     tmpl, used_lang = await _load_template(
         session,
         company_id=company_id,
         template_code=template_code,
         language=language,
+        provider=provider,
     )
     if tmpl is None:
-        raise ValueError(f"Template not found: company={company_id} code={template_code}")
+        raise ValueError(f"Template not found: provider={provider} company={company_id} code={template_code}")
 
     services_text = ""
     primary_service = ""
@@ -815,10 +882,19 @@ async def _render_message(
         services_text = "\n".join(lines)
 
     unsubscribe_link = ""
-    booking_link = BOOKING_LINKS.get(company_id, "")
+    if is_easyweek:
+        # EasyWeek has no BOOKING_LINKS entry and must never borrow one: that map
+        # is keyed by Altegio company id and holds Altegio salon pages.
+        booking_link = easyweek_effective_booking_link(record, template_code)
+    else:
+        booking_link = BOOKING_LINKS.get(company_id, "")
 
     sender_code = "default"
-    if record is not None:
+    # `service_sender_rules` is NOT provider-scoped, so an EasyWeek service id
+    # could match an Altegio rule and route the message to the wrong number.
+    # Until that table gets its own provider-aware design, EasyWeek stays on the
+    # default sender — safe, and explicit rather than accidental.
+    if record is not None and not is_easyweek:
         sender_code = await pick_sender_code_for_record(
             session=session,
             company_id=company_id,
@@ -829,9 +905,10 @@ async def _render_message(
         session=session,
         company_id=company_id,
         sender_code=sender_code,
+        provider=provider,
     )
     if sender_id is None:
-        raise ValueError(f"No active sender for company={company_id} code={sender_code}")
+        raise ValueError(f"No active sender for provider={provider} company={company_id} code={sender_code}")
 
     pre_appointment_notes = ""
     if template_code == "record_created" and record is not None and used_lang == "de":
@@ -860,6 +937,15 @@ async def _render_message(
         "sender_code": sender_code,
         "pre_appointment_notes": pre_appointment_notes,
     }
+
+    if is_easyweek:
+        # From the SAME row whose body/language/code were just used, so the name
+        # and the text can never come from two different templates.
+        ctx["meta_template_name"] = tmpl.meta_template_name
+        # An EasyWeek lifecycle message links only via `booking_link`; the raw
+        # `short_link` is unverified at this point and must not leak into a
+        # parameter slot.
+        ctx["short_link"] = booking_link
 
     if template_code == "review_3d":
         ctx["short_link"] = GOOGLE_MAPS_REVIEW_LINKS.get(
@@ -1838,6 +1924,13 @@ async def _run_job_logic(
         job.locked_at = None
         return
 
+    # The CRM this job belongs to. Read once, from the row, and threaded through
+    # template loading, sender routing and Meta-name resolution — every place
+    # where an Altegio and an EasyWeek row could otherwise collide on a numeric
+    # company_id. `getattr` with a default keeps hand-built test jobs and any
+    # legacy row without the column on the Altegio path, exactly as before.
+    job_provider = (getattr(job, "provider", None) or PROVIDER_ALTEGIO).strip() or PROVIDER_ALTEGIO
+
     success = await _find_success_outbox(session, job.id)
     if success is not None:
         logger.info(
@@ -2583,6 +2676,7 @@ async def _run_job_logic(
                 template_code=job.job_type,
                 record=record,
                 client=client,
+                provider=job_provider,
             )
     except Exception as exc:
         job.status = "failed"
@@ -2616,25 +2710,46 @@ async def _run_job_logic(
     template_params: list[str] = []
 
     if use_template:
-        is_new = bool(msg_ctx.get("pre_appointment_notes", ""))
-        meta_template_name = resolve_meta_template(
-            job.company_id,
-            job.job_type,
-            is_new_client=is_new,
-        )
-        if meta_template_name is None:
-            job.status = "failed"
-            job.locked_at = None
-            job.last_error = f"No Meta template for company={job.company_id} job_type={job.job_type}"
-            logger.error(
-                "No Meta template for company=%s job_type=%s; failing job_id=%s (send_mode=%s)",
+        if job_provider == PROVIDER_EASYWEEK:
+            # DB-first, and ONLY from the row already rendered above. The name is
+            # never derived from company_id, from a branch prefix or from the
+            # code: EasyWeek templates live in a different WABA and are named by
+            # whoever approved them, so any derivation would be a guess.
+            meta_template_name = (msg_ctx.get("meta_template_name") or "").strip() or None
+            if meta_template_name is None:
+                job.status = "failed"
+                job.locked_at = None
+                job.last_error = (
+                    f"No meta_template_name on EasyWeek template: company={job.company_id} code={job.job_type}"
+                )
+                logger.error(
+                    "EasyWeek template has no meta_template_name; failing job_id=%s company=%s code=%s",
+                    job.id,
+                    job.company_id,
+                    job.job_type,
+                )
+                return
+            template_params = build_lifecycle_template_params(job.job_type, msg_ctx)
+        else:
+            is_new = bool(msg_ctx.get("pre_appointment_notes", ""))
+            meta_template_name = resolve_meta_template(
                 job.company_id,
                 job.job_type,
-                job.id,
-                send_mode,
+                is_new_client=is_new,
             )
-            return
-        template_params = build_template_params(meta_template_name, msg_ctx)
+            if meta_template_name is None:
+                job.status = "failed"
+                job.locked_at = None
+                job.last_error = f"No Meta template for company={job.company_id} job_type={job.job_type}"
+                logger.error(
+                    "No Meta template for company=%s job_type=%s; failing job_id=%s (send_mode=%s)",
+                    job.company_id,
+                    job.job_type,
+                    job.id,
+                    send_mode,
+                )
+                return
+            template_params = build_template_params(meta_template_name, msg_ctx)
 
         # Resolve image header URL for newsletter templates before preflight so
         # a missing URL fails fast with a clear error (no blank-header send).
@@ -2653,7 +2768,13 @@ async def _run_job_logic(
                 job.last_error = err_msg
                 return
 
-        preflight_err = validate_template_params(meta_template_name, template_params)
+        # Keyed by CODE for EasyWeek: its Meta name is unknown to the Python
+        # rules, so a name-keyed check would fall through to the generic
+        # "non-empty" path and let a wrong-arity param list reach Meta.
+        if job_provider == PROVIDER_EASYWEEK:
+            preflight_err = validate_lifecycle_template_params(job.job_type, template_params)
+        else:
+            preflight_err = validate_template_params(meta_template_name, template_params)
         if preflight_err is not None:
             logger.error(
                 "Preflight validation failed: %s job_id=%s template=%s",

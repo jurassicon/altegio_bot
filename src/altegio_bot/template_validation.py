@@ -116,6 +116,66 @@ _TEMPLATE_RULES: dict[str, _TemplateRule] = {
 }
 
 
+# Lifecycle contracts keyed by CODE, for templates whose Meta name is only known
+# at runtime (EasyWeek reads it from `message_templates.meta_template_name`).
+#
+# Without this, a perfectly valid EasyWeek template name would miss
+# `_TEMPLATE_RULES` and fall into the generic path, which only checks
+# "non-empty" — so a 5-param list for a 7-param created template would pass
+# preflight and be rejected by Meta instead of locally.
+_LIFECYCLE_RULES: dict[str, _TemplateRule] = {
+    "record_created": (
+        7,
+        ["client_name", "staff_name", "date", "time", "services", "total_cost", "booking_link"],
+    ),
+    "record_updated": (
+        7,
+        ["client_name", "staff_name", "date", "time", "services", "total_cost", "booking_link"],
+    ),
+    "record_canceled": (
+        5,
+        ["client_name", "date", "time", "services", "booking_link"],
+    ),
+}
+
+
+def validate_lifecycle_template_params(code: str, params: list[str]) -> str | None:
+    """Validate params against the contract for a lifecycle *code*.
+
+    Same return convention as :func:`validate_template_params`: an error string,
+    or ``None`` when the params are acceptable. An unknown code is an error
+    rather than a pass — a lifecycle job whose code has no contract must not
+    reach Meta unchecked.
+    """
+    rule = _LIFECYCLE_RULES.get(code)
+    if rule is None:
+        return f"{_PREFIX}: no lifecycle param contract for code {code!r}"
+    return _check_against_rule(rule, params, subject=f"code {code!r}")
+
+
+def _check_against_rule(
+    rule: _TemplateRule,
+    params: list[str],
+    *,
+    subject: str,
+) -> str | None:
+    """Shared count/emptiness checks so both entry points agree exactly."""
+    expected_count, param_names = rule
+    if expected_count == 0:
+        if params:
+            return f"{_PREFIX}: expected {expected_count} params, got {len(params)}"
+        return None
+    if not params:
+        return f"{_PREFIX}: no params built for {subject} — template may be unrecognised"
+    if len(params) != expected_count:
+        return f"{_PREFIX}: expected {expected_count} params, got {len(params)}"
+    for i, val in enumerate(params):
+        if not val:
+            label = param_names[i] if param_names and i < len(param_names) else f"#{i + 1}"
+            return f"{_PREFIX}: missing required param #{i + 1} {label}"
+    return None
+
+
 def validate_template_params(
     template_name: str,
     params: list[str],

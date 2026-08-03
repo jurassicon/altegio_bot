@@ -97,6 +97,7 @@ def _patch_text_send(monkeypatch, message_id: str = "msg-comeback-001"):
         template_code,
         record,
         client,
+        **_kw,
     ):
         return (
             "Hallo {client_name}!",
