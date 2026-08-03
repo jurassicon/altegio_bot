@@ -19,6 +19,7 @@ from altegio_bot.easyweek_normalizer import (
     IGNORE,
     UPDATE,
     NormalizationError,
+    canonical_booking_uuid,
     easyweek_job_dedupe_key,
     extract_manage_link,
     map_event_hint,
@@ -668,3 +669,81 @@ def test_present_but_empty_is_still_carried() -> None:
     assert booking is not None
     assert booking.carries("comment")
     assert booking.comment is None
+
+
+# ===========================================================================
+# canonical_booking_uuid — the single definition of booking identity
+# ===========================================================================
+#
+# Shared by capture, the PR-4 migration backfill, the claim ordering key and the
+# normalizer, so all four agree on which booking a delivery belongs to.
+
+_CANONICAL = uuid.UUID("ac15372d-7422-4fc6-8fcb-b520bbffa669")
+
+
+@pytest.mark.parametrize(
+    "raw_uid",
+    [
+        "ac15372d-7422-4fc6-8fcb-b520bbffa669",
+        "AC15372D-7422-4FC6-8FCB-B520BBFFA669",
+        "  ac15372d-7422-4fc6-8fcb-b520bbffa669  ",
+        "\tac15372d-7422-4fc6-8fcb-b520bbffa669\n",
+        "{ac15372d-7422-4fc6-8fcb-b520bbffa669}",
+        "ac15372d74224fc68fcbb520bbffa669",
+        "urn:uuid:ac15372d-7422-4fc6-8fcb-b520bbffa669",
+    ],
+    ids=["canonical", "uppercase", "spaces", "whitespace", "braced", "compact", "urn"],
+)
+def test_every_textual_form_collapses_to_one_key(raw_uid) -> None:
+    assert canonical_booking_uuid({"uid": raw_uid}) == _CANONICAL
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"uid": "not-a-uuid"},
+        {"uid": ""},
+        {"uid": "   "},
+        {"uid": 12345},
+        {"uid": None},
+        {"uid": ["ac15372d-7422-4fc6-8fcb-b520bbffa669"]},
+        {"uid": {"value": "ac15372d-7422-4fc6-8fcb-b520bbffa669"}},
+        {},
+        [],
+        "a string",
+        None,
+        42,
+    ],
+    ids=[
+        "garbage",
+        "empty",
+        "blank",
+        "number",
+        "null",
+        "list",
+        "object",
+        "missing",
+        "array-payload",
+        "string-payload",
+        "none-payload",
+        "int-payload",
+    ],
+)
+def test_an_unusable_uid_yields_none_and_never_raises(payload) -> None:
+    """Capture must not be broken by a malformed research-grade delivery."""
+    assert canonical_booking_uuid(payload) is None
+
+
+def test_the_normalizer_agrees_with_the_shared_parser() -> None:
+    """The domain UUID and the ordering key must be the same value."""
+    for raw_uid in (
+        "ac15372d-7422-4fc6-8fcb-b520bbffa669",
+        "AC15372D-7422-4FC6-8FCB-B520BBFFA669",
+        "{ac15372d-7422-4fc6-8fcb-b520bbffa669}",
+        "ac15372d74224fc68fcbb520bbffa669",
+    ):
+        payload = booking_created()
+        payload["uid"] = raw_uid
+        booking = _normalize(payload)
+        assert booking is not None
+        assert booking.booking_uuid == canonical_booking_uuid(payload)

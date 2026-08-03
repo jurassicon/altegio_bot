@@ -236,13 +236,14 @@ async def test_migration_compatibility_scenarios(temp_db_url) -> None:
     removed = {c[0] for c in before} - {c[0] for c in after}
     # Everything added to easyweek_events ABOVE _BASE_REVISION, and nothing else:
     #   8705ec49cc73 (PR-1 follow-up) -> body_raw, body_size_bytes
-    #   d4e8a1c39f57 (PR-4)           -> processed_at, error_code,
+    #   d4e8a1c39f57 (PR-4)           -> booking_uuid, processed_at, error_code,
     #                                    processing_attempts, next_retry_at
     # The point of the assertion is that the downgrade is scoped — it must not
     # take the base capture columns with it.
     assert removed == {
         "body_raw",
         "body_size_bytes",
+        "booking_uuid",
         "processed_at",
         "error_code",
         "processing_attempts",

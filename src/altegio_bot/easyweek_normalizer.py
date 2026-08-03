@@ -88,6 +88,36 @@ MAX_MONEY: Final = Decimal("9999999999.99")
 MAX_MONEY_CENTS: Final = 999999999999
 
 
+def canonical_booking_uuid(payload: Any) -> uuid.UUID | None:
+    """The delivery's booking UUID in canonical form, or ``None``.
+
+    THE single definition of booking identity, shared by capture, the PR-4
+    migration backfill, the claim ordering key and the normalizer — so that the
+    row stored at capture, the row the claim serialises on, and the row the
+    domain writes can never disagree about which booking a delivery belongs to.
+
+    ``uuid.UUID`` accepts every textual form EasyWeek could plausibly send —
+    lowercase, uppercase, braced, ``urn:uuid:``-prefixed and dash-less — and
+    collapses them all to one value; ``.strip()`` covers surrounding whitespace.
+    Two deliveries of the same booking therefore share a key no matter how the
+    text was written.
+
+    Returns ``None`` — never raises — for a missing, non-string or syntactically
+    invalid ``uid``, and for any non-object payload. Capture must record such a
+    delivery unchanged, and it must neither block other bookings nor be blocked;
+    the deterministic rejection happens later, in the normalizer.
+    """
+    if not isinstance(payload, dict):
+        return None
+    raw = payload.get("uid")
+    if not isinstance(raw, str):
+        return None
+    try:
+        return uuid.UUID(raw.strip())
+    except (ValueError, AttributeError, TypeError):
+        return None
+
+
 class NormalizationError(Exception):
     """A deterministic, non-retryable rejection carrying a safe code.
 
@@ -511,10 +541,9 @@ def normalize_event(
         raise NormalizationError(NormalizationError.MISSING_BOOKING_UUID)
     if not isinstance(raw_uid, str):
         raise NormalizationError(NormalizationError.INVALID_BOOKING_UUID)
-    try:
-        booking_uuid = uuid.UUID(raw_uid.strip())
-    except (ValueError, AttributeError, TypeError):
-        raise NormalizationError(NormalizationError.INVALID_BOOKING_UUID) from None
+    booking_uuid = canonical_booking_uuid(payload)
+    if booking_uuid is None:
+        raise NormalizationError(NormalizationError.INVALID_BOOKING_UUID)
 
     # records.altegio_record_id is BIGINT.
     booking_id = _require_positive_id(payload.get("id"), code=NormalizationError.MISSING_BOOKING_ID)

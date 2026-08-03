@@ -201,6 +201,27 @@ class EasyWeekEvent(Base):
     headers: Mapped[dict] = mapped_column(JSONB, default=dict)  # только безопасные заголовки
     payload: Mapped[dict] = mapped_column(JSONB, default=dict)  # распарсенный JSON или {}
 
+    # --- PR-4 causal ordering key --------------------------------------------
+    # Канонический booking UUID доставки. ЕДИНСТВЕННЫЙ ключ, по которому claim
+    # сериализует события одной записи.
+    #
+    # Почему не `payload ->> 'uid'`: это сырой текст, а нормализатор приводит его
+    # к `uuid.UUID(raw.strip())`. Одна и та же UUID в lowercase, uppercase, в
+    # фигурных скобках, без дефисов или с пробелами — это РАЗНЫЕ строки, но ОДНА
+    # booking. По сырому тексту claim не увидел бы раннюю доставку как
+    # предшественника поздней, и поздняя обогнала бы раннюю: после retry ранняя
+    # легла бы сверху и откатила время, service snapshot, стоимость или client
+    # link. Здесь identity уже является UUID, поэтому и ключ — UUID.
+    #
+    # NULL, когда `uid` отсутствует или синтаксически невалиден. Такая строка
+    # никого не блокирует и сама не блокируется — она доходит до claim и
+    # получает детерминированный отказ. Сырой захват (body_raw/payload/
+    # payload_hash) при этом не меняется.
+    booking_uuid: Mapped[uuid.UUID | None] = mapped_column(
+        PostgresUUID(as_uuid=True),
+        nullable=True,
+    )
+
     # --- PR-4 runtime auditability -------------------------------------------
     # Когда строка достигла терминального статуса (processed/failed). NULL, пока
     # событие ещё captured.

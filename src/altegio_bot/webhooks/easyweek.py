@@ -48,6 +48,7 @@ from fastapi import APIRouter, HTTPException, Request
 from sqlalchemy.exc import SQLAlchemyError
 
 from ..db import SessionLocal
+from ..easyweek_normalizer import canonical_booking_uuid
 from ..models.models import EasyWeekEvent
 from ..perf import perf_log
 from ..settings import settings
@@ -175,8 +176,17 @@ async def easyweek_webhook(request: Request) -> dict[str, bool]:
         if content_type is not None:
             content_type = postgres_safe_text(content_type)[:128]
 
+        # Канонический booking UUID — ключ причинного порядка PR-4. Парсинг
+        # безопасный и НЕ влияет на приём доставки: при отсутствующем,
+        # нестроковом или синтаксически невалидном `uid` колонка остаётся NULL,
+        # строка сохраняется целиком как раньше, а ответ остаётся успешным.
+        # Никакой валидации location/семантики события здесь нет — это по-прежнему
+        # research-grade capture.
+        booking_uuid = canonical_booking_uuid(payload)
+
         # status получает значение "captured" из умолчания колонки модели.
         event = EasyWeekEvent(
+            booking_uuid=booking_uuid,
             event_hint=event_hint,
             auth_via=auth_via,
             payload_hash=payload_hash,

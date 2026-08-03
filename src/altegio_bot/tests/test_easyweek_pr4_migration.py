@@ -8,6 +8,7 @@ so a green build can never hide a migration that was silently never exercised.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -19,7 +20,10 @@ import pytest_asyncio
 from alembic.config import Config
 from alembic.script import ScriptDirectory
 from sqlalchemy import text
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.ext.asyncio import create_async_engine
+
+from altegio_bot.models.models import EasyWeekEvent
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 ALEMBIC_INI = _REPO_ROOT / "alembic.ini"
@@ -27,7 +31,7 @@ ALEMBIC_INI = _REPO_ROOT / "alembic.ini"
 PR4_REVISION = "d4e8a1c39f57"
 PR3_REVISION = "c1a7d3f905b2"
 
-PR4_COLUMNS = ("processed_at", "error_code", "processing_attempts", "next_retry_at")
+PR4_COLUMNS = ("booking_uuid", "processed_at", "error_code", "processing_attempts", "next_retry_at")
 PR4_INDEX = "ix_easyweek_events_claim"
 PR4_PENDING_INDEX = "ix_easyweek_events_pending_booking"
 
@@ -495,3 +499,161 @@ async def test_the_claim_query_runs_against_malformed_payloads(temp_db_url: str)
         """,
     )
     assert len(rows) == 5, "malformed payloads must stay claimable, not error or stall"
+
+
+# ===========================================================================
+# booking_uuid: the canonical causal-ordering key and its backfill
+# ===========================================================================
+
+
+async def _exec(db_url: str, sql: str, params: dict | list | None = None) -> None:
+    engine = create_async_engine(db_url)
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(text(sql), params or {})
+    finally:
+        await engine.dispose()
+
+
+def test_booking_uuid_is_declared_on_the_model() -> None:
+    column = EasyWeekEvent.__table__.c["booking_uuid"]
+    assert column.nullable is True, "a malformed or missing uid must stay NULL"
+    assert isinstance(column.type, postgresql.UUID), "the ordering key must be a real UUID column"
+
+
+def test_the_pending_index_keys_on_the_canonical_column_not_raw_json() -> None:
+    """Raw `payload ->> 'uid'` would split one booking across causal chains."""
+    statements = _migration_statements(PR4_REVISION)
+    assert '"booking_uuid", "received_at", "id"' in statements or (
+        "'booking_uuid', 'received_at', 'id'" in statements
+    ), "the pending-booking index must be keyed on booking_uuid"
+    # The backfill legitimately READS `payload ->> 'uid'` to canonicalise it;
+    # what must never happen is keying the INDEX on that raw text.
+    index_call = statements[statements.index("_PENDING_BOOKING_INDEX,") :]
+    assert "payload" not in index_call.split("postgresql_where")[0], "the index must not key on raw payload text"
+
+
+def test_the_backfill_does_not_use_an_unguarded_sql_cast() -> None:
+    """`(payload->>'uid')::uuid` aborts the whole migration on one bad row."""
+    statements = _migration_statements(PR4_REVISION)
+    assert "->> 'uid')::uuid" not in statements
+    assert "::uuid" not in statements.replace("CAST(:value AS uuid)", "")
+
+
+_BACKFILL_ROWS = (
+    # (payload uid, expected canonical value or None)
+    ("ac15372d-7422-4fc6-8fcb-b520bbffa669", "ac15372d-7422-4fc6-8fcb-b520bbffa669"),
+    ("AC15372D-7422-4FC6-8FCB-B520BBFFA669", "ac15372d-7422-4fc6-8fcb-b520bbffa669"),
+    ("  ac15372d-7422-4fc6-8fcb-b520bbffa669  ", "ac15372d-7422-4fc6-8fcb-b520bbffa669"),
+    ("{ac15372d-7422-4fc6-8fcb-b520bbffa669}", "ac15372d-7422-4fc6-8fcb-b520bbffa669"),
+    ("ac15372d74224fc68fcbb520bbffa669", "ac15372d-7422-4fc6-8fcb-b520bbffa669"),
+    ("not-a-uuid", None),
+    ("", None),
+)
+
+
+@pytest.mark.asyncio
+async def test_backfill_canonicalises_the_existing_backlog(temp_db_url: str) -> None:
+    """Rows captured BEFORE this revision must get the ordering key too.
+
+    Otherwise the whole pre-PR-4 backlog would have a NULL key and none of it
+    would be serialised per booking when processing is finally switched on.
+    """
+    # Bring the schema to the revision BEFORE PR-4 and seed a research backlog.
+    _alembic_ok("upgrade", PR3_REVISION, db_url=temp_db_url)
+
+    insert = (
+        "INSERT INTO easyweek_events (id, status, payload, query, headers, body_size_bytes, payload_hash) "
+        "VALUES (:id, 'captured', CAST(:payload AS jsonb), '{}', '{}', 0, :payload_hash)"
+    )
+    for index, (raw_uid, _expected) in enumerate(_BACKFILL_ROWS, start=1):
+        await _exec(
+            temp_db_url,
+            insert,
+            {
+                "id": index,
+                "payload": json.dumps({"uid": raw_uid, "id": 1000 + index}),
+                "payload_hash": f"hash-{index}",
+            },
+        )
+    # Shapes that carry no string uid at all must survive untouched.
+    await _exec(
+        temp_db_url,
+        insert,
+        {"id": 90, "payload": json.dumps({"id": 1}), "payload_hash": "hash-missing"},
+    )
+    await _exec(
+        temp_db_url,
+        insert,
+        {"id": 91, "payload": json.dumps({"uid": 12345}), "payload_hash": "hash-number"},
+    )
+    await _exec(
+        temp_db_url,
+        insert,
+        {"id": 92, "payload": json.dumps({"uid": ["x"]}), "payload_hash": "hash-list"},
+    )
+
+    before = await _fetch(
+        temp_db_url,
+        "SELECT id, status, payload_hash, payload FROM easyweek_events ORDER BY id",
+    )
+
+    # The migration must not abort on the malformed rows.
+    _alembic_ok("upgrade", PR4_REVISION, db_url=temp_db_url)
+
+    rows = dict(
+        (row[0], row[1])
+        for row in await _fetch(temp_db_url, "SELECT id, booking_uuid FROM easyweek_events ORDER BY id")
+    )
+    for index, (_raw_uid, expected) in enumerate(_BACKFILL_ROWS, start=1):
+        actual = rows[index]
+        assert (str(actual) if actual is not None else None) == expected, f"row {index} backfilled incorrectly"
+    for null_row in (90, 91, 92):
+        assert rows[null_row] is None
+
+    # Capture data is untouched by the backfill.
+    after = await _fetch(
+        temp_db_url,
+        "SELECT id, status, payload_hash, payload FROM easyweek_events ORDER BY id",
+    )
+    assert after == before, "the backfill changed status, payload_hash or payload"
+
+
+@pytest.mark.asyncio
+async def test_backfill_survives_a_downgrade_and_a_second_upgrade(temp_db_url: str) -> None:
+    _alembic_ok("upgrade", PR3_REVISION, db_url=temp_db_url)
+    await _exec(
+        temp_db_url,
+        "INSERT INTO easyweek_events (id, status, payload, query, headers, body_size_bytes) "
+        "VALUES (1, 'captured', CAST(:payload AS jsonb), '{}', '{}', 0)",
+        {"payload": json.dumps({"uid": "AC15372D-7422-4FC6-8FCB-B520BBFFA669"})},
+    )
+
+    _alembic_ok("upgrade", PR4_REVISION, db_url=temp_db_url)
+    assert "booking_uuid" in await _columns_of(temp_db_url, "easyweek_events")
+
+    _alembic_ok("downgrade", PR3_REVISION, db_url=temp_db_url)
+    assert "booking_uuid" not in await _columns_of(temp_db_url, "easyweek_events")
+    # The row itself is never deleted by a downgrade.
+    assert (await _fetch(temp_db_url, "SELECT count(*) FROM easyweek_events"))[0][0] == 1
+
+    _alembic_ok("upgrade", PR4_REVISION, db_url=temp_db_url)
+    value = (await _fetch(temp_db_url, "SELECT booking_uuid FROM easyweek_events WHERE id = 1"))[0][0]
+    assert str(value) == "ac15372d-7422-4fc6-8fcb-b520bbffa669", "the re-upgrade must backfill again"
+
+
+@pytest.mark.asyncio
+async def test_pending_index_is_partial_and_keyed_on_the_canonical_column(temp_db_url: str) -> None:
+    _alembic_ok("upgrade", PR4_REVISION, db_url=temp_db_url)
+    definition = (
+        await _fetch(
+            temp_db_url,
+            "SELECT indexdef FROM pg_indexes WHERE indexname = :name",
+            {"name": PR4_PENDING_INDEX},
+        )
+    )[0][0]
+    assert "booking_uuid" in definition
+    assert "payload" not in definition, "the index must not key on raw payload text"
+    assert "received_at" in definition and "id" in definition
+    normalised = definition.replace("(", "").replace(")", "").replace("::text", "")
+    assert "status = ANY" in normalised or "status IN" in normalised or "captured" in normalised

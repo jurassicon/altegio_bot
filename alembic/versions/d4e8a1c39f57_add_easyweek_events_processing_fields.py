@@ -26,7 +26,18 @@ per-event retry scheduling, нужные easyweek_inbox_worker:
     (next_retry_at IS NULL OR next_retry_at <= now()) ORDER BY received_at, id``;
   * ``ix_easyweek_events_pending_booking`` — коррелированный ``NOT EXISTS``,
     который сериализует доставки ОДНОГО booking UUID: partial по двум
-    нетерминальным статусам, ключ ``(payload ->> 'uid', received_at, id)``.
+    нетерминальным статусам, ключ ``(booking_uuid, received_at, id)``.
+
+Плюс сам ключ причинного порядка:
+
+  * ``booking_uuid`` (UUID, nullable) — канонический booking UUID доставки.
+    Заполняется на capture и backfill'ится для уже захваченного backlog тем же
+    парсером, что использует нормализатор. Сырой текст ``payload ->> 'uid'``
+    ключом быть не может: одна и та же UUID в lowercase, uppercase, в скобках,
+    без дефисов или с пробелами — разные строки, но одна booking, и claim не
+    увидел бы раннюю доставку предшественником поздней. Malformed/отсутствующий
+    ``uid`` оставляет NULL: такая строка никого не блокирует, не блокируется
+    сама и доходит до детерминированного отказа.
 
 Обычные Alembic-операции, БЕЗ ``IF NOT EXISTS`` / ``IF EXISTS``. Это осознанно:
 защитные варианты принимают объект с правильным ИМЕНЕМ, но неправильным типом
@@ -45,9 +56,11 @@ Create Date: 2026-08-02 20:10:00.000000
 
 """
 
+import uuid
 from typing import Sequence, Union
 
 import sqlalchemy as sa
+from sqlalchemy.dialects import postgresql
 
 from alembic import op
 
@@ -61,10 +74,67 @@ _TABLE = "easyweek_events"
 _CLAIM_INDEX = "ix_easyweek_events_claim"
 # Supports the correlated NOT EXISTS that serialises one booking UUID.
 _PENDING_BOOKING_INDEX = "ix_easyweek_events_pending_booking"
+# Backfill batch size: keeps one statement's parameter list bounded on a large
+# research-capture backlog.
+_BACKFILL_CHUNK = 500
+
+
+def _backfill_booking_uuid() -> None:
+    """Fill ``booking_uuid`` for the already-captured backlog.
+
+    Done in Python with the SAME parser the capture endpoint and the normalizer
+    use, so a backfilled row and a freshly captured one can never disagree about
+    a booking's identity. A SQL ``(payload ->> 'uid')::uuid`` was rejected on
+    purpose: PostgreSQL raises on the first malformed value, which would abort
+    the whole migration because of one bad research-capture row.
+
+    Only rows that actually carry a string ``uid`` are examined, and only rows
+    whose value parses are written. Malformed and missing ids stay NULL. Status,
+    payload, payload_hash and body_raw are never touched.
+    """
+    bind = op.get_bind()
+    if op.get_context().as_sql:
+        # Offline SQL generation cannot read rows. Say so instead of emitting a
+        # statement that looks like a completed backfill.
+        op.execute(
+            sa.text(
+                "-- WARNING: booking_uuid backfill SKIPPED: offline SQL generation "
+                "cannot read existing rows. Run this migration online."
+            )
+        )
+        return
+
+    rows = bind.execute(
+        sa.text(
+            f"SELECT id, payload ->> 'uid' AS raw_uid FROM {_TABLE} WHERE jsonb_typeof(payload -> 'uid') = 'string'"
+        )
+    ).all()
+
+    updates = []
+    for row in rows:
+        raw = row.raw_uid
+        if not isinstance(raw, str):
+            continue
+        try:
+            updates.append({"row_id": row.id, "value": str(uuid.UUID(raw.strip()))})
+        except (ValueError, AttributeError, TypeError):
+            # Malformed research-capture row: leave NULL, keep the raw capture.
+            continue
+
+    for chunk_start in range(0, len(updates), _BACKFILL_CHUNK):
+        bind.execute(
+            sa.text(f"UPDATE {_TABLE} SET booking_uuid = CAST(:value AS uuid) WHERE id = :row_id"),
+            updates[chunk_start : chunk_start + _BACKFILL_CHUNK],
+        )
 
 
 def upgrade() -> None:
     """Upgrade schema."""
+    op.add_column(
+        _TABLE,
+        sa.Column("booking_uuid", postgresql.UUID(as_uuid=True), nullable=True),
+    )
+    _backfill_booking_uuid()
     op.add_column(
         _TABLE,
         sa.Column("processed_at", sa.DateTime(timezone=True), nullable=True),
@@ -94,17 +164,20 @@ def upgrade() -> None:
         unique=False,
     )
     # The claim also has to answer "is there an EARLIER non-terminal delivery
-    # for this same booking?" — a correlated NOT EXISTS keyed on the booking
-    # UUID extracted from the JSONB payload, ordered by capture order. Partial
-    # on the two non-terminal statuses, because terminal rows never block.
+    # for this same booking?" — a correlated NOT EXISTS keyed on the CANONICAL
+    # booking UUID, ordered by capture order. Partial on the two non-terminal
+    # statuses, because terminal rows never block.
     #
-    # `payload ->> 'uid'` is NULL-safe for every JSONB shape (object without the
-    # key, array, string, number), so a malformed capture row can neither error
-    # the query nor act as a blocker.
+    # Keyed on the column, NOT on `payload ->> 'uid'`: the raw text differs
+    # between lowercase, uppercase, braced, dash-less and whitespace-padded
+    # spellings of ONE booking, so a raw-text key would let a later delivery
+    # overtake an earlier one that is still retrying. Rows whose id is malformed
+    # or missing hold NULL and are simply absent from this index, so they neither
+    # block nor group with anything.
     op.create_index(
         _PENDING_BOOKING_INDEX,
         _TABLE,
-        [sa.text("(payload ->> 'uid')"), "received_at", "id"],
+        ["booking_uuid", "received_at", "id"],
         unique=False,
         postgresql_where=sa.text("status IN ('captured', 'processing')"),
     )
@@ -118,3 +191,4 @@ def downgrade() -> None:
     op.drop_column(_TABLE, "processing_attempts")
     op.drop_column(_TABLE, "error_code")
     op.drop_column(_TABLE, "processed_at")
+    op.drop_column(_TABLE, "booking_uuid")

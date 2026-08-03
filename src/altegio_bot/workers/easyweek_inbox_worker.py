@@ -121,19 +121,42 @@ def processing_is_configured() -> bool:
 NON_TERMINAL_STATUSES = (STATUS_CAPTURED, STATUS_PROCESSING)
 
 
-def _booking_uid(column: Any) -> Any:
-    """The booking UUID as text, straight from the JSONB payload.
+def mark_processed(event: EasyWeekEvent) -> None:
+    """Move a row to its terminal SUCCESS state.
 
-    ``payload ->> 'uid'`` is NULL-safe for every JSONB shape — an object without
-    the key, an array, a bare string or number all yield NULL rather than an
-    error. So a malformed capture row can neither break the claim query nor act
-    as a blocker for well-formed bookings.
+    Every terminal transition goes through a helper so no branch can forget a
+    field. ``next_retry_at`` in particular: an event that failed transiently
+    carries a future retry timestamp, and if it later reaches a terminal state
+    through an EARLY return — booking-succeeded, an exact replay, a cancelled
+    no-op — that timestamp used to survive. The row then read as "waiting for
+    another attempt" to the runbook and to monitoring while actually being done,
+    which is exactly the kind of untrustworthy operator signal this worker is
+    supposed to avoid.
+
+    ``processing_attempts`` is deliberately NOT reset: it is audit history of how
+    many recoveries the row needed. It must never be read as "waiting" on its
+    own — that is what ``status`` and ``next_retry_at`` are for.
     """
-    return column["uid"].astext
+    event.status = STATUS_PROCESSED
+    event.processed_at = utcnow()
+    event.error_code = None
+    event.next_retry_at = None
+
+
+def mark_failed(event: EasyWeekEvent, code: str) -> None:
+    """Move a row to its terminal DETERMINISTIC-FAILURE state.
+
+    Same contract as :func:`mark_processed`; ``code`` is a stable safe code, never
+    ``str(exception)``.
+    """
+    event.status = STATUS_FAILED
+    event.processed_at = utcnow()
+    event.error_code = code
+    event.next_retry_at = None
 
 
 async def claim_next_event(session: AsyncSession) -> EasyWeekEvent | None:
-    """Claim the oldest eligible row, serialised per booking UUID.
+    """Claim the oldest eligible row, serialised per CANONICAL booking UUID.
 
     Eligibility has three parts:
 
@@ -149,9 +172,19 @@ async def claim_next_event(session: AsyncSession) -> EasyWeekEvent | None:
     the client link. ``already_applied`` cannot catch that — the two deliveries
     have different payload hashes.
 
+    The key is ``EasyWeekEvent.booking_uuid``, the canonical value written at
+    capture — NOT ``payload ->> 'uid'``. The raw text of one booking legitimately
+    varies (lowercase, uppercase, braced, dash-less, whitespace-padded), and the
+    normalizer collapses all of those to a single UUID. Keying on the raw text
+    would put two spellings of the SAME booking in different causal chains: the
+    later delivery would not see the earlier retrying one as its predecessor,
+    would be processed first, and the recovered earlier one would then overwrite
+    the newer times, service snapshot, price or client link. Two workers could
+    even run them concurrently.
+
     The guard is scoped to ONE booking: other UUIDs keep flowing, and rows whose
-    payload has no usable ``uid`` neither block nor are blocked (they still get
-    claimed, so they can reach their deterministic failure).
+    ``uid`` was missing or malformed hold NULL — they neither block nor are
+    blocked (they still get claimed, so they reach their deterministic failure).
 
     ``FOR UPDATE SKIP LOCKED`` is applied to the outer row only, so a row another
     worker is mid-flight on is skipped rather than waited on — while still being
@@ -162,7 +195,7 @@ async def claim_next_event(session: AsyncSession) -> EasyWeekEvent | None:
         select(predecessor.id)
         .where(predecessor.id != EasyWeekEvent.id)
         .where(predecessor.status.in_(NON_TERMINAL_STATUSES))
-        .where(_booking_uid(predecessor.payload) == _booking_uid(EasyWeekEvent.payload))
+        .where(predecessor.booking_uuid == EasyWeekEvent.booking_uuid)
         # Strictly EARLIER in capture order; ties break on id.
         .where(tuple_(predecessor.received_at, predecessor.id) < tuple_(EasyWeekEvent.received_at, EasyWeekEvent.id))
         .exists()
@@ -180,7 +213,7 @@ async def claim_next_event(session: AsyncSession) -> EasyWeekEvent | None:
         .where(
             or_(
                 # No usable booking identity: cannot be ordered, must not stall.
-                _booking_uid(EasyWeekEvent.payload).is_(None),
+                EasyWeekEvent.booking_uuid.is_(None),
                 ~earlier_pending,
             )
         )
@@ -220,8 +253,7 @@ async def already_applied(session: AsyncSession, event: EasyWeekEvent) -> bool:
         # Non-JSON bodies have no hash; nothing to compare. Lifecycle events
         # always carry one, so this only affects deliveries we reject anyway.
         return False
-    booking_uid = (event.payload or {}).get("uid")
-    if not isinstance(booking_uid, str) or not booking_uid:
+    if event.booking_uuid is None:
         return False
 
     stmt = (
@@ -230,7 +262,8 @@ async def already_applied(session: AsyncSession, event: EasyWeekEvent) -> bool:
         .where(EasyWeekEvent.status == STATUS_PROCESSED)
         .where(EasyWeekEvent.event_hint == event.event_hint)
         .where(EasyWeekEvent.payload_hash == event.payload_hash)
-        .where(EasyWeekEvent.payload["uid"].astext == booking_uid)
+        # Canonical identity, matching the claim key.
+        .where(EasyWeekEvent.booking_uuid == event.booking_uuid)
         .limit(1)
     )
     return (await session.execute(stmt)).scalars().first() is not None
@@ -429,18 +462,18 @@ def _service_title(booking: NormalizedBooking) -> str | None:
     ``service_name``. Only a field the delivery never mentioned is "unchanged",
     and the caller checks that before calling this.
     """
-    if booking.carries("services_description") and booking.services_description:
+    if booking.carries("services_description"):
         return booking.services_description
-    if booking.carries("service_name") and booking.service_name:
+    if booking.carries("service_name"):
         return booking.service_name
     return None
 
 
 def _service_amount(booking: NormalizedBooking) -> int | None:
     """Service count under the same contract: a carried value wins, empty clears."""
-    if booking.carries("services_count") and booking.services_count is not None:
+    if booking.carries("services_count"):
         return booking.services_count
-    if booking.carries("service_quantity") and booking.service_quantity is not None:
+    if booking.carries("service_quantity"):
         return booking.service_quantity
     return None
 
@@ -462,19 +495,27 @@ async def sync_record_service(session: AsyncSession, record: Record, booking: No
       * ``amount``      <- services_count, else quantity;
       * ``cost_to_pay`` <- the same value as ``Record.total_cost``.
 
-    Presence semantics, identical to every other patched field:
+    Presence semantics, identical to every other patched field, and applied
+    PRESENCE-FIRST — the fallback is chosen by which key the delivery carried,
+    never by whether its value happens to be truthy:
       * field ABSENT                     -> the known value is kept;
       * field present with a value       -> the snapshot is updated;
       * field present but empty
-        (``""`` / ``null``)              -> the value is CLEARED. The
-        description -> name fallback does not fire in that case, so an
-        explicitly cleared set description can never leave a stale title behind.
+        (``""`` / ``null`` / ``0``)      -> the value is CLEARED, and the
+        whole-set field still WINS. ``{"services_description": "",
+        "service_name": "Manicure"}`` clears the title; it must not fall back to
+        the singular name, because the delivery authoritatively said the set
+        description is now empty. Same for ``services_count`` over ``quantity``.
 
-    The price is synchronised even when the delivery omits ``service_id``, so a
-    price-only edit can never leave a stale ``cost_to_pay`` next to a fresh
-    ``Record.total_cost``. A delivery mentioning no service or price field at
-    all leaves the whole snapshot untouched: the payload carries one flat
-    service, not a list, so silence means "unchanged", never "no services".
+    **Price invariant:** ``Record.total_cost`` and ``RecordService.cost_to_pay``
+    are the same booking-level snapshot and must never diverge. So the price is
+    synchronised when the delivery carries one, AND a service row created
+    because ``service_id`` changed inherits the record's already-proven total
+    when the delivery carries no price.
+
+    A delivery mentioning no service or price field at all leaves the whole
+    snapshot untouched: the payload carries one flat service, not a list, so
+    silence means "unchanged", never "no services".
     """
     touches_service = any(
         booking.carries(field)
@@ -498,6 +539,18 @@ async def sync_record_service(session: AsyncSession, record: Record, booking: No
         target = next((row for row in existing if row.service_id == booking.service_id), None)
         if target is None:
             target = RecordService(record_id=record.id, service_id=booking.service_id)
+            # Seed the new row with the price the RECORD already proves. The
+            # price is a booking-level total — the payload sends one
+            # `booking_price_int` for the whole booking, and it is stored in
+            # both `Record.total_cost` and this snapshot — so a delivery that
+            # only changes `service_id` has not changed the amount owed.
+            #
+            # Without this seed, a service-id-only edit left `cost_to_pay` NULL
+            # next to a `Record.total_cost` of 35.00, breaking the invariant
+            # PR-5 renders from: it reads the service row and would print 0.00
+            # for a booking whose price is known. When the delivery DOES carry a
+            # price, the assignment below overwrites this immediately.
+            target.cost_to_pay = record.total_cost
             session.add(target)
     else:
         # No service identity in this delivery. Update the snapshot we already
@@ -656,9 +709,7 @@ async def process_claimed_event(session: AsyncSession, event: EasyWeekEvent) -> 
     if booking is None:
         # booking-succeeded: terminal, no Client/Record/Job side effects. It
         # still passed truncation, payload and location isolation above.
-        event.status = STATUS_PROCESSED
-        event.processed_at = utcnow()
-        event.error_code = None
+        mark_processed(event)
         logger.info("easyweek event=%s hint=%s ignored (no side effects)", event_id, event_hint)
         return
 
@@ -666,9 +717,7 @@ async def process_claimed_event(session: AsyncSession, event: EasyWeekEvent) -> 
     # byte-identical body, so without this an old `booking-created` replayed
     # after a cancel would un-delete the booking and restore its old times.
     if await already_applied(session, event):
-        event.status = STATUS_PROCESSED
-        event.processed_at = utcnow()
-        event.error_code = None
+        mark_processed(event)
         logger.info(
             "easyweek event=%s hint=%s booking_uuid=%s replay; no domain writes",
             event_id,
@@ -691,11 +740,7 @@ async def process_claimed_event(session: AsyncSession, event: EasyWeekEvent) -> 
             booking.booking_uuid,
         )
 
-    event.status = STATUS_PROCESSED
-    event.processed_at = utcnow()
-    event.error_code = None
-    # A recovered event must not keep a future retry timestamp on a terminal row.
-    event.next_retry_at = None
+    mark_processed(event)
     # Safe metadata only: ids and the action. No phone, e-mail, name or payload.
     logger.info(
         "easyweek event=%s hint=%s action=%s booking_uuid=%s processed",
@@ -801,9 +846,7 @@ async def process_one() -> bool:
                         .scalars()
                         .one()
                     )
-                    event.status = STATUS_FAILED
-                    event.processed_at = utcnow()
-                    event.error_code = exc.code
+                    mark_failed(event, exc.code)
                     logger.warning("easyweek event=%s failed code=%s", event_id, exc.code)
                     return True
                 except Exception:

@@ -257,6 +257,54 @@ Capture продолжает работать, накопление событи
 - не применяет Altegio-парсер дат, Europe/Belgrade и фильтр услуг;
 - не трогает Altegio-строки, jobs и dedupe-ключи.
 
+### 3a. Snapshot услуги и стоимости
+
+`Record.total_cost` и `RecordService.cost_to_pay` — это **один и тот же**
+booking-level снимок: payload присылает одну сумму `booking_price_int` на всю
+запись. Они обязаны совпадать всегда, потому что PR-5 рендерит шаблон из
+service-строки, и расхождение означало бы «0.00» в сообщении по записи с
+известной стоимостью.
+
+Отсюда правила при смене `service_id`:
+
+- пришёл новый `service_id` **без** `booking_price_int` → старая `RecordService`
+  удаляется, новая создаётся и **наследует уже доказанный `Record.total_cost`**;
+- пришёл новый `service_id` **с** `booking_price_int` → обе величины получают
+  новое значение;
+- пришёл явный сброс цены (`booking_price_int: null`) → обе величины очищаются
+  одновременно;
+- если известной стоимости не было — новая строка остаётся с `NULL`.
+
+`title` и `amount` при смене услуги **не переносятся** автоматически: другая
+service identity означает другую услугу, и если доставка их не подтвердила, они
+следуют обычной presence-семантике ниже.
+
+Проверка инварианта (ожидается **0 строк**):
+
+```bash
+docker compose -p altegio_bot exec -T postgres sh -lc 'psql -tAX -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT r.id FROM records r JOIN record_services rs ON rs.record_id = r.id WHERE r.provider = '"'"'easyweek'"'"' AND r.total_cost IS DISTINCT FROM rs.cost_to_pay"'
+```
+
+### 3b. Authoritative clear: приоритет решается ПРИСУТСТВИЕМ поля
+
+Для каждой группы полей выбор ветки определяется тем, **какой ключ пришёл**, а
+не тем, «истинно» ли его значение:
+
+| Группа | Приоритет | Правило |
+|---|---|---|
+| title | `services_description`, затем `service_name` | `services_description` — поле про ВЕСЬ набор услуг; если оно пришло, оно авторитетно **даже пустым** и fallback на singular `service_name` НЕ срабатывает |
+| amount | `services_count`, затем `quantity` | то же: пришедший `services_count` авторитетен, включая `null` и `0` |
+
+Следствия:
+
+- `{"services_description": "", "service_name": "Manicure"}` → `title = NULL`
+  (набор описан как пустой; подставлять имя одной услуги нельзя — для
+  multi-service booking это было бы прямой ложью);
+- `{"services_count": null, "quantity": 1}` → `amount = NULL`;
+- `{"services_count": 0, "quantity": 1}` → `amount = 0`;
+- singular-поле используется **только** когда whole-set поле отсутствует;
+- оба поля отсутствуют → прежнее значение сохраняется.
+
 ---
 
 ## 4. Статусы и безопасные коды ошибок
@@ -318,18 +366,38 @@ Per-event retry сам по себе ломал бы причинный поря
 у доставок разные `payload_hash`.
 
 Поэтому claim берёт старейшую готовую строку, **для которой не существует более
-ранней нетерминальной строки с тем же `payload->>'uid'`**. Блокирующими
-считаются `captured` (включая ожидание `next_retry_at`) и `processing`;
-`processed` и `failed` не блокируют.
+ранней нетерминальной строки с тем же `easyweek_events.booking_uuid`**.
+Блокирующими считаются `captured` (включая ожидание `next_retry_at`) и
+`processing`; `processed` и `failed` не блокируют.
 
-Сериализация действует **только внутри одной booking** — другие UUID идут
-параллельно. Строки без пригодного `uid` не блокируют никого и сами не
-блокируются: они доходят до своего детерминированного отказа.
+**Ключ порядка — колонка `booking_uuid`, а НЕ сырой `payload->>'uid'`.** Одна и
+та же UUID приходит текстом в разных формах: lowercase, uppercase, в фигурных
+скобках, без дефисов, с пробелами по краям, с префиксом `urn:uuid:`.
+Нормализатор сводит их все к одному `uuid.UUID`, а вот сырой текст остаётся
+разным. Если ключом был бы текст, поздняя доставка не увидела бы раннюю (ещё
+ретраящуюся) как предшественника, обогнала бы её, и восстановленная ранняя
+легла бы сверху — откатив время, service snapshot, стоимость или связь с
+клиентом. Возможна была бы и параллельная обработка двумя воркерами.
+
+Колонка заполняется на capture тем же парсером, что использует нормализатор, а
+для уже захваченного backlog — backfill'ом в миграции `d4e8a1c39f57`.
+
+Строки с отсутствующим или синтаксически невалидным `uid` имеют
+`booking_uuid IS NULL`: они **не блокируют никого и сами не блокируются**, и
+доходят до своего детерминированного отказа (`missing_booking_uuid` /
+`invalid_booking_uuid`). Сериализация действует **только внутри одной
+booking** — другие UUID идут параллельно.
 
 Найти booking, который держит очередь:
 
 ```bash
-docker compose -p altegio_bot exec -T postgres sh -lc 'psql -tAX -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT payload->>'"'"'uid'"'"' AS booking, min(received_at) AS oldest, count(*) AS pending, max(processing_attempts) AS attempts, min(next_retry_at) AS next_try FROM easyweek_events WHERE status IN ('"'"'captured'"'"','"'"'processing'"'"') GROUP BY 1 ORDER BY oldest LIMIT 20"'
+docker compose -p altegio_bot exec -T postgres sh -lc 'psql -tAX -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT booking_uuid, min(received_at) AS oldest, count(*) AS pending, max(processing_attempts) AS attempts, min(next_retry_at) AS next_try FROM easyweek_events WHERE status IN ('"'"'captured'"'"','"'"'processing'"'"') GROUP BY 1 ORDER BY oldest LIMIT 20"'
+```
+
+Строки без пригодного идентификатора (они не участвуют в сериализации):
+
+```bash
+docker compose -p altegio_bot exec -T postgres sh -lc 'psql -tAX -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT status, error_code, count(*) FROM easyweek_events WHERE booking_uuid IS NULL GROUP BY 1,2 ORDER BY 1,2"'
 ```
 
 Много `pending` у одной booking при растущем `attempts` означает, что её первое
@@ -347,6 +415,34 @@ docker compose -p altegio_bot exec -T postgres sh -lc 'psql -tAX -U "$POSTGRES_U
 Реальное расписание задержек (секунды): 5, 10, 20, 40, 80, 160, 300, 300, …
 
 Оператор видит «застрявшее» событие по `processing_attempts` и `next_retry_at`.
+
+**Терминальная строка никогда не ждёт.** Любой переход в `processed` или
+`failed` — обычная обработка, `booking-succeeded`, точный replay, no-op по уже
+отменённой booking, детерминированный отказ — проходит через общие хелперы
+`mark_processed()` / `mark_failed()`, которые всегда снимают `next_retry_at`.
+Без этого восстановившееся событие оставалось бы с будущим таймстампом ретрая и
+выглядело бы для мониторинга «ожидающим», хотя работа уже завершена.
+
+`processing_attempts` при этом **сохраняется** — это история восстановлений, а
+не признак ожидания. Признак ожидания — только пара `status='captured'` +
+`next_retry_at IS NOT NULL`.
+
+Инварианты:
+
+| Состояние | `processed_at` | `error_code` | `next_retry_at` |
+|---|---|---|---|
+| `processed` | NOT NULL | NULL | **NULL** |
+| `failed` (детерминированный) | NOT NULL | безопасный код | **NULL** |
+| `captured` после транзиентной ошибки | NULL | NULL | NOT NULL |
+| `processing` | — | — | не виден после commit |
+
+Проверка, что недопустимых «терминальных, но ждущих» строк нет:
+
+```bash
+docker compose -p altegio_bot exec -T postgres sh -lc 'psql -tAX -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT id, status, error_code, next_retry_at FROM easyweek_events WHERE status IN ('"'"'processed'"'"','"'"'failed'"'"') AND next_retry_at IS NOT NULL"'
+```
+
+Ожидается **0 строк**.
 
 В логе — только `processing_error` и имя класса исключения; ни текста ошибки,
 ни SQL-параметров, ни traceback.

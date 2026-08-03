@@ -8,7 +8,7 @@ the guarantee that none of it disturbs the Altegio path.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -18,7 +18,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 import altegio_bot.db as app_db
-from altegio_bot.easyweek_normalizer import NormalizationError
+from altegio_bot.easyweek_normalizer import NormalizationError, canonical_booking_uuid
 from altegio_bot.models.models import Client, EasyWeekEvent, MessageJob, Record, RecordService
 from altegio_bot.settings import settings
 from altegio_bot.tests.easyweek_fixtures import (
@@ -75,6 +75,10 @@ async def _capture(
         payload_hash=payload_hash,
         payload=payload,
         body_truncated=truncated,
+        # Exactly what the capture endpoint stores: the canonical booking UUID,
+        # or NULL when the id is missing/malformed. The claim orders on this
+        # column, so a fixture that skipped it would not be testing production.
+        booking_uuid=canonical_booking_uuid(payload),
     )
     session.add(event)
     await session.flush()
@@ -2066,15 +2070,23 @@ async def test_an_explicitly_cleared_description_clears_the_title(bound_session_
     assert title is None, "an explicitly cleared description left a stale title"
 
 
-async def test_a_cleared_description_falls_back_to_a_carried_name(bound_session_local) -> None:
-    """Clearing the SET description while naming one service is not a clear."""
+@pytest.mark.parametrize("cleared", ["", None])
+async def test_a_cleared_set_description_wins_over_a_carried_name(bound_session_local, cleared) -> None:
+    """The whole-set field is authoritative even when it is explicitly empty.
+
+    ``services_description`` describes ALL services; ``service_name`` names one
+    of them. A delivery that sends both has said "the set description is now
+    empty" — falling back to the singular name would resurrect a title the
+    delivery did not confirm, and for a multi-service booking it would be
+    actively wrong. Presence decides which field wins, not truthiness.
+    """
     async with bound_session_local() as session:
         async with session.begin():
             await _capture(session, booking_created(), payload_hash="h1")
     await _run_until_idle()
 
     event = booking_updated()
-    event["services_description"] = ""
+    event["services_description"] = cleared
     event["service_name"] = "Single Service"
     async with bound_session_local() as session:
         async with session.begin():
@@ -2082,7 +2094,7 @@ async def test_a_cleared_description_falls_back_to_a_carried_name(bound_session_
     await _run_until_idle()
 
     _t, _s, title, _a, _c = await _snapshot_row(bound_session_local)
-    assert title == "Single Service"
+    assert title is None
 
 
 @pytest.mark.parametrize("cleared", [None, 0])
@@ -2146,3 +2158,559 @@ async def test_absent_service_fields_still_keep_the_snapshot(bound_session_local
     await _run_until_idle()
 
     assert await _snapshot_row(bound_session_local) == before
+
+
+# ===========================================================================
+# Review fix 1 — causal ordering keys on the CANONICAL booking UUID
+# ===========================================================================
+#
+# The normalizer collapses every textual spelling of one UUID to a single value.
+# Ordering therefore has to key on that canonical value: on the raw
+# `payload ->> 'uid'` text, an EARLIER delivery still retrying would not be seen
+# as the predecessor of a LATER delivery written in a different case or format,
+# so the later one would be applied first and the recovered earlier one would
+# then overwrite the newer times, service snapshot, price or client link.
+
+_SAME_UUID_SPELLINGS = {
+    "uppercase": TEST_BOOKING_UUID.upper(),
+    "braced": "{" + TEST_BOOKING_UUID + "}",
+    "compact": TEST_BOOKING_UUID.replace("-", ""),
+    "padded": f"  {TEST_BOOKING_UUID}  ",
+    "urn": f"urn:uuid:{TEST_BOOKING_UUID}",
+}
+
+
+@pytest.mark.parametrize("spelling", sorted(_SAME_UUID_SPELLINGS))
+async def test_alternative_uuid_spellings_share_one_causal_chain(bound_session_local, spelling) -> None:
+    """A later delivery must wait behind an earlier one however the id is written."""
+    later = booking_updated()
+    later["uid"] = _SAME_UUID_SPELLINGS[spelling]
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, booking_created(), payload_hash="h-early")
+            await _capture(session, later, event_hint="booking-updated", payload_hash="h-late")
+
+    # The earlier row is claimed and held, exactly like a worker mid-flight.
+    async with bound_session_local() as first:
+        async with first.begin():
+            claimed = await worker.claim_next_event(first)
+            assert claimed is not None
+            assert claimed.payload_hash == "h-early"
+
+            async with bound_session_local() as second:
+                async with second.begin():
+                    concurrent = await worker.claim_next_event(second)
+                    assert concurrent is None, (
+                        f"the {spelling} spelling of the same booking was claimed out of order "
+                        f"({concurrent.payload_hash if concurrent else None})"
+                    )
+
+
+@pytest.mark.parametrize("spelling", sorted(_SAME_UUID_SPELLINGS))
+async def test_a_retrying_earlier_event_blocks_every_spelling(bound_session_local, spelling) -> None:
+    """The real regression: transient retry must not let a later delivery pass."""
+    later = booking_updated()
+    later["uid"] = _SAME_UUID_SPELLINGS[spelling]
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            early_id = await _capture(session, booking_created(), payload_hash="h-early")
+            await _capture(session, later, event_hint="booking-updated", payload_hash="h-late")
+
+    # The earlier row failed transiently and is waiting for its retry window.
+    async with bound_session_local() as session:
+        async with session.begin():
+            row = (await session.execute(select(EasyWeekEvent).where(EasyWeekEvent.id == early_id))).scalars().one()
+            row.next_retry_at = worker.utcnow() + timedelta(minutes=5)
+            row.processing_attempts = 1
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            claimed = await worker.claim_next_event(session)
+            assert claimed is None, "a later delivery overtook an earlier retrying one"
+
+
+async def test_recovered_earlier_event_is_applied_before_the_later_one(bound_session_local) -> None:
+    """After recovery the two deliveries apply in CAPTURE order, not retry order."""
+    later = booking_updated()
+    later["uid"] = TEST_BOOKING_UUID.upper()
+    later["service_id"] = 777
+    later["services_description"] = "Later description"
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            early_id = await _capture(session, booking_created(), payload_hash="h-early")
+            await _capture(session, later, event_hint="booking-updated", payload_hash="h-late")
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            row = (await session.execute(select(EasyWeekEvent).where(EasyWeekEvent.id == early_id))).scalars().one()
+            row.next_retry_at = worker.utcnow() - timedelta(seconds=1)  # window elapsed
+            row.processing_attempts = 2
+
+    await _run_until_idle()
+
+    async with bound_session_local() as session:
+        rows = (await session.execute(select(EasyWeekEvent).order_by(EasyWeekEvent.id))).scalars().all()
+        assert [r.status for r in rows] == ["processed", "processed"]
+        # Terminal rows never keep a retry timestamp.
+        assert all(r.next_retry_at is None for r in rows)
+        # The attempt history of the recovered row is preserved.
+        assert rows[0].processing_attempts == 2
+
+    # Final state reflects the LAST delivery.
+    _total, service_id, title, _amount, _cost = await _snapshot_row(bound_session_local)
+    assert service_id == 777
+    assert title == "Later description"
+
+
+async def test_a_malformed_uid_neither_blocks_nor_is_blocked(bound_session_local) -> None:
+    """A row with no canonical UUID must not stall the backlog."""
+    broken = booking_created()
+    broken["uid"] = "not-a-uuid"
+    other = booking_created()
+    other["uid"] = "bbbbbbbb-1111-4222-8333-444444444444"
+    other["id"] = TEST_BOOKING_ID + 900
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            broken_id = await _capture(session, broken, payload_hash="h-broken")
+            await _capture(session, other, payload_hash="h-other")
+
+    async with bound_session_local() as session:
+        row = (await session.execute(select(EasyWeekEvent).where(EasyWeekEvent.id == broken_id))).scalars().one()
+        assert row.booking_uuid is None, "a malformed uid must not produce a canonical key"
+
+    await _run_until_idle()
+
+    async with bound_session_local() as session:
+        rows = {r.payload_hash: r for r in (await session.execute(select(EasyWeekEvent))).scalars().all()}
+        # The malformed one reached its deterministic failure ...
+        assert rows["h-broken"].status == "failed"
+        assert rows["h-broken"].error_code == NormalizationError.INVALID_BOOKING_UUID
+        # ... and the unrelated booking was processed regardless.
+        assert rows["h-other"].status == "processed"
+        assert all(r.next_retry_at is None for r in rows.values())
+
+
+async def test_different_bookings_still_claim_in_parallel(bound_session_local) -> None:
+    """The serialisation is per booking, never global."""
+    other = booking_created()
+    other["uid"] = "cccccccc-1111-4222-8333-444444444444"
+    other["id"] = TEST_BOOKING_ID + 901
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, booking_created(), payload_hash="h-x")
+            await _capture(session, other, payload_hash="h-y")
+
+    async with bound_session_local() as first:
+        async with first.begin():
+            claimed = await worker.claim_next_event(first)
+            assert claimed is not None and claimed.payload_hash == "h-x"
+            async with bound_session_local() as second:
+                async with second.begin():
+                    concurrent = await worker.claim_next_event(second)
+                    assert concurrent is not None and concurrent.payload_hash == "h-y"
+
+
+# ===========================================================================
+# Review fix 2 — a service-id-only update keeps the price consistent
+# ===========================================================================
+
+
+async def _assert_price_invariant(bound_session_local) -> None:
+    """Record.total_cost and RecordService.cost_to_pay are ONE snapshot."""
+    async with bound_session_local() as session:
+        rows = (
+            await session.execute(
+                select(Record.total_cost, RecordService.cost_to_pay)
+                .join(RecordService, RecordService.record_id == Record.id)
+                .where(Record.provider == "easyweek")
+            )
+        ).all()
+    for total_cost, cost_to_pay in rows:
+        assert total_cost == cost_to_pay, f"price snapshot diverged: record={total_cost} service={cost_to_pay}"
+
+
+async def test_service_id_change_without_a_price_keeps_the_known_total(bound_session_local) -> None:
+    """The regression: a new service row must not start with an unknown price.
+
+    PR-5 renders from the service row, so a NULL there next to a known
+    Record.total_cost would print 0.00 for a booking whose price is proven.
+    """
+    created = booking_created()
+    created["service_id"] = 111
+    created["booking_price_int"] = 3500
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, created, payload_hash="h1")
+    await _run_until_idle()
+
+    updated = booking_updated()
+    updated["service_id"] = 222
+    updated.pop("booking_price_int", None)
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, updated, event_hint="booking-updated", payload_hash="h2")
+    await _run_until_idle()
+
+    total, service_id, _title, _amount, cost = await _snapshot_row(bound_session_local)
+    assert service_id == 222, "the new service identity was not adopted"
+    assert total == Decimal("35.00")
+    assert cost == Decimal("35.00"), "the proven booking total was not carried to the new service row"
+    await _assert_price_invariant(bound_session_local)
+
+    # Exactly one snapshot row: the old service was removed, not duplicated.
+    async with bound_session_local() as session:
+        services = (await session.execute(select(RecordService))).scalars().all()
+        assert len(services) == 1
+
+
+async def test_service_id_change_with_a_new_price_updates_both(bound_session_local) -> None:
+    created = booking_created()
+    created["service_id"] = 111
+    created["booking_price_int"] = 3500
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, created, payload_hash="h1")
+    await _run_until_idle()
+
+    updated = booking_updated()
+    updated["service_id"] = 222
+    updated["booking_price_int"] = 5000
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, updated, event_hint="booking-updated", payload_hash="h2")
+    await _run_until_idle()
+
+    total, service_id, _title, _amount, cost = await _snapshot_row(bound_session_local)
+    assert service_id == 222
+    assert total == Decimal("50.00")
+    assert cost == Decimal("50.00")
+    await _assert_price_invariant(bound_session_local)
+
+
+async def test_service_id_change_with_an_explicit_price_clear_clears_both(bound_session_local) -> None:
+    created = booking_created()
+    created["service_id"] = 111
+    created["booking_price_int"] = 3500
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, created, payload_hash="h1")
+    await _run_until_idle()
+
+    updated = booking_updated()
+    updated["service_id"] = 222
+    updated["booking_price_int"] = None
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, updated, event_hint="booking-updated", payload_hash="h2")
+    await _run_until_idle()
+
+    total, service_id, _title, _amount, cost = await _snapshot_row(bound_session_local)
+    assert service_id == 222
+    assert total is None
+    assert cost is None
+    await _assert_price_invariant(bound_session_local)
+
+
+async def test_service_id_change_without_any_known_total_stays_null(bound_session_local) -> None:
+    created = booking_created()
+    created["service_id"] = 111
+    created.pop("booking_price_int", None)
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, created, payload_hash="h1")
+    await _run_until_idle()
+
+    updated = booking_updated()
+    updated["service_id"] = 222
+    updated.pop("booking_price_int", None)
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, updated, event_hint="booking-updated", payload_hash="h2")
+    await _run_until_idle()
+
+    total, _service_id, _title, _amount, cost = await _snapshot_row(bound_session_local)
+    assert total is None and cost is None
+    await _assert_price_invariant(bound_session_local)
+
+
+async def test_a_service_id_only_resend_does_not_duplicate_the_snapshot(bound_session_local) -> None:
+    created = booking_created()
+    created["service_id"] = 111
+    created["booking_price_int"] = 3500
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, created, payload_hash="h1")
+    await _run_until_idle()
+
+    updated = booking_updated()
+    updated["service_id"] = 222
+    updated.pop("booking_price_int", None)
+    for payload_hash in ("h2", "h3"):
+        async with bound_session_local() as session:
+            async with session.begin():
+                await _capture(session, updated, event_hint="booking-updated", payload_hash=payload_hash)
+        await _run_until_idle()
+
+    async with bound_session_local() as session:
+        services = (await session.execute(select(RecordService))).scalars().all()
+        assert len(services) == 1
+    await _assert_price_invariant(bound_session_local)
+
+
+# ===========================================================================
+# Review fixes 3 and 4 — presence decides the fallback, not truthiness
+# ===========================================================================
+
+
+async def test_a_present_set_description_wins_even_when_a_name_is_carried(bound_session_local) -> None:
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, booking_created(), payload_hash="h1")
+    await _run_until_idle()
+
+    event = booking_updated()
+    event["services_description"] = "Set description"
+    event["service_name"] = "Single"
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, event, event_hint="booking-updated", payload_hash="h2")
+    await _run_until_idle()
+
+    _t, _s, title, _a, _c = await _snapshot_row(bound_session_local)
+    assert title == "Set description"
+
+
+async def test_a_singular_name_is_used_only_when_the_set_field_is_absent(bound_session_local) -> None:
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, booking_created(), payload_hash="h1")
+    await _run_until_idle()
+
+    event = booking_updated()
+    event.pop("services_description", None)
+    event["service_name"] = "Single"
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, event, event_hint="booking-updated", payload_hash="h2")
+    await _run_until_idle()
+
+    _t, _s, title, _a, _c = await _snapshot_row(bound_session_local)
+    assert title == "Single"
+
+
+async def test_both_title_fields_absent_preserves_the_known_title(bound_session_local) -> None:
+    created = booking_created()
+    created["services_description"] = "Original set"
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, created, payload_hash="h1")
+    await _run_until_idle()
+
+    event = booking_updated()
+    event.pop("services_description", None)
+    event.pop("service_name", None)
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, event, event_hint="booking-updated", payload_hash="h2")
+    await _run_until_idle()
+
+    _t, _s, title, _a, _c = await _snapshot_row(bound_session_local)
+    assert title == "Original set"
+
+
+@pytest.mark.parametrize("cleared", [None, 0])
+async def test_a_cleared_set_count_wins_over_a_carried_quantity(bound_session_local, cleared) -> None:
+    """`services_count` is the whole-set field; an explicit clear is authoritative."""
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, booking_created(), payload_hash="h1")
+    await _run_until_idle()
+
+    event = booking_updated()
+    event["services_count"] = cleared
+    event["quantity"] = 1
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, event, event_hint="booking-updated", payload_hash="h2")
+    await _run_until_idle()
+
+    _t, _s, _title, amount, _c = await _snapshot_row(bound_session_local)
+    assert amount == cleared
+
+
+async def test_a_present_set_count_wins_over_quantity(bound_session_local) -> None:
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, booking_created(), payload_hash="h1")
+    await _run_until_idle()
+
+    event = booking_updated()
+    event["services_count"] = 2
+    event["quantity"] = 1
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, event, event_hint="booking-updated", payload_hash="h2")
+    await _run_until_idle()
+
+    _t, _s, _title, amount, _c = await _snapshot_row(bound_session_local)
+    assert amount == 2
+
+
+async def test_quantity_is_used_only_when_the_set_count_is_absent(bound_session_local) -> None:
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, booking_created(), payload_hash="h1")
+    await _run_until_idle()
+
+    event = booking_updated()
+    event.pop("services_count", None)
+    event["quantity"] = 1
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, event, event_hint="booking-updated", payload_hash="h2")
+    await _run_until_idle()
+
+    _t, _s, _title, amount, _c = await _snapshot_row(bound_session_local)
+    assert amount == 1
+
+
+async def test_both_count_fields_absent_preserves_the_known_amount(bound_session_local) -> None:
+    created = booking_created()
+    created["services_count"] = 3
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, created, payload_hash="h1")
+    await _run_until_idle()
+
+    event = booking_updated()
+    event.pop("services_count", None)
+    event.pop("quantity", None)
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, event, event_hint="booking-updated", payload_hash="h2")
+    await _run_until_idle()
+
+    _t, _s, _title, amount, _c = await _snapshot_row(bound_session_local)
+    assert amount == 3
+
+
+# ===========================================================================
+# Review fix 5 — every terminal transition clears next_retry_at
+# ===========================================================================
+
+
+async def _mark_transiently_failed(bound_session_local, event_id: int) -> None:
+    """Put a row in the state a transient failure leaves behind."""
+    async with bound_session_local() as session:
+        async with session.begin():
+            row = (await session.execute(select(EasyWeekEvent).where(EasyWeekEvent.id == event_id))).scalars().one()
+            row.processing_attempts = 3
+            row.next_retry_at = worker.utcnow() - timedelta(seconds=1)
+
+
+async def _terminal_row(bound_session_local, event_id: int) -> EasyWeekEvent:
+    async with bound_session_local() as session:
+        return (await session.execute(select(EasyWeekEvent).where(EasyWeekEvent.id == event_id))).scalars().one()
+
+
+async def test_recovered_normal_processing_clears_the_retry_timestamp(bound_session_local) -> None:
+    async with bound_session_local() as session:
+        async with session.begin():
+            event_id = await _capture(session, booking_created(), payload_hash="h1")
+    await _mark_transiently_failed(bound_session_local, event_id)
+    await _run_until_idle()
+
+    row = await _terminal_row(bound_session_local, event_id)
+    assert row.status == "processed"
+    assert row.processed_at is not None
+    assert row.error_code is None
+    assert row.next_retry_at is None
+    assert row.processing_attempts == 3, "attempt history is audit data and is kept"
+
+
+async def test_recovered_booking_succeeded_clears_the_retry_timestamp(bound_session_local) -> None:
+    """An early-return terminal branch used to keep a future retry timestamp."""
+    async with bound_session_local() as session:
+        async with session.begin():
+            event_id = await _capture(
+                session, booking_created(), event_hint="booking-succeeded", payload_hash="h-succeeded"
+            )
+    await _mark_transiently_failed(bound_session_local, event_id)
+    await _run_until_idle()
+
+    row = await _terminal_row(bound_session_local, event_id)
+    assert row.status == "processed"
+    assert row.processed_at is not None
+    assert row.error_code is None
+    assert row.next_retry_at is None
+
+
+async def test_recovered_exact_replay_clears_the_retry_timestamp(bound_session_local) -> None:
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, booking_created(), payload_hash="h-same")
+    await _run_until_idle()
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            replay_id = await _capture(session, booking_created(), payload_hash="h-same")
+    await _mark_transiently_failed(bound_session_local, replay_id)
+    await _run_until_idle()
+
+    row = await _terminal_row(bound_session_local, replay_id)
+    assert row.status == "processed"
+    assert row.next_retry_at is None
+    assert row.error_code is None
+
+
+async def test_recovered_deterministic_failure_clears_the_retry_timestamp(bound_session_local) -> None:
+    broken = booking_created()
+    broken["uid"] = "not-a-uuid"
+    async with bound_session_local() as session:
+        async with session.begin():
+            event_id = await _capture(session, broken, payload_hash="h-broken")
+    await _mark_transiently_failed(bound_session_local, event_id)
+    await _run_until_idle()
+
+    row = await _terminal_row(bound_session_local, event_id)
+    assert row.status == "failed"
+    assert row.processed_at is not None
+    assert row.error_code == NormalizationError.INVALID_BOOKING_UUID
+    assert row.next_retry_at is None
+
+
+async def test_no_terminal_row_ever_looks_like_it_is_waiting(bound_session_local) -> None:
+    """The runbook query for "terminal but waiting" must return nothing.
+
+    SELECT ... WHERE status IN ('processed','failed') AND next_retry_at IS NOT NULL
+    """
+    broken = booking_created()
+    broken["uid"] = "not-a-uuid"
+    succeeded = booking_created()
+    succeeded["uid"] = "dddddddd-1111-4222-8333-444444444444"
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            ids = [
+                await _capture(session, booking_created(), payload_hash="h1"),
+                await _capture(session, broken, payload_hash="h2"),
+                await _capture(session, succeeded, event_hint="booking-succeeded", payload_hash="h3"),
+            ]
+    for event_id in ids:
+        await _mark_transiently_failed(bound_session_local, event_id)
+    await _run_until_idle()
+
+    async with bound_session_local() as session:
+        waiting = (
+            await session.execute(
+                select(EasyWeekEvent.id)
+                .where(EasyWeekEvent.status.in_(("processed", "failed")))
+                .where(EasyWeekEvent.next_retry_at.is_not(None))
+            )
+        ).all()
+    assert waiting == [], "a terminal row still carries next_retry_at"
