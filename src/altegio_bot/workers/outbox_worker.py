@@ -26,7 +26,8 @@ from altegio_bot.campaigns.runner import (
 from altegio_bot.db import SessionLocal
 from altegio_bot.delivery_retry_identity import (
     DELIVERY_RETRY_DEDUPE_PREFIX,
-    is_delivery_retry_dedupe_key,
+    DELIVERY_RETRY_JOB_TYPES,
+    claims_delivery_retry,
     resolve_retry_identity,
     resolve_retry_reference,
 )
@@ -127,13 +128,7 @@ MARKETING_TRANSIENT_CAP_JOB_TYPES = (
     FOLLOWUP_JOB_TYPE,
 )
 
-DELIVERY_DEADLINE_JOB_TYPES = (
-    "record_created",
-    "record_updated",
-    "record_canceled",
-    "reminder_24h",
-    "reminder_2h",
-)
+DELIVERY_DEADLINE_JOB_TYPES = DELIVERY_RETRY_JOB_TYPES
 
 _DELIVERED_READ_STATUSES = ("delivered", "read")
 _DEADLINE_ALREADY_PASSED = datetime(1970, 1, 1, tzinfo=timezone.utc)
@@ -458,9 +453,13 @@ async def _requeue_stale_processing_jobs(session: AsyncSession) -> int:
         # A stale legacy retry is not trusted merely because it once reached
         # `processing`. Re-prove it before making it sendable again; otherwise
         # recovery would undo the presend safety boundary on every worker boot.
-        if _is_delivery_retry_job(job):
-            record = await _load_record(session, job)
-            guard_reason = await _delivery_retry_presend_guard(session, job, record)
+        if claims_delivery_retry(job):
+            reference = resolve_retry_reference(job)
+            if reference.reference is None:
+                guard_reason = f"Canceled: {reference.error or 'delivery_retry_reference_unproven'}"
+            else:
+                record = await _load_record(session, job)
+                guard_reason = await _delivery_retry_presend_guard(session, job, record)
             if guard_reason is not None:
                 job.status = "canceled"
                 job.locked_at = None
@@ -1127,20 +1126,6 @@ _transient_error_reason = transient_error_reason
 
 def _decrement_send_attempt(job: MessageJob) -> None:
     job.attempts = max(0, int(getattr(job, "attempts", 0) or 0) - 1)
-
-
-def _is_delivery_retry_job(job: MessageJob) -> bool:
-    """True when the job CLAIMS to be a delivery retry, by payload or by namespace.
-
-    The dedupe-key namespace counts on its own. A row parked on
-    ``delivery_retry:<id>:<n>`` with a payload that does not describe a chain
-    used to slip past this check entirely and be processed as an ordinary job —
-    which is precisely the row that has no proven provenance and must not send.
-    """
-    payload = getattr(job, "payload", None) or {}
-    if payload.get("kind") == "delivery_failed_retry" and payload.get("delivery_retry_of_outbox_id") is not None:
-        return True
-    return is_delivery_retry_dedupe_key(getattr(job, "dedupe_key", None))
 
 
 def _original_run_at(job: MessageJob) -> datetime | None:
@@ -2093,6 +2078,19 @@ async def _run_job_logic(
     # Altegio path, exactly as before.
     job_provider = normalize_provider(getattr(job, "provider", None), default=PROVIDER_ALTEGIO)
 
+    # Retry syntax/reference/type is a routing boundary. It runs before campaign
+    # and promo dispatch so a malformed or legacy row cannot be interpreted as
+    # a different local command, much less reach an API or Meta. Full
+    # identity/domain/deadline proof remains immediately before the send path.
+    if claims_delivery_retry(job):
+        reference = resolve_retry_reference(job)
+        if reference.reference is None:
+            job.status = "canceled"
+            job.locked_at = None
+            job.updated_at = utcnow()
+            job.last_error = f"Canceled: {reference.error or 'delivery_retry_reference_unproven'}"
+            return None
+
     # Phase-1 allowlist, checked before ANYTHING else acts on this job.
     #
     # It has to be here rather than deeper down: the campaign branch below
@@ -2189,7 +2187,7 @@ async def _run_job_logic(
         job.last_error = f"Retry deadline exceeded for {job.job_type}"
         return
 
-    if _is_delivery_retry_job(job):
+    if claims_delivery_retry(job):
         guard_reason = await _delivery_retry_presend_guard(session, job, record)
         if guard_reason is not None:
             job.status = "canceled"
@@ -3433,7 +3431,7 @@ async def _run_job_logic(
         if err is not None:
             _ms_ctx.update(send_error=err)
 
-    if _is_delivery_retry_job(job):
+    if claims_delivery_retry(job):
         retry_payload = getattr(job, "payload", None) or {}
         send_meta["delivery_retry"] = True
         send_meta["delivery_retry_of_outbox_id"] = retry_payload.get("delivery_retry_of_outbox_id")

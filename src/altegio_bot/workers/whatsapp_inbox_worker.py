@@ -18,8 +18,13 @@ from altegio_bot.chatwoot_client import ChatwootClient
 from altegio_bot.db import SessionLocal
 from altegio_bot.delivery_retry_identity import (
     DELIVERY_RETRY_DEDUPE_PREFIX,
+    DELIVERY_RETRY_JOB_TYPES,
+    DELIVERY_RETRY_MAX_ATTEMPTS,
     RetryIdentity,
+    StatusRetryChain,
+    parse_retry_attempt,
     resolve_retry_identity,
+    resolve_status_retry_chain,
 )
 from altegio_bot.models.models import (
     CampaignRecipient,
@@ -64,14 +69,6 @@ MARKETING_JOB_TYPES = (
     "comeback_3d",
 )
 
-DELIVERY_RETRY_JOB_TYPES = (
-    "record_created",
-    "record_updated",
-    "record_canceled",
-    "reminder_24h",
-    "reminder_2h",
-)
-
 # Re-exported for existing importers; defined in `delivery_retry_identity`
 # alongside the identity rules that give the namespace its meaning.
 _DELIVERY_RETRY_DEDUPE_PREFIX = DELIVERY_RETRY_DEDUPE_PREFIX
@@ -81,7 +78,6 @@ _DELIVERY_RETRY_DELAYS_SECONDS = (
     2 * 60 * 60,
     6 * 60 * 60,
 )
-_DELIVERY_RETRY_MAX_ATTEMPTS = 4
 _DELIVERY_STATUS_ORDER = {"sent": 0, "delivered": 1, "read": 2}
 _SUCCESSFUL_DELIVERY_STATUSES = ("delivered", "read")
 
@@ -801,6 +797,10 @@ def _sanitize_delivery_detail(value: Any, limit: int = 300) -> str | None:
     return text
 
 
+def _copy_outbox_meta(outbox: OutboxMessage) -> dict[str, Any]:
+    return dict(outbox.meta) if isinstance(outbox.meta, dict) else {}
+
+
 def _mark_outbox_delivery_failed(outbox: OutboxMessage, status: dict[str, Any], reason: str) -> None:
     code = status.get("error_code")
     title = status.get("error_title")
@@ -813,7 +813,7 @@ def _mark_outbox_delivery_failed(outbox: OutboxMessage, status: dict[str, Any], 
     )
     outbox.error = f"WA delivery failed {bits}".strip()
 
-    meta = dict(outbox.meta or {})
+    meta = _copy_outbox_meta(outbox)
     meta["delivery_failed"] = True
     meta["delivery_failed_at"] = utcnow().isoformat()
     meta["delivery_failed_code"] = code
@@ -825,23 +825,12 @@ def _mark_outbox_delivery_failed(outbox: OutboxMessage, status: dict[str, Any], 
 
 
 def _mark_stale_failed_after_success(outbox: OutboxMessage, status: dict[str, Any]) -> None:
-    meta = dict(outbox.meta or {})
+    meta = _copy_outbox_meta(outbox)
     meta["stale_failed_after_success"] = True
     meta["stale_failed_code"] = status.get("error_code")
     meta["stale_failed_title"] = status.get("error_title")
     meta["stale_failed_at"] = utcnow().isoformat()
     outbox.meta = meta
-
-
-def _delivery_retry_chain_original_outbox_id(outbox: OutboxMessage) -> int:
-    meta = outbox.meta or {}
-    raw = meta.get("delivery_retry_of_outbox_id")
-    if raw is not None:
-        try:
-            return int(raw)
-        except (TypeError, ValueError):
-            pass
-    return int(outbox.id)
 
 
 async def _find_outbox_by_provider_message_id(
@@ -857,13 +846,25 @@ async def _find_outbox_by_provider_message_id(
     return (await session.execute(stmt)).scalars().first()
 
 
-async def _should_ignore_failed_after_success(session: AsyncSession, outbox: OutboxMessage) -> bool:
+async def _should_ignore_failed_after_success(
+    session: AsyncSession,
+    outbox: OutboxMessage,
+    chain: StatusRetryChain,
+) -> bool:
     if outbox.status in _SUCCESSFUL_DELIVERY_STATUSES:
         return True
 
     from altegio_bot.workers.outbox_worker import _delivery_retry_chain_has_success
 
-    return await _delivery_retry_chain_has_success(session, _delivery_retry_chain_original_outbox_id(outbox))
+    return await _delivery_retry_chain_has_success(session, chain.original_outbox_id)
+
+
+def _record_status_retry_chain_refusal(outbox: OutboxMessage, reason: str) -> None:
+    meta = _copy_outbox_meta(outbox)
+    meta["delivery_retry_chain_refused"] = True
+    meta["delivery_retry_chain_refusal_reason"] = reason
+    meta["delivery_retry_chain_refused_at"] = utcnow().isoformat()
+    outbox.meta = meta
 
 
 async def _cancel_queued_delivery_retry_jobs_for_chain(
@@ -884,7 +885,7 @@ async def _cancel_queued_delivery_retry_jobs_for_chain(
 
 def _record_retry_skip(outbox: OutboxMessage, reason: str, original_outbox_id: int) -> None:
     """Audit the refusal on the outbox row. Invariant names only, never values."""
-    skip_meta = dict(outbox.meta or {})
+    skip_meta = _copy_outbox_meta(outbox)
     skip_meta["delivery_retry_skipped"] = True
     skip_meta["delivery_retry_skip_reason"] = reason
     skip_meta["delivery_retry_original_outbox_id"] = original_outbox_id
@@ -1062,18 +1063,48 @@ async def _handle_delivery_statuses(
             )
             continue
 
+        chain_resolution = None
+        if kind == "failed" or kind in _SUCCESSFUL_DELIVERY_STATUSES:
+            chain_resolution = await resolve_status_retry_chain(session, outbox)
+
         if kind == "failed":
-            if await _should_ignore_failed_after_success(session, outbox):
+            if chain_resolution is None or chain_resolution.chain is None:
+                _record_status_retry_chain_refusal(
+                    outbox,
+                    (chain_resolution.error if chain_resolution is not None else None)
+                    or "retry_chain_identity_unproven",
+                )
+                if outbox.status in _SUCCESSFUL_DELIVERY_STATUSES:
+                    _mark_stale_failed_after_success(outbox, status)
+                    continue
+                _mark_outbox_delivery_failed(outbox, status, "whatsapp_delivery_failed")
+                updated_outbox_ids.append(int(outbox.id))
+                outbox_id_to_new_status[int(outbox.id)] = "failed"
+                continue
+
+            if await _should_ignore_failed_after_success(session, outbox, chain_resolution.chain):
                 _mark_stale_failed_after_success(outbox, status)
                 continue
             _mark_outbox_delivery_failed(outbox, status, "whatsapp_delivery_failed")
             updated_outbox_ids.append(int(outbox.id))
             outbox_id_to_new_status[int(outbox.id)] = "failed"
-            await _handle_failed_delivery_status(session, event, status, outbox=outbox)
+            await _handle_failed_delivery_status(
+                session,
+                event,
+                status,
+                outbox=outbox,
+                chain=chain_resolution.chain,
+            )
             continue
 
         if kind not in {"sent", "delivered", "read"}:
             continue
+
+        if kind in _SUCCESSFUL_DELIVERY_STATUSES and (chain_resolution is None or chain_resolution.chain is None):
+            _record_status_retry_chain_refusal(
+                outbox,
+                (chain_resolution.error if chain_resolution is not None else None) or "retry_chain_identity_unproven",
+            )
 
         current_rank = _WA_STATUS_RANK.get(outbox.status, 0)
         if outbox.status == "failed" and kind in _SUCCESSFUL_DELIVERY_STATUSES:
@@ -1084,21 +1115,23 @@ async def _handle_delivery_statuses(
 
         if outbox.status == "failed":
             outbox.error = None
-            recovered_meta = dict(outbox.meta or {})
+            recovered_meta = _copy_outbox_meta(outbox)
             recovered_meta["delivery_failed"] = False
             recovered_meta["delivery_recovered_to"] = kind
             recovered_meta["delivery_recovered_at"] = utcnow().isoformat()
             outbox.meta = recovered_meta
 
         outbox.status = kind
-        meta = dict(outbox.meta or {})
+        meta = _copy_outbox_meta(outbox)
         meta[f"wa_status_{kind}"] = {"timestamp": status.get("timestamp")}
         outbox.meta = meta
         updated_outbox_ids.append(int(outbox.id))
         outbox_id_to_new_status[int(outbox.id)] = kind
 
         if kind in _SUCCESSFUL_DELIVERY_STATUSES:
-            original_outbox_id = _delivery_retry_chain_original_outbox_id(outbox)
+            if chain_resolution is None or chain_resolution.chain is None:
+                continue
+            original_outbox_id = chain_resolution.chain.original_outbox_id
             canceled = await _cancel_queued_delivery_retry_jobs_for_chain(
                 session,
                 original_outbox_id,
@@ -1146,6 +1179,7 @@ async def _handle_failed_delivery_status(
     status: dict[str, Any],
     *,
     outbox: OutboxMessage | None,
+    chain: StatusRetryChain,
 ) -> None:
     provider_message_id = str(status["provider_message_id"])
     if outbox is None:
@@ -1159,16 +1193,8 @@ async def _handle_failed_delivery_status(
     if not _is_retryable_delivery_failure(status):
         return
 
-    meta = outbox.meta or {}
-    original_outbox_id = int(outbox.id)
-    attempt_number = 1
-    if meta.get("delivery_retry_of_outbox_id") is not None:
-        try:
-            original_outbox_id = int(meta["delivery_retry_of_outbox_id"])
-            attempt_number = int(meta.get("delivery_retry_attempt") or 0) + 1
-        except (TypeError, ValueError):
-            original_outbox_id = int(outbox.id)
-            attempt_number = 1
+    original_outbox_id = chain.original_outbox_id
+    attempt_number = (chain.attempt_number or 0) + 1
 
     # Resolve the chain's authoritative identity FIRST — before the occupied
     # dedupe key is treated as proof of anything.
@@ -1178,36 +1204,32 @@ async def _handle_failed_delivery_status(
     # pointing at EasyWeek domain rows was simply left queued, and the outbox
     # worker would go on to send it with an Altegio template from the Altegio
     # number. "The key is taken" is not "the retry already exists".
-    anchor_outbox = outbox
-    if original_outbox_id != int(outbox.id):
-        original = await session.get(OutboxMessage, original_outbox_id)
-        if original is None:
-            _record_retry_skip(outbox, "original_outbox_missing", original_outbox_id)
-            return
-        anchor_outbox = original
-
-    original_job: MessageJob | None = None
-    if anchor_outbox.job_id is not None:
-        original_job = await session.get(MessageJob, anchor_outbox.job_id)
-
-    resolution = await resolve_retry_identity(
-        session,
-        anchor_outbox=anchor_outbox,
-        original_job=original_job,
-        job_type=job_type,
-    )
-    if resolution.identity is None:
-        _record_retry_skip(outbox, resolution.error or "identity_unproven", original_outbox_id)
-        logger.warning(
-            "Delivery retry refused: reason=%s original_outbox_id=%s outbox_id=%s",
-            resolution.error,
-            original_outbox_id,
-            int(outbox.id),
+    anchor_outbox = chain.anchor_outbox
+    original_job = chain.original_job
+    identity = chain.identity
+    if identity is None:
+        resolution = await resolve_retry_identity(
+            session,
+            anchor_outbox=anchor_outbox,
+            original_job=original_job,
+            job_type=job_type,
         )
-        return
+        if resolution.identity is None:
+            _record_retry_skip(outbox, resolution.error or "identity_unproven", original_outbox_id)
+            logger.warning(
+                "Delivery retry refused: reason=%s original_outbox_id=%s outbox_id=%s",
+                resolution.error,
+                original_outbox_id,
+                int(outbox.id),
+            )
+            return
+        identity = resolution.identity
+    assert original_job is not None  # guaranteed by resolve_retry_identity / chain resolver
 
-    identity = resolution.identity
-    assert original_job is not None  # guaranteed by resolve_retry_identity
+    if attempt_number > DELIVERY_RETRY_MAX_ATTEMPTS:
+        if event is not None:
+            event.error = f"Delivery retry limit reached for outbox_id={original_outbox_id}"
+        return
 
     dedupe_key = f"{DELIVERY_RETRY_DEDUPE_PREFIX}{original_outbox_id}:{attempt_number}"
     occupant = await _select_retry_job_for_update(session, dedupe_key)
@@ -1238,12 +1260,11 @@ async def _handle_failed_delivery_status(
     for job_id, existing_key in rows:
         existing_job_ids.append(int(job_id))
         suffix = str(existing_key).rsplit(":", 1)[-1]
-        try:
-            existing_attempts.add(int(suffix))
-        except ValueError:
-            continue
+        parsed_attempt = parse_retry_attempt(suffix)
+        if parsed_attempt is not None:
+            existing_attempts.add(parsed_attempt)
 
-    if attempt_number > _DELIVERY_RETRY_MAX_ATTEMPTS or len(existing_attempts) >= _DELIVERY_RETRY_MAX_ATTEMPTS:
+    if len(existing_attempts) >= DELIVERY_RETRY_MAX_ATTEMPTS:
         if event is not None:
             event.error = f"Delivery retry limit reached for outbox_id={original_outbox_id}"
         return

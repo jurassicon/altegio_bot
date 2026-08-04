@@ -3049,6 +3049,18 @@ async def test_partial_job_without_a_client_sends_and_retries_as_easyweek(
     assert retry_rows[0].language == "de"
     assert retry_rows[0].client_id == client.id
 
+    # 10. The callback on the retry outbox proves its chain from the retry job,
+    # not from audit metadata, and creates the next bounded attempt.
+    await _deliver_failed_status(
+        db,
+        retry_rows[0].provider_message_id,
+        dedupe=f"wa:partial-retry-{job_type}-{explicit_null}",
+    )
+    retries = await _retry_jobs_for(db, rows[0].id)
+    assert len(retries) == 2
+    assert retries[1].provider == PROVIDER_EASYWEEK
+    assert retries[1].payload["delivery_retry_attempt"] == 2
+
 
 async def test_a_partial_job_still_passes_the_resolver_directly(
     db: AsyncSession,
@@ -3287,6 +3299,54 @@ async def test_stale_recovery_requeues_a_proven_easyweek_retry(
     assert retry.status == "queued"
     assert retry.locked_at is None
     assert retry.last_error == "Recovered: stale processing job"
+
+
+async def test_stale_recovery_rejects_oversized_attempt_and_next_callback_continues(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    session_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    job = await _seed_easyweek_happy_path(db)
+    await _run_job(db, job)
+    original = (await _outbox_rows(db, job))[0]
+    malformed = MessageJob(
+        provider=PROVIDER_EASYWEEK,
+        company_id=job.company_id,
+        record_id=job.record_id,
+        client_id=job.client_id,
+        job_type=job.job_type,
+        run_at=datetime.now(timezone.utc),
+        status="processing",
+        dedupe_key=f"delivery_retry:{original.id}:5",
+        payload={
+            "kind": "delivery_failed_retry",
+            "delivery_retry_of_outbox_id": original.id,
+            "delivery_retry_attempt": 5,
+            "delivery_retry_original_outbox_id": original.id,
+        },
+    )
+    db.add(malformed)
+    await db.flush()
+    malformed.locked_at = datetime.now(timezone.utc) - timedelta(hours=1)
+    await db.commit()
+
+    async with session_maker() as recovery_session:
+        async with recovery_session.begin():
+            recovered = await ow._requeue_stale_processing_jobs(recovery_session)
+
+    await db.refresh(malformed)
+    assert recovered == 0
+    assert malformed.status == "canceled"
+    assert malformed.locked_at is None
+    assert "delivery_retry_dedupe_attempt_invalid" in (malformed.last_error or "")
+
+    await _deliver_failed_status(db, original.provider_message_id, dedupe="wa:after-malformed-stale")
+    normal = (
+        await db.execute(select(MessageJob).where(MessageJob.dedupe_key == f"delivery_retry:{original.id}:1"))
+    ).scalar_one_or_none()
+    assert normal is not None
+    assert normal.status == "queued"
+    assert normal.provider == PROVIDER_EASYWEEK
 
 
 async def test_a_well_formed_retry_payload_with_the_wrong_provider_never_sends(
