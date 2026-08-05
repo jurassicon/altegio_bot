@@ -1228,6 +1228,19 @@ async def _delivery_retry_chain_has_success(
     session: AsyncSession,
     original_outbox_id: int,
 ) -> bool:
+    """True when the canonical chain rooted at *original_outbox_id* has landed.
+
+    Membership is PROVEN, not inferred from the dedupe prefix. Sharing a key
+    prefix says only that a row was named after this root; it says nothing about
+    who wrote it or which chain its payload points at. A corrupted or
+    hand-written row with a delivered outbox could otherwise declare the whole
+    chain successful — suppressing a legitimate failed-callback and cancelling
+    correct queued retries.
+
+    So a candidate counts only when its own payload/namespace prove a reference
+    to THIS root and its identity matches the identity proven from the root
+    itself, via the same resolver every other retry decision uses.
+    """
     orig_stmt = (
         select(OutboxMessage.id)
         .where(OutboxMessage.id == original_outbox_id)
@@ -1237,15 +1250,46 @@ async def _delivery_retry_chain_has_success(
     if (await session.execute(orig_stmt)).scalar_one_or_none() is not None:
         return True
 
+    anchor_outbox = await session.get(OutboxMessage, original_outbox_id)
+    if anchor_outbox is None:
+        return False
+    anchor_job: MessageJob | None = None
+    if anchor_outbox.job_id is not None:
+        anchor_job = await session.get(MessageJob, anchor_outbox.job_id)
+    resolution = await resolve_retry_identity(
+        session,
+        anchor_outbox=anchor_outbox,
+        original_job=anchor_job,
+        job_type=anchor_outbox.template_code,
+    )
+    if resolution.identity is None:
+        # The root is not a provable chain root, so nothing can be a proven
+        # member of it. Fail closed: the presend guard refuses this job anyway,
+        # and claiming success here would cancel siblings on unproven grounds.
+        return False
+    identity = resolution.identity
+
     prefix = f"{DELIVERY_RETRY_DEDUPE_PREFIX}{original_outbox_id}:"
-    job_ids_stmt = select(MessageJob.id).where(MessageJob.dedupe_key.like(prefix + "%"))
-    job_ids = [int(x) for x in (await session.execute(job_ids_stmt)).scalars().all()]
-    if not job_ids:
+    candidates_stmt = select(MessageJob).where(MessageJob.dedupe_key.like(prefix + "%"))
+    candidates = list((await session.execute(candidates_stmt)).scalars().all())
+
+    member_ids: list[int] = []
+    for candidate in candidates:
+        reference = resolve_retry_reference(candidate)
+        if reference.reference is None:
+            continue
+        if reference.reference.original_outbox_id != original_outbox_id:
+            continue
+        if identity.mismatch_field(candidate) is not None:
+            continue
+        member_ids.append(int(candidate.id))
+
+    if not member_ids:
         return False
 
     retry_stmt = (
         select(OutboxMessage.id)
-        .where(OutboxMessage.job_id.in_(job_ids))
+        .where(OutboxMessage.job_id.in_(member_ids))
         .where(OutboxMessage.status.in_(_DELIVERED_READ_STATUSES))
         .limit(1)
     )

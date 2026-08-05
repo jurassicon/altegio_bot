@@ -197,6 +197,17 @@ def parse_retry_attempt(value: object) -> int | None:
     return parse_bounded_positive_int(value, maximum=DELIVERY_RETRY_MAX_ATTEMPTS)
 
 
+def _outbox_meta_claims_retry(outbox: OutboxMessage) -> bool:
+    meta = outbox.meta
+    if not isinstance(meta, dict):
+        return False
+    return (
+        meta.get("delivery_retry") is True
+        or meta.get("delivery_retry_of_outbox_id") is not None
+        or meta.get("delivery_retry_attempt") is not None
+    )
+
+
 def resolve_retry_reference(job: MessageJob) -> RetryReferenceResolution:
     """Prove that retry payload and reserved dedupe namespace describe one row.
 
@@ -271,12 +282,31 @@ async def resolve_retry_identity(
     from the Record, the Client, the sender or the Meta template name — every
     one of which can look Altegio-shaped for an EasyWeek booking.
 
+    *anchor_outbox* must be the CANONICAL ROOT of the chain — the original send,
+    not one of its retries. Accepting a retry row as an anchor would nest one
+    chain inside another: the four-attempt budget would restart for every branch,
+    and a later delivered/read would cancel by the nested root's dedupe prefix
+    while the real root's queued retries sailed on. There is exactly one root per
+    chain and its id is the one every attempt key is built from.
+
     Every refusal reason names an invariant and never a value: a mismatching row
     may belong to another tenant, and these strings reach ``job.last_error``,
     the outbox audit metadata and the log.
     """
+    if anchor_outbox.job_id is None:
+        return _refuse("anchor_outbox_job_id_missing")
     if original_job is None:
-        return _refuse("original_job_missing")
+        return _refuse("anchor_outbox_job_missing")
+    if original_job.id != anchor_outbox.job_id:
+        # The caller handed us a job that did not produce this outbox row. The
+        # provider would then be read off an unrelated row.
+        return _refuse("anchor_outbox_job_mismatch")
+    if claims_delivery_retry(original_job):
+        return _refuse("anchor_job_is_retry")
+    if _outbox_meta_claims_retry(anchor_outbox):
+        # The job does not claim the boundary but the audit trail does. One of
+        # the two is wrong, and neither can be trusted to say which.
+        return _refuse("anchor_outbox_meta_claims_retry")
 
     provider = normalize_provider(getattr(original_job, "provider", None), default="")
     if not provider:
@@ -364,17 +394,6 @@ async def resolve_retry_identity(
             client_id=effective_client_id,
             job_type=job_type,
         )
-    )
-
-
-def _outbox_meta_claims_retry(outbox: OutboxMessage) -> bool:
-    meta = outbox.meta
-    if not isinstance(meta, dict):
-        return False
-    return (
-        meta.get("delivery_retry") is True
-        or meta.get("delivery_retry_of_outbox_id") is not None
-        or meta.get("delivery_retry_attempt") is not None
     )
 
 

@@ -22,8 +22,8 @@ from altegio_bot.delivery_retry_identity import (
     DELIVERY_RETRY_MAX_ATTEMPTS,
     RetryIdentity,
     StatusRetryChain,
-    parse_retry_attempt,
     resolve_retry_identity,
+    resolve_retry_reference,
     resolve_status_retry_chain,
 )
 from altegio_bot.models.models import (
@@ -892,6 +892,15 @@ def _record_retry_skip(outbox: OutboxMessage, reason: str, original_outbox_id: i
     outbox.meta = skip_meta
 
 
+def _record_retry_slot_reclaimed(outbox: OutboxMessage, reason: str, original_outbox_id: int) -> None:
+    """Audit a reclaimed slot. Distinct from a skip: the retry DID proceed."""
+    meta = _copy_outbox_meta(outbox)
+    meta["delivery_retry_slot_reclaimed"] = True
+    meta["delivery_retry_slot_reclaim_reason"] = reason
+    meta["delivery_retry_original_outbox_id"] = original_outbox_id
+    outbox.meta = meta
+
+
 # A job in one of these states can still be claimed and sent by the outbox
 # worker. `processing` is included because stale recovery requeues it.
 _SENDABLE_JOB_STATUSES = ("queued", "processing")
@@ -908,22 +917,93 @@ async def _select_retry_job_for_update(session: AsyncSession, dedupe_key: str) -
     return (await session.execute(stmt)).scalars().first()
 
 
-def _neutralize_conflicting_retry(job: MessageJob, mismatch_field: str) -> bool:
+def _neutralize_conflicting_retry(job: MessageJob, reason: str) -> bool:
     """Take a mismatching retry out of the sendable set. Returns True if changed.
 
-    Deliberately NOT a repair: the row's provenance is unproven, so rewriting its
-    provider, record or client to the proven ones would be inventing a job. It is
-    also not deleted — the dedupe key is globally unique and the row is evidence.
-    A terminal historical row is left exactly as it is; only a still-sendable one
-    is moved out of reach.
+    Deliberately NOT a repair: this is the branch for a row that already produced
+    an ``OutboxMessage``, so a message went out under this key and rewriting the
+    row would falsify the record of what was sent. It is also not deleted — the
+    dedupe key is globally unique and the row is the evidence. A terminal
+    historical row is left exactly as it is; only a still-sendable one is moved
+    out of reach.
     """
     if job.status not in _SENDABLE_JOB_STATUSES:
         return False
     job.status = "canceled"
     job.locked_at = None
     job.updated_at = utcnow()
-    job.last_error = f"Canceled: delivery retry {mismatch_field} does not match the proven chain identity"
+    job.last_error = f"Canceled: delivery retry {reason} does not match the proven chain identity"
     return True
+
+
+def _occupant_claim_error(
+    occupant: MessageJob,
+    *,
+    identity: RetryIdentity,
+    original_outbox_id: int,
+    attempt_number: int,
+) -> str | None:
+    """Return ``None`` only when *occupant* IS this exact retry, else a reason.
+
+    The single definition of "the same retry", used by the initial locked read
+    and by the lost-race re-read alike. Matching identity fields are not enough:
+    a row can carry the right provider, company, record, client and job type
+    while its payload points at a different chain or a different attempt. Such a
+    row is a squatter on a globally unique key, and treating it as idempotent
+    used to make the real retry unreachable forever — silently.
+    """
+    reference = resolve_retry_reference(occupant)
+    if reference.reference is None:
+        return reference.error or "delivery_retry_reference_unproven"
+    if reference.reference.original_outbox_id != original_outbox_id:
+        return "delivery_retry_outbox_reference_mismatch"
+    if reference.reference.attempt_number != attempt_number:
+        return "delivery_retry_attempt_mismatch"
+    mismatch = identity.mismatch_field(occupant)
+    if mismatch is not None:
+        return f"identity_{mismatch}_mismatch"
+    if occupant.job_type not in DELIVERY_RETRY_JOB_TYPES:
+        return "delivery_retry_job_type_not_enabled"
+    return None
+
+
+async def _job_has_outbox(session: AsyncSession, job_id: int) -> bool:
+    """True when the job already produced a send attempt of its own."""
+    stmt = select(OutboxMessage.id).where(OutboxMessage.job_id == job_id).limit(1)
+    return (await session.execute(stmt)).scalar_one_or_none() is not None
+
+
+def _reclaim_retry_slot(job: MessageJob, *, identity: RetryIdentity, fields: dict[str, Any]) -> None:
+    """Rewrite an unsent squatter into the canonical retry for this slot.
+
+    Not "inventing a job": the dedupe key ``delivery_retry:<root>:<attempt>``
+    belongs to this chain by construction, and every value written here is the
+    identity just proven from the chain's own root. The row contributed nothing
+    — it has no ``OutboxMessage``, so no message went out under it — so the only
+    thing being taken is a name that was never its to hold.
+
+    The alternative, cancelling it, leaves the key occupied and burns that
+    attempt number permanently: the next callback computes the same key, finds
+    the same terminal squatter, and the legitimate redelivery is lost for good.
+    That is the failure this whole change exists to remove, so a slot with no
+    side effect is reclaimed rather than abandoned.
+    """
+    for field, value in identity.as_job_fields().items():
+        setattr(job, field, value)
+    for field, value in fields.items():
+        setattr(job, field, value)
+    job.locked_at = None
+    job.updated_at = utcnow()
+    job.last_error = "Reclaimed: delivery retry slot normalized to the proven chain identity"
+
+
+@dataclass(frozen=True)
+class RetrySlotOutcome:
+    """What happened to the globally unique dedupe key for one attempt."""
+
+    job: MessageJob | None
+    reason: str | None = None
+    action: str = "created"  # created | idempotent | reclaimed | refused
 
 
 async def _create_delivery_retry_job_idempotent(
@@ -931,26 +1011,43 @@ async def _create_delivery_retry_job_idempotent(
     *,
     dedupe_key: str,
     identity: RetryIdentity,
+    original_outbox_id: int,
+    attempt_number: int,
     **fields: Any,
-) -> MessageJob | None:
-    job = MessageJob(dedupe_key=dedupe_key, **identity.as_job_fields(), **fields)
-    try:
-        async with session.begin_nested():
-            session.add(job)
-            await session.flush()
-    except IntegrityError:
-        # Lost a race for the unique dedupe key. Adopt the winner only if it is
-        # the same retry. A mismatching winner is subject to the same terminal
-        # fail-closed rule as a row found by the callback's initial locked read.
-        raced = await _select_retry_job_for_update(session, dedupe_key)
-        if raced is None:
-            return None
-        mismatch = identity.mismatch_field(raced)
-        if mismatch is not None:
-            _neutralize_conflicting_retry(raced, mismatch)
-            return None
-        return raced
-    return job
+) -> RetrySlotOutcome:
+    occupant = await _select_retry_job_for_update(session, dedupe_key)
+    if occupant is None:
+        job = MessageJob(dedupe_key=dedupe_key, **identity.as_job_fields(), **fields)
+        try:
+            async with session.begin_nested():
+                session.add(job)
+                await session.flush()
+        except IntegrityError:
+            # Lost the race for the unique key. The winner is judged by exactly
+            # the same rule as a row found by the initial locked read.
+            occupant = await _select_retry_job_for_update(session, dedupe_key)
+            if occupant is None:
+                return RetrySlotOutcome(job=None, reason="delivery_retry_slot_vanished", action="refused")
+        else:
+            return RetrySlotOutcome(job=job, action="created")
+
+    reason = _occupant_claim_error(
+        occupant,
+        identity=identity,
+        original_outbox_id=original_outbox_id,
+        attempt_number=attempt_number,
+    )
+    if reason is None:
+        # Genuinely idempotent: the same callback arriving twice. Leave the
+        # existing job exactly as it is — no restart, no reschedule, no second row.
+        return RetrySlotOutcome(job=occupant, action="idempotent")
+
+    if await _job_has_outbox(session, int(occupant.id)):
+        _neutralize_conflicting_retry(occupant, reason)
+        return RetrySlotOutcome(job=None, reason=reason, action="refused")
+
+    _reclaim_retry_slot(occupant, identity=identity, fields=fields)
+    return RetrySlotOutcome(job=occupant, reason=reason, action="reclaimed")
 
 
 def _extract_status_updates(
@@ -1130,6 +1227,21 @@ async def _handle_delivery_statuses(
 
         if kind in _SUCCESSFUL_DELIVERY_STATUSES:
             if chain_resolution is None or chain_resolution.chain is None:
+                # DELIBERATE, not an oversight — do not "fix" this back to a
+                # fallback on `outbox.id`.
+                #
+                # Cancelling siblings needs a chain root, and the only pointer
+                # available here is unproven. Acting on it would cancel queued
+                # jobs of whatever chain that pointer names — possibly another
+                # tenant's — which is worse than the alternative.
+                #
+                # The accepted cost: a retry already queued for THIS message may
+                # still fire after the original landed, and the customer sees a
+                # duplicate notification for one booking. That is annoying and
+                # visible; cancelling a stranger's retries is silent and wrong.
+                # The refusal is audited above via
+                # `_record_status_retry_chain_refusal`, so an operator can see
+                # which message this happened to.
                 continue
             original_outbox_id = chain_resolution.chain.original_outbox_id
             canceled = await _cancel_queued_delivery_retry_jobs_for_chain(
@@ -1232,54 +1344,35 @@ async def _handle_failed_delivery_status(
         return
 
     dedupe_key = f"{DELIVERY_RETRY_DEDUPE_PREFIX}{original_outbox_id}:{attempt_number}"
-    occupant = await _select_retry_job_for_update(session, dedupe_key)
-    if occupant is not None:
-        mismatch = identity.mismatch_field(occupant)
-        if mismatch is None:
-            # Genuinely idempotent: the same callback arriving twice. Leave the
-            # existing job exactly as it is — no restart, no second row.
-            return
-        neutralized = _neutralize_conflicting_retry(occupant, mismatch)
-        _record_retry_skip(outbox, f"conflicting_retry_{mismatch}", original_outbox_id)
-        logger.warning(
-            "Delivery retry conflict: dedupe_key=%s field=%s neutralized=%s",
-            dedupe_key,
-            mismatch,
-            neutralized,
-        )
-        return
 
+    # Budget and success are counted over PROVEN members of this chain, never
+    # over everything sharing the key prefix. A stranger's row named after this
+    # root must not consume an attempt, and must not be able to declare the
+    # chain delivered — either would deny a legitimate retry.
     dedupe_prefix = f"{DELIVERY_RETRY_DEDUPE_PREFIX}{original_outbox_id}:"
-    rows = (
-        await session.execute(
-            select(MessageJob.id, MessageJob.dedupe_key).where(MessageJob.dedupe_key.like(dedupe_prefix + "%"))
-        )
-    ).all()
-    existing_job_ids: list[int] = []
+    candidates = list(
+        (await session.execute(select(MessageJob).where(MessageJob.dedupe_key.like(dedupe_prefix + "%")))).scalars()
+    )
     existing_attempts: set[int] = set()
-    for job_id, existing_key in rows:
-        existing_job_ids.append(int(job_id))
-        suffix = str(existing_key).rsplit(":", 1)[-1]
-        parsed_attempt = parse_retry_attempt(suffix)
-        if parsed_attempt is not None:
-            existing_attempts.add(parsed_attempt)
+    for candidate in candidates:
+        reference = resolve_retry_reference(candidate)
+        if reference.reference is None:
+            continue
+        if reference.reference.original_outbox_id != original_outbox_id:
+            continue
+        if identity.mismatch_field(candidate) is not None:
+            continue
+        existing_attempts.add(reference.reference.attempt_number)
 
     if len(existing_attempts) >= DELIVERY_RETRY_MAX_ATTEMPTS:
         if event is not None:
             event.error = f"Delivery retry limit reached for outbox_id={original_outbox_id}"
         return
 
-    if existing_job_ids:
-        delivered = (
-            await session.execute(
-                select(OutboxMessage.id)
-                .where(OutboxMessage.job_id.in_(existing_job_ids))
-                .where(OutboxMessage.status.in_(_SUCCESSFUL_DELIVERY_STATUSES))
-                .limit(1)
-            )
-        ).scalar_one_or_none()
-        if delivered is not None:
-            return
+    from altegio_bot.workers.outbox_worker import _delivery_retry_chain_has_success
+
+    if await _delivery_retry_chain_has_success(session, original_outbox_id):
+        return
 
     record: Record | None = None
     if anchor_outbox.record_id is not None:
@@ -1320,7 +1413,7 @@ async def _handle_failed_delivery_status(
 
     max_attempts = int(getattr(original_job, "max_attempts", 5) or 5)
 
-    created = await _create_delivery_retry_job_idempotent(
+    outcome = await _create_delivery_retry_job_idempotent(
         session,
         dedupe_key=dedupe_key,
         # provider / company / record / client / job_type all come from the
@@ -1329,27 +1422,38 @@ async def _handle_failed_delivery_status(
         # Altegio template and send from the Altegio number — the exact
         # cross-tenant leak PR-5 exists to prevent.
         identity=identity,
+        original_outbox_id=original_outbox_id,
+        attempt_number=attempt_number,
         status="queued",
         run_at=next_run_at,
         attempts=0,
         max_attempts=max_attempts,
         payload=payload,
     )
-    if created is None:
-        _record_retry_skip(outbox, "existing_retry_identity_mismatch", original_outbox_id)
+    if outcome.job is None:
+        _record_retry_skip(outbox, f"conflicting_retry_{outcome.reason}", original_outbox_id)
         logger.warning(
-            "Delivery retry refused: an existing job for dedupe_key=%s does not match the chain identity",
+            "Delivery retry refused: dedupe_key=%s reason=%s",
             dedupe_key,
+            outcome.reason,
         )
         return
 
+    if outcome.action == "reclaimed":
+        _record_retry_slot_reclaimed(outbox, outcome.reason or "unknown", original_outbox_id)
+        logger.warning(
+            "Delivery retry slot reclaimed: dedupe_key=%s reason=%s",
+            dedupe_key,
+            outcome.reason,
+        )
+
     logger.warning(
-        "Scheduled delivery retry original_outbox_id=%s attempt=%s delay_seconds=%s dedupe_key=%s created=%s",
+        "Scheduled delivery retry original_outbox_id=%s attempt=%s delay_seconds=%s dedupe_key=%s action=%s",
         original_outbox_id,
         attempt_number,
         delay,
         dedupe_key,
-        created is not None,
+        outcome.action,
     )
 
 
