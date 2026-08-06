@@ -284,6 +284,34 @@ def retry_outbox_audit_mismatch(
     return None
 
 
+def delivery_retry_audit(job: MessageJob) -> dict[str, Any]:
+    """The audit fields EVERY outbox row produced by a retry job must carry.
+
+    Returns ``{}`` for a job that does not claim the retry boundary, so callers
+    can splat it into any ``meta`` unconditionally — which is the point. The
+    fields used to be written at a single spot near the end of ``_run_job_logic``
+    that three early-returning paths never reached (the 24h text send, the text
+    failure, the template preflight failure), and a retry that went out through
+    one of them produced a row the reader then rejected as unproven.
+
+    Writer and reader are one contract: the values are normalized through the
+    very parsers :func:`retry_outbox_audit_mismatch` will use, so anything this
+    function writes is by construction something that predicate can accept. A
+    job whose payload does not parse still gets the marker with ``None`` ids —
+    it is a retry row with an unusable pointer, and saying so is more honest
+    than omitting the marker and having it read as an ordinary send.
+    """
+    if not claims_delivery_retry(job):
+        return {}
+    payload = getattr(job, "payload", None)
+    payload = payload if isinstance(payload, dict) else {}
+    return {
+        "delivery_retry": True,
+        "delivery_retry_of_outbox_id": parse_retry_outbox_id(payload.get("delivery_retry_of_outbox_id")),
+        "delivery_retry_attempt": parse_retry_attempt(payload.get("delivery_retry_attempt")),
+    }
+
+
 def resolve_retry_reference(job: MessageJob) -> RetryReferenceResolution:
     """Prove that retry payload and reserved dedupe namespace describe one row.
 

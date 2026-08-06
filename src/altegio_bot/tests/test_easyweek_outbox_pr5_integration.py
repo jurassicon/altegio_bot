@@ -4658,3 +4658,187 @@ async def test_a_real_retry_send_writes_an_audit_the_success_path_accepts(
     retry_rows[0].status = "delivered"
     await db.flush()
     assert await ow._delivery_retry_chain_has_success(db, int(root_outbox.id)) is True
+
+
+# ---------------------------------------------------------------------------
+# 23. Every outbox row a retry produces carries the retry audit
+# ---------------------------------------------------------------------------
+#
+# The audit block at the end of `_run_job_logic` is not reached by the paths
+# that build an OutboxMessage and return early: the 24h text send, the text
+# failure, and the template preflight failure. All three are reachable for a
+# retry job — `_24h_eligible` requires `job.job_type in _get_24h_whitelist()`,
+# and that whitelist defaults to exactly the five lifecycle types delivery retry
+# supports. A retry that went out as text produced an outbox with no audit, so
+# the NEXT failed callback was refused as `retry_outbox_audit_marker_missing`
+# and no further attempt was created — the notification was lost for good.
+
+
+async def _seed_easyweek_retry_ready(
+    db: AsyncSession,
+    capture: CaptureProvider,
+) -> tuple[MessageJob, OutboxMessage, MessageJob]:
+    """An original send, its failed callback, and the queued attempt-1 retry."""
+    root_job, root_outbox = await _seed_easyweek_send_with_outbox(db, capture)
+    await _deliver_failed_status(db, root_outbox.provider_message_id, dedupe="wa:audit-paths-setup")
+    retry = (await _retry_jobs_for(db, root_outbox.id))[0]
+    retry.run_at = datetime.now(timezone.utc)
+    await db.flush()
+    capture.template_calls.clear()
+    capture.text_calls.clear()
+    return root_job, root_outbox, retry
+
+
+async def test_a_retry_sent_as_text_inside_24h_carries_the_audit(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    monkeypatch: pytest.MonkeyPatch,
+    no_contact_rate_limit: None,
+) -> None:
+    _root_job, root_outbox, retry = await _seed_easyweek_retry_ready(db, capture)
+    _enable_text_inside_24h(monkeypatch, window_open=True)
+
+    await _run_job(db, retry)
+
+    assert retry.status == "done", retry.last_error
+    rows = await _outbox_rows(db, retry)
+    assert len(rows) == 1
+    assert rows[0].meta["send_type"] == "text", "this test must exercise the TEXT path"
+    assert rows[0].meta["delivery_retry"] is True
+    assert rows[0].meta["delivery_retry_of_outbox_id"] == root_outbox.id
+    assert rows[0].meta["delivery_retry_attempt"] == 1
+    assert retry_outbox_audit_mismatch(rows[0], original_outbox_id=int(root_outbox.id), attempt_number=1) is None
+
+
+async def test_a_failed_callback_on_a_text_retry_creates_the_next_attempt(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    monkeypatch: pytest.MonkeyPatch,
+    no_contact_rate_limit: None,
+) -> None:
+    """THE regression: without the audit the chain is unprovable and attempt 2
+    is never created, so the notification is lost silently."""
+    _root_job, root_outbox, retry = await _seed_easyweek_retry_ready(db, capture)
+    _enable_text_inside_24h(monkeypatch, window_open=True)
+
+    await _run_job(db, retry)
+    text_rows = await _outbox_rows(db, retry)
+    assert text_rows[0].meta["send_type"] == "text"
+
+    await _deliver_failed_status(db, text_rows[0].provider_message_id, dedupe="wa:text-retry-failed")
+
+    attempts = sorted(j.dedupe_key for j in await _retry_jobs_for(db, root_outbox.id))
+    assert attempts == [
+        f"delivery_retry:{root_outbox.id}:1",
+        f"delivery_retry:{root_outbox.id}:2",
+    ], "the chain must remain provable so the next attempt is scheduled"
+    await db.refresh(text_rows[0])
+    assert text_rows[0].meta.get("delivery_retry_chain_refused") is None
+
+
+async def test_a_delivered_callback_on_a_text_retry_cancels_the_sibling(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    monkeypatch: pytest.MonkeyPatch,
+    no_contact_rate_limit: None,
+) -> None:
+    _root_job, root_outbox, retry = await _seed_easyweek_retry_ready(db, capture)
+    _enable_text_inside_24h(monkeypatch, window_open=True)
+
+    await _run_job(db, retry)
+    text_rows = await _outbox_rows(db, retry)
+
+    sibling = MessageJob(
+        provider=PROVIDER_EASYWEEK,
+        company_id=retry.company_id,
+        record_id=retry.record_id,
+        client_id=retry.client_id,
+        job_type=retry.job_type,
+        run_at=datetime.now(timezone.utc),
+        status="queued",
+        dedupe_key=f"delivery_retry:{root_outbox.id}:2",
+        payload={
+            "kind": "delivery_failed_retry",
+            "delivery_retry_of_outbox_id": root_outbox.id,
+            "delivery_retry_attempt": 2,
+        },
+    )
+    db.add(sibling)
+    await db.flush()
+
+    await _deliver_status(
+        db,
+        _delivered_status_payload(text_rows[0].provider_message_id),
+        dedupe="wa:text-retry-delivered",
+    )
+
+    assert await ow._delivery_retry_chain_has_success(db, int(root_outbox.id)) is True
+    await db.refresh(sibling)
+    assert sibling.status == "canceled"
+    assert sibling.last_error == "Canceled: original delivery later succeeded"
+
+
+async def test_a_failed_text_send_outbox_carries_the_audit(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    monkeypatch: pytest.MonkeyPatch,
+    no_contact_rate_limit: None,
+) -> None:
+    """An ambiguous text error records a failed row and returns early."""
+    _root_job, root_outbox, retry = await _seed_easyweek_retry_ready(db, capture)
+    _enable_text_inside_24h(monkeypatch, window_open=True)
+
+    async def _ambiguous_text(*args: Any, **kwargs: Any) -> tuple[None, str]:
+        capture.text_calls.append(dict(kwargs))
+        return None, "500: upstream timeout"
+
+    monkeypatch.setattr(ow, "safe_send", _ambiguous_text)
+
+    await _run_job(db, retry)
+
+    rows = await _outbox_rows(db, retry)
+    assert len(rows) == 1
+    assert rows[0].status == "failed"
+    assert rows[0].meta["send_type"] == "text"
+    assert rows[0].meta["delivery_retry"] is True
+    assert rows[0].meta["delivery_retry_of_outbox_id"] == root_outbox.id
+    assert rows[0].meta["delivery_retry_attempt"] == 1
+
+
+async def test_a_preflight_failure_on_a_retry_carries_the_audit(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    monkeypatch: pytest.MonkeyPatch,
+    no_contact_rate_limit: None,
+) -> None:
+    _root_job, root_outbox, retry = await _seed_easyweek_retry_ready(db, capture)
+    monkeypatch.setattr(ow, "build_lifecycle_template_params", lambda code, ctx: ["a", "b", "c"])
+
+    await _run_job(db, retry)
+
+    assert retry.status == "failed"
+    rows = await _outbox_rows(db, retry)
+    assert len(rows) == 1
+    assert rows[0].meta["validation"] == "local_preflight_failure"
+    assert rows[0].meta["delivery_retry"] is True
+    assert rows[0].meta["delivery_retry_of_outbox_id"] == root_outbox.id
+    assert rows[0].meta["delivery_retry_attempt"] == 1
+    assert capture.template_calls == []
+
+
+async def test_an_ordinary_text_send_carries_no_retry_audit(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The helper is a no-op for a job that does not claim the retry boundary."""
+    _enable_text_inside_24h(monkeypatch, window_open=True)
+    job = await _seed_easyweek_happy_path(db)
+
+    await _run_job(db, job)
+
+    assert job.status == "done", job.last_error
+    rows = await _outbox_rows(db, job)
+    assert rows[0].meta["send_type"] == "text"
+    for key in ("delivery_retry", "delivery_retry_of_outbox_id", "delivery_retry_attempt"):
+        assert key not in rows[0].meta

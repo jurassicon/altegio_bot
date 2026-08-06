@@ -27,6 +27,7 @@ from altegio_bot.db import SessionLocal
 from altegio_bot.delivery_retry_identity import (
     DELIVERY_RETRY_JOB_TYPES,
     claims_delivery_retry,
+    delivery_retry_audit,
     resolve_retry_chain_members,
     resolve_retry_identity,
     resolve_retry_reference,
@@ -2595,6 +2596,7 @@ async def _run_job_logic(
                     "threshold": (settings.wa_131026_suppression_threshold),
                     "window_days": _wd,
                     "matched_failures": n_fail,
+                    **delivery_retry_audit(job),
                 },
             )
             session.add(out)
@@ -2647,6 +2649,7 @@ async def _run_job_logic(
                     "suppression_code": supp_code,
                     "marketing_suppression": True,
                     "cooldown_days": settings.marketing_suppression_cooldown_days,
+                    **delivery_retry_audit(job),
                 },
             )
             session.add(out)
@@ -2800,7 +2803,7 @@ async def _run_job_logic(
             if err is not None:
                 _pd_ms_ctx.update(send_error=err)
         _pd_now = utcnow()
-        _pd_send_meta: dict[str, Any] = {"send_type": "text"}
+        _pd_send_meta: dict[str, Any] = {"send_type": "text", **delivery_retry_audit(job)}
 
         if err is not None:
             if settings.meta_circuit_breaker_enabled and _is_transient_provider_error(err):
@@ -3105,6 +3108,7 @@ async def _run_job_logic(
                     "params": template_params,
                     "lang": effective_template_language,
                     "validation": "local_preflight_failure",
+                    **delivery_retry_audit(job),
                 },
             )
             session.add(out)
@@ -3287,6 +3291,7 @@ async def _run_job_logic(
                             "wa_window_open": True,
                             "last_meta_inbound_at": _last_inbound_iso,
                             "route_reason": "customer_service_window_open",
+                            **delivery_retry_audit(job),
                         },
                     )
                     session.add(_text_out)
@@ -3365,6 +3370,7 @@ async def _run_job_logic(
                                 "wa_window_open": True,
                                 "last_meta_inbound_at": _last_inbound_iso,
                                 "route_reason": "customer_service_window_open",
+                                **delivery_retry_audit(job),
                             },
                         )
                     )
@@ -3480,11 +3486,10 @@ async def _run_job_logic(
         if err is not None:
             _ms_ctx.update(send_error=err)
 
-    if claims_delivery_retry(job):
+    _retry_audit = delivery_retry_audit(job)
+    if _retry_audit:
         retry_payload = getattr(job, "payload", None) or {}
-        send_meta["delivery_retry"] = True
-        send_meta["delivery_retry_of_outbox_id"] = retry_payload.get("delivery_retry_of_outbox_id")
-        send_meta["delivery_retry_attempt"] = retry_payload.get("delivery_retry_attempt")
+        send_meta.update(_retry_audit)
         send_meta["delivery_retry_reason"] = "original_delivery_failed"
         send_meta["original_provider_message_id"] = retry_payload.get("delivery_retry_of_provider_message_id")
 
