@@ -64,10 +64,21 @@ services:
         condition: service_started
     command: ["/app/.venv/bin/python", "-m", "altegio_bot.scripts.run_inbox_worker"]
 
+  # The one shared worker that also renders EasyWeek lifecycle jobs, so it is the
+  # one shared worker that needs easyweek.env: `EASYWEEK_BOOKING_PAGE_URL` and
+  # `EASYWEEK_DEFAULT_LANGUAGE` are read here. required:false keeps an
+  # Altegio-only host deployable without the file.
+  #
+  # NOTE: `docker compose restart` does NOT re-read env_file — changing the
+  # EasyWeek booking URL or language requires
+  # `up -d --force-recreate altegio-outbox-worker`.
   altegio-outbox-worker:
     build: .
     restart: always
-    env_file: .env
+    env_file:
+      - .env
+      - path: easyweek.env
+        required: false
     depends_on:
       postgres:
         condition: service_healthy

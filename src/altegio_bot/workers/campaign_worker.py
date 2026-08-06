@@ -12,7 +12,9 @@ from altegio_bot.campaigns.runner import (
     execute_queued_send_real,
 )
 from altegio_bot.db import SessionLocal
-from altegio_bot.models.models import MessageJob
+from altegio_bot.delivery_retry_identity import claims_delivery_retry, resolve_retry_reference
+from altegio_bot.easyweek_policy import easyweek_job_type_error, normalize_provider
+from altegio_bot.models.models import PROVIDER_ALTEGIO, MessageJob
 from altegio_bot.utils import utcnow
 
 logger = logging.getLogger("campaign_worker")
@@ -97,6 +99,40 @@ async def process_job_in_session(
 ) -> None:
     job = await _load_job(session, job_id)
     if job is None:
+        return
+
+    # Independent boundary: campaign execution has its own worker and never
+    # passes through outbox_worker. A retry-like row is terminal before its
+    # payload can be interpreted as a campaign run.
+    if claims_delivery_retry(job):
+        reference = resolve_retry_reference(job)
+        job.status = "failed"
+        job.locked_at = None
+        job.last_error = f"Rejected delivery retry claim: {reference.error or 'campaign_route_forbidden'}"
+        logger.error("Campaign job rejected a delivery retry claim job_id=%s", job.id)
+        return
+
+    # Fail-closed provider guard, before the payload is trusted and before the
+    # campaign runner is reached.
+    #
+    # The guard in outbox_worker._run_job_logic does NOT cover this path:
+    # campaign execution jobs are excluded from the outbox claim and picked up
+    # here instead. Campaigns are Altegio-only in PR-5 — the runner resolves
+    # recipients through Altegio client ids and calls the Altegio API — so an
+    # EasyWeek execution job must die here rather than start a campaign run
+    # against the wrong CRM.
+    job_provider = normalize_provider(getattr(job, "provider", None), default=PROVIDER_ALTEGIO)
+    job_type_err = easyweek_job_type_error(job_provider, job.job_type)
+    if job_type_err is not None:
+        job.status = "failed"
+        job.locked_at = None
+        job.last_error = job_type_err
+        logger.error(
+            "EasyWeek job type not enabled: campaign job_id=%s company=%s job_type=%s",
+            job.id,
+            job.company_id,
+            job.job_type,
+        )
         return
 
     payload = getattr(job, "payload", None) or {}

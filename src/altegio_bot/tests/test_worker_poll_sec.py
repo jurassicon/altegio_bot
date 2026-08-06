@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import types
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 from pydantic import ValidationError
@@ -222,6 +223,7 @@ class TestOutboxRunLoopSleepPath:
             types.SimpleNamespace(outbox_worker_poll_sec=0.2),
         )
         monkeypatch.setattr(ow, "SessionLocal", _session_local_factory)
+        monkeypatch.setattr(ow, "_requeue_stale_processing_jobs", AsyncMock(return_value=0))
 
         async def fake_lock_next_jobs(session: Any, batch_size: int) -> list:
             return []

@@ -172,6 +172,40 @@ def test_worker_reads_env_and_optional_easyweek_env() -> None:
     assert optional[0]["required"] is False
 
 
+def test_outbox_worker_reads_env_and_optional_easyweek_env() -> None:
+    """The outbox worker renders EasyWeek jobs, so it needs easyweek.env too.
+
+    ``settings.easyweek_booking_page_url`` and ``settings.easyweek_default_language``
+    are read inside ``outbox_worker``. Those live in ``easyweek.env``, which is
+    deliberately NOT copied into the image, so without this entry the worker
+    would silently fall back to ``""`` — an empty booking page — and fail every
+    EasyWeek lifecycle job locally.
+
+    ``required: false`` is not decoration: an Altegio-only host has no
+    ``easyweek.env`` and must still deploy the shared outbox worker.
+    """
+    env_file = _compose()["services"]["altegio-outbox-worker"]["env_file"]
+    assert env_file == [
+        ".env",
+        {"path": "easyweek.env", "required": False},
+    ]
+
+
+@pytest.mark.parametrize(
+    "service",
+    [
+        "altegio-inbox-worker",
+        "altegio-whatsapp-inbox-worker",
+        "altegio-meta-guard-worker",
+        "altegio-campaign-worker",
+        "altegio-followup-worker",
+    ],
+)
+def test_unrelated_workers_do_not_gain_easyweek_env(service: str) -> None:
+    """Only the two services that actually touch EasyWeek get its secrets."""
+    assert _compose()["services"][service]["env_file"] == ".env"
+
+
 def test_worker_waits_for_a_healthy_database() -> None:
     depends = _worker_service()["depends_on"]
     assert depends["postgres"]["condition"] == "service_healthy"

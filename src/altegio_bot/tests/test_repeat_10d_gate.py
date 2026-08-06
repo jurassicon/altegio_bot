@@ -236,7 +236,7 @@ async def test_repeat_10d_sends_and_marks_done_when_no_future_appointment(
 
     # Skip template/sender DB setup by mocking _render_message.
     # sender_id=None is valid (OutboxMessage.sender_id is nullable).
-    async def _fake_render(session, *, company_id, template_code, record, client):
+    async def _fake_render(session, *, company_id, template_code, record, client, **_kw):
         return (
             "Hallo {client_name}, wir vermissen dich!",
             None,
@@ -350,7 +350,7 @@ async def test_repeat_10d_not_canceled_when_no_appointment_after_source(
     send_mock = AsyncMock(return_value=("msg-no-later-001", None))
     monkeypatch.setattr(worker_mod, "safe_send", send_mock)
 
-    async def _fake_render(session, *, company_id, template_code, record, client):
+    async def _fake_render(session, *, company_id, template_code, record, client, **_kw):
         return (
             "Hallo {client_name}!",
             None,
@@ -394,7 +394,7 @@ async def test_repeat_10d_not_canceled_when_only_deleted_appointment_after_sourc
     send_mock = AsyncMock(return_value=("msg-deleted-001", None))
     monkeypatch.setattr(worker_mod, "safe_send", send_mock)
 
-    async def _fake_render(session, *, company_id, template_code, record, client):
+    async def _fake_render(session, *, company_id, template_code, record, client, **_kw):
         return (
             "Hallo {client_name}!",
             None,

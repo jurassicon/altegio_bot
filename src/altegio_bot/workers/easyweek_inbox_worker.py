@@ -62,6 +62,12 @@ from ..easyweek_normalizer import (
     easyweek_job_dedupe_key,
     normalize_event,
 )
+from ..easyweek_policy import (
+    EASYWEEK_LIFECYCLE_JOB_TYPES,
+    RECORD_CANCELED,
+    RECORD_CREATED,
+    RECORD_UPDATED,
+)
 from ..models.models import Client, EasyWeekEvent, MessageJob, Record, RecordService
 from ..settings import settings
 
@@ -69,13 +75,13 @@ logger = logging.getLogger("easyweek_inbox_worker")
 
 PROVIDER = "easyweek"
 
-RECORD_CREATED = "record_created"
-RECORD_UPDATED = "record_updated"
-RECORD_CANCELED = "record_canceled"
-
-# The ONLY job types PR-4 may plan. Reminders, review, repeat, comeback, promo,
-# campaign and follow-up jobs are explicitly out of scope (phase 2).
-EASYWEEK_LIFECYCLE_JOB_TYPES = (RECORD_CREATED, RECORD_UPDATED, RECORD_CANCELED)
+# Re-exported for the existing importers of this module. The definitions live in
+# `easyweek_policy` so the worker that PLANS these jobs and the workers that
+# CONSUME them cannot drift apart — two copies of an allowlist is two chances to
+# widen one of them by accident.
+#
+# The ONLY job types EasyWeek may plan. Reminders, review, repeat, comeback,
+# promo, campaign and follow-up jobs are explicitly out of scope (phase 2).
 
 _ACTION_TO_JOB_TYPE = {
     CREATE: RECORD_CREATED,

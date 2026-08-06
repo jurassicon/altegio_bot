@@ -292,7 +292,7 @@ async def test_outbox_worker_injects_loyalty_card_text_for_newsletter(monkeypatc
     monkeypatch.setattr(ow, "_count_131026_failures", AsyncMock(return_value=0))
 
     # Fake _render_message returning a booking_link context
-    async def _fake_render_message(session, *, company_id, template_code, record, client):
+    async def _fake_render_message(session, *, company_id, template_code, record, client, **_kw):
         ctx = {
             "client_name": "",  # CRM-only: no local client
             "booking_link": "https://n813709.alteg.io/",
@@ -365,7 +365,7 @@ async def test_outbox_worker_newsletter_ra_uses_v1_template(monkeypatch: Any) ->
     monkeypatch.setattr(ow, "_apply_rate_limit", AsyncMock(return_value=None))
     monkeypatch.setattr(ow, "_count_131026_failures", AsyncMock(return_value=0))
 
-    async def _fake_render_message(session, *, company_id, template_code, record, client):
+    async def _fake_render_message(session, *, company_id, template_code, record, client, **_kw):
         ctx = {
             "client_name": "",
             "booking_link": "https://n813709.alteg.io/",
@@ -473,7 +473,7 @@ async def test_crm_only_monthly_newsletter_uses_contact_name_as_param1(monkeypat
     monkeypatch.setattr(ow, "_apply_rate_limit", AsyncMock(return_value=None))
     monkeypatch.setattr(ow, "_count_131026_failures", AsyncMock(return_value=0))
 
-    async def _fake_render(session, *, company_id, template_code, record, client):
+    async def _fake_render(session, *, company_id, template_code, record, client, **_kw):
         # Simulates CRM-only: no local client → client_name=""
         return "Hallo {{1}}, ...", 1, "de", _make_render_ctx(client_name="")
 
@@ -534,7 +534,7 @@ async def test_crm_only_followup_newsletter_sends_with_empty_params(monkeypatch:
     monkeypatch.setattr(ow, "_count_131026_failures", AsyncMock(return_value=0))
     monkeypatch.setattr(ow, "client_has_any_future_record", AsyncMock(return_value=False))
 
-    async def _fake_render(session, *, company_id, template_code, record, client):
+    async def _fake_render(session, *, company_id, template_code, record, client, **_kw):
         return "Hallo {{1}}, ...", 1, "de", _make_render_ctx(client_name="")
 
     monkeypatch.setattr(ow, "_render_message", _fake_render)
@@ -591,7 +591,7 @@ async def test_local_client_monthly_newsletter_uses_display_name_not_payload(mon
     monkeypatch.setattr(ow, "_apply_rate_limit", AsyncMock(return_value=None))
     monkeypatch.setattr(ow, "_count_131026_failures", AsyncMock(return_value=0))
 
-    async def _fake_render(session, *, company_id, template_code, record, client):
+    async def _fake_render(session, *, company_id, template_code, record, client, **_kw):
         # Local client present: _render_message sets client_name=display_name
         name = client.display_name if client else ""
         return "Hallo {{1}}, ...", 1, "de", _make_render_ctx(client_name=name)
@@ -654,7 +654,7 @@ async def test_crm_only_no_contact_name_fails_preflight(monkeypatch: Any) -> Non
     monkeypatch.setattr(ow, "_apply_rate_limit", AsyncMock(return_value=None))
     monkeypatch.setattr(ow, "_count_131026_failures", AsyncMock(return_value=0))
 
-    async def _fake_render(session, *, company_id, template_code, record, client):
+    async def _fake_render(session, *, company_id, template_code, record, client, **_kw):
         return "Hallo {{1}}, ...", 1, "de", _make_render_ctx(client_name="")
 
     monkeypatch.setattr(ow, "_render_message", _fake_render)
@@ -750,7 +750,7 @@ def _base_patches(monkeypatch: Any) -> None:
     monkeypatch.setattr(ow.settings, "whatsapp_send_mode", "template")
 
 
-async def _fake_render(session: Any, *, company_id: int, template_code: str, record: Any, client: Any) -> tuple:
+async def _fake_render(session: Any, *, company_id: int, template_code: str, record: Any, client: Any, **_kw) -> tuple:
     ctx = {
         "client_name": "Test User",
         "booking_link": "https://n813709.alteg.io/",
