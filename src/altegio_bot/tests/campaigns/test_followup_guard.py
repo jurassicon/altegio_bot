@@ -1663,7 +1663,7 @@ async def test_live_altegio_guard_passes_when_no_future_record(
     send_mock = AsyncMock(return_value=("wamid.live-guard-c-001", None))
     monkeypatch.setattr(ow, "safe_send", send_mock)
 
-    async def _fake_render(session, *, company_id, template_code, record, client):
+    async def _fake_render(session, *, company_id, template_code, record, client, **_kw):
         return ("Hallo Test!", None, "de", {"client_name": "Test"})
 
     monkeypatch.setattr(ow, "_render_message", _fake_render)
@@ -1797,7 +1797,7 @@ async def test_live_altegio_guard_not_called_for_non_followup_job(
     monkeypatch.setattr(ow, "_apply_rate_limit", AsyncMock(return_value=None))
     monkeypatch.setattr(ow, "safe_send", AsyncMock(return_value=("wamid.f-001", None)))
 
-    async def _fake_render(session, *, company_id, template_code, record, client):
+    async def _fake_render(session, *, company_id, template_code, record, client, **_kw):
         return ("msg", None, "de", {})
 
     monkeypatch.setattr(ow, "_render_message", _fake_render)
@@ -1988,7 +1988,7 @@ async def test_live_altegio_guard_uses_client_altegio_id_fallback(
     send_mock = AsyncMock(return_value=("wamid.fallback-i-001", None))
     monkeypatch.setattr(ow, "safe_send", send_mock)
 
-    async def _fake_render(session, *, company_id, template_code, record, client):
+    async def _fake_render(session, *, company_id, template_code, record, client, **_kw):
         return ("Hallo Test!", None, "de", {"client_name": "Test"})
 
     monkeypatch.setattr(ow, "_render_message", _fake_render)

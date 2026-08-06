@@ -146,6 +146,69 @@ def resolve_meta_template(
     return name
 
 
+# ---------------------------------------------------------------------------
+# Lifecycle parameters keyed by CODE (provider-agnostic)
+# ---------------------------------------------------------------------------
+# EasyWeek's Meta template name comes from `message_templates.meta_template_name`
+# at runtime, so it is unknown to this module — a name-keyed lookup could never
+# match it and would silently fall through to the empty-list path. The parameter
+# ORDER, however, is a property of the lifecycle event, not of the name: it is
+# fixed by the approved template layout for that code. So it is keyed by code.
+#
+# Deliberately identical to the Altegio positional contract for the same codes,
+# because both CRMs use the same approved template shape.
+LIFECYCLE_PARAM_FIELDS: dict[str, tuple[str, ...]] = {
+    "record_created": (
+        "client_name",
+        "staff_name",
+        "date",
+        "time",
+        "services",
+        "total_cost",
+        "booking_link",
+    ),
+    "record_updated": (
+        "client_name",
+        "staff_name",
+        "date",
+        "time",
+        "services",
+        "total_cost",
+        "booking_link",
+    ),
+    "record_canceled": (
+        "client_name",
+        "date",
+        "time",
+        "services",
+        "booking_link",
+    ),
+}
+
+
+def build_lifecycle_template_params(code: str, ctx: dict[str, Any]) -> list[str]:
+    """Ordered params for a lifecycle *code*, independent of the template name.
+
+    ``ctx["booking_link"]`` is the EFFECTIVE link the caller already resolved —
+    for EasyWeek that is the re-verified manage link for created/updated, and the
+    static booking page for canceled. This function never derives a link itself.
+
+    Returns ``[]`` for an unknown code, which the preflight then rejects.
+    """
+    fields = LIFECYCLE_PARAM_FIELDS.get(code)
+    if fields is None:
+        logger.warning("build_lifecycle_template_params: unknown code=%s", code)
+        return []
+
+    # Same normalisation the name-keyed builder applies: Meta parameters may not
+    # contain newlines, so a multi-service list is joined.
+    services = ctx.get("services", "").replace("\n", ", ")
+    values: list[str] = []
+    for field in fields:
+        values.append(services if field == "services" else ctx.get(field, ""))
+    return values
+
+
 def requires_image_header(template_name: str) -> bool:
     """Return True when *template_name* has an IMAGE HEADER component in Meta WABA."""
     return template_name in NEWSLETTER_IMAGE_HEADER_TEMPLATES

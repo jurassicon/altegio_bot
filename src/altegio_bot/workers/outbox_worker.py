@@ -24,6 +24,22 @@ from altegio_bot.campaigns.runner import (
     recompute_campaign_run_stats,
 )
 from altegio_bot.db import SessionLocal
+from altegio_bot.delivery_retry_identity import (
+    DELIVERY_RETRY_JOB_TYPES,
+    claims_delivery_retry,
+    delivery_retry_audit,
+    resolve_retry_chain_members,
+    resolve_retry_identity,
+    resolve_retry_reference,
+    retry_outbox_audit_mismatch,
+)
+from altegio_bot.easyweek_normalizer import extract_manage_link
+from altegio_bot.easyweek_policy import (
+    EASYWEEK_LIFECYCLE_JOB_TYPES,
+    easyweek_job_type_error,
+    normalize_provider,
+    validate_static_booking_page,
+)
 from altegio_bot.message_planner import (
     COMEBACK_3D_DELAY,
     COMEBACK_3D_SOURCE_CANCELLED_AT_KEY,
@@ -34,11 +50,14 @@ from altegio_bot.meta_templates import (
     NEWSLETTER_MONTHLY_TEMPLATE,
     TEMPLATE_LANGUAGE,
     UNIVERSAL_JOB_TYPES,
+    build_lifecycle_template_params,
     build_template_params,
     requires_image_header,
     resolve_meta_template,
 )
 from altegio_bot.models.models import (
+    PROVIDER_ALTEGIO,
+    PROVIDER_EASYWEEK,
     CampaignRecipient,
     CampaignRun,
     Client,
@@ -64,7 +83,7 @@ from altegio_bot.services.meta_error_classifier import (
     transient_error_reason,
 )
 from altegio_bot.settings import settings
-from altegio_bot.template_validation import validate_template_params
+from altegio_bot.template_validation import validate_lifecycle_template_params, validate_template_params
 from altegio_bot.whatsapp_routing import pick_sender_code_for_record, pick_sender_id
 from altegio_bot.whatsapp_window import is_whatsapp_customer_window_open
 from altegio_bot.workers.promo_lead_handler import (
@@ -111,13 +130,7 @@ MARKETING_TRANSIENT_CAP_JOB_TYPES = (
     FOLLOWUP_JOB_TYPE,
 )
 
-DELIVERY_DEADLINE_JOB_TYPES = (
-    "record_created",
-    "record_updated",
-    "record_canceled",
-    "reminder_24h",
-    "reminder_2h",
-)
+DELIVERY_DEADLINE_JOB_TYPES = DELIVERY_RETRY_JOB_TYPES
 
 _DELIVERED_READ_STATUSES = ("delivered", "read")
 _DEADLINE_ALREADY_PASSED = datetime(1970, 1, 1, tzinfo=timezone.utc)
@@ -427,19 +440,43 @@ async def _requeue_stale_processing_jobs(session: AsyncSession) -> int:
     cutoff = utcnow() - timedelta(minutes=STALE_PROCESSING_MINUTES)
 
     stmt = (
-        update(MessageJob)
+        select(MessageJob)
         .where(MessageJob.status == "processing")
         .where(MessageJob.locked_at.is_not(None))
         .where(MessageJob.locked_at < cutoff)
-        .values(
-            status="queued",
-            locked_at=None,
-            run_at=utcnow(),
-            last_error="Recovered: stale processing job",
-        )
+        .order_by(MessageJob.id.asc())
+        .with_for_update(skip_locked=True)
     )
-    res = await session.execute(stmt)
-    return int(getattr(res, "rowcount", 0) or 0)
+    jobs = list((await session.execute(stmt)).scalars().all())
+
+    recovered = 0
+    now = utcnow()
+    for job in jobs:
+        # A stale legacy retry is not trusted merely because it once reached
+        # `processing`. Re-prove it before making it sendable again; otherwise
+        # recovery would undo the presend safety boundary on every worker boot.
+        if claims_delivery_retry(job):
+            reference = resolve_retry_reference(job)
+            if reference.reference is None:
+                guard_reason = f"Canceled: {reference.error or 'delivery_retry_reference_unproven'}"
+            else:
+                record = await _load_record(session, job)
+                guard_reason = await _delivery_retry_presend_guard(session, job, record)
+            if guard_reason is not None:
+                job.status = "canceled"
+                job.locked_at = None
+                job.updated_at = now
+                job.last_error = guard_reason
+                continue
+
+        job.status = "queued"
+        job.locked_at = None
+        job.run_at = now
+        job.updated_at = now
+        job.last_error = "Recovered: stale processing job"
+        recovered += 1
+
+    return recovered
 
 
 async def _apply_rate_limit(
@@ -617,10 +654,23 @@ async def _load_template(
     company_id: int,
     template_code: str,
     language: str,
+    provider: str = PROVIDER_ALTEGIO,
 ) -> tuple[MessageTemplate | None, str]:
-    """Look up the active MessageTemplate for *company_id* / *template_code*.
+    """Look up the active MessageTemplate for *provider* / *company_id* / *code*.
 
-    Lookup order (deterministic, always order_by id ASC where no unique match):
+    ``provider`` bounds EVERY phase below, including the cross-company fallback.
+    EasyWeek's ``company_id`` is the numeric EasyWeek ``:location_id`` and shares
+    an integer space with Altegio company ids, so a provider-blind query could
+    serve an Altegio body — with an Altegio address footer — to an EasyWeek
+    customer. The column has a server default of ``'altegio'``, but a default is
+    not a filter: it only decides what NEW rows get, so the predicate is explicit.
+
+    For EasyWeek there is deliberately NO cross-company phase at all (see below).
+
+    Lookup order — every step is ``order_by(id ASC).limit(1)``. Nothing enforces
+    one row per (provider, company_id, code, language), so without the explicit
+    order the winner would be whatever the planner returned first and could
+    change between two runs over identical data.
 
     Phase 1 — company-specific rows (always executed):
       1. company_id + code + requested language  (exact)
@@ -650,19 +700,20 @@ async def _load_template(
     # ------------------------------------------------------------------
     base = (
         select(MessageTemplate)
+        .where(MessageTemplate.provider == provider)
         .where(MessageTemplate.company_id == company_id)
         .where(MessageTemplate.code == template_code)
         .where(MessageTemplate.is_active.is_(True))
     )
 
-    stmt = base.where(MessageTemplate.language == language).limit(1)
+    stmt = base.where(MessageTemplate.language == language).order_by(MessageTemplate.id.asc()).limit(1)
     res = await session.execute(stmt)
     tmpl = res.scalar_one_or_none()
     if tmpl is not None:
         return tmpl, language
 
     if language != DEFAULT_LANGUAGE:
-        stmt = base.where(MessageTemplate.language == DEFAULT_LANGUAGE).limit(1)
+        stmt = base.where(MessageTemplate.language == DEFAULT_LANGUAGE).order_by(MessageTemplate.id.asc()).limit(1)
         res = await session.execute(stmt)
         tmpl = res.scalar_one_or_none()
         if tmpl is not None:
@@ -679,11 +730,20 @@ async def _load_template(
     # Branch-specific codes (record_*, reminder_*) intentionally skip this
     # to prevent accidentally serving the wrong branch's address footer.
     # ------------------------------------------------------------------
+    # EasyWeek has exactly ONE location, so "another company's row" can only be a
+    # different tenant — never a legitimate shared template. There is no
+    # cross-company phase for it at any code.
+    if provider != PROVIDER_ALTEGIO:
+        return None, language
+
     if template_code not in UNIVERSAL_JOB_TYPES:
         return None, language
 
     cross = (
-        select(MessageTemplate).where(MessageTemplate.code == template_code).where(MessageTemplate.is_active.is_(True))
+        select(MessageTemplate)
+        .where(MessageTemplate.provider == provider)
+        .where(MessageTemplate.code == template_code)
+        .where(MessageTemplate.is_active.is_(True))
     )
 
     stmt = cross.where(MessageTemplate.language == language).order_by(MessageTemplate.id.asc()).limit(1)
@@ -773,6 +833,133 @@ async def _is_new_client_for_record(
     return prev_id is None
 
 
+def _easyweek_domain_scope_error(
+    job: MessageJob,
+    record: Record | None,
+    client: Client | None,
+    *,
+    provider: str,
+) -> str | None:
+    """Prove the loaded Record and Client really belong to this EasyWeek job.
+
+    ``record_id`` and ``client_id`` are plain BIGINTs into tables that hold BOTH
+    CRMs' rows. A job pointing at the wrong id — a mis-planned job, an id reused
+    after a restore, a hand-edited row — would render an Altegio customer's
+    appointment into an EasyWeek message and send it from the EasyWeek number.
+    Nothing downstream re-checks this: ``_render_message`` trusts the objects it
+    is handed, and the provider predicates added in PR-5 bound the TEMPLATE and
+    the SENDER, not the domain rows.
+
+    ``RecordService`` has no provider column of its own — it is scoped only
+    through ``record_id``. So proving the Record here is exactly what makes the
+    service snapshot read later trustworthy.
+
+    Returns a reason on mismatch, ``None`` when the trio is consistent. The
+    reason names the broken invariant and never the values behind it: the
+    offending row belongs to another tenant, and this string is written to
+    ``job.last_error`` and to the log.
+    """
+    if record is None:
+        return "EasyWeek lifecycle job has no record"
+    if client is None:
+        return "EasyWeek lifecycle job has no client"
+    if record.provider != provider:
+        return "Record belongs to a different provider than the job"
+    if client.provider != provider:
+        return "Client belongs to a different provider than the job"
+    if record.company_id != job.company_id:
+        return "Record belongs to a different company than the job"
+    if client.company_id != job.company_id:
+        return "Client belongs to a different company than the job"
+    if record.client_id is None:
+        return "Record has no client"
+    if job.client_id is not None and job.client_id != record.client_id:
+        return "Job client_id does not match record client_id"
+    if client.id != record.client_id:
+        return "Loaded client is not the record's client"
+    return None
+
+
+def _easyweek_service_snapshot_error(
+    record: Record,
+    services: list[RecordService],
+) -> str | None:
+    """Refuse to invent a service name or a price the booking does not have.
+
+    PR-4 deliberately keeps three states apart: a real ``Decimal("0.00")``, an
+    unknown ``NULL``, and an authoritative clear. Rendering flattens all of them
+    — ``f"{svc.title}"`` turns ``None`` into the literal string ``"None"`` and
+    ``_fmt_money(None)`` turns an unknown price into ``0.00`` — and the preflight
+    then waves both through, because they are non-empty strings. A customer would
+    read "None — 0.00€" for a booking whose price nobody knows.
+
+    So for EasyWeek lifecycle v1 the contract is fail-closed: render only a
+    snapshot that is complete and self-consistent. ``Decimal("0.00")`` stays a
+    perfectly valid price — this rejects UNKNOWN, not zero.
+
+    The single-row shape is PR-4's, not an assumption: the payload carries one
+    flat service, and ``_sync_service_snapshot`` deletes any row whose
+    ``service_id`` the delivery did not name.
+
+    Reasons carry no title and no amount — an inconsistent snapshot may hold
+    another tenant's data, and this string reaches ``job.last_error``.
+    """
+    if len(services) != 1:
+        return f"EasyWeek service snapshot must hold exactly one service, found {len(services)}"
+
+    svc = services[0]
+    if svc.title is None or not svc.title.strip():
+        return "EasyWeek service snapshot has no service title"
+    if svc.cost_to_pay is None:
+        return "EasyWeek service snapshot has no price"
+    if record.total_cost is None:
+        return "EasyWeek record has no total_cost"
+    if record.total_cost != svc.cost_to_pay:
+        # PR-4 keeps these identical by construction, so a divergence means the
+        # snapshot was written by something else — guessing which one is right
+        # would be inventing a price.
+        return "EasyWeek record total_cost and service cost_to_pay disagree"
+    return None
+
+
+def easyweek_effective_booking_link(record: Record | None, template_code: str) -> str:
+    """The ONLY link an EasyWeek lifecycle message may carry.
+
+    ``record_canceled`` always gets the static booking page, even when a
+    verified manage link exists: the call to action after a cancellation is
+    "book again", and pointing the customer at the management page of a booking
+    that no longer exists is both useless and confusing.
+
+    ``record_created`` / ``record_updated`` may use ``Record.short_link``, but
+    only after the stored pair is re-verified HERE, at send time, by the very
+    same validator the normalizer used — :func:`extract_manage_link`. Re-using it
+    rather than re-implementing a check is the point: a second, looser copy would
+    drift, and this is the last gate before a URL reaches a customer. A link is
+    never synthesised from the booking UUID, the numeric id or the hash.
+
+    The static page is validated too, by :func:`validate_static_booking_page` —
+    a misconfigured ``EASYWEEK_BOOKING_PAGE_URL`` is just as customer-facing as a
+    forged ``short_link``, and for ``record_canceled`` it is the ONLY link. An
+    unusable value yields "" here, and the caller fails the job locally rather
+    than sending a message with a blank or hostile link.
+
+    Anything that does not verify falls back to the static page.
+    """
+    static_page = validate_static_booking_page(settings.easyweek_booking_page_url) or ""
+    if record is None or template_code == "record_canceled":
+        return static_page
+
+    link, _present = extract_manage_link(
+        {
+            "booking_page": record.short_link,
+            "booking_hash_id": record.easyweek_booking_hash_id,
+        }
+    )
+    if link is None:
+        return static_page
+    return link.url
+
+
 async def _render_message(
     session: AsyncSession,
     *,
@@ -780,17 +967,24 @@ async def _render_message(
     template_code: str,
     record: Record | None,
     client: Client | None,
+    provider: str = PROVIDER_ALTEGIO,
 ) -> tuple[str, int, str, dict[str, Any]]:
-    language = _pick_language(company_id, client)
+    is_easyweek = provider == PROVIDER_EASYWEEK
+    language = (
+        (settings.easyweek_default_language or DEFAULT_LANGUAGE).strip() or DEFAULT_LANGUAGE
+        if is_easyweek
+        else _pick_language(company_id, client)
+    )
 
     tmpl, used_lang = await _load_template(
         session,
         company_id=company_id,
         template_code=template_code,
         language=language,
+        provider=provider,
     )
     if tmpl is None:
-        raise ValueError(f"Template not found: company={company_id} code={template_code}")
+        raise ValueError(f"Template not found: provider={provider} company={company_id} code={template_code}")
 
     services_text = ""
     primary_service = ""
@@ -802,6 +996,13 @@ async def _render_message(
         )
         svc_res = await session.execute(svc_stmt)
         services = list(svc_res.scalars().all())
+
+        if is_easyweek and template_code in EASYWEEK_LIFECYCLE_JOB_TYPES:
+            # BEFORE the loop below, which is what would flatten an unknown
+            # title into "None" and an unknown price into "0.00".
+            snapshot_err = _easyweek_service_snapshot_error(record, services)
+            if snapshot_err is not None:
+                raise ValueError(snapshot_err)
 
         if services:
             primary_service = services[0].title or ""
@@ -815,10 +1016,19 @@ async def _render_message(
         services_text = "\n".join(lines)
 
     unsubscribe_link = ""
-    booking_link = BOOKING_LINKS.get(company_id, "")
+    if is_easyweek:
+        # EasyWeek has no BOOKING_LINKS entry and must never borrow one: that map
+        # is keyed by Altegio company id and holds Altegio salon pages.
+        booking_link = easyweek_effective_booking_link(record, template_code)
+    else:
+        booking_link = BOOKING_LINKS.get(company_id, "")
 
     sender_code = "default"
-    if record is not None:
+    # `service_sender_rules` is NOT provider-scoped, so an EasyWeek service id
+    # could match an Altegio rule and route the message to the wrong number.
+    # Until that table gets its own provider-aware design, EasyWeek stays on the
+    # default sender — safe, and explicit rather than accidental.
+    if record is not None and not is_easyweek:
         sender_code = await pick_sender_code_for_record(
             session=session,
             company_id=company_id,
@@ -829,12 +1039,17 @@ async def _render_message(
         session=session,
         company_id=company_id,
         sender_code=sender_code,
+        provider=provider,
     )
     if sender_id is None:
-        raise ValueError(f"No active sender for company={company_id} code={sender_code}")
+        raise ValueError(f"No active sender for provider={provider} company={company_id} code={sender_code}")
 
     pre_appointment_notes = ""
-    if template_code == "record_created" and record is not None and used_lang == "de":
+    # PRE_APPOINTMENT_NOTES_DE is KitiLash/Altegio copy — lash-extension prep
+    # instructions written for that salon. It has no business being appended to
+    # another CRM's booking confirmation, and PR-5 does not invent an EasyWeek
+    # equivalent: an empty string is the honest value until someone writes one.
+    if not is_easyweek and template_code == "record_created" and record is not None and used_lang == "de":
         is_new = await _is_new_client_for_record(
             session=session,
             company_id=company_id,
@@ -860,6 +1075,15 @@ async def _render_message(
         "sender_code": sender_code,
         "pre_appointment_notes": pre_appointment_notes,
     }
+
+    if is_easyweek:
+        # From the SAME row whose body/language/code were just used, so the name
+        # and the text can never come from two different templates.
+        ctx["meta_template_name"] = tmpl.meta_template_name
+        # An EasyWeek lifecycle message links only via `booking_link`; the raw
+        # `short_link` is unverified at this point and must not leak into a
+        # parameter slot.
+        ctx["short_link"] = booking_link
 
     if template_code == "review_3d":
         ctx["short_link"] = GOOGLE_MAPS_REVIEW_LINKS.get(
@@ -904,11 +1128,6 @@ _transient_error_reason = transient_error_reason
 
 def _decrement_send_attempt(job: MessageJob) -> None:
     job.attempts = max(0, int(getattr(job, "attempts", 0) or 0) - 1)
-
-
-def _is_delivery_retry_job(job: MessageJob) -> bool:
-    payload = getattr(job, "payload", None) or {}
-    return payload.get("kind") == "delivery_failed_retry" and payload.get("delivery_retry_of_outbox_id") is not None
 
 
 def _original_run_at(job: MessageJob) -> datetime | None:
@@ -1011,6 +1230,34 @@ async def _delivery_retry_chain_has_success(
     session: AsyncSession,
     original_outbox_id: int,
 ) -> bool:
+    """True when the canonical chain rooted at *original_outbox_id* has landed.
+
+    Membership is PROVEN, not inferred from the dedupe prefix. Sharing a key
+    prefix says only that a row was named after this root; it says nothing about
+    who wrote it or which chain its payload points at. A corrupted or
+    hand-written row with a delivered outbox could otherwise declare the whole
+    chain successful — suppressing a legitimate failed-callback and cancelling
+    correct queued retries.
+
+    So a candidate counts only when its own payload/namespace prove a reference
+    to THIS root and its identity matches the identity proven from the root
+    itself, via :func:`resolve_retry_chain_members` — the same definition of
+    membership every other retry decision uses.
+
+    The delivered ``OutboxMessage`` is checked too, not just the job that owns
+    it. Belonging to a proven member is what puts a row in the chain; its own
+    company, record, effective client and template code then have to agree with
+    the tenant that chain belongs to, and its retry audit has to corroborate
+    this root and this attempt — by the SAME predicate the callback resolver
+    applies, :func:`retry_outbox_audit_mismatch`. Without that last check the
+    identical row could be rejected as unproven when a status arrived for it and
+    accepted here as proof the chain had landed, which is enough to cancel a
+    correct queued retry and lose a notification.
+
+    The audit requirement applies to retry rows only. The ROOT is the original
+    send, not a retry: it carries no such audit and must not be asked for one,
+    so the early root check below stays exactly as it is.
+    """
     orig_stmt = (
         select(OutboxMessage.id)
         .where(OutboxMessage.id == original_outbox_id)
@@ -1020,19 +1267,39 @@ async def _delivery_retry_chain_has_success(
     if (await session.execute(orig_stmt)).scalar_one_or_none() is not None:
         return True
 
-    prefix = f"delivery_retry:{original_outbox_id}:"
-    job_ids_stmt = select(MessageJob.id).where(MessageJob.dedupe_key.like(prefix + "%"))
-    job_ids = [int(x) for x in (await session.execute(job_ids_stmt)).scalars().all()]
-    if not job_ids:
+    chain = await resolve_retry_chain_members(session, original_outbox_id)
+    if chain.identity is None:
+        # The root is not a provable chain root, so nothing can be a proven
+        # member of it. Fail closed: the presend guard refuses this job anyway,
+        # and claiming success here would cancel siblings on unproven grounds.
+        return False
+    if not chain.members:
         return False
 
-    retry_stmt = (
-        select(OutboxMessage.id)
-        .where(OutboxMessage.job_id.in_(job_ids))
+    delivered_stmt = (
+        select(OutboxMessage)
+        .where(OutboxMessage.job_id.in_(chain.job_ids))
         .where(OutboxMessage.status.in_(_DELIVERED_READ_STATUSES))
-        .limit(1)
     )
-    return (await session.execute(retry_stmt)).scalar_one_or_none() is not None
+    delivered_rows = list((await session.execute(delivered_stmt)).scalars().all())
+    if not delivered_rows:
+        return False
+
+    attempt_by_job_id = {int(member.job.id): member.reference.attempt_number for member in chain.members}
+    for row in delivered_rows:
+        if chain.identity.outbox_mismatch_field(row) is not None:
+            continue
+        attempt_number = attempt_by_job_id.get(int(row.job_id)) if row.job_id is not None else None
+        if attempt_number is None:
+            continue
+        if retry_outbox_audit_mismatch(
+            row,
+            original_outbox_id=original_outbox_id,
+            attempt_number=attempt_number,
+        ):
+            continue
+        return True
+    return False
 
 
 async def _delivery_retry_presend_guard(
@@ -1040,11 +1307,22 @@ async def _delivery_retry_presend_guard(
     job: MessageJob,
     record: Record | None,
 ) -> str | None:
-    payload = getattr(job, "payload", None) or {}
-    try:
-        original_outbox_id = int(payload["delivery_retry_of_outbox_id"])
-    except (KeyError, TypeError, ValueError):
-        return "Canceled: invalid delivery_retry_of_outbox_id"
+    """Re-prove a retry job's chain before it is allowed to send.
+
+    Independent of the callback that created it, and on purpose: this guard has
+    to hold for a row the callback never wrote — one left behind by an older
+    buggy build, hand-inserted, or restored from a backup. A well-formed retry
+    payload carrying ``provider='altegio'`` on an EasyWeek chain is exactly the
+    shape that must not survive to a send, and the callback repair alone cannot
+    see it.
+
+    Runs before the template lookup, the sender routing, the rate limit and any
+    Meta or text call.
+    """
+    reference = resolve_retry_reference(job)
+    if reference.reference is None:
+        return f"Canceled: {reference.error or 'delivery_retry_reference_unproven'}"
+    original_outbox_id = reference.reference.original_outbox_id
 
     if await _delivery_retry_chain_has_success(session, original_outbox_id):
         return "Canceled: delivery retry chain already succeeded"
@@ -1052,6 +1330,23 @@ async def _delivery_retry_presend_guard(
     original_outbox = await session.get(OutboxMessage, original_outbox_id)
     if original_outbox is None:
         return "Retry deadline exceeded or original outbox missing for delivery retry"
+
+    original_job: MessageJob | None = None
+    if original_outbox.job_id is not None:
+        original_job = await session.get(MessageJob, original_outbox.job_id)
+
+    resolution = await resolve_retry_identity(
+        session,
+        anchor_outbox=original_outbox,
+        original_job=original_job,
+        job_type=job.job_type,
+    )
+    if resolution.identity is None:
+        return f"Canceled: delivery retry identity unproven ({resolution.error})"
+
+    mismatch = resolution.identity.mismatch_field(job)
+    if mismatch is not None:
+        return f"Canceled: delivery retry {mismatch} does not match the proven chain identity"
 
     deadline = _retry_deadline_at(job, record, original_outbox=original_outbox)
     if deadline is not None and utcnow() > deadline:
@@ -1825,6 +2120,48 @@ async def _run_job_logic(
     after the transaction commits.  Returns ``None`` for every other
     outcome (non-campaign job, send failure, guard skip, etc.).
     """
+    # The CRM this job belongs to. Read FIRST — before routing, before any row is
+    # loaded, before any external call — and threaded through template loading,
+    # sender routing and Meta-name resolution: every place where an Altegio and an
+    # EasyWeek row could otherwise collide on a numeric company_id. The normalized
+    # read keeps hand-built test jobs and any legacy row without the column on the
+    # Altegio path, exactly as before.
+    job_provider = normalize_provider(getattr(job, "provider", None), default=PROVIDER_ALTEGIO)
+
+    # Retry syntax/reference/type is a routing boundary. It runs before campaign
+    # and promo dispatch so a malformed or legacy row cannot be interpreted as
+    # a different local command, much less reach an API or Meta. Full
+    # identity/domain/deadline proof remains immediately before the send path.
+    if claims_delivery_retry(job):
+        reference = resolve_retry_reference(job)
+        if reference.reference is None:
+            job.status = "canceled"
+            job.locked_at = None
+            job.updated_at = utcnow()
+            job.last_error = f"Canceled: {reference.error or 'delivery_retry_reference_unproven'}"
+            return None
+
+    # Phase-1 allowlist, checked before ANYTHING else acts on this job.
+    #
+    # It has to be here rather than deeper down: the campaign branch below
+    # requeues, the promo branches hand the job to their own handlers, and the
+    # marketing paths call the live Altegio API — all of which would have already
+    # happened by the time a later guard ran. An EasyWeek `reminder_24h` has no
+    # template, no Altegio client id and no reason to exist yet; the only correct
+    # outcome is a deterministic terminal failure that nobody retries.
+    job_type_err = easyweek_job_type_error(job_provider, job.job_type)
+    if job_type_err is not None:
+        job.status = "failed"
+        job.locked_at = None
+        job.last_error = job_type_err
+        logger.error(
+            "EasyWeek job type not enabled: job_id=%s company=%s job_type=%s",
+            job.id,
+            job.company_id,
+            job.job_type,
+        )
+        return None
+
     # Safety guard: orchestrator jobs must never reach outbox_worker.
     # _lock_next_jobs() already excludes them, but if somehow an execution job
     # arrives here (e.g. via direct process_job_in_session call), requeue it so
@@ -1900,7 +2237,7 @@ async def _run_job_logic(
         job.last_error = f"Retry deadline exceeded for {job.job_type}"
         return
 
-    if _is_delivery_retry_job(job):
+    if claims_delivery_retry(job):
         guard_reason = await _delivery_retry_presend_guard(session, job, record)
         if guard_reason is not None:
             job.status = "canceled"
@@ -1917,6 +2254,25 @@ async def _run_job_logic(
         company_id=job.company_id,
     ):
         client = await _load_client(session, job, record)
+
+    # Everything after this point — the phone, the body, the params, the Meta
+    # call — treats `record` and `client` as belonging to this job. For EasyWeek
+    # that has to be PROVEN, not assumed, and proven here: this is the last
+    # point at which no customer-facing value has been built yet.
+    if job_provider == PROVIDER_EASYWEEK and job.job_type in EASYWEEK_LIFECYCLE_JOB_TYPES:
+        scope_err = _easyweek_domain_scope_error(job, record, client, provider=job_provider)
+        if scope_err is not None:
+            job.status = "failed"
+            job.locked_at = None
+            job.last_error = f"EasyWeek domain scope violation: {scope_err}"
+            logger.error(
+                "EasyWeek domain scope violation: %s job_id=%s company=%s code=%s",
+                scope_err,
+                job.id,
+                job.company_id,
+                job.job_type,
+            )
+            return None
 
     # Follow-up final eligibility guard (DB phase): re-check current recipient/client state
     # before the actual send.  Catches changes that happened during the 14-day delay between
@@ -2240,6 +2596,7 @@ async def _run_job_logic(
                     "threshold": (settings.wa_131026_suppression_threshold),
                     "window_days": _wd,
                     "matched_failures": n_fail,
+                    **delivery_retry_audit(job),
                 },
             )
             session.add(out)
@@ -2292,6 +2649,7 @@ async def _run_job_logic(
                     "suppression_code": supp_code,
                     "marketing_suppression": True,
                     "cooldown_days": settings.marketing_suppression_cooldown_days,
+                    **delivery_retry_audit(job),
                 },
             )
             session.add(out)
@@ -2445,7 +2803,7 @@ async def _run_job_logic(
             if err is not None:
                 _pd_ms_ctx.update(send_error=err)
         _pd_now = utcnow()
-        _pd_send_meta: dict[str, Any] = {"send_type": "text"}
+        _pd_send_meta: dict[str, Any] = {"send_type": "text", **delivery_retry_audit(job)}
 
         if err is not None:
             if settings.meta_circuit_breaker_enabled and _is_transient_provider_error(err):
@@ -2583,12 +2941,53 @@ async def _run_job_logic(
                 template_code=job.job_type,
                 record=record,
                 client=client,
+                provider=job_provider,
             )
     except Exception as exc:
         job.status = "failed"
         job.locked_at = None
         job.last_error = f"Template render error: {exc}"
         return
+
+    # The language Meta is actually told the template is in.
+    #
+    # For Altegio this stays the global TEMPLATE_LANGUAGE: every approved
+    # kitilash_* template is registered in `de`, and `lang` may legitimately
+    # differ from it after a same-company fallback without meaning the Meta
+    # template changed. Nothing about that policy moves here.
+    #
+    # For EasyWeek it must be the language of the row `_load_template` actually
+    # returned. `body` and `meta_template_name` already come from that row; if
+    # the request said `de` while the row was `en`, Meta rejects the send —
+    # after the request is spent — for a mismatch we could see locally.
+    _is_easyweek_lifecycle = job_provider == PROVIDER_EASYWEEK and job.job_type in EASYWEEK_LIFECYCLE_JOB_TYPES
+    effective_template_language = TEMPLATE_LANGUAGE
+    if _is_easyweek_lifecycle:
+        effective_template_language = (lang or "").strip()
+        if not effective_template_language:
+            job.status = "failed"
+            job.locked_at = None
+            job.last_error = f"EasyWeek template has no language: company={job.company_id} code={job.job_type}"
+            logger.error(
+                "EasyWeek template row has a blank language; failing job_id=%s company=%s code=%s",
+                job.id,
+                job.company_id,
+                job.job_type,
+            )
+            return
+
+    # The language written to every OutboxMessage row for this job.
+    #
+    # For EasyWeek it is the SAME normalized string Meta was handed, so the audit
+    # trail cannot disagree with what was actually sent — a `lang` of `" de "`
+    # would otherwise be stored raw next to a `de` request, and a later
+    # investigation would be comparing two different-looking values.
+    #
+    # Altegio keeps storing `lang` (which may be a same-company fallback
+    # language) while sending TEMPLATE_LANGUAGE. That divergence is deliberate
+    # and pre-existing: the row records which template TEXT was used, the request
+    # records how the Meta template is registered.
+    outbox_language = effective_template_language if _is_easyweek_lifecycle else lang
 
     _job_payload = getattr(job, "payload", None) or {}
     loyalty_card_text = _job_payload.get("loyalty_card_text", "")
@@ -2616,25 +3015,46 @@ async def _run_job_logic(
     template_params: list[str] = []
 
     if use_template:
-        is_new = bool(msg_ctx.get("pre_appointment_notes", ""))
-        meta_template_name = resolve_meta_template(
-            job.company_id,
-            job.job_type,
-            is_new_client=is_new,
-        )
-        if meta_template_name is None:
-            job.status = "failed"
-            job.locked_at = None
-            job.last_error = f"No Meta template for company={job.company_id} job_type={job.job_type}"
-            logger.error(
-                "No Meta template for company=%s job_type=%s; failing job_id=%s (send_mode=%s)",
+        if job_provider == PROVIDER_EASYWEEK:
+            # DB-first, and ONLY from the row already rendered above. The name is
+            # never derived from company_id, from a branch prefix or from the
+            # code: EasyWeek templates live in a different WABA and are named by
+            # whoever approved them, so any derivation would be a guess.
+            meta_template_name = (msg_ctx.get("meta_template_name") or "").strip() or None
+            if meta_template_name is None:
+                job.status = "failed"
+                job.locked_at = None
+                job.last_error = (
+                    f"No meta_template_name on EasyWeek template: company={job.company_id} code={job.job_type}"
+                )
+                logger.error(
+                    "EasyWeek template has no meta_template_name; failing job_id=%s company=%s code=%s",
+                    job.id,
+                    job.company_id,
+                    job.job_type,
+                )
+                return
+            template_params = build_lifecycle_template_params(job.job_type, msg_ctx)
+        else:
+            is_new = bool(msg_ctx.get("pre_appointment_notes", ""))
+            meta_template_name = resolve_meta_template(
                 job.company_id,
                 job.job_type,
-                job.id,
-                send_mode,
+                is_new_client=is_new,
             )
-            return
-        template_params = build_template_params(meta_template_name, msg_ctx)
+            if meta_template_name is None:
+                job.status = "failed"
+                job.locked_at = None
+                job.last_error = f"No Meta template for company={job.company_id} job_type={job.job_type}"
+                logger.error(
+                    "No Meta template for company=%s job_type=%s; failing job_id=%s (send_mode=%s)",
+                    job.company_id,
+                    job.job_type,
+                    job.id,
+                    send_mode,
+                )
+                return
+            template_params = build_template_params(meta_template_name, msg_ctx)
 
         # Resolve image header URL for newsletter templates before preflight so
         # a missing URL fails fast with a clear error (no blank-header send).
@@ -2653,7 +3073,13 @@ async def _run_job_logic(
                 job.last_error = err_msg
                 return
 
-        preflight_err = validate_template_params(meta_template_name, template_params)
+        # Keyed by CODE for EasyWeek: its Meta name is unknown to the Python
+        # rules, so a name-keyed check would fall through to the generic
+        # "non-empty" path and let a wrong-arity param list reach Meta.
+        if job_provider == PROVIDER_EASYWEEK:
+            preflight_err = validate_lifecycle_template_params(job.job_type, template_params)
+        else:
+            preflight_err = validate_template_params(meta_template_name, template_params)
         if preflight_err is not None:
             logger.error(
                 "Preflight validation failed: %s job_id=%s template=%s",
@@ -2669,7 +3095,7 @@ async def _run_job_logic(
                 sender_id=sender_id,
                 phone_e164=phone,
                 template_code=job.job_type,
-                language=lang,
+                language=outbox_language,
                 body=body,
                 status="failed",
                 error=preflight_err,
@@ -2680,8 +3106,9 @@ async def _run_job_logic(
                     "send_type": "template",
                     "template": meta_template_name,
                     "params": template_params,
-                    "lang": TEMPLATE_LANGUAGE,
+                    "lang": effective_template_language,
                     "validation": "local_preflight_failure",
+                    **delivery_retry_audit(job),
                 },
             )
             session.add(out)
@@ -2846,7 +3273,7 @@ async def _run_job_logic(
                         sender_id=sender_id,
                         phone_e164=phone,
                         template_code=job.job_type,
-                        language=lang,
+                        language=outbox_language,
                         body=final_body,
                         status="sent",
                         error=None,
@@ -2859,11 +3286,12 @@ async def _run_job_logic(
                             "text_inside_24h": True,
                             "text_inside_24h_eligible": True,
                             "original_template": meta_template_name,
-                            "original_template_language": TEMPLATE_LANGUAGE,
+                            "original_template_language": effective_template_language,
                             "original_template_params": template_params,
                             "wa_window_open": True,
                             "last_meta_inbound_at": _last_inbound_iso,
                             "route_reason": "customer_service_window_open",
+                            **delivery_retry_audit(job),
                         },
                     )
                     session.add(_text_out)
@@ -2929,7 +3357,7 @@ async def _run_job_logic(
                             sender_id=sender_id,
                             phone_e164=phone,
                             template_code=job.job_type,
-                            language=lang,
+                            language=outbox_language,
                             body=final_body,
                             status="failed",
                             error=_text_err,
@@ -2942,6 +3370,7 @@ async def _run_job_logic(
                                 "wa_window_open": True,
                                 "last_meta_inbound_at": _last_inbound_iso,
                                 "route_reason": "customer_service_window_open",
+                                **delivery_retry_audit(job),
                             },
                         )
                     )
@@ -2993,7 +3422,7 @@ async def _run_job_logic(
                         sender_id=sender_id,
                         phone=phone,
                         template_name=meta_template_name,
-                        language=TEMPLATE_LANGUAGE,
+                        language=effective_template_language,
                         params=template_params,
                         fallback_text=final_body,
                         contact_name=contact_name,
@@ -3009,7 +3438,7 @@ async def _run_job_logic(
                     sender_id=sender_id,
                     phone=phone,
                     template_name=meta_template_name,
-                    language=TEMPLATE_LANGUAGE,
+                    language=effective_template_language,
                     params=template_params,
                     fallback_text=final_body,
                     contact_name=contact_name,
@@ -3020,7 +3449,7 @@ async def _run_job_logic(
                 "send_type": "template_fallback" if _use_template_fallback else "template",
                 "template": meta_template_name,
                 "params": template_params,
-                "lang": TEMPLATE_LANGUAGE,
+                "lang": effective_template_language,
             }
             if header_image_url:
                 send_meta["header_image_url"] = header_image_url
@@ -3030,7 +3459,7 @@ async def _run_job_logic(
                 send_meta["wa_window_open"] = bool(_wa_window_open)
                 send_meta["last_meta_inbound_at"] = _last_inbound_iso
                 send_meta["original_template"] = meta_template_name
-                send_meta["original_template_language"] = TEMPLATE_LANGUAGE
+                send_meta["original_template_language"] = effective_template_language
                 if _wa_window_check_error:
                     send_meta["text_inside_24h"] = False
                     send_meta["wa_window_check_error"] = _wa_window_check_error
@@ -3057,11 +3486,10 @@ async def _run_job_logic(
         if err is not None:
             _ms_ctx.update(send_error=err)
 
-    if _is_delivery_retry_job(job):
+    _retry_audit = delivery_retry_audit(job)
+    if _retry_audit:
         retry_payload = getattr(job, "payload", None) or {}
-        send_meta["delivery_retry"] = True
-        send_meta["delivery_retry_of_outbox_id"] = retry_payload.get("delivery_retry_of_outbox_id")
-        send_meta["delivery_retry_attempt"] = retry_payload.get("delivery_retry_attempt")
+        send_meta.update(_retry_audit)
         send_meta["delivery_retry_reason"] = "original_delivery_failed"
         send_meta["original_provider_message_id"] = retry_payload.get("delivery_retry_of_provider_message_id")
 
@@ -3089,7 +3517,7 @@ async def _run_job_logic(
                 sender_id=sender_id,
                 phone_e164=phone,
                 template_code=job.job_type,
-                language=lang,
+                language=outbox_language,
                 body=final_body,
                 status="failed",
                 error=err,
@@ -3146,7 +3574,7 @@ async def _run_job_logic(
             sender_id=sender_id,
             phone_e164=phone,
             template_code=job.job_type,
-            language=lang,
+            language=outbox_language,
             body=final_body,
             status="sent",
             error=None,

@@ -211,12 +211,13 @@ async def _setup_service_outbox(
     job_type: str = "record_created",
     outbox_status: str = "sent",
     wamid: str = WAMID,
+    altegio_record_id: int = 777,
 ) -> tuple[int, int, int]:
     async with session_maker() as session:
         async with session.begin():
             record = Record(
                 company_id=1,
-                altegio_record_id=777,
+                altegio_record_id=altegio_record_id,
                 client_id=1,
                 altegio_client_id=1,
                 starts_at=_utcnow().replace(microsecond=0),
@@ -257,6 +258,66 @@ async def _setup_service_outbox(
             session.add(ob)
             await session.flush()
             return int(record.id), int(job.id), int(ob.id)
+
+
+async def _setup_retry_outbox(
+    session_maker,
+    *,
+    original_wamid: str = "wamid.ORIGINAL",
+    retry_wamid: str = WAMID,
+) -> tuple[int, int, int]:
+    record_id, _, original_outbox_id = await _setup_service_outbox(
+        session_maker,
+        job_type="record_created",
+        wamid=original_wamid,
+    )
+    async with session_maker() as session:
+        async with session.begin():
+            original = await session.get(OutboxMessage, original_outbox_id)
+            assert original is not None
+            original_job = await session.get(MessageJob, original.job_id)
+            assert original_job is not None
+            retry_job = MessageJob(
+                provider=original_job.provider,
+                company_id=original_job.company_id,
+                record_id=record_id,
+                client_id=original_job.client_id,
+                job_type=original_job.job_type,
+                run_at=_utcnow(),
+                status="done",
+                attempts=1,
+                max_attempts=5,
+                dedupe_key=f"delivery_retry:{original_outbox_id}:1",
+                payload={
+                    "kind": "delivery_failed_retry",
+                    "delivery_retry_of_outbox_id": original_outbox_id,
+                    "delivery_retry_attempt": 1,
+                    "delivery_retry_original_outbox_id": original_outbox_id,
+                },
+            )
+            session.add(retry_job)
+            await session.flush()
+            retry_outbox = OutboxMessage(
+                company_id=original.company_id,
+                client_id=original.client_id,
+                record_id=original.record_id,
+                job_id=retry_job.id,
+                phone_e164=original.phone_e164,
+                template_code=original.template_code,
+                body="Retry",
+                status="sent",
+                provider_message_id=retry_wamid,
+                scheduled_at=_utcnow(),
+                sent_at=_utcnow(),
+                meta={
+                    "delivery_retry": True,
+                    "delivery_retry_of_outbox_id": original_outbox_id,
+                    "delivery_retry_attempt": 1,
+                },
+            )
+            session.add(retry_outbox)
+            await session.flush()
+            return original_outbox_id, int(retry_job.id), int(retry_outbox.id)
 
 
 # ---------------------------------------------------------------------------
@@ -834,6 +895,272 @@ async def test_duplicate_failed_webhook_dedupes_retry_job(session_maker) -> None
 
 
 @pytest.mark.asyncio
+async def test_valid_altegio_retry_callback_creates_next_attempt(session_maker) -> None:
+    original_id, _, retry_outbox_id = await _setup_retry_outbox(session_maker)
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _apply_status_updates(
+                session,
+                [{"wamid": WAMID, "status": "failed", "timestamp": "1", "raw": {}}],
+            )
+
+    async with session_maker() as session:
+        current = await session.get(OutboxMessage, retry_outbox_id)
+        assert current is not None
+        assert current.status == "failed"
+        next_retry = (
+            await session.execute(select(MessageJob).where(MessageJob.dedupe_key == f"delivery_retry:{original_id}:2"))
+        ).scalar_one_or_none()
+        assert next_retry is not None
+        assert next_retry.payload["delivery_retry_attempt"] == 2
+
+
+@pytest.mark.asyncio
+async def test_failed_retry_callback_does_not_follow_foreign_meta_pointer(session_maker) -> None:
+    original_id, _, retry_outbox_id = await _setup_retry_outbox(session_maker)
+    _, _, foreign_outbox_id = await _setup_service_outbox(
+        session_maker,
+        wamid="wamid.FOREIGN",
+        altegio_record_id=778,
+    )
+
+    async with session_maker() as session:
+        async with session.begin():
+            current = await session.get(OutboxMessage, retry_outbox_id)
+            assert current is not None
+            current.meta = {
+                **(current.meta or {}),
+                "delivery_retry_of_outbox_id": foreign_outbox_id,
+            }
+            await _apply_status_updates(
+                session,
+                [{"wamid": WAMID, "status": "failed", "timestamp": "1", "raw": {}}],
+            )
+
+    async with session_maker() as session:
+        current = await session.get(OutboxMessage, retry_outbox_id)
+        assert current is not None
+        assert current.status == "failed"
+        assert current.meta["delivery_retry_chain_refusal_reason"] == "retry_outbox_audit_reference_mismatch"
+        created = await session.execute(
+            select(MessageJob).where(
+                MessageJob.dedupe_key.in_([f"delivery_retry:{original_id}:2", f"delivery_retry:{foreign_outbox_id}:2"])
+            )
+        )
+        assert list(created.scalars().all()) == []
+
+
+@pytest.mark.asyncio
+async def test_invalid_retry_meta_does_not_use_foreign_success_for_failed_callback(session_maker) -> None:
+    _, _, retry_outbox_id = await _setup_retry_outbox(session_maker)
+    _, _, foreign_outbox_id = await _setup_service_outbox(
+        session_maker,
+        outbox_status="delivered",
+        wamid="wamid.FOREIGN-SUCCESS",
+        altegio_record_id=779,
+    )
+
+    async with session_maker() as session:
+        async with session.begin():
+            current = await session.get(OutboxMessage, retry_outbox_id)
+            assert current is not None
+            current.meta = {
+                **(current.meta or {}),
+                "delivery_retry_of_outbox_id": foreign_outbox_id,
+            }
+            await _apply_status_updates(
+                session,
+                [{"wamid": WAMID, "status": "failed", "timestamp": "1", "raw": {}}],
+            )
+
+    async with session_maker() as session:
+        current = await session.get(OutboxMessage, retry_outbox_id)
+        assert current is not None
+        assert current.status == "failed", "foreign success must not turn this into a stale failure"
+        assert "stale_failed_after_success" not in (current.meta or {})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("callback_status", ["delivered", "read"])
+async def test_success_callback_does_not_cancel_foreign_chain_from_retry_meta(
+    session_maker,
+    callback_status: str,
+) -> None:
+    _, _, retry_outbox_id = await _setup_retry_outbox(session_maker)
+    foreign_record_id, _, foreign_outbox_id = await _setup_service_outbox(
+        session_maker,
+        wamid="wamid.FOREIGN-CANCEL",
+        altegio_record_id=780,
+    )
+
+    async with session_maker() as session:
+        async with session.begin():
+            foreign_retry = MessageJob(
+                company_id=1,
+                record_id=foreign_record_id,
+                client_id=1,
+                job_type="record_created",
+                run_at=_utcnow(),
+                status="queued",
+                dedupe_key=f"delivery_retry:{foreign_outbox_id}:1",
+                payload={
+                    "kind": "delivery_failed_retry",
+                    "delivery_retry_of_outbox_id": foreign_outbox_id,
+                    "delivery_retry_attempt": 1,
+                },
+            )
+            session.add(foreign_retry)
+            current = await session.get(OutboxMessage, retry_outbox_id)
+            assert current is not None
+            current.meta = {
+                **(current.meta or {}),
+                "delivery_retry_of_outbox_id": foreign_outbox_id,
+            }
+            await _apply_status_updates(
+                session,
+                [{"wamid": WAMID, "status": callback_status, "timestamp": "1", "raw": {}}],
+            )
+
+    async with session_maker() as session:
+        current = await session.get(OutboxMessage, retry_outbox_id)
+        assert current is not None
+        assert current.status == callback_status
+        foreign_retry = (
+            await session.execute(
+                select(MessageJob).where(MessageJob.dedupe_key == f"delivery_retry:{foreign_outbox_id}:1")
+            )
+        ).scalar_one()
+        assert foreign_retry.status == "queued"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "meta_change,expected_reason",
+    [
+        ({"delivery_retry_of_outbox_id": 2**63}, "retry_outbox_audit_reference_invalid"),
+        ({"delivery_retry_of_outbox_id": "not-an-id"}, "retry_outbox_audit_reference_invalid"),
+        ({"delivery_retry_attempt": 2}, "retry_outbox_audit_attempt_mismatch"),
+    ],
+)
+async def test_retry_callback_rejects_invalid_audit_meta(
+    session_maker,
+    meta_change: dict[str, object],
+    expected_reason: str,
+) -> None:
+    original_id, _, retry_outbox_id = await _setup_retry_outbox(session_maker)
+
+    async with session_maker() as session:
+        async with session.begin():
+            current = await session.get(OutboxMessage, retry_outbox_id)
+            assert current is not None
+            current.meta = {**(current.meta or {}), **meta_change}
+            await _apply_status_updates(
+                session,
+                [{"wamid": WAMID, "status": "failed", "timestamp": "1", "raw": {}}],
+            )
+
+    async with session_maker() as session:
+        current = await session.get(OutboxMessage, retry_outbox_id)
+        assert current is not None
+        assert current.meta["delivery_retry_chain_refusal_reason"] == expected_reason
+        next_retry = (
+            await session.execute(select(MessageJob).where(MessageJob.dedupe_key == f"delivery_retry:{original_id}:2"))
+        ).scalar_one_or_none()
+        assert next_retry is None
+
+
+@pytest.mark.asyncio
+async def test_retry_callback_without_job_id_is_local_and_fail_closed(session_maker) -> None:
+    original_id, _, retry_outbox_id = await _setup_retry_outbox(session_maker)
+
+    async with session_maker() as session:
+        async with session.begin():
+            current = await session.get(OutboxMessage, retry_outbox_id)
+            assert current is not None
+            current.job_id = None
+            await _apply_status_updates(
+                session,
+                [{"wamid": WAMID, "status": "failed", "timestamp": "1", "raw": {}}],
+            )
+
+    async with session_maker() as session:
+        current = await session.get(OutboxMessage, retry_outbox_id)
+        assert current is not None
+        assert current.status == "failed"
+        assert current.meta["delivery_retry_chain_refusal_reason"] == "retry_outbox_job_id_missing"
+        next_retry = (
+            await session.execute(select(MessageJob).where(MessageJob.dedupe_key == f"delivery_retry:{original_id}:2"))
+        ).scalar_one_or_none()
+        assert next_retry is None
+
+
+@pytest.mark.asyncio
+async def test_retry_callback_after_current_job_was_deleted_is_fail_closed(session_maker) -> None:
+    original_id, retry_job_id, retry_outbox_id = await _setup_retry_outbox(session_maker)
+
+    async with session_maker() as session:
+        async with session.begin():
+            retry_job = await session.get(MessageJob, retry_job_id)
+            assert retry_job is not None
+            await session.delete(retry_job)
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _apply_status_updates(
+                session,
+                [{"wamid": WAMID, "status": "failed", "timestamp": "1", "raw": {}}],
+            )
+
+    async with session_maker() as session:
+        current = await session.get(OutboxMessage, retry_outbox_id)
+        assert current is not None
+        assert current.status == "failed"
+        assert current.meta["delivery_retry_chain_refusal_reason"] in {
+            "retry_outbox_job_id_missing",
+            "retry_outbox_job_missing",
+        }
+        next_retry = (
+            await session.execute(select(MessageJob).where(MessageJob.dedupe_key == f"delivery_retry:{original_id}:2"))
+        ).scalar_one_or_none()
+        assert next_retry is None
+
+
+@pytest.mark.asyncio
+async def test_retry_callback_rejects_conflicting_job_reference(session_maker) -> None:
+    original_id, retry_job_id, retry_outbox_id = await _setup_retry_outbox(session_maker)
+    _, _, foreign_outbox_id = await _setup_service_outbox(
+        session_maker,
+        wamid="wamid.FOREIGN-JOB-REF",
+        altegio_record_id=781,
+    )
+
+    async with session_maker() as session:
+        async with session.begin():
+            retry_job = await session.get(MessageJob, retry_job_id)
+            assert retry_job is not None
+            retry_job.payload = {
+                **(retry_job.payload or {}),
+                "delivery_retry_of_outbox_id": foreign_outbox_id,
+            }
+            await _apply_status_updates(
+                session,
+                [{"wamid": WAMID, "status": "failed", "timestamp": "1", "raw": {}}],
+            )
+
+    async with session_maker() as session:
+        current = await session.get(OutboxMessage, retry_outbox_id)
+        assert current is not None
+        assert current.meta["delivery_retry_chain_refusal_reason"] == "delivery_retry_outbox_reference_mismatch"
+        created = await session.execute(
+            select(MessageJob).where(
+                MessageJob.dedupe_key.in_([f"delivery_retry:{original_id}:2", f"delivery_retry:{foreign_outbox_id}:2"])
+            )
+        )
+        assert list(created.scalars().all()) == []
+
+
+@pytest.mark.asyncio
 async def test_delivered_cancels_queued_delivery_retries(session_maker) -> None:
     _, _, outbox_id = await _setup_service_outbox(session_maker, job_type="record_created")
     async with session_maker() as session:
@@ -849,7 +1176,13 @@ async def test_delivered_cancels_queued_delivery_retries(session_maker) -> None:
                     attempts=0,
                     max_attempts=5,
                     dedupe_key=f"delivery_retry:{outbox_id}:1",
-                    payload={"kind": "delivery_failed_retry", "delivery_retry_of_outbox_id": outbox_id},
+                    # A canonical retry payload: the attempt number is part of
+                    # the chain pointer, and only proven members are cancelled.
+                    payload={
+                        "kind": "delivery_failed_retry",
+                        "delivery_retry_of_outbox_id": outbox_id,
+                        "delivery_retry_attempt": 1,
+                    },
                 )
             )
 
@@ -925,8 +1258,13 @@ async def test_delivery_retry_presend_guard_cancels_when_chain_already_succeeded
         record = await session.get(Record, record_id)
         job = SimpleNamespace(
             job_type="record_created",
+            dedupe_key=f"delivery_retry:{outbox_id}:1",
             run_at=_utcnow(),
-            payload={"kind": "delivery_failed_retry", "delivery_retry_of_outbox_id": outbox_id},
+            payload={
+                "kind": "delivery_failed_retry",
+                "delivery_retry_of_outbox_id": outbox_id,
+                "delivery_retry_attempt": 1,
+            },
         )
 
         reason = await ow._delivery_retry_presend_guard(session, job, record)
@@ -939,8 +1277,13 @@ async def test_delivery_retry_presend_guard_cancels_when_original_missing(sessio
     async with session_maker() as session:
         job = SimpleNamespace(
             job_type="record_created",
+            dedupe_key="delivery_retry:999999:1",
             run_at=_utcnow(),
-            payload={"kind": "delivery_failed_retry", "delivery_retry_of_outbox_id": 999999},
+            payload={
+                "kind": "delivery_failed_retry",
+                "delivery_retry_of_outbox_id": 999999,
+                "delivery_retry_attempt": 1,
+            },
         )
 
         reason = await ow._delivery_retry_presend_guard(session, job, None)
@@ -957,10 +1300,21 @@ async def test_delivery_retry_presend_guard_cancels_when_deadline_passed(session
             record = await session.get(Record, record_id)
             assert record is not None
             record.starts_at = _utcnow() - timedelta(days=1)
+            # Identity matches the chain built by _setup_service_outbox, so the
+            # guard reaches the deadline branch this test is about.
             job = SimpleNamespace(
                 job_type="record_created",
+                provider="altegio",
+                company_id=1,
+                record_id=record_id,
+                client_id=1,
+                dedupe_key=f"delivery_retry:{outbox_id}:1",
                 run_at=_utcnow() - timedelta(days=1),
-                payload={"kind": "delivery_failed_retry", "delivery_retry_of_outbox_id": outbox_id},
+                payload={
+                    "kind": "delivery_failed_retry",
+                    "delivery_retry_of_outbox_id": outbox_id,
+                    "delivery_retry_attempt": 1,
+                },
             )
 
             reason = await ow._delivery_retry_presend_guard(session, job, record)

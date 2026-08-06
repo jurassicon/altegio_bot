@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from typing import Any
+from unittest.mock import AsyncMock
 
 from altegio_bot.workers import outbox_worker as ow
 
@@ -44,6 +45,7 @@ def _session_local_factory() -> _SessionLocalCM:
 
 def test_run_loop_sleeps_when_no_jobs(monkeypatch: Any) -> None:
     monkeypatch.setattr(ow, "SessionLocal", _session_local_factory)
+    monkeypatch.setattr(ow, "_requeue_stale_processing_jobs", AsyncMock(return_value=0))
 
     async def fake_lock_next_jobs(session: Any, batch_size: int) -> list[Any]:
         _ = session
@@ -74,6 +76,7 @@ def test_run_loop_sleeps_when_no_jobs(monkeypatch: Any) -> None:
 
 def test_run_loop_processes_job_ids(monkeypatch: Any) -> None:
     monkeypatch.setattr(ow, "SessionLocal", _session_local_factory)
+    monkeypatch.setattr(ow, "_requeue_stale_processing_jobs", AsyncMock(return_value=0))
 
     class Job:
         def __init__(self, jid: int) -> None:

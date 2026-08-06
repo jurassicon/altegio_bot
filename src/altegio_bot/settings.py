@@ -508,6 +508,22 @@ class Settings(BaseSettings):
 
     easyweek_inbox_worker_poll_sec: float = 1.0
 
+    # --- PR-5: outbox rendering ----------------------------------------------
+    # Static booking page for the EasyWeek location. Used as the fail-safe link
+    # whenever a per-booking manage link cannot be re-verified at send time, and
+    # ALWAYS for `record_canceled` — a cancelled booking must invite a new
+    # booking, not link to the management page of one that no longer exists.
+    #
+    # Empty by default and never hardcoded here: the real URL belongs to the
+    # location and lives in production easyweek.env. Empty means the lifecycle
+    # job fails locally rather than sending a message with a blank link.
+    easyweek_booking_page_url: str = ""
+
+    # Language used to look up EasyWeek message templates. Separate from the
+    # Altegio per-company map: EasyWeek has its own location and its own
+    # approved templates, and must not inherit an Altegio branch's language.
+    easyweek_default_language: str = "de"
+
     # ---------------------------------------------------------------------------
     # Worker polling intervals
     # ---------------------------------------------------------------------------

@@ -47,6 +47,41 @@ fail-closed: он не берёт события, потому что не см�
 > `docker compose restart` **не** перечитывает `env_file`. После правки любого
 > флага нужен `up -d --force-recreate <сервис>`.
 
+`easyweek.env` читают ТРИ сервиса, и все — с `required: false`, чтобы
+Altegio-only хост без этого файла продолжал разворачиваться:
+
+* `altegio-api` — приём вебхуков (PR-1/PR-2);
+* `altegio-easyweek-inbox-worker` — нормализатор (PR-4);
+* `altegio-outbox-worker` — общий outbox, он рендерит EasyWeek lifecycle jobs
+  (PR-5).
+
+Compose передаёт каждому сервису файл целиком; selective interpolation не
+используется. Поэтому «кто читает переменную» — это вопрос кода, а не Compose,
+и таблица ниже отвечает на практический вопрос: какой сервис пересоздавать.
+
+| Группа переменных | Кто реально читает | Что пересоздавать |
+| --- | --- | --- |
+| `EASYWEEK_ENABLED`, `EASYWEEK_WEBHOOK_SECRET` | приём и запись вебхуков | `altegio-api` |
+| `EASYWEEK_PROCESSING_ENABLED`, `EASYWEEK_LOCATION_ID`, `EASYWEEK_INBOX_WORKER_POLL_SEC`, `EASYWEEK_NOTIFICATIONS_ENABLED` | нормализатор и планирование job | `altegio-easyweek-inbox-worker` |
+| `EASYWEEK_BOOKING_PAGE_URL`, `EASYWEEK_DEFAULT_LANGUAGE` | рендер lifecycle-сообщений | `altegio-outbox-worker` |
+| `EASYWEEK_API_*` (probe) | только ручной запуск probe-команды | тот сервис/команда, где probe реально запускается |
+
+```bash
+docker compose -p altegio_bot up -d --force-recreate altegio-outbox-worker
+```
+
+Обычный `restart altegio-outbox-worker` оставит контейнер со старыми
+значениями, и это молчаливый режим отказа: невалидный или пустой
+`EASYWEEK_BOOKING_PAGE_URL` роняет lifecycle-job локально, а устаревший язык
+уйдёт в Meta.
+
+`EASYWEEK_BOOKING_PAGE_URL` валидируется на send-time, а не на старте
+процесса — умышленно. Глобальный Settings-валидатор уронил бы общий
+outbox-воркер и вместе с ним весь Altegio-трафик из-за EasyWeek-опечатки.
+Требования: абсолютный URL, только `https`, обязательный hostname, без
+credentials, без fragment, без control-символов. Невалидное значение приводит
+к локальному `failed` только EasyWeek lifecycle-job.
+
 ---
 
 ## 2. Безопасный порядок включения

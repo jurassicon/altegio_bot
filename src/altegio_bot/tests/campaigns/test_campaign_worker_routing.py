@@ -55,6 +55,8 @@ class _FakeJob:
     max_attempts: int = 5
     payload: dict = field(default_factory=dict)
     locked_at: Any = None
+    provider: str = "altegio"
+    dedupe_key: str | None = None
 
 
 @dataclass
@@ -198,6 +200,152 @@ async def test_campaign_worker_processes_execution_job(monkeypatch: Any) -> None
 
     assert execute_calls == [99]
     assert job.status == "done"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "dedupe_key,payload",
+    [
+        (
+            "delivery_retry:123:1",
+            {
+                "kind": "delivery_failed_retry",
+                "delivery_retry_of_outbox_id": 123,
+                "delivery_retry_attempt": 1,
+                "campaign_run_id": 99,
+            },
+        ),
+        (
+            None,
+            {
+                "kind": "delivery_failed_retry",
+                "delivery_retry_of_outbox_id": 123,
+                "delivery_retry_attempt": 1,
+                "campaign_run_id": 99,
+            },
+        ),
+        ("delivery_retry:malformed", {"campaign_run_id": 99}),
+    ],
+)
+async def test_campaign_worker_rejects_retry_claim_before_runner(
+    monkeypatch: Any,
+    dedupe_key: str | None,
+    payload: dict[str, Any],
+) -> None:
+    import altegio_bot.workers.campaign_worker as cw
+
+    job = _FakeJob(
+        id=21,
+        company_id=COMPANY_ID,
+        job_type=CAMPAIGN_EXECUTION_JOB_TYPE,
+        status="processing",
+        dedupe_key=dedupe_key,
+        payload=payload,
+    )
+    execute = AsyncMock(return_value=None)
+    monkeypatch.setattr(cw, "_load_job", AsyncMock(return_value=job))
+    monkeypatch.setattr(cw, "execute_queued_send_real", execute)
+
+    await cw.process_job_in_session(_FakeSession(), job.id)  # type: ignore[arg-type]
+
+    assert job.status == "failed"
+    assert job.locked_at is None
+    assert (job.last_error or "").startswith("Rejected delivery retry claim:")
+    execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "job_type",
+    [
+        CAMPAIGN_EXECUTION_JOB_TYPE,
+        ow.PROMO_ELIGIBILITY_CHECK_JOB_TYPE,
+        ow.PROMO_APPLY_EXISTING_BOOKING_JOB_TYPE,
+        ow.PROMO_CARD_BOOKING_REMINDER_JOB_TYPE,
+        "review_3d",
+    ],
+)
+async def test_outbox_rejects_retry_claim_before_campaign_or_promo_routes(
+    monkeypatch: Any,
+    job_type: str,
+) -> None:
+    job = _FakeJob(
+        id=22,
+        company_id=COMPANY_ID,
+        job_type=job_type,
+        status="processing",
+        dedupe_key="delivery_retry:123:1",
+        payload={
+            "kind": "delivery_failed_retry",
+            "delivery_retry_of_outbox_id": 123,
+            "delivery_retry_attempt": 1,
+            "campaign_run_id": 99,
+            "promo_lead_id": 99,
+        },
+    )
+    promo_eligibility = AsyncMock(return_value=None)
+    promo_apply = AsyncMock(return_value=None)
+    promo_reminder = AsyncMock(return_value=None)
+    monkeypatch.setattr(ow, "process_promo_eligibility_check_job", promo_eligibility)
+    monkeypatch.setattr(ow, "process_promo_apply_existing_booking_job", promo_apply)
+    monkeypatch.setattr(ow, "_process_promo_card_booking_reminder", promo_reminder)
+    meta_send = AsyncMock(side_effect=AssertionError("Meta send forbidden"))
+    meta_template_send = AsyncMock(side_effect=AssertionError("Meta send forbidden"))
+    monkeypatch.setattr(ow, "safe_send", meta_send)
+    monkeypatch.setattr(ow, "safe_send_template", meta_template_send)
+
+    session = _FakeSession()
+    await ow._run_job_logic(session, job, provider=MagicMock())  # type: ignore[arg-type]
+
+    assert job.status == "canceled"
+    assert job.locked_at is None
+    assert "delivery_retry_job_type_not_enabled" in (job.last_error or "")
+    assert session.added == []
+    promo_eligibility.assert_not_awaited()
+    promo_apply.assert_not_awaited()
+    promo_reminder.assert_not_awaited()
+    meta_send.assert_not_awaited()
+    meta_template_send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "job_type,expected_handler",
+    [
+        (ow.PROMO_ELIGIBILITY_CHECK_JOB_TYPE, "eligibility"),
+        (ow.PROMO_APPLY_EXISTING_BOOKING_JOB_TYPE, "apply"),
+        (ow.PROMO_CARD_BOOKING_REMINDER_JOB_TYPE, "reminder"),
+    ],
+)
+async def test_ordinary_altegio_promo_job_keeps_existing_route(
+    monkeypatch: Any,
+    job_type: str,
+    expected_handler: str,
+) -> None:
+    job = _FakeJob(
+        id=23,
+        company_id=COMPANY_ID,
+        job_type=job_type,
+        status="processing",
+        dedupe_key=f"ordinary:{job_type}",
+        payload={"kind": job_type, "promo_lead_id": 99},
+    )
+    handlers = {
+        "eligibility": AsyncMock(return_value=None),
+        "apply": AsyncMock(return_value=None),
+        "reminder": AsyncMock(return_value=None),
+    }
+    monkeypatch.setattr(ow, "_find_success_outbox", AsyncMock(return_value=None))
+    monkeypatch.setattr(ow, "process_promo_eligibility_check_job", handlers["eligibility"])
+    monkeypatch.setattr(ow, "process_promo_apply_existing_booking_job", handlers["apply"])
+    monkeypatch.setattr(ow, "_process_promo_card_booking_reminder", handlers["reminder"])
+
+    await ow._run_job_logic(_FakeSession(), job, provider=MagicMock())  # type: ignore[arg-type]
+
+    handlers[expected_handler].assert_awaited_once()
+    for name, handler in handlers.items():
+        if name != expected_handler:
+            handler.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------

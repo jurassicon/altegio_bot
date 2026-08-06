@@ -16,6 +16,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from altegio_bot.campaigns.runner import recompute_campaign_run_stats
 from altegio_bot.chatwoot_client import ChatwootClient
 from altegio_bot.db import SessionLocal
+from altegio_bot.delivery_retry_identity import (
+    DELIVERY_RETRY_DEDUPE_PREFIX,
+    DELIVERY_RETRY_JOB_TYPES,
+    DELIVERY_RETRY_MAX_ATTEMPTS,
+    RetryIdentity,
+    StatusRetryChain,
+    resolve_retry_chain_members,
+    resolve_retry_identity,
+    resolve_retry_reference,
+    resolve_status_retry_chain,
+)
 from altegio_bot.models.models import (
     CampaignRecipient,
     Client,
@@ -59,22 +70,15 @@ MARKETING_JOB_TYPES = (
     "comeback_3d",
 )
 
-DELIVERY_RETRY_JOB_TYPES = (
-    "record_created",
-    "record_updated",
-    "record_canceled",
-    "reminder_24h",
-    "reminder_2h",
-)
-
-_DELIVERY_RETRY_DEDUPE_PREFIX = "delivery_retry:"
+# Re-exported for existing importers; defined in `delivery_retry_identity`
+# alongside the identity rules that give the namespace its meaning.
+_DELIVERY_RETRY_DEDUPE_PREFIX = DELIVERY_RETRY_DEDUPE_PREFIX
 _DELIVERY_RETRY_DELAYS_SECONDS = (
     10 * 60,
     30 * 60,
     2 * 60 * 60,
     6 * 60 * 60,
 )
-_DELIVERY_RETRY_MAX_ATTEMPTS = 4
 _DELIVERY_STATUS_ORDER = {"sent": 0, "delivered": 1, "read": 2}
 _SUCCESSFUL_DELIVERY_STATUSES = ("delivered", "read")
 
@@ -794,6 +798,10 @@ def _sanitize_delivery_detail(value: Any, limit: int = 300) -> str | None:
     return text
 
 
+def _copy_outbox_meta(outbox: OutboxMessage) -> dict[str, Any]:
+    return dict(outbox.meta) if isinstance(outbox.meta, dict) else {}
+
+
 def _mark_outbox_delivery_failed(outbox: OutboxMessage, status: dict[str, Any], reason: str) -> None:
     code = status.get("error_code")
     title = status.get("error_title")
@@ -806,7 +814,7 @@ def _mark_outbox_delivery_failed(outbox: OutboxMessage, status: dict[str, Any], 
     )
     outbox.error = f"WA delivery failed {bits}".strip()
 
-    meta = dict(outbox.meta or {})
+    meta = _copy_outbox_meta(outbox)
     meta["delivery_failed"] = True
     meta["delivery_failed_at"] = utcnow().isoformat()
     meta["delivery_failed_code"] = code
@@ -818,23 +826,12 @@ def _mark_outbox_delivery_failed(outbox: OutboxMessage, status: dict[str, Any], 
 
 
 def _mark_stale_failed_after_success(outbox: OutboxMessage, status: dict[str, Any]) -> None:
-    meta = dict(outbox.meta or {})
+    meta = _copy_outbox_meta(outbox)
     meta["stale_failed_after_success"] = True
     meta["stale_failed_code"] = status.get("error_code")
     meta["stale_failed_title"] = status.get("error_title")
     meta["stale_failed_at"] = utcnow().isoformat()
     outbox.meta = meta
-
-
-def _delivery_retry_chain_original_outbox_id(outbox: OutboxMessage) -> int:
-    meta = outbox.meta or {}
-    raw = meta.get("delivery_retry_of_outbox_id")
-    if raw is not None:
-        try:
-            return int(raw)
-        except (TypeError, ValueError):
-            pass
-    return int(outbox.id)
 
 
 async def _find_outbox_by_provider_message_id(
@@ -850,54 +847,243 @@ async def _find_outbox_by_provider_message_id(
     return (await session.execute(stmt)).scalars().first()
 
 
-async def _should_ignore_failed_after_success(session: AsyncSession, outbox: OutboxMessage) -> bool:
+async def _should_ignore_failed_after_success(
+    session: AsyncSession,
+    outbox: OutboxMessage,
+    chain: StatusRetryChain,
+) -> bool:
     if outbox.status in _SUCCESSFUL_DELIVERY_STATUSES:
         return True
 
     from altegio_bot.workers.outbox_worker import _delivery_retry_chain_has_success
 
-    return await _delivery_retry_chain_has_success(session, _delivery_retry_chain_original_outbox_id(outbox))
+    return await _delivery_retry_chain_has_success(session, chain.original_outbox_id)
+
+
+def _record_status_retry_chain_refusal(outbox: OutboxMessage, reason: str) -> None:
+    meta = _copy_outbox_meta(outbox)
+    meta["delivery_retry_chain_refused"] = True
+    meta["delivery_retry_chain_refusal_reason"] = reason
+    meta["delivery_retry_chain_refused_at"] = utcnow().isoformat()
+    outbox.meta = meta
 
 
 async def _cancel_queued_delivery_retry_jobs_for_chain(
     session: AsyncSession,
     original_outbox_id: int,
     reason: str,
-) -> int:
-    prefix = f"{_DELIVERY_RETRY_DEDUPE_PREFIX}{original_outbox_id}:"
-    stmt = (
-        update(MessageJob)
-        .where(MessageJob.status == "queued")
-        .where(MessageJob.dedupe_key.like(prefix + "%"))
-        .values(status="canceled", locked_at=None, updated_at=utcnow(), last_error=reason)
+) -> tuple[int, bool]:
+    """Cancel the chain's own queued retries after the message landed.
+
+    Returns ``(canceled_count, saw_unproven_candidates)``.
+
+    Only PROVEN members are cancelled. A bulk ``UPDATE`` over the dedupe prefix
+    would also hit rows that merely carry the chain's name — and an unproven row
+    is evidence: it has its own handling in the occupant check and the presend
+    guard, both of which write a diagnostic ``last_error``. Overwriting that with
+    "the original later succeeded" would erase the only record of why the row was
+    rejected, and would assert a membership nobody proved.
+
+    The candidates are read ``FOR UPDATE`` with a BLOCKING lock, not
+    ``skip_locked``. A locked row is precisely the one the outbox worker is
+    claiming right now — the row most urgently in need of cancelling — so
+    skipping it would lose the race by design. Blocking waits for that
+    transaction: either it finishes the send first, in which case PostgreSQL
+    re-evaluates the ``queued`` predicate after the lock and the row drops out,
+    or we win and cancel before it is claimed. Both outcomes are correct; a
+    silent skip is not.
+    """
+    chain = await resolve_retry_chain_members(
+        session,
+        original_outbox_id,
+        statuses=("queued",),
+        for_update=True,
     )
-    res = await session.execute(stmt)
-    return int(getattr(res, "rowcount", 0) or 0)
+    if chain.identity is None:
+        return 0, chain.candidate_count > 0
+
+    now = utcnow()
+    canceled = 0
+    for member in chain.members:
+        job = member.job
+        # Re-checked after the lock: the predicate was evaluated before we
+        # waited for it, and the owner of the lock may have moved the row on.
+        if job.status != "queued":
+            continue
+        job.status = "canceled"
+        job.locked_at = None
+        job.updated_at = now
+        job.last_error = reason
+        canceled += 1
+
+    return canceled, chain.has_unproven_candidates
 
 
-async def _select_message_job_by_dedupe(session: AsyncSession, dedupe_key: str) -> MessageJob | None:
-    stmt = select(MessageJob).where(MessageJob.dedupe_key == dedupe_key).limit(1)
+def _record_retry_skip(outbox: OutboxMessage, reason: str, original_outbox_id: int) -> None:
+    """Audit the refusal on the outbox row. Invariant names only, never values."""
+    skip_meta = _copy_outbox_meta(outbox)
+    skip_meta["delivery_retry_skipped"] = True
+    skip_meta["delivery_retry_skip_reason"] = reason
+    skip_meta["delivery_retry_original_outbox_id"] = original_outbox_id
+    outbox.meta = skip_meta
+
+
+def _record_retry_slot_reclaimed(outbox: OutboxMessage, reason: str, original_outbox_id: int) -> None:
+    """Audit a reclaimed slot. Distinct from a skip: the retry DID proceed."""
+    meta = _copy_outbox_meta(outbox)
+    meta["delivery_retry_slot_reclaimed"] = True
+    meta["delivery_retry_slot_reclaim_reason"] = reason
+    meta["delivery_retry_original_outbox_id"] = original_outbox_id
+    outbox.meta = meta
+
+
+# A job in one of these states can still be claimed and sent by the outbox
+# worker. `processing` is included because stale recovery requeues it.
+_SENDABLE_JOB_STATUSES = ("queued", "processing")
+
+
+async def _select_retry_job_for_update(session: AsyncSession, dedupe_key: str) -> MessageJob | None:
+    """Read the row occupying *dedupe_key* under a row lock.
+
+    The lock is the point: without it the outbox worker can claim the very row
+    being inspected here, and a job would be judged "not a valid retry" and sent
+    in the same instant.
+    """
+    stmt = select(MessageJob).where(MessageJob.dedupe_key == dedupe_key).limit(1).with_for_update()
     return (await session.execute(stmt)).scalars().first()
+
+
+def _neutralize_conflicting_retry(job: MessageJob, reason: str) -> bool:
+    """Take a mismatching retry out of the sendable set. Returns True if changed.
+
+    Deliberately NOT a repair: this is the branch for a row that already produced
+    an ``OutboxMessage``, so a message went out under this key and rewriting the
+    row would falsify the record of what was sent. It is also not deleted — the
+    dedupe key is globally unique and the row is the evidence. A terminal
+    historical row is left exactly as it is; only a still-sendable one is moved
+    out of reach.
+    """
+    if job.status not in _SENDABLE_JOB_STATUSES:
+        return False
+    job.status = "canceled"
+    job.locked_at = None
+    job.updated_at = utcnow()
+    job.last_error = f"Canceled: delivery retry {reason} does not match the proven chain identity"
+    return True
+
+
+def _occupant_claim_error(
+    occupant: MessageJob,
+    *,
+    identity: RetryIdentity,
+    original_outbox_id: int,
+    attempt_number: int,
+) -> str | None:
+    """Return ``None`` only when *occupant* IS this exact retry, else a reason.
+
+    The single definition of "the same retry", used by the initial locked read
+    and by the lost-race re-read alike. Matching identity fields are not enough:
+    a row can carry the right provider, company, record, client and job type
+    while its payload points at a different chain or a different attempt. Such a
+    row is a squatter on a globally unique key, and treating it as idempotent
+    used to make the real retry unreachable forever — silently.
+    """
+    reference = resolve_retry_reference(occupant)
+    if reference.reference is None:
+        return reference.error or "delivery_retry_reference_unproven"
+    if reference.reference.original_outbox_id != original_outbox_id:
+        return "delivery_retry_outbox_reference_mismatch"
+    if reference.reference.attempt_number != attempt_number:
+        return "delivery_retry_attempt_mismatch"
+    mismatch = identity.mismatch_field(occupant)
+    if mismatch is not None:
+        return f"identity_{mismatch}_mismatch"
+    if occupant.job_type not in DELIVERY_RETRY_JOB_TYPES:
+        return "delivery_retry_job_type_not_enabled"
+    return None
+
+
+async def _job_has_outbox(session: AsyncSession, job_id: int) -> bool:
+    """True when the job already produced a send attempt of its own."""
+    stmt = select(OutboxMessage.id).where(OutboxMessage.job_id == job_id).limit(1)
+    return (await session.execute(stmt)).scalar_one_or_none() is not None
+
+
+def _reclaim_retry_slot(job: MessageJob, *, identity: RetryIdentity, fields: dict[str, Any]) -> None:
+    """Rewrite an unsent squatter into the canonical retry for this slot.
+
+    Not "inventing a job": the dedupe key ``delivery_retry:<root>:<attempt>``
+    belongs to this chain by construction, and every value written here is the
+    identity just proven from the chain's own root. The row contributed nothing
+    — it has no ``OutboxMessage``, so no message went out under it — so the only
+    thing being taken is a name that was never its to hold.
+
+    The alternative, cancelling it, leaves the key occupied and burns that
+    attempt number permanently: the next callback computes the same key, finds
+    the same terminal squatter, and the legitimate redelivery is lost for good.
+    That is the failure this whole change exists to remove, so a slot with no
+    side effect is reclaimed rather than abandoned.
+    """
+    for field, value in identity.as_job_fields().items():
+        setattr(job, field, value)
+    for field, value in fields.items():
+        setattr(job, field, value)
+    job.locked_at = None
+    job.updated_at = utcnow()
+    job.last_error = "Reclaimed: delivery retry slot normalized to the proven chain identity"
+
+
+@dataclass(frozen=True)
+class RetrySlotOutcome:
+    """What happened to the globally unique dedupe key for one attempt."""
+
+    job: MessageJob | None
+    reason: str | None = None
+    action: str = "created"  # created | idempotent | reclaimed | refused
 
 
 async def _create_delivery_retry_job_idempotent(
     session: AsyncSession,
     *,
     dedupe_key: str,
+    identity: RetryIdentity,
+    original_outbox_id: int,
+    attempt_number: int,
     **fields: Any,
-) -> MessageJob | None:
-    existing = await _select_message_job_by_dedupe(session, dedupe_key)
-    if existing is not None:
-        return existing
+) -> RetrySlotOutcome:
+    occupant = await _select_retry_job_for_update(session, dedupe_key)
+    if occupant is None:
+        job = MessageJob(dedupe_key=dedupe_key, **identity.as_job_fields(), **fields)
+        try:
+            async with session.begin_nested():
+                session.add(job)
+                await session.flush()
+        except IntegrityError:
+            # Lost the race for the unique key. The winner is judged by exactly
+            # the same rule as a row found by the initial locked read.
+            occupant = await _select_retry_job_for_update(session, dedupe_key)
+            if occupant is None:
+                return RetrySlotOutcome(job=None, reason="delivery_retry_slot_vanished", action="refused")
+        else:
+            return RetrySlotOutcome(job=job, action="created")
 
-    job = MessageJob(dedupe_key=dedupe_key, **fields)
-    try:
-        async with session.begin_nested():
-            session.add(job)
-            await session.flush()
-    except IntegrityError:
-        return await _select_message_job_by_dedupe(session, dedupe_key)
-    return job
+    reason = _occupant_claim_error(
+        occupant,
+        identity=identity,
+        original_outbox_id=original_outbox_id,
+        attempt_number=attempt_number,
+    )
+    if reason is None:
+        # Genuinely idempotent: the same callback arriving twice. Leave the
+        # existing job exactly as it is — no restart, no reschedule, no second row.
+        return RetrySlotOutcome(job=occupant, action="idempotent")
+
+    if await _job_has_outbox(session, int(occupant.id)):
+        _neutralize_conflicting_retry(occupant, reason)
+        return RetrySlotOutcome(job=None, reason=reason, action="refused")
+
+    _reclaim_retry_slot(occupant, identity=identity, fields=fields)
+    return RetrySlotOutcome(job=occupant, reason=reason, action="reclaimed")
 
 
 def _extract_status_updates(
@@ -1010,18 +1196,48 @@ async def _handle_delivery_statuses(
             )
             continue
 
+        chain_resolution = None
+        if kind == "failed" or kind in _SUCCESSFUL_DELIVERY_STATUSES:
+            chain_resolution = await resolve_status_retry_chain(session, outbox)
+
         if kind == "failed":
-            if await _should_ignore_failed_after_success(session, outbox):
+            if chain_resolution is None or chain_resolution.chain is None:
+                _record_status_retry_chain_refusal(
+                    outbox,
+                    (chain_resolution.error if chain_resolution is not None else None)
+                    or "retry_chain_identity_unproven",
+                )
+                if outbox.status in _SUCCESSFUL_DELIVERY_STATUSES:
+                    _mark_stale_failed_after_success(outbox, status)
+                    continue
+                _mark_outbox_delivery_failed(outbox, status, "whatsapp_delivery_failed")
+                updated_outbox_ids.append(int(outbox.id))
+                outbox_id_to_new_status[int(outbox.id)] = "failed"
+                continue
+
+            if await _should_ignore_failed_after_success(session, outbox, chain_resolution.chain):
                 _mark_stale_failed_after_success(outbox, status)
                 continue
             _mark_outbox_delivery_failed(outbox, status, "whatsapp_delivery_failed")
             updated_outbox_ids.append(int(outbox.id))
             outbox_id_to_new_status[int(outbox.id)] = "failed"
-            await _handle_failed_delivery_status(session, event, status, outbox=outbox)
+            await _handle_failed_delivery_status(
+                session,
+                event,
+                status,
+                outbox=outbox,
+                chain=chain_resolution.chain,
+            )
             continue
 
         if kind not in {"sent", "delivered", "read"}:
             continue
+
+        if kind in _SUCCESSFUL_DELIVERY_STATUSES and (chain_resolution is None or chain_resolution.chain is None):
+            _record_status_retry_chain_refusal(
+                outbox,
+                (chain_resolution.error if chain_resolution is not None else None) or "retry_chain_identity_unproven",
+            )
 
         current_rank = _WA_STATUS_RANK.get(outbox.status, 0)
         if outbox.status == "failed" and kind in _SUCCESSFUL_DELIVERY_STATUSES:
@@ -1032,22 +1248,39 @@ async def _handle_delivery_statuses(
 
         if outbox.status == "failed":
             outbox.error = None
-            recovered_meta = dict(outbox.meta or {})
+            recovered_meta = _copy_outbox_meta(outbox)
             recovered_meta["delivery_failed"] = False
             recovered_meta["delivery_recovered_to"] = kind
             recovered_meta["delivery_recovered_at"] = utcnow().isoformat()
             outbox.meta = recovered_meta
 
         outbox.status = kind
-        meta = dict(outbox.meta or {})
+        meta = _copy_outbox_meta(outbox)
         meta[f"wa_status_{kind}"] = {"timestamp": status.get("timestamp")}
         outbox.meta = meta
         updated_outbox_ids.append(int(outbox.id))
         outbox_id_to_new_status[int(outbox.id)] = kind
 
         if kind in _SUCCESSFUL_DELIVERY_STATUSES:
-            original_outbox_id = _delivery_retry_chain_original_outbox_id(outbox)
-            canceled = await _cancel_queued_delivery_retry_jobs_for_chain(
+            if chain_resolution is None or chain_resolution.chain is None:
+                # DELIBERATE, not an oversight — do not "fix" this back to a
+                # fallback on `outbox.id`.
+                #
+                # Cancelling siblings needs a chain root, and the only pointer
+                # available here is unproven. Acting on it would cancel queued
+                # jobs of whatever chain that pointer names — possibly another
+                # tenant's — which is worse than the alternative.
+                #
+                # The accepted cost: a retry already queued for THIS message may
+                # still fire after the original landed, and the customer sees a
+                # duplicate notification for one booking. That is annoying and
+                # visible; cancelling a stranger's retries is silent and wrong.
+                # The refusal is audited above via
+                # `_record_status_retry_chain_refusal`, so an operator can see
+                # which message this happened to.
+                continue
+            original_outbox_id = chain_resolution.chain.original_outbox_id
+            canceled, saw_unproven = await _cancel_queued_delivery_retry_jobs_for_chain(
                 session,
                 original_outbox_id,
                 "Canceled: original delivery later succeeded",
@@ -1057,6 +1290,16 @@ async def _handle_delivery_statuses(
                     "Canceled queued delivery retries original_outbox_id=%s canceled_count=%s status=%s",
                     original_outbox_id,
                     canceled,
+                    kind,
+                )
+            if saw_unproven:
+                # Rows wear this chain's name without proving membership. They
+                # are deliberately left alone, so surface the discrepancy: an
+                # operator should know the chain is not what it looks like.
+                _record_status_retry_chain_refusal(outbox, "chain_has_unproven_prefix_rows")
+                logger.warning(
+                    "Delivery retry chain has unproven prefix rows original_outbox_id=%s status=%s",
+                    original_outbox_id,
                     kind,
                 )
 
@@ -1094,6 +1337,7 @@ async def _handle_failed_delivery_status(
     status: dict[str, Any],
     *,
     outbox: OutboxMessage | None,
+    chain: StatusRetryChain,
 ) -> None:
     provider_message_id = str(status["provider_message_id"])
     if outbox is None:
@@ -1107,63 +1351,62 @@ async def _handle_failed_delivery_status(
     if not _is_retryable_delivery_failure(status):
         return
 
-    meta = outbox.meta or {}
-    original_outbox_id = int(outbox.id)
-    attempt_number = 1
-    if meta.get("delivery_retry_of_outbox_id") is not None:
-        try:
-            original_outbox_id = int(meta["delivery_retry_of_outbox_id"])
-            attempt_number = int(meta.get("delivery_retry_attempt") or 0) + 1
-        except (TypeError, ValueError):
-            original_outbox_id = int(outbox.id)
-            attempt_number = 1
+    original_outbox_id = chain.original_outbox_id
+    attempt_number = (chain.attempt_number or 0) + 1
 
-    dedupe_prefix = f"{_DELIVERY_RETRY_DEDUPE_PREFIX}{original_outbox_id}:"
-    rows = (
-        await session.execute(
-            select(MessageJob.id, MessageJob.dedupe_key).where(MessageJob.dedupe_key.like(dedupe_prefix + "%"))
+    # Resolve the chain's authoritative identity FIRST — before the occupied
+    # dedupe key is treated as proof of anything.
+    #
+    # A taken attempt suffix used to short-circuit here, which meant a row like
+    # `delivery_retry:<easyweek_outbox_id>:1` carrying `provider='altegio'` and
+    # pointing at EasyWeek domain rows was simply left queued, and the outbox
+    # worker would go on to send it with an Altegio template from the Altegio
+    # number. "The key is taken" is not "the retry already exists".
+    anchor_outbox = chain.anchor_outbox
+    original_job = chain.original_job
+    identity = chain.identity
+    if identity is None:
+        resolution = await resolve_retry_identity(
+            session,
+            anchor_outbox=anchor_outbox,
+            original_job=original_job,
+            job_type=job_type,
         )
-    ).all()
-    existing_job_ids: list[int] = []
-    existing_attempts: set[int] = set()
-    for job_id, dedupe_key in rows:
-        existing_job_ids.append(int(job_id))
-        suffix = str(dedupe_key).rsplit(":", 1)[-1]
-        try:
-            existing_attempts.add(int(suffix))
-        except ValueError:
-            continue
+        if resolution.identity is None:
+            _record_retry_skip(outbox, resolution.error or "identity_unproven", original_outbox_id)
+            logger.warning(
+                "Delivery retry refused: reason=%s original_outbox_id=%s outbox_id=%s",
+                resolution.error,
+                original_outbox_id,
+                int(outbox.id),
+            )
+            return
+        identity = resolution.identity
+    assert original_job is not None  # guaranteed by resolve_retry_identity / chain resolver
 
-    if attempt_number in existing_attempts:
-        return
-    if attempt_number > _DELIVERY_RETRY_MAX_ATTEMPTS or len(existing_attempts) >= _DELIVERY_RETRY_MAX_ATTEMPTS:
+    if attempt_number > DELIVERY_RETRY_MAX_ATTEMPTS:
         if event is not None:
             event.error = f"Delivery retry limit reached for outbox_id={original_outbox_id}"
         return
 
-    if existing_job_ids:
-        delivered = (
-            await session.execute(
-                select(OutboxMessage.id)
-                .where(OutboxMessage.job_id.in_(existing_job_ids))
-                .where(OutboxMessage.status.in_(_SUCCESSFUL_DELIVERY_STATUSES))
-                .limit(1)
-            )
-        ).scalar_one_or_none()
-        if delivered is not None:
-            return
+    dedupe_key = f"{DELIVERY_RETRY_DEDUPE_PREFIX}{original_outbox_id}:{attempt_number}"
 
-    anchor_outbox = outbox
-    if original_outbox_id != int(outbox.id):
-        original = await session.get(OutboxMessage, original_outbox_id)
-        if original is None:
-            skip_meta = dict(outbox.meta or {})
-            skip_meta["delivery_retry_skipped"] = True
-            skip_meta["delivery_retry_skip_reason"] = "original_outbox_missing"
-            skip_meta["delivery_retry_original_outbox_id"] = original_outbox_id
-            outbox.meta = skip_meta
-            return
-        anchor_outbox = original
+    # Budget and success are counted over PROVEN members of this chain, never
+    # over everything sharing the key prefix. A stranger's row named after this
+    # root must not consume an attempt, and must not be able to declare the
+    # chain delivered — either would deny a legitimate retry.
+    chain_members = await resolve_retry_chain_members(session, original_outbox_id)
+    existing_attempts = chain_members.attempt_numbers
+
+    if len(existing_attempts) >= DELIVERY_RETRY_MAX_ATTEMPTS:
+        if event is not None:
+            event.error = f"Delivery retry limit reached for outbox_id={original_outbox_id}"
+        return
+
+    from altegio_bot.workers.outbox_worker import _delivery_retry_chain_has_success
+
+    if await _delivery_retry_chain_has_success(session, original_outbox_id):
+        return
 
     record: Record | None = None
     if anchor_outbox.record_id is not None:
@@ -1202,32 +1445,49 @@ async def _handle_failed_delivery_status(
             record_starts_at = record_starts_at.replace(tzinfo=timezone.utc)
         payload["record_starts_at"] = record_starts_at.isoformat()
 
-    original_job = None
-    if anchor_outbox.job_id is not None:
-        original_job = await session.get(MessageJob, anchor_outbox.job_id)
     max_attempts = int(getattr(original_job, "max_attempts", 5) or 5)
 
-    dedupe_key = f"{_DELIVERY_RETRY_DEDUPE_PREFIX}{original_outbox_id}:{attempt_number}"
-    created = await _create_delivery_retry_job_idempotent(
+    outcome = await _create_delivery_retry_job_idempotent(
         session,
         dedupe_key=dedupe_key,
-        company_id=anchor_outbox.company_id,
-        record_id=anchor_outbox.record_id,
-        client_id=anchor_outbox.client_id,
-        job_type=job_type,
+        # provider / company / record / client / job_type all come from the
+        # proven identity. Leaving provider to the column default would silently
+        # stamp every EasyWeek retry as Altegio, and the retry would then load an
+        # Altegio template and send from the Altegio number — the exact
+        # cross-tenant leak PR-5 exists to prevent.
+        identity=identity,
+        original_outbox_id=original_outbox_id,
+        attempt_number=attempt_number,
         status="queued",
         run_at=next_run_at,
         attempts=0,
         max_attempts=max_attempts,
         payload=payload,
     )
+    if outcome.job is None:
+        _record_retry_skip(outbox, f"conflicting_retry_{outcome.reason}", original_outbox_id)
+        logger.warning(
+            "Delivery retry refused: dedupe_key=%s reason=%s",
+            dedupe_key,
+            outcome.reason,
+        )
+        return
+
+    if outcome.action == "reclaimed":
+        _record_retry_slot_reclaimed(outbox, outcome.reason or "unknown", original_outbox_id)
+        logger.warning(
+            "Delivery retry slot reclaimed: dedupe_key=%s reason=%s",
+            dedupe_key,
+            outcome.reason,
+        )
+
     logger.warning(
-        "Scheduled delivery retry original_outbox_id=%s attempt=%s delay_seconds=%s dedupe_key=%s created=%s",
+        "Scheduled delivery retry original_outbox_id=%s attempt=%s delay_seconds=%s dedupe_key=%s action=%s",
         original_outbox_id,
         attempt_number,
         delay,
         dedupe_key,
-        created is not None,
+        outcome.action,
     )
 
 

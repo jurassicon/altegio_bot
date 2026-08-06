@@ -244,7 +244,7 @@ async def test_monthly_empty_client_name_fails_locally(monkeypatch: Any) -> None
     session = _FakeSession()
     _patch_common(monkeypatch)
 
-    async def _fake_render(session, *, company_id, template_code, record, client):
+    async def _fake_render(session, *, company_id, template_code, record, client, **_kw):
         return "Hallo {{1}}, ...", 1, "de", _base_render_ctx(client_name="")
 
     monkeypatch.setattr(ow, "_render_message", _fake_render)
@@ -296,7 +296,7 @@ async def test_monthly_wrong_param_count_fails_locally(monkeypatch: Any) -> None
     session = _FakeSession()
     _patch_common(monkeypatch)
 
-    async def _fake_render(session, *, company_id, template_code, record, client):
+    async def _fake_render(session, *, company_id, template_code, record, client, **_kw):
         return "Hallo {{1}}, ...", 1, "de", _base_render_ctx()
 
     monkeypatch.setattr(ow, "_render_message", _fake_render)
@@ -349,7 +349,7 @@ async def test_followup_wrong_param_count_fails_locally(monkeypatch: Any) -> Non
     session = _FakeSession()
     _patch_common(monkeypatch)
 
-    async def _fake_render(session, *, company_id, template_code, record, client):
+    async def _fake_render(session, *, company_id, template_code, record, client, **_kw):
         return "Hallo {{1}}, ...", 1, "de", _base_render_ctx()
 
     monkeypatch.setattr(ow, "_render_message", _fake_render)
@@ -402,7 +402,7 @@ async def test_valid_monthly_template_calls_send(monkeypatch: Any) -> None:
     session = _FakeSession()
     _patch_common(monkeypatch)
 
-    async def _fake_render(session, *, company_id, template_code, record, client):
+    async def _fake_render(session, *, company_id, template_code, record, client, **_kw):
         return "Hallo {{1}}, ...", 1, "de", _base_render_ctx(client_name="Anna Müller")
 
     monkeypatch.setattr(ow, "_render_message", _fake_render)
@@ -448,7 +448,7 @@ async def test_text_send_path_unaffected_by_preflight(monkeypatch: Any) -> None:
     session = _FakeSession()
     _patch_common(monkeypatch)
 
-    async def _fake_render(session, *, company_id, template_code, record, client):
+    async def _fake_render(session, *, company_id, template_code, record, client, **_kw):
         return "Hallo Anna, ...", 1, "de", _base_render_ctx(client_name="")
 
     monkeypatch.setattr(ow, "_render_message", _fake_render)
