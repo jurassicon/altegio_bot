@@ -1176,7 +1176,13 @@ async def test_delivered_cancels_queued_delivery_retries(session_maker) -> None:
                     attempts=0,
                     max_attempts=5,
                     dedupe_key=f"delivery_retry:{outbox_id}:1",
-                    payload={"kind": "delivery_failed_retry", "delivery_retry_of_outbox_id": outbox_id},
+                    # A canonical retry payload: the attempt number is part of
+                    # the chain pointer, and only proven members are cancelled.
+                    payload={
+                        "kind": "delivery_failed_retry",
+                        "delivery_retry_of_outbox_id": outbox_id,
+                        "delivery_retry_attempt": 1,
+                    },
                 )
             )
 

@@ -26,6 +26,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.easyweek_policy import (
@@ -89,6 +90,34 @@ class RetryIdentity:
         for field in ("company_id", "record_id", "client_id", "job_type"):
             if getattr(job, field, None) != getattr(self, field):
                 return field
+        return None
+
+    def outbox_mismatch_field(self, outbox: OutboxMessage) -> str | None:
+        """Name the first field *outbox* disagrees on, or ``None``.
+
+        ``OutboxMessage`` has no ``provider`` column, so belonging to a proven
+        member job is what places a row in a chain; these fields then check that
+        the row itself is consistent with the tenant the chain belongs to.
+
+        ``client_id`` is compared against the EFFECTIVE client, which is what
+        this identity already carries. PR-4 partial deliveries legitimately
+        produce a job with ``client_id = NULL`` while the send resolves the
+        client through the record, so the outbox row names a real client that
+        the job does not — comparing against the job's column would reject an
+        ordinary booking.
+
+        ``template_code`` mirrors ``job_type``: the outbox column is named for
+        the template, the job column for the lifecycle event, and they are the
+        same value.
+        """
+        if outbox.company_id != self.company_id:
+            return "company_id"
+        if outbox.record_id != self.record_id:
+            return "record_id"
+        if outbox.client_id != self.client_id:
+            return "client_id"
+        if outbox.template_code != self.job_type:
+            return "template_code"
         return None
 
 
@@ -494,4 +523,111 @@ async def resolve_status_retry_chain(
             identity=identity,
             is_retry=True,
         )
+    )
+
+
+@dataclass(frozen=True)
+class RetryChainMember:
+    """One job proven to belong to a chain, with the pointer that proved it."""
+
+    job: MessageJob
+    reference: RetryReference
+
+
+@dataclass(frozen=True)
+class RetryChainMembers:
+    """The proven membership of one chain: its root identity and its jobs."""
+
+    original_outbox_id: int
+    identity: RetryIdentity | None = None
+    members: tuple[RetryChainMember, ...] = ()
+    candidate_count: int = 0
+    error: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.identity is not None
+
+    @property
+    def job_ids(self) -> list[int]:
+        return [int(member.job.id) for member in self.members]
+
+    @property
+    def attempt_numbers(self) -> set[int]:
+        return {member.reference.attempt_number for member in self.members}
+
+    @property
+    def has_unproven_candidates(self) -> bool:
+        """True when rows carry the chain's key prefix without proving membership."""
+        return self.candidate_count > len(self.members)
+
+
+async def resolve_retry_chain_members(
+    session: AsyncSession,
+    original_outbox_id: int,
+    *,
+    statuses: tuple[str, ...] | None = None,
+    for_update: bool = False,
+) -> RetryChainMembers:
+    """Who actually belongs to the chain rooted at *original_outbox_id*.
+
+    The one definition of chain membership. Sharing the dedupe key prefix is not
+    it: the prefix says a row was NAMED after this root, nothing about who wrote
+    it or which chain its payload points at. A row counts only when its own
+    payload and namespace prove a reference to this root AND its identity
+    matches the identity proven from the root itself.
+
+    ``statuses`` narrows the candidate set (the cancel path wants only
+    ``queued``); ``for_update`` takes a row lock on the candidates, which the
+    cancel path needs so the outbox worker cannot claim a row between the proof
+    and the cancellation. Both are read shapes — the membership rule below is
+    the same either way, which is the entire point of this living in one place.
+    """
+    anchor_outbox = await session.get(OutboxMessage, original_outbox_id)
+    if anchor_outbox is None:
+        return RetryChainMembers(original_outbox_id=original_outbox_id, error="chain_root_outbox_missing")
+
+    anchor_job: MessageJob | None = None
+    if anchor_outbox.job_id is not None:
+        anchor_job = await session.get(MessageJob, anchor_outbox.job_id)
+
+    resolution = await resolve_retry_identity(
+        session,
+        anchor_outbox=anchor_outbox,
+        original_job=anchor_job,
+        job_type=anchor_outbox.template_code,
+    )
+    if resolution.identity is None:
+        # An unprovable root has no provable members. Fail closed rather than
+        # letting an unproven pointer decide anything about other rows.
+        return RetryChainMembers(
+            original_outbox_id=original_outbox_id,
+            error=resolution.error or "chain_root_identity_unproven",
+        )
+    identity = resolution.identity
+
+    prefix = f"{DELIVERY_RETRY_DEDUPE_PREFIX}{original_outbox_id}:"
+    stmt = select(MessageJob).where(MessageJob.dedupe_key.like(prefix + "%"))
+    if statuses is not None:
+        stmt = stmt.where(MessageJob.status.in_(statuses))
+    if for_update:
+        stmt = stmt.with_for_update()
+    candidates = list((await session.execute(stmt)).scalars().all())
+
+    members: list[RetryChainMember] = []
+    for candidate in candidates:
+        reference = resolve_retry_reference(candidate)
+        if reference.reference is None:
+            continue
+        if reference.reference.original_outbox_id != original_outbox_id:
+            continue
+        if identity.mismatch_field(candidate) is not None:
+            continue
+        members.append(RetryChainMember(job=candidate, reference=reference.reference))
+
+    return RetryChainMembers(
+        original_outbox_id=original_outbox_id,
+        identity=identity,
+        members=tuple(members),
+        candidate_count=len(candidates),
     )

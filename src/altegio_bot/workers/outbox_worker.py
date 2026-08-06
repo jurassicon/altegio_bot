@@ -25,9 +25,9 @@ from altegio_bot.campaigns.runner import (
 )
 from altegio_bot.db import SessionLocal
 from altegio_bot.delivery_retry_identity import (
-    DELIVERY_RETRY_DEDUPE_PREFIX,
     DELIVERY_RETRY_JOB_TYPES,
     claims_delivery_retry,
+    resolve_retry_chain_members,
     resolve_retry_identity,
     resolve_retry_reference,
 )
@@ -1239,7 +1239,14 @@ async def _delivery_retry_chain_has_success(
 
     So a candidate counts only when its own payload/namespace prove a reference
     to THIS root and its identity matches the identity proven from the root
-    itself, via the same resolver every other retry decision uses.
+    itself, via :func:`resolve_retry_chain_members` — the same definition of
+    membership every other retry decision uses.
+
+    The delivered ``OutboxMessage`` is checked too, not just the job that owns
+    it. Belonging to a proven member is what puts a row in the chain; its own
+    company, record, effective client and template code then have to agree with
+    the tenant that chain belongs to, or the "success" it reports is about some
+    other message.
     """
     orig_stmt = (
         select(OutboxMessage.id)
@@ -1250,50 +1257,22 @@ async def _delivery_retry_chain_has_success(
     if (await session.execute(orig_stmt)).scalar_one_or_none() is not None:
         return True
 
-    anchor_outbox = await session.get(OutboxMessage, original_outbox_id)
-    if anchor_outbox is None:
-        return False
-    anchor_job: MessageJob | None = None
-    if anchor_outbox.job_id is not None:
-        anchor_job = await session.get(MessageJob, anchor_outbox.job_id)
-    resolution = await resolve_retry_identity(
-        session,
-        anchor_outbox=anchor_outbox,
-        original_job=anchor_job,
-        job_type=anchor_outbox.template_code,
-    )
-    if resolution.identity is None:
+    chain = await resolve_retry_chain_members(session, original_outbox_id)
+    if chain.identity is None:
         # The root is not a provable chain root, so nothing can be a proven
         # member of it. Fail closed: the presend guard refuses this job anyway,
         # and claiming success here would cancel siblings on unproven grounds.
         return False
-    identity = resolution.identity
-
-    prefix = f"{DELIVERY_RETRY_DEDUPE_PREFIX}{original_outbox_id}:"
-    candidates_stmt = select(MessageJob).where(MessageJob.dedupe_key.like(prefix + "%"))
-    candidates = list((await session.execute(candidates_stmt)).scalars().all())
-
-    member_ids: list[int] = []
-    for candidate in candidates:
-        reference = resolve_retry_reference(candidate)
-        if reference.reference is None:
-            continue
-        if reference.reference.original_outbox_id != original_outbox_id:
-            continue
-        if identity.mismatch_field(candidate) is not None:
-            continue
-        member_ids.append(int(candidate.id))
-
-    if not member_ids:
+    if not chain.members:
         return False
 
-    retry_stmt = (
-        select(OutboxMessage.id)
-        .where(OutboxMessage.job_id.in_(member_ids))
+    delivered_stmt = (
+        select(OutboxMessage)
+        .where(OutboxMessage.job_id.in_(chain.job_ids))
         .where(OutboxMessage.status.in_(_DELIVERED_READ_STATUSES))
-        .limit(1)
     )
-    return (await session.execute(retry_stmt)).scalar_one_or_none() is not None
+    delivered_rows = (await session.execute(delivered_stmt)).scalars().all()
+    return any(chain.identity.outbox_mismatch_field(row) is None for row in delivered_rows)
 
 
 async def _delivery_retry_presend_guard(

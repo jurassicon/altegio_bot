@@ -39,7 +39,11 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 import altegio_bot.db as app_db
 from altegio_bot.campaigns.runner import CAMPAIGN_EXECUTION_JOB_TYPE
-from altegio_bot.delivery_retry_identity import RetryIdentity, resolve_retry_identity
+from altegio_bot.delivery_retry_identity import (
+    RetryIdentity,
+    resolve_retry_chain_members,
+    resolve_retry_identity,
+)
 from altegio_bot.easyweek_normalizer import canonical_booking_uuid
 from altegio_bot.easyweek_policy import (
     EASYWEEK_LIFECYCLE_JOB_TYPES,
@@ -4207,3 +4211,250 @@ async def test_a_success_callback_on_a_proven_chain_still_cancels_siblings(
     assert sibling.last_error == "Canceled: original delivery later succeeded"
     await db.refresh(root_outbox)
     assert root_outbox.meta.get("delivery_retry_chain_refused") is None
+
+
+# ---------------------------------------------------------------------------
+# 21. Success is proven for the outbox row too, and cancels only proven members
+# ---------------------------------------------------------------------------
+
+
+async def _seed_member_retry_with_delivered_outbox(
+    db: AsyncSession,
+    *,
+    root_job: MessageJob,
+    root_outbox: OutboxMessage,
+    attempt: int = 2,
+    company_id: int | None = None,
+    record_id: int | None = None,
+    template_code: str | None = None,
+    client_id: int | None = None,
+) -> tuple[MessageJob, OutboxMessage]:
+    """A canonical member job whose delivered outbox may be off in one field."""
+    member = MessageJob(
+        provider=PROVIDER_EASYWEEK,
+        company_id=root_job.company_id,
+        record_id=root_job.record_id,
+        client_id=root_outbox.client_id,
+        job_type=root_job.job_type,
+        run_at=datetime.now(timezone.utc),
+        status="done",
+        dedupe_key=f"delivery_retry:{root_outbox.id}:{attempt}",
+        payload={
+            "kind": "delivery_failed_retry",
+            "delivery_retry_of_outbox_id": root_outbox.id,
+            "delivery_retry_attempt": attempt,
+        },
+    )
+    db.add(member)
+    await db.flush()
+    delivered = OutboxMessage(
+        company_id=company_id if company_id is not None else root_outbox.company_id,
+        client_id=client_id if client_id is not None else root_outbox.client_id,
+        record_id=record_id if record_id is not None else root_outbox.record_id,
+        job_id=member.id,
+        phone_e164=CLIENT_PHONE,
+        template_code=template_code if template_code is not None else root_outbox.template_code,
+        language="de",
+        body="BODY",
+        status="delivered",
+        scheduled_at=datetime.now(timezone.utc),
+        sent_at=datetime.now(timezone.utc),
+        meta={},
+    )
+    db.add(delivered)
+    await db.flush()
+    return member, delivered
+
+
+@pytest.mark.parametrize(
+    "field,value_kind",
+    [
+        ("company_id", "other"),
+        ("record_id", "other"),
+        ("template_code", "other"),
+    ],
+)
+async def test_a_delivered_outbox_from_another_scope_does_not_mark_the_chain_successful(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    field: str,
+    value_kind: str,
+) -> None:
+    """Owning a proven member job is not enough — the row itself must agree.
+
+    Otherwise a delivered row belonging to a different company, record or
+    template declares this chain landed, suppressing a real failed-callback and
+    cancelling correct queued retries.
+    """
+    root_job, root_outbox = await _seed_easyweek_send_with_outbox(db, capture)
+    await _deliver_failed_status(db, root_outbox.provider_message_id, dedupe="wa:scope-setup")
+    legitimate = (await _retry_jobs_for(db, root_outbox.id))[0]
+    assert legitimate.status == "queued"
+
+    overrides: dict[str, Any] = {}
+    if field == "company_id":
+        overrides["company_id"] = OTHER_EASYWEEK_COMPANY_ID
+    elif field == "record_id":
+        # Any record outside this chain will do; an Altegio one avoids the
+        # partial-unique EasyWeek booking UUID the fixture pins.
+        _other_client, other_record = await _seed_altegio_client_and_record(db)
+        overrides["record_id"] = other_record.id
+    else:
+        overrides["template_code"] = "record_canceled"
+
+    await _seed_member_retry_with_delivered_outbox(
+        db,
+        root_job=root_job,
+        root_outbox=root_outbox,
+        **overrides,
+    )
+
+    assert await ow._delivery_retry_chain_has_success(db, int(root_outbox.id)) is False
+
+    guard_reason = await ow._delivery_retry_presend_guard(
+        db,
+        legitimate,
+        await db.get(Record, legitimate.record_id),
+    )
+    assert guard_reason is None, "the legitimate retry must survive an out-of-scope delivered row"
+
+
+async def test_a_delivered_outbox_consistent_with_the_chain_marks_it_successful(
+    db: AsyncSession,
+    capture: CaptureProvider,
+) -> None:
+    """The positive control for the outbox-field check."""
+    root_job, root_outbox = await _seed_easyweek_send_with_outbox(db, capture)
+    await _seed_member_retry_with_delivered_outbox(db, root_job=root_job, root_outbox=root_outbox)
+
+    assert await ow._delivery_retry_chain_has_success(db, int(root_outbox.id)) is True
+
+
+async def test_a_success_callback_leaves_an_unproven_prefix_row_untouched(
+    db: AsyncSession,
+    capture: CaptureProvider,
+) -> None:
+    """A stranger on the prefix keeps its status AND its diagnostic error.
+
+    Its ``last_error`` is the only record of why it was rejected; overwriting it
+    with "the original later succeeded" would erase that and assert a membership
+    nobody proved.
+    """
+    root_job, root_outbox = await _seed_easyweek_send_with_outbox(db, capture)
+
+    stranger = MessageJob(
+        provider=PROVIDER_ALTEGIO,
+        company_id=root_job.company_id,
+        record_id=root_job.record_id,
+        client_id=root_outbox.client_id,
+        job_type=root_job.job_type,
+        run_at=datetime.now(timezone.utc),
+        status="queued",
+        dedupe_key=f"delivery_retry:{root_outbox.id}:3",
+        payload={
+            "kind": "delivery_failed_retry",
+            "delivery_retry_of_outbox_id": root_outbox.id,
+            "delivery_retry_attempt": 3,
+        },
+        last_error="Canceled: delivery retry provider does not match the proven chain identity",
+    )
+    db.add(stranger)
+    await db.flush()
+
+    await _deliver_status(db, _delivered_status_payload(root_outbox.provider_message_id), dedupe="wa:leave-stranger")
+
+    await db.refresh(stranger)
+    assert stranger.status == "queued", "an unproven row is evidence, not a member to cancel"
+    assert stranger.last_error == "Canceled: delivery retry provider does not match the proven chain identity"
+
+    # The discrepancy is surfaced rather than swallowed.
+    await db.refresh(root_outbox)
+    assert root_outbox.meta["delivery_retry_chain_refused"] is True
+    assert root_outbox.meta["delivery_retry_chain_refusal_reason"] == "chain_has_unproven_prefix_rows"
+    refusal = {k: v for k, v in root_outbox.meta.items() if k.startswith("delivery_retry_chain")}
+    for secret in (CLIENT_PHONE, CLIENT_EMAIL, "Anna", "Wimpernverlängerung", BOOKING_HASH, VERIFIED_PAGE):
+        assert secret not in str(refusal)
+
+
+async def test_a_success_callback_still_cancels_a_canonical_queued_sibling(
+    db: AsyncSession,
+    capture: CaptureProvider,
+) -> None:
+    """Regression guard: proving membership must not break ordinary cancellation."""
+    _root_job, root_outbox = await _seed_easyweek_send_with_outbox(db, capture)
+    await _deliver_failed_status(db, root_outbox.provider_message_id, dedupe="wa:canonical-sibling-setup")
+    sibling = (await _retry_jobs_for(db, root_outbox.id))[0]
+    assert sibling.status == "queued"
+
+    await _deliver_status(db, _delivered_status_payload(root_outbox.provider_message_id), dedupe="wa:canonical-sibling")
+
+    await db.refresh(sibling)
+    assert sibling.status == "canceled"
+    assert sibling.last_error == "Canceled: original delivery later succeeded"
+    assert sibling.locked_at is None
+    await db.refresh(root_outbox)
+    assert root_outbox.meta.get("delivery_retry_chain_refused") is None
+
+
+async def test_a_partial_delivery_outbox_is_still_a_proven_chain_member(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    easyweek_inbox: async_sessionmaker[AsyncSession],
+) -> None:
+    """The PARTIAL trap: job.client_id is NULL, the outbox names the real client.
+
+    ``resolve_retry_identity`` deliberately resolves the effective client through
+    the record, so the outbox row is compared against THAT — comparing it to the
+    job's NULL column would reject an ordinary EasyWeek booking.
+    """
+    await _capture_and_process(
+        easyweek_inbox,
+        _future_booking(booking_created()),
+        event_hint="booking-created",
+        payload_hash="h-1",
+    )
+    await _capture_and_process(
+        easyweek_inbox,
+        _partial_payload(booking_updated),
+        event_hint="booking-updated",
+        payload_hash="h-2",
+    )
+
+    record = (await db.execute(select(Record).where(Record.provider == PROVIDER_EASYWEEK))).scalars().one()
+    client = (await db.execute(select(Client).where(Client.provider == PROVIDER_EASYWEEK))).scalars().one()
+    job = await _job_by_type(db, "record_updated")
+    assert job.client_id is None
+
+    db.add(
+        _template(
+            provider=PROVIDER_EASYWEEK,
+            company_id=TEST_LOCATION_ID,
+            code="record_updated",
+            language="de",
+            meta_template_name=EASYWEEK_UPDATED_TEMPLATE,
+        )
+    )
+    db.add(
+        _sender(
+            provider=PROVIDER_EASYWEEK,
+            company_id=TEST_LOCATION_ID,
+            phone_number_id="eyw-phone-id",
+        )
+    )
+    await db.flush()
+
+    await _run_job(db, job)
+    assert job.status == "done", job.last_error
+    rows = await _outbox_rows(db, job)
+    assert rows[0].client_id == client.id, "the send resolved the client through the record"
+
+    chain = await resolve_retry_chain_members(db, int(rows[0].id))
+    assert chain.identity is not None
+    assert chain.identity.client_id == client.id
+    assert chain.identity.record_id == record.id
+    assert chain.identity.outbox_mismatch_field(rows[0]) is None, "the partial-delivery outbox is in scope"
+
+    # And the whole success path agrees.
+    rows[0].status = "delivered"
+    await db.flush()
+    assert await ow._delivery_retry_chain_has_success(db, int(rows[0].id)) is True

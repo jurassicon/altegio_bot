@@ -22,6 +22,7 @@ from altegio_bot.delivery_retry_identity import (
     DELIVERY_RETRY_MAX_ATTEMPTS,
     RetryIdentity,
     StatusRetryChain,
+    resolve_retry_chain_members,
     resolve_retry_identity,
     resolve_retry_reference,
     resolve_status_retry_chain,
@@ -871,16 +872,51 @@ async def _cancel_queued_delivery_retry_jobs_for_chain(
     session: AsyncSession,
     original_outbox_id: int,
     reason: str,
-) -> int:
-    prefix = f"{_DELIVERY_RETRY_DEDUPE_PREFIX}{original_outbox_id}:"
-    stmt = (
-        update(MessageJob)
-        .where(MessageJob.status == "queued")
-        .where(MessageJob.dedupe_key.like(prefix + "%"))
-        .values(status="canceled", locked_at=None, updated_at=utcnow(), last_error=reason)
+) -> tuple[int, bool]:
+    """Cancel the chain's own queued retries after the message landed.
+
+    Returns ``(canceled_count, saw_unproven_candidates)``.
+
+    Only PROVEN members are cancelled. A bulk ``UPDATE`` over the dedupe prefix
+    would also hit rows that merely carry the chain's name — and an unproven row
+    is evidence: it has its own handling in the occupant check and the presend
+    guard, both of which write a diagnostic ``last_error``. Overwriting that with
+    "the original later succeeded" would erase the only record of why the row was
+    rejected, and would assert a membership nobody proved.
+
+    The candidates are read ``FOR UPDATE`` with a BLOCKING lock, not
+    ``skip_locked``. A locked row is precisely the one the outbox worker is
+    claiming right now — the row most urgently in need of cancelling — so
+    skipping it would lose the race by design. Blocking waits for that
+    transaction: either it finishes the send first, in which case PostgreSQL
+    re-evaluates the ``queued`` predicate after the lock and the row drops out,
+    or we win and cancel before it is claimed. Both outcomes are correct; a
+    silent skip is not.
+    """
+    chain = await resolve_retry_chain_members(
+        session,
+        original_outbox_id,
+        statuses=("queued",),
+        for_update=True,
     )
-    res = await session.execute(stmt)
-    return int(getattr(res, "rowcount", 0) or 0)
+    if chain.identity is None:
+        return 0, chain.candidate_count > 0
+
+    now = utcnow()
+    canceled = 0
+    for member in chain.members:
+        job = member.job
+        # Re-checked after the lock: the predicate was evaluated before we
+        # waited for it, and the owner of the lock may have moved the row on.
+        if job.status != "queued":
+            continue
+        job.status = "canceled"
+        job.locked_at = None
+        job.updated_at = now
+        job.last_error = reason
+        canceled += 1
+
+    return canceled, chain.has_unproven_candidates
 
 
 def _record_retry_skip(outbox: OutboxMessage, reason: str, original_outbox_id: int) -> None:
@@ -1244,7 +1280,7 @@ async def _handle_delivery_statuses(
                 # which message this happened to.
                 continue
             original_outbox_id = chain_resolution.chain.original_outbox_id
-            canceled = await _cancel_queued_delivery_retry_jobs_for_chain(
+            canceled, saw_unproven = await _cancel_queued_delivery_retry_jobs_for_chain(
                 session,
                 original_outbox_id,
                 "Canceled: original delivery later succeeded",
@@ -1254,6 +1290,16 @@ async def _handle_delivery_statuses(
                     "Canceled queued delivery retries original_outbox_id=%s canceled_count=%s status=%s",
                     original_outbox_id,
                     canceled,
+                    kind,
+                )
+            if saw_unproven:
+                # Rows wear this chain's name without proving membership. They
+                # are deliberately left alone, so surface the discrepancy: an
+                # operator should know the chain is not what it looks like.
+                _record_status_retry_chain_refusal(outbox, "chain_has_unproven_prefix_rows")
+                logger.warning(
+                    "Delivery retry chain has unproven prefix rows original_outbox_id=%s status=%s",
+                    original_outbox_id,
                     kind,
                 )
 
@@ -1349,20 +1395,8 @@ async def _handle_failed_delivery_status(
     # over everything sharing the key prefix. A stranger's row named after this
     # root must not consume an attempt, and must not be able to declare the
     # chain delivered — either would deny a legitimate retry.
-    dedupe_prefix = f"{DELIVERY_RETRY_DEDUPE_PREFIX}{original_outbox_id}:"
-    candidates = list(
-        (await session.execute(select(MessageJob).where(MessageJob.dedupe_key.like(dedupe_prefix + "%")))).scalars()
-    )
-    existing_attempts: set[int] = set()
-    for candidate in candidates:
-        reference = resolve_retry_reference(candidate)
-        if reference.reference is None:
-            continue
-        if reference.reference.original_outbox_id != original_outbox_id:
-            continue
-        if identity.mismatch_field(candidate) is not None:
-            continue
-        existing_attempts.add(reference.reference.attempt_number)
+    chain_members = await resolve_retry_chain_members(session, original_outbox_id)
+    existing_attempts = chain_members.attempt_numbers
 
     if len(existing_attempts) >= DELIVERY_RETRY_MAX_ATTEMPTS:
         if event is not None:
