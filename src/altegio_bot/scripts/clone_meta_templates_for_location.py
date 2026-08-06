@@ -5,10 +5,21 @@ only approved German templates whose names start with the source location
 prefix, replaces the Karlsruhe address and Google Maps URL, and submits the new
 location-prefixed variants for Meta review.
 
+The WABA, the bot number and the contact phone are shared by every location, so
+the address and the Google Maps link are the only strings that are rewritten.
+
 Safety defaults:
 * dry-run unless --apply is supplied;
-* templates without the source address are skipped (universal templates are not
-  duplicated by accident);
+* a template with neither the address nor the Karlsruhe map link is genuinely
+  location-neutral and is skipped;
+* a template whose address was not recognised while its Karlsruhe map link WAS
+  found is a contradiction, not neutrality: it is reported as an error;
+* a branch-specific template whose Karlsruhe map link was not replaced is
+  BLOCKED and never submitted — an approved template pointing at the wrong shop
+  is worse than a missing one, because the outbox fails closed on a missing
+  template while a wrong map silently misroutes clients;
+* every branch-specific template known to ``meta_templates`` must be covered;
+  anything missing aborts the run with a non-zero exit code;
 * existing target template names are skipped;
 * source templates are never edited or deleted.
 """
@@ -22,9 +33,16 @@ import os
 import re
 import sys
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any, Iterable
 
 import httpx
+
+from altegio_bot.meta_templates import (
+    META_TEMPLATE_MAP,
+    UNIVERSAL_JOB_TYPES,
+    resolve_meta_template,
+)
 
 DEFAULT_GRAPH_URL = "https://graph.facebook.com"
 DEFAULT_API_VERSION = "v25.0"
@@ -32,7 +50,7 @@ DEFAULT_LANGUAGE = "de"
 DEFAULT_SOURCE_LOCATION = "ka"
 DEFAULT_TARGET_LOCATION = "du"
 DEFAULT_TARGET_ADDRESS = "Pfinztalstraße 4, 76227 Karlsruhe-Durlach"
-DEFAULT_TARGET_MAPS_URL = "https://maps.app.goo.gl/WWnqMQLH5avG7Ybn6"
+DEFAULT_TARGET_MAPS_URL = "https://maps.app.goo.gl/HnVPnHaJHf2DW3Nn8"
 
 # Current Karlsruhe spellings found in the repository/Meta template examples.
 SOURCE_ADDRESS_PATTERNS: tuple[re.Pattern[str], ...] = (
@@ -64,6 +82,15 @@ class ScriptError(RuntimeError):
     """Expected configuration/API error with a user-safe message."""
 
 
+class TemplateStatus(StrEnum):
+    """Outcome of inspecting one source template."""
+
+    READY = "READY"
+    NEUTRAL = "NEUTRAL"
+    ADDRESS_UNRECOGNIZED = "ADDRESS_UNRECOGNIZED"
+    BLOCKED_NO_MAPS = "BLOCKED_NO_MAPS"
+
+
 @dataclass(frozen=True)
 class ReplacementStats:
     address: int = 0
@@ -77,11 +104,27 @@ class ReplacementStats:
 
 
 @dataclass(frozen=True)
-class PreparedTemplate:
+class TemplateOutcome:
     source_name: str
     target_name: str
+    status: TemplateStatus
     payload: dict[str, Any]
     replacements: ReplacementStats
+    # First footer line of the rewritten body (the brand line). The script never
+    # rewrites it — Durlach inherits whatever Karlsruhe uses — but the operator
+    # must see what is about to be submitted before approving the run.
+    brand_line: str | None = None
+
+
+@dataclass(frozen=True)
+class ClonePlan:
+    prepared: tuple[TemplateOutcome, ...] = ()
+    existing: tuple[str, ...] = ()
+    neutral: tuple[str, ...] = ()
+    unrecognized: tuple[TemplateOutcome, ...] = ()
+    blocked: tuple[TemplateOutcome, ...] = ()
+    missing_expected: tuple[str, ...] = ()
+    neutral_expected: tuple[str, ...] = ()
 
 
 def _location_code(value: str) -> str:
@@ -95,6 +138,10 @@ def _template_prefix(location_code: str) -> str:
     return f"kitilash_{location_code}_"
 
 
+def _confirmation_word(location_code: str) -> str:
+    return location_code.upper()
+
+
 def _normalize_api_version(value: str) -> str:
     version = value.strip().lower()
     if not version:
@@ -104,6 +151,25 @@ def _normalize_api_version(value: str) -> str:
     if not re.fullmatch(r"v\d+\.\d+", version):
         raise ScriptError(f"invalid Meta Graph API version: {value!r}")
     return version
+
+
+def expected_branch_templates(*, source_prefix: str) -> frozenset[str]:
+    """Template names that MUST be cloned, derived from ``meta_templates``.
+
+    Branch-specific means "not in ``UNIVERSAL_JOB_TYPES``". The names come from
+    ``META_TEMPLATE_MAP``/``resolve_meta_template`` instead of a hand-written
+    list here, so adding a lifecycle template to the bot automatically makes
+    this script demand a variant for the new location.
+    """
+    names: set[str] = set()
+    for company_id, job_type in META_TEMPLATE_MAP:
+        if job_type in UNIVERSAL_JOB_TYPES:
+            continue
+        for is_new_client in (False, True):
+            name = resolve_meta_template(company_id, job_type, is_new_client=is_new_client)
+            if isinstance(name, str) and name.startswith(source_prefix):
+                names.add(name)
+    return frozenset(names)
 
 
 def _replace_location_text(text: str, *, address: str, maps_url: str) -> tuple[str, ReplacementStats]:
@@ -124,6 +190,20 @@ def _replace_location_text(text: str, *, address: str, maps_url: str) -> tuple[s
     return transformed, ReplacementStats(address=address_count, maps_url=maps_count)
 
 
+def _brand_line(text: str, *, address: str) -> str | None:
+    """Return the footer line that precedes *address*, or None when absent."""
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        if address not in line:
+            continue
+        for previous in reversed(lines[:index]):
+            stripped = previous.strip()
+            if stripped:
+                return stripped
+        return None
+    return None
+
+
 def _sanitize_component(
     component: dict[str, Any],
     *,
@@ -141,6 +221,18 @@ def _sanitize_component(
     return sanitized, stats
 
 
+def _classify(stats: ReplacementStats) -> TemplateStatus:
+    if stats.address == 0:
+        # No address AND no Karlsruhe map link: genuinely location-neutral.
+        # No address but a Karlsruhe map link: the address is written in a
+        # spelling the patterns above do not cover, so silently treating the
+        # template as neutral would leave the new location without it.
+        return TemplateStatus.NEUTRAL if stats.maps_url == 0 else TemplateStatus.ADDRESS_UNRECOGNIZED
+    if stats.maps_url == 0:
+        return TemplateStatus.BLOCKED_NO_MAPS
+    return TemplateStatus.READY
+
+
 def prepare_template(
     source: dict[str, Any],
     *,
@@ -148,8 +240,8 @@ def prepare_template(
     target_prefix: str,
     address: str,
     maps_url: str,
-) -> PreparedTemplate | None:
-    """Build a POST-safe target template, or None for a location-neutral source."""
+) -> TemplateOutcome:
+    """Build a POST-safe target template and classify the source it came from."""
     source_name = source.get("name")
     if not isinstance(source_name, str) or not source_name.startswith(source_prefix):
         raise ScriptError(f"unexpected source template name: {source_name!r}")
@@ -160,20 +252,17 @@ def prepare_template(
 
     components: list[dict[str, Any]] = []
     total_stats = ReplacementStats()
+    brand_line: str | None = None
     for raw_component in raw_components:
         if not isinstance(raw_component, dict):
             raise ScriptError(f"template {source_name!r} contains an invalid component")
         component, stats = _sanitize_component(raw_component, address=address, maps_url=maps_url)
         components.append(component)
         total_stats += stats
+        if brand_line is None and isinstance(component.get("text"), str):
+            brand_line = _brand_line(component["text"], address=address)
 
-    # A template with no Karlsruhe address is location-neutral. Duplicating it
-    # under du_* would create unnecessary templates and can require media sample
-    # handles for image headers, so it is intentionally skipped.
-    if total_stats.address == 0:
-        return None
-
-    target_name = f"{target_prefix}{source_name[len(source_prefix):]}"
+    target_name = f"{target_prefix}{source_name[len(source_prefix) :]}"
     payload: dict[str, Any] = {
         "name": target_name,
         "language": source.get("language"),
@@ -184,11 +273,13 @@ def prepare_template(
         payload["parameter_format"] = source["parameter_format"]
 
     payload = {key: value for key, value in payload.items() if key in _TEMPLATE_KEYS and value is not None}
-    return PreparedTemplate(
+    return TemplateOutcome(
         source_name=source_name,
         target_name=target_name,
+        status=_classify(total_stats),
         payload=payload,
         replacements=total_stats,
+        brand_line=brand_line,
     )
 
 
@@ -207,6 +298,114 @@ def select_sources(
         and template["name"].startswith(source_prefix)
     ]
     return sorted(selected, key=lambda item: item["name"])
+
+
+def build_plan(
+    sources: Iterable[dict[str, Any]],
+    *,
+    source_prefix: str,
+    target_prefix: str,
+    address: str,
+    maps_url: str,
+    language: str,
+    existing: Iterable[tuple[Any, Any]],
+    expected: frozenset[str],
+) -> ClonePlan:
+    """Classify every source template and check the expected branch coverage."""
+    existing_keys = set(existing)
+    prepared: list[TemplateOutcome] = []
+    existing_targets: list[str] = []
+    neutral: list[str] = []
+    unrecognized: list[TemplateOutcome] = []
+    blocked: list[TemplateOutcome] = []
+    seen: set[str] = set()
+
+    for source in sources:
+        outcome = prepare_template(
+            source,
+            source_prefix=source_prefix,
+            target_prefix=target_prefix,
+            address=address,
+            maps_url=maps_url,
+        )
+        seen.add(outcome.source_name)
+        if outcome.status is TemplateStatus.ADDRESS_UNRECOGNIZED:
+            unrecognized.append(outcome)
+        elif outcome.status is TemplateStatus.BLOCKED_NO_MAPS:
+            blocked.append(outcome)
+        elif outcome.status is TemplateStatus.NEUTRAL:
+            neutral.append(outcome.source_name)
+        elif (outcome.target_name, language) in existing_keys:
+            existing_targets.append(outcome.target_name)
+        else:
+            prepared.append(outcome)
+
+    return ClonePlan(
+        prepared=tuple(prepared),
+        existing=tuple(existing_targets),
+        neutral=tuple(neutral),
+        unrecognized=tuple(unrecognized),
+        blocked=tuple(blocked),
+        missing_expected=tuple(sorted(name for name in expected if name not in seen)),
+        neutral_expected=tuple(sorted(name for name in neutral if name in expected)),
+    )
+
+
+def plan_blockers(plan: ClonePlan) -> list[str]:
+    """Reasons the run must not submit anything; empty means the plan is sound."""
+    blockers: list[str] = []
+    for item in plan.blocked:
+        blockers.append(
+            f"{item.source_name}: Karlsruhe maps link not found, the clone would carry the Karlsruhe map "
+            f"(address={item.replacements.address}, maps=0)"
+        )
+    for item in plan.unrecognized:
+        blockers.append(
+            f"{item.source_name}: address not recognised while the Karlsruhe map link WAS found "
+            f"(address=0, maps={item.replacements.maps_url}) — the address spelling is not covered by "
+            "SOURCE_ADDRESS_PATTERNS"
+        )
+    for name in plan.neutral_expected:
+        blockers.append(f"{name}: expected branch-specific template classified as location-neutral")
+    for name in plan.missing_expected:
+        blockers.append(f"{name}: expected branch-specific template not found among the APPROVED sources")
+    return blockers
+
+
+def print_plan(plan: ClonePlan) -> None:
+    for item in plan.prepared:
+        print(
+            f"READY   {item.source_name} -> {item.target_name} "
+            f"[address={item.replacements.address}, maps={item.replacements.maps_url}]"
+        )
+        # The brand line is never rewritten: Karlsruhe's "*KitiLash*" is what the
+        # clone will carry. Whether that is right for the new location is the
+        # operator's call, so it is printed instead of guessed.
+        print(f"        brand line (kept as is): {item.brand_line or '<not found>'}")
+    for item in plan.blocked:
+        print(
+            f"BLOCKED {item.source_name}: maps link not replaced "
+            f"[address={item.replacements.address}, maps=0] — not prepared"
+        )
+    for item in plan.unrecognized:
+        print(
+            f"ERROR   {item.source_name}: address not recognised but Karlsruhe map found "
+            f"[address=0, maps={item.replacements.maps_url}]"
+        )
+    for name in plan.existing:
+        print(f"SKIP    target already exists: {name}")
+    for name in plan.neutral:
+        marker = " (EXPECTED BRANCH-SPECIFIC!)" if name in plan.neutral_expected else ""
+        print(f"SKIP    location-neutral, no address and no map: {name}{marker}")
+    for name in plan.missing_expected:
+        print(f"MISSING expected branch-specific template not among APPROVED sources: {name}")
+
+    print()
+    print(
+        f"Summary: ready={len(plan.prepared)}, existing={len(plan.existing)}, "
+        f"location-neutral={len(plan.neutral)}, blocked={len(plan.blocked)}, "
+        f"unrecognized-address={len(plan.unrecognized)}, missing={len(plan.missing_expected)}"
+    )
 
 
 class MetaTemplateClient:
@@ -306,8 +505,7 @@ def _required_env(name: str) -> str:
     return value
 
 
-def _confirm(count: int) -> None:
-    expected = "DURLACH"
+def _confirm(count: int, *, expected: str) -> None:
     answer = input(f"Submit {count} template(s) to Meta for review? Type {expected}: ").strip()
     if answer != expected:
         raise ScriptError("confirmation did not match; nothing was submitted")
@@ -343,25 +541,16 @@ async def async_main(args: argparse.Namespace) -> int:
         if not sources:
             raise ScriptError(f"no APPROVED {args.language!r} templates found with prefix {source_prefix!r}")
 
-        prepared: list[PreparedTemplate] = []
-        neutral: list[str] = []
-        existing_targets: list[str] = []
-
-        for source in sources:
-            candidate = prepare_template(
-                source,
-                source_prefix=source_prefix,
-                target_prefix=target_prefix,
-                address=args.address,
-                maps_url=args.maps_url,
-            )
-            if candidate is None:
-                neutral.append(source["name"])
-                continue
-            if (candidate.target_name, args.language) in existing:
-                existing_targets.append(candidate.target_name)
-                continue
-            prepared.append(candidate)
+        plan = build_plan(
+            sources,
+            source_prefix=source_prefix,
+            target_prefix=target_prefix,
+            address=args.address,
+            maps_url=args.maps_url,
+            language=args.language,
+            existing=existing,
+            expected=expected_branch_templates(source_prefix=source_prefix),
+        )
 
         mode = "APPLY" if args.apply else "DRY-RUN"
         print(f"Mode: {mode}")
@@ -372,34 +561,25 @@ async def async_main(args: argparse.Namespace) -> int:
         print(f"Maps: {args.maps_url}")
         print()
 
-        for item in prepared:
-            map_note = str(item.replacements.maps_url) if item.replacements.maps_url else "0 (warning)"
-            print(
-                f"READY  {item.source_name} -> {item.target_name} "
-                f"[address={item.replacements.address}, maps={map_note}]"
-            )
-        for name in existing_targets:
-            print(f"SKIP   target already exists: {name}")
-        for name in neutral:
-            print(f"SKIP   no Karlsruhe address (location-neutral): {name}")
+        print_plan(plan)
 
-        print()
-        print(
-            f"Summary: ready={len(prepared)}, existing={len(existing_targets)}, "
-            f"location-neutral={len(neutral)}"
-        )
+        blockers = plan_blockers(plan)
+        if blockers:
+            print()
+            details = "\n".join(f"  - {blocker}" for blocker in blockers)
+            raise ScriptError(f"nothing was submitted, {len(blockers)} problem(s) must be fixed first:\n{details}")
 
         if not args.apply:
             print("Nothing submitted. Re-run with --apply after reviewing this plan.")
             return 0
-        if not prepared:
+        if not plan.prepared:
             print("Nothing to submit.")
             return 0
         if not args.yes:
-            _confirm(len(prepared))
+            _confirm(len(plan.prepared), expected=_confirmation_word(args.target_location))
 
         failures = 0
-        for item in prepared:
+        for item in plan.prepared:
             try:
                 result = await client.create_template(item.payload)
             except ScriptError as exc:
