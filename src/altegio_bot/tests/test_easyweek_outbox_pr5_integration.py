@@ -43,6 +43,7 @@ from altegio_bot.delivery_retry_identity import (
     RetryIdentity,
     resolve_retry_chain_members,
     resolve_retry_identity,
+    retry_outbox_audit_mismatch,
 )
 from altegio_bot.easyweek_normalizer import canonical_booking_uuid
 from altegio_bot.easyweek_policy import (
@@ -4228,8 +4229,16 @@ async def _seed_member_retry_with_delivered_outbox(
     record_id: int | None = None,
     template_code: str | None = None,
     client_id: int | None = None,
+    audit: dict[str, Any] | None = None,
 ) -> tuple[MessageJob, OutboxMessage]:
-    """A canonical member job whose delivered outbox may be off in one field."""
+    """A canonical member job whose delivered outbox may be off in one field.
+
+    ``meta`` defaults to the audit a real retry send always writes. That default
+    matters: without it every negative case below would be rejected on the
+    missing marker BEFORE the field it is actually about was ever compared, and
+    the scope tests would silently stop testing scope. ``audit`` overrides it for
+    the tests that are about the audit itself.
+    """
     member = MessageJob(
         provider=PROVIDER_EASYWEEK,
         company_id=root_job.company_id,
@@ -4259,7 +4268,13 @@ async def _seed_member_retry_with_delivered_outbox(
         status="delivered",
         scheduled_at=datetime.now(timezone.utc),
         sent_at=datetime.now(timezone.utc),
-        meta={},
+        meta=audit
+        if audit is not None
+        else {
+            "delivery_retry": True,
+            "delivery_retry_of_outbox_id": root_outbox.id,
+            "delivery_retry_attempt": attempt,
+        },
     )
     db.add(delivered)
     await db.flush()
@@ -4302,12 +4317,28 @@ async def test_a_delivered_outbox_from_another_scope_does_not_mark_the_chain_suc
     else:
         overrides["template_code"] = "record_canceled"
 
-    await _seed_member_retry_with_delivered_outbox(
+    member, delivered = await _seed_member_retry_with_delivered_outbox(
         db,
         root_job=root_job,
         root_outbox=root_outbox,
         **overrides,
     )
+
+    # This row is rejected for the field under test and for NOTHING else. Without
+    # this the audit check added later would reject it first and the assertion
+    # below would pass while testing nothing.
+    chain = await resolve_retry_chain_members(db, int(root_outbox.id))
+    assert chain.identity is not None
+    assert member.id in chain.job_ids, "the member job itself is proven"
+    assert (
+        retry_outbox_audit_mismatch(
+            delivered,
+            original_outbox_id=int(root_outbox.id),
+            attempt_number=2,
+        )
+        is None
+    ), "the audit is canonical, so only the scope field can reject this row"
+    assert chain.identity.outbox_mismatch_field(delivered) == field
 
     assert await ow._delivery_retry_chain_has_success(db, int(root_outbox.id)) is False
 
@@ -4458,3 +4489,172 @@ async def test_a_partial_delivery_outbox_is_still_a_proven_chain_member(
     rows[0].status = "delivered"
     await db.flush()
     assert await ow._delivery_retry_chain_has_success(db, int(rows[0].id)) is True
+
+
+# ---------------------------------------------------------------------------
+# 22. The retry audit proves membership on the success path too
+# ---------------------------------------------------------------------------
+#
+# The callback resolver has always demanded this audit of a retry outbox. The
+# success scanner did not, so the identical row could be rejected as unproven
+# when a status arrived for it and accepted here as proof the chain had landed —
+# enough to cancel a correct queued retry and lose a notification silently.
+
+
+async def _assert_legitimate_retry_survives(db: AsyncSession, retry: MessageJob) -> None:
+    """The whole point of refusing an unproven success: nothing is lost."""
+    reason = await ow._delivery_retry_presend_guard(db, retry, await db.get(Record, retry.record_id))
+    assert reason is None, f"the legitimate retry must survive, got: {reason}"
+    await db.refresh(retry)
+    assert retry.status == "queued"
+
+
+@pytest.mark.parametrize(
+    "audit,label",
+    [
+        ({}, "no_audit_at_all"),
+        ({"delivery_retry_of_outbox_id": 1, "delivery_retry_attempt": 2}, "marker_missing"),
+        ({"delivery_retry": True, "delivery_retry_attempt": 2}, "reference_missing"),
+        ({"delivery_retry": True, "delivery_retry_of_outbox_id": 1}, "attempt_missing"),
+    ],
+)
+async def test_a_delivered_retry_outbox_without_a_canonical_audit_is_not_success(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    audit: dict[str, Any],
+    label: str,
+) -> None:
+    root_job, root_outbox = await _seed_easyweek_send_with_outbox(db, capture)
+    await _deliver_failed_status(db, root_outbox.provider_message_id, dedupe=f"wa:audit-{label}")
+    legitimate = (await _retry_jobs_for(db, root_outbox.id))[0]
+
+    # The parametrized ids above are placeholders; point them at the real root.
+    resolved_audit = {
+        key: (int(root_outbox.id) if key == "delivery_retry_of_outbox_id" else value) for key, value in audit.items()
+    }
+    await _seed_member_retry_with_delivered_outbox(
+        db,
+        root_job=root_job,
+        root_outbox=root_outbox,
+        audit=resolved_audit,
+    )
+
+    assert await ow._delivery_retry_chain_has_success(db, int(root_outbox.id)) is False
+    await _assert_legitimate_retry_survives(db, legitimate)
+
+
+async def test_a_delivered_retry_outbox_auditing_another_root_is_not_success(
+    db: AsyncSession,
+    capture: CaptureProvider,
+) -> None:
+    root_job, root_outbox = await _seed_easyweek_send_with_outbox(db, capture)
+    await _deliver_failed_status(db, root_outbox.provider_message_id, dedupe="wa:audit-other-root")
+    legitimate = (await _retry_jobs_for(db, root_outbox.id))[0]
+
+    _member, delivered = await _seed_member_retry_with_delivered_outbox(
+        db,
+        root_job=root_job,
+        root_outbox=root_outbox,
+        audit={
+            "delivery_retry": True,
+            "delivery_retry_of_outbox_id": int(root_outbox.id) + 4242,
+            "delivery_retry_attempt": 2,
+        },
+    )
+
+    assert (
+        retry_outbox_audit_mismatch(delivered, original_outbox_id=int(root_outbox.id), attempt_number=2)
+        == "retry_outbox_audit_reference_mismatch"
+    )
+    assert await ow._delivery_retry_chain_has_success(db, int(root_outbox.id)) is False
+    await _assert_legitimate_retry_survives(db, legitimate)
+
+
+async def test_a_delivered_retry_outbox_auditing_another_attempt_is_not_success(
+    db: AsyncSession,
+    capture: CaptureProvider,
+) -> None:
+    root_job, root_outbox = await _seed_easyweek_send_with_outbox(db, capture)
+    await _deliver_failed_status(db, root_outbox.provider_message_id, dedupe="wa:audit-other-attempt")
+    legitimate = (await _retry_jobs_for(db, root_outbox.id))[0]
+
+    _member, delivered = await _seed_member_retry_with_delivered_outbox(
+        db,
+        root_job=root_job,
+        root_outbox=root_outbox,
+        attempt=2,
+        audit={
+            "delivery_retry": True,
+            "delivery_retry_of_outbox_id": int(root_outbox.id),
+            # The job is attempt 2; its audit claims 3.
+            "delivery_retry_attempt": 3,
+        },
+    )
+
+    assert (
+        retry_outbox_audit_mismatch(delivered, original_outbox_id=int(root_outbox.id), attempt_number=2)
+        == "retry_outbox_audit_attempt_mismatch"
+    )
+    assert await ow._delivery_retry_chain_has_success(db, int(root_outbox.id)) is False
+    await _assert_legitimate_retry_survives(db, legitimate)
+
+
+async def test_a_fully_canonical_delivered_retry_outbox_is_success(
+    db: AsyncSession,
+    capture: CaptureProvider,
+) -> None:
+    """Positive control: the shape a real retry send produces."""
+    root_job, root_outbox = await _seed_easyweek_send_with_outbox(db, capture)
+    _member, delivered = await _seed_member_retry_with_delivered_outbox(
+        db,
+        root_job=root_job,
+        root_outbox=root_outbox,
+    )
+
+    assert retry_outbox_audit_mismatch(delivered, original_outbox_id=int(root_outbox.id), attempt_number=2) is None
+    assert await ow._delivery_retry_chain_has_success(db, int(root_outbox.id)) is True
+
+
+async def test_the_root_outbox_is_never_asked_for_a_retry_audit(
+    db: AsyncSession,
+    capture: CaptureProvider,
+) -> None:
+    """The root is the ORIGINAL send: it has no retry audit and needs none."""
+    _root_job, root_outbox = await _seed_easyweek_send_with_outbox(db, capture)
+    assert "delivery_retry" not in (root_outbox.meta or {})
+
+    root_outbox.status = "delivered"
+    await db.flush()
+
+    assert await ow._delivery_retry_chain_has_success(db, int(root_outbox.id)) is True
+
+
+async def test_a_real_retry_send_writes_an_audit_the_success_path_accepts(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    no_contact_rate_limit: None,
+) -> None:
+    """End to end, with no hand-built meta: production and the check agree.
+
+    This is what makes the stricter rule safe — the audit is written by
+    ``outbox_worker`` for every job that claims the retry boundary.
+    """
+    _root_job, root_outbox = await _seed_easyweek_send_with_outbox(db, capture)
+    await _deliver_failed_status(db, root_outbox.provider_message_id, dedupe="wa:real-retry-audit")
+    retry = (await _retry_jobs_for(db, root_outbox.id))[0]
+
+    retry.run_at = datetime.now(timezone.utc)
+    await db.flush()
+    await _run_job(db, retry)
+    assert retry.status == "done", retry.last_error
+
+    retry_rows = await _outbox_rows(db, retry)
+    assert len(retry_rows) == 1
+    assert retry_rows[0].meta["delivery_retry"] is True
+    assert retry_rows[0].meta["delivery_retry_of_outbox_id"] == root_outbox.id
+    assert retry_rows[0].meta["delivery_retry_attempt"] == 1
+    assert retry_outbox_audit_mismatch(retry_rows[0], original_outbox_id=int(root_outbox.id), attempt_number=1) is None
+
+    retry_rows[0].status = "delivered"
+    await db.flush()
+    assert await ow._delivery_retry_chain_has_success(db, int(root_outbox.id)) is True

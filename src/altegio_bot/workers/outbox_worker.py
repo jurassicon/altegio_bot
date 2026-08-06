@@ -30,6 +30,7 @@ from altegio_bot.delivery_retry_identity import (
     resolve_retry_chain_members,
     resolve_retry_identity,
     resolve_retry_reference,
+    retry_outbox_audit_mismatch,
 )
 from altegio_bot.easyweek_normalizer import extract_manage_link
 from altegio_bot.easyweek_policy import (
@@ -1245,8 +1246,16 @@ async def _delivery_retry_chain_has_success(
     The delivered ``OutboxMessage`` is checked too, not just the job that owns
     it. Belonging to a proven member is what puts a row in the chain; its own
     company, record, effective client and template code then have to agree with
-    the tenant that chain belongs to, or the "success" it reports is about some
-    other message.
+    the tenant that chain belongs to, and its retry audit has to corroborate
+    this root and this attempt — by the SAME predicate the callback resolver
+    applies, :func:`retry_outbox_audit_mismatch`. Without that last check the
+    identical row could be rejected as unproven when a status arrived for it and
+    accepted here as proof the chain had landed, which is enough to cancel a
+    correct queued retry and lose a notification.
+
+    The audit requirement applies to retry rows only. The ROOT is the original
+    send, not a retry: it carries no such audit and must not be asked for one,
+    so the early root check below stays exactly as it is.
     """
     orig_stmt = (
         select(OutboxMessage.id)
@@ -1271,8 +1280,25 @@ async def _delivery_retry_chain_has_success(
         .where(OutboxMessage.job_id.in_(chain.job_ids))
         .where(OutboxMessage.status.in_(_DELIVERED_READ_STATUSES))
     )
-    delivered_rows = (await session.execute(delivered_stmt)).scalars().all()
-    return any(chain.identity.outbox_mismatch_field(row) is None for row in delivered_rows)
+    delivered_rows = list((await session.execute(delivered_stmt)).scalars().all())
+    if not delivered_rows:
+        return False
+
+    attempt_by_job_id = {int(member.job.id): member.reference.attempt_number for member in chain.members}
+    for row in delivered_rows:
+        if chain.identity.outbox_mismatch_field(row) is not None:
+            continue
+        attempt_number = attempt_by_job_id.get(int(row.job_id)) if row.job_id is not None else None
+        if attempt_number is None:
+            continue
+        if retry_outbox_audit_mismatch(
+            row,
+            original_outbox_id=original_outbox_id,
+            attempt_number=attempt_number,
+        ):
+            continue
+        return True
+    return False
 
 
 async def _delivery_retry_presend_guard(

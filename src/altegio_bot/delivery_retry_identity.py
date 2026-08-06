@@ -237,6 +237,53 @@ def _outbox_meta_claims_retry(outbox: OutboxMessage) -> bool:
     )
 
 
+def retry_outbox_audit_mismatch(
+    outbox: OutboxMessage,
+    *,
+    original_outbox_id: int,
+    attempt_number: int,
+) -> str | None:
+    """Does this outbox row's own audit corroborate THIS root and THIS attempt?
+
+    Returns ``None`` when it does, else the name of the broken invariant.
+
+    Every retry send writes this audit unconditionally (``outbox_worker`` sets
+    ``delivery_retry`` / ``delivery_retry_of_outbox_id`` /
+    ``delivery_retry_attempt`` on ``send_meta`` before the row is built, for both
+    the sent and the failed row), so a retry row without it is malformed, not
+    legacy.
+
+    One predicate, two callers, on purpose. The callback resolver used to demand
+    this while the success scanner did not, so the very same row could be
+    rejected as unproven when a status arrived for it and simultaneously
+    accepted as proof that the chain had landed — enough to cancel a correct
+    queued retry and lose a notification silently.
+
+    Deliberately NOT implemented by running each row back through
+    :func:`resolve_status_retry_chain`. That function answers a different, wider
+    question — "which chain does this outbox belong to?" — by re-deriving the
+    anchor, the anchor job and the whole identity from the row itself. A caller
+    that has ALREADY proven the root identity and the member job would be paying
+    for that per row and, worse, re-deriving facts it holds: if the re-derivation
+    disagreed, there would once again be two answers. This narrow predicate is
+    exactly the part both callers need and nothing else.
+    """
+    meta = outbox.meta if isinstance(outbox.meta, dict) else {}
+    if meta.get("delivery_retry") is not True:
+        return "retry_outbox_audit_marker_missing"
+    meta_outbox_id = parse_retry_outbox_id(meta.get("delivery_retry_of_outbox_id"))
+    if meta_outbox_id is None:
+        return "retry_outbox_audit_reference_invalid"
+    if meta_outbox_id != original_outbox_id:
+        return "retry_outbox_audit_reference_mismatch"
+    meta_attempt = parse_retry_attempt(meta.get("delivery_retry_attempt"))
+    if meta_attempt is None:
+        return "retry_outbox_audit_attempt_invalid"
+    if meta_attempt != attempt_number:
+        return "retry_outbox_audit_attempt_mismatch"
+    return None
+
+
 def resolve_retry_reference(job: MessageJob) -> RetryReferenceResolution:
     """Prove that retry payload and reserved dedupe namespace describe one row.
 
@@ -471,19 +518,13 @@ async def resolve_status_retry_chain(
         return _status_chain_refuse(reference_resolution.error or "delivery_retry_reference_unproven")
     reference = reference_resolution.reference
 
-    meta = outbox.meta if isinstance(outbox.meta, dict) else {}
-    if meta.get("delivery_retry") is not True:
-        return _status_chain_refuse("retry_outbox_audit_marker_missing")
-    meta_outbox_id = parse_retry_outbox_id(meta.get("delivery_retry_of_outbox_id"))
-    if meta_outbox_id is None:
-        return _status_chain_refuse("retry_outbox_audit_reference_invalid")
-    if meta_outbox_id != reference.original_outbox_id:
-        return _status_chain_refuse("retry_outbox_audit_reference_mismatch")
-    meta_attempt = parse_retry_attempt(meta.get("delivery_retry_attempt"))
-    if meta_attempt is None:
-        return _status_chain_refuse("retry_outbox_audit_attempt_invalid")
-    if meta_attempt != reference.attempt_number:
-        return _status_chain_refuse("retry_outbox_audit_attempt_mismatch")
+    audit_mismatch = retry_outbox_audit_mismatch(
+        outbox,
+        original_outbox_id=reference.original_outbox_id,
+        attempt_number=reference.attempt_number,
+    )
+    if audit_mismatch is not None:
+        return _status_chain_refuse(audit_mismatch)
 
     anchor_outbox = await session.get(OutboxMessage, reference.original_outbox_id)
     if anchor_outbox is None:
