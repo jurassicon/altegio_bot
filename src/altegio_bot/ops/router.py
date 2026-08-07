@@ -1705,12 +1705,21 @@ async def ops_wa_inbox(request: Request) -> str:
 
 @router.get("/easyweek", response_class=HTMLResponse)
 async def ops_easyweek() -> str:
-    """Provider-scoped counters, so an operator can watch Dürlach come alive.
+    """Provider-scoped counters, so an operator can watch Durlach come alive.
 
     Deliberately small: capture, jobs and sends broken down by status, plus the
     seeded rows the activation depends on. Everything is filtered on
     ``provider = 'easyweek'`` — Altegio shares these tables and one integer
     space for ``company_id``, so an unfiltered count would silently mix branches.
+
+    The flags are labelled as belonging to THIS process rather than presented as
+    system state. They are read from the ``altegio-api`` container's own
+    environment, and the activation runbook recreates the workers — so right
+    after an operator flips ``EASYWEEK_NOTIFICATIONS_ENABLED`` the workers are
+    already sending while this page still says ``off``. Recreating the API
+    container purely to make a status line agree would restart the live webhook
+    endpoint, which is a worse trade than labelling the source. The counters
+    below come from the database and are authoritative either way.
     """
     async with SessionLocal() as session:
         events = (
@@ -1776,19 +1785,26 @@ async def ops_easyweek() -> str:
     notifications_on = bool(getattr(settings, "easyweek_notifications_enabled", False))
     processing_on = bool(getattr(settings, "easyweek_processing_enabled", False))
     parts = [
-        "<h4 class='mt-3'>EasyWeek (Dürlach)</h4>",
+        "<h4 class='mt-3'>EasyWeek (Durlach)</h4>",
         _metric_cards(
             [
-                ("capture", "on" if getattr(settings, "easyweek_enabled", False) else "off", "secondary"),
-                ("processing", "on" if processing_on else "off", "success" if processing_on else "secondary"),
+                ("capture (api env)", "on" if getattr(settings, "easyweek_enabled", False) else "off", "secondary"),
                 (
-                    "notifications",
+                    "processing (api env)",
+                    "on" if processing_on else "off",
+                    "success" if processing_on else "secondary",
+                ),
+                (
+                    "notifications (api env)",
                     "on" if notifications_on else "off",
                     "success" if notifications_on else "secondary",
                 ),
-                ("location_id", getattr(settings, "easyweek_location_id", 0), "secondary"),
+                ("location_id (api env)", getattr(settings, "easyweek_location_id", 0), "secondary"),
             ]
         ),
+        "<p class='small text-muted'>Flags above are this API container's own environment, "
+        "not the workers'. After flipping a flag the workers are recreated but this container "
+        "is not, so a stale <code>off</code> here is expected — trust the counters below.</p>",
         "<h6 class='mt-3'>easyweek_events by status</h6>",
         _table(["status", "count"], [[_esc(str(r.status)), str(r.n)] for r in events]),
         "<h6 class='mt-3'>message_jobs by type / status</h6>",

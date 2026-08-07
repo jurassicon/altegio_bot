@@ -1,4 +1,4 @@
-"""Seed the EasyWeek (Dürlach) message templates and WhatsApp sender.
+"""Seed the EasyWeek (Durlach) message templates and WhatsApp sender.
 
 Separate from ``seed_templates.py`` on purpose. That script is Altegio-only and
 starts by DELETEing every row for its own company ids; copying that pattern here
@@ -13,11 +13,14 @@ the other only produces failed jobs. One operator step, one transaction.
 Idempotent by construction — see :func:`_upsert_template` and
 :func:`_upsert_sender`. Running it twice is a no-op.
 
-Phase 1 seeds exactly the three lifecycle codes EasyWeek plans
-(``easyweek_policy.EASYWEEK_LIFECYCLE_JOB_TYPES``). Reminders are phase 2, and
-``record_created_new_client`` is deliberately absent: ``_render_message`` guards
-the new-client branch with ``if not is_easyweek``, so an EasyWeek job can never
-select it. Its Meta template exists but stays unused until that changes.
+Phase 1 seeds FOUR rows: the three lifecycle codes EasyWeek plans
+(``easyweek_policy.EASYWEEK_LIFECYCLE_JOB_TYPES``) plus the first-time-customer
+variant of ``record_created``. That fourth row is a TEMPLATE CODE, not a job
+type — the job stays ``record_created`` and so does its seven-field Meta param
+contract; only the row, and therefore ``meta_template_name``, differs. See
+``_render_message``.
+
+Reminders are phase 2.
 
 This script does NOT enable notifications. ``EASYWEEK_NOTIFICATIONS_ENABLED``
 stays an operator decision — see docs/easyweek/durlach_activation_runbook.md.
@@ -36,12 +39,14 @@ from altegio_bot.db import SessionLocal
 from altegio_bot.easyweek_policy import (
     RECORD_CANCELED,
     RECORD_CREATED,
+    RECORD_CREATED_NEW_CLIENT,
     RECORD_UPDATED,
 )
 from altegio_bot.models.models import PROVIDER_EASYWEEK, MessageTemplate, WhatsAppSender
 from altegio_bot.settings import settings
+from altegio_bot.workers.outbox_worker import PRE_APPOINTMENT_NOTES_DE
 
-# Approved Meta template names for the Dürlach location, in the shared WABA.
+# Approved Meta template names for the Durlach location, in the shared WABA.
 # DB-first resolution (PR-5) reads these from `message_templates`; they are
 # deliberately NOT added to META_TEMPLATE_MAP, which is keyed by Altegio company
 # id and must not learn about another CRM.
@@ -49,7 +54,26 @@ META_TEMPLATE_NAMES: dict[str, str] = {
     RECORD_CREATED: "kitilash_du_record_created_v1",
     RECORD_UPDATED: "kitilash_du_record_updated_v1",
     RECORD_CANCELED: "kitilash_du_record_canceled_v1",
+    RECORD_CREATED_NEW_CLIENT: "kitilash_du_record_created_new_client_v1",
 }
+
+# The confirmed numeric EasyWeek :location_id of the Durlach location.
+#
+# NOT YET CONFIRMED — read it from the production `easyweek.env`
+# (EASYWEEK_LOCATION_ID) and fill it in before the first seed.
+#
+# `None` means unconfirmed, and the seed then refuses to run. Everything below
+# is Durlach-specific content — its Meta template names, its address, its map
+# pin. Binding that to whatever location id happens to be configured would
+# silently give another location Durlach's messages, and nothing downstream
+# would notice: the worker matches rows by company_id and would find them.
+DURLACH_LOCATION_ID: int | None = None
+
+# The templates are written in German and point at German Meta templates, so
+# the configured language has to be German. `EASYWEEK_DEFAULT_LANGUAGE=en` would
+# otherwise create rows with `language='en'` referring to `kitilash_du_*_v1`,
+# and the mismatch would only surface as a Meta rejection at send time.
+DURLACH_LANGUAGE = "de"
 
 # Studio contact details. Public information, printed on the storefront.
 BRAND_LINE = "*KitiLash Durlach*"
@@ -104,6 +128,27 @@ BODIES: dict[str, str] = {
     ),
 }
 
+# The first-time-customer variant: the ordinary confirmation plus the
+# "Wichtige Hinweise" block.
+#
+# Composed from PRE_APPOINTMENT_NOTES_DE rather than retyped, because the
+# approved Meta template was cloned from `kitilash_ka_record_created_new_client_v1`
+# and carries that exact block. If the text here drifted from it, a customer
+# inside the 24h window would read one thing and a customer outside it another —
+# and nothing would flag the divergence.
+BODIES[RECORD_CREATED_NEW_CLIENT] = (
+    "*{client_name}, hallo! Ihre Terminbuchung wurde bestätigt:*\n\n"
+    "*Mitarbeiterin:* {staff_name}\n"
+    "*Datum:* {date}\n"
+    "*Zeit:* {time}\n"
+    "*Service:*\n"
+    "{services}\n"
+    "*Summe:* {total_cost}€\n\n"
+    "Termin verwalten: {booking_link}"
+    f"{PRE_APPOINTMENT_NOTES_DE}"
+    f"{FOOTER}"
+)
+
 
 class SeedConfigError(RuntimeError):
     """The environment is not configured well enough to seed safely."""
@@ -119,10 +164,27 @@ class SeedResult:
 
 
 def _resolve_company_id() -> int:
+    """The Durlach location id, or refuse.
+
+    A positive number is not enough. This script writes Durlach's Meta template
+    names, address and map pin; pointing them at a different location is not a
+    configuration error the system can detect later, it is Durlach's messages
+    being sent on another location's behalf.
+    """
     company_id = int(getattr(settings, "easyweek_location_id", 0) or 0)
     if company_id <= 0:
         raise SeedConfigError(
             "EASYWEEK_LOCATION_ID is not configured; refusing to seed rows that no job could ever match."
+        )
+    if DURLACH_LOCATION_ID is None:
+        raise SeedConfigError(
+            "DURLACH_LOCATION_ID is not confirmed in this script. Fill it from the production "
+            "easyweek.env before seeding, so Durlach content cannot be bound to another location."
+        )
+    if company_id != DURLACH_LOCATION_ID:
+        raise SeedConfigError(
+            "EASYWEEK_LOCATION_ID does not match the confirmed Durlach location id; "
+            "this seed writes Durlach-specific content and refuses to bind it elsewhere."
         )
     return company_id
 
@@ -131,7 +193,12 @@ def _resolve_language() -> str:
     language = (getattr(settings, "easyweek_default_language", "") or "").strip()
     if not language:
         raise SeedConfigError("EASYWEEK_DEFAULT_LANGUAGE is empty; the template language must be explicit.")
-    return language
+    if language.lower() != DURLACH_LANGUAGE:
+        raise SeedConfigError(
+            f"EASYWEEK_DEFAULT_LANGUAGE must be {DURLACH_LANGUAGE!r} for Durlach; the bodies are German "
+            "and the Meta templates they name are registered in German."
+        )
+    return DURLACH_LANGUAGE
 
 
 def _resolve_phone_number_id() -> str:
@@ -210,7 +277,7 @@ async def _upsert_sender(
     phone_number_id: str,
     result: SeedResult,
 ) -> SeedResult:
-    """Insert or update the Dürlach sender.
+    """Insert or update the Durlach sender.
 
     ``whatsapp_senders`` DOES carry a unique constraint on
     (provider, company_id, sender_code), so this is an atomic ``ON CONFLICT``.
@@ -264,7 +331,7 @@ async def seed(session: AsyncSession) -> SeedResult:
     phone_number_id = _resolve_phone_number_id()
 
     result = SeedResult()
-    for code in (RECORD_CREATED, RECORD_UPDATED, RECORD_CANCELED):
+    for code in (RECORD_CREATED, RECORD_CREATED_NEW_CLIENT, RECORD_UPDATED, RECORD_CANCELED):
         result = await _upsert_template(
             session,
             company_id=company_id,

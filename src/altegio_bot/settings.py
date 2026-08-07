@@ -519,6 +519,16 @@ class Settings(BaseSettings):
     # job fails locally rather than sending a message with a blank link.
     easyweek_booking_page_url: str = ""
 
+    # Comma-separated hosts EASYWEEK_BOOKING_PAGE_URL is allowed to point at.
+    #
+    # Empty by default, and empty REJECTS EVERYTHING rather than allowing
+    # everything: until the approved Durlach host is confirmed, a typo in the
+    # booking page would otherwise pass every syntactic check and reach a
+    # customer as the link they tap after a cancellation. Fail-closed stops the
+    # activation instead; see easyweek_policy.validate_static_booking_page.
+    # Example: EASYWEEK_BOOKING_PAGE_ALLOWED_HOSTS=book.example.com
+    easyweek_booking_page_allowed_hosts: str = ""
+
     # Language used to look up EasyWeek message templates. Separate from the
     # Altegio per-company map: EasyWeek has its own location and its own
     # approved templates, and must not inherit an Altegio branch's language.

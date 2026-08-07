@@ -1,4 +1,4 @@
-"""PR-6: the Dürlach activation seed, against a real database.
+"""PR-6: the Durlach activation seed, against a real database.
 
 Covers the two things an activation seed can get wrong in a way nobody notices
 until a customer is affected: writing rows the worker will not match, and
@@ -19,7 +19,12 @@ import pytest_asyncio
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from altegio_bot.easyweek_policy import RECORD_CANCELED, RECORD_CREATED, RECORD_UPDATED
+from altegio_bot.easyweek_policy import (
+    RECORD_CANCELED,
+    RECORD_CREATED,
+    RECORD_CREATED_NEW_CLIENT,
+    RECORD_UPDATED,
+)
 from altegio_bot.models.models import (
     PROVIDER_ALTEGIO,
     PROVIDER_EASYWEEK,
@@ -35,17 +40,23 @@ from altegio_bot.workers import outbox_worker as ow
 
 pytestmark = pytest.mark.asyncio
 
+# The production location id is not in the repo, so the tests pin the script's
+# own constant instead of a made-up number. That is the point of the binding:
+# whatever the confirmed id turns out to be, the seed must refuse anything else.
 DURLACH_LOCATION_ID = 999501
 SHARED_PHONE_NUMBER_ID = "shared-bot-phone-number-id"
-STATIC_BOOKING_PAGE = "https://example.invalid/durlach"
+BOOKING_PAGE_HOST = "book.durlach.invalid"
+STATIC_BOOKING_PAGE = f"https://{BOOKING_PAGE_HOST}/durlach"
 BOOKING_HASH = "90000123"
 VERIFIED_PAGE = f"https://eyw.me/r/{BOOKING_HASH}"
 
 
 @pytest.fixture(autouse=True)
 def _durlach_settings(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The Dürlach configuration, with notifications deliberately OFF."""
+    """The Durlach configuration, with notifications deliberately OFF."""
+    monkeypatch.setattr(seed_script, "DURLACH_LOCATION_ID", DURLACH_LOCATION_ID)
     monkeypatch.setattr(settings, "easyweek_location_id", DURLACH_LOCATION_ID, raising=False)
+    monkeypatch.setattr(settings, "easyweek_booking_page_allowed_hosts", BOOKING_PAGE_HOST, raising=False)
     monkeypatch.setattr(settings, "easyweek_default_language", "de", raising=False)
     monkeypatch.setattr(settings, "easyweek_booking_page_url", STATIC_BOOKING_PAGE, raising=False)
     monkeypatch.setattr(settings, "meta_wa_phone_number_id", SHARED_PHONE_NUMBER_ID, raising=False)
@@ -85,12 +96,14 @@ async def _count(db: AsyncSession, model: Any, **where: Any) -> int:
 # ---------------------------------------------------------------------------
 
 
-async def test_the_seed_writes_exactly_the_three_phase_one_templates(db: AsyncSession) -> None:
+async def test_the_seed_writes_exactly_the_four_phase_one_templates(db: AsyncSession) -> None:
     result = await _run_seed(db)
 
-    assert result.templates_created == 3
+    assert result.templates_created == 4
     rows = await _easyweek_templates(db)
-    assert [r.code for r in rows] == sorted([RECORD_CREATED, RECORD_UPDATED, RECORD_CANCELED])
+    assert [r.code for r in rows] == sorted(
+        [RECORD_CREATED, RECORD_CREATED_NEW_CLIENT, RECORD_UPDATED, RECORD_CANCELED]
+    )
 
     for row in rows:
         assert row.provider == PROVIDER_EASYWEEK
@@ -101,9 +114,9 @@ async def test_the_seed_writes_exactly_the_three_phase_one_templates(db: AsyncSe
         assert row.meta_template_name.startswith("kitilash_du_")
 
 
-@pytest.mark.parametrize("absent_code", ["record_created_new_client", "reminder_24h", "reminder_2h"])
+@pytest.mark.parametrize("absent_code", ["reminder_24h", "reminder_2h"])
 async def test_the_seed_writes_no_phase_two_codes(db: AsyncSession, absent_code: str) -> None:
-    """Reminders are PR-7; the new-client variant is unreachable for EasyWeek."""
+    """Reminders are phase 2 / PR-7 and must not be seeded here."""
     await _run_seed(db)
     assert await _count(db, MessageTemplate, provider=PROVIDER_EASYWEEK, code=absent_code) == 0
 
@@ -115,11 +128,11 @@ async def test_running_the_seed_twice_creates_no_duplicates(db: AsyncSession) ->
     second = await _run_seed(db)
     after = [(r.id, r.code, r.body, r.meta_template_name) for r in await _easyweek_templates(db)]
 
-    assert first.templates_created == 3
+    assert first.templates_created == 4
     assert second.templates_created == 0
-    assert second.templates_updated == 3
+    assert second.templates_updated == 4
     assert after == before, "a re-run must not add, renumber or rewrite rows"
-    assert await _count(db, MessageTemplate, provider=PROVIDER_EASYWEEK) == 3
+    assert await _count(db, MessageTemplate, provider=PROVIDER_EASYWEEK) == 4
 
 
 async def test_the_seed_reactivates_a_row_an_operator_disabled(db: AsyncSession) -> None:
@@ -240,7 +253,13 @@ async def test_the_sender_shares_the_bot_number_with_altegio_without_colliding(d
     "field,value",
     [
         ("easyweek_location_id", 0),
+        # A perfectly plausible positive id that simply is not Durlach's. Without
+        # the binding this would bind Durlach's Meta names, address and map pin
+        # to another location, and nothing downstream would notice.
+        ("easyweek_location_id", DURLACH_LOCATION_ID + 1),
         ("easyweek_default_language", "   "),
+        # German bodies naming German Meta templates must not be filed under `en`.
+        ("easyweek_default_language", "en"),
         ("meta_wa_phone_number_id", ""),
     ],
 )
@@ -255,6 +274,24 @@ async def test_the_seed_refuses_an_unconfigured_environment(
 
     with pytest.raises(seed_script.SeedConfigError):
         await seed_script.seed(db)
+
+    await db.flush()
+    assert await _count(db, MessageTemplate, provider=PROVIDER_EASYWEEK) == 0
+    assert await _count(db, WhatsAppSender, provider=PROVIDER_EASYWEEK) == 0
+
+
+async def test_an_unconfirmed_location_constant_refuses_to_seed(
+    db: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Until the real id is filled in, the seed must not run at all."""
+    monkeypatch.setattr(seed_script, "DURLACH_LOCATION_ID", None)
+
+    with pytest.raises(seed_script.SeedConfigError):
+        await seed_script.seed(db)
+
+    await db.flush()
+    assert await _count(db, MessageTemplate, provider=PROVIDER_EASYWEEK) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -304,6 +341,9 @@ async def _seed_durlach_domain(db: AsyncSession, *, short_link: str | None = VER
 async def test_the_seeded_rows_render_end_to_end(db: AsyncSession, code: str) -> None:
     await _run_seed(db)
     client, record = await _seed_durlach_domain(db)
+    # A returning customer, so `record_created` resolves to the ORDINARY row.
+    # The first-time variant has its own tests further down.
+    await _seed_previous_visit(db, client, record)
 
     body, sender_id, language, ctx = await ow._render_message(
         db,
@@ -394,3 +434,209 @@ async def test_an_unseeded_code_still_fails_closed(db: AsyncSession) -> None:
     assert "Template not found" in message
     assert PROVIDER_EASYWEEK in message
     assert "ALTEGIO REMINDER" not in message
+
+
+# ---------------------------------------------------------------------------
+# The first-time-customer variant
+# ---------------------------------------------------------------------------
+
+
+async def _seed_previous_visit(db: AsyncSession, client: Client, record: Record) -> Record:
+    """An earlier EasyWeek booking for the same customer — so they are not new."""
+    earlier = Record(
+        provider=PROVIDER_EASYWEEK,
+        company_id=DURLACH_LOCATION_ID,
+        altegio_record_id=4200776,
+        client_id=client.id,
+        staff_name="Tanja",
+        starts_at=record.starts_at - timedelta(days=30),
+        total_cost=Decimal("60.00"),
+        raw={},
+    )
+    db.add(earlier)
+    await db.flush()
+    return earlier
+
+
+async def test_a_new_easyweek_client_gets_the_new_client_template(db: AsyncSession) -> None:
+    await _run_seed(db)
+    client, record = await _seed_durlach_domain(db)
+
+    body, _sender_id, _lang, ctx = await ow._render_message(
+        db,
+        company_id=DURLACH_LOCATION_ID,
+        template_code=RECORD_CREATED,
+        record=record,
+        client=client,
+        provider=PROVIDER_EASYWEEK,
+    )
+
+    assert ctx["meta_template_name"] == "kitilash_du_record_created_new_client_v1"
+    assert "Wichtige Hinweise" in body
+
+
+async def test_a_returning_easyweek_client_gets_the_ordinary_template(db: AsyncSession) -> None:
+    await _run_seed(db)
+    client, record = await _seed_durlach_domain(db)
+    await _seed_previous_visit(db, client, record)
+
+    body, _sender_id, _lang, ctx = await ow._render_message(
+        db,
+        company_id=DURLACH_LOCATION_ID,
+        template_code=RECORD_CREATED,
+        record=record,
+        client=client,
+        provider=PROVIDER_EASYWEEK,
+    )
+
+    assert ctx["meta_template_name"] == "kitilash_du_record_created_v1"
+    assert "Wichtige Hinweise" not in body
+
+
+async def test_an_altegio_booking_does_not_make_an_easyweek_client_returning(db: AsyncSession) -> None:
+    """The two CRMs share one integer space for company_id."""
+    await _run_seed(db)
+    client, record = await _seed_durlach_domain(db)
+    db.add(
+        Record(
+            provider=PROVIDER_ALTEGIO,
+            company_id=DURLACH_LOCATION_ID,
+            altegio_record_id=555999,
+            client_id=client.id,
+            staff_name="Tanja",
+            starts_at=record.starts_at - timedelta(days=30),
+            raw={},
+        )
+    )
+    await db.flush()
+
+    _body, _sender_id, _lang, ctx = await ow._render_message(
+        db,
+        company_id=DURLACH_LOCATION_ID,
+        template_code=RECORD_CREATED,
+        record=record,
+        client=client,
+        provider=PROVIDER_EASYWEEK,
+    )
+
+    assert ctx["meta_template_name"] == "kitilash_du_record_created_new_client_v1"
+
+
+async def test_the_new_client_variant_builds_the_record_created_param_contract(db: AsyncSession) -> None:
+    """THE trap: params key on job_type, which stays `record_created`."""
+    from altegio_bot.meta_templates import build_lifecycle_template_params
+    from altegio_bot.template_validation import validate_lifecycle_template_params
+
+    await _run_seed(db)
+    client, record = await _seed_durlach_domain(db)
+
+    _body, _sender_id, _lang, ctx = await ow._render_message(
+        db,
+        company_id=DURLACH_LOCATION_ID,
+        template_code=RECORD_CREATED,
+        record=record,
+        client=client,
+        provider=PROVIDER_EASYWEEK,
+    )
+
+    # The JOB type, not the template code — that is what makes this work.
+    params = build_lifecycle_template_params(RECORD_CREATED, ctx)
+    assert len(params) == 7
+    assert all(params), "an empty slot would be rejected by Meta, not by us"
+    assert validate_lifecycle_template_params(RECORD_CREATED, params) is None
+
+    # And the template code on its own has no contract, which is exactly why the
+    # builder must never be keyed on it.
+    assert build_lifecycle_template_params(RECORD_CREATED_NEW_CLIENT, ctx) == []
+
+
+async def test_the_new_client_body_renders_with_no_missing_placeholders(db: AsyncSession) -> None:
+    await _run_seed(db)
+    client, record = await _seed_durlach_domain(db)
+
+    body, _sender_id, _lang, ctx = await ow._render_message(
+        db,
+        company_id=DURLACH_LOCATION_ID,
+        template_code=RECORD_CREATED,
+        record=record,
+        client=client,
+        provider=PROVIDER_EASYWEEK,
+    )
+
+    rendered = body.format(**ctx)
+    assert "{" not in rendered
+    assert "Anna Müller" in rendered
+    assert "KitiLash Durlach" in rendered
+    assert "Wichtige Hinweise" in rendered
+    assert VERIFIED_PAGE in rendered
+
+
+async def test_the_new_client_body_matches_the_shared_notes_constant(db: AsyncSession) -> None:
+    """The Meta template was cloned from the Karlsruhe one; the text must not drift."""
+    assert ow.PRE_APPOINTMENT_NOTES_DE in seed_script.BODIES[RECORD_CREATED_NEW_CLIENT]
+
+
+async def test_a_missing_new_client_row_falls_back_instead_of_failing(db: AsyncSession) -> None:
+    """A nicety must not cost a booking its confirmation."""
+    await _run_seed(db)
+    rows = await _easyweek_templates(db)
+    for row in rows:
+        if row.code == RECORD_CREATED_NEW_CLIENT:
+            row.is_active = False
+    await db.flush()
+    client, record = await _seed_durlach_domain(db)
+
+    _body, _sender_id, _lang, ctx = await ow._render_message(
+        db,
+        company_id=DURLACH_LOCATION_ID,
+        template_code=RECORD_CREATED,
+        record=record,
+        client=client,
+        provider=PROVIDER_EASYWEEK,
+    )
+
+    assert ctx["meta_template_name"] == "kitilash_du_record_created_v1"
+
+
+# ---------------------------------------------------------------------------
+# Booking page host allowlist (PR-5 debt closed in PR-6)
+# ---------------------------------------------------------------------------
+
+
+async def test_a_booking_page_on_an_unlisted_host_is_rejected(
+    db: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from altegio_bot.easyweek_policy import validate_static_booking_page
+
+    assert validate_static_booking_page(STATIC_BOOKING_PAGE) == STATIC_BOOKING_PAGE
+    assert validate_static_booking_page("https://typo.example.invalid/durlach") is None
+
+
+async def test_an_empty_allowlist_rejects_everything(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unconfirmed host must stop the activation, not wave any host through."""
+    from altegio_bot.easyweek_policy import validate_static_booking_page
+
+    monkeypatch.setattr(settings, "easyweek_booking_page_allowed_hosts", "", raising=False)
+    assert validate_static_booking_page(STATIC_BOOKING_PAGE) is None
+
+
+async def test_a_canceled_send_fails_closed_while_the_host_is_unconfirmed(
+    db: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """record_canceled has no other link, so an unlisted host stops it locally."""
+    await _run_seed(db)
+    client, record = await _seed_durlach_domain(db)
+    monkeypatch.setattr(settings, "easyweek_booking_page_allowed_hosts", "", raising=False)
+
+    _body, _sender_id, _lang, ctx = await ow._render_message(
+        db,
+        company_id=DURLACH_LOCATION_ID,
+        template_code=RECORD_CANCELED,
+        record=record,
+        client=client,
+        provider=PROVIDER_EASYWEEK,
+    )
+
+    assert ctx["booking_link"] == "", "no link is better than an unverified one"

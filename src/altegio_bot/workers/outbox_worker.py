@@ -36,6 +36,8 @@ from altegio_bot.delivery_retry_identity import (
 from altegio_bot.easyweek_normalizer import extract_manage_link
 from altegio_bot.easyweek_policy import (
     EASYWEEK_LIFECYCLE_JOB_TYPES,
+    RECORD_CREATED,
+    RECORD_CREATED_NEW_CLIENT,
     easyweek_job_type_error,
     normalize_provider,
     validate_static_booking_page,
@@ -815,7 +817,16 @@ async def _is_new_client_for_record(
     client_id: int | None,
     record_id: int | None,
     record_starts_at: datetime | None,
+    provider: str | None = None,
 ) -> bool:
+    """True when this booking is the customer's first at *company_id*.
+
+    ``provider`` is optional and defaults to no filter, which keeps every
+    existing Altegio call site on byte-identical SQL. EasyWeek passes it: the
+    two CRMs share one integer space for ``company_id``, so without the
+    predicate an Altegio booking could count as a "previous visit" and quietly
+    downgrade a first-time EasyWeek customer to the ordinary confirmation.
+    """
     if client_id is None or record_id is None or record_starts_at is None:
         return False
 
@@ -828,6 +839,8 @@ async def _is_new_client_for_record(
         .where(Record.starts_at < record_starts_at)
         .limit(1)
     )
+    if provider is not None:
+        stmt = stmt.where(Record.provider == provider)
     res = await session.execute(stmt)
     prev_id = res.scalar_one_or_none()
     return prev_id is None
@@ -976,13 +989,57 @@ async def _render_message(
         else _pick_language(company_id, client)
     )
 
+    # A first-time EasyWeek customer gets a different approved Meta template,
+    # which means a different DB row — but the SAME `record_created` job.
+    #
+    # That distinction is the whole design. `build_lifecycle_template_params`
+    # and its preflight key on `MessageJob.job_type`, which never changes, so
+    # the seven-field contract keeps holding; only the row that is looked up —
+    # and therefore `meta_template_name` — differs. Giving the new-client
+    # variant its own job type would have needed a second param contract and a
+    # second entry in every allowlist; giving it its own template code needs
+    # neither.
+    #
+    # Decided BEFORE the lookup, because it selects which row to load. The
+    # Altegio path is untouched: it keeps one row plus `{pre_appointment_notes}`
+    # and decides after loading, where `used_lang` is known.
+    lookup_code = template_code
+    if is_easyweek and template_code == RECORD_CREATED and record is not None:
+        is_new_client = await _is_new_client_for_record(
+            session=session,
+            company_id=company_id,
+            client_id=record.client_id,
+            record_id=record.id,
+            record_starts_at=record.starts_at,
+            provider=PROVIDER_EASYWEEK,
+        )
+        if is_new_client:
+            lookup_code = RECORD_CREATED_NEW_CLIENT
+
     tmpl, used_lang = await _load_template(
         session,
         company_id=company_id,
-        template_code=template_code,
+        template_code=lookup_code,
         language=language,
         provider=provider,
     )
+    if tmpl is None and lookup_code != template_code:
+        # The new-client row is optional. A location that has not seeded it yet
+        # still sends the ordinary confirmation rather than failing a booking
+        # over a variant that is a nicety, not a requirement.
+        logger.info(
+            "EasyWeek new-client template missing; falling back company=%s code=%s",
+            company_id,
+            lookup_code,
+        )
+        lookup_code = template_code
+        tmpl, used_lang = await _load_template(
+            session,
+            company_id=company_id,
+            template_code=template_code,
+            language=language,
+            provider=provider,
+        )
     if tmpl is None:
         raise ValueError(f"Template not found: provider={provider} company={company_id} code={template_code}")
 
