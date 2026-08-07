@@ -14,6 +14,12 @@ something that would have to be fixed by a new version afterwards.
 
 Safety defaults:
 * dry-run unless --apply is supplied, and --apply demands an explicit target;
+* the target address and map link are validated before anything is read from
+  Meta: empty, control-charactered, placeholder-carrying or copied-from-source
+  values are refused. Every other guard here watches the SOURCE side and would
+  happily accept a replacement with an empty string;
+* the full POST payload is printed before the confirmation is asked for, so
+  --apply never submits anything the operator has not seen;
 * a template with neither the address nor the Karlsruhe map link is genuinely
   location-neutral and is skipped;
 * a template whose address was not recognised while its Karlsruhe map link WAS
@@ -78,6 +84,10 @@ SOURCE_MAP_URLS: tuple[str, ...] = (
 
 # Meta positional parameters. The rewrite must not add, drop or move one.
 PLACEHOLDER_PATTERN = re.compile(r"\{\{\s*[^{}]+?\s*\}\}")
+
+# Anything unprintable in an operator-supplied value: a stray \r or \x00 would be
+# pasted straight into an approved footer.
+_CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f]")
 
 # GET /message_templates can contain server-side fields that are not accepted by
 # POST. Keep only fields used by template creation payloads.
@@ -863,11 +873,60 @@ def _confirm(count: int, *, expected: str) -> None:
         raise ScriptError("confirmation did not match; nothing was submitted")
 
 
+def validate_target_address(value: str) -> str:
+    """Reject an address the rest of the script would happily substitute.
+
+    Every guard downstream watches the SOURCE side: the replacement counters, the
+    residual scan and the placeholder signature all pass for ``--address ''``,
+    because the Karlsruhe address really is gone — replaced by nothing. The value
+    itself is the only place this is catchable.
+    """
+    address = value.strip()
+    if not address:
+        raise ScriptError("--address is empty; the clone would ship a footer with no address at all")
+    if _CONTROL_CHARACTERS.search(address):
+        raise ScriptError(f"--address contains a control character: {address!r}")
+    if PLACEHOLDER_PATTERN.search(address):
+        raise ScriptError(
+            f"--address contains a Meta placeholder: {address!r}; Meta would read it as a positional "
+            "parameter and the LIFECYCLE_PARAM_FIELDS order would no longer match"
+        )
+    for pattern in SOURCE_ADDRESS_PATTERNS:
+        if pattern.search(address):
+            raise ScriptError(
+                f"--address is the SOURCE address: {address!r}; the clone would keep pointing at the source location"
+            )
+    return address
+
+
+def validate_target_maps_url(value: str) -> str:
+    """Reject a maps link that would be pasted into the footer as-is."""
+    url = value.strip()
+    if not url:
+        raise ScriptError("--maps-url is empty; the clone would ship a footer with no map link at all")
+    if _CONTROL_CHARACTERS.search(url):
+        raise ScriptError(f"--maps-url contains a control character: {url!r}")
+    if url in SOURCE_MAP_URLS:
+        raise ScriptError(f"--maps-url is one of the SOURCE map links: {url}; the clone would keep the source map")
+    parsed = urlsplit(url)
+    if parsed.scheme != "https":
+        raise ScriptError(f"--maps-url must be an absolute https URL, got {url!r}")
+    if not parsed.hostname:
+        raise ScriptError(f"--maps-url has no hostname, got {url!r}")
+    if parsed.username or parsed.password:
+        raise ScriptError("--maps-url must not contain credentials")
+    if parsed.fragment:
+        raise ScriptError(f"--maps-url must not contain a fragment, got {url!r}")
+    return url
+
+
 def resolve_targets(args: argparse.Namespace) -> tuple[str, str, str]:
     """Target location/address/maps link: explicit under --apply, defaulted otherwise.
 
     The dry-run defaults describe Durlach. They are convenient for a plan and
-    dangerous for a submission, so --apply refuses to inherit them.
+    dangerous for a submission, so --apply refuses to inherit them. The values
+    are then validated whether they were given or defaulted — a default is only
+    trustworthy until someone edits the constant.
     """
     if args.apply:
         missing = [
@@ -886,8 +945,8 @@ def resolve_targets(args: argparse.Namespace) -> tuple[str, str, str]:
             )
     return (
         args.target_location or DEFAULT_TARGET_LOCATION,
-        DEFAULT_TARGET_ADDRESS if args.address is None else args.address,
-        DEFAULT_TARGET_MAPS_URL if args.maps_url is None else args.maps_url,
+        validate_target_address(DEFAULT_TARGET_ADDRESS if args.address is None else args.address),
+        validate_target_maps_url(DEFAULT_TARGET_MAPS_URL if args.maps_url is None else args.maps_url),
     )
 
 
@@ -952,6 +1011,18 @@ async def async_main(args: argparse.Namespace) -> int:
         if not plan.prepared:
             print("Nothing to submit.")
             return 0
+
+        # --apply does not require a prior dry-run, and CREATE:<TARGET>:<count>
+        # encodes only how many templates go out — not which address or which map
+        # link they carry. So the full payload is printed here, before the
+        # confirmation, and with --yes as well, where it is the run transcript.
+        print()
+        print(f"About to submit {len(plan.prepared)} template(s) to Meta for review:")
+        print()
+        for item in plan.prepared:
+            print_template_preview(item)
+        print()
+
         if not args.yes:
             _confirm(len(plan.prepared), expected=_confirmation_word(target_location, len(plan.prepared)))
 

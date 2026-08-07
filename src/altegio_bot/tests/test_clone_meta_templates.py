@@ -28,8 +28,11 @@ Covers:
 12. non-JSON 2xx bodies raise ScriptError on both list and create;
 13. a create response without an id is reported as indeterminate, never SENT;
 14. --apply refuses the dry-run defaults; a wrong confirmation sends nothing;
-15. the access token never appears in any line of output;
-16. _normalize_api_version on valid and garbage values.
+15. an empty/garbled/source-copied --address or --maps-url is refused before the
+    first GET — every other guard watches the source side and passes;
+16. --apply prints the full payload BEFORE asking for the confirmation;
+17. the access token never appears in any line of output;
+18. _normalize_api_version on valid and garbage values.
 """
 
 from __future__ import annotations
@@ -62,6 +65,8 @@ from altegio_bot.scripts.clone_meta_templates_for_location import (
     prepare_template,
     residual_source_markers,
     select_sources,
+    validate_target_address,
+    validate_target_maps_url,
 )
 from altegio_bot.scripts.seed_templates import COMPANIES, _footer
 
@@ -90,18 +95,28 @@ _PREPARE_KWARGS: dict[str, Any] = {
     "maps_url": DEFAULT_TARGET_MAPS_URL,
 }
 
+
 # --apply no longer inherits the dry-run defaults, so every applying test states
 # the target it means to submit.
-_APPLY_ARGS = [
-    "--apply",
-    "--yes",
-    "--target-location",
-    "du",
-    "--address",
-    DEFAULT_TARGET_ADDRESS,
-    "--maps-url",
-    DEFAULT_TARGET_MAPS_URL,
-]
+def _apply_args(
+    *,
+    address: str = DEFAULT_TARGET_ADDRESS,
+    maps_url: str = DEFAULT_TARGET_MAPS_URL,
+    yes: bool = True,
+) -> list[str]:
+    return [
+        "--apply",
+        *(["--yes"] if yes else []),
+        "--target-location",
+        "du",
+        "--address",
+        address,
+        "--maps-url",
+        maps_url,
+    ]
+
+
+_APPLY_ARGS = _apply_args()
 
 
 # ---------------------------------------------------------------------------
@@ -831,6 +846,168 @@ def test_dry_run_prints_the_full_preview(monkeypatch: pytest.MonkeyPatch, capsys
     assert DEFAULT_TARGET_ADDRESS in output
     assert DEFAULT_TARGET_MAPS_URL in output
     assert _KA_CFG.phone_line in output
+
+
+@pytest.mark.parametrize(
+    ("address", "reason"),
+    [
+        ("", "empty"),
+        ("   ", "empty"),
+        ("Pfinztalstraße 4,\x00 76227 Karlsruhe-Durlach", "control character"),
+        ("Pfinztalstraße 4,\r\n76227 Karlsruhe-Durlach", "control character"),
+        ("Pfinztalstraße {{1}}, 76227 Karlsruhe-Durlach", "Meta placeholder"),
+        ("76133 Karlsruhe, Kaiserstraße, 68", "SOURCE address"),
+        ("Kaiserstraße, 68, 76133 Karlsruhe", "SOURCE address"),
+    ],
+)
+def test_bad_address_is_refused_before_any_meta_call(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+    address: str,
+    reason: str,
+) -> None:
+    """Every SOURCE-side guard passes for these: only the value itself catches them."""
+    code, fake = _run_script(monkeypatch, _ka_sources(), _apply_args(address=address))
+
+    assert code == 1
+    assert fake.list_calls == 0
+    assert fake.created == []
+    error = capsys.readouterr().err
+    assert "--address" in error
+    assert reason in error
+
+
+@pytest.mark.parametrize(
+    ("maps_url", "reason"),
+    [
+        ("", "empty"),
+        ("   ", "empty"),
+        ("abc", "absolute https URL"),
+        ("maps.app.goo.gl/HnVPnHaJHf2DW3Nn8", "absolute https URL"),
+        ("http://maps.app.goo.gl/HnVPnHaJHf2DW3Nn8", "absolute https URL"),
+        ("https:///HnVPnHaJHf2DW3Nn8", "no hostname"),
+        ("https://user:pass@maps.app.goo.gl/HnVPnHaJHf2DW3Nn8", "credentials"),
+        ("https://maps.app.goo.gl/HnVPnHaJHf2DW3Nn8#pin", "fragment"),
+        ("https://maps.app.goo.gl/HnVP\x07naJHf2DW3Nn8", "control character"),
+        (_KA_MAPS_URL, "SOURCE map links"),
+        ("https://maps.app.goo.gl/p7quWqbAqY9cusuRA", "SOURCE map links"),
+    ],
+)
+def test_bad_maps_url_is_refused_before_any_meta_call(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+    maps_url: str,
+    reason: str,
+) -> None:
+    code, fake = _run_script(monkeypatch, _ka_sources(), _apply_args(maps_url=maps_url))
+
+    assert code == 1
+    assert fake.list_calls == 0
+    assert fake.created == []
+    error = capsys.readouterr().err
+    assert "--maps-url" in error
+    assert reason in error
+
+
+def test_empty_address_would_otherwise_pass_every_other_guard() -> None:
+    """Why the value check exists: an empty address leaves nothing to detect."""
+    source = _template("kitilash_ka_record_created_v1", body=_BODY + _KA_FOOTER)
+
+    outcome = prepare_template(
+        source,
+        source_prefix=_SOURCE_PREFIX,
+        target_prefix=_TARGET_PREFIX,
+        address="",
+        maps_url=DEFAULT_TARGET_MAPS_URL,
+    )
+
+    assert outcome.status is TemplateStatus.READY
+    assert outcome.replacements == ReplacementStats(address=1, maps_url=1)
+    assert outcome.residuals == ()
+    assert outcome.placeholders_before == outcome.placeholders_after
+    assert validate_target_address(DEFAULT_TARGET_ADDRESS) == DEFAULT_TARGET_ADDRESS
+    with pytest.raises(ScriptError):
+        validate_target_address("")
+
+
+def test_validators_accept_the_shipped_defaults() -> None:
+    assert validate_target_address(f"  {DEFAULT_TARGET_ADDRESS}  ") == DEFAULT_TARGET_ADDRESS
+    assert validate_target_maps_url(f"  {DEFAULT_TARGET_MAPS_URL}  ") == DEFAULT_TARGET_MAPS_URL
+
+
+def test_dry_run_also_refuses_a_bad_target_value(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """A plan built on an empty address is not worth reviewing either."""
+    code, fake = _run_script(monkeypatch, _ka_sources(), ["--address", ""])
+
+    assert code == 1
+    assert fake.list_calls == 0
+    assert "--address is empty" in capsys.readouterr().err
+
+
+def test_full_preview_is_printed_before_the_confirmation(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """--apply may run without a prior dry-run, and the word only encodes a count."""
+    at_prompt: dict[str, str] = {}
+
+    def _fake_input(prompt: str = "") -> str:
+        # readouterr() drains what was printed so far: everything asserted below
+        # therefore reached stdout BEFORE the operator was asked to confirm.
+        at_prompt["stdout"] = capsys.readouterr().out
+        at_prompt["prompt"] = prompt
+        return "CREATE:DU:6"
+
+    monkeypatch.setattr("builtins.input", _fake_input)
+
+    code, fake = _run_script(monkeypatch, _ka_sources(), _apply_args(yes=False))
+
+    assert code == 0
+    assert [payload["name"] for payload in fake.created] == sorted(
+        name.replace(_SOURCE_PREFIX, _TARGET_PREFIX) for name in _expected()
+    )
+    printed = at_prompt["stdout"]
+    assert "About to submit 6 template(s) to Meta for review:" in printed
+    assert "--- POST payload ---" in printed
+    assert "--- BODY ---" in printed
+    assert "placeholders: BODY {{1}},{{2}} | BUTTONS -" in printed
+    assert DEFAULT_TARGET_ADDRESS in printed
+    assert DEFAULT_TARGET_MAPS_URL in printed
+    assert _KA_CFG.address_line not in printed
+    assert "CREATE:DU:6" in at_prompt["prompt"]
+
+
+def test_preview_is_printed_with_yes_as_the_run_transcript(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    code, fake = _run_script(monkeypatch, _ka_sources(), _APPLY_ARGS)
+
+    assert code == 0
+    assert len(fake.created) == 6
+    output = capsys.readouterr().out
+    assert "--- POST payload ---" in output
+    assert DEFAULT_TARGET_MAPS_URL in output
+    assert output.index("--- POST payload ---") < output.index("SENT    ")
+
+
+def test_wrong_confirmation_still_sees_the_preview_but_sends_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    monkeypatch.setattr("builtins.input", lambda *_args: "CREATE:DU:5")
+
+    code, fake = _run_script(monkeypatch, _ka_sources(), _apply_args(yes=False))
+
+    assert code == 1
+    assert fake.created == []
+    output = capsys.readouterr()
+    assert "--- POST payload ---" in output.out
+    assert "SENT" not in output.out
+    assert "confirmation did not match" in output.err
 
 
 def test_confirmation_word_carries_the_plan(monkeypatch: pytest.MonkeyPatch) -> None:
