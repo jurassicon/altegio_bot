@@ -176,17 +176,54 @@ URL, которая иначе уехала бы клиенту как ссыл�
 атом активации: без шаблона job падает с `Template not found`, без отправителя —
 с `No active sender`.
 
-Подставьте вместо `<EASYWEEK_LOCATION_ID>` значение из production
-`easyweek.env` — это и есть подтверждение оператора:
+### Откуда взять `--expect-location-id`
+
+**НЕ из `easyweek.env`.** Смысл аргумента — второй независимый источник (§0).
+Если скопировать значение из `easyweek.env` в CLI, обе стороны сверки придут из
+одного места, проверка выродится в сравнение значения с самим собой, и неверно
+заданный `EASYWEEK_LOCATION_ID` пройдёт её беспрепятственно.
+
+Берите numeric `:location_id` из источника, не зависящего от конфигурации
+контейнера, в порядке предпочтения:
+
+1. **Захваченный вебхук.** Это число прислала сама EasyWeek, и в нашу БД оно
+   попало помимо `easyweek.env`:
+
+```sql
+SELECT DISTINCT payload ->> 'location_id' AS location_id, COUNT(*) AS events
+FROM easyweek_events
+GROUP BY 1
+ORDER BY events DESC;
+```
+
+   Ожидается одна локация. Если строк несколько — разберитесь, какая из них
+   Durlach, прежде чем продолжать.
+
+2. **Кабинет EasyWeek** — id локации в интерфейсе.
+
+3. **Операционное подтверждение владельца локации.**
+
+Read-only проба (`python -m altegio_bot.scripts.easyweek_probe --redact-pii`)
+для этого шага **не подходит**: она печатает `uuid`, `name` и `timezone`
+локации, но не numeric `id`. Ею удобно подтвердить, ЧТО за локация видна ключу,
+а не какой у неё numeric id.
+
+Полученное число оператор печатает руками:
 
 ```bash
 docker compose -p altegio_bot run --rm altegio-outbox-worker \
   /app/.venv/bin/python -m altegio_bot.scripts.seed_easyweek_templates \
-  --expect-location-id <EASYWEEK_LOCATION_ID>
+  --expect-location-id <id, подтверждённый выше>
 ```
 
 Сервис выбран не случайно: `altegio-outbox-worker` — один из трёх, кто читает
-`easyweek.env`.
+`easyweek.env`; сид сверит переданное число с тем, что там уже лежит.
+
+**Расхождение — это стоп, а не повод «подправить».** Оно означает одно из двух:
+контейнер сконфигурирован не на ту локацию, либо оператор подтвердил не ту. Сид
+не может отличить один случай от другого и обязан отказать — иначе контент
+Durlach привяжется к чужой локации. Выясните, какая сторона неверна, исправьте
+её и запустите сид заново.
 
 Скрипт fail-closed и ничего не запишет, если: аргумент не передан, он не
 совпадает с `EASYWEEK_LOCATION_ID`, язык не `de`, или `META_WA_PHONE_NUMBER_ID`
@@ -357,17 +394,39 @@ docker compose -p altegio_bot up -d --force-recreate altegio-easyweek-inbox-work
 
 3. Нейтрализовать EasyWeek-джобы — обязательно покрывая и `queued`, и
    `processing` (воркер остановлен, поэтому `processing` больше никем не
-   держится):
+   держится). **Двумя отдельными запросами, с разными маркерами**: происхождение
+   отмены потом нельзя восстановить, а разбирать эти две группы надо
+   по-разному.
+
+   Воркер на шаге 1 уже остановлен, поэтому переходов `queued` → `processing`
+   быть не должно и порядок запросов не влияет. Но выполняйте их именно в
+   порядке ниже — так набор деградирует безопасно, если остановка почему-то не
+   вступила в силу: джоб, захваченный между запросами, будет пойман вторым
+   запросом и получит консервативный маркер «исход неизвестен», а не потеряется
+   между двумя условиями.
 
 ```sql
 UPDATE message_jobs
 SET status     = 'canceled',
     locked_at  = NULL,
     updated_at = now(),
-    last_error = 'Canceled: activation rolled back'
+    last_error = 'Canceled: activation rolled back before send'
 WHERE provider = 'easyweek'
-  AND status IN ('queued', 'processing');
+  AND status = 'queued';
 ```
+
+```sql
+UPDATE message_jobs
+SET status     = 'canceled',
+    locked_at  = NULL,
+    updated_at = now(),
+    last_error = 'Canceled: activation rolled back from processing; outcome unknown'
+WHERE provider = 'easyweek'
+  AND status = 'processing';
+```
+
+   Маркер «before send» получает только строка, которая на момент `UPDATE` всё
+   ещё была `queued`, то есть заведомо не бралась воркером и не отправлялась.
 
 4. Убедиться, что не осталось отправляемых:
 
@@ -376,14 +435,13 @@ SELECT status, COUNT(*) FROM message_jobs
 WHERE provider = 'easyweek' GROUP BY status;
 ```
 
-4a. Найти джобы, отменённые из `processing`, — именно у них исход отправки
-    неопределён. Их немного (в пределе — по одному на убитый воркер), и каждый
-    надо разобрать вручную:
+4a. Разобрать бывшие `processing` — **только их**: именно у этой группы исход
+    отправки неопределён. Их немного (в пределе — по одному на убитый воркер),
+    и каждый надо разобрать вручную:
 
 ```sql
 SELECT j.id            AS job_id,
        j.job_type,
-       j.status        AS job_status,
        o.id            AS outbox_id,
        o.status        AS outbox_status,
        o.provider_message_id,
@@ -391,23 +449,29 @@ SELECT j.id            AS job_id,
 FROM message_jobs j
          LEFT JOIN outbox_messages o ON o.job_id = j.id
 WHERE j.provider = 'easyweek'
-  AND j.last_error = 'Canceled: activation rolled back'
+  AND j.last_error = 'Canceled: activation rolled back from processing; outcome unknown'
 ORDER BY j.id DESC;
 ```
 
-Как читать результат:
+Как читать результат — правило зависит от того, из какого состояния джоб был
+отменён:
 
-* **есть строка `outbox_messages` с непустым `provider_message_id`** — Meta
-  приняла сообщение, клиент его, скорее всего, получил. Джоб помечен
-  `canceled` ошибочно;
-* **строки `outbox_messages` нет вовсе** — отправка не начиналась, отмена
-  корректна. Это подавляющее большинство;
-* **строка есть, но `provider_message_id` пуст** — ответ Meta не сохранился;
-  проверьте по номеру клиента в WhatsApp вручную.
+| Маркер | `outbox_messages` | Что это значит |
+| --- | --- | --- |
+| `…before send` (бывший `queued`) | строки нет | Отправка не начиналась, отмена корректна. Подавляющее большинство; разбирать не нужно. |
+| `…from processing` | строка есть, `provider_message_id` не пуст | Meta приняла сообщение, клиент его, скорее всего, получил. Джоб помечен `canceled` **ошибочно**. |
+| `…from processing` | **строки нет** | **Исход неизвестен.** Вставка `OutboxMessage` откатывается вместе с транзакцией, поэтому отсутствие строки — ровно то, как выглядит уже отправленное сообщение, у которого не успел пройти коммит. Проверять вручную. |
+| `…from processing` | строка есть, `provider_message_id` пуст | Ответ Meta не сохранился. Проверять вручную. |
 
-Ту же проверку стоит сделать по WhatsApp-стороне: если сообщение всё-таки
-ушло, входящий status-callback (`delivered` / `read`) придёт на `wamid`,
-которого нет ни в одном живом джобе.
+Внимание на третью строку таблицы: для бывшего `queued` отсутствие
+`outbox_messages` — доказательство, что отправки не было, а для бывшего
+`processing` — **не доказательство ничего**. Ровно поэтому маркеры и разделены:
+без этого единственный опасный случай выглядел бы как самый безобидный.
+
+Для случаев «проверять вручную» есть один внешний признак: если сообщение
+всё-таки ушло, входящий status-callback (`delivered` / `read`) придёт на
+`wamid`, которого нет ни в одном живом джобе. Плюс прямая проверка переписки с
+клиентом в WhatsApp.
 
 5. Поднять outbox обратно — Altegio возобновляется:
 
