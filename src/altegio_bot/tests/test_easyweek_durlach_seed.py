@@ -40,9 +40,10 @@ from altegio_bot.workers import outbox_worker as ow
 
 pytestmark = pytest.mark.asyncio
 
-# The production location id is not in the repo, so the tests pin the script's
-# own constant instead of a made-up number. That is the point of the binding:
-# whatever the confirmed id turns out to be, the seed must refuse anything else.
+# A stand-in, never the production id — that lives in easyweek.env only, and a
+# repository-wide test enforces it. What these tests exercise is the MECHANISM:
+# the operator-supplied `--expect-location-id` and the configured
+# EASYWEEK_LOCATION_ID must agree, whatever the real number turns out to be.
 DURLACH_LOCATION_ID = 999501
 SHARED_PHONE_NUMBER_ID = "shared-bot-phone-number-id"
 BOOKING_PAGE_HOST = "book.durlach.invalid"
@@ -54,7 +55,6 @@ VERIFIED_PAGE = f"https://eyw.me/r/{BOOKING_HASH}"
 @pytest.fixture(autouse=True)
 def _durlach_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     """The Durlach configuration, with notifications deliberately OFF."""
-    monkeypatch.setattr(seed_script, "DURLACH_LOCATION_ID", DURLACH_LOCATION_ID)
     monkeypatch.setattr(settings, "easyweek_location_id", DURLACH_LOCATION_ID, raising=False)
     monkeypatch.setattr(settings, "easyweek_booking_page_allowed_hosts", BOOKING_PAGE_HOST, raising=False)
     monkeypatch.setattr(settings, "easyweek_default_language", "de", raising=False)
@@ -69,8 +69,10 @@ async def db(session_maker: async_sessionmaker[AsyncSession]) -> AsyncSession:
         yield session
 
 
-async def _run_seed(db: AsyncSession) -> seed_script.SeedResult:
-    result = await seed_script.seed(db)
+async def _run_seed(
+    db: AsyncSession, *, expect_location_id: int | None = DURLACH_LOCATION_ID
+) -> seed_script.SeedResult:
+    result = await seed_script.seed(db, expect_location_id=expect_location_id)
     await db.flush()
     return result
 
@@ -273,25 +275,69 @@ async def test_the_seed_refuses_an_unconfigured_environment(
     monkeypatch.setattr(settings, field, value, raising=False)
 
     with pytest.raises(seed_script.SeedConfigError):
-        await seed_script.seed(db)
+        await _run_seed(db)
 
     await db.flush()
     assert await _count(db, MessageTemplate, provider=PROVIDER_EASYWEEK) == 0
     assert await _count(db, WhatsAppSender, provider=PROVIDER_EASYWEEK) == 0
 
 
-async def test_an_unconfirmed_location_constant_refuses_to_seed(
-    db: AsyncSession,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Until the real id is filled in, the seed must not run at all."""
-    monkeypatch.setattr(seed_script, "DURLACH_LOCATION_ID", None)
+# ---------------------------------------------------------------------------
+# The two-source location confirmation
+# ---------------------------------------------------------------------------
 
+
+async def test_a_matching_confirmation_seeds(db: AsyncSession) -> None:
+    result = await _run_seed(db, expect_location_id=DURLACH_LOCATION_ID)
+
+    assert result.templates_created == 4
+    assert await _count(db, WhatsAppSender, provider=PROVIDER_EASYWEEK) == 1
+
+
+async def test_a_confirmation_for_another_location_writes_nothing(db: AsyncSession) -> None:
+    """The operator confirmed a location this container is not configured for.
+
+    Either the env is wrong or the operator is; the seed cannot tell which, and
+    writing Durlach's content under either answer would be a guess.
+    """
     with pytest.raises(seed_script.SeedConfigError):
-        await seed_script.seed(db)
+        await _run_seed(db, expect_location_id=DURLACH_LOCATION_ID + 1)
 
     await db.flush()
     assert await _count(db, MessageTemplate, provider=PROVIDER_EASYWEEK) == 0
+    assert await _count(db, WhatsAppSender, provider=PROVIDER_EASYWEEK) == 0
+
+
+@pytest.mark.parametrize("bad_confirmation", [None, 0, -1])
+async def test_a_missing_or_nonsense_confirmation_writes_nothing(
+    db: AsyncSession,
+    bad_confirmation: int | None,
+) -> None:
+    """No default is substituted — an unconfirmed seed simply does not run."""
+    with pytest.raises(seed_script.SeedConfigError):
+        await _run_seed(db, expect_location_id=bad_confirmation)
+
+    await db.flush()
+    assert await _count(db, MessageTemplate, provider=PROVIDER_EASYWEEK) == 0
+    assert await _count(db, WhatsAppSender, provider=PROVIDER_EASYWEEK) == 0
+
+
+async def test_the_cli_requires_the_confirmation() -> None:
+    """argparse refuses before anything opens a database session."""
+    with pytest.raises(SystemExit):
+        seed_script._parse_args([])
+
+    assert seed_script._parse_args(["--expect-location-id", "42"]).expect_location_id == 42
+
+
+async def test_the_refusal_never_echoes_the_location_id() -> None:
+    """These strings reach logs; the id is production configuration."""
+    with pytest.raises(seed_script.SeedConfigError) as excinfo:
+        seed_script._resolve_company_id(DURLACH_LOCATION_ID + 1)
+
+    message = str(excinfo.value)
+    assert str(DURLACH_LOCATION_ID) not in message
+    assert str(DURLACH_LOCATION_ID + 1) not in message
 
 
 # ---------------------------------------------------------------------------
@@ -640,3 +686,30 @@ async def test_a_canceled_send_fails_closed_while_the_host_is_unconfirmed(
     )
 
     assert ctx["booking_link"] == "", "no link is better than an unverified one"
+
+
+async def test_the_allowlist_is_an_origin_check_not_a_hostname_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A different port is a different service behind the same name.
+
+    `urlsplit(...).hostname` strips the port, so matching on it alone let
+    `https://allowed.host:4443/` through verbatim — and this value is the link a
+    customer taps after a cancellation.
+    """
+    from altegio_bot.easyweek_policy import validate_static_booking_page
+
+    monkeypatch.setattr(settings, "easyweek_booking_page_allowed_hosts", "booking.example.com", raising=False)
+
+    # Same origin: no port, and the redundant but equivalent :443.
+    assert validate_static_booking_page("https://booking.example.com/durlach") == (
+        "https://booking.example.com/durlach"
+    )
+    assert validate_static_booking_page("https://booking.example.com:443/durlach") == (
+        "https://booking.example.com:443/durlach"
+    )
+
+    # Any other port is a different origin.
+    assert validate_static_booking_page("https://booking.example.com:4443/durlach") is None
+    assert validate_static_booking_page("https://booking.example.com:80/durlach") is None
+    assert validate_static_booking_page("https://booking.example.com:8443/durlach") is None

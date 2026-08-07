@@ -134,10 +134,15 @@ def validate_static_booking_page(raw: object | None) -> str | None:
     every legitimate value or have to be loosened until it stopped protecting
     the manage link.
 
-    The host is checked against ``EASYWEEK_BOOKING_PAGE_ALLOWED_HOSTS``, which
+    The ORIGIN is checked against ``EASYWEEK_BOOKING_PAGE_ALLOWED_HOSTS``, which
     is configuration rather than a constant here: the approved page is a
     property of the location, not of this code, and hardcoding a guess would
     either block the real value or bless the wrong one.
+
+    Origin, not just hostname: a URL with no port and one with an explicit
+    ``:443`` are the same https origin and are both accepted, but any other port
+    is refused. ``https://allowed.host:4443/`` is a different service behind the
+    same name, and this value ends up as a link a customer taps.
 
     An EMPTY allowlist rejects everything. That is the point: until an operator
     confirms the approved host, a typo in ``EASYWEEK_BOOKING_PAGE_URL`` would
@@ -176,9 +181,20 @@ def validate_static_booking_page(raw: object | None) -> str | None:
             return None
         if parts.fragment:
             return None
-        _ = parts.port
-        # `hostname` is already lowercased and port-stripped by urlsplit, and
-        # credentials/port are rejected above, so an exact match is enough.
+        # The allowlist is an ORIGIN check, and an origin is scheme + host +
+        # PORT. `hostname` has the port stripped off, so matching on it alone
+        # let `https://allowed.host:4443/` through — a different port is a
+        # different service, and this link is what a customer taps after a
+        # cancellation.
+        #
+        # `None` (no port given) and an explicit `:443` are the same origin for
+        # https and are both accepted; anything else is refused. Accepting the
+        # redundant `:443` costs nothing and avoids rejecting a URL that is
+        # literally equivalent to the allowed one.
+        if parts.port is not None and parts.port != 443:
+            return None
+        # `hostname` is already lowercased by urlsplit, and credentials and any
+        # non-443 port are rejected above, so an exact match is enough.
         if parts.hostname not in allowed_hosts:
             return None
     except ValueError:

@@ -21,14 +21,24 @@ fail-closed: без них система останавливается, а н�
 
 | Что | Где | Пока не заполнено |
 | --- | --- | --- |
-| numeric `:location_id` Durlach | `DURLACH_LOCATION_ID` в `scripts/seed_easyweek_templates.py` | сид отказывается работать: `SeedConfigError` |
+| numeric `:location_id` Durlach | `EASYWEEK_LOCATION_ID` в `easyweek.env` **и** аргумент `--expect-location-id` при запуске сида | сид отказывается работать: `SeedConfigError` |
 | approved host страницы записи | `EASYWEEK_BOOKING_PAGE_ALLOWED_HOSTS` в `easyweek.env` | любой booking URL отвергается, lifecycle-job падает локально |
 
-`DURLACH_LOCATION_ID` — константа в скрипте, а не настройка, намеренно: скрипт
-пишет контент именно Durlach (Meta-имена, адрес, карту). Если значение из
-`EASYWEEK_LOCATION_ID` не совпадёт с константой, сид откажется — иначе контент
-Durlach молча привязался бы к другой локации, и ничто ниже по потоку этого бы не
+Location id в репозитории **не хранится** — он живёт только в production
+`easyweek.env`, и это закреплено тестом
+`test_the_production_location_id_is_not_hardcoded_in_python`.
+
+Поэтому подтверждение делает оператор: `--expect-location-id` обязателен и
+сверяется с `EASYWEEK_LOCATION_ID`. Два независимых источника — смысл именно в
+этом: константа, прочитанная из того же `easyweek.env`, сравнивала бы значение
+сама с собой и ничего бы не доказывала, а человек, которому надо набрать id
+руками, — настоящий второй источник. Скрипт пишет контент именно Durlach
+(Meta-имена, адрес, карту); при расхождении он откажется, иначе этот контент
+молча привязался бы к другой локации, и ничто ниже по потоку этого бы не
 заметило.
+
+Сообщения об отказе называют нарушенный инвариант и **не печатают сам id** — они
+попадают в логи.
 
 ---
 
@@ -166,16 +176,22 @@ URL, которая иначе уехала бы клиенту как ссыл�
 атом активации: без шаблона job падает с `Template not found`, без отправителя —
 с `No active sender`.
 
+Подставьте вместо `<EASYWEEK_LOCATION_ID>` значение из production
+`easyweek.env` — это и есть подтверждение оператора:
+
 ```bash
 docker compose -p altegio_bot run --rm altegio-outbox-worker \
-  /app/.venv/bin/python -m altegio_bot.scripts.seed_easyweek_templates
+  /app/.venv/bin/python -m altegio_bot.scripts.seed_easyweek_templates \
+  --expect-location-id <EASYWEEK_LOCATION_ID>
 ```
 
 Сервис выбран не случайно: `altegio-outbox-worker` — один из трёх, кто читает
 `easyweek.env`.
 
-Скрипт fail-closed и ничего не запишет, если: `EASYWEEK_LOCATION_ID` не равен
-`DURLACH_LOCATION_ID`, язык не `de`, или `META_WA_PHONE_NUMBER_ID` пуст.
+Скрипт fail-closed и ничего не запишет, если: аргумент не передан, он не
+совпадает с `EASYWEEK_LOCATION_ID`, язык не `de`, или `META_WA_PHONE_NUMBER_ID`
+пуст. Все проверки выполняются до первой записи, поэтому отказ оставляет БД в
+исходном состоянии.
 
 ---
 
@@ -254,13 +270,23 @@ docker compose -p altegio_bot up -d --force-recreate altegio-easyweek-inbox-work
 * `record_canceled` → **всегда** статическая страница записи.
 
 ```sql
-SELECT o.id, o.template_code, o.status, o.language, o.meta ->> 'send_type' AS send_type
+SELECT o.id,
+       o.template_code,
+       o.status,
+       o.language,
+       o.meta ->> 'send_type'                                            AS send_type,
+       COALESCE(o.meta ->> 'template', o.meta ->> 'original_template')   AS meta_template
 FROM outbox_messages o
          JOIN message_jobs j ON j.id = o.job_id
 WHERE j.provider = 'easyweek'
 ORDER BY o.id DESC
 LIMIT 20;
 ```
+
+`meta_template` берётся из двух ключей не случайно: при шаблонной отправке имя
+лежит в `meta->>'template'`, а при успешной текстовой внутри 24-часового окна —
+в `meta->>'original_template'`. Без `COALESCE` первичная запись, ушедшая текстом,
+показала бы пустое имя, и проверку new-client шаблона сделать было бы нельзя.
 
 Если job'ы встают в `failed`, смотрите `message_jobs.last_error` — сообщения
 инвариантные и без PII.
@@ -303,6 +329,16 @@ docker compose -p altegio_bot up -d --force-recreate altegio-easyweek-inbox-work
 Это не побочный эффект, это условие корректности: без остановки воркера
 нейтрализовать очередь без гонки нельзя.
 
+**Это best-effort остановка для ещё НЕ НАЧАТЫХ отправок, а не гарантия.**
+`run_outbox_worker.py` не реализует SIGTERM/drain, а отправка провайдеру
+происходит внутри транзакции, которая коммитится уже ПОСЛЕ ответа Meta. Значит
+существует узкое окно: Meta приняла сообщение → процесс убит до коммита → джоб
+остался `processing` → шаг 3 пометил его `canceled`. Клиент сообщение получил,
+а в БД оно выглядит отменённым. Одна уже начатая отправка может иметь
+неопределённый исход; всё, что ещё не начиналось, остановлено надёжно.
+
+Как найти такой случай после остановки — шаг 4a ниже.
+
 1. Остановить outbox-воркер:
 
 ```bash
@@ -339,6 +375,39 @@ WHERE provider = 'easyweek'
 SELECT status, COUNT(*) FROM message_jobs
 WHERE provider = 'easyweek' GROUP BY status;
 ```
+
+4a. Найти джобы, отменённые из `processing`, — именно у них исход отправки
+    неопределён. Их немного (в пределе — по одному на убитый воркер), и каждый
+    надо разобрать вручную:
+
+```sql
+SELECT j.id            AS job_id,
+       j.job_type,
+       j.status        AS job_status,
+       o.id            AS outbox_id,
+       o.status        AS outbox_status,
+       o.provider_message_id,
+       o.sent_at
+FROM message_jobs j
+         LEFT JOIN outbox_messages o ON o.job_id = j.id
+WHERE j.provider = 'easyweek'
+  AND j.last_error = 'Canceled: activation rolled back'
+ORDER BY j.id DESC;
+```
+
+Как читать результат:
+
+* **есть строка `outbox_messages` с непустым `provider_message_id`** — Meta
+  приняла сообщение, клиент его, скорее всего, получил. Джоб помечен
+  `canceled` ошибочно;
+* **строки `outbox_messages` нет вовсе** — отправка не начиналась, отмена
+  корректна. Это подавляющее большинство;
+* **строка есть, но `provider_message_id` пуст** — ответ Meta не сохранился;
+  проверьте по номеру клиента в WhatsApp вручную.
+
+Ту же проверку стоит сделать по WhatsApp-стороне: если сообщение всё-таки
+ушло, входящий status-callback (`delivered` / `read`) придёт на `wamid`,
+которого нет ни в одном живом джобе.
 
 5. Поднять outbox обратно — Altegio возобновляется:
 

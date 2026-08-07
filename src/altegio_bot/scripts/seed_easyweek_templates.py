@@ -28,6 +28,7 @@ stays an operator decision — see docs/easyweek/durlach_activation_runbook.md.
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 from dataclasses import dataclass
 
@@ -57,17 +58,20 @@ META_TEMPLATE_NAMES: dict[str, str] = {
     RECORD_CREATED_NEW_CLIENT: "kitilash_du_record_created_new_client_v1",
 }
 
-# The confirmed numeric EasyWeek :location_id of the Durlach location.
+# The Durlach location id is NOT in this file, and must not be added.
 #
-# NOT YET CONFIRMED — read it from the production `easyweek.env`
-# (EASYWEEK_LOCATION_ID) and fill it in before the first seed.
+# It lives in production `easyweek.env` only, and a repository-wide test
+# (`test_the_production_location_id_is_not_hardcoded_in_python`) enforces that.
+# So the confirmation comes from the operator instead: `--expect-location-id` is
+# required on the command line and is compared with `EASYWEEK_LOCATION_ID`.
 #
-# `None` means unconfirmed, and the seed then refuses to run. Everything below
-# is Durlach-specific content — its Meta template names, its address, its map
-# pin. Binding that to whatever location id happens to be configured would
-# silently give another location Durlach's messages, and nothing downstream
-# would notice: the worker matches rows by company_id and would find them.
-DURLACH_LOCATION_ID: int | None = None
+# Two INDEPENDENT sources is the whole point. Everything below is
+# Durlach-specific content — its Meta template names, its address, its map pin —
+# and binding it to whatever location id happens to be configured would silently
+# give another location Durlach's messages, with nothing downstream to notice:
+# the worker matches rows by company_id and would find them. A constant read
+# from the same `easyweek.env` would compare the value with itself and prove
+# nothing; a human who has to type the id independently is a real second source.
 
 # The templates are written in German and point at German Meta templates, so
 # the configured language has to be German. `EASYWEEK_DEFAULT_LANGUAGE=en` would
@@ -163,28 +167,38 @@ class SeedResult:
     sender_updated: bool = False
 
 
-def _resolve_company_id() -> int:
-    """The Durlach location id, or refuse.
+def _resolve_company_id(expect_location_id: int | None) -> int:
+    """The Durlach location id, confirmed from two sources, or refuse.
 
-    A positive number is not enough. This script writes Durlach's Meta template
-    names, address and map pin; pointing them at a different location is not a
-    configuration error the system can detect later, it is Durlach's messages
-    being sent on another location's behalf.
+    *expect_location_id* is what the operator typed on the command line;
+    ``EASYWEEK_LOCATION_ID`` is what the container was configured with. Both
+    must agree. A positive number on its own is not enough: this script writes
+    Durlach's Meta template names, address and map pin, and pointing them at a
+    different location is not a configuration error the system can detect later,
+    it is Durlach's messages being sent on another location's behalf.
+
+    Neither value is echoed in the error. These messages reach logs, and the
+    location id is production configuration; naming the broken invariant is
+    enough to act on.
     """
+    if expect_location_id is None:
+        raise SeedConfigError(
+            "--expect-location-id is required: the operator must confirm which location is being seeded, "
+            "independently of what EASYWEEK_LOCATION_ID happens to say."
+        )
+    if expect_location_id <= 0:
+        raise SeedConfigError("--expect-location-id must be a positive EasyWeek :location_id.")
+
     company_id = int(getattr(settings, "easyweek_location_id", 0) or 0)
     if company_id <= 0:
         raise SeedConfigError(
             "EASYWEEK_LOCATION_ID is not configured; refusing to seed rows that no job could ever match."
         )
-    if DURLACH_LOCATION_ID is None:
+    if company_id != expect_location_id:
         raise SeedConfigError(
-            "DURLACH_LOCATION_ID is not confirmed in this script. Fill it from the production "
-            "easyweek.env before seeding, so Durlach content cannot be bound to another location."
-        )
-    if company_id != DURLACH_LOCATION_ID:
-        raise SeedConfigError(
-            "EASYWEEK_LOCATION_ID does not match the confirmed Durlach location id; "
-            "this seed writes Durlach-specific content and refuses to bind it elsewhere."
+            "EASYWEEK_LOCATION_ID does not match --expect-location-id. Either this container is configured "
+            "for a different location, or the confirmed id is wrong; this seed writes Durlach-specific "
+            "content and refuses to bind it elsewhere."
         )
     return company_id
 
@@ -324,9 +338,13 @@ async def _upsert_sender(
     )
 
 
-async def seed(session: AsyncSession) -> SeedResult:
-    """Seed templates and sender into *session*. Caller owns the transaction."""
-    company_id = _resolve_company_id()
+async def seed(session: AsyncSession, *, expect_location_id: int | None) -> SeedResult:
+    """Seed templates and sender into *session*. Caller owns the transaction.
+
+    Every check runs BEFORE the first write, so a refusal leaves the database
+    exactly as it was.
+    """
+    company_id = _resolve_company_id(expect_location_id)
     language = _resolve_language()
     phone_number_id = _resolve_phone_number_id()
 
@@ -348,10 +366,25 @@ async def seed(session: AsyncSession) -> SeedResult:
     return result
 
 
-async def main() -> None:
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Seed the EasyWeek (Durlach) templates and sender.")
+    parser.add_argument(
+        "--expect-location-id",
+        type=int,
+        required=True,
+        help=(
+            "The EasyWeek :location_id you are seeding, taken from production easyweek.env. "
+            "Must match EASYWEEK_LOCATION_ID; there is no default, on purpose."
+        ),
+    )
+    return parser.parse_args(argv)
+
+
+async def main(argv: list[str] | None = None) -> None:
+    args = _parse_args(argv)
     async with SessionLocal() as session:
         async with session.begin():
-            result = await seed(session)
+            result = await seed(session, expect_location_id=args.expect_location_id)
 
     # Ids and counts only — no bodies, no phone numbers.
     print(
