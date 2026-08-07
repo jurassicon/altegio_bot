@@ -302,6 +302,9 @@ _NAV = """
           <a class="nav-link" href="/ops/whatsapp/inbox">💬 WA Events</a>
         </li>
         <li class="nav-item">
+          <a class="nav-link" href="/ops/easyweek">🗓 EasyWeek</a>
+        </li>
+        <li class="nav-item">
           <a class="nav-link" href="/ops/optouts">🚫 Opt-outs</a>
         </li>
         <li class="nav-item">
@@ -1693,6 +1696,140 @@ async def ops_wa_inbox(request: Request) -> str:
 """
 
     return _page("WA Events", body)
+
+
+# ---------------------------------------------------------------------------
+# /ops/easyweek
+# ---------------------------------------------------------------------------
+
+
+@router.get("/easyweek", response_class=HTMLResponse)
+async def ops_easyweek() -> str:
+    """Provider-scoped counters, so an operator can watch Dürlach come alive.
+
+    Deliberately small: capture, jobs and sends broken down by status, plus the
+    seeded rows the activation depends on. Everything is filtered on
+    ``provider = 'easyweek'`` — Altegio shares these tables and one integer
+    space for ``company_id``, so an unfiltered count would silently mix branches.
+    """
+    async with SessionLocal() as session:
+        events = (
+            await session.execute(
+                text("""
+                     SELECT status, COUNT(*) AS n
+                     FROM easyweek_events
+                     GROUP BY status
+                     ORDER BY status
+                     """)
+            )
+        ).fetchall()
+
+        jobs = (
+            await session.execute(
+                text("""
+                     SELECT job_type, status, COUNT(*) AS n
+                     FROM message_jobs
+                     WHERE provider = 'easyweek'
+                     GROUP BY job_type, status
+                     ORDER BY job_type, status
+                     """)
+            )
+        ).fetchall()
+
+        # `outbox_messages` has no provider column (deliberately — PR-5 does not
+        # add one), so EasyWeek rows are reached through their job.
+        sends = (
+            await session.execute(
+                text("""
+                     SELECT o.template_code, o.status, COUNT(*) AS n
+                     FROM outbox_messages o
+                              JOIN message_jobs j ON j.id = o.job_id
+                     WHERE j.provider = 'easyweek'
+                     GROUP BY o.template_code, o.status
+                     ORDER BY o.template_code, o.status
+                     """)
+            )
+        ).fetchall()
+
+        templates = (
+            await session.execute(
+                text("""
+                     SELECT company_id, code, language, meta_template_name, is_active
+                     FROM message_templates
+                     WHERE provider = 'easyweek'
+                     ORDER BY company_id, code
+                     """)
+            )
+        ).fetchall()
+
+        senders = (
+            await session.execute(
+                text("""
+                     SELECT company_id, sender_code, phone_number_id, is_active
+                     FROM whatsapp_senders
+                     WHERE provider = 'easyweek'
+                     ORDER BY company_id, sender_code
+                     """)
+            )
+        ).fetchall()
+
+    notifications_on = bool(getattr(settings, "easyweek_notifications_enabled", False))
+    processing_on = bool(getattr(settings, "easyweek_processing_enabled", False))
+    parts = [
+        "<h4 class='mt-3'>EasyWeek (Dürlach)</h4>",
+        _metric_cards(
+            [
+                ("capture", "on" if getattr(settings, "easyweek_enabled", False) else "off", "secondary"),
+                ("processing", "on" if processing_on else "off", "success" if processing_on else "secondary"),
+                (
+                    "notifications",
+                    "on" if notifications_on else "off",
+                    "success" if notifications_on else "secondary",
+                ),
+                ("location_id", getattr(settings, "easyweek_location_id", 0), "secondary"),
+            ]
+        ),
+        "<h6 class='mt-3'>easyweek_events by status</h6>",
+        _table(["status", "count"], [[_esc(str(r.status)), str(r.n)] for r in events]),
+        "<h6 class='mt-3'>message_jobs by type / status</h6>",
+        _table(
+            ["job_type", "status", "count"],
+            [[_esc(str(r.job_type)), _esc(str(r.status)), str(r.n)] for r in jobs],
+        ),
+        "<h6 class='mt-3'>outbox_messages by template / status</h6>",
+        _table(
+            ["template_code", "status", "count"],
+            [[_esc(str(r.template_code)), _esc(str(r.status)), str(r.n)] for r in sends],
+        ),
+        "<h6 class='mt-3'>seeded templates</h6>",
+        _table(
+            ["company_id", "code", "lang", "meta_template_name", "active"],
+            [
+                [
+                    str(r.company_id),
+                    _esc(str(r.code)),
+                    _esc(str(r.language)),
+                    _esc(str(r.meta_template_name or "—")),
+                    "yes" if r.is_active else "no",
+                ]
+                for r in templates
+            ],
+        ),
+        "<h6 class='mt-3'>seeded senders</h6>",
+        _table(
+            ["company_id", "sender_code", "phone_number_id", "active"],
+            [
+                [
+                    str(r.company_id),
+                    _esc(str(r.sender_code)),
+                    _esc(str(r.phone_number_id)),
+                    "yes" if r.is_active else "no",
+                ]
+                for r in senders
+            ],
+        ),
+    ]
+    return _page("EasyWeek", "\n".join(parts))
 
 
 # ---------------------------------------------------------------------------
