@@ -97,6 +97,10 @@ OTHER_EASYWEEK_COMPANY_ID = 999002
 BOOKING_HASH = "90000001"
 VERIFIED_PAGE = f"https://eyw.me/r/{BOOKING_HASH}"
 STATIC_BOOKING_PAGE = "https://example.invalid/book"
+# PR-6 added a host allowlist for the static booking page; these tests are about
+# the link RULES, so the hosts they use are simply allowed. `book.example.com`
+# is used by the validator's own positive cases further down.
+BOOKING_PAGE_ALLOWED_HOSTS = "example.invalid,book.example.com"
 
 # A name no Python constant knows: if it reaches the provider it can only have
 # come from the database row.
@@ -130,6 +134,7 @@ def _pr5_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "bot_template_text_inside_24h_enabled", False, raising=False)
     monkeypatch.setattr(settings, "meta_circuit_breaker_enabled", False, raising=False)
     monkeypatch.setattr(settings, "easyweek_booking_page_url", STATIC_BOOKING_PAGE, raising=False)
+    monkeypatch.setattr(settings, "easyweek_booking_page_allowed_hosts", BOOKING_PAGE_ALLOWED_HOSTS, raising=False)
     monkeypatch.setattr(settings, "easyweek_default_language", "de", raising=False)
     monkeypatch.setattr(settings, "easyweek_notifications_enabled", False, raising=False)
 
@@ -2047,10 +2052,22 @@ async def test_non_string_static_booking_pages_are_rejected(raw: Any) -> None:
     assert validate_static_booking_page(raw) is None
 
 
-async def test_no_host_allowlist_is_applied() -> None:
-    """PR-6 decides the approved host; guessing one here would block the real value."""
-    assert validate_static_booking_page("https://eyw.me/book") == "https://eyw.me/book"
-    assert validate_static_booking_page("https://any-other-host.example/book") is not None
+async def test_the_host_allowlist_is_configuration_not_a_hardcoded_constant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-6 closed the debt this test used to record.
+
+    The approved host is a property of the location, so it lives in settings.
+    An unlisted host is rejected however well-formed it is, and an EMPTY
+    allowlist rejects everything rather than waving everything through — that is
+    what stops an activation whose host has not been confirmed yet.
+    """
+    monkeypatch.setattr(settings, "easyweek_booking_page_allowed_hosts", "only.example", raising=False)
+    assert validate_static_booking_page("https://only.example/book") == "https://only.example/book"
+    assert validate_static_booking_page("https://any-other-host.example/book") is None
+
+    monkeypatch.setattr(settings, "easyweek_booking_page_allowed_hosts", "", raising=False)
+    assert validate_static_booking_page("https://only.example/book") is None
 
 
 @pytest.mark.parametrize(

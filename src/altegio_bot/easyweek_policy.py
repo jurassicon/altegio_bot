@@ -27,6 +27,17 @@ RECORD_CREATED = "record_created"
 RECORD_UPDATED = "record_updated"
 RECORD_CANCELED = "record_canceled"
 
+# A TEMPLATE CODE, deliberately not a job type.
+#
+# A first-time customer gets a different approved Meta template, which means a
+# different `message_templates` row — but the same `record_created` job. Keeping
+# it out of EASYWEEK_LIFECYCLE_JOB_TYPES is what makes that work: the allowlist,
+# the domain-scope gate, the param builder and the preflight all key on
+# `MessageJob.job_type`, so they keep seeing `record_created` and the seven-field
+# contract stays correct. Only the row lookup — and therefore
+# `meta_template_name` — differs.
+RECORD_CREATED_NEW_CLIENT = "record_created_new_client"
+
 # The ONLY job types EasyWeek may plan, render or send in this phase.
 #
 # Reminders, review_3d, repeat_10d, comeback_3d, newsletters, follow-up, promo
@@ -92,6 +103,22 @@ _FORBIDDEN_URL_CHARS: frozenset[str] = (
 )
 
 
+def booking_page_allowed_hosts() -> frozenset[str]:
+    """Hosts the static booking page may live on, from configuration.
+
+    Read at call time rather than import time so an operator can fix a typo and
+    recreate the service without a code change, and so tests can set it.
+
+    Empty until the approved Durlach host is confirmed. Empty means "nothing is
+    allowed", not "everything is allowed" — see
+    :func:`validate_static_booking_page`.
+    """
+    from altegio_bot.settings import settings
+
+    raw = getattr(settings, "easyweek_booking_page_allowed_hosts", "") or ""
+    return frozenset(host.strip().lower() for host in str(raw).split(",") if host.strip())
+
+
 def validate_static_booking_page(raw: object | None) -> str | None:
     """Return the normalized static booking page, or ``None`` when unusable.
 
@@ -107,9 +134,22 @@ def validate_static_booking_page(raw: object | None) -> str | None:
     every legitimate value or have to be loosened until it stopped protecting
     the manage link.
 
-    No host allowlist. The approved page for the Dürlach location is not
-    confirmed yet, and hardcoding a guess would either block the real value or
-    bless the wrong one. Host restriction belongs to PR-6 configuration.
+    The ORIGIN is checked against ``EASYWEEK_BOOKING_PAGE_ALLOWED_HOSTS``, which
+    is configuration rather than a constant here: the approved page is a
+    property of the location, not of this code, and hardcoding a guess would
+    either block the real value or bless the wrong one.
+
+    Origin, not just hostname: a URL with no port and one with an explicit
+    ``:443`` are the same https origin and are both accepted, but any other port
+    is refused. ``https://allowed.host:4443/`` is a different service behind the
+    same name, and this value ends up as a link a customer taps.
+
+    An EMPTY allowlist rejects everything. That is the point: until an operator
+    confirms the approved host, a typo in ``EASYWEEK_BOOKING_PAGE_URL`` would
+    otherwise pass every syntactic check and go out as the link a customer taps
+    after a cancellation. Failing closed stops the activation; failing open
+    would ship the typo. Altegio is unaffected — it never reaches this
+    validator.
 
     The returned string is rebuilt from the parsed components, so an
     unnormalised original never survives into a message.
@@ -121,6 +161,10 @@ def validate_static_booking_page(raw: object | None) -> str | None:
     if not candidate:
         return None
     if any(ch in _FORBIDDEN_URL_CHARS for ch in candidate):
+        return None
+
+    allowed_hosts = booking_page_allowed_hosts()
+    if not allowed_hosts:
         return None
 
     # Every component access is inside the guard: `.port` on
@@ -137,7 +181,22 @@ def validate_static_booking_page(raw: object | None) -> str | None:
             return None
         if parts.fragment:
             return None
-        _ = parts.port
+        # The allowlist is an ORIGIN check, and an origin is scheme + host +
+        # PORT. `hostname` has the port stripped off, so matching on it alone
+        # let `https://allowed.host:4443/` through — a different port is a
+        # different service, and this link is what a customer taps after a
+        # cancellation.
+        #
+        # `None` (no port given) and an explicit `:443` are the same origin for
+        # https and are both accepted; anything else is refused. Accepting the
+        # redundant `:443` costs nothing and avoids rejecting a URL that is
+        # literally equivalent to the allowed one.
+        if parts.port is not None and parts.port != 443:
+            return None
+        # `hostname` is already lowercased by urlsplit, and credentials and any
+        # non-443 port are rejected above, so an exact match is enough.
+        if parts.hostname not in allowed_hosts:
+            return None
     except ValueError:
         return None
 
