@@ -166,40 +166,93 @@ kitilash_du_record_canceled_v1
 
 ## 3. Chatwoot: обязательный шаг, не опциональный
 
-`CHATWOOT_INBOX_COMPANY_MAP` сопоставляет Chatwoot inbox_id → company_id и
-**обязателен, когда несколько company_id делят один `phone_number_id`** — это
-ровно наш случай. Поведение при непустой карте: если inbox_id в ней не найден,
-релей **fail-closed**.
+Нужны **четыре разных inbox**:
+
+* `Karlsruhe` — branch inbox;
+* `Durlach` — branch inbox;
+* `Rastatt` — branch inbox;
+* `General / Unassigned` — глобальный `CHATWOOT_INBOX_ID`, только для нового
+  входящего WhatsApp без authoritative company identity.
+
+`CHATWOOT_INBOX_COMPANY_MAP` — единственный источник обоих направлений:
+
+* outbound mirror: `company_id → inbox_id`;
+* operator relay: `inbox_id → company_id → provider/company-scoped sender`.
+
+Каноническое направление JSON остаётся `inbox_id → company_id`:
 
 ```text
-CHATWOOT_INBOX_COMPANY_MAP={"8": 758285, "7": 1271200, "<inbox_id EasyWeek>": <location_id из EASYWEEK_LOCATION_MAP>}
+CHATWOOT_INBOX_COMPANY_MAP={"<KA inbox>":<KA Altegio company_id>,"<DU inbox>":<DU EasyWeek location_id>,"<RA inbox>":<RA EasyWeek location_id>}
 ```
 
-Числа `8` и `7` — примеры из документации настройки; подставьте фактические
-значения прода.
+После cutover для Rastatt указывайте текущий EasyWeek `location_id`, который
+стал `company_id` EasyWeek-строк. Старый Altegio company ID Rastatt в этой карте
+после cutover недопустим.
 
-### Карту читает `altegio-whatsapp-inbox-worker`
+Configured map обязана быть однозначной. Parser отвергает duplicate JSON inbox
+keys, неканонические/неположительные ID и один `company_id`, назначенный двум
+inbox. При configured+invalid карте оба направления fail-closed. При валидной
+карте неизвестный inbox блокирует operator relay, а неизвестный company
+пропускает только secondary Chatwoot mirror; успешная WhatsApp-отправка клиенту
+не отменяется. Global inbox не используется как скрытый outbound fallback.
 
-Это отдельный сервис, и именно в нём живёт operator relay. После правки карты
-пересоздайте **его**:
+Пустая карта (`""`/`{}`) — только legacy single-inbox mode: outbound mirror
+остаётся в глобальном `CHATWOOT_INBOX_ID`, как до PR-7.
+
+### Проверка карты до deploy
 
 ```bash
-docker compose -p altegio_bot up -d --force-recreate altegio-whatsapp-inbox-worker
+docker compose -p altegio_bot run --rm altegio-outbox-worker \
+  /app/.venv/bin/python - <<'PY'
+from altegio_bot.easyweek_locations import configured_easyweek_locations
+from altegio_bot.settings import settings
+from altegio_bot.webhooks.common import parse_chatwoot_inbox_company_map
+
+branches = configured_easyweek_locations()
+inboxes = parse_chatwoot_inbox_company_map(settings.chatwoot_inbox_company_map)
+easyweek_ids = {location.company_id for location in branches.locations.values()}
+mapped_ids = set(inboxes.inverse_mapping)
+print(
+    {
+        "map_configured": inboxes.configured,
+        "map_valid": inboxes.valid,
+        "map_entries": len(inboxes.mapping),
+        "unique_inboxes": len(inboxes.mapping) == len(set(inboxes.mapping)),
+        "unique_companies": len(inboxes.inverse_mapping) == len(inboxes.mapping),
+        "easyweek_ids_all_mapped": easyweek_ids <= mapped_ids,
+        "global_general_inbox_configured": settings.chatwoot_inbox_id > 0,
+    }
+)
+PY
 ```
 
-**Если пропустить этот шаг**, карта не вступит в силу: воркер продолжит работать
-со старым значением, релей для бесед Durlach останется fail-closed, а всё
-остальное будет выглядеть здоровым — события захватываются, job'ы создаются,
-уведомления уходят. Симптом проявится только тогда, когда оператор попробует
-ответить клиенту Durlach из Chatwoot.
+Gate: configured=true, valid=true, `map_entries=3`, оба unique=true, EasyWeek
+IDs полностью покрыты, global General/Unassigned настроен отдельно. Вручную
+сверьте: DU/RA IDs равны одноимённым записям `EASYWEEK_LOCATION_MAP`, а третья
+company — действующая Karlsruhe Altegio company. Любое расхождение — STOP.
 
-### Smoke релея — ДО включения notifications
+### Карту читают два worker
 
-1. Напишите с тестового номера в inbox Durlach.
-2. Ответьте оператором из Chatwoot.
-3. Убедитесь, что ответ дошёл в WhatsApp.
+После правки карты пересоздайте оба потребителя; обычный `restart` и `up -d`
+без `--force-recreate` не перечитывают env:
 
-Если ответ не доходит — не включайте notifications, сначала разберитесь с картой.
+```bash
+docker compose -p altegio_bot up -d --force-recreate \
+  altegio-outbox-worker altegio-whatsapp-inbox-worker
+```
+
+`altegio-outbox-worker` читает company→inbox для outbound mirror;
+`altegio-whatsapp-inbox-worker` читает inbox→company для operator relay.
+`altegio-api` ради этой карты пересоздавать не нужно.
+
+### General / Unassigned — единственный разрешённый global fallback
+
+Совершенно новое входящее WhatsApp без authoritative company identity нельзя
+безопасно отнести к филиалу: общий `phone_number_id`, телефон клиента и последний
+booking не являются tenant proof. Такое входящее остаётся в глобальном
+`CHATWOOT_INBOX_ID` (`General / Unassigned`), а оператор определяет филиал
+вручную. По телефону филиал не угадывается. Для outbound lifecycle mirror и
+operator relay этот fallback запрещён при configured map.
 
 ### `whatsapp_allowed_phone_number_ids` — правка НЕ нужна
 
@@ -549,6 +602,28 @@ Smoke гоняется **одновременно по обоим филиала
 * в сообщении Durlach нет адреса/карты Rastatt и наоборот;
 * ссылка ведёт на страницу своего филиала;
 * `record_canceled` → статическая страница СВОЕГО филиала, не другого.
+
+### Chatwoot smoke-матрица
+
+**Outbound mirror:** отправьте безопасные тестовые lifecycle notifications для
+Durlach, Rastatt и контрольную для Karlsruhe. Проверьте, что private note и
+conversation появились только в DU, RA и KA inbox соответственно. Для каждого
+проверьте `conversation.inbox_id`, branch footer и отсутствие копии в двух
+остальных branch inbox. Один и тот же test phone для DU и RA обязан создать или
+использовать две разные conversations — по одной на inbox.
+
+**Operator relay:** из каждого branch inbox ответьте на тестовый номер.
+Durlach должен выбрать Durlach EasyWeek company/sender, Rastatt — текущий
+Rastatt EasyWeek company/sender, Karlsruhe — Karlsruhe Altegio company/sender.
+Общий `phone_number_id` не разрешает выбирать sender без inbox mapping;
+cross-provider/company selection блокирует rollout.
+
+**General inbound:** отправьте совершенно новое клиентское сообщение без reply
+context. Оно обязано появиться только в `General / Unassigned`, не в DU/RA/KA.
+Филиал не должен угадываться по телефону.
+
+Любое cross-inbox попадание, повторное использование conversation другого
+inbox или cross-company sender selection — **STOP** до продолжения rollout.
 
 ```sql
 SELECT j.company_id,

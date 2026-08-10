@@ -216,12 +216,14 @@ class InboxCompanyMap:
     * ``configured=True, valid=False`` — синтаксически/семантически невалидная
       конфигурация: relay блокируется стабильным ``invalid_inbox_company_map``.
     * ``configured=True, valid=True`` — ``mapping`` содержит только валидные
-      пары ``int inbox_id -> int company_id``.
+      пары ``int inbox_id -> int company_id``, а ``inverse_mapping`` — их
+      однозначную инверсию ``company_id -> inbox_id`` для outbound mirror.
     """
 
     configured: bool
     valid: bool
     mapping: dict[int, int] = field(default_factory=dict)
+    inverse_mapping: dict[int, int] = field(default_factory=dict)
 
 
 def _canonical_inbox_key(key: object) -> int | None:
@@ -266,7 +268,9 @@ def parse_chatwoot_inbox_company_map(raw: object) -> InboxCompanyMap:
         (``fullmatch``, без ``.strip()``, длина отсекается до ``int()``);
       * значение — только ``type(v) is int`` и ``0 < v <= PG_INT_MAX`` (никакого
         ``int(value)`` для произвольного JSON);
-      * коллизия нормализованного ключа (defense-in-depth) → невалидна.
+      * коллизия нормализованного ключа (defense-in-depth) → невалидна;
+      * один ``company_id`` в нескольких inbox → невалидна: обратный outbound
+        routing не имеет права выбирать inbox по порядку JSON.
     """
     if not isinstance(raw, str):
         return InboxCompanyMap(configured=True, valid=False)
@@ -291,6 +295,7 @@ def parse_chatwoot_inbox_company_map(raw: object) -> InboxCompanyMap:
         return InboxCompanyMap(configured=False, valid=True)
 
     mapping: dict[int, int] = {}
+    inverse_mapping: dict[int, int] = {}
     for key, company in parsed.items():
         inbox_id = _canonical_inbox_key(key)
         if inbox_id is None:
@@ -299,9 +304,17 @@ def parse_chatwoot_inbox_company_map(raw: object) -> InboxCompanyMap:
             return InboxCompanyMap(configured=True, valid=False)
         if inbox_id in mapping:  # defense-in-depth против коллизий ключей
             return InboxCompanyMap(configured=True, valid=False)
+        if company in inverse_mapping:
+            return InboxCompanyMap(configured=True, valid=False)
         mapping[inbox_id] = company
+        inverse_mapping[company] = inbox_id
 
-    return InboxCompanyMap(configured=True, valid=True, mapping=mapping)
+    return InboxCompanyMap(
+        configured=True,
+        valid=True,
+        mapping=mapping,
+        inverse_mapping=inverse_mapping,
+    )
 
 
 def nonempty_str(value: object) -> str | None:

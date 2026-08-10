@@ -36,6 +36,8 @@ class _FakeMetaProvider:
         contact_name: str | None = None,
         header_image_url: str | None = None,
     ) -> str:
+        if self._raise:
+            raise RuntimeError("Meta API failure")
         self.templates.append((sender_id, phone_e164, template_name, language, params, fallback_text, header_image_url))
         return f"meta-tpl-{uuid4()}"
 
@@ -45,15 +47,41 @@ class _FakeChatwootClient:
 
     def __init__(self, raise_on_log: bool = False) -> None:
         self.notes: list[tuple[str, str]] = []
+        self.contact_names: list[str | None] = []
+        self.close_calls = 0
         self._raise = raise_on_log
 
     async def mirror_outbound_as_note(self, phone_e164: str, text: str, *, contact_name: str | None = None) -> None:
         if self._raise:
             raise RuntimeError("Chatwoot API failure")
         self.notes.append((phone_e164, text))
+        self.contact_names.append(contact_name)
 
     async def aclose(self) -> None:
-        pass
+        self.close_calls += 1
+
+
+class _InboxChatwootClient(_FakeChatwootClient):
+    def __init__(self, inbox_id: int, *, delay: float = 0.0) -> None:
+        super().__init__()
+        self.inbox_id = inbox_id
+        self.delay = delay
+
+    async def mirror_outbound_as_note(self, phone_e164: str, text: str, *, contact_name: str | None = None) -> None:
+        if self.delay:
+            await asyncio.sleep(self.delay)
+        await super().mirror_outbound_as_note(phone_e164, text, contact_name=contact_name)
+
+
+class _InboxClientFactory:
+    def __init__(self, *, delay: float = 0.0) -> None:
+        self.delay = delay
+        self.clients: dict[int, _InboxChatwootClient] = {}
+
+    def __call__(self, inbox_id: int) -> _InboxChatwootClient:
+        client = _InboxChatwootClient(inbox_id, delay=self.delay)
+        self.clients[inbox_id] = client
+        return client
 
 
 @pytest.mark.asyncio
@@ -142,9 +170,22 @@ async def test_send_propagates_contact_name(monkeypatch: pytest.MonkeyPatch) -> 
     captured_names: list[str | None] = []
     original_log = provider._log_to_chatwoot
 
-    async def _spy_log(phone: str, text: str, *, contact_name: str | None = None, meta: object = None) -> None:
+    async def _spy_log(
+        phone: str,
+        text: str,
+        *,
+        company_id: int = 0,
+        contact_name: str | None = None,
+        meta: object = None,
+    ) -> None:
         captured_names.append(contact_name)
-        await original_log(phone, text, contact_name=contact_name, meta=meta)  # type: ignore[arg-type]
+        await original_log(
+            phone,
+            text,
+            company_id=company_id,
+            contact_name=contact_name,
+            meta=meta,  # type: ignore[arg-type]
+        )
 
     monkeypatch.setattr(provider, "_log_to_chatwoot", _spy_log)
 
@@ -203,3 +244,233 @@ async def test_send_template_none_header_image_url_not_forwarded_as_string() -> 
         f"primary.send_template must get header_image_url=None for non-header templates, got {recorded_header!r}"
     )
     await asyncio.sleep(0.05)
+
+
+_BRANCH_ROUTES = [
+    (900001, 101, "durlach"),
+    (900002, 102, "rastatt"),
+    (900003, 103, "karlsruhe"),
+]
+_THREE_BRANCH_MAP = '{"101": 900001, "102": 900002, "103": 900003}'
+
+
+@pytest.mark.parametrize("method", ["send", "send_template"])
+@pytest.mark.parametrize(("company_id", "inbox_id", "_branch"), _BRANCH_ROUTES)
+async def test_configured_map_routes_each_company_to_its_own_inbox(
+    monkeypatch: pytest.MonkeyPatch,
+    method: str,
+    company_id: int,
+    inbox_id: int,
+    _branch: str,
+) -> None:
+    monkeypatch.setattr("altegio_bot.providers.chatwoot_hybrid.settings.chatwoot_inbox_company_map", _THREE_BRANCH_MAP)
+    meta = _FakeMetaProvider()
+    legacy = _FakeChatwootClient()
+    factory = _InboxClientFactory()
+    provider = ChatwootHybridProvider(
+        primary=meta,
+        chatwoot=legacy,  # type: ignore[arg-type]
+        chatwoot_factory=factory,  # type: ignore[arg-type]
+    )
+
+    if method == "send":
+        await provider.send(
+            1,
+            "+49123000000",
+            f"{_branch} text",
+            company_id=company_id,
+            contact_name=f"{_branch} contact",
+        )
+    else:
+        await provider.send_template(
+            1,
+            "+49123000000",
+            f"{_branch}_template",
+            "de",
+            ["param"],
+            f"{_branch} fallback",
+            company_id=company_id,
+            contact_name=f"{_branch} contact",
+        )
+    await provider.aclose()
+
+    assert legacy.notes == []
+    assert set(factory.clients) == {inbox_id}
+    assert len(factory.clients[inbox_id].notes) == 1
+    assert factory.clients[inbox_id].contact_names == [f"{_branch} contact"]
+
+
+async def test_concurrent_same_phone_sends_never_cross_du_ra_inboxes(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("altegio_bot.providers.chatwoot_hybrid.settings.chatwoot_inbox_company_map", _THREE_BRANCH_MAP)
+    factory = _InboxClientFactory(delay=0.02)
+    legacy = _FakeChatwootClient()
+    provider = ChatwootHybridProvider(
+        primary=_FakeMetaProvider(),
+        chatwoot=legacy,  # type: ignore[arg-type]
+        chatwoot_factory=factory,  # type: ignore[arg-type]
+    )
+    phone = "+49123456789"
+
+    await asyncio.gather(
+        provider.send(1, phone, "DU", company_id=900001),
+        provider.send(1, phone, "RA", company_id=900002),
+    )
+    await provider.aclose()
+
+    assert factory.clients[101].notes == [(phone, "DU")]
+    assert factory.clients[102].notes == [(phone, "RA")]
+    assert legacy.notes == []
+
+
+@pytest.mark.parametrize(
+    ("raw_map", "company_id", "reason"),
+    [
+        (_THREE_BRANCH_MAP, 999999, "company_mapping_missing"),
+        ('{"101": 900001, "102": 900001}', 900001, "invalid_inbox_company_map"),
+    ],
+)
+async def test_configured_unknown_or_invalid_map_never_uses_global_inbox(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    raw_map: str,
+    company_id: int,
+    reason: str,
+) -> None:
+    monkeypatch.setattr("altegio_bot.providers.chatwoot_hybrid.settings.chatwoot_inbox_company_map", raw_map)
+    legacy = _FakeChatwootClient()
+    factory = _InboxClientFactory()
+    provider = ChatwootHybridProvider(
+        primary=_FakeMetaProvider(),
+        chatwoot=legacy,  # type: ignore[arg-type]
+        chatwoot_factory=factory,  # type: ignore[arg-type]
+    )
+    phone = "+49999999999"
+    text = "private-message-marker"
+
+    with caplog.at_level("WARNING", logger="altegio_bot.providers.chatwoot_hybrid"):
+        msg_id = await provider.send(
+            1,
+            phone,
+            text,
+            company_id=company_id,
+            staff_id=900001,
+            contact_name="Private Name",
+        )
+        await provider.aclose()
+
+    assert msg_id.startswith("meta-")
+    assert legacy.notes == []
+    assert factory.clients == {}
+    assert reason in caplog.text
+    assert phone not in caplog.text
+    assert text not in caplog.text
+    assert "Private Name" not in caplog.text
+    assert raw_map not in caplog.text
+
+
+async def test_empty_map_preserves_legacy_global_inbox(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("altegio_bot.providers.chatwoot_hybrid.settings.chatwoot_inbox_company_map", "{}")
+    legacy = _FakeChatwootClient()
+    factory = _InboxClientFactory()
+    provider = ChatwootHybridProvider(
+        primary=_FakeMetaProvider(),
+        chatwoot=legacy,  # type: ignore[arg-type]
+        chatwoot_factory=factory,  # type: ignore[arg-type]
+    )
+
+    await provider.send(1, "+49123000000", "legacy", company_id=0)
+    await provider.aclose()
+
+    assert legacy.notes == [("+49123000000", "legacy")]
+    assert factory.clients == {}
+
+
+async def test_routed_mirror_keeps_contact_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("altegio_bot.providers.chatwoot_hybrid.settings.chatwoot_inbox_company_map", _THREE_BRANCH_MAP)
+    factory = _InboxClientFactory()
+    provider = ChatwootHybridProvider(
+        primary=_FakeMetaProvider(),
+        chatwoot=_FakeChatwootClient(),  # type: ignore[arg-type]
+        chatwoot_factory=factory,  # type: ignore[arg-type]
+    )
+
+    await provider.send(1, "+49123000000", "hello", company_id=900001, contact_name="Anna Müller")
+    await provider.aclose()
+
+    assert factory.clients[101].contact_names == ["Anna Müller"]
+
+
+async def test_primary_failure_creates_no_routed_mirror_task(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("altegio_bot.providers.chatwoot_hybrid.settings.chatwoot_inbox_company_map", _THREE_BRANCH_MAP)
+    factory = _InboxClientFactory()
+    provider = ChatwootHybridProvider(
+        primary=_FakeMetaProvider(raise_on_send=True),
+        chatwoot=_FakeChatwootClient(),  # type: ignore[arg-type]
+        chatwoot_factory=factory,  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(RuntimeError, match="Meta API failure"):
+        await provider.send(1, "+49123000000", "never mirrored", company_id=900001)
+
+    assert provider._background_tasks == set()
+    assert factory.clients == {}
+    await provider.aclose()
+
+
+async def test_primary_template_failure_creates_no_routed_mirror_task(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("altegio_bot.providers.chatwoot_hybrid.settings.chatwoot_inbox_company_map", _THREE_BRANCH_MAP)
+    factory = _InboxClientFactory()
+    provider = ChatwootHybridProvider(
+        primary=_FakeMetaProvider(raise_on_send=True),
+        chatwoot=_FakeChatwootClient(),  # type: ignore[arg-type]
+        chatwoot_factory=factory,  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(RuntimeError, match="Meta API failure"):
+        await provider.send_template(
+            1,
+            "+49123000000",
+            "template",
+            "de",
+            ["param"],
+            company_id=900001,
+        )
+
+    assert provider._background_tasks == set()
+    assert factory.clients == {}
+    await provider.aclose()
+
+
+async def test_aclose_closes_legacy_and_every_created_inbox_client_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("altegio_bot.providers.chatwoot_hybrid.settings.chatwoot_inbox_company_map", _THREE_BRANCH_MAP)
+    legacy = _FakeChatwootClient()
+    factory = _InboxClientFactory()
+    provider = ChatwootHybridProvider(
+        primary=_FakeMetaProvider(),
+        chatwoot=legacy,  # type: ignore[arg-type]
+        chatwoot_factory=factory,  # type: ignore[arg-type]
+    )
+
+    for company_id, _inbox_id, branch in _BRANCH_ROUTES:
+        await provider.send(1, "+49123000000", branch, company_id=company_id)
+    await provider.aclose()
+
+    assert legacy.close_calls == 1
+    assert set(factory.clients) == {101, 102, 103}
+    assert all(client.close_calls == 1 for client in factory.clients.values())
+
+
+async def test_aclose_does_not_close_same_client_twice(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("altegio_bot.providers.chatwoot_hybrid.settings.chatwoot_inbox_company_map", _THREE_BRANCH_MAP)
+    shared = _InboxChatwootClient(101)
+    provider = ChatwootHybridProvider(
+        primary=_FakeMetaProvider(),
+        chatwoot=shared,  # type: ignore[arg-type]
+        chatwoot_factory=lambda _inbox_id: shared,  # type: ignore[arg-type]
+    )
+
+    await provider.send(1, "+49123000000", "DU", company_id=900001)
+    await provider.send(1, "+49123000000", "RA", company_id=900002)
+    await provider.aclose()
+
+    assert shared.close_calls == 1

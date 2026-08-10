@@ -441,6 +441,35 @@ def test_inbox_map_valid() -> None:
     assert m.configured is True
     assert m.valid is True
     assert m.mapping == {8: 758285, 42: 1271200}
+    assert m.inverse_mapping == {758285: 8, 1271200: 42}
+
+
+def test_inbox_map_three_branches_has_one_bidirectional_source() -> None:
+    from altegio_bot.webhooks.common import parse_chatwoot_inbox_company_map
+
+    m = parse_chatwoot_inbox_company_map('{"101": 900001, "102": 900002, "103": 900003}')
+    assert m.configured is True
+    assert m.valid is True
+    assert m.mapping == {101: 900001, 102: 900002, 103: 900003}
+    assert m.inverse_mapping == {900001: 101, 900002: 102, 900003: 103}
+
+
+def test_inbox_map_duplicate_company_is_invalid_for_both_directions() -> None:
+    from altegio_bot.webhooks.common import parse_chatwoot_inbox_company_map
+
+    m = parse_chatwoot_inbox_company_map('{"101": 900001, "102": 900001}')
+    assert m.configured is True
+    assert m.valid is False
+    assert m.mapping == {}
+    assert m.inverse_mapping == {}
+
+
+def test_inbox_map_parser_never_logs_raw_config(caplog: pytest.LogCaptureFixture) -> None:
+    from altegio_bot.webhooks.common import parse_chatwoot_inbox_company_map
+
+    secret_marker = "raw-map-secret-marker"
+    parse_chatwoot_inbox_company_map('{"101": "' + secret_marker + '"}')
+    assert secret_marker not in caplog.text
 
 
 def test_inbox_map_non_string_input_is_invalid() -> None:
@@ -530,6 +559,7 @@ def test_inbox_map_empty_object_any_formatting_is_unconfigured(raw: str) -> None
     assert m.configured is False
     assert m.valid is True
     assert m.mapping == {}
+    assert m.inverse_mapping == {}
 
 
 def test_inbox_map_key_range_and_totality() -> None:

@@ -131,6 +131,44 @@ async def test_get_or_create_conversation_creates_when_none(
 
 @respx.mock
 @pytest.mark.asyncio
+async def test_same_contact_uses_separate_conversations_for_different_inboxes() -> None:
+    """A shared account-level contact must never reuse another branch's thread."""
+    du = ChatwootClient(
+        base_url="https://chatwoot.example.com",
+        api_token="test-token",
+        account_id=1,
+        inbox_id=101,
+    )
+    ra = ChatwootClient(
+        base_url="https://chatwoot.example.com",
+        api_token="test-token",
+        account_id=1,
+        inbox_id=102,
+    )
+    respx.get("https://chatwoot.example.com/api/v1/accounts/1/contacts/42/conversations").mock(
+        return_value=httpx.Response(
+            200,
+            json={"payload": [{"id": 7001, "inbox_id": 101, "status": "open"}]},
+        )
+    )
+    create_route = respx.post("https://chatwoot.example.com/api/v1/accounts/1/conversations").mock(
+        return_value=httpx.Response(200, json={"id": 7002, "status": "open"})
+    )
+
+    try:
+        assert await du.get_or_create_conversation(42) == 7001
+        assert await ra.get_or_create_conversation(42) == 7002
+    finally:
+        await du.aclose()
+        await ra.aclose()
+
+    assert len(create_route.calls) == 1
+    body = json.loads(create_route.calls[0].request.content)
+    assert body == {"inbox_id": 102, "contact_id": 42, "status": "open"}
+
+
+@respx.mock
+@pytest.mark.asyncio
 async def test_send_message(client: ChatwootClient) -> None:
     """Should post a message and return the message id."""
     respx.post("https://chatwoot.example.com/api/v1/accounts/1/conversations/15/messages").mock(

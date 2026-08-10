@@ -34,11 +34,18 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
 
 import altegio_bot.workers.whatsapp_inbox_worker as wiw
-from altegio_bot.models.models import OutboxMessage, WhatsAppEvent, WhatsAppSender
+from altegio_bot.models.models import (
+    PROVIDER_ALTEGIO,
+    PROVIDER_EASYWEEK,
+    OutboxMessage,
+    WhatsAppEvent,
+    WhatsAppSender,
+)
 from altegio_bot.providers.base import WhatsAppProvider
 from altegio_bot.services import meta_circuit as mc
 from altegio_bot.workers.whatsapp_inbox_worker import (
     _apply_status_updates,
+    _company_hint_from_inbox,
     _is_operator_relay,
     _resolve_relay_sender,
     handle_event,
@@ -1642,6 +1649,166 @@ async def test_operator_relay_no_chatwoot_mirror(session_maker, monkeypatch) -> 
 # ---------------------------------------------------------------------------
 # Tests: inbox_company_map routing
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("inbox_id", "expected_company"),
+    [(101, 900001), (102, 900002), (103, 900003)],
+    ids=["durlach", "rastatt", "karlsruhe"],
+)
+def test_three_branch_map_drives_operator_relay_in_original_direction(
+    monkeypatch: pytest.MonkeyPatch,
+    inbox_id: int,
+    expected_company: int,
+) -> None:
+    monkeypatch.setattr(
+        wiw.settings,
+        "chatwoot_inbox_company_map",
+        '{"101": 900001, "102": 900002, "103": 900003}',
+    )
+
+    assert _company_hint_from_inbox(inbox_id) == (expected_company, None)
+
+
+def test_duplicate_company_map_blocks_operator_relay_too(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        wiw.settings,
+        "chatwoot_inbox_company_map",
+        '{"101": 900001, "102": 900001}',
+    )
+
+    company_id, error = _company_hint_from_inbox(101)
+    assert company_id is None
+    assert error == "operator_relay: invalid_inbox_company_map"
+
+
+@pytest.mark.asyncio
+async def test_company_hint_never_picks_between_providers_with_colliding_company_id(
+    session_maker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(wiw.settings, "easyweek_location_map", "{}")
+    async with session_maker() as session:
+        async with session.begin():
+            session.add_all(
+                [
+                    WhatsAppSender(
+                        id=138,
+                        provider=PROVIDER_ALTEGIO,
+                        company_id=900001,
+                        sender_code="default",
+                        phone_number_id="PNID_PROVIDER_COLLISION",
+                        display_phone="+49",
+                        is_active=True,
+                    ),
+                    WhatsAppSender(
+                        id=139,
+                        provider=PROVIDER_EASYWEEK,
+                        company_id=900001,
+                        sender_code="default",
+                        phone_number_id="PNID_PROVIDER_COLLISION",
+                        display_phone="+49",
+                        is_active=True,
+                    ),
+                ]
+            )
+
+        sender_id, company_id, error = await _resolve_relay_sender(
+            session,
+            "PNID_PROVIDER_COLLISION",
+            company_id_hint=900001,
+        )
+
+    assert sender_id is None
+    assert company_id is None
+    assert error == "operator_relay: ambiguous_sender_provider"
+
+
+@pytest.mark.asyncio
+async def test_ready_easyweek_registry_keeps_shared_phone_sender_provider_scoped(
+    session_maker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        wiw.settings,
+        "easyweek_location_map",
+        json.dumps(
+            {
+                "durlach": {
+                    "location_id": 900001,
+                    "location_uuid": "11111111-2222-4333-8444-555555555551",
+                    "meta_template_prefix": "du",
+                    "booking_page_url": "https://example.invalid/du",
+                },
+                "rastatt": {
+                    "location_id": 900002,
+                    "location_uuid": "11111111-2222-4333-8444-555555555552",
+                    "meta_template_prefix": "ra",
+                    "booking_page_url": "https://example.invalid/ra",
+                },
+            }
+        ),
+    )
+    shared_phone_number_id = "PNID_THREE_BRANCHES"
+    async with session_maker() as session:
+        async with session.begin():
+            session.add_all(
+                [
+                    WhatsAppSender(
+                        id=131,
+                        provider=PROVIDER_EASYWEEK,
+                        company_id=900001,
+                        sender_code="default",
+                        phone_number_id=shared_phone_number_id,
+                        display_phone="+49",
+                        is_active=True,
+                    ),
+                    WhatsAppSender(
+                        id=132,
+                        provider=PROVIDER_EASYWEEK,
+                        company_id=900002,
+                        sender_code="default",
+                        phone_number_id=shared_phone_number_id,
+                        display_phone="+49",
+                        is_active=True,
+                    ),
+                    WhatsAppSender(
+                        id=133,
+                        provider=PROVIDER_ALTEGIO,
+                        company_id=900003,
+                        sender_code="default",
+                        phone_number_id=shared_phone_number_id,
+                        display_phone="+49",
+                        is_active=True,
+                    ),
+                    # A colliding wrong-provider row must not win for Durlach.
+                    WhatsAppSender(
+                        id=134,
+                        provider=PROVIDER_ALTEGIO,
+                        company_id=900001,
+                        sender_code="default",
+                        phone_number_id=shared_phone_number_id,
+                        display_phone="+49",
+                        is_active=True,
+                    ),
+                ]
+            )
+
+        assert await _resolve_relay_sender(session, shared_phone_number_id, company_id_hint=900001) == (
+            131,
+            900001,
+            None,
+        )
+        assert await _resolve_relay_sender(session, shared_phone_number_id, company_id_hint=900002) == (
+            132,
+            900002,
+            None,
+        )
+        assert await _resolve_relay_sender(session, shared_phone_number_id, company_id_hint=900003) == (
+            133,
+            900003,
+            None,
+        )
 
 
 @pytest.mark.asyncio

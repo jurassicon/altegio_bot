@@ -27,7 +27,10 @@ from altegio_bot.delivery_retry_identity import (
     resolve_retry_reference,
     resolve_status_retry_chain,
 )
+from altegio_bot.easyweek_locations import configured_easyweek_locations
 from altegio_bot.models.models import (
+    PROVIDER_ALTEGIO,
+    PROVIDER_EASYWEEK,
     CampaignRecipient,
     Client,
     MessageJob,
@@ -412,9 +415,9 @@ async def _resolve_relay_sender(
     Returns (sender_id, company_id, error).
     error is None on success; non-None means the relay must be blocked.
 
-    If company_id_hint is provided (from inbox mapping), senders are
-    filtered to that company first — routing is unambiguous within one
-    company, safety-guard remains intact.
+    If company_id_hint is provided (from inbox mapping), senders are filtered
+    to that company and, when the EasyWeek registry is ready, to its
+    authoritative provider. Routing is never chosen across provider identity.
 
     Resolution rules (in order):
     - 0 active senders → error.
@@ -452,15 +455,32 @@ async def _resolve_relay_sender(
     # ── Hint path: inbox mapping resolved a specific company ───────────
     if company_id_hint is not None:
         hinted = [s for s in senders if s.company_id == company_id_hint]
+        # A ready PR-7 EasyWeek registry is authoritative for provider scope:
+        # member company IDs are EasyWeek; the mapped control branches are
+        # Altegio. If the registry is unavailable, retain the legacy path but
+        # still refuse any cross-provider ambiguity below.
+        registry = configured_easyweek_locations()
+        provider_hint: str | None = None
+        if registry.ready:
+            provider_hint = PROVIDER_EASYWEEK if company_id_hint in registry.locations else PROVIDER_ALTEGIO
+            hinted = [s for s in hinted if s.provider == provider_hint]
         if not hinted:
             logger.warning(
-                "operator_relay: no active sender in hinted company phone_number_id=%s company_id=%s",
+                "operator_relay: no active sender in hinted identity phone_number_id=%s company_id=%s provider=%s",
                 safe_log_value(safe_pnid, limit=32),
                 company_id_hint,
+                provider_hint,
             )
             return None, None, "operator_relay: sender_not_found_for_company"
+        hinted_providers = {s.provider for s in hinted}
+        if len(hinted_providers) != 1:
+            logger.warning(
+                "operator_relay: hinted company spans multiple providers company_id=%s — blocking",
+                company_id_hint,
+            )
+            return None, None, "operator_relay: ambiguous_sender_provider"
         default_s = [s for s in hinted if s.sender_code == "default"]
-        chosen = (default_s or sorted(hinted, key=lambda s: s.id))[0]
+        chosen = sorted(default_s or hinted, key=lambda s: s.id)[0]
         logger.info(
             "operator_relay: resolved via inbox_company_map sender_id=%s company_id=%s hint=%s",
             chosen.id,
@@ -471,6 +491,7 @@ async def _resolve_relay_sender(
 
     # ── Default path: no hint, existing safety-guard ───────────────────
     distinct_companies = {s.company_id for s in senders}
+    distinct_providers = {s.provider for s in senders}
 
     if len(distinct_companies) > 1:
         # company_ids come from the DB (not sender-controlled) → safe to log.
@@ -483,8 +504,12 @@ async def _resolve_relay_sender(
         )
         return None, None, "operator_relay: ambiguous_sender"
 
+    if len(distinct_providers) > 1:
+        logger.warning("operator_relay: sender identity spans multiple providers — blocking")
+        return None, None, "operator_relay: ambiguous_sender_provider"
+
     default_senders = [s for s in senders if s.sender_code == "default"]
-    chosen = (default_senders or sorted(senders, key=lambda s: s.id))[0]
+    chosen = sorted(default_senders or senders, key=lambda s: s.id)[0]
     return int(chosen.id), int(chosen.company_id), None
 
 
