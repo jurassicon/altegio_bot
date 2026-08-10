@@ -1,16 +1,43 @@
 # PR-6/PR-7 — активация локаций EasyWeek
 
-Порядок включения уведомлений для локации Durlach. Все шаги обратимы; откат —
-в §8.
+Порядок включения уведомлений для **всех** филиалов реестра. Сейчас их два —
+Durlach и Rastatt — и оба активируются одним проходом: `EASYWEEK_NOTIFICATIONS_ENABLED`
+глобален, отдельного флага на филиал нет и не планируется (§7.0). Все шаги
+обратимы; откат — в §8.
 
 **Фаза 1 — только три немаркетинговых lifecycle-события:** `record_created`,
 `record_updated`, `record_canceled`. Reminders (`reminder_24h` / `reminder_2h`)
 в фазу 1 не входят: их job'ы не планируются, шаблоны для них не сидятся.
 
 Первичная запись нового клиента получает отдельный шаблон
-(`kitilash_du_record_created_new_client_v1`). Это **не отдельный тип джоба** —
-job остаётся `record_created`, отличается только строка шаблона в БД и, значит,
-`meta_template_name`.
+(`kitilash_<xx>_record_created_new_client_v1`, где `<xx>` — Meta-префикс
+филиала). Это **не отдельный тип джоба** — job остаётся `record_created`,
+отличается только строка шаблона в БД и, значит, `meta_template_name`.
+
+## Профили филиалов
+
+Идентичность филиала неделима и живёт в исходниках
+(`src/altegio_bot/easyweek_branches.py`). Профиль связывает четыре вещи, и
+проверяются они вместе, а не по отдельности:
+
+| Профиль (slug) | API-имя в `GET /locations` | Meta-префикс | Контент футера |
+| --- | --- | --- | --- |
+| `durlach` | `KitiLash Durlach` | `du` | адрес и карта Durlach |
+| `rastatt` | `KitiLash Rastatt` | `ra` | адрес и карта Rastatt |
+
+Numeric `location_id` и `location_uuid` в исходниках **нет** — §10 канонического
+плана показал, что они не стабильны, поэтому они живут только в
+`EASYWEEK_LOCATION_MAP`. Slug — верхнеуровневый ключ реестра — выбирает профиль;
+всё остальное, что вводит оператор, проверяется *против* профиля.
+
+Именно это делает путаницу §10 невозможной: раньше контент выбирался по
+`meta_template_prefix`, который оператор вписывает руками, а API-имя лишь
+печаталось на экран. Теперь префикс обязан совпасть с профилем slug'а, а
+API-имя по UUID — с ожидаемым именем профиля, иначе сид падает до первой записи.
+
+Филиал без профиля в исходниках **не сидится и не отправляет**. Добавление
+третьего филиала — это его одобренные branch metadata плюс тесты, без правки
+архитектуры.
 
 ---
 
@@ -21,8 +48,32 @@ job остаётся `record_created`, отличается только стр�
 
 | Что | Где | Пока не заполнено |
 | --- | --- | --- |
-| пары numeric `location_id` + `location_uuid` филиалов | `EASYWEEK_LOCATION_MAP` в `easyweek.env`; сид независимо сверяет UUID через live `GET /locations` | worker не claim'ит; сид отказывается: `SeedConfigError` |
+| пары numeric `location_id` + `location_uuid` **каждого** филиала | `EASYWEEK_LOCATION_MAP` в `easyweek.env`; сид независимо сверяет UUID через live `GET /locations` | worker не claim'ит; сид отказывается: `SeedConfigError` |
+| slug каждой записи совпадает с одобренным профилем | верхнеуровневый ключ `EASYWEEK_LOCATION_MAP` | `SeedConfigError`: `no source-controlled profile`; отправка запрещена |
+| `meta_template_prefix` совпадает с профилем slug'а | `EASYWEEK_LOCATION_MAP` | `SeedConfigError` про `meta_template_prefix` |
 | approved host страницы записи | `EASYWEEK_BOOKING_PAGE_ALLOWED_HOSTS` в `easyweek.env` | любой booking URL отвергается, lifecycle-job падает локально |
+
+### Проверка пар до записи чего-либо
+
+Для КАЖДОГО филиала подтвердите пару из двух независимых источников:
+
+1. **Webhook capture** — `location_id` и `location_uuid` приходят в одном
+   payload, поэтому их можно сверить между собой:
+
+```bash
+docker compose -p altegio_bot exec -T postgres sh -lc 'psql -tAX -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT DISTINCT payload->>'"'"'location_id'"'"' AS location_id, payload->>'"'"'location_uuid'"'"' AS location_uuid FROM easyweek_events WHERE payload ? '"'"'location_uuid'"'"' ORDER BY 1"'
+```
+
+2. **Read-only `GET /locations`** — независимый источник, где UUID стоит рядом
+   с человекочитаемым именем филиала:
+
+```bash
+docker compose -p altegio_bot exec -T altegio-api /app/.venv/bin/python -m altegio_bot.scripts.easyweek_probe --redact-pii
+```
+
+Сверьте по таблице профилей выше: slug → API-имя → Meta-префикс → страница
+записи → ожидаемый адрес в футере. Расхождение любой из четырёх величин
+означает, что реестр собран неверно — правьте `easyweek.env`, не сид.
 
 Location id в репозитории **не хранится** — он живёт только в production
 `easyweek.env`, и это закреплено тестом
@@ -56,10 +107,11 @@ FROM whatsapp_senders ORDER BY company_id;
 
 * строки Карлсруэ (758285) и Растатта (1271200) с `provider='altegio'` и
   **одинаковым** `phone_number_id` — это штатная, проверенная боем конфигурация;
-* строки Durlach ещё нет — её создаст сид.
+* EasyWeek-строк Durlach и Rastatt может ещё не быть — сид создаст или
+  идемпотентно исправит обе provider-scoped строки.
 
 Сверьте, что `META_WA_PHONE_NUMBER_ID` в окружении равен этому общему
-`phone_number_id`: сид запишет в строку Durlach именно его. Проверка не
+`phone_number_id`: сид запишет его в EasyWeek-строки обоих филиалов. Проверка не
 автоматизирована в скрипте намеренно — сид выполняется одной транзакцией, а
 читать чужие строки, чтобы решить, что писать в свою, значит завязать сид на
 состояние, которое он не контролирует.
@@ -74,12 +126,19 @@ FROM whatsapp_senders ORDER BY company_id;
 ## 2. Meta-preflight: шаблоны должны быть APPROVED
 
 Одобрение шаблонов — предпосылка активации, а не предположение. Проверьте
-статусы read-only прогоном клонировщика (без `--apply` он ничего не отправляет):
+статусы read-only прогонами клонировщика (без `--apply` он ничего не отправляет)
+для **обоих** production-префиксов:
 
 ```bash
 docker compose -p altegio_bot run --rm altegio-api \
   /app/.venv/bin/python -m altegio_bot.scripts.clone_meta_templates_for_location \
   --target-location du --language de
+
+docker compose -p altegio_bot run --rm altegio-api \
+  /app/.venv/bin/python -m altegio_bot.scripts.clone_meta_templates_for_location \
+  --target-location ra --language de \
+  --address '76437 Rastatt, Rathausstraße 5' \
+  --maps-url 'https://maps.app.goo.gl/xvYYbJbPaWcnp9Xv5'
 ```
 
 В выводе должны быть `SKIP APPROVED target already exists` для **всех четырёх
@@ -91,6 +150,10 @@ kitilash_du_record_created_new_client_v1
 kitilash_du_record_updated_v1
 kitilash_du_record_canceled_v1
 ```
+
+И такой же набор с префиксом `kitilash_ra_` для Rastatt. Любой branch-specific
+шаблон, отсутствующий хотя бы у одного из двух филиалов, блокирует общий rollout:
+флаг notifications глобален и частично включить только готовый филиал нельзя.
 
 Любой другой статус — `PENDING`, `REJECTED`, `PAUSED`, `DISABLED`, `MISSING` —
 **останавливает активацию**. `PENDING` тоже: Meta отвергнет отправку по
@@ -150,6 +213,9 @@ company_id ничего не знает (`webhooks/whatsapp.py`,
 ## 4. Конфигурация в `easyweek.env`
 
 ```text
+EASYWEEK_ENABLED=true
+EASYWEEK_PROCESSING_ENABLED=false
+EASYWEEK_NOTIFICATIONS_ENABLED=false
 EASYWEEK_LOCATION_MAP=<JSON-реестр с id, uuid, Meta-префиксом и booking_page_url каждого филиала>
 EASYWEEK_BOOKING_PAGE_ALLOWED_HOSTS=<host из URL выше>
 EASYWEEK_DEFAULT_LANGUAGE=de
@@ -160,7 +226,50 @@ EASYWEEK_DEFAULT_LANGUAGE=de
 host из allowlist**. Пустой allowlist отвергает всё — это защита от опечатки в
 URL, которая иначе уехала бы клиенту как ссылка после отмены.
 
-`EASYWEEK_NOTIFICATIONS_ENABLED` на этом шаге остаётся `false`.
+Capture уже включён и остаётся включённым: `EASYWEEK_ENABLED=true` не меняйте и
+`altegio-api` не пересоздавайте. На время смены tenant boundary оба downstream
+флага обязаны быть `false`: worker не должен ни разбирать backlog по
+недопроверенной карте, ни создавать клиентские job'ы.
+
+После записи нового реестра пересоздайте **оба** его потребителя. Обычный
+`restart` и `up -d` без `--force-recreate` не перечитывают `env_file`:
+
+```bash
+docker compose -p altegio_bot up -d --force-recreate \
+  altegio-easyweek-inbox-worker altegio-outbox-worker
+```
+
+Проверьте эффективную конфигурацию внутри обоих контейнеров, не печатая raw
+JSON, UUID, URLs или секреты:
+
+```bash
+for EW_SERVICE in altegio-easyweek-inbox-worker altegio-outbox-worker; do
+  echo "SERVICE=$EW_SERVICE"
+  docker compose -p altegio_bot exec -T "$EW_SERVICE" /app/.venv/bin/python - <<'PY'
+from altegio_bot.easyweek_locations import configured_easyweek_locations
+from altegio_bot.settings import settings
+
+registry = configured_easyweek_locations()
+print(
+    {
+        "processing_enabled": settings.easyweek_processing_enabled,
+        "notifications_enabled": settings.easyweek_notifications_enabled,
+        "registry_configured": registry.configured,
+        "registry_valid": registry.valid,
+        "branches": sorted(
+            (location.name, location.company_id, location.meta_template_prefix)
+            for location in registry.locations.values()
+        ),
+        "booking_hosts_configured": bool(settings.easyweek_booking_page_allowed_hosts),
+    }
+)
+PY
+done
+```
+
+Gate: оба контейнера показывают один и тот же полный список `durlach`/`du` и
+`rastatt`/`ra`, registry configured+valid, processing=false и
+notifications=false. Любое расхождение останавливает rollout до сида.
 
 ---
 
@@ -186,8 +295,9 @@ GROUP BY 1
 ORDER BY events DESC;
 ```
 
-   Ожидается одна локация. Если строк несколько — разберитесь, какая из них
-   Durlach, прежде чем продолжать.
+   Ожидаются все филиалы реестра. Для каждой строки свяжите pair с Durlach или
+   Rastatt через независимый `GET /locations` и таблицу профилей; неизвестная
+   или отсутствующая пара останавливает rollout.
 
 2. **Кабинет EasyWeek** — id локации в интерфейсе.
 
@@ -208,7 +318,7 @@ docker compose -p altegio_bot run --rm altegio-outbox-worker \
 **Расхождение — это стоп, а не повод «подправить».** Оно означает одно из двух:
 контейнер сконфигурирован не на ту локацию, либо оператор подтвердил не ту. Сид
 не может отличить один случай от другого и обязан отказать — иначе контент
-Durlach привяжется к чужой локации. Выясните, какая сторона неверна, исправьте
+одного филиала привяжется к чужой локации. Выясните, какая сторона неверна, исправьте
 её и запустите сид заново.
 
 Скрипт fail-closed и ничего не запишет, если реестр пуст/невалиден, API
@@ -226,14 +336,49 @@ WHERE provider = 'easyweek'
 ORDER BY code;
 ```
 
-Ожидается ровно **четыре** строки, все `is_active = true`, язык `de`:
+Ожидается ровно **четыре** строки **на каждый** сконфигурированный
+`company_id`, все `is_active = true`, язык `de`. Для двух филиалов — восемь
+строк:
 
-| code | meta_template_name |
-| --- | --- |
-| `record_canceled` | `kitilash_du_record_canceled_v1` |
-| `record_created` | `kitilash_du_record_created_v1` |
-| `record_created_new_client` | `kitilash_du_record_created_new_client_v1` |
-| `record_updated` | `kitilash_du_record_updated_v1` |
+| code | Durlach | Rastatt |
+| --- | --- | --- |
+| `record_canceled` | `kitilash_du_record_canceled_v1` | `kitilash_ra_record_canceled_v1` |
+| `record_created` | `kitilash_du_record_created_v1` | `kitilash_ra_record_created_v1` |
+| `record_created_new_client` | `kitilash_du_record_created_new_client_v1` | `kitilash_ra_record_created_new_client_v1` |
+| `record_updated` | `kitilash_du_record_updated_v1` | `kitilash_ra_record_updated_v1` |
+
+Машинная проверка «четыре на филиал и никаких чужих префиксов»:
+
+```sql
+SELECT company_id,
+       count(*)                                               AS templates,
+       count(*) FILTER (WHERE is_active)                      AS active,
+       count(DISTINCT split_part(meta_template_name, '_', 2)) AS distinct_prefixes,
+       min(split_part(meta_template_name, '_', 2))            AS prefix
+FROM message_templates
+WHERE provider = 'easyweek'
+GROUP BY company_id
+ORDER BY company_id;
+```
+
+Ожидается по строке на филиал: `templates = 4`, `active = 4`,
+`distinct_prefixes = 1`, а `prefix` совпадает с профилем этого `company_id`.
+`distinct_prefixes > 1` означает cross-branch загрязнение — прогоните сид ещё
+раз, он идемпотентно перезапишет строки.
+
+Футер не должен пересекаться между филиалами:
+
+```sql
+SELECT company_id,
+       count(*) FILTER (WHERE body LIKE '%Durlach%') AS mentions_durlach,
+       count(*) FILTER (WHERE body LIKE '%Rastatt%') AS mentions_rastatt
+FROM message_templates
+WHERE provider = 'easyweek'
+GROUP BY company_id
+ORDER BY company_id;
+```
+
+У Durlach ожидается `mentions_rastatt = 0`, у Rastatt — `mentions_durlach = 0`.
 
 ```sql
 SELECT provider, company_id, sender_code, phone_number_id, is_active
@@ -241,8 +386,21 @@ FROM whatsapp_senders
 WHERE provider = 'easyweek';
 ```
 
-Ожидается одна строка: `sender_code='default'`, `phone_number_id` — общий номер
-бота, `is_active = true`.
+Ожидается **ровно одна активная** строка на филиал (для двух филиалов — две):
+`sender_code='default'`, `phone_number_id` — общий номер бота, `is_active = true`.
+
+```sql
+SELECT company_id, count(*) FILTER (WHERE is_active) AS active_senders
+FROM whatsapp_senders
+WHERE provider = 'easyweek'
+GROUP BY company_id
+ORDER BY company_id;
+```
+
+`active_senders` должен быть `1` для каждого `company_id` реестра.
+
+Страница записи каждого филиала берётся из его записи реестра — сверьте, что
+`booking_page_url` Durlach ведёт на страницу Durlach, а Rastatt — на свою.
 
 То же самое глазами: **Ops → EasyWeek** (`/ops/easyweek`).
 
@@ -256,33 +414,127 @@ WHERE provider = 'easyweek';
 
 ## 7. Включение и smoke
 
-**Порядок строгий.** Сначала preflight, карта, сид и проверка строк — только
-потом флаг.
+### 7.0 Обязательный gate: Altegio-путь Раштата должен быть выключен
 
-1. В `easyweek.env`: `EASYWEEK_NOTIFICATIONS_ENABLED=true`.
-2. Пересоздать воркеры:
+`EASYWEEK_NOTIFICATIONS_ENABLED` **глобален**: он включает создание job для
+ВСЕХ филиалов реестра сразу. Отдельного флага на филиал нет — канонический план
+требует операторского cutover, а не расширения архитектуры.
+
+Раштат (`1271200`) мигрирует с Altegio на EasyWeek. Пока Altegio-путь этого
+филиала жив, включение EasyWeek-уведомлений даст клиенту **два сообщения об
+одной записи** — по одному из каждой системы.
+
+Поэтому перед установкой `true`:
+
+1. Получите независимое подтверждение, что Altegio notification path для
+   company `1271200` выключен на дату миграции.
+2. Зафиксируйте это подтверждение письменно (кто, когда, что именно выключено).
+3. Убедитесь, что в Altegio для `1271200` больше не создаются новые
+   lifecycle-job:
+
+```sql
+SELECT count(*) AS queued_altegio_rastatt
+FROM message_jobs
+WHERE provider = 'altegio'
+  AND company_id = 1271200
+  AND job_type IN ('record_created', 'record_updated', 'record_canceled')
+  AND status IN ('queued', 'processing')
+  AND created_at > now() - interval '1 hour';
+```
+
+**Если cutover ещё не подтверждён — `EASYWEEK_NOTIFICATIONS_ENABLED` остаётся
+`false`.** Durlach в этом случае тоже ждёт: одного флага на всех достаточно,
+чтобы частичное включение было невозможно. Это осознанный размен — лучше
+задержать Durlach, чем удвоить уведомления клиентам Раштата.
+
+### 7.1 Включение
+
+**Порядок строгий.** Сначала preflight, карта, сид, проверка строк и gate 7.0 —
+только потом флаг.
+
+1. Сначала разрешите нормализацию, оставив отправки выключенными:
+
+```text
+EASYWEEK_PROCESSING_ENABLED=true
+EASYWEEK_NOTIFICATIONS_ENABLED=false
+```
+
+2. Пересоздайте inbox-worker и убедитесь, что captured backlog обрабатывается
+по новой карте, а EasyWeek `MessageJob` ещё не создаются:
 
 ```bash
-docker compose -p altegio_bot up -d --force-recreate altegio-easyweek-inbox-worker altegio-outbox-worker
+docker compose -p altegio_bot up -d --force-recreate altegio-easyweek-inbox-worker
+```
+
+3. Только после успешной нормализации и обязательного gate §7.0 установите:
+
+```text
+EASYWEEK_NOTIFICATIONS_ENABLED=true
+```
+
+4. Снова пересоздайте inbox-worker. Outbox уже получил новую карту на §4; его
+лишний рестарт здесь только приостановил бы общий Altegio-трафик:
+
+```bash
+docker compose -p altegio_bot up -d --force-recreate altegio-easyweek-inbox-worker
 ```
 
 Обычный `docker compose restart` **не перечитывает `env_file`**.
 
-### Smoke
+### Smoke — матрица PR-7
 
-Создайте тестовую запись в EasyWeek на свой номер, затем измените её и отмените.
+Smoke гоняется **одновременно по обоим филиалам**. Прогон только Durlach не
+закрывает DoD PR-7: именно cross-branch путаница была исходным дефектом.
+
+Для КАЖДОГО филиала (Durlach и Rastatt) создайте тестовую запись на свой номер,
+затем измените её, перенесите и отмените:
+
+| Сценарий | Durlach | Rastatt |
+| --- | --- | --- |
+| create | `du_*`, футер Durlach | `ra_*`, футер Rastatt |
+| update | `du_*` | `ra_*` |
+| reschedule | `du_*` (job `record_updated`) | `ra_*` |
+| cancel | `du_*`, статическая страница Durlach | `ra_*`, статическая страница Rastatt |
+| новый клиент | `kitilash_du_record_created_new_client_v1` + блок «Wichtige Hinweise» | `kitilash_ra_record_created_new_client_v1` + блок |
+| повторный клиент | `kitilash_du_record_created_v1`, без блока | `kitilash_ra_record_created_v1`, без блока |
+
+Общие ожидания по каждому событию:
 
 | Где | Что ожидать |
 | --- | --- |
 | `easyweek_events` | новая строка, `status` доходит до `processed` |
-| `message_jobs` (`provider='easyweek'`) | job нужного `job_type`, `status` → `done` |
+| `message_jobs` (`provider='easyweek'`) | job нужного `job_type` и `company_id` своего филиала, `status` → `done` |
 | `outbox_messages` | строка со `status='sent'`, `template_code` = job_type |
-| WhatsApp | сообщение с адресом Durlach в футере |
+| WhatsApp | сообщение с адресом СВОЕГО филиала в футере |
 
-Отдельно проверьте первичную запись: у клиента без прошлых записей в Durlach
-сообщение должно содержать блок «Wichtige Hinweise», а `outbox_messages.meta`
-— имя `kitilash_du_record_created_new_client_v1`. У повторного клиента — обычный
-`kitilash_du_record_created_v1` без блока.
+**Cross-branch проверки — обязательны:**
+
+* Durlach не отправил ни одного `ra_*`, Rastatt — ни одного `du_*`;
+* в сообщении Durlach нет адреса/карты Rastatt и наоборот;
+* ссылка ведёт на страницу своего филиала;
+* `record_canceled` → статическая страница СВОЕГО филиала, не другого.
+
+```sql
+SELECT j.company_id,
+       COALESCE(o.meta ->> 'template', o.meta ->> 'original_template') AS meta_template,
+       count(*)
+FROM outbox_messages o
+         JOIN message_jobs j ON j.id = o.job_id
+WHERE j.provider = 'easyweek'
+GROUP BY 1, 2
+ORDER BY 1, 2;
+```
+
+Каждая строка обязана нести префикс своего `company_id`. Любая пара
+«company Durlach + `ra_*`» или «company Rastatt + `du_*`» — это стоп.
+
+Логи обоих воркеров не должны содержать PII и секретов:
+
+```bash
+docker compose -p altegio_bot logs --since=1h altegio-outbox-worker altegio-easyweek-inbox-worker | grep -Eci 'customer_phone|customer_email|Authorization: Bearer|token='
+```
+
+Ожидается `0`.
 
 Ссылки:
 
@@ -619,10 +871,10 @@ docker compose -p altegio_bot up -d --force-recreate altegio-whatsapp-inbox-work
 
 ---
 
-## 9. Что НЕ входит в PR-6
+## 9. Что НЕ входит в PR-7
 
-* reminders (`reminder_24h`, `reminder_2h`) — фаза 2 / PR-7;
+* reminders (`reminder_24h`, `reminder_2h`) — следующая фаза / PR-8;
 * маркетинг, кампании, promo для EasyWeek;
 * гейт `EASYWEEK_NOTIFICATIONS_ENABLED` в `outbox_worker` — отдельное решение
-  вне PR-6 (см. §8: именно поэтому жёсткая остановка требует ручных шагов);
+  вне PR-7 (см. §8: именно поэтому жёсткая остановка требует ручных шагов);
 * изменения маршрутизации отправителей и Altegio-пути.

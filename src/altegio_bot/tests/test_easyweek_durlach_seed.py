@@ -20,6 +20,8 @@ import pytest_asyncio
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from altegio_bot.easyweek_branches import BRANCH_PROFILES
+from altegio_bot.easyweek_locations import configured_easyweek_locations
 from altegio_bot.easyweek_policy import (
     RECORD_CANCELED,
     RECORD_CREATED,
@@ -789,7 +791,7 @@ async def test_the_new_client_body_renders_with_no_missing_placeholders(db: Asyn
 
 async def test_the_new_client_body_matches_the_shared_notes_constant(db: AsyncSession) -> None:
     """The Meta template was cloned from the Karlsruhe one; the text must not drift."""
-    content = seed_script.BRANCH_CONTENT["du"]
+    content = BRANCH_PROFILES["durlach"].content
     assert ow.PRE_APPOINTMENT_NOTES_DE in seed_script.template_bodies(content)[RECORD_CREATED_NEW_CLIENT]
 
 
@@ -884,3 +886,205 @@ async def test_the_allowlist_is_an_origin_check_not_a_hostname_check(
     assert validate_static_booking_page("https://booking.example.com:4443/durlach") is None
     assert validate_static_booking_page("https://booking.example.com:80/durlach") is None
     assert validate_static_booking_page("https://booking.example.com:8443/durlach") is None
+
+
+# ===========================================================================
+# PR-7: branch identity is indivisible
+# ===========================================================================
+
+RASTATT_LOCATION_ID = 999502
+RASTATT_LOCATION_UUID = "dddddddd-eeee-4fff-8000-000000000002"
+RASTATT_PAGE = f"https://{BOOKING_PAGE_HOST}/rastatt"
+
+_BOTH_API_LOCATIONS = [
+    {"uuid": DURLACH_LOCATION_UUID, "name": "KitiLash Durlach"},
+    {"uuid": RASTATT_LOCATION_UUID, "name": "KitiLash Rastatt"},
+]
+
+
+def _set_registry(monkeypatch: pytest.MonkeyPatch, entries: dict[str, dict[str, Any]]) -> None:
+    monkeypatch.setattr(settings, "easyweek_location_map", json.dumps(entries), raising=False)
+
+
+def _entry(location_id: int, location_uuid: str, prefix: str, page: str) -> dict[str, Any]:
+    return {
+        "location_id": location_id,
+        "location_uuid": location_uuid,
+        "meta_template_prefix": prefix,
+        "booking_page_url": page,
+    }
+
+
+async def _easyweek_state(db: AsyncSession) -> tuple[int, int]:
+    templates = await _count(db, MessageTemplate, provider=PROVIDER_EASYWEEK)
+    senders = await _count(db, WhatsAppSender, provider=PROVIDER_EASYWEEK)
+    return templates, senders
+
+
+@pytest.mark.parametrize(
+    ("slug", "location_id", "location_uuid", "wrong_prefix", "page"),
+    [
+        ("durlach", DURLACH_LOCATION_ID, DURLACH_LOCATION_UUID, "ra", STATIC_BOOKING_PAGE),
+        ("rastatt", RASTATT_LOCATION_ID, RASTATT_LOCATION_UUID, "du", RASTATT_PAGE),
+    ],
+)
+async def test_a_crossed_meta_prefix_is_refused_before_any_write(
+    db: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    slug: str,
+    location_id: int,
+    location_uuid: str,
+    wrong_prefix: str,
+    page: str,
+) -> None:
+    """The §10 defect: real ids of one branch wearing the other's prefix."""
+    before = await _easyweek_state(db)
+    _set_registry(monkeypatch, {slug: _entry(location_id, location_uuid, wrong_prefix, page)})
+
+    with pytest.raises(seed_script.SeedConfigError) as excinfo:
+        await _run_seed(db, api_locations=_BOTH_API_LOCATIONS)
+
+    assert "meta_template_prefix" in str(excinfo.value)
+    assert await _easyweek_state(db) == before, "a refused seed still wrote to the database"
+
+
+async def test_the_other_branchs_uuid_under_a_slug_is_refused_even_with_a_matching_prefix(
+    db: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Prefix and slug agree; only the live API can expose the swapped UUID.
+
+    This is the case a prefix check alone cannot catch, and the one that
+    actually happened: every local field is self-consistent, and the identity is
+    still wrong.
+    """
+    before = await _easyweek_state(db)
+    _set_registry(
+        monkeypatch,
+        {"durlach": _entry(DURLACH_LOCATION_ID, RASTATT_LOCATION_UUID, "du", STATIC_BOOKING_PAGE)},
+    )
+
+    with pytest.raises(seed_script.SeedConfigError) as excinfo:
+        await _run_seed(db, api_locations=_BOTH_API_LOCATIONS)
+
+    message = str(excinfo.value)
+    assert "API identity mismatch" in message
+    assert "durlach" in message
+    assert await _easyweek_state(db) == before
+
+
+async def test_an_unknown_branch_slug_is_refused(db: AsyncSession, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A third branch cannot be seeded until its profile is approved in source."""
+    before = await _easyweek_state(db)
+    _set_registry(
+        monkeypatch,
+        {"karlsruhe": _entry(999503, "dddddddd-eeee-4fff-8000-000000000003", "ka", STATIC_BOOKING_PAGE)},
+    )
+
+    with pytest.raises(seed_script.SeedConfigError) as excinfo:
+        await _run_seed(db, api_locations=_BOTH_API_LOCATIONS)
+
+    assert "no source-controlled profile" in str(excinfo.value)
+    assert await _easyweek_state(db) == before
+
+
+async def test_both_correct_profiles_seed_eight_templates_and_two_senders(
+    db: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_registry(
+        monkeypatch,
+        {
+            "durlach": _entry(DURLACH_LOCATION_ID, DURLACH_LOCATION_UUID, "du", STATIC_BOOKING_PAGE),
+            "rastatt": _entry(RASTATT_LOCATION_ID, RASTATT_LOCATION_UUID, "ra", RASTATT_PAGE),
+        },
+    )
+    await _run_seed(db, api_locations=_BOTH_API_LOCATIONS)
+
+    templates, senders = await _easyweek_state(db)
+    assert (templates, senders) == (8, 2)
+
+    rows = await _easyweek_templates(db)
+    by_company: dict[int, set[str]] = {}
+    for row in rows:
+        by_company.setdefault(row.company_id, set()).add(row.meta_template_name or "")
+
+    assert all(name.startswith("kitilash_du_") for name in by_company[DURLACH_LOCATION_ID])
+    assert all(name.startswith("kitilash_ra_") for name in by_company[RASTATT_LOCATION_ID])
+
+    durlach_bodies = " ".join(r.body for r in rows if r.company_id == DURLACH_LOCATION_ID)
+    rastatt_bodies = " ".join(r.body for r in rows if r.company_id == RASTATT_LOCATION_ID)
+    assert "Durlach" in durlach_bodies and "Rastatt" not in durlach_bodies
+    assert "Rastatt" in rastatt_bodies and "Durlach" not in rastatt_bodies
+
+
+async def test_contaminated_rows_converge_to_the_right_branch(
+    db: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rastatt rows previously seeded with Durlach names are repaired in place."""
+    _set_registry(
+        monkeypatch,
+        {"rastatt": _entry(RASTATT_LOCATION_ID, RASTATT_LOCATION_UUID, "ra", RASTATT_PAGE)},
+    )
+    contaminated = MessageTemplate(
+        provider=PROVIDER_EASYWEEK,
+        company_id=RASTATT_LOCATION_ID,
+        code="record_created",
+        language="de",
+        body="Durlach body that never belonged here",
+        meta_template_name="kitilash_du_record_created_v1",
+        is_active=True,
+    )
+    db.add(contaminated)
+    await db.flush()
+
+    await _run_seed(db, api_locations=_BOTH_API_LOCATIONS)
+
+    rows = [r for r in await _easyweek_templates(db) if r.company_id == RASTATT_LOCATION_ID]
+    assert rows, "the branch was not seeded"
+    assert all((r.meta_template_name or "").startswith("kitilash_ra_") for r in rows), (
+        "a du_* name survived a Rastatt seed"
+    )
+    assert all("Durlach" not in r.body for r in rows)
+
+
+async def test_three_synthetic_branches_parse_and_scope_independently(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No 'exactly two' assumption anywhere in the registry.
+
+    Uses synthetic entries on purpose: a real third branch needs approved
+    metadata, and inventing one here would put unverified production data in
+    source. What is proven is that parsing, membership and provider-scoped
+    company ids already work for three.
+    """
+    entries = {
+        f"branch{n}": _entry(999600 + n, f"dddddddd-eeee-4fff-8000-00000000010{n}", f"b{n}", STATIC_BOOKING_PAGE)
+        for n in (1, 2, 3)
+    }
+    _set_registry(monkeypatch, entries)
+
+    registry = configured_easyweek_locations()
+    assert registry.ready
+    assert len(registry.locations) == 3
+    assert {loc.company_id for loc in registry.locations.values()} == {999601, 999602, 999603}
+    for n in (1, 2, 3):
+        location = registry.locations[999600 + n]
+        assert location.name == f"branch{n}"
+        assert location.company_id == location.location_id
+
+
+async def test_an_unprofiled_branch_is_member_but_cannot_seed(
+    db: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Membership and profile are different questions, and both are enforced."""
+    _set_registry(
+        monkeypatch,
+        {"branch1": _entry(999601, "dddddddd-eeee-4fff-8000-000000000101", "b1", STATIC_BOOKING_PAGE)},
+    )
+    assert 999601 in configured_easyweek_locations().locations
+
+    before = await _easyweek_state(db)
+    with pytest.raises(seed_script.SeedConfigError):
+        await _run_seed(db, api_locations=_BOTH_API_LOCATIONS)
+    assert await _easyweek_state(db) == before

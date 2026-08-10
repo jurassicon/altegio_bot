@@ -21,6 +21,13 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.db import SessionLocal
+from altegio_bot.easyweek_branches import (
+    BranchContent,
+    BranchProfile,
+    branch_profile_for_slug,
+    meta_template_name,
+    normalize_api_name,
+)
 from altegio_bot.easyweek_client import EasyWeekClient, EasyWeekError
 from altegio_bot.easyweek_locations import EasyWeekLocation, configured_easyweek_locations
 from altegio_bot.easyweek_policy import (
@@ -38,44 +45,24 @@ LANGUAGE = "de"
 TEMPLATE_CODES = (RECORD_CREATED, RECORD_CREATED_NEW_CLIENT, RECORD_UPDATED, RECORD_CANCELED)
 
 
-@dataclass(frozen=True)
-class BranchContent:
-    brand_line: str
-    address_line: str
-    contact_phone: str
-    maps_line: str
-    instagram_line: str
-
-
-# Public storefront content only. Numeric EasyWeek ids and UUIDs deliberately
-# never live in source; the registry is the sole source for those identities.
-BRANCH_CONTENT: dict[str, BranchContent] = {
-    "du": BranchContent(
-        brand_line="*KitiLash Durlach*",
-        address_line="Pfinztalstraße 4, 76227 Karlsruhe-Durlach",
-        contact_phone="+491742310386",
-        maps_line="📍https://maps.app.goo.gl/HnVPnHaJHf2DW3Nn8",
-        instagram_line="📺 https://www.instagram.com/kitilash001",
-    ),
-    "ra": BranchContent(
-        brand_line="*KitiLash Rastatt*",
-        address_line="76437 Rastatt, Rathausstraße 5",
-        contact_phone="+491742310386",
-        maps_line="📍https://maps.app.goo.gl/xvYYbJbPaWcnp9Xv5",
-        instagram_line="📺 https://www.instagram.com/kitilash001",
-    ),
-}
-
-
 class SeedConfigError(RuntimeError):
     """The environment or API identity check is not safe enough to write."""
 
 
 @dataclass(frozen=True)
 class VerifiedBranch:
+    """A branch whose registry entry, API identity and profile all agree."""
+
     location: EasyWeekLocation
+    profile: BranchProfile
     api_name: str
-    content: BranchContent
+
+    @property
+    def content(self) -> BranchContent:
+        # Content comes from the PROFILE, never from the operator-supplied
+        # prefix: that indirection is what let Durlach content be seeded under
+        # Rastatt's company id.
+        return self.profile.content
 
 
 @dataclass(frozen=True)
@@ -92,11 +79,6 @@ class SeedResult:
     template_duplicates: int = 0
     senders_created: int = 0
     senders_updated: int = 0
-
-
-def meta_template_name(prefix: str, code: str) -> str:
-    """Approved WABA template name for one branch and lifecycle code."""
-    return f"kitilash_{prefix}_{code}_v1"
 
 
 def _footer(content: BranchContent) -> str:
@@ -162,21 +144,37 @@ def _resolve_phone_number_id() -> str:
     return phone_number_id
 
 
-def _configured_seed_locations() -> tuple[tuple[EasyWeekLocation, BranchContent], ...]:
+def _configured_seed_locations() -> tuple[tuple[EasyWeekLocation, BranchProfile], ...]:
+    """Bind every registry entry to a trusted source-controlled profile.
+
+    The registry's TOP-LEVEL KEY selects the profile — a stable branch slug an
+    operator cannot silently repurpose — and the operator-supplied
+    ``meta_template_prefix`` must then agree with it. Deriving the profile from
+    the prefix instead (the old behaviour) is exactly how Durlach content ended
+    up seeded under Rastatt's company id: the prefix is data, not identity.
+    """
     registry = configured_easyweek_locations()
     if not registry.configured:
         raise SeedConfigError("EASYWEEK_LOCATION_MAP is empty; refusing to seed an unconfigured deployment.")
     if not registry.valid:
         raise SeedConfigError("EASYWEEK_LOCATION_MAP is invalid; refusing to seed a partial or ambiguous registry.")
 
-    result: list[tuple[EasyWeekLocation, BranchContent]] = []
+    result: list[tuple[EasyWeekLocation, BranchProfile]] = []
     for location in registry.locations.values():
-        content = BRANCH_CONTENT.get(location.meta_template_prefix)
-        if content is None:
-            raise SeedConfigError("EASYWEEK_LOCATION_MAP contains a branch prefix with no seed content.")
+        profile = branch_profile_for_slug(location.name)
+        if profile is None:
+            raise SeedConfigError(
+                f"EASYWEEK_LOCATION_MAP branch {location.name!r} has no source-controlled profile; "
+                "add an approved branch profile before seeding it."
+            )
+        if location.meta_template_prefix != profile.meta_template_prefix:
+            raise SeedConfigError(
+                f"EASYWEEK_LOCATION_MAP branch {location.name!r} declares meta_template_prefix "
+                f"{location.meta_template_prefix!r}, but that branch owns {profile.meta_template_prefix!r}."
+            )
         if validate_static_booking_page(location.booking_page_url) is None:
             raise SeedConfigError("A registry booking page is invalid or outside EASYWEEK_BOOKING_PAGE_ALLOWED_HOSTS.")
-        result.append((location, content))
+        result.append((location, profile))
     return tuple(sorted(result, key=lambda item: item[0].location_id))
 
 
@@ -215,19 +213,33 @@ async def build_seed_plan(*, client_factory: Callable[[], Any] | None = None) ->
         api_by_uuid[canonical_uuid] = raw_name
 
     verified: list[VerifiedBranch] = []
-    for location, content in configured:
+    for location, profile in configured:
         api_name = api_by_uuid.get(location.location_uuid)
         if api_name is None:
             raise SeedConfigError("A registry UUID is absent from GET /locations; refusing to seed.")
+
+        # THE check §10 was missing. Printing the name and continuing proves
+        # nothing: it confirms *a* location exists, not that it is the branch
+        # whose content is about to be written. EasyWeek is the independent
+        # third party here — the registry claims this UUID is `profile.slug`,
+        # and only the API can confirm or refute it.
+        if normalize_api_name(api_name) != normalize_api_name(profile.api_name):
+            raise SeedConfigError(
+                f"EasyWeek API identity mismatch for branch {profile.slug!r}: the configured UUID belongs to "
+                f"{json.dumps(api_name, ensure_ascii=False)}, expected "
+                f"{json.dumps(profile.api_name, ensure_ascii=False)}."
+            )
+
         # JSON quoting keeps terminal control characters escaped while showing
-        # the exact human-readable API name requested for operator confirmation.
+        # the exact human-readable API name that was matched.
         print(
-            "verified EasyWeek location: company_id={} name={}".format(
+            "verified EasyWeek location: branch={} company_id={} name={}".format(
+                profile.slug,
                 location.company_id,
                 json.dumps(api_name, ensure_ascii=False),
             )
         )
-        verified.append(VerifiedBranch(location=location, api_name=api_name, content=content))
+        verified.append(VerifiedBranch(location=location, profile=profile, api_name=api_name))
 
     return SeedPlan(branches=tuple(verified), language=language, phone_number_id=phone_number_id)
 
@@ -250,8 +262,11 @@ async def _upsert_template(
         .order_by(MessageTemplate.id.asc())
     )
     existing = list((await session.execute(stmt)).scalars().all())
+    # Body AND template name both come from the verified profile. Building
+    # either from `location.meta_template_prefix` would reintroduce the very
+    # indirection that let an operator-typed prefix choose the content.
     bodies = template_bodies(branch.content)
-    template_name = meta_template_name(location.meta_template_prefix, code)
+    template_name = meta_template_name(branch.profile.meta_template_prefix, code)
 
     if not existing:
         session.add(
