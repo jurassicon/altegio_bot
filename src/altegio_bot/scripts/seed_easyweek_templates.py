@@ -25,7 +25,7 @@ from altegio_bot.easyweek_branches import (
     BranchContent,
     BranchProfile,
     branch_profile_for_slug,
-    meta_template_name,
+    branch_template_contract,
     normalize_api_name,
 )
 from altegio_bot.easyweek_client import EasyWeekClient, EasyWeekError
@@ -39,7 +39,6 @@ from altegio_bot.easyweek_policy import (
 )
 from altegio_bot.models.models import PROVIDER_EASYWEEK, MessageTemplate, WhatsAppSender
 from altegio_bot.settings import settings
-from altegio_bot.workers.outbox_worker import PRE_APPOINTMENT_NOTES_DE
 
 LANGUAGE = "de"
 TEMPLATE_CODES = (RECORD_CREATED, RECORD_CREATED_NEW_CLIENT, RECORD_UPDATED, RECORD_CANCELED)
@@ -79,51 +78,6 @@ class SeedResult:
     template_duplicates: int = 0
     senders_created: int = 0
     senders_updated: int = 0
-
-
-def _footer(content: BranchContent) -> str:
-    return (
-        f"\n\n{content.brand_line}\n"
-        f"{content.address_line}\n"
-        f"☎ {content.contact_phone}\n\n"
-        f"{content.maps_line}\n"
-        f"{content.instagram_line}"
-    )
-
-
-def template_bodies(content: BranchContent) -> dict[str, str]:
-    """Location-specific text bodies; booking_link is resolved at send time."""
-    footer = _footer(content)
-    created = (
-        "*{client_name}, hallo! Ihre Terminbuchung wurde bestätigt:*\n\n"
-        "*Mitarbeiterin:* {staff_name}\n"
-        "*Datum:* {date}\n"
-        "*Zeit:* {time}\n"
-        "*Service:*\n"
-        "{services}\n"
-        "*Summe:* {total_cost}€\n\n"
-        "Termin verwalten: {booking_link}"
-    )
-    return {
-        RECORD_CREATED: f"{created}{footer}",
-        RECORD_CREATED_NEW_CLIENT: f"{created}{PRE_APPOINTMENT_NOTES_DE}{footer}",
-        RECORD_UPDATED: (
-            "*{client_name}, hallo! Ihr Termin wurde geändert:*\n\n"
-            "*Mitarbeiterin:* {staff_name}\n"
-            "*Neues Datum:* {date}\n"
-            "*Neue Zeit:* {time}\n"
-            "*Service:*\n"
-            "{services}\n"
-            "*Summe:* {total_cost}€\n\n"
-            f"Termin verwalten: {{booking_link}}{footer}"
-        ),
-        RECORD_CANCELED: (
-            "*{client_name}, hallo!*\n\n"
-            "Ihr Termin am {date} um {time} Uhr wurde storniert.\n"
-            "{services}\n\n"
-            f"Neuen Termin buchen: {{booking_link}}{footer}"
-        ),
-    }
 
 
 def _resolve_language() -> str:
@@ -262,11 +216,11 @@ async def _upsert_template(
         .order_by(MessageTemplate.id.asc())
     )
     existing = list((await session.execute(stmt)).scalars().all())
-    # Body AND template name both come from the verified profile. Building
-    # either from `location.meta_template_prefix` would reintroduce the very
-    # indirection that let an operator-typed prefix choose the content.
-    bodies = template_bodies(branch.content)
-    template_name = meta_template_name(branch.profile.meta_template_prefix, code)
+    # Body AND template name come from one source-owned contract. Building
+    # either separately would let seed and runtime silently disagree.
+    contract = branch_template_contract(branch.profile, code)
+    if contract is None:
+        raise SeedConfigError(f"Unsupported EasyWeek template code for branch {branch.profile.slug!r}.")
 
     if not existing:
         session.add(
@@ -275,8 +229,8 @@ async def _upsert_template(
                 company_id=location.company_id,
                 code=code,
                 language=language,
-                body=bodies[code],
-                meta_template_name=template_name,
+                body=contract.raw_body,
+                meta_template_name=contract.meta_template_name,
                 is_active=True,
             )
         )
@@ -289,8 +243,8 @@ async def _upsert_template(
         )
 
     row = existing[0]
-    row.body = bodies[code]
-    row.meta_template_name = template_name
+    row.body = contract.raw_body
+    row.meta_template_name = contract.meta_template_name
     row.is_active = True
     return SeedResult(
         templates_created=result.templates_created,

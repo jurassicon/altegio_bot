@@ -33,7 +33,12 @@ from altegio_bot.delivery_retry_identity import (
     resolve_retry_reference,
     retry_outbox_audit_mismatch,
 )
-from altegio_bot.easyweek_branches import BranchProfile, branch_profile_for_slug, branch_template_name_error
+from altegio_bot.easyweek_branches import (
+    PRE_APPOINTMENT_NOTES_DE,
+    BranchProfile,
+    branch_profile_for_slug,
+    branch_template_contract_error,
+)
 from altegio_bot.easyweek_locations import EasyWeekLocation, configured_easyweek_locations
 from altegio_bot.easyweek_normalizer import extract_manage_link
 from altegio_bot.easyweek_policy import (
@@ -222,17 +227,6 @@ GOOGLE_MAPS_REVIEW_LINKS: dict[int, str] = {
     758285: "https://g.page/r/CdOqDUWhxCAbEBM/review",
     1271200: "https://g.page/r/CWd7fy4dua5kEBM/review",
 }
-
-PRE_APPOINTMENT_NOTES_DE = (
-    "\n\nWichtige Hinweise vor dem Termin:\n"
-    "• Bitte pünktlich kommen — ab 15 Min. Verspätung können wir "
-    "nicht garantieren, dass der Termin stattfindet.\n"
-    "• Wimpern bitte sauber: ohne Mascara, ohne geklebte Wimpern.\n"
-    "• Falls Sie schon eine Kundenkarte haben, bitte mitbringen.\n"
-    "• Auffüllen: ab 3. Woche 60 €, ab 4. Woche 70 €, ab 5. Woche "
-    "keine Auffüllung (Neuauflage).\n"
-    "• Zahlung: bar oder mit Karte.\n"
-)
 
 SUCCESS_OUTBOX_STATUSES = ("sent", "delivered", "read")
 
@@ -3116,10 +3110,11 @@ async def _run_job_logic(
 
         selected_name = (msg_ctx.get("meta_template_name") or "").strip()
         selected_code = str(msg_ctx.get("easyweek_template_code") or job.job_type)
-        branch_error = branch_template_name_error(
+        branch_error = branch_template_contract_error(
             profile=profile,
             template_code=selected_code,
             resolved_name=selected_name,
+            resolved_body=body,
         )
         if branch_error is not None:
             job.status = "failed"

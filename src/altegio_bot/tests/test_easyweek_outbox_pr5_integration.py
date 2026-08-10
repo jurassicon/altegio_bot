@@ -46,7 +46,7 @@ from altegio_bot.delivery_retry_identity import (
     resolve_retry_identity,
     retry_outbox_audit_mismatch,
 )
-from altegio_bot.easyweek_branches import BRANCH_PROFILES, BranchProfile
+from altegio_bot.easyweek_branches import BRANCH_PROFILES, BranchProfile, branch_template_contract
 from altegio_bot.easyweek_normalizer import canonical_booking_uuid
 from altegio_bot.easyweek_policy import (
     EASYWEEK_LIFECYCLE_JOB_TYPES,
@@ -236,16 +236,34 @@ def _template(
     company_id: int,
     code: str,
     language: str = "de",
-    body: str = "Hallo {{1}}",
+    body: object = _UNSET,
     meta_template_name: str | None = None,
     is_active: bool = True,
 ) -> MessageTemplate:
+    resolved_body = body
+    if resolved_body is _UNSET and provider == PROVIDER_EASYWEEK:
+        location_map = json.loads(settings.easyweek_location_map or "{}")
+        slug = next(
+            (
+                candidate
+                for candidate, entry in location_map.items()
+                if isinstance(entry, dict) and entry.get("location_id") == company_id
+            ),
+            None,
+        )
+        profile = BRANCH_PROFILES.get(slug or "")
+        contract = branch_template_contract(profile, code) if profile is not None else None
+        if contract is not None:
+            resolved_body = contract.raw_body
+    if resolved_body is _UNSET:
+        resolved_body = "Hallo {{1}}"
+    assert isinstance(resolved_body, str)
     return MessageTemplate(
         provider=provider,
         company_id=company_id,
         code=code,
         language=language,
-        body=body,
+        body=resolved_body,
         meta_template_name=meta_template_name,
         is_active=is_active,
     )
@@ -388,6 +406,7 @@ async def _seed_easyweek_happy_path(
     total_cost: str | None = _UNSET,
     language: str = "de",
     with_sender: bool = True,
+    body: object = _UNSET,
 ) -> MessageJob:
     """Everything an EasyWeek lifecycle job needs to reach the provider."""
     client = await _seed_easyweek_client(db, company_id=company_id)
@@ -411,6 +430,7 @@ async def _seed_easyweek_happy_path(
             company_id=company_id,
             code=job_type,
             language=language,
+            body=body,
             meta_template_name=meta_template_name,
         )
     )
@@ -2050,10 +2070,8 @@ async def test_new_easyweek_client_gets_no_altegio_pre_appointment_notes(
     """
     _enable_text_inside_24h(monkeypatch, window_open=True)
     job = await _seed_easyweek_happy_path(db, language="de")
-    # A first booking: no earlier record exists for this client.
-    tmpl_res = await db.execute(select(MessageTemplate).where(MessageTemplate.provider == PROVIDER_EASYWEEK))
-    tmpl_res.scalars().one().body = "Hallo {{1}}, Termin am {{3}} um {{4}}.{pre_appointment_notes}"
-    await db.flush()
+    # A first booking has no dedicated new-client row here, so DB-first
+    # resolution deliberately falls back to the canonical ordinary body.
 
     await _run_job(db, job)
 
@@ -5315,3 +5333,170 @@ async def test_new_client_variant_is_validated_as_the_actually_selected_code(
     assert "record_created_new_client" in (job.last_error or "")
     assert capture.template_calls == []
     assert capture.text_calls == []
+
+
+@pytest.mark.parametrize(
+    ("selected_code", "job_type"),
+    [
+        ("record_created", "record_created"),
+        ("record_created_new_client", "record_created"),
+        ("record_updated", "record_updated"),
+        ("record_canceled", "record_canceled"),
+    ],
+)
+async def test_a_cross_branch_body_fails_for_every_selected_lifecycle_code(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    monkeypatch: pytest.MonkeyPatch,
+    selected_code: str,
+    job_type: str,
+) -> None:
+    """A correct `ra_*` name cannot authorize Durlach's raw DB body."""
+    _use_du_ra_registry(monkeypatch)
+    wrong_contract = branch_template_contract(BRANCH_PROFILES["durlach"], selected_code)
+    right_contract = branch_template_contract(BRANCH_PROFILES["rastatt"], selected_code)
+    assert wrong_contract is not None and right_contract is not None
+
+    ordinary = branch_template_contract(BRANCH_PROFILES["rastatt"], job_type)
+    assert ordinary is not None
+    job = await _seed_easyweek_happy_path(
+        db,
+        company_id=OTHER_EASYWEEK_COMPANY_ID,
+        job_type=job_type,
+        meta_template_name=ordinary.meta_template_name,
+        body=wrong_contract.raw_body if selected_code == job_type else ordinary.raw_body,
+    )
+    if selected_code == "record_created_new_client":
+        db.add(
+            _template(
+                provider=PROVIDER_EASYWEEK,
+                company_id=OTHER_EASYWEEK_COMPANY_ID,
+                code=selected_code,
+                body=wrong_contract.raw_body,
+                meta_template_name=right_contract.meta_template_name,
+            )
+        )
+        await db.flush()
+
+    await _run_job(db, job)
+
+    error = job.last_error or ""
+    assert job.status == "failed"
+    assert f"code={selected_code} body mismatch" in error
+    assert "Pfinztalstraße" not in error
+    assert BRANCH_PROFILES["durlach"].content.contact_phone not in error
+    assert CLIENT_PHONE not in error
+    assert capture.template_calls == []
+    assert capture.text_calls == []
+    assert await _outbox_rows(db, job) == []
+
+
+@pytest.mark.parametrize("send_mode", ["text", "auto"])
+async def test_a_cross_branch_body_fails_before_text_or_open_window_auto_send(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    monkeypatch: pytest.MonkeyPatch,
+    send_mode: str,
+) -> None:
+    _use_du_ra_registry(monkeypatch)
+    monkeypatch.setattr(settings, "whatsapp_send_mode", send_mode, raising=False)
+    if send_mode == "auto":
+        _enable_text_inside_24h(monkeypatch, window_open=True)
+    wrong = branch_template_contract(BRANCH_PROFILES["durlach"], "record_updated")
+    right = branch_template_contract(BRANCH_PROFILES["rastatt"], "record_updated")
+    assert wrong is not None and right is not None
+    job = await _seed_easyweek_happy_path(
+        db,
+        company_id=OTHER_EASYWEEK_COMPANY_ID,
+        job_type="record_updated",
+        meta_template_name=right.meta_template_name,
+        body=wrong.raw_body,
+    )
+
+    await _run_job(db, job)
+
+    assert job.status == "failed"
+    assert "body mismatch" in (job.last_error or "")
+    assert capture.template_calls == []
+    assert capture.text_calls == []
+    assert await _outbox_rows(db, job) == []
+
+
+@pytest.mark.parametrize(
+    ("company_id", "slug", "prefix"),
+    [
+        (COLLIDING_COMPANY_ID, "durlach", "du"),
+        (OTHER_EASYWEEK_COMPANY_ID, "rastatt", "ra"),
+    ],
+)
+@pytest.mark.parametrize("send_mode", ["template", "text", "auto"])
+async def test_canonical_du_ra_body_sends_in_every_runtime_mode(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    monkeypatch: pytest.MonkeyPatch,
+    company_id: int,
+    slug: str,
+    prefix: str,
+    send_mode: str,
+) -> None:
+    _use_du_ra_registry(monkeypatch)
+    monkeypatch.setattr(settings, "whatsapp_send_mode", send_mode, raising=False)
+    if send_mode == "auto":
+        _enable_text_inside_24h(monkeypatch, window_open=True)
+    contract = branch_template_contract(BRANCH_PROFILES[slug], "record_updated")
+    assert contract is not None
+    job = await _seed_easyweek_happy_path(
+        db,
+        company_id=company_id,
+        job_type="record_updated",
+        meta_template_name=f"kitilash_{prefix}_record_updated_v1",
+    )
+
+    await _run_job(db, job)
+
+    assert job.status == "done", job.last_error
+    rows = await _outbox_rows(db, job)
+    assert len(rows) == 1
+    assert contract.profile.content.address_line in rows[0].body
+    if send_mode == "template":
+        assert [call["template_name"] for call in capture.template_calls] == [contract.meta_template_name]
+        assert capture.text_calls == []
+    else:
+        assert capture.template_calls == []
+        assert len(capture.text_calls) == 1
+
+
+async def test_delivery_retry_revalidates_the_current_raw_body_before_sending(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    no_contact_rate_limit: None,
+) -> None:
+    job = await _seed_easyweek_happy_path(db)
+    await _run_job(db, job)
+    original = (await _outbox_rows(db, job))[0]
+    await _deliver_failed_status(db, original.provider_message_id, dedupe="wa:body-contract-retry")
+    retry = (await _retry_jobs_for(db, original.id))[0]
+
+    row = (
+        await db.execute(
+            select(MessageTemplate)
+            .where(MessageTemplate.provider == PROVIDER_EASYWEEK)
+            .where(MessageTemplate.company_id == COLLIDING_COMPANY_ID)
+            .where(MessageTemplate.code == "record_created")
+        )
+    ).scalar_one()
+    wrong = branch_template_contract(BRANCH_PROFILES["rastatt"], "record_created")
+    assert wrong is not None
+    row.body = wrong.raw_body
+    retry.run_at = datetime.now(timezone.utc)
+    await db.flush()
+    capture.template_calls.clear()
+    capture.text_calls.clear()
+
+    await _run_job(db, retry)
+
+    assert retry.status == "failed"
+    assert "body mismatch" in (retry.last_error or "")
+    assert capture.template_calls == []
+    assert capture.text_calls == []
+    assert await _outbox_rows(db, retry) == []

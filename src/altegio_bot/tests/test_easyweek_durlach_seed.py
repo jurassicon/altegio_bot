@@ -20,7 +20,7 @@ import pytest_asyncio
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from altegio_bot.easyweek_branches import BRANCH_PROFILES
+from altegio_bot.easyweek_branches import BRANCH_PROFILES, branch_template_contract
 from altegio_bot.easyweek_locations import configured_easyweek_locations
 from altegio_bot.easyweek_policy import (
     RECORD_CANCELED,
@@ -145,7 +145,10 @@ async def test_the_seed_writes_exactly_the_four_phase_one_templates(db: AsyncSes
         assert row.company_id == DURLACH_LOCATION_ID
         assert row.language == "de"
         assert row.is_active is True
-        assert row.meta_template_name == seed_script.meta_template_name("du", row.code)
+        contract = branch_template_contract(BRANCH_PROFILES["durlach"], row.code)
+        assert contract is not None
+        assert row.meta_template_name == contract.meta_template_name
+        assert row.body == contract.raw_body
         assert row.meta_template_name.startswith("kitilash_du_")
 
 
@@ -259,7 +262,10 @@ async def test_the_seed_reactivates_a_row_an_operator_disabled(db: AsyncSession)
 
     refreshed = await _easyweek_templates(db)
     assert all(r.is_active for r in refreshed)
-    assert refreshed[0].meta_template_name == seed_script.meta_template_name("du", refreshed[0].code)
+    contract = branch_template_contract(BRANCH_PROFILES["durlach"], refreshed[0].code)
+    assert contract is not None
+    assert refreshed[0].meta_template_name == contract.meta_template_name
+    assert refreshed[0].body == contract.raw_body
 
 
 # ---------------------------------------------------------------------------
@@ -500,7 +506,9 @@ async def test_the_seeded_rows_render_end_to_end(db: AsyncSession, code: str) ->
 
     assert language == "de"
     assert sender_id is not None
-    assert ctx["meta_template_name"] == seed_script.meta_template_name("du", code)
+    contract = branch_template_contract(BRANCH_PROFILES["durlach"], code)
+    assert contract is not None
+    assert ctx["meta_template_name"] == contract.meta_template_name
 
     rendered = body.format(**ctx)
     assert "{" not in rendered, "every placeholder in the seeded body must exist in ctx"
@@ -791,8 +799,9 @@ async def test_the_new_client_body_renders_with_no_missing_placeholders(db: Asyn
 
 async def test_the_new_client_body_matches_the_shared_notes_constant(db: AsyncSession) -> None:
     """The Meta template was cloned from the Karlsruhe one; the text must not drift."""
-    content = BRANCH_PROFILES["durlach"].content
-    assert ow.PRE_APPOINTMENT_NOTES_DE in seed_script.template_bodies(content)[RECORD_CREATED_NEW_CLIENT]
+    contract = branch_template_contract(BRANCH_PROFILES["durlach"], RECORD_CREATED_NEW_CLIENT)
+    assert contract is not None
+    assert ow.PRE_APPOINTMENT_NOTES_DE in contract.raw_body
 
 
 async def test_a_missing_new_client_row_falls_back_instead_of_failing(db: AsyncSession) -> None:

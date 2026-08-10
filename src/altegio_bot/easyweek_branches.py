@@ -51,6 +51,17 @@ BRANCH_TEMPLATE_CODES: Final = (
     RECORD_CANCELED,
 )
 
+PRE_APPOINTMENT_NOTES_DE: Final = (
+    "\n\nWichtige Hinweise vor dem Termin:\n"
+    "• Bitte pünktlich kommen — ab 15 Min. Verspätung können wir "
+    "nicht garantieren, dass der Termin stattfindet.\n"
+    "• Wimpern bitte sauber: ohne Mascara, ohne geklebte Wimpern.\n"
+    "• Falls Sie schon eine Kundenkarte haben, bitte mitbringen.\n"
+    "• Auffüllen: ab 3. Woche 60 €, ab 4. Woche 70 €, ab 5. Woche "
+    "keine Auffüllung (Neuauflage).\n"
+    "• Zahlung: bar oder mit Karte.\n"
+)
+
 _WHITESPACE_RE = re.compile(r"\s+")
 
 
@@ -79,6 +90,16 @@ class BranchProfile:
     api_name: str
     meta_template_prefix: str
     content: BranchContent
+
+
+@dataclass(frozen=True)
+class BranchTemplateContract:
+    """Canonical source-owned row expected for one branch and selected code."""
+
+    profile: BranchProfile
+    template_code: str
+    meta_template_name: str
+    raw_body: str
 
 
 # Public storefront content only. Numeric EasyWeek ids and UUIDs deliberately
@@ -136,35 +157,97 @@ def meta_template_name(prefix: str, code: str) -> str:
     return f"kitilash_{prefix}_{code}_v1"
 
 
-def branch_template_name_error(
+def _footer(content: BranchContent) -> str:
+    return (
+        f"\n\n{content.brand_line}\n"
+        f"{content.address_line}\n"
+        f"☎ {content.contact_phone}\n\n"
+        f"{content.maps_line}\n"
+        f"{content.instagram_line}"
+    )
+
+
+def branch_template_contract(profile: BranchProfile, template_code: str) -> BranchTemplateContract | None:
+    """Bind a trusted profile to its approved Meta name and canonical DB body."""
+    if template_code not in BRANCH_TEMPLATE_CODES:
+        return None
+
+    footer = _footer(profile.content)
+    created = (
+        "*{client_name}, hallo! Ihre Terminbuchung wurde bestätigt:*\n\n"
+        "*Mitarbeiterin:* {staff_name}\n"
+        "*Datum:* {date}\n"
+        "*Zeit:* {time}\n"
+        "*Service:*\n"
+        "{services}\n"
+        "*Summe:* {total_cost}€\n\n"
+        "Termin verwalten: {booking_link}"
+    )
+    bodies = {
+        RECORD_CREATED: f"{created}{footer}",
+        RECORD_CREATED_NEW_CLIENT: f"{created}{PRE_APPOINTMENT_NOTES_DE}{footer}",
+        RECORD_UPDATED: (
+            "*{client_name}, hallo! Ihr Termin wurde geändert:*\n\n"
+            "*Mitarbeiterin:* {staff_name}\n"
+            "*Neues Datum:* {date}\n"
+            "*Neue Zeit:* {time}\n"
+            "*Service:*\n"
+            "{services}\n"
+            "*Summe:* {total_cost}€\n\n"
+            f"Termin verwalten: {{booking_link}}{footer}"
+        ),
+        RECORD_CANCELED: (
+            "*{client_name}, hallo!*\n\n"
+            "Ihr Termin am {date} um {time} Uhr wurde storniert.\n"
+            "{services}\n\n"
+            f"Neuen Termin buchen: {{booking_link}}{footer}"
+        ),
+    }
+    return BranchTemplateContract(
+        profile=profile,
+        template_code=template_code,
+        meta_template_name=meta_template_name(profile.meta_template_prefix, template_code),
+        raw_body=bodies[template_code],
+    )
+
+
+def branch_template_contract_error(
     *,
     profile: BranchProfile,
     template_code: str,
     resolved_name: object,
+    resolved_body: object,
 ) -> str | None:
-    """Fail-closed check that a DB template row belongs to this branch.
+    """Fail closed unless a DB row exactly matches its source-owned contract.
 
     DB-first resolution is preserved: the name still comes from
-    ``message_templates.meta_template_name``. This only proves the row that was
-    selected is the row this branch may send — a ``du_*`` name resolved for a
-    Rastatt job means the seed or the registry is crossed, and sending it would
-    put Durlach's address in front of a Rastatt customer.
+    ``message_templates.meta_template_name`` and the raw body still comes from
+    ``message_templates.body``. The source contract proves that both values
+    belong to the selected branch and code before either can reach a provider.
 
     ``record_created_new_client`` is validated as its own selected code, because
     it is a genuinely different approved template, not a variant of
     ``record_created``.
 
-    The message names the branch and the code only — never the message body.
+    Errors name only the branch, code and failed field. They never echo either
+    DB value, so a corrupted body cannot leak customer data into logs.
     """
+    contract = branch_template_contract(profile, template_code)
+    if contract is None:
+        return f"EasyWeek template contract violation: branch={profile.slug} code={template_code} unsupported code"
     if not isinstance(resolved_name, str) or not resolved_name.strip():
-        return f"EasyWeek template has no meta_template_name for branch {profile.slug} code {template_code}"
-
-    name = resolved_name.strip()
-
-    expected = meta_template_name(profile.meta_template_prefix, template_code)
-    if name != expected:
+        return (
+            f"EasyWeek template contract violation: branch={profile.slug} "
+            f"code={template_code} meta_template_name missing"
+        )
+    if resolved_name.strip() != contract.meta_template_name:
         return (
             f"EasyWeek template does not belong to the selected code and branch {profile.slug}: "
-            f"expected {expected} for code {template_code}, resolved {name}"
+            f"code={template_code} meta_template_name mismatch"
+        )
+    if not isinstance(resolved_body, str) or resolved_body != contract.raw_body:
+        return (
+            f"EasyWeek template does not belong to the selected code and branch {profile.slug}: "
+            f"code={template_code} body mismatch"
         )
     return None

@@ -363,8 +363,42 @@ ORDER BY company_id;
 
 Ожидается по строке на филиал: `templates = 4`, `active = 4`,
 `distinct_prefixes = 1`, а `prefix` совпадает с профилем этого `company_id`.
-`distinct_prefixes > 1` означает cross-branch загрязнение — прогоните сид ещё
-раз, он идемпотентно перезапишет строки.
+
+**STOP:** любое другое значение (`templates != 4`, `active != 4`,
+`distinct_prefixes != 1` или чужой `prefix`) блокирует rollout. Повторный запуск
+сида не считается исправлением: при дубликатах он обновляет только строку с
+минимальным `id`, а лишние строки намеренно не удаляет. Ничего не отправляйте и
+не включайте notifications, пока оператор вручную не установит причину и не
+согласует восстановление данных.
+
+Read-only проверка дубликатов по фактическому ключу lookup:
+
+```sql
+SELECT candidate.id,
+       candidate.company_id,
+       candidate.code,
+       candidate.language,
+       candidate.meta_template_name AS name,
+       candidate.is_active          AS active
+FROM message_templates AS candidate
+WHERE provider = 'easyweek'
+  AND EXISTS (
+      SELECT 1
+      FROM message_templates AS duplicate
+      WHERE duplicate.provider = candidate.provider
+        AND duplicate.company_id = candidate.company_id
+        AND duplicate.code = candidate.code
+        AND duplicate.language = candidate.language
+        AND duplicate.id <> candidate.id
+  )
+ORDER BY company_id, code, language, id;
+```
+
+Ожидается **0 строк**. Любая строка — **STOP** и ручной разбор. Не выполняйте
+`DELETE`, не пытайтесь «починить» данные повторным сидом и не выбирайте строку
+для удаления на глаз: в PR-7 нет ни unique constraint, ни автоматической
+destructive cleanup. Исправление дубликатов — отдельная контролируемая
+операторская процедура после проверки содержимого и истории строк.
 
 Футер не должен пересекаться между филиалами:
 
@@ -379,6 +413,8 @@ ORDER BY company_id;
 ```
 
 У Durlach ожидается `mentions_rastatt = 0`, у Rastatt — `mentions_durlach = 0`.
+Любое cross-branch упоминание — **STOP**; повторный сид не доказывает, что
+дубликат, который worker выбирает по минимальному `id`, устранён.
 
 ```sql
 SELECT provider, company_id, sender_code, phone_number_id, is_active
