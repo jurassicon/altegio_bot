@@ -52,6 +52,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
 from ..db import SessionLocal
+from ..easyweek_locations import configured_easyweek_locations
 from ..easyweek_normalizer import (
     CREATE,
     DELETE,
@@ -144,12 +145,11 @@ def loop_backoff_delay(failures: int, base_sec: float) -> float:
 def processing_is_configured() -> bool:
     """True when this worker is allowed to claim events at all.
 
-    Processing enabled but no location configured is treated as NOT configured:
-    without the numeric location id the worker cannot tell its own location from
-    a foreign one, and guessing would be exactly the cross-location leak the
-    plan forbids.
+    Processing enabled with an empty OR invalid registry is not configured. In
+    particular, malformed JSON must not degrade into an empty ownership set and
+    make every captured event look like ordinary foreign traffic.
     """
-    return bool(settings.easyweek_processing_enabled) and int(settings.easyweek_location_id or 0) > 0
+    return bool(settings.easyweek_processing_enabled) and configured_easyweek_locations().ready
 
 
 # Statuses that are NOT terminal: a row in one of these still owes the domain
@@ -812,11 +812,12 @@ async def process_claimed_event(session: AsyncSession, event: EasyWeekEvent) -> 
     event_hint = event.event_hint
     payload_hash = event.payload_hash
 
+    registry = configured_easyweek_locations()
     booking = normalize_event(
         event_hint=event_hint,
         payload=event.payload,
         body_truncated=bool(event.body_truncated),
-        expected_location_id=int(settings.easyweek_location_id or 0),
+        location_registry=registry.locations if registry.ready else {},
     )
 
     if booking is None:
@@ -1034,9 +1035,9 @@ async def run_loop(
             if not announced_disabled:
                 logger.info(
                     "EasyWeek processing is disabled or unconfigured; not claiming events. "
-                    "processing_enabled=%s location_configured=%s",
+                    "processing_enabled=%s location_registry_ready=%s",
                     bool(settings.easyweek_processing_enabled),
-                    int(settings.easyweek_location_id or 0) > 0,
+                    configured_easyweek_locations().ready,
                 )
                 announced_disabled = True
             await _sleep_unless_stopping(effective_poll_sec, stop_event)

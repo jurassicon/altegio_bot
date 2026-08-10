@@ -25,6 +25,7 @@ cross-tenant leak waiting for the two spaces to overlap.
 
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -75,6 +76,7 @@ from altegio_bot.providers.base import WhatsAppProvider
 from altegio_bot.settings import settings
 from altegio_bot.tests.easyweek_fixtures import (
     TEST_LOCATION_ID,
+    TEST_LOCATION_UUID,
     booking_canceled,
     booking_created,
     booking_rescheduled,
@@ -133,10 +135,43 @@ def _pr5_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "whatsapp_send_mode", "template", raising=False)
     monkeypatch.setattr(settings, "bot_template_text_inside_24h_enabled", False, raising=False)
     monkeypatch.setattr(settings, "meta_circuit_breaker_enabled", False, raising=False)
-    monkeypatch.setattr(settings, "easyweek_booking_page_url", STATIC_BOOKING_PAGE, raising=False)
+    monkeypatch.setattr(
+        settings,
+        "easyweek_location_map",
+        json.dumps(
+            {
+                "colliding": {
+                    "location_id": COLLIDING_COMPANY_ID,
+                    "location_uuid": "cccccccc-dddd-4eee-8fff-000000000001",
+                    "meta_template_prefix": "cc",
+                    "booking_page_url": STATIC_BOOKING_PAGE,
+                },
+                "other": {
+                    "location_id": OTHER_EASYWEEK_COMPANY_ID,
+                    "location_uuid": "cccccccc-dddd-4eee-8fff-000000000002",
+                    "meta_template_prefix": "ot",
+                    "booking_page_url": STATIC_BOOKING_PAGE,
+                },
+                "fixture": {
+                    "location_id": TEST_LOCATION_ID,
+                    "location_uuid": TEST_LOCATION_UUID,
+                    "meta_template_prefix": "fx",
+                    "booking_page_url": STATIC_BOOKING_PAGE,
+                },
+            }
+        ),
+        raising=False,
+    )
     monkeypatch.setattr(settings, "easyweek_booking_page_allowed_hosts", BOOKING_PAGE_ALLOWED_HOSTS, raising=False)
     monkeypatch.setattr(settings, "easyweek_default_language", "de", raising=False)
     monkeypatch.setattr(settings, "easyweek_notifications_enabled", False, raising=False)
+
+
+def _set_booking_page(monkeypatch: pytest.MonkeyPatch, value: str, *, company_id: int = COLLIDING_COMPANY_ID) -> None:
+    location_map = json.loads(settings.easyweek_location_map)
+    entry = next(entry for entry in location_map.values() if entry["location_id"] == company_id)
+    entry["booking_page_url"] = value
+    monkeypatch.setattr(settings, "easyweek_location_map", json.dumps(location_map), raising=False)
 
 
 class CaptureProvider:
@@ -239,6 +274,7 @@ async def _seed_easyweek_record(
     services: tuple[tuple[int, str | None, str | None], ...] = ((11, "Wimpernverlängerung", "60.00"),),
     total_cost: str | None = _UNSET,
     provider: str = PROVIDER_EASYWEEK,
+    booking_uuid: uuid.UUID = uuid.UUID("11111111-2222-4333-8444-555555555555"),
 ) -> Record:
     """Seed a record whose snapshot obeys PR-4's price invariant by default.
 
@@ -257,9 +293,7 @@ async def _seed_easyweek_record(
         provider=provider,
         company_id=company_id,
         altegio_record_id=4200001,
-        easyweek_booking_uuid=(
-            uuid.UUID("11111111-2222-4333-8444-555555555555") if provider == PROVIDER_EASYWEEK else None
-        ),
+        easyweek_booking_uuid=booking_uuid if provider == PROVIDER_EASYWEEK else None,
         easyweek_booking_hash_id=booking_hash_id,
         client_id=client.id,
         staff_name="Tanja",
@@ -325,6 +359,7 @@ async def _outbox_rows(db: AsyncSession, job: MessageJob) -> list[OutboxMessage]
 async def _seed_easyweek_happy_path(
     db: AsyncSession,
     *,
+    company_id: int = COLLIDING_COMPANY_ID,
     job_type: str = "record_created",
     meta_template_name: str | None = EASYWEEK_CREATED_TEMPLATE,
     short_link: str | None = VERIFIED_PAGE,
@@ -335,19 +370,25 @@ async def _seed_easyweek_happy_path(
     with_sender: bool = True,
 ) -> MessageJob:
     """Everything an EasyWeek lifecycle job needs to reach the provider."""
-    client = await _seed_easyweek_client(db)
+    client = await _seed_easyweek_client(db, company_id=company_id)
     record = await _seed_easyweek_record(
         db,
         client,
+        company_id=company_id,
         short_link=short_link,
         booking_hash_id=booking_hash_id,
         services=services,
         total_cost=total_cost,
+        booking_uuid=(
+            uuid.UUID("11111111-2222-4333-8444-555555555555")
+            if company_id == COLLIDING_COMPANY_ID
+            else uuid.UUID("11111111-2222-4333-8444-555555555556")
+        ),
     )
     db.add(
         _template(
             provider=PROVIDER_EASYWEEK,
-            company_id=COLLIDING_COMPANY_ID,
+            company_id=company_id,
             code=job_type,
             language=language,
             meta_template_name=meta_template_name,
@@ -357,7 +398,7 @@ async def _seed_easyweek_happy_path(
         db.add(
             _sender(
                 provider=PROVIDER_EASYWEEK,
-                company_id=COLLIDING_COMPANY_ID,
+                company_id=company_id,
                 phone_number_id="eyw-phone-id",
             )
         )
@@ -365,11 +406,11 @@ async def _seed_easyweek_happy_path(
     return await _seed_job(
         db,
         provider=PROVIDER_EASYWEEK,
-        company_id=COLLIDING_COMPANY_ID,
+        company_id=company_id,
         job_type=job_type,
         record=record,
         client=client,
-        dedupe_key=f"eyw-{job_type}-1",
+        dedupe_key=f"eyw-{company_id}-{job_type}-1",
     )
 
 
@@ -1111,12 +1152,56 @@ async def test_canceled_ignores_even_a_verified_link(
     assert VERIFIED_PAGE not in params
 
 
+async def test_canceled_uses_the_static_page_of_its_own_location(
+    db: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    other_page = "https://example.invalid/other-branch"
+    _set_booking_page(monkeypatch, other_page, company_id=OTHER_EASYWEEK_COMPANY_ID)
+    first = await _seed_easyweek_happy_path(
+        db,
+        company_id=COLLIDING_COMPANY_ID,
+        job_type="record_canceled",
+        meta_template_name=EASYWEEK_CANCELED_TEMPLATE,
+    )
+    second = await _seed_easyweek_happy_path(
+        db,
+        company_id=OTHER_EASYWEEK_COMPANY_ID,
+        job_type="record_canceled",
+        meta_template_name="other_branch_canceled_v1",
+    )
+
+    first_record = await db.get(Record, first.record_id)
+    first_client = await db.get(Client, first.client_id)
+    second_record = await db.get(Record, second.record_id)
+    second_client = await db.get(Client, second.client_id)
+    _body, _sender, _language, first_ctx = await ow._render_message(
+        db,
+        company_id=COLLIDING_COMPANY_ID,
+        template_code="record_canceled",
+        record=first_record,
+        client=first_client,
+        provider=PROVIDER_EASYWEEK,
+    )
+    _body, _sender, _language, second_ctx = await ow._render_message(
+        db,
+        company_id=OTHER_EASYWEEK_COMPANY_ID,
+        template_code="record_canceled",
+        record=second_record,
+        client=second_client,
+        provider=PROVIDER_EASYWEEK,
+    )
+
+    assert first_ctx["booking_link"] == STATIC_BOOKING_PAGE
+    assert second_ctx["booking_link"] == other_page
+
+
 async def test_no_safe_link_and_no_static_page_fails_locally(
     db: AsyncSession,
     capture: CaptureProvider,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(settings, "easyweek_booking_page_url", "", raising=False)
+    _set_booking_page(monkeypatch, "")
     job = await _seed_easyweek_happy_path(db, short_link=None)
 
     await _run_job(db, job)
@@ -1132,7 +1217,7 @@ async def test_canceled_without_static_page_fails_locally(
     capture: CaptureProvider,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(settings, "easyweek_booking_page_url", "   ", raising=False)
+    _set_booking_page(monkeypatch, "   ")
     job = await _seed_easyweek_happy_path(
         db,
         job_type="record_canceled",
@@ -1153,14 +1238,19 @@ async def test_easyweek_effective_link_helper_is_the_single_gate() -> None:
         short_link = VERIFIED_PAGE
         easyweek_booking_hash_id = BOOKING_HASH
 
-    assert ow.easyweek_effective_booking_link(_Rec(), "record_created") == VERIFIED_PAGE  # type: ignore[arg-type]
-    assert ow.easyweek_effective_booking_link(_Rec(), "record_updated") == VERIFIED_PAGE  # type: ignore[arg-type]
     assert (
-        ow.easyweek_effective_booking_link(_Rec(), "record_canceled")  # type: ignore[arg-type]
-        == (settings.easyweek_booking_page_url or "").strip()
+        ow.easyweek_effective_booking_link(_Rec(), "record_created", company_id=COLLIDING_COMPANY_ID) == VERIFIED_PAGE
+    )  # type: ignore[arg-type]
+    assert (
+        ow.easyweek_effective_booking_link(_Rec(), "record_updated", company_id=COLLIDING_COMPANY_ID) == VERIFIED_PAGE
+    )  # type: ignore[arg-type]
+    assert (
+        ow.easyweek_effective_booking_link(_Rec(), "record_canceled", company_id=COLLIDING_COMPANY_ID)
+        == STATIC_BOOKING_PAGE
     )
     assert (
-        ow.easyweek_effective_booking_link(None, "record_created") == (settings.easyweek_booking_page_url or "").strip()
+        ow.easyweek_effective_booking_link(None, "record_created", company_id=COLLIDING_COMPANY_ID)
+        == STATIC_BOOKING_PAGE
     )
 
 
@@ -2081,7 +2171,7 @@ async def test_invalid_static_page_fails_canceled_locally(
     bad_static: str,
 ) -> None:
     """``record_canceled`` has no other link, so an unusable static page is fatal."""
-    monkeypatch.setattr(settings, "easyweek_booking_page_url", bad_static, raising=False)
+    _set_booking_page(monkeypatch, bad_static)
     job = await _seed_easyweek_happy_path(
         db,
         job_type="record_canceled",
@@ -2102,7 +2192,7 @@ async def test_invalid_static_page_fails_created_when_manage_link_is_unusable(
     capture: CaptureProvider,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(settings, "easyweek_booking_page_url", "http://book.example.com/x", raising=False)
+    _set_booking_page(monkeypatch, "http://book.example.com/x")
     job = await _seed_easyweek_happy_path(db, short_link=None)
 
     await _run_job(db, job)
@@ -2118,7 +2208,7 @@ async def test_a_valid_manage_link_survives_an_invalid_static_page(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The static page is a fallback, not a filter — a verified link still wins."""
-    monkeypatch.setattr(settings, "easyweek_booking_page_url", "javascript:alert(1)", raising=False)
+    _set_booking_page(monkeypatch, "javascript:alert(1)")
     job = await _seed_easyweek_happy_path(db)
 
     params = await _run_and_get_params(db, capture, job)
@@ -2915,7 +3005,6 @@ async def easyweek_inbox(
     monkeypatch.setattr(eyw_worker, "SessionLocal", session_maker, raising=False)
     monkeypatch.setattr(settings, "easyweek_processing_enabled", True, raising=False)
     monkeypatch.setattr(settings, "easyweek_notifications_enabled", True, raising=False)
-    monkeypatch.setattr(settings, "easyweek_location_id", TEST_LOCATION_ID, raising=False)
     return session_maker
 
 

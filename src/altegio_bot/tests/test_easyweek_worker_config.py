@@ -11,6 +11,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import inspect
+import json
 import math
 from pathlib import Path
 
@@ -49,8 +50,8 @@ def test_every_easyweek_gate_defaults_to_off(field: str) -> None:
     assert Settings.model_fields[field].default is False
 
 
-def test_location_id_defaults_to_unset() -> None:
-    assert Settings.model_fields["easyweek_location_id"].default == 0
+def test_location_registry_defaults_to_unset() -> None:
+    assert Settings.model_fields["easyweek_location_map"].default == "{}"
 
 
 def test_processing_is_a_separate_field_from_capture() -> None:
@@ -75,24 +76,32 @@ def test_worker_reads_only_the_processing_gate_not_the_capture_gate() -> None:
 
 
 @pytest.mark.parametrize(
-    ("processing", "location", "expected"),
+    ("processing", "location_map", "expected"),
     [
-        (True, 305156, True),
-        (True, 0, False),
-        (True, -1, False),
-        (False, 305156, False),
-        (False, 0, False),
+        (
+            True,
+            '{"test":{"location_id":999001,"location_uuid":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee","meta_template_prefix":"tt","booking_page_url":"https://booking.example.invalid/test"}}',
+            True,
+        ),
+        (True, "{}", False),
+        (True, "{not json", False),
+        (
+            False,
+            '{"test":{"location_id":999001,"location_uuid":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee","meta_template_prefix":"tt","booking_page_url":"https://booking.example.invalid/test"}}',
+            False,
+        ),
+        (False, "{}", False),
     ],
 )
-def test_processing_requires_both_the_flag_and_a_location(
-    monkeypatch: pytest.MonkeyPatch, processing: bool, location: int, expected: bool
+def test_processing_requires_both_the_flag_and_a_valid_registry(
+    monkeypatch: pytest.MonkeyPatch, processing: bool, location_map: str, expected: bool
 ) -> None:
     """A configured location is as mandatory as the flag itself.
 
     Without it the worker could not tell its own location from a foreign one.
     """
     monkeypatch.setattr(settings, "easyweek_processing_enabled", processing, raising=False)
-    monkeypatch.setattr(settings, "easyweek_location_id", location, raising=False)
+    monkeypatch.setattr(settings, "easyweek_location_map", location_map, raising=False)
     assert worker.processing_is_configured() is expected
 
 
@@ -103,12 +112,14 @@ def test_disabling_processing_does_not_disable_capture(monkeypatch: pytest.Monke
     assert worker.processing_is_configured() is False
 
 
-def test_the_production_location_id_is_not_hardcoded_in_python() -> None:
-    """305156 belongs in easyweek.env, never in the package."""
+def test_production_location_identities_are_not_hardcoded_in_python() -> None:
+    forbidden = ("305156", "308697", "315607", "b9d689f2", "cd91816d")
     for path in (_REPO_ROOT / "src" / "altegio_bot").rglob("*.py"):
         if "tests" in path.parts:
             continue
-        assert "305156" not in path.read_text(), f"production location id hardcoded in {path}"
+        source = path.read_text()
+        for value in forbidden:
+            assert value not in source, f"production location identity hardcoded in {path}"
 
 
 # ===========================================================================
@@ -121,7 +132,7 @@ def test_env_example_documents_every_new_flag() -> None:
     for key in (
         "EASYWEEK_PROCESSING_ENABLED",
         "EASYWEEK_NOTIFICATIONS_ENABLED",
-        "EASYWEEK_LOCATION_ID",
+        "EASYWEEK_LOCATION_MAP",
     ):
         assert key in text, f"{key} is undocumented in easyweek.env.example"
 
@@ -130,20 +141,23 @@ def test_env_example_ships_fail_closed_values() -> None:
     text = ENV_EXAMPLE.read_text()
     assert "EASYWEEK_PROCESSING_ENABLED=false" in text
     assert "EASYWEEK_NOTIFICATIONS_ENABLED=false" in text
-    assert "EASYWEEK_LOCATION_ID=0" in text
+    assert "EASYWEEK_LOCATION_MAP={}" in text
+    assert "EASYWEEK_LOCATION_ID" not in text
+    assert "EASYWEEK_LOCATION_UUID" not in text
+    assert "EASYWEEK_BOOKING_PAGE_URL" not in text
 
 
 def test_env_example_carries_no_real_secrets_or_production_values() -> None:
     text = ENV_EXAMPLE.read_text()
-    assert "305156" not in text, "the real location id must not be committed"
-    assert "a02a61bf" not in text, "the real location uuid must not be committed"
+    for value in ("305156", "308697", "315607", "a02a61bf", "b9d689f2", "cd91816d"):
+        assert value not in text, "a real location identity must not be committed"
 
     assignments = {
         line.split("=", 1)[0]: line.split("=", 1)[1]
         for line in text.splitlines()
         if "=" in line and not line.lstrip().startswith("#")
     }
-    for key in ("EASYWEEK_WEBHOOK_SECRET", "EASYWEEK_API_KEY", "EASYWEEK_WORKSPACE_SLUG", "EASYWEEK_LOCATION_UUID"):
+    for key in ("EASYWEEK_WEBHOOK_SECRET", "EASYWEEK_API_KEY", "EASYWEEK_WORKSPACE_SLUG"):
         assert key in assignments, f"{key} is missing from easyweek.env.example"
         assert assignments[key] == "", f"{key} must ship empty, got {assignments[key]!r}"
 
@@ -175,7 +189,7 @@ def test_worker_reads_env_and_optional_easyweek_env() -> None:
 def test_outbox_worker_reads_env_and_optional_easyweek_env() -> None:
     """The outbox worker renders EasyWeek jobs, so it needs easyweek.env too.
 
-    ``settings.easyweek_booking_page_url`` and ``settings.easyweek_default_language``
+    ``settings.easyweek_location_map`` and ``settings.easyweek_default_language``
     are read inside ``outbox_worker``. Those live in ``easyweek.env``, which is
     deliberately NOT copied into the image, so without this entry the worker
     would silently fall back to ``""`` — an empty booking page — and fail every
@@ -244,6 +258,24 @@ async def _run_briefly(stop_after: float = 0.15, **kwargs) -> None:
     await asyncio.wait_for(task, timeout=2.0)
 
 
+def _set_ready_registry(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        settings,
+        "easyweek_location_map",
+        json.dumps(
+            {
+                "test": {
+                    "location_id": 999001,
+                    "location_uuid": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+                    "meta_template_prefix": "tt",
+                    "booking_page_url": "https://booking.example.invalid/test",
+                }
+            }
+        ),
+        raising=False,
+    )
+
+
 @pytest.mark.asyncio
 async def test_disabled_worker_never_claims_and_never_busy_loops(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
@@ -284,7 +316,7 @@ async def test_worker_stops_promptly_on_the_stop_event(monkeypatch: pytest.Monke
 async def test_stop_is_checked_before_claiming_not_mid_transaction(monkeypatch: pytest.MonkeyPatch) -> None:
     """A claim already in flight is always finished."""
     monkeypatch.setattr(settings, "easyweek_processing_enabled", True, raising=False)
-    monkeypatch.setattr(settings, "easyweek_location_id", 999001, raising=False)
+    _set_ready_registry(monkeypatch)
 
     stop_event = asyncio.Event()
     started = asyncio.Event()
@@ -345,7 +377,7 @@ async def test_unexpected_error_logs_no_pii_and_no_traceback(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     monkeypatch.setattr(settings, "easyweek_processing_enabled", True, raising=False)
-    monkeypatch.setattr(settings, "easyweek_location_id", 999001, raising=False)
+    _set_ready_registry(monkeypatch)
 
     calls = {"n": 0}
 
@@ -380,7 +412,7 @@ async def test_unexpected_error_logs_no_pii_and_no_traceback(
 async def test_worker_survives_a_failing_cycle_and_keeps_going(monkeypatch: pytest.MonkeyPatch) -> None:
     """One poisoned row must not kill the process or wedge the backlog."""
     monkeypatch.setattr(settings, "easyweek_processing_enabled", True, raising=False)
-    monkeypatch.setattr(settings, "easyweek_location_id", 999001, raising=False)
+    _set_ready_registry(monkeypatch)
 
     attempts = {"n": 0}
 
@@ -407,7 +439,7 @@ async def test_worker_survives_a_failing_cycle_and_keeps_going(monkeypatch: pyte
 async def test_transient_errors_back_off_instead_of_hot_looping(monkeypatch: pytest.MonkeyPatch) -> None:
     """A permanently failing row must not spin the loop at full speed."""
     monkeypatch.setattr(settings, "easyweek_processing_enabled", True, raising=False)
-    monkeypatch.setattr(settings, "easyweek_location_id", 999001, raising=False)
+    _set_ready_registry(monkeypatch)
 
     attempts = {"n": 0}
 
@@ -431,7 +463,7 @@ async def test_transient_errors_back_off_instead_of_hot_looping(monkeypatch: pyt
 async def test_shutdown_signals_are_never_swallowed(monkeypatch: pytest.MonkeyPatch) -> None:
     """`except Exception` must not catch CancelledError or SystemExit."""
     monkeypatch.setattr(settings, "easyweek_processing_enabled", True, raising=False)
-    monkeypatch.setattr(settings, "easyweek_location_id", 999001, raising=False)
+    _set_ready_registry(monkeypatch)
 
     async def _system_exit() -> bool:
         raise SystemExit(3)

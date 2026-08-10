@@ -8,6 +8,7 @@ the guarantee that none of it disturbs the Altegio path.
 from __future__ import annotations
 
 import asyncio
+import json
 import math
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -31,6 +32,7 @@ from altegio_bot.tests.easyweek_fixtures import (
     TEST_BOOKING_UUID,
     TEST_CUSTOMER_ID,
     TEST_LOCATION_ID,
+    TEST_LOCATION_UUID,
     booking_canceled,
     booking_created,
     booking_created_multi_service,
@@ -48,7 +50,21 @@ def _enable_processing(monkeypatch: pytest.MonkeyPatch) -> None:
     """Processing on, notifications OFF — the production default for PR-4."""
     monkeypatch.setattr(settings, "easyweek_processing_enabled", True, raising=False)
     monkeypatch.setattr(settings, "easyweek_notifications_enabled", False, raising=False)
-    monkeypatch.setattr(settings, "easyweek_location_id", TEST_LOCATION_ID, raising=False)
+    monkeypatch.setattr(
+        settings,
+        "easyweek_location_map",
+        json.dumps(
+            {
+                "test-branch": {
+                    "location_id": TEST_LOCATION_ID,
+                    "location_uuid": TEST_LOCATION_UUID,
+                    "meta_template_prefix": "tb",
+                    "booking_page_url": "https://booking.example.invalid/test",
+                }
+            }
+        ),
+        raising=False,
+    )
 
 
 @pytest_asyncio.fixture
@@ -279,9 +295,9 @@ async def test_processing_disabled_claims_nothing(bound_session_local, monkeypat
         assert status == "captured", "a disabled worker must leave the backlog untouched"
 
 
-@pytest.mark.parametrize("location", [0, -5])
-async def test_unconfigured_location_claims_nothing(bound_session_local, monkeypatch, location: int) -> None:
-    monkeypatch.setattr(settings, "easyweek_location_id", location, raising=False)
+@pytest.mark.parametrize("location_map", ["{}", "", "{not json"])
+async def test_unconfigured_location_claims_nothing(bound_session_local, monkeypatch, location_map: str) -> None:
+    monkeypatch.setattr(settings, "easyweek_location_map", location_map, raising=False)
     assert worker.processing_is_configured() is False
 
 
@@ -295,6 +311,46 @@ async def test_notifications_disabled_creates_zero_jobs(bound_session_local) -> 
         records, clients, jobs = await _counts(session)
         assert records == 1 and clients == 1
         assert jobs == 0, "notifications=false must not fill the queue"
+
+
+async def test_two_registry_locations_write_their_own_company_ids(bound_session_local, monkeypatch) -> None:
+    second_id = 999002
+    second_uuid = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff"
+    location_map = json.loads(settings.easyweek_location_map)
+    location_map["second-branch"] = {
+        "location_id": second_id,
+        "location_uuid": second_uuid,
+        "meta_template_prefix": "sb",
+        "booking_page_url": "https://booking.example.invalid/second",
+    }
+    monkeypatch.setattr(settings, "easyweek_location_map", json.dumps(location_map), raising=False)
+
+    first = booking_created()
+    second = booking_created()
+    second.update(
+        {
+            "location_id": second_id,
+            "location_uuid": second_uuid,
+            "uid": "22222222-3333-4444-8555-666666666666",
+            "id": TEST_BOOKING_ID + 1,
+            "customer_id": TEST_CUSTOMER_ID + 1,
+            "service_id": 5100004,
+        }
+    )
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, first, payload_hash="location-a")
+            await _capture(session, second, payload_hash="location-b")
+
+    assert await _run_until_idle() == 2
+    async with bound_session_local() as session:
+        record_companies = set(
+            (await session.execute(select(Record.company_id).where(Record.provider == "easyweek"))).scalars().all()
+        )
+        client_companies = set(
+            (await session.execute(select(Client.company_id).where(Client.provider == "easyweek"))).scalars().all()
+        )
+        assert record_companies == client_companies == {TEST_LOCATION_ID, second_id}
 
 
 async def test_notifications_enabled_creates_only_lifecycle_types(bound_session_local, monkeypatch) -> None:
@@ -343,6 +399,11 @@ async def test_no_marketing_or_reminder_jobs_are_ever_planned(bound_session_loca
     ("mutate", "hint", "expected_code"),
     [
         (lambda p: p.update({"location_id": FOREIGN_LOCATION_ID}), "booking-created", "foreign_location"),
+        (
+            lambda p: p.update({"location_uuid": "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff"}),
+            "booking-created",
+            "location_identity_mismatch",
+        ),
         (lambda p: p.update({"uid": "not-a-uuid"}), "booking-created", "invalid_booking_uuid"),
         (lambda p: p.pop("uid"), "booking-created", "missing_booking_uuid"),
         (lambda p: p.update({"id": "nope"}), "booking-created", "missing_booking_id"),
@@ -2891,7 +2952,6 @@ async def test_reconciliation_is_idempotent_and_bounded(bound_session_local) -> 
 async def test_the_loop_refuses_to_claim_until_reconciliation_succeeds(bound_session_local, monkeypatch) -> None:
     """Fail-closed: a broken reconciliation must not let claiming start."""
     monkeypatch.setattr(settings, "easyweek_processing_enabled", True, raising=False)
-    monkeypatch.setattr(settings, "easyweek_location_id", TEST_LOCATION_ID, raising=False)
 
     async with bound_session_local() as session:
         async with session.begin():
@@ -2930,7 +2990,6 @@ async def test_the_loop_refuses_to_claim_until_reconciliation_succeeds(bound_ses
 
 async def test_the_loop_reconciles_once_then_claims(bound_session_local, monkeypatch) -> None:
     monkeypatch.setattr(settings, "easyweek_processing_enabled", True, raising=False)
-    monkeypatch.setattr(settings, "easyweek_location_id", TEST_LOCATION_ID, raising=False)
 
     async with bound_session_local() as session:
         async with session.begin():
@@ -3084,7 +3143,6 @@ async def test_a_persistently_failing_reconciliation_never_overflows_or_claims(
 ) -> None:
     """Fail-closed AND crash-free, however long the outage lasts."""
     monkeypatch.setattr(settings, "easyweek_processing_enabled", True, raising=False)
-    monkeypatch.setattr(settings, "easyweek_location_id", TEST_LOCATION_ID, raising=False)
 
     async with bound_session_local() as session:
         async with session.begin():

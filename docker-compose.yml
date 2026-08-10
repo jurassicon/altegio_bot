@@ -65,7 +65,7 @@ services:
     command: ["/app/.venv/bin/python", "-m", "altegio_bot.scripts.run_inbox_worker"]
 
   # The one shared worker that also renders EasyWeek lifecycle jobs, so it is the
-  # one shared worker that needs easyweek.env: `EASYWEEK_BOOKING_PAGE_URL` and
+  # one shared worker that needs easyweek.env: `EASYWEEK_LOCATION_MAP` and
   # `EASYWEEK_DEFAULT_LANGUAGE` are read here. required:false keeps an
   # Altegio-only host deployable without the file.
   #
@@ -135,7 +135,7 @@ services:
   #
   # Reads easyweek.env in addition to .env, with required:false so a host
   # without the file still deploys. The worker stays inert and quiet until
-  # EASYWEEK_PROCESSING_ENABLED=true AND EASYWEEK_LOCATION_ID is set, so
+  # EASYWEEK_PROCESSING_ENABLED=true AND EASYWEEK_LOCATION_MAP is valid, so
   # deploying PR-4 does not start chewing through the captured backlog.
   #
   # NOTE: `docker compose restart` does NOT re-read env_file — flipping any

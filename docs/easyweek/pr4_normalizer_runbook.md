@@ -36,11 +36,11 @@ backlog** сразу после деплоя PR-4. Выключение обра
 Дополнительно:
 
 ```text
-EASYWEEK_LOCATION_ID=0        # 0 = не сконфигурировано → воркер не claim'ит
+EASYWEEK_LOCATION_MAP={}      # пусто/невалидно → воркер не claim'ит
 EASYWEEK_INBOX_WORKER_POLL_SEC=1.0
 ```
 
-При `EASYWEEK_PROCESSING_ENABLED=true` и `EASYWEEK_LOCATION_ID=0` воркер
+При `EASYWEEK_PROCESSING_ENABLED=true` и пустом/невалидном реестре воркер
 fail-closed: он не берёт события, потому что не смог бы отличить свою локацию
 от чужой.
 
@@ -62,8 +62,8 @@ Compose передаёт каждому сервису файл целиком; 
 | Группа переменных | Кто реально читает | Что пересоздавать |
 | --- | --- | --- |
 | `EASYWEEK_ENABLED`, `EASYWEEK_WEBHOOK_SECRET` | приём и запись вебхуков | `altegio-api` |
-| `EASYWEEK_PROCESSING_ENABLED`, `EASYWEEK_LOCATION_ID`, `EASYWEEK_INBOX_WORKER_POLL_SEC`, `EASYWEEK_NOTIFICATIONS_ENABLED` | нормализатор и планирование job | `altegio-easyweek-inbox-worker` |
-| `EASYWEEK_BOOKING_PAGE_URL`, `EASYWEEK_DEFAULT_LANGUAGE` | рендер lifecycle-сообщений | `altegio-outbox-worker` |
+| `EASYWEEK_PROCESSING_ENABLED`, `EASYWEEK_LOCATION_MAP`, `EASYWEEK_INBOX_WORKER_POLL_SEC`, `EASYWEEK_NOTIFICATIONS_ENABLED` | нормализатор и планирование job | `altegio-easyweek-inbox-worker` |
+| `EASYWEEK_LOCATION_MAP`, `EASYWEEK_DEFAULT_LANGUAGE` | рендер lifecycle-сообщений | `altegio-outbox-worker` |
 | `EASYWEEK_API_*` (probe) | только ручной запуск probe-команды | тот сервис/команда, где probe реально запускается |
 
 ```bash
@@ -72,10 +72,10 @@ docker compose -p altegio_bot up -d --force-recreate altegio-outbox-worker
 
 Обычный `restart altegio-outbox-worker` оставит контейнер со старыми
 значениями, и это молчаливый режим отказа: невалидный или пустой
-`EASYWEEK_BOOKING_PAGE_URL` роняет lifecycle-job локально, а устаревший язык
+`booking_page_url` филиала в реестре роняет lifecycle-job локально, а устаревший язык
 уйдёт в Meta.
 
-`EASYWEEK_BOOKING_PAGE_URL` валидируется на send-time, а не на старте
+`booking_page_url` из реестра валидируется на send-time, а не на старте
 процесса — умышленно. Глобальный Settings-валидатор уронил бы общий
 outbox-воркер и вместе с ним весь Altegio-трафик из-за EasyWeek-опечатки.
 Требования: абсолютный URL, только `https`, обязательный hostname, без
@@ -230,12 +230,12 @@ docker compose -p altegio_bot exec -T postgres sh -lc 'psql -tAX -U "$POSTGRES_U
 
 Записать числа. Ни payload, ни PII в отчёт не переносить.
 
-### Шаг 6 — задать numeric location id
+### Шаг 6 — задать реестр локаций
 
 В production `easyweek.env`:
 
 ```text
-EASYWEEK_LOCATION_ID=305156
+EASYWEEK_LOCATION_MAP=<JSON-реестр филиалов; формат см. easyweek.env.example>
 ```
 
 ### Шаг 7 — в контролируемом окне включить обработку
@@ -414,7 +414,8 @@ Capture продолжает работать, накопление событи
 - claim ровно одной `captured` строки (`FOR UPDATE SKIP LOCKED`);
 - `captured → processing → доменные записи → processed` в **одной** транзакции;
 - provider-scoped upsert `Client` (`provider='easyweek'`,
-  `company_id = EASYWEEK_LOCATION_ID`, `altegio_client_id = customer_id`);
+  `company_id = payload.location_id`, `altegio_client_id = customer_id`), после
+  проверки пары `location_id + location_uuid` по реестру;
 - UUID-first upsert `Record` по `uid`, с `altegio_record_id = numeric id`;
 - отмена → `is_deleted = true`;
 - manage-link строго из доказанной пары `booking_page` + `booking_hash_id`.

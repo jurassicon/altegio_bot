@@ -1,4 +1,4 @@
-# PR-6 — активация локации Durlach (EasyWeek)
+# PR-6/PR-7 — активация локаций EasyWeek
 
 Порядок включения уведомлений для локации Durlach. Все шаги обратимы; откат —
 в §8.
@@ -16,26 +16,22 @@ job остаётся `record_created`, отличается только стр�
 
 ## 0. Что должно быть заполнено до начала
 
-Активация **не начинается**, пока не подтверждены два значения. Оба намеренно
-fail-closed: без них система останавливается, а не работает «как получится».
+Активация **не начинается**, пока не подтверждены реестр и host-allowlist. Оба
+намеренно fail-closed: без них система останавливается.
 
 | Что | Где | Пока не заполнено |
 | --- | --- | --- |
-| numeric `:location_id` Durlach | `EASYWEEK_LOCATION_ID` в `easyweek.env` **и** аргумент `--expect-location-id` при запуске сида | сид отказывается работать: `SeedConfigError` |
+| пары numeric `location_id` + `location_uuid` филиалов | `EASYWEEK_LOCATION_MAP` в `easyweek.env`; сид независимо сверяет UUID через live `GET /locations` | worker не claim'ит; сид отказывается: `SeedConfigError` |
 | approved host страницы записи | `EASYWEEK_BOOKING_PAGE_ALLOWED_HOSTS` в `easyweek.env` | любой booking URL отвергается, lifecycle-job падает локально |
 
 Location id в репозитории **не хранится** — он живёт только в production
 `easyweek.env`, и это закреплено тестом
 `test_the_production_location_id_is_not_hardcoded_in_python`.
 
-Поэтому подтверждение делает оператор: `--expect-location-id` обязателен и
-сверяется с `EASYWEEK_LOCATION_ID`. Два независимых источника — смысл именно в
-этом: константа, прочитанная из того же `easyweek.env`, сравнивала бы значение
-сама с собой и ничего бы не доказывала, а человек, которому надо набрать id
-руками, — настоящий второй источник. Скрипт пишет контент именно Durlach
-(Meta-имена, адрес, карту); при расхождении он откажется, иначе этот контент
-молча привязался бы к другой локации, и ничто ниже по потоку этого бы не
-заметило.
+Перед записью сид вызывает live `GET /locations`: каждый UUID реестра обязан
+найтись, а API-имя филиала печатается оператору. Это независимый источник
+identity; недоступный API, отсутствующий UUID или неизвестный seed-префикс
+останавливает сид до первой записи.
 
 Сообщения об отказе называют нарушенный инвариант и **не печатают сам id** — они
 попадают в логи.
@@ -113,7 +109,7 @@ kitilash_du_record_canceled_v1
 релей **fail-closed**.
 
 ```text
-CHATWOOT_INBOX_COMPANY_MAP={"8": 758285, "7": 1271200, "<inbox_id Durlach>": <EASYWEEK_LOCATION_ID>}
+CHATWOOT_INBOX_COMPANY_MAP={"8": 758285, "7": 1271200, "<inbox_id EasyWeek>": <location_id из EASYWEEK_LOCATION_MAP>}
 ```
 
 Числа `8` и `7` — примеры из документации настройки; подставьте фактические
@@ -154,13 +150,12 @@ company_id ничего не знает (`webhooks/whatsapp.py`,
 ## 4. Конфигурация в `easyweek.env`
 
 ```text
-EASYWEEK_LOCATION_ID=<numeric :location_id Durlach>
-EASYWEEK_BOOKING_PAGE_URL=<https-URL страницы записи Durlach>
+EASYWEEK_LOCATION_MAP=<JSON-реестр с id, uuid, Meta-префиксом и booking_page_url каждого филиала>
 EASYWEEK_BOOKING_PAGE_ALLOWED_HOSTS=<host из URL выше>
 EASYWEEK_DEFAULT_LANGUAGE=de
 ```
 
-`EASYWEEK_BOOKING_PAGE_URL` валидируется на send-time: абсолютный URL, только
+Каждый `booking_page_url` из реестра валидируется на send-time: абсолютный URL, только
 `https`, обязательный hostname, без credentials/fragment/control-символов **и
 host из allowlist**. Пустой allowlist отвергает всё — это защита от опечатки в
 URL, которая иначе уехала бы клиенту как ссылка после отмены.
@@ -176,12 +171,7 @@ URL, которая иначе уехала бы клиенту как ссыл�
 атом активации: без шаблона job падает с `Template not found`, без отправителя —
 с `No active sender`.
 
-### Откуда взять `--expect-location-id`
-
-**НЕ из `easyweek.env`.** Смысл аргумента — второй независимый источник (§0).
-Если скопировать значение из `easyweek.env` в CLI, обе стороны сверки придут из
-одного места, проверка выродится в сравнение значения с самим собой, и неверно
-заданный `EASYWEEK_LOCATION_ID` пройдёт её беспрепятственно.
+### Как подтверждается identity
 
 Берите numeric `:location_id` из источника, не зависящего от конфигурации
 контейнера, в порядке предпочтения:
@@ -203,21 +193,17 @@ ORDER BY events DESC;
 
 3. **Операционное подтверждение владельца локации.**
 
-Read-only проба (`python -m altegio_bot.scripts.easyweek_probe --redact-pii`)
-для этого шага **не подходит**: она печатает `uuid`, `name` и `timezone`
-локации, но не numeric `id`. Ею удобно подтвердить, ЧТО за локация видна ключу,
-а не какой у неё numeric id.
-
-Полученное число оператор печатает руками:
+Read-only проба помогает собрать реестр, а сам сид повторяет `GET /locations`
+непосредственно перед записью и печатает найденные имена. CLI-аргумента с id
+больше нет:
 
 ```bash
 docker compose -p altegio_bot run --rm altegio-outbox-worker \
-  /app/.venv/bin/python -m altegio_bot.scripts.seed_easyweek_templates \
-  --expect-location-id <id, подтверждённый выше>
+  /app/.venv/bin/python -m altegio_bot.scripts.seed_easyweek_templates
 ```
 
 Сервис выбран не случайно: `altegio-outbox-worker` — один из трёх, кто читает
-`easyweek.env`; сид сверит переданное число с тем, что там уже лежит.
+`easyweek.env`; сид прочитает весь реестр и проверит его через API.
 
 **Расхождение — это стоп, а не повод «подправить».** Оно означает одно из двух:
 контейнер сконфигурирован не на ту локацию, либо оператор подтвердил не ту. Сид
@@ -225,10 +211,9 @@ docker compose -p altegio_bot run --rm altegio-outbox-worker \
 Durlach привяжется к чужой локации. Выясните, какая сторона неверна, исправьте
 её и запустите сид заново.
 
-Скрипт fail-closed и ничего не запишет, если: аргумент не передан, он не
-совпадает с `EASYWEEK_LOCATION_ID`, язык не `de`, или `META_WA_PHONE_NUMBER_ID`
-пуст. Все проверки выполняются до первой записи, поэтому отказ оставляет БД в
-исходном состоянии.
+Скрипт fail-closed и ничего не запишет, если реестр пуст/невалиден, API
+недоступен, UUID не найден, язык не `de`, booking page не проходит allowlist
+или `META_WA_PHONE_NUMBER_ID` пуст. Все проверки выполняются до первой записи.
 
 ---
 

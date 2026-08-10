@@ -33,6 +33,7 @@ from altegio_bot.delivery_retry_identity import (
     resolve_retry_reference,
     retry_outbox_audit_mismatch,
 )
+from altegio_bot.easyweek_locations import configured_easyweek_locations
 from altegio_bot.easyweek_normalizer import extract_manage_link
 from altegio_bot.easyweek_policy import (
     EASYWEEK_LIFECYCLE_JOB_TYPES,
@@ -935,7 +936,7 @@ def _easyweek_service_snapshot_error(
     return None
 
 
-def easyweek_effective_booking_link(record: Record | None, template_code: str) -> str:
+def easyweek_effective_booking_link(record: Record | None, template_code: str, *, company_id: int) -> str:
     """The ONLY link an EasyWeek lifecycle message may carry.
 
     ``record_canceled`` always gets the static booking page, even when a
@@ -950,15 +951,16 @@ def easyweek_effective_booking_link(record: Record | None, template_code: str) -
     drift, and this is the last gate before a URL reaches a customer. A link is
     never synthesised from the booking UUID, the numeric id or the hash.
 
-    The static page is validated too, by :func:`validate_static_booking_page` —
-    a misconfigured ``EASYWEEK_BOOKING_PAGE_URL`` is just as customer-facing as a
-    forged ``short_link``, and for ``record_canceled`` it is the ONLY link. An
-    unusable value yields "" here, and the caller fails the job locally rather
-    than sending a message with a blank or hostile link.
+    The static page comes from the registry entry selected by ``company_id`` and
+    is validated too, by :func:`validate_static_booking_page`. An unknown
+    location, invalid registry or unusable URL yields "" here, and the caller
+    fails the job locally rather than sending a blank or cross-branch link.
 
     Anything that does not verify falls back to the static page.
     """
-    static_page = validate_static_booking_page(settings.easyweek_booking_page_url) or ""
+    registry = configured_easyweek_locations()
+    location = registry.locations.get(company_id) if registry.ready else None
+    static_page = validate_static_booking_page(location.booking_page_url if location else None) or ""
     if record is None or template_code == "record_canceled":
         return static_page
 
@@ -1076,7 +1078,7 @@ async def _render_message(
     if is_easyweek:
         # EasyWeek has no BOOKING_LINKS entry and must never borrow one: that map
         # is keyed by Altegio company id and holds Altegio salon pages.
-        booking_link = easyweek_effective_booking_link(record, template_code)
+        booking_link = easyweek_effective_booking_link(record, template_code, company_id=company_id)
     else:
         booking_link = BOOKING_LINKS.get(company_id, "")
 

@@ -122,9 +122,9 @@ def booking_page_allowed_hosts() -> frozenset[str]:
 def validate_static_booking_page(raw: object | None) -> str | None:
     """Return the normalized static booking page, or ``None`` when unusable.
 
-    ``EASYWEEK_BOOKING_PAGE_URL`` is not an internal setting: it is the link a
-    customer taps after a cancellation, and the fallback whenever a per-booking
-    manage link cannot be re-verified. "Non-empty string" was never enough of a
+    A registry ``booking_page_url`` is the link a customer taps after a
+    cancellation, and the fallback whenever a per-booking manage link cannot be
+    re-verified. "Non-empty string" was never enough of a
     check for that — ``javascript:alert(1)``, ``//evil.invalid/book`` and
     ``https://user:pw@host/`` are all non-empty.
 
@@ -145,7 +145,7 @@ def validate_static_booking_page(raw: object | None) -> str | None:
     same name, and this value ends up as a link a customer taps.
 
     An EMPTY allowlist rejects everything. That is the point: until an operator
-    confirms the approved host, a typo in ``EASYWEEK_BOOKING_PAGE_URL`` would
+    confirms the approved host, a typo in a registry booking page would
     otherwise pass every syntactic check and go out as the link a customer taps
     after a cancellation. Failing closed stops the activation; failing open
     would ship the typo. Altegio is unaffected — it never reaches this
