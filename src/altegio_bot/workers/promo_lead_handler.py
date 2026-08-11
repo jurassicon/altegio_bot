@@ -15,6 +15,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.altegio_records import AltegioNewClientCheckError, check_client_has_any_altegio_record
+from altegio_bot.chatwoot_outbox_route import outbox_meta_with_chatwoot_route
 from altegio_bot.easyweek_policy import normalize_provider
 from altegio_bot.models.models import PROVIDER_ALTEGIO, Client, MessageJob, OutboxMessage, PromoLead, Record
 from altegio_bot.promo_loyalty import AltegioLoyaltyError, issue_promo_loyalty_card
@@ -599,13 +600,16 @@ async def handle_promo_info_command(
             scheduled_at=now,
             sent_at=now,
             message_source="bot",
-            meta={
-                "source": "promo_lead",
-                "command": "promo",
-                "inbound_text": text,
-                "whatsapp_event_id": event.id,
-                "campaign_name": cfg.promo_campaign_name,
-            },
+            meta=outbox_meta_with_chatwoot_route(
+                {
+                    "source": "promo_lead",
+                    "command": "promo",
+                    "inbound_text": text,
+                    "whatsapp_event_id": event.id,
+                    "campaign_name": cfg.promo_campaign_name,
+                },
+                ChatwootRoute.GENERAL,
+            ),
         )
     )
     event.error = None
@@ -1325,13 +1329,16 @@ async def handle_promo_command(
             scheduled_at=now,
             sent_at=now,
             message_source="bot",
-            meta={
-                "source": "promo_lead",
-                "command": "promo",
-                "inbound_text": text,
-                "whatsapp_event_id": event.id,
-                "campaign_name": cfg.promo_campaign_name,
-            },
+            meta=outbox_meta_with_chatwoot_route(
+                {
+                    "source": "promo_lead",
+                    "command": "promo",
+                    "inbound_text": text,
+                    "whatsapp_event_id": event.id,
+                    "campaign_name": cfg.promo_campaign_name,
+                },
+                ChatwootRoute.GENERAL,
+            ),
         )
     )
 

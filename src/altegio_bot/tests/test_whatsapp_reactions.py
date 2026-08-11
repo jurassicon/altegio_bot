@@ -18,6 +18,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from sqlalchemy import select
 
+from altegio_bot.chatwoot_outbox_route import CHATWOOT_ROUTE_META_KEY
 from altegio_bot.models.models import (
     PROVIDER_ALTEGIO,
     PROVIDER_EASYWEEK,
@@ -27,7 +28,7 @@ from altegio_bot.models.models import (
     WhatsAppEvent,
     WhatsAppSender,
 )
-from altegio_bot.providers.base import WhatsAppProvider
+from altegio_bot.providers.base import ChatwootRoute, WhatsAppProvider
 from altegio_bot.workers.whatsapp_inbox_worker import (
     ReactionTarget,
     _extract_actions,
@@ -47,6 +48,20 @@ BRANCH_MAP = (
     '"102":{"provider":"easyweek","company_id":900002},'
     '"103":{"provider":"altegio","company_id":900003}}'
 )
+
+GENERAL_REACTION_PROVENANCE_CASES = [
+    ("wa_cmd_stop", {"source": "inbound_command", "command": "stop"}),
+    ("wa_cmd_start", {"source": "inbound_command", "command": "start"}),
+    ("wa_promo_info", {"source": "promo_lead", "command": "promo"}),
+    ("wa_promo_lead_issued", {"source": "promo_lead", "command": "promo"}),
+]
+
+
+def _general_reaction_meta(provenance: dict[str, Any], *, marked: bool) -> dict[str, Any]:
+    meta = dict(provenance)
+    if marked:
+        meta[CHATWOOT_ROUTE_META_KEY] = ChatwootRoute.GENERAL.value
+    return meta
 
 
 class _CaptureProvider(WhatsAppProvider):
@@ -121,6 +136,7 @@ def _outbox(
     job_id: int | None = None,
     sender_id: int | None = None,
     created_at: datetime | None = None,
+    meta: dict[str, Any] | None = None,
 ) -> OutboxMessage:
     now = datetime.now(timezone.utc)
     ob = OutboxMessage(
@@ -139,7 +155,7 @@ def _outbox(
         record_id=record_id,
         chatwoot_message_id=chatwoot_message_id,
         chatwoot_conversation_id=chatwoot_conversation_id,
-        meta={},
+        meta=meta or {},
     )
     if created_at is not None:
         ob.created_at = created_at
@@ -302,6 +318,7 @@ async def _run_tenant_reaction(
     prior_inbound: bool = False,
     prior_inbound_events: list[WhatsAppEvent] | None = None,
     general_inbox_id: int = 999,
+    outboxes: list[OutboxMessage] | None = None,
 ) -> tuple[WhatsAppEvent, MagicMock, MagicMock]:
     import altegio_bot.workers.whatsapp_inbox_worker as wiw
 
@@ -327,6 +344,7 @@ async def _run_tenant_reaction(
                 assert target_wamid is not None
                 session.add(_prior_inbound_event(whatsapp_message_id=target_wamid))
             session.add_all(prior_inbound_events or [])
+            session.add_all(outboxes or [])
 
             evt = _make_event(
                 _reaction_payload(target_wamid=target_wamid, from_phone=from_phone),
@@ -703,6 +721,176 @@ async def test_unknown_reaction_general_overlap_fails_before_chatwoot_client(
     assert evt.error == "chatwoot tenant routing failed: general_inbox_overlaps_branch"
 
 
+@pytest.mark.parametrize(("template_code", "provenance"), GENERAL_REACTION_PROVENANCE_CASES)
+@pytest.mark.asyncio
+async def test_markerless_historical_direct_reaction_returns_to_validated_general(
+    session_maker,
+    monkeypatch: pytest.MonkeyPatch,
+    template_code: str,
+    provenance: dict[str, Any],
+) -> None:
+    wamid = f"wamid.HISTORICAL.REACTION.{template_code}"
+    evt, mock_cls, cw = await _run_tenant_reaction(
+        session_maker,
+        monkeypatch,
+        raw_map=BRANCH_MAP,
+        targets=[],
+        target_wamid=wamid,
+        dedupe_key=f"wa:historical-reaction:{template_code}",
+        outboxes=[
+            _outbox(
+                provider_message_id=wamid,
+                template_code=template_code,
+                meta=_general_reaction_meta(provenance, marked=False),
+            )
+        ],
+    )
+
+    mock_cls.assert_called_once_with(inbox_id=999)
+    cw.send_message.assert_called_once()
+    assert evt.error is None
+
+
+@pytest.mark.parametrize(
+    ("raw_map", "general_inbox_id", "expected_reason"),
+    [
+        (BRANCH_MAP, 101, "general_inbox_overlaps_branch"),
+        (BRANCH_MAP, 0, "invalid_general_inbox_id"),
+        ("{not json", 999, "invalid_inbox_company_map"),
+        ('{"101":900001}', 999, "provider_scope_missing"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_general_outbox_reaction_invalid_route_fails_before_chatwoot_client(
+    session_maker,
+    monkeypatch: pytest.MonkeyPatch,
+    raw_map: str,
+    general_inbox_id: int,
+    expected_reason: str,
+) -> None:
+    wamid = f"wamid.GENERAL.REACTION.BLOCKED.{expected_reason}"
+    evt, mock_cls, cw = await _run_tenant_reaction(
+        session_maker,
+        monkeypatch,
+        raw_map=raw_map,
+        targets=[],
+        target_wamid=wamid,
+        dedupe_key=f"wa:general-reaction-blocked:{expected_reason}",
+        general_inbox_id=general_inbox_id,
+        expected_error=expected_reason,
+        outboxes=[
+            _outbox(
+                provider_message_id=wamid,
+                template_code="wa_promo_info",
+                meta=_general_reaction_meta({"source": "promo_lead", "command": "promo"}, marked=True),
+            )
+        ],
+    )
+
+    mock_cls.assert_not_called()
+    cw.send_message.assert_not_called()
+    assert evt.error == f"chatwoot tenant routing failed: {expected_reason}"
+
+
+@pytest.mark.parametrize(
+    ("template_code", "meta", "expected_reason"),
+    [
+        ("wa_unproven", {}, "bot_job_identity_missing"),
+        (
+            "wa_cmd_stop",
+            {
+                "source": "inbound_command",
+                "command": "stop",
+                CHATWOOT_ROUTE_META_KEY: "unknown",
+            },
+            "invalid_outbox_route_marker",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_unproven_general_like_reaction_stays_fail_closed(
+    session_maker,
+    monkeypatch: pytest.MonkeyPatch,
+    template_code: str,
+    meta: dict[str, Any],
+    expected_reason: str,
+) -> None:
+    wamid = f"wamid.UNPROVEN.REACTION.{expected_reason}"
+    evt, mock_cls, cw = await _run_tenant_reaction(
+        session_maker,
+        monkeypatch,
+        raw_map=BRANCH_MAP,
+        targets=[],
+        target_wamid=wamid,
+        dedupe_key=f"wa:unproven-reaction:{expected_reason}",
+        expected_error=expected_reason,
+        outboxes=[_outbox(provider_message_id=wamid, template_code=template_code, meta=meta)],
+    )
+
+    mock_cls.assert_not_called()
+    cw.send_message.assert_not_called()
+    assert evt.error == f"chatwoot tenant routing failed: {expected_reason}"
+
+
+@pytest.mark.asyncio
+async def test_duplicate_general_reaction_rows_prove_one_general_route(session_maker) -> None:
+    wamid = "wamid.DUPLICATE.GENERAL.REACTION"
+    meta = _general_reaction_meta({"source": "promo_lead", "command": "promo"}, marked=True)
+    async with session_maker() as session:
+        async with session.begin():
+            session.add_all(
+                [
+                    _outbox(provider_message_id=wamid, template_code="wa_promo_info", meta=meta),
+                    _outbox(provider_message_id=wamid, template_code="wa_promo_info", meta=meta),
+                ]
+            )
+            await session.flush()
+            target = await _resolve_reaction_target(session, wamid, phone_e164=PHONE_E164)
+
+    assert target.kind == "outbox_message"
+    assert target.chatwoot_route is ChatwootRoute.GENERAL
+    assert target.tenant_provider is None
+    assert target.company_id is None
+    assert target.tenant_error is None
+
+
+@pytest.mark.asyncio
+async def test_general_and_tenant_reaction_rows_are_ambiguous(session_maker) -> None:
+    wamid = "wamid.GENERAL.TENANT.REACTION.COLLISION"
+    now = datetime.now(timezone.utc)
+    async with session_maker() as session:
+        async with session.begin():
+            job = MessageJob(
+                provider=PROVIDER_EASYWEEK,
+                company_id=900001,
+                job_type="record_created",
+                run_at=now,
+                status="done",
+                dedupe_key="general-tenant-reaction-collision",
+                payload={},
+            )
+            session.add(job)
+            await session.flush()
+            session.add_all(
+                [
+                    _outbox(
+                        provider_message_id=wamid,
+                        template_code="wa_cmd_start",
+                        meta=_general_reaction_meta(
+                            {"source": "inbound_command", "command": "start"},
+                            marked=True,
+                        ),
+                    ),
+                    _outbox(provider_message_id=wamid, company_id=900001, job_id=job.id),
+                ]
+            )
+            await session.flush()
+            target = await _resolve_reaction_target(session, wamid, phone_e164=PHONE_E164)
+
+    assert target.kind == "outbox_message"
+    assert target.tenant_error == "ambiguous_outbox_chatwoot_route"
+
+
 @pytest.mark.parametrize(
     "candidate",
     [
@@ -954,7 +1142,11 @@ async def test_resolve_reaction_target_missing_phone_returns_unknown(session_mak
             session.add(_outbox(phone_e164=PHONE_E164, template_code="reminder_24h"))
             await session.flush()
             target = await _resolve_reaction_target(session, TARGET_WAMID, phone_e164=None)
-    assert target == ReactionTarget(kind="unknown", provider_message_id=TARGET_WAMID)
+    assert target == ReactionTarget(
+        kind="unknown",
+        provider_message_id=TARGET_WAMID,
+        chatwoot_route=ChatwootRoute.GENERAL,
+    )
 
 
 # ---------------------------------------------------------------------------

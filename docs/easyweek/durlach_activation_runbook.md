@@ -385,6 +385,27 @@ reply и существующий synchronous promo funnel reply зеркали�
 `(provider, company_id)` по-прежнему блокирует Chatwoot mirror fail-closed и не
 получает неявный fallback в General.
 
+Explicit-General intent сохраняется вместе с каждой такой отправкой в
+`OutboxMessage.meta.chatwoot_route`. Поэтому reply или reaction клиента на
+STOP/START ACK либо synchronous promo reply снова проходит проверку отдельного
+General inbox и возвращается в `General / Unassigned`, а не пытается вывести
+филиал из `sender_id`, `company_id`, общего номера или телефона клиента.
+
+Исторические STOP/START и synchronous promo Outbox-строки без marker
+поддерживаются только по строгой старой provenance: internal `message_source=bot`,
+`job_id IS NULL`, непустой Meta message ID и точное согласование
+`meta.source` + `meta.command` + `template_code`. Почти похожая либо
+противоречивая строка, неизвестный marker и любой другой bot Outbox без
+`MessageJob` остаются fail-closed с технической route-причиной. Marker на
+lifecycle Outbox с `MessageJob` не заменяет provider-scoped identity, а marker
+на operator Outbox не заменяет identity из `WhatsAppSender`: оба случая
+считаются audit-конфликтом и блокируются fail-closed.
+
+General ID по-прежнему валидируется против всей branch map до создания
+Chatwoot client. Совпадение General хотя бы с одним branch inbox остаётся hard
+**STOP** (`general_inbox_overlaps_branch`) для нового inbound и для всей цепочки
+reply/reaction на explicit-General Outbox.
+
 ### `whatsapp_allowed_phone_number_ids` — правка НЕ нужна
 
 Этот allowlist фильтрует **входящие вебхуки по `phone_number_id`** и о
