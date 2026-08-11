@@ -21,14 +21,16 @@ import pytest
 from sqlalchemy import select
 
 from altegio_bot.models.models import (
+    PROVIDER_ALTEGIO,
+    PROVIDER_EASYWEEK,
     Client,
+    MessageJob,
     OutboxMessage,
     WhatsAppEvent,
     WhatsAppSender,
 )
 from altegio_bot.providers.base import WhatsAppProvider
 from altegio_bot.workers.whatsapp_inbox_worker import (
-    ReplyContextTarget,
     WhatsAppReplyContextTarget,
     _event_origin_for_metrics,
     _extract_actions,
@@ -45,6 +47,11 @@ from altegio_bot.workers.whatsapp_inbox_worker import (
 PHONE_NUMBER_ID = "PNID_REPLY"
 FROM_PHONE = "49222333444"
 PHONE_E164 = "+49222333444"
+BRANCH_MAP = (
+    '{"101":{"provider":"easyweek","company_id":900001},'
+    '"102":{"provider":"easyweek","company_id":900002},'
+    '"103":{"provider":"altegio","company_id":900003}}'
+)
 
 
 class _CaptureProvider(WhatsAppProvider):
@@ -114,11 +121,14 @@ def _operator_outbox(
     chatwoot_conversation_id: int | None = 277,
     body: str = "На 9:00?",
     message_source: str = "operator",
+    company_id: int = 1,
+    job_id: int | None = None,
+    sender_id: int | None = None,
     created_at: datetime | None = None,
 ) -> OutboxMessage:
     now = datetime.now(timezone.utc)
     ob = OutboxMessage(
-        company_id=1,
+        company_id=company_id,
         phone_e164=phone_e164,
         template_code="operator_relay",
         language="de",
@@ -128,6 +138,8 @@ def _operator_outbox(
         scheduled_at=now,
         sent_at=now,
         message_source=message_source,
+        job_id=job_id,
+        sender_id=sender_id,
         chatwoot_message_id=chatwoot_message_id,
         chatwoot_conversation_id=chatwoot_conversation_id,
         meta={},
@@ -144,6 +156,8 @@ def _bot_outbox(
     chatwoot_message_id: int | None = None,
     chatwoot_conversation_id: int | None = None,
     body: str = "Напоминание: запись завтра в 10:00",
+    company_id: int = 1,
+    job_id: int | None = None,
     created_at: datetime | None = None,
 ) -> OutboxMessage:
     """A bot/automation OutboxMessage (``message_source='bot'``).
@@ -158,6 +172,8 @@ def _bot_outbox(
         chatwoot_conversation_id=chatwoot_conversation_id,
         body=body,
         message_source="bot",
+        company_id=company_id,
+        job_id=job_id,
         created_at=created_at,
     )
 
@@ -345,11 +361,13 @@ async def test_reply_target_found(session_maker) -> None:
 
         target = await _get_reply_context_target(session, "wamid.OP1", phone_e164=PHONE_E164)
 
-    assert target == ReplyContextTarget(
-        chatwoot_message_id=7644,
-        chatwoot_conversation_id=277,
-        body="На 9:00?",
-    )
+    assert target is not None
+    assert target.chatwoot_message_id == 7644
+    assert target.chatwoot_conversation_id == 277
+    assert target.body == "На 9:00?"
+    assert target.outbox_id is not None
+    assert target.template_code == "operator_relay"
+    assert target.tenant_error == "operator_sender_identity_missing"
 
 
 @pytest.mark.asyncio
@@ -628,6 +646,305 @@ async def _run_forward(
                 await handle_event(session, evt, provider)
 
     return evt, mock_inst
+
+
+async def _seed_proven_reply_target(
+    session: Any,
+    *,
+    provider: str,
+    company_id: int,
+    source: str,
+    wamid: str,
+    phone_e164: str,
+    suffix: str,
+) -> None:
+    now = datetime.now(timezone.utc)
+    if source == "operator":
+        sender = WhatsAppSender(
+            provider=provider,
+            company_id=company_id,
+            sender_code=f"reply-{company_id}-{suffix[-8:]}",
+            phone_number_id=PHONE_NUMBER_ID,
+            display_phone="+49",
+            is_active=True,
+        )
+        session.add(sender)
+        await session.flush()
+        session.add(
+            _operator_outbox(
+                wamid=wamid,
+                phone_e164=phone_e164,
+                company_id=company_id,
+                sender_id=sender.id,
+            )
+        )
+        return
+
+    job = MessageJob(
+        provider=provider,
+        company_id=company_id,
+        job_type="reminder_24h",
+        run_at=now,
+        status="done",
+        dedupe_key=f"reply-route:{suffix}:{wamid}",
+        payload={},
+    )
+    session.add(job)
+    await session.flush()
+    session.add(
+        _bot_outbox(
+            wamid=wamid,
+            phone_e164=phone_e164,
+            company_id=company_id,
+            job_id=job.id,
+        )
+    )
+
+
+async def _run_tenant_reply(
+    session_maker: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    raw_map: str,
+    targets: list[tuple[str, int, str]],
+    context_id: str | None = "wamid.TENANT.TARGET",
+    target_phone: str = PHONE_E164,
+    from_phone: str = FROM_PHONE,
+    dedupe_key: str = "wa:tenant-reply",
+    destination_conversation_id: int = 277,
+    expected_error: str | None = None,
+) -> tuple[WhatsAppEvent, MagicMock, MagicMock]:
+    import altegio_bot.workers.whatsapp_inbox_worker as wiw
+
+    monkeypatch.setattr(wiw.settings, "chatwoot_inbox_company_map", raw_map)
+    provider = _CaptureProvider()
+    mock_cls, mock_inst = _mock_chatwoot_client(conversation_id=destination_conversation_id)
+
+    async with session_maker() as session:
+        async with session.begin():
+            if not targets:
+                session.add(
+                    WhatsAppSender(
+                        provider=PROVIDER_ALTEGIO,
+                        company_id=1,
+                        sender_code="reply-inbound",
+                        phone_number_id=PHONE_NUMBER_ID,
+                        display_phone="+49",
+                        is_active=True,
+                    )
+                )
+            elif all(source != "operator" for _provider, _company_id, source in targets):
+                first_provider, first_company_id, _source = targets[0]
+                session.add(
+                    WhatsAppSender(
+                        provider=first_provider,
+                        company_id=first_company_id,
+                        sender_code="reply-inbound",
+                        phone_number_id=PHONE_NUMBER_ID,
+                        display_phone="+49",
+                        is_active=True,
+                    )
+                )
+            for index, (target_provider, company_id, source) in enumerate(targets):
+                assert context_id is not None
+                await _seed_proven_reply_target(
+                    session,
+                    provider=target_provider,
+                    company_id=company_id,
+                    source=source,
+                    wamid=context_id,
+                    phone_e164=target_phone,
+                    suffix=f"{dedupe_key}-{index}",
+                )
+
+            evt = _make_event(
+                _meta_payload("Ответ филиалу", from_phone=from_phone, context_id=context_id),
+                dedupe_key=dedupe_key,
+            )
+            session.add(evt)
+            await session.flush()
+
+            with patch("altegio_bot.workers.whatsapp_inbox_worker.ChatwootClient", mock_cls):
+                if expected_error is None:
+                    await handle_event(session, evt, provider)
+                else:
+                    with pytest.raises(RuntimeError, match=expected_error):
+                        await handle_event(session, evt, provider)
+
+    return evt, mock_cls, mock_inst
+
+
+@pytest.mark.parametrize(
+    ("tenant_provider", "company_id", "inbox_id"),
+    [
+        (PROVIDER_EASYWEEK, 900001, 101),
+        (PROVIDER_EASYWEEK, 900002, 102),
+        (PROVIDER_ALTEGIO, 900003, 103),
+    ],
+    ids=["durlach", "rastatt", "karlsruhe"],
+)
+@pytest.mark.asyncio
+async def test_reply_to_lifecycle_notification_uses_its_branch_inbox(
+    session_maker,
+    monkeypatch: pytest.MonkeyPatch,
+    tenant_provider: str,
+    company_id: int,
+    inbox_id: int,
+) -> None:
+    evt, mock_cls, cw = await _run_tenant_reply(
+        session_maker,
+        monkeypatch,
+        raw_map=BRANCH_MAP,
+        targets=[(tenant_provider, company_id, "bot")],
+        dedupe_key=f"wa:tenant-reply:{inbox_id}",
+    )
+
+    mock_cls.assert_called_once_with(inbox_id=inbox_id)
+    cw.send_message.assert_called_once()
+    assert evt.forwarded_chatwoot_conversation_id == 277
+    assert evt.error is None
+
+
+@pytest.mark.asyncio
+async def test_reply_to_operator_message_uses_sender_tenant_branch(
+    session_maker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    evt, mock_cls, cw = await _run_tenant_reply(
+        session_maker,
+        monkeypatch,
+        raw_map=BRANCH_MAP,
+        targets=[(PROVIDER_EASYWEEK, 900001, "operator")],
+        dedupe_key="wa:tenant-reply:operator",
+    )
+
+    mock_cls.assert_called_once_with(inbox_id=101)
+    assert cw.send_message.call_args.kwargs["content_attributes"]["in_reply_to"] == 7644
+    assert evt.error is None
+
+
+@pytest.mark.asyncio
+async def test_same_phone_reply_contexts_keep_separate_branch_conversations(
+    session_maker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    du_event, du_cls, _du = await _run_tenant_reply(
+        session_maker,
+        monkeypatch,
+        raw_map=BRANCH_MAP,
+        targets=[(PROVIDER_EASYWEEK, 900001, "bot")],
+        context_id="wamid.DU.TARGET",
+        dedupe_key="wa:tenant-reply:du",
+        destination_conversation_id=1101,
+    )
+    ra_event, ra_cls, _ra = await _run_tenant_reply(
+        session_maker,
+        monkeypatch,
+        raw_map=BRANCH_MAP,
+        targets=[(PROVIDER_EASYWEEK, 900002, "bot")],
+        context_id="wamid.RA.TARGET",
+        dedupe_key="wa:tenant-reply:ra",
+        destination_conversation_id=1102,
+    )
+
+    du_cls.assert_called_once_with(inbox_id=101)
+    ra_cls.assert_called_once_with(inbox_id=102)
+    assert du_event.forwarded_chatwoot_conversation_id == 1101
+    assert ra_event.forwarded_chatwoot_conversation_id == 1102
+
+
+@pytest.mark.parametrize(
+    ("context_id", "target_phone", "dedupe_key"),
+    [
+        (None, PHONE_E164, "wa:tenant-reply:no-context"),
+        ("wamid.UNKNOWN", PHONE_E164, "wa:tenant-reply:unknown"),
+        ("wamid.WRONG.PHONE", "+49000000000", "wa:tenant-reply:wrong-phone"),
+    ],
+    ids=["no-context", "unknown-context", "wrong-phone"],
+)
+@pytest.mark.asyncio
+async def test_reply_without_proven_target_uses_general_inbox(
+    session_maker,
+    monkeypatch: pytest.MonkeyPatch,
+    context_id: str | None,
+    target_phone: str,
+    dedupe_key: str,
+) -> None:
+    targets = [] if context_id is None or context_id == "wamid.UNKNOWN" else [(PROVIDER_EASYWEEK, 900001, "bot")]
+    evt, mock_cls, cw = await _run_tenant_reply(
+        session_maker,
+        monkeypatch,
+        raw_map=BRANCH_MAP,
+        targets=targets,
+        context_id=context_id,
+        target_phone=target_phone,
+        dedupe_key=dedupe_key,
+    )
+
+    mock_cls.assert_called_once_with()
+    cw.send_message.assert_called_once()
+    assert evt.error is None
+
+
+@pytest.mark.parametrize(
+    ("raw_map", "expected_reason"),
+    [
+        (
+            '{"102":{"provider":"easyweek","company_id":900002}}',
+            "tenant_mapping_missing",
+        ),
+        (
+            '{"101":{"provider":"easyweek","company_id":900001},"102":{"provider":"easyweek","company_id":900001}}',
+            "invalid_inbox_company_map",
+        ),
+        ('{"101":900001}', "provider_scope_missing"),
+    ],
+    ids=["missing-route", "invalid-map", "legacy-unscoped-map"],
+)
+@pytest.mark.asyncio
+async def test_reply_with_found_target_and_unusable_route_fails_before_chatwoot_client(
+    session_maker,
+    monkeypatch: pytest.MonkeyPatch,
+    raw_map: str,
+    expected_reason: str,
+) -> None:
+    evt, mock_cls, cw = await _run_tenant_reply(
+        session_maker,
+        monkeypatch,
+        raw_map=raw_map,
+        targets=[(PROVIDER_EASYWEEK, 900001, "bot")],
+        dedupe_key=f"wa:tenant-reply:blocked:{expected_reason}",
+        expected_error=expected_reason,
+    )
+
+    mock_cls.assert_not_called()
+    cw.send_message.assert_not_called()
+    assert evt.error == f"chatwoot tenant routing failed: {expected_reason}"
+
+
+@pytest.mark.asyncio
+async def test_reply_provider_collision_fails_closed_before_chatwoot_client(
+    session_maker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    collision_map = (
+        '{"101":{"provider":"easyweek","company_id":900001},"201":{"provider":"altegio","company_id":900001}}'
+    )
+    evt, mock_cls, cw = await _run_tenant_reply(
+        session_maker,
+        monkeypatch,
+        raw_map=collision_map,
+        targets=[
+            (PROVIDER_EASYWEEK, 900001, "bot"),
+            (PROVIDER_ALTEGIO, 900001, "bot"),
+        ],
+        dedupe_key="wa:tenant-reply:provider-collision",
+        expected_error="ambiguous_outbox_tenant_identity",
+    )
+
+    mock_cls.assert_not_called()
+    cw.send_message.assert_not_called()
+    assert evt.error == "chatwoot tenant routing failed: ambiguous_outbox_tenant_identity"
 
 
 @pytest.mark.asyncio

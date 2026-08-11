@@ -174,6 +174,7 @@ async def test_send_propagates_contact_name(monkeypatch: pytest.MonkeyPatch) -> 
         phone: str,
         text: str,
         *,
+        tenant_provider: str | None = None,
         company_id: int = 0,
         contact_name: str | None = None,
         meta: object = None,
@@ -182,6 +183,7 @@ async def test_send_propagates_contact_name(monkeypatch: pytest.MonkeyPatch) -> 
         await original_log(
             phone,
             text,
+            tenant_provider=tenant_provider,
             company_id=company_id,
             contact_name=contact_name,
             meta=meta,  # type: ignore[arg-type]
@@ -247,18 +249,23 @@ async def test_send_template_none_header_image_url_not_forwarded_as_string() -> 
 
 
 _BRANCH_ROUTES = [
-    (900001, 101, "durlach"),
-    (900002, 102, "rastatt"),
-    (900003, 103, "karlsruhe"),
+    ("easyweek", 900001, 101, "durlach"),
+    ("easyweek", 900002, 102, "rastatt"),
+    ("altegio", 900003, 103, "karlsruhe"),
 ]
-_THREE_BRANCH_MAP = '{"101": 900001, "102": 900002, "103": 900003}'
+_THREE_BRANCH_MAP = (
+    '{"101":{"provider":"easyweek","company_id":900001},'
+    '"102":{"provider":"easyweek","company_id":900002},'
+    '"103":{"provider":"altegio","company_id":900003}}'
+)
 
 
 @pytest.mark.parametrize("method", ["send", "send_template"])
-@pytest.mark.parametrize(("company_id", "inbox_id", "_branch"), _BRANCH_ROUTES)
+@pytest.mark.parametrize(("tenant_provider", "company_id", "inbox_id", "_branch"), _BRANCH_ROUTES)
 async def test_configured_map_routes_each_company_to_its_own_inbox(
     monkeypatch: pytest.MonkeyPatch,
     method: str,
+    tenant_provider: str,
     company_id: int,
     inbox_id: int,
     _branch: str,
@@ -278,6 +285,7 @@ async def test_configured_map_routes_each_company_to_its_own_inbox(
             1,
             "+49123000000",
             f"{_branch} text",
+            tenant_provider=tenant_provider,
             company_id=company_id,
             contact_name=f"{_branch} contact",
         )
@@ -289,6 +297,7 @@ async def test_configured_map_routes_each_company_to_its_own_inbox(
             "de",
             ["param"],
             f"{_branch} fallback",
+            tenant_provider=tenant_provider,
             company_id=company_id,
             contact_name=f"{_branch} contact",
         )
@@ -312,8 +321,8 @@ async def test_concurrent_same_phone_sends_never_cross_du_ra_inboxes(monkeypatch
     phone = "+49123456789"
 
     await asyncio.gather(
-        provider.send(1, phone, "DU", company_id=900001),
-        provider.send(1, phone, "RA", company_id=900002),
+        provider.send(1, phone, "DU", tenant_provider="easyweek", company_id=900001),
+        provider.send(1, phone, "RA", tenant_provider="easyweek", company_id=900002),
     )
     await provider.aclose()
 
@@ -322,11 +331,38 @@ async def test_concurrent_same_phone_sends_never_cross_du_ra_inboxes(monkeypatch
     assert legacy.notes == []
 
 
+async def test_same_company_id_for_different_providers_routes_to_distinct_inboxes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw_map = '{"101":{"provider":"easyweek","company_id":900001},"201":{"provider":"altegio","company_id":900001}}'
+    monkeypatch.setattr("altegio_bot.providers.chatwoot_hybrid.settings.chatwoot_inbox_company_map", raw_map)
+    meta = _FakeMetaProvider()
+    factory = _InboxClientFactory()
+    provider = ChatwootHybridProvider(
+        primary=meta,
+        chatwoot=_FakeChatwootClient(),  # type: ignore[arg-type]
+        chatwoot_factory=factory,  # type: ignore[arg-type]
+    )
+
+    await provider.send(1, "+49123456789", "EW", tenant_provider="easyweek", company_id=900001)
+    await provider.send(1, "+49123456789", "ALT", tenant_provider="altegio", company_id=900001)
+    await provider.aclose()
+
+    assert len(meta.sent) == 2
+    assert factory.clients[101].notes == [("+49123456789", "EW")]
+    assert factory.clients[201].notes == [("+49123456789", "ALT")]
+
+
 @pytest.mark.parametrize(
     ("raw_map", "company_id", "reason"),
     [
-        (_THREE_BRANCH_MAP, 999999, "company_mapping_missing"),
-        ('{"101": 900001, "102": 900001}', 900001, "invalid_inbox_company_map"),
+        (_THREE_BRANCH_MAP, 999999, "tenant_mapping_missing"),
+        (
+            '{"101":{"provider":"easyweek","company_id":900001},"102":{"provider":"easyweek","company_id":900001}}',
+            900001,
+            "invalid_inbox_company_map",
+        ),
+        ('{"101":900001}', 900001, "provider_scope_missing"),
     ],
 )
 async def test_configured_unknown_or_invalid_map_never_uses_global_inbox(
@@ -352,6 +388,7 @@ async def test_configured_unknown_or_invalid_map_never_uses_global_inbox(
             1,
             phone,
             text,
+            tenant_provider="easyweek",
             company_id=company_id,
             staff_id=900001,
             contact_name="Private Name",
@@ -394,7 +431,14 @@ async def test_routed_mirror_keeps_contact_name(monkeypatch: pytest.MonkeyPatch)
         chatwoot_factory=factory,  # type: ignore[arg-type]
     )
 
-    await provider.send(1, "+49123000000", "hello", company_id=900001, contact_name="Anna Müller")
+    await provider.send(
+        1,
+        "+49123000000",
+        "hello",
+        tenant_provider="easyweek",
+        company_id=900001,
+        contact_name="Anna Müller",
+    )
     await provider.aclose()
 
     assert factory.clients[101].contact_names == ["Anna Müller"]
@@ -410,7 +454,13 @@ async def test_primary_failure_creates_no_routed_mirror_task(monkeypatch: pytest
     )
 
     with pytest.raises(RuntimeError, match="Meta API failure"):
-        await provider.send(1, "+49123000000", "never mirrored", company_id=900001)
+        await provider.send(
+            1,
+            "+49123000000",
+            "never mirrored",
+            tenant_provider="easyweek",
+            company_id=900001,
+        )
 
     assert provider._background_tasks == set()
     assert factory.clients == {}
@@ -433,6 +483,7 @@ async def test_primary_template_failure_creates_no_routed_mirror_task(monkeypatc
             "template",
             "de",
             ["param"],
+            tenant_provider="easyweek",
             company_id=900001,
         )
 
@@ -451,8 +502,14 @@ async def test_aclose_closes_legacy_and_every_created_inbox_client_once(monkeypa
         chatwoot_factory=factory,  # type: ignore[arg-type]
     )
 
-    for company_id, _inbox_id, branch in _BRANCH_ROUTES:
-        await provider.send(1, "+49123000000", branch, company_id=company_id)
+    for tenant_provider, company_id, _inbox_id, branch in _BRANCH_ROUTES:
+        await provider.send(
+            1,
+            "+49123000000",
+            branch,
+            tenant_provider=tenant_provider,
+            company_id=company_id,
+        )
     await provider.aclose()
 
     assert legacy.close_calls == 1
@@ -469,8 +526,8 @@ async def test_aclose_does_not_close_same_client_twice(monkeypatch: pytest.Monke
         chatwoot_factory=lambda _inbox_id: shared,  # type: ignore[arg-type]
     )
 
-    await provider.send(1, "+49123000000", "DU", company_id=900001)
-    await provider.send(1, "+49123000000", "RA", company_id=900002)
+    await provider.send(1, "+49123000000", "DU", tenant_provider="easyweek", company_id=900001)
+    await provider.send(1, "+49123000000", "RA", tenant_provider="easyweek", company_id=900002)
     await provider.aclose()
 
     assert shared.close_calls == 1

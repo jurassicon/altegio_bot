@@ -440,28 +440,72 @@ def test_inbox_map_valid() -> None:
     m = parse_chatwoot_inbox_company_map('{"8": 758285, "42": 1271200}')
     assert m.configured is True
     assert m.valid is True
-    assert m.mapping == {8: 758285, 42: 1271200}
-    assert m.inverse_mapping == {758285: 8, 1271200: 42}
+    assert m.provider_scoped is False
+    assert m.mapping == {}
+    assert m.inverse_mapping == {}
+    assert m.legacy_mapping == {8: 758285, 42: 1271200}
 
 
 def test_inbox_map_three_branches_has_one_bidirectional_source() -> None:
-    from altegio_bot.webhooks.common import parse_chatwoot_inbox_company_map
+    from altegio_bot.webhooks.common import ChatwootTenantIdentity, parse_chatwoot_inbox_company_map
 
-    m = parse_chatwoot_inbox_company_map('{"101": 900001, "102": 900002, "103": 900003}')
+    m = parse_chatwoot_inbox_company_map(
+        '{"101":{"provider":"easyweek","company_id":900001},'
+        '"102":{"provider":"easyweek","company_id":900002},'
+        '"103":{"provider":"altegio","company_id":900003}}'
+    )
     assert m.configured is True
     assert m.valid is True
-    assert m.mapping == {101: 900001, 102: 900002, 103: 900003}
-    assert m.inverse_mapping == {900001: 101, 900002: 102, 900003: 103}
+    assert m.provider_scoped is True
+    assert m.mapping == {
+        101: ChatwootTenantIdentity("easyweek", 900001),
+        102: ChatwootTenantIdentity("easyweek", 900002),
+        103: ChatwootTenantIdentity("altegio", 900003),
+    }
+    assert m.inverse_mapping == {identity: inbox for inbox, identity in m.mapping.items()}
 
 
 def test_inbox_map_duplicate_company_is_invalid_for_both_directions() -> None:
     from altegio_bot.webhooks.common import parse_chatwoot_inbox_company_map
 
-    m = parse_chatwoot_inbox_company_map('{"101": 900001, "102": 900001}')
+    m = parse_chatwoot_inbox_company_map(
+        '{"101":{"provider":"easyweek","company_id":900001},"102":{"provider":"easyweek","company_id":900001}}'
+    )
     assert m.configured is True
     assert m.valid is False
     assert m.mapping == {}
     assert m.inverse_mapping == {}
+
+
+def test_same_numeric_company_in_different_providers_is_two_tenants() -> None:
+    from altegio_bot.webhooks.common import ChatwootTenantIdentity, parse_chatwoot_inbox_company_map
+
+    m = parse_chatwoot_inbox_company_map(
+        '{"101":{"provider":"easyweek","company_id":900001},"102":{"provider":"altegio","company_id":900001}}'
+    )
+    assert m.valid is True
+    assert m.inverse_mapping == {
+        ChatwootTenantIdentity("easyweek", 900001): 101,
+        ChatwootTenantIdentity("altegio", 900001): 102,
+    }
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        '{"8":{"provider":"unknown","company_id":1}}',
+        '{"8":{"provider":"easyweek","company_id":"1"}}',
+        '{"8":{"provider":"easyweek","company_id":1,"extra":true}}',
+        '{"8":{"company_id":1}}',
+        '{"8":1,"9":{"provider":"altegio","company_id":2}}',
+    ],
+)
+def test_provider_scoped_map_rejects_invalid_or_mixed_values(raw: str) -> None:
+    from altegio_bot.webhooks.common import parse_chatwoot_inbox_company_map
+
+    parsed = parse_chatwoot_inbox_company_map(raw)
+    assert parsed.configured is True
+    assert parsed.valid is False
 
 
 def test_inbox_map_parser_never_logs_raw_config(caplog: pytest.LogCaptureFixture) -> None:
@@ -567,7 +611,7 @@ def test_inbox_map_key_range_and_totality() -> None:
 
     # str(PG_INT_MAX) accepted; +1 rejected; 5000-digit key rejected WITHOUT raising.
     ok = parse_chatwoot_inbox_company_map('{"' + str(PG_INT_MAX) + '": 5}')
-    assert ok.valid is True and ok.mapping == {PG_INT_MAX: 5}
+    assert ok.valid is True and ok.legacy_mapping == {PG_INT_MAX: 5}
 
     over = parse_chatwoot_inbox_company_map('{"' + str(PG_INT_MAX + 1) + '": 5}')
     assert over.configured is True and over.valid is False

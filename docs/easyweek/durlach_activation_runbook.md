@@ -14,6 +14,25 @@ Durlach и Rastatt — и оба активируются одним прохо�
 филиала). Это **не отдельный тип джоба** — job остаётся `record_created`,
 отличается только строка шаблона в БД и, значит, `meta_template_name`.
 
+## Production Compose contract
+
+На production все команды этого runbook выполняются из `/opt/altegio_bot` с
+одним и тем же file set. Optional override сохраняет подключение реальных
+потребителей Chatwoot к `chatwoot_internal`; команда только с
+`docker-compose.yml` при recreate отсоединит контейнер от этой сети:
+
+```bash
+cd /opt/altegio_bot
+COMPOSE="docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml"
+$COMPOSE config >/tmp/altegio_bot-pr7-compose-config.txt
+```
+
+Далее `$COMPOSE` означает именно эту переменную. Пока
+`CHATWOOT_BASE_URL` указывает на внутренний host, тот же file set обязателен и
+при rollback. Local/dev без внешней сети Chatwoot продолжает использовать
+только base-файл: `docker compose -f docker-compose.yml ...`; optional override
+в base-конфигурацию не добавляется.
+
 ## Профили филиалов
 
 Идентичность филиала неделима и живёт в исходниках
@@ -176,13 +195,14 @@ kitilash_du_record_canceled_v1
 
 `CHATWOOT_INBOX_COMPANY_MAP` — единственный источник обоих направлений:
 
-* outbound mirror: `company_id → inbox_id`;
-* operator relay: `inbox_id → company_id → provider/company-scoped sender`.
+* outbound mirror: `(provider, company_id) → inbox_id`;
+* operator relay: `inbox_id → (provider, company_id) → sender`.
 
-Каноническое направление JSON остаётся `inbox_id → company_id`:
+Каноническое направление JSON остаётся `inbox_id → tenant`, но tenant всегда
+записывается полной provider-scoped парой:
 
 ```text
-CHATWOOT_INBOX_COMPANY_MAP={"<KA inbox>":<KA Altegio company_id>,"<DU inbox>":<DU EasyWeek location_id>,"<RA inbox>":<RA EasyWeek location_id>}
+CHATWOOT_INBOX_COMPANY_MAP={"<KA inbox>":{"provider":"altegio","company_id":<KA Altegio company_id>},"<DU inbox>":{"provider":"easyweek","company_id":<DU EasyWeek location_id>},"<RA inbox>":{"provider":"easyweek","company_id":<RA EasyWeek location_id>}}
 ```
 
 После cutover для Rastatt указывайте текущий EasyWeek `location_id`, который
@@ -190,9 +210,13 @@ CHATWOOT_INBOX_COMPANY_MAP={"<KA inbox>":<KA Altegio company_id>,"<DU inbox>":<D
 после cutover недопустим.
 
 Configured map обязана быть однозначной. Parser отвергает duplicate JSON inbox
-keys, неканонические/неположительные ID и один `company_id`, назначенный двум
-inbox. При configured+invalid карте оба направления fail-closed. При валидной
-карте неизвестный inbox блокирует operator relay, а неизвестный company
+keys, неизвестный provider, неканонические/неположительные ID и одну tenant-пару,
+назначенную двум inbox. Одинаковый numeric `company_id` у Altegio и EasyWeek —
+две разные identity и может вести в два разных inbox. Старый integer-only JSON
+считается provider-unscoped и при configured map fail-closed: он не может
+однозначно разрешить provider collision. При configured+invalid карте оба
+направления fail-closed. При валидной карте неизвестный inbox блокирует operator
+relay, а неизвестная tenant-пара
 пропускает только secondary Chatwoot mirror; успешная WhatsApp-отправка клиенту
 не отменяется. Global inbox не используется как скрытый outbound fallback.
 
@@ -202,47 +226,130 @@ inbox. При configured+invalid карте оба направления fail-c
 ### Проверка карты до deploy
 
 ```bash
-docker compose -p altegio_bot run --rm altegio-outbox-worker \
+$COMPOSE run --rm altegio-outbox-worker \
   /app/.venv/bin/python - <<'PY'
 from altegio_bot.easyweek_locations import configured_easyweek_locations
 from altegio_bot.settings import settings
-from altegio_bot.webhooks.common import parse_chatwoot_inbox_company_map
+from altegio_bot.webhooks.common import ChatwootTenantIdentity, parse_chatwoot_inbox_company_map
 
 branches = configured_easyweek_locations()
 inboxes = parse_chatwoot_inbox_company_map(settings.chatwoot_inbox_company_map)
-easyweek_ids = {location.company_id for location in branches.locations.values()}
-mapped_ids = set(inboxes.inverse_mapping)
+easyweek_tenants = {
+    ChatwootTenantIdentity(provider="easyweek", company_id=location.company_id)
+    for location in branches.locations.values()
+}
+mapped_tenants = set(inboxes.inverse_mapping)
 print(
     {
         "map_configured": inboxes.configured,
         "map_valid": inboxes.valid,
+        "provider_scoped": inboxes.provider_scoped,
         "map_entries": len(inboxes.mapping),
         "unique_inboxes": len(inboxes.mapping) == len(set(inboxes.mapping)),
-        "unique_companies": len(inboxes.inverse_mapping) == len(inboxes.mapping),
-        "easyweek_ids_all_mapped": easyweek_ids <= mapped_ids,
+        "unique_tenants": len(inboxes.inverse_mapping) == len(inboxes.mapping),
+        "easyweek_tenants_all_mapped": easyweek_tenants <= mapped_tenants,
         "global_general_inbox_configured": settings.chatwoot_inbox_id > 0,
     }
 )
 PY
 ```
 
-Gate: configured=true, valid=true, `map_entries=3`, оба unique=true, EasyWeek
-IDs полностью покрыты, global General/Unassigned настроен отдельно. Вручную
+Gate: configured=true, valid=true, provider_scoped=true, `map_entries=3`, оба
+unique=true, EasyWeek tenant-пары полностью покрыты, global General/Unassigned
+настроен отдельно. Вручную
 сверьте: DU/RA IDs равны одноимённым записям `EASYWEEK_LOCATION_MAP`, а третья
 company — действующая Karlsruhe Altegio company. Любое расхождение — STOP.
 
 ### Карту читают два worker
 
 После правки карты пересоздайте оба потребителя; обычный `restart` и `up -d`
-без `--force-recreate` не перечитывают env:
+без `--force-recreate` не перечитывают env. До recreate зафиксируйте сети обоих
+текущих контейнеров:
 
 ```bash
-docker compose -p altegio_bot up -d --force-recreate \
+for CHATWOOT_SERVICE in altegio-outbox-worker altegio-whatsapp-inbox-worker; do
+  CONTAINER_ID="$($COMPOSE ps -q "$CHATWOOT_SERVICE")"
+  test -n "$CONTAINER_ID"
+  echo "SERVICE=$CHATWOOT_SERVICE"
+  docker inspect "$CONTAINER_ID" \
+    --format '{{range $name, $_ := .NetworkSettings.Networks}}{{println $name}}{{end}}' | sort
+done
+```
+
+Gate до deploy: у каждого worker видны `altegio_bot_default` и
+`${CHATWOOT_INTERNAL_NETWORK:-chatwoot_default}`. Затем recreate выполняется
+тем же production file set:
+
+```bash
+$COMPOSE up -d --force-recreate \
   altegio-outbox-worker altegio-whatsapp-inbox-worker
 ```
 
-`altegio-outbox-worker` читает company→inbox для outbound mirror;
-`altegio-whatsapp-inbox-worker` читает inbox→company для operator relay.
+Сразу после recreate повторите inspect — отсутствие любой из двух сетей
+останавливает rollout:
+
+```bash
+for CHATWOOT_SERVICE in altegio-outbox-worker altegio-whatsapp-inbox-worker; do
+  CONTAINER_ID="$($COMPOSE ps -q "$CHATWOOT_SERVICE")"
+  test -n "$CONTAINER_ID"
+  echo "SERVICE=$CHATWOOT_SERVICE"
+  docker inspect "$CONTAINER_ID" \
+    --format '{{range $name, $_ := .NetworkSettings.Networks}}{{println $name}}{{end}}' | sort
+done
+```
+
+Проверьте внутренний DNS и authenticated API из **обоих** реальных
+потребителей. Проба выводит только boolean/status и тип технической ошибки: не
+печатает token, телефон, URL или response body.
+
+```bash
+for CHATWOOT_SERVICE in altegio-outbox-worker altegio-whatsapp-inbox-worker; do
+  echo "SERVICE=$CHATWOOT_SERVICE"
+  $COMPOSE exec -T "$CHATWOOT_SERVICE" /app/.venv/bin/python - <<'PY'
+import asyncio
+import socket
+from urllib.parse import urlsplit
+
+import httpx
+
+from altegio_bot.settings import settings
+
+base_url = settings.chatwoot_base_url.rstrip("/")
+hostname = urlsplit(base_url).hostname
+if not hostname:
+    print({"dns_ok": False, "dns_error_type": "MissingHostname"})
+    raise SystemExit(1)
+try:
+    socket.getaddrinfo(hostname, None)
+except Exception as exc:
+    print({"dns_ok": False, "dns_error_type": type(exc).__name__})
+    raise SystemExit(1) from None
+
+headers = {"api_access_token": settings.chatwoot_api_token}
+if settings.chatwoot_api_forwarded_proto:
+    headers["X-Forwarded-Proto"] = settings.chatwoot_api_forwarded_proto
+url = f"{base_url}/api/v1/accounts/{settings.chatwoot_account_id}/inboxes"
+
+async def probe() -> None:
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(url, headers=headers)
+    except Exception as exc:
+        print({"dns_ok": True, "api_ok": False, "api_error_type": type(exc).__name__})
+        raise SystemExit(1) from None
+    ok = response.status_code == 200
+    print({"dns_ok": True, "api_ok": ok, "api_status": response.status_code})
+    if not ok:
+        raise SystemExit(1)
+
+asyncio.run(probe())
+PY
+done
+```
+
+`altegio-outbox-worker` читает tenant→inbox для outbound mirror;
+`altegio-whatsapp-inbox-worker` читает inbox→tenant для operator relay и
+tenant route для входящих reply/reaction.
 `altegio-api` ради этой карты пересоздавать не нужно.
 
 ### General / Unassigned — единственный разрешённый global fallback
@@ -288,7 +395,7 @@ Capture уже включён и остаётся включённым: `EASYWEE
 `restart` и `up -d` без `--force-recreate` не перечитывают `env_file`:
 
 ```bash
-docker compose -p altegio_bot up -d --force-recreate \
+$COMPOSE up -d --force-recreate \
   altegio-easyweek-inbox-worker altegio-outbox-worker
 ```
 
@@ -298,7 +405,7 @@ JSON, UUID, URLs или секреты:
 ```bash
 for EW_SERVICE in altegio-easyweek-inbox-worker altegio-outbox-worker; do
   echo "SERVICE=$EW_SERVICE"
-  docker compose -p altegio_bot exec -T "$EW_SERVICE" /app/.venv/bin/python - <<'PY'
+  $COMPOSE exec -T "$EW_SERVICE" /app/.venv/bin/python - <<'PY'
 from altegio_bot.easyweek_locations import configured_easyweek_locations
 from altegio_bot.settings import settings
 
@@ -361,7 +468,7 @@ Read-only проба помогает собрать реестр, а сам с�
 больше нет:
 
 ```bash
-docker compose -p altegio_bot run --rm altegio-outbox-worker \
+$COMPOSE run --rm altegio-outbox-worker \
   /app/.venv/bin/python -m altegio_bot.scripts.seed_easyweek_templates
 ```
 
@@ -612,6 +719,14 @@ conversation появились только в DU, RA и KA inbox соотве�
 остальных branch inbox. Один и тот же test phone для DU и RA обязан создать или
 использовать две разные conversations — по одной на inbox.
 
+**Inbound reply и reaction:** ответьте в WhatsApp через reply context сначала
+на DU lifecycle notification, затем тем же test phone на RA notification. Reply
+и reaction на DU обязаны остаться в DU conversation/inbox, на RA — в RA;
+cross-inbox native `in_reply_to` запрещён. Повторите контроль для KA. Новое
+сообщение или reaction без найденного target остаётся в General / Unassigned,
+но найденный authoritative target с missing/invalid tenant route обязан
+fail-closed без fallback в General.
+
 **Operator relay:** из каждого branch inbox ответьте на тестовый номер.
 Durlach должен выбрать Durlach EasyWeek company/sender, Rastatt — текущий
 Rastatt EasyWeek company/sender, Karlsruhe — Karlsruhe Altegio company/sender.
@@ -639,10 +754,11 @@ ORDER BY 1, 2;
 Каждая строка обязана нести префикс своего `company_id`. Любая пара
 «company Durlach + `ra_*`» или «company Rastatt + `du_*`» — это стоп.
 
-Логи обоих воркеров не должны содержать PII и секретов:
+Логи потребителей не должны содержать PII, raw map и секреты:
 
 ```bash
-docker compose -p altegio_bot logs --since=1h altegio-outbox-worker altegio-easyweek-inbox-worker | grep -Eci 'customer_phone|customer_email|Authorization: Bearer|token='
+$COMPOSE logs --since=1h altegio-outbox-worker altegio-whatsapp-inbox-worker altegio-easyweek-inbox-worker \
+  | grep -Eci 'customer_phone|customer_email|Authorization: Bearer|token=|CHATWOOT_INBOX_COMPANY_MAP=|Traceback|gaierror'
 ```
 
 Ожидается `0`.
@@ -747,7 +863,7 @@ delivery-retry рождается не там: его создаёт `_handle_fa
 1. Остановить outbox-воркер:
 
 ```bash
-docker compose -p altegio_bot stop altegio-outbox-worker
+$COMPOSE stop altegio-outbox-worker
 ```
 
 2. Выключить планировщик, чтобы не появлялись новые job'ы:
@@ -903,7 +1019,7 @@ ORDER BY created_at DESC;
 5A.3 Только теперь поднимите outbox:
 
 ```bash
-docker compose -p altegio_bot up -d altegio-outbox-worker
+$COMPOSE up -d altegio-outbox-worker
 ```
 
 #### Вариант B — выключить создание delivery-retry и поднять outbox
@@ -921,7 +1037,7 @@ OUTBOX_DELIVERY_RETRY_ENABLED=false
 2. Пересоздать сервис, который обрабатывает status-callbacks:
 
 ```bash
-docker compose -p altegio_bot up -d --force-recreate altegio-whatsapp-inbox-worker
+$COMPOSE up -d --force-recreate altegio-whatsapp-inbox-worker
 ```
 
    **Этот шаг обязателен, и пропустить его — значит не сделать ничего.**
@@ -946,7 +1062,7 @@ docker compose -p altegio_bot up -d --force-recreate altegio-whatsapp-inbox-work
 5. Теперь поднять общий outbox — Altegio возобновляется:
 
 ```bash
-docker compose -p altegio_bot up -d altegio-outbox-worker
+$COMPOSE up -d altegio-outbox-worker
 ```
 
 6. Повторите проверку из шага 4 несколько раз в течение получаса: запоздавшие
@@ -964,7 +1080,7 @@ OUTBOX_DELIVERY_RETRY_ENABLED=true
 ```
 
 ```bash
-docker compose -p altegio_bot up -d --force-recreate altegio-whatsapp-inbox-worker
+$COMPOSE up -d --force-recreate altegio-whatsapp-inbox-worker
 ```
 
 ### Что НЕ ломается в обоих режимах

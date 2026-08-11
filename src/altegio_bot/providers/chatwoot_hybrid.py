@@ -15,7 +15,11 @@ from altegio_bot.chatwoot_client import ChatwootClient
 from altegio_bot.providers.base import WhatsAppProvider
 from altegio_bot.providers.meta_cloud import MetaCloudProvider
 from altegio_bot.settings import settings
-from altegio_bot.webhooks.common import InboxCompanyMap, parse_chatwoot_inbox_company_map, positive_int
+from altegio_bot.webhooks.common import (
+    InboxCompanyMap,
+    parse_chatwoot_inbox_company_map,
+    resolve_chatwoot_tenant_inbox,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -25,8 +29,8 @@ _ACLOSE_TIMEOUT = 3.0
 class ChatwootHybridProvider:
     """Wraps MetaCloudProvider and mirrors outbound messages to Chatwoot."""
 
-    # Signals to safe_send / safe_send_template that this provider accepts
-    # company_id and staff_id keyword arguments.
+    # Signals to safe_send / safe_send_template that this provider accepts the
+    # tenant-provider/company routing kwargs (plus the legacy staff audit kwarg).
     _supports_mirror_kwargs: bool = True
 
     def __init__(
@@ -95,6 +99,7 @@ class ChatwootHybridProvider:
         phone_e164: str,
         text: str,
         *,
+        tenant_provider: str | None = None,
         company_id: int = 0,
         staff_id: int | None = None,
         contact_name: str | None = None,
@@ -116,6 +121,7 @@ class ChatwootHybridProvider:
             self._log_to_chatwoot(
                 phone_e164,
                 text,
+                tenant_provider=tenant_provider,
                 company_id=company_id,
                 contact_name=contact_name,
                 meta={"msg_id": msg_id},
@@ -133,6 +139,7 @@ class ChatwootHybridProvider:
         params: list[str],
         fallback_text: str = "",
         *,
+        tenant_provider: str | None = None,
         company_id: int = 0,
         staff_id: int | None = None,
         contact_name: str | None = None,
@@ -155,6 +162,7 @@ class ChatwootHybridProvider:
             self._log_to_chatwoot(
                 phone_e164,
                 content,
+                tenant_provider=tenant_provider,
                 company_id=company_id,
                 contact_name=contact_name,
                 meta={"msg_id": msg_id},
@@ -168,11 +176,12 @@ class ChatwootHybridProvider:
         phone_e164: str,
         content: str,
         *,
+        tenant_provider: str | None = None,
         company_id: int = 0,
         contact_name: str | None = None,
         meta: dict[str, Any] | None = None,
     ) -> None:
-        chatwoot, inbox_id, routing_error = self._chatwoot_for_company(company_id)
+        chatwoot, inbox_id, routing_error = self._chatwoot_for_tenant(tenant_provider, company_id)
         if chatwoot is None:
             # Stable reason only: never log the raw map, phone, text, contact,
             # provider response or any other customer data.
@@ -194,20 +203,18 @@ class ChatwootHybridProvider:
                 type(exc).__name__,
             )
 
-    def _chatwoot_for_company(self, company_id: object) -> tuple[ChatwootClient | None, int | None, str | None]:
-        """Resolve the outbound mirror client without guessing or mutable state."""
+    def _chatwoot_for_tenant(
+        self,
+        tenant_provider: object,
+        company_id: object,
+    ) -> tuple[ChatwootClient | None, int | None, str | None]:
+        """Resolve the outbound mirror client by the full CRM tenant pair."""
         parsed = self._inbox_company_map
-        if not parsed.configured:
-            return self._chatwoot, getattr(self._chatwoot, "_inbox_id", None), None
-        if not parsed.valid:
-            return None, None, "invalid_inbox_company_map"
-
-        canonical_company_id = positive_int(company_id)
-        if canonical_company_id is None:
-            return None, None, "invalid_company_id"
-        inbox_id = parsed.inverse_mapping.get(canonical_company_id)
+        inbox_id, routing_error = resolve_chatwoot_tenant_inbox(parsed, tenant_provider, company_id)
+        if routing_error is not None:
+            return None, None, routing_error
         if inbox_id is None:
-            return None, None, "company_mapping_missing"
+            return self._chatwoot, getattr(self._chatwoot, "_inbox_id", None), None
 
         client = self._chatwoot_clients.get(inbox_id)
         if client is None:

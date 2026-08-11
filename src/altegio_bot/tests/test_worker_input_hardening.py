@@ -668,7 +668,7 @@ async def test_lifecycle_non_string_relay_text(session_maker, monkeypatch, bad_t
 
 import logging  # noqa: E402
 
-_MAP_ONE = '{"8": 1}'  # inbox 8 -> company 1 (matches the seeded sender)
+_MAP_ONE = '{"8":{"provider":"altegio","company_id":1}}'  # matches the seeded sender
 _MISSING = object()  # sentinel: omit chatwoot_inbox_id entirely
 
 

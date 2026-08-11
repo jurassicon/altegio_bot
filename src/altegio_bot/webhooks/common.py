@@ -32,6 +32,11 @@ PG_BIGINT_MIN, PG_BIGINT_MAX = -(2**63), 2**63 - 1
 # отсекаем ДО ``int()`` (Python бросает ValueError на очень длинной строке).
 _PG_INT_MAX_DIGITS = len(str(PG_INT_MAX))
 
+# Closed tenant-provider vocabulary for branch routing. Provider is part of the
+# security boundary: accepting arbitrary/coerced strings here would turn a
+# typo into a silently different tenant namespace.
+CHATWOOT_TENANT_PROVIDERS = frozenset({"altegio", "easyweek"})
+
 # E.164 допускает максимум 15 цифр; больше не влезает и в downstream-колонки
 # (OutboxMessage.phone_e164 = VARCHAR(32)) — режем ДО persistence.
 _E164_MAX_DIGITS = 15
@@ -208,6 +213,24 @@ def positive_int(value: object, *, max_value: int = PG_INT_MAX) -> int | None:
 
 
 @dataclass(frozen=True)
+class ChatwootTenantIdentity:
+    """Authoritative CRM tenant identity used by Chatwoot branch routing."""
+
+    provider: str
+    company_id: int
+
+
+def chatwoot_tenant_identity(provider: object, company_id: object) -> ChatwootTenantIdentity | None:
+    """Return a strict provider/company pair, without coercion or guessing."""
+    if not isinstance(provider, str) or provider not in CHATWOOT_TENANT_PROVIDERS:
+        return None
+    canonical_company_id = positive_int(company_id)
+    if canonical_company_id is None:
+        return None
+    return ChatwootTenantIdentity(provider=provider, company_id=canonical_company_id)
+
+
+@dataclass(frozen=True)
 class InboxCompanyMap:
     """Результат разбора ``CHATWOOT_INBOX_COMPANY_MAP``.
 
@@ -215,15 +238,48 @@ class InboxCompanyMap:
       backward-compatible fallback по ``phone_number_id``.
     * ``configured=True, valid=False`` — синтаксически/семантически невалидная
       конфигурация: relay блокируется стабильным ``invalid_inbox_company_map``.
-    * ``configured=True, valid=True`` — ``mapping`` содержит только валидные
-      пары ``int inbox_id -> int company_id``, а ``inverse_mapping`` — их
-      однозначную инверсию ``company_id -> inbox_id`` для outbound mirror.
+    * ``configured=True, valid=True, provider_scoped=True`` — ``mapping``
+      содержит только валидные пары ``inbox_id -> (provider, company_id)``, а
+      ``inverse_mapping`` — их однозначную инверсию для outbound mirror.
+    * ``provider_scoped=False`` при configured map означает распознанный старый
+      integer-only формат. Он сохраняется только как явный legacy diagnostic и
+      НЕ имеет права маршрутизировать branch traffic: provider из него доказать
+      невозможно.
     """
 
     configured: bool
     valid: bool
-    mapping: dict[int, int] = field(default_factory=dict)
-    inverse_mapping: dict[int, int] = field(default_factory=dict)
+    provider_scoped: bool = False
+    mapping: dict[int, ChatwootTenantIdentity] = field(default_factory=dict)
+    inverse_mapping: dict[ChatwootTenantIdentity, int] = field(default_factory=dict)
+    legacy_mapping: dict[int, int] = field(default_factory=dict)
+
+
+def resolve_chatwoot_tenant_inbox(
+    parsed: InboxCompanyMap,
+    tenant_provider: object,
+    company_id: object,
+) -> tuple[int | None, str | None]:
+    """Resolve a proven tenant to its inbox with stable fail-closed reasons.
+
+    ``(None, None)`` means only that the map is unconfigured and the documented
+    legacy General/single-inbox route is allowed. Every configured-map problem
+    returns a stable reason and never falls back to the global inbox.
+    """
+    if not parsed.configured:
+        return None, None
+    if not parsed.valid:
+        return None, "invalid_inbox_company_map"
+    if not parsed.provider_scoped:
+        return None, "provider_scope_missing"
+
+    identity = chatwoot_tenant_identity(tenant_provider, company_id)
+    if identity is None:
+        return None, "invalid_tenant_identity"
+    inbox_id = parsed.inverse_mapping.get(identity)
+    if inbox_id is None:
+        return None, "tenant_mapping_missing"
+    return inbox_id, None
 
 
 def _canonical_inbox_key(key: object) -> int | None:
@@ -256,7 +312,7 @@ def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict:
 
 
 def parse_chatwoot_inbox_company_map(raw: object) -> InboxCompanyMap:
-    """Тотальный ambiguity-safe парсер inbox→company конфигурации.
+    """Тотальный ambiguity-safe parser единой inbox↔tenant конфигурации.
 
     Для ЛЮБОГО ``raw`` возвращает :class:`InboxCompanyMap` и НИКОГДА не бросает
     исключение, не возвращает и не логирует сырой конфиг/значение. Правила:
@@ -266,11 +322,15 @@ def parse_chatwoot_inbox_company_map(raw: object) -> InboxCompanyMap:
       * ошибка JSON / duplicate JSON key / не-``dict`` top-level → невалидна;
       * ключ — строгий canonical positive int в диапазоне PG Integer
         (``fullmatch``, без ``.strip()``, длина отсекается до ``int()``);
-      * значение — только ``type(v) is int`` и ``0 < v <= PG_INT_MAX`` (никакого
-        ``int(value)`` для произвольного JSON);
+      * provider-scoped значение — объект РОВНО с ключами ``provider`` и
+        ``company_id``; provider входит в закрытый allowlist, company_id —
+        строгий positive PostgreSQL Integer;
+      * старые integer-only значения распознаются как legacy schema, но не
+        считаются доказательством provider и не маршрутизируют branch traffic;
+      * смешивать legacy и provider-scoped значения запрещено;
       * коллизия нормализованного ключа (defense-in-depth) → невалидна;
-      * один ``company_id`` в нескольких inbox → невалидна: обратный outbound
-        routing не имеет права выбирать inbox по порядку JSON.
+      * одна tenant-пара в нескольких inbox → невалидна; одинаковый numeric
+        company_id у РАЗНЫХ providers допустим и остаётся двумя tenant'ами.
     """
     if not isinstance(raw, str):
         return InboxCompanyMap(configured=True, valid=False)
@@ -294,26 +354,43 @@ def parse_chatwoot_inbox_company_map(raw: object) -> InboxCompanyMap:
     if not parsed:
         return InboxCompanyMap(configured=False, valid=True)
 
-    mapping: dict[int, int] = {}
-    inverse_mapping: dict[int, int] = {}
-    for key, company in parsed.items():
+    mapping: dict[int, ChatwootTenantIdentity] = {}
+    inverse_mapping: dict[ChatwootTenantIdentity, int] = {}
+    legacy_mapping: dict[int, int] = {}
+    value_mode: str | None = None
+    for key, value in parsed.items():
         inbox_id = _canonical_inbox_key(key)
         if inbox_id is None:
             return InboxCompanyMap(configured=True, valid=False)
-        if type(company) is not int or not (0 < company <= PG_INT_MAX):
+
+        if type(value) is int:
+            if value_mode == "tenant":
+                return InboxCompanyMap(configured=True, valid=False)
+            value_mode = "legacy"
+            company_id = positive_int(value)
+            if company_id is None or company_id in legacy_mapping.values():
+                return InboxCompanyMap(configured=True, valid=False)
+            legacy_mapping[inbox_id] = company_id
+            continue
+
+        if not isinstance(value, dict) or set(value) != {"provider", "company_id"}:
             return InboxCompanyMap(configured=True, valid=False)
-        if inbox_id in mapping:  # defense-in-depth против коллизий ключей
+        if value_mode == "legacy":
             return InboxCompanyMap(configured=True, valid=False)
-        if company in inverse_mapping:
+        value_mode = "tenant"
+        identity = chatwoot_tenant_identity(value.get("provider"), value.get("company_id"))
+        if identity is None or identity in inverse_mapping:
             return InboxCompanyMap(configured=True, valid=False)
-        mapping[inbox_id] = company
-        inverse_mapping[company] = inbox_id
+        mapping[inbox_id] = identity
+        inverse_mapping[identity] = inbox_id
 
     return InboxCompanyMap(
         configured=True,
         valid=True,
+        provider_scoped=value_mode == "tenant",
         mapping=mapping,
         inverse_mapping=inverse_mapping,
+        legacy_mapping=legacy_mapping,
     )
 
 

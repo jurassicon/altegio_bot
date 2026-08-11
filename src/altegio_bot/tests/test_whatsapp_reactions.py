@@ -18,7 +18,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from sqlalchemy import select
 
-from altegio_bot.models.models import OutboxMessage, Record, WhatsAppEvent
+from altegio_bot.models.models import (
+    PROVIDER_ALTEGIO,
+    PROVIDER_EASYWEEK,
+    MessageJob,
+    OutboxMessage,
+    Record,
+    WhatsAppEvent,
+    WhatsAppSender,
+)
 from altegio_bot.providers.base import WhatsAppProvider
 from altegio_bot.workers.whatsapp_inbox_worker import (
     ReactionTarget,
@@ -34,6 +42,11 @@ TARGET_WAMID = "wamid.TARGET"
 REACTION_WAMID = "wamid.REACTION"
 DEST_CONVERSATION_ID = 555
 MESSAGE_ID = 9100
+BRANCH_MAP = (
+    '{"101":{"provider":"easyweek","company_id":900001},'
+    '"102":{"provider":"easyweek","company_id":900002},'
+    '"103":{"provider":"altegio","company_id":900003}}'
+)
 
 
 class _CaptureProvider(WhatsAppProvider):
@@ -104,11 +117,14 @@ def _outbox(
     chatwoot_message_id: int | None = None,
     chatwoot_conversation_id: int | None = None,
     body: str = "Ваша запись завтра в 10:00",
+    company_id: int = 1,
+    job_id: int | None = None,
+    sender_id: int | None = None,
     created_at: datetime | None = None,
 ) -> OutboxMessage:
     now = datetime.now(timezone.utc)
     ob = OutboxMessage(
-        company_id=1,
+        company_id=company_id,
         phone_e164=phone_e164,
         template_code=template_code,
         language="de",
@@ -118,6 +134,8 @@ def _outbox(
         scheduled_at=now,
         sent_at=now,
         message_source=message_source,
+        job_id=job_id,
+        sender_id=sender_id,
         record_id=record_id,
         chatwoot_message_id=chatwoot_message_id,
         chatwoot_conversation_id=chatwoot_conversation_id,
@@ -212,6 +230,117 @@ async def _run_reaction(
     return evt, mock_inst
 
 
+async def _seed_proven_reaction_target(
+    session: Any,
+    *,
+    provider: str,
+    company_id: int,
+    source: str,
+    wamid: str,
+    phone_e164: str,
+    suffix: str,
+) -> None:
+    now = datetime.now(timezone.utc)
+    if source == "operator":
+        sender = WhatsAppSender(
+            provider=provider,
+            company_id=company_id,
+            sender_code=f"react-{company_id}-{suffix[-8:]}",
+            phone_number_id=PHONE_NUMBER_ID,
+            display_phone="+49",
+            is_active=True,
+        )
+        session.add(sender)
+        await session.flush()
+        session.add(
+            _outbox(
+                provider_message_id=wamid,
+                phone_e164=phone_e164,
+                company_id=company_id,
+                message_source="operator",
+                template_code="operator_relay",
+                sender_id=sender.id,
+                chatwoot_message_id=123,
+                chatwoot_conversation_id=DEST_CONVERSATION_ID,
+            )
+        )
+        return
+
+    job = MessageJob(
+        provider=provider,
+        company_id=company_id,
+        job_type="reminder_24h",
+        run_at=now,
+        status="done",
+        dedupe_key=f"reaction-route:{suffix}:{wamid}",
+        payload={},
+    )
+    session.add(job)
+    await session.flush()
+    session.add(
+        _outbox(
+            provider_message_id=wamid,
+            phone_e164=phone_e164,
+            company_id=company_id,
+            job_id=job.id,
+        )
+    )
+
+
+async def _run_tenant_reaction(
+    session_maker: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    raw_map: str,
+    targets: list[tuple[str, int, str]],
+    target_wamid: str | None = TARGET_WAMID,
+    target_phone: str = PHONE_E164,
+    from_phone: str = FROM_PHONE,
+    dedupe_key: str = "wa:tenant-reaction",
+    destination_conversation_id: int = DEST_CONVERSATION_ID,
+    expected_error: str | None = None,
+    prior_inbound: bool = False,
+) -> tuple[WhatsAppEvent, MagicMock, MagicMock]:
+    import altegio_bot.workers.whatsapp_inbox_worker as wiw
+
+    monkeypatch.setattr(wiw.settings, "chatwoot_inbox_company_map", raw_map)
+    provider = _CaptureProvider()
+    mock_cls, mock_inst = _mock_chatwoot_client(conversation_id=destination_conversation_id)
+
+    async with session_maker() as session:
+        async with session.begin():
+            for index, (target_provider, company_id, source) in enumerate(targets):
+                assert target_wamid is not None
+                await _seed_proven_reaction_target(
+                    session,
+                    provider=target_provider,
+                    company_id=company_id,
+                    source=source,
+                    wamid=target_wamid,
+                    phone_e164=target_phone,
+                    suffix=f"{dedupe_key}-{index}",
+                )
+            if prior_inbound:
+                assert target_wamid is not None
+                session.add(_prior_inbound_event(whatsapp_message_id=target_wamid))
+
+            evt = _make_event(
+                _reaction_payload(target_wamid=target_wamid, from_phone=from_phone),
+                dedupe_key=dedupe_key,
+            )
+            session.add(evt)
+            await session.flush()
+
+            with patch("altegio_bot.workers.whatsapp_inbox_worker.ChatwootClient", mock_cls):
+                if expected_error is None:
+                    await handle_event(session, evt, provider)
+                else:
+                    with pytest.raises(RuntimeError, match=expected_error):
+                        await handle_event(session, evt, provider)
+
+    return evt, mock_cls, mock_inst
+
+
 # ---------------------------------------------------------------------------
 # 1. extraction
 # ---------------------------------------------------------------------------
@@ -227,6 +356,206 @@ def test_extract_actions_reaction() -> None:
     assert a["whatsapp_message_id"] == REACTION_WAMID
     assert a["phone_e164"] == PHONE_E164
     assert a["cmd"] is None
+
+
+@pytest.mark.parametrize(
+    ("tenant_provider", "company_id", "inbox_id"),
+    [
+        (PROVIDER_EASYWEEK, 900001, 101),
+        (PROVIDER_EASYWEEK, 900002, 102),
+        (PROVIDER_ALTEGIO, 900003, 103),
+    ],
+    ids=["durlach", "rastatt", "karlsruhe"],
+)
+@pytest.mark.asyncio
+async def test_reaction_to_lifecycle_notification_uses_its_branch_inbox(
+    session_maker,
+    monkeypatch: pytest.MonkeyPatch,
+    tenant_provider: str,
+    company_id: int,
+    inbox_id: int,
+) -> None:
+    evt, mock_cls, cw = await _run_tenant_reaction(
+        session_maker,
+        monkeypatch,
+        raw_map=BRANCH_MAP,
+        targets=[(tenant_provider, company_id, "bot")],
+        dedupe_key=f"wa:tenant-reaction:{inbox_id}",
+    )
+
+    mock_cls.assert_called_once_with(inbox_id=inbox_id)
+    cw.send_message.assert_called_once()
+    assert evt.forwarded_chatwoot_conversation_id == DEST_CONVERSATION_ID
+    assert evt.error is None
+
+
+@pytest.mark.asyncio
+async def test_reaction_to_operator_message_uses_sender_tenant_branch(
+    session_maker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    evt, mock_cls, cw = await _run_tenant_reaction(
+        session_maker,
+        monkeypatch,
+        raw_map=BRANCH_MAP,
+        targets=[(PROVIDER_EASYWEEK, 900001, "operator")],
+        dedupe_key="wa:tenant-reaction:operator",
+    )
+
+    mock_cls.assert_called_once_with(inbox_id=101)
+    assert cw.send_message.call_args.kwargs["content_attributes"]["in_reply_to"] == 123
+    assert evt.error is None
+
+
+@pytest.mark.asyncio
+async def test_same_phone_reactions_keep_separate_branch_conversations(
+    session_maker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    du_event, du_cls, _du = await _run_tenant_reaction(
+        session_maker,
+        monkeypatch,
+        raw_map=BRANCH_MAP,
+        targets=[(PROVIDER_EASYWEEK, 900001, "bot")],
+        target_wamid="wamid.DU.REACT",
+        dedupe_key="wa:tenant-reaction:du",
+        destination_conversation_id=2101,
+    )
+    ra_event, ra_cls, _ra = await _run_tenant_reaction(
+        session_maker,
+        monkeypatch,
+        raw_map=BRANCH_MAP,
+        targets=[(PROVIDER_EASYWEEK, 900002, "bot")],
+        target_wamid="wamid.RA.REACT",
+        dedupe_key="wa:tenant-reaction:ra",
+        destination_conversation_id=2102,
+    )
+
+    du_cls.assert_called_once_with(inbox_id=101)
+    ra_cls.assert_called_once_with(inbox_id=102)
+    assert du_event.forwarded_chatwoot_conversation_id == 2101
+    assert ra_event.forwarded_chatwoot_conversation_id == 2102
+
+
+@pytest.mark.parametrize(
+    ("target_wamid", "target_phone", "targets", "dedupe_key"),
+    [
+        (None, PHONE_E164, [], "wa:tenant-reaction:no-target"),
+        ("wamid.UNKNOWN", PHONE_E164, [], "wa:tenant-reaction:unknown"),
+        (
+            "wamid.WRONG.PHONE",
+            "+10000000001",
+            [(PROVIDER_EASYWEEK, 900001, "bot")],
+            "wa:tenant-reaction:wrong-phone",
+        ),
+    ],
+    ids=["no-target", "unknown-target", "wrong-phone"],
+)
+@pytest.mark.asyncio
+async def test_reaction_without_proven_target_uses_general_inbox(
+    session_maker,
+    monkeypatch: pytest.MonkeyPatch,
+    target_wamid: str | None,
+    target_phone: str,
+    targets: list[tuple[str, int, str]],
+    dedupe_key: str,
+) -> None:
+    evt, mock_cls, cw = await _run_tenant_reaction(
+        session_maker,
+        monkeypatch,
+        raw_map=BRANCH_MAP,
+        targets=targets,
+        target_wamid=target_wamid,
+        target_phone=target_phone,
+        dedupe_key=dedupe_key,
+    )
+
+    mock_cls.assert_called_once_with()
+    cw.send_message.assert_called_once()
+    assert evt.error is None
+
+
+@pytest.mark.parametrize(
+    ("raw_map", "expected_reason"),
+    [
+        (
+            '{"102":{"provider":"easyweek","company_id":900002}}',
+            "tenant_mapping_missing",
+        ),
+        (
+            '{"101":{"provider":"easyweek","company_id":900001},"102":{"provider":"easyweek","company_id":900001}}',
+            "invalid_inbox_company_map",
+        ),
+        ('{"101":900001}', "provider_scope_missing"),
+    ],
+    ids=["missing-route", "invalid-map", "legacy-unscoped-map"],
+)
+@pytest.mark.asyncio
+async def test_reaction_with_found_target_and_unusable_route_fails_before_chatwoot_client(
+    session_maker,
+    monkeypatch: pytest.MonkeyPatch,
+    raw_map: str,
+    expected_reason: str,
+) -> None:
+    evt, mock_cls, cw = await _run_tenant_reaction(
+        session_maker,
+        monkeypatch,
+        raw_map=raw_map,
+        targets=[(PROVIDER_EASYWEEK, 900001, "bot")],
+        dedupe_key=f"wa:tenant-reaction:blocked:{expected_reason}",
+        expected_error=expected_reason,
+    )
+
+    mock_cls.assert_not_called()
+    cw.send_message.assert_not_called()
+    assert evt.error == f"chatwoot tenant routing failed: {expected_reason}"
+
+
+@pytest.mark.asyncio
+async def test_reaction_provider_collision_fails_closed_before_chatwoot_client(
+    session_maker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    collision_map = (
+        '{"101":{"provider":"easyweek","company_id":900001},"201":{"provider":"altegio","company_id":900001}}'
+    )
+    evt, mock_cls, cw = await _run_tenant_reaction(
+        session_maker,
+        monkeypatch,
+        raw_map=collision_map,
+        targets=[
+            (PROVIDER_EASYWEEK, 900001, "bot"),
+            (PROVIDER_ALTEGIO, 900001, "bot"),
+        ],
+        dedupe_key="wa:tenant-reaction:provider-collision",
+        expected_error="ambiguous_outbox_tenant_identity",
+        # A duplicate prior inbound event must not mask an authoritative but
+        # ambiguous Outbox target and downgrade it to General.
+        prior_inbound=True,
+    )
+
+    mock_cls.assert_not_called()
+    cw.send_message.assert_not_called()
+    assert evt.error == "chatwoot tenant routing failed: ambiguous_outbox_tenant_identity"
+
+
+@pytest.mark.asyncio
+async def test_configured_map_keeps_prior_inbound_target_in_general_without_tenant_proof(
+    session_maker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    evt, mock_cls, cw = await _run_tenant_reaction(
+        session_maker,
+        monkeypatch,
+        raw_map=BRANCH_MAP,
+        targets=[],
+        dedupe_key="wa:tenant-reaction:prior-inbound-unproven",
+        prior_inbound=True,
+    )
+
+    mock_cls.assert_called_once_with()
+    cw.send_message.assert_called_once()
+    assert evt.error is None
 
 
 # ---------------------------------------------------------------------------

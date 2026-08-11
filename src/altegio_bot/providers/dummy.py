@@ -86,6 +86,7 @@ async def safe_send(
     phone: str,
     text: str,
     *,
+    tenant_provider: str | None = None,
     company_id: int = 0,
     staff_id: int | None = None,
     contact_name: str | None = None,
@@ -99,6 +100,7 @@ async def safe_send(
         if isinstance(reply_to_provider_message_id, str) and reply_to_provider_message_id.strip():
             kwargs["reply_to_provider_message_id"] = reply_to_provider_message_id.strip()
         if _supports_mirror(provider):
+            kwargs["tenant_provider"] = tenant_provider
             kwargs["company_id"] = company_id
             kwargs["staff_id"] = staff_id
         msg_id = await provider.send(sender_id, phone, text, **kwargs)  # type: ignore[call-arg]
@@ -121,6 +123,7 @@ async def safe_send_template(
     params: list[str],
     fallback_text: str = "",
     *,
+    tenant_provider: str | None = None,
     company_id: int = 0,
     staff_id: int | None = None,
     contact_name: str | None = None,
@@ -136,6 +139,7 @@ async def safe_send_template(
             "header_image_url": header_image_url,
         }
         if _supports_mirror(provider):
+            kwargs["tenant_provider"] = tenant_provider
             kwargs["company_id"] = company_id
             kwargs["staff_id"] = staff_id
         msg_id = await provider.send_template(  # type: ignore[call-arg]

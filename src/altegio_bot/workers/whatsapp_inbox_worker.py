@@ -27,10 +27,7 @@ from altegio_bot.delivery_retry_identity import (
     resolve_retry_reference,
     resolve_status_retry_chain,
 )
-from altegio_bot.easyweek_locations import configured_easyweek_locations
 from altegio_bot.models.models import (
-    PROVIDER_ALTEGIO,
-    PROVIDER_EASYWEEK,
     CampaignRecipient,
     Client,
     MessageJob,
@@ -50,6 +47,8 @@ from altegio_bot.services.meta_error_classifier import (
 )
 from altegio_bot.settings import settings
 from altegio_bot.webhooks.common import (
+    ChatwootTenantIdentity,
+    chatwoot_tenant_identity,
     list_or_empty,
     mapping_or_empty,
     nonempty_str,
@@ -57,6 +56,7 @@ from altegio_bot.webhooks.common import (
     optional_chatwoot_id,
     parse_chatwoot_inbox_company_map,
     positive_int,
+    resolve_chatwoot_tenant_inbox,
     safe_log_value,
 )
 from altegio_bot.whatsapp_window import is_whatsapp_customer_window_open, normalize_phone
@@ -351,10 +351,10 @@ async def _pick_sender(
 
 def _company_hint_from_inbox(
     chatwoot_inbox_id: object,
-) -> tuple[int | None, str | None]:
-    """Resolve company_id hint from Chatwoot inbox_id via the validated map.
+) -> tuple[ChatwootTenantIdentity | None, str | None]:
+    """Resolve an authoritative tenant hint from a Chatwoot inbox.
 
-    Returns (company_id, error) with STABLE, non-sensitive error codes. The
+    Returns (tenant, error) with STABLE, non-sensitive error codes. The
     inbox-company map is parsed/validated once by
     :func:`parse_chatwoot_inbox_company_map`; this function never touches a raw
     ``json.loads`` result.
@@ -368,7 +368,8 @@ def _company_hint_from_inbox(
         * inbox_id absent          → (None, "missing_inbox_id");
         * inbox_id not a positive int → (None, "invalid_inbox_id");
         * inbox_id not in the map  → (None, "inbox_mapping_missing");
-        * inbox_id in the map      → (company_id, None).
+        * provider-less legacy map → fail-closed;
+        * inbox_id in the map      → ((provider, company_id), None).
     """
     parsed = parse_chatwoot_inbox_company_map(settings.chatwoot_inbox_company_map)
 
@@ -379,6 +380,10 @@ def _company_hint_from_inbox(
         # Never persist/return raw config or exception text.
         logger.warning("operator_relay: invalid CHATWOOT_INBOX_COMPANY_MAP")
         return None, "operator_relay: invalid_inbox_company_map"
+
+    if not parsed.provider_scoped:
+        logger.warning("operator_relay: provider scope missing from CHATWOOT_INBOX_COMPANY_MAP")
+        return None, "operator_relay: provider_scope_missing"
 
     # Configured map: inbox_id is required and must be a valid positive int. No
     # fallback to phone_number_id — that could route to the wrong company.
@@ -408,20 +413,20 @@ async def _resolve_relay_sender(
     session: AsyncSession,
     phone_number_id: object,
     *,
-    company_id_hint: int | None = None,
+    tenant_hint: ChatwootTenantIdentity | None = None,
 ) -> tuple[int | None, int | None, str | None]:
     """Strict, fail-closed sender resolution for operator relay.
 
     Returns (sender_id, company_id, error).
     error is None on success; non-None means the relay must be blocked.
 
-    If company_id_hint is provided (from inbox mapping), senders are filtered
-    to that company and, when the EasyWeek registry is ready, to its
-    authoritative provider. Routing is never chosen across provider identity.
+    If tenant_hint is provided by the provider-scoped inbox map, senders are
+    filtered by the complete authoritative pair. A numeric company id alone is
+    never used to discard a colliding provider.
 
     Resolution rules (in order):
     - 0 active senders → error.
-    - company_id_hint given → filter to that company; pick deterministically.
+    - tenant_hint given → filter to that exact provider/company pair.
     - Active senders span >1 distinct company_ids → ambiguous error.
       Picking one would silently route through the wrong company context.
     - Multiple active senders but all in the same company → pick
@@ -453,39 +458,23 @@ async def _resolve_relay_sender(
         return None, None, "operator_relay: sender_not_found"
 
     # ── Hint path: inbox mapping resolved a specific company ───────────
-    if company_id_hint is not None:
-        hinted = [s for s in senders if s.company_id == company_id_hint]
-        # A ready PR-7 EasyWeek registry is authoritative for provider scope:
-        # member company IDs are EasyWeek; the mapped control branches are
-        # Altegio. If the registry is unavailable, retain the legacy path but
-        # still refuse any cross-provider ambiguity below.
-        registry = configured_easyweek_locations()
-        provider_hint: str | None = None
-        if registry.ready:
-            provider_hint = PROVIDER_EASYWEEK if company_id_hint in registry.locations else PROVIDER_ALTEGIO
-            hinted = [s for s in hinted if s.provider == provider_hint]
+    if tenant_hint is not None:
+        hinted = [s for s in senders if s.provider == tenant_hint.provider and s.company_id == tenant_hint.company_id]
         if not hinted:
             logger.warning(
                 "operator_relay: no active sender in hinted identity phone_number_id=%s company_id=%s provider=%s",
                 safe_log_value(safe_pnid, limit=32),
-                company_id_hint,
-                provider_hint,
+                tenant_hint.company_id,
+                tenant_hint.provider,
             )
-            return None, None, "operator_relay: sender_not_found_for_company"
-        hinted_providers = {s.provider for s in hinted}
-        if len(hinted_providers) != 1:
-            logger.warning(
-                "operator_relay: hinted company spans multiple providers company_id=%s — blocking",
-                company_id_hint,
-            )
-            return None, None, "operator_relay: ambiguous_sender_provider"
+            return None, None, "operator_relay: sender_not_found_for_tenant"
         default_s = [s for s in hinted if s.sender_code == "default"]
         chosen = sorted(default_s or hinted, key=lambda s: s.id)[0]
         logger.info(
-            "operator_relay: resolved via inbox_company_map sender_id=%s company_id=%s hint=%s",
+            "operator_relay: resolved via inbox_company_map sender_id=%s provider=%s company_id=%s",
             chosen.id,
+            chosen.provider,
             chosen.company_id,
-            company_id_hint,
         )
         return int(chosen.id), int(chosen.company_id), None
 
@@ -1536,12 +1525,98 @@ class ReplyContextTarget:
     chatwoot_conversation_id: int | None
     body: str | None
     kind: str = "operator"
+    outbox_id: int | None = None
+    template_code: str | None = None
+    record_id: int | None = None
+    tenant_provider: str | None = None
+    company_id: int | None = None
+    tenant_error: str | None = None
 
 
 @dataclass(frozen=True)
 class WhatsAppReplyContextTarget:
     provider_message_id: str
     source: str
+
+
+async def _get_outbox_context_target(
+    session: AsyncSession,
+    provider_message_id: str | None,
+    *,
+    phone_e164: str | None,
+    operator: bool,
+    match_phone_variants: bool = False,
+) -> ReplyContextTarget | None:
+    """Resolve one phone-scoped Outbox target plus its authoritative tenant.
+
+    Bot/lifecycle identity comes only from its linked MessageJob. Operator
+    identity comes only from its linked WhatsAppSender. Outbox.company_id must
+    agree with that relation. Duplicate rows are accepted only when every row
+    proves the same tenant pair; a provider collision is returned as a stable
+    tenant_error and is never resolved by row order.
+    """
+    if not provider_message_id or not phone_e164:
+        return None
+
+    phones = _phone_variants(phone_e164) if match_phone_variants else [phone_e164]
+    source_predicate = (
+        OutboxMessage.message_source == "operator" if operator else OutboxMessage.message_source != "operator"
+    )
+    stmt = (
+        select(OutboxMessage, MessageJob, WhatsAppSender)
+        .outerjoin(MessageJob, MessageJob.id == OutboxMessage.job_id)
+        .outerjoin(WhatsAppSender, WhatsAppSender.id == OutboxMessage.sender_id)
+        .where(OutboxMessage.provider_message_id == provider_message_id)
+        .where(OutboxMessage.phone_e164.in_(phones))
+        .where(source_predicate)
+        .order_by(OutboxMessage.created_at.desc(), OutboxMessage.id.desc())
+    )
+    rows = list((await session.execute(stmt)).all())
+    if not rows:
+        return None
+
+    identities: set[ChatwootTenantIdentity] = set()
+    identity_errors: set[str] = set()
+    for outbox, job, sender in rows:
+        if operator:
+            if sender is None:
+                identity_errors.add("operator_sender_identity_missing")
+                continue
+            if outbox.company_id != sender.company_id:
+                identity_errors.add("operator_sender_company_mismatch")
+                continue
+            identity = chatwoot_tenant_identity(sender.provider, sender.company_id)
+        else:
+            if job is None:
+                identity_errors.add("bot_job_identity_missing")
+                continue
+            if outbox.company_id != job.company_id:
+                identity_errors.add("bot_job_company_mismatch")
+                continue
+            identity = chatwoot_tenant_identity(job.provider, job.company_id)
+
+        if identity is None:
+            identity_errors.add("invalid_outbox_tenant_identity")
+            continue
+        identities.add(identity)
+
+    if len(identities) > 1:
+        identity_errors.add("ambiguous_outbox_tenant_identity")
+
+    first = rows[0][0]
+    identity = next(iter(identities)) if len(identities) == 1 and not identity_errors else None
+    return ReplyContextTarget(
+        chatwoot_message_id=first.chatwoot_message_id,
+        chatwoot_conversation_id=first.chatwoot_conversation_id,
+        body=first.body,
+        kind="operator" if operator else "bot_outbox_message",
+        outbox_id=first.id,
+        template_code=first.template_code,
+        record_id=first.record_id,
+        tenant_provider=identity.provider if identity is not None else None,
+        company_id=identity.company_id if identity is not None else None,
+        tenant_error=sorted(identity_errors)[0] if identity_errors else None,
+    )
 
 
 async def _get_reply_context_target(
@@ -1564,54 +1639,21 @@ async def _get_reply_context_target(
 
     Returns ``None`` on a miss.
     """
-    if not provider_message_id or not phone_e164:
-        return None
-
-    operator_stmt = (
-        select(
-            OutboxMessage.chatwoot_message_id,
-            OutboxMessage.chatwoot_conversation_id,
-            OutboxMessage.body,
-        )
-        .where(OutboxMessage.provider_message_id == provider_message_id)
-        .where(OutboxMessage.phone_e164 == phone_e164)
-        .where(OutboxMessage.message_source == "operator")
-        .order_by(OutboxMessage.created_at.desc(), OutboxMessage.id.desc())
-        .limit(1)
+    operator_target = await _get_outbox_context_target(
+        session,
+        provider_message_id,
+        phone_e164=phone_e164,
+        operator=True,
     )
-    row = (await session.execute(operator_stmt)).first()
-    if row is not None:
-        return ReplyContextTarget(
-            chatwoot_message_id=row[0],
-            chatwoot_conversation_id=row[1],
-            body=row[2],
-            kind="operator",
-        )
+    if operator_target is not None:
+        return operator_target
 
-    # PR2: a reply to a bot/automation message. These rows have no native
-    # chatwoot_message_id, so the caller renders a visible fallback quote of body.
-    bot_stmt = (
-        select(
-            OutboxMessage.chatwoot_message_id,
-            OutboxMessage.chatwoot_conversation_id,
-            OutboxMessage.body,
-        )
-        .where(OutboxMessage.provider_message_id == provider_message_id)
-        .where(OutboxMessage.phone_e164 == phone_e164)
-        .where(OutboxMessage.message_source != "operator")
-        .order_by(OutboxMessage.created_at.desc(), OutboxMessage.id.desc())
-        .limit(1)
+    return await _get_outbox_context_target(
+        session,
+        provider_message_id,
+        phone_e164=phone_e164,
+        operator=False,
     )
-    row = (await session.execute(bot_stmt)).first()
-    if row is not None:
-        return ReplyContextTarget(
-            chatwoot_message_id=row[0],
-            chatwoot_conversation_id=row[1],
-            body=row[2],
-            kind="bot_outbox_message",
-        )
-
-    return None
 
 
 async def _get_whatsapp_reply_context_target(
@@ -1710,6 +1752,42 @@ def _format_reply_context_prefix(quoted_body: str | None) -> str:
     return f"↩️ Ответ на сообщение:\n«{_shorten_reply_context_quote(quoted_body)}»"
 
 
+def _inbound_target_inbox(
+    *,
+    tenant_provider: object,
+    company_id: object,
+    tenant_error: str | None,
+) -> tuple[int | None, str | None]:
+    """Resolve one proven context target through the shared branch map.
+
+    This helper is intentionally shared by text replies and reactions so their
+    configured/invalid/unconfigured semantics cannot drift apart.
+    """
+    parsed = parse_chatwoot_inbox_company_map(settings.chatwoot_inbox_company_map)
+    if not parsed.configured:
+        return None, None
+    if not parsed.valid:
+        return None, "invalid_inbox_company_map"
+    if not parsed.provider_scoped:
+        return None, "provider_scope_missing"
+    if tenant_error is not None:
+        return None, tenant_error
+    return resolve_chatwoot_tenant_inbox(parsed, tenant_provider, company_id)
+
+
+def _raise_inbound_tenant_route_error(event: WhatsAppEvent, reason: str, *, action: str) -> None:
+    """Persist/log only a stable technical reason, then fail the event closed."""
+    safe_error = f"chatwoot tenant routing failed: {reason}"
+    event.error = safe_error
+    logger.warning(
+        "chatwoot: inbound tenant routing blocked event_id=%s action=%s reason=%s",
+        event.id,
+        action,
+        reason,
+    )
+    raise RuntimeError(safe_error)
+
+
 async def _forward_text_to_chatwoot(
     session: AsyncSession,
     event: WhatsAppEvent,
@@ -1735,6 +1813,25 @@ async def _forward_text_to_chatwoot(
     in ``forwarded_chatwoot_conversation_id`` — never in
     ``chatwoot_conversation_id``, which stays a Chatwoot-origin source marker.
     """
+    target: ReplyContextTarget | None = None
+    inbox_id: int | None = None
+    if reply_to_provider_message_id:
+        # Resolve and prove tenant identity before a Chatwoot client exists or a
+        # conversation is selected. Unknown targets intentionally stay General.
+        target = await _get_reply_context_target(
+            session,
+            reply_to_provider_message_id,
+            phone_e164=phone_e164,
+        )
+        if target is not None:
+            inbox_id, routing_error = _inbound_target_inbox(
+                tenant_provider=target.tenant_provider,
+                company_id=target.company_id,
+                tenant_error=target.tenant_error,
+            )
+            if routing_error is not None:
+                _raise_inbound_tenant_route_error(event, routing_error, action="reply")
+
     variants = _phone_variants(phone_e164)
     stmt = (
         select(Client.display_name)
@@ -1742,10 +1839,15 @@ async def _forward_text_to_chatwoot(
         .where(Client.display_name.is_not(None))
         .limit(1)
     )
+    if inbox_id is not None and target is not None:
+        stmt = stmt.where(
+            Client.provider == target.tenant_provider,
+            Client.company_id == target.company_id,
+        )
     res = await session.execute(stmt)
     client_name = res.scalar_one_or_none()
 
-    cw = ChatwootClient()
+    cw = ChatwootClient(inbox_id=inbox_id) if inbox_id is not None else ChatwootClient()
     try:
         conversation_id = await cw.get_or_create_incoming_conversation(
             phone_e164,
@@ -1755,11 +1857,6 @@ async def _forward_text_to_chatwoot(
         content = text
         content_attributes: dict[str, Any] | None = None
         if reply_to_provider_message_id:
-            target = await _get_reply_context_target(
-                session,
-                reply_to_provider_message_id,
-                phone_e164=phone_e164,
-            )
             native_ok = (
                 target is not None
                 and target.chatwoot_message_id is not None
@@ -1869,6 +1966,9 @@ class ReactionTarget:
     outbox_template_code: str | None = None
     outbox_record_id: int | None = None
     body_preview: str | None = None
+    tenant_provider: str | None = None
+    company_id: int | None = None
+    tenant_error: str | None = None
 
 
 async def _resolve_reaction_target(
@@ -1882,14 +1982,13 @@ async def _resolve_reaction_target(
     Resolution order (altegio_bot has no separate agent-message table — operator
     replies are OutboxMessage rows carrying a Chatwoot message id):
 
-    1. Operator OutboxMessage (``message_source='operator'``) with a real
-       ``chatwoot_message_id`` (agent message, native reply candidate) matched by
-       ``provider_message_id`` AND phone.  Bot/automatic rows are excluded here
-       so they can never become a native ``chatwoot_agent_message`` target.
-    2. Prior Meta-origin inbound WhatsAppEvent forwarded to Chatwoot, matched by
+    1. Operator OutboxMessage (``message_source='operator'``), matched by
+       ``provider_message_id`` AND phone. A real Chatwoot id is a native reply
+       candidate; otherwise it remains an authoritative Outbox fallback.
+    2. Automatic/bot OutboxMessage matched by ``provider_message_id`` AND phone
+       — visible fallback only, no native reply.
+    3. Prior Meta-origin inbound WhatsAppEvent forwarded to Chatwoot, matched by
        ``whatsapp_message_id`` AND payload sender phone.
-    3. Automatic OutboxMessage (any source) matched by ``provider_message_id``
-       AND phone — visible fallback only, no native reply.
     4. Unknown fallback.
 
     OutboxMessage.provider_message_id is indexed but not unique, so the lookup is
@@ -1899,41 +1998,65 @@ async def _resolve_reaction_target(
     if not reaction_target_provider_message_id:
         return ReactionTarget(kind="unknown")
 
-    variants = _phone_variants(phone_e164) if phone_e164 else None
-
-    # 1. Operator/agent OutboxMessage that carries a real Chatwoot message id.
-    if variants:
-        agent_stmt = (
-            select(
-                OutboxMessage.id,
-                OutboxMessage.chatwoot_message_id,
-                OutboxMessage.chatwoot_conversation_id,
-                OutboxMessage.template_code,
-                OutboxMessage.record_id,
-                OutboxMessage.body,
-            )
-            .where(OutboxMessage.provider_message_id == reaction_target_provider_message_id)
-            .where(OutboxMessage.phone_e164.in_(variants))
-            .where(OutboxMessage.message_source == "operator")
-            .where(OutboxMessage.chatwoot_message_id.is_not(None))
-            .where(OutboxMessage.chatwoot_conversation_id.is_not(None))
-            .order_by(OutboxMessage.created_at.desc(), OutboxMessage.id.desc())
-            .limit(1)
-        )
-        row = (await session.execute(agent_stmt)).first()
-        if row is not None:
+    # 1. Operator/agent OutboxMessage. The shared resolver proves its tenant via
+    #    WhatsAppSender and detects duplicate provider collisions.
+    operator_target = await _get_outbox_context_target(
+        session,
+        reaction_target_provider_message_id,
+        phone_e164=phone_e164,
+        operator=True,
+        match_phone_variants=True,
+    )
+    if operator_target is not None:
+        if operator_target.chatwoot_message_id is not None and operator_target.chatwoot_conversation_id is not None:
             return ReactionTarget(
                 kind="chatwoot_agent_message",
                 provider_message_id=reaction_target_provider_message_id,
-                chatwoot_message_id=row[1],
-                chatwoot_conversation_id=row[2],
-                outbox_id=row[0],
-                outbox_template_code=row[3],
-                outbox_record_id=row[4],
-                body_preview=row[5],
+                chatwoot_message_id=operator_target.chatwoot_message_id,
+                chatwoot_conversation_id=operator_target.chatwoot_conversation_id,
+                outbox_id=operator_target.outbox_id,
+                outbox_template_code=operator_target.template_code,
+                outbox_record_id=operator_target.record_id,
+                body_preview=operator_target.body,
+                tenant_provider=operator_target.tenant_provider,
+                company_id=operator_target.company_id,
+                tenant_error=operator_target.tenant_error,
             )
+        return ReactionTarget(
+            kind="outbox_message",
+            provider_message_id=reaction_target_provider_message_id,
+            outbox_id=operator_target.outbox_id,
+            outbox_template_code=operator_target.template_code,
+            outbox_record_id=operator_target.record_id,
+            body_preview=operator_target.body,
+            tenant_provider=operator_target.tenant_provider,
+            company_id=operator_target.company_id,
+            tenant_error=operator_target.tenant_error,
+        )
 
-    # 2. Prior Meta-origin inbound WhatsAppEvent that was forwarded to Chatwoot.
+    # 2. Automatic OutboxMessage (fallback only). Identity comes from its
+    #    linked MessageJob; no bot row can become a native agent target.
+    bot_target = await _get_outbox_context_target(
+        session,
+        reaction_target_provider_message_id,
+        phone_e164=phone_e164,
+        operator=False,
+        match_phone_variants=True,
+    )
+    if bot_target is not None:
+        return ReactionTarget(
+            kind="outbox_message",
+            provider_message_id=reaction_target_provider_message_id,
+            outbox_id=bot_target.outbox_id,
+            outbox_template_code=bot_target.template_code,
+            outbox_record_id=bot_target.record_id,
+            body_preview=bot_target.body,
+            tenant_provider=bot_target.tenant_provider,
+            company_id=bot_target.company_id,
+            tenant_error=bot_target.tenant_error,
+        )
+
+    # 3. Prior Meta-origin inbound WhatsAppEvent that was forwarded to Chatwoot.
     #    The dedupe_key filter keeps this to real Meta inbound events (consistent
     #    with the reply-context lookup) and never matches Chatwoot-origin events.
     event_stmt = (
@@ -1959,31 +2082,6 @@ async def _resolve_reaction_target(
             chatwoot_message_id=candidate.chatwoot_message_id,
             chatwoot_conversation_id=candidate.forwarded_chatwoot_conversation_id,
         )
-
-    # 3. Automatic OutboxMessage without a Chatwoot message id (fallback only).
-    if variants:
-        outbox_stmt = (
-            select(
-                OutboxMessage.id,
-                OutboxMessage.template_code,
-                OutboxMessage.record_id,
-                OutboxMessage.body,
-            )
-            .where(OutboxMessage.provider_message_id == reaction_target_provider_message_id)
-            .where(OutboxMessage.phone_e164.in_(variants))
-            .order_by(OutboxMessage.created_at.desc(), OutboxMessage.id.desc())
-            .limit(1)
-        )
-        row = (await session.execute(outbox_stmt)).first()
-        if row is not None:
-            return ReactionTarget(
-                kind="outbox_message",
-                provider_message_id=reaction_target_provider_message_id,
-                outbox_id=row[0],
-                outbox_template_code=row[1],
-                outbox_record_id=row[2],
-                body_preview=row[3],
-            )
 
     # 4. Unknown fallback.
     return ReactionTarget(
@@ -2062,6 +2160,26 @@ async def _forward_reaction_to_chatwoot(
     only when the reacted-to message has a Chatwoot message id in the same
     conversation; otherwise a visible fallback message is posted.
     """
+    # Resolve the target and branch before constructing any Chatwoot client.
+    # Only Outbox targets carry an authoritative tenant relation (MessageJob or
+    # WhatsAppSender). Unknown targets and prior inbound events have no such
+    # proof and intentionally use General; their old Chatwoot ids can become a
+    # native reply only if they already belong to that General conversation.
+    target = await _resolve_reaction_target(
+        session,
+        reaction_target_provider_message_id,
+        phone_e164=phone_e164,
+    )
+    inbox_id: int | None = None
+    if target.kind in {"chatwoot_agent_message", "outbox_message"}:
+        inbox_id, routing_error = _inbound_target_inbox(
+            tenant_provider=target.tenant_provider,
+            company_id=target.company_id,
+            tenant_error=target.tenant_error,
+        )
+        if routing_error is not None:
+            _raise_inbound_tenant_route_error(event, routing_error, action="reaction")
+
     variants = _phone_variants(phone_e164)
     stmt = (
         select(Client.display_name)
@@ -2069,21 +2187,21 @@ async def _forward_reaction_to_chatwoot(
         .where(Client.display_name.is_not(None))
         .limit(1)
     )
+    if inbox_id is not None:
+        stmt = stmt.where(
+            Client.provider == target.tenant_provider,
+            Client.company_id == target.company_id,
+        )
     res = await session.execute(stmt)
     client_name = res.scalar_one_or_none()
 
-    cw = ChatwootClient()
+    cw = ChatwootClient(inbox_id=inbox_id) if inbox_id is not None else ChatwootClient()
     try:
         conversation_id = await cw.get_or_create_incoming_conversation(
             phone_e164,
             contact_name=client_name,
         )
 
-        target = await _resolve_reaction_target(
-            session,
-            reaction_target_provider_message_id,
-            phone_e164=phone_e164,
-        )
         native_ok = target.chatwoot_message_id is not None and target.chatwoot_conversation_id == conversation_id
         content = _reaction_display_text(reaction_emoji, target, native_ok=native_ok)
         content_attributes = _reaction_content_attributes(
@@ -2586,7 +2704,7 @@ async def _prepare_operator_relay(event_id: int, provider: WhatsAppProvider) -> 
                 _mark_event_processed(event, "operator_relay: missing text")
                 return _PreparedRelay(outbox_id=None)
 
-            company_id_hint, hint_err = _company_hint_from_inbox(chatwoot_inbox_id)
+            tenant_hint, hint_err = _company_hint_from_inbox(chatwoot_inbox_id)
             if hint_err is not None:
                 logger.warning(
                     "operator_relay: inbox routing error conv_id=%s msg_id=%s inbox_id=%s: %s",
@@ -2601,7 +2719,7 @@ async def _prepare_operator_relay(event_id: int, provider: WhatsAppProvider) -> 
             sender_id, company_id, routing_err = await _resolve_relay_sender(
                 session,
                 phone_number_id,
-                company_id_hint=company_id_hint,
+                tenant_hint=tenant_hint,
             )
             if routing_err is not None:
                 logger.warning(

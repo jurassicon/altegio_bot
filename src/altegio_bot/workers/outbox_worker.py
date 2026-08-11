@@ -2091,6 +2091,7 @@ async def _process_promo_card_booking_reminder(
         template_name=template_name,
         language=TEMPLATE_LANGUAGE,
         params=template_params,
+        tenant_provider=normalize_provider(getattr(job, "provider", None), default=PROVIDER_ALTEGIO),
         company_id=lead.company_id,
     )
 
@@ -2939,6 +2940,7 @@ async def _run_job_logic(
                 phone=phone,
                 text=_pd_body,
                 contact_name=contact_name,
+                tenant_provider=job_provider,
                 company_id=job.company_id,
             )
             _pd_ms_ctx.update(provider_message_id=msg_id)
@@ -3416,6 +3418,7 @@ async def _run_job_logic(
                     phone=phone,
                     text=final_body,
                     contact_name=contact_name,
+                    tenant_provider=job_provider,
                     company_id=job.company_id,
                 )
                 _ts_ctx.update(provider_message_id=_text_msg_id)
@@ -3606,6 +3609,7 @@ async def _run_job_logic(
                         params=template_params,
                         fallback_text=final_body,
                         contact_name=contact_name,
+                        tenant_provider=job_provider,
                         company_id=job.company_id,
                         header_image_url=header_image_url,
                     )
@@ -3622,6 +3626,7 @@ async def _run_job_logic(
                     params=template_params,
                     fallback_text=final_body,
                     contact_name=contact_name,
+                    tenant_provider=job_provider,
                     company_id=job.company_id,
                     header_image_url=header_image_url,
                 )
@@ -3659,6 +3664,7 @@ async def _run_job_logic(
                 phone=phone,
                 text=final_body,
                 contact_name=contact_name,
+                tenant_provider=job_provider,
                 company_id=job.company_id,
             )
             send_meta = {"send_type": "text"}
