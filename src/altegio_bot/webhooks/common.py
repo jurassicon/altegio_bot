@@ -282,6 +282,33 @@ def resolve_chatwoot_tenant_inbox(
     return inbox_id, None
 
 
+def resolve_chatwoot_general_inbox(
+    parsed: InboxCompanyMap,
+    general_inbox_id: object,
+) -> tuple[int | None, str | None]:
+    """Validate the global General inbox against the parsed branch map.
+
+    ``(None, None)`` is reserved for the unconfigured legacy single-inbox mode,
+    where :class:`ChatwootClient` keeps using its historical global setting.
+    Once a branch map is configured, General must be a strict positive inbox id
+    outside that map.  Stable reason codes deliberately contain no raw config,
+    tenant data, phones, URLs, or secrets.
+    """
+    if not parsed.configured:
+        return None, None
+    if not parsed.valid:
+        return None, "invalid_inbox_company_map"
+    if not parsed.provider_scoped:
+        return None, "provider_scope_missing"
+
+    general_id = positive_int(general_inbox_id)
+    if general_id is None:
+        return None, "invalid_general_inbox_id"
+    if general_id in parsed.mapping:
+        return None, "general_inbox_overlaps_branch"
+    return general_id, None
+
+
 def _canonical_inbox_key(key: object) -> int | None:
     """Строгий inbox-ключ → положительный int в диапазоне PG Integer, иначе None.
 

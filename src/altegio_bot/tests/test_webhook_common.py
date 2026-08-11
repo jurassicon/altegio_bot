@@ -465,6 +465,54 @@ def test_inbox_map_three_branches_has_one_bidirectional_source() -> None:
     assert m.inverse_mapping == {identity: inbox for inbox, identity in m.mapping.items()}
 
 
+def test_general_inbox_must_be_separate_from_all_branch_inboxes() -> None:
+    from altegio_bot.webhooks.common import (
+        parse_chatwoot_inbox_company_map,
+        resolve_chatwoot_general_inbox,
+    )
+
+    parsed = parse_chatwoot_inbox_company_map(
+        '{"101":{"provider":"easyweek","company_id":900001},'
+        '"102":{"provider":"easyweek","company_id":900002},'
+        '"103":{"provider":"altegio","company_id":900003}}'
+    )
+    assert resolve_chatwoot_general_inbox(parsed, 999) == (999, None)
+    assert resolve_chatwoot_general_inbox(parsed, 101) == (None, "general_inbox_overlaps_branch")
+
+
+@pytest.mark.parametrize(
+    ("raw_map", "general_id", "expected_reason"),
+    [
+        ("{not json", 999, "invalid_inbox_company_map"),
+        ('{"101":900001}', 999, "provider_scope_missing"),
+        ('{"101":{"provider":"easyweek","company_id":900001}}', 0, "invalid_general_inbox_id"),
+        ('{"101":{"provider":"easyweek","company_id":900001}}', "999", "invalid_general_inbox_id"),
+    ],
+)
+def test_general_inbox_validation_has_stable_fail_closed_reasons(
+    raw_map: str,
+    general_id: object,
+    expected_reason: str,
+) -> None:
+    from altegio_bot.webhooks.common import (
+        parse_chatwoot_inbox_company_map,
+        resolve_chatwoot_general_inbox,
+    )
+
+    parsed = parse_chatwoot_inbox_company_map(raw_map)
+    assert resolve_chatwoot_general_inbox(parsed, general_id) == (None, expected_reason)
+
+
+def test_general_inbox_empty_map_preserves_legacy_single_inbox_mode() -> None:
+    from altegio_bot.webhooks.common import (
+        parse_chatwoot_inbox_company_map,
+        resolve_chatwoot_general_inbox,
+    )
+
+    parsed = parse_chatwoot_inbox_company_map("{}")
+    assert resolve_chatwoot_general_inbox(parsed, 0) == (None, None)
+
+
 def test_inbox_map_duplicate_company_is_invalid_for_both_directions() -> None:
     from altegio_bot.webhooks.common import parse_chatwoot_inbox_company_map
 

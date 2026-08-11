@@ -15,7 +15,8 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.altegio_records import AltegioNewClientCheckError, check_client_has_any_altegio_record
-from altegio_bot.models.models import Client, MessageJob, OutboxMessage, PromoLead, Record
+from altegio_bot.easyweek_policy import normalize_provider
+from altegio_bot.models.models import PROVIDER_ALTEGIO, Client, MessageJob, OutboxMessage, PromoLead, Record
 from altegio_bot.promo_loyalty import AltegioLoyaltyError, issue_promo_loyalty_card
 from altegio_bot.providers.base import WhatsAppProvider
 from altegio_bot.providers.dummy import safe_send
@@ -858,6 +859,7 @@ async def process_promo_eligibility_check_job(
         sender_id=sender_id,
         phone=phone_e164,
         text=reply,
+        tenant_provider=normalize_provider(getattr(job, "provider", None), default=PROVIDER_ALTEGIO),
         company_id=lead.company_id,
     )
     if err is not None:

@@ -382,6 +382,73 @@ async def test_reply_target_wrong_phone_returns_none(session_maker) -> None:
 
 
 @pytest.mark.asyncio
+async def test_reply_target_finds_exact_prior_meta_inbound_conversation(session_maker) -> None:
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(_forwarded_whatsapp_event(chatwoot_message_id=501, chatwoot_conversation_id=1101))
+
+        target = await _get_reply_context_target(session, "wamid.INBOUND", phone_e164=PHONE_E164)
+
+    assert target is not None
+    assert target.kind == "prior_inbound_whatsapp_event"
+    assert target.exact_conversation is True
+    assert target.chatwoot_message_id == 501
+    assert target.chatwoot_conversation_id == 1101
+    assert target.tenant_error is None
+
+
+@pytest.mark.parametrize(
+    "candidate",
+    [
+        _forwarded_whatsapp_event(dedupe_key="chatwoot:230:4960"),
+        _forwarded_whatsapp_event(dedupe_key="wa:wrong-phone", from_phone="49000000000"),
+        _forwarded_whatsapp_event(
+            dedupe_key="wa:incomplete",
+            chatwoot_message_id=None,
+            chatwoot_conversation_id=230,
+        ),
+    ],
+    ids=["chatwoot-origin", "wrong-phone", "incomplete"],
+)
+@pytest.mark.asyncio
+async def test_reply_target_rejects_unproven_prior_inbound_candidates(session_maker, candidate: WhatsAppEvent) -> None:
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(candidate)
+
+        target = await _get_reply_context_target(session, "wamid.INBOUND", phone_e164=PHONE_E164)
+
+    assert target is None
+
+
+@pytest.mark.asyncio
+async def test_reply_target_conflicting_prior_conversations_is_stable_fail_closed(session_maker) -> None:
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(
+                _forwarded_whatsapp_event(
+                    dedupe_key="wa:prior-du",
+                    chatwoot_message_id=501,
+                    chatwoot_conversation_id=1101,
+                )
+            )
+            session.add(
+                _forwarded_whatsapp_event(
+                    dedupe_key="wa:prior-ra",
+                    chatwoot_message_id=502,
+                    chatwoot_conversation_id=1102,
+                )
+            )
+
+        target = await _get_reply_context_target(session, "wamid.INBOUND", phone_e164=PHONE_E164)
+
+    assert target is not None
+    assert target.exact_conversation is True
+    assert target.tenant_error == "ambiguous_prior_inbound_conversation"
+    assert target.chatwoot_conversation_id is None
+
+
+@pytest.mark.asyncio
 async def test_reply_target_bot_source_found(session_maker) -> None:
     """PR2: a reply to a bot/automation message now resolves as a fallback target.
 
@@ -713,10 +780,13 @@ async def _run_tenant_reply(
     dedupe_key: str = "wa:tenant-reply",
     destination_conversation_id: int = 277,
     expected_error: str | None = None,
+    prior_inbound_events: list[WhatsAppEvent] | None = None,
+    general_inbox_id: int = 999,
 ) -> tuple[WhatsAppEvent, MagicMock, MagicMock]:
     import altegio_bot.workers.whatsapp_inbox_worker as wiw
 
     monkeypatch.setattr(wiw.settings, "chatwoot_inbox_company_map", raw_map)
+    monkeypatch.setattr(wiw.settings, "chatwoot_inbox_id", general_inbox_id)
     provider = _CaptureProvider()
     mock_cls, mock_inst = _mock_chatwoot_client(conversation_id=destination_conversation_id)
 
@@ -727,7 +797,7 @@ async def _run_tenant_reply(
                     WhatsAppSender(
                         provider=PROVIDER_ALTEGIO,
                         company_id=1,
-                        sender_code="reply-inbound",
+                        sender_code=f"ri-{dedupe_key[-20:]}",
                         phone_number_id=PHONE_NUMBER_ID,
                         display_phone="+49",
                         is_active=True,
@@ -756,6 +826,7 @@ async def _run_tenant_reply(
                     phone_e164=target_phone,
                     suffix=f"{dedupe_key}-{index}",
                 )
+            session.add_all(prior_inbound_events or [])
 
             evt = _make_event(
                 _meta_payload("Ответ филиалу", from_phone=from_phone, context_id=context_id),
@@ -854,6 +925,95 @@ async def test_same_phone_reply_contexts_keep_separate_branch_conversations(
 
 
 @pytest.mark.parametrize(
+    ("branch", "target_wamid", "chatwoot_message_id", "conversation_id"),
+    [
+        ("durlach", "wamid.DU.INBOUND", 501, 1101),
+        ("rastatt", "wamid.RA.INBOUND", 502, 1102),
+    ],
+)
+@pytest.mark.asyncio
+async def test_reply_to_prior_inbound_reuses_exact_branch_conversation_without_lookup(
+    session_maker,
+    monkeypatch: pytest.MonkeyPatch,
+    branch: str,
+    target_wamid: str,
+    chatwoot_message_id: int,
+    conversation_id: int,
+) -> None:
+    prior = _forwarded_whatsapp_event(
+        dedupe_key=f"wa:prior-inbound:{branch}",
+        chatwoot_message_id=chatwoot_message_id,
+        chatwoot_conversation_id=conversation_id,
+        whatsapp_message_id=target_wamid,
+    )
+    evt, mock_cls, cw = await _run_tenant_reply(
+        session_maker,
+        monkeypatch,
+        raw_map=BRANCH_MAP,
+        targets=[],
+        context_id=target_wamid,
+        dedupe_key=f"wa:chained-reply:{branch}",
+        destination_conversation_id=9999,
+        prior_inbound_events=[prior],
+    )
+
+    mock_cls.assert_called_once_with()
+    cw.get_or_create_incoming_conversation.assert_not_called()
+    call = cw.send_message.call_args
+    assert call.args[0] == conversation_id
+    assert call.kwargs["content_attributes"] == {
+        "in_reply_to": chatwoot_message_id,
+        "in_reply_to_external_id": target_wamid,
+    }
+    assert evt.forwarded_chatwoot_conversation_id == conversation_id
+    assert evt.error is None
+
+
+@pytest.mark.asyncio
+async def test_same_phone_prior_inbound_reply_wamids_do_not_mix_du_and_ra_conversations(
+    session_maker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    du_event, _du_cls, du_cw = await _run_tenant_reply(
+        session_maker,
+        monkeypatch,
+        raw_map=BRANCH_MAP,
+        targets=[],
+        context_id="wamid.DU.CHAIN",
+        dedupe_key="wa:du-chain-reply",
+        prior_inbound_events=[
+            _forwarded_whatsapp_event(
+                dedupe_key="wa:du-chain-target",
+                whatsapp_message_id="wamid.DU.CHAIN",
+                chatwoot_message_id=601,
+                chatwoot_conversation_id=1201,
+            )
+        ],
+    )
+    ra_event, _ra_cls, ra_cw = await _run_tenant_reply(
+        session_maker,
+        monkeypatch,
+        raw_map=BRANCH_MAP,
+        targets=[],
+        context_id="wamid.RA.CHAIN",
+        dedupe_key="wa:ra-chain-reply",
+        prior_inbound_events=[
+            _forwarded_whatsapp_event(
+                dedupe_key="wa:ra-chain-target",
+                whatsapp_message_id="wamid.RA.CHAIN",
+                chatwoot_message_id=602,
+                chatwoot_conversation_id=1202,
+            )
+        ],
+    )
+
+    assert du_cw.send_message.call_args.args[0] == 1201
+    assert ra_cw.send_message.call_args.args[0] == 1202
+    assert du_event.forwarded_chatwoot_conversation_id == 1201
+    assert ra_event.forwarded_chatwoot_conversation_id == 1202
+
+
+@pytest.mark.parametrize(
     ("context_id", "target_phone", "dedupe_key"),
     [
         (None, PHONE_E164, "wa:tenant-reply:no-context"),
@@ -881,9 +1041,94 @@ async def test_reply_without_proven_target_uses_general_inbox(
         dedupe_key=dedupe_key,
     )
 
-    mock_cls.assert_called_once_with()
+    mock_cls.assert_called_once_with(inbox_id=999)
     cw.send_message.assert_called_once()
     assert evt.error is None
+
+
+@pytest.mark.parametrize(
+    ("raw_map", "expected_reason"),
+    [
+        ("{not json", "invalid_inbox_company_map"),
+        ('{"101":900001}', "provider_scope_missing"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_unresolved_reply_with_unusable_map_fails_before_chatwoot_client(
+    session_maker,
+    monkeypatch: pytest.MonkeyPatch,
+    raw_map: str,
+    expected_reason: str,
+) -> None:
+    evt, mock_cls, cw = await _run_tenant_reply(
+        session_maker,
+        monkeypatch,
+        raw_map=raw_map,
+        targets=[],
+        context_id="wamid.UNKNOWN",
+        dedupe_key=f"wa:unresolved-reply:{expected_reason}",
+        expected_error=expected_reason,
+    )
+
+    mock_cls.assert_not_called()
+    cw.get_or_create_incoming_conversation.assert_not_called()
+    cw.send_message.assert_not_called()
+    assert evt.error == f"chatwoot tenant routing failed: {expected_reason}"
+
+
+@pytest.mark.asyncio
+async def test_new_text_general_overlap_fails_before_chatwoot_client(
+    session_maker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    evt, mock_cls, cw = await _run_tenant_reply(
+        session_maker,
+        monkeypatch,
+        raw_map=BRANCH_MAP,
+        targets=[],
+        context_id=None,
+        dedupe_key="wa:new-text:general-overlap",
+        general_inbox_id=101,
+        expected_error="general_inbox_overlaps_branch",
+    )
+
+    mock_cls.assert_not_called()
+    cw.send_message.assert_not_called()
+    assert evt.error == "chatwoot tenant routing failed: general_inbox_overlaps_branch"
+
+
+@pytest.mark.asyncio
+async def test_conflicting_prior_inbound_reply_fails_before_chatwoot_client(
+    session_maker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    evt, mock_cls, cw = await _run_tenant_reply(
+        session_maker,
+        monkeypatch,
+        raw_map=BRANCH_MAP,
+        targets=[],
+        context_id="wamid.CONFLICTING.PRIOR",
+        dedupe_key="wa:conflicting-prior-reply",
+        prior_inbound_events=[
+            _forwarded_whatsapp_event(
+                dedupe_key="wa:conflicting-prior:1",
+                whatsapp_message_id="wamid.CONFLICTING.PRIOR",
+                chatwoot_message_id=701,
+                chatwoot_conversation_id=1301,
+            ),
+            _forwarded_whatsapp_event(
+                dedupe_key="wa:conflicting-prior:2",
+                whatsapp_message_id="wamid.CONFLICTING.PRIOR",
+                chatwoot_message_id=702,
+                chatwoot_conversation_id=1302,
+            ),
+        ],
+        expected_error="ambiguous_prior_inbound_conversation",
+    )
+
+    mock_cls.assert_not_called()
+    cw.send_message.assert_not_called()
+    assert evt.error == "chatwoot tenant routing failed: ambiguous_prior_inbound_conversation"
 
 
 @pytest.mark.parametrize(

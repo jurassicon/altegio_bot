@@ -230,7 +230,12 @@ $COMPOSE run --rm altegio-outbox-worker \
   /app/.venv/bin/python - <<'PY'
 from altegio_bot.easyweek_locations import configured_easyweek_locations
 from altegio_bot.settings import settings
-from altegio_bot.webhooks.common import ChatwootTenantIdentity, parse_chatwoot_inbox_company_map
+from altegio_bot.webhooks.common import (
+    ChatwootTenantIdentity,
+    parse_chatwoot_inbox_company_map,
+    positive_int,
+    resolve_chatwoot_general_inbox,
+)
 
 branches = configured_easyweek_locations()
 inboxes = parse_chatwoot_inbox_company_map(settings.chatwoot_inbox_company_map)
@@ -239,6 +244,11 @@ easyweek_tenants = {
     for location in branches.locations.values()
 }
 mapped_tenants = set(inboxes.inverse_mapping)
+configured_general_id = positive_int(settings.chatwoot_inbox_id)
+general_inbox_id, general_inbox_reason = resolve_chatwoot_general_inbox(
+    inboxes,
+    settings.chatwoot_inbox_id,
+)
 print(
     {
         "map_configured": inboxes.configured,
@@ -248,7 +258,9 @@ print(
         "unique_inboxes": len(inboxes.mapping) == len(set(inboxes.mapping)),
         "unique_tenants": len(inboxes.inverse_mapping) == len(inboxes.mapping),
         "easyweek_tenants_all_mapped": easyweek_tenants <= mapped_tenants,
-        "global_general_inbox_configured": settings.chatwoot_inbox_id > 0,
+        "global_general_inbox_configured": configured_general_id is not None,
+        "global_general_inbox_distinct_from_branches": general_inbox_id is not None,
+        "global_general_inbox_validation_reason": general_inbox_reason,
     }
 )
 PY
@@ -256,7 +268,10 @@ PY
 
 Gate: configured=true, valid=true, provider_scoped=true, `map_entries=3`, оба
 unique=true, EasyWeek tenant-пары полностью покрыты, global General/Unassigned
-настроен отдельно. Вручную
+настроен отдельно: `global_general_inbox_configured=true` и
+`global_general_inbox_distinct_from_branches=true`. Если General ID совпал хотя
+бы с одним ключом branch map (`general_inbox_overlaps_branch`) — **STOP**: новый
+или неразрешённый inbound иначе попадёт в филиал. Вручную
 сверьте: DU/RA IDs равны одноимённым записям `EASYWEEK_LOCATION_MAP`, а третья
 company — действующая Karlsruhe Altegio company. Любое расхождение — STOP.
 
