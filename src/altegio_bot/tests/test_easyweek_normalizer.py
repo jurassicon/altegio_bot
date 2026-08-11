@@ -13,6 +13,7 @@ from decimal import Decimal
 
 import pytest
 
+from altegio_bot.easyweek_locations import EasyWeekLocation
 from altegio_bot.easyweek_normalizer import (
     CREATE,
     DELETE,
@@ -35,6 +36,7 @@ from altegio_bot.tests.easyweek_fixtures import (
     TEST_BOOKING_UUID,
     TEST_CUSTOMER_ID,
     TEST_LOCATION_ID,
+    TEST_LOCATION_UUID,
     booking_canceled,
     booking_created,
     booking_created_full_shape,
@@ -44,12 +46,22 @@ from altegio_bot.tests.easyweek_fixtures import (
 )
 
 
-def _normalize(payload, *, event_hint="booking-created", truncated=False, location=TEST_LOCATION_ID):
+def _location(location_id: int = TEST_LOCATION_ID, location_uuid: str = TEST_LOCATION_UUID) -> EasyWeekLocation:
+    return EasyWeekLocation(
+        name="test-branch",
+        location_id=location_id,
+        location_uuid=location_uuid,
+        meta_template_prefix="tb",
+        booking_page_url="https://booking.example.invalid/test",
+    )
+
+
+def _normalize(payload, *, event_hint="booking-created", truncated=False, registry=None):
     return normalize_event(
         event_hint=event_hint,
         payload=payload,
         body_truncated=truncated,
-        expected_location_id=location,
+        location_registry=registry if registry is not None else {TEST_LOCATION_ID: _location()},
     )
 
 
@@ -200,18 +212,25 @@ def test_foreign_location_is_rejected() -> None:
     assert excinfo.value.code == NormalizationError.FOREIGN_LOCATION
 
 
-@pytest.mark.parametrize("configured", [0, -1])
-def test_unconfigured_location_fails_closed(configured: int) -> None:
+def test_unconfigured_location_fails_closed() -> None:
     """The payload must never be able to supply the location we own."""
     with pytest.raises(NormalizationError) as excinfo:
-        _normalize(booking_created(), location=configured)
-    assert excinfo.value.code == NormalizationError.INVALID_LOCATION_ID
+        _normalize(booking_created(), registry={})
+    assert excinfo.value.code == NormalizationError.FOREIGN_LOCATION
 
 
-def test_company_id_comes_from_config_not_from_payload() -> None:
+def test_company_id_comes_from_verified_payload_location() -> None:
     booking = _normalize(booking_created())
     assert booking is not None
     assert booking.company_id == TEST_LOCATION_ID
+
+
+def test_known_location_with_wrong_uuid_has_distinct_identity_error() -> None:
+    payload = booking_created()
+    payload["location_uuid"] = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff"
+    with pytest.raises(NormalizationError) as excinfo:
+        _normalize(payload)
+    assert excinfo.value.code == NormalizationError.LOCATION_IDENTITY_MISMATCH
 
 
 # ===========================================================================

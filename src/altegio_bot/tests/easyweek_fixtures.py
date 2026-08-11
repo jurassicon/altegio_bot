@@ -30,6 +30,7 @@ from typing import Any
 # numeric location lives only in easyweek.env.
 TEST_LOCATION_ID = 999001
 FOREIGN_LOCATION_ID = 888002
+TEST_LOCATION_UUID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
 
 TEST_BOOKING_UUID = "11111111-2222-4333-8444-555555555555"
 TEST_BOOKING_ID = 4200001
@@ -46,7 +47,7 @@ def _base_payload() -> dict[str, Any]:
         "id": TEST_BOOKING_ID,
         "customer_id": TEST_CUSTOMER_ID,
         "location_id": TEST_LOCATION_ID,
-        "location_uuid": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+        "location_uuid": TEST_LOCATION_UUID,
         # --- manage link (string hash, exact pair) -------------------------
         "booking_hash_id": TEST_BOOKING_HASH_ID,
         "booking_page": TEST_BOOKING_PAGE,

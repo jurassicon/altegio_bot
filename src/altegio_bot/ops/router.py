@@ -26,6 +26,7 @@ from altegio_bot.campaigns.followup import (
 )
 from altegio_bot.campaigns.reports import monthly_dashboard, run_report
 from altegio_bot.db import SessionLocal
+from altegio_bot.easyweek_locations import configured_easyweek_locations
 from altegio_bot.meta_templates import META_TEMPLATE_MAP
 from altegio_bot.models.models import CampaignRecipient, CampaignRun, MessageJob, OutboxMessage
 from altegio_bot.settings import settings
@@ -1705,7 +1706,7 @@ async def ops_wa_inbox(request: Request) -> str:
 
 @router.get("/easyweek", response_class=HTMLResponse)
 async def ops_easyweek() -> str:
-    """Provider-scoped counters, so an operator can watch Durlach come alive.
+    """Provider-scoped, per-location counters for the EasyWeek registry.
 
     Deliberately small: capture, jobs and sends broken down by status, plus the
     seeded rows the activation depends on. Everything is filtered on
@@ -1721,6 +1722,9 @@ async def ops_easyweek() -> str:
     endpoint, which is a worse trade than labelling the source. The counters
     below come from the database and are authoritative either way.
     """
+    registry = configured_easyweek_locations()
+    location_rows: list[list[str]] = []
+
     async with SessionLocal() as session:
         events = (
             await session.execute(
@@ -1782,10 +1786,47 @@ async def ops_easyweek() -> str:
             )
         ).fetchall()
 
+        if registry.ready:
+            for location in registry.locations.values():
+                event_counts = (
+                    await session.execute(
+                        text("""
+                             SELECT status, COUNT(*) AS n
+                             FROM easyweek_events
+                             WHERE payload -> 'location_id' = to_jsonb(CAST(:company_id AS INTEGER))
+                             GROUP BY status
+                             ORDER BY status
+                             """),
+                        {"company_id": location.company_id},
+                    )
+                ).fetchall()
+                job_counts = (
+                    await session.execute(
+                        text("""
+                             SELECT status, COUNT(*) AS n
+                             FROM message_jobs
+                             WHERE provider = 'easyweek' AND company_id = :company_id
+                             GROUP BY status
+                             ORDER BY status
+                             """),
+                        {"company_id": location.company_id},
+                    )
+                ).fetchall()
+                event_summary = ", ".join(f"{row.status}={row.n}" for row in event_counts) or "—"
+                job_summary = ", ".join(f"{row.status}={row.n}" for row in job_counts) or "—"
+                location_rows.append(
+                    [
+                        str(location.company_id),
+                        _esc(location.name),
+                        _esc(event_summary),
+                        _esc(job_summary),
+                    ]
+                )
+
     notifications_on = bool(getattr(settings, "easyweek_notifications_enabled", False))
     processing_on = bool(getattr(settings, "easyweek_processing_enabled", False))
     parts = [
-        "<h4 class='mt-3'>EasyWeek (Durlach)</h4>",
+        "<h4 class='mt-3'>EasyWeek locations</h4>",
         _metric_cards(
             [
                 ("capture (api env)", "on" if getattr(settings, "easyweek_enabled", False) else "off", "secondary"),
@@ -1799,12 +1840,18 @@ async def ops_easyweek() -> str:
                     "on" if notifications_on else "off",
                     "success" if notifications_on else "secondary",
                 ),
-                ("location_id (api env)", getattr(settings, "easyweek_location_id", 0), "secondary"),
+                (
+                    "location registry (api env)",
+                    f"{len(registry.locations)} locations" if registry.ready else "not ready",
+                    "success" if registry.ready else "danger",
+                ),
             ]
         ),
         "<p class='small text-muted'>Flags above are this API container's own environment, "
         "not the workers'. After flipping a flag the workers are recreated but this container "
         "is not, so a stale <code>off</code> here is expected — trust the counters below.</p>",
+        "<h6 class='mt-3'>registry locations: events / jobs by status</h6>",
+        _table(["company_id", "name", "events", "jobs"], location_rows),
         "<h6 class='mt-3'>easyweek_events by status</h6>",
         _table(["status", "count"], [[_esc(str(r.status)), str(r.n)] for r in events]),
         "<h6 class='mt-3'>message_jobs by type / status</h6>",

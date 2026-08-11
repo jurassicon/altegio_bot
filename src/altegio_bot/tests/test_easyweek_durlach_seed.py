@@ -10,6 +10,7 @@ is an operator step and stays off.
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
@@ -19,6 +20,8 @@ import pytest_asyncio
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from altegio_bot.easyweek_branches import BRANCH_PROFILES, branch_template_contract
+from altegio_bot.easyweek_locations import configured_easyweek_locations
 from altegio_bot.easyweek_policy import (
     RECORD_CANCELED,
     RECORD_CREATED,
@@ -42,9 +45,9 @@ pytestmark = pytest.mark.asyncio
 
 # A stand-in, never the production id — that lives in easyweek.env only, and a
 # repository-wide test enforces it. What these tests exercise is the MECHANISM:
-# the operator-supplied `--expect-location-id` and the configured
-# EASYWEEK_LOCATION_ID must agree, whatever the real number turns out to be.
+# the registry and the read-only API must agree, whatever the real number is.
 DURLACH_LOCATION_ID = 999501
+DURLACH_LOCATION_UUID = "dddddddd-eeee-4fff-8000-000000000001"
 SHARED_PHONE_NUMBER_ID = "shared-bot-phone-number-id"
 BOOKING_PAGE_HOST = "book.durlach.invalid"
 STATIC_BOOKING_PAGE = f"https://{BOOKING_PAGE_HOST}/durlach"
@@ -55,10 +58,23 @@ VERIFIED_PAGE = f"https://eyw.me/r/{BOOKING_HASH}"
 @pytest.fixture(autouse=True)
 def _durlach_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     """The Durlach configuration, with notifications deliberately OFF."""
-    monkeypatch.setattr(settings, "easyweek_location_id", DURLACH_LOCATION_ID, raising=False)
+    monkeypatch.setattr(
+        settings,
+        "easyweek_location_map",
+        json.dumps(
+            {
+                "durlach": {
+                    "location_id": DURLACH_LOCATION_ID,
+                    "location_uuid": DURLACH_LOCATION_UUID,
+                    "meta_template_prefix": "du",
+                    "booking_page_url": STATIC_BOOKING_PAGE,
+                }
+            }
+        ),
+        raising=False,
+    )
     monkeypatch.setattr(settings, "easyweek_booking_page_allowed_hosts", BOOKING_PAGE_HOST, raising=False)
     monkeypatch.setattr(settings, "easyweek_default_language", "de", raising=False)
-    monkeypatch.setattr(settings, "easyweek_booking_page_url", STATIC_BOOKING_PAGE, raising=False)
     monkeypatch.setattr(settings, "meta_wa_phone_number_id", SHARED_PHONE_NUMBER_ID, raising=False)
     monkeypatch.setattr(settings, "easyweek_notifications_enabled", False, raising=False)
 
@@ -69,10 +85,27 @@ async def db(session_maker: async_sessionmaker[AsyncSession]) -> AsyncSession:
         yield session
 
 
-async def _run_seed(
-    db: AsyncSession, *, expect_location_id: int | None = DURLACH_LOCATION_ID
-) -> seed_script.SeedResult:
-    result = await seed_script.seed(db, expect_location_id=expect_location_id)
+class _FakeLocationsClient:
+    def __init__(self, locations: list[dict[str, Any]]) -> None:
+        self.locations = locations
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args) -> None:
+        return None
+
+    async def list_locations(self) -> list[dict[str, Any]]:
+        return self.locations
+
+
+def _client_factory(locations: list[dict[str, Any]] | None = None):
+    visible = locations or [{"uuid": DURLACH_LOCATION_UUID, "name": "KitiLash Durlach"}]
+    return lambda: _FakeLocationsClient(visible)
+
+
+async def _run_seed(db: AsyncSession, *, api_locations: list[dict[str, Any]] | None = None) -> seed_script.SeedResult:
+    result = await seed_script.seed(db, client_factory=_client_factory(api_locations))
     await db.flush()
     return result
 
@@ -112,8 +145,88 @@ async def test_the_seed_writes_exactly_the_four_phase_one_templates(db: AsyncSes
         assert row.company_id == DURLACH_LOCATION_ID
         assert row.language == "de"
         assert row.is_active is True
-        assert row.meta_template_name == seed_script.META_TEMPLATE_NAMES[row.code]
+        contract = branch_template_contract(BRANCH_PROFILES["durlach"], row.code)
+        assert contract is not None
+        assert row.meta_template_name == contract.meta_template_name
+        assert row.body == contract.raw_body
         assert row.meta_template_name.startswith("kitilash_du_")
+
+
+async def test_the_seed_writes_two_branch_specific_suites(db: AsyncSession, monkeypatch: pytest.MonkeyPatch) -> None:
+    rastatt_id = 999502
+    rastatt_uuid = "dddddddd-eeee-4fff-8000-000000000002"
+    rastatt_page = "https://book.rastatt.invalid/rastatt"
+    monkeypatch.setattr(
+        settings,
+        "easyweek_location_map",
+        json.dumps(
+            {
+                "durlach": {
+                    "location_id": DURLACH_LOCATION_ID,
+                    "location_uuid": DURLACH_LOCATION_UUID,
+                    "meta_template_prefix": "du",
+                    "booking_page_url": STATIC_BOOKING_PAGE,
+                },
+                "rastatt": {
+                    "location_id": rastatt_id,
+                    "location_uuid": rastatt_uuid,
+                    "meta_template_prefix": "ra",
+                    "booking_page_url": rastatt_page,
+                },
+            }
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        settings,
+        "easyweek_booking_page_allowed_hosts",
+        f"{BOOKING_PAGE_HOST},book.rastatt.invalid",
+        raising=False,
+    )
+    api_locations = [
+        {"uuid": DURLACH_LOCATION_UUID, "name": "KitiLash Durlach"},
+        {"uuid": rastatt_uuid, "name": "KitiLash Rastatt"},
+    ]
+
+    result = await _run_seed(db, api_locations=api_locations)
+    assert result.templates_created == 8
+    assert result.senders_created == 2
+
+    rows = await _easyweek_templates(db)
+    assert len(rows) == 8
+    by_company: dict[int, list[MessageTemplate]] = {}
+    for row in rows:
+        by_company.setdefault(row.company_id, []).append(row)
+    assert all(row.meta_template_name.startswith("kitilash_du_") for row in by_company[DURLACH_LOCATION_ID])
+    assert all(row.meta_template_name.startswith("kitilash_ra_") for row in by_company[rastatt_id])
+    assert all(
+        "KitiLash Durlach" in row.body and "Pfinztalstraße" in row.body for row in by_company[DURLACH_LOCATION_ID]
+    )
+    assert all("KitiLash Rastatt" in row.body and "Rathausstraße" in row.body for row in by_company[rastatt_id])
+
+    senders = list(
+        (
+            await db.execute(
+                select(WhatsAppSender)
+                .where(WhatsAppSender.provider == PROVIDER_EASYWEEK)
+                .order_by(WhatsAppSender.company_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert [sender.company_id for sender in senders] == [DURLACH_LOCATION_ID, rastatt_id]
+    assert {sender.phone_number_id for sender in senders} == {SHARED_PHONE_NUMBER_ID}
+
+    plan = await seed_script.build_seed_plan(client_factory=_client_factory(api_locations))
+    assert {branch.location.booking_page_url for branch in plan.branches} == {STATIC_BOOKING_PAGE, rastatt_page}
+
+    second = await seed_script.seed(db, plan=plan)
+    await db.flush()
+    assert second.templates_created == 0
+    assert second.templates_updated == 8
+    assert await _count(db, MessageTemplate, provider=PROVIDER_EASYWEEK) == 8
+    assert await _count(db, WhatsAppSender, provider=PROVIDER_EASYWEEK) == 2
 
 
 @pytest.mark.parametrize("absent_code", ["reminder_24h", "reminder_2h"])
@@ -149,7 +262,10 @@ async def test_the_seed_reactivates_a_row_an_operator_disabled(db: AsyncSession)
 
     refreshed = await _easyweek_templates(db)
     assert all(r.is_active for r in refreshed)
-    assert refreshed[0].meta_template_name == seed_script.META_TEMPLATE_NAMES[refreshed[0].code]
+    contract = branch_template_contract(BRANCH_PROFILES["durlach"], refreshed[0].code)
+    assert contract is not None
+    assert refreshed[0].meta_template_name == contract.meta_template_name
+    assert refreshed[0].body == contract.raw_body
 
 
 # ---------------------------------------------------------------------------
@@ -212,11 +328,11 @@ async def test_the_seed_leaves_altegio_rows_untouched(db: AsyncSession) -> None:
 
 async def test_the_sender_seed_is_idempotent(db: AsyncSession) -> None:
     first = await _run_seed(db)
-    assert first.sender_created is True
+    assert first.senders_created == 1
 
     second = await _run_seed(db)
-    assert second.sender_created is False
-    assert second.sender_updated is True
+    assert second.senders_created == 0
+    assert second.senders_updated == 1
 
     res = await db.execute(select(WhatsAppSender).where(WhatsAppSender.provider == PROVIDER_EASYWEEK))
     senders = list(res.scalars().all())
@@ -254,11 +370,8 @@ async def test_the_sender_shares_the_bot_number_with_altegio_without_colliding(d
 @pytest.mark.parametrize(
     "field,value",
     [
-        ("easyweek_location_id", 0),
-        # A perfectly plausible positive id that simply is not Durlach's. Without
-        # the binding this would bind Durlach's Meta names, address and map pin
-        # to another location, and nothing downstream would notice.
-        ("easyweek_location_id", DURLACH_LOCATION_ID + 1),
+        ("easyweek_location_map", "{}"),
+        ("easyweek_location_map", "{not json"),
         ("easyweek_default_language", "   "),
         # German bodies naming German Meta templates must not be filed under `en`.
         ("easyweek_default_language", "en"),
@@ -283,61 +396,46 @@ async def test_the_seed_refuses_an_unconfigured_environment(
 
 
 # ---------------------------------------------------------------------------
-# The two-source location confirmation
+# The independent GET /locations confirmation
 # ---------------------------------------------------------------------------
 
 
-async def test_a_matching_confirmation_seeds(db: AsyncSession) -> None:
-    result = await _run_seed(db, expect_location_id=DURLACH_LOCATION_ID)
+async def test_a_matching_api_uuid_seeds(db: AsyncSession, capsys) -> None:
+    result = await _run_seed(db)
 
     assert result.templates_created == 4
     assert await _count(db, WhatsAppSender, provider=PROVIDER_EASYWEEK) == 1
+    assert "KitiLash Durlach" in capsys.readouterr().out
 
 
-async def test_a_confirmation_for_another_location_writes_nothing(db: AsyncSession) -> None:
-    """The operator confirmed a location this container is not configured for.
-
-    Either the env is wrong or the operator is; the seed cannot tell which, and
-    writing Durlach's content under either answer would be a guess.
-    """
+async def test_a_registry_uuid_missing_from_api_writes_nothing(db: AsyncSession) -> None:
     with pytest.raises(seed_script.SeedConfigError):
-        await _run_seed(db, expect_location_id=DURLACH_LOCATION_ID + 1)
+        await _run_seed(
+            db,
+            api_locations=[{"uuid": "eeeeeeee-ffff-4000-8111-000000000002", "name": "Another branch"}],
+        )
 
     await db.flush()
     assert await _count(db, MessageTemplate, provider=PROVIDER_EASYWEEK) == 0
     assert await _count(db, WhatsAppSender, provider=PROVIDER_EASYWEEK) == 0
 
 
-@pytest.mark.parametrize("bad_confirmation", [None, 0, -1])
-async def test_a_missing_or_nonsense_confirmation_writes_nothing(
-    db: AsyncSession,
-    bad_confirmation: int | None,
-) -> None:
-    """No default is substituted — an unconfirmed seed simply does not run."""
+async def test_an_unavailable_api_writes_nothing(db: AsyncSession) -> None:
+    def unavailable():
+        raise RuntimeError("offline")
+
     with pytest.raises(seed_script.SeedConfigError):
-        await _run_seed(db, expect_location_id=bad_confirmation)
+        await seed_script.seed(db, client_factory=unavailable)
 
     await db.flush()
     assert await _count(db, MessageTemplate, provider=PROVIDER_EASYWEEK) == 0
     assert await _count(db, WhatsAppSender, provider=PROVIDER_EASYWEEK) == 0
 
 
-async def test_the_cli_requires_the_confirmation() -> None:
-    """argparse refuses before anything opens a database session."""
+async def test_cli_has_no_expect_location_id_escape_hatch() -> None:
+    seed_script._parse_args([])
     with pytest.raises(SystemExit):
-        seed_script._parse_args([])
-
-    assert seed_script._parse_args(["--expect-location-id", "42"]).expect_location_id == 42
-
-
-async def test_the_refusal_never_echoes_the_location_id() -> None:
-    """These strings reach logs; the id is production configuration."""
-    with pytest.raises(seed_script.SeedConfigError) as excinfo:
-        seed_script._resolve_company_id(DURLACH_LOCATION_ID + 1)
-
-    message = str(excinfo.value)
-    assert str(DURLACH_LOCATION_ID) not in message
-    assert str(DURLACH_LOCATION_ID + 1) not in message
+        seed_script._parse_args(["--expect-location-id", "42"])
 
 
 # ---------------------------------------------------------------------------
@@ -345,11 +443,17 @@ async def test_the_refusal_never_echoes_the_location_id() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def _seed_durlach_domain(db: AsyncSession, *, short_link: str | None = VERIFIED_PAGE) -> tuple[Client, Record]:
+async def _seed_durlach_domain(
+    db: AsyncSession,
+    *,
+    short_link: str | None = VERIFIED_PAGE,
+    company_id: int = DURLACH_LOCATION_ID,
+    identity_offset: int = 0,
+) -> tuple[Client, Record]:
     client = Client(
         provider=PROVIDER_EASYWEEK,
-        company_id=DURLACH_LOCATION_ID,
-        altegio_client_id=7300777,
+        company_id=company_id,
+        altegio_client_id=7300777 + identity_offset,
         phone_e164="+491700000777",
         display_name="Anna Müller",
         raw={},
@@ -358,8 +462,8 @@ async def _seed_durlach_domain(db: AsyncSession, *, short_link: str | None = VER
     await db.flush()
     record = Record(
         provider=PROVIDER_EASYWEEK,
-        company_id=DURLACH_LOCATION_ID,
-        altegio_record_id=4200777,
+        company_id=company_id,
+        altegio_record_id=4200777 + identity_offset,
         easyweek_booking_hash_id=BOOKING_HASH,
         client_id=client.id,
         staff_name="Tanja",
@@ -402,7 +506,9 @@ async def test_the_seeded_rows_render_end_to_end(db: AsyncSession, code: str) ->
 
     assert language == "de"
     assert sender_id is not None
-    assert ctx["meta_template_name"] == seed_script.META_TEMPLATE_NAMES[code]
+    contract = branch_template_contract(BRANCH_PROFILES["durlach"], code)
+    assert contract is not None
+    assert ctx["meta_template_name"] == contract.meta_template_name
 
     rendered = body.format(**ctx)
     assert "{" not in rendered, "every placeholder in the seeded body must exist in ctx"
@@ -412,6 +518,80 @@ async def test_the_seeded_rows_render_end_to_end(db: AsyncSession, code: str) ->
     assert "Pfinztalstraße 4, 76227 Karlsruhe-Durlach" in rendered
     # Phase 1 is transactional, so the marketing opt-out line must not appear.
     assert "abbestellen" not in rendered
+
+
+async def test_seeded_two_branches_render_every_lifecycle_and_new_repeat_variant(
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rastatt_id = 999502
+    rastatt_uuid = "dddddddd-eeee-4fff-8000-000000000002"
+    rastatt_page = "https://book.rastatt.invalid/rastatt"
+    monkeypatch.setattr(
+        settings,
+        "easyweek_location_map",
+        json.dumps(
+            {
+                "durlach": {
+                    "location_id": DURLACH_LOCATION_ID,
+                    "location_uuid": DURLACH_LOCATION_UUID,
+                    "meta_template_prefix": "du",
+                    "booking_page_url": STATIC_BOOKING_PAGE,
+                },
+                "rastatt": {
+                    "location_id": rastatt_id,
+                    "location_uuid": rastatt_uuid,
+                    "meta_template_prefix": "ra",
+                    "booking_page_url": rastatt_page,
+                },
+            }
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        settings,
+        "easyweek_booking_page_allowed_hosts",
+        f"{BOOKING_PAGE_HOST},book.rastatt.invalid",
+        raising=False,
+    )
+    api_locations = [
+        {"uuid": DURLACH_LOCATION_UUID, "name": "KitiLash Durlach"},
+        {"uuid": rastatt_uuid, "name": "KitiLash Rastatt"},
+    ]
+    await _run_seed(db, api_locations=api_locations)
+
+    for offset, (company_id, prefix, brand, static_page) in enumerate(
+        [
+            (DURLACH_LOCATION_ID, "du", "KitiLash Durlach", STATIC_BOOKING_PAGE),
+            (rastatt_id, "ra", "KitiLash Rastatt", rastatt_page),
+        ]
+    ):
+        client, record = await _seed_durlach_domain(db, company_id=company_id, identity_offset=offset * 100)
+
+        new_body, _sender, _language, new_ctx = await ow._render_message(
+            db,
+            company_id=company_id,
+            template_code=RECORD_CREATED,
+            record=record,
+            client=client,
+            provider=PROVIDER_EASYWEEK,
+        )
+        assert new_ctx["meta_template_name"] == f"kitilash_{prefix}_record_created_new_client_v1"
+        assert "Wichtige Hinweise" in new_body
+
+        await _seed_previous_visit(db, client, record)
+        for code in (RECORD_CREATED, RECORD_UPDATED, RECORD_CANCELED):
+            body, _sender, _language, ctx = await ow._render_message(
+                db,
+                company_id=company_id,
+                template_code=code,
+                record=record,
+                client=client,
+                provider=PROVIDER_EASYWEEK,
+            )
+            assert ctx["meta_template_name"] == f"kitilash_{prefix}_{code}_v1"
+            assert brand in body.format(**ctx)
+            if code == RECORD_CANCELED:
+                assert ctx["booking_link"] == static_page
 
 
 async def test_created_and_updated_use_the_verified_manage_link(db: AsyncSession) -> None:
@@ -491,8 +671,8 @@ async def _seed_previous_visit(db: AsyncSession, client: Client, record: Record)
     """An earlier EasyWeek booking for the same customer — so they are not new."""
     earlier = Record(
         provider=PROVIDER_EASYWEEK,
-        company_id=DURLACH_LOCATION_ID,
-        altegio_record_id=4200776,
+        company_id=record.company_id,
+        altegio_record_id=record.altegio_record_id - 1,
         client_id=client.id,
         staff_name="Tanja",
         starts_at=record.starts_at - timedelta(days=30),
@@ -619,7 +799,9 @@ async def test_the_new_client_body_renders_with_no_missing_placeholders(db: Asyn
 
 async def test_the_new_client_body_matches_the_shared_notes_constant(db: AsyncSession) -> None:
     """The Meta template was cloned from the Karlsruhe one; the text must not drift."""
-    assert ow.PRE_APPOINTMENT_NOTES_DE in seed_script.BODIES[RECORD_CREATED_NEW_CLIENT]
+    contract = branch_template_contract(BRANCH_PROFILES["durlach"], RECORD_CREATED_NEW_CLIENT)
+    assert contract is not None
+    assert ow.PRE_APPOINTMENT_NOTES_DE in contract.raw_body
 
 
 async def test_a_missing_new_client_row_falls_back_instead_of_failing(db: AsyncSession) -> None:
@@ -713,3 +895,205 @@ async def test_the_allowlist_is_an_origin_check_not_a_hostname_check(
     assert validate_static_booking_page("https://booking.example.com:4443/durlach") is None
     assert validate_static_booking_page("https://booking.example.com:80/durlach") is None
     assert validate_static_booking_page("https://booking.example.com:8443/durlach") is None
+
+
+# ===========================================================================
+# PR-7: branch identity is indivisible
+# ===========================================================================
+
+RASTATT_LOCATION_ID = 999502
+RASTATT_LOCATION_UUID = "dddddddd-eeee-4fff-8000-000000000002"
+RASTATT_PAGE = f"https://{BOOKING_PAGE_HOST}/rastatt"
+
+_BOTH_API_LOCATIONS = [
+    {"uuid": DURLACH_LOCATION_UUID, "name": "KitiLash Durlach"},
+    {"uuid": RASTATT_LOCATION_UUID, "name": "KitiLash Rastatt"},
+]
+
+
+def _set_registry(monkeypatch: pytest.MonkeyPatch, entries: dict[str, dict[str, Any]]) -> None:
+    monkeypatch.setattr(settings, "easyweek_location_map", json.dumps(entries), raising=False)
+
+
+def _entry(location_id: int, location_uuid: str, prefix: str, page: str) -> dict[str, Any]:
+    return {
+        "location_id": location_id,
+        "location_uuid": location_uuid,
+        "meta_template_prefix": prefix,
+        "booking_page_url": page,
+    }
+
+
+async def _easyweek_state(db: AsyncSession) -> tuple[int, int]:
+    templates = await _count(db, MessageTemplate, provider=PROVIDER_EASYWEEK)
+    senders = await _count(db, WhatsAppSender, provider=PROVIDER_EASYWEEK)
+    return templates, senders
+
+
+@pytest.mark.parametrize(
+    ("slug", "location_id", "location_uuid", "wrong_prefix", "page"),
+    [
+        ("durlach", DURLACH_LOCATION_ID, DURLACH_LOCATION_UUID, "ra", STATIC_BOOKING_PAGE),
+        ("rastatt", RASTATT_LOCATION_ID, RASTATT_LOCATION_UUID, "du", RASTATT_PAGE),
+    ],
+)
+async def test_a_crossed_meta_prefix_is_refused_before_any_write(
+    db: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    slug: str,
+    location_id: int,
+    location_uuid: str,
+    wrong_prefix: str,
+    page: str,
+) -> None:
+    """The §10 defect: real ids of one branch wearing the other's prefix."""
+    before = await _easyweek_state(db)
+    _set_registry(monkeypatch, {slug: _entry(location_id, location_uuid, wrong_prefix, page)})
+
+    with pytest.raises(seed_script.SeedConfigError) as excinfo:
+        await _run_seed(db, api_locations=_BOTH_API_LOCATIONS)
+
+    assert "meta_template_prefix" in str(excinfo.value)
+    assert await _easyweek_state(db) == before, "a refused seed still wrote to the database"
+
+
+async def test_the_other_branchs_uuid_under_a_slug_is_refused_even_with_a_matching_prefix(
+    db: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Prefix and slug agree; only the live API can expose the swapped UUID.
+
+    This is the case a prefix check alone cannot catch, and the one that
+    actually happened: every local field is self-consistent, and the identity is
+    still wrong.
+    """
+    before = await _easyweek_state(db)
+    _set_registry(
+        monkeypatch,
+        {"durlach": _entry(DURLACH_LOCATION_ID, RASTATT_LOCATION_UUID, "du", STATIC_BOOKING_PAGE)},
+    )
+
+    with pytest.raises(seed_script.SeedConfigError) as excinfo:
+        await _run_seed(db, api_locations=_BOTH_API_LOCATIONS)
+
+    message = str(excinfo.value)
+    assert "API identity mismatch" in message
+    assert "durlach" in message
+    assert await _easyweek_state(db) == before
+
+
+async def test_an_unknown_branch_slug_is_refused(db: AsyncSession, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A third branch cannot be seeded until its profile is approved in source."""
+    before = await _easyweek_state(db)
+    _set_registry(
+        monkeypatch,
+        {"karlsruhe": _entry(999503, "dddddddd-eeee-4fff-8000-000000000003", "ka", STATIC_BOOKING_PAGE)},
+    )
+
+    with pytest.raises(seed_script.SeedConfigError) as excinfo:
+        await _run_seed(db, api_locations=_BOTH_API_LOCATIONS)
+
+    assert "no source-controlled profile" in str(excinfo.value)
+    assert await _easyweek_state(db) == before
+
+
+async def test_both_correct_profiles_seed_eight_templates_and_two_senders(
+    db: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_registry(
+        monkeypatch,
+        {
+            "durlach": _entry(DURLACH_LOCATION_ID, DURLACH_LOCATION_UUID, "du", STATIC_BOOKING_PAGE),
+            "rastatt": _entry(RASTATT_LOCATION_ID, RASTATT_LOCATION_UUID, "ra", RASTATT_PAGE),
+        },
+    )
+    await _run_seed(db, api_locations=_BOTH_API_LOCATIONS)
+
+    templates, senders = await _easyweek_state(db)
+    assert (templates, senders) == (8, 2)
+
+    rows = await _easyweek_templates(db)
+    by_company: dict[int, set[str]] = {}
+    for row in rows:
+        by_company.setdefault(row.company_id, set()).add(row.meta_template_name or "")
+
+    assert all(name.startswith("kitilash_du_") for name in by_company[DURLACH_LOCATION_ID])
+    assert all(name.startswith("kitilash_ra_") for name in by_company[RASTATT_LOCATION_ID])
+
+    durlach_bodies = " ".join(r.body for r in rows if r.company_id == DURLACH_LOCATION_ID)
+    rastatt_bodies = " ".join(r.body for r in rows if r.company_id == RASTATT_LOCATION_ID)
+    assert "Durlach" in durlach_bodies and "Rastatt" not in durlach_bodies
+    assert "Rastatt" in rastatt_bodies and "Durlach" not in rastatt_bodies
+
+
+async def test_contaminated_rows_converge_to_the_right_branch(
+    db: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rastatt rows previously seeded with Durlach names are repaired in place."""
+    _set_registry(
+        monkeypatch,
+        {"rastatt": _entry(RASTATT_LOCATION_ID, RASTATT_LOCATION_UUID, "ra", RASTATT_PAGE)},
+    )
+    contaminated = MessageTemplate(
+        provider=PROVIDER_EASYWEEK,
+        company_id=RASTATT_LOCATION_ID,
+        code="record_created",
+        language="de",
+        body="Durlach body that never belonged here",
+        meta_template_name="kitilash_du_record_created_v1",
+        is_active=True,
+    )
+    db.add(contaminated)
+    await db.flush()
+
+    await _run_seed(db, api_locations=_BOTH_API_LOCATIONS)
+
+    rows = [r for r in await _easyweek_templates(db) if r.company_id == RASTATT_LOCATION_ID]
+    assert rows, "the branch was not seeded"
+    assert all((r.meta_template_name or "").startswith("kitilash_ra_") for r in rows), (
+        "a du_* name survived a Rastatt seed"
+    )
+    assert all("Durlach" not in r.body for r in rows)
+
+
+async def test_three_synthetic_branches_parse_and_scope_independently(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No 'exactly two' assumption anywhere in the registry.
+
+    Uses synthetic entries on purpose: a real third branch needs approved
+    metadata, and inventing one here would put unverified production data in
+    source. What is proven is that parsing, membership and provider-scoped
+    company ids already work for three.
+    """
+    entries = {
+        f"branch{n}": _entry(999600 + n, f"dddddddd-eeee-4fff-8000-00000000010{n}", f"b{n}", STATIC_BOOKING_PAGE)
+        for n in (1, 2, 3)
+    }
+    _set_registry(monkeypatch, entries)
+
+    registry = configured_easyweek_locations()
+    assert registry.ready
+    assert len(registry.locations) == 3
+    assert {loc.company_id for loc in registry.locations.values()} == {999601, 999602, 999603}
+    for n in (1, 2, 3):
+        location = registry.locations[999600 + n]
+        assert location.name == f"branch{n}"
+        assert location.company_id == location.location_id
+
+
+async def test_an_unprofiled_branch_is_member_but_cannot_seed(
+    db: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Membership and profile are different questions, and both are enforced."""
+    _set_registry(
+        monkeypatch,
+        {"branch1": _entry(999601, "dddddddd-eeee-4fff-8000-000000000101", "b1", STATIC_BOOKING_PAGE)},
+    )
+    assert 999601 in configured_easyweek_locations().locations
+
+    before = await _easyweek_state(db)
+    with pytest.raises(seed_script.SeedConfigError):
+        await _run_seed(db, api_locations=_BOTH_API_LOCATIONS)
+    assert await _easyweek_state(db) == before

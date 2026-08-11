@@ -256,7 +256,7 @@ def _has_usable_timezone(value: object) -> bool:
 def _validated_location(item: object) -> dict[str, Any]:
     """Return *item* if it is a usable location entry, otherwise raise.
 
-    The operator reads this list to pick ``EASYWEEK_LOCATION_UUID`` by hand, so an
+    The seed reads this list to verify registry UUIDs independently, so an
     entry is only usable when it can actually be identified AND referenced. A bare
     ``{}`` used to pass the "is a dict" check and reach the probe as
     ``{"uuid": null, "name": null, "timezone": null}`` — an operator could not act
@@ -536,7 +536,7 @@ class EasyWeekClient:
         """``GET /locations`` — locations this API key can see.
 
         One key may legitimately see several locations (§1.6 p.5), which is why
-        the operator picks ``EASYWEEK_LOCATION_UUID`` from this list by hand.
+        the seed matches every registry UUID to a human-readable API location name.
         A bare list and the documented ``{"data": [...]}`` envelope are both
         accepted.
 

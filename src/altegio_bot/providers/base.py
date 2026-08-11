@@ -1,6 +1,14 @@
 from __future__ import annotations
 
+from enum import StrEnum
 from typing import Protocol
+
+
+class ChatwootRoute(StrEnum):
+    """Explicit outbound Chatwoot mirror routing intent."""
+
+    TENANT = "tenant"
+    GENERAL = "general"
 
 
 class WhatsAppProvider(Protocol):

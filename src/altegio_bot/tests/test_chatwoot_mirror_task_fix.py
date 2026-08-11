@@ -7,6 +7,7 @@ from uuid import uuid4
 
 import pytest
 
+from altegio_bot.providers.base import ChatwootRoute
 from altegio_bot.providers.chatwoot_hybrid import ChatwootHybridProvider
 from altegio_bot.providers.dummy import _supports_mirror, safe_send, safe_send_template
 
@@ -292,12 +293,16 @@ async def test_safe_send_passes_mirror_kwargs() -> None:
             phone_e164: str,
             text: str,
             *,
+            tenant_provider: str | None = None,
             company_id: int = 0,
             staff_id: int | None = None,
             contact_name: str | None = None,
+            chatwoot_route: ChatwootRoute = ChatwootRoute.TENANT,
         ) -> str:
+            received["tenant_provider"] = tenant_provider
             received["company_id"] = company_id
             received["staff_id"] = staff_id
+            received["chatwoot_route"] = chatwoot_route
             return "fake-id"
 
     provider = _CaptureMeta()
@@ -313,8 +318,10 @@ async def test_safe_send_passes_mirror_kwargs() -> None:
             sender_id=1,
             phone="+49100000006",
             text="test",
+            tenant_provider="easyweek",
             company_id=42,
             staff_id=7,
+            chatwoot_route=ChatwootRoute.GENERAL,
         )
     finally:
         del os.environ["WHATSAPP_PROVIDER"]
@@ -322,8 +329,10 @@ async def test_safe_send_passes_mirror_kwargs() -> None:
 
     assert err is None
     assert msg_id == "fake-id"
+    assert received["tenant_provider"] == "easyweek"
     assert received["company_id"] == 42
     assert received["staff_id"] == 7
+    assert received["chatwoot_route"] is ChatwootRoute.GENERAL
 
 
 async def test_safe_send_template_passes_mirror_kwargs() -> None:
@@ -342,11 +351,13 @@ async def test_safe_send_template_passes_mirror_kwargs() -> None:
             params: list[str],
             fallback_text: str = "",
             *,
+            tenant_provider: str | None = None,
             company_id: int = 0,
             staff_id: int | None = None,
             contact_name: str | None = None,
             header_image_url: str | None = None,
         ) -> str:
+            received["tenant_provider"] = tenant_provider
             received["company_id"] = company_id
             received["staff_id"] = staff_id
             return "fake-tpl-id"
@@ -365,6 +376,7 @@ async def test_safe_send_template_passes_mirror_kwargs() -> None:
             template_name="tpl",
             language="de",
             params=["p1"],
+            tenant_provider="altegio",
             company_id=99,
             staff_id=3,
         )
@@ -374,5 +386,6 @@ async def test_safe_send_template_passes_mirror_kwargs() -> None:
 
     assert err is None
     assert msg_id == "fake-tpl-id"
+    assert received["tenant_provider"] == "altegio"
     assert received["company_id"] == 99
     assert received["staff_id"] == 3

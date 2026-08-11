@@ -5,10 +5,8 @@ schema (PR-3) or normalizer (PR-4) depends on them, that:
 
   1. the API key and workspace slug are accepted (``GET /ping``);
   2. which locations that key can see (``GET /locations``);
-  3. which of them is Durlach — so ``EASYWEEK_LOCATION_UUID`` can be recorded by
-     hand in the production ``easyweek.env`` (INTEGRATION_PLAN §1.6 p.5: one key
-     sees several locations, and the numeric ``location_id`` from a webhook does
-     NOT substitute for the UUID);
+  3. which branches and UUIDs the key sees, so the operator can build the strict
+     ``EASYWEEK_LOCATION_MAP`` (one key may see several locations);
   4. optionally, that a known booking UUID reads back (``GET /bookings/{uuid}``).
 
 Read-only by construction: it can only call the three GET methods of

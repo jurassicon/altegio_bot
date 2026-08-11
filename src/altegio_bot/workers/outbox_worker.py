@@ -33,6 +33,13 @@ from altegio_bot.delivery_retry_identity import (
     resolve_retry_reference,
     retry_outbox_audit_mismatch,
 )
+from altegio_bot.easyweek_branches import (
+    PRE_APPOINTMENT_NOTES_DE,
+    BranchProfile,
+    branch_profile_for_slug,
+    branch_template_contract_error,
+)
+from altegio_bot.easyweek_locations import EasyWeekLocation, configured_easyweek_locations
 from altegio_bot.easyweek_normalizer import extract_manage_link
 from altegio_bot.easyweek_policy import (
     EASYWEEK_LIFECYCLE_JOB_TYPES,
@@ -220,17 +227,6 @@ GOOGLE_MAPS_REVIEW_LINKS: dict[int, str] = {
     758285: "https://g.page/r/CdOqDUWhxCAbEBM/review",
     1271200: "https://g.page/r/CWd7fy4dua5kEBM/review",
 }
-
-PRE_APPOINTMENT_NOTES_DE = (
-    "\n\nWichtige Hinweise vor dem Termin:\n"
-    "• Bitte pünktlich kommen — ab 15 Min. Verspätung können wir "
-    "nicht garantieren, dass der Termin stattfindet.\n"
-    "• Wimpern bitte sauber: ohne Mascara, ohne geklebte Wimpern.\n"
-    "• Falls Sie schon eine Kundenkarte haben, bitte mitbringen.\n"
-    "• Auffüllen: ab 3. Woche 60 €, ab 4. Woche 70 €, ab 5. Woche "
-    "keine Auffüllung (Neuauflage).\n"
-    "• Zahlung: bar oder mit Karte.\n"
-)
 
 SUCCESS_OUTBOX_STATUSES = ("sent", "delivered", "read")
 
@@ -935,7 +931,60 @@ def _easyweek_service_snapshot_error(
     return None
 
 
-def easyweek_effective_booking_link(record: Record | None, template_code: str) -> str:
+def _easyweek_owned_branch(
+    company_id: int | None,
+) -> tuple[EasyWeekLocation | None, BranchProfile | None, str | None]:
+    """Resolve one job to the registry entry and profile selected by its slug."""
+    registry = configured_easyweek_locations()
+    if not registry.configured:
+        return None, None, "EasyWeek registry is not configured; refusing to send."
+    if not registry.valid:
+        return None, None, "EasyWeek registry is invalid; refusing to send."
+
+    location = registry.locations.get(company_id) if company_id is not None else None
+    if location is None:
+        return (
+            None,
+            None,
+            f"EasyWeek company {company_id} is not in the configured registry; refusing to send.",
+        )
+
+    profile = branch_profile_for_slug(location.name)
+    if profile is None:
+        return (
+            location,
+            None,
+            f"EasyWeek company {company_id} has no source-controlled branch profile; refusing to send.",
+        )
+    if location.meta_template_prefix != profile.meta_template_prefix:
+        return (
+            location,
+            None,
+            f"EasyWeek company {company_id} registry prefix does not match its branch profile; refusing to send.",
+        )
+    return location, profile, None
+
+
+def easyweek_job_ownership_error(company_id: int | None) -> str | None:
+    """Fail-closed proof that the configured registry still owns this company.
+
+    The registry is the EasyWeek tenant boundary. A queued job outlives the
+    configuration that created it, so membership has to be re-proven at send
+    time: a branch removed from ``EASYWEEK_LOCATION_MAP``, an empty registry and
+    a malformed one must all stop the job rather than let an already-verified
+    ``Record.short_link`` carry it through.
+
+    The branch must also resolve to a source-controlled profile, so a company
+    whose content and template prefix nobody has approved cannot send at all.
+
+    Returns a short, stable reason (no registry contents, no URLs, no payload)
+    or ``None`` when the job may proceed.
+    """
+    _location, _profile, error = _easyweek_owned_branch(company_id)
+    return error
+
+
+def easyweek_effective_booking_link(record: Record | None, template_code: str, *, company_id: int) -> str:
     """The ONLY link an EasyWeek lifecycle message may carry.
 
     ``record_canceled`` always gets the static booking page, even when a
@@ -950,15 +999,23 @@ def easyweek_effective_booking_link(record: Record | None, template_code: str) -
     drift, and this is the last gate before a URL reaches a customer. A link is
     never synthesised from the booking UUID, the numeric id or the hash.
 
-    The static page is validated too, by :func:`validate_static_booking_page` —
-    a misconfigured ``EASYWEEK_BOOKING_PAGE_URL`` is just as customer-facing as a
-    forged ``short_link``, and for ``record_canceled`` it is the ONLY link. An
-    unusable value yields "" here, and the caller fails the job locally rather
-    than sending a message with a blank or hostile link.
+    The static page comes from the registry entry selected by ``company_id`` and
+    is validated too, by :func:`validate_static_booking_page`. An unknown
+    location, invalid registry or unusable URL yields "" here, and the caller
+    fails the job locally rather than sending a blank or cross-branch link.
 
     Anything that does not verify falls back to the static page.
     """
-    static_page = validate_static_booking_page(settings.easyweek_booking_page_url) or ""
+    # Ownership FIRST, before any link is considered. A proven `short_link` on
+    # the Record is not authorisation to send: the registry is the tenant
+    # boundary, and a branch that was removed from it — or a registry that is
+    # empty or malformed — must not yield a customer-facing URL just because an
+    # older, then-valid manage link is still stored on the row.
+    location, _profile, ownership_error = _easyweek_owned_branch(company_id)
+    if ownership_error is not None or location is None:
+        return ""
+
+    static_page = validate_static_booking_page(location.booking_page_url) or ""
     if record is None or template_code == "record_canceled":
         return static_page
 
@@ -1076,7 +1133,7 @@ async def _render_message(
     if is_easyweek:
         # EasyWeek has no BOOKING_LINKS entry and must never borrow one: that map
         # is keyed by Altegio company id and holds Altegio salon pages.
-        booking_link = easyweek_effective_booking_link(record, template_code)
+        booking_link = easyweek_effective_booking_link(record, template_code, company_id=company_id)
     else:
         booking_link = BOOKING_LINKS.get(company_id, "")
 
@@ -1137,6 +1194,10 @@ async def _render_message(
         # From the SAME row whose body/language/code were just used, so the name
         # and the text can never come from two different templates.
         ctx["meta_template_name"] = tmpl.meta_template_name
+        # The code that was ACTUALLY selected — `record_created_new_client` is a
+        # distinct approved template, not a variant — so the branch guard below
+        # validates the row that will really be sent.
+        ctx["easyweek_template_code"] = lookup_code
         # An EasyWeek lifecycle message links only via `booking_link`; the raw
         # `short_link` is unverified at this point and must not leak into a
         # parameter slot.
@@ -1750,6 +1811,7 @@ async def _backfill_campaign_recipient_after_send(
     campaign_recipient_id = payload.get("campaign_recipient_id")
     if campaign_recipient_id is None:
         return
+
     _rcid_int, _rcid_err = _parse_int_payload_id(campaign_recipient_id, "campaign_recipient_id")
     if _rcid_err is not None:
         logger.warning(
@@ -2029,6 +2091,7 @@ async def _process_promo_card_booking_reminder(
         template_name=template_name,
         language=TEMPLATE_LANGUAGE,
         params=template_params,
+        tenant_provider=normalize_provider(getattr(job, "provider", None), default=PROVIDER_ALTEGIO),
         company_id=lead.company_id,
     )
 
@@ -2218,6 +2281,29 @@ async def _run_job_logic(
             job.job_type,
         )
         return None
+
+    # EasyWeek registry ownership. Deliberately HERE: after the provider is
+    # known and the phase-1 allowlist has run, but before the template, Record,
+    # Client, sender, rate limit, render and every external call. The registry
+    # is the tenant boundary, so membership has to be proven before anything
+    # acts on the job — a branch removed from `EASYWEEK_LOCATION_MAP` must not
+    # keep sending just because its jobs were queued while it was still there.
+    #
+    # Failing locally and terminally is the point: a retry cannot fix a
+    # configuration that no longer claims this company.
+    if job_provider == PROVIDER_EASYWEEK:
+        ownership_err = easyweek_job_ownership_error(job.company_id)
+        if ownership_err is not None:
+            job.status = "failed"
+            job.locked_at = None
+            job.last_error = ownership_err
+            logger.error(
+                "EasyWeek job company is not owned by the configured registry: job_id=%s company=%s job_type=%s",
+                job.id,
+                job.company_id,
+                job.job_type,
+            )
+            return None
 
     # Safety guard: orchestrator jobs must never reach outbox_worker.
     # _lock_next_jobs() already excludes them, but if somehow an execution job
@@ -2854,6 +2940,7 @@ async def _run_job_logic(
                 phone=phone,
                 text=_pd_body,
                 contact_name=contact_name,
+                tenant_provider=job_provider,
                 company_id=job.company_id,
             )
             _pd_ms_ctx.update(provider_message_id=msg_id)
@@ -3006,6 +3093,43 @@ async def _run_job_logic(
         job.last_error = f"Template render error: {exc}"
         return
 
+    # Validate the DB row selected by `_render_message` for every send mode.
+    # Text sends carry the rendered body rather than the Meta template name, so
+    # allowing them to skip this proof would still let a Rastatt row containing
+    # Durlach content reach the customer. Delivery retries enter this same path.
+    if job_provider == PROVIDER_EASYWEEK:
+        _location, profile, ownership_error = _easyweek_owned_branch(job.company_id)
+        if ownership_error is not None or profile is None:
+            job.status = "failed"
+            job.locked_at = None
+            job.last_error = ownership_error or "EasyWeek branch ownership could not be proven."
+            logger.error(
+                "EasyWeek branch ownership changed during render; failing job_id=%s company=%s",
+                job.id,
+                job.company_id,
+            )
+            return
+
+        selected_name = (msg_ctx.get("meta_template_name") or "").strip()
+        selected_code = str(msg_ctx.get("easyweek_template_code") or job.job_type)
+        branch_error = branch_template_contract_error(
+            profile=profile,
+            template_code=selected_code,
+            resolved_name=selected_name,
+            resolved_body=body,
+        )
+        if branch_error is not None:
+            job.status = "failed"
+            job.locked_at = None
+            job.last_error = branch_error
+            logger.error(
+                "EasyWeek template does not belong to the job's branch; failing job_id=%s company=%s branch=%s",
+                job.id,
+                job.company_id,
+                profile.slug,
+            )
+            return
+
     # The language Meta is actually told the template is in.
     #
     # For Altegio this stays the global TEMPLATE_LANGUAGE: every approved
@@ -3073,10 +3197,10 @@ async def _run_job_logic(
 
     if use_template:
         if job_provider == PROVIDER_EASYWEEK:
-            # DB-first, and ONLY from the row already rendered above. The name is
-            # never derived from company_id, from a branch prefix or from the
-            # code: EasyWeek templates live in a different WABA and are named by
-            # whoever approved them, so any derivation would be a guess.
+            # DB-first: the name sent to Meta is ONLY the value from the row
+            # rendered above, never a freshly derived replacement. The branch
+            # guard before this block has already proved that DB value equals
+            # the source-controlled name approved for the selected branch/code.
             meta_template_name = (msg_ctx.get("meta_template_name") or "").strip() or None
             if meta_template_name is None:
                 job.status = "failed"
@@ -3091,6 +3215,7 @@ async def _run_job_logic(
                     job.job_type,
                 )
                 return
+
             template_params = build_lifecycle_template_params(job.job_type, msg_ctx)
         else:
             is_new = bool(msg_ctx.get("pre_appointment_notes", ""))
@@ -3293,6 +3418,7 @@ async def _run_job_logic(
                     phone=phone,
                     text=final_body,
                     contact_name=contact_name,
+                    tenant_provider=job_provider,
                     company_id=job.company_id,
                 )
                 _ts_ctx.update(provider_message_id=_text_msg_id)
@@ -3483,6 +3609,7 @@ async def _run_job_logic(
                         params=template_params,
                         fallback_text=final_body,
                         contact_name=contact_name,
+                        tenant_provider=job_provider,
                         company_id=job.company_id,
                         header_image_url=header_image_url,
                     )
@@ -3499,6 +3626,7 @@ async def _run_job_logic(
                     params=template_params,
                     fallback_text=final_body,
                     contact_name=contact_name,
+                    tenant_provider=job_provider,
                     company_id=job.company_id,
                     header_image_url=header_image_url,
                 )
@@ -3536,6 +3664,7 @@ async def _run_job_logic(
                 phone=phone,
                 text=final_body,
                 contact_name=contact_name,
+                tenant_provider=job_provider,
                 company_id=job.company_id,
             )
             send_meta = {"send_type": "text"}

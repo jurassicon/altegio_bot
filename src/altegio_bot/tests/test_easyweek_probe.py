@@ -1,7 +1,7 @@
 """Tests for the read-only EasyWeek operator probe (PR-2).
 
 The probe is the operator's only way to discover the real Durlach
-``EASYWEEK_LOCATION_UUID``, and it runs against production data — so its output
+the UUID entries later placed into ``EASYWEEK_LOCATION_MAP``, and it runs against production data — so its output
 must be an allowlist projection, never a redaction pass over a raw response.
 
 These tests drive the probe through ``httpx.MockTransport`` (no real network) and

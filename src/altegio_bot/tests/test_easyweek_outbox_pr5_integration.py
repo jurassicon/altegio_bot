@@ -25,6 +25,7 @@ cross-tenant leak waiting for the two spaces to overlap.
 
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -45,6 +46,7 @@ from altegio_bot.delivery_retry_identity import (
     resolve_retry_identity,
     retry_outbox_audit_mismatch,
 )
+from altegio_bot.easyweek_branches import BRANCH_PROFILES, BranchProfile, branch_template_contract
 from altegio_bot.easyweek_normalizer import canonical_booking_uuid
 from altegio_bot.easyweek_policy import (
     EASYWEEK_LIFECYCLE_JOB_TYPES,
@@ -75,6 +77,7 @@ from altegio_bot.providers.base import WhatsAppProvider
 from altegio_bot.settings import settings
 from altegio_bot.tests.easyweek_fixtures import (
     TEST_LOCATION_ID,
+    TEST_LOCATION_UUID,
     booking_canceled,
     booking_created,
     booking_rescheduled,
@@ -104,9 +107,11 @@ BOOKING_PAGE_ALLOWED_HOSTS = "example.invalid,book.example.com"
 
 # A name no Python constant knows: if it reaches the provider it can only have
 # come from the database row.
-EASYWEEK_CREATED_TEMPLATE = "eyw_zzz_created_v9"
-EASYWEEK_UPDATED_TEMPLATE = "eyw_zzz_updated_v9"
-EASYWEEK_CANCELED_TEMPLATE = "eyw_zzz_canceled_v9"
+EASYWEEK_CREATED_TEMPLATE = "kitilash_cc_record_created_v1"
+EASYWEEK_UPDATED_TEMPLATE = "kitilash_cc_record_updated_v1"
+EASYWEEK_CANCELED_TEMPLATE = "kitilash_cc_record_canceled_v1"
+EASYWEEK_FIXTURE_UPDATED_TEMPLATE = "kitilash_fx_record_updated_v1"
+EASYWEEK_FIXTURE_CANCELED_TEMPLATE = "kitilash_fx_record_canceled_v1"
 
 # Never asserted *into* an outgoing message — only asserted ABSENT from errors.
 CLIENT_PHONE = "+491700000001"
@@ -133,10 +138,60 @@ def _pr5_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "whatsapp_send_mode", "template", raising=False)
     monkeypatch.setattr(settings, "bot_template_text_inside_24h_enabled", False, raising=False)
     monkeypatch.setattr(settings, "meta_circuit_breaker_enabled", False, raising=False)
-    monkeypatch.setattr(settings, "easyweek_booking_page_url", STATIC_BOOKING_PAGE, raising=False)
+    monkeypatch.setattr(
+        settings,
+        "easyweek_location_map",
+        json.dumps(
+            {
+                "colliding": {
+                    "location_id": COLLIDING_COMPANY_ID,
+                    "location_uuid": "cccccccc-dddd-4eee-8fff-000000000001",
+                    "meta_template_prefix": "cc",
+                    "booking_page_url": STATIC_BOOKING_PAGE,
+                },
+                "other": {
+                    "location_id": OTHER_EASYWEEK_COMPANY_ID,
+                    "location_uuid": "cccccccc-dddd-4eee-8fff-000000000002",
+                    "meta_template_prefix": "ot",
+                    "booking_page_url": STATIC_BOOKING_PAGE,
+                },
+                "fixture": {
+                    "location_id": TEST_LOCATION_ID,
+                    "location_uuid": TEST_LOCATION_UUID,
+                    "meta_template_prefix": "fx",
+                    "booking_page_url": STATIC_BOOKING_PAGE,
+                },
+            }
+        ),
+        raising=False,
+    )
     monkeypatch.setattr(settings, "easyweek_booking_page_allowed_hosts", BOOKING_PAGE_ALLOWED_HOSTS, raising=False)
     monkeypatch.setattr(settings, "easyweek_default_language", "de", raising=False)
     monkeypatch.setattr(settings, "easyweek_notifications_enabled", False, raising=False)
+
+    # PR-7: only a branch with a source-controlled profile may send. These
+    # tenants are synthetic on purpose — they exercise provider collision and
+    # link rules, not Durlach/Rastatt content — so they get synthetic profiles
+    # registered for the duration of the test. Production ships only the
+    # approved ones; nothing here relaxes that.
+    for slug, prefix in (("colliding", "cc"), ("other", "ot"), ("fixture", "fx")):
+        monkeypatch.setitem(
+            BRANCH_PROFILES,
+            slug,
+            BranchProfile(
+                slug=slug,
+                api_name=f"Synthetic {slug}",
+                meta_template_prefix=prefix,
+                content=BRANCH_PROFILES["durlach"].content,
+            ),
+        )
+
+
+def _set_booking_page(monkeypatch: pytest.MonkeyPatch, value: str, *, company_id: int = COLLIDING_COMPANY_ID) -> None:
+    location_map = json.loads(settings.easyweek_location_map)
+    entry = next(entry for entry in location_map.values() if entry["location_id"] == company_id)
+    entry["booking_page_url"] = value
+    monkeypatch.setattr(settings, "easyweek_location_map", json.dumps(location_map), raising=False)
 
 
 class CaptureProvider:
@@ -181,16 +236,34 @@ def _template(
     company_id: int,
     code: str,
     language: str = "de",
-    body: str = "Hallo {{1}}",
+    body: object = _UNSET,
     meta_template_name: str | None = None,
     is_active: bool = True,
 ) -> MessageTemplate:
+    resolved_body = body
+    if resolved_body is _UNSET and provider == PROVIDER_EASYWEEK:
+        location_map = json.loads(settings.easyweek_location_map or "{}")
+        slug = next(
+            (
+                candidate
+                for candidate, entry in location_map.items()
+                if isinstance(entry, dict) and entry.get("location_id") == company_id
+            ),
+            None,
+        )
+        profile = BRANCH_PROFILES.get(slug or "")
+        contract = branch_template_contract(profile, code) if profile is not None else None
+        if contract is not None:
+            resolved_body = contract.raw_body
+    if resolved_body is _UNSET:
+        resolved_body = "Hallo {{1}}"
+    assert isinstance(resolved_body, str)
     return MessageTemplate(
         provider=provider,
         company_id=company_id,
         code=code,
         language=language,
-        body=body,
+        body=resolved_body,
         meta_template_name=meta_template_name,
         is_active=is_active,
     )
@@ -239,6 +312,7 @@ async def _seed_easyweek_record(
     services: tuple[tuple[int, str | None, str | None], ...] = ((11, "Wimpernverlängerung", "60.00"),),
     total_cost: str | None = _UNSET,
     provider: str = PROVIDER_EASYWEEK,
+    booking_uuid: uuid.UUID = uuid.UUID("11111111-2222-4333-8444-555555555555"),
 ) -> Record:
     """Seed a record whose snapshot obeys PR-4's price invariant by default.
 
@@ -257,9 +331,7 @@ async def _seed_easyweek_record(
         provider=provider,
         company_id=company_id,
         altegio_record_id=4200001,
-        easyweek_booking_uuid=(
-            uuid.UUID("11111111-2222-4333-8444-555555555555") if provider == PROVIDER_EASYWEEK else None
-        ),
+        easyweek_booking_uuid=booking_uuid if provider == PROVIDER_EASYWEEK else None,
         easyweek_booking_hash_id=booking_hash_id,
         client_id=client.id,
         staff_name="Tanja",
@@ -325,6 +397,7 @@ async def _outbox_rows(db: AsyncSession, job: MessageJob) -> list[OutboxMessage]
 async def _seed_easyweek_happy_path(
     db: AsyncSession,
     *,
+    company_id: int = COLLIDING_COMPANY_ID,
     job_type: str = "record_created",
     meta_template_name: str | None = EASYWEEK_CREATED_TEMPLATE,
     short_link: str | None = VERIFIED_PAGE,
@@ -333,23 +406,31 @@ async def _seed_easyweek_happy_path(
     total_cost: str | None = _UNSET,
     language: str = "de",
     with_sender: bool = True,
+    body: object = _UNSET,
 ) -> MessageJob:
     """Everything an EasyWeek lifecycle job needs to reach the provider."""
-    client = await _seed_easyweek_client(db)
+    client = await _seed_easyweek_client(db, company_id=company_id)
     record = await _seed_easyweek_record(
         db,
         client,
+        company_id=company_id,
         short_link=short_link,
         booking_hash_id=booking_hash_id,
         services=services,
         total_cost=total_cost,
+        booking_uuid=(
+            uuid.UUID("11111111-2222-4333-8444-555555555555")
+            if company_id == COLLIDING_COMPANY_ID
+            else uuid.UUID("11111111-2222-4333-8444-555555555556")
+        ),
     )
     db.add(
         _template(
             provider=PROVIDER_EASYWEEK,
-            company_id=COLLIDING_COMPANY_ID,
+            company_id=company_id,
             code=job_type,
             language=language,
+            body=body,
             meta_template_name=meta_template_name,
         )
     )
@@ -357,7 +438,7 @@ async def _seed_easyweek_happy_path(
         db.add(
             _sender(
                 provider=PROVIDER_EASYWEEK,
-                company_id=COLLIDING_COMPANY_ID,
+                company_id=company_id,
                 phone_number_id="eyw-phone-id",
             )
         )
@@ -365,11 +446,11 @@ async def _seed_easyweek_happy_path(
     return await _seed_job(
         db,
         provider=PROVIDER_EASYWEEK,
-        company_id=COLLIDING_COMPANY_ID,
+        company_id=company_id,
         job_type=job_type,
         record=record,
         client=client,
-        dedupe_key=f"eyw-{job_type}-1",
+        dedupe_key=f"eyw-{company_id}-{job_type}-1",
     )
 
 
@@ -799,11 +880,11 @@ async def test_meta_template_map_holds_no_easyweek_company_and_cannot_produce_th
     assert resolve_meta_template(OTHER_EASYWEEK_COMPANY_ID, "record_created") is None
 
 
-async def test_easyweek_name_is_not_derived_from_company_id_or_code(
+async def test_easyweek_name_comes_from_the_provider_scoped_db_row(
     db: AsyncSession,
     capture: CaptureProvider,
 ) -> None:
-    """The colliding company id maps to a Karlsruhe name — which must NOT be sent."""
+    """A colliding company id must not select the Altegio template row."""
     job = await _seed_easyweek_happy_path(db)
 
     await _run_job(db, job)
@@ -811,7 +892,6 @@ async def test_easyweek_name_is_not_derived_from_company_id_or_code(
     sent_name = capture.template_calls[0]["template_name"]
     assert sent_name == EASYWEEK_CREATED_TEMPLATE
     assert sent_name != META_TEMPLATE_MAP[(COLLIDING_COMPANY_ID, "record_created")]
-    assert "kitilash" not in sent_name
     assert "_ka_" not in sent_name and "_ra_" not in sent_name
     assert sent_name != "record_created"
 
@@ -1111,18 +1191,67 @@ async def test_canceled_ignores_even_a_verified_link(
     assert VERIFIED_PAGE not in params
 
 
+async def test_canceled_uses_the_static_page_of_its_own_location(
+    db: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    other_page = "https://example.invalid/other-branch"
+    _set_booking_page(monkeypatch, other_page, company_id=OTHER_EASYWEEK_COMPANY_ID)
+    first = await _seed_easyweek_happy_path(
+        db,
+        company_id=COLLIDING_COMPANY_ID,
+        job_type="record_canceled",
+        meta_template_name=EASYWEEK_CANCELED_TEMPLATE,
+    )
+    second = await _seed_easyweek_happy_path(
+        db,
+        company_id=OTHER_EASYWEEK_COMPANY_ID,
+        job_type="record_canceled",
+        meta_template_name="other_branch_canceled_v1",
+    )
+
+    first_record = await db.get(Record, first.record_id)
+    first_client = await db.get(Client, first.client_id)
+    second_record = await db.get(Record, second.record_id)
+    second_client = await db.get(Client, second.client_id)
+    _body, _sender, _language, first_ctx = await ow._render_message(
+        db,
+        company_id=COLLIDING_COMPANY_ID,
+        template_code="record_canceled",
+        record=first_record,
+        client=first_client,
+        provider=PROVIDER_EASYWEEK,
+    )
+    _body, _sender, _language, second_ctx = await ow._render_message(
+        db,
+        company_id=OTHER_EASYWEEK_COMPANY_ID,
+        template_code="record_canceled",
+        record=second_record,
+        client=second_client,
+        provider=PROVIDER_EASYWEEK,
+    )
+
+    assert first_ctx["booking_link"] == STATIC_BOOKING_PAGE
+    assert second_ctx["booking_link"] == other_page
+
+
 async def test_no_safe_link_and_no_static_page_fails_locally(
     db: AsyncSession,
     capture: CaptureProvider,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(settings, "easyweek_booking_page_url", "", raising=False)
+    # An unusable booking page invalidates the WHOLE registry (a partial
+    # registry is never accepted), so PR-7's ownership guard now stops the job
+    # before render — earlier than the old param-level failure, and for a
+    # stricter reason. The guarantee under test is unchanged: terminal local
+    # failure, nothing sent.
+    _set_booking_page(monkeypatch, "")
     job = await _seed_easyweek_happy_path(db, short_link=None)
 
     await _run_job(db, job)
 
     assert job.status == "failed"
-    assert "missing required param #7" in (job.last_error or "")
+    assert "EasyWeek registry is invalid" in (job.last_error or "")
     assert capture.template_calls == []
     assert capture.text_calls == []
 
@@ -1132,7 +1261,9 @@ async def test_canceled_without_static_page_fails_locally(
     capture: CaptureProvider,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(settings, "easyweek_booking_page_url", "   ", raising=False)
+    # Same as above: a blank page makes the registry invalid, and the PR-7
+    # ownership guard is deliberately the first thing to notice.
+    _set_booking_page(monkeypatch, "   ")
     job = await _seed_easyweek_happy_path(
         db,
         job_type="record_canceled",
@@ -1142,7 +1273,7 @@ async def test_canceled_without_static_page_fails_locally(
     await _run_job(db, job)
 
     assert job.status == "failed"
-    assert "missing required param #5" in (job.last_error or "")
+    assert "EasyWeek registry is invalid" in (job.last_error or "")
     assert capture.template_calls == []
 
 
@@ -1153,14 +1284,19 @@ async def test_easyweek_effective_link_helper_is_the_single_gate() -> None:
         short_link = VERIFIED_PAGE
         easyweek_booking_hash_id = BOOKING_HASH
 
-    assert ow.easyweek_effective_booking_link(_Rec(), "record_created") == VERIFIED_PAGE  # type: ignore[arg-type]
-    assert ow.easyweek_effective_booking_link(_Rec(), "record_updated") == VERIFIED_PAGE  # type: ignore[arg-type]
     assert (
-        ow.easyweek_effective_booking_link(_Rec(), "record_canceled")  # type: ignore[arg-type]
-        == (settings.easyweek_booking_page_url or "").strip()
+        ow.easyweek_effective_booking_link(_Rec(), "record_created", company_id=COLLIDING_COMPANY_ID) == VERIFIED_PAGE
+    )  # type: ignore[arg-type]
+    assert (
+        ow.easyweek_effective_booking_link(_Rec(), "record_updated", company_id=COLLIDING_COMPANY_ID) == VERIFIED_PAGE
+    )  # type: ignore[arg-type]
+    assert (
+        ow.easyweek_effective_booking_link(_Rec(), "record_canceled", company_id=COLLIDING_COMPANY_ID)
+        == STATIC_BOOKING_PAGE
     )
     assert (
-        ow.easyweek_effective_booking_link(None, "record_created") == (settings.easyweek_booking_page_url or "").strip()
+        ow.easyweek_effective_booking_link(None, "record_created", company_id=COLLIDING_COMPANY_ID)
+        == STATIC_BOOKING_PAGE
     )
 
 
@@ -1934,10 +2070,8 @@ async def test_new_easyweek_client_gets_no_altegio_pre_appointment_notes(
     """
     _enable_text_inside_24h(monkeypatch, window_open=True)
     job = await _seed_easyweek_happy_path(db, language="de")
-    # A first booking: no earlier record exists for this client.
-    tmpl_res = await db.execute(select(MessageTemplate).where(MessageTemplate.provider == PROVIDER_EASYWEEK))
-    tmpl_res.scalars().one().body = "Hallo {{1}}, Termin am {{3}} um {{4}}.{pre_appointment_notes}"
-    await db.flush()
+    # A first booking has no dedicated new-client row here, so DB-first
+    # resolution deliberately falls back to the canonical ordinary body.
 
     await _run_job(db, job)
 
@@ -2081,7 +2215,7 @@ async def test_invalid_static_page_fails_canceled_locally(
     bad_static: str,
 ) -> None:
     """``record_canceled`` has no other link, so an unusable static page is fatal."""
-    monkeypatch.setattr(settings, "easyweek_booking_page_url", bad_static, raising=False)
+    _set_booking_page(monkeypatch, bad_static)
     job = await _seed_easyweek_happy_path(
         db,
         job_type="record_canceled",
@@ -2102,7 +2236,7 @@ async def test_invalid_static_page_fails_created_when_manage_link_is_unusable(
     capture: CaptureProvider,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(settings, "easyweek_booking_page_url", "http://book.example.com/x", raising=False)
+    _set_booking_page(monkeypatch, "http://book.example.com/x")
     job = await _seed_easyweek_happy_path(db, short_link=None)
 
     await _run_job(db, job)
@@ -2118,7 +2252,7 @@ async def test_a_valid_manage_link_survives_an_invalid_static_page(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The static page is a fallback, not a filter — a verified link still wins."""
-    monkeypatch.setattr(settings, "easyweek_booking_page_url", "javascript:alert(1)", raising=False)
+    _set_booking_page(monkeypatch, "javascript:alert(1)")
     job = await _seed_easyweek_happy_path(db)
 
     params = await _run_and_get_params(db, capture, job)
@@ -2915,7 +3049,6 @@ async def easyweek_inbox(
     monkeypatch.setattr(eyw_worker, "SessionLocal", session_maker, raising=False)
     monkeypatch.setattr(settings, "easyweek_processing_enabled", True, raising=False)
     monkeypatch.setattr(settings, "easyweek_notifications_enabled", True, raising=False)
-    monkeypatch.setattr(settings, "easyweek_location_id", TEST_LOCATION_ID, raising=False)
     return session_maker
 
 
@@ -3005,9 +3138,9 @@ async def _job_by_type(db: AsyncSession, job_type: str) -> MessageJob:
 @pytest.mark.parametrize(
     "job_type,event_hint,builder,meta_name",
     [
-        ("record_updated", "booking-updated", booking_updated, EASYWEEK_UPDATED_TEMPLATE),
-        ("record_updated", "booking-rescheduled", booking_rescheduled, EASYWEEK_UPDATED_TEMPLATE),
-        ("record_canceled", "booking-canceled", booking_canceled, EASYWEEK_CANCELED_TEMPLATE),
+        ("record_updated", "booking-updated", booking_updated, EASYWEEK_FIXTURE_UPDATED_TEMPLATE),
+        ("record_updated", "booking-rescheduled", booking_rescheduled, EASYWEEK_FIXTURE_UPDATED_TEMPLATE),
+        ("record_canceled", "booking-canceled", booking_canceled, EASYWEEK_FIXTURE_CANCELED_TEMPLATE),
     ],
 )
 @pytest.mark.parametrize("explicit_null", [False, True])
@@ -4479,7 +4612,7 @@ async def test_a_partial_delivery_outbox_is_still_a_proven_chain_member(
             company_id=TEST_LOCATION_ID,
             code="record_updated",
             language="de",
-            meta_template_name=EASYWEEK_UPDATED_TEMPLATE,
+            meta_template_name=EASYWEEK_FIXTURE_UPDATED_TEMPLATE,
         )
     )
     db.add(
@@ -4859,3 +4992,511 @@ async def test_an_ordinary_text_send_carries_no_retry_audit(
     assert rows[0].meta["send_type"] == "text"
     for key in ("delivery_retry", "delivery_retry_of_outbox_id", "delivery_retry_attempt"):
         assert key not in rows[0].meta
+
+
+# ===========================================================================
+# PR-7: the registry is an ownership boundary, not just a link source
+# ===========================================================================
+
+
+@pytest.mark.parametrize(
+    ("registry_value", "expected"),
+    [
+        ("not json at all", "EasyWeek registry is invalid"),
+        ('{"durlach": {"location_id": "not-an-int"}}', "EasyWeek registry is invalid"),
+        ("{}", "EasyWeek registry is not configured"),
+        ("", "EasyWeek registry is not configured"),
+    ],
+    ids=["malformed-json", "structurally-invalid", "empty-object", "empty-string"],
+)
+@pytest.mark.parametrize("job_type", ["record_created", "record_updated", "record_canceled"])
+async def test_a_broken_or_empty_registry_blocks_every_lifecycle_send(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    monkeypatch: pytest.MonkeyPatch,
+    registry_value: str,
+    expected: str,
+    job_type: str,
+) -> None:
+    """A PROVEN short link must not survive an unusable registry.
+
+    This is the reproduction from the review: `Record.short_link` was verified
+    when it was stored, so the link helper happily returned it even with no
+    registry at all. Ownership has to be decided before the link is considered.
+    """
+    template = EASYWEEK_CANCELED_TEMPLATE if job_type == "record_canceled" else EASYWEEK_CREATED_TEMPLATE
+    job = await _seed_easyweek_happy_path(db, job_type=job_type, meta_template_name=template)
+    # The link is genuinely valid; only the registry is broken.
+    monkeypatch.setattr(settings, "easyweek_location_map", registry_value, raising=False)
+
+    await _run_job(db, job)
+
+    assert job.status == "failed"
+    assert expected in (job.last_error or "")
+    assert capture.template_calls == [], "a send happened despite an unusable registry"
+    assert capture.text_calls == []
+
+
+@pytest.mark.parametrize("job_type", ["record_created", "record_updated", "record_canceled"])
+async def test_removing_a_branch_from_the_registry_stops_its_queued_jobs(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    monkeypatch: pytest.MonkeyPatch,
+    job_type: str,
+) -> None:
+    """A job outlives the configuration that created it; membership is re-proven."""
+    template = EASYWEEK_CANCELED_TEMPLATE if job_type == "record_canceled" else EASYWEEK_CREATED_TEMPLATE
+    job = await _seed_easyweek_happy_path(db, job_type=job_type, meta_template_name=template)
+
+    # The branch is dropped AFTER the job was queued; the rest of the registry
+    # stays valid, so this is membership, not a parse failure.
+    remaining = json.loads(settings.easyweek_location_map)
+    remaining = {k: v for k, v in remaining.items() if v["location_id"] != COLLIDING_COMPANY_ID}
+    monkeypatch.setattr(settings, "easyweek_location_map", json.dumps(remaining), raising=False)
+
+    await _run_job(db, job)
+
+    assert job.status == "failed"
+    assert "is not in the configured registry" in (job.last_error or "")
+    assert capture.template_calls == []
+    assert capture.text_calls == []
+
+
+async def test_a_branch_without_a_source_controlled_profile_cannot_send(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job = await _seed_easyweek_happy_path(db)
+    monkeypatch.delitem(BRANCH_PROFILES, "colliding")
+
+    await _run_job(db, job)
+
+    assert job.status == "failed"
+    assert "no source-controlled branch profile" in (job.last_error or "")
+    assert capture.template_calls == []
+
+
+async def test_registry_prefix_must_match_the_profile_selected_by_slug(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An operator-controlled prefix cannot silently select another profile."""
+    job = await _seed_easyweek_happy_path(db)
+    location_map = json.loads(settings.easyweek_location_map)
+    location_map["colliding"]["meta_template_prefix"] = "ra"
+    monkeypatch.setattr(settings, "easyweek_location_map", json.dumps(location_map), raising=False)
+
+    await _run_job(db, job)
+
+    assert job.status == "failed"
+    assert "registry prefix does not match its branch profile" in (job.last_error or "")
+    assert capture.template_calls == []
+    assert capture.text_calls == []
+
+
+async def test_the_link_helper_refuses_an_unowned_company(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Defence in depth: even called directly it yields nothing for a stranger."""
+
+    class _Rec:
+        short_link = VERIFIED_PAGE
+        easyweek_booking_hash_id = BOOKING_HASH
+
+    for broken in ("", "{}", "not json"):
+        monkeypatch.setattr(settings, "easyweek_location_map", broken, raising=False)
+        assert ow.easyweek_effective_booking_link(_Rec(), "record_created", company_id=COLLIDING_COMPANY_ID) == ""
+        assert ow.easyweek_effective_booking_link(None, "record_canceled", company_id=COLLIDING_COMPANY_ID) == ""
+
+    # A valid registry that simply does not contain this company.
+    monkeypatch.setattr(
+        settings,
+        "easyweek_location_map",
+        json.dumps(
+            {
+                "other": {
+                    "location_id": OTHER_EASYWEEK_COMPANY_ID,
+                    "location_uuid": "cccccccc-dddd-4eee-8fff-000000000002",
+                    "meta_template_prefix": "ot",
+                    "booking_page_url": STATIC_BOOKING_PAGE,
+                }
+            }
+        ),
+        raising=False,
+    )
+    assert ow.easyweek_effective_booking_link(_Rec(), "record_created", company_id=COLLIDING_COMPANY_ID) == ""
+
+
+async def test_an_easyweek_delivery_retry_cannot_bypass_the_membership_guard(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The retry path enters through the same door."""
+    job = await _seed_easyweek_happy_path(db)
+    job.payload = {**(job.payload or {}), "delivery_retry": True}
+    await db.flush()
+    monkeypatch.setattr(settings, "easyweek_location_map", "{}", raising=False)
+
+    await _run_job(db, job)
+
+    assert job.status in {"failed", "canceled"}
+    assert capture.template_calls == []
+    assert capture.text_calls == []
+
+
+def _repoint_branch(monkeypatch: pytest.MonkeyPatch, *, slug: str, company_id: int, prefix: str) -> None:
+    """Move one synthetic branch onto a different Meta prefix, consistently.
+
+    The registry entry and the profile must agree, otherwise the ownership
+    guard (which resolves the profile FROM the registry prefix) refuses before
+    the template guard is ever reached — and the test would pass for the wrong
+    reason.
+    """
+    location_map = json.loads(settings.easyweek_location_map)
+    location_map[slug]["meta_template_prefix"] = prefix
+    monkeypatch.setattr(settings, "easyweek_location_map", json.dumps(location_map), raising=False)
+    monkeypatch.setitem(
+        BRANCH_PROFILES,
+        slug,
+        BranchProfile(
+            slug=slug,
+            api_name=f"Synthetic {slug}",
+            meta_template_prefix=prefix,
+            content=BRANCH_PROFILES["durlach"].content,
+        ),
+    )
+
+
+async def test_a_cross_branch_template_name_fails_before_the_provider(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A `du_*` row resolved for a branch that owns `ra_*` must not be sent."""
+    _repoint_branch(monkeypatch, slug="colliding", company_id=COLLIDING_COMPANY_ID, prefix="ra")
+    job = await _seed_easyweek_happy_path(db, meta_template_name="kitilash_du_record_created_v1")
+
+    await _run_job(db, job)
+
+    assert job.status == "failed"
+    assert "does not belong to the selected code and branch" in (job.last_error or "")
+    assert capture.template_calls == [], "a cross-branch template reached the provider"
+
+
+@pytest.mark.parametrize("send_mode", ["template", "auto", "text"])
+async def test_an_unapproved_template_name_fails_in_every_send_mode(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    monkeypatch: pytest.MonkeyPatch,
+    send_mode: str,
+) -> None:
+    """DB-first does not make an arbitrary DB name an approved branch row."""
+    monkeypatch.setattr(settings, "whatsapp_send_mode", send_mode, raising=False)
+    job = await _seed_easyweek_happy_path(db, meta_template_name="unapproved_record_created")
+
+    await _run_job(db, job)
+
+    assert job.status == "failed"
+    assert "does not belong to the selected code and branch" in (job.last_error or "")
+    assert capture.template_calls == []
+    assert capture.text_calls == []
+
+
+async def test_the_matching_branch_template_still_sends(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The guard must not block a correctly-seeded branch."""
+    _repoint_branch(monkeypatch, slug="colliding", company_id=COLLIDING_COMPANY_ID, prefix="du")
+    job = await _seed_easyweek_happy_path(db, meta_template_name="kitilash_du_record_created_v1")
+
+    await _run_job(db, job)
+
+    assert job.status == "done", job.last_error
+    assert [call["template_name"] for call in capture.template_calls] == ["kitilash_du_record_created_v1"]
+
+
+def _use_du_ra_registry(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Configure the two approved profiles on test-only numeric identities."""
+    monkeypatch.setattr(
+        settings,
+        "easyweek_location_map",
+        json.dumps(
+            {
+                "durlach": {
+                    "location_id": COLLIDING_COMPANY_ID,
+                    "location_uuid": "cccccccc-dddd-4eee-8fff-000000000001",
+                    "meta_template_prefix": "du",
+                    "booking_page_url": STATIC_BOOKING_PAGE,
+                },
+                "rastatt": {
+                    "location_id": OTHER_EASYWEEK_COMPANY_ID,
+                    "location_uuid": "cccccccc-dddd-4eee-8fff-000000000002",
+                    "meta_template_prefix": "ra",
+                    "booking_page_url": "https://example.invalid/rastatt",
+                },
+            }
+        ),
+        raising=False,
+    )
+
+
+@pytest.mark.parametrize(
+    ("company_id", "prefix"),
+    [(COLLIDING_COMPANY_ID, "du"), (OTHER_EASYWEEK_COMPANY_ID, "ra")],
+    ids=["durlach", "rastatt"],
+)
+@pytest.mark.parametrize(
+    ("job_type", "client_kind", "selected_code"),
+    [
+        ("record_created", "new", "record_created_new_client"),
+        ("record_created", "repeat", "record_created"),
+        ("record_updated", "existing", "record_updated"),
+        ("record_canceled", "existing", "record_canceled"),
+    ],
+    ids=["new-client", "repeat-client", "updated", "canceled"],
+)
+async def test_approved_du_ra_templates_send_for_every_pr7_lifecycle_variant(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    monkeypatch: pytest.MonkeyPatch,
+    company_id: int,
+    prefix: str,
+    job_type: str,
+    client_kind: str,
+    selected_code: str,
+) -> None:
+    _use_du_ra_registry(monkeypatch)
+    ordinary_name = f"kitilash_{prefix}_{job_type}_v1"
+    job = await _seed_easyweek_happy_path(
+        db,
+        company_id=company_id,
+        job_type=job_type,
+        meta_template_name=ordinary_name,
+    )
+
+    if client_kind == "new":
+        db.add(
+            _template(
+                provider=PROVIDER_EASYWEEK,
+                company_id=company_id,
+                code="record_created_new_client",
+                meta_template_name=f"kitilash_{prefix}_record_created_new_client_v1",
+            )
+        )
+    elif client_kind == "repeat":
+        current = await db.get(Record, job.record_id)
+        assert current is not None and current.starts_at is not None
+        db.add(
+            Record(
+                provider=PROVIDER_EASYWEEK,
+                company_id=company_id,
+                altegio_record_id=4200002,
+                client_id=job.client_id,
+                easyweek_booking_uuid=uuid.uuid4(),
+                starts_at=current.starts_at - timedelta(days=30),
+                raw={},
+            )
+        )
+    await db.flush()
+
+    await _run_job(db, job)
+
+    expected_name = f"kitilash_{prefix}_{selected_code}_v1"
+    assert job.status == "done", job.last_error
+    assert [call["template_name"] for call in capture.template_calls] == [expected_name]
+    assert capture.text_calls == []
+
+
+async def test_new_client_variant_is_validated_as_the_actually_selected_code(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _use_du_ra_registry(monkeypatch)
+    job = await _seed_easyweek_happy_path(db, meta_template_name="kitilash_du_record_created_v1")
+    db.add(
+        _template(
+            provider=PROVIDER_EASYWEEK,
+            company_id=COLLIDING_COMPANY_ID,
+            code="record_created_new_client",
+            meta_template_name="kitilash_du_record_created_v1",
+        )
+    )
+    await db.flush()
+
+    await _run_job(db, job)
+
+    assert job.status == "failed"
+    assert "record_created_new_client" in (job.last_error or "")
+    assert capture.template_calls == []
+    assert capture.text_calls == []
+
+
+@pytest.mark.parametrize(
+    ("selected_code", "job_type"),
+    [
+        ("record_created", "record_created"),
+        ("record_created_new_client", "record_created"),
+        ("record_updated", "record_updated"),
+        ("record_canceled", "record_canceled"),
+    ],
+)
+async def test_a_cross_branch_body_fails_for_every_selected_lifecycle_code(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    monkeypatch: pytest.MonkeyPatch,
+    selected_code: str,
+    job_type: str,
+) -> None:
+    """A correct `ra_*` name cannot authorize Durlach's raw DB body."""
+    _use_du_ra_registry(monkeypatch)
+    wrong_contract = branch_template_contract(BRANCH_PROFILES["durlach"], selected_code)
+    right_contract = branch_template_contract(BRANCH_PROFILES["rastatt"], selected_code)
+    assert wrong_contract is not None and right_contract is not None
+
+    ordinary = branch_template_contract(BRANCH_PROFILES["rastatt"], job_type)
+    assert ordinary is not None
+    job = await _seed_easyweek_happy_path(
+        db,
+        company_id=OTHER_EASYWEEK_COMPANY_ID,
+        job_type=job_type,
+        meta_template_name=ordinary.meta_template_name,
+        body=wrong_contract.raw_body if selected_code == job_type else ordinary.raw_body,
+    )
+    if selected_code == "record_created_new_client":
+        db.add(
+            _template(
+                provider=PROVIDER_EASYWEEK,
+                company_id=OTHER_EASYWEEK_COMPANY_ID,
+                code=selected_code,
+                body=wrong_contract.raw_body,
+                meta_template_name=right_contract.meta_template_name,
+            )
+        )
+        await db.flush()
+
+    await _run_job(db, job)
+
+    error = job.last_error or ""
+    assert job.status == "failed"
+    assert f"code={selected_code} body mismatch" in error
+    assert "Pfinztalstraße" not in error
+    assert BRANCH_PROFILES["durlach"].content.contact_phone not in error
+    assert CLIENT_PHONE not in error
+    assert capture.template_calls == []
+    assert capture.text_calls == []
+    assert await _outbox_rows(db, job) == []
+
+
+@pytest.mark.parametrize("send_mode", ["text", "auto"])
+async def test_a_cross_branch_body_fails_before_text_or_open_window_auto_send(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    monkeypatch: pytest.MonkeyPatch,
+    send_mode: str,
+) -> None:
+    _use_du_ra_registry(monkeypatch)
+    monkeypatch.setattr(settings, "whatsapp_send_mode", send_mode, raising=False)
+    if send_mode == "auto":
+        _enable_text_inside_24h(monkeypatch, window_open=True)
+    wrong = branch_template_contract(BRANCH_PROFILES["durlach"], "record_updated")
+    right = branch_template_contract(BRANCH_PROFILES["rastatt"], "record_updated")
+    assert wrong is not None and right is not None
+    job = await _seed_easyweek_happy_path(
+        db,
+        company_id=OTHER_EASYWEEK_COMPANY_ID,
+        job_type="record_updated",
+        meta_template_name=right.meta_template_name,
+        body=wrong.raw_body,
+    )
+
+    await _run_job(db, job)
+
+    assert job.status == "failed"
+    assert "body mismatch" in (job.last_error or "")
+    assert capture.template_calls == []
+    assert capture.text_calls == []
+    assert await _outbox_rows(db, job) == []
+
+
+@pytest.mark.parametrize(
+    ("company_id", "slug", "prefix"),
+    [
+        (COLLIDING_COMPANY_ID, "durlach", "du"),
+        (OTHER_EASYWEEK_COMPANY_ID, "rastatt", "ra"),
+    ],
+)
+@pytest.mark.parametrize("send_mode", ["template", "text", "auto"])
+async def test_canonical_du_ra_body_sends_in_every_runtime_mode(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    monkeypatch: pytest.MonkeyPatch,
+    company_id: int,
+    slug: str,
+    prefix: str,
+    send_mode: str,
+) -> None:
+    _use_du_ra_registry(monkeypatch)
+    monkeypatch.setattr(settings, "whatsapp_send_mode", send_mode, raising=False)
+    if send_mode == "auto":
+        _enable_text_inside_24h(monkeypatch, window_open=True)
+    contract = branch_template_contract(BRANCH_PROFILES[slug], "record_updated")
+    assert contract is not None
+    job = await _seed_easyweek_happy_path(
+        db,
+        company_id=company_id,
+        job_type="record_updated",
+        meta_template_name=f"kitilash_{prefix}_record_updated_v1",
+    )
+
+    await _run_job(db, job)
+
+    assert job.status == "done", job.last_error
+    rows = await _outbox_rows(db, job)
+    assert len(rows) == 1
+    assert contract.profile.content.address_line in rows[0].body
+    if send_mode == "template":
+        assert [call["template_name"] for call in capture.template_calls] == [contract.meta_template_name]
+        assert capture.text_calls == []
+    else:
+        assert capture.template_calls == []
+        assert len(capture.text_calls) == 1
+
+
+async def test_delivery_retry_revalidates_the_current_raw_body_before_sending(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    no_contact_rate_limit: None,
+) -> None:
+    job = await _seed_easyweek_happy_path(db)
+    await _run_job(db, job)
+    original = (await _outbox_rows(db, job))[0]
+    await _deliver_failed_status(db, original.provider_message_id, dedupe="wa:body-contract-retry")
+    retry = (await _retry_jobs_for(db, original.id))[0]
+
+    row = (
+        await db.execute(
+            select(MessageTemplate)
+            .where(MessageTemplate.provider == PROVIDER_EASYWEEK)
+            .where(MessageTemplate.company_id == COLLIDING_COMPANY_ID)
+            .where(MessageTemplate.code == "record_created")
+        )
+    ).scalar_one()
+    wrong = branch_template_contract(BRANCH_PROFILES["rastatt"], "record_created")
+    assert wrong is not None
+    row.body = wrong.raw_body
+    retry.run_at = datetime.now(timezone.utc)
+    await db.flush()
+    capture.template_calls.clear()
+    capture.text_calls.clear()
+
+    await _run_job(db, retry)
+
+    assert retry.status == "failed"
+    assert "body mismatch" in (retry.last_error or "")
+    assert capture.template_calls == []
+    assert capture.text_calls == []
+    assert await _outbox_rows(db, retry) == []

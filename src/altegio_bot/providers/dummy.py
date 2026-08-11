@@ -4,7 +4,7 @@ import logging
 import os
 from uuid import uuid4
 
-from altegio_bot.providers.base import WhatsAppProvider
+from altegio_bot.providers.base import ChatwootRoute, WhatsAppProvider
 
 logger = logging.getLogger(__name__)
 
@@ -86,10 +86,12 @@ async def safe_send(
     phone: str,
     text: str,
     *,
+    tenant_provider: str | None = None,
     company_id: int = 0,
     staff_id: int | None = None,
     contact_name: str | None = None,
     reply_to_provider_message_id: str | None = None,
+    chatwoot_route: ChatwootRoute = ChatwootRoute.TENANT,
 ) -> tuple[str | None, str | None]:
     if not _real_send_allowed(provider):
         return None, "Real send disabled"
@@ -99,8 +101,10 @@ async def safe_send(
         if isinstance(reply_to_provider_message_id, str) and reply_to_provider_message_id.strip():
             kwargs["reply_to_provider_message_id"] = reply_to_provider_message_id.strip()
         if _supports_mirror(provider):
+            kwargs["tenant_provider"] = tenant_provider
             kwargs["company_id"] = company_id
             kwargs["staff_id"] = staff_id
+            kwargs["chatwoot_route"] = chatwoot_route
         msg_id = await provider.send(sender_id, phone, text, **kwargs)  # type: ignore[call-arg]
         return msg_id, None
     except Exception as exc:
@@ -121,6 +125,7 @@ async def safe_send_template(
     params: list[str],
     fallback_text: str = "",
     *,
+    tenant_provider: str | None = None,
     company_id: int = 0,
     staff_id: int | None = None,
     contact_name: str | None = None,
@@ -136,6 +141,7 @@ async def safe_send_template(
             "header_image_url": header_image_url,
         }
         if _supports_mirror(provider):
+            kwargs["tenant_provider"] = tenant_provider
             kwargs["company_id"] = company_id
             kwargs["staff_id"] = staff_id
         msg_id = await provider.send_template(  # type: ignore[call-arg]

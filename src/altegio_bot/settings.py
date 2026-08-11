@@ -186,9 +186,12 @@ class Settings(BaseSettings):
     # Default False (safe). Enable only after verifying no double-send risk.
     chatwoot_operator_relay_enabled: bool = False
 
-    # JSON mapping Chatwoot inbox_id -> company_id for operator relay.
-    # Required when multiple company_ids share the same WA phone_number_id.
-    # Example: CHATWOOT_INBOX_COMPANY_MAP={"8": 758285, "7": 1271200}
+    # One provider-scoped JSON mapping for both Chatwoot directions:
+    # inbox_id -> {provider, company_id}. Required when multiple tenants share
+    # one WA phone_number_id. Integer-only values are recognized as the legacy
+    # schema but fail closed for branch routing because they cannot prove CRM
+    # provider identity.
+    # Example: {"8":{"provider":"altegio","company_id":758285}}
     # If empty (default) — routing falls back to phone_number_id only.
     # If non-empty and inbox_id not found — relay is fail-closed.
     chatwoot_inbox_company_map: str = "{}"
@@ -477,11 +480,6 @@ class Settings(BaseSettings):
     easyweek_workspace_slug: str = ""
     # Pinned base URL публичного API v2 (см. INTEGRATION_PLAN §1.1).
     easyweek_api_base_url: str = "https://my.easyweek.io/api/public/v2"
-    # UUID локации Дурлаха. Пока optional: оператор определяет его read-only
-    # пробой (PR-2) и записывает в production easyweek.env. Numeric location_id
-    # из вебхука его НЕ заменяет (INTEGRATION_PLAN §1.6 п.5).
-    easyweek_location_uuid: str = ""
-
     # --- PR-4: normalizer / easyweek_inbox_worker ----------------------------
     # THREE independent gates, all fail-closed by default. They are separate on
     # purpose: production already runs with EASYWEEK_ENABLED=true so the capture
@@ -499,27 +497,15 @@ class Settings(BaseSettings):
     # until PR-6; with it off the normalizer still keeps Client/Record current.
     easyweek_notifications_enabled: bool = False
 
-    # Numeric ``:location_id`` of the EasyWeek location this bot owns, and the
-    # ``company_id`` of every EasyWeek row it writes. 0 means "not configured":
-    # with processing enabled and this unset the worker refuses to claim
-    # anything, because it could not tell its own location from a foreign one.
-    # The real production value lives in easyweek.env, never in Python.
-    easyweek_location_id: int = 0
+    # Strict JSON registry of every EasyWeek branch this deployment owns.
+    # Parsed at the security boundary by ``easyweek_locations``; malformed and
+    # empty maps both keep processing off, while remaining distinguishable.
+    easyweek_location_map: str = "{}"
 
     easyweek_inbox_worker_poll_sec: float = 1.0
 
     # --- PR-5: outbox rendering ----------------------------------------------
-    # Static booking page for the EasyWeek location. Used as the fail-safe link
-    # whenever a per-booking manage link cannot be re-verified at send time, and
-    # ALWAYS for `record_canceled` — a cancelled booking must invite a new
-    # booking, not link to the management page of one that no longer exists.
-    #
-    # Empty by default and never hardcoded here: the real URL belongs to the
-    # location and lives in production easyweek.env. Empty means the lifecycle
-    # job fails locally rather than sending a message with a blank link.
-    easyweek_booking_page_url: str = ""
-
-    # Comma-separated hosts EASYWEEK_BOOKING_PAGE_URL is allowed to point at.
+    # Comma-separated hosts every registry booking page is allowed to point at.
     #
     # Empty by default, and empty REJECTS EVERYTHING rather than allowing
     # everything: until the approved Durlach host is confirmed, a typo in the

@@ -1022,7 +1022,11 @@ async def test_routing_ambiguous_sender_stable_and_clean(session_maker, monkeypa
 async def test_routing_inbox_mapping_missing_stable_and_clean(session_maker, monkeypatch, caplog) -> None:
     provider = _CaptureProvider()
     monkeypatch.setattr(worker_module, "ChatwootClient", _FakeChatwoot)
-    monkeypatch.setattr(worker_module.settings, "chatwoot_inbox_company_map", '{"8": 758285}')
+    monkeypatch.setattr(
+        worker_module.settings,
+        "chatwoot_inbox_company_map",
+        '{"8":{"provider":"altegio","company_id":758285}}',
+    )
 
     # A valid but unknown inbox id → mapping_missing (positive_int accepts 99).
     await _run_relay(
@@ -1046,7 +1050,11 @@ async def test_routing_invalid_inbox_id_stable_and_clean(session_maker, monkeypa
     """A configured map + hostile non-int inbox id → invalid_inbox_id, no injection."""
     provider = _CaptureProvider()
     monkeypatch.setattr(worker_module, "ChatwootClient", _FakeChatwoot)
-    monkeypatch.setattr(worker_module.settings, "chatwoot_inbox_company_map", '{"8": 758285}')
+    monkeypatch.setattr(
+        worker_module.settings,
+        "chatwoot_inbox_company_map",
+        '{"8":{"provider":"altegio","company_id":758285}}',
+    )
 
     await _run_relay(
         session_maker,

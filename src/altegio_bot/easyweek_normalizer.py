@@ -9,9 +9,9 @@ deliberately stricter than the payload:
 
 * **UUID-first.** Root ``uid`` is the authoritative booking identity. ``id``,
   ``booking_hash_id`` and ``location_uuid`` do not substitute for it.
-* **Location isolation.** The numeric ``location_id`` is compared against the
-  operator-configured location. A foreign location is rejected outright — the
-  payload never gets to choose which location this bot owns.
+* **Location isolation.** The numeric ``location_id`` must belong to the strict
+  registry and the payload's ``location_uuid`` must match the same entry. A
+  foreign location or a mismatched pair is rejected before domain writes.
 * **Fail-closed manage links.** A URL is never synthesised. Only the exact pair
   ``booking_page`` + ``booking_hash_id`` forming ``https://eyw.me/r/<hash>`` is
   trusted; anything else clears the stored link rather than keeping an unproven
@@ -36,8 +36,10 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any, Final
+from typing import Any, Final, Mapping
 from urllib.parse import urlsplit
+
+from altegio_bot.easyweek_locations import EasyWeekLocation
 
 # ---------------------------------------------------------------------------
 # Event mapping — exact trigger names only
@@ -135,6 +137,7 @@ class NormalizationError(Exception):
     MISSING_BOOKING_ID: Final = "missing_booking_id"
     INVALID_LOCATION_ID: Final = "invalid_location_id"
     FOREIGN_LOCATION: Final = "foreign_location"
+    LOCATION_IDENTITY_MISMATCH: Final = "location_identity_mismatch"
     INVALID_DATETIME: Final = "invalid_datetime"
     INVALID_MANAGE_LINK: Final = "invalid_manage_link"
     # The numeric booking id already belongs to a Record carrying a DIFFERENT
@@ -156,6 +159,7 @@ class NormalizationError(Exception):
             MISSING_BOOKING_ID,
             INVALID_LOCATION_ID,
             FOREIGN_LOCATION,
+            LOCATION_IDENTITY_MISMATCH,
             INVALID_DATETIME,
             INVALID_MANAGE_LINK,
             IDENTITY_CONFLICT,
@@ -497,7 +501,7 @@ def normalize_event(
     event_hint: str | None,
     payload: Any,
     body_truncated: bool,
-    expected_location_id: int,
+    location_registry: Mapping[int, EasyWeekLocation],
 ) -> NormalizedBooking | None:
     """Validate one captured delivery.
 
@@ -517,16 +521,22 @@ def normalize_event(
     if not isinstance(payload, dict) or not payload:
         raise NormalizationError(NormalizationError.INVALID_PAYLOAD)
 
-    # The operator's configured location decides ownership, never the payload.
-    if not isinstance(expected_location_id, int) or expected_location_id <= 0:
-        raise NormalizationError(NormalizationError.INVALID_LOCATION_ID)
     location_id = _require_positive_id(
         payload.get("location_id"),
         code=NormalizationError.INVALID_LOCATION_ID,
         maximum=PG_INT_MAX,  # clients.company_id / records.company_id are INTEGER
     )
-    if location_id != expected_location_id:
+    location = location_registry.get(location_id)
+    if location is None:
         raise NormalizationError(NormalizationError.FOREIGN_LOCATION)
+
+    raw_location_uuid = payload.get("location_uuid")
+    try:
+        payload_location_uuid = str(uuid.UUID(raw_location_uuid)) if isinstance(raw_location_uuid, str) else None
+    except (ValueError, AttributeError, TypeError):
+        payload_location_uuid = None
+    if payload_location_uuid != location.location_uuid:
+        raise NormalizationError(NormalizationError.LOCATION_IDENTITY_MISMATCH)
 
     if action == IGNORE:
         # `booking-succeeded` is captured for phase 2 (visits_total / review
@@ -652,7 +662,9 @@ def normalize_event(
         booking_uuid=booking_uuid,
         booking_id=booking_id,
         customer_id=customer_id,
-        company_id=expected_location_id,
+        # The registry proves ownership, but the event itself selects the
+        # provider-scoped tenant. Never substitute a process-global id here.
+        company_id=location_id,
         starts_at=starts_at,
         ends_at=ends_at,
         duration_sec=duration_sec,

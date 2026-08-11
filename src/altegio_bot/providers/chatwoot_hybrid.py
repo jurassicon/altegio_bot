@@ -8,11 +8,19 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable
 from typing import Any
 
 from altegio_bot.chatwoot_client import ChatwootClient
-from altegio_bot.providers.base import WhatsAppProvider
+from altegio_bot.providers.base import ChatwootRoute, WhatsAppProvider
 from altegio_bot.providers.meta_cloud import MetaCloudProvider
+from altegio_bot.settings import settings
+from altegio_bot.webhooks.common import (
+    InboxCompanyMap,
+    parse_chatwoot_inbox_company_map,
+    resolve_chatwoot_general_inbox,
+    resolve_chatwoot_tenant_inbox,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -22,8 +30,8 @@ _ACLOSE_TIMEOUT = 3.0
 class ChatwootHybridProvider:
     """Wraps MetaCloudProvider and mirrors outbound messages to Chatwoot."""
 
-    # Signals to safe_send / safe_send_template that this provider accepts
-    # company_id and staff_id keyword arguments.
+    # Signals to safe_send / safe_send_template that this provider accepts the
+    # tenant-provider/company routing kwargs (plus the legacy staff audit kwarg).
     _supports_mirror_kwargs: bool = True
 
     def __init__(
@@ -31,9 +39,20 @@ class ChatwootHybridProvider:
         *,
         primary: MetaCloudProvider | None = None,
         chatwoot: ChatwootClient | None = None,
+        chatwoot_factory: Callable[[int], ChatwootClient] | None = None,
     ) -> None:
         self._primary: WhatsAppProvider = primary or MetaCloudProvider()
+        # The legacy client targets the same global General/Unassigned inbox as
+        # inbound code (which owns a separate client outside this provider), and
+        # preserves single-inbox behavior when the map is empty.
         self._chatwoot: ChatwootClient = chatwoot or ChatwootClient()
+        self._chatwoot_factory = chatwoot_factory or (lambda inbox_id: ChatwootClient(inbox_id=inbox_id))
+        self._inbox_company_map: InboxCompanyMap = parse_chatwoot_inbox_company_map(settings.chatwoot_inbox_company_map)
+        self._general_inbox_id: object = settings.chatwoot_inbox_id
+        # Lazy and bounded: at most one client per validated configured inbox.
+        # The configuration snapshot is immutable for this provider lifetime;
+        # env changes require the documented worker recreation.
+        self._chatwoot_clients: dict[int, ChatwootClient] = {}
         self._background_tasks: set[asyncio.Task[None]] = set()
 
     async def aclose(self) -> None:
@@ -52,7 +71,17 @@ class ChatwootHybridProvider:
         aclose_primary = getattr(self._primary, "aclose", None)
         if callable(aclose_primary):
             await aclose_primary()
-        await self._chatwoot.aclose()
+
+        # A test factory may deliberately return the same object for multiple
+        # inboxes. Close by identity so no underlying AsyncClient is closed
+        # twice; the legacy client follows the same rule.
+        seen: set[int] = set()
+        for client in (self._chatwoot, *self._chatwoot_clients.values()):
+            identity = id(client)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            await client.aclose()
 
     def _schedule_mirror(self, coro: Any) -> None:
         """Schedule a mirror coroutine as a tracked background task."""
@@ -72,10 +101,12 @@ class ChatwootHybridProvider:
         phone_e164: str,
         text: str,
         *,
+        tenant_provider: str | None = None,
         company_id: int = 0,
         staff_id: int | None = None,
         contact_name: str | None = None,
         reply_to_provider_message_id: str | None = None,
+        chatwoot_route: ChatwootRoute = ChatwootRoute.TENANT,
     ) -> str:
         # PRIMARY – must succeed (Отправка напрямую в Meta)
         kwargs: dict[str, object] = {}
@@ -90,7 +121,15 @@ class ChatwootHybridProvider:
 
         # SECONDARY – best-effort (Логируем в Chatwoot как ПРИВАТНУЮ ЗАМЕТКУ)
         self._schedule_mirror(
-            self._log_to_chatwoot(phone_e164, text, contact_name=contact_name, meta={"msg_id": msg_id})
+            self._log_to_chatwoot(
+                phone_e164,
+                text,
+                tenant_provider=tenant_provider,
+                company_id=company_id,
+                chatwoot_route=chatwoot_route,
+                contact_name=contact_name,
+                meta={"msg_id": msg_id},
+            )
         )
 
         return msg_id
@@ -104,6 +143,7 @@ class ChatwootHybridProvider:
         params: list[str],
         fallback_text: str = "",
         *,
+        tenant_provider: str | None = None,
         company_id: int = 0,
         staff_id: int | None = None,
         contact_name: str | None = None,
@@ -123,7 +163,14 @@ class ChatwootHybridProvider:
         # SECONDARY – best-effort (Отправляем в Chatwoot красивый сгенерированный текст)
         content = fallback_text if fallback_text else (f"[{template_name}] " + " | ".join(params))
         self._schedule_mirror(
-            self._log_to_chatwoot(phone_e164, content, contact_name=contact_name, meta={"msg_id": msg_id})
+            self._log_to_chatwoot(
+                phone_e164,
+                content,
+                tenant_provider=tenant_provider,
+                company_id=company_id,
+                contact_name=contact_name,
+                meta={"msg_id": msg_id},
+            )
         )
 
         return msg_id
@@ -133,20 +180,78 @@ class ChatwootHybridProvider:
         phone_e164: str,
         content: str,
         *,
+        tenant_provider: str | None = None,
+        company_id: int = 0,
+        chatwoot_route: ChatwootRoute = ChatwootRoute.TENANT,
         contact_name: str | None = None,
         meta: dict[str, Any] | None = None,
     ) -> None:
+        chatwoot, inbox_id, routing_error = self._chatwoot_for_route(
+            chatwoot_route,
+            tenant_provider,
+            company_id,
+        )
+        if chatwoot is None:
+            # Stable reason only: never log the raw map, phone, text, contact,
+            # provider response or any other customer data.
+            logger.warning("Chatwoot mirror skipped routing_reason=%s", routing_error)
+            return
+
         try:
-            await self._chatwoot.mirror_outbound_as_note(phone_e164, content, contact_name=contact_name)
+            await chatwoot.mirror_outbound_as_note(phone_e164, content, contact_name=contact_name)
             logger.debug(
-                "Chatwoot mirror ok phone=%s extra=%s",
-                phone_e164,
-                meta,
+                "Chatwoot mirror ok company_id=%s inbox_id=%s",
+                company_id,
+                inbox_id,
             )
         except Exception as exc:
             logger.warning(
-                "Chatwoot log failed phone=%s err=%s extra=%s",
-                phone_e164,
-                exc,
-                meta,
+                "Chatwoot log failed company_id=%s inbox_id=%s error_type=%s",
+                company_id,
+                inbox_id,
+                type(exc).__name__,
             )
+
+    def _chatwoot_for_route(
+        self,
+        route: ChatwootRoute,
+        tenant_provider: object,
+        company_id: object,
+    ) -> tuple[ChatwootClient | None, int | None, str | None]:
+        """Resolve a mirror client from an explicit, fail-closed route intent."""
+        if route is ChatwootRoute.TENANT:
+            return self._chatwoot_for_tenant(tenant_provider, company_id)
+        if route is not ChatwootRoute.GENERAL:
+            return None, None, "invalid_chatwoot_route"
+
+        inbox_id, routing_error = resolve_chatwoot_general_inbox(
+            self._inbox_company_map,
+            self._general_inbox_id,
+        )
+        if routing_error is not None:
+            return None, None, routing_error
+        if inbox_id is None:
+            inbox_id = getattr(self._chatwoot, "_inbox_id", None)
+        return self._chatwoot, inbox_id, None
+
+    def _chatwoot_for_tenant(
+        self,
+        tenant_provider: object,
+        company_id: object,
+    ) -> tuple[ChatwootClient | None, int | None, str | None]:
+        """Resolve the outbound mirror client by the full CRM tenant pair."""
+        parsed = self._inbox_company_map
+        inbox_id, routing_error = resolve_chatwoot_tenant_inbox(parsed, tenant_provider, company_id)
+        if routing_error is not None:
+            return None, None, routing_error
+        if inbox_id is None:
+            return self._chatwoot, getattr(self._chatwoot, "_inbox_id", None), None
+
+        client = self._chatwoot_clients.get(inbox_id)
+        if client is None:
+            try:
+                client = self._chatwoot_factory(inbox_id)
+            except Exception:
+                return None, inbox_id, "chatwoot_client_init_failed"
+            self._chatwoot_clients[inbox_id] = client
+        return client, inbox_id, None

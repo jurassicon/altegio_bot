@@ -34,11 +34,19 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
 
 import altegio_bot.workers.whatsapp_inbox_worker as wiw
-from altegio_bot.models.models import OutboxMessage, WhatsAppEvent, WhatsAppSender
+from altegio_bot.models.models import (
+    PROVIDER_ALTEGIO,
+    PROVIDER_EASYWEEK,
+    OutboxMessage,
+    WhatsAppEvent,
+    WhatsAppSender,
+)
 from altegio_bot.providers.base import WhatsAppProvider
 from altegio_bot.services import meta_circuit as mc
+from altegio_bot.webhooks.common import ChatwootTenantIdentity
 from altegio_bot.workers.whatsapp_inbox_worker import (
     _apply_status_updates,
+    _company_hint_from_inbox,
     _is_operator_relay,
     _resolve_relay_sender,
     handle_event,
@@ -1644,9 +1652,172 @@ async def test_operator_relay_no_chatwoot_mirror(session_maker, monkeypatch) -> 
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize(
+    ("inbox_id", "expected_tenant"),
+    [
+        (101, ChatwootTenantIdentity(provider=PROVIDER_EASYWEEK, company_id=900001)),
+        (102, ChatwootTenantIdentity(provider=PROVIDER_EASYWEEK, company_id=900002)),
+        (103, ChatwootTenantIdentity(provider=PROVIDER_ALTEGIO, company_id=900003)),
+    ],
+    ids=["durlach", "rastatt", "karlsruhe"],
+)
+def test_three_branch_map_drives_operator_relay_in_original_direction(
+    monkeypatch: pytest.MonkeyPatch,
+    inbox_id: int,
+    expected_tenant: ChatwootTenantIdentity,
+) -> None:
+    monkeypatch.setattr(
+        wiw.settings,
+        "chatwoot_inbox_company_map",
+        '{"101":{"provider":"easyweek","company_id":900001},'
+        '"102":{"provider":"easyweek","company_id":900002},'
+        '"103":{"provider":"altegio","company_id":900003}}',
+    )
+
+    assert _company_hint_from_inbox(inbox_id) == (expected_tenant, None)
+
+
+def test_duplicate_company_map_blocks_operator_relay_too(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        wiw.settings,
+        "chatwoot_inbox_company_map",
+        '{"101":{"provider":"easyweek","company_id":900001},"102":{"provider":"easyweek","company_id":900001}}',
+    )
+
+    tenant, error = _company_hint_from_inbox(101)
+    assert tenant is None
+    assert error == "operator_relay: invalid_inbox_company_map"
+
+
+def test_legacy_integer_map_blocks_operator_relay(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(wiw.settings, "chatwoot_inbox_company_map", '{"101":900001}')
+
+    tenant, error = _company_hint_from_inbox(101)
+
+    assert tenant is None
+    assert error == "operator_relay: provider_scope_missing"
+
+
 @pytest.mark.asyncio
-async def test_resolve_relay_sender_with_company_hint(session_maker) -> None:
-    """company_id_hint resolves ambiguous phone_number_id to correct company."""
+async def test_company_hint_never_picks_between_providers_with_colliding_company_id(
+    session_maker,
+) -> None:
+    async with session_maker() as session:
+        async with session.begin():
+            session.add_all(
+                [
+                    WhatsAppSender(
+                        id=138,
+                        provider=PROVIDER_ALTEGIO,
+                        company_id=900001,
+                        sender_code="default",
+                        phone_number_id="PNID_PROVIDER_COLLISION",
+                        display_phone="+49",
+                        is_active=True,
+                    ),
+                    WhatsAppSender(
+                        id=139,
+                        provider=PROVIDER_EASYWEEK,
+                        company_id=900001,
+                        sender_code="default",
+                        phone_number_id="PNID_PROVIDER_COLLISION",
+                        display_phone="+49",
+                        is_active=True,
+                    ),
+                ]
+            )
+
+        sender_id, company_id, error = await _resolve_relay_sender(
+            session,
+            "PNID_PROVIDER_COLLISION",
+        )
+
+    assert sender_id is None
+    assert company_id is None
+    assert error == "operator_relay: ambiguous_sender_provider"
+
+
+@pytest.mark.asyncio
+async def test_authoritative_tenant_hint_keeps_shared_phone_sender_provider_scoped(
+    session_maker,
+) -> None:
+    shared_phone_number_id = "PNID_THREE_BRANCHES"
+    async with session_maker() as session:
+        async with session.begin():
+            session.add_all(
+                [
+                    WhatsAppSender(
+                        id=131,
+                        provider=PROVIDER_EASYWEEK,
+                        company_id=900001,
+                        sender_code="default",
+                        phone_number_id=shared_phone_number_id,
+                        display_phone="+49",
+                        is_active=True,
+                    ),
+                    WhatsAppSender(
+                        id=132,
+                        provider=PROVIDER_EASYWEEK,
+                        company_id=900002,
+                        sender_code="default",
+                        phone_number_id=shared_phone_number_id,
+                        display_phone="+49",
+                        is_active=True,
+                    ),
+                    WhatsAppSender(
+                        id=133,
+                        provider=PROVIDER_ALTEGIO,
+                        company_id=900003,
+                        sender_code="default",
+                        phone_number_id=shared_phone_number_id,
+                        display_phone="+49",
+                        is_active=True,
+                    ),
+                    # A colliding wrong-provider row must not win for Durlach.
+                    WhatsAppSender(
+                        id=134,
+                        provider=PROVIDER_ALTEGIO,
+                        company_id=900001,
+                        sender_code="default",
+                        phone_number_id=shared_phone_number_id,
+                        display_phone="+49",
+                        is_active=True,
+                    ),
+                ]
+            )
+
+        assert await _resolve_relay_sender(
+            session,
+            shared_phone_number_id,
+            tenant_hint=ChatwootTenantIdentity(provider=PROVIDER_EASYWEEK, company_id=900001),
+        ) == (
+            131,
+            900001,
+            None,
+        )
+        assert await _resolve_relay_sender(
+            session,
+            shared_phone_number_id,
+            tenant_hint=ChatwootTenantIdentity(provider=PROVIDER_EASYWEEK, company_id=900002),
+        ) == (
+            132,
+            900002,
+            None,
+        )
+        assert await _resolve_relay_sender(
+            session,
+            shared_phone_number_id,
+            tenant_hint=ChatwootTenantIdentity(provider=PROVIDER_ALTEGIO, company_id=900003),
+        ) == (
+            133,
+            900003,
+            None,
+        )
+
+
+@pytest.mark.asyncio
+async def test_resolve_relay_sender_with_tenant_hint(session_maker) -> None:
+    """A complete tenant identity resolves an ambiguous phone_number_id."""
     async with session_maker() as session:
         async with session.begin():
             session.add(
@@ -1670,7 +1841,11 @@ async def test_resolve_relay_sender_with_company_hint(session_maker) -> None:
                 )
             )
 
-        sid, cid, err = await _resolve_relay_sender(session, "PNID_HINT", company_id_hint=758285)
+        sid, cid, err = await _resolve_relay_sender(
+            session,
+            "PNID_HINT",
+            tenant_hint=ChatwootTenantIdentity(provider=PROVIDER_ALTEGIO, company_id=758285),
+        )
 
     assert err is None
     assert cid == 758285
@@ -1682,7 +1857,11 @@ async def test_relay_with_inbox_company_map(session_maker, monkeypatch) -> None:
     """CHATWOOT_INBOX_COMPANY_MAP disambiguates relay for two company_ids."""
     monkeypatch.setattr(wiw, "SessionLocal", session_maker)
     monkeypatch.setattr(wiw.settings, "chatwoot_operator_relay_enabled", True)
-    monkeypatch.setattr(wiw.settings, "chatwoot_inbox_company_map", '{"8": 758285, "7": 1271200}')
+    monkeypatch.setattr(
+        wiw.settings,
+        "chatwoot_inbox_company_map",
+        '{"8":{"provider":"altegio","company_id":758285},"7":{"provider":"altegio","company_id":1271200}}',
+    )
     monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
     provider = _FakeProvider(wamid="wamid.INBOX_MAP")
 
@@ -1755,7 +1934,11 @@ async def test_relay_inbox_not_in_map_fail_closed(session_maker, monkeypatch) ->
     monkeypatch.setattr(wiw, "SessionLocal", session_maker)
     monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
     monkeypatch.setattr(wiw.settings, "chatwoot_operator_relay_enabled", True)
-    monkeypatch.setattr(wiw.settings, "chatwoot_inbox_company_map", '{"8": 758285}')
+    monkeypatch.setattr(
+        wiw.settings,
+        "chatwoot_inbox_company_map",
+        '{"8":{"provider":"altegio","company_id":758285}}',
+    )
     provider = _FakeProvider()
 
     async with session_maker() as session:

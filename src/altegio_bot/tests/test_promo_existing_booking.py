@@ -46,6 +46,8 @@ import pytest
 from sqlalchemy import select
 
 from altegio_bot.models.models import (
+    PROVIDER_ALTEGIO,
+    PROVIDER_EASYWEEK,
     Client,
     MessageJob,
     PromoLead,
@@ -64,6 +66,7 @@ from altegio_bot.workers.promo_lead_handler import (
     build_reply_already_issued,
     build_reply_issued,
     build_reply_issued_with_card,
+    process_promo_eligibility_check_job,
 )
 from altegio_bot.workers.whatsapp_inbox_worker import handle_event
 
@@ -603,6 +606,64 @@ async def test_eligibility_check_job_no_existing_booking_job_on_send_failure(ses
         )
 
     assert len(eb_jobs) == 0, "send failed: existing-booking job must NOT be created"
+
+
+@pytest.mark.asyncio
+async def test_eligibility_reply_passes_altegio_tenant_to_provider_scoped_chatwoot_mirror(
+    session_maker,
+) -> None:
+    """An Altegio promo job keeps its provider/company pair through safe_send."""
+    from altegio_bot.webhooks.common import (
+        parse_chatwoot_inbox_company_map,
+        resolve_chatwoot_tenant_inbox,
+    )
+
+    captured: dict[str, object] = {}
+
+    async def fake_safe_send(**kwargs: object) -> tuple[str, None]:
+        captured.update(kwargs)
+        return "wamid.PROMO.ELIGIBILITY", None
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _setup_sender(session, sender_id=406)
+            lead = _make_lead(status="pending_check", loyalty_card_id=None)
+            session.add(lead)
+            await session.flush()
+            job = MessageJob(
+                provider=PROVIDER_ALTEGIO,
+                company_id=_COMPANY,
+                job_type=PROMO_ELIGIBILITY_CHECK_JOB_TYPE,
+                run_at=_NOW,
+                status="processing",
+                dedupe_key="promo-eligibility-provider-scope",
+                payload={"promo_lead_id": lead.id},
+            )
+            session.add(job)
+            await session.flush()
+
+            with (
+                patch.object(settings, "promo_issue_loyalty_card_enabled", False),
+                patch(
+                    "altegio_bot.workers.promo_lead_handler.safe_send",
+                    side_effect=fake_safe_send,
+                ),
+            ):
+                await process_promo_eligibility_check_job(session, job, _CaptureProvider())
+
+        jobs = list((await session.execute(select(MessageJob))).scalars().all())
+
+    assert captured["tenant_provider"] == PROVIDER_ALTEGIO
+    assert captured["company_id"] == _COMPANY
+    parsed = parse_chatwoot_inbox_company_map(
+        '{"103":{"provider":"altegio","company_id":1},"101":{"provider":"easyweek","company_id":308697}}'
+    )
+    assert resolve_chatwoot_tenant_inbox(
+        parsed,
+        captured["tenant_provider"],
+        captured["company_id"],
+    ) == (103, None)
+    assert all(queued.provider != PROVIDER_EASYWEEK for queued in jobs)
 
 
 # =============================================================================
