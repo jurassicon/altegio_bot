@@ -18,7 +18,7 @@ from altegio_bot.altegio_records import AltegioNewClientCheckError, check_client
 from altegio_bot.easyweek_policy import normalize_provider
 from altegio_bot.models.models import PROVIDER_ALTEGIO, Client, MessageJob, OutboxMessage, PromoLead, Record
 from altegio_bot.promo_loyalty import AltegioLoyaltyError, issue_promo_loyalty_card
-from altegio_bot.providers.base import WhatsAppProvider
+from altegio_bot.providers.base import ChatwootRoute, WhatsAppProvider
 from altegio_bot.providers.dummy import safe_send
 from altegio_bot.settings import settings
 from altegio_bot.whatsapp_routing import pick_sender_id
@@ -560,7 +560,7 @@ async def handle_promo_info_command(
     discount assignment.  An OutboxMessage audit row is created on success.
     """
     if company_id is None:
-        logger.warning("promo_info: missing company_id phone=%s sender_id=%s", phone_e164, sender_id)
+        logger.warning("promo_info: missing company_id sender_id=%s", sender_id)
         event.error = "promo_info: missing company_id"
         return
 
@@ -573,13 +573,12 @@ async def handle_promo_info_command(
         sender_id=sender_id,
         phone=phone_e164,
         text=reply,
+        chatwoot_route=ChatwootRoute.GENERAL,
     )
     if err is not None:
         logger.warning(
-            "promo_info: send failed phone=%s sender_id=%s err=%s",
-            phone_e164,
+            "promo_info: send failed sender_id=%s",
             sender_id,
-            err,
         )
         event.error = f"promo_info: send failed: {err}"
         return
@@ -611,10 +610,9 @@ async def handle_promo_info_command(
     )
     event.error = None
     logger.info(
-        "promo_info: sent phone=%s sender_id=%s msg_id=%s",
-        phone_e164,
+        "promo_info: sent sender_id=%s event_id=%s",
         sender_id,
-        msg_id,
+        event.id,
     )
 
 
@@ -646,8 +644,7 @@ async def _attempt_loyalty_card_issue(
         if event is not None:
             event.error = err
         logger.warning(
-            "promo_loyalty: card issuance blocked (promo_loyalty_card_api_verified=False) phone=%s",
-            phone_e164,
+            "promo_loyalty: card issuance blocked promo_loyalty_card_api_verified=false",
         )
         return False
 
@@ -656,7 +653,7 @@ async def _attempt_loyalty_card_issue(
         lead.meta = {**(lead.meta or {}), "loyalty_card_issued": False, "loyalty_card_error": err}
         if event is not None:
             event.error = err
-        logger.warning("promo_loyalty: missing promo_loyalty_card_type_id phone=%s", phone_e164)
+        logger.warning("promo_loyalty: missing promo_loyalty_card_type_id")
         return False
 
     if not cfg.promo_discount_program_id:
@@ -664,7 +661,7 @@ async def _attempt_loyalty_card_issue(
         lead.meta = {**(lead.meta or {}), "loyalty_card_issued": False, "loyalty_card_error": err}
         if event is not None:
             event.error = err
-        logger.warning("promo_loyalty: missing promo_discount_program_id phone=%s", phone_e164)
+        logger.warning("promo_loyalty: missing promo_discount_program_id")
         return False
 
     try:
@@ -674,7 +671,7 @@ async def _attempt_loyalty_card_issue(
         lead.meta = {**(lead.meta or {}), "loyalty_card_issued": False, "loyalty_card_error": err}
         if event is not None:
             event.error = err
-        logger.warning("promo_loyalty: location_id resolution failed phone=%s: %s", phone_e164, exc)
+        logger.warning("promo_loyalty: location_id resolution failed error_type=%s", type(exc).__name__)
         return False
 
     try:
@@ -688,7 +685,7 @@ async def _attempt_loyalty_card_issue(
         lead.meta = {**(lead.meta or {}), "loyalty_card_issued": False, "loyalty_card_error": err_str}
         if event is not None:
             event.error = f"promo_loyalty: {err_str}"
-        logger.warning("promo_loyalty: card issue failed phone=%s: %s", phone_e164, exc)
+        logger.warning("promo_loyalty: card issue failed error_type=%s", type(exc).__name__)
         return False
 
     lead.altegio_client_id = result.altegio_client_id
@@ -699,10 +696,8 @@ async def _attempt_loyalty_card_issue(
     lead.location_id = location_id
     lead.meta = {**(lead.meta or {}), "loyalty_card_issued": True}
     logger.info(
-        "promo_loyalty: card issued card_id=%s card_number=%s phone=%s",
+        "promo_loyalty: card issued card_id=%s",
         result.loyalty_card_id,
-        result.loyalty_card_number,
-        phone_e164,
     )
     return True
 
@@ -986,7 +981,7 @@ async def handle_promo_command(
     Creates an OutboxMessage audit row on success.
     """
     if company_id is None:
-        logger.warning("promo_lead: missing company_id phone=%s sender_id=%s", phone_e164, sender_id)
+        logger.warning("promo_lead: missing company_id sender_id=%s", sender_id)
         event.error = "promo_lead: missing company_id"
         return
 
@@ -1121,10 +1116,9 @@ async def handle_promo_command(
             except AltegioNewClientCheckError as exc:
                 err = str(exc)
                 logger.warning(
-                    "promo_lead: Altegio new-client check failed phone=%s company_id=%s: %s",
-                    phone_e164,
+                    "promo_lead: Altegio new-client check failed company_id=%s error_type=%s",
                     company_id,
-                    err,
+                    type(exc).__name__,
                 )
                 candidate = _build_new_client_check_failed_lead(
                     company_id=company_id,
@@ -1193,9 +1187,8 @@ async def handle_promo_command(
             # UniqueConstraint violation: a concurrent worker won the race.
             # The savepoint is auto-rolled back; the outer transaction is clean.
             logger.warning(
-                "promo_lead: concurrent insert race phone=%s campaign=%s — reading winner",
-                phone_e164,
-                cfg.promo_campaign_name,
+                "promo_lead: concurrent insert race event_id=%s — reading winner",
+                event.id,
             )
             lead = await _find_any_lead(session, phone_e164, cfg.promo_campaign_name)
 
@@ -1271,10 +1264,8 @@ async def handle_promo_command(
 
     # ── 4. Send free-form reply ──────────────────────────────────────────────
     logger.info(
-        "promo_lead: phone=%s template=%s campaign=%s event_id=%s",
-        phone_e164,
+        "promo_lead: sending template=%s event_id=%s",
         template_code,
-        cfg.promo_campaign_name,
         event.id,
     )
 
@@ -1283,14 +1274,14 @@ async def handle_promo_command(
         sender_id=sender_id,
         phone=phone_e164,
         text=reply,
+        chatwoot_route=ChatwootRoute.GENERAL,
     )
 
     if err is not None:
         logger.warning(
-            "promo_lead: send failed phone=%s sender_id=%s err=%s",
-            phone_e164,
+            "promo_lead: send failed sender_id=%s event_id=%s",
             sender_id,
-            err,
+            event.id,
         )
         lead_to_update = new_lead or repair_lead
         if lead_to_update is not None:
@@ -1347,9 +1338,8 @@ async def handle_promo_command(
     if not card_issue_failed:
         event.error = None
     logger.info(
-        "promo_lead: sent phone=%s sender_id=%s msg_id=%s template=%s",
-        phone_e164,
+        "promo_lead: sent sender_id=%s event_id=%s template=%s",
         sender_id,
-        msg_id,
+        event.id,
         template_code,
     )

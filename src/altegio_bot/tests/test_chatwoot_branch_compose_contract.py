@@ -67,6 +67,17 @@ def test_activation_runbook_gates_isolated_general_inbox() -> None:
     assert "**STOP**" in text
 
 
+def test_activation_runbook_documents_only_the_explicit_identityless_general_routes() -> None:
+    text = ACTIVATION_RUNBOOK.read_text()
+
+    assert "STOP ACK, START ACK" in text
+    assert "synchronous promo info" in text
+    assert "synchronous promo funnel" in text
+    assert "Это не EasyWeek promo и не филиальная маршрутизация" in text
+    assert "обычный lifecycle send" in text
+    assert "неявный fallback в General" in text
+
+
 def test_official_env_example_uses_provider_scoped_branches_and_separate_general() -> None:
     from altegio_bot.webhooks.common import (
         parse_chatwoot_inbox_company_map,

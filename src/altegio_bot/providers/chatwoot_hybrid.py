@@ -12,12 +12,13 @@ from collections.abc import Callable
 from typing import Any
 
 from altegio_bot.chatwoot_client import ChatwootClient
-from altegio_bot.providers.base import WhatsAppProvider
+from altegio_bot.providers.base import ChatwootRoute, WhatsAppProvider
 from altegio_bot.providers.meta_cloud import MetaCloudProvider
 from altegio_bot.settings import settings
 from altegio_bot.webhooks.common import (
     InboxCompanyMap,
     parse_chatwoot_inbox_company_map,
+    resolve_chatwoot_general_inbox,
     resolve_chatwoot_tenant_inbox,
 )
 
@@ -47,6 +48,7 @@ class ChatwootHybridProvider:
         self._chatwoot: ChatwootClient = chatwoot or ChatwootClient()
         self._chatwoot_factory = chatwoot_factory or (lambda inbox_id: ChatwootClient(inbox_id=inbox_id))
         self._inbox_company_map: InboxCompanyMap = parse_chatwoot_inbox_company_map(settings.chatwoot_inbox_company_map)
+        self._general_inbox_id: object = settings.chatwoot_inbox_id
         # Lazy and bounded: at most one client per validated configured inbox.
         # The configuration snapshot is immutable for this provider lifetime;
         # env changes require the documented worker recreation.
@@ -104,6 +106,7 @@ class ChatwootHybridProvider:
         staff_id: int | None = None,
         contact_name: str | None = None,
         reply_to_provider_message_id: str | None = None,
+        chatwoot_route: ChatwootRoute = ChatwootRoute.TENANT,
     ) -> str:
         # PRIMARY – must succeed (Отправка напрямую в Meta)
         kwargs: dict[str, object] = {}
@@ -123,6 +126,7 @@ class ChatwootHybridProvider:
                 text,
                 tenant_provider=tenant_provider,
                 company_id=company_id,
+                chatwoot_route=chatwoot_route,
                 contact_name=contact_name,
                 meta={"msg_id": msg_id},
             )
@@ -178,10 +182,15 @@ class ChatwootHybridProvider:
         *,
         tenant_provider: str | None = None,
         company_id: int = 0,
+        chatwoot_route: ChatwootRoute = ChatwootRoute.TENANT,
         contact_name: str | None = None,
         meta: dict[str, Any] | None = None,
     ) -> None:
-        chatwoot, inbox_id, routing_error = self._chatwoot_for_tenant(tenant_provider, company_id)
+        chatwoot, inbox_id, routing_error = self._chatwoot_for_route(
+            chatwoot_route,
+            tenant_provider,
+            company_id,
+        )
         if chatwoot is None:
             # Stable reason only: never log the raw map, phone, text, contact,
             # provider response or any other customer data.
@@ -202,6 +211,28 @@ class ChatwootHybridProvider:
                 inbox_id,
                 type(exc).__name__,
             )
+
+    def _chatwoot_for_route(
+        self,
+        route: ChatwootRoute,
+        tenant_provider: object,
+        company_id: object,
+    ) -> tuple[ChatwootClient | None, int | None, str | None]:
+        """Resolve a mirror client from an explicit, fail-closed route intent."""
+        if route is ChatwootRoute.TENANT:
+            return self._chatwoot_for_tenant(tenant_provider, company_id)
+        if route is not ChatwootRoute.GENERAL:
+            return None, None, "invalid_chatwoot_route"
+
+        inbox_id, routing_error = resolve_chatwoot_general_inbox(
+            self._inbox_company_map,
+            self._general_inbox_id,
+        )
+        if routing_error is not None:
+            return None, None, routing_error
+        if inbox_id is None:
+            inbox_id = getattr(self._chatwoot, "_inbox_id", None)
+        return self._chatwoot, inbox_id, None
 
     def _chatwoot_for_tenant(
         self,

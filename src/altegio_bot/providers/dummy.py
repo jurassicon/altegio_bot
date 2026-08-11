@@ -4,7 +4,7 @@ import logging
 import os
 from uuid import uuid4
 
-from altegio_bot.providers.base import WhatsAppProvider
+from altegio_bot.providers.base import ChatwootRoute, WhatsAppProvider
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +91,7 @@ async def safe_send(
     staff_id: int | None = None,
     contact_name: str | None = None,
     reply_to_provider_message_id: str | None = None,
+    chatwoot_route: ChatwootRoute = ChatwootRoute.TENANT,
 ) -> tuple[str | None, str | None]:
     if not _real_send_allowed(provider):
         return None, "Real send disabled"
@@ -103,6 +104,7 @@ async def safe_send(
             kwargs["tenant_provider"] = tenant_provider
             kwargs["company_id"] = company_id
             kwargs["staff_id"] = staff_id
+            kwargs["chatwoot_route"] = chatwoot_route
         msg_id = await provider.send(sender_id, phone, text, **kwargs)  # type: ignore[call-arg]
         return msg_id, None
     except Exception as exc:

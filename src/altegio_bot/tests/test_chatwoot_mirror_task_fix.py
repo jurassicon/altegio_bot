@@ -7,6 +7,7 @@ from uuid import uuid4
 
 import pytest
 
+from altegio_bot.providers.base import ChatwootRoute
 from altegio_bot.providers.chatwoot_hybrid import ChatwootHybridProvider
 from altegio_bot.providers.dummy import _supports_mirror, safe_send, safe_send_template
 
@@ -296,10 +297,12 @@ async def test_safe_send_passes_mirror_kwargs() -> None:
             company_id: int = 0,
             staff_id: int | None = None,
             contact_name: str | None = None,
+            chatwoot_route: ChatwootRoute = ChatwootRoute.TENANT,
         ) -> str:
             received["tenant_provider"] = tenant_provider
             received["company_id"] = company_id
             received["staff_id"] = staff_id
+            received["chatwoot_route"] = chatwoot_route
             return "fake-id"
 
     provider = _CaptureMeta()
@@ -318,6 +321,7 @@ async def test_safe_send_passes_mirror_kwargs() -> None:
             tenant_provider="easyweek",
             company_id=42,
             staff_id=7,
+            chatwoot_route=ChatwootRoute.GENERAL,
         )
     finally:
         del os.environ["WHATSAPP_PROVIDER"]
@@ -328,6 +332,7 @@ async def test_safe_send_passes_mirror_kwargs() -> None:
     assert received["tenant_provider"] == "easyweek"
     assert received["company_id"] == 42
     assert received["staff_id"] == 7
+    assert received["chatwoot_route"] is ChatwootRoute.GENERAL
 
 
 async def test_safe_send_template_passes_mirror_kwargs() -> None:

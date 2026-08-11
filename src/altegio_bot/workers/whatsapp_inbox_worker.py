@@ -37,7 +37,7 @@ from altegio_bot.models.models import (
     WhatsAppSender,
 )
 from altegio_bot.perf import perf_log
-from altegio_bot.providers.base import WhatsAppProvider
+from altegio_bot.providers.base import ChatwootRoute, WhatsAppProvider
 from altegio_bot.providers.dummy import safe_send, safe_send_template
 from altegio_bot.services import meta_circuit
 from altegio_bot.services.meta_error_classifier import (
@@ -3821,13 +3821,13 @@ async def handle_event(
         sender_id=sender_id,
         phone=phone_e164,
         text=ack,
+        chatwoot_route=ChatwootRoute.GENERAL,
     )
 
     if err is not None:
         logger.warning(
-            "Ack send failed sender_id=%s err=%s",
+            "Ack send failed sender_id=%s",
             sender_id,
-            err,
         )
         event.error = f"Ack send failed: {err}"
         return

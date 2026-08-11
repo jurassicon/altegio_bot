@@ -18,11 +18,14 @@ import pytest
 from sqlalchemy import select
 
 from altegio_bot.models.models import (
+    Client,
     OutboxMessage,
+    PromoLead,
     WhatsAppEvent,
     WhatsAppSender,
 )
 from altegio_bot.providers.base import WhatsAppProvider
+from altegio_bot.providers.chatwoot_hybrid import ChatwootHybridProvider
 from altegio_bot.settings import settings
 from altegio_bot.workers.whatsapp_inbox_worker import (
     _parse_command,
@@ -56,6 +59,18 @@ class _CaptureProvider(WhatsAppProvider):
 
 
 class _FakeCW:
+    def __init__(self) -> None:
+        self.notes: list[tuple[str, str]] = []
+
+    async def mirror_outbound_as_note(
+        self,
+        phone: str,
+        text: str,
+        *,
+        contact_name: str | None = None,
+    ) -> None:
+        self.notes.append((phone, text))
+
     async def log_incoming_message(
         self,
         phone: str,
@@ -265,6 +280,143 @@ async def test_promo_command_creates_outbox_audit(session_maker) -> None:
 )
 def test_stop_start_parse_command_regression(text: str, expected_cmd: str) -> None:
     assert _parse_command(text) == expected_cmd
+
+
+@pytest.mark.parametrize(
+    ("text", "funnel_enabled", "expected_template"),
+    [
+        ("STOP", False, "wa_cmd_stop"),
+        ("START", False, "wa_cmd_start"),
+        ("AKTION", False, "wa_promo_info"),
+        ("AKTION", True, "wa_promo_lead_issued"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_identityless_direct_replies_use_only_explicit_general_with_shared_sender(
+    session_maker,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    text: str,
+    funnel_enabled: bool,
+    expected_template: str,
+) -> None:
+    """A shared phone_number_id must never turn _pick_sender() into tenant proof."""
+    branch_map = (
+        '{"101":{"provider":"altegio","company_id":71},'
+        '"102":{"provider":"easyweek","company_id":72},'
+        '"103":{"provider":"easyweek","company_id":73}}'
+    )
+    monkeypatch.setattr(settings, "chatwoot_inbox_company_map", branch_map)
+    monkeypatch.setattr(settings, "chatwoot_inbox_id", 999)
+    monkeypatch.setattr(settings, "promo_lead_funnel_enabled", funnel_enabled)
+    monkeypatch.setattr(settings, "promo_check_new_client_in_altegio", False)
+    monkeypatch.setattr(settings, "promo_async_eligibility_check_enabled", False)
+    monkeypatch.setattr(settings, "promo_issue_loyalty_card_enabled", False)
+
+    meta = _CaptureProvider()
+    general = _FakeCW()
+    branch_factory_calls: list[int] = []
+
+    def _branch_factory(inbox_id: int) -> _FakeCW:
+        branch_factory_calls.append(inbox_id)
+        return _FakeCW()
+
+    provider = ChatwootHybridProvider(
+        primary=meta,  # type: ignore[arg-type]
+        chatwoot=general,  # type: ignore[arg-type]
+        chatwoot_factory=_branch_factory,  # type: ignore[arg-type]
+    )
+    opted_out_initially = text == "START"
+
+    with caplog.at_level("INFO"):
+        async with session_maker() as session:
+            async with session.begin():
+                session.add_all(
+                    [
+                        WhatsAppSender(
+                            id=871,
+                            provider="altegio",
+                            company_id=71,
+                            sender_code="shared_ka",
+                            phone_number_id=PHONE_NUMBER_ID,
+                            display_phone="+49",
+                            is_active=True,
+                        ),
+                        WhatsAppSender(
+                            id=872,
+                            provider="easyweek",
+                            company_id=72,
+                            sender_code="shared_du",
+                            phone_number_id=PHONE_NUMBER_ID,
+                            display_phone="+49",
+                            is_active=True,
+                        ),
+                        WhatsAppSender(
+                            id=873,
+                            provider="easyweek",
+                            company_id=73,
+                            sender_code="shared_ra",
+                            phone_number_id=PHONE_NUMBER_ID,
+                            display_phone="+49",
+                            is_active=True,
+                        ),
+                        Client(
+                            id=879,
+                            company_id=71,
+                            altegio_client_id=879,
+                            display_name="General Route Customer",
+                            phone_e164=PHONE_E164,
+                            wa_opted_out=opted_out_initially,
+                            wa_opt_out_reason="wa:stop" if opted_out_initially else None,
+                            raw={},
+                        ),
+                    ]
+                )
+                event = WhatsAppEvent(
+                    dedupe_key=f"wa:explicit-general:{text.lower()}:{int(funnel_enabled)}",
+                    status="received",
+                    error=None,
+                    query={},
+                    headers={},
+                    payload=_inbound_payload(PHONE_NUMBER_ID, FROM_PHONE, text),
+                )
+                session.add(event)
+                await session.flush()
+
+                await handle_event(session, event, provider)
+                await provider.aclose()
+
+                outbox = (
+                    await session.execute(select(OutboxMessage).where(OutboxMessage.template_code == expected_template))
+                ).scalar_one_or_none()
+                assert outbox is not None
+                assert outbox.status == "sent"
+                assert outbox.message_source == "bot"
+
+                customer = await session.get(Client, 879)
+                assert customer is not None
+                if text == "STOP":
+                    assert customer.wa_opted_out is True
+                    assert customer.wa_opt_out_reason == "wa:stop"
+                elif text == "START":
+                    assert customer.wa_opted_out is False
+                    assert customer.wa_opt_out_reason is None
+                elif funnel_enabled:
+                    leads = (await session.execute(select(PromoLead))).scalars().all()
+                    assert len(leads) == 1
+                    assert leads[0].status == "issued"
+                else:
+                    assert (await session.execute(select(PromoLead))).scalars().all() == []
+
+    assert len(meta.sent) == 1
+    assert len(general.notes) == 1
+    assert general.notes[0][0] == PHONE_E164
+    assert branch_factory_calls == []
+    assert PHONE_E164 not in caplog.text
+    assert FROM_PHONE not in caplog.text
+    assert branch_map not in caplog.text
+    assert settings.promo_booking_url not in caplog.text
+    assert "General Route Customer" not in caplog.text
 
 
 # ---------------------------------------------------------------------------

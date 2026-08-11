@@ -376,6 +376,15 @@ booking не являются tenant proof. Такое входящее оста
 вручную. По телефону филиал не угадывается. Для outbound lifecycle mirror и
 operator relay этот fallback запрещён при configured map.
 
+Ответы на новые identity-less команды используют тот же маршрут только по
+явному outbound intent: STOP ACK, START ACK, существующий synchronous promo info
+reply и существующий synchronous promo funnel reply зеркалируются в
+`General / Unassigned`. Это не EasyWeek promo и не филиальная маршрутизация:
+результат `_pick_sender()` по общему `phone_number_id` не считается tenant proof.
+Любой обычный lifecycle send со случайно отсутствующей или невалидной парой
+`(provider, company_id)` по-прежнему блокирует Chatwoot mirror fail-closed и не
+получает неявный fallback в General.
+
 ### `whatsapp_allowed_phone_number_ids` — правка НЕ нужна
 
 Этот allowlist фильтрует **входящие вебхуки по `phone_number_id`** и о
