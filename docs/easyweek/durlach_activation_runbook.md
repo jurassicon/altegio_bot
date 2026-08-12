@@ -805,18 +805,184 @@ business suppression. `allowed_categories_unconfigured` и
 inbox не claim'ит новые events при включённых notifications, а outbox не
 отменяет job, а откладывает её с bounded backoff без расхода Meta attempts.
 
-Безопасное восстановление после invalid/unconfigured allowlist:
+### Восстановление после invalid/unconfigured allowlist
 
-1. Установить `EASYWEEK_NOTIFICATIONS_ENABLED=false` и force-recreate inbox
-   worker. При необходимости дождаться обработки captured backlog: domain
-   snapshot обновляется, но lifecycle jobs не создаются.
-2. Исправить allowlist, сохранив production-инвариант
-   `EASYWEEK_ALLOWED_SERVICE_CATEGORIES=["Wimpernverlängerung"]`.
-3. Force-recreate inbox и outbox workers и повторить effective-config probe:
-   configured=true, valid=true, count=1, без печати raw env.
-4. Установить notifications=true и снова force-recreate inbox worker. Captured
-   events после configuration outage сразу снова доступны claim'у; queued jobs
-   outbox повторно проходят identity/category/count guards и штатный deadline.
+#### Почему notifications НЕ выключают
+
+Ключевая асимметрия `processing_is_configured()`, и её надо понимать до первой
+команды:
+
+| `processing` | `notifications` | allowlist невалиден | Что делает inbox worker |
+| --- | --- | --- | --- |
+| `true` | **`true`** | да | **не claim'ит** — captured backlog цел |
+| `true` | **`false`** | да | **claim'ит**: обновляет domain snapshot, `plan_lifecycle_job` выходит на первой строке, событие уходит в terminal `processed` **без job** |
+
+Вторая строка необратима. Автоматического replay для `processed` события нет:
+после исправления allowlist уведомление уже не восстановится никогда. Поэтому
+**невалидный allowlist при включённых notifications — это и есть штатный
+fail-closed fence**, и трогать его не нужно: он уже остановил конвейер ровно
+там, где надо, и сохранил backlog.
+
+Выключение notifications в этой ситуации — не «безопасный шаг перед починкой»,
+а способ молча уничтожить backlog. О том, когда это всё же допустимо, — ниже,
+в «Domain-only drain».
+
+#### Штатное восстановление
+
+`EASYWEEK_NOTIFICATIONS_ENABLED` остаётся `true` на всём протяжении. Работающий
+inbox worker не пересоздаётся, пока конфигурация невалидна.
+
+1. Зафиксировать объём затронутого backlog — только aggregate counts:
+
+```sql
+SELECT status, count(*)
+FROM easyweek_events
+GROUP BY status
+ORDER BY status;
+```
+
+```sql
+SELECT status, count(*)
+FROM message_jobs
+WHERE provider = 'easyweek'
+  AND job_type IN ('record_created', 'record_updated', 'record_canceled')
+  AND status IN ('queued', 'processing')
+GROUP BY status
+ORDER BY status;
+```
+
+   `captured` события и `queued`/`processing` jobs обязаны сохраниться до конца
+   процедуры. Ни удалять их, ни переводить руками в `processed`, ни делать
+   любой другой `UPDATE` production-данных ради восстановления нельзя.
+
+2. Исправить allowlist в `easyweek.env`, сохранив production-инвариант:
+
+```text
+EASYWEEK_ALLOWED_SERVICE_CATEGORIES=["Wimpernverlängerung"]
+```
+
+3. Проверить новую effective-конфигурацию **до** пересоздания потребителей —
+   одноразовым контейнером, который не запускает inbox loop:
+
+```bash
+$COMPOSE run --rm --no-deps \
+  --entrypoint /app/.venv/bin/python \
+  altegio-easyweek-inbox-worker \
+  -c 'from altegio_bot.easyweek_locations import configured_easyweek_locations; from altegio_bot.easyweek_service_category import parse_allowed_service_categories; from altegio_bot.settings import settings; r = configured_easyweek_locations(); c = parse_allowed_service_categories(settings.easyweek_allowed_service_categories); print({"processing_enabled": settings.easyweek_processing_enabled, "notifications_enabled": settings.easyweek_notifications_enabled, "registry_ready": r.ready, "service_categories_configured": c.configured, "service_categories_valid": c.valid, "service_categories_count": len(c.keys)})'
+```
+
+   `--entrypoint` и `--no-deps` здесь обязательны: они гарантируют, что
+   контейнер выполнит только эту проверку и не стартует inbox loop. Вывод —
+   только booleans и число: raw allowlist, название категории, API key, webhook
+   secret, UUID, URL и payload не печатаются.
+
+   Gate: `service_categories_configured=true`, `service_categories_valid=true`,
+   `service_categories_count=1`, `registry_ready=true`,
+   `notifications_enabled=true`. Любое расхождение — вернуться к шагу 2, не
+   пересоздавая работающие сервисы.
+
+4. Только после успешной валидации пересоздать обоих потребителей настройки:
+
+```bash
+$COMPOSE up -d --force-recreate \
+  altegio-easyweek-inbox-worker altegio-outbox-worker
+```
+
+   Inbox worker стартует с `notifications=true` и валидным allowlist, поэтому
+   `processing_is_configured()` снова истинно: сохранённые `captured` события
+   штатно берутся в работу и **создают** lifecycle jobs.
+
+5. Подтвердить, что backlog именно восстановился, а не был списан. Повторите
+   оба запроса из шага 1: `captured` убывает, а число EasyWeek lifecycle jobs
+   растёт. Если `captured` ушёл в ноль, а jobs не появились — **STOP**: это
+   признак того, что события были обработаны с выключенными notifications.
+
+```sql
+SELECT count(*) AS processed_without_job
+FROM easyweek_events e
+LEFT JOIN records r
+       ON r.provider = 'easyweek'
+      AND r.easyweek_booking_uuid = e.booking_uuid
+LEFT JOIN message_jobs j
+       ON j.provider = 'easyweek'
+      AND j.record_id = r.id
+      AND j.job_type IN ('record_created', 'record_updated', 'record_canceled')
+WHERE e.status = 'processed'
+  AND e.received_at >= TIMESTAMPTZ '<outage_start>'
+  AND j.id IS NULL;
+```
+
+   Ожидается `0`. Ненулевое значение означает, что часть backlog уже потеряна
+   безвозвратно; дальше — ручная оценка ущерба, а не автоматический replay.
+
+#### Staged fence, если inbox worker нужно остановить
+
+Иногда конвейер надо остановить жёстче, чем это делает невалидный allowlist, —
+например, когда правится не только allowlist. Тогда fence — это
+`EASYWEEK_PROCESSING_ENABLED=false`, а **не** notifications.
+
+1. `EASYWEEK_PROCESSING_ENABLED=false` в `easyweek.env`.
+2. Force-recreate **только** inbox worker, чтобы он гарантированно перестал
+   claim'ить:
+
+```bash
+$COMPOSE up -d --force-recreate altegio-easyweek-inbox-worker
+```
+
+3. `EASYWEEK_NOTIFICATIONS_ENABLED` **остаётся `true`** и на этом шаге не
+   трогается.
+4. Исправить allowlist и проверить его одноразовым контейнером из шага 3
+   штатного восстановления.
+5. Пересоздать потребителей с валидной конфигурацией:
+
+```bash
+$COMPOSE up -d --force-recreate \
+  altegio-easyweek-inbox-worker altegio-outbox-worker
+```
+
+6. Вернуть `EASYWEEK_PROCESSING_ENABLED=true`.
+7. Ещё раз force-recreate inbox worker:
+
+```bash
+$COMPOSE up -d --force-recreate altegio-easyweek-inbox-worker
+```
+
+**Инвариант обоих вариантов:** при наличии captured backlog не должно
+существовать ни одного окна, в котором inbox worker работает с
+`EASYWEEK_PROCESSING_ENABLED=true` и `EASYWEEK_NOTIFICATIONS_ENABLED=false`.
+Именно эта пара молча превращает captured события в `processed` без jobs.
+
+#### Domain-only drain — НЕОБРАТИМАЯ операция, не восстановление
+
+`EASYWEEK_PROCESSING_ENABLED=true` вместе с
+`EASYWEEK_NOTIFICATIONS_ENABLED=false` действительно прогоняет captured backlog
+и обновляет `Client`/`Record`. Но lifecycle jobs при этом не создаются, а
+события становятся терминальными. **Это не безопасное восстановление и не
+подготовительный шаг к нему.**
+
+Операция допустима, только если оператор осознанно решил **отказаться** от
+клиентских уведомлений за этот период — например, backlog устарел настолько,
+что подтверждение записи, которая уже прошла, только запутает клиента.
+
+Прежде чем её выполнять, обязательно:
+
+1. Подсчитать затрагиваемый backlog — сколько уведомлений будет потеряно:
+
+```sql
+SELECT count(*) AS captured_backlog
+FROM easyweek_events
+WHERE status = 'captured';
+```
+
+2. Явно подтвердить отказ от этих уведомлений — с тем, кто отвечает за
+   клиентскую коммуникацию, а не в одиночку.
+3. Понимать, что **автоматического replay после `processed` не существует**:
+   ни исправление allowlist, ни повторное включение notifications, ни
+   пересоздание воркеров эти уведомления не вернут. Единственный способ —
+   ручная работа с клиентами.
+
+Если хотя бы один из трёх пунктов не выполнен — используйте штатное
+восстановление выше.
 
 Отдельный production follow-up до любого ослабления count gate: создать одну
 контролируемую смешанную multi-service booking, сохранить безопасный реальный
