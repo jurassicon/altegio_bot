@@ -26,6 +26,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from altegio_bot.easyweek_normalizer import easyweek_job_dedupe_key
 from altegio_bot.models.models import PROVIDER_EASYWEEK, EasyWeekEvent, MessageJob, OutboxMessage, Record
 from altegio_bot.scripts.easyweek_recovery_audit import (
+    OUTBOX_DELIVERED_STATUSES,
+    OUTBOX_PENDING_STATUSES,
     SmokeVerificationError,
     audit_recovery,
     expected_job_type,
@@ -500,7 +502,7 @@ async def _smoke_with_outbox(
     return result["events"][0]  # type: ignore[index,return-value]
 
 
-@pytest.mark.parametrize("status", ["sent", "delivered", "read"])
+@pytest.mark.parametrize("status", ["delivered", "read"])
 async def test_a_single_landed_outbox_row_proves_delivery(
     session_maker: async_sessionmaker[AsyncSession],
     status: str,
@@ -513,12 +515,17 @@ async def test_a_single_landed_outbox_row_proves_delivery(
     assert event["outbox_status_counts"] == {status: 1}
 
 
-@pytest.mark.parametrize("status", ["queued", "sending"])
+@pytest.mark.parametrize("status", ["queued", "sending", "sent"])
 async def test_an_unfinished_outbox_row_is_pending_not_proven(
     session_maker: async_sessionmaker[AsyncSession],
     status: str,
 ) -> None:
-    """The operator must wait and re-run the audit, not call the smoke green."""
+    """The operator must wait and re-run the audit, not call the smoke green.
+
+    `sent` belongs here, not with the proven statuses: it means Meta accepted
+    the message, and a `failed` callback can still arrive afterwards and flip
+    the row — see the runtime tuple this module imports.
+    """
     event = await _smoke_with_outbox(session_maker, lambda job_id: _outbox(job_id, status))
 
     assert event["outbox_rows"] == 1, "the row exists — which is exactly why a count proves nothing"
@@ -602,3 +609,62 @@ async def test_the_outbox_fields_leak_no_recipient_or_body(
     rendered = str(event)
     for leaked in ("+490000000000", "wamid.smoke", "record_created:", str(FRESH_BOOKING), "fresh"):
         assert leaked not in rendered, f"the smoke report must not surface {leaked}"
+
+
+async def test_sent_is_provider_accepted_but_never_proven_delivery(
+    session_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """The distinction the whole status fix exists for."""
+    event = await _smoke_with_outbox(session_maker, lambda job_id: _outbox(job_id, "sent"))
+
+    assert event["outbox_rows"] == 1
+    assert event["outbox_provider_accepted"] is True, "Meta took it — worth reporting"
+    assert event["outbox_delivery_proven"] is False, "but the customer has not been proven to receive it"
+    assert event["outbox_outcome"] == "pending"
+
+
+async def test_a_sent_row_that_later_failed_is_not_green(
+    session_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """Exactly the sequence that made `sent` unsafe as proof.
+
+    Meta accepted the message, a late `failed` callback arrived, the row moved
+    to `failed` and a delivery retry was scheduled. Had the audit frozen its
+    verdict at `sent`, the smoke would have been called green.
+    """
+    event = await _smoke_with_outbox(
+        session_maker,
+        lambda job_id: _outbox(job_id, "failed", sent_at=SMOKE_START, provider_message_id="wamid.late-fail"),
+    )
+
+    assert event["outbox_delivery_proven"] is False
+    assert event["outbox_outcome"] == "not_green"
+
+
+async def test_several_delivered_rows_are_still_not_green(
+    session_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """Two confirmed deliveries for one controlled booking is a finding."""
+    event = await _smoke_with_outbox(
+        session_maker,
+        lambda job_id: _outbox(job_id, "delivered"),
+        lambda job_id: _outbox(job_id, "delivered"),
+    )
+
+    assert event["outbox_rows"] == 2
+    assert event["outbox_delivery_proven"] is False
+    assert event["outbox_outcome"] == "not_green"
+
+
+def test_the_proven_statuses_are_the_runtime_successful_delivery_statuses() -> None:
+    """The anti-drift binding, so the audit cannot fall behind the worker.
+
+    If someone adds a status to the runtime tuple, this module picks it up;
+    if someone widens the audit by hand, this test rejects it.
+    """
+    from altegio_bot.workers.whatsapp_inbox_worker import _SUCCESSFUL_DELIVERY_STATUSES
+
+    assert OUTBOX_DELIVERED_STATUSES == frozenset(_SUCCESSFUL_DELIVERY_STATUSES)
+    assert "sent" not in OUTBOX_DELIVERED_STATUSES
+    assert "sent" in OUTBOX_PENDING_STATUSES
+    assert not (OUTBOX_DELIVERED_STATUSES & OUTBOX_PENDING_STATUSES)

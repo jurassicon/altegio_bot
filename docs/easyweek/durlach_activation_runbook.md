@@ -754,16 +754,38 @@ ORDER BY status;
    ли оператор закончить deploy быстрее неё.
 
 ```bash
-$COMPOSE stop altegio-whatsapp-inbox-worker
+$COMPOSE stop -t 300 altegio-whatsapp-inbox-worker
 ```
 
+   `-t 300` обязателен и соответствует `stop_grace_period: 5m` в
+   `docker-compose.yml`. Worker обрабатывает SIGTERM: новый batch он больше не
+   claim'ит, но уже закоммиченный `received -> processing` batch дорабатывает
+   до конца. Дефолтные 10 секунд убили бы его в середине batch, а восстановить
+   такие строки нечем — обычный claim берёт только `received`, а
+   `recover_stale_processing_events` покрывает только Chatwoot operator-relay.
+
    Что именно останавливается: `altegio-api` продолжает принимать вебхуки Meta
-   и сохранять их в `whatsapp_events`, ничего не теряется. Приостановлена
-   только обработка inbound-сообщений и status-callbacks — до шага 11. Это
-   общий для всех филиалов worker, поэтому пауза затрагивает и Altegio-трафик:
-   входящие сообщения и статусы Карлсруэ и Раштата будут разобраны после
-   возобновления, с задержкой на длительность rollout. Это цена корректности,
-   а не побочный эффект.
+   и сохранять их в `whatsapp_events` со статусом `received`, ничего не
+   теряется. Приостановлена только обработка inbound-сообщений и
+   status-callbacks — до шага 12. Это общий для всех филиалов worker, поэтому
+   пауза затрагивает и Altegio-трафик: входящие сообщения и статусы Карлсруэ и
+   Раштата будут разобраны после возобновления, с задержкой на длительность
+   rollout. Это цена корректности, а не побочный эффект.
+
+   Обязательный gate после остановки — обычных событий в `processing` быть не
+   должно:
+
+```sql
+SELECT count(*) AS stranded_processing
+FROM whatsapp_events
+WHERE status = 'processing';
+```
+
+   Ожидается `0`. Ненулевое значение — **STOP**: worker не успел дренировать
+   batch. Разбирать такие строки нужно поштучно. Массовый
+   `UPDATE processing -> received` делать нельзя: для обычных webhook events
+   безопасность повторного side effect не доказана, и replay может отправить
+   сообщение повторно.
 
 5. Только теперь — финальный queue gate. Producer закрыт, поэтому пустая
    очередь останется пустой:
@@ -895,7 +917,7 @@ $COMPOSE run --rm --no-deps \
    | `job_statuses` | одно объяснимое значение: `queued`, `processing`, `done` либо terminal по штатному deadline |
    | `outbox_rows` | ровно `1` |
    | `outbox_delivery_proven` | `true` |
-   | `outbox_status_counts` | единственный статус из `sent`, `delivered`, `read` |
+   | `outbox_status_counts` | единственный статус из `delivered` или `read` |
 
    **Наличие Outbox-строки и успешная отправка — разные доказательства.**
    `outbox_rows=1` доказывает только то, что planner и фильтр PR-7.1
@@ -905,10 +927,17 @@ $COMPOSE run --rm --no-deps \
 
    | `outbox_outcome` | Статусы | Что делать |
    | --- | --- | --- |
-   | `proven` | `sent`, `delivered`, `read` | smoke зелёный |
-   | `pending` | `queued`, `sending` | ещё не завершено — подождать и повторить audit |
+   | `proven` | `delivered`, `read` | smoke зелёный |
+   | `pending` | `queued`, `sending`, `sent` | ещё не завершено — подождать и повторить audit |
    | `not_green` | `failed`, `unknown`, либо более одной строки | **STOP** |
    | `none` | строк нет | ожидаемо для disallowed |
+
+   **`sent` не является доказательством доставки.** Он означает только, что
+   Meta приняла сообщение; после него ещё может прийти `failed`, строка
+   перейдёт в `failed` и будет создан delivery retry. Поэтому `sent` — это
+   `pending` (в отчёте виден отдельно как `outbox_provider_accepted=true`), и
+   зелёными считаются только `delivered` и `read`, ровно как в runtime
+   (`_SUCCESSFUL_DELIVERY_STATUSES`).
 
    `sent_at` или `provider_message_id` сами по себе `failed`/`unknown` в успех
    не превращают: оба поля остаются на строке отклонённой попытки. Если
@@ -1184,9 +1213,11 @@ $COMPOSE run --rm --no-deps \
    объяснимый `job_statuses`, `outbox_rows=1` и
    `outbox_delivery_proven=true`. Новая exact job, созданная после
    `<smoke_start>`, доказывает, что planner и фильтр снова работают; успешную
-   отправку доказывает отдельно статус Outbox — единственный из `sent`,
-   `delivered`, `read`. `outbox_rows` сам по себе доказательством отправки не
-   является: строка существует и в `queued`, и в `failed`. `queued`/`sending`
+   отправку доказывает отдельно статус Outbox — единственный из `delivered` или
+   `read`. `outbox_rows` сам по себе доказательством отправки не
+   является: строка существует и в `queued`, и в `sent`, и в `failed`. `sent`
+   означает лишь приём сообщения на стороне Meta — после него ещё может прийти
+   `failed`, поэтому он тоже `pending`. `queued`/`sending`/`sent`
    (`outbox_outcome=pending`) — повторить audit позже; `failed`/`unknown` или
    более одной строки (`not_green`) — **STOP**, затем новая контролируемая
    booking с новым UUID.

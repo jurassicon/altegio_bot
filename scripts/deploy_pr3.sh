@@ -1030,8 +1030,103 @@ if [ "$PR3_TRANSITION" -eq 1 ]; then
   remove_stopped_canary
 fi
 
-echo "🚀 Starting updated containers..."
-$COMPOSE up -d --remove-orphans
+# ── Ordered start: the delivery-retry producer goes LAST ──────────────
+#
+# `altegio-whatsapp-inbox-worker` is the second producer of EasyWeek
+# lifecycle jobs. `_handle_failed_delivery_status` turns a late Meta
+# `failed` callback into a `provider='easyweek'` delivery-retry job of type
+# record_created / record_updated / record_canceled, gated only by
+# OUTBOX_DELIVERY_RETRY_ENABLED — it reads neither EasyWeek flag. If it
+# comes up alongside a not-yet-verified outbox, that retry can be claimed
+# by the OLD outbox image, the one without the PR-7.1 send-time category
+# guard, and a message for a disallowed category goes out.
+#
+# So it is held at zero replicas through the global reconciliation and
+# started only after the new outbox is proven running on the image this
+# deploy just built. Compose service order, `depends_on` without a health
+# gate and sleeps prove nothing here — container id, state, restart count
+# and image id are checked explicitly instead.
+echo "🚀 Starting updated containers (delivery-retry producer held back)..."
+$COMPOSE up -d --remove-orphans --scale altegio-whatsapp-inbox-worker=0
+
+echo "🚀 Recreating altegio-outbox-worker from the new image..."
+$COMPOSE up -d --force-recreate altegio-outbox-worker
+
+# The image Compose resolves for THIS service. `config --images <svc>` also
+# lists the images of its dependencies and the order is not guaranteed, so
+# the service's own build tag is selected by name rather than by position.
+OUTBOX_IMAGE_REF="$($COMPOSE config --images altegio-outbox-worker | grep -F 'altegio-outbox-worker' | head -n 1)"
+if [ -z "$OUTBOX_IMAGE_REF" ]; then
+  echo "❌ Cannot resolve the Compose image for altegio-outbox-worker."
+  exit 1
+fi
+OUTBOX_IMAGE_EXPECTED="$(docker image inspect -f '{{.Id}}' "$OUTBOX_IMAGE_REF" 2>/dev/null || true)"
+if [ -z "$OUTBOX_IMAGE_EXPECTED" ]; then
+  echo "❌ Cannot inspect the freshly built outbox image."
+  exit 1
+fi
+
+OUTBOX_IDS="$($COMPOSE ps -q altegio-outbox-worker)"
+OUTBOX_COUNT="$(printf '%s\n' "$OUTBOX_IDS" | grep -c '[0-9a-f]' || true)"
+OUTBOX_ID="$(printf '%s\n' "$OUTBOX_IDS" | head -n 1)"
+
+if [ -z "$OUTBOX_ID" ] || [ "$OUTBOX_COUNT" != "1" ]; then
+  echo "❌ Expected exactly one altegio-outbox-worker container, got '${OUTBOX_COUNT:-0}'."
+  exit 1
+fi
+if [ "$(container_field "$OUTBOX_ID" '{{index .Config.Labels "com.docker.compose.oneoff"}}')" = "True" ]; then
+  echo "❌ The resolved outbox container is a one-off, not the Compose service container."
+  exit 1
+fi
+
+# Give the worker a bounded window to reach `running` with no restarts. This
+# is a readiness POLL with an explicit failure, not a sleep used as proof.
+OUTBOX_ATTEMPTS=0
+OUTBOX_MAX_ATTEMPTS=30
+until [ $OUTBOX_ATTEMPTS -ge $OUTBOX_MAX_ATTEMPTS ]; do
+  OUTBOX_STATE="$(container_field "$OUTBOX_ID" '{{.State.Status}}')"
+  OUTBOX_RESTARTS="$(container_field "$OUTBOX_ID" '{{.RestartCount}}')"
+  if [ "$OUTBOX_STATE" = "running" ] && [ "${OUTBOX_RESTARTS:-0}" = "0" ]; then
+    break
+  fi
+  if [ "$OUTBOX_STATE" = "exited" ] || [ "${OUTBOX_RESTARTS:-0}" != "0" ]; then
+    echo "❌ New outbox worker is '${OUTBOX_STATE:-missing}' with ${OUTBOX_RESTARTS:-?} restart(s) — crash loop."
+    exit 1
+  fi
+  OUTBOX_ATTEMPTS=$((OUTBOX_ATTEMPTS + 1))
+  sleep 1
+done
+
+OUTBOX_STATE="$(container_field "$OUTBOX_ID" '{{.State.Status}}')"
+OUTBOX_RESTARTS="$(container_field "$OUTBOX_ID" '{{.RestartCount}}')"
+OUTBOX_IMAGE_ACTUAL="$(container_field "$OUTBOX_ID" '{{.Image}}')"
+
+if [ "$OUTBOX_STATE" != "running" ]; then
+  echo "❌ New outbox worker is '${OUTBOX_STATE:-missing}', expected running."
+  exit 1
+fi
+if [ "${OUTBOX_RESTARTS:-0}" != "0" ]; then
+  echo "❌ New outbox worker restarted ${OUTBOX_RESTARTS} time(s) — crash loop."
+  exit 1
+fi
+if [ "$OUTBOX_IMAGE_ACTUAL" != "$OUTBOX_IMAGE_EXPECTED" ]; then
+  echo "❌ The outbox worker does not run the image this deploy just built."
+  exit 1
+fi
+
+echo "✅ New outbox worker running ($OUTBOX_ID) on the freshly built image."
+
+# Only now: any late status callback can create a retry, and the guarded
+# outbox is the one that will claim it.
+echo "🚀 Starting the delivery-retry producer (altegio-whatsapp-inbox-worker)..."
+$COMPOSE up -d altegio-whatsapp-inbox-worker
+
+WA_WORKER_ID="$($COMPOSE ps -q altegio-whatsapp-inbox-worker | head -n 1)"
+if [ -z "$WA_WORKER_ID" ] || ! container_is_running "$WA_WORKER_ID"; then
+  echo "❌ altegio-whatsapp-inbox-worker did not start after the outbox was verified."
+  exit 1
+fi
+echo "✅ Delivery-retry producer started ($WA_WORKER_ID), after the guarded outbox."
 
 # The follow-up worker is NOT attached to the Chatwoot network (it only
 # claims due campaign runs and creates MessageJob rows — no Chatwoot API

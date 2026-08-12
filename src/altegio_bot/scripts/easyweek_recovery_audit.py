@@ -50,6 +50,7 @@ from altegio_bot.models.models import (
     Record,
 )
 from altegio_bot.workers.easyweek_inbox_worker import _ACTION_TO_JOB_TYPE
+from altegio_bot.workers.whatsapp_inbox_worker import _SUCCESSFUL_DELIVERY_STATUSES
 
 
 def expected_job_type(event_hint: str | None) -> str | None:
@@ -213,12 +214,20 @@ class SmokeVerificationError(RuntimeError):
     """Fail-closed: the smoke cannot be judged, so it is not green."""
 
 
-# A provider attempt that actually landed. `sent` is the first status that
-# proves Meta accepted the message; `delivered`/`read` are later stages of the
-# same success and must not be treated as regressions.
-OUTBOX_DELIVERED_STATUSES: Final[frozenset[str]] = frozenset({"sent", "delivered", "read"})
-# Not finished yet: re-run the audit rather than judging the smoke.
-OUTBOX_PENDING_STATUSES: Final[frozenset[str]] = frozenset({"queued", "sending"})
+# Delivery to the customer, as the runtime defines it. Taken FROM the runtime
+# tuple rather than restated, so the audit cannot drift from the worker that
+# actually interprets Meta status callbacks.
+#
+# `sent` is deliberately NOT here. It means Meta accepted the message, nothing
+# more: a `failed` callback can still arrive afterwards, flip the Outbox row to
+# `failed` and schedule a delivery retry. Treating `sent` as proof would call a
+# smoke green while the customer never received anything.
+OUTBOX_DELIVERED_STATUSES: Final[frozenset[str]] = frozenset(_SUCCESSFUL_DELIVERY_STATUSES)
+# Not finished yet: wait and re-run the audit rather than judging the smoke.
+OUTBOX_PENDING_STATUSES: Final[frozenset[str]] = frozenset({"queued", "sending", "sent"})
+# Accepted by the provider but not yet confirmed delivered — reported for
+# context only; it never turns an outcome green.
+OUTBOX_PROVIDER_ACCEPTED_STATUSES: Final[frozenset[str]] = frozenset({"sent"})
 
 
 @dataclass(frozen=True)
@@ -242,14 +251,20 @@ class SmokeEventReport:
     outbox_status_counts: dict[str, int]
 
     @property
+    def outbox_provider_accepted(self) -> bool:
+        """Meta took the message. Context only — never a green result."""
+        return bool(set(self.outbox_status_counts) & OUTBOX_PROVIDER_ACCEPTED_STATUSES)
+
+    @property
     def outbox_delivery_proven(self) -> bool:
         """One Outbox row that actually reached the provider.
 
         A row COUNT proves the planner ran, nothing more: `queued`, `sending`,
-        `failed` and `unknown` all count as one. Delivery is proven only by a
-        status in :data:`OUTBOX_DELIVERED_STATUSES`, and only when the smoke
-        produced the single row it was supposed to — several rows mean the
-        chain did something unplanned and needs reading, not a green tick.
+        `sent`, `failed` and `unknown` all count as one. Delivery is proven only
+        by a status in :data:`OUTBOX_DELIVERED_STATUSES` — which excludes
+        `sent`, since a `failed` callback can still follow it — and only when
+        the smoke produced the single row it was supposed to. Several rows mean
+        the chain did something unplanned and needs reading, not a green tick.
         """
         if self.outbox_rows != 1:
             return False
@@ -285,6 +300,7 @@ class SmokeEventReport:
             "job_record_matches_booking": self.job_record_matches_booking,
             "outbox_rows": self.outbox_rows,
             "outbox_status_counts": dict(sorted(self.outbox_status_counts.items())),
+            "outbox_provider_accepted": self.outbox_provider_accepted,
             "outbox_delivery_proven": self.outbox_delivery_proven,
             "outbox_outcome": self.outbox_outcome,
         }

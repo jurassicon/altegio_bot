@@ -16,6 +16,7 @@ invariants — deliberately not the full prose.
 from __future__ import annotations
 
 import inspect
+import re
 import uuid
 from pathlib import Path
 
@@ -646,7 +647,7 @@ def test_the_retry_producer_is_stopped_before_the_final_queue_gate() -> None:
     """A queue read while the producer runs is a snapshot, not a fence."""
     rollout = _rollout()
 
-    stop = _first_instruction_offset(rollout, "stop altegio-whatsapp-inbox-worker")
+    stop = _first_instruction_offset(rollout, "stop -t 300 altegio-whatsapp-inbox-worker")
     final_gate = rollout.index("Только теперь — финальный queue gate")
 
     assert stop < final_gate, "the producer must be closed before the queue is declared empty"
@@ -742,7 +743,54 @@ def test_the_disallowed_gate_stays_absence_based() -> None:
 
 
 def test_the_delivered_statuses_are_taken_from_the_audit_module() -> None:
-    """Document and code must not drift on what counts as delivered."""
-    assert OUTBOX_DELIVERED_STATUSES == frozenset({"sent", "delivered", "read"})
-    assert OUTBOX_PENDING_STATUSES == frozenset({"queued", "sending"})
+    """Document and code must not drift on what counts as delivered.
+
+    `sent` is provider acceptance only — a `failed` callback can still follow
+    it — so it belongs with the pending statuses, matching the runtime tuple.
+    """
+    from altegio_bot.workers.whatsapp_inbox_worker import _SUCCESSFUL_DELIVERY_STATUSES
+
+    assert OUTBOX_DELIVERED_STATUSES == frozenset({"delivered", "read"})
+    assert OUTBOX_DELIVERED_STATUSES == frozenset(_SUCCESSFUL_DELIVERY_STATUSES)
+    assert OUTBOX_PENDING_STATUSES == frozenset({"queued", "sending", "sent"})
     assert not (OUTBOX_DELIVERED_STATUSES & OUTBOX_PENDING_STATUSES)
+
+
+def test_no_smoke_gate_accepts_sent_as_final_delivery_proof() -> None:
+    """`sent` may appear, but never as the green status."""
+    for section in (_section(_rollout(), SMOKE_HEADING), _section(_runbook(), LEVEL_B_HEADING)):
+        assert "`sent`, `delivered`, `read`" not in section, "sent must not be listed among proven statuses"
+        assert "не является доказательством доставки" in section or "тоже `pending`" in section
+        assert "delivered" in section and "read" in section
+
+
+def test_the_rollout_proves_no_stranded_processing_events_before_deploy() -> None:
+    """The drain has to be verified, not assumed, after the stop."""
+    rollout = _rollout()
+
+    stop = _first_instruction_offset(rollout, "stop -t 300 altegio-whatsapp-inbox-worker")
+    gate = rollout.index("stranded_processing")
+    deploy = rollout.index("Развернуть новый код")
+
+    assert stop < gate < deploy, "the processing gate belongs between the stop and the deploy"
+    assert "FROM whatsapp_events" in rollout
+    assert "STOP" in rollout[gate : gate + 800]
+    # Bulk revival of ordinary webhook events is not proven safe to replay.
+    assert "UPDATE processing -> received" in rollout or "UPDATE processing" in rollout
+    for block in _code_blocks(rollout):
+        assert "UPDATE whatsapp_events" not in block
+
+
+def test_the_stop_timeout_matches_the_compose_grace_period() -> None:
+    """A shorter `-t` than the grace period would SIGKILL a draining batch."""
+    import yaml
+
+    rollout = _rollout()
+    service = yaml.safe_load((REPO_ROOT / "docker-compose.yml").read_text())["services"][
+        "altegio-whatsapp-inbox-worker"
+    ]
+    grace_minutes = int(str(service["stop_grace_period"]).rstrip("m"))
+
+    match = re.search(r"stop -t (\d+) altegio-whatsapp-inbox-worker", rollout)
+    assert match is not None, "the runbook must stop the worker with an explicit timeout"
+    assert int(match.group(1)) >= grace_minutes * 60, "the runbook timeout must cover the drain window"

@@ -7,7 +7,7 @@ from typing import Any
 
 from altegio_bot.providers.dummy import DummyProvider
 from altegio_bot.providers.meta_cloud import MetaCloudProvider
-from altegio_bot.workers.whatsapp_inbox_worker import run_loop
+from altegio_bot.workers.whatsapp_inbox_worker import run_with_graceful_shutdown
 
 
 def _build_provider() -> Any:
@@ -33,7 +33,7 @@ async def _amain() -> None:
     provider = _build_provider()
 
     try:
-        await run_loop(provider=provider)
+        await run_with_graceful_shutdown(provider)
     finally:
         aclose = getattr(provider, "aclose", None)
         if callable(aclose):

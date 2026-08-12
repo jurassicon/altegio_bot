@@ -945,3 +945,129 @@ def test_safety_guarantees_survived_the_move() -> None:
         "clock_timestamp()",
     ):
         assert guarantee in script, f"the extraction lost {guarantee!r}"
+
+
+# ---------------------------------------------------------------------------
+# PR-7.1: the delivery-retry producer starts LAST
+# ---------------------------------------------------------------------------
+#
+# `altegio-whatsapp-inbox-worker` is the second producer of EasyWeek lifecycle
+# jobs: `_handle_failed_delivery_status` turns a late Meta `failed` callback
+# into a `provider='easyweek'` retry, gated only by
+# OUTBOX_DELIVERY_RETRY_ENABLED. A bare `up -d --remove-orphans` started it in
+# the same breath as the outbox update, so that retry could be claimed by the
+# OLD outbox image — the one without the send-time category guard.
+#
+# These read the real deploy script and the real workflow, not the runbook.
+
+WHATSAPP_SERVICE = "altegio-whatsapp-inbox-worker"
+OUTBOX_SERVICE = "altegio-outbox-worker"
+
+
+def _global_up_offset(script: str) -> int:
+    match = re.search(r"^\$COMPOSE up -d --remove-orphans.*$", script, re.MULTILINE)
+    assert match is not None, "the deploy must still perform a global reconciliation"
+    return match.start()
+
+
+def test_the_global_reconciliation_holds_the_retry_producer_at_zero() -> None:
+    """`up -d --remove-orphans` must not be what starts the producer."""
+    script = _deploy_script()
+    match = re.search(r"^\$COMPOSE up -d --remove-orphans.*$", script, re.MULTILINE)
+    assert match is not None
+
+    assert f"--scale {WHATSAPP_SERVICE}=0" in match.group(0), (
+        "the global up must hold the delivery-retry producer at zero replicas"
+    )
+
+
+def test_the_new_outbox_is_recreated_and_verified_before_the_producer_starts() -> None:
+    script = _deploy_script()
+
+    global_up = _global_up_offset(script)
+    outbox_recreate = script.index(f"up -d --force-recreate {OUTBOX_SERVICE}", global_up)
+    outbox_verified = script.index("New outbox worker running", outbox_recreate)
+    producer_start = script.index(f"$COMPOSE up -d {WHATSAPP_SERVICE}", global_up)
+
+    assert global_up < outbox_recreate < outbox_verified < producer_start, (
+        "order must be: global up (producer held) -> recreate outbox -> verify outbox -> start producer"
+    )
+
+
+def test_no_command_starts_the_whatsapp_worker_before_the_outbox_is_verified() -> None:
+    """Exhaustive: every command that could start the service, in order."""
+    script = _deploy_script()
+    outbox_verified = script.index("New outbox worker running")
+
+    starters: list[int] = []
+    for match in re.finditer(r"^\s*\$COMPOSE (up|start|restart)\b[^\n]*$", script, re.MULTILINE):
+        line = match.group(0)
+        if f"--scale {WHATSAPP_SERVICE}=0" in line:
+            continue  # explicitly held down
+        if WHATSAPP_SERVICE in line:
+            starters.append(match.start())
+            continue
+        # A service-less `up` starts EVERYTHING, including the producer — the
+        # original defect. Naming no service is not the same as touching none.
+        if re.fullmatch(r"\s*\$COMPOSE up -d(\s+--[\w-]+)*\s*", line):
+            starters.append(match.start())
+
+    assert starters, "the producer must be started somewhere"
+    for offset in starters:
+        assert offset > outbox_verified, "nothing may start the retry producer before the outbox is verified"
+
+
+def test_the_outbox_check_proves_image_state_and_restarts_not_a_sleep() -> None:
+    """Readiness is asserted from container facts, never from elapsed time."""
+    script = _deploy_script()
+    start = script.index(f"up -d --force-recreate {OUTBOX_SERVICE}")
+    end = script.index(f"$COMPOSE up -d {WHATSAPP_SERVICE}", start)
+    block = script[start:end]
+
+    assert "OUTBOX_IMAGE_EXPECTED" in block and "OUTBOX_IMAGE_ACTUAL" in block
+    assert "{{.State.Status}}" in block
+    assert "{{.RestartCount}}" in block
+    assert "com.docker.compose.oneoff" in block
+    # A sleep may pace a bounded poll, but the verdict comes from the checks.
+    assert "does not run the image this deploy just built" in block
+
+
+def test_a_failed_outbox_check_exits_without_starting_the_producer() -> None:
+    script = _deploy_script()
+    start = script.index(f"up -d --force-recreate {OUTBOX_SERVICE}")
+    end = script.index(f"$COMPOSE up -d {WHATSAPP_SERVICE}", start)
+    block = script[start:end]
+
+    assert block.count("exit 1") >= 5, "every outbox failure mode must abort the deploy"
+    assert script.startswith("#!/usr/bin/env bash")
+    assert "set -Eeuo pipefail" in script, "an unchecked command must not be able to continue the deploy"
+
+
+def test_the_producer_service_name_is_a_real_compose_service() -> None:
+    services = yaml.safe_load(COMPOSE_FILE.read_text())["services"]
+
+    for name in (WHATSAPP_SERVICE, OUTBOX_SERVICE):
+        assert name in services, f"{name} is not a real compose service"
+
+
+def test_the_workflow_actually_hands_over_to_this_script() -> None:
+    """The ordering is only real if the workflow runs this file."""
+    step = _bootstrap_step()
+    script = str(step["with"]["script"])
+
+    assert DEPLOY_SCRIPT_PATH in script
+    # And the workflow must not re-run a bare global up of its own afterwards.
+    for other in _deploy_steps():
+        body = str(other.get("with", {}).get("script", "")) + str(other.get("run", ""))
+        if DEPLOY_SCRIPT_PATH in body:
+            continue
+        assert "up -d" not in body, "no later workflow step may re-start services out of order"
+
+
+def test_the_whatsapp_worker_has_a_drain_grace_period() -> None:
+    """SIGTERM must be able to finish a claimed batch before SIGKILL."""
+    service = yaml.safe_load(COMPOSE_FILE.read_text())["services"][WHATSAPP_SERVICE]
+
+    grace = str(service.get("stop_grace_period", ""))
+    assert grace, f"{WHATSAPP_SERVICE} needs stop_grace_period for the drain"
+    assert grace.endswith("m") and int(grace.rstrip("m")) >= 1, f"grace period too short: {grace}"
