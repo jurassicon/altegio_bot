@@ -15,10 +15,13 @@ invariants — deliberately not the full prose.
 
 from __future__ import annotations
 
+import uuid
 from pathlib import Path
 
 import pytest
 
+from altegio_bot.easyweek_normalizer import easyweek_job_dedupe_key
+from altegio_bot.scripts.easyweek_recovery_audit import expected_job_type
 from altegio_bot.settings import settings
 from altegio_bot.workers.easyweek_inbox_worker import processing_is_configured
 
@@ -34,6 +37,8 @@ VALID_LOCATION_MAP = (
 
 RECOVERY_HEADING = "### Восстановление после invalid/unconfigured allowlist"
 NORMAL_HEADING = "#### Штатное восстановление"
+LEVEL_A_HEADING = "##### Уровень A"
+LEVEL_B_HEADING = "##### Уровень B"
 STAGED_HEADING = "#### Staged fence, если inbox worker нужно остановить"
 DRAIN_HEADING = "#### Domain-only drain"
 # The recovery region ends where the pre-existing §6 prose resumes. Bounding it
@@ -166,7 +171,6 @@ def test_normal_recovery_preserves_captured_backlog() -> None:
     # No destructive recovery: the backlog is evidence, not something to clear.
     for forbidden in ("UPDATE easyweek_events", "DELETE FROM easyweek_events", "DELETE FROM message_jobs"):
         assert forbidden not in normal
-    assert "processed_without_job" in normal, "recovery must prove jobs appeared, not just that events drained"
 
 
 def test_the_one_shot_validation_does_not_start_the_inbox_loop() -> None:
@@ -175,6 +179,164 @@ def test_the_one_shot_validation_does_not_start_the_inbox_loop() -> None:
     assert "run --rm --no-deps" in normal
     assert "--entrypoint" in normal
     assert "run_easyweek_inbox_worker" not in normal, "config validation must not invoke the worker entrypoint"
+
+
+def test_recovery_does_not_require_jobs_to_stay_queued_or_processing() -> None:
+    """After recovery, `done`, a retry or a deadline-driven terminal is normal.
+
+    The old wording ("queued/processing must survive to the end") would have an
+    operator escalate on a successfully delivered notification.
+    """
+    normal = _section(_runbook(), NORMAL_HEADING)
+
+    assert "обязаны сохраниться до конца" not in normal
+    assert "существование job и объяснимый terminal/retry исход" in normal
+    for status in ("done", "canceled"):
+        assert status in normal, "the doc must name the terminal statuses that are legitimate after recovery"
+
+
+# ---------------------------------------------------------------------------
+# Post-recovery audit: per delivery, never per booking
+# ---------------------------------------------------------------------------
+
+
+def test_recovery_has_no_global_processed_without_job_invariant() -> None:
+    """The regression this second contract exists for.
+
+    `processed_without_job = 0` was never a production invariant: it is false
+    green when a stale job covers a dropped delivery, and false alarm for every
+    legitimately suppressed one.
+    """
+    recovery = _runbook()
+
+    assert "processed_without_job" not in recovery
+    for claim in ("Ожидается `0`", "должно быть 0", "равно нулю"):
+        assert claim not in recovery
+
+
+def test_the_audit_never_links_an_event_to_a_job_through_the_record() -> None:
+    """Forbidden as proof: record_id, booking_uuid, company_id, job_type, time.
+
+    Any of them can be satisfied by an unrelated older job for the same booking.
+    """
+    recovery = _runbook()
+
+    for broad_join in (
+        "j.record_id = r.id",
+        "j.record_id=r.id",
+        "ON j.record_id",
+        "AND j.record_id",
+        "easyweek_booking_uuid = e.booking_uuid",
+    ):
+        assert broad_join not in recovery, f"a job may not be matched to an event by {broad_join}"
+
+
+def test_the_audit_uses_the_production_dedupe_key_helper() -> None:
+    """Never a second SHA-256 implementation — it would rot out of sync."""
+    audit = _section(_runbook(), LEVEL_A_HEADING) + _section(_runbook(), LEVEL_B_HEADING)
+
+    assert "easyweek_job_dedupe_key" in audit
+    assert "altegio_bot.scripts.easyweek_recovery_audit" in audit
+    for block in _code_blocks(audit):
+        assert "sha256" not in block.lower(), "the audit must import the key function, not restate the digest"
+
+
+def test_a_stale_job_for_the_same_record_cannot_answer_for_a_new_delivery() -> None:
+    """Bound to runtime: the key separates what the record_id join conflated."""
+    booking = uuid.UUID("aaaaaaaa-bbbb-4ccc-8ddd-000000000009")
+
+    created = easyweek_job_dedupe_key(
+        event_hint="booking-created", booking_uuid=booking, payload_hash="hash-a", job_type="record_created"
+    )
+    updated = easyweek_job_dedupe_key(
+        event_hint="booking-updated", booking_uuid=booking, payload_hash="hash-b", job_type="record_updated"
+    )
+
+    assert created != updated, "an old record_created job must never satisfy a booking-updated check"
+
+
+def test_the_documented_mapping_matches_the_runtime_mapping() -> None:
+    """booking-updated and booking-rescheduled share a job type, not an identity."""
+    assert expected_job_type("booking-created") == "record_created"
+    assert expected_job_type("booking-updated") == "record_updated"
+    assert expected_job_type("booking-rescheduled") == "record_updated"
+    assert expected_job_type("booking-canceled") == "record_canceled"
+    assert expected_job_type("booking-succeeded") is None, "booking-succeeded owes no lifecycle job"
+
+    # Same job_type, different payload -> different expected key, still separate.
+    booking = uuid.UUID("aaaaaaaa-bbbb-4ccc-8ddd-000000000010")
+    keys = {
+        easyweek_job_dedupe_key(
+            event_hint=hint, booking_uuid=booking, payload_hash=payload_hash, job_type="record_updated"
+        )
+        for hint, payload_hash in (("booking-updated", "h1"), ("booking-rescheduled", "h2"))
+    }
+    assert len(keys) == 2
+
+
+def test_resend_is_documented_as_deduplication_not_loss() -> None:
+    """Byte-identical deliveries share one key and are owed exactly one job."""
+    level_a = _section(_runbook(), LEVEL_A_HEADING)
+
+    assert "resend_groups" in level_a
+    assert "Resend" in level_a
+    assert "дедупликация" in level_a
+
+    # Runtime: identical hint + uuid + payload hash collapse to one key.
+    booking = uuid.UUID("aaaaaaaa-bbbb-4ccc-8ddd-000000000011")
+    kwargs = {
+        "event_hint": "booking-created",
+        "booking_uuid": booking,
+        "payload_hash": "same-hash",
+        "job_type": "record_created",
+    }
+    assert easyweek_job_dedupe_key(**kwargs) == easyweek_job_dedupe_key(**kwargs)
+
+
+def test_booking_succeeded_is_documented_as_owing_no_job() -> None:
+    level_a = _section(_runbook(), LEVEL_A_HEADING)
+
+    assert "non_lifecycle_event_ids" in level_a
+    assert "booking-succeeded" in level_a
+
+
+def test_a_missing_job_is_unclassified_and_not_declared_lost() -> None:
+    """Suppression, no-op, replay and real loss are indistinguishable here.
+
+    `Record.raw` cannot settle it either: a later delivery may have overwritten
+    the snapshot the decision was made against.
+    """
+    level_a = _section(_runbook(), LEVEL_A_HEADING)
+
+    assert "no_event_specific_job_unclassified" in level_a
+    assert "не означает «потеряно»" in level_a
+    for legitimate in ("category_not_allowed", "post-cancel no-op", "already_applied"):
+        assert legitimate in level_a
+    assert "Record.raw" in level_a and "нельзя" in level_a
+
+
+def test_controlled_smoke_proves_both_directions() -> None:
+    """Level B is the only positive proof that the pipeline creates jobs again."""
+    level_b = _section(_runbook(), LEVEL_B_HEADING)
+
+    assert "<allowed_event_id>" in level_b
+    assert "<disallowed_event_id>" in level_b
+    assert "easyweek_job_dedupe_key" in level_b
+    assert "exact_jobs=0" in level_b, "the disallowed smoke must require the ABSENCE of an exact job"
+    assert "ровно одна job" in level_b
+    for field in ("MessageJob.provider", "MessageJob.company_id", "MessageJob.record_id", "MessageJob.job_type"):
+        assert field in level_b
+
+
+def test_the_audit_command_is_read_only_and_leaks_nothing() -> None:
+    audit = _section(_runbook(), LEVEL_A_HEADING) + _section(_runbook(), LEVEL_B_HEADING)
+
+    for block in _code_blocks(audit):
+        assert "run --rm --no-deps" in block or "select(" in block or block.strip().startswith("|")
+        for mutation in ("UPDATE ", "DELETE ", "INSERT ", "replay"):
+            assert mutation not in block, f"the audit must stay read-only, found {mutation}"
+    assert "run_easyweek_inbox_worker" not in audit, "the audit must not start the inbox loop"
+    assert "read-only" in audit
 
 
 # ---------------------------------------------------------------------------

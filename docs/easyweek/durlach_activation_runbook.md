@@ -851,9 +851,18 @@ GROUP BY status
 ORDER BY status;
 ```
 
-   `captured` события и `queued`/`processing` jobs обязаны сохраниться до конца
-   процедуры. Ни удалять их, ни переводить руками в `processed`, ни делать
-   любой другой `UPDATE` production-данных ради восстановления нельзя.
+   Ни удалять эти строки, ни переводить руками в `processed`, ни делать любой
+   другой `UPDATE` production-данных ради восстановления нельзя.
+
+   Что именно обязано сохраниться: до пересоздания сервисов ни один
+   отложенный конфигурацией job не должен исчезнуть из БД или израсходовать
+   попытку Meta из-за невалидного allowlist. **После** восстановления статусы
+   меняться могут и это штатно: outbox доводит job до `done`, retry
+   продолжается, а истёкший штатный delivery deadline законно переводит job в
+   `canceled`/`failed` по существующей политике. Поэтому требование
+   «`queued`/`processing` должны сохраниться до конца процедуры» неверно —
+   проверять надо существование job и объяснимый terminal/retry исход, а не
+   застывший статус.
 
 2. Исправить allowlist в `easyweek.env`, сохранив production-инвариант:
 
@@ -892,28 +901,115 @@ $COMPOSE up -d --force-recreate \
    `processing_is_configured()` снова истинно: сохранённые `captured` события
    штатно берутся в работу и **создают** lifecycle jobs.
 
-5. Подтвердить, что backlog именно восстановился, а не был списан. Повторите
-   оба запроса из шага 1: `captured` убывает, а число EasyWeek lifecycle jobs
-   растёт. Если `captured` ушёл в ноль, а jobs не появились — **STOP**: это
-   признак того, что события были обработаны с выключенными notifications.
+5. Подтвердить результат восстановления. Проверка двухуровневая: уровень A
+   разбирает исторический backlog, уровень B доказывает, что pipeline снова
+   создаёт jobs. Уровень B обязателен — только он является положительным
+   доказательством.
 
-```sql
-SELECT count(*) AS processed_without_job
-FROM easyweek_events e
-LEFT JOIN records r
-       ON r.provider = 'easyweek'
-      AND r.easyweek_booking_uuid = e.booking_uuid
-LEFT JOIN message_jobs j
-       ON j.provider = 'easyweek'
-      AND j.record_id = r.id
-      AND j.job_type IN ('record_created', 'record_updated', 'record_canceled')
-WHERE e.status = 'processed'
-  AND e.received_at >= TIMESTAMPTZ '<outage_start>'
-  AND j.id IS NULL;
+##### Уровень A — исторический backlog, по конкретной доставке
+
+Вопрос уровня A звучит не «есть ли у этой записи хоть какая-нибудь job», а
+«создала ли **эта доставка** свою собственную job». Разница принципиальна:
+у записи почти всегда уже есть более старая job от `booking-created`, и связь
+через `record_id` покажет её вместо потерянного `booking-updated`.
+
+Идентичность доставки — это `easyweek_job_dedupe_key()`: SHA-256 от
+`event_hint | booking_uuid | payload_hash`. Аудит **импортирует эту
+production-функцию**, а не повторяет формулу в SQL: иначе при будущей смене
+формата ключа аудит продолжил бы показывать зелёный по устаревшей формуле.
+
+```bash
+$COMPOSE run --rm --no-deps \
+  --entrypoint /app/.venv/bin/python \
+  altegio-easyweek-inbox-worker \
+  -m altegio_bot.scripts.easyweek_recovery_audit --since '<outage_start>'
 ```
 
-   Ожидается `0`. Ненулевое значение означает, что часть backlog уже потеряна
-   безвозвратно; дальше — ручная оценка ущерба, а не автоматический replay.
+Команда read-only: только `SELECT`, без `UPDATE`, `DELETE` и replay, без
+запуска inbox/outbox loop. Печатает только event id, технические статусы и
+агрегаты — ни payload, ни названия категории, ни имени, ни телефона, ни email,
+ни секретов, ни самого dedupe key.
+
+Как читать вывод:
+
+| Поле | Что означает |
+| --- | --- |
+| `lifecycle_delivery_groups` | сколько различных доставок ожидали job. Byte-identical Resend'ы схлопываются в одну группу — у них общий expected key |
+| `resend_groups` | сколько из них были повторными доставками. Одна job на такую группу — **успешная дедупликация**, а не потеря |
+| `groups_with_exact_job` | сколько групп имеют job именно со своим ключом. Это и есть доказательство создания job |
+| `job_status_counts` | статусы найденных jobs |
+| `no_event_specific_job_unclassified` | event id без собственной job — **список для разбора, а не вердикт** |
+| `non_lifecycle_event_ids` | `booking-succeeded`: терминальный, job не ожидается |
+| `unmappable_event_ids` | нераспознанный hint или отсутствующий `booking_uuid` |
+
+**`no_event_specific_job_unclassified` не означает «потеряно».** Отсутствие
+своей job законно для:
+
+* terminal business suppression — `category_not_allowed`, `category_missing`,
+  `category_ambiguous_multi_service`, `service_count_unproven`;
+* post-cancel no-op;
+* `already_applied` replay.
+
+И означает реальную потерю, если доставка была обработана с выключенными
+notifications. Различить эти случаи по текущему `Record.raw` **нельзя**: более
+поздняя доставка могла перезаписать snapshot, против которого решение
+принималось в тот момент. Допустимые доказательства suppression — сохранённая
+стабильная runtime-причина именно для этого event id (см. подсчёт `reason=` в
+логах выше) либо контролируемый сценарий с заранее известным payload contract.
+
+Поэтому список требует ручного разбора по event id. Ни ноль, ни ненулевое
+значение сами по себе не закрывают восстановление.
+
+##### Уровень B — контролируемый smoke, обязательное положительное доказательство
+
+Уровень A показывает, что не потерялось. Что pipeline **снова работает**,
+доказывает только новая контролируемая доставка.
+
+1. Создать (или сделать Resend) одну контролируемую **allowed** single-service
+   запись категории `Wimpernverlängerung`. Записать её `easyweek_events.id` как
+   `<allowed_event_id>`.
+2. Создать одну контролируемую запись **другой** категории. Записать её id как
+   `<disallowed_event_id>`.
+3. Прогнать аудит по узкому окну этого smoke:
+
+```bash
+$COMPOSE run --rm --no-deps \
+  --entrypoint /app/.venv/bin/python \
+  altegio-easyweek-inbox-worker \
+  -m altegio_bot.scripts.easyweek_recovery_audit --since '<smoke_start>'
+```
+
+   Gate: `<allowed_event_id>` **не** входит в
+   `no_event_specific_job_unclassified`, а `groups_with_exact_job` вырос
+   ровно на его группу. `<disallowed_event_id>` — наоборот: своей job у него
+   быть не должно.
+
+4. Проверить саму job allowed-доставки по её event-specific ключу, без вывода
+   категории и клиентских данных:
+
+```bash
+$COMPOSE run --rm --no-deps \
+  --entrypoint /app/.venv/bin/python \
+  altegio-easyweek-inbox-worker \
+  -c 'import asyncio; from sqlalchemy import select; from altegio_bot.db import SessionLocal; from altegio_bot.models.models import EasyWeekEvent, MessageJob, PROVIDER_EASYWEEK; from altegio_bot.easyweek_normalizer import easyweek_job_dedupe_key; from altegio_bot.scripts.easyweek_recovery_audit import expected_job_type
+async def main():
+    async with SessionLocal() as s:
+        e = (await s.execute(select(EasyWeekEvent).where(EasyWeekEvent.id == <allowed_event_id>))).scalars().one()
+        jt = expected_job_type(e.event_hint)
+        k = easyweek_job_dedupe_key(event_hint=e.event_hint, booking_uuid=e.booking_uuid, payload_hash=e.payload_hash, job_type=jt)
+        rows = (await s.execute(select(MessageJob.id, MessageJob.provider, MessageJob.company_id, MessageJob.record_id, MessageJob.job_type, MessageJob.status).where(MessageJob.dedupe_key == k))).all()
+        print({"event_id": e.id, "event_status": e.status, "expected_job_type": jt, "exact_jobs": len(rows), "jobs": [tuple(r) for r in rows]})
+asyncio.run(main())'
+```
+
+   Ожидается ровно одна job: `provider='easyweek'`, ожидаемые `company_id`,
+   `record_id` и `job_type`, статус — любой объяснимый (`queued`,
+   `processing`, `done`, либо terminal по штатному deadline). Для
+   `<disallowed_event_id>` тот же запрос обязан вернуть `exact_jobs=0`.
+
+**Именно шаг 4 закрывает восстановление.** Старая job этой же записи здесь
+помочь не может: ключ включает `payload_hash` конкретной доставки, поэтому
+`booking-created` никогда не удовлетворит проверку `booking-updated`.
 
 #### Staged fence, если inbox worker нужно остановить
 
