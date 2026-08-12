@@ -40,6 +40,7 @@ from typing import Any, Final, Mapping
 from urllib.parse import urlsplit
 
 from altegio_bot.easyweek_locations import EasyWeekLocation
+from altegio_bot.easyweek_service_category import normalize_service_category
 
 # ---------------------------------------------------------------------------
 # Event mapping — exact trigger names only
@@ -217,6 +218,9 @@ class NormalizedBooking:
     # services the booking has. Confirmed root fields in the live capture.
     services_description: str | None
     services_count: int | None
+    # Root-level machine category. It is normalized here but eligibility is
+    # deliberately decided later from the persisted Record.raw snapshot.
+    service_category: str | None
     # `booking_price_int` is the authoritative JSON number and is in CENTS
     # (3500 == 35.00). The `booking_price*` string variants are display values.
     total_cost: Decimal | None
@@ -639,6 +643,7 @@ def normalize_event(
                 ("service_quantity", "quantity"),
                 ("services_description", "services_description"),
                 ("services_count", "services_count"),
+                ("service_category", "service_category"),
                 ("total_cost", "booking_price_int"),
                 # Presence decides whether the client link may be rewritten.
                 ("customer_id", "customer_id"),
@@ -681,6 +686,11 @@ def normalize_event(
         service_quantity=service_quantity,
         services_description=_optional_str(payload.get("services_description"), limit=512),
         services_count=services_count,
+        service_category=(
+            normalized_category.value
+            if (normalized_category := normalize_service_category(payload.get("service_category"))) is not None
+            else None
+        ),
         total_cost=total_cost,
         present_fields=present_fields,
     )

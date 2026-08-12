@@ -7,6 +7,7 @@ carry a payload value.
 
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -27,6 +28,19 @@ from altegio_bot.easyweek_normalizer import (
     normalize_booking_hash_id,
     normalize_event,
     parse_iso_utc,
+)
+from altegio_bot.easyweek_service_category import (
+    ALLOWED,
+    ALLOWED_CATEGORIES_INVALID,
+    ALLOWED_CATEGORIES_UNCONFIGURED,
+    CATEGORY_MISSING,
+    CATEGORY_NOT_ALLOWED,
+    MAX_ALLOWED_SERVICE_CATEGORIES,
+    MAX_SERVICE_CATEGORY_LENGTH,
+    evaluate_service_category,
+    normalize_service_category,
+    parse_allowed_service_categories,
+    record_raw_with_service_category,
 )
 from altegio_bot.tests.easyweek_fixtures import (
     FOREIGN_LOCATION_ID,
@@ -663,6 +677,142 @@ def test_service_fields_are_normalized() -> None:
     assert booking.service_id == 5100003
     assert booking.service_name == "Fixture Service"
     assert booking.service_quantity == 1
+
+
+# ===========================================================================
+# PR-7.1 service-category eligibility
+# ===========================================================================
+
+
+def _category_eligibility(category: object, raw_allowlist: object = '["Wimpernverlängerung"]'):
+    normalized = normalize_service_category(category)
+    record_raw = record_raw_with_service_category(
+        {"unrelated": {"kept": True}},
+        normalized.value if normalized is not None else None,
+    )
+    return evaluate_service_category(record_raw=record_raw, allowed_categories_raw=raw_allowlist)
+
+
+def test_production_service_category_is_allowed() -> None:
+    result = _category_eligibility("Wimpernverlängerung")
+    assert result.allowed is True
+    assert result.reason == ALLOWED
+
+
+@pytest.mark.parametrize(
+    "category",
+    [
+        "wimpernverlängerung",
+        " WIMPERNVERLÄNGERUNG ",
+        "Wimpernverlängerung\u00a0",
+        "Wimpernverlängerung\u2003",
+    ],
+)
+def test_case_and_safe_unicode_whitespace_normalize_for_exact_match(category: str) -> None:
+    assert _category_eligibility(category).allowed is True
+
+
+def test_category_matching_is_exact_not_prefix_or_substring() -> None:
+    result = _category_eligibility("Wimpernverlängerung Extra")
+    assert result == type(result)(allowed=False, reason=CATEGORY_NOT_ALLOWED)
+
+
+def test_service_name_never_substitutes_for_a_different_category() -> None:
+    payload = booking_created()
+    payload["service_name"] = "Wimpernverlängerung"
+    payload["services_description"] = "Wimpernverlängerung"
+    payload["service_category"] = "Nails"
+    booking = _normalize(payload)
+    assert booking is not None
+    assert booking.service_category == "Nails"
+    assert _category_eligibility(booking.service_category).reason == CATEGORY_NOT_ALLOWED
+
+
+@pytest.mark.parametrize("value", [None, "", "   ", 123, [], "Wimpern\nverlängerung", "\u200b"])
+def test_missing_blank_non_string_and_control_categories_are_not_proof(value: object) -> None:
+    assert normalize_service_category(value) is None
+    assert _category_eligibility(value).reason == CATEGORY_MISSING
+
+
+def test_absent_category_is_not_reported_as_carried() -> None:
+    payload = booking_created()
+    payload.pop("service_category")
+    booking = _normalize(payload)
+    assert booking is not None
+    assert booking.service_category is None
+    assert not booking.carries("service_category")
+
+
+@pytest.mark.parametrize("value", [None, "", "  ", {"bad": "shape"}, "bad\x00value"])
+def test_present_unusable_category_is_an_explicit_clear(value: object) -> None:
+    payload = booking_created()
+    payload["service_category"] = value
+    booking = _normalize(payload)
+    assert booking is not None
+    assert booking.service_category is None
+    assert booking.carries("service_category")
+
+
+@pytest.mark.parametrize("raw", ["{not-json", '"Wimpernverlängerung"', "{}", "1", "null"])
+def test_malformed_or_non_array_allowlist_is_wholly_invalid(raw: str) -> None:
+    parsed = parse_allowed_service_categories(raw)
+    assert parsed.configured is True
+    assert parsed.valid is False
+    assert _category_eligibility("Wimpernverlängerung", raw).reason == ALLOWED_CATEGORIES_INVALID
+
+
+@pytest.mark.parametrize("raw", ["", "   ", "[]"])
+def test_empty_allowlist_is_unconfigured_and_allows_nothing(raw: str) -> None:
+    parsed = parse_allowed_service_categories(raw)
+    assert parsed.configured is False
+    assert parsed.ready is False
+    assert _category_eligibility("Wimpernverlängerung", raw).reason == ALLOWED_CATEGORIES_UNCONFIGURED
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        ["Wimpernverlängerung", 7],
+        ["Wimpernverlängerung", ""],
+        ["Wimpernverlängerung", "bad\nvalue"],
+        ["Wimpernverlängerung", " WIMPERNVERLÄNGERUNG "],
+    ],
+)
+def test_one_invalid_or_duplicate_entry_rejects_the_whole_allowlist(values: list[object]) -> None:
+    parsed = parse_allowed_service_categories(json.dumps(values))
+    assert parsed.valid is False
+    assert parsed.keys == frozenset()
+
+
+def test_allowlist_count_and_category_length_are_bounded() -> None:
+    too_many = [f"category-{index}" for index in range(MAX_ALLOWED_SERVICE_CATEGORIES + 1)]
+    assert parse_allowed_service_categories(json.dumps(too_many)).valid is False
+    assert normalize_service_category("x" * (MAX_SERVICE_CATEGORY_LENGTH + 1)) is None
+    assert parse_allowed_service_categories(json.dumps(["x" * (MAX_SERVICE_CATEGORY_LENGTH + 1)])).valid is False
+
+
+def test_parser_result_and_eligibility_never_echo_raw_configuration() -> None:
+    secret_like_raw = '["Wimpernverlängerung", "customer@example.invalid", 7]'
+    parsed = parse_allowed_service_categories(secret_like_raw)
+    result = _category_eligibility("Wimpernverlängerung", secret_like_raw)
+    assert parsed.valid is False
+    assert result.reason == ALLOWED_CATEGORIES_INVALID
+    assert secret_like_raw not in repr(parsed)
+    assert secret_like_raw not in repr(result)
+
+
+def test_category_snapshot_returns_a_new_dict_and_preserves_unrelated_keys() -> None:
+    original = {"outside": {"kept": True}, "easyweek": {"other": "kept"}}
+    updated = record_raw_with_service_category(original, "Wimpernverlängerung")
+    assert updated is not original
+    assert original == {"outside": {"kept": True}, "easyweek": {"other": "kept"}}
+    assert updated == {
+        "outside": {"kept": True},
+        "easyweek": {"other": "kept", "service_category": "Wimpernverlängerung"},
+    }
+
+    cleared = record_raw_with_service_category(updated, None)
+    assert cleared == {"outside": {"kept": True}, "easyweek": {"other": "kept"}}
 
 
 # ===========================================================================

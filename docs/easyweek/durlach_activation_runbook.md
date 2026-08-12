@@ -1,4 +1,4 @@
-# PR-6/PR-7 — активация локаций EasyWeek
+# PR-6/PR-7/PR-7.1 — активация локаций EasyWeek
 
 Порядок включения уведомлений для **всех** филиалов реестра. Сейчас их два —
 Durlach и Rastatt — и оба активируются одним проходом: `EASYWEEK_NOTIFICATIONS_ENABLED`
@@ -421,6 +421,7 @@ company_id ничего не знает (`webhooks/whatsapp.py`,
 EASYWEEK_ENABLED=true
 EASYWEEK_PROCESSING_ENABLED=false
 EASYWEEK_NOTIFICATIONS_ENABLED=false
+EASYWEEK_ALLOWED_SERVICE_CATEGORIES=[]
 EASYWEEK_LOCATION_MAP=<JSON-реестр с id, uuid, Meta-префиксом и booking_page_url каждого филиала>
 EASYWEEK_BOOKING_PAGE_ALLOWED_HOSTS=<host из URL выше>
 EASYWEEK_DEFAULT_LANGUAGE=de
@@ -435,6 +436,20 @@ Capture уже включён и остаётся включённым: `EASYWEE
 `altegio-api` не пересоздавайте. На время смены tenant boundary оба downstream
 флага обязаны быть `false`: worker не должен ни разбирать backlog по
 недопроверенной карте, ни создавать клиентские job'ы.
+
+`EASYWEEK_ALLOWED_SERVICE_CATEGORIES` — строгий JSON-массив точных root-level
+`service_category`. Пустая строка/массив, malformed JSON, duplicate после
+нормализации либо любой нестроковый/blank/control/слишком длинный элемент
+ничего не разрешает. Production-значение PR-7.1:
+
+```text
+EASYWEEK_ALLOWED_SERVICE_CATEGORIES=["Wimpernverlängerung"]
+```
+
+Категория не выводится из `service_name`, `services_description` или
+`service_id`. Настройку читают `altegio-easyweek-inbox-worker` и общий
+`altegio-outbox-worker`, поэтому после её изменения оба контейнера требуется
+пересоздать через `--force-recreate`.
 
 После записи нового реестра пересоздайте **оба** его потребителя. Обычный
 `restart` и `up -d` без `--force-recreate` не перечитывают `env_file`:
@@ -452,15 +467,20 @@ for EW_SERVICE in altegio-easyweek-inbox-worker altegio-outbox-worker; do
   echo "SERVICE=$EW_SERVICE"
   $COMPOSE exec -T "$EW_SERVICE" /app/.venv/bin/python - <<'PY'
 from altegio_bot.easyweek_locations import configured_easyweek_locations
+from altegio_bot.easyweek_service_category import parse_allowed_service_categories
 from altegio_bot.settings import settings
 
 registry = configured_easyweek_locations()
+categories = parse_allowed_service_categories(settings.easyweek_allowed_service_categories)
 print(
     {
         "processing_enabled": settings.easyweek_processing_enabled,
         "notifications_enabled": settings.easyweek_notifications_enabled,
         "registry_configured": registry.configured,
         "registry_valid": registry.valid,
+        "service_categories_configured": categories.configured,
+        "service_categories_valid": categories.valid,
+        "service_categories_count": len(categories.keys),
         "branches": sorted(
             (location.name, location.company_id, location.meta_template_prefix)
             for location in registry.locations.values()
@@ -474,7 +494,10 @@ done
 
 Gate: оба контейнера показывают один и тот же полный список `durlach`/`du` и
 `rastatt`/`ra`, registry configured+valid, processing=false и
-notifications=false. Любое расхождение останавливает rollout до сида.
+notifications=false. Для PR-7.1 также обязательны
+`service_categories_configured=true`, `service_categories_valid=true` и
+`service_categories_count=1`. Raw allowlist и название категории эта проверка
+намеренно не печатает. Любое расхождение останавливает rollout до сида.
 
 ---
 
@@ -650,6 +673,134 @@ ORDER BY company_id;
 > (это живой эндпоинт вебхуков, и рестарт ради строчки статуса — плохой размен),
 > поэтому сразу после включения там ожидаемо будет `off`, пока воркеры уже
 > отправляют. Достоверны счётчики ниже — они из БД.
+
+---
+
+## 6A. Обязательный rollout PR-7.1: service-category filter
+
+PR-8 и reminders не начинаются, пока этот gate не пройден. На production не
+запускаются pytest, миграционные тесты или произвольные replay: только
+read-only SQL/log checks ниже и две контролируемые реальные smoke-записи.
+
+Порядок строгий:
+
+1. В `easyweek.env` временно установить
+   `EASYWEEK_NOTIFICATIONS_ENABLED=false`.
+2. Пересоздать inbox worker, чтобы он перестал планировать новые lifecycle jobs:
+
+```bash
+$COMPOSE up -d --force-recreate altegio-easyweek-inbox-worker
+```
+
+3. Проверить незавершённую EasyWeek lifecycle-очередь:
+
+```sql
+SELECT status, count(*)
+FROM message_jobs
+WHERE provider = 'easyweek'
+  AND job_type IN ('record_created', 'record_updated', 'record_canceled')
+  AND status IN ('queued', 'processing')
+GROUP BY status
+ORDER BY status;
+```
+
+Ожидается 0 строк. Если очередь непуста — **STOP** и разбор каждой job до
+deploy; автоматически отменять или переписывать её этим rollout нельзя.
+
+4. Записать точный production allowlist:
+
+```text
+EASYWEEK_ALLOWED_SERVICE_CATEGORIES=["Wimpernverlängerung"]
+```
+
+5. Развернуть новый код, не включая notifications.
+6. Force-recreate оба потребителя настройки:
+
+```bash
+$COMPOSE up -d --force-recreate \
+  altegio-easyweek-inbox-worker altegio-outbox-worker
+```
+
+7. Повторить effective-config probe из §4 в обоих контейнерах. Gate проверяет
+   только booleans и количество: configured=true, valid=true, count=1. Raw env
+   и название категории не печатаются.
+8. Установить `EASYWEEK_NOTIFICATIONS_ENABLED=true` и снова пересоздать только
+   inbox worker:
+
+```bash
+$COMPOSE up -d --force-recreate altegio-easyweek-inbox-worker
+```
+
+9. Создать одну контролируемую запись с категорией `Wimpernverlängerung` и
+   записать её новый `easyweek_events.id` как `<allowed_event_id>`.
+10. Создать одну контролируемую запись другой категории и записать её event id
+    как `<disallowed_event_id>`. Не подбирать текст услуги под ресничную
+    категорию: фильтр намеренно смотрит только root-level category.
+11. Проверить обе строки без вывода category, payload или клиентских данных:
+
+```sql
+SELECT e.id AS event_id,
+       e.status,
+       r.id AS record_id,
+       r.company_id,
+       count(DISTINCT j.id) AS lifecycle_jobs,
+       count(DISTINCT o.id) AS outbox_rows
+FROM easyweek_events e
+LEFT JOIN records r
+       ON r.provider = 'easyweek'
+      AND r.easyweek_booking_uuid = e.booking_uuid
+LEFT JOIN message_jobs j
+       ON j.provider = 'easyweek'
+      AND j.record_id = r.id
+      AND j.job_type IN ('record_created', 'record_updated', 'record_canceled')
+LEFT JOIN outbox_messages o ON o.job_id = j.id
+WHERE e.id IN (<allowed_event_id>, <disallowed_event_id>)
+GROUP BY e.id, e.status, r.id, r.company_id
+ORDER BY e.id;
+```
+
+Обе доставки обязаны быть `processed`, обе — иметь `Record`. У allowed event
+ожидаются одна lifecycle job и один sent Outbox после обработки; у disallowed
+— `lifecycle_jobs=0`, `outbox_rows=0`, Meta/Chatwoot сообщений нет.
+
+Безопасная агрегированная наблюдаемость за выбранное окно:
+
+```sql
+SELECT status, count(*)
+FROM easyweek_events
+WHERE received_at >= TIMESTAMPTZ '<smoke_start>'
+GROUP BY status
+ORDER BY status;
+```
+
+```sql
+SELECT status, count(*)
+FROM message_jobs
+WHERE provider = 'easyweek'
+  AND job_type IN ('record_created', 'record_updated', 'record_canceled')
+  AND created_at >= TIMESTAMPTZ '<smoke_start>'
+GROUP BY status
+ORDER BY status;
+```
+
+Количество planner/send-time suppression по стабильной технической причине:
+
+```bash
+$COMPOSE logs --since='<smoke_start>' altegio-easyweek-inbox-worker altegio-outbox-worker \
+  | grep -Eo 'reason=(category_missing|category_not_allowed|allowed_categories_unconfigured|allowed_categories_invalid)' \
+  | sort | uniq -c
+```
+
+Последняя проверка log hygiene — ожидается `0`; названия категорий, услуг,
+payload и PII в логах не допускаются:
+
+```bash
+$COMPOSE logs --since='<smoke_start>' altegio-easyweek-inbox-worker altegio-outbox-worker \
+  | grep -Eci 'service_category|service_name|customer_phone|customer_email|booking_page|Authorization: Bearer|token=|Traceback'
+```
+
+Любой traceback, утечка, job/Outbox для disallowed записи или отсутствие
+job/Outbox для allowed записи — **STOP** до PR-8.
 
 ---
 

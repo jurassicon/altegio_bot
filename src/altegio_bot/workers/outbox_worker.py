@@ -49,6 +49,7 @@ from altegio_bot.easyweek_policy import (
     normalize_provider,
     validate_static_booking_page,
 )
+from altegio_bot.easyweek_service_category import evaluate_service_category
 from altegio_bot.message_planner import (
     COMEBACK_3D_DELAY,
     COMEBACK_3D_SOURCE_CANCELLED_AT_KEY,
@@ -2414,6 +2415,28 @@ async def _run_job_logic(
                 job.id,
                 job.company_id,
                 job.job_type,
+            )
+            return None
+
+        # Re-prove the CURRENT persisted category after provider/company/record
+        # identity, but before the phone, rate limit, rendering, Meta, Chatwoot
+        # or any Outbox audit row. This closes queued/pre-PR-7.1 jobs and the
+        # allowed -> disallowed race between planner and claim.
+        eligibility = evaluate_service_category(
+            record_raw=record.raw,
+            allowed_categories_raw=settings.easyweek_allowed_service_categories,
+        )
+        if not eligibility.allowed:
+            job.status = "canceled"
+            job.locked_at = None
+            job.last_error = eligibility.reason
+            logger.info(
+                "EasyWeek lifecycle suppressed before send job_id=%s provider=%s company_id=%s record_id=%s reason=%s",
+                job.id,
+                job_provider,
+                job.company_id,
+                record.id,
+                eligibility.reason,
             )
             return None
 

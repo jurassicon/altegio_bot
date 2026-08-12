@@ -497,6 +497,12 @@ class Settings(BaseSettings):
     # until PR-6; with it off the normalizer still keeps Client/Record current.
     easyweek_notifications_enabled: bool = False
 
+    # PR-7.1: exact EasyWeek service-category allowlist as a JSON array of
+    # strings. Parsing is deliberately deferred to the shared eligibility
+    # helper so malformed input suppresses EasyWeek jobs without preventing the
+    # API or the shared outbox worker from starting. Empty permits nothing.
+    easyweek_allowed_service_categories: str = ""
+
     # Strict JSON registry of every EasyWeek branch this deployment owns.
     # Parsed at the security boundary by ``easyweek_locations``; malformed and
     # empty maps both keep processing off, while remaining distinguishable.

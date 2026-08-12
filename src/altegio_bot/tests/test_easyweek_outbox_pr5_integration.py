@@ -53,6 +53,7 @@ from altegio_bot.easyweek_policy import (
     easyweek_job_type_error,
     validate_static_booking_page,
 )
+from altegio_bot.easyweek_service_category import record_raw_with_service_category
 from altegio_bot.meta_templates import (
     META_TEMPLATE_MAP,
     TEMPLATE_LANGUAGE,
@@ -168,6 +169,12 @@ def _pr5_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "easyweek_booking_page_allowed_hosts", BOOKING_PAGE_ALLOWED_HOSTS, raising=False)
     monkeypatch.setattr(settings, "easyweek_default_language", "de", raising=False)
     monkeypatch.setattr(settings, "easyweek_notifications_enabled", False, raising=False)
+    monkeypatch.setattr(
+        settings,
+        "easyweek_allowed_service_categories",
+        json.dumps(["Wimpernverlängerung", "Fixture Category"]),
+        raising=False,
+    )
 
     # PR-7: only a branch with a source-controlled profile may send. These
     # tenants are synthetic on purpose — they exercise provider collision and
@@ -338,7 +345,7 @@ async def _seed_easyweek_record(
         starts_at=starts_at or (datetime.now(timezone.utc) + timedelta(days=3)),
         short_link=short_link,
         total_cost=resolved_total,
-        raw={},
+        raw=(record_raw_with_service_category({}, "Wimpernverlängerung") if provider == PROVIDER_EASYWEEK else {}),
     )
     db.add(record)
     await db.flush()
@@ -1787,6 +1794,164 @@ async def test_altegio_job_is_untouched_by_the_easyweek_scope_gate(
     would silently cancel live traffic this PR never set out to touch.
     """
     job = await _seed_altegio_happy_path(db, mismatched_client=True)
+
+    await _run_job(db, job)
+
+    assert job.status == "done", job.last_error
+    assert len(capture.template_calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# 7.1 PR-7.1 persisted service-category send-time guard
+# ---------------------------------------------------------------------------
+
+
+def _assert_category_suppressed(
+    job: MessageJob,
+    capture: CaptureProvider,
+    outbox_rows: list[OutboxMessage],
+    reason: str,
+) -> None:
+    assert job.status == "canceled"
+    assert job.locked_at is None
+    assert job.last_error == reason
+    assert capture.template_calls == []
+    assert capture.text_calls == []
+    assert outbox_rows == []
+    for forbidden in (CLIENT_PHONE, CLIENT_EMAIL, "Anna", "Wimpernverlängerung", "Other Category"):
+        assert forbidden not in (job.last_error or "")
+
+
+async def test_allowed_easyweek_category_reaches_meta_and_the_proven_branch(
+    db: AsyncSession,
+    capture: CaptureProvider,
+) -> None:
+    job = await _seed_easyweek_happy_path(db)
+
+    await _run_job(db, job)
+
+    assert job.status == "done", job.last_error
+    assert len(capture.template_calls) == 1
+    call = capture.template_calls[0]
+    assert call["template_name"] == EASYWEEK_CREATED_TEMPLATE
+    assert call["tenant_provider"] == PROVIDER_EASYWEEK
+    assert call["company_id"] == COLLIDING_COMPANY_ID
+    assert len(await _outbox_rows(db, job)) == 1
+
+
+@pytest.mark.parametrize(
+    ("category", "expected_reason"),
+    [
+        ("Other Category", "category_not_allowed"),
+        (None, "category_missing"),
+    ],
+)
+async def test_persisted_disallowed_or_missing_category_blocks_every_send_side_effect(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    category: str | None,
+    expected_reason: str,
+) -> None:
+    job = await _seed_easyweek_happy_path(db)
+    record = await db.get(Record, job.record_id)
+    assert record is not None
+    record.raw = record_raw_with_service_category(record.raw, category)
+    await db.flush()
+
+    await _run_job(db, job)
+
+    _assert_category_suppressed(job, capture, await _outbox_rows(db, job), expected_reason)
+
+
+@pytest.mark.parametrize(
+    ("raw_allowlist", "expected_reason"),
+    [
+        ("", "allowed_categories_unconfigured"),
+        ("[]", "allowed_categories_unconfigured"),
+        ("{not-json", "allowed_categories_invalid"),
+        ('["Wimpernverlängerung", 7]', "allowed_categories_invalid"),
+    ],
+)
+async def test_empty_or_invalid_allowlist_cancels_before_meta_chatwoot_and_outbox(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    monkeypatch: pytest.MonkeyPatch,
+    raw_allowlist: str,
+    expected_reason: str,
+) -> None:
+    monkeypatch.setattr(settings, "easyweek_allowed_service_categories", raw_allowlist, raising=False)
+    job = await _seed_easyweek_happy_path(db)
+
+    await _run_job(db, job)
+
+    _assert_category_suppressed(job, capture, await _outbox_rows(db, job), expected_reason)
+
+
+async def test_suppression_reason_and_log_never_echo_raw_config_or_category(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    raw_allowlist = '["customer@example.invalid", 7]'
+    monkeypatch.setattr(settings, "easyweek_allowed_service_categories", raw_allowlist, raising=False)
+    caplog.set_level(logging.INFO, logger="outbox_worker")
+    job = await _seed_easyweek_happy_path(db)
+
+    await _run_job(db, job)
+
+    _assert_category_suppressed(
+        job,
+        capture,
+        await _outbox_rows(db, job),
+        "allowed_categories_invalid",
+    )
+    logged = caplog.text
+    assert "allowed_categories_invalid" in logged
+    assert raw_allowlist not in logged
+    assert "customer@example.invalid" not in logged
+    assert "Wimpernverlängerung" not in logged
+
+
+async def test_allowed_to_disallowed_race_before_claim_uses_current_snapshot(
+    db: AsyncSession,
+    capture: CaptureProvider,
+) -> None:
+    job = await _seed_easyweek_happy_path(db)
+    record = await db.get(Record, job.record_id)
+    assert record is not None
+    # The planner saw allowed; a later booking-updated committed before this
+    # queued job was claimed. The send-time guard must use the latter state.
+    record.raw = record_raw_with_service_category(record.raw, "Other Category")
+    await db.flush()
+
+    await _run_job(db, job)
+
+    _assert_category_suppressed(job, capture, await _outbox_rows(db, job), "category_not_allowed")
+
+
+async def test_pre_pr71_queued_job_without_snapshot_is_canceled_locally(
+    db: AsyncSession,
+    capture: CaptureProvider,
+) -> None:
+    job = await _seed_easyweek_happy_path(db)
+    record = await db.get(Record, job.record_id)
+    assert record is not None
+    record.raw = {"legacy_unrelated": {"kept": True}}
+    await db.flush()
+
+    await _run_job(db, job)
+
+    _assert_category_suppressed(job, capture, await _outbox_rows(db, job), "category_missing")
+
+
+async def test_altegio_lifecycle_send_ignores_easyweek_category_configuration(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "easyweek_allowed_service_categories", "{invalid", raising=False)
+    job = await _seed_altegio_happy_path(db)
 
     await _run_job(db, job)
 

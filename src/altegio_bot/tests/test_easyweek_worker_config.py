@@ -20,6 +20,7 @@ import yaml
 
 from altegio_bot.settings import Settings, settings
 from altegio_bot.workers import easyweek_inbox_worker as worker
+from altegio_bot.workers import outbox_worker
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 COMPOSE_FILE = _REPO_ROOT / "docker-compose.yml"
@@ -52,6 +53,10 @@ def test_every_easyweek_gate_defaults_to_off(field: str) -> None:
 
 def test_location_registry_defaults_to_unset() -> None:
     assert Settings.model_fields["easyweek_location_map"].default == "{}"
+
+
+def test_service_category_allowlist_defaults_to_deny_all() -> None:
+    assert Settings.model_fields["easyweek_allowed_service_categories"].default == ""
 
 
 def test_processing_is_a_separate_field_from_capture() -> None:
@@ -132,6 +137,7 @@ def test_env_example_documents_every_new_flag() -> None:
     for key in (
         "EASYWEEK_PROCESSING_ENABLED",
         "EASYWEEK_NOTIFICATIONS_ENABLED",
+        "EASYWEEK_ALLOWED_SERVICE_CATEGORIES",
         "EASYWEEK_LOCATION_MAP",
     ):
         assert key in text, f"{key} is undocumented in easyweek.env.example"
@@ -141,6 +147,7 @@ def test_env_example_ships_fail_closed_values() -> None:
     text = ENV_EXAMPLE.read_text()
     assert "EASYWEEK_PROCESSING_ENABLED=false" in text
     assert "EASYWEEK_NOTIFICATIONS_ENABLED=false" in text
+    assert "EASYWEEK_ALLOWED_SERVICE_CATEGORIES=[]" in text
     assert "EASYWEEK_LOCATION_MAP={}" in text
     assert "EASYWEEK_LOCATION_ID" not in text
     assert "EASYWEEK_LOCATION_UUID" not in text
@@ -203,6 +210,11 @@ def test_outbox_worker_reads_env_and_optional_easyweek_env() -> None:
         ".env",
         {"path": "easyweek.env", "required": False},
     ]
+
+
+def test_both_category_guard_consumers_read_the_shared_setting() -> None:
+    assert "settings.easyweek_allowed_service_categories" in inspect.getsource(worker)
+    assert "settings.easyweek_allowed_service_categories" in inspect.getsource(outbox_worker)
 
 
 @pytest.mark.parametrize(

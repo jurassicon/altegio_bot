@@ -69,6 +69,7 @@ from ..easyweek_policy import (
     RECORD_CREATED,
     RECORD_UPDATED,
 )
+from ..easyweek_service_category import evaluate_service_category, record_raw_with_service_category
 from ..models.models import Client, EasyWeekEvent, MessageJob, Record, RecordService
 from ..settings import settings
 
@@ -554,6 +555,13 @@ async def upsert_record(
     _patch(record, "comment", booking, booking.comment)
     _patch(record, "total_cost", booking, booking.total_cost)
 
+    # A dedicated minimal domain snapshot: never store the webhook payload or
+    # any customer fields in Record.raw. Assign a NEW dict so SQLAlchemy always
+    # detects the JSONB change. Absent means patch/no-op; explicit invalid,
+    # blank or null normalizes to None and removes the previous proof.
+    if booking.carries("service_category"):
+        record.raw = record_raw_with_service_category(record.raw, booking.service_category)
+
     if booking.action == DELETE:
         record.is_deleted = True
 
@@ -692,6 +700,7 @@ async def plan_lifecycle_job(
     client: Client | None,
     event_hint: str,
     payload_hash: str | None,
+    event_id: int | None = None,
 ) -> None:
     """Create the single lifecycle job for this event, if notifications are on.
 
@@ -702,6 +711,20 @@ async def plan_lifecycle_job(
     byte-for-byte unchanged.
     """
     if not settings.easyweek_notifications_enabled:
+        return
+
+    eligibility = evaluate_service_category(
+        record_raw=record.raw,
+        allowed_categories_raw=settings.easyweek_allowed_service_categories,
+    )
+    if not eligibility.allowed:
+        logger.info(
+            "easyweek lifecycle suppressed event_id=%s record_id=%s company_id=%s reason=%s",
+            event_id,
+            record.id,
+            booking.company_id,
+            eligibility.reason,
+        )
         return
 
     job_type = _ACTION_TO_JOB_TYPE[booking.action]
@@ -766,6 +789,7 @@ async def apply_booking(
     *,
     event_hint: str,
     payload_hash: str | None,
+    event_id: int | None = None,
 ) -> Record | None:
     """Apply one validated delivery. Returns None when it was a no-op.
 
@@ -797,6 +821,7 @@ async def apply_booking(
         client=client,
         event_hint=event_hint,
         payload_hash=payload_hash,
+        event_id=event_id,
     )
     return record
 
@@ -845,6 +870,7 @@ async def process_claimed_event(session: AsyncSession, event: EasyWeekEvent) -> 
         booking,
         event_hint=str(event_hint),
         payload_hash=payload_hash,
+        event_id=event_id,
     )
     if applied is None:
         logger.info(
