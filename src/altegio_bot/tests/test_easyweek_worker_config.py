@@ -117,6 +117,42 @@ def test_disabling_processing_does_not_disable_capture(monkeypatch: pytest.Monke
     assert worker.processing_is_configured() is False
 
 
+@pytest.mark.parametrize("allowlist", ["", "[]", "{invalid", '["Fixture Category", 7]'])
+def test_category_config_is_not_a_processing_gate_while_notifications_are_off(
+    monkeypatch: pytest.MonkeyPatch,
+    allowlist: str,
+) -> None:
+    monkeypatch.setattr(settings, "easyweek_processing_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_notifications_enabled", False, raising=False)
+    monkeypatch.setattr(settings, "easyweek_allowed_service_categories", allowlist, raising=False)
+    monkeypatch.setattr(
+        settings,
+        "easyweek_location_map",
+        '{"test":{"location_id":999001,"location_uuid":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",'
+        '"meta_template_prefix":"tt","booking_page_url":"https://booking.example.invalid/test"}}',
+        raising=False,
+    )
+    assert worker.processing_is_configured() is True
+
+
+@pytest.mark.parametrize("allowlist", ["", "[]", "{invalid", '["Fixture Category", 7]'])
+def test_notifications_require_a_ready_category_allowlist_before_claim(
+    monkeypatch: pytest.MonkeyPatch,
+    allowlist: str,
+) -> None:
+    monkeypatch.setattr(settings, "easyweek_processing_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_notifications_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_allowed_service_categories", allowlist, raising=False)
+    monkeypatch.setattr(
+        settings,
+        "easyweek_location_map",
+        '{"test":{"location_id":999001,"location_uuid":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",'
+        '"meta_template_prefix":"tt","booking_page_url":"https://booking.example.invalid/test"}}',
+        raising=False,
+    )
+    assert worker.processing_is_configured() is False
+
+
 def test_production_location_identities_are_not_hardcoded_in_python() -> None:
     forbidden = ("305156", "308697", "315607", "b9d689f2", "cd91816d")
     for path in (_REPO_ROOT / "src" / "altegio_bot").rglob("*.py"):
@@ -310,6 +346,39 @@ async def test_disabled_worker_never_claims_and_never_busy_loops(
     # The disabled state is announced once, not once per poll.
     disabled_lines = [r for r in caplog.records if "processing is disabled" in r.getMessage()]
     assert len(disabled_lines) == 1, f"log spam: {len(disabled_lines)} disabled notices"
+
+
+@pytest.mark.asyncio
+async def test_unavailable_category_config_logs_only_safe_readiness_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    raw_allowlist = '["Wimpernverlängerung", "customer@example.invalid", 7]'
+    monkeypatch.setattr(settings, "easyweek_processing_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_notifications_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_allowed_service_categories", raw_allowlist, raising=False)
+    _set_ready_registry(monkeypatch)
+
+    claims = 0
+
+    async def _never_called() -> bool:
+        nonlocal claims
+        claims += 1
+        return False
+
+    monkeypatch.setattr(worker, "process_one", _never_called)
+    with caplog.at_level("INFO", logger="easyweek_inbox_worker"):
+        await _run_briefly()
+
+    assert claims == 0
+    text = "\n".join(record.getMessage() for record in caplog.records)
+    assert "service_categories_configured=True" in text
+    assert "service_categories_valid=False" in text
+    assert "service_categories_count=0" in text
+    assert "category_reason=allowed_categories_invalid" in text
+    assert raw_allowlist not in text
+    assert "Wimpernverlängerung" not in text
+    assert "customer@example.invalid" not in text
 
 
 @pytest.mark.asyncio

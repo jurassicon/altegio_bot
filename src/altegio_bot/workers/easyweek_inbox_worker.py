@@ -69,7 +69,12 @@ from ..easyweek_policy import (
     RECORD_CREATED,
     RECORD_UPDATED,
 )
-from ..easyweek_service_category import evaluate_service_category, record_raw_with_service_category
+from ..easyweek_service_category import (
+    evaluate_service_category,
+    parse_allowed_service_categories,
+    record_raw_with_service_category,
+    record_raw_with_services_count,
+)
 from ..models.models import Client, EasyWeekEvent, MessageJob, Record, RecordService
 from ..settings import settings
 
@@ -111,6 +116,14 @@ STATUS_PROCESSED = "processed"
 STATUS_FAILED = "failed"
 
 
+class RecoverableCategoryConfigurationError(RuntimeError):
+    """Safe internal signal: rollback the claim until configuration recovers."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(reason)
+
+
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -148,9 +161,16 @@ def processing_is_configured() -> bool:
 
     Processing enabled with an empty OR invalid registry is not configured. In
     particular, malformed JSON must not degrade into an empty ownership set and
-    make every captured event look like ordinary foreign traffic.
+    make every captured event look like ordinary foreign traffic. When
+    notifications are enabled, category configuration readiness joins this
+    production claim gate; with notifications disabled it deliberately does
+    not, so domain-only backlog recovery remains possible.
     """
-    return bool(settings.easyweek_processing_enabled) and configured_easyweek_locations().ready
+    if not bool(settings.easyweek_processing_enabled) or not configured_easyweek_locations().ready:
+        return False
+    if not bool(settings.easyweek_notifications_enabled):
+        return True
+    return parse_allowed_service_categories(settings.easyweek_allowed_service_categories).ready
 
 
 # Statuses that are NOT terminal: a row in one of these still owes the domain
@@ -304,6 +324,14 @@ async def claim_next_event(session: AsyncSession) -> EasyWeekEvent | None:
     worker is mid-flight on is skipped rather than waited on — while still being
     visible as a ``captured`` blocker to its own successors.
     """
+    # Keep the readiness boundary at the actual claim operation as well as the
+    # polling loop. Tests, maintenance commands and future callers can invoke
+    # this helper directly; none may turn recoverable configuration downtime
+    # into terminal processed events. With notifications disabled the allowlist
+    # is intentionally irrelevant and domain catch-up remains available.
+    if not processing_is_configured():
+        return None
+
     predecessor = aliased(EasyWeekEvent)
     earlier_pending = (
         select(predecessor.id)
@@ -561,6 +589,8 @@ async def upsert_record(
     # blank or null normalizes to None and removes the previous proof.
     if booking.carries("service_category"):
         record.raw = record_raw_with_service_category(record.raw, booking.service_category)
+    if booking.carries("services_count"):
+        record.raw = record_raw_with_services_count(record.raw, booking.services_count)
 
     if booking.action == DELETE:
         record.is_deleted = True
@@ -718,6 +748,12 @@ async def plan_lifecycle_job(
         allowed_categories_raw=settings.easyweek_allowed_service_categories,
     )
     if not eligibility.allowed:
+        if eligibility.recoverable_configuration:
+            # The claim gate normally prevents this. Keep the in-transaction
+            # check as defence against a runtime settings change between claim
+            # and planning: rolling back leaves the event captured instead of
+            # publishing a terminal processed outcome without its job.
+            raise RecoverableCategoryConfigurationError(eligibility.reason)
         logger.info(
             "easyweek lifecycle suppressed event_id=%s record_id=%s company_id=%s reason=%s",
             event_id,
@@ -1006,6 +1042,16 @@ async def process_one() -> bool:
         # Safe metadata only: never str(exc), never a traceback. A SQLAlchemy
         # error renders the statement WITH its bound parameters, which here
         # means the customer's phone, e-mail, name and comment.
+        if isinstance(exc, RecoverableCategoryConfigurationError):
+            logger.warning(
+                "easyweek event=%s configuration_unavailable reason=%s",
+                transient_event_id,
+                exc.reason,
+            )
+            # The outer transaction already rolled the claim and all domain
+            # writes back. Do not add a retry timestamp: as soon as the config
+            # is fixed this captured row must be immediately claimable again.
+            return True
         logger.error(
             "easyweek event=%s processing_error type=%s",
             transient_event_id,
@@ -1059,11 +1105,20 @@ async def run_loop(
 
         if not processing_is_configured():
             if not announced_disabled:
+                registry = configured_easyweek_locations()
+                categories = parse_allowed_service_categories(settings.easyweek_allowed_service_categories)
                 logger.info(
                     "EasyWeek processing is disabled or unconfigured; not claiming events. "
-                    "processing_enabled=%s location_registry_ready=%s",
+                    "processing_enabled=%s notifications_enabled=%s location_registry_ready=%s "
+                    "service_categories_configured=%s service_categories_valid=%s "
+                    "service_categories_count=%s category_reason=%s",
                     bool(settings.easyweek_processing_enabled),
-                    configured_easyweek_locations().ready,
+                    bool(settings.easyweek_notifications_enabled),
+                    registry.ready,
+                    categories.configured,
+                    categories.valid,
+                    len(categories.keys),
+                    categories.unavailable_reason if settings.easyweek_notifications_enabled else None,
                 )
                 announced_disabled = True
             await _sleep_unless_stopping(effective_poll_sec, stop_event)

@@ -25,6 +25,7 @@ cross-tenant leak waiting for the two spaces to overlap.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import uuid
@@ -53,7 +54,10 @@ from altegio_bot.easyweek_policy import (
     easyweek_job_type_error,
     validate_static_booking_page,
 )
-from altegio_bot.easyweek_service_category import record_raw_with_service_category
+from altegio_bot.easyweek_service_category import (
+    record_raw_with_service_category,
+    record_raw_with_services_count,
+)
 from altegio_bot.meta_templates import (
     META_TEMPLATE_MAP,
     TEMPLATE_LANGUAGE,
@@ -345,7 +349,14 @@ async def _seed_easyweek_record(
         starts_at=starts_at or (datetime.now(timezone.utc) + timedelta(days=3)),
         short_link=short_link,
         total_cost=resolved_total,
-        raw=(record_raw_with_service_category({}, "Wimpernverlängerung") if provider == PROVIDER_EASYWEEK else {}),
+        raw=(
+            record_raw_with_services_count(
+                record_raw_with_service_category({}, "Wimpernverlängerung"),
+                1,
+            )
+            if provider == PROVIDER_EASYWEEK
+            else {}
+        ),
     )
     db.add(record)
     await db.flush()
@@ -1872,7 +1883,7 @@ async def test_persisted_disallowed_or_missing_category_blocks_every_send_side_e
         ('["Wimpernverlängerung", 7]', "allowed_categories_invalid"),
     ],
 )
-async def test_empty_or_invalid_allowlist_cancels_before_meta_chatwoot_and_outbox(
+async def test_empty_or_invalid_allowlist_requeues_without_meta_chatwoot_or_outbox(
     db: AsyncSession,
     capture: CaptureProvider,
     monkeypatch: pytest.MonkeyPatch,
@@ -1884,7 +1895,14 @@ async def test_empty_or_invalid_allowlist_cancels_before_meta_chatwoot_and_outbo
 
     await _run_job(db, job)
 
-    _assert_category_suppressed(job, capture, await _outbox_rows(db, job), expected_reason)
+    assert job.status == "queued"
+    assert job.locked_at is None
+    assert job.last_error == expected_reason
+    assert job.attempts == 0
+    assert job.payload["_easyweek_category_config_deferrals"] == 1
+    assert capture.template_calls == []
+    assert capture.text_calls == []
+    assert await _outbox_rows(db, job) == []
 
 
 async def test_suppression_reason_and_log_never_echo_raw_config_or_category(
@@ -1900,17 +1918,102 @@ async def test_suppression_reason_and_log_never_echo_raw_config_or_category(
 
     await _run_job(db, job)
 
-    _assert_category_suppressed(
-        job,
-        capture,
-        await _outbox_rows(db, job),
-        "allowed_categories_invalid",
-    )
+    assert job.status == "queued"
+    assert job.last_error == "allowed_categories_invalid"
+    assert capture.template_calls == []
+    assert capture.text_calls == []
+    assert await _outbox_rows(db, job) == []
     logged = caplog.text
     assert "allowed_categories_invalid" in logged
     assert raw_allowlist not in logged
     assert "customer@example.invalid" not in logged
     assert "Wimpernverlängerung" not in logged
+
+
+async def test_configuration_deferral_is_bounded_does_not_spend_attempts_and_recovers(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job = await _seed_easyweek_happy_path(db)
+    job.payload = {"_easyweek_category_config_deferrals": 10**100}
+    monkeypatch.setattr(settings, "easyweek_allowed_service_categories", "{invalid", raising=False)
+
+    await _run_job(db, job)
+
+    assert job.status == "queued"
+    assert job.attempts == 0
+    assert job.payload["_easyweek_category_config_deferrals"] == 6
+    assert job.run_at <= datetime.now(timezone.utc) + timedelta(minutes=16)
+    assert capture.template_calls == []
+    assert await _outbox_rows(db, job) == []
+
+    job.run_at = datetime.now(timezone.utc)
+    monkeypatch.setattr(
+        settings,
+        "easyweek_allowed_service_categories",
+        json.dumps(["Wimpernverlängerung"]),
+        raising=False,
+    )
+    await _run_job(db, job)
+    assert job.status == "done", job.last_error
+    assert len(capture.template_calls) == 1
+
+
+async def test_configuration_deferral_still_obeys_lifecycle_deadline(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job = await _seed_easyweek_happy_path(db)
+    record = await db.get(Record, job.record_id)
+    assert record is not None
+    record.starts_at = datetime.now(timezone.utc) + timedelta(minutes=10)
+    monkeypatch.setattr(settings, "easyweek_allowed_service_categories", "{invalid", raising=False)
+
+    await _run_job(db, job)
+
+    assert job.status == "canceled"
+    assert job.attempts == 0
+    assert job.last_error == "Retry deadline exceeded for record_created"
+    assert capture.template_calls == []
+    assert capture.text_calls == []
+    assert await _outbox_rows(db, job) == []
+
+
+@pytest.mark.parametrize(
+    ("count", "expected_reason"),
+    [(2, "category_ambiguous_multi_service"), (None, "service_count_unproven")],
+)
+@pytest.mark.parametrize(
+    ("job_type", "template_name"),
+    [
+        ("record_created", EASYWEEK_CREATED_TEMPLATE),
+        ("record_updated", EASYWEEK_UPDATED_TEMPLATE),
+        ("record_canceled", EASYWEEK_CANCELED_TEMPLATE),
+    ],
+)
+async def test_queued_job_requires_persisted_single_service_proof(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    count: int | None,
+    expected_reason: str,
+    job_type: str,
+    template_name: str,
+) -> None:
+    job = await _seed_easyweek_happy_path(
+        db,
+        job_type=job_type,
+        meta_template_name=template_name,
+    )
+    record = await db.get(Record, job.record_id)
+    assert record is not None
+    record.raw = record_raw_with_services_count(record.raw, count)
+    await db.flush()
+
+    await _run_job(db, job)
+
+    _assert_category_suppressed(job, capture, await _outbox_rows(db, job), expected_reason)
 
 
 async def test_allowed_to_disallowed_race_before_claim_uses_current_snapshot(
@@ -1930,6 +2033,193 @@ async def test_allowed_to_disallowed_race_before_claim_uses_current_snapshot(
     _assert_category_suppressed(job, capture, await _outbox_rows(db, job), "category_not_allowed")
 
 
+async def _process_job_in_new_transaction(
+    session_maker: async_sessionmaker[AsyncSession],
+    job_id: int,
+    *,
+    order: list[str] | None = None,
+    preload_record_id: int | None = None,
+) -> None:
+    async with session_maker() as session:
+        async with session.begin():
+            if preload_record_id is not None:
+                stale_record = await session.get(Record, preload_record_id)
+                assert stale_record is not None
+                assert stale_record.raw["easyweek"]["service_category"] == "Wimpernverlängerung"
+            await ow.process_job_in_session(session, job_id, object())  # type: ignore[arg-type]
+        if order is not None:
+            order.append("outbox_commit")
+
+
+async def test_inbox_commit_precedes_waiting_outbox_and_suppresses_send(
+    db: AsyncSession,
+    session_maker: async_sessionmaker[AsyncSession],
+    capture: CaptureProvider,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Order 1: inbox lock/update/commit -> outbox refresh -> canceled."""
+    job = await _seed_easyweek_happy_path(db)
+    job_id = int(job.id)
+    record_id = int(job.record_id)
+    await db.commit()
+
+    outbox_reached_lock = asyncio.Event()
+    original_load_record = ow._load_easyweek_record_for_update
+
+    async def _observed_load_record(
+        session: AsyncSession,
+        candidate: MessageJob,
+    ) -> Record | None:
+        if candidate.id == job_id:
+            outbox_reached_lock.set()
+        return await original_load_record(session, candidate)
+
+    monkeypatch.setattr(ow, "_load_easyweek_record_for_update", _observed_load_record)
+
+    async with session_maker() as inbox_session:
+        async with inbox_session.begin():
+            record = (
+                await inbox_session.execute(select(Record).where(Record.id == record_id).with_for_update())
+            ).scalar_one()
+            record.raw = record_raw_with_service_category(record.raw, "Other Category")
+            await inbox_session.flush()
+
+            outbox_task = asyncio.create_task(
+                _process_job_in_new_transaction(
+                    session_maker,
+                    job_id,
+                    preload_record_id=record_id,
+                )
+            )
+            await asyncio.wait_for(outbox_reached_lock.wait(), timeout=5)
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(asyncio.shield(outbox_task), timeout=0.1)
+
+    await asyncio.wait_for(outbox_task, timeout=5)
+    async with session_maker() as verification:
+        persisted_job = await verification.get(MessageJob, job_id)
+        assert persisted_job is not None
+        assert persisted_job.status == "canceled"
+        assert persisted_job.last_error == "category_not_allowed"
+        assert (
+            await verification.execute(select(OutboxMessage).where(OutboxMessage.job_id == job_id))
+        ).scalars().all() == []
+    assert capture.template_calls == []
+    assert capture.text_calls == []
+
+
+async def test_outbox_holds_record_lock_through_provider_attempt_and_commit(
+    db: AsyncSession,
+    session_maker: async_sessionmaker[AsyncSession],
+    capture: CaptureProvider,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Order 2: outbox lock/send/commit -> inbox lock/category update."""
+    job = await _seed_easyweek_happy_path(db)
+    job_id = int(job.id)
+    record_id = int(job.record_id)
+    await db.commit()
+
+    provider_barrier = asyncio.Event()
+    release_provider = asyncio.Event()
+    inbox_started = asyncio.Event()
+    inbox_acquired_record = asyncio.Event()
+    order: list[str] = []
+
+    async def _barrier_send_template(*args: Any, **kwargs: Any) -> tuple[str, None]:
+        order.append("provider_attempt")
+        provider_barrier.set()
+        await release_provider.wait()
+        order.append("provider_return")
+        return "serialized-msg-1", None
+
+    monkeypatch.setattr(ow, "safe_send_template", _barrier_send_template)
+
+    async def _inbox_update() -> None:
+        inbox_started.set()
+        async with session_maker() as inbox_session:
+            async with inbox_session.begin():
+                record = (
+                    await inbox_session.execute(
+                        select(Record)
+                        .where(Record.id == record_id)
+                        .with_for_update()
+                        .execution_options(populate_existing=True)
+                    )
+                ).scalar_one()
+                order.append("inbox_record_lock")
+                inbox_acquired_record.set()
+                committed_send = (
+                    (await inbox_session.execute(select(OutboxMessage).where(OutboxMessage.job_id == job_id)))
+                    .scalars()
+                    .all()
+                )
+                assert len(committed_send) == 1
+                order.append("committed_send_visible")
+                record.raw = record_raw_with_service_category(record.raw, "Other Category")
+            order.append("inbox_commit")
+
+    outbox_task = asyncio.create_task(_process_job_in_new_transaction(session_maker, job_id, order=order))
+    await asyncio.wait_for(provider_barrier.wait(), timeout=5)
+    inbox_task = asyncio.create_task(_inbox_update())
+    await asyncio.wait_for(inbox_started.wait(), timeout=5)
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(inbox_acquired_record.wait(), timeout=0.1)
+
+    release_provider.set()
+    await asyncio.wait_for(outbox_task, timeout=5)
+    await asyncio.wait_for(inbox_task, timeout=5)
+
+    assert order.index("provider_return") < order.index("outbox_commit")
+    assert order.index("provider_return") < order.index("inbox_record_lock")
+    assert order.index("inbox_record_lock") < order.index("committed_send_visible")
+    assert order.index("committed_send_visible") < order.index("inbox_commit")
+    async with session_maker() as verification:
+        persisted_job = await verification.get(MessageJob, job_id)
+        record = await verification.get(Record, record_id)
+        assert persisted_job is not None and persisted_job.status == "done"
+        assert record is not None
+        assert record.raw["easyweek"]["service_category"] == "Other Category"
+        assert (
+            len(
+                (await verification.execute(select(OutboxMessage).where(OutboxMessage.job_id == job_id)))
+                .scalars()
+                .all()
+            )
+            == 1
+        )
+    assert len(capture.template_calls) == 0  # overridden barrier captured the call
+
+
+async def test_altegio_lifecycle_record_load_does_not_request_easyweek_mutex(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job = await _seed_altegio_happy_path(db)
+    observed = 0
+    original_load_record = ow._load_record
+
+    async def _observed_load_record(
+        session: AsyncSession,
+        candidate: MessageJob,
+    ) -> Record | None:
+        nonlocal observed
+        observed += 1
+        return await original_load_record(session, candidate)
+
+    async def _forbidden_easyweek_mutex(*args: Any, **kwargs: Any) -> Record | None:
+        raise AssertionError("Altegio path requested EasyWeek Record mutex")
+
+    monkeypatch.setattr(ow, "_load_record", _observed_load_record)
+    monkeypatch.setattr(ow, "_load_easyweek_record_for_update", _forbidden_easyweek_mutex)
+    await _run_job(db, job)
+
+    assert job.status == "done", job.last_error
+    assert observed >= 1
+    assert len(capture.template_calls) == 1
+
+
 async def test_pre_pr71_queued_job_without_snapshot_is_canceled_locally(
     db: AsyncSession,
     capture: CaptureProvider,
@@ -1942,7 +2232,7 @@ async def test_pre_pr71_queued_job_without_snapshot_is_canceled_locally(
 
     await _run_job(db, job)
 
-    _assert_category_suppressed(job, capture, await _outbox_rows(db, job), "category_missing")
+    _assert_category_suppressed(job, capture, await _outbox_rows(db, job), "service_count_unproven")
 
 
 async def test_altegio_lifecycle_send_ignores_easyweek_category_configuration(

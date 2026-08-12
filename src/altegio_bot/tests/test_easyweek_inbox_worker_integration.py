@@ -25,7 +25,9 @@ from altegio_bot.easyweek_normalizer import NormalizationError, canonical_bookin
 from altegio_bot.easyweek_service_category import (
     EASYWEEK_RAW_NAMESPACE,
     SERVICE_CATEGORY_SNAPSHOT_KEY,
+    SERVICES_COUNT_SNAPSHOT_KEY,
     service_category_from_record_raw,
+    services_count_from_record_raw,
 )
 from altegio_bot.models.models import Client, EasyWeekEvent, MessageJob, Record, RecordService
 from altegio_bot.settings import settings
@@ -385,6 +387,37 @@ async def test_notifications_enabled_creates_only_lifecycle_types(bound_session_
 # ===========================================================================
 
 
+@pytest.mark.parametrize("broken_allowlist", ["", "[]", "{invalid", '["Fixture Category", 7]'])
+async def test_unavailable_category_configuration_leaves_event_captured_until_fixed(
+    bound_session_local,
+    monkeypatch: pytest.MonkeyPatch,
+    broken_allowlist: str,
+) -> None:
+    monkeypatch.setattr(settings, "easyweek_notifications_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_allowed_service_categories", broken_allowlist, raising=False)
+    async with bound_session_local() as session:
+        async with session.begin():
+            event_id = await _capture(session, booking_created(), payload_hash="config-recovery")
+
+    assert await worker.process_one() is False
+    async with bound_session_local() as session:
+        event = await session.get(EasyWeekEvent, event_id)
+        assert event is not None and event.status == "captured"
+        assert await _counts(session) == (0, 0, 0)
+
+    monkeypatch.setattr(
+        settings,
+        "easyweek_allowed_service_categories",
+        json.dumps(["Fixture Category"]),
+        raising=False,
+    )
+    assert await worker.process_one() is True
+    async with bound_session_local() as session:
+        event = await session.get(EasyWeekEvent, event_id)
+        assert event is not None and event.status == "processed"
+        assert await _counts(session) == (1, 1, 1)
+
+
 async def _capture_and_process(
     session_maker,
     payload: dict[str, Any],
@@ -425,7 +458,136 @@ async def test_allowed_create_persists_minimal_snapshot_and_plans_one_job(
     assert [job.job_type for job in jobs] == ["record_created"]
     async with bound_session_local() as session:
         record = (await session.execute(select(Record).where(Record.provider == "easyweek"))).scalars().one()
-        assert record.raw == {EASYWEEK_RAW_NAMESPACE: {SERVICE_CATEGORY_SNAPSHOT_KEY: "FIXTURE CATEGORY"}}
+        assert record.raw == {
+            EASYWEEK_RAW_NAMESPACE: {
+                SERVICE_CATEGORY_SNAPSHOT_KEY: "FIXTURE CATEGORY",
+                SERVICES_COUNT_SNAPSHOT_KEY: 1,
+            }
+        }
+
+
+@pytest.mark.parametrize(
+    ("payload_builder", "event_hint"),
+    [
+        (booking_created, "booking-created"),
+        (booking_updated, "booking-updated"),
+        (booking_rescheduled, "booking-rescheduled"),
+        (booking_canceled, "booking-canceled"),
+    ],
+)
+async def test_multi_service_is_terminal_business_suppression_for_every_lifecycle_event(
+    bound_session_local,
+    monkeypatch: pytest.MonkeyPatch,
+    payload_builder,
+    event_hint: str,
+) -> None:
+    monkeypatch.setattr(settings, "easyweek_notifications_enabled", True, raising=False)
+    payload = payload_builder()
+    payload["services_count"] = 2
+    await _capture_and_process(
+        bound_session_local,
+        payload,
+        event_hint=event_hint,
+        payload_hash=f"multi-{event_hint}",
+    )
+
+    assert await _easyweek_jobs(bound_session_local) == []
+    async with bound_session_local() as session:
+        event = (await session.execute(select(EasyWeekEvent))).scalars().one()
+        record = (await session.execute(select(Record).where(Record.provider == "easyweek"))).scalars().one()
+        assert event.status == "processed"
+        assert services_count_from_record_raw(record.raw) == 2
+
+
+async def test_absent_service_count_update_preserves_single_service_proof_and_plans(
+    bound_session_local,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "easyweek_notifications_enabled", True, raising=False)
+    await _capture_and_process(
+        bound_session_local,
+        booking_created(),
+        event_hint="booking-created",
+        payload_hash="count-one-create",
+    )
+    update_payload = booking_updated()
+    update_payload.pop("services_count")
+    await _capture_and_process(
+        bound_session_local,
+        update_payload,
+        event_hint="booking-updated",
+        payload_hash="count-absent-update",
+    )
+
+    assert [job.job_type for job in await _easyweek_jobs(bound_session_local)] == [
+        "record_created",
+        "record_updated",
+    ]
+    async with bound_session_local() as session:
+        record = (await session.execute(select(Record).where(Record.provider == "easyweek"))).scalars().one()
+        assert services_count_from_record_raw(record.raw) == 1
+
+
+@pytest.mark.parametrize("cleared", [None, 0, -1, "1", 1.5, True, {}])
+async def test_explicit_unusable_service_count_clears_proof_and_suppresses(
+    bound_session_local,
+    monkeypatch: pytest.MonkeyPatch,
+    cleared: object,
+) -> None:
+    monkeypatch.setattr(settings, "easyweek_notifications_enabled", True, raising=False)
+    await _capture_and_process(
+        bound_session_local,
+        booking_created(),
+        event_hint="booking-created",
+        payload_hash="count-before-clear",
+    )
+    update_payload = booking_updated()
+    update_payload["services_count"] = cleared
+    await _capture_and_process(
+        bound_session_local,
+        update_payload,
+        event_hint="booking-updated",
+        payload_hash=f"count-clear-{cleared!r}",
+    )
+
+    assert [job.job_type for job in await _easyweek_jobs(bound_session_local)] == ["record_created"]
+    async with bound_session_local() as session:
+        record = (await session.execute(select(Record).where(Record.provider == "easyweek"))).scalars().one()
+        assert services_count_from_record_raw(record.raw) is None
+
+
+async def test_service_count_transition_one_to_multi_to_one_reopens_planning(
+    bound_session_local,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "easyweek_notifications_enabled", True, raising=False)
+    await _capture_and_process(
+        bound_session_local,
+        booking_created(),
+        event_hint="booking-created",
+        payload_hash="count-transition-one",
+    )
+    multi = booking_updated()
+    multi["services_count"] = 2
+    await _capture_and_process(
+        bound_session_local,
+        multi,
+        event_hint="booking-updated",
+        payload_hash="count-transition-two",
+    )
+    single = booking_updated()
+    single["services_count"] = 1
+    await _capture_and_process(
+        bound_session_local,
+        single,
+        event_hint="booking-updated",
+        payload_hash="count-transition-back-one",
+    )
+
+    assert [job.job_type for job in await _easyweek_jobs(bound_session_local)] == [
+        "record_created",
+        "record_updated",
+    ]
 
 
 @pytest.mark.parametrize("category", ["Other Category", None])
@@ -564,6 +726,7 @@ async def test_cancel_uses_persisted_allowed_category(
     )
     cancel_payload = booking_canceled()
     cancel_payload.pop("service_category")
+    cancel_payload.pop("services_count")
     await _capture_and_process(
         bound_session_local,
         cancel_payload,
@@ -572,6 +735,36 @@ async def test_cancel_uses_persisted_allowed_category(
     )
     jobs = await _easyweek_jobs(bound_session_local)
     assert [job.job_type for job in jobs] == ["record_created", "record_canceled"]
+
+
+async def test_cancel_without_count_uses_persisted_multi_service_suppression(
+    bound_session_local,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "easyweek_notifications_enabled", True, raising=False)
+    created = booking_created()
+    created["services_count"] = 2
+    await _capture_and_process(
+        bound_session_local,
+        created,
+        event_hint="booking-created",
+        payload_hash="multi-before-cancel",
+    )
+    canceled = booking_canceled()
+    canceled.pop("service_category")
+    canceled.pop("services_count")
+    await _capture_and_process(
+        bound_session_local,
+        canceled,
+        event_hint="booking-canceled",
+        payload_hash="multi-absent-cancel",
+    )
+
+    assert await _easyweek_jobs(bound_session_local) == []
+    async with bound_session_local() as session:
+        record = (await session.execute(select(Record).where(Record.provider == "easyweek"))).scalars().one()
+        assert services_count_from_record_raw(record.raw) == 2
+        assert record.is_deleted is True
 
 
 @pytest.mark.parametrize("cleared", [None, "", "  ", 42, "bad\nvalue"])
@@ -603,7 +796,11 @@ async def test_explicit_unusable_category_clears_eligibility(
         assert service_category_from_record_raw(record.raw) is None
 
 
-async def test_notifications_disabled_still_saves_category_snapshot(bound_session_local) -> None:
+async def test_notifications_disabled_processes_snapshot_even_with_invalid_allowlist(
+    bound_session_local,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "easyweek_allowed_service_categories", "{invalid", raising=False)
     payload = booking_created()
     payload["service_category"] = "Other Category"
     await _capture_and_process(
@@ -615,10 +812,11 @@ async def test_notifications_disabled_still_saves_category_snapshot(bound_sessio
     async with bound_session_local() as session:
         record = (await session.execute(select(Record).where(Record.provider == "easyweek"))).scalars().one()
         assert service_category_from_record_raw(record.raw) == "Other Category"
+        assert services_count_from_record_raw(record.raw) == 1
         assert await _counts(session) == (1, 1, 0)
 
 
-async def test_durlach_and_rastatt_registry_entries_share_identical_category_semantics(
+async def test_durlach_and_rastatt_share_identical_category_and_count_semantics(
     bound_session_local,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -671,7 +869,7 @@ async def test_durlach_and_rastatt_registry_entries_share_identical_category_sem
     }
 
     durlach_update = booking_updated()
-    durlach_update["service_category"] = "Other Category"
+    durlach_update["services_count"] = 2
     rastatt_update = booking_updated()
     rastatt_update.update(
         {
@@ -680,7 +878,7 @@ async def test_durlach_and_rastatt_registry_entries_share_identical_category_sem
             "customer_id": rastatt_allowed["customer_id"],
             "location_id": second_id,
             "location_uuid": second_uuid,
-            "service_category": "Other Category",
+            "services_count": 2,
         }
     )
     async with bound_session_local() as session:
@@ -707,7 +905,8 @@ async def test_durlach_and_rastatt_registry_entries_share_identical_category_sem
             .all()
         )
         assert {record.company_id for record in records} == {TEST_LOCATION_ID, second_id}
-        assert {service_category_from_record_raw(record.raw) for record in records} == {"Other Category"}
+        assert {service_category_from_record_raw(record.raw) for record in records} == {"Fixture Category"}
+        assert {services_count_from_record_raw(record.raw) for record in records} == {2}
 
 
 async def test_no_marketing_or_reminder_jobs_are_ever_planned(bound_session_local, monkeypatch) -> None:

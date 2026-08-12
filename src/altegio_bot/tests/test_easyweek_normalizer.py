@@ -33,14 +33,18 @@ from altegio_bot.easyweek_service_category import (
     ALLOWED,
     ALLOWED_CATEGORIES_INVALID,
     ALLOWED_CATEGORIES_UNCONFIGURED,
+    CATEGORY_AMBIGUOUS_MULTI_SERVICE,
     CATEGORY_MISSING,
     CATEGORY_NOT_ALLOWED,
     MAX_ALLOWED_SERVICE_CATEGORIES,
     MAX_SERVICE_CATEGORY_LENGTH,
+    SERVICE_COUNT_UNPROVEN,
     evaluate_service_category,
     normalize_service_category,
     parse_allowed_service_categories,
     record_raw_with_service_category,
+    record_raw_with_services_count,
+    services_count_from_record_raw,
 )
 from altegio_bot.tests.easyweek_fixtures import (
     FOREIGN_LOCATION_ID,
@@ -690,6 +694,7 @@ def _category_eligibility(category: object, raw_allowlist: object = '["Wimpernve
         {"unrelated": {"kept": True}},
         normalized.value if normalized is not None else None,
     )
+    record_raw = record_raw_with_services_count(record_raw, 1)
     return evaluate_service_category(record_raw=record_raw, allowed_categories_raw=raw_allowlist)
 
 
@@ -766,7 +771,10 @@ def test_empty_allowlist_is_unconfigured_and_allows_nothing(raw: str) -> None:
     parsed = parse_allowed_service_categories(raw)
     assert parsed.configured is False
     assert parsed.ready is False
-    assert _category_eligibility("Wimpernverlängerung", raw).reason == ALLOWED_CATEGORIES_UNCONFIGURED
+    eligibility = _category_eligibility("Wimpernverlängerung", raw)
+    assert eligibility.reason == ALLOWED_CATEGORIES_UNCONFIGURED
+    assert eligibility.recoverable_configuration is True
+    assert eligibility.terminal_business_suppression is False
 
 
 @pytest.mark.parametrize(
@@ -801,6 +809,65 @@ def test_parser_result_and_eligibility_never_echo_raw_configuration() -> None:
     assert secret_like_raw not in repr(result)
 
 
+def test_invalid_allowlist_is_explicitly_recoverable_not_business_suppression() -> None:
+    result = _category_eligibility("Wimpernverlängerung", "{invalid")
+    assert result.reason == ALLOWED_CATEGORIES_INVALID
+    assert result.recoverable_configuration is True
+    assert result.terminal_business_suppression is False
+
+
+@pytest.mark.parametrize(
+    ("services_count", "expected_reason"),
+    [
+        (None, SERVICE_COUNT_UNPROVEN),
+        (0, SERVICE_COUNT_UNPROVEN),
+        (2, CATEGORY_AMBIGUOUS_MULTI_SERVICE),
+        (99, CATEGORY_AMBIGUOUS_MULTI_SERVICE),
+    ],
+)
+def test_only_persisted_single_service_count_can_authorize(
+    services_count: int | None,
+    expected_reason: str,
+) -> None:
+    raw = record_raw_with_service_category({}, "Wimpernverlängerung")
+    raw = record_raw_with_services_count(raw, services_count)
+    result = evaluate_service_category(
+        record_raw=raw,
+        allowed_categories_raw='["Wimpernverlängerung"]',
+    )
+    assert result.reason == expected_reason
+    assert result.terminal_business_suppression is True
+
+
+@pytest.mark.parametrize("value", [None, -1, True, "1", 1.5, {}, 2**63])
+def test_present_unusable_service_count_clears_proof_without_rejecting_event(value: object) -> None:
+    payload = booking_created()
+    payload["services_count"] = value
+    booking = _normalize(payload)
+    assert booking is not None
+    assert booking.services_count is None
+    assert booking.carries("services_count")
+
+
+def test_zero_service_count_remains_a_display_value_but_not_eligibility_proof() -> None:
+    payload = booking_created()
+    payload["services_count"] = 0
+    booking = _normalize(payload)
+    assert booking is not None
+    assert booking.services_count == 0
+    raw = record_raw_with_services_count({}, booking.services_count)
+    assert services_count_from_record_raw(raw) is None
+
+
+def test_absent_service_count_preserves_patch_semantics() -> None:
+    payload = booking_updated()
+    payload.pop("services_count")
+    booking = _normalize(payload)
+    assert booking is not None
+    assert booking.services_count is None
+    assert not booking.carries("services_count")
+
+
 def test_category_snapshot_returns_a_new_dict_and_preserves_unrelated_keys() -> None:
     original = {"outside": {"kept": True}, "easyweek": {"other": "kept"}}
     updated = record_raw_with_service_category(original, "Wimpernverlängerung")
@@ -813,6 +880,22 @@ def test_category_snapshot_returns_a_new_dict_and_preserves_unrelated_keys() -> 
 
     cleared = record_raw_with_service_category(updated, None)
     assert cleared == {"outside": {"kept": True}, "easyweek": {"other": "kept"}}
+
+
+def test_service_count_snapshot_is_minimal_patchable_and_revalidated() -> None:
+    original = {"outside": {"kept": True}, "easyweek": {"service_category": "Wimpernverlängerung"}}
+    updated = record_raw_with_services_count(original, 2)
+    assert updated is not original
+    assert services_count_from_record_raw(updated) == 2
+    assert original == {
+        "outside": {"kept": True},
+        "easyweek": {"service_category": "Wimpernverlängerung"},
+    }
+
+    for invalid in (None, 0, -1, True):
+        cleared = record_raw_with_services_count(updated, invalid)  # type: ignore[arg-type]
+        assert services_count_from_record_raw(cleared) is None
+        assert cleared["easyweek"] == {"service_category": "Wimpernverlängerung"}
 
 
 # ===========================================================================

@@ -18,10 +18,13 @@ MAX_SERVICE_CATEGORY_LENGTH: Final = 128
 
 EASYWEEK_RAW_NAMESPACE: Final = "easyweek"
 SERVICE_CATEGORY_SNAPSHOT_KEY: Final = "service_category"
+SERVICES_COUNT_SNAPSHOT_KEY: Final = "services_count"
 
 ALLOWED: Final = "allowed"
 CATEGORY_MISSING: Final = "category_missing"
 CATEGORY_NOT_ALLOWED: Final = "category_not_allowed"
+CATEGORY_AMBIGUOUS_MULTI_SERVICE: Final = "category_ambiguous_multi_service"
+SERVICE_COUNT_UNPROVEN: Final = "service_count_unproven"
 ALLOWED_CATEGORIES_UNCONFIGURED: Final = "allowed_categories_unconfigured"
 ALLOWED_CATEGORIES_INVALID: Final = "allowed_categories_invalid"
 
@@ -46,6 +49,15 @@ class AllowedServiceCategories:
     def ready(self) -> bool:
         return self.configured and self.valid and bool(self.keys)
 
+    @property
+    def unavailable_reason(self) -> str | None:
+        """Stable reason for an unusable configuration, if any."""
+        if not self.configured:
+            return ALLOWED_CATEGORIES_UNCONFIGURED
+        if not self.valid:
+            return ALLOWED_CATEGORIES_INVALID
+        return None
+
 
 @dataclass(frozen=True)
 class ServiceCategoryEligibility:
@@ -53,6 +65,11 @@ class ServiceCategoryEligibility:
 
     allowed: bool
     reason: str
+    recoverable_configuration: bool = False
+
+    @property
+    def terminal_business_suppression(self) -> bool:
+        return not self.allowed and not self.recoverable_configuration
 
 
 def normalize_service_category(value: object) -> NormalizedServiceCategory | None:
@@ -135,6 +152,29 @@ def record_raw_with_service_category(raw: object, category: str | None) -> dict:
     return updated
 
 
+def record_raw_with_services_count(raw: object, services_count: int | None) -> dict:
+    """Return a new JSONB object with the minimal service-count proof.
+
+    Only a positive, non-bool integer is persisted. Explicit null, zero,
+    negative or malformed input removes the proof; callers use presence
+    tracking to distinguish that clear from an absent patch field.
+    """
+    updated = dict(raw) if isinstance(raw, Mapping) else {}
+    namespace_raw = updated.get(EASYWEEK_RAW_NAMESPACE)
+    namespace = dict(namespace_raw) if isinstance(namespace_raw, Mapping) else {}
+
+    if isinstance(services_count, bool) or not isinstance(services_count, int) or services_count <= 0:
+        namespace.pop(SERVICES_COUNT_SNAPSHOT_KEY, None)
+    else:
+        namespace[SERVICES_COUNT_SNAPSHOT_KEY] = services_count
+
+    if namespace:
+        updated[EASYWEEK_RAW_NAMESPACE] = namespace
+    else:
+        updated.pop(EASYWEEK_RAW_NAMESPACE, None)
+    return updated
+
+
 def service_category_from_record_raw(raw: object) -> str | None:
     """Read and revalidate the persisted category proof without guessing."""
     if not isinstance(raw, Mapping):
@@ -146,6 +186,19 @@ def service_category_from_record_raw(raw: object) -> str | None:
     return normalized.value if normalized is not None else None
 
 
+def services_count_from_record_raw(raw: object) -> int | None:
+    """Read a positive persisted count without coercing corrupted JSONB."""
+    if not isinstance(raw, Mapping):
+        return None
+    namespace = raw.get(EASYWEEK_RAW_NAMESPACE)
+    if not isinstance(namespace, Mapping):
+        return None
+    value = namespace.get(SERVICES_COUNT_SNAPSHOT_KEY)
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
+
+
 def evaluate_service_category(
     *,
     record_raw: object,
@@ -153,10 +206,18 @@ def evaluate_service_category(
 ) -> ServiceCategoryEligibility:
     """Evaluate persisted category proof against the configured exact allowlist."""
     allowed_categories = parse_allowed_service_categories(allowed_categories_raw)
-    if not allowed_categories.configured:
-        return ServiceCategoryEligibility(False, ALLOWED_CATEGORIES_UNCONFIGURED)
-    if not allowed_categories.valid:
-        return ServiceCategoryEligibility(False, ALLOWED_CATEGORIES_INVALID)
+    if unavailable_reason := allowed_categories.unavailable_reason:
+        return ServiceCategoryEligibility(
+            False,
+            unavailable_reason,
+            recoverable_configuration=True,
+        )
+
+    services_count = services_count_from_record_raw(record_raw)
+    if services_count is None:
+        return ServiceCategoryEligibility(False, SERVICE_COUNT_UNPROVEN)
+    if services_count != 1:
+        return ServiceCategoryEligibility(False, CATEGORY_AMBIGUOUS_MULTI_SERVICE)
 
     category = service_category_from_record_raw(record_raw)
     normalized = normalize_service_category(category)
@@ -171,12 +232,15 @@ __all__ = [
     "ALLOWED",
     "ALLOWED_CATEGORIES_INVALID",
     "ALLOWED_CATEGORIES_UNCONFIGURED",
+    "CATEGORY_AMBIGUOUS_MULTI_SERVICE",
     "CATEGORY_MISSING",
     "CATEGORY_NOT_ALLOWED",
     "EASYWEEK_RAW_NAMESPACE",
     "MAX_ALLOWED_SERVICE_CATEGORIES",
     "MAX_SERVICE_CATEGORY_LENGTH",
     "SERVICE_CATEGORY_SNAPSHOT_KEY",
+    "SERVICES_COUNT_SNAPSHOT_KEY",
+    "SERVICE_COUNT_UNPROVEN",
     "AllowedServiceCategories",
     "NormalizedServiceCategory",
     "ServiceCategoryEligibility",
@@ -184,5 +248,7 @@ __all__ = [
     "normalize_service_category",
     "parse_allowed_service_categories",
     "record_raw_with_service_category",
+    "record_raw_with_services_count",
     "service_category_from_record_raw",
+    "services_count_from_record_raw",
 ]

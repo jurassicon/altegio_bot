@@ -451,6 +451,13 @@ EASYWEEK_ALLOWED_SERVICE_CATEGORIES=["Wimpernverlängerung"]
 `altegio-outbox-worker`, поэтому после её изменения оба контейнера требуется
 пересоздать через `--force-recreate`.
 
+До отдельного реального multi-service capture действует временное строгое
+правило: только root-level `services_count=1` доказывает применимость singular
+`service_category`. Значение больше 1 подавляется как
+`category_ambiguous_multi_service`; отсутствующий/null/invalid/0 count и старый
+snapshot без count — как `service_count_unproven`. `quantity`, текст услуги и
+`RecordService.amount` доказательством не являются.
+
 После записи нового реестра пересоздайте **оба** его потребителя. Обычный
 `restart` и `up -d` без `--force-recreate` не перечитывают `env_file`:
 
@@ -787,9 +794,35 @@ ORDER BY status;
 
 ```bash
 $COMPOSE logs --since='<smoke_start>' altegio-easyweek-inbox-worker altegio-outbox-worker \
-  | grep -Eo 'reason=(category_missing|category_not_allowed|allowed_categories_unconfigured|allowed_categories_invalid)' \
+  | grep -Eo 'reason=(category_missing|category_not_allowed|category_ambiguous_multi_service|service_count_unproven|allowed_categories_unconfigured|allowed_categories_invalid)' \
   | sort | uniq -c
 ```
+
+`category_missing`, `category_not_allowed`,
+`category_ambiguous_multi_service` и `service_count_unproven` — terminal
+business suppression. `allowed_categories_unconfigured` и
+`allowed_categories_invalid` означают recoverable configuration outage:
+inbox не claim'ит новые events при включённых notifications, а outbox не
+отменяет job, а откладывает её с bounded backoff без расхода Meta attempts.
+
+Безопасное восстановление после invalid/unconfigured allowlist:
+
+1. Установить `EASYWEEK_NOTIFICATIONS_ENABLED=false` и force-recreate inbox
+   worker. При необходимости дождаться обработки captured backlog: domain
+   snapshot обновляется, но lifecycle jobs не создаются.
+2. Исправить allowlist, сохранив production-инвариант
+   `EASYWEEK_ALLOWED_SERVICE_CATEGORIES=["Wimpernverlängerung"]`.
+3. Force-recreate inbox и outbox workers и повторить effective-config probe:
+   configured=true, valid=true, count=1, без печати raw env.
+4. Установить notifications=true и снова force-recreate inbox worker. Captured
+   events после configuration outage сразу снова доступны claim'у; queued jobs
+   outbox повторно проходят identity/category/count guards и штатный deadline.
+
+Отдельный production follow-up до любого ослабления count gate: создать одну
+контролируемую смешанную multi-service booking, сохранить безопасный реальный
+webhook capture для анализа и подтвердить отсутствие job/Outbox/send. Не
+выводить payload/category/PII в консоль и не включать поддержку multi-service в
+этом rollout; её семантика принимается только отдельным будущим решением.
 
 Последняя проверка log hygiene — ожидается `0`; названия категорий, услуг,
 payload и PII в логах не допускаются:
