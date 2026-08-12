@@ -689,17 +689,54 @@ PR-8 и reminders не начинаются, пока этот gate не про�
 запускаются pytest, миграционные тесты или произвольные replay: только
 read-only SQL/log checks ниже и две контролируемые реальные smoke-записи.
 
+`EASYWEEK_NOTIFICATIONS_ENABLED` остаётся `true` на всём протяжении rollout.
+Write fence — это `EASYWEEK_PROCESSING_ENABLED`.
+
+> **Запрещённая пара.** Работающий inbox worker не должен ни на одном шаге
+> rollout видеть `EASYWEEK_PROCESSING_ENABLED=true` одновременно с
+> `EASYWEEK_NOTIFICATIONS_ENABLED=false`. В этом режиме
+> `processing_is_configured()` возвращает `true`, то есть **разрешает claim**:
+> worker забирает новые captured events, обновляет domain snapshot, выходит из
+> `plan_lifecycle_job()` до INSERT и переводит event в терминальный `processed`
+> без lifecycle job. Автоматического replay после обратного включения
+> notifications нет, поэтому даже короткое deploy-окно необратимо теряет
+> клиентские уведомления. Единственная процедура, где эта пара допустима, —
+> явно необратимый domain-only drain (§6A, раздел восстановления); он не
+> является ни rollout, ни recovery, и настоящий порядок на него не ссылается.
+
 Порядок строгий:
 
-1. В `easyweek.env` временно установить
-   `EASYWEEK_NOTIFICATIONS_ENABLED=false`.
-2. Пересоздать inbox worker, чтобы он перестал планировать новые lifecycle jobs:
+1. В `easyweek.env` поставить write fence, не трогая notifications:
+
+```text
+EASYWEEK_PROCESSING_ENABLED=false
+```
+
+   `EASYWEEK_NOTIFICATIONS_ENABLED` остаётся `true` и на этом шаге не
+   редактируется.
+
+2. Пересоздать **только** inbox worker, чтобы он перестал claim'ить новые
+   события:
 
 ```bash
 $COMPOSE up -d --force-recreate altegio-easyweek-inbox-worker
 ```
 
-3. Проверить незавершённую EasyWeek lifecycle-очередь:
+3. Убедиться, что claim действительно остановлен. Выполнить запрос дважды с
+   интервалом в минуту: `captured` не должен убывать, новые `processed` не
+   должны появляться.
+
+```sql
+SELECT status, count(*)
+FROM easyweek_events
+GROUP BY status
+ORDER BY status;
+```
+
+   Живые вебхуки продолжают приниматься и копиться в `captured` — это и есть
+   цель fence: события сохраняются до включения нового фильтра.
+
+4. Дождаться завершения lifecycle jobs, созданных **до** fence:
 
 ```sql
 SELECT status, count(*)
@@ -711,64 +748,125 @@ GROUP BY status
 ORDER BY status;
 ```
 
-Ожидается 0 строк. Если очередь непуста — **STOP** и разбор каждой job до
-deploy; автоматически отменять или переписывать её этим rollout нельзя.
+   Ожидается 0 строк. Если очередь непуста — **STOP** и разбор каждой job до
+   deploy; автоматически отменять или переписывать её этим rollout нельзя.
 
-4. Записать точный production allowlist:
+5. Записать точный production allowlist:
 
 ```text
 EASYWEEK_ALLOWED_SERVICE_CATEGORIES=["Wimpernverlängerung"]
 ```
 
-5. Развернуть новый код, не включая notifications.
-6. Force-recreate оба потребителя настройки:
+6. Развернуть новый код при `EASYWEEK_PROCESSING_ENABLED=false`. Notifications
+   по-прежнему не трогаются.
+7. Проверить effective-конфигурацию одноразовым контейнером, который не
+   запускает loop (probe из §4). Gate проверяет только booleans и количество:
+   `configured=true`, `valid=true`, `count=1`, а также
+   `notifications_enabled=true`. Raw env и название категории не печатаются.
+8. Пересоздать `altegio-outbox-worker` с новым кодом и валидной конфигурацией:
 
 ```bash
-$COMPOSE up -d --force-recreate \
-  altegio-easyweek-inbox-worker altegio-outbox-worker
+$COMPOSE up -d --force-recreate altegio-outbox-worker
 ```
 
-7. Повторить effective-config probe из §4 в обоих контейнерах. Gate проверяет
-   только booleans и количество: configured=true, valid=true, count=1. Raw env
-   и название категории не печатаются.
-8. Установить `EASYWEEK_NOTIFICATIONS_ENABLED=true` и снова пересоздать только
-   inbox worker:
+9. Ещё раз подтвердить, что `EASYWEEK_NOTIFICATIONS_ENABLED=true` — до снятия
+   fence, а не после.
+10. Снять write fence:
+
+```text
+EASYWEEK_PROCESSING_ENABLED=true
+```
+
+11. Пересоздать inbox worker:
 
 ```bash
 $COMPOSE up -d --force-recreate altegio-easyweek-inbox-worker
 ```
 
-9. Создать одну контролируемую запись с категорией `Wimpernverlängerung` и
-   записать её новый `easyweek_events.id` как `<allowed_event_id>`.
-10. Создать одну контролируемую запись другой категории и записать её event id
-    как `<disallowed_event_id>`. Не подбирать текст услуги под ресничную
-    категорию: фильтр намеренно смотрит только root-level category.
-11. Проверить обе строки без вывода category, payload или клиентских данных:
+12. Сохранённые за время fence `captured` события проходят новый
+    category-фильтр: разрешённые создают lifecycle job, остальные штатно
+    suppress'атся по стабильной технической причине. Ни одно из них не было
+    списано терминально без решения фильтра.
+
+### Контролируемый smoke rollout
+
+Положительным доказательством является **новая** job, созданная после начала
+smoke. Resend старой доставки таким доказательством быть не может: он
+воспроизводит тот же `event_hint`, `booking_uuid` и `payload_hash`, а значит и
+тот же expected dedupe key, поэтому находит job, созданную задолго до rollout.
+Поэтому smoke делается только на новых bookings с новыми `booking_uuid`.
+
+1. Зафиксировать baseline до создания smoke-записей:
 
 ```sql
-SELECT e.id AS event_id,
-       e.status,
-       r.id AS record_id,
-       r.company_id,
-       count(DISTINCT j.id) AS lifecycle_jobs,
-       count(DISTINCT o.id) AS outbox_rows
-FROM easyweek_events e
-LEFT JOIN records r
-       ON r.provider = 'easyweek'
-      AND r.easyweek_booking_uuid = e.booking_uuid
-LEFT JOIN message_jobs j
-       ON j.provider = 'easyweek'
-      AND j.record_id = r.id
-      AND j.job_type IN ('record_created', 'record_updated', 'record_canceled')
-LEFT JOIN outbox_messages o ON o.job_id = j.id
-WHERE e.id IN (<allowed_event_id>, <disallowed_event_id>)
-GROUP BY e.id, e.status, r.id, r.company_id
-ORDER BY e.id;
+SELECT COALESCE(MAX(id), 0) AS smoke_event_id_baseline
+FROM easyweek_events;
 ```
 
-Обе доставки обязаны быть `processed`, обе — иметь `Record`. У allowed event
-ожидаются одна lifecycle job и один sent Outbox после обработки; у disallowed
-— `lifecycle_jobs=0`, `outbox_rows=0`, Meta/Chatwoot сообщений нет.
+   Записать результат как `<baseline_event_id>` и текущий UTC-момент как
+   `<smoke_start>`.
+
+2. Создать **новую** allowed single-service booking категории
+   `Wimpernverlängerung` — новая запись, новый `booking_uuid`. Записать её
+   `easyweek_events.id` как `<allowed_event_id>`.
+3. Создать **новую** disallowed single-service booking другой категории —
+   отдельная новая booking с собственным `booking_uuid`. Записать её id как
+   `<disallowed_event_id>`. Не подбирать текст услуги под ресничную категорию:
+   фильтр намеренно смотрит только root-level category.
+4. Проверить обе доставки одной read-only командой:
+
+```bash
+$COMPOSE run --rm --no-deps \
+  --entrypoint /app/.venv/bin/python \
+  altegio-easyweek-inbox-worker \
+  -m altegio_bot.scripts.easyweek_recovery_audit \
+  --baseline-event-id <baseline_event_id> \
+  --smoke-start '<smoke_start>' \
+  --smoke-event-id <allowed_event_id> \
+  --smoke-event-id <disallowed_event_id>
+```
+
+   Команда read-only, не поднимает worker loop, использует production
+   `easyweek_job_dedupe_key()` и печатает только booleans, counts и технические
+   ID. `booking_uuid`, dedupe key, payload, категория и клиентские данные не
+   выводятся. Отсутствующий event, нераспознанный hint или `booking_uuid=NULL`
+   приводят к ошибке, а не к зелёному отчёту.
+
+   Общий gate для обеих записей: `distinct_bookings=2`,
+   `newer_than_baseline=true`, `booking_first_seen_here=true`. Последнее и
+   отличает новую booking от Resend: у Resend более ранний event с тем же
+   `booking_uuid` уже существует.
+
+   Gate для `<allowed_event_id>`:
+
+   | Поле | Ожидание |
+   | --- | --- |
+   | `event_status` | `processed` |
+   | `expected_job_type` | соответствует hint доставки |
+   | `exact_jobs` | ровно `1` |
+   | `job_created_after_smoke_start` | `true` — это и есть положительное доказательство |
+   | `job_type_matches_event` | `true` |
+   | `job_company_matches_record` | `true` |
+   | `job_record_matches_booking` | `true` |
+   | `job_statuses` | одно объяснимое значение: `queued`, `processing`, `done` либо terminal по штатному deadline |
+   | `outbox_rows` | штатный lifecycle: одна доставка, дошедшая до `sent` |
+
+   Gate для `<disallowed_event_id>`:
+
+   | Поле | Ожидание |
+   | --- | --- |
+   | `event_status` | `processed` |
+   | `record_id` | не `null` — domain snapshot сохранён |
+   | `exact_jobs` | `0` |
+   | `outbox_rows` | `0` |
+   | Meta / Chatwoot | сообщений нет |
+
+   Отсутствие job у disallowed объясняется контролируемым disallowed payload
+   contract этой конкретной smoke-записи, а не текущим `Record.raw`.
+
+   Gate привязан к `<allowed_event_id>` и `<disallowed_event_id>`. Агрегаты за
+   окно (ниже) — только наблюдаемость: при живом трафике в окно попадают чужие
+   события, поэтому изменение общего счётчика ничего не доказывает.
 
 Безопасная агрегированная наблюдаемость за выбранное окно:
 
@@ -963,53 +1061,69 @@ notifications. Различить эти случаи по текущему `Rec
 ##### Уровень B — контролируемый smoke, обязательное положительное доказательство
 
 Уровень A показывает, что не потерялось. Что pipeline **снова работает**,
-доказывает только новая контролируемая доставка.
+доказывает только новая доставка, создавшая новую job после восстановления.
 
-1. Создать (или сделать Resend) одну контролируемую **allowed** single-service
-   запись категории `Wimpernverlängerung`. Записать её `easyweek_events.id` как
-   `<allowed_event_id>`.
-2. Создать одну контролируемую запись **другой** категории. Записать её id как
+> **Resend запрещён как положительный smoke.** Byte-identical Resend сохраняет
+> `event_hint`, `booking_uuid` и `payload_hash`, а значит и тот же expected
+> `easyweek_job_dedupe_key()`. Если исходная доставка создала job ещё до
+> outage, аудит найдёт именно её: `exact_jobs=1` при том, что inbox worker мог
+> вообще не обработать новый event. Для исторического уровня A такая
+> группировка корректна — несколько byte-identical доставок образуют одну
+> delivery group, и одна job на группу означает успешную дедупликацию. Для
+> уровня B она бесполезна: доказывать надо создание **новой** job сейчас.
+> Поэтому smoke делается только на новой business identity. Update или
+> reschedule существующей booking тоже не подходит как основной вариант —
+> новая booking с новым `booking_uuid` даёт более простое доказательство того,
+> что старой exact job существовать не могло.
+
+1. Зафиксировать baseline **до** создания smoke-записей:
+
+```sql
+SELECT COALESCE(MAX(id), 0) AS smoke_event_id_baseline
+FROM easyweek_events;
+```
+
+   Записать результат как `<baseline_event_id>` и текущий UTC-момент как
+   `<smoke_start>`. Payload, категория, UUID, телефон и email не выводятся.
+
+2. Создать **новую** allowed single-service booking категории
+   `Wimpernverlängerung`: новая запись, новый `booking_uuid`, новый
+   `EasyWeekEvent`. Записать её id как `<allowed_event_id>`.
+3. Создать **новую** disallowed single-service booking другой категории —
+   отдельная booking с собственным новым `booking_uuid`. Записать её id как
    `<disallowed_event_id>`.
-3. Прогнать аудит по узкому окну этого smoke:
+4. Проверить обе доставки одной read-only командой:
 
 ```bash
 $COMPOSE run --rm --no-deps \
   --entrypoint /app/.venv/bin/python \
   altegio-easyweek-inbox-worker \
-  -m altegio_bot.scripts.easyweek_recovery_audit --since '<smoke_start>'
+  -m altegio_bot.scripts.easyweek_recovery_audit \
+  --baseline-event-id <baseline_event_id> \
+  --smoke-start '<smoke_start>' \
+  --smoke-event-id <allowed_event_id> \
+  --smoke-event-id <disallowed_event_id>
 ```
 
-   Gate: `<allowed_event_id>` **не** входит в
-   `no_event_specific_job_unclassified`, а `groups_with_exact_job` вырос
-   ровно на его группу. `<disallowed_event_id>` — наоборот: своей job у него
-   быть не должно.
+   Доказательства свежести, общие для обеих записей: `distinct_bookings=2`
+   (allowed и disallowed используют разные новые booking), у каждой
+   `newer_than_baseline=true` и `booking_first_seen_here=true`. Последнее прямо
+   исключает Resend: у повторной доставки существует более ранний event с тем
+   же `booking_uuid`.
 
-4. Проверить саму job allowed-доставки по её event-specific ключу, без вывода
-   категории и клиентских данных:
+   `<allowed_event_id>` обязан дать `event_status=processed`, `exact_jobs=1`,
+   `job_created_after_smoke_start=true`, `job_type_matches_event=true`,
+   `job_company_matches_record=true`, `job_record_matches_booking=true`,
+   объяснимый `job_statuses` и штатный `outbox_rows`. Новая exact job,
+   созданная после `<smoke_start>`, — и есть положительное доказательство
+   восстановления.
 
-```bash
-$COMPOSE run --rm --no-deps \
-  --entrypoint /app/.venv/bin/python \
-  altegio-easyweek-inbox-worker \
-  -c 'import asyncio; from sqlalchemy import select; from altegio_bot.db import SessionLocal; from altegio_bot.models.models import EasyWeekEvent, MessageJob, PROVIDER_EASYWEEK; from altegio_bot.easyweek_normalizer import easyweek_job_dedupe_key; from altegio_bot.scripts.easyweek_recovery_audit import expected_job_type
-async def main():
-    async with SessionLocal() as s:
-        e = (await s.execute(select(EasyWeekEvent).where(EasyWeekEvent.id == <allowed_event_id>))).scalars().one()
-        jt = expected_job_type(e.event_hint)
-        k = easyweek_job_dedupe_key(event_hint=e.event_hint, booking_uuid=e.booking_uuid, payload_hash=e.payload_hash, job_type=jt)
-        rows = (await s.execute(select(MessageJob.id, MessageJob.provider, MessageJob.company_id, MessageJob.record_id, MessageJob.job_type, MessageJob.status).where(MessageJob.dedupe_key == k))).all()
-        print({"event_id": e.id, "event_status": e.status, "expected_job_type": jt, "exact_jobs": len(rows), "jobs": [tuple(r) for r in rows]})
-asyncio.run(main())'
-```
+   `<disallowed_event_id>` обязан дать `event_status=processed`, непустой
+   `record_id`, `exact_jobs=0` и `outbox_rows=0`; Meta и Chatwoot не вызваны.
 
-   Ожидается ровно одна job: `provider='easyweek'`, ожидаемые `company_id`,
-   `record_id` и `job_type`, статус — любой объяснимый (`queued`,
-   `processing`, `done`, либо terminal по штатному deadline). Для
-   `<disallowed_event_id>` тот же запрос обязан вернуть `exact_jobs=0`.
-
-**Именно шаг 4 закрывает восстановление.** Старая job этой же записи здесь
-помочь не может: ключ включает `payload_hash` конкретной доставки, поэтому
-`booking-created` никогда не удовлетворит проверку `booking-updated`.
+   Gate привязан к этим двум конкретным event ID. Общий
+   `groups_with_exact_job` из уровня A главным gate быть не может: при живом
+   трафике в окно попадают чужие события.
 
 #### Staged fence, если inbox worker нужно остановить
 
@@ -1145,6 +1259,20 @@ WHERE provider = 'altegio'
 EASYWEEK_PROCESSING_ENABLED=true
 EASYWEEK_NOTIFICATIONS_ENABLED=false
 ```
+
+> **Это domain-only drain — необратимая операция, а не подготовительный шаг.**
+> Пара `processing=true` + `notifications=false` прогоняет captured backlog,
+> обновляя `Client`/`Record`, но делает события терминальными **без** lifecycle
+> jobs, и автоматического replay после этого не существует. Шаг допустим
+> только здесь, при первичной активации, когда backlog накоплен до запуска
+> интеграции и клиентских уведомлений за него никто не ждёт. Прежде чем его
+> выполнять, обязательно выполните все три требования из «Domain-only drain —
+> НЕОБРАТИМАЯ операция» (§6A): подсчитать `captured_backlog`, явно подтвердить
+> отказ от этих уведомлений с ответственным за клиентскую коммуникацию и
+> понимать, что вернуть их будет нельзя. Если backlog содержит записи, по
+> которым клиент ждёт подтверждения, — этот шаг пропускается: держите
+> `EASYWEEK_PROCESSING_ENABLED=false` при `EASYWEEK_NOTIFICATIONS_ENABLED=true`
+> до §7.1.3, как это делает штатный rollout §6A.
 
 2. Пересоздайте inbox-worker и убедитесь, что captured backlog обрабатывается
 по новой карте, а EasyWeek `MessageJob` ещё не создаются:

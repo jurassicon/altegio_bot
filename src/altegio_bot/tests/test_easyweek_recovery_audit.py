@@ -26,9 +26,11 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from altegio_bot.easyweek_normalizer import easyweek_job_dedupe_key
 from altegio_bot.models.models import PROVIDER_EASYWEEK, EasyWeekEvent, MessageJob, Record
 from altegio_bot.scripts.easyweek_recovery_audit import (
+    SmokeVerificationError,
     audit_recovery,
     expected_job_type,
     group_deliveries,
+    verify_controlled_smoke,
 )
 
 OUTAGE_START = datetime(2026, 8, 12, 9, 0, tzinfo=timezone.utc)
@@ -284,6 +286,159 @@ async def test_the_audit_window_is_honoured(
         report = await audit_recovery(session, since=OUTAGE_START)
 
     assert report.no_event_specific_job_unclassified == (2,), "events before the outage window are out of scope"
+
+
+# ---------------------------------------------------------------------------
+# Controlled smoke — Resend can never be the positive proof
+# ---------------------------------------------------------------------------
+
+SMOKE_START = OUTAGE_START + timedelta(hours=1)
+FRESH_BOOKING = uuid.UUID("aaaaaaaa-bbbb-4ccc-8ddd-000000000042")
+
+
+def _record(record_id: int, booking: uuid.UUID) -> Record:
+    return Record(
+        id=record_id,
+        provider=PROVIDER_EASYWEEK,
+        company_id=999501,
+        altegio_record_id=record_id,
+        easyweek_booking_uuid=booking,
+    )
+
+
+async def test_a_fresh_booking_with_a_new_job_is_a_valid_positive_smoke(
+    session_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    key = easyweek_job_dedupe_key(
+        event_hint="booking-created", booking_uuid=FRESH_BOOKING, payload_hash="fresh", job_type="record_created"
+    )
+    async with session_maker() as session:
+        await _seed(session, _record(77, FRESH_BOOKING))
+        job = _job(key, job_type="record_created", record_id=77)
+        job.created_at = SMOKE_START + timedelta(minutes=1)
+        await _seed(session, _event(90, "booking-created", booking=FRESH_BOOKING, payload_hash="fresh"), job)
+
+        result = await verify_controlled_smoke(session, event_ids=[90], baseline_event_id=89, smoke_start=SMOKE_START)
+
+    [event] = result["events"]  # type: ignore[index]
+    assert event["newer_than_baseline"] is True
+    assert event["booking_first_seen_here"] is True
+    assert event["exact_jobs"] == 1
+    assert event["job_created_after_smoke_start"] is True
+    assert event["job_type_matches_event"] is True
+    assert event["job_company_matches_record"] is True
+    assert event["job_record_matches_booking"] is True
+
+
+async def test_a_resend_of_a_pre_smoke_delivery_cannot_pass_as_a_positive_smoke(
+    session_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """The false green this contract exists for.
+
+    The Resend reproduces hint, booking uuid and payload hash, so it resolves to
+    the very same expected key and finds the job created long before the smoke.
+    `exact_jobs=1` looks green — both freshness axes must refuse it.
+    """
+    key = easyweek_job_dedupe_key(
+        event_hint="booking-created", booking_uuid=BOOKING, payload_hash="hash-a", job_type="record_created"
+    )
+    async with session_maker() as session:
+        await _seed(session, _record(55, BOOKING))
+        old_job = _job(key, job_type="record_created", record_id=55)
+        old_job.created_at = OUTAGE_START - timedelta(days=3)
+        await _seed(
+            session,
+            _event(10, "booking-created", payload_hash="hash-a", minutes=-4000),
+            _event(90, "booking-created", payload_hash="hash-a", minutes=70),  # the Resend
+            old_job,
+        )
+
+        result = await verify_controlled_smoke(session, event_ids=[90], baseline_event_id=89, smoke_start=SMOKE_START)
+
+    [event] = result["events"]  # type: ignore[index]
+    assert event["newer_than_baseline"] is True, "the Resend row itself is new — which is exactly the trap"
+    assert event["exact_jobs"] == 1, "and it does find a job, because the key is byte-identical"
+    assert event["booking_first_seen_here"] is False, "but this booking existed before the smoke"
+    assert event["job_created_after_smoke_start"] is False, "and the job predates the smoke — no new job was created"
+
+
+async def test_a_disallowed_smoke_must_have_no_exact_job_and_no_outbox(
+    session_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    async with session_maker() as session:
+        await _seed(session, _record(78, FRESH_BOOKING))
+        await _seed(session, _event(91, "booking-created", booking=FRESH_BOOKING, payload_hash="disallowed"))
+
+        result = await verify_controlled_smoke(session, event_ids=[91], baseline_event_id=89, smoke_start=SMOKE_START)
+
+    [event] = result["events"]  # type: ignore[index]
+    assert event["event_status"] == "processed", "a suppressed delivery is still processed terminally"
+    assert event["record_id"] == 78, "the domain snapshot is kept"
+    assert event["exact_jobs"] == 0
+    assert event["outbox_rows"] == 0
+
+
+async def test_distinct_bookings_are_counted_so_both_smokes_cannot_share_one(
+    session_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    other = uuid.UUID("aaaaaaaa-bbbb-4ccc-8ddd-000000000043")
+    async with session_maker() as session:
+        await _seed(
+            session,
+            _event(90, "booking-created", booking=FRESH_BOOKING),
+            _event(91, "booking-created", booking=other),
+        )
+
+        result = await verify_controlled_smoke(
+            session, event_ids=[90, 91], baseline_event_id=89, smoke_start=SMOKE_START
+        )
+
+    assert result["distinct_bookings"] == 2
+
+
+@pytest.mark.parametrize(
+    ("event_id", "row"),
+    [
+        (404, None),
+        (92, ("booking-created", None)),
+        (93, ("booking-succeeded", FRESH_BOOKING)),
+    ],
+    ids=["missing-event", "null-booking-uuid", "non-lifecycle-hint"],
+)
+async def test_the_smoke_fails_closed_instead_of_reporting_green(
+    session_maker: async_sessionmaker[AsyncSession],
+    event_id: int,
+    row: tuple[str, uuid.UUID | None] | None,
+) -> None:
+    async with session_maker() as session:
+        if row is not None:
+            hint, booking = row
+            await _seed(session, _event(event_id, hint, booking=booking))
+
+        with pytest.raises(SmokeVerificationError):
+            await verify_controlled_smoke(session, event_ids=[event_id], baseline_event_id=89, smoke_start=SMOKE_START)
+
+
+async def test_the_smoke_report_leaks_no_booking_uuid_or_dedupe_key(
+    session_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    key = easyweek_job_dedupe_key(
+        event_hint="booking-created", booking_uuid=FRESH_BOOKING, payload_hash="fresh", job_type="record_created"
+    )
+    async with session_maker() as session:
+        await _seed(session, _record(79, FRESH_BOOKING))
+        await _seed(
+            session,
+            _event(90, "booking-created", booking=FRESH_BOOKING, payload_hash="fresh"),
+            _job(key, job_type="record_created", record_id=79),
+        )
+
+        result = await verify_controlled_smoke(session, event_ids=[90], baseline_event_id=89, smoke_start=SMOKE_START)
+
+    rendered = str(result)
+    assert str(FRESH_BOOKING) not in rendered
+    assert key not in rendered
+    assert "fresh" not in rendered
 
 
 async def test_the_printed_report_carries_no_dedupe_key_or_payload(

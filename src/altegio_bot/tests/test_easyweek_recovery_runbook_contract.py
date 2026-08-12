@@ -15,18 +15,21 @@ invariants — deliberately not the full prose.
 
 from __future__ import annotations
 
+import inspect
 import uuid
 from pathlib import Path
 
 import pytest
 
 from altegio_bot.easyweek_normalizer import easyweek_job_dedupe_key
-from altegio_bot.scripts.easyweek_recovery_audit import expected_job_type
+from altegio_bot.scripts.easyweek_recovery_audit import expected_job_type, verify_controlled_smoke
 from altegio_bot.settings import settings
 from altegio_bot.workers.easyweek_inbox_worker import processing_is_configured
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 ACTIVATION_RUNBOOK = REPO_ROOT / "docs/easyweek/durlach_activation_runbook.md"
+
+VALID_ALLOWLIST = '["Wimpernverlängerung"]'
 
 VALID_LOCATION_MAP = (
     '{"durlach": {"location_id": 999501, '
@@ -46,6 +49,19 @@ DRAIN_HEADING = "#### Domain-only drain"
 # log-hygiene grep, which legitimately SEARCHES for leak markers.
 RECOVERY_REGION_END = "Отдельный production follow-up"
 
+# The active PR-7.1 rollout: everything from its heading up to the recovery
+# subsection. The forbidden flag pair has to be absent from the rollout itself,
+# not only from the recovery text that explains why it is forbidden.
+ROLLOUT_HEADING = "## 6A. Обязательный rollout PR-7.1: service-category filter"
+SMOKE_HEADING = "### Контролируемый smoke rollout"
+
+
+def _rollout() -> str:
+    """The PR-7.1 rollout region, excluding the recovery subsection."""
+    text = ACTIVATION_RUNBOOK.read_text()
+    start = text.index(ROLLOUT_HEADING)
+    return text[start : text.index(RECOVERY_HEADING, start)]
+
 
 def _runbook() -> str:
     """The recovery region only — everything this contract governs."""
@@ -63,6 +79,20 @@ def _code_blocks(section: str) -> list[str]:
     """
     parts = section.split("```")
     return parts[1::2]
+
+
+def _first_instruction_offset(section: str, token: str) -> int:
+    """Offset of the first FENCED block containing *token*.
+
+    Prose necessarily names the flags it forbids, so ordering assertions have to
+    look at what the operator actually applies, not at the warning above it.
+    """
+    offset = 0
+    for index, part in enumerate(section.split("```")):
+        if index % 2 == 1 and token in part:
+            return offset
+        offset += len(part) + 3
+    raise AssertionError(f"no fenced block contains {token}")
 
 
 def _section(text: str, heading: str) -> str:
@@ -321,10 +351,10 @@ def test_controlled_smoke_proves_both_directions() -> None:
 
     assert "<allowed_event_id>" in level_b
     assert "<disallowed_event_id>" in level_b
-    assert "easyweek_job_dedupe_key" in level_b
     assert "exact_jobs=0" in level_b, "the disallowed smoke must require the ABSENCE of an exact job"
-    assert "ровно одна job" in level_b
-    for field in ("MessageJob.provider", "MessageJob.company_id", "MessageJob.record_id", "MessageJob.job_type"):
+    assert "exact_jobs=1" in level_b, "the allowed smoke must require exactly one event-specific job"
+    # The job must belong to the right record and company, not merely exist.
+    for field in ("job_type_matches_event", "job_company_matches_record", "job_record_matches_booking"):
         assert field in level_b
 
 
@@ -332,9 +362,11 @@ def test_the_audit_command_is_read_only_and_leaks_nothing() -> None:
     audit = _section(_runbook(), LEVEL_A_HEADING) + _section(_runbook(), LEVEL_B_HEADING)
 
     for block in _code_blocks(audit):
-        assert "run --rm --no-deps" in block or "select(" in block or block.strip().startswith("|")
         for mutation in ("UPDATE ", "DELETE ", "INSERT ", "replay"):
             assert mutation not in block, f"the audit must stay read-only, found {mutation}"
+    assert any("run --rm --no-deps" in block for block in _code_blocks(audit)), (
+        "the audit must run in a one-shot container"
+    )
     assert "run_easyweek_inbox_worker" not in audit, "the audit must not start the inbox loop"
     assert "read-only" in audit
 
@@ -421,3 +453,170 @@ def test_recovery_uses_real_compose_service_names() -> None:
         assert named in recovery
         assert named in services, f"{named} is not a real compose service"
     assert "$COMPOSE" in recovery, "recovery must use the production file set variable"
+
+
+# ---------------------------------------------------------------------------
+# The PR-7.1 rollout itself must not open the destructive window
+# ---------------------------------------------------------------------------
+
+
+def test_the_rollout_never_instructs_the_operator_to_disable_notifications() -> None:
+    """The recovery section forbade this pair; the rollout used to prescribe it.
+
+    With a live webhook feed even a short deploy window is enough: the worker
+    claims new captured events, terminalizes them `processed` without a job, and
+    nothing replays them afterwards.
+    """
+    rollout = _rollout()
+
+    for block in _code_blocks(rollout):
+        assert "EASYWEEK_NOTIFICATIONS_ENABLED=false" not in block, (
+            "the PR-7.1 rollout must never carry an executable notifications=false step"
+        )
+    assert "EASYWEEK_NOTIFICATIONS_ENABLED` остаётся `true`" in rollout
+    assert "Запрещённая пара" in rollout
+
+
+def test_the_rollout_fences_with_processing_before_touching_the_inbox_worker() -> None:
+    rollout = _rollout()
+
+    fence = _first_instruction_offset(rollout, "EASYWEEK_PROCESSING_ENABLED=false")
+    first_recreate = _first_instruction_offset(rollout, "up -d --force-recreate")
+
+    assert fence < first_recreate, "the write fence must be set before the first worker recreate"
+
+
+def test_processing_returns_to_true_only_after_deploy_config_and_consumers() -> None:
+    """Order is the whole safety property, so it is asserted as an order."""
+    rollout = _rollout()
+
+    allowlist = _first_instruction_offset(rollout, 'EASYWEEK_ALLOWED_SERVICE_CATEGORIES=["Wimpernverlängerung"]')
+    deploy = rollout.index("Развернуть новый код")
+    probe = rollout.index("effective-конфигурацию одноразовым контейнером")
+    outbox = _first_instruction_offset(rollout, "up -d --force-recreate altegio-outbox-worker")
+    unfence = _first_instruction_offset(rollout, "EASYWEEK_PROCESSING_ENABLED=true")
+
+    assert allowlist < deploy < probe < outbox < unfence, (
+        "processing may only return to true after allowlist, deploy, probe and consumer recreate"
+    )
+
+
+def test_the_rollout_does_not_route_the_operator_into_the_domain_only_drain() -> None:
+    rollout = _rollout()
+
+    # It may NAME the drain to say it is out of scope, but must not prescribe it.
+    assert "не ссылается" in rollout or "не является ни rollout" in rollout
+
+
+def test_the_forbidden_pair_is_exactly_the_mode_that_claims(
+    _invalid_allowlist: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Runtime-bound: why the rollout order above is not merely stylistic."""
+    monkeypatch.setattr(settings, "easyweek_allowed_service_categories", VALID_ALLOWLIST, raising=False)
+
+    monkeypatch.setattr(settings, "easyweek_processing_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_notifications_enabled", False, raising=False)
+    assert processing_is_configured() is True, (
+        "processing=true + notifications=false lets the worker claim and terminalize captured "
+        "events without jobs — the mode the rollout must never enter"
+    )
+
+    monkeypatch.setattr(settings, "easyweek_processing_enabled", False, raising=False)
+    for notifications in (True, False):
+        monkeypatch.setattr(settings, "easyweek_notifications_enabled", notifications, raising=False)
+        assert processing_is_configured() is False, "processing=false is the fence, regardless of notifications"
+
+
+# ---------------------------------------------------------------------------
+# Level B: a Resend can never be the positive smoke
+# ---------------------------------------------------------------------------
+
+
+def test_level_a_still_treats_a_resend_as_successful_deduplication() -> None:
+    """Historical grouping is correct and must survive the Level B tightening."""
+    level_a = _section(_runbook(), LEVEL_A_HEADING)
+
+    assert "resend_groups" in level_a
+    assert "дедупликация" in level_a
+
+    booking = uuid.UUID("aaaaaaaa-bbbb-4ccc-8ddd-000000000021")
+    kwargs = {
+        "event_hint": "booking-created",
+        "booking_uuid": booking,
+        "payload_hash": "identical",
+        "job_type": "record_created",
+    }
+    assert easyweek_job_dedupe_key(**kwargs) == easyweek_job_dedupe_key(**kwargs), (
+        "byte-identical deliveries share one key — one job for the group is correct"
+    )
+
+
+def test_level_b_forbids_resend_as_the_positive_smoke() -> None:
+    """Exactly why: the same key resolves to a job created before the outage."""
+    level_b = _section(_runbook(), LEVEL_B_HEADING)
+
+    assert "Resend запрещён" in level_b
+    for block in _code_blocks(level_b):
+        assert "Resend" not in block, "no smoke step may instruct the operator to Resend"
+    # The prohibition has to hold in the steps too, not only in the warning:
+    # an "or Resend it" aside would reopen the false green in plain prose.
+    for offer in ("сделать Resend", "или Resend", "либо Resend"):
+        assert offer not in level_b, f"Level B must not offer Resend as an option: {offer}"
+
+
+def test_level_b_requires_a_brand_new_booking_identity() -> None:
+    level_b = _section(_runbook(), LEVEL_B_HEADING)
+
+    assert "новый `booking_uuid`" in level_b
+    assert "distinct_bookings=2" in level_b, "allowed and disallowed must use different new bookings"
+    assert "booking_first_seen_here=true" in level_b, "the freshness axis that a Resend cannot satisfy"
+
+
+def test_level_b_records_a_baseline_before_the_smoke() -> None:
+    level_b = _section(_runbook(), LEVEL_B_HEADING)
+
+    assert "MAX(id)" in level_b and "FROM easyweek_events" in level_b
+    assert "smoke_event_id_baseline" in level_b
+    assert "newer_than_baseline=true" in level_b
+
+
+def test_level_b_positive_proof_is_a_job_created_after_smoke_start() -> None:
+    level_b = _section(_runbook(), LEVEL_B_HEADING)
+
+    assert "job_created_after_smoke_start=true" in level_b
+    assert "smoke-start" in level_b, "the command must pass the recorded instant"
+    assert "exact_jobs=1" in level_b
+
+
+def test_level_b_disallowed_smoke_requires_no_exact_job() -> None:
+    level_b = _section(_runbook(), LEVEL_B_HEADING)
+
+    assert "exact_jobs=0" in level_b
+    assert "outbox_rows=0" in level_b
+
+
+def test_level_b_gates_on_specific_event_ids_not_on_the_aggregate() -> None:
+    """Live traffic lands in the same window; the aggregate proves nothing."""
+    level_b = _section(_runbook(), LEVEL_B_HEADING)
+
+    assert "<allowed_event_id>" in level_b and "<disallowed_event_id>" in level_b
+    assert "groups_with_exact_job" in level_b and "главным gate быть не может" in level_b
+
+
+def test_the_smoke_verifier_is_bound_to_the_production_key_and_fails_closed() -> None:
+    """The documented mode has to exist in code, with the documented fields."""
+    level_b = _section(_runbook(), LEVEL_B_HEADING)
+
+    assert "--smoke-event-id" in level_b
+    assert "--baseline-event-id" in level_b
+    assert "altegio_bot.scripts.easyweek_recovery_audit" in level_b
+
+    signature = inspect.signature(verify_controlled_smoke)
+    assert {"event_ids", "baseline_event_id", "smoke_start"} <= set(signature.parameters)
+
+    source = inspect.getsource(verify_controlled_smoke)
+    assert "easyweek_job_dedupe_key(" in source, "the smoke must reuse the production key, not a copy"
+    assert "sha256" not in source.lower()
+    for guard in ("not found", "no booking uuid", "no lifecycle hint"):
+        assert guard in source, f"fail-closed guard missing: {guard}"

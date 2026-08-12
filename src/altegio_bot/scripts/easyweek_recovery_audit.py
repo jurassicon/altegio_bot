@@ -30,17 +30,24 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import uuid
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.db import SessionLocal
 from altegio_bot.easyweek_normalizer import _EVENT_HINT_MAP, easyweek_job_dedupe_key
 from altegio_bot.easyweek_policy import EASYWEEK_LIFECYCLE_JOB_TYPES
-from altegio_bot.models.models import PROVIDER_EASYWEEK, EasyWeekEvent, MessageJob
+from altegio_bot.models.models import (
+    PROVIDER_EASYWEEK,
+    EasyWeekEvent,
+    MessageJob,
+    OutboxMessage,
+    Record,
+)
 from altegio_bot.workers.easyweek_inbox_worker import _ACTION_TO_JOB_TYPE
 
 
@@ -201,22 +208,210 @@ async def audit_recovery(
     )
 
 
+class SmokeVerificationError(RuntimeError):
+    """Fail-closed: the smoke cannot be judged, so it is not green."""
+
+
+@dataclass(frozen=True)
+class SmokeEventReport:
+    """One controlled smoke delivery, in booleans / counts / technical ids."""
+
+    event_id: int
+    event_status: str
+    newer_than_baseline: bool
+    booking_first_seen_here: bool
+    expected_job_type: str
+    record_id: int | None
+    record_company_id: int | None
+    exact_job_ids: tuple[int, ...]
+    job_statuses: tuple[str, ...]
+    job_created_after_smoke_start: bool
+    job_type_matches_event: bool
+    job_company_matches_record: bool
+    job_record_matches_booking: bool
+    outbox_rows: int
+
+    def as_safe_dict(self) -> dict[str, object]:
+        return {
+            "event_id": self.event_id,
+            "event_status": self.event_status,
+            "newer_than_baseline": self.newer_than_baseline,
+            "booking_first_seen_here": self.booking_first_seen_here,
+            "expected_job_type": self.expected_job_type,
+            "record_id": self.record_id,
+            "record_company_id": self.record_company_id,
+            "exact_jobs": len(self.exact_job_ids),
+            "exact_job_ids": list(self.exact_job_ids),
+            "job_statuses": list(self.job_statuses),
+            "job_created_after_smoke_start": self.job_created_after_smoke_start,
+            "job_type_matches_event": self.job_type_matches_event,
+            "job_company_matches_record": self.job_company_matches_record,
+            "job_record_matches_booking": self.job_record_matches_booking,
+            "outbox_rows": self.outbox_rows,
+        }
+
+
+async def verify_controlled_smoke(
+    session: AsyncSession,
+    *,
+    event_ids: list[int],
+    baseline_event_id: int,
+    smoke_start: datetime,
+) -> dict[str, object]:
+    """Read-only proof that the pipeline created a job *now*, for a *new* booking.
+
+    A byte-identical Resend cannot serve as this proof: it reproduces the same
+    hint, booking uuid and payload hash, hence the same expected key, so a job
+    created long before the outage answers for it. That is correct dedup
+    behaviour historically (see :func:`audit_recovery`) and useless as a
+    positive smoke. So freshness is asserted on two independent axes here — the
+    event is newer than the pre-smoke baseline and is the FIRST event ever seen
+    for its booking, and the job itself was created after ``smoke_start``.
+
+    Fail-closed: a missing event, an unrecognised hint or a NULL booking uuid
+    raises instead of returning a green-looking report.
+    """
+    if not event_ids:
+        raise SmokeVerificationError("no smoke event ids given")
+
+    reports: list[SmokeEventReport] = []
+    bookings: set[uuid.UUID] = set()
+
+    for event_id in event_ids:
+        event = (await session.execute(select(EasyWeekEvent).where(EasyWeekEvent.id == event_id))).scalar_one_or_none()
+        if event is None:
+            raise SmokeVerificationError(f"event {event_id} not found")
+        if event.booking_uuid is None:
+            raise SmokeVerificationError(f"event {event_id} has no booking uuid")
+        job_type = expected_job_type(event.event_hint)
+        if job_type is None:
+            raise SmokeVerificationError(f"event {event_id} carries no lifecycle hint")
+
+        bookings.add(event.booking_uuid)
+
+        # Freshness axis 1: nothing for this booking predates the smoke.
+        earliest_id = (
+            await session.execute(
+                select(EasyWeekEvent.id)
+                .where(EasyWeekEvent.booking_uuid == event.booking_uuid)
+                .order_by(EasyWeekEvent.id)
+                .limit(1)
+            )
+        ).scalar_one()
+
+        record = (
+            await session.execute(
+                select(Record)
+                .where(Record.provider == PROVIDER_EASYWEEK)
+                .where(Record.easyweek_booking_uuid == event.booking_uuid)
+            )
+        ).scalar_one_or_none()
+
+        key = easyweek_job_dedupe_key(
+            event_hint=event.event_hint or "",
+            booking_uuid=event.booking_uuid,
+            payload_hash=event.payload_hash,
+            job_type=job_type,
+        )
+        jobs = list(
+            (
+                await session.execute(
+                    select(MessageJob)
+                    .where(MessageJob.provider == PROVIDER_EASYWEEK)
+                    .where(MessageJob.dedupe_key == key)
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+        outbox_rows = 0
+        if jobs:
+            outbox_rows = int(
+                (
+                    await session.execute(
+                        select(func.count(OutboxMessage.id)).where(OutboxMessage.job_id.in_([job.id for job in jobs]))
+                    )
+                ).scalar_one()
+            )
+
+        reports.append(
+            SmokeEventReport(
+                event_id=int(event.id),
+                event_status=str(event.status),
+                newer_than_baseline=int(event.id) > baseline_event_id,
+                booking_first_seen_here=int(earliest_id) == int(event.id),
+                expected_job_type=job_type,
+                record_id=int(record.id) if record is not None else None,
+                record_company_id=int(record.company_id) if record is not None else None,
+                exact_job_ids=tuple(sorted(int(job.id) for job in jobs)),
+                job_statuses=tuple(sorted(str(job.status) for job in jobs)),
+                # Freshness axis 2: the job itself is new, not a survivor.
+                job_created_after_smoke_start=bool(jobs)
+                and all(job.created_at is not None and job.created_at >= smoke_start for job in jobs),
+                job_type_matches_event=all(str(job.job_type) == job_type for job in jobs),
+                job_company_matches_record=bool(jobs)
+                and record is not None
+                and all(int(job.company_id) == int(record.company_id) for job in jobs),
+                job_record_matches_booking=bool(jobs)
+                and record is not None
+                and all(job.record_id is not None and int(job.record_id) == int(record.id) for job in jobs),
+                outbox_rows=outbox_rows,
+            )
+        )
+
+    return {
+        "baseline_event_id": baseline_event_id,
+        "smoke_start": smoke_start.isoformat(),
+        "distinct_bookings": len(bookings),
+        "events": [report.as_safe_dict() for report in reports],
+    }
+
+
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Read-only EasyWeek post-recovery delivery audit.")
-    parser.add_argument("--since", required=True, help="ISO-8601 start of the window, e.g. 2026-08-12T09:00:00+00:00")
+    parser.add_argument("--since", default=None, help="ISO-8601 start of the window, e.g. 2026-08-12T09:00:00+00:00")
     parser.add_argument("--until", default=None, help="Optional ISO-8601 end of the window.")
-    return parser.parse_args(argv)
+    parser.add_argument(
+        "--smoke-event-id",
+        type=int,
+        action="append",
+        default=[],
+        dest="smoke_event_ids",
+        help="Controlled-smoke mode: repeat once per smoke event id.",
+    )
+    parser.add_argument("--baseline-event-id", type=int, default=None, help="MAX(easyweek_events.id) before the smoke.")
+    parser.add_argument("--smoke-start", default=None, help="ISO-8601 UTC instant recorded before the smoke bookings.")
+
+    args = parser.parse_args(argv)
+    if args.smoke_event_ids:
+        if args.baseline_event_id is None or args.smoke_start is None:
+            parser.error("--smoke-event-id requires --baseline-event-id and --smoke-start")
+    elif args.since is None:
+        parser.error("either --since or --smoke-event-id is required")
+    return args
 
 
 async def main(argv: list[str] | None = None) -> None:
     args = _parse_args(argv)
-    since = datetime.fromisoformat(args.since)
-    until = datetime.fromisoformat(args.until) if args.until else None
 
     async with SessionLocal() as session:
-        report = await audit_recovery(session, since=since, until=until)
+        if args.smoke_event_ids:
+            payload: dict[str, object] = await verify_controlled_smoke(
+                session,
+                event_ids=args.smoke_event_ids,
+                baseline_event_id=args.baseline_event_id,
+                smoke_start=datetime.fromisoformat(args.smoke_start),
+            )
+        else:
+            report = await audit_recovery(
+                session,
+                since=datetime.fromisoformat(args.since),
+                until=datetime.fromisoformat(args.until) if args.until else None,
+            )
+            payload = report.as_safe_dict()
 
-    print(report.as_safe_dict())
+    print(payload)
 
 
 if __name__ == "__main__":
