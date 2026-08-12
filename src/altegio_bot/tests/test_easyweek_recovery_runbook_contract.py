@@ -794,3 +794,82 @@ def test_the_stop_timeout_matches_the_compose_grace_period() -> None:
     match = re.search(r"stop -t (\d+) altegio-whatsapp-inbox-worker", rollout)
     assert match is not None, "the runbook must stop the worker with an explicit timeout"
     assert int(match.group(1)) >= grace_minutes * 60, "the runbook timeout must cover the drain window"
+
+
+# ---------------------------------------------------------------------------
+# The one-time transition off the pre-graceful image
+# ---------------------------------------------------------------------------
+
+
+def test_the_runbook_separates_the_legacy_transition_from_routine_deploys() -> None:
+    """`stop -t 300` is only safe once the signal handler is actually deployed."""
+    rollout = _rollout()
+
+    assert "Вариант «graceful»" in rollout
+    assert "Вариант «legacy»" in rollout
+    legacy = rollout.index("Вариант «legacy»")
+    graceful = rollout.index("Вариант «graceful»")
+    assert graceful < legacy, "the routine path comes first; the transition is the exception"
+
+    assert "не обрабатывает SIGTERM" in rollout, "the doc must state why stop is unsafe there"
+    assert "бесполезен" in rollout, "the -t timeout is meaningless without a handler"
+
+
+def test_capability_is_checked_on_the_running_container_not_the_checkout() -> None:
+    rollout = _rollout()
+
+    probe = rollout.index("docker exec $WA_CID")
+    assert "inspect.signature(w.run_loop).parameters" in rollout
+    assert "checked-out" in rollout, "the doc must warn against trusting the deployed source"
+    # And it must be read before either stop variant is applied.
+    assert probe < rollout.index("Вариант «graceful»")
+
+
+def test_the_legacy_transition_freezes_before_it_counts() -> None:
+    """No claim window between the count and the retire."""
+    rollout = _rollout()
+    legacy = _section(rollout, "##### Вариант «legacy»")
+
+    pause = legacy.index("docker pause")
+    count = legacy.index("stranded_processing")
+    retire = legacy.index("docker rm -f")
+
+    assert pause < count < retire, "freeze -> prove processing = 0 -> retire"
+    assert "race" in legacy, "the doc must explain why the freeze closes the window"
+    assert "откатывается" in legacy, "an uncommitted claim rolls back when the process dies"
+
+
+def test_the_legacy_transition_never_sigterms_or_bulk_updates() -> None:
+    legacy = _section(_rollout(), "##### Вариант «legacy»")
+
+    for block in _code_blocks(legacy):
+        assert "stop -t" not in block, "a legacy worker must never be SIGTERM'd"
+        assert "UPDATE" not in block
+    assert "запрещён" in legacy, "the bulk update must be forbidden in words too"
+    assert "unpause" in legacy, "a non-zero count is resolved by letting it finish, not by killing it"
+
+
+def test_the_operator_verifies_exactly_one_non_oneoff_container() -> None:
+    rollout = _rollout()
+
+    assert "com.docker.compose.oneoff" in rollout
+    assert "ровно `1`" in rollout
+    assert "STOP" in rollout
+
+
+def test_the_graceful_variant_does_not_trust_the_stop_exit_code() -> None:
+    graceful = _section(_rollout(), "##### Вариант «graceful»")
+
+    assert "доказательством **не является**" in graceful
+    assert "137" in graceful, "the SIGKILL-after-timeout code must be named"
+    for field in ("State.Status", "State.ExitCode", "State.OOMKilled"):
+        assert field in graceful
+    assert "не удалять" in graceful, "the container is the only carrier of that evidence"
+
+
+def test_the_api_keeps_capturing_during_the_pause() -> None:
+    rollout = _rollout()
+
+    assert "продолжает принимать вебхуки" in rollout
+    assert "received" in rollout
+    assert "EasyWeek capture" in rollout

@@ -22,6 +22,11 @@ cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 COMPOSE="docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml"
 
+# Retirement of the delivery-retry producer lives in its own sourceable file so
+# every failure path can be exercised against fake docker/psql commands.
+# shellcheck source=lib/whatsapp_drain.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib/whatsapp_drain.sh"
+
 # The bootstrap already fetched and reset to DEPLOY_SHA. Re-verify it HERE,
 # before any migration or queue mutation: if the checkout drifted (a concurrent
 # deploy, a failed reset, a hand-run of this script) every later guard would be
@@ -631,6 +636,16 @@ recover() {
 }
 trap 'recover $?' EXIT
 
+# ── Gate: is the RUNNING WhatsApp worker safe to stop at all? ─────
+#
+# Checked here, before the first build / migration / reconciliation, so a
+# legacy container aborts the deploy while production is still untouched.
+# Capability is read from the running container, never from this checkout —
+# the new runner is always present in the source being deployed.
+if ! wa_require_drainable_worker; then
+  exit 1
+fi
+
 echo "🔨 Building new images (without starting containers)..."
 $COMPOSE build
 
@@ -1046,6 +1061,24 @@ fi
 # deploy just built. Compose service order, `depends_on` without a health
 # gate and sleeps prove nothing here — container id, state, restart count
 # and image id are checked explicitly instead.
+# Drain BEFORE the reconciliation, and prove it from the stopped container.
+#
+# `--scale <svc>=0` on its own is not a drain: it removes the container, and
+# with it ExitCode, OOMKilled and State.Error — the only evidence of whether
+# the batch finished or a SIGKILL cut it off after the stop timeout. So the
+# worker is stopped by id, verified, and only then discarded.
+WA_WORKER_PRE_ID="$(wa_service_container_id)" || WA_WORKER_PRE_ID=""
+if [ -n "$WA_WORKER_PRE_ID" ] && container_is_running "$WA_WORKER_PRE_ID"; then
+  if ! wa_graceful_quiesce "$WA_WORKER_PRE_ID" 300; then
+    echo "❌ Refusing to continue: the delivery-retry producer did not drain cleanly."
+    echo "   The container is left in place for analysis; no rows were rewritten."
+    exit 1
+  fi
+  # Proven drained. The container is discarded by the reconciliation below —
+  # deliberately not before, so that a failed drain above leaves ExitCode,
+  # OOMKilled and State.Error intact for whoever investigates.
+fi
+
 echo "🚀 Starting updated containers (delivery-retry producer held back)..."
 $COMPOSE up -d --remove-orphans --scale altegio-whatsapp-inbox-worker=0
 

@@ -753,27 +753,65 @@ ORDER BY status;
    (10 минут) защитой не является: rollout не должен зависеть от того, успеет
    ли оператор закончить deploy быстрее неё.
 
+   Каким способом останавливать — зависит от того, какой image сейчас в
+   production. Проверьте это **до** остановки, у запущенного контейнера, а не
+   по checked-out исходникам: в рабочем дереве новый runner есть всегда, в том
+   числе на том самом deploy, который его ещё только устанавливает.
+
+```bash
+WA_CID="$(docker ps -a \
+  --filter 'label=com.docker.compose.project=altegio_bot' \
+  --filter 'label=com.docker.compose.service=altegio-whatsapp-inbox-worker' \
+  --format '{{.ID}}')"
+printf 'containers: %s\n' "$(printf '%s\n' "$WA_CID" | grep -c '[0-9a-f]')"
+printf 'oneoff: %s\n' "$(docker inspect -f '{{index .Config.Labels "com.docker.compose.oneoff"}}' $WA_CID)"
+docker exec $WA_CID /app/.venv/bin/python -c 'import inspect; from altegio_bot.workers import whatsapp_inbox_worker as w; print("graceful" if "stop_event" in inspect.signature(w.run_loop).parameters else "legacy")'
+```
+
+   Контейнеров должно быть ровно `1`, `oneoff` — `false`. Несколько service
+   containers, неизвестная one-off replica или пустой вывод — **STOP** и ручной
+   разбор: дренировать один контейнер ничего не говорит о claimed batch другого.
+
+##### Вариант «graceful» — обычный порядок для всех последующих deploy
+
 ```bash
 $COMPOSE stop -t 300 altegio-whatsapp-inbox-worker
 ```
 
-   `-t 300` обязателен и соответствует `stop_grace_period: 5m` в
-   `docker-compose.yml`. Worker обрабатывает SIGTERM: новый batch он больше не
-   claim'ит, но уже закоммиченный `received -> processing` batch дорабатывает
-   до конца. Дефолтные 10 секунд убили бы его в середине batch, а восстановить
-   такие строки нечем — обычный claim берёт только `received`, а
-   `recover_stale_processing_events` покрывает только Chatwoot operator-relay.
+   `-t 300` соответствует `stop_grace_period: 5m` в `docker-compose.yml`.
+   Worker обрабатывает SIGTERM: новый batch он больше не claim'ит, но уже
+   закоммиченный `received -> processing` batch дорабатывает до конца.
 
-   Что именно останавливается: `altegio-api` продолжает принимать вебхуки Meta
-   и сохранять их в `whatsapp_events` со статусом `received`, ничего не
-   теряется. Приостановлена только обработка inbound-сообщений и
-   status-callbacks — до шага 12. Это общий для всех филиалов worker, поэтому
-   пауза затрагивает и Altegio-трафик: входящие сообщения и статусы Карлсруэ и
-   Раштата будут разобраны после возобновления, с задержкой на длительность
-   rollout. Это цена корректности, а не побочный эффект.
+   Успешный код возврата `docker stop` доказательством **не является**: демон
+   возвращает `0` и тогда, когда истёк timeout и процесс пришлось убить
+   SIGKILL. Проверяйте финальное состояние контейнера, **не удаляя** его:
 
-   Обязательный gate после остановки — обычных событий в `processing` быть не
-   должно:
+```bash
+docker inspect -f 'status={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}}' $WA_CID
+```
+
+   Требуется `status=exited`, `exit=0`, `oom=false`. `exit=137` — это SIGKILL
+   после истечения timeout, то есть batch оборвали. Любое отклонение —
+   **STOP**: контейнер не удалять, он единственный носитель этих данных.
+
+##### Вариант «legacy» — РАЗОВЫЙ переход со старого image (a82d449 и раньше)
+
+Старый worker **не обрабатывает SIGTERM**: у него нет ни `stop_event`, ни
+signal handlers. `docker stop` с любым timeout убивает процесс там, где он
+находится, и уже закоммиченный `processing` batch остаётся навсегда —
+`-t 300` здесь бесполезен. SQL-проверка после такой остановки только
+зафиксирует уже нанесённый ущерб.
+
+Поэтому переход выполняется заморозкой, а не сигналом:
+
+1. Заморозить процесс. `docker pause` останавливает его через cgroup freezer:
+   он не может ни claim'ить новый batch, ни закоммитить открытую транзакцию.
+
+```bash
+docker pause $WA_CID
+```
+
+2. Проверить, что незавершённых обычных событий нет:
 
 ```sql
 SELECT count(*) AS stranded_processing
@@ -781,10 +819,62 @@ FROM whatsapp_events
 WHERE status = 'processing';
 ```
 
-   Ожидается `0`. Ненулевое значение — **STOP**: worker не успел дренировать
-   batch. Разбирать такие строки нужно поштучно. Массовый
+   Между заморозкой и этой проверкой race'а нет: процесс стоит, новые claim'ы
+   невозможны. Незакоммиченный claim (транзакция открыта в момент паузы) в
+   этот счётчик не попадает — он ещё не виден другим сессиям.
+
+3. Если счётчик **не** `0` — старый worker успел закоммитить batch. Убивать
+   его нельзя. Разморозьте его, дайте доработать batch и повторите заморозку с
+   проверкой:
+
+```bash
+docker unpause $WA_CID
+sleep 60
+docker pause $WA_CID
+```
+
+   Повторяйте, пока счётчик не станет `0`. Если он не сходится к нулю —
+   **STOP** и ручной разбор. Массовый `UPDATE processing -> received`
+   запрещён.
+
+4. Только при счётчике `0` — снять замороженный контейнер. Открытая
+   транзакция (если worker был заморожен посреди claim'а) откатывается
+   PostgreSQL при разрыве соединения, и строки остаются `received`:
+
+```bash
+docker rm -f $WA_CID
+```
+
+5. Убедиться, что счётчик по-прежнему `0`, и только затем продолжать rollout.
+   Дальше deploy сам не тронет legacy worker: его gate падает non-zero до
+   build и migrations, если обнаружит running контейнер без graceful
+   contract.
+
+##### Общее для обоих вариантов
+
+   Что именно останавливается: `altegio-api` продолжает принимать вебхуки Meta
+   и сохранять их в `whatsapp_events` со статусом `received`, ничего не
+   теряется. EasyWeek capture тоже продолжает работать. Приостановлена только
+   обработка inbound-сообщений и status-callbacks — до шага 12. Это общий для
+   всех филиалов worker, поэтому пауза затрагивает и Altegio-трафик: входящие
+   сообщения и статусы Карлсруэ и Раштата будут разобраны после возобновления,
+   с задержкой на длительность rollout. Это цена корректности, а не побочный
+   эффект.
+
+   Обязательный gate перед продолжением — обычных событий в `processing` быть
+   не должно:
+
+```sql
+SELECT count(*) AS stranded_processing
+FROM whatsapp_events
+WHERE status = 'processing';
+```
+
+   Ожидается `0`. Ненулевое значение — **STOP**: batch не дренирован.
+   Разбирать такие строки нужно поштучно. Массовый
    `UPDATE processing -> received` делать нельзя: для обычных webhook events
    безопасность повторного side effect не доказана, и replay может отправить
+
    сообщение повторно.
 
 5. Только теперь — финальный queue gate. Producer закрыт, поэтому пустая
