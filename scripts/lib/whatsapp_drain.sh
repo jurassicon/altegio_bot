@@ -223,21 +223,58 @@ wa_graceful_quiesce() {
   wa_verify_drained "$id"
 }
 
+# The one thing this gate can still do for the operator: print a procedure that
+# actually runs.
+#
+# It is only a message. The gate never executes any of it: the retirement pauses
+# and removes a production container while holding a database barrier open, and
+# that stays a deliberate one-time operator action with a mandatory read-only
+# probe in front of it — not something a deploy performs on its own.
+#
+# The helper cannot run in `altegio-api`: that image is built from the PREVIOUS
+# commit (so it does not contain the module), it has no Docker CLI and no Docker
+# socket. It runs in the ephemeral `easyweek-legacy-retire` ops service, which is
+# the only service that gets any of the three. `--build` is therefore part of the
+# command, not an optimisation.
 wa_legacy_instructions() {
   cat >&2 <<'LEGACY'
 ❌ The running altegio-whatsapp-inbox-worker predates the graceful shutdown
    contract: it has no SIGTERM handler, so `docker stop` (any timeout) kills it
    wherever it is and strands the batch it already committed as `processing`.
 
-   This deploy refuses to touch it. Run the ONE-TIME transitional retirement,
-   which holds a DB-side barrier across the retirement:
+   This deploy refuses to touch it. Retiring it is a ONE-TIME operator procedure
+   that runs in the ephemeral ops service easyweek-legacy-retire — the only
+   service with a Docker client and the host Docker socket — and holds a
+   DB-side barrier open across the retirement. The helper resolves and proves
+   its own target from the Compose labels; no container id is chosen by hand.
 
-     docker compose -p altegio_bot -f docker-compose.yml \
+   STEP 1 — read-only check. Pauses nothing, removes nothing, writes nothing:
+
+     docker compose -p altegio_bot \
+       -f docker-compose.yml \
        -f docker-compose.chatwoot-internal.yml \
-       run --rm --no-deps --entrypoint /app/.venv/bin/python altegio-api \
-       -m altegio_bot.scripts.retire_legacy_whatsapp_worker --container <id>
+       --profile ops run --rm --build easyweek-legacy-retire \
+       -m altegio_bot.scripts.retire_legacy_whatsapp_worker --probe
 
-   See docs/easyweek/durlach_activation_runbook.md, then run the deploy again.
+   Required before going any further: exit code 0, docker_cli: True,
+   docker_daemon: True, database: True, and whatsapp_worker_containers exactly
+   1. Any False value, any other container count, or a non-zero exit code is a
+   STOP — do NOT continue to step 2, and do not retire anything by hand.
+
+   STEP 2 — the retirement itself, only once step 1 passed:
+
+     docker compose -p altegio_bot \
+       -f docker-compose.yml \
+       -f docker-compose.chatwoot-internal.yml \
+       --profile ops run --rm --build easyweek-legacy-retire \
+       -m altegio_bot.scripts.retire_legacy_whatsapp_worker
+
+   Success is {'retired': True, 'processing_under_lock': 0} with exit code 0.
+   Any "STOP: ..." line means nothing was removed and nothing was rewritten.
+
+   The full procedure, the expected output and the STOP table are in
+   docs/easyweek/durlach_activation_runbook.md (section "Вариант «legacy»").
+   Run this deploy again once the retirement has succeeded.
 LEGACY
 }
 
