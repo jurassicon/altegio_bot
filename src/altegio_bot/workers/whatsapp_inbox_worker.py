@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import signal
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -4018,11 +4019,46 @@ async def run_poll_cycle(
     return stats
 
 
+async def _sleep_unless_stopping(delay: float, stop_event: asyncio.Event | None) -> None:
+    """Idle for *delay*, but wake immediately once shutdown is requested.
+
+    A plain ``asyncio.sleep`` would hold the process for a whole polling
+    interval after SIGTERM — dead time in a deploy window that is already
+    fencing this worker off.
+    """
+    if stop_event is None:
+        await asyncio.sleep(delay)
+        return
+    try:
+        await asyncio.wait_for(stop_event.wait(), timeout=delay)
+    except asyncio.TimeoutError:
+        pass
+
+
 async def run_loop(
     provider: WhatsAppProvider,
     batch_size: int = 50,
     poll_sec: float | None = None,
+    stop_event: asyncio.Event | None = None,
 ) -> None:
+    """Claim batches of received events and process them until asked to stop.
+
+    Shutdown contract, relied on by the PR-7.1 rollout that stops this worker to
+    fence the delivery-retry producer:
+
+      * the stop flag is checked ONLY before claiming a new batch — once
+        ``lock_next_batch`` has committed ``received -> processing``, those ids
+        belong to this process and are always drained;
+      * a claimed batch is never pushed back to ``received`` and never failed
+        just because a signal arrived;
+      * the idle wait ends as soon as the flag is set.
+
+    This matters more here than convenience: nothing recovers ordinary inbound
+    messages or Meta status callbacks left in ``processing``. The normal claim
+    only selects ``received``, and ``recover_stale_processing_events`` is scoped
+    to Chatwoot operator-relay rows. A batch abandoned mid-flight would be
+    stranded permanently.
+    """
     effective_poll_sec = _resolve_poll_sec(poll_sec, settings.whatsapp_inbox_worker_poll_sec)
     logger.info(
         "WhatsApp inbox worker started. batch_size=%s poll=%ss",
@@ -4041,6 +4077,11 @@ async def run_loop(
     last_recovery = time.monotonic()
 
     while True:
+        # Checked here and only here: past this point the batch is ours.
+        if stop_event is not None and stop_event.is_set():
+            logger.info("WhatsApp inbox worker shutdown requested; not claiming a new batch.")
+            break
+
         run_recovery = (time.monotonic() - last_recovery) >= recovery_interval
         if run_recovery:
             last_recovery = time.monotonic()
@@ -4048,7 +4089,34 @@ async def run_loop(
         stats = await run_poll_cycle(provider, batch_size=batch_size, run_recovery=run_recovery)
 
         if stats.processed == 0 and stats.failed == 0:
-            await asyncio.sleep(effective_poll_sec)
+            await _sleep_unless_stopping(effective_poll_sec, stop_event)
+
+    logger.info("WhatsApp inbox worker stopped cleanly.")
+
+
+def _install_stop_handlers(stop_event: asyncio.Event) -> None:
+    """Route SIGTERM/SIGINT into *stop_event* instead of killing the process.
+
+    ``docker compose stop`` sends SIGTERM; the default handler would abort the
+    loop wherever it happened to be, stranding the claimed batch in
+    ``processing``. Platforms without ``add_signal_handler`` keep the default.
+    """
+    loop = asyncio.get_running_loop()
+    for signal_name in ("SIGTERM", "SIGINT"):
+        sig = getattr(signal, signal_name, None)
+        if sig is None:
+            continue
+        try:
+            loop.add_signal_handler(sig, stop_event.set)
+        except (NotImplementedError, RuntimeError, ValueError):  # pragma: no cover - platform dependent
+            logger.warning("Cannot install %s handler; graceful drain unavailable.", signal_name)
+
+
+async def run_with_graceful_shutdown(provider: WhatsAppProvider, **kwargs: Any) -> None:
+    """Entrypoint helper: install the handlers, then run the loop."""
+    stop_event = asyncio.Event()
+    _install_stop_handlers(stop_event)
+    await run_loop(provider, stop_event=stop_event, **kwargs)
 
 
 def main() -> None:

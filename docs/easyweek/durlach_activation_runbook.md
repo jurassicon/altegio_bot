@@ -1,4 +1,4 @@
-# PR-6/PR-7 — активация локаций EasyWeek
+# PR-6/PR-7/PR-7.1 — активация локаций EasyWeek
 
 Порядок включения уведомлений для **всех** филиалов реестра. Сейчас их два —
 Durlach и Rastatt — и оба активируются одним проходом: `EASYWEEK_NOTIFICATIONS_ENABLED`
@@ -421,6 +421,7 @@ company_id ничего не знает (`webhooks/whatsapp.py`,
 EASYWEEK_ENABLED=true
 EASYWEEK_PROCESSING_ENABLED=false
 EASYWEEK_NOTIFICATIONS_ENABLED=false
+EASYWEEK_ALLOWED_SERVICE_CATEGORIES=[]
 EASYWEEK_LOCATION_MAP=<JSON-реестр с id, uuid, Meta-префиксом и booking_page_url каждого филиала>
 EASYWEEK_BOOKING_PAGE_ALLOWED_HOSTS=<host из URL выше>
 EASYWEEK_DEFAULT_LANGUAGE=de
@@ -435,6 +436,27 @@ Capture уже включён и остаётся включённым: `EASYWEE
 `altegio-api` не пересоздавайте. На время смены tenant boundary оба downstream
 флага обязаны быть `false`: worker не должен ни разбирать backlog по
 недопроверенной карте, ни создавать клиентские job'ы.
+
+`EASYWEEK_ALLOWED_SERVICE_CATEGORIES` — строгий JSON-массив точных root-level
+`service_category`. Пустая строка/массив, malformed JSON, duplicate после
+нормализации либо любой нестроковый/blank/control/слишком длинный элемент
+ничего не разрешает. Production-значение PR-7.1:
+
+```text
+EASYWEEK_ALLOWED_SERVICE_CATEGORIES=["Wimpernverlängerung"]
+```
+
+Категория не выводится из `service_name`, `services_description` или
+`service_id`. Настройку читают `altegio-easyweek-inbox-worker` и общий
+`altegio-outbox-worker`, поэтому после её изменения оба контейнера требуется
+пересоздать через `--force-recreate`.
+
+До отдельного реального multi-service capture действует временное строгое
+правило: только root-level `services_count=1` доказывает применимость singular
+`service_category`. Значение больше 1 подавляется как
+`category_ambiguous_multi_service`; отсутствующий/null/invalid/0 count и старый
+snapshot без count — как `service_count_unproven`. `quantity`, текст услуги и
+`RecordService.amount` доказательством не являются.
 
 После записи нового реестра пересоздайте **оба** его потребителя. Обычный
 `restart` и `up -d` без `--force-recreate` не перечитывают `env_file`:
@@ -452,15 +474,20 @@ for EW_SERVICE in altegio-easyweek-inbox-worker altegio-outbox-worker; do
   echo "SERVICE=$EW_SERVICE"
   $COMPOSE exec -T "$EW_SERVICE" /app/.venv/bin/python - <<'PY'
 from altegio_bot.easyweek_locations import configured_easyweek_locations
+from altegio_bot.easyweek_service_category import parse_allowed_service_categories
 from altegio_bot.settings import settings
 
 registry = configured_easyweek_locations()
+categories = parse_allowed_service_categories(settings.easyweek_allowed_service_categories)
 print(
     {
         "processing_enabled": settings.easyweek_processing_enabled,
         "notifications_enabled": settings.easyweek_notifications_enabled,
         "registry_configured": registry.configured,
         "registry_valid": registry.valid,
+        "service_categories_configured": categories.configured,
+        "service_categories_valid": categories.valid,
+        "service_categories_count": len(categories.keys),
         "branches": sorted(
             (location.name, location.company_id, location.meta_template_prefix)
             for location in registry.locations.values()
@@ -474,7 +501,10 @@ done
 
 Gate: оба контейнера показывают один и тот же полный список `durlach`/`du` и
 `rastatt`/`ra`, registry configured+valid, processing=false и
-notifications=false. Любое расхождение останавливает rollout до сида.
+notifications=false. Для PR-7.1 также обязательны
+`service_categories_configured=true`, `service_categories_valid=true` и
+`service_categories_count=1`. Raw allowlist и название категории эта проверка
+намеренно не печатает. Любое расхождение останавливает rollout до сида.
 
 ---
 
@@ -653,6 +683,801 @@ ORDER BY company_id;
 
 ---
 
+## 6A. Обязательный rollout PR-7.1: service-category filter
+
+PR-8 и reminders не начинаются, пока этот gate не пройден. На production не
+запускаются pytest, миграционные тесты или произвольные replay: только
+read-only SQL/log checks ниже и две контролируемые реальные smoke-записи.
+
+`EASYWEEK_NOTIFICATIONS_ENABLED` остаётся `true` на всём протяжении rollout.
+Write fence — это `EASYWEEK_PROCESSING_ENABLED`.
+
+> **Запрещённая пара.** Работающий inbox worker не должен ни на одном шаге
+> rollout видеть `EASYWEEK_PROCESSING_ENABLED=true` одновременно с
+> `EASYWEEK_NOTIFICATIONS_ENABLED=false`. В этом режиме
+> `processing_is_configured()` возвращает `true`, то есть **разрешает claim**:
+> worker забирает новые captured events, обновляет domain snapshot, выходит из
+> `plan_lifecycle_job()` до INSERT и переводит event в терминальный `processed`
+> без lifecycle job. Автоматического replay после обратного включения
+> notifications нет, поэтому даже короткое deploy-окно необратимо теряет
+> клиентские уведомления. Единственная процедура, где эта пара допустима, —
+> явно необратимый domain-only drain (§6A, раздел восстановления); он не
+> является ни rollout, ни recovery, и настоящий порядок на него не ссылается.
+
+Порядок строгий:
+
+1. В `easyweek.env` поставить write fence, не трогая notifications:
+
+```text
+EASYWEEK_PROCESSING_ENABLED=false
+```
+
+   `EASYWEEK_NOTIFICATIONS_ENABLED` остаётся `true` и на этом шаге не
+   редактируется.
+
+2. Пересоздать **только** inbox worker, чтобы он перестал claim'ить новые
+   события:
+
+```bash
+$COMPOSE up -d --force-recreate altegio-easyweek-inbox-worker
+```
+
+3. Убедиться, что claim действительно остановлен. Выполнить запрос дважды с
+   интервалом в минуту: `captured` не должен убывать, новые `processed` не
+   должны появляться.
+
+```sql
+SELECT status, count(*)
+FROM easyweek_events
+GROUP BY status
+ORDER BY status;
+```
+
+   Живые вебхуки продолжают приниматься и копиться в `captured` — это и есть
+   цель fence: события сохраняются до включения нового фильтра.
+
+4. Остановить **второй источник** EasyWeek jobs. `EASYWEEK_PROCESSING_ENABLED`
+   закрывает только planner в `easyweek_inbox_worker`. Delivery-retry рождается
+   не там: его создаёт `_handle_failed_delivery_status` в
+   `altegio-whatsapp-inbox-worker` при запоздавшем Meta `failed`-callback. Этот
+   путь гейтится только `OUTBOX_DELIVERY_RETRY_ENABLED` и **не читает** ни
+   `EASYWEEK_PROCESSING_ENABLED`, ни `EASYWEEK_NOTIFICATIONS_ENABLED`, а
+   создаёт `provider='easyweek'` job ровно тех трёх типов, ради которых
+   делается rollout: `record_created`, `record_updated`, `record_canceled`
+   (`DELIVERY_RETRY_JOB_TYPES`, ключ `delivery_retry:<outbox_id>:<attempt>`).
+
+   Поэтому запрос очереди при работающем producer — это моментальный снимок, а
+   не fence. Пока старый `altegio-outbox-worker` ещё не пересоздан, он не
+   содержит send-time category guard PR-7.1, и один поздний retryable callback
+   по disallowed booking отправит запрещённое уведомление. Первая retry delay
+   (10 минут) защитой не является: rollout не должен зависеть от того, успеет
+   ли оператор закончить deploy быстрее неё.
+
+   Каким способом останавливать — зависит от того, какой image сейчас в
+   production. Проверьте это **до** остановки, у запущенного контейнера, а не
+   по checked-out исходникам: в рабочем дереве новый runner есть всегда, в том
+   числе на том самом deploy, который его ещё только устанавливает.
+
+```bash
+WA_CID="$(docker ps -a \
+  --filter 'label=com.docker.compose.project=altegio_bot' \
+  --filter 'label=com.docker.compose.service=altegio-whatsapp-inbox-worker' \
+  --format '{{.ID}}')"
+printf 'containers: %s\n' "$(printf '%s\n' "$WA_CID" | grep -c '[0-9a-f]')"
+printf 'oneoff: %s\n' "$(docker inspect -f '{{index .Config.Labels "com.docker.compose.oneoff"}}' $WA_CID)"
+docker exec $WA_CID /app/.venv/bin/python -c 'import inspect; from altegio_bot.workers import whatsapp_inbox_worker as w; print("graceful" if "stop_event" in inspect.signature(w.run_loop).parameters else "legacy")'
+```
+
+   Контейнеров должно быть ровно `1`, `oneoff` — `false`. Несколько service
+   containers, неизвестная one-off replica или пустой вывод — **STOP** и ручной
+   разбор: дренировать один контейнер ничего не говорит о claimed batch другого.
+
+##### Вариант «graceful» — обычный порядок для всех последующих deploy
+
+```bash
+$COMPOSE stop -t 300 altegio-whatsapp-inbox-worker
+```
+
+   `-t 300` соответствует `stop_grace_period: 5m` в `docker-compose.yml`.
+   Worker обрабатывает SIGTERM: новый batch он больше не claim'ит, но уже
+   закоммиченный `received -> processing` batch дорабатывает до конца.
+
+   Успешный код возврата `docker stop` доказательством **не является**: демон
+   возвращает `0` и тогда, когда истёк timeout и процесс пришлось убить
+   SIGKILL. Проверяйте финальное состояние контейнера, **не удаляя** его:
+
+```bash
+docker inspect -f 'status={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}}' $WA_CID
+```
+
+   Требуется `status=exited`, `exit=0`, `oom=false`. `exit=137` — это SIGKILL
+   после истечения timeout, то есть batch оборвали. Любое отклонение —
+   **STOP**: контейнер не удалять, он единственный носитель этих данных.
+
+##### Вариант «legacy» — РАЗОВЫЙ переход со старого image (a82d449 и раньше)
+
+Старый worker **не обрабатывает SIGTERM**: у него нет ни `stop_event`, ни
+signal handlers. `docker stop` с любым timeout убивает процесс там, где он
+находится, и уже закоммиченный `processing` batch остаётся навсегда —
+`-t 300` здесь бесполезен.
+
+**`docker pause` сам по себе эту гонку не закрывает.** Он замораживает
+клиентский процесс в контейнере, но не его backend в PostgreSQL. Уже
+отправленный COMMIT доводится до конца независимо от замороженного клиента:
+
+```text
+worker отправил COMMIT
+  → контейнер заморожен до получения ответа
+  → backend PostgreSQL завершает COMMIT
+  → проверочный SELECT в другой сессии ещё видит 0
+  → контейнер удалён
+  → строки становятся видимыми: 'processing' без владельца
+```
+
+Ни второй SELECT, ни более долгая пауза, ни аудит после `rm` эту гонку не
+закрывают — они лишь фиксируют уже нанесённый ущерб. Барьер должен быть на
+стороне БД.
+
+Поэтому переход выполняется одним helper'ом, который держит DB-side барьер на
+всё время проверки и retirement.
+
+Helper'у одновременно нужны три вещи: код именно этого commit, доступ к
+production PostgreSQL и управление host Docker (pause/rm). Обычный
+`altegio-api` не подходит ни по одному пункту: его image собран из предыдущего
+commit, в нём нет Docker CLI и у него нет Docker socket. Поэтому helper
+запускается в отдельном одноразовом ops-сервисе `easyweek-legacy-retire`
+(profile `ops`, `Dockerfile.ops`) — **единственном**, который получает bind
+mount host Docker socket. Обычный `docker compose up -d` его не запускает.
+
+1. Собрать ops image из текущего checkout и выполнить **read-only** probe:
+
+```bash
+$COMPOSE --profile ops run --rm --build easyweek-legacy-retire \
+  -m altegio_bot.scripts.retire_legacy_whatsapp_worker --probe
+```
+
+   Ожидаемый вывод — все четыре значения истинны, например:
+
+```text
+{'helper_module': 'altegio_bot.scripts.retire_legacy_whatsapp_worker',
+ 'docker_cli': True, 'docker_daemon': True,
+ 'whatsapp_worker_containers': 1, 'database': True}
+```
+
+   `--build` обязателен: без него запустился бы старый image без helper'а.
+   Probe ничего не pause'ит, не удаляет и не переписывает. Любое `False`,
+   `whatsapp_worker_containers` не равное `1` или ненулевой код возврата —
+   **STOP**, retirement не запускать.
+
+2. Выполнить сам retirement:
+
+```bash
+$COMPOSE --profile ops run --rm --build easyweek-legacy-retire \
+  -m altegio_bot.scripts.retire_legacy_whatsapp_worker
+```
+
+   Helper сам находит свой target по Compose-меткам и доказывает его identity.
+   Передавать container ID вручную не нужно и не следует: опция
+   `--expect-container` существует только как перекрёстная проверка и цель
+   **не** выбирает — при несовпадении helper отказывается работать.
+
+Что он делает по шагам:
+
+1. Сам резолвит цель и доказывает её identity: ровно один контейнер с метками
+   `com.docker.compose.project=altegio_bot` и
+   `com.docker.compose.service=altegio-whatsapp-inbox-worker`, метка
+   `oneoff` — отрицательная (регистр не важен: Compose пишет и `False`, и
+   `false`), состояние `running`, а живой image **не** поддерживает graceful
+   shutdown. Любое расхождение — **STOP**, ничего не трогается.
+2. `docker pause` — чтобы клиент не начинал новых действий. Сразу после
+   заморозки топология проверяется повторно: если появилась вторая replica,
+   helper размораживает worker и завершается **STOP**.
+3. Открывает отдельную транзакцию с `lock_timeout` и `statement_timeout`.
+4. Берёт `LOCK TABLE whatsapp_events IN SHARE MODE`. Это и есть барьер: claim
+   старого worker'а выполняет `UPDATE whatsapp_events` под `ROW EXCLUSIVE`, а
+   `SHARE` — минимальный режим, который с ним конфликтует. Либо lock ждёт
+   завершения in-flight claim-транзакции и последующий счёт видит её строки,
+   либо lock взят первым, и тогда `UPDATE` старого worker'а уже не пройдёт.
+5. Под этим lock считает `whatsapp_events` в `processing`.
+6. При `0` — удаляет **тот самый** проверенный контейнер, **не отпуская lock**,
+   и повторяет проверку под тем же lock.
+7. Только после этого фиксирует транзакцию.
+
+Ожидаемый вывод при успехе — `{'retired': True, 'processing_under_lock': 0}` и
+нулевой код возврата.
+
+**STOP-условия** (helper завершается ненулевым кодом и печатает `STOP: ...`):
+
+| Причина | Что означает |
+| --- | --- |
+| `could not acquire the whatsapp_events barrier` | claim-транзакция ещё открыта; контейнер не удалён, worker разморожен |
+| `N row(s) are in 'processing' under the barrier` | worker закоммитил batch, который не доработал |
+| `expected exactly one … container` / one-off | топология не доказана |
+| `container belongs to project/service …` | цель не тот сервис — ничего не трогается |
+| `the one-off label … is not recognisable` | метка нераспознаваема; fail-closed |
+| `is '<state>', not 'running'` | не живой worker: helper только для running legacy |
+| `already honours the graceful shutdown contract` | это не legacy image — используйте обычный deploy path |
+| `cannot read the shutdown capability` | capability не читается |
+| `the container set changed after the freeze` | появилась вторая replica |
+| `Docker discovery failed` / `cannot inspect` | состояние не читается |
+
+Ни одна из этих веток не удаляет контейнер, не переписывает строки и не
+продолжает rollout. Если `docker rm` всё же не удался и состояние контейнера
+прочитать нельзя, helper явно предупредит, что worker **может остаться
+paused** — молча считать Docker-ошибку отсутствием контейнера он не будет. Массовый `UPDATE processing -> received` запрещён: для
+обычных webhook events безопасность повторного side effect не доказана.
+
+Если helper вернул STOP из-за открытой claim-транзакции, дайте старому worker'у
+доработать batch (он размораживается автоматически) и запустите helper снова.
+Если `processing` не сходится к нулю — ручной разбор по event id, без replay.
+
+**Цена барьера.** Пока lock удерживается (секунды: только финальная проверка и
+удаление контейнера), запись новых WhatsApp webhook events в `whatsapp_events`
+может ждать освобождения lock. Приём вебхуков при этом не теряется — запросы
+просто дожидаются lock. EasyWeek capture идёт в свою таблицу и не затрагивается.
+
+После успешного helper'а продолжайте rollout обычным порядком: сам deploy
+legacy worker уже не увидит, а его gate падает non-zero до build и migrations,
+если такой контейнер всё же обнаружится.
+
+##### Общее для обоих вариантов
+
+   Что именно останавливается: `altegio-api` продолжает принимать вебхуки Meta
+   и сохранять их в `whatsapp_events` со статусом `received`, ничего не
+   теряется. EasyWeek capture тоже продолжает работать. Приостановлена только
+   обработка inbound-сообщений и status-callbacks — до шага 12. Это общий для
+   всех филиалов worker, поэтому пауза затрагивает и Altegio-трафик: входящие
+   сообщения и статусы Карлсруэ и Раштата будут разобраны после возобновления,
+   с задержкой на длительность rollout. Это цена корректности, а не побочный
+   эффект.
+
+   Обязательный gate перед продолжением — обычных событий в `processing` быть
+   не должно:
+
+```sql
+SELECT count(*) AS stranded_processing
+FROM whatsapp_events
+WHERE status = 'processing';
+```
+
+   Ожидается `0`. Ненулевое значение — **STOP**: batch не дренирован.
+   Разбирать такие строки нужно поштучно. Массовый
+   `UPDATE processing -> received` делать нельзя: для обычных webhook events
+   безопасность повторного side effect не доказана, и replay может отправить
+
+   сообщение повторно.
+
+5. Только теперь — финальный queue gate. Producer закрыт, поэтому пустая
+   очередь останется пустой:
+
+```sql
+SELECT status, count(*)
+FROM message_jobs
+WHERE provider = 'easyweek'
+  AND job_type IN ('record_created', 'record_updated', 'record_canceled')
+  AND status IN ('queued', 'processing')
+GROUP BY status
+ORDER BY status;
+```
+
+   Ожидается 0 строк. Если очередь непуста — **STOP** и индивидуальный разбор
+   каждой job до deploy. Нельзя ни автоматически отменять, ни переписывать, ни
+   безусловно выпускать их старым outbox.
+6. Записать точный production allowlist:
+
+```text
+EASYWEEK_ALLOWED_SERVICE_CATEGORIES=["Wimpernverlängerung"]
+```
+
+7. Развернуть новый код при `EASYWEEK_PROCESSING_ENABLED=false`. Notifications
+   по-прежнему не трогаются.
+8. Проверить effective-конфигурацию одноразовым контейнером, который не
+   запускает loop (probe из §4). Gate проверяет только booleans и количество:
+   `configured=true`, `valid=true`, `count=1`, а также
+   `notifications_enabled=true`. Raw env и название категории не печатаются.
+9. Пересоздать `altegio-outbox-worker` с новым кодом и валидной конфигурацией:
+
+```bash
+$COMPOSE up -d --force-recreate altegio-outbox-worker
+```
+
+10. Убедиться, что новый outbox действительно поднялся и обслуживает очередь,
+    **до** возврата retry producer. Порядок здесь и есть защита: сохранённые
+    поздние status-callbacks могут создать retries, и обрабатывать их должен
+    только новый образ с send-time eligibility guard PR-7.1.
+11. Только теперь вернуть `altegio-whatsapp-inbox-worker`:
+
+```bash
+$COMPOSE up -d --force-recreate altegio-whatsapp-inbox-worker
+```
+
+    Накопленные `whatsapp_events` разбираются штатно. Retry-jobs, которые из
+    них родятся, попадут уже в guarded outbox: для disallowed категории job
+    завершится локально, без Meta attempt.
+
+12. Ещё раз подтвердить, что `EASYWEEK_NOTIFICATIONS_ENABLED=true` — до снятия
+   fence, а не после.
+13. Снять write fence:
+
+```text
+EASYWEEK_PROCESSING_ENABLED=true
+```
+
+14. Пересоздать inbox worker:
+
+```bash
+$COMPOSE up -d --force-recreate altegio-easyweek-inbox-worker
+```
+
+15. Сохранённые за время fence `captured` события проходят новый
+    category-фильтр: разрешённые создают lifecycle job, остальные штатно
+    suppress'атся по стабильной технической причине. Ни одно из них не было
+    списано терминально без решения фильтра.
+
+### Контролируемый smoke rollout
+
+Положительным доказательством является **новая** job, созданная после начала
+smoke. Resend старой доставки таким доказательством быть не может: он
+воспроизводит тот же `event_hint`, `booking_uuid` и `payload_hash`, а значит и
+тот же expected dedupe key, поэтому находит job, созданную задолго до rollout.
+Поэтому smoke делается только на новых bookings с новыми `booking_uuid`.
+
+1. Зафиксировать baseline до создания smoke-записей:
+
+```sql
+SELECT COALESCE(MAX(id), 0) AS smoke_event_id_baseline
+FROM easyweek_events;
+```
+
+   Записать результат как `<baseline_event_id>` и текущий UTC-момент как
+   `<smoke_start>`.
+
+2. Создать **новую** allowed single-service booking категории
+   `Wimpernverlängerung` — новая запись, новый `booking_uuid`. Записать её
+   `easyweek_events.id` как `<allowed_event_id>`.
+3. Создать **новую** disallowed single-service booking другой категории —
+   отдельная новая booking с собственным `booking_uuid`. Записать её id как
+   `<disallowed_event_id>`. Не подбирать текст услуги под ресничную категорию:
+   фильтр намеренно смотрит только root-level category.
+4. Проверить обе доставки одной read-only командой:
+
+```bash
+$COMPOSE run --rm --no-deps \
+  --entrypoint /app/.venv/bin/python \
+  altegio-easyweek-inbox-worker \
+  -m altegio_bot.scripts.easyweek_recovery_audit \
+  --baseline-event-id <baseline_event_id> \
+  --smoke-start '<smoke_start>' \
+  --smoke-event-id <allowed_event_id> \
+  --smoke-event-id <disallowed_event_id>
+```
+
+   Команда read-only, не поднимает worker loop, использует production
+   `easyweek_job_dedupe_key()` и печатает только booleans, counts и технические
+   ID. `booking_uuid`, dedupe key, payload, категория и клиентские данные не
+   выводятся. Отсутствующий event, нераспознанный hint или `booking_uuid=NULL`
+   приводят к ошибке, а не к зелёному отчёту.
+
+   Общий gate для обеих записей: `distinct_bookings=2`,
+   `newer_than_baseline=true`, `booking_first_seen_here=true`. Последнее и
+   отличает новую booking от Resend: у Resend более ранний event с тем же
+   `booking_uuid` уже существует.
+
+   Gate для `<allowed_event_id>`:
+
+   | Поле | Ожидание |
+   | --- | --- |
+   | `event_status` | `processed` |
+   | `expected_job_type` | соответствует hint доставки |
+   | `exact_jobs` | ровно `1` |
+   | `job_created_after_smoke_start` | `true` — это и есть положительное доказательство |
+   | `job_type_matches_event` | `true` |
+   | `job_company_matches_record` | `true` |
+   | `job_record_matches_booking` | `true` |
+   | `job_statuses` | одно объяснимое значение: `queued`, `processing`, `done` либо terminal по штатному deadline |
+   | `outbox_rows` | ровно `1` |
+   | `outbox_delivery_proven` | `true` |
+   | `outbox_status_counts` | единственный статус из `delivered` или `read` |
+
+   **Наличие Outbox-строки и успешная отправка — разные доказательства.**
+   `outbox_rows=1` доказывает только то, что planner и фильтр PR-7.1
+   отработали и job дошла до outbox: строка существует и в `queued`, и в
+   `sending`, и в `failed`, и в `unknown`. Успешную provider-попытку
+   доказывает только статус:
+
+   | `outbox_outcome` | Статусы | Что делать |
+   | --- | --- | --- |
+   | `proven` | `delivered`, `read` | smoke зелёный |
+   | `pending` | `queued`, `sending`, `sent` | ещё не завершено — подождать и повторить audit |
+   | `not_green` | `failed`, `unknown`, либо более одной строки | **STOP** |
+   | `none` | строк нет | ожидаемо для disallowed |
+
+   **`sent` не является доказательством доставки.** Он означает только, что
+   Meta приняла сообщение; после него ещё может прийти `failed`, строка
+   перейдёт в `failed` и будет создан delivery retry. Поэтому `sent` — это
+   `pending` (в отчёте виден отдельно как `outbox_provider_accepted=true`), и
+   зелёными считаются только `delivered` и `read`, ровно как в runtime
+   (`_SUCCESSFUL_DELIVERY_STATUSES`).
+
+   `sent_at` или `provider_message_id` сами по себе `failed`/`unknown` в успех
+   не превращают: оба поля остаются на строке отклонённой попытки. Если
+   allowed smoke получил `failed`/`unknown` — разобраться с внешней причиной
+   (Meta, шаблон, номер), затем сделать **новую** контролируемую booking с
+   новым UUID и повторить smoke. Не засчитывать неудачную попытку через
+   старую строку и не чинить это replay'ем.
+
+   Gate для `<disallowed_event_id>`:
+
+   | Поле | Ожидание |
+   | --- | --- |
+   | `event_status` | `processed` |
+   | `record_id` | не `null` — domain snapshot сохранён |
+   | `exact_jobs` | `0` |
+   | `outbox_rows` | `0` |
+   | `outbox_outcome` | `none` — это ожидаемый результат, а не ошибка |
+   | Meta / Chatwoot | сообщений нет |
+
+   Отсутствие job у disallowed объясняется контролируемым disallowed payload
+   contract этой конкретной smoke-записи, а не текущим `Record.raw`.
+
+   Gate привязан к `<allowed_event_id>` и `<disallowed_event_id>`. Агрегаты за
+   окно (ниже) — только наблюдаемость: при живом трафике в окно попадают чужие
+   события, поэтому изменение общего счётчика ничего не доказывает.
+
+Безопасная агрегированная наблюдаемость за выбранное окно:
+
+```sql
+SELECT status, count(*)
+FROM easyweek_events
+WHERE received_at >= TIMESTAMPTZ '<smoke_start>'
+GROUP BY status
+ORDER BY status;
+```
+
+```sql
+SELECT status, count(*)
+FROM message_jobs
+WHERE provider = 'easyweek'
+  AND job_type IN ('record_created', 'record_updated', 'record_canceled')
+  AND created_at >= TIMESTAMPTZ '<smoke_start>'
+GROUP BY status
+ORDER BY status;
+```
+
+Количество planner/send-time suppression по стабильной технической причине:
+
+```bash
+$COMPOSE logs --since='<smoke_start>' altegio-easyweek-inbox-worker altegio-outbox-worker \
+  | grep -Eo 'reason=(category_missing|category_not_allowed|category_ambiguous_multi_service|service_count_unproven|allowed_categories_unconfigured|allowed_categories_invalid)' \
+  | sort | uniq -c
+```
+
+`category_missing`, `category_not_allowed`,
+`category_ambiguous_multi_service` и `service_count_unproven` — terminal
+business suppression. `allowed_categories_unconfigured` и
+`allowed_categories_invalid` означают recoverable configuration outage:
+inbox не claim'ит новые events при включённых notifications, а outbox не
+отменяет job, а откладывает её с bounded backoff без расхода Meta attempts.
+
+### Восстановление после invalid/unconfigured allowlist
+
+#### Почему notifications НЕ выключают
+
+Ключевая асимметрия `processing_is_configured()`, и её надо понимать до первой
+команды:
+
+| `processing` | `notifications` | allowlist невалиден | Что делает inbox worker |
+| --- | --- | --- | --- |
+| `true` | **`true`** | да | **не claim'ит** — captured backlog цел |
+| `true` | **`false`** | да | **claim'ит**: обновляет domain snapshot, `plan_lifecycle_job` выходит на первой строке, событие уходит в terminal `processed` **без job** |
+
+Вторая строка необратима. Автоматического replay для `processed` события нет:
+после исправления allowlist уведомление уже не восстановится никогда. Поэтому
+**невалидный allowlist при включённых notifications — это и есть штатный
+fail-closed fence**, и трогать его не нужно: он уже остановил конвейер ровно
+там, где надо, и сохранил backlog.
+
+Выключение notifications в этой ситуации — не «безопасный шаг перед починкой»,
+а способ молча уничтожить backlog. О том, когда это всё же допустимо, — ниже,
+в «Domain-only drain».
+
+#### Штатное восстановление
+
+`EASYWEEK_NOTIFICATIONS_ENABLED` остаётся `true` на всём протяжении. Работающий
+inbox worker не пересоздаётся, пока конфигурация невалидна.
+
+1. Зафиксировать объём затронутого backlog — только aggregate counts:
+
+```sql
+SELECT status, count(*)
+FROM easyweek_events
+GROUP BY status
+ORDER BY status;
+```
+
+```sql
+SELECT status, count(*)
+FROM message_jobs
+WHERE provider = 'easyweek'
+  AND job_type IN ('record_created', 'record_updated', 'record_canceled')
+  AND status IN ('queued', 'processing')
+GROUP BY status
+ORDER BY status;
+```
+
+   Ни удалять эти строки, ни переводить руками в `processed`, ни делать любой
+   другой `UPDATE` production-данных ради восстановления нельзя.
+
+   Что именно обязано сохраниться: до пересоздания сервисов ни один
+   отложенный конфигурацией job не должен исчезнуть из БД или израсходовать
+   попытку Meta из-за невалидного allowlist. **После** восстановления статусы
+   меняться могут и это штатно: outbox доводит job до `done`, retry
+   продолжается, а истёкший штатный delivery deadline законно переводит job в
+   `canceled`/`failed` по существующей политике. Поэтому требование
+   «`queued`/`processing` должны сохраниться до конца процедуры» неверно —
+   проверять надо существование job и объяснимый terminal/retry исход, а не
+   застывший статус.
+
+2. Исправить allowlist в `easyweek.env`, сохранив production-инвариант:
+
+```text
+EASYWEEK_ALLOWED_SERVICE_CATEGORIES=["Wimpernverlängerung"]
+```
+
+3. Проверить новую effective-конфигурацию **до** пересоздания потребителей —
+   одноразовым контейнером, который не запускает inbox loop:
+
+```bash
+$COMPOSE run --rm --no-deps \
+  --entrypoint /app/.venv/bin/python \
+  altegio-easyweek-inbox-worker \
+  -c 'from altegio_bot.easyweek_locations import configured_easyweek_locations; from altegio_bot.easyweek_service_category import parse_allowed_service_categories; from altegio_bot.settings import settings; r = configured_easyweek_locations(); c = parse_allowed_service_categories(settings.easyweek_allowed_service_categories); print({"processing_enabled": settings.easyweek_processing_enabled, "notifications_enabled": settings.easyweek_notifications_enabled, "registry_ready": r.ready, "service_categories_configured": c.configured, "service_categories_valid": c.valid, "service_categories_count": len(c.keys)})'
+```
+
+   `--entrypoint` и `--no-deps` здесь обязательны: они гарантируют, что
+   контейнер выполнит только эту проверку и не стартует inbox loop. Вывод —
+   только booleans и число: raw allowlist, название категории, API key, webhook
+   secret, UUID, URL и payload не печатаются.
+
+   Gate: `service_categories_configured=true`, `service_categories_valid=true`,
+   `service_categories_count=1`, `registry_ready=true`,
+   `notifications_enabled=true`. Любое расхождение — вернуться к шагу 2, не
+   пересоздавая работающие сервисы.
+
+4. Только после успешной валидации пересоздать обоих потребителей настройки:
+
+```bash
+$COMPOSE up -d --force-recreate \
+  altegio-easyweek-inbox-worker altegio-outbox-worker
+```
+
+   Inbox worker стартует с `notifications=true` и валидным allowlist, поэтому
+   `processing_is_configured()` снова истинно: сохранённые `captured` события
+   штатно берутся в работу и **создают** lifecycle jobs.
+
+5. Подтвердить результат восстановления. Проверка двухуровневая: уровень A
+   разбирает исторический backlog, уровень B доказывает, что pipeline снова
+   создаёт jobs. Уровень B обязателен — только он является положительным
+   доказательством.
+
+##### Уровень A — исторический backlog, по конкретной доставке
+
+Вопрос уровня A звучит не «есть ли у этой записи хоть какая-нибудь job», а
+«создала ли **эта доставка** свою собственную job». Разница принципиальна:
+у записи почти всегда уже есть более старая job от `booking-created`, и связь
+через `record_id` покажет её вместо потерянного `booking-updated`.
+
+Идентичность доставки — это `easyweek_job_dedupe_key()`: SHA-256 от
+`event_hint | booking_uuid | payload_hash`. Аудит **импортирует эту
+production-функцию**, а не повторяет формулу в SQL: иначе при будущей смене
+формата ключа аудит продолжил бы показывать зелёный по устаревшей формуле.
+
+```bash
+$COMPOSE run --rm --no-deps \
+  --entrypoint /app/.venv/bin/python \
+  altegio-easyweek-inbox-worker \
+  -m altegio_bot.scripts.easyweek_recovery_audit --since '<outage_start>'
+```
+
+Команда read-only: только `SELECT`, без `UPDATE`, `DELETE` и replay, без
+запуска inbox/outbox loop. Печатает только event id, технические статусы и
+агрегаты — ни payload, ни названия категории, ни имени, ни телефона, ни email,
+ни секретов, ни самого dedupe key.
+
+Как читать вывод:
+
+| Поле | Что означает |
+| --- | --- |
+| `lifecycle_delivery_groups` | сколько различных доставок ожидали job. Byte-identical Resend'ы схлопываются в одну группу — у них общий expected key |
+| `resend_groups` | сколько из них были повторными доставками. Одна job на такую группу — **успешная дедупликация**, а не потеря |
+| `groups_with_exact_job` | сколько групп имеют job именно со своим ключом. Это и есть доказательство создания job |
+| `job_status_counts` | статусы найденных jobs |
+| `no_event_specific_job_unclassified` | event id без собственной job — **список для разбора, а не вердикт** |
+| `non_lifecycle_event_ids` | `booking-succeeded`: терминальный, job не ожидается |
+| `unmappable_event_ids` | нераспознанный hint или отсутствующий `booking_uuid` |
+
+**`no_event_specific_job_unclassified` не означает «потеряно».** Отсутствие
+своей job законно для:
+
+* terminal business suppression — `category_not_allowed`, `category_missing`,
+  `category_ambiguous_multi_service`, `service_count_unproven`;
+* post-cancel no-op;
+* `already_applied` replay.
+
+И означает реальную потерю, если доставка была обработана с выключенными
+notifications. Различить эти случаи по текущему `Record.raw` **нельзя**: более
+поздняя доставка могла перезаписать snapshot, против которого решение
+принималось в тот момент. Допустимые доказательства suppression — сохранённая
+стабильная runtime-причина именно для этого event id (см. подсчёт `reason=` в
+логах выше) либо контролируемый сценарий с заранее известным payload contract.
+
+Поэтому список требует ручного разбора по event id. Ни ноль, ни ненулевое
+значение сами по себе не закрывают восстановление.
+
+##### Уровень B — контролируемый smoke, обязательное положительное доказательство
+
+Уровень A показывает, что не потерялось. Что pipeline **снова работает**,
+доказывает только новая доставка, создавшая новую job после восстановления.
+
+> **Resend запрещён как положительный smoke.** Byte-identical Resend сохраняет
+> `event_hint`, `booking_uuid` и `payload_hash`, а значит и тот же expected
+> `easyweek_job_dedupe_key()`. Если исходная доставка создала job ещё до
+> outage, аудит найдёт именно её: `exact_jobs=1` при том, что inbox worker мог
+> вообще не обработать новый event. Для исторического уровня A такая
+> группировка корректна — несколько byte-identical доставок образуют одну
+> delivery group, и одна job на группу означает успешную дедупликацию. Для
+> уровня B она бесполезна: доказывать надо создание **новой** job сейчас.
+> Поэтому smoke делается только на новой business identity. Update или
+> reschedule существующей booking тоже не подходит как основной вариант —
+> новая booking с новым `booking_uuid` даёт более простое доказательство того,
+> что старой exact job существовать не могло.
+
+1. Зафиксировать baseline **до** создания smoke-записей:
+
+```sql
+SELECT COALESCE(MAX(id), 0) AS smoke_event_id_baseline
+FROM easyweek_events;
+```
+
+   Записать результат как `<baseline_event_id>` и текущий UTC-момент как
+   `<smoke_start>`. Payload, категория, UUID, телефон и email не выводятся.
+
+2. Создать **новую** allowed single-service booking категории
+   `Wimpernverlängerung`: новая запись, новый `booking_uuid`, новый
+   `EasyWeekEvent`. Записать её id как `<allowed_event_id>`.
+3. Создать **новую** disallowed single-service booking другой категории —
+   отдельная booking с собственным новым `booking_uuid`. Записать её id как
+   `<disallowed_event_id>`.
+4. Проверить обе доставки одной read-only командой:
+
+```bash
+$COMPOSE run --rm --no-deps \
+  --entrypoint /app/.venv/bin/python \
+  altegio-easyweek-inbox-worker \
+  -m altegio_bot.scripts.easyweek_recovery_audit \
+  --baseline-event-id <baseline_event_id> \
+  --smoke-start '<smoke_start>' \
+  --smoke-event-id <allowed_event_id> \
+  --smoke-event-id <disallowed_event_id>
+```
+
+   Доказательства свежести, общие для обеих записей: `distinct_bookings=2`
+   (allowed и disallowed используют разные новые booking), у каждой
+   `newer_than_baseline=true` и `booking_first_seen_here=true`. Последнее прямо
+   исключает Resend: у повторной доставки существует более ранний event с тем
+   же `booking_uuid`.
+
+   `<allowed_event_id>` обязан дать `event_status=processed`, `exact_jobs=1`,
+   `job_created_after_smoke_start=true`, `job_type_matches_event=true`,
+   `job_company_matches_record=true`, `job_record_matches_booking=true`,
+   объяснимый `job_statuses`, `outbox_rows=1` и
+   `outbox_delivery_proven=true`. Новая exact job, созданная после
+   `<smoke_start>`, доказывает, что planner и фильтр снова работают; успешную
+   отправку доказывает отдельно статус Outbox — единственный из `delivered` или
+   `read`. `outbox_rows` сам по себе доказательством отправки не
+   является: строка существует и в `queued`, и в `sent`, и в `failed`. `sent`
+   означает лишь приём сообщения на стороне Meta — после него ещё может прийти
+   `failed`, поэтому он тоже `pending`. `queued`/`sending`/`sent`
+   (`outbox_outcome=pending`) — повторить audit позже; `failed`/`unknown` или
+   более одной строки (`not_green`) — **STOP**, затем новая контролируемая
+   booking с новым UUID.
+
+   `<disallowed_event_id>` обязан дать `event_status=processed`, непустой
+   `record_id`, `exact_jobs=0`, `outbox_rows=0` и `outbox_outcome=none`
+   (ожидаемый результат, а не ошибка); Meta и Chatwoot не вызваны.
+
+   Gate привязан к этим двум конкретным event ID. Общий
+   `groups_with_exact_job` из уровня A главным gate быть не может: при живом
+   трафике в окно попадают чужие события.
+
+#### Staged fence, если inbox worker нужно остановить
+
+Иногда конвейер надо остановить жёстче, чем это делает невалидный allowlist, —
+например, когда правится не только allowlist. Тогда fence — это
+`EASYWEEK_PROCESSING_ENABLED=false`, а **не** notifications.
+
+1. `EASYWEEK_PROCESSING_ENABLED=false` в `easyweek.env`.
+2. Force-recreate **только** inbox worker, чтобы он гарантированно перестал
+   claim'ить:
+
+```bash
+$COMPOSE up -d --force-recreate altegio-easyweek-inbox-worker
+```
+
+3. `EASYWEEK_NOTIFICATIONS_ENABLED` **остаётся `true`** и на этом шаге не
+   трогается.
+4. Исправить allowlist и проверить его одноразовым контейнером из шага 3
+   штатного восстановления.
+5. Пересоздать потребителей с валидной конфигурацией:
+
+```bash
+$COMPOSE up -d --force-recreate \
+  altegio-easyweek-inbox-worker altegio-outbox-worker
+```
+
+6. Вернуть `EASYWEEK_PROCESSING_ENABLED=true`.
+7. Ещё раз force-recreate inbox worker:
+
+```bash
+$COMPOSE up -d --force-recreate altegio-easyweek-inbox-worker
+```
+
+**Инвариант обоих вариантов:** при наличии captured backlog не должно
+существовать ни одного окна, в котором inbox worker работает с
+`EASYWEEK_PROCESSING_ENABLED=true` и `EASYWEEK_NOTIFICATIONS_ENABLED=false`.
+Именно эта пара молча превращает captured события в `processed` без jobs.
+
+#### Domain-only drain — НЕОБРАТИМАЯ операция, не восстановление
+
+`EASYWEEK_PROCESSING_ENABLED=true` вместе с
+`EASYWEEK_NOTIFICATIONS_ENABLED=false` действительно прогоняет captured backlog
+и обновляет `Client`/`Record`. Но lifecycle jobs при этом не создаются, а
+события становятся терминальными. **Это не безопасное восстановление и не
+подготовительный шаг к нему.**
+
+Операция допустима, только если оператор осознанно решил **отказаться** от
+клиентских уведомлений за этот период — например, backlog устарел настолько,
+что подтверждение записи, которая уже прошла, только запутает клиента.
+
+Прежде чем её выполнять, обязательно:
+
+1. Подсчитать затрагиваемый backlog — сколько уведомлений будет потеряно:
+
+```sql
+SELECT count(*) AS captured_backlog
+FROM easyweek_events
+WHERE status = 'captured';
+```
+
+2. Явно подтвердить отказ от этих уведомлений — с тем, кто отвечает за
+   клиентскую коммуникацию, а не в одиночку.
+3. Понимать, что **автоматического replay после `processed` не существует**:
+   ни исправление allowlist, ни повторное включение notifications, ни
+   пересоздание воркеров эти уведомления не вернут. Единственный способ —
+   ручная работа с клиентами.
+
+Если хотя бы один из трёх пунктов не выполнен — используйте штатное
+восстановление выше.
+
+Отдельный production follow-up до любого ослабления count gate: создать одну
+контролируемую смешанную multi-service booking, сохранить безопасный реальный
+webhook capture для анализа и подтвердить отсутствие job/Outbox/send. Не
+выводить payload/category/PII в консоль и не включать поддержку multi-service в
+этом rollout; её семантика принимается только отдельным будущим решением.
+
+Последняя проверка log hygiene — ожидается `0`; названия категорий, услуг,
+payload и PII в логах не допускаются:
+
+```bash
+$COMPOSE logs --since='<smoke_start>' altegio-easyweek-inbox-worker altegio-outbox-worker \
+  | grep -Eci 'service_category|service_name|customer_phone|customer_email|booking_page|Authorization: Bearer|token=|Traceback'
+```
+
+Любой traceback, утечка, job/Outbox для disallowed записи или отсутствие
+job/Outbox для allowed записи — **STOP** до PR-8.
+
+---
+
 ## 7. Включение и smoke
 
 ### 7.0 Обязательный gate: Altegio-путь Раштата должен быть выключен
@@ -699,6 +1524,20 @@ WHERE provider = 'altegio'
 EASYWEEK_PROCESSING_ENABLED=true
 EASYWEEK_NOTIFICATIONS_ENABLED=false
 ```
+
+> **Это domain-only drain — необратимая операция, а не подготовительный шаг.**
+> Пара `processing=true` + `notifications=false` прогоняет captured backlog,
+> обновляя `Client`/`Record`, но делает события терминальными **без** lifecycle
+> jobs, и автоматического replay после этого не существует. Шаг допустим
+> только здесь, при первичной активации, когда backlog накоплен до запуска
+> интеграции и клиентских уведомлений за него никто не ждёт. Прежде чем его
+> выполнять, обязательно выполните все три требования из «Domain-only drain —
+> НЕОБРАТИМАЯ операция» (§6A): подсчитать `captured_backlog`, явно подтвердить
+> отказ от этих уведомлений с ответственным за клиентскую коммуникацию и
+> понимать, что вернуть их будет нельзя. Если backlog содержит записи, по
+> которым клиент ждёт подтверждения, — этот шаг пропускается: держите
+> `EASYWEEK_PROCESSING_ENABLED=false` при `EASYWEEK_NOTIFICATIONS_ENABLED=true`
+> до §7.1.3, как это делает штатный rollout §6A.
 
 2. Пересоздайте inbox-worker и убедитесь, что captured backlog обрабатывается
 по новой карте, а EasyWeek `MessageJob` ещё не создаются:

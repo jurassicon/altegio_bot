@@ -40,6 +40,7 @@ from typing import Any, Final, Mapping
 from urllib.parse import urlsplit
 
 from altegio_bot.easyweek_locations import EasyWeekLocation
+from altegio_bot.easyweek_service_category import normalize_service_category
 
 # ---------------------------------------------------------------------------
 # Event mapping — exact trigger names only
@@ -217,6 +218,9 @@ class NormalizedBooking:
     # services the booking has. Confirmed root fields in the live capture.
     services_description: str | None
     services_count: int | None
+    # Root-level machine category. It is normalized here but eligibility is
+    # deliberately decided later from the persisted Record.raw snapshot.
+    service_category: str | None
     # `booking_price_int` is the authoritative JSON number and is in CENTS
     # (3500 == 35.00). The `booking_price*` string variants are display values.
     total_cost: Decimal | None
@@ -353,6 +357,23 @@ def _optional_bounded_int(
         minimum=minimum,
         maximum=maximum,
     )
+
+
+def _optional_services_count(payload: dict[str, Any]) -> int | None:
+    """Normalize the singular EasyWeek service count as optional proof.
+
+    Unlike identifiers and persisted numeric domain fields, an unusable
+    ``services_count`` is not a malformed event: it means only that notification
+    eligibility is unproven. Zero remains available to the existing display
+    snapshot but clears the separate eligibility proof. Presence tracking still
+    records every explicit clear, while absent updates preserve previous proof.
+    """
+    if "services_count" not in payload:
+        return None
+    count = _as_exact_int(payload.get("services_count"))
+    if count is None or count < 0 or count > PG_INT_MAX:
+        return None
+    return count
 
 
 def _optional_str(value: Any, *, limit: int | None = None) -> str | None:
@@ -614,7 +635,7 @@ def normalize_event(
         )
     # record_services.amount is INTEGER.
     service_quantity = _optional_bounded_int(payload, "quantity", minimum=0, maximum=PG_INT_MAX)
-    services_count = _optional_bounded_int(payload, "services_count", minimum=0, maximum=PG_INT_MAX)
+    services_count = _optional_services_count(payload)
     total_cost = _price_to_decimal(payload)
 
     manage_link, manage_link_present = extract_manage_link(payload)
@@ -639,6 +660,7 @@ def normalize_event(
                 ("service_quantity", "quantity"),
                 ("services_description", "services_description"),
                 ("services_count", "services_count"),
+                ("service_category", "service_category"),
                 ("total_cost", "booking_price_int"),
                 # Presence decides whether the client link may be rewritten.
                 ("customer_id", "customer_id"),
@@ -681,6 +703,11 @@ def normalize_event(
         service_quantity=service_quantity,
         services_description=_optional_str(payload.get("services_description"), limit=512),
         services_count=services_count,
+        service_category=(
+            normalized_category.value
+            if (normalized_category := normalize_service_category(payload.get("service_category"))) is not None
+            else None
+        ),
         total_cost=total_cost,
         present_fields=present_fields,
     )

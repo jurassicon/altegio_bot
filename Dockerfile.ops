@@ -1,0 +1,44 @@
+# One-shot ops image for the PR-7.1 legacy WhatsApp worker retirement.
+#
+# Carries the same application code and dependencies as the service image, plus
+# the Docker CLI. Both are needed in ONE process: the retirement holds a
+# PostgreSQL barrier (`LOCK TABLE whatsapp_events IN SHARE MODE`) open while it
+# pauses and removes the legacy container, so the transaction and the container
+# control cannot live in separate places.
+#
+# The CLI is copied as a static binary from the official image instead of being
+# installed with a package manager: no daemon, no init system, nothing else
+# added to the image.
+#
+# Deliberately NOT built into the API image. `altegio-api` and every other
+# long-running service must never carry a Docker client — nor the socket mount
+# that would make one useful. Only the ephemeral `easyweek-legacy-retire`
+# service (profile `ops`) gets either.
+
+FROM docker:27-cli AS docker-cli
+
+FROM python:3.12-slim
+
+WORKDIR /app
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+RUN pip install --no-cache-dir uv
+
+COPY pyproject.toml uv.lock /app/
+RUN uv sync --frozen --no-install-project
+
+COPY alembic.ini /app/
+COPY alembic /app/alembic
+COPY src /app/src
+
+COPY --from=docker-cli /usr/local/bin/docker /usr/local/bin/docker
+
+ENV PYTHONPATH=/app/src
+ENV PATH=/app/.venv/bin:$PATH
+
+ENTRYPOINT ["/app/.venv/bin/python"]
+
+# Safe default: a bare `run` only probes. Retirement must be asked for.
+CMD ["-m", "altegio_bot.scripts.retire_legacy_whatsapp_worker", "--probe"]

@@ -49,6 +49,7 @@ from altegio_bot.easyweek_policy import (
     normalize_provider,
     validate_static_booking_page,
 )
+from altegio_bot.easyweek_service_category import evaluate_service_category
 from altegio_bot.message_planner import (
     COMEBACK_3D_DELAY,
     COMEBACK_3D_SOURCE_CANCELLED_AT_KEY,
@@ -158,6 +159,14 @@ WA_131026_SUPPRESSIBLE_JOB_TYPES: tuple[str, ...] = (
 TOKEN_EXPIRED_RETRY_SECONDS = 60
 STOP_WORKER_ON_TOKEN_EXPIRED_ENV = "STOP_WORKER_ON_TOKEN_EXPIRED"
 _TOKEN_EXPIRED = False
+
+# Configuration downtime is retried independently from real Meta attempts.
+# The persisted counter saturates before exponentiation, so a manually corrupt
+# or years-old value cannot overflow and can never exhaust ``job.attempts``.
+_EASYWEEK_CONFIG_DEFERRALS_KEY = "_easyweek_category_config_deferrals"
+EASYWEEK_CONFIG_RETRY_BASE_SECONDS = 30
+EASYWEEK_CONFIG_RETRY_CAP_SECONDS = 15 * 60
+MAX_EASYWEEK_CONFIG_BACKOFF_EXPONENT = 5
 
 # Maximum number of Altegio API guard retries (for repeat_10d / review_3d
 # pre-send checks). This counter is stored in job.payload["_api_guard_attempts"]
@@ -513,6 +522,22 @@ async def _load_record(
     if job.record_id is None:
         return None
     return await session.get(Record, job.record_id)
+
+
+async def _load_easyweek_record_for_update(
+    session: AsyncSession,
+    job: MessageJob,
+) -> Record | None:
+    if job.record_id is None:
+        return None
+
+    # ``populate_existing`` is essential: tests and maintenance callers may
+    # already have this Record in the identity map. The lock must refresh raw
+    # from PostgreSQL after waiting for the inbox transaction, not reuse a stale
+    # ORM snapshot. The surrounding outbox transaction holds FOR UPDATE across
+    # eligibility, provider attempt and Outbox audit write.
+    stmt = select(Record).where(Record.id == job.record_id).with_for_update().execution_options(populate_existing=True)
+    return (await session.execute(stmt)).scalars().one_or_none()
 
 
 def _as_utc(dt: datetime) -> datetime:
@@ -1330,6 +1355,28 @@ def _schedule_retry_or_cancel(
     job.updated_at = utcnow()
     job.last_error = reason
     return True
+
+
+def _defer_easyweek_configuration(
+    job: MessageJob,
+    record: Record | None,
+    reason: str,
+) -> bool:
+    """Requeue a configuration-unavailable job without spending send attempts."""
+    payload = dict(getattr(job, "payload", None) or {})
+    raw_count = payload.get(_EASYWEEK_CONFIG_DEFERRALS_KEY, 0)
+    count = raw_count if isinstance(raw_count, int) and not isinstance(raw_count, bool) and raw_count >= 0 else 0
+    exponent = min(count, MAX_EASYWEEK_CONFIG_BACKOFF_EXPONENT)
+    delay = min(
+        EASYWEEK_CONFIG_RETRY_BASE_SECONDS * (2**exponent),
+        EASYWEEK_CONFIG_RETRY_CAP_SECONDS,
+    )
+    payload[_EASYWEEK_CONFIG_DEFERRALS_KEY] = min(
+        count + 1,
+        MAX_EASYWEEK_CONFIG_BACKOFF_EXPONENT + 1,
+    )
+    job.payload = payload
+    return _schedule_retry_or_cancel(job, record, delay, reason)
 
 
 def _deadline_passed_for_send(job: MessageJob, record: Record | None) -> bool:
@@ -2358,7 +2405,10 @@ async def _run_job_logic(
         job_type=job.job_type,
         company_id=job.company_id,
     ):
-        record = await _load_record(session, job)
+        if job_provider == PROVIDER_EASYWEEK and job.job_type in EASYWEEK_LIFECYCLE_JOB_TYPES:
+            record = await _load_easyweek_record_for_update(session, job)
+        else:
+            record = await _load_record(session, job)
     if _record_is_in_past(record, job_type=job.job_type):
         job.status = "canceled"
         job.locked_at = None
@@ -2414,6 +2464,41 @@ async def _run_job_logic(
                 job.id,
                 job.company_id,
                 job.job_type,
+            )
+            return None
+
+        # Re-prove the CURRENT persisted category after provider/company/record
+        # identity, but before the phone, rate limit, rendering, Meta, Chatwoot
+        # or any Outbox audit row. This closes queued/pre-PR-7.1 jobs and the
+        # allowed -> disallowed race between planner and claim.
+        eligibility = evaluate_service_category(
+            record_raw=record.raw,
+            allowed_categories_raw=settings.easyweek_allowed_service_categories,
+        )
+        if not eligibility.allowed:
+            if eligibility.recoverable_configuration:
+                requeued = _defer_easyweek_configuration(job, record, eligibility.reason)
+                logger.info(
+                    "EasyWeek lifecycle configuration unavailable job_id=%s provider=%s "
+                    "company_id=%s record_id=%s reason=%s outcome=%s",
+                    job.id,
+                    job_provider,
+                    job.company_id,
+                    record.id,
+                    eligibility.reason,
+                    "queued" if requeued else "deadline_canceled",
+                )
+                return None
+            job.status = "canceled"
+            job.locked_at = None
+            job.last_error = eligibility.reason
+            logger.info(
+                "EasyWeek lifecycle suppressed before send job_id=%s provider=%s company_id=%s record_id=%s reason=%s",
+                job.id,
+                job_provider,
+                job.company_id,
+                record.id,
+                eligibility.reason,
             )
             return None
 
