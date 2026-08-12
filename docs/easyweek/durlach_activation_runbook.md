@@ -736,7 +736,37 @@ ORDER BY status;
    Живые вебхуки продолжают приниматься и копиться в `captured` — это и есть
    цель fence: события сохраняются до включения нового фильтра.
 
-4. Дождаться завершения lifecycle jobs, созданных **до** fence:
+4. Остановить **второй источник** EasyWeek jobs. `EASYWEEK_PROCESSING_ENABLED`
+   закрывает только planner в `easyweek_inbox_worker`. Delivery-retry рождается
+   не там: его создаёт `_handle_failed_delivery_status` в
+   `altegio-whatsapp-inbox-worker` при запоздавшем Meta `failed`-callback. Этот
+   путь гейтится только `OUTBOX_DELIVERY_RETRY_ENABLED` и **не читает** ни
+   `EASYWEEK_PROCESSING_ENABLED`, ни `EASYWEEK_NOTIFICATIONS_ENABLED`, а
+   создаёт `provider='easyweek'` job ровно тех трёх типов, ради которых
+   делается rollout: `record_created`, `record_updated`, `record_canceled`
+   (`DELIVERY_RETRY_JOB_TYPES`, ключ `delivery_retry:<outbox_id>:<attempt>`).
+
+   Поэтому запрос очереди при работающем producer — это моментальный снимок, а
+   не fence. Пока старый `altegio-outbox-worker` ещё не пересоздан, он не
+   содержит send-time category guard PR-7.1, и один поздний retryable callback
+   по disallowed booking отправит запрещённое уведомление. Первая retry delay
+   (10 минут) защитой не является: rollout не должен зависеть от того, успеет
+   ли оператор закончить deploy быстрее неё.
+
+```bash
+$COMPOSE stop altegio-whatsapp-inbox-worker
+```
+
+   Что именно останавливается: `altegio-api` продолжает принимать вебхуки Meta
+   и сохранять их в `whatsapp_events`, ничего не теряется. Приостановлена
+   только обработка inbound-сообщений и status-callbacks — до шага 11. Это
+   общий для всех филиалов worker, поэтому пауза затрагивает и Altegio-трафик:
+   входящие сообщения и статусы Карлсруэ и Раштата будут разобраны после
+   возобновления, с задержкой на длительность rollout. Это цена корректности,
+   а не побочный эффект.
+
+5. Только теперь — финальный queue gate. Producer закрыт, поэтому пустая
+   очередь останется пустой:
 
 ```sql
 SELECT status, count(*)
@@ -748,42 +778,56 @@ GROUP BY status
 ORDER BY status;
 ```
 
-   Ожидается 0 строк. Если очередь непуста — **STOP** и разбор каждой job до
-   deploy; автоматически отменять или переписывать её этим rollout нельзя.
-
-5. Записать точный production allowlist:
+   Ожидается 0 строк. Если очередь непуста — **STOP** и индивидуальный разбор
+   каждой job до deploy. Нельзя ни автоматически отменять, ни переписывать, ни
+   безусловно выпускать их старым outbox.
+6. Записать точный production allowlist:
 
 ```text
 EASYWEEK_ALLOWED_SERVICE_CATEGORIES=["Wimpernverlängerung"]
 ```
 
-6. Развернуть новый код при `EASYWEEK_PROCESSING_ENABLED=false`. Notifications
+7. Развернуть новый код при `EASYWEEK_PROCESSING_ENABLED=false`. Notifications
    по-прежнему не трогаются.
-7. Проверить effective-конфигурацию одноразовым контейнером, который не
+8. Проверить effective-конфигурацию одноразовым контейнером, который не
    запускает loop (probe из §4). Gate проверяет только booleans и количество:
    `configured=true`, `valid=true`, `count=1`, а также
    `notifications_enabled=true`. Raw env и название категории не печатаются.
-8. Пересоздать `altegio-outbox-worker` с новым кодом и валидной конфигурацией:
+9. Пересоздать `altegio-outbox-worker` с новым кодом и валидной конфигурацией:
 
 ```bash
 $COMPOSE up -d --force-recreate altegio-outbox-worker
 ```
 
-9. Ещё раз подтвердить, что `EASYWEEK_NOTIFICATIONS_ENABLED=true` — до снятия
+10. Убедиться, что новый outbox действительно поднялся и обслуживает очередь,
+    **до** возврата retry producer. Порядок здесь и есть защита: сохранённые
+    поздние status-callbacks могут создать retries, и обрабатывать их должен
+    только новый образ с send-time eligibility guard PR-7.1.
+11. Только теперь вернуть `altegio-whatsapp-inbox-worker`:
+
+```bash
+$COMPOSE up -d --force-recreate altegio-whatsapp-inbox-worker
+```
+
+    Накопленные `whatsapp_events` разбираются штатно. Retry-jobs, которые из
+    них родятся, попадут уже в guarded outbox: для disallowed категории job
+    завершится локально, без Meta attempt.
+
+12. Ещё раз подтвердить, что `EASYWEEK_NOTIFICATIONS_ENABLED=true` — до снятия
    fence, а не после.
-10. Снять write fence:
+13. Снять write fence:
 
 ```text
 EASYWEEK_PROCESSING_ENABLED=true
 ```
 
-11. Пересоздать inbox worker:
+14. Пересоздать inbox worker:
 
 ```bash
 $COMPOSE up -d --force-recreate altegio-easyweek-inbox-worker
 ```
 
-12. Сохранённые за время fence `captured` события проходят новый
+15. Сохранённые за время fence `captured` события проходят новый
     category-фильтр: разрешённые создают lifecycle job, остальные штатно
     suppress'атся по стабильной технической причине. Ни одно из них не было
     списано терминально без решения фильтра.
@@ -849,7 +893,29 @@ $COMPOSE run --rm --no-deps \
    | `job_company_matches_record` | `true` |
    | `job_record_matches_booking` | `true` |
    | `job_statuses` | одно объяснимое значение: `queued`, `processing`, `done` либо terminal по штатному deadline |
-   | `outbox_rows` | штатный lifecycle: одна доставка, дошедшая до `sent` |
+   | `outbox_rows` | ровно `1` |
+   | `outbox_delivery_proven` | `true` |
+   | `outbox_status_counts` | единственный статус из `sent`, `delivered`, `read` |
+
+   **Наличие Outbox-строки и успешная отправка — разные доказательства.**
+   `outbox_rows=1` доказывает только то, что planner и фильтр PR-7.1
+   отработали и job дошла до outbox: строка существует и в `queued`, и в
+   `sending`, и в `failed`, и в `unknown`. Успешную provider-попытку
+   доказывает только статус:
+
+   | `outbox_outcome` | Статусы | Что делать |
+   | --- | --- | --- |
+   | `proven` | `sent`, `delivered`, `read` | smoke зелёный |
+   | `pending` | `queued`, `sending` | ещё не завершено — подождать и повторить audit |
+   | `not_green` | `failed`, `unknown`, либо более одной строки | **STOP** |
+   | `none` | строк нет | ожидаемо для disallowed |
+
+   `sent_at` или `provider_message_id` сами по себе `failed`/`unknown` в успех
+   не превращают: оба поля остаются на строке отклонённой попытки. Если
+   allowed smoke получил `failed`/`unknown` — разобраться с внешней причиной
+   (Meta, шаблон, номер), затем сделать **новую** контролируемую booking с
+   новым UUID и повторить smoke. Не засчитывать неудачную попытку через
+   старую строку и не чинить это replay'ем.
 
    Gate для `<disallowed_event_id>`:
 
@@ -859,6 +925,7 @@ $COMPOSE run --rm --no-deps \
    | `record_id` | не `null` — domain snapshot сохранён |
    | `exact_jobs` | `0` |
    | `outbox_rows` | `0` |
+   | `outbox_outcome` | `none` — это ожидаемый результат, а не ошибка |
    | Meta / Chatwoot | сообщений нет |
 
    Отсутствие job у disallowed объясняется контролируемым disallowed payload
@@ -1114,12 +1181,19 @@ $COMPOSE run --rm --no-deps \
    `<allowed_event_id>` обязан дать `event_status=processed`, `exact_jobs=1`,
    `job_created_after_smoke_start=true`, `job_type_matches_event=true`,
    `job_company_matches_record=true`, `job_record_matches_booking=true`,
-   объяснимый `job_statuses` и штатный `outbox_rows`. Новая exact job,
-   созданная после `<smoke_start>`, — и есть положительное доказательство
-   восстановления.
+   объяснимый `job_statuses`, `outbox_rows=1` и
+   `outbox_delivery_proven=true`. Новая exact job, созданная после
+   `<smoke_start>`, доказывает, что planner и фильтр снова работают; успешную
+   отправку доказывает отдельно статус Outbox — единственный из `sent`,
+   `delivered`, `read`. `outbox_rows` сам по себе доказательством отправки не
+   является: строка существует и в `queued`, и в `failed`. `queued`/`sending`
+   (`outbox_outcome=pending`) — повторить audit позже; `failed`/`unknown` или
+   более одной строки (`not_green`) — **STOP**, затем новая контролируемая
+   booking с новым UUID.
 
    `<disallowed_event_id>` обязан дать `event_status=processed`, непустой
-   `record_id`, `exact_jobs=0` и `outbox_rows=0`; Meta и Chatwoot не вызваны.
+   `record_id`, `exact_jobs=0`, `outbox_rows=0` и `outbox_outcome=none`
+   (ожидаемый результат, а не ошибка); Meta и Chatwoot не вызваны.
 
    Gate привязан к этим двум конкретным event ID. Общий
    `groups_with_exact_job` из уровня A главным gate быть не может: при живом

@@ -42,6 +42,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 import altegio_bot.db as app_db
 from altegio_bot.campaigns.runner import CAMPAIGN_EXECUTION_JOB_TYPE
 from altegio_bot.delivery_retry_identity import (
+    DELIVERY_RETRY_JOB_TYPES,
     RetryIdentity,
     resolve_retry_chain_members,
     resolve_retry_identity,
@@ -5955,3 +5956,45 @@ async def test_delivery_retry_revalidates_the_current_raw_body_before_sending(
     assert capture.template_calls == []
     assert capture.text_calls == []
     assert await _outbox_rows(db, retry) == []
+
+
+async def test_the_processing_fence_does_not_stop_the_delivery_retry_producer(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    no_contact_rate_limit: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-7.1 rollout: `EASYWEEK_PROCESSING_ENABLED=false` fences ONE producer.
+
+    The rollout fence stops `easyweek_inbox_worker` from claiming events, and it
+    is easy to read that as "no new EasyWeek jobs can appear". They can:
+    `_handle_failed_delivery_status` in `whatsapp_inbox_worker` gates on
+    `outbox_delivery_retry_enabled` alone and creates a `provider='easyweek'`
+    job for exactly the three lifecycle types the rollout is about.
+
+    So a queue that reads empty is a snapshot, not a fence — a late Meta failed
+    callback can refill it while the OLD outbox image (without the PR-7.1
+    send-time category guard) is still running. This test is the reason the
+    runbook must stop the retry producer itself before its final queue gate.
+    """
+    root_job, root_outbox = await _seed_easyweek_send_with_outbox(db, capture)
+    assert not await _retry_jobs_for(db, int(root_outbox.id))
+
+    # The rollout fence, exactly as the runbook sets it.
+    monkeypatch.setattr(settings, "easyweek_processing_enabled", False, raising=False)
+    monkeypatch.setattr(settings, "easyweek_notifications_enabled", True, raising=False)
+    assert eyw_worker.processing_is_configured() is False, "inbox claiming is fenced"
+
+    await _deliver_status(
+        db,
+        _failed_status_payload(str(root_outbox.provider_message_id)),
+        dedupe="wa:retry-producer-during-fence",
+    )
+
+    retries = await _retry_jobs_for(db, int(root_outbox.id))
+    assert len(retries) == 1, "the fence did NOT stop the second producer — this is the rollout race"
+    retry = retries[0]
+    assert retry.provider == PROVIDER_EASYWEEK
+    assert retry.job_type in DELIVERY_RETRY_JOB_TYPES
+    assert retry.job_type in {"record_created", "record_updated", "record_canceled"}
+    assert retry.status == "queued", "and an old outbox worker could claim it"

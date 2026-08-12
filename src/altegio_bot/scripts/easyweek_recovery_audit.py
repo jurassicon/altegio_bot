@@ -34,6 +34,7 @@ import uuid
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime
+from typing import Final
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -212,6 +213,14 @@ class SmokeVerificationError(RuntimeError):
     """Fail-closed: the smoke cannot be judged, so it is not green."""
 
 
+# A provider attempt that actually landed. `sent` is the first status that
+# proves Meta accepted the message; `delivered`/`read` are later stages of the
+# same success and must not be treated as regressions.
+OUTBOX_DELIVERED_STATUSES: Final[frozenset[str]] = frozenset({"sent", "delivered", "read"})
+# Not finished yet: re-run the audit rather than judging the smoke.
+OUTBOX_PENDING_STATUSES: Final[frozenset[str]] = frozenset({"queued", "sending"})
+
+
 @dataclass(frozen=True)
 class SmokeEventReport:
     """One controlled smoke delivery, in booleans / counts / technical ids."""
@@ -230,6 +239,33 @@ class SmokeEventReport:
     job_company_matches_record: bool
     job_record_matches_booking: bool
     outbox_rows: int
+    outbox_status_counts: dict[str, int]
+
+    @property
+    def outbox_delivery_proven(self) -> bool:
+        """One Outbox row that actually reached the provider.
+
+        A row COUNT proves the planner ran, nothing more: `queued`, `sending`,
+        `failed` and `unknown` all count as one. Delivery is proven only by a
+        status in :data:`OUTBOX_DELIVERED_STATUSES`, and only when the smoke
+        produced the single row it was supposed to — several rows mean the
+        chain did something unplanned and needs reading, not a green tick.
+        """
+        if self.outbox_rows != 1:
+            return False
+        return set(self.outbox_status_counts) <= OUTBOX_DELIVERED_STATUSES
+
+    @property
+    def outbox_outcome(self) -> str:
+        """`proven`, `pending`, `not_green`, or `none` — never a bare count."""
+        if self.outbox_rows == 0:
+            return "none"
+        if self.outbox_delivery_proven:
+            return "proven"
+        statuses = set(self.outbox_status_counts)
+        if statuses <= (OUTBOX_PENDING_STATUSES | OUTBOX_DELIVERED_STATUSES) and self.outbox_rows == 1:
+            return "pending"
+        return "not_green"
 
     def as_safe_dict(self) -> dict[str, object]:
         return {
@@ -248,6 +284,9 @@ class SmokeEventReport:
             "job_company_matches_record": self.job_company_matches_record,
             "job_record_matches_booking": self.job_record_matches_booking,
             "outbox_rows": self.outbox_rows,
+            "outbox_status_counts": dict(sorted(self.outbox_status_counts.items())),
+            "outbox_delivery_proven": self.outbox_delivery_proven,
+            "outbox_outcome": self.outbox_outcome,
         }
 
 
@@ -325,15 +364,19 @@ async def verify_controlled_smoke(
             .all()
         )
 
-        outbox_rows = 0
+        # Status, not just a count: a row exists in `queued`, `failed` and
+        # `sent` alike, and only the last one says anything was delivered.
+        outbox_status_counts: dict[str, int] = {}
         if jobs:
-            outbox_rows = int(
-                (
-                    await session.execute(
-                        select(func.count(OutboxMessage.id)).where(OutboxMessage.job_id.in_([job.id for job in jobs]))
-                    )
-                ).scalar_one()
-            )
+            status_rows = (
+                await session.execute(
+                    select(OutboxMessage.status, func.count(OutboxMessage.id))
+                    .where(OutboxMessage.job_id.in_([job.id for job in jobs]))
+                    .group_by(OutboxMessage.status)
+                )
+            ).all()
+            outbox_status_counts = {str(status): int(count) for status, count in status_rows}
+        outbox_rows = sum(outbox_status_counts.values())
 
         reports.append(
             SmokeEventReport(
@@ -357,6 +400,7 @@ async def verify_controlled_smoke(
                 and record is not None
                 and all(job.record_id is not None and int(job.record_id) == int(record.id) for job in jobs),
                 outbox_rows=outbox_rows,
+                outbox_status_counts=outbox_status_counts,
             )
         )
 

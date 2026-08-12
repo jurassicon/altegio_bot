@@ -24,7 +24,7 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from altegio_bot.easyweek_normalizer import easyweek_job_dedupe_key
-from altegio_bot.models.models import PROVIDER_EASYWEEK, EasyWeekEvent, MessageJob, Record
+from altegio_bot.models.models import PROVIDER_EASYWEEK, EasyWeekEvent, MessageJob, OutboxMessage, Record
 from altegio_bot.scripts.easyweek_recovery_audit import (
     SmokeVerificationError,
     audit_recovery,
@@ -158,7 +158,7 @@ def test_byte_identical_resend_is_one_delivery_group_expecting_one_job() -> None
 # ---------------------------------------------------------------------------
 
 
-async def _seed(session: AsyncSession, *rows: EasyWeekEvent | MessageJob | Record) -> None:
+async def _seed(session: AsyncSession, *rows: EasyWeekEvent | MessageJob | OutboxMessage | Record) -> None:
     session.add_all(list(rows))
     await session.commit()
 
@@ -454,3 +454,151 @@ async def test_the_printed_report_carries_no_dedupe_key_or_payload(
     assert str(BOOKING) not in rendered
     assert "hash-a" not in rendered
     assert "easyweek:record_created" not in rendered
+
+
+# ---------------------------------------------------------------------------
+# Outbox presence is not delivery
+# ---------------------------------------------------------------------------
+
+
+def _outbox(job_id: int, status: str, *, sent_at: datetime | None = None, provider_message_id: str | None = None):
+    return OutboxMessage(
+        company_id=999501,
+        record_id=77,
+        job_id=job_id,
+        phone_e164="+490000000000",
+        template_code="record_created",
+        language="de",
+        body="",
+        status=status,
+        scheduled_at=SMOKE_START,
+        sent_at=sent_at,
+        provider_message_id=provider_message_id,
+    )
+
+
+async def _smoke_with_outbox(
+    session_maker: async_sessionmaker[AsyncSession],
+    *outbox_factories: object,
+    **outbox_kwargs: object,
+) -> dict[str, object]:
+    """One fresh allowed smoke delivery, with caller-chosen Outbox rows."""
+    key = easyweek_job_dedupe_key(
+        event_hint="booking-created", booking_uuid=FRESH_BOOKING, payload_hash="fresh", job_type="record_created"
+    )
+    async with session_maker() as session:
+        await _seed(session, _record(77, FRESH_BOOKING))
+        job = _job(key, job_type="record_created", record_id=77)
+        job.created_at = SMOKE_START + timedelta(minutes=1)
+        await _seed(session, _event(90, "booking-created", booking=FRESH_BOOKING, payload_hash="fresh"), job)
+
+        rows = [factory(int(job.id)) for factory in outbox_factories]  # type: ignore[operator]
+        if rows:
+            await _seed(session, *rows)
+
+        result = await verify_controlled_smoke(session, event_ids=[90], baseline_event_id=89, smoke_start=SMOKE_START)
+    return result["events"][0]  # type: ignore[index,return-value]
+
+
+@pytest.mark.parametrize("status", ["sent", "delivered", "read"])
+async def test_a_single_landed_outbox_row_proves_delivery(
+    session_maker: async_sessionmaker[AsyncSession],
+    status: str,
+) -> None:
+    event = await _smoke_with_outbox(session_maker, lambda job_id: _outbox(job_id, status))
+
+    assert event["outbox_rows"] == 1
+    assert event["outbox_delivery_proven"] is True
+    assert event["outbox_outcome"] == "proven"
+    assert event["outbox_status_counts"] == {status: 1}
+
+
+@pytest.mark.parametrize("status", ["queued", "sending"])
+async def test_an_unfinished_outbox_row_is_pending_not_proven(
+    session_maker: async_sessionmaker[AsyncSession],
+    status: str,
+) -> None:
+    """The operator must wait and re-run the audit, not call the smoke green."""
+    event = await _smoke_with_outbox(session_maker, lambda job_id: _outbox(job_id, status))
+
+    assert event["outbox_rows"] == 1, "the row exists — which is exactly why a count proves nothing"
+    assert event["outbox_delivery_proven"] is False
+    assert event["outbox_outcome"] == "pending"
+
+
+@pytest.mark.parametrize("status", ["failed", "unknown"])
+async def test_a_failed_or_unknown_outbox_row_is_not_green(
+    session_maker: async_sessionmaker[AsyncSession],
+    status: str,
+) -> None:
+    event = await _smoke_with_outbox(session_maker, lambda job_id: _outbox(job_id, status))
+
+    assert event["outbox_rows"] == 1
+    assert event["outbox_delivery_proven"] is False
+    assert event["outbox_outcome"] == "not_green"
+
+
+@pytest.mark.parametrize("status", ["failed", "unknown"])
+async def test_sent_at_and_provider_message_id_do_not_rescue_a_failed_row(
+    session_maker: async_sessionmaker[AsyncSession],
+    status: str,
+) -> None:
+    """An attempt that reached Meta and then failed is still a failed attempt.
+
+    Both fields survive on a failed row, so treating either as success would
+    turn every rejected send into a green smoke.
+    """
+    event = await _smoke_with_outbox(
+        session_maker,
+        lambda job_id: _outbox(
+            job_id, status, sent_at=SMOKE_START + timedelta(minutes=2), provider_message_id="wamid.smoke"
+        ),
+    )
+
+    assert event["outbox_delivery_proven"] is False
+    assert event["outbox_outcome"] == "not_green"
+
+
+async def test_several_outbox_rows_are_never_an_automatic_green(
+    session_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """Two sends for one controlled booking is a finding, not a success."""
+    event = await _smoke_with_outbox(
+        session_maker,
+        lambda job_id: _outbox(job_id, "sent"),
+        lambda job_id: _outbox(job_id, "sent"),
+    )
+
+    assert event["outbox_rows"] == 2
+    assert event["outbox_delivery_proven"] is False, "the smoke expected exactly one delivery"
+    assert event["outbox_outcome"] == "not_green"
+
+
+async def test_a_suppressed_delivery_reports_none_rather_than_a_failure(
+    session_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """Disallowed smoke: no job, no outbox — correct, and not an error state."""
+    async with session_maker() as session:
+        await _seed(session, _record(78, FRESH_BOOKING))
+        await _seed(session, _event(91, "booking-created", booking=FRESH_BOOKING, payload_hash="disallowed"))
+
+        result = await verify_controlled_smoke(session, event_ids=[91], baseline_event_id=89, smoke_start=SMOKE_START)
+
+    [event] = result["events"]  # type: ignore[index]
+    assert event["exact_jobs"] == 0
+    assert event["outbox_rows"] == 0
+    assert event["outbox_delivery_proven"] is False
+    assert event["outbox_outcome"] == "none", "absence is the expected result here, not a failure"
+
+
+async def test_the_outbox_fields_leak_no_recipient_or_body(
+    session_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    event = await _smoke_with_outbox(
+        session_maker,
+        lambda job_id: _outbox(job_id, "sent", provider_message_id="wamid.smoke"),
+    )
+
+    rendered = str(event)
+    for leaked in ("+490000000000", "wamid.smoke", "record_created:", str(FRESH_BOOKING), "fresh"):
+        assert leaked not in rendered, f"the smoke report must not surface {leaked}"

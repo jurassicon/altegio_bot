@@ -22,7 +22,12 @@ from pathlib import Path
 import pytest
 
 from altegio_bot.easyweek_normalizer import easyweek_job_dedupe_key
-from altegio_bot.scripts.easyweek_recovery_audit import expected_job_type, verify_controlled_smoke
+from altegio_bot.scripts.easyweek_recovery_audit import (
+    OUTBOX_DELIVERED_STATUSES,
+    OUTBOX_PENDING_STATUSES,
+    expected_job_type,
+    verify_controlled_smoke,
+)
 from altegio_bot.settings import settings
 from altegio_bot.workers.easyweek_inbox_worker import processing_is_configured
 
@@ -620,3 +625,124 @@ def test_the_smoke_verifier_is_bound_to_the_production_key_and_fails_closed() ->
     assert "sha256" not in source.lower()
     for guard in ("not found", "no booking uuid", "no lifecycle hint"):
         assert guard in source, f"fail-closed guard missing: {guard}"
+
+
+# ---------------------------------------------------------------------------
+# The rollout must close the SECOND producer, not just the planner
+# ---------------------------------------------------------------------------
+
+
+def test_the_rollout_names_delivery_retry_as_the_second_producer() -> None:
+    rollout = _rollout()
+
+    assert "_handle_failed_delivery_status" in rollout
+    assert "altegio-whatsapp-inbox-worker" in rollout
+    assert "OUTBOX_DELIVERY_RETRY_ENABLED" in rollout
+    for job_type in ("record_created", "record_updated", "record_canceled"):
+        assert job_type in rollout, f"the affected retry scope must name {job_type}"
+
+
+def test_the_retry_producer_is_stopped_before_the_final_queue_gate() -> None:
+    """A queue read while the producer runs is a snapshot, not a fence."""
+    rollout = _rollout()
+
+    stop = _first_instruction_offset(rollout, "stop altegio-whatsapp-inbox-worker")
+    final_gate = rollout.index("Только теперь — финальный queue gate")
+
+    assert stop < final_gate, "the producer must be closed before the queue is declared empty"
+
+
+def test_the_new_outbox_starts_before_the_retry_producer_returns() -> None:
+    """Late callbacks must land in the guarded image, never the old one."""
+    rollout = _rollout()
+
+    new_outbox = _first_instruction_offset(rollout, "up -d --force-recreate altegio-outbox-worker")
+    producer_back = _first_instruction_offset(rollout, "up -d --force-recreate altegio-whatsapp-inbox-worker")
+
+    assert new_outbox < producer_back
+
+
+def test_processing_returns_to_true_only_after_the_producer_is_restored() -> None:
+    rollout = _rollout()
+
+    producer_back = _first_instruction_offset(rollout, "up -d --force-recreate altegio-whatsapp-inbox-worker")
+    unfence = _first_instruction_offset(rollout, "EASYWEEK_PROCESSING_ENABLED=true")
+
+    assert producer_back < unfence
+
+
+def test_the_controlled_smoke_runs_only_after_the_fence_is_lifted() -> None:
+    rollout = _rollout()
+
+    unfence = _first_instruction_offset(rollout, "EASYWEEK_PROCESSING_ENABLED=true")
+    smoke = rollout.index(SMOKE_HEADING)
+
+    assert unfence < smoke
+
+
+def test_the_rollout_admits_the_shared_worker_pause() -> None:
+    """The WhatsApp worker is shared, so Altegio is affected — say so."""
+    rollout = _rollout()
+
+    assert "Altegio" in rollout
+    assert "whatsapp_events" in rollout, "the doc must state that webhooks are still persisted"
+
+
+def test_the_rollout_mutates_no_production_rows() -> None:
+    rollout = _rollout()
+
+    for block in _code_blocks(rollout):
+        for mutation in ("UPDATE ", "DELETE ", "INSERT "):
+            assert mutation not in block, f"the rollout must not mutate production data: {mutation}"
+    assert "replay" not in rollout.lower() or "не" in rollout
+
+
+def test_the_rollout_uses_real_compose_services_and_the_production_file_set() -> None:
+    import yaml
+
+    rollout = _rollout()
+    services = set(yaml.safe_load((REPO_ROOT / "docker-compose.yml").read_text())["services"])
+
+    for named in ("altegio-easyweek-inbox-worker", "altegio-outbox-worker", "altegio-whatsapp-inbox-worker"):
+        assert named in rollout
+        assert named in services, f"{named} is not a real compose service"
+    assert "$COMPOSE" in rollout
+
+
+# ---------------------------------------------------------------------------
+# Outbox presence is not proof of sending
+# ---------------------------------------------------------------------------
+
+
+def test_the_smoke_gates_require_proven_delivery_not_a_row_count() -> None:
+    for section in (_section(_rollout(), SMOKE_HEADING), _section(_runbook(), LEVEL_B_HEADING)):
+        assert "outbox_delivery_proven" in section
+        assert "outbox_rows=1" in section or "| `outbox_rows` | ровно `1` |" in section
+        for landed in ("sent", "delivered", "read"):
+            assert landed in section, f"the successful progression must list {landed}"
+        for pending in ("queued", "sending"):
+            assert pending in section
+        for not_green in ("failed", "unknown"):
+            assert not_green in section
+        assert "STOP" in section
+
+
+def test_no_smoke_gate_calls_a_bare_row_count_proof_of_sending() -> None:
+    """The exact false claim: "one row means it reached sent"."""
+    for section in (_section(_rollout(), SMOKE_HEADING), _section(_runbook(), LEVEL_B_HEADING)):
+        assert "одна доставка, дошедшая до `sent`" not in section
+        assert "доказательством отправки не" in section or "разные доказательства" in section
+
+
+def test_the_disallowed_gate_stays_absence_based() -> None:
+    for section in (_section(_rollout(), SMOKE_HEADING), _section(_runbook(), LEVEL_B_HEADING)):
+        assert "exact_jobs=0" in section or "| `exact_jobs` | `0` |" in section
+        assert "outbox_rows=0" in section or "| `outbox_rows` | `0` |" in section
+        assert "none" in section, "absence must have neutral semantics, not a failure"
+
+
+def test_the_delivered_statuses_are_taken_from_the_audit_module() -> None:
+    """Document and code must not drift on what counts as delivered."""
+    assert OUTBOX_DELIVERED_STATUSES == frozenset({"sent", "delivered", "read"})
+    assert OUTBOX_PENDING_STATUSES == frozenset({"queued", "sending"})
+    assert not (OUTBOX_DELIVERED_STATUSES & OUTBOX_PENDING_STATUSES)
