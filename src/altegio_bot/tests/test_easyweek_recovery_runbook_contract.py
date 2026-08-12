@@ -825,18 +825,35 @@ def test_capability_is_checked_on_the_running_container_not_the_checkout() -> No
     assert probe < rollout.index("Вариант «graceful»")
 
 
-def test_the_legacy_transition_freezes_before_it_counts() -> None:
-    """No claim window between the count and the retire."""
-    rollout = _rollout()
-    legacy = _section(rollout, "##### Вариант «legacy»")
+def test_the_legacy_transition_uses_a_db_barrier_not_a_bare_freeze() -> None:
+    """`docker pause` freezes the client, not its PostgreSQL backend.
 
-    pause = legacy.index("docker pause")
-    count = legacy.index("stranded_processing")
-    retire = legacy.index("docker rm -f")
+    A COMMIT already on the wire completes anyway, so a plain
+    pause -> SELECT -> rm can still strand rows. The doc must say so and point
+    at the lock instead.
+    """
+    legacy = _section(_rollout(), "##### Вариант «legacy»")
 
-    assert pause < count < retire, "freeze -> prove processing = 0 -> retire"
-    assert "race" in legacy, "the doc must explain why the freeze closes the window"
-    assert "откатывается" in legacy, "an uncommitted claim rolls back when the process dies"
+    assert "не закрывает" in legacy, "the doc must retract the pause-is-enough claim"
+    assert "backend" in legacy, "and explain that the backend keeps going"
+    assert "LOCK TABLE whatsapp_events IN SHARE MODE" in legacy
+    assert "ROW EXCLUSIVE" in legacy, "the conflicting mode must be named"
+
+    # Ordered as the helper performs it: barrier, then count, then removal.
+    barrier = legacy.index("LOCK TABLE whatsapp_events")
+    count = legacy.index("считает", barrier)
+    removal = legacy.index("удаляет", count)
+    assert barrier < count < removal
+
+
+def test_the_legacy_transition_is_a_runnable_helper_not_a_manual_protocol() -> None:
+    """A multi-session lock protocol must not be retyped by an operator."""
+    legacy = _section(_rollout(), "##### Вариант «legacy»")
+
+    assert "altegio_bot.scripts.retire_legacy_whatsapp_worker" in legacy
+    assert "run --rm --no-deps" in legacy, "it runs as a one-shot container"
+    assert "STOP" in legacy
+    assert "lock" in legacy.lower()
 
 
 def test_the_legacy_transition_never_sigterms_or_bulk_updates() -> None:
@@ -846,7 +863,16 @@ def test_the_legacy_transition_never_sigterms_or_bulk_updates() -> None:
         assert "stop -t" not in block, "a legacy worker must never be SIGTERM'd"
         assert "UPDATE" not in block
     assert "запрещён" in legacy, "the bulk update must be forbidden in words too"
-    assert "unpause" in legacy, "a non-zero count is resolved by letting it finish, not by killing it"
+    assert "без replay" in legacy or "без replay" in legacy.lower()
+
+
+def test_the_legacy_transition_documents_the_lock_cost() -> None:
+    """Holding SHARE briefly blocks inserts of new webhook events — say so."""
+    legacy = _section(_rollout(), "##### Вариант «legacy»")
+
+    assert "Цена барьера" in legacy
+    assert "ждать освобождения lock" in legacy
+    assert "не теряется" in legacy, "webhooks queue rather than being dropped"
 
 
 def test_the_operator_verifies_exactly_one_non_oneoff_container() -> None:

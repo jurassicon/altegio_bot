@@ -31,12 +31,15 @@ printf '%s\n' "$*" >> "$FAKE_LOG"
 
 case "$1" in
   ps)
+    [ "$FAKE_PS_FAILS" = "1" ] && exit 1
     printf '%s\n' "$FAKE_CONTAINER_IDS"
     ;;
   inspect)
     fmt="$3"
+    current_state="$FAKE_STATE"
+    if [ -s "$FAKE_STATE_FILE" ]; then current_state="$(cat "$FAKE_STATE_FILE")"; fi
     case "$fmt" in
-      *State.Status*)   printf '%s\n' "$FAKE_STATE" ;;
+      *State.Status*)   printf '%s\n' "$current_state" ;;
       *State.ExitCode*) printf '%s\n' "$FAKE_EXIT_CODE" ;;
       *State.OOMKilled*) printf '%s\n' "$FAKE_OOM" ;;
       *State.Error*)    printf '%s\n' "$FAKE_ERROR" ;;
@@ -53,7 +56,7 @@ case "$1" in
     # A real `docker stop` returns 0 even when the timeout expired and the
     # daemon had to SIGKILL — which is exactly why the verdict comes from the
     # exit state instead of from this status.
-    printf '%s\n' "$FAKE_STATE_AFTER_STOP" > "$FAKE_STATE_FILE"
+    printf '%s\n' "${FAKE_STATE_AFTER_STOP:-$FAKE_STATE}" > "$FAKE_STATE_FILE"
     exit "${FAKE_STOP_STATUS:-0}"
     ;;
   rm)
@@ -86,7 +89,7 @@ def shell(tmp_path):
             "FAKE_STATE_FILE": str(state_file),
             "FAKE_CONTAINER_IDS": "cafe1234",
             "FAKE_STATE": "running",
-            "FAKE_STATE_AFTER_STOP": "exited",
+            "FAKE_STATE_AFTER_STOP": "",
             "FAKE_EXIT_CODE": "0",
             "FAKE_OOM": "false",
             "FAKE_ERROR": "",
@@ -94,6 +97,7 @@ def shell(tmp_path):
             "FAKE_CAPABILITY": "graceful",
             "FAKE_PROCESSING": "0",
             "FAKE_INSPECT_FAILS": "0",
+            "FAKE_PS_FAILS": "0",
             "FAKE_EXEC_FAILS": "0",
         }
         env.update(env_overrides)
@@ -163,13 +167,44 @@ def test_an_unprobeable_worker_is_treated_as_legacy(shell) -> None:
     assert result.returncode != 0
 
 
-def test_a_stopped_or_absent_worker_needs_no_drain(shell) -> None:
-    stopped = shell("wa_require_drainable_worker", FAKE_STATE="exited")
-    assert stopped.returncode == 0
+# An absent or stopped container is NOT evidence that nothing was stranded: a
+# crash, an OOM kill or a manual `docker rm` removes exactly the thing that
+# would have shown it, while the committed `processing` rows stay behind.
 
-    absent = shell("wa_require_drainable_worker", FAKE_CONTAINER_IDS="")
-    assert absent.returncode == 0
-    assert "nothing to drain" in absent.stdout
+
+@pytest.mark.parametrize("gate", ["wa_require_drainable_worker", "wa_retire_before_reconciliation"])
+@pytest.mark.parametrize(
+    ("label", "env"),
+    [
+        ("absent", {"FAKE_CONTAINER_IDS": ""}),
+        ("stopped", {"FAKE_STATE": "exited"}),
+    ],
+)
+def test_a_worker_that_is_gone_still_has_to_prove_the_queue_is_empty(
+    shell, gate: str, label: str, env: dict[str, str]
+) -> None:
+    allowed = shell(gate, FAKE_PROCESSING="0", **env)
+    assert allowed.returncode == 0, f"{label}: an empty queue is safe to continue on"
+    assert "no stranded processing rows" in allowed.stdout or "not running" in allowed.stdout
+
+    blocked = shell(gate, FAKE_PROCESSING="3", **env)
+    assert blocked.returncode != 0, f"{label}: stranded rows must stop the deploy"
+    assert "3 whatsapp_events row(s)" in blocked.stderr
+    assert "Do NOT bulk-update" in blocked.stderr
+
+    unreadable = shell(gate, FAKE_PROCESSING="", **env)
+    assert unreadable.returncode != 0, f"{label}: an unreadable count is not a zero"
+
+    nonnumeric = shell(gate, FAKE_PROCESSING="ERROR: connection refused", **env)
+    assert nonnumeric.returncode != 0, f"{label}: a SQL error is not a zero"
+
+
+def test_a_stopped_worker_is_never_called_a_proven_drain(shell) -> None:
+    """Its exit state says nothing: this deploy did not stop it."""
+    result = shell("wa_require_drainable_worker", FAKE_STATE="exited", FAKE_PROCESSING="0")
+
+    assert result.returncode == 0
+    assert "not a proven graceful drain" in result.stdout
 
 
 # ---------------------------------------------------------------------------
@@ -299,7 +334,7 @@ def test_the_deploy_sources_the_library_and_gates_before_building() -> None:
 def test_the_deploy_drains_and_verifies_before_the_scale_to_zero() -> None:
     script = DEPLOY_SCRIPT.read_text()
 
-    quiesce = script.index("wa_graceful_quiesce")
+    quiesce = script.index("wa_retire_before_reconciliation")
     scale_zero = script.index("--scale altegio-whatsapp-inbox-worker=0")
     outbox = script.index("up -d --force-recreate altegio-outbox-worker")
     producer = script.index("$COMPOSE up -d altegio-whatsapp-inbox-worker")
@@ -311,11 +346,11 @@ def test_the_deploy_drains_and_verifies_before_the_scale_to_zero() -> None:
 
 def test_a_failed_drain_stops_the_deploy_before_the_producer() -> None:
     script = DEPLOY_SCRIPT.read_text()
-    start = script.index("wa_graceful_quiesce")
+    start = script.index("wa_retire_before_reconciliation")
     block = script[start : script.index("--scale altegio-whatsapp-inbox-worker=0", start)]
 
     assert "exit 1" in block
-    assert "left in place for analysis" in block
+    assert "left in" in block and "analysis" in block
 
 
 def test_the_recovery_trap_never_starts_the_producer() -> None:
@@ -324,3 +359,93 @@ def test_the_recovery_trap_never_starts_the_producer() -> None:
     recover = script[script.index("recover() {") : script.index("trap 'recover $?' EXIT")]
 
     assert "whatsapp" not in recover.lower()
+
+
+# ---------------------------------------------------------------------------
+# The final gate, immediately before the Compose reconciliation
+# ---------------------------------------------------------------------------
+#
+# The preflight ran before the build, the backup and the migrations. The
+# container set can change under the deploy in that window, so the gate repeats
+# the full discovery — and a Docker failure here must never look like "there is
+# no container".
+
+
+def test_a_second_container_appearing_after_preflight_blocks_the_gate(shell) -> None:
+    preflight = shell("wa_require_drainable_worker")
+    assert preflight.returncode == 0
+
+    gate = shell("wa_retire_before_reconciliation", FAKE_CONTAINER_IDS="cafe1234\ndead5678")
+    assert gate.returncode != 0
+    assert "Expected exactly one" in gate.stderr
+
+    verbs = {line.split()[0] for line in _commands(shell) if line.split()}
+    assert "stop" not in verbs, "nothing may be stopped once the container set is untrusted"
+
+
+@pytest.mark.parametrize(
+    ("label", "env"),
+    [
+        ("docker-ps-failure", {"FAKE_PS_FAILS": "1"}),
+        ("docker-inspect-failure", {"FAKE_INSPECT_FAILS": "1"}),
+        ("one-off-container", {"FAKE_ONEOFF": "True"}),
+        ("legacy-image", {"FAKE_CAPABILITY": "legacy"}),
+        ("absent-with-stranded-rows", {"FAKE_CONTAINER_IDS": "", "FAKE_PROCESSING": "2"}),
+        ("stopped-with-stranded-rows", {"FAKE_STATE": "exited", "FAKE_PROCESSING": "2"}),
+        ("sigkill-after-timeout", {"FAKE_STATE_AFTER_STOP": "exited", "FAKE_EXIT_CODE": "137"}),
+        ("oom-killed", {"FAKE_STATE_AFTER_STOP": "exited", "FAKE_OOM": "true"}),
+        ("unreadable-oom", {"FAKE_STATE_AFTER_STOP": "exited", "FAKE_OOM": ""}),
+        ("container-error", {"FAKE_STATE_AFTER_STOP": "exited", "FAKE_ERROR": "boom"}),
+        ("stranded-after-drain", {"FAKE_STATE_AFTER_STOP": "exited", "FAKE_PROCESSING": "4"}),
+        ("never-exits", {"FAKE_STATE_AFTER_STOP": "running"}),
+    ],
+)
+def test_the_final_gate_blocks_every_unproven_state(shell, label: str, env: dict[str, str]) -> None:
+    result = shell("wa_retire_before_reconciliation && echo GATE_PASSED", **env)
+
+    assert result.returncode != 0, f"{label} must not pass the final gate"
+    assert "GATE_PASSED" not in result.stdout
+
+    combined = result.stdout + result.stderr
+    assert "UPDATE" not in combined, f"{label}: no automatic rewrite of whatsapp_events"
+    verbs = {line.split()[0] for line in _commands(shell) if line.split()}
+    assert "rm" not in verbs, f"{label}: the container must survive for analysis"
+
+
+def test_a_docker_failure_is_not_read_as_an_absent_container(shell) -> None:
+    """The bug this gate replaced: every error collapsed into an empty id."""
+    failure = shell("wa_retire_before_reconciliation", FAKE_PS_FAILS="1")
+    assert failure.returncode != 0
+    assert "Docker discovery failed" in failure.stderr
+
+    # Whereas a genuinely absent container with an empty queue is fine.
+    absent = shell("wa_retire_before_reconciliation", FAKE_CONTAINER_IDS="", FAKE_PROCESSING="0")
+    assert absent.returncode == 0
+
+
+def test_an_unreadable_oneoff_label_does_not_count_as_a_service_container(shell) -> None:
+    """`<no value>` is an answer; a failed inspect is not."""
+    unknown = shell("wa_retire_before_reconciliation", FAKE_ONEOFF="<no value>", FAKE_STATE_AFTER_STOP="exited")
+    assert unknown.returncode == 0, "an absent label is the normal Compose service case"
+
+    unreadable = shell("wa_retire_before_reconciliation", FAKE_INSPECT_FAILS="1")
+    assert unreadable.returncode != 0
+
+
+def test_the_happy_path_stops_verifies_and_allows_the_reconciliation(shell) -> None:
+    result = shell(
+        "wa_retire_before_reconciliation && echo GATE_PASSED",
+        FAKE_STATE="running",
+        FAKE_STATE_AFTER_STOP="exited",
+        FAKE_EXIT_CODE="0",
+        FAKE_OOM="false",
+        FAKE_PROCESSING="0",
+    )
+
+    assert result.returncode == 0
+    assert "GATE_PASSED" in result.stdout
+    assert "drained cleanly" in result.stdout
+
+    verbs = [line.split()[0] for line in _commands(shell) if line.split()]
+    assert "stop" in verbs, "the graceful stop must actually be issued"
+    assert "rm" not in verbs, "removal is left to the reconciliation, after the evidence is read"

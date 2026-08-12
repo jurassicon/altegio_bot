@@ -1067,17 +1067,15 @@ fi
 # with it ExitCode, OOMKilled and State.Error — the only evidence of whether
 # the batch finished or a SIGKILL cut it off after the stop timeout. So the
 # worker is stopped by id, verified, and only then discarded.
-WA_WORKER_PRE_ID="$(wa_service_container_id)" || WA_WORKER_PRE_ID=""
-if [ -n "$WA_WORKER_PRE_ID" ] && container_is_running "$WA_WORKER_PRE_ID"; then
-  if ! wa_graceful_quiesce "$WA_WORKER_PRE_ID" 300; then
-    echo "❌ Refusing to continue: the delivery-retry producer did not drain cleanly."
-    echo "   The container is left in place for analysis; no rows were rewritten."
-    exit 1
-  fi
-  # Proven drained. The container is discarded by the reconciliation below —
-  # deliberately not before, so that a failed drain above leaves ExitCode,
-  # OOMKilled and State.Error intact for whoever investigates.
+if ! wa_retire_before_reconciliation 300; then
+  echo "❌ Refusing to continue: the delivery-retry producer is not proven retired."
+  echo "   Nothing was scaled, recreated or rewritten; any container is left in"
+  echo "   place with its exit state intact for analysis."
+  exit 1
 fi
+# Proven retired. A stopped container is discarded by the reconciliation below —
+# deliberately not before, so that a failed drain leaves ExitCode, OOMKilled and
+# State.Error intact for whoever investigates.
 
 echo "🚀 Starting updated containers (delivery-retry producer held back)..."
 $COMPOSE up -d --remove-orphans --scale altegio-whatsapp-inbox-worker=0
