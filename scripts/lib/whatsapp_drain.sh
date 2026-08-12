@@ -83,15 +83,24 @@ wa_service_container_id() {
   id="$(printf '%s\n' "$ids" | head -n 1)"
 
   # An unreadable or absent label is NOT proof that this is a service
-  # container; only an explicit `false`/`<no value>` is.
+  # container; only an explicit negative is.
+  #
+  # Compose writes this label with a capitalised Python bool on some versions
+  # (`False` on v5.3.1, `false` elsewhere) and omits it on others, so the value
+  # is case-folded before it is judged. Anything unrecognised is refused rather
+  # than assumed benign.
   if ! oneoff="$(wa_docker_field "$id" '{{index .Config.Labels "com.docker.compose.oneoff"}}')"; then
     echo "❌ Cannot inspect the ${WA_SERVICE} container (Docker inspect failed)." >&2
     return "$WA_DISCOVERY_FAILED"
   fi
-  case "$oneoff" in
+  case "$(printf '%s' "$oneoff" | tr '[:upper:]' '[:lower:]')" in
     false | "<no value>" | "") ;;
-    *)
+    true)
       echo "❌ The resolved ${WA_SERVICE} container is a one-off, not the service container." >&2
+      return "$WA_FOUND_UNTRUSTED"
+      ;;
+    *)
+      echo "❌ Unrecognisable one-off label on the ${WA_SERVICE} container; refusing to continue." >&2
       return "$WA_FOUND_UNTRUSTED"
       ;;
   esac
@@ -270,14 +279,38 @@ wa_assert_retirable() {
     return 1
   fi
 
-  if [ "$state" != "running" ]; then
-    # Stopped by something other than this deploy. Its exit evidence proves
-    # nothing about a drain, so only the database can clear it.
-    echo "ℹ️  ${WA_SERVICE} is '${state}' (${stage}); this is not a proven graceful drain."
-    wa_require_no_stranded_processing "container ${state}" || return 1
-    echo "✅ ${WA_SERVICE} is not running and no processing rows are stranded."
-    return 0
+  # Transitional states are NOT "not running". A paused container still owns
+  # whatever it claimed, and its process is frozen mid-batch: scaling it to zero
+  # would discard exactly the batch the barrier procedure exists to protect.
+  # Restarting/removing/created/dead are equally unproven. Only `exited` — a
+  # process that actually finished — may be cleared by the database alone.
+  local paused restarting
+  paused="$(wa_docker_field "$id" '{{.State.Paused}}')" || paused="unreadable"
+  restarting="$(wa_docker_field "$id" '{{.State.Restarting}}')" || restarting="unreadable"
+  if [ "$paused" = "true" ] || [ "$restarting" = "true" ]; then
+    echo "❌ ${WA_SERVICE} is paused/restarting (${stage}); STOP." >&2
+    echo "   A frozen or restarting worker must be handled by the one-time legacy" >&2
+    echo "   retirement or manually — never scaled to zero by this deploy." >&2
+    return 1
   fi
+
+  case "$state" in
+    exited)
+      # Stopped by something other than this deploy. Its exit evidence proves
+      # nothing about a drain, so only the database can clear it.
+      echo "ℹ️  ${WA_SERVICE} is 'exited' (${stage}); this is not a proven graceful drain."
+      wa_require_no_stranded_processing "container exited" || return 1
+      echo "✅ ${WA_SERVICE} is not running and no processing rows are stranded."
+      return 0
+      ;;
+    running) ;;
+    *)
+      echo "❌ ${WA_SERVICE} is '${state}' (${stage}); STOP." >&2
+      echo "   Only 'running' (drained here) or 'exited' (cleared by the database)" >&2
+      echo "   are safe to continue on." >&2
+      return 1
+      ;;
+  esac
 
   if ! wa_worker_supports_graceful_shutdown "$id"; then
     wa_legacy_instructions

@@ -819,20 +819,59 @@ worker отправил COMMIT
 стороне БД.
 
 Поэтому переход выполняется одним helper'ом, который держит DB-side барьер на
-всё время проверки и retirement:
+всё время проверки и retirement.
+
+Helper'у одновременно нужны три вещи: код именно этого commit, доступ к
+production PostgreSQL и управление host Docker (pause/rm). Обычный
+`altegio-api` не подходит ни по одному пункту: его image собран из предыдущего
+commit, в нём нет Docker CLI и у него нет Docker socket. Поэтому helper
+запускается в отдельном одноразовом ops-сервисе `easyweek-legacy-retire`
+(profile `ops`, `Dockerfile.ops`) — **единственном**, который получает bind
+mount host Docker socket. Обычный `docker compose up -d` его не запускает.
+
+1. Собрать ops image из текущего checkout и выполнить **read-only** probe:
 
 ```bash
-$COMPOSE run --rm --no-deps \
-  --entrypoint /app/.venv/bin/python \
-  altegio-api \
+$COMPOSE --profile ops run --rm --build easyweek-legacy-retire \
+  -m altegio_bot.scripts.retire_legacy_whatsapp_worker --probe
+```
+
+   Ожидаемый вывод — все четыре значения истинны, например:
+
+```text
+{'helper_module': 'altegio_bot.scripts.retire_legacy_whatsapp_worker',
+ 'docker_cli': True, 'docker_daemon': True,
+ 'whatsapp_worker_containers': 1, 'database': True}
+```
+
+   `--build` обязателен: без него запустился бы старый image без helper'а.
+   Probe ничего не pause'ит, не удаляет и не переписывает. Любое `False`,
+   `whatsapp_worker_containers` не равное `1` или ненулевой код возврата —
+   **STOP**, retirement не запускать.
+
+2. Выполнить сам retirement:
+
+```bash
+$COMPOSE --profile ops run --rm --build easyweek-legacy-retire \
   -m altegio_bot.scripts.retire_legacy_whatsapp_worker
 ```
 
+   Helper сам находит свой target по Compose-меткам и доказывает его identity.
+   Передавать container ID вручную не нужно и не следует: опция
+   `--expect-container` существует только как перекрёстная проверка и цель
+   **не** выбирает — при несовпадении helper отказывается работать.
+
 Что он делает по шагам:
 
-1. Резолвит ровно один service container (не one-off). Несколько контейнеров,
-   one-off или ошибка Docker — **STOP**, ничего не трогается.
-2. `docker pause` — чтобы клиент не начинал новых действий.
+1. Сам резолвит цель и доказывает её identity: ровно один контейнер с метками
+   `com.docker.compose.project=altegio_bot` и
+   `com.docker.compose.service=altegio-whatsapp-inbox-worker`, метка
+   `oneoff` — отрицательная (регистр не важен: Compose пишет и `False`, и
+   `false`), состояние `running`, а живой image **не** поддерживает graceful
+   shutdown. Любое расхождение — **STOP**, ничего не трогается.
+2. `docker pause` — чтобы клиент не начинал новых действий. Сразу после
+   заморозки топология проверяется повторно: если появилась вторая replica,
+   helper размораживает worker и завершается **STOP**.
 3. Открывает отдельную транзакцию с `lock_timeout` и `statement_timeout`.
 4. Берёт `LOCK TABLE whatsapp_events IN SHARE MODE`. Это и есть барьер: claim
    старого worker'а выполняет `UPDATE whatsapp_events` под `ROW EXCLUSIVE`, а
@@ -854,10 +893,18 @@ $COMPOSE run --rm --no-deps \
 | `could not acquire the whatsapp_events barrier` | claim-транзакция ещё открыта; контейнер не удалён, worker разморожен |
 | `N row(s) are in 'processing' under the barrier` | worker закоммитил batch, который не доработал |
 | `expected exactly one … container` / one-off | топология не доказана |
+| `container belongs to project/service …` | цель не тот сервис — ничего не трогается |
+| `the one-off label … is not recognisable` | метка нераспознаваема; fail-closed |
+| `is '<state>', not 'running'` | не живой worker: helper только для running legacy |
+| `already honours the graceful shutdown contract` | это не legacy image — используйте обычный deploy path |
+| `cannot read the shutdown capability` | capability не читается |
+| `the container set changed after the freeze` | появилась вторая replica |
 | `Docker discovery failed` / `cannot inspect` | состояние не читается |
 
 Ни одна из этих веток не удаляет контейнер, не переписывает строки и не
-продолжает rollout. Массовый `UPDATE processing -> received` запрещён: для
+продолжает rollout. Если `docker rm` всё же не удался и состояние контейнера
+прочитать нельзя, helper явно предупредит, что worker **может остаться
+paused** — молча считать Docker-ошибку отсутствием контейнера он не будет. Массовый `UPDATE processing -> received` запрещён: для
 обычных webhook events безопасность повторного side effect не доказана.
 
 Если helper вернул STOP из-за открытой claim-транзакции, дайте старому worker'у

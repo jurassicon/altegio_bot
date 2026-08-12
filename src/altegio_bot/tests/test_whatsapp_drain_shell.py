@@ -43,6 +43,8 @@ case "$1" in
       *State.ExitCode*) printf '%s\n' "$FAKE_EXIT_CODE" ;;
       *State.OOMKilled*) printf '%s\n' "$FAKE_OOM" ;;
       *State.Error*)    printf '%s\n' "$FAKE_ERROR" ;;
+      *State.Paused*)     printf '%s\n' "$FAKE_PAUSED" ;;
+      *State.Restarting*) printf '%s\n' "$FAKE_RESTARTING" ;;
       *oneoff*)         printf '%s\n' "$FAKE_ONEOFF" ;;
       *)                printf '\n' ;;
     esac
@@ -94,6 +96,8 @@ def shell(tmp_path):
             "FAKE_OOM": "false",
             "FAKE_ERROR": "",
             "FAKE_ONEOFF": "false",
+            "FAKE_PAUSED": "false",
+            "FAKE_RESTARTING": "false",
             "FAKE_CAPABILITY": "graceful",
             "FAKE_PROCESSING": "0",
             "FAKE_INSPECT_FAILS": "0",
@@ -449,3 +453,79 @@ def test_the_happy_path_stops_verifies_and_allows_the_reconciliation(shell) -> N
     verbs = [line.split()[0] for line in _commands(shell) if line.split()]
     assert "stop" in verbs, "the graceful stop must actually be issued"
     assert "rm" not in verbs, "removal is left to the reconciliation, after the evidence is read"
+
+
+# ---------------------------------------------------------------------------
+# The one-off label, as Compose actually writes it
+# ---------------------------------------------------------------------------
+#
+# Compose v5.3.1 writes `com.docker.compose.oneoff=False` — capitalised. A
+# resolver that only accepted lowercase `false` rejected the ordinary service
+# container and blocked the whole rollout.
+
+
+@pytest.mark.parametrize("label", ["False", "false", "<no value>", ""])
+def test_a_service_container_is_accepted_whatever_the_label_casing(shell, label: str) -> None:
+    result = shell("wa_retire_before_reconciliation", FAKE_ONEOFF=label, FAKE_STATE_AFTER_STOP="exited")
+
+    assert result.returncode == 0, f"{label!r} identifies an ordinary service container"
+
+
+@pytest.mark.parametrize("label", ["True", "true"])
+def test_a_one_off_is_refused_whatever_the_label_casing(shell, label: str) -> None:
+    result = shell("wa_retire_before_reconciliation", FAKE_ONEOFF=label)
+
+    assert result.returncode != 0
+    assert "one-off" in result.stderr
+
+
+@pytest.mark.parametrize("label", ["maybe", "0", "1", "Yes"])
+def test_an_unrecognisable_one_off_label_is_refused(shell, label: str) -> None:
+    """Fail closed: an unknown value is not evidence of a service container."""
+    result = shell("wa_retire_before_reconciliation", FAKE_ONEOFF=label)
+
+    assert result.returncode != 0
+    assert "Unrecognisable one-off label" in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# Container states
+# ---------------------------------------------------------------------------
+#
+# `paused` used to fall through the "not running" branch: with processing=0 the
+# gate returned success, WA_RESOLVED_ID stayed empty, and the reconciliation
+# scaled a frozen worker to zero — discarding the very batch the barrier
+# procedure exists to protect.
+
+
+@pytest.mark.parametrize(
+    ("label", "env"),
+    [
+        ("paused-status", {"FAKE_STATE": "paused"}),
+        ("paused-flag", {"FAKE_STATE": "running", "FAKE_PAUSED": "true"}),
+        ("restarting-status", {"FAKE_STATE": "restarting"}),
+        ("restarting-flag", {"FAKE_STATE": "running", "FAKE_RESTARTING": "true"}),
+        ("removing", {"FAKE_STATE": "removing"}),
+        ("created", {"FAKE_STATE": "created"}),
+        ("dead", {"FAKE_STATE": "dead"}),
+        ("unknown", {"FAKE_STATE": "wat"}),
+    ],
+)
+def test_transitional_states_never_pass_the_gate(shell, label: str, env: dict[str, str]) -> None:
+    result = shell("wa_retire_before_reconciliation && echo GATE_PASSED", FAKE_PROCESSING="0", **env)
+
+    assert result.returncode != 0, f"{label} must stop the deploy even with an empty queue"
+    assert "GATE_PASSED" not in result.stdout
+    assert "STOP" in result.stderr
+
+    verbs = {line.split()[0] for line in _commands(shell) if line.split()}
+    assert "rm" not in verbs, f"{label}: nothing may be removed"
+
+
+def test_a_paused_worker_is_never_unpaused_by_the_deploy(shell) -> None:
+    """Only the controlled legacy helper may touch a frozen worker."""
+    shell("wa_retire_before_reconciliation", FAKE_STATE="paused", FAKE_PROCESSING="0")
+
+    verbs = {line.split()[0] for line in _commands(shell) if line.split()}
+    assert "unpause" not in verbs
+    assert "stop" not in verbs

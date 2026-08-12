@@ -851,9 +851,29 @@ def test_the_legacy_transition_is_a_runnable_helper_not_a_manual_protocol() -> N
     legacy = _section(_rollout(), "##### Вариант «legacy»")
 
     assert "altegio_bot.scripts.retire_legacy_whatsapp_worker" in legacy
-    assert "run --rm --no-deps" in legacy, "it runs as a one-shot container"
+    # It runs in the ephemeral ops service — the only one with a Docker socket
+    # — and is rebuilt from the deployed commit, not from a stale image.
+    assert "--profile ops run --rm --build easyweek-legacy-retire" in legacy
+    assert "--probe" in legacy, "a read-only probe must come before the real run"
     assert "STOP" in legacy
     assert "lock" in legacy.lower()
+
+
+def test_the_legacy_helper_is_not_run_from_the_api_image() -> None:
+    """The API image lacks the new module, a Docker CLI and the socket."""
+    legacy = _section(_rollout(), "##### Вариант «legacy»")
+
+    for block in _code_blocks(legacy):
+        assert "altegio-api" not in block, "the helper cannot run in altegio-api"
+    assert "не подходит ни по одному пункту" in legacy
+
+
+def test_the_operator_is_not_asked_to_paste_a_container_id() -> None:
+    legacy = _section(_rollout(), "##### Вариант «legacy»")
+
+    assert "<id>" not in legacy
+    assert "сам находит свой target" in legacy
+    assert "перекрёстная проверка" in legacy, "--expect-container must be a cross-check only"
 
 
 def test_the_legacy_transition_never_sigterms_or_bulk_updates() -> None:

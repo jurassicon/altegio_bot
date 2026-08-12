@@ -172,6 +172,33 @@ services:
     profiles:
       - ops
 
+  # One-shot retirement of a pre-graceful altegio-whatsapp-inbox-worker (PR-7.1).
+  # Not started by `docker compose up -d`; run explicitly, always with --build so
+  # the helper is the code of the commit being deployed:
+  #   docker compose --profile ops run --rm --build easyweek-legacy-retire \
+  #     -m altegio_bot.scripts.retire_legacy_whatsapp_worker --probe
+  #
+  # This is the ONLY service that mounts the host Docker socket. It exists
+  # because the retirement must pause and remove the legacy container while
+  # holding a PostgreSQL barrier open, and it is ephemeral: no long-running
+  # service ever gets a Docker client or that socket.
+  easyweek-legacy-retire:
+    build:
+      context: .
+      dockerfile: Dockerfile.ops
+    env_file:
+      - .env
+      - path: easyweek.env
+        required: false
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: "no"
+    profiles:
+      - ops
+
 volumes:
   postgres_data:
   redis_data:

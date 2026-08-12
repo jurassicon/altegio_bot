@@ -49,15 +49,15 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import shutil
 import subprocess
 from dataclasses import dataclass
+from enum import Enum
 from typing import Protocol
 
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-
-from altegio_bot.db import SessionLocal
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +69,33 @@ class LegacyRetirementError(RuntimeError):
     """Fail-closed: the retirement is not proven, so it did not happen."""
 
 
+class Presence(str, Enum):
+    """Three outcomes, never two: "Docker failed" is not "container gone"."""
+
+    PRESENT = "present"
+    ABSENT = "absent"
+    UNREADABLE = "unreadable"
+
+
+# Compose writes this label with a capitalised Python bool on some versions
+# (`False` on Compose v5.3.1, `false` elsewhere) and omits it entirely on
+# others. Only an explicit negative or a missing label means "service
+# container"; anything else — including an unreadable value — is refused.
+_ONEOFF_SERVICE_VALUES = frozenset({"false", "<no value>", ""})
+_ONEOFF_ONESHOT_VALUES = frozenset({"true"})
+
+
+def oneoff_label_is_service_container(raw: str | None) -> bool:
+    """True only for a label that positively identifies a service container."""
+    if raw is None:
+        return False
+    return raw.strip().lower() in _ONEOFF_SERVICE_VALUES
+
+
+def oneoff_label_is_one_shot(raw: str | None) -> bool:
+    return raw is not None and raw.strip().lower() in _ONEOFF_ONESHOT_VALUES
+
+
 class ContainerControl(Protocol):
     """The container operations this procedure needs, injected for testing."""
 
@@ -78,7 +105,7 @@ class ContainerControl(Protocol):
 
     def remove(self, container: str) -> None: ...
 
-    def exists(self, container: str) -> bool: ...
+    def presence(self, container: str) -> Presence: ...
 
 
 class DockerCli:
@@ -99,8 +126,61 @@ class DockerCli:
         if self._run("rm", "-f", container).returncode != 0:
             raise LegacyRetirementError(f"cannot remove container {container}")
 
-    def exists(self, container: str) -> bool:
-        return self._run("inspect", "-f", "{{.Id}}", container).returncode == 0
+    def presence(self, container: str) -> Presence:
+        """Absent and unreadable are different facts and stay different.
+
+        Treating an inspect failure as "gone" would let a cleanup path claim the
+        worker is retired when it may still be sitting there, paused.
+        """
+        result = self._run("inspect", "-f", "{{.Id}}", container)
+        if result.returncode == 0:
+            return Presence.PRESENT
+        if "No such object" in result.stderr or "no such container" in result.stderr.lower():
+            return Presence.ABSENT
+        return Presence.UNREADABLE
+
+    def inspect_field(self, container: str, fmt: str) -> str | None:
+        result = self._run("inspect", "-f", fmt, container)
+        if result.returncode != 0:
+            return None
+        return result.stdout.strip()
+
+    def service_container_ids(self) -> list[str] | None:
+        """Ids of the WhatsApp worker service, or None if discovery failed."""
+        result = self._run(
+            "ps",
+            "-a",
+            "--filter",
+            f"label=com.docker.compose.project={COMPOSE_PROJECT}",
+            "--filter",
+            f"label=com.docker.compose.service={WA_SERVICE}",
+            "--format",
+            "{{.ID}}",
+        )
+        if result.returncode != 0:
+            return None
+        return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+    def supports_graceful_shutdown(self, container: str) -> bool | None:
+        """Probe the LIVE image; None when the answer cannot be read."""
+        result = self._run(
+            "exec",
+            container,
+            "/app/.venv/bin/python",
+            "-c",
+            "import inspect\n"
+            "from altegio_bot.workers import whatsapp_inbox_worker as w\n"
+            'print("graceful" if "stop_event" in inspect.signature(w.run_loop).parameters '
+            'and hasattr(w, "run_with_graceful_shutdown") else "legacy")',
+        )
+        if result.returncode != 0:
+            return None
+        answer = result.stdout.strip()
+        if answer == "graceful":
+            return True
+        if answer == "legacy":
+            return False
+        return None
 
 
 @dataclass(frozen=True)
@@ -132,10 +212,20 @@ async def retire_with_barrier(
     if lock_timeout_ms <= 0 or statement_timeout_ms <= 0:
         raise LegacyRetirementError("timeouts must be positive")
 
-    docker.pause(container)
+    await asyncio.to_thread(docker.pause, container)
     removed = False
 
     try:
+        # Topology is re-proven AFTER the freeze: a replica started between the
+        # resolve and the pause would keep claiming while we retire this one.
+        ids_after_pause = await asyncio.to_thread(docker.service_container_ids)
+        if ids_after_pause is None:
+            raise LegacyRetirementError("Docker discovery failed after the freeze")
+        if ids_after_pause != [container]:
+            raise LegacyRetirementError(
+                f"the container set changed after the freeze ({len(ids_after_pause)} found); STOP"
+            )
+
         async with session_factory() as session:
             async with session.begin():
                 # Bounded: a barrier that waits forever would just move the
@@ -166,7 +256,7 @@ async def retire_with_barrier(
 
                 # Still holding the lock: no claim can slip in between this
                 # check and the removal.
-                docker.remove(container)
+                await asyncio.to_thread(docker.remove, container)
                 removed = True
 
                 after = await _count_processing(session)
@@ -182,75 +272,156 @@ async def retire_with_barrier(
         # container removed mid-failure must not be silently recreated.
         if not removed:
             try:
-                if docker.exists(container):
+                presence = docker.presence(container)
+                if presence is Presence.PRESENT:
                     docker.unpause(container)
                     logger.info("legacy worker left running for analysis container=%s", container)
+                elif presence is Presence.UNREADABLE:
+                    # Never silently read a Docker failure as "already gone".
+                    logger.error(
+                        "container %s state is UNREADABLE — it may still be PAUSED; "
+                        "check and unpause it manually before investigating",
+                        container,
+                    )
             except Exception:
                 logger.error(
                     "container %s may still be PAUSED — unpause it manually before investigating",
                     container,
                 )
+        else:
+            # Removal was attempted. If it failed we cannot claim the worker is
+            # gone, and it is frozen, so say so plainly.
+            if docker.presence(container) is not Presence.ABSENT:
+                logger.error(
+                    "container %s was NOT confirmed removed and may still be PAUSED; "
+                    "resolve its state manually before continuing the rollout",
+                    container,
+                )
         raise
 
 
-def _resolve_container() -> str:
-    """Exactly one non-one-off service container, or refuse."""
-    listed = subprocess.run(
-        [
-            "docker",
-            "ps",
-            "-a",
-            "--filter",
-            f"label=com.docker.compose.project={COMPOSE_PROJECT}",
-            "--filter",
-            f"label=com.docker.compose.service={WA_SERVICE}",
-            "--format",
-            "{{.ID}}",
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=60,
-    )
-    if listed.returncode != 0:
-        raise LegacyRetirementError("Docker discovery failed")
+def resolve_legacy_container(docker: ContainerControl) -> str:
+    """The one container this helper is allowed to touch.
 
-    ids = [line.strip() for line in listed.stdout.splitlines() if line.strip()]
+    Identity is PROVEN here rather than accepted from an argument: a mistyped id
+    would otherwise pause and remove an unrelated production container. Every
+    check is a refusal, not a warning.
+    """
+    ids = docker.service_container_ids()
+    if ids is None:
+        raise LegacyRetirementError("Docker discovery failed")
     if not ids:
         raise LegacyRetirementError(f"no {WA_SERVICE} container found")
     if len(ids) != 1:
         raise LegacyRetirementError(f"expected exactly one {WA_SERVICE} container, found {len(ids)}")
 
-    oneoff = subprocess.run(
-        ["docker", "inspect", "-f", '{{index .Config.Labels "com.docker.compose.oneoff"}}', ids[0]],
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=60,
-    )
-    if oneoff.returncode != 0:
-        raise LegacyRetirementError("cannot inspect the resolved container")
-    if oneoff.stdout.strip() not in {"false", "<no value>", ""}:
-        raise LegacyRetirementError("the resolved container is a one-off, not the service container")
+    container = ids[0]
 
-    return ids[0]
+    # The labels are re-read from the container itself: `docker ps --filter`
+    # selected it, but the identity this helper acts on must be its own.
+    project = docker.inspect_field(container, '{{index .Config.Labels "com.docker.compose.project"}}')
+    service = docker.inspect_field(container, '{{index .Config.Labels "com.docker.compose.service"}}')
+    if project is None or service is None:
+        raise LegacyRetirementError("cannot inspect the resolved container")
+    if project != COMPOSE_PROJECT:
+        raise LegacyRetirementError(f"container belongs to project '{project}', not '{COMPOSE_PROJECT}'")
+    if service != WA_SERVICE:
+        raise LegacyRetirementError(f"container belongs to service '{service}', not '{WA_SERVICE}'")
+
+    oneoff = docker.inspect_field(container, '{{index .Config.Labels "com.docker.compose.oneoff"}}')
+    if oneoff is None:
+        raise LegacyRetirementError("cannot read the one-off label of the resolved container")
+    if oneoff_label_is_one_shot(oneoff):
+        raise LegacyRetirementError("the resolved container is a one-off, not the service container")
+    if not oneoff_label_is_service_container(oneoff):
+        raise LegacyRetirementError("the one-off label of the resolved container is not recognisable")
+
+    state = docker.inspect_field(container, "{{.State.Status}}")
+    if not state:
+        raise LegacyRetirementError("cannot read the state of the resolved container")
+    if state != "running":
+        raise LegacyRetirementError(
+            f"the {WA_SERVICE} container is '{state}', not 'running'; this helper only retires a live legacy worker"
+        )
+
+    graceful = docker.supports_graceful_shutdown(container)
+    if graceful is None:
+        raise LegacyRetirementError("cannot read the shutdown capability of the running image")
+    if graceful:
+        raise LegacyRetirementError(
+            "the running image already honours the graceful shutdown contract; "
+            "use the ordinary deploy path, not this one-time retirement"
+        )
+
+    return container
+
+
+def probe_ops_runtime(docker: ContainerControl) -> dict[str, object]:
+    """Read-only: can this environment run the retirement at all?
+
+    Pauses nothing, removes nothing, writes nothing. It exists so the operator
+    can verify the ops image before the procedure that touches production.
+    """
+    ids = docker.service_container_ids()
+    return {
+        "helper_module": __name__,
+        "docker_cli": shutil.which("docker") is not None,
+        "docker_daemon": ids is not None,
+        "whatsapp_worker_containers": len(ids) if ids is not None else None,
+    }
 
 
 async def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="One-time retirement of a legacy WhatsApp worker.")
-    parser.add_argument("--container", default=None, help="Container id; resolved automatically if omitted.")
+    parser.add_argument(
+        "--probe",
+        action="store_true",
+        help="Read-only: check module, Docker CLI, daemon and database, then exit.",
+    )
+    parser.add_argument(
+        "--expect-container",
+        default=None,
+        help=(
+            "Optional cross-check. The helper always resolves the container itself; "
+            "if given, this id must match what it resolved, or the run is refused."
+        ),
+    )
     parser.add_argument("--lock-timeout-ms", type=int, default=5_000)
     parser.add_argument("--statement-timeout-ms", type=int, default=15_000)
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    docker = DockerCli()
+
+    # Imported here, not at module scope: `Settings` requires the full
+    # production environment, and the module must stay importable for the probe
+    # and for inspection without it.
+    from altegio_bot.db import SessionLocal
+
+    if args.probe:
+        report = probe_ops_runtime(docker)
+        try:
+            async with SessionLocal() as session:
+                await session.execute(text("SELECT 1"))
+            report["database"] = True
+        except Exception as exc:  # noqa: BLE001 - class name only, never the text
+            report["database"] = False
+            report["database_error_type"] = type(exc).__name__
+        print(report)
+        ok = bool(report["docker_cli"]) and bool(report["docker_daemon"]) and bool(report["database"])
+        return 0 if ok else 1
 
     try:
-        container = args.container or _resolve_container()
+        container = resolve_legacy_container(docker)
+        # An operator-supplied id never SELECTS the target; it can only disagree
+        # with the proven one, and then nothing happens.
+        if args.expect_container and args.expect_container != container:
+            raise LegacyRetirementError("the resolved container does not match --expect-container")
+
         outcome = await retire_with_barrier(
             SessionLocal,
             container=container,
-            docker=DockerCli(),
+            docker=docker,
             lock_timeout_ms=args.lock_timeout_ms,
             statement_timeout_ms=args.statement_timeout_ms,
         )
