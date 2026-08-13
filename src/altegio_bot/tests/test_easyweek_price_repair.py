@@ -15,6 +15,7 @@ captures, hand-edited snapshots and rows that are already right.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -35,11 +36,12 @@ from altegio_bot.models.models import (
 )
 from altegio_bot.scripts.easyweek_price_repair import (
     SKIP_ALREADY_CORRECT,
+    SKIP_AMBIGUOUS_EVIDENCE,
+    SKIP_INCONSISTENT_SERVICE_SNAPSHOT,
+    SKIP_LEGACY_SIGNATURE_MISMATCH,
     SKIP_NO_BOOKING_UUID,
-    SKIP_NO_USABLE_EVENT,
+    SKIP_NO_USABLE_EVIDENCE,
     SKIP_NOT_ONE_SERVICE,
-    SKIP_SIGNATURE_MISMATCH,
-    SKIP_SNAPSHOT_INCONSISTENT,
     _parse_args,
     legacy_price,
     repair_prices,
@@ -83,13 +85,16 @@ async def _seed_event(
     booking: uuid.UUID | None = BOOKING,
     body_truncated: bool = False,
     minutes: int = 0,
+    status: str = "processed",
+    event_hint: str = "booking-created",
+    payload_hash: str = "hash-a",
 ) -> EasyWeekEvent:
     event = EasyWeekEvent(
-        event_hint="booking-created",
+        event_hint=event_hint,
         booking_uuid=booking,
         payload=payload if payload is not None else _price_payload(),
-        payload_hash="hash-a",
-        status="processed",
+        payload_hash=payload_hash,
+        status=status,
         body_truncated=body_truncated,
         received_at=STARTS_AT - timedelta(days=1) + timedelta(minutes=minutes),
     )
@@ -269,7 +274,7 @@ async def test_a_hand_edited_snapshot_is_skipped(session_maker) -> None:
     report = await repair_prices(session_maker, apply=True)
 
     assert report.repaired == 0
-    assert report.skipped[SKIP_SIGNATURE_MISMATCH] == 1
+    assert report.skipped[SKIP_LEGACY_SIGNATURE_MISMATCH] == 1
     assert await _snapshot(session_maker, record_id) == (Decimal("99.00"), [Decimal("99.00")])
 
 
@@ -283,7 +288,7 @@ async def test_a_diverged_snapshot_is_skipped_rather_than_papered_over(session_m
     report = await repair_prices(session_maker, apply=True)
 
     assert report.repaired == 0
-    assert report.skipped[SKIP_SNAPSHOT_INCONSISTENT] == 1
+    assert report.skipped[SKIP_INCONSISTENT_SERVICE_SNAPSHOT] == 1
     assert await _snapshot(session_maker, record_id) == (CORRUPTED, [Decimal("7.00")])
 
 
@@ -318,7 +323,7 @@ async def test_a_truncated_capture_proves_nothing(session_maker) -> None:
     report = await repair_prices(session_maker, apply=True)
 
     assert report.repaired == 0
-    assert report.skipped[SKIP_NO_USABLE_EVENT] == 1
+    assert report.skipped[SKIP_NO_USABLE_EVIDENCE] == 1
     assert await _snapshot(session_maker, record_id) == (CORRUPTED, [CORRUPTED])
 
 
@@ -342,7 +347,7 @@ async def test_an_unusable_event_leaves_the_row_alone(session_maker, label: str,
     report = await repair_prices(session_maker, apply=True)
 
     assert report.repaired == 0, label
-    assert report.skipped[SKIP_NO_USABLE_EVENT] == 1, label
+    assert report.skipped[SKIP_NO_USABLE_EVIDENCE] == 1, label
     assert await _snapshot(session_maker, record_id) == (CORRUPTED, [CORRUPTED]), label
 
 
@@ -372,15 +377,17 @@ async def test_identity_is_the_booking_uuid_and_not_the_company(session_maker) -
     report = await repair_prices(session_maker, apply=True)
 
     assert report.repaired == 0
-    assert report.skipped[SKIP_NO_USABLE_EVENT] == 1
+    assert report.skipped[SKIP_NO_USABLE_EVIDENCE] == 1
     assert await _snapshot(session_maker, record_id) == (CORRUPTED, [CORRUPTED])
 
 
-async def test_the_newest_proving_event_wins_deterministically(session_maker) -> None:
-    """Capture is append-only, so "newest id" is a total order, not a guess."""
+async def test_the_candidate_that_explains_the_stored_value_is_the_one_used(session_maker) -> None:
+    """Not the newest — the one whose legacy value reproduces what is stored."""
     async with session_maker() as session:
         async with session.begin():
+            # Legacy 0.30: cannot have produced the stored 1.20.
             await _seed_event(session, payload=_price_payload(minor_units="3000", major_units=30, projection="30.00"))
+            # Legacy 1.20, canonical 120.00: the one that fits.
             await _seed_event(session, minutes=10)
             # Newer, but proves nothing: it must not shadow the event above.
             await _seed_event(session, payload={}, minutes=20)
@@ -391,6 +398,185 @@ async def test_the_newest_proving_event_wins_deterministically(session_maker) ->
 
     assert report.repaired == 1
     assert await _snapshot(session_maker, record_id) == (CORRECT, [CORRECT])
+
+
+# ---------------------------------------------------------------------------
+# Evidence selection: which deliveries may speak for the stored price
+# ---------------------------------------------------------------------------
+#
+# The first version of this command took the newest delivery it could parse.
+# That is wrong in a way that silently writes the wrong amount: `processed` is
+# not a record of a domain write. A `booking-succeeded`, an exact replay and a
+# post-cancel update all reach `processed` having changed nothing, and a
+# `failed` or still-`captured` delivery never wrote at all. Meanwhile the legacy
+# formula reads `booking_price_int`, which is a whole-euro count — so 120.00 and
+# 120.50 share the legacy signature 1.20 and are indistinguishable by it.
+#
+# Two deliveries can therefore both "fit" the corrupted row and disagree about
+# the truth. The rule is: gather every candidate that could have written, keep
+# the ones that explain the stored value, and require them to agree.
+
+# 120.50: the same booking_price_int=120, hence the same legacy 1.20 as 120.00.
+OTHER_MINOR_UNITS = "12050"
+OTHER_MAJOR_UNITS = 120
+OTHER_PROJECTION = "120.50"
+OTHER_CORRECT = Decimal("120.50")
+
+
+def _other_price_payload() -> dict[str, Any]:
+    return _price_payload(
+        minor_units=OTHER_MINOR_UNITS,
+        major_units=OTHER_MAJOR_UNITS,
+        projection=OTHER_PROJECTION,
+    )
+
+
+def test_the_two_candidate_prices_share_a_legacy_signature() -> None:
+    """Without this, the tests below would prove nothing."""
+    assert legacy_price({"booking_price_int": PRODUCTION_MAJOR_UNITS}) == CORRUPTED
+    assert legacy_price({"booking_price_int": OTHER_MAJOR_UNITS}) == CORRUPTED
+    assert CORRECT != OTHER_CORRECT
+
+
+@pytest.mark.parametrize("status", ["failed", "captured", "received", "processing"])
+async def test_only_a_processed_delivery_can_speak_for_the_price(session_maker, status: str) -> None:
+    """A later delivery that never completed must not overrule one that did."""
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_event(session)
+            await _seed_event(session, payload=_other_price_payload(), minutes=30, status=status, payload_hash="hash-b")
+            record = await _seed_record(session)
+    record_id = record.id
+
+    report = await repair_prices(session_maker, apply=True)
+
+    assert report.repaired == 1
+    assert await _snapshot(session_maker, record_id) == (CORRECT, [CORRECT]), (
+        f"a {status} delivery was treated as evidence"
+    )
+
+
+async def test_booking_succeeded_never_speaks_for_the_price(session_maker) -> None:
+    """It normalises to None: the worker marks it processed before any write."""
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_event(session)
+            await _seed_event(
+                session,
+                payload=_other_price_payload(),
+                minutes=30,
+                event_hint="booking-succeeded",
+                payload_hash="hash-b",
+            )
+            record = await _seed_record(session)
+    record_id = record.id
+
+    report = await repair_prices(session_maker, apply=True)
+
+    assert report.repaired == 1
+    assert await _snapshot(session_maker, record_id) == (CORRECT, [CORRECT])
+
+
+async def test_two_agreeing_candidates_repair_the_row_once(session_maker) -> None:
+    """A Resend is byte-identical, so agreement is the normal case."""
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_event(session)
+            await _seed_event(session, minutes=30, payload_hash="hash-b")
+            record = await _seed_record(session)
+    record_id = record.id
+
+    report = await repair_prices(session_maker, apply=True)
+
+    assert report.repaired == 1
+    assert report.repaired_record_ids == [record_id]
+    assert await _snapshot(session_maker, record_id) == (CORRECT, [CORRECT])
+
+
+async def test_two_disagreeing_candidates_stop_the_repair(session_maker) -> None:
+    """Both fit the corrupted value and name different prices. We do not pick."""
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_event(session)
+            await _seed_event(session, payload=_other_price_payload(), minutes=30, payload_hash="hash-b")
+            record = await _seed_record(session)
+    record_id = record.id
+
+    report = await repair_prices(session_maker, apply=True)
+
+    assert report.repaired == 0
+    assert report.repairable == 0
+    assert report.skipped[SKIP_AMBIGUOUS_EVIDENCE] == 1
+    assert await _snapshot(session_maker, record_id) == (CORRUPTED, [CORRUPTED])
+
+
+async def test_a_processed_delivery_that_wrote_nothing_still_forces_a_stop(session_maker) -> None:
+    """A post-cancel update reaches `processed` without touching the domain.
+
+    The schema does not record that, so the command cannot prove which of the
+    two deliveries set the price — and refuses rather than guessing by recency.
+    """
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_event(session)
+            await _seed_event(session, minutes=10, event_hint="booking-canceled", payload_hash="hash-cancel")
+            # Arrived after the cancel; the worker marked it processed and
+            # returned without writing. Same legacy signature, different price.
+            await _seed_event(
+                session,
+                payload=_other_price_payload(),
+                minutes=30,
+                event_hint="booking-updated",
+                payload_hash="hash-b",
+            )
+            record = await _seed_record(session)
+    record_id = record.id
+
+    report = await repair_prices(session_maker, apply=True)
+
+    assert report.repaired == 0
+    assert report.skipped[SKIP_AMBIGUOUS_EVIDENCE] == 1
+    assert await _snapshot(session_maker, record_id) == (CORRUPTED, [CORRUPTED])
+
+
+async def test_an_older_lifecycle_event_stays_usable_once_the_rest_are_excluded(session_maker) -> None:
+    """Age is not a disqualification; being unable to have written one is."""
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_event(session)
+            await _seed_event(
+                session, payload=_other_price_payload(), minutes=10, status="failed", payload_hash="hash-b"
+            )
+            await _seed_event(
+                session,
+                payload=_other_price_payload(),
+                minutes=20,
+                event_hint="booking-succeeded",
+                payload_hash="hash-c",
+            )
+            await _seed_event(
+                session, payload=_other_price_payload(), minutes=30, body_truncated=True, payload_hash="hash-d"
+            )
+            record = await _seed_record(session)
+    record_id = record.id
+
+    report = await repair_prices(session_maker, apply=True)
+
+    assert report.repaired == 1
+    assert await _snapshot(session_maker, record_id) == (CORRECT, [CORRECT])
+
+
+async def test_event_ids_only_label_the_report_and_never_choose_the_value(session_maker) -> None:
+    async with session_maker() as session:
+        async with session.begin():
+            first = await _seed_event(session)
+            await _seed_event(session, minutes=30, payload_hash="hash-b")
+            await _seed_record(session)
+
+    report = await repair_prices(session_maker)
+
+    assert report.evidence_event_ids == [first.id], "the label is stable, not the newest"
+    assert report.repairable == 1
 
 
 # ---------------------------------------------------------------------------
@@ -486,6 +672,137 @@ async def test_max_records_bounds_a_first_look(session_maker) -> None:
     assert report.scanned == 2
     assert report.repairable == 2
     assert report.repaired == 0
+
+
+# ---------------------------------------------------------------------------
+# Concurrency with the live worker
+# ---------------------------------------------------------------------------
+#
+# EASYWEEK_PROCESSING_ENABLED may legitimately stay on while this command runs,
+# so the worker can write a newer — and already correct — price at any moment.
+# The dangerous interleaving is: repair reads 1.20, decides 120.00, the worker
+# commits 150.00, repair writes its stale 120.00 and the newer business fact is
+# gone.
+#
+# These tests use two real PostgreSQL sessions and real row locks. They are the
+# only way to prove the ordering; a mocked session would prove the mock.
+
+CONCURRENT = Decimal("150.00")
+LOCK_TIMEOUT_SEC = 30
+
+
+async def _worker_writes_a_newer_price(session: AsyncSession, record_id: int, value: Decimal) -> None:
+    """What `upsert_record` + `sync_record_service` do: lock, then write both."""
+    record = (await session.execute(select(Record).where(Record.id == record_id).with_for_update())).scalars().one()
+    services = (
+        (await session.execute(select(RecordService).where(RecordService.record_id == record_id).with_for_update()))
+        .scalars()
+        .all()
+    )
+    record.total_cost = value
+    for service in services:
+        service.cost_to_pay = value
+
+
+async def test_a_price_the_worker_writes_while_we_wait_is_not_overwritten(session_maker) -> None:
+    """The lost-update scenario, run for real: the worker holds the lock first."""
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_event(session)
+            record = await _seed_record(session)
+    record_id = record.id
+
+    worker_session = session_maker()
+    await worker_session.__aenter__()
+    try:
+        worker_tx = await worker_session.begin().__aenter__()
+        await _worker_writes_a_newer_price(worker_session, record_id, CONCURRENT)
+
+        # The repair now has to wait for that lock before it can decide anything.
+        repair = asyncio.create_task(repair_prices(session_maker, apply=True))
+        await asyncio.sleep(1.0)
+        assert not repair.done(), "the repair must block on the worker's row lock, not race it"
+
+        await worker_tx.__aexit__(None, None, None)
+    finally:
+        await worker_session.__aexit__(None, None, None)
+
+    report = await asyncio.wait_for(repair, timeout=LOCK_TIMEOUT_SEC)
+
+    assert report.repaired == 0, "the historical value must not replace a newer business fact"
+    assert report.skipped[SKIP_LEGACY_SIGNATURE_MISMATCH] == 1
+    assert await _snapshot(session_maker, record_id) == (CONCURRENT, [CONCURRENT])
+
+
+async def test_when_the_repair_gets_the_lock_first_the_worker_still_wins_afterwards(session_maker) -> None:
+    """The other legal interleaving: repair completes, then the worker updates."""
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_event(session)
+            record = await _seed_record(session)
+    record_id = record.id
+
+    report = await repair_prices(session_maker, apply=True)
+    assert report.repaired == 1
+    assert await _snapshot(session_maker, record_id) == (CORRECT, [CORRECT])
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _worker_writes_a_newer_price(session, record_id, CONCURRENT)
+
+    assert await _snapshot(session_maker, record_id) == (CONCURRENT, [CONCURRENT])
+
+
+async def test_the_snapshot_is_never_observed_diverged_across_the_handover(session_maker) -> None:
+    """Both columns move together in both interleavings, at every commit."""
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_event(session)
+            record = await _seed_record(session)
+    record_id = record.id
+
+    worker_session = session_maker()
+    await worker_session.__aenter__()
+    try:
+        worker_tx = await worker_session.begin().__aenter__()
+        await _worker_writes_a_newer_price(worker_session, record_id, CONCURRENT)
+        repair = asyncio.create_task(repair_prices(session_maker, apply=True))
+        await asyncio.sleep(1.0)
+        await worker_tx.__aexit__(None, None, None)
+    finally:
+        await worker_session.__aexit__(None, None, None)
+
+    await asyncio.wait_for(repair, timeout=LOCK_TIMEOUT_SEC)
+
+    total, costs = await _snapshot(session_maker, record_id)
+    assert costs == [total], "Record.total_cost and RecordService.cost_to_pay diverged"
+    assert total == CONCURRENT
+
+
+async def test_a_dry_run_takes_no_write_locks_and_cannot_block_the_worker(session_maker) -> None:
+    """An audit must be safe to run against a busy production database."""
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_event(session)
+            record = await _seed_record(session)
+    record_id = record.id
+
+    worker_session = session_maker()
+    await worker_session.__aenter__()
+    try:
+        worker_tx = await worker_session.begin().__aenter__()
+        # Hold the row exactly as the worker would, for the whole audit.
+        await worker_session.execute(select(Record).where(Record.id == record_id).with_for_update())
+
+        report = await asyncio.wait_for(repair_prices(session_maker), timeout=LOCK_TIMEOUT_SEC)
+
+        await worker_tx.__aexit__(None, None, None)
+    finally:
+        await worker_session.__aexit__(None, None, None)
+
+    assert report.repairable == 1
+    assert report.repaired == 0
+    assert await _snapshot(session_maker, record_id) == (CORRUPTED, [CORRUPTED])
 
 
 # ---------------------------------------------------------------------------

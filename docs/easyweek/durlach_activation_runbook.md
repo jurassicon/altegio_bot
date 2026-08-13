@@ -2165,11 +2165,49 @@ docker compose -p altegio_bot exec -T altegio-api /app/.venv/bin/python -m alteg
 | Причина | Что означает |
 | --- | --- |
 | `no_booking_uuid` | нет канонической identity |
-| `no_usable_event` | нет сохранённого события с валидным price-контрактом (в т.ч. truncated) |
+| `no_usable_evidence` | нет доставки, которая вообще могла записать цену (см. 11.3a) |
 | `not_exactly_one_service` | ноль или несколько service-строк: сумму не к чему привязать |
-| `snapshot_inconsistent` | `total_cost` и `cost_to_pay` уже расходятся — отдельная проблема |
+| `inconsistent_service_snapshot` | `total_cost` и `cost_to_pay` уже расходятся — отдельная проблема |
 | `already_correct` | цена уже правильная |
-| `signature_mismatch` | сохранённое значение не равно результату старой формулы: значение писал кто-то ещё |
+| `legacy_signature_mismatch` | сохранённое значение не равно результату старой формулы: значение писал кто-то ещё |
+| `ambiguous_evidence` | несколько допустимых доставок одинаково объясняют сохранённое значение, но называют разные цены |
+
+#### 11.3a Какие события допускаются как evidence
+
+Кандидатом считается доставка этой же booking UUID, которая:
+
+- имеет `status='processed'` — `captured`/`received`/`processing` ещё не
+  доработали, а `failed` не записывал вообще ничего;
+- имеет lifecycle-хинт (`booking-created`, `booking-updated`,
+  `booking-rescheduled`, `booking-canceled`). `booking-succeeded` исключён:
+  normalizer возвращает по нему `None`, и worker помечает событие `processed`,
+  не тронув Client, Record и MessageJob;
+- не truncated;
+- разбирается исправленным парсером и реально несёт цену.
+
+**`processed` не означает «записал».** Worker помечает доставку `processed` и
+выходит без domain write ещё в трёх случаях: `booking-succeeded`, точный replay
+(`already_applied` — Resend байт-идентичен) и update, пришедший после отмены
+записи (`is_cancel_terminal`). Схема не хранит, какая именно доставка выполнила
+запись, и repair этого не выдумывает.
+
+Поэтому решение принимается не по одной доставке:
+
+1. собираются **все** кандидаты;
+2. остаются те, у которых старая формула воспроизводит текущее сохранённое
+   `Record.total_cost`;
+3. если таких нет — `legacy_signature_mismatch`;
+4. если все они называют одну и ту же исправленную цену — repair разрешён;
+5. если называют разные — `ambiguous_evidence`, строка не меняется.
+
+Это не теория: `booking_price_int` считает целые евро, поэтому `120.00` и
+`120.50` дают одну и ту же старую сигнатуру `1.20`. Выбор «самого нового
+события» записал бы `120.50` там, где верно `120.00`. `event.id` используется
+только как стабильная метка в отчёте и **никогда** не выбирает сумму.
+
+Если `ambiguous_evidence` встречается, разбирать такие booking поимённо по
+`repairable_record_ids`/`evidence_event_ids` и `easyweek_events`; массового
+автоматического решения для них нет и не будет.
 
 **4. Backup / фиксация восстановимых значений.** До `--apply` сохранить текущее
 состояние кандидатов, чтобы откат был арифметически проверяем:
@@ -2187,11 +2225,39 @@ docker compose -p altegio_bot exec -T postgres sh -lc 'psql -tAX -U "$POSTGRES_U
 docker compose -p altegio_bot exec -T altegio-api /app/.venv/bin/python -m altegio_bot.scripts.easyweek_price_repair --apply
 ```
 
-Ожидается `repaired == repairable` из шага 3. Команда не создаёт и не
-переоткрывает job, ничего не отправляет и не меняет статус `easyweek_events`.
+Ожидается `repaired == repairable` из шага 3, либо меньше — если между audit и
+apply worker успел записать новые корректные цены (см. 11.3b). Команда не
+создаёт и не переоткрывает job, ничего не отправляет и не меняет статус
+`easyweek_events`.
 
 **6. Проверка идемпотентности.** Повторный `--apply` обязан дать
 `repaired: 0` и `already_correct` на тех же строках.
+
+#### 11.3b Concurrency: останавливать ли обработку
+
+**Останавливать EasyWeek inbox worker не требуется.** `EASYWEEK_PROCESSING_ENABLED`
+может оставаться `true`: корректность обеспечена на уровне строк, а не режимом
+обслуживания.
+
+- audit (`dry-run`) **не берёт write-блокировок** вообще — его безопасно
+  запускать на нагруженной БД, он не может заблокировать worker;
+- `--apply` берёт `SELECT ... FOR UPDATE` на `records`, затем на связанные
+  `record_services` — тот же порядок блокировок, что и у `upsert_record`, —
+  и **заново** собирает evidence и переклассифицирует строку уже под
+  блокировкой;
+- значение, вычисленное до блокировки, не записывается никогда;
+- обход — read-only keyset-страница по `records.id`, дальше по одной короткой
+  транзакции на запись, поэтому долгих удержаний блокировок нет.
+
+Практический смысл: если worker успел сохранить новую корректную цену, пока
+repair ждал блокировку, сохранённое значение перестаёт соответствовать старой
+сигнатуре, и строка уходит в `legacy_signature_mismatch` вместо отката к
+историческому значению. Более новый business update не теряется ни при одном
+порядке событий.
+
+Что при этом обязано остаться выключенным до конца шага 8 — это
+**`EASYWEEK_NOTIFICATIONS_ENABLED`**. Обработка и capture безопасны; отправка
+клиентам при известной ошибке цены — нет.
 
 **7. Проверка инварианта.** Ожидается **0 строк**:
 
@@ -2207,6 +2273,24 @@ docker compose -p altegio_bot exec -T postgres sh -lc 'psql -tAX -U "$POSTGRES_U
 
 Ненулевой результат — не автоматический откат, а повод разобрать эти строки
 поимённо: настоящая цена в 0.50 € возможна.
+
+**7a. Повторный audit после repair.** Тот же dry-run, что и в шаге 3:
+
+```bash
+docker compose -p altegio_bot exec -T altegio-api /app/.venv/bin/python -m altegio_bot.scripts.easyweek_price_repair
+```
+
+Ожидается `repairable: 0`, а исправленные строки — в `already_correct`.
+Ненулевой `repairable` означает, что появились новые кандидаты (например, worker
+обработал старое событие), и шаги 4–7 нужно повторить.
+
+**7b. Подтвердить, что jobs/outbox/events не изменились.** Repair их не трогает,
+и это проверяется прямо: счётчики до и после должны совпадать, а `updated_at`
+джобов не должен сдвинуться в окно repair.
+
+```bash
+docker compose -p altegio_bot exec -T postgres sh -lc 'psql -tAX -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT (SELECT count(*) FROM message_jobs WHERE provider = '"'"'easyweek'"'"'), (SELECT count(*) FROM outbox_messages), (SELECT count(*) FROM easyweek_events), (SELECT count(*) FROM easyweek_events WHERE status = '"'"'failed'"'"')"'
+```
 
 **8. Controlled smoke.** Только теперь и только на собственном тестовом
 клиенте:

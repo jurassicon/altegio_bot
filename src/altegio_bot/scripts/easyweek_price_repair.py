@@ -12,20 +12,26 @@ What makes a row repairable is not "the number looks small". It is a proof,
 assembled per booking from evidence we already stored:
 
 1. the record is ``provider='easyweek'`` and has a canonical booking UUID;
-2. a captured, untruncated event for that UUID carries a price the NEW contract
-   accepts — the same ``_price_to_decimal`` the worker runs, never a second
-   implementation that could drift from it;
-3. that same event also carries an exact ``booking_price_int``, so the OLD
-   formula can be replayed;
-4. the stored ``Record.total_cost`` equals what the old formula produced, and
-   the new canonical value differs from it — i.e. the row carries the bug's
-   signature rather than merely an unexpected amount;
-5. the booking has exactly one service snapshot, and its ``cost_to_pay`` already
-   equals ``Record.total_cost`` — the consistent pre-repair state.
+2. the booking has exactly one service snapshot, and its ``cost_to_pay`` already
+   equals ``Record.total_cost`` — the consistent pre-repair state;
+3. among the deliveries that could have written a price — ``processed``, a
+   lifecycle hint, untruncated, and carrying a price the NEW contract accepts —
+   at least one reproduces the stored value through the OLD formula;
+4. and every such candidate agrees on the same corrected value.
 
-Anything short of that is skipped and counted, never guessed at. A row edited by
-hand, a booking whose service set is ambiguous, a truncated capture, an Altegio
-record, a row that is already correct: all skips.
+**Why the last point is not pedantry.** ``status='processed'`` does not mean
+"this delivery wrote the price". The worker marks a delivery processed and
+returns without touching the domain when it is a ``booking-succeeded`` event, an
+exact replay of one already applied, or an update arriving after the booking was
+cancelled. The schema does not record which processed delivery performed a
+write, and this command does not invent that record. It therefore refuses to
+pick a winner: if two candidates are equally consistent with the stored value
+and name different prices, the row is reported as ``ambiguous_evidence`` and
+left alone. Event ids order the report; they never decide the amount.
+
+Anything short of that proof is skipped and counted, never guessed at. A row
+edited by hand, a booking whose service set is ambiguous, a truncated capture,
+an Altegio record, a row that is already correct: all skips.
 
 Blast radius, deliberately small:
 
@@ -40,8 +46,18 @@ Idempotent by construction: after a successful repair the stored value no longer
 matches the old formula, so a second run classifies the row as already correct
 and writes nothing.
 
-Traversal is keyset-paged over ``records.id`` in bounded batches, each in its own
-short transaction, so a long production table never holds one lock for minutes.
+**Concurrency.** ``EASYWEEK_PROCESSING_ENABLED`` may legitimately stay on while
+this runs, so the worker can write a newer, already-correct price at any moment.
+Under ``--apply`` each record is therefore locked with ``SELECT ... FOR UPDATE``
+— the same lock ``upsert_record`` takes, in the same order, record before
+service row — and the ENTIRE decision is re-derived underneath that lock. A
+value computed before the lock is never written. If the worker committed a new
+price while we waited, the stored value no longer carries the bug's signature
+and the row is skipped instead of being dragged back to a historical amount.
+
+Traversal is a read-only keyset page over ``records.id`` followed by one short
+transaction per record, so a long production table never holds one lock for
+minutes and an audit takes no write locks at all.
 
 Output discipline matches the rest of the EasyWeek ops tooling: counts and
 technical ids (record, service, event, company) only. No payload, no price, no
@@ -58,11 +74,13 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, Final
 
-from sqlalchemy import select
+from sqlalchemy import Select, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.db import SessionLocal
 from altegio_bot.easyweek_normalizer import (
+    _EVENT_HINT_MAP,
+    IGNORE,
     MAX_MONEY_CENTS,
     NormalizationError,
     _as_exact_int,
@@ -74,18 +92,27 @@ from altegio_bot.models.models import (
     Record,
     RecordService,
 )
+from altegio_bot.workers.easyweek_inbox_worker import STATUS_PROCESSED
 
 DEFAULT_BATCH_SIZE: Final = 200
 # Reported id lists are for an operator to spot-check, not a data export.
 MAX_REPORTED_IDS: Final = 50
 
+# The hints whose deliveries can reach a domain write at all. Derived from the
+# normalizer's own map rather than restated, so a new trigger cannot silently
+# become evidence here without going through the parser first.
+# `booking-succeeded` is excluded because it normalises to None: the worker
+# marks it processed and returns before touching Client, Record or MessageJob.
+PRICE_WRITING_HINTS: Final = frozenset(hint for hint, action in _EVENT_HINT_MAP.items() if action != IGNORE)
+
 # Why a record was left alone. Every one of these is a refusal to guess.
 SKIP_NO_BOOKING_UUID: Final = "no_booking_uuid"
-SKIP_NO_USABLE_EVENT: Final = "no_usable_event"
+SKIP_NO_USABLE_EVIDENCE: Final = "no_usable_evidence"
 SKIP_NOT_ONE_SERVICE: Final = "not_exactly_one_service"
-SKIP_SNAPSHOT_INCONSISTENT: Final = "snapshot_inconsistent"
+SKIP_INCONSISTENT_SERVICE_SNAPSHOT: Final = "inconsistent_service_snapshot"
 SKIP_ALREADY_CORRECT: Final = "already_correct"
-SKIP_SIGNATURE_MISMATCH: Final = "signature_mismatch"
+SKIP_LEGACY_SIGNATURE_MISMATCH: Final = "legacy_signature_mismatch"
+SKIP_AMBIGUOUS_EVIDENCE: Final = "ambiguous_evidence"
 
 
 @dataclass(frozen=True)
@@ -97,6 +124,25 @@ class PriceEvidence:
     # produces from the same bytes. The repair is only ever the step between.
     old_value: Decimal
     new_value: Decimal
+
+
+@dataclass(frozen=True)
+class Decision:
+    """Either a skip reason, or the single value every candidate agreed on."""
+
+    reason: str | None
+    value: Decimal | None = None
+    service: RecordService | None = None
+    evidence_event_id: int | None = None
+
+
+def _maybe_lock(stmt: Select[Any], lock: bool) -> Select[Any]:
+    """``FOR UPDATE`` when we intend to write, a plain read when we do not.
+
+    A dry-run must stay genuinely read-only: taking write locks during an audit
+    would let a report block the live worker.
+    """
+    return stmt.with_for_update() if lock else stmt
 
 
 @dataclass
@@ -169,72 +215,123 @@ def price_evidence(event: EasyWeekEvent) -> PriceEvidence | None:
     return PriceEvidence(event_id=event.id, old_value=old_value, new_value=new_value)
 
 
-async def find_price_evidence(session: AsyncSession, record: Record) -> PriceEvidence | None:
-    """The newest captured delivery for this booking that proves a price.
+async def collect_price_evidence(session: AsyncSession, record: Record) -> list[PriceEvidence]:
+    """Every delivery of this booking that could have written the stored price.
 
-    Deterministic by ``easyweek_events.id`` descending: capture is append-only
-    and monotonic, so "newest" is a total order, not a timestamp tie-break.
+    The filter is the set of preconditions the worker itself imposes before a
+    price reaches ``Record``:
+
+    * ``status='processed'`` — a ``captured``/``processing`` row has not run to
+      completion, and a ``failed`` row never wrote anything at all;
+    * a lifecycle hint — ``booking-succeeded`` normalises to ``None`` and returns
+      before any domain write, so it can never have set a price;
+    * a body the fixed parser accepts, that actually carries a price.
+
+    ``processed`` is necessary but NOT sufficient, and the schema does not record
+    which processed delivery performed a write: a replay and a post-cancel
+    delivery both reach ``processed`` having changed nothing. That gap is not
+    papered over here. Every surviving candidate is returned, the caller requires
+    them to AGREE, and disagreement is a refusal rather than a tie-break.
+
+    Ordered by id purely so the report is stable.
     """
     if record.easyweek_booking_uuid is None:
-        return None
+        return []
 
     events = (
         (
             await session.execute(
                 select(EasyWeekEvent)
                 .where(EasyWeekEvent.booking_uuid == record.easyweek_booking_uuid)
-                .order_by(EasyWeekEvent.id.desc())
+                .where(EasyWeekEvent.status == STATUS_PROCESSED)
+                .where(EasyWeekEvent.event_hint.in_(PRICE_WRITING_HINTS))
+                .order_by(EasyWeekEvent.id.asc())
             )
         )
         .scalars()
         .all()
     )
-    for event in events:
-        evidence = price_evidence(event)
-        if evidence is not None:
-            return evidence
-    return None
+    return [evidence for event in events if (evidence := price_evidence(event)) is not None]
 
 
-async def classify(
-    session: AsyncSession, record: Record
-) -> tuple[str | None, PriceEvidence | None, RecordService | None]:
-    """Decide what to do with one record.
+async def classify(session: AsyncSession, record: Record, *, lock: bool = False) -> Decision:
+    """Decide what to do with one record, from ALL of its usable evidence.
 
-    Returns ``(skip_reason, evidence, service)``. A ``None`` skip reason means
-    the record carries the bug's full signature and may be repaired.
+    ``lock`` takes the same row-level locks the worker takes, in the same order
+    (record first, then its service snapshot), so a decision made with it can
+    still be true when it is written.
     """
     if record.easyweek_booking_uuid is None:
-        return SKIP_NO_BOOKING_UUID, None, None
-
-    evidence = await find_price_evidence(session, record)
-    if evidence is None:
-        return SKIP_NO_USABLE_EVENT, None, None
+        return Decision(SKIP_NO_BOOKING_UUID)
 
     services = list(
-        (await session.execute(select(RecordService).where(RecordService.record_id == record.id))).scalars().all()
+        (await session.execute(_maybe_lock(select(RecordService).where(RecordService.record_id == record.id), lock)))
+        .scalars()
+        .all()
     )
     if len(services) != 1:
         # Zero rows leave nothing to keep in step with the record; several rows
         # mean the booking-level total cannot be attributed to one of them.
-        return SKIP_NOT_ONE_SERVICE, evidence, None
+        return Decision(SKIP_NOT_ONE_SERVICE)
     service = services[0]
 
-    if record.total_cost == evidence.new_value:
-        # Either already repaired, or written after the fix. Both are correct.
-        return SKIP_ALREADY_CORRECT, evidence, service
+    usable = await collect_price_evidence(session, record)
+    if not usable:
+        return Decision(SKIP_NO_USABLE_EVIDENCE)
 
-    if record.total_cost is None or record.total_cost != evidence.old_value:
-        # Not what the old formula would have produced: something else wrote
-        # this value, and we do not know what it meant.
-        return SKIP_SIGNATURE_MISMATCH, evidence, service
+    if any(record.total_cost == item.new_value for item in usable):
+        # Either already repaired, or written after the fix. Both are correct,
+        # and this is what makes a second --apply a no-op.
+        return Decision(SKIP_ALREADY_CORRECT)
+
+    compatible = [item for item in usable if record.total_cost is not None and item.old_value == record.total_cost]
+    if not compatible:
+        # Nothing we can prove wrote this value. Something else did, and we do
+        # not know what it meant.
+        return Decision(SKIP_LEGACY_SIGNATURE_MISMATCH)
 
     if service.cost_to_pay != record.total_cost:
         # The pre-repair state is supposed to be consistent. A divergence is a
         # separate problem, and overwriting it would hide it.
-        return SKIP_SNAPSHOT_INCONSISTENT, evidence, service
+        return Decision(SKIP_INCONSISTENT_SERVICE_SNAPSHOT)
 
-    return None, evidence, service
+    canonical_values = {item.new_value for item in compatible}
+    if len(canonical_values) != 1:
+        # Several deliveries are equally consistent with the stored value and
+        # they disagree about the real price. Picking the newest would be a
+        # guess dressed up as a rule.
+        return Decision(SKIP_AMBIGUOUS_EVIDENCE)
+
+    value = canonical_values.pop()
+    return Decision(
+        None,
+        value=value,
+        service=service,
+        # Lowest id: a stable label for the report, chosen AFTER the value was
+        # agreed. It never selects the value.
+        evidence_event_id=min(item.event_id for item in compatible),
+    )
+
+
+async def _record_id_page(session: AsyncSession, after_id: int, limit: int) -> list[int]:
+    """One bounded keyset page of EasyWeek record ids, read-only.
+
+    Altegio records are excluded by the query itself, so no Altegio row is ever
+    read, let alone written.
+    """
+    return list(
+        (
+            await session.execute(
+                select(Record.id)
+                .where(Record.provider == PROVIDER_EASYWEEK)
+                .where(Record.id > after_id)
+                .order_by(Record.id.asc())
+                .limit(limit)
+            )
+        )
+        .scalars()
+        .all()
+    )
 
 
 async def repair_prices(
@@ -246,8 +343,11 @@ async def repair_prices(
 ) -> RepairReport:
     """Audit — and, with ``apply``, correct — EasyWeek price snapshots.
 
-    One short transaction per batch. Altegio records are excluded by the query
-    itself, so no Altegio row is ever read, let alone written.
+    Traversal is a read-only keyset page of ids, followed by one short
+    transaction per record. Under ``apply`` that transaction locks the record
+    and its service row FIRST and re-derives the whole decision underneath the
+    lock, so a price the worker wrote while we were paging cannot be replaced by
+    a value computed before it existed.
     """
     report = RepairReport(applied=apply)
     last_id = 0
@@ -259,44 +359,49 @@ async def repair_prices(
         limit = batch_size if remaining is None else min(batch_size, remaining)
 
         async with session_factory() as session:
-            async with session.begin():
-                records = list(
-                    (
-                        await session.execute(
-                            select(Record)
-                            .where(Record.provider == PROVIDER_EASYWEEK)
-                            .where(Record.id > last_id)
-                            .order_by(Record.id.asc())
-                            .limit(limit)
-                        )
+            record_ids = await _record_id_page(session, last_id, limit)
+        if not record_ids:
+            break
+        last_id = record_ids[-1]
+
+        for record_id in record_ids:
+            report.scanned += 1
+            async with session_factory() as session:
+                async with session.begin():
+                    # Under --apply this SELECT waits for any worker transaction
+                    # holding the row, and returns what that worker committed —
+                    # not what we saw while paging.
+                    record = (
+                        (await session.execute(_maybe_lock(select(Record).where(Record.id == record_id), apply)))
+                        .scalars()
+                        .first()
                     )
-                    .scalars()
-                    .all()
-                )
-                if not records:
-                    break
-
-                for record in records:
-                    last_id = record.id
-                    report.scanned += 1
-
-                    reason, evidence, service = await classify(session, record)
-                    if reason is not None:
-                        report.skipped[reason] += 1
+                    if record is None or record.provider != PROVIDER_EASYWEEK:
+                        # Deleted, or re-provisioned, between the page and the
+                        # lock. Not ours to touch.
+                        report.scanned -= 1
                         continue
 
-                    assert evidence is not None and service is not None
+                    decision = await classify(session, record, lock=apply)
+                    if decision.reason is not None:
+                        report.skipped[decision.reason] += 1
+                        continue
+
+                    assert decision.value is not None and decision.service is not None
                     report.repairable += 1
                     report.repairable_record_ids.append(record.id)
-                    report.evidence_event_ids.append(evidence.event_id)
+                    if decision.evidence_event_id is not None:
+                        report.evidence_event_ids.append(decision.evidence_event_id)
 
                     if not apply:
                         continue
 
-                    # Both halves of one snapshot, in one transaction: the
-                    # invariant PR-5 renders from is never observable as broken.
-                    record.total_cost = evidence.new_value
-                    service.cost_to_pay = evidence.new_value
+                    # Both halves of one snapshot, under the same lock and in
+                    # one transaction: the invariant PR-5 renders from is never
+                    # observable as broken, and the value written was derived
+                    # from the state we are holding.
+                    record.total_cost = decision.value
+                    decision.service.cost_to_pay = decision.value
                     report.repaired += 1
                     report.repaired_record_ids.append(record.id)
 
@@ -316,7 +421,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--batch-size",
         type=int,
         default=DEFAULT_BATCH_SIZE,
-        help=f"Records per transaction (default {DEFAULT_BATCH_SIZE}).",
+        help=(
+            f"Record ids read per keyset page (default {DEFAULT_BATCH_SIZE}). "
+            "Each record is then handled in its own short transaction."
+        ),
     )
     parser.add_argument(
         "--max-records",
