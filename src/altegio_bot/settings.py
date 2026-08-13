@@ -252,6 +252,32 @@ class Settings(BaseSettings):
             )
         return v
 
+    # PR-7.2. Where a customer's inbound WhatsApp message is shown, and whether
+    # an operator reply typed in General may resolve a branch sender.
+    #   context  — today's behaviour: reply/reaction context decides, otherwise
+    #              General; a General operator reply stays blocked.
+    #   affinity — context first, then the proven-tenant resolver; only real
+    #              NO_EVIDENCE falls back to General.
+    #   general  — one-inbox display rollback. Inbound is shown in General, but
+    #              an operator reply still has to PROVE a tenant before a sender
+    #              is chosen; it never means "pick the first sender".
+    # Consumed by altegio-whatsapp-inbox-worker only.
+    chatwoot_inbound_routing_mode: str = "context"
+
+    @field_validator("chatwoot_inbound_routing_mode")
+    @classmethod
+    def validate_inbound_routing_mode(cls, v: str) -> str:
+        allowed = {"context", "affinity", "general"}
+        if v not in allowed:
+            # Fail fast: a silent fallback would route customer messages to a
+            # branch nobody chose, and the operator would never know.
+            raise ValueError(
+                f"chatwoot_inbound_routing_mode must be one of "
+                f"{sorted(allowed)!r}, got {v!r}. "
+                "Check CHATWOOT_INBOUND_ROUTING_MODE."
+            )
+        return v
+
     @field_validator("chatwoot_operator_closed_window_mode")
     @classmethod
     def validate_closed_window_mode(cls, v: str) -> str:
