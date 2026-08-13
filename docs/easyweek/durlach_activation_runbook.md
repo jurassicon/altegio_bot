@@ -1989,3 +1989,103 @@ $COMPOSE up -d --force-recreate altegio-whatsapp-inbox-worker
 * гейт `EASYWEEK_NOTIFICATIONS_ENABLED` в `outbox_worker` — отдельное решение
   вне PR-7 (см. §8: именно поэтому жёсткая остановка требует ручных шагов);
 * изменения маршрутизации отправителей и Altegio-пути.
+
+---
+
+## 10. PR-7.2 — Chatwoot affinity routing и обратимый one-inbox UX
+
+Три технических inbox (Karlsruhe, Durlach, Rastatt) и отдельный validated
+General остаются раздельными. Ничего не объединяется физически.
+
+### 10.1 Режимы
+
+`CHATWOOT_INBOUND_ROUTING_MODE` — ровно одно из трёх значений. Невалидное
+значение роняет запуск settings; тихого fallback нет.
+
+| Режим | Клиентский inbound | Ответ оператора из General |
+| --- | --- | --- |
+| `context` (default) | reply/reaction context решает, иначе General | заблокирован, как сегодня |
+| `affinity` | context, затем доказанная affinity; только настоящий NO_EVIDENCE → General | разрешён при PROVEN tenant |
+| `general` | всё показывается в General | разрешён при PROVEN tenant |
+
+`general` — это режим **отображения**. Он не ослабляет доказательство, которое
+нужно ответу оператора, и никогда не означает «взять первый sender».
+
+Порядок доказательств: последняя доставленная (`delivered`/`read`) tenant-
+коммуникация → ближайшая будущая запись клиента, иначе последняя прошедшая →
+единственная provider/company identity клиента. `AMBIGUOUS` и `INVALID`
+блокируют, а не уходят в General.
+
+Единственный потребитель настройки — `altegio-whatsapp-inbox-worker`.
+
+### 10.2 Переключение и rollback
+
+```bash
+$COMPOSE up -d --force-recreate altegio-whatsapp-inbox-worker
+```
+
+Обычный `restart` или `up -d` без `--force-recreate` **не** перечитывает `.env`.
+API, outbox и EasyWeek inbox worker пересоздавать не нужно: настройку читает
+только WhatsApp inbox worker.
+
+Проверка эффективного значения без вывода секретов:
+
+```bash
+$COMPOSE exec -T altegio-whatsapp-inbox-worker /app/.venv/bin/python -c \
+  'from altegio_bot.settings import settings; print({"mode": settings.chatwoot_inbound_routing_mode})'
+```
+
+Активация: `CHATWOOT_INBOUND_ROUTING_MODE=affinity` → recreate.
+Откат в один inbox: `CHATWOOT_INBOUND_ROUTING_MODE=general` → recreate.
+Возврат к текущему поведению: `CHATWOOT_INBOUND_ROUTING_MODE=context` → recreate.
+
+Откат не требует ни отката commit, ни downgrade миграции, не меняет EasyWeek
+processing/notifications и не трогает outbound branch notifications.
+
+### 10.3 Оператор на iPhone
+
+Оператор добавлен во все четыре inbox (Karlsruhe, Durlach, Rastatt, General) и
+работает из общего списка **All** или **Mine**. Переключать филиальные inbox
+вручную не нужно: название inbox в списке показывает филиал, фильтр по inbox
+нужен только для поиска, push открывает нужную conversation.
+
+### 10.4 Smoke после deploy
+
+Выводить только IDs, provider/company, inbox, статусы, reason codes и booleans.
+Не выводить `phone_e164`, тело сообщения, payload, token и secret.
+
+**A. `affinity`.** Для контакта с недавним Durlach-уведомлением новое сообщение
+без Reply должно появиться в Durlach inbox; аналогично Rastatt и Karlsruhe.
+Ответ оператора из branch inbox уходит своим sender; ответ из General для
+контакта с proven affinity — тоже своим. Outbox доходит до `delivered`/`read`.
+
+**B. Неизвестный контакт.** Новый номер без Client/Record/коммуникации →
+General. Ответ из General заблокирован, Meta не вызывается, оператор видит
+private note.
+
+**C. Ambiguity.** Подготовленный конфликтующий tenant evidence → blocked, Meta
+не вызвана, произвольный sender не выбран.
+
+**D. `general` rollback rehearsal.** Выставить `general`, пересоздать только
+WhatsApp inbox worker: новое inbound появляется в General, branch conversation
+не переиспользуется, ответ из General с proven affinity уходит правильным
+branch sender. Затем вернуть `affinity` и снова пересоздать worker.
+
+Для каждого шага проверить `conversation.inbox_id`, `WhatsAppEvent.status`,
+`forwarded_chatwoot_conversation_id`, отсутствие cross-inbox дубля и traceback.
+
+```sql
+SELECT id, status, error, chatwoot_conversation_id
+FROM whatsapp_events
+ORDER BY id DESC
+LIMIT 10;
+```
+
+**STOP-условия:** sender другого филиала или другого provider; сообщение,
+ушедшее клиенту из чужого салона; появление conversation в двух inbox;
+`general_affinity_ambiguous` / `general_affinity_invalid`, трактованные как
+норма.
+
+**Событие 20794 (conversation 230, message 9343) терминально и не
+переигрывается.** Проверка выполняется новым сообщением с новым Chatwoot
+message ID.

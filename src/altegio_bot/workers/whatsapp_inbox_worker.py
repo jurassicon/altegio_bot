@@ -15,6 +15,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.campaigns.runner import recompute_campaign_run_stats
+from altegio_bot.chatwoot_affinity import AffinityOutcome, resolve_tenant_affinity
 from altegio_bot.chatwoot_client import ChatwootClient
 from altegio_bot.chatwoot_outbox_route import (
     outbox_has_chatwoot_route_marker,
@@ -414,6 +415,122 @@ def _company_hint_from_inbox(
         return None, "operator_relay: inbox_mapping_missing"
 
     return parsed.mapping[inbox_int], None
+
+
+def _inbound_mode_forces_general() -> bool:
+    """`general` mode: show every customer inbound in the one General inbox.
+
+    Display only. It never relaxes the proof an operator reply needs before a
+    sender is chosen, and it never reuses another inbox's conversation.
+    """
+    return settings.chatwoot_inbound_routing_mode == "general"
+
+
+async def _inbound_affinity_inbox(
+    session: AsyncSession,
+    phone_e164: str,
+) -> tuple[int | None, ChatwootRoute, str | None]:
+    """Where a contextless customer inbound belongs, in `affinity` mode.
+
+    Returns ``(inbox_id, route, routing_error)``.
+
+    NO_EVIDENCE is the only outcome that may land in General — that is what
+    General is for. AMBIGUOUS and INVALID are surfaced as routing errors
+    instead: showing a conversation in the wrong branch invites an operator to
+    answer as the wrong salon.
+    """
+    if settings.chatwoot_inbound_routing_mode != "affinity":
+        return None, ChatwootRoute.GENERAL, None
+
+    result = await resolve_tenant_affinity(session, _phone_variants(phone_e164))
+    if result.outcome is AffinityOutcome.NO_EVIDENCE:
+        return None, ChatwootRoute.GENERAL, None
+    if not result.is_proven:
+        logger.info(
+            "inbound_affinity: unresolved outcome=%s source=%s reason=%s",
+            result.outcome.value,
+            result.source,
+            result.reason,
+        )
+        return None, ChatwootRoute.GENERAL, f"affinity_{result.outcome.value}"
+
+    inbox_id, routing_error = _inbound_target_inbox(
+        chatwoot_route=ChatwootRoute.TENANT,
+        tenant_provider=result.identity.provider,
+        company_id=result.identity.company_id,
+        tenant_error=None,
+    )
+    if routing_error is not None:
+        # Proven tenant with no usable inbox mapping is a configuration fault,
+        # never a reason to quietly fall back to General.
+        return None, ChatwootRoute.GENERAL, routing_error
+    logger.info(
+        "inbound_affinity: routed provider=%s company_id=%s source=%s",
+        result.identity.provider,
+        result.identity.company_id,
+        result.source,
+    )
+    return inbox_id, ChatwootRoute.TENANT, None
+
+
+async def _general_relay_tenant_hint(
+    session: AsyncSession,
+    *,
+    chatwoot_inbox_id: object,
+    phone_e164: str,
+) -> tuple[ChatwootTenantIdentity | None, str | None]:
+    """Tenant for an operator reply written in the validated General inbox.
+
+    Returns ``(identity, error)``. Called only after the branch map has already
+    refused the inbox, so this is the last chance for a legitimate General
+    reply — and the first chance for an arbitrary unmapped inbox to be refused
+    for good.
+
+    Fail-closed at every step:
+
+    * the inbox must be EXACTLY the configured General one, and General must
+      still pass its own distinct-from-branches validation;
+    * routing mode must be `affinity` or `general` — `context` keeps today's
+      behaviour, where a General reply is simply blocked;
+    * only a PROVEN tenant yields a hint. NO_EVIDENCE, AMBIGUOUS and INVALID
+      all block, because choosing a branch for an operator reply means sending
+      a customer a message from the wrong salon.
+    """
+    mode = settings.chatwoot_inbound_routing_mode
+    if mode not in {"affinity", "general"}:
+        return None, "operator_relay: inbox_mapping_missing"
+
+    parsed = parse_chatwoot_inbox_company_map(settings.chatwoot_inbox_company_map)
+    general_id, general_err = resolve_chatwoot_general_inbox(parsed, settings.chatwoot_inbox_id)
+    if general_err is not None:
+        logger.warning("operator_relay: general inbox invalid err=%s", general_err)
+        return None, f"operator_relay: {general_err}"
+    if general_id is None:
+        return None, "operator_relay: inbox_mapping_missing"
+
+    inbox_int = positive_int(chatwoot_inbox_id)
+    if inbox_int is None or inbox_int != general_id:
+        # Not General: an arbitrary unmapped inbox keeps its existing outcome
+        # and never reaches the resolver.
+        return None, "operator_relay: inbox_mapping_missing"
+
+    result = await resolve_tenant_affinity(session, _phone_variants(phone_e164))
+    if not result.is_proven:
+        logger.info(
+            "operator_relay: general affinity unresolved outcome=%s source=%s reason=%s",
+            result.outcome.value,
+            result.source,
+            result.reason,
+        )
+        return None, f"operator_relay: general_affinity_{result.outcome.value}"
+
+    logger.info(
+        "operator_relay: general affinity resolved provider=%s company_id=%s source=%s",
+        result.identity.provider,
+        result.identity.company_id,
+        result.source,
+    )
+    return result.identity, None
 
 
 async def _resolve_relay_sender(
@@ -1966,6 +2083,21 @@ async def _forward_text_to_chatwoot(
                 if routing_error is not None:
                     _raise_inbound_tenant_route_error(event, routing_error, action="reply")
 
+    if _inbound_mode_forces_general():
+        # One-inbox display rollback: drop any branch destination and any
+        # cross-inbox conversation, so nothing is shown in — or threaded into —
+        # an inbox the operator is not looking at.
+        inbox_id = None
+        exact_conversation_id = None
+        destination_route = ChatwootRoute.GENERAL
+    elif exact_conversation_id is None and inbox_id is None:
+        affinity_inbox, affinity_route, affinity_error = await _inbound_affinity_inbox(session, phone_e164)
+        if affinity_error is not None:
+            _raise_inbound_tenant_route_error(event, affinity_error, action="reply")
+        if affinity_inbox is not None:
+            inbox_id = affinity_inbox
+            destination_route = affinity_route
+
     if exact_conversation_id is None and inbox_id is None:
         inbox_id, routing_error = _inbound_general_inbox()
         if routing_error is not None:
@@ -2335,6 +2467,23 @@ async def _forward_reaction_to_chatwoot(
         if routing_error is not None:
             _raise_inbound_tenant_route_error(event, routing_error, action="reaction")
     else:
+        # Unknown reaction target: same evidence rules as a contextless text.
+        affinity_inbox, affinity_route, affinity_error = await _inbound_affinity_inbox(session, phone_e164)
+        if affinity_error is not None:
+            _raise_inbound_tenant_route_error(event, affinity_error, action="reaction")
+        if affinity_inbox is not None:
+            inbox_id = affinity_inbox
+            destination_route = affinity_route
+        else:
+            inbox_id, routing_error = _inbound_general_inbox()
+            if routing_error is not None:
+                _raise_inbound_tenant_route_error(event, routing_error, action="reaction")
+
+    if _inbound_mode_forces_general():
+        # One-inbox display rollback, reactions included: never thread a
+        # reaction into a conversation living in another inbox.
+        exact_conversation_id = None
+        destination_route = ChatwootRoute.GENERAL
         inbox_id, routing_error = _inbound_general_inbox()
         if routing_error is not None:
             _raise_inbound_tenant_route_error(event, routing_error, action="reaction")
@@ -2869,6 +3018,22 @@ async def _prepare_operator_relay(event_id: int, provider: WhatsAppProvider) -> 
                 return _PreparedRelay(outbox_id=None)
 
             tenant_hint, hint_err = _company_hint_from_inbox(chatwoot_inbox_id)
+
+            # PR-7.2: a reply typed in the validated General inbox.
+            #
+            # General is a real, separately validated inbox — not an arbitrary
+            # unmapped one — but it is deliberately absent from the branch map,
+            # so the lookup above ends in `inbox_mapping_missing` and the reply
+            # dies there (production event 20794). Resolve the branch from the
+            # customer's own proven history instead. An arbitrary unmapped
+            # inbox keeps failing exactly as before.
+            if hint_err == "operator_relay: inbox_mapping_missing":
+                tenant_hint, hint_err = await _general_relay_tenant_hint(
+                    session,
+                    chatwoot_inbox_id=chatwoot_inbox_id,
+                    phone_e164=phone_e164,
+                )
+
             if hint_err is not None:
                 logger.warning(
                     "operator_relay: inbox routing error conv_id=%s msg_id=%s inbox_id=%s: %s",
