@@ -523,6 +523,31 @@ class Settings(BaseSettings):
     # until PR-6; with it off the normalizer still keeps Client/Record current.
     easyweek_notifications_enabled: bool = False
 
+    # --- PR-8: reminders ------------------------------------------------------
+    # TWO more independent gates, both fail-closed, and deliberately NOT one
+    # flag. They govern different halves of the pipeline and are turned on at
+    # different times during rollout:
+    #
+    #   easyweek_reminders_enabled           -> ONLY planning new reminder jobs
+    #                                           (read by the easyweek inbox worker)
+    #   easyweek_reminder_api_guard_enabled  -> the SEND FENCE for those jobs
+    #                                           (read by the shared outbox worker)
+    #
+    # The rollout that this split exists for: turn planning on with the fence
+    # still closed, so real reminder jobs accumulate as `queued` and can be
+    # inspected by the read-only preflight against the live EasyWeek API before
+    # a single message is sent. Only a green preflight opens the fence.
+    #
+    # Planning additionally requires easyweek_notifications_enabled: a reminder
+    # is a customer notification, and the master notification switch must not be
+    # bypassed by a second flag.
+    easyweek_reminders_enabled: bool = False
+    # False means EasyWeek reminder jobs are not claimed at all — they stay
+    # `queued`, spend no attempts and keep their run_at. It is NOT a way to send
+    # without the guard: when this is true the API guard still runs before every
+    # single Meta attempt. There is no mode that sends a reminder unverified.
+    easyweek_reminder_api_guard_enabled: bool = False
+
     # PR-7.1: exact EasyWeek service-category allowlist as a JSON array of
     # strings. Parsing is deliberately deferred to the shared eligibility
     # helper so malformed input suppresses EasyWeek jobs without preventing the

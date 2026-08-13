@@ -72,6 +72,13 @@ services:
   # NOTE: `docker compose restart` does NOT re-read env_file — changing the
   # EasyWeek booking URL or language requires
   # `up -d --force-recreate altegio-outbox-worker`.
+  #
+  # PR-8: this service reads EASYWEEK_REMINDER_API_GUARD_ENABLED (the send
+  # fence) and, because every reminder is verified against the live API before
+  # it is sent, EASYWEEK_API_KEY / EASYWEEK_WORKSPACE_SLUG. Those two are
+  # already in easyweek.env, which this service already loads — no new service
+  # and no new secret distribution. Reminder PLANNING is a different flag on a
+  # different service; see altegio-easyweek-inbox-worker below.
   altegio-outbox-worker:
     build: .
     restart: always
@@ -145,6 +152,10 @@ services:
   #
   # NOTE: `docker compose restart` does NOT re-read env_file — flipping any
   # EASYWEEK_* flag requires `up -d --force-recreate altegio-easyweek-inbox-worker`.
+  #
+  # PR-8: this service reads EASYWEEK_REMINDERS_ENABLED (reminder PLANNING).
+  # The send fence, EASYWEEK_REMINDER_API_GUARD_ENABLED, is read by
+  # altegio-outbox-worker instead — recreate that one when flipping it.
   altegio-easyweek-inbox-worker:
     build: .
     restart: always

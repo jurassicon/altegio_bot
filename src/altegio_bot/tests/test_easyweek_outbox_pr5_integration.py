@@ -49,10 +49,13 @@ from altegio_bot.delivery_retry_identity import (
     retry_outbox_audit_mismatch,
 )
 from altegio_bot.easyweek_branches import BRANCH_PROFILES, BranchProfile, branch_template_contract
+from altegio_bot.easyweek_client import EasyWeekConfigError, EasyWeekRetryableError
 from altegio_bot.easyweek_locations import EasyWeekLocation
 from altegio_bot.easyweek_normalizer import canonical_booking_uuid, normalize_event
 from altegio_bot.easyweek_policy import (
+    EASYWEEK_CUSTOMER_JOB_TYPES,
     EASYWEEK_LIFECYCLE_JOB_TYPES,
+    EASYWEEK_REMINDER_JOB_TYPES,
     easyweek_job_type_error,
     validate_static_booking_page,
 )
@@ -90,6 +93,7 @@ from altegio_bot.tests.easyweek_fixtures import (
     booking_rescheduled,
     booking_updated,
 )
+from altegio_bot.utils import utcnow
 from altegio_bot.whatsapp_routing import pick_sender_id, pick_sender_id_by_code
 from altegio_bot.workers import campaign_worker
 from altegio_bot.workers import easyweek_inbox_worker as eyw_worker
@@ -2807,15 +2811,355 @@ async def test_a_valid_manage_link_survives_an_invalid_static_page(
 
 
 # ---------------------------------------------------------------------------
+# 11b. PR-8: the send fence and the mandatory API guard
+# ---------------------------------------------------------------------------
+#
+# Two separate protections, and they fail in different directions on purpose.
+#
+# The FENCE (`EASYWEEK_REMINDER_API_GUARD_ENABLED=false`) keeps reminders out of
+# the claim query entirely, so a rollout can accumulate real jobs and inspect
+# them before anything is sent. Claim-and-requeue would have spun the worker and
+# disturbed exactly the state the preflight needs to read.
+#
+# The GUARD runs on every claimed reminder, before the phone, the render, the
+# attempt counter and Meta. A reminder is planned hours or days ahead; by the
+# time it fires, the appointment may have moved, been cancelled or been
+# completed without a webhook we saw.
+
+REMINDER_STARTS_AT = datetime(2026, 9, 14, 8, 30, tzinfo=timezone.utc)
+
+
+class _Reader:
+    """Stand-in for EasyWeekClient.get_booking. Read-only by construction."""
+
+    def __init__(self, payload: dict | None = None, *, error: Exception | None = None) -> None:
+        self.payload = payload
+        self.error = error
+        self.calls: list[str] = []
+
+    async def get_booking(self, booking_uuid: str) -> dict:
+        self.calls.append(booking_uuid)
+        if self.error is not None:
+            raise self.error
+        return self.payload if self.payload is not None else _booking_api_payload()
+
+    async def aclose(self) -> None:
+        return None
+
+
+def _booking_api_payload(**overrides) -> dict:
+    payload = {
+        "uuid": str(EASYWEEK_BOOKING_UUID),
+        "location_uuid": EASYWEEK_LOCATION_UUID_VALUE,
+        "start_time": REMINDER_STARTS_AT.isoformat(),
+        "is_canceled": False,
+        "is_completed": False,
+    }
+    payload.update(overrides)
+    return payload
+
+
+EASYWEEK_BOOKING_UUID = uuid.UUID("11111111-2222-4333-8444-555555555555")
+# The registry entry `_pr5_settings` configures for COLLIDING_COMPANY_ID. Taken
+# from there rather than restated, so a fixture change cannot leave the guard
+# tests silently proving the wrong branch.
+EASYWEEK_LOCATION_UUID_VALUE = "cccccccc-dddd-4eee-8fff-000000000001"
+
+
+@pytest.fixture
+def _reader(monkeypatch: pytest.MonkeyPatch) -> _Reader:
+    """Replace the real client with a fake, so no test touches the API."""
+    reader = _Reader()
+    monkeypatch.setattr(ow, "EasyWeekClient", lambda *a, **k: reader)
+    return reader
+
+
+async def _seed_reminder_job(
+    db: AsyncSession,
+    *,
+    job_type: str = "reminder_24h",
+    starts_at: datetime = REMINDER_STARTS_AT,
+    planned_start: datetime | None = None,
+    company_id: int = COLLIDING_COMPANY_ID,
+    status: str = "queued",
+    run_at: datetime | None = None,
+    record: Record | None = None,
+    client: Client | None = None,
+) -> MessageJob:
+    # In production both reminders hang off ONE booking, and the booking uuid is
+    # unique per record — so a caller wanting a second reminder passes the same
+    # rows rather than seeding a colliding record.
+    if client is None:
+        client = await _seed_easyweek_client(db, company_id=company_id)
+    if record is None:
+        record = await _seed_easyweek_record(db, client, company_id=company_id, starts_at=starts_at)
+    # Derived from the branch profile the fixtures register for this company, so
+    # the row's name, body and footer all belong to one branch — the same
+    # contract the lifecycle rows are held to.
+    contract = branch_template_contract(BRANCH_PROFILES["colliding"], job_type)
+    assert contract is not None, f"no branch contract for {job_type}"
+    db.add(
+        _template(
+            provider=PROVIDER_EASYWEEK,
+            company_id=company_id,
+            code=job_type,
+            meta_template_name=contract.meta_template_name,
+        )
+    )
+    existing_sender = (
+        (
+            await db.execute(
+                select(WhatsAppSender)
+                .where(WhatsAppSender.provider == PROVIDER_EASYWEEK)
+                .where(WhatsAppSender.company_id == company_id)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if existing_sender is None:
+        db.add(_sender(provider=PROVIDER_EASYWEEK, company_id=company_id, phone_number_id="eyw-phone-id"))
+    await db.flush()
+
+    job = await _seed_job(
+        db,
+        provider=PROVIDER_EASYWEEK,
+        company_id=company_id,
+        job_type=job_type,
+        record=record,
+        client=client,
+        dedupe_key=f"eyw-reminder-{job_type}-{company_id}",
+    )
+    job.status = status
+    job.run_at = run_at or (utcnow() - timedelta(minutes=1))
+    job.payload = {
+        "provider": "easyweek",
+        "booking_uuid": str(EASYWEEK_BOOKING_UUID),
+        "company_id": company_id,
+        "job_type": job_type,
+        "record_starts_at": (planned_start or starts_at).isoformat(),
+    }
+    await db.flush()
+    return job
+
+
+# --- the fence --------------------------------------------------------------
+
+
+async def test_the_closed_fence_leaves_due_reminders_unclaimed(db: AsyncSession, monkeypatch) -> None:
+    monkeypatch.setattr(settings, "easyweek_reminder_api_guard_enabled", False, raising=False)
+    job = await _seed_reminder_job(db)
+
+    claimed = await ow._lock_next_jobs(db, 10)
+
+    assert [j.id for j in claimed] == [], "a reminder must not be claimed with the fence shut"
+    await db.refresh(job)
+    assert job.status == "queued", "left exactly as planned, for the preflight to read"
+    assert job.attempts == 0, "an unclaimed job spends no attempts"
+    assert job.locked_at is None
+
+
+async def test_the_closed_fence_does_not_block_lifecycle_or_altegio_jobs(db: AsyncSession, monkeypatch) -> None:
+    """The predicate is narrow; everything else keeps flowing."""
+    monkeypatch.setattr(settings, "easyweek_reminder_api_guard_enabled", False, raising=False)
+
+    reminder = await _seed_reminder_job(db)
+    lifecycle = await _seed_easyweek_happy_path(db, company_id=COLLIDING_COMPANY_ID + 1)
+    lifecycle.run_at = utcnow() - timedelta(minutes=1)
+    altegio = await _seed_altegio_happy_path(db)
+    altegio.run_at = utcnow() - timedelta(minutes=1)
+    await db.flush()
+
+    claimed_ids = {j.id for j in await ow._lock_next_jobs(db, 10)}
+
+    assert lifecycle.id in claimed_ids, "EasyWeek lifecycle jobs are unaffected"
+    assert altegio.id in claimed_ids, "Altegio jobs are unaffected"
+    assert reminder.id not in claimed_ids
+
+
+async def test_the_open_fence_admits_the_reminder(db: AsyncSession, monkeypatch) -> None:
+    monkeypatch.setattr(settings, "easyweek_reminder_api_guard_enabled", True, raising=False)
+    job = await _seed_reminder_job(db)
+
+    claimed_ids = {j.id for j in await ow._lock_next_jobs(db, 10)}
+
+    assert job.id in claimed_ids
+
+
+# --- the guard --------------------------------------------------------------
+
+
+async def test_a_proven_reminder_is_sent_with_its_branch_template(
+    db: AsyncSession, capture: CaptureProvider, _reader: _Reader, monkeypatch
+) -> None:
+    monkeypatch.setattr(settings, "easyweek_reminder_api_guard_enabled", True, raising=False)
+    job = await _seed_reminder_job(db)
+
+    await _run_job(db, job)
+
+    assert job.status == "done", job.last_error
+    assert _reader.calls == [str(EASYWEEK_BOOKING_UUID)], "exactly one read-only lookup"
+    assert len(capture.template_calls) == 1
+    call = capture.template_calls[0]
+    assert call["template_name"] == "kitilash_cc_reminder_24h_v1"
+    assert len(call["params"]) == 6, "the approved reminder signature"
+
+
+@pytest.mark.parametrize(
+    ("label", "payload"),
+    [
+        ("canceled", _booking_api_payload(is_canceled=True)),
+        ("completed", _booking_api_payload(is_completed=True)),
+        ("moved", _booking_api_payload(start_time="2026-09-14T09:30:00+00:00")),
+        ("other-booking", _booking_api_payload(uuid="99999999-8888-4777-8666-555555555555")),
+        ("other-branch", _booking_api_payload(location_uuid="bbbbbbbb-cccc-4ddd-8eee-ffffffffffff")),
+        ("string-flag", _booking_api_payload(is_canceled="false")),
+        ("missing-flag", {k: v for k, v in _booking_api_payload().items() if k != "is_completed"}),
+    ],
+)
+async def test_a_refused_reminder_never_reaches_meta(
+    db: AsyncSession, capture: CaptureProvider, _reader: _Reader, monkeypatch, label: str, payload: dict
+) -> None:
+    monkeypatch.setattr(settings, "easyweek_reminder_api_guard_enabled", True, raising=False)
+    _reader.payload = payload
+    job = await _seed_reminder_job(db)
+
+    await _run_job(db, job)
+
+    assert job.status == "canceled", label
+    assert job.attempts == 0, f"{label}: a refusal must not spend a Meta attempt"
+    assert capture.template_calls == [], label
+    assert capture.text_calls == [], label
+    assert await _outbox_rows(db, job) == [], label
+    assert "easyweek_reminder_guard:" in (job.last_error or ""), label
+
+
+async def test_a_temporarily_unavailable_api_requeues_without_an_attempt(
+    db: AsyncSession, capture: CaptureProvider, _reader: _Reader, monkeypatch
+) -> None:
+    monkeypatch.setattr(settings, "easyweek_reminder_api_guard_enabled", True, raising=False)
+    _reader.error = EasyWeekRetryableError("timeout", operation="get_booking", status_code=503)
+    job = await _seed_reminder_job(db)
+
+    await _run_job(db, job)
+
+    assert job.status == "queued", "nothing is known to be wrong; try again later"
+    assert job.attempts == 0
+    assert capture.template_calls == []
+    assert await _outbox_rows(db, job) == []
+
+
+async def test_missing_api_credentials_never_send_the_reminder(
+    db: AsyncSession, capture: CaptureProvider, monkeypatch
+) -> None:
+    """We could not ask, so we do not send — and we do not fail terminally."""
+    monkeypatch.setattr(settings, "easyweek_reminder_api_guard_enabled", True, raising=False)
+
+    def _no_client(*args, **kwargs):
+        raise EasyWeekConfigError("EASYWEEK_API_KEY is not configured")
+
+    monkeypatch.setattr(ow, "EasyWeekClient", _no_client)
+    job = await _seed_reminder_job(db)
+
+    await _run_job(db, job)
+
+    assert job.status == "queued"
+    assert capture.template_calls == []
+
+
+async def test_the_guard_runs_before_the_attempt_counter_and_the_render(
+    db: AsyncSession, capture: CaptureProvider, _reader: _Reader, monkeypatch
+) -> None:
+    """No customer-facing value may be built for a reminder we cannot prove."""
+    monkeypatch.setattr(settings, "easyweek_reminder_api_guard_enabled", True, raising=False)
+    _reader.payload = _booking_api_payload(is_canceled=True)
+    rendered = AsyncMock(side_effect=AssertionError("nothing may be rendered for a refused reminder"))
+    monkeypatch.setattr(ow, "_render_message", rendered)
+
+    job = await _seed_reminder_job(db)
+    await _run_job(db, job)
+
+    assert job.status == "canceled"
+    assert job.attempts == 0
+    rendered.assert_not_awaited()
+
+
+async def test_a_record_moved_after_planning_is_caught_without_an_api_call(
+    db: AsyncSession, capture: CaptureProvider, _reader: _Reader, monkeypatch
+) -> None:
+    monkeypatch.setattr(settings, "easyweek_reminder_api_guard_enabled", True, raising=False)
+    job = await _seed_reminder_job(
+        db,
+        starts_at=REMINDER_STARTS_AT + timedelta(hours=3),
+        planned_start=REMINDER_STARTS_AT,
+    )
+
+    await _run_job(db, job)
+
+    assert job.status == "canceled"
+    assert _reader.calls == [], "a locally provable mismatch costs no API call"
+    assert capture.template_calls == []
+
+
+async def test_a_category_that_turned_disallowed_blocks_the_reminder_before_the_guard(
+    db: AsyncSession, capture: CaptureProvider, _reader: _Reader, monkeypatch
+) -> None:
+    monkeypatch.setattr(settings, "easyweek_reminder_api_guard_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_allowed_service_categories", json.dumps(["Something Else"]), raising=False)
+    job = await _seed_reminder_job(db)
+
+    await _run_job(db, job)
+
+    assert job.status == "canceled"
+    assert capture.template_calls == []
+    assert _reader.calls == [], "eligibility is local; it must not cost an API call"
+
+
+async def test_no_guard_result_is_ever_reused_across_sends(
+    db: AsyncSession, capture: CaptureProvider, _reader: _Reader, monkeypatch
+) -> None:
+    """A proof is about one moment; the next send re-proves from scratch.
+
+    Driven with the booking's two reminders: the 24h one is proven and sent,
+    then the booking is cancelled, and the 2h one must be refused rather than
+    inheriting the earlier positive answer.
+    """
+    monkeypatch.setattr(settings, "easyweek_reminder_api_guard_enabled", True, raising=False)
+    first_client = await _seed_easyweek_client(db)
+    first_record = await _seed_easyweek_record(db, first_client, starts_at=REMINDER_STARTS_AT)
+    first = await _seed_reminder_job(db, job_type="reminder_24h", record=first_record, client=first_client)
+    await _run_job(db, first)
+    assert first.status == "done", first.last_error
+    assert len(_reader.calls) == 1
+
+    _reader.payload = _booking_api_payload(is_canceled=True)
+    second = await _seed_reminder_job(
+        db,
+        job_type="reminder_2h",
+        record=first_record,
+        client=first_client,
+    )
+
+    await _run_job(db, second)
+
+    assert len(_reader.calls) == 2, "the second send asks the API again"
+    assert second.status == "canceled"
+    assert len(capture.template_calls) == 1, "only the proven reminder was sent"
+
+
+# ---------------------------------------------------------------------------
 # 12. Early EasyWeek job-type allowlist
 # ---------------------------------------------------------------------------
 
+# PR-8 moved reminder_24h/reminder_2h OUT of this list — they are now EasyWeek
+# customer notifications with their own planner, send fence and API guard. What
+# stays here is everything that still calls something EasyWeek has no
+# equivalent for: the Altegio API, an Altegio-keyed BOOKING_LINKS entry, or a
+# campaign runner built around Altegio client ids.
 _DISALLOWED_EASYWEEK_JOB_TYPES = [
     "review_3d",
     "repeat_10d",
     "comeback_3d",
-    "reminder_24h",
-    "reminder_2h",
     "promo_eligibility_check",
     "promo_apply_existing_booking",
     "promo_card_booking_reminder",
@@ -2823,6 +3167,26 @@ _DISALLOWED_EASYWEEK_JOB_TYPES = [
     "newsletter_new_clients_monthly",
     CAMPAIGN_EXECUTION_JOB_TYPE,
 ]
+
+
+@pytest.mark.parametrize("job_type", ["reminder_24h", "reminder_2h"])
+async def test_reminders_are_now_inside_the_easyweek_allowlist(job_type: str) -> None:
+    """PR-8 admits exactly two new job types, and nothing else moved."""
+    assert easyweek_job_type_error(PROVIDER_EASYWEEK, job_type) is None
+    assert job_type in EASYWEEK_REMINDER_JOB_TYPES
+    assert job_type not in EASYWEEK_LIFECYCLE_JOB_TYPES, "reminders must not inherit the lifecycle seven-field contract"
+
+
+async def test_the_easyweek_allowlist_is_exactly_lifecycle_plus_reminders() -> None:
+    """A new customer notification kind has one place to be registered."""
+    assert EASYWEEK_CUSTOMER_JOB_TYPES == EASYWEEK_LIFECYCLE_JOB_TYPES | EASYWEEK_REMINDER_JOB_TYPES
+    assert EASYWEEK_CUSTOMER_JOB_TYPES == {
+        "record_created",
+        "record_updated",
+        "record_canceled",
+        "reminder_24h",
+        "reminder_2h",
+    }
 
 
 @pytest.mark.parametrize("job_type", _DISALLOWED_EASYWEEK_JOB_TYPES)

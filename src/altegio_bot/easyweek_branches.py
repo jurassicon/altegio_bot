@@ -43,12 +43,18 @@ RECORD_CREATED: Final = "record_created"
 RECORD_CREATED_NEW_CLIENT: Final = "record_created_new_client"
 RECORD_UPDATED: Final = "record_updated"
 RECORD_CANCELED: Final = "record_canceled"
+# PR-8. Seeded per branch exactly like the lifecycle codes, so a reminder is
+# bound to one branch's Meta name, body and footer by the same contract.
+REMINDER_24H: Final = "reminder_24h"
+REMINDER_2H: Final = "reminder_2h"
 
 BRANCH_TEMPLATE_CODES: Final = (
     RECORD_CREATED,
     RECORD_CREATED_NEW_CLIENT,
     RECORD_UPDATED,
     RECORD_CANCELED,
+    REMINDER_24H,
+    REMINDER_2H,
 )
 
 PRE_APPOINTMENT_NOTES_DE: Final = (
@@ -201,6 +207,26 @@ def branch_template_contract(profile: BranchProfile, template_code: str) -> Bran
             "Ihr Termin am {date} um {time} Uhr wurde storniert.\n"
             "{services}\n\n"
             f"Neuen Termin buchen: {{booking_link}}{footer}"
+        ),
+        # Six positional parameters, in the order the approved Meta reminder
+        # templates use: client_name, staff_name, date, time, services, link.
+        REMINDER_24H: (
+            "*{client_name}, hallo! Wir erinnern an Ihren Termin morgen:*\n\n"
+            "*Mitarbeiterin:* {staff_name}\n"
+            "*Datum:* {date}\n"
+            "*Zeit:* {time}\n"
+            "*Service:*\n"
+            "{services}\n\n"
+            f"Termin verwalten: {{booking_link}}{footer}"
+        ),
+        REMINDER_2H: (
+            "*{client_name}, hallo! Ihr Termin ist in 2 Stunden:*\n\n"
+            "*Mitarbeiterin:* {staff_name}\n"
+            "*Datum:* {date}\n"
+            "*Zeit:* {time}\n"
+            "*Service:*\n"
+            "{services}\n\n"
+            f"Termin verwalten: {{booking_link}}{footer}"
         ),
     }
     return BranchTemplateContract(

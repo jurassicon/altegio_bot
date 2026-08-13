@@ -183,6 +183,30 @@ LIFECYCLE_PARAM_FIELDS: dict[str, tuple[str, ...]] = {
         "services",
         "booking_link",
     ),
+    # PR-8 reminders. Six positional parameters in the order the approved Meta
+    # reminder templates already use (see template_validation), so the DB row
+    # and the WABA template agree without either being changed.
+    #
+    # The last field is `booking_link`, NOT `short_link`: for EasyWeek that slot
+    # holds the link re-verified at send time — the manage link when its
+    # booking-hash pair still proves out, and the branch's static booking page
+    # otherwise. A raw stored `short_link` would be a value nobody re-checked.
+    "reminder_24h": (
+        "client_name",
+        "staff_name",
+        "date",
+        "time",
+        "services",
+        "booking_link",
+    ),
+    "reminder_2h": (
+        "client_name",
+        "staff_name",
+        "date",
+        "time",
+        "services",
+        "booking_link",
+    ),
 }
 
 

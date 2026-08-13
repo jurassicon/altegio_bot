@@ -136,6 +136,17 @@ _LIFECYCLE_RULES: dict[str, _TemplateRule] = {
         5,
         ["client_name", "date", "time", "services", "booking_link"],
     ),
+    # PR-8. Same six positional slots as the approved reminder templates above,
+    # with the link slot named `booking_link` because EasyWeek fills it with the
+    # link re-verified at send time rather than a stored `short_link`.
+    "reminder_24h": (
+        6,
+        ["client_name", "staff_name", "date", "time", "services", "booking_link"],
+    ),
+    "reminder_2h": (
+        6,
+        ["client_name", "staff_name", "date", "time", "services", "booking_link"],
+    ),
 }
 
 
