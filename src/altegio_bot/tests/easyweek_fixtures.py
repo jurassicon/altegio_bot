@@ -24,6 +24,7 @@ below — deliberately NOT the production location id.
 from __future__ import annotations
 
 import copy
+from decimal import Decimal
 from typing import Any
 
 # A test location id that is deliberately NOT the production one. The real
@@ -115,8 +116,12 @@ def _base_payload() -> dict[str, Any]:
         "company_logo": "https://example.invalid/logo.png",
         "ref_title": "Fixture",
         # --- money -----------------------------------------------------------
-        "booking_price": "35.00",
-        "booking_price_int": 3500,
+        # The confirmed production shape: `booking_price` is the authoritative
+        # storage value in exact minor units, `booking_price_int` is the MAJOR
+        # unit count (35, not 3500), `booking_price_float` is the major-unit
+        # projection and `booking_price_formatted` is localized display text.
+        "booking_price": "3500",
+        "booking_price_int": 35,
         "booking_price_float": "35.00",
         "booking_price_formatted": "€35.00",
         "booking_price_currency": "EUR",
@@ -141,6 +146,50 @@ def _base_payload() -> dict[str, Any]:
         "utm_content": "",
         "utm_term": "",
     }
+
+
+# ---------------------------------------------------------------------------
+# Price helpers — one place that knows the confirmed field shape
+# ---------------------------------------------------------------------------
+#
+# Production capture settled what each field means: for 120.00 € EasyWeek sends
+# `booking_price_int=120`, `booking_price="12000"`, `booking_price_float="120.00"`
+# and `booking_price_formatted="€120.00"`. Tests set prices through these
+# helpers so no test can accidentally re-assert the old "int is cents" theory
+# by writing a single field.
+
+PRICE_FIELDS = (
+    "booking_price",
+    "booking_price_int",
+    "booking_price_float",
+    "booking_price_formatted",
+)
+
+
+def set_booking_price(payload: dict[str, Any], minor_units: int) -> dict[str, Any]:
+    """Write the whole price quartet for an exact minor-unit amount."""
+    major = (Decimal(minor_units) / Decimal(100)).quantize(Decimal("0.01"))
+    payload["booking_price"] = str(minor_units)
+    # Mirrors the confirmed shape. The parser never reads this field; it is here
+    # so fixtures look like real deliveries, not so anything depends on it.
+    payload["booking_price_int"] = int(major)
+    payload["booking_price_float"] = f"{major:.2f}"
+    payload["booking_price_formatted"] = f"€{major:.2f}"
+    return payload
+
+
+def clear_booking_price(payload: dict[str, Any]) -> dict[str, Any]:
+    """An explicit, self-consistent clear: every price field present and null."""
+    for key in PRICE_FIELDS:
+        payload[key] = None
+    return payload
+
+
+def drop_booking_price(payload: dict[str, Any]) -> dict[str, Any]:
+    """A partial delivery that mentions no price at all."""
+    for key in PRICE_FIELDS:
+        payload.pop(key, None)
+    return payload
 
 
 def booking_created() -> dict[str, Any]:
@@ -213,5 +262,5 @@ def booking_created_multi_service() -> dict[str, Any]:
     payload["services_count"] = 2
     payload["services_description"] = "Fixture Service, Second Fixture Service"
     payload["service_name"] = "Fixture Service"
-    payload["booking_price_int"] = 8000
+    set_booking_price(payload, 8000)
     return payload

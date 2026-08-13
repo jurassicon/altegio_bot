@@ -2089,3 +2089,237 @@ LIMIT 10;
 **Событие 20794 (conversation 230, message 9343) терминально и не
 переигрывается.** Проверка выполняется новым сообщением с новым Chatwoot
 message ID.
+
+
+---
+
+## 11. PR-7.3 — корректный контракт цены EasyWeek
+
+### 11.1 Что было сломано
+
+Для реальной цены `120.00 €` EasyWeek присылает четвёрку полей:
+
+```text
+booking_price_int:       120        # МАЖОРНЫЕ единицы, не центы
+booking_price:           "12000"    # storage format: точные минорные единицы
+booking_price_float:     "120.00"   # мажорная проекция
+booking_price_formatted: "€120.00"  # локализованный display text
+```
+
+Старый normalizer делил `booking_price_int` на 100 и сохранял `1.20`. То есть
+любая EasyWeek-запись, созданная до PR-7.3, держит цену в сто раз меньше
+реальной — и в `records.total_cost`, и в `record_services.cost_to_pay`.
+Клиентский шаблон рендерится именно из service-строки, поэтому дефект дошёл бы
+до клиента.
+
+### 11.2 Действующий контракт парсера
+
+- **authoritative** — `booking_price`. Только строка из одних цифр; парсится
+  целочисленной арифметикой. Запятая, точка, валюта, экспонента, пробелы,
+  JSON-число и `bool` отклоняются как `invalid_payload`; отрицательное значение
+  и выход за `Numeric(12, 2)` — как `invalid_numeric_range`.
+- **cross-check** — `booking_price_float`. Если поле пришло, оно обязано
+  описывать ту же сумму; расхождение — `price_fields_conflict`.
+- **никогда не источник** — `booking_price_formatted` и `booking_price_int`.
+- Присутствие цены определяется ключом `booking_price`: поля нет → цена
+  не менялась; `booking_price: null` при непротиворечивых остальных полях →
+  цена очищается; `"0"` → настоящий ноль.
+- Ни один код ошибки не содержит саму сумму.
+
+### 11.3 Rollout: порядок обязателен
+
+Флаг остаётся выключенным до конца шага 8.
+
+**1. Подтвердить effective config ДО deploy.** Значение читается из процесса,
+не из файла:
+
+```bash
+docker compose -p altegio_bot exec -T altegio-api /app/.venv/bin/python -c 'from altegio_bot.settings import settings; print("notifications_enabled=", settings.easyweek_notifications_enabled)'
+```
+
+Требуется `notifications_enabled= False`. Если `True` — выставить в
+`easyweek.env` `EASYWEEK_NOTIFICATIONS_ENABLED=false`, пересоздать сервисы и
+повторить проверку. С известной ошибкой цены включённые уведомления
+запрещены.
+
+**2. Deploy исправления** обычным порядком по разделу 4. Сам deploy ничего не
+чинит в данных: он только ставит правильный парсер.
+
+**3. Read-only audit.** Ничего не меняет:
+
+```bash
+docker compose -p altegio_bot exec -T altegio-api /app/.venv/bin/python -m altegio_bot.scripts.easyweek_price_repair
+```
+
+Вывод — только счётчики и технические ID:
+
+```text
+{'mode': 'dry-run', 'scanned': N, 'repairable': K, 'repaired': 0,
+ 'skipped': {...}, 'repairable_record_ids': [...],
+ 'evidence_event_ids': [...]}
+```
+
+`repairable` — строки, у которых доказана сигнатура именно этого бага. Всё
+остальное попадает в `skipped` с причиной и **не будет** тронуто:
+
+| Причина | Что означает |
+| --- | --- |
+| `no_booking_uuid` | нет канонической identity |
+| `no_usable_evidence` | нет доставки, которая вообще могла записать цену (см. 11.3a) |
+| `not_exactly_one_service` | ноль или несколько service-строк: сумму не к чему привязать |
+| `inconsistent_service_snapshot` | `total_cost` и `cost_to_pay` уже расходятся — отдельная проблема |
+| `already_correct` | цена уже правильная |
+| `legacy_signature_mismatch` | сохранённое значение не равно результату старой формулы: значение писал кто-то ещё |
+| `ambiguous_evidence` | несколько допустимых доставок одинаково объясняют сохранённое значение, но называют разные цены |
+
+#### 11.3a Какие события допускаются как evidence
+
+Кандидатом считается доставка этой же booking UUID, которая:
+
+- имеет `status='processed'` — `captured`/`received`/`processing` ещё не
+  доработали, а `failed` не записывал вообще ничего;
+- имеет lifecycle-хинт (`booking-created`, `booking-updated`,
+  `booking-rescheduled`, `booking-canceled`). `booking-succeeded` исключён:
+  normalizer возвращает по нему `None`, и worker помечает событие `processed`,
+  не тронув Client, Record и MessageJob;
+- не truncated;
+- разбирается исправленным парсером и реально несёт цену.
+
+**`processed` не означает «записал».** Worker помечает доставку `processed` и
+выходит без domain write ещё в трёх случаях: `booking-succeeded`, точный replay
+(`already_applied` — Resend байт-идентичен) и update, пришедший после отмены
+записи (`is_cancel_terminal`). Схема не хранит, какая именно доставка выполнила
+запись, и repair этого не выдумывает.
+
+Поэтому решение принимается не по одной доставке:
+
+1. собираются **все** кандидаты;
+2. остаются те, у которых старая формула воспроизводит текущее сохранённое
+   `Record.total_cost`;
+3. если таких нет — `legacy_signature_mismatch`;
+4. если все они называют одну и ту же исправленную цену — repair разрешён;
+5. если называют разные — `ambiguous_evidence`, строка не меняется.
+
+Это не теория: `booking_price_int` считает целые евро, поэтому `120.00` и
+`120.50` дают одну и ту же старую сигнатуру `1.20`. Выбор «самого нового
+события» записал бы `120.50` там, где верно `120.00`. `event.id` используется
+только как стабильная метка в отчёте и **никогда** не выбирает сумму.
+
+Если `ambiguous_evidence` встречается, разбирать такие booking поимённо по
+`repairable_record_ids`/`evidence_event_ids` и `easyweek_events`; массового
+автоматического решения для них нет и не будет.
+
+**4. Backup / фиксация восстановимых значений.** До `--apply` сохранить текущее
+состояние кандидатов, чтобы откат был арифметически проверяем:
+
+```bash
+docker compose -p altegio_bot exec -T postgres sh -lc 'psql -tAX -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "COPY (SELECT r.id, r.total_cost, rs.id, rs.cost_to_pay FROM records r JOIN record_services rs ON rs.record_id = r.id WHERE r.provider = '"'"'easyweek'"'"') TO STDOUT WITH CSV" ' > easyweek_prices_before.csv
+```
+
+Этот CSV содержит суммы: хранить как обычный production dump, не пересылать в
+чаты и не прикладывать к тикетам.
+
+**5. Explicit repair.** Только после успешного audit:
+
+```bash
+docker compose -p altegio_bot exec -T altegio-api /app/.venv/bin/python -m altegio_bot.scripts.easyweek_price_repair --apply
+```
+
+Ожидается `repaired == repairable` из шага 3, либо меньше — если между audit и
+apply worker успел записать новые корректные цены (см. 11.3b). Команда не
+создаёт и не переоткрывает job, ничего не отправляет и не меняет статус
+`easyweek_events`.
+
+**6. Проверка идемпотентности.** Повторный `--apply` обязан дать
+`repaired: 0` и `already_correct` на тех же строках.
+
+#### 11.3b Concurrency: останавливать ли обработку
+
+**Останавливать EasyWeek inbox worker не требуется.** `EASYWEEK_PROCESSING_ENABLED`
+может оставаться `true`: корректность обеспечена на уровне строк, а не режимом
+обслуживания.
+
+- audit (`dry-run`) **не берёт write-блокировок** вообще — его безопасно
+  запускать на нагруженной БД, он не может заблокировать worker;
+- `--apply` берёт `SELECT ... FOR UPDATE` на `records`, затем на связанные
+  `record_services` — тот же порядок блокировок, что и у `upsert_record`, —
+  и **заново** собирает evidence и переклассифицирует строку уже под
+  блокировкой;
+- значение, вычисленное до блокировки, не записывается никогда;
+- обход — read-only keyset-страница по `records.id`, дальше по одной короткой
+  транзакции на запись, поэтому долгих удержаний блокировок нет.
+
+Практический смысл: если worker успел сохранить новую корректную цену, пока
+repair ждал блокировку, сохранённое значение перестаёт соответствовать старой
+сигнатуре, и строка уходит в `legacy_signature_mismatch` вместо отката к
+историческому значению. Более новый business update не теряется ни при одном
+порядке событий.
+
+Что при этом обязано остаться выключенным до конца шага 8 — это
+**`EASYWEEK_NOTIFICATIONS_ENABLED`**. Обработка и capture безопасны; отправка
+клиентам при известной ошибке цены — нет.
+
+**7. Проверка инварианта.** Ожидается **0 строк**:
+
+```bash
+docker compose -p altegio_bot exec -T postgres sh -lc 'psql -tAX -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT r.id FROM records r JOIN record_services rs ON rs.record_id = r.id WHERE r.provider = '"'"'easyweek'"'"' AND r.total_cost IS DISTINCT FROM rs.cost_to_pay"'
+```
+
+Дополнительно — что не осталось «подозрительно мелких» цен:
+
+```bash
+docker compose -p altegio_bot exec -T postgres sh -lc 'psql -tAX -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT count(*) FROM records WHERE provider = '"'"'easyweek'"'"' AND total_cost > 0 AND total_cost < 1"'
+```
+
+Ненулевой результат — не автоматический откат, а повод разобрать эти строки
+поимённо: настоящая цена в 0.50 € возможна.
+
+**7a. Повторный audit после repair.** Тот же dry-run, что и в шаге 3:
+
+```bash
+docker compose -p altegio_bot exec -T altegio-api /app/.venv/bin/python -m altegio_bot.scripts.easyweek_price_repair
+```
+
+Ожидается `repairable: 0`, а исправленные строки — в `already_correct`.
+Ненулевой `repairable` означает, что появились новые кандидаты (например, worker
+обработал старое событие), и шаги 4–7 нужно повторить.
+
+**7b. Подтвердить, что jobs/outbox/events не изменились.** Repair их не трогает,
+и это проверяется прямо: счётчики до и после должны совпадать, а `updated_at`
+джобов не должен сдвинуться в окно repair.
+
+```bash
+docker compose -p altegio_bot exec -T postgres sh -lc 'psql -tAX -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT (SELECT count(*) FROM message_jobs WHERE provider = '"'"'easyweek'"'"'), (SELECT count(*) FROM outbox_messages), (SELECT count(*) FROM easyweek_events), (SELECT count(*) FROM easyweek_events WHERE status = '"'"'failed'"'"')"'
+```
+
+**8. Controlled smoke.** Только теперь и только на собственном тестовом
+клиенте:
+
+- выставить `EASYWEEK_NOTIFICATIONS_ENABLED=true`, пересоздать consumers;
+- создать **новую** тестовую booking с известной ценой (или реально изменить
+  цену существующей), чтобы EasyWeek прислал новый payload;
+- проверить цепочку `easyweek_events` → конкретный `message_jobs` →
+  `outbox_messages` → `delivered`/`read`;
+- убедиться, что в доставленном шаблоне стоит правильная сумма.
+
+**Почему старое событие не является smoke.** Уже обработанное событие
+терминально: worker его не переигрывает, нового job не создаст, и «зелёный»
+результат будет означать лишь, что строка осталась в прежнем статусе.
+
+**Почему Resend не является доказательством.** Байт-идентичная повторная
+доставка даёт тот же `payload_hash` и тот же dedupe key, поэтому она сознательно
+дедуплицируется. Это проверяет дедупликацию, а не новый pipeline. Нужен новый
+бизнес-факт: новая booking либо реальное изменение цены.
+
+### 11.4 Откат
+
+Если на любом шаге результат расходится с ожидаемым, первым действием выключить
+уведомления: `EASYWEEK_NOTIFICATIONS_ENABLED=false` в `easyweek.env`, затем
+пересоздать consumers и повторить проверку effective config из шага 1. Отправки
+прекращаются; capture и запись `easyweek_events` продолжаются, ничего не
+теряется.
+
+Откат самих данных выполняется из CSV шага 4 поимённо, по `records.id` и
+`record_services.id`. Массовый `UPDATE` по эвристике «умножить на 100»
+запрещён: после repair в таблице сосуществуют исправленные и изначально
+корректные строки, и такой запрос испортил бы вторые.

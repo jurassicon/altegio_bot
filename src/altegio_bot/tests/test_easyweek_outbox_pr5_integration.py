@@ -49,7 +49,8 @@ from altegio_bot.delivery_retry_identity import (
     retry_outbox_audit_mismatch,
 )
 from altegio_bot.easyweek_branches import BRANCH_PROFILES, BranchProfile, branch_template_contract
-from altegio_bot.easyweek_normalizer import canonical_booking_uuid
+from altegio_bot.easyweek_locations import EasyWeekLocation
+from altegio_bot.easyweek_normalizer import canonical_booking_uuid, normalize_event
 from altegio_bot.easyweek_policy import (
     EASYWEEK_LIFECYCLE_JOB_TYPES,
     easyweek_job_type_error,
@@ -955,6 +956,94 @@ async def _run_and_get_params(db: AsyncSession, capture: CaptureProvider, job: M
     assert job.status == "done", job.last_error
     assert len(capture.template_calls) == 1
     return list(capture.template_calls[0]["params"])
+
+
+# ---------------------------------------------------------------------------
+# PR-7.3: the price the customer is actually shown
+# ---------------------------------------------------------------------------
+#
+# The rendered total is summed from `RecordService.cost_to_pay`, so a parser
+# that turned 120.00 € into 1.20 € would have reached the customer through this
+# path. The price below is therefore not written by hand: it is whatever the
+# REAL normalizer makes of the REAL captured payload, so the parser and the
+# message can never drift apart again.
+
+
+def _production_price_payload(minor_units: str, *, projection: str) -> dict[str, Any]:
+    """The confirmed production quartet, written out field by field."""
+    payload = booking_created()
+    payload["booking_price"] = minor_units
+    payload["booking_price_int"] = int(projection.split(".")[0])
+    payload["booking_price_float"] = projection
+    payload["booking_price_formatted"] = f"\u20ac{projection}"
+    return payload
+
+
+def _normalized_total(payload: dict[str, Any]) -> Decimal:
+    booking = normalize_event(
+        event_hint="booking-created",
+        payload=payload,
+        body_truncated=False,
+        location_registry={
+            TEST_LOCATION_ID: EasyWeekLocation(
+                name="test-branch",
+                location_id=TEST_LOCATION_ID,
+                location_uuid=TEST_LOCATION_UUID,
+                meta_template_prefix="tb",
+                booking_page_url="https://booking.example.invalid/test",
+            )
+        },
+    )
+    assert booking is not None and booking.total_cost is not None
+    return booking.total_cost
+
+
+@pytest.mark.parametrize(
+    ("minor_units", "projection", "rendered"),
+    [
+        ("12000", "120.00", "120.00"),
+        ("15000", "150.00", "150.00"),
+        ("3000", "30.00", "30.00"),
+        ("3550", "35.50", "35.50"),
+        ("0", "0.00", "0.00"),
+    ],
+)
+async def test_the_customer_is_shown_the_price_the_payload_states(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    minor_units: str,
+    projection: str,
+    rendered: str,
+) -> None:
+    total = _normalized_total(_production_price_payload(minor_units, projection=projection))
+
+    job = await _seed_easyweek_happy_path(
+        db,
+        services=((11, "Wimpernverl\u00e4ngerung", f"{total:.2f}"),),
+    )
+    params = await _run_and_get_params(db, capture, job)
+
+    assert params[5] == rendered, "the rendered total must be the amount the payload states"
+    assert params[4] == f"Wimpernverl\u00e4ngerung \u2014 {rendered}\u20ac"
+
+
+async def test_the_confirmed_payload_never_renders_a_hundredth_of_the_price(
+    db: AsyncSession,
+    capture: CaptureProvider,
+) -> None:
+    """The production defect, asserted where the customer would have seen it."""
+    total = _normalized_total(_production_price_payload("12000", projection="120.00"))
+    assert total == Decimal("120.00")
+
+    job = await _seed_easyweek_happy_path(
+        db,
+        services=((11, "Wimpernverl\u00e4ngerung", f"{total:.2f}"),),
+    )
+    params = await _run_and_get_params(db, capture, job)
+
+    assert "1.20" not in params[5]
+    assert "1.20\u20ac" not in params[4]
+    assert params[5] == "120.00"
 
 
 async def test_record_created_builds_seven_params_in_order(
