@@ -61,6 +61,9 @@ from altegio_bot.tests.easyweek_fixtures import (
     booking_created_resend,
     booking_rescheduled,
     booking_updated,
+    clear_booking_price,
+    drop_booking_price,
+    set_booking_price,
 )
 
 
@@ -632,47 +635,198 @@ def test_succeeded_does_not_require_a_booking_uuid() -> None:
 # ===========================================================================
 
 
-def test_price_comes_from_the_numeric_field_in_minor_units() -> None:
-    booking = _normalize(booking_created())
-    assert booking is not None
-    assert booking.total_cost == Decimal("35.00"), "booking_price_int is cents"
-
-
-def test_localized_price_strings_are_not_used() -> None:
-    payload = booking_created()
-    payload["booking_price"] = "999,99"
-    payload["booking_price_formatted"] = "€999.99"
-    payload["booking_price_float"] = "999.99"
-    booking = _normalize(payload)
-    assert booking is not None
-    assert booking.total_cost == Decimal("35.00")
-
-
-def test_absent_price_yields_no_total_cost() -> None:
-    """Absent is "unchanged", not an error."""
-    payload = booking_created()
-    payload["booking_price_int"] = None
-    booking = _normalize(payload)
-    assert booking is not None
-    assert booking.total_cost is None
+# The production defect this contract replaced: `booking_price_int` was read as
+# a cent count, so a real 120.00 € booking was stored — and would have been sent
+# to the customer — as 1.20 €. Production capture settled the field semantics:
+#
+#     120.00 €  ->  booking_price_int=120, booking_price="12000",
+#                   booking_price_float="120.00", booking_price_formatted="€120.00"
+#
+# `booking_price` is the authoritative storage value in exact minor units,
+# `booking_price_float` is a cross-check, and the other two are never parsed.
 
 
 @pytest.mark.parametrize(
-    ("bad", "expected"),
+    ("minor_units", "expected"),
     [
-        ("3500", NormalizationError.INVALID_PAYLOAD),
-        (True, NormalizationError.INVALID_PAYLOAD),
-        (1.5, NormalizationError.INVALID_PAYLOAD),
-        (-1, NormalizationError.INVALID_NUMERIC_RANGE),
+        (12000, Decimal("120.00")),
+        (15000, Decimal("150.00")),
+        (3000, Decimal("30.00")),
+        (3500, Decimal("35.00")),
+        # A price that is not a whole euro: the parser must keep both decimals.
+        (3550, Decimal("35.50")),
+        (99, Decimal("0.99")),
+        (1, Decimal("0.01")),
     ],
 )
-def test_malformed_price_is_a_deterministic_rejection(bad, expected: str) -> None:
-    """Never a silent None: a bad price must be visible, once, as failed."""
+def test_the_authoritative_storage_value_is_read_as_exact_minor_units(minor_units: int, expected: Decimal) -> None:
+    booking = _normalize(set_booking_price(booking_created(), minor_units))
+    assert booking is not None
+    assert booking.total_cost == expected
+    assert booking.total_cost.as_tuple().exponent == -2, "money is always scale 2"
+
+
+def test_the_confirmed_production_payload_is_not_divided_by_a_hundred() -> None:
+    """The regression itself, spelled out with the captured 120.00 € delivery."""
     payload = booking_created()
-    payload["booking_price_int"] = bad
+    payload["booking_price_int"] = 120
+    payload["booking_price"] = "12000"
+    payload["booking_price_float"] = "120.00"
+    payload["booking_price_formatted"] = "€120.00"
+
+    booking = _normalize(payload)
+    assert booking is not None
+    assert booking.total_cost == Decimal("120.00")
+    assert booking.total_cost != Decimal("1.20"), "booking_price_int is not a cent count"
+
+
+def test_booking_price_int_alone_never_produces_a_price() -> None:
+    """It is not authoritative, so on its own it proves nothing — and must not
+    quietly resurrect the old value through a fallback."""
+    payload = drop_booking_price(booking_created())
+    payload["booking_price_int"] = 120
+
+    booking = _normalize(payload)
+    assert booking is not None
+    assert booking.total_cost is None
+    assert not booking.carries("total_cost"), "an unproven price must not overwrite a known one"
+
+
+def test_the_formatted_string_is_never_a_fallback() -> None:
+    """Display text carries the salon's currency and separator; parsing it would
+    inherit both."""
+    payload = drop_booking_price(booking_created())
+    payload["booking_price_formatted"] = "€120.00"
+
+    booking = _normalize(payload)
+    assert booking is not None
+    assert booking.total_cost is None
+    assert not booking.carries("total_cost")
+
+
+def test_a_real_zero_price_is_a_price_and_not_an_absence() -> None:
+    booking = _normalize(set_booking_price(booking_created(), 0))
+    assert booking is not None
+    assert booking.total_cost == Decimal("0.00")
+    assert booking.carries("total_cost"), "0.00 is authoritative, not silence"
+
+
+def test_a_delivery_without_any_price_field_keeps_the_known_price() -> None:
+    """Absent is "unchanged", not an error and not a clear."""
+    booking = _normalize(drop_booking_price(booking_created()))
+    assert booking is not None
+    assert booking.total_cost is None
+    assert not booking.carries("total_cost")
+
+
+def test_an_explicit_consistent_clear_is_authoritative() -> None:
+    booking = _normalize(clear_booking_price(booking_created()))
+    assert booking is not None
+    assert booking.total_cost is None
+    assert booking.carries("total_cost"), "an explicit null really clears the snapshot"
+
+
+def test_a_clear_contradicted_by_another_price_field_is_refused() -> None:
+    """Half a delivery says "no price", the other half names one. We do not pick."""
+    payload = booking_created()
+    payload["booking_price"] = None
+    payload["booking_price_float"] = "120.00"
+
     with pytest.raises(NormalizationError) as excinfo:
         _normalize(payload)
-    assert excinfo.value.code == expected
+    assert excinfo.value.code == NormalizationError.PRICE_FIELDS_CONFLICT
+
+
+def test_a_price_claimed_without_the_authoritative_field_is_refused() -> None:
+    payload = drop_booking_price(booking_created())
+    payload["booking_price_float"] = "120.00"
+
+    with pytest.raises(NormalizationError) as excinfo:
+        _normalize(payload)
+    assert excinfo.value.code == NormalizationError.PRICE_FIELDS_CONFLICT
+
+
+def test_the_projection_must_describe_the_same_amount() -> None:
+    payload = set_booking_price(booking_created(), 12000)
+    payload["booking_price_float"] = "1.20"
+
+    with pytest.raises(NormalizationError) as excinfo:
+        _normalize(payload)
+    assert excinfo.value.code == NormalizationError.PRICE_FIELDS_CONFLICT
+
+
+@pytest.mark.parametrize("projection", ["120.0", "120", "120.00"])
+def test_an_agreeing_projection_is_accepted_in_any_equivalent_form(projection: str) -> None:
+    """The comparison is numeric: the same amount written differently agrees."""
+    payload = set_booking_price(booking_created(), 12000)
+    payload["booking_price_float"] = projection
+
+    booking = _normalize(payload)
+    assert booking is not None
+    assert booking.total_cost == Decimal("120.00")
+
+
+@pytest.mark.parametrize(
+    ("label", "bad", "expected"),
+    [
+        # A JSON number where the contract says storage string: the very
+        # ambiguity between major and minor units that caused the defect.
+        ("json-int", 12000, NormalizationError.INVALID_PAYLOAD),
+        ("json-float", 12000.0, NormalizationError.INVALID_PAYLOAD),
+        ("bool", True, NormalizationError.INVALID_PAYLOAD),
+        ("exponent", "1.2e4", NormalizationError.INVALID_PAYLOAD),
+        ("comma", "120,00", NormalizationError.INVALID_PAYLOAD),
+        ("decimal-point", "120.00", NormalizationError.INVALID_PAYLOAD),
+        ("currency", "€120.00", NormalizationError.INVALID_PAYLOAD),
+        ("padded", " 12000 ", NormalizationError.INVALID_PAYLOAD),
+        ("empty", "", NormalizationError.INVALID_PAYLOAD),
+        ("words", "twelve thousand", NormalizationError.INVALID_PAYLOAD),
+        ("nan", "NaN", NormalizationError.INVALID_PAYLOAD),
+        ("infinity", "Infinity", NormalizationError.INVALID_PAYLOAD),
+        ("negative", "-12000", NormalizationError.INVALID_NUMERIC_RANGE),
+        # Numeric(12, 2) holds 9999999999.99 and not a cent more.
+        ("too-large", "1000000000000", NormalizationError.INVALID_NUMERIC_RANGE),
+    ],
+)
+def test_a_malformed_price_is_a_deterministic_rejection(label: str, bad: object, expected: str) -> None:
+    """Never a silent None: a bad price must be visible, once, as failed."""
+    payload = booking_created()
+    payload["booking_price"] = bad
+
+    with pytest.raises(NormalizationError) as excinfo:
+        _normalize(payload)
+    assert excinfo.value.code == expected, label
+
+
+def test_the_largest_representable_price_is_still_accepted() -> None:
+    booking = _normalize(set_booking_price(booking_created(), 999999999999))
+    assert booking is not None
+    assert booking.total_cost == Decimal("9999999999.99")
+
+
+@pytest.mark.parametrize(
+    "projection",
+    ["120,00", "€120.00", "1.2e2", " 120.00 ", "", "120.000", 120.0, True],
+)
+def test_a_malformed_projection_is_refused_rather_than_ignored(projection: object) -> None:
+    payload = set_booking_price(booking_created(), 12000)
+    payload["booking_price_float"] = projection
+
+    with pytest.raises(NormalizationError) as excinfo:
+        _normalize(payload)
+    assert excinfo.value.code == NormalizationError.INVALID_PAYLOAD
+
+
+def test_no_price_rejection_ever_echoes_the_amount() -> None:
+    """Error codes reach the logs; a price is customer data."""
+    payload = booking_created()
+    payload["booking_price"] = "€1234,56"
+
+    with pytest.raises(NormalizationError) as excinfo:
+        _normalize(payload)
+    text = f"{excinfo.value.code} {excinfo.value}"
+    assert "1234" not in text and "€" not in text
+    assert excinfo.value.code in NormalizationError.ALL_CODES
 
 
 def test_service_fields_are_normalized() -> None:

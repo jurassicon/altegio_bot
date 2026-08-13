@@ -2089,3 +2089,153 @@ LIMIT 10;
 **Событие 20794 (conversation 230, message 9343) терминально и не
 переигрывается.** Проверка выполняется новым сообщением с новым Chatwoot
 message ID.
+
+
+---
+
+## 11. PR-7.3 — корректный контракт цены EasyWeek
+
+### 11.1 Что было сломано
+
+Для реальной цены `120.00 €` EasyWeek присылает четвёрку полей:
+
+```text
+booking_price_int:       120        # МАЖОРНЫЕ единицы, не центы
+booking_price:           "12000"    # storage format: точные минорные единицы
+booking_price_float:     "120.00"   # мажорная проекция
+booking_price_formatted: "€120.00"  # локализованный display text
+```
+
+Старый normalizer делил `booking_price_int` на 100 и сохранял `1.20`. То есть
+любая EasyWeek-запись, созданная до PR-7.3, держит цену в сто раз меньше
+реальной — и в `records.total_cost`, и в `record_services.cost_to_pay`.
+Клиентский шаблон рендерится именно из service-строки, поэтому дефект дошёл бы
+до клиента.
+
+### 11.2 Действующий контракт парсера
+
+- **authoritative** — `booking_price`. Только строка из одних цифр; парсится
+  целочисленной арифметикой. Запятая, точка, валюта, экспонента, пробелы,
+  JSON-число и `bool` отклоняются как `invalid_payload`; отрицательное значение
+  и выход за `Numeric(12, 2)` — как `invalid_numeric_range`.
+- **cross-check** — `booking_price_float`. Если поле пришло, оно обязано
+  описывать ту же сумму; расхождение — `price_fields_conflict`.
+- **никогда не источник** — `booking_price_formatted` и `booking_price_int`.
+- Присутствие цены определяется ключом `booking_price`: поля нет → цена
+  не менялась; `booking_price: null` при непротиворечивых остальных полях →
+  цена очищается; `"0"` → настоящий ноль.
+- Ни один код ошибки не содержит саму сумму.
+
+### 11.3 Rollout: порядок обязателен
+
+Флаг остаётся выключенным до конца шага 8.
+
+**1. Подтвердить effective config ДО deploy.** Значение читается из процесса,
+не из файла:
+
+```bash
+docker compose -p altegio_bot exec -T altegio-api /app/.venv/bin/python -c 'from altegio_bot.settings import settings; print("notifications_enabled=", settings.easyweek_notifications_enabled)'
+```
+
+Требуется `notifications_enabled= False`. Если `True` — выставить в
+`easyweek.env` `EASYWEEK_NOTIFICATIONS_ENABLED=false`, пересоздать сервисы и
+повторить проверку. С известной ошибкой цены включённые уведомления
+запрещены.
+
+**2. Deploy исправления** обычным порядком по разделу 4. Сам deploy ничего не
+чинит в данных: он только ставит правильный парсер.
+
+**3. Read-only audit.** Ничего не меняет:
+
+```bash
+docker compose -p altegio_bot exec -T altegio-api /app/.venv/bin/python -m altegio_bot.scripts.easyweek_price_repair
+```
+
+Вывод — только счётчики и технические ID:
+
+```text
+{'mode': 'dry-run', 'scanned': N, 'repairable': K, 'repaired': 0,
+ 'skipped': {...}, 'repairable_record_ids': [...],
+ 'evidence_event_ids': [...]}
+```
+
+`repairable` — строки, у которых доказана сигнатура именно этого бага. Всё
+остальное попадает в `skipped` с причиной и **не будет** тронуто:
+
+| Причина | Что означает |
+| --- | --- |
+| `no_booking_uuid` | нет канонической identity |
+| `no_usable_event` | нет сохранённого события с валидным price-контрактом (в т.ч. truncated) |
+| `not_exactly_one_service` | ноль или несколько service-строк: сумму не к чему привязать |
+| `snapshot_inconsistent` | `total_cost` и `cost_to_pay` уже расходятся — отдельная проблема |
+| `already_correct` | цена уже правильная |
+| `signature_mismatch` | сохранённое значение не равно результату старой формулы: значение писал кто-то ещё |
+
+**4. Backup / фиксация восстановимых значений.** До `--apply` сохранить текущее
+состояние кандидатов, чтобы откат был арифметически проверяем:
+
+```bash
+docker compose -p altegio_bot exec -T postgres sh -lc 'psql -tAX -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "COPY (SELECT r.id, r.total_cost, rs.id, rs.cost_to_pay FROM records r JOIN record_services rs ON rs.record_id = r.id WHERE r.provider = '"'"'easyweek'"'"') TO STDOUT WITH CSV" ' > easyweek_prices_before.csv
+```
+
+Этот CSV содержит суммы: хранить как обычный production dump, не пересылать в
+чаты и не прикладывать к тикетам.
+
+**5. Explicit repair.** Только после успешного audit:
+
+```bash
+docker compose -p altegio_bot exec -T altegio-api /app/.venv/bin/python -m altegio_bot.scripts.easyweek_price_repair --apply
+```
+
+Ожидается `repaired == repairable` из шага 3. Команда не создаёт и не
+переоткрывает job, ничего не отправляет и не меняет статус `easyweek_events`.
+
+**6. Проверка идемпотентности.** Повторный `--apply` обязан дать
+`repaired: 0` и `already_correct` на тех же строках.
+
+**7. Проверка инварианта.** Ожидается **0 строк**:
+
+```bash
+docker compose -p altegio_bot exec -T postgres sh -lc 'psql -tAX -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT r.id FROM records r JOIN record_services rs ON rs.record_id = r.id WHERE r.provider = '"'"'easyweek'"'"' AND r.total_cost IS DISTINCT FROM rs.cost_to_pay"'
+```
+
+Дополнительно — что не осталось «подозрительно мелких» цен:
+
+```bash
+docker compose -p altegio_bot exec -T postgres sh -lc 'psql -tAX -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT count(*) FROM records WHERE provider = '"'"'easyweek'"'"' AND total_cost > 0 AND total_cost < 1"'
+```
+
+Ненулевой результат — не автоматический откат, а повод разобрать эти строки
+поимённо: настоящая цена в 0.50 € возможна.
+
+**8. Controlled smoke.** Только теперь и только на собственном тестовом
+клиенте:
+
+- выставить `EASYWEEK_NOTIFICATIONS_ENABLED=true`, пересоздать consumers;
+- создать **новую** тестовую booking с известной ценой (или реально изменить
+  цену существующей), чтобы EasyWeek прислал новый payload;
+- проверить цепочку `easyweek_events` → конкретный `message_jobs` →
+  `outbox_messages` → `delivered`/`read`;
+- убедиться, что в доставленном шаблоне стоит правильная сумма.
+
+**Почему старое событие не является smoke.** Уже обработанное событие
+терминально: worker его не переигрывает, нового job не создаст, и «зелёный»
+результат будет означать лишь, что строка осталась в прежнем статусе.
+
+**Почему Resend не является доказательством.** Байт-идентичная повторная
+доставка даёт тот же `payload_hash` и тот же dedupe key, поэтому она сознательно
+дедуплицируется. Это проверяет дедупликацию, а не новый pipeline. Нужен новый
+бизнес-факт: новая booking либо реальное изменение цены.
+
+### 11.4 Откат
+
+Если на любом шаге результат расходится с ожидаемым, первым действием выключить
+уведомления: `EASYWEEK_NOTIFICATIONS_ENABLED=false` в `easyweek.env`, затем
+пересоздать consumers и повторить проверку effective config из шага 1. Отправки
+прекращаются; capture и запись `easyweek_events` продолжаются, ничего не
+теряется.
+
+Откат самих данных выполняется из CSV шага 4 поимённо, по `records.id` и
+`record_services.id`. Массовый `UPDATE` по эвристике «умножить на 100»
+запрещён: после repair в таблице сосуществуют исправленные и изначально
+корректные строки, и такой запрос испортил бы вторые.

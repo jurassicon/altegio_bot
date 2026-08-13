@@ -32,6 +32,7 @@ Nothing here logs, and no error code ever embeds a payload value.
 from __future__ import annotations
 
 import hashlib
+import re
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -89,6 +90,19 @@ PG_BIGINT_MAX: Final = 9223372036854775807
 MAX_MONEY: Final = Decimal("9999999999.99")
 # The same ceiling expressed in the minor units the payload actually sends.
 MAX_MONEY_CENTS: Final = 999999999999
+
+# ---------------------------------------------------------------------------
+# Price field syntax — see _price_to_decimal for the confirmed field semantics
+# ---------------------------------------------------------------------------
+# Digits only. No sign, no separator, no exponent, no currency, no surrounding
+# space: a money amount is parsed, never interpreted.
+_MINOR_UNITS_RE: Final = re.compile(r"[0-9]+")
+# Matched separately so a negative amount reports "out of range" rather than
+# "not a number" — it IS a number, just not one a booking total may hold.
+_NEGATIVE_MINOR_UNITS_RE: Final = re.compile(r"-[0-9]+")
+# The major-unit cross-check projection: "120.00", "120.0" and "120" all state
+# the same amount, and the comparison that follows is numeric, not textual.
+_MAJOR_UNITS_RE: Final = re.compile(r"[0-9]+(?:\.[0-9]{1,2})?")
 
 
 def canonical_booking_uuid(payload: Any) -> uuid.UUID | None:
@@ -149,6 +163,12 @@ class NormalizationError(Exception):
     # later as a DataError/InvalidOperation that would look transient and be
     # retried forever.
     INVALID_NUMERIC_RANGE: Final = "invalid_numeric_range"
+    # The delivery's price fields do not describe the same amount — either the
+    # major-unit projection disagrees with the authoritative storage value, or a
+    # price is claimed by a field that is not authoritative. Distinct from
+    # INVALID_PAYLOAD on purpose: each individual field is well-formed, and the
+    # operator's next step is to look at the delivery, not at our parser.
+    PRICE_FIELDS_CONFLICT: Final = "price_fields_conflict"
 
     ALL_CODES: Final = frozenset(
         {
@@ -165,6 +185,7 @@ class NormalizationError(Exception):
             INVALID_MANAGE_LINK,
             IDENTITY_CONFLICT,
             INVALID_NUMERIC_RANGE,
+            PRICE_FIELDS_CONFLICT,
         }
     )
 
@@ -221,8 +242,9 @@ class NormalizedBooking:
     # Root-level machine category. It is normalized here but eligibility is
     # deliberately decided later from the persisted Record.raw snapshot.
     service_category: str | None
-    # `booking_price_int` is the authoritative JSON number and is in CENTS
-    # (3500 == 35.00). The `booking_price*` string variants are display values.
+    # Booking-level total. `booking_price` is the authoritative storage value in
+    # exact minor units ("12000" == 120.00); `booking_price_int` is NOT a cent
+    # count and is never read. See `_price_to_decimal`.
     total_cost: Decimal | None
 
     # Logical names of the fields this delivery actually CARRIED. Patch
@@ -310,35 +332,98 @@ def _optional_int(value: Any) -> int | None:
     return None
 
 
+def _price_minor_units(raw: str) -> int:
+    """Exact minor units from the authoritative storage string.
+
+    Deliberately syntactic and total: only ASCII digits are a price. A comma, a
+    currency symbol, an exponent, surrounding space or any other localized form
+    is rejected rather than coerced — the salon's locale must never decide what
+    a customer is told they owe.
+    """
+    if _MINOR_UNITS_RE.fullmatch(raw):
+        return int(raw)
+    if _NEGATIVE_MINOR_UNITS_RE.fullmatch(raw):
+        # Well-formed, but not an amount a booking total may hold: it would
+        # render as a negative price to the customer.
+        raise NormalizationError(NormalizationError.INVALID_NUMERIC_RANGE)
+    raise NormalizationError(NormalizationError.INVALID_PAYLOAD)
+
+
+def _assert_price_projection(value: Decimal, raw: Any) -> None:
+    """The major-unit projection must describe the amount we already parsed."""
+    if not isinstance(raw, str) or not _MAJOR_UNITS_RE.fullmatch(raw):
+        raise NormalizationError(NormalizationError.INVALID_PAYLOAD)
+    if Decimal(raw) != value:
+        raise NormalizationError(NormalizationError.PRICE_FIELDS_CONFLICT)
+
+
 def _price_to_decimal(payload: dict[str, Any]) -> Decimal | None:
     """Booking price as a money Decimal, or a deterministic rejection.
 
-    ``booking_price_int`` is the authoritative JSON **number** and is expressed
-    in minor units (3500 == 35.00). The ``booking_price`` / ``_float`` /
-    ``_formatted`` siblings are localized display strings — parsing those would
-    inherit the salon's decimal separator and currency symbol.
+    The field semantics here come from confirmed production captures, which
+    contradicted the documentation this parser was first written against. For a
+    real price of 120.00 € EasyWeek sends::
 
-    The value is range-checked against ``Numeric(12, 2)`` BEFORE the division,
-    so an absurd price is a payload rejection rather than a DataError at INSERT
-    time (which the worker would mistake for a transient fault and retry).
+        booking_price_int: 120           # MAJOR units, not cents
+        booking_price: "12000"           # storage format: exact minor units
+        booking_price_float: "120.00"    # major-unit projection
+        booking_price_formatted: "€120.00"   # localized display text
+
+    So:
+
+    * ``booking_price`` is the single authoritative value, read as exact minor
+      units with integer arithmetic — never through ``float``;
+    * ``booking_price_float`` is a cross-check, not a source. When the delivery
+      carries it, it must describe the same amount, or the delivery is refused;
+    * ``booking_price_formatted`` is display text and is never parsed, not even
+      as a fallback — it carries the salon's currency symbol and separator;
+    * ``booking_price_int`` is NOT a cent count. Dividing it by 100 is what
+      turned 120.00 € into 1.20 € in production, so it is not read at all.
+
+    Presence semantics are unchanged and keyed on the authoritative field alone
+    (see ``present_fields``): absent means "unchanged", an explicit ``null``
+    means "cleared", and a real 0.00 stays a real price. A clear that another
+    price field contradicts is a conflict, not a clear — we do not guess which
+    half of the delivery to believe.
+
+    The value is range-checked against ``Numeric(12, 2)`` BEFORE any Decimal
+    arithmetic: ``quantize()`` on a 30-digit value raises
+    ``decimal.InvalidOperation`` (the default context carries 28 digits), which
+    would escape as an unexpected error and be retried forever instead of being
+    rejected once.
     """
-    raw = payload.get("booking_price_int")
-    if raw is None:
+    projection_present = "booking_price_float" in payload
+    projection = payload.get("booking_price_float")
+    # A price claimed only by a non-authoritative field. Whatever produced it,
+    # it is not the shape we confirmed, and guessing is exactly the failure this
+    # PR exists to remove.
+    claims_price_without_authority = projection_present and projection is not None
+
+    if "booking_price" not in payload:
+        if claims_price_without_authority:
+            raise NormalizationError(NormalizationError.PRICE_FIELDS_CONFLICT)
         return None
-    cents = _as_exact_int(raw)
-    if cents is None:
+
+    raw = payload.get("booking_price")
+    if raw is None:
+        if claims_price_without_authority:
+            raise NormalizationError(NormalizationError.PRICE_FIELDS_CONFLICT)
+        return None
+
+    # Only the storage string. A JSON number here — including ``bool``, which is
+    # an ``int`` subclass — is an unconfirmed shape, and reading it would revive
+    # the ambiguity between major and minor units that caused the defect.
+    if not isinstance(raw, str):
         raise NormalizationError(NormalizationError.INVALID_PAYLOAD)
-    if cents < 0:
-        # A negative booking total is not something the confirmed payloads
-        # contain, and it would render as a negative price to the customer.
+
+    minor_units = _price_minor_units(raw)
+    if minor_units > MAX_MONEY_CENTS:
         raise NormalizationError(NormalizationError.INVALID_NUMERIC_RANGE)
-    # Bound BEFORE any Decimal arithmetic: quantize() on a 30-digit value
-    # raises decimal.InvalidOperation (the default context carries 28 digits of
-    # precision), which would escape as an unexpected error and be retried
-    # forever instead of rejected once.
-    if cents > MAX_MONEY_CENTS:
-        raise NormalizationError(NormalizationError.INVALID_NUMERIC_RANGE)
-    return (Decimal(cents) / Decimal(100)).quantize(Decimal("0.01"))
+    value = (Decimal(minor_units) / Decimal(100)).quantize(Decimal("0.01"))
+
+    if projection is not None:
+        _assert_price_projection(value, projection)
+    return value
 
 
 def _optional_bounded_int(
@@ -661,7 +746,10 @@ def normalize_event(
                 ("services_description", "services_description"),
                 ("services_count", "services_count"),
                 ("service_category", "service_category"),
-                ("total_cost", "booking_price_int"),
+                # The authoritative price field, and the only one presence is
+                # keyed on: a delivery that carries only display variants has
+                # not proven a price. See `_price_to_decimal`.
+                ("total_cost", "booking_price"),
                 # Presence decides whether the client link may be rewritten.
                 ("customer_id", "customer_id"),
             )

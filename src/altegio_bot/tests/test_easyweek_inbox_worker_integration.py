@@ -33,6 +33,7 @@ from altegio_bot.models.models import Client, EasyWeekEvent, MessageJob, Record,
 from altegio_bot.settings import settings
 from altegio_bot.tests.easyweek_fixtures import (
     FOREIGN_LOCATION_ID,
+    PRICE_FIELDS,
     TEST_BOOKING_HASH_ID,
     TEST_BOOKING_ID,
     TEST_BOOKING_PAGE,
@@ -46,6 +47,9 @@ from altegio_bot.tests.easyweek_fixtures import (
     booking_created_resend,
     booking_rescheduled,
     booking_updated,
+    clear_booking_price,
+    drop_booking_price,
+    set_booking_price,
 )
 from altegio_bot.workers import easyweek_inbox_worker as worker
 
@@ -1390,7 +1394,7 @@ async def test_update_synchronises_a_changed_service_and_price(bound_session_loc
     changed["service_id"] = 5100099
     changed["service_name"] = "Different Service"
     changed["services_description"] = "Different Service"
-    changed["booking_price_int"] = 5000
+    set_booking_price(changed, 5000)
     async with bound_session_local() as session:
         async with session.begin():
             await _capture(session, changed, event_hint="booking-updated", payload_hash="h2")
@@ -1432,7 +1436,7 @@ async def test_partial_event_without_service_fields_keeps_the_service(bound_sess
         "services_description",
         "services_count",
         "quantity",
-        "booking_price_int",
+        *PRICE_FIELDS,
     ):
         silent.pop(key, None)
     async with bound_session_local() as session:
@@ -1917,7 +1921,11 @@ async def test_transient_failure_logs_no_pii(bound_session_local, monkeypatch, c
 async def test_a_poisoned_numeric_event_does_not_block_the_next_one(bound_session_local) -> None:
     """An out-of-range number is deterministic, not transient."""
     poisoned = booking_created()
-    poisoned["booking_price_int"] = 10**30
+    # Set straight onto the authoritative field: an amount this large cannot be
+    # expressed as a Decimal projection at all, which is precisely why the
+    # parser bounds it BEFORE any Decimal arithmetic.
+    drop_booking_price(poisoned)
+    poisoned["booking_price"] = str(10**30)
     healthy = booking_created()
     healthy["uid"] = "33333333-4444-4555-8666-777777777777"
     healthy["id"] = TEST_BOOKING_ID + 2
@@ -2156,7 +2164,7 @@ async def test_no_post_cancel_delivery_resurrects_the_booking(bound_session_loca
 
     stale = build()
     stale["booking_attributes.booking_comment"] = "stale edit"
-    stale["booking_price_int"] = 111
+    set_booking_price(stale, 111)
     async with bound_session_local() as session:
         async with session.begin():
             await _capture(session, stale, event_hint=hint, payload_hash="h-stale-new-hash")
@@ -2213,7 +2221,7 @@ async def test_post_cancel_service_snapshot_is_not_rolled_back(bound_session_loc
     stale = booking_updated()
     stale["service_id"] = 5100777
     stale["services_description"] = "Stale Service"
-    stale["booking_price_int"] = 100
+    set_booking_price(stale, 100)
     async with bound_session_local() as session:
         async with session.begin():
             await _capture(session, stale, event_hint="booking-updated", payload_hash="h-stale")
@@ -2337,7 +2345,7 @@ async def test_price_only_update_keeps_the_service_row_consistent(bound_session_
     price_only = booking_updated()
     for key in ("service_id", "service_name", "services_description", "services_count", "quantity"):
         price_only.pop(key, None)
-    price_only["booking_price_int"] = 4200
+    set_booking_price(price_only, 4200)
     async with bound_session_local() as session:
         async with session.begin():
             await _capture(session, price_only, event_hint="booking-updated", payload_hash="h2")
@@ -2355,7 +2363,7 @@ async def test_description_only_update_is_not_lost_without_a_service_id(bound_se
     await _run_until_idle()
 
     description_only = booking_updated()
-    for key in ("service_id", "service_name", "quantity", "booking_price_int"):
+    for key in ("service_id", "service_name", "quantity", *PRICE_FIELDS):
         description_only.pop(key, None)
     description_only["services_description"] = "Renamed Service Set"
     async with bound_session_local() as session:
@@ -2726,7 +2734,7 @@ async def test_an_explicitly_null_price_clears_both_costs(bound_session_local) -
     await _run_until_idle()
 
     event = booking_updated()
-    event["booking_price_int"] = None
+    clear_booking_price(event)
     async with bound_session_local() as session:
         async with session.begin():
             await _capture(session, event, event_hint="booking-updated", payload_hash="h2")
@@ -2752,7 +2760,7 @@ async def test_absent_service_fields_still_keep_the_snapshot(bound_session_local
         "services_description",
         "services_count",
         "quantity",
-        "booking_price_int",
+        *PRICE_FIELDS,
     ):
         silent.pop(key, None)
     async with bound_session_local() as session:
@@ -2937,6 +2945,151 @@ async def _assert_price_invariant(bound_session_local) -> None:
         assert total_cost == cost_to_pay, f"price snapshot diverged: record={total_cost} service={cost_to_pay}"
 
 
+# ---------------------------------------------------------------------------
+# PR-7.3: the confirmed production price contract, end to end
+# ---------------------------------------------------------------------------
+#
+# Production sent `booking_price_int=120`, `booking_price="12000"`,
+# `booking_price_float="120.00"` for a real 120.00 € booking. The old parser
+# divided the first field by 100 and persisted 1.20. These tests drive the real
+# worker over the real payload and assert on what the database ends up holding,
+# because that is what the customer-facing message is rendered from.
+
+
+def _production_price_event(minor_units: str, projection: str, **overrides: object) -> dict:
+    payload = booking_created()
+    payload["booking_price"] = minor_units
+    payload["booking_price_int"] = int(projection.split(".")[0])
+    payload["booking_price_float"] = projection
+    payload["booking_price_formatted"] = f"\u20ac{projection}"
+    payload.update(overrides)
+    return payload
+
+
+@pytest.mark.parametrize(
+    ("minor_units", "projection", "expected"),
+    [
+        ("12000", "120.00", Decimal("120.00")),
+        ("15000", "150.00", Decimal("150.00")),
+        ("3000", "30.00", Decimal("30.00")),
+        ("3550", "35.50", Decimal("35.50")),
+    ],
+)
+async def test_the_production_payload_is_stored_at_its_real_value(
+    bound_session_local, minor_units: str, projection: str, expected: Decimal
+) -> None:
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, _production_price_event(minor_units, projection), payload_hash="h1")
+    await _run_until_idle()
+
+    total, _service_id, _title, _amount, cost = await _snapshot_row(bound_session_local)
+    assert total == expected
+    assert cost == expected
+    assert total != expected / 100, "booking_price_int was read as cents again"
+    await _assert_price_invariant(bound_session_local)
+
+
+async def test_a_real_zero_price_is_stored_as_zero_and_not_as_unknown(bound_session_local) -> None:
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, _production_price_event("0", "0.00"), payload_hash="h1")
+    await _run_until_idle()
+
+    total, _service_id, _title, _amount, cost = await _snapshot_row(bound_session_local)
+    assert total == Decimal("0.00") and cost == Decimal("0.00")
+    assert total is not None, "a free booking has a known price, not an unknown one"
+    await _assert_price_invariant(bound_session_local)
+
+
+async def test_an_update_moves_both_price_columns_together(bound_session_local) -> None:
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, _production_price_event("12000", "120.00"), payload_hash="h1")
+    await _run_until_idle()
+
+    updated = _production_price_event("15000", "150.00")
+    updated["booking_status"] = "Updated appointment"
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, updated, event_hint="booking-updated", payload_hash="h2")
+    await _run_until_idle()
+
+    total, _service_id, _title, _amount, cost = await _snapshot_row(bound_session_local)
+    assert total == Decimal("150.00") and cost == Decimal("150.00")
+    await _assert_price_invariant(bound_session_local)
+
+
+@pytest.mark.parametrize(
+    ("label", "mutate"),
+    [
+        # The projection names a different amount than the authoritative field.
+        ("projection-disagrees", {"booking_price": "12000", "booking_price_float": "1.20"}),
+        # A clear that another price field contradicts.
+        ("contradicted-clear", {"booking_price": None, "booking_price_float": "120.00"}),
+        # A price claimed only by a field that is not authoritative.
+        ("no-authority", {"booking_price": None, "booking_price_float": "35.00"}),
+        # Localized text where exact minor units belong.
+        ("localized", {"booking_price": "120,00"}),
+        ("currency", {"booking_price": "\u20ac120.00"}),
+        ("negative", {"booking_price": "-12000"}),
+    ],
+)
+async def test_a_conflicting_price_changes_nothing_and_plans_no_job(
+    bound_session_local, label: str, mutate: dict
+) -> None:
+    """A price we cannot prove must not reach a customer, and must not damage
+    the snapshot we already proved."""
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, _production_price_event("12000", "120.00"), payload_hash="h1")
+    await _run_until_idle()
+
+    before = await _snapshot_row(bound_session_local)
+    async with bound_session_local() as session:
+        jobs_before = sorted((await session.execute(select(MessageJob.id))).scalars().all())
+
+    broken = booking_updated()
+    for key, value in mutate.items():
+        broken[key] = value
+    async with bound_session_local() as session:
+        async with session.begin():
+            event_id = await _capture(session, broken, event_hint="booking-updated", payload_hash="h2")
+    await _run_until_idle()
+
+    async with bound_session_local() as session:
+        row = (await session.execute(select(EasyWeekEvent).where(EasyWeekEvent.id == event_id))).scalars().one()
+        assert row.status == "failed", label
+        assert row.error_code in NormalizationError.ALL_CODES, label
+        assert row.next_retry_at is None, f"{label}: a bad price is deterministic, not transient"
+        assert row.processed_at is not None
+
+        jobs_after = sorted((await session.execute(select(MessageJob.id))).scalars().all())
+
+    assert await _snapshot_row(bound_session_local) == before, f"{label}: the proven snapshot was damaged"
+    assert jobs_after == jobs_before, f"{label}: a job was planned from an unprovable price"
+    await _assert_price_invariant(bound_session_local)
+
+
+async def test_the_error_code_of_a_conflicting_price_carries_no_amount(bound_session_local) -> None:
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, booking_created(), payload_hash="h1")
+    await _run_until_idle()
+
+    broken = booking_updated()
+    broken["booking_price"] = "\u20ac1234,56"
+    async with bound_session_local() as session:
+        async with session.begin():
+            event_id = await _capture(session, broken, event_hint="booking-updated", payload_hash="h2")
+    await _run_until_idle()
+
+    async with bound_session_local() as session:
+        row = (await session.execute(select(EasyWeekEvent).where(EasyWeekEvent.id == event_id))).scalars().one()
+    assert row.error_code == NormalizationError.INVALID_PAYLOAD
+    assert "1234" not in (row.error_code or "")
+
+
 async def test_service_id_change_without_a_price_keeps_the_known_total(bound_session_local) -> None:
     """The regression: a new service row must not start with an unknown price.
 
@@ -2945,7 +3098,7 @@ async def test_service_id_change_without_a_price_keeps_the_known_total(bound_ses
     """
     created = booking_created()
     created["service_id"] = 111
-    created["booking_price_int"] = 3500
+    set_booking_price(created, 3500)
     async with bound_session_local() as session:
         async with session.begin():
             await _capture(session, created, payload_hash="h1")
@@ -2953,7 +3106,7 @@ async def test_service_id_change_without_a_price_keeps_the_known_total(bound_ses
 
     updated = booking_updated()
     updated["service_id"] = 222
-    updated.pop("booking_price_int", None)
+    drop_booking_price(updated)
     async with bound_session_local() as session:
         async with session.begin():
             await _capture(session, updated, event_hint="booking-updated", payload_hash="h2")
@@ -2974,7 +3127,7 @@ async def test_service_id_change_without_a_price_keeps_the_known_total(bound_ses
 async def test_service_id_change_with_a_new_price_updates_both(bound_session_local) -> None:
     created = booking_created()
     created["service_id"] = 111
-    created["booking_price_int"] = 3500
+    set_booking_price(created, 3500)
     async with bound_session_local() as session:
         async with session.begin():
             await _capture(session, created, payload_hash="h1")
@@ -2982,7 +3135,7 @@ async def test_service_id_change_with_a_new_price_updates_both(bound_session_loc
 
     updated = booking_updated()
     updated["service_id"] = 222
-    updated["booking_price_int"] = 5000
+    set_booking_price(updated, 5000)
     async with bound_session_local() as session:
         async with session.begin():
             await _capture(session, updated, event_hint="booking-updated", payload_hash="h2")
@@ -2998,7 +3151,7 @@ async def test_service_id_change_with_a_new_price_updates_both(bound_session_loc
 async def test_service_id_change_with_an_explicit_price_clear_clears_both(bound_session_local) -> None:
     created = booking_created()
     created["service_id"] = 111
-    created["booking_price_int"] = 3500
+    set_booking_price(created, 3500)
     async with bound_session_local() as session:
         async with session.begin():
             await _capture(session, created, payload_hash="h1")
@@ -3006,7 +3159,7 @@ async def test_service_id_change_with_an_explicit_price_clear_clears_both(bound_
 
     updated = booking_updated()
     updated["service_id"] = 222
-    updated["booking_price_int"] = None
+    clear_booking_price(updated)
     async with bound_session_local() as session:
         async with session.begin():
             await _capture(session, updated, event_hint="booking-updated", payload_hash="h2")
@@ -3022,7 +3175,7 @@ async def test_service_id_change_with_an_explicit_price_clear_clears_both(bound_
 async def test_service_id_change_without_any_known_total_stays_null(bound_session_local) -> None:
     created = booking_created()
     created["service_id"] = 111
-    created.pop("booking_price_int", None)
+    drop_booking_price(created)
     async with bound_session_local() as session:
         async with session.begin():
             await _capture(session, created, payload_hash="h1")
@@ -3030,7 +3183,7 @@ async def test_service_id_change_without_any_known_total_stays_null(bound_sessio
 
     updated = booking_updated()
     updated["service_id"] = 222
-    updated.pop("booking_price_int", None)
+    drop_booking_price(updated)
     async with bound_session_local() as session:
         async with session.begin():
             await _capture(session, updated, event_hint="booking-updated", payload_hash="h2")
@@ -3044,7 +3197,7 @@ async def test_service_id_change_without_any_known_total_stays_null(bound_sessio
 async def test_a_service_id_only_resend_does_not_duplicate_the_snapshot(bound_session_local) -> None:
     created = booking_created()
     created["service_id"] = 111
-    created["booking_price_int"] = 3500
+    set_booking_price(created, 3500)
     async with bound_session_local() as session:
         async with session.begin():
             await _capture(session, created, payload_hash="h1")
@@ -3052,7 +3205,7 @@ async def test_a_service_id_only_resend_does_not_duplicate_the_snapshot(bound_se
 
     updated = booking_updated()
     updated["service_id"] = 222
-    updated.pop("booking_price_int", None)
+    drop_booking_price(updated)
     for payload_hash in ("h2", "h3"):
         async with bound_session_local() as session:
             async with session.begin():
@@ -3594,7 +3747,7 @@ async def test_an_unusable_service_id_fails_deterministically(bound_session_loca
     """
     created = booking_created()
     created["service_id"] = 10
-    created["booking_price_int"] = 3500
+    set_booking_price(created, 3500)
     async with bound_session_local() as session:
         async with session.begin():
             await _capture(session, created, payload_hash="h1")
@@ -3608,7 +3761,7 @@ async def test_an_unusable_service_id_fails_deterministically(bound_session_loca
     event["service_id"] = bad_value
     event["services_description"] = "Should never be applied"
     event["services_count"] = 9
-    event["booking_price_int"] = 9900
+    set_booking_price(event, 9900)
     async with bound_session_local() as session:
         async with session.begin():
             event_id = await _capture(session, event, event_hint="booking-updated", payload_hash="h2")
@@ -3630,7 +3783,7 @@ async def test_an_unusable_service_id_fails_deterministically(bound_session_loca
 async def test_an_absent_service_id_still_preserves_identity(bound_session_local) -> None:
     created = booking_created()
     created["service_id"] = 10
-    created["booking_price_int"] = 3500
+    set_booking_price(created, 3500)
     async with bound_session_local() as session:
         async with session.begin():
             await _capture(session, created, payload_hash="h1")
@@ -3653,7 +3806,7 @@ async def test_an_absent_service_id_still_preserves_identity(bound_session_local
 async def test_a_valid_service_id_change_still_works(bound_session_local) -> None:
     created = booking_created()
     created["service_id"] = 10
-    created["booking_price_int"] = 3500
+    set_booking_price(created, 3500)
     async with bound_session_local() as session:
         async with session.begin():
             await _capture(session, created, payload_hash="h1")
@@ -3661,7 +3814,7 @@ async def test_a_valid_service_id_change_still_works(bound_session_local) -> Non
 
     event = booking_updated()
     event["service_id"] = 20
-    event.pop("booking_price_int", None)
+    drop_booking_price(event)
     async with bound_session_local() as session:
         async with session.begin():
             await _capture(session, event, event_hint="booking-updated", payload_hash="h2")
