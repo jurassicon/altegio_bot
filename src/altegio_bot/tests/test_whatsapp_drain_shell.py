@@ -16,6 +16,7 @@ answers from environment variables.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import textwrap
 from pathlib import Path
@@ -25,6 +26,10 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DRAIN_LIB = REPO_ROOT / "scripts" / "lib" / "whatsapp_drain.sh"
 DEPLOY_SCRIPT = REPO_ROOT / "scripts" / "deploy_pr3.sh"
+ACTIVATION_RUNBOOK = REPO_ROOT / "docs" / "easyweek" / "durlach_activation_runbook.md"
+
+OPS_SERVICE = "easyweek-legacy-retire"
+HELPER_MODULE = "altegio_bot.scripts.retire_legacy_whatsapp_worker"
 
 FAKE_DOCKER = r"""#!/usr/bin/env bash
 printf '%s\n' "$*" >> "$FAKE_LOG"
@@ -169,6 +174,122 @@ def test_an_unprobeable_worker_is_treated_as_legacy(shell) -> None:
     result = shell("wa_require_drainable_worker", FAKE_EXEC_FAILS="1", FAKE_CAPABILITY="")
 
     assert result.returncode != 0
+
+
+# ---------------------------------------------------------------------------
+# What the aborted deploy actually tells the operator to do
+# ---------------------------------------------------------------------------
+#
+# The gate above is the ONLY thing an operator sees when the rollout stops, so
+# the procedure it prints is a production artefact. It used to print a command
+# that could not run: `--entrypoint /app/.venv/bin/python altegio-api` (an image
+# built from the previous commit, with no Docker CLI and no Docker socket),
+# `--no-deps`, and `--container <id>` — a target chosen by hand, which the
+# helper refuses on purpose. The runbook was corrected; this message was not,
+# and the rollout stalled on it.
+#
+# These tests therefore run the REAL `wa_legacy_instructions` through the real
+# gate and assert on the stderr production emits — not on documentation prose.
+
+
+def _legacy_stderr(shell) -> subprocess.CompletedProcess[str]:
+    return shell("wa_require_drainable_worker", FAKE_CAPABILITY="legacy")
+
+
+def _flatten(text: str) -> str:
+    """Join shell line continuations and collapse runs of whitespace."""
+    return re.sub(r"\s+", " ", text.replace("\\\n", " "))
+
+
+def _runbook_helper_commands() -> list[str]:
+    """Flattened fenced `bash` commands in the runbook that call the helper."""
+    blocks = re.findall(r"```bash\n(.*?)```", ACTIVATION_RUNBOOK.read_text(), flags=re.DOTALL)
+    return [_flatten(block).strip() for block in blocks if HELPER_MODULE in block]
+
+
+def _helper_lines(stderr: str) -> list[str]:
+    return [line for line in stderr.splitlines() if HELPER_MODULE in line]
+
+
+def test_the_legacy_message_prescribes_the_ops_service_procedure(shell) -> None:
+    result = _legacy_stderr(shell)
+
+    assert result.returncode != 0, "the gate must still fail closed"
+    assert "--profile ops" in result.stderr, f"{OPS_SERVICE} only exists behind its profile"
+    assert f"run --rm --build {OPS_SERVICE}" in result.stderr, "the helper needs an image built from this commit"
+    assert HELPER_MODULE in result.stderr
+    assert "--probe" in result.stderr
+    assert "durlach_activation_runbook" in result.stderr
+
+
+def test_the_unrunnable_command_is_gone_from_the_message(shell) -> None:
+    """Each fragment below made the printed command fail or unsafe."""
+    stderr = _legacy_stderr(shell).stderr
+
+    assert "altegio-api" not in stderr, "the API image has no helper module, no Docker CLI and no socket"
+    assert "--no-deps" not in stderr
+    assert "--entrypoint" not in stderr
+    assert "--container" not in stderr, "the helper resolves and proves its own target"
+    assert "<id>" not in stderr, "no hand-picked container id may be pasted anywhere"
+
+
+def test_the_read_only_probe_comes_before_the_mutating_retirement(shell) -> None:
+    """Two distinct runs, in one order: probe first, retirement second."""
+    stderr = _legacy_stderr(shell).stderr
+
+    helper_lines = _helper_lines(stderr)
+    assert len(helper_lines) == 2, f"expected a probe and a retirement, got {len(helper_lines)} helper invocation(s)"
+    assert "--probe" in helper_lines[0], "the first run must be the read-only probe"
+    assert "--probe" not in helper_lines[1], "the retirement must be a separate, explicitly mutating run"
+
+    assert stderr.count("--probe") == 1, "the mutating run must not be probe-flagged anywhere"
+    assert stderr.count(f"run --rm --build {OPS_SERVICE}") == 2, "both steps run the ops service from a fresh build"
+
+
+def test_the_message_states_what_the_probe_must_report_and_forbids_continuing(shell) -> None:
+    """A probe the operator cannot judge is not a gate."""
+    stderr = _legacy_stderr(shell).stderr
+
+    for expectation in ("docker_cli: True", "docker_daemon: True", "database: True"):
+        assert expectation in stderr, f"the operator must know that {expectation} is required"
+    assert re.search(r"whatsapp_worker_containers exactly\s+1", stderr), "exactly one container, never 'at least one'"
+
+    after_probe = stderr.split("--probe", 1)[1]
+    assert "STOP" in after_probe
+    assert "do NOT continue to step 2" in after_probe
+    assert "deploy again" in stderr, "the rollout resumes only by re-running the deploy"
+
+
+def test_the_shell_and_the_runbook_prescribe_the_same_two_commands(shell) -> None:
+    """Derived from the runbook, asserted on stderr: one procedure, two places."""
+    commands = _runbook_helper_commands()
+    assert len(commands) == 2, f"the runbook must document exactly a probe and a retirement, got {len(commands)}"
+
+    flat_stderr = _flatten(_legacy_stderr(shell).stderr)
+    for command in commands:
+        # Drop the operator's `$COMPOSE` variable: the message spells the file
+        # set out in full, but everything after it must match token for token.
+        assert "$COMPOSE" in command, "the runbook commands are written against $COMPOSE"
+        tail = command.split("$COMPOSE", 1)[1].strip()
+        assert tail in flat_stderr, f"the deploy prints a different command than the runbook: {tail!r}"
+
+    probe_command, retire_command = commands
+    assert probe_command.endswith("--probe")
+    assert not retire_command.endswith("--probe")
+
+
+def test_printing_the_procedure_never_executes_any_of_it(shell) -> None:
+    """The retirement stays a deliberate operator action, not a deploy step."""
+    result = _legacy_stderr(shell)
+    assert result.returncode != 0
+
+    issued = _commands(shell)
+    verbs = {line.split()[0] for line in issued if line.split()}
+    assert "compose" not in verbs, "the gate must not run the retirement it printed"
+    assert "build" not in verbs, "a legacy worker aborts before anything is built"
+    assert "pause" not in verbs
+    assert "run" not in verbs
+    assert not any("alembic" in line or "upgrade head" in line for line in issued), "no migration may start"
 
 
 # An absent or stopped container is NOT evidence that nothing was stranded: a
