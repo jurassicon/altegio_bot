@@ -1106,3 +1106,325 @@ async def test_the_same_instant_conflict_blocks_the_general_relay(
     async with session_maker() as session:
         event = await session.get(WhatsAppEvent, event_id)
     assert event.error == "operator_relay: general_affinity_ambiguous"
+
+
+# ---------------------------------------------------------------------------
+# The warning has to survive a crash
+# ---------------------------------------------------------------------------
+#
+# The event is terminal `processed` with no Outbox, so no other recovery path
+# revisits it: an obligation held only in memory dies with the process, and the
+# operator is never told. The marker is therefore written in the SAME
+# transaction that terminalizes the event.
+
+
+def _note_marker(payload: dict[str, Any]) -> dict[str, Any]:
+    return (payload or {}).get(wiw._GENERAL_NOTE_KEY) or {}
+
+
+async def _seed_blocked_relay_event(
+    session_maker: async_sessionmaker[AsyncSession],
+    *,
+    conversation_id: int = 600,
+    message_id: int = 9600,
+) -> int:
+    """A committed pending marker, exactly as a crashed worker would leave it."""
+    async with session_maker() as session:
+        async with session.begin():
+            event = WhatsAppEvent(
+                dedupe_key=f"chatwoot_out:{conversation_id}:{message_id}",
+                status="processed",
+                error="operator_relay: general_affinity_no_evidence",
+                query={},
+                headers={},
+                payload={
+                    "_chatwoot_operator_relay": {
+                        "recipient_phone": PHONE,
+                        "text": "Hallo!",
+                        "conversation_id": conversation_id,
+                        "message_id": message_id,
+                        "phone_number_id": "PNID_GENERAL",
+                        "chatwoot_inbox_id": GENERAL_INBOX,
+                    },
+                    wiw._GENERAL_NOTE_KEY: {
+                        "status": "pending",
+                        "reason": "operator_relay: general_affinity_no_evidence",
+                        "attempts": 0,
+                        "updated_at": NOW.isoformat(),
+                    },
+                },
+                chatwoot_conversation_id=conversation_id,
+            )
+            session.add(event)
+            await session.flush()
+            return int(event.id)
+
+
+@pytest.mark.parametrize("blocked", ["no_evidence", "ambiguous", "invalid"])
+async def test_every_blocked_outcome_commits_a_pending_marker(
+    session_maker: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+    blocked: str,
+) -> None:
+    """Committed with the terminal status, not merely held in memory."""
+    async with session_maker() as session:
+        if blocked == "ambiguous":
+            await _client(session, 9001, DURLACH)
+            await _client(session, 9002, RASTATT)
+        elif blocked == "invalid":
+            await _operator_outbox(session, 1, RASTATT, sent_at=NOW, outbox_company=999599)
+
+    provider, spy, event_id = await _run_general_relay(session_maker, monkeypatch, mode="affinity")
+
+    async with session_maker() as session:
+        event = await session.get(WhatsAppEvent, event_id)
+
+    marker = _note_marker(event.payload)
+    assert marker["reason"] == f"operator_relay: general_affinity_{blocked}"
+    assert marker["status"] == "sent", "the happy path completes the marker"
+    # The captured relay envelope is audit data and must be untouched.
+    assert event.payload["_chatwoot_operator_relay"]["text"] == "Hallo!"
+    assert provider.sent == []
+
+
+async def test_a_crash_before_the_note_leaves_a_pending_marker_that_recovery_finishes(
+    session_maker: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Scenario A: the process dies between COMMIT and the Chatwoot call."""
+    monkeypatch.setattr(wiw, "SessionLocal", session_maker)
+    _relay_settings(monkeypatch, "affinity")
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_reopen_private_note_enabled", True)
+
+    class _Crash(RuntimeError):
+        pass
+
+    # Keep the real sender so recovery can use it once the "process" restarts.
+    real_sender = wiw._send_general_affinity_blocked_note
+
+    async def _die(*args: Any, **kwargs: Any) -> None:
+        raise _Crash("worker died before the note")
+
+    monkeypatch.setattr(wiw, "_send_general_affinity_blocked_note", _die)
+    provider = _CountingProvider()
+
+    async with session_maker() as session:
+        async with session.begin():
+            event = WhatsAppEvent(
+                dedupe_key="chatwoot_out:601:9601",
+                status="received",
+                query={},
+                headers={},
+                payload={
+                    "_chatwoot_operator_relay": {
+                        "recipient_phone": PHONE,
+                        "text": "Hallo!",
+                        "conversation_id": 601,
+                        "message_id": 9601,
+                        "phone_number_id": "PNID_GENERAL",
+                        "chatwoot_inbox_id": GENERAL_INBOX,
+                    },
+                },
+                chatwoot_conversation_id=601,
+            )
+            session.add(event)
+            await session.flush()
+            event_id = int(event.id)
+
+    with pytest.raises(_Crash):
+        await wiw.process_one_event(event_id, provider)
+
+    # The terminal state survived the crash, and so did the obligation.
+    async with session_maker() as session:
+        event = await session.get(WhatsAppEvent, event_id)
+        outbox = list((await session.execute(select(OutboxMessage))).scalars().all())
+
+    assert event.status == "processed"
+    assert event.error == "operator_relay: general_affinity_no_evidence"
+    assert _note_marker(event.payload)["status"] == "pending"
+    assert outbox == [], "no sender was proven, so no Outbox may exist"
+    assert provider.sent == []
+
+    # Recovery finishes what the crash interrupted.
+    spy = _NoteSpy()
+    spy.install(monkeypatch)
+    monkeypatch.setattr(wiw, "_send_general_affinity_blocked_note", real_sender)
+    dispatched = await wiw.dispatch_pending_general_affinity_notes()
+
+    assert dispatched == 1
+    assert len(spy.notes) == 1
+    assert spy.notes[0]["private"] is True
+    assert spy.notes[0]["conversation_id"] == 601
+
+    async with session_maker() as session:
+        event = await session.get(WhatsAppEvent, event_id)
+    assert _note_marker(event.payload)["status"] == "sent"
+    assert provider.sent == [], "recovery must never call Meta"
+
+
+async def test_a_transient_chatwoot_failure_stays_pending_then_succeeds_once(
+    session_maker: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Scenario B: timeout, retry, success — and no third note afterwards."""
+    monkeypatch.setattr(wiw, "SessionLocal", session_maker)
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_reopen_private_note_enabled", True)
+    event_id = await _seed_blocked_relay_event(session_maker, conversation_id=602, message_id=9602)
+
+    attempts: list[int] = []
+
+    class _FlakyChatwoot:
+        async def send_message(self, conversation_id: int, text: str, **kwargs: Any) -> dict[str, Any]:
+            attempts.append(conversation_id)
+            if len(attempts) == 1:
+                raise TimeoutError("https://chatwoot.example/api?token=SECRET")
+            return {"id": 1}
+
+        async def aclose(self) -> None:
+            return None
+
+    monkeypatch.setattr(wiw, "ChatwootClient", _FlakyChatwoot)
+
+    await wiw.dispatch_pending_general_affinity_notes()
+    async with session_maker() as session:
+        event = await session.get(WhatsAppEvent, event_id)
+    marker = _note_marker(event.payload)
+    assert marker["status"] == "pending", "a transient failure must stay recoverable"
+    assert marker["attempts"] == 1
+    assert marker["error_type"] == "TimeoutError"
+    assert "SECRET" not in str(event.payload), "no URL or token may be persisted"
+
+    await wiw.dispatch_pending_general_affinity_notes()
+    async with session_maker() as session:
+        event = await session.get(WhatsAppEvent, event_id)
+    assert _note_marker(event.payload)["status"] == "sent"
+    assert len(attempts) == 2
+
+    # A completed note is not resent by the next ordinary cycle.
+    await wiw.dispatch_pending_general_affinity_notes()
+    assert len(attempts) == 2
+
+
+async def test_a_permanently_failing_note_becomes_terminal(
+    session_maker: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bounded attempts: never an eternally pending row."""
+    monkeypatch.setattr(wiw, "SessionLocal", session_maker)
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_reopen_private_note_enabled", True)
+    event_id = await _seed_blocked_relay_event(session_maker, conversation_id=603, message_id=9603)
+
+    class _DeadChatwoot:
+        async def send_message(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+            raise ConnectionError("unreachable")
+
+        async def aclose(self) -> None:
+            return None
+
+    monkeypatch.setattr(wiw, "ChatwootClient", _DeadChatwoot)
+
+    for _ in range(wiw._TERMINAL_ACTION_MAX_ATTEMPTS + 2):
+        await wiw.dispatch_pending_general_affinity_notes()
+
+    async with session_maker() as session:
+        event = await session.get(WhatsAppEvent, event_id)
+    marker = _note_marker(event.payload)
+    assert marker["status"] == "failed"
+    assert marker["attempts"] == wiw._TERMINAL_ACTION_MAX_ATTEMPTS
+    assert marker["error_type"] == "ConnectionError"
+
+
+async def test_disabled_private_notes_end_terminally_not_pending(
+    session_maker: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(wiw, "SessionLocal", session_maker)
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_reopen_private_note_enabled", False)
+    event_id = await _seed_blocked_relay_event(session_maker, conversation_id=604, message_id=9604)
+
+    await wiw.dispatch_pending_general_affinity_notes()
+
+    async with session_maker() as session:
+        event = await session.get(WhatsAppEvent, event_id)
+    assert _note_marker(event.payload)["status"] == "disabled"
+
+
+async def test_recovery_only_posts_a_note_and_never_replays_the_relay(
+    session_maker: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Scenario C: a restarted worker finds the marker and finishes it."""
+    monkeypatch.setattr(wiw, "SessionLocal", session_maker)
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_reopen_private_note_enabled", True)
+    event_id = await _seed_blocked_relay_event(session_maker, conversation_id=605, message_id=9605)
+
+    spy = _NoteSpy()
+    spy.install(monkeypatch)
+
+    dispatched = await wiw.dispatch_pending_general_affinity_notes()
+
+    assert dispatched == 1
+    assert len(spy.notes) == 1
+    assert spy.notes[0]["private"] is True
+
+    async with session_maker() as session:
+        event = await session.get(WhatsAppEvent, event_id)
+        senders = list((await session.execute(select(WhatsAppSender))).scalars().all())
+        outbox = list((await session.execute(select(OutboxMessage))).scalars().all())
+
+    assert event.status == "processed", "the relay must not be reopened"
+    assert outbox == [], "recovery must never create an Outbox"
+    assert senders == [], "recovery must never resolve a sender"
+    assert PHONE not in spy.notes[0]["text"]
+    assert "Hallo!" not in spy.notes[0]["text"]
+
+
+async def test_the_lifecycle_runs_the_note_recovery_alongside_the_others(
+    session_maker: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """It must be wired into the real cycle, not only callable on its own."""
+    monkeypatch.setattr(wiw, "SessionLocal", session_maker)
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_reopen_private_note_enabled", True)
+    await _seed_blocked_relay_event(session_maker, conversation_id=606, message_id=9606)
+
+    spy = _NoteSpy()
+    spy.install(monkeypatch)
+    provider = _CountingProvider()
+
+    stats = await wiw.recover_operator_relay_lifecycle(provider)
+
+    assert len(spy.notes) == 1
+    assert stats.dispatched_actions >= 1
+    assert provider.sent == [], "no recovery step may call Meta"
+
+
+async def test_one_stuck_note_does_not_block_the_rest_of_the_batch(
+    session_maker: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(wiw, "SessionLocal", session_maker)
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_reopen_private_note_enabled", True)
+    first = await _seed_blocked_relay_event(session_maker, conversation_id=607, message_id=9607)
+    await _seed_blocked_relay_event(session_maker, conversation_id=608, message_id=9608)
+
+    delivered: list[int] = []
+
+    class _PartlyBroken:
+        async def send_message(self, conversation_id: int, text: str, **kwargs: Any) -> dict[str, Any]:
+            if conversation_id == 607:
+                raise ConnectionError("stuck")
+            delivered.append(conversation_id)
+            return {"id": 1}
+
+        async def aclose(self) -> None:
+            return None
+
+    monkeypatch.setattr(wiw, "ChatwootClient", _PartlyBroken)
+
+    await wiw.dispatch_pending_general_affinity_notes()
+
+    assert delivered == [608], "the healthy note still went out"
+    async with session_maker() as session:
+        stuck = await session.get(WhatsAppEvent, first)
+    assert _note_marker(stuck.payload)["status"] == "pending"

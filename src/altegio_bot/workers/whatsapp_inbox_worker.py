@@ -434,16 +434,82 @@ _GENERAL_AFFINITY_BLOCKED_NOTE = (
 )
 
 
-async def _send_general_affinity_blocked_note(conversation_id: int, reason: str) -> None:
+# The durable marker for that note.
+#
+# It lives on the event's payload as a SIBLING of `_chatwoot_operator_relay`,
+# never inside it: the relay envelope is captured audit data and stays byte for
+# byte as the webhook wrote it. The payload of a relay event is itself a
+# synthesized envelope (webhooks/chatwoot.py builds it), not raw Meta data, so
+# a technical key beside it carries no other authoritative meaning.
+#
+# A column would have been cleaner, but this fix may not add schema — and the
+# obligation MUST outlive the process: the event is already terminal
+# `processed`, so no other recovery path will ever revisit it.
+_GENERAL_NOTE_KEY = "_general_affinity_note"
+_NOTE_PENDING = "pending"
+_NOTE_SENT = "sent"
+_NOTE_FAILED = "failed"
+_NOTE_DISABLED = "disabled"
+
+
+def _blocked_note_marker(reason: str) -> dict[str, Any]:
+    """The pending obligation, written in the terminal transaction itself."""
+    return {
+        "status": _NOTE_PENDING,
+        "reason": reason,
+        "attempts": 0,
+        "updated_at": utcnow().isoformat(),
+    }
+
+
+def _stamp_blocked_note(event: WhatsAppEvent, marker: dict[str, Any]) -> None:
+    """Persist the marker, replacing the payload dict so SQLAlchemy sees it."""
+    payload = dict(event.payload or {})
+    payload[_GENERAL_NOTE_KEY] = marker
+    event.payload = payload
+
+
+async def _persist_blocked_note_marker(event_id: int, marker: dict[str, Any]) -> None:
+    """Short transaction of its own — never open during a Chatwoot call."""
+    async with SessionLocal() as session:
+        async with session.begin():
+            event = await session.get(WhatsAppEvent, event_id)
+            if event is None:
+                return
+            _stamp_blocked_note(event, marker)
+
+
+async def _send_general_affinity_blocked_note(
+    event_id: int,
+    conversation_id: int,
+    reason: str,
+    *,
+    attempts: int = 0,
+) -> None:
     """Tell the operator their General reply was not delivered.
 
     Runs AFTER the transaction is committed — a Chatwoot call must never be made
-    with a PostgreSQL transaction open. Never raises: failing to write the note
-    must not resurrect the relay, and there is nothing to send anyway, since no
-    sender was ever chosen.
+    with a PostgreSQL transaction open. Never raises: failing here must not
+    resurrect the relay, and there is nothing to send anyway, since no sender
+    was ever chosen.
+
+    The durable marker is what makes this survivable. A transient Chatwoot
+    failure leaves it `pending` so the next recovery cycle retries; only after
+    :data:`_TERMINAL_ACTION_MAX_ATTEMPTS` does it become terminal `failed`.
+
+    At-least-once, deliberately: Chatwoot may accept the note and the worker may
+    die before recording it, so a rare duplicate warning is possible. On this
+    single-worker topology that is the right trade — a repeated warning is
+    harmless, a silently lost one is not.
     """
+    attempt = attempts + 1
     if not settings.chatwoot_operator_reopen_private_note_enabled:
+        # Terminal `disabled`, never an eternally pending row.
         logger.info("operator_relay: blocked note disabled conv_id=%s reason=%s", conversation_id, reason)
+        await _persist_blocked_note_marker(
+            event_id,
+            {"status": _NOTE_DISABLED, "reason": reason, "attempts": attempts, "updated_at": utcnow().isoformat()},
+        )
         return
 
     cw = ChatwootClient()
@@ -455,16 +521,83 @@ async def _send_general_affinity_blocked_note(conversation_id: int, reason: str)
             private=True,
         )
         logger.info("operator_relay: blocked note sent conv_id=%s reason=%s", conversation_id, reason)
+        await _persist_blocked_note_marker(
+            event_id,
+            {"status": _NOTE_SENT, "reason": reason, "attempts": attempt, "updated_at": utcnow().isoformat()},
+        )
     except Exception as exc:
-        # A Chatwoot exception may carry a URL or a token: class name only.
+        # A Chatwoot exception may carry a URL, a token or a response body:
+        # the class name is the only part that may be recorded.
+        error_type = type(exc).__name__
+        exhausted = attempt >= _TERMINAL_ACTION_MAX_ATTEMPTS
         logger.warning(
-            "operator_relay: blocked note failed conv_id=%s reason=%s error_type=%s",
+            "operator_relay: blocked note failed conv_id=%s reason=%s error_type=%s attempts=%s",
             conversation_id,
             reason,
-            type(exc).__name__,
+            error_type,
+            attempt,
+        )
+        await _persist_blocked_note_marker(
+            event_id,
+            {
+                "status": _NOTE_FAILED if exhausted else _NOTE_PENDING,
+                "reason": reason,
+                "attempts": attempt,
+                "error_type": error_type,
+                "updated_at": utcnow().isoformat(),
+            },
         )
     finally:
         await cw.aclose()
+
+
+async def dispatch_pending_general_affinity_notes(*, limit: int | None = None) -> int:
+    """Finish blocked-General notes whose delivery never completed.
+
+    The event is terminal `processed` with no Outbox, so no other recovery path
+    revisits it: without this step a crash between the commit and the Chatwoot
+    call would leave the operator permanently unwarned.
+
+    Bounded batch. Never calls Meta, never resolves a sender, never creates an
+    Outbox row and never re-runs the relay — it only finishes the note.
+    """
+    batch = limit or settings.chatwoot_operator_relay_recovery_batch_size
+    async with SessionLocal() as session:
+        rows = (
+            await session.execute(
+                select(WhatsAppEvent.id, WhatsAppEvent.chatwoot_conversation_id, WhatsAppEvent.payload)
+                .where(WhatsAppEvent.payload[_GENERAL_NOTE_KEY]["status"].astext == _NOTE_PENDING)
+                .order_by(WhatsAppEvent.id.asc())
+                .limit(batch)
+            )
+        ).all()
+
+    dispatched = 0
+    for event_id, conversation_id, payload in rows:
+        marker = (payload or {}).get(_GENERAL_NOTE_KEY) or {}
+        if conversation_id is None:
+            # Nothing to post into: close it out rather than retry forever.
+            await _persist_blocked_note_marker(
+                int(event_id),
+                {**marker, "status": _NOTE_FAILED, "updated_at": utcnow().isoformat()},
+            )
+            continue
+        try:
+            await _send_general_affinity_blocked_note(
+                int(event_id),
+                int(conversation_id),
+                str(marker.get("reason") or ""),
+                attempts=int(marker.get("attempts") or 0),
+            )
+            dispatched += 1
+        except Exception as exc:
+            # One stuck note must never stop the rest of the batch.
+            logger.error(
+                "operator_relay: blocked note dispatch failed event_id=%s error_type=%s",
+                event_id,
+                type(exc).__name__,
+            )
+    return dispatched
 
 
 def _inbound_mode_forces_general() -> bool:
@@ -3102,6 +3235,10 @@ async def _prepare_operator_relay(event_id: int, provider: WhatsAppProvider) -> 
                     hint_err,
                 )
                 _mark_event_processed(event, hint_err)
+                # The obligation is committed with the terminal status, not
+                # merely held in memory: this event is now terminal `processed`
+                # with no Outbox, so nothing else would ever revisit it.
+                _stamp_blocked_note(event, _blocked_note_marker(hint_err))
                 return _PreparedRelay(
                     outbox_id=None,
                     blocked_note_conversation_id=optional_chatwoot_id(conversation_id),
@@ -3648,6 +3785,7 @@ async def _process_operator_relay_event(event_id: int, provider: WhatsAppProvide
 
     if prepared.blocked_note_conversation_id is not None:
         await _send_general_affinity_blocked_note(
+            event_id,
             prepared.blocked_note_conversation_id,
             prepared.blocked_note_reason or "",
         )
@@ -3909,6 +4047,16 @@ async def recover_operator_relay_lifecycle(
     except Exception as exc:
         logger.error(
             "operator_relay: recovery step failed operation=terminal_actions error_type=%s", type(exc).__name__
+        )
+    try:
+        # 5. Blocked General replies whose warning never reached the operator.
+        #    They own no Outbox, so step 4 cannot see them, and the event is
+        #    already terminal, so steps 1-3 never revisit it.
+        stats.dispatched_actions += await dispatch_pending_general_affinity_notes()
+    except Exception as exc:
+        logger.error(
+            "operator_relay: recovery step failed operation=general_affinity_notes error_type=%s",
+            type(exc).__name__,
         )
 
     if stats.recovered_sending or stats.recovered_processing or stats.resumed_queued or stats.dispatched_actions:
