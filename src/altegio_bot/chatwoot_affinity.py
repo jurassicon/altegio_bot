@@ -140,25 +140,32 @@ async def _identity_from_communication(
     # Walk newest-first and stop at the first row whose identity is PROVABLE.
     # Rows that prove nothing (General ACK, jobless bot row) are skipped rather
     # than treated as evidence or as a conflict.
-    ranked: list[tuple[tuple[datetime | None, int], ChatwootTenantIdentity]] = []
+    ranked: list[tuple[datetime | None, int, ChatwootTenantIdentity]] = []
     for row in rows:
         identity, verdict = await _identity_of_outbox(session, row)
         if verdict is not None:
             return verdict
         if identity is None:
             continue
-        ranked.append(((row.sent_at, int(row.id)), identity))
+        ranked.append((row.sent_at, int(row.id), identity))
 
     if not ranked:
         return None
 
-    top_key = ranked[0][0]
-    top_identities = {identity for key, identity in ranked if key == top_key}
-    if len(top_identities) > 1:
-        # Two rows at the very same instant AND id cannot both be "the last".
+    # The two keys have different jobs, and conflating them was a real defect:
+    # ranking by `(sent_at, id)` made every key unique, so two branches that
+    # delivered at the SAME instant could never tie — the larger row id quietly
+    # won and was reported as proven. Time alone decides which communications
+    # are "the latest"; the id only orders rows inside that bucket, and never
+    # arbitrates between tenants.
+    newest = ranked[0][0]
+    tied = [identity for sent_at, _row_id, identity in ranked if sent_at == newest]
+
+    if len(set(tied)) > 1:
         return _ambiguous("communication", "conflicting_latest_communication")
 
-    return _proven(ranked[0][1], "communication")
+    # One identity, however many rows proved it.
+    return _proven(tied[0], "communication")
 
 
 async def _identity_of_outbox(

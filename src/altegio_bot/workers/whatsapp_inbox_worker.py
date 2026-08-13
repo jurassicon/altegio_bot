@@ -417,6 +417,56 @@ def _company_hint_from_inbox(
     return parsed.mapping[inbox_int], None
 
 
+# Errors from the General-affinity path, as opposed to every other relay
+# refusal. Only these owe the operator a private note: the reply looked
+# perfectly normal in Chatwoot and silently went nowhere.
+_GENERAL_AFFINITY_BLOCKED_PREFIX = "operator_relay: general_affinity_"
+
+# Static, non-PII, and deliberately identical for every blocked outcome the
+# operator can act on the same way. The reason code lives in the event and the
+# logs; the note tells a human what happened, without naming the customer.
+_GENERAL_AFFINITY_BLOCKED_NOTE = (
+    "⚠️ Diese Nachricht wurde NICHT per WhatsApp an den Kunden gesendet.\n\n"
+    "Die Filiale liess sich für diesen Kontakt nicht eindeutig bestimmen, "
+    "deshalb wurde keine Absendernummer gewählt.\n\n"
+    "Bitte antworte aus der Filial-Inbox (Karlsruhe, Durlach oder Rastatt), "
+    "zu der dieser Kunde gehört."
+)
+
+
+async def _send_general_affinity_blocked_note(conversation_id: int, reason: str) -> None:
+    """Tell the operator their General reply was not delivered.
+
+    Runs AFTER the transaction is committed — a Chatwoot call must never be made
+    with a PostgreSQL transaction open. Never raises: failing to write the note
+    must not resurrect the relay, and there is nothing to send anyway, since no
+    sender was ever chosen.
+    """
+    if not settings.chatwoot_operator_reopen_private_note_enabled:
+        logger.info("operator_relay: blocked note disabled conv_id=%s reason=%s", conversation_id, reason)
+        return
+
+    cw = ChatwootClient()
+    try:
+        await cw.send_message(
+            conversation_id,
+            _GENERAL_AFFINITY_BLOCKED_NOTE,
+            message_type="outgoing",
+            private=True,
+        )
+        logger.info("operator_relay: blocked note sent conv_id=%s reason=%s", conversation_id, reason)
+    except Exception as exc:
+        # A Chatwoot exception may carry a URL or a token: class name only.
+        logger.warning(
+            "operator_relay: blocked note failed conv_id=%s reason=%s error_type=%s",
+            conversation_id,
+            reason,
+            type(exc).__name__,
+        )
+    finally:
+        await cw.aclose()
+
+
 def _inbound_mode_forces_general() -> bool:
     """`general` mode: show every customer inbound in the one General inbox.
 
@@ -2716,6 +2766,12 @@ class _PreparedRelay:
     outbox_id: int | None = None
     send_type: str | None = None
     terminal_outbox_id: int | None = None
+    # PR-7.2: a General reply blocked because the branch could not be proven.
+    # It owns no Outbox row — inventing one would need a company_id nobody
+    # proved — so the note it still owes the operator travels here instead, and
+    # is delivered after the transaction closes.
+    blocked_note_conversation_id: int | None = None
+    blocked_note_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -3032,6 +3088,24 @@ async def _prepare_operator_relay(event_id: int, provider: WhatsAppProvider) -> 
                     session,
                     chatwoot_inbox_id=chatwoot_inbox_id,
                     phone_e164=phone_e164,
+                )
+
+            if hint_err is not None and hint_err.startswith(_GENERAL_AFFINITY_BLOCKED_PREFIX):
+                # Blocked General reply: terminal, no Meta, no sender, no
+                # Outbox — but the operator must be told, or they will assume
+                # the customer received it. The note is sent after commit.
+                logger.warning(
+                    "operator_relay: general reply blocked event_id=%s conv_id=%s msg_id=%s err=%s",
+                    event.id,
+                    safe_log_value(conversation_id, limit=32),
+                    safe_log_value(chatwoot_message_id, limit=32),
+                    hint_err,
+                )
+                _mark_event_processed(event, hint_err)
+                return _PreparedRelay(
+                    outbox_id=None,
+                    blocked_note_conversation_id=optional_chatwoot_id(conversation_id),
+                    blocked_note_reason=hint_err,
                 )
 
             if hint_err is not None:
@@ -3571,6 +3645,12 @@ async def _process_operator_relay_event(event_id: int, provider: WhatsAppProvide
 
     if prepared.terminal_outbox_id is not None:
         await _dispatch_terminal_actions_for(prepared.terminal_outbox_id)
+
+    if prepared.blocked_note_conversation_id is not None:
+        await _send_general_affinity_blocked_note(
+            prepared.blocked_note_conversation_id,
+            prepared.blocked_note_reason or "",
+        )
 
     if prepared.outbox_id is None:
         return

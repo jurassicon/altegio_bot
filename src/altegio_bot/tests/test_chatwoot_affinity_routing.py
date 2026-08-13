@@ -484,6 +484,8 @@ async def test_the_result_carries_no_customer_data(
 
 from typing import Any  # noqa: E402
 
+from sqlalchemy import select  # noqa: E402
+
 from altegio_bot.models.models import WhatsAppEvent  # noqa: E402
 from altegio_bot.workers import whatsapp_inbox_worker as wiw  # noqa: E402
 
@@ -695,3 +697,412 @@ async def test_the_relay_hint_logs_no_customer_data(
 
     assert PHONE not in caplog.text
     assert BRANCH_MAP not in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Blocked General relay: the operator must be told
+# ---------------------------------------------------------------------------
+#
+# Terminating the event silently is worse than the original bug: the reply
+# looks sent in Chatwoot, so the operator believes the customer received it.
+# No tenant is proven here, so there is no Outbox to hang the existing
+# terminal-action machinery on — inventing one would need a company_id nobody
+# proved. A narrow post-commit note carries it instead.
+
+from altegio_bot.providers.base import WhatsAppProvider  # noqa: E402
+
+
+class _CountingProvider(WhatsAppProvider):
+    """Fails the test loudly if the blocked path ever reaches Meta."""
+
+    def __init__(self) -> None:
+        self.sent: list[dict[str, Any]] = []
+
+    async def send(self, sender_id: int, phone_e164: str, text: str, **kwargs: Any) -> str:
+        self.sent.append({"sender_id": sender_id})
+        return "wamid.SHOULD_NOT_HAPPEN"
+
+    async def send_template(self, *args: Any, **kwargs: Any) -> str:
+        self.sent.append({"template": True})
+        return "wamid.SHOULD_NOT_HAPPEN"
+
+
+class _NoteSpy:
+    """Captures the private notes the worker would post to Chatwoot."""
+
+    def __init__(self) -> None:
+        self.notes: list[dict[str, Any]] = []
+
+    def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        spy = self
+
+        class _FakeChatwoot:
+            async def send_message(
+                self,
+                conversation_id: int,
+                text: str,
+                *,
+                message_type: str = "outgoing",
+                private: bool = False,
+            ) -> dict[str, Any]:
+                spy.notes.append(
+                    {
+                        "conversation_id": conversation_id,
+                        "text": text,
+                        "private": private,
+                        "message_type": message_type,
+                    }
+                )
+                return {"id": 1}
+
+            async def aclose(self) -> None:
+                return None
+
+        monkeypatch.setattr(wiw, "ChatwootClient", _FakeChatwoot)
+
+
+async def _run_general_relay(
+    session_maker: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    mode: str,
+    conversation_id: int = 500,
+    message_id: int = 9000,
+    inbox_id: object = GENERAL_INBOX,
+) -> tuple[_CountingProvider, _NoteSpy, int]:
+    """Drive a real operator-relay event end to end."""
+    monkeypatch.setattr(wiw, "SessionLocal", session_maker)
+    monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
+    _relay_settings(monkeypatch, mode)
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_reopen_private_note_enabled", True)
+
+    provider = _CountingProvider()
+    spy = _NoteSpy()
+    spy.install(monkeypatch)
+
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(
+                WhatsAppSender(
+                    id=700,
+                    provider=PROVIDER_EASYWEEK,
+                    company_id=DURLACH[1],
+                    sender_code="default",
+                    phone_number_id="PNID_GENERAL",
+                    display_phone="+49",
+                    is_active=True,
+                )
+            )
+            event = WhatsAppEvent(
+                dedupe_key=f"chatwoot_out:{conversation_id}:{message_id}",
+                status="received",
+                query={},
+                headers={},
+                payload={
+                    "_chatwoot_operator_relay": {
+                        "recipient_phone": PHONE,
+                        "text": "Hallo!",
+                        "conversation_id": conversation_id,
+                        "message_id": message_id,
+                        "phone_number_id": "PNID_GENERAL",
+                        "chatwoot_inbox_id": inbox_id,
+                    },
+                },
+                chatwoot_conversation_id=conversation_id,
+            )
+            session.add(event)
+            await session.flush()
+            event_id = int(event.id)
+
+    await wiw.process_one_event(event_id, provider)
+    return provider, spy, event_id
+
+
+@pytest.mark.parametrize("mode", ["affinity", "general"])
+@pytest.mark.parametrize("blocked", ["no_evidence", "ambiguous", "invalid"])
+async def test_a_blocked_general_reply_warns_the_operator_and_never_reaches_meta(
+    session_maker: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+    blocked: str,
+) -> None:
+    async with session_maker() as session:
+        if blocked == "ambiguous":
+            await _client(session, 9001, DURLACH)
+            await _client(session, 9002, RASTATT)
+        elif blocked == "invalid":
+            await _operator_outbox(session, 1, RASTATT, sent_at=NOW, outbox_company=999599)
+
+    provider, spy, event_id = await _run_general_relay(session_maker, monkeypatch, mode=mode)
+
+    assert provider.sent == [], f"{mode}/{blocked}: Meta must never be called"
+
+    async with session_maker() as session:
+        event = await session.get(WhatsAppEvent, event_id)
+        rows = list(
+            (await session.execute(select(OutboxMessage).where(OutboxMessage.chatwoot_conversation_id == 500)))
+            .scalars()
+            .all()
+        )
+
+    assert event.status == "processed"
+    assert event.error == f"operator_relay: general_affinity_{blocked}"
+    assert rows == [], "no sender was proven, so no Outbox may exist at all"
+
+    assert len(spy.notes) == 1, f"{mode}/{blocked}: the operator must be warned exactly once"
+    note = spy.notes[0]
+    assert note["private"] is True
+    assert note["conversation_id"] == 500
+    assert "NICHT" in note["text"]
+    # The note explains the situation without naming the customer.
+    assert PHONE not in note["text"]
+    assert "Hallo!" not in note["text"]
+
+
+async def test_a_provable_general_reply_still_sends_and_posts_no_warning(
+    session_maker: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The control: proving a branch must still deliver as before."""
+    async with session_maker() as session:
+        await _delivered_bot_outbox(session, 1, DURLACH, sent_at=NOW - timedelta(hours=2))
+
+    provider, spy, event_id = await _run_general_relay(session_maker, monkeypatch, mode="affinity")
+
+    async with session_maker() as session:
+        event = await session.get(WhatsAppEvent, event_id)
+        outbox = (
+            await session.execute(select(OutboxMessage).where(OutboxMessage.chatwoot_conversation_id == 500))
+        ).scalar_one()
+
+    # The relay was accepted and bound to the PROVEN branch. Whether Meta is
+    # actually called depends on the 24h customer window, which this PR does
+    # not touch — affinity's job is choosing the right sender.
+    assert event.error is None
+    assert outbox.sender_id == 700
+    assert outbox.company_id == DURLACH[1]
+    assert not any("NICHT per WhatsApp" in note["text"] for note in spy.notes), (
+        "nothing was blocked, so no affinity warning is owed"
+    )
+
+
+async def test_context_mode_blocks_without_a_note(
+    session_maker: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`context` keeps the pre-PR-7.2 outcome, note included."""
+    async with session_maker() as session:
+        await _delivered_bot_outbox(session, 1, DURLACH, sent_at=NOW - timedelta(hours=2))
+
+    provider, spy, event_id = await _run_general_relay(session_maker, monkeypatch, mode="context")
+
+    assert provider.sent == []
+    assert spy.notes == []
+    async with session_maker() as session:
+        event = await session.get(WhatsAppEvent, event_id)
+    assert event.error == "operator_relay: inbox_mapping_missing"
+
+
+@pytest.mark.parametrize("mode", ["affinity", "general"])
+async def test_an_arbitrary_unmapped_inbox_is_blocked_without_a_note(
+    session_maker: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+) -> None:
+    """Inbox 99 is not General: no affinity, no note, same outcome as before."""
+    async with session_maker() as session:
+        await _delivered_bot_outbox(session, 1, DURLACH, sent_at=NOW - timedelta(hours=2))
+
+    provider, spy, event_id = await _run_general_relay(session_maker, monkeypatch, mode=mode, inbox_id=99)
+
+    assert provider.sent == []
+    assert spy.notes == []
+    async with session_maker() as session:
+        event = await session.get(WhatsAppEvent, event_id)
+    assert event.error == "operator_relay: inbox_mapping_missing"
+
+
+async def test_a_mapped_branch_reply_never_consults_affinity(
+    session_maker: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The branch map stays authoritative: inbox 9 is Durlach, full stop."""
+    called: list[str] = []
+
+    async def _tripwire(*args: Any, **kwargs: Any) -> Any:
+        called.append("resolver")
+        raise AssertionError("the branch map must decide without the resolver")
+
+    monkeypatch.setattr(wiw, "resolve_tenant_affinity", _tripwire)
+
+    provider, spy, event_id = await _run_general_relay(session_maker, monkeypatch, mode="affinity", inbox_id=9)
+
+    assert called == [], "the branch map decided on its own"
+
+    async with session_maker() as session:
+        event = await session.get(WhatsAppEvent, event_id)
+        outbox = (
+            await session.execute(select(OutboxMessage).where(OutboxMessage.chatwoot_conversation_id == 500))
+        ).scalar_one()
+
+    assert event.error is None
+    assert outbox.sender_id == 700, "inbox 9 maps to Durlach, with or without affinity"
+    assert not any("NICHT per WhatsApp" in note["text"] for note in spy.notes)
+
+
+async def test_a_failing_note_never_resurrects_the_send(
+    session_maker: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Chatwoot being down must not turn a blocked relay into a Meta call."""
+    monkeypatch.setattr(wiw, "SessionLocal", session_maker)
+    _relay_settings(monkeypatch, "affinity")
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_reopen_private_note_enabled", True)
+
+    class _BrokenChatwoot:
+        async def send_message(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+            raise RuntimeError("https://chatwoot.example/api?token=SECRET")
+
+        async def aclose(self) -> None:
+            return None
+
+    monkeypatch.setattr(wiw, "ChatwootClient", _BrokenChatwoot)
+    provider = _CountingProvider()
+
+    async with session_maker() as session:
+        async with session.begin():
+            event = WhatsAppEvent(
+                dedupe_key="chatwoot_out:501:9001",
+                status="received",
+                query={},
+                headers={},
+                payload={
+                    "_chatwoot_operator_relay": {
+                        "recipient_phone": PHONE,
+                        "text": "Hallo!",
+                        "conversation_id": 501,
+                        "message_id": 9001,
+                        "phone_number_id": "PNID_GENERAL",
+                        "chatwoot_inbox_id": GENERAL_INBOX,
+                    },
+                },
+                chatwoot_conversation_id=501,
+            )
+            session.add(event)
+            await session.flush()
+            event_id = int(event.id)
+
+    await wiw.process_one_event(event_id, provider)
+
+    assert provider.sent == []
+    async with session_maker() as session:
+        event = await session.get(WhatsAppEvent, event_id)
+    assert event.status == "processed"
+    assert event.error == "operator_relay: general_affinity_no_evidence"
+
+
+# ---------------------------------------------------------------------------
+# Blocker B: the id must not arbitrate between tenants
+# ---------------------------------------------------------------------------
+
+
+async def test_two_branches_delivering_at_the_same_instant_are_ambiguous(
+    session_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """The reproduction: id=1 Durlach, id=2 Rastatt, identical sent_at.
+
+    Ranking by `(sent_at, id)` made every key unique, so the tie could never be
+    seen and the larger id silently won.
+    """
+    same = NOW - timedelta(hours=1)
+    async with session_maker() as session:
+        await _delivered_bot_outbox(session, 1, DURLACH, sent_at=same)
+        await _delivered_bot_outbox(session, 2, RASTATT, sent_at=same)
+
+        result = await resolve_tenant_affinity(session, [PHONE], now=NOW)
+
+    assert result.outcome is AffinityOutcome.AMBIGUOUS
+    assert result.reason == "conflicting_latest_communication"
+
+
+async def test_several_rows_of_one_branch_at_the_same_instant_are_proven(
+    session_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """One identity, however many rows proved it — the id may order them."""
+    same = NOW - timedelta(hours=1)
+    async with session_maker() as session:
+        await _delivered_bot_outbox(session, 1, DURLACH, sent_at=same)
+        await _delivered_bot_outbox(session, 2, DURLACH, sent_at=same)
+
+        result = await resolve_tenant_affinity(session, [PHONE], now=NOW)
+
+    assert result.outcome is AffinityOutcome.PROVEN
+    assert (result.identity.provider, result.identity.company_id) == DURLACH
+
+
+async def test_a_newer_branch_still_beats_an_older_tie(
+    session_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """Older timestamps must not disturb the newest bucket once chosen."""
+    older = NOW - timedelta(days=2)
+    async with session_maker() as session:
+        await _delivered_bot_outbox(session, 1, DURLACH, sent_at=older)
+        await _delivered_bot_outbox(session, 2, RASTATT, sent_at=older)
+        await _delivered_bot_outbox(session, 3, KARLSRUHE, sent_at=NOW - timedelta(minutes=5))
+
+        result = await resolve_tenant_affinity(session, [PHONE], now=NOW)
+
+    assert result.outcome is AffinityOutcome.PROVEN
+    assert (result.identity.provider, result.identity.company_id) == KARLSRUHE
+
+
+async def test_an_unproven_status_never_joins_the_tie(
+    session_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    same = NOW - timedelta(hours=1)
+    async with session_maker() as session:
+        await _delivered_bot_outbox(session, 1, DURLACH, sent_at=same)
+        await _delivered_bot_outbox(session, 2, RASTATT, sent_at=same, status="sent")
+        await _delivered_bot_outbox(session, 3, KARLSRUHE, sent_at=same, status="failed")
+
+        result = await resolve_tenant_affinity(session, [PHONE], now=NOW)
+
+    assert result.outcome is AffinityOutcome.PROVEN
+    assert (result.identity.provider, result.identity.company_id) == DURLACH
+
+
+async def test_the_same_instant_conflict_blocks_contextless_inbound(
+    session_maker: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tie must not be shown in a branch inbox chosen by row id."""
+    monkeypatch.setattr(wiw.settings, "chatwoot_inbound_routing_mode", "affinity")
+    monkeypatch.setattr(wiw.settings, "chatwoot_inbox_company_map", BRANCH_MAP)
+
+    same = NOW - timedelta(hours=1)
+    async with session_maker() as session:
+        await _delivered_bot_outbox(session, 1, DURLACH, sent_at=same)
+        await _delivered_bot_outbox(session, 2, RASTATT, sent_at=same)
+
+        inbox_id, route, error = await wiw._inbound_affinity_inbox(session, PHONE)
+
+    assert inbox_id is None
+    assert error == "affinity_ambiguous", "a tie must fail closed, not pick a branch"
+
+
+async def test_the_same_instant_conflict_blocks_the_general_relay(
+    session_maker: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    same = NOW - timedelta(hours=1)
+    async with session_maker() as session:
+        await _delivered_bot_outbox(session, 1, DURLACH, sent_at=same)
+        await _delivered_bot_outbox(session, 2, RASTATT, sent_at=same)
+
+    provider, spy, event_id = await _run_general_relay(session_maker, monkeypatch, mode="affinity")
+
+    assert provider.sent == [], "a tie must never pick a sender"
+    assert len(spy.notes) == 1
+    async with session_maker() as session:
+        event = await session.get(WhatsAppEvent, event_id)
+    assert event.error == "operator_relay: general_affinity_ambiguous"
