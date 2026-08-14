@@ -70,6 +70,12 @@ MAX_REPORTED_IDS: Final = 25
 # excluding it would let a preflight miss exactly the job that is about to fire.
 OPEN_STATUSES: Final = ("queued", "processing")
 
+# Reported separately from every guard outcome, because it is a different fact:
+# the booking may be perfectly current and the reminder still too late to send.
+# Checked BEFORE the API call — an expired job is provable locally, and spending
+# a request on it would only burn the rate limit.
+DEADLINE_EXPIRED_OUTCOME: Final = "deadline_expired"
+
 
 @dataclass
 class PreflightReport:
@@ -150,13 +156,36 @@ async def run_preflight(
     registry = configured_easyweek_locations()
     locations = registry.locations if registry.valid else {}
 
-    for index, job in enumerate(jobs):
-        if index:
-            await pause(pause_sec)
+    # The runtime's own timeliness rule, imported rather than reimplemented: a
+    # preflight that judged "too late" differently from the worker would bless a
+    # backlog the worker then refuses.
+    from altegio_bot.workers.outbox_worker import easyweek_reminder_deadline_passed
 
+    # Counted, not derived from the loop index: a job refused locally makes no
+    # request, so it owes no pause. Pacing is about the API, not about position.
+    api_calls = 0
+
+    for job in jobs:
         record = None
         if job.record_id is not None:
             record = (await session.execute(select(Record).where(Record.id == job.record_id))).scalars().one_or_none()
+
+        if easyweek_reminder_deadline_passed(job, record):
+            # Provable without the API, so no request is spent and no pause is
+            # owed. The booking may well still be current; this reminder is
+            # simply past the moment it was worth sending.
+            report.checked_count += 1
+            report.outcomes[DEADLINE_EXPIRED_OUTCOME] += 1
+            report.unproven_job_ids.append(job.id)
+            if job.record_id is not None:
+                report.unproven_record_ids.append(job.record_id)
+            if job.company_id is not None:
+                report.company_ids.add(job.company_id)
+            continue
+
+        if api_calls:
+            await pause(pause_sec)
+        api_calls += 1
 
         try:
             result = await verify_reminder_is_current(

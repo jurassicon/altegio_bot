@@ -30,6 +30,7 @@ from altegio_bot.models.models import (
     Record,
 )
 from altegio_bot.scripts.easyweek_reminder_preflight import (
+    DEADLINE_EXPIRED_OUTCOME,
     OPEN_STATUSES,
     PreflightReport,
     _parse_args,
@@ -336,6 +337,126 @@ def test_ready_requires_all_three_conditions_together() -> None:
     ):
         broken.outcomes["proven_current"] = broken.checked_count
         assert broken.ready is False
+
+
+# ---------------------------------------------------------------------------
+# Deadline: a current booking is not the same as a timely reminder
+# ---------------------------------------------------------------------------
+#
+# The closed send fence deliberately lets reminders accumulate. Some of that
+# backlog goes stale while it waits: the booking is still perfectly current —
+# same uuid, same branch, same hour, not cancelled — but the moment the reminder
+# was worth sending has passed. A preflight that only asked the guard would call
+# that queue green and the fence would open onto messages nobody should receive.
+#
+# The rule is the runtime's own, imported rather than restated:
+#   reminder_24h -> min(starts_at - 3h, anchor + 6h)
+#   reminder_2h  -> starts_at - 15m
+
+
+async def _seed_expired(session, *, job_type: str, suffix: str = "1", booking: uuid.UUID = BOOKING):
+    """A queued reminder past its deadline whose appointment is still future."""
+    from altegio_bot.utils import utcnow
+
+    now = utcnow()
+    if job_type == "reminder_24h":
+        starts_at = now + timedelta(hours=30)
+        run_at = now - timedelta(hours=7)
+    else:
+        starts_at = now + timedelta(minutes=10)
+        run_at = now - timedelta(minutes=20)
+
+    job = await _seed(session, job_type=job_type, starts_at=starts_at, suffix=suffix, booking=booking)
+    job.run_at = run_at
+    await session.flush()
+    return job
+
+
+@pytest.mark.parametrize("job_type", ["reminder_24h", "reminder_2h"])
+async def test_an_expired_reminder_is_red_even_though_the_booking_is_current(session_maker, job_type: str) -> None:
+    async with session_maker() as session:
+        async with session.begin():
+            job = await _seed_expired(session, job_type=job_type)
+    job_id = job.id
+
+    reader = FakeReader()
+    async with session_maker() as session:
+        report = await run_preflight(session, client=reader, sleep=_noop_sleep)
+
+    assert report.candidate_count == 1
+    assert report.checked_count == 1
+    assert report.outcomes == {DEADLINE_EXPIRED_OUTCOME: 1}
+    assert report.ready is False, "a current booking does not make a late reminder sendable"
+    assert report.unproven_job_ids == [job_id]
+    assert reader.calls == [], "expiry is provable locally; no API request is spent on it"
+
+
+@pytest.mark.parametrize("job_type", ["reminder_24h", "reminder_2h"])
+async def test_a_reminder_inside_its_deadline_stays_green(session_maker, job_type: str) -> None:
+    """Positive control: the deadline check must not swallow a timely reminder."""
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed(session, job_type=job_type)
+
+    reader = FakeReader()
+    async with session_maker() as session:
+        report = await run_preflight(session, client=reader, sleep=_noop_sleep)
+
+    assert report.outcomes == {"proven_current": 1}
+    assert report.ready is True
+    assert len(reader.calls) == 1
+
+
+async def test_a_future_reminder_is_never_called_expired(session_maker) -> None:
+    """`run_at` in the future is the normal state of a planned reminder.
+
+    The default seed is exactly that shape: the appointment is a month out and
+    `run_at` is 24h before it, so nothing here is late.
+    """
+    from altegio_bot.utils import utcnow
+
+    async with session_maker() as session:
+        async with session.begin():
+            job = await _seed(session)
+    assert job.run_at > utcnow(), "the fixture must really be a future reminder"
+
+    async with session_maker() as session:
+        report = await run_preflight(session, client=FakeReader(), sleep=_noop_sleep)
+
+    assert DEADLINE_EXPIRED_OUTCOME not in report.outcomes
+    assert report.ready is True
+
+
+async def test_one_expired_reminder_fails_a_queue_that_is_otherwise_proven(session_maker) -> None:
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed(session, suffix="1")
+            expired = await _seed_expired(
+                session,
+                job_type="reminder_2h",
+                suffix="2",
+                booking=uuid.UUID("22222222-2222-4333-8444-555555555555"),
+            )
+    expired_id = expired.id
+
+    reader = FakeReader()
+    async with session_maker() as session:
+        report = await run_preflight(session, client=reader, sleep=_noop_sleep)
+
+    assert report.outcomes == {"proven_current": 1, DEADLINE_EXPIRED_OUTCOME: 1}
+    assert report.ready is False
+    assert report.unproven_job_ids == [expired_id]
+    assert len(reader.calls) == 1, "only the timely job costs a request"
+
+
+async def test_the_preflight_and_the_worker_share_one_timeliness_rule() -> None:
+    """Bound to the runtime function, so the two can never drift apart."""
+    from altegio_bot.scripts import easyweek_reminder_preflight as pf
+    from altegio_bot.workers.outbox_worker import easyweek_reminder_deadline_passed
+
+    source = (pf.__file__ and open(pf.__file__).read()) or ""
+    assert "easyweek_reminder_deadline_passed" in source
+    assert callable(easyweek_reminder_deadline_passed)
 
 
 # ---------------------------------------------------------------------------

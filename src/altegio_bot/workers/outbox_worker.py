@@ -1433,12 +1433,46 @@ def _defer_easyweek_configuration(
     return _schedule_retry_or_cancel(job, record, delay, reason)
 
 
+def easyweek_reminder_deadline_passed(job: MessageJob, record: Record | None) -> bool:
+    """Is this EasyWeek reminder too late to send? THE single criterion.
+
+    One function, two callers: the outbox worker below, and the read-only
+    preflight. A preflight that judged timeliness by its own rule would bless a
+    backlog the worker then refuses, or — far worse — the other way round.
+
+    The rule itself is not restated here: it is whatever ``_retry_deadline_at``
+    already says for ``reminder_24h`` (``min(starts_at - 3h, anchor + 6h)``) and
+    ``reminder_2h`` (``starts_at - 15m``). ``_original_run_at`` falls back to
+    ``job.run_at``, so an initial job that never went through a retry still has
+    a usable anchor.
+
+    Non-reminders and non-EasyWeek jobs are never judged here — this is not a
+    general timeliness helper, and Altegio's semantics are untouched.
+    """
+    if normalize_provider(getattr(job, "provider", None), default="") != PROVIDER_EASYWEEK:
+        return False
+    if getattr(job, "job_type", None) not in EASYWEEK_REMINDER_JOB_TYPES:
+        return False
+    deadline = _retry_deadline_at(job, record)
+    if deadline is None or deadline == _DEADLINE_ALREADY_PASSED:
+        return False
+    return utcnow() > deadline
+
+
 def _deadline_passed_for_send(job: MessageJob, record: Record | None) -> bool:
     if job.job_type not in DELIVERY_DEADLINE_JOB_TYPES:
         return False
     payload = getattr(job, "payload", None) or {}
     if _ORIGINAL_RUN_AT_KEY not in payload:
-        return False
+        # PR-8: an EasyWeek reminder is judged even on its FIRST attempt.
+        #
+        # `_original_run_at` is written by the retry/deferral path, so an initial
+        # job never carries it — and this early return therefore exempted exactly
+        # the case the send fence creates: a reminder that sat `queued` while the
+        # fence was shut, went past its deadline, and would be sent the moment
+        # the fence opened. Altegio jobs and EasyWeek lifecycle jobs keep the
+        # first-attempt exemption they have always had.
+        return easyweek_reminder_deadline_passed(job, record)
     deadline = _retry_deadline_at(job, record)
     if deadline is None or deadline == _DEADLINE_ALREADY_PASSED:
         return False

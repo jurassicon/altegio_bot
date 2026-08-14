@@ -2464,6 +2464,50 @@ reminder перенести либо отменить **свою тестову�
 | `malformed_response` | поле отсутствует, не bool, naive timestamp, противоречивый `status.type` | локальная отмена |
 | `permanent_error` | прочий permanent 4xx | локальная отмена |
 
+### 12.4a Deadline: current booking ≠ отправляемый reminder
+
+Reminder подчиняется тому же delivery deadline, что и остальные job, **включая
+первую отправку**:
+
+- `reminder_24h` — `min(starts_at - 3ч, run_at + 6ч)`;
+- `reminder_2h` — `starts_at - 15м`.
+
+Практический смысл при закрытом fence: job может пролежать `queued` дольше
+своего окна. Booking при этом остаётся полностью корректным — тот же UUID,
+филиал, время, не отменён — но момент, когда напоминание имело смысл, прошёл.
+
+Поэтому:
+
+- **preflight красный** для такой job: отдельный outcome `deadline_expired`,
+  `ready=false`, ненулевой exit code. EasyWeek API на неё не тратится —
+  просрочка доказывается локально;
+- **runtime отменяет** job локально: `status=canceled`, короткий стабильный
+  `last_error`, Meta не вызывается, строка Outbox не создаётся.
+
+Если preflight показал `deadline_expired`, fence открывать **нельзя** до
+разбора: это backlog, который нельзя досылать. Отдельного режима «доставить
+просроченное» нет и не планируется.
+
+Altegio jobs и EasyWeek lifecycle jobs это изменение не затрагивает — их
+first-attempt семантика прежняя.
+
+### 12.4b Delivery retry напоминания
+
+Retryable failed callback от Meta создаёт retry обычным механизмом delivery
+retry (тот же chain, тот же `delivery_retry:<root>:<attempt>`, тот же бюджет
+попыток). Для reminder дополнительно:
+
+- retry наследует из **корневой** job два значения: canonical `booking_uuid`
+  и `record_starts_at` — исходный запланированный старт;
+- `record_starts_at` **не** перечитывается из текущего `Record`. Если между
+  отправкой и callback запись перенесли, retry сохранит старое время, и это
+  расхождение будет поймано локально — Meta не вызовется;
+- каждый retry заново проходит read-only API guard. Положительный результат
+  предыдущей попытки не кэшируется и не наследуется;
+- если у корневой job нет доказуемых `booking_uuid`/`record_starts_at`, retry
+  **не создаётся вообще**; в `outbox_messages.meta` пишется
+  `delivery_retry_skip_reason=easyweek_reminder_retry_identity_unproven`.
+
 ### 12.5 Rollback
 
 Первым действием — закрыть fence:

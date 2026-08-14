@@ -23,14 +23,17 @@ at module level without a cycle.
 from __future__ import annotations
 
 import re
+import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.easyweek_policy import (
-    EASYWEEK_LIFECYCLE_JOB_TYPES,
+    EASYWEEK_CUSTOMER_JOB_TYPES,
+    EASYWEEK_REMINDER_JOB_TYPES,
     normalize_provider,
 )
 from altegio_bot.models.models import (
@@ -57,6 +60,69 @@ DELIVERY_RETRY_JOB_TYPES = (
 # as a set: a row that disagrees on ANY of them is not "the same retry", it is a
 # different job wearing the same dedupe key.
 RETRY_IDENTITY_FIELDS = ("provider", "company_id", "record_id", "client_id", "job_type")
+
+
+@dataclass(frozen=True)
+class ReminderRetryIdentity:
+    """The two values a reminder retry must inherit from its ROOT job.
+
+    A reminder is verified against the live EasyWeek API before every Meta
+    attempt, and that guard needs a canonical booking uuid and the start instant
+    the reminder was PLANNED for. A retry skips planning entirely, so both have
+    to come across from the original job — and from nowhere else.
+
+    In particular ``record_starts_at`` is deliberately NOT read from the current
+    ``Record``. If the appointment moved between the first send and the failed
+    callback, taking today's value would manufacture a retry that agrees with
+    the new time and sends a reminder the customer was never owed. Inheriting
+    the original instant makes the guard notice the move and refuse.
+
+    Both fields are stored as ISO-8601 text, the same shape
+    ``reminder_job_payload`` writes, so the guard reads one format everywhere.
+    """
+
+    booking_uuid: str
+    record_starts_at: str
+
+
+def easyweek_reminder_retry_identity(original_job: MessageJob | None) -> ReminderRetryIdentity | None:
+    """Validate the reminder identity carried by a root job, or ``None``.
+
+    ``None`` means the root cannot support a retry — a missing payload, a
+    booking uuid that is not canonical, a start instant that is absent or has no
+    timezone. Every one of those is a refusal rather than a value to patch up:
+    the retry would otherwise be built on an identity nobody proved.
+    """
+    payload = getattr(original_job, "payload", None)
+    if not isinstance(payload, dict):
+        return None
+
+    raw_uuid = payload.get("booking_uuid")
+    if not isinstance(raw_uuid, str):
+        return None
+    try:
+        booking_uuid = uuid.UUID(raw_uuid.strip())
+    except (ValueError, AttributeError, TypeError):
+        return None
+
+    raw_start = payload.get("record_starts_at")
+    if not isinstance(raw_start, str):
+        return None
+    text = raw_start.strip()
+    if text.endswith(("Z", "z")):
+        text = f"{text[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        # A naive instant would compare as a different moment against the API.
+        return None
+
+    return ReminderRetryIdentity(
+        booking_uuid=str(booking_uuid),
+        record_starts_at=parsed.astimezone(timezone.utc).isoformat(),
+    )
 
 
 @dataclass(frozen=True)
@@ -443,8 +509,13 @@ async def resolve_retry_identity(
     # EasyWeek: re-prove the domain scope the outbox worker performs on a
     # freshly planned job. A retry skips planning entirely.
     # ------------------------------------------------------------------
-    if job_type not in EASYWEEK_LIFECYCLE_JOB_TYPES:
+    if job_type not in EASYWEEK_CUSTOMER_JOB_TYPES:
         return _refuse("easyweek_job_type_not_enabled")
+    if job_type in EASYWEEK_REMINDER_JOB_TYPES and easyweek_reminder_retry_identity(original_job) is None:
+        # A reminder retry has to re-prove itself against the live API, and the
+        # guard needs the ROOT job's booking uuid and planned start to do it.
+        # Without both, there is nothing to build a provable retry on.
+        return _refuse("easyweek_reminder_retry_identity_unproven")
     if original_job.record_id is None:
         return _refuse("easyweek_retry_missing_record")
 

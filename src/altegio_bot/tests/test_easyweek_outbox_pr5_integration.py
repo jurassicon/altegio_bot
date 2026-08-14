@@ -3518,6 +3518,289 @@ async def test_second_attempt_in_the_same_chain_also_stays_easyweek(
     assert chain[1].payload["delivery_retry_attempt"] == 2
 
 
+# ---------------------------------------------------------------------------
+# PR-8 blocker 1: a reminder must be able to retry, and re-prove itself
+# ---------------------------------------------------------------------------
+#
+# The original PR-8 shipped reminders that could never retry: the identity
+# resolver only admitted EASYWEEK_LIFECYCLE_JOB_TYPES, so a retryable failed
+# callback was refused with `easyweek_job_type_not_enabled`. And even with the
+# allowlist widened, the retry payload carried no `booking_uuid`, so the guard
+# would have killed it with `identity_mismatch:job_booking_uuid`.
+#
+# The second half is the subtle one. A retry inherits `record_starts_at` from
+# the ROOT job, never from today's Record — otherwise a reschedule that happened
+# between the send and the callback would be silently adopted, and the retry
+# would deliver a reminder for an hour the customer no longer has.
+
+
+async def _send_reminder_and_fail(
+    db: AsyncSession,
+    reader: "_Reader",
+    *,
+    job_type: str = "reminder_24h",
+    starts_at: datetime = REMINDER_STARTS_AT,
+    dedupe: str = "wa:eyw-reminder-failed-1",
+) -> tuple[MessageJob, int]:
+    """Drive one reminder through a successful send and a retryable failure."""
+    job = await _seed_reminder_job(db, job_type=job_type, starts_at=starts_at)
+    await _run_job(db, job)
+    assert job.status == "done", job.last_error
+
+    rows = await _outbox_rows(db, job)
+    assert len(rows) == 1
+    original_outbox_id = rows[0].id
+    wamid = rows[0].provider_message_id
+    assert wamid is not None
+
+    await _deliver_failed_status(db, wamid, dedupe=dedupe)
+    return job, original_outbox_id
+
+
+async def test_a_failed_reminder_delivery_produces_one_provable_retry(
+    db: AsyncSession, capture: CaptureProvider, _reader: _Reader, no_contact_rate_limit: None, monkeypatch
+) -> None:
+    monkeypatch.setattr(settings, "easyweek_reminder_api_guard_enabled", True, raising=False)
+    job, original_outbox_id = await _send_reminder_and_fail(db, _reader)
+
+    retries = await _retry_jobs_for(db, original_outbox_id)
+    assert len(retries) == 1, "a retryable reminder failure must produce exactly one retry"
+    retry = retries[0]
+
+    assert retry.provider == PROVIDER_EASYWEEK
+    assert retry.company_id == job.company_id
+    assert retry.record_id == job.record_id
+    assert retry.client_id == job.client_id
+    assert retry.job_type == "reminder_24h"
+
+    # The two values the guard needs, carried across from the root job.
+    assert retry.payload["booking_uuid"] == str(EASYWEEK_BOOKING_UUID)
+    assert datetime.fromisoformat(retry.payload["record_starts_at"]) == REMINDER_STARTS_AT
+
+    # And the retry really does re-ask the API before its own Meta attempt.
+    calls_before = len(_reader.calls)
+    retry.run_at = utcnow() - timedelta(seconds=1)
+    await db.flush()
+    await _run_job(db, retry)
+
+    assert len(_reader.calls) == calls_before + 1, "every attempt re-proves the reminder"
+    assert retry.status == "done", retry.last_error
+    assert len(capture.template_calls) == 2, "a second Meta attempt was made"
+
+
+async def test_a_retry_keeps_the_planned_start_when_the_booking_moved(
+    db: AsyncSession, capture: CaptureProvider, _reader: _Reader, no_contact_rate_limit: None, monkeypatch
+) -> None:
+    """The reschedule-between-send-and-callback case, end to end.
+
+    The retry must be built on start A. Adopting the new start B would make the
+    guard agree with a reminder the customer was never owed.
+    """
+    monkeypatch.setattr(settings, "easyweek_reminder_api_guard_enabled", True, raising=False)
+    job, original_outbox_id = await _send_reminder_and_fail(db, _reader)
+
+    moved = REMINDER_STARTS_AT + timedelta(hours=3)
+    record = (await db.execute(select(Record).where(Record.id == job.record_id))).scalars().one()
+    record.starts_at = moved
+    await db.flush()
+    _reader.payload = _booking_api_payload(start_time=moved.isoformat())
+
+    retries = await _retry_jobs_for(db, original_outbox_id)
+    assert len(retries) == 1
+    retry = retries[0]
+    assert datetime.fromisoformat(retry.payload["record_starts_at"]) == REMINDER_STARTS_AT, (
+        "the retry must keep start A, not adopt B"
+    )
+
+    calls_before = len(_reader.calls)
+    sends_before = len(capture.template_calls)
+    retry.run_at = utcnow() - timedelta(seconds=1)
+    await db.flush()
+    await _run_job(db, retry)
+
+    assert retry.status == "canceled"
+    # Refused locally, and by the FIRST layer that can see the contradiction:
+    # carrying start A across makes the existing stale-reminder check fire
+    # before the guard is even reached. Either refusal is correct; what matters
+    # is that the move is noticed and nothing is sent.
+    assert retry.last_error in ("Skipped: stale reminder after record reschedule",) or "start_time_mismatch" in (
+        retry.last_error or ""
+    ), retry.last_error
+    assert len(capture.template_calls) == sends_before, "Meta must not be called for a moved booking"
+    assert await _outbox_rows(db, retry) == []
+    assert len(_reader.calls) == calls_before, "the mismatch is provable locally; no API call is owed"
+
+
+async def test_a_duplicate_failed_callback_does_not_create_a_second_retry(
+    db: AsyncSession, capture: CaptureProvider, _reader: _Reader, no_contact_rate_limit: None, monkeypatch
+) -> None:
+    monkeypatch.setattr(settings, "easyweek_reminder_api_guard_enabled", True, raising=False)
+    job, original_outbox_id = await _send_reminder_and_fail(db, _reader)
+    assert len(await _retry_jobs_for(db, original_outbox_id)) == 1
+
+    rows = await _outbox_rows(db, job)
+    await _deliver_failed_status(db, rows[0].provider_message_id, dedupe="wa:eyw-reminder-failed-dup")
+
+    assert len(await _retry_jobs_for(db, original_outbox_id)) == 1, "one failure, one retry"
+
+
+@pytest.mark.parametrize(
+    ("label", "mutate"),
+    [
+        ("no-booking-uuid", {"booking_uuid": None}),
+        ("malformed-booking-uuid", {"booking_uuid": "not-a-uuid"}),
+        ("no-planned-start", {"record_starts_at": None}),
+        ("naive-planned-start", {"record_starts_at": "2026-09-14T08:30:00"}),
+        ("garbage-planned-start", {"record_starts_at": "soon"}),
+    ],
+)
+async def test_an_unprovable_root_identity_creates_no_retry_at_all(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    _reader: _Reader,
+    no_contact_rate_limit: None,
+    monkeypatch,
+    label: str,
+    mutate: dict,
+) -> None:
+    """Fail closed: no retry, no Meta, and a safe reason on the audit row."""
+    monkeypatch.setattr(settings, "easyweek_reminder_api_guard_enabled", True, raising=False)
+    job = await _seed_reminder_job(db)
+    await _run_job(db, job)
+    assert job.status == "done", job.last_error
+
+    rows = await _outbox_rows(db, job)
+    original_outbox_id, wamid = rows[0].id, rows[0].provider_message_id
+
+    payload = dict(job.payload or {})
+    for key, value in mutate.items():
+        if value is None:
+            payload.pop(key, None)
+        else:
+            payload[key] = value
+    job.payload = payload
+    await db.flush()
+
+    sends_before = len(capture.template_calls)
+    await _deliver_failed_status(db, wamid, dedupe=f"wa:eyw-reminder-bad-{label}")
+
+    assert await _retry_jobs_for(db, original_outbox_id) == [], label
+    assert len(capture.template_calls) == sends_before, label
+    refreshed = (await db.execute(select(OutboxMessage).where(OutboxMessage.id == original_outbox_id))).scalars().one()
+    assert refreshed.meta.get("delivery_retry_skip_reason") == "easyweek_reminder_retry_identity_unproven", label
+
+
+async def test_a_reminder_retry_cannot_borrow_a_colliding_altegio_row(
+    db: AsyncSession, capture: CaptureProvider, _reader: _Reader, no_contact_rate_limit: None, monkeypatch
+) -> None:
+    """An Altegio template and sender share the numeric company for the run."""
+    monkeypatch.setattr(settings, "easyweek_reminder_api_guard_enabled", True, raising=False)
+    db.add(
+        _template(
+            provider=PROVIDER_ALTEGIO,
+            company_id=COLLIDING_COMPANY_ID,
+            code="reminder_24h",
+            body="ALTEGIO REMINDER BODY",
+        )
+    )
+    db.add(_sender(provider=PROVIDER_ALTEGIO, company_id=COLLIDING_COMPANY_ID, phone_number_id="altegio-phone-id"))
+    await db.flush()
+
+    _job, original_outbox_id = await _send_reminder_and_fail(db, _reader)
+    retry = (await _retry_jobs_for(db, original_outbox_id))[0]
+    assert retry.provider == PROVIDER_EASYWEEK
+
+    retry.run_at = utcnow() - timedelta(seconds=1)
+    await db.flush()
+    await _run_job(db, retry)
+
+    assert retry.status == "done", retry.last_error
+    assert capture.template_calls[-1]["template_name"] == "kitilash_cc_reminder_24h_v1"
+    assert "ALTEGIO REMINDER BODY" not in str(capture.template_calls[-1])
+
+
+# ---------------------------------------------------------------------------
+# PR-8 blocker 2: a reminder that sat behind a closed fence past its deadline
+# ---------------------------------------------------------------------------
+#
+# `_deadline_passed_for_send` exempted any job whose payload had no
+# `_original_run_at` — a key only the retry/deferral path writes. An INITIAL
+# reminder therefore skipped the deadline entirely, which is exactly the job the
+# send fence creates: queued while the fence is shut, past its deadline by the
+# time it opens, and sent anyway.
+#
+# The deadline rules themselves are unchanged and shared with Altegio:
+#   reminder_24h -> min(starts_at - 3h, anchor + 6h)
+#   reminder_2h  -> starts_at - 15m
+
+
+async def _expired_reminder(db: AsyncSession, job_type: str) -> MessageJob:
+    """A queued initial reminder past its deadline whose booking is still future.
+
+    The appointment deliberately stays in the future so the job is refused for
+    being LATE, not for pointing at a past record.
+    """
+    now = utcnow()
+    if job_type == "reminder_24h":
+        starts_at = now + timedelta(hours=30)
+        run_at = now - timedelta(hours=7)  # anchor + 6h is already behind us
+    else:
+        starts_at = now + timedelta(minutes=10)  # starts_at - 15m has passed
+        run_at = now - timedelta(minutes=20)
+
+    job = await _seed_reminder_job(db, job_type=job_type, starts_at=starts_at, run_at=run_at)
+    return job
+
+
+@pytest.mark.parametrize("job_type", ["reminder_24h", "reminder_2h"])
+async def test_an_expired_backlog_reminder_is_cancelled_instead_of_sent(
+    db: AsyncSession, capture: CaptureProvider, _reader: _Reader, monkeypatch, job_type: str
+) -> None:
+    monkeypatch.setattr(settings, "easyweek_reminder_api_guard_enabled", True, raising=False)
+    job = await _expired_reminder(db, job_type)
+
+    await _run_job(db, job)
+
+    assert job.status == "canceled", job.last_error
+    assert "deadline" in (job.last_error or "").lower()
+    assert capture.template_calls == [], "an expired reminder must not reach Meta"
+    assert await _outbox_rows(db, job) == []
+    assert _reader.calls == [], "expiry is provable locally; no API call is owed"
+
+
+@pytest.mark.parametrize("job_type", ["reminder_24h", "reminder_2h"])
+async def test_a_reminder_still_inside_its_deadline_sends_normally(
+    db: AsyncSession, capture: CaptureProvider, _reader: _Reader, monkeypatch, job_type: str
+) -> None:
+    """The positive control: the fix must not swallow a timely reminder."""
+    monkeypatch.setattr(settings, "easyweek_reminder_api_guard_enabled", True, raising=False)
+    job = await _seed_reminder_job(db, job_type=job_type)
+
+    await _run_job(db, job)
+
+    assert job.status == "done", job.last_error
+    assert len(capture.template_calls) == 1
+    assert len(_reader.calls) == 1
+
+
+async def test_an_expired_lifecycle_job_keeps_its_first_attempt_exemption(
+    db: AsyncSession, capture: CaptureProvider, monkeypatch
+) -> None:
+    """Altegio and EasyWeek lifecycle semantics are deliberately untouched.
+
+    A lifecycle job with no `_original_run_at` is still exempt on its first
+    attempt, exactly as before PR-8's fix.
+    """
+    job = await _seed_easyweek_happy_path(db)
+    job.run_at = utcnow() - timedelta(days=2)
+    await db.flush()
+
+    await _run_job(db, job)
+
+    assert job.status == "done", job.last_error
+    assert len(capture.template_calls) == 1
+
+
 async def test_altegio_delivery_retry_still_stays_altegio(
     db: AsyncSession,
     capture: CaptureProvider,
