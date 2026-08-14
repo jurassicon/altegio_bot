@@ -57,6 +57,7 @@ from altegio_bot.easyweek_policy import (
     EASYWEEK_LIFECYCLE_JOB_TYPES,
     EASYWEEK_REMINDER_JOB_TYPES,
     EASYWEEK_REVIEW_JOB_TYPES,
+    EASYWEEK_SERVICE_SNAPSHOT_JOB_TYPES,
     easyweek_job_type_error,
     validate_static_booking_page,
 )
@@ -3146,6 +3147,231 @@ async def test_no_guard_result_is_ever_reused_across_sends(
     assert len(_reader.calls) == 2, "the second send asks the API again"
     assert second.status == "canceled"
     assert len(capture.template_calls) == 1, "only the proven reminder was sent"
+
+
+# ---------------------------------------------------------------------------
+# 11c. PR-9: a review does not depend on the service snapshot
+# ---------------------------------------------------------------------------
+#
+# The service-snapshot guard exists because lifecycle and reminder templates
+# PRINT the service line and the total, and rendering flattens an unknown title
+# into the literal "None" and an unknown price into "0.00". A review prints
+# neither: two parameters, the customer's name and the proven link.
+#
+# When review_3d joined EASYWEEK_CUSTOMER_JOB_TYPES it inherited that guard by
+# accident, so a booking whose price was never proven lost its review at render
+# time — after planning, after the send-time guard, without a Meta attempt. The
+# guard is now asked only of the job types that always depended on it.
+
+
+async def _seed_review_job(
+    db: AsyncSession,
+    *,
+    company_id: int = COLLIDING_COMPANY_ID,
+    services: tuple = ((11, "Wimpernverlängerung", "60.00"),),
+    total_cost: str | None = _UNSET,
+    review_url: str | None = None,
+    starts_at: datetime = REMINDER_STARTS_AT,
+) -> MessageJob:
+    client = await _seed_easyweek_client(db, company_id=company_id)
+    record = await _seed_easyweek_record(
+        db,
+        client,
+        company_id=company_id,
+        starts_at=starts_at,
+        services=services,
+        total_cost=total_cost,
+    )
+    contract = branch_template_contract(BRANCH_PROFILES["colliding"], "review_3d")
+    assert contract is not None
+    db.add(
+        _template(
+            provider=PROVIDER_EASYWEEK,
+            company_id=company_id,
+            code="review_3d",
+            meta_template_name=contract.meta_template_name,
+        )
+    )
+    existing_sender = (
+        (
+            await db.execute(
+                select(WhatsAppSender)
+                .where(WhatsAppSender.provider == PROVIDER_EASYWEEK)
+                .where(WhatsAppSender.company_id == company_id)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if existing_sender is None:
+        db.add(_sender(provider=PROVIDER_EASYWEEK, company_id=company_id, phone_number_id="eyw-phone-id"))
+    await db.flush()
+
+    job = await _seed_job(
+        db,
+        provider=PROVIDER_EASYWEEK,
+        company_id=company_id,
+        job_type="review_3d",
+        record=record,
+        client=client,
+        dedupe_key=f"eyw-review-{company_id}",
+    )
+    job.run_at = utcnow() - timedelta(minutes=1)
+    job.payload = {
+        "provider": "easyweek",
+        "company_id": company_id,
+        "booking_uuid": str(EASYWEEK_BOOKING_UUID),
+        "record_starts_at": starts_at.isoformat(),
+        "review_url": review_url if review_url is not None else f"https://eyw.me/f/{BOOKING_HASH}",
+        "job_type": "review_3d",
+    }
+    await db.flush()
+    return job
+
+
+async def test_a_review_sends_even_when_the_price_was_never_proven(
+    db: AsyncSession, capture: CaptureProvider, monkeypatch
+) -> None:
+    """The regression: an unknown price must not destroy an earned review."""
+    monkeypatch.setattr(settings, "easyweek_review_send_enabled", True, raising=False)
+    job = await _seed_review_job(db, services=((11, None, None),), total_cost=None)
+
+    await _run_job(db, job)
+
+    assert job.status == "done", job.last_error
+    assert len(capture.template_calls) == 1
+    call = capture.template_calls[0]
+    assert call["template_name"] == "kitilash_cc_review_3d_v1"
+    assert call["params"] == ["Anna Müller", f"https://eyw.me/f/{BOOKING_HASH}"]
+
+    rows = await _outbox_rows(db, job)
+    assert len(rows) == 1
+    assert rows[0].template_code == "review_3d"
+
+
+async def test_a_review_never_carries_a_maps_manage_or_storefront_link(
+    db: AsyncSession, capture: CaptureProvider, monkeypatch
+) -> None:
+    monkeypatch.setattr(settings, "easyweek_review_send_enabled", True, raising=False)
+    job = await _seed_review_job(db, services=((11, None, None),), total_cost=None)
+
+    await _run_job(db, job)
+
+    params = capture.template_calls[0]["params"]
+    assert len(params) == 2, "a review has exactly two parameters"
+    assert params[1].startswith("https://eyw.me/f/")
+    for forbidden in ("google", "maps", "/r/", VERIFIED_PAGE, "60.00", "Wimpernverlängerung"):
+        assert forbidden not in " ".join(params), forbidden
+
+
+async def test_a_review_makes_no_altegio_api_call(db: AsyncSession, capture: CaptureProvider, monkeypatch) -> None:
+    """Visit counting is Altegio's review contract, and is not EasyWeek's."""
+    altegio_api = AsyncMock(side_effect=AssertionError("no Altegio API call for an EasyWeek review"))
+    monkeypatch.setattr(ow, "count_attended_client_visits", altegio_api)
+    monkeypatch.setattr(settings, "easyweek_review_send_enabled", True, raising=False)
+
+    job = await _seed_review_job(db, services=((11, None, None),), total_cost=None)
+    await _run_job(db, job)
+
+    assert job.status == "done", job.last_error
+    altegio_api.assert_not_awaited()
+
+
+# --- the guard the review no longer inherits still binds everything else ----
+
+
+@pytest.mark.parametrize("job_type", ["record_created", "reminder_24h"])
+async def test_an_unknown_price_still_fails_lifecycle_and_reminders_closed(
+    db: AsyncSession, capture: CaptureProvider, _reader: _Reader, monkeypatch, job_type: str
+) -> None:
+    """The control: narrowing the gate must not relax it for anyone else."""
+    monkeypatch.setattr(settings, "easyweek_reminder_api_guard_enabled", True, raising=False)
+
+    if job_type == "record_created":
+        job = await _seed_easyweek_happy_path(db, services=((11, None, None),), total_cost=None)
+    else:
+        job = await _seed_reminder_job(db)
+        record = (await db.execute(select(Record).where(Record.id == job.record_id))).scalars().one()
+        record.total_cost = None
+        for svc in (await db.execute(select(RecordService).where(RecordService.record_id == record.id))).scalars():
+            svc.cost_to_pay = None
+            svc.title = None
+        await db.flush()
+
+    await _run_job(db, job)
+
+    assert job.status == "failed", f"{job_type} must stay fail-closed on an unknown price"
+    assert capture.template_calls == []
+
+
+async def test_only_lifecycle_and_reminders_depend_on_the_service_snapshot() -> None:
+    """Pins the allowlist itself, so a future job type is a deliberate choice.
+
+    A negative `!= review_3d` test would have been fail-open here: the next
+    EasyWeek job type would skip the guard without anyone deciding that.
+    """
+    assert EASYWEEK_SERVICE_SNAPSHOT_JOB_TYPES == EASYWEEK_LIFECYCLE_JOB_TYPES | EASYWEEK_REMINDER_JOB_TYPES
+    assert EASYWEEK_SERVICE_SNAPSHOT_JOB_TYPES == {
+        "record_created",
+        "record_updated",
+        "record_canceled",
+        "reminder_24h",
+        "reminder_2h",
+    }
+    assert "review_3d" not in EASYWEEK_SERVICE_SNAPSHOT_JOB_TYPES
+    assert EASYWEEK_SERVICE_SNAPSHOT_JOB_TYPES < EASYWEEK_CUSTOMER_JOB_TYPES, (
+        "every snapshot-dependent type is still a customer notification"
+    )
+
+
+# --- the guards a review DOES keep ------------------------------------------
+
+
+async def test_a_disallowed_category_still_blocks_the_review(
+    db: AsyncSession, capture: CaptureProvider, monkeypatch
+) -> None:
+    monkeypatch.setattr(settings, "easyweek_review_send_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_allowed_service_categories", json.dumps(["Something Else"]), raising=False)
+    job = await _seed_review_job(db, services=((11, None, None),), total_cost=None)
+
+    await _run_job(db, job)
+
+    assert job.status == "canceled"
+    assert capture.template_calls == []
+    assert await _outbox_rows(db, job) == []
+
+
+async def test_an_unprovable_review_url_still_blocks_the_review(
+    db: AsyncSession, capture: CaptureProvider, monkeypatch
+) -> None:
+    monkeypatch.setattr(settings, "easyweek_review_send_enabled", True, raising=False)
+    job = await _seed_review_job(
+        db,
+        services=((11, None, None),),
+        total_cost=None,
+        review_url="https://eyw.me/f/99999999",
+    )
+
+    await _run_job(db, job)
+
+    assert job.status == "canceled"
+    assert "review_url_unproven" in (job.last_error or "")
+    assert capture.template_calls == []
+
+
+async def test_the_closed_review_fence_still_leaves_the_job_queued(
+    db: AsyncSession, capture: CaptureProvider, monkeypatch
+) -> None:
+    monkeypatch.setattr(settings, "easyweek_review_send_enabled", False, raising=False)
+    job = await _seed_review_job(db, services=((11, None, None),), total_cost=None)
+
+    claimed = await ow._lock_next_jobs(db, 10)
+
+    assert job.id not in {j.id for j in claimed}
+    await db.refresh(job)
+    assert job.status == "queued"
+    assert job.attempts == 0
+    assert capture.template_calls == []
 
 
 # ---------------------------------------------------------------------------

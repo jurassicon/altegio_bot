@@ -48,6 +48,7 @@ from altegio_bot.easyweek_policy import (
     EASYWEEK_LIFECYCLE_JOB_TYPES,
     EASYWEEK_REMINDER_JOB_TYPES,
     EASYWEEK_REVIEW_JOB_TYPES,
+    EASYWEEK_SERVICE_SNAPSHOT_JOB_TYPES,
     RECORD_CREATED,
     RECORD_CREATED_NEW_CLIENT,
     REVIEW_3D,
@@ -1299,7 +1300,7 @@ async def _render_message(
         svc_res = await session.execute(svc_stmt)
         services = list(svc_res.scalars().all())
 
-        if is_easyweek and template_code in EASYWEEK_CUSTOMER_JOB_TYPES:
+        if is_easyweek and template_code in EASYWEEK_SERVICE_SNAPSHOT_JOB_TYPES:
             # BEFORE the loop below, which is what would flatten an unknown
             # title into "None" and an unknown price into "0.00".
             snapshot_err = _easyweek_service_snapshot_error(record, services)

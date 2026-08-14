@@ -84,6 +84,23 @@ EASYWEEK_REMINDER_JOB_TYPES: frozenset[str] = frozenset(
 # own send fence, and it must never inherit the reminder or lifecycle rules.
 EASYWEEK_REVIEW_JOB_TYPES: frozenset[str] = frozenset({REVIEW_3D})
 
+# The job types whose rendering DEPENDS on a complete service snapshot: a single
+# RecordService with a title, a price, and a Record.total_cost that agrees with
+# it. Lifecycle messages print the service line and the total; reminders print
+# the service line. Both are fail-closed on an unknown value, because rendering
+# flattens `None` into the literal "None" and an unknown price into "0.00".
+#
+# Stated as a POSITIVE allowlist rather than "everything except review". A
+# negative test is fail-OPEN: the next EasyWeek job type added to the customer
+# set would silently skip a guard it may well need. A type has to be listed here
+# to get the guard, and listing it is a deliberate act.
+#
+# review_3d is deliberately absent. It renders exactly two parameters — the
+# customer's name and the proven review link — so a booking with an unknown
+# price still owes a perfectly sendable review, and failing it on a price it
+# never prints would lose the review outright.
+EASYWEEK_SERVICE_SNAPSHOT_JOB_TYPES: frozenset[str] = EASYWEEK_LIFECYCLE_JOB_TYPES | EASYWEEK_REMINDER_JOB_TYPES
+
 EASYWEEK_CUSTOMER_JOB_TYPES: frozenset[str] = (
     EASYWEEK_LIFECYCLE_JOB_TYPES | EASYWEEK_REMINDER_JOB_TYPES | EASYWEEK_REVIEW_JOB_TYPES
 )
