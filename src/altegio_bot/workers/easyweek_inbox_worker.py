@@ -62,6 +62,7 @@ from ..easyweek_normalizer import (
     canonical_booking_uuid,
     easyweek_job_dedupe_key,
     normalize_event,
+    normalize_succeeded_event,
 )
 from ..easyweek_policy import (
     EASYWEEK_LIFECYCLE_JOB_TYPES,
@@ -69,13 +70,16 @@ from ..easyweek_policy import (
     RECORD_CANCELED,
     RECORD_CREATED,
     RECORD_UPDATED,
+    REVIEW_3D,
 )
 from ..easyweek_reminders import plan_reminders, reminder_job_payload
+from ..easyweek_review import plan_review, review_job_payload
 from ..easyweek_service_category import (
     evaluate_service_category,
     parse_allowed_service_categories,
     record_raw_with_service_category,
     record_raw_with_services_count,
+    services_count_from_record_raw,
 )
 from ..models.models import Client, EasyWeekEvent, MessageJob, Record, RecordService
 from ..settings import settings
@@ -114,6 +118,9 @@ MAX_TRACKED_ATTEMPTS = 1000
 
 STATUS_CAPTURED = "captured"
 STATUS_PROCESSING = "processing"
+# PR-9: the one trigger whose claim is gated on review planning.
+SUCCEEDED_EVENT_HINT = "booking-succeeded"
+
 STATUS_PROCESSED = "processed"
 STATUS_FAILED = "failed"
 
@@ -334,16 +341,29 @@ async def claim_next_event(session: AsyncSession) -> EasyWeekEvent | None:
     if not processing_is_configured():
         return None
 
+    # PR-9. With review planning off, a `booking-succeeded` delivery is neither
+    # claimed nor destroyed: it waits, `captured`, until planning is enabled.
+    #
+    # Two predicates, not one, and the second is the important half. A deferred
+    # succeeded row is still non-terminal, so without excluding it from the
+    # PREDECESSOR subquery too it would sit in front of every later delivery of
+    # the same booking and stall lifecycle processing indefinitely — a review
+    # feature nobody switched on would quietly stop confirmations. The deferral
+    # is therefore scoped to this one trigger on both sides.
+    reviews_enabled = bool(getattr(settings, "easyweek_reviews_enabled", False))
+
     predecessor = aliased(EasyWeekEvent)
-    earlier_pending = (
+    earlier_pending_stmt = (
         select(predecessor.id)
         .where(predecessor.id != EasyWeekEvent.id)
         .where(predecessor.status.in_(NON_TERMINAL_STATUSES))
         .where(predecessor.booking_uuid == EasyWeekEvent.booking_uuid)
         # Strictly EARLIER in capture order; ties break on id.
         .where(tuple_(predecessor.received_at, predecessor.id) < tuple_(EasyWeekEvent.received_at, EasyWeekEvent.id))
-        .exists()
     )
+    if not reviews_enabled:
+        earlier_pending_stmt = earlier_pending_stmt.where(predecessor.event_hint != SUCCEEDED_EVENT_HINT)
+    earlier_pending = earlier_pending_stmt.exists()
 
     stmt = (
         select(EasyWeekEvent)
@@ -365,6 +385,8 @@ async def claim_next_event(session: AsyncSession) -> EasyWeekEvent | None:
         .limit(1)
         .with_for_update(skip_locked=True, of=EasyWeekEvent)
     )
+    if not reviews_enabled:
+        stmt = stmt.where(EasyWeekEvent.event_hint != SUCCEEDED_EVENT_HINT)
     event = (await session.execute(stmt)).scalars().first()
     if event is None:
         return None
@@ -797,6 +819,161 @@ async def plan_lifecycle_job(
     await session.execute(stmt)
 
 
+async def plan_review_job(
+    session: AsyncSession,
+    *,
+    event: EasyWeekEvent,
+    registry: Any,
+) -> None:
+    """PR-9: earn at most one ``review_3d`` from a proven succeeded delivery.
+
+    Runs inside the caller's transaction, so the event's terminal status and the
+    job it earned commit together or not at all.
+
+    Everything here is a proof, and a failed proof is a silent no-op rather than
+    an error: a succeeded delivery we cannot turn into a review is still a
+    perfectly valid succeeded delivery. What must never happen is a review
+    request sent to the wrong person, for the wrong branch, or carrying a link
+    to someone else's booking — so every identity is re-derived from the
+    database instead of trusted from the payload.
+
+    Deliberately NOT ``plan_jobs_for_record_event``: that planner gates review on
+    a live Altegio API visit count and renders from an Altegio-keyed Google Maps
+    link. EasyWeek has neither, and ``visits_total`` is the next phase.
+    """
+    if not (settings.easyweek_notifications_enabled and settings.easyweek_reviews_enabled):
+        return
+
+    succeeded = normalize_succeeded_event(
+        event_hint=event.event_hint,
+        payload=event.payload,
+        body_truncated=bool(event.body_truncated),
+        location_registry=registry.locations if registry.ready else {},
+    )
+
+    record = (
+        (
+            await session.execute(
+                select(Record)
+                .where(Record.provider == PROVIDER)
+                .where(Record.easyweek_booking_uuid == succeeded.booking_uuid)
+                .with_for_update()
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if record is None:
+        logger.info(
+            "easyweek review skipped event=%s booking_uuid=%s reason=no_record",
+            event.id,
+            succeeded.booking_uuid,
+        )
+        return
+    if record.company_id != succeeded.company_id:
+        # The booking UUID resolves to a record in another branch. Nothing here
+        # is safe to use: not the template, not the sender, not the link.
+        logger.warning(
+            "easyweek review refused event=%s record_id=%s reason=company_mismatch",
+            event.id,
+            record.id,
+        )
+        return
+    if record.altegio_record_id is not None and record.altegio_record_id != succeeded.booking_id:
+        logger.warning(
+            "easyweek review refused event=%s record_id=%s reason=booking_id_mismatch",
+            event.id,
+            record.id,
+        )
+        return
+    if bool(record.is_deleted) or record.starts_at is None:
+        return
+
+    client = None
+    if record.client_id is not None:
+        client = (
+            (
+                await session.execute(
+                    select(Client)
+                    .where(Client.id == record.client_id)
+                    .where(Client.provider == PROVIDER)
+                    .where(Client.company_id == record.company_id)
+                )
+            )
+            .scalars()
+            .first()
+        )
+    if client is None:
+        logger.info("easyweek review skipped event=%s record_id=%s reason=no_client", event.id, record.id)
+        return
+    if bool(getattr(client, "wa_opted_out", False)):
+        # Marketing, and this customer said no. Nothing else needs checking.
+        return
+
+    eligibility = evaluate_service_category(
+        record_raw=record.raw,
+        allowed_categories_raw=settings.easyweek_allowed_service_categories,
+    )
+    if not eligibility.allowed:
+        if eligibility.recoverable_configuration:
+            # Same contract as the other planners: a broken allowlist is not a
+            # decision. Roll back so the event stays claimable once it is fixed.
+            raise RecoverableCategoryConfigurationError(eligibility.reason)
+        logger.info(
+            "easyweek review suppressed event=%s record_id=%s reason=%s",
+            event.id,
+            record.id,
+            eligibility.reason,
+        )
+        return
+    if services_count_from_record_raw(record.raw) != 1:  # pragma: no cover - eligibility proves it
+        return
+
+    planned = plan_review(
+        booking_uuid=succeeded.booking_uuid,
+        starts_at=record.starts_at,
+        now=utcnow(),
+        review_url=succeeded.review_url,
+        booking_hash_id=record.easyweek_booking_hash_id,
+        is_deleted=bool(record.is_deleted),
+    )
+    if planned is None:
+        # An unprovable link, or a moment already past. Either way there is no
+        # review to send, and inventing one is exactly what must not happen.
+        logger.info("easyweek review skipped event=%s record_id=%s reason=unplannable", event.id, record.id)
+        return
+
+    stmt = pg_insert(MessageJob).values(
+        provider=PROVIDER,
+        company_id=record.company_id,
+        record_id=record.id,
+        client_id=client.id,
+        job_type=REVIEW_3D,
+        run_at=planned.run_at,
+        status="queued",
+        dedupe_key=planned.dedupe_key,
+        payload=review_job_payload(
+            booking_uuid=succeeded.booking_uuid,
+            company_id=record.company_id,
+            starts_at=record.starts_at,
+            review_url=planned.review_url,
+            source_event_id=event.id,
+            source_payload_hash=event.payload_hash,
+        ),
+    )
+    # One earned review per booking. A Resend, a second succeeded delivery with
+    # a different payload hash, and a delivery retry all describe the same fact.
+    stmt = stmt.on_conflict_do_nothing(index_elements=[MessageJob.dedupe_key])
+    await session.execute(stmt)
+    logger.info(
+        "easyweek review planned event=%s record_id=%s company_id=%s booking_uuid=%s",
+        event.id,
+        record.id,
+        record.company_id,
+        succeeded.booking_uuid,
+    )
+
+
 async def sync_reminder_jobs(
     session: AsyncSession,
     *,
@@ -992,10 +1169,13 @@ async def process_claimed_event(session: AsyncSession, event: EasyWeekEvent) -> 
     )
 
     if booking is None:
-        # booking-succeeded: terminal, no Client/Record/Job side effects. It
-        # still passed truncation, payload and location isolation above.
+        # booking-succeeded. Terminal for the lifecycle — it never rewrites the
+        # name, phone, price, service, time or client link the lifecycle events
+        # proved — but PR-9 reads it as evidence that a visit finished, and may
+        # earn exactly one review request from it.
+        await plan_review_job(session, event=event, registry=registry)
         mark_processed(event)
-        logger.info("easyweek event=%s hint=%s ignored (no side effects)", event_id, event_hint)
+        logger.info("easyweek event=%s hint=%s succeeded processed", event_id, event_hint)
         return
 
     # Stale-replay guard, BEFORE any domain write. A Resend re-delivers a
@@ -1344,6 +1524,7 @@ __all__ = [
     "retry_delay_for",
     "schedule_retry",
     "sync_record_service",
+    "plan_review_job",
     "sync_reminder_jobs",
     "upsert_client",
     "upsert_record",

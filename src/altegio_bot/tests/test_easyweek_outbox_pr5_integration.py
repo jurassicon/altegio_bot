@@ -56,6 +56,7 @@ from altegio_bot.easyweek_policy import (
     EASYWEEK_CUSTOMER_JOB_TYPES,
     EASYWEEK_LIFECYCLE_JOB_TYPES,
     EASYWEEK_REMINDER_JOB_TYPES,
+    EASYWEEK_REVIEW_JOB_TYPES,
     easyweek_job_type_error,
     validate_static_booking_page,
 )
@@ -3156,8 +3157,10 @@ async def test_no_guard_result_is_ever_reused_across_sends(
 # stays here is everything that still calls something EasyWeek has no
 # equivalent for: the Altegio API, an Altegio-keyed BOOKING_LINKS entry, or a
 # campaign runner built around Altegio client ids.
+# PR-9 moved review_3d out of this list: it is now an EasyWeek customer
+# notification with its own planner, send fence, link validator and send-time
+# guard. What remains here still calls something EasyWeek has no equivalent for.
 _DISALLOWED_EASYWEEK_JOB_TYPES = [
-    "review_3d",
     "repeat_10d",
     "comeback_3d",
     "promo_eligibility_check",
@@ -3177,16 +3180,24 @@ async def test_reminders_are_now_inside_the_easyweek_allowlist(job_type: str) ->
     assert job_type not in EASYWEEK_LIFECYCLE_JOB_TYPES, "reminders must not inherit the lifecycle seven-field contract"
 
 
-async def test_the_easyweek_allowlist_is_exactly_lifecycle_plus_reminders() -> None:
+async def test_the_easyweek_allowlist_is_exactly_lifecycle_reminders_and_review() -> None:
     """A new customer notification kind has one place to be registered."""
-    assert EASYWEEK_CUSTOMER_JOB_TYPES == EASYWEEK_LIFECYCLE_JOB_TYPES | EASYWEEK_REMINDER_JOB_TYPES
+    assert (
+        EASYWEEK_CUSTOMER_JOB_TYPES
+        == EASYWEEK_LIFECYCLE_JOB_TYPES | EASYWEEK_REMINDER_JOB_TYPES | EASYWEEK_REVIEW_JOB_TYPES
+    )
     assert EASYWEEK_CUSTOMER_JOB_TYPES == {
         "record_created",
         "record_updated",
         "record_canceled",
         "reminder_24h",
         "reminder_2h",
+        "review_3d",
     }
+    assert EASYWEEK_REVIEW_JOB_TYPES == {"review_3d"}
+    assert not EASYWEEK_REVIEW_JOB_TYPES & (EASYWEEK_LIFECYCLE_JOB_TYPES | EASYWEEK_REMINDER_JOB_TYPES), (
+        "review must not inherit lifecycle or reminder rules"
+    )
 
 
 @pytest.mark.parametrize("job_type", _DISALLOWED_EASYWEEK_JOB_TYPES)

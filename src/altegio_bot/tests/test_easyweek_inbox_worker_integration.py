@@ -424,6 +424,17 @@ def _in(payload: dict, **delta) -> dict:
 
 
 @pytest.fixture
+def _reviews_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    """PR-9: claim booking-succeeded at all.
+
+    With review planning off the trigger is deliberately left `captured`, so any
+    test about what the succeeded PATH does has to switch planning on first.
+    """
+    monkeypatch.setattr(settings, "easyweek_notifications_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_reviews_enabled", True, raising=False)
+
+
+@pytest.fixture
 def _reminders_on(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "easyweek_notifications_enabled", True, raising=False)
     monkeypatch.setattr(settings, "easyweek_reminders_enabled", True, raising=False)
@@ -1322,7 +1333,7 @@ async def test_truncated_body_is_failed_not_processed(bound_session_local) -> No
         assert event.error_code == "truncated_payload"
 
 
-async def test_booking_succeeded_is_processed_without_side_effects(bound_session_local) -> None:
+async def test_booking_succeeded_is_processed_without_side_effects(bound_session_local, _reviews_on) -> None:
     async with bound_session_local() as session:
         async with session.begin():
             await _capture(session, booking_created(), event_hint="booking-succeeded", payload_hash="h1")
@@ -1950,7 +1961,7 @@ async def test_domain_writes_and_event_status_never_disagree(bound_session_local
 # ===========================================================================
 
 
-async def test_processed_rows_have_a_timestamp_and_no_error_code(bound_session_local) -> None:
+async def test_processed_rows_have_a_timestamp_and_no_error_code(bound_session_local, _reviews_on) -> None:
     async with bound_session_local() as session:
         async with session.begin():
             await _capture(session, booking_created(), payload_hash="h1")
@@ -2007,7 +2018,7 @@ async def test_captured_rows_after_a_transient_fault_stay_pristine(bound_session
 # ===========================================================================
 
 
-async def test_succeeded_for_our_location_is_processed_without_side_effects(bound_session_local) -> None:
+async def test_succeeded_for_our_location_is_processed_without_side_effects(bound_session_local, _reviews_on) -> None:
     async with bound_session_local() as session:
         async with session.begin():
             await _capture(session, booking_created(), event_hint="booking-succeeded", payload_hash="h1")
@@ -2029,7 +2040,9 @@ async def test_succeeded_for_our_location_is_processed_without_side_effects(boun
         (lambda p: p.pop("location_id"), False, "invalid_location_id"),
     ],
 )
-async def test_invalid_succeeded_events_fail_closed(bound_session_local, mutate, truncated, expected) -> None:
+async def test_invalid_succeeded_events_fail_closed(
+    bound_session_local, _reviews_on, mutate, truncated, expected
+) -> None:
     """A foreign or malformed `booking-succeeded` must NOT be marked processed."""
     payload = booking_created()
     mutate(payload)
@@ -3707,7 +3720,7 @@ async def test_recovered_normal_processing_clears_the_retry_timestamp(bound_sess
     assert row.processing_attempts == 3, "attempt history is audit data and is kept"
 
 
-async def test_recovered_booking_succeeded_clears_the_retry_timestamp(bound_session_local) -> None:
+async def test_recovered_booking_succeeded_clears_the_retry_timestamp(bound_session_local, _reviews_on) -> None:
     """An early-return terminal branch used to keep a future retry timestamp."""
     async with bound_session_local() as session:
         async with session.begin():
