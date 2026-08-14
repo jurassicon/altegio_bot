@@ -182,6 +182,22 @@ def processing_is_configured() -> bool:
     return parse_allowed_service_categories(settings.easyweek_allowed_service_categories).ready
 
 
+def review_planning_enabled() -> bool:
+    """THE effective gate for the PR-9 succeeded path — one definition.
+
+    ``easyweek_reviews_enabled`` alone is not the answer. A review request is a
+    customer notification, so the master switch governs it too, and the planner
+    has always required both. When the claim asked only the narrower question,
+    the pair (reviews on, notifications off) let a `booking-succeeded` be
+    claimed, produce nothing, and reach `processed` — a review owed to a real
+    visit, destroyed by a configuration state an operator can reach in one step
+    and never recover from.
+
+    So the claim, the predecessor subquery and the planner all ask this.
+    """
+    return bool(settings.easyweek_notifications_enabled) and bool(settings.easyweek_reviews_enabled)
+
+
 # Statuses that are NOT terminal: a row in one of these still owes the domain
 # an outcome, so a LATER delivery of the same booking must wait for it.
 NON_TERMINAL_STATUSES = (STATUS_CAPTURED, STATUS_PROCESSING)
@@ -350,7 +366,7 @@ async def claim_next_event(session: AsyncSession) -> EasyWeekEvent | None:
     # the same booking and stall lifecycle processing indefinitely — a review
     # feature nobody switched on would quietly stop confirmations. The deferral
     # is therefore scoped to this one trigger on both sides.
-    reviews_enabled = bool(getattr(settings, "easyweek_reviews_enabled", False))
+    reviews_enabled = review_planning_enabled()
 
     predecessor = aliased(EasyWeekEvent)
     earlier_pending_stmt = (
@@ -841,7 +857,9 @@ async def plan_review_job(
     a live Altegio API visit count and renders from an Altegio-keyed Google Maps
     link. EasyWeek has neither, and ``visits_total`` is the next phase.
     """
-    if not (settings.easyweek_notifications_enabled and settings.easyweek_reviews_enabled):
+    if not review_planning_enabled():
+        # Same gate the claim used, so a succeeded event is never claimed by one
+        # rule and then discarded by a stricter one.
         return
 
     succeeded = normalize_succeeded_event(
@@ -1525,6 +1543,7 @@ __all__ = [
     "schedule_retry",
     "sync_record_service",
     "plan_review_job",
+    "review_planning_enabled",
     "sync_reminder_jobs",
     "upsert_client",
     "upsert_record",

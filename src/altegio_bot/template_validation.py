@@ -147,6 +147,10 @@ _LIFECYCLE_RULES: dict[str, _TemplateRule] = {
         6,
         ["client_name", "staff_name", "date", "time", "services", "booking_link"],
     ),
+    "review_3d": (
+        2,
+        ["client_name", "review_url"],
+    ),
 }
 
 
