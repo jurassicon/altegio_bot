@@ -2527,3 +2527,146 @@ Capture, lifecycle notifications, Chatwoot и Altegio при обоих шага
 
 **`booking-succeeded` в PR-8 не включается** — он нужен последующей
 review/visit-counter фазе.
+
+
+---
+
+## 13. PR-9 — review_3d после booking-succeeded
+
+### 13.1 Пятый webhook
+
+К четырём lifecycle-триггерам добавляется пятый. Полный список поддерживаемых
+на этой фазе:
+
+- `booking-created`
+- `booking-updated`
+- `booking-rescheduled`
+- `booking-canceled`
+- `booking-succeeded`
+
+Новый URL использует **тот же** endpoint и **тот же** secret, отдельного
+маршрута не создаётся:
+
+```text
+https://api.kitilash.com/webhooks/easyweek?event=booking-succeeded&token=<EASYWEEK_WEBHOOK_SECRET>
+```
+
+Подставьте значение из `easyweek.env` вручную в интерфейсе EasyWeek. Никогда не
+печатайте собранный URL в консоль, скрипты или тикеты — он содержит secret.
+
+Проверка захвата — только по техническим полям, без payload:
+
+```bash
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml exec -T postgres sh -lc 'psql -tAX -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT id, status, event_hint, received_at FROM easyweek_events WHERE event_hint = '"'"'booking-succeeded'"'"' ORDER BY id DESC LIMIT 5"'
+```
+
+Ранее `booking-succeeded` описывался как терминальный без побочных эффектов —
+это верно для lifecycle, но начиная с PR-9 он также является доказательством
+завершённого визита и может создать **один** `review_3d`. Он по-прежнему не
+создаёт lifecycle-уведомление и не переписывает snapshot записи.
+
+### 13.2 Rollout
+
+Оба флага деплоятся `false` и включаются по очереди.
+
+**1. Deploy с закрытыми gates.** В `easyweek.env`:
+
+```text
+EASYWEEK_REVIEWS_ENABLED=false
+EASYWEEK_REVIEW_SEND_ENABLED=false
+```
+
+Проверить effective config в обоих сервисах:
+
+```bash
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml exec -T altegio-easyweek-inbox-worker /app/.venv/bin/python -c 'from altegio_bot.settings import settings; print("reviews=", settings.easyweek_reviews_enabled)'
+```
+
+```bash
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml exec -T altegio-outbox-worker /app/.venv/bin/python -c 'from altegio_bot.settings import settings; print("review_send=", settings.easyweek_review_send_enabled)'
+```
+
+**2. Подтвердить APPROVED Meta review templates** для каждого включаемого
+филиала: `kitilash_du_review_3d_v1`, `kitilash_ra_review_3d_v1`. Не объявлять
+их APPROVED без проверки в Meta — отсутствующий или неодобренный шаблон
+блокирует rollout.
+
+**3. Seed по существующему contract** (идемпотентный, ничего не удаляет):
+
+```bash
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml exec -T altegio-outbox-worker /app/.venv/bin/python -m altegio_bot.scripts.seed_easyweek_templates
+```
+
+**4. Добавить webhook `booking-succeeded`** (см. 13.1) при `planning=false` и
+убедиться, что событие осталось `captured`, review job не создана, а более
+поздние lifecycle events той же booking обрабатываются.
+
+**5. Включить только planning.** `EASYWEEK_REVIEWS_ENABLED=true`, затем:
+
+```bash
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml up -d --force-recreate altegio-easyweek-inbox-worker
+```
+
+`docker compose restart` не перечитывает `env_file` — только `--force-recreate`.
+
+**6. Создать новую controlled запись** разрешённой категории с одной услугой и
+дождаться реального `booking-succeeded`. Байт-идентичный Resend старого события
+доказательством не является: он дедуплицируется по замыслу и проверяет
+дедупликацию, а не новый путь.
+
+**7. Проверить очередь** — ровно одна job, ничего не отправлено:
+
+```bash
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml exec -T postgres sh -lc 'psql -tAX -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT id, company_id, job_type, status, attempts, run_at FROM message_jobs WHERE provider = '"'"'easyweek'"'"' AND job_type = '"'"'review_3d'"'"' ORDER BY id DESC LIMIT 5"'
+```
+
+Требуется `status=queued`, `attempts=0`, `run_at` = начало записи плюс трое
+суток, и ноль строк в `outbox_messages` для этой job.
+
+**8. Read-only preflight** при всё ещё закрытом fence:
+
+```bash
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml exec -T altegio-outbox-worker /app/.venv/bin/python -m altegio_bot.scripts.easyweek_review_preflight
+```
+
+**9. Открывать fence только при `ready=true` и exit code 0.** Пустая очередь,
+`truncated=true`, любой blocked кандидат или `config_error` — это STOP.
+
+**10. Открыть send fence.** `EASYWEEK_REVIEW_SEND_ENABLED=true`, затем
+пересоздать **только** outbox worker:
+
+```bash
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml up -d --force-recreate altegio-outbox-worker
+```
+
+**11. Controlled production validation.** Дождаться естественного `run_at` —
+не менять его SQL-командой, не редактировать payload и не подделывать событие.
+Проверить цепочку: `easyweek_events` → одна `review_3d` job → правильный branch
+template и sender → `outbox_messages` `sent` → Meta `delivered`/`read`. Статус
+`sent` финальным доказательством не считается.
+
+**12. Проверить логи** обоих worker на отсутствие traceback, а также имени,
+телефона, email, review URL и token.
+
+### 13.3 Rollback
+
+Порядок обратный включению: сначала закрывается отправка.
+
+1. `EASYWEEK_REVIEW_SEND_ENABLED=false`.
+2. `up -d --force-recreate altegio-outbox-worker`.
+3. Проверить effective `review_send=False` командой из шага 1 rollout.
+4. Убедиться, что review jobs больше не claim'ятся: `status` остаётся `queued`,
+   `attempts` не растёт.
+5. При необходимости `EASYWEEK_REVIEWS_ENABLED=false`.
+6. `up -d --force-recreate altegio-easyweek-inbox-worker`.
+7. `EASYWEEK_NOTIFICATIONS_ENABLED` **не** выключать — это остановило бы
+   lifecycle и reminders.
+8. Ничего не удалять: ни events, ни jobs, ни Outbox, ни templates, ни senders.
+9. Не выполнять массовых `UPDATE` по production-строкам и не переигрывать
+   delivery callbacks вручную.
+10. Оставшаяся очередь проверяется только read-only запросом из шага 7 rollout
+    и повторным preflight перед следующим включением.
+
+Что продолжает работать после rollback: capture всех пяти триггеров, lifecycle
+notifications, PR-8 reminders и весь Altegio path — они управляются своими
+флагами и этим откатом не затрагиваются.

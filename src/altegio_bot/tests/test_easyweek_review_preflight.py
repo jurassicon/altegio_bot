@@ -36,6 +36,7 @@ from altegio_bot.models.models import (
     WhatsAppSender,
 )
 from altegio_bot.scripts.easyweek_review_preflight import (
+    EASYWEEK_SENDER_CODE,
     OPEN_STATUSES,
     PROVEN,
     REASON_CATEGORY,
@@ -44,13 +45,20 @@ from altegio_bot.scripts.easyweek_review_preflight import (
     REASON_DEADLINE,
     REASON_DOMAIN,
     REASON_NOT_OWNED,
+    REASON_NOTIFICATIONS_DISABLED,
+    REASON_PHONE_MISSING,
+    REASON_PLANNING_DISABLED,
+    REASON_SEND_FENCE_OPEN,
     REASON_SENDER_MISSING,
+    REASON_SENDER_PHONE_ID_EMPTY,
     REASON_TEMPLATE_CONTRACT,
     REASON_TEMPLATE_DUPLICATE,
     REASON_TEMPLATE_MISSING,
+    REASON_TEMPLATE_PARAMS,
     ReviewPreflightReport,
     _parse_args,
     main,
+    rollout_state_error,
     run_review_preflight,
     select_open_review_jobs,
 )
@@ -99,6 +107,13 @@ def _pr9_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "easyweek_booking_page_allowed_hosts", "book.durlach.invalid", raising=False)
 
 
+class _UnsetPhone:
+    """Distinguishes "left at the default" from an explicit ``None``."""
+
+
+_UNSET_PHONE = _UnsetPhone()
+
+
 def _branch(company_id: int) -> str:
     return "durlach" if company_id == COMPANY_ID else "rastatt"
 
@@ -127,6 +142,12 @@ async def _seed_review(
     duplicate_template: bool = False,
     with_sender: bool = True,
     sender_active: bool = True,
+    sender_code: str = "default",
+    sender_provider: str = PROVIDER_EASYWEEK,
+    sender_company_id: int | None = None,
+    sender_phone_number_id: str | None = None,
+    phone_e164: object = _UNSET_PHONE,
+    display_name: str | None = "Anna Müller",
     link_client: bool = True,
     suffix: str = "1",
 ) -> MessageJob:
@@ -137,8 +158,8 @@ async def _seed_review(
         provider=provider,
         company_id=company_id,
         altegio_client_id=7000 + int(suffix),
-        display_name="Anna Müller",
-        phone_e164=f"+4917000000{suffix}",
+        display_name=display_name,
+        phone_e164=(f"+4917000000{suffix}" if phone_e164 is _UNSET_PHONE else phone_e164),
         email="anna@example.invalid",
         wa_opted_out=opted_out,
         raw={},
@@ -210,10 +231,12 @@ async def _seed_review(
     if with_sender and existing_sender is None:
         session.add(
             WhatsAppSender(
-                provider=PROVIDER_EASYWEEK,
-                company_id=company_id,
-                sender_code="default",
-                phone_number_id=f"eyw-phone-{suffix}",
+                provider=sender_provider,
+                company_id=sender_company_id if sender_company_id is not None else company_id,
+                sender_code=sender_code,
+                phone_number_id=(
+                    sender_phone_number_id if sender_phone_number_id is not None else f"eyw-phone-{suffix}"
+                ),
                 is_active=sender_active,
             )
         )
@@ -657,6 +680,172 @@ async def test_one_blocked_candidate_fails_an_otherwise_proven_queue(session_mak
     assert report.reasons == {PROVEN: 1, REASON_SENDER_MISSING: 1}
     assert report.blocked_job_ids == [blocked.id]
     assert report.ready is False
+
+
+# ---------------------------------------------------------------------------
+# The rollout state the report is a statement about
+# ---------------------------------------------------------------------------
+#
+# "Every queued review would be sent correctly if the fence opened" is only a
+# true sentence in one configuration. With notifications or planning off the
+# queue is not being fed; with the fence already open there is nothing left to
+# authorise. Reading the queue in those states and calling it green would
+# authorise a rollout step against a world that no longer exists.
+
+
+def test_the_only_auditable_state_is_planning_on_and_the_fence_shut() -> None:
+    assert rollout_state_error() is None
+
+
+@pytest.mark.parametrize(
+    ("label", "notifications", "reviews", "send", "expected"),
+    [
+        ("notifications-off", False, True, False, REASON_NOTIFICATIONS_DISABLED),
+        ("planning-off", True, False, False, REASON_PLANNING_DISABLED),
+        ("fence-already-open", True, True, True, REASON_SEND_FENCE_OPEN),
+        ("everything-off-but-send", False, False, True, REASON_NOTIFICATIONS_DISABLED),
+    ],
+)
+async def test_a_wrong_rollout_state_is_red_and_never_reads_the_queue(
+    session_maker, monkeypatch, label: str, notifications: bool, reviews: bool, send: bool, expected: str
+) -> None:
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_review(session)
+
+    monkeypatch.setattr(settings, "easyweek_notifications_enabled", notifications, raising=False)
+    monkeypatch.setattr(settings, "easyweek_reviews_enabled", reviews, raising=False)
+    monkeypatch.setattr(settings, "easyweek_review_send_enabled", send, raising=False)
+
+    report = await _run(session_maker)
+
+    assert report.config_error == expected, label
+    assert report.ready is False, label
+    assert report.candidate_count == 0, f"{label}: the queue must not be read at all"
+    assert report.checked_count == 0, label
+    assert report.reasons == {}, label
+
+
+async def test_a_wrong_rollout_state_exits_non_zero(session_maker, monkeypatch) -> None:
+    import altegio_bot.scripts.easyweek_review_preflight as module
+
+    monkeypatch.setattr(module, "SessionLocal", session_maker, raising=False)
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_review(session)
+
+    monkeypatch.setattr(settings, "easyweek_review_send_enabled", True, raising=False)
+    assert await main([]) == 1
+
+
+# ---------------------------------------------------------------------------
+# The values the send path itself needs
+# ---------------------------------------------------------------------------
+#
+# `phone_e164` and `display_name` are both nullable and neither is covered by
+# the domain guard, so a review could be proven here and then die at send time
+# on "No phone_e164" or on an empty first template parameter. The parameters are
+# built and validated with the SAME functions the outbox calls, so this cannot
+# become a third copy of the contract.
+
+
+@pytest.mark.parametrize("phone", [None, "", "   "])
+async def test_a_client_without_a_usable_phone_is_red(session_maker, phone: str | None) -> None:
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_review(session, phone_e164=phone)
+
+    report = await _run(session_maker)
+
+    assert report.reasons == {REASON_PHONE_MISSING: 1}
+    assert report.ready is False
+
+
+@pytest.mark.parametrize("name", [None, ""])
+async def test_a_client_without_a_name_fails_the_param_contract(session_maker, name: str | None) -> None:
+    """`client_name` is the first positional parameter; Meta rejects an empty one.
+
+    A whitespace-only name is deliberately NOT covered: the shared
+    `validate_lifecycle_template_params` tests emptiness rather than
+    blankness, and PR-9 does not introduce a name validator of its own —
+    doing so here would change the contract for every other job type.
+    """
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_review(session, display_name=name)
+
+    report = await _run(session_maker)
+
+    assert report.reasons == {REASON_TEMPLATE_PARAMS: 1}
+    assert report.ready is False
+
+
+async def test_only_the_phone_missing_still_blocks_an_otherwise_proven_review(session_maker) -> None:
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_review(session, phone_e164=None)
+
+    report = await _run(session_maker)
+
+    assert report.green_count == 0
+    assert report.blocked_count == 1
+
+
+async def test_a_complete_client_proves_the_two_review_parameters(session_maker) -> None:
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_review(session)
+
+    report = await _run(session_maker)
+
+    assert report.reasons == {PROVEN: 1}
+
+
+# ---------------------------------------------------------------------------
+# The sender runtime will actually route to
+# ---------------------------------------------------------------------------
+#
+# EasyWeek sends always resolve `sender_code="default"`. An audit that accepted
+# any active row would pass a branch whose only sender is `vip`, and the send
+# would then fail for want of a sender at all.
+
+
+@pytest.mark.parametrize(
+    ("label", "kwargs"),
+    [
+        ("only-a-vip-sender", {"sender_code": "vip"}),
+        ("default-inactive", {"sender_active": False}),
+        ("other-provider", {"sender_provider": PROVIDER_ALTEGIO}),
+        ("other-company", {"sender_company_id": OTHER_COMPANY_ID}),
+    ],
+)
+async def test_a_sender_runtime_would_not_pick_is_red(session_maker, label: str, kwargs: dict) -> None:
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_review(session, **kwargs)
+
+    report = await _run(session_maker)
+
+    assert report.reasons == {REASON_SENDER_MISSING: 1}, label
+    assert report.ready is False, label
+
+
+@pytest.mark.parametrize("phone_number_id", ["", "   "])
+async def test_a_default_sender_naming_no_whatsapp_number_is_red(session_maker, phone_number_id: str) -> None:
+    """A row that exists but names no number is not a sender."""
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_review(session, sender_phone_number_id=phone_number_id)
+
+    report = await _run(session_maker)
+
+    assert report.reasons == {REASON_SENDER_PHONE_ID_EMPTY: 1}
+    assert report.ready is False
+
+
+async def test_the_audited_sender_code_is_the_one_runtime_resolves() -> None:
+    """Pinned so the audit cannot drift from the send path."""
+    assert EASYWEEK_SENDER_CODE == "default"
 
 
 # ---------------------------------------------------------------------------

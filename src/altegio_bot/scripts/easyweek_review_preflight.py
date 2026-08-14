@@ -48,6 +48,7 @@ from altegio_bot.db import SessionLocal
 from altegio_bot.easyweek_branches import branch_template_contract
 from altegio_bot.easyweek_policy import REVIEW_3D
 from altegio_bot.easyweek_service_category import evaluate_service_category
+from altegio_bot.meta_templates import build_lifecycle_template_params
 from altegio_bot.models.models import (
     PROVIDER_EASYWEEK,
     Client,
@@ -57,10 +58,15 @@ from altegio_bot.models.models import (
     WhatsAppSender,
 )
 from altegio_bot.settings import settings
+from altegio_bot.template_validation import validate_lifecycle_template_params
 
 DEFAULT_LIMIT: Final = 200
 # Ids are for an operator to spot-check a row, not a data export.
 MAX_REPORTED_IDS: Final = 25
+
+# EasyWeek never runs service-based sender routing; the outbox resolves this
+# code and only this one.
+EASYWEEK_SENDER_CODE: Final = "default"
 
 # Everything that can still be waiting to send. `processing` is included on
 # purpose rather than filtered away: with the fence shut nothing should ever be
@@ -79,6 +85,16 @@ REASON_TEMPLATE_MISSING: Final = "template_row_missing"
 REASON_TEMPLATE_DUPLICATE: Final = "template_row_duplicated"
 REASON_TEMPLATE_CONTRACT: Final = "template_contract_mismatch"
 REASON_SENDER_MISSING: Final = "sender_missing_or_inactive"
+REASON_SENDER_PHONE_ID_EMPTY: Final = "sender_phone_number_id_empty"
+REASON_PHONE_MISSING: Final = "phone_missing"
+REASON_TEMPLATE_PARAMS: Final = "template_params_unproven"
+
+# Rollout state, checked BEFORE the queue. A preflight is a statement about a
+# specific configuration — "these jobs are safe to release" — and it is only
+# meaningful in the state the rollout is actually supposed to be in.
+REASON_NOTIFICATIONS_DISABLED: Final = "notifications_disabled"
+REASON_PLANNING_DISABLED: Final = "review_planning_disabled"
+REASON_SEND_FENCE_OPEN: Final = "review_send_fence_open"
 
 
 @dataclass
@@ -88,6 +104,10 @@ class ReviewPreflightReport:
     candidate_count: int = 0
     checked_count: int = 0
     truncated: bool = False
+    # Set when the rollout state itself is wrong. The queue is then not read at
+    # all: auditing a backlog while the fence is already open would describe a
+    # world that no longer exists.
+    config_error: str | None = None
     reasons: Counter = field(default_factory=Counter)
     blocked_job_ids: list[int] = field(default_factory=list)
     blocked_record_ids: list[int] = field(default_factory=list)
@@ -104,6 +124,8 @@ class ReviewPreflightReport:
     @property
     def ready(self) -> bool:
         """Green, and only for the narrow case that actually proves something."""
+        if self.config_error is not None:
+            return False
         if self.truncated:
             return False
         if self.candidate_count == 0:
@@ -117,6 +139,7 @@ class ReviewPreflightReport:
     def as_safe_dict(self) -> dict[str, Any]:
         return {
             "mode": "read-only",
+            "config_error": self.config_error,
             "candidate_count": self.candidate_count,
             "checked_count": self.checked_count,
             "green_count": self.green_count,
@@ -128,6 +151,24 @@ class ReviewPreflightReport:
             "company_ids": sorted(self.company_ids)[:MAX_REPORTED_IDS],
             "ready": self.ready,
         }
+
+
+def rollout_state_error() -> str | None:
+    """The one configuration this preflight is a statement about, or a reason.
+
+    A green report means "every queued review would be sent correctly if the
+    fence opened". That sentence is only true in one state: notifications on,
+    planning on, fence still shut. With notifications or planning off the queue
+    is not being fed and the audit describes a frozen picture; with the fence
+    already open there is nothing left to authorise — the sends are happening.
+    """
+    if not bool(getattr(settings, "easyweek_notifications_enabled", False)):
+        return REASON_NOTIFICATIONS_DISABLED
+    if not bool(getattr(settings, "easyweek_reviews_enabled", False)):
+        return REASON_PLANNING_DISABLED
+    if bool(getattr(settings, "easyweek_review_send_enabled", False)):
+        return REASON_SEND_FENCE_OPEN
+    return None
 
 
 async def select_open_review_jobs(session: AsyncSession, *, limit: int) -> tuple[list[MessageJob], bool]:
@@ -190,20 +231,55 @@ async def _template_reason(session: AsyncSession, job: MessageJob, profile: Any)
 
 
 async def _sender_reason(session: AsyncSession, job: MessageJob) -> str | None:
-    """An active EasyWeek sender owned by this branch, and no fallback."""
+    """The sender runtime will actually route to, not merely one that exists.
+
+    EasyWeek sends always resolve `sender_code="default"` (the outbox worker
+    never runs service-based routing for EasyWeek), so an audit that accepted
+    any active row would pass a branch whose only sender is, say, `vip` — and
+    the send would then fail with no sender at all.
+    """
     sender = (
         (
             await session.execute(
                 select(WhatsAppSender)
                 .where(WhatsAppSender.provider == PROVIDER_EASYWEEK)
                 .where(WhatsAppSender.company_id == job.company_id)
+                .where(WhatsAppSender.sender_code == EASYWEEK_SENDER_CODE)
                 .where(WhatsAppSender.is_active.is_(True))
             )
         )
         .scalars()
         .first()
     )
-    return None if sender is not None else REASON_SENDER_MISSING
+    if sender is None:
+        return REASON_SENDER_MISSING
+    if not (sender.phone_number_id or "").strip():
+        # A row that exists but names no WhatsApp number is not a sender.
+        return REASON_SENDER_PHONE_ID_EMPTY
+    return None
+
+
+def _send_prerequisites_reason(client: Client, review_url: str) -> str | None:
+    """The values the send path itself requires, checked with its own builders.
+
+    `Client.phone_e164` and `display_name` are both nullable, and neither is
+    covered by the domain guard. Without this, a review could be proven here and
+    then die at send time on "No phone_e164" or on an empty first parameter —
+    which is exactly the kind of surprise a preflight exists to remove.
+
+    The parameters are built and validated by the SAME functions the outbox
+    calls, so this cannot become a third copy of the contract that drifts.
+    """
+    if not (getattr(client, "phone_e164", None) or "").strip():
+        return REASON_PHONE_MISSING
+
+    params = build_lifecycle_template_params(
+        REVIEW_3D,
+        {"client_name": getattr(client, "display_name", None) or "", "review_url": review_url},
+    )
+    if validate_lifecycle_template_params(REVIEW_3D, params) is not None:
+        return REASON_TEMPLATE_PARAMS
+    return None
 
 
 async def check_review_job(session: AsyncSession, job: MessageJob) -> str:
@@ -215,6 +291,7 @@ async def check_review_job(session: AsyncSession, job: MessageJob) -> str:
         _easyweek_owned_branch,
         _easyweek_review_presend_error,
         easyweek_reminder_deadline_passed,
+        easyweek_review_url_for_send,
     )
 
     if job.status == "processing":
@@ -258,6 +335,14 @@ async def check_review_job(session: AsyncSession, job: MessageJob) -> str:
     if sender_reason is not None:
         return sender_reason
 
+    assert client is not None  # proven by the domain guard above
+    review_url = easyweek_review_url_for_send(job, record)
+    if review_url is None:  # pragma: no cover - the domain guard proves it
+        return REASON_DOMAIN
+    prerequisites_reason = _send_prerequisites_reason(client, review_url)
+    if prerequisites_reason is not None:
+        return prerequisites_reason
+
     return PROVEN
 
 
@@ -267,6 +352,12 @@ async def run_review_preflight(
     limit: int = DEFAULT_LIMIT,
 ) -> ReviewPreflightReport:
     """Check every open review job with the runtime rules. Writes nothing."""
+    config_error = rollout_state_error()
+    if config_error is not None:
+        # The queue is deliberately not read: this is not an audit that failed,
+        # it is an audit that does not apply.
+        return ReviewPreflightReport(config_error=config_error)
+
     jobs, truncated = await select_open_review_jobs(session, limit=limit)
     report = ReviewPreflightReport(candidate_count=len(jobs), truncated=truncated)
 
