@@ -103,6 +103,11 @@ def validate_review_url(raw: object, *, booking_hash_id: object) -> str | None:
         return None
     if any(ch in _FORBIDDEN_URL_CHARS for ch in candidate):
         return None
+    # Checked on the raw text, not on the parsed components: a trailing "?" or
+    # "#" parses to an EMPTY query/fragment, which is falsy, so the component
+    # tests below would wave it through. The documented review URL has neither.
+    if "?" in candidate or "#" in candidate:
+        return None
 
     # Every component access sits inside the guard: `.port` on
     # "https://eyw.me:bad/f/1" or "https://[oops/f/1" raises ValueError lazily,
