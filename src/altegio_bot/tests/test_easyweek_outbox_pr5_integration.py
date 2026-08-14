@@ -3375,6 +3375,173 @@ async def test_the_closed_review_fence_still_leaves_the_job_queued(
 
 
 # ---------------------------------------------------------------------------
+# 11d. PR-9: review delivery retry and the backlog deadline
+# ---------------------------------------------------------------------------
+
+
+async def test_a_failed_review_delivery_produces_one_retry_with_root_identity(
+    db: AsyncSession, capture: CaptureProvider, no_contact_rate_limit: None, monkeypatch
+) -> None:
+    monkeypatch.setattr(settings, "easyweek_review_send_enabled", True, raising=False)
+    job = await _seed_review_job(db, services=((11, None, None),), total_cost=None)
+    await _run_job(db, job)
+    assert job.status == "done", job.last_error
+
+    rows = await _outbox_rows(db, job)
+    original_outbox_id, wamid = rows[0].id, rows[0].provider_message_id
+    await _deliver_failed_status(db, wamid, dedupe="wa:eyw-review-failed-1")
+
+    retries = await _retry_jobs_for(db, original_outbox_id)
+    assert len(retries) == 1
+    retry = retries[0]
+    assert retry.provider == PROVIDER_EASYWEEK
+    assert retry.job_type == "review_3d"
+    assert retry.company_id == job.company_id
+    assert retry.record_id == job.record_id
+    assert retry.client_id == job.client_id
+    assert retry.payload["booking_uuid"] == str(EASYWEEK_BOOKING_UUID)
+    assert retry.payload["review_url"] == f"https://eyw.me/f/{BOOKING_HASH}"
+    assert datetime.fromisoformat(retry.payload["record_starts_at"]) == REMINDER_STARTS_AT
+
+    retry.run_at = utcnow() - timedelta(seconds=1)
+    await db.flush()
+    await _run_job(db, retry)
+
+    assert retry.status == "done", retry.last_error
+    assert len(capture.template_calls) == 2
+    assert capture.template_calls[-1]["template_name"] == "kitilash_cc_review_3d_v1"
+    assert capture.template_calls[-1]["params"] == ["Anna Müller", f"https://eyw.me/f/{BOOKING_HASH}"]
+
+
+async def test_a_duplicate_review_callback_does_not_create_a_second_retry(
+    db: AsyncSession, capture: CaptureProvider, no_contact_rate_limit: None, monkeypatch
+) -> None:
+    monkeypatch.setattr(settings, "easyweek_review_send_enabled", True, raising=False)
+    job = await _seed_review_job(db, services=((11, None, None),), total_cost=None)
+    await _run_job(db, job)
+    rows = await _outbox_rows(db, job)
+
+    await _deliver_failed_status(db, rows[0].provider_message_id, dedupe="wa:eyw-review-dup-1")
+    await _deliver_failed_status(db, rows[0].provider_message_id, dedupe="wa:eyw-review-dup-2")
+
+    assert len(await _retry_jobs_for(db, rows[0].id)) == 1
+
+
+@pytest.mark.parametrize(
+    ("label", "mutate"),
+    [
+        ("no-booking-uuid", {"booking_uuid": None}),
+        ("no-review-url", {"review_url": None}),
+        ("naive-start", {"record_starts_at": "2026-09-14T08:30:00"}),
+    ],
+)
+async def test_an_unprovable_review_root_creates_no_retry(
+    db: AsyncSession, capture: CaptureProvider, no_contact_rate_limit: None, monkeypatch, label: str, mutate: dict
+) -> None:
+    monkeypatch.setattr(settings, "easyweek_review_send_enabled", True, raising=False)
+    job = await _seed_review_job(db, services=((11, None, None),), total_cost=None)
+    await _run_job(db, job)
+    rows = await _outbox_rows(db, job)
+
+    payload = dict(job.payload or {})
+    for key, value in mutate.items():
+        payload.pop(key, None) if value is None else payload.__setitem__(key, value)
+    job.payload = payload
+    await db.flush()
+
+    sends_before = len(capture.template_calls)
+    await _deliver_failed_status(db, rows[0].provider_message_id, dedupe=f"wa:eyw-review-bad-{label}")
+
+    assert await _retry_jobs_for(db, rows[0].id) == [], label
+    assert len(capture.template_calls) == sends_before, label
+
+
+async def test_a_review_retry_is_refused_when_the_booking_moved(
+    db: AsyncSession, capture: CaptureProvider, no_contact_rate_limit: None, monkeypatch
+) -> None:
+    monkeypatch.setattr(settings, "easyweek_review_send_enabled", True, raising=False)
+    job = await _seed_review_job(db, services=((11, None, None),), total_cost=None)
+    await _run_job(db, job)
+    rows = await _outbox_rows(db, job)
+    await _deliver_failed_status(db, rows[0].provider_message_id, dedupe="wa:eyw-review-moved")
+
+    retry = (await _retry_jobs_for(db, rows[0].id))[0]
+    record = (await db.execute(select(Record).where(Record.id == job.record_id))).scalars().one()
+    record.starts_at = REMINDER_STARTS_AT + timedelta(hours=5)
+    retry.run_at = utcnow() - timedelta(seconds=1)
+    await db.flush()
+
+    sends_before = len(capture.template_calls)
+    await _run_job(db, retry)
+
+    assert retry.status == "canceled"
+    assert "start_time_mismatch" in (retry.last_error or "")
+    assert len(capture.template_calls) == sends_before
+
+
+async def test_a_review_retry_stays_queued_behind_a_closed_fence(
+    db: AsyncSession, capture: CaptureProvider, no_contact_rate_limit: None, monkeypatch
+) -> None:
+    monkeypatch.setattr(settings, "easyweek_review_send_enabled", True, raising=False)
+    job = await _seed_review_job(db, services=((11, None, None),), total_cost=None)
+    await _run_job(db, job)
+    rows = await _outbox_rows(db, job)
+    await _deliver_failed_status(db, rows[0].provider_message_id, dedupe="wa:eyw-review-fence")
+
+    retry = (await _retry_jobs_for(db, rows[0].id))[0]
+    retry.run_at = utcnow() - timedelta(seconds=1)
+    await db.flush()
+
+    monkeypatch.setattr(settings, "easyweek_review_send_enabled", False, raising=False)
+    claimed = await ow._lock_next_jobs(db, 10)
+
+    assert retry.id not in {j.id for j in claimed}
+    await db.refresh(retry)
+    assert retry.status == "queued"
+    assert retry.attempts == 0
+
+
+async def test_an_expired_review_backlog_is_cancelled_instead_of_sent(
+    db: AsyncSession, capture: CaptureProvider, monkeypatch
+) -> None:
+    """The rollout hazard: reviews pile up behind a closed fence and go stale."""
+    monkeypatch.setattr(settings, "easyweek_review_send_enabled", True, raising=False)
+    job = await _seed_review_job(db, services=((11, None, None),), total_cost=None)
+    # Older than the existing 24h marketing transient cap.
+    job.run_at = utcnow() - timedelta(hours=30)
+    await db.flush()
+
+    await _run_job(db, job)
+
+    assert job.status == "canceled", job.last_error
+    assert "deadline" in (job.last_error or "").lower()
+    assert job.attempts == 0
+    assert capture.template_calls == []
+    assert await _outbox_rows(db, job) == []
+
+
+async def test_a_review_inside_the_cap_still_sends(db: AsyncSession, capture: CaptureProvider, monkeypatch) -> None:
+    monkeypatch.setattr(settings, "easyweek_review_send_enabled", True, raising=False)
+    job = await _seed_review_job(db, services=((11, None, None),), total_cost=None)
+    job.run_at = utcnow() - timedelta(hours=2)
+    await db.flush()
+
+    await _run_job(db, job)
+
+    assert job.status == "done", job.last_error
+    assert len(capture.template_calls) == 1
+
+
+async def test_altegio_review_is_still_not_retry_enabled(db: AsyncSession) -> None:
+    """Altegio's review keeps exactly the behaviour it had: no delivery retry."""
+    from altegio_bot.delivery_retry_identity import DELIVERY_RETRY_JOB_TYPES
+
+    assert "review_3d" not in DELIVERY_RETRY_JOB_TYPES, (
+        "review must be retry-enabled for EasyWeek only, through the provider-aware gate"
+    )
+
+
+# ---------------------------------------------------------------------------
 # 12. Early EasyWeek job-type allowlist
 # ---------------------------------------------------------------------------
 

@@ -1543,8 +1543,11 @@ def _defer_easyweek_configuration(
     return _schedule_retry_or_cancel(job, record, delay, reason)
 
 
+_EASYWEEK_DEADLINE_JOB_TYPES = EASYWEEK_REMINDER_JOB_TYPES | EASYWEEK_REVIEW_JOB_TYPES
+
+
 def easyweek_reminder_deadline_passed(job: MessageJob, record: Record | None) -> bool:
-    """Is this EasyWeek reminder too late to send? THE single criterion.
+    """Is this EasyWeek reminder or review too late to send? THE single criterion.
 
     One function, two callers: the outbox worker below, and the read-only
     preflight. A preflight that judged timeliness by its own rule would bless a
@@ -1561,7 +1564,13 @@ def easyweek_reminder_deadline_passed(job: MessageJob, record: Record | None) ->
     """
     if normalize_provider(getattr(job, "provider", None), default="") != PROVIDER_EASYWEEK:
         return False
-    if getattr(job, "job_type", None) not in EASYWEEK_REMINDER_JOB_TYPES:
+    # PR-9 joins review to the same criterion. Its deadline is not a new number:
+    # `review_3d` is already in MARKETING_TRANSIENT_CAP_JOB_TYPES, so
+    # `_retry_deadline_at` answers `anchor + 24h` for it — and `_original_run_at`
+    # falls back to `job.run_at`, so an initial job that never retried still has
+    # an anchor. This matters exactly during rollout: reviews pile up behind a
+    # closed fence, and opening it must not release a backlog that went stale.
+    if getattr(job, "job_type", None) not in _EASYWEEK_DEADLINE_JOB_TYPES:
         return False
     deadline = _retry_deadline_at(job, record)
     if deadline is None or deadline == _DEADLINE_ALREADY_PASSED:
@@ -1570,6 +1579,13 @@ def easyweek_reminder_deadline_passed(job: MessageJob, record: Record | None) ->
 
 
 def _deadline_passed_for_send(job: MessageJob, record: Record | None) -> bool:
+    # EasyWeek reminders and reviews are judged first, by their own scoped rule.
+    # `review_3d` is not in DELIVERY_DEADLINE_JOB_TYPES — adding it there would
+    # give Altegio's review a deadline it never had — so without this it would
+    # leave through the next line and a backlog that went stale behind a closed
+    # fence would send the moment the fence opened.
+    if easyweek_reminder_deadline_passed(job, record):
+        return True
     if job.job_type not in DELIVERY_DEADLINE_JOB_TYPES:
         return False
     payload = getattr(job, "payload", None) or {}
