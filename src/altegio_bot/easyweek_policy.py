@@ -27,6 +27,9 @@ RECORD_CREATED = "record_created"
 RECORD_UPDATED = "record_updated"
 RECORD_CANCELED = "record_canceled"
 
+REMINDER_24H = "reminder_24h"
+REMINDER_2H = "reminder_2h"
+
 # A TEMPLATE CODE, deliberately not a job type.
 #
 # A first-time customer gets a different approved Meta template, which means a
@@ -38,13 +41,13 @@ RECORD_CANCELED = "record_canceled"
 # `meta_template_name` — differs.
 RECORD_CREATED_NEW_CLIENT = "record_created_new_client"
 
-# The ONLY job types EasyWeek may plan, render or send in this phase.
+# The lifecycle job types: one notification per webhook delivery.
 #
-# Reminders, review_3d, repeat_10d, comeback_3d, newsletters, follow-up, promo
-# and campaigns are Altegio-only for now. That is not an oversight to be relaxed
-# by whoever next touches a worker: each of those paths calls something EasyWeek
-# has no equivalent for — the Altegio API, an Altegio-keyed BOOKING_LINKS entry,
-# a campaign runner built around Altegio client ids.
+# Deliberately UNCHANGED by PR-8. Several gates key on this exact set — the
+# seven-field param contract, the domain-scope check, the record loader — and
+# widening it to include reminders would silently apply lifecycle rules to a job
+# that has different ones (a reminder has a run_at in the future, a stale check,
+# and a mandatory API guard).
 EASYWEEK_LIFECYCLE_JOB_TYPES: frozenset[str] = frozenset(
     {
         RECORD_CREATED,
@@ -52,6 +55,28 @@ EASYWEEK_LIFECYCLE_JOB_TYPES: frozenset[str] = frozenset(
         RECORD_CANCELED,
     }
 )
+
+# PR-8. Time-triggered rather than delivery-triggered, which is what makes them
+# a separate set: they are planned once and sent hours or days later, so what
+# was true at planning time has to be re-proven against the live EasyWeek API
+# before the message goes out.
+EASYWEEK_REMINDER_JOB_TYPES: frozenset[str] = frozenset(
+    {
+        REMINDER_24H,
+        REMINDER_2H,
+    }
+)
+
+# Everything EasyWeek may send TO A CUSTOMER. The allowlist below is keyed on
+# this union so a new EasyWeek notification kind has exactly one place to be
+# registered.
+#
+# review_3d, repeat_10d, comeback_3d, newsletters, follow-up, promo and
+# campaigns remain Altegio-only. That is not an oversight to be relaxed by
+# whoever next touches a worker: each of those paths calls something EasyWeek
+# has no equivalent for — the Altegio API, an Altegio-keyed BOOKING_LINKS entry,
+# a campaign runner built around Altegio client ids.
+EASYWEEK_CUSTOMER_JOB_TYPES: frozenset[str] = EASYWEEK_LIFECYCLE_JOB_TYPES | EASYWEEK_REMINDER_JOB_TYPES
 
 
 def normalize_provider(value: object | None, *, default: str) -> str:
@@ -68,14 +93,14 @@ def normalize_provider(value: object | None, *, default: str) -> str:
 
 
 def easyweek_job_type_allowed(provider: str, job_type: str) -> bool:
-    """True when *job_type* is inside EasyWeek's phase-1 allowlist.
+    """True when *job_type* is inside EasyWeek's customer-notification allowlist.
 
     Non-EasyWeek providers are always allowed through: this function bounds
     EasyWeek, it is not a general-purpose job-type filter.
     """
     if provider != PROVIDER_EASYWEEK:
         return True
-    return job_type in EASYWEEK_LIFECYCLE_JOB_TYPES
+    return job_type in EASYWEEK_CUSTOMER_JOB_TYPES
 
 
 def easyweek_job_type_error(provider: str, job_type: str) -> str | None:

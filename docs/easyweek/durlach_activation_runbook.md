@@ -2323,3 +2323,207 @@ docker compose -p altegio_bot exec -T postgres sh -lc 'psql -tAX -U "$POSTGRES_U
 `record_services.id`. Массовый `UPDATE` по эвристике «умножить на 100»
 запрещён: после repair в таблице сосуществуют исправленные и изначально
 корректные строки, и такой запрос испортил бы вторые.
+
+
+---
+
+## 12. PR-8 — reminders, обязательный API guard и preflight
+
+### 12.1 Что добавлено
+
+Два клиентских уведомления: `reminder_24h` и `reminder_2h`. Отличие от
+lifecycle принципиальное — reminder планируется за часы или сутки и срабатывает
+по времени, поэтому всё, что его обосновывало, к моменту отправки может стать
+неправдой без вебхука, который мы видели.
+
+Поэтому перед **каждым** Meta attempt выполняется read-only
+`GET /bookings/{uuid}`, и отправка разрешена только если одновременно доказано:
+booking существует, тот же UUID, тот же филиал, то же время, `is_canceled` и
+`is_completed` — настоящие `false`.
+
+### 12.2 Два флага и почему их два
+
+| Флаг | Что делает | Читает сервис |
+| --- | --- | --- |
+| `EASYWEEK_REMINDERS_ENABLED` | только СОЗДАНИЕ reminder jobs | `altegio-easyweek-inbox-worker` |
+| `EASYWEEK_REMINDER_API_GUARD_ENABLED` | send fence | `altegio-outbox-worker` |
+
+Планирование дополнительно требует `EASYWEEK_NOTIFICATIONS_ENABLED=true`:
+reminder — клиентское уведомление, мастер-флаг вторым флагом не обходится.
+
+При закрытом fence reminder jobs **вообще не claim'ятся**: остаются `queued`,
+не тратят attempts, сохраняют `run_at`. Это и есть состояние, которое читает
+preflight. Altegio jobs и EasyWeek lifecycle jobs не затронуты.
+
+`true` не отключает guard — он разрешает обработку, в которой guard обязателен
+всегда. Режима «отправить reminder без проверки API» не существует.
+
+`docker compose restart` не перечитывает `env_file`. Нужен
+`up -d --force-recreate <сервис>`.
+
+### 12.3 Rollout — порядок обязателен
+
+**1. Deploy с обоими флагами `false`.**
+
+**2. Проверить effective settings внутри обоих контейнеров:**
+
+```bash
+docker compose -p altegio_bot exec -T altegio-easyweek-inbox-worker /app/.venv/bin/python -c 'from altegio_bot.settings import settings; print("reminders=", settings.easyweek_reminders_enabled, "notifications=", settings.easyweek_notifications_enabled)'
+```
+
+```bash
+docker compose -p altegio_bot exec -T altegio-outbox-worker /app/.venv/bin/python -c 'from altegio_bot.settings import settings; print("guard=", settings.easyweek_reminder_api_guard_enabled)'
+```
+
+**3. Проверить API key/workspace/registry read-only probe:**
+
+```bash
+docker compose -p altegio_bot exec -T altegio-outbox-worker /app/.venv/bin/python -m altegio_bot.scripts.easyweek_probe
+```
+
+**4. Проверить, что reminder Meta templates существуют и APPROVED** для каждого
+филиала: `kitilash_du_reminder_24h_v1`, `kitilash_du_reminder_2h_v1`,
+`kitilash_ra_reminder_24h_v1`, `kitilash_ra_reminder_2h_v1`. Отсутствующий или
+неодобренный шаблон блокирует rollout — включать флаги нельзя.
+
+**5. Идемпотентный seed DB-строк шаблонов:**
+
+```bash
+docker compose -p altegio_bot exec -T altegio-outbox-worker /app/.venv/bin/python -m altegio_bot.scripts.seed_easyweek_templates
+```
+
+Ожидается 6 строк на филиал (4 lifecycle + 2 reminder). Повтор — 0 created.
+
+**6. API guard остаётся `false`.**
+
+**7. Включить планирование** — только после шагов 4–5:
+`EASYWEEK_REMINDERS_ENABLED=true` в `easyweek.env`, затем
+
+```bash
+docker compose -p altegio_bot up -d --force-recreate altegio-easyweek-inbox-worker
+```
+
+**8. Создать контролируемую тестовую booking** собственного тестового клиента:
+разрешённая категория, одна услуга, начало достаточно далеко в будущем (больше
+суток), чтобы появились обе reminder job.
+
+**9. Проверить очередь в PostgreSQL:**
+
+```bash
+docker compose -p altegio_bot exec -T postgres sh -lc 'psql -tAX -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT id, company_id, job_type, status, run_at, payload->>'"'"'record_starts_at'"'"' FROM message_jobs WHERE provider = '"'"'easyweek'"'"' AND job_type IN ('"'"'reminder_24h'"'"','"'"'reminder_2h'"'"') ORDER BY run_at"'
+```
+
+Требуется: `provider=easyweek`, правильный `company_id`, оба job_type,
+`status=queued`, `run_at` = старт минус 24ч и минус 2ч, `record_starts_at`
+совпадает с реальным началом, дублей нет.
+
+**10. Read-only preflight:**
+
+```bash
+docker compose -p altegio_bot exec -T altegio-outbox-worker /app/.venv/bin/python -m altegio_bot.scripts.easyweek_reminder_preflight
+```
+
+**11. Требуется:** `candidate_count > 0`, `truncated=false`, `ready=true`,
+`outcomes = {'proven_current': N}` и exit code 0. Любой другой outcome —
+**STOP**, fence не открывать.
+
+**12. Только теперь открыть fence:** `EASYWEEK_REMINDER_API_GUARD_ENABLED=true`,
+затем
+
+```bash
+docker compose -p altegio_bot up -d --force-recreate altegio-outbox-worker
+```
+
+**13. Controlled smoke.** Дождаться реального reminder job:
+
+- guard прошёл;
+- Meta HTTP 200;
+- Outbox `sent` → `delivered`/`read`;
+- правильный branch template и sender;
+- клиент получил сообщение.
+
+**14. Negative smoke без порчи production data.** До срабатывания второго
+reminder перенести либо отменить **свою тестовую** booking. Ожидается: guard
+локально отменяет reminder (`status=canceled`, `last_error` начинается с
+`easyweek_reminder_guard:`), Meta не вызывается, Outbox-строка не создаётся.
+
+### 12.4 Как читать отказ guard
+
+`last_error` содержит короткий стабильный код без данных клиента:
+
+| Outcome | Что означает | Поведение job |
+| --- | --- | --- |
+| `proven_current` | всё доказано | отправка |
+| `retryable_unavailable` | 429/5xx/timeout/сеть | queued, backoff, attempts не тратятся |
+| `configuration_unavailable` | нет API key/slug, 401/403 | queued до reminder deadline; preflight красный |
+| `not_found` | 404 | локальная отмена, Meta не вызывается |
+| `identity_mismatch` | UUID/provider/company/record не совпали | локальная отмена |
+| `location_mismatch` | филиал не тот | локальная отмена |
+| `start_time_mismatch` | время изменилось | локальная отмена |
+| `canceled` / `completed` | booking отменена или завершена | локальная отмена |
+| `malformed_response` | поле отсутствует, не bool, naive timestamp, противоречивый `status.type` | локальная отмена |
+| `permanent_error` | прочий permanent 4xx | локальная отмена |
+
+### 12.4a Deadline: current booking ≠ отправляемый reminder
+
+Reminder подчиняется тому же delivery deadline, что и остальные job, **включая
+первую отправку**:
+
+- `reminder_24h` — `min(starts_at - 3ч, run_at + 6ч)`;
+- `reminder_2h` — `starts_at - 15м`.
+
+Практический смысл при закрытом fence: job может пролежать `queued` дольше
+своего окна. Booking при этом остаётся полностью корректным — тот же UUID,
+филиал, время, не отменён — но момент, когда напоминание имело смысл, прошёл.
+
+Поэтому:
+
+- **preflight красный** для такой job: отдельный outcome `deadline_expired`,
+  `ready=false`, ненулевой exit code. EasyWeek API на неё не тратится —
+  просрочка доказывается локально;
+- **runtime отменяет** job локально: `status=canceled`, короткий стабильный
+  `last_error`, Meta не вызывается, строка Outbox не создаётся.
+
+Если preflight показал `deadline_expired`, fence открывать **нельзя** до
+разбора: это backlog, который нельзя досылать. Отдельного режима «доставить
+просроченное» нет и не планируется.
+
+Altegio jobs и EasyWeek lifecycle jobs это изменение не затрагивает — их
+first-attempt семантика прежняя.
+
+### 12.4b Delivery retry напоминания
+
+Retryable failed callback от Meta создаёт retry обычным механизмом delivery
+retry (тот же chain, тот же `delivery_retry:<root>:<attempt>`, тот же бюджет
+попыток). Для reminder дополнительно:
+
+- retry наследует из **корневой** job два значения: canonical `booking_uuid`
+  и `record_starts_at` — исходный запланированный старт;
+- `record_starts_at` **не** перечитывается из текущего `Record`. Если между
+  отправкой и callback запись перенесли, retry сохранит старое время, и это
+  расхождение будет поймано локально — Meta не вызовется;
+- каждый retry заново проходит read-only API guard. Положительный результат
+  предыдущей попытки не кэшируется и не наследуется;
+- если у корневой job нет доказуемых `booking_uuid`/`record_starts_at`, retry
+  **не создаётся вообще**; в `outbox_messages.meta` пишется
+  `delivery_retry_skip_reason=easyweek_reminder_retry_identity_unproven`.
+
+### 12.5 Rollback
+
+Первым действием — закрыть fence:
+
+`EASYWEEK_REMINDER_API_GUARD_ENABLED=false`, затем
+
+```bash
+docker compose -p altegio_bot up -d --force-recreate altegio-outbox-worker
+```
+
+Reminder jobs остаются `queued` и не отправляются. При необходимости следом
+`EASYWEEK_REMINDERS_ENABLED=false` и force-recreate
+`altegio-easyweek-inbox-worker` — новые reminders перестанут планироваться.
+
+Capture, lifecycle notifications, Chatwoot и Altegio при обоих шагах
+продолжают работать без изменений.
+
+**`booking-succeeded` в PR-8 не включается** — он нужен последующей
+review/visit-counter фазе.

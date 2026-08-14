@@ -29,12 +29,15 @@ from altegio_bot.delivery_retry_identity import (
     DELIVERY_RETRY_MAX_ATTEMPTS,
     RetryIdentity,
     StatusRetryChain,
+    easyweek_reminder_retry_identity,
     resolve_retry_chain_members,
     resolve_retry_identity,
     resolve_retry_reference,
     resolve_status_retry_chain,
 )
+from altegio_bot.easyweek_policy import EASYWEEK_REMINDER_JOB_TYPES
 from altegio_bot.models.models import (
+    PROVIDER_EASYWEEK,
     CampaignRecipient,
     Client,
     MessageJob,
@@ -1760,11 +1763,29 @@ async def _handle_failed_delivery_status(
         payload[_ORIGINAL_RUN_AT_KEY] = anchor_scheduled.isoformat()
         payload["delivery_retry_original_scheduled_at"] = anchor_scheduled.isoformat()
 
-    record_starts_at = getattr(record, "starts_at", None) if record is not None else None
-    if job_type in ("reminder_24h", "reminder_2h") and record_starts_at is not None:
-        if record_starts_at.tzinfo is None:
-            record_starts_at = record_starts_at.replace(tzinfo=timezone.utc)
-        payload["record_starts_at"] = record_starts_at.isoformat()
+    if job_type in EASYWEEK_REMINDER_JOB_TYPES and identity.provider == PROVIDER_EASYWEEK:
+        # Inherited from the ROOT job, never re-derived from today's Record.
+        #
+        # The EasyWeek reminder guard runs again on this retry and compares the
+        # planned start against both the Record and the live API. Reading the
+        # current `Record.starts_at` here would quietly agree with a reschedule
+        # that happened between the first send and this callback — and deliver a
+        # reminder for an appointment the customer no longer has. Carrying the
+        # original instant across is what lets the guard catch that.
+        reminder_identity = easyweek_reminder_retry_identity(original_job)
+        if reminder_identity is None:
+            _record_retry_skip(outbox, "easyweek_reminder_retry_identity_unproven", original_outbox_id)
+            logger.warning(
+                "Delivery retry refused: reason=easyweek_reminder_retry_identity_unproven"
+                " original_outbox_id=%s outbox_id=%s",
+                original_outbox_id,
+                int(outbox.id),
+            )
+            return
+        payload["provider"] = PROVIDER_EASYWEEK
+        payload["booking_uuid"] = reminder_identity.booking_uuid
+        payload["record_starts_at"] = reminder_identity.record_starts_at
+        payload["job_type"] = job_type
 
     max_attempts = int(getattr(original_job, "max_attempts", 5) or 5)
 

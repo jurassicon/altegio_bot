@@ -65,10 +65,12 @@ from ..easyweek_normalizer import (
 )
 from ..easyweek_policy import (
     EASYWEEK_LIFECYCLE_JOB_TYPES,
+    EASYWEEK_REMINDER_JOB_TYPES,
     RECORD_CANCELED,
     RECORD_CREATED,
     RECORD_UPDATED,
 )
+from ..easyweek_reminders import plan_reminders, reminder_job_payload
 from ..easyweek_service_category import (
     evaluate_service_category,
     parse_allowed_service_categories,
@@ -795,6 +797,109 @@ async def plan_lifecycle_job(
     await session.execute(stmt)
 
 
+async def sync_reminder_jobs(
+    session: AsyncSession,
+    *,
+    record: Record,
+    booking: NormalizedBooking,
+    client: Client | None,
+) -> None:
+    """Make the queued reminders match the appointment as it now stands (PR-8).
+
+    Runs inside the caller's transaction, under the Record lock the domain write
+    already holds, so the queue and the appointment commit together. A reminder
+    queue that briefly disagreed with its booking is the entire failure mode
+    this is guarding against.
+
+    **Withdrawal comes first, and is unconditional.** A cancel delivery does not
+    have to carry a service category — and if withdrawal were gated on
+    eligibility, a cancellation whose payload omitted the category would leave a
+    live reminder pointed at an appointment that no longer exists. So stale
+    reminders are cancelled before anything is checked, and only the CREATION of
+    new ones is gated.
+
+    Creation additionally requires both switches. ``easyweek_notifications_enabled``
+    is the master gate for anything a customer receives; ``easyweek_reminders_enabled``
+    is the PR-8 one. Neither implies the other, which is what lets the rollout
+    accumulate real reminder jobs while the send fence is still shut.
+
+    Nothing here sends, and nothing re-opens a reminder that already went out:
+    an existing key is left exactly as it is.
+    """
+    if record.id is None:  # pragma: no cover - defensive
+        return
+
+    now = utcnow()
+    desired = plan_reminders(
+        booking_uuid=booking.booking_uuid,
+        starts_at=record.starts_at,
+        now=now,
+        is_deleted=bool(record.is_deleted),
+    )
+    desired_keys = {item.dedupe_key for item in desired}
+
+    # Anything queued for this booking that the current appointment no longer
+    # owes: a reschedule changed the start instant (and therefore the key), or
+    # the booking was cancelled and owes nothing at all.
+    stale = (
+        update(MessageJob)
+        .where(MessageJob.provider == PROVIDER)
+        .where(MessageJob.record_id == record.id)
+        .where(MessageJob.job_type.in_(EASYWEEK_REMINDER_JOB_TYPES))
+        .where(MessageJob.status == "queued")
+        .values(status="canceled", locked_at=None, last_error="EasyWeek reminder superseded by a newer booking state")
+    )
+    if desired_keys:
+        stale = stale.where(MessageJob.dedupe_key.notin_(desired_keys))
+    await session.execute(stale)
+
+    if not desired:
+        return
+    if not (settings.easyweek_notifications_enabled and settings.easyweek_reminders_enabled):
+        return
+
+    eligibility = evaluate_service_category(
+        record_raw=record.raw,
+        allowed_categories_raw=settings.easyweek_allowed_service_categories,
+    )
+    if not eligibility.allowed:
+        if eligibility.recoverable_configuration:
+            # Same contract as the lifecycle planner: a broken allowlist is not
+            # a decision, so roll back and leave the event captured rather than
+            # publish a processed outcome with a silently empty reminder queue.
+            raise RecoverableCategoryConfigurationError(eligibility.reason)
+        logger.info(
+            "easyweek reminders suppressed record_id=%s company_id=%s reason=%s",
+            record.id,
+            booking.company_id,
+            eligibility.reason,
+        )
+        return
+
+    for item in desired:
+        stmt = pg_insert(MessageJob).values(
+            provider=PROVIDER,
+            company_id=booking.company_id,
+            record_id=record.id,
+            client_id=client.id if client is not None else None,
+            job_type=item.job_type,
+            run_at=item.run_at,
+            status="queued",
+            dedupe_key=item.dedupe_key,
+            payload=reminder_job_payload(
+                booking_uuid=booking.booking_uuid,
+                company_id=booking.company_id,
+                starts_at=record.starts_at,
+                job_type=item.job_type,
+            ),
+        )
+        # An identical business fact — a Resend, an unrelated edit, a second
+        # delivery of the same appointment — owes the same reminder, and a
+        # reminder that has already been sent must never be re-opened.
+        stmt = stmt.on_conflict_do_nothing(index_elements=[MessageJob.dedupe_key])
+        await session.execute(stmt)
+
+
 def is_cancel_terminal(record: Record | None, booking: NormalizedBooking) -> bool:
     """True when this booking is already cancelled and must stay that way.
 
@@ -859,6 +964,11 @@ async def apply_booking(
         payload_hash=payload_hash,
         event_id=event_id,
     )
+    # After the service snapshot, because eligibility is read from the Record we
+    # just wrote, and inside the same transaction under the same lock: a
+    # reminder queue that disagreed with the appointment it belongs to would be
+    # the whole failure mode.
+    await sync_reminder_jobs(session, record=record, booking=booking, client=client)
     return record
 
 
@@ -1234,6 +1344,7 @@ __all__ = [
     "retry_delay_for",
     "schedule_retry",
     "sync_record_service",
+    "sync_reminder_jobs",
     "upsert_client",
     "upsert_record",
 ]

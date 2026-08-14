@@ -39,15 +39,23 @@ from altegio_bot.easyweek_branches import (
     branch_profile_for_slug,
     branch_template_contract_error,
 )
+from altegio_bot.easyweek_client import EasyWeekClient
 from altegio_bot.easyweek_locations import EasyWeekLocation, configured_easyweek_locations
 from altegio_bot.easyweek_normalizer import extract_manage_link
 from altegio_bot.easyweek_policy import (
+    EASYWEEK_CUSTOMER_JOB_TYPES,
     EASYWEEK_LIFECYCLE_JOB_TYPES,
+    EASYWEEK_REMINDER_JOB_TYPES,
     RECORD_CREATED,
     RECORD_CREATED_NEW_CLIENT,
     easyweek_job_type_error,
     normalize_provider,
     validate_static_booking_page,
+)
+from altegio_bot.easyweek_reminder_guard import (
+    GuardResult,
+    classify_client_error,
+    verify_reminder_is_current,
 )
 from altegio_bot.easyweek_service_category import evaluate_service_category
 from altegio_bot.message_planner import (
@@ -417,6 +425,22 @@ async def _lock_next_jobs(
         .limit(batch_size)
         .with_for_update(skip_locked=True)
     )
+
+    # PR-8 send fence. With the guard switched off, an EasyWeek reminder is not
+    # claimed AT ALL — excluded by the query rather than claimed and requeued.
+    #
+    # That distinction is the whole design. A claim-then-requeue loop would spin
+    # the worker on every due reminder, burn a `locked_at` cycle each pass, and
+    # (depending on where the requeue landed) either consume attempts or reset
+    # them. Leaving the rows unclaimed keeps them exactly as planned — `queued`,
+    # zero attempts, original `run_at` — which is precisely the state the
+    # read-only preflight is meant to inspect before anyone opens the fence.
+    #
+    # Altegio jobs and EasyWeek LIFECYCLE jobs are untouched by this predicate.
+    if not settings.easyweek_reminder_api_guard_enabled:
+        stmt = stmt.where(
+            ~((MessageJob.provider == PROVIDER_EASYWEEK) & (MessageJob.job_type.in_(EASYWEEK_REMINDER_JOB_TYPES)))
+        )
     res = await session.execute(stmt)
     jobs = list(res.scalars().all())
 
@@ -867,6 +891,36 @@ async def _is_new_client_for_record(
     return prev_id is None
 
 
+async def _run_easyweek_reminder_guard(job: MessageJob, record: Record | None) -> GuardResult:
+    """Ask EasyWeek whether this reminder is still true, once, read-only.
+
+    The client is built here and closed here: one short-lived GET-only client per
+    attempt, so nothing long-lived holds the API key and a configuration change
+    takes effect on the next attempt rather than on the next restart.
+
+    A missing key or slug raises at construction. That is a
+    CONFIGURATION_UNAVAILABLE, not a reason to send: the booking may be perfectly
+    fine, but we could not ask, and an unverified reminder is exactly what this
+    guard exists to prevent.
+    """
+    location, _profile, _err = _easyweek_owned_branch(job.company_id)
+
+    try:
+        client = EasyWeekClient()
+    except Exception as exc:  # noqa: BLE001 — mapped by class, text never kept
+        return classify_client_error(exc)
+
+    try:
+        return await verify_reminder_is_current(
+            job=job,
+            record=record,
+            location=location,
+            client=client,
+        )
+    finally:
+        await client.aclose()
+
+
 def _easyweek_domain_scope_error(
     job: MessageJob,
     record: Record | None,
@@ -1136,7 +1190,7 @@ async def _render_message(
         svc_res = await session.execute(svc_stmt)
         services = list(svc_res.scalars().all())
 
-        if is_easyweek and template_code in EASYWEEK_LIFECYCLE_JOB_TYPES:
+        if is_easyweek and template_code in EASYWEEK_CUSTOMER_JOB_TYPES:
             # BEFORE the loop below, which is what would flatten an unknown
             # title into "None" and an unknown price into "0.00".
             snapshot_err = _easyweek_service_snapshot_error(record, services)
@@ -1379,12 +1433,46 @@ def _defer_easyweek_configuration(
     return _schedule_retry_or_cancel(job, record, delay, reason)
 
 
+def easyweek_reminder_deadline_passed(job: MessageJob, record: Record | None) -> bool:
+    """Is this EasyWeek reminder too late to send? THE single criterion.
+
+    One function, two callers: the outbox worker below, and the read-only
+    preflight. A preflight that judged timeliness by its own rule would bless a
+    backlog the worker then refuses, or — far worse — the other way round.
+
+    The rule itself is not restated here: it is whatever ``_retry_deadline_at``
+    already says for ``reminder_24h`` (``min(starts_at - 3h, anchor + 6h)``) and
+    ``reminder_2h`` (``starts_at - 15m``). ``_original_run_at`` falls back to
+    ``job.run_at``, so an initial job that never went through a retry still has
+    a usable anchor.
+
+    Non-reminders and non-EasyWeek jobs are never judged here — this is not a
+    general timeliness helper, and Altegio's semantics are untouched.
+    """
+    if normalize_provider(getattr(job, "provider", None), default="") != PROVIDER_EASYWEEK:
+        return False
+    if getattr(job, "job_type", None) not in EASYWEEK_REMINDER_JOB_TYPES:
+        return False
+    deadline = _retry_deadline_at(job, record)
+    if deadline is None or deadline == _DEADLINE_ALREADY_PASSED:
+        return False
+    return utcnow() > deadline
+
+
 def _deadline_passed_for_send(job: MessageJob, record: Record | None) -> bool:
     if job.job_type not in DELIVERY_DEADLINE_JOB_TYPES:
         return False
     payload = getattr(job, "payload", None) or {}
     if _ORIGINAL_RUN_AT_KEY not in payload:
-        return False
+        # PR-8: an EasyWeek reminder is judged even on its FIRST attempt.
+        #
+        # `_original_run_at` is written by the retry/deferral path, so an initial
+        # job never carries it — and this early return therefore exempted exactly
+        # the case the send fence creates: a reminder that sat `queued` while the
+        # fence was shut, went past its deadline, and would be sent the moment
+        # the fence opened. Altegio jobs and EasyWeek lifecycle jobs keep the
+        # first-attempt exemption they have always had.
+        return easyweek_reminder_deadline_passed(job, record)
     deadline = _retry_deadline_at(job, record)
     if deadline is None or deadline == _DEADLINE_ALREADY_PASSED:
         return False
@@ -2405,7 +2493,7 @@ async def _run_job_logic(
         job_type=job.job_type,
         company_id=job.company_id,
     ):
-        if job_provider == PROVIDER_EASYWEEK and job.job_type in EASYWEEK_LIFECYCLE_JOB_TYPES:
+        if job_provider == PROVIDER_EASYWEEK and job.job_type in EASYWEEK_CUSTOMER_JOB_TYPES:
             record = await _load_easyweek_record_for_update(session, job)
         else:
             record = await _load_record(session, job)
@@ -2452,7 +2540,7 @@ async def _run_job_logic(
     # call — treats `record` and `client` as belonging to this job. For EasyWeek
     # that has to be PROVEN, not assumed, and proven here: this is the last
     # point at which no customer-facing value has been built yet.
-    if job_provider == PROVIDER_EASYWEEK and job.job_type in EASYWEEK_LIFECYCLE_JOB_TYPES:
+    if job_provider == PROVIDER_EASYWEEK and job.job_type in EASYWEEK_CUSTOMER_JOB_TYPES:
         scope_err = _easyweek_domain_scope_error(job, record, client, provider=job_provider)
         if scope_err is not None:
             job.status = "failed"
@@ -2501,6 +2589,46 @@ async def _run_job_logic(
                 eligibility.reason,
             )
             return None
+
+        # PR-8: the mandatory read-only API guard, and this is the only place it
+        # may sit.
+        #
+        # AFTER the local proofs above, so a job that is already wrong locally is
+        # reported as that and costs no API call. BEFORE the phone, the template,
+        # the rendered body, `attempts += 1`, Meta and the Chatwoot mirror — this
+        # is the last point at which no customer-facing value has been built and
+        # no attempt has been spent.
+        #
+        # It runs on the first send AND on every delivery retry, because the
+        # thing it proves — that the appointment still exists, in this branch, at
+        # this hour, uncancelled — can stop being true between two attempts. A
+        # positive result is never carried over.
+        if job.job_type in EASYWEEK_REMINDER_JOB_TYPES:
+            guard = await _run_easyweek_reminder_guard(job, record)
+            if not guard.proven:
+                if guard.recoverable:
+                    requeued = _defer_easyweek_configuration(job, record, guard.reason)
+                    logger.info(
+                        "EasyWeek reminder guard unavailable job_id=%s company_id=%s record_id=%s "
+                        "outcome=%s outcome=%s",
+                        job.id,
+                        job.company_id,
+                        record.id,
+                        guard.outcome.value,
+                        "queued" if requeued else "deadline_canceled",
+                    )
+                    return None
+                job.status = "canceled"
+                job.locked_at = None
+                job.last_error = guard.reason
+                logger.info(
+                    "EasyWeek reminder refused before send job_id=%s company_id=%s record_id=%s outcome=%s",
+                    job.id,
+                    job.company_id,
+                    record.id,
+                    guard.outcome.value,
+                )
+                return None
 
     # Follow-up final eligibility guard (DB phase): re-check current recipient/client state
     # before the actual send.  Catches changes that happened during the 14-day delay between

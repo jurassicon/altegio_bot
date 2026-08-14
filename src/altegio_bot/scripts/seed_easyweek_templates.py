@@ -35,13 +35,25 @@ from altegio_bot.easyweek_policy import (
     RECORD_CREATED,
     RECORD_CREATED_NEW_CLIENT,
     RECORD_UPDATED,
+    REMINDER_2H,
+    REMINDER_24H,
     validate_static_booking_page,
 )
 from altegio_bot.models.models import PROVIDER_EASYWEEK, MessageTemplate, WhatsAppSender
 from altegio_bot.settings import settings
 
 LANGUAGE = "de"
-TEMPLATE_CODES = (RECORD_CREATED, RECORD_CREATED_NEW_CLIENT, RECORD_UPDATED, RECORD_CANCELED)
+# PR-8 adds the two reminder codes here rather than in a second seeding path:
+# a reminder row must be bound to its branch by exactly the contract the
+# lifecycle rows already use — one branch's Meta name, body and footer.
+TEMPLATE_CODES = (
+    RECORD_CREATED,
+    RECORD_CREATED_NEW_CLIENT,
+    RECORD_UPDATED,
+    RECORD_CANCELED,
+    REMINDER_24H,
+    REMINDER_2H,
+)
 
 
 class SeedConfigError(RuntimeError):

@@ -51,6 +51,7 @@ from altegio_bot.tests.easyweek_fixtures import (
     drop_booking_price,
     set_booking_price,
 )
+from altegio_bot.utils import utcnow
 from altegio_bot.workers import easyweek_inbox_worker as worker
 
 pytestmark = pytest.mark.asyncio
@@ -384,6 +385,323 @@ async def test_notifications_enabled_creates_only_lifecycle_types(bound_session_
         assert job_types == ["record_canceled", "record_created", "record_updated"]
         providers = set((await session.execute(select(MessageJob.provider))).scalars().all())
         assert providers == {"easyweek"}
+
+
+# ===========================================================================
+# PR-8 reminder planning
+# ===========================================================================
+#
+# Reminders are planned inside the same transaction as the domain write, under
+# the same Record lock, which is what keeps the queue and the appointment from
+# ever disagreeing. These tests drive the real worker and then read the queue.
+#
+# Both switches are required to CREATE a reminder. Withdrawal is unconditional:
+# a cancel delivery need not carry a service category, and a queue that survived
+# a cancellation because its payload was thin would point a customer at an
+# appointment that no longer exists.
+
+
+def _at(payload: dict, start: datetime) -> dict:
+    """Move a fixture booking to an absolute start instant."""
+    end = start + timedelta(hours=1)
+    payload["booking_date_start"] = start.strftime("%Y-%m-%dT%H:%M:%S+0000")
+    payload["booking_date_end"] = end.strftime("%Y-%m-%dT%H:%M:%S+0000")
+    return payload
+
+
+def _future(**delta) -> datetime:
+    """A future instant the payload format can express exactly.
+
+    The webhook carries whole seconds, so a microsecond-precision `utcnow()`
+    would not survive the round trip and the comparison would be against a value
+    the pipeline never saw.
+    """
+    return (utcnow() + timedelta(**delta)).replace(microsecond=0)
+
+
+def _in(payload: dict, **delta) -> dict:
+    return _at(payload, _future(**delta))
+
+
+@pytest.fixture
+def _reminders_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "easyweek_notifications_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_reminders_enabled", True, raising=False)
+
+
+async def _reminder_rows(session_maker) -> list[tuple]:
+    async with session_maker() as session:
+        rows = (
+            await session.execute(
+                select(MessageJob.job_type, MessageJob.status, MessageJob.run_at, MessageJob.dedupe_key)
+                .where(MessageJob.job_type.in_(("reminder_24h", "reminder_2h")))
+                .order_by(MessageJob.run_at.asc(), MessageJob.job_type.asc())
+            )
+        ).all()
+    return [tuple(row) for row in rows]
+
+
+async def test_a_booking_days_away_gets_both_reminders(bound_session_local, _reminders_on) -> None:
+    start = _future(days=3)
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, _at(booking_created(), start), payload_hash="h1")
+    await _run_until_idle()
+
+    rows = await _reminder_rows(bound_session_local)
+    assert [(r[0], r[1]) for r in rows] == [("reminder_24h", "queued"), ("reminder_2h", "queued")]
+    assert rows[0][2] == start - timedelta(hours=24)
+    assert rows[1][2] == start - timedelta(hours=2)
+
+    async with bound_session_local() as session:
+        providers = set((await session.execute(select(MessageJob.provider))).scalars().all())
+    assert providers == {"easyweek"}, "a reminder must never be planned as an Altegio job"
+
+
+async def test_a_booking_inside_the_day_gets_only_the_two_hour_reminder(bound_session_local, _reminders_on) -> None:
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, _in(booking_created(), hours=6), payload_hash="h1")
+    await _run_until_idle()
+
+    assert [row[0] for row in await _reminder_rows(bound_session_local)] == ["reminder_2h"]
+
+
+async def test_a_booking_within_two_hours_gets_no_reminder(bound_session_local, _reminders_on) -> None:
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, _in(booking_created(), minutes=90), payload_hash="h1")
+    await _run_until_idle()
+
+    assert await _reminder_rows(bound_session_local) == []
+
+
+async def test_the_lifecycle_job_is_still_planned_alongside_the_reminders(bound_session_local, _reminders_on) -> None:
+    """PR-8 adds a queue; it does not replace the lifecycle notification."""
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, _in(booking_created(), days=3), payload_hash="h1")
+    await _run_until_idle()
+
+    async with bound_session_local() as session:
+        job_types = sorted((await session.execute(select(MessageJob.job_type))).scalars().all())
+    assert job_types == ["record_created", "reminder_24h", "reminder_2h"]
+
+
+# --- cancellation and rescheduling -----------------------------------------
+
+
+async def test_a_cancellation_withdraws_every_queued_reminder(bound_session_local, _reminders_on) -> None:
+    start = _future(days=3)
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, _at(booking_created(), start), payload_hash="h1")
+    await _run_until_idle()
+    assert len(await _reminder_rows(bound_session_local)) == 2
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, _at(booking_canceled(), start), event_hint="booking-canceled", payload_hash="h2")
+    await _run_until_idle()
+
+    rows = await _reminder_rows(bound_session_local)
+    assert {row[1] for row in rows} == {"canceled"}, "a cancelled booking owes no reminder"
+
+
+async def test_a_cancellation_without_a_category_still_withdraws_reminders(bound_session_local, _reminders_on) -> None:
+    """Withdrawal must not be gated on eligibility the cancel payload lacks."""
+    start = _future(days=3)
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, _at(booking_created(), start), payload_hash="h1")
+    await _run_until_idle()
+
+    thin_cancel = _at(booking_canceled(), start)
+    thin_cancel.pop("service_category", None)
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, thin_cancel, event_hint="booking-canceled", payload_hash="h2")
+    await _run_until_idle()
+
+    assert {row[1] for row in await _reminder_rows(bound_session_local)} == {"canceled"}
+
+
+async def test_a_reschedule_withdraws_the_stale_reminders_and_plans_new_ones(
+    bound_session_local, _reminders_on
+) -> None:
+    start = _future(days=3)
+    moved = start + timedelta(days=1)
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, _at(booking_created(), start), payload_hash="h1")
+    await _run_until_idle()
+    original_keys = {row[3] for row in await _reminder_rows(bound_session_local)}
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(
+                session, _at(booking_rescheduled(), moved), event_hint="booking-rescheduled", payload_hash="h2"
+            )
+    await _run_until_idle()
+
+    rows = await _reminder_rows(bound_session_local)
+    queued = [row for row in rows if row[1] == "queued"]
+    canceled = [row for row in rows if row[1] == "canceled"]
+
+    assert {row[3] for row in canceled} == original_keys, "the reminders for the old hour must be withdrawn"
+    assert [row[0] for row in queued] == ["reminder_24h", "reminder_2h"]
+    assert queued[0][2] == moved - timedelta(hours=24)
+    assert not original_keys & {row[3] for row in queued}
+
+
+async def test_an_edit_that_keeps_the_time_neither_duplicates_nor_withdraws(bound_session_local, _reminders_on) -> None:
+    start = _future(days=3)
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, _at(booking_created(), start), payload_hash="h1")
+    await _run_until_idle()
+    before = await _reminder_rows(bound_session_local)
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, _at(booking_updated(), start), event_hint="booking-updated", payload_hash="h2")
+    await _run_until_idle()
+
+    assert await _reminder_rows(bound_session_local) == before
+
+
+async def test_a_resend_does_not_produce_a_second_reminder(bound_session_local, _reminders_on) -> None:
+    start = _future(days=3)
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, _at(booking_created(), start), payload_hash="h1")
+    await _run_until_idle()
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, _at(booking_created_resend(), start), payload_hash="h2")
+    await _run_until_idle()
+
+    assert len(await _reminder_rows(bound_session_local)) == 2
+
+
+async def test_a_reminder_that_already_went_out_is_never_reopened(bound_session_local, _reminders_on) -> None:
+    """The same business fact must not resurrect a message already delivered."""
+    start = _future(days=3)
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, _at(booking_created(), start), payload_hash="h1")
+    await _run_until_idle()
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            await session.execute(update(MessageJob).where(MessageJob.job_type == "reminder_24h").values(status="done"))
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, _at(booking_updated(), start), event_hint="booking-updated", payload_hash="h2")
+    await _run_until_idle()
+
+    rows = await _reminder_rows(bound_session_local)
+    done = [row for row in rows if row[0] == "reminder_24h"]
+    assert [row[1] for row in done] == ["done"], "a delivered reminder must stay delivered"
+
+
+# --- eligibility and the switches -------------------------------------------
+
+
+async def test_reminders_are_not_planned_while_the_switch_is_off(bound_session_local, monkeypatch) -> None:
+    monkeypatch.setattr(settings, "easyweek_notifications_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_reminders_enabled", False, raising=False)
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, _in(booking_created(), days=3), payload_hash="h1")
+    await _run_until_idle()
+
+    assert await _reminder_rows(bound_session_local) == []
+    async with bound_session_local() as session:
+        job_types = sorted((await session.execute(select(MessageJob.job_type))).scalars().all())
+    assert job_types == ["record_created"], "the lifecycle notification is unaffected"
+
+
+async def test_the_master_notification_switch_cannot_be_bypassed(bound_session_local, monkeypatch) -> None:
+    monkeypatch.setattr(settings, "easyweek_notifications_enabled", False, raising=False)
+    monkeypatch.setattr(settings, "easyweek_reminders_enabled", True, raising=False)
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, _in(booking_created(), days=3), payload_hash="h1")
+    await _run_until_idle()
+
+    assert await _reminder_rows(bound_session_local) == []
+
+
+async def test_a_disallowed_category_plans_no_reminder(bound_session_local, _reminders_on, monkeypatch) -> None:
+    monkeypatch.setattr(settings, "easyweek_allowed_service_categories", json.dumps(["Something Else"]), raising=False)
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, _in(booking_created(), days=3), payload_hash="h1")
+    await _run_until_idle()
+
+    assert await _reminder_rows(bound_session_local) == []
+
+
+async def test_a_multi_service_booking_plans_no_reminder(bound_session_local, _reminders_on) -> None:
+    """Same eligibility contract as PR-7.1; reminders do not relax it."""
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, _in(booking_created_multi_service(), days=3), payload_hash="h1")
+    await _run_until_idle()
+
+    assert await _reminder_rows(bound_session_local) == []
+
+
+async def test_a_broken_allowlist_leaves_the_queue_recoverable(bound_session_local, _reminders_on, monkeypatch) -> None:
+    """Configuration unavailable is not a decision — nothing is planned, and
+    nothing already correct is destroyed."""
+    start = _future(days=3)
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, _at(booking_created(), start), payload_hash="h1")
+    await _run_until_idle()
+    before = await _reminder_rows(bound_session_local)
+    assert len(before) == 2
+
+    monkeypatch.setattr(settings, "easyweek_allowed_service_categories", "{invalid", raising=False)
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, _at(booking_updated(), start), event_hint="booking-updated", payload_hash="h2")
+    await _run_until_idle()
+
+    assert await _reminder_rows(bound_session_local) == before
+
+
+async def test_the_reminder_payload_stays_minimal_and_carries_the_planned_start(
+    bound_session_local, _reminders_on
+) -> None:
+    start = _future(days=3)
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, _at(booking_created(), start), payload_hash="h1")
+    await _run_until_idle()
+
+    async with bound_session_local() as session:
+        payloads = (
+            (await session.execute(select(MessageJob.payload).where(MessageJob.job_type == "reminder_24h")))
+            .scalars()
+            .all()
+        )
+
+    assert len(payloads) == 1
+    payload = payloads[0]
+    assert set(payload) == {"provider", "booking_uuid", "company_id", "job_type", "record_starts_at"}
+    assert datetime.fromisoformat(payload["record_starts_at"]) == start
+    text = str(payload)
+    for leak in ("Fixture Specialist", "Fixture Service", "+49", "@example"):
+        assert leak not in text
 
 
 # ===========================================================================
