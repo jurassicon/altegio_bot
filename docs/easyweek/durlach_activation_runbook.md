@@ -2623,11 +2623,33 @@ docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-i
 Требуется `status=queued`, `attempts=0`, `run_at` = начало записи плюс трое
 суток, и ноль строк в `outbox_messages` для этой job.
 
-**8. Read-only preflight** при всё ещё закрытом fence:
+**8. Read-only preflight** при всё ещё закрытом fence — в **свежем one-off
+container**, а не внутри работающего outbox worker:
 
 ```bash
-docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml exec -T altegio-outbox-worker /app/.venv/bin/python -m altegio_bot.scripts.easyweek_review_preflight
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml run --rm --no-deps --entrypoint /app/.venv/bin/python altegio-outbox-worker -m altegio_bot.scripts.easyweek_review_preflight
 ```
+
+`docker compose exec -T altegio-outbox-worker ... easyweek_review_preflight`
+здесь **запрещён**. Тот контейнер создан на шаге 1, когда
+`EASYWEEK_REVIEWS_ENABLED` был `false`, и держит именно то окружение: шаг 5
+менял `easyweek.env` и пересоздавал только inbox worker. Preflight внутри него
+увидел бы `easyweek_reviews_enabled=False`, вернул бы `config_error`
+`review_planning_disabled`, `ready=false` и exit code 1 — не потому, что
+rollout плох, а потому, что процесс читает устаревшее окружение. Не обходите
+это через `exec -e` и не «чините» пересозданием outbox worker: он обязан
+оставаться за закрытым fence до шага 10.
+
+`run --rm --no-deps` стартует новый процесс из того же уже задеплоенного
+образа и того же сервиса `altegio-outbox-worker`, поэтому он читает актуальный
+`easyweek.env` и видит `notifications=true`, `reviews=true`,
+`review_send=false` — ровно то состояние, о котором preflight делает
+утверждение. `--no-deps` не трогает production-зависимости, `--rm` не
+оставляет контейнер, exit code доходит до оператора. Preflight остаётся
+read-only: ни одного вызова Meta, Chatwoot или EasyWeek API.
+
+Тот же `-p altegio_bot` и те же два `-f` файла, что у production deployment —
+иначе one-off контейнер попадёт в другой project и другую сеть.
 
 **9. Открывать fence только при `ready=true` и exit code 0.** Пустая очередь,
 `truncated=true`, любой blocked кандидат или `config_error` — это STOP.
@@ -2638,6 +2660,12 @@ docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-i
 ```bash
 docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml up -d --force-recreate altegio-outbox-worker
 ```
+
+Это первое пересоздание outbox worker с шага 1: до зелёного preflight он
+намеренно продолжал работать со старым окружением и закрытым fence. Здесь он
+подхватывает оба флага сразу — `reviews=true` (для runtime отправки не
+используется) и `review_send=true`. Раньше шага 10 пересоздавать его нельзя:
+это открыло бы отправку до аудита очереди.
 
 **11. Controlled production validation.** Дождаться естественного `run_at` —
 не менять его SQL-командой, не редактировать payload и не подделывать событие.
@@ -2665,7 +2693,10 @@ template и sender → `outbox_messages` `sent` → Meta `delivered`/`read`. С�
 9. Не выполнять массовых `UPDATE` по production-строкам и не переигрывать
    delivery callbacks вручную.
 10. Оставшаяся очередь проверяется только read-only запросом из шага 7 rollout
-    и повторным preflight перед следующим включением.
+    и повторным preflight перед следующим включением — снова через one-off
+    `run --rm --no-deps` из шага 8, а не через `exec` в long-running worker:
+    после любого изменения `easyweek.env` работающий контейнер держит
+    окружение, с которым был создан.
 
 Что продолжает работать после rollback: capture всех пяти триггеров, lifecycle
 notifications, PR-8 reminders и весь Altegio path — они управляются своими

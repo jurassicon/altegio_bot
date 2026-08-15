@@ -30,6 +30,8 @@ PLANNING_FLAG = "EASYWEEK_REVIEWS_ENABLED"
 SEND_FLAG = "EASYWEEK_REVIEW_SEND_ENABLED"
 INBOX_SERVICE = "altegio-easyweek-inbox-worker"
 OUTBOX_SERVICE = "altegio-outbox-worker"
+PREFLIGHT_MODULE = "altegio_bot.scripts.easyweek_review_preflight"
+PYTHON_ENTRYPOINT = "/app/.venv/bin/python"
 
 
 def prose(text: str) -> str:
@@ -46,6 +48,50 @@ def position(text: str, needle: str) -> int:
     """Index of `needle`, with a readable failure when the step is missing."""
     assert needle in text, f"the document no longer contains: {needle}"
     return text.index(needle)
+
+
+def bash_blocks(text: str) -> list[str]:
+    """Contents of every ```bash fence — the lines an operator actually runs.
+
+    Prose that merely mentions a command must not be mistaken for an
+    instruction, so only fenced blocks count.
+    """
+    return [block.strip() for block in re.findall(r"```bash\n(.*?)```", text, flags=re.S)]
+
+
+def preflight_commands(text: str) -> list[str]:
+    return [block for block in bash_blocks(text) if PREFLIGHT_MODULE in block]
+
+
+def preflight_violations(command: str) -> list[str]:
+    """Everything wrong with a proposed preflight command, in plain words.
+
+    Shared by the positive contract and the negative regressions, so the two can
+    never drift apart: whatever this accepts is exactly what the runbook may say.
+    """
+    words = command.split()
+    problems: list[str] = []
+
+    if "exec" in words:
+        problems.append("uses `exec`, reusing a container created with the pre-rollout environment")
+    if "restart" in words:
+        problems.append("uses `restart`, which does not re-read env_file")
+    if "run" not in words:
+        problems.append("does not use `docker compose run`, so it never re-reads easyweek.env")
+    if "--rm" not in words:
+        problems.append("omits `--rm` and leaves a one-off container behind")
+    if "--no-deps" not in words:
+        problems.append("omits `--no-deps` and may restart production dependencies")
+    if "-e" in words or any(word.startswith("--env") for word in words):
+        problems.append("hand-forces environment values instead of reading easyweek.env")
+    if OUTBOX_SERVICE not in words:
+        problems.append(f"does not run as the {OUTBOX_SERVICE} service")
+    if "--entrypoint" not in words or PYTHON_ENTRYPOINT not in words:
+        problems.append(f"does not override the entrypoint to {PYTHON_ENTRYPOINT}")
+    if "-m" not in words or PREFLIGHT_MODULE not in words:
+        problems.append(f"does not run `-m {PREFLIGHT_MODULE}`")
+
+    return problems
 
 
 @pytest.fixture(scope="module")
@@ -83,10 +129,11 @@ def test_each_flag_is_declared_exactly_once_and_false(env_example: str, flag: st
     assert assignments == ["false"], f"{flag} must be declared once, as false"
 
 
-def test_the_example_documents_which_service_reads_which_flag(env_example: str) -> None:
+def test_the_example_documents_which_worker_reads_which_flag_at_runtime(env_example: str) -> None:
     """Recreating the wrong container is the classic way to flip nothing.
 
-    Each flag's own paragraph — not the file header — must name its worker.
+    Each flag's own paragraph — not the file header — must name its worker, and
+    must scope the claim to RUNTIME: one-off processes read more than one flag.
     """
     section = env_example[env_example.index("--- PR-9") :]
     planning_para = prose(section[: section.index(f"{PLANNING_FLAG}=false")])
@@ -94,6 +141,34 @@ def test_the_example_documents_which_service_reads_which_flag(env_example: str) 
 
     assert INBOX_SERVICE in planning_para and OUTBOX_SERVICE not in planning_para
     assert OUTBOX_SERVICE in send_para and INBOX_SERVICE not in send_para
+    for para in (planning_para, send_para):
+        assert "runtime" in para.lower() or "long-running" in para.lower(), (
+            "ownership is a runtime claim; say so, or the preflight looks like a contradiction"
+        )
+
+
+def test_the_example_says_the_one_off_preflight_reads_all_three_flags(env_example: str) -> None:
+    """Runtime ownership is split; the audit process is not.
+
+    The preflight's whole statement is "notifications on, planning on, fence
+    still shut", so it must see all three. A document claiming the outbox side
+    never reads EASYWEEK_REVIEWS_ENABLED would make the P1 blocker invisible.
+    """
+    section = prose(env_example[env_example.index("--- PR-9") :])
+
+    assert "Один процесс читает ОБА флага сразу: one-off review preflight" in section
+    assert f"создаётся из сервиса {OUTBOX_SERVICE}" in section
+    for flag in ("EASYWEEK_NOTIFICATIONS_ENABLED", PLANNING_FLAG, SEND_FLAG):
+        assert flag in section, flag
+    # The wrong model is named and refuted, not merely left unstated.
+    assert f"«{PLANNING_FLAG} вообще не читается ничем на базе outbox service» — неверно" in section
+
+
+def test_the_example_warns_that_exec_would_read_a_stale_environment(env_example: str) -> None:
+    section = prose(env_example[env_example.index("--- PR-9") :])
+    assert "нельзя запускать через `docker compose exec`" in section
+    assert "config_error `review_planning_disabled`" in section
+    assert "свежий one-off контейнер" in section
 
 
 def test_the_example_says_restart_is_not_enough(env_example: str) -> None:
@@ -220,6 +295,134 @@ def test_each_flag_change_is_followed_by_force_recreate_of_its_own_service(pr9_s
     assert f"up -d --force-recreate {INBOX_SERVICE}" in pr9_section
     assert f"up -d --force-recreate {OUTBOX_SERVICE}" in pr9_section
     assert "restart` не перечитывает" in pr9_section
+
+
+# ---------------------------------------------------------------------------
+# The preflight must run in a process that re-read easyweek.env
+# ---------------------------------------------------------------------------
+#
+# The rollout enables planning and force-recreates ONLY the inbox worker, so the
+# long-running outbox container still holds the environment it was created with,
+# where EASYWEEK_REVIEWS_ENABLED was false. A preflight `exec`d into it reports
+# config_error=review_planning_disabled and exits 1 — the documented rollout
+# could never reach a green preflight, and so could never open the fence.
+
+
+def test_exactly_one_command_runs_the_preflight(pr9_section: str) -> None:
+    """Two competing commands would let an operator pick the broken one."""
+    assert len(preflight_commands(pr9_section)) == 1
+
+
+def test_the_preflight_command_runs_in_a_fresh_one_off_container(pr9_section: str) -> None:
+    command = preflight_commands(pr9_section)[0]
+    assert preflight_violations(command) == [], command
+
+
+def test_the_preflight_command_matches_the_production_compose_invocation(pr9_section: str) -> None:
+    """A different project or file set is a different network and a different env."""
+    command = preflight_commands(pr9_section)[0]
+    assert "-p altegio_bot" in command
+    assert "-f docker-compose.yml" in command
+    assert "-f docker-compose.chatwoot-internal.yml" in command
+
+
+def test_the_old_exec_form_is_rejected_by_the_same_contract() -> None:
+    """Negative regression: restoring the pre-fix command must fail the check.
+
+    This is the command the reviewed commit shipped. If a future edit puts it
+    back, `test_the_preflight_command_runs_in_a_fresh_one_off_container` has to
+    fail — which it only does if the checker actually rejects this string.
+    """
+    old = (
+        "docker compose -p altegio_bot -f docker-compose.yml "
+        "-f docker-compose.chatwoot-internal.yml exec -T altegio-outbox-worker "
+        "/app/.venv/bin/python -m altegio_bot.scripts.easyweek_review_preflight"
+    )
+    violations = preflight_violations(old)
+
+    assert any("exec" in problem for problem in violations), violations
+    assert any("run" in problem for problem in violations), violations
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        pytest.param(
+            "docker compose -p altegio_bot -f docker-compose.yml "
+            "-f docker-compose.chatwoot-internal.yml restart altegio-outbox-worker",
+            id="restart-does-not-reread-env_file",
+        ),
+        pytest.param(
+            "docker compose -p altegio_bot -f docker-compose.yml "
+            "-f docker-compose.chatwoot-internal.yml run --rm --no-deps "
+            "--entrypoint /app/.venv/bin/python altegio-easyweek-inbox-worker "
+            "-m altegio_bot.scripts.easyweek_review_preflight",
+            id="wrong-service",
+        ),
+        pytest.param(
+            "docker compose -p altegio_bot -f docker-compose.yml "
+            "-f docker-compose.chatwoot-internal.yml run --rm --no-deps "
+            "-e EASYWEEK_REVIEWS_ENABLED=true --entrypoint /app/.venv/bin/python "
+            "altegio-outbox-worker -m altegio_bot.scripts.easyweek_review_preflight",
+            id="hand-forced-flag",
+        ),
+        pytest.param(
+            "docker compose -p altegio_bot -f docker-compose.yml "
+            "-f docker-compose.chatwoot-internal.yml run --entrypoint "
+            "/app/.venv/bin/python altegio-outbox-worker "
+            "-m altegio_bot.scripts.easyweek_review_preflight",
+            id="leaks-a-container-and-restarts-dependencies",
+        ),
+    ],
+)
+def test_the_checker_rejects_the_near_misses(command: str) -> None:
+    """Each of these would look plausible in a review and still be wrong."""
+    assert preflight_violations(command) != []
+
+
+def test_the_runbook_explains_why_exec_is_forbidden_here(pr9_section: str) -> None:
+    """The reason has to survive: otherwise the next editor 'simplifies' it back."""
+    text = prose(pr9_section)
+    assert "создан на шаге 1" in text
+    assert "review_planning_disabled" in text
+    assert "не обходите это через `exec -e`" in text.lower()
+
+
+def test_the_outbox_worker_is_not_recreated_before_the_preflight(pr9_section: str) -> None:
+    """Recreating it early would open the fence before the queue was audited.
+
+    Checked per command, not by substring: `--force-recreate inbox outbox` and a
+    bare `--force-recreate` (which recreates everything) both recreate the outbox
+    worker while reading like they only touch the inbox one.
+    """
+    window = pr9_section[position(pr9_section, f"{PLANNING_FLAG}=true") : position(pr9_section, PREFLIGHT_MODULE)]
+    assert f"{SEND_FLAG}=true" not in window
+
+    for block in bash_blocks(window):
+        if "--force-recreate" not in block:
+            continue
+        services = block.split("--force-recreate", 1)[1].split()
+        assert services == [INBOX_SERVICE], (
+            f"before the preflight, only {INBOX_SERVICE} may be recreated; got {services or 'every service'}"
+        )
+
+
+def test_the_full_rollout_sequence_is_in_the_only_workable_order(pr9_section: str) -> None:
+    steps = [
+        f"{PLANNING_FLAG}=true",
+        f"up -d --force-recreate {INBOX_SERVICE}",
+        PREFLIGHT_MODULE,
+        f"{SEND_FLAG}=true",
+        f"up -d --force-recreate {OUTBOX_SERVICE}",
+    ]
+    positions = [position(pr9_section, step) for step in steps]
+    assert positions == sorted(positions), f"rollout steps out of order: {steps}"
+
+
+def test_the_runbook_says_step_ten_is_the_first_outbox_recreate(pr9_section: str) -> None:
+    text = prose(pr9_section)
+    assert "первое пересоздание outbox worker с шага 1" in text
+    assert "Раньше шага 10 пересоздавать его нельзя" in text
 
 
 def test_a_byte_identical_resend_is_rejected_as_positive_proof(pr9_section: str) -> None:
