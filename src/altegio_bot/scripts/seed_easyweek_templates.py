@@ -37,6 +37,7 @@ from altegio_bot.easyweek_policy import (
     RECORD_UPDATED,
     REMINDER_2H,
     REMINDER_24H,
+    REVIEW_3D,
     validate_static_booking_page,
 )
 from altegio_bot.models.models import PROVIDER_EASYWEEK, MessageTemplate, WhatsAppSender
@@ -53,6 +54,7 @@ TEMPLATE_CODES = (
     RECORD_CANCELED,
     REMINDER_24H,
     REMINDER_2H,
+    REVIEW_3D,
 )
 
 

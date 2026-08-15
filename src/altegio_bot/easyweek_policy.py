@@ -30,6 +30,8 @@ RECORD_CANCELED = "record_canceled"
 REMINDER_24H = "reminder_24h"
 REMINDER_2H = "reminder_2h"
 
+REVIEW_3D = "review_3d"
+
 # A TEMPLATE CODE, deliberately not a job type.
 #
 # A first-time customer gets a different approved Meta template, which means a
@@ -71,12 +73,37 @@ EASYWEEK_REMINDER_JOB_TYPES: frozenset[str] = frozenset(
 # this union so a new EasyWeek notification kind has exactly one place to be
 # registered.
 #
-# review_3d, repeat_10d, comeback_3d, newsletters, follow-up, promo and
-# campaigns remain Altegio-only. That is not an oversight to be relaxed by
+# repeat_10d, comeback_3d, newsletters, follow-up, promo and campaigns remain
+# Altegio-only. That is not an oversight to be relaxed by
 # whoever next touches a worker: each of those paths calls something EasyWeek
 # has no equivalent for — the Altegio API, an Altegio-keyed BOOKING_LINKS entry,
 # a campaign runner built around Altegio client ids.
-EASYWEEK_CUSTOMER_JOB_TYPES: frozenset[str] = EASYWEEK_LIFECYCLE_JOB_TYPES | EASYWEEK_REMINDER_JOB_TYPES
+# PR-9. Earned by a proven `booking-succeeded`, sent three days after the
+# appointment. Its own set because it is marketing rather than a lifecycle
+# notification: it carries a different param contract, a different link and its
+# own send fence, and it must never inherit the reminder or lifecycle rules.
+EASYWEEK_REVIEW_JOB_TYPES: frozenset[str] = frozenset({REVIEW_3D})
+
+# The job types whose rendering DEPENDS on a complete service snapshot: a single
+# RecordService with a title, a price, and a Record.total_cost that agrees with
+# it. Lifecycle messages print the service line and the total; reminders print
+# the service line. Both are fail-closed on an unknown value, because rendering
+# flattens `None` into the literal "None" and an unknown price into "0.00".
+#
+# Stated as a POSITIVE allowlist rather than "everything except review". A
+# negative test is fail-OPEN: the next EasyWeek job type added to the customer
+# set would silently skip a guard it may well need. A type has to be listed here
+# to get the guard, and listing it is a deliberate act.
+#
+# review_3d is deliberately absent. It renders exactly two parameters — the
+# customer's name and the proven review link — so a booking with an unknown
+# price still owes a perfectly sendable review, and failing it on a price it
+# never prints would lose the review outright.
+EASYWEEK_SERVICE_SNAPSHOT_JOB_TYPES: frozenset[str] = EASYWEEK_LIFECYCLE_JOB_TYPES | EASYWEEK_REMINDER_JOB_TYPES
+
+EASYWEEK_CUSTOMER_JOB_TYPES: frozenset[str] = (
+    EASYWEEK_LIFECYCLE_JOB_TYPES | EASYWEEK_REMINDER_JOB_TYPES | EASYWEEK_REVIEW_JOB_TYPES
+)
 
 
 def normalize_provider(value: object | None, *, default: str) -> str:

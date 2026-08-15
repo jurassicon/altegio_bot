@@ -34,6 +34,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from altegio_bot.easyweek_policy import (
     EASYWEEK_CUSTOMER_JOB_TYPES,
     EASYWEEK_REMINDER_JOB_TYPES,
+    EASYWEEK_REVIEW_JOB_TYPES,
     normalize_provider,
 )
 from altegio_bot.models.models import (
@@ -122,6 +123,72 @@ def easyweek_reminder_retry_identity(original_job: MessageJob | None) -> Reminde
     return ReminderRetryIdentity(
         booking_uuid=str(booking_uuid),
         record_starts_at=parsed.astimezone(timezone.utc).isoformat(),
+    )
+
+
+@dataclass(frozen=True)
+class EasyWeekReviewRetryIdentity:
+    """What an EasyWeek review retry must inherit from its ROOT job (PR-9).
+
+    A separate object from :class:`ReminderRetryIdentity` on purpose. A reminder
+    carries two values; a review carries three, and one of them is a customer
+    facing URL. Widening the reminder object would hand reminders a field they
+    have no use for and no rule about.
+
+    All three come from the root job's payload and from nowhere else. Not from
+    the current Record — if the appointment moved between the send and the
+    callback, today's values would manufacture a retry that agrees with the new
+    state and asks a customer to review a visit that did not happen as recorded.
+    Not from the Outbox body or meta, which hold rendered text rather than proven
+    identity. Not from the callback payload, which is Meta's, not ours.
+    """
+
+    booking_uuid: str
+    record_starts_at: str
+    review_url: str
+
+
+def easyweek_review_retry_identity(original_job: MessageJob | None) -> EasyWeekReviewRetryIdentity | None:
+    """Validate the review identity carried by a root job, or ``None``.
+
+    ``None`` means no retry may be built: a missing payload, a booking uuid that
+    is not canonical, a start instant without a timezone, or a review URL that is
+    not a bounded string. The URL is re-proven against the Record at send time
+    anyway; what this refuses is carrying something unusable forward at all.
+    """
+    payload = getattr(original_job, "payload", None)
+    if not isinstance(payload, dict):
+        return None
+
+    raw_uuid = payload.get("booking_uuid")
+    if not isinstance(raw_uuid, str):
+        return None
+    try:
+        booking_uuid = uuid.UUID(raw_uuid.strip())
+    except (ValueError, AttributeError, TypeError):
+        return None
+
+    raw_start = payload.get("record_starts_at")
+    if not isinstance(raw_start, str):
+        return None
+    text = raw_start.strip()
+    if text.endswith(("Z", "z")):
+        text = f"{text[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+
+    review_url = payload.get("review_url")
+    if not isinstance(review_url, str) or not review_url.strip():
+        return None
+
+    return EasyWeekReviewRetryIdentity(
+        booking_uuid=str(booking_uuid),
+        record_starts_at=parsed.astimezone(timezone.utc).isoformat(),
+        review_url=review_url.strip(),
     )
 
 
@@ -426,7 +493,14 @@ def resolve_retry_reference(job: MessageJob) -> RetryReferenceResolution:
     if repeated_original is not None and parse_retry_outbox_id(repeated_original) != original_outbox_id:
         return RetryReferenceResolution(error="delivery_retry_original_reference_mismatch")
 
-    if getattr(job, "job_type", None) not in DELIVERY_RETRY_JOB_TYPES:
+    job_type = getattr(job, "job_type", None)
+    if job_type not in DELIVERY_RETRY_JOB_TYPES and not (
+        # PR-9: review is retry-enabled for EasyWeek only. Keeping it out of the
+        # shared tuple is what leaves Altegio's own review without a retry and
+        # without a delivery deadline, exactly as before.
+        job_type in EASYWEEK_REVIEW_JOB_TYPES
+        and normalize_provider(getattr(job, "provider", None), default="") == PROVIDER_EASYWEEK
+    ):
         return RetryReferenceResolution(error="delivery_retry_job_type_not_enabled")
 
     return RetryReferenceResolution(
@@ -511,6 +585,8 @@ async def resolve_retry_identity(
     # ------------------------------------------------------------------
     if job_type not in EASYWEEK_CUSTOMER_JOB_TYPES:
         return _refuse("easyweek_job_type_not_enabled")
+    if job_type in EASYWEEK_REVIEW_JOB_TYPES and easyweek_review_retry_identity(original_job) is None:
+        return _refuse("easyweek_review_retry_identity_unproven")
     if job_type in EASYWEEK_REMINDER_JOB_TYPES and easyweek_reminder_retry_identity(original_job) is None:
         # A reminder retry has to re-prove itself against the live API, and the
         # guard needs the ROOT job's booking uuid and planned start to do it.

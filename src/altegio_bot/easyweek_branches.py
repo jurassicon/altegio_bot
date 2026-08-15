@@ -47,6 +47,8 @@ RECORD_CANCELED: Final = "record_canceled"
 # bound to one branch's Meta name, body and footer by the same contract.
 REMINDER_24H: Final = "reminder_24h"
 REMINDER_2H: Final = "reminder_2h"
+# PR-9: the review request earned by a proven booking-succeeded.
+REVIEW_3D: Final = "review_3d"
 
 BRANCH_TEMPLATE_CODES: Final = (
     RECORD_CREATED,
@@ -55,6 +57,7 @@ BRANCH_TEMPLATE_CODES: Final = (
     RECORD_CANCELED,
     REMINDER_24H,
     REMINDER_2H,
+    REVIEW_3D,
 )
 
 PRE_APPOINTMENT_NOTES_DE: Final = (
@@ -218,6 +221,15 @@ def branch_template_contract(profile: BranchProfile, template_code: str) -> Bran
             "*Service:*\n"
             "{services}\n\n"
             f"Termin verwalten: {{booking_link}}{footer}"
+        ),
+        # Two positional parameters only: the name and the proven review link.
+        # No price, no service list, no manage link — a review request asks one
+        # thing, and every extra field is another value to keep true for days.
+        REVIEW_3D: (
+            "*{client_name}, hallo!*\n\n"
+            "Vielen Dank für Ihren Besuch! Wir würden uns sehr über Ihre "
+            "Bewertung freuen:\n\n"
+            f"{{review_url}}{footer}"
         ),
         REMINDER_2H: (
             "*{client_name}, hallo! Ihr Termin ist in 2 Stunden:*\n\n"

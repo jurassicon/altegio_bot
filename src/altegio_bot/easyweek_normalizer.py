@@ -602,6 +602,92 @@ def _display_name(payload: dict[str, Any]) -> str | None:
     return joined[:256] if joined else None
 
 
+@dataclass(frozen=True)
+class SucceededBooking:
+    """PR-9: a proven ``booking-succeeded`` delivery, and nothing more.
+
+    Deliberately tiny, and deliberately NOT a :class:`NormalizedBooking`. A
+    succeeded delivery is evidence that a visit finished — it is not a new
+    version of the booking. Handing the lifecycle object back here would invite
+    a caller to write its fields, and a succeeded payload must never rewrite the
+    name, phone, price, service, or time that the lifecycle events proved.
+
+    ``review_url`` is carried raw and unvalidated on purpose: proving it needs
+    the booking hash, which lives on the Record, and the normalizer has no
+    database. :func:`altegio_bot.easyweek_review.validate_review_url` does that
+    once the Record is in hand.
+    """
+
+    booking_uuid: uuid.UUID
+    booking_id: int
+    company_id: int
+    review_url: Any
+
+
+def normalize_succeeded_event(
+    *,
+    event_hint: str | None,
+    payload: Any,
+    body_truncated: bool,
+    location_registry: Mapping[int, EasyWeekLocation],
+) -> SucceededBooking:
+    """Validate one ``booking-succeeded`` delivery, or reject it deterministically.
+
+    Applies exactly the integrity and isolation rules every other event gets —
+    truncation, payload shape, the ``location_id`` + ``location_uuid`` pair as
+    ONE registry identity — and then the identity a review needs: a canonical
+    ``uid`` and the numeric booking id, both of which the caller matches against
+    the Record before anything is planned.
+
+    Separate from :func:`normalize_event` rather than folded into it: that
+    function returns ``None`` for this trigger and every caller relies on that
+    meaning "terminal, no side effects". Widening its contract would make a
+    lifecycle path responsible for a marketing one.
+    """
+    if map_event_hint(event_hint) is not IGNORE:
+        raise NormalizationError(NormalizationError.INVALID_EVENT_HINT)
+
+    if body_truncated:
+        raise NormalizationError(NormalizationError.TRUNCATED_PAYLOAD)
+    if not isinstance(payload, dict) or not payload:
+        raise NormalizationError(NormalizationError.INVALID_PAYLOAD)
+
+    location_id = _require_positive_id(
+        payload.get("location_id"),
+        code=NormalizationError.INVALID_LOCATION_ID,
+        maximum=PG_INT_MAX,
+    )
+    location = location_registry.get(location_id)
+    if location is None:
+        raise NormalizationError(NormalizationError.FOREIGN_LOCATION)
+
+    raw_location_uuid = payload.get("location_uuid")
+    try:
+        payload_location_uuid = str(uuid.UUID(raw_location_uuid)) if isinstance(raw_location_uuid, str) else None
+    except (ValueError, AttributeError, TypeError):
+        payload_location_uuid = None
+    if payload_location_uuid != location.location_uuid:
+        raise NormalizationError(NormalizationError.LOCATION_IDENTITY_MISMATCH)
+
+    raw_uid = payload.get("uid")
+    if raw_uid is None or (isinstance(raw_uid, str) and not raw_uid.strip()):
+        raise NormalizationError(NormalizationError.MISSING_BOOKING_UUID)
+    if not isinstance(raw_uid, str):
+        raise NormalizationError(NormalizationError.INVALID_BOOKING_UUID)
+    booking_uuid = canonical_booking_uuid(payload)
+    if booking_uuid is None:
+        raise NormalizationError(NormalizationError.INVALID_BOOKING_UUID)
+
+    booking_id = _require_positive_id(payload.get("id"), code=NormalizationError.MISSING_BOOKING_ID)
+
+    return SucceededBooking(
+        booking_uuid=booking_uuid,
+        booking_id=booking_id,
+        company_id=location_id,
+        review_url=payload.get("review_url"),
+    )
+
+
 def normalize_event(
     *,
     event_hint: str | None,

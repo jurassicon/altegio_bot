@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 import re
+import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
@@ -46,8 +47,11 @@ from altegio_bot.easyweek_policy import (
     EASYWEEK_CUSTOMER_JOB_TYPES,
     EASYWEEK_LIFECYCLE_JOB_TYPES,
     EASYWEEK_REMINDER_JOB_TYPES,
+    EASYWEEK_REVIEW_JOB_TYPES,
+    EASYWEEK_SERVICE_SNAPSHOT_JOB_TYPES,
     RECORD_CREATED,
     RECORD_CREATED_NEW_CLIENT,
+    REVIEW_3D,
     easyweek_job_type_error,
     normalize_provider,
     validate_static_booking_page,
@@ -57,7 +61,8 @@ from altegio_bot.easyweek_reminder_guard import (
     classify_client_error,
     verify_reminder_is_current,
 )
-from altegio_bot.easyweek_service_category import evaluate_service_category
+from altegio_bot.easyweek_review import validate_review_url
+from altegio_bot.easyweek_service_category import evaluate_service_category, services_count_from_record_raw
 from altegio_bot.message_planner import (
     COMEBACK_3D_DELAY,
     COMEBACK_3D_SOURCE_CANCELLED_AT_KEY,
@@ -440,6 +445,20 @@ async def _lock_next_jobs(
     if not settings.easyweek_reminder_api_guard_enabled:
         stmt = stmt.where(
             ~((MessageJob.provider == PROVIDER_EASYWEEK) & (MessageJob.job_type.in_(EASYWEEK_REMINDER_JOB_TYPES)))
+        )
+
+    # PR-9 send fence, the same shape and for the same reason: with the fence
+    # shut an EasyWeek review is not claimed AT ALL, so it keeps its `queued`
+    # status, its original `run_at` and its zero attempts while the rollout
+    # audits it. Claim-and-cancel would destroy the very queue the audit reads;
+    # claim-and-requeue would spin the worker on every due row.
+    #
+    # Scoped to exactly one provider and one job type: EasyWeek lifecycle jobs,
+    # EasyWeek reminders (which answer to their own fence above) and every
+    # Altegio job — including Altegio's own review_3d — are untouched.
+    if not settings.easyweek_review_send_enabled:
+        stmt = stmt.where(
+            ~((MessageJob.provider == PROVIDER_EASYWEEK) & (MessageJob.job_type.in_(EASYWEEK_REVIEW_JOB_TYPES)))
         )
     res = await session.execute(stmt)
     jobs = list(res.scalars().all())
@@ -891,6 +910,97 @@ async def _is_new_client_for_record(
     return prev_id is None
 
 
+def _easyweek_review_presend_error(
+    job: MessageJob,
+    record: Record | None,
+    client: Client | None,
+) -> str | None:
+    """Re-prove an EasyWeek review immediately before Meta, or refuse it.
+
+    Runs on the first send AND on every delivery retry: a review is planned
+    three days ahead, and identity, eligibility, consent and the link can all
+    change in between. Nothing proven at planning time is trusted here.
+
+    Reasons are short, stable and PII-free — they reach ``job.last_error`` and
+    the log — and they never contain the URL, the name or the phone.
+    """
+    payload = getattr(job, "payload", None)
+    if not isinstance(payload, dict):
+        return "EasyWeek review refused: payload_missing"
+
+    ownership_error = easyweek_job_ownership_error(job.company_id)
+    if ownership_error is not None:
+        return f"EasyWeek review refused: {ownership_error}"
+
+    if record is None or client is None:
+        return "EasyWeek review refused: domain_rows_missing"
+    if record.provider != PROVIDER_EASYWEEK or client.provider != PROVIDER_EASYWEEK:
+        return "EasyWeek review refused: provider_mismatch"
+    if record.company_id != job.company_id or client.company_id != job.company_id:
+        return "EasyWeek review refused: company_mismatch"
+    if job.record_id is not None and job.record_id != record.id:
+        return "EasyWeek review refused: record_mismatch"
+    if record.client_id != client.id:
+        return "EasyWeek review refused: client_not_linked"
+
+    booking_uuid = _canonical_uuid_or_none(payload.get("booking_uuid"))
+    if booking_uuid is None:
+        return "EasyWeek review refused: booking_uuid_unproven"
+    if _canonical_uuid_or_none(record.easyweek_booking_uuid) != booking_uuid:
+        return "EasyWeek review refused: booking_uuid_mismatch"
+
+    if bool(getattr(record, "is_deleted", False)):
+        return "EasyWeek review refused: record_deleted"
+
+    planned_start = _parse_payload_datetime(payload.get("record_starts_at"))
+    if planned_start is None:
+        return "EasyWeek review refused: planned_start_unproven"
+    if record.starts_at is None or _as_utc(record.starts_at) != planned_start:
+        # The appointment moved after the review was earned. The visit we are
+        # asking about is not the visit that happened.
+        return "EasyWeek review refused: start_time_mismatch"
+
+    if bool(getattr(client, "wa_opted_out", False)):
+        return "EasyWeek review refused: client_unsubscribed"
+
+    if services_count_from_record_raw(record.raw) != 1:
+        return "EasyWeek review refused: services_count_unproven"
+
+    # The link, re-proven against the hash this booking owns. A review URL that
+    # no longer matches is a link to somebody else's appointment.
+    if easyweek_review_url_for_send(job, record) is None:
+        return "EasyWeek review refused: review_url_unproven"
+
+    return None
+
+
+def easyweek_review_url_for_send(job: MessageJob, record: Record | None) -> str | None:
+    """The one link an EasyWeek review may carry, or ``None``.
+
+    Only the payload value, and only after it re-proves against the Record's
+    booking hash. Never ``Record.short_link`` (that is the MANAGE link), never
+    the static booking page, never ``GOOGLE_MAPS_REVIEW_LINKS``.
+    """
+    payload = getattr(job, "payload", None)
+    if not isinstance(payload, dict) or record is None:
+        return None
+    return validate_review_url(
+        payload.get("review_url"),
+        booking_hash_id=getattr(record, "easyweek_booking_hash_id", None),
+    )
+
+
+def _canonical_uuid_or_none(value: object) -> uuid.UUID | None:
+    if isinstance(value, uuid.UUID):
+        return value
+    if not isinstance(value, str):
+        return None
+    try:
+        return uuid.UUID(value.strip())
+    except (ValueError, AttributeError, TypeError):
+        return None
+
+
 async def _run_easyweek_reminder_guard(job: MessageJob, record: Record | None) -> GuardResult:
     """Ask EasyWeek whether this reminder is still true, once, read-only.
 
@@ -1190,7 +1300,7 @@ async def _render_message(
         svc_res = await session.execute(svc_stmt)
         services = list(svc_res.scalars().all())
 
-        if is_easyweek and template_code in EASYWEEK_CUSTOMER_JOB_TYPES:
+        if is_easyweek and template_code in EASYWEEK_SERVICE_SNAPSHOT_JOB_TYPES:
             # BEFORE the loop below, which is what would flatten an unknown
             # title into "None" and an unknown price into "0.00".
             snapshot_err = _easyweek_service_snapshot_error(record, services)
@@ -1433,8 +1543,11 @@ def _defer_easyweek_configuration(
     return _schedule_retry_or_cancel(job, record, delay, reason)
 
 
+_EASYWEEK_DEADLINE_JOB_TYPES = EASYWEEK_REMINDER_JOB_TYPES | EASYWEEK_REVIEW_JOB_TYPES
+
+
 def easyweek_reminder_deadline_passed(job: MessageJob, record: Record | None) -> bool:
-    """Is this EasyWeek reminder too late to send? THE single criterion.
+    """Is this EasyWeek reminder or review too late to send? THE single criterion.
 
     One function, two callers: the outbox worker below, and the read-only
     preflight. A preflight that judged timeliness by its own rule would bless a
@@ -1451,7 +1564,13 @@ def easyweek_reminder_deadline_passed(job: MessageJob, record: Record | None) ->
     """
     if normalize_provider(getattr(job, "provider", None), default="") != PROVIDER_EASYWEEK:
         return False
-    if getattr(job, "job_type", None) not in EASYWEEK_REMINDER_JOB_TYPES:
+    # PR-9 joins review to the same criterion. Its deadline is not a new number:
+    # `review_3d` is already in MARKETING_TRANSIENT_CAP_JOB_TYPES, so
+    # `_retry_deadline_at` answers `anchor + 24h` for it — and `_original_run_at`
+    # falls back to `job.run_at`, so an initial job that never retried still has
+    # an anchor. This matters exactly during rollout: reviews pile up behind a
+    # closed fence, and opening it must not release a backlog that went stale.
+    if getattr(job, "job_type", None) not in _EASYWEEK_DEADLINE_JOB_TYPES:
         return False
     deadline = _retry_deadline_at(job, record)
     if deadline is None or deadline == _DEADLINE_ALREADY_PASSED:
@@ -1460,6 +1579,13 @@ def easyweek_reminder_deadline_passed(job: MessageJob, record: Record | None) ->
 
 
 def _deadline_passed_for_send(job: MessageJob, record: Record | None) -> bool:
+    # EasyWeek reminders and reviews are judged first, by their own scoped rule.
+    # `review_3d` is not in DELIVERY_DEADLINE_JOB_TYPES — adding it there would
+    # give Altegio's review a deadline it never had — so without this it would
+    # leave through the next line and a backlog that went stale behind a closed
+    # fence would send the moment the fence opened.
+    if easyweek_reminder_deadline_passed(job, record):
+        return True
     if job.job_type not in DELIVERY_DEADLINE_JOB_TYPES:
         return False
     payload = getattr(job, "payload", None) or {}
@@ -2743,14 +2869,35 @@ async def _run_job_logic(
             job.last_error = "Skipped: client unsubscribed"
             return
 
-    if record is not None and job.job_type in ("review_3d", "repeat_10d"):
+    # PR-9: EasyWeek review takes its own path, BEFORE every Altegio review
+    # branch below. Those branches prove attendance from `Record.attendance`,
+    # count visits through the Altegio API and render a Google Maps link keyed
+    # by an Altegio company id — EasyWeek has none of the three, and its
+    # `company_id` shares an integer space with Altegio's, so a lookup would
+    # silently answer for another salon.
+    is_easyweek_review = job_provider == PROVIDER_EASYWEEK and job.job_type == REVIEW_3D
+    if is_easyweek_review:
+        review_error = _easyweek_review_presend_error(job, record, client)
+        if review_error is not None:
+            job.status = "canceled"
+            job.locked_at = None
+            job.last_error = review_error
+            logger.info(
+                "EasyWeek review refused before send job_id=%s company_id=%s record_id=%s reason=%s",
+                job.id,
+                job.company_id,
+                getattr(record, "id", None),
+                review_error,
+            )
+            return
+    elif record is not None and job.job_type in ("review_3d", "repeat_10d"):
         if not _record_attended(record):
             job.status = "canceled"
             job.locked_at = None
             job.last_error = "Skipped: record is not attended"
             return
 
-    if job.job_type == "review_3d":
+    if job.job_type == "review_3d" and not is_easyweek_review:
         altegio_cid = getattr(client, "altegio_client_id", None) if client is not None else None
         if altegio_cid is None:
             job.status = "canceled"
@@ -3428,6 +3575,19 @@ async def _run_job_logic(
                     job.job_type,
                 )
                 return
+
+            if job.job_type == REVIEW_3D:
+                # The ONE link a review may carry, re-proven here rather than
+                # inherited from the render context: `booking_link` in that
+                # context is the manage link or the storefront page, and either
+                # would be the wrong thing to ask a customer to review.
+                proven_review_url = easyweek_review_url_for_send(job, record)
+                if proven_review_url is None:
+                    job.status = "canceled"
+                    job.locked_at = None
+                    job.last_error = "EasyWeek review refused: review_url_unproven"
+                    return
+                msg_ctx["review_url"] = proven_review_url
 
             template_params = build_lifecycle_template_params(job.job_type, msg_ctx)
         else:

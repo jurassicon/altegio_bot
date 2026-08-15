@@ -548,6 +548,24 @@ class Settings(BaseSettings):
     # single Meta attempt. There is no mode that sends a reminder unverified.
     easyweek_reminder_api_guard_enabled: bool = False
 
+    # --- PR-9: review_3d --------------------------------------------------
+    # Same two-flag shape as PR-8, and for the same reason: planning and sending
+    # are turned on at different points in the rollout.
+    #
+    #   easyweek_reviews_enabled      -> ONLY planning booking-succeeded ->
+    #                                    review_3d (easyweek inbox worker)
+    #   easyweek_review_send_enabled  -> the SEND FENCE (shared outbox worker)
+    #
+    # easyweek_notifications_enabled remains the master gate above both.
+    #
+    # With planning on and the fence shut, real review jobs accumulate as
+    # `queued` and can be audited against the live branch, template, sender and
+    # review link before a single message goes out. Turning planning off does
+    # not open the fence, and closing the fence does not cancel what is queued —
+    # every job re-proves itself when the fence reopens.
+    easyweek_reviews_enabled: bool = False
+    easyweek_review_send_enabled: bool = False
+
     # PR-7.1: exact EasyWeek service-category allowlist as a JSON array of
     # strings. Parsing is deliberately deferred to the shared eligibility
     # helper so malformed input suppresses EasyWeek jobs without preventing the

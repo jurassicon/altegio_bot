@@ -207,6 +207,14 @@ LIFECYCLE_PARAM_FIELDS: dict[str, tuple[str, ...]] = {
         "services",
         "booking_link",
     ),
+    # PR-9. Two parameters, and `review_url` is deliberately its own ctx key:
+    # it is neither the manage link nor the storefront page, and reusing
+    # `booking_link` here would let one of those reach a customer as a review
+    # link if the review value were ever missing.
+    "review_3d": (
+        "client_name",
+        "review_url",
+    ),
 }
 
 

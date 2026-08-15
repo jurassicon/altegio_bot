@@ -75,10 +75,21 @@ services:
   #
   # PR-8: this service reads EASYWEEK_REMINDER_API_GUARD_ENABLED (the send
   # fence) and, because every reminder is verified against the live API before
-  # it is sent, EASYWEEK_API_KEY / EASYWEEK_WORKSPACE_SLUG. Those two are
-  # already in easyweek.env, which this service already loads — no new service
-  # and no new secret distribution. Reminder PLANNING is a different flag on a
-  # different service; see altegio-easyweek-inbox-worker below.
+  # it is sent, EASYWEEK_API_KEY / EASYWEEK_WORKSPACE_SLUG.
+  #
+  # PR-9 adds EASYWEEK_REVIEW_SEND_ENABLED here — the review send fence. It is
+  # already in easyweek.env, which this service already loads: no new service,
+  # no new secret, and no EasyWeek API call on the review send path. Review
+  # PLANNING is a different flag on a different service; see
+  # altegio-easyweek-inbox-worker below.
+  #
+  # This service is also the base image for the one-off review preflight
+  # (`run --rm --no-deps --entrypoint /app/.venv/bin/python
+  # altegio-outbox-worker -m altegio_bot.scripts.easyweek_review_preflight`).
+  # That process reads EASYWEEK_REVIEWS_ENABLED too — the running worker never
+  # does. A one-off container is required rather than `exec`, because this
+  # long-running container keeps the environment it was created with, and the
+  # rollout enables planning while deliberately leaving it untouched.
   altegio-outbox-worker:
     build: .
     restart: always
@@ -156,6 +167,9 @@ services:
   # PR-8: this service reads EASYWEEK_REMINDERS_ENABLED (reminder PLANNING).
   # The send fence, EASYWEEK_REMINDER_API_GUARD_ENABLED, is read by
   # altegio-outbox-worker instead — recreate that one when flipping it.
+  #
+  # PR-9: likewise EASYWEEK_REVIEWS_ENABLED (review PLANNING) is read here;
+  # its send fence EASYWEEK_REVIEW_SEND_ENABLED belongs to the outbox worker.
   altegio-easyweek-inbox-worker:
     build: .
     restart: always

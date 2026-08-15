@@ -30,12 +30,17 @@ from altegio_bot.delivery_retry_identity import (
     RetryIdentity,
     StatusRetryChain,
     easyweek_reminder_retry_identity,
+    easyweek_review_retry_identity,
     resolve_retry_chain_members,
     resolve_retry_identity,
     resolve_retry_reference,
     resolve_status_retry_chain,
 )
-from altegio_bot.easyweek_policy import EASYWEEK_REMINDER_JOB_TYPES
+from altegio_bot.easyweek_policy import (
+    EASYWEEK_REMINDER_JOB_TYPES,
+    EASYWEEK_REVIEW_JOB_TYPES,
+    normalize_provider,
+)
 from altegio_bot.models.models import (
     PROVIDER_EASYWEEK,
     CampaignRecipient,
@@ -1322,7 +1327,13 @@ def _occupant_claim_error(
     mismatch = identity.mismatch_field(occupant)
     if mismatch is not None:
         return f"identity_{mismatch}_mismatch"
-    if occupant.job_type not in DELIVERY_RETRY_JOB_TYPES:
+    if occupant.job_type not in DELIVERY_RETRY_JOB_TYPES and not (
+        # PR-9: review is retry-enabled for EasyWeek only, and by this point the
+        # occupant's provider has been proven by `identity.mismatch_field`
+        # above — so this reads a value that is already established, not a hint.
+        occupant.job_type in EASYWEEK_REVIEW_JOB_TYPES
+        and normalize_provider(getattr(occupant, "provider", None), default="") == PROVIDER_EASYWEEK
+    ):
         return "delivery_retry_job_type_not_enabled"
     return None
 
@@ -1670,7 +1681,12 @@ async def _handle_failed_delivery_status(
         return
 
     job_type = outbox.template_code
-    if job_type not in DELIVERY_RETRY_JOB_TYPES:
+    # PR-9: `review_3d` is retry-enabled for EasyWeek only. It is admitted here
+    # because the provider is not known yet — `OutboxMessage` has no provider
+    # column — and refused below the moment the chain proves it is Altegio's.
+    # Adding it to DELIVERY_RETRY_JOB_TYPES instead would have given Altegio's
+    # own review a retry and a delivery deadline it never had.
+    if job_type not in DELIVERY_RETRY_JOB_TYPES and job_type not in EASYWEEK_REVIEW_JOB_TYPES:
         return
     if not _is_retryable_delivery_failure(status):
         return
@@ -1762,6 +1778,32 @@ async def _handle_failed_delivery_status(
             anchor_scheduled = anchor_scheduled.replace(tzinfo=timezone.utc)
         payload[_ORIGINAL_RUN_AT_KEY] = anchor_scheduled.isoformat()
         payload["delivery_retry_original_scheduled_at"] = anchor_scheduled.isoformat()
+
+    if job_type in EASYWEEK_REVIEW_JOB_TYPES:
+        if identity.provider != PROVIDER_EASYWEEK:
+            # Altegio's review keeps exactly the behaviour it had: no retry.
+            _record_retry_skip(outbox, "review_retry_not_enabled_for_provider", original_outbox_id)
+            return
+        review_identity = easyweek_review_retry_identity(original_job)
+        if review_identity is None:
+            _record_retry_skip(outbox, "easyweek_review_retry_identity_unproven", original_outbox_id)
+            logger.warning(
+                "Delivery retry refused: reason=easyweek_review_retry_identity_unproven"
+                " original_outbox_id=%s outbox_id=%s",
+                original_outbox_id,
+                int(outbox.id),
+            )
+            return
+        # Inherited from the ROOT job, never re-derived from today's Record and
+        # never taken from the Outbox body or the callback. The send-time guard
+        # re-proves all three, and inheriting the originals is what lets it
+        # notice a booking that moved between the send and this callback.
+        payload["provider"] = PROVIDER_EASYWEEK
+        payload["company_id"] = identity.company_id
+        payload["booking_uuid"] = review_identity.booking_uuid
+        payload["record_starts_at"] = review_identity.record_starts_at
+        payload["review_url"] = review_identity.review_url
+        payload["job_type"] = job_type
 
     if job_type in EASYWEEK_REMINDER_JOB_TYPES and identity.provider == PROVIDER_EASYWEEK:
         # Inherited from the ROOT job, never re-derived from today's Record.

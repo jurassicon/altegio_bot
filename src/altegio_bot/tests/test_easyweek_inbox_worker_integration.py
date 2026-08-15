@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 import altegio_bot.db as app_db
 from altegio_bot.easyweek_normalizer import NormalizationError, canonical_booking_uuid
+from altegio_bot.easyweek_review import easyweek_review_dedupe_key
 from altegio_bot.easyweek_service_category import (
     EASYWEEK_RAW_NAMESPACE,
     SERVICE_CATEGORY_SNAPSHOT_KEY,
@@ -424,6 +425,17 @@ def _in(payload: dict, **delta) -> dict:
 
 
 @pytest.fixture
+def _reviews_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    """PR-9: claim booking-succeeded at all.
+
+    With review planning off the trigger is deliberately left `captured`, so any
+    test about what the succeeded PATH does has to switch planning on first.
+    """
+    monkeypatch.setattr(settings, "easyweek_notifications_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_reviews_enabled", True, raising=False)
+
+
+@pytest.fixture
 def _reminders_on(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "easyweek_notifications_enabled", True, raising=False)
     monkeypatch.setattr(settings, "easyweek_reminders_enabled", True, raising=False)
@@ -702,6 +714,607 @@ async def test_the_reminder_payload_stays_minimal_and_carries_the_planned_start(
     text = str(payload)
     for leak in ("Fixture Specialist", "Fixture Service", "+49", "@example"):
         assert leak not in text
+
+
+# ===========================================================================
+# PR-9 review planning, end to end through the real worker
+# ===========================================================================
+#
+# `booking-succeeded` is EVIDENCE THAT A VISIT HAPPENED — not a newer version of
+# the booking. That distinction is the axis most of these tests turn on: the
+# succeeded delivery may earn exactly one review request, and it may not rewrite
+# a single lifecycle field while doing so.
+#
+# Everything here drives the real claim/process transaction rather than calling
+# `plan_review_job` directly, because the properties worth proving — atomicity,
+# the claim gates, causal ordering — only exist at that level.
+
+REVIEW_URL = f"https://eyw.me/f/{TEST_BOOKING_HASH_ID}"
+
+
+def _succeeded(*, review_url: object = REVIEW_URL, **overrides) -> dict:
+    """A booking-succeeded delivery for the fixture booking."""
+    payload = booking_created()
+    payload["booking_status"] = "Succeeded appointment"
+    if review_url is not _UNSET_REVIEW:
+        payload["review_url"] = review_url
+    payload.update(overrides)
+    return payload
+
+
+class _UnsetReview:
+    pass
+
+
+_UNSET_REVIEW = _UnsetReview()
+
+
+async def _review_jobs(session_maker) -> list[MessageJob]:
+    async with session_maker() as session:
+        return list(
+            (
+                await session.execute(
+                    select(MessageJob).where(MessageJob.job_type == "review_3d").order_by(MessageJob.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+
+async def _domain_snapshot(session_maker) -> tuple:
+    """Everything a succeeded delivery must NOT be able to change."""
+    async with session_maker() as session:
+        record = (await session.execute(select(Record).where(Record.provider == "easyweek"))).scalars().one()
+        client = (await session.execute(select(Client).where(Client.provider == "easyweek"))).scalars().one()
+        services = (
+            (await session.execute(select(RecordService).where(RecordService.record_id == record.id))).scalars().all()
+        )
+        return (
+            record.provider,
+            record.company_id,
+            record.client_id,
+            record.starts_at,
+            record.ends_at,
+            record.total_cost,
+            record.staff_name,
+            record.short_link,
+            record.easyweek_booking_uuid,
+            record.easyweek_booking_hash_id,
+            record.raw,
+            client.display_name,
+            client.phone_e164,
+            client.email,
+            tuple((s.service_id, s.title, s.amount, s.cost_to_pay) for s in services),
+        )
+
+
+async def _seed_lifecycle(bound_session_local, *, start: datetime | None = None) -> datetime:
+    """Create the EasyWeek Record/Client the review will hang off."""
+    starts_at = start or (_future(days=3) - timedelta(days=3, hours=1))
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, _at(booking_created(), starts_at), payload_hash="h-created")
+    await _run_until_idle()
+    return starts_at
+
+
+# --- the positive path ------------------------------------------------------
+
+
+async def test_a_proven_succeeded_delivery_earns_exactly_one_review(bound_session_local, _reviews_on) -> None:
+    starts_at = await _seed_lifecycle(bound_session_local)
+    baseline = await _domain_snapshot(bound_session_local)
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            event_id = await _capture(
+                session, _at(_succeeded(), starts_at), event_hint="booking-succeeded", payload_hash="h-succeeded"
+            )
+    await _run_until_idle()
+
+    async with bound_session_local() as session:
+        event = (await session.execute(select(EasyWeekEvent).where(EasyWeekEvent.id == event_id))).scalars().one()
+        assert event.status == "processed"
+        assert event.processed_at is not None
+        assert event.error_code is None
+        assert event.next_retry_at is None
+
+        record = (await session.execute(select(Record).where(Record.provider == "easyweek"))).scalars().one()
+        client = (await session.execute(select(Client).where(Client.provider == "easyweek"))).scalars().one()
+
+    jobs = await _review_jobs(bound_session_local)
+    assert len(jobs) == 1
+    job = jobs[0]
+
+    assert job.provider == "easyweek"
+    assert job.job_type == "review_3d"
+    assert job.status == "queued"
+    assert job.attempts == 0
+    assert job.company_id == record.company_id == TEST_LOCATION_ID
+    assert job.record_id == record.id
+    assert job.client_id == client.id
+    assert job.run_at == starts_at + timedelta(days=3)
+    assert job.dedupe_key == easyweek_review_dedupe_key(booking_uuid=uuid.UUID(TEST_BOOKING_UUID), starts_at=starts_at)
+
+    payload = job.payload
+    assert payload["provider"] == "easyweek"
+    assert payload["booking_uuid"] == TEST_BOOKING_UUID
+    assert payload["review_url"] == REVIEW_URL
+    assert payload["source_event_id"] == event_id
+    parsed = datetime.fromisoformat(payload["record_starts_at"])
+    assert parsed.tzinfo is not None and parsed == starts_at
+
+    # The lifecycle snapshot is untouched by the delivery that earned the review.
+    assert await _domain_snapshot(bound_session_local) == baseline
+
+
+async def test_the_review_payload_carries_no_customer_or_service_data(bound_session_local, _reviews_on) -> None:
+    starts_at = await _seed_lifecycle(bound_session_local)
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(
+                session, _at(_succeeded(), starts_at), event_hint="booking-succeeded", payload_hash="h-succeeded"
+            )
+    await _run_until_idle()
+
+    payload = (await _review_jobs(bound_session_local))[0].payload
+    assert set(payload) == {
+        "provider",
+        "company_id",
+        "booking_uuid",
+        "record_starts_at",
+        "review_url",
+        "job_type",
+        "source_event_id",
+        "source_payload_hash",
+    }
+    text = str(payload)
+    for leak in ("Fixture Specialist", "Fixture Service", "Fixture Category", "+49", "@example", "3500", "35.00"):
+        assert leak not in text, leak
+
+
+async def test_a_succeeded_delivery_never_rewrites_the_lifecycle_snapshot(bound_session_local, _reviews_on) -> None:
+    """It proves a visit finished; it is not a newer version of the booking."""
+    starts_at = await _seed_lifecycle(bound_session_local)
+    baseline = await _domain_snapshot(bound_session_local)
+
+    contradicting = _at(_succeeded(), starts_at + timedelta(hours=5))
+    contradicting["customer_full_name"] = "Someone Else"
+    contradicting["customer_phone"] = "+49111111111"
+    contradicting["customer_email"] = "other@example.invalid"
+    contradicting["service_name"] = "Different Service"
+    contradicting["services_description"] = "Different Service"
+    contradicting["service_category"] = "Different Category"
+    contradicting["users_description"] = "Different Specialist"
+    contradicting["booking_page"] = "https://eyw.me/r/99999999"
+    set_booking_price(contradicting, 999900)
+    # Identity itself stays valid: same booking, same branch.
+    contradicting["uid"] = TEST_BOOKING_UUID
+    contradicting["id"] = TEST_BOOKING_ID
+    contradicting["review_url"] = REVIEW_URL
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, contradicting, event_hint="booking-succeeded", payload_hash="h-contra")
+    await _run_until_idle()
+
+    assert await _domain_snapshot(bound_session_local) == baseline, "succeeded must not update the snapshot"
+
+    jobs = await _review_jobs(bound_session_local)
+    assert len(jobs) == 1
+    # run_at comes from the STORED start, not from the contradicting payload.
+    assert jobs[0].run_at == starts_at + timedelta(days=3)
+
+
+# --- dedupe -----------------------------------------------------------------
+
+
+async def test_an_exact_resend_of_a_succeeded_delivery_earns_no_second_review(bound_session_local, _reviews_on) -> None:
+    starts_at = await _seed_lifecycle(bound_session_local)
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, _at(_succeeded(), starts_at), event_hint="booking-succeeded", payload_hash="h-s1")
+    await _run_until_idle()
+    first = (await _review_jobs(bound_session_local))[0]
+    original_run_at, original_id = first.run_at, first.id
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, _at(_succeeded(), starts_at), event_hint="booking-succeeded", payload_hash="h-s1")
+    await _run_until_idle()
+
+    jobs = await _review_jobs(bound_session_local)
+    assert len(jobs) == 1
+    assert jobs[0].id == original_id, "the existing job must not be replaced"
+    assert jobs[0].run_at == original_run_at
+    assert jobs[0].status == "queued"
+
+
+async def test_a_second_delivery_with_a_different_hash_earns_no_second_review(bound_session_local, _reviews_on) -> None:
+    """Identity is the business fact, not the delivery."""
+    starts_at = await _seed_lifecycle(bound_session_local)
+    for payload_hash in ("h-s1", "h-s2"):
+        async with bound_session_local() as session:
+            async with session.begin():
+                await _capture(
+                    session,
+                    _at(_succeeded(), starts_at),
+                    event_hint="booking-succeeded",
+                    payload_hash=payload_hash,
+                )
+        await _run_until_idle()
+
+    assert len(await _review_jobs(bound_session_local)) == 1
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    [
+        TEST_BOOKING_UUID.upper(),
+        "{" + TEST_BOOKING_UUID + "}",
+        TEST_BOOKING_UUID.replace("-", ""),
+        f"  {TEST_BOOKING_UUID}  ",
+    ],
+)
+async def test_another_spelling_of_the_same_uuid_earns_no_second_review(
+    bound_session_local, _reviews_on, spelling: str
+) -> None:
+    starts_at = await _seed_lifecycle(bound_session_local)
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, _at(_succeeded(), starts_at), event_hint="booking-succeeded", payload_hash="h-s1")
+    await _run_until_idle()
+
+    respelled = _at(_succeeded(), starts_at)
+    respelled["uid"] = spelling
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, respelled, event_hint="booking-succeeded", payload_hash="h-s2")
+    await _run_until_idle()
+
+    assert len(await _review_jobs(bound_session_local)) == 1
+
+
+async def test_the_start_instant_is_part_of_the_review_identity(bound_session_local, _reviews_on) -> None:
+    """Documented on purpose: a review is owed for a VISIT, and a visit is a
+    booking at a time. Two different proven starts are two different visits, so
+    they do not share one key — the same rule the reminder queue uses."""
+    starts_at = await _seed_lifecycle(bound_session_local)
+    first = easyweek_review_dedupe_key(booking_uuid=uuid.UUID(TEST_BOOKING_UUID), starts_at=starts_at)
+    moved = easyweek_review_dedupe_key(
+        booking_uuid=uuid.UUID(TEST_BOOKING_UUID), starts_at=starts_at + timedelta(hours=1)
+    )
+    assert first != moved
+
+
+# --- transaction atomicity --------------------------------------------------
+
+
+async def test_a_failure_after_planning_leaves_no_job_and_a_recoverable_event(
+    bound_session_local, _reviews_on, monkeypatch
+) -> None:
+    """The job and the event's terminal status commit together, or not at all."""
+    starts_at = await _seed_lifecycle(bound_session_local)
+
+    boom = {"raised": False}
+    real_mark_processed = worker.mark_processed
+
+    def _explode(event):
+        # After plan_review_job has already INSERTed, before the transaction ends.
+        if event.event_hint == "booking-succeeded" and not boom["raised"]:
+            boom["raised"] = True
+            raise RuntimeError("injected failure after planning")
+        return real_mark_processed(event)
+
+    monkeypatch.setattr(worker, "mark_processed", _explode)
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            event_id = await _capture(
+                session, _at(_succeeded(), starts_at), event_hint="booking-succeeded", payload_hash="h-s1"
+            )
+    await _run_until_idle()
+
+    assert boom["raised"], "the injected failure must actually have fired"
+    assert await _review_jobs(bound_session_local) == [], "a rolled-back transaction leaves no job"
+    async with bound_session_local() as session:
+        event = (await session.execute(select(EasyWeekEvent).where(EasyWeekEvent.id == event_id))).scalars().one()
+        assert event.status == "captured", "the event stays recoverable, never stranded in processing"
+        assert event.processed_at is None
+
+    # With the fault gone the very same event produces exactly one review.
+    monkeypatch.setattr(worker, "mark_processed", real_mark_processed)
+    async with bound_session_local() as session:
+        async with session.begin():
+            await session.execute(update(EasyWeekEvent).where(EasyWeekEvent.id == event_id).values(next_retry_at=None))
+    await _run_until_idle()
+
+    async with bound_session_local() as session:
+        event = (await session.execute(select(EasyWeekEvent).where(EasyWeekEvent.id == event_id))).scalars().one()
+        assert event.status == "processed"
+    assert len(await _review_jobs(bound_session_local)) == 1
+
+
+async def test_a_deterministic_invalid_succeeded_leaves_the_domain_untouched(bound_session_local, _reviews_on) -> None:
+    starts_at = await _seed_lifecycle(bound_session_local)
+    baseline = await _domain_snapshot(bound_session_local)
+
+    poisoned = _at(_succeeded(), starts_at)
+    poisoned["location_id"] = FOREIGN_LOCATION_ID
+    async with bound_session_local() as session:
+        async with session.begin():
+            event_id = await _capture(session, poisoned, event_hint="booking-succeeded", payload_hash="h-bad")
+    await _run_until_idle()
+
+    async with bound_session_local() as session:
+        event = (await session.execute(select(EasyWeekEvent).where(EasyWeekEvent.id == event_id))).scalars().one()
+        assert event.status == "failed"
+        assert event.error_code == "foreign_location"
+    assert await _review_jobs(bound_session_local) == []
+    assert await _domain_snapshot(bound_session_local) == baseline
+
+
+# --- the flags --------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("label", "notifications", "reviews"),
+    [
+        ("both-off", False, False),
+        ("reviews-only", False, True),
+        ("notifications-only", True, False),
+    ],
+)
+async def test_a_succeeded_delivery_waits_until_both_switches_are_on(
+    bound_session_local, monkeypatch, label: str, notifications: bool, reviews: bool
+) -> None:
+    """Never destroyed by a configuration state, only deferred."""
+    monkeypatch.setattr(settings, "easyweek_notifications_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_reviews_enabled", True, raising=False)
+    starts_at = await _seed_lifecycle(bound_session_local)
+
+    monkeypatch.setattr(settings, "easyweek_notifications_enabled", notifications, raising=False)
+    monkeypatch.setattr(settings, "easyweek_reviews_enabled", reviews, raising=False)
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            event_id = await _capture(
+                session, _at(_succeeded(), starts_at), event_hint="booking-succeeded", payload_hash="h-s1"
+            )
+    await _run_until_idle()
+
+    async with bound_session_local() as session:
+        event = (await session.execute(select(EasyWeekEvent).where(EasyWeekEvent.id == event_id))).scalars().one()
+        assert event.status == "captured", label
+        assert event.processed_at is None, label
+        assert event.error_code is None, label
+    assert await _review_jobs(bound_session_local) == [], label
+
+
+async def test_turning_both_switches_on_processes_the_waiting_delivery_once(bound_session_local, monkeypatch) -> None:
+    monkeypatch.setattr(settings, "easyweek_notifications_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_reviews_enabled", False, raising=False)
+    starts_at = await _seed_lifecycle(bound_session_local)
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, _at(_succeeded(), starts_at), event_hint="booking-succeeded", payload_hash="h-s1")
+    await _run_until_idle()
+    assert await _review_jobs(bound_session_local) == []
+
+    monkeypatch.setattr(settings, "easyweek_reviews_enabled", True, raising=False)
+    await _run_until_idle()
+
+    assert len(await _review_jobs(bound_session_local)) == 1
+
+
+async def test_the_send_fence_is_not_a_planning_switch(bound_session_local, monkeypatch) -> None:
+    """`review_send_enabled` governs sending only; it plans nothing."""
+    monkeypatch.setattr(settings, "easyweek_notifications_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_reviews_enabled", False, raising=False)
+    monkeypatch.setattr(settings, "easyweek_review_send_enabled", True, raising=False)
+    starts_at = await _seed_lifecycle(bound_session_local)
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, _at(_succeeded(), starts_at), event_hint="booking-succeeded", payload_hash="h-s1")
+    await _run_until_idle()
+
+    assert await _review_jobs(bound_session_local) == []
+
+
+# --- causal ordering --------------------------------------------------------
+
+
+async def test_a_deferred_succeeded_never_blocks_a_later_lifecycle_event(bound_session_local, monkeypatch) -> None:
+    """A feature nobody switched on must not stall confirmations."""
+    monkeypatch.setattr(settings, "easyweek_notifications_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_reviews_enabled", False, raising=False)
+    starts_at = await _seed_lifecycle(bound_session_local)
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            succeeded_id = await _capture(
+                session, _at(_succeeded(), starts_at), event_hint="booking-succeeded", payload_hash="h-s1"
+            )
+    await _run_until_idle()
+
+    # A LATER delivery of the same booking, sitting behind the deferred one.
+    later = _at(booking_updated(), starts_at)
+    later["booking_attributes.booking_comment"] = "later edit"
+    async with bound_session_local() as session:
+        async with session.begin():
+            later_id = await _capture(session, later, event_hint="booking-updated", payload_hash="h-later")
+    await _run_until_idle()
+
+    async with bound_session_local() as session:
+        rows = {row.id: row.status for row in (await session.execute(select(EasyWeekEvent))).scalars().all()}
+    assert rows[succeeded_id] == "captured", "still waiting for review planning"
+    assert rows[later_id] == "processed", "the lifecycle event must not be blocked by it"
+
+
+async def test_another_booking_is_unaffected_by_a_deferred_succeeded(bound_session_local, monkeypatch) -> None:
+    monkeypatch.setattr(settings, "easyweek_notifications_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_reviews_enabled", False, raising=False)
+    starts_at = await _seed_lifecycle(bound_session_local)
+
+    other = _at(booking_created(), starts_at)
+    other["uid"] = "33333333-4444-4555-8666-777777777777"
+    other["id"] = TEST_BOOKING_ID + 5
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, _at(_succeeded(), starts_at), event_hint="booking-succeeded", payload_hash="h-s1")
+            other_id = await _capture(session, other, payload_hash="h-other")
+    await _run_until_idle()
+
+    async with bound_session_local() as session:
+        event = (await session.execute(select(EasyWeekEvent).where(EasyWeekEvent.id == other_id))).scalars().one()
+        assert event.status == "processed"
+
+
+# --- the suppression / isolation matrix --------------------------------------
+
+
+async def _succeeded_earns_nothing(bound_session_local, payload: dict, *, expected_status: str = "processed") -> None:
+    async with bound_session_local() as session:
+        async with session.begin():
+            event_id = await _capture(session, payload, event_hint="booking-succeeded", payload_hash="h-neg")
+    await _run_until_idle()
+
+    async with bound_session_local() as session:
+        event = (await session.execute(select(EasyWeekEvent).where(EasyWeekEvent.id == event_id))).scalars().one()
+        assert event.status == expected_status, event.error_code
+    assert await _review_jobs(bound_session_local) == []
+
+
+async def test_a_succeeded_without_a_record_earns_nothing(bound_session_local, _reviews_on) -> None:
+    """No lifecycle event ever created this booking."""
+    await _succeeded_earns_nothing(bound_session_local, _at(_succeeded(), _future(days=3) - timedelta(days=3)))
+
+
+@pytest.mark.parametrize(
+    ("label", "mutate"),
+    [
+        ("other-booking-uuid", {"uid": "33333333-4444-4555-8666-777777777777"}),
+        ("other-numeric-id", {"id": TEST_BOOKING_ID + 99}),
+    ],
+)
+async def test_a_succeeded_whose_identity_disagrees_earns_nothing(
+    bound_session_local, _reviews_on, label: str, mutate: dict
+) -> None:
+    starts_at = await _seed_lifecycle(bound_session_local)
+    payload = _at(_succeeded(), starts_at)
+    payload.update(mutate)
+    await _succeeded_earns_nothing(bound_session_local, payload)
+
+
+@pytest.mark.parametrize(
+    ("label", "review_url"),
+    [
+        ("missing", _UNSET_REVIEW),
+        ("null", None),
+        ("manage-link", f"https://eyw.me/r/{TEST_BOOKING_HASH_ID}"),
+        ("malformed", "not-a-url"),
+        ("http", f"http://eyw.me/f/{TEST_BOOKING_HASH_ID}"),
+        ("other-hash", "https://eyw.me/f/12345678"),
+        ("other-host", f"https://evil.invalid/f/{TEST_BOOKING_HASH_ID}"),
+    ],
+)
+async def test_an_unprovable_review_link_earns_nothing(
+    bound_session_local, _reviews_on, label: str, review_url: object
+) -> None:
+    starts_at = await _seed_lifecycle(bound_session_local)
+    await _succeeded_earns_nothing(bound_session_local, _at(_succeeded(review_url=review_url), starts_at))
+
+
+async def test_an_opted_out_client_earns_nothing(bound_session_local, _reviews_on) -> None:
+    starts_at = await _seed_lifecycle(bound_session_local)
+    async with bound_session_local() as session:
+        async with session.begin():
+            await session.execute(update(Client).where(Client.provider == "easyweek").values(wa_opted_out=True))
+
+    await _succeeded_earns_nothing(bound_session_local, _at(_succeeded(), starts_at))
+
+
+async def test_a_cancelled_booking_earns_nothing(bound_session_local, _reviews_on) -> None:
+    starts_at = await _seed_lifecycle(bound_session_local)
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(
+                session, _at(booking_canceled(), starts_at), event_hint="booking-canceled", payload_hash="h-cancel"
+            )
+    await _run_until_idle()
+
+    await _succeeded_earns_nothing(bound_session_local, _at(_succeeded(), starts_at))
+
+
+async def test_a_disallowed_category_earns_nothing(bound_session_local, _reviews_on, monkeypatch) -> None:
+    starts_at = await _seed_lifecycle(bound_session_local)
+    monkeypatch.setattr(settings, "easyweek_allowed_service_categories", json.dumps(["Something Else"]), raising=False)
+
+    await _succeeded_earns_nothing(bound_session_local, _at(_succeeded(), starts_at))
+
+
+async def test_a_multi_service_booking_earns_nothing(bound_session_local, _reviews_on) -> None:
+    starts_at = await _seed_lifecycle(bound_session_local)
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(
+                session,
+                _at(booking_created_multi_service(), starts_at),
+                event_hint="booking-updated",
+                payload_hash="h-multi",
+            )
+    await _run_until_idle()
+
+    await _succeeded_earns_nothing(bound_session_local, _at(_succeeded(), starts_at))
+
+
+async def test_a_visit_more_than_three_days_ago_earns_nothing(bound_session_local, _reviews_on) -> None:
+    """No historical backfill: the moment to ask has passed."""
+    starts_at = await _seed_lifecycle(bound_session_local, start=utcnow() - timedelta(days=5))
+    await _succeeded_earns_nothing(bound_session_local, _at(_succeeded(), starts_at))
+
+
+async def test_a_broken_allowlist_keeps_the_succeeded_recoverable(
+    bound_session_local, _reviews_on, monkeypatch
+) -> None:
+    """Configuration unavailable is not a decision to suppress the review."""
+    starts_at = await _seed_lifecycle(bound_session_local)
+    monkeypatch.setattr(settings, "easyweek_allowed_service_categories", "{invalid", raising=False)
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            event_id = await _capture(
+                session, _at(_succeeded(), starts_at), event_hint="booking-succeeded", payload_hash="h-cfg"
+            )
+    await _run_until_idle()
+
+    async with bound_session_local() as session:
+        event = (await session.execute(select(EasyWeekEvent).where(EasyWeekEvent.id == event_id))).scalars().one()
+        assert event.status == "captured", "a broken allowlist must not consume the event"
+        assert event.processed_at is None
+    assert await _review_jobs(bound_session_local) == []
+
+
+async def test_no_review_refusal_ever_records_customer_data(bound_session_local, _reviews_on) -> None:
+    """error_code and last_error reach the logs and the ops cabinet."""
+    starts_at = await _seed_lifecycle(bound_session_local)
+    payload = _at(_succeeded(review_url="https://evil.invalid/f/12345678"), starts_at)
+    payload["location_id"] = FOREIGN_LOCATION_ID
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            event_id = await _capture(session, payload, event_hint="booking-succeeded", payload_hash="h-pii")
+    await _run_until_idle()
+
+    async with bound_session_local() as session:
+        event = (await session.execute(select(EasyWeekEvent).where(EasyWeekEvent.id == event_id))).scalars().one()
+    text = f"{event.error_code}"
+    for leak in ("evil.invalid", "eyw.me", "Fixture", "+49", "@example", "http"):
+        assert leak not in text, leak
 
 
 # ===========================================================================
@@ -1322,7 +1935,7 @@ async def test_truncated_body_is_failed_not_processed(bound_session_local) -> No
         assert event.error_code == "truncated_payload"
 
 
-async def test_booking_succeeded_is_processed_without_side_effects(bound_session_local) -> None:
+async def test_booking_succeeded_is_processed_without_side_effects(bound_session_local, _reviews_on) -> None:
     async with bound_session_local() as session:
         async with session.begin():
             await _capture(session, booking_created(), event_hint="booking-succeeded", payload_hash="h1")
@@ -1950,7 +2563,7 @@ async def test_domain_writes_and_event_status_never_disagree(bound_session_local
 # ===========================================================================
 
 
-async def test_processed_rows_have_a_timestamp_and_no_error_code(bound_session_local) -> None:
+async def test_processed_rows_have_a_timestamp_and_no_error_code(bound_session_local, _reviews_on) -> None:
     async with bound_session_local() as session:
         async with session.begin():
             await _capture(session, booking_created(), payload_hash="h1")
@@ -2007,7 +2620,7 @@ async def test_captured_rows_after_a_transient_fault_stay_pristine(bound_session
 # ===========================================================================
 
 
-async def test_succeeded_for_our_location_is_processed_without_side_effects(bound_session_local) -> None:
+async def test_succeeded_for_our_location_is_processed_without_side_effects(bound_session_local, _reviews_on) -> None:
     async with bound_session_local() as session:
         async with session.begin():
             await _capture(session, booking_created(), event_hint="booking-succeeded", payload_hash="h1")
@@ -2029,7 +2642,9 @@ async def test_succeeded_for_our_location_is_processed_without_side_effects(boun
         (lambda p: p.pop("location_id"), False, "invalid_location_id"),
     ],
 )
-async def test_invalid_succeeded_events_fail_closed(bound_session_local, mutate, truncated, expected) -> None:
+async def test_invalid_succeeded_events_fail_closed(
+    bound_session_local, _reviews_on, mutate, truncated, expected
+) -> None:
     """A foreign or malformed `booking-succeeded` must NOT be marked processed."""
     payload = booking_created()
     mutate(payload)
@@ -3707,7 +4322,7 @@ async def test_recovered_normal_processing_clears_the_retry_timestamp(bound_sess
     assert row.processing_attempts == 3, "attempt history is audit data and is kept"
 
 
-async def test_recovered_booking_succeeded_clears_the_retry_timestamp(bound_session_local) -> None:
+async def test_recovered_booking_succeeded_clears_the_retry_timestamp(bound_session_local, _reviews_on) -> None:
     """An early-return terminal branch used to keep a future retry timestamp."""
     async with bound_session_local() as session:
         async with session.begin():
