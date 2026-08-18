@@ -970,7 +970,8 @@ def _easyweek_review_presend_error(
     if services_count_from_record_raw(record.raw) != 1:
         return "EasyWeek review refused: services_count_unproven"
 
-    # The link, re-proven against the hash this booking owns. A review URL that
+    # The link, re-resolved from configuration and matched against the
+    # one this job was planned with. A review URL that
     # no longer matches is a link to somebody else's appointment.
     if easyweek_review_url_for_send(job, record) is None:
         return "EasyWeek review refused: review_url_unproven"
@@ -981,9 +982,17 @@ def _easyweek_review_presend_error(
 def easyweek_review_url_for_send(job: MessageJob, record: Record | None) -> str | None:
     """The one link an EasyWeek review may carry, or ``None``.
 
-    Only the payload value, and only after it re-proves against the Record's
-    booking hash. Never ``Record.short_link`` (that is the MANAGE link), never
-    the static booking page, never ``GOOGLE_MAPS_REVIEW_LINKS``.
+    PR-10: the link comes from ``EASYWEEK_GOOGLE_REVIEW_LINKS``, resolved by
+    ``company_id`` and re-proven on every attempt — EasyWeek sends no
+    ``review_url`` at all. The payload value is not a source; it is only
+    compared, so a link that changed after planning is refused rather than
+    silently swapped.
+
+    The booking hash no longer sources anything and is checked only as proof
+    that the booking is identifiable. Never ``Record.short_link`` (the MANAGE
+    link), never the static booking page, and never
+    ``GOOGLE_MAPS_REVIEW_LINKS`` — that map is Altegio's and is keyed by an
+    Altegio company id sharing an integer space with EasyWeek location ids.
     """
     payload = getattr(job, "payload", None)
     if not isinstance(payload, dict) or record is None:

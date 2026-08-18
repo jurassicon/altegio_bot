@@ -2562,11 +2562,18 @@ Read-only проверка эффективной карты (печатает �
 без самих ссылок):
 
 ```bash
-docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml exec -T altegio-easyweek-inbox-worker /app/.venv/bin/python -c 'from altegio_bot.easyweek_review import parse_google_review_links; from altegio_bot.settings import settings; m = parse_google_review_links(settings.easyweek_google_review_links); print({"configured": m.configured, "valid": m.valid, "ready": m.ready, "companies": sorted(m.links)})'
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml run --rm --no-deps --entrypoint /app/.venv/bin/python altegio-easyweek-inbox-worker -c 'from altegio_bot.easyweek_review import parse_google_review_links; from altegio_bot.settings import settings; m = parse_google_review_links(settings.easyweek_google_review_links); print({"configured": m.configured, "valid": m.valid, "ready": m.ready, "companies": sorted(m.links)})'
 ```
 
 Ожидается `ready=True` и ваш `company_id` в `companies`. `valid=False` —
 **STOP**: карта непригодна целиком, чинить до включения планирования.
+
+Команда намеренно `run --rm --no-deps`, а не `exec`. Самое вероятное действие
+после STOP — починить карту в `easyweek.env` и перепроверить, но `exec` читает
+окружение, с которым контейнер был **создан**, и покажет старую сломанную карту.
+Одноразовый контейнер читает `env_file` заново. Это та же ловушка, что снял
+P1-фикс PR-9 (шаг 8 в 13.2). Вывод печатает только количество и список
+`company_id` — сами ссылки не выводятся никогда.
 
 ### 13.1 Пятый webhook
 

@@ -533,7 +533,11 @@ def test_the_env_example_names_both_consuming_services() -> None:
 def test_the_link_map_is_kept_out_of_the_location_registry() -> None:
     """A typo in a review link must not take lifecycle and reminders down."""
     text = (REPO_ROOT / "easyweek.env.example").read_text()
-    registry_line = next(line for line in text.splitlines() if line.startswith("EASYWEEK_LOCATION_MAP="))
+    registry_line = next(
+        (line for line in text.splitlines() if line.startswith("EASYWEEK_LOCATION_MAP=")),
+        None,
+    )
+    assert registry_line is not None, "easyweek.env.example must still ship EASYWEEK_LOCATION_MAP"
 
     assert "g.page" not in registry_line
     assert "review" not in registry_line.lower()
@@ -552,7 +556,7 @@ def test_the_runbook_explains_that_the_link_is_ours() -> None:
     assert "не payload" in section or "а не payload" in section
 
 
-def test_the_runbook_check_prints_no_links(self=None) -> None:
+def test_the_runbook_check_prints_no_links() -> None:
     """The operator command reports counts and branches, never the URLs."""
     text = (REPO_ROOT / "docs/easyweek/durlach_activation_runbook.md").read_text()
     section = text[text.index("### 13.0") : text.index("### 13.1")]
@@ -561,3 +565,21 @@ def test_the_runbook_check_prints_no_links(self=None) -> None:
     assert "sorted(m.links)" in command, "keys only"
     assert "m.links.values" not in command
     assert "print(settings.easyweek_google_review_links" not in command
+
+
+def test_the_runbook_map_check_survives_an_env_edit() -> None:
+    """`exec` reads the environment the container was CREATED with.
+
+    The most likely action after a STOP is fixing `easyweek.env` and checking
+    again — and `exec` would show the old broken map. Same trap PR-9's step 8
+    already removed.
+    """
+    text = (REPO_ROOT / "docs/easyweek/durlach_activation_runbook.md").read_text()
+    section = text[text.index("### 13.0") : text.index("### 13.1")]
+    command = section[section.index("```bash") : section.index("```", section.index("```bash") + 7)]
+
+    assert "run --rm --no-deps" in command
+    assert "exec -T" not in command, "a re-check after an env edit must not use exec"
+    assert "--entrypoint /app/.venv/bin/python" in command
+    # And the reason has to be written down, not just implied by the command.
+    assert "exec" in section and "созда" in section

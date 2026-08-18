@@ -276,7 +276,9 @@ def parse_google_review_links(raw: object) -> GoogleReviewLinks:
     if not isinstance(raw, str):
         return GoogleReviewLinks(configured=True, valid=False)
     text = raw.strip()
-    if not text or text == "{}":
+    # `{}` and `{ }` are one intention written two ways; both mean "nothing
+    # configured here yet", not "configured wrongly".
+    if not text or text.replace(" ", "") == "{}":
         return GoogleReviewLinks(configured=False, valid=True)
 
     # The hook fires ONLY for JSON objects, and it sees the duplicate keys
@@ -325,7 +327,11 @@ def _canonical_company_id(key: object) -> int | None:
         value = key
     elif isinstance(key, str):
         candidate = key.strip()
-        if not candidate or not candidate.lstrip("+").isdigit():
+        # ASCII digits only, and no sign: `str.isdigit()` accepts Arabic-Indic
+        # and other Unicode digits, and a leading `+` would silently make a
+        # second valid key for the same branch written differently. Softer than the
+        # fail-closed discipline around it.
+        if not candidate or not candidate.isascii() or not candidate.isdecimal():
             return None
         try:
             value = int(candidate)

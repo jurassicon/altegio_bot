@@ -1013,7 +1013,13 @@ async def test_a_branch_without_a_configured_link_is_red(session_maker, monkeypa
         ("duplicate", '{"%d": "%s", "%d": "%s"}' % (COMPANY_ID, REVIEW_URL, COMPANY_ID, OTHER_REVIEW_URL)),
     ],
 )
-async def test_an_unusable_link_map_is_red(session_maker, monkeypatch, label: str, raw: str) -> None:
+async def test_an_unusable_link_map_stops_before_the_queue(session_maker, monkeypatch, label: str, raw: str) -> None:
+    """The map is a statement about the whole rollout, not about one row.
+
+    Reported per-row it would be invisible on the very rollout that needs it:
+    a broken map means the planner created nothing, so the queue is empty and
+    the report would read "candidate_count=0, STOP" with no hint of the cause.
+    """
     monkeypatch.setattr(settings, "easyweek_google_review_links", raw, raising=False)
     async with session_maker() as session:
         async with session.begin():
@@ -1021,8 +1027,23 @@ async def test_an_unusable_link_map_is_red(session_maker, monkeypatch, label: st
 
     report = await _run(session_maker)
 
-    assert report.reasons == {"review_link_invalid": 1}, label
+    assert report.config_error == "review_links_invalid", label
     assert report.ready is False
+    assert report.reasons == {}, "the queue must not be read at all"
+    assert report.candidate_count == 0
+
+
+async def test_an_unconfigured_link_map_is_distinguished_from_an_invalid_one(session_maker, monkeypatch) -> None:
+    """ "Never set up" and "set up wrongly" are different operator actions."""
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_review(session)
+
+    monkeypatch.setattr(settings, "easyweek_google_review_links", "", raising=False)
+    assert (await _run(session_maker)).config_error == "review_links_unconfigured"
+
+    monkeypatch.setattr(settings, "easyweek_google_review_links", "{not json", raising=False)
+    assert (await _run(session_maker)).config_error == "review_links_invalid"
 
 
 async def test_a_link_that_changed_after_planning_is_red(session_maker) -> None:
@@ -1038,7 +1059,7 @@ async def test_a_link_that_changed_after_planning_is_red(session_maker) -> None:
 
 
 async def test_an_unconfigured_map_stops_the_whole_queue(session_maker, monkeypatch) -> None:
-    """Nothing can be proven without the map; the queue is not green."""
+    """Nothing can be proven without the map; the queue is not even read."""
     monkeypatch.setattr(settings, "easyweek_google_review_links", "", raising=False)
     async with session_maker() as session:
         async with session.begin():
@@ -1047,4 +1068,5 @@ async def test_an_unconfigured_map_stops_the_whole_queue(session_maker, monkeypa
     report = await _run(session_maker)
 
     assert report.ready is False
-    assert PROVEN not in report.reasons
+    assert report.config_error == "review_links_unconfigured"
+    assert report.reasons == {}

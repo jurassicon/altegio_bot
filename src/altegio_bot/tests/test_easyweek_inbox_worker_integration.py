@@ -1269,13 +1269,103 @@ async def test_the_payload_link_is_ignored_entirely(
         ("legacy-array", '["https://g.page/r/T/review"]'),
     ],
 )
-async def test_an_unprovable_configured_link_earns_nothing(
+async def test_an_unprovable_configured_link_leaves_the_event_recoverable(
     bound_session_local, _reviews_on, monkeypatch, label: str, config: str
 ) -> None:
-    """Fail-closed: no provable link, no review job — and the event survives."""
+    """A broken map is configuration, not a verdict on this booking.
+
+    Terminalizing here would mean that once the map is fixed, this real
+    finished visit could never be asked for a review — the row is never
+    revisited. So it stays `captured` and immediately claimable, exactly like a
+    broken category allowlist.
+    """
     monkeypatch.setattr(settings, "easyweek_google_review_links", config, raising=False)
     starts_at = await _seed_lifecycle(bound_session_local)
-    await _succeeded_earns_nothing(bound_session_local, _at(_succeeded(), starts_at))
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            event_id = await _capture(
+                session, _at(_succeeded(), starts_at), event_hint="booking-succeeded", payload_hash="h-recover"
+            )
+    await _run_until_idle()
+
+    async with bound_session_local() as session:
+        event = (await session.execute(select(EasyWeekEvent).where(EasyWeekEvent.id == event_id))).scalars().one()
+
+    assert event.status == "captured", f"{label}: must stay claimable"
+    assert event.processed_at is None
+    assert event.processing_attempts == 0, "a rolled-back claim must not burn an attempt"
+    assert await _review_jobs(bound_session_local) == []
+
+
+async def test_fixing_the_map_lets_the_waiting_event_earn_its_review(
+    bound_session_local, _reviews_on, monkeypatch
+) -> None:
+    """The whole point of staying recoverable."""
+    monkeypatch.setattr(settings, "easyweek_google_review_links", "{not json", raising=False)
+    starts_at = await _seed_lifecycle(bound_session_local)
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(
+                session, _at(_succeeded(), starts_at), event_hint="booking-succeeded", payload_hash="h-fixme"
+            )
+    await _run_until_idle()
+    assert await _review_jobs(bound_session_local) == []
+
+    monkeypatch.setattr(
+        settings, "easyweek_google_review_links", json.dumps({str(TEST_LOCATION_ID): REVIEW_URL}), raising=False
+    )
+    await _run_until_idle()
+
+    jobs = await _review_jobs(bound_session_local)
+    assert len(jobs) == 1, "the same captured event now earns exactly one review"
+    assert jobs[0].payload["review_url"] == REVIEW_URL
+
+
+async def test_past_the_delivery_deadline_the_wait_becomes_terminal(
+    bound_session_local, _reviews_on, monkeypatch
+) -> None:
+    """The window is bounded by the deadline the outbox already enforces.
+
+    While the event waits it is a predecessor, so the whole booking's lifecycle
+    queues behind it. Past `run_at + 24h` the review could not be delivered
+    anyway, so "no review" becomes final and the queue is released.
+    """
+    monkeypatch.setattr(settings, "easyweek_google_review_links", "{not json", raising=False)
+    # Started long enough ago that starts_at + 3d + 24h is already behind us.
+    starts_at = await _seed_lifecycle(bound_session_local, start=_future(days=3) - timedelta(days=9))
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            event_id = await _capture(
+                session, _at(_succeeded(), starts_at), event_hint="booking-succeeded", payload_hash="h-expired"
+            )
+    await _run_until_idle()
+
+    async with bound_session_local() as session:
+        event = (await session.execute(select(EasyWeekEvent).where(EasyWeekEvent.id == event_id))).scalars().one()
+
+    assert event.status == "processed", "past the deadline the answer is final"
+    assert await _review_jobs(bound_session_local) == []
+
+
+async def test_a_broken_map_does_not_spin_the_worker(bound_session_local, _reviews_on, monkeypatch) -> None:
+    """A rolled-back claim is not work, so the loop must pause between tries.
+
+    Reporting work here would spin claim -> rollback -> claim at full speed for
+    as long as the configuration stayed broken, with a warning per iteration.
+    """
+    monkeypatch.setattr(settings, "easyweek_google_review_links", "{not json", raising=False)
+    starts_at = await _seed_lifecycle(bound_session_local)
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, _at(_succeeded(), starts_at), event_hint="booking-succeeded", payload_hash="h-spin")
+
+    did_work = await worker.process_one()
+
+    assert did_work is False, "a recoverable rollback must let the loop sleep"
 
 
 async def test_an_opted_out_client_earns_nothing(bound_session_local, _reviews_on) -> None:

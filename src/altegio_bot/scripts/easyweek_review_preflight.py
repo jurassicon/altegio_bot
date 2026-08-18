@@ -49,7 +49,10 @@ from altegio_bot.easyweek_branches import branch_template_contract
 from altegio_bot.easyweek_policy import REVIEW_3D
 from altegio_bot.easyweek_review import (
     REVIEW_LINK_MISSING,
+    REVIEW_LINKS_INVALID,
+    REVIEW_LINKS_UNCONFIGURED,
     google_review_url_for_company,
+    parse_google_review_links,
     validate_google_review_url,
 )
 from altegio_bot.easyweek_service_category import evaluate_service_category
@@ -179,6 +182,16 @@ def rollout_state_error() -> str | None:
         return REASON_PLANNING_DISABLED
     if bool(getattr(settings, "easyweek_review_send_enabled", False)):
         return REASON_SEND_FENCE_OPEN
+
+    # PR-10. Without a usable link map the planner creates nothing, so the queue
+    # is empty for a reason that has nothing to do with the queue. Reported here
+    # rather than per-row: otherwise the first rollout reads "candidate_count=0,
+    # STOP" and the operator never learns the map is the cause.
+    links = parse_google_review_links(settings.easyweek_google_review_links)
+    if not links.configured:
+        return REVIEW_LINKS_UNCONFIGURED
+    if not links.valid:
+        return REVIEW_LINKS_INVALID
     return None
 
 
@@ -331,7 +344,8 @@ async def check_review_job(session: AsyncSession, job: MessageJob) -> str:
     if link_error == REVIEW_LINK_MISSING:
         return REASON_REVIEW_LINK_MISSING
     if link_error is not None:
-        return REASON_REVIEW_LINK_INVALID
+        # "Never set up" and "set up wrongly" are different operator actions.
+        return link_error
     planned_url = validate_google_review_url((job.payload or {}).get("review_url"))
     if planned_url is None:
         return REASON_REVIEW_LINK_INVALID

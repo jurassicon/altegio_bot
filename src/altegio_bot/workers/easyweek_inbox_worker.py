@@ -73,7 +73,12 @@ from ..easyweek_policy import (
     REVIEW_3D,
 )
 from ..easyweek_reminders import plan_reminders, reminder_job_payload
-from ..easyweek_review import google_review_url_for_company, plan_review, review_job_payload
+from ..easyweek_review import (
+    google_review_url_for_company,
+    plan_review,
+    review_job_payload,
+    review_run_at,
+)
 from ..easyweek_service_category import (
     evaluate_service_category,
     parse_allowed_service_categories,
@@ -123,6 +128,11 @@ SUCCEEDED_EVENT_HINT = "booking-succeeded"
 
 STATUS_PROCESSED = "processed"
 STATUS_FAILED = "failed"
+
+
+# Last recoverable configuration reason announced, so a broken map is logged
+# once per state rather than once per poll. Reset as soon as anything succeeds.
+_last_recoverable_reason: str | None = None
 
 
 class RecoverableCategoryConfigurationError(RuntimeError):
@@ -955,8 +965,31 @@ async def plan_review_job(
         settings.easyweek_google_review_links,
     )
     if link_error is not None:
+        # Configuration state, not a decision — exactly like a broken category
+        # allowlist three checks above, and handled by the SAME mechanism. A
+        # plain `return` here would terminalize a real finished visit, and once
+        # the map is fixed that customer could never be asked for a review.
+        #
+        # `review_link_missing` counts as configuration too: a branch absent
+        # from the map is far more often a typo in the key than a deliberate
+        # decision to skip that salon's reviews.
+        #
+        # The window is NOT open-ended. While this event stays `captured` it is
+        # a predecessor, so every later lifecycle event for the same booking
+        # waits behind it — a branch missing from the map would otherwise
+        # freeze its own confirmations and reschedules forever. The bound is
+        # the delivery deadline the outbox already enforces: `run_at + 24h`,
+        # reusing that exact definition rather than inventing a second one.
+        # Past it the review cannot be delivered anyway, so "no review" becomes
+        # the final answer and the booking's queue is released.
+        from altegio_bot.workers.outbox_worker import _MARKETING_TRANSIENT_RETRY_CAP
+
+        deadline = review_run_at(record.starts_at) + _MARKETING_TRANSIENT_RETRY_CAP if record.starts_at else None
+        if deadline is not None and utcnow() <= deadline:
+            raise RecoverableCategoryConfigurationError(link_error)
+
         logger.info(
-            "easyweek review skipped event=%s record_id=%s reason=%s",
+            "easyweek review skipped event=%s record_id=%s reason=%s_deadline_passed",
             event.id,
             record.id,
             link_error,
@@ -1367,15 +1400,25 @@ async def process_one() -> bool:
         # error renders the statement WITH its bound parameters, which here
         # means the customer's phone, e-mail, name and comment.
         if isinstance(exc, RecoverableCategoryConfigurationError):
-            logger.warning(
-                "easyweek event=%s configuration_unavailable reason=%s",
-                transient_event_id,
-                exc.reason,
-            )
+            global _last_recoverable_reason
+            if _last_recoverable_reason != exc.reason:
+                # Once per state, not once per iteration: a broken map is one
+                # fact, and repeating it every poll buries everything else.
+                logger.warning(
+                    "easyweek event=%s configuration_unavailable reason=%s",
+                    transient_event_id,
+                    exc.reason,
+                )
+                _last_recoverable_reason = exc.reason
             # The outer transaction already rolled the claim and all domain
             # writes back. Do not add a retry timestamp: as soon as the config
             # is fixed this captured row must be immediately claimable again.
-            return True
+            #
+            # `False` on purpose: nothing was accomplished, so the caller sleeps
+            # its normal poll interval. Reporting work here would spin
+            # claim -> rollback -> claim at full speed for as long as the
+            # configuration stays broken.
+            return False
         logger.error(
             "easyweek event=%s processing_error type=%s",
             transient_event_id,
@@ -1508,6 +1551,11 @@ async def run_loop(
             continue
 
         consecutive_errors = 0
+        if did_work:
+            # Something completed, so any earlier configuration complaint is
+            # stale; the next one deserves to be heard.
+            global _last_recoverable_reason
+            _last_recoverable_reason = None
         if not did_work:
             await _sleep_unless_stopping(effective_poll_sec, stop_event)
 
