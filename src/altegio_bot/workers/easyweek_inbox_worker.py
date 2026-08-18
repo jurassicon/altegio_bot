@@ -73,7 +73,7 @@ from ..easyweek_policy import (
     REVIEW_3D,
 )
 from ..easyweek_reminders import plan_reminders, reminder_job_payload
-from ..easyweek_review import plan_review, review_job_payload
+from ..easyweek_review import google_review_url_for_company, plan_review, review_job_payload
 from ..easyweek_service_category import (
     evaluate_service_category,
     parse_allowed_service_categories,
@@ -947,11 +947,27 @@ async def plan_review_job(
     if services_count_from_record_raw(record.raw) != 1:  # pragma: no cover - eligibility proves it
         return
 
+    # PR-10: the link is ours, not EasyWeek's. Their payload has no
+    # `review_url` at all, which is why PR-9 never produced a job in
+    # production. Resolved per branch and re-validated inside plan_review.
+    review_url, link_error = google_review_url_for_company(
+        record.company_id,
+        settings.easyweek_google_review_links,
+    )
+    if link_error is not None:
+        logger.info(
+            "easyweek review skipped event=%s record_id=%s reason=%s",
+            event.id,
+            record.id,
+            link_error,
+        )
+        return
+
     planned = plan_review(
         booking_uuid=succeeded.booking_uuid,
         starts_at=record.starts_at,
         now=utcnow(),
-        review_url=succeeded.review_url,
+        review_url=review_url,
         booking_hash_id=record.easyweek_booking_hash_id,
         is_deleted=bool(record.is_deleted),
     )

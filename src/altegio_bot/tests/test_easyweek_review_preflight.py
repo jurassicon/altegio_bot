@@ -67,7 +67,9 @@ from altegio_bot.utils import utcnow
 
 BOOKING = uuid.UUID("11111111-2222-4333-8444-555555555555")
 HASH = "90000001"
-REVIEW_URL = f"https://eyw.me/f/{HASH}"
+REVIEW_URL = "https://g.page/r/CaV0vSmrSYkdEAE/review"
+# PR-10: the link is resolved from our own configuration by company_id.
+OTHER_REVIEW_URL = "https://g.page/r/DifferentTokenAB/review"
 COMPANY_ID = 999501
 OTHER_COMPANY_ID = 999502
 LOCATION_UUID = "dddddddd-eeee-4fff-8000-000000000001"
@@ -83,6 +85,12 @@ def _pr9_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "easyweek_review_send_enabled", False, raising=False)
     monkeypatch.setattr(settings, "easyweek_default_language", "de", raising=False)
     monkeypatch.setattr(settings, "easyweek_allowed_service_categories", json.dumps([CATEGORY]), raising=False)
+    monkeypatch.setattr(
+        settings,
+        "easyweek_google_review_links",
+        json.dumps({str(COMPANY_ID): REVIEW_URL, str(OTHER_COMPANY_ID): OTHER_REVIEW_URL}),
+        raising=False,
+    )
     monkeypatch.setattr(
         settings,
         "easyweek_location_map",
@@ -304,6 +312,8 @@ async def test_two_branches_are_each_proven_against_their_own_configuration(sess
                 session,
                 company_id=OTHER_COMPANY_ID,
                 booking=uuid.UUID("22222222-2222-4333-8444-555555555555"),
+                # Each branch is planned with ITS OWN configured link.
+                review_url=OTHER_REVIEW_URL,
                 suffix="2",
             )
 
@@ -417,10 +427,6 @@ async def test_a_branch_outside_the_registry_is_red(session_maker, monkeypatch) 
         ("client-opted-out", {"opted_out": True}),
         ("client-not-linked", {"link_client": False}),
         ("no-booking-hash", {"booking_hash": None}),
-        ("no-review-url", {"review_url": None}),
-        ("manage-link", {"review_url": f"https://eyw.me/r/{HASH}"}),
-        ("other-hash", {"review_url": "https://eyw.me/f/12345678"}),
-        ("http-link", {"review_url": f"http://eyw.me/f/{HASH}"}),
         ("services-count-two", {"services_count": 2}),
         ("services-count-missing", {"services_count": None}),
     ],
@@ -671,6 +677,7 @@ async def test_one_blocked_candidate_fails_an_otherwise_proven_queue(session_mak
                 session,
                 company_id=OTHER_COMPANY_ID,
                 booking=uuid.UUID("22222222-2222-4333-8444-555555555555"),
+                review_url=OTHER_REVIEW_URL,
                 with_sender=False,
                 suffix="2",
             )
@@ -978,3 +985,66 @@ async def test_a_database_failure_is_red_rather_than_green(monkeypatch) -> None:
 
     monkeypatch.setattr(module, "SessionLocal", _Boom(), raising=False)
     assert await main([]) == 1
+
+
+# ---------------------------------------------------------------------------
+# PR-10: the link is ours, so its failure modes are reported as ours
+# ---------------------------------------------------------------------------
+
+
+async def test_a_branch_without_a_configured_link_is_red(session_maker, monkeypatch) -> None:
+    monkeypatch.setattr(settings, "easyweek_google_review_links", json.dumps({"999999": REVIEW_URL}), raising=False)
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_review(session)
+
+    report = await _run(session_maker)
+
+    assert report.reasons == {"review_link_missing": 1}
+    assert report.ready is False
+
+
+@pytest.mark.parametrize(
+    ("label", "raw"),
+    [
+        ("not-json", "{not json"),
+        ("legacy-array", '["%s"]' % REVIEW_URL),
+        ("bad-url", json.dumps({str(COMPANY_ID): "http://g.page/r/T/review"})),
+        ("duplicate", '{"%d": "%s", "%d": "%s"}' % (COMPANY_ID, REVIEW_URL, COMPANY_ID, OTHER_REVIEW_URL)),
+    ],
+)
+async def test_an_unusable_link_map_is_red(session_maker, monkeypatch, label: str, raw: str) -> None:
+    monkeypatch.setattr(settings, "easyweek_google_review_links", raw, raising=False)
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_review(session)
+
+    report = await _run(session_maker)
+
+    assert report.reasons == {"review_link_invalid": 1}, label
+    assert report.ready is False
+
+
+async def test_a_link_that_changed_after_planning_is_red(session_maker) -> None:
+    """Identity is bound to the planned link, so a swap is refused, not applied."""
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_review(session, review_url=OTHER_REVIEW_URL)
+
+    report = await _run(session_maker)
+
+    assert report.reasons == {"review_link_changed": 1}
+    assert report.ready is False
+
+
+async def test_an_unconfigured_map_stops_the_whole_queue(session_maker, monkeypatch) -> None:
+    """Nothing can be proven without the map; the queue is not green."""
+    monkeypatch.setattr(settings, "easyweek_google_review_links", "", raising=False)
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_review(session)
+
+    report = await _run(session_maker)
+
+    assert report.ready is False
+    assert PROVEN not in report.reasons

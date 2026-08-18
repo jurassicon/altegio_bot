@@ -433,6 +433,12 @@ def _reviews_on(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     monkeypatch.setattr(settings, "easyweek_notifications_enabled", True, raising=False)
     monkeypatch.setattr(settings, "easyweek_reviews_enabled", True, raising=False)
+    monkeypatch.setattr(
+        settings,
+        "easyweek_google_review_links",
+        json.dumps({str(TEST_LOCATION_ID): REVIEW_URL}),
+        raising=False,
+    )
 
 
 @pytest.fixture
@@ -729,7 +735,9 @@ async def test_the_reminder_payload_stays_minimal_and_carries_the_planned_start(
 # `plan_review_job` directly, because the properties worth proving — atomicity,
 # the claim gates, causal ordering — only exist at that level.
 
-REVIEW_URL = f"https://eyw.me/f/{TEST_BOOKING_HASH_ID}"
+# PR-10: our own Google review link for this branch, resolved by company_id.
+# EasyWeek's payload has no review_url at all — that is why PR-9 never fired.
+REVIEW_URL = "https://g.page/r/CaV0vSmrSYkdEAE/review"
 
 
 def _succeeded(*, review_url: object = REVIEW_URL, **overrides) -> dict:
@@ -1072,6 +1080,9 @@ async def test_a_succeeded_delivery_waits_until_both_switches_are_on(
     """Never destroyed by a configuration state, only deferred."""
     monkeypatch.setattr(settings, "easyweek_notifications_enabled", True, raising=False)
     monkeypatch.setattr(settings, "easyweek_reviews_enabled", True, raising=False)
+    monkeypatch.setattr(
+        settings, "easyweek_google_review_links", json.dumps({str(TEST_LOCATION_ID): REVIEW_URL}), raising=False
+    )
     starts_at = await _seed_lifecycle(bound_session_local)
 
     monkeypatch.setattr(settings, "easyweek_notifications_enabled", notifications, raising=False)
@@ -1095,6 +1106,9 @@ async def test_a_succeeded_delivery_waits_until_both_switches_are_on(
 async def test_turning_both_switches_on_processes_the_waiting_delivery_once(bound_session_local, monkeypatch) -> None:
     monkeypatch.setattr(settings, "easyweek_notifications_enabled", True, raising=False)
     monkeypatch.setattr(settings, "easyweek_reviews_enabled", False, raising=False)
+    monkeypatch.setattr(
+        settings, "easyweek_google_review_links", json.dumps({str(TEST_LOCATION_ID): REVIEW_URL}), raising=False
+    )
     starts_at = await _seed_lifecycle(bound_session_local)
 
     async with bound_session_local() as session:
@@ -1211,22 +1225,57 @@ async def test_a_succeeded_whose_identity_disagrees_earns_nothing(
 
 
 @pytest.mark.parametrize(
-    ("label", "review_url"),
+    ("label", "payload_review_url"),
     [
         ("missing", _UNSET_REVIEW),
         ("null", None),
-        ("manage-link", f"https://eyw.me/r/{TEST_BOOKING_HASH_ID}"),
-        ("malformed", "not-a-url"),
-        ("http", f"http://eyw.me/f/{TEST_BOOKING_HASH_ID}"),
-        ("other-hash", "https://eyw.me/f/12345678"),
-        ("other-host", f"https://evil.invalid/f/{TEST_BOOKING_HASH_ID}"),
+        ("hostile", "https://evil.invalid/r/anything/review"),
     ],
 )
-async def test_an_unprovable_review_link_earns_nothing(
-    bound_session_local, _reviews_on, label: str, review_url: object
+async def test_the_payload_link_is_ignored_entirely(
+    bound_session_local, _reviews_on, label: str, payload_review_url: object
 ) -> None:
+    """PR-10: EasyWeek sends no review_url, and we would not trust one anyway.
+
+    Production record 6922 has 88 root keys and no `review_url` — planning must
+    succeed regardless of what the payload does or does not carry, because the
+    link now comes from our own configuration.
+    """
     starts_at = await _seed_lifecycle(bound_session_local)
-    await _succeeded_earns_nothing(bound_session_local, _at(_succeeded(review_url=review_url), starts_at))
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(
+                session,
+                _at(_succeeded(review_url=payload_review_url), starts_at),
+                event_hint="booking-succeeded",
+                payload_hash=f"h-ignored-{label}",
+            )
+    await _run_until_idle()
+
+    async with bound_session_local() as session:
+        jobs = list((await session.execute(select(MessageJob).where(MessageJob.job_type == "review_3d"))).scalars())
+
+    assert len(jobs) == 1, f"{label}: the configured link decides, not the payload"
+    assert jobs[0].payload["review_url"] == REVIEW_URL
+
+
+@pytest.mark.parametrize(
+    ("label", "config"),
+    [
+        ("no-entry-for-branch", '{"999999": "https://g.page/r/Other/review"}'),
+        ("unconfigured", ""),
+        ("malformed-map", "{not json"),
+        ("bad-link", '{"999001": "http://g.page/r/T/review"}'),
+        ("legacy-array", '["https://g.page/r/T/review"]'),
+    ],
+)
+async def test_an_unprovable_configured_link_earns_nothing(
+    bound_session_local, _reviews_on, monkeypatch, label: str, config: str
+) -> None:
+    """Fail-closed: no provable link, no review job — and the event survives."""
+    monkeypatch.setattr(settings, "easyweek_google_review_links", config, raising=False)
+    starts_at = await _seed_lifecycle(bound_session_local)
+    await _succeeded_earns_nothing(bound_session_local, _at(_succeeded(), starts_at))
 
 
 async def test_an_opted_out_client_earns_nothing(bound_session_local, _reviews_on) -> None:

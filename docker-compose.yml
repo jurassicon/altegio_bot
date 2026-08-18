@@ -170,6 +170,9 @@ services:
   #
   # PR-9: likewise EASYWEEK_REVIEWS_ENABLED (review PLANNING) is read here;
   # its send fence EASYWEEK_REVIEW_SEND_ENABLED belongs to the outbox worker.
+  # PR-10: EASYWEEK_GOOGLE_REVIEW_LINKS is read here (review planning) and by
+  # altegio-outbox-worker (send-time re-proof). `docker compose restart` does
+  # NOT re-read env_file — recreate both services after changing it.
   altegio-easyweek-inbox-worker:
     build: .
     restart: always

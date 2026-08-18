@@ -2531,7 +2531,42 @@ review/visit-counter фазе.
 
 ---
 
-## 13. PR-9 — review_3d после booking-succeeded
+## 13. PR-9/PR-10 — review_3d после booking-succeeded
+
+### 13.0 Откуда берётся ссылка отзыва (PR-10)
+
+Источник ссылки — **наша конфигурация**, а не payload EasyWeek.
+
+PR-9 исходил из того, что EasyWeek присылает поле со ссылкой на отзыв.
+Production это опроверг: у записи Durlach 6922 (события 54 и 55, филиал
+`company_id=308697`) payload содержит 88 корневых ключей, и поля со ссылкой
+среди них нет. Планировщик поэтому всегда возвращал «нечего планировать», и
+PR-9 не создал ни одной job. Ревизия 12 канонического плана санкционировала
+смену источника — и только источника.
+
+Теперь ссылка берётся из `EASYWEEK_GOOGLE_REVIEW_LINKS` по EasyWeek
+`company_id` и обязана иметь строгий вид `https://g.page/r/<token>/review`.
+Карта разбирается тотально и fail-closed: одна невалидная запись делает
+невалидной всю карту, и тогда ни одна job не планируется и ни одна не
+отправляется. Ссылку перепроверяют дважды — при планировании и перед каждым
+Meta attempt; если она изменилась после планирования, отправка отклоняется
+(`review_link_changed`), а не подменяется: identity delivery-retry цепочки
+привязана к запланированной ссылке. Job истечёт сама по дедлайну
+`run_at + 24h`.
+
+Отдельная переменная намеренно: `EASYWEEK_LOCATION_MAP` гейтит lifecycle и
+reminders целиком, а `GOOGLE_MAPS_REVIEW_LINKS` принадлежит Altegio и
+ключуется Altegio company id из общего целочисленного пространства.
+
+Read-only проверка эффективной карты (печатает только количество и филиалы,
+без самих ссылок):
+
+```bash
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml exec -T altegio-easyweek-inbox-worker /app/.venv/bin/python -c 'from altegio_bot.easyweek_review import parse_google_review_links; from altegio_bot.settings import settings; m = parse_google_review_links(settings.easyweek_google_review_links); print({"configured": m.configured, "valid": m.valid, "ready": m.ready, "companies": sorted(m.links)})'
+```
+
+Ожидается `ready=True` и ваш `company_id` в `companies`. `valid=False` —
+**STOP**: карта непригодна целиком, чинить до включения планирования.
 
 ### 13.1 Пятый webhook
 
@@ -2585,6 +2620,10 @@ docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-i
 ```bash
 docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml exec -T altegio-outbox-worker /app/.venv/bin/python -c 'from altegio_bot.settings import settings; print("review_send=", settings.easyweek_review_send_enabled)'
 ```
+
+И **там же** — карту ссылок (PR-10), в обоих сервисах: без неё планирование
+молча не создаст ни одной job. Команда — из 13.0; ожидается `ready=True` и
+нужный `company_id` в `companies`.
 
 **2. Подтвердить APPROVED Meta review templates** для каждого включаемого
 филиала: `kitilash_du_review_3d_v1`, `kitilash_ra_review_3d_v1`. Не объявлять

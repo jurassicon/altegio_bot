@@ -47,6 +47,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from altegio_bot.db import SessionLocal
 from altegio_bot.easyweek_branches import branch_template_contract
 from altegio_bot.easyweek_policy import REVIEW_3D
+from altegio_bot.easyweek_review import (
+    REVIEW_LINK_MISSING,
+    google_review_url_for_company,
+    validate_google_review_url,
+)
 from altegio_bot.easyweek_service_category import evaluate_service_category
 from altegio_bot.meta_templates import build_lifecycle_template_params
 from altegio_bot.models.models import (
@@ -78,6 +83,12 @@ PROVEN: Final = "proven"
 REASON_CLAIMED_WHILE_FENCED: Final = "claimed_while_fence_closed"
 REASON_NOT_OWNED: Final = "branch_not_in_registry"
 REASON_DOMAIN: Final = "domain_identity_unproven"
+# PR-10. The link is ours now, so its failure modes are ours to report: no
+# entry for this branch, an entry that does not validate, and a link that
+# changed after the job was planned (identity-bound, so never swapped in).
+REASON_REVIEW_LINK_MISSING: Final = "review_link_missing"
+REASON_REVIEW_LINK_INVALID: Final = "review_link_invalid"
+REASON_REVIEW_LINK_CHANGED: Final = "review_link_changed"
 REASON_CATEGORY: Final = "category_not_allowed"
 REASON_CATEGORY_CONFIG: Final = "category_configuration_unavailable"
 REASON_DEADLINE: Final = "deadline_expired"
@@ -308,6 +319,24 @@ async def check_review_job(session: AsyncSession, job: MessageJob) -> str:
     client = None
     if job.client_id is not None:
         client = (await session.execute(select(Client).where(Client.id == job.client_id))).scalars().one_or_none()
+
+    # PR-10: report WHY the link failed rather than folding every cause into
+    # the generic domain reason. An operator fixing one variable needs to know
+    # whether the entry is absent, malformed, or simply different from the one
+    # this job was planned with.
+    configured_url, link_error = google_review_url_for_company(
+        job.company_id,
+        settings.easyweek_google_review_links,
+    )
+    if link_error == REVIEW_LINK_MISSING:
+        return REASON_REVIEW_LINK_MISSING
+    if link_error is not None:
+        return REASON_REVIEW_LINK_INVALID
+    planned_url = validate_google_review_url((job.payload or {}).get("review_url"))
+    if planned_url is None:
+        return REASON_REVIEW_LINK_INVALID
+    if planned_url != configured_url:
+        return REASON_REVIEW_LINK_CHANGED
 
     # THE runtime guard: identity, tenancy, booking uuid, planned start, deletion,
     # opt-out, services_count and the review link, all in one place.

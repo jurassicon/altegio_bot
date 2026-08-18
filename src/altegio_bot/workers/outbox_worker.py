@@ -42,7 +42,7 @@ from altegio_bot.easyweek_branches import (
 )
 from altegio_bot.easyweek_client import EasyWeekClient
 from altegio_bot.easyweek_locations import EasyWeekLocation, configured_easyweek_locations
-from altegio_bot.easyweek_normalizer import extract_manage_link
+from altegio_bot.easyweek_normalizer import extract_manage_link, normalize_booking_hash_id
 from altegio_bot.easyweek_policy import (
     EASYWEEK_CUSTOMER_JOB_TYPES,
     EASYWEEK_LIFECYCLE_JOB_TYPES,
@@ -61,7 +61,11 @@ from altegio_bot.easyweek_reminder_guard import (
     classify_client_error,
     verify_reminder_is_current,
 )
-from altegio_bot.easyweek_review import validate_review_url
+from altegio_bot.easyweek_review import (
+    REVIEW_LINK_CHANGED,
+    google_review_url_for_company,
+    validate_google_review_url,
+)
 from altegio_bot.easyweek_service_category import evaluate_service_category, services_count_from_record_raw
 from altegio_bot.message_planner import (
     COMEBACK_3D_DELAY,
@@ -984,10 +988,37 @@ def easyweek_review_url_for_send(job: MessageJob, record: Record | None) -> str 
     payload = getattr(job, "payload", None)
     if not isinstance(payload, dict) or record is None:
         return None
-    return validate_review_url(
-        payload.get("review_url"),
-        booking_hash_id=getattr(record, "easyweek_booking_hash_id", None),
+    # The booking still has to be identifiable — that is what PR-4 proved and
+    # what the review is attached to — even though the link no longer comes
+    # from it.
+    if normalize_booking_hash_id(getattr(record, "easyweek_booking_hash_id", None)) is None:
+        return None
+
+    # Re-resolved from configuration on EVERY attempt, so a corrected link
+    # takes effect without a redeploy and a removed one stops sends at once.
+    current, link_error = google_review_url_for_company(
+        getattr(job, "company_id", None),
+        settings.easyweek_google_review_links,
     )
+    if link_error is not None or current is None:
+        return None
+
+    planned = validate_google_review_url(payload.get("review_url"))
+    if planned is None:
+        return None
+    if planned != current:
+        # `EasyWeekReviewRetryIdentity` is bound to the planned `review_url`,
+        # so quietly swapping in the new one would break the identity of an
+        # in-flight delivery-retry chain. Refuse instead; the job expires on
+        # its own deadline at run_at + 24h.
+        logger.info(
+            "easyweek review refused job_id=%s company_id=%s reason=%s",
+            getattr(job, "id", None),
+            getattr(job, "company_id", None),
+            REVIEW_LINK_CHANGED,
+        )
+        return None
+    return current
 
 
 def _canonical_uuid_or_none(value: object) -> uuid.UUID | None:
