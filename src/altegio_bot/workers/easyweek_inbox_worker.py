@@ -77,7 +77,7 @@ from ..easyweek_review import (
     google_review_url_for_company,
     plan_review,
     review_job_payload,
-    review_run_at,
+    review_moment_passed,
 )
 from ..easyweek_service_category import (
     evaluate_service_category,
@@ -117,6 +117,13 @@ MAX_ERROR_BACKOFF_SEC = 30.0
 # the oldest eligible row and would keep picking the same poisoned one.
 RETRY_BASE_SEC = 5.0
 MAX_RETRY_DELAY_SEC = 300.0
+
+# How long a configuration-deferred event waits before it is eligible again.
+# Deliberately short and FLAT, not exponential: a broken review-link map or
+# allowlist is fixed by a person editing a file, and once they do the event
+# should be picked up promptly rather than after a backoff nobody can predict.
+# Its only job is to stop the row monopolising `claim_next_event`.
+CONFIG_DEFERRAL_DELAY_SEC = 60.0
 # `processing_attempts` is kept for observability only and SATURATES here, so
 # the counter cannot grow without bound while a dependency is down.
 MAX_TRACKED_ATTEMPTS = 1000
@@ -128,11 +135,6 @@ SUCCEEDED_EVENT_HINT = "booking-succeeded"
 
 STATUS_PROCESSED = "processed"
 STATUS_FAILED = "failed"
-
-
-# Last recoverable configuration reason announced, so a broken map is logged
-# once per state rather than once per poll. Reset as soon as anything succeeds.
-_last_recoverable_reason: str | None = None
 
 
 class RecoverableCategoryConfigurationError(RuntimeError):
@@ -974,18 +976,13 @@ async def plan_review_job(
         # from the map is far more often a typo in the key than a deliberate
         # decision to skip that salon's reviews.
         #
-        # The window is NOT open-ended. While this event stays `captured` it is
-        # a predecessor, so every later lifecycle event for the same booking
-        # waits behind it — a branch missing from the map would otherwise
-        # freeze its own confirmations and reschedules forever. The bound is
-        # the delivery deadline the outbox already enforces: `run_at + 24h`,
-        # reusing that exact definition rather than inventing a second one.
-        # Past it the review cannot be delivered anyway, so "no review" becomes
-        # the final answer and the booking's queue is released.
-        from altegio_bot.workers.outbox_worker import _MARKETING_TRANSIENT_RETRY_CAP
-
-        deadline = review_run_at(record.starts_at) + _MARKETING_TRANSIENT_RETRY_CAP if record.starts_at else None
-        if deadline is not None and utcnow() <= deadline:
+        # The window is NOT open-ended: while this event waits it is a
+        # predecessor, so later lifecycle events of the same booking queue
+        # behind it. The bound is exactly the moment `plan_review` itself stops
+        # being able to produce a job — asked through the SAME function, so the
+        # two boundaries cannot drift apart. Waiting past it would hold the
+        # booking hostage for an outcome that can no longer happen.
+        if not review_moment_passed(record.starts_at, utcnow()):
             raise RecoverableCategoryConfigurationError(link_error)
 
         logger.info(
@@ -1344,6 +1341,55 @@ async def schedule_retry(event_id: int) -> bool:
             return True
 
 
+async def defer_for_configuration(event_id: int, reason: str) -> bool:
+    """Hold a captured event briefly because we cannot DECIDE about it yet.
+
+    Distinct from :func:`schedule_retry` on purpose. A retry means "processing
+    failed"; this means "the configuration does not let us answer", so
+    ``processing_attempts`` is left alone — the row is not degrading, and an
+    operator reading it should not think it is.
+
+    The short delay is the whole point. Without a ``next_retry_at``,
+    ``claim_next_event`` — which takes the globally oldest eligible row — picks
+    this same event forever, and every newer event of every OTHER booking stops
+    being processed: confirmations, reschedules, cancellations and reminder
+    planning all freeze behind one branch missing from a map. That is exactly
+    the starvation ``claim_next_event`` documents itself as preventing.
+
+    Runs in its OWN transaction, like ``schedule_retry``: the caller's was
+    already rolled back by the raise. The lookup is conditional on the row still
+    being ``captured``, so a terminal status another worker committed meanwhile
+    is never resurrected. Nothing about the exception is persisted.
+    """
+    async with SessionLocal() as session:
+        async with session.begin():
+            event = (
+                (
+                    await session.execute(
+                        select(EasyWeekEvent)
+                        .where(EasyWeekEvent.id == event_id)
+                        .where(EasyWeekEvent.status == STATUS_CAPTURED)
+                        .with_for_update()
+                    )
+                )
+                .scalars()
+                .first()
+            )
+            if event is None:
+                # Already terminal — do not resurrect it.
+                return False
+
+            # `processing_attempts` deliberately untouched.
+            event.next_retry_at = utcnow() + timedelta(seconds=CONFIG_DEFERRAL_DELAY_SEC)
+            logger.warning(
+                "easyweek event=%s configuration_unavailable reason=%s retry_in=%ss",
+                event_id,
+                reason,
+                int(CONFIG_DEFERRAL_DELAY_SEC),
+            )
+            return True
+
+
 async def process_one() -> bool:
     """One full claim/process cycle. Returns False when there was nothing to do.
 
@@ -1400,24 +1446,14 @@ async def process_one() -> bool:
         # error renders the statement WITH its bound parameters, which here
         # means the customer's phone, e-mail, name and comment.
         if isinstance(exc, RecoverableCategoryConfigurationError):
-            global _last_recoverable_reason
-            if _last_recoverable_reason != exc.reason:
-                # Once per state, not once per iteration: a broken map is one
-                # fact, and repeating it every poll buries everything else.
-                logger.warning(
-                    "easyweek event=%s configuration_unavailable reason=%s",
-                    transient_event_id,
-                    exc.reason,
-                )
-                _last_recoverable_reason = exc.reason
             # The outer transaction already rolled the claim and all domain
-            # writes back. Do not add a retry timestamp: as soon as the config
-            # is fixed this captured row must be immediately claimable again.
+            # writes back, so the row is `captured` again. Give it a short,
+            # flat deferral: without one it stays the globally oldest eligible
+            # row and starves every other booking's events.
             #
             # `False` on purpose: nothing was accomplished, so the caller sleeps
-            # its normal poll interval. Reporting work here would spin
-            # claim -> rollback -> claim at full speed for as long as the
-            # configuration stays broken.
+            # its normal poll interval rather than spinning.
+            await defer_for_configuration(transient_event_id, exc.reason)
             return False
         logger.error(
             "easyweek event=%s processing_error type=%s",
@@ -1551,11 +1587,6 @@ async def run_loop(
             continue
 
         consecutive_errors = 0
-        if did_work:
-            # Something completed, so any earlier configuration complaint is
-            # stale; the next one deserves to be heard.
-            global _last_recoverable_reason
-            _last_recoverable_reason = None
         if not did_work:
             await _sleep_unless_stopping(effective_poll_sec, stop_event)
 

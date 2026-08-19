@@ -2565,8 +2565,15 @@ Read-only проверка эффективной карты (печатает �
 docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml run --rm --no-deps --entrypoint /app/.venv/bin/python altegio-easyweek-inbox-worker -c 'from altegio_bot.easyweek_review import parse_google_review_links; from altegio_bot.settings import settings; m = parse_google_review_links(settings.easyweek_google_review_links); print({"configured": m.configured, "valid": m.valid, "ready": m.ready, "companies": sorted(m.links)})'
 ```
 
-Ожидается `ready=True` и ваш `company_id` в `companies`. `valid=False` —
-**STOP**: карта непригодна целиком, чинить до включения планирования.
+Ожидается `ready=True`, и в `companies` — **все** активные филиалы из
+`EASYWEEK_LOCATION_MAP`, а не только тот, который включается сейчас.
+Филиал, забытый в карте, не создаст ни одной job и поэтому не появится в
+отчёте preflight как строка — его события молча уйдут в конфигурационную
+задержку. Поэтому preflight отдельно сравнивает ключи реестра и карты и
+возвращает `config_error=review_links_incomplete` при расхождении.
+
+`valid=False` — **STOP**: карта непригодна целиком, чинить до включения
+планирования.
 
 Команда намеренно `run --rm --no-deps`, а не `exec`. Самое вероятное действие
 после STOP — починить карту в `easyweek.env` и перепроверить, но `exec` читает

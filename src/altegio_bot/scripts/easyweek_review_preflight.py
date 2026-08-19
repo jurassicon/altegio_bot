@@ -46,6 +46,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.db import SessionLocal
 from altegio_bot.easyweek_branches import branch_template_contract
+from altegio_bot.easyweek_locations import configured_easyweek_locations
 from altegio_bot.easyweek_policy import REVIEW_3D
 from altegio_bot.easyweek_review import (
     REVIEW_LINK_MISSING,
@@ -92,6 +93,8 @@ REASON_DOMAIN: Final = "domain_identity_unproven"
 REASON_REVIEW_LINK_MISSING: Final = "review_link_missing"
 REASON_REVIEW_LINK_INVALID: Final = "review_link_invalid"
 REASON_REVIEW_LINK_CHANGED: Final = "review_link_changed"
+# A valid map that does not cover every live branch.
+REASON_REVIEW_LINKS_INCOMPLETE: Final = "review_links_incomplete"
 REASON_CATEGORY: Final = "category_not_allowed"
 REASON_CATEGORY_CONFIG: Final = "category_configuration_unavailable"
 REASON_DEADLINE: Final = "deadline_expired"
@@ -192,6 +195,20 @@ def rollout_state_error() -> str | None:
         return REVIEW_LINKS_UNCONFIGURED
     if not links.valid:
         return REVIEW_LINKS_INVALID
+
+    # A valid map is not necessarily a COMPLETE one. The location registry is
+    # the definition of "which branches are live", so a branch missing from the
+    # map is a configuration gap — and the most invisible kind: it plans no
+    # jobs, so it never appears in this report as a row, while its events sit
+    # in configuration deferral. Exactly the state this preflight exists to
+    # surface, and exactly the one it would otherwise miss.
+    registry = configured_easyweek_locations()
+    if registry.ready:
+        uncovered = sorted(set(registry.locations) - set(links.links))
+        if uncovered:
+            # company_id only — never the links themselves. The reason code
+            # is the report's channel; this script prints nothing else.
+            return REASON_REVIEW_LINKS_INCOMPLETE
     return None
 
 
@@ -344,7 +361,11 @@ async def check_review_job(session: AsyncSession, job: MessageJob) -> str:
     if link_error == REVIEW_LINK_MISSING:
         return REASON_REVIEW_LINK_MISSING
     if link_error is not None:
-        # "Never set up" and "set up wrongly" are different operator actions.
+        # Defence in depth only: `rollout_state_error()` already refuses these
+        # states before the queue is read, so an operator never arrives here.
+        # Kept so a future caller of `check_review_job` cannot lose the answer,
+        # and reported verbatim because "never set up" and "set up wrongly" are
+        # different operator actions.
         return link_error
     planned_url = validate_google_review_url((job.payload or {}).get("review_url"))
     if planned_url is None:

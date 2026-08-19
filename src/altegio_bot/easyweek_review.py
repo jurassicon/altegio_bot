@@ -278,7 +278,7 @@ def parse_google_review_links(raw: object) -> GoogleReviewLinks:
     text = raw.strip()
     # `{}` and `{ }` are one intention written two ways; both mean "nothing
     # configured here yet", not "configured wrongly".
-    if not text or text.replace(" ", "") == "{}":
+    if not text or "".join(text.split()) == "{}":
         return GoogleReviewLinks(configured=False, valid=True)
 
     # The hook fires ONLY for JSON objects, and it sees the duplicate keys
@@ -366,6 +366,18 @@ def review_run_at(starts_at: datetime) -> datetime:
     return _as_utc(starts_at) + REVIEW_DELAY
 
 
+def review_moment_passed(starts_at: datetime, now: datetime) -> bool:
+    """Is it already too late for this booking to earn a review at all?
+
+    THE single definition, so the planner's "keep waiting for a fixed config"
+    window and ``plan_review``'s own refusal cannot drift apart. Past this
+    instant no configuration change can produce a job — asking for a review of
+    a visit three days gone is unsolicited marketing, not a late reminder — so
+    holding the event any longer only blocks its booking's lifecycle.
+    """
+    return review_run_at(starts_at) <= _as_utc(now)
+
+
 def easyweek_review_dedupe_key(*, booking_uuid: uuid.UUID, starts_at: datetime) -> str:
     """Stable identity for "this booking, this appointment, one review".
 
@@ -425,7 +437,7 @@ def plan_review(
         return None
 
     run_at = review_run_at(starts_at)
-    if run_at <= _as_utc(now):
+    if review_moment_passed(starts_at, now):
         # Not "slightly late": the appointment is at least three days gone, and
         # a review request for it now is unsolicited marketing.
         return None

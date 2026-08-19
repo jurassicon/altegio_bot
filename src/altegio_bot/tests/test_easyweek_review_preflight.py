@@ -35,6 +35,7 @@ from altegio_bot.models.models import (
     RecordService,
     WhatsAppSender,
 )
+from altegio_bot.scripts import easyweek_review_preflight as preflight
 from altegio_bot.scripts.easyweek_review_preflight import (
     EASYWEEK_SENDER_CODE,
     OPEN_STATUSES,
@@ -992,7 +993,14 @@ async def test_a_database_failure_is_red_rather_than_green(monkeypatch) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_a_branch_without_a_configured_link_is_red(session_maker, monkeypatch) -> None:
+async def test_a_live_branch_missing_from_the_map_stops_before_the_queue(session_maker, monkeypatch) -> None:
+    """The most invisible gap, and the one this preflight exists to catch.
+
+    A branch absent from the map plans no jobs, so it can never appear as a
+    ROW in this report — its events are sitting in configuration deferral. The
+    location registry is the definition of "live", so the difference between
+    the two key sets is the finding.
+    """
     monkeypatch.setattr(settings, "easyweek_google_review_links", json.dumps({"999999": REVIEW_URL}), raising=False)
     async with session_maker() as session:
         async with session.begin():
@@ -1000,8 +1008,36 @@ async def test_a_branch_without_a_configured_link_is_red(session_maker, monkeypa
 
     report = await _run(session_maker)
 
-    assert report.reasons == {"review_link_missing": 1}
+    assert report.config_error == "review_links_incomplete"
     assert report.ready is False
+    assert report.reasons == {}, "the queue must not be read at all"
+
+
+async def test_a_map_covering_every_live_branch_is_not_flagged(session_maker) -> None:
+    """The control: full coverage must not be reported as a gap."""
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_review(session)
+
+    report = await _run(session_maker)
+
+    assert report.config_error is None
+    assert report.reasons == {PROVEN: 1}
+
+
+async def test_the_per_row_missing_link_reason_survives_as_defence_in_depth(session_maker, monkeypatch) -> None:
+    """`check_review_job` keeps its own answer even though the gate precedes it.
+
+    Not an operator path any more — `rollout_state_error()` catches the same
+    states first — but the row-level guard must not silently rot.
+    """
+    monkeypatch.setattr(settings, "easyweek_google_review_links", json.dumps({"999999": REVIEW_URL}), raising=False)
+    async with session_maker() as session:
+        async with session.begin():
+            job = await _seed_review(session)
+        reason = await preflight.check_review_job(session, job)
+
+    assert reason == "review_link_missing"
 
 
 @pytest.mark.parametrize(
