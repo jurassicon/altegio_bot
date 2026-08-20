@@ -19,6 +19,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from altegio_bot.easyweek_review import REVIEW_SEND_REFUSAL_REASONS
 from altegio_bot.settings import Settings
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -504,3 +505,92 @@ def test_no_command_prints_a_payload_or_customer_data(pr9_section: str) -> None:
     """Every SQL snippet selects ids, statuses and times — never content."""
     for forbidden in ("SELECT payload", "payload,", "phone_e164", "display_name", "review_url", "body"):
         assert forbidden not in pr9_section, forbidden
+
+
+# ---------------------------------------------------------------------------
+# PR-10: the link source, as documented
+# ---------------------------------------------------------------------------
+
+
+def test_the_link_map_is_its_own_variable_in_the_env_example() -> None:
+    text = (REPO_ROOT / "easyweek.env.example").read_text()
+
+    assert "EASYWEEK_GOOGLE_REVIEW_LINKS=" in text
+    assert "REPLACE_WITH_REAL_TOKEN" in text, "the example must be a placeholder"
+    # A real branch link is a production value and does not belong in a
+    # committed example.
+    assert "CaV0vSmrSYkdEAE" not in text
+
+
+def test_the_env_example_names_both_consuming_services() -> None:
+    text = (REPO_ROOT / "easyweek.env.example").read_text()
+    block = text[text.index("EASYWEEK_GOOGLE_REVIEW_LINKS") - 2000 : text.index("EASYWEEK_GOOGLE_REVIEW_LINKS") + 200]
+
+    assert "altegio-easyweek-inbox-worker" in block, "planning reads it"
+    assert "altegio-outbox-worker" in block, "send-time re-proof reads it"
+    assert "restart" in block, "a plain restart does not re-read env_file"
+
+
+def test_the_link_map_is_kept_out_of_the_location_registry() -> None:
+    """A typo in a review link must not take lifecycle and reminders down."""
+    text = (REPO_ROOT / "easyweek.env.example").read_text()
+    registry_line = next(
+        (line for line in text.splitlines() if line.startswith("EASYWEEK_LOCATION_MAP=")),
+        None,
+    )
+    assert registry_line is not None, "easyweek.env.example must still ship EASYWEEK_LOCATION_MAP"
+
+    assert "g.page" not in registry_line
+    assert "review" not in registry_line.lower()
+
+
+def test_the_runbook_explains_that_the_link_is_ours() -> None:
+    text = (REPO_ROOT / "docs/easyweek/durlach_activation_runbook.md").read_text()
+    section = text[text.index("### 13.0") : text.index("### 13.1")]
+
+    assert "EASYWEEK_GOOGLE_REVIEW_LINKS" in section
+    assert "g.page/r/" in section
+    assert "fail-closed" in section
+    assert "parse_google_review_links" in section, "step 1 needs a read-only check"
+    assert "review_link_changed" in section
+    # And it must say plainly that the payload is not the source.
+    assert "не payload" in section or "а не payload" in section
+
+
+def test_the_runbook_check_prints_no_links() -> None:
+    """The operator command reports counts and branches, never the URLs."""
+    text = (REPO_ROOT / "docs/easyweek/durlach_activation_runbook.md").read_text()
+    section = text[text.index("### 13.0") : text.index("### 13.1")]
+    command = section[section.index("```bash") : section.index("```", section.index("```bash") + 7)]
+
+    assert "sorted(m.links)" in command, "keys only"
+    assert "m.links.values" not in command
+    assert "print(settings.easyweek_google_review_links" not in command
+
+
+def test_the_runbook_map_check_survives_an_env_edit() -> None:
+    """`exec` reads the environment the container was CREATED with.
+
+    The most likely action after a STOP is fixing `easyweek.env` and checking
+    again — and `exec` would show the old broken map. Same trap PR-9's step 8
+    already removed.
+    """
+    text = (REPO_ROOT / "docs/easyweek/durlach_activation_runbook.md").read_text()
+    section = text[text.index("### 13.0") : text.index("### 13.1")]
+    command = section[section.index("```bash") : section.index("```", section.index("```bash") + 7)]
+
+    assert "run --rm --no-deps" in command
+    assert "exec -T" not in command, "a re-check after an env edit must not use exec"
+    assert "--entrypoint /app/.venv/bin/python" in command
+    # And the reason has to be written down, not just implied by the command.
+    assert "exec" in section and "созда" in section
+
+
+def test_the_runbook_lists_the_complete_send_time_refusal_vocabulary(pr9_section: str) -> None:
+    section = pr9_section[pr9_section.index("### 13.4") :]
+    documented = set(re.findall(r"^\| `([^`]+)` \|", section, flags=re.M))
+
+    assert documented == REVIEW_SEND_REFUSAL_REASONS
+    assert "http://" not in section
+    assert "https://" not in section
+    assert "g.page" not in section

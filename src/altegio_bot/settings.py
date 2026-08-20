@@ -262,6 +262,19 @@ class Settings(BaseSettings):
     #              an operator reply still has to PROVE a tenant before a sender
     #              is chosen; it never means "pick the first sender".
     # Consumed by altegio-whatsapp-inbox-worker only.
+    # PR-10. Google review links for EasyWeek review_3d, keyed by EasyWeek
+    # company_id: {"<location_id>": "https://g.page/r/<token>/review"}.
+    #
+    # Its OWN variable on purpose. Not a field of EASYWEEK_LOCATION_MAP, which
+    # gates lifecycle and reminders wholesale — a typo in a review link must not
+    # take booking confirmations down with it. Not GOOGLE_MAPS_REVIEW_LINKS,
+    # which is Altegio's and keyed by an Altegio company id sharing an integer
+    # space with EasyWeek location ids.
+    #
+    # Consumers: altegio-easyweek-inbox-worker (planning) and
+    # altegio-outbox-worker (send-time re-proof).
+    easyweek_google_review_links: str = ""
+
     chatwoot_inbound_routing_mode: str = "context"
 
     @field_validator("chatwoot_inbound_routing_mode")

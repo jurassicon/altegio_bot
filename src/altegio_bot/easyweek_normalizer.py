@@ -612,10 +612,15 @@ class SucceededBooking:
     a caller to write its fields, and a succeeded payload must never rewrite the
     name, phone, price, service, or time that the lifecycle events proved.
 
-    ``review_url`` is carried raw and unvalidated on purpose: proving it needs
-    the booking hash, which lives on the Record, and the normalizer has no
-    database. :func:`altegio_bot.easyweek_review.validate_review_url` does that
-    once the Record is in hand.
+    ``review_url`` is captured raw and read by nobody. PR-9 planned to prove it
+    against the booking hash once the Record was in hand; PR-10 replaced the
+    SOURCE of the review link with our own configuration after production
+    showed EasyWeek does not send this field at all. The field and
+    :func:`altegio_bot.easyweek_review.validate_review_url` are kept
+    deliberately, not by oversight: the normalizer's job is to record the
+    payload shape faithfully, and the validator remains the written contract
+    for ``eyw.me`` links should EasyWeek ever start sending one. Neither is on
+    any production path today.
     """
 
     booking_uuid: uuid.UUID

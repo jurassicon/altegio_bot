@@ -2531,7 +2531,56 @@ review/visit-counter фазе.
 
 ---
 
-## 13. PR-9 — review_3d после booking-succeeded
+## 13. PR-9/PR-10 — review_3d после booking-succeeded
+
+### 13.0 Откуда берётся ссылка отзыва (PR-10)
+
+Источник ссылки — **наша конфигурация**, а не payload EasyWeek.
+
+PR-9 исходил из того, что EasyWeek присылает поле со ссылкой на отзыв.
+Production это опроверг: у записи Durlach 6922 (события 54 и 55, филиал
+`company_id=308697`) payload содержит 88 корневых ключей, и поля со ссылкой
+среди них нет. Планировщик поэтому всегда возвращал «нечего планировать», и
+PR-9 не создал ни одной job. Ревизия 12 канонического плана санкционировала
+смену источника — и только источника.
+
+Теперь ссылка берётся из `EASYWEEK_GOOGLE_REVIEW_LINKS` по EasyWeek
+`company_id` и обязана иметь строгий вид `https://g.page/r/<token>/review`.
+Карта разбирается тотально и fail-closed: одна невалидная запись делает
+невалидной всю карту, и тогда ни одна job не планируется и ни одна не
+отправляется. Ссылку перепроверяют дважды — при планировании и перед каждым
+Meta attempt; если она изменилась после планирования, отправка отклоняется
+(`review_link_changed`), а не подменяется: identity delivery-retry цепочки
+привязана к запланированной ссылке. Job истечёт сама по дедлайну
+`run_at + 24h`.
+
+Отдельная переменная намеренно: `EASYWEEK_LOCATION_MAP` гейтит lifecycle и
+reminders целиком, а `GOOGLE_MAPS_REVIEW_LINKS` принадлежит Altegio и
+ключуется Altegio company id из общего целочисленного пространства.
+
+Read-only проверка эффективной карты (печатает только количество и филиалы,
+без самих ссылок):
+
+```bash
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml run --rm --no-deps --entrypoint /app/.venv/bin/python altegio-easyweek-inbox-worker -c 'from altegio_bot.easyweek_review import parse_google_review_links; from altegio_bot.settings import settings; m = parse_google_review_links(settings.easyweek_google_review_links); print({"configured": m.configured, "valid": m.valid, "ready": m.ready, "companies": sorted(m.links)})'
+```
+
+Ожидается `ready=True`, и в `companies` — **все** активные филиалы из
+`EASYWEEK_LOCATION_MAP`, а не только тот, который включается сейчас.
+Филиал, забытый в карте, не создаст ни одной job и поэтому не появится в
+отчёте preflight как строка — его события молча уйдут в конфигурационную
+задержку. Поэтому preflight отдельно сравнивает ключи реестра и карты и
+возвращает `config_error=review_links_incomplete` при расхождении.
+
+`valid=False` — **STOP**: карта непригодна целиком, чинить до включения
+планирования.
+
+Команда намеренно `run --rm --no-deps`, а не `exec`. Самое вероятное действие
+после STOP — починить карту в `easyweek.env` и перепроверить, но `exec` читает
+окружение, с которым контейнер был **создан**, и покажет старую сломанную карту.
+Одноразовый контейнер читает `env_file` заново. Это та же ловушка, что снял
+P1-фикс PR-9 (шаг 8 в 13.2). Вывод печатает только количество и список
+`company_id` — сами ссылки не выводятся никогда.
 
 ### 13.1 Пятый webhook
 
@@ -2585,6 +2634,10 @@ docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-i
 ```bash
 docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml exec -T altegio-outbox-worker /app/.venv/bin/python -c 'from altegio_bot.settings import settings; print("review_send=", settings.easyweek_review_send_enabled)'
 ```
+
+И **там же** — карту ссылок (PR-10), в обоих сервисах: без неё планирование
+молча не создаст ни одной job. Команда — из 13.0; ожидается `ready=True` и
+нужный `company_id` в `companies`.
 
 **2. Подтвердить APPROVED Meta review templates** для каждого включаемого
 филиала: `kitilash_du_review_3d_v1`, `kitilash_ra_review_3d_v1`. Не объявлять
@@ -2701,3 +2754,18 @@ template и sender → `outbox_messages` `sent` → Meta `delivered`/`read`. С�
 Что продолжает работать после rollback: capture всех пяти триггеров, lifecycle
 notifications, PR-8 reminders и весь Altegio path — они управляются своими
 флагами и этим откатом не затрагиваются.
+
+### 13.4 Отказы review на send-time
+
+После открытия send fence точная причина локального отказа записывается в
+`job.last_error`. Действия оператора для каждого кода:
+
+| Код | Действие оператора |
+|---|---|
+| `review_job_incomplete` | Проверить целостность job и связанных domain-строк; не исправлять payload вручную. |
+| `booking_hash_unproven` | Проверить сохранённое доказательство identity записи и дождаться нового валидного события; не синтезировать hash. |
+| `review_links_unconfigured` | Настроить карту для всех активных филиалов, пересоздать outbox worker и повторить preflight. |
+| `review_links_invalid` | Исправить всю карту как единый fail-closed конфиг, пересоздать outbox worker и повторить preflight. |
+| `review_link_missing` | Добавить отсутствующий `company_id` в карту, пересоздать outbox worker и повторить preflight. |
+| `planned_review_link_unprovable` | Не редактировать job; проверить планирование и создавать следующую job только из нового доказанного события. |
+| `review_link_changed` | Сверить конфигурацию и rollout; не подменять значение в уже запланированной или retry job. |

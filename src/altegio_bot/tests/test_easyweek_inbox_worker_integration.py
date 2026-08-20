@@ -11,6 +11,7 @@ import asyncio
 import json
 import math
 import uuid
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
@@ -433,6 +434,12 @@ def _reviews_on(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     monkeypatch.setattr(settings, "easyweek_notifications_enabled", True, raising=False)
     monkeypatch.setattr(settings, "easyweek_reviews_enabled", True, raising=False)
+    monkeypatch.setattr(
+        settings,
+        "easyweek_google_review_links",
+        json.dumps({str(TEST_LOCATION_ID): REVIEW_URL}),
+        raising=False,
+    )
 
 
 @pytest.fixture
@@ -729,7 +736,9 @@ async def test_the_reminder_payload_stays_minimal_and_carries_the_planned_start(
 # `plan_review_job` directly, because the properties worth proving — atomicity,
 # the claim gates, causal ordering — only exist at that level.
 
-REVIEW_URL = f"https://eyw.me/f/{TEST_BOOKING_HASH_ID}"
+# PR-10: our own Google review link for this branch, resolved by company_id.
+# EasyWeek's payload has no review_url at all — that is why PR-9 never fired.
+REVIEW_URL = "https://g.page/r/CaV0vSmrSYkdEAE/review"
 
 
 def _succeeded(*, review_url: object = REVIEW_URL, **overrides) -> dict:
@@ -1072,6 +1081,9 @@ async def test_a_succeeded_delivery_waits_until_both_switches_are_on(
     """Never destroyed by a configuration state, only deferred."""
     monkeypatch.setattr(settings, "easyweek_notifications_enabled", True, raising=False)
     monkeypatch.setattr(settings, "easyweek_reviews_enabled", True, raising=False)
+    monkeypatch.setattr(
+        settings, "easyweek_google_review_links", json.dumps({str(TEST_LOCATION_ID): REVIEW_URL}), raising=False
+    )
     starts_at = await _seed_lifecycle(bound_session_local)
 
     monkeypatch.setattr(settings, "easyweek_notifications_enabled", notifications, raising=False)
@@ -1095,6 +1107,9 @@ async def test_a_succeeded_delivery_waits_until_both_switches_are_on(
 async def test_turning_both_switches_on_processes_the_waiting_delivery_once(bound_session_local, monkeypatch) -> None:
     monkeypatch.setattr(settings, "easyweek_notifications_enabled", True, raising=False)
     monkeypatch.setattr(settings, "easyweek_reviews_enabled", False, raising=False)
+    monkeypatch.setattr(
+        settings, "easyweek_google_review_links", json.dumps({str(TEST_LOCATION_ID): REVIEW_URL}), raising=False
+    )
     starts_at = await _seed_lifecycle(bound_session_local)
 
     async with bound_session_local() as session:
@@ -1211,22 +1226,124 @@ async def test_a_succeeded_whose_identity_disagrees_earns_nothing(
 
 
 @pytest.mark.parametrize(
-    ("label", "review_url"),
+    ("label", "payload_review_url"),
     [
         ("missing", _UNSET_REVIEW),
         ("null", None),
-        ("manage-link", f"https://eyw.me/r/{TEST_BOOKING_HASH_ID}"),
-        ("malformed", "not-a-url"),
-        ("http", f"http://eyw.me/f/{TEST_BOOKING_HASH_ID}"),
-        ("other-hash", "https://eyw.me/f/12345678"),
-        ("other-host", f"https://evil.invalid/f/{TEST_BOOKING_HASH_ID}"),
+        ("hostile", "https://evil.invalid/r/anything/review"),
     ],
 )
-async def test_an_unprovable_review_link_earns_nothing(
-    bound_session_local, _reviews_on, label: str, review_url: object
+async def test_the_payload_link_is_ignored_entirely(
+    bound_session_local, _reviews_on, label: str, payload_review_url: object
 ) -> None:
+    """PR-10: EasyWeek sends no review_url, and we would not trust one anyway.
+
+    Production record 6922 has 88 root keys and no `review_url` — planning must
+    succeed regardless of what the payload does or does not carry, because the
+    link now comes from our own configuration.
+    """
     starts_at = await _seed_lifecycle(bound_session_local)
-    await _succeeded_earns_nothing(bound_session_local, _at(_succeeded(review_url=review_url), starts_at))
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(
+                session,
+                _at(_succeeded(review_url=payload_review_url), starts_at),
+                event_hint="booking-succeeded",
+                payload_hash=f"h-ignored-{label}",
+            )
+    await _run_until_idle()
+
+    async with bound_session_local() as session:
+        jobs = list((await session.execute(select(MessageJob).where(MessageJob.job_type == "review_3d"))).scalars())
+
+    assert len(jobs) == 1, f"{label}: the configured link decides, not the payload"
+    assert jobs[0].payload["review_url"] == REVIEW_URL
+
+
+@pytest.mark.parametrize(
+    ("label", "config"),
+    [
+        ("no-entry-for-branch", '{"999999": "https://g.page/r/Other/review"}'),
+        ("unconfigured", ""),
+        ("malformed-map", "{not json"),
+        ("bad-link", '{"999001": "http://g.page/r/T/review"}'),
+        ("legacy-array", '["https://g.page/r/T/review"]'),
+    ],
+)
+async def test_an_unprovable_configured_link_leaves_the_event_recoverable(
+    bound_session_local, _reviews_on, monkeypatch, label: str, config: str
+) -> None:
+    """A broken map is configuration, not a verdict on this booking.
+
+    Terminalizing here would mean that once the map is fixed, this real
+    finished visit could never be asked for a review — the row is never
+    revisited. So it stays `captured` and immediately claimable, exactly like a
+    broken category allowlist.
+    """
+    monkeypatch.setattr(settings, "easyweek_google_review_links", config, raising=False)
+    starts_at = await _seed_lifecycle(bound_session_local)
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            event_id = await _capture(
+                session, _at(_succeeded(), starts_at), event_hint="booking-succeeded", payload_hash="h-recover"
+            )
+    await _run_until_idle()
+
+    async with bound_session_local() as session:
+        event = (await session.execute(select(EasyWeekEvent).where(EasyWeekEvent.id == event_id))).scalars().one()
+
+    assert event.status == "captured", f"{label}: must stay claimable"
+    assert event.processed_at is None
+    assert event.processing_attempts == 0, "a rolled-back claim must not burn an attempt"
+    assert event.next_retry_at is not None, f"{label}: without a delay it starves every other booking"
+    assert event.next_retry_at > utcnow()
+    assert await _review_jobs(bound_session_local) == []
+
+
+async def test_past_the_delivery_deadline_the_wait_becomes_terminal(
+    bound_session_local, _reviews_on, monkeypatch
+) -> None:
+    """The window is bounded by the deadline the outbox already enforces.
+
+    While the event waits it is a predecessor, so the whole booking's lifecycle
+    queues behind it. Past `run_at + 24h` the review could not be delivered
+    anyway, so "no review" becomes final and the queue is released.
+    """
+    monkeypatch.setattr(settings, "easyweek_google_review_links", "{not json", raising=False)
+    # Started long enough ago that starts_at + 3d + 24h is already behind us.
+    starts_at = await _seed_lifecycle(bound_session_local, start=_future(days=3) - timedelta(days=9))
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            event_id = await _capture(
+                session, _at(_succeeded(), starts_at), event_hint="booking-succeeded", payload_hash="h-expired"
+            )
+    await _run_until_idle()
+
+    async with bound_session_local() as session:
+        event = (await session.execute(select(EasyWeekEvent).where(EasyWeekEvent.id == event_id))).scalars().one()
+
+    assert event.status == "processed", "past the deadline the answer is final"
+    assert await _review_jobs(bound_session_local) == []
+
+
+async def test_a_broken_map_does_not_spin_the_worker(bound_session_local, _reviews_on, monkeypatch) -> None:
+    """A rolled-back claim is not work, so the loop must pause between tries.
+
+    Reporting work here would spin claim -> rollback -> claim at full speed for
+    as long as the configuration stayed broken, with a warning per iteration.
+    """
+    monkeypatch.setattr(settings, "easyweek_google_review_links", "{not json", raising=False)
+    starts_at = await _seed_lifecycle(bound_session_local)
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, _at(_succeeded(), starts_at), event_hint="booking-succeeded", payload_hash="h-spin")
+
+    did_work = await worker.process_one()
+
+    assert did_work is False, "a recoverable rollback must let the loop sleep"
 
 
 async def test_an_opted_out_client_earns_nothing(bound_session_local, _reviews_on) -> None:
@@ -4888,3 +5005,208 @@ async def test_reconciliation_survives_a_batch_of_only_malformed_strings(bound_s
     async with bound_session_local() as session:
         rows = (await session.execute(select(EasyWeekEvent))).scalars().all()
         assert all(r.booking_uuid is None for r in rows)
+
+
+# ---------------------------------------------------------------------------
+# Configuration deferral must not monopolise the claim
+# ---------------------------------------------------------------------------
+#
+# `claim_next_event` takes the globally oldest eligible row. A recoverable
+# rollback that leaves `next_retry_at` NULL makes that same row eligible again
+# immediately, so the worker picks it forever and every newer event of every
+# OTHER booking stops being processed — exactly the starvation
+# `claim_next_event` documents itself as preventing.
+
+
+async def test_a_config_deferred_event_does_not_starve_other_bookings(
+    bound_session_local, _reviews_on, monkeypatch
+) -> None:
+    monkeypatch.setattr(settings, "easyweek_google_review_links", "{not json", raising=False)
+    starts_at = await _seed_lifecycle(bound_session_local)
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            blocked_id = await _capture(
+                session, _at(_succeeded(), starts_at), event_hint="booking-succeeded", payload_hash="h-blocked"
+            )
+            # A different booking, captured later, that must not wait for it.
+            other = booking_created()
+            other["uid"] = "77777777-8888-4999-8aaa-bbbbbbbbbbbb"
+            other["id"] = TEST_BOOKING_ID + 77
+            later_id = await _capture(
+                session,
+                _at(other, starts_at),
+                event_hint="booking-created",
+                payload_hash="h-later",
+            )
+
+    # Driven explicitly, like `test_a_stalled_event_does_not_hold_up_other_bookings`:
+    # the deferral reports "no work", which is what makes the real loop sleep,
+    # so `_run_until_idle` would stop here rather than continue.
+    assert await worker.process_one() is False, "the deferral is not work"
+    assert await worker.process_one() is True, "the OTHER booking must still flow"
+
+    async with bound_session_local() as session:
+        blocked = (await session.execute(select(EasyWeekEvent).where(EasyWeekEvent.id == blocked_id))).scalars().one()
+        later = (await session.execute(select(EasyWeekEvent).where(EasyWeekEvent.id == later_id))).scalars().one()
+
+    assert blocked.status == "captured"
+    assert blocked.next_retry_at is not None, "a NULL delay re-selects this row forever"
+    assert blocked.next_retry_at > utcnow()
+    assert blocked.processing_attempts == 0, "a deferral is not a failed attempt"
+    assert later.status == "processed", "the other booking must not wait behind it"
+
+
+async def test_a_config_deferred_event_is_picked_up_once_the_delay_elapses(
+    bound_session_local, _reviews_on, monkeypatch
+) -> None:
+    monkeypatch.setattr(settings, "easyweek_google_review_links", "{not json", raising=False)
+    starts_at = await _seed_lifecycle(bound_session_local)
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            event_id = await _capture(
+                session, _at(_succeeded(), starts_at), event_hint="booking-succeeded", payload_hash="h-elapse"
+            )
+    await _run_until_idle()
+    assert await _review_jobs(bound_session_local) == []
+
+    # The operator fixes the map, and the short delay expires.
+    monkeypatch.setattr(
+        settings, "easyweek_google_review_links", json.dumps({str(TEST_LOCATION_ID): REVIEW_URL}), raising=False
+    )
+    async with bound_session_local() as session:
+        async with session.begin():
+            await session.execute(
+                update(EasyWeekEvent).where(EasyWeekEvent.id == event_id).values(next_retry_at=utcnow())
+            )
+    await _run_until_idle()
+
+    jobs = await _review_jobs(bound_session_local)
+    assert len(jobs) == 1
+    assert jobs[0].payload["review_url"] == REVIEW_URL
+
+
+async def test_the_window_closes_at_run_at_not_a_day_later(bound_session_local, _reviews_on, monkeypatch) -> None:
+    """The bound is the moment `plan_review` itself stops being able to answer.
+
+    Between `run_at` and `run_at + 24h` no configuration change could produce a
+    job, so holding the event there would block its booking for a full day for
+    nothing.
+    """
+    monkeypatch.setattr(settings, "easyweek_google_review_links", "{not json", raising=False)
+    # `run_at` = starts_at + 3d, so this booking's review moment is one hour gone
+    # while the outbox delivery deadline (run_at + 24h) is still comfortably ahead.
+    starts_at = await _seed_lifecycle(bound_session_local, start=utcnow() - timedelta(days=3, hours=1))
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            event_id = await _capture(
+                session, _at(_succeeded(), starts_at), event_hint="booking-succeeded", payload_hash="h-atrunat"
+            )
+    await _run_until_idle()
+
+    async with bound_session_local() as session:
+        event = (await session.execute(select(EasyWeekEvent).where(EasyWeekEvent.id == event_id))).scalars().one()
+
+    assert event.status == "processed", "past run_at the answer is final, a day early"
+    assert await _review_jobs(bound_session_local) == []
+
+
+# ---------------------------------------------------------------------------
+# The deferral is quiet after the first one, and the delay is untouched
+# ---------------------------------------------------------------------------
+
+
+async def test_only_the_first_deferral_of_an_event_is_a_warning(
+    bound_session_local, _reviews_on, monkeypatch, caplog
+) -> None:
+    """A 60s cadence over a three-day window is ~4300 lines per stuck event.
+
+    The interval is load-bearing — it is the starvation guard — so the VOLUME
+    is what drops, not the delay. Primacy is read off the row itself, so it
+    survives restarts and concurrent events without module state.
+    """
+    monkeypatch.setattr(settings, "easyweek_google_review_links", "{not json", raising=False)
+    starts_at = await _seed_lifecycle(bound_session_local)
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            event_id = await _capture(
+                session, _at(_succeeded(), starts_at), event_hint="booking-succeeded", payload_hash="h-quiet"
+            )
+
+    async def _deferrals_at(level: str) -> list[str]:
+        return [r.message for r in caplog.records if r.levelname == level and "configuration_unavailable" in r.message]
+
+    with caplog.at_level("INFO"):
+        await worker.process_one()
+        first_warnings = await _deferrals_at("WARNING")
+
+        # Make it eligible again without touching anything else, then re-run.
+        async with bound_session_local() as session:
+            async with session.begin():
+                await session.execute(
+                    update(EasyWeekEvent).where(EasyWeekEvent.id == event_id).values(next_retry_at=utcnow())
+                )
+        caplog.clear()
+        await worker.process_one()
+        repeat_warnings = await _deferrals_at("WARNING")
+        repeat_infos = await _deferrals_at("INFO")
+
+    assert len(first_warnings) == 1, "the first deferral must be loud"
+    assert repeat_warnings == [], "repeats must not keep shouting"
+    assert len(repeat_infos) == 1, "but they must still be visible"
+
+    async with bound_session_local() as session:
+        event = (await session.execute(select(EasyWeekEvent).where(EasyWeekEvent.id == event_id))).scalars().one()
+
+    assert event.status == "captured", "the contract from revision 19.1 is unchanged"
+    assert event.processing_attempts == 0
+    assert event.next_retry_at is not None and event.next_retry_at > utcnow()
+
+
+async def test_a_category_config_race_gets_the_same_deferral(bound_session_local, _reviews_on, monkeypatch) -> None:
+    """The category path reaches the shared handler only through a race.
+
+    With a broken allowlist `processing_is_configured()` is already False, so
+    the event is never claimed and the handler is never reached. The reachable
+    route is narrow: the configuration is valid when the row is claimed and
+    unavailable when eligibility is evaluated. Reproduced here by making the
+    evaluation — and only the evaluation — report a recoverable outage.
+    """
+    other = booking_created()
+    other["uid"] = "77777777-8888-4999-8aaa-bbbbbbbbbbbb"
+    other["id"] = TEST_BOOKING_ID + 77
+    starts_at = await _seed_lifecycle(bound_session_local)
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            blocked_id = await _capture(
+                session, _at(_succeeded(), starts_at), event_hint="booking-succeeded", payload_hash="h-cat-race"
+            )
+            later_id = await _capture(
+                session, _at(other, starts_at), event_hint="booking-created", payload_hash="h-cat-later"
+            )
+
+    real_evaluate = worker.evaluate_service_category
+
+    def _unavailable_mid_flight(*args, **kwargs):
+        result = real_evaluate(*args, **kwargs)
+        # Same shape the allowlist parser produces when it cannot decide.
+        return replace(result, allowed=False, recoverable_configuration=True, reason="allowed_categories_invalid")
+
+    monkeypatch.setattr(worker, "evaluate_service_category", _unavailable_mid_flight)
+
+    assert await worker.process_one() is False, "a category outage defers, it does not count as work"
+    monkeypatch.setattr(worker, "evaluate_service_category", real_evaluate)
+    assert await worker.process_one() is True, "the OTHER booking must not wait behind it"
+
+    async with bound_session_local() as session:
+        blocked = (await session.execute(select(EasyWeekEvent).where(EasyWeekEvent.id == blocked_id))).scalars().one()
+        later = (await session.execute(select(EasyWeekEvent).where(EasyWeekEvent.id == later_id))).scalars().one()
+
+    assert blocked.status == "captured"
+    assert blocked.next_retry_at is not None, "categories get the same starvation guard as the link map"
+    assert blocked.processing_attempts == 0
+    assert later.status == "processed"

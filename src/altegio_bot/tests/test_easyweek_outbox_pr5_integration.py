@@ -61,6 +61,11 @@ from altegio_bot.easyweek_policy import (
     easyweek_job_type_error,
     validate_static_booking_page,
 )
+from altegio_bot.easyweek_review import (
+    REVIEW_BOOKING_HASH_UNPROVEN,
+    REVIEW_JOB_INCOMPLETE,
+    REVIEW_PLANNED_LINK_UNPROVABLE,
+)
 from altegio_bot.easyweek_service_category import (
     record_raw_with_service_category,
     record_raw_with_services_count,
@@ -116,6 +121,11 @@ STATIC_BOOKING_PAGE = "https://example.invalid/book"
 # PR-6 added a host allowlist for the static booking page; these tests are about
 # the link RULES, so the hosts they use are simply allowed. `book.example.com`
 # is used by the validator's own positive cases further down.
+# PR-10: our own Google review link. EasyWeek sends no review_url at all, so
+# the payload value is planned FROM this configuration and re-proven against it
+# on every attempt.
+EASYWEEK_REVIEW_URL = "https://g.page/r/CaV0vSmrSYkdEAE/review"
+
 BOOKING_PAGE_ALLOWED_HOSTS = "example.invalid,book.example.com"
 
 # A name no Python constant knows: if it reaches the provider it can only have
@@ -180,6 +190,20 @@ def _pr5_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     monkeypatch.setattr(settings, "easyweek_booking_page_allowed_hosts", BOOKING_PAGE_ALLOWED_HOSTS, raising=False)
     monkeypatch.setattr(settings, "easyweek_default_language", "de", raising=False)
+    # PR-10: every synthetic tenant that can earn a review gets the same link,
+    # so the send-time re-proof has something to match against.
+    monkeypatch.setattr(
+        settings,
+        "easyweek_google_review_links",
+        json.dumps(
+            {
+                str(COLLIDING_COMPANY_ID): EASYWEEK_REVIEW_URL,
+                str(OTHER_EASYWEEK_COMPANY_ID): EASYWEEK_REVIEW_URL,
+                str(TEST_LOCATION_ID): EASYWEEK_REVIEW_URL,
+            }
+        ),
+        raising=False,
+    )
     monkeypatch.setattr(settings, "easyweek_notifications_enabled", False, raising=False)
     monkeypatch.setattr(
         settings,
@@ -3222,7 +3246,7 @@ async def _seed_review_job(
         "company_id": company_id,
         "booking_uuid": str(EASYWEEK_BOOKING_UUID),
         "record_starts_at": starts_at.isoformat(),
-        "review_url": review_url if review_url is not None else f"https://eyw.me/f/{BOOKING_HASH}",
+        "review_url": review_url if review_url is not None else EASYWEEK_REVIEW_URL,
         "job_type": "review_3d",
     }
     await db.flush()
@@ -3242,7 +3266,7 @@ async def test_a_review_sends_even_when_the_price_was_never_proven(
     assert len(capture.template_calls) == 1
     call = capture.template_calls[0]
     assert call["template_name"] == "kitilash_cc_review_3d_v1"
-    assert call["params"] == ["Anna Müller", f"https://eyw.me/f/{BOOKING_HASH}"]
+    assert call["params"] == ["Anna Müller", EASYWEEK_REVIEW_URL]
 
     rows = await _outbox_rows(db, job)
     assert len(rows) == 1
@@ -3259,9 +3283,22 @@ async def test_a_review_never_carries_a_maps_manage_or_storefront_link(
 
     params = capture.template_calls[0]["params"]
     assert len(params) == 2, "a review has exactly two parameters"
-    assert params[1].startswith("https://eyw.me/f/")
-    for forbidden in ("google", "maps", "/r/", VERIFIED_PAGE, "60.00", "Wimpernverlängerung"):
-        assert forbidden not in " ".join(params), forbidden
+    assert params[1] == EASYWEEK_REVIEW_URL
+    rendered = " ".join(params)
+    # PR-10 note: the bare substring "/r/" used to stand in for "the eyw.me
+    # MANAGE link". It cannot any more — a Google review link legitimately
+    # contains "/r/" on a completely different host — so the manage and
+    # storefront links are named by their real shapes instead.
+    for forbidden in (
+        "eyw.me/r/",  # the MANAGE link
+        "eyw.me/f/",  # the EasyWeek feedback link PR-9 used to send
+        "maps.google",
+        "goo.gl/maps",
+        VERIFIED_PAGE,  # the static storefront
+        "60.00",
+        "Wimpernverlängerung",
+    ):
+        assert forbidden not in rendered, forbidden
 
 
 async def test_a_review_makes_no_altegio_api_call(db: AsyncSession, capture: CaptureProvider, monkeypatch) -> None:
@@ -3349,13 +3386,13 @@ async def test_an_unprovable_review_url_still_blocks_the_review(
         db,
         services=((11, None, None),),
         total_cost=None,
-        review_url="https://eyw.me/f/99999999",
+        review_url="https://g.page/r/DifferentTokenAB/review",
     )
 
     await _run_job(db, job)
 
     assert job.status == "canceled"
-    assert "review_url_unproven" in (job.last_error or "")
+    assert "review_link_changed" in (job.last_error or ""), job.last_error
     assert capture.template_calls == []
 
 
@@ -3400,7 +3437,7 @@ async def test_a_failed_review_delivery_produces_one_retry_with_root_identity(
     assert retry.record_id == job.record_id
     assert retry.client_id == job.client_id
     assert retry.payload["booking_uuid"] == str(EASYWEEK_BOOKING_UUID)
-    assert retry.payload["review_url"] == f"https://eyw.me/f/{BOOKING_HASH}"
+    assert retry.payload["review_url"] == EASYWEEK_REVIEW_URL
     assert datetime.fromisoformat(retry.payload["record_starts_at"]) == REMINDER_STARTS_AT
 
     retry.run_at = utcnow() - timedelta(seconds=1)
@@ -3410,7 +3447,7 @@ async def test_a_failed_review_delivery_produces_one_retry_with_root_identity(
     assert retry.status == "done", retry.last_error
     assert len(capture.template_calls) == 2
     assert capture.template_calls[-1]["template_name"] == "kitilash_cc_review_3d_v1"
-    assert capture.template_calls[-1]["params"] == ["Anna Müller", f"https://eyw.me/f/{BOOKING_HASH}"]
+    assert capture.template_calls[-1]["params"] == ["Anna Müller", EASYWEEK_REVIEW_URL]
 
 
 async def test_a_duplicate_review_callback_does_not_create_a_second_retry(
@@ -7138,3 +7175,169 @@ async def test_the_processing_fence_does_not_stop_the_delivery_retry_producer(
     assert retry.job_type in DELIVERY_RETRY_JOB_TYPES
     assert retry.job_type in {"record_created", "record_updated", "record_canceled"}
     assert retry.status == "queued", "and an old outbox worker could claim it"
+
+
+# ---------------------------------------------------------------------------
+# PR-10: the link is re-proven from configuration on every attempt
+# ---------------------------------------------------------------------------
+
+
+async def test_a_review_send_uses_the_configured_link(db: AsyncSession, capture: CaptureProvider, monkeypatch) -> None:
+    monkeypatch.setattr(settings, "easyweek_review_send_enabled", True, raising=False)
+    job = await _seed_review_job(db)
+
+    await _run_job(db, job)
+
+    assert capture.template_calls[-1]["params"][1] == EASYWEEK_REVIEW_URL
+
+
+@pytest.mark.parametrize(
+    ("label", "config"),
+    [
+        ("removed", ""),
+        ("branch-dropped", json.dumps({"999999": EASYWEEK_REVIEW_URL})),
+        ("map-broken", "{not json"),
+        ("link-invalid", json.dumps({str(COLLIDING_COMPANY_ID): "http://g.page/r/T/review"})),
+    ],
+)
+async def test_a_review_without_a_provable_link_is_not_sent(
+    db: AsyncSession, capture: CaptureProvider, monkeypatch, label: str, config: str
+) -> None:
+    """Fail-closed at send time, not just at planning time."""
+    monkeypatch.setattr(settings, "easyweek_review_send_enabled", True, raising=False)
+    job = await _seed_review_job(db)
+    monkeypatch.setattr(settings, "easyweek_google_review_links", config, raising=False)
+
+    await _run_job(db, job)
+
+    assert capture.template_calls == [], f"{label}: nothing may reach Meta"
+
+
+async def test_a_changed_link_is_refused_rather_than_swapped(
+    db: AsyncSession, capture: CaptureProvider, monkeypatch
+) -> None:
+    """`EasyWeekReviewRetryIdentity` is bound to the planned link.
+
+    Quietly substituting the new one would break the identity of an in-flight
+    delivery-retry chain, so the send is refused and the job expires on its own
+    deadline instead.
+    """
+    monkeypatch.setattr(settings, "easyweek_review_send_enabled", True, raising=False)
+    job = await _seed_review_job(db)
+    monkeypatch.setattr(
+        settings,
+        "easyweek_google_review_links",
+        json.dumps({str(COLLIDING_COMPANY_ID): "https://g.page/r/DifferentTokenAB/review"}),
+        raising=False,
+    )
+    attempts_before = job.attempts
+
+    await _run_job(db, job)
+
+    assert capture.template_calls == [], "a changed link must not be sent"
+    await db.refresh(job)
+    assert job.attempts == attempts_before, "a refused link must not burn a Meta attempt"
+
+
+# ---------------------------------------------------------------------------
+# PR-10 cleanup: `job.last_error` names WHICH link failure it was
+# ---------------------------------------------------------------------------
+#
+# Once the send fence is open, `last_error` is the only diagnosis an operator
+# has: the preflight ran before that moment and cannot speak for a job refused
+# hours later. One catch-all code would leave three different operator actions
+# — add the branch, fix the map, reconcile a changed link — behind one word.
+
+
+@pytest.mark.parametrize(
+    ("label", "config", "expected"),
+    [
+        ("branch-absent", json.dumps({"999999": EASYWEEK_REVIEW_URL}), "review_link_missing"),
+        ("map-unusable", "{not json", "review_links_invalid"),
+        ("map-unset", "", "review_links_unconfigured"),
+    ],
+)
+async def test_each_link_failure_gets_its_own_reason(
+    db: AsyncSession, capture: CaptureProvider, monkeypatch, label: str, config: str, expected: str
+) -> None:
+    monkeypatch.setattr(settings, "easyweek_review_send_enabled", True, raising=False)
+    job = await _seed_review_job(db)
+    monkeypatch.setattr(settings, "easyweek_google_review_links", config, raising=False)
+
+    await _run_job(db, job)
+
+    assert capture.template_calls == [], f"{label}: nothing may reach Meta"
+    assert expected in (job.last_error or ""), f"{label}: got {job.last_error!r}"
+    # The refusal itself is unchanged — only its description got sharper.
+    assert job.status == "canceled"
+
+
+@pytest.mark.parametrize(
+    "expected",
+    [
+        REVIEW_JOB_INCOMPLETE,
+        REVIEW_BOOKING_HASH_UNPROVEN,
+        REVIEW_PLANNED_LINK_UNPROVABLE,
+    ],
+)
+async def test_each_named_non_map_link_failure_reaches_last_error(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    monkeypatch: pytest.MonkeyPatch,
+    expected: str,
+) -> None:
+    monkeypatch.setattr(settings, "easyweek_review_send_enabled", True, raising=False)
+    job = await _seed_review_job(db)
+
+    if expected == REVIEW_JOB_INCOMPLETE:
+        real_link_for_send = ow.easyweek_review_link_for_send
+        link_checks = 0
+
+        def _lose_the_reason_after_presend(*args):
+            nonlocal link_checks
+            link_checks += 1
+            if link_checks == 1:
+                return real_link_for_send(*args)
+            return None, None
+
+        monkeypatch.setattr(ow, "easyweek_review_link_for_send", _lose_the_reason_after_presend)
+    elif expected == REVIEW_BOOKING_HASH_UNPROVEN:
+        record = await db.get(Record, job.record_id)
+        assert record is not None
+        record.easyweek_booking_hash_id = None
+    else:
+        job.payload = {**job.payload, "review_url": "not-a-proven-link"}
+    await db.flush()
+
+    await _run_job(db, job)
+
+    assert capture.template_calls == []
+    assert job.last_error == f"EasyWeek review refused: {expected}"
+    assert job.status == "canceled"
+
+
+async def test_a_changed_link_is_named_as_changed(db: AsyncSession, capture: CaptureProvider, monkeypatch) -> None:
+    monkeypatch.setattr(settings, "easyweek_review_send_enabled", True, raising=False)
+    job = await _seed_review_job(db)
+    monkeypatch.setattr(
+        settings,
+        "easyweek_google_review_links",
+        json.dumps({str(COLLIDING_COMPANY_ID): "https://g.page/r/DifferentTokenAB/review"}),
+        raising=False,
+    )
+
+    await _run_job(db, job)
+
+    assert capture.template_calls == []
+    assert "review_link_changed" in (job.last_error or ""), job.last_error
+
+
+async def test_no_reason_code_carries_a_link(db: AsyncSession, capture: CaptureProvider, monkeypatch) -> None:
+    monkeypatch.setattr(settings, "easyweek_review_send_enabled", True, raising=False)
+    job = await _seed_review_job(db)
+    monkeypatch.setattr(settings, "easyweek_google_review_links", "{not json", raising=False)
+
+    await _run_job(db, job)
+
+    assert "g.page" not in (job.last_error or "")
+    assert EASYWEEK_REVIEW_URL not in (job.last_error or "")

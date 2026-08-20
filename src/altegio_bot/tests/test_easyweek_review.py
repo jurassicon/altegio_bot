@@ -43,6 +43,10 @@ COMPANY_ID = 999001
 
 GOOD_URL = f"https://eyw.me/f/{HASH}"
 
+# PR-10: what the planner is actually handed now — our own Google review link,
+# chosen by company_id. EasyWeek never sends a review_url at all.
+GOOGLE_URL = "https://g.page/r/CaV0vSmrSYkdEAE/review"
+
 
 def _url(raw: object, *, booking_hash_id: object = HASH) -> str | None:
     return validate_review_url(raw, booking_hash_id=booking_hash_id)
@@ -168,7 +172,7 @@ def _plan(**overrides):
         "booking_uuid": BOOKING,
         "starts_at": STARTS_AT,
         "now": NOW,
-        "review_url": GOOD_URL,
+        "review_url": GOOGLE_URL,
         "booking_hash_id": HASH,
         "is_deleted": False,
     }
@@ -202,8 +206,16 @@ def test_a_booking_without_a_known_start_earns_no_review() -> None:
 
 
 def test_an_unprovable_link_earns_no_review() -> None:
+    # An eyw.me link is no longer the contract: PR-10 sends a Google link.
+    assert _plan(review_url=GOOD_URL) is None
     assert _plan(review_url=f"https://eyw.me/r/{HASH}") is None
     assert _plan(review_url=None) is None
+
+
+def test_a_booking_without_a_proven_hash_earns_no_review() -> None:
+    """The hash stopped sourcing the link, but still proves the booking."""
+    assert _plan(booking_hash_id=None) is None
+    assert _plan(booking_hash_id="  ") is None
 
 
 @pytest.mark.parametrize("days_ago", [0, 1, 30])
@@ -218,9 +230,9 @@ def test_the_boundary_is_strictly_in_the_future() -> None:
 
 
 def test_a_planned_review_carries_the_normalised_link() -> None:
-    planned = _plan(review_url=f"  https://eyw.me:443/f/{HASH}  ")
+    planned = _plan(review_url="https://g.page:443/r/CaV0vSmrSYkdEAE/review")
     assert planned is not None
-    assert planned.review_url == GOOD_URL
+    assert planned.review_url == GOOGLE_URL
 
 
 # ---------------------------------------------------------------------------
@@ -289,7 +301,7 @@ def _payload(**overrides):
         "booking_uuid": BOOKING,
         "company_id": COMPANY_ID,
         "starts_at": STARTS_AT,
-        "review_url": GOOD_URL,
+        "review_url": GOOGLE_URL,
     }
     kwargs.update(overrides)
     return review_job_payload(**kwargs)
@@ -332,3 +344,181 @@ def test_the_payload_holds_no_customer_data() -> None:
     text = str(_payload(source_event_id=1, source_payload_hash="h"))
     for forbidden in ("name", "phone", "email", "service", "price", "title", "comment", "customer"):
         assert forbidden not in text.lower()
+
+
+# ---------------------------------------------------------------------------
+# PR-10: the Google link, and where it comes from
+# ---------------------------------------------------------------------------
+#
+# Production settled the question: a `booking-succeeded` payload for Durlach
+# (company 308697, record 6922) has 88 root keys and no `review_url`, so PR-9
+# could never plan a job. The link now comes from our own configuration, keyed
+# by EasyWeek company_id — a customer taps it, so a near-miss sends them to
+# another salon's review form.
+
+from altegio_bot.easyweek_review import (  # noqa: E402
+    REVIEW_LINK_MISSING,
+    REVIEW_LINKS_INVALID,
+    REVIEW_LINKS_UNCONFIGURED,
+    google_review_url_for_company,
+    parse_google_review_links,
+    validate_google_review_url,
+)
+
+GOOGLE_TOKEN = "CaV0vSmrSYkdEAE"
+DURLACH_COMPANY = 308697
+RASTATT_COMPANY = 308698
+OTHER_GOOGLE_URL = "https://g.page/r/OtherTokenXYZ/review"
+
+
+def test_the_real_durlach_review_link_is_accepted() -> None:
+    assert validate_google_review_url(GOOGLE_URL) == GOOGLE_URL
+
+
+def test_an_explicit_443_is_the_same_origin() -> None:
+    assert validate_google_review_url(f"https://g.page:443/r/{GOOGLE_TOKEN}/review") == GOOGLE_URL
+
+
+@pytest.mark.parametrize(
+    ("label", "raw"),
+    [
+        ("http", f"http://g.page/r/{GOOGLE_TOKEN}/review"),
+        ("foreign-host", f"https://evil.com/r/{GOOGLE_TOKEN}/review"),
+        ("subdomain-suffix", f"https://g.page.evil.com/r/{GOOGLE_TOKEN}/review"),
+        ("subdomain-prefix", f"https://www.g.page/r/{GOOGLE_TOKEN}/review"),
+        # Cyrillic 'е' — visually identical, a different salon entirely.
+        ("homoglyph", "https://g.pag" + chr(0x435) + f"/r/{GOOGLE_TOKEN}/review"),
+        ("no-review-suffix", f"https://g.page/r/{GOOGLE_TOKEN}"),
+        ("manage-path", f"https://g.page/f/{GOOGLE_TOKEN}/review"),
+        ("extra-segment", f"https://g.page/r/{GOOGLE_TOKEN}/extra/review"),
+        ("empty-token", "https://g.page/r//review"),
+        ("bad-token-char", f"https://g.page/r/{GOOGLE_TOKEN}!/review"),
+        ("empty-query", f"https://g.page/r/{GOOGLE_TOKEN}/review?"),
+        ("query", f"https://g.page/r/{GOOGLE_TOKEN}/review?placeid=1"),
+        ("fragment", f"https://g.page/r/{GOOGLE_TOKEN}/review#x"),
+        ("credentials", f"https://user:pw@g.page/r/{GOOGLE_TOKEN}/review"),
+        ("odd-port", f"https://g.page:8443/r/{GOOGLE_TOKEN}/review"),
+        ("interior-space", f"https://g.page/r/{GOOGLE_TOKEN} /review"),
+        ("tab", f"https://g.page/r/{GOOGLE_TOKEN}/review" + chr(9)),
+        ("newline", f"https://g.page/r/{GOOGLE_TOKEN}/review" + chr(10)),
+        ("too-long", "https://g.page/r/" + "A" * 600 + "/review"),
+        ("leading-space", f"  https://g.page/r/{GOOGLE_TOKEN}/review"),
+        ("trailing-space", f"https://g.page/r/{GOOGLE_TOKEN}/review  "),
+        ("empty", ""),
+        ("not-a-string", 12345),
+        ("none", None),
+        # A query is required by this form, and this contract forbids queries.
+        ("search-google-form", "https://search.google.com/local/writereview?placeid=X"),
+    ],
+)
+def test_every_near_miss_link_is_refused(label: str, raw: object) -> None:
+    assert validate_google_review_url(raw) is None, f"{label} was accepted"
+
+
+# ── the configuration map ─────────────────────────────────────────────────
+
+
+def test_a_two_branch_map_parses() -> None:
+    parsed = parse_google_review_links(
+        '{"%d": "%s", "%d": "%s"}' % (DURLACH_COMPANY, GOOGLE_URL, RASTATT_COMPANY, OTHER_GOOGLE_URL)
+    )
+
+    assert parsed.ready is True
+    assert parsed.links == {DURLACH_COMPANY: GOOGLE_URL, RASTATT_COMPANY: OTHER_GOOGLE_URL}
+
+
+@pytest.mark.parametrize("raw", ["", "   ", "{}", None])
+def test_an_absent_map_is_unconfigured_not_invalid(raw: object) -> None:
+    parsed = parse_google_review_links(raw)
+
+    assert parsed.configured is False
+    assert parsed.ready is False
+    assert parsed.unavailable_reason == REVIEW_LINKS_UNCONFIGURED
+
+
+@pytest.mark.parametrize(
+    ("label", "raw"),
+    [
+        ("not-json", "not json at all"),
+        ("array", '[{"308697": "x"}]'),
+        ("string", '"308697"'),
+        ("number", "42"),
+        ("null", "null"),
+        ("duplicate-key", '{"308697": "%s", "308697": "%s"}' % (GOOGLE_URL, OTHER_GOOGLE_URL)),
+        ("non-numeric-key", '{"durlach": "%s"}' % GOOGLE_URL),
+        ("negative-key", '{"-5": "%s"}' % GOOGLE_URL),
+        ("zero-key", '{"0": "%s"}' % GOOGLE_URL),
+        ("bad-url-value", '{"308697": "http://g.page/r/T/review"}'),
+        ("non-string-value", '{"308697": 42}'),
+        ("null-value", '{"308697": null}'),
+    ],
+)
+def test_one_bad_entry_invalidates_the_whole_map(label: str, raw: str) -> None:
+    """All-or-nothing: a silently shrunken map looks like "not configured"."""
+    parsed = parse_google_review_links(raw)
+
+    assert parsed.valid is False, f"{label} was accepted"
+    assert parsed.links == {}
+    assert parsed.unavailable_reason == REVIEW_LINKS_INVALID
+
+
+def test_the_parser_never_raises_on_hostile_input() -> None:
+    for raw in ["[1]", "[[]]", '{"a"', "{" * 200, b"bytes", object(), 3.14, True]:
+        parse_google_review_links(raw)
+
+
+# ── resolution by company ─────────────────────────────────────────────────
+
+
+def test_the_branch_link_is_chosen_by_company_id() -> None:
+    config = '{"%d": "%s", "%d": "%s"}' % (DURLACH_COMPANY, GOOGLE_URL, RASTATT_COMPANY, OTHER_GOOGLE_URL)
+
+    assert google_review_url_for_company(DURLACH_COMPANY, config) == (GOOGLE_URL, None)
+    assert google_review_url_for_company(RASTATT_COMPANY, config) == (OTHER_GOOGLE_URL, None)
+
+
+def test_a_branch_without_a_link_is_missing_not_invalid() -> None:
+    url, reason = google_review_url_for_company(999999, '{"%d": "%s"}' % (DURLACH_COMPANY, GOOGLE_URL))
+
+    assert url is None
+    assert reason == REVIEW_LINK_MISSING
+
+
+def test_an_unusable_map_blocks_every_branch() -> None:
+    url, reason = google_review_url_for_company(DURLACH_COMPANY, "{not json")
+
+    assert url is None
+    assert reason == REVIEW_LINKS_INVALID
+
+
+def test_an_easyweek_company_is_never_read_from_the_altegio_map() -> None:
+    """Provider isolation: the two id spaces overlap and must not be mixed."""
+    from altegio_bot.workers.outbox_worker import GOOGLE_MAPS_REVIEW_LINKS
+
+    assert DURLACH_COMPANY not in GOOGLE_MAPS_REVIEW_LINKS
+    # And the EasyWeek link is unreachable through the Altegio map.
+    url, _reason = google_review_url_for_company(DURLACH_COMPANY, "")
+    assert url is None
+
+
+def test_a_good_entry_beside_a_bad_one_invalidates_both() -> None:
+    """The dangerous shape: a map that silently shrinks.
+
+    If the bad entry were merely skipped, the surviving branch would look
+    perfectly configured while the dropped one looked like "no link set" — and
+    would go quietly unreviewed forever. All or nothing.
+    """
+    parsed = parse_google_review_links(
+        '{"%d": "%s", "%d": "http://g.page/r/T/review"}' % (DURLACH_COMPANY, GOOGLE_URL, RASTATT_COMPANY)
+    )
+
+    assert parsed.valid is False
+    assert parsed.links == {}, "no branch may survive a partially valid map"
+    assert parsed.ready is False
+
+
+def test_a_good_entry_beside_an_unusable_key_invalidates_both() -> None:
+    parsed = parse_google_review_links('{"%d": "%s", "durlach": "%s"}' % (DURLACH_COMPANY, GOOGLE_URL, GOOGLE_URL))
+
+    assert parsed.valid is False
+    assert parsed.links == {}

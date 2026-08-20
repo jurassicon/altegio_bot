@@ -1,23 +1,22 @@
-"""PR-9: the review link, and when a booking has earned a review request.
+"""PR-9/PR-10: the review link, and when a booking has earned a review request.
 
 Two decisions live here, and nowhere else.
 
-**The link.** ``review_url`` is the only trusted source, and it is trusted only
-after being proven. Everything else that looks like a link on this booking is
-the wrong one: ``Record.short_link`` is the MANAGE link, the registry booking
-page is a static storefront, ``GOOGLE_MAPS_REVIEW_LINKS`` belongs to Altegio and
-is keyed by an Altegio company id that shares an integer space with EasyWeek's
-``location_id``. A review link is tapped by a customer, so a near-miss here is a
-customer sent to another salon's review form.
+**The link.** Since PR-10 it comes from OUR configuration —
+``EASYWEEK_GOOGLE_REVIEW_LINKS``, keyed by EasyWeek ``company_id`` — because
+production showed EasyWeek sends no ``review_url`` at all. Everything else that
+looks like a link on this booking is the wrong one: ``Record.short_link`` is the
+MANAGE link, the registry booking page is a static storefront, and
+``GOOGLE_MAPS_REVIEW_LINKS`` belongs to Altegio and is keyed by an Altegio
+company id that shares an integer space with EasyWeek's ``location_id``. A
+review link is tapped by a customer, so a near-miss here is a customer sent to
+another salon's review form.
 
-The validator is deliberately NOT the manage-link one. They are different
-contracts — ``/f/<hash>`` against ``/r/<hash>`` — and loosening one validator to
-cover both would weaken the link that PR-4 already proves. What they DO share is
-the hash: EasyWeek's own variable catalogue pairs ``booking_hash_id=40589417``
-with ``booking_page=https://eyw.me/r/40589417`` and
-``review_url=https://eyw.me/f/40589417``. So the hash inside the review URL must
-equal the ``booking_hash_id`` this booking already proved; a review link naming
-some other booking is refused rather than sent.
+Two validators, on purpose. :func:`validate_google_review_url` is the live one.
+:func:`validate_review_url` is the ``eyw.me`` contract PR-9 was built around —
+``/f/<hash>`` against the manage link's ``/r/<hash>``, with the hash required to
+match the booking's own — kept as a written contract but on no production path
+today.
 
 **The moment.** Three days after the appointment started, and only for a booking
 that finished. Never earlier, and never retroactively: a review request for a
@@ -37,9 +36,10 @@ can share one definition without a cycle.
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Final
 from urllib.parse import urlsplit
@@ -82,7 +82,14 @@ def _as_utc(value: datetime) -> datetime:
 
 
 def validate_review_url(raw: object, *, booking_hash_id: object) -> str | None:
-    """The proven review link, or ``None``. Never raises, never guesses.
+    """The proven ``eyw.me`` review link, or ``None``. Never raises, never guesses.
+
+    NOT on any production path since PR-10: the review link now comes from
+    ``EASYWEEK_GOOGLE_REVIEW_LINKS`` (see :func:`validate_google_review_url`),
+    because production proved EasyWeek sends no ``review_url`` at all. Kept
+    deliberately as the written contract for this URL shape, and exercised by
+    its own tests, so the day EasyWeek starts sending one there is a proven
+    validator rather than an improvised one.
 
     ``None`` is a suppression, not an error to work around: without a link we
     can prove, there is no review request to send.
@@ -144,9 +151,254 @@ def validate_review_url(raw: object, *, booking_hash_id: object) -> str | None:
     return f"{REVIEW_URL_SCHEME}://{REVIEW_URL_HOST}{REVIEW_URL_PREFIX}{url_hash}"
 
 
+# ── PR-10: the link comes from OUR configuration, not from the payload ─────
+#
+# Production proved the premise wrong: a real `booking-succeeded` payload for
+# the Durlach branch carries 88 root keys and `review_url`
+# is not among them. `plan_review` therefore always returned None and PR-9
+# could never fire. Revision 12 of the canonical plan authorises the change of
+# SOURCE — and only the source. Everything else about PR-9 stands.
+#
+# The link is a Google review link, chosen by EasyWeek `company_id`, and it
+# lives in its own variable. NOT in `EASYWEEK_LOCATION_MAP`, which gates
+# lifecycle and reminders as a whole: a typo in a review link must not take
+# booking confirmations down with it. NOT in `GOOGLE_MAPS_REVIEW_LINKS`, which
+# is keyed by an Altegio company id sharing an integer space with EasyWeek's
+# `location_id` — mixing them breaks provider isolation.
+
+GOOGLE_REVIEW_SCHEME: Final = "https"
+GOOGLE_REVIEW_HOST: Final = "g.page"
+GOOGLE_REVIEW_PREFIX: Final = "/r/"
+GOOGLE_REVIEW_SUFFIX: Final = "/review"
+
+# The opaque place token between them. Bounded, and deliberately the same
+# character class the rest of this module accepts.
+_GOOGLE_TOKEN_RE: Final = re.compile(r"[A-Za-z0-9_-]{1,128}")
+
+REVIEW_LINK_MISSING: Final = "review_link_missing"
+REVIEW_LINK_INVALID: Final = "review_link_invalid"
+REVIEW_LINK_CHANGED: Final = "review_link_changed"
+REVIEW_LINKS_UNCONFIGURED: Final = "review_links_unconfigured"
+REVIEW_LINKS_INVALID: Final = "review_links_invalid"
+REVIEW_JOB_INCOMPLETE: Final = "review_job_incomplete"
+REVIEW_BOOKING_HASH_UNPROVEN: Final = "booking_hash_unproven"
+REVIEW_PLANNED_LINK_UNPROVABLE: Final = "planned_review_link_unprovable"
+
+# The complete send-time vocabulary. REVIEW_LINK_INVALID is a preflight-only
+# verdict, so it is deliberately not part of this operator-facing set.
+REVIEW_SEND_REFUSAL_REASONS: Final = frozenset(
+    {
+        REVIEW_JOB_INCOMPLETE,
+        REVIEW_BOOKING_HASH_UNPROVEN,
+        REVIEW_LINKS_UNCONFIGURED,
+        REVIEW_LINKS_INVALID,
+        REVIEW_LINK_MISSING,
+        REVIEW_PLANNED_LINK_UNPROVABLE,
+        REVIEW_LINK_CHANGED,
+    }
+)
+
+
+def validate_google_review_url(raw: object) -> str | None:
+    """The proven Google review link, or ``None``. Never raises.
+
+    Same discipline as :func:`validate_review_url`, minus the booking hash: a
+    Google link identifies the SALON, not the booking, so there is nothing on
+    the appointment to compare it against. What replaces that proof is the
+    strictness of everything else — one host, one path shape, no query, no
+    fragment, no credentials, no odd port.
+
+    Only ``https://g.page/r/<token>/review`` is accepted. Other Google review
+    forms (``search.google.com/local/writereview?placeid=…``) need a query
+    string, which this contract forbids outright; supporting them is a separate
+    plan change, not a loosened validator.
+
+    The result is rebuilt from validated components, so an unnormalised
+    original can never survive into a customer's message.
+    """
+    if not isinstance(raw, str):
+        return None
+    # Deliberately NOT trimmed. This value comes from our own configuration, so
+    # stray whitespace is an operator typo worth surfacing, not something to
+    # paper over — and trimming first would swallow a trailing TAB before the
+    # control-character check below ever saw it.
+    candidate = raw
+    if not candidate or candidate != candidate.strip():
+        return None
+    if len(candidate) > MAX_REVIEW_URL_LEN:
+        return None
+    if any(ch in _FORBIDDEN_URL_CHARS for ch in candidate):
+        return None
+    # On the RAW text: a trailing "?" or "#" parses to an empty component,
+    # which is falsy, so the component checks below would wave it through. PR-9
+    # already shipped that bug once.
+    if "?" in candidate or "#" in candidate:
+        return None
+
+    try:
+        parts = urlsplit(candidate)
+        if parts.scheme != GOOGLE_REVIEW_SCHEME:
+            return None
+        # `hostname` is already lowercased and IDNA-decoded by urlsplit; an
+        # exact ASCII match rejects both `g.page.evil.com` and a Cyrillic
+        # homoglyph that merely looks like `g.page`.
+        if parts.hostname != GOOGLE_REVIEW_HOST:
+            return None
+        if parts.username or parts.password:
+            return None
+        if parts.query or parts.fragment:
+            return None
+        if parts.port is not None and parts.port != 443:
+            return None
+        path = parts.path
+    except ValueError:
+        return None
+
+    if not path.startswith(GOOGLE_REVIEW_PREFIX) or not path.endswith(GOOGLE_REVIEW_SUFFIX):
+        return None
+    token = path[len(GOOGLE_REVIEW_PREFIX) : -len(GOOGLE_REVIEW_SUFFIX)]
+    if not _GOOGLE_TOKEN_RE.fullmatch(token):
+        # Catches the empty token, an extra path segment (the "/" is not in the
+        # class) and any character outside it.
+        return None
+
+    return f"{GOOGLE_REVIEW_SCHEME}://{GOOGLE_REVIEW_HOST}{GOOGLE_REVIEW_PREFIX}{token}{GOOGLE_REVIEW_SUFFIX}"
+
+
+@dataclass(frozen=True)
+class GoogleReviewLinks:
+    """Total parse result; invalid input never degrades to a partial map."""
+
+    configured: bool
+    valid: bool
+    links: dict[int, str] = field(default_factory=dict)
+
+    @property
+    def ready(self) -> bool:
+        return self.configured and self.valid and bool(self.links)
+
+    @property
+    def unavailable_reason(self) -> str | None:
+        if not self.configured:
+            return REVIEW_LINKS_UNCONFIGURED
+        if not self.valid:
+            return REVIEW_LINKS_INVALID
+        return None
+
+
+def parse_google_review_links(raw: object) -> GoogleReviewLinks:
+    """Parse ``EASYWEEK_GOOGLE_REVIEW_LINKS``. Never raises.
+
+    Fail-closed and all-or-nothing, like ``parse_allowed_service_categories``:
+    one bad entry invalidates the whole map rather than silently shrinking it.
+    A half-parsed map is the dangerous case — the branch whose entry was
+    dropped would look like "no link configured" and go quietly unreviewed.
+    """
+    if raw is None:
+        return GoogleReviewLinks(configured=False, valid=True)
+    if not isinstance(raw, str):
+        return GoogleReviewLinks(configured=True, valid=False)
+    text = raw.strip()
+    # `{}` and `{ }` are one intention written two ways; both mean "nothing
+    # configured here yet", not "configured wrongly".
+    if not text or "".join(text.split()) == "{}":
+        return GoogleReviewLinks(configured=False, valid=True)
+
+    # The hook fires ONLY for JSON objects, and it sees the duplicate keys
+    # json.loads would otherwise silently collapse — two entries for one branch
+    # mean the operator disagrees with themselves about where customers go.
+    #
+    # It is wrapped in a marker rather than returning the bare pair list: a
+    # top-level JSON ARRAY never reaches the hook and would otherwise arrive
+    # here as an ordinary list, indistinguishable from parsed pairs, and blow up
+    # on unpacking. A parser fed untrusted configuration must not raise.
+    def _object_marker(items: list[tuple[str, object]]) -> tuple[str, list[tuple[str, object]]]:
+        return ("object", items)
+
+    try:
+        parsed = json.loads(text, object_pairs_hook=_object_marker)
+    except (ValueError, TypeError, RecursionError):
+        return GoogleReviewLinks(configured=True, valid=False)
+
+    if not (isinstance(parsed, tuple) and len(parsed) == 2 and parsed[0] == "object"):
+        # A JSON array, string, number or null — not the object this is.
+        return GoogleReviewLinks(configured=True, valid=False)
+    pairs: list[tuple[str, object]] = parsed[1]
+
+    links: dict[int, str] = {}
+    for key, value in pairs:
+        company_id = _canonical_company_id(key)
+        if company_id is None:
+            return GoogleReviewLinks(configured=True, valid=False)
+        if company_id in links:
+            return GoogleReviewLinks(configured=True, valid=False)
+        url = validate_google_review_url(value)
+        if url is None:
+            return GoogleReviewLinks(configured=True, valid=False)
+        links[company_id] = url
+
+    if not links:
+        return GoogleReviewLinks(configured=True, valid=False)
+    return GoogleReviewLinks(configured=True, valid=True, links=links)
+
+
+def _canonical_company_id(key: object) -> int | None:
+    """A positive integer company id, written as a JSON object key."""
+    if isinstance(key, bool):
+        return None
+    if isinstance(key, int):
+        value = key
+    elif isinstance(key, str):
+        candidate = key.strip()
+        # ASCII digits only, and no sign: `str.isdigit()` accepts Arabic-Indic
+        # and other Unicode digits, and a leading `+` would silently make a
+        # second valid key for the same branch written differently. Softer than the
+        # fail-closed discipline around it.
+        if not candidate or not candidate.isascii() or not candidate.isdecimal():
+            return None
+        try:
+            value = int(candidate)
+        except ValueError:
+            return None
+    else:
+        return None
+    return value if value > 0 else None
+
+
+def google_review_url_for_company(company_id: object, raw_config: object) -> tuple[str | None, str | None]:
+    """``(url, reason)`` for this branch. Exactly one side is ever set.
+
+    The reason codes are stable and carry no customer data, so they are safe in
+    an event error, a log line and a preflight report alike.
+    """
+    parsed = parse_google_review_links(raw_config)
+    if not parsed.configured or not parsed.valid:
+        return None, parsed.unavailable_reason or REVIEW_LINKS_INVALID
+
+    canonical = _canonical_company_id(company_id)
+    if canonical is None:
+        return None, REVIEW_LINK_MISSING
+    url = parsed.links.get(canonical)
+    if url is None:
+        return None, REVIEW_LINK_MISSING
+    return url, None
+
+
 def review_run_at(starts_at: datetime) -> datetime:
     """When the review request is due, in UTC."""
     return _as_utc(starts_at) + REVIEW_DELAY
+
+
+def review_moment_passed(starts_at: datetime, now: datetime) -> bool:
+    """Is it already too late for this booking to earn a review at all?
+
+    THE single definition, so the planner's "keep waiting for a fixed config"
+    window and ``plan_review``'s own refusal cannot drift apart. Past this
+    instant no configuration change can produce a job — asking for a review of
+    a visit three days gone is unsolicited marketing, not a late reminder — so
+    holding the event any longer only blocks its booking's lifecycle.
+    """
+    return review_run_at(starts_at) <= _as_utc(now)
 
 
 def easyweek_review_dedupe_key(*, booking_uuid: uuid.UUID, starts_at: datetime) -> str:
@@ -181,6 +433,11 @@ def plan_review(
 ) -> PlannedReview | None:
     """The review this finished booking owes, or ``None``.
 
+    ``review_url`` is the Google link resolved from
+    ``EASYWEEK_GOOGLE_REVIEW_LINKS`` for this branch — NOT a payload field.
+    EasyWeek does not send one (a real production record has 88 root keys and no
+    ``review_url``), which is why PR-9 never fired.
+
     Total and side-effect free, so the planner, the tests and anyone reasoning
     about production all get the same answer. Eligibility that needs the
     database — the category snapshot, the client's opt-out, the record's tenancy
@@ -190,12 +447,20 @@ def plan_review(
     if is_deleted or starts_at is None:
         return None
 
-    url = validate_review_url(review_url, booking_hash_id=booking_hash_id)
+    # PR-10: the hash no longer sources the link, but it still has to exist.
+    # It is how this booking proved its identity in PR-4, and a review request
+    # for a booking we cannot identify has nothing to stand on.
+    if normalize_booking_hash_id(booking_hash_id) is None:
+        return None
+
+    # The link now comes from our configuration, already resolved by the
+    # caller; it is re-validated here so no path can plan an unproven URL.
+    url = validate_google_review_url(review_url)
     if url is None:
         return None
 
     run_at = review_run_at(starts_at)
-    if run_at <= _as_utc(now):
+    if review_moment_passed(starts_at, now):
         # Not "slightly late": the appointment is at least three days gone, and
         # a review request for it now is unsolicited marketing.
         return None

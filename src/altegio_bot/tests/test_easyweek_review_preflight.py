@@ -35,6 +35,7 @@ from altegio_bot.models.models import (
     RecordService,
     WhatsAppSender,
 )
+from altegio_bot.scripts import easyweek_review_preflight as preflight
 from altegio_bot.scripts.easyweek_review_preflight import (
     EASYWEEK_SENDER_CODE,
     OPEN_STATUSES,
@@ -67,7 +68,9 @@ from altegio_bot.utils import utcnow
 
 BOOKING = uuid.UUID("11111111-2222-4333-8444-555555555555")
 HASH = "90000001"
-REVIEW_URL = f"https://eyw.me/f/{HASH}"
+REVIEW_URL = "https://g.page/r/CaV0vSmrSYkdEAE/review"
+# PR-10: the link is resolved from our own configuration by company_id.
+OTHER_REVIEW_URL = "https://g.page/r/DifferentTokenAB/review"
 COMPANY_ID = 999501
 OTHER_COMPANY_ID = 999502
 LOCATION_UUID = "dddddddd-eeee-4fff-8000-000000000001"
@@ -83,6 +86,12 @@ def _pr9_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "easyweek_review_send_enabled", False, raising=False)
     monkeypatch.setattr(settings, "easyweek_default_language", "de", raising=False)
     monkeypatch.setattr(settings, "easyweek_allowed_service_categories", json.dumps([CATEGORY]), raising=False)
+    monkeypatch.setattr(
+        settings,
+        "easyweek_google_review_links",
+        json.dumps({str(COMPANY_ID): REVIEW_URL, str(OTHER_COMPANY_ID): OTHER_REVIEW_URL}),
+        raising=False,
+    )
     monkeypatch.setattr(
         settings,
         "easyweek_location_map",
@@ -304,6 +313,8 @@ async def test_two_branches_are_each_proven_against_their_own_configuration(sess
                 session,
                 company_id=OTHER_COMPANY_ID,
                 booking=uuid.UUID("22222222-2222-4333-8444-555555555555"),
+                # Each branch is planned with ITS OWN configured link.
+                review_url=OTHER_REVIEW_URL,
                 suffix="2",
             )
 
@@ -398,10 +409,31 @@ async def test_a_claimed_review_behind_a_closed_fence_is_red(session_maker) -> N
 
 
 async def test_a_branch_outside_the_registry_is_red(session_maker, monkeypatch) -> None:
+    """A VALID registry that simply does not own this job's branch.
+
+    An empty or broken registry is a different finding — it stops the whole
+    audit before the queue is read — so this case keeps a registry that works
+    and lists somebody else.
+    """
     async with session_maker() as session:
         async with session.begin():
             await _seed_review(session)
-    monkeypatch.setattr(settings, "easyweek_location_map", "{}", raising=False)
+    monkeypatch.setattr(
+        settings,
+        "easyweek_location_map",
+        json.dumps(
+            {
+                "elsewhere": {
+                    "location_id": 999888,
+                    "location_uuid": "aaaaaaaa-bbbb-4ccc-8ddd-000000000009",
+                    "meta_template_prefix": "el",
+                    "booking_page_url": "https://book.durlach.invalid/d",
+                }
+            }
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(settings, "easyweek_google_review_links", json.dumps({"999888": REVIEW_URL}), raising=False)
 
     report = await _run(session_maker)
 
@@ -417,10 +449,6 @@ async def test_a_branch_outside_the_registry_is_red(session_maker, monkeypatch) 
         ("client-opted-out", {"opted_out": True}),
         ("client-not-linked", {"link_client": False}),
         ("no-booking-hash", {"booking_hash": None}),
-        ("no-review-url", {"review_url": None}),
-        ("manage-link", {"review_url": f"https://eyw.me/r/{HASH}"}),
-        ("other-hash", {"review_url": "https://eyw.me/f/12345678"}),
-        ("http-link", {"review_url": f"http://eyw.me/f/{HASH}"}),
         ("services-count-two", {"services_count": 2}),
         ("services-count-missing", {"services_count": None}),
     ],
@@ -671,6 +699,7 @@ async def test_one_blocked_candidate_fails_an_otherwise_proven_queue(session_mak
                 session,
                 company_id=OTHER_COMPANY_ID,
                 booking=uuid.UUID("22222222-2222-4333-8444-555555555555"),
+                review_url=OTHER_REVIEW_URL,
                 with_sender=False,
                 suffix="2",
             )
@@ -978,3 +1007,201 @@ async def test_a_database_failure_is_red_rather_than_green(monkeypatch) -> None:
 
     monkeypatch.setattr(module, "SessionLocal", _Boom(), raising=False)
     assert await main([]) == 1
+
+
+# ---------------------------------------------------------------------------
+# PR-10: the link is ours, so its failure modes are reported as ours
+# ---------------------------------------------------------------------------
+
+
+async def test_a_live_branch_missing_from_the_map_stops_before_the_queue(session_maker, monkeypatch) -> None:
+    """The most invisible gap, and the one this preflight exists to catch.
+
+    A branch absent from the map plans no jobs, so it can never appear as a
+    ROW in this report — its events are sitting in configuration deferral. The
+    location registry is the definition of "live", so the difference between
+    the two key sets is the finding.
+    """
+    monkeypatch.setattr(settings, "easyweek_google_review_links", json.dumps({"999999": REVIEW_URL}), raising=False)
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_review(session)
+
+    report = await _run(session_maker)
+
+    assert report.config_error == "review_links_incomplete"
+    assert report.ready is False
+    assert report.reasons == {}, "the queue must not be read at all"
+
+
+async def test_a_map_covering_every_live_branch_is_not_flagged(session_maker) -> None:
+    """The control: full coverage must not be reported as a gap."""
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_review(session)
+
+    report = await _run(session_maker)
+
+    assert report.config_error is None
+    assert report.reasons == {PROVEN: 1}
+
+
+async def test_the_per_row_missing_link_reason_survives_as_defence_in_depth(session_maker, monkeypatch) -> None:
+    """`check_review_job` keeps its own answer even though the gate precedes it.
+
+    Not an operator path any more — `rollout_state_error()` catches the same
+    states first — but the row-level guard must not silently rot.
+    """
+    monkeypatch.setattr(settings, "easyweek_google_review_links", json.dumps({"999999": REVIEW_URL}), raising=False)
+    async with session_maker() as session:
+        async with session.begin():
+            job = await _seed_review(session)
+        reason = await preflight.check_review_job(session, job)
+
+    assert reason == "review_link_missing"
+
+
+@pytest.mark.parametrize(
+    ("label", "raw"),
+    [
+        ("not-json", "{not json"),
+        ("legacy-array", '["%s"]' % REVIEW_URL),
+        ("bad-url", json.dumps({str(COMPANY_ID): "http://g.page/r/T/review"})),
+        ("duplicate", '{"%d": "%s", "%d": "%s"}' % (COMPANY_ID, REVIEW_URL, COMPANY_ID, OTHER_REVIEW_URL)),
+    ],
+)
+async def test_an_unusable_link_map_stops_before_the_queue(session_maker, monkeypatch, label: str, raw: str) -> None:
+    """The map is a statement about the whole rollout, not about one row.
+
+    Reported per-row it would be invisible on the very rollout that needs it:
+    a broken map means the planner created nothing, so the queue is empty and
+    the report would read "candidate_count=0, STOP" with no hint of the cause.
+    """
+    monkeypatch.setattr(settings, "easyweek_google_review_links", raw, raising=False)
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_review(session)
+
+    report = await _run(session_maker)
+
+    assert report.config_error == "review_links_invalid", label
+    assert report.ready is False
+    assert report.reasons == {}, "the queue must not be read at all"
+    assert report.candidate_count == 0
+
+
+async def test_an_unconfigured_link_map_is_distinguished_from_an_invalid_one(session_maker, monkeypatch) -> None:
+    """ "Never set up" and "set up wrongly" are different operator actions."""
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_review(session)
+
+    monkeypatch.setattr(settings, "easyweek_google_review_links", "", raising=False)
+    assert (await _run(session_maker)).config_error == "review_links_unconfigured"
+
+    monkeypatch.setattr(settings, "easyweek_google_review_links", "{not json", raising=False)
+    assert (await _run(session_maker)).config_error == "review_links_invalid"
+
+
+async def test_a_link_that_changed_after_planning_is_red(session_maker) -> None:
+    """Identity is bound to the planned link, so a swap is refused, not applied."""
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_review(session, review_url=OTHER_REVIEW_URL)
+
+    report = await _run(session_maker)
+
+    assert report.reasons == {"review_link_changed": 1}
+    assert report.ready is False
+
+
+async def test_an_unconfigured_map_stops_the_whole_queue(session_maker, monkeypatch) -> None:
+    """Nothing can be proven without the map; the queue is not even read."""
+    monkeypatch.setattr(settings, "easyweek_google_review_links", "", raising=False)
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_review(session)
+
+    report = await _run(session_maker)
+
+    assert report.ready is False
+    assert report.config_error == "review_links_unconfigured"
+    assert report.reasons == {}
+
+
+# ---------------------------------------------------------------------------
+# The report must NAME the gap, not merely detect it
+# ---------------------------------------------------------------------------
+
+
+async def test_the_report_names_the_branches_missing_from_the_map(session_maker, monkeypatch) -> None:
+    """Knowing "a branch is missing" without knowing which one is a diff by hand."""
+    monkeypatch.setattr(
+        settings, "easyweek_google_review_links", json.dumps({str(COMPANY_ID): REVIEW_URL}), raising=False
+    )
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_review(session)
+
+    report = await _run(session_maker)
+
+    assert report.config_error == "review_links_incomplete"
+    assert report.uncovered_company_ids == [OTHER_COMPANY_ID]
+    assert report.as_safe_dict()["uncovered_company_ids"] == [OTHER_COMPANY_ID]
+
+
+async def test_the_report_never_prints_a_link(session_maker, monkeypatch) -> None:
+    monkeypatch.setattr(
+        settings, "easyweek_google_review_links", json.dumps({str(COMPANY_ID): REVIEW_URL}), raising=False
+    )
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_review(session)
+
+    rendered = str((await _run(session_maker)).as_safe_dict())
+
+    assert REVIEW_URL not in rendered
+    assert "g.page" not in rendered
+
+
+async def test_a_covered_map_reports_no_uncovered_branches(session_maker) -> None:
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_review(session)
+
+    report = await _run(session_maker)
+
+    assert report.config_error is None
+    assert report.uncovered_company_ids == []
+
+
+# ---------------------------------------------------------------------------
+# An unusable location registry is the same class of blindness
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("label", "raw", "expected"),
+    [
+        ("unconfigured", "", "location_registry_unconfigured"),
+        ("empty-object", "{}", "location_registry_unconfigured"),
+        ("not-json", "{not json", "location_registry_invalid"),
+        ("legacy-shape", '{"du": 999501}', "location_registry_invalid"),
+    ],
+)
+async def test_an_unusable_location_registry_stops_before_the_queue(
+    session_maker, monkeypatch, label: str, raw: str, expected: str
+) -> None:
+    """With the registry broken the worker claims nothing, so the queue is
+    empty for a reason that has nothing to do with the queue."""
+    monkeypatch.setattr(settings, "easyweek_location_map", raw, raising=False)
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_review(session)
+
+    report = await _run(session_maker)
+
+    assert report.config_error == expected, label
+    assert report.ready is False
+    assert report.reasons == {}, "the queue must not be read at all"
+    assert report.candidate_count == 0
