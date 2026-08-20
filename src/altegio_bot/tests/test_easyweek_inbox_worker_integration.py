@@ -11,6 +11,7 @@ import asyncio
 import json
 import math
 import uuid
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
@@ -5110,3 +5111,102 @@ async def test_the_window_closes_at_run_at_not_a_day_later(bound_session_local, 
 
     assert event.status == "processed", "past run_at the answer is final, a day early"
     assert await _review_jobs(bound_session_local) == []
+
+
+# ---------------------------------------------------------------------------
+# The deferral is quiet after the first one, and the delay is untouched
+# ---------------------------------------------------------------------------
+
+
+async def test_only_the_first_deferral_of_an_event_is_a_warning(
+    bound_session_local, _reviews_on, monkeypatch, caplog
+) -> None:
+    """A 60s cadence over a three-day window is ~4300 lines per stuck event.
+
+    The interval is load-bearing — it is the starvation guard — so the VOLUME
+    is what drops, not the delay. Primacy is read off the row itself, so it
+    survives restarts and concurrent events without module state.
+    """
+    monkeypatch.setattr(settings, "easyweek_google_review_links", "{not json", raising=False)
+    starts_at = await _seed_lifecycle(bound_session_local)
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            event_id = await _capture(
+                session, _at(_succeeded(), starts_at), event_hint="booking-succeeded", payload_hash="h-quiet"
+            )
+
+    async def _deferrals_at(level: str) -> list[str]:
+        return [r.message for r in caplog.records if r.levelname == level and "configuration_unavailable" in r.message]
+
+    with caplog.at_level("INFO"):
+        await worker.process_one()
+        first_warnings = await _deferrals_at("WARNING")
+
+        # Make it eligible again without touching anything else, then re-run.
+        async with bound_session_local() as session:
+            async with session.begin():
+                await session.execute(
+                    update(EasyWeekEvent).where(EasyWeekEvent.id == event_id).values(next_retry_at=utcnow())
+                )
+        caplog.clear()
+        await worker.process_one()
+        repeat_warnings = await _deferrals_at("WARNING")
+        repeat_infos = await _deferrals_at("INFO")
+
+    assert len(first_warnings) == 1, "the first deferral must be loud"
+    assert repeat_warnings == [], "repeats must not keep shouting"
+    assert len(repeat_infos) == 1, "but they must still be visible"
+
+    async with bound_session_local() as session:
+        event = (await session.execute(select(EasyWeekEvent).where(EasyWeekEvent.id == event_id))).scalars().one()
+
+    assert event.status == "captured", "the contract from revision 19.1 is unchanged"
+    assert event.processing_attempts == 0
+    assert event.next_retry_at is not None and event.next_retry_at > utcnow()
+
+
+async def test_a_category_config_race_gets_the_same_deferral(bound_session_local, _reviews_on, monkeypatch) -> None:
+    """The category path reaches the shared handler only through a race.
+
+    With a broken allowlist `processing_is_configured()` is already False, so
+    the event is never claimed and the handler is never reached. The reachable
+    route is narrow: the configuration is valid when the row is claimed and
+    unavailable when eligibility is evaluated. Reproduced here by making the
+    evaluation — and only the evaluation — report a recoverable outage.
+    """
+    other = booking_created()
+    other["uid"] = "77777777-8888-4999-8aaa-bbbbbbbbbbbb"
+    other["id"] = TEST_BOOKING_ID + 77
+    starts_at = await _seed_lifecycle(bound_session_local)
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            blocked_id = await _capture(
+                session, _at(_succeeded(), starts_at), event_hint="booking-succeeded", payload_hash="h-cat-race"
+            )
+            later_id = await _capture(
+                session, _at(other, starts_at), event_hint="booking-created", payload_hash="h-cat-later"
+            )
+
+    real_evaluate = worker.evaluate_service_category
+
+    def _unavailable_mid_flight(*args, **kwargs):
+        result = real_evaluate(*args, **kwargs)
+        # Same shape the allowlist parser produces when it cannot decide.
+        return replace(result, allowed=False, recoverable_configuration=True, reason="allowed_categories_invalid")
+
+    monkeypatch.setattr(worker, "evaluate_service_category", _unavailable_mid_flight)
+
+    assert await worker.process_one() is False, "a category outage defers, it does not count as work"
+    monkeypatch.setattr(worker, "evaluate_service_category", real_evaluate)
+    assert await worker.process_one() is True, "the OTHER booking must not wait behind it"
+
+    async with bound_session_local() as session:
+        blocked = (await session.execute(select(EasyWeekEvent).where(EasyWeekEvent.id == blocked_id))).scalars().one()
+        later = (await session.execute(select(EasyWeekEvent).where(EasyWeekEvent.id == later_id))).scalars().one()
+
+    assert blocked.status == "captured"
+    assert blocked.next_retry_at is not None, "categories get the same starvation guard as the link map"
+    assert blocked.processing_attempts == 0
+    assert later.status == "processed"

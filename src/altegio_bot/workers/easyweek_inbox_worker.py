@@ -1341,7 +1341,7 @@ async def schedule_retry(event_id: int) -> bool:
             return True
 
 
-async def defer_for_configuration(event_id: int, reason: str) -> bool:
+async def defer_for_configuration(event_id: int, reason: str) -> None:
     """Hold a captured event briefly because we cannot DECIDE about it yet.
 
     Distinct from :func:`schedule_retry` on purpose. A retry means "processing
@@ -1360,6 +1360,9 @@ async def defer_for_configuration(event_id: int, reason: str) -> bool:
     already rolled back by the raise. The lookup is conditional on the row still
     being ``captured``, so a terminal status another worker committed meanwhile
     is never resurrected. Nothing about the exception is persisted.
+
+    Returns nothing: the caller's decision does not depend on the outcome, and
+    a status nobody reads is a status that quietly rots.
     """
     async with SessionLocal() as session:
         async with session.begin():
@@ -1377,17 +1380,27 @@ async def defer_for_configuration(event_id: int, reason: str) -> bool:
             )
             if event is None:
                 # Already terminal — do not resurrect it.
-                return False
+                return
+
+            # A 60s cadence over a window that can reach three days is ~4300
+            # lines per stuck event. The interval itself is load-bearing — it is
+            # the starvation guard — so the VOLUME is what gets turned down, not
+            # the delay. The row itself says which deferral this is: before this
+            # write, only the very first one has no `next_retry_at`. Read from
+            # the row rather than from module state, so it stays correct across
+            # restarts and across concurrent events.
+            first_deferral = event.next_retry_at is None
 
             # `processing_attempts` deliberately untouched.
             event.next_retry_at = utcnow() + timedelta(seconds=CONFIG_DEFERRAL_DELAY_SEC)
-            logger.warning(
-                "easyweek event=%s configuration_unavailable reason=%s retry_in=%ss",
+            log = logger.warning if first_deferral else logger.info
+            log(
+                "easyweek event=%s configuration_unavailable reason=%s retry_in=%ss first=%s",
                 event_id,
                 reason,
                 int(CONFIG_DEFERRAL_DELAY_SEC),
+                first_deferral,
             )
-            return True
 
 
 async def process_one() -> bool:

@@ -63,6 +63,7 @@ from altegio_bot.easyweek_reminder_guard import (
 )
 from altegio_bot.easyweek_review import (
     REVIEW_LINK_CHANGED,
+    REVIEW_LINK_MISSING,
     google_review_url_for_company,
     validate_google_review_url,
 )
@@ -973,8 +974,9 @@ def _easyweek_review_presend_error(
     # The link, re-resolved from configuration and matched against the
     # one this job was planned with. A review URL that
     # no longer matches is a link to somebody else's appointment.
-    if easyweek_review_url_for_send(job, record) is None:
-        return "EasyWeek review refused: review_url_unproven"
+    _url, link_reason = easyweek_review_link_for_send(job, record)
+    if link_reason is not None:
+        return f"EasyWeek review refused: {link_reason}"
 
     return None
 
@@ -994,14 +996,30 @@ def easyweek_review_url_for_send(job: MessageJob, record: Record | None) -> str 
     ``GOOGLE_MAPS_REVIEW_LINKS`` — that map is Altegio's and is keyed by an
     Altegio company id sharing an integer space with EasyWeek location ids.
     """
+    url, _reason = easyweek_review_link_for_send(job, record)
+    return url
+
+
+def easyweek_review_link_for_send(job: MessageJob, record: Record | None) -> tuple[str | None, str | None]:
+    """``(url, reason)`` — exactly one is ever set.
+
+    The reason exists because ``job.last_error`` is the ONLY diagnosis an
+    operator has once the send fence is open: the preflight runs before that
+    moment and cannot speak for a job refused hours later. Folding "no entry
+    for this branch", "the map is unusable" and "the link changed after
+    planning" into one code would leave three different operator actions
+    behind one word.
+
+    Every code is stable and PII-free; none of them carries the link itself.
+    """
     payload = getattr(job, "payload", None)
     if not isinstance(payload, dict) or record is None:
-        return None
+        return None, "review_job_incomplete"
     # The booking still has to be identifiable — that is what PR-4 proved and
     # what the review is attached to — even though the link no longer comes
     # from it.
     if normalize_booking_hash_id(getattr(record, "easyweek_booking_hash_id", None)) is None:
-        return None
+        return None, "booking_hash_unproven"
 
     # Re-resolved from configuration on EVERY attempt, so a corrected link
     # takes effect without a redeploy and a removed one stops sends at once.
@@ -1009,12 +1027,14 @@ def easyweek_review_url_for_send(job: MessageJob, record: Record | None) -> str 
         getattr(job, "company_id", None),
         settings.easyweek_google_review_links,
     )
-    if link_error is not None or current is None:
-        return None
+    if link_error is not None:
+        return None, link_error
+    if current is None:  # pragma: no cover - google_review_url_for_company pairs them
+        return None, REVIEW_LINK_MISSING
 
     planned = validate_google_review_url(payload.get("review_url"))
     if planned is None:
-        return None
+        return None, "planned_review_link_unprovable"
     if planned != current:
         # `EasyWeekReviewRetryIdentity` is bound to the planned `review_url`,
         # so quietly swapping in the new one would break the identity of an
@@ -1026,8 +1046,8 @@ def easyweek_review_url_for_send(job: MessageJob, record: Record | None) -> str 
             getattr(job, "company_id", None),
             REVIEW_LINK_CHANGED,
         )
-        return None
-    return current
+        return None, REVIEW_LINK_CHANGED
+    return current, None
 
 
 def _canonical_uuid_or_none(value: object) -> uuid.UUID | None:
@@ -3621,11 +3641,13 @@ async def _run_job_logic(
                 # inherited from the render context: `booking_link` in that
                 # context is the manage link or the storefront page, and either
                 # would be the wrong thing to ask a customer to review.
-                proven_review_url = easyweek_review_url_for_send(job, record)
+                proven_review_url, link_reason = easyweek_review_link_for_send(job, record)
                 if proven_review_url is None:
                     job.status = "canceled"
                     job.locked_at = None
-                    job.last_error = "EasyWeek review refused: review_url_unproven"
+                    # The specific cause, not a catch-all: after the fence opens
+                    # this string is the operator's only diagnosis.
+                    job.last_error = f"EasyWeek review refused: {link_reason or 'review_link_unproven'}"
                     return
                 msg_ctx["review_url"] = proven_review_url
 

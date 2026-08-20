@@ -409,10 +409,31 @@ async def test_a_claimed_review_behind_a_closed_fence_is_red(session_maker) -> N
 
 
 async def test_a_branch_outside_the_registry_is_red(session_maker, monkeypatch) -> None:
+    """A VALID registry that simply does not own this job's branch.
+
+    An empty or broken registry is a different finding — it stops the whole
+    audit before the queue is read — so this case keeps a registry that works
+    and lists somebody else.
+    """
     async with session_maker() as session:
         async with session.begin():
             await _seed_review(session)
-    monkeypatch.setattr(settings, "easyweek_location_map", "{}", raising=False)
+    monkeypatch.setattr(
+        settings,
+        "easyweek_location_map",
+        json.dumps(
+            {
+                "elsewhere": {
+                    "location_id": 999888,
+                    "location_uuid": "aaaaaaaa-bbbb-4ccc-8ddd-000000000009",
+                    "meta_template_prefix": "el",
+                    "booking_page_url": "https://book.durlach.invalid/d",
+                }
+            }
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(settings, "easyweek_google_review_links", json.dumps({"999888": REVIEW_URL}), raising=False)
 
     report = await _run(session_maker)
 
@@ -1106,3 +1127,81 @@ async def test_an_unconfigured_map_stops_the_whole_queue(session_maker, monkeypa
     assert report.ready is False
     assert report.config_error == "review_links_unconfigured"
     assert report.reasons == {}
+
+
+# ---------------------------------------------------------------------------
+# The report must NAME the gap, not merely detect it
+# ---------------------------------------------------------------------------
+
+
+async def test_the_report_names_the_branches_missing_from_the_map(session_maker, monkeypatch) -> None:
+    """Knowing "a branch is missing" without knowing which one is a diff by hand."""
+    monkeypatch.setattr(
+        settings, "easyweek_google_review_links", json.dumps({str(COMPANY_ID): REVIEW_URL}), raising=False
+    )
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_review(session)
+
+    report = await _run(session_maker)
+
+    assert report.config_error == "review_links_incomplete"
+    assert report.uncovered_company_ids == [OTHER_COMPANY_ID]
+    assert report.as_safe_dict()["uncovered_company_ids"] == [OTHER_COMPANY_ID]
+
+
+async def test_the_report_never_prints_a_link(session_maker, monkeypatch) -> None:
+    monkeypatch.setattr(
+        settings, "easyweek_google_review_links", json.dumps({str(COMPANY_ID): REVIEW_URL}), raising=False
+    )
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_review(session)
+
+    rendered = str((await _run(session_maker)).as_safe_dict())
+
+    assert REVIEW_URL not in rendered
+    assert "g.page" not in rendered
+
+
+async def test_a_covered_map_reports_no_uncovered_branches(session_maker) -> None:
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_review(session)
+
+    report = await _run(session_maker)
+
+    assert report.config_error is None
+    assert report.uncovered_company_ids == []
+
+
+# ---------------------------------------------------------------------------
+# An unusable location registry is the same class of blindness
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("label", "raw", "expected"),
+    [
+        ("unconfigured", "", "location_registry_unconfigured"),
+        ("empty-object", "{}", "location_registry_unconfigured"),
+        ("not-json", "{not json", "location_registry_invalid"),
+        ("legacy-shape", '{"du": 999501}', "location_registry_invalid"),
+    ],
+)
+async def test_an_unusable_location_registry_stops_before_the_queue(
+    session_maker, monkeypatch, label: str, raw: str, expected: str
+) -> None:
+    """With the registry broken the worker claims nothing, so the queue is
+    empty for a reason that has nothing to do with the queue."""
+    monkeypatch.setattr(settings, "easyweek_location_map", raw, raising=False)
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_review(session)
+
+    report = await _run(session_maker)
+
+    assert report.config_error == expected, label
+    assert report.ready is False
+    assert report.reasons == {}, "the queue must not be read at all"
+    assert report.candidate_count == 0

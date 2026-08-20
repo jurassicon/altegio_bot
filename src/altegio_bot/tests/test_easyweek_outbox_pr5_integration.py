@@ -3387,7 +3387,7 @@ async def test_an_unprovable_review_url_still_blocks_the_review(
     await _run_job(db, job)
 
     assert job.status == "canceled"
-    assert "review_url_unproven" in (job.last_error or "")
+    assert "review_link_changed" in (job.last_error or ""), job.last_error
     assert capture.template_calls == []
 
 
@@ -7232,3 +7232,63 @@ async def test_a_changed_link_is_refused_rather_than_swapped(
     assert capture.template_calls == [], "a changed link must not be sent"
     await db.refresh(job)
     assert job.attempts == attempts_before, "a refused link must not burn a Meta attempt"
+
+
+# ---------------------------------------------------------------------------
+# PR-10 cleanup: `job.last_error` names WHICH link failure it was
+# ---------------------------------------------------------------------------
+#
+# Once the send fence is open, `last_error` is the only diagnosis an operator
+# has: the preflight ran before that moment and cannot speak for a job refused
+# hours later. One catch-all code would leave three different operator actions
+# — add the branch, fix the map, reconcile a changed link — behind one word.
+
+
+@pytest.mark.parametrize(
+    ("label", "config", "expected"),
+    [
+        ("branch-absent", json.dumps({"999999": EASYWEEK_REVIEW_URL}), "review_link_missing"),
+        ("map-unusable", "{not json", "review_links_invalid"),
+        ("map-unset", "", "review_links_unconfigured"),
+    ],
+)
+async def test_each_link_failure_gets_its_own_reason(
+    db: AsyncSession, capture: CaptureProvider, monkeypatch, label: str, config: str, expected: str
+) -> None:
+    monkeypatch.setattr(settings, "easyweek_review_send_enabled", True, raising=False)
+    job = await _seed_review_job(db)
+    monkeypatch.setattr(settings, "easyweek_google_review_links", config, raising=False)
+
+    await _run_job(db, job)
+
+    assert capture.template_calls == [], f"{label}: nothing may reach Meta"
+    assert expected in (job.last_error or ""), f"{label}: got {job.last_error!r}"
+    # The refusal itself is unchanged — only its description got sharper.
+    assert job.status == "canceled"
+
+
+async def test_a_changed_link_is_named_as_changed(db: AsyncSession, capture: CaptureProvider, monkeypatch) -> None:
+    monkeypatch.setattr(settings, "easyweek_review_send_enabled", True, raising=False)
+    job = await _seed_review_job(db)
+    monkeypatch.setattr(
+        settings,
+        "easyweek_google_review_links",
+        json.dumps({str(COLLIDING_COMPANY_ID): "https://g.page/r/DifferentTokenAB/review"}),
+        raising=False,
+    )
+
+    await _run_job(db, job)
+
+    assert capture.template_calls == []
+    assert "review_link_changed" in (job.last_error or ""), job.last_error
+
+
+async def test_no_reason_code_carries_a_link(db: AsyncSession, capture: CaptureProvider, monkeypatch) -> None:
+    monkeypatch.setattr(settings, "easyweek_review_send_enabled", True, raising=False)
+    job = await _seed_review_job(db)
+    monkeypatch.setattr(settings, "easyweek_google_review_links", "{not json", raising=False)
+
+    await _run_job(db, job)
+
+    assert "g.page" not in (job.last_error or "")
+    assert EASYWEEK_REVIEW_URL not in (job.last_error or "")

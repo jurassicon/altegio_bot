@@ -95,6 +95,9 @@ REASON_REVIEW_LINK_INVALID: Final = "review_link_invalid"
 REASON_REVIEW_LINK_CHANGED: Final = "review_link_changed"
 # A valid map that does not cover every live branch.
 REASON_REVIEW_LINKS_INCOMPLETE: Final = "review_links_incomplete"
+# The location registry itself, which gates whether anything is claimed at all.
+REASON_LOCATION_REGISTRY_UNCONFIGURED: Final = "location_registry_unconfigured"
+REASON_LOCATION_REGISTRY_INVALID: Final = "location_registry_invalid"
 REASON_CATEGORY: Final = "category_not_allowed"
 REASON_CATEGORY_CONFIG: Final = "category_configuration_unavailable"
 REASON_DEADLINE: Final = "deadline_expired"
@@ -129,6 +132,10 @@ class ReviewPreflightReport:
     blocked_job_ids: list[int] = field(default_factory=list)
     blocked_record_ids: list[int] = field(default_factory=list)
     company_ids: set[int] = field(default_factory=set)
+    # Live branches absent from the review link map. Named, not merely counted:
+    # otherwise the operator knows one is missing but has to diff the two
+    # variables by hand to learn which.
+    uncovered_company_ids: list[int] = field(default_factory=list)
 
     @property
     def green_count(self) -> int:
@@ -166,6 +173,7 @@ class ReviewPreflightReport:
             "blocked_job_ids": sorted(self.blocked_job_ids)[:MAX_REPORTED_IDS],
             "blocked_record_ids": sorted(self.blocked_record_ids)[:MAX_REPORTED_IDS],
             "company_ids": sorted(self.company_ids)[:MAX_REPORTED_IDS],
+            "uncovered_company_ids": sorted(self.uncovered_company_ids)[:MAX_REPORTED_IDS],
             "ready": self.ready,
         }
 
@@ -196,20 +204,51 @@ def rollout_state_error() -> str | None:
     if not links.valid:
         return REVIEW_LINKS_INVALID
 
+    # An unusable registry is its own blindness, by the same argument. With it
+    # broken `processing_is_configured()` is False, so the worker claims
+    # nothing, no job is ever planned, and this report would say
+    # "candidate_count=0" without naming the cause — the exact class of silence
+    # revision 13 closed for the link map. The registry has no
+    # `unavailable_reason` of its own (unlike the link map and the category
+    # allowlist), so the two states are read off its own `configured`/`valid`
+    # rather than reclassified somewhere else.
+    registry = configured_easyweek_locations()
+    if not registry.configured:
+        return REASON_LOCATION_REGISTRY_UNCONFIGURED
+    if not registry.valid or not registry.locations:
+        return REASON_LOCATION_REGISTRY_INVALID
+
     # A valid map is not necessarily a COMPLETE one. The location registry is
     # the definition of "which branches are live", so a branch missing from the
     # map is a configuration gap — and the most invisible kind: it plans no
     # jobs, so it never appears in this report as a row, while its events sit
     # in configuration deferral. Exactly the state this preflight exists to
     # surface, and exactly the one it would otherwise miss.
-    registry = configured_easyweek_locations()
-    if registry.ready:
-        uncovered = sorted(set(registry.locations) - set(links.links))
-        if uncovered:
-            # company_id only — never the links themselves. The reason code
-            # is the report's channel; this script prints nothing else.
-            return REASON_REVIEW_LINKS_INCOMPLETE
+    if uncovered_review_link_companies():
+        return REASON_REVIEW_LINKS_INCOMPLETE
     return None
+
+
+def uncovered_review_link_companies() -> list[int]:
+    """Live branches with no entry in the review link map, as company ids.
+
+    Kept separate from :func:`rollout_state_error` deliberately. That function
+    answers one question with one string and has callers and tests relying on
+    exactly that shape; widening its return type to smuggle a payload would
+    churn every one of them for a value only a single branch needs. A named
+    helper says what it computes, is callable on its own, and keeps the reason
+    code and its detail from drifting apart.
+
+    ``company_id`` is not a link and is already reported by this preflight as
+    ``company_ids`` — the links themselves are never returned or printed.
+    """
+    links = parse_google_review_links(settings.easyweek_google_review_links)
+    if not links.valid:
+        return []
+    registry = configured_easyweek_locations()
+    if not registry.ready:
+        return []
+    return sorted(set(registry.locations) - set(links.links))
 
 
 async def select_open_review_jobs(session: AsyncSession, *, limit: int) -> tuple[list[MessageJob], bool]:
@@ -419,8 +458,11 @@ async def run_review_preflight(
     config_error = rollout_state_error()
     if config_error is not None:
         # The queue is deliberately not read: this is not an audit that failed,
-        # it is an audit that does not apply.
-        return ReviewPreflightReport(config_error=config_error)
+        # it is an audit that does not apply. The one config error that has a
+        # concrete list behind it carries that list, so the operator does not
+        # have to diff two environment variables by hand.
+        uncovered = uncovered_review_link_companies() if config_error == REASON_REVIEW_LINKS_INCOMPLETE else []
+        return ReviewPreflightReport(config_error=config_error, uncovered_company_ids=uncovered)
 
     jobs, truncated = await select_open_review_jobs(session, limit=limit)
     report = ReviewPreflightReport(candidate_count=len(jobs), truncated=truncated)

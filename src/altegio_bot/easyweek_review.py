@@ -1,23 +1,22 @@
-"""PR-9: the review link, and when a booking has earned a review request.
+"""PR-9/PR-10: the review link, and when a booking has earned a review request.
 
 Two decisions live here, and nowhere else.
 
-**The link.** ``review_url`` is the only trusted source, and it is trusted only
-after being proven. Everything else that looks like a link on this booking is
-the wrong one: ``Record.short_link`` is the MANAGE link, the registry booking
-page is a static storefront, ``GOOGLE_MAPS_REVIEW_LINKS`` belongs to Altegio and
-is keyed by an Altegio company id that shares an integer space with EasyWeek's
-``location_id``. A review link is tapped by a customer, so a near-miss here is a
-customer sent to another salon's review form.
+**The link.** Since PR-10 it comes from OUR configuration —
+``EASYWEEK_GOOGLE_REVIEW_LINKS``, keyed by EasyWeek ``company_id`` — because
+production showed EasyWeek sends no ``review_url`` at all. Everything else that
+looks like a link on this booking is the wrong one: ``Record.short_link`` is the
+MANAGE link, the registry booking page is a static storefront, and
+``GOOGLE_MAPS_REVIEW_LINKS`` belongs to Altegio and is keyed by an Altegio
+company id that shares an integer space with EasyWeek's ``location_id``. A
+review link is tapped by a customer, so a near-miss here is a customer sent to
+another salon's review form.
 
-The validator is deliberately NOT the manage-link one. They are different
-contracts — ``/f/<hash>`` against ``/r/<hash>`` — and loosening one validator to
-cover both would weaken the link that PR-4 already proves. What they DO share is
-the hash: EasyWeek's own variable catalogue pairs ``booking_hash_id=40589417``
-with ``booking_page=https://eyw.me/r/40589417`` and
-``review_url=https://eyw.me/f/40589417``. So the hash inside the review URL must
-equal the ``booking_hash_id`` this booking already proved; a review link naming
-some other booking is refused rather than sent.
+Two validators, on purpose. :func:`validate_google_review_url` is the live one.
+:func:`validate_review_url` is the ``eyw.me`` contract PR-9 was built around —
+``/f/<hash>`` against the manage link's ``/r/<hash>``, with the hash required to
+match the booking's own — kept as a written contract but on no production path
+today.
 
 **The moment.** Three days after the appointment started, and only for a booking
 that finished. Never earlier, and never retroactively: a review request for a
@@ -83,7 +82,14 @@ def _as_utc(value: datetime) -> datetime:
 
 
 def validate_review_url(raw: object, *, booking_hash_id: object) -> str | None:
-    """The proven review link, or ``None``. Never raises, never guesses.
+    """The proven ``eyw.me`` review link, or ``None``. Never raises, never guesses.
+
+    NOT on any production path since PR-10: the review link now comes from
+    ``EASYWEEK_GOOGLE_REVIEW_LINKS`` (see :func:`validate_google_review_url`),
+    because production proved EasyWeek sends no ``review_url`` at all. Kept
+    deliberately as the written contract for this URL shape, and exercised by
+    its own tests, so the day EasyWeek starts sending one there is a proven
+    validator rather than an improvised one.
 
     ``None`` is a suppression, not an error to work around: without a link we
     can prove, there is no review request to send.
