@@ -1385,10 +1385,9 @@ async def defer_for_configuration(event_id: int, reason: str) -> None:
             # A 60s cadence over a window that can reach three days is ~4300
             # lines per stuck event. The interval itself is load-bearing — it is
             # the starvation guard — so the VOLUME is what gets turned down, not
-            # the delay. The row itself says which deferral this is: before this
-            # write, only the very first one has no `next_retry_at`. Read from
-            # the row rather than from module state, so it stays correct across
-            # restarts and across concurrent events.
+            # the delay. `next_retry_at` distinguishes repeats without module
+            # state, but it is shared with transient retries: if one happened
+            # first, the first later configuration deferral is logged at info.
             first_deferral = event.next_retry_at is None
 
             # `processing_attempts` deliberately untouched.

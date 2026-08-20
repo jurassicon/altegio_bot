@@ -180,6 +180,23 @@ REVIEW_LINK_INVALID: Final = "review_link_invalid"
 REVIEW_LINK_CHANGED: Final = "review_link_changed"
 REVIEW_LINKS_UNCONFIGURED: Final = "review_links_unconfigured"
 REVIEW_LINKS_INVALID: Final = "review_links_invalid"
+REVIEW_JOB_INCOMPLETE: Final = "review_job_incomplete"
+REVIEW_BOOKING_HASH_UNPROVEN: Final = "booking_hash_unproven"
+REVIEW_PLANNED_LINK_UNPROVABLE: Final = "planned_review_link_unprovable"
+
+# The complete send-time vocabulary. REVIEW_LINK_INVALID is a preflight-only
+# verdict, so it is deliberately not part of this operator-facing set.
+REVIEW_SEND_REFUSAL_REASONS: Final = frozenset(
+    {
+        REVIEW_JOB_INCOMPLETE,
+        REVIEW_BOOKING_HASH_UNPROVEN,
+        REVIEW_LINKS_UNCONFIGURED,
+        REVIEW_LINKS_INVALID,
+        REVIEW_LINK_MISSING,
+        REVIEW_PLANNED_LINK_UNPROVABLE,
+        REVIEW_LINK_CHANGED,
+    }
+)
 
 
 def validate_google_review_url(raw: object) -> str | None:

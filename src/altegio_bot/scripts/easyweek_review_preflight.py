@@ -215,8 +215,10 @@ def rollout_state_error() -> str | None:
     registry = configured_easyweek_locations()
     if not registry.configured:
         return REASON_LOCATION_REGISTRY_UNCONFIGURED
-    if not registry.valid or not registry.locations:
+    if not registry.valid:
         return REASON_LOCATION_REGISTRY_INVALID
+    if not registry.locations:  # pragma: no cover - a valid parser result is non-empty
+        return REASON_LOCATION_REGISTRY_UNCONFIGURED
 
     # A valid map is not necessarily a COMPLETE one. The location registry is
     # the definition of "which branches are live", so a branch missing from the

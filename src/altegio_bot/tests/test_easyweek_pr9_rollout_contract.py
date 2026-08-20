@@ -19,6 +19,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from altegio_bot.easyweek_review import REVIEW_SEND_REFUSAL_REASONS
 from altegio_bot.settings import Settings
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -583,3 +584,13 @@ def test_the_runbook_map_check_survives_an_env_edit() -> None:
     assert "--entrypoint /app/.venv/bin/python" in command
     # And the reason has to be written down, not just implied by the command.
     assert "exec" in section and "созда" in section
+
+
+def test_the_runbook_lists_the_complete_send_time_refusal_vocabulary(pr9_section: str) -> None:
+    section = pr9_section[pr9_section.index("### 13.4") :]
+    documented = set(re.findall(r"^\| `([^`]+)` \|", section, flags=re.M))
+
+    assert documented == REVIEW_SEND_REFUSAL_REASONS
+    assert "http://" not in section
+    assert "https://" not in section
+    assert "g.page" not in section

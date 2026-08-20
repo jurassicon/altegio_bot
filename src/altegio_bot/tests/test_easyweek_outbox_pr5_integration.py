@@ -61,6 +61,11 @@ from altegio_bot.easyweek_policy import (
     easyweek_job_type_error,
     validate_static_booking_page,
 )
+from altegio_bot.easyweek_review import (
+    REVIEW_BOOKING_HASH_UNPROVEN,
+    REVIEW_JOB_INCOMPLETE,
+    REVIEW_PLANNED_LINK_UNPROVABLE,
+)
 from altegio_bot.easyweek_service_category import (
     record_raw_with_service_category,
     record_raw_with_services_count,
@@ -7264,6 +7269,50 @@ async def test_each_link_failure_gets_its_own_reason(
     assert capture.template_calls == [], f"{label}: nothing may reach Meta"
     assert expected in (job.last_error or ""), f"{label}: got {job.last_error!r}"
     # The refusal itself is unchanged — only its description got sharper.
+    assert job.status == "canceled"
+
+
+@pytest.mark.parametrize(
+    "expected",
+    [
+        REVIEW_JOB_INCOMPLETE,
+        REVIEW_BOOKING_HASH_UNPROVEN,
+        REVIEW_PLANNED_LINK_UNPROVABLE,
+    ],
+)
+async def test_each_named_non_map_link_failure_reaches_last_error(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    monkeypatch: pytest.MonkeyPatch,
+    expected: str,
+) -> None:
+    monkeypatch.setattr(settings, "easyweek_review_send_enabled", True, raising=False)
+    job = await _seed_review_job(db)
+
+    if expected == REVIEW_JOB_INCOMPLETE:
+        real_link_for_send = ow.easyweek_review_link_for_send
+        link_checks = 0
+
+        def _lose_the_reason_after_presend(*args):
+            nonlocal link_checks
+            link_checks += 1
+            if link_checks == 1:
+                return real_link_for_send(*args)
+            return None, None
+
+        monkeypatch.setattr(ow, "easyweek_review_link_for_send", _lose_the_reason_after_presend)
+    elif expected == REVIEW_BOOKING_HASH_UNPROVEN:
+        record = await db.get(Record, job.record_id)
+        assert record is not None
+        record.easyweek_booking_hash_id = None
+    else:
+        job.payload = {**job.payload, "review_url": "not-a-proven-link"}
+    await db.flush()
+
+    await _run_job(db, job)
+
+    assert capture.template_calls == []
+    assert job.last_error == f"EasyWeek review refused: {expected}"
     assert job.status == "canceled"
 
 

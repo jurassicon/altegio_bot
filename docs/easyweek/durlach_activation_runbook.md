@@ -2754,3 +2754,18 @@ template и sender → `outbox_messages` `sent` → Meta `delivered`/`read`. С�
 Что продолжает работать после rollback: capture всех пяти триггеров, lifecycle
 notifications, PR-8 reminders и весь Altegio path — они управляются своими
 флагами и этим откатом не затрагиваются.
+
+### 13.4 Отказы review на send-time
+
+После открытия send fence точная причина локального отказа записывается в
+`job.last_error`. Действия оператора для каждого кода:
+
+| Код | Действие оператора |
+|---|---|
+| `review_job_incomplete` | Проверить целостность job и связанных domain-строк; не исправлять payload вручную. |
+| `booking_hash_unproven` | Проверить сохранённое доказательство identity записи и дождаться нового валидного события; не синтезировать hash. |
+| `review_links_unconfigured` | Настроить карту для всех активных филиалов, пересоздать outbox worker и повторить preflight. |
+| `review_links_invalid` | Исправить всю карту как единый fail-closed конфиг, пересоздать outbox worker и повторить preflight. |
+| `review_link_missing` | Добавить отсутствующий `company_id` в карту, пересоздать outbox worker и повторить preflight. |
+| `planned_review_link_unprovable` | Не редактировать job; проверить планирование и создавать следующую job только из нового доказанного события. |
+| `review_link_changed` | Сверить конфигурацию и rollout; не подменять значение в уже запланированной или retry job. |

@@ -62,8 +62,11 @@ from altegio_bot.easyweek_reminder_guard import (
     verify_reminder_is_current,
 )
 from altegio_bot.easyweek_review import (
+    REVIEW_BOOKING_HASH_UNPROVEN,
+    REVIEW_JOB_INCOMPLETE,
     REVIEW_LINK_CHANGED,
     REVIEW_LINK_MISSING,
+    REVIEW_PLANNED_LINK_UNPROVABLE,
     google_review_url_for_company,
     validate_google_review_url,
 )
@@ -1014,12 +1017,12 @@ def easyweek_review_link_for_send(job: MessageJob, record: Record | None) -> tup
     """
     payload = getattr(job, "payload", None)
     if not isinstance(payload, dict) or record is None:
-        return None, "review_job_incomplete"
+        return None, REVIEW_JOB_INCOMPLETE
     # The booking still has to be identifiable — that is what PR-4 proved and
     # what the review is attached to — even though the link no longer comes
     # from it.
     if normalize_booking_hash_id(getattr(record, "easyweek_booking_hash_id", None)) is None:
-        return None, "booking_hash_unproven"
+        return None, REVIEW_BOOKING_HASH_UNPROVEN
 
     # Re-resolved from configuration on EVERY attempt, so a corrected link
     # takes effect without a redeploy and a removed one stops sends at once.
@@ -1034,7 +1037,7 @@ def easyweek_review_link_for_send(job: MessageJob, record: Record | None) -> tup
 
     planned = validate_google_review_url(payload.get("review_url"))
     if planned is None:
-        return None, "planned_review_link_unprovable"
+        return None, REVIEW_PLANNED_LINK_UNPROVABLE
     if planned != current:
         # `EasyWeekReviewRetryIdentity` is bound to the planned `review_url`,
         # so quietly swapping in the new one would break the identity of an
@@ -3645,9 +3648,11 @@ async def _run_job_logic(
                 if proven_review_url is None:
                     job.status = "canceled"
                     job.locked_at = None
+                    if link_reason is None:  # pragma: no cover - the helper pairs them
+                        link_reason = REVIEW_JOB_INCOMPLETE
                     # The specific cause, not a catch-all: after the fence opens
                     # this string is the operator's only diagnosis.
-                    job.last_error = f"EasyWeek review refused: {link_reason or 'review_link_unproven'}"
+                    job.last_error = f"EasyWeek review refused: {link_reason}"
                     return
                 msg_ctx["review_url"] = proven_review_url
 
