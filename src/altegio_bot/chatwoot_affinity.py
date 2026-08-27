@@ -45,7 +45,9 @@ from typing import Final
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from altegio_bot.chatwoot_outbox_route import resolve_operator_outbox_route
 from altegio_bot.models.models import Client, MessageJob, OutboxMessage, Record, WhatsAppSender
+from altegio_bot.providers.base import ChatwootRoute
 from altegio_bot.webhooks.common import ChatwootTenantIdentity, chatwoot_tenant_identity
 
 # `sent` means Meta accepted the message; a `failed` callback can still follow
@@ -56,6 +58,10 @@ PROVEN_DELIVERY_STATUSES: Final[frozenset[str]] = frozenset({"delivered", "read"
 # An explicit General ACK (STOP/START, promo answers) is deliberately routed to
 # General and says nothing about a branch. Neither does a bot row with no job
 # behind it: without a MessageJob there is no provider-scoped identity to read.
+#
+# BOT rows only. An operator row's route is decided by
+# ``resolve_operator_outbox_route``, which demands the complete provenance pair
+# — a lone marker there is an audit conflict, not a General intent.
 GENERAL_ROUTE_MARKER: Final[str] = "general"
 
 
@@ -174,10 +180,28 @@ async def _identity_of_outbox(
 ) -> tuple[ChatwootTenantIdentity | None, AffinityResult | None]:
     """(identity, blocking_result). Both None means "proves nothing"."""
     meta = row.meta if isinstance(row.meta, dict) else {}
-    if meta.get("chatwoot_route") == GENERAL_ROUTE_MARKER:
-        return None, None  # explicit General: routed there on purpose
 
     if row.message_source == "operator":
+        # PR-7.4: ONE trust model for an operator row, shared with the
+        # reply/reaction resolver. Reading a bare `chatwoot_route` here while
+        # `_get_outbox_context_target` demanded the full provenance pair meant
+        # the same row could be "deliberately General" to one resolver and a
+        # broken audit row to the other.
+        route, route_error = resolve_operator_outbox_route(
+            message_source=row.message_source,
+            job_id=row.job_id,
+            template_code=row.template_code,
+            sender_id=row.sender_id,
+            meta=row.meta,
+        )
+        if route_error is not None:
+            # Half a proof is not "nothing known": a partial or contradictory
+            # marker blocks rather than quietly falling through to General.
+            return None, _invalid("communication", route_error)
+        if route is ChatwootRoute.GENERAL:
+            # The single-inbox relay chose a transport line on purpose. It is
+            # deliberately not evidence of any branch.
+            return None, None
         if row.sender_id is None:
             return None, None
         sender = await session.get(WhatsAppSender, row.sender_id)
@@ -189,6 +213,9 @@ async def _identity_of_outbox(
         if row.company_id is not None and int(row.company_id) != int(sender.company_id):
             return None, _invalid("communication", "operator_outbox_sender_company_mismatch")
         return identity, None
+
+    if meta.get("chatwoot_route") == GENERAL_ROUTE_MARKER:
+        return None, None  # explicit General: routed there on purpose
 
     # Bot / lifecycle row: the job is the only provider-scoped source.
     if row.job_id is None:

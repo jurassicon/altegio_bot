@@ -107,9 +107,17 @@ def runbook() -> str:
 
 @pytest.fixture(scope="module")
 def pr9_section(runbook: str) -> str:
-    """Only the PR-9 chapter, so an assertion cannot pass on PR-8 prose."""
+    """Only the PR-9 chapter, so an assertion cannot pass on neighbouring prose.
+
+    Bounded at BOTH ends. Slicing to the end of the file was correct only while
+    PR-9 happened to be the last chapter: the next chapter appended after it
+    would silently be read as PR-9 prose, and every "must not appear" assertion
+    below would start failing on somebody else's section.
+    """
     start = runbook.index("## 13. PR-9")
-    return runbook[start:]
+    following = re.search(r"^## \d+\. ", runbook[start + 1 :], flags=re.M)
+    end = start + 1 + following.start() if following else len(runbook)
+    return runbook[start:end]
 
 
 # ---------------------------------------------------------------------------

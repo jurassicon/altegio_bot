@@ -291,6 +291,42 @@ class Settings(BaseSettings):
             )
         return v
 
+    # PR-7.4 production hotfix: single-inbox operator relay.
+    #
+    # A customer who writes FIRST has no provider/company affiliation at all,
+    # so the affinity resolver correctly answers NO_EVIDENCE and the operator's
+    # General reply dies as `general_affinity_no_evidence`. Emptying the branch
+    # map does not fix it either: every branch sender shares one Meta
+    # phone_number_id, so the legacy fallback ends in `ambiguous_sender`.
+    #
+    # This is the id of the ONE WhatsAppSender such a reply may use. It is
+    # never a search hint: the row is read by primary key and then PROVED —
+    # active, same phone_number_id as the relay AND as META_WA_PHONE_NUMBER_ID,
+    # valid provider/company pair. No LIMIT 1, no min(id), no row order.
+    #
+    # 0 (default) — off; every relay decision stays exactly as it is today.
+    # A positive value is honoured ONLY together with an unconfigured
+    # CHATWOOT_INBOX_COMPANY_MAP, CHATWOOT_INBOUND_ROUTING_MODE=general, and a
+    # reply written in exactly CHATWOOT_INBOX_ID. Any other combination is a
+    # configuration fault and fails closed before Meta is called.
+    #
+    # Consumed by altegio-whatsapp-inbox-worker only. Automatic MessageJob
+    # sends keep their own provider-scoped sender selection.
+    chatwoot_single_inbox_operator_sender_id: int = 0
+
+    @field_validator("chatwoot_single_inbox_operator_sender_id")
+    @classmethod
+    def validate_single_inbox_operator_sender_id(cls, v: int) -> int:
+        if v < 0:
+            # Fail fast: a negative id is a typo, and quietly reading it as
+            # "off" would hide a rollback the operator believes is armed.
+            raise ValueError(
+                "chatwoot_single_inbox_operator_sender_id must be 0 (off) or a "
+                "positive WhatsAppSender id. "
+                "Check CHATWOOT_SINGLE_INBOX_OPERATOR_SENDER_ID."
+            )
+        return v
+
     @field_validator("chatwoot_operator_closed_window_mode")
     @classmethod
     def validate_closed_window_mode(cls, v: str) -> str:

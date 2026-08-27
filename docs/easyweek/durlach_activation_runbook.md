@@ -398,8 +398,17 @@ General inbox и возвращается в `General / Unassigned`, а не п�
 противоречивая строка, неизвестный marker и любой другой bot Outbox без
 `MessageJob` остаются fail-closed с технической route-причиной. Marker на
 lifecycle Outbox с `MessageJob` не заменяет provider-scoped identity, а marker
-на operator Outbox не заменяет identity из `WhatsAppSender`: оба случая
-считаются audit-конфликтом и блокируются fail-closed.
+на operator Outbox сам по себе не заменяет identity из `WhatsAppSender`: оба
+случая считаются audit-конфликтом и блокируются fail-closed.
+
+Единственное узкое исключение для operator Outbox — single-inbox hotfix (§14).
+Там sender является технической линией отправки, а не доказательством филиала,
+и строка несёт согласованную пару `chatwoot_route=general` +
+`single_inbox_relay={route, sender_scope}` на настоящей operator-relay строке
+(`message_source=operator`, `job_id IS NULL`, известный `template_code`,
+непустой `sender_id`). Только полная пара доказывает General и запрещает читать
+sender как tenant evidence. Любая половина, чужой marker, лишний ключ или
+несоответствующая строка остаются audit-конфликтом и блокируются fail-closed.
 
 General ID по-прежнему валидируется против всей branch map до создания
 Chatwoot client. Совпадение General хотя бы с одним branch inbox остаётся hard
@@ -2769,3 +2778,812 @@ notifications, PR-8 reminders и весь Altegio path — они управля
 | `review_link_missing` | Добавить отсутствующий `company_id` в карту, пересоздать outbox worker и повторить preflight. |
 | `planned_review_link_unprovable` | Не редактировать job; проверить планирование и создавать следующую job только из нового доказанного события. |
 | `review_link_changed` | Сверить конфигурацию и rollout; не подменять значение в уже запланированной или retry job. |
+---
+
+## 14. PR-7.4 — single-inbox rollback: один inbox и один явный sender
+
+Production hotfix поверх PR-7.2. Ничего из PR-7/PR-7.2/PR-7.3 не откатывается,
+миграций нет, EasyWeek processing, notifications, reminders, reviews, реестр
+локаций, шаблоны и Altegio webhook path не затрагиваются.
+
+### 14.1 Что именно было сломано
+
+Новый клиент пишет **первым**. У него нет ни Client, ни Record, ни одной ранее
+доставленной коммуникации — доказывать филиал нечем. `resolve_tenant_affinity`
+отвечает `NO_EVIDENCE`, и это правильный ответ. Ответ оператора из General
+терминально блокируется как `general_affinity_no_evidence` (либо
+`general_affinity_ambiguous` / `general_affinity_invalid`, если evidence
+конфликтует). `CHATWOOT_INBOUND_ROUTING_MODE=general` эту блокировку не
+снимает: это режим **отображения**.
+
+Пустая `CHATWOOT_INBOX_COMPANY_MAP` сама по себе тоже не помогает. Все
+филиальные sender-строки живут на одном общем Meta `phone_number_id`, поэтому
+legacy-fallback по номеру видит несколько provider-scoped строк и отвечает
+`ambiguous_sender`.
+
+Вывод, который зафиксирован в коде: правильного ответа в данных нет, и
+выдумывать его нельзя. Оператор задаёт единственный sender явно.
+
+### 14.2 Настройка
+
+`CHATWOOT_SINGLE_INBOX_OPERATOR_SENDER_ID` — id строки `whatsapp_senders`.
+
+`0` (default) — выключено. Все решения relay остаются ровно такими, как сегодня.
+
+Положительное значение действует **только** при одновременном выполнении всех
+условий:
+
+| Условие | Проверка |
+| --- | --- |
+| branch map не настроена | `CHATWOOT_INBOX_COMPANY_MAP` = `""` или `{}` |
+| режим отображения | `CHATWOOT_INBOUND_ROUTING_MODE=general` |
+| General inbox задан | `CHATWOOT_INBOX_ID` — положительный int |
+| ответ написан именно в нём | `conversation.inbox_id` точно равен `CHATWOOT_INBOX_ID` |
+
+Строка читается **по первичному ключу** и затем доказывается: существует,
+`is_active=true`, `phone_number_id` совпадает и с `phone_number_id` самого
+relay, и с `META_WA_PHONE_NUMBER_ID`, `provider`/`company_id` образуют валидную
+CRM identity. Выбора по `LIMIT 1`, `min(id)`, первой строке или порядку строк на
+этом пути нет. Остальные sender-строки не деактивируются и продолжают
+обслуживать автоматические `MessageJob` своим обычным provider-scoped выбором.
+
+Ограничение 24-часового Meta customer service window не ослаблено:
+`CHATWOOT_OPERATOR_CLOSED_WINDOW_MODE` работает как раньше.
+
+Обе production-величины (`CHATWOOT_INBOX_ID` и
+`CHATWOOT_SINGLE_INBOX_OPERATOR_SENDER_ID`) задаются только в `.env`. В коде,
+defaults, тестах и `.env.example` их нет.
+
+### 14.3 Как найти id sender до правки `.env`
+
+Sender выбирается один раз и подтверждается человеком. Вывод содержит только id,
+provider, company_id, sender_code и booleans — ни телефона, ни текста, ни token.
+
+```bash
+cd /opt/altegio_bot
+$COMPOSE exec -T postgres psql -U altegio -d altegio_bot -c "SELECT s.id, s.provider, s.company_id, s.sender_code, s.is_active, (SELECT count(*) FROM outbox_messages o WHERE o.sender_id = s.id AND o.message_source = 'operator') AS operator_messages FROM whatsapp_senders s ORDER BY operator_messages DESC, s.id;"
+```
+
+Берётся активная строка с наибольшей исторической operator-нагрузкой на общем
+Meta-номере. Её `phone_number_id` обязан совпадать с `META_WA_PHONE_NUMBER_ID`:
+worker всё равно проверит это сам и откажет, но узнать об этом лучше до deploy.
+
+**Этот sender — техническая линия отправки, а не доказательство филиала
+клиента.** В production для hotfix выбран существующий sender Karlsruhe, но он
+не делает клиента клиентом Karlsruhe. Каждое отправленное через hotfix
+сообщение помечается в `OutboxMessage.meta` парой
+`chatwoot_route=general` + `single_inbox_relay={route, sender_scope}`, поэтому
+после возврата к `affinity` reply и reaction клиента на такое сообщение снова
+приходят в General, а не в филиал технического sender. Половина этой пары
+доказательством не считается и блокируется fail-closed. Ту же пару требует и
+affinity resolver: `chatwoot_route` без `single_inbox_relay` на operator-строке
+считается audit-конфликтом и блокирует, а не «доказывает General».
+
+### 14.4 Rollout
+
+Chatwoot-переменные живут в `/opt/altegio_bot/.env`. `easyweek.env` этот hotfix
+не трогает и править его не нужно. Отдельная строка вида `KEY=value` в консоли
+**не** правит `.env` и до Docker Compose не доходит — значения записываются в
+файл.
+
+Все блоки, меняющие `.env`, исполняются одним и тем же безопасным контрактом:
+`set -euo pipefail`, временный файл рядом с `.env` на той же файловой системе,
+полное формирование и проверка временного файла, перенос owner/group/mode с
+исходного `.env`, атомарная замена через `mv`, cleanup trap. Исходный `.env`
+не усекается на месте, и ошибка на любом шаге оставляет его байт в байт прежним.
+
+**Шаг 1. Gate: код уже умеет параметр.** Пока хотя бы один worker отвечает
+`single_inbox_sender_supported: False`, переключать env нельзя: карта опустеет,
+sender прочитан не будет, и operator relay остановится на `ambiguous_sender`.
+
+```bash
+cd /opt/altegio_bot
+for CHATWOOT_SERVICE in altegio-outbox-worker altegio-whatsapp-inbox-worker; do
+  echo "SERVICE=$CHATWOOT_SERVICE"
+  $COMPOSE exec -T "$CHATWOOT_SERVICE" /app/.venv/bin/python -c 'from altegio_bot.settings import Settings; print({"single_inbox_sender_supported": "chatwoot_single_inbox_operator_sender_id" in Settings.model_fields})'
+done
+```
+
+**Шаг 2. Доказать pre-hotfix состояние и зафиксировать его в handoff.**
+
+Откат восстанавливает карту из backup. Backup, снятый уже после включения
+hotfix, содержит `CHATWOOT_INBOX_COMPANY_MAP={}` — «откат» по нему вернул бы production в то же
+пустое состояние. Поэтому rollout обязан сначала **доказать**, что текущая карта
+действительно pre-hotfix, и только потом получить право её стереть.
+
+Шаг делает ровно это:
+
+1. в текущем `.env` `CHATWOOT_INBOX_COMPANY_MAP` встречается ровно один раз;
+2. карта разбирается тем же fail-closed парсером, что и worker, и обязана быть
+   `configured` + `valid` + `provider_scoped`;
+3. `CHATWOOT_INBOUND_ROUTING_MODE` встречается ровно один раз и равен
+   `affinity`, а `CHATWOOT_SINGLE_INBOX_OPERATOR_SENDER_ID` либо отсутствует,
+   либо встречается ровно один раз со значением `0`;
+4. снимается sibling backup через `cp -p` (owner/group/mode сохраняются);
+5. считается SHA256 всего backup и детерминированный fingerprint нормализованной
+   карты — sha256 от отсортированных `(inbox_id, provider, company_id)`;
+6. handoff создаётся атомарно, mode `0600`, и хранит путь backup, его SHA256 и
+   fingerprint карты. Ни карта, ни mode, ни sender в handoff не пишутся: handoff
+   уже связан с backup через SHA256, поэтому значения доказываются прямо из
+   привязанного файла.
+
+**Почему baseline — precondition, а не только карта.** §14.7 восстанавливает не
+произвольную конфигурацию, а один подтверждённый production baseline: исходную
+provider-scoped карту, `affinity` и sender off. Если `.env` неожиданно окажется
+в `context`, доказанной карты недостаточно — откат всё равно записал бы
+`affinity`, то есть режим, которого до rollout не было. `context` и `general` —
+полностью валидные режимы приложения, но не поддерживаемое исходное состояние
+именно этого одноразового rollout, поэтому процедура останавливается.
+
+Положительный sender при непустой карте тоже не сохраняется и не
+восстанавливается: runtime считает такую комбинацию `single_inbox_config_invalid`
+(§14.6), так что это не второй легальный baseline, а конфигурация, которую
+нужно исправить до rollout.
+
+Отсутствующая строка sender и явный `0` эквивалентны по смыслу — обе означают
+«функция выключена», — поэтому откат просто пишет `0` и не пытается
+восстанавливать отсутствие строки байт в байт.
+
+Уже существующий handoff **не** принимается на веру: он проходит полную
+проверку — путь, symlink, поля, SHA256, fingerprint карты и baseline
+(`affinity` + sender off) в самом backup. Если live `.env` всё ещё в pre-hotfix
+состоянии, его карта обязана совпасть со снимком, а mode и sender — пройти тот же
+baseline; расхождение означает, что конфигурация изменилась после создания
+handoff, и rollout останавливается. Если hotfix уже включён, live `.env` обязан
+быть ровно в armed-состоянии: карта `{}`, режим `general`, положительный sender.
+Существующий handoff никогда не перепривязывается автоматически.
+
+Проверка карты выполняется внутри worker-контейнера, потому что там живёт тот же
+парсер. В контейнер передаётся **только** строка карты, а не `.env` целиком:
+
+```bash
+cd /opt/altegio_bot
+export COMPOSE
+bash <<'PREHOTFIX_HANDOFF'
+set -euo pipefail
+ENV_FILE="${ENV_FILE:-/opt/altegio_bot/.env}"
+HANDOFF_FILE="${HANDOFF_FILE:-/root/altegio_bot-single-inbox-hotfix.handoff}"
+MAP_KEY=CHATWOOT_INBOX_COMPANY_MAP
+MODE_KEY=CHATWOOT_INBOUND_ROUTING_MODE
+SENDER_KEY=CHATWOOT_SINGLE_INBOX_OPERATOR_SENDER_ID
+VERIFY_BACKUP_CMD="${VERIFY_BACKUP_CMD:-${COMPOSE:?export COMPOSE from the Production Compose contract first} exec -T altegio-whatsapp-inbox-worker /app/.venv/bin/python -m altegio_bot.scripts.verify_pre_hotfix_env_backup}"
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi
+}
+handoff_field() {
+  test "$(grep -Ec "^$1=" "$HANDOFF_FILE")" = "1"
+  grep -E "^$1=" "$HANDOFF_FILE" | cut -d= -f2-
+}
+env_key_count() {
+  COUNT_RC=0
+  KEY_COUNT="$(grep -Ec "^$2=" "$1")" || COUNT_RC=$?
+  test "$COUNT_RC" -le 1
+  printf '%s\n' "$KEY_COUNT"
+}
+env_value() {
+  grep -E "^$2=" "$1" | cut -d= -f2-
+}
+assert_pre_hotfix_baseline() {
+  test "$(env_key_count "$1" "$MODE_KEY")" = "1"
+  test "$(env_value "$1" "$MODE_KEY")" = "affinity"
+  SENDER_COUNT="$(env_key_count "$1" "$SENDER_KEY")"
+  test "$SENDER_COUNT" -le 1
+  if [ "$SENDER_COUNT" = "1" ]; then
+    test "$(env_value "$1" "$SENDER_KEY")" = "0"
+  fi
+}
+assert_armed_state() {
+  test "$(env_key_count "$1" "$MODE_KEY")" = "1"
+  test "$(env_value "$1" "$MODE_KEY")" = "general"
+  test "$(env_key_count "$1" "$SENDER_KEY")" = "1"
+  printf '%s\n' "$(env_value "$1" "$SENDER_KEY")" | grep -Eq '^[1-9][0-9]*$'
+}
+test -f "$ENV_FILE"
+test ! -L "$ENV_FILE"
+if [ ! -e "$HANDOFF_FILE" ]; then
+  test "$(grep -Ec "^${MAP_KEY}=" "$ENV_FILE")" = "1"
+  assert_pre_hotfix_baseline "$ENV_FILE"
+  LIVE_MAP_FINGERPRINT="$(grep -E "^${MAP_KEY}=" "$ENV_FILE" \
+    | $VERIFY_BACKUP_CMD snapshot \
+    | grep -E '^PRE_HOTFIX_MAP_FINGERPRINT=' | cut -d= -f2-)"
+  test -n "$LIVE_MAP_FINGERPRINT"
+  BACKUP_FILE="${ENV_FILE}.bak.$(date -u +%Y%m%dT%H%M%SZ)"
+  test ! -e "$BACKUP_FILE"
+  cp -p "$ENV_FILE" "$BACKUP_FILE"
+  BACKUP_SHA256="$(sha256_of "$BACKUP_FILE")"
+  HANDOFF_TMP="$(mktemp "${HANDOFF_FILE}.XXXXXX")"
+  trap 'rm -f "$HANDOFF_TMP"' EXIT
+  chmod 600 "$HANDOFF_TMP"
+  printf 'PRE_HOTFIX_ENV_BACKUP=%s\n' "$BACKUP_FILE" > "$HANDOFF_TMP"
+  printf 'PRE_HOTFIX_BACKUP_SHA256=%s\n' "$BACKUP_SHA256" >> "$HANDOFF_TMP"
+  printf 'PRE_HOTFIX_MAP_FINGERPRINT=%s\n' "$LIVE_MAP_FINGERPRINT" >> "$HANDOFF_TMP"
+  mv -n "$HANDOFF_TMP" "$HANDOFF_FILE"
+  trap - EXIT
+  rm -f "$HANDOFF_TMP"
+fi
+test -f "$HANDOFF_FILE"
+test ! -L "$HANDOFF_FILE"
+PRE_HOTFIX_ENV_BACKUP="$(handoff_field PRE_HOTFIX_ENV_BACKUP)"
+PRE_HOTFIX_BACKUP_SHA256="$(handoff_field PRE_HOTFIX_BACKUP_SHA256)"
+PRE_HOTFIX_MAP_FINGERPRINT="$(handoff_field PRE_HOTFIX_MAP_FINGERPRINT)"
+test -n "$PRE_HOTFIX_ENV_BACKUP"
+test -n "$PRE_HOTFIX_BACKUP_SHA256"
+test -n "$PRE_HOTFIX_MAP_FINGERPRINT"
+case "$PRE_HOTFIX_ENV_BACKUP" in "${ENV_FILE}.bak."*) ;; *) exit 1 ;; esac
+test -f "$PRE_HOTFIX_ENV_BACKUP"
+test ! -L "$PRE_HOTFIX_ENV_BACKUP"
+test "$(sha256_of "$PRE_HOTFIX_ENV_BACKUP")" = "$PRE_HOTFIX_BACKUP_SHA256"
+grep -E "^${MAP_KEY}=" "$PRE_HOTFIX_ENV_BACKUP" \
+  | $VERIFY_BACKUP_CMD verify --expect-fingerprint "$PRE_HOTFIX_MAP_FINGERPRINT" > /dev/null
+assert_pre_hotfix_baseline "$PRE_HOTFIX_ENV_BACKUP"
+LIVE_MAP_RC=0
+LIVE_MAP_LINES="$(grep -E "^${MAP_KEY}=" "$ENV_FILE")" || LIVE_MAP_RC=$?
+test "$LIVE_MAP_RC" -le 1
+if [ "$LIVE_MAP_LINES" = "${MAP_KEY}={}" ]; then
+  assert_armed_state "$ENV_FILE"
+else
+  printf '%s\n' "$LIVE_MAP_LINES" \
+    | $VERIFY_BACKUP_CMD verify --expect-fingerprint "$PRE_HOTFIX_MAP_FINGERPRINT" > /dev/null
+  assert_pre_hotfix_baseline "$ENV_FILE"
+fi
+echo "pre-hotfix handoff proven"
+PREHOTFIX_HANDOFF
+```
+
+Печатаются только booleans, inbox/provider/company и hex-дайджест — ни карты,
+ни токенов, ни содержимого `.env`. Handoff и backup удаляются только после
+успешного post-rollback smoke.
+
+**Шаг 3. Подтверждённый sender id как положительное целое.** `export` нужен,
+чтобы значение дошло до блока изменения `.env`.
+
+```bash
+cd /opt/altegio_bot
+export SINGLE_INBOX_SENDER_ID=<подтверждённый_sender_id>
+printf '%s\n' "$SINGLE_INBOX_SENDER_ID" | grep -Eq '^[1-9][0-9]*$'
+```
+
+**Шаг 4. Доказать handoff ещё раз и атомарно записать три ключа.**
+
+Прохождения шага 2 недостаточно: между ним и записью может пройти сколько угодно
+времени, а backup может исчезнуть, быть подменён или указывать уже на другую
+карту. Поэтому блок, который реально стирает `CHATWOOT_INBOX_COMPANY_MAP`, сам заново проходит
+весь gate — handoff, symlink, поля, SHA256 backup, fingerprint карты, baseline
+`affinity` + sender off в backup и, пока live `.env` ещё pre-hotfix, совпадение
+его карты со снимком вместе с тем же baseline. Право очистить карту даёт только
+этот gate, а не факт выполнения предыдущего шага.
+
+`grep` на чтении `.env` возвращает `1`, если удалять нечего, — это допустимо;
+любой другой код означает ошибку чтения и останавливает процедуру **до**
+изменения `.env`. `diff` сверяет, что все остальные строки исходного файла
+сохранены (вывод подавлен, чтобы содержимое `.env` не попало на экран).
+
+```bash
+cd /opt/altegio_bot
+export COMPOSE
+bash <<'ROLLOUT_ENV'
+set -euo pipefail
+ENV_FILE="${ENV_FILE:-/opt/altegio_bot/.env}"
+HANDOFF_FILE="${HANDOFF_FILE:-/root/altegio_bot-single-inbox-hotfix.handoff}"
+MAP_KEY=CHATWOOT_INBOX_COMPANY_MAP
+MODE_KEY=CHATWOOT_INBOUND_ROUTING_MODE
+SENDER_KEY=CHATWOOT_SINGLE_INBOX_OPERATOR_SENDER_ID
+VERIFY_BACKUP_CMD="${VERIFY_BACKUP_CMD:-${COMPOSE:?export COMPOSE from the Production Compose contract first} exec -T altegio-whatsapp-inbox-worker /app/.venv/bin/python -m altegio_bot.scripts.verify_pre_hotfix_env_backup}"
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi
+}
+handoff_field() {
+  test "$(grep -Ec "^$1=" "$HANDOFF_FILE")" = "1"
+  grep -E "^$1=" "$HANDOFF_FILE" | cut -d= -f2-
+}
+env_key_count() {
+  COUNT_RC=0
+  KEY_COUNT="$(grep -Ec "^$2=" "$1")" || COUNT_RC=$?
+  test "$COUNT_RC" -le 1
+  printf '%s\n' "$KEY_COUNT"
+}
+env_value() {
+  grep -E "^$2=" "$1" | cut -d= -f2-
+}
+assert_pre_hotfix_baseline() {
+  test "$(env_key_count "$1" "$MODE_KEY")" = "1"
+  test "$(env_value "$1" "$MODE_KEY")" = "affinity"
+  SENDER_COUNT="$(env_key_count "$1" "$SENDER_KEY")"
+  test "$SENDER_COUNT" -le 1
+  if [ "$SENDER_COUNT" = "1" ]; then
+    test "$(env_value "$1" "$SENDER_KEY")" = "0"
+  fi
+}
+assert_armed_state() {
+  test "$(env_key_count "$1" "$MODE_KEY")" = "1"
+  test "$(env_value "$1" "$MODE_KEY")" = "general"
+  test "$(env_key_count "$1" "$SENDER_KEY")" = "1"
+  printf '%s\n' "$(env_value "$1" "$SENDER_KEY")" | grep -Eq '^[1-9][0-9]*$'
+}
+MANAGED_RE='^(CHATWOOT_INBOX_COMPANY_MAP|CHATWOOT_INBOUND_ROUTING_MODE|CHATWOOT_SINGLE_INBOX_OPERATOR_SENDER_ID)='
+test -f "$ENV_FILE"
+test ! -L "$ENV_FILE"
+test -n "${SINGLE_INBOX_SENDER_ID:-}"
+printf '%s\n' "$SINGLE_INBOX_SENDER_ID" | grep -Eq '^[1-9][0-9]*$'
+test -f "$HANDOFF_FILE"
+test ! -L "$HANDOFF_FILE"
+PRE_HOTFIX_ENV_BACKUP="$(handoff_field PRE_HOTFIX_ENV_BACKUP)"
+PRE_HOTFIX_BACKUP_SHA256="$(handoff_field PRE_HOTFIX_BACKUP_SHA256)"
+PRE_HOTFIX_MAP_FINGERPRINT="$(handoff_field PRE_HOTFIX_MAP_FINGERPRINT)"
+test -n "$PRE_HOTFIX_ENV_BACKUP"
+test -n "$PRE_HOTFIX_BACKUP_SHA256"
+test -n "$PRE_HOTFIX_MAP_FINGERPRINT"
+case "$PRE_HOTFIX_ENV_BACKUP" in "${ENV_FILE}.bak."*) ;; *) exit 1 ;; esac
+test -f "$PRE_HOTFIX_ENV_BACKUP"
+test ! -L "$PRE_HOTFIX_ENV_BACKUP"
+test "$(sha256_of "$PRE_HOTFIX_ENV_BACKUP")" = "$PRE_HOTFIX_BACKUP_SHA256"
+grep -E "^${MAP_KEY}=" "$PRE_HOTFIX_ENV_BACKUP" \
+  | $VERIFY_BACKUP_CMD verify --expect-fingerprint "$PRE_HOTFIX_MAP_FINGERPRINT" > /dev/null
+assert_pre_hotfix_baseline "$PRE_HOTFIX_ENV_BACKUP"
+LIVE_MAP_RC=0
+LIVE_MAP_LINES="$(grep -E "^${MAP_KEY}=" "$ENV_FILE")" || LIVE_MAP_RC=$?
+test "$LIVE_MAP_RC" -le 1
+if [ "$LIVE_MAP_LINES" = "${MAP_KEY}={}" ]; then
+  assert_armed_state "$ENV_FILE"
+else
+  printf '%s\n' "$LIVE_MAP_LINES" \
+    | $VERIFY_BACKUP_CMD verify --expect-fingerprint "$PRE_HOTFIX_MAP_FINGERPRINT" > /dev/null
+  assert_pre_hotfix_baseline "$ENV_FILE"
+fi
+ENV_TMP="$(mktemp "${ENV_FILE}.rollout.XXXXXX")"
+trap 'rm -f "$ENV_TMP"' EXIT
+cp -p "$ENV_FILE" "$ENV_TMP"
+KEPT_RC=0
+grep -Ev "$MANAGED_RE" "$ENV_FILE" > "$ENV_TMP" || KEPT_RC=$?
+test "$KEPT_RC" -le 1
+printf 'CHATWOOT_INBOX_COMPANY_MAP={}\n' >> "$ENV_TMP"
+printf 'CHATWOOT_INBOUND_ROUTING_MODE=general\n' >> "$ENV_TMP"
+printf 'CHATWOOT_SINGLE_INBOX_OPERATOR_SENDER_ID=%s\n' "$SINGLE_INBOX_SENDER_ID" >> "$ENV_TMP"
+for KEY in CHATWOOT_INBOX_COMPANY_MAP CHATWOOT_INBOUND_ROUTING_MODE CHATWOOT_SINGLE_INBOX_OPERATOR_SENDER_ID; do
+  test "$(grep -Ec "^${KEY}=" "$ENV_TMP")" = "1"
+done
+diff <(grep -Ev "$MANAGED_RE" "$ENV_FILE") <(grep -Ev "$MANAGED_RE" "$ENV_TMP") > /dev/null
+mv -f "$ENV_TMP" "$ENV_FILE"
+trap - EXIT
+echo "rollout env upsert ok"
+ROLLOUT_ENV
+```
+
+**Шаг 5. Каждый ключ встречается ровно один раз.** Печатаются только имена и
+счётчики, значения не выводятся.
+
+```bash
+cd /opt/altegio_bot
+for KEY in CHATWOOT_INBOX_COMPANY_MAP CHATWOOT_INBOUND_ROUTING_MODE CHATWOOT_SINGLE_INBOX_OPERATOR_SENDER_ID; do
+  printf '%s occurrences=%s\n' "$KEY" "$(grep -Ec "^${KEY}=" .env)"
+done
+```
+
+**Шаг 6. Пересоздать оба worker.** Карту читают двое:
+`altegio-whatsapp-inbox-worker` — inbox→tenant для operator relay и tenant route
+для reply/reaction; `altegio-outbox-worker` — tenant→inbox для outbound mirror.
+Если пересоздать только один, автоматические зеркала продолжат уходить в
+филиальные inbox. Обычный `restart` и `up -d` без `--force-recreate` `.env` не
+перечитывают.
+
+```bash
+cd /opt/altegio_bot
+$COMPOSE up -d --force-recreate \
+  altegio-outbox-worker altegio-whatsapp-inbox-worker
+```
+
+**Шаг 7. Обязательный post-recreate preflight в обоих контейнерах.** Выводятся
+только режим, General inbox ID, booleans валидности, provider/company/inbox ID и
+поддержка параметра. Ни token, ни телефон, ни payload.
+
+`general_inbox_id_valid` считается отдельно через `positive_int()` и намеренно
+**не** выводится из карты: `resolve_chatwoot_general_inbox()` при пустой карте
+возвращает `(None, None)` — это корректное поведение общего resolver для legacy
+single-inbox режима, и оно не является доказательством того, что
+`CHATWOOT_INBOX_ID` вообще задан. При `CHATWOOT_INBOX_ID=0` и пустой карте
+runtime заблокирует каждый ответ оператора как `single_inbox_config_invalid`.
+
+```bash
+cd /opt/altegio_bot
+for CHATWOOT_SERVICE in altegio-outbox-worker altegio-whatsapp-inbox-worker; do
+  echo "SERVICE=$CHATWOOT_SERVICE"
+  $COMPOSE exec -T "$CHATWOOT_SERVICE" /app/.venv/bin/python - <<'PY'
+from altegio_bot.settings import Settings, settings
+from altegio_bot.webhooks.common import (
+    parse_chatwoot_inbox_company_map,
+    positive_int,
+    resolve_chatwoot_general_inbox,
+)
+
+parsed = parse_chatwoot_inbox_company_map(settings.chatwoot_inbox_company_map)
+validated_general_id, general_error = resolve_chatwoot_general_inbox(parsed, settings.chatwoot_inbox_id)
+print(
+    {
+        "mode": settings.chatwoot_inbound_routing_mode,
+        "general_inbox_id": settings.chatwoot_inbox_id,
+        "general_inbox_id_valid": positive_int(settings.chatwoot_inbox_id) is not None,
+        "branch_map_configured": parsed.configured,
+        "branch_map_valid": parsed.valid,
+        "branch_map_provider_scoped": parsed.provider_scoped,
+        "branch_identities": sorted(
+            (inbox_id, identity.provider, identity.company_id)
+            for inbox_id, identity in parsed.mapping.items()
+        ),
+        "general_inbox_isolated": (validated_general_id is not None) if parsed.configured else None,
+        "general_inbox_error": general_error,
+        "single_inbox_sender_supported": "chatwoot_single_inbox_operator_sender_id" in Settings.model_fields,
+        "single_inbox_sender_id": getattr(settings, "chatwoot_single_inbox_operator_sender_id", 0),
+    }
+)
+PY
+done
+```
+
+Gate: **оба** worker показывают `mode: general`, `branch_map_configured: False`,
+`general_inbox_id_valid: True`, `general_inbox_id: 8` для подтверждённой
+production topology, `single_inbox_sender_supported: True` и один и тот же
+положительный `single_inbox_sender_id`. Любое расхождение между двумя worker
+останавливает rollout.
+
+### 14.5 Smoke
+
+Выводить только IDs, provider/company, inbox, статусы, reason codes и booleans.
+Не выводить `phone_e164`, тело сообщения, payload, token и secret.
+
+**A. Новый контакт.** Незнакомый номер пишет первым → сообщение появляется в
+General. Ответ оператора из General уходит клиенту; `whatsapp_events.error`
+пуст, в `outbox_messages` ровно одна строка `message_source='operator'` с
+настроенным `sender_id`, статус доходит до `sent` → `delivered`/`read`.
+
+**B. Старый branch inbox.** Ответ в исторической conversation инбоксов
+Karlsruhe / Rastatt / Durlach блокируется с `single_inbox_not_general`. Meta не
+вызывается, Outbox не создаётся, технический sender не используется, а оператор
+получает private note с указанием ответить из General.
+
+**C. Native Chatwoot WhatsApp inbox.** Тот же результат: он не General.
+
+**D. Автоматика.** Плановое Altegio/EasyWeek уведомление уходит своим
+provider-scoped sender и зеркалится в General.
+
+**E. Закрытое окно.** Контакт без inbound за 24 часа: ответ не уходит в Meta,
+создаётся `canceled` Outbox и private note — как и до hotfix.
+
+**F. Переходный сценарий.** Отправленное во время hotfix сообщение получает
+reply и reaction уже после возврата к `affinity` (§14.7): оба обязаны остаться
+в General, а affinity resolver не должен считать технический sender филиалом.
+
+```sql
+SELECT id, status, error, chatwoot_conversation_id
+FROM whatsapp_events
+ORDER BY id DESC
+LIMIT 10;
+```
+
+**STOP-условия rollout:**
+
+- код ещё возвращает `single_inbox_sender_supported: False`;
+- `general_inbox_id_valid: False` хотя бы у одного worker;
+- worker видят разные значения `mode`, карты или `single_inbox_sender_id`;
+- один worker остался в прежнем режиме либо продолжает видеть непустую карту;
+- автоматические зеркала после rollout не идут в General;
+- ответ ушёл из branch inbox через технический sender;
+- выбран sender с чужим `phone_number_id`;
+- появился `sent` Outbox без реального вызова Meta;
+- автоматические job'ы начали выбирать технический sender.
+
+### 14.6 Reason codes
+
+Все коды стабильны и не содержат конфиг, телефоны, текст и секреты. Каждый —
+терминальный отказ **до** вызова Meta и без создания `sent` Outbox. Каждый
+оставляет оператору durable private note: сообщение клиенту не отправлено,
+отвечать нужно из General. Текст note статичен и не содержит ни PII, ни
+конфигурации, ни sender ID, ни самого reason code.
+
+| Код | Что это значит | Действие оператора |
+|---|---|---|
+| `single_inbox_config_invalid` | положительный sender id при настроенной branch map, режиме не `general` либо без положительного `CHATWOOT_INBOX_ID` | Привести три условия §14.2 в соответствие и пересоздать оба worker. |
+| `single_inbox_not_general` | ответ написан не в `CHATWOOT_INBOX_ID` (branch inbox, native WhatsApp inbox, отсутствующий или нечисловой id) | Ответить из General. Историческую conversation не переоткрывать через технический sender. |
+| `single_inbox_sender_not_found` | строки с таким id в `whatsapp_senders` нет | Сверить id по запросу §14.3, исправить `.env`, пересоздать оба worker. |
+| `single_inbox_sender_inactive` | строка есть, но `is_active=false` | Не менять флаг ради обхода: выяснить, почему sender выключен, и выбрать корректный. |
+| `single_inbox_sender_phone_mismatch` | `phone_number_id` sender не совпадает с relay и/или с `META_WA_PHONE_NUMBER_ID`, либо одно из значений пустое | Проверить `META_WA_PHONE_NUMBER_ID` и номер строки. Отправка с недоказанной линии запрещена. |
+| `single_inbox_sender_identity_invalid` | `provider`/`company_id` строки не образуют валидную CRM identity | Чинить данные строки, а не обходить проверку. |
+
+Отдельно, для reply/reaction и для affinity resolver на сообщениях hotfix:
+`operator_route_marker_conflict` и `invalid_outbox_route_marker` означают, что
+provenance строки неполна или противоречива. Это тоже fail-closed: маршрут не
+выбирается ни в General, ни в филиал, а affinity возвращает `INVALID`, а не
+«нет данных». Такую строку не редактируют вручную.
+
+Коды проверки карты (общие для rollout gate и отката): `map_line_missing` и
+`map_line_not_unique` (в файле нет строки карты либо их несколько),
+`map_unconfigured` (пустая карта — файл снят уже после включения hotfix либо
+предшествует branch map), `map_invalid` (malformed JSON, duplicate key,
+коллизия ключей), `map_not_provider_scoped` (legacy integer-only карта),
+`map_fingerprint_mismatch` (карта валидна, но это не та topology, которая была
+зафиксирована перед rollout). Каждый из них останавливает процедуру до
+изменения `.env`.
+
+Baseline-проверки кодов не печатают: блок просто завершается ненулевым кодом,
+если `CHATWOOT_INBOUND_ROUTING_MODE` встречается не один раз либо не равен
+`affinity`, если `CHATWOOT_SINGLE_INBOX_OPERATOR_SENDER_ID` дублирован либо
+имеет значение, отличное от `0`, или — для уже включённого hotfix — если live
+`.env` не находится ровно в armed-состоянии (`{}` + `general` + положительный
+sender).
+
+### 14.7 Откат
+
+Откат — это **согласованный набор из трёх значений**, а не одно. Снять только
+`CHATWOOT_SINGLE_INBOX_OPERATOR_SENDER_ID` либо выставить его в `0`, оставив
+карту пустой и режим `general`, — не откат: legacy fallback снова увидит три
+sender на одном Meta-номере и остановится на `operator_relay: ambiguous_sender`.
+
+Источник карты — **только** backup, на который указывает handoff из §14.4 шаг 2.
+Выбирать backup по `ls | tail` запрещено: более свежий файл может быть снят уже
+после включения hotfix и содержать пустую карту.
+
+**Шаг 1. Доказать handoff и его backup.** Тот же gate, что и в §14.4: путь,
+symlink, три обязательных поля ровно по разу, SHA256 всего backup, fingerprint
+нормализованной карты и baseline `affinity` + sender off в самом backup —
+именно то поведение, которое шаг 2 затем восстанавливает. Ожидаемой topology здесь нет и быть не может — источник
+истины это снимок конфигурации, снятый и проверенный непосредственно перед
+rollout. Зашивать numeric ID филиалов в репозиторий нельзя: плановая ревизия 3
+(§10 канонического плана) зафиксировала EasyWeek location, которая просто
+перестала существовать, и такой gate однажды заблокировал бы легитимный откат.
+
+```bash
+cd /opt/altegio_bot
+export COMPOSE
+bash <<'ROLLBACK_RESOLVE'
+set -euo pipefail
+ENV_FILE="${ENV_FILE:-/opt/altegio_bot/.env}"
+HANDOFF_FILE="${HANDOFF_FILE:-/root/altegio_bot-single-inbox-hotfix.handoff}"
+MAP_KEY=CHATWOOT_INBOX_COMPANY_MAP
+MODE_KEY=CHATWOOT_INBOUND_ROUTING_MODE
+SENDER_KEY=CHATWOOT_SINGLE_INBOX_OPERATOR_SENDER_ID
+VERIFY_BACKUP_CMD="${VERIFY_BACKUP_CMD:-${COMPOSE:?export COMPOSE from the Production Compose contract first} exec -T altegio-whatsapp-inbox-worker /app/.venv/bin/python -m altegio_bot.scripts.verify_pre_hotfix_env_backup}"
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi
+}
+handoff_field() {
+  test "$(grep -Ec "^$1=" "$HANDOFF_FILE")" = "1"
+  grep -E "^$1=" "$HANDOFF_FILE" | cut -d= -f2-
+}
+env_key_count() {
+  COUNT_RC=0
+  KEY_COUNT="$(grep -Ec "^$2=" "$1")" || COUNT_RC=$?
+  test "$COUNT_RC" -le 1
+  printf '%s\n' "$KEY_COUNT"
+}
+env_value() {
+  grep -E "^$2=" "$1" | cut -d= -f2-
+}
+assert_pre_hotfix_baseline() {
+  test "$(env_key_count "$1" "$MODE_KEY")" = "1"
+  test "$(env_value "$1" "$MODE_KEY")" = "affinity"
+  SENDER_COUNT="$(env_key_count "$1" "$SENDER_KEY")"
+  test "$SENDER_COUNT" -le 1
+  if [ "$SENDER_COUNT" = "1" ]; then
+    test "$(env_value "$1" "$SENDER_KEY")" = "0"
+  fi
+}
+assert_armed_state() {
+  test "$(env_key_count "$1" "$MODE_KEY")" = "1"
+  test "$(env_value "$1" "$MODE_KEY")" = "general"
+  test "$(env_key_count "$1" "$SENDER_KEY")" = "1"
+  printf '%s\n' "$(env_value "$1" "$SENDER_KEY")" | grep -Eq '^[1-9][0-9]*$'
+}
+test -f "$ENV_FILE"
+test ! -L "$ENV_FILE"
+test -f "$HANDOFF_FILE"
+test ! -L "$HANDOFF_FILE"
+PRE_HOTFIX_ENV_BACKUP="$(handoff_field PRE_HOTFIX_ENV_BACKUP)"
+PRE_HOTFIX_BACKUP_SHA256="$(handoff_field PRE_HOTFIX_BACKUP_SHA256)"
+PRE_HOTFIX_MAP_FINGERPRINT="$(handoff_field PRE_HOTFIX_MAP_FINGERPRINT)"
+test -n "$PRE_HOTFIX_ENV_BACKUP"
+test -n "$PRE_HOTFIX_BACKUP_SHA256"
+test -n "$PRE_HOTFIX_MAP_FINGERPRINT"
+case "$PRE_HOTFIX_ENV_BACKUP" in "${ENV_FILE}.bak."*) ;; *) exit 1 ;; esac
+test -f "$PRE_HOTFIX_ENV_BACKUP"
+test ! -L "$PRE_HOTFIX_ENV_BACKUP"
+test "$(sha256_of "$PRE_HOTFIX_ENV_BACKUP")" = "$PRE_HOTFIX_BACKUP_SHA256"
+grep -E "^${MAP_KEY}=" "$PRE_HOTFIX_ENV_BACKUP" \
+  | $VERIFY_BACKUP_CMD verify --expect-fingerprint "$PRE_HOTFIX_MAP_FINGERPRINT" > /dev/null
+assert_pre_hotfix_baseline "$PRE_HOTFIX_ENV_BACKUP"
+LIVE_MAP_RC=0
+LIVE_MAP_LINES="$(grep -E "^${MAP_KEY}=" "$ENV_FILE")" || LIVE_MAP_RC=$?
+test "$LIVE_MAP_RC" -le 1
+if [ "$LIVE_MAP_LINES" = "${MAP_KEY}={}" ]; then
+  assert_armed_state "$ENV_FILE"
+else
+  printf '%s\n' "$LIVE_MAP_LINES" \
+    | $VERIFY_BACKUP_CMD verify --expect-fingerprint "$PRE_HOTFIX_MAP_FINGERPRINT" > /dev/null
+  assert_pre_hotfix_baseline "$ENV_FILE"
+fi
+printf 'PRE_HOTFIX_ENV_BACKUP=%s\n' "$PRE_HOTFIX_ENV_BACKUP"
+ROLLBACK_RESOLVE
+```
+
+Печатается только путь backup. Значение карты не выводится ни здесь, ни в
+контейнерной проверке — та отвечает booleans, identity и hex-дайджестом.
+
+**Шаг 2. Атомарно восстановить все три ключа.** Блок сам заново проходит тот же
+gate и берёт путь backup только из handoff, а не из окружения оператора;
+контракт записи тот же, что в §14.4. Так как gate уже доказал, что backup несёт
+`affinity` и sender off, запись этих двух значений — восстановление
+подтверждённого production поведения, а не предположение о нём.
+
+```bash
+cd /opt/altegio_bot
+export COMPOSE
+bash <<'ROLLBACK_ENV'
+set -euo pipefail
+ENV_FILE="${ENV_FILE:-/opt/altegio_bot/.env}"
+HANDOFF_FILE="${HANDOFF_FILE:-/root/altegio_bot-single-inbox-hotfix.handoff}"
+MAP_KEY=CHATWOOT_INBOX_COMPANY_MAP
+MODE_KEY=CHATWOOT_INBOUND_ROUTING_MODE
+SENDER_KEY=CHATWOOT_SINGLE_INBOX_OPERATOR_SENDER_ID
+VERIFY_BACKUP_CMD="${VERIFY_BACKUP_CMD:-${COMPOSE:?export COMPOSE from the Production Compose contract first} exec -T altegio-whatsapp-inbox-worker /app/.venv/bin/python -m altegio_bot.scripts.verify_pre_hotfix_env_backup}"
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi
+}
+handoff_field() {
+  test "$(grep -Ec "^$1=" "$HANDOFF_FILE")" = "1"
+  grep -E "^$1=" "$HANDOFF_FILE" | cut -d= -f2-
+}
+env_key_count() {
+  COUNT_RC=0
+  KEY_COUNT="$(grep -Ec "^$2=" "$1")" || COUNT_RC=$?
+  test "$COUNT_RC" -le 1
+  printf '%s\n' "$KEY_COUNT"
+}
+env_value() {
+  grep -E "^$2=" "$1" | cut -d= -f2-
+}
+assert_pre_hotfix_baseline() {
+  test "$(env_key_count "$1" "$MODE_KEY")" = "1"
+  test "$(env_value "$1" "$MODE_KEY")" = "affinity"
+  SENDER_COUNT="$(env_key_count "$1" "$SENDER_KEY")"
+  test "$SENDER_COUNT" -le 1
+  if [ "$SENDER_COUNT" = "1" ]; then
+    test "$(env_value "$1" "$SENDER_KEY")" = "0"
+  fi
+}
+assert_armed_state() {
+  test "$(env_key_count "$1" "$MODE_KEY")" = "1"
+  test "$(env_value "$1" "$MODE_KEY")" = "general"
+  test "$(env_key_count "$1" "$SENDER_KEY")" = "1"
+  printf '%s\n' "$(env_value "$1" "$SENDER_KEY")" | grep -Eq '^[1-9][0-9]*$'
+}
+MANAGED_RE='^(CHATWOOT_INBOX_COMPANY_MAP|CHATWOOT_INBOUND_ROUTING_MODE|CHATWOOT_SINGLE_INBOX_OPERATOR_SENDER_ID)='
+test -f "$ENV_FILE"
+test ! -L "$ENV_FILE"
+test -f "$HANDOFF_FILE"
+test ! -L "$HANDOFF_FILE"
+PRE_HOTFIX_ENV_BACKUP="$(handoff_field PRE_HOTFIX_ENV_BACKUP)"
+PRE_HOTFIX_BACKUP_SHA256="$(handoff_field PRE_HOTFIX_BACKUP_SHA256)"
+PRE_HOTFIX_MAP_FINGERPRINT="$(handoff_field PRE_HOTFIX_MAP_FINGERPRINT)"
+test -n "$PRE_HOTFIX_ENV_BACKUP"
+test -n "$PRE_HOTFIX_BACKUP_SHA256"
+test -n "$PRE_HOTFIX_MAP_FINGERPRINT"
+case "$PRE_HOTFIX_ENV_BACKUP" in "${ENV_FILE}.bak."*) ;; *) exit 1 ;; esac
+test -f "$PRE_HOTFIX_ENV_BACKUP"
+test ! -L "$PRE_HOTFIX_ENV_BACKUP"
+test "$(sha256_of "$PRE_HOTFIX_ENV_BACKUP")" = "$PRE_HOTFIX_BACKUP_SHA256"
+grep -E "^${MAP_KEY}=" "$PRE_HOTFIX_ENV_BACKUP" \
+  | $VERIFY_BACKUP_CMD verify --expect-fingerprint "$PRE_HOTFIX_MAP_FINGERPRINT" > /dev/null
+assert_pre_hotfix_baseline "$PRE_HOTFIX_ENV_BACKUP"
+LIVE_MAP_RC=0
+LIVE_MAP_LINES="$(grep -E "^${MAP_KEY}=" "$ENV_FILE")" || LIVE_MAP_RC=$?
+test "$LIVE_MAP_RC" -le 1
+if [ "$LIVE_MAP_LINES" = "${MAP_KEY}={}" ]; then
+  assert_armed_state "$ENV_FILE"
+else
+  printf '%s\n' "$LIVE_MAP_LINES" \
+    | $VERIFY_BACKUP_CMD verify --expect-fingerprint "$PRE_HOTFIX_MAP_FINGERPRINT" > /dev/null
+  assert_pre_hotfix_baseline "$ENV_FILE"
+fi
+MAP_RC=0
+BACKUP_MAP_LINE="$(grep -E "^${MAP_KEY}=" "$PRE_HOTFIX_ENV_BACKUP")" || MAP_RC=$?
+test "$MAP_RC" = "0"
+ENV_TMP="$(mktemp "${ENV_FILE}.rollback.XXXXXX")"
+trap 'rm -f "$ENV_TMP"' EXIT
+cp -p "$ENV_FILE" "$ENV_TMP"
+KEPT_RC=0
+grep -Ev "$MANAGED_RE" "$ENV_FILE" > "$ENV_TMP" || KEPT_RC=$?
+test "$KEPT_RC" -le 1
+printf '%s\n' "$BACKUP_MAP_LINE" >> "$ENV_TMP"
+printf 'CHATWOOT_INBOUND_ROUTING_MODE=affinity\n' >> "$ENV_TMP"
+printf 'CHATWOOT_SINGLE_INBOX_OPERATOR_SENDER_ID=0\n' >> "$ENV_TMP"
+for KEY in CHATWOOT_INBOX_COMPANY_MAP CHATWOOT_INBOUND_ROUTING_MODE CHATWOOT_SINGLE_INBOX_OPERATOR_SENDER_ID; do
+  test "$(grep -Ec "^${KEY}=" "$ENV_TMP")" = "1"
+done
+diff <(grep -Ev "$MANAGED_RE" "$ENV_FILE") <(grep -Ev "$MANAGED_RE" "$ENV_TMP") > /dev/null
+mv -f "$ENV_TMP" "$ENV_FILE"
+trap - EXIT
+echo "rollback env restore ok"
+ROLLBACK_ENV
+```
+
+**Шаг 3. Каждый ключ снова ровно один раз.**
+
+```bash
+cd /opt/altegio_bot
+for KEY in CHATWOOT_INBOX_COMPANY_MAP CHATWOOT_INBOUND_ROUTING_MODE CHATWOOT_SINGLE_INBOX_OPERATOR_SENDER_ID; do
+  printf '%s occurrences=%s\n' "$KEY" "$(grep -Ec "^${KEY}=" .env)"
+done
+```
+
+**Шаг 4. Пересоздать оба worker.** Причина та же, что и при rollout: карту
+читают двое, и оставленный в старом env worker продолжит зеркалить по-своему.
+
+```bash
+cd /opt/altegio_bot
+$COMPOSE up -d --force-recreate \
+  altegio-outbox-worker altegio-whatsapp-inbox-worker
+```
+
+**Шаг 5. Обязательный post-recreate preflight в обоих контейнерах.**
+
+```bash
+cd /opt/altegio_bot
+for CHATWOOT_SERVICE in altegio-outbox-worker altegio-whatsapp-inbox-worker; do
+  echo "SERVICE=$CHATWOOT_SERVICE"
+  $COMPOSE exec -T "$CHATWOOT_SERVICE" /app/.venv/bin/python - <<'PY'
+from altegio_bot.settings import Settings, settings
+from altegio_bot.webhooks.common import (
+    parse_chatwoot_inbox_company_map,
+    positive_int,
+    resolve_chatwoot_general_inbox,
+)
+
+parsed = parse_chatwoot_inbox_company_map(settings.chatwoot_inbox_company_map)
+validated_general_id, general_error = resolve_chatwoot_general_inbox(parsed, settings.chatwoot_inbox_id)
+print(
+    {
+        "mode": settings.chatwoot_inbound_routing_mode,
+        "general_inbox_id": settings.chatwoot_inbox_id,
+        "general_inbox_id_valid": positive_int(settings.chatwoot_inbox_id) is not None,
+        "branch_map_configured": parsed.configured,
+        "branch_map_valid": parsed.valid,
+        "branch_map_provider_scoped": parsed.provider_scoped,
+        "branch_identities": sorted(
+            (inbox_id, identity.provider, identity.company_id)
+            for inbox_id, identity in parsed.mapping.items()
+        ),
+        "general_inbox_isolated": (validated_general_id is not None) if parsed.configured else None,
+        "general_inbox_error": general_error,
+        "single_inbox_sender_supported": "chatwoot_single_inbox_operator_sender_id" in Settings.model_fields,
+        "single_inbox_sender_id": getattr(settings, "chatwoot_single_inbox_operator_sender_id", 0),
+    }
+)
+PY
+done
+```
+
+Gate: **оба** worker показывают `mode: affinity`, `branch_map_configured: True`,
+`branch_map_valid: True`, `branch_map_provider_scoped: True`,
+`general_inbox_id_valid: True`, `general_inbox_isolated: True`, полный список из
+трёх `branch_identities` (Karlsruhe, Rastatt, Durlach) и
+`single_inbox_sender_id: 0`.
+
+**STOP-условия отката:**
+
+- handoff отсутствует, указывает на несуществующий путь либо на файл вне
+  `/opt/altegio_bot/.env.bak.*`;
+- любой ненулевой exit gate на шаге 1 или 2: отсутствующее либо дублированное
+  поле handoff, backup вне разрешённого шаблона, symlink, несовпадение SHA256
+  backup, невалидная карта, `map_fingerprint_mismatch` либо backup, не
+  содержащий baseline `affinity` + sender off;
+- карта восстановлена не полностью либо невалидна;
+- `general_inbox_id_valid: False`;
+- worker видят разные значения;
+- один worker остался в `general`;
+- один worker продолжает видеть пустую карту;
+- reply или reaction на сообщение hotfix маршрутизируется в филиал технического
+  sender;
+- автоматические зеркала не вернулись к филиальным inbox.
+
+Handoff и pre-hotfix backup удаляются только после успешного post-rollback
+smoke. Отката commit и downgrade миграции не требуется ни в одном из
+направлений: этот hotfix не добавляет схему и хранит provenance в существующем
+`OutboxMessage.meta`.
