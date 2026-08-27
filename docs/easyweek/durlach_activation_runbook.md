@@ -2884,41 +2884,99 @@ for CHATWOOT_SERVICE in altegio-outbox-worker altegio-whatsapp-inbox-worker; do
 done
 ```
 
-**Шаг 2. Ровно один pre-hotfix backup и handoff на него.** Откат обязан
-восстановить карту из backup, снятого **до** hotfix. Backup, снятый уже после
-включения, содержит `CHATWOOT_INBOX_COMPANY_MAP={}`, и «откат» по нему вернул бы
-production в то же пустое состояние. Поэтому имя правильного backup
-фиксируется один раз в root-only handoff-файле, а повторный запуск шага эту
-ссылку **не** перезаписывает и молча новый backup не подставляет.
+**Шаг 2. Доказать pre-hotfix состояние и зафиксировать его в handoff.**
+
+Откат восстанавливает карту из backup. Backup, снятый уже после включения
+hotfix, содержит `CHATWOOT_INBOX_COMPANY_MAP={}` — «откат» по нему вернул бы production в то же
+пустое состояние. Поэтому rollout обязан сначала **доказать**, что текущая карта
+действительно pre-hotfix, и только потом получить право её стереть.
+
+Шаг делает ровно это:
+
+1. в текущем `.env` `CHATWOOT_INBOX_COMPANY_MAP` встречается ровно один раз;
+2. карта разбирается тем же fail-closed парсером, что и worker, и обязана быть
+   `configured` + `valid` + `provider_scoped`;
+3. снимается sibling backup через `cp -p` (owner/group/mode сохраняются);
+4. считается SHA256 всего backup и детерминированный fingerprint нормализованной
+   карты — sha256 от отсортированных `(inbox_id, provider, company_id)`;
+5. handoff создаётся атомарно, mode `0600`, и хранит путь backup, его SHA256 и
+   fingerprint карты. Сама карта в handoff не пишется.
+
+Уже существующий handoff **не** принимается на веру: он проходит полную
+проверку — путь, symlink, поля, SHA256, fingerprint. Если live `.env` всё ещё в
+pre-hotfix состоянии, его карта обязана совпасть со снимком; расхождение
+означает, что конфигурация изменилась после создания handoff, и rollout
+останавливается. Существующий handoff никогда не перепривязывается автоматически.
+
+Проверка карты выполняется внутри worker-контейнера, потому что там живёт тот же
+парсер. В контейнер передаётся **только** строка карты, а не `.env` целиком:
 
 ```bash
 cd /opt/altegio_bot
-bash <<'PREHOTFIX_BACKUP'
+export COMPOSE
+bash <<'PREHOTFIX_HANDOFF'
 set -euo pipefail
 ENV_FILE="${ENV_FILE:-/opt/altegio_bot/.env}"
 HANDOFF_FILE="${HANDOFF_FILE:-/root/altegio_bot-single-inbox-hotfix.handoff}"
+MAP_KEY=CHATWOOT_INBOX_COMPANY_MAP
+VERIFY_BACKUP_CMD="${VERIFY_BACKUP_CMD:-${COMPOSE:?export COMPOSE from the Production Compose contract first} exec -T altegio-whatsapp-inbox-worker /app/.venv/bin/python -m altegio_bot.scripts.verify_pre_hotfix_env_backup}"
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi
+}
+handoff_field() {
+  test "$(grep -Ec "^$1=" "$HANDOFF_FILE")" = "1"
+  grep -E "^$1=" "$HANDOFF_FILE" | cut -d= -f2-
+}
 test -f "$ENV_FILE"
 test ! -L "$ENV_FILE"
-if [ -e "$HANDOFF_FILE" ]; then
-  echo "handoff exists — keeping the pre-hotfix backup it already names"
-else
+if [ ! -e "$HANDOFF_FILE" ]; then
+  test "$(grep -Ec "^${MAP_KEY}=" "$ENV_FILE")" = "1"
+  LIVE_MAP_FINGERPRINT="$(grep -E "^${MAP_KEY}=" "$ENV_FILE" \
+    | $VERIFY_BACKUP_CMD snapshot \
+    | grep -E '^PRE_HOTFIX_MAP_FINGERPRINT=' | cut -d= -f2-)"
+  test -n "$LIVE_MAP_FINGERPRINT"
   BACKUP_FILE="${ENV_FILE}.bak.$(date -u +%Y%m%dT%H%M%SZ)"
   test ! -e "$BACKUP_FILE"
   cp -p "$ENV_FILE" "$BACKUP_FILE"
+  BACKUP_SHA256="$(sha256_of "$BACKUP_FILE")"
   HANDOFF_TMP="$(mktemp "${HANDOFF_FILE}.XXXXXX")"
   trap 'rm -f "$HANDOFF_TMP"' EXIT
-  printf 'PRE_HOTFIX_ENV_BACKUP=%s\n' "$BACKUP_FILE" > "$HANDOFF_TMP"
   chmod 600 "$HANDOFF_TMP"
+  printf 'PRE_HOTFIX_ENV_BACKUP=%s\n' "$BACKUP_FILE" > "$HANDOFF_TMP"
+  printf 'PRE_HOTFIX_BACKUP_SHA256=%s\n' "$BACKUP_SHA256" >> "$HANDOFF_TMP"
+  printf 'PRE_HOTFIX_MAP_FINGERPRINT=%s\n' "$LIVE_MAP_FINGERPRINT" >> "$HANDOFF_TMP"
   mv -n "$HANDOFF_TMP" "$HANDOFF_FILE"
   trap - EXIT
   rm -f "$HANDOFF_TMP"
 fi
-grep -E '^PRE_HOTFIX_ENV_BACKUP=' "$HANDOFF_FILE"
-PREHOTFIX_BACKUP
+test -f "$HANDOFF_FILE"
+test ! -L "$HANDOFF_FILE"
+PRE_HOTFIX_ENV_BACKUP="$(handoff_field PRE_HOTFIX_ENV_BACKUP)"
+PRE_HOTFIX_BACKUP_SHA256="$(handoff_field PRE_HOTFIX_BACKUP_SHA256)"
+PRE_HOTFIX_MAP_FINGERPRINT="$(handoff_field PRE_HOTFIX_MAP_FINGERPRINT)"
+test -n "$PRE_HOTFIX_ENV_BACKUP"
+test -n "$PRE_HOTFIX_BACKUP_SHA256"
+test -n "$PRE_HOTFIX_MAP_FINGERPRINT"
+case "$PRE_HOTFIX_ENV_BACKUP" in "${ENV_FILE}.bak."*) ;; *) exit 1 ;; esac
+test -f "$PRE_HOTFIX_ENV_BACKUP"
+test ! -L "$PRE_HOTFIX_ENV_BACKUP"
+test "$(sha256_of "$PRE_HOTFIX_ENV_BACKUP")" = "$PRE_HOTFIX_BACKUP_SHA256"
+grep -E "^${MAP_KEY}=" "$PRE_HOTFIX_ENV_BACKUP" \
+  | $VERIFY_BACKUP_CMD verify --expect-fingerprint "$PRE_HOTFIX_MAP_FINGERPRINT" > /dev/null
+LIVE_MAP_RC=0
+LIVE_MAP_LINES="$(grep -E "^${MAP_KEY}=" "$ENV_FILE")" || LIVE_MAP_RC=$?
+test "$LIVE_MAP_RC" -le 1
+if [ "$LIVE_MAP_LINES" != "${MAP_KEY}={}" ]; then
+  printf '%s\n' "$LIVE_MAP_LINES" \
+    | $VERIFY_BACKUP_CMD verify --expect-fingerprint "$PRE_HOTFIX_MAP_FINGERPRINT" > /dev/null
+fi
+echo "pre-hotfix handoff proven"
+PREHOTFIX_HANDOFF
 ```
 
-Печатается только путь backup — содержимое `.env` и backup не выводится.
-Handoff и backup удаляются только после успешного post-rollback smoke.
+Печатаются только booleans, inbox/provider/company и hex-дайджест — ни карты,
+ни токенов, ни содержимого `.env`. Handoff и backup удаляются только после
+успешного post-rollback smoke.
 
 **Шаг 3. Подтверждённый sender id как положительное целое.** `export` нужен,
 чтобы значение дошло до блока изменения `.env`.
@@ -2929,22 +2987,62 @@ export SINGLE_INBOX_SENDER_ID=<подтверждённый_sender_id>
 printf '%s\n' "$SINGLE_INBOX_SENDER_ID" | grep -Eq '^[1-9][0-9]*$'
 ```
 
-**Шаг 4. Атомарная запись трёх ключей.** `grep` на чтении `.env` возвращает `1`,
-если удалять нечего, — это допустимо; любой другой код означает ошибку чтения и
-останавливает процедуру **до** изменения `.env`. `diff` сверяет, что все
-остальные строки исходного файла сохранены (вывод подавлен, чтобы содержимое
-`.env` не попало на экран).
+**Шаг 4. Доказать handoff ещё раз и атомарно записать три ключа.**
+
+Прохождения шага 2 недостаточно: между ним и записью может пройти сколько угодно
+времени, а backup может исчезнуть, быть подменён или указывать уже на другую
+карту. Поэтому блок, который реально стирает `CHATWOOT_INBOX_COMPANY_MAP`, сам заново проходит
+весь gate — handoff, symlink, поля, SHA256 backup, fingerprint карты и, пока
+live `.env` ещё pre-hotfix, совпадение его карты со снимком. Право очистить
+карту даёт только этот gate, а не факт выполнения предыдущего шага.
+
+`grep` на чтении `.env` возвращает `1`, если удалять нечего, — это допустимо;
+любой другой код означает ошибку чтения и останавливает процедуру **до**
+изменения `.env`. `diff` сверяет, что все остальные строки исходного файла
+сохранены (вывод подавлен, чтобы содержимое `.env` не попало на экран).
 
 ```bash
 cd /opt/altegio_bot
+export COMPOSE
 bash <<'ROLLOUT_ENV'
 set -euo pipefail
 ENV_FILE="${ENV_FILE:-/opt/altegio_bot/.env}"
+HANDOFF_FILE="${HANDOFF_FILE:-/root/altegio_bot-single-inbox-hotfix.handoff}"
+MAP_KEY=CHATWOOT_INBOX_COMPANY_MAP
+VERIFY_BACKUP_CMD="${VERIFY_BACKUP_CMD:-${COMPOSE:?export COMPOSE from the Production Compose contract first} exec -T altegio-whatsapp-inbox-worker /app/.venv/bin/python -m altegio_bot.scripts.verify_pre_hotfix_env_backup}"
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi
+}
+handoff_field() {
+  test "$(grep -Ec "^$1=" "$HANDOFF_FILE")" = "1"
+  grep -E "^$1=" "$HANDOFF_FILE" | cut -d= -f2-
+}
 MANAGED_RE='^(CHATWOOT_INBOX_COMPANY_MAP|CHATWOOT_INBOUND_ROUTING_MODE|CHATWOOT_SINGLE_INBOX_OPERATOR_SENDER_ID)='
 test -f "$ENV_FILE"
 test ! -L "$ENV_FILE"
 test -n "${SINGLE_INBOX_SENDER_ID:-}"
 printf '%s\n' "$SINGLE_INBOX_SENDER_ID" | grep -Eq '^[1-9][0-9]*$'
+test -f "$HANDOFF_FILE"
+test ! -L "$HANDOFF_FILE"
+PRE_HOTFIX_ENV_BACKUP="$(handoff_field PRE_HOTFIX_ENV_BACKUP)"
+PRE_HOTFIX_BACKUP_SHA256="$(handoff_field PRE_HOTFIX_BACKUP_SHA256)"
+PRE_HOTFIX_MAP_FINGERPRINT="$(handoff_field PRE_HOTFIX_MAP_FINGERPRINT)"
+test -n "$PRE_HOTFIX_ENV_BACKUP"
+test -n "$PRE_HOTFIX_BACKUP_SHA256"
+test -n "$PRE_HOTFIX_MAP_FINGERPRINT"
+case "$PRE_HOTFIX_ENV_BACKUP" in "${ENV_FILE}.bak."*) ;; *) exit 1 ;; esac
+test -f "$PRE_HOTFIX_ENV_BACKUP"
+test ! -L "$PRE_HOTFIX_ENV_BACKUP"
+test "$(sha256_of "$PRE_HOTFIX_ENV_BACKUP")" = "$PRE_HOTFIX_BACKUP_SHA256"
+grep -E "^${MAP_KEY}=" "$PRE_HOTFIX_ENV_BACKUP" \
+  | $VERIFY_BACKUP_CMD verify --expect-fingerprint "$PRE_HOTFIX_MAP_FINGERPRINT" > /dev/null
+LIVE_MAP_RC=0
+LIVE_MAP_LINES="$(grep -E "^${MAP_KEY}=" "$ENV_FILE")" || LIVE_MAP_RC=$?
+test "$LIVE_MAP_RC" -le 1
+if [ "$LIVE_MAP_LINES" != "${MAP_KEY}={}" ]; then
+  printf '%s\n' "$LIVE_MAP_LINES" \
+    | $VERIFY_BACKUP_CMD verify --expect-fingerprint "$PRE_HOTFIX_MAP_FINGERPRINT" > /dev/null
+fi
 ENV_TMP="$(mktemp "${ENV_FILE}.rollout.XXXXXX")"
 trap 'rm -f "$ENV_TMP"' EXIT
 cp -p "$ENV_FILE" "$ENV_TMP"
@@ -3109,11 +3207,14 @@ provenance строки неполна или противоречива. Это
 выбирается ни в General, ни в филиал, а affinity возвращает `INVALID`, а не
 «нет данных». Такую строку не редактируют вручную.
 
-Коды проверки backup при откате: `backup_map_unconfigured` (backup снят уже
-после включения hotfix либо предшествует branch map), `backup_map_invalid`,
-`backup_map_not_provider_scoped` (legacy integer-only карта),
-`backup_map_identity_mismatch` (неполная или чужая topology),
-`expected_map_unusable` (ошибка в самой ожидаемой карте из runbook).
+Коды проверки карты (общие для rollout gate и отката): `map_line_missing` и
+`map_line_not_unique` (в файле нет строки карты либо их несколько),
+`map_unconfigured` (пустая карта — файл снят уже после включения hotfix либо
+предшествует branch map), `map_invalid` (malformed JSON, duplicate key,
+коллизия ключей), `map_not_provider_scoped` (legacy integer-only карта),
+`map_fingerprint_mismatch` (карта валидна, но это не та topology, которая была
+зафиксирована перед rollout). Каждый из них останавливает процедуру до
+изменения `.env`.
 
 ### 14.7 Откат
 
@@ -3126,72 +3227,107 @@ sender на одном Meta-номере и остановится на `operato
 Выбирать backup по `ls | tail` запрещено: более свежий файл может быть снят уже
 после включения hotfix и содержать пустую карту.
 
-**Шаг 1. Разрешить handoff в конкретный путь и проверить его безопасность.**
+**Шаг 1. Доказать handoff и его backup.** Тот же gate, что и в §14.4: путь,
+symlink, три обязательных поля ровно по разу, SHA256 всего backup и fingerprint
+нормализованной карты. Ожидаемой topology здесь нет и быть не может — источник
+истины это снимок конфигурации, снятый и проверенный непосредственно перед
+rollout. Зашивать numeric ID филиалов в репозиторий нельзя: плановая ревизия 3
+(§10 канонического плана) зафиксировала EasyWeek location, которая просто
+перестала существовать, и такой gate однажды заблокировал бы легитимный откат.
 
 ```bash
 cd /opt/altegio_bot
+export COMPOSE
 bash <<'ROLLBACK_RESOLVE'
 set -euo pipefail
 ENV_FILE="${ENV_FILE:-/opt/altegio_bot/.env}"
 HANDOFF_FILE="${HANDOFF_FILE:-/root/altegio_bot-single-inbox-hotfix.handoff}"
+MAP_KEY=CHATWOOT_INBOX_COMPANY_MAP
+VERIFY_BACKUP_CMD="${VERIFY_BACKUP_CMD:-${COMPOSE:?export COMPOSE from the Production Compose contract first} exec -T altegio-whatsapp-inbox-worker /app/.venv/bin/python -m altegio_bot.scripts.verify_pre_hotfix_env_backup}"
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi
+}
+handoff_field() {
+  test "$(grep -Ec "^$1=" "$HANDOFF_FILE")" = "1"
+  grep -E "^$1=" "$HANDOFF_FILE" | cut -d= -f2-
+}
+test -f "$ENV_FILE"
+test ! -L "$ENV_FILE"
 test -f "$HANDOFF_FILE"
 test ! -L "$HANDOFF_FILE"
-HANDOFF_RC=0
-PRE_HOTFIX_ENV_BACKUP="$(grep -E '^PRE_HOTFIX_ENV_BACKUP=' "$HANDOFF_FILE" | cut -d= -f2-)" || HANDOFF_RC=$?
-test "$HANDOFF_RC" = "0"
+PRE_HOTFIX_ENV_BACKUP="$(handoff_field PRE_HOTFIX_ENV_BACKUP)"
+PRE_HOTFIX_BACKUP_SHA256="$(handoff_field PRE_HOTFIX_BACKUP_SHA256)"
+PRE_HOTFIX_MAP_FINGERPRINT="$(handoff_field PRE_HOTFIX_MAP_FINGERPRINT)"
 test -n "$PRE_HOTFIX_ENV_BACKUP"
+test -n "$PRE_HOTFIX_BACKUP_SHA256"
+test -n "$PRE_HOTFIX_MAP_FINGERPRINT"
 case "$PRE_HOTFIX_ENV_BACKUP" in "${ENV_FILE}.bak."*) ;; *) exit 1 ;; esac
 test -f "$PRE_HOTFIX_ENV_BACKUP"
 test ! -L "$PRE_HOTFIX_ENV_BACKUP"
-test "$(grep -Ec '^CHATWOOT_INBOX_COMPANY_MAP=' "$PRE_HOTFIX_ENV_BACKUP")" = "1"
+test "$(sha256_of "$PRE_HOTFIX_ENV_BACKUP")" = "$PRE_HOTFIX_BACKUP_SHA256"
+grep -E "^${MAP_KEY}=" "$PRE_HOTFIX_ENV_BACKUP" \
+  | $VERIFY_BACKUP_CMD verify --expect-fingerprint "$PRE_HOTFIX_MAP_FINGERPRINT" > /dev/null
+LIVE_MAP_RC=0
+LIVE_MAP_LINES="$(grep -E "^${MAP_KEY}=" "$ENV_FILE")" || LIVE_MAP_RC=$?
+test "$LIVE_MAP_RC" -le 1
+if [ "$LIVE_MAP_LINES" != "${MAP_KEY}={}" ]; then
+  printf '%s\n' "$LIVE_MAP_LINES" \
+    | $VERIFY_BACKUP_CMD verify --expect-fingerprint "$PRE_HOTFIX_MAP_FINGERPRINT" > /dev/null
+fi
 printf 'PRE_HOTFIX_ENV_BACKUP=%s\n' "$PRE_HOTFIX_ENV_BACKUP"
 ROLLBACK_RESOLVE
 ```
 
-**Шаг 2. Доказать карту backup до любого изменения `.env`.** Проверка идёт тем
-же fail-closed парсером, что и worker, и сверяет identity по каждому inbox.
-Пустая, неполная, legacy, с duplicate key либо чужая карта останавливает откат
-здесь. Значение карты не печатается — только inbox/provider/company и booleans.
+Печатается только путь backup. Значение карты не выводится ни здесь, ни в
+контейнерной проверке — та отвечает booleans, identity и hex-дайджестом.
+
+**Шаг 2. Атомарно восстановить все три ключа.** Блок сам заново проходит тот же
+gate и берёт путь backup только из handoff, а не из окружения оператора;
+контракт записи тот же, что в §14.4.
 
 ```bash
 cd /opt/altegio_bot
-PRE_HOTFIX_ENV_BACKUP=<путь_из_шага_1>
-BACKUP_MAP="$(grep -E '^CHATWOOT_INBOX_COMPANY_MAP=' "$PRE_HOTFIX_ENV_BACKUP" | cut -d= -f2-)"
-EXPECTED_BRANCH_MAP='{"9":{"provider":"altegio","company_id":758285},"10":{"provider":"easyweek","company_id":315607},"11":{"provider":"easyweek","company_id":308697}}'
-$COMPOSE exec -T -e BACKUP_MAP="$BACKUP_MAP" -e EXPECTED_BRANCH_MAP="$EXPECTED_BRANCH_MAP" \
-  altegio-whatsapp-inbox-worker /app/.venv/bin/python -m altegio_bot.scripts.verify_pre_hotfix_env_backup
-```
-
-Gate: `backup_ok: True` и `identities_match: True`. `post_hotfix_backup: True`
-означает, что handoff указывает на backup, снятый уже после включения hotfix, —
-такой backup восстанавливать нельзя.
-
-**Шаг 3. Атомарно восстановить все три ключа.** Блок сам заново читает handoff и
-не принимает путь из окружения оператора; контракт записи тот же, что в §14.4.
-
-```bash
-cd /opt/altegio_bot
+export COMPOSE
 bash <<'ROLLBACK_ENV'
 set -euo pipefail
 ENV_FILE="${ENV_FILE:-/opt/altegio_bot/.env}"
 HANDOFF_FILE="${HANDOFF_FILE:-/root/altegio_bot-single-inbox-hotfix.handoff}"
+MAP_KEY=CHATWOOT_INBOX_COMPANY_MAP
+VERIFY_BACKUP_CMD="${VERIFY_BACKUP_CMD:-${COMPOSE:?export COMPOSE from the Production Compose contract first} exec -T altegio-whatsapp-inbox-worker /app/.venv/bin/python -m altegio_bot.scripts.verify_pre_hotfix_env_backup}"
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi
+}
+handoff_field() {
+  test "$(grep -Ec "^$1=" "$HANDOFF_FILE")" = "1"
+  grep -E "^$1=" "$HANDOFF_FILE" | cut -d= -f2-
+}
 MANAGED_RE='^(CHATWOOT_INBOX_COMPANY_MAP|CHATWOOT_INBOUND_ROUTING_MODE|CHATWOOT_SINGLE_INBOX_OPERATOR_SENDER_ID)='
 test -f "$ENV_FILE"
 test ! -L "$ENV_FILE"
 test -f "$HANDOFF_FILE"
 test ! -L "$HANDOFF_FILE"
-HANDOFF_RC=0
-PRE_HOTFIX_ENV_BACKUP="$(grep -E '^PRE_HOTFIX_ENV_BACKUP=' "$HANDOFF_FILE" | cut -d= -f2-)" || HANDOFF_RC=$?
-test "$HANDOFF_RC" = "0"
+PRE_HOTFIX_ENV_BACKUP="$(handoff_field PRE_HOTFIX_ENV_BACKUP)"
+PRE_HOTFIX_BACKUP_SHA256="$(handoff_field PRE_HOTFIX_BACKUP_SHA256)"
+PRE_HOTFIX_MAP_FINGERPRINT="$(handoff_field PRE_HOTFIX_MAP_FINGERPRINT)"
 test -n "$PRE_HOTFIX_ENV_BACKUP"
+test -n "$PRE_HOTFIX_BACKUP_SHA256"
+test -n "$PRE_HOTFIX_MAP_FINGERPRINT"
 case "$PRE_HOTFIX_ENV_BACKUP" in "${ENV_FILE}.bak."*) ;; *) exit 1 ;; esac
 test -f "$PRE_HOTFIX_ENV_BACKUP"
 test ! -L "$PRE_HOTFIX_ENV_BACKUP"
-test "$(grep -Ec '^CHATWOOT_INBOX_COMPANY_MAP=' "$PRE_HOTFIX_ENV_BACKUP")" = "1"
+test "$(sha256_of "$PRE_HOTFIX_ENV_BACKUP")" = "$PRE_HOTFIX_BACKUP_SHA256"
+grep -E "^${MAP_KEY}=" "$PRE_HOTFIX_ENV_BACKUP" \
+  | $VERIFY_BACKUP_CMD verify --expect-fingerprint "$PRE_HOTFIX_MAP_FINGERPRINT" > /dev/null
+LIVE_MAP_RC=0
+LIVE_MAP_LINES="$(grep -E "^${MAP_KEY}=" "$ENV_FILE")" || LIVE_MAP_RC=$?
+test "$LIVE_MAP_RC" -le 1
+if [ "$LIVE_MAP_LINES" != "${MAP_KEY}={}" ]; then
+  printf '%s\n' "$LIVE_MAP_LINES" \
+    | $VERIFY_BACKUP_CMD verify --expect-fingerprint "$PRE_HOTFIX_MAP_FINGERPRINT" > /dev/null
+fi
 MAP_RC=0
-BACKUP_MAP_LINE="$(grep -E '^CHATWOOT_INBOX_COMPANY_MAP=' "$PRE_HOTFIX_ENV_BACKUP")" || MAP_RC=$?
+BACKUP_MAP_LINE="$(grep -E "^${MAP_KEY}=" "$PRE_HOTFIX_ENV_BACKUP")" || MAP_RC=$?
 test "$MAP_RC" = "0"
-test "$BACKUP_MAP_LINE" != 'CHATWOOT_INBOX_COMPANY_MAP={}'
 ENV_TMP="$(mktemp "${ENV_FILE}.rollback.XXXXXX")"
 trap 'rm -f "$ENV_TMP"' EXIT
 cp -p "$ENV_FILE" "$ENV_TMP"
@@ -3211,7 +3347,7 @@ echo "rollback env restore ok"
 ROLLBACK_ENV
 ```
 
-**Шаг 4. Каждый ключ снова ровно один раз.**
+**Шаг 3. Каждый ключ снова ровно один раз.**
 
 ```bash
 cd /opt/altegio_bot
@@ -3220,7 +3356,7 @@ for KEY in CHATWOOT_INBOX_COMPANY_MAP CHATWOOT_INBOUND_ROUTING_MODE CHATWOOT_SIN
 done
 ```
 
-**Шаг 5. Пересоздать оба worker.** Причина та же, что и при rollout: карту
+**Шаг 4. Пересоздать оба worker.** Причина та же, что и при rollout: карту
 читают двое, и оставленный в старом env worker продолжит зеркалить по-своему.
 
 ```bash
@@ -3229,7 +3365,7 @@ $COMPOSE up -d --force-recreate \
   altegio-outbox-worker altegio-whatsapp-inbox-worker
 ```
 
-**Шаг 6. Обязательный post-recreate preflight в обоих контейнерах.**
+**Шаг 5. Обязательный post-recreate preflight в обоих контейнерах.**
 
 ```bash
 cd /opt/altegio_bot

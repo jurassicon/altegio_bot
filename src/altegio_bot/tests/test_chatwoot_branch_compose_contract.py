@@ -2,16 +2,22 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 import yaml
 
-from altegio_bot.scripts.verify_pre_hotfix_env_backup import verify_backup_map
+from altegio_bot.scripts.verify_pre_hotfix_env_backup import (
+    extract_map_value,
+    map_fingerprint,
+    snapshot_branch_map,
+)
 from altegio_bot.webhooks.common import (
     parse_chatwoot_inbox_company_map,
     positive_int,
@@ -105,22 +111,31 @@ def test_official_env_example_uses_provider_scoped_branches_and_separate_general
 
 
 # ---------------------------------------------------------------------------
-# PR-7.4 single-inbox hotfix: the rollout has to be executable, not indicative
+# PR-7.4 single-inbox hotfix: no rollout without a proven rollback
 # ---------------------------------------------------------------------------
 #
-# Two earlier drafts of §14 were unsafe in ways that only show up on the day it
-# is actually run:
+# Three drafts of §14 were unsafe, each in a way that only shows up on the day
+# it is run:
 #
 #   * bare `KEY=value` lines set shell variables and vanish — `.env` untouched,
-#     Compose none the wiser, and the operator believing the rollback is armed;
-#   * `cat "$ENV_TMP" > .env` truncates the live production `.env` FIRST, so an
-#     interrupted write leaves it empty or half-written, and `grep ... || true`
-#     swallowed real read errors on the way there — after which the temp file
-#     held three Chatwoot keys and every other production secret was gone.
+#     Compose none the wiser, the operator believing the rollback is armed;
+#   * `cat "$ENV_TMP" > .env` truncated the live production file first, and
+#     `grep ... || true` swallowed real read errors on the way there;
+#   * the handoff was accepted on sight ("keeping the pre-hotfix backup it
+#     already names") and only checked at some future rollback — so the rollout
+#     could empty `CHATWOOT_INBOX_COMPANY_MAP` while the backup it was supposed
+#     to restore was missing, tampered with, or a snapshot of a different
+#     topology entirely.
+#
+# The gate is now cryptographic and it runs inside the block that does the
+# writing: handoff fields, backup SHA256, and a fingerprint of the normalised
+# branch map captured immediately before the rollout. Nothing here knows what
+# the topology *should* be — plan §10 records an EasyWeek location id that
+# stopped existing, so a numeric id pinned in this repository would one day
+# block a rollback that has to succeed.
 #
 # These tests do not paraphrase the runbook. They lift its own bash blocks out
-# of the markdown and run them against a throwaway `.env`, so "the documented
-# procedure is safe" is a fact rather than a claim.
+# of the markdown and run them against a throwaway `.env`.
 
 SINGLE_INBOX_KEYS = (
     "CHATWOOT_INBOX_COMPANY_MAP",
@@ -128,20 +143,21 @@ SINGLE_INBOX_KEYS = (
     "CHATWOOT_SINGLE_INBOX_OPERATOR_SENDER_ID",
 )
 RECREATE_BOTH_WORKERS = "$COMPOSE up -d --force-recreate \\\n  altegio-outbox-worker altegio-whatsapp-inbox-worker"
+HANDOFF_FIELDS = ("PRE_HOTFIX_ENV_BACKUP", "PRE_HOTFIX_BACKUP_SHA256", "PRE_HOTFIX_MAP_FINGERPRINT")
 
-# The confirmed production topology, as the runbook states it. Restoring
-# anything else is not a rollback.
-PRODUCTION_BRANCH_MAP = (
-    '{"9":{"provider":"altegio","company_id":758285},'
-    '"10":{"provider":"easyweek","company_id":315607},'
-    '"11":{"provider":"easyweek","company_id":308697}}'
+# Deliberately NOT the current production ids. The procedure must work for
+# whatever topology is live when it runs, and these tests must keep passing the
+# day production changes.
+SYNTHETIC_BRANCH_MAP = (
+    '{"9":{"provider":"altegio","company_id":700001},'
+    '"10":{"provider":"easyweek","company_id":700002},'
+    '"11":{"provider":"easyweek","company_id":700003}}'
 )
-# Deliberately fake: no test may read or print a real production secret.
 FIXTURE_ENV_LINES = (
     "APP_NAME=altegio_bot",
     "WHATSAPP_ACCESS_TOKEN=NOT_A_REAL_TOKEN_FIXTURE",
     "CHATWOOT_INBOX_ID=8",
-    f"CHATWOOT_INBOX_COMPANY_MAP={PRODUCTION_BRANCH_MAP}",
+    f"CHATWOOT_INBOX_COMPANY_MAP={SYNTHETIC_BRANCH_MAP}",
     "CHATWOOT_INBOUND_ROUTING_MODE=affinity",
     "# trailing comment",
     "",
@@ -172,11 +188,17 @@ def _run_block(
     extra_env: dict[str, str] | None = None,
     script: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    """Execute a runbook block against a throwaway .env, never the real one."""
+    """Execute a runbook block against a throwaway .env, never the real one.
+
+    The verifier normally runs inside a worker container; here it runs in this
+    interpreter, which is the same code the container would execute.
+    """
     env = {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         "ENV_FILE": str(env_file),
         "HANDOFF_FILE": str(handoff_file),
+        "VERIFY_BACKUP_CMD": f"{sys.executable} -m altegio_bot.scripts.verify_pre_hotfix_env_backup",
+        "PYTHONPATH": str(REPO_ROOT / "src"),
     }
     env.update(extra_env or {})
     return subprocess.run(
@@ -187,12 +209,33 @@ def _run_block(
     )
 
 
+def _handoff_fields(handoff_file) -> dict[str, str]:
+    return dict(line.split("=", 1) for line in handoff_file.read_text().splitlines() if "=" in line)
+
+
+def _sha256_of(path) -> str:
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
 @pytest.fixture
 def env_fixture(tmp_path):
-    """A stand-in `.env` plus a handoff path, both inside tmp_path."""
+    """A stand-in `.env` in a valid pre-hotfix state, plus a handoff path."""
     env_file = tmp_path / ".env"
     env_file.write_text("\n".join(FIXTURE_ENV_LINES), encoding="utf-8")
     return env_file, tmp_path / "hotfix.handoff"
+
+
+def _arm(env_fixture, sender_id: str = "3"):
+    """Walk the documented rollout: prove, snapshot, then write."""
+    env_file, handoff = env_fixture
+    proved = _run_block("PREHOTFIX_HANDOFF", env_file=env_file, handoff_file=handoff)
+    written = _run_block(
+        "ROLLOUT_ENV",
+        env_file=env_file,
+        handoff_file=handoff,
+        extra_env={"SINGLE_INBOX_SENDER_ID": sender_id},
+    )
+    return proved, written
 
 
 # --- static contract --------------------------------------------------------
@@ -210,7 +253,6 @@ def test_single_inbox_rollout_edits_the_real_env_file() -> None:
 
 
 def test_the_env_edit_is_never_an_in_place_truncation() -> None:
-    """The exact defect: `cat "$TMP" > .env` empties production before writing."""
     section = _single_inbox_section()
 
     assert 'cat "$ENV_TMP" > .env' not in section
@@ -222,13 +264,11 @@ def test_the_env_edit_is_never_an_in_place_truncation() -> None:
 def test_the_env_edit_uses_a_sibling_temp_file_and_an_atomic_rename() -> None:
     section = _single_inbox_section()
 
-    # Same filesystem as .env, so the rename is atomic and cannot cross devices.
     assert section.count('ENV_TMP="$(mktemp "${ENV_FILE}.rollout.XXXXXX")"') == 1
     assert section.count('ENV_TMP="$(mktemp "${ENV_FILE}.rollback.XXXXXX")"') == 1
     assert not re.search(r"mktemp\s*\)", section), "mktemp must always be given a directory"
-    assert not re.search(r"mktemp\s*\n", section)
     assert section.count('mv -f "$ENV_TMP" "$ENV_FILE"') == 2, "rollout and rollback both rename atomically"
-    assert section.count("""trap 'rm -f "$ENV_TMP"' EXIT""") == 2, "both blocks clean their temp up"
+    assert section.count("""trap 'rm -f "$ENV_TMP"' EXIT""") == 2
     assert section.count("set -euo pipefail") >= 4, "every mutating block fails fast"
 
 
@@ -236,7 +276,6 @@ def test_a_read_error_is_never_masked_by_true() -> None:
     section = _single_inbox_section()
 
     assert "|| true" not in section, "|| true hides a real read error as well as the benign exit 1"
-    # Only the documented benign code is tolerated, and only explicitly.
     assert section.count('grep -Ev "$MANAGED_RE" "$ENV_FILE" > "$ENV_TMP" || KEPT_RC=$?') == 2
     assert section.count('test "$KEPT_RC" -le 1') == 2
 
@@ -256,9 +295,7 @@ def test_rollout_and_rollback_share_one_write_contract() -> None:
 
 
 def test_single_inbox_rollout_validates_the_sender_id_before_writing_it() -> None:
-    section = _single_inbox_section()
-
-    assert "grep -Eq '^[1-9][0-9]*$'" in section, "only a positive integer may be written"
+    assert "grep -Eq '^[1-9][0-9]*$'" in _single_inbox_section()
 
 
 def test_single_inbox_rollout_never_prints_env_contents_or_secrets() -> None:
@@ -273,15 +310,15 @@ def test_single_inbox_rollout_never_prints_env_contents_or_secrets() -> None:
 def test_single_inbox_hotfix_does_not_touch_easyweek_env() -> None:
     section = _single_inbox_section()
 
-    assert "easyweek.env" in section, "the runbook must say the file is NOT involved"
+    assert "easyweek.env" in section
     assert "не трогает и править его не нужно" in section
 
 
 def test_single_inbox_rollout_and_rollback_recreate_both_chatwoot_consumers() -> None:
     section = _single_inbox_section()
 
-    assert section.count(RECREATE_BOTH_WORKERS) == 2, "both rollout and rollback recreate both workers"
-    assert "restart" not in section.replace("`restart`", ""), "a plain restart does not re-read .env"
+    assert section.count(RECREATE_BOTH_WORKERS) == 2
+    assert "restart" not in section.replace("`restart`", "")
     for service_name in CHATWOOT_CONSUMERS:
         assert service_name in section
 
@@ -300,7 +337,6 @@ def test_single_inbox_rollout_and_rollback_both_preflight_both_workers() -> None
     section = _single_inbox_section()
     worker_loop = "for CHATWOOT_SERVICE in altegio-outbox-worker altegio-whatsapp-inbox-worker; do"
 
-    # Support gate, rollout preflight, rollback preflight.
     assert section.count(worker_loop) >= 3
     assert section.count('"single_inbox_sender_supported"') >= 3
     assert section.count('"branch_map_provider_scoped": parsed.provider_scoped') == 2
@@ -315,7 +351,6 @@ def test_single_inbox_stop_conditions_cover_split_worker_configuration() -> None
     assert "один worker остался в `general`" in section
     assert "продолжает видеть пустую карту" in section
     assert "маршрутизируется в филиал технического" in section
-    assert "зеркала" in section
 
 
 # --- General inbox validity is proved, not inferred from an empty map -------
@@ -325,8 +360,6 @@ def test_the_preflight_proves_a_positive_general_inbox_id() -> None:
     section = _single_inbox_section()
 
     assert section.count('"general_inbox_id_valid": positive_int(settings.chatwoot_inbox_id) is not None') == 2
-    # The old expression called an unset General inbox "isolated" purely because
-    # the branch map was empty.
     assert "validated_general_id is not None or not parsed.configured" not in section
     assert (
         section.count('"general_inbox_isolated": (validated_general_id is not None) if parsed.configured else None')
@@ -337,8 +370,7 @@ def test_the_preflight_proves_a_positive_general_inbox_id() -> None:
 def test_both_gates_require_a_valid_general_inbox_id() -> None:
     section = _single_inbox_section()
 
-    assert section.count("`general_inbox_id_valid: True`") == 2, "rollout and rollback gates both demand it"
-    assert "`general_inbox_id: 8`" in section, "the confirmed production General inbox"
+    assert section.count("`general_inbox_id_valid: True`") == 2
     assert "general_inbox_id_valid: False" in section, "and it is a STOP condition"
 
 
@@ -349,11 +381,10 @@ def test_both_gates_require_a_valid_general_inbox_id() -> None:
         pytest.param(-1, False, id="negative"),
         pytest.param("8", False, id="string"),
         pytest.param(True, False, id="bool"),
-        pytest.param(8, True, id="production_general_inbox"),
+        pytest.param(8, True, id="positive"),
     ],
 )
 def test_general_inbox_validity_never_comes_from_an_empty_map(inbox_id: object, expected: bool) -> None:
-    """The preflight expression itself, evaluated the way the runbook does."""
     parsed = parse_chatwoot_inbox_company_map("{}")
 
     assert parsed.configured is False
@@ -364,195 +395,409 @@ def test_general_inbox_validity_never_comes_from_an_empty_map(inbox_id: object, 
 
 
 def test_the_central_general_inbox_resolver_is_untouched() -> None:
-    """Its two documented contracts still hold; the fix lives in the runbook."""
-    configured = parse_chatwoot_inbox_company_map(PRODUCTION_BRANCH_MAP)
+    configured = parse_chatwoot_inbox_company_map(SYNTHETIC_BRANCH_MAP)
 
     assert resolve_chatwoot_general_inbox(configured, 8) == (8, None)
     assert resolve_chatwoot_general_inbox(configured, 9) == (None, "general_inbox_overlaps_branch")
     assert resolve_chatwoot_general_inbox(configured, 0) == (None, "invalid_general_inbox_id")
 
 
-# --- the rollback source is a proven backup, not the newest filename ---------
+# --- no topology is pinned in the repository --------------------------------
 
 
-def test_the_rollback_never_picks_a_backup_by_filename() -> None:
+def test_no_expected_branch_map_is_hardcoded_anywhere() -> None:
+    """Plan §10: numeric location ids are not eternal constants."""
     section = _single_inbox_section()
-    rollback = section[section.index("### 14.7") :]
+    verifier = (REPO_ROOT / "src/altegio_bot/scripts/verify_pre_hotfix_env_backup.py").read_text()
 
-    assert "ls -1 .env.bak.*" not in section, "a newer backup may already hold the emptied map"
-    assert "tail -1" not in section
-    assert "PRE_HOTFIX_ENV_BACKUP=" in rollback
-    assert rollback.count("grep -E '^PRE_HOTFIX_ENV_BACKUP=' \"$HANDOFF_FILE\"") == 2
-    assert rollback.count('case "$PRE_HOTFIX_ENV_BACKUP" in "${ENV_FILE}.bak."*)') == 2
-    assert rollback.count('test ! -L "$PRE_HOTFIX_ENV_BACKUP"') == 2
+    assert "EXPECTED_BRANCH_MAP" not in section
+    assert "EXPECTED_BRANCH_MAP" not in verifier
+    assert "identities_match" not in section
+    # No production branch identity may act as a permanent gate.
+    for production_id in ("315607", "308697", "758285"):
+        assert production_id not in section, production_id
+        assert production_id not in verifier, production_id
 
 
-def test_the_rollout_writes_the_handoff_once_and_never_silently_replaces_it() -> None:
+def test_the_fingerprint_is_the_only_source_of_expected_identity() -> None:
     section = _single_inbox_section()
 
-    assert 'if [ -e "$HANDOFF_FILE" ]; then' in section
-    assert 'mv -n "$HANDOFF_TMP" "$HANDOFF_FILE"' in section, "-n so a second run cannot overwrite it"
-    assert "Handoff и pre-hotfix backup удаляются только после успешного post-rollback" in section
+    # Four blocks carry the gate, and each proves the backup and, while the
+    # live .env is still pre-hotfix, the live map against the same digest.
+    assert section.count("$VERIFY_BACKUP_CMD verify --expect-fingerprint") == 8
+    assert section.count("$VERIFY_BACKUP_CMD snapshot") == 1, "the snapshot is taken once, before arming"
 
 
-def test_the_rollback_proves_the_backup_map_before_touching_env() -> None:
-    section = _single_inbox_section()
-    rollback = section[section.index("### 14.7") :]
+# --- the verifier itself ----------------------------------------------------
 
-    assert "python -m altegio_bot.scripts.verify_pre_hotfix_env_backup" in rollback
-    assert f"EXPECTED_BRANCH_MAP='{PRODUCTION_BRANCH_MAP}'" in rollback
-    # The gate is stated, and it precedes the block that writes .env.
-    assert rollback.index("backup_ok: True") < rollback.index("ROLLBACK_ENV")
-    assert "post_hotfix_backup: True" in rollback
+
+def test_the_fingerprint_ignores_formatting_but_not_identity() -> None:
+    spaced = (
+        '{ "11" : {"provider":"easyweek","company_id":700003} ,'
+        ' "9": {"provider":"altegio","company_id":700001},'
+        ' "10":{"provider":"easyweek","company_id":700002} }'
+    )
+    baseline = snapshot_branch_map(f"CHATWOOT_INBOX_COMPANY_MAP={SYNTHETIC_BRANCH_MAP}")
+    reordered = snapshot_branch_map(f"CHATWOOT_INBOX_COMPANY_MAP={spaced}")
+    changed = snapshot_branch_map("CHATWOOT_INBOX_COMPANY_MAP=" + SYNTHETIC_BRANCH_MAP.replace("700003", "700009"))
+
+    assert baseline.ok and reordered.ok and changed.ok
+    assert baseline.fingerprint == reordered.fingerprint, "key order and spacing are not identity"
+    assert baseline.fingerprint != changed.fingerprint, "a different company id is"
+    assert baseline.fingerprint == map_fingerprint(
+        [(9, "altegio", 700001), (10, "easyweek", 700002), (11, "easyweek", 700003)]
+    )
 
 
 @pytest.mark.parametrize(
-    "backup_map, expected_reason",
+    "map_value, expected_reason",
     [
-        pytest.param("{}", "backup_map_unconfigured", id="taken_after_the_hotfix_armed"),
-        pytest.param("", "backup_map_unconfigured", id="predates_the_branch_map"),
-        pytest.param('{"9":758285,"10":315607,"11":308697}', "backup_map_not_provider_scoped", id="legacy_integer_map"),
+        pytest.param("{}", "map_unconfigured", id="emptied_by_the_hotfix"),
+        pytest.param("", "map_unconfigured", id="predates_the_branch_map"),
+        pytest.param('{"9":700001,"10":700002}', "map_not_provider_scoped", id="legacy_integer_map"),
         pytest.param(
-            '{"9":{"provider":"altegio","company_id":758285},"9":{"provider":"easyweek","company_id":315607}}',
-            "backup_map_invalid",
-            id="duplicate_key",
+            '{"9":{"provider":"altegio","company_id":700001},"9":{"provider":"easyweek","company_id":700002}}',
+            "map_invalid",
+            id="duplicate_json_key",
         ),
-        pytest.param("{not json", "backup_map_invalid", id="malformed"),
-        pytest.param(
-            '{"9":{"provider":"altegio","company_id":758285}}',
-            "backup_map_identity_mismatch",
-            id="incomplete_topology",
-        ),
-        pytest.param(
-            '{"9":{"provider":"easyweek","company_id":758285},'
-            '"10":{"provider":"easyweek","company_id":315607},'
-            '"11":{"provider":"easyweek","company_id":308697}}',
-            "backup_map_identity_mismatch",
-            id="foreign_provider",
-        ),
+        pytest.param("{not json", "map_invalid", id="malformed"),
     ],
 )
-def test_an_unusable_backup_map_is_rejected(backup_map: str, expected_reason: str) -> None:
-    verdict = verify_backup_map(backup_map, PRODUCTION_BRANCH_MAP)
+def test_an_unusable_map_is_refused(map_value: str, expected_reason: str) -> None:
+    verdict = snapshot_branch_map(f"CHATWOOT_INBOX_COMPANY_MAP={map_value}")
 
     assert verdict.ok is False
     assert verdict.reason == expected_reason
-    assert backup_map not in str(verdict.as_safe_dict()) or backup_map == ""
+    assert verdict.fingerprint == ""
 
 
-def test_the_expected_pre_hotfix_backup_is_accepted() -> None:
-    verdict = verify_backup_map(PRODUCTION_BRANCH_MAP, PRODUCTION_BRANCH_MAP)
+def test_a_missing_or_duplicated_map_line_is_refused() -> None:
+    assert snapshot_branch_map("APP_NAME=x").reason == "map_line_missing"
+    doubled = f"CHATWOOT_INBOX_COMPANY_MAP={SYNTHETIC_BRANCH_MAP}\nCHATWOOT_INBOX_COMPANY_MAP={{}}"
+    assert snapshot_branch_map(doubled).reason == "map_line_not_unique"
+    assert extract_map_value(doubled) == (None, "map_line_not_unique")
+
+
+def test_a_fingerprint_mismatch_is_refused_even_for_a_valid_map() -> None:
+    other = snapshot_branch_map("CHATWOOT_INBOX_COMPANY_MAP=" + SYNTHETIC_BRANCH_MAP.replace("700003", "700009"))
+    verdict = snapshot_branch_map(
+        f"CHATWOOT_INBOX_COMPANY_MAP={SYNTHETIC_BRANCH_MAP}",
+        expected_fingerprint=other.fingerprint,
+    )
+
+    assert verdict.ok is False
+    assert verdict.reason == "map_fingerprint_mismatch"
+
+
+def test_the_verifier_output_never_carries_the_raw_map() -> None:
+    verdict = snapshot_branch_map(f"CHATWOOT_INBOX_COMPANY_MAP={SYNTHETIC_BRANCH_MAP}")
+    printed = str(verdict.as_safe_dict())
 
     assert verdict.ok is True
-    assert verdict.reason == "backup_map_proven"
-    assert verdict.branch_identities == [
-        (9, "altegio", 758285),
-        (10, "easyweek", 315607),
-        (11, "easyweek", 308697),
-    ]
-    assert verdict.as_safe_dict()["identities_match"] is True
-
-
-def test_a_broken_expectation_cannot_wave_a_bad_backup_through() -> None:
-    assert verify_backup_map(PRODUCTION_BRANCH_MAP, "{}").reason == "expected_map_unusable"
-    assert verify_backup_map("{}", "{}").reason == "expected_map_unusable"
+    # Identities are normalised tuples; the configuration string itself never
+    # leaves, in whole or in part.
+    assert SYNTHETIC_BRANCH_MAP not in printed
+    assert '"provider"' not in printed and "company_id" not in printed
+    assert "NOT_A_REAL_TOKEN_FIXTURE" not in printed
 
 
 # --- the blocks, actually executed ------------------------------------------
 
 
-def test_the_documented_rollout_replaces_only_the_three_keys(env_fixture) -> None:
+def test_a_valid_pre_hotfix_env_arms_and_records_a_bound_snapshot(env_fixture) -> None:
     env_file, handoff = env_fixture
 
-    backup = _run_block("PREHOTFIX_BACKUP", env_file=env_file, handoff_file=handoff)
-    upsert = _run_block(
-        "ROLLOUT_ENV",
-        env_file=env_file,
-        handoff_file=handoff,
-        extra_env={"SINGLE_INBOX_SENDER_ID": "3"},
-    )
+    proved, written = _arm(env_fixture)
+    fields = _handoff_fields(handoff)
     after = env_file.read_text().splitlines()
 
-    assert backup.returncode == 0, backup.stderr
-    assert upsert.returncode == 0, upsert.stderr
-    assert handoff.exists()
-    # Untouched lines survive verbatim, in their original order.
+    assert proved.returncode == 0, proved.stderr
+    assert written.returncode == 0, written.stderr
+    assert set(fields) == set(HANDOFF_FIELDS)
+    assert oct(handoff.stat().st_mode)[-3:] == "600", "the handoff is root-only"
+    assert fields["PRE_HOTFIX_BACKUP_SHA256"] == _sha256_of(fields["PRE_HOTFIX_ENV_BACKUP"])
+    assert fields["PRE_HOTFIX_MAP_FINGERPRINT"] == map_fingerprint(
+        [(9, "altegio", 700001), (10, "easyweek", 700002), (11, "easyweek", 700003)]
+    )
+    # The handoff carries a digest, never the configuration itself.
+    assert SYNTHETIC_BRANCH_MAP not in handoff.read_text()
+    assert "NOT_A_REAL_TOKEN_FIXTURE" not in handoff.read_text()
+
     assert [line for line in after if not line.startswith(SINGLE_INBOX_KEYS)] == [
         "APP_NAME=altegio_bot",
         "WHATSAPP_ACCESS_TOKEN=NOT_A_REAL_TOKEN_FIXTURE",
         "CHATWOOT_INBOX_ID=8",
         "# trailing comment",
     ]
-    for key in SINGLE_INBOX_KEYS:
-        assert len([line for line in after if line.startswith(f"{key}=")]) == 1
     assert "CHATWOOT_INBOX_COMPANY_MAP={}" in after
     assert "CHATWOOT_INBOUND_ROUTING_MODE=general" in after
     assert "CHATWOOT_SINGLE_INBOX_OPERATOR_SENDER_ID=3" in after
 
 
-def test_the_documented_rollback_restores_the_proven_map(env_fixture) -> None:
+def test_the_rollback_restores_the_exact_captured_map(env_fixture) -> None:
     env_file, handoff = env_fixture
 
-    _run_block("PREHOTFIX_BACKUP", env_file=env_file, handoff_file=handoff)
-    _run_block("ROLLOUT_ENV", env_file=env_file, handoff_file=handoff, extra_env={"SINGLE_INBOX_SENDER_ID": "3"})
-    restore = _run_block("ROLLBACK_ENV", env_file=env_file, handoff_file=handoff)
+    _arm(env_fixture)
+    restored = _run_block("ROLLBACK_ENV", env_file=env_file, handoff_file=handoff)
     after = env_file.read_text().splitlines()
 
-    assert restore.returncode == 0, restore.stderr
-    assert f"CHATWOOT_INBOX_COMPANY_MAP={PRODUCTION_BRANCH_MAP}" in after
+    assert restored.returncode == 0, restored.stderr
+    assert f"CHATWOOT_INBOX_COMPANY_MAP={SYNTHETIC_BRANCH_MAP}" in after
     assert "CHATWOOT_INBOUND_ROUTING_MODE=affinity" in after
     assert "CHATWOOT_SINGLE_INBOX_OPERATOR_SENDER_ID=0" in after
     assert "WHATSAPP_ACCESS_TOKEN=NOT_A_REAL_TOKEN_FIXTURE" in after
 
 
-def test_a_second_rollout_run_keeps_the_original_handoff(env_fixture) -> None:
+@pytest.mark.parametrize(
+    "live_map",
+    [
+        pytest.param("{}", id="already_empty"),
+        pytest.param('{"9":700001}', id="legacy_integer_map"),
+        pytest.param("{not json", id="malformed"),
+        pytest.param("", id="unset"),
+    ],
+)
+def test_an_unusable_live_map_can_never_arm_the_hotfix(tmp_path, live_map: str) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text("\n".join(FIXTURE_ENV_LINES).replace(SYNTHETIC_BRANCH_MAP, live_map), encoding="utf-8")
+    handoff = tmp_path / "hotfix.handoff"
+    before = env_file.read_bytes()
+
+    proved = _run_block("PREHOTFIX_HANDOFF", env_file=env_file, handoff_file=handoff)
+    written = _run_block(
+        "ROLLOUT_ENV",
+        env_file=env_file,
+        handoff_file=handoff,
+        extra_env={"SINGLE_INBOX_SENDER_ID": "3"},
+    )
+
+    assert proved.returncode != 0
+    assert written.returncode != 0, "no handoff, so the write gate cannot pass either"
+    assert not handoff.exists(), "an unprovable pre-hotfix state must not produce a handoff"
+    assert env_file.read_bytes() == before
+
+
+def test_a_duplicated_map_line_can_never_arm_the_hotfix(tmp_path) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "\n".join(FIXTURE_ENV_LINES) + f"CHATWOOT_INBOX_COMPANY_MAP={SYNTHETIC_BRANCH_MAP}\n",
+        encoding="utf-8",
+    )
+    handoff = tmp_path / "hotfix.handoff"
+    before = env_file.read_bytes()
+
+    proved = _run_block("PREHOTFIX_HANDOFF", env_file=env_file, handoff_file=handoff)
+
+    assert proved.returncode != 0, "last-wins on a duplicated key is not a state anyone proved"
+    assert not handoff.exists()
+    assert env_file.read_bytes() == before
+
+
+def test_a_missing_backup_stops_the_rollout(env_fixture) -> None:
     env_file, handoff = env_fixture
 
-    _run_block("PREHOTFIX_BACKUP", env_file=env_file, handoff_file=handoff)
+    _run_block("PREHOTFIX_HANDOFF", env_file=env_file, handoff_file=handoff)
+    os.remove(_handoff_fields(handoff)["PRE_HOTFIX_ENV_BACKUP"])
+    before = env_file.read_bytes()
+
+    reproved = _run_block("PREHOTFIX_HANDOFF", env_file=env_file, handoff_file=handoff)
+    written = _run_block(
+        "ROLLOUT_ENV",
+        env_file=env_file,
+        handoff_file=handoff,
+        extra_env={"SINGLE_INBOX_SENDER_ID": "3"},
+    )
+
+    assert reproved.returncode != 0, "an existing handoff is verified, never taken on trust"
+    assert written.returncode != 0
+    assert env_file.read_bytes() == before
+
+
+def test_a_tampered_backup_stops_the_rollout(env_fixture) -> None:
+    env_file, handoff = env_fixture
+
+    _run_block("PREHOTFIX_HANDOFF", env_file=env_file, handoff_file=handoff)
+    backup = Path(_handoff_fields(handoff)["PRE_HOTFIX_ENV_BACKUP"])
+    backup.write_text(backup.read_text() + "SNEAKY=1\n", encoding="utf-8")
+    before = env_file.read_bytes()
+
+    written = _run_block(
+        "ROLLOUT_ENV",
+        env_file=env_file,
+        handoff_file=handoff,
+        extra_env={"SINGLE_INBOX_SENDER_ID": "3"},
+    )
+    rolled_back = _run_block("ROLLBACK_ENV", env_file=env_file, handoff_file=handoff)
+
+    assert written.returncode != 0, "SHA256 binds the handoff to that exact file"
+    assert rolled_back.returncode != 0
+    assert env_file.read_bytes() == before
+
+
+@pytest.mark.parametrize("target", ["handoff", "backup"])
+def test_a_symlinked_handoff_or_backup_is_refused(env_fixture, target: str) -> None:
+    env_file, handoff = env_fixture
+
+    _run_block("PREHOTFIX_HANDOFF", env_file=env_file, handoff_file=handoff)
+    if target == "handoff":
+        real = handoff.with_suffix(".real")
+        shutil.move(handoff, real)
+        handoff.symlink_to(real)
+    else:
+        backup = Path(_handoff_fields(handoff)["PRE_HOTFIX_ENV_BACKUP"])
+        real = backup.with_suffix(".real")
+        shutil.move(backup, real)
+        backup.symlink_to(real)
+    before = env_file.read_bytes()
+
+    written = _run_block(
+        "ROLLOUT_ENV",
+        env_file=env_file,
+        handoff_file=handoff,
+        extra_env={"SINGLE_INBOX_SENDER_ID": "3"},
+    )
+
+    assert written.returncode != 0
+    assert env_file.read_bytes() == before
+
+
+def test_a_handoff_whose_snapshot_no_longer_matches_the_live_env_is_stale(env_fixture) -> None:
+    """The map legitimately changed after the handoff was taken — stop."""
+    env_file, handoff = env_fixture
+
+    _run_block("PREHOTFIX_HANDOFF", env_file=env_file, handoff_file=handoff)
+    env_file.write_text(
+        "\n".join(FIXTURE_ENV_LINES).replace("700003", "700009"),
+        encoding="utf-8",
+    )
+    before = env_file.read_bytes()
+
+    reproved = _run_block("PREHOTFIX_HANDOFF", env_file=env_file, handoff_file=handoff)
+    written = _run_block(
+        "ROLLOUT_ENV",
+        env_file=env_file,
+        handoff_file=handoff,
+        extra_env={"SINGLE_INBOX_SENDER_ID": "3"},
+    )
+
+    assert reproved.returncode != 0, "restoring the old snapshot would undo a real change"
+    assert written.returncode != 0
+    assert env_file.read_bytes() == before
+
+
+def test_a_missing_handoff_field_is_refused(env_fixture) -> None:
+    env_file, handoff = env_fixture
+
+    _run_block("PREHOTFIX_HANDOFF", env_file=env_file, handoff_file=handoff)
+    kept = [line for line in handoff.read_text().splitlines() if not line.startswith("PRE_HOTFIX_BACKUP_SHA256=")]
+    handoff.write_text("\n".join(kept) + "\n", encoding="utf-8")
+    before = env_file.read_bytes()
+
+    written = _run_block(
+        "ROLLOUT_ENV",
+        env_file=env_file,
+        handoff_file=handoff,
+        extra_env={"SINGLE_INBOX_SENDER_ID": "3"},
+    )
+
+    assert written.returncode != 0
+    assert env_file.read_bytes() == before
+
+
+def test_a_duplicated_handoff_field_is_refused(env_fixture) -> None:
+    env_file, handoff = env_fixture
+
+    _run_block("PREHOTFIX_HANDOFF", env_file=env_file, handoff_file=handoff)
+    fields = _handoff_fields(handoff)
+    handoff.write_text(
+        handoff.read_text() + f"PRE_HOTFIX_ENV_BACKUP={fields['PRE_HOTFIX_ENV_BACKUP']}\n",
+        encoding="utf-8",
+    )
+    before = env_file.read_bytes()
+
+    written = _run_block(
+        "ROLLOUT_ENV",
+        env_file=env_file,
+        handoff_file=handoff,
+        extra_env={"SINGLE_INBOX_SENDER_ID": "3"},
+    )
+
+    assert written.returncode != 0
+    assert env_file.read_bytes() == before
+
+
+def test_a_backup_path_outside_the_allowed_pattern_is_refused(env_fixture, tmp_path) -> None:
+    env_file, handoff = env_fixture
+
+    _run_block("PREHOTFIX_HANDOFF", env_file=env_file, handoff_file=handoff)
+    fields = _handoff_fields(handoff)
+    elsewhere = tmp_path / "somewhere-else.env"
+    shutil.copy(fields["PRE_HOTFIX_ENV_BACKUP"], elsewhere)
+    handoff.write_text(
+        handoff.read_text().replace(fields["PRE_HOTFIX_ENV_BACKUP"], str(elsewhere)),
+        encoding="utf-8",
+    )
+    before = env_file.read_bytes()
+
+    written = _run_block(
+        "ROLLOUT_ENV",
+        env_file=env_file,
+        handoff_file=handoff,
+        extra_env={"SINGLE_INBOX_SENDER_ID": "3"},
+    )
+
+    assert written.returncode != 0
+    assert env_file.read_bytes() == before
+
+
+def test_a_second_rollout_run_after_arming_is_idempotent(env_fixture) -> None:
+    """Already armed, empty map: accept the original handoff, take no new backup."""
+    env_file, handoff = env_fixture
+
+    _arm(env_fixture)
     first = handoff.read_text()
-    _run_block("ROLLOUT_ENV", env_file=env_file, handoff_file=handoff, extra_env={"SINGLE_INBOX_SENDER_ID": "3"})
-    second = _run_block("PREHOTFIX_BACKUP", env_file=env_file, handoff_file=handoff)
+    reproved = _run_block("PREHOTFIX_HANDOFF", env_file=env_file, handoff_file=handoff)
 
-    assert second.returncode == 0, second.stderr
+    assert reproved.returncode == 0, reproved.stderr
     assert handoff.read_text() == first, "a re-run must not repoint at a post-hotfix backup"
+    assert len(list(env_file.parent.glob(".env.bak.*"))) == 1, "and must not take a second backup"
 
 
-def test_a_newer_backup_cannot_become_the_rollback_source(env_fixture, tmp_path) -> None:
+def test_a_second_rollout_run_still_refuses_a_broken_handoff(env_fixture) -> None:
     env_file, handoff = env_fixture
 
-    _run_block("PREHOTFIX_BACKUP", env_file=env_file, handoff_file=handoff)
-    proven = handoff.read_text().split("=", 1)[1].strip()
-    _run_block("ROLLOUT_ENV", env_file=env_file, handoff_file=handoff, extra_env={"SINGLE_INBOX_SENDER_ID": "3"})
-    # Someone takes another backup — now holding the EMPTY map.
-    newer = tmp_path / ".env.bak.29990101T000000Z"
-    shutil.copy(env_file, newer)
+    _arm(env_fixture)
+    os.remove(_handoff_fields(handoff)["PRE_HOTFIX_ENV_BACKUP"])
+    before = env_file.read_bytes()
+
+    reproved = _run_block("PREHOTFIX_HANDOFF", env_file=env_file, handoff_file=handoff)
+
+    assert reproved.returncode != 0, "idempotent only for a handoff that is still fully valid"
+    assert env_file.read_bytes() == before
+
+
+def test_a_newer_stray_backup_cannot_become_the_rollback_source(env_fixture) -> None:
+    env_file, handoff = env_fixture
+
+    _arm(env_fixture)
+    proven = _handoff_fields(handoff)["PRE_HOTFIX_ENV_BACKUP"]
+    stray = env_file.parent / ".env.bak.29990101T000000Z"
+    shutil.copy(env_file, stray)  # holds the EMPTY map
 
     resolved = _run_block("ROLLBACK_RESOLVE", env_file=env_file, handoff_file=handoff)
-    _run_block("ROLLBACK_ENV", env_file=env_file, handoff_file=handoff)
-    after = env_file.read_text()
+    restored = _run_block("ROLLBACK_ENV", env_file=env_file, handoff_file=handoff)
 
     assert resolved.returncode == 0, resolved.stderr
     assert resolved.stdout.strip() == f"PRE_HOTFIX_ENV_BACKUP={proven}"
-    assert str(newer) not in resolved.stdout
-    assert f"CHATWOOT_INBOX_COMPANY_MAP={PRODUCTION_BRANCH_MAP}" in after
-
-
-def test_a_rollback_from_an_emptied_backup_is_refused(env_fixture) -> None:
-    """Belt to the container-side identity gate, on the host, before any write."""
-    env_file, handoff = env_fixture
-    env_file.write_text("\n".join(FIXTURE_ENV_LINES).replace(PRODUCTION_BRANCH_MAP, "{}"), encoding="utf-8")
-
-    _run_block("PREHOTFIX_BACKUP", env_file=env_file, handoff_file=handoff)
-    before = env_file.read_bytes()
-    refused = _run_block("ROLLBACK_ENV", env_file=env_file, handoff_file=handoff)
-
-    assert refused.returncode != 0
-    assert env_file.read_bytes() == before, "a refused rollback leaves .env byte for byte"
+    assert str(stray) not in resolved.stdout
+    assert restored.returncode == 0, restored.stderr
+    assert f"CHATWOOT_INBOX_COMPANY_MAP={SYNTHETIC_BRANCH_MAP}" in env_file.read_text()
 
 
 def test_a_read_error_stops_before_env_is_touched(env_fixture) -> None:
-    """`grep` exit 2 must abort, not be swallowed as the benign exit 1."""
     env_file, handoff = env_fixture
+
+    _run_block("PREHOTFIX_HANDOFF", env_file=env_file, handoff_file=handoff)
     before = env_file.read_bytes()
     env_file.chmod(0o000)
     try:
@@ -570,8 +815,9 @@ def test_a_read_error_stops_before_env_is_touched(env_fixture) -> None:
 
 
 def test_a_failure_just_before_the_rename_leaves_env_untouched(env_fixture, tmp_path) -> None:
-    """The whole point of the temp-then-rename shape, proved rather than argued."""
     env_file, handoff = env_fixture
+
+    _run_block("PREHOTFIX_HANDOFF", env_file=env_file, handoff_file=handoff)
     before = env_file.read_bytes()
     sabotaged = _runbook_block("ROLLOUT_ENV").replace(
         'mv -f "$ENV_TMP" "$ENV_FILE"',
@@ -593,6 +839,8 @@ def test_a_failure_just_before_the_rename_leaves_env_untouched(env_fixture, tmp_
 
 def test_an_invalid_sender_id_never_reaches_the_env_file(env_fixture) -> None:
     env_file, handoff = env_fixture
+
+    _run_block("PREHOTFIX_HANDOFF", env_file=env_file, handoff_file=handoff)
     before = env_file.read_bytes()
 
     for bad in ("0", "-1", "3a", "", " 3"):
@@ -604,3 +852,18 @@ def test_an_invalid_sender_id_never_reaches_the_env_file(env_fixture) -> None:
         )
         assert rejected.returncode != 0, bad
         assert env_file.read_bytes() == before, bad
+
+
+def test_no_block_output_ever_carries_the_map_or_a_secret(env_fixture) -> None:
+    env_file, handoff = env_fixture
+
+    proved, written = _arm(env_fixture)
+    resolved = _run_block("ROLLBACK_RESOLVE", env_file=env_file, handoff_file=handoff)
+    restored = _run_block("ROLLBACK_ENV", env_file=env_file, handoff_file=handoff)
+
+    for result in (proved, written, resolved, restored):
+        assert result.returncode == 0, result.stderr
+        printed = result.stdout + result.stderr
+        assert SYNTHETIC_BRANCH_MAP not in printed
+        assert "NOT_A_REAL_TOKEN_FIXTURE" not in printed
+        assert "700001" not in printed
