@@ -1361,3 +1361,207 @@ async def test_the_hotfix_being_off_adds_no_note_where_there_was_none(
     assert rows == []
     assert event.error == "operator_relay: ambiguous_sender"
     assert spy.notes == []
+
+
+# ---------------------------------------------------------------------------
+# 11. One trust model for an operator row, in BOTH resolvers
+# ---------------------------------------------------------------------------
+#
+# `_get_outbox_context_target` (reply/reaction) demands the complete provenance
+# pair, while `chatwoot_affinity._identity_of_outbox` used to accept a bare
+# `chatwoot_route=general` and answer "proves nothing". The same row could
+# therefore be a deliberate General row to one resolver and a broken audit row
+# to the other — and a half-written marker quietly became NO_EVIDENCE instead of
+# blocking. Both now ask `resolve_operator_outbox_route`.
+
+
+async def _delivered_operator_outbox(
+    session_maker: async_sessionmaker[AsyncSession],
+    *,
+    meta: dict[str, Any] | None,
+    sender_id: int = SINGLE_SENDER_ID,
+    company_id: int = KARLSRUHE[1],
+    template_code: str = "operator_relay",
+    wamid: str = "wamid.AFFINITY_PROBE",
+) -> None:
+    """One delivered operator message — the strongest tenant evidence there is."""
+    now = datetime.now(timezone.utc)
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(
+                OutboxMessage(
+                    company_id=company_id,
+                    sender_id=sender_id,
+                    phone_e164=PHONE,
+                    template_code=template_code,
+                    language="de",
+                    body="Bis morgen!",
+                    status="delivered",
+                    scheduled_at=now,
+                    sent_at=now,
+                    provider_message_id=wamid,
+                    message_source="operator",
+                    chatwoot_conversation_id=630,
+                    chatwoot_message_id=9630,
+                    meta=meta,
+                )
+            )
+
+
+async def test_an_operator_row_without_provenance_still_proves_its_branch(
+    session_maker: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The control: nothing about ordinary operator evidence changed."""
+    _single_inbox_settings(monkeypatch, sender_id=0, mode="affinity", branch_map=BRANCH_MAP)
+    await _seed_transport_line(session_maker)
+    await _delivered_operator_outbox(session_maker, meta={"send_type": "text"})
+
+    async with session_maker() as session:
+        result = await resolve_tenant_affinity(session, [PHONE])
+
+    assert result.outcome is AffinityOutcome.PROVEN
+    assert (result.identity.provider, result.identity.company_id) == KARLSRUHE
+
+
+async def test_a_full_hotfix_provenance_proves_no_branch_at_all(
+    session_maker: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _single_inbox_settings(monkeypatch, sender_id=0, mode="affinity", branch_map=BRANCH_MAP)
+    await _seed_transport_line(session_maker)
+    await _delivered_operator_outbox(
+        session_maker,
+        meta={
+            "send_type": "text",
+            CHATWOOT_ROUTE_META_KEY: "general",
+            SINGLE_INBOX_RELAY_META_KEY: dict(_VALID_PROVENANCE),
+        },
+    )
+
+    async with session_maker() as session:
+        result = await resolve_tenant_affinity(session, [PHONE])
+
+    assert result.outcome is AffinityOutcome.NO_EVIDENCE, "the transport line is not a branch"
+    assert result.identity is None
+
+
+@pytest.mark.parametrize(
+    "meta, expected_reason",
+    [
+        pytest.param(
+            {CHATWOOT_ROUTE_META_KEY: "general"},
+            "operator_route_marker_conflict",
+            id="marker_only",
+        ),
+        pytest.param(
+            {SINGLE_INBOX_RELAY_META_KEY: dict(_VALID_PROVENANCE)},
+            "operator_route_marker_conflict",
+            id="provenance_only",
+        ),
+        pytest.param(
+            {CHATWOOT_ROUTE_META_KEY: "general", SINGLE_INBOX_RELAY_META_KEY: {"route": "general"}},
+            "operator_route_marker_conflict",
+            id="malformed_provenance",
+        ),
+        pytest.param(
+            {
+                CHATWOOT_ROUTE_META_KEY: "general",
+                SINGLE_INBOX_RELAY_META_KEY: {**_VALID_PROVENANCE, "sender_scope": "tenant"},
+            },
+            "operator_route_marker_conflict",
+            id="provenance_claims_tenant_scope",
+        ),
+        pytest.param(
+            {CHATWOOT_ROUTE_META_KEY: "tenant", SINGLE_INBOX_RELAY_META_KEY: dict(_VALID_PROVENANCE)},
+            "invalid_outbox_route_marker",
+            id="conflicting_route_and_provenance",
+        ),
+        pytest.param(
+            {CHATWOOT_ROUTE_META_KEY: "unknown", SINGLE_INBOX_RELAY_META_KEY: dict(_VALID_PROVENANCE)},
+            "invalid_outbox_route_marker",
+            id="unknown_marker",
+        ),
+    ],
+)
+async def test_a_broken_operator_provenance_blocks_affinity_instead_of_proving_nothing(
+    session_maker: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+    meta: dict[str, Any],
+    expected_reason: str,
+) -> None:
+    """INVALID, never NO_EVIDENCE: a contradictory row must not fall to General."""
+    _single_inbox_settings(monkeypatch, sender_id=0, mode="affinity", branch_map=BRANCH_MAP)
+    await _seed_transport_line(session_maker)
+    await _delivered_operator_outbox(session_maker, meta=meta)
+
+    async with session_maker() as session:
+        result = await resolve_tenant_affinity(session, [PHONE])
+
+    assert result.outcome is AffinityOutcome.INVALID
+    assert result.identity is None
+    assert result.reason == expected_reason
+    assert result.source == "communication"
+    # The safe dict is what reaches logs: ids and codes only.
+    assert PHONE not in str(result.as_safe_dict())
+
+
+async def test_a_marker_on_the_wrong_operator_row_blocks_affinity(
+    session_maker: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A complete pair on a foreign template is still not a relay row."""
+    _single_inbox_settings(monkeypatch, sender_id=0, mode="affinity", branch_map=BRANCH_MAP)
+    await _seed_transport_line(session_maker)
+    await _delivered_operator_outbox(
+        session_maker,
+        template_code="record_created",
+        meta={
+            CHATWOOT_ROUTE_META_KEY: "general",
+            SINGLE_INBOX_RELAY_META_KEY: dict(_VALID_PROVENANCE),
+        },
+    )
+
+    async with session_maker() as session:
+        result = await resolve_tenant_affinity(session, [PHONE])
+
+    assert result.outcome is AffinityOutcome.INVALID
+    assert result.reason == "operator_route_marker_conflict"
+
+
+async def test_the_jobless_bot_general_contract_is_untouched(
+    session_maker: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A STOP ACK still proves nothing through its own, unchanged contract."""
+    _single_inbox_settings(monkeypatch, sender_id=0, mode="affinity", branch_map=BRANCH_MAP)
+    await _seed_transport_line(session_maker)
+
+    now = datetime.now(timezone.utc)
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(
+                OutboxMessage(
+                    company_id=KARLSRUHE[1],
+                    phone_e164=PHONE,
+                    template_code="wa_cmd_stop",
+                    language="de",
+                    body="",
+                    status="delivered",
+                    scheduled_at=now,
+                    sent_at=now,
+                    provider_message_id="wamid.STOP_ACK",
+                    message_source="bot",
+                    meta={
+                        CHATWOOT_ROUTE_META_KEY: "general",
+                        "source": "inbound_command",
+                        "command": "stop",
+                    },
+                )
+            )
+
+    async with session_maker() as session:
+        result = await resolve_tenant_affinity(session, [PHONE])
+
+    assert result.outcome is AffinityOutcome.NO_EVIDENCE
+    assert result.identity is None
