@@ -9,6 +9,25 @@ from altegio_bot.providers.base import ChatwootRoute
 
 CHATWOOT_ROUTE_META_KEY = "chatwoot_route"
 
+# PR-7.4. The single-inbox operator relay picks a sender the operator named in
+# the environment. That sender is a TRANSPORT line — the only active row on the
+# shared Meta number that may carry the reply — and deliberately NOT proof of
+# which branch the customer belongs to: during the rollback there is no such
+# proof, which is the whole reason the setting exists.
+#
+# Without provenance the row would lie later. `_get_outbox_context_target` reads
+# an operator Outbox's `WhatsAppSender` as authoritative tenant evidence, so once
+# the branch map and `affinity` come back, a customer replying to a message sent
+# during the rollback would be dragged into the transport sender's branch inbox.
+# This marker records "General route, sender was transport only" so the reply and
+# the reaction both stay in General.
+SINGLE_INBOX_RELAY_META_KEY = "single_inbox_relay"
+SINGLE_INBOX_RELAY_SENDER_SCOPE = "transport_only"
+
+# The only template codes the operator relay itself writes. A marker on anything
+# else is not a relay row and is not believed.
+_SINGLE_INBOX_RELAY_TEMPLATES = frozenset({"operator_relay", "operator_reopen_template"})
+
 _GENERAL_COMMAND_TEMPLATES = {
     "stop": "wa_cmd_stop",
     "start": "wa_cmd_start",
@@ -90,3 +109,87 @@ def resolve_jobless_bot_outbox_route(
     if provenance_matches:
         return ChatwootRoute.GENERAL, None
     return None, "bot_job_identity_missing"
+
+
+def outbox_meta_with_single_inbox_general_route(meta: Mapping[str, Any]) -> dict[str, Any]:
+    """Stamp one operator-relay row as General-routed with a transport sender.
+
+    Both halves are written together and are meaningless apart: the centralized
+    route marker says WHERE the row belongs, the provenance says WHY its sender
+    proves nothing. :func:`resolve_operator_outbox_route` accepts only the pair.
+    """
+    return {
+        **meta,
+        CHATWOOT_ROUTE_META_KEY: ChatwootRoute.GENERAL.value,
+        SINGLE_INBOX_RELAY_META_KEY: {
+            "route": ChatwootRoute.GENERAL.value,
+            "sender_scope": SINGLE_INBOX_RELAY_SENDER_SCOPE,
+        },
+    }
+
+
+def _matches_single_inbox_relay_provenance(value: object) -> bool:
+    """Exact shape only — no extra keys, no coercion, no partial credit."""
+    if not isinstance(value, Mapping):
+        return False
+    if set(value) != {"route", "sender_scope"}:
+        return False
+    return (
+        value.get("route") == ChatwootRoute.GENERAL.value
+        and value.get("sender_scope") == SINGLE_INBOX_RELAY_SENDER_SCOPE
+    )
+
+
+def resolve_operator_outbox_route(
+    *,
+    message_source: object,
+    job_id: object,
+    template_code: object,
+    sender_id: object,
+    meta: object,
+) -> tuple[ChatwootRoute | None, str | None]:
+    """Prove the route of ONE operator Outbox row before its sender is read.
+
+    Three outcomes, and nothing in between:
+
+    * ``(TENANT, None)`` — no route provenance at all. Every operator row
+      written before this hotfix looks like this, and keeps resolving its tenant
+      through ``WhatsAppSender`` exactly as before.
+    * ``(GENERAL, None)`` — the exact shape the single-inbox relay writes, on a
+      row that is actually an operator-relay row with a sender and no job. The
+      caller must NOT read the sender as tenant evidence.
+    * ``(None, reason)`` — a partial, contradictory or foreign marker. Half a
+      proof is not a proof: it fails closed rather than falling back to the
+      sender, because falling back is precisely the wrong-branch bug.
+
+    A marker alone still never overrides sender identity — that stayed an audit
+    conflict. What changed is that the relay now writes a second, matching field
+    that says why the sender must be ignored.
+    """
+    audit_meta: Mapping[str, Any] = meta if isinstance(meta, Mapping) else {}
+    marker_present = CHATWOOT_ROUTE_META_KEY in audit_meta
+    provenance_present = SINGLE_INBOX_RELAY_META_KEY in audit_meta
+
+    if not marker_present and not provenance_present:
+        return ChatwootRoute.TENANT, None
+
+    if not (marker_present and provenance_present):
+        # Exactly one half present: a hand-edited row, a truncated write, or a
+        # foreign marker. Never resolved by preferring whichever half exists.
+        return None, "operator_route_marker_conflict"
+
+    if audit_meta.get(CHATWOOT_ROUTE_META_KEY) != ChatwootRoute.GENERAL.value:
+        return None, "invalid_outbox_route_marker"
+
+    if not _matches_single_inbox_relay_provenance(audit_meta.get(SINGLE_INBOX_RELAY_META_KEY)):
+        return None, "operator_route_marker_conflict"
+
+    # The row must also BE what the provenance claims it is.
+    if message_source != "operator" or job_id is not None:
+        return None, "operator_route_marker_conflict"
+    if template_code not in _SINGLE_INBOX_RELAY_TEMPLATES:
+        return None, "operator_route_marker_conflict"
+    if sender_id is None:
+        return None, "operator_route_marker_conflict"
+
+    return ChatwootRoute.GENERAL, None

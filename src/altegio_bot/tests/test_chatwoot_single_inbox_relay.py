@@ -30,6 +30,12 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from altegio_bot.chatwoot_affinity import AffinityOutcome, resolve_tenant_affinity
+from altegio_bot.chatwoot_outbox_route import (
+    CHATWOOT_ROUTE_META_KEY,
+    SINGLE_INBOX_RELAY_META_KEY,
+    resolve_operator_outbox_route,
+)
 from altegio_bot.models.models import (
     PROVIDER_ALTEGIO,
     PROVIDER_EASYWEEK,
@@ -50,7 +56,7 @@ BRANCH_INBOXES = (9, 10, 11)
 NATIVE_WHATSAPP_INBOX = 7
 
 KARLSRUHE = (PROVIDER_ALTEGIO, 999701)
-RASTATT = (PROVIDER_ALTEGIO, 999702)
+RASTATT = (PROVIDER_EASYWEEK, 999702)
 DURLACH = (PROVIDER_EASYWEEK, 999703)
 
 # The configured sender is deliberately the HIGHEST id and not the only
@@ -66,11 +72,14 @@ FOREIGN_PNID = "PNID_SOME_OTHER_LINE"
 PHONE = "+491700000042"
 TEXT = "Guten Tag, morgen haben wir noch Termine frei."
 
+# The map exactly as production restores it: inbox 9 Karlsruhe (Altegio),
+# inbox 10 Rastatt, inbox 11 Durlach.
 BRANCH_MAP = (
     '{"9":{"provider":"altegio","company_id":999701},'
-    '"10":{"provider":"altegio","company_id":999702},'
+    '"10":{"provider":"easyweek","company_id":999702},'
     '"11":{"provider":"easyweek","company_id":999703}}'
 )
+KARLSRUHE_INBOX = 9
 
 API_TOKEN = "cw_token_MUST_NEVER_BE_LOGGED"
 
@@ -746,3 +755,609 @@ async def test_no_phone_text_token_or_raw_env_reaches_logs_or_event_error(
     # ...and no logger anywhere may echo a credential or the raw configuration.
     for secret in (API_TOKEN, BRANCH_MAP):
         assert secret not in every_log, f"logs leaked {secret!r}"
+
+
+# ---------------------------------------------------------------------------
+# 8. The message sent during the rollback keeps its General route afterwards
+# ---------------------------------------------------------------------------
+#
+# This is the trap the provenance exists for. The rollback sends through a
+# TRANSPORT sender — in production the Karlsruhe row, because it is the one
+# active line on the shared Meta number. That sender says nothing about which
+# branch the customer belongs to; during the rollback nothing does, which is why
+# the setting exists at all.
+#
+# `_get_outbox_context_target()` normally reads an operator Outbox's sender as
+# authoritative tenant evidence. So without provenance, the moment the branch
+# map and `affinity` come back, a customer replying to a message sent during the
+# rollback would be pulled into Karlsruhe — a branch nobody proved.
+
+
+async def _seed_transport_line(session_maker: async_sessionmaker[AsyncSession]) -> None:
+    """Production's shape: the technical line is Karlsruhe, the customer is not."""
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(_sender(LOW_SENDER_ID, DURLACH))
+            session.add(_sender(MID_SENDER_ID, RASTATT))
+            session.add(_sender(SINGLE_SENDER_ID, KARLSRUHE))
+            session.add(_open_window_event())
+
+
+def _restore_affinity(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The rollback is over: provider-scoped map back, `affinity` back, feature off."""
+    monkeypatch.setattr(wiw.settings, "chatwoot_inbox_company_map", BRANCH_MAP)
+    monkeypatch.setattr(wiw.settings, "chatwoot_inbound_routing_mode", "affinity")
+    monkeypatch.setattr(wiw.settings, "chatwoot_single_inbox_operator_sender_id", 0)
+
+
+async def _inbound_reply_event(
+    session_maker: async_sessionmaker[AsyncSession],
+    *,
+    dedupe_key: str,
+) -> int:
+    async with session_maker() as session:
+        async with session.begin():
+            event = WhatsAppEvent(dedupe_key=dedupe_key, status="received", query={}, headers={}, payload={})
+            session.add(event)
+            await session.flush()
+            return int(event.id)
+
+
+async def test_a_reply_to_a_hotfix_message_stays_in_general_after_affinity_returns(
+    session_maker: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _single_inbox_settings(monkeypatch)
+    await _seed_transport_line(session_maker)
+
+    provider, _spy, event_id = await _run_relay(session_maker, monkeypatch)
+    assert [call["sender_id"] for call in provider.sent] == [SINGLE_SENDER_ID], "sent via the Karlsruhe transport line"
+
+    _restore_affinity(monkeypatch)
+    spy = _ChatwootSpy(conversation_id=7200)
+    spy.install(monkeypatch)
+
+    reply_event_id = await _inbound_reply_event(session_maker, dedupe_key="wa:inbound:after-restore")
+    async with session_maker() as session:
+        async with session.begin():
+            event = await session.get(WhatsAppEvent, reply_event_id)
+            await wiw._forward_text_to_chatwoot(
+                session,
+                event,
+                phone_e164=PHONE,
+                text="Ja, 14 Uhr passt.",
+                reply_to_provider_message_id=provider.wamid,
+            )
+
+    async with session_maker() as session:
+        stored = await session.get(WhatsAppEvent, reply_event_id)
+
+    assert stored.error is None
+    assert spy.built_inbox_ids == [GENERAL_INBOX], "the reply must land in General, not in the transport branch"
+    assert KARLSRUHE_INBOX not in spy.built_inbox_ids
+
+
+async def test_a_reaction_on_a_hotfix_message_stays_in_general_after_affinity_returns(
+    session_maker: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _single_inbox_settings(monkeypatch)
+    await _seed_transport_line(session_maker)
+
+    provider, _spy, _event_id = await _run_relay(session_maker, monkeypatch)
+    _restore_affinity(monkeypatch)
+
+    async with session_maker() as session:
+        target = await wiw._resolve_reaction_target(session, provider.wamid, phone_e164=PHONE)
+        inbox_id, routing_error = wiw._inbound_target_inbox(
+            chatwoot_route=target.chatwoot_route,
+            tenant_provider=target.tenant_provider,
+            company_id=target.company_id,
+            tenant_error=target.tenant_error,
+        )
+
+    assert target.kind == "chatwoot_agent_message"
+    assert target.tenant_error is None
+    assert target.chatwoot_route is ChatwootRoute.GENERAL
+    assert target.tenant_provider is None and target.company_id is None
+    assert routing_error is None
+    assert inbox_id == GENERAL_INBOX
+
+
+async def test_the_transport_sender_never_becomes_tenant_evidence(
+    session_maker: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Not even once the message is delivered — the affinity resolver skips it."""
+    _single_inbox_settings(monkeypatch)
+    await _seed_transport_line(session_maker)
+
+    provider, _spy, event_id = await _run_relay(session_maker, monkeypatch)
+    _restore_affinity(monkeypatch)
+
+    async with session_maker() as session:
+        async with session.begin():
+            row = (
+                await session.execute(select(OutboxMessage).where(OutboxMessage.source_whatsapp_event_id == event_id))
+            ).scalar_one()
+            row.status = "delivered"
+            outbox_meta = dict(row.meta or {})
+
+        result = await resolve_tenant_affinity(session, [PHONE])
+        target = await wiw._get_reply_context_target(session, provider.wamid, phone_e164=PHONE)
+
+    # The provenance is written as one coherent pair, and it is not a secret.
+    assert outbox_meta[CHATWOOT_ROUTE_META_KEY] == ChatwootRoute.GENERAL.value
+    assert outbox_meta[SINGLE_INBOX_RELAY_META_KEY] == {"route": "general", "sender_scope": "transport_only"}
+
+    # A delivered operator message would normally PROVE its sender's branch.
+    assert result.outcome is AffinityOutcome.NO_EVIDENCE, "the transport line must not prove Karlsruhe"
+    assert result.identity is None
+
+    assert target.chatwoot_route is ChatwootRoute.GENERAL
+    assert target.tenant_provider is None and target.company_id is None
+    assert target.tenant_error is None
+
+
+async def test_an_ordinary_operator_message_still_routes_by_its_sender_tenant(
+    session_maker: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The control: rows written outside the rollback keep today's behaviour."""
+    _single_inbox_settings(monkeypatch, sender_id=0, mode="affinity", branch_map=BRANCH_MAP)
+    await _seed_transport_line(session_maker)
+
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(
+                OutboxMessage(
+                    company_id=KARLSRUHE[1],
+                    sender_id=SINGLE_SENDER_ID,
+                    phone_e164=PHONE,
+                    template_code="operator_relay",
+                    language="de",
+                    body="Bis morgen!",
+                    status="sent",
+                    scheduled_at=datetime.now(timezone.utc),
+                    sent_at=datetime.now(timezone.utc),
+                    provider_message_id="wamid.PLAIN_OPERATOR",
+                    message_source="operator",
+                    chatwoot_conversation_id=615,
+                    chatwoot_message_id=9615,
+                    meta={"send_type": "text"},
+                )
+            )
+
+    spy = _ChatwootSpy(conversation_id=7300)
+    spy.install(monkeypatch)
+    reply_event_id = await _inbound_reply_event(session_maker, dedupe_key="wa:inbound:plain-operator")
+    async with session_maker() as session:
+        async with session.begin():
+            event = await session.get(WhatsAppEvent, reply_event_id)
+            await wiw._forward_text_to_chatwoot(
+                session,
+                event,
+                phone_e164=PHONE,
+                text="Danke!",
+                reply_to_provider_message_id="wamid.PLAIN_OPERATOR",
+            )
+
+    assert spy.built_inbox_ids == [KARLSRUHE_INBOX], "no provenance means the sender still proves the branch"
+
+
+# ---------------------------------------------------------------------------
+# 9. The provenance is a pair, and half a pair proves nothing
+# ---------------------------------------------------------------------------
+
+_VALID_PROVENANCE = {"route": "general", "sender_scope": "transport_only"}
+
+
+def _operator_row(**overrides: Any) -> dict[str, Any]:
+    row: dict[str, Any] = {
+        "message_source": "operator",
+        "job_id": None,
+        "template_code": "operator_relay",
+        "sender_id": SINGLE_SENDER_ID,
+        "meta": {CHATWOOT_ROUTE_META_KEY: "general", SINGLE_INBOX_RELAY_META_KEY: dict(_VALID_PROVENANCE)},
+    }
+    row.update(overrides)
+    return row
+
+
+def test_a_complete_provenance_pair_proves_general() -> None:
+    route, error = resolve_operator_outbox_route(**_operator_row())
+    assert error is None
+    assert route is ChatwootRoute.GENERAL
+
+
+@pytest.mark.parametrize(
+    "meta",
+    [
+        pytest.param({}, id="no_provenance_at_all"),
+        pytest.param({"send_type": "text"}, id="ordinary_relay_meta"),
+        pytest.param(None, id="meta_is_null"),
+        pytest.param(["general"], id="meta_is_not_a_mapping"),
+    ],
+)
+def test_a_row_without_provenance_keeps_its_sender_tenant(meta: object) -> None:
+    route, error = resolve_operator_outbox_route(**_operator_row(meta=meta))
+    assert error is None
+    assert route is ChatwootRoute.TENANT
+
+
+@pytest.mark.parametrize(
+    "meta, expected",
+    [
+        pytest.param(
+            {CHATWOOT_ROUTE_META_KEY: "general"},
+            "operator_route_marker_conflict",
+            id="marker_without_provenance",
+        ),
+        pytest.param(
+            {SINGLE_INBOX_RELAY_META_KEY: dict(_VALID_PROVENANCE)},
+            "operator_route_marker_conflict",
+            id="provenance_without_marker",
+        ),
+        pytest.param(
+            {CHATWOOT_ROUTE_META_KEY: "tenant", SINGLE_INBOX_RELAY_META_KEY: dict(_VALID_PROVENANCE)},
+            "invalid_outbox_route_marker",
+            id="marker_says_tenant",
+        ),
+        pytest.param(
+            {CHATWOOT_ROUTE_META_KEY: "unknown", SINGLE_INBOX_RELAY_META_KEY: dict(_VALID_PROVENANCE)},
+            "invalid_outbox_route_marker",
+            id="unknown_marker",
+        ),
+        pytest.param(
+            {CHATWOOT_ROUTE_META_KEY: "general", SINGLE_INBOX_RELAY_META_KEY: {"route": "general"}},
+            "operator_route_marker_conflict",
+            id="partial_provenance",
+        ),
+        pytest.param(
+            {
+                CHATWOOT_ROUTE_META_KEY: "general",
+                SINGLE_INBOX_RELAY_META_KEY: {**_VALID_PROVENANCE, "sender_scope": "tenant"},
+            },
+            "operator_route_marker_conflict",
+            id="sender_claims_tenant_scope",
+        ),
+        pytest.param(
+            {
+                CHATWOOT_ROUTE_META_KEY: "general",
+                SINGLE_INBOX_RELAY_META_KEY: {**_VALID_PROVENANCE, "extra": 1},
+            },
+            "operator_route_marker_conflict",
+            id="unexpected_provenance_key",
+        ),
+        pytest.param(
+            {CHATWOOT_ROUTE_META_KEY: "general", SINGLE_INBOX_RELAY_META_KEY: "general"},
+            "operator_route_marker_conflict",
+            id="provenance_is_not_a_mapping",
+        ),
+    ],
+)
+def test_a_broken_provenance_fails_closed(meta: dict[str, Any], expected: str) -> None:
+    route, error = resolve_operator_outbox_route(**_operator_row(meta=meta))
+    assert route is None
+    assert error == expected
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        pytest.param({"message_source": "bot"}, id="not_an_operator_row"),
+        pytest.param({"job_id": 42}, id="carries_a_message_job"),
+        pytest.param({"template_code": "record_created"}, id="foreign_template"),
+        pytest.param({"template_code": None}, id="no_template"),
+        pytest.param({"sender_id": None}, id="no_sender"),
+    ],
+)
+def test_a_valid_marker_on_the_wrong_row_fails_closed(overrides: dict[str, Any]) -> None:
+    """The row has to BE what the provenance claims — a marker is not enough."""
+    route, error = resolve_operator_outbox_route(**_operator_row(**overrides))
+    assert route is None
+    assert error == "operator_route_marker_conflict"
+
+
+async def test_a_forged_provenance_blocks_the_reply_before_any_chatwoot_call(
+    session_maker: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End to end: a half-written row never silently picks either route."""
+    _single_inbox_settings(monkeypatch, sender_id=0, mode="affinity", branch_map=BRANCH_MAP)
+    await _seed_transport_line(session_maker)
+
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(
+                OutboxMessage(
+                    company_id=KARLSRUHE[1],
+                    sender_id=SINGLE_SENDER_ID,
+                    phone_e164=PHONE,
+                    template_code="operator_relay",
+                    language="de",
+                    body="Bis morgen!",
+                    status="sent",
+                    scheduled_at=datetime.now(timezone.utc),
+                    sent_at=datetime.now(timezone.utc),
+                    provider_message_id="wamid.FORGED",
+                    message_source="operator",
+                    chatwoot_conversation_id=616,
+                    chatwoot_message_id=9616,
+                    meta={SINGLE_INBOX_RELAY_META_KEY: dict(_VALID_PROVENANCE)},
+                )
+            )
+
+    spy = _ChatwootSpy()
+    spy.install(monkeypatch)
+    reply_event_id = await _inbound_reply_event(session_maker, dedupe_key="wa:inbound:forged")
+    with pytest.raises(RuntimeError) as blocked:
+        async with session_maker() as session:
+            async with session.begin():
+                event = await session.get(WhatsAppEvent, reply_event_id)
+                await wiw._forward_text_to_chatwoot(
+                    session,
+                    event,
+                    phone_e164=PHONE,
+                    text="Danke!",
+                    reply_to_provider_message_id="wamid.FORGED",
+                )
+
+    # Neither route was chosen: the row is refused, not resolved by preferring
+    # whichever half of the provenance happens to be present.
+    assert str(blocked.value) == "chatwoot tenant routing failed: operator_route_marker_conflict"
+    assert spy.built_inbox_ids == [], "fail-closed means no Chatwoot client is built at all"
+
+
+# ---------------------------------------------------------------------------
+# 10. A refused reply must never look delivered
+# ---------------------------------------------------------------------------
+#
+# Terminating the event silently is worse than the original bug: the reply sits
+# in Chatwoot looking sent, so the operator believes the customer got it. PR-7.2
+# already owed that warning for an unprovable General reply; a refused
+# single-inbox relay owes exactly the same one, through the same durable
+# post-commit machinery — but with the opposite advice, because during the
+# rollback the branch inboxes are precisely where a reply must NOT be written.
+
+
+class _FailingChatwootSpy(_ChatwootSpy):
+    """Chatwoot rejects the note until :attr:`failures` is exhausted."""
+
+    def __init__(self, failures: int = 1) -> None:
+        super().__init__()
+        self.failures = failures
+        self.attempts = 0
+
+    def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        spy = self
+
+        class _FlakyChatwoot:
+            def __init__(self, *args: Any, inbox_id: object = None, **kwargs: Any) -> None:
+                spy.built_inbox_ids.append(inbox_id)
+
+            async def send_message(self, conversation_id: int, text: str, **kwargs: Any) -> int:
+                spy.attempts += 1
+                if spy.attempts <= spy.failures:
+                    raise RuntimeError("chatwoot unavailable")
+                record = {"conversation_id": conversation_id, "text": text, **kwargs}
+                spy.messages.append(record)
+                if kwargs.get("private"):
+                    spy.notes.append(record)
+                return 991
+
+            async def aclose(self) -> None:
+                return None
+
+        monkeypatch.setattr(wiw, "ChatwootClient", _FlakyChatwoot)
+
+
+def _assert_single_inbox_note(spy: _ChatwootSpy, *, conversation_id: int = 610) -> dict[str, Any]:
+    assert len(spy.notes) == 1, "the operator must be warned exactly once"
+    note = spy.notes[0]
+    assert note["private"] is True
+    assert note["conversation_id"] == conversation_id
+    assert "NICHT" in note["text"]
+    assert "General-Inbox" in note["text"], "the rollback advice must point at General"
+    # Nothing about the customer, the sender, the configuration or the failure.
+    for secret in (PHONE, TEXT, API_TOKEN, SHARED_PNID, BRANCH_MAP, "Anna", str(SINGLE_SENDER_ID)):
+        assert secret not in note["text"], f"the note leaked {secret!r}"
+    for code in ("single_inbox_", "operator_relay:"):
+        assert code not in note["text"], "reason codes belong in the event, not in the operator's note"
+    return note
+
+
+@pytest.mark.parametrize("branch_inbox", BRANCH_INBOXES)
+async def test_a_branch_inbox_refusal_warns_the_operator(
+    session_maker: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+    branch_inbox: int,
+) -> None:
+    _single_inbox_settings(monkeypatch)
+    await _seed_shared_line(session_maker)
+
+    provider, spy, event_id = await _run_relay(session_maker, monkeypatch, inbox_id=branch_inbox)
+    event, rows = await _event_and_outbox(session_maker, event_id)
+
+    assert provider.sent == [] and provider.templates_sent == []
+    assert rows == []
+    assert event.error == "operator_relay: single_inbox_not_general", "the stable reason code is unchanged"
+    _assert_single_inbox_note(spy)
+
+
+async def test_a_native_whatsapp_inbox_refusal_warns_the_operator(
+    session_maker: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _single_inbox_settings(monkeypatch)
+    await _seed_shared_line(session_maker)
+
+    provider, spy, event_id = await _run_relay(session_maker, monkeypatch, inbox_id=NATIVE_WHATSAPP_INBOX)
+    event, rows = await _event_and_outbox(session_maker, event_id)
+
+    assert provider.sent == []
+    assert rows == []
+    assert event.error == "operator_relay: single_inbox_not_general"
+    _assert_single_inbox_note(spy)
+
+
+@pytest.mark.parametrize(
+    "spec, meta_pnid, expected",
+    [
+        pytest.param(None, SHARED_PNID, "single_inbox_sender_not_found", id="missing"),
+        pytest.param(
+            {"tenant": DURLACH, "is_active": False},
+            SHARED_PNID,
+            "single_inbox_sender_inactive",
+            id="inactive",
+        ),
+        pytest.param(
+            {"tenant": DURLACH, "phone_number_id": FOREIGN_PNID},
+            SHARED_PNID,
+            "single_inbox_sender_phone_mismatch",
+            id="mismatched",
+        ),
+        pytest.param(
+            {"tenant": ("unknown_crm", 999703)},
+            SHARED_PNID,
+            "single_inbox_sender_identity_invalid",
+            id="invalid_identity",
+        ),
+    ],
+)
+async def test_an_unproved_sender_refusal_warns_the_operator(
+    session_maker: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+    spec: dict[str, Any] | None,
+    meta_pnid: str,
+    expected: str,
+) -> None:
+    _single_inbox_settings(monkeypatch, meta_pnid=meta_pnid)
+
+    if spec is None:
+        async with session_maker() as session:
+            async with session.begin():
+                session.add(_sender(LOW_SENDER_ID, KARLSRUHE))
+                session.add(_open_window_event())
+    else:
+        await _seed_shared_line(session_maker, configured=_sender(SINGLE_SENDER_ID, **spec))
+
+    provider, spy, event_id = await _run_relay(session_maker, monkeypatch)
+    event, rows = await _event_and_outbox(session_maker, event_id)
+
+    assert provider.sent == [] and provider.templates_sent == []
+    assert rows == [], "no Meta call means no Outbox at all — never a false 'sent' row"
+    assert event.error == f"operator_relay: {expected}"
+    _assert_single_inbox_note(spy)
+
+
+async def test_a_config_fault_warns_the_operator_too(
+    session_maker: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The operator cannot see the env — silence would look like delivery."""
+    _single_inbox_settings(monkeypatch, mode="context")
+    await _seed_shared_line(session_maker)
+
+    provider, spy, event_id = await _run_relay(session_maker, monkeypatch)
+    event, rows = await _event_and_outbox(session_maker, event_id)
+
+    assert provider.sent == []
+    assert rows == []
+    assert event.error == "operator_relay: single_inbox_config_invalid"
+    _assert_single_inbox_note(spy)
+
+
+async def test_a_note_that_chatwoot_rejects_is_retried_and_never_duplicated(
+    session_maker: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Durable, commit-safe, at-least-once — and idempotent on re-dispatch."""
+    _single_inbox_settings(monkeypatch)
+    await _seed_shared_line(session_maker)
+
+    monkeypatch.setattr(wiw, "SessionLocal", session_maker)
+    monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
+    flaky = _FailingChatwootSpy(failures=1)
+    flaky.install(monkeypatch)
+
+    provider = _CountingProvider()
+    async with session_maker() as session:
+        async with session.begin():
+            event = WhatsAppEvent(
+                dedupe_key="chatwoot_out:620:9620",
+                status="received",
+                query={},
+                headers={},
+                payload={
+                    "_chatwoot_operator_relay": {
+                        "recipient_phone": PHONE,
+                        "text": TEXT,
+                        "conversation_id": 620,
+                        "message_id": 9620,
+                        "phone_number_id": SHARED_PNID,
+                        "chatwoot_inbox_id": BRANCH_INBOXES[0],
+                        "agent_name": "Anna",
+                    },
+                },
+                chatwoot_conversation_id=620,
+            )
+            session.add(event)
+            await session.flush()
+            event_id = int(event.id)
+
+    await wiw.process_one_event(event_id, provider)
+
+    # First attempt failed: nothing delivered, but the obligation survived the
+    # commit rather than dying with the process.
+    assert flaky.notes == []
+    async with session_maker() as session:
+        stored = await session.get(WhatsAppEvent, event_id)
+        marker = (stored.payload or {})[wiw._GENERAL_NOTE_KEY]
+    assert stored.error == "operator_relay: single_inbox_not_general"
+    assert marker["status"] == wiw._NOTE_PENDING
+    assert marker["reason"] == "operator_relay: single_inbox_not_general"
+
+    dispatched = await wiw.dispatch_pending_general_affinity_notes()
+    assert dispatched == 1
+    _assert_single_inbox_note(flaky, conversation_id=620)
+
+    # Re-running recovery must not warn the operator twice.
+    assert await wiw.dispatch_pending_general_affinity_notes() == 0
+    assert len(flaky.notes) == 1
+    assert provider.sent == [], "recovery only finishes the note; it never replays the relay"
+
+
+async def test_an_unprovable_general_reply_keeps_its_own_branch_advice(
+    session_maker: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-7.2's note is unchanged: with the map configured, branches are right."""
+    _single_inbox_settings(monkeypatch, sender_id=0, mode="affinity", branch_map=BRANCH_MAP)
+    await _seed_shared_line(session_maker)
+
+    provider, spy, event_id = await _run_relay(session_maker, monkeypatch)
+    event, _rows = await _event_and_outbox(session_maker, event_id)
+
+    assert provider.sent == []
+    assert event.error == "operator_relay: general_affinity_no_evidence"
+    assert len(spy.notes) == 1
+    assert "Filial-Inbox" in spy.notes[0]["text"]
+    assert "General-Inbox" not in spy.notes[0]["text"]
+
+
+async def test_the_hotfix_being_off_adds_no_note_where_there_was_none(
+    session_maker: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`ambiguous_sender` was silent before this hotfix and stays silent."""
+    _single_inbox_settings(monkeypatch, sender_id=0)
+    await _seed_shared_line(session_maker)
+
+    provider, spy, event_id = await _run_relay(session_maker, monkeypatch)
+    event, rows = await _event_and_outbox(session_maker, event_id)
+
+    assert provider.sent == []
+    assert rows == []
+    assert event.error == "operator_relay: ambiguous_sender"
+    assert spy.notes == []

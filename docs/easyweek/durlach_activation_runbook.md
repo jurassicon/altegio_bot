@@ -398,8 +398,17 @@ General inbox и возвращается в `General / Unassigned`, а не п�
 противоречивая строка, неизвестный marker и любой другой bot Outbox без
 `MessageJob` остаются fail-closed с технической route-причиной. Marker на
 lifecycle Outbox с `MessageJob` не заменяет provider-scoped identity, а marker
-на operator Outbox не заменяет identity из `WhatsAppSender`: оба случая
-считаются audit-конфликтом и блокируются fail-closed.
+на operator Outbox сам по себе не заменяет identity из `WhatsAppSender`: оба
+случая считаются audit-конфликтом и блокируются fail-closed.
+
+Единственное узкое исключение для operator Outbox — single-inbox hotfix (§14).
+Там sender является технической линией отправки, а не доказательством филиала,
+и строка несёт согласованную пару `chatwoot_route=general` +
+`single_inbox_relay={route, sender_scope}` на настоящей operator-relay строке
+(`message_source=operator`, `job_id IS NULL`, известный `template_code`,
+непустой `sender_id`). Только полная пара доказывает General и запрещает читать
+sender как tenant evidence. Любая половина, чужой marker, лишний ключ или
+несоответствующая строка остаются audit-конфликтом и блокируются fail-closed.
 
 General ID по-прежнему валидируется против всей branch map до создания
 Chatwoot client. Совпадение General хотя бы с одним branch inbox остаётся hard
@@ -2827,43 +2836,141 @@ defaults, тестах и `.env.example` их нет.
 
 ### 14.3 Как найти id sender до правки `.env`
 
-Вывод содержит только id, provider, company_id, sender_code и booleans.
+Sender выбирается один раз и подтверждается человеком. Вывод содержит только id,
+provider, company_id, sender_code и booleans — ни телефона, ни текста, ни token.
 
 ```bash
 cd /opt/altegio_bot
 $COMPOSE exec -T postgres psql -U altegio -d altegio_bot -c "SELECT s.id, s.provider, s.company_id, s.sender_code, s.is_active, (SELECT count(*) FROM outbox_messages o WHERE o.sender_id = s.id AND o.message_source = 'operator') AS operator_messages FROM whatsapp_senders s ORDER BY operator_messages DESC, s.id;"
 ```
 
-Берётся строка с наибольшей исторической operator-нагрузкой на общем
-`phone_number_id`. Сверить её `phone_number_id` с `META_WA_PHONE_NUMBER_ID`
-обязательно — worker всё равно проверит это сам и откажет, но узнать об ошибке
-лучше до deploy.
+Берётся активная строка с наибольшей исторической operator-нагрузкой на общем
+Meta-номере. Её `phone_number_id` обязан совпадать с `META_WA_PHONE_NUMBER_ID`:
+worker всё равно проверит это сам и откажет, но узнать об этом лучше до deploy.
+
+**Этот sender — техническая линия отправки, а не доказательство филиала
+клиента.** В production для hotfix выбран существующий sender Karlsruhe, но он
+не делает клиента клиентом Karlsruhe. Каждое отправленное через hotfix
+сообщение помечается в `OutboxMessage.meta` парой
+`chatwoot_route=general` + `single_inbox_relay={route, sender_scope}`, поэтому
+после возврата к `affinity` reply и reaction клиента на такое сообщение снова
+приходят в General, а не в филиал технического sender. Половина этой пары
+доказательством не считается и блокируется fail-closed.
 
 ### 14.4 Rollout
 
-Порядок обязателен: сначала три условия, потом id sender.
+Chatwoot-переменные живут в `/opt/altegio_bot/.env`. `easyweek.env` этот hotfix
+не трогает и править его не нужно. Отдельная строка вида `KEY=value` в консоли
+**не** правит `.env` и до Docker Compose не доходит — значения записываются в
+файл.
+
+**Шаг 1. Gate: код уже умеет параметр.** Пока хотя бы один worker отвечает
+`single_inbox_sender_supported: False`, переключать env нельзя: карта опустеет,
+sender прочитан не будет, и operator relay остановится на `ambiguous_sender`.
 
 ```bash
 cd /opt/altegio_bot
-CHATWOOT_INBOX_COMPANY_MAP={}
-CHATWOOT_INBOUND_ROUTING_MODE=general
-CHATWOOT_SINGLE_INBOX_OPERATOR_SENDER_ID=<sender_id>
+for CHATWOOT_SERVICE in altegio-outbox-worker altegio-whatsapp-inbox-worker; do
+  echo "SERVICE=$CHATWOOT_SERVICE"
+  $COMPOSE exec -T "$CHATWOOT_SERVICE" /app/.venv/bin/python -c 'from altegio_bot.settings import Settings; print({"single_inbox_sender_supported": "chatwoot_single_inbox_operator_sender_id" in Settings.model_fields})'
+done
 ```
 
-Настройку читает только WhatsApp inbox worker; пересоздаётся один сервис.
-Обычный `restart` или `up -d` без `--force-recreate` `.env` не перечитывает.
+**Шаг 2. Backup `.env` с сохранением прав и владельца.**
 
 ```bash
 cd /opt/altegio_bot
-$COMPOSE up -d --force-recreate altegio-whatsapp-inbox-worker
+test -f .env
+cp -p .env ".env.bak.$(date -u +%Y%m%dT%H%M%SZ)"
+ls -1 .env.bak.* | tail -1
 ```
 
-Проверка эффективной конфигурации без вывода секретов:
+**Шаг 3. Подтверждённый sender id как положительное целое.** Проверка молча
+завершается ненулевым кодом на пустом, нулевом, отрицательном или нечисловом
+значении.
 
 ```bash
 cd /opt/altegio_bot
-$COMPOSE exec -T altegio-whatsapp-inbox-worker /app/.venv/bin/python -c 'from altegio_bot.settings import settings; print({"mode": settings.chatwoot_inbound_routing_mode, "map_set": bool(settings.chatwoot_inbox_company_map.strip() not in ("", "{}")), "inbox": settings.chatwoot_inbox_id, "sender": settings.chatwoot_single_inbox_operator_sender_id})'
+SINGLE_INBOX_SENDER_ID=<подтверждённый_sender_id>
+printf '%s\n' "$SINGLE_INBOX_SENDER_ID" | grep -Eq '^[1-9][0-9]*$'
 ```
+
+**Шаг 4. Атомарный upsert трёх ключей.** Прежние строки этих ключей удаляются
+целиком, поэтому дубликатов не появляется; `cat > .env` пишет в исходный inode и
+сохраняет владельца и права. Содержимое `.env` при этом не печатается.
+
+```bash
+cd /opt/altegio_bot
+umask 077
+ENV_TMP="$(mktemp)"
+{ grep -Ev '^(CHATWOOT_INBOX_COMPANY_MAP|CHATWOOT_INBOUND_ROUTING_MODE|CHATWOOT_SINGLE_INBOX_OPERATOR_SENDER_ID)=' .env || true; } > "$ENV_TMP"
+printf 'CHATWOOT_INBOX_COMPANY_MAP={}\nCHATWOOT_INBOUND_ROUTING_MODE=general\nCHATWOOT_SINGLE_INBOX_OPERATOR_SENDER_ID=%s\n' "$SINGLE_INBOX_SENDER_ID" >> "$ENV_TMP"
+cat "$ENV_TMP" > .env
+rm -f "$ENV_TMP"
+```
+
+**Шаг 5. Каждый ключ встречается ровно один раз.** Печатаются только имена и
+счётчики, значения не выводятся.
+
+```bash
+cd /opt/altegio_bot
+for KEY in CHATWOOT_INBOX_COMPANY_MAP CHATWOOT_INBOUND_ROUTING_MODE CHATWOOT_SINGLE_INBOX_OPERATOR_SENDER_ID; do
+  printf '%s occurrences=%s\n' "$KEY" "$(grep -Ec "^${KEY}=" .env)"
+done
+```
+
+**Шаг 6. Пересоздать оба worker.** Карту читают двое:
+`altegio-whatsapp-inbox-worker` — inbox→tenant для operator relay и tenant route
+для reply/reaction; `altegio-outbox-worker` — tenant→inbox для outbound mirror.
+Если пересоздать только один, автоматические зеркала продолжат уходить в
+филиальные inbox. Обычный `restart` и `up -d` без `--force-recreate` `.env` не
+перечитывают.
+
+```bash
+cd /opt/altegio_bot
+$COMPOSE up -d --force-recreate \
+  altegio-outbox-worker altegio-whatsapp-inbox-worker
+```
+
+**Шаг 7. Обязательный post-recreate preflight в обоих контейнерах.** Выводятся
+только режим, General inbox ID, booleans валидности карты, provider/company/inbox
+ID и поддержка параметра. Ни token, ни телефон, ни payload.
+
+```bash
+cd /opt/altegio_bot
+for CHATWOOT_SERVICE in altegio-outbox-worker altegio-whatsapp-inbox-worker; do
+  echo "SERVICE=$CHATWOOT_SERVICE"
+  $COMPOSE exec -T "$CHATWOOT_SERVICE" /app/.venv/bin/python - <<'PY'
+from altegio_bot.settings import Settings, settings
+from altegio_bot.webhooks.common import parse_chatwoot_inbox_company_map, resolve_chatwoot_general_inbox
+
+parsed = parse_chatwoot_inbox_company_map(settings.chatwoot_inbox_company_map)
+validated_general_id, general_error = resolve_chatwoot_general_inbox(parsed, settings.chatwoot_inbox_id)
+print(
+    {
+        "mode": settings.chatwoot_inbound_routing_mode,
+        "general_inbox_id": settings.chatwoot_inbox_id,
+        "branch_map_configured": parsed.configured,
+        "branch_map_valid": parsed.valid,
+        "branch_map_provider_scoped": parsed.provider_scoped,
+        "branch_identities": sorted(
+            (inbox_id, identity.provider, identity.company_id)
+            for inbox_id, identity in parsed.mapping.items()
+        ),
+        "general_inbox_isolated": validated_general_id is not None or not parsed.configured,
+        "general_inbox_error": general_error,
+        "single_inbox_sender_supported": "chatwoot_single_inbox_operator_sender_id" in Settings.model_fields,
+        "single_inbox_sender_id": getattr(settings, "chatwoot_single_inbox_operator_sender_id", 0),
+    }
+)
+PY
+done
+```
+
+Gate: **оба** worker показывают `mode: general`, `branch_map_configured: False`,
+`single_inbox_sender_supported: True` и один и тот же положительный
+`single_inbox_sender_id`. Любое расхождение между двумя worker останавливает
+rollout.
 
 ### 14.5 Smoke
 
@@ -2877,7 +2984,8 @@ General. Ответ оператора из General уходит клиенту;
 
 **B. Старый branch inbox.** Ответ в исторической conversation инбоксов
 Karlsruhe / Rastatt / Durlach блокируется с `single_inbox_not_general`. Meta не
-вызывается, Outbox не создаётся, аварийный sender не используется.
+вызывается, Outbox не создаётся, технический sender не используется, а оператор
+получает private note с указанием ответить из General.
 
 **C. Native Chatwoot WhatsApp inbox.** Тот же результат: он не General.
 
@@ -2887,6 +2995,10 @@ provider-scoped sender и зеркалится в General.
 **E. Закрытое окно.** Контакт без inbound за 24 часа: ответ не уходит в Meta,
 создаётся `canceled` Outbox и private note — как и до hotfix.
 
+**F. Переходный сценарий.** Отправленное во время hotfix сообщение получает
+reply и reaction уже после возврата к `affinity` (§14.7): оба обязаны остаться
+в General.
+
 ```sql
 SELECT id, status, error, chatwoot_conversation_id
 FROM whatsapp_events
@@ -2894,40 +3006,141 @@ ORDER BY id DESC
 LIMIT 10;
 ```
 
-**STOP-условия:** ответ ушёл из branch inbox через аварийный sender; выбран
-sender с чужим `phone_number_id`; появился `sent` Outbox без реального вызова
-Meta; автоматические job'ы начали выбирать аварийный sender.
+**STOP-условия rollout:**
+
+- код ещё возвращает `single_inbox_sender_supported: False`;
+- worker видят разные значения `mode`, карты или `single_inbox_sender_id`;
+- один worker остался в прежнем режиме либо продолжает видеть непустую карту;
+- автоматические зеркала после rollout не идут в General;
+- ответ ушёл из branch inbox через технический sender;
+- выбран sender с чужим `phone_number_id`;
+- появился `sent` Outbox без реального вызова Meta;
+- автоматические job'ы начали выбирать технический sender.
 
 ### 14.6 Reason codes
 
 Все коды стабильны и не содержат конфиг, телефоны, текст и секреты. Каждый —
-терминальный отказ **до** вызова Meta и без создания `sent` Outbox.
+терминальный отказ **до** вызова Meta и без создания `sent` Outbox. Каждый
+оставляет оператору durable private note: сообщение клиенту не отправлено,
+отвечать нужно из General. Текст note статичен и не содержит ни PII, ни
+конфигурации, ни sender ID, ни самого reason code.
 
 | Код | Что это значит | Действие оператора |
 |---|---|---|
-| `single_inbox_config_invalid` | положительный sender id при настроенной branch map, режиме не `general` либо без положительного `CHATWOOT_INBOX_ID` | Привести три условия §14.2 в соответствие и пересоздать worker. |
-| `single_inbox_not_general` | ответ написан не в `CHATWOOT_INBOX_ID` (branch inbox, native WhatsApp inbox, отсутствующий или нечисловой id) | Отвечать из General. Историческую conversation не переоткрывать через аварийный sender. |
-| `single_inbox_sender_not_found` | строки с таким id в `whatsapp_senders` нет | Сверить id по запросу §14.3, исправить `.env`, пересоздать worker. |
+| `single_inbox_config_invalid` | положительный sender id при настроенной branch map, режиме не `general` либо без положительного `CHATWOOT_INBOX_ID` | Привести три условия §14.2 в соответствие и пересоздать оба worker. |
+| `single_inbox_not_general` | ответ написан не в `CHATWOOT_INBOX_ID` (branch inbox, native WhatsApp inbox, отсутствующий или нечисловой id) | Ответить из General. Историческую conversation не переоткрывать через технический sender. |
+| `single_inbox_sender_not_found` | строки с таким id в `whatsapp_senders` нет | Сверить id по запросу §14.3, исправить `.env`, пересоздать оба worker. |
 | `single_inbox_sender_inactive` | строка есть, но `is_active=false` | Не менять флаг ради обхода: выяснить, почему sender выключен, и выбрать корректный. |
 | `single_inbox_sender_phone_mismatch` | `phone_number_id` sender не совпадает с relay и/или с `META_WA_PHONE_NUMBER_ID`, либо одно из значений пустое | Проверить `META_WA_PHONE_NUMBER_ID` и номер строки. Отправка с недоказанной линии запрещена. |
 | `single_inbox_sender_identity_invalid` | `provider`/`company_id` строки не образуют валидную CRM identity | Чинить данные строки, а не обходить проверку. |
 
+Отдельно, для reply/reaction на сообщения hotfix: `operator_route_marker_conflict`
+и `invalid_outbox_route_marker` означают, что provenance строки неполна или
+противоречива. Это тоже fail-closed: маршрут не выбирается ни в General, ни в
+филиал. Такую строку не редактируют вручную.
+
 ### 14.7 Откат
 
-Возврат к поведению до hotfix — одно значение:
+Откат — это **согласованный набор из трёх значений**, а не одно. Снять только
+`CHATWOOT_SINGLE_INBOX_OPERATOR_SENDER_ID` либо выставить его в `0`, оставив
+карту пустой и режим `general`, — не откат: legacy fallback снова увидит три
+sender на одном Meta-номере и остановится на `operator_relay: ambiguous_sender`.
+
+**Шаг 1. Найти backup и убедиться, что в нём ровно одна строка карты.** Значение
+карты не печатается.
 
 ```bash
 cd /opt/altegio_bot
-CHATWOOT_SINGLE_INBOX_OPERATOR_SENDER_ID=0
+ls -1 .env.bak.* | tail -1
 ```
 
 ```bash
 cd /opt/altegio_bot
-$COMPOSE up -d --force-recreate altegio-whatsapp-inbox-worker
+ENV_BACKUP=<файл_из_предыдущего_шага>
+test -f "$ENV_BACKUP"
+test "$(grep -Ec '^CHATWOOT_INBOX_COMPANY_MAP=' "$ENV_BACKUP")" = "1"
 ```
 
-`0` возвращает ровно прежние решения relay. Возврат к мульти-inbox топологии —
-отдельным шагом: восстановить `CHATWOOT_INBOX_COMPANY_MAP`, выставить
-`CHATWOOT_INBOUND_ROUTING_MODE=affinity` (или `context`) и снова пересоздать тот
-же один сервис. Отката commit и downgrade миграции не требуется ни в одном из
-направлений.
+**Шаг 2. Восстановить все три ключа одной правкой.** Точное прежнее значение
+provider-scoped карты берётся из backup как есть.
+
+```bash
+cd /opt/altegio_bot
+umask 077
+ENV_TMP="$(mktemp)"
+{ grep -Ev '^(CHATWOOT_INBOX_COMPANY_MAP|CHATWOOT_INBOUND_ROUTING_MODE|CHATWOOT_SINGLE_INBOX_OPERATOR_SENDER_ID)=' .env || true; } > "$ENV_TMP"
+grep -E '^CHATWOOT_INBOX_COMPANY_MAP=' "$ENV_BACKUP" >> "$ENV_TMP"
+printf 'CHATWOOT_INBOUND_ROUTING_MODE=affinity\nCHATWOOT_SINGLE_INBOX_OPERATOR_SENDER_ID=0\n' >> "$ENV_TMP"
+cat "$ENV_TMP" > .env
+rm -f "$ENV_TMP"
+```
+
+**Шаг 3. Каждый ключ снова ровно один раз.**
+
+```bash
+cd /opt/altegio_bot
+for KEY in CHATWOOT_INBOX_COMPANY_MAP CHATWOOT_INBOUND_ROUTING_MODE CHATWOOT_SINGLE_INBOX_OPERATOR_SENDER_ID; do
+  printf '%s occurrences=%s\n' "$KEY" "$(grep -Ec "^${KEY}=" .env)"
+done
+```
+
+**Шаг 4. Пересоздать оба worker.** Причина та же, что и при rollout: карту
+читают двое, и оставленный в старом env worker продолжит зеркалить по-своему.
+
+```bash
+cd /opt/altegio_bot
+$COMPOSE up -d --force-recreate \
+  altegio-outbox-worker altegio-whatsapp-inbox-worker
+```
+
+**Шаг 5. Обязательный post-recreate preflight в обоих контейнерах.**
+
+```bash
+cd /opt/altegio_bot
+for CHATWOOT_SERVICE in altegio-outbox-worker altegio-whatsapp-inbox-worker; do
+  echo "SERVICE=$CHATWOOT_SERVICE"
+  $COMPOSE exec -T "$CHATWOOT_SERVICE" /app/.venv/bin/python - <<'PY'
+from altegio_bot.settings import Settings, settings
+from altegio_bot.webhooks.common import parse_chatwoot_inbox_company_map, resolve_chatwoot_general_inbox
+
+parsed = parse_chatwoot_inbox_company_map(settings.chatwoot_inbox_company_map)
+validated_general_id, general_error = resolve_chatwoot_general_inbox(parsed, settings.chatwoot_inbox_id)
+print(
+    {
+        "mode": settings.chatwoot_inbound_routing_mode,
+        "general_inbox_id": settings.chatwoot_inbox_id,
+        "branch_map_configured": parsed.configured,
+        "branch_map_valid": parsed.valid,
+        "branch_map_provider_scoped": parsed.provider_scoped,
+        "branch_identities": sorted(
+            (inbox_id, identity.provider, identity.company_id)
+            for inbox_id, identity in parsed.mapping.items()
+        ),
+        "general_inbox_isolated": validated_general_id is not None or not parsed.configured,
+        "general_inbox_error": general_error,
+        "single_inbox_sender_supported": "chatwoot_single_inbox_operator_sender_id" in Settings.model_fields,
+        "single_inbox_sender_id": getattr(settings, "chatwoot_single_inbox_operator_sender_id", 0),
+    }
+)
+PY
+done
+```
+
+Gate: **оба** worker показывают `mode: affinity`, `branch_map_configured: True`,
+`branch_map_valid: True`, `branch_map_provider_scoped: True`, полный список из
+трёх `branch_identities` (Karlsruhe, Rastatt, Durlach) и
+`single_inbox_sender_id: 0`.
+
+**STOP-условия отката:**
+
+- карта восстановлена не полностью либо невалидна;
+- worker видят разные значения;
+- один worker остался в `general`;
+- один worker продолжает видеть пустую карту;
+- reply или reaction на сообщение hotfix маршрутизируется в филиал технического
+  sender;
+- автоматические зеркала не вернулись к филиальным inbox.
+
+Отката commit и downgrade миграции не требуется ни в одном из направлений: этот
+hotfix не добавляет схему и хранит provenance в существующем
+`OutboxMessage.meta`.

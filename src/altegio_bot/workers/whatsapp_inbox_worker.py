@@ -20,7 +20,9 @@ from altegio_bot.chatwoot_client import ChatwootClient
 from altegio_bot.chatwoot_outbox_route import (
     outbox_has_chatwoot_route_marker,
     outbox_meta_with_chatwoot_route,
+    outbox_meta_with_single_inbox_general_route,
     resolve_jobless_bot_outbox_route,
+    resolve_operator_outbox_route,
 )
 from altegio_bot.db import SessionLocal
 from altegio_bot.delivery_retry_identity import (
@@ -441,6 +443,26 @@ _GENERAL_AFFINITY_BLOCKED_NOTE = (
     "zu der dieser Kunde gehört."
 )
 
+# PR-7.4. Terminal refusals of the single-inbox relay owe the operator the same
+# warning — but NOT the same advice. While the rollback is active the branch
+# inboxes are exactly where a reply must not be written, so pointing at them
+# would send the operator round the loop that just failed.
+_SINGLE_INBOX_BLOCKED_PREFIX = "operator_relay: single_inbox_"
+
+_SINGLE_INBOX_BLOCKED_NOTE = (
+    "⚠️ Diese Nachricht wurde NICHT per WhatsApp an den Kunden gesendet.\n\n"
+    "Antworten sind zurzeit nur aus der General-Inbox möglich.\n\n"
+    "Bitte öffne diesen Kontakt in der General-Inbox und schreibe die Antwort "
+    "dort noch einmal."
+)
+
+
+def _blocked_note_text(reason: str) -> str:
+    """Which static warning this refusal earns. Never interpolates anything."""
+    if reason.startswith(_SINGLE_INBOX_BLOCKED_PREFIX):
+        return _SINGLE_INBOX_BLOCKED_NOTE
+    return _GENERAL_AFFINITY_BLOCKED_NOTE
+
 
 # The durable marker for that note.
 #
@@ -494,7 +516,12 @@ async def _send_general_affinity_blocked_note(
     *,
     attempts: int = 0,
 ) -> None:
-    """Tell the operator their General reply was not delivered.
+    """Tell the operator their reply was not delivered.
+
+    Shared by both terminal refusal families — an unprovable General reply
+    (PR-7.2) and a refused single-inbox relay (PR-7.4). The *reason* picks the
+    static text; nothing about the customer, the sender or the configuration
+    is ever interpolated into it.
 
     Runs AFTER the transaction is committed — a Chatwoot call must never be made
     with a PostgreSQL transaction open. Never raises: failing here must not
@@ -524,7 +551,7 @@ async def _send_general_affinity_blocked_note(
     try:
         await cw.send_message(
             conversation_id,
-            _GENERAL_AFFINITY_BLOCKED_NOTE,
+            _blocked_note_text(reason),
             message_type="outgoing",
             private=True,
         )
@@ -2044,7 +2071,10 @@ async def _get_outbox_context_target(
     Bot/lifecycle identity comes only from its linked MessageJob. Operator
     identity comes only from its linked WhatsAppSender. The narrow jobless-bot
     exception proves General through the centralized marker plus exact producer
-    provenance (or that same provenance for historical markerless rows).
+    provenance (or that same provenance for historical markerless rows); the
+    equally narrow single-inbox operator exception proves General through the
+    marker plus its transport-sender provenance, and then refuses to read that
+    sender as tenant evidence.
     Duplicate rows are accepted only when every row proves one route and, for
     tenant routing, one identity; collisions are never resolved by row order.
     """
@@ -2073,8 +2103,22 @@ async def _get_outbox_context_target(
     identity_errors: set[str] = set()
     for outbox, job, sender in rows:
         if operator:
-            if outbox_has_chatwoot_route_marker(outbox.meta):
-                identity_errors.add("operator_route_marker_conflict")
+            operator_route, operator_route_error = resolve_operator_outbox_route(
+                message_source=outbox.message_source,
+                job_id=outbox.job_id,
+                template_code=outbox.template_code,
+                sender_id=outbox.sender_id,
+                meta=outbox.meta,
+            )
+            if operator_route_error is not None:
+                identity_errors.add(operator_route_error)
+                continue
+            if operator_route is ChatwootRoute.GENERAL:
+                # PR-7.4: the single-inbox relay chose a TRANSPORT sender, not a
+                # tenant. Reading its branch here is the wrong-inbox bug this
+                # provenance exists to prevent, so no identity is recorded at
+                # all — the reply and the reaction both go back to General.
+                routes.add(ChatwootRoute.GENERAL)
                 continue
             if sender is None:
                 identity_errors.add("operator_sender_identity_missing")
@@ -3389,6 +3433,7 @@ async def _prepare_operator_relay(event_id: int, provider: WhatsAppProvider) -> 
                 _mark_event_processed(event, "operator_relay: missing text")
                 return _PreparedRelay(outbox_id=None)
 
+            single_inbox_route = False
             if _single_inbox_relay_armed():
                 # PR-7.4 hotfix: one General inbox, one explicitly configured
                 # sender. The branch map is off in this topology, so neither
@@ -3399,6 +3444,7 @@ async def _prepare_operator_relay(event_id: int, provider: WhatsAppProvider) -> 
                     chatwoot_inbox_id=chatwoot_inbox_id,
                     phone_number_id=phone_number_id,
                 )
+                single_inbox_route = routing_err is None
             else:
                 tenant_hint, hint_err = _company_hint_from_inbox(chatwoot_inbox_id)
 
@@ -3465,6 +3511,17 @@ async def _prepare_operator_relay(event_id: int, provider: WhatsAppProvider) -> 
                     routing_err,
                 )
                 _mark_event_processed(event, routing_err)
+                if routing_err.startswith(_SINGLE_INBOX_BLOCKED_PREFIX):
+                    # Same debt as a blocked General reply, for the same reason:
+                    # the reply looks delivered in Chatwoot and went nowhere. The
+                    # obligation is committed with the terminal status, so a
+                    # crash before the Chatwoot call leaves it recoverable.
+                    _stamp_blocked_note(event, _blocked_note_marker(routing_err))
+                    return _PreparedRelay(
+                        outbox_id=None,
+                        blocked_note_conversation_id=optional_chatwoot_id(conversation_id),
+                        blocked_note_reason=routing_err,
+                    )
                 return _PreparedRelay(outbox_id=None)
 
             logger.info(
@@ -3511,6 +3568,14 @@ async def _prepare_operator_relay(event_id: int, provider: WhatsAppProvider) -> 
                     source_whatsapp_event_id=event.id,
                 )
                 base.update(overrides)
+                if single_inbox_route:
+                    # Stamped here rather than at each call site so no branch of
+                    # this function can forget it: the customer may later reply
+                    # to any row that reached Meta, and `company_id` above is the
+                    # TRANSPORT sender's company, not a proven tenant.
+                    base["meta"] = outbox_meta_with_single_inbox_general_route(
+                        mapping_or_empty(base.get("meta")),
+                    )
                 return OutboxMessage(**base)
 
             # ── Pre-send Meta circuit guard: never call Meta while paused ──────
