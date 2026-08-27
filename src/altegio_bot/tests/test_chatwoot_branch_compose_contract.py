@@ -867,3 +867,293 @@ def test_no_block_output_ever_carries_the_map_or_a_secret(env_fixture) -> None:
         assert SYNTHETIC_BRANCH_MAP not in printed
         assert "NOT_A_REAL_TOKEN_FIXTURE" not in printed
         assert "700001" not in printed
+
+
+# ---------------------------------------------------------------------------
+# The supported pre-hotfix baseline is a precondition, not a hope
+# ---------------------------------------------------------------------------
+#
+# §14.7 does not restore an arbitrary Chatwoot configuration. It restores ONE
+# confirmed production baseline: the captured provider-scoped branch map,
+# `affinity`, and the sender switched off. The gate used to prove only the map,
+# so a `.env` that had drifted to `context` could still arm the hotfix — and the
+# rollback would then "restore" a mode that was never live.
+#
+# `context` and `general` are perfectly valid application modes. They are simply
+# not a supported starting point for this one-off rollout, so the procedure
+# stops instead of quietly widening what rollback means.
+#
+# A positive sender alongside a non-empty map is not a second legal baseline
+# either: the runtime calls that combination `single_inbox_config_invalid`, so
+# it is a configuration to fix before the rollout, never one to capture.
+
+BASELINE_ENV_LINES = (
+    "APP_NAME=altegio_bot",
+    "WHATSAPP_ACCESS_TOKEN=NOT_A_REAL_TOKEN_FIXTURE",
+    "CHATWOOT_INBOX_ID=8",
+    f"CHATWOOT_INBOX_COMPANY_MAP={SYNTHETIC_BRANCH_MAP}",
+    "CHATWOOT_INBOUND_ROUTING_MODE=affinity",
+)
+
+
+def _env_text(*, mode: str = "affinity", sender: str | None = None, extra: tuple[str, ...] = ()) -> str:
+    lines = [line for line in BASELINE_ENV_LINES if not line.startswith("CHATWOOT_INBOUND_ROUTING_MODE=")]
+    lines.append(f"CHATWOOT_INBOUND_ROUTING_MODE={mode}")
+    if sender is not None:
+        lines.append(f"CHATWOOT_SINGLE_INBOX_OPERATOR_SENDER_ID={sender}")
+    lines.extend(extra)
+    lines.append("# trailing comment")
+    return "\n".join(lines) + "\n"
+
+
+def _env_at(tmp_path, text: str):
+    env_file = tmp_path / ".env"
+    env_file.write_text(text, encoding="utf-8")
+    return env_file, tmp_path / "hotfix.handoff"
+
+
+def _rollout_is_refused(env_file, handoff) -> None:
+    """Neither half of the rollout may proceed, and `.env` must not move."""
+    before = env_file.read_bytes()
+
+    proved = _run_block("PREHOTFIX_HANDOFF", env_file=env_file, handoff_file=handoff)
+    written = _run_block(
+        "ROLLOUT_ENV",
+        env_file=env_file,
+        handoff_file=handoff,
+        extra_env={"SINGLE_INBOX_SENDER_ID": "3"},
+    )
+
+    assert proved.returncode != 0, proved.stdout
+    assert written.returncode != 0, written.stdout
+    assert env_file.read_bytes() == before, "a refused rollout leaves .env byte for byte"
+
+
+@pytest.mark.parametrize(
+    "sender",
+    [
+        pytest.param(None, id="sender_line_absent"),
+        pytest.param("0", id="sender_explicitly_off"),
+    ],
+)
+def test_the_supported_baseline_arms_and_rolls_back(tmp_path, sender: str | None) -> None:
+    """Absent and `0` are the same runtime state: the feature is off."""
+    env_file, handoff = _env_at(tmp_path, _env_text(sender=sender))
+
+    proved = _run_block("PREHOTFIX_HANDOFF", env_file=env_file, handoff_file=handoff)
+    armed = _run_block(
+        "ROLLOUT_ENV",
+        env_file=env_file,
+        handoff_file=handoff,
+        extra_env={"SINGLE_INBOX_SENDER_ID": "3"},
+    )
+    after_rollout = env_file.read_text().splitlines()
+    restored = _run_block("ROLLBACK_ENV", env_file=env_file, handoff_file=handoff)
+    after_rollback = env_file.read_text().splitlines()
+
+    assert proved.returncode == 0, proved.stderr
+    assert armed.returncode == 0, armed.stderr
+    assert restored.returncode == 0, restored.stderr
+    assert "CHATWOOT_INBOX_COMPANY_MAP={}" in after_rollout
+    assert "CHATWOOT_INBOUND_ROUTING_MODE=general" in after_rollout
+    assert "CHATWOOT_SINGLE_INBOX_OPERATOR_SENDER_ID=3" in after_rollout
+    # The rollback writes `0` rather than reproducing a missing line: the two
+    # are runtime-equivalent, and byte-exact absence buys nothing.
+    assert f"CHATWOOT_INBOX_COMPANY_MAP={SYNTHETIC_BRANCH_MAP}" in after_rollback
+    assert "CHATWOOT_INBOUND_ROUTING_MODE=affinity" in after_rollback
+    assert "CHATWOOT_SINGLE_INBOX_OPERATOR_SENDER_ID=0" in after_rollback
+    assert "WHATSAPP_ACCESS_TOKEN=NOT_A_REAL_TOKEN_FIXTURE" in after_rollback
+
+
+@pytest.mark.parametrize("mode", ["context", "general"])
+def test_an_unsupported_starting_mode_stops_the_rollout(tmp_path, mode: str) -> None:
+    """Valid modes, but not the baseline §14.7 knows how to give back."""
+    env_file, handoff = _env_at(tmp_path, _env_text(mode=mode))
+
+    _rollout_is_refused(env_file, handoff)
+    assert not handoff.exists(), "an unprovable baseline must not be captured"
+
+
+@pytest.mark.parametrize(
+    "sender",
+    [
+        pytest.param("3", id="positive"),
+        pytest.param("-1", id="negative"),
+        pytest.param("abc", id="malformed"),
+        pytest.param("00", id="non_canonical_zero"),
+        pytest.param("", id="empty_value"),
+    ],
+)
+def test_a_sender_that_is_not_off_stops_the_rollout(tmp_path, sender: str) -> None:
+    """A positive sender with a non-empty map is `single_inbox_config_invalid`."""
+    env_file, handoff = _env_at(tmp_path, _env_text(sender=sender))
+
+    _rollout_is_refused(env_file, handoff)
+    assert not handoff.exists()
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        pytest.param(("CHATWOOT_INBOUND_ROUTING_MODE=affinity",), id="duplicate_mode"),
+        pytest.param(("CHATWOOT_SINGLE_INBOX_OPERATOR_SENDER_ID=0",), id="duplicate_sender"),
+    ],
+)
+def test_a_duplicated_baseline_key_stops_the_rollout(tmp_path, extra: tuple[str, ...]) -> None:
+    """Last-wins on a duplicated key is not a state anybody proved."""
+    sender = "0" if extra[0].startswith("CHATWOOT_SINGLE_INBOX") else None
+    env_file, handoff = _env_at(tmp_path, _env_text(sender=sender, extra=extra))
+
+    _rollout_is_refused(env_file, handoff)
+    assert not handoff.exists()
+
+
+def test_a_missing_routing_mode_stops_the_rollout(tmp_path) -> None:
+    env_file, handoff = _env_at(
+        tmp_path,
+        f"APP_NAME=altegio_bot\nCHATWOOT_INBOX_COMPANY_MAP={SYNTHETIC_BRANCH_MAP}\n",
+    )
+
+    _rollout_is_refused(env_file, handoff)
+    assert not handoff.exists()
+
+
+def test_a_backup_that_is_not_the_baseline_is_refused_even_when_it_hashes(tmp_path) -> None:
+    """SHA256 and map fingerprint can both be right and the backup still wrong."""
+    env_file, handoff = _env_at(tmp_path, _env_text())
+
+    _run_block("PREHOTFIX_HANDOFF", env_file=env_file, handoff_file=handoff)
+    fields = _handoff_fields(handoff)
+    backup = Path(fields["PRE_HOTFIX_ENV_BACKUP"])
+    backup.write_text(_env_text(mode="context"), encoding="utf-8")
+    # Re-bind the digest so ONLY the baseline check can refuse this backup.
+    handoff.write_text(
+        handoff.read_text().replace(fields["PRE_HOTFIX_BACKUP_SHA256"], _sha256_of(backup)),
+        encoding="utf-8",
+    )
+    before = env_file.read_bytes()
+
+    reproved = _run_block("PREHOTFIX_HANDOFF", env_file=env_file, handoff_file=handoff)
+    written = _run_block(
+        "ROLLOUT_ENV",
+        env_file=env_file,
+        handoff_file=handoff,
+        extra_env={"SINGLE_INBOX_SENDER_ID": "3"},
+    )
+    resolved = _run_block("ROLLBACK_RESOLVE", env_file=env_file, handoff_file=handoff)
+    restored = _run_block("ROLLBACK_ENV", env_file=env_file, handoff_file=handoff)
+
+    assert _sha256_of(backup) == _handoff_fields(handoff)["PRE_HOTFIX_BACKUP_SHA256"]
+    for result in (reproved, written, resolved, restored):
+        assert result.returncode != 0, result.stdout
+    assert env_file.read_bytes() == before
+
+
+def test_the_armed_state_itself_is_checked_on_a_repeat_rollout(tmp_path) -> None:
+    """Empty map is not enough: mode and sender must match what §14.4 wrote."""
+    env_file, handoff = _env_at(tmp_path, _env_text())
+    _run_block("PREHOTFIX_HANDOFF", env_file=env_file, handoff_file=handoff)
+    _run_block(
+        "ROLLOUT_ENV",
+        env_file=env_file,
+        handoff_file=handoff,
+        extra_env={"SINGLE_INBOX_SENDER_ID": "3"},
+    )
+    armed = env_file.read_text()
+
+    for broken in (
+        armed.replace("CHATWOOT_INBOUND_ROUTING_MODE=general", "CHATWOOT_INBOUND_ROUTING_MODE=affinity"),
+        armed.replace("CHATWOOT_SINGLE_INBOX_OPERATOR_SENDER_ID=3", "CHATWOOT_SINGLE_INBOX_OPERATOR_SENDER_ID=0"),
+    ):
+        env_file.write_text(broken, encoding="utf-8")
+        before = env_file.read_bytes()
+
+        reproved = _run_block("PREHOTFIX_HANDOFF", env_file=env_file, handoff_file=handoff)
+
+        assert reproved.returncode != 0, reproved.stdout
+        assert env_file.read_bytes() == before
+
+
+def test_a_repeat_rollout_after_arming_stays_idempotent(tmp_path) -> None:
+    env_file, handoff = _env_at(tmp_path, _env_text())
+    _run_block("PREHOTFIX_HANDOFF", env_file=env_file, handoff_file=handoff)
+    first = handoff.read_text()
+    _run_block(
+        "ROLLOUT_ENV",
+        env_file=env_file,
+        handoff_file=handoff,
+        extra_env={"SINGLE_INBOX_SENDER_ID": "3"},
+    )
+    armed = env_file.read_bytes()
+
+    reproved = _run_block("PREHOTFIX_HANDOFF", env_file=env_file, handoff_file=handoff)
+    rewritten = _run_block(
+        "ROLLOUT_ENV",
+        env_file=env_file,
+        handoff_file=handoff,
+        extra_env={"SINGLE_INBOX_SENDER_ID": "3"},
+    )
+
+    assert reproved.returncode == 0, reproved.stderr
+    assert rewritten.returncode == 0, rewritten.stderr
+    assert handoff.read_text() == first, "no repointing"
+    assert env_file.read_bytes() == armed, "and no drift"
+    assert len(list(env_file.parent.glob(".env.bak.*"))) == 1, "no second backup"
+
+
+def test_the_rollback_stays_idempotent_after_it_lands(tmp_path) -> None:
+    """Once restored, the live file IS the baseline again — so it re-verifies."""
+    env_file, handoff = _env_at(tmp_path, _env_text())
+    _run_block("PREHOTFIX_HANDOFF", env_file=env_file, handoff_file=handoff)
+    _run_block(
+        "ROLLOUT_ENV",
+        env_file=env_file,
+        handoff_file=handoff,
+        extra_env={"SINGLE_INBOX_SENDER_ID": "3"},
+    )
+    _run_block("ROLLBACK_ENV", env_file=env_file, handoff_file=handoff)
+    restored = env_file.read_bytes()
+
+    again = _run_block("ROLLBACK_ENV", env_file=env_file, handoff_file=handoff)
+
+    assert again.returncode == 0, again.stderr
+    assert env_file.read_bytes() == restored
+
+
+def test_the_baseline_gate_runs_in_every_block_before_any_write() -> None:
+    section = _single_inbox_section()
+
+    # Four blocks share the prelude, so each defines both assertions...
+    assert section.count("assert_pre_hotfix_baseline() {") == 4
+    assert section.count("assert_armed_state() {") == 4
+    # ...proves the backup once per gate, plus the one-off live check in §14.4.
+    assert section.count('assert_pre_hotfix_baseline "$PRE_HOTFIX_ENV_BACKUP"') == 4
+    assert section.count('assert_pre_hotfix_baseline "$ENV_FILE"') == 5
+    assert section.count('assert_armed_state "$ENV_FILE"') == 4
+    # The rollout may only capture a baseline it has already proven.
+    handoff_block = _runbook_block("PREHOTFIX_HANDOFF")
+    assert handoff_block.index('assert_pre_hotfix_baseline "$ENV_FILE"') < handoff_block.index("cp -p")
+
+
+def test_the_handoff_stores_no_copy_of_mode_or_sender(tmp_path) -> None:
+    """SHA256 already binds the backup; a second copy would only drift."""
+    env_file, handoff = _env_at(tmp_path, _env_text(sender="0"))
+
+    _run_block("PREHOTFIX_HANDOFF", env_file=env_file, handoff_file=handoff)
+    stored = handoff.read_text()
+
+    assert set(_handoff_fields(handoff)) == set(HANDOFF_FIELDS)
+    assert "CHATWOOT_INBOUND_ROUTING_MODE" not in stored
+    assert "CHATWOOT_SINGLE_INBOX_OPERATOR_SENDER_ID" not in stored
+    assert "affinity" not in stored
+
+
+def test_the_rollback_stop_conditions_name_the_real_failures() -> None:
+    section = _single_inbox_section()
+
+    # The old verifier printed these; the current one does not.
+    assert "backup_ok" not in section
+    assert "post_hotfix_backup" not in section
+    assert "map_fingerprint_mismatch" in section
+    assert "несовпадение SHA256" in section
+    assert "baseline `affinity` + sender off" in section

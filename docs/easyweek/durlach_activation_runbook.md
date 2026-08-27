@@ -2896,17 +2896,42 @@ hotfix, содержит `CHATWOOT_INBOX_COMPANY_MAP={}` — «откат» по
 1. в текущем `.env` `CHATWOOT_INBOX_COMPANY_MAP` встречается ровно один раз;
 2. карта разбирается тем же fail-closed парсером, что и worker, и обязана быть
    `configured` + `valid` + `provider_scoped`;
-3. снимается sibling backup через `cp -p` (owner/group/mode сохраняются);
-4. считается SHA256 всего backup и детерминированный fingerprint нормализованной
+3. `CHATWOOT_INBOUND_ROUTING_MODE` встречается ровно один раз и равен
+   `affinity`, а `CHATWOOT_SINGLE_INBOX_OPERATOR_SENDER_ID` либо отсутствует,
+   либо встречается ровно один раз со значением `0`;
+4. снимается sibling backup через `cp -p` (owner/group/mode сохраняются);
+5. считается SHA256 всего backup и детерминированный fingerprint нормализованной
    карты — sha256 от отсортированных `(inbox_id, provider, company_id)`;
-5. handoff создаётся атомарно, mode `0600`, и хранит путь backup, его SHA256 и
-   fingerprint карты. Сама карта в handoff не пишется.
+6. handoff создаётся атомарно, mode `0600`, и хранит путь backup, его SHA256 и
+   fingerprint карты. Ни карта, ни mode, ни sender в handoff не пишутся: handoff
+   уже связан с backup через SHA256, поэтому значения доказываются прямо из
+   привязанного файла.
+
+**Почему baseline — precondition, а не только карта.** §14.7 восстанавливает не
+произвольную конфигурацию, а один подтверждённый production baseline: исходную
+provider-scoped карту, `affinity` и sender off. Если `.env` неожиданно окажется
+в `context`, доказанной карты недостаточно — откат всё равно записал бы
+`affinity`, то есть режим, которого до rollout не было. `context` и `general` —
+полностью валидные режимы приложения, но не поддерживаемое исходное состояние
+именно этого одноразового rollout, поэтому процедура останавливается.
+
+Положительный sender при непустой карте тоже не сохраняется и не
+восстанавливается: runtime считает такую комбинацию `single_inbox_config_invalid`
+(§14.6), так что это не второй легальный baseline, а конфигурация, которую
+нужно исправить до rollout.
+
+Отсутствующая строка sender и явный `0` эквивалентны по смыслу — обе означают
+«функция выключена», — поэтому откат просто пишет `0` и не пытается
+восстанавливать отсутствие строки байт в байт.
 
 Уже существующий handoff **не** принимается на веру: он проходит полную
-проверку — путь, symlink, поля, SHA256, fingerprint. Если live `.env` всё ещё в
-pre-hotfix состоянии, его карта обязана совпасть со снимком; расхождение
-означает, что конфигурация изменилась после создания handoff, и rollout
-останавливается. Существующий handoff никогда не перепривязывается автоматически.
+проверку — путь, symlink, поля, SHA256, fingerprint карты и baseline
+(`affinity` + sender off) в самом backup. Если live `.env` всё ещё в pre-hotfix
+состоянии, его карта обязана совпасть со снимком, а mode и sender — пройти тот же
+baseline; расхождение означает, что конфигурация изменилась после создания
+handoff, и rollout останавливается. Если hotfix уже включён, live `.env` обязан
+быть ровно в armed-состоянии: карта `{}`, режим `general`, положительный sender.
+Существующий handoff никогда не перепривязывается автоматически.
 
 Проверка карты выполняется внутри worker-контейнера, потому что там живёт тот же
 парсер. В контейнер передаётся **только** строка карты, а не `.env` целиком:
@@ -2919,6 +2944,8 @@ set -euo pipefail
 ENV_FILE="${ENV_FILE:-/opt/altegio_bot/.env}"
 HANDOFF_FILE="${HANDOFF_FILE:-/root/altegio_bot-single-inbox-hotfix.handoff}"
 MAP_KEY=CHATWOOT_INBOX_COMPANY_MAP
+MODE_KEY=CHATWOOT_INBOUND_ROUTING_MODE
+SENDER_KEY=CHATWOOT_SINGLE_INBOX_OPERATOR_SENDER_ID
 VERIFY_BACKUP_CMD="${VERIFY_BACKUP_CMD:-${COMPOSE:?export COMPOSE from the Production Compose contract first} exec -T altegio-whatsapp-inbox-worker /app/.venv/bin/python -m altegio_bot.scripts.verify_pre_hotfix_env_backup}"
 sha256_of() {
   if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi
@@ -2927,10 +2954,35 @@ handoff_field() {
   test "$(grep -Ec "^$1=" "$HANDOFF_FILE")" = "1"
   grep -E "^$1=" "$HANDOFF_FILE" | cut -d= -f2-
 }
+env_key_count() {
+  COUNT_RC=0
+  KEY_COUNT="$(grep -Ec "^$2=" "$1")" || COUNT_RC=$?
+  test "$COUNT_RC" -le 1
+  printf '%s\n' "$KEY_COUNT"
+}
+env_value() {
+  grep -E "^$2=" "$1" | cut -d= -f2-
+}
+assert_pre_hotfix_baseline() {
+  test "$(env_key_count "$1" "$MODE_KEY")" = "1"
+  test "$(env_value "$1" "$MODE_KEY")" = "affinity"
+  SENDER_COUNT="$(env_key_count "$1" "$SENDER_KEY")"
+  test "$SENDER_COUNT" -le 1
+  if [ "$SENDER_COUNT" = "1" ]; then
+    test "$(env_value "$1" "$SENDER_KEY")" = "0"
+  fi
+}
+assert_armed_state() {
+  test "$(env_key_count "$1" "$MODE_KEY")" = "1"
+  test "$(env_value "$1" "$MODE_KEY")" = "general"
+  test "$(env_key_count "$1" "$SENDER_KEY")" = "1"
+  printf '%s\n' "$(env_value "$1" "$SENDER_KEY")" | grep -Eq '^[1-9][0-9]*$'
+}
 test -f "$ENV_FILE"
 test ! -L "$ENV_FILE"
 if [ ! -e "$HANDOFF_FILE" ]; then
   test "$(grep -Ec "^${MAP_KEY}=" "$ENV_FILE")" = "1"
+  assert_pre_hotfix_baseline "$ENV_FILE"
   LIVE_MAP_FINGERPRINT="$(grep -E "^${MAP_KEY}=" "$ENV_FILE" \
     | $VERIFY_BACKUP_CMD snapshot \
     | grep -E '^PRE_HOTFIX_MAP_FINGERPRINT=' | cut -d= -f2-)"
@@ -2963,12 +3015,16 @@ test ! -L "$PRE_HOTFIX_ENV_BACKUP"
 test "$(sha256_of "$PRE_HOTFIX_ENV_BACKUP")" = "$PRE_HOTFIX_BACKUP_SHA256"
 grep -E "^${MAP_KEY}=" "$PRE_HOTFIX_ENV_BACKUP" \
   | $VERIFY_BACKUP_CMD verify --expect-fingerprint "$PRE_HOTFIX_MAP_FINGERPRINT" > /dev/null
+assert_pre_hotfix_baseline "$PRE_HOTFIX_ENV_BACKUP"
 LIVE_MAP_RC=0
 LIVE_MAP_LINES="$(grep -E "^${MAP_KEY}=" "$ENV_FILE")" || LIVE_MAP_RC=$?
 test "$LIVE_MAP_RC" -le 1
-if [ "$LIVE_MAP_LINES" != "${MAP_KEY}={}" ]; then
+if [ "$LIVE_MAP_LINES" = "${MAP_KEY}={}" ]; then
+  assert_armed_state "$ENV_FILE"
+else
   printf '%s\n' "$LIVE_MAP_LINES" \
     | $VERIFY_BACKUP_CMD verify --expect-fingerprint "$PRE_HOTFIX_MAP_FINGERPRINT" > /dev/null
+  assert_pre_hotfix_baseline "$ENV_FILE"
 fi
 echo "pre-hotfix handoff proven"
 PREHOTFIX_HANDOFF
@@ -2992,9 +3048,10 @@ printf '%s\n' "$SINGLE_INBOX_SENDER_ID" | grep -Eq '^[1-9][0-9]*$'
 Прохождения шага 2 недостаточно: между ним и записью может пройти сколько угодно
 времени, а backup может исчезнуть, быть подменён или указывать уже на другую
 карту. Поэтому блок, который реально стирает `CHATWOOT_INBOX_COMPANY_MAP`, сам заново проходит
-весь gate — handoff, symlink, поля, SHA256 backup, fingerprint карты и, пока
-live `.env` ещё pre-hotfix, совпадение его карты со снимком. Право очистить
-карту даёт только этот gate, а не факт выполнения предыдущего шага.
+весь gate — handoff, symlink, поля, SHA256 backup, fingerprint карты, baseline
+`affinity` + sender off в backup и, пока live `.env` ещё pre-hotfix, совпадение
+его карты со снимком вместе с тем же baseline. Право очистить карту даёт только
+этот gate, а не факт выполнения предыдущего шага.
 
 `grep` на чтении `.env` возвращает `1`, если удалять нечего, — это допустимо;
 любой другой код означает ошибку чтения и останавливает процедуру **до**
@@ -3009,6 +3066,8 @@ set -euo pipefail
 ENV_FILE="${ENV_FILE:-/opt/altegio_bot/.env}"
 HANDOFF_FILE="${HANDOFF_FILE:-/root/altegio_bot-single-inbox-hotfix.handoff}"
 MAP_KEY=CHATWOOT_INBOX_COMPANY_MAP
+MODE_KEY=CHATWOOT_INBOUND_ROUTING_MODE
+SENDER_KEY=CHATWOOT_SINGLE_INBOX_OPERATOR_SENDER_ID
 VERIFY_BACKUP_CMD="${VERIFY_BACKUP_CMD:-${COMPOSE:?export COMPOSE from the Production Compose contract first} exec -T altegio-whatsapp-inbox-worker /app/.venv/bin/python -m altegio_bot.scripts.verify_pre_hotfix_env_backup}"
 sha256_of() {
   if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi
@@ -3016,6 +3075,30 @@ sha256_of() {
 handoff_field() {
   test "$(grep -Ec "^$1=" "$HANDOFF_FILE")" = "1"
   grep -E "^$1=" "$HANDOFF_FILE" | cut -d= -f2-
+}
+env_key_count() {
+  COUNT_RC=0
+  KEY_COUNT="$(grep -Ec "^$2=" "$1")" || COUNT_RC=$?
+  test "$COUNT_RC" -le 1
+  printf '%s\n' "$KEY_COUNT"
+}
+env_value() {
+  grep -E "^$2=" "$1" | cut -d= -f2-
+}
+assert_pre_hotfix_baseline() {
+  test "$(env_key_count "$1" "$MODE_KEY")" = "1"
+  test "$(env_value "$1" "$MODE_KEY")" = "affinity"
+  SENDER_COUNT="$(env_key_count "$1" "$SENDER_KEY")"
+  test "$SENDER_COUNT" -le 1
+  if [ "$SENDER_COUNT" = "1" ]; then
+    test "$(env_value "$1" "$SENDER_KEY")" = "0"
+  fi
+}
+assert_armed_state() {
+  test "$(env_key_count "$1" "$MODE_KEY")" = "1"
+  test "$(env_value "$1" "$MODE_KEY")" = "general"
+  test "$(env_key_count "$1" "$SENDER_KEY")" = "1"
+  printf '%s\n' "$(env_value "$1" "$SENDER_KEY")" | grep -Eq '^[1-9][0-9]*$'
 }
 MANAGED_RE='^(CHATWOOT_INBOX_COMPANY_MAP|CHATWOOT_INBOUND_ROUTING_MODE|CHATWOOT_SINGLE_INBOX_OPERATOR_SENDER_ID)='
 test -f "$ENV_FILE"
@@ -3036,12 +3119,16 @@ test ! -L "$PRE_HOTFIX_ENV_BACKUP"
 test "$(sha256_of "$PRE_HOTFIX_ENV_BACKUP")" = "$PRE_HOTFIX_BACKUP_SHA256"
 grep -E "^${MAP_KEY}=" "$PRE_HOTFIX_ENV_BACKUP" \
   | $VERIFY_BACKUP_CMD verify --expect-fingerprint "$PRE_HOTFIX_MAP_FINGERPRINT" > /dev/null
+assert_pre_hotfix_baseline "$PRE_HOTFIX_ENV_BACKUP"
 LIVE_MAP_RC=0
 LIVE_MAP_LINES="$(grep -E "^${MAP_KEY}=" "$ENV_FILE")" || LIVE_MAP_RC=$?
 test "$LIVE_MAP_RC" -le 1
-if [ "$LIVE_MAP_LINES" != "${MAP_KEY}={}" ]; then
+if [ "$LIVE_MAP_LINES" = "${MAP_KEY}={}" ]; then
+  assert_armed_state "$ENV_FILE"
+else
   printf '%s\n' "$LIVE_MAP_LINES" \
     | $VERIFY_BACKUP_CMD verify --expect-fingerprint "$PRE_HOTFIX_MAP_FINGERPRINT" > /dev/null
+  assert_pre_hotfix_baseline "$ENV_FILE"
 fi
 ENV_TMP="$(mktemp "${ENV_FILE}.rollout.XXXXXX")"
 trap 'rm -f "$ENV_TMP"' EXIT
@@ -3216,6 +3303,13 @@ provenance строки неполна или противоречива. Это
 зафиксирована перед rollout). Каждый из них останавливает процедуру до
 изменения `.env`.
 
+Baseline-проверки кодов не печатают: блок просто завершается ненулевым кодом,
+если `CHATWOOT_INBOUND_ROUTING_MODE` встречается не один раз либо не равен
+`affinity`, если `CHATWOOT_SINGLE_INBOX_OPERATOR_SENDER_ID` дублирован либо
+имеет значение, отличное от `0`, или — для уже включённого hotfix — если live
+`.env` не находится ровно в armed-состоянии (`{}` + `general` + положительный
+sender).
+
 ### 14.7 Откат
 
 Откат — это **согласованный набор из трёх значений**, а не одно. Снять только
@@ -3228,8 +3322,9 @@ sender на одном Meta-номере и остановится на `operato
 после включения hotfix и содержать пустую карту.
 
 **Шаг 1. Доказать handoff и его backup.** Тот же gate, что и в §14.4: путь,
-symlink, три обязательных поля ровно по разу, SHA256 всего backup и fingerprint
-нормализованной карты. Ожидаемой topology здесь нет и быть не может — источник
+symlink, три обязательных поля ровно по разу, SHA256 всего backup, fingerprint
+нормализованной карты и baseline `affinity` + sender off в самом backup —
+именно то поведение, которое шаг 2 затем восстанавливает. Ожидаемой topology здесь нет и быть не может — источник
 истины это снимок конфигурации, снятый и проверенный непосредственно перед
 rollout. Зашивать numeric ID филиалов в репозиторий нельзя: плановая ревизия 3
 (§10 канонического плана) зафиксировала EasyWeek location, которая просто
@@ -3243,6 +3338,8 @@ set -euo pipefail
 ENV_FILE="${ENV_FILE:-/opt/altegio_bot/.env}"
 HANDOFF_FILE="${HANDOFF_FILE:-/root/altegio_bot-single-inbox-hotfix.handoff}"
 MAP_KEY=CHATWOOT_INBOX_COMPANY_MAP
+MODE_KEY=CHATWOOT_INBOUND_ROUTING_MODE
+SENDER_KEY=CHATWOOT_SINGLE_INBOX_OPERATOR_SENDER_ID
 VERIFY_BACKUP_CMD="${VERIFY_BACKUP_CMD:-${COMPOSE:?export COMPOSE from the Production Compose contract first} exec -T altegio-whatsapp-inbox-worker /app/.venv/bin/python -m altegio_bot.scripts.verify_pre_hotfix_env_backup}"
 sha256_of() {
   if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi
@@ -3250,6 +3347,30 @@ sha256_of() {
 handoff_field() {
   test "$(grep -Ec "^$1=" "$HANDOFF_FILE")" = "1"
   grep -E "^$1=" "$HANDOFF_FILE" | cut -d= -f2-
+}
+env_key_count() {
+  COUNT_RC=0
+  KEY_COUNT="$(grep -Ec "^$2=" "$1")" || COUNT_RC=$?
+  test "$COUNT_RC" -le 1
+  printf '%s\n' "$KEY_COUNT"
+}
+env_value() {
+  grep -E "^$2=" "$1" | cut -d= -f2-
+}
+assert_pre_hotfix_baseline() {
+  test "$(env_key_count "$1" "$MODE_KEY")" = "1"
+  test "$(env_value "$1" "$MODE_KEY")" = "affinity"
+  SENDER_COUNT="$(env_key_count "$1" "$SENDER_KEY")"
+  test "$SENDER_COUNT" -le 1
+  if [ "$SENDER_COUNT" = "1" ]; then
+    test "$(env_value "$1" "$SENDER_KEY")" = "0"
+  fi
+}
+assert_armed_state() {
+  test "$(env_key_count "$1" "$MODE_KEY")" = "1"
+  test "$(env_value "$1" "$MODE_KEY")" = "general"
+  test "$(env_key_count "$1" "$SENDER_KEY")" = "1"
+  printf '%s\n' "$(env_value "$1" "$SENDER_KEY")" | grep -Eq '^[1-9][0-9]*$'
 }
 test -f "$ENV_FILE"
 test ! -L "$ENV_FILE"
@@ -3267,12 +3388,16 @@ test ! -L "$PRE_HOTFIX_ENV_BACKUP"
 test "$(sha256_of "$PRE_HOTFIX_ENV_BACKUP")" = "$PRE_HOTFIX_BACKUP_SHA256"
 grep -E "^${MAP_KEY}=" "$PRE_HOTFIX_ENV_BACKUP" \
   | $VERIFY_BACKUP_CMD verify --expect-fingerprint "$PRE_HOTFIX_MAP_FINGERPRINT" > /dev/null
+assert_pre_hotfix_baseline "$PRE_HOTFIX_ENV_BACKUP"
 LIVE_MAP_RC=0
 LIVE_MAP_LINES="$(grep -E "^${MAP_KEY}=" "$ENV_FILE")" || LIVE_MAP_RC=$?
 test "$LIVE_MAP_RC" -le 1
-if [ "$LIVE_MAP_LINES" != "${MAP_KEY}={}" ]; then
+if [ "$LIVE_MAP_LINES" = "${MAP_KEY}={}" ]; then
+  assert_armed_state "$ENV_FILE"
+else
   printf '%s\n' "$LIVE_MAP_LINES" \
     | $VERIFY_BACKUP_CMD verify --expect-fingerprint "$PRE_HOTFIX_MAP_FINGERPRINT" > /dev/null
+  assert_pre_hotfix_baseline "$ENV_FILE"
 fi
 printf 'PRE_HOTFIX_ENV_BACKUP=%s\n' "$PRE_HOTFIX_ENV_BACKUP"
 ROLLBACK_RESOLVE
@@ -3283,7 +3408,9 @@ ROLLBACK_RESOLVE
 
 **Шаг 2. Атомарно восстановить все три ключа.** Блок сам заново проходит тот же
 gate и берёт путь backup только из handoff, а не из окружения оператора;
-контракт записи тот же, что в §14.4.
+контракт записи тот же, что в §14.4. Так как gate уже доказал, что backup несёт
+`affinity` и sender off, запись этих двух значений — восстановление
+подтверждённого production поведения, а не предположение о нём.
 
 ```bash
 cd /opt/altegio_bot
@@ -3293,6 +3420,8 @@ set -euo pipefail
 ENV_FILE="${ENV_FILE:-/opt/altegio_bot/.env}"
 HANDOFF_FILE="${HANDOFF_FILE:-/root/altegio_bot-single-inbox-hotfix.handoff}"
 MAP_KEY=CHATWOOT_INBOX_COMPANY_MAP
+MODE_KEY=CHATWOOT_INBOUND_ROUTING_MODE
+SENDER_KEY=CHATWOOT_SINGLE_INBOX_OPERATOR_SENDER_ID
 VERIFY_BACKUP_CMD="${VERIFY_BACKUP_CMD:-${COMPOSE:?export COMPOSE from the Production Compose contract first} exec -T altegio-whatsapp-inbox-worker /app/.venv/bin/python -m altegio_bot.scripts.verify_pre_hotfix_env_backup}"
 sha256_of() {
   if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi
@@ -3300,6 +3429,30 @@ sha256_of() {
 handoff_field() {
   test "$(grep -Ec "^$1=" "$HANDOFF_FILE")" = "1"
   grep -E "^$1=" "$HANDOFF_FILE" | cut -d= -f2-
+}
+env_key_count() {
+  COUNT_RC=0
+  KEY_COUNT="$(grep -Ec "^$2=" "$1")" || COUNT_RC=$?
+  test "$COUNT_RC" -le 1
+  printf '%s\n' "$KEY_COUNT"
+}
+env_value() {
+  grep -E "^$2=" "$1" | cut -d= -f2-
+}
+assert_pre_hotfix_baseline() {
+  test "$(env_key_count "$1" "$MODE_KEY")" = "1"
+  test "$(env_value "$1" "$MODE_KEY")" = "affinity"
+  SENDER_COUNT="$(env_key_count "$1" "$SENDER_KEY")"
+  test "$SENDER_COUNT" -le 1
+  if [ "$SENDER_COUNT" = "1" ]; then
+    test "$(env_value "$1" "$SENDER_KEY")" = "0"
+  fi
+}
+assert_armed_state() {
+  test "$(env_key_count "$1" "$MODE_KEY")" = "1"
+  test "$(env_value "$1" "$MODE_KEY")" = "general"
+  test "$(env_key_count "$1" "$SENDER_KEY")" = "1"
+  printf '%s\n' "$(env_value "$1" "$SENDER_KEY")" | grep -Eq '^[1-9][0-9]*$'
 }
 MANAGED_RE='^(CHATWOOT_INBOX_COMPANY_MAP|CHATWOOT_INBOUND_ROUTING_MODE|CHATWOOT_SINGLE_INBOX_OPERATOR_SENDER_ID)='
 test -f "$ENV_FILE"
@@ -3318,12 +3471,16 @@ test ! -L "$PRE_HOTFIX_ENV_BACKUP"
 test "$(sha256_of "$PRE_HOTFIX_ENV_BACKUP")" = "$PRE_HOTFIX_BACKUP_SHA256"
 grep -E "^${MAP_KEY}=" "$PRE_HOTFIX_ENV_BACKUP" \
   | $VERIFY_BACKUP_CMD verify --expect-fingerprint "$PRE_HOTFIX_MAP_FINGERPRINT" > /dev/null
+assert_pre_hotfix_baseline "$PRE_HOTFIX_ENV_BACKUP"
 LIVE_MAP_RC=0
 LIVE_MAP_LINES="$(grep -E "^${MAP_KEY}=" "$ENV_FILE")" || LIVE_MAP_RC=$?
 test "$LIVE_MAP_RC" -le 1
-if [ "$LIVE_MAP_LINES" != "${MAP_KEY}={}" ]; then
+if [ "$LIVE_MAP_LINES" = "${MAP_KEY}={}" ]; then
+  assert_armed_state "$ENV_FILE"
+else
   printf '%s\n' "$LIVE_MAP_LINES" \
     | $VERIFY_BACKUP_CMD verify --expect-fingerprint "$PRE_HOTFIX_MAP_FINGERPRINT" > /dev/null
+  assert_pre_hotfix_baseline "$ENV_FILE"
 fi
 MAP_RC=0
 BACKUP_MAP_LINE="$(grep -E "^${MAP_KEY}=" "$PRE_HOTFIX_ENV_BACKUP")" || MAP_RC=$?
@@ -3413,7 +3570,10 @@ Gate: **оба** worker показывают `mode: affinity`, `branch_map_confi
 
 - handoff отсутствует, указывает на несуществующий путь либо на файл вне
   `/opt/altegio_bot/.env.bak.*`;
-- `backup_ok: False` или `post_hotfix_backup: True` на шаге 2;
+- любой ненулевой exit gate на шаге 1 или 2: отсутствующее либо дублированное
+  поле handoff, backup вне разрешённого шаблона, symlink, несовпадение SHA256
+  backup, невалидная карта, `map_fingerprint_mismatch` либо backup, не
+  содержащий baseline `affinity` + sender off;
 - карта восстановлена не полностью либо невалидна;
 - `general_inbox_id_valid: False`;
 - worker видят разные значения;
