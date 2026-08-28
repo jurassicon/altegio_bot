@@ -3587,3 +3587,293 @@ Handoff и pre-hotfix backup удаляются только после успе
 smoke. Отката commit и downgrade миграции не требуется ни в одном из
 направлений: этот hotfix не добавляет схему и хранит provenance в существующем
 `OutboxMessage.meta`.
+---
+
+## 15. PR-11 — visits_total: счётчик завершённых визитов EasyWeek
+
+Доменная основа для PR-12 (`repeat_10d` / `comeback_3d`). PR-11 **ничего не
+отправляет** клиентам и не создаёт ни одной MessageJob. Он сохраняет одно число:
+сколько завершённых визитов у клиента, по данным самого EasyWeek.
+
+### 15.1 Что именно сохраняется
+
+Событие `booking-succeeded` несёт корневое поле `visits_total` — JSON-число.
+После того как identity записи доказана заново по БД, это число кладётся в две
+новые nullable-колонки `clients`:
+
+| Колонка | Что это |
+|---|---|
+| `easyweek_visits_total` | последний доказанный снимок `visits_total` |
+| `easyweek_visits_total_updated_at` | момент, когда значение было принято |
+
+У клиентов Altegio обе колонки остаются NULL — это гарантирует CHECK, а не
+соглашение. У Altegio своя живая правда (`count_attended_client_visits` по API),
+и второе хранимое число стало бы молча расходящимся источником истины.
+
+**Это снимок, а не инкремент.** Мы записываем число, которое назвал EasyWeek, и
+никогда не делаем `current + 1` по факту прихода вебхука. Resend, повтор с
+другим payload hash и настоящий второй визит на уровне «пришёл вебхук»
+неразличимы: инкремент разошёлся бы с EasyWeek на первом же Resend, а снимок
+сходится к одному значению при любом количестве повторов.
+
+Счётчик монотонен: большее значение обновляет, равное — идемпотентный no-op без
+обновления timestamp, меньшее не понижает уже сохранённое.
+
+### 15.2 Флаг
+
+`EASYWEEK_VISIT_COUNTER_ENABLED` (default `false`) управляет ТОЛЬКО записью
+счётчика. В runtime его читает единственный сервис
+`altegio-easyweek-inbox-worker`. Общий `altegio-outbox-worker` его не читает:
+счётчику некуда отправлять, поэтому send fence у него отсутствует как класс.
+
+Флаг намеренно **не** подчинён `EASYWEEK_NOTIFICATIONS_ENABLED`. Тот флаг —
+фенс клиентских сообщений; счётчик сообщений не шлёт, он фиксирует уже
+состоявшийся факт. Если бы мастер-флаг его гасил, пауза в рассылке молча
+останавливала бы доменный учёт, а пропущенные снимки восстановить нечем:
+EasyWeek не переотправляет события.
+
+Матрица состояний:
+
+| counter | reviews | Что происходит с `booking-succeeded` |
+|---|---|---|
+| off | off | остаётся `captured`, не claim'ится, **не блокирует** lifecycle своей booking |
+| on | off | обрабатывается, счётчик обновляется, MessageJob не создаётся |
+| off | on | ровно поведение PR-9/PR-10, без изменений |
+| on | on | счётчик, возможная review job и терминальный статус — одна транзакция |
+
+### 15.3 Rollout
+
+**Шаг 1. Деплой кода с выключенным счётчиком.** Команда меняет production: она
+выкатывает новый образ. Поведение при этом не меняется — новый путь выключен,
+колонок ещё нет. Ожидаемый результат: сервисы поднялись, `booking-succeeded`
+по-прежнему обрабатывается ровно так, как до PR-11.
+
+Production `easyweek.env` в git не хранится и из `easyweek.env.example` не
+обновляется, поэтому нового ключа там, скорее всего, **нет вообще**. Отсутствие
+строки и строка `=false` — одно и то же состояние: значение по умолчанию `false`.
+Проверка ниже это и утверждает: счётчик сейчас выключен. Она только читает и
+production не меняет; ожидаемый результат — успешный exit без вывода.
+
+```bash
+cd /opt/altegio_bot
+bash <<'VISIT_COUNTER_OFF_ASSERT'
+set -euo pipefail
+ENV_FILE="${ENV_FILE:-/opt/altegio_bot/easyweek.env}"
+KEY=EASYWEEK_VISIT_COUNTER_ENABLED
+test -f "$ENV_FILE"
+FOUND_RC=0
+FOUND="$(grep -Ec "^${KEY}=" "$ENV_FILE")" || FOUND_RC=$?
+test "$FOUND_RC" -le 1
+test "$FOUND" -le 1
+if [ "$FOUND" = "1" ]; then
+  test "$(grep -E "^${KEY}=" "$ENV_FILE")" = "${KEY}=false"
+fi
+echo "visit counter is off"
+VISIT_COUNTER_OFF_ASSERT
+```
+
+**Шаг 2. Миграция.** Команда меняет production: добавляет две nullable-колонки и
+три CHECK в `clients`. Существующие строки не переписываются — у всех клиентов
+остаётся NULL, backfill не выполняется. Ожидаемый результат: `alembic upgrade
+head` завершается без ошибок, единственный head.
+
+```bash
+cd /opt/altegio_bot
+$COMPOSE run --rm --no-deps altegio-api alembic upgrade head
+```
+
+**Проверка после миграции.** Команда только читает: спрашивает у БД схему.
+Production не меняет. Ожидаемый результат: две колонки, три CHECK, ноль
+заполненных значений.
+
+```bash
+cd /opt/altegio_bot
+$COMPOSE exec -T postgres psql -U altegio -d altegio_bot -c "SELECT count(*) FILTER (WHERE easyweek_visits_total IS NOT NULL) AS filled, count(*) AS clients FROM clients;"
+```
+
+**Шаг 3. Read-only preflight.** Команда только читает: разбирает уже сохранённые
+`booking-succeeded` тем же нормализатором, что и worker, и проверяет, что их
+identity доказуема. Production не меняет, ничего не переотправляет, статусы
+событий не трогает и backfill не делает. Ожидаемый результат: `ready: True`.
+`ready: False` при `candidate_count: 0` означает «доказывать нечего» и зелёным
+светом не является.
+
+```bash
+cd /opt/altegio_bot
+$COMPOSE run --rm --no-deps altegio-easyweek-inbox-worker python -m altegio_bot.scripts.easyweek_visit_counter_preflight
+```
+
+Зелёным считается отчёт, в котором одновременно: `candidate_count > 0`,
+`truncated: false`, `checked_count == candidate_count`, `green_count ==
+candidate_count`, `config_error: null`. Вывод содержит только технические ID,
+provider/company, booleans, агрегированные reason codes и счётчики.
+
+**Шаг 4. Включение флага.** Команда меняет production `easyweek.env`. Ожидаемый
+результат: в файле ровно одна строка ключа и её значение ровно `true`; всё
+остальное — переменные, комментарии, секреты — байт в байт прежнее.
+
+Замена через `sed -i 's/^KEY=false$/KEY=true/'` здесь не годится: при
+отсутствующем ключе она молча не делает ничего, а оператор видит нулевой exit и
+считает, что счётчик включён. Блок ниже обрабатывает все три случая явно:
+
+| Ключа в файле | Что делает блок |
+|---|---|
+| нет | добавляет ровно одну строку `KEY=true` |
+| ровно один | заменяет значение на `true` |
+| больше одного | **STOP** до любого изменения файла |
+
+Контракт записи тот же, что и в §14: `set -euo pipefail`, временный файл рядом
+с целевым на той же файловой системе, `cp -p` переносит owner/mode, допустимые
+коды `grep` разрешены явно (а ошибка чтения останавливает процедуру), `diff`
+доказывает, что все остальные строки сохранены, замена — атомарный `mv`,
+временный файл убирает `trap`. Symlink отвергается. Значения других переменных
+не печатаются.
+
+```bash
+cd /opt/altegio_bot
+bash <<'VISIT_COUNTER_ON'
+set -euo pipefail
+ENV_FILE="${ENV_FILE:-/opt/altegio_bot/easyweek.env}"
+KEY=EASYWEEK_VISIT_COUNTER_ENABLED
+TARGET=true
+test -f "$ENV_FILE"
+test ! -L "$ENV_FILE"
+FOUND_RC=0
+FOUND="$(grep -Ec "^${KEY}=" "$ENV_FILE")" || FOUND_RC=$?
+test "$FOUND_RC" -le 1
+test "$FOUND" -le 1
+ENV_TMP="$(mktemp "${ENV_FILE}.visitcounter.XXXXXX")"
+trap 'rm -f "$ENV_TMP"' EXIT
+cp -p "$ENV_FILE" "$ENV_TMP"
+KEPT_RC=0
+grep -Ev "^${KEY}=" "$ENV_FILE" > "$ENV_TMP" || KEPT_RC=$?
+test "$KEPT_RC" -le 1
+printf '%s=%s\n' "$KEY" "$TARGET" >> "$ENV_TMP"
+test "$(grep -Ec "^${KEY}=" "$ENV_TMP")" = "1"
+test "$(grep -E "^${KEY}=" "$ENV_TMP")" = "${KEY}=${TARGET}"
+diff <(grep -Ev "^${KEY}=" "$ENV_FILE") <(grep -Ev "^${KEY}=" "$ENV_TMP") > /dev/null
+mv -f "$ENV_TMP" "$ENV_FILE"
+trap - EXIT
+test "$(grep -Ec "^${KEY}=" "$ENV_FILE")" = "1"
+test "$(grep -E "^${KEY}=" "$ENV_FILE")" = "${KEY}=${TARGET}"
+echo "visit counter flag now ${TARGET}"
+VISIT_COUNTER_ON
+```
+
+**Шаг 5. Пересоздать ТОЛЬКО EasyWeek inbox worker.** Команда меняет production:
+пересоздаёт один контейнер. Обычный `restart` не перечитывает `env_file`.
+Пересоздавать что-то ещё не нужно и вредно: флаг читает только этот сервис.
+Ожидаемый результат: контейнер поднялся с новым окружением.
+
+```bash
+cd /opt/altegio_bot
+$COMPOSE up -d --force-recreate altegio-easyweek-inbox-worker
+```
+
+**Проверка effective config.** Команда только читает: печатает то, что видит сам
+процесс. Production не меняет. Ожидаемый результат: `visit_counter: True`.
+
+```bash
+cd /opt/altegio_bot
+$COMPOSE exec -T altegio-easyweek-inbox-worker /app/.venv/bin/python -c 'from altegio_bot.settings import settings; print({"processing": settings.easyweek_processing_enabled, "notifications": settings.easyweek_notifications_enabled, "reviews": settings.easyweek_reviews_enabled, "visit_counter": settings.easyweek_visit_counter_enabled})'
+```
+
+### 15.4 Controlled smoke
+
+**Шаг 6. Тестовая booking.** Действие выполняется в EasyWeek оператором, а не
+командой: создать тестовую запись в Durlach и довести её до статуса succeeded.
+Production меняется ровно настолько, насколько его меняет обычная тестовая
+запись. Ожидаемый результат: приходит `booking-succeeded`.
+
+**Проверка счётчика.** Команда только читает и production не меняет. Вывод
+содержит ID, provider/company, значение счётчика и его timestamp — без телефона,
+имени и payload. Ожидаемый результат: одна строка с непустым
+`easyweek_visits_total`.
+
+```bash
+cd /opt/altegio_bot
+$COMPOSE exec -T postgres psql -U altegio -d altegio_bot -c "SELECT id, provider, company_id, easyweek_visits_total, easyweek_visits_total_updated_at FROM clients WHERE provider = 'easyweek' AND easyweek_visits_total IS NOT NULL ORDER BY easyweek_visits_total_updated_at DESC LIMIT 5;"
+```
+
+**Шаг 7. Resend / idempotency smoke.** Действие выполняется в UI EasyWeek:
+нажать **Resend** для того же `booking-succeeded`; в БД появится вторая строка
+события. Команда ниже только читает и production не меняет. Ожидаемый результат:
+значение счётчика и его timestamp **не изменились** — Resend не является вторым
+визитом.
+
+```bash
+cd /opt/altegio_bot
+$COMPOSE exec -T postgres psql -U altegio -d altegio_bot -c "SELECT id, easyweek_visits_total, easyweek_visits_total_updated_at FROM clients WHERE provider = 'easyweek' AND easyweek_visits_total IS NOT NULL ORDER BY easyweek_visits_total_updated_at DESC LIMIT 5;"
+```
+
+**STOP-условия:**
+
+- счётчик вырос после Resend — значит где-то появился инкремент вместо снимка;
+- значение появилось у клиента Altegio;
+- значение уменьшилось;
+- появилась MessageJob, созданная только из-за счётчика;
+- `booking-succeeded` при выключенных consumer'ах перестал пропускать вперёд
+  lifecycle-события своей booking.
+
+### 15.5 Откат
+
+Откат — это выключение флага. Уже доказанные значения в БД **не удаляются**: они
+описывают визиты, которые действительно состоялись, и повторно их получить
+неоткуда. Миграция при откате флага не откатывается.
+
+**Откат, шаг 1.** Команда меняет production `easyweek.env` тем же контрактом,
+что и §15.3 шаг 4, — включая обработку отсутствующего и дублированного ключа.
+Ожидаемый результат: ровно одна строка ключа со значением `false`, остальные
+строки не тронуты.
+
+```bash
+cd /opt/altegio_bot
+bash <<'VISIT_COUNTER_OFF'
+set -euo pipefail
+ENV_FILE="${ENV_FILE:-/opt/altegio_bot/easyweek.env}"
+KEY=EASYWEEK_VISIT_COUNTER_ENABLED
+TARGET=false
+test -f "$ENV_FILE"
+test ! -L "$ENV_FILE"
+FOUND_RC=0
+FOUND="$(grep -Ec "^${KEY}=" "$ENV_FILE")" || FOUND_RC=$?
+test "$FOUND_RC" -le 1
+test "$FOUND" -le 1
+ENV_TMP="$(mktemp "${ENV_FILE}.visitcounter.XXXXXX")"
+trap 'rm -f "$ENV_TMP"' EXIT
+cp -p "$ENV_FILE" "$ENV_TMP"
+KEPT_RC=0
+grep -Ev "^${KEY}=" "$ENV_FILE" > "$ENV_TMP" || KEPT_RC=$?
+test "$KEPT_RC" -le 1
+printf '%s=%s\n' "$KEY" "$TARGET" >> "$ENV_TMP"
+test "$(grep -Ec "^${KEY}=" "$ENV_TMP")" = "1"
+test "$(grep -E "^${KEY}=" "$ENV_TMP")" = "${KEY}=${TARGET}"
+diff <(grep -Ev "^${KEY}=" "$ENV_FILE") <(grep -Ev "^${KEY}=" "$ENV_TMP") > /dev/null
+mv -f "$ENV_TMP" "$ENV_FILE"
+trap - EXIT
+test "$(grep -Ec "^${KEY}=" "$ENV_FILE")" = "1"
+test "$(grep -E "^${KEY}=" "$ENV_FILE")" = "${KEY}=${TARGET}"
+echo "visit counter flag now ${TARGET}"
+VISIT_COUNTER_OFF
+```
+
+**Откат, шаг 2.** Команда меняет production: пересоздаёт один контейнер.
+Ожидаемый результат: worker перестал записывать счётчик, всё остальное работает
+как раньше.
+
+```bash
+cd /opt/altegio_bot
+$COMPOSE up -d --force-recreate altegio-easyweek-inbox-worker
+```
+
+**Откат, проверка.** Команда только читает. Production не меняет. Ожидаемый
+результат: `visit_counter: False`, а ранее записанные значения на месте.
+
+```bash
+cd /opt/altegio_bot
+$COMPOSE exec -T altegio-easyweek-inbox-worker /app/.venv/bin/python -c 'from altegio_bot.settings import settings; print({"visit_counter": settings.easyweek_visit_counter_enabled})'
+```
+
+Схемный откат (`alembic downgrade`) в штатный rollback не входит: он удалил бы
+доказанные значения. Он предусмотрен в миграции и применяется только по
+отдельному решению владельца.

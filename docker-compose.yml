@@ -173,6 +173,12 @@ services:
   # PR-10: EASYWEEK_GOOGLE_REVIEW_LINKS is read here (review planning) and by
   # altegio-outbox-worker (send-time re-proof). `docker compose restart` does
   # NOT re-read env_file — recreate both services after changing it.
+  #
+  # PR-11: EASYWEEK_VISIT_COUNTER_ENABLED is read HERE and nowhere else. The
+  # visit counter has no send fence because it sends nothing — it stores the
+  # `visits_total` snapshot a proven booking-succeeded carries. Recreate ONLY
+  # this service when flipping it; adding it to the outbox worker would imply a
+  # second reader that does not exist.
   altegio-easyweek-inbox-worker:
     build: .
     restart: always

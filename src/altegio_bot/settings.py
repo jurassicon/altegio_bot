@@ -615,6 +615,22 @@ class Settings(BaseSettings):
     easyweek_reviews_enabled: bool = False
     easyweek_review_send_enabled: bool = False
 
+    # --- PR-11: visits_total / completed-visit counter ------------------------
+    # Reads the `visits_total` snapshot from a proven `booking-succeeded` and
+    # stores it on the EasyWeek Client. Read by altegio-easyweek-inbox-worker
+    # and by nothing else.
+    #
+    # Deliberately NOT under `easyweek_notifications_enabled`. That flag is a
+    # customer-message fence, and this counter sends nothing: it records a fact
+    # about a visit that already happened. Coupling the two would mean an
+    # operator who pauses outbound messaging also silently stops the domain
+    # bookkeeping PR-12 (`repeat_10d` / `comeback_3d`) will depend on, and the
+    # missed snapshots could never be recovered — EasyWeek does not re-deliver.
+    #
+    # Turning it off stops future writes and keeps every value already proven:
+    # the rollback is the flag, never a DELETE.
+    easyweek_visit_counter_enabled: bool = False
+
     # PR-7.1: exact EasyWeek service-category allowlist as a JSON array of
     # strings. Parsing is deliberately deferred to the shared eligibility
     # helper so malformed input suppresses EasyWeek jobs without preventing the

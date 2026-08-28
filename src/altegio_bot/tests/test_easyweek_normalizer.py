@@ -27,6 +27,7 @@ from altegio_bot.easyweek_normalizer import (
     map_event_hint,
     normalize_booking_hash_id,
     normalize_event,
+    normalize_succeeded_visit_event,
     parse_iso_utc,
 )
 from altegio_bot.easyweek_service_category import (
@@ -1153,3 +1154,212 @@ def test_the_normalizer_agrees_with_the_shared_parser() -> None:
         booking = _normalize(payload)
         assert booking is not None
         assert booking.booking_uuid == canonical_booking_uuid(payload)
+
+
+# ===========================================================================
+# PR-11 — visits_total: a JSON integer, or nothing
+# ===========================================================================
+#
+# The counter reads exactly two extra fields off a proven `booking-succeeded`,
+# and both are validated far more strictly than the lifecycle path validates its
+# own numbers. The reason is what the value becomes: a number written onto a
+# customer's row and read later by PR-12 to decide whether to message them.
+#
+# `3.0`, `"3"` and `True` are all "3" to a permissive parser. Each of them is
+# also a signal that the producer changed the field's type or encoding — the
+# exact class of silent contract drift that cost PR-9 its entire review path
+# (plan §18), where a documented `review_url` turned out never to be sent.
+
+
+def _succeeded_visit(payload, *, event_hint="booking-succeeded", truncated=False, registry=None):
+    return normalize_succeeded_visit_event(
+        event_hint=event_hint,
+        payload=payload,
+        body_truncated=truncated,
+        location_registry=registry if registry is not None else {TEST_LOCATION_ID: _location()},
+    )
+
+
+def _succeeded_payload(**overrides):
+    payload = booking_created()
+    payload["booking_status"] = "Succeeded appointment"
+    payload.update(overrides)
+    return payload
+
+
+def test_a_production_shaped_succeeded_delivery_yields_the_counter_inputs() -> None:
+    """The captured fixture already carries `visits_total` as a root JSON number."""
+    visit = _succeeded_visit(_succeeded_payload(visits_total=4))
+
+    assert visit.visits_total == 4
+    assert visit.customer_id == TEST_CUSTOMER_ID
+    assert visit.booking_id == TEST_BOOKING_ID
+    assert visit.company_id == TEST_LOCATION_ID
+    assert str(visit.booking_uuid) == TEST_BOOKING_UUID
+
+
+def test_the_shipped_fixture_visits_total_is_a_root_level_json_number() -> None:
+    payload = _succeeded_payload()
+
+    assert "visits_total" in payload, "root-level, not nested"
+    assert type(payload["visits_total"]) is int
+    assert _succeeded_visit(payload).visits_total == payload["visits_total"]
+
+
+@pytest.mark.parametrize(
+    ("visits_total", "expected"),
+    [
+        pytest.param(1, None, id="one_visit_is_the_minimum"),
+        pytest.param(2147483647, None, id="largest_integer_that_fits"),
+    ],
+)
+def test_a_visits_total_inside_the_column_range_is_accepted(visits_total, expected) -> None:
+    del expected
+    assert _succeeded_visit(_succeeded_payload(visits_total=visits_total)).visits_total == visits_total
+
+
+def test_a_missing_visits_total_is_refused() -> None:
+    payload = _succeeded_payload()
+    payload.pop("visits_total")
+
+    with pytest.raises(NormalizationError) as exc:
+        _succeeded_visit(payload)
+    assert exc.value.code == NormalizationError.MISSING_VISITS_TOTAL
+
+
+def test_an_explicit_null_visits_total_is_refused() -> None:
+    with pytest.raises(NormalizationError) as exc:
+        _succeeded_visit(_succeeded_payload(visits_total=None))
+    assert exc.value.code == NormalizationError.MISSING_VISITS_TOTAL
+
+
+@pytest.mark.parametrize(
+    "visits_total",
+    [
+        pytest.param(True, id="bool_true"),
+        pytest.param(False, id="bool_false"),
+        pytest.param(3.0, id="integral_float"),
+        pytest.param(2.5, id="fractional_float"),
+        pytest.param("3", id="numeric_string"),
+        pytest.param("", id="empty_string"),
+        pytest.param([3], id="list"),
+        pytest.param({"count": 3}, id="object"),
+    ],
+)
+def test_a_visits_total_that_is_not_a_json_integer_is_refused(visits_total) -> None:
+    """No coercion. A changed type is a changed contract, not a value to salvage."""
+    with pytest.raises(NormalizationError) as exc:
+        _succeeded_visit(_succeeded_payload(visits_total=visits_total))
+    assert exc.value.code == NormalizationError.INVALID_VISITS_TOTAL
+
+
+@pytest.mark.parametrize(
+    "visits_total",
+    [
+        pytest.param(0, id="zero_contradicts_the_trigger"),
+        pytest.param(-1, id="negative"),
+        pytest.param(2147483648, id="overflows_the_integer_column"),
+        pytest.param(10**18, id="far_overflow"),
+    ],
+)
+def test_a_visits_total_outside_the_supported_range_is_refused(visits_total) -> None:
+    with pytest.raises(NormalizationError) as exc:
+        _succeeded_visit(_succeeded_payload(visits_total=visits_total))
+    assert exc.value.code == NormalizationError.VISITS_TOTAL_OUT_OF_RANGE
+
+
+@pytest.mark.parametrize(
+    ("customer_id", "expected"),
+    [
+        pytest.param(None, NormalizationError.MISSING_CUSTOMER_ID, id="missing"),
+        pytest.param("7300002", NormalizationError.MISSING_CUSTOMER_ID, id="numeric_string"),
+        pytest.param(True, NormalizationError.MISSING_CUSTOMER_ID, id="bool"),
+        # The normalizer's established split: `code` means "not a number at
+        # all", `range_code` means "a number that does not fit". Every other id
+        # in this module reports out-of-range the same way.
+        pytest.param(0, NormalizationError.INVALID_NUMERIC_RANGE, id="zero"),
+        pytest.param(-5, NormalizationError.INVALID_NUMERIC_RANGE, id="negative"),
+    ],
+)
+def test_a_customer_id_that_cannot_address_a_client_is_refused(customer_id, expected) -> None:
+    """Without a provable customer there is no row to write, and guessing one by
+    phone or name is exactly the cross-provider lookup this integration bans."""
+    with pytest.raises(NormalizationError) as exc:
+        _succeeded_visit(_succeeded_payload(customer_id=customer_id))
+    assert exc.value.code == expected
+
+
+def test_the_shared_succeeded_contract_still_runs_first() -> None:
+    """Identity and isolation are proved before `visits_total` is even looked at."""
+    for payload, hint, truncated, registry, expected in (
+        (_succeeded_payload(), "booking-created", False, None, NormalizationError.INVALID_EVENT_HINT),
+        (_succeeded_payload(), "booking-succeeded", True, None, NormalizationError.TRUNCATED_PAYLOAD),
+        ({}, "booking-succeeded", False, None, NormalizationError.INVALID_PAYLOAD),
+        ("not-an-object", "booking-succeeded", False, None, NormalizationError.INVALID_PAYLOAD),
+        (
+            _succeeded_payload(location_id=FOREIGN_LOCATION_ID),
+            "booking-succeeded",
+            False,
+            None,
+            NormalizationError.FOREIGN_LOCATION,
+        ),
+        (
+            _succeeded_payload(location_uuid="99999999-9999-4999-8999-999999999999"),
+            "booking-succeeded",
+            False,
+            None,
+            NormalizationError.LOCATION_IDENTITY_MISMATCH,
+        ),
+        (
+            _succeeded_payload(uid="not-a-uuid"),
+            "booking-succeeded",
+            False,
+            None,
+            NormalizationError.INVALID_BOOKING_UUID,
+        ),
+        (_succeeded_payload(uid=None), "booking-succeeded", False, None, NormalizationError.MISSING_BOOKING_UUID),
+        (_succeeded_payload(id=None), "booking-succeeded", False, None, NormalizationError.MISSING_BOOKING_ID),
+        (_succeeded_payload(id=0), "booking-succeeded", False, None, NormalizationError.INVALID_NUMERIC_RANGE),
+    ):
+        with pytest.raises(NormalizationError) as exc:
+            _succeeded_visit(payload, event_hint=hint, truncated=truncated, registry=registry)
+        assert exc.value.code == expected, (hint, expected)
+
+
+def test_a_bad_visits_total_never_breaks_the_review_contract() -> None:
+    """PR-9/PR-10 must keep working on a delivery the counter cannot use.
+
+    The two paths read the same event through different functions on purpose:
+    folding `visits_total` into the shared succeeded contract would turn a
+    counter problem into a silently lost review.
+    """
+    from altegio_bot.easyweek_normalizer import normalize_succeeded_event
+
+    payload = _succeeded_payload(visits_total="3")
+
+    succeeded = normalize_succeeded_event(
+        event_hint="booking-succeeded",
+        payload=payload,
+        body_truncated=False,
+        location_registry={TEST_LOCATION_ID: _location()},
+    )
+    assert str(succeeded.booking_uuid) == TEST_BOOKING_UUID
+
+    with pytest.raises(NormalizationError):
+        _succeeded_visit(payload)
+
+
+def test_every_new_reason_code_is_registered_and_pii_free() -> None:
+    codes = (
+        NormalizationError.MISSING_CUSTOMER_ID,
+        NormalizationError.MISSING_VISITS_TOTAL,
+        NormalizationError.INVALID_VISITS_TOTAL,
+        NormalizationError.VISITS_TOTAL_OUT_OF_RANGE,
+    )
+    for code in codes:
+        assert code in NormalizationError.ALL_CODES
+        # A code is an identifier, so it can never smuggle a payload value into
+        # a log line or the `error_code` column.
+        assert code == code.lower()
+        assert " " not in code
+        assert str(NormalizationError(code)) == code

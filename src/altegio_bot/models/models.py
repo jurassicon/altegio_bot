@@ -126,6 +126,15 @@ class EasyWeekEvent(Base):
     """
 
     __tablename__ = "easyweek_events"
+    __table_args__ = (
+        # PR-11. Exactly the recovery scan's predicate, so the partial index the
+        # migration creates also exists in the schema tests build from the model.
+        Index(
+            "ix_easyweek_events_review_deferred",
+            "review_deferred_at",
+            postgresql_where=text("review_deferred_at IS NOT NULL"),
+        ),
+    )
 
     id: Mapped[int] = mapped_column(
         BigInteger,
@@ -155,6 +164,37 @@ class EasyWeekEvent(Base):
     event_hint: Mapped[str | None] = mapped_column(
         String(32),
         index=True,
+        nullable=True,
+    )
+
+    # PR-11. Узкое durable continuation-state ТОЛЬКО для потребителей
+    # `booking-succeeded`: момент, когда визит был доказан и счётчик записан, но
+    # отзыв рассмотреть не удалось, потому что мастер-фенс уведомлений был
+    # закрыт.
+    #
+    # Зачем отдельное поле, а не `captured`: visit counter должен быть записан и
+    # закоммичен независимо от фенса уведомлений, а откат транзакции ради
+    # удержания события уничтожил бы этот счётчик. Оставить строку нетерминальной
+    # тоже нельзя — она стала бы predecessor и заблокировала бы последующие
+    # lifecycle-события СВОЕЙ booking, чего PR-11 требует избежать.
+    #
+    # Поэтому строка становится `processed` (очередь свободна, hot loop
+    # отсутствует), но несёт отметку «отзыв ещё должен быть рассмотрен».
+    # `recover_deferred_reviews` снимает её, когда фенс открывается.
+    # NULL — обязательства нет: либо отзыв уже рассмотрен, либо оператор их не
+    # включал, либо это не `booking-succeeded`.
+    #
+    # Значение — это момент, **начиная с которого** обязательство можно
+    # рассматривать, а не только момент его появления. Первая отметка ставится
+    # «сейчас», то есть сразу eligible; если проход не смог принять решение
+    # (невалидная карта ссылок, сломанный аллоулист, неожиданная транзиентная
+    # ошибка), момент сдвигается вперёд. Выборка recovery это учитывает и
+    # сортирует по нему, поэтому неразрешимая строка не занимает слот
+    # ограниченного batch на каждом проходе и не морит голодом корректные
+    # строки за собой. Отдельная колонка под retry не заводится: у обязательства
+    # ровно одно расписание, и второе поле могло бы с ним разойтись.
+    review_deferred_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
         nullable=True,
     )
 
@@ -307,6 +347,28 @@ class Client(Base):
         ),
         Index("ix_clients_provider_company_phone", "provider", "company_id", "phone_e164"),
         Index("ix_clients_wa_opted_out_at", "wa_opted_out", "wa_opted_out_at"),
+        # PR-11. The EasyWeek visit counter is provider-scoped by construction,
+        # not by convention: an Altegio row must never carry one. Altegio's own
+        # count is answered live by `count_attended_client_visits`, so a stored
+        # number there would be a second, silently diverging source of truth.
+        CheckConstraint(
+            "easyweek_visits_total IS NULL OR provider = 'easyweek'",
+            name="ck_clients_easyweek_visits_total_provider",
+        ),
+        # `booking-succeeded` proves a finished visit, so the snapshot it
+        # carries is at least 1. Zero or negative is a malformed delivery, and
+        # the database refuses it even if a future caller forgets to.
+        CheckConstraint(
+            "easyweek_visits_total IS NULL OR easyweek_visits_total >= 1",
+            name="ck_clients_easyweek_visits_total_positive",
+        ),
+        # The value and the moment it was accepted are one fact. A timestamp
+        # without a count says a visit was recorded and lost the number; a count
+        # without a timestamp cannot be audited against the delivery that set it.
+        CheckConstraint(
+            "(easyweek_visits_total IS NULL) = (easyweek_visits_total_updated_at IS NULL)",
+            name="ck_clients_easyweek_visits_total_paired",
+        ),
     )
 
     id: Mapped[int] = mapped_column(
@@ -344,6 +406,22 @@ class Client(Base):
     )
     wa_opt_out_reason: Mapped[str | None] = mapped_column(
         Text,
+        nullable=True,
+    )
+
+    # PR-11: the last PROVEN `visits_total` snapshot from a `booking-succeeded`
+    # delivery, and the moment that value was accepted.
+    #
+    # A snapshot, never a tally. EasyWeek states the total; we never compute
+    # `current + 1` from the fact that a webhook arrived, because a Resend, a
+    # replay with a different payload hash and a genuine second visit are
+    # indistinguishable at that level. Storing the number EasyWeek states makes
+    # all three converge on the same value instead of drifting upwards.
+    #
+    # NULL on every Altegio row, enforced by a CHECK above.
+    easyweek_visits_total: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    easyweek_visits_total_updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
         nullable=True,
     )
 

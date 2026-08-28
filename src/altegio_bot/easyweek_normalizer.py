@@ -169,6 +169,13 @@ class NormalizationError(Exception):
     # INVALID_PAYLOAD on purpose: each individual field is well-formed, and the
     # operator's next step is to look at the delivery, not at our parser.
     PRICE_FIELDS_CONFLICT: Final = "price_fields_conflict"
+    # PR-11: the visit counter's own inputs. Separate codes from the lifecycle
+    # ones because the operator's next step differs — these say "this succeeded
+    # delivery cannot move the counter", not "this delivery is unusable".
+    MISSING_CUSTOMER_ID: Final = "missing_customer_id"
+    MISSING_VISITS_TOTAL: Final = "missing_visits_total"
+    INVALID_VISITS_TOTAL: Final = "invalid_visits_total"
+    VISITS_TOTAL_OUT_OF_RANGE: Final = "visits_total_out_of_range"
 
     ALL_CODES: Final = frozenset(
         {
@@ -186,6 +193,10 @@ class NormalizationError(Exception):
             IDENTITY_CONFLICT,
             INVALID_NUMERIC_RANGE,
             PRICE_FIELDS_CONFLICT,
+            MISSING_CUSTOMER_ID,
+            MISSING_VISITS_TOTAL,
+            INVALID_VISITS_TOTAL,
+            VISITS_TOTAL_OUT_OF_RANGE,
         }
     )
 
@@ -690,6 +701,113 @@ def normalize_succeeded_event(
         booking_id=booking_id,
         company_id=location_id,
         review_url=payload.get("review_url"),
+    )
+
+
+@dataclass(frozen=True)
+class SucceededVisit:
+    """PR-11: a proven ``booking-succeeded`` plus the two fields a counter needs.
+
+    Built on top of :class:`SucceededBooking` rather than replacing it. The
+    review path (PR-9/PR-10) must keep working on deliveries that carry no
+    usable ``visits_total`` at all, so demanding one inside
+    :func:`normalize_succeeded_event` would turn a counter problem into a lost
+    review.
+    """
+
+    booking_uuid: uuid.UUID
+    booking_id: int
+    company_id: int
+    customer_id: int
+    visits_total: int
+
+
+def _require_strict_int(value: Any, *, code: str) -> int:
+    """A JSON integer and nothing else — not a bool, float, or numeric string.
+
+    Stricter than :func:`_as_exact_int`, which accepts ``3.0`` because a price
+    or a duration may legitimately arrive as an integral float. A visit count
+    may not: ``3.0`` means the producer changed the field's type, ``"3"`` means
+    it changed its encoding, and ``True`` means it is not a count at all.
+    Coercing any of them would hide a contract change behind a plausible number,
+    and this value is written to a client's row.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise NormalizationError(code)
+    return value
+
+
+def normalize_succeeded_customer_id(payload: Any) -> int:
+    """The external customer id one ``booking-succeeded`` names. Strict, or refuses.
+
+    Split out from :func:`normalize_succeeded_visit_event` because the deferred
+    review recovery needs this ONE field and must not depend on ``visits_total``:
+    a delivery whose counter input is unusable can still owe a perfectly valid
+    review, and coupling the two would refuse it for an unrelated reason.
+
+    The payload of a captured delivery is never rewritten, which is the whole
+    point of asking it rather than the Record: a later ``booking-updated`` may
+    move the booking to a different customer, and the review earned by THIS
+    delivery belongs to the customer THIS delivery named.
+    """
+    return _require_positive_id(
+        payload.get("customer_id") if isinstance(payload, dict) else None,
+        code=NormalizationError.MISSING_CUSTOMER_ID,
+    )
+
+
+def normalize_succeeded_visit_event(
+    *,
+    event_hint: str | None,
+    payload: Any,
+    body_truncated: bool,
+    location_registry: Mapping[int, EasyWeekLocation],
+) -> SucceededVisit:
+    """Validate one ``booking-succeeded`` as evidence for the visit counter.
+
+    Runs the full succeeded contract first — trigger, truncation, payload shape,
+    the ``location_id`` + ``location_uuid`` pair as ONE registry identity, the
+    canonical ``uid`` and the numeric booking id — then adds the two fields the
+    counter needs and nothing else.
+
+    Everything else in the payload is deliberately ignored. A succeeded delivery
+    proves a visit finished; it is not a newer version of the booking, so its
+    name, phone, price, services, times and localised status must never reach a
+    domain row.
+    """
+    succeeded = normalize_succeeded_event(
+        event_hint=event_hint,
+        payload=payload,
+        body_truncated=body_truncated,
+        location_registry=location_registry,
+    )
+
+    # The external customer id is matched against `Client.altegio_client_id` by
+    # the caller. Without it there is no provable client, and finding one by
+    # phone or name would be exactly the cross-provider guess this integration
+    # forbids.
+    customer_id = _require_positive_id(
+        payload.get("customer_id"),
+        code=NormalizationError.MISSING_CUSTOMER_ID,
+    )
+
+    if "visits_total" not in payload or payload.get("visits_total") is None:
+        raise NormalizationError(NormalizationError.MISSING_VISITS_TOTAL)
+    visits_total = _require_strict_int(
+        payload.get("visits_total"),
+        code=NormalizationError.INVALID_VISITS_TOTAL,
+    )
+    # A finished visit means the customer has at least this one. Zero or
+    # negative contradicts the trigger that delivered it.
+    if visits_total < 1 or visits_total > PG_INT_MAX:
+        raise NormalizationError(NormalizationError.VISITS_TOTAL_OUT_OF_RANGE)
+
+    return SucceededVisit(
+        booking_uuid=succeeded.booking_uuid,
+        booking_id=succeeded.booking_id,
+        company_id=succeeded.company_id,
+        customer_id=customer_id,
+        visits_total=visits_total,
     )
 
 

@@ -43,6 +43,7 @@ import asyncio
 import logging
 import math
 import signal
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -62,7 +63,9 @@ from ..easyweek_normalizer import (
     canonical_booking_uuid,
     easyweek_job_dedupe_key,
     normalize_event,
+    normalize_succeeded_customer_id,
     normalize_succeeded_event,
+    normalize_succeeded_visit_event,
 )
 from ..easyweek_policy import (
     EASYWEEK_LIFECYCLE_JOB_TYPES,
@@ -208,6 +211,52 @@ def review_planning_enabled() -> bool:
     So the claim, the predecessor subquery and the planner all ask this.
     """
     return bool(settings.easyweek_notifications_enabled) and bool(settings.easyweek_reviews_enabled)
+
+
+def visit_counter_enabled() -> bool:
+    """PR-11's own gate — deliberately NOT under the notifications master switch.
+
+    ``easyweek_notifications_enabled`` fences customer messages. The visit
+    counter sends nothing: it records that a visit EasyWeek already confirmed
+    happened. Putting it behind that switch would mean an operator pausing
+    outbound messaging also stops the domain bookkeeping PR-12 will read, and
+    the missed snapshots are unrecoverable — EasyWeek does not re-deliver, and
+    `current + 1` is not a legitimate way to reconstruct them.
+    """
+    return bool(settings.easyweek_visit_counter_enabled)
+
+
+def review_obligation_deferred() -> bool:
+    """Does a `booking-succeeded` owe a review that cannot be considered now?
+
+    True in exactly one state: the operator has turned EasyWeek reviews ON, but
+    the master notification fence is shut. The review is owed and must survive;
+    it simply cannot be planned yet.
+
+    Reviews switched OFF is NOT this state. That is a decision, not a pause: the
+    operator has said these visits earn no review, and inventing an obligation
+    from it would queue messages nobody asked for the moment the fence opens.
+    """
+    return bool(settings.easyweek_reviews_enabled) and not review_planning_enabled()
+
+
+def succeeded_consumer_enabled() -> bool:
+    """Is ANY consumer of `booking-succeeded` switched on?
+
+    One effective contract for the claim, the predecessor subquery and the
+    processing branch. Two failures it exists to prevent:
+
+    * a disabled consumer must not hold the queue — with everything off the row
+      is never claimed and never counts as a predecessor, so the other events of
+      that booking keep flowing;
+    * an event must never be terminalized without at least one enabled consumer
+      having run — that would silently destroy the only evidence a visit
+      finished.
+
+    Asking two separate questions in the claim and the branch is exactly how the
+    second failure happens, so both ask this one.
+    """
+    return review_planning_enabled() or visit_counter_enabled()
 
 
 # Statuses that are NOT terminal: a row in one of these still owes the domain
@@ -378,7 +427,7 @@ async def claim_next_event(session: AsyncSession) -> EasyWeekEvent | None:
     # the same booking and stall lifecycle processing indefinitely — a review
     # feature nobody switched on would quietly stop confirmations. The deferral
     # is therefore scoped to this one trigger on both sides.
-    reviews_enabled = review_planning_enabled()
+    succeeded_consumers = succeeded_consumer_enabled()
 
     predecessor = aliased(EasyWeekEvent)
     earlier_pending_stmt = (
@@ -389,7 +438,7 @@ async def claim_next_event(session: AsyncSession) -> EasyWeekEvent | None:
         # Strictly EARLIER in capture order; ties break on id.
         .where(tuple_(predecessor.received_at, predecessor.id) < tuple_(EasyWeekEvent.received_at, EasyWeekEvent.id))
     )
-    if not reviews_enabled:
+    if not succeeded_consumers:
         earlier_pending_stmt = earlier_pending_stmt.where(predecessor.event_hint != SUCCEEDED_EVENT_HINT)
     earlier_pending = earlier_pending_stmt.exists()
 
@@ -413,7 +462,7 @@ async def claim_next_event(session: AsyncSession) -> EasyWeekEvent | None:
         .limit(1)
         .with_for_update(skip_locked=True, of=EasyWeekEvent)
     )
-    if not reviews_enabled:
+    if not succeeded_consumers:
         stmt = stmt.where(EasyWeekEvent.event_hint != SUCCEEDED_EVENT_HINT)
     event = (await session.execute(stmt)).scalars().first()
     if event is None:
@@ -847,11 +896,169 @@ async def plan_lifecycle_job(
     await session.execute(stmt)
 
 
+async def record_visit_counter(
+    session: AsyncSession,
+    *,
+    event: EasyWeekEvent,
+    registry: Any,
+) -> None:
+    """PR-11: store the ``visits_total`` snapshot a proven succeeded delivery carries.
+
+    Runs inside the caller's transaction, so the counter and the event's terminal
+    status commit together or not at all.
+
+    A SNAPSHOT, never an increment. EasyWeek states the customer's total; we
+    write the number it states. ``current + 1`` would be wrong on the very first
+    Resend, and a Resend, a replay with a different payload hash and a genuine
+    second visit are indistinguishable at the "a webhook arrived" level. Storing
+    the stated total makes all three converge instead of drifting upward.
+
+    Every identity is re-derived from the database. A failed proof is a silent
+    no-op with a stable reason code, not an error: a succeeded delivery whose
+    counter we cannot place is still a perfectly valid succeeded delivery, and
+    failing the event would also destroy the review it might owe.
+    """
+    if not visit_counter_enabled():
+        return
+
+    try:
+        visit = normalize_succeeded_visit_event(
+            event_hint=event.event_hint,
+            payload=event.payload,
+            body_truncated=bool(event.body_truncated),
+            location_registry=registry.locations if registry.ready else {},
+        )
+    except NormalizationError as exc:
+        # The delivery is a valid succeeded event but cannot move a counter:
+        # no usable `visits_total`, no `customer_id`, or an identity this
+        # deployment does not own. The code is a fixed identifier, never a
+        # payload value.
+        logger.info(
+            "easyweek visit counter skipped event=%s reason=%s",
+            event.id,
+            exc.code,
+        )
+        return
+
+    record = (
+        (
+            await session.execute(
+                select(Record)
+                .where(Record.provider == PROVIDER)
+                .where(Record.easyweek_booking_uuid == visit.booking_uuid)
+                .with_for_update()
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if record is None:
+        logger.info(
+            "easyweek visit counter skipped event=%s booking_uuid=%s reason=no_record",
+            event.id,
+            visit.booking_uuid,
+        )
+        return
+    if record.company_id != visit.company_id:
+        # The booking UUID resolves to a record in another branch. Writing a
+        # count here would attribute one salon's visit to another's client.
+        logger.warning(
+            "easyweek visit counter refused event=%s record_id=%s reason=company_mismatch",
+            event.id,
+            record.id,
+        )
+        return
+    if record.altegio_record_id is not None and record.altegio_record_id != visit.booking_id:
+        logger.warning(
+            "easyweek visit counter refused event=%s record_id=%s reason=booking_id_mismatch",
+            event.id,
+            record.id,
+        )
+        return
+    if record.client_id is None:
+        logger.info(
+            "easyweek visit counter skipped event=%s record_id=%s reason=no_client",
+            event.id,
+            record.id,
+        )
+        return
+
+    # Provider AND company are part of the lookup, not checked afterwards: the
+    # pair is the identity, and a numeric id alone is shared across providers.
+    # The row lock is what makes two concurrent succeeded deliveries for the
+    # same customer serialise instead of losing one another's update.
+    client = (
+        (
+            await session.execute(
+                select(Client)
+                .where(Client.id == record.client_id)
+                .where(Client.provider == PROVIDER)
+                .where(Client.company_id == record.company_id)
+                .with_for_update()
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if client is None:
+        logger.info(
+            "easyweek visit counter skipped event=%s record_id=%s reason=no_client",
+            event.id,
+            record.id,
+        )
+        return
+    if int(client.altegio_client_id) != visit.customer_id:
+        # The Record points at a client the payload does not name. Never
+        # resolved by phone, name or a bare customer id — that is how one
+        # person's visit count lands on another person's row.
+        logger.warning(
+            "easyweek visit counter refused event=%s record_id=%s client_id=%s reason=client_mismatch",
+            event.id,
+            record.id,
+            client.id,
+        )
+        return
+
+    current = client.easyweek_visits_total
+    if current is not None and visit.visits_total < current:
+        # An older snapshot arriving late — a delayed delivery, a Resend of an
+        # earlier visit, or events processed out of order. The counter only ever
+        # moves forward: going back would make PR-12 re-send a customer a
+        # message they already had.
+        logger.info(
+            "easyweek visit counter stale event=%s client_id=%s reason=stale_snapshot",
+            event.id,
+            client.id,
+        )
+        return
+    if current == visit.visits_total:
+        # Idempotent no-op. The timestamp is deliberately NOT touched: it records
+        # when the VALUE last changed, so a Resend must not make an old count
+        # look freshly proven.
+        logger.info(
+            "easyweek visit counter unchanged event=%s client_id=%s",
+            event.id,
+            client.id,
+        )
+        return
+
+    client.easyweek_visits_total = visit.visits_total
+    client.easyweek_visits_total_updated_at = utcnow()
+    logger.info(
+        "easyweek visit counter accepted event=%s record_id=%s client_id=%s company_id=%s",
+        event.id,
+        record.id,
+        client.id,
+        record.company_id,
+    )
+
+
 async def plan_review_job(
     session: AsyncSession,
     *,
     event: EasyWeekEvent,
     registry: Any,
+    expected_customer_id: int | None = None,
 ) -> None:
     """PR-9: earn at most one ``review_3d`` from a proven succeeded delivery.
 
@@ -868,6 +1075,15 @@ async def plan_review_job(
     Deliberately NOT ``plan_jobs_for_record_event``: that planner gates review on
     a live Altegio API visit count and renders from an Altegio-keyed Google Maps
     link. EasyWeek has neither, and ``visits_total`` is the next phase.
+
+    ``expected_customer_id`` is the external customer the ORIGINAL delivery named.
+    It is passed only by the deferred-review recovery (PR-11) and defaults to
+    None, leaving the immediate PR-9/PR-10 path byte-for-byte unchanged: there
+    the succeeded event is planned in the same claim that read it, and the
+    predecessor rule guarantees no later delivery of the same booking has run in
+    between. Recovery has no such guarantee — an arbitrary amount of time and any
+    number of ``booking-updated`` deliveries may have passed — so it must prove
+    the Record still points at the same person.
     """
     if not review_planning_enabled():
         # Same gate the claim used, so a succeeded event is never claimed by one
@@ -935,6 +1151,18 @@ async def plan_review_job(
         )
     if client is None:
         logger.info("easyweek review skipped event=%s record_id=%s reason=no_client", event.id, record.id)
+        return
+    if expected_customer_id is not None and int(client.altegio_client_id) != expected_customer_id:
+        # The booking was reassigned after this delivery was captured. The review
+        # belongs to the customer who actually had the visit, and sending it to
+        # whoever holds the booking now is a cross-client message — the one thing
+        # this planner exists to make impossible.
+        logger.warning(
+            "easyweek review refused event=%s record_id=%s client_id=%s reason=client_reassigned",
+            event.id,
+            record.id,
+            client.id,
+        )
         return
     if bool(getattr(client, "wa_opted_out", False)):
         # Marketing, and this customer said no. Nothing else needs checking.
@@ -1235,9 +1463,35 @@ async def process_claimed_event(session: AsyncSession, event: EasyWeekEvent) -> 
     if booking is None:
         # booking-succeeded. Terminal for the lifecycle — it never rewrites the
         # name, phone, price, service, time or client link the lifecycle events
-        # proved — but PR-9 reads it as evidence that a visit finished, and may
-        # earn exactly one review request from it.
+        # proved — but two consumers read it as evidence that a visit finished:
+        # PR-9/PR-10 may earn exactly one review request from it, and PR-11
+        # stores the `visits_total` snapshot it carries.
+        if not succeeded_consumer_enabled():
+            # The claim gate said yes and the flags changed underneath us.
+            # Terminalizing now would destroy the only evidence this visit
+            # happened, so hand the row back through the shared configuration
+            # deferral instead: status stays `captured`, a short retry is set,
+            # and `processing_attempts` is not charged for a decision nobody
+            # made. Its own booking waits; every other booking keeps flowing.
+            raise RecoverableCategoryConfigurationError("succeeded_consumers_disabled")
+        await record_visit_counter(session, event=event, registry=registry)
         await plan_review_job(session, event=event, registry=registry)
+        if review_obligation_deferred():
+            # The counter is committed and the queue must not be held, but the
+            # review this visit earns has not been considered yet. Marking the
+            # row `processed` and stopping there would destroy it: a `processed`
+            # row is never claimed again, so opening the fence later could not
+            # recover it.
+            #
+            # Holding the row `captured` instead is not an option either — the
+            # counter write would have to roll back with it, and the row would
+            # become a predecessor blocking its own booking's later lifecycle
+            # events. So the row terminalizes AND carries the obligation.
+            event.review_deferred_at = utcnow()
+            logger.info(
+                "easyweek event=%s review deferred; notifications fence closed",
+                event_id,
+            )
         mark_processed(event)
         logger.info("easyweek event=%s hint=%s succeeded processed", event_id, event_hint)
         return
@@ -1402,6 +1656,164 @@ async def defer_for_configuration(event_id: int, reason: str) -> None:
             )
 
 
+# How often the deferred-review recovery scan runs, and how many rows it takes.
+# Flat and generous on purpose: the trigger is a person opening the notification
+# fence, not a hot path. Scanning every poll would read the same rows once a
+# second for nothing while the fence stays shut.
+REVIEW_RECOVERY_INTERVAL_SEC = 60.0
+REVIEW_RECOVERY_BATCH = 50
+# How long an obligation that could NOT be decided steps aside for. Flat, like
+# the configuration deferral it mirrors: a broken allowlist or review-link map is
+# fixed by a person, and the only job of this delay is to stop one undecidable
+# row occupying a batch slot on every single pass.
+REVIEW_RECOVERY_RETRY_SEC = 300.0
+
+
+async def _discharge_deferred_review(event_id: int, *, reason: str) -> None:
+    """Clear one obligation for good, in its own short transaction.
+
+    Used when the delivery can never earn a review: its payload cannot be
+    normalised, or it does not name a provable customer. Leaving the marker would
+    make the row a permanent candidate that re-fails on every pass and, because
+    the batch is bounded, keeps newer rows behind it forever.
+    """
+    async with SessionLocal() as session:
+        async with session.begin():
+            event = (
+                await session.execute(select(EasyWeekEvent).where(EasyWeekEvent.id == event_id).with_for_update())
+            ).scalar_one_or_none()
+            if event is not None:
+                event.review_deferred_at = None
+    logger.info("easyweek deferred review discharged event=%s reason=%s", event_id, reason)
+
+
+async def _postpone_deferred_review(event_id: int, *, reason: str) -> None:
+    """Keep one obligation, but move it to the back of the queue.
+
+    The row is still owed a review — the outcome was "cannot decide yet", not
+    "no". Pushing its eligibility moment forward is what makes the queue fair:
+    without it the same undecidable rows fill every bounded batch and a correct
+    row behind them is never reached.
+    """
+    async with SessionLocal() as session:
+        async with session.begin():
+            event = (
+                await session.execute(select(EasyWeekEvent).where(EasyWeekEvent.id == event_id).with_for_update())
+            ).scalar_one_or_none()
+            if event is not None and event.review_deferred_at is not None:
+                event.review_deferred_at = utcnow() + timedelta(seconds=REVIEW_RECOVERY_RETRY_SEC)
+    logger.info("easyweek deferred review postponed event=%s reason=%s", event_id, reason)
+
+
+async def recover_deferred_reviews(*, limit: int | None = None) -> int:
+    """Reconsider the reviews that were owed while the fence was shut.
+
+    Returns how many obligations were DECIDED — planned, or refused for a reason
+    that will not change. Rows that were merely postponed are not counted.
+
+    Narrow by construction: it reads ONLY `booking-succeeded` rows carrying
+    :attr:`EasyWeekEvent.review_deferred_at`, and it calls only the review
+    planner. It never re-runs the visit counter — that value is already
+    committed, and re-running it could only be a no-op or, if EasyWeek had
+    meanwhile stated a different total, a change nobody proved from this event.
+
+    Two things make the batch fair rather than a fixed prefix:
+
+    * every outcome either clears the marker or pushes it into the future, so no
+      row can occupy a slot on every pass;
+    * the selection honours that moment and orders by it, so the rows that have
+      waited longest are reconsidered first.
+
+    Each row gets its own short transaction: one row's undecidable configuration
+    must not roll back the obligations already discharged beside it.
+    """
+    if not review_planning_enabled():
+        # The fence is still shut. Nothing here can be decided, and reading the
+        # rows to decide nothing is what would make this a busy loop.
+        return 0
+
+    batch = limit or REVIEW_RECOVERY_BATCH
+    registry = configured_easyweek_locations()
+    if not registry.ready:
+        return 0
+
+    now = utcnow()
+    async with SessionLocal() as session:
+        rows = list(
+            (
+                await session.execute(
+                    select(EasyWeekEvent.id)
+                    .where(EasyWeekEvent.review_deferred_at.is_not(None))
+                    .where(EasyWeekEvent.review_deferred_at <= now)
+                    .where(EasyWeekEvent.event_hint == SUCCEEDED_EVENT_HINT)
+                    .order_by(EasyWeekEvent.review_deferred_at.asc(), EasyWeekEvent.id.asc())
+                    .limit(batch)
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    decided = 0
+    for event_id in rows:
+        try:
+            async with SessionLocal() as session:
+                async with session.begin():
+                    event = (
+                        await session.execute(
+                            select(EasyWeekEvent).where(EasyWeekEvent.id == event_id).with_for_update()
+                        )
+                    ).scalar_one_or_none()
+                    if event is None or event.review_deferred_at is None:
+                        # Another pass got there first. Clearing is idempotent,
+                        # and the review dedupe key makes a double attempt safe
+                        # anyway, but there is nothing left to do here.
+                        continue
+
+                    # The customer THIS delivery named, read from the captured
+                    # payload, which is never rewritten. Asking the Record
+                    # instead would follow a `booking-updated` that reassigned
+                    # the booking and earn the review for the wrong person.
+                    expected_customer_id = normalize_succeeded_customer_id(event.payload)
+                    await plan_review_job(
+                        session,
+                        event=event,
+                        registry=registry,
+                        expected_customer_id=expected_customer_id,
+                    )
+                    # Considered — planned, or refused for a reason that will not
+                    # change. Either way the obligation is discharged.
+                    event.review_deferred_at = None
+            decided += 1
+        except NormalizationError as exc:
+            # A permanent property of the stored payload: it will parse exactly
+            # the same way on every future pass. Retrying it forever is what
+            # starves the rows behind it, so this is a terminal fail-closed
+            # outcome — no job, marker cleared, stable code only.
+            await _discharge_deferred_review(event_id, reason=exc.code)
+            decided += 1
+        except RecoverableCategoryConfigurationError as exc:
+            # A broken allowlist or review-link map is not a decision. The
+            # transaction rolled back, so the obligation still stands — but it
+            # steps aside so it cannot hold a batch slot until someone fixes the
+            # configuration.
+            await _postpone_deferred_review(event_id, reason=exc.reason)
+        except Exception as exc:
+            # Class name only — a SQLAlchemy error renders bound parameters, and
+            # for this worker those are a customer's phone, e-mail and name.
+            # Treated like a recoverable one: the obligation survives, and the
+            # row still yields its slot rather than failing at the head forever.
+            logger.error(
+                "easyweek deferred review recovery failed event=%s type=%s",
+                event_id,
+                type(exc).__name__,
+            )
+            await _postpone_deferred_review(event_id, reason=type(exc).__name__)
+    if decided:
+        logger.info("easyweek deferred reviews decided=%s", decided)
+    return decided
+
+
 async def process_one() -> bool:
     """One full claim/process cycle. Returns False when there was nothing to do.
 
@@ -1504,6 +1916,11 @@ async def run_loop(
     # carry a NULL canonical key and would silently escape causal ordering.
     reconciled = False
     reconcile_failures = 0
+    # PR-11. Deferred reviews are reconsidered on a slow interval rather than
+    # every poll: the event that unblocks them is a person opening the
+    # notification fence, and re-reading the same rows once a second while it
+    # stays shut is exactly the busy loop this worker avoids everywhere else.
+    last_review_recovery_at = 0.0
 
     logger.info(
         "EasyWeek inbox worker started. processing=%s notifications=%s poll=%ss",
@@ -1570,6 +1987,18 @@ async def run_loop(
             reconciled = True
             reconcile_failures = 0
             logger.info("easyweek reconcile complete repaired=%s", repaired)
+
+        # Runs before the claim so a backlog never starves it, and returns
+        # immediately while the fence is shut.
+        now_monotonic = time.monotonic()
+        if now_monotonic - last_review_recovery_at >= REVIEW_RECOVERY_INTERVAL_SEC:
+            last_review_recovery_at = now_monotonic
+            try:
+                await recover_deferred_reviews()
+            except Exception as exc:
+                # Recovery is best-effort: the obligations stay recorded, and a
+                # failure here must not stop the worker claiming new events.
+                logger.error("easyweek deferred review recovery pass failed type=%s", type(exc).__name__)
 
         try:
             did_work = await process_one()
