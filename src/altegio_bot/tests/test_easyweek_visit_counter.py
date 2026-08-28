@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -1000,3 +1001,287 @@ async def test_reviews_wanted_without_the_counter_is_unchanged_pr9_behaviour(bou
     assert event.status == "captured", "no enabled consumer, so it is never claimed"
     assert event.review_deferred_at is None, "an unclaimed row owes nothing yet"
     assert (await _client_row(bound_session_local)).easyweek_visits_total is None
+
+
+# ===========================================================================
+# A deferred review belongs to the customer who had the visit
+# ===========================================================================
+#
+# The marker survives an arbitrary amount of time, and `booking-updated` may
+# reassign the Record to a different customer while it waits. `plan_review_job`
+# resolves its client from `Record.client_id` — mutable by construction — so
+# recovery had to re-prove the identity the ORIGINAL delivery named, or it would
+# earn one person's review for another. That is a cross-client send, the exact
+# thing the planner exists to prevent.
+#
+# The proof comes from the captured payload, which is never rewritten.
+
+OTHER_CUSTOMER_ID = TEST_CUSTOMER_ID + 1
+
+
+def _reassignment_to_other_customer() -> dict[str, Any]:
+    payload = _booking_starting(booking_updated(), _future_start(days=1))
+    payload["customer_id"] = OTHER_CUSTOMER_ID
+    return payload
+
+
+async def test_a_deferred_review_is_never_earned_for_a_reassigned_client(bound_session_local, monkeypatch) -> None:
+    """Client A had the visit; the booking later moves to Client B; nobody is messaged."""
+    _counter_on(monkeypatch)
+    _reviews_wanted(monkeypatch)  # fence still shut
+    await _seed_future_booking(bound_session_local)
+    await _deliver_future_succeeded(bound_session_local, visits_total=3)
+
+    client_a = await _client_row(bound_session_local)
+    assert client_a.altegio_client_id == TEST_CUSTOMER_ID
+    assert (await _event_rows(bound_session_local))[-1].review_deferred_at is not None
+
+    # The booking is reassigned to a different customer.
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(
+                session,
+                _reassignment_to_other_customer(),
+                event_hint="booking-updated",
+                payload_hash="updated-reassign",
+            )
+    await _run_until_idle()
+
+    record = await _record_row(bound_session_local)
+    async with bound_session_local() as session:
+        client_b = (
+            (await session.execute(select(Client).where(Client.altegio_client_id == OTHER_CUSTOMER_ID))).scalars().one()
+        )
+    assert record.client_id == client_b.id, "the Record really did move to Client B"
+    assert client_b.id != client_a.id
+
+    _fence_open(monkeypatch)
+    decided = await worker.recover_deferred_reviews()
+
+    jobs = await _review_jobs(bound_session_local)
+    succeeded_row = next(e for e in await _event_rows(bound_session_local) if e.payload_hash == "succeeded-1")
+
+    assert jobs == [], "no review may be earned for a customer who did not have the visit"
+    assert decided == 1, "the obligation was decided — fail closed, not left dangling"
+    # Discharged: retrying forever cannot make the reassignment go away.
+    assert succeeded_row.review_deferred_at is None
+
+
+async def test_a_deferred_review_still_lands_when_the_client_is_unchanged(bound_session_local, monkeypatch) -> None:
+    """The control: an ordinary `booking-updated` must not block the review."""
+    _counter_on(monkeypatch)
+    _reviews_wanted(monkeypatch)
+    await _seed_future_booking(bound_session_local)
+    await _deliver_future_succeeded(bound_session_local, visits_total=3)
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(
+                session,
+                _booking_starting(booking_updated(), _future_start(days=2)),
+                event_hint="booking-updated",
+                payload_hash="updated-same-client",
+            )
+    await _run_until_idle()
+
+    _fence_open(monkeypatch)
+    await worker.recover_deferred_reviews()
+
+    jobs = await _review_jobs(bound_session_local)
+    client = await _client_row(bound_session_local)
+    assert len(jobs) == 1
+    assert jobs[0].client_id == client.id
+
+
+async def test_a_succeeded_payload_without_a_provable_customer_earns_nothing(bound_session_local, monkeypatch) -> None:
+    """No customer id, no proof, no review — and the obligation is discharged."""
+    _counter_on(monkeypatch)
+    _reviews_wanted(monkeypatch)
+    await _seed_future_booking(bound_session_local)
+
+    payload = _booking_starting(_succeeded(visits_total=3), _future_start(days=1))
+    payload.pop("customer_id")
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, payload, event_hint="booking-succeeded", payload_hash="succeeded-nocust")
+    await _run_until_idle()
+
+    _fence_open(monkeypatch)
+    decided = await worker.recover_deferred_reviews()
+
+    assert decided == 1
+    assert await _review_jobs(bound_session_local) == []
+    row = next(e for e in await _event_rows(bound_session_local) if e.payload_hash == "succeeded-nocust")
+    assert row.review_deferred_at is None
+
+
+# ===========================================================================
+# A bounded batch must be a queue, not a fixed prefix
+# ===========================================================================
+#
+# Recovery takes the first REVIEW_RECOVERY_BATCH rows by id. Every outcome that
+# left the marker in place therefore re-took the same slot on the next pass, and
+# fifty undecidable rows were enough to make row fifty-one unreachable forever.
+#
+# The fix is that every outcome either clears the marker or moves it forward, and
+# the selection honours that moment.
+
+
+async def _seed_deferred_rows(session_maker, *, count: int, malformed: bool, first_index: int = 0) -> list[int]:
+    """Directly seeded `processed` succeeded rows that already owe a review."""
+    ids: list[int] = []
+    async with session_maker() as session:
+        async with session.begin():
+            for offset in range(count):
+                index = first_index + offset
+                payload = _booking_starting(_succeeded(visits_total=2), _future_start(days=1))
+                if malformed:
+                    payload["uid"] = f"not-a-uuid-{index}"
+                else:
+                    payload["uid"] = TEST_BOOKING_UUID
+                event = EasyWeekEvent(
+                    status="processed",
+                    event_hint="booking-succeeded",
+                    auth_via="query",
+                    payload_hash=f"deferred-{index}",
+                    payload=payload,
+                    body_truncated=False,
+                    booking_uuid=canonical_booking_uuid(payload),
+                    review_deferred_at=datetime.now(timezone.utc) - timedelta(minutes=5),
+                )
+                session.add(event)
+                await session.flush()
+                ids.append(int(event.id))
+    return ids
+
+
+async def test_a_permanently_unparseable_row_is_discharged_not_retried(bound_session_local, monkeypatch) -> None:
+    _counter_on(monkeypatch)
+    _reviews_wanted(monkeypatch)
+    _fence_open(monkeypatch)
+    await _seed_future_booking(bound_session_local)
+    (poison_id,) = await _seed_deferred_rows(bound_session_local, count=1, malformed=True)
+
+    decided = await worker.recover_deferred_reviews()
+
+    async with bound_session_local() as session:
+        row = await session.get(EasyWeekEvent, poison_id)
+    assert decided == 1
+    assert row.review_deferred_at is None, "the payload will parse the same way forever"
+    assert await _review_jobs(bound_session_local) == []
+
+
+async def test_fifty_poison_rows_do_not_starve_the_valid_row_behind_them(bound_session_local, monkeypatch) -> None:
+    """The reported defect, end to end."""
+    _counter_on(monkeypatch)
+    _reviews_wanted(monkeypatch)
+    _fence_open(monkeypatch)
+    await _seed_future_booking(bound_session_local)
+
+    poison_ids = await _seed_deferred_rows(bound_session_local, count=worker.REVIEW_RECOVERY_BATCH, malformed=True)
+    (good_id,) = await _seed_deferred_rows(
+        bound_session_local, count=1, malformed=False, first_index=worker.REVIEW_RECOVERY_BATCH
+    )
+    assert len(poison_ids) == 50
+    assert good_id > max(poison_ids), "the valid row really is behind the whole batch"
+
+    await worker.recover_deferred_reviews()
+    await worker.recover_deferred_reviews()
+
+    async with bound_session_local() as session:
+        good = await session.get(EasyWeekEvent, good_id)
+        still_marked = (
+            await session.execute(
+                select(func.count()).select_from(EasyWeekEvent).where(EasyWeekEvent.review_deferred_at.is_not(None))
+            )
+        ).scalar_one()
+
+    assert good.review_deferred_at is None, "row 51 was reached and decided"
+    assert still_marked == 0, "and no obligation is left circling"
+    assert len(await _review_jobs(bound_session_local)) == 1, "exactly one review, from the one valid row"
+
+
+async def test_an_undecidable_configuration_keeps_the_obligation_but_yields_its_slot(
+    bound_session_local, monkeypatch
+) -> None:
+    _counter_on(monkeypatch)
+    _reviews_wanted(monkeypatch)
+    await _seed_future_booking(bound_session_local)
+    # The obligation is created while the fence is shut and the map is still
+    # good; only then does the map break. A broken map at delivery time would
+    # keep the event `captured` instead, which is a different path entirely.
+    await _deliver_future_succeeded(bound_session_local, visits_total=3)
+
+    monkeypatch.setattr(settings, "easyweek_google_review_links", "{not json", raising=False)
+    _fence_open(monkeypatch)
+
+    first = await worker.recover_deferred_reviews()
+    row_after_first = next(e for e in await _event_rows(bound_session_local) if e.payload_hash == "succeeded-1")
+    second = await worker.recover_deferred_reviews()
+
+    assert first == 0 and second == 0, "nothing was decided"
+    assert row_after_first.review_deferred_at is not None, "the obligation stands"
+    assert row_after_first.review_deferred_at > datetime.now(timezone.utc), "and it stepped aside"
+    assert await _review_jobs(bound_session_local) == []
+
+
+async def test_the_obligation_is_honoured_once_the_configuration_is_fixed(bound_session_local, monkeypatch) -> None:
+    _counter_on(monkeypatch)
+    _reviews_wanted(monkeypatch)
+    await _seed_future_booking(bound_session_local)
+    await _deliver_future_succeeded(bound_session_local, visits_total=3)
+
+    monkeypatch.setattr(settings, "easyweek_google_review_links", "{not json", raising=False)
+    _fence_open(monkeypatch)
+    await worker.recover_deferred_reviews()
+
+    # The operator fixes the map, and the retry moment arrives.
+    _review_links_on(monkeypatch)
+    async with bound_session_local() as session:
+        async with session.begin():
+            row = (
+                (await session.execute(select(EasyWeekEvent).where(EasyWeekEvent.payload_hash == "succeeded-1")))
+                .scalars()
+                .one()
+            )
+            row.review_deferred_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+
+    decided = await worker.recover_deferred_reviews()
+    # A further pass must not earn a second review.
+    again = await worker.recover_deferred_reviews()
+
+    assert decided == 1
+    assert again == 0
+    assert len(await _review_jobs(bound_session_local)) == 1
+    row = next(e for e in await _event_rows(bound_session_local) if e.payload_hash == "succeeded-1")
+    assert row.review_deferred_at is None
+
+
+async def test_recovery_logs_carry_no_payload_or_pii(bound_session_local, monkeypatch, caplog) -> None:
+    _counter_on(monkeypatch)
+    _reviews_wanted(monkeypatch)
+    _fence_open(monkeypatch)
+    await _seed_future_booking(bound_session_local)
+    await _seed_deferred_rows(bound_session_local, count=1, malformed=True)
+    await _deliver_future_succeeded(bound_session_local, visits_total=3)
+
+    with caplog.at_level(logging.DEBUG):
+        await worker.recover_deferred_reviews()
+
+    blob = "\n".join(record.getMessage() for record in caplog.records)
+    fixture = booking_created()
+    for key in (
+        "customer_phone",
+        "customer_email",
+        "customer_full_name",
+        "customer_name",
+        "customer_attributes.customer_phone",
+        "customer_attributes.customer_email",
+    ):
+        value = str(fixture.get(key, "")).strip()
+        assert value, f"the fixture must actually carry {key} for this test to mean anything"
+        assert value not in blob, key
+    # The malformed value itself is payload content and must not be echoed —
+    # only the stable reason code may name what was wrong with it.
+    assert "not-a-uuid" not in blob
+    assert "invalid_booking_uuid" in blob, "the stable code IS reported"

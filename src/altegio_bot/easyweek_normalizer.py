@@ -737,6 +737,25 @@ def _require_strict_int(value: Any, *, code: str) -> int:
     return value
 
 
+def normalize_succeeded_customer_id(payload: Any) -> int:
+    """The external customer id one ``booking-succeeded`` names. Strict, or refuses.
+
+    Split out from :func:`normalize_succeeded_visit_event` because the deferred
+    review recovery needs this ONE field and must not depend on ``visits_total``:
+    a delivery whose counter input is unusable can still owe a perfectly valid
+    review, and coupling the two would refuse it for an unrelated reason.
+
+    The payload of a captured delivery is never rewritten, which is the whole
+    point of asking it rather than the Record: a later ``booking-updated`` may
+    move the booking to a different customer, and the review earned by THIS
+    delivery belongs to the customer THIS delivery named.
+    """
+    return _require_positive_id(
+        payload.get("customer_id") if isinstance(payload, dict) else None,
+        code=NormalizationError.MISSING_CUSTOMER_ID,
+    )
+
+
 def normalize_succeeded_visit_event(
     *,
     event_hint: str | None,

@@ -63,6 +63,7 @@ from ..easyweek_normalizer import (
     canonical_booking_uuid,
     easyweek_job_dedupe_key,
     normalize_event,
+    normalize_succeeded_customer_id,
     normalize_succeeded_event,
     normalize_succeeded_visit_event,
 )
@@ -1057,6 +1058,7 @@ async def plan_review_job(
     *,
     event: EasyWeekEvent,
     registry: Any,
+    expected_customer_id: int | None = None,
 ) -> None:
     """PR-9: earn at most one ``review_3d`` from a proven succeeded delivery.
 
@@ -1073,6 +1075,15 @@ async def plan_review_job(
     Deliberately NOT ``plan_jobs_for_record_event``: that planner gates review on
     a live Altegio API visit count and renders from an Altegio-keyed Google Maps
     link. EasyWeek has neither, and ``visits_total`` is the next phase.
+
+    ``expected_customer_id`` is the external customer the ORIGINAL delivery named.
+    It is passed only by the deferred-review recovery (PR-11) and defaults to
+    None, leaving the immediate PR-9/PR-10 path byte-for-byte unchanged: there
+    the succeeded event is planned in the same claim that read it, and the
+    predecessor rule guarantees no later delivery of the same booking has run in
+    between. Recovery has no such guarantee — an arbitrary amount of time and any
+    number of ``booking-updated`` deliveries may have passed — so it must prove
+    the Record still points at the same person.
     """
     if not review_planning_enabled():
         # Same gate the claim used, so a succeeded event is never claimed by one
@@ -1140,6 +1151,18 @@ async def plan_review_job(
         )
     if client is None:
         logger.info("easyweek review skipped event=%s record_id=%s reason=no_client", event.id, record.id)
+        return
+    if expected_customer_id is not None and int(client.altegio_client_id) != expected_customer_id:
+        # The booking was reassigned after this delivery was captured. The review
+        # belongs to the customer who actually had the visit, and sending it to
+        # whoever holds the booking now is a cross-client message — the one thing
+        # this planner exists to make impossible.
+        logger.warning(
+            "easyweek review refused event=%s record_id=%s client_id=%s reason=client_reassigned",
+            event.id,
+            record.id,
+            client.id,
+        )
         return
     if bool(getattr(client, "wa_opted_out", False)):
         # Marketing, and this customer said no. Nothing else needs checking.
@@ -1639,12 +1662,54 @@ async def defer_for_configuration(event_id: int, reason: str) -> None:
 # second for nothing while the fence stays shut.
 REVIEW_RECOVERY_INTERVAL_SEC = 60.0
 REVIEW_RECOVERY_BATCH = 50
+# How long an obligation that could NOT be decided steps aside for. Flat, like
+# the configuration deferral it mirrors: a broken allowlist or review-link map is
+# fixed by a person, and the only job of this delay is to stop one undecidable
+# row occupying a batch slot on every single pass.
+REVIEW_RECOVERY_RETRY_SEC = 300.0
+
+
+async def _discharge_deferred_review(event_id: int, *, reason: str) -> None:
+    """Clear one obligation for good, in its own short transaction.
+
+    Used when the delivery can never earn a review: its payload cannot be
+    normalised, or it does not name a provable customer. Leaving the marker would
+    make the row a permanent candidate that re-fails on every pass and, because
+    the batch is bounded, keeps newer rows behind it forever.
+    """
+    async with SessionLocal() as session:
+        async with session.begin():
+            event = (
+                await session.execute(select(EasyWeekEvent).where(EasyWeekEvent.id == event_id).with_for_update())
+            ).scalar_one_or_none()
+            if event is not None:
+                event.review_deferred_at = None
+    logger.info("easyweek deferred review discharged event=%s reason=%s", event_id, reason)
+
+
+async def _postpone_deferred_review(event_id: int, *, reason: str) -> None:
+    """Keep one obligation, but move it to the back of the queue.
+
+    The row is still owed a review — the outcome was "cannot decide yet", not
+    "no". Pushing its eligibility moment forward is what makes the queue fair:
+    without it the same undecidable rows fill every bounded batch and a correct
+    row behind them is never reached.
+    """
+    async with SessionLocal() as session:
+        async with session.begin():
+            event = (
+                await session.execute(select(EasyWeekEvent).where(EasyWeekEvent.id == event_id).with_for_update())
+            ).scalar_one_or_none()
+            if event is not None and event.review_deferred_at is not None:
+                event.review_deferred_at = utcnow() + timedelta(seconds=REVIEW_RECOVERY_RETRY_SEC)
+    logger.info("easyweek deferred review postponed event=%s reason=%s", event_id, reason)
 
 
 async def recover_deferred_reviews(*, limit: int | None = None) -> int:
     """Reconsider the reviews that were owed while the fence was shut.
 
-    Returns how many rows were reconsidered.
+    Returns how many obligations were DECIDED — planned, or refused for a reason
+    that will not change. Rows that were merely postponed are not counted.
 
     Narrow by construction: it reads ONLY `booking-succeeded` rows carrying
     :attr:`EasyWeekEvent.review_deferred_at`, and it calls only the review
@@ -1652,9 +1717,15 @@ async def recover_deferred_reviews(*, limit: int | None = None) -> int:
     committed, and re-running it could only be a no-op or, if EasyWeek had
     meanwhile stated a different total, a change nobody proved from this event.
 
-    Each row gets its own short transaction: the planner's own recoverable
-    configuration error must leave that row's obligation standing without
-    rolling back the ones already cleared.
+    Two things make the batch fair rather than a fixed prefix:
+
+    * every outcome either clears the marker or pushes it into the future, so no
+      row can occupy a slot on every pass;
+    * the selection honours that moment and orders by it, so the rows that have
+      waited longest are reconsidered first.
+
+    Each row gets its own short transaction: one row's undecidable configuration
+    must not roll back the obligations already discharged beside it.
     """
     if not review_planning_enabled():
         # The fence is still shut. Nothing here can be decided, and reading the
@@ -1666,14 +1737,16 @@ async def recover_deferred_reviews(*, limit: int | None = None) -> int:
     if not registry.ready:
         return 0
 
+    now = utcnow()
     async with SessionLocal() as session:
         rows = list(
             (
                 await session.execute(
                     select(EasyWeekEvent.id)
                     .where(EasyWeekEvent.review_deferred_at.is_not(None))
+                    .where(EasyWeekEvent.review_deferred_at <= now)
                     .where(EasyWeekEvent.event_hint == SUCCEEDED_EVENT_HINT)
-                    .order_by(EasyWeekEvent.id.asc())
+                    .order_by(EasyWeekEvent.review_deferred_at.asc(), EasyWeekEvent.id.asc())
                     .limit(batch)
                 )
             )
@@ -1681,7 +1754,7 @@ async def recover_deferred_reviews(*, limit: int | None = None) -> int:
             .all()
         )
 
-    reconsidered = 0
+    decided = 0
     for event_id in rows:
         try:
             async with SessionLocal() as session:
@@ -1696,32 +1769,49 @@ async def recover_deferred_reviews(*, limit: int | None = None) -> int:
                         # and the review dedupe key makes a double attempt safe
                         # anyway, but there is nothing left to do here.
                         continue
-                    await plan_review_job(session, event=event, registry=registry)
+
+                    # The customer THIS delivery named, read from the captured
+                    # payload, which is never rewritten. Asking the Record
+                    # instead would follow a `booking-updated` that reassigned
+                    # the booking and earn the review for the wrong person.
+                    expected_customer_id = normalize_succeeded_customer_id(event.payload)
+                    await plan_review_job(
+                        session,
+                        event=event,
+                        registry=registry,
+                        expected_customer_id=expected_customer_id,
+                    )
                     # Considered — planned, or refused for a reason that will not
-                    # change. Either way the obligation is discharged; leaving the
-                    # marker would make the row a permanent candidate.
+                    # change. Either way the obligation is discharged.
                     event.review_deferred_at = None
-            reconsidered += 1
+            decided += 1
+        except NormalizationError as exc:
+            # A permanent property of the stored payload: it will parse exactly
+            # the same way on every future pass. Retrying it forever is what
+            # starves the rows behind it, so this is a terminal fail-closed
+            # outcome — no job, marker cleared, stable code only.
+            await _discharge_deferred_review(event_id, reason=exc.code)
+            decided += 1
         except RecoverableCategoryConfigurationError as exc:
             # A broken allowlist or review-link map is not a decision. The
-            # transaction rolled back, so the obligation is still recorded and
-            # the next pass will try again once configuration is fixed.
-            logger.info(
-                "easyweek deferred review still unconfigured event=%s reason=%s",
-                event_id,
-                exc.reason,
-            )
+            # transaction rolled back, so the obligation still stands — but it
+            # steps aside so it cannot hold a batch slot until someone fixes the
+            # configuration.
+            await _postpone_deferred_review(event_id, reason=exc.reason)
         except Exception as exc:
             # Class name only — a SQLAlchemy error renders bound parameters, and
             # for this worker those are a customer's phone, e-mail and name.
+            # Treated like a recoverable one: the obligation survives, and the
+            # row still yields its slot rather than failing at the head forever.
             logger.error(
                 "easyweek deferred review recovery failed event=%s type=%s",
                 event_id,
                 type(exc).__name__,
             )
-    if reconsidered:
-        logger.info("easyweek deferred reviews reconsidered=%s", reconsidered)
-    return reconsidered
+            await _postpone_deferred_review(event_id, reason=type(exc).__name__)
+    if decided:
+        logger.info("easyweek deferred reviews decided=%s", decided)
+    return decided
 
 
 async def process_one() -> bool:
