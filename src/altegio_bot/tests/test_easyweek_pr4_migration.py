@@ -145,8 +145,19 @@ async def _indexes_of(db_url: str, table: str) -> set[str]:
 
 
 def test_exactly_one_alembic_head() -> None:
+    """One head — not "PR-4 is the head".
+
+    Pinning the head to this module's own revision made the assertion stale the
+    moment any later PR added one on top, and it then failed for a reason that
+    had nothing to do with PR-4. What this test is actually for is the branch
+    check: two heads mean two migration lineages and a deploy that cannot
+    upgrade.
+    """
     script = ScriptDirectory.from_config(Config(str(ALEMBIC_INI)))
-    assert script.get_heads() == [PR4_REVISION]
+    heads = script.get_heads()
+
+    assert len(heads) == 1, f"expected exactly one Alembic head, got {heads}"
+    assert PR4_REVISION in {revision.revision for revision in script.walk_revisions()}
 
 
 def test_pr4_is_a_direct_child_of_the_pr3_revision() -> None:
@@ -314,10 +325,24 @@ async def test_captured_rows_survive_the_pr4_round_trip(temp_db_url: str) -> Non
 
 
 @pytest.mark.asyncio
-async def test_head_upgrade_on_an_empty_database_reaches_pr4(temp_db_url: str) -> None:
+async def test_head_upgrade_on_an_empty_database_passes_through_pr4(temp_db_url: str) -> None:
+    """`upgrade head` from empty arrives at the single head, PR-4 applied on the way.
+
+    The landing revision is read from the graph rather than hardcoded: asserting
+    that PR-4 is where `head` stops was only ever true while PR-4 happened to be
+    last, and a later revision would break it for the wrong reason.
+    """
+    script = ScriptDirectory.from_config(Config(str(ALEMBIC_INI)))
+    (head,) = script.get_heads()
+
     _alembic_ok("upgrade", "head", db_url=temp_db_url)
     current = _alembic_ok("current", db_url=temp_db_url)
-    assert PR4_REVISION in current
+
+    assert head in current
+    # PR-4's own columns are proved by the rest of this module; here it is
+    # enough that its revision is an ancestor of the head we landed on.
+    ancestors = {revision.revision for revision in script.iterate_revisions(head, "base")}
+    assert PR4_REVISION in ancestors
 
 
 # ===========================================================================

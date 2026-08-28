@@ -307,6 +307,28 @@ class Client(Base):
         ),
         Index("ix_clients_provider_company_phone", "provider", "company_id", "phone_e164"),
         Index("ix_clients_wa_opted_out_at", "wa_opted_out", "wa_opted_out_at"),
+        # PR-11. The EasyWeek visit counter is provider-scoped by construction,
+        # not by convention: an Altegio row must never carry one. Altegio's own
+        # count is answered live by `count_attended_client_visits`, so a stored
+        # number there would be a second, silently diverging source of truth.
+        CheckConstraint(
+            "easyweek_visits_total IS NULL OR provider = 'easyweek'",
+            name="ck_clients_easyweek_visits_total_provider",
+        ),
+        # `booking-succeeded` proves a finished visit, so the snapshot it
+        # carries is at least 1. Zero or negative is a malformed delivery, and
+        # the database refuses it even if a future caller forgets to.
+        CheckConstraint(
+            "easyweek_visits_total IS NULL OR easyweek_visits_total >= 1",
+            name="ck_clients_easyweek_visits_total_positive",
+        ),
+        # The value and the moment it was accepted are one fact. A timestamp
+        # without a count says a visit was recorded and lost the number; a count
+        # without a timestamp cannot be audited against the delivery that set it.
+        CheckConstraint(
+            "(easyweek_visits_total IS NULL) = (easyweek_visits_total_updated_at IS NULL)",
+            name="ck_clients_easyweek_visits_total_paired",
+        ),
     )
 
     id: Mapped[int] = mapped_column(
@@ -344,6 +366,22 @@ class Client(Base):
     )
     wa_opt_out_reason: Mapped[str | None] = mapped_column(
         Text,
+        nullable=True,
+    )
+
+    # PR-11: the last PROVEN `visits_total` snapshot from a `booking-succeeded`
+    # delivery, and the moment that value was accepted.
+    #
+    # A snapshot, never a tally. EasyWeek states the total; we never compute
+    # `current + 1` from the fact that a webhook arrived, because a Resend, a
+    # replay with a different payload hash and a genuine second visit are
+    # indistinguishable at that level. Storing the number EasyWeek states makes
+    # all three converge on the same value instead of drifting upwards.
+    #
+    # NULL on every Altegio row, enforced by a CHECK above.
+    easyweek_visits_total: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    easyweek_visits_total_updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
         nullable=True,
     )
 
