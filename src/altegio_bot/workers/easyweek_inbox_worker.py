@@ -43,6 +43,7 @@ import asyncio
 import logging
 import math
 import signal
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -222,6 +223,20 @@ def visit_counter_enabled() -> bool:
     `current + 1` is not a legitimate way to reconstruct them.
     """
     return bool(settings.easyweek_visit_counter_enabled)
+
+
+def review_obligation_deferred() -> bool:
+    """Does a `booking-succeeded` owe a review that cannot be considered now?
+
+    True in exactly one state: the operator has turned EasyWeek reviews ON, but
+    the master notification fence is shut. The review is owed and must survive;
+    it simply cannot be planned yet.
+
+    Reviews switched OFF is NOT this state. That is a decision, not a pause: the
+    operator has said these visits earn no review, and inventing an obligation
+    from it would queue messages nobody asked for the moment the fence opens.
+    """
+    return bool(settings.easyweek_reviews_enabled) and not review_planning_enabled()
 
 
 def succeeded_consumer_enabled() -> bool:
@@ -1438,6 +1453,22 @@ async def process_claimed_event(session: AsyncSession, event: EasyWeekEvent) -> 
             raise RecoverableCategoryConfigurationError("succeeded_consumers_disabled")
         await record_visit_counter(session, event=event, registry=registry)
         await plan_review_job(session, event=event, registry=registry)
+        if review_obligation_deferred():
+            # The counter is committed and the queue must not be held, but the
+            # review this visit earns has not been considered yet. Marking the
+            # row `processed` and stopping there would destroy it: a `processed`
+            # row is never claimed again, so opening the fence later could not
+            # recover it.
+            #
+            # Holding the row `captured` instead is not an option either — the
+            # counter write would have to roll back with it, and the row would
+            # become a predecessor blocking its own booking's later lifecycle
+            # events. So the row terminalizes AND carries the obligation.
+            event.review_deferred_at = utcnow()
+            logger.info(
+                "easyweek event=%s review deferred; notifications fence closed",
+                event_id,
+            )
         mark_processed(event)
         logger.info("easyweek event=%s hint=%s succeeded processed", event_id, event_hint)
         return
@@ -1602,6 +1633,97 @@ async def defer_for_configuration(event_id: int, reason: str) -> None:
             )
 
 
+# How often the deferred-review recovery scan runs, and how many rows it takes.
+# Flat and generous on purpose: the trigger is a person opening the notification
+# fence, not a hot path. Scanning every poll would read the same rows once a
+# second for nothing while the fence stays shut.
+REVIEW_RECOVERY_INTERVAL_SEC = 60.0
+REVIEW_RECOVERY_BATCH = 50
+
+
+async def recover_deferred_reviews(*, limit: int | None = None) -> int:
+    """Reconsider the reviews that were owed while the fence was shut.
+
+    Returns how many rows were reconsidered.
+
+    Narrow by construction: it reads ONLY `booking-succeeded` rows carrying
+    :attr:`EasyWeekEvent.review_deferred_at`, and it calls only the review
+    planner. It never re-runs the visit counter — that value is already
+    committed, and re-running it could only be a no-op or, if EasyWeek had
+    meanwhile stated a different total, a change nobody proved from this event.
+
+    Each row gets its own short transaction: the planner's own recoverable
+    configuration error must leave that row's obligation standing without
+    rolling back the ones already cleared.
+    """
+    if not review_planning_enabled():
+        # The fence is still shut. Nothing here can be decided, and reading the
+        # rows to decide nothing is what would make this a busy loop.
+        return 0
+
+    batch = limit or REVIEW_RECOVERY_BATCH
+    registry = configured_easyweek_locations()
+    if not registry.ready:
+        return 0
+
+    async with SessionLocal() as session:
+        rows = list(
+            (
+                await session.execute(
+                    select(EasyWeekEvent.id)
+                    .where(EasyWeekEvent.review_deferred_at.is_not(None))
+                    .where(EasyWeekEvent.event_hint == SUCCEEDED_EVENT_HINT)
+                    .order_by(EasyWeekEvent.id.asc())
+                    .limit(batch)
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    reconsidered = 0
+    for event_id in rows:
+        try:
+            async with SessionLocal() as session:
+                async with session.begin():
+                    event = (
+                        await session.execute(
+                            select(EasyWeekEvent).where(EasyWeekEvent.id == event_id).with_for_update()
+                        )
+                    ).scalar_one_or_none()
+                    if event is None or event.review_deferred_at is None:
+                        # Another pass got there first. Clearing is idempotent,
+                        # and the review dedupe key makes a double attempt safe
+                        # anyway, but there is nothing left to do here.
+                        continue
+                    await plan_review_job(session, event=event, registry=registry)
+                    # Considered — planned, or refused for a reason that will not
+                    # change. Either way the obligation is discharged; leaving the
+                    # marker would make the row a permanent candidate.
+                    event.review_deferred_at = None
+            reconsidered += 1
+        except RecoverableCategoryConfigurationError as exc:
+            # A broken allowlist or review-link map is not a decision. The
+            # transaction rolled back, so the obligation is still recorded and
+            # the next pass will try again once configuration is fixed.
+            logger.info(
+                "easyweek deferred review still unconfigured event=%s reason=%s",
+                event_id,
+                exc.reason,
+            )
+        except Exception as exc:
+            # Class name only — a SQLAlchemy error renders bound parameters, and
+            # for this worker those are a customer's phone, e-mail and name.
+            logger.error(
+                "easyweek deferred review recovery failed event=%s type=%s",
+                event_id,
+                type(exc).__name__,
+            )
+    if reconsidered:
+        logger.info("easyweek deferred reviews reconsidered=%s", reconsidered)
+    return reconsidered
+
+
 async def process_one() -> bool:
     """One full claim/process cycle. Returns False when there was nothing to do.
 
@@ -1704,6 +1826,11 @@ async def run_loop(
     # carry a NULL canonical key and would silently escape causal ordering.
     reconciled = False
     reconcile_failures = 0
+    # PR-11. Deferred reviews are reconsidered on a slow interval rather than
+    # every poll: the event that unblocks them is a person opening the
+    # notification fence, and re-reading the same rows once a second while it
+    # stays shut is exactly the busy loop this worker avoids everywhere else.
+    last_review_recovery_at = 0.0
 
     logger.info(
         "EasyWeek inbox worker started. processing=%s notifications=%s poll=%ss",
@@ -1770,6 +1897,18 @@ async def run_loop(
             reconciled = True
             reconcile_failures = 0
             logger.info("easyweek reconcile complete repaired=%s", repaired)
+
+        # Runs before the claim so a backlog never starves it, and returns
+        # immediately while the fence is shut.
+        now_monotonic = time.monotonic()
+        if now_monotonic - last_review_recovery_at >= REVIEW_RECOVERY_INTERVAL_SEC:
+            last_review_recovery_at = now_monotonic
+            try:
+                await recover_deferred_reviews()
+            except Exception as exc:
+                # Recovery is best-effort: the obligations stay recorded, and a
+                # failure here must not stop the worker claiming new events.
+                logger.error("easyweek deferred review recovery pass failed type=%s", type(exc).__name__)
 
         try:
             did_work = await process_one()

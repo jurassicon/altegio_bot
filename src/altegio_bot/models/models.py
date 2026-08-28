@@ -126,6 +126,15 @@ class EasyWeekEvent(Base):
     """
 
     __tablename__ = "easyweek_events"
+    __table_args__ = (
+        # PR-11. Exactly the recovery scan's predicate, so the partial index the
+        # migration creates also exists in the schema tests build from the model.
+        Index(
+            "ix_easyweek_events_review_deferred",
+            "review_deferred_at",
+            postgresql_where=text("review_deferred_at IS NOT NULL"),
+        ),
+    )
 
     id: Mapped[int] = mapped_column(
         BigInteger,
@@ -155,6 +164,27 @@ class EasyWeekEvent(Base):
     event_hint: Mapped[str | None] = mapped_column(
         String(32),
         index=True,
+        nullable=True,
+    )
+
+    # PR-11. Узкое durable continuation-state ТОЛЬКО для потребителей
+    # `booking-succeeded`: момент, когда визит был доказан и счётчик записан, но
+    # отзыв рассмотреть не удалось, потому что мастер-фенс уведомлений был
+    # закрыт.
+    #
+    # Зачем отдельное поле, а не `captured`: visit counter должен быть записан и
+    # закоммичен независимо от фенса уведомлений, а откат транзакции ради
+    # удержания события уничтожил бы этот счётчик. Оставить строку нетерминальной
+    # тоже нельзя — она стала бы predecessor и заблокировала бы последующие
+    # lifecycle-события СВОЕЙ booking, чего PR-11 требует избежать.
+    #
+    # Поэтому строка становится `processed` (очередь свободна, hot loop
+    # отсутствует), но несёт отметку «отзыв ещё должен быть рассмотрен».
+    # `recover_deferred_reviews` снимает её, когда фенс открывается.
+    # NULL — обязательства нет: либо отзыв уже рассмотрен, либо оператор их не
+    # включал, либо это не `booking-succeeded`.
+    review_deferred_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
         nullable=True,
     )
 

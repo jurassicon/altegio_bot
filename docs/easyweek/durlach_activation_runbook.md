@@ -3643,14 +3643,33 @@ EasyWeek не переотправляет события.
 
 ### 15.3 Rollout
 
-**Шаг 1. Деплой кода с флагом `false`.** Команда меняет production: она
+**Шаг 1. Деплой кода с выключенным счётчиком.** Команда меняет production: она
 выкатывает новый образ. Поведение при этом не меняется — новый путь выключен,
 колонок ещё нет. Ожидаемый результат: сервисы поднялись, `booking-succeeded`
 по-прежнему обрабатывается ровно так, как до PR-11.
 
+Production `easyweek.env` в git не хранится и из `easyweek.env.example` не
+обновляется, поэтому нового ключа там, скорее всего, **нет вообще**. Отсутствие
+строки и строка `=false` — одно и то же состояние: значение по умолчанию `false`.
+Проверка ниже это и утверждает: счётчик сейчас выключен. Она только читает и
+production не меняет; ожидаемый результат — успешный exit без вывода.
+
 ```bash
 cd /opt/altegio_bot
-grep -Ec '^EASYWEEK_VISIT_COUNTER_ENABLED=false' easyweek.env
+bash <<'VISIT_COUNTER_OFF_ASSERT'
+set -euo pipefail
+ENV_FILE="${ENV_FILE:-/opt/altegio_bot/easyweek.env}"
+KEY=EASYWEEK_VISIT_COUNTER_ENABLED
+test -f "$ENV_FILE"
+FOUND_RC=0
+FOUND="$(grep -Ec "^${KEY}=" "$ENV_FILE")" || FOUND_RC=$?
+test "$FOUND_RC" -le 1
+test "$FOUND" -le 1
+if [ "$FOUND" = "1" ]; then
+  test "$(grep -E "^${KEY}=" "$ENV_FILE")" = "${KEY}=false"
+fi
+echo "visit counter is off"
+VISIT_COUNTER_OFF_ASSERT
 ```
 
 **Шаг 2. Миграция.** Команда меняет production: добавляет две nullable-колонки и
@@ -3690,12 +3709,55 @@ candidate_count`, `config_error: null`. Вывод содержит только
 provider/company, booleans, агрегированные reason codes и счётчики.
 
 **Шаг 4. Включение флага.** Команда меняет production `easyweek.env`. Ожидаемый
-результат: ровно одна строка флага со значением `true`.
+результат: в файле ровно одна строка ключа и её значение ровно `true`; всё
+остальное — переменные, комментарии, секреты — байт в байт прежнее.
+
+Замена через `sed -i 's/^KEY=false$/KEY=true/'` здесь не годится: при
+отсутствующем ключе она молча не делает ничего, а оператор видит нулевой exit и
+считает, что счётчик включён. Блок ниже обрабатывает все три случая явно:
+
+| Ключа в файле | Что делает блок |
+|---|---|
+| нет | добавляет ровно одну строку `KEY=true` |
+| ровно один | заменяет значение на `true` |
+| больше одного | **STOP** до любого изменения файла |
+
+Контракт записи тот же, что и в §14: `set -euo pipefail`, временный файл рядом
+с целевым на той же файловой системе, `cp -p` переносит owner/mode, допустимые
+коды `grep` разрешены явно (а ошибка чтения останавливает процедуру), `diff`
+доказывает, что все остальные строки сохранены, замена — атомарный `mv`,
+временный файл убирает `trap`. Symlink отвергается. Значения других переменных
+не печатаются.
 
 ```bash
 cd /opt/altegio_bot
-sed -i 's/^EASYWEEK_VISIT_COUNTER_ENABLED=false$/EASYWEEK_VISIT_COUNTER_ENABLED=true/' easyweek.env
-grep -Ec '^EASYWEEK_VISIT_COUNTER_ENABLED=true$' easyweek.env
+bash <<'VISIT_COUNTER_ON'
+set -euo pipefail
+ENV_FILE="${ENV_FILE:-/opt/altegio_bot/easyweek.env}"
+KEY=EASYWEEK_VISIT_COUNTER_ENABLED
+TARGET=true
+test -f "$ENV_FILE"
+test ! -L "$ENV_FILE"
+FOUND_RC=0
+FOUND="$(grep -Ec "^${KEY}=" "$ENV_FILE")" || FOUND_RC=$?
+test "$FOUND_RC" -le 1
+test "$FOUND" -le 1
+ENV_TMP="$(mktemp "${ENV_FILE}.visitcounter.XXXXXX")"
+trap 'rm -f "$ENV_TMP"' EXIT
+cp -p "$ENV_FILE" "$ENV_TMP"
+KEPT_RC=0
+grep -Ev "^${KEY}=" "$ENV_FILE" > "$ENV_TMP" || KEPT_RC=$?
+test "$KEPT_RC" -le 1
+printf '%s=%s\n' "$KEY" "$TARGET" >> "$ENV_TMP"
+test "$(grep -Ec "^${KEY}=" "$ENV_TMP")" = "1"
+test "$(grep -E "^${KEY}=" "$ENV_TMP")" = "${KEY}=${TARGET}"
+diff <(grep -Ev "^${KEY}=" "$ENV_FILE") <(grep -Ev "^${KEY}=" "$ENV_TMP") > /dev/null
+mv -f "$ENV_TMP" "$ENV_FILE"
+trap - EXIT
+test "$(grep -Ec "^${KEY}=" "$ENV_FILE")" = "1"
+test "$(grep -E "^${KEY}=" "$ENV_FILE")" = "${KEY}=${TARGET}"
+echo "visit counter flag now ${TARGET}"
+VISIT_COUNTER_ON
 ```
 
 **Шаг 5. Пересоздать ТОЛЬКО EasyWeek inbox worker.** Команда меняет production:
@@ -3759,13 +3821,40 @@ $COMPOSE exec -T postgres psql -U altegio -d altegio_bot -c "SELECT id, easyweek
 описывают визиты, которые действительно состоялись, и повторно их получить
 неоткуда. Миграция при откате флага не откатывается.
 
-**Откат, шаг 1.** Команда меняет production `easyweek.env`. Ожидаемый результат:
-ровно одна строка флага со значением `false`.
+**Откат, шаг 1.** Команда меняет production `easyweek.env` тем же контрактом,
+что и §15.3 шаг 4, — включая обработку отсутствующего и дублированного ключа.
+Ожидаемый результат: ровно одна строка ключа со значением `false`, остальные
+строки не тронуты.
 
 ```bash
 cd /opt/altegio_bot
-sed -i 's/^EASYWEEK_VISIT_COUNTER_ENABLED=true$/EASYWEEK_VISIT_COUNTER_ENABLED=false/' easyweek.env
-grep -Ec '^EASYWEEK_VISIT_COUNTER_ENABLED=false$' easyweek.env
+bash <<'VISIT_COUNTER_OFF'
+set -euo pipefail
+ENV_FILE="${ENV_FILE:-/opt/altegio_bot/easyweek.env}"
+KEY=EASYWEEK_VISIT_COUNTER_ENABLED
+TARGET=false
+test -f "$ENV_FILE"
+test ! -L "$ENV_FILE"
+FOUND_RC=0
+FOUND="$(grep -Ec "^${KEY}=" "$ENV_FILE")" || FOUND_RC=$?
+test "$FOUND_RC" -le 1
+test "$FOUND" -le 1
+ENV_TMP="$(mktemp "${ENV_FILE}.visitcounter.XXXXXX")"
+trap 'rm -f "$ENV_TMP"' EXIT
+cp -p "$ENV_FILE" "$ENV_TMP"
+KEPT_RC=0
+grep -Ev "^${KEY}=" "$ENV_FILE" > "$ENV_TMP" || KEPT_RC=$?
+test "$KEPT_RC" -le 1
+printf '%s=%s\n' "$KEY" "$TARGET" >> "$ENV_TMP"
+test "$(grep -Ec "^${KEY}=" "$ENV_TMP")" = "1"
+test "$(grep -E "^${KEY}=" "$ENV_TMP")" = "${KEY}=${TARGET}"
+diff <(grep -Ev "^${KEY}=" "$ENV_FILE") <(grep -Ev "^${KEY}=" "$ENV_TMP") > /dev/null
+mv -f "$ENV_TMP" "$ENV_FILE"
+trap - EXIT
+test "$(grep -Ec "^${KEY}=" "$ENV_FILE")" = "1"
+test "$(grep -E "^${KEY}=" "$ENV_FILE")" = "${KEY}=${TARGET}"
+echo "visit counter flag now ${TARGET}"
+VISIT_COUNTER_OFF
 ```
 
 **Откат, шаг 2.** Команда меняет production: пересоздаёт один контейнер.

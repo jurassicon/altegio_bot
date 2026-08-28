@@ -36,6 +36,24 @@
 PR-11 намеренно не делается: прошлые визиты не доказаны ни одним сохранённым
 ``booking-succeeded``, а придумывать их значение нельзя.
 
+Плюс одна колонка в ``easyweek_events``:
+
+  * ``review_deferred_at`` (TIMESTAMPTZ, nullable) — визит доказан и счётчик
+    записан, но отзыв рассмотреть не удалось: мастер-фенс уведомлений был
+    закрыт.
+
+Она существует потому, что счётчик и отзыв — два независимых потребителя одного
+``booking-succeeded`` с разными фенсами. Счётчик обязан коммититься при
+выключенных уведомлениях, поэтому удержать событие откатом транзакции нельзя —
+это уничтожило бы счётчик. Оставить строку нетерминальной тоже нельзя: она
+стала бы predecessor и заблокировала бы последующие lifecycle-события своей
+booking. Отметка позволяет строке стать ``processed`` и при этом остаться
+восстановимой, когда фенс откроется.
+
+Partial-индекс покрывает ровно скан восстановления
+(``WHERE review_deferred_at IS NOT NULL``) и на подавляющем большинстве строк,
+где отметки нет, места не занимает.
+
 Revision ID: a7c3e91b5d24
 Revises: d4e8a1c39f57
 Create Date: 2026-08-28
@@ -51,6 +69,9 @@ depends_on = None
 
 _VISITS_TOTAL = "easyweek_visits_total"
 _VISITS_TOTAL_UPDATED_AT = "easyweek_visits_total_updated_at"
+
+_REVIEW_DEFERRED_AT = "review_deferred_at"
+_REVIEW_DEFERRED_INDEX = "ix_easyweek_events_review_deferred"
 
 _PROVIDER_CHECK = "ck_clients_easyweek_visits_total_provider"
 _POSITIVE_CHECK = "ck_clients_easyweek_visits_total_positive"
@@ -80,8 +101,23 @@ def upgrade() -> None:
         f"({_VISITS_TOTAL} IS NULL) = ({_VISITS_TOTAL_UPDATED_AT} IS NULL)",
     )
 
+    op.add_column(
+        "easyweek_events",
+        sa.Column(_REVIEW_DEFERRED_AT, sa.DateTime(timezone=True), nullable=True),
+    )
+    op.create_index(
+        _REVIEW_DEFERRED_INDEX,
+        "easyweek_events",
+        [_REVIEW_DEFERRED_AT],
+        unique=False,
+        postgresql_where=sa.text(f"{_REVIEW_DEFERRED_AT} IS NOT NULL"),
+    )
+
 
 def downgrade() -> None:
+    op.drop_index(_REVIEW_DEFERRED_INDEX, table_name="easyweek_events")
+    op.drop_column("easyweek_events", _REVIEW_DEFERRED_AT)
+
     # Constraints first: dropping a column that a CHECK still references fails
     # on PostgreSQL, and the order must mirror upgrade() exactly so a
     # downgrade/upgrade cycle leaves the same schema.

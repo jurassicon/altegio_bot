@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pytest
@@ -26,11 +27,13 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 import altegio_bot.db as app_db
+from altegio_bot.easyweek_locations import configured_easyweek_locations
 from altegio_bot.easyweek_normalizer import canonical_booking_uuid
 from altegio_bot.models.models import Client, EasyWeekEvent, MessageJob, Record
 from altegio_bot.settings import settings
 from altegio_bot.tests.easyweek_fixtures import (
     TEST_BOOKING_ID,
+    TEST_BOOKING_UUID,
     TEST_CUSTOMER_ID,
     TEST_LOCATION_ID,
     TEST_LOCATION_UUID,
@@ -39,6 +42,11 @@ from altegio_bot.tests.easyweek_fixtures import (
     booking_updated,
 )
 from altegio_bot.workers import easyweek_inbox_worker as worker
+
+# A SECOND synthetic booking for the same customer: two bookings are what put
+# two transactions on one Client row, which is the only way to contend the lock.
+SECOND_BOOKING_UUID = "22222222-3333-4444-8555-666666666666"
+SECOND_BOOKING_ID = 4200002
 
 
 @pytest.fixture(autouse=True)
@@ -257,12 +265,133 @@ async def test_a_lower_snapshot_never_walks_the_counter_back(bound_session_local
     assert [e.status for e in await _event_rows(bound_session_local)][-1] == "processed"
 
 
-async def test_two_concurrent_deliveries_neither_lose_nor_lower_the_result(bound_session_local, monkeypatch) -> None:
-    """Row lock, not read-modify-write in Python.
+async def _seed_second_booking(session_maker) -> None:
+    """A SECOND EasyWeek booking for the SAME customer, in the same branch.
 
-    Both events are for the same booking, so the predecessor rule already
-    serialises them; the lock is what makes the outcome correct even when two
-    workers race on the same client from different bookings.
+    Two bookings, not two deliveries of one: the predecessor rule serialises
+    everything sharing a `booking_uuid`, so a single booking can never reach the
+    Client row lock from two transactions at once. Only two distinct bookings
+    that resolve to one Client put two writers on the same row.
+    """
+    payload = booking_created()
+    payload["uid"] = SECOND_BOOKING_UUID
+    payload["id"] = SECOND_BOOKING_ID
+    payload["booking_hash_id"] = "90000002"
+    payload["booking_page"] = "https://eyw.me/r/90000002"
+    async with session_maker() as session:
+        async with session.begin():
+            await _capture(session, payload, event_hint="booking-created", payload_hash="created-2")
+    await _run_until_idle()
+
+
+def _second_succeeded(*, visits_total: int) -> dict[str, Any]:
+    payload = _succeeded(visits_total=visits_total)
+    payload["uid"] = SECOND_BOOKING_UUID
+    payload["id"] = SECOND_BOOKING_ID
+    return payload
+
+
+async def test_two_bookings_of_one_client_serialise_on_the_client_row_lock(bound_session_local, monkeypatch) -> None:
+    """The lower snapshot must not overwrite the higher one, whatever the order.
+
+    This is a real lock test, and it is built to FAIL if
+    ``Client.with_for_update()`` is removed from ``record_visit_counter``.
+
+    The two transactions are interleaved deliberately rather than merely started
+    together:
+
+    * T1 (visits_total=6) enters ``record_visit_counter``, takes the Client row
+      lock and then holds its transaction open;
+    * T2 (visits_total=4) starts while T1 still holds it, and is made to commit
+      LAST.
+
+    With the lock, T2 blocks inside its own SELECT until T1 commits, then re-reads
+    6, sees 4 < 6 and refuses — final value 6. Without it, T2 reads the pre-T1
+    snapshot (no counter yet), writes 4 and commits after T1 — final value 4, and
+    this test fails. Committing last is the part that matters: `asyncio.gather`
+    alone would let T2 finish first and the assertion would pass either way.
+    """
+    _counter_on(monkeypatch)
+    await _seed_booking(bound_session_local)
+    await _seed_second_booking(bound_session_local)
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            high_event_id = await _capture(
+                session,
+                _succeeded(visits_total=6),
+                event_hint="booking-succeeded",
+                payload_hash="succeeded-high",
+            )
+            low_event_id = await _capture(
+                session,
+                _second_succeeded(visits_total=4),
+                event_hint="booking-succeeded",
+                payload_hash="succeeded-low",
+            )
+
+    # Both bookings must really resolve to ONE client row, or the lock is never
+    # contended and the test proves nothing.
+    async with bound_session_local() as session:
+        records = list(
+            (await session.execute(select(Record).where(Record.provider == "easyweek").order_by(Record.id)))
+            .scalars()
+            .all()
+        )
+    assert len(records) == 2
+    assert {str(r.easyweek_booking_uuid) for r in records} == {TEST_BOOKING_UUID, SECOND_BOOKING_UUID}
+    assert {r.altegio_record_id for r in records} == {TEST_BOOKING_ID, SECOND_BOOKING_ID}
+    assert len({r.company_id for r in records}) == 1
+    assert len({r.client_id for r in records}) == 1, "one client, two bookings"
+
+    registry = configured_easyweek_locations()
+    holder_took_the_lock = asyncio.Event()
+    holder_committed = asyncio.Event()
+
+    async def _writes_six() -> None:
+        async with bound_session_local() as session:
+            async with session.begin():
+                event = await session.get(EasyWeekEvent, high_event_id)
+                await worker.record_visit_counter(session, event=event, registry=registry)
+                holder_took_the_lock.set()
+                # Hold the transaction open so the other writer meets the lock.
+                await asyncio.sleep(0.3)
+        holder_committed.set()
+
+    async def _writes_four() -> None:
+        await holder_took_the_lock.wait()
+        async with bound_session_local() as session:
+            async with session.begin():
+                event = await session.get(EasyWeekEvent, low_event_id)
+                # With the row lock this call blocks here until T1 commits.
+                await worker.record_visit_counter(session, event=event, registry=registry)
+                # Commit LAST either way, so an unlocked read-modify-write would
+                # land its stale 4 on top of the 6.
+                await asyncio.wait_for(holder_committed.wait(), timeout=10)
+
+    await asyncio.wait_for(asyncio.gather(_writes_six(), _writes_four()), timeout=30)
+
+    client = await _client_row(bound_session_local)
+    assert client.easyweek_visits_total == 6, "the lower snapshot must never overwrite the higher"
+
+    # Both deliveries still reach a correct terminal state through the worker,
+    # and re-processing them changes nothing.
+    stamp = client.easyweek_visits_total_updated_at
+    await _run_until_idle()
+
+    final = await _client_row(bound_session_local)
+    statuses = {e.payload_hash: e.status for e in await _event_rows(bound_session_local)}
+    assert final.easyweek_visits_total == 6
+    assert final.easyweek_visits_total_updated_at == stamp
+    assert statuses["succeeded-high"] == "processed"
+    assert statuses["succeeded-low"] == "processed"
+
+
+async def test_one_booking_still_serialises_through_the_predecessor_rule(bound_session_local, monkeypatch) -> None:
+    """The lifecycle contract for a single booking is unchanged.
+
+    Kept alongside the lock test: two deliveries of the SAME booking must still
+    be ordered by the predecessor rule, and the highest snapshot must still win.
     """
     _counter_on(monkeypatch)
     await _seed_booking(bound_session_local)
@@ -285,9 +414,9 @@ async def test_two_concurrent_deliveries_neither_lose_nor_lower_the_result(bound
     await asyncio.gather(_run_until_idle(), _run_until_idle())
 
     client = await _client_row(bound_session_local)
-    assert client.easyweek_visits_total == 6, "the highest proven snapshot wins, whatever the order"
+    assert client.easyweek_visits_total == 6
     statuses = [e.status for e in await _event_rows(bound_session_local)]
-    assert statuses.count("processed") == 3, "both succeeded events reached a terminal state"
+    assert statuses.count("processed") == 3
 
 
 # ===========================================================================
@@ -605,3 +734,269 @@ def test_one_effective_gate_answers_for_every_succeeded_consumer(
     monkeypatch.setattr(settings, "easyweek_visit_counter_enabled", counter, raising=False)
 
     assert worker.succeeded_consumer_enabled() is expected
+
+
+# ===========================================================================
+# A notification pause must not destroy a review the visit earned
+# ===========================================================================
+#
+# The counter and the review are two independent consumers of one
+# `booking-succeeded`, behind two different fences. PR-11 made the counter
+# claim the event even with notifications off — correctly, since the counter
+# sends nothing — and that quietly created a way to lose a review: the event
+# reached `processed` with the review never considered, and a `processed` row
+# is never claimed again.
+#
+# The fix is a narrow durable marker rather than a held claim. Holding the row
+# `captured` would have to roll back the counter with it, and would make the row
+# a predecessor blocking its own booking. So the row terminalizes AND records
+# that a review is still owed.
+
+REVIEW_URL = "https://g.page/r/CfakeFAKEfake123/review"
+
+
+def _review_links_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        settings,
+        "easyweek_google_review_links",
+        json.dumps({str(TEST_LOCATION_ID): REVIEW_URL}),
+        raising=False,
+    )
+
+
+def _reviews_wanted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The operator wants reviews. Whether the fence is open is a separate flag."""
+    monkeypatch.setattr(settings, "easyweek_reviews_enabled", True, raising=False)
+    _review_links_on(monkeypatch)
+
+
+def _fence_open(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "easyweek_notifications_enabled", True, raising=False)
+
+
+def _future_start(**delta) -> datetime:
+    # Whole seconds: the webhook format cannot express microseconds, so a
+    # `utcnow()` with them would not survive the round trip.
+    return (datetime.now(timezone.utc) + timedelta(**delta)).replace(microsecond=0)
+
+
+def _booking_starting(payload: dict[str, Any], start: datetime) -> dict[str, Any]:
+    end = start + timedelta(hours=1)
+    payload["booking_date_start"] = start.strftime("%Y-%m-%dT%H:%M:%S+0000")
+    payload["booking_date_end"] = end.strftime("%Y-%m-%dT%H:%M:%S+0000")
+    return payload
+
+
+async def _seed_future_booking(session_maker) -> None:
+    """A booking whose review moment (`starts_at + 3d`) is still ahead."""
+    async with session_maker() as session:
+        async with session.begin():
+            await _capture(
+                session,
+                _booking_starting(booking_created(), _future_start(days=1)),
+                event_hint="booking-created",
+                payload_hash="created-1",
+            )
+    await _run_until_idle()
+
+
+async def _review_jobs(session_maker) -> list[MessageJob]:
+    async with session_maker() as session:
+        return list(
+            (
+                await session.execute(
+                    select(MessageJob).where(MessageJob.job_type == "review_3d").order_by(MessageJob.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+
+async def _deliver_future_succeeded(session_maker, *, visits_total=3, payload_hash="succeeded-1"):
+    payload = _booking_starting(_succeeded(visits_total=visits_total), _future_start(days=1))
+    async with session_maker() as session:
+        async with session.begin():
+            await _capture(session, payload, event_hint="booking-succeeded", payload_hash=payload_hash)
+    return await _run_until_idle()
+
+
+# --- A: counter on, reviews wanted, fence shut ------------------------------
+
+
+async def test_a_closed_fence_keeps_the_counter_and_the_review_obligation(bound_session_local, monkeypatch) -> None:
+    _counter_on(monkeypatch)
+    _reviews_wanted(monkeypatch)  # notifications deliberately still off
+    await _seed_future_booking(bound_session_local)
+
+    await _deliver_future_succeeded(bound_session_local, visits_total=3)
+
+    client = await _client_row(bound_session_local)
+    event = (await _event_rows(bound_session_local))[-1]
+
+    assert client.easyweek_visits_total == 3, "the counter does not wait for the notification fence"
+    assert await _review_jobs(bound_session_local) == [], "and no message is queued while it is shut"
+    # Terminal for the queue, but NOT irreversibly done: the obligation is
+    # recorded on the row itself.
+    assert event.status == "processed"
+    assert event.review_deferred_at is not None
+
+
+async def test_the_deferred_obligation_is_recorded_only_when_reviews_are_wanted(
+    bound_session_local, monkeypatch
+) -> None:
+    """Reviews OFF is a decision, not a pause — it owes nothing."""
+    _counter_on(monkeypatch)
+    await _seed_future_booking(bound_session_local)
+
+    await _deliver_future_succeeded(bound_session_local, visits_total=3)
+
+    event = (await _event_rows(bound_session_local))[-1]
+    assert event.status == "processed"
+    assert event.review_deferred_at is None
+
+
+# --- B: the fence opens -----------------------------------------------------
+
+
+async def test_opening_the_fence_recovers_exactly_one_review(bound_session_local, monkeypatch) -> None:
+    _counter_on(monkeypatch)
+    _reviews_wanted(monkeypatch)
+    await _seed_future_booking(bound_session_local)
+    await _deliver_future_succeeded(bound_session_local, visits_total=3)
+
+    before = await _client_row(bound_session_local)
+    stamp = before.easyweek_visits_total_updated_at
+
+    _fence_open(monkeypatch)
+    reconsidered = await worker.recover_deferred_reviews()
+    # A second pass must find nothing left to do.
+    again = await worker.recover_deferred_reviews()
+
+    jobs = await _review_jobs(bound_session_local)
+    client = await _client_row(bound_session_local)
+    event = (await _event_rows(bound_session_local))[-1]
+
+    assert reconsidered == 1
+    assert again == 0, "the obligation is discharged, not re-offered forever"
+    assert len(jobs) == 1, "at most one review per booking"
+    assert jobs[0].provider == "easyweek"
+    assert jobs[0].company_id == TEST_LOCATION_ID
+    # Recovery reconsiders the review and nothing else.
+    assert client.easyweek_visits_total == 3
+    assert client.easyweek_visits_total_updated_at == stamp
+    assert event.status == "processed"
+    assert event.review_deferred_at is None
+
+
+async def test_a_resend_after_recovery_adds_no_second_review_and_no_second_count(
+    bound_session_local, monkeypatch
+) -> None:
+    _counter_on(monkeypatch)
+    _reviews_wanted(monkeypatch)
+    await _seed_future_booking(bound_session_local)
+    await _deliver_future_succeeded(bound_session_local, visits_total=3)
+    _fence_open(monkeypatch)
+    await worker.recover_deferred_reviews()
+    stamp = (await _client_row(bound_session_local)).easyweek_visits_total_updated_at
+
+    await _deliver_future_succeeded(bound_session_local, visits_total=3, payload_hash="succeeded-2")
+
+    client = await _client_row(bound_session_local)
+    assert len(await _review_jobs(bound_session_local)) == 1
+    assert client.easyweek_visits_total == 3
+    assert client.easyweek_visits_total_updated_at == stamp
+
+
+async def test_recovery_does_nothing_while_the_fence_stays_shut(bound_session_local, monkeypatch) -> None:
+    """No decision is possible, so no rows are read — that is what stops a busy loop."""
+    _counter_on(monkeypatch)
+    _reviews_wanted(monkeypatch)
+    await _seed_future_booking(bound_session_local)
+    await _deliver_future_succeeded(bound_session_local, visits_total=3)
+
+    assert await worker.recover_deferred_reviews() == 0
+    assert await worker.recover_deferred_reviews() == 0
+
+    event = (await _event_rows(bound_session_local))[-1]
+    assert event.review_deferred_at is not None, "still owed"
+    assert await _review_jobs(bound_session_local) == []
+
+
+# --- C: a waiting review must not hold up its own booking -------------------
+
+
+async def test_a_deferred_review_does_not_block_later_lifecycle_events(bound_session_local, monkeypatch) -> None:
+    _counter_on(monkeypatch)
+    _reviews_wanted(monkeypatch)
+    await _seed_future_booking(bound_session_local)
+    await _deliver_future_succeeded(bound_session_local, visits_total=3)
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(
+                session,
+                _booking_starting(booking_updated(), _future_start(days=2)),
+                event_hint="booking-updated",
+                payload_hash="updated-1",
+            )
+            await _capture(session, booking_canceled(), event_hint="booking-canceled", payload_hash="cancel-1")
+
+    processed = await _run_until_idle()
+
+    rows = {e.payload_hash: e for e in await _event_rows(bound_session_local)}
+    assert processed >= 2, "later deliveries of the same booking keep flowing"
+    assert rows["updated-1"].status == "processed"
+    assert rows["cancel-1"].status == "processed"
+    # The obligation is untouched by the lifecycle events that overtook it.
+    assert rows["succeeded-1"].review_deferred_at is not None
+    record = await _record_row(bound_session_local)
+    assert bool(record.is_deleted) is True
+
+
+async def test_a_deferred_review_is_never_reclaimed_as_an_event(bound_session_local, monkeypatch) -> None:
+    """No tight retry loop: the row is terminal, so the claim never sees it again."""
+    _counter_on(monkeypatch)
+    _reviews_wanted(monkeypatch)
+    await _seed_future_booking(bound_session_local)
+    await _deliver_future_succeeded(bound_session_local, visits_total=3)
+
+    assert await _run_until_idle() == 0, "nothing left to claim"
+
+    event = (await _event_rows(bound_session_local))[-1]
+    assert event.status == "processed"
+    assert event.next_retry_at is None
+    assert event.review_deferred_at is not None
+
+
+# --- D: counter-only is unaffected ------------------------------------------
+
+
+async def test_counter_only_still_completes_without_any_obligation(bound_session_local, monkeypatch) -> None:
+    _counter_on(monkeypatch)
+    await _seed_future_booking(bound_session_local)
+
+    await _deliver_future_succeeded(bound_session_local, visits_total=5)
+
+    client = await _client_row(bound_session_local)
+    event = (await _event_rows(bound_session_local))[-1]
+
+    assert client.easyweek_visits_total == 5
+    assert await _review_jobs(bound_session_local) == []
+    assert event.status == "processed"
+    assert event.review_deferred_at is None
+    # And recovery has nothing to reconsider even once the fence opens.
+    _fence_open(monkeypatch)
+    assert await worker.recover_deferred_reviews() == 0
+
+
+async def test_reviews_wanted_without_the_counter_is_unchanged_pr9_behaviour(bound_session_local, monkeypatch) -> None:
+    """counter=false, reviews=true, notifications=false — exactly as before PR-11."""
+    _reviews_wanted(monkeypatch)  # counter stays off
+    await _seed_future_booking(bound_session_local)
+    await _deliver_future_succeeded(bound_session_local, visits_total=3)
+
+    event = (await _event_rows(bound_session_local))[-1]
+    assert event.status == "captured", "no enabled consumer, so it is never claimed"
+    assert event.review_deferred_at is None, "an unclaimed row owes nothing yet"
+    assert (await _client_row(bound_session_local)).easyweek_visits_total is None

@@ -13,7 +13,9 @@ Two things are pinned here that no unit test can see:
 from __future__ import annotations
 
 import json
+import os
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -110,13 +112,16 @@ def test_the_runbook_documents_the_full_rollout_and_rollback() -> None:
     section = _visit_counter_section()
 
     for required in (
-        f"{FLAG}=false",
-        f"{FLAG}=true",
+        # The value is applied through the upsert contract, not a literal
+        # `KEY=value` line the operator is told to paste.
+        "TARGET=true",
+        "TARGET=false",
         "alembic upgrade head",
         "easyweek_visit_counter_preflight",
         f"up -d --force-recreate {COUNTER_SERVICE}",
     ):
         assert required in section, required
+    assert FLAG in section
 
 
 def _command_blocks() -> list[tuple[str, str]]:
@@ -417,3 +422,185 @@ async def test_a_config_error_does_not_read_the_queue(bound_session_local, monke
     assert report.config_error == "visit_counter_already_enabled"
     assert report.candidate_count == 0, "auditing a world that no longer exists proves nothing"
     assert report.ready is False
+
+
+# ===========================================================================
+# The env-flag blocks, actually executed
+# ===========================================================================
+#
+# Production `easyweek.env` is gitignored and is never refreshed from
+# `easyweek.env.example`, so the new key is most likely absent there. The first
+# draft used a replacement-only `sed -i 's/^KEY=false$/KEY=true/'`, which on such
+# a file changes nothing, exits 0, and leaves the operator believing the counter
+# is on.
+#
+# These tests lift the runbook's own blocks out of the markdown and run them
+# against a throwaway env file, so "the documented rollout works" is a fact.
+
+FLAG_LINE_TRUE = f"{FLAG}=true"
+FLAG_LINE_FALSE = f"{FLAG}=false"
+
+# Deliberately fake. No production secret or real value is copied into this PR.
+NEIGHBOUR_LINES = (
+    "# --- a comment that must survive byte for byte -----------------------------",
+    "EASYWEEK_API_KEY=NOT_A_REAL_KEY_FIXTURE",
+    "EASYWEEK_WEBHOOK_SECRET=NOT_A_REAL_SECRET_FIXTURE",
+    'EASYWEEK_LOCATION_MAP={"branch":{"location_id":999001}}',
+    "",
+    "# trailing comment",
+)
+SECRET_VALUES = ("NOT_A_REAL_KEY_FIXTURE", "NOT_A_REAL_SECRET_FIXTURE")
+
+
+def _env_block(label: str) -> str:
+    """The body of one `bash <<'LABEL'` block in the PR-11 section."""
+    match = re.search(rf"bash <<'{label}'\n(.*?)\n{label}\n", _visit_counter_section(), flags=re.S)
+    assert match is not None, f"runbook block {label} is missing"
+    return match.group(1)
+
+
+def _run_env_block(label: str, env_file) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["bash", "-c", _env_block(label)],
+        capture_output=True,
+        text=True,
+        env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "ENV_FILE": str(env_file)},
+    )
+
+
+def _write_env(tmp_path, *flag_lines: str):
+    env_file = tmp_path / "easyweek.env"
+    lines = list(NEIGHBOUR_LINES[:4]) + list(flag_lines) + list(NEIGHBOUR_LINES[4:])
+    env_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return env_file
+
+
+def _flag_lines(env_file) -> list[str]:
+    return [line for line in env_file.read_text().splitlines() if line.startswith(f"{FLAG}=")]
+
+
+def _other_lines(env_file) -> list[str]:
+    return [line for line in env_file.read_text().splitlines() if not line.startswith(f"{FLAG}=")]
+
+
+def test_the_rollout_adds_the_key_when_production_does_not_have_it(tmp_path) -> None:
+    """The exact production shape: gitignored env, key never added."""
+    env_file = _write_env(tmp_path)
+    before_others = _other_lines(env_file)
+    assert _flag_lines(env_file) == []
+
+    result = _run_env_block("VISIT_COUNTER_ON", env_file)
+
+    assert result.returncode == 0, result.stderr
+    assert _flag_lines(env_file) == [FLAG_LINE_TRUE]
+    assert _other_lines(env_file) == before_others, "everything else is byte for byte"
+
+
+def test_the_rollout_replaces_an_existing_false(tmp_path) -> None:
+    env_file = _write_env(tmp_path, FLAG_LINE_FALSE)
+    before_others = _other_lines(env_file)
+
+    result = _run_env_block("VISIT_COUNTER_ON", env_file)
+
+    assert result.returncode == 0, result.stderr
+    assert _flag_lines(env_file) == [FLAG_LINE_TRUE]
+    assert _other_lines(env_file) == before_others
+
+
+def test_the_rollback_sets_false_through_the_same_contract(tmp_path) -> None:
+    env_file = _write_env(tmp_path, FLAG_LINE_TRUE)
+    before_others = _other_lines(env_file)
+
+    result = _run_env_block("VISIT_COUNTER_OFF", env_file)
+
+    assert result.returncode == 0, result.stderr
+    assert _flag_lines(env_file) == [FLAG_LINE_FALSE]
+    assert _other_lines(env_file) == before_others
+
+
+def test_the_rollback_also_adds_the_key_when_it_is_missing(tmp_path) -> None:
+    env_file = _write_env(tmp_path)
+
+    result = _run_env_block("VISIT_COUNTER_OFF", env_file)
+
+    assert result.returncode == 0, result.stderr
+    assert _flag_lines(env_file) == [FLAG_LINE_FALSE]
+
+
+@pytest.mark.parametrize("label", ["VISIT_COUNTER_ON", "VISIT_COUNTER_OFF"])
+def test_duplicate_assignments_stop_before_the_file_is_touched(tmp_path, label: str) -> None:
+    """Last-wins on a duplicated key is not a state anybody chose."""
+    env_file = _write_env(tmp_path, FLAG_LINE_FALSE, FLAG_LINE_TRUE)
+    before = env_file.read_bytes()
+
+    result = _run_env_block(label, env_file)
+
+    assert result.returncode != 0, result.stdout
+    assert env_file.read_bytes() == before
+    assert list(tmp_path.glob("easyweek.env.visitcounter.*")) == [], "the trap cleans the temp up"
+
+
+@pytest.mark.parametrize("label", ["VISIT_COUNTER_ON", "VISIT_COUNTER_OFF"])
+def test_a_symlinked_env_file_is_refused(tmp_path, label: str) -> None:
+    real = _write_env(tmp_path, FLAG_LINE_FALSE)
+    link = tmp_path / "linked.env"
+    link.symlink_to(real)
+    before = real.read_bytes()
+
+    result = _run_env_block(label, link)
+
+    assert result.returncode != 0
+    assert real.read_bytes() == before
+
+
+@pytest.mark.parametrize("label", ["VISIT_COUNTER_ON", "VISIT_COUNTER_OFF"])
+def test_no_neighbouring_secret_reaches_stdout_or_stderr(tmp_path, label: str) -> None:
+    env_file = _write_env(tmp_path, FLAG_LINE_FALSE)
+
+    result = _run_env_block(label, env_file)
+    printed = result.stdout + result.stderr
+
+    assert result.returncode == 0, result.stderr
+    for secret in SECRET_VALUES:
+        assert secret not in printed, secret
+    assert "EASYWEEK_LOCATION_MAP" not in printed
+
+
+@pytest.mark.parametrize("label", ["VISIT_COUNTER_ON", "VISIT_COUNTER_OFF"])
+def test_the_env_edit_is_a_sibling_temp_and_an_atomic_rename(label: str) -> None:
+    block = _env_block(label)
+
+    assert "set -euo pipefail" in block
+    assert 'ENV_TMP="$(mktemp "${ENV_FILE}.visitcounter.XXXXXX")"' in block, "sibling, same filesystem"
+    assert "trap 'rm -f \"$ENV_TMP\"' EXIT" in block
+    assert 'cp -p "$ENV_FILE" "$ENV_TMP"' in block, "owner and mode carried over"
+    assert 'mv -f "$ENV_TMP" "$ENV_FILE"' in block
+    assert 'cat "$ENV_TMP" > "$ENV_FILE"' not in block, "never truncate the live file"
+    assert "|| true" not in block, "a real read error must not be masked"
+    # A real assertion on the result, not a printed count.
+    assert 'test "$(grep -Ec "^${KEY}=" "$ENV_FILE")" = "1"' in block
+    assert 'test "$(grep -E "^${KEY}=" "$ENV_FILE")" = "${KEY}=${TARGET}"' in block
+
+
+def test_rollout_and_rollback_differ_only_in_the_target_value() -> None:
+    """One contract, two values — so a fix to one cannot miss the other."""
+    on = _env_block("VISIT_COUNTER_ON").replace("TARGET=true", "TARGET=<value>")
+    off = _env_block("VISIT_COUNTER_OFF").replace("TARGET=false", "TARGET=<value>")
+
+    assert on == off
+
+
+def test_the_first_rollout_step_does_not_demand_an_existing_line(tmp_path) -> None:
+    """Production may not have the key at all; step 1 must still pass there."""
+    missing = _write_env(tmp_path)
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    already_false = _write_env(sub, FLAG_LINE_FALSE)
+    already_true = tmp_path / "on.env"
+    already_true.write_text(f"{FLAG_LINE_TRUE}\n", encoding="utf-8")
+
+    assert _run_env_block("VISIT_COUNTER_OFF_ASSERT", missing).returncode == 0
+    assert _run_env_block("VISIT_COUNTER_OFF_ASSERT", already_false).returncode == 0
+    assert _run_env_block("VISIT_COUNTER_OFF_ASSERT", already_true).returncode != 0, (
+        "and it must refuse when the counter is already on"
+    )

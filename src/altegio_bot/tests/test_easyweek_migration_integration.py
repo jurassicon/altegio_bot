@@ -238,6 +238,7 @@ async def test_migration_compatibility_scenarios(temp_db_url) -> None:
     #   8705ec49cc73 (PR-1 follow-up) -> body_raw, body_size_bytes
     #   d4e8a1c39f57 (PR-4)           -> booking_uuid, processed_at, error_code,
     #                                    processing_attempts, next_retry_at
+    #   a7c3e91b5d24 (PR-11)          -> review_deferred_at
     # The point of the assertion is that the downgrade is scoped — it must not
     # take the base capture columns with it.
     assert removed == {
@@ -248,6 +249,7 @@ async def test_migration_compatibility_scenarios(temp_db_url) -> None:
         "error_code",
         "processing_attempts",
         "next_retry_at",
+        "review_deferred_at",
     }, f"downgrade removed too much: {removed}"
 
     remaining_indexes = await _fetch(
