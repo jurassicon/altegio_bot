@@ -26,6 +26,28 @@ of boundary:
   manifest is not secret, but errors from it end up in tickets, and the habit of
   echoing configuration is how tokens leak.
 
+The wave selector
+-----------------
+The cutover runs in waves: the first one migrates an explicitly chosen set of
+masters, and the nail-service masters follow in a later wave. That decision has
+to be **stated**, not implied.
+
+Leaving a master out of the ``staff`` mapping would exclude them too — and that
+is exactly why it is forbidden as a mechanism. "No mapping" already means
+"somebody has not finished the manifest", and overloading it with "we meant to
+leave her out" makes the two indistinguishable: the day an operator forgets a
+master, the tool would silently agree with them and the completeness check would
+call the wave finished.
+
+So every branch names both sets by Altegio staff id:
+
+* ``selected_altegio_staff_ids`` — migrating in THIS wave, and each one must have
+  a real EasyWeek UUID in ``staff``;
+* ``deferred_altegio_staff_ids`` — deliberately not migrating yet.
+
+A master seen in the window who is in neither set is unknown, and blocks. Names
+are never runtime identity — they may appear in an operator's notes, never here.
+
 The manifest holds ids only. It carries no customer data of any kind, which is
 why it is the one migration input that may safely live in Git.
 """
@@ -71,11 +93,20 @@ EXPECTED_BRANCH_SLUG: Final[dict[int, str]] = {
 
 PG_BIGINT_MAX: Final = 9_223_372_036_854_775_807
 
+# The three answers to "does this master migrate in this wave?".
+STAFF_SELECTED: Final = "selected"
+STAFF_DEFERRED: Final = "deferred"
+STAFF_UNKNOWN: Final = "unknown"
+
 _BRANCH_FIELDS: Final = frozenset(
     {
         "altegio_company_id",
         "easyweek_location_id",
         "easyweek_location_uuid",
+        # The wave selector. Every master seen in the window must appear in
+        # exactly one of these two lists — see the module docstring.
+        "selected_altegio_staff_ids",
+        "deferred_altegio_staff_ids",
         "staff",
         "services",
     }
@@ -108,6 +139,11 @@ INVALID_NOT_JSON: Final = "manifest_not_json"
 INVALID_SHAPE: Final = "manifest_shape_invalid"
 INVALID_EMPTY: Final = "manifest_empty"
 INVALID_UNKNOWN_COMPANY: Final = "manifest_unknown_company"
+# The wave selector's own invariants. Each is a manifest an operator has to
+# fix before any mode will act on it.
+INVALID_STAFF_SCOPE_OVERLAP: Final = "manifest_staff_scope_overlap"
+INVALID_SELECTED_STAFF_UNMAPPED: Final = "manifest_selected_staff_unmapped"
+INVALID_STAFF_SCOPE_EMPTY: Final = "manifest_staff_scope_empty"
 
 
 class _DuplicateJSONKey(Exception):
@@ -146,6 +182,10 @@ class BranchMapping:
     altegio_company_id: int
     easyweek_location_id: int
     easyweek_location_uuid: str
+    # The wave selector, by Altegio staff id. Disjoint by construction; the
+    # parser refuses a manifest where they overlap.
+    selected_staff_ids: frozenset[int]
+    deferred_staff_ids: frozenset[int]
     # Altegio staff id → EasyWeek staff uuid, scoped to THIS company.
     staff: dict[int, str]
     # Altegio service id → its EasyWeek target and catalogue baseline, scoped to
@@ -157,6 +197,20 @@ class BranchMapping:
         if type(altegio_staff_id) is not int:
             return None
         return self.staff.get(altegio_staff_id)
+
+    def staff_scope(self, altegio_staff_id: object) -> str:
+        """Which wave this master belongs to: selected, deferred or unknown.
+
+        A non-integer id is unknown, not deferred: we could not classify it, and
+        "we could not tell" must never read as "deliberately left out".
+        """
+        if type(altegio_staff_id) is not int:
+            return STAFF_UNKNOWN
+        if altegio_staff_id in self.selected_staff_ids:
+            return STAFF_SELECTED
+        if altegio_staff_id in self.deferred_staff_ids:
+            return STAFF_DEFERRED
+        return STAFF_UNKNOWN
 
     def service(self, altegio_service_id: object) -> ServiceMapping | None:
         """Exact lookup only. An unmapped or non-integer id resolves to nothing."""
@@ -203,6 +257,8 @@ class MigrationManifest:
                     "easyweek_location_uuid": branch.easyweek_location_uuid,
                     "staff_mappings": len(branch.staff),
                     "service_mappings": len(branch.services),
+                    "selected_staff_ids": sorted(branch.selected_staff_ids),
+                    "deferred_staff_ids": sorted(branch.deferred_staff_ids),
                 }
                 for _company_id, branch in sorted(self.branches.items())
             ],
@@ -267,6 +323,26 @@ def _parse_id_to_uuid_map(raw: object) -> dict[int, str] | None:
     return result
 
 
+def _parse_staff_id_list(raw: object) -> frozenset[int] | None:
+    """Parse one wave-selector list of Altegio staff ids.
+
+    Strict for the same reason the mappings are: a selector an operator cannot
+    read back exactly is a selector they cannot verify. Exact ``int`` only —
+    ``bool`` is not an id and ``"111"`` is not a number — and a repeated id is a
+    typo worth surfacing, not silently collapsing.
+    """
+    if not isinstance(raw, list):
+        return None
+    result: set[int] = set()
+    for value in raw:
+        if type(value) is not int or not (0 < value <= PG_BIGINT_MAX):
+            return None
+        if value in result:
+            return None
+        result.add(value)
+    return frozenset(result)
+
+
 def _parse_service_map(raw: object) -> dict[int, ServiceMapping] | None:
     """Parse the ``services`` object: id → target uuid + catalogue baseline.
 
@@ -324,6 +400,12 @@ def _canonical_digest(manifest_id: str, branches: dict[int, BranchMapping]) -> s
                 "altegio_company_id": branch.altegio_company_id,
                 "easyweek_location_id": branch.easyweek_location_id,
                 "easyweek_location_uuid": branch.easyweek_location_uuid,
+                # The wave selector is part of WHAT a verified dry-run approved.
+                # Moving a master between the two lists changes which customers
+                # get booked, so it must move the digest and invalidate the
+                # reviewed plan and the canary proof along with it.
+                "selected_staff": sorted(branch.selected_staff_ids),
+                "deferred_staff": sorted(branch.deferred_staff_ids),
                 "staff": sorted(branch.staff.items()),
                 "services": sorted(
                     (
@@ -361,6 +443,8 @@ def _parse(raw: object, *, allow_empty_mappings: bool) -> MigrationManifest:
               "altegio_company_id": 758285,
               "easyweek_location_id": 100001,
               "easyweek_location_uuid": "<easyweek location uuid>",
+              "selected_altegio_staff_ids": [111],
+              "deferred_altegio_staff_ids": [112],
               "staff":    {"111": "<easyweek staff uuid>"},
               "services": {"222": "<easyweek service uuid>"}
             }
@@ -441,10 +525,35 @@ def _parse(raw: object, *, allow_empty_mappings: bool) -> MigrationManifest:
         if not allow_empty_mappings and (not staff or not services):
             return _invalid(INVALID_EMPTY)
 
+        selected = _parse_staff_id_list(entry.get("selected_altegio_staff_ids"))
+        deferred = _parse_staff_id_list(entry.get("deferred_altegio_staff_ids"))
+        if selected is None or deferred is None:
+            return _invalid(INVALID_SHAPE)
+
+        # A master cannot be both migrating now and deliberately postponed. The
+        # overlap is the one selector mistake that would otherwise resolve
+        # silently — whichever check ran first would win.
+        if selected & deferred:
+            return _invalid(INVALID_STAFF_SCOPE_OVERLAP)
+
+        # A selected master MUST have a real EasyWeek UUID. This is what stops
+        # "no mapping" from working as a back-door way to exclude somebody: if
+        # you meant to leave her out, say so in `deferred_altegio_staff_ids`.
+        if selected - set(staff):
+            return _invalid(INVALID_SELECTED_STAFF_UNMAPPED)
+
+        # An empty selector is an unfinished manifest for every writing mode:
+        # a wave that migrates nobody is not a wave. `inventory` runs before the
+        # selector exists, which is exactly what it is for.
+        if not allow_empty_mappings and not selected:
+            return _invalid(INVALID_STAFF_SCOPE_EMPTY)
+
         branches[company_id] = BranchMapping(
             altegio_company_id=company_id,
             easyweek_location_id=location_id,
             easyweek_location_uuid=location_uuid,
+            selected_staff_ids=selected,
+            deferred_staff_ids=deferred,
             staff=staff,
             services=services,
         )
@@ -479,8 +588,8 @@ def inventory_manifest(raw: object) -> MigrationManifest:
     supposed to tell you which ids to fill in refused to run until you had filled
     them in.
 
-    This parser therefore accepts empty (and only empty) mapping objects, and
-    keeps every other rule: the company must be one of the two migrating
+    This parser therefore accepts empty (and only empty) mapping objects and an
+    empty wave selector, and keeps every other rule: the company must be one of the two migrating
     branches, both company ids must agree, the location UUID must be canonical.
     A partially-filled mapping is still parsed strictly — a malformed entry is a
     malformed entry whatever mode is reading it.
@@ -489,6 +598,10 @@ def inventory_manifest(raw: object) -> MigrationManifest:
     :func:`parse_manifest`, which stays strictly all-or-nothing.
     """
     parsed = parse_manifest(raw)
-    if parsed.valid or parsed.reason != INVALID_EMPTY:
+    # `INVALID_STAFF_SCOPE_EMPTY` is here for the same reason as `INVALID_EMPTY`:
+    # inventory runs BEFORE the wave selector exists, and refusing to tell an
+    # operator which masters have bookings until they have already chosen which
+    # masters to migrate is the same chicken-and-egg bug in a new place.
+    if parsed.valid or parsed.reason not in (INVALID_EMPTY, INVALID_STAFF_SCOPE_EMPTY):
         return parsed
     return _parse(raw, allow_empty_mappings=True)

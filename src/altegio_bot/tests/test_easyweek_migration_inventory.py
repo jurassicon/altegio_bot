@@ -60,6 +60,8 @@ def unfinished_manifest_text() -> str:
                     "altegio_company_id": KARLSRUHE_COMPANY_ID,
                     "easyweek_location_id": 308001,
                     "easyweek_location_uuid": KA_LOCATION_UUID,
+                    "selected_altegio_staff_ids": [],
+                    "deferred_altegio_staff_ids": [],
                     "staff": {},
                     "services": {},
                 },
@@ -67,6 +69,8 @@ def unfinished_manifest_text() -> str:
                     "altegio_company_id": RASTATT_COMPANY_ID,
                     "easyweek_location_id": 315001,
                     "easyweek_location_uuid": RA_LOCATION_UUID,
+                    "selected_altegio_staff_ids": [],
+                    "deferred_altegio_staff_ids": [],
                     "staff": {},
                     "services": {},
                 },
@@ -80,6 +84,7 @@ def half_finished_manifest_text() -> str:
     payload = json.loads(unfinished_manifest_text())
     payload["manifest_id"] = "inventory-half-way"
     payload["branches"][str(KARLSRUHE_COMPANY_ID)]["staff"] = {str(KA_STAFF_ID): KA_STAFF_UUID}
+    payload["branches"][str(KARLSRUHE_COMPANY_ID)]["selected_altegio_staff_ids"] = [KA_STAFF_ID]
     return json.dumps(payload)
 
 

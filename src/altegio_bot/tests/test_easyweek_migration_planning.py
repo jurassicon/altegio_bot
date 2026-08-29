@@ -19,7 +19,7 @@ from altegio_bot.easyweek_migration.classify import (
     BLOCK_MULTI_SERVICE,
     BLOCK_SERVICE_MAPPING_MISSING,
     BLOCK_SOURCE_CHANGED,
-    BLOCK_STAFF_MAPPING_MISSING,
+    BLOCK_STAFF_NOT_IN_WAVE,
     BLOCK_STATUS_UNRECOGNISED,
     BLOCKED,
     READY,
@@ -67,6 +67,8 @@ KA_STAFF_ID = 5001
 KA_SERVICE_ID = 6001
 RA_STAFF_ID = 5002
 RA_SERVICE_ID = 6002
+# A master deliberately held back for a later wave (the nail services).
+KA_DEFERRED_STAFF_ID = 5003
 
 CUSTOMER_PHONE = "+4915112345678"
 
@@ -79,6 +81,8 @@ def manifest_text(**overrides) -> str:
                 "altegio_company_id": KARLSRUHE_COMPANY_ID,
                 "easyweek_location_id": 308697,
                 "easyweek_location_uuid": KA_LOCATION_UUID,
+                "selected_altegio_staff_ids": [KA_STAFF_ID],
+                "deferred_altegio_staff_ids": [KA_DEFERRED_STAFF_ID],
                 "staff": {str(KA_STAFF_ID): KA_STAFF_UUID},
                 "services": {
                     str(KA_SERVICE_ID): {
@@ -92,6 +96,8 @@ def manifest_text(**overrides) -> str:
                 "altegio_company_id": RASTATT_COMPANY_ID,
                 "easyweek_location_id": 315607,
                 "easyweek_location_uuid": RA_LOCATION_UUID,
+                "selected_altegio_staff_ids": [RA_STAFF_ID],
+                "deferred_altegio_staff_ids": [],
                 "staff": {str(RA_STAFF_ID): RA_STAFF_UUID},
                 "services": {
                     str(RA_SERVICE_ID): {
@@ -170,6 +176,8 @@ def test_durlach_cannot_be_written_into_the_manifest():
                     "altegio_company_id": 308697,
                     "easyweek_location_id": 308697,
                     "easyweek_location_uuid": KA_LOCATION_UUID,
+                    "selected_altegio_staff_ids": [1],
+                    "deferred_altegio_staff_ids": [],
                     "staff": {"1": KA_STAFF_UUID},
                     "services": {
                         "2": {
@@ -309,7 +317,8 @@ def test_karlsruhe_and_rastatt_are_provider_and_branch_scoped(manifest, director
     assert ka.easyweek_location_uuid == KA_LOCATION_UUID
     assert ra.easyweek_location_uuid == RA_LOCATION_UUID
 
-    # Karlsruhe's staff id in a Rastatt booking has no Rastatt mapping.
+    # Karlsruhe's staff id in a Rastatt booking is in neither of Rastatt's wave
+    # lists, so it is an unknown master there — not a missing mapping.
     crossed = classify(
         record(services=[{"id": RA_SERVICE_ID, "cost": 90.0, "cost_to_pay": 90.0}]),
         manifest=manifest,
@@ -318,7 +327,7 @@ def test_karlsruhe_and_rastatt_are_provider_and_branch_scoped(manifest, director
         company_id=RASTATT_COMPANY_ID,
     )
     assert crossed.outcome == BLOCKED
-    assert crossed.reason == BLOCK_STAFF_MAPPING_MISSING
+    assert crossed.reason == BLOCK_STAFF_NOT_IN_WAVE
 
 
 def test_a_company_outside_the_manifest_is_skipped_not_blocked(manifest, directory, cutover):
@@ -366,11 +375,11 @@ def test_an_unrecognised_status_blocks_rather_than_being_assumed_live(manifest, 
 # ---------------------------------------------------------------------------
 
 
-def test_a_missing_staff_mapping_blocks_that_row_only(manifest, directory, cutover):
+def test_an_unlisted_master_blocks_that_row_only(manifest, directory, cutover):
     blocked = classify(record(staff_id=999999), manifest=manifest, directory=directory, cutover=cutover)
     healthy = classify(record(id=900002), manifest=manifest, directory=directory, cutover=cutover)
     assert blocked.outcome == BLOCKED
-    assert blocked.reason == BLOCK_STAFF_MAPPING_MISSING
+    assert blocked.reason == BLOCK_STAFF_NOT_IN_WAVE
     # The independent booking keeps going — one gap does not stop the cutover.
     assert healthy.outcome == READY
 
@@ -386,10 +395,11 @@ def test_a_missing_service_mapping_blocks(manifest, directory, cutover):
     assert decision.reason == BLOCK_SERVICE_MAPPING_MISSING
 
 
-def test_a_string_staff_id_never_matches_an_integer_mapping(manifest, directory, cutover):
+def test_a_string_staff_id_never_matches_an_integer_selector(manifest, directory, cutover):
+    """A master we could not classify is unknown, never "deliberately deferred"."""
     decision = classify(record(staff_id=str(KA_STAFF_ID)), manifest=manifest, directory=directory, cutover=cutover)
     assert decision.outcome == BLOCKED
-    assert decision.reason == BLOCK_STAFF_MAPPING_MISSING
+    assert decision.reason == BLOCK_STAFF_NOT_IN_WAVE
 
 
 # ---------------------------------------------------------------------------

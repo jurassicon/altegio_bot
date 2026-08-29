@@ -140,3 +140,68 @@ async def reprove_source_booking(
         return ReproofResult(confirmed=False, reason=REPROOF_SOURCE_CHANGED, detail="fingerprint_changed")
 
     return CONFIRMED
+
+
+async def reclassify_source_for_resolution(
+    *,
+    company_id: int,
+    record_id: int,
+    expected_fingerprint: str,
+    manifest: MigrationManifest,
+    directory: CustomerDirectory,
+    cutover: Cutover,
+    http_client: httpx.AsyncClient | None = None,
+) -> tuple[ReproofResult, Decision | None]:
+    """Rebuild what the migration MEANT to create for one already-attempted row.
+
+    The resolution paths (``resolve-created``, and reconcile when a target UUID
+    is known) need the expected staff, service, customer, start time and duration
+    so they can compare them against the live booking. Those live in the source,
+    not in the ledger — the ledger deliberately stores a digest and no PII.
+
+    Two things make this different from :func:`reprove_source_booking`:
+
+    * it is keyed by the **stored** source fingerprint rather than by a Decision
+      from a plan, because a row being resolved has no plan any more; and
+    * it classifies with ``ledger=None`` on purpose. The row's own terminal
+      status is ``uncertain`` or ``pending``, and passing that in would make the
+      classifier return ``blocked: ledger_uncertain_needs_reconcile`` — the
+      classifier refusing to help the very command whose job is to resolve it.
+      Reading the source content is not the same question as reading the row's
+      outcome, and only the first one is being asked here.
+
+    The same manifest, wave selector, customer directory, cutover and price /
+    duration rules as every other mode. Returns the fresh Decision only when the
+    source still matches the fingerprint recorded before the original POST.
+    """
+    try:
+        live = await fetch_single_record(company_id=company_id, record_id=record_id, client=http_client)
+    except AltegioSourceError:
+        return ReproofResult(confirmed=False, reason=REPROOF_FAILED, detail="source_unreadable"), None
+
+    if live is None:
+        return ReproofResult(confirmed=False, reason=REPROOF_SOURCE_CHANGED, detail="source_absent"), None
+
+    live_id = live.get("id")
+    if type(live_id) is not int or live_id != record_id:
+        return ReproofResult(confirmed=False, reason=REPROOF_FAILED, detail="source_identity_mismatch"), None
+
+    fresh = classify_record(
+        live,
+        company_id=company_id,
+        manifest=manifest,
+        directory=directory,
+        cutover=cutover,
+        ledger=None,
+    )
+
+    if fresh.outcome != READY:
+        return ReproofResult(confirmed=False, reason=REPROOF_SOURCE_CHANGED, detail=fresh.reason), None
+
+    if fresh.source_fingerprint != expected_fingerprint:
+        # The booking still migrates, but not as the booking that was attempted:
+        # resolving it against the old attempt would record a target that does
+        # not describe the appointment any more.
+        return ReproofResult(confirmed=False, reason=REPROOF_SOURCE_CHANGED, detail="fingerprint_changed"), None
+
+    return CONFIRMED, fresh

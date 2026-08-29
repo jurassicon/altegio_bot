@@ -78,6 +78,8 @@ def manifest(
                         "altegio_company_id": KARLSRUHE_COMPANY_ID,
                         "easyweek_location_id": ka_location_id,
                         "easyweek_location_uuid": ka_uuid,
+                        "selected_altegio_staff_ids": [KA_STAFF_ID],
+                        "deferred_altegio_staff_ids": [],
                         "staff": {str(KA_STAFF_ID): KA_STAFF_UUID},
                         "services": {
                             str(KA_SERVICE_ID): {
@@ -91,6 +93,8 @@ def manifest(
                         "altegio_company_id": RASTATT_COMPANY_ID,
                         "easyweek_location_id": ra_location_id,
                         "easyweek_location_uuid": ra_uuid,
+                        "selected_altegio_staff_ids": [RA_STAFF_ID],
+                        "deferred_altegio_staff_ids": [],
                         "staff": {str(RA_STAFF_ID): RA_STAFF_UUID},
                         "services": {
                             str(RA_SERVICE_ID): {

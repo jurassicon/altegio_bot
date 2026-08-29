@@ -132,6 +132,8 @@ def manifest_with(*, catalog_price: str, catalog_minutes: int = 60):
                         "altegio_company_id": KARLSRUHE_COMPANY_ID,
                         "easyweek_location_id": 308001,
                         "easyweek_location_uuid": KA_LOCATION_UUID,
+                        "selected_altegio_staff_ids": [KA_STAFF_ID],
+                        "deferred_altegio_staff_ids": [],
                         "staff": {str(KA_STAFF_ID): KA_STAFF_UUID},
                         "services": {
                             str(KA_SERVICE_ID): {
@@ -145,6 +147,8 @@ def manifest_with(*, catalog_price: str, catalog_minutes: int = 60):
                         "altegio_company_id": RASTATT_COMPANY_ID,
                         "easyweek_location_id": 315001,
                         "easyweek_location_uuid": RA_LOCATION_UUID,
+                        "selected_altegio_staff_ids": [RA_STAFF_ID],
+                        "deferred_altegio_staff_ids": [],
                         "staff": {str(RA_STAFF_ID): RA_STAFF_UUID},
                         "services": {
                             str(RA_SERVICE_ID): {
@@ -334,6 +338,8 @@ def test_a_manifest_service_entry_needs_both_baselines():
                         "altegio_company_id": KARLSRUHE_COMPANY_ID,
                         "easyweek_location_id": 308001,
                         "easyweek_location_uuid": KA_LOCATION_UUID,
+                        "selected_altegio_staff_ids": [KA_STAFF_ID],
+                        "deferred_altegio_staff_ids": [],
                         "staff": {str(KA_STAFF_ID): KA_STAFF_UUID},
                         "services": {str(KA_SERVICE_ID): entry},
                     }

@@ -55,6 +55,7 @@ from altegio_bot.easyweek_migration.classify import (
     BLOCK_SOURCE_CHANGED,
     BLOCKED,
     READY,
+    SKIP_STAFF_DEFERRED,
     SKIPPED,
     Decision,
     classify_record,
@@ -62,11 +63,24 @@ from altegio_bot.easyweek_migration.classify import (
 from altegio_bot.easyweek_migration.customers import CustomerDirectory
 from altegio_bot.easyweek_migration.cutover import Cutover
 from altegio_bot.easyweek_migration.gates import (
+    GATE_BRANCH_IDENTITY_UNPROVEN,
+    GATE_MANIFEST_INVALID,
     ApplyGateResult,
     evaluate_apply_gate,
     require_apply_gate,
 )
-from altegio_bot.easyweek_migration.manifest import MigrationManifest
+from altegio_bot.easyweek_migration.manifest import (
+    STAFF_DEFERRED,
+    STAFF_SELECTED,
+    STAFF_UNKNOWN,
+    MigrationManifest,
+)
+from altegio_bot.easyweek_migration.proof import (
+    TARGET_SNAPSHOT_MISSING,
+    TARGET_UUID_MISSING,
+    expected_target_for,
+    prove_live_target,
+)
 from altegio_bot.easyweek_migration.report import (
     CREATED,
     FAILED,
@@ -74,7 +88,10 @@ from altegio_bot.easyweek_migration.report import (
     MigrationReport,
     plan_digest,
 )
-from altegio_bot.easyweek_migration.reproof import reprove_source_booking
+from altegio_bot.easyweek_migration.reproof import (
+    reclassify_source_for_resolution,
+    reprove_source_booking,
+)
 from altegio_bot.easyweek_migration.target_snapshot import (
     TargetSnapshotError,
     compare,
@@ -123,6 +140,15 @@ RESOLVE_PROOF_FAILED: Final = "target_does_not_match_source_identity"
 RESOLVE_CONFIRMED: Final = "resolved_created"
 RESOLVE_ABSENT_CONFIRMED: Final = "resolved_absent_by_operator"
 RESOLVE_ABSENT_UNCONFIRMED: Final = "absent_resolution_not_confirmed"
+# A resolution path needs the source to rebuild what SHOULD be in EasyWeek,
+# and the customer directory to rebuild which customer it was for.
+RESOLVE_SOURCE_UNPROVEN: Final = "source_could_not_be_reproved"
+RESOLVE_INPUTS_MISSING: Final = "resolution_inputs_missing"
+
+# Final reconciliation, per row.
+COMPLETENESS_TARGET_UNPROVEN: Final = "target_not_proven_in_easyweek"
+COMPLETENESS_NO_LEDGER_ROW: Final = "no_ledger_row_for_active_booking"
+COMPLETENESS_LEDGER_NOT_CREATED: Final = "ledger_row_not_created"
 
 
 def new_run_id() -> str:
@@ -192,6 +218,8 @@ async def build_plan(
     # whose job is to tell an operator what the manifest still needs.
     staff_seen: dict[int, Counter] = {}
     service_seen: dict[int, Counter] = {}
+    # company_id -> altegio staff id -> {"scope": ..., "active_bookings": n}
+    wave_seen: dict[int, dict[int, dict[str, Any]]] = {}
 
     for company_id in company_ids:
         records = await fetch_company_records(company_id=company_id, window=window, client=http_client)
@@ -206,6 +234,19 @@ async def build_plan(
                 ledger=ledger_views.get((company_id, _record_id_of(record))),
             )
             decisions.append(decision)
+            # A deferred master's booking is skipped, but it is NOT invisible:
+            # the whole point of naming the wave is that an operator can count
+            # what it left behind. So the wave tally sees every booking that is
+            # in scope for the branch and the window, deferred ones included,
+            # and only genuinely out-of-scope rows (past, cancelled, finished)
+            # are left out.
+            if decision.outcome != SKIPPED or decision.reason == SKIP_STAFF_DEFERRED:
+                _collect_wave_counts(
+                    record,
+                    decision,
+                    inputs.manifest.branch(company_id),
+                    wave_seen.setdefault(company_id, {}),
+                )
             if decision.outcome != SKIPPED:
                 _collect_identifiers(
                     record,
@@ -214,6 +255,7 @@ async def build_plan(
                 )
 
     report.source_identifiers = _identifier_summary(inputs, staff_seen, service_seen)
+    report.wave = _wave_summary(inputs, wave_seen)
 
     report.plan_digest = plan_digest(
         decisions,
@@ -283,6 +325,69 @@ def _identifier_summary(
     return summary
 
 
+def _collect_wave_counts(
+    record: dict[str, Any],
+    decision: Decision,
+    branch: Any,
+    per_staff: dict[int, dict[str, Any]],
+) -> None:
+    """Tally one in-scope booking against its master's wave classification.
+
+    Counting by Altegio staff id, not by name: the operator compares these
+    numbers against the Altegio and EasyWeek interfaces, and an id is the only
+    thing all three agree on. A name here would also be PII-adjacent for a small
+    salon, and it would be a second, softer identity next to the id.
+    """
+    staff_id = _staff_id_of(record)
+    if type(staff_id) is not int:
+        # An unreadable master id cannot be tallied per master; it is already
+        # blocked as unknown, and the branch-level `unknown` total covers it.
+        per_staff.setdefault(-1, {"scope": STAFF_UNKNOWN, "active_bookings": 0})
+        per_staff[-1]["active_bookings"] += 1
+        return
+    scope = branch.staff_scope(staff_id) if branch is not None else STAFF_UNKNOWN
+    entry = per_staff.setdefault(staff_id, {"scope": scope, "active_bookings": 0})
+    entry["active_bookings"] += 1
+    if decision.outcome == BLOCKED:
+        entry["blocked"] = entry.get("blocked", 0) + 1
+
+
+def _wave_summary(inputs: RunInputs, wave_seen: dict[int, dict[int, dict[str, Any]]]) -> dict[str, Any]:
+    """Per branch and per Altegio staff id: how many active bookings, and whose wave.
+
+    This is the number an operator reads next to the Altegio and EasyWeek screens
+    to answer "did everything I expected actually move?". Ids and counts only —
+    no names, no customers, no payloads.
+    """
+    summary: dict[str, Any] = {}
+    for company_id in sorted(set(wave_seen) | set(inputs.manifest.company_ids)):
+        per_staff = wave_seen.get(company_id, {})
+        branch = inputs.manifest.branch(company_id)
+        selected_ids = sorted(branch.selected_staff_ids) if branch else []
+        deferred_ids = sorted(branch.deferred_staff_ids) if branch else []
+
+        by_scope: Counter = Counter()
+        staff_rows: dict[str, Any] = {}
+        for staff_id, entry in sorted(per_staff.items()):
+            by_scope[entry["scope"]] += entry["active_bookings"]
+            staff_rows[str(staff_id)] = {
+                "scope": entry["scope"],
+                "active_bookings": entry["active_bookings"],
+                "blocked": entry.get("blocked", 0),
+            }
+
+        summary[str(company_id)] = {
+            "selected_staff_ids": selected_ids,
+            "deferred_staff_ids": deferred_ids,
+            "active_bookings_total": sum(entry["active_bookings"] for entry in per_staff.values()),
+            "active_bookings_selected": by_scope.get(STAFF_SELECTED, 0),
+            "active_bookings_deferred": by_scope.get(STAFF_DEFERRED, 0),
+            "active_bookings_unknown_staff": by_scope.get(STAFF_UNKNOWN, 0),
+            "by_altegio_staff_id": staff_rows,
+        }
+    return summary
+
+
 def _record_id_of(record: dict[str, Any]) -> int:
     """The record id used only for the ledger lookup key.
 
@@ -334,6 +439,10 @@ async def _prepare_write_gate(
         decisions, planned = await build_plan(session, inputs, http_client=http_client)
     report.plan_digest = planned.plan_digest
     report.source_records_fetched = planned.source_records_fetched
+    # The wave counters travel with the plan: an apply report has to answer the
+    # same "what did this wave leave behind?" question a dry-run does.
+    report.wave = planned.wave
+    report.source_identifiers = planned.source_identifiers
 
     # The manifest says which EasyWeek location a branch maps to; only the
     # runtime registry can say whether that location IS that branch.
@@ -741,12 +850,14 @@ async def run_reconcile(
     Two jobs, deliberately in one command because they answer the same question
     at different strengths.
 
-    The everyday job resolves what CAN be resolved on evidence: an unresolved row
-    that does carry a target UUID is fetched, and a 404 proves the booking is not
-    there. A row with no UUID — the usual shape after a timeout — stays
-    unresolved, because "it probably worked" and "it probably did not" are
-    equally wrong and both are avoided by not guessing. The operator resolves
-    those explicitly through ``resolve-created`` / ``resolve-absent``.
+    The everyday job resolves what CAN be resolved on evidence. A 404 proves a
+    booking is not there. A 2xx proves only that *something* is there — so a row
+    is promoted to ``created`` only after the same full proof ``resolve-created``
+    uses: the source still describes the attempted booking, and the live booking
+    matches it field for field. A row with no UUID — the usual shape after a
+    timeout — stays unresolved, because "it probably worked" and "it probably did
+    not" are equally wrong and both are avoided by not guessing. The operator
+    resolves those explicitly through ``resolve-created`` / ``resolve-absent``.
 
     The ``--final`` job is the one that says the migration is over, and it cannot
     be answered from the ledger alone: a ledger listing only proves things about
@@ -764,27 +875,38 @@ async def run_reconcile(
 
     async with session_maker() as session:
         pending = await ledger_module.uncertain_rows(session)
-        snapshot = [ledger_module.row_as_safe_dict(row) for row in pending]
+        # The source fingerprint is carried alongside the report-safe row: it is
+        # what the proof compares the live source against, and it never reaches
+        # the report itself.
+        snapshot = [(ledger_module.row_as_safe_dict(row), row.source_fingerprint) for row in pending]
 
-    for row in snapshot:
+    for row, stored_fingerprint in snapshot:
         entry = dict(row)
         target = row.get("target_booking_uuid")
-        if target is None or write_client is None:
-            entry["reconcile_outcome"] = RECONCILE_STILL_UNKNOWN
-            report.reasons[RECONCILE_STILL_UNKNOWN] += 1
+        company_id = int(row["source_company_id"])
+        record_id = int(row["source_record_id"])
+
+        def _leave_uncertain(reason: str) -> None:
+            entry["reconcile_outcome"] = reason
+            report.reasons[reason] += 1
             report.uncertain_rows.append(entry)
+
+        if target is None or write_client is None:
+            _leave_uncertain(RECONCILE_STILL_UNKNOWN)
             continue
 
+        # A 404 is the one thing a bare GET *can* prove: the booking named by
+        # this row is not in EasyWeek. Everything else needs the full proof.
         try:
-            await write_client.get_booking(target)
+            await write_client.get_booking(str(target))
         except EasyWeekNotFoundError:
             async with session_maker() as session:
                 async with session.begin():
                     await ledger_module.record_failed(
                         session,
                         run_id=inputs.run_id,
-                        source_company_id=int(row["source_company_id"]),
-                        source_record_id=int(row["source_record_id"]),
+                        source_company_id=company_id,
+                        source_record_id=record_id,
                         reason_code=RECONCILE_CONFIRMED_ABSENT,
                     )
             entry["reconcile_outcome"] = RECONCILE_CONFIRMED_ABSENT
@@ -792,9 +914,29 @@ async def run_reconcile(
             report.failed_rows.append(entry)
             continue
         except EasyWeekError:
-            entry["reconcile_outcome"] = RECONCILE_STILL_UNKNOWN
-            report.reasons[RECONCILE_STILL_UNKNOWN] += 1
-            report.uncertain_rows.append(entry)
+            _leave_uncertain(RECONCILE_STILL_UNKNOWN)
+            continue
+
+        # The booking exists. That is NOT proof it is the right booking — the
+        # earlier version stopped here and promoted the row on a bare 2xx, which
+        # would accept a booking at the wrong time, for the wrong master or the
+        # wrong customer. Same proof as `resolve-created`, and it also produces
+        # the target fingerprint this row was missing.
+        if stored_fingerprint is None:
+            _leave_uncertain(f"{RECONCILE_STILL_UNKNOWN}:{RESOLVE_ROW_MISSING}")
+            continue
+
+        proven, reason, live = await _prove_uncertain_row_against_target(
+            inputs,
+            company_id=company_id,
+            record_id=record_id,
+            stored_source_fingerprint=stored_fingerprint,
+            target_booking_uuid=str(target),
+            write_client=write_client,
+            http_client=http_client,
+        )
+        if not proven or live is None:
+            _leave_uncertain(reason)
             continue
 
         async with session_maker() as session:
@@ -802,9 +944,10 @@ async def run_reconcile(
                 await ledger_module.record_created(
                     session,
                     run_id=inputs.run_id,
-                    source_company_id=int(row["source_company_id"]),
-                    source_record_id=int(row["source_record_id"]),
-                    target_booking_uuid=str(target),
+                    source_company_id=company_id,
+                    source_record_id=record_id,
+                    target_booking_uuid=live.booking_uuid,
+                    target_snapshot_fingerprint=live.fingerprint,
                 )
         entry["reconcile_outcome"] = RECONCILE_CONFIRMED_CREATED
         report.reasons[RECONCILE_CONFIRMED_CREATED] += 1
@@ -824,6 +967,7 @@ async def run_reconcile(
             inputs,
             report=report,
             ledger_by_identity=by_identity,
+            write_client=write_client,
             http_client=http_client,
         )
 
@@ -836,43 +980,100 @@ async def _prove_completeness(
     *,
     report: MigrationReport,
     ledger_by_identity: dict[tuple[int, int], Any],
+    write_client: EasyWeekMigrationWriteClient | None,
     http_client: httpx.AsyncClient | None = None,
 ) -> dict[str, Any]:
-    """Re-read the live source and check every active booking has a proven target.
+    """Re-read the live source AND the live targets, and prove the wave landed.
 
-    Returns a verdict dict. ``passed`` is only true when the source was actually
-    read, nothing is left in an unknown or failed state, and every active source
-    booking is accounted for — created, already migrated, or blocked with a
-    matching ledger row an operator accepted.
+    The earlier version stopped at the ledger: a row saying ``created`` counted
+    as an accounted-for booking. That is a statement about our own bookkeeping,
+    and it stays true after somebody deletes the booking, cancels it, moves it to
+    another day, hands it to another master or reassigns it to another customer.
+    A cutover can be reported complete while half of it is no longer there.
+
+    So each accounted booking is now fetched from EasyWeek and proven: the marker
+    still names this source identity, the booking is neither cancelled nor
+    completed, every write-critical field is present, and the live fingerprint
+    equals the one stored when it was written. Anything less makes the row
+    unaccounted and the whole reconciliation fail.
+
+    Completeness is judged for **the selected wave only** — a deferred master's
+    bookings are not a gap, they are a later wave. An unknown master is still a
+    gap, and still fails: that is the difference the selector exists to keep.
     """
     async with session_maker() as session:
         decisions, planned = await build_plan(session, inputs, http_client=http_client)
     report.source_records_fetched = planned.source_records_fetched
+    report.wave = planned.wave
 
+    # `skipped` covers the past, the cancelled, the finished — and deferred
+    # masters, whose reason code is reported separately below.
     active: list[Decision] = [d for d in decisions if d.outcome != SKIPPED]
+    deferred = sum(1 for d in decisions if d.outcome == SKIPPED and d.reason == SKIP_STAFF_DEFERRED)
+
     unaccounted: list[dict[str, Any]] = []
+    reasons: Counter = Counter()
     accounted = 0
     source_changed = 0
     blocked_now = 0
+    targets_proven = 0
+
+    def _unaccount(decision: Decision, reason: str) -> None:
+        entry = decision.as_safe_dict()
+        entry["completeness_reason"] = reason
+        reasons[reason] += 1
+        unaccounted.append(entry)
 
     for decision in active:
         if decision.source_record_id is None:
-            unaccounted.append(decision.as_safe_dict())
+            _unaccount(decision, COMPLETENESS_NO_LEDGER_ROW)
             continue
-        row = ledger_by_identity.get((decision.source_company_id, decision.source_record_id))
-        if row is not None and row.status == ledger_module.STATUS_CREATED:
-            accounted += 1
-            continue
-        if decision.outcome == ALREADY_MIGRATED:
-            accounted += 1
-            continue
+
         if decision.outcome == BLOCKED:
             blocked_now += 1
             if decision.reason == BLOCK_SOURCE_CHANGED:
                 source_changed += 1
-            unaccounted.append(decision.as_safe_dict())
+            _unaccount(decision, decision.reason or COMPLETENESS_LEDGER_NOT_CREATED)
             continue
-        unaccounted.append(decision.as_safe_dict())
+
+        row = ledger_by_identity.get((decision.source_company_id, decision.source_record_id))
+        if row is None:
+            _unaccount(decision, COMPLETENESS_NO_LEDGER_ROW)
+            continue
+        if row.status != ledger_module.STATUS_CREATED:
+            _unaccount(decision, COMPLETENESS_LEDGER_NOT_CREATED)
+            continue
+
+        # The ledger says it was created. Now prove it still is.
+        if not row.target_booking_uuid:
+            _unaccount(decision, TARGET_UUID_MISSING)
+            continue
+        if not row.target_snapshot_fingerprint:
+            # Written before snapshots existed, or by a path that could not take
+            # one. Nothing to compare against, and "nothing to compare" is not
+            # "unchanged".
+            _unaccount(decision, TARGET_SNAPSHOT_MISSING)
+            continue
+        if write_client is None:
+            _unaccount(decision, COMPLETENESS_TARGET_UNPROVEN)
+            continue
+
+        marker = ledger_module.migration_marker(
+            source_company_id=decision.source_company_id,
+            source_record_id=decision.source_record_id,
+        )
+        proof = await prove_live_target(
+            write_client,
+            target_booking_uuid=row.target_booking_uuid,
+            marker=marker,
+            expected_fingerprint=row.target_snapshot_fingerprint,
+        )
+        if not proof.proven:
+            _unaccount(decision, proof.reason)
+            continue
+
+        targets_proven += 1
+        accounted += 1
 
     unresolved = report.outcomes.get(ledger_module.STATUS_UNCERTAIN, 0) + report.outcomes.get(
         ledger_module.STATUS_PENDING, 0
@@ -884,18 +1085,31 @@ async def _prove_completeness(
     source_was_read = bool(report.source_records_fetched) and all(
         company_id in report.source_records_fetched for company_id in inputs.manifest.company_ids
     )
+    # Proving zero targets is only acceptable when there were none to prove.
+    targets_were_checked = write_client is not None
 
-    passed = source_was_read and unresolved == 0 and failed == 0 and not unaccounted
+    passed = (
+        source_was_read
+        and targets_were_checked
+        and unresolved == 0
+        and failed == 0
+        and not unaccounted
+        and targets_proven == accounted
+    )
 
     verdict = {
         "passed": passed,
         "source_was_read": source_was_read,
+        "targets_were_checked": targets_were_checked,
         "source_active_bookings": len(active),
+        "deferred_bookings": deferred,
         "accounted_for": accounted,
+        "live_targets_proven": targets_proven,
         "blocked": blocked_now,
         "source_changed": source_changed,
         "uncertain_or_pending": unresolved,
         "failed": failed,
+        "unaccounted_reason_codes": dict(sorted(reasons.items())),
         "unaccounted_rows": unaccounted,
     }
     if not passed:
@@ -903,21 +1117,90 @@ async def _prove_completeness(
     return verdict
 
 
+async def _prove_uncertain_row_against_target(
+    inputs: RunInputs,
+    *,
+    company_id: int,
+    record_id: int,
+    stored_source_fingerprint: str,
+    target_booking_uuid: str,
+    write_client: EasyWeekMigrationWriteClient,
+    http_client: httpx.AsyncClient | None = None,
+) -> tuple[bool, str, Any]:
+    """The shared proof behind ``resolve-created`` and reconcile-with-a-UUID.
+
+    Both commands answer the same question — *is this EasyWeek booking the one
+    the migration tried to create for this source row?* — and both used to answer
+    it too weakly. Reconcile accepted any 2xx; resolve-created checked the marker
+    and the branch but not the staff, service, customer, start time or duration,
+    so a booking for the right customer at the wrong time was accepted.
+
+    The proof has two halves, and both must hold:
+
+    1. **The source still describes the attempted booking.** It is re-read and
+       re-classified with the same manifest, wave selector, customer directory,
+       cutover and price/duration rules, and its fingerprint must equal the one
+       recorded before the original POST. Without this the "expected" target
+       would be rebuilt from a source that has since moved.
+    2. **The live booking matches that expectation exactly** — every
+       write-critical field, plus the marker and the active status.
+
+    Returns ``(proven, reason, live_snapshot)``. Never issues a POST.
+    """
+    if not inputs.manifest.valid:
+        return False, GATE_MANIFEST_INVALID, None
+    if not inputs.directory.valid or not inputs.directory.by_phone:
+        # Without the export there is no way to say which customer this booking
+        # was for, and "we could not check the customer" must not pass as "the
+        # customer is right".
+        return False, RESOLVE_INPUTS_MISSING, None
+
+    branch_identity = verify_branch_identity(inputs.manifest)
+    if not branch_identity.proven:
+        return False, GATE_BRANCH_IDENTITY_UNPROVEN, None
+
+    reproof, expected_decision = await reclassify_source_for_resolution(
+        company_id=company_id,
+        record_id=record_id,
+        expected_fingerprint=stored_source_fingerprint,
+        manifest=inputs.manifest,
+        directory=inputs.directory,
+        cutover=inputs.cutover,
+        http_client=http_client,
+    )
+    if not reproof.confirmed or expected_decision is None:
+        detail = f"{reproof.reason}:{reproof.detail}" if reproof.detail else reproof.reason
+        return False, f"{RESOLVE_SOURCE_UNPROVEN}:{detail}", None
+
+    marker = ledger_module.migration_marker(source_company_id=company_id, source_record_id=record_id)
+    expected = expected_target_for(expected_decision, booking_uuid=target_booking_uuid, marker=marker)
+    proof = await prove_live_target(
+        write_client,
+        target_booking_uuid=target_booking_uuid,
+        marker=marker,
+        expected=expected,
+    )
+    if not proof.proven:
+        return False, proof.reason, None
+    return True, RESOLVE_CONFIRMED, proof.live
+
+
 async def run_resolve_created(
     session_maker: async_sessionmaker[AsyncSession],
     inputs: RunInputs,
     *,
     write_client: EasyWeekMigrationWriteClient,
+    http_client: httpx.AsyncClient | None = None,
 ) -> MigrationReport:
     """Resolve ONE unresolved row against an operator-supplied booking UUID.
 
     The operator finds the booking in the EasyWeek UI — the migration marker
     makes that possible — and names it. The tool does not take their word for it:
-    it fetches the booking and proves the marker matches this exact source
-    identity and the branch is the expected one. Only then is the row created.
+    it re-reads the source, rebuilds the booking the migration meant to create,
+    fetches the named booking and requires every write-critical field to match.
 
     The origin run is preserved, so the booking stays in the rollback set of the
-    apply that made it.
+    apply that made it. Any mismatch leaves the row exactly as it was — uncertain.
     """
     report = MigrationReport(
         mode=MODE_RESOLVE_CREATED,
@@ -936,41 +1219,32 @@ async def run_resolve_created(
     async with session_maker() as session:
         row = await ledger_module.get_row(session, source_company_id=company_id, source_record_id=record_id)
         row_snapshot = ledger_module.row_as_safe_dict(row) if row is not None else None
+        stored_source_fingerprint = row.source_fingerprint if row is not None else None
 
-    if row is None or row_snapshot is None:
+    if row is None or row_snapshot is None or stored_source_fingerprint is None:
         report.errors.append(RESOLVE_ROW_MISSING)
         return report
     if row_snapshot["status"] not in (ledger_module.STATUS_UNCERTAIN, ledger_module.STATUS_PENDING):
         report.errors.append(RESOLVE_NOT_UNCERTAIN)
         return report
 
-    branch_identity = verify_branch_identity(inputs.manifest)
-    if not branch_identity.proven:
-        report.errors.append("target_branch_identity_unproven")
-        return report
-
-    marker = ledger_module.migration_marker(source_company_id=company_id, source_record_id=record_id)
-    try:
-        payload = await write_client.get_booking(target)
-    except EasyWeekNotFoundError:
-        report.errors.append(RESOLVE_TARGET_ABSENT)
-        return report
-    except EasyWeekError:
-        report.errors.append(RESOLVE_TARGET_UNREADABLE)
-        return report
-
-    try:
-        # The marker check inside the projection is the identity proof: the
-        # marker is derived from this exact source company and record, so a
-        # booking carrying it cannot belong to a different source booking.
-        live = project_target(payload, expected_marker=marker)
-    except TargetSnapshotError as exc:
-        report.errors.append(f"{RESOLVE_PROOF_FAILED}:{exc.reason}")
-        return report
-
-    branch = inputs.manifest.branch(company_id)
-    if branch is None or live.location_uuid != branch.easyweek_location_uuid:
-        report.errors.append(f"{RESOLVE_PROOF_FAILED}:location_uuid")
+    proven, reason, live = await _prove_uncertain_row_against_target(
+        inputs,
+        company_id=company_id,
+        record_id=record_id,
+        stored_source_fingerprint=stored_source_fingerprint,
+        target_booking_uuid=target,
+        write_client=write_client,
+        http_client=http_client,
+    )
+    if not proven or live is None:
+        # The row stays uncertain. That is the point: a resolution that cannot be
+        # proven is not a resolution.
+        entry = dict(row_snapshot)
+        entry["reconcile_outcome"] = reason
+        report.reasons[reason] += 1
+        report.uncertain_rows.append(entry)
+        report.errors.append(reason)
         return report
 
     async with session_maker() as session:

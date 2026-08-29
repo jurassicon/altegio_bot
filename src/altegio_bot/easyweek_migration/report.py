@@ -96,6 +96,9 @@ class MigrationReport:
     # Inventory only: which Altegio staff/service ids the source actually uses,
     # and which of them the manifest already covers.
     source_identifiers: dict[str, Any] | None = None
+    # Per branch and per Altegio staff id: active bookings, and which wave
+    # each master belongs to. The operator's cross-check against Altegio.
+    wave: dict[str, Any] | None = None
 
     # Source-side truth.
     source_records_fetched: Counter = field(default_factory=Counter)
@@ -167,6 +170,7 @@ class MigrationReport:
             "canary_binding": self.canary_binding,
             "completeness": self.completeness,
             "source_identifiers": self.source_identifiers,
+            "wave": self.wave,
             "mutations_attempted": self.mutations_attempted,
             "source": {
                 "provider": "altegio",

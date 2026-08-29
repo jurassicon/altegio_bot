@@ -95,9 +95,21 @@ MODES: Final = (
 
 # Modes that must see a COMPLETE manifest. `inventory` is deliberately absent:
 # it exists to help build the mapping and so must run before one exists.
-STRICT_MANIFEST_MODES: Final = (MODE_DRY_RUN, MODE_CANARY, MODE_APPLY, MODE_RECONCILE)
+STRICT_MANIFEST_MODES: Final = (
+    MODE_DRY_RUN,
+    MODE_CANARY,
+    MODE_APPLY,
+    MODE_RECONCILE,
+    # `resolve-created` re-classifies the source to rebuild the booking the
+    # migration meant to create, so it needs the same complete manifest and
+    # the same wave selector every other proving mode uses.
+    MODE_RESOLVE_CREATED,
+)
 # Modes that resolve a customer and therefore need the EasyWeek export.
-CUSTOMER_DIRECTORY_MODES: Final = (MODE_DRY_RUN, MODE_CANARY, MODE_APPLY)
+# `resolve-created` is here because without the directory there is no way to
+# say which customer the booking was for — and an unchecked customer must not
+# pass as a correct one.
+CUSTOMER_DIRECTORY_MODES: Final = (MODE_DRY_RUN, MODE_CANARY, MODE_APPLY, MODE_RESOLVE_CREATED)
 
 # The operator attestation. Spelled out in full, every time, on purpose: it is a
 # claim about a system this process cannot inspect, and a short flag would make
@@ -222,11 +234,18 @@ async def _run(args: argparse.Namespace) -> int:
             return _fail(f"customer directory is unusable ({directory.reason})")
     else:
         if args.mode in CUSTOMER_DIRECTORY_MODES:
-            return _fail("--customer-directory is required for dry-run, canary and apply")
-        if args.mode == MODE_RECONCILE and args.final:
-            # A final reconciliation re-classifies the live source, and that
-            # cannot be done without resolving customers.
-            return _fail("--customer-directory is required for reconcile --final")
+            return _fail(f"--customer-directory is required for {args.mode}")
+        if args.mode == MODE_RECONCILE:
+            # A final reconciliation re-classifies the live source, and the
+            # everyday one proves any row whose target UUID is known — both need
+            # to resolve customers.
+            if args.final:
+                return _fail("--customer-directory is required for reconcile --final")
+            print(
+                "easyweek_migration: no --customer-directory: rows with a known target UUID "
+                "cannot be proven and will stay uncertain",
+                file=sys.stderr,
+            )
         directory = CustomerDirectory(valid=True, by_phone={})
 
     writes = args.mode in (MODE_CANARY, MODE_APPLY) or (args.mode.startswith("rollback") and args.apply)

@@ -1,9 +1,17 @@
 # PR-11.1 — production runbook: перенос будущих активных записей Altegio → EasyWeek
 
 Область: **только будущие активные бронирования** филиалов Karlsruhe
-(Altegio `758285`) и Rastatt (Altegio `1271200`). Прошлые, завершённые и
-отменённые записи в EasyWeek не создаются никогда. Durlach в Altegio отсутствует
-и в миграции не участвует ни на одном шаге.
+(Altegio `758285`) и Rastatt (Altegio `1271200`), и **только у явно выбранных
+мастеров этой волны**. Прошлые, завершённые и отменённые записи в EasyWeek не
+создаются никогда. Durlach в Altegio отсутствует и в миграции не участвует ни на
+одном шаге.
+
+**Волны.** Первая волна переносит мастеров, перечисленных в
+`selected_altegio_staff_ids`. Ногтевые мастера отложены и указаны в
+`deferred_altegio_staff_ids` — их записи **переносятся отдельной будущей
+волной**, для которой этот же runbook выполняется заново с новым manifest.
+Мастер, не попавший ни в один список, блокирует cutover: «отложили» и «забыли»
+не должны выглядеть одинаково.
 
 Исторические счётчики визитов переносятся **нативным импортом клиентов
 EasyWeek**, а не этим инструментом. Canary подтвердил: EasyWeek сохраняет
@@ -126,7 +134,29 @@ docker compose --profile ops run --rm --build easyweek-booking-migration invento
 ```
 
 Повторять, пока `source_identifiers[*].staff.missing` и `.services.missing` не
-станут пустыми.
+станут пустыми **для выбранных мастеров**.
+
+**Что делает оператор:** распределяет каждый Altegio staff ID из отчёта ровно в
+один список — `selected_altegio_staff_ids` или `deferred_altegio_staff_ids`.
+**Зачем:** мастер вне обоих списков блокирует cutover (`staff_not_in_wave_scope`),
+а незаполненный mapping намеренно **не** работает как способ исключить мастера.
+Иначе забытый мастер выглядел бы как отложенный, полнота волны была бы объявлена
+доказанной, и его клиенты приехали бы в салон, где о них не знают.
+
+Имена мастеров помогают принять решение, но в файл идут только ID.
+
+**Что делает команда:** печатает, сколько активных записей приходится на каждый
+Altegio staff ID и как они распределены по selected / deferred / unknown.
+**Зачем:** это число оператор сверяет с интерфейсом Altegio и позже с EasyWeek —
+«ожидал 34 записи у выбранных мастеров, вижу 34».
+
+```bash
+docker compose --profile ops run --rm --build easyweek-booking-migration inventory --manifest /migration/input/manifest.json --cutover-at 2026-09-01T00:00:00+02:00
+```
+
+В отчёте раздел `wave`: `active_bookings_selected`, `active_bookings_deferred`,
+`active_bookings_unknown_staff` и разбивка `by_altegio_staff_id`. Перед
+переходом дальше `active_bookings_unknown_staff` обязан быть нулём.
 
 **Проверка филиалов.** Manifest дополнительно сверяется с рантайм-реестром
 `EASYWEEK_LOCATION_MAP`: location ID, location UUID и slug филиала
@@ -256,8 +286,12 @@ docker compose --profile ops run --rm --build easyweek-booking-migration dry-run
 `staff_mapping_missing`, `service_mapping_missing`, `customer_not_found`,
 `customer_ambiguous`, `multi_service_unsupported`, `custom_price_unsupported`,
 `custom_duration_unsupported`, `price_baseline_missing`,
-`start_time_ambiguous_dst`. Ни одна не чинится инструментом — правится manifest
-или экспорт, либо запись переносится руками.
+`start_time_ambiguous_dst`, `staff_not_in_wave_scope`. Ни одна не чинится
+инструментом — правится manifest или экспорт, либо запись переносится руками.
+
+Записи отложенных мастеров в `blocked_rows` **не попадают**: они пропускаются с
+`staff_deferred_to_later_wave` и видны отдельным счётчиком в разделе `wave`.
+Ещё раз сверить `wave.active_bookings_selected` с ожиданием по Altegio.
 
 Записать `plan_digest` из отчёта.
 
@@ -306,8 +340,12 @@ docker compose exec postgres psql -U "${POSTGRES_USER:-altegio}" -d "${POSTGRES_
 **Что делает:** печатает состояние ledger и разрешает то, что можно разрешить.
 **Зачем:** перед bulk не должно оставаться ни одной записи с неизвестным исходом.
 
+Строка с известным target UUID повышается до `created` только после полного
+доказательства — успешного GET недостаточно. Поэтому команде передаётся
+`--customer-directory`: без него такие строки останутся `uncertain`.
+
 ```bash
-docker compose --profile ops run --rm --build easyweek-booking-migration reconcile --manifest /migration/input/manifest.json --cutover-at 2026-09-01T00:00:00+02:00
+docker compose --profile ops run --rm --build easyweek-booking-migration reconcile --manifest /migration/input/manifest.json --customer-directory /migration/input/easyweek-customers-after-import.csv --cutover-at 2026-09-01T00:00:00+02:00
 ```
 
 Требуется `uncertain = 0` и `pending = 0`.
@@ -340,9 +378,18 @@ EasyWeek по marker'у `altegio-migration:<company_id>:<record_id>` и назы
 Инструмент не верит на слово: он делает GET и доказывает marker, филиал и
 критичные поля.
 
+Инструмент перечитывает исходную запись, восстанавливает бронирование, которое
+миграция собиралась создать, и требует точного совпадения marker, филиала,
+мастера, услуги, клиента, времени начала, длительности и активного статуса.
+Поэтому команде нужны тот же `--customer-directory` (без него невозможно
+восстановить ожидаемого клиента) и тот же неизменный `--cutover-at`.
+
 ```bash
-docker compose --profile ops run --rm --build easyweek-booking-migration resolve-created --manifest /migration/input/manifest.json --cutover-at 2026-09-01T00:00:00+02:00 --resolve-company-id 758285 --resolve-record-id ID_ЗАПИСИ --target-uuid UUID_НАЙДЕННОГО_БРОНИРОВАНИЯ
+docker compose --profile ops run --rm --build easyweek-booking-migration resolve-created --manifest /migration/input/manifest.json --customer-directory /migration/input/easyweek-customers-after-import.csv --cutover-at 2026-09-01T00:00:00+02:00 --resolve-company-id 758285 --resolve-record-id ID_ЗАПИСИ --target-uuid UUID_НАЙДЕННОГО_БРОНИРОВАНИЯ
 ```
+
+Любое несовпадение оставляет строку `uncertain` — это не сбой команды, а отказ
+записать недоказанное.
 
 **Если бронирования в EasyWeek действительно нет.** Это опасное направление:
 после подтверждения следующий apply создаст запись, и ошибка оператора означает
@@ -370,19 +417,29 @@ docker compose --profile ops run --rm --build easyweek-booking-migration apply -
 
 ## 19. Финальная reconciliation
 
-**Что делает:** перечитывает **живой** Altegio и сверяет каждую активную запись
-с доказанным target. Печатает source active bookings, created, already_migrated,
-blocked, failed, uncertain, source_changed, разрез по филиалам и reason codes.
-**Зачем:** перечисление ledger доказывает только то, что мы и так знаем. Полноту
-cutover доказывает лишь сверка с источником.
+**Что делает:** перечитывает **живой** Altegio, а затем **перечитывает каждый
+target в EasyWeek**: GET, строгая проверка marker, location, мастера, услуги,
+клиента, времени начала, длительности и активного статуса, и сверка live
+fingerprint с сохранённым при создании. Печатает source active bookings,
+created, already_migrated, blocked, failed, uncertain, source_changed, число
+отложенных, разрез по филиалам и reason codes.
+**Зачем:** перечисление ledger доказывает только то, что мы и так знаем, и
+остаётся истинным после того, как booking удалили, отменили или перенесли.
+Полноту cutover доказывает лишь сверка и с источником, и с целью.
 
 ```bash
 docker compose --profile ops run --rm --build easyweek-booking-migration reconcile --final --manifest /migration/input/manifest.json --customer-directory /migration/input/easyweek-customers-after-import.csv --cutover-at 2026-09-01T00:00:00+02:00
 ```
 
 PASS только при `completeness.passed = true`: `uncertain = 0`, `pending = 0`,
-`failed = 0`, каждая активная запись источника имеет доказанный target либо
-принятый операторский blocked-исход. Иначе команда завершается ненулевым кодом.
+`failed = 0`, `live_targets_proven = accounted_for`, и каждая активная запись
+**выбранной волны** имеет доказанный живой target. Записи отложенных мастеров
+учитываются в `deferred_bookings` и пробелом не считаются; неизвестный мастер —
+считается и валит проверку. Иначе команда завершается ненулевым кодом, а
+`unaccounted_reason_codes` называет причину по каждой строке.
+
+Здесь же оператор сверяет `wave.active_bookings_selected` с числом записей,
+фактически появившихся в EasyWeek у выбранных мастеров.
 
 ## 19a. Rollback — **внутри того же окна**
 

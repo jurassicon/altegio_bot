@@ -32,7 +32,12 @@ from typing import Any, Final
 from altegio_bot.easyweek_migration.altegio_source import ACTIVE_ATTENDANCE
 from altegio_bot.easyweek_migration.customers import CustomerDirectory
 from altegio_bot.easyweek_migration.cutover import Cutover, LocalTimeError, parse_altegio_local_to_utc
-from altegio_bot.easyweek_migration.manifest import BranchMapping, MigrationManifest
+from altegio_bot.easyweek_migration.manifest import (
+    STAFF_DEFERRED,
+    STAFF_UNKNOWN,
+    BranchMapping,
+    MigrationManifest,
+)
 from altegio_bot.easyweek_migration.money import (
     AmountError,
     DurationError,
@@ -53,11 +58,18 @@ SKIP_PAST: Final = "starts_before_cutover"
 SKIP_DELETED: Final = "source_deleted"
 SKIP_CANCELED: Final = "source_canceled"
 SKIP_COMPLETED: Final = "source_completed"
+# Not an error and not a gap: this master is migrating in a LATER wave, and
+# the manifest says so out loud.
+SKIP_STAFF_DEFERRED: Final = "staff_deferred_to_later_wave"
 
 # -- block reasons (need a human) -------------------------------------------
 BLOCK_NO_RECORD_ID: Final = "source_record_id_invalid"
 BLOCK_STATUS_UNRECOGNISED: Final = "source_status_unrecognised"
 BLOCK_STAFF_MAPPING_MISSING: Final = "staff_mapping_missing"
+# A master the wave selector never classified. Deliberately NOT reported as
+# `staff_mapping_missing`: "we forgot to map her" and "we chose to defer her"
+# must stay distinguishable, or a forgotten master reads as an intended one.
+BLOCK_STAFF_NOT_IN_WAVE: Final = "staff_not_in_wave_scope"
 BLOCK_SERVICE_MAPPING_MISSING: Final = "service_mapping_missing"
 BLOCK_SERVICE_ID_INVALID: Final = "service_id_invalid"
 BLOCK_NO_SERVICES: Final = "source_has_no_service"
@@ -263,6 +275,21 @@ def classify_record(
     if starts_at < cutover.at:
         return _skip(SKIP_PAST)
 
+    # -- 2a. is this master part of THIS wave? -----------------------------
+    # Asked before anything about the service, the price or the mapping, because
+    # a deferred master's booking is not a problem to be reported — it is simply
+    # somebody else's wave, and it should not appear in the blocked list an
+    # operator has to work through.
+    staff_id = _staff_id(record)
+    scope = branch.staff_scope(staff_id)
+    if scope == STAFF_DEFERRED:
+        return _skip(SKIP_STAFF_DEFERRED)
+    if scope == STAFF_UNKNOWN:
+        # A master nobody classified. Fail closed: an unlisted master is the one
+        # case where "not migrating" and "we missed her" look identical, and
+        # only a human can tell them apart.
+        return _block(BLOCK_STAFF_NOT_IN_WAVE)
+
     # -- 3. exactly one service, no overrides ------------------------------
     services = _services(record)
     if services is None:
@@ -358,7 +385,10 @@ def classify_record(
         return _block(BLOCK_CUSTOM_DURATION)
 
     # -- 5. staff mapping: exact, or blocked -------------------------------
-    staff_uuid = branch.staff_uuid(_staff_id(record))
+    # A selected master is guaranteed a mapping by the manifest parser; this stays
+    # fail-closed anyway, because the classifier must not depend on a validation
+    # that lives in another module.
+    staff_uuid = branch.staff_uuid(staff_id)
     if staff_uuid is None:
         return _block(BLOCK_STAFF_MAPPING_MISSING)
 
