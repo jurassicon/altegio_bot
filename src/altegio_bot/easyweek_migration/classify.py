@@ -1,0 +1,387 @@
+"""Turning one Altegio record into a migration decision (PR-11.1).
+
+Every source booking lands in exactly one of four buckets:
+
+``skipped``           it is not ours to migrate at all — wrong branch, in the
+                      past, cancelled, finished. Not a problem; not reported as
+                      one.
+``already_migrated``  the ledger already holds a proven target for it.
+``blocked``           it *should* migrate but something is missing or ambiguous,
+                      and guessing would put a real appointment in the wrong
+                      place. An operator fixes it by hand.
+``ready``             everything resolved to exactly one value and it can be
+                      created.
+
+The rule that shapes all of it: **anything not proven is blocked, never
+approximated.** A booking an operator moves by hand costs five minutes. A booking
+we place with the wrong master, at the wrong time, or on someone else's profile
+costs a customer, and it is discovered by the customer.
+
+Blocking is per-row. One unmapped master does not stop the run — the other
+bookings are independent and keep going, which is what makes the blocked list
+short enough for a human to work through.
+"""
+
+from __future__ import annotations
+
+import hashlib
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any, Final
+
+from altegio_bot.easyweek_migration.altegio_source import ACTIVE_ATTENDANCE
+from altegio_bot.easyweek_migration.customers import CustomerDirectory
+from altegio_bot.easyweek_migration.cutover import Cutover, LocalTimeError, parse_altegio_local_to_utc
+from altegio_bot.easyweek_migration.manifest import BranchMapping, MigrationManifest
+
+# -- outcomes ---------------------------------------------------------------
+READY: Final = "ready"
+ALREADY_MIGRATED: Final = "already_migrated"
+BLOCKED: Final = "blocked"
+SKIPPED: Final = "skipped"
+
+# -- skip reasons (expected, not problems) ----------------------------------
+SKIP_FOREIGN_COMPANY: Final = "foreign_company"
+SKIP_PAST: Final = "starts_before_cutover"
+SKIP_DELETED: Final = "source_deleted"
+SKIP_CANCELED: Final = "source_canceled"
+SKIP_COMPLETED: Final = "source_completed"
+
+# -- block reasons (need a human) -------------------------------------------
+BLOCK_NO_RECORD_ID: Final = "source_record_id_invalid"
+BLOCK_STATUS_UNRECOGNISED: Final = "source_status_unrecognised"
+BLOCK_STAFF_MAPPING_MISSING: Final = "staff_mapping_missing"
+BLOCK_SERVICE_MAPPING_MISSING: Final = "service_mapping_missing"
+BLOCK_SERVICE_ID_INVALID: Final = "service_id_invalid"
+BLOCK_NO_SERVICES: Final = "source_has_no_service"
+BLOCK_MULTI_SERVICE: Final = "multi_service_unsupported"
+BLOCK_CUSTOM_DURATION: Final = "custom_duration_unsupported"
+BLOCK_CUSTOM_PRICE: Final = "custom_price_unsupported"
+BLOCK_DURATION_UNKNOWN: Final = "duration_unknown"
+BLOCK_LEDGER_UNCERTAIN: Final = "ledger_uncertain_needs_reconcile"
+BLOCK_SOURCE_CHANGED: Final = "source_changed_since_ledger"
+
+# ``LocalTimeError`` reasons and the customer reasons pass through unchanged;
+# they are already stable codes owned by their own modules.
+
+# Ledger statuses that mean "a booking may exist and we cannot say". Spelled as
+# literals rather than imported from :mod:`ledger`, which imports this module.
+# The two lists are pinned together by a test.
+LEDGER_UNRESOLVED_STATUSES: Final = frozenset({"uncertain", "pending"})
+
+
+@dataclass(frozen=True)
+class Decision:
+    """One source booking's outcome, carrying only what a report may print."""
+
+    outcome: str
+    reason: str | None
+    source_company_id: int
+    source_record_id: int | None
+    # Populated only for ``ready``: everything the writer needs, all proven.
+    starts_at_utc: datetime | None = None
+    duration_minutes: int | None = None
+    easyweek_location_uuid: str | None = None
+    easyweek_staff_uuid: str | None = None
+    easyweek_service_uuid: str | None = None
+    easyweek_customer_uuid: str | None = None
+    source_fingerprint: str | None = None
+    # Set when the ledger already knew this row.
+    target_booking_uuid: str | None = None
+
+    def as_safe_dict(self) -> dict[str, Any]:
+        """Ids, codes and a UTC instant. No phone, no name, no payload."""
+        return {
+            "outcome": self.outcome,
+            "reason": self.reason,
+            "source_company_id": self.source_company_id,
+            "source_record_id": self.source_record_id,
+            "starts_at_utc": self.starts_at_utc.isoformat().replace("+00:00", "Z")
+            if self.starts_at_utc is not None
+            else None,
+            "target_booking_uuid": self.target_booking_uuid,
+        }
+
+
+def _exact_int(value: object) -> int | None:
+    """Exact ``int``. ``bool`` is not an id and ``"3"`` is not a number."""
+    return value if type(value) is int else None
+
+
+def _record_id(record: dict[str, Any]) -> int | None:
+    raw = record.get("id")
+    value = _exact_int(raw)
+    if value is None or value <= 0:
+        return None
+    return value
+
+
+def _staff_id(record: dict[str, Any]) -> object:
+    """Altegio reports the master either flat or nested. Both are read; neither
+    is invented — an absent id stays absent and the row blocks."""
+    flat = record.get("staff_id")
+    if flat is not None:
+        return flat
+    staff = record.get("staff")
+    if isinstance(staff, dict):
+        return staff.get("id")
+    return None
+
+
+def _services(record: dict[str, Any]) -> list[dict[str, Any]] | None:
+    raw = record.get("services")
+    if not isinstance(raw, list):
+        return None
+    if any(not isinstance(item, dict) for item in raw):
+        return None
+    return [item for item in raw if isinstance(item, dict)]
+
+
+def _positive_number(value: object) -> float | None:
+    if type(value) in (int, float) and not isinstance(value, bool) and value > 0:
+        return float(value)
+    return None
+
+
+def source_fingerprint(
+    *,
+    company_id: int,
+    record_id: int,
+    starts_at_utc: datetime,
+    staff_uuid: str,
+    service_uuid: str,
+    duration_minutes: int,
+    customer_uuid: str,
+) -> str:
+    """Digest of the schedule identity this row was migrated as.
+
+    Compared on a later run to answer "is the Altegio side still what we created
+    in EasyWeek?". Nothing reversible to a person goes in — the customer appears
+    as their EasyWeek UUID, which is an identifier we already store, not contact
+    data.
+    """
+    blob = "|".join(
+        [
+            str(company_id),
+            str(record_id),
+            starts_at_utc.isoformat(),
+            staff_uuid,
+            service_uuid,
+            str(duration_minutes),
+            customer_uuid,
+        ]
+    )
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class LedgerView:
+    """What the ledger already knows about one source booking."""
+
+    status: str
+    target_booking_uuid: str | None
+    source_fingerprint: str
+
+
+def classify_record(
+    record: dict[str, Any],
+    *,
+    company_id: int,
+    manifest: MigrationManifest,
+    directory: CustomerDirectory,
+    cutover: Cutover,
+    ledger: LedgerView | None,
+) -> Decision:
+    """Decide what happens to one Altegio record. Pure; performs no I/O.
+
+    The order of the checks is part of the contract, and it runs cheapest-and-
+    most-exclusionary first: a booking that is not ours, or is in the past, is
+    ``skipped`` before we ever ask whether its master is mapped. That keeps the
+    blocked list free of rows nobody was ever going to migrate.
+    """
+    branch: BranchMapping | None = manifest.branch(company_id)
+    if branch is None:
+        # Not in the manifest, so not part of this cutover. Durlach reaches this
+        # branch only in the sense that it can never reach it at all: it has no
+        # Altegio company_id to be fetched under.
+        return Decision(
+            outcome=SKIPPED, reason=SKIP_FOREIGN_COMPANY, source_company_id=company_id, source_record_id=None
+        )
+
+    record_id = _record_id(record)
+    if record_id is None:
+        return Decision(outcome=BLOCKED, reason=BLOCK_NO_RECORD_ID, source_company_id=company_id, source_record_id=None)
+
+    def _skip(reason: str) -> Decision:
+        return Decision(outcome=SKIPPED, reason=reason, source_company_id=company_id, source_record_id=record_id)
+
+    def _block(reason: str) -> Decision:
+        return Decision(outcome=BLOCKED, reason=reason, source_company_id=company_id, source_record_id=record_id)
+
+    # -- 1. is the source booking still alive? ------------------------------
+    if bool(record.get("deleted")):
+        return _skip(SKIP_DELETED)
+
+    confirmed = record.get("confirmed")
+    if confirmed is not None:
+        confirmed_int = _exact_int(confirmed)
+        if confirmed_int is None:
+            return _block(BLOCK_STATUS_UNRECOGNISED)
+        if confirmed_int == 0:
+            return _skip(SKIP_CANCELED)
+
+    # ``attendance`` is absent on a plain future booking and present once the
+    # visit resolves. Present-and-terminal is skipped; present-and-unrecognised
+    # is BLOCKED rather than assumed live — an unknown status is exactly the case
+    # where guessing creates a booking for a visit that already happened.
+    attendance = record.get("attendance")
+    if attendance is not None:
+        attendance_int = _exact_int(attendance)
+        if attendance_int is None:
+            return _block(BLOCK_STATUS_UNRECOGNISED)
+        if attendance_int not in ACTIVE_ATTENDANCE:
+            return _skip(SKIP_COMPLETED)
+
+    visit_attendance = record.get("visit_attendance")
+    if visit_attendance is not None:
+        visit_int = _exact_int(visit_attendance)
+        if visit_int is None:
+            return _block(BLOCK_STATUS_UNRECOGNISED)
+        if visit_int not in ACTIVE_ATTENDANCE:
+            return _skip(SKIP_COMPLETED)
+
+    # -- 2. when does it start? --------------------------------------------
+    raw_start = record.get("date") if record.get("date") else record.get("datetime")
+    try:
+        starts_at = parse_altegio_local_to_utc(raw_start)
+    except LocalTimeError as exc:
+        return _block(exc.reason)
+
+    if starts_at < cutover.at:
+        return _skip(SKIP_PAST)
+
+    # -- 3. exactly one service, no overrides ------------------------------
+    services = _services(record)
+    if services is None:
+        return _block(BLOCK_NO_SERVICES)
+    if not services:
+        return _block(BLOCK_NO_SERVICES)
+    if len(services) > 1:
+        # EasyWeek's representation of a multi-service booking is not proven, so
+        # it is refused outright rather than flattened to "the first service".
+        return _block(BLOCK_MULTI_SERVICE)
+
+    service = services[0]
+    service_id = _exact_int(service.get("id"))
+    if service_id is None or service_id <= 0:
+        return _block(BLOCK_SERVICE_ID_INVALID)
+
+    # A per-booking price override has no proven EasyWeek equivalent. Migrating
+    # it as the catalogue price would quietly change what the customer was
+    # promised, so the row goes to a human instead.
+    catalogue_price = _positive_number(service.get("cost_to_pay"))
+    listed_price = _positive_number(service.get("cost"))
+    first_price = _positive_number(service.get("first_cost"))
+    if catalogue_price is not None and listed_price is not None and catalogue_price != listed_price:
+        return _block(BLOCK_CUSTOM_PRICE)
+    if first_price is not None and listed_price is not None and first_price != listed_price:
+        return _block(BLOCK_CUSTOM_PRICE)
+    if _positive_number(service.get("discount")) is not None:
+        return _block(BLOCK_CUSTOM_PRICE)
+
+    # -- 4. duration -------------------------------------------------------
+    seance_seconds = _positive_number(record.get("seance_length"))
+    service_seconds = _positive_number(service.get("seance_length"))
+    if seance_seconds is None:
+        return _block(BLOCK_DURATION_UNKNOWN)
+    if service_seconds is not None and service_seconds != seance_seconds:
+        # The booking runs for a different length than its service defines: a
+        # hand-stretched slot. EasyWeek's custom-duration representation is not
+        # proven, so it is not approximated.
+        return _block(BLOCK_CUSTOM_DURATION)
+    duration_minutes = int(seance_seconds // 60)
+    if duration_minutes <= 0 or seance_seconds % 60 != 0:
+        return _block(BLOCK_CUSTOM_DURATION)
+
+    # -- 5. mapping: exact, or blocked -------------------------------------
+    staff_uuid = branch.staff_uuid(_staff_id(record))
+    if staff_uuid is None:
+        return _block(BLOCK_STAFF_MAPPING_MISSING)
+
+    service_uuid = branch.service_uuid(service_id)
+    if service_uuid is None:
+        return _block(BLOCK_SERVICE_MAPPING_MISSING)
+
+    # -- 6. customer: exactly one --------------------------------------
+    client = record.get("client")
+    raw_phone = client.get("phone") if isinstance(client, dict) else None
+    match = directory.resolve(raw_phone)
+    if not match.resolved:
+        assert match.reason is not None
+        return _block(match.reason)
+    customer_uuid = match.uuid
+    assert customer_uuid is not None
+
+    fingerprint = source_fingerprint(
+        company_id=company_id,
+        record_id=record_id,
+        starts_at_utc=starts_at,
+        staff_uuid=staff_uuid,
+        service_uuid=service_uuid,
+        duration_minutes=duration_minutes,
+        customer_uuid=customer_uuid,
+    )
+
+    # -- 7. has this already been migrated? --------------------------------
+    if ledger is not None:
+        if ledger.status in LEDGER_UNRESOLVED_STATUSES:
+            # A mutation whose outcome we never learned. `uncertain` says so
+            # explicitly; `pending` says it by omission — some process claimed
+            # this booking and never came back, and it may well have sent the
+            # POST before it died. Retrying either blind is exactly the
+            # double-booking this whole design exists to prevent; both need
+            # `reconcile`, not another attempt.
+            return Decision(
+                outcome=BLOCKED,
+                reason=BLOCK_LEDGER_UNCERTAIN,
+                source_company_id=company_id,
+                source_record_id=record_id,
+                target_booking_uuid=ledger.target_booking_uuid,
+            )
+        if ledger.status == "created":
+            if ledger.source_fingerprint != fingerprint:
+                # It was migrated, and then Altegio changed underneath. Creating
+                # a second booking would double-book; silently accepting the old
+                # one would leave the customer with a stale appointment. Human.
+                return Decision(
+                    outcome=BLOCKED,
+                    reason=BLOCK_SOURCE_CHANGED,
+                    source_company_id=company_id,
+                    source_record_id=record_id,
+                    target_booking_uuid=ledger.target_booking_uuid,
+                )
+            return Decision(
+                outcome=ALREADY_MIGRATED,
+                reason=None,
+                source_company_id=company_id,
+                source_record_id=record_id,
+                starts_at_utc=starts_at,
+                target_booking_uuid=ledger.target_booking_uuid,
+                source_fingerprint=fingerprint,
+            )
+        # `blocked` / `failed` ledger rows carry no target, so the row is simply
+        # re-evaluated from scratch and may become ready once the cause is fixed.
+
+    return Decision(
+        outcome=READY,
+        reason=None,
+        source_company_id=company_id,
+        source_record_id=record_id,
+        starts_at_utc=starts_at,
+        duration_minutes=duration_minutes,
+        easyweek_location_uuid=branch.easyweek_location_uuid,
+        easyweek_staff_uuid=staff_uuid,
+        easyweek_service_uuid=service_uuid,
+        easyweek_customer_uuid=customer_uuid,
+        source_fingerprint=fingerprint,
+    )

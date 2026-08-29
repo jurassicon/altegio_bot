@@ -1,0 +1,435 @@
+"""The ONLY module in this project allowed to mutate EasyWeek (PR-11.1).
+
+``easyweek_client.EasyWeekClient`` is GET-only by construction and stays that
+way: plan §1.6 p.8 is a hard rule, the running bot depends on it, and "we added a
+POST to the shared client, but only the migration calls it" is how a hard rule
+stops being one. The cutover therefore gets its own client, in its own module,
+with its own name — so the grep for "who can write to EasyWeek" has exactly one
+answer.
+
+It reuses the transport *policy* of the read client (pinned origin, no redirects,
+typed errors, no bodies in logs) by importing those pieces rather than
+re-deciding them.
+
+The uncertain-result contract
+-----------------------------
+A ``POST`` that times out, or dies mid-flight, is **not** a failed POST. The
+server may have created the booking and lost the response. Retrying it would
+create a second appointment for a real person, and the customer would see two.
+
+So this client separates three outcomes, and the caller must too:
+
+``BookingCreated``      a 2xx we read back, carrying a booking UUID.
+``EasyWeekUncertainMutation``  we do not know. No retry, ever, automatically.
+                        The row goes to ``uncertain`` and waits for reconcile.
+``EasyWeekError``       a definite failure — the request provably did not create
+                        anything (a 4xx the server rejected before acting).
+
+Retries exist only where they are provably safe: a 429 or a 5xx *received as a
+complete HTTP response* means the server answered, and answering "too many
+requests" is not creating a booking. A timeout is not an answer, so it is never
+retried.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from types import TracebackType
+from typing import Any, Awaitable, Callable, Final
+
+import httpx
+
+from altegio_bot.easyweek_client import (
+    _DEFAULT_TIMEOUT,
+    EasyWeekAuthError,
+    EasyWeekConfigError,
+    EasyWeekError,
+    EasyWeekNotFoundError,
+    EasyWeekPermanentError,
+    EasyWeekProtocolError,
+    EasyWeekRetryableError,
+    _backoff_delay,
+    _canonical_booking_uuid,
+    _normalize_base_url,
+    _parse_retry_after,
+    _unwrap_secret,
+)
+from altegio_bot.settings import settings
+
+logger = logging.getLogger("easyweek_migration.write")
+
+_PATH_BOOKINGS: Final = "bookings"
+
+# EasyWeek allows 60 requests/min per key (plan §1.1). The migration is the only
+# thing that ever runs at volume against that budget, and the shared outbox
+# worker's reminder guard is using the same key at the same time — so the
+# cutover deliberately takes well under half of it.
+DEFAULT_REQUESTS_PER_MINUTE: Final = 24
+
+# A mutation gets fewer attempts than a read. Every extra attempt is another
+# chance to time out in a way we cannot interpret.
+_MAX_MUTATION_ATTEMPTS: Final = 2
+
+
+class EasyWeekUncertainMutation(EasyWeekError):
+    """The request was sent and its outcome is unknown. NEVER retried automatically.
+
+    Deliberately not a subclass of the retryable error: the whole point is that
+    no generic "retryable?" check can sweep it up. A caller has to name it.
+    """
+
+    retryable = False
+
+
+class RateLimiter:
+    """A simple, monotonic-clock request pacer.
+
+    Not a token bucket with a burst: a burst is precisely what trips a
+    60-per-minute limit at the start of a bulk apply, and being slightly slower
+    costs a cutover nothing.
+    """
+
+    def __init__(
+        self,
+        *,
+        requests_per_minute: int = DEFAULT_REQUESTS_PER_MINUTE,
+        sleep: Callable[[float], Awaitable[None]] | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if requests_per_minute < 1:
+            raise ValueError("requests_per_minute must be >= 1")
+        self._interval = 60.0 / requests_per_minute
+        self._sleep = sleep or asyncio.sleep
+        self._monotonic = monotonic
+        self._next_allowed: float | None = None
+
+    async def acquire(self) -> None:
+        now = self._monotonic()
+        if self._next_allowed is not None and now < self._next_allowed:
+            await self._sleep(self._next_allowed - now)
+            now = self._monotonic()
+        self._next_allowed = now + self._interval
+
+
+class BookingCreated:
+    """A proven creation: EasyWeek answered 2xx and named the booking."""
+
+    __slots__ = ("booking_uuid", "attempts")
+
+    def __init__(self, *, booking_uuid: str, attempts: int) -> None:
+        self.booking_uuid = booking_uuid
+        self.attempts = attempts
+
+    def __repr__(self) -> str:
+        return f"<BookingCreated uuid={self.booking_uuid!r} attempts={self.attempts}>"
+
+
+def build_booking_request(
+    *,
+    location_uuid: str,
+    staff_uuid: str,
+    service_uuid: str,
+    customer_uuid: str,
+    starts_at_utc_iso: str,
+    duration_minutes: int,
+    comment: str,
+) -> dict[str, Any]:
+    """Build the ``POST /bookings`` body from PROVEN identifiers only.
+
+    Every value here was resolved to exactly one UUID by the classifier; nothing
+    is derived from a name, and no field is filled in with a plausible default.
+
+    The endpoint itself is confirmed by plan §1.1; its exact body schema is not
+    documented there. That is why the request shape lives in ONE function and why
+    the runbook makes a single-booking **canary** the gate before any bulk apply:
+    the canary is what proves this shape, and correcting it is a one-place change
+    rather than an archaeology exercise. Until the canary is green, no volume
+    goes anywhere near this.
+
+    ``comment`` carries the migration's stable, PII-free marker (see
+    :func:`altegio_bot.easyweek_migration.ledger.migration_marker`) so a booking
+    created by the cutover can be recognised in the EasyWeek UI without opening a
+    report.
+    """
+    return {
+        "location_uuid": location_uuid,
+        "staff_uuid": staff_uuid,
+        "customer_uuid": customer_uuid,
+        "start_time": starts_at_utc_iso,
+        "duration": duration_minutes,
+        "services": [{"service_uuid": service_uuid}],
+        "comment": comment,
+    }
+
+
+class EasyWeekMigrationWriteClient:
+    """Mutating EasyWeek client, scoped to the cutover and nothing else."""
+
+    def __init__(
+        self,
+        *,
+        api_key: str | None = None,
+        workspace_slug: str | None = None,
+        base_url: str | None = None,
+        timeout: httpx.Timeout | None = None,
+        transport: httpx.AsyncBaseTransport | None = None,
+        http_client: httpx.AsyncClient | None = None,
+        sleep: Callable[[float], Awaitable[None]] | None = None,
+        rate_limiter: RateLimiter | None = None,
+        max_attempts: int = _MAX_MUTATION_ATTEMPTS,
+    ) -> None:
+        key = _unwrap_secret(api_key if api_key is not None else settings.easyweek_api_key)
+        slug = _unwrap_secret(workspace_slug if workspace_slug is not None else settings.easyweek_workspace_slug)
+        if not (isinstance(key, str) and key.strip()):
+            raise EasyWeekConfigError("EASYWEEK_API_KEY is not configured")
+        if not (isinstance(slug, str) and slug.strip()):
+            raise EasyWeekConfigError("EASYWEEK_WORKSPACE_SLUG is not configured")
+
+        self._api_key = key.strip()
+        self._workspace_slug = slug.strip()
+        self._base_url = _normalize_base_url(base_url if base_url is not None else settings.easyweek_api_base_url)
+        self._max_attempts = max(1, int(max_attempts))
+        self._sleep = sleep or asyncio.sleep
+        self._limiter = rate_limiter or RateLimiter(sleep=self._sleep)
+
+        if http_client is not None:
+            self._client = http_client
+            self._owns_client = False
+        else:
+            self._client = httpx.AsyncClient(
+                timeout=timeout or _DEFAULT_TIMEOUT,
+                follow_redirects=False,
+                transport=transport,
+            )
+            self._owns_client = True
+
+    async def aclose(self) -> None:
+        if self._owns_client:
+            await self._client.aclose()
+
+    async def __aenter__(self) -> EasyWeekMigrationWriteClient:
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        await self.aclose()
+
+    def __repr__(self) -> str:
+        return f"<EasyWeekMigrationWriteClient base_url={self._base_url!r}>"
+
+    __str__ = __repr__
+
+    def _headers(self) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {self._api_key}",
+            "Workspace": self._workspace_slug,
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
+
+    async def create_booking(self, body: dict[str, Any]) -> BookingCreated:
+        """``POST /bookings``. Returns only on a PROVEN creation.
+
+        Raises :class:`EasyWeekUncertainMutation` when the outcome is unknown,
+        and the caller must record that rather than trying again.
+        """
+        url = "/".join([self._base_url, _PATH_BOOKINGS])
+        last_retryable: EasyWeekError | None = None
+
+        for attempt in range(1, self._max_attempts + 1):
+            await self._limiter.acquire()
+            try:
+                response = await self._client.post(url, headers=self._headers(), json=body)
+            except httpx.TimeoutException:
+                # The request left; no answer came back. Whether a booking exists
+                # is genuinely unknown, and this is the single most important
+                # branch in the file.
+                logger.error("easyweek_migration: create_booking timeout attempt=%s — outcome UNKNOWN", attempt)
+                raise EasyWeekUncertainMutation(
+                    "mutation timed out; outcome unknown", operation="create_booking", attempts=attempt
+                ) from None
+            except httpx.HTTPError as exc:
+                logger.error(
+                    "easyweek_migration: create_booking transport failure attempt=%s error_type=%s — outcome UNKNOWN",
+                    attempt,
+                    type(exc).__name__,
+                )
+                raise EasyWeekUncertainMutation(
+                    "mutation transport failure; outcome unknown",
+                    operation="create_booking",
+                    attempts=attempt,
+                ) from None
+
+            status = response.status_code
+            logger.info("easyweek_migration: create_booking status=%s attempt=%s", status, attempt)
+
+            if 200 <= status < 300:
+                return BookingCreated(booking_uuid=self._booking_uuid_from(response), attempts=attempt)
+
+            if status == 429 or 500 <= status < 600:
+                # A complete HTTP response. The server declined to act, so
+                # another attempt cannot duplicate anything.
+                last_retryable = EasyWeekRetryableError(
+                    "retryable mutation status",
+                    operation="create_booking",
+                    status_code=status,
+                    attempts=attempt,
+                )
+                if attempt < self._max_attempts:
+                    retry_after = _parse_retry_after(response.headers.get("Retry-After"))
+                    await self._sleep(retry_after if retry_after is not None else _backoff_delay(attempt))
+                    continue
+                break
+
+            # Permanent 4xx: the request was rejected, nothing was created, and
+            # repeating it cannot change the answer.
+            if status in (401, 403):
+                raise EasyWeekAuthError(
+                    "authentication or authorization failed",
+                    operation="create_booking",
+                    status_code=status,
+                    attempts=attempt,
+                )
+            if status == 404:
+                raise EasyWeekNotFoundError(
+                    "resource not found", operation="create_booking", status_code=status, attempts=attempt
+                )
+            raise EasyWeekPermanentError(
+                "permanent client error", operation="create_booking", status_code=status, attempts=attempt
+            )
+
+        assert last_retryable is not None
+        raise last_retryable
+
+    @staticmethod
+    def _booking_uuid_from(response: httpx.Response) -> str:
+        """Read the created booking's UUID out of a 2xx body.
+
+        A 2xx we cannot read is NOT a success we can record: without a UUID there
+        is nothing to reconcile against and nothing to roll back. It is reported
+        as uncertain, because a booking probably was created.
+        """
+        try:
+            payload: Any = response.json()
+        except Exception:
+            raise EasyWeekUncertainMutation(
+                "mutation succeeded but the response was not JSON", operation="create_booking"
+            ) from None
+
+        if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
+            payload = payload["data"]
+        if not isinstance(payload, dict):
+            raise EasyWeekUncertainMutation(
+                "mutation succeeded but the response was not an object", operation="create_booking"
+            )
+
+        for key in ("uuid", "uid"):
+            candidate = payload.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                try:
+                    return _canonical_booking_uuid(candidate)
+                except EasyWeekPermanentError:
+                    break
+        raise EasyWeekUncertainMutation(
+            "mutation succeeded but the response carried no usable booking uuid",
+            operation="create_booking",
+        )
+
+    async def get_booking(self, booking_uuid: str) -> dict[str, Any]:
+        """``GET /bookings/{uuid}`` — used by reconcile and rollback.
+
+        Present on the write client so reconciliation can prove an uncertain
+        outcome using the same key, pacing and error taxonomy as the mutation it
+        is reconciling. It never logs the body, which carries customer PII.
+        """
+        canonical = _canonical_booking_uuid(booking_uuid)
+        url = "/".join([self._base_url, _PATH_BOOKINGS, canonical])
+
+        last_retryable: EasyWeekError | None = None
+        for attempt in range(1, self._max_attempts + 1):
+            await self._limiter.acquire()
+            try:
+                response = await self._client.get(url, headers=self._headers())
+            except httpx.TimeoutException:
+                last_retryable = EasyWeekRetryableError("request timed out", operation="get_booking", attempts=attempt)
+            except httpx.HTTPError:
+                last_retryable = EasyWeekRetryableError("transport error", operation="get_booking", attempts=attempt)
+            else:
+                status = response.status_code
+                if 200 <= status < 300:
+                    try:
+                        payload: Any = response.json()
+                    except Exception:
+                        raise EasyWeekProtocolError(
+                            "booking response is not valid JSON", operation="get_booking", status_code=status
+                        ) from None
+                    if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
+                        payload = payload["data"]
+                    if not isinstance(payload, dict):
+                        raise EasyWeekProtocolError("booking response is not a JSON object", operation="get_booking")
+                    return payload
+                if status == 404:
+                    raise EasyWeekNotFoundError(
+                        "resource not found", operation="get_booking", status_code=status, attempts=attempt
+                    )
+                if status in (401, 403):
+                    raise EasyWeekAuthError(
+                        "authentication or authorization failed",
+                        operation="get_booking",
+                        status_code=status,
+                        attempts=attempt,
+                    )
+                if not (status == 429 or 500 <= status < 600):
+                    raise EasyWeekPermanentError(
+                        "permanent client error", operation="get_booking", status_code=status, attempts=attempt
+                    )
+                last_retryable = EasyWeekRetryableError(
+                    "retryable response status", operation="get_booking", status_code=status, attempts=attempt
+                )
+
+            if attempt < self._max_attempts:
+                await self._sleep(_backoff_delay(attempt))
+
+        assert last_retryable is not None
+        raise last_retryable
+
+    async def cancel_booking(self, booking_uuid: str) -> None:
+        """Cancel one booking. Reached ONLY by a confirmed rollback.
+
+        Uses the plan's documented ``set-booking-cancel`` action (§1.1). Like
+        ``create_booking``, an unknown outcome is raised as uncertain rather than
+        retried: a cancel that may or may not have landed must be looked at, not
+        repeated.
+        """
+        canonical = _canonical_booking_uuid(booking_uuid)
+        url = "/".join([self._base_url, _PATH_BOOKINGS, canonical, "set-booking-cancel"])
+
+        await self._limiter.acquire()
+        try:
+            response = await self._client.post(url, headers=self._headers(), json={})
+        except httpx.TimeoutException:
+            raise EasyWeekUncertainMutation("cancel timed out; outcome unknown", operation="cancel_booking") from None
+        except httpx.HTTPError:
+            raise EasyWeekUncertainMutation(
+                "cancel transport failure; outcome unknown", operation="cancel_booking"
+            ) from None
+
+        status = response.status_code
+        logger.info("easyweek_migration: cancel_booking status=%s", status)
+        if 200 <= status < 300:
+            return
+        if status in (401, 403):
+            raise EasyWeekAuthError(
+                "authentication or authorization failed", operation="cancel_booking", status_code=status
+            )
+        if status == 404:
+            raise EasyWeekNotFoundError("resource not found", operation="cancel_booking", status_code=status)
+        if status == 429 or 500 <= status < 600:
+            raise EasyWeekRetryableError("retryable cancel status", operation="cancel_booking", status_code=status)
+        raise EasyWeekPermanentError("permanent client error", operation="cancel_booking", status_code=status)

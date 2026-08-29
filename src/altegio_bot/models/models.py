@@ -1438,3 +1438,107 @@ class PromoLead(Base):
     )
 
     meta: Mapped[dict] = mapped_column(JSONB, default=dict)
+
+
+class EasyWeekMigrationLedger(Base):
+    """One durable row per SOURCE booking a cutover migration has looked at (PR-11.1).
+
+    The migration writes bookings into a live CRM. Its whole safety story rests
+    on being able to answer, offline and forever, *"has this Altegio record
+    already been created in EasyWeek?"* — so the answer lives in PostgreSQL under
+    a unique constraint, not in a report file, not in a marker on the remote
+    booking, and not in an in-memory set that dies with the process.
+
+    Identity is **source-scoped**, not target-scoped: the natural key is
+    ``(source_provider, source_company_id, source_record_id)``. A target UUID is
+    the *result* of a migration attempt and is unknown for every row that has not
+    succeeded yet — keying on it would leave exactly the uncertain rows unkeyed.
+
+    ``status`` is a small closed vocabulary owned by
+    :mod:`altegio_bot.easyweek_migration.ledger`; it is a plain string here for
+    the same reason ``provider`` is (see above): a new outcome must be a code
+    change, not a migration against a restrictive type.
+
+    Nothing on this row is PII. Phones, names and payloads are deliberately
+    absent: the ledger is read by operators, printed into reports and kept long
+    after the cutover, and a customer identifier stored here would outlive every
+    reason to have it. ``source_fingerprint`` is a digest of the source booking's
+    *schedule identity*, which is what proves a row was migrated as planned and
+    what detects a source that changed under us.
+    """
+
+    __tablename__ = "easyweek_migration_ledger"
+    __table_args__ = (
+        # The idempotency guarantee, enforced by the database rather than by the
+        # tool: a second `apply` (a rerun, a parallel operator, a crashed run
+        # picked up again) cannot insert a second row for the same source
+        # booking, so it cannot create a second EasyWeek booking for it either.
+        UniqueConstraint(
+            "source_provider",
+            "source_company_id",
+            "source_record_id",
+            name="uq_easyweek_migration_ledger_source_identity",
+        ),
+        Index("ix_easyweek_migration_ledger_run", "run_id"),
+        Index("ix_easyweek_migration_ledger_status", "status"),
+        # A created row must name what it created; a row that created nothing
+        # must not claim a target. Without this, an interrupted apply could leave
+        # `created` with a NULL target and reconciliation would report a booking
+        # nobody can find or roll back.
+        CheckConstraint(
+            "(status <> 'created') OR (target_booking_uuid IS NOT NULL)",
+            name="ck_easyweek_migration_ledger_created_has_target",
+        ),
+        CheckConstraint(
+            "attempts >= 0",
+            name="ck_easyweek_migration_ledger_attempts_non_negative",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+
+    # -- source identity (Altegio) ----------------------------------------
+    source_provider: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        server_default=_PROVIDER_SERVER_DEFAULT,
+    )
+    source_company_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    source_record_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # Digest over the source booking's schedule identity (start, staff, service,
+    # duration, customer key). Not a secret and not reversible to PII; it exists
+    # so a later run can say "this source booking is no longer what we migrated".
+    source_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+
+    # -- target identity (EasyWeek) ---------------------------------------
+    target_provider: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        server_default=text(f"'{PROVIDER_EASYWEEK}'"),
+    )
+    # NULL until a mutation is PROVEN to have created a booking. An uncertain
+    # POST leaves this NULL on purpose: claiming a UUID we never read back would
+    # be worse than admitting we do not know.
+    target_booking_uuid: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    # -- run bookkeeping ---------------------------------------------------
+    run_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    # The index lives in ``__table_args__`` above, next to the others; declaring
+    # ``index=True`` here as well would emit the same CREATE INDEX twice.
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"), default=0)
+    # Stable technical code (`mapping_missing`, `customer_ambiguous`, …). Never a
+    # provider message, never a payload excerpt, never a phone number.
+    reason_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
