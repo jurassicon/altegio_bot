@@ -40,12 +40,34 @@ from pathlib import Path
 from typing import Any, Final
 
 from altegio_bot.easyweek_locations import PG_INT_MAX
+from altegio_bot.easyweek_migration.money import (
+    Amount,
+    AmountError,
+    Duration,
+    DurationError,
+    read_amount,
+    read_duration_minutes,
+)
 
 # The two Altegio branches that migrate. Durlach is absent from Altegio entirely
 # and is therefore not expressible here: there is no company_id to write down.
 KARLSRUHE_COMPANY_ID: Final = 758285
 RASTATT_COMPANY_ID: Final = 1271200
 MIGRATABLE_COMPANY_IDS: Final[frozenset[int]] = frozenset({KARLSRUHE_COMPANY_ID, RASTATT_COMPANY_ID})
+
+# The EasyWeek branch each Altegio company MUST land in, named by the registry
+# slug (`EASYWEEK_LOCATION_MAP` key). This mapping is source-controlled on
+# purpose: it is the one fact a manifest cannot be trusted to state about
+# itself, because a manifest with Karlsruhe and Rastatt swapped is internally
+# consistent and would migrate every Karlsruhe customer into Rastatt.
+#
+# Plan §10 is the precedent: two configuration values that each looked correct
+# pointed at different branches, and nothing caught it until real messages went
+# to the wrong salon's customers.
+EXPECTED_BRANCH_SLUG: Final[dict[int, str]] = {
+    KARLSRUHE_COMPANY_ID: "karlsruhe",
+    RASTATT_COMPANY_ID: "rastatt",
+}
 
 PG_BIGINT_MAX: Final = 9_223_372_036_854_775_807
 
@@ -60,6 +82,18 @@ _BRANCH_FIELDS: Final = frozenset(
 )
 
 _TOP_LEVEL_FIELDS: Final = frozenset({"manifest_id", "branches"})
+
+# A service entry is an OBJECT, not a bare uuid. The extra two fields are the
+# catalogue baseline the classifier compares a booking against; without them a
+# stretched slot or a discounted price has nothing to be measured as an
+# override *against*, and "no baseline" silently reads as "no override".
+_SERVICE_FIELDS: Final = frozenset(
+    {
+        "easyweek_service_uuid",
+        "catalog_duration_minutes",
+        "catalog_price",
+    }
+)
 
 # A manifest id is an operator-chosen label that ends up in every report and in
 # the apply gate. Kept to a boring closed alphabet so it cannot smuggle newlines
@@ -88,6 +122,24 @@ def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]
 
 
 @dataclass(frozen=True)
+class ServiceMapping:
+    """One Altegio service, its EasyWeek target, and its verified catalogue baseline.
+
+    The two catalogue fields are what make a per-booking override *detectable*.
+    Altegio does not always repeat a service's catalogue duration or price on the
+    booking row, and the first version of this migration treated that silence as
+    "no override" — so a booking hand-stretched to 90 minutes, or discounted to
+    zero, migrated as if it were the standard service. The baseline lives here,
+    in a file an operator wrote and checked, so there is always something to
+    compare against.
+    """
+
+    easyweek_service_uuid: str
+    catalog_duration: Duration
+    catalog_price: Amount
+
+
+@dataclass(frozen=True)
 class BranchMapping:
     """Everything needed to place one Altegio branch's booking into EasyWeek."""
 
@@ -96,8 +148,9 @@ class BranchMapping:
     easyweek_location_uuid: str
     # Altegio staff id → EasyWeek staff uuid, scoped to THIS company.
     staff: dict[int, str]
-    # Altegio service id → EasyWeek service uuid, scoped to THIS company.
-    services: dict[int, str]
+    # Altegio service id → its EasyWeek target and catalogue baseline, scoped to
+    # THIS company.
+    services: dict[int, ServiceMapping]
 
     def staff_uuid(self, altegio_staff_id: object) -> str | None:
         """Exact lookup only. An unmapped or non-integer id resolves to nothing."""
@@ -105,11 +158,15 @@ class BranchMapping:
             return None
         return self.staff.get(altegio_staff_id)
 
-    def service_uuid(self, altegio_service_id: object) -> str | None:
+    def service(self, altegio_service_id: object) -> ServiceMapping | None:
         """Exact lookup only. An unmapped or non-integer id resolves to nothing."""
         if type(altegio_service_id) is not int:
             return None
         return self.services.get(altegio_service_id)
+
+    def service_uuid(self, altegio_service_id: object) -> str | None:
+        mapping = self.service(altegio_service_id)
+        return mapping.easyweek_service_uuid if mapping is not None else None
 
 
 @dataclass(frozen=True)
@@ -210,6 +267,49 @@ def _parse_id_to_uuid_map(raw: object) -> dict[int, str] | None:
     return result
 
 
+def _parse_service_map(raw: object) -> dict[int, ServiceMapping] | None:
+    """Parse the ``services`` object: id → target uuid + catalogue baseline.
+
+    Every entry must carry all three fields. ``catalog_price`` may legitimately
+    be ``"0"`` for a genuinely free service — and that is precisely why it is
+    required rather than optional: a missing baseline and a zero baseline lead to
+    opposite decisions, and only the operator knows which one is true.
+    """
+    if not isinstance(raw, dict):
+        return None
+
+    result: dict[int, ServiceMapping] = {}
+    for key, value in raw.items():
+        if not isinstance(key, str) or not key.isdigit():
+            return None
+        source_id = int(key)
+        if str(source_id) != key or not (0 < source_id <= PG_BIGINT_MAX):
+            return None
+        if not isinstance(value, dict) or frozenset(value) != _SERVICE_FIELDS:
+            return None
+
+        target_uuid = canonical_uuid(value.get("easyweek_service_uuid"))
+        if target_uuid is None:
+            return None
+
+        try:
+            catalog_duration = read_duration_minutes(value.get("catalog_duration_minutes"))
+            catalog_price = read_amount(value.get("catalog_price"))
+        except (DurationError, AmountError):
+            return None
+        # Both baselines are mandatory: an absent one is an unfinished manifest,
+        # not a service without a duration or a price.
+        if not catalog_duration.present or not catalog_price.present:
+            return None
+
+        result[source_id] = ServiceMapping(
+            easyweek_service_uuid=target_uuid,
+            catalog_duration=catalog_duration,
+            catalog_price=catalog_price,
+        )
+    return result
+
+
 def _canonical_digest(manifest_id: str, branches: dict[int, BranchMapping]) -> str:
     """Digest over the SEMANTIC content, in a fixed order.
 
@@ -225,7 +325,15 @@ def _canonical_digest(manifest_id: str, branches: dict[int, BranchMapping]) -> s
                 "easyweek_location_id": branch.easyweek_location_id,
                 "easyweek_location_uuid": branch.easyweek_location_uuid,
                 "staff": sorted(branch.staff.items()),
-                "services": sorted(branch.services.items()),
+                "services": sorted(
+                    (
+                        service_id,
+                        mapping.easyweek_service_uuid,
+                        mapping.catalog_duration.minutes,
+                        str(mapping.catalog_price.value),
+                    )
+                    for service_id, mapping in branch.services.items()
+                ),
             }
             for _company_id, branch in sorted(branches.items())
         ],
@@ -235,6 +343,11 @@ def _canonical_digest(manifest_id: str, branches: dict[int, BranchMapping]) -> s
 
 
 def parse_manifest(raw: object) -> MigrationManifest:
+    """Strict, all-or-nothing parse. Used by dry-run, canary and apply."""
+    return _parse(raw, allow_empty_mappings=False)
+
+
+def _parse(raw: object, *, allow_empty_mappings: bool) -> MigrationManifest:
     """Parse manifest JSON text without coercion or partial acceptance.
 
     Canonical shape (placeholder values — the real EasyWeek location identity is
@@ -318,14 +431,14 @@ def parse_manifest(raw: object) -> MigrationManifest:
             return _invalid(INVALID_SHAPE)
 
         staff = _parse_id_to_uuid_map(entry.get("staff"))
-        services = _parse_id_to_uuid_map(entry.get("services"))
+        services = _parse_service_map(entry.get("services"))
         if staff is None or services is None:
             return _invalid(INVALID_SHAPE)
         # An empty staff or service map is not a configuration, it is an
         # unfinished one: every booking in that branch would block, and the
         # operator would read a report full of `mapping_missing` instead of a
         # single clear "you have not filled the manifest in yet".
-        if not staff or not services:
+        if not allow_empty_mappings and (not staff or not services):
             return _invalid(INVALID_EMPTY)
 
         branches[company_id] = BranchMapping(
@@ -355,3 +468,27 @@ def load_manifest(path: str | Path) -> MigrationManifest:
     except UnicodeDecodeError:
         return _invalid(INVALID_NOT_JSON)
     return parse_manifest(raw)
+
+
+def inventory_manifest(raw: object) -> MigrationManifest:
+    """A manifest for INVENTORY only: the branches, without a finished mapping.
+
+    Inventory exists to help an operator *build* the mapping, so requiring a
+    complete one is a chicken-and-egg problem — and the first version had it: the
+    parser rejected an empty ``staff``/``services`` object, so the mode that was
+    supposed to tell you which ids to fill in refused to run until you had filled
+    them in.
+
+    This parser therefore accepts empty (and only empty) mapping objects, and
+    keeps every other rule: the company must be one of the two migrating
+    branches, both company ids must agree, the location UUID must be canonical.
+    A partially-filled mapping is still parsed strictly — a malformed entry is a
+    malformed entry whatever mode is reading it.
+
+    ``dry-run``, ``canary`` and ``apply`` never call this. They use
+    :func:`parse_manifest`, which stays strictly all-or-nothing.
+    """
+    parsed = parse_manifest(raw)
+    if parsed.valid or parsed.reason != INVALID_EMPTY:
+        return parsed
+    return _parse(raw, allow_empty_mappings=True)

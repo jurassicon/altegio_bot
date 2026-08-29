@@ -1521,8 +1521,23 @@ class EasyWeekMigrationLedger(Base):
     # be worse than admitting we do not know.
     target_booking_uuid: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
+    # PII-free digest of the LIVE target booking as it was written: location,
+    # staff, service, customer uuid, start, duration, marker and active status.
+    # Rollback compares a freshly fetched booking against this before cancelling
+    # anything — the marker alone cannot tell a booking that was moved to another
+    # day, master or customer from one nobody has touched.
+    target_snapshot_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
     # -- run bookkeeping ---------------------------------------------------
+    # The run that first claimed this source booking. It never changes, because
+    # it is what a rollback of THAT apply selects on: if a later reconciliation
+    # overwrote it, the booking would silently drop out of its own run's rollback
+    # set and become unrollbackable.
     run_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    # The run that last MOVED this row's status — a reconciliation, a resolution,
+    # a rollback. Separate from `run_id` so bookkeeping about the row cannot
+    # rewrite the row's origin.
+    last_resolution_run_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # The index lives in ``__table_args__`` above, next to the others; declaring
     # ``index=True`` here as well would emit the same CREATE INDEX twice.
     status: Mapped[str] = mapped_column(String(32), nullable=False)
@@ -1530,6 +1545,91 @@ class EasyWeekMigrationLedger(Base):
     # Stable technical code (`mapping_missing`, `customer_ambiguous`, …). Never a
     # provider message, never a payload excerpt, never a phone number.
     reason_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+
+class EasyWeekMigrationCanaryProof(Base):
+    """Durable evidence that ONE real booking was created and read back correctly.
+
+    The canary exists because ``POST /bookings`` is a confirmed endpoint with an
+    unconfirmed body schema (plan §1.1, §21.4). Before hundreds of real customers
+    get appointments, exactly one must be created and then *re-read from EasyWeek*
+    and compared field by field against what was sent.
+
+    The first version treated ``--limit 1`` as that evidence. It was not: a limit
+    proves only that one POST returned 2xx, it says nothing about whether the
+    booking landed at the right branch, with the right master, at the right time,
+    and it picked whichever row the Altegio API happened to return first — a
+    different, arbitrary customer on every run.
+
+    So the proof is a row, and a bulk apply requires one that still applies. The
+    binding fields are what "still applies" means: change the manifest, change
+    the branch mapping, change the request schema or the cutover, and the stored
+    proof no longer matches the run being attempted — because it is no longer
+    evidence about that run.
+
+    PII-free by construction: source ids, UUIDs, digests and a timestamp.
+    """
+
+    __tablename__ = "easyweek_migration_canary_proof"
+    __table_args__ = (
+        # One proof per (manifest, schema, cutover, source booking). A re-run of
+        # the same canary updates its row rather than accumulating history that
+        # would make "which proof is current?" ambiguous.
+        UniqueConstraint(
+            "manifest_digest",
+            "request_schema_version",
+            "cutover_at",
+            "source_company_id",
+            "source_record_id",
+            name="uq_easyweek_migration_canary_identity",
+        ),
+        Index("ix_easyweek_migration_canary_lookup", "manifest_digest", "request_schema_version"),
+        # A proof row that did not verify is not a proof. It is still stored —
+        # a failed canary is exactly what an operator needs to read — but the
+        # bulk gate selects on `verified`, and a NULL target on a verified row
+        # would be a proof of nothing.
+        CheckConstraint(
+            "(verified IS NOT TRUE) OR (target_booking_uuid IS NOT NULL)",
+            name="ck_easyweek_migration_canary_verified_has_target",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+
+    # -- what was proven --------------------------------------------------
+    source_company_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    source_record_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    source_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    target_booking_uuid: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Digest of the live booking as read back from EasyWeek after the write.
+    target_snapshot_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    # -- what the proof is BOUND to ---------------------------------------
+    manifest_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    # Bumped whenever the POST body changes shape. An old proof cannot vouch for
+    # a request we no longer send.
+    request_schema_version: Mapped[str] = mapped_column(String(16), nullable=False)
+    cutover_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    branch_identity_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+
+    # -- the verdict -------------------------------------------------------
+    verified: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"), default=False)
+    # Stable code naming the first field that did not match, when it failed.
+    failure_reason: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    run_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

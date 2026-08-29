@@ -191,3 +191,58 @@ async def fetch_company_records(
             client=client,
         )
     ]
+
+
+async def fetch_single_record(
+    *,
+    company_id: int,
+    record_id: int,
+    timeout_sec: float = _DEFAULT_TIMEOUT_SEC,
+    client: httpx.AsyncClient | None = None,
+) -> dict[str, Any] | None:
+    """Read ONE Altegio record live. Read-only; used by the pre-POST re-proof.
+
+    Returns the record, or ``None`` when Altegio says it does not exist (404).
+    A 404 is meaningful here — the booking was hard-deleted between the plan and
+    now — so it is distinguished from a transport failure, which raises.
+
+    Uses ``GET /record/{company_id}/{record_id}``: the record is addressed by
+    both ids, so a response for a different company cannot come back and be
+    mistaken for ours. The caller re-checks both ids anyway.
+    """
+    base = settings.altegio_api_base_url.rstrip("/")
+    url = f"{base}/record/{company_id}/{record_id}"
+
+    owns_client = client is None
+    http = client or httpx.AsyncClient(timeout=timeout_sec)
+    try:
+        try:
+            response = await http.get(url, headers=_headers())
+        except httpx.HTTPError as exc:
+            raise AltegioSourceError(
+                f"altegio single-record transport error company_id={company_id} error_type={type(exc).__name__}"
+            ) from None
+
+        if response.status_code == 404:
+            return None
+        if response.status_code >= 400:
+            raise AltegioSourceError(
+                f"altegio single-record request failed company_id={company_id} status={response.status_code}"
+            )
+
+        try:
+            payload = response.json()
+        except ValueError:
+            raise AltegioSourceError(f"altegio single-record response is not JSON company_id={company_id}") from None
+
+        if not isinstance(payload, dict):
+            raise AltegioSourceError("altegio single-record response is not a JSON object")
+        data = payload.get("data")
+        if data is None:
+            return None
+        if not isinstance(data, dict):
+            raise AltegioSourceError("altegio single-record data is not a JSON object")
+        return data
+    finally:
+        if owns_client:
+            await http.aclose()

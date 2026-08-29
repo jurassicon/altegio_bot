@@ -17,25 +17,49 @@ PR-11.1 **не пишет счётчики через API**.
 cd /opt/altegio_bot
 ```
 
-Инструмент запускается **внутри контейнера EasyWeek-воркера**. Это не стилевое
-предпочтение: gate проверяет effective settings текущего процесса, и только
-запуск с `env_file` самого воркера делает эту проверку утверждением о воркере, а
-не о чьём-то ноутбуке.
-
 ---
 
-## 0. Что означают режимы
+## 0. Как запускается инструмент
+
+Через отдельный one-off compose service `easyweek-booking-migration` под профилем
+`ops`. Он не запускается обычным `docker compose up -d`.
+
+Почему не внутри воркера: у контейнера воркера нет монтирований, поэтому manifest
+и экспорт клиентов туда не попадают, а отчёт умирает вместе с контейнером. У
+one-off сервиса входы смонтированы **read-only** (экспорт клиентов — это PII), а
+каталог отчётов — на запись, поэтому отчёт остаётся на хосте.
+
+Пути на хосте задаются переменными (по умолчанию — внутри git-ignored `outputs/`):
+
+```bash
+export EASYWEEK_MIGRATION_INPUT_DIR=/opt/altegio_bot/outputs/easyweek_migration/input
+```
+
+```bash
+export EASYWEEK_MIGRATION_REPORT_DIR=/opt/altegio_bot/outputs/easyweek_migration
+```
+
+```bash
+mkdir -p "$EASYWEEK_MIGRATION_INPUT_DIR" "$EASYWEEK_MIGRATION_REPORT_DIR"
+```
+
+Внутри контейнера они видны как `/migration/input` (ro) и `/migration/reports`.
+`--build` обязателен всегда: инструмент должен быть кодом разворачиваемого
+коммита.
 
 | Режим | Пишет в EasyWeek | Пишет в БД | Назначение |
 |---|---|---|---|
-| `inventory` | нет | нет | что есть в Altegio и что покрыто mapping'ом |
-| `dry-run` | нет | нет | проверяемый план; его `plan_digest` открывает apply |
-| `apply` | да, только через полный gate | ledger | единственный пишущий режим |
-| `reconcile` | только GET | ledger | разрешает `uncertain` строки по факту |
+| `inventory` | нет | нет | какие Altegio staff/service ID нужны и каких нет в manifest. Работает на **незаполненном** manifest |
+| `dry-run` | нет | нет | проверяемый план; его `plan_digest` открывает запись |
+| `canary` | одна запись | ledger + proof | создаёт одну **названную** запись, перечитывает её и сохраняет durable proof |
+| `apply` | да | ledger | bulk; требует подходящий canary proof |
+| `reconcile` | только GET | ledger | состояние; с `--final` доказывает полноту |
+| `resolve-created` | только GET | ledger | разрешает неизвестный исход по UUID, который инструмент проверяет |
+| `resolve-absent` | нет | ledger | фиксирует, что оператор убедился: записи нет |
 | `rollback-dry-run` | только GET | нет | что откат **бы** отменил |
 
-`dry-run` — режим по умолчанию. Без `--apply` ни один mutation-запрос не
-существует как достижимый путь кода.
+`dry-run` — режим по умолчанию. Без `--apply` mutation-путь недостижим по
+конструкции.
 
 ---
 
@@ -46,64 +70,75 @@ cd /opt/altegio_bot
 **Зачем:** это единственная точка возврата. Если импорт счётчиков склеит или
 задвоит клиентов, восстановить «как было» можно только из этого файла.
 
-Настройки → Клиенты → Экспорт. Сохранить **вне репозитория**, например
-`/opt/altegio_bot/outputs/easyweek-customers-before-import.csv`.
-`outputs/` в `.gitignore`; коммитить экспорт нельзя — это PII.
+Настройки → Клиенты → Экспорт. Сохранить в `$EASYWEEK_MIGRATION_INPUT_DIR`,
+например `easyweek-customers-before-import.csv`. Это PII: `outputs/` в
+`.gitignore`, коммитить нельзя.
 
 ## 2. Импорт исторических счётчиков визитов
 
 **Что делает:** загружает в EasyWeek количество завершённых визитов по каждому
 клиенту нативным импортом.
-**Зачем:** это единственный доказанный способ перенести историю. PR-11.1 не
-пишет счётчики через API, а PR-12 (`repeat_10d` / `comeback_3d`) принимает
-решение «писать клиенту или нет» именно по этому числу: постоянный клиент,
-приехавший в EasyWeek с нулём визитов, получит сообщение для новичка.
+**Зачем:** это единственный доказанный способ перенести историю. PR-12
+(`repeat_10d` / `comeback_3d`) принимает решение «писать клиенту или нет» именно
+по этому числу: постоянный клиент, приехавший в EasyWeek с нулём визитов,
+получит сообщение для новичка.
 
 ## 3. Сохранить отчёт импорта
 
 **Что делает:** сохраняет выданный EasyWeek отчёт импорта.
-**Зачем:** отчёт — единственное доказательство, сколько строк принято, сколько
-отклонено и почему. Без него расхождение счётчиков через месяц не расследуется.
+**Зачем:** единственное доказательство, сколько строк принято и сколько
+отклонено. Без него расхождение счётчиков через месяц не расследуется.
 
 ## 4. Повторный экспорт клиентов EasyWeek
 
-**Что делает:** выгружает клиентскую базу **после** импорта.
-**Зачем:** два разных применения одного файла:
-
-1. сверка с шагом 1 — импорт не создал дублей;
-2. это и есть `--customer-directory` для миграции. Клиент ищется по точному
-   нормализованному международному номеру: ноль совпадений и больше одного —
-   `blocked`, ровно одно — берётся его UUID. Клиенты автоматически не создаются.
-
-Файл — PII. Держать в `outputs/`, не коммитить, после миграции удалить.
+**Что делает:** выгружает клиентскую базу **после** импорта в
+`$EASYWEEK_MIGRATION_INPUT_DIR/easyweek-customers-after-import.csv`.
+**Зачем:** два применения одного файла: сверка с шагом 1 (импорт не создал
+дублей) и `--customer-directory` для миграции. Клиент ищется по точному
+нормализованному международному номеру: ноль совпадений и больше одного —
+`blocked`, ровно одно — его UUID. Клиенты автоматически не создаются.
 
 ## 5. Подготовка mapping location / staff / service
 
 **Что делает:** заполняется manifest — явное соответствие Altegio-идентификаторов
-и EasyWeek UUID.
-**Зачем:** ни один из трёх идентификаторов не выводится автоматически. Fuzzy-match
-по именам верен в 95 % случаев, а оставшиеся 5 % — это запись к другому мастеру,
-и узнаёт об этом клиент.
+и EasyWeek UUID, плюс каталожные длительность и цена каждой услуги.
+**Зачем:** ни один идентификатор не выводится автоматически, а каталожные
+значения — это то, **с чем** сравнивается запись: без них растянутый слот и
+скидка до нуля невидимы. Шаблон и правила:
+`docs/easyweek/migration_manifest.example.json` и `migration_manifest.README.md`.
 
-Шаблон и правила: `docs/easyweek/migration_manifest.example.json` и
-`docs/easyweek/migration_manifest.README.md`.
+**Что делает команда:** выгружает локации EasyWeek с UUID и именами, read-only.
 
-**Что делает команда:** выгружает список локаций EasyWeek с их UUID и
-человекочитаемыми именами, read-only.
+```bash
+docker compose --profile ops run --rm --build easyweek-booking-migration --help
+```
 
 ```bash
 docker compose exec altegio-easyweek-inbox-worker python -m altegio_bot.scripts.easyweek_probe --redact-pii
 ```
 
-**Что делает команда:** показывает, какие Altegio staff/service id реально
-встречаются в будущих записях, чтобы заполнить manifest ровно ими. Ничего не
-пишет и не требует экспорта клиентов.
+**Что делает команда:** показывает, какие Altegio staff/service ID реально
+встречаются в будущих записях и каких ещё нет в manifest. Работает на
+незаполненном manifest, экспорт клиентов не нужен, ничего не пишет.
 
 ```bash
-docker compose exec altegio-easyweek-inbox-worker python -m altegio_bot.scripts.easyweek_migration inventory --manifest /opt/altegio_bot/outputs/migration_manifest.json
+docker compose --profile ops run --rm --build easyweek-booking-migration inventory --manifest /migration/input/manifest.json --cutover-at 2026-09-01T00:00:00+02:00
 ```
 
-Повторять шаги 5 и `inventory`, пока `mapping_missing` не станет нулём.
+Повторять, пока `source_identifiers[*].staff.missing` и `.services.missing` не
+станут пустыми.
+
+**Проверка филиалов.** Manifest дополнительно сверяется с рантайм-реестром
+`EASYWEEK_LOCATION_MAP`: location ID, location UUID и slug филиала
+(`758285 → karlsruhe`, `1271200 → rastatt`) должны совпасть. Перепутанные
+Karlsruhe и Rastatt отвергаются до первого запроса.
+
+---
+
+# Notification maintenance window
+
+Шаги 6–19 выполняются **внутри одного окна с выключенными уведомлениями**.
+Окно закрывается только на шаге 20, отдельным ручным решением.
 
 ## 6. Отключить **все** нативные уведомления EasyWeek
 
@@ -115,9 +150,9 @@ docker compose exec altegio-easyweek-inbox-worker python -m altegio_bot.scripts.
 столько же живых людей одновременно получат сообщение о «новой записи», которую
 они сделали недели назад. Код это не видит и выключить не может.
 
-## 7. Выключить уведомления и отзывы бота
+## 7. Выключить planning-флаги уведомлений и отзывов бота
 
-**Что делает:** в `easyweek.env` выставляется
+**Что делает:** в `easyweek.env`:
 
 ```bash
 EASYWEEK_NOTIFICATIONS_ENABLED=false
@@ -127,11 +162,27 @@ EASYWEEK_NOTIFICATIONS_ENABLED=false
 EASYWEEK_REVIEWS_ENABLED=false
 ```
 
-**Зачем:** это наша половина той же защиты. Миграция породит вебхуки
-`booking-created`; с включёнными флагами бот отправит по ним lifecycle-сообщения
-и запланирует отзывы. Оба флага проверяются gate'ом и без них apply не начнётся.
+**Зачем:** наша половина той же защиты. Миграция породит вебхуки
+`booking-created`; с включёнными флагами бот отправит lifecycle-сообщения и
+запланирует отзывы. Оба флага проверяются gate'ом.
 
-## 8. Оставить capture и processing включёнными
+## 8. Закрыть существующие send fences
+
+**Что делает:** в `easyweek.env`:
+
+```bash
+EASYWEEK_REVIEW_SEND_ENABLED=false
+```
+
+```bash
+EASYWEEK_REMINDER_API_GUARD_ENABLED=false
+```
+
+**Зачем:** planning-флаги останавливают создание **новых** job. Уже стоящие в
+очереди review и reminder они не трогают, а мигрированные записи — это будущие
+визиты, по которым очередь может ожить. Fence закрывает отправку.
+
+## 9. Оставить capture и processing включёнными
 
 **Что делает:** в `easyweek.env` остаются
 
@@ -146,76 +197,92 @@ EASYWEEK_PROCESSING_ENABLED=true
 **Зачем:** это не противоречие «выключить всё». EasyWeek **не переигрывает
 историю доставок** (§1.3): выключенный capture потеряет события самой миграции
 навсегда — вместе с будущими `booking-succeeded`, из которых PR-11 берёт
-`visits_total`, и вместе с доказательствами для reconciliation. Gate требует
-оба флага включёнными.
+`visits_total`. Gate требует оба флага включёнными. Visit counter
+(`EASYWEEK_VISIT_COUNTER_ENABLED=true`) можно оставить: он ничего не отправляет.
 
-Visit counter (`EASYWEEK_VISIT_COUNTER_ENABLED=true`) можно оставить: он ничего
-не отправляет, а лишь фиксирует уже подтверждённый EasyWeek факт.
+## 10. Пересоздать контейнеры и проверить effective settings
 
-## 9. Пересоздать воркер и проверить effective settings
-
-**Что делает:** пересоздаёт контейнер, чтобы он перечитал `env_file`. Обычный
-`restart` этого не делает — env_file читается только при создании контейнера.
+**Что делает:** пересоздаёт контейнеры, чтобы они перечитали `env_file`.
+`restart` этого не делает — `env_file` читается только при создании контейнера.
 
 ```bash
-docker compose up -d --force-recreate altegio-easyweek-inbox-worker
+docker compose up -d --force-recreate altegio-easyweek-inbox-worker altegio-outbox-worker
 ```
 
 **Что делает:** печатает флаги, с которыми процесс реально работает.
-**Зачем:** «я поправил .env» и «воркер работает с новыми значениями» — разные
-утверждения, и между ними стоит именно `--force-recreate`.
 
 ```bash
-docker compose exec altegio-easyweek-inbox-worker python -c "from altegio_bot.easyweek_migration.gates import read_effective_settings; import json; print(json.dumps(read_effective_settings().as_safe_dict(), indent=2))"
+docker compose --profile ops run --rm --build easyweek-booking-migration inventory --manifest /migration/input/manifest.json --cutover-at 2026-09-01T00:00:00+02:00
 ```
 
-Ожидается: `EASYWEEK_ENABLED=true`, `EASYWEEK_PROCESSING_ENABLED=true`,
-`EASYWEEK_NOTIFICATIONS_ENABLED=false`, `EASYWEEK_REVIEWS_ENABLED=false`.
+В отчёте раздел `gate.effective_settings` появляется при записи; для проверки
+сейчас достаточно, что команда не отказала. Ожидается: `EASYWEEK_ENABLED=true`,
+`EASYWEEK_PROCESSING_ENABLED=true`, `EASYWEEK_NOTIFICATIONS_ENABLED=false`,
+`EASYWEEK_REVIEWS_ENABLED=false`.
 
-## 10. Inventory
+**Опция: остановка общего outbox worker.** Если нужна максимальная гарантия, что
+за время окна не уйдёт ни одного клиентского сообщения, общий outbox worker
+можно остановить: `docker compose stop altegio-outbox-worker`. Последствия —
+на время окна замирает **вся** исходящая очередь, включая Altegio-филиалы;
+job'ы не теряются, они остаются `queued` и разбираются после `start`. Это
+операторский компромисс, а не требование: архитектура общего Altegio outbox
+ради миграции не меняется.
 
-**Что делает:** читает Altegio API по обоим филиалам и печатает, что там есть и
-что покрыто manifest'ом. Не пишет ничего и не требует экспорта клиентов.
-**Зачем:** последняя проверка mapping'а до того, как в игру вступает PII-файл.
+## 11. Read-only preflight по клиентским job
+
+**Что делает:** показывает, есть ли в очереди EasyWeek клиентские job, которые
+могли бы уйти во время окна.
+**Зачем:** флаги закрывают будущее; эта проверка смотрит на настоящее.
 
 ```bash
-docker compose exec altegio-easyweek-inbox-worker python -m altegio_bot.scripts.easyweek_migration inventory --manifest /opt/altegio_bot/outputs/migration_manifest.json --cutover-at 2026-09-01T00:00:00+02:00
+docker compose exec postgres psql -U "${POSTGRES_USER:-altegio}" -d "${POSTGRES_DB:-altegio_bot}" -c "select job_type, status, count(*) from message_jobs where provider = 'easyweek' and status in ('queued','processing') group by job_type, status order by job_type"
 ```
 
-## 11. Dry-run
+Ожидается пусто. Ненулевые строки разбираются до canary.
+
+## 12. Dry-run
 
 **Что делает:** строит полный план — ready / already_migrated / blocked /
 skipped — и печатает `plan_digest`. Ни одного EasyWeek-запроса, ни одной строки
 в ledger.
-**Зачем:** это артефакт, который проверяет человек, и его `plan_digest` —
-единственный ключ, открывающий apply.
+**Зачем:** артефакт, который проверяет человек, и его `plan_digest` —
+единственный ключ, открывающий запись.
 
 ```bash
-docker compose exec altegio-easyweek-inbox-worker python -m altegio_bot.scripts.easyweek_migration dry-run --manifest /opt/altegio_bot/outputs/migration_manifest.json --customer-directory /opt/altegio_bot/outputs/easyweek-customers-after-import.csv --cutover-at 2026-09-01T00:00:00+02:00
+docker compose --profile ops run --rm --build easyweek-booking-migration dry-run --manifest /migration/input/manifest.json --customer-directory /migration/input/easyweek-customers-after-import.csv --cutover-at 2026-09-01T00:00:00+02:00
 ```
 
 Разобрать **каждую** строку `blocked_rows` вручную. Типовые причины:
 `staff_mapping_missing`, `service_mapping_missing`, `customer_not_found`,
 `customer_ambiguous`, `multi_service_unsupported`, `custom_price_unsupported`,
-`custom_duration_unsupported`, `start_time_ambiguous_dst`. Ни одна из них не
-чинится инструментом — либо правится manifest/экспорт, либо запись переносится
-руками.
+`custom_duration_unsupported`, `price_baseline_missing`,
+`start_time_ambiguous_dst`. Ни одна не чинится инструментом — правится manifest
+или экспорт, либо запись переносится руками.
 
 Записать `plan_digest` из отчёта.
 
-## 12. Canary — ровно одна запись
+## 13. Canary — одна **названная** запись
 
-**Что делает:** создаёт **одно** бронирование в EasyWeek.
+**Что делает:** создаёт одно бронирование, выбранное по точной source identity,
+перечитывает его через GET и строго сверяет booking UUID, marker, location,
+staff, service, customer, время начала, длительность и активный статус. Результат
+сохраняется durable proof'ом.
 **Зачем:** тело `POST /bookings` подтверждено планом как эндпоинт, но не как
-схема. Canary — то, что доказывает форму запроса на одной живой записи прежде,
-чем ей подвергнутся сотни. Он же проверяет, что нативные уведомления действительно
-молчат.
+схема. Canary доказывает форму запроса на одной живой записи прежде, чем ей
+подвергнутся сотни. `--limit` больше не существует: он брал первую попавшуюся
+строку ответа Altegio API — на каждом прогоне другого живого клиента.
+
+Выбрать конкретную запись из `dry-run` (её `source_company_id` и
+`source_record_id`) и подставить ниже.
 
 ```bash
-docker compose exec altegio-easyweek-inbox-worker python -m altegio_bot.scripts.easyweek_migration apply --manifest /opt/altegio_bot/outputs/migration_manifest.json --customer-directory /opt/altegio_bot/outputs/easyweek-customers-after-import.csv --cutover-at 2026-09-01T00:00:00+02:00 --verified-dry-run-id <plan_digest из шага 11> --confirm-easyweek-native-notifications-disabled --apply --limit 1
+docker compose --profile ops run --rm --build easyweek-booking-migration canary --manifest /migration/input/manifest.json --customer-directory /migration/input/easyweek-customers-after-import.csv --cutover-at 2026-09-01T00:00:00+02:00 --verified-dry-run-id ПЛАН_DIGEST_ИЗ_ШАГА_12 --canary-company-id 758285 --canary-record-id ID_ЗАПИСИ --confirm-easyweek-native-notifications-disabled --apply
 ```
 
-## 13. Проверить, что клиент ничего не получил
+Green — когда `errors` пуст и `totals.created = 1`. Любое несовпадение поля
+означает, что canary не доказан, и bulk запрещён.
+
+## 14. Проверить, что клиент ничего не получил
 
 **Что делает:** оператор проверяет почту/SMS/WhatsApp/push тестового клиента и
 Chatwoot.
@@ -226,126 +293,141 @@ Chatwoot.
 Вернуться к шагу 6, а последующие запуски помечать
 `--canary-notification-observed`, что gate трактует как безусловный отказ.
 
-**Что делает:** подтверждает, что миграция не создала ни одной клиентской
-задачи на отправку.
+**Что делает:** подтверждает, что миграция не создала клиентских задач.
 
 ```bash
 docker compose exec postgres psql -U "${POSTGRES_USER:-altegio}" -d "${POSTGRES_DB:-altegio_bot}" -c "select count(*) as easyweek_jobs_last_hour from message_jobs where provider = 'easyweek' and created_at > now() - interval '1 hour'"
 ```
 
+Ожидается `0`.
+
+## 15. Reconciliation canary
+
+**Что делает:** печатает состояние ledger и разрешает то, что можно разрешить.
+**Зачем:** перед bulk не должно оставаться ни одной записи с неизвестным исходом.
+
 ```bash
-docker compose exec postgres psql -U "${POSTGRES_USER:-altegio}" -d "${POSTGRES_DB:-altegio_bot}" -c "select status, count(*) from easyweek_migration_ledger group by status order by status"
+docker compose --profile ops run --rm --build easyweek-booking-migration reconcile --manifest /migration/input/manifest.json --cutover-at 2026-09-01T00:00:00+02:00
 ```
 
-Ожидается `easyweek_jobs_last_hour = 0`. Любое ненулевое значение означает, что
-флаг уведомлений остался включённым — вернуться к шагам 7 и 9.
+Требуется `uncertain = 0` и `pending = 0`.
 
-## 14. Reconciliation canary
+## 16. Bulk apply
 
-**Что делает:** печатает состояние ledger и разрешает `uncertain` строки чтением
-EasyWeek.
-**Зачем:** перед bulk не должно оставаться ни одной записи, про которую неизвестно,
-создалась она или нет.
+**Что делает:** создаёт все оставшиеся `ready` бронирования, с паузами под лимит
+EasyWeek 60 запросов/мин. Перед каждым POST выполняется последний read-only
+re-proof исходной записи.
+**Зачем:** основная работа. Уже созданное повторно не создаётся, а запись,
+отменённая или перенесённая во время прогона, не создаётся вовсе.
 
-```bash
-docker compose exec altegio-easyweek-inbox-worker python -m altegio_bot.scripts.easyweek_migration reconcile --manifest /opt/altegio_bot/outputs/migration_manifest.json --cutover-at 2026-09-01T00:00:00+02:00
-```
-
-Требуется `uncertain = 0`.
-
-## 15. Bulk apply
-
-**Что делает:** создаёт все оставшиеся `ready` бронирования, с паузами под
-лимит EasyWeek 60 запросов/мин.
-**Зачем:** основная работа миграции. Уже созданное повторно не создаётся —
-ledger не даёт claim'ить строку со статусом `created`.
-
-Digest после canary изменился, поэтому dry-run повторяется, и его новый
-`plan_digest` подставляется в команду.
+Digest после canary изменился, поэтому dry-run повторяется.
 
 ```bash
-docker compose exec altegio-easyweek-inbox-worker python -m altegio_bot.scripts.easyweek_migration dry-run --manifest /opt/altegio_bot/outputs/migration_manifest.json --customer-directory /opt/altegio_bot/outputs/easyweek-customers-after-import.csv --cutover-at 2026-09-01T00:00:00+02:00
+docker compose --profile ops run --rm --build easyweek-booking-migration dry-run --manifest /migration/input/manifest.json --customer-directory /migration/input/easyweek-customers-after-import.csv --cutover-at 2026-09-01T00:00:00+02:00
 ```
 
 ```bash
-docker compose exec altegio-easyweek-inbox-worker python -m altegio_bot.scripts.easyweek_migration apply --manifest /opt/altegio_bot/outputs/migration_manifest.json --customer-directory /opt/altegio_bot/outputs/easyweek-customers-after-import.csv --cutover-at 2026-09-01T00:00:00+02:00 --verified-dry-run-id <новый plan_digest> --confirm-easyweek-native-notifications-disabled --apply
+docker compose --profile ops run --rm --build easyweek-booking-migration apply --manifest /migration/input/manifest.json --customer-directory /migration/input/easyweek-customers-after-import.csv --cutover-at 2026-09-01T00:00:00+02:00 --verified-dry-run-id НОВЫЙ_ПЛАН_DIGEST --confirm-easyweek-native-notifications-disabled --apply
 ```
 
-Если прогон остановился на `uncertain` — это штатное поведение, а не сбой.
-Выполнить шаг 14 и только потом повторить apply.
+Остановка на `uncertain` — штатное поведение, не сбой. Перейти к шагу 17.
 
-## 16. Повторный dry-run и delta apply
+## 17. Разрешение неизвестных исходов
 
-**Что делает:** ловит записи, созданные в Altegio уже после bulk, и переносит
-только их.
-**Зачем:** между dry-run и cutover клиенты продолжают записываться. Delta — это
-тот же цикл, а не особый режим; `cutover_at` остаётся прежним, иначе граница
-поедет.
+**Что делает:** timeout, обрыв и 5xx оставляют запись в `uncertain` **без**
+target UUID — перечитать нечего. Оператор находит бронирование в интерфейсе
+EasyWeek по marker'у `altegio-migration:<company_id>:<record_id>` и называет его.
+Инструмент не верит на слово: он делает GET и доказывает marker, филиал и
+критичные поля.
 
 ```bash
-docker compose exec altegio-easyweek-inbox-worker python -m altegio_bot.scripts.easyweek_migration dry-run --manifest /opt/altegio_bot/outputs/migration_manifest.json --customer-directory /opt/altegio_bot/outputs/easyweek-customers-after-import.csv --cutover-at 2026-09-01T00:00:00+02:00
+docker compose --profile ops run --rm --build easyweek-booking-migration resolve-created --manifest /migration/input/manifest.json --cutover-at 2026-09-01T00:00:00+02:00 --resolve-company-id 758285 --resolve-record-id ID_ЗАПИСИ --target-uuid UUID_НАЙДЕННОГО_БРОНИРОВАНИЯ
+```
+
+**Если бронирования в EasyWeek действительно нет.** Это опасное направление:
+после подтверждения следующий apply создаст запись, и ошибка оператора означает
+два бронирования у живого человека. Поэтому нужны два отдельных флага.
+
+```bash
+docker compose --profile ops run --rm --build easyweek-booking-migration resolve-absent --manifest /migration/input/manifest.json --cutover-at 2026-09-01T00:00:00+02:00 --resolve-company-id 758285 --resolve-record-id ID_ЗАПИСИ --i-verified-the-booking-does-not-exist-in-easyweek --i-understand-the-next-apply-will-create-it
+```
+
+После разрешения повторить шаг 16.
+
+## 18. Delta apply
+
+**Что делает:** переносит записи, созданные в Altegio уже после bulk.
+**Зачем:** между dry-run и cutover клиенты продолжают записываться. `cutover_at`
+остаётся прежним, иначе граница поедет.
+
+```bash
+docker compose --profile ops run --rm --build easyweek-booking-migration dry-run --manifest /migration/input/manifest.json --customer-directory /migration/input/easyweek-customers-after-import.csv --cutover-at 2026-09-01T00:00:00+02:00
 ```
 
 ```bash
-docker compose exec altegio-easyweek-inbox-worker python -m altegio_bot.scripts.easyweek_migration apply --manifest /opt/altegio_bot/outputs/migration_manifest.json --customer-directory /opt/altegio_bot/outputs/easyweek-customers-after-import.csv --cutover-at 2026-09-01T00:00:00+02:00 --verified-dry-run-id <plan_digest этого dry-run> --confirm-easyweek-native-notifications-disabled --apply
+docker compose --profile ops run --rm --build easyweek-booking-migration apply --manifest /migration/input/manifest.json --customer-directory /migration/input/easyweek-customers-after-import.csv --cutover-at 2026-09-01T00:00:00+02:00 --verified-dry-run-id PLAN_DIGEST_ЭТОГО_DRY_RUN --confirm-easyweek-native-notifications-disabled --apply
 ```
 
-## 17. Финальная reconciliation
+## 19. Финальная reconciliation
 
-**Что делает:** итоговый PII-free отчёт: source active bookings, created,
-already_migrated, blocked, uncertain, failed, разрез по филиалам и распределение
-reason codes.
-**Зачем:** это документ, по которому принимается решение «миграция закончена».
+**Что делает:** перечитывает **живой** Altegio и сверяет каждую активную запись
+с доказанным target. Печатает source active bookings, created, already_migrated,
+blocked, failed, uncertain, source_changed, разрез по филиалам и reason codes.
+**Зачем:** перечисление ledger доказывает только то, что мы и так знаем. Полноту
+cutover доказывает лишь сверка с источником.
 
 ```bash
-docker compose exec altegio-easyweek-inbox-worker python -m altegio_bot.scripts.easyweek_migration reconcile --manifest /opt/altegio_bot/outputs/migration_manifest.json --cutover-at 2026-09-01T00:00:00+02:00
+docker compose --profile ops run --rm --build easyweek-booking-migration reconcile --final --manifest /migration/input/manifest.json --customer-directory /migration/input/easyweek-customers-after-import.csv --cutover-at 2026-09-01T00:00:00+02:00
 ```
 
-Приёмка: `uncertain = 0`, `failed = 0`, каждая `blocked` строка либо перенесена
-руками, либо сознательно оставлена, `created + already_migrated` сходится с
-`source active bookings`.
+PASS только при `completeness.passed = true`: `uncertain = 0`, `pending = 0`,
+`failed = 0`, каждая активная запись источника имеет доказанный target либо
+принятый операторский blocked-исход. Иначе команда завершается ненулевым кодом.
 
-После этого удалить экспорт клиентов из `outputs/` — он больше не нужен.
+## 19a. Rollback — **внутри того же окна**
 
-## 18. Отдельное решение о включении уведомлений
+Универсального автоматического отката нет. Безопасный откат: остановить apply,
+сохранить ledger и отчёты, найти только записи конкретного run и не трогать
+изменённые вручную. Rollback выполняется **до** шага 20: отмена тоже порождает
+события EasyWeek, и с включёнными уведомлениями она сообщила бы об отмене
+каждому из мигрированных клиентов. Инструмент проверяет тот же notification
+gate и откажет, если уведомления вернули.
+
+**Что делает:** показывает, что откат отменил бы. Только GET.
+
+```bash
+docker compose --profile ops run --rm --build easyweek-booking-migration rollback-dry-run --manifest /migration/input/manifest.json --cutover-at 2026-09-01T00:00:00+02:00 --rollback-run-id RUN_ID_ИЗ_ОТЧЁТА_APPLY
+```
+
+Записи, у которых изменились время, мастер, услуга, клиент, филиал,
+длительность или marker, помечаются
+`rollback_target_modified_after_migration` и не отменяются.
+
+**Что делает:** реально отменяет отобранные записи. Требует двух явных флагов.
+
+```bash
+docker compose --profile ops run --rm --build easyweek-booking-migration rollback-dry-run --manifest /migration/input/manifest.json --cutover-at 2026-09-01T00:00:00+02:00 --rollback-run-id RUN_ID --confirm-easyweek-native-notifications-disabled --apply --confirm-rollback
+```
+
+---
+
+## 20. Отдельное решение о включении уведомлений
 
 **Что делает:** ничего автоматического. Обратное включение каналов — отдельное
-ручное решение владельца проекта **после** шага 17.
+ручное решение владельца проекта **после** PASS на шаге 19 и после того, как
+rollback (если он был нужен) выполнен.
 **Зачем:** миграция не знает, когда бизнес готов снова писать клиентам, а
 автоматическое включение сразу после массового создания записей — ровно тот
 случай, когда рассылка уходит по всей мигрированной базе.
 
 Порядок: сначала нативные каналы EasyWeek в UI, затем — при необходимости —
-`EASYWEEK_NOTIFICATIONS_ENABLED` / `EASYWEEK_REVIEWS_ENABLED` с
-`--force-recreate` воркера.
+`EASYWEEK_NOTIFICATIONS_ENABLED` / `EASYWEEK_REVIEWS_ENABLED` /
+`EASYWEEK_REVIEW_SEND_ENABLED` / `EASYWEEK_REMINDER_API_GUARD_ENABLED` с
+`--force-recreate` затронутых контейнеров. Если outbox worker останавливали —
+`docker compose start altegio-outbox-worker`.
 
-## 19. Rollback
-
-Универсального автоматического отката **нет**, и инструмент его не обещает.
-Безопасный откат: остановить apply, сохранить ledger и отчёты, найти только
-записи конкретного run и не трогать изменённые руками.
-
-**Что делает:** показывает, что откат отменил бы. Только GET, ничего не меняет.
-**Зачем:** режим по умолчанию. Записи, у которых пропал migration marker или
-которые уже отменены/завершены, помечаются
-`rollback_target_modified_after_migration` и не отменяются — кто-то работал с
-ними после миграции.
-
-```bash
-docker compose exec altegio-easyweek-inbox-worker python -m altegio_bot.scripts.easyweek_migration rollback-dry-run --manifest /opt/altegio_bot/outputs/migration_manifest.json --cutover-at 2026-09-01T00:00:00+02:00 --rollback-run-id <run_id из отчёта apply>
-```
-
-**Что делает:** реально отменяет отобранные записи. Требует **двух** явных
-флагов.
-**Зачем:** отмена бронирования — это потеря записи у живого клиента, поэтому
-одного «пишущего» флага недостаточно.
-
-```bash
-docker compose exec altegio-easyweek-inbox-worker python -m altegio_bot.scripts.easyweek_migration rollback-dry-run --manifest /opt/altegio_bot/outputs/migration_manifest.json --cutover-at 2026-09-01T00:00:00+02:00 --rollback-run-id <run_id> --apply --confirm-rollback
-```
-
-Ledger при откате сохраняет `target_booking_uuid`: через полгода вопрос «что
-именно отменил откат» должен иметь ответ.
+После этого удалить экспорт клиентов из `$EASYWEEK_MIGRATION_INPUT_DIR` — он
+больше не нужен.
 
 ---
 
@@ -353,6 +435,5 @@ Ledger при откате сохраняет `target_booking_uuid`: через 
 
 Токены и API-ключи; клиентские XLS/XLSX/CSV; телефоны и имена; сырые
 webhook/API payload'ы; manifest'ы и отчёты с PII; экспорты EasyWeek; содержимое
-`outputs/`. Соответствующие правила добавлены в `.gitignore`. В репозитории
-живёт только `docs/easyweek/migration_manifest.example.json` — шаблон с
-placeholder-значениями.
+`outputs/`. Правила — в `.gitignore`. В репозитории живёт только
+`docs/easyweek/migration_manifest.example.json` — шаблон с placeholder-значениями.

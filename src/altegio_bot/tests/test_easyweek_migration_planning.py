@@ -80,14 +80,26 @@ def manifest_text(**overrides) -> str:
                 "easyweek_location_id": 308697,
                 "easyweek_location_uuid": KA_LOCATION_UUID,
                 "staff": {str(KA_STAFF_ID): KA_STAFF_UUID},
-                "services": {str(KA_SERVICE_ID): KA_SERVICE_UUID},
+                "services": {
+                    str(KA_SERVICE_ID): {
+                        "easyweek_service_uuid": KA_SERVICE_UUID,
+                        "catalog_duration_minutes": 60,
+                        "catalog_price": "90.00",
+                    }
+                },
             },
             str(RASTATT_COMPANY_ID): {
                 "altegio_company_id": RASTATT_COMPANY_ID,
                 "easyweek_location_id": 315607,
                 "easyweek_location_uuid": RA_LOCATION_UUID,
                 "staff": {str(RA_STAFF_ID): RA_STAFF_UUID},
-                "services": {str(RA_SERVICE_ID): RA_SERVICE_UUID},
+                "services": {
+                    str(RA_SERVICE_ID): {
+                        "easyweek_service_uuid": RA_SERVICE_UUID,
+                        "catalog_duration_minutes": 60,
+                        "catalog_price": "90.00",
+                    }
+                },
             },
         },
     }
@@ -159,7 +171,13 @@ def test_durlach_cannot_be_written_into_the_manifest():
                     "easyweek_location_id": 308697,
                     "easyweek_location_uuid": KA_LOCATION_UUID,
                     "staff": {"1": KA_STAFF_UUID},
-                    "services": {"2": KA_SERVICE_UUID},
+                    "services": {
+                        "2": {
+                            "easyweek_service_uuid": KA_SERVICE_UUID,
+                            "catalog_duration_minutes": 60,
+                            "catalog_price": "90.00",
+                        }
+                    },
                 }
             },
         }

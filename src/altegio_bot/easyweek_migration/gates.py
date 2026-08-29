@@ -37,6 +37,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Final
 
+from altegio_bot.easyweek_migration.branch_identity import BranchIdentityResult
+from altegio_bot.easyweek_migration.canary import CanaryVerdict
 from altegio_bot.easyweek_migration.customers import CustomerDirectory
 from altegio_bot.easyweek_migration.manifest import MigrationManifest
 from altegio_bot.settings import settings
@@ -56,6 +58,10 @@ GATE_DRY_RUN_ID_MISMATCH: Final = "verified_dry_run_id_mismatch"
 GATE_MANIFEST_INVALID: Final = "manifest_invalid"
 GATE_CUSTOMER_DIRECTORY_INVALID: Final = "customer_directory_invalid"
 GATE_CANARY_NOTIFICATION_OBSERVED: Final = "canary_notification_observed"
+# Independent proof that each manifest target really is the branch it claims.
+GATE_BRANCH_IDENTITY_UNPROVEN: Final = "target_branch_identity_unproven"
+# A bulk apply needs a machine-checked canary, not an operator's recollection.
+GATE_CANARY_PROOF_MISSING: Final = "canary_proof_missing_or_stale"
 
 
 class ApplyGateError(RuntimeError):
@@ -117,12 +123,16 @@ class ApplyGateResult:
     passed: bool
     failures: list[str] = field(default_factory=list)
     effective_settings: dict[str, Any] = field(default_factory=dict)
+    branch_identity: dict[str, Any] | None = None
+    canary: dict[str, Any] | None = None
 
     def as_safe_dict(self) -> dict[str, Any]:
         return {
             "passed": self.passed,
             "failures": list(self.failures),
             "effective_settings": dict(self.effective_settings),
+            "branch_identity": self.branch_identity,
+            "canary": self.canary,
         }
 
 
@@ -137,6 +147,9 @@ def evaluate_apply_gate(
     directory: CustomerDirectory,
     canary_notification_observed: bool = False,
     effective: EffectiveBotSettings | None = None,
+    branch_identity: BranchIdentityResult | None = None,
+    canary_verdict: CanaryVerdict | None = None,
+    require_canary_proof: bool = True,
 ) -> ApplyGateResult:
     """Collect EVERY reason the apply may not proceed, then decide.
 
@@ -187,10 +200,25 @@ def evaluate_apply_gate(
     if canary_notification_observed:
         failures.append(GATE_CANARY_NOTIFICATION_OBSERVED)
 
+    # Every manifest target must be provably the branch it claims to be, checked
+    # against the runtime registry rather than against the manifest's own word.
+    # `None` means the caller did not run the check at all, which is treated as
+    # "not proven" — a check that can be skipped is not a check.
+    if branch_identity is None or not branch_identity.proven:
+        failures.append(GATE_BRANCH_IDENTITY_UNPROVEN)
+
+    # A bulk apply needs a verified canary that still applies to this manifest,
+    # request schema, cutover and branch mapping. The canary run itself is the
+    # one apply that legitimately has no proof yet.
+    if require_canary_proof and (canary_verdict is None or not canary_verdict.licensed):
+        failures.append(GATE_CANARY_PROOF_MISSING)
+
     return ApplyGateResult(
         passed=not failures,
         failures=failures,
         effective_settings=settings_snapshot.as_safe_dict(),
+        branch_identity=branch_identity.as_safe_dict() if branch_identity is not None else None,
+        canary=canary_verdict.as_safe_dict() if canary_verdict is not None else None,
     )
 
 

@@ -193,6 +193,7 @@ async def _finalize(
     target_booking_uuid: str | None,
     reason_code: str | None,
     count_attempt: bool,
+    target_snapshot_fingerprint: str | None = None,
 ) -> None:
     row = (
         await session.execute(
@@ -205,10 +206,17 @@ async def _finalize(
     ).scalar_one_or_none()
     if row is None:
         raise RuntimeError(f"migration ledger row vanished company_id={source_company_id} record_id={source_record_id}")
-    row.run_id = run_id
+    # `run_id` is the ORIGIN run and is never rewritten here. A reconciliation or
+    # a resolution that stamped its own id over it would remove the booking from
+    # the rollback set of the apply that actually created it — the one run an
+    # operator would reach for. Bookkeeping about a row must not rewrite the
+    # row's origin.
+    row.last_resolution_run_id = run_id
     row.status = status
     if target_booking_uuid is not None:
         row.target_booking_uuid = target_booking_uuid
+    if target_snapshot_fingerprint is not None:
+        row.target_snapshot_fingerprint = target_snapshot_fingerprint
     row.reason_code = reason_code
     if count_attempt:
         row.attempts = (row.attempts or 0) + 1
@@ -223,8 +231,14 @@ async def record_created(
     source_company_id: int,
     source_record_id: int,
     target_booking_uuid: str,
+    target_snapshot_fingerprint: str | None = None,
 ) -> None:
-    """A proven creation. This is the only place a target UUID is ever stored."""
+    """A proven creation. This is the only place a target UUID is ever stored.
+
+    ``target_snapshot_fingerprint`` is the digest of the booking as written. It is
+    what rollback later compares a live GET against, so a booking somebody moved
+    or reassigned by hand is refused instead of cancelled.
+    """
     await _finalize(
         session,
         run_id=run_id,
@@ -234,6 +248,7 @@ async def record_created(
         target_booking_uuid=target_booking_uuid,
         reason_code=None,
         count_attempt=True,
+        target_snapshot_fingerprint=target_snapshot_fingerprint,
     )
 
 
@@ -310,7 +325,12 @@ async def rows_for_run(
     run_id: str,
     statuses: tuple[str, ...] | None = None,
 ) -> list[EasyWeekMigrationLedger]:
-    """Every ledger row a given run last touched, optionally filtered by status."""
+    """Every ledger row a given run ORIGINATED, optionally filtered by status.
+
+    Matches on ``run_id``, the origin, not on the last run to touch the row. That
+    is what makes a rollback of one apply still find a booking whose uncertain
+    outcome a later reconciliation resolved.
+    """
     stmt = select(EasyWeekMigrationLedger).where(EasyWeekMigrationLedger.run_id == run_id)
     if statuses:
         stmt = stmt.where(EasyWeekMigrationLedger.status.in_(statuses))
@@ -349,9 +369,116 @@ def row_as_safe_dict(row: EasyWeekMigrationLedger) -> dict[str, Any]:
         "target_provider": row.target_provider,
         "target_booking_uuid": row.target_booking_uuid,
         "run_id": row.run_id,
+        "last_resolution_run_id": row.last_resolution_run_id,
+        "target_snapshot_fingerprint": row.target_snapshot_fingerprint,
         "status": row.status,
         "attempts": row.attempts,
         "reason_code": row.reason_code,
         "created_at": row.created_at.isoformat() if row.created_at else None,
         "updated_at": row.updated_at.isoformat() if row.updated_at else None,
     }
+
+
+# ---------------------------------------------------------------------------
+# Operator resolution of an unknown outcome
+# ---------------------------------------------------------------------------
+# A timeout leaves `uncertain` with NO target uuid — the POST never returned one.
+# Reconciliation cannot fetch a booking it cannot name, so without an operator
+# path those rows stay unresolved forever, and every later apply refuses them.
+#
+# Both paths below are deliberately narrow, and neither ever issues a POST.
+
+
+async def resolve_uncertain_as_created(
+    session: AsyncSession,
+    *,
+    run_id: str,
+    source_company_id: int,
+    source_record_id: int,
+    target_booking_uuid: str,
+    target_snapshot_fingerprint: str,
+) -> None:
+    """Record an operator-supplied target that the tool has already PROVEN.
+
+    The caller must have fetched the booking and matched its marker, branch and
+    write-critical fields first; this function only writes the verdict down. The
+    origin ``run_id`` is preserved, so the booking stays inside the rollback set
+    of the apply that created it.
+    """
+    await _finalize(
+        session,
+        run_id=run_id,
+        source_company_id=source_company_id,
+        source_record_id=source_record_id,
+        status=STATUS_CREATED,
+        target_booking_uuid=target_booking_uuid,
+        reason_code=None,
+        count_attempt=False,
+        target_snapshot_fingerprint=target_snapshot_fingerprint,
+    )
+
+
+async def resolve_uncertain_as_absent(
+    session: AsyncSession,
+    *,
+    run_id: str,
+    source_company_id: int,
+    source_record_id: int,
+    reason_code: str,
+) -> None:
+    """Record that an operator checked EasyWeek and the booking is NOT there.
+
+    This is the dangerous direction, and the danger is worth naming: it makes the
+    row re-claimable, so the next apply will POST again. If the operator was
+    wrong, the customer gets two appointments.
+
+    Nothing here decides that on its own — the CLI requires a separate, explicit
+    multi-step confirmation, and no automatic path ever reaches this function.
+    """
+    await _finalize(
+        session,
+        run_id=run_id,
+        source_company_id=source_company_id,
+        source_record_id=source_record_id,
+        status=STATUS_FAILED,
+        target_booking_uuid=None,
+        reason_code=reason_code,
+        count_attempt=False,
+    )
+
+
+async def get_row(
+    session: AsyncSession,
+    *,
+    source_company_id: int,
+    source_record_id: int,
+) -> EasyWeekMigrationLedger | None:
+    """One ledger row by its source identity, or ``None``."""
+    return (
+        await session.execute(
+            select(EasyWeekMigrationLedger).where(
+                EasyWeekMigrationLedger.source_provider == PROVIDER_ALTEGIO,
+                EasyWeekMigrationLedger.source_company_id == source_company_id,
+                EasyWeekMigrationLedger.source_record_id == source_record_id,
+            )
+        )
+    ).scalar_one_or_none()
+
+
+async def all_rows(
+    session: AsyncSession,
+    *,
+    company_ids: tuple[int, ...],
+) -> list[EasyWeekMigrationLedger]:
+    """Every ledger row for the given source companies, ordered by identity."""
+    if not company_ids:
+        return []
+    stmt = (
+        select(EasyWeekMigrationLedger)
+        .where(
+            EasyWeekMigrationLedger.source_provider == PROVIDER_ALTEGIO,
+            EasyWeekMigrationLedger.source_company_id.in_(company_ids),
+        )
+        .order_by(EasyWeekMigrationLedger.source_company_id, EasyWeekMigrationLedger.source_record_id)
+    )
+    return list((await session.execute(stmt)).scalars().all())

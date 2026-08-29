@@ -25,10 +25,16 @@ So this client separates three outcomes, and the caller must too:
 ``EasyWeekError``       a definite failure — the request provably did not create
                         anything (a 4xx the server rejected before acting).
 
-Retries exist only where they are provably safe: a 429 or a 5xx *received as a
-complete HTTP response* means the server answered, and answering "too many
-requests" is not creating a booking. A timeout is not an answer, so it is never
-retried.
+Retries exist only where they are provably safe, and that is **429 alone**: a
+rate limiter refuses a request before the handler runs, so nothing was created.
+Everything else — a timeout, a transport disconnect, any 5xx, a 2xx we cannot
+read a UUID out of — leaves the outcome unknown and gets exactly one POST.
+
+A 5xx is deliberately NOT retried. "The server answered, so it declined to act"
+sounds right and is false: gateways, proxies and application handlers all return
+5xx after a write has already landed, and EasyWeek publishes no idempotency key
+for ``POST /bookings``. Without documented idempotency, a second POST is a coin
+flip on whether a real customer gets two appointments.
 """
 
 from __future__ import annotations
@@ -236,8 +242,27 @@ class EasyWeekMigrationWriteClient:
     async def create_booking(self, body: dict[str, Any]) -> BookingCreated:
         """``POST /bookings``. Returns only on a PROVEN creation.
 
-        Raises :class:`EasyWeekUncertainMutation` when the outcome is unknown,
-        and the caller must record that rather than trying again.
+        Exactly one outcome per call, and only ONE of them permits another POST:
+
+        =========================  ===========================================
+        429                        bounded retry — the server explicitly
+                                   declined to process the request
+        5xx                        **uncertain**, one POST only
+        timeout                    **uncertain**, one POST only
+        transport disconnect       **uncertain**, one POST only
+        2xx without usable uuid    **uncertain**
+        permanent 4xx              definite failure, no retry
+        =========================  ===========================================
+
+        The 5xx row is a correction. An earlier version retried 5xx on the
+        reasoning that "the server answered, so it declined to act". That
+        reasoning is wrong: a 500 from a gateway, a proxy or an application
+        handler is routinely returned *after* the write has landed, and EasyWeek
+        publishes no idempotency key for ``POST /bookings``. Retrying it is a
+        coin flip on whether a real customer gets two appointments.
+
+        Only 429 keeps its retry, because "too many requests" is a refusal to
+        process, stated by the rate limiter before the handler runs.
         """
         url = "/".join([self._base_url, _PATH_BOOKINGS])
         last_retryable: EasyWeekError | None = None
@@ -272,11 +297,28 @@ class EasyWeekMigrationWriteClient:
             if 200 <= status < 300:
                 return BookingCreated(booking_uuid=self._booking_uuid_from(response), attempts=attempt)
 
-            if status == 429 or 500 <= status < 600:
-                # A complete HTTP response. The server declined to act, so
-                # another attempt cannot duplicate anything.
+            if 500 <= status < 600:
+                # NOT retried. A 5xx does not prove the booking was not created:
+                # gateways, proxies and application handlers all return one after
+                # a write has already landed, and EasyWeek offers no idempotency
+                # key that would make a second POST safe.
+                logger.error(
+                    "easyweek_migration: create_booking server error status=%s attempt=%s — outcome UNKNOWN",
+                    status,
+                    attempt,
+                )
+                raise EasyWeekUncertainMutation(
+                    "server error; outcome unknown",
+                    operation="create_booking",
+                    status_code=status,
+                    attempts=attempt,
+                )
+
+            if status == 429:
+                # The only safe retry. A rate limiter refuses the request before
+                # the handler runs, so nothing was created.
                 last_retryable = EasyWeekRetryableError(
-                    "retryable mutation status",
+                    "rate limited",
                     operation="create_booking",
                     status_code=status,
                     attempts=attempt,

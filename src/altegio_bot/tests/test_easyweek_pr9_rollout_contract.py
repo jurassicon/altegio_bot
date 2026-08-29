@@ -224,6 +224,16 @@ def test_both_workers_still_read_easyweek_env_and_nothing_new_was_added() -> Non
         INBOX_SERVICE,
         OUTBOX_SERVICE,
         "easyweek-legacy-retire",
+        # PR-11.1 (plan §7, revision 16). `easyweek.env` holds the EasyWeek API
+        # key, so this set is a secret-distribution allowlist and every addition
+        # is a deliberate decision, not a formality.
+        #
+        # The cutover runner is admitted because it calls the EasyWeek API by
+        # definition — it is the tool that creates the migrated bookings — and it
+        # is the narrowest possible carrier: an `ops`-profile, `restart: "no"`,
+        # one-off container that exists only for the length of one command and is
+        # never started by `docker compose up -d`.
+        "easyweek-booking-migration",
     }, f"easyweek.env reached an unexpected service: {with_easyweek_env}"
 
 

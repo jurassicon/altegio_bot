@@ -17,12 +17,15 @@ import pytest
 from altegio_bot.easyweek_client import (
     EasyWeekAuthError,
     EasyWeekPermanentError,
-    EasyWeekRetryableError,
 )
+from altegio_bot.easyweek_migration.branch_identity import BranchIdentityResult
+from altegio_bot.easyweek_migration.canary import CanaryVerdict
 from altegio_bot.easyweek_migration.customers import CustomerDirectory
 from altegio_bot.easyweek_migration.gates import (
     GATE_APPLY_FLAG_MISSING,
+    GATE_BRANCH_IDENTITY_UNPROVEN,
     GATE_CANARY_NOTIFICATION_OBSERVED,
+    GATE_CANARY_PROOF_MISSING,
     GATE_CAPTURE_DISABLED,
     GATE_CUSTOMER_DIRECTORY_INVALID,
     GATE_CUTOVER_MISSING,
@@ -39,7 +42,11 @@ from altegio_bot.easyweek_migration.gates import (
     read_effective_settings,
     require_apply_gate,
 )
-from altegio_bot.easyweek_migration.manifest import parse_manifest
+from altegio_bot.easyweek_migration.manifest import (
+    KARLSRUHE_COMPANY_ID,
+    RASTATT_COMPANY_ID,
+    parse_manifest,
+)
 from altegio_bot.easyweek_migration.write_client import (
     DEFAULT_REQUESTS_PER_MINUTE,
     EasyWeekMigrationWriteClient,
@@ -79,6 +86,23 @@ def directory():
     return CustomerDirectory(valid=True, by_phone={"+4915112345678": [BOOKING_UUID]})
 
 
+def proven_branches(manifest) -> BranchIdentityResult:
+    """A branch-identity result standing in for a verified runtime registry."""
+    return BranchIdentityResult(
+        proven=True,
+        proven_branches={KARLSRUHE_COMPANY_ID: "karlsruhe", RASTATT_COMPANY_ID: "rastatt"},
+    )
+
+
+def licensing_canary() -> CanaryVerdict:
+    return CanaryVerdict(
+        licensed=True,
+        source_company_id=KARLSRUHE_COMPANY_ID,
+        source_record_id=900001,
+        target_booking_uuid=BOOKING_UUID,
+    )
+
+
 def gate(*, manifest, directory, effective=None, **overrides):
     kwargs = {
         "apply_requested": True,
@@ -90,6 +114,8 @@ def gate(*, manifest, directory, effective=None, **overrides):
         "directory": directory,
         "canary_notification_observed": False,
         "effective": effective or production_settings(),
+        "branch_identity": proven_branches(manifest),
+        "canary_verdict": licensing_canary(),
     }
     kwargs.update(overrides)
     return evaluate_apply_gate(**kwargs)
@@ -313,7 +339,14 @@ async def test_429_is_retried_with_bounded_backoff():
     assert any(delay > 0 for delay in sleeps)
 
 
-async def test_a_transient_5xx_is_retried_then_gives_up_as_retryable():
+async def test_a_5xx_is_uncertain_and_the_post_is_never_repeated():
+    """A 5xx does not prove the booking was not created.
+
+    Gateways, proxies and application handlers all return one *after* a write has
+    landed, and EasyWeek publishes no idempotency key for POST /bookings. The
+    earlier version retried on the reasoning that "the server answered, so it
+    declined to act" — which is how a real customer gets two appointments.
+    """
     calls: list[int] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -321,9 +354,38 @@ async def test_a_transient_5xx_is_retried_then_gives_up_as_retryable():
         return httpx.Response(503)
 
     async with make_client(handler) as client:
-        with pytest.raises(EasyWeekRetryableError):
+        with pytest.raises(EasyWeekUncertainMutation):
             await client.create_booking(booking_body())
-    assert len(calls) == 2  # bounded, not unbounded
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("status", [500, 502, 503, 504, 599])
+async def test_every_5xx_is_uncertain_never_retryable(status):
+    calls: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        return httpx.Response(status)
+
+    async with make_client(handler) as client:
+        with pytest.raises(EasyWeekUncertainMutation):
+            await client.create_booking(booking_body())
+    assert len(calls) == 1
+
+
+async def test_a_5xx_that_already_created_the_booking_is_not_duplicated():
+    """The exact failure the retry caused: a side effect behind an error status."""
+    created: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        # The fake provider creates the booking and THEN fails to say so.
+        created.append({"booking": len(created) + 1})
+        return httpx.Response(503)
+
+    async with make_client(handler) as client:
+        with pytest.raises(EasyWeekUncertainMutation):
+            await client.create_booking(booking_body())
+    assert len(created) == 1  # one side effect, not two
 
 
 async def test_a_permanent_4xx_is_never_retried():
@@ -392,3 +454,47 @@ def test_the_client_repr_never_carries_the_api_key():
     )
     assert "super-secret-key" not in repr(client)
     assert "super-secret-key" not in str(client)
+
+
+# ---------------------------------------------------------------------------
+# Branch identity and canary proof (revision 16 blockers 3 and 4)
+# ---------------------------------------------------------------------------
+
+
+def test_apply_is_blocked_when_branch_identity_was_not_proven(manifest, directory):
+    """A check that can be skipped is not a check: `None` means unproven."""
+    result = gate(manifest=manifest, directory=directory, branch_identity=None)
+    assert not result.passed
+    assert GATE_BRANCH_IDENTITY_UNPROVEN in result.failures
+
+
+def test_apply_is_blocked_when_branch_identity_failed(manifest, directory):
+    unproven = BranchIdentityResult(proven=False, failures=["target_branch_slug_mismatch"])
+    result = gate(manifest=manifest, directory=directory, branch_identity=unproven)
+    assert not result.passed
+    assert GATE_BRANCH_IDENTITY_UNPROVEN in result.failures
+
+
+def test_bulk_apply_is_blocked_without_a_canary_proof(manifest, directory):
+    result = gate(manifest=manifest, directory=directory, canary_verdict=None)
+    assert not result.passed
+    assert GATE_CANARY_PROOF_MISSING in result.failures
+
+
+def test_bulk_apply_is_blocked_by_an_unlicensed_canary_proof(manifest, directory):
+    stale = CanaryVerdict(licensed=False, reason="canary_proof_manifest_changed")
+    result = gate(manifest=manifest, directory=directory, canary_verdict=stale)
+    assert not result.passed
+    assert GATE_CANARY_PROOF_MISSING in result.failures
+
+
+def test_the_canary_run_itself_needs_no_prior_proof(manifest, directory):
+    """The one apply that legitimately has none — it is the run that earns it."""
+    result = gate(manifest=manifest, directory=directory, canary_verdict=None, require_canary_proof=False)
+    assert result.passed
+
+
+def test_the_gate_records_what_it_proved(manifest, directory):
+    result = gate(manifest=manifest, directory=directory)
+    assert result.as_safe_dict()["branch_identity"]["proven"] is True
+    assert result.as_safe_dict()["canary"]["licensed"] is True

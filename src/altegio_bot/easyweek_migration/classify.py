@@ -33,6 +33,13 @@ from altegio_bot.easyweek_migration.altegio_source import ACTIVE_ATTENDANCE
 from altegio_bot.easyweek_migration.customers import CustomerDirectory
 from altegio_bot.easyweek_migration.cutover import Cutover, LocalTimeError, parse_altegio_local_to_utc
 from altegio_bot.easyweek_migration.manifest import BranchMapping, MigrationManifest
+from altegio_bot.easyweek_migration.money import (
+    AmountError,
+    DurationError,
+    amounts_differ,
+    read_amount,
+    read_duration_seconds,
+)
 
 # -- outcomes ---------------------------------------------------------------
 READY: Final = "ready"
@@ -58,6 +65,8 @@ BLOCK_MULTI_SERVICE: Final = "multi_service_unsupported"
 BLOCK_CUSTOM_DURATION: Final = "custom_duration_unsupported"
 BLOCK_CUSTOM_PRICE: Final = "custom_price_unsupported"
 BLOCK_DURATION_UNKNOWN: Final = "duration_unknown"
+BLOCK_PRICE_MALFORMED: Final = "price_malformed"
+BLOCK_PRICE_BASELINE_MISSING: Final = "price_baseline_missing"
 BLOCK_LEDGER_UNCERTAIN: Final = "ledger_uncertain_needs_reconcile"
 BLOCK_SOURCE_CHANGED: Final = "source_changed_since_ledger"
 
@@ -135,12 +144,6 @@ def _services(record: dict[str, Any]) -> list[dict[str, Any]] | None:
     if any(not isinstance(item, dict) for item in raw):
         return None
     return [item for item in raw if isinstance(item, dict)]
-
-
-def _positive_number(value: object) -> float | None:
-    if type(value) in (int, float) and not isinstance(value, bool) and value > 0:
-        return float(value)
-    return None
 
 
 def source_fingerprint(
@@ -276,41 +279,88 @@ def classify_record(
     if service_id is None or service_id <= 0:
         return _block(BLOCK_SERVICE_ID_INVALID)
 
+    # -- 3a. mapping first: the catalogue baseline lives in the manifest -----
+    # Price and duration are checked against a baseline an operator wrote down
+    # and verified. Without the mapping there is no baseline, so the override
+    # checks below would have nothing to compare against — and "nothing to
+    # compare against" must never read as "no override".
+    service_mapping = branch.service(service_id)
+    if service_mapping is None:
+        return _block(BLOCK_SERVICE_MAPPING_MISSING)
+    service_uuid = service_mapping.easyweek_service_uuid
+
     # A per-booking price override has no proven EasyWeek equivalent. Migrating
     # it as the catalogue price would quietly change what the customer was
     # promised, so the row goes to a human instead.
-    catalogue_price = _positive_number(service.get("cost_to_pay"))
-    listed_price = _positive_number(service.get("cost"))
-    first_price = _positive_number(service.get("first_cost"))
-    if catalogue_price is not None and listed_price is not None and catalogue_price != listed_price:
+    #
+    # Every read below distinguishes ABSENT from ZERO. `cost=90, cost_to_pay=0`
+    # is a full discount, not a missing field, and the earlier "positive numbers
+    # only" helper silently dropped exactly that case — a booking promised free
+    # would have migrated at 90 EUR.
+    try:
+        price_to_pay = read_amount(service.get("cost_to_pay"))
+        listed_price = read_amount(service.get("cost"))
+        first_price = read_amount(service.get("first_cost"))
+        discount = read_amount(service.get("discount"))
+    except AmountError:
+        # NaN, infinity, a boolean, a negative or unparseable amount. Not a
+        # price we can reason about, so not a booking we migrate.
+        return _block(BLOCK_PRICE_MALFORMED)
+
+    catalog_price = service_mapping.catalog_price
+
+    # The booking must state a price at all: with none, there is nothing to
+    # compare to the catalogue and an override would be invisible.
+    if not price_to_pay.present and not listed_price.present:
+        return _block(BLOCK_PRICE_BASELINE_MISSING)
+
+    # Exact Decimal comparison throughout — a cent of difference IS the override.
+    if amounts_differ(price_to_pay, listed_price):
         return _block(BLOCK_CUSTOM_PRICE)
-    if first_price is not None and listed_price is not None and first_price != listed_price:
+    if amounts_differ(first_price, listed_price):
         return _block(BLOCK_CUSTOM_PRICE)
-    if _positive_number(service.get("discount")) is not None:
+    if amounts_differ(price_to_pay, catalog_price):
+        return _block(BLOCK_CUSTOM_PRICE)
+    if amounts_differ(listed_price, catalog_price):
+        return _block(BLOCK_CUSTOM_PRICE)
+    if amounts_differ(first_price, catalog_price):
+        return _block(BLOCK_CUSTOM_PRICE)
+    # A discount of zero is not a discount; any other stated discount is.
+    if discount.present and not discount.is_zero:
         return _block(BLOCK_CUSTOM_PRICE)
 
     # -- 4. duration -------------------------------------------------------
-    seance_seconds = _positive_number(record.get("seance_length"))
-    service_seconds = _positive_number(service.get("seance_length"))
-    if seance_seconds is None:
-        return _block(BLOCK_DURATION_UNKNOWN)
-    if service_seconds is not None and service_seconds != seance_seconds:
-        # The booking runs for a different length than its service defines: a
-        # hand-stretched slot. EasyWeek's custom-duration representation is not
-        # proven, so it is not approximated.
-        return _block(BLOCK_CUSTOM_DURATION)
-    duration_minutes = int(seance_seconds // 60)
-    if duration_minutes <= 0 or seance_seconds % 60 != 0:
+    # The booking's own length, and the catalogue length it must equal. The
+    # manifest always supplies the second one; Altegio does not always repeat it
+    # on the booking row, and treating that silence as "no override" is how a
+    # hand-stretched slot used to pass.
+    try:
+        booking_duration = read_duration_seconds(record.get("seance_length"))
+        service_duration = read_duration_seconds(service.get("seance_length"))
+    except DurationError:
+        # Zero, negative, fractional-second, non-finite or malformed.
         return _block(BLOCK_CUSTOM_DURATION)
 
-    # -- 5. mapping: exact, or blocked -------------------------------------
+    if not booking_duration.present:
+        return _block(BLOCK_DURATION_UNKNOWN)
+    assert booking_duration.minutes is not None
+    duration_minutes = booking_duration.minutes
+
+    catalog_duration = service_mapping.catalog_duration
+    assert catalog_duration.minutes is not None
+    if duration_minutes != catalog_duration.minutes:
+        # A slot that does not match its service's catalogue length. EasyWeek's
+        # custom-duration representation is not proven, so it is not guessed.
+        return _block(BLOCK_CUSTOM_DURATION)
+    # When Altegio DOES state the service's own length, it must agree too —
+    # otherwise the manifest baseline has gone stale against the live catalogue.
+    if service_duration.present and service_duration.minutes != duration_minutes:
+        return _block(BLOCK_CUSTOM_DURATION)
+
+    # -- 5. staff mapping: exact, or blocked -------------------------------
     staff_uuid = branch.staff_uuid(_staff_id(record))
     if staff_uuid is None:
         return _block(BLOCK_STAFF_MAPPING_MISSING)
-
-    service_uuid = branch.service_uuid(service_id)
-    if service_uuid is None:
-        return _block(BLOCK_SERVICE_MAPPING_MISSING)
 
     # -- 6. customer: exactly one --------------------------------------
     client = record.get("client")

@@ -89,6 +89,13 @@ class MigrationReport:
     customer_directory: dict[str, Any] = field(default_factory=dict)
     gate: dict[str, Any] | None = None
     plan_digest: str = ""
+    # What a canary proof would be bound to, for the canary mode's report.
+    canary_binding: dict[str, Any] | None = None
+    # Completeness verdict of a final reconciliation.
+    completeness: dict[str, Any] | None = None
+    # Inventory only: which Altegio staff/service ids the source actually uses,
+    # and which of them the manifest already covers.
+    source_identifiers: dict[str, Any] | None = None
 
     # Source-side truth.
     source_records_fetched: Counter = field(default_factory=Counter)
@@ -157,6 +164,9 @@ class MigrationReport:
             "manifest": self.manifest,
             "customer_directory": self.customer_directory,
             "gate": self.gate,
+            "canary_binding": self.canary_binding,
+            "completeness": self.completeness,
+            "source_identifiers": self.source_identifiers,
             "mutations_attempted": self.mutations_attempted,
             "source": {
                 "provider": "altegio",
