@@ -28,6 +28,11 @@ PR-11 stores and the evidence any later reconciliation would need.
 
 The visit counter may stay on. It sends nothing; it records a fact.
 
+The gate has since become the place where every other precondition lands too —
+the branch identities, the canary proof, and the previous waves' cumulative
+context — for the same reason: it is the one chokepoint every forward mutation
+passes through, so a check placed here cannot be skipped by taking another route.
+
 A failed gate raises before a single request is built. There is no partial mode,
 no ``--force``, and no path where a mutation happens with an unproven gate.
 """
@@ -41,6 +46,7 @@ from altegio_bot.easyweek_migration.branch_identity import BranchIdentityResult
 from altegio_bot.easyweek_migration.canary import CanaryVerdict
 from altegio_bot.easyweek_migration.customers import CustomerDirectory
 from altegio_bot.easyweek_migration.manifest import MigrationManifest
+from altegio_bot.easyweek_migration.previous_wave import PreviousWaveContext
 from altegio_bot.settings import settings
 
 # Flags that must be FALSE, with the reason each one is here.
@@ -62,6 +68,9 @@ GATE_CANARY_NOTIFICATION_OBSERVED: Final = "canary_notification_observed"
 GATE_BRANCH_IDENTITY_UNPROVEN: Final = "target_branch_identity_unproven"
 # A bulk apply needs a machine-checked canary, not an operator's recollection.
 GATE_CANARY_PROOF_MISSING: Final = "canary_proof_missing_or_stale"
+# The manifest of wave N must still carry the mappings and catalogue baselines
+# that waves 1..N-1 were migrated against. See `previous_wave`.
+GATE_PREVIOUS_WAVE_CONTEXT_UNPROVEN: Final = "previous_wave_context_unprovable"
 
 
 class ApplyGateError(RuntimeError):
@@ -125,6 +134,7 @@ class ApplyGateResult:
     effective_settings: dict[str, Any] = field(default_factory=dict)
     branch_identity: dict[str, Any] | None = None
     canary: dict[str, Any] | None = None
+    previous_wave_context: dict[str, Any] | None = None
 
     def as_safe_dict(self) -> dict[str, Any]:
         return {
@@ -133,6 +143,7 @@ class ApplyGateResult:
             "effective_settings": dict(self.effective_settings),
             "branch_identity": self.branch_identity,
             "canary": self.canary,
+            "previous_wave_context": self.previous_wave_context,
         }
 
 
@@ -150,6 +161,8 @@ def evaluate_apply_gate(
     branch_identity: BranchIdentityResult | None = None,
     canary_verdict: CanaryVerdict | None = None,
     require_canary_proof: bool = True,
+    previous_wave_context: PreviousWaveContext | None = None,
+    require_previous_wave_context: bool = False,
 ) -> ApplyGateResult:
     """Collect EVERY reason the apply may not proceed, then decide.
 
@@ -213,12 +226,20 @@ def evaluate_apply_gate(
     if require_canary_proof and (canary_verdict is None or not canary_verdict.licensed):
         failures.append(GATE_CANARY_PROOF_MISSING)
 
+    # Every wave after the first inherits the previous waves' live `created`
+    # rows, and its manifest has to keep proving them. Required on the two paths
+    # that mutate EasyWeek forward — canary and bulk apply — and not on rollback,
+    # which exists to undo a wave and must not be gated on the wave being sound.
+    if require_previous_wave_context and (previous_wave_context is None or not previous_wave_context.proven):
+        failures.append(GATE_PREVIOUS_WAVE_CONTEXT_UNPROVEN)
+
     return ApplyGateResult(
         passed=not failures,
         failures=failures,
         effective_settings=settings_snapshot.as_safe_dict(),
         branch_identity=branch_identity.as_safe_dict() if branch_identity is not None else None,
         canary=canary_verdict.as_safe_dict() if canary_verdict is not None else None,
+        previous_wave_context=(previous_wave_context.as_safe_dict() if previous_wave_context is not None else None),
     )
 
 

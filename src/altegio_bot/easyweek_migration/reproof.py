@@ -293,9 +293,36 @@ class LifecycleResult:
     # The classifier's own code when it had one — already a stable, PII-free
     # string such as `source_canceled`.
     detail: str | None = None
+    # The Altegio ids the source booking uses. Technical source identifiers, so
+    # they may be reported: when a mapping is missing, "which id do I have to add
+    # to the manifest?" is the whole question an operator needs answered.
+    altegio_staff_id: int | None = None
+    altegio_service_id: int | None = None
 
     def as_safe_dict(self) -> dict[str, Any]:
         return {"source_lifecycle": self.state, "source_lifecycle_detail": self.detail}
+
+
+def _source_ids(record: dict[str, Any]) -> tuple[int | None, int | None]:
+    """The Altegio staff and service ids a source booking uses, or ``None``.
+
+    Read straight off the record rather than through the manifest, because the
+    caller needs them precisely when the manifest has no entry for them.
+    """
+    staff_id = record.get("staff_id")
+    if staff_id is None and isinstance(record.get("staff"), dict):
+        staff_id = record["staff"].get("id")
+    if type(staff_id) is not int:
+        staff_id = None
+
+    service_id = None
+    services = record.get("services")
+    if isinstance(services, list) and len(services) == 1 and isinstance(services[0], dict):
+        candidate = services[0].get("id")
+        if type(candidate) is int:
+            service_id = candidate
+
+    return staff_id, service_id
 
 
 async def reclassify_source_lifecycle(
@@ -334,6 +361,8 @@ async def reclassify_source_lifecycle(
     if identity_failure is not None:
         return LifecycleResult(state=LIFECYCLE_UNPROVABLE, detail=identity_failure)
 
+    staff_id, service_id = _source_ids(live)
+
     fresh = classify_record(
         live,
         company_id=company_id,
@@ -344,17 +373,20 @@ async def reclassify_source_lifecycle(
         ignore_wave_scope=True,
     )
 
+    def _result(state: str, detail: str | None = None) -> LifecycleResult:
+        return LifecycleResult(state=state, detail=detail, altegio_staff_id=staff_id, altegio_service_id=service_id)
+
     if fresh.outcome == READY:
         if fresh.source_fingerprint == expected_fingerprint:
-            return LifecycleResult(state=LIFECYCLE_ACTIVE_UNCHANGED)
+            return _result(LIFECYCLE_ACTIVE_UNCHANGED)
         # Still a live booking, but no longer the one we migrated: moved, given
         # to another master, re-serviced or reassigned. The target we created
         # describes an appointment that no longer exists in that form.
-        return LifecycleResult(state=LIFECYCLE_INACTIVE_OR_CHANGED, detail="fingerprint_changed")
+        return _result(LIFECYCLE_INACTIVE_OR_CHANGED, "fingerprint_changed")
 
     if fresh.reason in _LIFECYCLE_ENDED_REASONS:
-        return LifecycleResult(state=LIFECYCLE_INACTIVE_OR_CHANGED, detail=fresh.reason)
+        return _result(LIFECYCLE_INACTIVE_OR_CHANGED, fresh.reason)
 
     # A mapping that has since been removed, a price we can no longer read: we
     # cannot say whether the appointment still stands, so we do not say.
-    return LifecycleResult(state=LIFECYCLE_UNPROVABLE, detail=fresh.reason)
+    return _result(LIFECYCLE_UNPROVABLE, fresh.reason)

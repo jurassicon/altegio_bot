@@ -81,6 +81,10 @@ from altegio_bot.easyweek_migration.manifest import (
     STAFF_UNKNOWN,
     MigrationManifest,
 )
+from altegio_bot.easyweek_migration.previous_wave import (
+    PreviousWaveContext,
+    prove_previous_wave_context,
+)
 from altegio_bot.easyweek_migration.proof import (
     GHOST_TARGET_STILL_ACTIVE,
     TARGET_SNAPSHOT_MISSING,
@@ -434,6 +438,21 @@ async def run_inventory_or_dry_run(
     for decision in decisions:
         report.note(decision)
 
+    # `inventory` runs against a manifest that is still being written, so asking
+    # it to prove anything cumulative would only produce noise. `dry-run` is the
+    # review artefact, and it is where an operator should learn that their wave-2
+    # manifest dropped wave 1's mappings — long before the canary refuses.
+    if inputs.mode != MODE_INVENTORY:
+        context = await prove_previous_wave_context(
+            session,
+            manifest=inputs.manifest,
+            directory=inputs.directory,
+            cutover=inputs.cutover,
+            decisions=decisions,
+            http_client=http_client,
+        )
+        report.previous_wave_context = context.as_safe_dict()
+
     return report
 
 
@@ -503,6 +522,24 @@ async def _prepare_write_gate(
     # runtime registry can say whether that location IS that branch.
     branch_identity = verify_branch_identity(inputs.manifest)
 
+    # Waves after the first inherit live `created` rows from the waves before
+    # them, and this manifest still has to prove those rows. Read-only, and
+    # placed here — above the gate, above every write path — so that a manifest
+    # which dropped an earlier wave's mapping is refused while EasyWeek is still
+    # untouched, rather than after a wave has been migrated that can never be
+    # reconciled. Reads Altegio and PostgreSQL; issues no EasyWeek request.
+    context: PreviousWaveContext
+    async with session_maker() as session:
+        context = await prove_previous_wave_context(
+            session,
+            manifest=inputs.manifest,
+            directory=inputs.directory,
+            cutover=inputs.cutover,
+            decisions=decisions,
+            http_client=http_client,
+        )
+    report.previous_wave_context = context.as_safe_dict()
+
     canary_verdict: CanaryVerdict | None = None
     if require_canary_proof:
         binding = _binding_for(inputs, branch_identity)
@@ -521,6 +558,8 @@ async def _prepare_write_gate(
         branch_identity=branch_identity,
         canary_verdict=canary_verdict,
         require_canary_proof=require_canary_proof,
+        previous_wave_context=context,
+        require_previous_wave_context=True,
     )
     report.gate = gate.as_safe_dict()
     # Nothing below this line may run on a failed gate, and nothing above it

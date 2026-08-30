@@ -105,6 +105,9 @@ class MigrationReport:
     # Set only when the narrow canary-recovery path was consulted: whether an
     # unverified canary attempt was allowed to recover its own row.
     canary_recovery: dict[str, Any] | None = None
+    # Waves after the first: whether this manifest still proves the earlier
+    # waves' live `created` rows, and which rows it no longer covers.
+    previous_wave_context: dict[str, Any] | None = None
 
     # Source-side truth.
     source_records_fetched: Counter = field(default_factory=Counter)
@@ -179,6 +182,7 @@ class MigrationReport:
             "wave": self.wave,
             "scope": self.scope,
             "canary_recovery": self.canary_recovery,
+            "previous_wave_context": self.previous_wave_context,
             "mutations_attempted": self.mutations_attempted,
             "source": {
                 "provider": "altegio",

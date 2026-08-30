@@ -9,9 +9,15 @@
 **Волны.** Первая волна переносит мастеров, перечисленных в
 `selected_altegio_staff_ids`. Ногтевые мастера отложены и указаны в
 `deferred_altegio_staff_ids` — их записи **переносятся отдельной будущей
-волной**, для которой этот же runbook выполняется заново с новым manifest.
-Мастер, не попавший ни в один список, блокирует cutover: «отложили» и «забыли»
-не должны выглядеть одинаково.
+волной**, для которой этот же runbook выполняется заново. Мастер, не попавший ни
+в один список, блокирует cutover: «отложили» и «забыли» не должны выглядеть
+одинаково.
+
+**Manifest волны 2 и далее — не новый файл, а предыдущий плюс новые mappings.**
+Selector (`selected` / `deferred`) описывает состав текущей волны; mappings
+накапливаются и не удаляются, пока живы записи, которые по ним переносили.
+Полный порядок сборки — шаг 5a; пропустить его нельзя: manifest, потерявший
+mapping предыдущей волны, останавливает canary и apply до первой mutation.
 
 Исторические счётчики визитов переносятся **нативным импортом клиентов
 EasyWeek**, а не этим инструментом. Canary подтвердил: EasyWeek сохраняет
@@ -149,6 +155,11 @@ mkdir -p "$EASYWEEK_MIGRATION_INPUT_DIR" "$EASYWEEK_MIGRATION_REPORT_DIR"
 нормализованному международному номеру: ноль совпадений и больше одного —
 `blocked`, ровно одно — его UUID. Клиенты автоматически не создаются.
 
+Экспорт — **полный и свежий**, а не выборка под мастеров текущей волны. Каждая
+волна берёт новый экспорт, и он обязан резолвить не только клиентов этой волны,
+но и клиентов живых записей всех предыдущих: их проверяет и cumulative-guard
+(шаг 5a), и финальная reconciliation. Файл фильтровать нельзя.
+
 ## 5. Подготовка mapping location / staff / service
 
 **Что делает:** заполняется manifest — явное соответствие Altegio-идентификаторов
@@ -177,7 +188,18 @@ docker compose --profile ops run --rm --build easyweek-booking-migration invento
 ```
 
 Повторять, пока `source_identifiers[*].staff.missing` и `.services.missing` не
-станут пустыми **для выбранных мастеров**.
+станут пустыми. Пустыми они обязаны быть **в двух смыслах**, и путать их нельзя:
+
+- **новое в этой волне** — каждый мастер из `selected_altegio_staff_ids` и каждая
+  услуга, встречающаяся в его будущих записях, должны быть отображены. Без этого
+  волна не поедет;
+- **унаследованное от предыдущих волн** — mappings и каталожные baselines всех
+  мастеров и услуг, по которым уже есть живые `created`-строки ledger, должны
+  остаться в файле, даже если эти мастера теперь в `deferred`. Без этого волна
+  **поедет и не закроется** (шаг 5a).
+
+Для первой волны второй список пуст: у отложенных мастеров ещё нет
+`created`-строк, и заранее отображать их не требуется.
 
 **Что делает оператор:** распределяет каждый Altegio staff ID из отчёта ровно в
 один список — `selected_altegio_staff_ids` или `deferred_altegio_staff_ids`.
@@ -205,6 +227,93 @@ docker compose --profile ops run --rm --build easyweek-booking-migration invento
 `EASYWEEK_LOCATION_MAP`: location ID, location UUID и slug филиала
 (`758285 → karlsruhe`, `1271200 → rastatt`) должны совпасть. Перепутанные
 Karlsruhe и Rastatt отвергаются до первого запроса.
+
+---
+
+## 5a. Волна 2 и далее — кумулятивный manifest
+
+**Пропустить этот шаг нельзя, если волна не первая.**
+
+**Что делает оператор:** берёт manifest **предыдущей** волны, меняет в нём только
+selector и **добавляет** mappings новых мастеров и услуг.
+**Зачем:** финальная reconciliation каждой волны перечитывает живые записи всех
+предыдущих волн полным классификатором. Ей нужны их staff/service mappings и
+каталожные baselines. Manifest, собранный с нуля «под текущую волну», их теряет —
+и волна проходит canary и apply, а затем навсегда упирается в
+`migrated_source_lifecycle_unprovable` о записи, которую никто не трогал. К этому
+моменту бронирования уже созданы, и правка manifest их не отменяет.
+
+Порядок:
+
+1. Скопировать manifest предыдущей волны — он основа, а не образец.
+2. Изменить **только** `selected_altegio_staff_ids` и
+   `deferred_altegio_staff_ids`: мастера этой волны — в `selected`, все
+   остальные, включая уже перенесённых, — в `deferred`.
+3. **Добавить** mappings новых мастеров и их услуг, вместе с
+   `catalog_duration_minutes` и `catalog_price`.
+4. **Ничего не удалять.** Mappings и baselines предыдущих волн остаются как есть.
+   Менять их значения тоже нельзя: изменённая каталожная цена читается так же,
+   как пропавшая.
+5. Взять **свежий полный** экспорт клиентов (шаг 4). Прошлый файл устарел,
+   отфильтрованный — не подходит.
+
+**Наличие mapping не делает мастера selected.** Состав волны задаёт только
+selector: мастер ресниц с сохранённым mapping, но в `deferred`, повторно не
+переносится — его записи остаются `already_migrated`, а новые пропускаются с
+`staff_deferred_to_later_wave`.
+
+### Пример: волна A — ресницы, волна B — ногти
+
+Волна A: мастер ресниц в `selected`, мастер ногтей в `deferred`, отображена
+только услуга LASH. Mapping для NAIL не нужен — у ногтевого мастера ещё нет ни
+одной `created`-строки.
+
+Волна B, тот же файл, три правки:
+
+| | волна A | волна B |
+|---|---|---|
+| `selected_altegio_staff_ids` | мастер ресниц | **мастер ногтей** |
+| `deferred_altegio_staff_ids` | мастер ногтей | **мастер ресниц** |
+| mapping мастера ресниц | есть | **есть — остаётся** |
+| mapping услуги LASH + baseline | есть | **есть — остаётся** |
+| mapping мастера ногтей | нет | **добавлен** |
+| mapping услуги NAIL + baseline | нет | **добавлен** |
+
+Мастер ресниц переехал в `deferred` — но его mapping и baseline услуги LASH
+остаются в файле, потому что её записи живы. Переносится в волне B только мастер
+ногтей.
+
+**Что делает команда:** строит план и печатает раздел `previous_wave_context` —
+результат read-only проверки того, что текущие manifest и экспорт клиентов всё
+ещё доказывают живые `created`-строки предыдущих волн. Ни одного EasyWeek-запроса.
+
+```bash
+docker compose --profile ops run --rm --build easyweek-booking-migration dry-run --manifest /migration/input/manifest.json --customer-directory /migration/input/easyweek-customers-after-import.csv --cutover-at 2026-09-01T00:00:00+02:00
+```
+
+**Зачем именно здесь:** та же проверка встроена в gate перед первой mutation
+`canary` и `apply`, и там она уже отказ. Здесь она — предупреждение, которое
+чинится правкой файла.
+
+Требуется `previous_wave_context.proven: true`. При `false` каждая строка
+`previous_wave_context.rows` называет source identity, причину и Altegio ID,
+которого не хватает:
+
+| причина | что вернуть в manifest |
+|---|---|
+| `previous_wave_staff_mapping_missing` | staff mapping для `altegio_staff_id` |
+| `previous_wave_service_mapping_missing` | service mapping для `altegio_service_id` |
+| `previous_wave_catalogue_baseline_missing` | `catalog_duration_minutes` / `catalog_price` услуги — пропали или изменены |
+| `previous_wave_customer_unresolved` | взять полный свежий экспорт клиентов, не отфильтрованный |
+| `previous_wave_source_fingerprint_mismatch` | запись предыдущей волны изменилась в Altegio: её target — ghost, разобрать вручную до начала волны |
+
+Общий код отказа gate — `previous_wave_context_unprovable`. Отказ происходит до
+первой mutation: ни одного созданного бронирования, ledger и proof предыдущих
+волн не тронуты.
+
+Строки **текущей** волны эта проверка не считает: их разбирает обычный
+`blocked_rows` на шаге 12. `previous_wave_context.checked` для первой волны равен
+нулю — это нормально.
 
 ---
 
@@ -336,6 +445,10 @@ docker compose --profile ops run --rm --build easyweek-booking-migration dry-run
 `staff_deferred_to_later_wave` и видны отдельным счётчиком в разделе `wave`.
 Ещё раз сверить `wave.active_bookings_selected` с ожиданием по Altegio.
 
+Для волны 2 и далее здесь же проверить `previous_wave_context.proven: true` —
+записи предыдущих волн живут в отдельном разделе отчёта, а не в `blocked_rows`
+(шаг 5a).
+
 Записать `plan_digest` из отчёта.
 
 ## 13. Canary — одна **названная** запись
@@ -351,6 +464,11 @@ staff, service, customer, время начала, длительность и �
 
 Выбрать конкретную запись из `dry-run` (её `source_company_id` и
 `source_record_id`) и подставить ниже.
+
+Для волны 2 и далее gate дополнительно требует
+`previous_wave_context_unprovable` **не** в списке отказов: manifest, потерявший
+mapping или baseline живой записи предыдущей волны, останавливает canary **до
+первого POST** (шаг 5a). Тот же gate стоит и перед bulk apply на шаге 16.
 
 ```bash
 docker compose --profile ops run --rm --build easyweek-booking-migration canary --manifest /migration/input/manifest.json --customer-directory /migration/input/easyweek-customers-after-import.csv --cutover-at 2026-09-01T00:00:00+02:00 --verified-dry-run-id ПЛАН_DIGEST_ИЗ_ШАГА_12 --canary-company-id 758285 --canary-record-id ID_ЗАПИСИ --confirm-easyweek-native-notifications-disabled --apply
@@ -599,3 +717,5 @@ rollback (если он был нужен) выполнен.
 webhook/API payload'ы; manifest'ы и отчёты с PII; экспорты EasyWeek; содержимое
 `outputs/`. Правила — в `.gitignore`. В репозитории живёт только
 `docs/easyweek/migration_manifest.example.json` — шаблон с placeholder-значениями.
+Реальные production ID, имена, телефоны и UUID клиентов в него не переносятся ни
+при каких обстоятельствах, в том числе «для наглядности» после успешной волны.
