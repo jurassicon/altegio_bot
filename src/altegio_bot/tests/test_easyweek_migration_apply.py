@@ -857,6 +857,9 @@ async def test_final_reconciliation_fails_when_a_source_booking_has_no_target(se
 async def test_final_reconciliation_does_not_call_an_empty_source_a_success(session_local, source, monkeypatch):
     """`source_active_bookings == 0` proves nothing if the API was never read."""
     transport = RecordingTransport()
+    # A wave has to be licensed before any reconciliation has something to be
+    # about; the scope gate is proven separately.
+    await license_bulk(session_local, transport)
 
     async def _empty(*, company_id, window, timeout_sec=30.0, client=None):
         return []

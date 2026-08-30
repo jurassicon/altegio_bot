@@ -664,3 +664,131 @@ async def test_the_source_reproof_uses_the_same_wave_selector(session_local, sou
     assert not parse_manifest(json.dumps(narrowed)).valid
     # And the digest of the wider plan no longer opens anything else.
     assert plan.plan_digest
+
+
+# ---------------------------------------------------------------------------
+# Blocker 2 (rev 18) — the resolution paths prove the source's company too
+# ---------------------------------------------------------------------------
+# `reclassify_source_for_resolution` checked the record id but not the company
+# id, so a payload from a different company could be classified and used to
+# resolve a row. The pre-POST re-proof already had the right contract; both now
+# share it.
+
+COMPANY_IDENTITY_CASES = [
+    ("absent", {}, True),
+    ("matching int", {"company_id": KARLSRUHE_COMPANY_ID}, True),
+    ("different company", {"company_id": 1271200}, False),
+    ("string", {"company_id": str(KARLSRUHE_COMPANY_ID)}, False),
+    ("true", {"company_id": True}, False),
+    ("false", {"company_id": False}, False),
+    ("malformed", {"company_id": {"id": KARLSRUHE_COMPANY_ID}}, False),
+]
+
+
+def _company_case_ids():
+    return [name for name, _payload, _ok in COMPANY_IDENTITY_CASES]
+
+
+@pytest.mark.parametrize(
+    "overrides,should_prove",
+    [(payload, ok) for _name, payload, ok in COMPANY_IDENTITY_CASES],
+    ids=_company_case_ids(),
+)
+def test_the_shared_source_identity_contract(overrides, should_prove):
+    from altegio_bot.easyweek_migration.reproof import DETAIL_COMPANY_MISMATCH, prove_source_identity
+
+    payload = {"id": KA_RECORD_B, **overrides}
+    failure = prove_source_identity(payload, company_id=KARLSRUHE_COMPANY_ID, record_id=KA_RECORD_B)
+    if should_prove:
+        assert failure is None
+    else:
+        assert failure == DETAIL_COMPANY_MISMATCH
+
+
+@pytest.mark.parametrize(
+    "overrides,should_prove",
+    [(payload, ok) for _name, payload, ok in COMPANY_IDENTITY_CASES],
+    ids=_company_case_ids(),
+)
+async def test_resolve_created_honours_the_company_contract(session_local, source, overrides, should_prove):
+    transport = RecordingTransport()
+    await uncertain_without_target(session_local, source, transport)
+    transport.plant_booking(CREATED_UUIDS[KA_RECORD_B], record_id=KA_RECORD_B)
+
+    planned = next(r for r in source[KARLSRUHE_COMPANY_ID] if r["id"] == KA_RECORD_B)
+    source["live_changes"][(KARLSRUHE_COMPANY_ID, KA_RECORD_B)] = {**planned, **overrides}
+    posts_before = transport.mutations
+
+    async with make_write_client(transport) as client:
+        report = await run_resolve_created(session_local, resolve_inputs(), write_client=client)
+
+    rows = {row.source_record_id: row for row in await ledger_rows(session_local)}
+    row = rows[KA_RECORD_B]
+    if should_prove:
+        assert report.errors == []
+        assert row.status == "created"
+    else:
+        assert any("source_company_mismatch" in err for err in report.errors)
+        # The row is untouched: still uncertain, still no target fingerprint,
+        # and its origin run is unchanged.
+        assert row.status == "uncertain"
+        assert row.target_snapshot_fingerprint is None
+    # Never a POST on a resolution path, proven or not.
+    assert transport.mutations == posts_before
+
+
+@pytest.mark.parametrize(
+    "overrides,should_prove",
+    [(payload, ok) for _name, payload, ok in COMPANY_IDENTITY_CASES],
+    ids=_company_case_ids(),
+)
+async def test_ordinary_reconcile_honours_the_company_contract(session_local, source, overrides, should_prove):
+    from sqlalchemy import text
+
+    transport = RecordingTransport()
+    await uncertain_row_with_known_target(session_local, source, transport)
+    async with session_local() as session:
+        await session.execute(
+            text(
+                "UPDATE easyweek_migration_ledger SET target_snapshot_fingerprint = NULL WHERE source_record_id = :rid"
+            ),
+            {"rid": KA_RECORD_B},
+        )
+        await session.commit()
+
+    planned = next(r for r in source[KARLSRUHE_COMPANY_ID] if r["id"] == KA_RECORD_B)
+    source["live_changes"][(KARLSRUHE_COMPANY_ID, KA_RECORD_B)] = {**planned, **overrides}
+    posts_before = transport.mutations
+
+    async with make_write_client(transport) as client:
+        await run_reconcile(session_local, make_inputs(MODE_RECONCILE), write_client=client)
+
+    rows = {row.source_record_id: row for row in await ledger_rows(session_local)}
+    row = rows[KA_RECORD_B]
+    if should_prove:
+        assert row.status == "created"
+        assert row.target_snapshot_fingerprint
+    else:
+        assert row.status == "uncertain"
+        assert row.target_snapshot_fingerprint is None
+    assert transport.mutations == posts_before
+
+
+async def test_a_wrong_company_never_reaches_the_classifier(session_local, source, monkeypatch):
+    """Identity first: a payload we cannot vouch for is not classified at all."""
+    from altegio_bot.easyweek_migration import reproof as reproof_module
+
+    transport = RecordingTransport()
+    await uncertain_without_target(session_local, source, transport)
+    transport.plant_booking(CREATED_UUIDS[KA_RECORD_B], record_id=KA_RECORD_B)
+
+    planned = next(r for r in source[KARLSRUHE_COMPANY_ID] if r["id"] == KA_RECORD_B)
+    source["live_changes"][(KARLSRUHE_COMPANY_ID, KA_RECORD_B)] = {**planned, "company_id": 1271200}
+
+    def _must_not_run(*args, **kwargs):
+        raise AssertionError("an unproven payload must never be classified")
+
+    monkeypatch.setattr(reproof_module, "classify_record", _must_not_run)
+    async with make_write_client(transport) as client:
+        report = await run_resolve_created(session_local, resolve_inputs(), write_client=client)
+    assert any("source_company_mismatch" in err for err in report.errors)

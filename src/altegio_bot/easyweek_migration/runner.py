@@ -45,9 +45,12 @@ from altegio_bot.easyweek_migration.canary import (
     CANARY_POST_UNCERTAIN,
     CANARY_READBACK_FAILED,
     CANARY_REPROOF_FAILED,
+    CanaryBinding,
     CanaryVerdict,
+    ScopeVerdict,
     build_binding,
     find_licensing_proof,
+    find_proven_scope,
     record_proof,
 )
 from altegio_bot.easyweek_migration.classify import (
@@ -421,6 +424,45 @@ async def run_inventory_or_dry_run(
     return report
 
 
+def _binding_for(inputs: RunInputs, branch_identity: BranchIdentityResult) -> CanaryBinding:
+    """The durable identity of the wave these inputs describe.
+
+    One place, so a command that continues a wave cannot compute the wave's name
+    slightly differently from the command that created it.
+    """
+    return build_binding(
+        manifest_digest=inputs.manifest.digest,
+        staff_scope_digest=inputs.manifest.staff_scope_digest,
+        cutover_at=inputs.cutover.at,
+        horizon_days=inputs.horizon_days,
+        branch_result=branch_identity,
+    )
+
+
+async def _require_proven_scope(
+    session_maker: async_sessionmaker[AsyncSession],
+    inputs: RunInputs,
+) -> tuple[ScopeVerdict, CanaryBinding | None]:
+    """Prove that these arguments describe the wave that was actually migrated.
+
+    Every command that *continues* a wave — the reconciliations and the
+    resolutions — has to pass this before it may claim anything. Without it the
+    scope of the proof was whatever the operator typed, and two edits silently
+    narrowed it: omitting ``--cutover-at`` (the code used "now", so earlier
+    bookings became out-of-window and their targets were never fetched) and
+    moving a migrated master into ``deferred_altegio_staff_ids``.
+
+    Reads only. Never touches EasyWeek and never writes.
+    """
+    branch_identity = verify_branch_identity(inputs.manifest)
+    if not branch_identity.proven:
+        return ScopeVerdict(proven=False, reason=GATE_BRANCH_IDENTITY_UNPROVEN), None
+    binding = _binding_for(inputs, branch_identity)
+    async with session_maker() as session:
+        verdict = await find_proven_scope(session, binding=binding)
+    return verdict, binding
+
+
 async def _prepare_write_gate(
     session_maker: async_sessionmaker[AsyncSession],
     inputs: RunInputs,
@@ -450,11 +492,7 @@ async def _prepare_write_gate(
 
     canary_verdict: CanaryVerdict | None = None
     if require_canary_proof:
-        binding = build_binding(
-            manifest_digest=inputs.manifest.digest,
-            cutover_at=inputs.cutover.at,
-            branch_result=branch_identity,
-        )
+        binding = _binding_for(inputs, branch_identity)
         async with session_maker() as session:
             canary_verdict = await find_licensing_proof(session, binding=binding)
 
@@ -566,11 +604,7 @@ async def run_canary(
         require_canary_proof=False,
         http_client=http_client,
     )
-    binding = build_binding(
-        manifest_digest=inputs.manifest.digest,
-        cutover_at=inputs.cutover.at,
-        branch_result=branch_identity,
-    )
+    binding = _binding_for(inputs, branch_identity)
     report.canary_binding = binding.as_safe_dict()
 
     chosen: Decision | None = None
@@ -873,6 +907,23 @@ async def run_reconcile(
         customer_directory=inputs.directory.as_safe_dict(),
     )
 
+    # Which wave is this? Asked FIRST, before the live source or any target is
+    # read, so a command describing a different wave cannot reach a verdict —
+    # let alone a passing one — about this wave's bookings.
+    scope, _binding = await _require_proven_scope(session_maker, inputs)
+    report.scope = scope.as_safe_dict()
+    if not scope.proven:
+        report.errors.append(scope.reason)
+        report.reasons[scope.reason] += 1
+        if inputs.final:
+            report.completeness = {
+                "passed": False,
+                "scope_proven": False,
+                "scope_reason": scope.reason,
+                "wave_identity": scope.wave_identity,
+            }
+        return report
+
     async with session_maker() as session:
         pending = await ledger_module.uncertain_rows(session)
         # The source fingerprint is carried alongside the report-safe row: it is
@@ -1099,6 +1150,10 @@ async def _prove_completeness(
 
     verdict = {
         "passed": passed,
+        # Which wave this verdict is about. Two consecutive waves have different
+        # identities, so a PASS can never be read as covering the other one.
+        "wave_identity": (report.scope or {}).get("wave_identity"),
+        "scope_proven": True,
         "source_was_read": source_was_read,
         "targets_were_checked": targets_were_checked,
         "source_active_bookings": len(active),
@@ -1214,6 +1269,17 @@ async def run_resolve_created(
     target = inputs.resolve_target_booking_uuid
     if company_id is None or record_id is None or not target:
         report.errors.append("resolve-created requires --resolve-company-id, --resolve-record-id and --target-uuid")
+        return report
+
+    # A row is resolved against the wave that tried to create it, never against
+    # whatever scope the operator happens to be holding today. A different
+    # cutover would re-classify the source and rebuild a different "expected"
+    # booking to compare the live one against.
+    scope, _binding = await _require_proven_scope(session_maker, inputs)
+    report.scope = scope.as_safe_dict()
+    if not scope.proven:
+        report.errors.append(scope.reason)
+        report.reasons[scope.reason] += 1
         return report
 
     async with session_maker() as session:

@@ -49,6 +49,11 @@ REPROOF_SOURCE_CHANGED: Final = "source_changed_after_plan"
 # The booking could not be re-read or re-derived at all.
 REPROOF_FAILED: Final = "source_reproof_failed"
 
+# Source-identity details. Stable, PII-free, and shared by both re-proof
+# paths so neither can drift into a weaker check than the other.
+DETAIL_IDENTITY_MISMATCH: Final = "source_identity_mismatch"
+DETAIL_COMPANY_MISMATCH: Final = "source_company_mismatch"
+
 
 @dataclass(frozen=True)
 class ReproofResult:
@@ -65,6 +70,40 @@ class ReproofResult:
 
 
 CONFIRMED: Final = ReproofResult(confirmed=True, reason=REPROOF_CONFIRMED)
+
+
+def prove_source_identity(live: dict[str, Any], *, company_id: int, record_id: int) -> str | None:
+    """Prove the payload really is the record we asked Altegio for.
+
+    Returns ``None`` when proven, or a stable detail code.
+
+    Altegio addresses a record by both ids, but a proxy, a cache or a future API
+    change must not be able to hand back somebody else's booking and have it
+    migrated or resolved against. So both are re-checked here, and the payload is
+    not classified at all until they hold.
+
+    ``company_id`` is treated as *optional but binding*: Altegio does not always
+    repeat it on a record, and demanding it would block every legitimate row. But
+    when it IS present it must be an exact ``int`` and it must match — a string,
+    a boolean (``True == 1``), a different company or anything malformed means we
+    are looking at a payload we do not understand, and that is never a proof.
+
+    Shared by the pre-POST re-proof and the resolution re-proof. The resolution
+    path used to check only the record id, which left a wrong-company payload
+    able to resolve an uncertain row.
+    """
+    live_id = live.get("id")
+    if type(live_id) is not int or live_id != record_id:
+        return DETAIL_IDENTITY_MISMATCH
+
+    live_company = live.get("company_id")
+    if live_company is None:
+        # Genuinely absent. Altegio does not always send it, and the record id
+        # was already addressed under this company.
+        return None
+    if type(live_company) is not int or live_company != company_id:
+        return DETAIL_COMPANY_MISMATCH
+    return None
 
 
 async def reprove_source_booking(
@@ -105,16 +144,9 @@ async def reprove_source_booking(
         # Hard-deleted between the plan and now.
         return ReproofResult(confirmed=False, reason=REPROOF_SOURCE_CHANGED, detail="source_absent")
 
-    # The record must still be the record we asked for. Altegio addresses it by
-    # both ids, but a proxy, a cache or a future API change must not be able to
-    # hand back somebody else's booking and have it migrated.
-    live_id = live.get("id")
-    if type(live_id) is not int or live_id != record_id:
-        return ReproofResult(confirmed=False, reason=REPROOF_FAILED, detail="source_identity_mismatch")
-
-    live_company = live.get("company_id")
-    if live_company is not None and (type(live_company) is not int or live_company != company_id):
-        return ReproofResult(confirmed=False, reason=REPROOF_FAILED, detail="source_company_mismatch")
+    identity_failure = prove_source_identity(live, company_id=company_id, record_id=record_id)
+    if identity_failure is not None:
+        return ReproofResult(confirmed=False, reason=REPROOF_FAILED, detail=identity_failure)
 
     # Same inputs as the plan. A different manifest or cutover here would let the
     # re-proof approve something the operator never reviewed.
@@ -182,9 +214,12 @@ async def reclassify_source_for_resolution(
     if live is None:
         return ReproofResult(confirmed=False, reason=REPROOF_SOURCE_CHANGED, detail="source_absent"), None
 
-    live_id = live.get("id")
-    if type(live_id) is not int or live_id != record_id:
-        return ReproofResult(confirmed=False, reason=REPROOF_FAILED, detail="source_identity_mismatch"), None
+    # The same identity contract as the pre-POST re-proof, and for the same
+    # reason: a payload whose company we cannot vouch for must never be
+    # classified, let alone used to resolve a row.
+    identity_failure = prove_source_identity(live, company_id=company_id, record_id=record_id)
+    if identity_failure is not None:
+        return ReproofResult(confirmed=False, reason=REPROOF_FAILED, detail=identity_failure), None
 
     fresh = classify_record(
         live,

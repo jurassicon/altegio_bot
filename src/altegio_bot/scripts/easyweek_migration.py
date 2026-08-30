@@ -110,6 +110,11 @@ STRICT_MANIFEST_MODES: Final = (
 # say which customer the booking was for — and an unchecked customer must not
 # pass as a correct one.
 CUSTOMER_DIRECTORY_MODES: Final = (MODE_DRY_RUN, MODE_CANARY, MODE_APPLY, MODE_RESOLVE_CREATED)
+# Modes that CONTINUE a wave rather than start one. They prove or resolve
+# rows another run created, so their scope is not theirs to choose: the
+# cutover must be the exact value that wave was applied with, and a run-start
+# default would quietly prove a different window.
+CONTINUING_MODES: Final = (MODE_RECONCILE, MODE_RESOLVE_CREATED)
 
 # The operator attestation. Spelled out in full, every time, on purpose: it is a
 # claim about a system this process cannot inspect, and a short flag would make
@@ -136,13 +141,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--cutover-at",
-        help="immutable cutover instant, ISO-8601 WITH offset (e.g. 2026-09-01T00:00:00+02:00). Required for apply.",
+        help=(
+            "immutable cutover instant, ISO-8601 WITH offset (e.g. 2026-09-01T00:00:00+02:00). "
+            "Required for apply, canary, reconcile and resolve-created — for the latter two it must be "
+            "the exact value the wave was applied with."
+        ),
     )
     parser.add_argument(
         "--horizon-days",
         type=int,
         default=DEFAULT_HORIZON_DAYS,
-        help=f"how far ahead to read Altegio bookings (default {DEFAULT_HORIZON_DAYS})",
+        help=(
+            f"how far ahead to read Altegio bookings (default {DEFAULT_HORIZON_DAYS}). "
+            "Part of the wave identity: reconciliation must use the same value the wave was applied with."
+        ),
     )
     parser.add_argument(
         "--apply",
@@ -255,6 +267,15 @@ async def _run(args: argparse.Namespace) -> int:
         elif writes:
             # A write's boundary must be a value a second person can check.
             return _fail(f"--cutover-at is required for {args.mode}")
+        elif args.mode in CONTINUING_MODES:
+            # These commands continue a wave somebody else started, and the
+            # cutover decides which bookings are even in it. Defaulting to "now"
+            # was a silent narrowing: a booking earlier today became
+            # `starts_before_cutover`, its EasyWeek target was never fetched, and
+            # a deleted target could not fail a check that never looked at it.
+            return _fail(
+                f"--cutover-at is required for {args.mode}: it must be the exact value the wave was applied with"
+            )
         else:
             cutover = run_start_cutover(utcnow())
     except CutoverError as exc:

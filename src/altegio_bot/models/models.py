@@ -1618,6 +1618,15 @@ class EasyWeekMigrationCanaryProof(Base):
 
     # -- what the proof is BOUND to ---------------------------------------
     manifest_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    # The wave selector on its own. It is already inside `manifest_digest`, but
+    # keeping it separately is what lets a mismatch say "somebody moved a master
+    # between waves" instead of the useless "the manifest changed" — and moving a
+    # master is the one change that would hide her bookings from the very check
+    # that is supposed to prove they landed.
+    staff_scope_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # How far ahead the wave looked. A narrower horizon at reconciliation time
+    # would silently drop the far end of the wave out of the proof.
+    horizon_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # Bumped whenever the POST body changes shape. An old proof cannot vouch for
     # a request we no longer send.
     request_schema_version: Mapped[str] = mapped_column(String(16), nullable=False)

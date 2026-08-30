@@ -19,6 +19,49 @@ EasyWeek**, а не этим инструментом. Canary подтверди
 числовой `visits_total`, и PR-11 сохраняет его в локальный `Client`. Поэтому
 PR-11.1 **не пишет счётчики через API**.
 
+## Неизменяемые аргументы волны
+
+Волна имеет **durable identity**, и её нельзя менять после apply. Шесть значений
+образуют эту identity; её дайджест печатается в отчёте как
+`scope.wave_identity`:
+
+| значение | что скрыла бы подмена |
+|---|---|
+| `manifest` (его canonical содержимое) | другой mapping — другие targets |
+| `selected_altegio_staff_ids` / `deferred_altegio_staff_ids` | мастер переведён в другую волну, его записи и targets выпали из проверки |
+| `--cutover-at` | более поздняя граница выкидывает ранние записи из окна |
+| `--horizon-days` | более узкий горизонт отбрасывает дальний край волны |
+| branch identity (`EASYWEEK_LOCATION_MAP`) | доказан другой филиал |
+| request schema версия | форма запроса не проходила canary |
+
+Отсюда правила, обязательные к соблюдению:
+
+- **`--cutover-at` нельзя опускать.** Для `reconcile`, `reconcile --final` и
+  `resolve-created` он обязателен и должен быть **точно тем же значением**, с
+  которым выполнялся apply. Раньше без него подставлялось текущее время, и
+  запись на 10:00, сверяемая в 12:00, выпадала из окна вместе со своим EasyWeek
+  target — удалённый target не мог провалить проверку, которая на него не
+  смотрела.
+- **`--horizon-days` должен совпадать** с тем, что использовал apply. Значение
+  по умолчанию (180) считается таким же явным выбором, как и указанное.
+- **Manifest и staff selector после apply менять нельзя**, пока эта волна не
+  доказана финальной reconciliation. Перевод уже перенесённого мастера в
+  `deferred_altegio_staff_ids` — это подмена волны, а не уточнение.
+- **Следующая волна — это новая identity.** Волна ногтевых мастеров получит свой
+  manifest со своим selector, свой canary и свой `wave_identity`; доказать её
+  targets аргументами первой волны невозможно, и наоборот.
+
+Проверяет совпадение сам инструмент: любая команда, продолжающая волну, до
+чтения источника и любого target ищет verified canary proof с точно совпадающим
+scope. Подтверждение — поле `scope` в отчёте (`scope_proven: true` и
+`wave_identity`). Несовпадение даёт ненулевой код и одну из причин:
+`migration_scope_missing`, `migration_scope_ambiguous`,
+`migration_scope_manifest_mismatch`, `migration_scope_staff_scope_mismatch`,
+`migration_scope_cutover_mismatch`, `migration_scope_horizon_mismatch`,
+`migration_scope_branch_mismatch`, `migration_scope_schema_mismatch`.
+
+---
+
 Все команды выполняются из корня проекта:
 
 ```bash
@@ -341,8 +384,10 @@ docker compose exec postgres psql -U "${POSTGRES_USER:-altegio}" -d "${POSTGRES_
 **Зачем:** перед bulk не должно оставаться ни одной записи с неизвестным исходом.
 
 Строка с известным target UUID повышается до `created` только после полного
-доказательства — успешного GET недостаточно. Поэтому команде передаётся
-`--customer-directory`: без него такие строки останутся `uncertain`.
+доказательства — успешного GET недостаточно. Поэтому команде передаются
+`--customer-directory` (без него такие строки останутся `uncertain`) и тот же
+`--cutover-at`, с которым выполнялся apply: без него команда откажется
+запускаться.
 
 ```bash
 docker compose --profile ops run --rm --build easyweek-booking-migration reconcile --manifest /migration/input/manifest.json --customer-directory /migration/input/easyweek-customers-after-import.csv --cutover-at 2026-09-01T00:00:00+02:00
@@ -382,7 +427,10 @@ EasyWeek по marker'у `altegio-migration:<company_id>:<record_id>` и назы
 миграция собиралась создать, и требует точного совпадения marker, филиала,
 мастера, услуги, клиента, времени начала, длительности и активного статуса.
 Поэтому команде нужны тот же `--customer-directory` (без него невозможно
-восстановить ожидаемого клиента) и тот же неизменный `--cutover-at`.
+восстановить ожидаемого клиента) и тот же неизменный `--cutover-at` — **ровно то
+значение, с которым выполнялся apply**. Инструмент дополнительно сверяет весь
+scope волны и откажет с `migration_scope_*`, если manifest, selector, cutover,
+горизонт, филиал или версия схемы отличаются от доказанных.
 
 ```bash
 docker compose --profile ops run --rm --build easyweek-booking-migration resolve-created --manifest /migration/input/manifest.json --customer-directory /migration/input/easyweek-customers-after-import.csv --cutover-at 2026-09-01T00:00:00+02:00 --resolve-company-id 758285 --resolve-record-id ID_ЗАПИСИ --target-uuid UUID_НАЙДЕННОГО_БРОНИРОВАНИЯ
@@ -430,6 +478,13 @@ created, already_migrated, blocked, failed, uncertain, source_changed, числ�
 ```bash
 docker compose --profile ops run --rm --build easyweek-booking-migration reconcile --final --manifest /migration/input/manifest.json --customer-directory /migration/input/easyweek-customers-after-import.csv --cutover-at 2026-09-01T00:00:00+02:00
 ```
+
+Перед чтением источника и любого target команда доказывает scope волны. В
+отчёте это раздел `scope`: `scope_proven: true` и `wave_identity`. Если manifest,
+selector, `--cutover-at`, `--horizon-days`, филиал или версия схемы отличаются от
+доказанных canary, команда завершается ненулевым кодом с `migration_scope_*` и
+**не** делает вывода о полноте — именно так закрывается обход, при котором
+смещённое окно или переведённый в deferred мастер убирали записи из проверки.
 
 PASS только при `completeness.passed = true`: `uncertain = 0`, `pending = 0`,
 `failed = 0`, `live_targets_proven = accounted_for`, и каждая активная запись

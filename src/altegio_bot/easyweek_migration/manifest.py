@@ -240,6 +240,27 @@ class MigrationManifest:
     def company_ids(self) -> tuple[int, ...]:
         return tuple(sorted(self.branches))
 
+    @property
+    def staff_scope_digest(self) -> str:
+        """Digest of the wave selector alone, across every branch.
+
+        Already covered by :attr:`digest`, and kept separately anyway so a
+        mismatch can name what actually moved. Moving a master from ``selected``
+        to ``deferred`` is the one manifest edit that hides her bookings — and
+        her EasyWeek targets — from the check meant to prove they landed, so it
+        deserves its own reason code rather than "the manifest changed".
+        """
+        canonical = [
+            {
+                "company": company_id,
+                "selected": sorted(branch.selected_staff_ids),
+                "deferred": sorted(branch.deferred_staff_ids),
+            }
+            for company_id, branch in sorted(self.branches.items())
+        ]
+        blob = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
     def branch(self, altegio_company_id: int) -> BranchMapping | None:
         return self.branches.get(altegio_company_id)
 

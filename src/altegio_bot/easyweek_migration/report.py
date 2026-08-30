@@ -99,6 +99,9 @@ class MigrationReport:
     # Per branch and per Altegio staff id: active bookings, and which wave
     # each master belongs to. The operator's cross-check against Altegio.
     wave: dict[str, Any] | None = None
+    # The durable identity of the migration wave this run is about, and
+    # whether the run's arguments actually describe it.
+    scope: dict[str, Any] | None = None
 
     # Source-side truth.
     source_records_fetched: Counter = field(default_factory=Counter)
@@ -171,6 +174,7 @@ class MigrationReport:
             "completeness": self.completeness,
             "source_identifiers": self.source_identifiers,
             "wave": self.wave,
+            "scope": self.scope,
             "mutations_attempted": self.mutations_attempted,
             "source": {
                 "provider": "altegio",
