@@ -45,12 +45,16 @@ from altegio_bot.easyweek_migration.canary import (
     CANARY_POST_UNCERTAIN,
     CANARY_READBACK_FAILED,
     CANARY_REPROOF_FAILED,
+    SCOPE_MISSING,
     CanaryBinding,
     CanaryVerdict,
+    RecoveryAdmission,
     ScopeVerdict,
     build_binding,
     find_licensing_proof,
     find_proven_scope,
+    find_recoverable_canary_attempt,
+    promote_proof_to_verified,
     record_proof,
 )
 from altegio_bot.easyweek_migration.classify import (
@@ -79,10 +83,12 @@ from altegio_bot.easyweek_migration.manifest import (
     MigrationManifest,
 )
 from altegio_bot.easyweek_migration.proof import (
+    GHOST_TARGET_STILL_ACTIVE,
     TARGET_SNAPSHOT_MISSING,
     TARGET_UUID_MISSING,
     expected_target_for,
     prove_live_target,
+    prove_target_inactive_or_absent,
 )
 from altegio_bot.easyweek_migration.report import (
     CREATED,
@@ -147,6 +153,9 @@ RESOLVE_ABSENT_UNCONFIRMED: Final = "absent_resolution_not_confirmed"
 # and the customer directory to rebuild which customer it was for.
 RESOLVE_SOURCE_UNPROVEN: Final = "source_could_not_be_reproved"
 RESOLVE_INPUTS_MISSING: Final = "resolution_inputs_missing"
+# Ledger-side refusals of the narrow canary recovery path.
+RECOVERY_RUN_MISMATCH: Final = "canary_recovery_run_id_mismatch"
+RECOVERY_ATTEMPTS_UNEXPECTED: Final = "canary_recovery_unexpected_attempt_count"
 
 # Final reconciliation, per row.
 COMPLETENESS_TARGET_UNPROVEN: Final = "target_not_proven_in_easyweek"
@@ -1068,6 +1077,12 @@ async def _prove_completeness(
     source_changed = 0
     blocked_now = 0
     targets_proven = 0
+    # Every ledger identity the active loop proved, so the ledger-side sweep
+    # below knows which rows it still has to account for.
+    proven_identities: set[tuple[int, int]] = set()
+    targets_checked = 0
+    terminal_targets = 0
+    active_ghosts = 0
 
     def _unaccount(decision: Decision, reason: str) -> None:
         entry = decision.as_safe_dict()
@@ -1125,6 +1140,57 @@ async def _prove_completeness(
 
         targets_proven += 1
         accounted += 1
+        proven_identities.add((decision.source_company_id, decision.source_record_id))
+
+    # -- the other direction: targets whose source is no longer active ------
+    # A migrated booking whose source was cancelled, deleted, rescheduled into
+    # the past or has simply vanished from Altegio classifies as SKIPPED, so the
+    # loop above never sees it — and the EasyWeek appointment we created for it
+    # kept standing while the reconciliation reported success. That is a real
+    # extra appointment in the new schedule that no customer made.
+    #
+    # So every row the ledger says we CREATED is accounted for from the ledger
+    # side too: either it was just proven active against an active source, or its
+    # target must be proven gone or finished.
+    #
+    # Read-only. A ghost is reported and blocks the PASS; cancelling it is a
+    # human decision, and this command never makes it.
+    ghosts: list[dict[str, Any]] = []
+    for (company_id, source_record_id), row in sorted(ledger_by_identity.items()):
+        if row.status != ledger_module.STATUS_CREATED:
+            continue
+        if (company_id, source_record_id) in proven_identities:
+            continue
+
+        entry = {
+            "source_company_id": company_id,
+            "source_record_id": source_record_id,
+            "target_booking_uuid": row.target_booking_uuid,
+        }
+        if write_client is None:
+            entry["completeness_reason"] = COMPLETENESS_TARGET_UNPROVEN
+            reasons[COMPLETENESS_TARGET_UNPROVEN] += 1
+            ghosts.append(entry)
+            continue
+
+        marker = ledger_module.migration_marker(source_company_id=company_id, source_record_id=source_record_id)
+        proof = await prove_target_inactive_or_absent(
+            write_client,
+            target_booking_uuid=row.target_booking_uuid,
+            marker=marker,
+        )
+        targets_checked += 1
+        if proof.proven:
+            # The source is gone and so is its booking. A consistent terminal
+            # state, not a gap.
+            terminal_targets += 1
+            continue
+
+        entry["completeness_reason"] = proof.reason
+        reasons[proof.reason] += 1
+        ghosts.append(entry)
+        if proof.reason == GHOST_TARGET_STILL_ACTIVE:
+            active_ghosts += 1
 
     unresolved = report.outcomes.get(ledger_module.STATUS_UNCERTAIN, 0) + report.outcomes.get(
         ledger_module.STATUS_PENDING, 0
@@ -1145,6 +1211,7 @@ async def _prove_completeness(
         and unresolved == 0
         and failed == 0
         and not unaccounted
+        and not ghosts
         and targets_proven == accounted
     )
 
@@ -1164,8 +1231,17 @@ async def _prove_completeness(
         "source_changed": source_changed,
         "uncertain_or_pending": unresolved,
         "failed": failed,
+        # Both directions of the check, so an operator can read at a glance what
+        # was looked at and what needs a hand.
+        "migration_targets_checked": targets_proven + targets_checked,
+        "inactive_source_targets_checked": targets_checked,
+        "inactive_source_targets_terminal": terminal_targets,
+        "ghost_targets_active": active_ghosts,
         "unaccounted_reason_codes": dict(sorted(reasons.items())),
         "unaccounted_rows": unaccounted,
+        # Source identities a human has to act on: a migrated booking whose
+        # source is gone but whose EasyWeek appointment is still standing.
+        "manual_action_required": ghosts,
     }
     if not passed:
         report.errors.append("final reconciliation did not prove cutover completeness")
@@ -1240,6 +1316,52 @@ async def _prove_uncertain_row_against_target(
     return True, RESOLVE_CONFIRMED, proof.live
 
 
+async def _admit_canary_recovery(
+    session_maker: async_sessionmaker[AsyncSession],
+    inputs: RunInputs,
+    *,
+    binding: CanaryBinding,
+    company_id: int,
+    record_id: int,
+) -> tuple[RecoveryAdmission, int | None]:
+    """May this row be resolved against its own unverified canary attempt?
+
+    The canary-side conditions live in :func:`find_recoverable_canary_attempt`;
+    the ledger-side ones are here, because this is where that data is:
+
+    * the row exists and is still unresolved (``uncertain`` / ``pending``);
+    * its ORIGIN run is the run that wrote the canary proof — a later run's
+      uncertain row may not ride on an earlier canary's attempt;
+    * exactly one mutation attempt was recorded. More than one would mean the
+      POST was sent again, which this design forbids and which would make "the
+      booking the operator found" ambiguous between attempts.
+
+    Admission is permission to *start* proving, never a substitute for the proof.
+    Nothing outside PostgreSQL is read here.
+    """
+    async with session_maker() as session:
+        admission, proof = await find_recoverable_canary_attempt(
+            session,
+            binding=binding,
+            source_company_id=company_id,
+            source_record_id=record_id,
+        )
+        if not admission.admitted or proof is None:
+            return admission, None
+
+        row = await ledger_module.get_row(session, source_company_id=company_id, source_record_id=record_id)
+        if row is None:
+            return RecoveryAdmission(admitted=False, reason=RESOLVE_ROW_MISSING), None
+        if row.status not in (ledger_module.STATUS_UNCERTAIN, ledger_module.STATUS_PENDING):
+            return RecoveryAdmission(admitted=False, reason=RESOLVE_NOT_UNCERTAIN), None
+        if row.run_id != proof.run_id:
+            return RecoveryAdmission(admitted=False, reason=RECOVERY_RUN_MISMATCH), None
+        if (row.attempts or 0) != 1:
+            return RecoveryAdmission(admitted=False, reason=RECOVERY_ATTEMPTS_UNEXPECTED), None
+
+        return admission, proof.id
+
+
 async def run_resolve_created(
     session_maker: async_sessionmaker[AsyncSession],
     inputs: RunInputs,
@@ -1275,12 +1397,40 @@ async def run_resolve_created(
     # whatever scope the operator happens to be holding today. A different
     # cutover would re-classify the source and rebuild a different "expected"
     # booking to compare the live one against.
-    scope, _binding = await _require_proven_scope(session_maker, inputs)
+    scope, binding = await _require_proven_scope(session_maker, inputs)
     report.scope = scope.as_safe_dict()
+
+    recoverable_proof_id: int | None = None
     if not scope.proven:
-        report.errors.append(scope.reason)
-        report.reasons[scope.reason] += 1
-        return report
+        # One exception, and only one: the canary whose own POST outcome is
+        # unknown. Its proof is the wave's first, it is unverified precisely
+        # because the outcome is unknown, and the ordinary gate would therefore
+        # refuse to resolve the row that would make it verified — a deadlock with
+        # no safe way out, since re-sending the POST could double-book a person.
+        #
+        # `_admit_canary_recovery` opens that door for that row alone. Every
+        # other use of an unverified proof stays shut.
+        if scope.reason != SCOPE_MISSING or binding is None:
+            report.errors.append(scope.reason)
+            report.reasons[scope.reason] += 1
+            return report
+
+        admission, recoverable_proof_id = await _admit_canary_recovery(
+            session_maker,
+            inputs,
+            binding=binding,
+            company_id=company_id,
+            record_id=record_id,
+        )
+        report.canary_recovery = admission.as_safe_dict()
+        if not admission.admitted:
+            # Neither an ordinary verified wave nor a recoverable canary attempt.
+            # Nothing outside PostgreSQL has been read.
+            report.errors.append(scope.reason)
+            report.reasons[scope.reason] += 1
+            report.errors.append(admission.reason)
+            report.reasons[admission.reason] += 1
+            return report
 
     async with session_maker() as session:
         row = await ledger_module.get_row(session, source_company_id=company_id, source_record_id=record_id)
@@ -1313,6 +1463,12 @@ async def run_resolve_created(
         report.errors.append(reason)
         return report
 
+    # One transaction for both verdicts. A canary recovery promotes the ledger row
+    # AND its proof, and the two must never disagree: a ledger row that says
+    # `created` beside a proof that still says "unknown outcome" would either
+    # keep the wave locked out of bulk forever or, worse, be read as an
+    # unverified wave that somehow produced bookings. Either both land or
+    # neither does.
     async with session_maker() as session:
         async with session.begin():
             await ledger_module.resolve_uncertain_as_created(
@@ -1323,6 +1479,13 @@ async def run_resolve_created(
                 target_booking_uuid=live.booking_uuid,
                 target_snapshot_fingerprint=live.fingerprint,
             )
+            if recoverable_proof_id is not None:
+                await promote_proof_to_verified(
+                    session,
+                    proof_id=recoverable_proof_id,
+                    target_booking_uuid=live.booking_uuid,
+                    target_snapshot=live,
+                )
 
     entry = dict(row_snapshot)
     entry["reconcile_outcome"] = RESOLVE_CONFIRMED

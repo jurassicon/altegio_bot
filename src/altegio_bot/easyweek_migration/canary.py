@@ -324,6 +324,13 @@ SCOPE_BRANCH_MISMATCH: Final = "migration_scope_branch_mismatch"
 SCOPE_SCHEMA_MISMATCH: Final = "migration_scope_schema_mismatch"
 SCOPE_PROVEN: Final = "migration_scope_proven"
 
+# The one narrow admission that lets an UNVERIFIED proof be used — and only
+# to recover the very row it belongs to. See `find_recoverable_canary_attempt`.
+RECOVERY_ADMITTED: Final = "canary_recovery_admitted"
+RECOVERY_NO_ATTEMPT: Final = "canary_recovery_no_matching_attempt"
+RECOVERY_NOT_UNCERTAIN_OUTCOME: Final = "canary_recovery_failure_not_an_unknown_outcome"
+RECOVERY_ALREADY_VERIFIED: Final = "canary_recovery_proof_already_verified"
+
 
 @dataclass(frozen=True)
 class ScopeVerdict:
@@ -450,3 +457,133 @@ async def find_proven_scope(session: AsyncSession, *, binding: CanaryBinding) ->
 
     only = next(iter(distinct.values()))
     return ScopeVerdict(proven=False, reason=_first_difference(only, binding), wave_identity=only.wave_identity)
+
+
+# ---------------------------------------------------------------------------
+# Recovering the one canary whose own outcome is unknown
+# ---------------------------------------------------------------------------
+# A deadlock, and a narrow key for it.
+#
+# When the canary POST times out (or breaks, or 5xx's, or returns a body with no
+# readable uuid) the ledger row is `uncertain` and the proof is stored with
+# `verified=false`. The booking may well exist — the operator can find it in the
+# EasyWeek UI by its migration marker — but `resolve-created` goes through the
+# scope gate, and that gate only accepts a *verified* proof. So the one row that
+# would produce the wave's first verified proof is the one row that cannot be
+# resolved, and re-sending the POST is forbidden because it may duplicate a real
+# customer's appointment.
+#
+# The key below is deliberately the narrowest thing that opens it: an unverified
+# proof may be used to recover **its own** uncertain ledger row, and nothing
+# else. Every other use of an unverified proof — licensing a bulk, passing a
+# final reconciliation, resolving a different row — stays exactly as closed as it
+# was. `find_proven_scope()` and `find_licensing_proof()` are not touched.
+
+# Only an outcome that is genuinely UNKNOWN qualifies. A 4xx proves the booking
+# was not created; a source re-proof failure means the POST never went; a
+# readback mismatch means something WAS created and it was wrong. None of those
+# is a booking waiting to be found, and none of them may take this path.
+_RECOVERABLE_FAILURE_REASONS: Final[frozenset[str]] = frozenset({CANARY_POST_UNCERTAIN})
+
+
+@dataclass(frozen=True)
+class RecoveryAdmission:
+    """Whether an unverified canary attempt may be used to recover its own row."""
+
+    admitted: bool
+    reason: str
+    proof_run_id: str | None = None
+
+    def as_safe_dict(self) -> dict[str, Any]:
+        return {"canary_recovery": self.reason, "canary_recovery_admitted": self.admitted}
+
+
+async def find_recoverable_canary_attempt(
+    session: AsyncSession,
+    *,
+    binding: CanaryBinding,
+    source_company_id: int,
+    source_record_id: int,
+) -> tuple[RecoveryAdmission, EasyWeekMigrationCanaryProof | None]:
+    """Is there an unverified canary attempt that THIS row is allowed to recover?
+
+    Admission requires, all at once:
+
+    * a proof row with ``verified=false``;
+    * a ``failure_reason`` that names an unknown mutation outcome — not a 4xx,
+      not a source re-proof failure, not a readback mismatch;
+    * the **exact** wave binding: manifest, staff scope, cutover, horizon, branch
+      identity and request schema all equal to the current run's;
+    * the proof's own source identity equal to the row being resolved.
+
+    The ledger-side conditions — the row exists, is unresolved, carries the same
+    origin run as the proof, and recorded exactly one mutation attempt — are the
+    caller's to check, because they are the caller's data. Admission here is
+    necessary, never sufficient.
+
+    Reads only, and reads nothing outside PostgreSQL: a refusal must not cost an
+    Altegio or EasyWeek request.
+    """
+    candidate = (
+        await session.execute(
+            select(EasyWeekMigrationCanaryProof)
+            .where(
+                EasyWeekMigrationCanaryProof.source_company_id == source_company_id,
+                EasyWeekMigrationCanaryProof.source_record_id == source_record_id,
+                EasyWeekMigrationCanaryProof.manifest_digest == binding.manifest_digest,
+                EasyWeekMigrationCanaryProof.staff_scope_digest == binding.staff_scope_digest,
+                EasyWeekMigrationCanaryProof.request_schema_version == binding.request_schema_version,
+                EasyWeekMigrationCanaryProof.cutover_at == binding.cutover_at,
+                EasyWeekMigrationCanaryProof.horizon_days == binding.horizon_days,
+                EasyWeekMigrationCanaryProof.branch_identity_digest == binding.branch_identity_digest,
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+
+    if candidate is None:
+        # No attempt with this exact binding and this exact source. Nothing to
+        # recover, and nothing to read outside the database to find out.
+        return RecoveryAdmission(admitted=False, reason=RECOVERY_NO_ATTEMPT), None
+    if candidate.verified:
+        # Already proven; the ordinary scope gate applies and this path is not
+        # needed. Saying so plainly beats silently doing nothing.
+        return RecoveryAdmission(admitted=False, reason=RECOVERY_ALREADY_VERIFIED), None
+    if candidate.failure_reason not in _RECOVERABLE_FAILURE_REASONS:
+        return RecoveryAdmission(admitted=False, reason=RECOVERY_NOT_UNCERTAIN_OUTCOME), None
+
+    return (
+        RecoveryAdmission(admitted=True, reason=RECOVERY_ADMITTED, proof_run_id=candidate.run_id),
+        candidate,
+    )
+
+
+async def promote_proof_to_verified(
+    session: AsyncSession,
+    *,
+    proof_id: int,
+    target_booking_uuid: str,
+    target_snapshot: TargetSnapshot,
+) -> None:
+    """Turn one attempted canary into a verified one, on completed evidence.
+
+    Called only after the full target proof has passed: the source was re-read
+    and re-classified, the live booking was fetched, and every write-critical
+    field matched. This function records that verdict; it never decides it.
+
+    The caller runs it inside the SAME transaction that flips the ledger row, so
+    the two can never disagree about whether the canary is proven.
+    """
+    row = (
+        await session.execute(select(EasyWeekMigrationCanaryProof).where(EasyWeekMigrationCanaryProof.id == proof_id))
+    ).scalar_one_or_none()
+    if row is None:
+        raise RuntimeError(f"canary proof vanished proof_id={proof_id}")
+
+    now = datetime.now(timezone.utc)
+    row.verified = True
+    row.failure_reason = None
+    row.target_booking_uuid = target_booking_uuid
+    row.target_snapshot_fingerprint = target_snapshot.fingerprint
+    row.verified_at = now
+    row.updated_at = now

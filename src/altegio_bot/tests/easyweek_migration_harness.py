@@ -168,6 +168,24 @@ def make_inputs(mode: str, **overrides) -> RunInputs:
     return RunInputs(**kwargs)
 
 
+def _planned_start_time(company_id: int, record_id: int) -> str:
+    """The UTC start the migration would have written for this source record.
+
+    Derived from the same local wall-clock parsing the classifier uses, so a
+    planted booking matches the expected target instead of a hardcoded instant.
+    """
+    from altegio_bot.easyweek_migration.cutover import parse_altegio_local_to_utc
+
+    known = {
+        KA_RECORD_A: record(id=KA_RECORD_A),
+        KA_RECORD_B: record(id=KA_RECORD_B, date="2026-09-11 10:00:00"),
+        RA_RECORD_A: record(id=RA_RECORD_A),
+    }
+    source_record = known.get(record_id)
+    assert source_record is not None, f"no planned start time known for record {record_id}"
+    return parse_altegio_local_to_utc(source_record["date"]).isoformat().replace("+00:00", "Z")
+
+
 class RecordingTransport:
     """Counts every request that actually left, and answers per source record."""
 
@@ -247,11 +265,16 @@ class RecordingTransport:
         self.bookings[uuid] = booking
         return uuid
 
-    def plant_booking(self, uuid: str, *, record_id: int) -> None:
+    def plant_booking(self, uuid: str, *, record_id: int, start_time: str | None = None) -> None:
         """Put a booking in EasyWeek that our ledger does not know about.
 
         Stands in for the real situation behind a timeout: the write landed, the
         response did not, and an operator later finds the booking by its marker.
+
+        The start time is derived from the source record by default, because a
+        planted booking has to look like the one the migration would have made —
+        a fixed value would only ever match one fixture record and would fail the
+        field comparison for every other.
         """
         company_id = RASTATT_COMPANY_ID if record_id == RA_RECORD_A else KARLSRUHE_COMPANY_ID
         branch = parse_manifest(manifest_json()).branch(company_id)
@@ -261,7 +284,7 @@ class RecordingTransport:
         self.bookings[uuid] = {
             "uuid": uuid,
             "comment": f"altegio-migration:{company_id}:{record_id}",
-            "start_time": "2026-09-11T08:00:00Z",
+            "start_time": start_time or _planned_start_time(company_id, record_id),
             "duration": 60,
             "location_uuid": branch.easyweek_location_uuid,
             "staff_uuid": branch.staff[RA_STAFF_ID if record_id == RA_RECORD_A else KA_STAFF_ID],

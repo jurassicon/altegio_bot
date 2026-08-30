@@ -33,6 +33,7 @@ from typing import Any, Final
 from altegio_bot.easyweek_client import EasyWeekError, EasyWeekNotFoundError
 from altegio_bot.easyweek_migration.classify import Decision
 from altegio_bot.easyweek_migration.target_snapshot import (
+    SNAPSHOT_NOT_ACTIVE,
     TargetSnapshot,
     TargetSnapshotError,
     compare,
@@ -151,3 +152,71 @@ async def prove_live_target(
         return TargetProof(proven=False, reason=TARGET_FINGERPRINT_MISMATCH, live=live)
 
     return TargetProof(proven=True, reason=TARGET_PROVEN, live=live)
+
+
+# ---------------------------------------------------------------------------
+# The other direction: a target that outlived its source
+# ---------------------------------------------------------------------------
+TARGET_INACTIVE_OR_ABSENT: Final = "target_inactive_or_absent"
+GHOST_TARGET_STILL_ACTIVE: Final = "source_inactive_target_still_active"
+GHOST_TARGET_UNREADABLE: Final = "source_inactive_target_unreadable"
+GHOST_TARGET_MALFORMED: Final = "source_inactive_target_malformed"
+GHOST_TARGET_UUID_MISSING: Final = "source_inactive_target_uuid_missing"
+
+
+async def prove_target_inactive_or_absent(
+    write_client: EasyWeekMigrationWriteClient,
+    *,
+    target_booking_uuid: str | None,
+    marker: str,
+) -> TargetProof:
+    """Prove a migrated booking is gone or finished — the mirror of the usual check.
+
+    The usual question is "is the target still the booking we created?". This is
+    the one that goes the other way: the source booking has since been cancelled,
+    deleted or has vanished from Altegio, so the appointment we created in
+    EasyWeek should not be standing any more.
+
+    Left unasked, that gap was silent. The completeness check only looked at
+    *active* source bookings, so a cancelled source dropped out of the loop and
+    took its EasyWeek target with it — an extra appointment a customer never
+    made, sitting in the new schedule, while the reconciliation reported success.
+
+    What counts as consistent:
+
+    * **404** — the booking is not there. Proven absent.
+    * **cancelled or completed** — its life has ended. Proven inactive.
+
+    What does not:
+
+    * an active booking — that is the ghost;
+    * an unreadable or malformed response — "we could not tell" is not "it is
+      gone", and this is exactly the case where guessing leaves a real customer
+      with an appointment nobody expects.
+
+    Read-only. Reconciliation never cancels anything: it reports the ghost and
+    refuses to pass, and a human decides what to do about it.
+    """
+    if not target_booking_uuid:
+        return TargetProof(proven=False, reason=GHOST_TARGET_UUID_MISSING)
+
+    try:
+        payload = await write_client.get_booking(target_booking_uuid)
+    except EasyWeekNotFoundError:
+        # Proven absent: nothing is standing.
+        return TargetProof(proven=True, reason=TARGET_INACTIVE_OR_ABSENT)
+    except EasyWeekError:
+        return TargetProof(proven=False, reason=GHOST_TARGET_UNREADABLE)
+
+    try:
+        live = project_target(payload, expected_marker=marker)
+    except TargetSnapshotError as exc:
+        if exc.reason == SNAPSHOT_NOT_ACTIVE:
+            # Cancelled or completed, and the marker still proves it is ours.
+            return TargetProof(proven=True, reason=TARGET_INACTIVE_OR_ABSENT)
+        # A rewritten marker or a missing field. We cannot say this booking is
+        # finished, so we do not say it.
+        return TargetProof(proven=False, reason=f"{GHOST_TARGET_MALFORMED}:{exc.reason}")
+
+    # It read cleanly, which means it is active. That is the ghost.
+    return TargetProof(proven=False, reason=GHOST_TARGET_STILL_ACTIVE, live=live)

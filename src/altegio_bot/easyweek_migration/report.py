@@ -102,6 +102,9 @@ class MigrationReport:
     # The durable identity of the migration wave this run is about, and
     # whether the run's arguments actually describe it.
     scope: dict[str, Any] | None = None
+    # Set only when the narrow canary-recovery path was consulted: whether an
+    # unverified canary attempt was allowed to recover its own row.
+    canary_recovery: dict[str, Any] | None = None
 
     # Source-side truth.
     source_records_fetched: Counter = field(default_factory=Counter)
@@ -175,6 +178,7 @@ class MigrationReport:
             "source_identifiers": self.source_identifiers,
             "wave": self.wave,
             "scope": self.scope,
+            "canary_recovery": self.canary_recovery,
             "mutations_attempted": self.mutations_attempted,
             "source": {
                 "provider": "altegio",
