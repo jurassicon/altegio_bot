@@ -105,17 +105,15 @@ def wave_b_manifest():
         str(KA_STAFF_ID): branch["staff"][str(KA_STAFF_ID)],
         str(KA_DEFERRED_STAFF_ID): DEFERRED_STAFF_UUID,
     }
-    # Rastatt migrated with wave A; wave B leaves it alone entirely.
+    # Rastatt migrated with wave A and has nothing new, so wave B selects nobody
+    # there — and keeps the branch, its mappings and its baselines as pure
+    # cumulative context. Deleting it would be the one thing that must not work:
+    # its live targets would vanish from the guard and the reconciliation. Wave B
+    # is still a wave because Karlsruhe selects somebody.
     payload["branches"][str(RASTATT_COMPANY_ID)]["deferred_altegio_staff_ids"] = payload["branches"][
         str(RASTATT_COMPANY_ID)
     ]["selected_altegio_staff_ids"]
     payload["branches"][str(RASTATT_COMPANY_ID)]["selected_altegio_staff_ids"] = []
-    manifest = parse_manifest(json.dumps(payload))
-    if manifest.valid:
-        return manifest
-    # A wave that selects nobody in a branch is refused, so Rastatt keeps its
-    # own selection and simply has nothing left to migrate.
-    payload["branches"][str(RASTATT_COMPANY_ID)] = json.loads(manifest_json())["branches"][str(RASTATT_COMPANY_ID)]
     manifest = parse_manifest(json.dumps(payload))
     assert manifest.valid, manifest.reason
     return manifest
@@ -368,10 +366,10 @@ async def test_wave_a_live_targets_are_not_ghosts_of_wave_b(session_local, sourc
 
     assert verdict["ghost_targets_active"] == 0
     assert verdict["manual_action_required"] == []
-    # Not merely skipped: wave A's two Karlsruhe targets were fetched and proven
-    # by the sweep. Rastatt is still selected in wave B, so its row goes through
-    # the ordinary active loop instead.
-    assert verdict["earlier_wave_targets_proven"] == 2
+    # Not merely skipped: all three of wave A's targets were fetched and proven by
+    # the sweep — the two Karlsruhe ones whose master wave B defers, and the
+    # Rastatt one whose whole branch wave B carries as cumulative context.
+    assert verdict["earlier_wave_targets_proven"] == 3
     assert verdict["live_targets_proven"] >= 1
     assert verdict["passed"] is True
 
@@ -472,7 +470,7 @@ async def test_an_unreadable_earlier_wave_source_fails_closed(session_local, sou
     verdict = (await final_b(session_local, transport)).as_safe_dict()["completeness"]
 
     assert verdict["passed"] is False
-    assert verdict["unaccounted_reason_codes"]["migrated_source_lifecycle_unprovable"] == 2
+    assert verdict["unaccounted_reason_codes"]["migrated_source_lifecycle_unprovable"] == 3
 
 
 async def test_the_multi_wave_reconciliation_never_mutates(session_local, source):

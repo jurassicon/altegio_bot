@@ -59,6 +59,22 @@ fetched.
 
   Both lists are part of the manifest digest, so moving a master between waves
   invalidates the verified dry-run and the canary proof.
+- **`selected_altegio_staff_ids` may be empty for one branch, never for all of
+  them.** From the second wave on, a branch can have nothing new to migrate and
+  still be obliged to stay in the file, because its earlier waves' bookings are
+  alive and every later wave re-proves them. Such a branch is pure cumulative
+  context: its mappings and catalogue baselines are read, none of its masters are
+  migrated. A file where nobody anywhere is selected is still not a wave, and is
+  still refused with `manifest_staff_scope_empty`.
+
+  The rule used to be per-branch, and that was a hole rather than strictness. An
+  operator with nothing new in Rastatt could not write `"selected": []` there, so
+  the only routes to a valid file were to **delete the Rastatt branch** — which
+  took its live rows out of the cumulative guard and out of the final
+  reconciliation together, letting a wave pass without ever looking at Rastatt —
+  or to **re-select an already-migrated master**, which quietly drags her new
+  bookings into this wave. Neither is a workaround to reach for now that
+  `"selected": []` exists.
 - **The mapping is cumulative; the selector is not.** `staff` and `services` hold
   every master and service mapped by *any* wave so far. The selector holds only
   the composition of the wave being run now. Those are different questions, and
@@ -68,12 +84,14 @@ fetched.
   in `deferred_altegio_staff_ids` is not migrated again, her already-migrated
   bookings stay `already_migrated`, and her new ones are skipped with
   `staff_deferred_to_later_wave`. The example file shows exactly this shape —
-  `1000002` is deferred and mapped, because an earlier wave migrated her.
+  `1000002` is deferred and mapped, because an earlier wave migrated her, and the
+  whole Rastatt branch selects nobody while keeping its master, its mapping and
+  its catalogue baseline.
 
   And a mapping may not be dropped once it has been used: while a master has a
   live source booking with a `created` ledger row, her staff mapping, that
-  booking's service mapping and its catalogue baseline must stay in every later
-  manifest, unchanged, until that row is finished. The final reconciliation of
+  booking's service mapping, its catalogue baseline **and her whole branch** must
+  stay in every later manifest, unchanged, until that row is finished. The final reconciliation of
   *every* later wave re-reads those live bookings with the current manifest, so a
   manifest that lost the mapping turns an untouched, perfectly healthy booking
   into `migrated_source_lifecycle_unprovable`. Checked before the first mutation
@@ -116,10 +134,18 @@ fetched.
    active bookings per branch and per staff id, split into selected, deferred
    and unknown.
 6. From wave 2 on, the manifest is the previous wave's file plus the new wave's
-   mappings: copy it, change the selector, **add**, never delete. The dry-run
-   report's `previous_wave_context` says whether it still proves the earlier
-   waves' live rows; `proven: false` names each missing Altegio staff/service id
-   and blocks the canary before its first POST.
+   mappings: copy it, change the selector, **add**, never delete — and that
+   includes branches. A branch with no new masters this wave stays, with
+   `"selected_altegio_staff_ids": []` and every previously migrated master of its
+   own in `deferred_altegio_staff_ids`. The dry-run report's
+   `previous_wave_context` says whether the file still proves the earlier waves'
+   live rows; `proven: false` names each missing Altegio staff/service id, or
+   reports `previous_wave_branch_missing` for a deleted branch, and blocks the
+   canary before its first POST.
+
+   The guard and the final reconciliation both read the ledger for **both**
+   migrating branches whatever the manifest names, so deleting a branch narrows
+   nothing.
 
 Never copy an EasyWeek customer export into this file. Customers are resolved at
 run time from a separate, git-ignored export passed with `--customer-directory`,

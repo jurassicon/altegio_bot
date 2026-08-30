@@ -198,6 +198,89 @@ class LedgerView:
     source_fingerprint: str
 
 
+@dataclass(frozen=True)
+class SourceLiveness:
+    """Is this Altegio record still a live booking in the future?
+
+    Extracted so that there is exactly **one** implementation of "cancelled,
+    deleted, finished, in the past". Two callers ask it, and they ask for
+    different reasons:
+
+    * :func:`classify_record`, deciding whether a booking migrates at all; and
+    * the lifecycle re-proof, deciding what became of a booking that was already
+      migrated — including one whose branch the current manifest no longer
+      names, where the classifier's own first question ("is this company in the
+      manifest?") would otherwise hide the answer.
+
+    A second copy of these rules in the second caller would be a second way of
+    being wrong about whether a customer still has an appointment.
+
+    ``outcome`` is ``None`` exactly when the booking is live and starts at or
+    after the cutover; then ``starts_at_utc`` carries the parsed instant.
+    ``BLOCKED`` means the record could not be read well enough to say — an
+    unrecognised status, an unparseable time — and is never "still alive".
+    """
+
+    outcome: str | None = None
+    reason: str | None = None
+    starts_at_utc: datetime | None = None
+
+    @property
+    def alive(self) -> bool:
+        return self.outcome is None
+
+
+def classify_source_liveness(record: dict[str, Any], *, cutover: Cutover) -> SourceLiveness:
+    """Whether one source record is still a future, uncancelled, unfinished booking.
+
+    Pure; performs no I/O and consults neither the manifest nor the wave
+    selector. Deliberately independent of both: a master moved to a later wave,
+    or a branch left out of this wave's manifest, has not thereby cancelled
+    anybody's appointment.
+    """
+    if bool(record.get("deleted")):
+        return SourceLiveness(outcome=SKIPPED, reason=SKIP_DELETED)
+
+    confirmed = record.get("confirmed")
+    if confirmed is not None:
+        confirmed_int = _exact_int(confirmed)
+        if confirmed_int is None:
+            return SourceLiveness(outcome=BLOCKED, reason=BLOCK_STATUS_UNRECOGNISED)
+        if confirmed_int == 0:
+            return SourceLiveness(outcome=SKIPPED, reason=SKIP_CANCELED)
+
+    # ``attendance`` is absent on a plain future booking and present once the
+    # visit resolves. Present-and-terminal is skipped; present-and-unrecognised
+    # is BLOCKED rather than assumed live — an unknown status is exactly the case
+    # where guessing creates a booking for a visit that already happened.
+    attendance = record.get("attendance")
+    if attendance is not None:
+        attendance_int = _exact_int(attendance)
+        if attendance_int is None:
+            return SourceLiveness(outcome=BLOCKED, reason=BLOCK_STATUS_UNRECOGNISED)
+        if attendance_int not in ACTIVE_ATTENDANCE:
+            return SourceLiveness(outcome=SKIPPED, reason=SKIP_COMPLETED)
+
+    visit_attendance = record.get("visit_attendance")
+    if visit_attendance is not None:
+        visit_int = _exact_int(visit_attendance)
+        if visit_int is None:
+            return SourceLiveness(outcome=BLOCKED, reason=BLOCK_STATUS_UNRECOGNISED)
+        if visit_int not in ACTIVE_ATTENDANCE:
+            return SourceLiveness(outcome=SKIPPED, reason=SKIP_COMPLETED)
+
+    raw_start = record.get("date") if record.get("date") else record.get("datetime")
+    try:
+        starts_at = parse_altegio_local_to_utc(raw_start)
+    except LocalTimeError as exc:
+        return SourceLiveness(outcome=BLOCKED, reason=exc.reason)
+
+    if starts_at < cutover.at:
+        return SourceLiveness(outcome=SKIPPED, reason=SKIP_PAST)
+
+    return SourceLiveness(starts_at_utc=starts_at)
+
+
 def classify_record(
     record: dict[str, Any],
     *,
@@ -234,47 +317,15 @@ def classify_record(
     def _block(reason: str) -> Decision:
         return Decision(outcome=BLOCKED, reason=reason, source_company_id=company_id, source_record_id=record_id)
 
-    # -- 1. is the source booking still alive? ------------------------------
-    if bool(record.get("deleted")):
-        return _skip(SKIP_DELETED)
-
-    confirmed = record.get("confirmed")
-    if confirmed is not None:
-        confirmed_int = _exact_int(confirmed)
-        if confirmed_int is None:
-            return _block(BLOCK_STATUS_UNRECOGNISED)
-        if confirmed_int == 0:
-            return _skip(SKIP_CANCELED)
-
-    # ``attendance`` is absent on a plain future booking and present once the
-    # visit resolves. Present-and-terminal is skipped; present-and-unrecognised
-    # is BLOCKED rather than assumed live — an unknown status is exactly the case
-    # where guessing creates a booking for a visit that already happened.
-    attendance = record.get("attendance")
-    if attendance is not None:
-        attendance_int = _exact_int(attendance)
-        if attendance_int is None:
-            return _block(BLOCK_STATUS_UNRECOGNISED)
-        if attendance_int not in ACTIVE_ATTENDANCE:
-            return _skip(SKIP_COMPLETED)
-
-    visit_attendance = record.get("visit_attendance")
-    if visit_attendance is not None:
-        visit_int = _exact_int(visit_attendance)
-        if visit_int is None:
-            return _block(BLOCK_STATUS_UNRECOGNISED)
-        if visit_int not in ACTIVE_ATTENDANCE:
-            return _skip(SKIP_COMPLETED)
-
-    # -- 2. when does it start? --------------------------------------------
-    raw_start = record.get("date") if record.get("date") else record.get("datetime")
-    try:
-        starts_at = parse_altegio_local_to_utc(raw_start)
-    except LocalTimeError as exc:
-        return _block(exc.reason)
-
-    if starts_at < cutover.at:
-        return _skip(SKIP_PAST)
+    # -- 1-2. is the source booking still alive, and still in the future? ----
+    # The rules themselves live in `classify_source_liveness`, because the
+    # lifecycle re-proof needs the same answer to a different question.
+    liveness = classify_source_liveness(record, cutover=cutover)
+    if not liveness.alive:
+        assert liveness.reason is not None
+        return _block(liveness.reason) if liveness.outcome == BLOCKED else _skip(liveness.reason)
+    assert liveness.starts_at_utc is not None
+    starts_at = liveness.starts_at_utc
 
     # -- 2a. is this master part of THIS wave? -----------------------------
     # Asked before anything about the service, the price or the mapping, because

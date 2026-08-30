@@ -48,6 +48,15 @@ So every branch names both sets by Altegio staff id:
 A master seen in the window who is in neither set is unknown, and blocks. Names
 are never runtime identity — they may appear in an operator's notes, never here.
 
+``selected_altegio_staff_ids`` may be **empty for one branch**, and must not be
+empty for all of them at once. That asymmetry is the cumulative contract applied
+to branches: from the second wave on, a branch can have nothing new to migrate
+and still be obliged to stay in the file, because its earlier waves' bookings are
+alive and every later wave re-proves them. A branch with an empty selector is
+pure cumulative context — its mappings and catalogue baselines are still read,
+none of its masters are migrated. A file where nobody anywhere is selected is
+still not a wave.
+
 The manifest holds ids only. It carries no customer data of any kind, which is
 why it is the one migration input that may safely live in Git.
 """
@@ -563,12 +572,6 @@ def _parse(raw: object, *, allow_empty_mappings: bool) -> MigrationManifest:
         if selected - set(staff):
             return _invalid(INVALID_SELECTED_STAFF_UNMAPPED)
 
-        # An empty selector is an unfinished manifest for every writing mode:
-        # a wave that migrates nobody is not a wave. `inventory` runs before the
-        # selector exists, which is exactly what it is for.
-        if not allow_empty_mappings and not selected:
-            return _invalid(INVALID_STAFF_SCOPE_EMPTY)
-
         branches[company_id] = BranchMapping(
             altegio_company_id=company_id,
             easyweek_location_id=location_id,
@@ -580,6 +583,24 @@ def _parse(raw: object, *, allow_empty_mappings: bool) -> MigrationManifest:
         )
         seen_location_ids.add(location_id)
         seen_location_uuids.add(location_uuid)
+
+    # An empty selector is an unfinished manifest for every writing mode: a wave
+    # that migrates nobody is not a wave. The rule is about the WHOLE file, not
+    # each branch, because from the second wave on a branch may legitimately have
+    # no new masters and still have to be here.
+    #
+    # It was per-branch once, and that was the hole: an operator with nothing new
+    # in Rastatt could not write `selected: []`, so the only way to produce a
+    # valid file was to delete the Rastatt branch entirely — taking its already
+    # migrated bookings out of the cumulative guard and out of the final
+    # reconciliation with it. Re-selecting an already-migrated master just to
+    # satisfy the parser was the other way out, and it silently drags her NEW
+    # bookings into this wave. Both are worse than the rule they worked around.
+    #
+    # `inventory` runs before the selector exists, which is exactly what it is
+    # for, so it is exempt.
+    if not allow_empty_mappings and not any(branch.selected_staff_ids for branch in branches.values()):
+        return _invalid(INVALID_STAFF_SCOPE_EMPTY)
 
     return MigrationManifest(
         valid=True,

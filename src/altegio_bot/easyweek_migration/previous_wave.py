@@ -29,10 +29,11 @@ bulk apply both pass through.
 
 What it proves
 --------------
-For every ``created`` ledger row that is **not** part of the current wave's own
-plan — those are checked the ordinary way, and counting them twice would only
-turn one problem into two report entries — and whose source booking is still
-live, the current manifest and customer directory must still be able to:
+For every ``created`` ledger row of **either** migrating branch that is not part
+of the current wave's own plan — those are checked the ordinary way, and counting
+them twice would only turn one problem into two report entries — and whose source
+booking is still live, the current manifest and customer directory must still be
+able to:
 
 * prove the source identity,
 * apply the stored staff mapping,
@@ -40,6 +41,14 @@ live, the current manifest and customer directory must still be able to:
 * apply the stored catalogue price/duration baseline,
 * resolve the customer through the full directory export,
 * recompute the same source fingerprint the ledger recorded.
+
+The branch itself is part of that, and it is the half that was missing. A wave
+with nothing new in Rastatt could not write ``selected: []`` while the rule was
+per-branch, so the only way to a valid file was to delete the Rastatt branch —
+which took its live rows out of this check and out of the final reconciliation
+together. The parser now allows an empty selector on one branch, and this sweep
+reads both branches regardless of what the manifest names, so neither deleting a
+branch nor re-selecting an already-migrated master is a way through.
 
 That is exactly the work the final reconciliation will demand later, which is
 why it is done with the same :func:`reclassify_source_lifecycle` rather than a
@@ -77,6 +86,7 @@ from altegio_bot.easyweek_migration.classify import (
     BLOCK_SERVICE_MAPPING_MISSING,
     BLOCK_STAFF_MAPPING_MISSING,
     BLOCK_STAFF_NOT_IN_WAVE,
+    SKIP_FOREIGN_COMPANY,
     SKIPPED,
     Decision,
 )
@@ -87,7 +97,7 @@ from altegio_bot.easyweek_migration.customers import (
     CustomerDirectory,
 )
 from altegio_bot.easyweek_migration.cutover import Cutover
-from altegio_bot.easyweek_migration.manifest import MigrationManifest
+from altegio_bot.easyweek_migration.manifest import MIGRATABLE_COMPANY_IDS, MigrationManifest
 from altegio_bot.easyweek_migration.reproof import (
     LIFECYCLE_INACTIVE_OR_CHANGED,
     LIFECYCLE_UNPROVABLE,
@@ -103,6 +113,11 @@ PREV_SERVICE_MAPPING_MISSING: Final = "previous_wave_service_mapping_missing"
 PREV_CATALOGUE_BASELINE_MISSING: Final = "previous_wave_catalogue_baseline_missing"
 PREV_CUSTOMER_UNRESOLVED: Final = "previous_wave_customer_unresolved"
 PREV_SOURCE_FINGERPRINT_MISMATCH: Final = "previous_wave_source_fingerprint_mismatch"
+# A whole branch was dropped from this wave's manifest while its earlier wave's
+# bookings are still live. Deliberately its own code: it is not a foreign
+# company, not an inactive source, not a ghost target and not an ordinary
+# mapping gap — it is the cumulative contract broken one level up, at the branch.
+PREV_BRANCH_MISSING: Final = "previous_wave_branch_missing"
 # Everything else that left the row unprovable — an unreadable source, an
 # identity that no longer matches. Kept as one code with the classifier's own
 # detail alongside, rather than mirroring every reason the classifier has.
@@ -127,6 +142,10 @@ _REASON_TO_CODE: Final[dict[str, str]] = {
     CUSTOMER_NOT_FOUND: PREV_CUSTOMER_UNRESOLVED,
     CUSTOMER_AMBIGUOUS: PREV_CUSTOMER_UNRESOLVED,
     CUSTOMER_PHONE_UNUSABLE: PREV_CUSTOMER_UNRESOLVED,
+    # The classifier's word for "this company is not in the manifest". Rows are
+    # only ever read for the two migrating branches, so here it can mean exactly
+    # one thing: the operator deleted a branch that still owes live rows.
+    SKIP_FOREIGN_COMPANY: PREV_BRANCH_MISSING,
 }
 
 
@@ -173,7 +192,12 @@ async def prove_previous_wave_context(
         (decision.source_company_id, decision.source_record_id) for decision in decisions if decision.outcome != SKIPPED
     }
 
-    rows = await ledger_module.all_rows(session, company_ids=manifest.company_ids)
+    # Every migrating branch, NOT just the ones this manifest happens to name.
+    # Scoping the sweep to `manifest.company_ids` made the guard trivially
+    # bypassable: deleting a branch from the file deleted its live rows from the
+    # check, and a wave could then canary, apply and pass a final reconciliation
+    # that had never looked at the other branch at all.
+    rows = await ledger_module.all_rows(session, company_ids=tuple(sorted(MIGRATABLE_COMPANY_IDS)))
     failures: list[dict[str, Any]] = []
     checked = 0
 

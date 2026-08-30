@@ -42,6 +42,7 @@ from altegio_bot.easyweek_migration.classify import (
     SKIP_PAST,
     Decision,
     classify_record,
+    classify_source_liveness,
 )
 from altegio_bot.easyweek_migration.customers import CustomerDirectory
 from altegio_bot.easyweek_migration.cutover import Cutover
@@ -363,6 +364,27 @@ async def reclassify_source_lifecycle(
 
     staff_id, service_id = _source_ids(live)
 
+    def _result(state: str, detail: str | None = None) -> LifecycleResult:
+        return LifecycleResult(state=state, detail=detail, altegio_staff_id=staff_id, altegio_service_id=service_id)
+
+    # Liveness FIRST, before anything that depends on the manifest.
+    #
+    # `classify_record` asks "is this company in the manifest?" before it asks
+    # anything about the booking, which is right for planning and wrong here: a
+    # branch dropped from a later wave's manifest would make every one of its
+    # migrated bookings — cancelled ones included — indistinguishable from each
+    # other, all of them `foreign_company`. Whether a customer still has an
+    # appointment is a fact about Altegio, not about which branches somebody
+    # listed in this wave's file, so it is established from the source alone,
+    # with the same shared rules the classifier uses.
+    liveness = classify_source_liveness(live, cutover=cutover)
+    if liveness.reason in _LIFECYCLE_ENDED_REASONS:
+        return _result(LIFECYCLE_INACTIVE_OR_CHANGED, liveness.reason)
+    if not liveness.alive:
+        # An unrecognised status or an unreadable start time. Fail closed: we
+        # could not tell whether the appointment stands.
+        return _result(LIFECYCLE_UNPROVABLE, liveness.reason)
+
     fresh = classify_record(
         live,
         company_id=company_id,
@@ -373,9 +395,6 @@ async def reclassify_source_lifecycle(
         ignore_wave_scope=True,
     )
 
-    def _result(state: str, detail: str | None = None) -> LifecycleResult:
-        return LifecycleResult(state=state, detail=detail, altegio_staff_id=staff_id, altegio_service_id=service_id)
-
     if fresh.outcome == READY:
         if fresh.source_fingerprint == expected_fingerprint:
             return _result(LIFECYCLE_ACTIVE_UNCHANGED)
@@ -384,9 +403,9 @@ async def reclassify_source_lifecycle(
         # describes an appointment that no longer exists in that form.
         return _result(LIFECYCLE_INACTIVE_OR_CHANGED, "fingerprint_changed")
 
-    if fresh.reason in _LIFECYCLE_ENDED_REASONS:
-        return _result(LIFECYCLE_INACTIVE_OR_CHANGED, fresh.reason)
-
-    # A mapping that has since been removed, a price we can no longer read: we
-    # cannot say whether the appointment still stands, so we do not say.
+    # A mapping that has since been removed, a price we can no longer read, a
+    # whole branch dropped from this wave's manifest (`foreign_company`): the
+    # booking is demonstrably still live, so this is a gap in the manifest, not
+    # evidence about the appointment. We cannot say what became of it, so we do
+    # not say. Liveness was settled above, so no ended reason reaches here.
     return _result(LIFECYCLE_UNPROVABLE, fresh.reason)

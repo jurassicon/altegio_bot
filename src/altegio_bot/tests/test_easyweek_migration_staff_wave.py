@@ -271,8 +271,12 @@ def test_the_plan_digest_moves_when_the_wave_changes(directory):
         KA_DEFERRED_STAFF_ID,
     ]
     narrow = parse_manifest(json.dumps(narrow_text))
-    # An empty wave is refused outright, which is itself the protection.
-    assert not narrow.valid
+    # One branch may select nobody — Rastatt still does, so this is a real wave.
+    # The protection is not refusal, it is that the file is a DIFFERENT file: its
+    # digest moves, and the verified dry-run of the wide wave stops matching.
+    assert narrow.valid, narrow.reason
+    assert narrow.digest != wide.digest
+    assert narrow.staff_scope_digest != wide.staff_scope_digest
 
     decisions = [
         classify_record(

@@ -76,6 +76,7 @@ from altegio_bot.easyweek_migration.gates import (
     require_apply_gate,
 )
 from altegio_bot.easyweek_migration.manifest import (
+    MIGRATABLE_COMPANY_IDS,
     STAFF_DEFERRED,
     STAFF_SELECTED,
     STAFF_UNKNOWN,
@@ -1056,8 +1057,12 @@ async def run_reconcile(
         report.reasons[RECONCILE_CONFIRMED_CREATED] += 1
         report.created_rows.append(entry)
 
+    # Both migrating branches, whatever this manifest names. A branch left out of
+    # the file must not be a way to narrow the reconciliation: its live targets
+    # are exactly the ones nobody would otherwise look at, and a PASS earned by
+    # not asking is the failure mode this whole command exists to prevent.
     async with session_maker() as session:
-        ledger_rows = await ledger_module.all_rows(session, company_ids=inputs.manifest.company_ids)
+        ledger_rows = await ledger_module.all_rows(session, company_ids=tuple(sorted(MIGRATABLE_COMPANY_IDS)))
     by_identity = {(row.source_company_id, row.source_record_id): row for row in ledger_rows}
 
     for row in ledger_rows:

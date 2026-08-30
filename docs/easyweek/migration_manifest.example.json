@@ -32,10 +32,10 @@
       "altegio_company_id": 1271200,
       "easyweek_location_id": 100002,
       "easyweek_location_uuid": "00000000-0000-4000-8000-000000000002",
-      "selected_altegio_staff_ids": [
+      "selected_altegio_staff_ids": [],
+      "deferred_altegio_staff_ids": [
         1100001
       ],
-      "deferred_altegio_staff_ids": [],
       "staff": {
         "1100001": "00000000-0000-4000-8000-000000000031"
       },

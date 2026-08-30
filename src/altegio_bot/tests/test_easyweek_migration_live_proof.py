@@ -647,6 +647,7 @@ async def test_final_reconciliation_fails_while_an_unknown_master_has_bookings(s
 
 async def test_the_source_reproof_uses_the_same_wave_selector(session_local, source):
     """A master deferred mid-run must not be written by a plan that predates it."""
+    from altegio_bot.easyweek_migration.gates import ApplyGateError
     from altegio_bot.easyweek_migration.manifest import parse_manifest
     from altegio_bot.tests.test_easyweek_migration_planning import KA_STAFF_ID
 
@@ -654,16 +655,28 @@ async def test_the_source_reproof_uses_the_same_wave_selector(session_local, sou
     transport = RecordingTransport()
     await license_bulk(session_local, transport)
     plan = await run_dry_run(session_local, manifest=wide)
+    posts_before = transport.mutations
 
     # The operator moves the master into the later wave between plan and apply.
+    # Karlsruhe now selects nobody, which is allowed — Rastatt still does, and a
+    # branch kept as cumulative context is the point of the rule. So the file is
+    # valid, and the protection has to come from the plan digest instead.
     narrowed = json.loads(_wave_manifest())
     branch = narrowed["branches"][str(KARLSRUHE_COMPANY_ID)]
     branch["selected_altegio_staff_ids"] = []
     branch["deferred_altegio_staff_ids"] = [KA_STAFF_ID]
-    # An empty wave is refused outright — which is the protection itself.
-    assert not parse_manifest(json.dumps(narrowed)).valid
-    # And the digest of the wider plan no longer opens anything else.
-    assert plan.plan_digest
+    narrow = parse_manifest(json.dumps(narrowed))
+    assert narrow.valid, narrow.reason
+
+    async with make_write_client(transport) as client:
+        with pytest.raises(ApplyGateError) as exc:
+            await run_apply(
+                session_local,
+                make_inputs(MODE_APPLY, manifest=narrow, verified_dry_run_id=plan.plan_digest),
+                write_client=client,
+            )
+    assert "verified_dry_run_id_mismatch" in exc.value.failures
+    assert transport.mutations == posts_before
 
 
 # ---------------------------------------------------------------------------
