@@ -45,7 +45,6 @@ from altegio_bot.easyweek_migration.canary import (
     CANARY_POST_UNCERTAIN,
     CANARY_READBACK_FAILED,
     CANARY_REPROOF_FAILED,
-    SCOPE_MISSING,
     CanaryBinding,
     CanaryVerdict,
     RecoveryAdmission,
@@ -98,7 +97,10 @@ from altegio_bot.easyweek_migration.report import (
     plan_digest,
 )
 from altegio_bot.easyweek_migration.reproof import (
+    LIFECYCLE_ACTIVE_UNCHANGED,
+    LIFECYCLE_UNPROVABLE,
     reclassify_source_for_resolution,
+    reclassify_source_lifecycle,
     reprove_source_booking,
 )
 from altegio_bot.easyweek_migration.target_snapshot import (
@@ -161,6 +163,8 @@ RECOVERY_ATTEMPTS_UNEXPECTED: Final = "canary_recovery_unexpected_attempt_count"
 COMPLETENESS_TARGET_UNPROVEN: Final = "target_not_proven_in_easyweek"
 COMPLETENESS_NO_LEDGER_ROW: Final = "no_ledger_row_for_active_booking"
 COMPLETENESS_LEDGER_NOT_CREATED: Final = "ledger_row_not_created"
+# The source of an already-migrated row could not be established either way.
+COMPLETENESS_SOURCE_UNPROVABLE: Final = "migrated_source_lifecycle_unprovable"
 
 
 def new_run_id() -> str:
@@ -1077,12 +1081,15 @@ async def _prove_completeness(
     source_changed = 0
     blocked_now = 0
     targets_proven = 0
-    # Every ledger identity the active loop proved, so the ledger-side sweep
-    # below knows which rows it still has to account for.
-    proven_identities: set[tuple[int, int]] = set()
+    # Every ledger identity the active loop reached a verdict on, so the
+    # ledger-side sweep below knows which rows it still has to account for.
+    judged_identities: set[tuple[int, int]] = set()
     targets_checked = 0
     terminal_targets = 0
     active_ghosts = 0
+    # Correct, still-live rows of an earlier confirmed wave, re-proved here
+    # rather than assumed.
+    earlier_wave_targets = 0
 
     def _unaccount(decision: Decision, reason: str) -> None:
         entry = decision.as_safe_dict()
@@ -1094,6 +1101,12 @@ async def _prove_completeness(
         if decision.source_record_id is None:
             _unaccount(decision, COMPLETENESS_NO_LEDGER_ROW)
             continue
+
+        # Judged here, whatever the verdict. The ledger sweep below is for rows
+        # this loop never reached — counting a row in both would report one
+        # broken target twice and, worse, ask the source about a booking whose
+        # target this loop has already condemned.
+        judged_identities.add((decision.source_company_id, decision.source_record_id))
 
         if decision.outcome == BLOCKED:
             blocked_now += 1
@@ -1140,7 +1153,6 @@ async def _prove_completeness(
 
         targets_proven += 1
         accounted += 1
-        proven_identities.add((decision.source_company_id, decision.source_record_id))
 
     # -- the other direction: targets whose source is no longer active ------
     # A migrated booking whose source was cancelled, deleted, rescheduled into
@@ -1159,7 +1171,7 @@ async def _prove_completeness(
     for (company_id, source_record_id), row in sorted(ledger_by_identity.items()):
         if row.status != ledger_module.STATUS_CREATED:
             continue
-        if (company_id, source_record_id) in proven_identities:
+        if (company_id, source_record_id) in judged_identities:
             continue
 
         entry = {
@@ -1173,7 +1185,58 @@ async def _prove_completeness(
             ghosts.append(entry)
             continue
 
+        # Being absent from THIS wave's active decisions does not mean the source
+        # is gone. From the second wave onwards most of these rows belong to an
+        # earlier, already-confirmed wave whose masters this manifest defers —
+        # their bookings are alive, their targets are correct, and demanding that
+        # they be cancelled before wave B can pass is exactly backwards.
+        #
+        # So the source is asked directly, with the wave selector switched off:
+        # a selector says which masters migrate now, never whether a customer
+        # still has an appointment.
+        lifecycle = await reclassify_source_lifecycle(
+            company_id=company_id,
+            record_id=source_record_id,
+            expected_fingerprint=row.source_fingerprint,
+            manifest=inputs.manifest,
+            directory=inputs.directory,
+            cutover=inputs.cutover,
+            http_client=http_client,
+        )
+        entry.update(lifecycle.as_safe_dict())
         marker = ledger_module.migration_marker(source_company_id=company_id, source_record_id=source_record_id)
+
+        if lifecycle.state == LIFECYCLE_UNPROVABLE:
+            # We could not establish what became of the source. Guessing either
+            # way is wrong: "gone" would demand a live booking be cancelled,
+            # "alive" would hide a real ghost.
+            entry["completeness_reason"] = f"{COMPLETENESS_SOURCE_UNPROVABLE}:{lifecycle.detail}"
+            reasons[COMPLETENESS_SOURCE_UNPROVABLE] += 1
+            ghosts.append(entry)
+            continue
+
+        if lifecycle.state == LIFECYCLE_ACTIVE_UNCHANGED:
+            # A correct row of an earlier wave. It is not a ghost — but it is
+            # not taken on trust either: its target is proven live and still
+            # matching the fingerprint stored when it was written.
+            proof = await prove_live_target(
+                write_client,
+                target_booking_uuid=row.target_booking_uuid,
+                marker=marker,
+                expected_fingerprint=row.target_snapshot_fingerprint,
+            )
+            targets_checked += 1
+            if proof.proven:
+                earlier_wave_targets += 1
+                continue
+            entry["completeness_reason"] = proof.reason
+            reasons[proof.reason] += 1
+            ghosts.append(entry)
+            continue
+
+        # The source was cancelled, deleted, finished, moved into the past, or
+        # changed out from under the booking we created. Its target must be gone
+        # or finished.
         proof = await prove_target_inactive_or_absent(
             write_client,
             target_booking_uuid=row.target_booking_uuid,
@@ -1236,6 +1299,7 @@ async def _prove_completeness(
         "migration_targets_checked": targets_proven + targets_checked,
         "inactive_source_targets_checked": targets_checked,
         "inactive_source_targets_terminal": terminal_targets,
+        "earlier_wave_targets_proven": earlier_wave_targets,
         "ghost_targets_active": active_ghosts,
         "unaccounted_reason_codes": dict(sorted(reasons.items())),
         "unaccounted_rows": unaccounted,
@@ -1406,11 +1470,20 @@ async def run_resolve_created(
         # unknown. Its proof is the wave's first, it is unverified precisely
         # because the outcome is unknown, and the ordinary gate would therefore
         # refuse to resolve the row that would make it verified — a deadlock with
-        # no safe way out, since re-sending the POST could double-book a person.
+        # no safe way out, since re-sending the POST could double-break a person's
+        # schedule by creating a second booking.
         #
-        # `_admit_canary_recovery` opens that door for that row alone. Every
-        # other use of an unverified proof stays shut.
-        if scope.reason != SCOPE_MISSING or binding is None:
+        # The recovery is tried whatever the scope gate's reason was, and that
+        # matters from the second wave onwards. Once wave A has a verified proof,
+        # wave B's unknown canary no longer produces `migration_scope_missing` —
+        # the lookup finds wave A's proof and answers `*_mismatch` or
+        # `ambiguous` instead. Keying the recovery on one particular reason
+        # therefore locked every wave after the first into the same deadlock.
+        #
+        # Widening the trigger does not widen the door: `_admit_canary_recovery`
+        # still demands an EXACT binding, so wave A's proof can never admit
+        # wave B, and every other use of an unverified proof stays shut.
+        if binding is None:
             report.errors.append(scope.reason)
             report.reasons[scope.reason] += 1
             return report

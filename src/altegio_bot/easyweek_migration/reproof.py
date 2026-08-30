@@ -34,7 +34,15 @@ from typing import Any, Final
 import httpx
 
 from altegio_bot.easyweek_migration.altegio_source import AltegioSourceError, fetch_single_record
-from altegio_bot.easyweek_migration.classify import READY, Decision, classify_record
+from altegio_bot.easyweek_migration.classify import (
+    READY,
+    SKIP_CANCELED,
+    SKIP_COMPLETED,
+    SKIP_DELETED,
+    SKIP_PAST,
+    Decision,
+    classify_record,
+)
 from altegio_bot.easyweek_migration.customers import CustomerDirectory
 from altegio_bot.easyweek_migration.cutover import Cutover
 from altegio_bot.easyweek_migration.manifest import MigrationManifest
@@ -240,3 +248,113 @@ async def reclassify_source_for_resolution(
         return ReproofResult(confirmed=False, reason=REPROOF_SOURCE_CHANGED, detail="fingerprint_changed"), None
 
     return CONFIRMED, fresh
+
+
+# ---------------------------------------------------------------------------
+# Is this migrated booking still alive, and still the one we migrated?
+# ---------------------------------------------------------------------------
+# A different question from both of the above, and the difference is the whole
+# point of this helper.
+#
+# `reprove_source_booking` asks "may this be created now?" and
+# `reclassify_source_for_resolution` asks "what did we mean to create?". Both
+# answer within the CURRENT wave, so a master the current manifest defers is
+# out of scope for them — correctly.
+#
+# The final reconciliation of wave B has to ask something else about wave A's
+# rows: *is that booking still alive?* The wave selector cannot answer it. A
+# master moved to a later wave has not thereby cancelled her customers'
+# appointments, and reading "deferred" as "source gone" made wave B demand that
+# wave A's perfectly correct bookings be cancelled before it could pass.
+#
+# So this one classifies with the wave scope switched off, and reports the
+# source's LIFECYCLE.
+
+# The booking is still there, still active, and still the booking whose
+# fingerprint the ledger recorded.
+LIFECYCLE_ACTIVE_UNCHANGED: Final = "source_active_and_unchanged"
+# Cancelled, deleted, finished, moved into the past, or changed so that the
+# stored fingerprint no longer describes it. Its target should not be standing.
+LIFECYCLE_INACTIVE_OR_CHANGED: Final = "source_inactive_or_changed"
+# We could not find out. Never treated as either of the above.
+LIFECYCLE_UNPROVABLE: Final = "source_lifecycle_unprovable"
+
+# Classifier outcomes that genuinely describe the booking's life ending. Anything
+# else that stops a classification — a missing mapping, a malformed price — is a
+# configuration gap, not evidence about the customer's appointment.
+_LIFECYCLE_ENDED_REASONS: Final[frozenset[str]] = frozenset({SKIP_DELETED, SKIP_CANCELED, SKIP_COMPLETED, SKIP_PAST})
+
+
+@dataclass(frozen=True)
+class LifecycleResult:
+    """What became of one already-migrated source booking."""
+
+    state: str
+    # The classifier's own code when it had one — already a stable, PII-free
+    # string such as `source_canceled`.
+    detail: str | None = None
+
+    def as_safe_dict(self) -> dict[str, Any]:
+        return {"source_lifecycle": self.state, "source_lifecycle_detail": self.detail}
+
+
+async def reclassify_source_lifecycle(
+    *,
+    company_id: int,
+    record_id: int,
+    expected_fingerprint: str,
+    manifest: MigrationManifest,
+    directory: CustomerDirectory,
+    cutover: Cutover,
+    http_client: httpx.AsyncClient | None = None,
+) -> LifecycleResult:
+    """Re-read one migrated booking and say what became of it. Read-only.
+
+    Deliberately reuses the same fetch, the same identity contract, the same
+    classifier and the same fingerprint as every other re-proof: a second way of
+    deciding "is this the same booking?" would be a second way of being wrong.
+    The only difference is ``ignore_wave_scope``, because the current wave's
+    selector is not evidence about a booking's life.
+
+    Every ambiguity is :data:`LIFECYCLE_UNPROVABLE` rather than a guess in either
+    direction — calling an unreadable source "gone" would make the caller demand
+    a live booking be cancelled, and calling it "alive" would hide a real ghost.
+    """
+    try:
+        live = await fetch_single_record(company_id=company_id, record_id=record_id, client=http_client)
+    except AltegioSourceError:
+        return LifecycleResult(state=LIFECYCLE_UNPROVABLE, detail="source_unreadable")
+
+    if live is None:
+        # Hard-deleted or no longer served by the API at all. Its booking should
+        # not be standing.
+        return LifecycleResult(state=LIFECYCLE_INACTIVE_OR_CHANGED, detail="source_absent")
+
+    identity_failure = prove_source_identity(live, company_id=company_id, record_id=record_id)
+    if identity_failure is not None:
+        return LifecycleResult(state=LIFECYCLE_UNPROVABLE, detail=identity_failure)
+
+    fresh = classify_record(
+        live,
+        company_id=company_id,
+        manifest=manifest,
+        directory=directory,
+        cutover=cutover,
+        ledger=None,
+        ignore_wave_scope=True,
+    )
+
+    if fresh.outcome == READY:
+        if fresh.source_fingerprint == expected_fingerprint:
+            return LifecycleResult(state=LIFECYCLE_ACTIVE_UNCHANGED)
+        # Still a live booking, but no longer the one we migrated: moved, given
+        # to another master, re-serviced or reassigned. The target we created
+        # describes an appointment that no longer exists in that form.
+        return LifecycleResult(state=LIFECYCLE_INACTIVE_OR_CHANGED, detail="fingerprint_changed")
+
+    if fresh.reason in _LIFECYCLE_ENDED_REASONS:
+        return LifecycleResult(state=LIFECYCLE_INACTIVE_OR_CHANGED, detail=fresh.reason)
+
+    # A mapping that has since been removed, a price we can no longer read: we
+    # cannot say whether the appointment still stands, so we do not say.
+    return LifecycleResult(state=LIFECYCLE_UNPROVABLE, detail=fresh.reason)

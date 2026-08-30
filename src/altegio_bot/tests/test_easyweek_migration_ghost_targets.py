@@ -244,7 +244,12 @@ async def test_an_active_source_with_a_cancelled_target_still_fails(session_loca
 
 
 async def test_zero_active_source_rows_cannot_pass_while_a_target_stands(session_local, source, monkeypatch):
-    """The vacuous PASS, closed from the other side."""
+    """The vacuous PASS, closed from the other side.
+
+    Every source vanishes — from the list read AND from the per-record read, the
+    way a real disappearance looks — while all three EasyWeek bookings keep
+    standing. An empty source is not a finished cutover.
+    """
     from altegio_bot.easyweek_migration import runner as runner_module
 
     transport = RecordingTransport()
@@ -254,6 +259,10 @@ async def test_zero_active_source_rows_cannot_pass_while_a_target_stands(session
         return []
 
     monkeypatch.setattr(runner_module, "fetch_company_records", _empty)
+    for company_id in (KARLSRUHE_COMPANY_ID, RASTATT_COMPANY_ID):
+        for row in list(source.get(company_id, [])):
+            source["live_changes"][(company_id, row["id"])] = None
+
     verdict = (await final(session_local, transport)).as_safe_dict()["completeness"]
 
     assert verdict["source_active_bookings"] == 0

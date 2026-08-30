@@ -206,6 +206,7 @@ def classify_record(
     directory: CustomerDirectory,
     cutover: Cutover,
     ledger: LedgerView | None,
+    ignore_wave_scope: bool = False,
 ) -> Decision:
     """Decide what happens to one Altegio record. Pure; performs no I/O.
 
@@ -282,13 +283,23 @@ def classify_record(
     # operator has to work through.
     staff_id = _staff_id(record)
     scope = branch.staff_scope(staff_id)
-    if scope == STAFF_DEFERRED:
-        return _skip(SKIP_STAFF_DEFERRED)
-    if scope == STAFF_UNKNOWN:
-        # A master nobody classified. Fail closed: an unlisted master is the one
-        # case where "not migrating" and "we missed her" look identical, and
-        # only a human can tell them apart.
-        return _block(BLOCK_STAFF_NOT_IN_WAVE)
+    # `ignore_wave_scope` is for the ONE caller that is asking a different
+    # question: not "does this booking migrate in this wave?" but "is this
+    # booking still alive and still the booking we migrated?". The wave selector
+    # answers the first and says nothing about the second — a master moved to a
+    # later wave has not thereby cancelled her customers' appointments. See
+    # `reclassify_source_lifecycle`.
+    #
+    # It is never set by planning, apply, canary or the pre-POST re-proof: for
+    # them a deferred master IS out of scope, and an unknown one still blocks.
+    if not ignore_wave_scope:
+        if scope == STAFF_DEFERRED:
+            return _skip(SKIP_STAFF_DEFERRED)
+        if scope == STAFF_UNKNOWN:
+            # A master nobody classified. Fail closed: an unlisted master is the
+            # one case where "not migrating" and "we missed her" look identical,
+            # and only a human can tell them apart.
+            return _block(BLOCK_STAFF_NOT_IN_WAVE)
 
     # -- 3. exactly one service, no overrides ------------------------------
     services = _services(record)
