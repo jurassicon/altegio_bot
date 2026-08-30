@@ -60,3 +60,24 @@ CLAUDE.md
 AGENTS.md
 .codex/
 /docs/easyweek/INTEGRATION_PLAN.md
+
+# ===== PR-11.1 EasyWeek cutover: operational artefacts, never tracked =====
+# `outputs/` holds run reports, canary logs and operator exports. It was only in
+# .git/info/exclude, which is local to one clone — a second machine would have
+# tracked it. The migration writes reports here by default, so the rule belongs
+# in the repository.
+outputs/
+
+# Customer exports and any spreadsheet dropped into the tree. These are PII by
+# definition: EasyWeek customer exports, Altegio client lists, visit-counter
+# import files.
+*.csv
+*.xls
+*.xlsx
+!docs/**/*.example.csv
+
+# Real cutover manifests. The committed template is
+# docs/easyweek/migration_manifest.example.json; anything else is an operator's
+# working copy and may name production locations, staff and services.
+migration_manifest*.json
+!docs/easyweek/migration_manifest.example.json

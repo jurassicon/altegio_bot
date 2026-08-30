@@ -233,6 +233,54 @@ services:
     profiles:
       - ops
 
+  # PR-11.1 one-off cutover runner. NOT started by `docker compose up -d`.
+  #
+  # It exists because the migration CLI needs two things no long-running service
+  # has: an operator-supplied manifest and EasyWeek customer export on the way
+  # in, and a report that survives the container on the way out. Running it in
+  # `altegio-easyweek-inbox-worker` looked right and was not — that container has
+  # no mounts, so every documented path pointed at a directory that did not exist
+  # inside it, and any report it wrote died with the container.
+  #
+  # Inputs are mounted READ-ONLY. The customer export is PII; the container has
+  # no reason to be able to modify or grow it, and a read-only mount is the
+  # cheapest way to guarantee it does not.
+  #
+  # Host paths are configurable so no operator's directory layout is baked in:
+  #   EASYWEEK_MIGRATION_INPUT_DIR   (default ./outputs/easyweek_migration/input)
+  #   EASYWEEK_MIGRATION_REPORT_DIR  (default ./outputs/easyweek_migration)
+  # Both live under `outputs/`, which is git-ignored.
+  #
+  # Run explicitly, always with --build so the tool is the code of the commit
+  # being deployed:
+  #   docker compose --profile ops run --rm --build easyweek-booking-migration \
+  #     dry-run --manifest /migration/input/manifest.json \
+  #     --customer-directory /migration/input/customers.csv \
+  #     --cutover-at 2026-09-01T00:00:00+02:00
+  easyweek-booking-migration:
+    build: .
+    env_file:
+      - .env
+      - path: easyweek.env
+        required: false
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ${EASYWEEK_MIGRATION_INPUT_DIR:-./outputs/easyweek_migration/input}:/migration/input:ro
+      - ${EASYWEEK_MIGRATION_REPORT_DIR:-./outputs/easyweek_migration}:/migration/reports
+    environment:
+      # Where the CLI writes its report INSIDE the container. It is the mounted
+      # directory, so the report lands on the host and outlives the run.
+      EASYWEEK_MIGRATION_REPORT_DIR: /migration/reports
+    entrypoint:
+      ["/app/.venv/bin/python", "-m", "altegio_bot.scripts.easyweek_migration"]
+    command: ["--help"]
+    working_dir: /app
+    restart: "no"
+    profiles:
+      - ops
+
 volumes:
   postgres_data:
   redis_data:

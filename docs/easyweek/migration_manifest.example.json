@@ -1,0 +1,51 @@
+{
+  "manifest_id": "cutover-example-wave-2",
+  "branches": {
+    "758285": {
+      "altegio_company_id": 758285,
+      "easyweek_location_id": 100001,
+      "easyweek_location_uuid": "00000000-0000-4000-8000-000000000001",
+      "selected_altegio_staff_ids": [
+        1000001
+      ],
+      "deferred_altegio_staff_ids": [
+        1000002
+      ],
+      "staff": {
+        "1000001": "00000000-0000-4000-8000-000000000011",
+        "1000002": "00000000-0000-4000-8000-000000000012"
+      },
+      "services": {
+        "2000001": {
+          "easyweek_service_uuid": "00000000-0000-4000-8000-000000000021",
+          "catalog_duration_minutes": 60,
+          "catalog_price": "90.00"
+        },
+        "2000002": {
+          "easyweek_service_uuid": "00000000-0000-4000-8000-000000000022",
+          "catalog_duration_minutes": 90,
+          "catalog_price": "120.00"
+        }
+      }
+    },
+    "1271200": {
+      "altegio_company_id": 1271200,
+      "easyweek_location_id": 100002,
+      "easyweek_location_uuid": "00000000-0000-4000-8000-000000000002",
+      "selected_altegio_staff_ids": [],
+      "deferred_altegio_staff_ids": [
+        1100001
+      ],
+      "staff": {
+        "1100001": "00000000-0000-4000-8000-000000000031"
+      },
+      "services": {
+        "2100001": {
+          "easyweek_service_uuid": "00000000-0000-4000-8000-000000000041",
+          "catalog_duration_minutes": 60,
+          "catalog_price": "90.00"
+        }
+      }
+    }
+  }
+}
