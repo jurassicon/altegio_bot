@@ -65,6 +65,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import unicodedata
 import uuid as uuid_module
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -72,6 +73,7 @@ from typing import Any, Final
 
 from altegio_bot.easyweek_locations import PG_INT_MAX
 from altegio_bot.easyweek_migration.money import (
+    MINOR_UNIT_EXPONENT,
     Amount,
     AmountError,
     Duration,
@@ -127,13 +129,21 @@ _TOP_LEVEL_FIELDS: Final = frozenset({"manifest_id", "branches"})
 # catalogue baseline the classifier compares a booking against; without them a
 # stretched slot or a discounted price has nothing to be measured as an
 # override *against*, and "no baseline" silently reads as "no override".
-_SERVICE_FIELDS: Final = frozenset(
+# The identity half is the newer part. EasyWeek gives no catalogue service uuid
+# back on a booking, so the service is proven by its exact attributes — and those
+# attributes have to be something an operator REVIEWED, not something read out of
+# the live catalogue at the moment of writing. Name and currency were missing
+# from the file, so they were taken from the catalogue instead, which meant a
+# service renamed after the canary supplied its own new "expectation".
+_SERVICE_IDENTITY_FIELDS: Final = frozenset({"catalog_service_name", "catalog_currency"})
+_SERVICE_BASELINE_FIELDS: Final = frozenset(
     {
         "easyweek_service_uuid",
         "catalog_duration_minutes",
         "catalog_price",
     }
 )
+_SERVICE_FIELDS: Final = _SERVICE_BASELINE_FIELDS | _SERVICE_IDENTITY_FIELDS
 
 # A manifest id is an operator-chosen label that ends up in every report and in
 # the apply gate. Kept to a boring closed alphabet so it cannot smuggle newlines
@@ -153,6 +163,10 @@ INVALID_UNKNOWN_COMPANY: Final = "manifest_unknown_company"
 INVALID_STAFF_SCOPE_OVERLAP: Final = "manifest_staff_scope_overlap"
 INVALID_SELECTED_STAFF_UNMAPPED: Final = "manifest_selected_staff_unmapped"
 INVALID_STAFF_SCOPE_EMPTY: Final = "manifest_staff_scope_empty"
+# A service entry that predates the identity fields. Writing modes refuse it by
+# name rather than as a generic shape error, because the fix is specific: add the
+# service's exact name and currency, the ones the operator can see in EasyWeek.
+INVALID_SERVICE_IDENTITY_MISSING: Final = "manifest_service_identity_missing"
 
 
 class _DuplicateJSONKey(Exception):
@@ -182,6 +196,21 @@ class ServiceMapping:
     easyweek_service_uuid: str
     catalog_duration: Duration
     catalog_price: Amount
+    # The identity half, and the reason it lives here rather than being read from
+    # the catalogue at write time: this file is the artefact an operator reviewed
+    # and the plan digest covers. A name taken from the live catalogue instead
+    # would make the check circular — the catalogue proving itself — which is
+    # exactly how a service renamed between the canary and the bulk got a fresh
+    # "expectation" it satisfied by construction.
+    #
+    # ``None`` only in `inventory`, which runs while the file is still being
+    # filled in. Every writing mode requires both.
+    catalog_service_name: str | None = None
+    catalog_currency: str | None = None
+
+    @property
+    def identity_complete(self) -> bool:
+        return bool(self.catalog_service_name) and bool(self.catalog_currency)
 
 
 @dataclass(frozen=True)
@@ -287,6 +316,12 @@ class MigrationManifest:
                     "easyweek_location_uuid": branch.easyweek_location_uuid,
                     "staff_mappings": len(branch.staff),
                     "service_mappings": len(branch.services),
+                    # Which services still need their reviewed name and currency.
+                    # Ids only, and the list is what an operator acts on when a
+                    # writing mode refuses the file.
+                    "services_missing_identity": sorted(
+                        service_id for service_id, mapping in branch.services.items() if not mapping.identity_complete
+                    ),
                     "selected_staff_ids": sorted(branch.selected_staff_ids),
                     "deferred_staff_ids": sorted(branch.deferred_staff_ids),
                 }
@@ -374,12 +409,18 @@ def _parse_staff_id_list(raw: object) -> frozenset[int] | None:
 
 
 def _parse_service_map(raw: object) -> dict[int, ServiceMapping] | None:
-    """Parse the ``services`` object: id → target uuid + catalogue baseline.
+    """Parse the ``services`` object: id → target uuid + reviewed expectation.
 
-    Every entry must carry all three fields. ``catalog_price`` may legitimately
-    be ``"0"`` for a genuinely free service — and that is precisely why it is
-    required rather than optional: a missing baseline and a zero baseline lead to
-    opposite decisions, and only the operator knows which one is true.
+    The baseline fields are mandatory in every mode. ``catalog_price`` may
+    legitimately be ``"0"`` for a genuinely free service — and that is precisely
+    why it is required rather than optional: a missing baseline and a zero
+    baseline lead to opposite decisions, and only the operator knows which is true.
+
+    The identity fields (``catalog_service_name``, ``catalog_currency``) are read
+    when present and left as ``None`` when absent, so `inventory` can still run on
+    a half-written file. Requiring them is a separate, named check that only the
+    writing modes apply — an old manifest is refused with an instruction, not with
+    "shape invalid".
     """
     if not isinstance(raw, dict):
         return None
@@ -391,7 +432,11 @@ def _parse_service_map(raw: object) -> dict[int, ServiceMapping] | None:
         source_id = int(key)
         if str(source_id) != key or not (0 < source_id <= PG_BIGINT_MAX):
             return None
-        if not isinstance(value, dict) or frozenset(value) != _SERVICE_FIELDS:
+        if not isinstance(value, dict):
+            return None
+        # Unknown keys are still rejected: a typo'd field name must not read as
+        # an absent one, or "catalog_currancy" would silently become no currency.
+        if not _SERVICE_BASELINE_FIELDS <= frozenset(value) <= _SERVICE_FIELDS:
             return None
 
         target_uuid = canonical_uuid(value.get("easyweek_service_uuid"))
@@ -408,12 +453,65 @@ def _parse_service_map(raw: object) -> dict[int, ServiceMapping] | None:
         if not catalog_duration.present or not catalog_price.present:
             return None
 
+        service_name, currency = _parse_service_identity(value)
+        if service_name is _REJECT or currency is _REJECT:
+            return None
+
         result[source_id] = ServiceMapping(
             easyweek_service_uuid=target_uuid,
             catalog_duration=catalog_duration,
             catalog_price=catalog_price,
+            catalog_service_name=service_name,
+            catalog_currency=currency,
         )
     return result
+
+
+# Sentinel: the field was present and unusable, which is never the same as absent.
+_REJECT: Final = object()
+
+
+def _parse_service_identity(value: dict[str, Any]) -> tuple[Any, Any]:
+    """The reviewed name and currency, canonicalised, or the absent/reject marker.
+
+    The name is stored in the SAME canonical form the comparison uses — NFC,
+    collapsed whitespace, case-folded — so the file and the catalogue can never
+    disagree over an encoding of the same name. The currency must be one this
+    project can express in minor units exactly; guessing a minor-unit exponent is
+    how a price comparison quietly starts rounding.
+    """
+    raw_name = value.get("catalog_service_name")
+    if raw_name is None:
+        service_name: Any = None
+    else:
+        service_name = canonical_service_name(raw_name)
+        if service_name is None:
+            service_name = _REJECT
+
+    raw_currency = value.get("catalog_currency")
+    if raw_currency is None:
+        currency: Any = None
+    elif isinstance(raw_currency, str) and raw_currency.strip().upper() in MINOR_UNIT_EXPONENT:
+        currency = raw_currency.strip().upper()
+    else:
+        currency = _REJECT
+
+    return service_name, currency
+
+
+def canonical_service_name(raw: object) -> str | None:
+    """Canonical form of a catalogue service name, or ``None`` if unusable.
+
+    Lives here rather than in `service_catalog` so the manifest parser and the
+    catalogue reader cannot drift apart on what "the same name" means; that module
+    imports this one.
+    """
+    if not isinstance(raw, str):
+        return None
+    collapsed = " ".join(raw.split())
+    if not collapsed:
+        return None
+    return unicodedata.normalize("NFC", collapsed).casefold()
 
 
 def _canonical_digest(manifest_id: str, branches: dict[int, BranchMapping]) -> str:
@@ -437,12 +535,20 @@ def _canonical_digest(manifest_id: str, branches: dict[int, BranchMapping]) -> s
                 "selected_staff": sorted(branch.selected_staff_ids),
                 "deferred_staff": sorted(branch.deferred_staff_ids),
                 "staff": sorted(branch.staff.items()),
+                # Name and currency are in here for the same reason the
+                # selector is: they are part of WHAT the operator approved. A
+                # renamed service is a different expectation, so it must move the
+                # digest and invalidate the reviewed dry-run and the canary proof
+                # — otherwise the plan looks identical while the thing it proves
+                # has changed underneath it.
                 "services": sorted(
                     (
                         service_id,
                         mapping.easyweek_service_uuid,
                         mapping.catalog_duration.minutes,
                         str(mapping.catalog_price.value),
+                        mapping.catalog_service_name or "",
+                        mapping.catalog_currency or "",
                     )
                     for service_id, mapping in branch.services.items()
                 ),
@@ -554,6 +660,10 @@ def _parse(raw: object, *, allow_empty_mappings: bool) -> MigrationManifest:
         # single clear "you have not filled the manifest in yet".
         if not allow_empty_mappings and (not staff or not services):
             return _invalid(INVALID_EMPTY)
+        # Writing modes need the whole reviewed expectation, identity included.
+        # `inventory` does not: it exists to help build this file.
+        if not allow_empty_mappings and any(not mapping.identity_complete for mapping in services.values()):
+            return _invalid(INVALID_SERVICE_IDENTITY_MISSING)
 
         selected = _parse_staff_id_list(entry.get("selected_altegio_staff_ids"))
         deferred = _parse_staff_id_list(entry.get("deferred_altegio_staff_ids"))
@@ -644,6 +754,10 @@ def inventory_manifest(raw: object) -> MigrationManifest:
     # inventory runs BEFORE the wave selector exists, and refusing to tell an
     # operator which masters have bookings until they have already chosen which
     # masters to migrate is the same chicken-and-egg bug in a new place.
-    if parsed.valid or parsed.reason not in (INVALID_EMPTY, INVALID_STAFF_SCOPE_EMPTY):
+    if parsed.valid or parsed.reason not in (
+        INVALID_EMPTY,
+        INVALID_STAFF_SCOPE_EMPTY,
+        INVALID_SERVICE_IDENTITY_MISSING,
+    ):
         return parsed
     return _parse(raw, allow_empty_mappings=True)

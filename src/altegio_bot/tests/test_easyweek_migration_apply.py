@@ -53,7 +53,9 @@ from altegio_bot.tests.easyweek_migration_harness import (
     CREATED_UUIDS,
     KA_RECORD_A,
     KA_RECORD_B,
+    MUTATION_IDS,
     RA_RECORD_A,
+    TARGET_MUTATIONS,
     RecordingTransport,
     _registry_json,
     apply_production_flags,
@@ -241,7 +243,7 @@ async def test_the_created_booking_carries_a_stable_pii_free_marker(session_loca
     await license_bulk(session_local, transport)
 
     bodies = [json.loads(r.content.decode()) for r in transport.requests if r.method == "POST"]
-    comments = {body["comment"] for body in bodies}
+    comments = {body["booking_comment"] for body in bodies}
     assert f"altegio-migration:{KARLSRUHE_COMPANY_ID}:{KA_RECORD_A}" in comments
     assert all(CUSTOMER_PHONE not in comment for comment in comments)
 
@@ -581,7 +583,7 @@ async def test_a_verified_canary_stores_a_durable_proof(session_local, source):
 
 async def test_a_canary_whose_readback_disagrees_does_not_license_a_bulk(session_local, source):
     """A 2xx says the request was accepted, not that it landed where we meant."""
-    transport = RecordingTransport(readback_override={"staff_uuid": "00000000-0000-4000-8000-0000000000ff"})
+    transport = RecordingTransport(readback_override={"location_uuid": "00000000-0000-4000-8000-0000000000ff"})
     plan = await run_dry_run(session_local)
     async with make_write_client(transport) as client:
         report = await run_canary(
@@ -939,24 +941,13 @@ async def test_a_confirmed_rollback_cancels_and_records(session_local, source):
     assert all(row.target_booking_uuid for row in rolled)
 
 
-@pytest.mark.parametrize(
-    "field,value",
-    [
-        ("start_time", "2026-09-11T09:00:00Z"),
-        ("staff_uuid", "00000000-0000-4000-8000-0000000000aa"),
-        ("service_uuid", "00000000-0000-4000-8000-0000000000bb"),
-        ("customer_uuid", "00000000-0000-4000-8000-0000000000cc"),
-        ("location_uuid", "00000000-0000-4000-8000-0000000000dd"),
-        ("duration", 90),
-        ("comment", "moved to Thursday, called the client"),
-    ],
-)
-async def test_a_target_changed_after_migration_is_never_cancelled(session_local, source, field, value):
+@pytest.mark.parametrize("label,mutate", TARGET_MUTATIONS, ids=MUTATION_IDS)
+async def test_a_target_changed_after_migration_is_never_cancelled(session_local, source, label, mutate):
     """Marker-plus-status was not enough: all of these survive both checks."""
     transport = RecordingTransport()
     run_id = await _applied_run(session_local, source, transport)
     edited = CREATED_UUIDS[KA_RECORD_B]
-    transport.bookings[edited][field] = value
+    mutate(transport, edited)
 
     async with make_write_client(transport) as client:
         report = await run_rollback(
@@ -964,15 +955,28 @@ async def test_a_target_changed_after_migration_is_never_cancelled(session_local
             make_inputs(MODE_ROLLBACK_DRY_RUN, rollback_run_id=run_id, rollback_confirmed=True),
             write_client=client,
         )
-    assert report.as_safe_dict()["reason_codes"]["rollback_target_modified_after_migration"] == 1
+    codes = report.as_safe_dict()["reason_codes"]
+    # Each kind of change is refused under the code that describes it. "Modified"
+    # would be the wrong thing to tell an operator about a reassigned master or a
+    # service that no longer matches its baseline: in both cases the booking
+    # payload is byte-identical and the difference is only visible to the
+    # independent check that found it.
+    refusal = {
+        "master": "rollback_staff_assignment_unproven",
+        "service": "rollback_service_evidence_unproven",
+        "price": "rollback_service_evidence_unproven",
+    }.get(label, "rollback_target_modified_after_migration")
+    assert codes[refusal] == 1
     assert edited not in transport.cancelled
+    # Whatever the reason, no cancel request was sent for it.
+    assert transport.cancelled == [] or edited not in transport.cancelled
 
 
 async def test_a_malformed_target_is_never_cancelled(session_local, source):
     transport = RecordingTransport()
     run_id = await _applied_run(session_local, source, transport)
     edited = CREATED_UUIDS[KA_RECORD_B]
-    transport.bookings[edited].pop("staff_uuid")
+    transport.bookings[edited].pop("duration")
 
     async with make_write_client(transport) as client:
         report = await run_rollback(

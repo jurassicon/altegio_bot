@@ -42,14 +42,13 @@ from altegio_bot.easyweek_migration.manifest import (
     parse_manifest,
 )
 from altegio_bot.tests.test_easyweek_migration_planning import (
-    CUSTOMER_PHONE,
-    CUSTOMER_UUID,
     KA_DEFERRED_STAFF_ID,
     KA_LOCATION_UUID,
     KA_SERVICE_ID,
     KA_SERVICE_UUID,
     KA_STAFF_ID,
     KA_STAFF_UUID,
+    directory_with,
     manifest_text,
     record,
 )
@@ -77,6 +76,8 @@ def wave_manifest(*, selected, deferred, staff=None) -> str:
                             "easyweek_service_uuid": KA_SERVICE_UUID,
                             "catalog_duration_minutes": 60,
                             "catalog_price": "90.00",
+                            "catalog_service_name": "Mascara Effekt",
+                            "catalog_currency": "EUR",
                         }
                     },
                 }
@@ -87,9 +88,8 @@ def wave_manifest(*, selected, deferred, staff=None) -> str:
 
 @pytest.fixture
 def directory():
-    from altegio_bot.easyweek_migration.customers import CustomerDirectory
 
-    return CustomerDirectory(valid=True, by_phone={CUSTOMER_PHONE: [CUSTOMER_UUID]})
+    return directory_with()
 
 
 def classify(rec, manifest_json, directory):

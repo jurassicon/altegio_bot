@@ -39,6 +39,8 @@ from altegio_bot.tests.easyweek_migration_harness import (
     CUSTOMER_PHONE,
     KA_RECORD_B,
     KARLSRUHE_COMPANY_ID,
+    MUTATION_IDS,
+    TARGET_MUTATIONS,
     RecordingTransport,
     apply_production_flags,
     ledger_rows,
@@ -63,18 +65,6 @@ def source(monkeypatch: pytest.MonkeyPatch) -> dict[int, list[dict]]:
 @pytest_asyncio.fixture
 async def session_local(session_maker: async_sessionmaker[AsyncSession]) -> async_sessionmaker[AsyncSession]:
     return session_maker
-
-
-# Field → the value that makes the live booking disagree with what we wrote.
-TARGET_MUTATIONS = [
-    ("location_uuid", "00000000-0000-4000-8000-0000000000d1"),
-    ("staff_uuid", "00000000-0000-4000-8000-0000000000d2"),
-    ("service_uuid", "00000000-0000-4000-8000-0000000000d3"),
-    ("customer_uuid", "00000000-0000-4000-8000-0000000000d4"),
-    ("start_time", "2026-09-14T07:00:00Z"),
-    ("duration", 120),
-    ("comment", "rewritten by hand"),
-]
 
 
 async def applied_run(session_local, source, transport) -> str:
@@ -157,18 +147,18 @@ async def test_an_unreadable_target_fails(session_local, source):
 async def test_a_malformed_target_fails(session_local, source):
     transport = RecordingTransport()
     await applied_run(session_local, source, transport)
-    transport.bookings[CREATED_UUIDS[KA_RECORD_B]].pop("staff_uuid")
+    transport.bookings[CREATED_UUIDS[KA_RECORD_B]].pop("duration")
 
     verdict = (await final_reconcile(session_local, transport)).as_safe_dict()["completeness"]
     assert verdict["passed"] is False
     assert any("target_malformed" in reason for reason in verdict["unaccounted_reason_codes"])
 
 
-@pytest.mark.parametrize("field,value", TARGET_MUTATIONS)
-async def test_any_changed_critical_field_fails_the_final_reconciliation(session_local, source, field, value):
+@pytest.mark.parametrize("label,mutate", TARGET_MUTATIONS, ids=MUTATION_IDS)
+async def test_any_changed_critical_field_fails_the_final_reconciliation(session_local, source, label, mutate):
     transport = RecordingTransport()
     await applied_run(session_local, source, transport)
-    transport.bookings[CREATED_UUIDS[KA_RECORD_B]][field] = value
+    mutate(transport, CREATED_UUIDS[KA_RECORD_B])
 
     verdict = (await final_reconcile(session_local, transport)).as_safe_dict()["completeness"]
     assert verdict["passed"] is False
@@ -359,13 +349,13 @@ async def test_a_correct_target_is_fully_confirmed(session_local, source):
     assert rows[KA_RECORD_B].target_snapshot_fingerprint
 
 
-@pytest.mark.parametrize("field,value", TARGET_MUTATIONS)
-async def test_any_mismatched_field_leaves_the_row_uncertain(session_local, source, field, value):
+@pytest.mark.parametrize("label,mutate", TARGET_MUTATIONS, ids=MUTATION_IDS)
+async def test_any_mismatched_field_leaves_the_row_uncertain(session_local, source, label, mutate):
     """The gap this closes: only the marker and the branch used to be checked."""
     transport = RecordingTransport()
     await uncertain_without_target(session_local, source, transport)
     transport.plant_booking(CREATED_UUIDS[KA_RECORD_B], record_id=KA_RECORD_B)
-    transport.bookings[CREATED_UUIDS[KA_RECORD_B]][field] = value
+    mutate(transport, CREATED_UUIDS[KA_RECORD_B])
 
     async with make_write_client(transport) as client:
         report = await run_resolve_created(session_local, resolve_inputs(), write_client=client)

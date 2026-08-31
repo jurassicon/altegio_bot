@@ -50,6 +50,7 @@ from altegio_bot.tests.test_easyweek_migration_planning import (
     RA_SERVICE_UUID,
     RA_STAFF_ID,
     RA_STAFF_UUID,
+    directory_with,
 )
 
 # ---------------------------------------------------------------------------
@@ -140,6 +141,8 @@ def manifest_with(*, catalog_price: str, catalog_minutes: int = 60):
                                 "easyweek_service_uuid": KA_SERVICE_UUID,
                                 "catalog_duration_minutes": catalog_minutes,
                                 "catalog_price": catalog_price,
+                                "catalog_service_name": "Mascara Effekt",
+                                "catalog_currency": "EUR",
                             }
                         },
                     },
@@ -155,6 +158,8 @@ def manifest_with(*, catalog_price: str, catalog_minutes: int = 60):
                                 "easyweek_service_uuid": RA_SERVICE_UUID,
                                 "catalog_duration_minutes": 60,
                                 "catalog_price": "90.00",
+                                "catalog_service_name": "Eyeliner Effekt",
+                                "catalog_currency": "EUR",
                             }
                         },
                     },
@@ -188,9 +193,8 @@ def classify(record, *, manifest, directory):
 
 @pytest.fixture
 def directory():
-    from altegio_bot.easyweek_migration.customers import CustomerDirectory
 
-    return CustomerDirectory(valid=True, by_phone={CUSTOMER_PHONE: [CUSTOMER_UUID]})
+    return directory_with()
 
 
 def test_a_full_discount_to_zero_is_blocked(directory):
@@ -328,6 +332,8 @@ def test_a_manifest_service_entry_needs_both_baselines():
             "easyweek_service_uuid": KA_SERVICE_UUID,
             "catalog_duration_minutes": 60,
             "catalog_price": "90.00",
+            "catalog_service_name": "Mascara Effekt",
+            "catalog_currency": "EUR",
         }
         entry.pop(missing)
         raw = json.dumps(

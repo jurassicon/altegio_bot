@@ -18,6 +18,8 @@ and nothing else — no phone, no name, no e-mail, no export.
 | `services.<altegio_service_id>.easyweek_service_uuid` | EasyWeek service UUID for that service |
 | `services.<altegio_service_id>.catalog_duration_minutes` | the service's catalogue length, whole minutes |
 | `services.<altegio_service_id>.catalog_price` | the service's catalogue price, as a string (`"90.00"`, `"0"`) |
+| `services.<altegio_service_id>.catalog_service_name` | the service's name **exactly as EasyWeek shows it** |
+| `services.<altegio_service_id>.catalog_currency` | its currency code, `"EUR"` |
 
 Durlach is deliberately absent. It does not exist in Altegio, so there is no
 `company_id` under which it could be written down, and no booking of its can be
@@ -38,7 +40,25 @@ fetched.
   `inventory` deliberately accepts an empty mapping — it is the mode whose job
   is to tell you which ids to fill in, and requiring them first was a
   chicken-and-egg bug.
-- **Both catalogue fields are mandatory.** They are what a per-booking override
+- **The four catalogue fields are mandatory, and they are the reviewed
+  expectation.** EasyWeek does not return a catalogue service uuid on a booking,
+  so the service is proven by its exact attributes — and those attributes have to
+  be ones an operator checked, not ones read out of the live catalogue at the
+  moment of writing. Name and currency used to be missing from this file and were
+  taken from the catalogue instead, which made the check circular: a service
+  renamed after the canary supplied its own new "expectation" and satisfied it by
+  construction. All four are part of the manifest digest, so editing any of them
+  invalidates the reviewed dry-run and the canary proof — which is the point.
+
+  `catalog_service_name` is compared in a canonical form (Unicode NFC, collapsed
+  whitespace, case-folded), so `"Mascara Effekt"` and `"mascara  effekt"` are the
+  same name and neither spelling is "wrong". Copy what EasyWeek shows.
+
+  `catalog_currency` must be one this project can convert to minor units exactly.
+  Today that is `EUR` only; anything else is refused rather than guessed at, because
+  guessing a minor-unit exponent is how a price comparison quietly starts rounding.
+
+- **Both baseline fields are mandatory.** They are what a per-booking override
   is measured *against*: without them a slot hand-stretched to 90 minutes, or a
   price discounted to zero, has nothing to disagree with and migrates as if it
   were the standard service. `catalog_price` is a string so `"0"` (a genuinely
@@ -118,9 +138,15 @@ fetched.
 3. Decide the wave. Put every master the report listed into exactly one of
    `selected_altegio_staff_ids` or `deferred_altegio_staff_ids` — names may
    guide the decision, but only ids go in the file.
-4. Fill the mapping in — including each service's catalogue duration and price —
-   re-run `inventory`, and confirm `staff.missing` and `services.missing` are
-   empty. "Empty" covers two different obligations, and only the first is about
+4. Fill the mapping in — each service's catalogue duration, price, **name and
+   currency** — re-run `inventory`, and confirm `staff.missing` and
+   `services.missing` are empty.
+
+   `inventory` still runs on a half-written file, and its report's
+   `services_missing_identity` lists the services whose name and currency are
+   still absent. Every writing mode refuses such a file by name
+   (`manifest_service_identity_missing`) rather than filling the gaps in from the
+   catalogue. "Empty" covers two different obligations, and only the first is about
    this wave:
    - every selected master, and every service her future bookings use, must be
      mapped — otherwise the wave cannot run;

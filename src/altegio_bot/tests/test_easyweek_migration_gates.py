@@ -268,11 +268,11 @@ def make_client(handler, *, max_attempts=2, sleeps=None):
 def booking_body():
     return build_booking_request(
         location_uuid="11111111-1111-4111-8111-111111111111",
-        staff_uuid="33333333-3333-4333-8333-333333333333",
+        staffer_uuid="33333333-3333-4333-8333-333333333333",
         service_uuid="44444444-4444-4444-8444-444444444444",
-        customer_uuid="77777777-7777-4777-8777-777777777777",
-        starts_at_utc_iso="2026-09-10T12:00:00Z",
-        duration_minutes=60,
+        customer_phone="+4915112345678",
+        customer_first_name="Testkundin",
+        reserved_on_utc_iso="2026-09-10T12:00:00Z",
         comment="altegio-migration:758285:900001",
     )
 
@@ -431,19 +431,46 @@ async def test_the_rate_limiter_paces_below_the_easyweek_budget():
     assert slept and slept[0] == pytest.approx(1.0)
 
 
-def test_the_request_body_carries_only_proven_identifiers():
+def test_the_request_body_matches_the_documented_contract():
+    """Exactly the documented fields, and none of the invented ones.
+
+    The first version guessed six names out of seven and EasyWeek answered 422.
+    This pins the published contract so a rename cannot happen by accident again.
+    """
     body = booking_body()
     assert set(body) == {
         "location_uuid",
-        "staff_uuid",
-        "customer_uuid",
-        "start_time",
-        "duration",
-        "services",
-        "comment",
+        "service_uuid",
+        "reserved_on",
+        "customer_phone",
+        "customer_first_name",
+        "staffer_uuid",
+        "booking_comment",
+        "timezone",
     }
-    # No name, no phone, no free-text service label.
-    assert body["comment"].startswith("altegio-migration:")
+    assert body["booking_comment"].startswith("altegio-migration:")
+
+
+@pytest.mark.parametrize("field", ["staff_uuid", "customer_uuid", "start_time", "duration", "services", "comment"])
+def test_the_request_body_carries_none_of_the_rejected_fields(field):
+    """The exact shape that earned the 422 never goes out again.
+
+    `duration` and `price` are absent for a reason beyond the 422: this endpoint
+    does not accept them at all, so the length and the money come from the
+    catalogue service. That is what makes the classifier's custom-price and
+    custom-duration refusals load-bearing rather than cautious.
+    """
+    assert field not in booking_body()
+
+
+def test_the_migration_never_asks_easyweek_to_pick_a_master():
+    """`staffer_uuid` is optional to EasyWeek and mandatory to us.
+
+    Omitting it lets the server auto-assign, and a migration that lets somebody
+    else choose who serves the customer is not a migration.
+    """
+    body = booking_body()
+    assert body["staffer_uuid"]
 
 
 def test_the_client_repr_never_carries_the_api_key():

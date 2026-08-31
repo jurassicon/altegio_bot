@@ -31,7 +31,7 @@ before anything else, everywhere.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
+from decimal import Context, Decimal, Inexact, InvalidOperation, Rounded
 from typing import Any, Final
 
 # Duration is stored and sent in whole minutes, so a source duration that is not
@@ -118,6 +118,45 @@ def amounts_differ(left: Amount, right: Amount) -> bool:
         return False
     assert left.value is not None and right.value is not None
     return left.value != right.value
+
+
+# Currencies this migration can express in minor units, and the exponent each
+# one uses. A closed list on purpose: "multiply by 100" is an assumption about
+# the currency, and EasyWeek returns `price` as an integer of minor units with
+# no exponent alongside it. A currency that is not listed here is not a currency
+# we can compare exactly, so it fails closed rather than being guessed at.
+MINOR_UNIT_EXPONENT: Final[dict[str, int]] = {"EUR": 2}
+
+
+def to_minor_units(amount: Amount, *, currency: str) -> int:
+    """Exact minor-unit integer for *amount* in *currency*, or raise.
+
+    EasyWeek states catalogue and booking prices as an integer number of minor
+    units (``12000`` for €120.00); the manifest states them as an exact decimal
+    string (``"120.00"``). Comparing the two needs one conversion, and it has to
+    be exact in both directions — a price that rounds is a price that could hide
+    a per-booking override of less than a cent's worth of difference, which is
+    the whole class of change this migration refuses to migrate silently.
+
+    Raises :class:`AmountError` for an absent amount, an unsupported currency, or
+    a value with more precision than the currency has (``"1.005"`` in EUR).
+    Decimal arithmetic throughout — never float.
+    """
+    if not amount.present or amount.value is None:
+        raise AmountError("amount is absent")
+    code = currency.strip().upper() if isinstance(currency, str) else ""
+    exponent = MINOR_UNIT_EXPONENT.get(code)
+    if exponent is None:
+        raise AmountError("currency is not supported for minor-unit comparison")
+
+    scaled = amount.value.scaleb(exponent)
+    try:
+        # `to_integral_exact` raises Inexact rather than rounding, which is
+        # exactly the behaviour we want: "1.005 EUR" has no minor-unit form.
+        minor = scaled.to_integral_exact(context=Context(traps=[Inexact, Rounded]))
+    except (Inexact, Rounded, InvalidOperation):
+        raise AmountError("amount has more precision than the currency") from None
+    return int(minor)
 
 
 @dataclass(frozen=True)

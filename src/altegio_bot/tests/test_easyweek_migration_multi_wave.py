@@ -44,11 +44,11 @@ from altegio_bot.easyweek_migration.runner import (
     run_reconcile,
     run_resolve_created,
 )
+from altegio_bot.easyweek_migration.write_client import EASYWEEK_BOOKING_TIMEZONE
 from altegio_bot.models.models import EasyWeekMigrationCanaryProof
 from altegio_bot.tests.easyweek_migration_harness import (
     CREATED_UUIDS,
     CUSTOMER_PHONE,
-    CUSTOMER_UUID,
     KA_RECORD_A,
     RASTATT_COMPANY_ID,
     RecordingTransport,
@@ -145,19 +145,21 @@ def plant_wave_b_booking(transport) -> None:
     assert branch is not None
     service = branch.service(KA_SERVICE_ID)
     assert service is not None
-    transport.bookings[CREATED_UUIDS[WAVE_B_RECORD]] = {
-        "uuid": CREATED_UUIDS[WAVE_B_RECORD],
-        "comment": f"altegio-migration:{KARLSRUHE_COMPANY_ID}:{WAVE_B_RECORD}",
-        # 2026-09-16 10:00 local (CEST) is 08:00Z.
-        "start_time": "2026-09-16T08:00:00Z",
-        "duration": 60,
-        "location_uuid": branch.easyweek_location_uuid,
-        "staff_uuid": DEFERRED_STAFF_UUID,
-        "customer_uuid": CUSTOMER_UUID,
-        "service_uuid": service.easyweek_service_uuid,
-        "is_canceled": False,
-        "is_completed": False,
-    }
+    # Built through the fake's own writer, so a planted booking is byte-identical
+    # to one the migration would have created — including the fields the real API
+    # returns and our request never sends.
+    transport._store(
+        {
+            "location_uuid": branch.easyweek_location_uuid,
+            "service_uuid": service.easyweek_service_uuid,
+            # 2026-09-16 10:00 local (CEST) is 08:00Z.
+            "reserved_on": "2026-09-16T08:00:00Z",
+            "booking_comment": f"altegio-migration:{KARLSRUHE_COMPANY_ID}:{WAVE_B_RECORD}",
+            "timezone": EASYWEEK_BOOKING_TIMEZONE,
+            "staffer_uuid": DEFERRED_STAFF_UUID,
+        },
+        WAVE_B_RECORD,
+    )
 
 
 async def proofs(session_local) -> list[EasyWeekMigrationCanaryProof]:

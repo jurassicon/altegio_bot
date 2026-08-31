@@ -192,6 +192,7 @@ async def reclassify_source_for_resolution(
     directory: CustomerDirectory,
     cutover: Cutover,
     http_client: httpx.AsyncClient | None = None,
+    ignore_wave_scope: bool = False,
 ) -> tuple[ReproofResult, Decision | None]:
     """Rebuild what the migration MEANT to create for one already-attempted row.
 
@@ -214,6 +215,14 @@ async def reclassify_source_for_resolution(
     The same manifest, wave selector, customer directory, cutover and price /
     duration rules as every other mode. Returns the fresh Decision only when the
     source still matches the fingerprint recorded before the original POST.
+
+    ``ignore_wave_scope`` is for **rollback**, and for nothing else. Rollback is
+    scoped by run id, not by wave: it undoes bookings a named run created, and
+    which wave the master belongs to *today* says nothing about what that run
+    wrote. Without it, an operator holding a later wave's manifest could not roll
+    back an earlier run at all — the masters it created for are deferred now, so
+    every row would classify as somebody else's wave and refuse. The emergency
+    path must not depend on the selector being current.
     """
     try:
         live = await fetch_single_record(company_id=company_id, record_id=record_id, client=http_client)
@@ -237,6 +246,7 @@ async def reclassify_source_for_resolution(
         directory=directory,
         cutover=cutover,
         ledger=None,
+        ignore_wave_scope=ignore_wave_scope,
     )
 
     if fresh.outcome != READY:

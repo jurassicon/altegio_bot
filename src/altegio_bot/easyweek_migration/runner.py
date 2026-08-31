@@ -34,8 +34,10 @@ import httpx
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from altegio_bot.easyweek_client import EasyWeekError, EasyWeekNotFoundError
+from altegio_bot.easyweek_migration import baseline_store
 from altegio_bot.easyweek_migration import ledger as ledger_module
 from altegio_bot.easyweek_migration.altegio_source import build_window, fetch_company_records
+from altegio_bot.easyweek_migration.baseline_store import load_baselines
 from altegio_bot.easyweek_migration.branch_identity import BranchIdentityResult, verify_branch_identity
 from altegio_bot.easyweek_migration.canary import (
     CANARY_IDENTITY_REQUIRED,
@@ -61,6 +63,7 @@ from altegio_bot.easyweek_migration.classify import (
     BLOCK_SOURCE_CHANGED,
     BLOCKED,
     READY,
+    SKIP_EMPTY_SERVICES,
     SKIP_STAFF_DEFERRED,
     SKIPPED,
     Decision,
@@ -81,6 +84,7 @@ from altegio_bot.easyweek_migration.manifest import (
     STAFF_SELECTED,
     STAFF_UNKNOWN,
     MigrationManifest,
+    ServiceMapping,
 )
 from altegio_bot.easyweek_migration.previous_wave import (
     PreviousWaveContext,
@@ -92,6 +96,7 @@ from altegio_bot.easyweek_migration.proof import (
     TARGET_UUID_MISSING,
     expected_target_for,
     prove_live_target,
+    prove_staff_assignment,
     prove_target_inactive_or_absent,
 )
 from altegio_bot.easyweek_migration.report import (
@@ -108,10 +113,24 @@ from altegio_bot.easyweek_migration.reproof import (
     reclassify_source_lifecycle,
     reprove_source_booking,
 )
+from altegio_bot.easyweek_migration.service_catalog import (
+    CATALOG_UNREADABLE,
+    SERVICE_BASELINE_CONFLICTS_WITH_PLAN,
+    SERVICE_BASELINE_MISSING,
+    SERVICE_BASELINE_VERSION,
+    SERVICE_PROOF_METHOD,
+    CatalogSnapshot,
+    ServiceBaseline,
+    ServiceEvidenceError,
+    build_catalog_snapshot,
+    expectation_from_manifest,
+    prove_ordered_service,
+    read_ordered_service,
+    read_pagination,
+    verify_baseline,
+)
 from altegio_bot.easyweek_migration.target_snapshot import (
     TargetSnapshotError,
-    compare,
-    expected_snapshot,
     project_target,
 )
 from altegio_bot.easyweek_migration.write_client import (
@@ -145,6 +164,14 @@ ROLLBACK_TARGET_MODIFIED: Final = "rollback_target_modified_after_migration"
 ROLLBACK_TARGET_UNREADABLE: Final = "rollback_target_unreadable"
 ROLLBACK_ELIGIBLE: Final = "rollback_eligible"
 ROLLBACK_NO_SNAPSHOT: Final = "rollback_target_snapshot_missing"
+# The booking names no master, so rollback proves one the same way every other
+# path does. An unproven master is an unproven target, and an unproven target is
+# never cancelled.
+ROLLBACK_STAFF_UNPROVEN: Final = "rollback_staff_assignment_unproven"
+# Same rule for the service: a target whose service cannot be proven against its
+# stored baseline is a target we cannot identify, and an unidentified booking is
+# never cancelled.
+ROLLBACK_SERVICE_UNPROVEN: Final = "rollback_service_evidence_unproven"
 ROLLBACK_GATE_REFUSED: Final = "rollback_notification_gate_refused"
 
 # Operator resolution of an unknown outcome.
@@ -208,6 +235,168 @@ class RunInputs:
     resolve_absent_confirmed: bool = False
     # reconcile-only
     final: bool = False
+
+
+# Stable, PII-free reasons a row could not be prepared for writing.
+CUSTOMER_UNADDRESSABLE: Final = "customer_transport_fields_missing"
+# A booking was created and could not be proven. The run stops there.
+APPLY_HALTED_UNPROVEN: Final = "run halted: a created booking could not be proven; no further bookings were created"
+
+
+class ServiceEvidence:
+    """Durable expectations, plus a catalogue observation taken fresh each time.
+
+    The correction this class exists for. Its predecessor cached both halves for
+    a whole run: `load()` returned early once a location had been read, and every
+    pinned expectation was reused. So a bulk apply proved uniqueness against the
+    catalogue as it stood before its FIRST booking, and a service added
+    half-way through the run — one that made an earlier service ambiguous — was
+    invisible to every remaining POST.
+
+    The two halves are now separated on purpose:
+
+    ``baselines``
+        the stored expectations, loaded once because they are immutable by
+        construction — nothing but an explicit operator act changes them;
+    ``observe()``
+        a catalogue read, taken **again at every operation boundary** and never
+        remembered. There is no positive result to go stale, and no TTL to tune.
+
+    Re-reading is not a lock and is not claimed to be one: a service can still be
+    added between the read and the POST that follows it. What it removes is the
+    specific defect — a snapshot from the top of a bulk being treated as evidence
+    for its two-hundredth booking.
+    """
+
+    def __init__(self, baselines: dict[tuple[str, str], ServiceBaseline] | None = None) -> None:
+        self.baselines: dict[tuple[str, str], ServiceBaseline] = dict(baselines or {})
+        # Only failures are remembered, and only for the report. A refusal that
+        # is re-checked and passes simply produces no new entry; a positive
+        # result is never cached, because that is the bug.
+        self._failures: dict[tuple[str, str], str] = {}
+        self._observations = 0
+
+    async def observe(
+        self, write_client: EasyWeekMigrationWriteClient, *, location_uuid: str
+    ) -> CatalogSnapshot | None:
+        """Read every page of one location's catalogue, now. Never cached.
+
+        Uniqueness is judged over the whole returned catalogue: no filtering by
+        the wave's services, by category or by master, because the look-alike
+        that would make an attribute match ambiguous is exactly the entry such a
+        filter would hide.
+
+        Goes through the shared client, so the existing rate limiter and its
+        bounded, safe GET retries still apply. Nothing here fans out.
+        """
+        rows: list[Any] = []
+        page = 1
+        while True:
+            try:
+                payload = await write_client.list_location_services(location_uuid, page=page)
+            except EasyWeekError:
+                return self._refuse(location_uuid, CATALOG_UNREADABLE)
+            data = payload.get("data")
+            if not isinstance(data, list):
+                return self._refuse(location_uuid, CATALOG_UNREADABLE)
+            try:
+                last_page, total = read_pagination(payload.get("meta"), page=page)
+            except ServiceEvidenceError as exc:
+                return self._refuse(location_uuid, exc.reason)
+            rows.extend(data)
+            if page >= last_page:
+                if len(rows) != total:
+                    # A page set that does not add up to the stated total is a
+                    # partial catalogue, and a partial catalogue cannot prove
+                    # that anything in it is unique.
+                    return self._refuse(location_uuid, CATALOG_UNREADABLE)
+                break
+            page += 1
+
+        try:
+            snapshot = build_catalog_snapshot(location_uuid, rows)
+        except ServiceEvidenceError as exc:
+            return self._refuse(location_uuid, exc.reason)
+        self._observations += 1
+        return snapshot
+
+    def _refuse(self, location_uuid: str, reason: str) -> None:
+        self._failures[(location_uuid, "")] = reason
+        return None
+
+    async def prove(
+        self,
+        write_client: EasyWeekMigrationWriteClient,
+        decision: Decision,
+    ) -> ServiceBaseline | None:
+        """Re-read the catalogue and check it still satisfies the stored baseline.
+
+        The only way any path gets a usable expectation. A missing stored
+        baseline is a refusal, not an invitation to derive one: deriving it here
+        would mean the check compares the catalogue with itself, which is the
+        circularity the baseline table exists to break. Establishing one happens
+        in exactly one place — beside the ledger claim, before the first POST for
+        that service — and never as a side effect of proving.
+        """
+        location_uuid = decision.easyweek_location_uuid
+        service_uuid = decision.easyweek_service_uuid
+        if location_uuid is None or service_uuid is None:
+            return None
+        key = (location_uuid, service_uuid)
+
+        baseline = self.baselines.get(key)
+        if baseline is None:
+            self._failures[key] = SERVICE_BASELINE_MISSING
+            return None
+
+        catalog = await self.observe(write_client, location_uuid=location_uuid)
+        if catalog is None:
+            return None
+        try:
+            verify_baseline(catalog, baseline)
+        except ServiceEvidenceError as exc:
+            self._failures[key] = exc.reason
+            return None
+        self._failures.pop(key, None)
+        return baseline
+
+    def note_failure(self, decision: Decision, reason: str) -> None:
+        location_uuid = decision.easyweek_location_uuid or ""
+        service_uuid = decision.easyweek_service_uuid or ""
+        self._failures[(location_uuid, service_uuid)] = reason
+
+    def failure_for(self, decision: Decision) -> str:
+        """The stable reason a service could not be proven."""
+        location_uuid = decision.easyweek_location_uuid or ""
+        service_uuid = decision.easyweek_service_uuid or ""
+        return self._failures.get((location_uuid, service_uuid)) or self._failures.get(
+            (location_uuid, ""), CATALOG_UNREADABLE
+        )
+
+    def as_safe_dict(self) -> dict[str, Any]:
+        return {
+            "method": SERVICE_PROOF_METHOD,
+            "baseline_version": SERVICE_BASELINE_VERSION,
+            "stored_baselines": baseline_store.as_safe_dict(self.baselines),
+            "catalog_observations": self._observations,
+            "refusals": sorted(set(self._failures.values())),
+        }
+
+
+async def load_service_evidence(session_maker: async_sessionmaker[AsyncSession], inputs: RunInputs) -> ServiceEvidence:
+    """Load the stored expectations for every branch this manifest names.
+
+    Reads PostgreSQL only. The catalogue itself is deliberately NOT read here:
+    an observation taken at the start of a command must never become the evidence
+    a later operation in that command leans on.
+    """
+    locations = tuple(
+        branch.easyweek_location_uuid
+        for company_id in inputs.manifest.company_ids
+        if (branch := inputs.manifest.branch(company_id)) is not None
+    )
+    async with session_maker() as session:
+        return ServiceEvidence(await load_baselines(session, location_uuids=locations))
 
 
 async def build_plan(
@@ -608,9 +797,20 @@ async def run_apply(
         if decision.outcome != READY:
             report.note(decision)
 
+    # The stored expectations. Each booking re-reads the catalogue for itself
+    # immediately before its own POST — see `_service_baseline_for`.
+    evidence = await load_service_evidence(session_maker, inputs)
+    report.service_evidence = evidence.as_safe_dict()
+
     for decision in (d for d in decisions if d.outcome == READY):
         outcome, reason = await _apply_one(
-            session_maker, inputs, decision, write_client=write_client, http_client=http_client
+            session_maker,
+            inputs,
+            decision,
+            write_client=write_client,
+            evidence=evidence,
+            http_client=http_client,
+            verify_readback=True,
         )
         if outcome in (CREATED, UNCERTAIN, FAILED):
             report.mutations_attempted += 1
@@ -619,6 +819,16 @@ async def run_apply(
             # Stop. We do not know whether the last write landed, so we cannot
             # reason about the next one either. `reconcile` first.
             report.errors.append("run halted after an uncertain mutation; run reconcile before applying again")
+            break
+        report.service_evidence = evidence.as_safe_dict()
+        if outcome == CREATED and reason is not None:
+            # The POST landed and the proof did not. The booking exists, its UUID
+            # and the failing reason are recorded, and nothing else is created:
+            # whatever made this one unprovable would make the next one
+            # unprovable too, and a run that keeps writing while it cannot verify
+            # is a run producing bookings nobody has checked. Never a second POST
+            # and never an automatic cancellation — a human looks at it.
+            report.errors.append(APPLY_HALTED_UNPROVEN)
             break
 
     return report
@@ -683,11 +893,15 @@ async def run_canary(
         report.errors.append(CANARY_NOT_READY)
         return report
 
+    evidence = await load_service_evidence(session_maker, inputs)
+    report.service_evidence = evidence.as_safe_dict()
+
     outcome, reason = await _apply_one(
         session_maker,
         inputs,
         chosen,
         write_client=write_client,
+        evidence=evidence,
         http_client=http_client,
         verify_readback=True,
         binding_for_proof=binding,
@@ -695,6 +909,7 @@ async def run_canary(
     if outcome in (CREATED, UNCERTAIN, FAILED):
         report.mutations_attempted += 1
     report.note(chosen, outcome=outcome, reason=reason)
+    report.service_evidence = evidence.as_safe_dict()
 
     # A canary is only green when the booking was created AND read back clean.
     # `CREATED` with a reason means the write landed but the verification did
@@ -704,12 +919,105 @@ async def run_canary(
     return report
 
 
+async def _service_baseline_for(
+    session_maker: async_sessionmaker[AsyncSession],
+    inputs: RunInputs,
+    decision: Decision,
+    *,
+    evidence: ServiceEvidence,
+    write_client: EasyWeekMigrationWriteClient,
+    wave_identity: str | None = None,
+) -> ServiceBaseline | None:
+    """The expectation this booking must satisfy, proven against a fresh catalogue.
+
+    Establishes it the first time a service is migrated and verifies it every
+    time after. The order matters and is the whole point:
+
+    1. read the catalogue **now**;
+    2. if this service has no stored expectation, derive one — which requires the
+       manifest's own price and duration to still agree with the catalogue — and
+       write it down before anything is created;
+    3. verify what is actually stored against that same fresh read.
+
+    Step 3 verifies the STORED row, not the candidate from step 2, because
+    another run may have established it first and the row already there wins. A
+    service that has drifted since it was reviewed fails here — before the claim,
+    so a refusal leaves no `pending` row behind.
+    """
+    location_uuid = decision.easyweek_location_uuid
+    service_uuid = decision.easyweek_service_uuid
+    if location_uuid is None or service_uuid is None:
+        return None
+
+    key = (location_uuid, service_uuid)
+
+    # 1. The REVIEWED expectation, from the manifest the plan digest covers.
+    #    Built first and from the file alone — never from the catalogue — so a
+    #    service edited after the review cannot supply its own expectation.
+    mapping = _service_mapping_for(inputs.manifest, decision)
+    if mapping is None:
+        evidence.note_failure(decision, SERVICE_BASELINE_MISSING)
+        return None
+    try:
+        expected = expectation_from_manifest(location_uuid, easyweek_service_uuid=service_uuid, mapping=mapping)
+    except ServiceEvidenceError as exc:
+        evidence.note_failure(decision, exc.reason)
+        return None
+
+    # 2. The STORED expectation, if this service has been migrated before. It and
+    #    the reviewed one must agree. Neither is allowed to win automatically:
+    #    silently preferring the manifest would be a re-baseline by another name,
+    #    and silently preferring the row would let a reviewed change be ignored.
+    stored = evidence.baselines.get(key)
+    if stored is not None and stored.digest != expected.digest:
+        evidence.note_failure(decision, SERVICE_BASELINE_CONFLICTS_WITH_PLAN)
+        return None
+
+    if stored is None:
+        # 3. First booking for this service. The catalogue is read to CONFIRM the
+        #    reviewed expectation still holds — it supplies no values — and the
+        #    expectation is written down before anything is created.
+        catalog = await evidence.observe(write_client, location_uuid=location_uuid)
+        if catalog is None:
+            return None
+        try:
+            verify_baseline(catalog, expected)
+        except ServiceEvidenceError as exc:
+            evidence.note_failure(decision, exc.reason)
+            return None
+        async with session_maker() as session:
+            async with session.begin():
+                written, _outcome = await baseline_store.establish(
+                    session, expected, run_id=inputs.run_id, wave_identity=wave_identity
+                )
+        # A concurrent run may have won the insert with a different expectation.
+        if written.digest != expected.digest:
+            evidence.note_failure(decision, SERVICE_BASELINE_CONFLICTS_WITH_PLAN)
+            return None
+        evidence.baselines[key] = written
+
+    # 4. Always a fresh catalogue read for the verification itself.
+    return await evidence.prove(write_client, decision)
+
+
+def _service_mapping_for(manifest: MigrationManifest, decision: Decision) -> ServiceMapping | None:
+    """The manifest entry behind a decision's EasyWeek service uuid."""
+    branch = manifest.branch(decision.source_company_id)
+    if branch is None:
+        return None
+    return next(
+        (entry for entry in branch.services.values() if entry.easyweek_service_uuid == decision.easyweek_service_uuid),
+        None,
+    )
+
+
 async def _apply_one(
     session_maker: async_sessionmaker[AsyncSession],
     inputs: RunInputs,
     decision: Decision,
     *,
     write_client: EasyWeekMigrationWriteClient,
+    evidence: ServiceEvidence,
     http_client: httpx.AsyncClient | None = None,
     verify_readback: bool = False,
     binding_for_proof: Any = None,
@@ -755,6 +1063,36 @@ async def _apply_one(
             )
         return BLOCKED, detail
 
+    # -- everything that can still refuse, BEFORE the ledger claim ---------
+    # A refusal after the claim leaves a `pending` row, and `pending` means "a
+    # POST may have been sent". None of these checks sends anything, so all of
+    # them belong on this side of the line.
+
+    # The service. The catalogue is read AGAIN here, immediately before this
+    # booking — not once at the top of the run. A bulk apply walks its plan for
+    # many minutes, and a look-alike service added in those minutes makes an
+    # earlier service ambiguous; a snapshot taken before the first POST cannot
+    # see that and would license every remaining one.
+    expectation = await _service_baseline_for(
+        session_maker,
+        inputs,
+        decision,
+        evidence=evidence,
+        write_client=write_client,
+        wave_identity=getattr(binding_for_proof, "wave_identity", None),
+    )
+    if expectation is None:
+        return BLOCKED, evidence.failure_for(decision)
+
+    # The customer's transport fields, taken from the EasyWeek card we matched.
+    # `POST /bookings` rejects `customer_uuid` and requires a phone and a given
+    # name, so these have to travel — but only ever as EasyWeek already spells
+    # them. Missing means blocked: writing Altegio's spelling over the card that
+    # holds the imported visit history is not a fallback, it is damage.
+    card = inputs.directory.transport_fields(decision.easyweek_customer_uuid)
+    if card is None:
+        return BLOCKED, CUSTOMER_UNADDRESSABLE
+
     async with session_maker() as session:
         async with session.begin():
             claimed = await ledger_module.claim_for_apply(
@@ -772,13 +1110,14 @@ async def _apply_one(
 
     marker = ledger_module.migration_marker(source_company_id=company_id, source_record_id=record_id)
     starts_at_iso = decision.starts_at_utc.isoformat().replace("+00:00", "Z")
+
     body = build_booking_request(
         location_uuid=decision.easyweek_location_uuid,
-        staff_uuid=decision.easyweek_staff_uuid,
+        staffer_uuid=decision.easyweek_staff_uuid,
         service_uuid=decision.easyweek_service_uuid,
-        customer_uuid=decision.easyweek_customer_uuid,
-        starts_at_utc_iso=starts_at_iso,
-        duration_minutes=decision.duration_minutes,
+        customer_phone=card.phone,
+        customer_first_name=card.first_name or "",
+        reserved_on_utc_iso=starts_at_iso,
         comment=marker,
     )
 
@@ -829,36 +1168,33 @@ async def _apply_one(
             )
         return FAILED, _safe_error_code(exc)
 
-    wanted = expected_snapshot(
-        booking_uuid=created.booking_uuid,
-        location_uuid=decision.easyweek_location_uuid,
-        staff_uuid=decision.easyweek_staff_uuid,
-        service_uuid=decision.easyweek_service_uuid,
-        customer_uuid=decision.easyweek_customer_uuid,
-        start_time_utc=starts_at_iso,
-        duration_minutes=decision.duration_minutes,
-        marker=marker,
-    )
+    wanted = expected_target_for(decision, booking_uuid=created.booking_uuid, marker=marker, expectation=expectation)
 
     readback_failure: str | None = None
     stored_snapshot = wanted
     if verify_readback:
-        # The canary reads the booking back and compares every write-critical
-        # field. A 2xx alone says the request was accepted, not that it landed
-        # where we meant it to.
-        try:
-            live_payload = await write_client.get_booking(created.booking_uuid)
-            live = project_target(live_payload, expected_marker=marker)
-        except TargetSnapshotError as exc:
-            readback_failure = f"{CANARY_READBACK_FAILED}:{exc.reason}"
-        except EasyWeekError:
-            readback_failure = CANARY_READBACK_FAILED
+        # The canary reads the booking back through the SAME proof every other
+        # path uses: the projection, the catalogue service check and the
+        # independent master query. A 2xx alone says the request was accepted,
+        # not that it landed where we meant it to — and against this API a 2xx
+        # says nothing at all about which master got the appointment.
+        # The catalogue is read AGAIN for the readback. The pre-POST proof is not
+        # eternal: a look-alike published between the POST and this moment makes
+        # the service ambiguous, and reusing the earlier snapshot would call the
+        # booking proven on evidence that has since stopped being true.
+        readback_baseline = await evidence.prove(write_client, decision)
+        proof = await prove_live_target(
+            write_client,
+            target_booking_uuid=created.booking_uuid,
+            marker=marker,
+            expected=wanted,
+            service_baseline=readback_baseline,
+        )
+        if not proof.proven:
+            readback_failure = f"{CANARY_READBACK_FAILED}:{proof.reason}"
         else:
-            mismatch = compare(live, wanted)
-            if not mismatch.matched:
-                readback_failure = f"{CANARY_READBACK_FAILED}:{mismatch.reasons[0]}"
-            else:
-                stored_snapshot = live
+            assert proof.live is not None
+            stored_snapshot = proof.live
 
     async with session_maker() as session:
         async with session.begin():
@@ -977,6 +1313,12 @@ async def run_reconcile(
             }
         return report
 
+    # The stored expectations, from PostgreSQL. The catalogue itself is read
+    # again by each proof below — resolving an uncertain row, and every target
+    # the final reconciliation checks — so no observation is reused across them.
+    evidence = await load_service_evidence(session_maker, inputs)
+    report.service_evidence = evidence.as_safe_dict()
+
     async with session_maker() as session:
         pending = await ledger_module.uncertain_rows(session)
         # The source fingerprint is carried alongside the report-safe row: it is
@@ -1032,6 +1374,7 @@ async def run_reconcile(
 
         proven, reason, live = await _prove_uncertain_row_against_target(
             inputs,
+            evidence=evidence,
             company_id=company_id,
             record_id=record_id,
             stored_source_fingerprint=stored_fingerprint,
@@ -1075,6 +1418,7 @@ async def run_reconcile(
             inputs,
             report=report,
             ledger_by_identity=by_identity,
+            evidence=evidence,
             write_client=write_client,
             http_client=http_client,
         )
@@ -1088,6 +1432,7 @@ async def _prove_completeness(
     *,
     report: MigrationReport,
     ledger_by_identity: dict[tuple[int, int], Any],
+    evidence: ServiceEvidence,
     write_client: EasyWeekMigrationWriteClient | None,
     http_client: httpx.AsyncClient | None = None,
 ) -> dict[str, Any]:
@@ -1118,6 +1463,10 @@ async def _prove_completeness(
     # masters, whose reason code is reported separately below.
     active: list[Decision] = [d for d in decisions if d.outcome != SKIPPED]
     deferred = sum(1 for d in decisions if d.outcome == SKIPPED and d.reason == SKIP_STAFF_DEFERRED)
+    # Breaks, excluded by owner decision. Reported next to `deferred` because
+    # both answer the same operator question — "what did this wave not migrate,
+    # and is that a problem?" — and for both the answer is "no".
+    empty_services = sum(1 for d in decisions if d.outcome == SKIPPED and d.reason == SKIP_EMPTY_SERVICES)
 
     unaccounted: list[dict[str, Any]] = []
     reasons: Counter = Counter()
@@ -1185,11 +1534,26 @@ async def _prove_completeness(
             source_company_id=decision.source_company_id,
             source_record_id=decision.source_record_id,
         )
+        # The service, re-proven against a catalogue read for THIS target. The
+        # reconciliation used to skip this entirely: it passed no expectation, so
+        # `prove_live_target` had nothing to check the ordered line against and a
+        # matching fingerprint over the other fields read as a clean target.
+        service_baseline = await evidence.prove(write_client, decision)
+        if service_baseline is None:
+            _unaccount(decision, evidence.failure_for(decision))
+            continue
+
         proof = await prove_live_target(
             write_client,
             target_booking_uuid=row.target_booking_uuid,
             marker=marker,
             expected_fingerprint=row.target_snapshot_fingerprint,
+            # The stored fingerprint binds the master, and the booking payload
+            # names none — so the master has to be re-proven by the filtered
+            # list before the fingerprints can even be compared.
+            expected_staff_uuid=decision.easyweek_staff_uuid,
+            expected_location_uuid=decision.easyweek_location_uuid,
+            service_baseline=service_baseline,
         )
         if not proof.proven:
             _unaccount(decision, proof.reason)
@@ -1263,11 +1627,49 @@ async def _prove_completeness(
             # A correct row of an earlier wave. It is not a ghost — but it is
             # not taken on trust either: its target is proven live and still
             # matching the fingerprint stored when it was written.
+            # An earlier wave's row: no decision to read the master off, so the
+            # expected master comes from the manifest mapping of the Altegio
+            # staff id the live source states — and is then PROVEN by the same
+            # filtered-list query as everywhere else. The manifest supplies the
+            # question; EasyWeek supplies the answer.
+            earlier_branch = inputs.manifest.branch(company_id)
+            expected_staff = (
+                earlier_branch.staff_uuid(lifecycle.altegio_staff_id) if earlier_branch is not None else None
+            )
+            # An earlier wave's target is proven against ITS OWN stored
+            # baseline — the expectation written down when it was created, which
+            # no later plan rewrites.
+            earlier_baseline = None
+            earlier_service = (
+                earlier_branch.service(lifecycle.altegio_service_id)
+                if earlier_branch is not None and lifecycle.altegio_service_id is not None
+                else None
+            )
+            if earlier_service is not None:
+                assert earlier_branch is not None
+                earlier_baseline = evidence.baselines.get(
+                    (earlier_branch.easyweek_location_uuid, earlier_service.easyweek_service_uuid)
+                )
+                if earlier_baseline is not None:
+                    catalog = await evidence.observe(write_client, location_uuid=earlier_branch.easyweek_location_uuid)
+                    try:
+                        if catalog is None:
+                            raise ServiceEvidenceError(CATALOG_UNREADABLE)
+                        verify_baseline(catalog, earlier_baseline)
+                    except ServiceEvidenceError as exc:
+                        entry["completeness_reason"] = exc.reason
+                        reasons[exc.reason] += 1
+                        ghosts.append(entry)
+                        continue
+
             proof = await prove_live_target(
                 write_client,
                 target_booking_uuid=row.target_booking_uuid,
                 marker=marker,
                 expected_fingerprint=row.target_snapshot_fingerprint,
+                expected_staff_uuid=expected_staff,
+                expected_location_uuid=earlier_branch.easyweek_location_uuid if earlier_branch is not None else None,
+                service_baseline=earlier_baseline,
             )
             targets_checked += 1
             if proof.proven:
@@ -1332,6 +1734,7 @@ async def _prove_completeness(
         "targets_were_checked": targets_were_checked,
         "source_active_bookings": len(active),
         "deferred_bookings": deferred,
+        "excluded_empty_services": empty_services,
         "accounted_for": accounted,
         "live_targets_proven": targets_proven,
         "blocked": blocked_now,
@@ -1359,6 +1762,7 @@ async def _prove_completeness(
 async def _prove_uncertain_row_against_target(
     inputs: RunInputs,
     *,
+    evidence: ServiceEvidence,
     company_id: int,
     record_id: int,
     stored_source_fingerprint: str,
@@ -1411,13 +1815,24 @@ async def _prove_uncertain_row_against_target(
         detail = f"{reproof.reason}:{reproof.detail}" if reproof.detail else reproof.reason
         return False, f"{RESOLVE_SOURCE_UNPROVEN}:{detail}", None
 
+    # The service, re-proven against a catalogue read now, against the baseline
+    # stored when the booking was created. A resolution is a claim that a
+    # specific booking is the right one, so it carries the same burden a creation
+    # does — and never a verdict cached from earlier in this command.
+    expectation = await evidence.prove(write_client, expected_decision)
+    if expectation is None:
+        return False, f"{RESOLVE_SOURCE_UNPROVEN}:{evidence.failure_for(expected_decision)}", None
+
     marker = ledger_module.migration_marker(source_company_id=company_id, source_record_id=record_id)
-    expected = expected_target_for(expected_decision, booking_uuid=target_booking_uuid, marker=marker)
+    expected = expected_target_for(
+        expected_decision, booking_uuid=target_booking_uuid, marker=marker, expectation=expectation
+    )
     proof = await prove_live_target(
         write_client,
         target_booking_uuid=target_booking_uuid,
         marker=marker,
         expected=expected,
+        service_baseline=expectation,
     )
     if not proof.proven:
         return False, proof.reason, None
@@ -1561,8 +1976,12 @@ async def run_resolve_created(
         report.errors.append(RESOLVE_NOT_UNCERTAIN)
         return report
 
+    evidence = await load_service_evidence(session_maker, inputs)
+    report.service_evidence = evidence.as_safe_dict()
+
     proven, reason, live = await _prove_uncertain_row_against_target(
         inputs,
+        evidence=evidence,
         company_id=company_id,
         record_id=record_id,
         stored_source_fingerprint=stored_source_fingerprint,
@@ -1674,6 +2093,7 @@ async def run_rollback(
     inputs: RunInputs,
     *,
     write_client: EasyWeekMigrationWriteClient,
+    http_client: httpx.AsyncClient | None = None,
 ) -> MigrationReport:
     """Find, and only on explicit confirmation cancel, one run's own bookings.
 
@@ -1739,6 +2159,10 @@ async def run_rollback(
             report.reasons[ROLLBACK_GATE_REFUSED] += 1
             return report
 
+    # The stored expectations. Each row re-reads the catalogue for itself below.
+    evidence = await load_service_evidence(session_maker, inputs)
+    report.service_evidence = evidence.as_safe_dict()
+
     async with session_maker() as session:
         rows = await ledger_module.rows_for_run(session, run_id=target_run, statuses=(ledger_module.STATUS_CREATED,))
         candidates = [
@@ -1748,11 +2172,12 @@ async def run_rollback(
                 row.source_record_id,
                 row.target_booking_uuid,
                 row.target_snapshot_fingerprint,
+                row.source_fingerprint,
             )
             for row in rows
         ]
 
-    for safe_row, company_id, record_id, target, stored_fingerprint in candidates:
+    for safe_row, company_id, record_id, target, stored_fingerprint, source_fingerprint in candidates:
         entry = dict(safe_row)
 
         def _refuse(reason: str) -> None:
@@ -1788,6 +2213,60 @@ async def run_rollback(
             # cancelled or completed booking. All of them mean "we cannot prove
             # this is untouched", which is treated exactly as "it was touched".
             _refuse(ROLLBACK_TARGET_MODIFIED)
+            continue
+
+        # The stored fingerprint binds the master, and the booking payload names
+        # none — so rollback proves it the same way every other path does, and
+        # refuses when it cannot. That is the contract stated the other way
+        # round: a target we cannot prove is a target we must not cancel.
+        #
+        # The master to ask about comes from re-deriving the source, which is
+        # also the check that the appointment still is the one we wrote. A source
+        # that has moved on since therefore blocks the cancellation — deliberately:
+        # cancelling a booking somebody has deliberately changed is the damage
+        # this whole path exists to avoid.
+        _reproof, fresh_decision = await reclassify_source_for_resolution(
+            company_id=company_id,
+            record_id=record_id,
+            expected_fingerprint=source_fingerprint,
+            manifest=inputs.manifest,
+            directory=inputs.directory,
+            cutover=inputs.cutover,
+            http_client=http_client,
+            # Rollback is scoped by run id, not by wave. A master this manifest
+            # defers today may well be the master that run created for.
+            ignore_wave_scope=True,
+        )
+        if fresh_decision is None or fresh_decision.easyweek_staff_uuid is None:
+            _refuse(ROLLBACK_TARGET_MODIFIED)
+            continue
+
+        assignment = await prove_staff_assignment(
+            write_client,
+            target_booking_uuid=live.booking_uuid,
+            location_uuid=live.location_uuid,
+            staff_uuid=fresh_decision.easyweek_staff_uuid,
+            start_time_utc=live.start_time_utc,
+        )
+        if not assignment.proven:
+            _refuse(ROLLBACK_STAFF_UNPROVEN)
+            continue
+        live = live.with_proven_staff(fresh_decision.easyweek_staff_uuid)
+
+        # The service, through the SAME proof every other path uses. Rollback had
+        # its own weaker check — project the booking, compare the fingerprint —
+        # which never looked at the ordered line at all. An ambiguous or drifted
+        # service therefore left a target "eligible" for cancellation, and
+        # cancelling a booking we cannot identify is the damage this path exists
+        # to avoid.
+        service_baseline = await evidence.prove(write_client, fresh_decision)
+        if service_baseline is None:
+            _refuse(ROLLBACK_SERVICE_UNPROVEN)
+            continue
+        try:
+            prove_ordered_service(read_ordered_service(booking), service_baseline)
+        except ServiceEvidenceError:
+            _refuse(ROLLBACK_SERVICE_UNPROVEN)
             continue
 
         if live.fingerprint != stored_fingerprint:

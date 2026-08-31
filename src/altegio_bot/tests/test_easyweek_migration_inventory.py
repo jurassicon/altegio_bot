@@ -20,7 +20,6 @@ import pytest_asyncio
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from altegio_bot.easyweek_migration import runner as runner_module
-from altegio_bot.easyweek_migration.customers import CustomerDirectory
 from altegio_bot.easyweek_migration.cutover import parse_cutover
 from altegio_bot.easyweek_migration.manifest import (
     KARLSRUHE_COMPANY_ID,
@@ -43,6 +42,7 @@ from altegio_bot.tests.test_easyweek_migration_planning import (
     KA_STAFF_ID,
     KA_STAFF_UUID,
     RA_LOCATION_UUID,
+    directory_with,
     record,
 )
 
@@ -126,7 +126,7 @@ def inputs_for(mode: str, manifest_text: str) -> RunInputs:
         run_id=new_run_id(),
         cutover=parse_cutover("2026-09-01T00:00:00Z"),
         manifest=manifest,
-        directory=CustomerDirectory(valid=True, by_phone={CUSTOMER_PHONE: [CUSTOMER_UUID]}),
+        directory=directory_with(),
     )
 
 

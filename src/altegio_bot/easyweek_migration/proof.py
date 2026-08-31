@@ -32,6 +32,13 @@ from typing import Any, Final
 
 from altegio_bot.easyweek_client import EasyWeekError, EasyWeekNotFoundError
 from altegio_bot.easyweek_migration.classify import Decision
+from altegio_bot.easyweek_migration.service_catalog import (
+    ServiceBaseline,
+    ServiceEvidenceError,
+    prove_ordered_service,
+    read_ordered_service,
+    read_pagination,
+)
 from altegio_bot.easyweek_migration.target_snapshot import (
     SNAPSHOT_NOT_ACTIVE,
     TargetSnapshot,
@@ -40,7 +47,10 @@ from altegio_bot.easyweek_migration.target_snapshot import (
     expected_snapshot,
     project_target,
 )
-from altegio_bot.easyweek_migration.write_client import EasyWeekMigrationWriteClient
+from altegio_bot.easyweek_migration.write_client import (
+    EASYWEEK_BOOKING_TIMEZONE,
+    EasyWeekMigrationWriteClient,
+)
 
 logger = logging.getLogger("easyweek_migration.proof")
 
@@ -52,6 +62,22 @@ TARGET_UNREADABLE: Final = "target_unreadable"
 TARGET_MALFORMED: Final = "target_malformed"
 TARGET_FINGERPRINT_MISMATCH: Final = "target_fingerprint_mismatch"
 TARGET_PROVEN: Final = "target_proven"
+# The master. The booking response names no staffer at all, so assignment is
+# proven by the documented filtered list and by nothing else.
+STAFF_LIST_UNREADABLE: Final = "staff_assignment_list_unreadable"
+STAFF_LIST_INCOMPLETE: Final = "staff_assignment_list_incomplete"
+STAFF_NOT_ASSIGNED: Final = "staff_assignment_absent"
+STAFF_ASSIGNMENT_PROVEN: Final = "staff_assignment_proven"
+# The service, under the limited attribute method of plan §28.
+SERVICE_EVIDENCE_MISSING: Final = "service_evidence_missing"
+
+# `GET /bookings` caps a page at 100 (documented). Asking for the maximum keeps
+# the number of round trips down without relying on a default we did not set.
+_BOOKINGS_PER_PAGE: Final = 100
+# A filtered list bounded to one instant at one location for one master should
+# be a handful of rows. Anything past this is a filter that is not filtering,
+# and reading on would be pretending we understand the response.
+_MAX_BOOKING_PAGES: Final = 20
 
 
 @dataclass(frozen=True)
@@ -66,12 +92,109 @@ class TargetProof:
         return {"target_proof": self.reason, "target_proven": self.proven}
 
 
-def expected_target_for(decision: Decision, *, booking_uuid: str, marker: str) -> TargetSnapshot:
+@dataclass(frozen=True)
+class StaffAssignmentProof:
+    """Whether a named master really holds this booking."""
+
+    proven: bool
+    reason: str
+    pages_read: int = 0
+
+    def as_safe_dict(self) -> dict[str, Any]:
+        return {"staff_assignment": self.reason, "staff_assignment_proven": self.proven}
+
+
+async def prove_staff_assignment(
+    write_client: EasyWeekMigrationWriteClient,
+    *,
+    target_booking_uuid: str,
+    location_uuid: str,
+    staff_uuid: str,
+    start_time_utc: str,
+) -> StaffAssignmentProof:
+    """Prove one booking belongs to one master, by documented list membership.
+
+    ``GET /bookings/{uuid}`` returns no staffer field of any kind, so there is
+    nothing on the booking to compare. What there is, is a documented filter:
+    ``GET /bookings?staffer_uuid=...``. An operator probe confirmed it
+    discriminates on live data — a known test booking appeared under its own
+    master and was absent from an otherwise identical query naming a different
+    one.
+
+    So the question asked here is membership: with the list bounded to this
+    location, this master and this exact instant, does our booking's UUID appear?
+
+    Everything that is not a complete, readable list containing the target is a
+    refusal, and each has its own code:
+
+    * the request failed, or a page could not be read → unreadable;
+    * the pagination metadata is missing, inconsistent or unbounded → incomplete;
+    * the list read cleanly to its last page and our booking is not in it → not
+      assigned to this master.
+
+    The last one is the finding that matters: it is what "EasyWeek gave the
+    appointment to somebody else" looks like. Reading only the first page would
+    make it indistinguishable from "it is on page two", which is why an
+    incomplete list is never allowed to answer.
+
+    Read-only. Never logs a row: this list carries customer names and phones.
+    """
+    params = {
+        "location_uuid": location_uuid,
+        "staffer_uuid": staff_uuid,
+        # Inclusive bounds, both the booking's own instant: the tightest window
+        # the documented filter allows.
+        "reserved_on_from": start_time_utc,
+        "reserved_on_to": start_time_utc,
+        "per_page": _BOOKINGS_PER_PAGE,
+    }
+
+    page = 1
+    while page <= _MAX_BOOKING_PAGES:
+        try:
+            payload = await write_client.list_bookings(params={**params, "page": page})
+        except EasyWeekError:
+            return StaffAssignmentProof(proven=False, reason=STAFF_LIST_UNREADABLE, pages_read=page - 1)
+
+        rows = payload.get("data")
+        if not isinstance(rows, list):
+            return StaffAssignmentProof(proven=False, reason=STAFF_LIST_INCOMPLETE, pages_read=page - 1)
+        try:
+            last_page, _total = read_pagination(payload.get("meta"), page=page)
+        except ServiceEvidenceError:
+            return StaffAssignmentProof(proven=False, reason=STAFF_LIST_INCOMPLETE, pages_read=page - 1)
+
+        for row in rows:
+            if isinstance(row, dict) and row.get("uuid") == target_booking_uuid:
+                return StaffAssignmentProof(proven=True, reason=STAFF_ASSIGNMENT_PROVEN, pages_read=page)
+
+        if page >= last_page:
+            # The list is complete and our booking is not in it.
+            return StaffAssignmentProof(proven=False, reason=STAFF_NOT_ASSIGNED, pages_read=page)
+        page += 1
+
+    return StaffAssignmentProof(proven=False, reason=STAFF_LIST_INCOMPLETE, pages_read=_MAX_BOOKING_PAGES)
+
+
+def expected_target_for(
+    decision: Decision,
+    *,
+    booking_uuid: str,
+    marker: str,
+    expectation: ServiceBaseline,
+    timezone_name: str = EASYWEEK_BOOKING_TIMEZONE,
+) -> TargetSnapshot:
     """The snapshot a correctly-migrated booking of *decision* would have.
 
-    Built from the decision the classifier just produced, so it always describes
-    the booking as the migration would create it **today** — which is what makes
-    it a real comparison rather than a restatement of whatever EasyWeek returned.
+    Built from the decision the classifier just produced plus the service
+    expectation pinned from the live catalogue, so it describes the booking as
+    the migration would create it **today** — a real comparison rather than a
+    restatement of whatever EasyWeek returned.
+
+    The money and the length come from :class:`ServiceExpectation` rather than
+    from the decision, because the API takes neither on the request: EasyWeek
+    prices and times the booking from its own catalogue, so the catalogue entry
+    is what the result has to be measured against.
     """
     assert decision.starts_at_utc is not None
     assert decision.duration_minutes is not None
@@ -79,14 +202,21 @@ def expected_target_for(decision: Decision, *, booking_uuid: str, marker: str) -
     assert decision.easyweek_staff_uuid is not None
     assert decision.easyweek_service_uuid is not None
     assert decision.easyweek_customer_uuid is not None
+    # The plan and the catalogue must already agree; `establish_baseline`
+    # refuses otherwise, and this restates it where it would be read.
+    assert decision.easyweek_service_uuid == expectation.easyweek_service_uuid
+    assert decision.duration_minutes == expectation.duration_minutes
     return expected_snapshot(
         booking_uuid=booking_uuid,
         location_uuid=decision.easyweek_location_uuid,
         staff_uuid=decision.easyweek_staff_uuid,
-        service_uuid=decision.easyweek_service_uuid,
         customer_uuid=decision.easyweek_customer_uuid,
         start_time_utc=decision.starts_at_utc.isoformat().replace("+00:00", "Z"),
-        duration_minutes=decision.duration_minutes,
+        duration_minutes=expectation.duration_minutes,
+        timezone_name=timezone_name,
+        currency=expectation.currency,
+        price_minor=expectation.price_minor,
+        service_name=expectation.normalized_name,
         marker=marker,
     )
 
@@ -98,6 +228,10 @@ async def prove_live_target(
     marker: str,
     expected: TargetSnapshot | None = None,
     expected_fingerprint: str | None = None,
+    expected_staff_uuid: str | None = None,
+    expected_location_uuid: str | None = None,
+    service_baseline: ServiceBaseline | None = None,
+    require_service_evidence: bool = True,
 ) -> TargetProof:
     """Fetch one booking and prove it is unchanged. Read-only; never POSTs.
 
@@ -113,6 +247,12 @@ async def prove_live_target(
         what we created?".
 
     When both are given both must hold.
+
+    Either way an ACTIVE target also needs ``service_baseline``: the booking
+    carries no catalogue service uuid, so without a stored expectation to compare
+    its ordered line against, nothing proves the right service is on it. A target
+    that is proven gone or finished goes through
+    :func:`prove_target_inactive_or_absent` instead, which never needed one.
 
     Every refusal is fail-closed and named. A missing UUID, a missing stored
     fingerprint, a 404, an unreadable response, a rewritten marker, a cancelled
@@ -142,6 +282,42 @@ async def prove_live_target(
         live = project_target(payload, expected_marker=marker)
     except TargetSnapshotError as exc:
         return TargetProof(proven=False, reason=f"{TARGET_MALFORMED}:{exc.reason}")
+
+    # The service, under the limited method plan §28 authorises. Run separately
+    # from `compare` because it is the only place a DIRECT catalogue uuid — if
+    # EasyWeek ever returns one — can be seen to contradict us. A conflicting
+    # direct link must never be rescued by matching attributes.
+    #
+    # REQUIRED, not optional. It was a keyword defaulting to None, and the two
+    # callers that mattered most — the final reconciliation and rollback — simply
+    # never passed it. So the service check switched itself off exactly where a
+    # wrong service does the most damage, and a fingerprint match over the
+    # remaining fields read as a clean target.
+    if service_baseline is None:
+        if require_service_evidence:
+            return TargetProof(proven=False, reason=SERVICE_EVIDENCE_MISSING, live=live)
+    else:
+        try:
+            prove_ordered_service(read_ordered_service(payload), service_baseline)
+        except ServiceEvidenceError as exc:
+            return TargetProof(proven=False, reason=str(exc), live=live)
+
+    # The master, from the documented filtered list. Attempted only when a
+    # caller states which master it expects; without one there is nothing to
+    # query for, and `compare` reports the snapshot as staff-unproven.
+    staff_uuid = expected_staff_uuid or (expected.staff_uuid if expected is not None else None)
+    location_uuid = expected_location_uuid or (expected.location_uuid if expected is not None else live.location_uuid)
+    if staff_uuid is not None:
+        assignment = await prove_staff_assignment(
+            write_client,
+            target_booking_uuid=live.booking_uuid,
+            location_uuid=location_uuid,
+            staff_uuid=staff_uuid,
+            start_time_utc=live.start_time_utc,
+        )
+        if not assignment.proven:
+            return TargetProof(proven=False, reason=assignment.reason, live=live)
+        live = live.with_proven_staff(staff_uuid)
 
     if expected is not None:
         mismatch = compare(live, expected)

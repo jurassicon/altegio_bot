@@ -67,6 +67,8 @@ from altegio_bot.settings import settings
 logger = logging.getLogger("easyweek_migration.write")
 
 _PATH_BOOKINGS: Final = "bookings"
+_PATH_LOCATIONS: Final = "locations"
+_PATH_SERVICES: Final = "services"
 
 # EasyWeek allows 60 requests/min per key (plan §1.1). The migration is the only
 # thing that ever runs at volume against that budget, and the shared outbox
@@ -132,42 +134,124 @@ class BookingCreated:
         return f"<BookingCreated uuid={self.booking_uuid!r} attempts={self.attempts}>"
 
 
+# The IANA zone these branches run on, as EasyWeek itself reports it on a live
+# booking (`"timezone": "Europe/Berlin"`). Sent explicitly rather than left to a
+# server default, and — because a constant is still an assumption — re-read from
+# the booking and compared at readback, so a wrong value fails a canary instead
+# of quietly shifting appointments.
+#
+# Not the same string as `cutover.ALTEGIO_LOCAL_TZ` ("Europe/Belgrade"), and
+# deliberately so: that one is how the Altegio production path parses source
+# timestamps, this one is what EasyWeek calls the destination's zone. The two
+# share CET/CEST offsets and DST rules to the second, so the instant is identical
+# either way; keeping them as separate names keeps the two contracts separate.
+EASYWEEK_BOOKING_TIMEZONE: Final = "Europe/Berlin"
+
+# Exactly the fields `POST /bookings` documents, and nothing else. Used to build
+# the request and to allowlist field names in 422 diagnostics — a server naming
+# a field outside this set is telling us something we must not paraphrase.
+BOOKING_REQUEST_FIELDS: Final[frozenset[str]] = frozenset(
+    {
+        "location_uuid",
+        "service_uuid",
+        "reserved_on",
+        "customer_phone",
+        "customer_first_name",
+        "staffer_uuid",
+        "booking_comment",
+        "timezone",
+    }
+)
+
+
 def build_booking_request(
     *,
     location_uuid: str,
-    staff_uuid: str,
+    staffer_uuid: str,
     service_uuid: str,
-    customer_uuid: str,
-    starts_at_utc_iso: str,
-    duration_minutes: int,
+    customer_phone: str,
+    customer_first_name: str,
+    reserved_on_utc_iso: str,
     comment: str,
+    timezone_name: str = EASYWEEK_BOOKING_TIMEZONE,
 ) -> dict[str, Any]:
-    """Build the ``POST /bookings`` body from PROVEN identifiers only.
+    """Build the ``POST /bookings`` body from the DOCUMENTED contract.
 
-    Every value here was resolved to exactly one UUID by the classifier; nothing
-    is derived from a name, and no field is filled in with a plausible default.
+    The first version of this function was written against the endpoint alone —
+    the plan confirmed the path but not the schema — and it guessed six field
+    names out of seven. EasyWeek answered 422 and the canary died there. The
+    published contract is:
 
-    The endpoint itself is confirmed by plan §1.1; its exact body schema is not
-    documented there. That is why the request shape lives in ONE function and why
-    the runbook makes a single-booking **canary** the gate before any bulk apply:
-    the canary is what proves this shape, and correcting it is a one-place change
-    rather than an archaeology exercise. Until the canary is green, no volume
-    goes anywhere near this.
+    ``location_uuid``, ``service_uuid``, ``reserved_on``, ``customer_phone`` and
+    ``customer_first_name`` are required; ``staffer_uuid``, ``booking_comment``
+    and ``timezone`` are the optional fields this migration uses. There is no
+    ``customer_uuid``, no ``duration`` and no ``price`` on this endpoint: the
+    length and the money come from the catalogue service, which is exactly why
+    the classifier refuses any booking whose price or duration differs from its
+    catalogue baseline. Those refusals stopped being caution and became load
+    bearing the moment this contract was confirmed.
 
-    ``comment`` carries the migration's stable, PII-free marker (see
-    :func:`altegio_bot.easyweek_migration.ledger.migration_marker`) so a booking
-    created by the cutover can be recognised in the EasyWeek UI without opening a
-    report.
+    ``staffer_uuid`` is optional to EasyWeek and mandatory to us. Omitting it
+    lets the server pick a master, and a migration that lets somebody else choose
+    who serves the customer is not a migration.
+
+    The customer is identified by phone because the API offers no other way, and
+    the phone and first name come from the **EasyWeek card that was already
+    matched** — never invented, never taken from Altegio to overwrite what
+    EasyWeek holds. Support confirmed on 2026-08-31 that a phone number is a
+    unique customer identifier and duplicates cannot be created, which is what
+    makes sending one safe; it is not, however, idempotency for the booking
+    itself, so the ledger's claim-before-write contract is unchanged.
+
+    ``booking_comment`` carries the stable, PII-free marker (see
+    :func:`altegio_bot.easyweek_migration.ledger.migration_marker`) that lets a
+    migrated booking be recognised in the EasyWeek UI. It comes back as
+    ``public_notes``.
+
+    Undocumented Form Builder fields are never guessed. If a workspace requires
+    one, the server says 422 and the run stops with that named refusal.
     """
-    return {
+    body = {
         "location_uuid": location_uuid,
-        "staff_uuid": staff_uuid,
-        "customer_uuid": customer_uuid,
-        "start_time": starts_at_utc_iso,
-        "duration": duration_minutes,
-        "services": [{"service_uuid": service_uuid}],
-        "comment": comment,
+        "service_uuid": service_uuid,
+        "reserved_on": reserved_on_utc_iso,
+        "customer_phone": customer_phone,
+        "customer_first_name": customer_first_name,
+        "staffer_uuid": staffer_uuid,
+        "booking_comment": comment,
+        "timezone": timezone_name,
     }
+    # A body that grew a field the contract does not name is a body we cannot
+    # reason about. Caught here rather than by the server.
+    assert frozenset(body) == BOOKING_REQUEST_FIELDS
+    return body
+
+
+def _safe_validation_fields(response: httpx.Response) -> list[str]:
+    """Field NAMES a 422 complained about, filtered to ones we sent.
+
+    Deliberately narrow. A validation body is written by the server and can carry
+    anything — the submitted phone number echoed back, a stack frame, an internal
+    column name. So nothing is read out of it except keys, and a key survives only
+    if it is a field this migration itself put in the request.
+
+    A workspace that requires an undocumented Form Builder field therefore shows
+    up as "no recognised field named", which is the correct answer: we cannot fix
+    it by guessing, and the runbook says to ask the operator.
+    """
+    try:
+        payload: Any = response.json()
+    except Exception:
+        return []
+    if not isinstance(payload, dict):
+        return []
+
+    candidates: set[str] = set()
+    # Laravel-shaped: {"errors": {"field": [...]}}, and the flat variant.
+    for container in (payload.get("errors"), payload):
+        if isinstance(container, dict):
+            candidates.update(key for key in container if isinstance(key, str))
+    return sorted(candidates & BOOKING_REQUEST_FIELDS)
 
 
 class EasyWeekMigrationWriteClient:
@@ -342,6 +426,23 @@ class EasyWeekMigrationWriteClient:
                 raise EasyWeekNotFoundError(
                     "resource not found", operation="create_booking", status_code=status, attempts=attempt
                 )
+            if status == 422:
+                # The one 4xx worth describing. A validation failure is an
+                # operator's problem to fix, and "422" alone sent the first
+                # canary into an afternoon of archaeology. What may be reported
+                # is the NAME of a field we ourselves sent; never the server's
+                # prose, never a value, never the body.
+                fields = _safe_validation_fields(response)
+                logger.error(
+                    "easyweek_migration: create_booking rejected status=422 fields=%s",
+                    ",".join(fields) if fields else "unnamed",
+                )
+                raise EasyWeekPermanentError(
+                    "request rejected as invalid: " + (",".join(fields) if fields else "no recognised field named"),
+                    operation="create_booking",
+                    status_code=status,
+                    attempts=attempt,
+                )
             raise EasyWeekPermanentError(
                 "permanent client error", operation="create_booking", status_code=status, attempts=attempt
             )
@@ -440,6 +541,85 @@ class EasyWeekMigrationWriteClient:
 
         assert last_retryable is not None
         raise last_retryable
+
+    async def _get_json(self, path: str, *, params: dict[str, Any], operation: str) -> dict[str, Any]:
+        """One paced, retried GET returning a JSON object. Read-only.
+
+        Shares `get_booking`'s error taxonomy and pacing so the reads that PROVE
+        a booking cannot drift from the read that fetches it. Never logs a body:
+        a bookings list carries customer names and phone numbers.
+        """
+        url = "/".join([self._base_url, path])
+        last_retryable: EasyWeekError | None = None
+
+        for attempt in range(1, self._max_attempts + 1):
+            await self._limiter.acquire()
+            try:
+                response = await self._client.get(url, headers=self._headers(), params=params)
+            except httpx.TimeoutException:
+                last_retryable = EasyWeekRetryableError("request timed out", operation=operation, attempts=attempt)
+            except httpx.HTTPError:
+                last_retryable = EasyWeekRetryableError("transport error", operation=operation, attempts=attempt)
+            else:
+                status = response.status_code
+                if 200 <= status < 300:
+                    try:
+                        payload: Any = response.json()
+                    except Exception:
+                        raise EasyWeekProtocolError(
+                            "response is not valid JSON", operation=operation, status_code=status
+                        ) from None
+                    if not isinstance(payload, dict):
+                        raise EasyWeekProtocolError("response is not a JSON object", operation=operation)
+                    return payload
+                if status == 404:
+                    raise EasyWeekNotFoundError(
+                        "resource not found", operation=operation, status_code=status, attempts=attempt
+                    )
+                if status in (401, 403):
+                    raise EasyWeekAuthError(
+                        "authentication or authorization failed",
+                        operation=operation,
+                        status_code=status,
+                        attempts=attempt,
+                    )
+                if not (status == 429 or 500 <= status < 600):
+                    raise EasyWeekPermanentError(
+                        "permanent client error", operation=operation, status_code=status, attempts=attempt
+                    )
+                last_retryable = EasyWeekRetryableError(
+                    "retryable response status", operation=operation, status_code=status, attempts=attempt
+                )
+
+            if attempt < self._max_attempts:
+                await self._sleep(_backoff_delay(attempt))
+
+        assert last_retryable is not None
+        raise last_retryable
+
+    async def list_location_services(self, location_uuid: str, *, page: int) -> dict[str, Any]:
+        """``GET /locations/{uuid}/services`` — one page of the catalogue.
+
+        The catalogue is how the service on a booking is proven at all: the
+        booking response carries an order-line uuid, not a catalogue one. See
+        `service_catalog`.
+        """
+        canonical = _canonical_booking_uuid(location_uuid)
+        return await self._get_json(
+            "/".join([_PATH_LOCATIONS, canonical, _PATH_SERVICES]),
+            params={"page": page},
+            operation="list_location_services",
+        )
+
+    async def list_bookings(self, *, params: dict[str, Any]) -> dict[str, Any]:
+        """``GET /bookings`` — the documented filtered list.
+
+        The only way to prove which master a booking belongs to: the booking
+        response itself names no staffer. An operator probe confirmed the filter
+        discriminates — the test booking appears under its own master and is
+        absent under a control master.
+        """
+        return await self._get_json(_PATH_BOOKINGS, params=dict(params), operation="list_bookings")
 
     async def cancel_booking(self, booking_uuid: str) -> None:
         """Cancel one booking. Reached ONLY by a confirmed rollback.
