@@ -200,7 +200,7 @@ async def test_a_rewritten_marker_is_not_accepted_as_terminal(session_local, sou
     transport = RecordingTransport()
     await migrated_wave(session_local, transport)
     deactivate_source(source, KA_RECORD_B, confirmed=0)
-    transport.bookings[GHOST_UUID]["comment"] = "somebody rewrote this"
+    transport.bookings[GHOST_UUID]["public_notes"] = "somebody rewrote this"
     transport.bookings[GHOST_UUID]["is_canceled"] = True
 
     verdict = (await final(session_local, transport)).as_safe_dict()["completeness"]

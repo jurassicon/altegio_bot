@@ -21,6 +21,8 @@ day it matters, a read-only guard proves it before the first mutation of a wave.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
+from datetime import datetime, timedelta
 
 import httpx
 import pytest
@@ -30,7 +32,6 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from altegio_bot.easyweek_migration import reproof as reproof_module
 from altegio_bot.easyweek_migration import runner as runner_module
-from altegio_bot.easyweek_migration.customers import CustomerDirectory
 from altegio_bot.easyweek_migration.manifest import KARLSRUHE_COMPANY_ID, parse_manifest
 from altegio_bot.easyweek_migration.runner import (
     MODE_APPLY,
@@ -49,6 +50,7 @@ from altegio_bot.tests.easyweek_migration_harness import (
     KA_LOCATION_ID,
     RecordingTransport,
     apply_production_flags,
+    catalog_entry,
     make_inputs,
     make_write_client,
 )
@@ -56,6 +58,7 @@ from altegio_bot.tests.test_easyweek_migration_planning import (
     CUSTOMER_PHONE,
     CUSTOMER_UUID,
     KA_LOCATION_UUID,
+    directory_with,
 )
 
 # Two waves, two masters, two genuinely different services.
@@ -197,25 +200,55 @@ async def session_local(session_maker: async_sessionmaker[AsyncSession]) -> asyn
     return session_maker
 
 
+# This file's two services, in the shape `GET /locations/{uuid}/services` returns.
+TWO_SERVICE_CATALOG = {
+    KA_LOCATION_UUID: [
+        {"uuid": LASH_SERVICE_UUID, "name": "Lash Extensions", "price": 9000, "minutes": 60},
+        {"uuid": NAIL_SERVICE_UUID, "name": "Nail Modellage", "price": 12000, "minutes": 90},
+    ]
+}
+
+
 class TwoServiceTransport(RecordingTransport):
     """The shared fake, taught about this file's two distinct services."""
 
+    def __init__(self, **kwargs) -> None:
+        kwargs.setdefault("catalog", TWO_SERVICE_CATALOG)
+        super().__init__(**kwargs)
+
     def _store(self, body: dict, record_id: int) -> str:  # type: ignore[override]
         uuid = TARGETS[record_id]
+        entry = catalog_entry(body["location_uuid"], body["service_uuid"], catalog=self.catalog)
+        start = datetime.fromisoformat(body["reserved_on"].replace("Z", "+00:00"))
         booking = {
             "uuid": uuid,
-            "comment": body["comment"],
-            "start_time": body["start_time"],
-            "duration": body["duration"],
             "location_uuid": body["location_uuid"],
-            "staff_uuid": body["staff_uuid"],
-            "customer_uuid": body["customer_uuid"],
-            "service_uuid": body["services"][0]["service_uuid"],
+            "start_time": body["reserved_on"],
+            "end_time": (start + timedelta(minutes=entry["minutes"])).isoformat().replace("+00:00", "Z"),
+            "timezone": body["timezone"],
+            "duration": {"value": entry["minutes"], "label": "minutes", "iso_8601": f"PT{entry['minutes']}M"},
             "is_canceled": False,
             "is_completed": False,
+            "public_notes": body["booking_comment"],
+            "currency": "EUR",
+            "customer": {"uuid": CUSTOMER_UUID},
+            "ordered_services": [
+                {
+                    # An order-line uuid, deliberately not the catalogue one.
+                    "uuid": f"0de4{uuid[4:]}",
+                    "name": entry["name"],
+                    "quantity": 1,
+                    "currency": "EUR",
+                    "price": entry["price"],
+                    "original_price": entry["price"],
+                    "duration": {"value": entry["minutes"], "label": "minutes"},
+                    "original_duration": {"value": entry["minutes"], "label": "minutes"},
+                }
+            ],
         }
         booking.update(self.readback_override)
         self.bookings[uuid] = booking
+        self.assignments[uuid] = body["staffer_uuid"]
         return uuid
 
     def plant_from_last_post(self, record_id: int) -> str:
@@ -230,7 +263,7 @@ class TwoServiceTransport(RecordingTransport):
             if request.method != "POST" or request.url.path.endswith("set-booking-cancel"):
                 continue
             body = json.loads(request.content.decode())
-            if int(body["comment"].rsplit(":", 1)[-1]) == record_id:
+            if int(body["booking_comment"].rsplit(":", 1)[-1]) == record_id:
                 return self._store(body, record_id)
         raise AssertionError(f"no create POST recorded for {record_id}")
 
@@ -239,7 +272,7 @@ def wave_inputs(mode: str, manifest, **overrides):
     return make_inputs(
         mode,
         manifest=manifest,
-        directory=CustomerDirectory(valid=True, by_phone={CUSTOMER_PHONE: [CUSTOMER_UUID]}),
+        directory=directory_with(),
         **overrides,
     )
 
@@ -469,14 +502,14 @@ async def test_each_kind_of_missing_context_has_its_own_reason(session_local, so
 
     staff = {str(LASH_STAFF_ID): LASH_STAFF_UUID, str(NAIL_STAFF_ID): NAIL_STAFF_UUID}
     services = {str(LASH_SERVICE_ID): LASH_ENTRY, str(NAIL_SERVICE_ID): NAIL_ENTRY}
-    directory = CustomerDirectory(valid=True, by_phone={CUSTOMER_PHONE: [CUSTOMER_UUID]})
+    directory = directory_with()
     if drop == "staff":
         staff.pop(str(LASH_STAFF_ID))
     elif drop == "service":
         services.pop(str(LASH_SERVICE_ID))
     else:
         # A customer export that no longer covers the earlier wave's customer.
-        directory = CustomerDirectory(valid=True, by_phone={"+4915100000000": [CUSTOMER_UUID]})
+        directory = replace(directory_with(), by_phone={"+4915100000000": [CUSTOMER_UUID]})
 
     manifest = build_manifest(
         manifest_id="wave-b-partial",

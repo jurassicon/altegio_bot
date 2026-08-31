@@ -33,6 +33,7 @@ from altegio_bot.easyweek_migration.classify import (
     ALREADY_MIGRATED,
     BLOCKED,
     READY,
+    SKIP_EMPTY_SERVICES,
     SKIPPED,
     Decision,
 )
@@ -108,10 +109,18 @@ class MigrationReport:
     # Waves after the first: whether this manifest still proves the earlier
     # waves' live `created` rows, and which rows it no longer covers.
     previous_wave_context: dict[str, Any] | None = None
+    # How the service on a booking was proven, and what that method cannot
+    # promise. Named in the report because it is NOT a vendor UUID link, and a
+    # reader has to be able to tell the difference — see plan §28.
+    service_evidence: dict[str, Any] | None = None
 
     # Source-side truth.
     source_records_fetched: Counter = field(default_factory=Counter)
     source_active_bookings: int = 0
+    # Bookings the masters keep as breaks — a proven-empty service list. Counted
+    # on its own so "we deliberately did not migrate these" can never be read as
+    # a gap, and so the number is visible rather than buried in `skipped`.
+    excluded_empty_services: int = 0
 
     # Outcome tallies.
     outcomes: Counter = field(default_factory=Counter)
@@ -153,6 +162,8 @@ class MigrationReport:
         # are reported side by side.
         if final_outcome != SKIPPED:
             self.source_active_bookings += 1
+        elif final_reason == SKIP_EMPTY_SERVICES:
+            self.excluded_empty_services += 1
 
         entry = decision.as_safe_dict()
         entry["outcome"] = final_outcome
@@ -183,11 +194,15 @@ class MigrationReport:
             "scope": self.scope,
             "canary_recovery": self.canary_recovery,
             "previous_wave_context": self.previous_wave_context,
+            "service_evidence": self.service_evidence,
             "mutations_attempted": self.mutations_attempted,
             "source": {
                 "provider": "altegio",
                 "records_fetched_by_company": {str(k): v for k, v in sorted(self.source_records_fetched.items())},
                 "active_bookings_considered": self.source_active_bookings,
+                # Not a gap and not a failure: service bookings the masters use
+                # as breaks, excluded by owner decision (plan §28.4).
+                "excluded_empty_services": self.excluded_empty_services,
             },
             "totals": {
                 "ready": self.outcomes.get(READY, 0),

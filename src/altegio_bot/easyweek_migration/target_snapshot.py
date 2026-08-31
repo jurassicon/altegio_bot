@@ -1,53 +1,113 @@
-"""Reading a live EasyWeek booking back, and proving it is still ours (PR-11.1, rev 16).
+"""Reading a live EasyWeek booking back, and proving it is still ours.
 
-One projection, used by three callers that must agree:
+One projection, used by four callers that must agree:
 
 * the **canary** — after its single POST, it re-reads the booking and proves
   every write-critical field came back as sent;
 * **reconciliation** — an operator supplying a UUID for an uncertain row must be
   proven right, not believed;
+* **final reconciliation** — a ledger row saying ``created`` proves nothing about
+  a booking somebody has since moved;
 * **rollback** — before cancelling anything, the live booking must still be the
   booking this run created.
-
-The first version of rollback asked two questions: is the marker still in the
-comment, and is the booking neither cancelled nor completed. Both can be true
-while the appointment has been moved to a different day, given to a different
-master, or reassigned to a different customer — and cancelling *that* destroys
-work somebody did deliberately. So the projection covers every field the
-migration itself wrote.
 
 **Absence is a mismatch.** If EasyWeek does not return a field we need, the
 answer is "we cannot prove this is unchanged", which is treated exactly like
 "this changed". The alternative — silently skipping fields the response happens
 to omit — turns a thin response into a green light.
 
+What the v1 projection got wrong
+--------------------------------
+It was written against the shape of our own ``POST`` body, because the plan
+documented the endpoint and not the schema, and the test transport echoed the
+request back. Every one of those guesses was wrong against the live API:
+
+===================  ==================================================
+we read              the booking actually carries
+===================  ==================================================
+``comment``          ``public_notes``
+``duration`` as int  ``duration`` as ``{value, label, iso_8601}``
+``staff_uuid``       **nothing** — no staffer field of any kind
+``service_uuid``     ``ordered_services[]``, whose ``uuid`` is the order
+                     line, not the catalogue service
+===================  ==================================================
+
+So two of the fields are not in the response at all, and each needed its own
+answer rather than a looser read of the booking:
+
+* **the master** is proven by an independent ``GET /bookings`` filtered by
+  ``staffer_uuid`` — see :mod:`proof`. :attr:`TargetSnapshot.staff_uuid` is
+  ``None`` until that query has actually placed this booking under that master.
+  It is never populated from the booking payload, and never from what we
+  expected, because a field filled in from the expectation would make the
+  comparison compare the expectation with itself;
+* **the service** is proven by its exact attributes against the location
+  catalogue — see :mod:`service_catalog` and plan §28.
+
 The stored form is a digest, so nothing derived from a customer is kept: the
-customer appears only as their EasyWeek UUID inside the hash input, and the hash
-is what lands in the ledger and the reports.
+customer appears only as their EasyWeek UUID inside the hash input, the service
+only as a digest of its normalised name, and the hash is what lands in the ledger
+and the reports.
 """
 
 from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Final
 
 from altegio_bot.easyweek_migration.manifest import canonical_uuid
+from altegio_bot.easyweek_migration.service_catalog import (
+    SERVICE_PROOF_METHOD,
+    SERVICE_PROOF_TAG,
+    ServiceEvidenceError,
+    normalize_service_name,
+    read_ordered_service,
+)
 
 # The version of the projection itself. Bumping it invalidates every stored
 # snapshot and every canary proof — which is the point: if the set of fields we
 # compare changes, an old proof no longer means what it used to.
-TARGET_SNAPSHOT_VERSION: Final = "v1"
+#
+# v2: projected from the real GET shape (public_notes, duration object, nested
+# customer, ordered_services) instead of from an echo of our own request; staff
+# proven separately; service proven by catalogue attributes.
+TARGET_SNAPSHOT_VERSION: Final = "v2"
 
 # Bumped whenever `build_booking_request` changes shape. A canary proves one
-# request schema; a changed schema is unproven again.
-REQUEST_SCHEMA_VERSION: Final = "v1"
+# request schema; a changed schema is unproven again. The service-proof method is
+# folded in deliberately: a proof recorded under a different method must not
+# license this one, which is plan §28.2 point 6.
+REQUEST_SCHEMA_VERSION: Final = f"v2+{SERVICE_PROOF_TAG}"
+# The canary proof stores this in a varchar(16). Widening that column would mean
+# a migration for a string, so the version stays short instead — and says so here
+# rather than failing on an INSERT during a production canary.
+assert len(REQUEST_SCHEMA_VERSION) <= 16
 
 SNAPSHOT_FIELD_MISSING: Final = "target_field_missing"
 SNAPSHOT_FIELD_MISMATCH: Final = "target_field_mismatch"
 SNAPSHOT_NOT_ACTIVE: Final = "target_not_active"
 SNAPSHOT_MARKER_MISSING: Final = "target_marker_missing"
+SNAPSHOT_STAFF_UNPROVEN: Final = "target_staff_unproven"
+
+# Every field `compare` looks at. Kept as one list so a field added to the
+# snapshot cannot be forgotten by the comparison.
+COMPARED_FIELDS: Final[tuple[str, ...]] = (
+    "booking_uuid",
+    "location_uuid",
+    "staff_uuid",
+    "customer_uuid",
+    "start_time_utc",
+    "end_time_utc",
+    "duration_minutes",
+    "timezone_name",
+    "currency",
+    "price_minor",
+    "service_name_digest",
+    "marker",
+    "active",
+)
 
 
 class TargetSnapshotError(ValueError):
@@ -59,49 +119,63 @@ class TargetSnapshotError(ValueError):
         super().__init__(reason if field_name is None else f"{reason}:{field_name}")
 
 
+def service_name_digest(normalized_name: str) -> str:
+    """Short digest of a normalised service name.
+
+    A service name is not personal data, but it is operator-authored free text
+    and this projection is written into reports and the ledger. A digest compares
+    exactly and prints nothing.
+    """
+    return hashlib.sha256(normalized_name.encode("utf-8")).hexdigest()[:16]
+
+
 @dataclass(frozen=True)
 class TargetSnapshot:
     """The write-critical projection of one EasyWeek booking."""
 
     booking_uuid: str
     location_uuid: str
-    staff_uuid: str
-    service_uuid: str
     customer_uuid: str
     start_time_utc: str
+    end_time_utc: str
     duration_minutes: int
+    timezone_name: str
+    currency: str
+    price_minor: int
+    service_name_digest: str
     marker: str
     active: bool
+    # ``None`` until an independent `GET /bookings?staffer_uuid=...` has placed
+    # this booking under that master. The booking payload never sets it.
+    staff_uuid: str | None = None
+
+    def with_proven_staff(self, staff_uuid: str) -> TargetSnapshot:
+        """Return a copy carrying a master that was independently proven."""
+        return TargetSnapshot(**{**self.__dict__, "staff_uuid": staff_uuid})
 
     @property
     def fingerprint(self) -> str:
-        """Stable digest of every field above, plus the projection version."""
+        """Stable digest of every compared field, plus the projection version."""
         blob = "|".join(
-            [
-                TARGET_SNAPSHOT_VERSION,
-                self.booking_uuid,
-                self.location_uuid,
-                self.staff_uuid,
-                self.service_uuid,
-                self.customer_uuid,
-                self.start_time_utc,
-                str(self.duration_minutes),
-                self.marker,
-                "active" if self.active else "inactive",
-            ]
+            [TARGET_SNAPSHOT_VERSION, *(str(getattr(self, name)) for name in COMPARED_FIELDS)],
         )
         return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
     def as_safe_dict(self) -> dict[str, Any]:
-        """Technical identifiers and an instant. No name, phone or free text."""
+        """Technical identifiers, instants and numbers. No name, phone or text."""
         return {
             "booking_uuid": self.booking_uuid,
             "location_uuid": self.location_uuid,
             "staff_uuid": self.staff_uuid,
-            "service_uuid": self.service_uuid,
             "customer_uuid": self.customer_uuid,
             "start_time_utc": self.start_time_utc,
+            "end_time_utc": self.end_time_utc,
             "duration_minutes": self.duration_minutes,
+            "timezone": self.timezone_name,
+            "currency": self.currency,
+            "price_minor_units": self.price_minor,
+            "service_name_digest": self.service_name_digest,
+            "service_proof_method": SERVICE_PROOF_METHOD,
             "marker": self.marker,
             "active": self.active,
             "snapshot_version": TARGET_SNAPSHOT_VERSION,
@@ -122,10 +196,9 @@ class SnapshotMismatch:
 def _require_uuid(payload: dict[str, Any], *keys: str, field_name: str) -> str:
     """First present key that parses as a canonical UUID, or refuse.
 
-    Several keys are accepted because EasyWeek's read shape for a nested entity
-    is not pinned by the plan (it documents the endpoint, not the schema). A
-    *missing* value is never tolerated, though — only an alternative spelling of
-    a present one.
+    A nested object is unwrapped by its own ``uuid``/``uid`` — which is how the
+    live response carries the customer (``customer.uuid``). A *missing* value is
+    never tolerated, only an alternative spelling of a present one.
     """
     for key in keys:
         value = payload.get(key)
@@ -137,80 +210,73 @@ def _require_uuid(payload: dict[str, Any], *keys: str, field_name: str) -> str:
     raise TargetSnapshotError(SNAPSHOT_FIELD_MISSING, field_name)
 
 
-def _require_service_uuid(payload: dict[str, Any]) -> str:
-    """The single service's UUID, from either a flat key or the services list.
+def _require_instant(payload: dict[str, Any], key: str) -> str:
+    """One offset-bearing timestamp, normalised to UTC ISO-8601 with ``Z``.
 
-    A booking that comes back with more than one service is not the booking we
-    created — the migration only ever writes single-service bookings — so that
-    is a mismatch, not something to pick the first element out of.
+    A naive timestamp is refused rather than assumed local: an hour's silent
+    error puts a customer in front of a locked door.
     """
-    for key in ("service_uuid", "service"):
-        value = payload.get(key)
-        if isinstance(value, dict):
-            value = value.get("uuid") or value.get("uid")
-        parsed = canonical_uuid(value)
-        if parsed is not None:
-            return parsed
-
-    for key in ("services", "ordered_services"):
-        items = payload.get(key)
-        if isinstance(items, list) and len(items) == 1 and isinstance(items[0], dict):
-            item = items[0]
-            for inner in ("service_uuid", "uuid", "uid"):
-                candidate = item.get(inner)
-                if isinstance(candidate, dict):
-                    candidate = candidate.get("uuid") or candidate.get("uid")
-                parsed = canonical_uuid(candidate)
-                if parsed is not None:
-                    return parsed
-    raise TargetSnapshotError(SNAPSHOT_FIELD_MISSING, "service_uuid")
+    raw = payload.get(key)
+    if not isinstance(raw, str) or not raw.strip():
+        raise TargetSnapshotError(SNAPSHOT_FIELD_MISSING, key)
+    text = raw.strip()
+    candidate = text[:-1] + "+00:00" if text.endswith("Z") else text
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError:
+        raise TargetSnapshotError(SNAPSHOT_FIELD_MISSING, key) from None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise TargetSnapshotError(SNAPSHOT_FIELD_MISSING, key)
+    return to_utc_iso(parsed)
 
 
-def _require_start_time(payload: dict[str, Any]) -> str:
-    """The booking's start instant, normalised to UTC ISO-8601 with ``Z``."""
-    for key in ("start_time", "start_at", "starts_at"):
-        raw = payload.get(key)
-        if not isinstance(raw, str) or not raw.strip():
-            continue
-        text = raw.strip()
-        candidate = text[:-1] + "+00:00" if text.endswith("Z") else text
-        try:
-            parsed = datetime.fromisoformat(candidate)
-        except ValueError:
-            continue
-        if parsed.tzinfo is None or parsed.utcoffset() is None:
-            # A naive start time cannot be compared to the aware instant we sent.
-            continue
-        return parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-    raise TargetSnapshotError(SNAPSHOT_FIELD_MISSING, "start_time")
+def to_utc_iso(moment: datetime) -> str:
+    """One spelling of an instant, used on both sides of every comparison."""
+    return moment.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _require_duration_minutes(payload: dict[str, Any]) -> int:
-    """Duration in whole minutes, from an explicit field or start/end."""
-    raw = payload.get("duration")
-    if type(raw) is int and raw > 0:
-        return raw
+    """Whole minutes from the booking's ``duration`` object.
 
-    start = payload.get("start_time")
-    end = payload.get("end_time")
-    if isinstance(start, str) and isinstance(end, str):
-        try:
-            begin = datetime.fromisoformat(start.replace("Z", "+00:00"))
-            finish = datetime.fromisoformat(end.replace("Z", "+00:00"))
-        except ValueError:
-            raise TargetSnapshotError(SNAPSHOT_FIELD_MISSING, "duration") from None
-        if begin.tzinfo and finish.tzinfo:
-            seconds = (finish - begin).total_seconds()
-            if seconds > 0 and seconds % 60 == 0:
-                return int(seconds // 60)
-    raise TargetSnapshotError(SNAPSHOT_FIELD_MISSING, "duration")
+    The unit comes from the payload's own ``label``. v1 read this field as a bare
+    integer and fell back to ``end - start`` when it was not one; against the real
+    API the field is always an object, so the fallback was doing all the work and
+    a wrong duration would only have been caught by accident.
+    """
+    duration = payload.get("duration")
+    if not isinstance(duration, dict):
+        raise TargetSnapshotError(SNAPSHOT_FIELD_MISSING, "duration")
+    value = duration.get("value")
+    label = duration.get("label")
+    if type(value) is not int or value <= 0:
+        raise TargetSnapshotError(SNAPSHOT_FIELD_MISSING, "duration_value")
+    if not isinstance(label, str) or label.strip().lower() != "minutes":
+        raise TargetSnapshotError(SNAPSHOT_FIELD_MISSING, "duration_label")
+    return value
 
 
 def _require_marker(payload: dict[str, Any], *, expected_marker: str) -> str:
-    comment = payload.get("comment")
-    if not isinstance(comment, str) or expected_marker not in comment:
-        raise TargetSnapshotError(SNAPSHOT_MARKER_MISSING, "comment")
+    """The migration marker, in the field the API actually returns it in.
+
+    ``booking_comment`` goes out; ``public_notes`` comes back. v1 looked for
+    ``comment`` — a field that does not exist on the response — so the marker
+    check could never have passed against the live API.
+
+    A ``null`` ``public_notes`` is not evidence of anything except that the
+    marker is not there, which is a refusal: without it we cannot say the booking
+    in front of us is one this migration wrote.
+    """
+    notes = payload.get("public_notes")
+    if not isinstance(notes, str) or expected_marker not in notes:
+        raise TargetSnapshotError(SNAPSHOT_MARKER_MISSING, "public_notes")
     return expected_marker
+
+
+def _require_timezone(payload: dict[str, Any]) -> str:
+    value = payload.get("timezone")
+    if not isinstance(value, str) or not value.strip():
+        raise TargetSnapshotError(SNAPSHOT_FIELD_MISSING, "timezone")
+    return value.strip()
 
 
 def _require_active(payload: dict[str, Any]) -> bool:
@@ -232,21 +298,54 @@ def project_target(payload: dict[str, Any], *, expected_marker: str) -> TargetSn
 
     Raises :class:`TargetSnapshotError` on the first field that cannot be read.
     The caller turns that into a blocked or unproven outcome — never into a
-    partial match.
+    partial match. ``staff_uuid`` is left unset: the payload does not carry one,
+    and :mod:`proof` fills it in only after proving it independently.
     """
     if not isinstance(payload, dict):
         raise TargetSnapshotError(SNAPSHOT_FIELD_MISSING, "booking")
 
+    # Identity, then ownership, then liveness — before anything expensive.
+    #
+    # The order matters to one caller in particular. `prove_target_inactive_or_absent`
+    # reads a cancelled booking on purpose and needs `SNAPSHOT_NOT_ACTIVE` back,
+    # which is its proof that a ghost is not standing. If the service or time
+    # projection ran first, a cancelled booking with a thin `ordered_services`
+    # would come back "malformed" instead of "terminal", and reconciliation would
+    # report an unresolvable row where it should have reported a clean ending.
+    booking_uuid = _require_uuid(payload, "uuid", "uid", field_name="booking_uuid")
+    marker = _require_marker(payload, expected_marker=expected_marker)
+    active = _require_active(payload)
+
+    try:
+        ordered = read_ordered_service(payload)
+    except ServiceEvidenceError as exc:
+        raise TargetSnapshotError(exc.reason, exc.detail) from None
+
+    start = _require_instant(payload, "start_time")
+    end = _require_instant(payload, "end_time")
+    duration = _require_duration_minutes(payload)
+
+    # The three time fields must agree with each other. A booking whose stated
+    # length disagrees with its own start and end is not a booking we can say
+    # anything confident about.
+    begin = datetime.fromisoformat(start.replace("Z", "+00:00"))
+    finish = datetime.fromisoformat(end.replace("Z", "+00:00"))
+    if finish - begin != timedelta(minutes=duration):
+        raise TargetSnapshotError(SNAPSHOT_FIELD_MISMATCH, "duration_vs_end_time")
+
     return TargetSnapshot(
-        booking_uuid=_require_uuid(payload, "uuid", "uid", field_name="booking_uuid"),
+        booking_uuid=booking_uuid,
         location_uuid=_require_uuid(payload, "location_uuid", "location", field_name="location_uuid"),
-        staff_uuid=_require_uuid(payload, "staff_uuid", "staff", "user", field_name="staff_uuid"),
-        service_uuid=_require_service_uuid(payload),
-        customer_uuid=_require_uuid(payload, "customer_uuid", "customer", field_name="customer_uuid"),
-        start_time_utc=_require_start_time(payload),
-        duration_minutes=_require_duration_minutes(payload),
-        marker=_require_marker(payload, expected_marker=expected_marker),
-        active=_require_active(payload),
+        customer_uuid=_require_uuid(payload, "customer", "customer_uuid", field_name="customer_uuid"),
+        start_time_utc=start,
+        end_time_utc=end,
+        duration_minutes=duration,
+        timezone_name=_require_timezone(payload),
+        currency=ordered.currency,
+        price_minor=ordered.price_minor,
+        service_name_digest=service_name_digest(ordered.normalized_name),
+        marker=marker,
+        active=active,
     )
 
 
@@ -255,40 +354,52 @@ def expected_snapshot(
     booking_uuid: str,
     location_uuid: str,
     staff_uuid: str,
-    service_uuid: str,
     customer_uuid: str,
     start_time_utc: str,
     duration_minutes: int,
+    timezone_name: str,
+    currency: str,
+    price_minor: int,
+    service_name: str,
     marker: str,
 ) -> TargetSnapshot:
-    """The snapshot a successful write SHOULD produce, built from what we sent."""
+    """The snapshot a successful write SHOULD produce, built from what we sent.
+
+    ``end_time_utc`` is derived rather than accepted: the end EasyWeek reports has
+    to follow from the start and the catalogue length, and deriving it here is
+    what makes the comparison able to notice when it does not.
+    """
+    begin = datetime.fromisoformat(start_time_utc.replace("Z", "+00:00"))
     return TargetSnapshot(
         booking_uuid=booking_uuid,
         location_uuid=location_uuid,
         staff_uuid=staff_uuid,
-        service_uuid=service_uuid,
         customer_uuid=customer_uuid,
         start_time_utc=start_time_utc,
+        end_time_utc=to_utc_iso(begin + timedelta(minutes=duration_minutes)),
         duration_minutes=duration_minutes,
+        timezone_name=timezone_name,
+        currency=currency,
+        price_minor=price_minor,
+        service_name_digest=service_name_digest(normalize_service_name(service_name) or ""),
         marker=marker,
         active=True,
     )
 
 
 def compare(live: TargetSnapshot, expected: TargetSnapshot) -> SnapshotMismatch:
-    """Field-by-field comparison, reporting every difference as a stable code."""
+    """Field-by-field comparison, reporting every difference as a stable code.
+
+    An unproven master (``staff_uuid is None`` on the live side) is reported
+    under its own code rather than as a generic mismatch, because "we did not
+    manage to check" and "it is the wrong master" call for different actions.
+    """
     mismatch = SnapshotMismatch()
-    for field_name in (
-        "booking_uuid",
-        "location_uuid",
-        "staff_uuid",
-        "service_uuid",
-        "customer_uuid",
-        "start_time_utc",
-        "duration_minutes",
-        "marker",
-        "active",
-    ):
+    if live.staff_uuid is None:
+        mismatch.reasons.append(SNAPSHOT_STAFF_UNPROVEN)
+    for field_name in COMPARED_FIELDS:
+        if field_name == "staff_uuid" and live.staff_uuid is None:
+            continue
         if getattr(live, field_name) != getattr(expected, field_name):
             mismatch.reasons.append(f"{SNAPSHOT_FIELD_MISMATCH}:{field_name}")
     return mismatch

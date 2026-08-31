@@ -61,6 +61,16 @@ SKIP_COMPLETED: Final = "source_completed"
 # Not an error and not a gap: this master is migrating in a LATER wave, and
 # the manifest says so out loud.
 SKIP_STAFF_DEFERRED: Final = "staff_deferred_to_later_wave"
+# A booking with a PROVEN empty service list. The masters use these as breaks in
+# their own calendar, and the owner confirmed on 2026-08-31 that they must not be
+# recreated in EasyWeek as customer bookings. Deliberately a skip and not a
+# block: a block is a row somebody has to fix, and there is nothing here to fix.
+#
+# Narrow on purpose. Only `services: []` — an explicit, well-formed, empty list —
+# qualifies. Missing, null, not-a-list and corrupt entries stay data errors
+# (`source_has_no_service`), because "the field is broken" and "the master
+# blocked out an hour" are different facts and only one of them is safe to skip.
+SKIP_EMPTY_SERVICES: Final = "source_empty_services_excluded"
 
 # -- block reasons (need a human) -------------------------------------------
 BLOCK_NO_RECORD_ID: Final = "source_record_id_invalid"
@@ -355,9 +365,15 @@ def classify_record(
     # -- 3. exactly one service, no overrides ------------------------------
     services = _services(record)
     if services is None:
+        # Missing, null, not a list, or an entry that is not an object. A data
+        # error, and never read as a break: see `SKIP_EMPTY_SERVICES`.
         return _block(BLOCK_NO_SERVICES)
     if not services:
-        return _block(BLOCK_NO_SERVICES)
+        # Reached only after liveness, the cutover window and the wave selector
+        # have all been decided, so an unknown master's break still blocks and a
+        # deferred master's break is still somebody else's wave. The exclusion
+        # cannot be used to launder a row past those checks.
+        return _skip(SKIP_EMPTY_SERVICES)
     if len(services) > 1:
         # EasyWeek's representation of a multi-service booking is not proven, so
         # it is refused outright rather than flattened to "the first service".
@@ -502,12 +518,24 @@ def classify_record(
                     source_record_id=record_id,
                     target_booking_uuid=ledger.target_booking_uuid,
                 )
+            # Carries the full resolution, not just the target uuid. An
+            # already-migrated row is exactly the row a reconciliation has to
+            # PROVE, and proving it needs the master, the service and the
+            # customer this booking should have — the master especially, since
+            # the EasyWeek booking payload names none and the expected one has
+            # to come from somewhere before it can be checked against the
+            # filtered list.
             return Decision(
                 outcome=ALREADY_MIGRATED,
                 reason=None,
                 source_company_id=company_id,
                 source_record_id=record_id,
                 starts_at_utc=starts_at,
+                duration_minutes=duration_minutes,
+                easyweek_location_uuid=branch.easyweek_location_uuid,
+                easyweek_staff_uuid=staff_uuid,
+                easyweek_service_uuid=service_uuid,
+                easyweek_customer_uuid=customer_uuid,
                 target_booking_uuid=ledger.target_booking_uuid,
                 source_fingerprint=fingerprint,
             )

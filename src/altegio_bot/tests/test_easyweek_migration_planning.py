@@ -36,6 +36,7 @@ from altegio_bot.easyweek_migration.customers import (
     CUSTOMER_AMBIGUOUS,
     CUSTOMER_NOT_FOUND,
     CUSTOMER_PHONE_UNUSABLE,
+    CustomerCard,
     CustomerDirectory,
     load_customer_directory,
 )
@@ -120,9 +121,19 @@ def manifest():
     return parsed
 
 
+def directory_with(**cards: str) -> CustomerDirectory:
+    """An export that can actually address its customers — phone AND given name."""
+    entries = {CUSTOMER_UUID: "Testkundin", **cards}
+    return CustomerDirectory(
+        valid=True,
+        by_phone={CUSTOMER_PHONE: list(entries)},
+        cards={uuid: CustomerCard(uuid=uuid, phone=CUSTOMER_PHONE, first_name=name) for uuid, name in entries.items()},
+    )
+
+
 @pytest.fixture
 def directory() -> CustomerDirectory:
-    return CustomerDirectory(valid=True, by_phone={CUSTOMER_PHONE: [CUSTOMER_UUID]})
+    return directory_with()
 
 
 @pytest.fixture
@@ -504,7 +515,7 @@ def test_matching_is_by_normalised_number_not_by_formatting(directory):
 
 def test_names_are_never_used_to_resolve_a_customer(manifest, cutover):
     """Even a perfect name match resolves nothing without a phone."""
-    directory = CustomerDirectory(valid=True, by_phone={CUSTOMER_PHONE: [CUSTOMER_UUID]})
+    directory = directory_with()
     decision = classify(
         record(client={"name": "A. Muster", "phone": None}),
         manifest=manifest,
@@ -524,12 +535,44 @@ def test_a_directory_summary_carries_no_phone_numbers(directory):
 def test_a_csv_export_indexes_by_phone(tmp_path):
     path = tmp_path / "customers.csv"
     path.write_text(
-        f"uuid,phone,name\n{CUSTOMER_UUID},{CUSTOMER_PHONE},Someone\n{OTHER_CUSTOMER_UUID},+4915100000000,Else\n",
+        f"uuid,phone,first_name\n{CUSTOMER_UUID},{CUSTOMER_PHONE},Someone\n{OTHER_CUSTOMER_UUID},+4915100000000,Else\n",
         encoding="utf-8",
     )
     loaded = load_customer_directory(path)
     assert loaded.valid
     assert loaded.resolve(CUSTOMER_PHONE).uuid == CUSTOMER_UUID
+    card = loaded.transport_fields(CUSTOMER_UUID)
+    assert card is not None
+    assert (card.phone, card.first_name) == (CUSTOMER_PHONE, "Someone")
+
+
+def test_a_full_name_column_is_not_a_first_name(tmp_path):
+    """`POST /bookings` wants a given name, and a full name is not one.
+
+    Splitting "Anna Maria" on the space to produce "Anna" is a guess about a real
+    person's name, made to get a request accepted. The export is refused per row
+    instead, so an operator adds the column rather than the tool inventing it.
+    """
+    path = tmp_path / "customers.csv"
+    path.write_text(f"uuid,phone,name\n{CUSTOMER_UUID},{CUSTOMER_PHONE},Anna Maria Müller\n", encoding="utf-8")
+    loaded = load_customer_directory(path)
+    assert loaded.valid
+    match = loaded.resolve(CUSTOMER_PHONE)
+    assert match.uuid is None
+    assert match.reason == "customer_first_name_missing"
+    assert loaded.transport_fields(CUSTOMER_UUID) is None
+
+
+def test_a_directory_summary_counts_unaddressable_rows_without_naming_them(tmp_path):
+    path = tmp_path / "customers.csv"
+    path.write_text(
+        f"uuid,phone,first_name\n{CUSTOMER_UUID},{CUSTOMER_PHONE},Someone\n{OTHER_CUSTOMER_UUID},+4915100000000,\n",
+        encoding="utf-8",
+    )
+    summary = load_customer_directory(path).as_safe_dict()
+    assert summary["rows_without_first_name"] == 1
+    blob = json.dumps(summary)
+    assert CUSTOMER_PHONE not in blob and "Someone" not in blob
 
 
 def test_a_csv_with_unrecognised_columns_fails_loudly(tmp_path):

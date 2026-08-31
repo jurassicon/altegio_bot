@@ -50,6 +50,7 @@ from altegio_bot.tests.test_easyweek_migration_planning import (
     RA_SERVICE_UUID,
     RA_STAFF_ID,
     RA_STAFF_UUID,
+    directory_with,
 )
 
 # ---------------------------------------------------------------------------
@@ -188,9 +189,8 @@ def classify(record, *, manifest, directory):
 
 @pytest.fixture
 def directory():
-    from altegio_bot.easyweek_migration.customers import CustomerDirectory
 
-    return CustomerDirectory(valid=True, by_phone={CUSTOMER_PHONE: [CUSTOMER_UUID]})
+    return directory_with()
 
 
 def test_a_full_discount_to_zero_is_blocked(directory):

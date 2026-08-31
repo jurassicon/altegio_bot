@@ -49,6 +49,8 @@ from altegio_bot.tests.easyweek_migration_harness import (
     CREATED_UUIDS,
     KA_RECORD_A,
     KA_RECORD_B,
+    MUTATION_IDS,
+    TARGET_MUTATIONS,
     RecordingTransport,
     apply_production_flags,
     ledger_rows,
@@ -295,7 +297,7 @@ async def test_an_unverified_proof_cannot_resolve_a_different_row(session_local,
     [
         pytest.param(CANARY_POST_FAILED, id="permanent 4xx"),
         pytest.param(CANARY_REPROOF_FAILED, id="source re-proof failure"),
-        pytest.param(f"{CANARY_READBACK_FAILED}:target_field_mismatch:staff_uuid", id="readback mismatch"),
+        pytest.param(f"{CANARY_READBACK_FAILED}:target_field_mismatch:location_uuid", id="readback mismatch"),
     ],
 )
 async def test_only_an_unknown_outcome_qualifies(session_local, source, failure_reason):
@@ -381,22 +383,12 @@ async def test_an_already_verified_proof_does_not_take_the_recovery_path(session
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "field,value",
-    [
-        ("staff_uuid", "00000000-0000-4000-8000-0000000000a1"),
-        ("service_uuid", "00000000-0000-4000-8000-0000000000a2"),
-        ("customer_uuid", "00000000-0000-4000-8000-0000000000a3"),
-        ("start_time", "2026-09-14T07:00:00Z"),
-        ("duration", 120),
-        ("comment", "rewritten by hand"),
-    ],
-)
-async def test_a_mismatched_target_leaves_both_unproven(session_local, source, field, value):
+@pytest.mark.parametrize("label,mutate", TARGET_MUTATIONS, ids=MUTATION_IDS)
+async def test_a_mismatched_target_leaves_both_unproven(session_local, source, label, mutate):
     transport = RecordingTransport()
     await uncertain_canary(session_local, transport)
     transport.plant_booking(CREATED_UUIDS[KA_RECORD_A], record_id=KA_RECORD_A)
-    transport.bookings[CREATED_UUIDS[KA_RECORD_A]][field] = value
+    mutate(transport, CREATED_UUIDS[KA_RECORD_A])
 
     async with make_write_client(transport) as client:
         report = await run_resolve_created(session_local, resolve_inputs(), write_client=client)
