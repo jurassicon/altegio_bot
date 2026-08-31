@@ -65,6 +65,10 @@ SERVICE_PROOF_METHOD: Final = "catalog_attributes_unique_v1"
 # what a report says, the short form is what a stored proof is bound to, and a
 # new method must change BOTH or an old proof would license it.
 SERVICE_PROOF_TAG: Final = "cat-attr-v1"
+# The version of the STORED expectation. A baseline written under another version
+# is not read as evidence for this one — it is refused, so that changing what a
+# baseline means can never be mistaken for the old baseline still holding.
+SERVICE_BASELINE_VERSION: Final = "v1"
 
 # Stable, PII-free refusals. A service name is not personal data, but it is free
 # text an operator typed, so it never appears in these codes either.
@@ -76,6 +80,12 @@ SERVICE_NOT_IN_CATALOG: Final = "service_not_in_catalog"
 SERVICE_ATTRIBUTES_AMBIGUOUS: Final = "service_attributes_ambiguous"
 SERVICE_ATTRIBUTES_CHANGED: Final = "service_attributes_changed"
 SERVICE_FORMAT_UNSUPPORTED: Final = "service_format_unsupported"
+# No stored expectation for this service at all, or one written under a method or
+# version this build cannot read. Never recovered from the current catalogue:
+# rebuilding a lost baseline out of whatever the catalogue says today is exactly
+# the circular check this module exists to stop.
+SERVICE_BASELINE_MISSING: Final = "service_baseline_missing"
+SERVICE_BASELINE_VERSION_UNSUPPORTED: Final = "service_baseline_version_unsupported"
 # Readback-side codes.
 ORDERED_SERVICE_MISSING: Final = "ordered_service_missing"
 ORDERED_SERVICE_NOT_SINGLE: Final = "ordered_service_not_single"
@@ -166,33 +176,64 @@ class CatalogSnapshot:
 
 
 @dataclass(frozen=True)
-class ServiceExpectation:
-    """What the booking's service must look like, pinned before the write.
+class ServiceBaseline:
+    """The service a wave was reviewed against. Immutable once written.
 
-    Pinned from the live catalogue rather than from the manifest alone: the
-    manifest states the price and duration an operator verified, and this records
-    that the catalogue still agrees with them *and* that nothing else in the
-    catalogue looks the same.
+    The distinction between this and a :class:`CatalogSnapshot` is the whole
+    correction. A snapshot is an **observation** — what the catalogue said at one
+    moment. A baseline is an **expectation** — what an operator reviewed and what
+    every later run must still find. Collapsing the two is what made the first
+    version circular: each run re-derived its expectation from the current
+    catalogue, so a renamed service produced a new expectation that the new
+    catalogue satisfied by construction, and the check proved nothing.
+
+    So this is established once, before the first booking for the service, and
+    afterwards only ever verified. Never recomputed, never silently widened, and
+    never rebuilt from the catalogue when the stored row is missing.
     """
 
-    method: str
+    easyweek_location_uuid: str
     easyweek_service_uuid: str
     normalized_name: str
     currency: str
     price_minor: int
     duration_minutes: int
-    catalog_digest: str
+    method: str = SERVICE_PROOF_METHOD
+    version: str = SERVICE_BASELINE_VERSION
+
+    @property
+    def attributes(self) -> tuple[str, str, int, int]:
+        return (self.normalized_name, self.currency, self.price_minor, self.duration_minutes)
+
+    @property
+    def digest(self) -> str:
+        """Stable identity of this expectation, for reports and comparisons."""
+        blob = "|".join(
+            [
+                self.version,
+                self.method,
+                self.easyweek_location_uuid,
+                self.easyweek_service_uuid,
+                self.normalized_name,
+                self.currency,
+                str(self.price_minor),
+                str(self.duration_minutes),
+            ]
+        )
+        return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
     def as_safe_dict(self) -> dict[str, Any]:
         """Identifiers, numbers and the method. The name is a digest, not text."""
         return {
             "method": self.method,
+            "version": self.version,
+            "easyweek_location_uuid": self.easyweek_location_uuid,
             "easyweek_service_uuid": self.easyweek_service_uuid,
             "service_name_digest": hashlib.sha256(self.normalized_name.encode("utf-8")).hexdigest()[:16],
             "currency": self.currency,
             "price_minor_units": self.price_minor,
             "duration_minutes": self.duration_minutes,
-            "catalog_digest": self.catalog_digest,
+            "baseline_digest": self.digest[:16],
             "limitations": [
                 "uniqueness holds only among services the catalogue endpoint returned at read time",
                 "hidden, historical or deleted services are not covered",
@@ -270,29 +311,47 @@ def build_catalog_snapshot(location_uuid: str, rows: list[Any]) -> CatalogSnapsh
     return CatalogSnapshot(location_uuid=location_uuid, services=tuple(services))
 
 
-def pin_service_expectation(
-    catalog: CatalogSnapshot,
-    *,
-    easyweek_service_uuid: str,
-    mapping: ServiceMapping,
-) -> ServiceExpectation:
-    """Pin what the booking's service must look like, or raise fail-closed.
+def _unique_entry(catalog: CatalogSnapshot, easyweek_service_uuid: str) -> CatalogService:
+    """The catalogue entry for this uuid, proven to be identifiable by attributes.
 
-    Three things must hold, and all three are checked against the catalogue that
-    was just read rather than against a stored audit:
-
-    1. the expected UUID is in the catalogue;
-    2. its price and duration still equal the manifest's verified baseline —
-       a catalogue edit since the operator checked is a changed expectation, and
-       §28.2 requires a new reviewed plan for that, not a silent re-baseline;
-    3. no other catalogue entry shares its exact attributes, so the attributes
-       identify it.
+    Shared by establishing a baseline and by verifying one, so the two can never
+    disagree about what "unique" means. Uniqueness is judged across the WHOLE
+    returned catalogue — never narrowed to the wave's services, a category or a
+    master, because a look-alike outside that narrowing is exactly the one that
+    would make the attributes ambiguous.
     """
     service = catalog.by_uuid(easyweek_service_uuid)
     if service is None:
         # Includes the re-created-service case: a new UUID is never adopted by
         # name, however well the name matches.
         raise ServiceEvidenceError(SERVICE_NOT_IN_CATALOG)
+
+    candidates = catalog.matching(service.attributes)
+    if len(candidates) != 1 or candidates[0].uuid != service.uuid:
+        # Either two services look identical, or the one that does is not ours.
+        # Both mean the attributes cannot stand in for the identifier.
+        raise ServiceEvidenceError(SERVICE_ATTRIBUTES_AMBIGUOUS)
+    return service
+
+
+def establish_baseline(
+    catalog: CatalogSnapshot,
+    *,
+    easyweek_service_uuid: str,
+    mapping: ServiceMapping,
+) -> ServiceBaseline:
+    """Derive the expectation for a service that has none yet, or raise.
+
+    Called at most once per service, in the transaction that claims the ledger
+    row for its first booking — before any POST, so what gets written down is
+    what the run is about to act on.
+
+    The manifest's own price and duration must agree with the catalogue here.
+    That is what ties the stored expectation back to the file an operator
+    reviewed: if the catalogue has moved since, this refuses rather than writing
+    down whatever the catalogue happens to say now.
+    """
+    service = _unique_entry(catalog, easyweek_service_uuid)
 
     try:
         expected_price_minor = to_minor_units(mapping.catalog_price, currency=service.currency)
@@ -305,21 +364,37 @@ def pin_service_expectation(
     if service.price_minor != expected_price_minor or service.duration_minutes != mapping.catalog_duration.minutes:
         raise ServiceEvidenceError(SERVICE_ATTRIBUTES_CHANGED)
 
-    candidates = catalog.matching(service.attributes)
-    if len(candidates) != 1 or candidates[0].uuid != service.uuid:
-        # Either two services look identical, or the one that does is not ours.
-        # Both mean the attributes cannot stand in for the identifier.
-        raise ServiceEvidenceError(SERVICE_ATTRIBUTES_AMBIGUOUS)
-
-    return ServiceExpectation(
-        method=SERVICE_PROOF_METHOD,
+    return ServiceBaseline(
+        easyweek_location_uuid=catalog.location_uuid,
         easyweek_service_uuid=service.uuid,
         normalized_name=service.normalized_name,
         currency=service.currency,
         price_minor=service.price_minor,
         duration_minutes=service.duration_minutes,
-        catalog_digest=catalog.digest,
     )
+
+
+def verify_baseline(catalog: CatalogSnapshot, baseline: ServiceBaseline) -> None:
+    """Raise unless a FRESH catalogue still satisfies a stored expectation.
+
+    The only direction this function works in. It can agree with the baseline or
+    fail closed; it can never update it. A renamed, repriced, re-timed, deleted,
+    re-created or newly-ambiguous service all end here as a refusal, and fixing
+    any of them is an explicit operator act with a new reviewed plan — not
+    something a run does on its way to a POST.
+    """
+    if baseline.version != SERVICE_BASELINE_VERSION or baseline.method != SERVICE_PROOF_METHOD:
+        # Written under a different contract. Adapting to it would mean guessing
+        # what the old version meant, which is how a weaker check gets inherited.
+        raise ServiceEvidenceError(SERVICE_BASELINE_VERSION_UNSUPPORTED)
+    if baseline.easyweek_location_uuid != catalog.location_uuid:
+        # A baseline for another branch proves nothing here, and a look-alike in
+        # a foreign catalogue must never count towards this location's uniqueness.
+        raise ServiceEvidenceError(SERVICE_BASELINE_MISSING, "location")
+
+    service = _unique_entry(catalog, baseline.easyweek_service_uuid)
+    if service.attributes != baseline.attributes:
+        raise ServiceEvidenceError(SERVICE_ATTRIBUTES_CHANGED)
 
 
 @dataclass(frozen=True)
@@ -385,7 +460,7 @@ def read_ordered_service(payload: dict[str, Any]) -> OrderedService:
     )
 
 
-def prove_ordered_service(ordered: OrderedService, expectation: ServiceExpectation) -> None:
+def prove_ordered_service(ordered: OrderedService, expectation: ServiceBaseline) -> None:
     """Raise unless the live line matches what was pinned before the write.
 
     A direct catalogue UUID, if the API ever supplies one, is authoritative in

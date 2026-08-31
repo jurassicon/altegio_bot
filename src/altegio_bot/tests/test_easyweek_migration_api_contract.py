@@ -39,18 +39,17 @@ from altegio_bot.easyweek_migration.proof import (
 from altegio_bot.easyweek_migration.runner import (
     MODE_APPLY,
     MODE_RECONCILE,
-    ServiceEvidenceBook,
-    load_service_evidence,
+    ServiceEvidence,
     run_apply,
     run_reconcile,
 )
 from altegio_bot.easyweek_migration.service_catalog import (
     SERVICE_PROOF_METHOD,
+    ServiceBaseline,
     ServiceEvidenceError,
-    ServiceExpectation,
     build_catalog_snapshot,
+    establish_baseline,
     normalize_service_name,
-    pin_service_expectation,
     prove_ordered_service,
     read_ordered_service,
 )
@@ -167,13 +166,13 @@ def booking_payload(**overrides) -> dict:
     return payload
 
 
-def expectation() -> ServiceExpectation:
+def expectation() -> ServiceBaseline:
     catalog = build_catalog_snapshot(KA_LOCATION_UUID, catalog_rows())
     branch = parse_manifest(manifest_json()).branch(KARLSRUHE_COMPANY_ID)
     assert branch is not None
     mapping = branch.service(KA_SERVICE_ID)
     assert mapping is not None
-    return pin_service_expectation(catalog, easyweek_service_uuid=KA_SERVICE_UUID, mapping=mapping)
+    return establish_baseline(catalog, easyweek_service_uuid=KA_SERVICE_UUID, mapping=mapping)
 
 
 def mapping_for(price: str = "90.00", minutes: int = 60):
@@ -243,7 +242,7 @@ def test_two_identical_looking_services_are_ambiguous_not_a_coin_flip():
     twin["uuid"] = "00000000-0000-4000-8000-0000000000ab"
     catalog = build_catalog_snapshot(KA_LOCATION_UUID, [*rows, twin])
     with pytest.raises(ServiceEvidenceError) as exc:
-        pin_service_expectation(catalog, easyweek_service_uuid=KA_SERVICE_UUID, mapping=mapping_for())
+        establish_baseline(catalog, easyweek_service_uuid=KA_SERVICE_UUID, mapping=mapping_for())
     assert exc.value.reason == "service_attributes_ambiguous"
 
 
@@ -259,7 +258,7 @@ def test_price_and_duration_alone_are_not_enough_to_identify_a_service():
 def test_a_service_missing_from_the_catalogue_fails_closed():
     catalog = build_catalog_snapshot(KA_LOCATION_UUID, catalog_rows()[1:])
     with pytest.raises(ServiceEvidenceError) as exc:
-        pin_service_expectation(catalog, easyweek_service_uuid=KA_SERVICE_UUID, mapping=mapping_for())
+        establish_baseline(catalog, easyweek_service_uuid=KA_SERVICE_UUID, mapping=mapping_for())
     assert exc.value.reason == "service_not_in_catalog"
 
 
@@ -273,7 +272,7 @@ def test_a_recreated_service_is_not_adopted_by_its_name():
     rows[0]["uuid"] = "00000000-0000-4000-8000-0000000000cd"
     catalog = build_catalog_snapshot(KA_LOCATION_UUID, rows)
     with pytest.raises(ServiceEvidenceError) as exc:
-        pin_service_expectation(catalog, easyweek_service_uuid=KA_SERVICE_UUID, mapping=mapping_for())
+        establish_baseline(catalog, easyweek_service_uuid=KA_SERVICE_UUID, mapping=mapping_for())
     assert exc.value.reason == "service_not_in_catalog"
 
 
@@ -287,7 +286,7 @@ def test_a_recreated_service_is_not_adopted_by_its_name():
 def test_a_changed_catalogue_baseline_needs_a_new_plan_not_a_silent_rebase(override, label):
     catalog = build_catalog_snapshot(KA_LOCATION_UUID, catalog_rows(**override))
     with pytest.raises(ServiceEvidenceError) as exc:
-        pin_service_expectation(catalog, easyweek_service_uuid=KA_SERVICE_UUID, mapping=mapping_for())
+        establish_baseline(catalog, easyweek_service_uuid=KA_SERVICE_UUID, mapping=mapping_for())
     assert exc.value.reason == "service_attributes_changed"
 
 
@@ -466,14 +465,35 @@ async def test_every_catalogue_page_is_read(session_local, source):
     transport = RecordingTransport()
     assert len(CATALOG_SERVICES[KA_LOCATION_UUID]) == 3
 
+    book = ServiceEvidence()
     async with make_write_client(transport) as client:
-        book = await load_service_evidence(make_inputs(MODE_APPLY), write_client=client)
+        catalog = await book.observe(client, location_uuid=KA_LOCATION_UUID)
 
     pages = [r for r in transport.requests if r.url.path.endswith("/services") and KA_LOCATION_UUID in r.url.path]
     assert len(pages) == 2
-    summary = book.as_safe_dict()
-    assert summary["method"] == SERVICE_PROOF_METHOD
-    assert any(entry["services"] == 3 for entry in summary["catalogs"])
+    assert catalog is not None
+    # The whole catalogue, not just the services this wave happens to use: a
+    # look-alike outside the wave is exactly what makes an attribute match
+    # ambiguous, and narrowing the read would hide it.
+    assert len(catalog.services) == 3
+
+
+async def test_the_catalogue_is_read_again_for_every_booking(session_local, source):
+    """No snapshot from the top of a run is reused by the bookings after it."""
+    transport = RecordingTransport()
+    await license_bulk(session_local, transport)
+    reads_after_canary = sum(1 for r in transport.requests if r.url.path.endswith("/services"))
+
+    plan = await run_dry_run(session_local)
+    async with make_write_client(transport) as client:
+        await run_apply(
+            session_local, make_inputs(MODE_APPLY, verified_dry_run_id=plan.plan_digest), write_client=client
+        )
+
+    reads_after_bulk = sum(1 for r in transport.requests if r.url.path.endswith("/services"))
+    # Two more bookings were created, and each of them re-read the catalogue
+    # rather than trusting the one the canary had already seen.
+    assert reads_after_bulk > reads_after_canary + 2
 
 
 async def test_an_unreadable_catalogue_blocks_the_row_and_creates_nothing(session_local, source):
@@ -699,7 +719,8 @@ async def test_the_report_names_the_limited_method_and_leaks_nothing(session_loc
 
     evidence = safe["service_evidence"]
     assert evidence["method"] == SERVICE_PROOF_METHOD
-    assert evidence["pinned_services"] >= 1
+    assert evidence["catalog_observations"] >= 1
+    assert len(evidence["stored_baselines"]) >= 1
 
     blob = json.dumps(safe)
     assert CUSTOMER_PHONE not in blob
@@ -709,7 +730,7 @@ async def test_the_report_names_the_limited_method_and_leaks_nothing(session_loc
 
 
 def test_an_empty_evidence_book_proves_nothing():
-    book = ServiceEvidenceBook()
+    book = ServiceEvidence()
     summary = book.as_safe_dict()
-    assert summary["pinned_services"] == 0
-    assert summary["catalogs"] == []
+    assert summary["stored_baselines"] == []
+    assert summary["catalog_observations"] == 0

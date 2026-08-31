@@ -1440,6 +1440,77 @@ class PromoLead(Base):
     meta: Mapped[dict] = mapped_column(JSONB, default=dict)
 
 
+class EasyWeekMigrationServiceBaseline(Base):
+    """The service a wave was reviewed against, kept so a later run cannot drift.
+
+    The migration cannot read a booking's catalogue service back: EasyWeek
+    returns an order-line uuid, not a catalogue one. Plan §28 authorises proving
+    the service by its exact attributes instead, and that only means anything if
+    the attributes being compared are the ones an operator actually reviewed.
+
+    Without this table they were not. Each run re-derived the expectation from
+    whatever the catalogue said at that moment, so renaming a service between the
+    canary and the bulk silently produced a new "expectation" that the new
+    catalogue trivially satisfied — the check compared the catalogue with itself
+    and the old canary went on licensing the wave.
+
+    So the expectation is written down, once, in the same transaction as the
+    ledger claim that precedes the very first booking for that service. After
+    that it is only ever **verified**: a later catalogue read can agree with it or
+    fail closed, never overwrite it. That is what makes the chain
+    ``reviewed dry-run → canary → apply → reconcile/rollback`` mean one thing
+    rather than four.
+
+    Deliberately NOT a catalogue history. One row per
+    ``(location, service)`` — the current agreed truth — with no versions, no
+    audit trail and no snapshot of the manifest. Changing it is an explicit
+    operator act, not something a run does on its way past.
+    """
+
+    __tablename__ = "easyweek_migration_service_baseline"
+
+    __table_args__ = (
+        # One agreed truth per service per location. The unique constraint is the
+        # mechanism: an INSERT that loses the race reads the winner back rather
+        # than establishing a second, different expectation.
+        UniqueConstraint(
+            "easyweek_location_uuid",
+            "easyweek_service_uuid",
+            name="uq_easyweek_service_baseline_identity",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+
+    easyweek_location_uuid: Mapped[str] = mapped_column(String(64), nullable=False)
+    easyweek_service_uuid: Mapped[str] = mapped_column(String(64), nullable=False)
+
+    # The attributes identity is argued from. `canonical_name` is stored in the
+    # normalised form the comparison uses (NFC, collapsed whitespace, casefold)
+    # so a run cannot disagree with a stored baseline over an encoding.
+    canonical_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    currency: Mapped[str] = mapped_column(String(8), nullable=False)
+    price_minor: Mapped[int] = mapped_column(Integer, nullable=False)
+    duration_minutes: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    # How it was proven. A baseline written under one method or version must not
+    # be read as evidence for another; the reader refuses instead of adapting.
+    proof_method: Mapped[str] = mapped_column(String(64), nullable=False)
+    proof_version: Mapped[str] = mapped_column(String(16), nullable=False)
+
+    # Which wave and run established it. Reported, never used to decide — the
+    # decision is the attribute comparison — but an operator asking "where did
+    # this expectation come from?" needs an answer that is not "some run".
+    wave_identity: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    established_run_id: Mapped[str] = mapped_column(String(64), nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+
 class EasyWeekMigrationLedger(Base):
     """One durable row per SOURCE booking a cutover migration has looked at (PR-11.1).
 

@@ -956,11 +956,20 @@ async def test_a_target_changed_after_migration_is_never_cancelled(session_local
             write_client=client,
         )
     codes = report.as_safe_dict()["reason_codes"]
-    # A reassigned master is refused under its own code — the booking itself is
-    # unchanged, so "modified" would be the wrong thing to tell an operator.
-    refusal = "rollback_staff_assignment_unproven" if label == "master" else "rollback_target_modified_after_migration"
+    # Each kind of change is refused under the code that describes it. "Modified"
+    # would be the wrong thing to tell an operator about a reassigned master or a
+    # service that no longer matches its baseline: in both cases the booking
+    # payload is byte-identical and the difference is only visible to the
+    # independent check that found it.
+    refusal = {
+        "master": "rollback_staff_assignment_unproven",
+        "service": "rollback_service_evidence_unproven",
+        "price": "rollback_service_evidence_unproven",
+    }.get(label, "rollback_target_modified_after_migration")
     assert codes[refusal] == 1
     assert edited not in transport.cancelled
+    # Whatever the reason, no cancel request was sent for it.
+    assert transport.cancelled == [] or edited not in transport.cancelled
 
 
 async def test_a_malformed_target_is_never_cancelled(session_local, source):

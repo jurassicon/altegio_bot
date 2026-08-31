@@ -33,8 +33,8 @@ from typing import Any, Final
 from altegio_bot.easyweek_client import EasyWeekError, EasyWeekNotFoundError
 from altegio_bot.easyweek_migration.classify import Decision
 from altegio_bot.easyweek_migration.service_catalog import (
+    ServiceBaseline,
     ServiceEvidenceError,
-    ServiceExpectation,
     prove_ordered_service,
     read_ordered_service,
     read_pagination,
@@ -181,7 +181,7 @@ def expected_target_for(
     *,
     booking_uuid: str,
     marker: str,
-    expectation: ServiceExpectation,
+    expectation: ServiceBaseline,
     timezone_name: str = EASYWEEK_BOOKING_TIMEZONE,
 ) -> TargetSnapshot:
     """The snapshot a correctly-migrated booking of *decision* would have.
@@ -202,7 +202,7 @@ def expected_target_for(
     assert decision.easyweek_staff_uuid is not None
     assert decision.easyweek_service_uuid is not None
     assert decision.easyweek_customer_uuid is not None
-    # The plan and the catalogue must already agree; `pin_service_expectation`
+    # The plan and the catalogue must already agree; `establish_baseline`
     # refuses otherwise, and this restates it where it would be read.
     assert decision.easyweek_service_uuid == expectation.easyweek_service_uuid
     assert decision.duration_minutes == expectation.duration_minutes
@@ -230,7 +230,8 @@ async def prove_live_target(
     expected_fingerprint: str | None = None,
     expected_staff_uuid: str | None = None,
     expected_location_uuid: str | None = None,
-    service_expectation: ServiceExpectation | None = None,
+    service_baseline: ServiceBaseline | None = None,
+    require_service_evidence: bool = True,
 ) -> TargetProof:
     """Fetch one booking and prove it is unchanged. Read-only; never POSTs.
 
@@ -246,6 +247,12 @@ async def prove_live_target(
         what we created?".
 
     When both are given both must hold.
+
+    Either way an ACTIVE target also needs ``service_baseline``: the booking
+    carries no catalogue service uuid, so without a stored expectation to compare
+    its ordered line against, nothing proves the right service is on it. A target
+    that is proven gone or finished goes through
+    :func:`prove_target_inactive_or_absent` instead, which never needed one.
 
     Every refusal is fail-closed and named. A missing UUID, a missing stored
     fingerprint, a 404, an unreadable response, a rewritten marker, a cancelled
@@ -280,9 +287,18 @@ async def prove_live_target(
     # from `compare` because it is the only place a DIRECT catalogue uuid — if
     # EasyWeek ever returns one — can be seen to contradict us. A conflicting
     # direct link must never be rescued by matching attributes.
-    if service_expectation is not None:
+    #
+    # REQUIRED, not optional. It was a keyword defaulting to None, and the two
+    # callers that mattered most — the final reconciliation and rollback — simply
+    # never passed it. So the service check switched itself off exactly where a
+    # wrong service does the most damage, and a fingerprint match over the
+    # remaining fields read as a clean target.
+    if service_baseline is None:
+        if require_service_evidence:
+            return TargetProof(proven=False, reason=SERVICE_EVIDENCE_MISSING, live=live)
+    else:
         try:
-            prove_ordered_service(read_ordered_service(payload), service_expectation)
+            prove_ordered_service(read_ordered_service(payload), service_baseline)
         except ServiceEvidenceError as exc:
             return TargetProof(proven=False, reason=str(exc), live=live)
 
