@@ -45,11 +45,14 @@ Nothing here writes. It reads the catalogue and compares numbers.
 from __future__ import annotations
 
 import hashlib
-import unicodedata
 from dataclasses import dataclass
 from typing import Any, Final
 
-from altegio_bot.easyweek_migration.manifest import ServiceMapping, canonical_uuid
+from altegio_bot.easyweek_migration.manifest import (
+    ServiceMapping,
+    canonical_service_name,
+    canonical_uuid,
+)
 from altegio_bot.easyweek_migration.money import (
     AmountError,
     to_minor_units,
@@ -86,6 +89,13 @@ SERVICE_FORMAT_UNSUPPORTED: Final = "service_format_unsupported"
 # the circular check this module exists to stop.
 SERVICE_BASELINE_MISSING: Final = "service_baseline_missing"
 SERVICE_BASELINE_VERSION_UNSUPPORTED: Final = "service_baseline_version_unsupported"
+# The manifest does not state this service's reviewed name or currency, so there
+# is no approved expectation to prove anything against. Never filled in from the
+# live catalogue: that is what made the check circular in the first place.
+SERVICE_EXPECTATION_INCOMPLETE: Final = "service_expectation_incomplete"
+# The stored baseline and the reviewed manifest disagree. Neither wins
+# automatically — an operator decides which is right.
+SERVICE_BASELINE_CONFLICTS_WITH_PLAN: Final = "service_baseline_conflicts_with_plan"
 # Readback-side codes.
 ORDERED_SERVICE_MISSING: Final = "ordered_service_missing"
 ORDERED_SERVICE_NOT_SINGLE: Final = "ordered_service_not_single"
@@ -120,13 +130,11 @@ def normalize_service_name(raw: object) -> str | None:
     which is safe here only because uniqueness is verified under exactly this
     same normalisation — two names that fold together are reported as ambiguous
     rather than silently treated as one.
+
+    One implementation, shared with the manifest parser, so the reviewed file and
+    the live catalogue cannot disagree about what the same name is.
     """
-    if not isinstance(raw, str):
-        return None
-    collapsed = " ".join(raw.split())
-    if not collapsed:
-        return None
-    return unicodedata.normalize("NFC", collapsed).casefold()
+    return canonical_service_name(raw)
 
 
 @dataclass(frozen=True)
@@ -334,44 +342,63 @@ def _unique_entry(catalog: CatalogSnapshot, easyweek_service_uuid: str) -> Catal
     return service
 
 
+def expectation_from_manifest(
+    location_uuid: str,
+    *,
+    easyweek_service_uuid: str,
+    mapping: ServiceMapping,
+) -> ServiceBaseline:
+    """The reviewed expectation for one service, built from the manifest alone.
+
+    Every value comes from the file an operator checked and the plan digest
+    covers. Nothing is read from the live catalogue here, and that is the whole
+    correction: the previous version took the name and the currency from
+    whatever the catalogue said at write time, so a service renamed after the
+    canary supplied its own new "expectation" and satisfied it by construction.
+
+    Raises when the manifest does not state the identity — never fills it in.
+    """
+    if not mapping.identity_complete:
+        raise ServiceEvidenceError(SERVICE_EXPECTATION_INCOMPLETE)
+    assert mapping.catalog_service_name is not None
+    assert mapping.catalog_currency is not None
+
+    if mapping.catalog_duration.minutes is None:
+        raise ServiceEvidenceError(SERVICE_FORMAT_UNSUPPORTED, "manifest_duration")
+    try:
+        price_minor = to_minor_units(mapping.catalog_price, currency=mapping.catalog_currency)
+    except AmountError:
+        raise ServiceEvidenceError(SERVICE_FORMAT_UNSUPPORTED, "manifest_price") from None
+
+    return ServiceBaseline(
+        easyweek_location_uuid=location_uuid,
+        easyweek_service_uuid=easyweek_service_uuid,
+        normalized_name=mapping.catalog_service_name,
+        currency=mapping.catalog_currency,
+        price_minor=price_minor,
+        duration_minutes=mapping.catalog_duration.minutes,
+    )
+
+
 def establish_baseline(
     catalog: CatalogSnapshot,
     *,
     easyweek_service_uuid: str,
     mapping: ServiceMapping,
 ) -> ServiceBaseline:
-    """Derive the expectation for a service that has none yet, or raise.
+    """The reviewed expectation, confirmed against the catalogue. Or raise.
 
-    Called at most once per service, in the transaction that claims the ledger
-    row for its first booking — before any POST, so what gets written down is
-    what the run is about to act on.
-
-    The manifest's own price and duration must agree with the catalogue here.
-    That is what ties the stored expectation back to the file an operator
-    reviewed: if the catalogue has moved since, this refuses rather than writing
-    down whatever the catalogue happens to say now.
+    Two steps, and the order carries the meaning: the expectation is built from
+    the manifest, then the live catalogue is asked whether it still holds. The
+    catalogue is an observation that can agree or disagree — it never supplies a
+    value. If it has moved since the operator reviewed the file, this refuses
+    rather than writing down what the catalogue happens to say now.
     """
-    service = _unique_entry(catalog, easyweek_service_uuid)
-
-    try:
-        expected_price_minor = to_minor_units(mapping.catalog_price, currency=service.currency)
-    except AmountError:
-        raise ServiceEvidenceError(SERVICE_FORMAT_UNSUPPORTED, "manifest_price") from None
-
-    if mapping.catalog_duration.minutes is None:
-        raise ServiceEvidenceError(SERVICE_FORMAT_UNSUPPORTED, "manifest_duration")
-
-    if service.price_minor != expected_price_minor or service.duration_minutes != mapping.catalog_duration.minutes:
-        raise ServiceEvidenceError(SERVICE_ATTRIBUTES_CHANGED)
-
-    return ServiceBaseline(
-        easyweek_location_uuid=catalog.location_uuid,
-        easyweek_service_uuid=service.uuid,
-        normalized_name=service.normalized_name,
-        currency=service.currency,
-        price_minor=service.price_minor,
-        duration_minutes=service.duration_minutes,
+    expected = expectation_from_manifest(
+        catalog.location_uuid, easyweek_service_uuid=easyweek_service_uuid, mapping=mapping
     )
+    verify_baseline(catalog, expected)
+    return expected
 
 
 def verify_baseline(catalog: CatalogSnapshot, baseline: ServiceBaseline) -> None:

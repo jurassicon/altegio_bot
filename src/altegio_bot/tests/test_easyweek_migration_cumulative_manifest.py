@@ -84,11 +84,15 @@ LASH_ENTRY = {
     "easyweek_service_uuid": LASH_SERVICE_UUID,
     "catalog_duration_minutes": 60,
     "catalog_price": "90.00",
+    "catalog_service_name": "Lash Extensions",
+    "catalog_currency": "EUR",
 }
 NAIL_ENTRY = {
     "easyweek_service_uuid": NAIL_SERVICE_UUID,
     "catalog_duration_minutes": 90,
     "catalog_price": "120.00",
+    "catalog_service_name": "Nail Modellage",
+    "catalog_currency": "EUR",
 }
 
 

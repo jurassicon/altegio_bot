@@ -84,6 +84,7 @@ from altegio_bot.easyweek_migration.manifest import (
     STAFF_SELECTED,
     STAFF_UNKNOWN,
     MigrationManifest,
+    ServiceMapping,
 )
 from altegio_bot.easyweek_migration.previous_wave import (
     PreviousWaveContext,
@@ -114,6 +115,7 @@ from altegio_bot.easyweek_migration.reproof import (
 )
 from altegio_bot.easyweek_migration.service_catalog import (
     CATALOG_UNREADABLE,
+    SERVICE_BASELINE_CONFLICTS_WITH_PLAN,
     SERVICE_BASELINE_MISSING,
     SERVICE_BASELINE_VERSION,
     SERVICE_PROOF_METHOD,
@@ -121,7 +123,7 @@ from altegio_bot.easyweek_migration.service_catalog import (
     ServiceBaseline,
     ServiceEvidenceError,
     build_catalog_snapshot,
-    establish_baseline,
+    expectation_from_manifest,
     prove_ordered_service,
     read_ordered_service,
     read_pagination,
@@ -948,34 +950,65 @@ async def _service_baseline_for(
         return None
 
     key = (location_uuid, service_uuid)
-    if key not in evidence.baselines:
+
+    # 1. The REVIEWED expectation, from the manifest the plan digest covers.
+    #    Built first and from the file alone — never from the catalogue — so a
+    #    service edited after the review cannot supply its own expectation.
+    mapping = _service_mapping_for(inputs.manifest, decision)
+    if mapping is None:
+        evidence.note_failure(decision, SERVICE_BASELINE_MISSING)
+        return None
+    try:
+        expected = expectation_from_manifest(location_uuid, easyweek_service_uuid=service_uuid, mapping=mapping)
+    except ServiceEvidenceError as exc:
+        evidence.note_failure(decision, exc.reason)
+        return None
+
+    # 2. The STORED expectation, if this service has been migrated before. It and
+    #    the reviewed one must agree. Neither is allowed to win automatically:
+    #    silently preferring the manifest would be a re-baseline by another name,
+    #    and silently preferring the row would let a reviewed change be ignored.
+    stored = evidence.baselines.get(key)
+    if stored is not None and stored.digest != expected.digest:
+        evidence.note_failure(decision, SERVICE_BASELINE_CONFLICTS_WITH_PLAN)
+        return None
+
+    if stored is None:
+        # 3. First booking for this service. The catalogue is read to CONFIRM the
+        #    reviewed expectation still holds — it supplies no values — and the
+        #    expectation is written down before anything is created.
         catalog = await evidence.observe(write_client, location_uuid=location_uuid)
         if catalog is None:
             return None
-        branch = inputs.manifest.branch(decision.source_company_id)
-        mapping = None
-        if branch is not None:
-            mapping = next(
-                (entry for entry in branch.services.values() if entry.easyweek_service_uuid == service_uuid),
-                None,
-            )
-        if mapping is None:
-            evidence.note_failure(decision, SERVICE_BASELINE_MISSING)
-            return None
         try:
-            candidate = establish_baseline(catalog, easyweek_service_uuid=service_uuid, mapping=mapping)
+            verify_baseline(catalog, expected)
         except ServiceEvidenceError as exc:
             evidence.note_failure(decision, exc.reason)
             return None
         async with session_maker() as session:
             async with session.begin():
-                stored, _outcome = await baseline_store.establish(
-                    session, candidate, run_id=inputs.run_id, wave_identity=wave_identity
+                written, _outcome = await baseline_store.establish(
+                    session, expected, run_id=inputs.run_id, wave_identity=wave_identity
                 )
-        evidence.baselines[key] = stored
+        # A concurrent run may have won the insert with a different expectation.
+        if written.digest != expected.digest:
+            evidence.note_failure(decision, SERVICE_BASELINE_CONFLICTS_WITH_PLAN)
+            return None
+        evidence.baselines[key] = written
 
-    # Always a fresh read for the verification itself, whichever branch we took.
+    # 4. Always a fresh catalogue read for the verification itself.
     return await evidence.prove(write_client, decision)
+
+
+def _service_mapping_for(manifest: MigrationManifest, decision: Decision) -> ServiceMapping | None:
+    """The manifest entry behind a decision's EasyWeek service uuid."""
+    branch = manifest.branch(decision.source_company_id)
+    if branch is None:
+        return None
+    return next(
+        (entry for entry in branch.services.values() if entry.easyweek_service_uuid == decision.easyweek_service_uuid),
+        None,
+    )
 
 
 async def _apply_one(

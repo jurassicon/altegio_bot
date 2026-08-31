@@ -90,6 +90,10 @@ def manifest_text(**overrides) -> str:
                         "easyweek_service_uuid": KA_SERVICE_UUID,
                         "catalog_duration_minutes": 60,
                         "catalog_price": "90.00",
+                        # The reviewed identity: what the operator saw in
+                        # EasyWeek, matching the fake catalogue exactly.
+                        "catalog_service_name": "Mascara Effekt",
+                        "catalog_currency": "EUR",
                     }
                 },
             },
@@ -105,6 +109,8 @@ def manifest_text(**overrides) -> str:
                         "easyweek_service_uuid": RA_SERVICE_UUID,
                         "catalog_duration_minutes": 60,
                         "catalog_price": "90.00",
+                        "catalog_service_name": "Eyeliner Effekt",
+                        "catalog_currency": "EUR",
                     }
                 },
             },

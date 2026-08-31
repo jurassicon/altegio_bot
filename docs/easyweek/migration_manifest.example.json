@@ -19,12 +19,16 @@
         "2000001": {
           "easyweek_service_uuid": "00000000-0000-4000-8000-000000000021",
           "catalog_duration_minutes": 60,
-          "catalog_price": "90.00"
+          "catalog_price": "90.00",
+          "catalog_service_name": "Mascara Effekt",
+          "catalog_currency": "EUR"
         },
         "2000002": {
           "easyweek_service_uuid": "00000000-0000-4000-8000-000000000022",
           "catalog_duration_minutes": 90,
-          "catalog_price": "120.00"
+          "catalog_price": "120.00",
+          "catalog_service_name": "Mascara Effekt. Auffuellen",
+          "catalog_currency": "EUR"
         }
       }
     },
@@ -43,7 +47,9 @@
         "2100001": {
           "easyweek_service_uuid": "00000000-0000-4000-8000-000000000041",
           "catalog_duration_minutes": 60,
-          "catalog_price": "90.00"
+          "catalog_price": "90.00",
+          "catalog_service_name": "Eyeliner Effekt",
+          "catalog_currency": "EUR"
         }
       }
     }

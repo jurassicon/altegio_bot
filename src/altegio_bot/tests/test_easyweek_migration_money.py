@@ -141,6 +141,8 @@ def manifest_with(*, catalog_price: str, catalog_minutes: int = 60):
                                 "easyweek_service_uuid": KA_SERVICE_UUID,
                                 "catalog_duration_minutes": catalog_minutes,
                                 "catalog_price": catalog_price,
+                                "catalog_service_name": "Mascara Effekt",
+                                "catalog_currency": "EUR",
                             }
                         },
                     },
@@ -156,6 +158,8 @@ def manifest_with(*, catalog_price: str, catalog_minutes: int = 60):
                                 "easyweek_service_uuid": RA_SERVICE_UUID,
                                 "catalog_duration_minutes": 60,
                                 "catalog_price": "90.00",
+                                "catalog_service_name": "Eyeliner Effekt",
+                                "catalog_currency": "EUR",
                             }
                         },
                     },
@@ -328,6 +332,8 @@ def test_a_manifest_service_entry_needs_both_baselines():
             "easyweek_service_uuid": KA_SERVICE_UUID,
             "catalog_duration_minutes": 60,
             "catalog_price": "90.00",
+            "catalog_service_name": "Mascara Effekt",
+            "catalog_currency": "EUR",
         }
         entry.pop(missing)
         raw = json.dumps(

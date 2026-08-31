@@ -175,13 +175,16 @@ def expectation() -> ServiceBaseline:
     return establish_baseline(catalog, easyweek_service_uuid=KA_SERVICE_UUID, mapping=mapping)
 
 
-def mapping_for(price: str = "90.00", minutes: int = 60):
-    from altegio_bot.easyweek_migration.manifest import ServiceMapping
+def mapping_for(price: str = "90.00", minutes: int = 60, name: str = "Mascara Effekt"):
+    """A manifest entry carrying the whole reviewed expectation, identity included."""
+    from altegio_bot.easyweek_migration.manifest import ServiceMapping, canonical_service_name
 
     return ServiceMapping(
         easyweek_service_uuid=KA_SERVICE_UUID,
         catalog_duration=read_duration_minutes(minutes),
         catalog_price=read_amount(price),
+        catalog_service_name=canonical_service_name(name),
+        catalog_currency="EUR",
     )
 
 

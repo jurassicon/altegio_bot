@@ -76,6 +76,8 @@ def wave_manifest(*, selected, deferred, staff=None) -> str:
                             "easyweek_service_uuid": KA_SERVICE_UUID,
                             "catalog_duration_minutes": 60,
                             "catalog_price": "90.00",
+                            "catalog_service_name": "Mascara Effekt",
+                            "catalog_currency": "EUR",
                         }
                     },
                 }
