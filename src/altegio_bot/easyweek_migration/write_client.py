@@ -71,10 +71,13 @@ _PATH_LOCATIONS: Final = "locations"
 _PATH_SERVICES: Final = "services"
 
 # EasyWeek allows 60 requests/min per key (plan §1.1). The migration is the only
-# thing that ever runs at volume against that budget, and the shared outbox
-# worker's reminder guard is using the same key at the same time — so the
-# cutover deliberately takes well under half of it.
-DEFAULT_REQUESTS_PER_MINUTE: Final = 24
+# thing that ever runs at volume against that budget, but it is not alone on the
+# key: the shared outbox worker's reminder guard verifies every reminder against
+# the same API. 40/min (one request every 1.5s) is the operator-chosen pace — it
+# leaves a third of the budget for that worker rather than the two thirds the
+# earlier 24 left. A 429 is still handled by the retry path; this constant only
+# decides how often we walk into one.
+DEFAULT_REQUESTS_PER_MINUTE: Final = 40
 
 # A mutation gets fewer attempts than a read. Every extra attempt is another
 # chance to time out in a way we cannot interpret.
