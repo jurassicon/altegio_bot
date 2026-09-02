@@ -20,8 +20,9 @@ Safety defaults:
   happily accept a replacement with an empty string;
 * the full POST payload is printed before the confirmation is asked for, so
   --apply never submits anything the operator has not seen;
-* a template with neither the address nor the Karlsruhe map link is genuinely
-  location-neutral and is skipped;
+* a template with neither the address nor the Karlsruhe map link is skipped
+  unless --include-neutral and exact --template-name selections are supplied;
+  explicitly selected neutral templates are copied without changing content;
 * a template whose address was not recognised while its Karlsruhe map link WAS
   found is a contradiction, not neutrality: it is reported as an error;
 * a branch-specific template whose Karlsruhe map link was not replaced is
@@ -32,8 +33,9 @@ Safety defaults:
   replacement did not reach blocks the run instead of shipping;
 * the {{n}} placeholder signature must survive the rewrite unchanged, because
   LIFECYCLE_PARAM_FIELDS binds template parameters by position;
-* every branch-specific template known to ``meta_templates`` must be covered;
-  anything missing aborts the run with a non-zero exit code;
+* every branch-specific template known to ``meta_templates`` must be covered
+  in a full run; a targeted run instead requires every --template-name source;
+  a known branch-specific template missing its footer remains blocked;
 * an existing target is a safe skip only while it is APPROVED or PENDING;
   REJECTED/PAUSED/DISABLED targets block the run instead of reporting success;
 * source templates are never edited or deleted.
@@ -188,6 +190,7 @@ class ClonePlan:
     existing_pending: tuple[str, ...] = ()
     existing_unusable: tuple[ExistingTarget, ...] = ()
     neutral: tuple[str, ...] = ()
+    neutral_included: tuple[str, ...] = ()
     unrecognized: tuple[TemplateOutcome, ...] = ()
     blocked: tuple[TemplateOutcome, ...] = ()
     residual: tuple[TemplateOutcome, ...] = ()
@@ -511,6 +514,7 @@ def build_plan(
     language: str,
     existing: Mapping[tuple[str, Any], str | None],
     expected: frozenset[str],
+    include_neutral: bool = False,
 ) -> ClonePlan:
     """Classify every source template and check the expected branch coverage."""
     prepared: list[TemplateOutcome] = []
@@ -518,6 +522,7 @@ def build_plan(
     existing_pending: list[str] = []
     existing_unusable: list[ExistingTarget] = []
     neutral: list[str] = []
+    neutral_included: list[str] = []
     unrecognized: list[TemplateOutcome] = []
     blocked: list[TemplateOutcome] = []
     residual: list[TemplateOutcome] = []
@@ -525,6 +530,7 @@ def build_plan(
     seen: set[str] = set()
     totals = ReplacementStats()
     source_count = 0
+    footer_required = expected_branch_templates(source_prefix=source_prefix)
 
     for source in sources:
         source_count += 1
@@ -546,18 +552,23 @@ def build_plan(
             unrecognized.append(outcome)
         elif outcome.status is TemplateStatus.BLOCKED_NO_MAPS:
             blocked.append(outcome)
-        elif outcome.status is TemplateStatus.NEUTRAL:
+        elif outcome.status is TemplateStatus.NEUTRAL and (
+            not include_neutral or outcome.source_name in footer_required
+        ):
             neutral.append(outcome.source_name)
-        elif (outcome.target_name, language) in existing:
-            target_status = existing[(outcome.target_name, language)]
-            if target_status not in REUSABLE_TARGET_STATUSES:
-                existing_unusable.append(ExistingTarget(outcome.target_name, target_status))
-            elif target_status == "APPROVED":
-                existing_approved.append(outcome.target_name)
-            else:
-                existing_pending.append(outcome.target_name)
         else:
-            prepared.append(outcome)
+            if outcome.status is TemplateStatus.NEUTRAL:
+                neutral_included.append(outcome.source_name)
+            if (outcome.target_name, language) in existing:
+                target_status = existing[(outcome.target_name, language)]
+                if target_status not in REUSABLE_TARGET_STATUSES:
+                    existing_unusable.append(ExistingTarget(outcome.target_name, target_status))
+                elif target_status == "APPROVED":
+                    existing_approved.append(outcome.target_name)
+                else:
+                    existing_pending.append(outcome.target_name)
+            else:
+                prepared.append(outcome)
 
     return ClonePlan(
         prepared=tuple(prepared),
@@ -565,6 +576,7 @@ def build_plan(
         existing_pending=tuple(existing_pending),
         existing_unusable=tuple(existing_unusable),
         neutral=tuple(neutral),
+        neutral_included=tuple(neutral_included),
         unrecognized=tuple(unrecognized),
         blocked=tuple(blocked),
         residual=tuple(residual),
@@ -580,7 +592,7 @@ def plan_blockers(plan: ClonePlan) -> list[str]:
     """Reasons the run must not submit anything; empty means the plan is sound."""
     blockers: list[str] = []
 
-    if plan.source_count and plan.total_replacements.total == 0:
+    if plan.source_count and plan.total_replacements.total == 0 and len(plan.neutral_included) != plan.source_count:
         blockers.append(
             f"none of the {plan.source_count} source template(s) contained the source address or the source "
             "maps link: SOURCE_ADDRESS_PATTERNS / SOURCE_MAP_URLS do not cover this --source-location"
@@ -661,6 +673,8 @@ def print_template_preview(item: TemplateOutcome) -> None:
         f"category: {item.payload.get('category', '-')}"
     )
     print(f"        replacements: address={item.replacements.address}, maps={item.replacements.maps_url}")
+    if item.status is TemplateStatus.NEUTRAL:
+        print("        neutral copy: content unchanged; only the template name changes")
     print(f"        placeholders: {format_placeholder_signature(item.placeholders_after)}")
     # The brand line is never rewritten: the source brand is what the clone will
     # carry. Whether that is right for the new location is the operator's call,
@@ -722,6 +736,7 @@ def print_plan(plan: ClonePlan, *, detailed: bool) -> None:
         f"Summary: ready={len(plan.prepared)}, approved-targets={len(plan.existing_approved)}, "
         f"pending-targets={len(plan.existing_pending)}, unusable-targets={len(plan.existing_unusable)}, "
         f"location-neutral={len(plan.neutral)}, blocked={len(plan.blocked)}, "
+        f"neutral-included={len(plan.neutral_included)}, "
         f"residual-markers={len(plan.residual)}, placeholder-mismatch={len(plan.placeholder_mismatch)}, "
         f"unrecognized-address={len(plan.unrecognized)}, missing={len(plan.missing_expected)}"
     )
@@ -831,6 +846,16 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"target location code (dry-run default: {DEFAULT_TARGET_LOCATION}); required with --apply",
     )
     parser.add_argument("--language", default=DEFAULT_LANGUAGE)
+    parser.add_argument(
+        "--template-name",
+        action="append",
+        help="exact source template name; repeat to select several instead of the full branch set",
+    )
+    parser.add_argument(
+        "--include-neutral",
+        action="store_true",
+        help="also copy neutral templates unchanged; requires explicit --template-name selections",
+    )
     parser.add_argument(
         "--address",
         default=None,
@@ -963,6 +988,18 @@ async def async_main(args: argparse.Namespace) -> int:
     waba_id = _required_env("META_WABA_ID")
     source_prefix = _template_prefix(args.source_location)
     target_prefix = _template_prefix(target_location)
+    selected_names = args.template_name
+    if args.include_neutral and not selected_names:
+        raise ScriptError("--include-neutral requires explicit --template-name selections")
+    if selected_names:
+        if len(set(selected_names)) != len(selected_names):
+            raise ScriptError("duplicate --template-name selection")
+        for name in selected_names:
+            if not re.fullmatch(r"[a-z0-9_]+", name) or not name.startswith(source_prefix):
+                raise ScriptError(f"--template-name must be an exact name starting with {source_prefix!r}: {name!r}")
+        expected = frozenset(selected_names)
+    else:
+        expected = expected_branch_templates(source_prefix=source_prefix)
 
     async with MetaTemplateClient(
         token=token,
@@ -973,8 +1010,12 @@ async def async_main(args: argparse.Namespace) -> int:
     ) as client:
         all_templates = await client.list_templates()
         sources = select_sources(all_templates, source_prefix=source_prefix, language=args.language)
+        if selected_names:
+            sources = [source for source in sources if source["name"] in expected]
+            if len({source["name"] for source in sources}) != len(sources):
+                raise ScriptError("duplicate selected source in the APPROVED template list; nothing submitted")
 
-        if not sources:
+        if not sources and not selected_names:
             raise ScriptError(f"no APPROVED {args.language!r} templates found with prefix {source_prefix!r}")
 
         plan = build_plan(
@@ -985,13 +1026,17 @@ async def async_main(args: argparse.Namespace) -> int:
             maps_url=maps_url,
             language=args.language,
             existing=index_existing(all_templates),
-            expected=expected_branch_templates(source_prefix=source_prefix),
+            expected=expected,
+            include_neutral=args.include_neutral,
         )
 
         mode = "APPLY" if args.apply else "DRY-RUN"
         print(f"Mode: {mode}")
         print(f"Meta Graph API: {api_version}")
         print(f"Source: {source_prefix}* ({args.language}, APPROVED)")
+        if selected_names:
+            print(f"Exact source selection: {', '.join(sorted(expected))}")
+        print(f"Include neutral: {args.include_neutral}")
         print(f"Target: {target_prefix}*")
         print(f"Address: {address}")
         print(f"Maps: {maps_url}")
