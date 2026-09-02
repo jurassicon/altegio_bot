@@ -40,12 +40,15 @@ from __future__ import annotations
 import itertools
 import re
 import sys
+from copy import deepcopy
 from typing import Any
+from unittest.mock import Mock
 
 import httpx
 import pytest
 import respx
 
+from altegio_bot.easyweek_branches import BRANCH_PROFILES
 from altegio_bot.scripts import clone_meta_templates_for_location as cloner
 from altegio_bot.scripts.clone_meta_templates_for_location import (
     DEFAULT_TARGET_ADDRESS,
@@ -366,6 +369,314 @@ def test_neutral_template_is_skipped_without_blocking_the_run() -> None:
     assert plan.neutral_expected == ()
     assert plan_blockers(plan) == []
     assert len(plan.prepared) == len(_expected())
+
+
+_NEUTRAL_BODIES = {
+    "review_3d": "Hallo {{1}}!\nDanke für Ihren Besuch bei KitiLash.\nBewertung: {{2}}\nAntworten Sie mit STOP.",
+    "comeback_3d": "Hallo, {{1}} 🙂\nMöchten Sie einen neuen Termin vereinbaren?\n{{2}}\nAntworten Sie mit STOP.",
+    "repeat_10d": (
+        "Hallo, {{1}} 🙂\nIch bin Julia vom Beautystudio KitiLash.\n"
+        "Vor 10 Tagen waren Sie bei uns für: {{2}}.\n{{3}}\nAntworten Sie mit STOP."
+    ),
+}
+
+
+def _neutral_sources() -> list[dict[str, Any]]:
+    return [
+        {
+            "id": f"existing-{code}",
+            "name": f"kitilash_ka_{code}_v1",
+            "language": "de",
+            "status": "APPROVED",
+            "category": "MARKETING",
+            "parameter_format": "POSITIONAL",
+            "components": [
+                {
+                    "type": "BODY",
+                    "text": body,
+                    "example": {
+                        "body_text": [["Test", *(["Beispiel"] if code == "repeat_10d" else []), "https://example.com"]]
+                    },
+                }
+            ],
+        }
+        for code, body in _NEUTRAL_BODIES.items()
+    ]
+
+
+def _neutral_args(*, include_neutral: bool = True) -> list[str]:
+    return [
+        *(["--include-neutral"] if include_neutral else []),
+        *(arg for code in _NEUTRAL_BODIES for arg in ("--template-name", f"kitilash_ka_{code}_v1")),
+    ]
+
+
+@pytest.mark.parametrize("source_args", [[], ["--source-location", "ka"]], ids=["default-ka", "explicit-ka"])
+def test_targeted_neutral_dry_run_needs_no_other_branch_templates(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, source_args: list[str]
+) -> None:
+    code, fake = _run_script(monkeypatch, _neutral_sources(), [*source_args, *_neutral_args()])
+
+    assert code == 0
+    assert fake.created == []
+    output = capsys.readouterr().out
+    assert "Mode: DRY-RUN" in output
+    assert "ready=3" in output
+    assert "neutral-included=3" in output
+    assert "neutral copy: content unchanged; only the template name changes" in output
+    assert "Antworten Sie mit STOP." in output
+    assert _TOKEN not in output
+
+
+@pytest.mark.parametrize("source_args", [[], ["--source-location", "ka"]], ids=["default-ka", "explicit-ka"])
+def test_targeted_apply_copies_only_named_neutral_templates_without_content_changes(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, source_args: list[str]
+) -> None:
+    sources = _neutral_sources()
+    original = deepcopy(sources)
+    unrelated = _template("kitilash_ka_newsletter_new_clients_monthly_v1", body="Newsletter {{1}}")
+
+    code, fake = _run_script(
+        monkeypatch, [*sources, unrelated, *_ka_sources()], [*_APPLY_ARGS, *source_args, *_neutral_args()]
+    )
+
+    assert code == 0
+    assert len(fake.created) == 3
+    assert sources == original
+    for source, payload in zip(sorted(sources, key=lambda row: row["name"]), fake.created, strict=True):
+        assert payload == {key: source[key] for key in ("language", "category", "parameter_format", "components")} | {
+            "name": source["name"].replace(_SOURCE_PREFIX, _TARGET_PREFIX, 1)
+        }
+    output = capsys.readouterr().out
+    assert output.index("--- POST payload ---") < output.index("SENT    ")
+    assert "status=PENDING" in output
+    assert _TOKEN not in output
+
+
+def test_neutral_inclusion_requires_exact_selection_before_reading_meta(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    code, fake = _run_script(monkeypatch, _neutral_sources(), [*_APPLY_ARGS, "--include-neutral"])
+
+    assert code == 1
+    assert fake.list_calls == 0
+    assert fake.created == []
+    assert "requires explicit --template-name" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("source_location", ["du", "ra", "xx"])
+@pytest.mark.parametrize("apply", [False, True], ids=["dry-run", "apply-yes"])
+@pytest.mark.parametrize("credentials_present", [False, True], ids=["no-credentials", "fake-credentials"])
+def test_neutral_inclusion_rejects_non_karlsruhe_before_credentials_or_meta(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+    source_location: str,
+    apply: bool,
+    credentials_present: bool,
+) -> None:
+    name = f"kitilash_{source_location}_reminder_24h_v1"
+    body = _BODY
+    if source_location == "du":
+        # Regression: this real Durlach footer used to be classified as neutral
+        # and submitted unchanged under a Rastatt name with --include-neutral.
+        content = BRANCH_PROFILES["durlach"].content
+        body += "\n" + "\n".join((content.brand_line, content.address_line, content.maps_line))
+    fake = _FakeMetaClient([_template(name, body=body)])
+    factory = Mock(return_value=fake)
+    monkeypatch.setattr(cloner, "MetaTemplateClient", factory)
+    for key, value in (("WHATSAPP_ACCESS_TOKEN", _TOKEN), ("META_WABA_ID", "test-waba")):
+        if credentials_present:
+            monkeypatch.setenv(key, value)
+        else:
+            monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "clone_meta_templates_for_location.py",
+            "--source-location",
+            source_location,
+            "--target-location",
+            "ra" if source_location == "du" else "du",
+            "--address",
+            _RA_CFG.address_line if source_location == "du" else DEFAULT_TARGET_ADDRESS,
+            "--maps-url",
+            "https://maps.app.goo.gl/xvYYbJbPaWcnp9Xv5" if source_location == "du" else DEFAULT_TARGET_MAPS_URL,
+            "--include-neutral",
+            "--template-name",
+            name,
+            *(["--apply", "--yes"] if apply else []),
+        ],
+    )
+
+    assert cloner.main() == 1
+    assert "--include-neutral requires --source-location ka" in capsys.readouterr().err
+    factory.assert_not_called()
+    assert fake.list_calls == 0
+    assert fake.created == []
+
+
+@pytest.mark.parametrize("source_location", ["du", "ra", "xx"])
+def test_non_karlsruhe_without_neutral_opt_in_keeps_existing_source_checks(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, source_location: str
+) -> None:
+    name = f"kitilash_{source_location}_review_3d_v1"
+    code, fake = _run_script(
+        monkeypatch,
+        [_template(name, body=_NEUTRAL_BODIES["review_3d"])],
+        ["--source-location", source_location, "--target-location", "ka", "--template-name", name],
+    )
+
+    assert code == 1
+    assert fake.list_calls == 1
+    assert fake.created == []
+    assert "SOURCE_ADDRESS_PATTERNS / SOURCE_MAP_URLS do not cover" in capsys.readouterr().err
+
+
+def test_exact_selection_does_not_itself_authorize_neutral_copying(monkeypatch: pytest.MonkeyPatch) -> None:
+    code, fake = _run_script(monkeypatch, _neutral_sources(), [*_APPLY_ARGS, *_neutral_args(include_neutral=False)])
+
+    assert code == 1
+    assert fake.created == []
+
+
+@pytest.mark.parametrize("status", ["PENDING", "REJECTED", "PAUSED"])
+def test_one_unapproved_selected_source_blocks_the_entire_apply(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, status: str
+) -> None:
+    sources = _neutral_sources()
+    sources[0]["status"] = status
+
+    code, fake = _run_script(monkeypatch, sources, [*_APPLY_ARGS, *_neutral_args()])
+
+    assert code == 1
+    assert fake.created == []
+    assert sources[0]["name"] in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("source_count", [0, 2])
+def test_missing_selected_sources_block_apply(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, source_count: int
+) -> None:
+    code, fake = _run_script(monkeypatch, _neutral_sources()[:source_count], [*_APPLY_ARGS, *_neutral_args()])
+
+    assert code == 1
+    assert fake.created == []
+    assert "expected branch-specific template not found" in capsys.readouterr().err
+
+
+def test_wrong_language_selected_source_is_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    sources = _neutral_sources()
+    sources[0]["language"] = "en"
+
+    code, fake = _run_script(monkeypatch, sources, [*_APPLY_ARGS, *_neutral_args()])
+
+    assert code == 1
+    assert fake.created == []
+
+
+@pytest.mark.parametrize("status", ["APPROVED", "PENDING"])
+def test_existing_neutral_targets_are_skipped_even_when_the_whole_plan_has_zero_replacements(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, status: str
+) -> None:
+    sources = _neutral_sources()
+    targets = [
+        dict(source, name=source["name"].replace(_SOURCE_PREFIX, _TARGET_PREFIX), status=status) for source in sources
+    ]
+
+    code, fake = _run_script(monkeypatch, [*sources, *targets], [*_APPLY_ARGS, *_neutral_args()])
+
+    assert code == 0
+    assert fake.created == []
+    assert "Nothing to submit." in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("status", ["REJECTED", "PAUSED", "DISABLED", "UNKNOWN"])
+def test_unusable_neutral_target_blocks_other_creates(monkeypatch: pytest.MonkeyPatch, status: str) -> None:
+    sources = _neutral_sources()
+    target = dict(sources[0], name=sources[0]["name"].replace(_SOURCE_PREFIX, _TARGET_PREFIX), status=status)
+
+    code, fake = _run_script(monkeypatch, [*sources, target], [*_APPLY_ARGS, *_neutral_args()])
+
+    assert code == 1
+    assert fake.created == []
+
+
+@pytest.mark.parametrize("name", ["kitilash_ra_review_3d_v1", "kitilash_ka_*", "", "kitilash_ka_review_3d_v1\n"])
+def test_invalid_exact_selection_is_rejected_before_reading_meta(monkeypatch: pytest.MonkeyPatch, name: str) -> None:
+    code, fake = _run_script(monkeypatch, _neutral_sources(), [*_APPLY_ARGS, "--template-name", name])
+
+    assert code == 1
+    assert fake.list_calls == 0
+    assert fake.created == []
+
+
+def test_duplicate_selected_names_are_rejected_before_reading_meta(monkeypatch: pytest.MonkeyPatch) -> None:
+    code, fake = _run_script(
+        monkeypatch,
+        _neutral_sources(),
+        [*_APPLY_ARGS, *_neutral_args(), "--template-name", "kitilash_ka_review_3d_v1"],
+    )
+
+    assert code == 1
+    assert fake.list_calls == 0
+    assert fake.created == []
+
+
+def test_duplicate_selected_sources_cannot_produce_duplicate_posts(monkeypatch: pytest.MonkeyPatch) -> None:
+    sources = _neutral_sources()
+    code, fake = _run_script(monkeypatch, [*sources, sources[0]], [*_APPLY_ARGS, *_neutral_args()])
+
+    assert code == 1
+    assert fake.created == []
+
+
+def test_known_branch_template_missing_its_footer_stays_blocked_with_neutral_opt_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "kitilash_ka_record_canceled_v1"
+    source = _template(name, body="Hallo {{1}}")
+    code, fake = _run_script(monkeypatch, [source], [*_APPLY_ARGS, "--include-neutral", "--template-name", name])
+
+    assert code == 1
+    assert fake.created == []
+
+
+@pytest.mark.parametrize("body", [_BODY + "\n" + _KA_CFG.address_line, _BODY + "\n" + _KA_MAPS_URL])
+def test_neutral_opt_in_does_not_bypass_partial_footer_guards(monkeypatch: pytest.MonkeyPatch, body: str) -> None:
+    sources = _neutral_sources()
+    sources[0]["components"][0]["text"] = body
+
+    code, fake = _run_script(monkeypatch, sources, [*_APPLY_ARGS, *_neutral_args()])
+
+    assert code == 1
+    assert fake.created == []
+
+
+def test_targeted_branch_copy_does_not_require_unselected_branch_templates(monkeypatch: pytest.MonkeyPatch) -> None:
+    source = _ka_sources()[0]
+    code, fake = _run_script(monkeypatch, [source], [*_APPLY_ARGS, "--template-name", source["name"]])
+
+    assert code == 0
+    assert len(fake.created) == 1
+    assert DEFAULT_TARGET_ADDRESS in _body_text(fake.created[0])
+
+
+def test_neutral_apply_requires_confirmation_and_shows_unchanged_body_first(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    def refuse(prompt: str) -> str:
+        assert "CREATE:DU:3" in prompt
+        preview = capsys.readouterr().out
+        assert "neutral copy: content unchanged" in preview
+        assert "Antworten Sie mit STOP." in preview
+        return "NO"
+
+    monkeypatch.setattr("builtins.input", refuse)
+    code, fake = _run_script(monkeypatch, _neutral_sources(), [*_apply_args(yes=False), *_neutral_args()])
+
+    assert code == 1
+    assert fake.created == []
 
 
 def test_expected_branch_template_classified_as_neutral_blocks_the_run() -> None:
