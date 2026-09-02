@@ -563,13 +563,30 @@ class Settings(BaseSettings):
     #
     #   easyweek_enabled                -> ONLY the public capture endpoint
     #   easyweek_processing_enabled     -> ONLY claiming/normalising captured rows
-    #   easyweek_notifications_enabled  -> ONLY creating EasyWeek MessageJob rows
+    #   easyweek_notifications_enabled  -> creating EasyWeek MessageJob rows of
+    #                                      every type, PLUS (since PR-12) the
+    #                                      send side of retention only
+    #
+    # That third line was "ONLY creating MessageJob rows" until PR-12, and the
+    # correction matters operationally. On the SEND side the flag gates exactly
+    # `repeat_10d` and `comeback_3d`: with it false those two are not claimed and
+    # not sent. It is NOT a send fence for EasyWeek lifecycle, `reminder_24h` /
+    # `reminder_2h` or `review_3d` — each of those answers to its own contract
+    # and its own fence — and it does not touch Altegio at all. Reading it as a
+    # global stop is how an operator concludes that messaging is paused when
+    # queued lifecycle and reminder jobs are still going out; the emergency stop
+    # for the whole EasyWeek queue is §8.2 of the activation runbook.
     #
     # Turning processing off never turns capture off: deliveries keep being
     # stored, they simply stay `captured` until processing is enabled again.
     easyweek_processing_enabled: bool = False
     # Creating queue-consumable EasyWeek jobs. Production default stays false
     # until PR-6; with it off the normalizer still keeps Client/Record current.
+    #
+    # Read by TWO long-running services, and differently by each: the EasyWeek
+    # inbox worker gates PLANNING on it, and the shared outbox worker gates the
+    # SEND of PR-12 retention on it. See the block above for why that asymmetry
+    # is deliberate rather than an oversight.
     easyweek_notifications_enabled: bool = False
 
     # --- PR-8: reminders ------------------------------------------------------
@@ -605,7 +622,10 @@ class Settings(BaseSettings):
     #                                    review_3d (easyweek inbox worker)
     #   easyweek_review_send_enabled  -> the SEND FENCE (shared outbox worker)
     #
-    # easyweek_notifications_enabled remains the master gate above both.
+    # easyweek_notifications_enabled remains the master gate above both — over
+    # PLANNING. It is deliberately not a second send fence for review: once a
+    # `review_3d` job exists, `easyweek_review_send_enabled` is what decides
+    # whether it goes out, and closing the master flag does not recall it.
     #
     # With planning on and the fence shut, real review jobs accumulate as
     # `queued` and can be audited against the live branch, template, sender and
@@ -641,7 +661,9 @@ class Settings(BaseSettings):
     #
     # easyweek_notifications_enabled remains the master gate above both: a
     # retention message is a customer notification, and the master switch must
-    # not be bypassed by a second flag.
+    # not be bypassed by a second flag. Retention is the ONE job family whose
+    # SEND side it also gates — a narrow extension, not a global outbox fence:
+    # lifecycle, reminders and review keep their own send-time contracts.
     #
     # Narrow ON PURPOSE. This pair permits exactly `repeat_10d` and
     # `comeback_3d` and nothing else — it is not a "marketing" or "campaigns"

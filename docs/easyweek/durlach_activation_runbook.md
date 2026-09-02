@@ -1690,9 +1690,13 @@ LIMIT 20;
 ## 8. Откат: два режима
 
 Важно понимать, что именно гейтит флаг. `EASYWEEK_NOTIFICATIONS_ENABLED`
-проверяется **только в планировщике** (`easyweek_inbox_worker`): он перестаёт
-создавать новые `MessageJob`. `outbox_worker` этим флагом **не гейтится** — уже
-созданные job'ы он доработает.
+останавливает **планировщик** (`easyweek_inbox_worker`): он перестаёт создавать
+новые `MessageJob` любого типа. Уже созданные job'ы `outbox_worker` доработает.
+
+Единственное исключение появилось в PR-12: на send-side тот же флаг закрывает
+`repeat_10d` / `comeback_3d` (§16.1). Для lifecycle, reminders и review
+`outbox_worker` им по-прежнему **не гейтится**, поэтому вывод этого раздела не
+меняется: чтобы остановить уже созданную очередь, нужен §8.2, а не флаг.
 
 Поэтому режимов два, и выбор зависит от того, что не так.
 
@@ -3928,10 +3932,17 @@ identity `provider` + `company_id` + `id`, и:
 переписать, и клиентский текст читается из текущей строки уже после совпадения
 identity.
 
-**Мастер-флаг останавливает и отправку, не только планирование.** При
-`EASYWEEK_NOTIFICATIONS_ENABLED=false` уже созданные retention jobs не
-claim'ятся и не отправляются даже при открытом `EASYWEEK_RETENTION_SEND_ENABLED`:
-они остаются `queued` с прежними `run_at`, `attempts=0` и `locked_at=NULL`.
+**Мастер-флаг останавливает и отправку — но только retention.** При
+`EASYWEEK_NOTIFICATIONS_ENABLED=false` уже созданные `repeat_10d` /
+`comeback_3d` не claim'ятся и не отправляются даже при открытом
+`EASYWEEK_RETENTION_SEND_ENABLED`: они остаются `queued` с прежними `run_at`,
+`attempts=0` и `locked_at=NULL`.
+
+Это узкое расширение, а не глобальный send fence. На send-side флаг не гейтит
+ни EasyWeek lifecycle, ни `reminder_24h` / `reminder_2h`, ни `review_3d` — у
+каждого свой контракт и свой фенс, — и не касается Altegio вообще. Для
+планирования флаг остаётся общим: при `false` inbox не создаёт новых EasyWeek
+jobs ни одного типа.
 
 **Поэтому `EASYWEEK_NOTIFICATIONS_ENABLED` читают ДВА long-running сервиса**, и
 изменение флага требует пересоздания обоих. Пересоздать только
@@ -3941,7 +3952,7 @@ outbox-worker останется с прежним runtime-значением `t
 рассылке, которой не произошло, — это ровно тот сценарий, который мастер-флаг
 обязан закрывать.
 
-#### Выключение мастер-флага — единственная безопасная последовательность
+#### Выключение мастер-флага — остановка retention sends и нового planning
 
 Одна Compose-команда с двумя сервисами порядка **не** даёт. Docker Compose
 упорядочивает сервисы по dependency graph, а эти два worker'а друг от друга не
@@ -3968,7 +3979,7 @@ $COMPOSE up -d --force-recreate altegio-outbox-worker
 ```
 
 **Шаг 3.** Read-only проверка изнутри outbox-worker. Это gate, а не
-формальность: пока она не вернула `False`, клиентские отправки не остановлены.
+формальность: пока она не вернула `False`, retention sends не остановлены.
 
 ```bash
 cd /opt/altegio_bot
@@ -3976,10 +3987,10 @@ $COMPOSE exec -T altegio-outbox-worker /app/.venv/bin/python -c 'from altegio_bo
 ```
 
 Если вывод не `{'notifications': False}` — **остановиться здесь**. Не
-пересоздавать inbox-worker, не считать рассылку остановленной и не сообщать об
-этом. Наиболее частая причина — правка попала не в тот файл или сервис не был
-пересоздан (`docker compose restart` не перечитывает `env_file`). Исправить и
-повторить шаги 2–3.
+пересоздавать inbox-worker, не считать retention sends остановленными и не
+сообщать об этом. Наиболее частая причина — правка попала не в тот файл или
+сервис не был пересоздан (`docker compose restart` не перечитывает `env_file`).
+Исправить и повторить шаги 2–3.
 
 **Шаг 4.** Только после успешной проверки — пересоздать планирующий сервис:
 
@@ -3995,8 +4006,29 @@ cd /opt/altegio_bot
 $COMPOSE exec -T altegio-easyweek-inbox-worker /app/.venv/bin/python -c 'from altegio_bot.settings import settings; print({"notifications": settings.easyweek_notifications_enabled})'
 ```
 
-Оба вывода `{'notifications': False}` — рассылка остановлена: outbox больше не
-claim'ит и не отправляет, inbox больше не планирует.
+**Что доказывают два `{'notifications': False}` — и что нет.**
+
+Доказано:
+
+- outbox больше не claim'ит и не отправляет **PR-12 retention jobs**
+  `repeat_10d` / `comeback_3d`;
+- inbox больше не планирует новые EasyWeek jobs любого типа.
+
+**НЕ доказано:** что EasyWeek перестал писать клиентам. На send-side мастер-флаг
+— это фенс **только** над retention. Уже созданные EasyWeek
+lifecycle (`record_created` / `record_updated` / `record_canceled`),
+`reminder_24h` / `reminder_2h` и `review_3d` продолжают подчиняться своим
+собственным send-time контрактам и **могут быть отправлены** после этой
+процедуры, если их фенсы (`EASYWEEK_REMINDER_API_GUARD_ENABLED`,
+`EASYWEEK_REVIEW_SEND_ENABLED`) открыты. Altegio эта процедура не касается
+вообще.
+
+Поэтому **это не аварийная остановка всего EasyWeek outbox.** Если нужна именно
+полная остановка всех клиентских отправок — используйте существующий hard-stop
+из §8.2 (остановка общего outbox-воркера, нейтрализация очереди, закрытие
+производителя delivery-retry) и закройте соответствующие feature-specific send
+fences. Второй процедуры hard-stop здесь нет и быть не должно: две расходящиеся
+инструкции аварийной остановки хуже одной.
 
 #### Обратное включение — это НЕ зеркало выключения
 
@@ -4222,11 +4254,13 @@ backfill исторических маркетинговых сообщений 
 5. При необходимости `EASYWEEK_RETENTION_ENABLED=false`.
 6. `$COMPOSE up -d --force-recreate altegio-easyweek-inbox-worker`.
 7. `EASYWEEK_NOTIFICATIONS_ENABLED` **не** выключать — это остановило бы
-   lifecycle, reminders и review. Если его всё же нужно закрыть (общая пауза
-   рассылки, а не откат PR-12), выполнять пять шагов «Выключение мастер-флага»
-   из §16.1 — отдельными командами, с проверкой внутри outbox-worker между
-   ними. Одного inbox-worker недостаточно, а одна Compose-команда с двумя
-   сервисами порядка не даёт.
+   планирование lifecycle, reminders и review. Если его всё же нужно закрыть
+   (остановка retention sends и нового EasyWeek planning, а не откат PR-12),
+   выполнять пять шагов «Выключение мастер-флага» из §16.1 — отдельными
+   командами, с проверкой внутри outbox-worker между ними. Одного inbox-worker
+   недостаточно, а одна Compose-команда с двумя сервисами порядка не даёт.
+   Эта процедура **не** останавливает уже созданные lifecycle/reminder/review
+   jobs: для полной остановки всех EasyWeek отправок — hard-stop из §8.2.
 8. `EASYWEEK_VISIT_COUNTER_ENABLED` **не** выключать и доказанные
    `visits_total` **не** удалять: они описывают состоявшиеся визиты, и получить
    их повторно неоткуда.

@@ -351,11 +351,20 @@ def test_an_invalid_canary_is_documented_as_fail_closed(pr12_section: str) -> No
     assert "fail-closed" in text.lower()
 
 
-def test_the_master_fence_is_documented_as_stopping_sends_too(pr12_section: str) -> None:
-    """The P1 defect, stated where an operator will read it."""
+def test_the_master_fence_is_documented_as_stopping_retention_sends_only(pr12_section: str) -> None:
+    """It gates SENDING as well as planning — but only for retention.
+
+    Both halves are load-bearing and they fail in opposite directions. Omitting
+    the send half lets an operator recreate the wrong container and keep sending;
+    overstating it as a general stop lets them believe EasyWeek is silent while
+    queued lifecycle and reminder jobs are still going out.
+    """
     text = prose(pr12_section)
-    assert "Мастер-флаг останавливает и отправку, не только планирование" in text
+    assert "Мастер-флаг останавливает и отправку — но только retention" in text
     assert "EASYWEEK_NOTIFICATIONS_ENABLED=false" in text
+    assert "Это узкое расширение, а не глобальный send fence" in text
+    for untouched in ("lifecycle", "reminder_24h", "review_3d", "Altegio"):
+        assert untouched in text, f"the narrow scope must name {untouched} as unaffected"
 
 
 def test_the_deadline_deadlock_has_a_documented_way_out(pr12_section: str) -> None:
@@ -611,7 +620,7 @@ def test_a_failed_outbox_check_stops_the_procedure(master_flag_shutdown: str) ->
 
     assert "остановиться здесь" in text.lower()
     assert "Не" in master_flag_shutdown and "пересоздавать inbox-worker" in text
-    assert "не считать рассылку остановленной" in text
+    assert "не считать retention sends остановленными" in text
 
 
 def test_the_shutdown_does_not_ask_for_a_dependency_between_the_workers(master_flag_shutdown: str) -> None:
@@ -730,3 +739,123 @@ def test_the_env_example_separates_shutdown_from_enabling(env_example: str) -> N
     assert "ВКЛЮЧЕНИЕ — не зеркало выключения" in entry
     assert "раздела 16.2" in entry, "enabling points at the rollout with its fences"
     assert "«всегда outbox первым» не существует" in entry
+
+
+# ---------------------------------------------------------------------------
+# The master flag is a RETENTION send fence, not a general one
+#
+# On the send side EASYWEEK_NOTIFICATIONS_ENABLED gates exactly repeat_10d and
+# comeback_3d. Queued EasyWeek lifecycle, reminder_24h/reminder_2h and review_3d
+# keep their own send-time contracts and can still go out. A runbook that
+# promises "messaging is stopped" after the shutdown sequence tells an operator
+# the outage is contained when it is not — and they stop looking.
+# ---------------------------------------------------------------------------
+
+_UNAFFECTED_JOB_TYPES = ("record_created", "reminder_24h", "reminder_2h", "review_3d")
+
+
+def test_the_shutdown_promises_retention_sends_only(master_flag_shutdown: str) -> None:
+    text = prose(master_flag_shutdown)
+
+    assert "PR-12 retention jobs" in text
+    assert "`repeat_10d` / `comeback_3d`" in text
+    assert "inbox больше не планирует новые EasyWeek jobs" in text
+
+
+def test_the_shutdown_warns_that_queued_non_retention_jobs_still_send(master_flag_shutdown: str) -> None:
+    """The warning has to name the job types, not gesture at "other messages"."""
+    text = prose(master_flag_shutdown)
+
+    assert "НЕ доказано" in text
+    assert "могут быть отправлены" in text
+    for job_type in _UNAFFECTED_JOB_TYPES:
+        assert job_type in text, f"the warning must name {job_type} as still sendable"
+
+
+def test_the_shutdown_points_at_the_existing_hard_stop(master_flag_shutdown: str) -> None:
+    """One hard-stop procedure, referenced — never a second one invented here."""
+    text = prose(master_flag_shutdown)
+
+    assert "не аварийная остановка всего EasyWeek outbox" in text
+    assert "§8.2" in text
+    assert "Второй процедуры hard-stop здесь нет" in text
+    # A copied hard-stop would show up as its own commands.
+    for block in bash_blocks(master_flag_shutdown):
+        assert "stop" not in block.split(), f"the hard-stop must be referenced, not duplicated: {block}"
+        assert "UPDATE" not in block.upper()
+
+
+def test_no_general_claim_that_all_messaging_is_stopped(pr12_section: str) -> None:
+    """The exact phrasings the two reviewers flagged, refused by name."""
+    text = prose(pr12_section)
+
+    for overclaim in (
+        "рассылка остановлена",
+        "клиентские отправки не остановлены",
+        "не считать рассылку остановленной",
+        "общая пауза рассылки",
+    ):
+        assert overclaim not in text, f"a global shutdown promise came back: {overclaim!r}"
+
+
+def test_the_rollback_calls_it_retention_and_planning_not_a_general_pause(pr12_section: str) -> None:
+    text = prose(pr12_section)
+    rollback = text[text.index("16.3 Rollback") :]
+    master_note = rollback[rollback.index(MASTER_FLAG) :]
+
+    assert "остановка retention sends и нового EasyWeek planning" in master_note
+    assert "§8.2" in master_note, "a full stop must point at the one hard-stop procedure"
+
+
+def test_the_env_example_states_the_asymmetry_between_the_two_readers(env_example: str) -> None:
+    """Same flag, two services, two different meanings."""
+    table = prose(_ownership_table(env_example))
+    entry = table[table.index(MASTER_FLAG) : table.index("EASYWEEK_ENABLED,")]
+
+    assert "ПЛАНИРОВАНИЕ" in entry and "НИ ОДНОГО типа" in entry
+    assert "SEND только для PR-12 retention" in entry
+    assert "И БОЛЬШЕ НИЧЕГО" in entry
+    assert "Это НЕ глобальный send fence" in entry
+    assert "8.2" in entry, "the env example must point at the real emergency stop"
+
+
+def test_the_settings_comment_does_not_call_the_flag_a_global_send_fence() -> None:
+    """The declaration an engineer reads first must not overstate the flag."""
+    settings_source = (REPO_ROOT / "src" / "altegio_bot" / "settings.py").read_text()
+    raw = settings_source[settings_source.index("easyweek_enabled                ->") :]
+    raw = raw[: raw.index("easyweek_processing_enabled: bool")]
+    # Unwrapped: these are wrapped comment lines, and an assertion that depended
+    # on where the author happened to break a line would be accidental matching.
+    block = prose(raw)
+
+    assert "ONLY creating EasyWeek MessageJob rows" not in block, (
+        "that absolute stopped being true when PR-12 added a retention send gate"
+    )
+    assert "the send side of retention only" in block
+    assert "NOT a send fence" in block
+    for untouched in ("reminder_24h", "review_3d", "Altegio"):
+        assert untouched in block, f"the comment must name {untouched} as unaffected"
+
+
+def test_the_review_comment_does_not_read_as_a_send_side_gate() -> None:
+    """PR-9's "master gate above both" is about planning, and must say so."""
+    settings_source = (REPO_ROOT / "src" / "altegio_bot" / "settings.py").read_text()
+    raw = settings_source[settings_source.index("--- PR-9: review_3d") :]
+    block = prose(raw[: raw.index("easyweek_reviews_enabled: bool")])
+
+    assert "master gate above both — over PLANNING" in block
+    assert "not a second send fence for review" in block
+
+
+def test_the_outbox_gate_docstring_is_scoped_to_retention() -> None:
+    """`master fence over every customer message` was too wide to be safe."""
+    worker_source = (REPO_ROOT / "src" / "altegio_bot" / "workers" / "outbox_worker.py").read_text()
+    start = worker_source.index("def easyweek_retention_send_blocked")
+    raw = worker_source[start : worker_source.index("def easyweek_retention_job_blocked")]
+    doc = " ".join(raw.split())
+
+    assert "master fence over every PR-12 RETENTION customer message" in doc
+    assert "master fence over every customer message" not in doc, "the too-wide phrasing came back"
+    assert "Scoped to retention here, and only retention" in doc
+    for untouched in ("lifecycle", "reminder_24h", "review_3d", "Altegio"):
+        assert untouched in doc, f"the docstring must name {untouched} as unaffected"

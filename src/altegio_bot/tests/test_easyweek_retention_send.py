@@ -1449,3 +1449,48 @@ async def test_the_cleanup_never_touches_altegio_or_other_easyweek_types(db: Asy
     assert cancelled == 0
     assert reminder.status == "queued"
     assert altegio.status == "queued"
+
+
+async def test_a_closed_master_fence_holds_retention_while_lifecycle_stays_claimable(
+    db: AsyncSession, monkeypatch
+) -> None:
+    """Both halves of the narrow contract, in ONE queue and one claim.
+
+    `test_the_master_fence_does_not_change_other_easyweek_or_altegio_jobs` proves
+    the other paths keep flowing. This proves the two outcomes side by side,
+    which is the thing the runbook now has to describe accurately: after closing
+    the master flag the retention job is held, and the lifecycle job beside it is
+    still claimed and would still be sent by its own contract.
+
+    It confirms the existing behaviour; it does not ask for a wider fence. A
+    global master gate over EASYWEEK_CUSTOMER_JOB_TYPES would break this test,
+    and that is deliberate — the emergency stop for the whole EasyWeek queue is
+    the operator procedure in §8.2, not this flag.
+    """
+    client = await _seed_client(db)
+    record = await _seed_record(db, client)
+    retention = await _seed_repeat_job(db, client, record, run_at=_utcnow() - timedelta(minutes=1))
+    lifecycle = MessageJob(
+        provider=PROVIDER_EASYWEEK,
+        company_id=COLLIDING_COMPANY_ID,
+        record_id=record.id,
+        client_id=client.id,
+        job_type="record_created",
+        run_at=_utcnow() - timedelta(minutes=1),
+        status="queued",
+        dedupe_key="easyweek-lifecycle-alongside-retention",
+        payload={},
+    )
+    db.add(lifecycle)
+    await db.flush()
+
+    monkeypatch.setattr(settings, "easyweek_notifications_enabled", False, raising=False)
+    claimed = {row.id for row in await ow._lock_next_jobs(db, 10)}
+
+    assert retention.id not in claimed, "the retention job is held by the master fence"
+    assert lifecycle.id in claimed, "the lifecycle job is not, and would still be sent"
+
+    await db.refresh(retention)
+    assert retention.status == "queued"
+    assert retention.attempts == 0
+    assert retention.locked_at is None

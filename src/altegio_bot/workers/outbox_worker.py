@@ -472,11 +472,20 @@ def easyweek_retention_send_blocked() -> str | None:
 
     Three gates, in the order an operator turns them:
 
-    1. ``easyweek_notifications_enabled`` — the master fence over every customer
-       message. A queued retention job is still a customer message, so pausing
-       outbound messaging has to stop it. Planning already answered to this flag;
-       sending did not, which meant a queue planned while the master was open
-       could be released after it was shut.
+    1. ``easyweek_notifications_enabled`` — the master fence over every PR-12
+       RETENTION customer message. A queued retention job is still a customer
+       message, so pausing outbound messaging has to stop it. Planning already
+       answered to this flag; sending did not, which meant a queue planned while
+       the master was open could be released after it was shut.
+
+       Scoped to retention here, and only retention. This function is reached
+       exclusively from the ``repeat_10d`` / ``comeback_3d`` path, so the flag's
+       effect on the send side ends there: EasyWeek lifecycle, ``reminder_24h`` /
+       ``reminder_2h`` and ``review_3d`` keep their own send-time contracts and
+       their own fences, and Altegio is untouched. Reading this as a global
+       outbox stop is how an operator concludes messaging is paused while queued
+       lifecycle jobs are still going out — the emergency stop for the whole
+       EasyWeek queue is §8.2 of the activation runbook, not this flag.
     2. ``easyweek_retention_send_enabled`` — PR-12's own fence.
     3. the canary restriction — a MALFORMED value fails closed here rather than
        silently reverting to bulk, because an operator who set it has decided at
