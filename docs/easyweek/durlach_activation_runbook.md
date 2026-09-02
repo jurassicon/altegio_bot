@@ -4034,15 +4034,145 @@ fences. Второй процедуры hard-stop здесь нет и быть 
 
 Последовательность выше относится **только к выключению**. Универсального
 правила «всегда пересоздавать outbox первым» не существует, и переносить этот
-порядок на включение нельзя: там открытие мастер-флага само по себе ничего не
-разрешает.
+порядок на включение нельзя.
 
-Включение мастер-флага не открывает retention: `EASYWEEK_RETENTION_ENABLED` и
-`EASYWEEK_RETENTION_SEND_ENABLED` остаются собственными fence'ами, и
-последовательность включения — это раздел 16.2 целиком: planning при закрытом
-send fence, накопление реальных кандидатов, read-only preflight, canary по
-одному job, и только затем bulk. Пересоздание сервисов в другом порядке этих
-шагов не заменяет и их не сокращает.
+Дальше два разных случая, и путать их опасно:
+
+- **первый rollout** — retention ещё ни разу не включался, send fence закрыт с
+  деплоя. Это раздел 16.2 целиком, с самого начала;
+- **возобновление после паузы мастер-флага** — retention уже работал, и его
+  выключили только процедурой выше. Это подраздел ниже.
+
+#### Возобновление после паузы мастер-флага
+
+**Опасность, которую закрывает этот подраздел.** Если retention уже был
+включён, то после паузы в `easyweek.env` осталось
+`EASYWEEK_RETENTION_SEND_ENABLED=true`, а `EASYWEEK_RETENTION_CANARY_JOB_ID`
+пуст. Send-gate не хранит никакого «разрешения от preflight»: он проверяет
+мастер-флаг, send fence и canary — и всё. Поэтому в момент, когда
+пересозданный outbox увидит `notifications=true`, **вся накопившаяся за паузу
+due retention-очередь становится claimable сразу**, без preflight и без canary.
+
+`EASYWEEK_RETENTION_ENABLED=false` от этого не защищает: это флаг
+**планирования**. Он не создаёт новых job, но уже созданную очередь не держит.
+Единственный send-side тормоз — `EASYWEEK_RETENTION_SEND_ENABLED`.
+
+Поэтому send fence закрывается **до** восстановления мастер-флага, и
+закрывается доказанно — в уже пересозданном outbox, а не только в файле.
+
+**Шаг A. Доказать исходную паузу.** Обе команды только читают и возвращают
+ненулевой код при несовпадении.
+
+```bash
+cd /opt/altegio_bot
+$COMPOSE exec -T altegio-outbox-worker /app/.venv/bin/python -c 'import sys; from altegio_bot.settings import settings as s; ok = s.easyweek_notifications_enabled is False; print({"notifications": s.easyweek_notifications_enabled, "retention_send": s.easyweek_retention_send_enabled, "gate": "PASS" if ok else "FAIL"}); sys.exit(0 if ok else 1)'
+```
+
+```bash
+cd /opt/altegio_bot
+$COMPOSE exec -T altegio-easyweek-inbox-worker /app/.venv/bin/python -c 'import sys; from altegio_bot.settings import settings as s; ok = s.easyweek_notifications_enabled is False; print({"notifications": s.easyweek_notifications_enabled, "retention": s.easyweek_retention_enabled, "gate": "PASS" if ok else "FAIL"}); sys.exit(0 if ok else 1)'
+```
+
+Записать напечатанные `retention_send` и `retention` — они понадобятся ниже.
+
+Если хотя бы одна команда вернула `FAIL` или ненулевой код, пауза **не
+доказана**. Не объявлять её состоявшейся и не продолжать: сначала выполнить
+процедуру «Выключение мастер-флага» выше целиком, вместе с её проверками.
+
+**Шаг B. Пока мастер-флаг ещё `false`**, закрыть send fence в `easyweek.env`:
+
+```text
+EASYWEEK_RETENTION_SEND_ENABLED=false
+```
+
+`EASYWEEK_RETENTION_ENABLED` при этом **не трогать**. Если retention-planning
+был включён — он остаётся включённым: выключать планирование ради удержания
+отправки бессмысленно (оно её не держит) и означало бы потерю обязательств,
+которые иначе были бы запланированы. Если он был выключен — он остаётся
+выключенным: включение planning это отдельное решение о rollout, а не часть
+возобновления.
+
+**Шаг C. Пересоздать только outbox** — мастер-флаг всё ещё `false`:
+
+```bash
+cd /opt/altegio_bot
+$COMPOSE up -d --force-recreate altegio-outbox-worker
+```
+
+Обязательный gate: оба значения читаются из НОВОГО контейнера.
+
+```bash
+cd /opt/altegio_bot
+$COMPOSE exec -T altegio-outbox-worker /app/.venv/bin/python -c 'import sys; from altegio_bot.settings import settings as s; ok = s.easyweek_notifications_enabled is False and s.easyweek_retention_send_enabled is False; print({"notifications": s.easyweek_notifications_enabled, "retention_send": s.easyweek_retention_send_enabled, "gate": "PASS" if ok else "FAIL"}); sys.exit(0 if ok else 1)'
+```
+
+`PASS` и код `0` — единственное разрешение идти дальше. Любой другой исход —
+`FAIL`, ненулевой код, ошибка команды, неожиданные значения — **запрещает**
+шаг D. Мастер-флаг при этом не трогать: пока он `false`, retention не уходит
+клиентам, и время на разбор есть.
+
+**Шаг D. Только после зелёного gate** восстановить мастер-флаг:
+
+```text
+EASYWEEK_NOTIFICATIONS_ENABLED=true
+```
+
+`EASYWEEK_RETENTION_SEND_ENABLED` остаётся `false`. Пересоздать оба сервиса
+отдельными последовательными командами.
+
+```bash
+cd /opt/altegio_bot
+$COMPOSE up -d --force-recreate altegio-easyweek-inbox-worker
+```
+
+```bash
+cd /opt/altegio_bot
+$COMPOSE exec -T -e EXPECTED_RETENTION_PLANNING=true altegio-easyweek-inbox-worker /app/.venv/bin/python -c 'import os, sys; from altegio_bot.settings import settings as s; expected = os.environ["EXPECTED_RETENTION_PLANNING"] == "true"; ok = s.easyweek_notifications_enabled is True and s.easyweek_retention_enabled is expected; print({"notifications": s.easyweek_notifications_enabled, "retention": s.easyweek_retention_enabled, "gate": "PASS" if ok else "FAIL"}); sys.exit(0 if ok else 1)'
+```
+
+Если на шаге A было напечатано `retention: False`, заменить в команде выше
+`EXPECTED_RETENTION_PLANNING=true` на `EXPECTED_RETENTION_PLANNING=false`:
+проверка обязана подтверждать сохранённое значение, а не желаемое.
+
+```bash
+cd /opt/altegio_bot
+$COMPOSE up -d --force-recreate altegio-outbox-worker
+```
+
+```bash
+cd /opt/altegio_bot
+$COMPOSE exec -T altegio-outbox-worker /app/.venv/bin/python -c 'import sys; from altegio_bot.settings import settings as s; ok = s.easyweek_notifications_enabled is True and s.easyweek_retention_send_enabled is False; print({"notifications": s.easyweek_notifications_enabled, "retention_send": s.easyweek_retention_send_enabled, "gate": "PASS" if ok else "FAIL"}); sys.exit(0 if ok else 1)'
+```
+
+**Шаг E. Мастер-флаг восстановлен, retention-отправки по-прежнему закрыты.**
+
+Что уже работает: capture, domain processing, планирование (включая retention,
+если его planning включён), lifecycle, reminders, review — по своим контрактам.
+Отложенные обязательства `booking-succeeded` восстанавливаются штатно.
+
+Что ещё закрыто: отправка `repeat_10d` / `comeback_3d`.
+
+Дальше — существующий путь раздела 16.2, без повторения первого деплоя.
+Шаги 1–7 (проверка счётчика, APPROVED-шаблоны, seed, включение planning) уже
+выполнены и не повторяются. Продолжать с:
+
+- **шаг 8** — read-only preflight по реальной очереди;
+- **шаги 10–14** — выбор canary job, preflight под canary, открытие fence для
+  canary, ожидание естественного `run_at`, проверка доставки;
+- **шаги 15–17** — закрыть fence обратно, пересоздать outbox, снять canary;
+- **шаг 18** — полный read-only аудит очереди;
+- **шаг 19** — bulk release.
+
+`EASYWEEK_RETENTION_CANARY_JOB_ID` автоматически не очищается. Любое изменение
+ограничения — только при доказанно закрытом send fence, по правилам шагов
+15–17.
+
+**Что эта процедура НЕ делает.** Она удерживает **retention**, а не все
+клиентские сообщения: уже созданные lifecycle, `reminder_24h` / `reminder_2h` и
+`review_3d` продолжают подчиняться своим send-time контрактам и могут уйти сразу
+после шага D. Read-only preflight работающий outbox не закрывает — он ничего не
+пишет и ничего не останавливает. Полная аварийная остановка всех EasyWeek
+отправок — это по-прежнему §8.2.
 
 Что PR-12 **не** добавляет: newsletters, newsletter follow-up, promo, campaign
 runner, общий marketing engine, backfill старых событий и jobs, новый scheduler,

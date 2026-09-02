@@ -92,6 +92,20 @@ def master_flag_shutdown(pr12_section: str) -> str:
 
 
 @pytest.fixture(scope="module")
+def master_flag_resume(pr12_section: str) -> str:
+    """Only the "resuming after a master-flag pause" procedure in §16.1.
+
+    Bounded at both ends. Every other part of the chapter also talks about
+    fences, preflights and recreates, so an unbounded slice would let these
+    assertions pass on the shutdown procedure or on the §16.2 rollout — which is
+    exactly the mistake that made the old enabling advice look safe.
+    """
+    start = pr12_section.index("#### Возобновление после паузы мастер-флага")
+    end = pr12_section.index("Что PR-12 **не** добавляет")
+    return pr12_section[start:end]
+
+
+@pytest.fixture(scope="module")
 def rollout_steps(pr12_section: str) -> str:
     """Only §16.2 — the numbered steps an operator executes in order.
 
@@ -225,20 +239,26 @@ def test_the_compose_comments_name_the_right_owner_for_each_flag() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_planning_is_enabled_before_the_send_fence(pr12_section: str) -> None:
-    assert position(pr12_section, f"{PLANNING_FLAG}=true") < position(pr12_section, f"{SEND_FLAG}=true")
+# These four sequence the §16.2 ROLLOUT steps, so they read `rollout_steps`
+# rather than the whole chapter. §16.1 legitimately mentions the same flags
+# while describing the shutdown and the resume, and a chapter-wide `index()`
+# would match those first and assert about the wrong procedure.
 
 
-def test_the_counter_is_confirmed_before_planning_is_enabled(pr12_section: str) -> None:
+def test_planning_is_enabled_before_the_send_fence(rollout_steps: str) -> None:
+    assert position(rollout_steps, f"{PLANNING_FLAG}=true") < position(rollout_steps, f"{SEND_FLAG}=true")
+
+
+def test_the_counter_is_confirmed_before_planning_is_enabled(rollout_steps: str) -> None:
     """A repeat planned without a proven baseline is never created at all."""
-    assert position(pr12_section, COUNTER_FLAG) < position(pr12_section, f"{PLANNING_FLAG}=true")
+    assert position(rollout_steps, COUNTER_FLAG) < position(rollout_steps, f"{PLANNING_FLAG}=true")
 
 
-def test_the_preflight_runs_between_planning_and_the_send_fence(pr12_section: str) -> None:
+def test_the_preflight_runs_between_planning_and_the_send_fence(rollout_steps: str) -> None:
     assert (
-        position(pr12_section, f"{PLANNING_FLAG}=true")
-        < position(pr12_section, PREFLIGHT_MODULE)
-        < position(pr12_section, f"{SEND_FLAG}=true")
+        position(rollout_steps, f"{PLANNING_FLAG}=true")
+        < position(rollout_steps, PREFLIGHT_MODULE)
+        < position(rollout_steps, f"{SEND_FLAG}=true")
     )
 
 
@@ -276,9 +296,11 @@ def test_every_preflight_invocation_is_a_fresh_one_off_container(pr12_section: s
     assert "restart" not in words
 
 
-def test_each_flag_change_is_followed_by_force_recreate_of_its_own_service(pr12_section: str) -> None:
-    planning = pr12_section[position(pr12_section, f"{PLANNING_FLAG}=true") :]
-    sending = pr12_section[position(pr12_section, f"{SEND_FLAG}=true") :]
+def test_each_flag_change_is_followed_by_force_recreate_of_its_own_service(
+    pr12_section: str, rollout_steps: str
+) -> None:
+    planning = rollout_steps[position(rollout_steps, f"{PLANNING_FLAG}=true") :]
+    sending = rollout_steps[position(rollout_steps, f"{SEND_FLAG}=true") :]
 
     assert f"--force-recreate {INBOX_SERVICE}" in planning[:1200]
     assert f"--force-recreate {OUTBOX_SERVICE}" in sending[:1200]
@@ -320,24 +342,24 @@ def test_the_canary_is_a_technical_restriction_not_a_promise(pr12_section: str) 
     assert "Остальные EasyWeek retention jobs остаются `queued`" in text
 
 
-def test_the_canary_sequence_is_in_the_only_workable_order(pr12_section: str) -> None:
+def test_the_canary_sequence_is_in_the_only_workable_order(rollout_steps: str) -> None:
     """canary preflight -> canary fence -> verify -> close -> unset -> preflight -> bulk.
 
     Every one of those steps is load-bearing, and the order is the whole safety
     argument: releasing the bulk queue before the restriction is removed and the
     full audit is green is exactly the blast the canary exists to prevent.
     """
-    set_canary = position(pr12_section, f"{CANARY_FLAG}=<message_jobs.id")
+    set_canary = position(rollout_steps, f"{CANARY_FLAG}=<message_jobs.id")
     # The audit that belongs to the canary is the one AFTER the restriction is
     # set; the earlier one audits the queue before a canary is even chosen.
-    canary_preflight = pr12_section.index(PREFLIGHT_MODULE, set_canary)
-    open_for_canary = position(pr12_section, f"{SEND_FLAG}=true")
+    canary_preflight = rollout_steps.index(PREFLIGHT_MODULE, set_canary)
+    open_for_canary = position(rollout_steps, f"{SEND_FLAG}=true")
     # Searched FORWARD from the canary send: `...=false` also appears in step 1,
     # where both flags are deployed shut, and that occurrence is not this step.
-    close_again = pr12_section.index(f"{SEND_FLAG}=false", open_for_canary)
-    unset_canary = pr12_section.index(f"`{CANARY_FLAG}=` (пусто)", close_again)
-    full_preflight = pr12_section.index(PREFLIGHT_MODULE, unset_canary)
-    bulk = pr12_section.index(f"{SEND_FLAG}=true", full_preflight)
+    close_again = rollout_steps.index(f"{SEND_FLAG}=false", open_for_canary)
+    unset_canary = rollout_steps.index(f"`{CANARY_FLAG}=` (пусто)", close_again)
+    full_preflight = rollout_steps.index(PREFLIGHT_MODULE, unset_canary)
+    bulk = rollout_steps.index(f"{SEND_FLAG}=true", full_preflight)
 
     assert set_canary < canary_preflight < open_for_canary
     assert open_for_canary < close_again < unset_canary
@@ -859,3 +881,168 @@ def test_the_outbox_gate_docstring_is_scoped_to_retention() -> None:
     assert "Scoped to retention here, and only retention" in doc
     for untouched in ("lifecycle", "reminder_24h", "review_3d", "Altegio"):
         assert untouched in doc, f"the docstring must name {untouched} as unaffected"
+
+
+# ---------------------------------------------------------------------------
+# Resuming after a master-flag pause
+#
+# "Opening the master flag permits nothing on its own" is true for a FIRST
+# rollout, where the send fence has been shut since deploy. It is false for a
+# retention that was already running and was merely paused: the fence is still
+# true in easyweek.env, the canary is empty, and `easyweek_retention_send_blocked`
+# consults no stored preflight approval. The moment the recreated outbox reads
+# notifications=true, the whole backlog that accumulated during the pause is
+# claimable — with no preflight and no canary in between.
+# ---------------------------------------------------------------------------
+
+
+def test_the_chapter_separates_a_first_rollout_from_a_resume(pr12_section: str) -> None:
+    """Two different situations; conflating them is what made the advice unsafe."""
+    text = prose(pr12_section)
+
+    assert "первый rollout" in text
+    assert "возобновление после паузы мастер-флага" in text.lower()
+
+
+def test_the_resume_names_the_danger_it_closes(master_flag_resume: str) -> None:
+    """The failure has to be stated, not merely designed around."""
+    text = prose(master_flag_resume)
+
+    assert "EASYWEEK_RETENTION_SEND_ENABLED=true" in text
+    assert "claimable" in text
+    assert "без preflight и без canary" in text
+
+
+def test_the_resume_says_planning_is_not_a_send_side_protection(master_flag_resume: str) -> None:
+    """`EASYWEEK_RETENTION_ENABLED=false` does not hold a queue that already exists."""
+    text = prose(master_flag_resume)
+
+    assert f"{PLANNING_FLAG}=false" in text
+    assert "флаг **планирования**" in text
+    assert "уже созданную очередь не держит" in text
+    assert f"Единственный send-side тормоз — `{SEND_FLAG}`" in text
+
+
+def test_the_resume_proves_the_starting_pause_before_anything_else(master_flag_resume: str) -> None:
+    """Step A: both workers must be shown to be at notifications=false."""
+    text = prose(master_flag_resume)
+    first_gate = master_flag_resume[: position(master_flag_resume, f"{SEND_FLAG}=false")]
+
+    assert "Шаг A" in text
+    checks = [b for b in bash_blocks(first_gate) if "easyweek_notifications_enabled" in b]
+    assert len(checks) == 2, "the starting pause is proven in BOTH workers before it is trusted"
+    assert any(OUTBOX_SERVICE in b for b in checks)
+    assert any(INBOX_SERVICE in b for b in checks)
+    assert "пауза **не доказана**" in text
+    assert "Не объявлять её состоявшейся" in text
+
+
+def test_the_send_fence_is_closed_before_the_master_flag_is_restored(master_flag_resume: str) -> None:
+    """THE ordering property: the fence closes while the master is still false."""
+    close_fence = position(master_flag_resume, f"{SEND_FLAG}=false")
+    restore_master = position(master_flag_resume, f"{MASTER_FLAG}=true")
+
+    assert close_fence < restore_master
+
+
+def test_the_outbox_is_recreated_and_verified_before_the_master_flag(master_flag_resume: str) -> None:
+    """Closing the fence in the file is not closing it in the running worker."""
+    close_fence = position(master_flag_resume, f"{SEND_FLAG}=false")
+    restore_master = position(master_flag_resume, f"{MASTER_FLAG}=true")
+    between = master_flag_resume[close_fence:restore_master]
+
+    recreates = [b for b in bash_blocks(between) if "--force-recreate" in b]
+    assert recreates, "the outbox must be recreated before the master flag is restored"
+    assert all(OUTBOX_SERVICE in b for b in recreates), "and only the outbox at this point"
+    assert all(INBOX_SERVICE not in b for b in recreates)
+
+    gates = [
+        b
+        for b in bash_blocks(between)
+        if "easyweek_notifications_enabled" in b and "easyweek_retention_send_enabled" in b
+    ]
+    assert gates, "an effective-config gate must sit between the recreate and the master flag"
+    gate = gates[-1]
+    assert "sys.exit" in gate, "the gate must fail with a non-zero exit code"
+    assert "exec" in gate.split()
+
+
+def test_the_gate_is_mandatory_before_restoring_the_master_flag(master_flag_resume: str) -> None:
+    text = prose(master_flag_resume)
+
+    assert "Обязательный gate" in text
+    assert "единственное разрешение идти дальше" in text
+    assert "запрещает" in text
+
+
+def test_the_send_fence_stays_closed_after_the_master_flag_is_restored(master_flag_resume: str) -> None:
+    """Restoring the master flag must not be the moment the queue is released."""
+    text = prose(master_flag_resume)
+    after = master_flag_resume[position(master_flag_resume, f"{MASTER_FLAG}=true") :]
+
+    assert f"`{SEND_FLAG}` остаётся `false`" in text
+    verifications = [
+        b
+        for b in bash_blocks(after)
+        if OUTBOX_SERVICE in b and "easyweek_retention_send_enabled" in b and "sys.exit" in b
+    ]
+    assert verifications, "the post-restore outbox check must re-prove the fence is still shut"
+    assert "retention-отправки по-прежнему закрыты" in text
+
+
+def test_the_resume_recreates_both_workers_separately(master_flag_resume: str) -> None:
+    """No combined command, and no dependency between the workers."""
+    for block in bash_blocks(master_flag_resume):
+        if "--force-recreate" not in block:
+            continue
+        assert not (OUTBOX_SERVICE in block and INBOX_SERVICE in block), (
+            f"a combined force-recreate is not an ordering guarantee: {block}"
+        )
+    assert "depends_on" not in master_flag_resume
+
+
+def test_the_resume_hands_over_to_the_existing_preflight_and_canary(master_flag_resume: str) -> None:
+    """It continues §16.2 by step number; it does not replay the first deploy."""
+    text = prose(master_flag_resume)
+
+    assert "шаг 8" in text, "the read-only preflight over the real queue"
+    assert "шаги 10–14" in text, "the controlled single-job canary"
+    assert "шаги 15–17" in text, "close the fence again and unset the canary"
+    assert "шаг 18" in text and "шаг 19" in text, "full audit, then bulk"
+    assert "Шаги 1–7" in text and "не повторяются" in text
+    assert "автоматически не очищается" in text, "the canary restriction is not cleared for the operator"
+
+
+def test_the_resume_does_not_claim_a_general_stop(master_flag_resume: str) -> None:
+    """It holds retention, not every customer message."""
+    text = prose(master_flag_resume)
+
+    assert "удерживает **retention**, а не все клиентские сообщения" in text
+    for job_type in ("reminder_24h", "review_3d"):
+        assert job_type in text, f"the warning must name {job_type} as still sendable"
+    assert "§8.2" in text
+    assert "preflight работающий outbox не закрывает" in text
+
+
+def test_the_old_unsafe_enabling_claim_is_gone(pr12_section: str) -> None:
+    """The exact sentence that made the resume unsafe, refused by name.
+
+    It read as an unconditional property of the master flag. It is only true
+    while the send fence is shut — which is precisely NOT the state a paused
+    retention is left in.
+    """
+    text = prose(pr12_section)
+
+    assert "открытие мастер-флага само по себе ничего не разрешает" not in text
+    assert "Включение мастер-флага не открывает retention" not in text
+
+
+def test_the_env_example_no_longer_promises_that_the_master_flag_is_inert(env_example: str) -> None:
+    table = prose(_ownership_table(env_example))
+    entry = table[table.index(MASTER_FLAG) : table.index("EASYWEEK_ENABLED,")]
+
+    assert "ВЕРНО ТОЛЬКО для первого rollout" in entry
+    assert "СРАЗУ освобождает" in entry
+    assert f"{PLANNING_FLAG}=false от этого не спасает" in entry
+    assert "Возобновление после паузы мастер-флага" in entry, "and it points at the canonical procedure"
+    assert "16.1" in entry

@@ -1494,3 +1494,121 @@ async def test_a_closed_master_fence_holds_retention_while_lifecycle_stays_claim
     assert retention.status == "queued"
     assert retention.attempts == 0
     assert retention.locked_at is None
+
+
+# ===========================================================================
+# Resuming after a master-flag pause: what actually holds a queue
+#
+# The runbook used to say that restoring the master flag "permits nothing on its
+# own". These three states show why that is only true while the send fence is
+# shut — and therefore why the resume procedure has to close the fence in a
+# recreated outbox BEFORE the master flag comes back.
+# ===========================================================================
+
+
+async def _two_due_retention_jobs(db: AsyncSession) -> tuple[MessageJob, MessageJob]:
+    """Two independent due retention jobs, on a clean queue.
+
+    Two clients and two bookings, not one job looked at twice: a queue is
+    released or held as a whole, and a single row cannot show that.
+    """
+    first_client = await _seed_client(db)
+    first_record = await _seed_record(db, first_client)
+    first = await _seed_repeat_job(
+        db,
+        first_client,
+        first_record,
+        run_at=_utcnow() - timedelta(minutes=5),
+        dedupe_key="easyweek_retention:resume:1",
+    )
+
+    second_client = await _seed_client(db, altegio_client_id=7300077)
+    second_record = await _seed_record(
+        db,
+        second_client,
+        starts_at=_utcnow() - timedelta(days=10),
+        booking_uuid=OTHER_BOOKING_UUID,
+        altegio_record_id=4200077,
+    )
+    second = await _seed_repeat_job(
+        db,
+        second_client,
+        second_record,
+        run_at=_utcnow() - timedelta(minutes=4),
+        dedupe_key="easyweek_retention:resume:2",
+    )
+    return first, second
+
+
+def _held_state(job: MessageJob, run_at: datetime) -> tuple[str, int, object, bool]:
+    return (job.status, job.attempts, job.locked_at, job.run_at == run_at)
+
+
+async def test_a_paused_master_holds_the_whole_due_retention_queue(db: AsyncSession, capture, monkeypatch) -> None:
+    """master=false, send fence still true — the state a pause actually leaves."""
+    first, second = await _two_due_retention_jobs(db)
+    run_ats = (first.run_at, second.run_at)
+    monkeypatch.setattr(settings, "easyweek_notifications_enabled", False, raising=False)
+    monkeypatch.setattr(settings, "easyweek_retention_send_enabled", True, raising=False)
+
+    claimed = {row.id for row in await ow._lock_next_jobs(db, 10)}
+
+    assert claimed == set(), "both jobs are held while the master flag is shut"
+    for job, run_at in zip((first, second), run_ats, strict=True):
+        await db.refresh(job)
+        assert _held_state(job, run_at) == ("queued", 0, None, True)
+    assert capture.template_calls == []
+
+
+async def test_a_closed_send_fence_holds_the_whole_due_retention_queue(db: AsyncSession, capture, monkeypatch) -> None:
+    """master=true, fence false — the state the resume procedure creates.
+
+    This is what makes the resume safe: the master flag can come back while the
+    queue stays exactly where the preflight will find it.
+    """
+    first, second = await _two_due_retention_jobs(db)
+    run_ats = (first.run_at, second.run_at)
+    monkeypatch.setattr(settings, "easyweek_notifications_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_retention_send_enabled", False, raising=False)
+
+    claimed = {row.id for row in await ow._lock_next_jobs(db, 10)}
+
+    assert claimed == set(), "both jobs are held while the send fence is shut"
+    for job, run_at in zip((first, second), run_ats, strict=True):
+        await db.refresh(job)
+        assert _held_state(job, run_at) == ("queued", 0, None, True)
+    assert capture.template_calls == []
+
+
+async def test_master_and_fence_both_open_release_the_whole_queue(db: AsyncSession, monkeypatch) -> None:
+    """The control, and the reason the runbook needed fixing.
+
+    Nothing else is consulted — no stored preflight verdict, no canary — so a
+    master flag restored while the fence is still true releases the entire
+    backlog that accumulated during the pause, at once.
+    """
+    first, second = await _two_due_retention_jobs(db)
+    monkeypatch.setattr(settings, "easyweek_notifications_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_retention_send_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_retention_canary_job_id", "", raising=False)
+
+    claimed = {row.id for row in await ow._lock_next_jobs(db, 10)}
+
+    assert claimed == {first.id, second.id}, "both become claimable the moment both gates are open"
+
+
+async def test_retention_planning_does_not_hold_an_existing_queue(db: AsyncSession, monkeypatch) -> None:
+    """`EASYWEEK_RETENTION_ENABLED` is a PLANNING flag, and only that.
+
+    Turning planning off is not a way to hold a queue that already exists — the
+    send gate never reads it. That is why the resume procedure closes the send
+    fence instead.
+    """
+    first, second = await _two_due_retention_jobs(db)
+    monkeypatch.setattr(settings, "easyweek_notifications_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_retention_send_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_retention_enabled", False, raising=False)
+
+    claimed = {row.id for row in await ow._lock_next_jobs(db, 10)}
+
+    assert claimed == {first.id, second.id}, "planning=false does not fence an existing queue"
