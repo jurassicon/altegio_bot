@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -34,15 +35,19 @@ from altegio_bot.easyweek_retention import (
     PAYLOAD_PROOF_VERSION,
     PAYLOAD_RECORD_STARTS_AT,
     PAYLOAD_SOURCE_CANCELLED_AT,
+    PAYLOAD_SOURCE_SERVICE_ID,
     PAYLOAD_VISITS_BASELINE,
     REPEAT_DELAY,
     RETENTION_PROOF_VERSION,
+    RETENTION_SERVICE_CHANGED,
+    service_identity_reason,
 )
-from altegio_bot.models.models import Client, EasyWeekEvent, MessageJob, Record
+from altegio_bot.models.models import Client, EasyWeekEvent, MessageJob, Record, RecordService
 from altegio_bot.settings import settings
 from altegio_bot.tests.easyweek_fixtures import (
     FOREIGN_LOCATION_ID,
     TEST_BOOKING_ID,
+    TEST_BOOKING_UUID,
     TEST_CUSTOMER_ID,
     TEST_LOCATION_ID,
     TEST_LOCATION_UUID,
@@ -507,7 +512,8 @@ async def test_planning_off_creates_nothing_and_leaves_the_counter_working(bound
     assert (await _client_row(bound_session_local)).easyweek_visits_total == 5
     event = (await _event_rows(bound_session_local))[-1]
     assert event.status == "processed"
-    assert event.review_deferred_at is None, "retention OFF is a decision, not a pause"
+    assert event.retention_deferred_at is None, "retention OFF is a decision, not a pause"
+    assert event.review_deferred_at is None
 
 
 async def test_a_closed_master_fence_keeps_the_obligation(bound_session_local, monkeypatch) -> None:
@@ -527,7 +533,10 @@ async def test_a_closed_master_fence_keeps_the_obligation(bound_session_local, m
     assert (await _client_row(bound_session_local)).easyweek_visits_total == 3
     event = (await _event_rows(bound_session_local))[-1]
     assert event.status == "processed", "the queue must not be held"
-    assert event.review_deferred_at is not None, "and the obligation must survive"
+    assert event.retention_deferred_at is not None, "and the obligation must survive"
+    # Reviews were never switched on, so no review is owed. The marker names the
+    # obligation TYPE precisely so recovery cannot invent the other one.
+    assert event.review_deferred_at is None
 
 
 async def test_opening_the_master_fence_recovers_the_deferred_repeat(bound_session_local, monkeypatch) -> None:
@@ -543,12 +552,12 @@ async def test_opening_the_master_fence_recovers_the_deferred_repeat(bound_sessi
     assert await _jobs(bound_session_local, "repeat_10d") == []
 
     _fence_open(monkeypatch)
-    assert await worker.recover_deferred_reviews() == 1
+    assert await worker.recover_deferred_retention() == 1
 
     jobs = await _jobs(bound_session_local, "repeat_10d")
     assert len(jobs) == 1
     assert jobs[0].payload[PAYLOAD_VISITS_BASELINE] == 3
-    assert (await _event_rows(bound_session_local))[-1].review_deferred_at is None
+    assert (await _event_rows(bound_session_local))[-1].retention_deferred_at is None
 
 
 async def test_the_recovery_is_idempotent(bound_session_local, monkeypatch) -> None:
@@ -564,8 +573,8 @@ async def test_the_recovery_is_idempotent(bound_session_local, monkeypatch) -> N
     )
 
     _fence_open(monkeypatch)
-    await worker.recover_deferred_reviews()
-    await worker.recover_deferred_reviews()
+    await worker.recover_deferred_retention()
+    await worker.recover_deferred_retention()
 
     assert len(await _jobs(bound_session_local, "repeat_10d")) == 1
 
@@ -846,3 +855,333 @@ async def test_lifecycle_and_reminders_are_untouched_by_retention(bound_session_
     assert len(await _jobs(bound_session_local, "reminder_2h")) == 1
     assert await _jobs(bound_session_local, "repeat_10d") == []
     assert await _jobs(bound_session_local, "comeback_3d") == []
+
+
+# ===========================================================================
+# The durable obligation TYPE (P1)
+#
+# One marker meaning "something is owed" forces recovery to consult today's
+# flags instead of what the delivery actually earned. That is two opposite
+# defects at once: a feature that was OFF at event time gets a message invented
+# for it retroactively, and a feature that WAS on loses its obligation the
+# moment the other planner clears the shared marker.
+# ===========================================================================
+
+
+def _reviews_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "easyweek_notifications_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_reviews_enabled", True, raising=False)
+    monkeypatch.setattr(
+        settings,
+        "easyweek_google_review_links",
+        json.dumps({str(TEST_LOCATION_ID): "https://g.page/r/CaV0vSmrSYkdEAE/review"}),
+        raising=False,
+    )
+
+
+def _reviews_wanted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Reviews on, master fence deliberately shut."""
+    monkeypatch.setattr(settings, "easyweek_reviews_enabled", True, raising=False)
+    monkeypatch.setattr(
+        settings,
+        "easyweek_google_review_links",
+        json.dumps({str(TEST_LOCATION_ID): "https://g.page/r/CaV0vSmrSYkdEAE/review"}),
+        raising=False,
+    )
+
+
+async def test_scenario_a_a_flag_flip_neither_invents_nor_loses_an_obligation(bound_session_local, monkeypatch) -> None:
+    """Scenario A from the review.
+
+    At event time:  notifications off, retention ON,  reviews off.
+    At recovery:    notifications ON,  retention off, reviews ON.
+
+    A shared marker would read "something is owed", see reviews enabled, and
+    create a review this visit never earned — while the repeat it DID earn was
+    discharged unread. Both halves are checked here.
+    """
+    _counter_on(monkeypatch)
+    _retention_wanted(monkeypatch)  # retention on, master shut, reviews off
+    start = await _seed_booking(bound_session_local)
+    await _deliver(
+        bound_session_local,
+        _succeeded(_starting(booking_created(), start), visits_total=3),
+        event_hint="booking-succeeded",
+        payload_hash="succeeded-1",
+    )
+    event = (await _event_rows(bound_session_local))[-1]
+    assert event.retention_deferred_at is not None
+    assert event.review_deferred_at is None
+
+    # The operator opens the master fence, turns retention OFF and reviews ON.
+    monkeypatch.setattr(settings, "easyweek_retention_enabled", False, raising=False)
+    _reviews_on(monkeypatch)
+
+    await worker.recover_deferred_reviews()
+    await worker.recover_deferred_retention()
+
+    assert await _jobs(bound_session_local, "review_3d") == [], (
+        "reviews were off when the visit happened; no review may be invented now"
+    )
+    event = (await _event_rows(bound_session_local))[-1]
+    assert event.retention_deferred_at is not None, "the repeat obligation must survive a retention pause"
+
+    # Retention comes back on: exactly one repeat, and only now.
+    monkeypatch.setattr(settings, "easyweek_retention_enabled", True, raising=False)
+    assert await worker.recover_deferred_retention() == 1
+
+    assert len(await _jobs(bound_session_local, "repeat_10d")) == 1
+    assert (await _event_rows(bound_session_local))[-1].retention_deferred_at is None
+
+
+async def test_scenario_b_two_obligations_are_discharged_independently(bound_session_local, monkeypatch) -> None:
+    """Scenario B from the review.
+
+    Both obligations earned; only ONE feature available at recovery. The handled
+    marker clears, the other stays, and enabling the second feature processes it
+    exactly once.
+    """
+    _counter_on(monkeypatch)
+    _retention_wanted(monkeypatch)
+    _reviews_wanted(monkeypatch)  # both wanted, master fence shut
+    start = await _seed_booking(bound_session_local, start=_at(days=1))
+    await _deliver(
+        bound_session_local,
+        _succeeded(_starting(booking_created(), _at(days=1)), visits_total=3),
+        event_hint="booking-succeeded",
+        payload_hash="succeeded-1",
+    )
+    event = (await _event_rows(bound_session_local))[-1]
+    assert event.review_deferred_at is not None
+    assert event.retention_deferred_at is not None
+    assert start is not None
+
+    # Only reviews are available when the fence opens.
+    monkeypatch.setattr(settings, "easyweek_notifications_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_retention_enabled", False, raising=False)
+
+    assert await worker.recover_deferred_reviews() == 1
+    assert await worker.recover_deferred_retention() == 0
+
+    assert len(await _jobs(bound_session_local, "review_3d")) == 1
+    assert await _jobs(bound_session_local, "repeat_10d") == []
+    event = (await _event_rows(bound_session_local))[-1]
+    assert event.review_deferred_at is None, "the handled obligation is discharged"
+    assert event.retention_deferred_at is not None, "the other one is untouched"
+
+    # The second feature comes on.
+    monkeypatch.setattr(settings, "easyweek_retention_enabled", True, raising=False)
+    assert await worker.recover_deferred_retention() == 1
+    assert await worker.recover_deferred_retention() == 0, "and exactly once"
+
+    assert len(await _jobs(bound_session_local, "repeat_10d")) == 1
+    assert len(await _jobs(bound_session_local, "review_3d")) == 1
+    event = (await _event_rows(bound_session_local))[-1]
+    assert event.review_deferred_at is None
+    assert event.retention_deferred_at is None
+
+
+async def test_one_delivery_can_earn_both_markers(bound_session_local, monkeypatch) -> None:
+    _counter_on(monkeypatch)
+    _retention_wanted(monkeypatch)
+    _reviews_wanted(monkeypatch)
+    start = await _seed_booking(bound_session_local, start=_at(days=1))
+
+    await _deliver(
+        bound_session_local,
+        _succeeded(_starting(booking_created(), _at(days=1))),
+        event_hint="booking-succeeded",
+        payload_hash="succeeded-1",
+    )
+
+    event = (await _event_rows(bound_session_local))[-1]
+    assert start is not None
+    assert event.status == "processed"
+    assert event.review_deferred_at is not None
+    assert event.retention_deferred_at is not None
+
+
+async def test_a_closed_retention_fence_never_discharges_the_marker(bound_session_local, monkeypatch) -> None:
+    """A pause is not a discharge: a disabled feature keeps what it earned."""
+    _counter_on(monkeypatch)
+    _retention_wanted(monkeypatch)
+    start = await _seed_booking(bound_session_local)
+    await _deliver(
+        bound_session_local,
+        _succeeded(_starting(booking_created(), start)),
+        event_hint="booking-succeeded",
+        payload_hash="succeeded-1",
+    )
+
+    for _ in range(3):
+        assert await worker.recover_deferred_retention() == 0
+
+    assert (await _event_rows(bound_session_local))[-1].retention_deferred_at is not None
+
+
+async def test_a_recoverable_error_in_one_obligation_spares_the_other(bound_session_local, monkeypatch) -> None:
+    """Separate transactions: one broken configuration must not clear the other marker."""
+    _counter_on(monkeypatch)
+    _retention_wanted(monkeypatch)
+    _reviews_wanted(monkeypatch)
+    await _seed_booking(bound_session_local, start=_at(days=1))
+    await _deliver(
+        bound_session_local,
+        _succeeded(_starting(booking_created(), _at(days=1))),
+        event_hint="booking-succeeded",
+        payload_hash="succeeded-1",
+    )
+    monkeypatch.setattr(settings, "easyweek_notifications_enabled", True, raising=False)
+    # The review link map is unusable; the category allowlist is fine.
+    monkeypatch.setattr(settings, "easyweek_google_review_links", "{not json", raising=False)
+
+    assert await worker.recover_deferred_reviews() == 0, "an undecidable review is postponed, not decided"
+    assert await worker.recover_deferred_retention() == 1
+
+    event = (await _event_rows(bound_session_local))[-1]
+    assert event.review_deferred_at is not None, "the review obligation survives its own outage"
+    assert event.retention_deferred_at is None
+    assert len(await _jobs(bound_session_local, "repeat_10d")) == 1
+
+
+# ===========================================================================
+# Frozen service identity at planning time (P2)
+# ===========================================================================
+
+
+async def test_the_repeat_payload_freezes_the_service_id(bound_session_local, monkeypatch) -> None:
+    _counter_on(monkeypatch)
+    _retention_on(monkeypatch)
+    start = await _seed_booking(bound_session_local)
+
+    await _deliver(
+        bound_session_local,
+        _succeeded(_starting(booking_created(), start)),
+        event_hint="booking-succeeded",
+        payload_hash="succeeded-1",
+    )
+
+    job = (await _jobs(bound_session_local, "repeat_10d"))[0]
+    assert job.payload[PAYLOAD_SOURCE_SERVICE_ID] == 5100003, "the fixture's service_id, frozen"
+    assert job.payload[PAYLOAD_PROOF_VERSION] == RETENTION_PROOF_VERSION
+    # The identity is technical: no title, no price, no description.
+    rendered = json.dumps(job.payload)
+    assert "Fixture Service" not in rendered
+
+
+async def test_a_swapped_service_cancels_the_repeat_before_meta(bound_session_local, monkeypatch) -> None:
+    """The end-to-end version of the P2 scenario, from webhook to refusal.
+
+    booking-succeeded with service A -> repeat queued -> booking-updated moves
+    the booking to service B -> the repeat is refused with a stable, safe code
+    before any Meta attempt.
+    """
+    _counter_on(monkeypatch)
+    _retention_on(monkeypatch)
+    start = await _seed_booking(bound_session_local)
+    await _deliver(
+        bound_session_local,
+        _succeeded(_starting(booking_created(), start)),
+        event_hint="booking-succeeded",
+        payload_hash="succeeded-1",
+    )
+    job = (await _jobs(bound_session_local, "repeat_10d"))[0]
+    assert job.payload[PAYLOAD_SOURCE_SERVICE_ID] == 5100003
+
+    swapped = _starting(booking_created(), start)
+    swapped["service_id"] = 5100099
+    swapped["service_name"] = "Другая услуга"
+    swapped["services_description"] = "Другая услуга"
+    await _deliver(bound_session_local, swapped, event_hint="booking-updated", payload_hash="updated-1")
+
+    async with bound_session_local() as session:
+        services = list(
+            (await session.execute(select(RecordService).order_by(RecordService.service_id))).scalars().all()
+        )
+    assert [svc.service_id for svc in services] == [5100099], "the snapshot followed the update"
+
+    assert (
+        service_identity_reason(frozen=job.payload[PAYLOAD_SOURCE_SERVICE_ID], current=services[0].service_id)
+        == RETENTION_SERVICE_CHANGED
+    )
+
+
+# ===========================================================================
+# What the new PR-12 log lines may not contain (P2)
+# ===========================================================================
+
+
+def _pr12_lines(caplog) -> list[str]:
+    """Only the log statements PR-12 added.
+
+    Scoped deliberately. The older PR-4 lifecycle and PR-11 counter lines do
+    print a booking uuid; rewriting those is a separate decision about a separate
+    PR's logs, and widening this assertion to the whole logger would smuggle it
+    in. What PR-12 owes is that IT does not add new ones.
+    """
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith(("easyweek repeat", "easyweek comeback", "easyweek deferred retention"))
+    ]
+
+
+async def test_the_repeat_success_log_carries_no_booking_uuid(bound_session_local, monkeypatch, caplog) -> None:
+    _counter_on(monkeypatch)
+    _retention_on(monkeypatch)
+    start = await _seed_booking(bound_session_local)
+
+    with caplog.at_level(logging.INFO, logger="easyweek_inbox_worker"):
+        await _deliver(
+            bound_session_local,
+            _succeeded(_starting(booking_created(), start)),
+            event_hint="booking-succeeded",
+            payload_hash="succeeded-1",
+        )
+
+    assert len(await _jobs(bound_session_local, "repeat_10d")) == 1
+    planned = _pr12_lines(caplog)
+    assert any("repeat planned" in line for line in planned), "the success path must still be observable"
+    for line in planned:
+        assert TEST_BOOKING_UUID not in line
+
+
+async def test_the_repeat_refusal_log_carries_no_booking_uuid(bound_session_local, monkeypatch, caplog) -> None:
+    """The `no_record` path: a succeeded delivery for a booking we never stored."""
+    _counter_on(monkeypatch)
+    _retention_on(monkeypatch)
+
+    with caplog.at_level(logging.INFO, logger="easyweek_inbox_worker"):
+        await _deliver(
+            bound_session_local,
+            _succeeded(_starting(booking_created(), _at(days=-1))),
+            event_hint="booking-succeeded",
+            payload_hash="succeeded-1",
+        )
+
+    lines = _pr12_lines(caplog)
+    skipped = [line for line in lines if "repeat skipped" in line]
+    assert skipped, "the refusal must still be observable"
+    assert any("no_record" in line for line in skipped)
+    for line in lines:
+        assert TEST_BOOKING_UUID not in line
+
+
+async def test_the_comeback_success_log_carries_no_booking_uuid(bound_session_local, monkeypatch, caplog) -> None:
+    _retention_on(monkeypatch)
+    await _seed_booking(bound_session_local, start=_at(days=2))
+    await _seed_client_counter(bound_session_local)
+
+    with caplog.at_level(logging.INFO, logger="easyweek_inbox_worker"):
+        await _deliver(
+            bound_session_local,
+            _starting(booking_canceled(), _at(days=2)),
+            event_hint="booking-canceled",
+            payload_hash="canceled-1",
+        )
+
+    assert len(await _jobs(bound_session_local, "comeback_3d")) == 1
+    planned = _pr12_lines(caplog)
+    assert any("comeback planned" in line for line in planned)
+    for line in planned:
+        assert TEST_BOOKING_UUID not in line

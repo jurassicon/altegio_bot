@@ -657,7 +657,26 @@ class Settings(BaseSettings):
     # `queued`, spend no attempts and keep their run_at, which is exactly the
     # state the read-only preflight is meant to inspect. Closing it does not
     # cancel what is already queued, and turning planning off does not open it.
+    #
+    # `easyweek_notifications_enabled` gates SENDING as well as planning: a
+    # retention job already in the queue is still a customer message, and the
+    # master fence has to be able to stop one. Opening this fence while the
+    # master is shut sends nothing.
     easyweek_retention_send_enabled: bool = False
+
+    # The controlled-canary restriction: one internal `message_jobs.id`, and the
+    # ONLY EasyWeek retention job the worker may claim or send while it is set.
+    #
+    # A string rather than an int on purpose. Typing it as `int | None` would
+    # make a typo raise inside `Settings()` — every worker and the API would fail
+    # to start over a rollout variable. Parsing at the point of use instead lets
+    # a malformed value fail CLOSED in exactly one place: no retention job is
+    # claimed at all, and the preflight reports it as a configuration error.
+    #
+    # Empty means no restriction (ordinary bulk behaviour). The restriction is
+    # scoped to EasyWeek `repeat_10d` / `comeback_3d`: Altegio jobs and every
+    # other EasyWeek job type ignore it entirely.
+    easyweek_retention_canary_job_id: str = ""
 
     # PR-7.1: exact EasyWeek service-category allowlist as a JSON array of
     # strings. Parsing is deliberately deferred to the shared eligibility

@@ -27,9 +27,11 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from altegio_bot.easyweek_branches import BRANCH_PROFILES, BranchProfile, branch_template_contract
 from altegio_bot.easyweek_policy import COMEBACK_3D, REPEAT_10D
 from altegio_bot.easyweek_retention import (
+    CANARY_INVALID,
     COMEBACK_DELAY,
     REPEAT_DELAY,
     RETENTION_CLIENT_RETURNED,
+    RETENTION_SERVICE_CHANGED,
     comeback_job_payload,
     repeat_job_payload,
 )
@@ -67,6 +69,7 @@ def _rollout_state(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "easyweek_visit_counter_enabled", True, raising=False)
     monkeypatch.setattr(settings, "easyweek_retention_enabled", True, raising=False)
     monkeypatch.setattr(settings, "easyweek_retention_send_enabled", False, raising=False)
+    monkeypatch.setattr(settings, "easyweek_retention_canary_job_id", "", raising=False)
     monkeypatch.setattr(settings, "easyweek_default_language", "de", raising=False)
     monkeypatch.setattr(settings, "easyweek_booking_page_allowed_hosts", "example.invalid", raising=False)
     monkeypatch.setattr(settings, "easyweek_allowed_service_categories", json.dumps([SERVICE_TITLE]), raising=False)
@@ -188,6 +191,7 @@ async def _seed_candidate(
             company_id=COMPANY_ID,
             starts_at=record.starts_at,
             visits_baseline=baseline,
+            service_id=11,
         )
         run_at = record.starts_at + REPEAT_DELAY
     else:
@@ -409,3 +413,146 @@ async def test_a_check_that_raises_is_never_a_pass(db: AsyncSession, monkeypatch
 
     assert report.reasons["check_failed"] == 1
     assert report.ready is False
+
+
+# ===========================================================================
+# The controlled canary (P1)
+# ===========================================================================
+
+
+async def test_the_canary_narrows_the_report_to_the_named_job(db: AsyncSession, monkeypatch) -> None:
+    """The report is a statement about what the worker may actually send.
+
+    While the restriction is in force the named job is the only one that can
+    move, so auditing the rest would block the canary on rows nobody is about to
+    release. The full-queue audit is what the runbook requires after the
+    restriction is removed.
+    """
+    chosen = await _seed_candidate(db, dedupe_key="k1")
+    await _seed_candidate(db, dedupe_key="k2", index=1)
+    monkeypatch.setattr(settings, "easyweek_retention_canary_job_id", str(chosen.id), raising=False)
+
+    report = await pf.run_retention_preflight(db)
+
+    assert report.candidate_count == 1
+    assert report.canary_job_id == chosen.id
+    assert report.green_count == 1
+    assert report.ready is True
+    assert report.as_safe_dict()["canary_job_id"] == chosen.id
+
+
+async def test_a_canary_that_is_not_provable_is_not_green(db: AsyncSession, monkeypatch) -> None:
+    chosen = await _seed_candidate(db, visits_total=9, baseline=4)
+    monkeypatch.setattr(settings, "easyweek_retention_canary_job_id", str(chosen.id), raising=False)
+
+    report = await pf.run_retention_preflight(db)
+
+    assert report.reasons[RETENTION_CLIENT_RETURNED] == 1
+    assert report.ready is False
+
+
+async def test_a_canary_naming_no_open_job_is_reported_with_its_cause(db: AsyncSession, monkeypatch) -> None:
+    """ "candidate_count=0" alone would read as "the queue is empty"."""
+    job = await _seed_candidate(db)
+    monkeypatch.setattr(settings, "easyweek_retention_canary_job_id", str(job.id + 5000), raising=False)
+
+    report = await pf.run_retention_preflight(db)
+
+    assert report.config_error == pf.REASON_CANARY_NOT_FOUND
+    assert report.ready is False
+
+
+async def test_a_canary_naming_an_altegio_job_is_not_found(db: AsyncSession, monkeypatch) -> None:
+    """The restriction governs one provider; naming another's job proves nothing."""
+    await _seed_candidate(db)
+    altegio = MessageJob(
+        provider="altegio",
+        company_id=COMPANY_ID,
+        record_id=None,
+        client_id=None,
+        job_type=REPEAT_10D,
+        run_at=_utcnow(),
+        status="queued",
+        dedupe_key="altegio-repeat-1",
+        payload={},
+    )
+    db.add(altegio)
+    await db.flush()
+    monkeypatch.setattr(settings, "easyweek_retention_canary_job_id", str(altegio.id), raising=False)
+
+    report = await pf.run_retention_preflight(db)
+
+    assert report.config_error == pf.REASON_CANARY_NOT_FOUND
+
+
+@pytest.mark.parametrize("bad", ["0", "-1", "abc", "12.5"])
+async def test_an_invalid_canary_is_a_configuration_error(db: AsyncSession, monkeypatch, bad: str) -> None:
+    """Fail-closed at runtime, so the report must say so rather than audit a frozen queue."""
+    await _seed_candidate(db)
+    monkeypatch.setattr(settings, "easyweek_retention_canary_job_id", bad, raising=False)
+
+    report = await pf.run_retention_preflight(db)
+
+    assert report.config_error == CANARY_INVALID
+    assert report.candidate_count == 0
+    assert report.ready is False
+
+
+async def test_the_report_still_carries_no_customer_data_under_a_canary(db: AsyncSession, monkeypatch) -> None:
+    """An internal job id is fine; a booking uuid or a phone number is not."""
+    chosen = await _seed_candidate(db)
+    monkeypatch.setattr(settings, "easyweek_retention_canary_job_id", str(chosen.id), raising=False)
+
+    rendered = json.dumps((await pf.run_retention_preflight(db)).as_safe_dict(), default=str)
+
+    for secret in (CLIENT_PHONE, CLIENT_NAME, str(BOOKING_UUID), SERVICE_TITLE, STATIC_BOOKING_PAGE):
+        assert secret not in rendered, secret
+
+
+# ===========================================================================
+# Frozen service identity, judged by the runtime's own rule (P2)
+# ===========================================================================
+
+
+async def test_a_swapped_service_blocks_the_report(db: AsyncSession) -> None:
+    job = await _seed_candidate(db)
+    service = (await db.execute(select(RecordService).where(RecordService.record_id == job.record_id))).scalars().one()
+    service.service_id = 77
+    await db.flush()
+
+    report = await pf.run_retention_preflight(db)
+
+    assert report.reasons[RETENTION_SERVICE_CHANGED] == 1
+    assert report.ready is False
+
+
+# ===========================================================================
+# The expired-job deadlock (P2)
+# ===========================================================================
+
+
+async def test_an_expired_job_blocks_the_report_until_the_cleanup_runs(db: AsyncSession) -> None:
+    """The deadlock, and the sanctioned way out of it.
+
+    The preflight stays read-only and keeps reporting the expired row as blocked.
+    What unblocks the rollout is the worker's own bounded cleanup — never an
+    operator opening the fence or editing rows.
+    """
+    from altegio_bot.workers.outbox_worker import cancel_expired_easyweek_retention_jobs
+
+    job = await _seed_candidate(db)
+    job.run_at = _utcnow() - timedelta(days=10)
+    await db.flush()
+
+    blocked = await pf.run_retention_preflight(db)
+    assert blocked.reasons[pf.REASON_DEADLINE] == 1
+    assert blocked.ready is False
+    await db.refresh(job)
+    assert job.status == "queued", "the preflight writes nothing, including here"
+
+    assert await cancel_expired_easyweek_retention_jobs(db) == 1
+    await db.flush()
+
+    after = await pf.run_retention_preflight(db)
+    assert after.candidate_count == 0, "the expired row is no longer open"
+    assert after.ready is False, "and an empty queue is still not permission"

@@ -84,8 +84,14 @@ services:
   # altegio-easyweek-inbox-worker below.
   #
   # PR-12 adds EASYWEEK_RETENTION_SEND_ENABLED here — the retention send fence
-  # for repeat_10d and comeback_3d. Same file, no new service and no new secret.
-  # Retention PLANNING is EASYWEEK_RETENTION_ENABLED on the inbox worker below.
+  # for repeat_10d and comeback_3d — and EASYWEEK_RETENTION_CANARY_JOB_ID, the
+  # controlled-canary restriction that limits sending to one named job id. Same
+  # file, no new service and no new secret. Retention PLANNING is
+  # EASYWEEK_RETENTION_ENABLED on the inbox worker below.
+  #
+  # EASYWEEK_NOTIFICATIONS_ENABLED gates retention SENDING here too, not only
+  # planning: a queued retention job is still a customer message, so the master
+  # fence has to be able to stop one that is already in the queue.
   #
   # This service is also the base image for the one-off review preflight
   # (`run --rm --no-deps --entrypoint /app/.venv/bin/python

@@ -41,6 +41,7 @@ from altegio_bot.easyweek_branches import BRANCH_PROFILES, BranchProfile, branch
 from altegio_bot.easyweek_policy import COMEBACK_3D, REPEAT_10D
 from altegio_bot.easyweek_retention import (
     COMEBACK_DELAY,
+    PAYLOAD_SOURCE_SERVICE_ID,
     REPEAT_DELAY,
     RETENTION_BOOKING_UUID_MISMATCH,
     RETENTION_CLIENT_RETURNED,
@@ -50,6 +51,7 @@ from altegio_bot.easyweek_retention import (
     RETENTION_COUNTER_REGRESSED,
     RETENTION_FUTURE_BOOKING,
     RETENTION_PROOF_VERSION_UNKNOWN,
+    RETENTION_SERVICE_CHANGED,
     RETENTION_SERVICE_UNPROVEN,
     RETENTION_SOURCE_NOT_CANCELED,
     RETENTION_SOURCE_NOT_FINISHED,
@@ -102,12 +104,19 @@ def _pr12_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "whatsapp_send_mode", "template", raising=False)
     monkeypatch.setattr(settings, "bot_template_text_inside_24h_enabled", False, raising=False)
     monkeypatch.setattr(settings, "meta_circuit_breaker_enabled", False, raising=False)
-    monkeypatch.setattr(settings, "easyweek_notifications_enabled", False, raising=False)
+    # The MASTER notification fence is explicitly OPEN here, and that is not a
+    # detail: a retention job in the queue is still a customer message, so the
+    # master gates sending as well as planning. A fixture that left it shut would
+    # have every happy-path test below quietly proving that the master can be
+    # bypassed — which is exactly the defect these tests now guard against.
+    monkeypatch.setattr(settings, "easyweek_notifications_enabled", True, raising=False)
     monkeypatch.setattr(settings, "easyweek_retention_enabled", False, raising=False)
-    # The fence is OPEN in most of these tests: they are about what the send path
-    # proves once it is allowed to run. The fence's own behaviour has its own
-    # tests below, which close it explicitly.
+    # The PR-12 fence is OPEN in most of these tests: they are about what the
+    # send path proves once it is allowed to run. The fences' own behaviour has
+    # its own tests below, which close them explicitly.
     monkeypatch.setattr(settings, "easyweek_retention_send_enabled", True, raising=False)
+    # No canary restriction by default; the canary tests set it explicitly.
+    monkeypatch.setattr(settings, "easyweek_retention_canary_job_id", "", raising=False)
     monkeypatch.setattr(settings, "easyweek_default_language", "de", raising=False)
     monkeypatch.setattr(settings, "easyweek_booking_page_allowed_hosts", BOOKING_PAGE_ALLOWED_HOSTS, raising=False)
     monkeypatch.setattr(
@@ -329,6 +338,7 @@ async def _seed_repeat_job(
     payload: dict[str, Any] | None = None,
     run_at: datetime | None = None,
     dedupe_key: str = "easyweek_retention:repeat_10d:test",
+    service_id: int = 11,
 ) -> MessageJob:
     assert record.starts_at is not None
     body = (
@@ -339,6 +349,7 @@ async def _seed_repeat_job(
             company_id=record.company_id,
             starts_at=record.starts_at,
             visits_baseline=baseline,
+            service_id=service_id,
         )
     )
     job = MessageJob(
@@ -753,6 +764,7 @@ async def test_an_unknown_proof_version_blocks_the_send(db: AsyncSession, captur
         company_id=record.company_id,
         starts_at=record.starts_at,
         visits_baseline=4,
+        service_id=11,
     )
     payload["proof_version"] = 99
     job = await _seed_repeat_job(db, client, record, payload=payload)
@@ -1023,3 +1035,417 @@ async def test_a_branch_removed_from_the_registry_stops_sending(db: AsyncSession
 
     assert job.status in ("failed", "canceled")
     assert capture.template_calls == []
+
+
+# ===========================================================================
+# The master notification fence (P1)
+# ===========================================================================
+
+
+async def test_a_closed_master_fence_never_claims_a_retention_job(db: AsyncSession, monkeypatch) -> None:
+    """A queued retention job is still a customer message.
+
+    The master fence gated PLANNING from the start; it did not gate SENDING, so a
+    queue planned while it was open could be released after it was shut. That is
+    the one state an operator reaches by pausing outbound messaging.
+    """
+    client = await _seed_client(db)
+    record = await _seed_record(db, client)
+    job = await _seed_repeat_job(db, client, record, run_at=_utcnow() - timedelta(minutes=1))
+    monkeypatch.setattr(settings, "easyweek_notifications_enabled", False, raising=False)
+
+    claimed = await ow._lock_next_jobs(db, 10)
+
+    assert [row.id for row in claimed] == []
+    await db.refresh(job)
+    assert job.status == "queued"
+    assert job.attempts == 0
+    assert job.locked_at is None
+
+
+async def test_the_master_fence_closing_after_the_claim_still_blocks_the_send(
+    db: AsyncSession, capture, monkeypatch
+) -> None:
+    """The race an operator can actually cause: claim, then pause messaging."""
+    _client, _record, job = await _ready_repeat(db)
+    original_run_at = job.run_at
+    original_payload = dict(job.payload)
+    job.status = "processing"
+    job.locked_at = _utcnow()
+    await db.flush()
+    monkeypatch.setattr(settings, "easyweek_notifications_enabled", False, raising=False)
+
+    await _run_job(db, job)
+
+    assert job.status == "queued", "handed back, not cancelled"
+    assert job.attempts == 0, "and not charged for a decision nobody made"
+    assert job.locked_at is None
+    assert job.run_at == original_run_at
+    assert dict(job.payload) == original_payload
+    assert capture.template_calls == []
+    assert await _outbox_rows(db, job) == []
+
+
+async def test_the_master_fence_does_not_change_other_easyweek_or_altegio_jobs(db: AsyncSession, monkeypatch) -> None:
+    """Scoped to retention: the master fence's effect on other paths is unchanged.
+
+    `record_created` and Altegio jobs are claimed exactly as before — their own
+    gates decide what happens to them, and PR-12 must not become a second,
+    wider fence over paths it does not own.
+    """
+    monkeypatch.setattr(settings, "easyweek_notifications_enabled", False, raising=False)
+    client = await _seed_client(db)
+    record = await _seed_record(db, client)
+    lifecycle = MessageJob(
+        provider=PROVIDER_EASYWEEK,
+        company_id=COLLIDING_COMPANY_ID,
+        record_id=record.id,
+        client_id=client.id,
+        job_type="record_created",
+        run_at=_utcnow() - timedelta(minutes=1),
+        status="queued",
+        dedupe_key="easyweek-lifecycle-1",
+        payload={},
+    )
+    altegio_client = await _seed_client(db, provider=PROVIDER_ALTEGIO, visits_total=None)
+    altegio_record = await _seed_record(db, altegio_client, provider=PROVIDER_ALTEGIO, altegio_record_id=999123)
+    altegio = MessageJob(
+        provider=PROVIDER_ALTEGIO,
+        company_id=COLLIDING_COMPANY_ID,
+        record_id=altegio_record.id,
+        client_id=altegio_client.id,
+        job_type=REPEAT_10D,
+        run_at=_utcnow() - timedelta(minutes=1),
+        status="queued",
+        dedupe_key="altegio-repeat-1",
+        payload={},
+    )
+    db.add_all([lifecycle, altegio])
+    await db.flush()
+
+    claimed = {row.id for row in await ow._lock_next_jobs(db, 10)}
+
+    assert lifecycle.id in claimed
+    assert altegio.id in claimed
+
+
+# ===========================================================================
+# The controlled canary (P1)
+# ===========================================================================
+
+
+def _canary(monkeypatch, value: object) -> None:
+    monkeypatch.setattr(settings, "easyweek_retention_canary_job_id", value, raising=False)
+
+
+async def test_the_canary_lets_exactly_one_due_job_reach_meta(db: AsyncSession, capture, monkeypatch) -> None:
+    """THE canary property: two due jobs, one message, and nothing else moves.
+
+    "The queue happens to hold one job" is not a controlled canary — the queue
+    can grow between the preflight and the fence opening. This proves the
+    restriction is mechanical.
+    """
+    chosen_client, chosen_record, chosen = await _ready_repeat(db)
+    other_client = await _seed_client(db, altegio_client_id=7300099)
+    other_record = await _seed_record(
+        db,
+        other_client,
+        starts_at=_utcnow() - timedelta(days=10),
+        booking_uuid=OTHER_BOOKING_UUID,
+        altegio_record_id=4200055,
+    )
+    other = await _seed_repeat_job(
+        db,
+        other_client,
+        other_record,
+        dedupe_key="easyweek_retention:repeat_10d:other",
+    )
+    # The other job's payload names its own booking, so it would be perfectly
+    # sendable on its own — the canary is the only thing holding it.
+    other.payload = dict(other.payload, booking_uuid=str(OTHER_BOOKING_UUID))
+    await db.flush()
+    assert chosen_record.id != other_record.id
+
+    _canary(monkeypatch, str(chosen.id))
+
+    claimed = await ow._lock_next_jobs(db, 10)
+    assert [row.id for row in claimed] == [chosen.id], "only the named job is claimed"
+
+    for row in claimed:
+        await _run_job(db, row)
+
+    assert len(capture.template_calls) == 1
+    await db.refresh(chosen)
+    await db.refresh(other)
+    assert chosen.status == "done"
+    # The untouched job keeps everything the preflight is meant to inspect.
+    assert other.status == "queued"
+    assert other.attempts == 0
+    assert other.locked_at is None
+    assert await _outbox_rows(db, other) == []
+
+
+async def test_the_canary_blocks_a_non_canary_job_that_slipped_past_the_claim(
+    db: AsyncSession, capture, monkeypatch
+) -> None:
+    """Checked before Meta as well as at the claim, for the same race as the fence."""
+    _client, _record, job = await _ready_repeat(db)
+    job.status = "processing"
+    job.locked_at = _utcnow()
+    await db.flush()
+    _canary(monkeypatch, str(job.id + 1000))
+
+    await _run_job(db, job)
+
+    assert job.status == "queued"
+    assert job.attempts == 0
+    assert job.locked_at is None
+    assert capture.template_calls == []
+
+
+# Whitespace-only is deliberately NOT here: an env variable set to spaces is
+# "unset" in every other reading of the file, and `test_an_empty_canary_...`
+# below pins that. These are values an operator meant as an id and got wrong.
+@pytest.mark.parametrize("bad", ["0", "-3", "abc", "12.5", "١٢", "+7", "1 2"])
+async def test_an_invalid_canary_fails_closed(db: AsyncSession, capture, monkeypatch, bad: str) -> None:
+    """A typo must never read as "no restriction" and release the whole queue."""
+    _client, _record, job = await _ready_repeat(db)
+    _canary(monkeypatch, bad)
+
+    claimed = await ow._lock_next_jobs(db, 10)
+    assert [row.id for row in claimed] == []
+
+    job.status = "processing"
+    job.locked_at = _utcnow()
+    await db.flush()
+    await _run_job(db, job)
+
+    assert job.status == "queued"
+    assert job.attempts == 0
+    assert capture.template_calls == []
+
+
+async def test_an_empty_canary_is_ordinary_bulk_behaviour(db: AsyncSession, capture, monkeypatch) -> None:
+    _client, _record, job = await _ready_repeat(db)
+    _canary(monkeypatch, "   ")
+
+    await _run_job(db, job)
+
+    assert job.status == "done"
+
+
+async def test_the_canary_does_not_restrict_altegio_or_other_easyweek_types(db: AsyncSession, monkeypatch) -> None:
+    client = await _seed_client(db)
+    record = await _seed_record(db, client)
+    lifecycle = MessageJob(
+        provider=PROVIDER_EASYWEEK,
+        company_id=COLLIDING_COMPANY_ID,
+        record_id=record.id,
+        client_id=client.id,
+        job_type="record_created",
+        run_at=_utcnow() - timedelta(minutes=1),
+        status="queued",
+        dedupe_key="easyweek-lifecycle-1",
+        payload={},
+    )
+    altegio_client = await _seed_client(db, provider=PROVIDER_ALTEGIO, visits_total=None)
+    altegio_record = await _seed_record(db, altegio_client, provider=PROVIDER_ALTEGIO, altegio_record_id=999123)
+    altegio = MessageJob(
+        provider=PROVIDER_ALTEGIO,
+        company_id=COLLIDING_COMPANY_ID,
+        record_id=altegio_record.id,
+        client_id=altegio_client.id,
+        job_type=COMEBACK_3D,
+        run_at=_utcnow() - timedelta(minutes=1),
+        status="queued",
+        dedupe_key="altegio-comeback-1",
+        payload={},
+    )
+    db.add_all([lifecycle, altegio])
+    await db.flush()
+    _canary(monkeypatch, "999999")
+
+    claimed = {row.id for row in await ow._lock_next_jobs(db, 10)}
+
+    assert lifecycle.id in claimed
+    assert altegio.id in claimed
+
+
+# ===========================================================================
+# Frozen service identity (P2)
+# ===========================================================================
+
+
+async def test_a_swapped_service_cancels_the_repeat_before_meta(db: AsyncSession, capture) -> None:
+    """The booking's service changed after the visit was proven."""
+    _client, record, job = await _ready_repeat(db)
+    # `booking-updated` replaced the single service with a different one.
+    await db.execute(RecordService.__table__.delete().where(RecordService.record_id == record.id))
+    db.add(RecordService(record_id=record.id, service_id=77, title="Something Else", cost_to_pay=None, raw={}))
+    await db.flush()
+
+    await _run_job(db, job)
+
+    assert job.status == "canceled"
+    assert _refusal(job) == RETENTION_SERVICE_CHANGED
+    assert job.attempts == 0
+    assert capture.template_calls == []
+
+
+async def test_an_unchanged_service_still_sends(db: AsyncSession, capture) -> None:
+    _client, _record, job = await _ready_repeat(db)
+
+    await _run_job(db, job)
+
+    assert job.status == "done"
+    assert capture.template_calls[0]["params"][1] == SERVICE_TITLE
+
+
+async def test_a_renamed_service_still_sends_with_the_current_title(db: AsyncSession, capture) -> None:
+    """Only the ID is frozen. A salon rewording a title is not a swapped service.
+
+    The customer-facing text is read from the CURRENT row, so the rename is what
+    the customer sees — but only because the identity matched first.
+    """
+    _client, record, job = await _ready_repeat(db)
+    service = (await db.execute(select(RecordService).where(RecordService.record_id == record.id))).scalars().one()
+    service.title = "Wimpernverlängerung Classic"
+    service.cost_to_pay = Decimal("70.00")
+    await db.flush()
+
+    await _run_job(db, job)
+
+    assert job.status == "done"
+    assert capture.template_calls[0]["params"][1] == "Wimpernverlängerung Classic"
+
+
+async def test_a_payload_without_a_frozen_service_is_refused(db: AsyncSession, capture) -> None:
+    """The version-1 shape. Assuming the missing field would weaken the contract."""
+    client = await _seed_client(db)
+    record = await _seed_record(db, client)
+    await _seed_template(db, code=REPEAT_10D)
+    await _seed_sender(db)
+    assert record.starts_at is not None
+    payload = repeat_job_payload(
+        booking_uuid=BOOKING_UUID,
+        company_id=record.company_id,
+        starts_at=record.starts_at,
+        visits_baseline=4,
+        service_id=11,
+    )
+    del payload[PAYLOAD_SOURCE_SERVICE_ID]
+    job = await _seed_repeat_job(db, client, record, payload=payload)
+
+    await _run_job(db, job)
+
+    assert job.status == "canceled"
+    assert _refusal(job) == RETENTION_SERVICE_UNPROVEN
+    assert capture.template_calls == []
+
+
+async def test_a_comeback_carries_no_service_identity(db: AsyncSession, capture) -> None:
+    """Its template names no service, so freezing one would be a field nobody reads."""
+    _client, _record, job = await _ready_comeback(db)
+
+    assert PAYLOAD_SOURCE_SERVICE_ID not in job.payload
+
+    await _run_job(db, job)
+    assert job.status == "done"
+
+
+# ===========================================================================
+# The expired-retention cleanup (P2)
+# ===========================================================================
+
+
+async def test_the_cleanup_terminalizes_an_expired_job_with_the_fence_shut(
+    db: AsyncSession, capture, monkeypatch
+) -> None:
+    """The deadlock this exists to break: never claimable, never green."""
+    monkeypatch.setattr(settings, "easyweek_retention_send_enabled", False, raising=False)
+    client = await _seed_client(db)
+    record = await _seed_record(db, client, starts_at=_utcnow() - timedelta(days=20))
+    job = await _seed_repeat_job(db, client, record, run_at=_utcnow() - timedelta(days=10))
+
+    cancelled = await ow.cancel_expired_easyweek_retention_jobs(db)
+    await db.flush()
+    await db.refresh(job)
+
+    assert cancelled == 1
+    assert job.status == "canceled"
+    assert job.last_error == ow.RETENTION_DEADLINE_EXPIRED_REASON
+    assert job.attempts == 0
+    assert job.locked_at is None
+    assert capture.template_calls == []
+    assert await _outbox_rows(db, job) == []
+
+
+async def test_the_cleanup_leaves_a_fresh_job_alone(db: AsyncSession) -> None:
+    client = await _seed_client(db)
+    record = await _seed_record(db, client)
+    job = await _seed_repeat_job(db, client, record, run_at=_utcnow() - timedelta(minutes=1))
+
+    cancelled = await ow.cancel_expired_easyweek_retention_jobs(db)
+    await db.flush()
+    await db.refresh(job)
+
+    assert cancelled == 0
+    assert job.status == "queued"
+
+
+async def test_the_cleanup_is_idempotent(db: AsyncSession) -> None:
+    client = await _seed_client(db)
+    record = await _seed_record(db, client, starts_at=_utcnow() - timedelta(days=20))
+    await _seed_repeat_job(db, client, record, run_at=_utcnow() - timedelta(days=10))
+
+    first = await ow.cancel_expired_easyweek_retention_jobs(db)
+    await db.flush()
+    second = await ow.cancel_expired_easyweek_retention_jobs(db)
+
+    assert (first, second) == (1, 0)
+
+
+async def test_the_cleanup_never_touches_altegio_or_other_easyweek_types(db: AsyncSession) -> None:
+    client = await _seed_client(db)
+    record = await _seed_record(db, client, starts_at=_utcnow() - timedelta(days=20))
+    reminder = MessageJob(
+        provider=PROVIDER_EASYWEEK,
+        company_id=COLLIDING_COMPANY_ID,
+        record_id=record.id,
+        client_id=client.id,
+        job_type="reminder_24h",
+        run_at=_utcnow() - timedelta(days=10),
+        status="queued",
+        dedupe_key="easyweek-reminder-1",
+        payload={},
+    )
+    altegio_client = await _seed_client(db, provider=PROVIDER_ALTEGIO, visits_total=None)
+    altegio_record = await _seed_record(
+        db,
+        altegio_client,
+        provider=PROVIDER_ALTEGIO,
+        starts_at=_utcnow() - timedelta(days=20),
+        altegio_record_id=999123,
+    )
+    altegio = MessageJob(
+        provider=PROVIDER_ALTEGIO,
+        company_id=COLLIDING_COMPANY_ID,
+        record_id=altegio_record.id,
+        client_id=altegio_client.id,
+        job_type=REPEAT_10D,
+        run_at=_utcnow() - timedelta(days=10),
+        status="queued",
+        dedupe_key="altegio-repeat-1",
+        payload={},
+    )
+    db.add_all([reminder, altegio])
+    await db.flush()
+
+    cancelled = await ow.cancel_expired_easyweek_retention_jobs(db)
+    await db.flush()
+    await db.refresh(reminder)
+    await db.refresh(altegio)
+
+    assert cancelled == 0
+    assert reminder.status == "queued"
+    assert altegio.status == "queued"

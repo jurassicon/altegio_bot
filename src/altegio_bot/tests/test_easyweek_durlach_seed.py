@@ -1032,6 +1032,36 @@ _BOTH_API_LOCATIONS = [
     {"uuid": RASTATT_LOCATION_UUID, "name": "KitiLash Rastatt"},
 ]
 
+# PR-11.1 moved Karlsruhe onto EasyWeek, so the production registry now holds
+# three branches. Without a source-controlled profile the seed, the preflight and
+# the send path all refuse it — which is why the profile exists and why these
+# fixtures cover it like any other branch.
+KARLSRUHE_LOCATION_ID = 999503
+KARLSRUHE_LOCATION_UUID = "dddddddd-eeee-4fff-8000-000000000003"
+KARLSRUHE_PAGE = f"https://{BOOKING_PAGE_HOST}/karlsruhe"
+
+_ALL_API_LOCATIONS = [
+    *_BOTH_API_LOCATIONS,
+    {"uuid": KARLSRUHE_LOCATION_UUID, "name": "KitiLash Karlsruhe"},
+]
+
+
+def _all_three_registry(monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_registry(
+        monkeypatch,
+        {
+            "durlach": _entry(DURLACH_LOCATION_ID, DURLACH_LOCATION_UUID, "du", STATIC_BOOKING_PAGE),
+            "rastatt": _entry(RASTATT_LOCATION_ID, RASTATT_LOCATION_UUID, "ra", RASTATT_PAGE),
+            "karlsruhe": _entry(KARLSRUHE_LOCATION_ID, KARLSRUHE_LOCATION_UUID, "ka", KARLSRUHE_PAGE),
+        },
+    )
+    monkeypatch.setattr(
+        settings,
+        "easyweek_booking_page_allowed_hosts",
+        BOOKING_PAGE_HOST,
+        raising=False,
+    )
+
 
 def _set_registry(monkeypatch: pytest.MonkeyPatch, entries: dict[str, dict[str, Any]]) -> None:
     monkeypatch.setattr(settings, "easyweek_location_map", json.dumps(entries), raising=False)
@@ -1105,15 +1135,21 @@ async def test_the_other_branchs_uuid_under_a_slug_is_refused_even_with_a_matchi
 
 
 async def test_an_unknown_branch_slug_is_refused(db: AsyncSession, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A third branch cannot be seeded until its profile is approved in source."""
+    """A branch cannot be seeded until its profile is approved in source.
+
+    The slug here is one that genuinely has no profile. Karlsruhe used to play
+    that role and no longer can — PR-11.1 put it in the production registry, so
+    it has a real approved profile now — but the RULE is unchanged, and this
+    keeps proving it.
+    """
     before = await _easyweek_state(db)
     _set_registry(
         monkeypatch,
-        {"karlsruhe": _entry(999503, "dddddddd-eeee-4fff-8000-000000000003", "ka", STATIC_BOOKING_PAGE)},
+        {"ettlingen": _entry(999504, "dddddddd-eeee-4fff-8000-000000000004", "et", STATIC_BOOKING_PAGE)},
     )
 
     with pytest.raises(seed_script.SeedConfigError) as excinfo:
-        await _run_seed(db, api_locations=_BOTH_API_LOCATIONS)
+        await _run_seed(db, api_locations=_ALL_API_LOCATIONS)
 
     assert "no source-controlled profile" in str(excinfo.value)
     assert await _easyweek_state(db) == before
@@ -1219,3 +1255,136 @@ async def test_an_unprofiled_branch_is_member_but_cannot_seed(
     with pytest.raises(seed_script.SeedConfigError):
         await _run_seed(db, api_locations=_BOTH_API_LOCATIONS)
     assert await _easyweek_state(db) == before
+
+
+# ---------------------------------------------------------------------------
+# Karlsruhe: the third production branch (PR-11.1 put it on EasyWeek)
+# ---------------------------------------------------------------------------
+
+
+async def test_the_three_branch_production_registry_seeds(
+    db: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """durlach + rastatt + karlsruhe — the registry production actually holds.
+
+    Without an approved Karlsruhe profile this raised before writing a single
+    row, which made the seed, the preflight and the send path unexecutable for a
+    branch whose customers are already on EasyWeek.
+    """
+    _all_three_registry(monkeypatch)
+
+    result = await _run_seed(db, api_locations=_ALL_API_LOCATIONS)
+
+    assert result.templates_created == 27, "nine codes for each of three branches"
+    assert result.senders_created == 3
+
+    rows = await _easyweek_templates(db)
+    by_company: dict[int, list[MessageTemplate]] = {}
+    for row in rows:
+        by_company.setdefault(row.company_id, []).append(row)
+    assert set(by_company) == {DURLACH_LOCATION_ID, RASTATT_LOCATION_ID, KARLSRUHE_LOCATION_ID}
+    assert all(row.meta_template_name.startswith("kitilash_ka_") for row in by_company[KARLSRUHE_LOCATION_ID])
+
+
+async def test_the_karlsruhe_footer_is_its_own_source_controlled_content(
+    db: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The address a customer reads must be Karlsruhe's, not a neighbour's."""
+    _all_three_registry(monkeypatch)
+    await _run_seed(db, api_locations=_ALL_API_LOCATIONS)
+
+    rows = [row for row in await _easyweek_templates(db) if row.company_id == KARLSRUHE_LOCATION_ID]
+    assert rows
+    for row in rows:
+        assert "76133 Karlsruhe, Kaiserstraße, 68" in row.body
+        assert "Pfinztalstraße" not in row.body
+        assert "Rathausstraße" not in row.body
+
+
+async def test_karlsruhe_is_verified_against_its_exact_api_name(
+    db: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """EasyWeek is the independent third party, for Karlsruhe like every branch."""
+    before = await _easyweek_state(db)
+    _all_three_registry(monkeypatch)
+    wrong_name = [
+        *_BOTH_API_LOCATIONS,
+        {"uuid": KARLSRUHE_LOCATION_UUID, "name": "KitiLash Durlach"},
+    ]
+
+    with pytest.raises(seed_script.SeedConfigError) as excinfo:
+        await _run_seed(db, api_locations=wrong_name)
+
+    assert "identity mismatch" in str(excinfo.value)
+    assert "karlsruhe" in str(excinfo.value)
+    assert await _easyweek_state(db) == before, "nothing is written before identity is proven"
+
+
+async def test_a_wrong_karlsruhe_prefix_is_refused_before_any_write(
+    db: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The prefix is data an operator supplies; the profile owns the truth.
+
+    A prefix DUPLICATED across two branches is refused even earlier, by the
+    registry parser itself. This is the subtler case: a unique prefix that simply
+    is not the one Karlsruhe owns, which only the profile can catch.
+    """
+    before = await _easyweek_state(db)
+    _set_registry(
+        monkeypatch,
+        {
+            "durlach": _entry(DURLACH_LOCATION_ID, DURLACH_LOCATION_UUID, "du", STATIC_BOOKING_PAGE),
+            "karlsruhe": _entry(KARLSRUHE_LOCATION_ID, KARLSRUHE_LOCATION_UUID, "kx", KARLSRUHE_PAGE),
+        },
+    )
+    monkeypatch.setattr(settings, "easyweek_booking_page_allowed_hosts", BOOKING_PAGE_HOST, raising=False)
+
+    with pytest.raises(seed_script.SeedConfigError) as excinfo:
+        await _run_seed(db, api_locations=_ALL_API_LOCATIONS)
+
+    assert "meta_template_prefix" in str(excinfo.value)
+    assert await _easyweek_state(db) == before
+
+
+async def test_the_three_branch_seed_stays_idempotent(
+    db: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _all_three_registry(monkeypatch)
+    plan = await seed_script.build_seed_plan(client_factory=_client_factory(_ALL_API_LOCATIONS))
+
+    first = await seed_script.seed(db, plan=plan)
+    await db.flush()
+    second = await seed_script.seed(db, plan=plan)
+    await db.flush()
+
+    assert first.templates_created == 27
+    assert second.templates_created == 0
+    assert second.templates_updated == 27
+    assert await _easyweek_state(db) == (27, 3)
+
+
+@pytest.mark.parametrize("code", ["repeat_10d", "comeback_3d"])
+async def test_karlsruhe_retention_rows_are_bound_to_karlsruhe(
+    db: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    code: str,
+) -> None:
+    """Send and preflight accept Karlsruhe only on a complete branch contract."""
+    _all_three_registry(monkeypatch)
+    await _run_seed(db, api_locations=_ALL_API_LOCATIONS)
+
+    rows = [
+        row for row in await _easyweek_templates(db) if row.company_id == KARLSRUHE_LOCATION_ID and row.code == code
+    ]
+    assert len(rows) == 1
+    row = rows[0]
+    contract = branch_template_contract(BRANCH_PROFILES["karlsruhe"], code)
+    assert contract is not None
+    assert row.meta_template_name == contract.meta_template_name == f"kitilash_ka_{code}_v1"
+    assert row.body == contract.raw_body
+    assert row.is_active is True

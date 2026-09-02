@@ -19,7 +19,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from altegio_bot.easyweek_retention import RETENTION_SEND_REFUSAL_REASONS
+from altegio_bot.easyweek_retention import RETENTION_HOLD_REASONS, RETENTION_SEND_REFUSAL_REASONS
 from altegio_bot.settings import Settings
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -30,6 +30,7 @@ RUNBOOK = REPO_ROOT / "docs" / "easyweek" / "durlach_activation_runbook.md"
 PLANNING_FLAG = "EASYWEEK_RETENTION_ENABLED"
 SEND_FLAG = "EASYWEEK_RETENTION_SEND_ENABLED"
 COUNTER_FLAG = "EASYWEEK_VISIT_COUNTER_ENABLED"
+CANARY_FLAG = "EASYWEEK_RETENTION_CANARY_JOB_ID"
 INBOX_SERVICE = "altegio-easyweek-inbox-worker"
 OUTBOX_SERVICE = "altegio-outbox-worker"
 PREFLIGHT_MODULE = "altegio_bot.scripts.easyweek_retention_preflight"
@@ -231,11 +232,19 @@ def test_a_truncated_result_is_a_stop(pr12_section: str) -> None:
     assert "truncated=true" in prose(pr12_section)
 
 
-def test_exactly_one_command_runs_the_preflight_and_it_is_a_fresh_container(pr12_section: str) -> None:
+def test_every_preflight_invocation_is_a_fresh_one_off_container(pr12_section: str) -> None:
+    """The rollout runs it three times — before the canary, under the canary, and
+    over the whole queue once the restriction is gone — and each must be a
+    one-off container.
+
+    A single canonical form is what stops an operator picking the wrong one, so
+    the assertion is that every invocation is byte-identical rather than that
+    there is only one.
+    """
     commands = [block for block in bash_blocks(pr12_section) if PREFLIGHT_MODULE in block]
-    assert len(commands) == 1, "one canonical invocation, or an operator picks the wrong one"
-    command = commands[0]
-    words = command.split()
+    assert len(commands) == 3, "queue audit, canary audit, and the full audit after the canary"
+    assert len(set(commands)) == 1, "all three must be the same canonical command"
+    words = commands[0].split()
     assert "run" in words and "--rm" in words and "--no-deps" in words
     assert "exec" not in words, "exec reuses a container created with the pre-rollout environment"
     assert "restart" not in words
@@ -266,10 +275,84 @@ def test_a_byte_identical_resend_is_rejected_as_positive_proof(pr12_section: str
     assert "Байт-идентичный Resend старого события доказательством не является" in text
 
 
-def test_the_canary_is_one_job_and_not_a_blast(pr12_section: str) -> None:
+def test_the_canary_is_a_technical_restriction_not_a_promise(pr12_section: str) -> None:
+    """ "Pick one job and hope the queue holds only it" is not a canary.
+
+    The queue can grow between the preflight and the fence opening, so the
+    restriction has to be mechanical — a named job id the worker enforces.
+    """
     text = prose(pr12_section)
-    assert "Одна заранее выбранная job" in text
-    assert "Массовой отправки на этом шаге быть не должно" in text
+    assert CANARY_FLAG in text
+    assert "message_jobs.id" in text
+    assert "claim'ить и отправлять **только** эту job" in text
+    assert "Остальные EasyWeek retention jobs остаются `queued`" in text
+
+
+def test_the_canary_sequence_is_in_the_only_workable_order(pr12_section: str) -> None:
+    """canary preflight -> canary fence -> verify -> close -> unset -> preflight -> bulk.
+
+    Every one of those steps is load-bearing, and the order is the whole safety
+    argument: releasing the bulk queue before the restriction is removed and the
+    full audit is green is exactly the blast the canary exists to prevent.
+    """
+    set_canary = position(pr12_section, f"{CANARY_FLAG}=<message_jobs.id")
+    # The audit that belongs to the canary is the one AFTER the restriction is
+    # set; the earlier one audits the queue before a canary is even chosen.
+    canary_preflight = pr12_section.index(PREFLIGHT_MODULE, set_canary)
+    open_for_canary = position(pr12_section, f"{SEND_FLAG}=true")
+    # Searched FORWARD from the canary send: `...=false` also appears in step 1,
+    # where both flags are deployed shut, and that occurrence is not this step.
+    close_again = pr12_section.index(f"{SEND_FLAG}=false", open_for_canary)
+    unset_canary = pr12_section.index(f"`{CANARY_FLAG}=` (пусто)", close_again)
+    full_preflight = pr12_section.index(PREFLIGHT_MODULE, unset_canary)
+    bulk = pr12_section.index(f"{SEND_FLAG}=true", full_preflight)
+
+    assert set_canary < canary_preflight < open_for_canary
+    assert open_for_canary < close_again < unset_canary
+    assert unset_canary < full_preflight < bulk
+    assert canary_preflight < full_preflight, "two distinct audits, not one"
+
+
+def test_an_invalid_canary_is_documented_as_fail_closed(pr12_section: str) -> None:
+    text = prose(pr12_section)
+    assert "retention_canary_job_id_invalid" in text
+    assert "fail-closed" in text.lower()
+
+
+def test_the_master_fence_is_documented_as_stopping_sends_too(pr12_section: str) -> None:
+    """The P1 defect, stated where an operator will read it."""
+    text = prose(pr12_section)
+    assert "Мастер-флаг останавливает и отправку, не только планирование" in text
+    assert "EASYWEEK_NOTIFICATIONS_ENABLED=false" in text
+
+
+def test_the_deadline_deadlock_has_a_documented_way_out(pr12_section: str) -> None:
+    """Waiting for the bounded cleanup — never opening the fence or editing SQL."""
+    text = prose(pr12_section)
+    assert "deadline_expired" in text
+    assert "bounded cleanup" in text.lower()
+    assert "Открывать fence при `deadline_expired` и править строки SQL-командами запрещено" in text
+
+
+def test_the_hold_codes_are_documented_as_holds_rather_than_refusals(pr12_section: str) -> None:
+    """A held job is not a cancelled one, and an operator must not read it as one."""
+    table = pr12_section[position(pr12_section, "### 16.5") :]
+    for reason in RETENTION_HOLD_REASONS:
+        assert f"`{reason}`" in table, f"undocumented hold reason: {reason}"
+    assert "**не** отменяют job" in prose(table)
+
+
+def test_the_frozen_service_identity_is_documented(pr12_section: str) -> None:
+    text = prose(pr12_section)
+    assert "retention_service_changed" in text
+    assert "service_id" in text
+    assert "Сравнивается только id" in text
+
+
+def test_the_two_obligation_markers_are_documented_as_independent(pr12_section: str) -> None:
+    text = prose(pr12_section)
+    assert "Отметки раздельные" in text
+    assert "задним числом сообщение не получает" in text
 
 
 def test_sent_is_not_treated_as_final_delivery(pr12_section: str) -> None:

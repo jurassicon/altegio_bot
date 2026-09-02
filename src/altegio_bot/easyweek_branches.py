@@ -12,7 +12,7 @@ slug, fixes four things together:
 
 * the slug used as the top-level key of ``EASYWEEK_LOCATION_MAP``;
 * the human-readable name the EasyWeek API returns for that branch;
-* the Meta template prefix (``du`` / ``ra``) — and therefore the template names;
+* the Meta template prefix (``du`` / ``ka`` / ``ra``) — and therefore the names;
 * the storefront content (brand line, address, maps link) in the message footer.
 
 Anything the operator supplies is checked *against* a profile; nothing is
@@ -131,6 +131,32 @@ BRANCH_PROFILES: Final[dict[str, BranchProfile]] = {
             address_line="Pfinztalstraße 4, 76227 Karlsruhe-Durlach",
             contact_phone="+491742310386",
             maps_line="📍https://maps.app.goo.gl/HnVPnHaJHf2DW3Nn8",
+            instagram_line="📺 https://www.instagram.com/kitilash001",
+        ),
+    ),
+    # PR-11.1 migrated Karlsruhe's future bookings to EasyWeek, so the branch is
+    # in the production `EASYWEEK_LOCATION_MAP` and needs a source-controlled
+    # profile like every other one: without it the seed, the preflight and the
+    # send path all refuse the branch as unapproved.
+    #
+    # The storefront content is copied VERBATIM from the existing
+    # source-controlled Karlsruhe values in `scripts/seed_templates.py` — the
+    # same address, phone, maps link and Instagram handle Altegio has been
+    # sending for this salon. Nothing here is invented: an address or a maps URL
+    # guessed to look plausible is a customer sent to the wrong door.
+    #
+    # `brand_line` is `*KitiLash*` rather than `*KitiLash Karlsruhe*` for the
+    # same reason: that is the line the salon already uses, and "improving" it
+    # would be inventing branding.
+    "karlsruhe": BranchProfile(
+        slug="karlsruhe",
+        api_name="KitiLash Karlsruhe",
+        meta_template_prefix="ka",
+        content=BranchContent(
+            brand_line="*KitiLash*",
+            address_line="76133 Karlsruhe, Kaiserstraße, 68",
+            contact_phone="+491742310386",
+            maps_line="📍https://goo.gl/maps/p7quWqbAqY9cusuRA",
             instagram_line="📺 https://www.instagram.com/kitilash001",
         ),
     ),

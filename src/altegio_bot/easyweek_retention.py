@@ -68,7 +68,13 @@ COMEBACK_REPEAT_WINDOW: Final = timedelta(days=30)
 # guard refuses a payload whose proof it does not recognise, so a job planned by
 # an older, weaker contract can never be released by a newer, stricter one that
 # assumes fields it does not carry.
-RETENTION_PROOF_VERSION: Final = 1
+#
+# Version 2 adds the frozen service identity to `repeat_10d`. A version-1 job
+# proved which booking it belonged to but not which SERVICE, so the guard could
+# not tell an unchanged appointment from one whose service was swapped after the
+# visit. Those jobs are refused rather than re-interpreted: assuming the missing
+# field is what makes a stricter contract weaker than the one it replaced.
+RETENTION_PROOF_VERSION: Final = 2
 
 _KEY_PREFIX: Final = "easyweek_retention"
 
@@ -85,6 +91,11 @@ PAYLOAD_RECORD_STARTS_AT: Final = "record_starts_at"
 PAYLOAD_SOURCE_CANCELLED_AT: Final = "source_cancelled_at"
 PAYLOAD_VISITS_BASELINE: Final = "visits_baseline"
 PAYLOAD_PROOF_VERSION: Final = "proof_version"
+# The external service id of the ONE service the source booking had when the
+# visit was proven. A technical identifier and nothing else: no title, no price,
+# no description — the customer-facing text is read from the current row at send
+# time, and only after this identity has matched.
+PAYLOAD_SOURCE_SERVICE_ID: Final = "source_service_id"
 
 # --- refusal reasons --------------------------------------------------------
 #
@@ -103,6 +114,7 @@ RETENTION_COUNTER_UNSTAMPED: Final = "retention_counter_unstamped"
 RETENTION_CLIENT_RETURNED: Final = "retention_client_returned"
 RETENTION_FUTURE_BOOKING: Final = "retention_future_booking"
 RETENTION_SERVICE_UNPROVEN: Final = "retention_service_unproven"
+RETENTION_SERVICE_CHANGED: Final = "retention_service_changed"
 RETENTION_SOURCE_NOT_FINISHED: Final = "retention_source_not_finished"
 RETENTION_SOURCE_NOT_CANCELED: Final = "retention_source_canceled_state_lost"
 RETENTION_SOURCE_START_MISMATCH: Final = "retention_source_start_mismatch"
@@ -110,6 +122,22 @@ RETENTION_CANCELLED_AT_UNPROVEN: Final = "retention_cancelled_at_unproven"
 RETENTION_COMEBACK_ALREADY_SENT: Final = "retention_comeback_already_sent"
 RETENTION_CLIENT_UNSUBSCRIBED: Final = "retention_client_unsubscribed"
 RETENTION_BOOKING_PAGE_UNPROVEN: Final = "retention_booking_page_unproven"
+
+# --- hold reasons -----------------------------------------------------------
+#
+# Distinct from the refusals above, and the distinction is the point: a REFUSAL
+# cancels the job because it can never legitimately be sent, while a HOLD leaves
+# it exactly as planned — `queued`, original `run_at`, zero attempts — because
+# the configuration currently forbids sending it. Folding the two together would
+# either cancel a queue an operator meant to pause, or send one they meant to
+# hold.
+RETENTION_NOTIFICATIONS_DISABLED: Final = "retention_notifications_disabled"
+RETENTION_SEND_FENCE_CLOSED: Final = "retention_send_fence_closed"
+RETENTION_CANARY_RESTRICTED: Final = "retention_canary_restricted"
+# The canary value itself is unreadable. Defined here with the other hold codes
+# rather than beside the parser below, so the vocabulary set can name it instead
+# of repeating the string.
+CANARY_INVALID: Final = "retention_canary_job_id_invalid"
 
 # The complete send-time vocabulary, so the runbook table and the code cannot
 # drift apart. Asserted by the rollout contract test.
@@ -126,6 +154,7 @@ RETENTION_SEND_REFUSAL_REASONS: Final = frozenset(
         RETENTION_CLIENT_RETURNED,
         RETENTION_FUTURE_BOOKING,
         RETENTION_SERVICE_UNPROVEN,
+        RETENTION_SERVICE_CHANGED,
         RETENTION_SOURCE_NOT_FINISHED,
         RETENTION_SOURCE_NOT_CANCELED,
         RETENTION_SOURCE_START_MISMATCH,
@@ -133,6 +162,16 @@ RETENTION_SEND_REFUSAL_REASONS: Final = frozenset(
         RETENTION_COMEBACK_ALREADY_SENT,
         RETENTION_CLIENT_UNSUBSCRIBED,
         RETENTION_BOOKING_PAGE_UNPROVEN,
+    }
+)
+
+# Every reason a retention job is HELD rather than cancelled.
+RETENTION_HOLD_REASONS: Final = frozenset(
+    {
+        RETENTION_NOTIFICATIONS_DISABLED,
+        RETENTION_SEND_FENCE_CLOSED,
+        RETENTION_CANARY_RESTRICTED,
+        CANARY_INVALID,
     }
 )
 
@@ -168,6 +207,131 @@ def parse_visits_total(value: object) -> int | None:
     return value if value >= 1 else None
 
 
+def parse_service_id(value: object) -> int | None:
+    """A usable external service id, or ``None``. Never raises, never coerces.
+
+    The same strictness the counter gets, and for the same reason: ``True`` is
+    not 1 and ``"11"`` is not 11. An identity this function cannot read is a
+    fail-closed refusal — the alternative is comparing a frozen identity against
+    something that merely looks like it.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if value > 0 else None
+
+
+def service_identity_reason(*, frozen: object, current: object) -> str | None:
+    """Does the booking still have the SERVICE its repeat was earned for?
+
+    THE single definition, shared by the send guard and the read-only preflight,
+    so the two cannot disagree about a queue.
+
+    ``repeat_10d`` names a service in the message a customer reads. The booking
+    proved exactly one at the moment the visit finished, and that id is frozen
+    into the job. Ten days is long enough for a ``booking-updated`` to swap it —
+    and a message inviting someone back for a treatment they did not have is
+    exactly the failure the frozen identity exists to prevent.
+
+    Only the ID is compared. The title, the price and the description are
+    display fields: the salon may legitimately rewrite any of them, and refusing
+    on a re-worded title would cancel perfectly good messages. The title the
+    customer finally reads is taken from the current row, and only after this
+    function has returned ``None``.
+    """
+    proven = parse_service_id(frozen)
+    if proven is None:
+        # A payload with no readable identity cannot be checked at all. That is
+        # the version-1 shape, and it is refused rather than waved through.
+        return RETENTION_SERVICE_UNPROVEN
+    live = parse_service_id(current)
+    if live is None:
+        return RETENTION_SERVICE_UNPROVEN
+    if live != proven:
+        return RETENTION_SERVICE_CHANGED
+    return None
+
+
+# ---------------------------------------------------------------------------
+# The canary restriction
+# ---------------------------------------------------------------------------
+#
+# A controlled canary is a promise that exactly ONE message goes out. Until now
+# that promise was procedural — "pick one job and hope the queue holds only
+# it" — and a queue that quietly grew a second due job would break it silently,
+# at the worst possible moment in the rollout.
+#
+# `EASYWEEK_RETENTION_CANARY_JOB_ID` makes the promise mechanical: the claim and
+# the pre-send check both restrict EasyWeek retention to that one internal
+# MessageJob id. Every other retention job stays exactly as planned — `queued`,
+# original `run_at`, zero attempts — and Altegio and every other EasyWeek job
+# type are not touched at all.
+
+
+@dataclass(frozen=True)
+class RetentionCanary:
+    """Total parse result; a malformed value never degrades to "no restriction"."""
+
+    configured: bool
+    valid: bool
+    job_id: int | None = None
+
+    @property
+    def restricted(self) -> bool:
+        """True when the worker may send exactly one named job and nothing else."""
+        return self.configured and self.valid and self.job_id is not None
+
+    @property
+    def unavailable_reason(self) -> str | None:
+        if self.configured and not self.valid:
+            return CANARY_INVALID
+        return None
+
+
+def parse_retention_canary_job_id(raw: object) -> RetentionCanary:
+    """Parse ``EASYWEEK_RETENTION_CANARY_JOB_ID``. Never raises.
+
+    Three outcomes, and the third is the one worth stating:
+
+    * absent or empty — no restriction, ordinary bulk behaviour;
+    * a positive integer — that one job, and no other retention job;
+    * anything else — CONFIGURED BUT INVALID, which fails CLOSED: no EasyWeek
+      retention job is claimed or sent at all.
+
+    Failing closed on a typo is the whole point. An operator setting this
+    variable has decided that at most one message may go out; reading a
+    malformed value as "no restriction" would turn that decision into a bulk
+    send of the entire queue, which is the exact accident the flag exists to
+    make impossible.
+
+    Parsed at call time rather than at import, so an operator can correct a typo
+    and recreate the service without a code change.
+    """
+    if raw is None:
+        return RetentionCanary(configured=False, valid=True)
+    if isinstance(raw, bool):
+        return RetentionCanary(configured=True, valid=False)
+    if isinstance(raw, int):
+        return RetentionCanary(configured=True, valid=raw > 0, job_id=raw if raw > 0 else None)
+    if not isinstance(raw, str):
+        return RetentionCanary(configured=True, valid=False)
+
+    text = raw.strip()
+    if not text:
+        return RetentionCanary(configured=False, valid=True)
+    # ASCII digits only, and no sign: `str.isdigit()` accepts Arabic-Indic and
+    # other Unicode digits, and a leading `+` would make a second spelling of the
+    # same id. A job id is written one way.
+    if not text.isascii() or not text.isdecimal():
+        return RetentionCanary(configured=True, valid=False)
+    try:
+        value = int(text)
+    except ValueError:  # pragma: no cover - isdecimal already proves this parses
+        return RetentionCanary(configured=True, valid=False)
+    if value <= 0:
+        return RetentionCanary(configured=True, valid=False)
+    return RetentionCanary(configured=True, valid=True, job_id=value)
+
+
 @dataclass(frozen=True)
 class PlannedRetention:
     """One earned retention message: when it fires, and how it is identified."""
@@ -176,6 +340,11 @@ class PlannedRetention:
     run_at: datetime
     dedupe_key: str
     visits_baseline: int
+    # Only `repeat_10d` carries one: it is the single service the source booking
+    # had when the visit was proven. `comeback_3d` deliberately has none — its
+    # template names no service, so freezing one would be a field nobody reads
+    # and one more way for a good message to be refused.
+    service_id: int | None = None
 
 
 def easyweek_retention_dedupe_key(*, booking_uuid: uuid.UUID, job_type: str) -> str:
@@ -232,6 +401,7 @@ def plan_repeat(
     starts_at: datetime | None,
     now: datetime,
     visits_baseline: int,
+    service_id: object,
     is_deleted: bool = False,
 ) -> PlannedRetention | None:
     """The repeat this FINISHED booking owes, or ``None``.
@@ -245,11 +415,19 @@ def plan_repeat(
     this visit. It is required rather than optional: a repeat with no baseline
     could never answer "has the customer come back?", and a repeat that silently
     treated a missing baseline as zero would send to everyone.
+
+    ``service_id`` is the external id of the ONE service the booking had when the
+    visit finished. Equally required: the message names a service, and a repeat
+    that could not say WHICH one has no way to notice the booking's service being
+    swapped underneath it in the ten days before it fires.
     """
     if is_deleted or starts_at is None:
         return None
     baseline = parse_visits_total(visits_baseline)
     if baseline is None:
+        return None
+    proven_service = parse_service_id(service_id)
+    if proven_service is None:
         return None
 
     run_at = repeat_run_at(starts_at)
@@ -261,6 +439,7 @@ def plan_repeat(
         run_at=run_at,
         dedupe_key=easyweek_retention_dedupe_key(booking_uuid=booking_uuid, job_type=REPEAT_10D),
         visits_baseline=baseline,
+        service_id=proven_service,
     )
 
 
@@ -303,6 +482,7 @@ def repeat_job_payload(
     company_id: int,
     starts_at: datetime,
     visits_baseline: int,
+    service_id: int,
     source_event_id: int | None = None,
     source_payload_hash: str | None = None,
 ) -> dict[str, Any]:
@@ -317,6 +497,11 @@ def repeat_job_payload(
     after it finished cannot deliver an invitation about a visit that did not
     happen when we thought it did. The two source markers are audit only — they
     are never used to decide anything.
+
+    ``source_service_id`` is the frozen service IDENTITY, and deliberately not
+    the service NAME. A numeric id is not customer data, survives a re-worded
+    title, and is the only thing that can prove ten days later that the booking
+    still holds the service this invitation is about.
     """
     payload: dict[str, Any] = {
         "provider": "easyweek",
@@ -325,6 +510,7 @@ def repeat_job_payload(
         PAYLOAD_JOB_TYPE: REPEAT_10D,
         PAYLOAD_RECORD_STARTS_AT: _as_utc(starts_at).isoformat(),
         PAYLOAD_VISITS_BASELINE: visits_baseline,
+        PAYLOAD_SOURCE_SERVICE_ID: service_id,
         PAYLOAD_PROOF_VERSION: RETENTION_PROOF_VERSION,
     }
     if source_event_id is not None:

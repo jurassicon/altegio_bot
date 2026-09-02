@@ -48,6 +48,7 @@ from altegio_bot.db import SessionLocal
 from altegio_bot.easyweek_branches import branch_template_contract
 from altegio_bot.easyweek_locations import configured_easyweek_locations
 from altegio_bot.easyweek_policy import COMEBACK_3D, EASYWEEK_RETENTION_JOB_TYPES, REPEAT_10D
+from altegio_bot.easyweek_retention import CANARY_INVALID, parse_retention_canary_job_id
 from altegio_bot.easyweek_service_category import evaluate_service_category
 from altegio_bot.meta_templates import build_lifecycle_template_params
 from altegio_bot.models.models import (
@@ -104,6 +105,11 @@ REASON_LOCATION_REGISTRY_INVALID: Final = "location_registry_invalid"
 REASON_NOTIFICATIONS_DISABLED: Final = "notifications_disabled"
 REASON_PLANNING_DISABLED: Final = "retention_planning_disabled"
 REASON_SEND_FENCE_OPEN: Final = "retention_send_fence_open"
+# The canary names a job that is not in the audited queue at all — an id that
+# does not exist, belongs to another provider or job type, or is not open. An
+# operator about to release exactly one message must learn that before the fence
+# opens, not from an empty send.
+REASON_CANARY_NOT_FOUND: Final = "retention_canary_job_not_found"
 # PR-11's counter is the input the whole feature reads. With it off no repeat is
 # ever planned and no comeback can prove a baseline, so an empty queue would be
 # reported without naming its cause.
@@ -126,6 +132,10 @@ class RetentionPreflightReport:
     blocked_job_ids: list[int] = field(default_factory=list)
     blocked_record_ids: list[int] = field(default_factory=list)
     company_ids: set[int] = field(default_factory=set)
+    # The controlled-canary restriction in force while this report was produced.
+    # An internal job id is not customer data and is exactly what the operator
+    # needs to confirm they are about to release the job they chose.
+    canary_job_id: int | None = None
 
     @property
     def green_count(self) -> int:
@@ -167,6 +177,7 @@ class RetentionPreflightReport:
             "truncated": self.truncated,
             "job_types": dict(sorted(self.job_types.items())),
             "reasons": dict(sorted(self.reasons.items())),
+            "canary_job_id": self.canary_job_id,
             "blocked_job_ids": sorted(self.blocked_job_ids)[:MAX_REPORTED_IDS],
             "blocked_record_ids": sorted(self.blocked_record_ids)[:MAX_REPORTED_IDS],
             "company_ids": sorted(self.company_ids)[:MAX_REPORTED_IDS],
@@ -196,6 +207,13 @@ def rollout_state_error() -> str | None:
         # learning why.
         return REASON_VISIT_COUNTER_DISABLED
 
+    # A malformed canary value fails closed at runtime — no retention job is
+    # claimed at all — so a report that ignored it would describe a queue that
+    # cannot move. Same parser as the worker, so the two cannot disagree.
+    canary = parse_retention_canary_job_id(settings.easyweek_retention_canary_job_id)
+    if canary.unavailable_reason is not None:
+        return CANARY_INVALID
+
     registry = configured_easyweek_locations()
     if not registry.configured:
         return REASON_LOCATION_REGISTRY_UNCONFIGURED
@@ -215,6 +233,13 @@ async def select_open_retention_jobs(session: AsyncSession, *, limit: int) -> tu
     Provider AND job type are both in the predicate. ``repeat_10d`` and
     ``comeback_3d`` exist on the Altegio side too, and auditing those here would
     report on a queue this fence does not govern.
+
+    **The canary restriction is applied here, the same way the claim applies it.**
+    While one job is named, that job is the only one the worker may send — so it
+    is the only one this report is a statement about. Auditing the jobs that
+    cannot move would block the canary on rows nobody is about to release; the
+    full-queue audit is what the runbook requires AFTER the restriction is
+    removed and before the bulk fence opens.
     """
     stmt = (
         select(MessageJob)
@@ -224,6 +249,9 @@ async def select_open_retention_jobs(session: AsyncSession, *, limit: int) -> tu
         .order_by(MessageJob.run_at.asc(), MessageJob.id.asc())
         .limit(limit + 1)
     )
+    canary = parse_retention_canary_job_id(settings.easyweek_retention_canary_job_id)
+    if canary.restricted:
+        stmt = stmt.where(MessageJob.id == canary.job_id)
     rows = list((await session.execute(stmt)).scalars().all())
     return rows[:limit], len(rows) > limit
 
@@ -429,8 +457,20 @@ async def run_retention_preflight(
         # it is an audit that does not apply.
         return RetentionPreflightReport(config_error=config_error)
 
+    canary = parse_retention_canary_job_id(settings.easyweek_retention_canary_job_id)
     jobs, truncated = await select_open_retention_jobs(session, limit=limit)
-    report = RetentionPreflightReport(candidate_count=len(jobs), truncated=truncated)
+    report = RetentionPreflightReport(
+        candidate_count=len(jobs),
+        truncated=truncated,
+        canary_job_id=canary.job_id if canary.restricted else None,
+    )
+    if canary.restricted and not jobs:
+        # The named job is not an open EasyWeek retention job: wrong id, wrong
+        # provider, wrong type, or already terminal. `ready` is False anyway
+        # because there are no candidates, but the operator needs the CAUSE —
+        # otherwise "candidate_count=0" reads as "the queue is empty".
+        report.config_error = REASON_CANARY_NOT_FOUND
+        return report
 
     for job in jobs:
         try:
