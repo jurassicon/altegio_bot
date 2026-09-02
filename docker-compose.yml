@@ -83,9 +83,21 @@ services:
   # PLANNING is a different flag on a different service; see
   # altegio-easyweek-inbox-worker below.
   #
+  # PR-12 adds EASYWEEK_RETENTION_SEND_ENABLED here — the retention send fence
+  # for repeat_10d and comeback_3d — and EASYWEEK_RETENTION_CANARY_JOB_ID, the
+  # controlled-canary restriction that limits sending to one named job id. Same
+  # file, no new service and no new secret. Retention PLANNING is
+  # EASYWEEK_RETENTION_ENABLED on the inbox worker below.
+  #
+  # EASYWEEK_NOTIFICATIONS_ENABLED gates retention SENDING here too, not only
+  # planning: a queued retention job is still a customer message, so the master
+  # fence has to be able to stop one that is already in the queue.
+  #
   # This service is also the base image for the one-off review preflight
   # (`run --rm --no-deps --entrypoint /app/.venv/bin/python
-  # altegio-outbox-worker -m altegio_bot.scripts.easyweek_review_preflight`).
+  # altegio-outbox-worker -m altegio_bot.scripts.easyweek_review_preflight`),
+  # and for the PR-12 one the same way
+  # (`... -m altegio_bot.scripts.easyweek_retention_preflight`).
   # That process reads EASYWEEK_REVIEWS_ENABLED too — the running worker never
   # does. A one-off container is required rather than `exec`, because this
   # long-running container keeps the environment it was created with, and the
@@ -173,6 +185,11 @@ services:
   # PR-10: EASYWEEK_GOOGLE_REVIEW_LINKS is read here (review planning) and by
   # altegio-outbox-worker (send-time re-proof). `docker compose restart` does
   # NOT re-read env_file — recreate both services after changing it.
+  #
+  # PR-12: EASYWEEK_RETENTION_ENABLED (repeat_10d / comeback_3d PLANNING) is read
+  # here; its send fence EASYWEEK_RETENTION_SEND_ENABLED belongs to the outbox
+  # worker. Planning also needs the PR-11 counter below: a repeat with no proven
+  # baseline is never created.
   #
   # PR-11: EASYWEEK_VISIT_COUNTER_ENABLED is read HERE and nowhere else. The
   # visit counter has no send fence because it sends nothing — it stores the

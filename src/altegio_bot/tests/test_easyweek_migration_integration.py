@@ -179,6 +179,34 @@ async def _fetch(db_url: str, sql: str, params: dict | None = None) -> list[tupl
         await engine.dispose()
 
 
+# PR-12's deferred-retention marker. Named here so the upgrade assertions and
+# the downgrade assertions cannot disagree about what they are looking for.
+_RETENTION_DEFERRED_COLUMN = "retention_deferred_at"
+_RETENTION_DEFERRED_INDEX = "ix_easyweek_events_retention_deferred"
+
+
+async def _easyweek_event_column(db_url: str, column: str) -> tuple | None:
+    """One ``easyweek_events`` column as (name, type, is_nullable), or ``None``."""
+    rows = await _fetch(
+        db_url,
+        "SELECT column_name, data_type, is_nullable "
+        "FROM information_schema.columns "
+        "WHERE table_name = 'easyweek_events' AND column_name = :column",
+        {"column": column},
+    )
+    return rows[0] if rows else None
+
+
+async def _easyweek_event_index(db_url: str, index: str) -> str | None:
+    """The full ``CREATE INDEX`` definition, or ``None`` when it does not exist."""
+    rows = await _fetch(
+        db_url,
+        "SELECT indexdef FROM pg_indexes WHERE tablename = 'easyweek_events' AND indexname = :index",
+        {"index": index},
+    )
+    return rows[0][0] if rows else None
+
+
 async def _raw_body_columns(db_url: str) -> dict[str, tuple]:
     rows = await _fetch(
         db_url,
@@ -214,6 +242,28 @@ async def test_migration_compatibility_scenarios(temp_db_url) -> None:
     assert payload_hash_index, "payload_hash index is missing"
     assert "UNIQUE" not in payload_hash_index[0].upper()
 
+    # PR-12 (b2d4f7a91c68): the deferred-retention marker and its partial index.
+    #
+    # Checked as a SHAPE, not merely as "the column exists". The recovery scan
+    # selects on `retention_deferred_at IS NOT NULL` and stores a moment the pass
+    # moves forward when it cannot decide, so three properties are load-bearing:
+    # the column has to hold a timestamptz, it has to be nullable (NULL is what
+    # "no obligation" means), and the index has to carry the same partial
+    # predicate the scan uses — a full index would silently cover every row and
+    # stop being the thing the migration claims to create.
+    marker = await _easyweek_event_column(temp_db_url, _RETENTION_DEFERRED_COLUMN)
+    assert marker is not None, f"{_RETENTION_DEFERRED_COLUMN} is missing after upgrade head"
+    assert marker[1] == "timestamp with time zone", f"unexpected type for the marker: {marker}"
+    assert marker[2] == "YES", "the marker must be nullable: NULL is how 'no obligation' is expressed"
+
+    marker_index = await _easyweek_event_index(temp_db_url, _RETENTION_DEFERRED_INDEX)
+    assert marker_index is not None, f"{_RETENTION_DEFERRED_INDEX} is missing after upgrade head"
+    assert _RETENTION_DEFERRED_COLUMN in marker_index, f"the index is not on the marker: {marker_index}"
+    normalized_predicate = " ".join(marker_index.split()).lower()
+    assert f"where ({_RETENTION_DEFERRED_COLUMN} is not null)" in normalized_predicate, (
+        f"the marker index must be PARTIAL on the recovery scan's predicate: {marker_index}"
+    )
+
     current = _alembic_ok("current", db_url=temp_db_url)
     assert _HEAD_REVISION in current
 
@@ -239,8 +289,11 @@ async def test_migration_compatibility_scenarios(temp_db_url) -> None:
     #   d4e8a1c39f57 (PR-4)           -> booking_uuid, processed_at, error_code,
     #                                    processing_attempts, next_retry_at
     #   a7c3e91b5d24 (PR-11)          -> review_deferred_at
-    # The point of the assertion is that the downgrade is scoped — it must not
-    # take the base capture columns with it.
+    #   b2d4f7a91c68 (PR-12)          -> retention_deferred_at
+    # The set is EXACT in both directions on purpose. Too much removed means the
+    # downgrade took base capture columns with it; too little means a migration
+    # added a column its own downgrade does not undo, and the next environment to
+    # roll back would be left with a column no revision admits to owning.
     assert removed == {
         "body_raw",
         "body_size_bytes",
@@ -250,7 +303,14 @@ async def test_migration_compatibility_scenarios(temp_db_url) -> None:
         "processing_attempts",
         "next_retry_at",
         "review_deferred_at",
-    }, f"downgrade removed too much: {removed}"
+        _RETENTION_DEFERRED_COLUMN,
+    }, f"downgrade removed the wrong set: {removed}"
+
+    # The index goes with the column. Dropping the column would take the index
+    # with it in PostgreSQL, so this proves the pair is really gone rather than
+    # that the migration remembered to name both.
+    assert await _easyweek_event_column(temp_db_url, _RETENTION_DEFERRED_COLUMN) is None
+    assert await _easyweek_event_index(temp_db_url, _RETENTION_DEFERRED_INDEX) is None
 
     remaining_indexes = await _fetch(
         temp_db_url,

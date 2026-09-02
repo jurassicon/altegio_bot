@@ -56,6 +56,7 @@ from altegio_bot.easyweek_policy import (
     EASYWEEK_CUSTOMER_JOB_TYPES,
     EASYWEEK_LIFECYCLE_JOB_TYPES,
     EASYWEEK_REMINDER_JOB_TYPES,
+    EASYWEEK_RETENTION_JOB_TYPES,
     EASYWEEK_REVIEW_JOB_TYPES,
     EASYWEEK_SERVICE_SNAPSHOT_JOB_TYPES,
     easyweek_job_type_error,
@@ -3590,9 +3591,12 @@ async def test_altegio_review_is_still_not_retry_enabled(db: AsyncSession) -> No
 # PR-9 moved review_3d out of this list: it is now an EasyWeek customer
 # notification with its own planner, send fence, link validator and send-time
 # guard. What remains here still calls something EasyWeek has no equivalent for.
+# PR-12 moved `repeat_10d` and `comeback_3d` OUT of this list and into the
+# allowlist, behind their own planning flag and their own send fence. What
+# remains here is what stays Altegio-only: promo, newsletters and the campaign
+# runner, each of which reaches an Altegio API, an Altegio-keyed link map or a
+# runner built around Altegio client ids.
 _DISALLOWED_EASYWEEK_JOB_TYPES = [
-    "repeat_10d",
-    "comeback_3d",
     "promo_eligibility_check",
     "promo_apply_existing_booking",
     "promo_card_booking_reminder",
@@ -3610,11 +3614,14 @@ async def test_reminders_are_now_inside_the_easyweek_allowlist(job_type: str) ->
     assert job_type not in EASYWEEK_LIFECYCLE_JOB_TYPES, "reminders must not inherit the lifecycle seven-field contract"
 
 
-async def test_the_easyweek_allowlist_is_exactly_lifecycle_reminders_and_review() -> None:
+async def test_the_easyweek_allowlist_is_exactly_lifecycle_reminders_review_and_retention() -> None:
     """A new customer notification kind has one place to be registered."""
     assert (
         EASYWEEK_CUSTOMER_JOB_TYPES
-        == EASYWEEK_LIFECYCLE_JOB_TYPES | EASYWEEK_REMINDER_JOB_TYPES | EASYWEEK_REVIEW_JOB_TYPES
+        == EASYWEEK_LIFECYCLE_JOB_TYPES
+        | EASYWEEK_REMINDER_JOB_TYPES
+        | EASYWEEK_REVIEW_JOB_TYPES
+        | EASYWEEK_RETENTION_JOB_TYPES
     )
     assert EASYWEEK_CUSTOMER_JOB_TYPES == {
         "record_created",
@@ -3623,11 +3630,17 @@ async def test_the_easyweek_allowlist_is_exactly_lifecycle_reminders_and_review(
         "reminder_24h",
         "reminder_2h",
         "review_3d",
+        "repeat_10d",
+        "comeback_3d",
     }
     assert EASYWEEK_REVIEW_JOB_TYPES == {"review_3d"}
+    assert EASYWEEK_RETENTION_JOB_TYPES == {"repeat_10d", "comeback_3d"}
     assert not EASYWEEK_REVIEW_JOB_TYPES & (EASYWEEK_LIFECYCLE_JOB_TYPES | EASYWEEK_REMINDER_JOB_TYPES), (
         "review must not inherit lifecycle or reminder rules"
     )
+    assert not EASYWEEK_RETENTION_JOB_TYPES & (
+        EASYWEEK_LIFECYCLE_JOB_TYPES | EASYWEEK_REMINDER_JOB_TYPES | EASYWEEK_REVIEW_JOB_TYPES
+    ), "retention must not inherit lifecycle, reminder or review rules"
 
 
 @pytest.mark.parametrize("job_type", _DISALLOWED_EASYWEEK_JOB_TYPES)

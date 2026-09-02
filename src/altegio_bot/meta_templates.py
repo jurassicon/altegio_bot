@@ -215,6 +215,27 @@ LIFECYCLE_PARAM_FIELDS: dict[str, tuple[str, ...]] = {
         "client_name",
         "review_url",
     ),
+    # PR-12 retention. The positional orders are deliberately IDENTICAL to the
+    # approved Altegio templates for the same two codes — both CRMs use the same
+    # approved layout, and inventing a second order would mean a second Meta
+    # template review for no product difference.
+    #
+    # `booking_link`, not `short_link`: for EasyWeek that slot holds the
+    # branch's proven static booking page. Both messages say "book again", so
+    # the manage link of a finished or cancelled appointment would be the wrong
+    # destination even when one exists.
+    "repeat_10d": (
+        "client_name",
+        "primary_service",
+        "booking_link",
+    ),
+    # No service parameter at all. A cancelled booking's service is not what the
+    # message is about, and printing one would promise an appointment that was
+    # called off.
+    "comeback_3d": (
+        "client_name",
+        "booking_link",
+    ),
 }
 
 

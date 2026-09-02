@@ -132,10 +132,15 @@ async def _count(db: AsyncSession, model: Any, **where: Any) -> int:
 
 
 async def test_the_seed_writes_exactly_the_branch_template_suite(db: AsyncSession) -> None:
-    """Four lifecycle codes plus the two PR-8 reminders — and nothing else."""
+    """Four lifecycle codes, the two PR-8 reminders, review, and PR-12 retention.
+
+    The list is exhaustive on purpose: seeding a row is the first half of being
+    able to send it, so a code appearing here without a deliberate decision is
+    exactly the drift this assertion exists to catch.
+    """
     result = await _run_seed(db)
 
-    assert result.templates_created == 7
+    assert result.templates_created == 9
     rows = await _easyweek_templates(db)
     assert [r.code for r in rows] == sorted(
         [
@@ -146,6 +151,8 @@ async def test_the_seed_writes_exactly_the_branch_template_suite(db: AsyncSessio
             "reminder_24h",
             "reminder_2h",
             "review_3d",
+            "repeat_10d",
+            "comeback_3d",
         ]
     )
 
@@ -198,11 +205,11 @@ async def test_the_seed_writes_two_branch_specific_suites(db: AsyncSession, monk
     ]
 
     result = await _run_seed(db, api_locations=api_locations)
-    assert result.templates_created == 14
+    assert result.templates_created == 18
     assert result.senders_created == 2
 
     rows = await _easyweek_templates(db)
-    assert len(rows) == 14
+    assert len(rows) == 18
     by_company: dict[int, list[MessageTemplate]] = {}
     for row in rows:
         by_company.setdefault(row.company_id, []).append(row)
@@ -233,18 +240,21 @@ async def test_the_seed_writes_two_branch_specific_suites(db: AsyncSession, monk
     second = await seed_script.seed(db, plan=plan)
     await db.flush()
     assert second.templates_created == 0
-    assert second.templates_updated == 14
-    assert await _count(db, MessageTemplate, provider=PROVIDER_EASYWEEK) == 14
+    assert second.templates_updated == 18
+    assert await _count(db, MessageTemplate, provider=PROVIDER_EASYWEEK) == 18
     assert await _count(db, WhatsAppSender, provider=PROVIDER_EASYWEEK) == 2
 
 
-@pytest.mark.parametrize("absent_code", ["repeat_10d", "comeback_3d", "newsletter_new_clients_monthly"])
+@pytest.mark.parametrize(
+    "absent_code",
+    ["newsletter_new_clients_monthly", "newsletter_new_clients_followup", "promo_card_booking_reminder"],
+)
 async def test_the_seed_writes_no_deferred_marketing_codes(db: AsyncSession, absent_code: str) -> None:
-    """PR-8 admitted the two reminders and nothing else.
+    """PR-12 admitted repeat and comeback; it admitted nothing else.
 
-    Review, repeat, comeback and newsletters each need something EasyWeek has no
-    equivalent for, and seeding a row for one would be the first half of sending
-    it.
+    Newsletters and promo each need something EasyWeek has no equivalent for — an
+    Altegio-keyed link map, a campaign runner built around Altegio client ids —
+    and seeding a row for one would be the first half of sending it.
     """
     await _run_seed(db)
     assert await _count(db, MessageTemplate, provider=PROVIDER_EASYWEEK, code=absent_code) == 0
@@ -275,11 +285,11 @@ async def test_running_the_seed_twice_creates_no_duplicates(db: AsyncSession) ->
     second = await _run_seed(db)
     after = [(r.id, r.code, r.body, r.meta_template_name) for r in await _easyweek_templates(db)]
 
-    assert first.templates_created == 7
+    assert first.templates_created == 9
     assert second.templates_created == 0
-    assert second.templates_updated == 7
+    assert second.templates_updated == 9
     assert after == before, "a re-run must not add, renumber or rewrite rows"
-    assert await _count(db, MessageTemplate, provider=PROVIDER_EASYWEEK) == 7
+    assert await _count(db, MessageTemplate, provider=PROVIDER_EASYWEEK) == 9
 
 
 async def test_the_seed_reactivates_a_row_an_operator_disabled(db: AsyncSession) -> None:
@@ -435,7 +445,7 @@ async def test_the_seed_refuses_an_unconfigured_environment(
 async def test_a_matching_api_uuid_seeds(db: AsyncSession, capsys) -> None:
     result = await _run_seed(db)
 
-    assert result.templates_created == 7
+    assert result.templates_created == 9
     assert await _count(db, WhatsAppSender, provider=PROVIDER_EASYWEEK) == 1
     assert "KitiLash Durlach" in capsys.readouterr().out
 
@@ -665,9 +675,11 @@ async def test_canceled_uses_the_static_booking_page_not_the_manage_link(db: Asy
 async def test_an_unseeded_code_still_fails_closed(db: AsyncSession) -> None:
     """An EasyWeek job must never borrow an Altegio row of the same code.
 
-    PR-8 seeded the two reminder codes, so the code used here is one that is
-    still deliberately unseeded for EasyWeek. The invariant is unchanged and is
-    exactly what keeps a marketing template from becoming reachable the moment
+    PR-12 seeded the two retention codes, so the code used here is one that is
+    still deliberately unseeded for EasyWeek — and it is a UNIVERSAL code on the
+    Altegio side, which is what makes it the sharp case: universal codes are the
+    ones reachable by a cross-company fallback. The invariant is unchanged and is
+    exactly what keeps a newsletter template from becoming reachable the moment
     someone adds an Altegio row for the same company id.
     """
     await _run_seed(db)
@@ -676,9 +688,9 @@ async def test_an_unseeded_code_still_fails_closed(db: AsyncSession) -> None:
         MessageTemplate(
             provider=PROVIDER_ALTEGIO,
             company_id=DURLACH_LOCATION_ID,
-            code="repeat_10d",
+            code="newsletter_new_clients_monthly",
             language="de",
-            body="ALTEGIO REPEAT",
+            body="ALTEGIO NEWSLETTER",
             is_active=True,
         )
     )
@@ -688,7 +700,7 @@ async def test_an_unseeded_code_still_fails_closed(db: AsyncSession) -> None:
         await ow._render_message(
             db,
             company_id=DURLACH_LOCATION_ID,
-            template_code="repeat_10d",
+            template_code="newsletter_new_clients_monthly",
             record=record,
             client=client,
             provider=PROVIDER_EASYWEEK,
@@ -697,7 +709,49 @@ async def test_an_unseeded_code_still_fails_closed(db: AsyncSession) -> None:
     message = str(excinfo.value)
     assert "Template not found" in message
     assert PROVIDER_EASYWEEK in message
-    assert "ALTEGIO REPEAT" not in message
+    assert "ALTEGIO NEWSLETTER" not in message
+
+
+@pytest.mark.parametrize("code", ["repeat_10d", "comeback_3d"])
+async def test_a_seeded_retention_code_renders_from_the_easyweek_row(db: AsyncSession, code: str) -> None:
+    """PR-12: EasyWeek now owns these codes, and still never reads Altegio's row.
+
+    Both providers have a `repeat_10d` and a `comeback_3d` for the SAME numeric
+    company id here, which is the collision the provider predicate exists to
+    survive. The EasyWeek render must resolve its own branch-bound row — Meta
+    name, body and footer — and the Altegio body must not appear anywhere in it.
+    """
+    await _run_seed(db)
+    client, record = await _seed_durlach_domain(db)
+    db.add(
+        MessageTemplate(
+            provider=PROVIDER_ALTEGIO,
+            company_id=DURLACH_LOCATION_ID,
+            code=code,
+            language="de",
+            body="ALTEGIO RETENTION",
+            meta_template_name="kitilash_ka_altegio_v1",
+            is_active=True,
+        )
+    )
+    await db.flush()
+
+    body, _sender_id, _lang, ctx = await ow._render_message(
+        db,
+        company_id=DURLACH_LOCATION_ID,
+        template_code=code,
+        record=record,
+        client=client,
+        provider=PROVIDER_EASYWEEK,
+    )
+
+    assert ctx["meta_template_name"] == f"kitilash_du_{code}_v1"
+    assert "ALTEGIO RETENTION" not in body
+    assert "KitiLash Durlach" in body
+    # Both retention messages call the customer back to the branch's own booking
+    # page — never the manage link of a booking that is over or cancelled.
+    assert ctx["booking_link"] == STATIC_BOOKING_PAGE
+    assert VERIFIED_PAGE not in body.format(**ctx)
 
 
 async def test_a_seeded_reminder_renders_from_the_easyweek_row(db: AsyncSession) -> None:
@@ -978,6 +1032,36 @@ _BOTH_API_LOCATIONS = [
     {"uuid": RASTATT_LOCATION_UUID, "name": "KitiLash Rastatt"},
 ]
 
+# PR-11.1 moved Karlsruhe onto EasyWeek, so the production registry now holds
+# three branches. Without a source-controlled profile the seed, the preflight and
+# the send path all refuse it — which is why the profile exists and why these
+# fixtures cover it like any other branch.
+KARLSRUHE_LOCATION_ID = 999503
+KARLSRUHE_LOCATION_UUID = "dddddddd-eeee-4fff-8000-000000000003"
+KARLSRUHE_PAGE = f"https://{BOOKING_PAGE_HOST}/karlsruhe"
+
+_ALL_API_LOCATIONS = [
+    *_BOTH_API_LOCATIONS,
+    {"uuid": KARLSRUHE_LOCATION_UUID, "name": "KitiLash Karlsruhe"},
+]
+
+
+def _all_three_registry(monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_registry(
+        monkeypatch,
+        {
+            "durlach": _entry(DURLACH_LOCATION_ID, DURLACH_LOCATION_UUID, "du", STATIC_BOOKING_PAGE),
+            "rastatt": _entry(RASTATT_LOCATION_ID, RASTATT_LOCATION_UUID, "ra", RASTATT_PAGE),
+            "karlsruhe": _entry(KARLSRUHE_LOCATION_ID, KARLSRUHE_LOCATION_UUID, "ka", KARLSRUHE_PAGE),
+        },
+    )
+    monkeypatch.setattr(
+        settings,
+        "easyweek_booking_page_allowed_hosts",
+        BOOKING_PAGE_HOST,
+        raising=False,
+    )
+
 
 def _set_registry(monkeypatch: pytest.MonkeyPatch, entries: dict[str, dict[str, Any]]) -> None:
     monkeypatch.setattr(settings, "easyweek_location_map", json.dumps(entries), raising=False)
@@ -1051,15 +1135,21 @@ async def test_the_other_branchs_uuid_under_a_slug_is_refused_even_with_a_matchi
 
 
 async def test_an_unknown_branch_slug_is_refused(db: AsyncSession, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A third branch cannot be seeded until its profile is approved in source."""
+    """A branch cannot be seeded until its profile is approved in source.
+
+    The slug here is one that genuinely has no profile. Karlsruhe used to play
+    that role and no longer can — PR-11.1 put it in the production registry, so
+    it has a real approved profile now — but the RULE is unchanged, and this
+    keeps proving it.
+    """
     before = await _easyweek_state(db)
     _set_registry(
         monkeypatch,
-        {"karlsruhe": _entry(999503, "dddddddd-eeee-4fff-8000-000000000003", "ka", STATIC_BOOKING_PAGE)},
+        {"ettlingen": _entry(999504, "dddddddd-eeee-4fff-8000-000000000004", "et", STATIC_BOOKING_PAGE)},
     )
 
     with pytest.raises(seed_script.SeedConfigError) as excinfo:
-        await _run_seed(db, api_locations=_BOTH_API_LOCATIONS)
+        await _run_seed(db, api_locations=_ALL_API_LOCATIONS)
 
     assert "no source-controlled profile" in str(excinfo.value)
     assert await _easyweek_state(db) == before
@@ -1079,7 +1169,7 @@ async def test_both_correct_profiles_seed_a_full_suite_each_and_two_senders(
     await _run_seed(db, api_locations=_BOTH_API_LOCATIONS)
 
     templates, senders = await _easyweek_state(db)
-    assert (templates, senders) == (14, 2)
+    assert (templates, senders) == (18, 2)
 
     rows = await _easyweek_templates(db)
     by_company: dict[int, set[str]] = {}
@@ -1165,3 +1255,136 @@ async def test_an_unprofiled_branch_is_member_but_cannot_seed(
     with pytest.raises(seed_script.SeedConfigError):
         await _run_seed(db, api_locations=_BOTH_API_LOCATIONS)
     assert await _easyweek_state(db) == before
+
+
+# ---------------------------------------------------------------------------
+# Karlsruhe: the third production branch (PR-11.1 put it on EasyWeek)
+# ---------------------------------------------------------------------------
+
+
+async def test_the_three_branch_production_registry_seeds(
+    db: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """durlach + rastatt + karlsruhe — the registry production actually holds.
+
+    Without an approved Karlsruhe profile this raised before writing a single
+    row, which made the seed, the preflight and the send path unexecutable for a
+    branch whose customers are already on EasyWeek.
+    """
+    _all_three_registry(monkeypatch)
+
+    result = await _run_seed(db, api_locations=_ALL_API_LOCATIONS)
+
+    assert result.templates_created == 27, "nine codes for each of three branches"
+    assert result.senders_created == 3
+
+    rows = await _easyweek_templates(db)
+    by_company: dict[int, list[MessageTemplate]] = {}
+    for row in rows:
+        by_company.setdefault(row.company_id, []).append(row)
+    assert set(by_company) == {DURLACH_LOCATION_ID, RASTATT_LOCATION_ID, KARLSRUHE_LOCATION_ID}
+    assert all(row.meta_template_name.startswith("kitilash_ka_") for row in by_company[KARLSRUHE_LOCATION_ID])
+
+
+async def test_the_karlsruhe_footer_is_its_own_source_controlled_content(
+    db: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The address a customer reads must be Karlsruhe's, not a neighbour's."""
+    _all_three_registry(monkeypatch)
+    await _run_seed(db, api_locations=_ALL_API_LOCATIONS)
+
+    rows = [row for row in await _easyweek_templates(db) if row.company_id == KARLSRUHE_LOCATION_ID]
+    assert rows
+    for row in rows:
+        assert "76133 Karlsruhe, Kaiserstraße, 68" in row.body
+        assert "Pfinztalstraße" not in row.body
+        assert "Rathausstraße" not in row.body
+
+
+async def test_karlsruhe_is_verified_against_its_exact_api_name(
+    db: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """EasyWeek is the independent third party, for Karlsruhe like every branch."""
+    before = await _easyweek_state(db)
+    _all_three_registry(monkeypatch)
+    wrong_name = [
+        *_BOTH_API_LOCATIONS,
+        {"uuid": KARLSRUHE_LOCATION_UUID, "name": "KitiLash Durlach"},
+    ]
+
+    with pytest.raises(seed_script.SeedConfigError) as excinfo:
+        await _run_seed(db, api_locations=wrong_name)
+
+    assert "identity mismatch" in str(excinfo.value)
+    assert "karlsruhe" in str(excinfo.value)
+    assert await _easyweek_state(db) == before, "nothing is written before identity is proven"
+
+
+async def test_a_wrong_karlsruhe_prefix_is_refused_before_any_write(
+    db: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The prefix is data an operator supplies; the profile owns the truth.
+
+    A prefix DUPLICATED across two branches is refused even earlier, by the
+    registry parser itself. This is the subtler case: a unique prefix that simply
+    is not the one Karlsruhe owns, which only the profile can catch.
+    """
+    before = await _easyweek_state(db)
+    _set_registry(
+        monkeypatch,
+        {
+            "durlach": _entry(DURLACH_LOCATION_ID, DURLACH_LOCATION_UUID, "du", STATIC_BOOKING_PAGE),
+            "karlsruhe": _entry(KARLSRUHE_LOCATION_ID, KARLSRUHE_LOCATION_UUID, "kx", KARLSRUHE_PAGE),
+        },
+    )
+    monkeypatch.setattr(settings, "easyweek_booking_page_allowed_hosts", BOOKING_PAGE_HOST, raising=False)
+
+    with pytest.raises(seed_script.SeedConfigError) as excinfo:
+        await _run_seed(db, api_locations=_ALL_API_LOCATIONS)
+
+    assert "meta_template_prefix" in str(excinfo.value)
+    assert await _easyweek_state(db) == before
+
+
+async def test_the_three_branch_seed_stays_idempotent(
+    db: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _all_three_registry(monkeypatch)
+    plan = await seed_script.build_seed_plan(client_factory=_client_factory(_ALL_API_LOCATIONS))
+
+    first = await seed_script.seed(db, plan=plan)
+    await db.flush()
+    second = await seed_script.seed(db, plan=plan)
+    await db.flush()
+
+    assert first.templates_created == 27
+    assert second.templates_created == 0
+    assert second.templates_updated == 27
+    assert await _easyweek_state(db) == (27, 3)
+
+
+@pytest.mark.parametrize("code", ["repeat_10d", "comeback_3d"])
+async def test_karlsruhe_retention_rows_are_bound_to_karlsruhe(
+    db: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    code: str,
+) -> None:
+    """Send and preflight accept Karlsruhe only on a complete branch contract."""
+    _all_three_registry(monkeypatch)
+    await _run_seed(db, api_locations=_ALL_API_LOCATIONS)
+
+    rows = [
+        row for row in await _easyweek_templates(db) if row.company_id == KARLSRUHE_LOCATION_ID and row.code == code
+    ]
+    assert len(rows) == 1
+    row = rows[0]
+    contract = branch_template_contract(BRANCH_PROFILES["karlsruhe"], code)
+    assert contract is not None
+    assert row.meta_template_name == contract.meta_template_name == f"kitilash_ka_{code}_v1"
+    assert row.body == contract.raw_body
+    assert row.is_active is True

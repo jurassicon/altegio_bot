@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 import re
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -44,13 +45,16 @@ from altegio_bot.easyweek_client import EasyWeekClient
 from altegio_bot.easyweek_locations import EasyWeekLocation, configured_easyweek_locations
 from altegio_bot.easyweek_normalizer import extract_manage_link, normalize_booking_hash_id
 from altegio_bot.easyweek_policy import (
+    COMEBACK_3D,
     EASYWEEK_CUSTOMER_JOB_TYPES,
     EASYWEEK_LIFECYCLE_JOB_TYPES,
     EASYWEEK_REMINDER_JOB_TYPES,
+    EASYWEEK_RETENTION_JOB_TYPES,
     EASYWEEK_REVIEW_JOB_TYPES,
     EASYWEEK_SERVICE_SNAPSHOT_JOB_TYPES,
     RECORD_CREATED,
     RECORD_CREATED_NEW_CLIENT,
+    REPEAT_10D,
     REVIEW_3D,
     easyweek_job_type_error,
     normalize_provider,
@@ -60,6 +64,36 @@ from altegio_bot.easyweek_reminder_guard import (
     GuardResult,
     classify_client_error,
     verify_reminder_is_current,
+)
+from altegio_bot.easyweek_retention import (
+    COMEBACK_REPEAT_WINDOW,
+    PAYLOAD_BOOKING_UUID,
+    PAYLOAD_PROOF_VERSION,
+    PAYLOAD_RECORD_STARTS_AT,
+    PAYLOAD_SOURCE_CANCELLED_AT,
+    PAYLOAD_SOURCE_SERVICE_ID,
+    PAYLOAD_VISITS_BASELINE,
+    RETENTION_BOOKING_PAGE_UNPROVEN,
+    RETENTION_BOOKING_UUID_MISMATCH,
+    RETENTION_BOOKING_UUID_UNPROVEN,
+    RETENTION_CANARY_RESTRICTED,
+    RETENTION_CANCELLED_AT_UNPROVEN,
+    RETENTION_CLIENT_UNSUBSCRIBED,
+    RETENTION_COMEBACK_ALREADY_SENT,
+    RETENTION_COUNTER_UNSTAMPED,
+    RETENTION_FUTURE_BOOKING,
+    RETENTION_JOB_INCOMPLETE,
+    RETENTION_NOTIFICATIONS_DISABLED,
+    RETENTION_PROOF_VERSION,
+    RETENTION_PROOF_VERSION_UNKNOWN,
+    RETENTION_SEND_FENCE_CLOSED,
+    RETENTION_SERVICE_UNPROVEN,
+    RETENTION_SOURCE_NOT_CANCELED,
+    RETENTION_SOURCE_NOT_FINISHED,
+    RETENTION_SOURCE_START_MISMATCH,
+    counter_refusal_reason,
+    parse_retention_canary_job_id,
+    service_identity_reason,
 )
 from altegio_bot.easyweek_review import (
     REVIEW_BOOKING_HASH_UNPROVEN,
@@ -203,6 +237,11 @@ _FOLLOWUP_LIVE_GUARD_ATTEMPTS_KEY = "_followup_live_guard_attempts"
 MAX_FOLLOWUP_LIVE_GUARD_ATTEMPTS = 10
 
 COMEBACK_3D_MISSING_SOURCE_REASON = "Skipped: source record missing for comeback_3d"
+
+# The prefix every EasyWeek retention refusal carries into `job.last_error`.
+# One place, so the operator table in the runbook matches every string the
+# worker can actually write.
+EASYWEEK_RETENTION_REFUSED = "EasyWeek retention refused"
 
 
 def _resolve_template_header_image_url(template_name: str) -> str | None:
@@ -423,6 +462,62 @@ def _fmt_time(dt: datetime | None) -> str:
     return dt.astimezone(tz).strftime("%H:%M")
 
 
+def easyweek_retention_send_blocked() -> str | None:
+    """The configuration reason EasyWeek retention may not send AT ALL, or ``None``.
+
+    THE single definition of the send-side gate, asked by the claim, by the
+    pre-send check and by the read-only preflight. Three separate copies of "is
+    the fence open?" is exactly how a job gets claimed under one rule and
+    delivered under a looser one.
+
+    Three gates, in the order an operator turns them:
+
+    1. ``easyweek_notifications_enabled`` — the master fence over every PR-12
+       RETENTION customer message. A queued retention job is still a customer
+       message, so pausing outbound messaging has to stop it. Planning already
+       answered to this flag; sending did not, which meant a queue planned while
+       the master was open could be released after it was shut.
+
+       Scoped to retention here, and only retention. This function is reached
+       exclusively from the ``repeat_10d`` / ``comeback_3d`` path, so the flag's
+       effect on the send side ends there: EasyWeek lifecycle, ``reminder_24h`` /
+       ``reminder_2h`` and ``review_3d`` keep their own send-time contracts and
+       their own fences, and Altegio is untouched. Reading this as a global
+       outbox stop is how an operator concludes messaging is paused while queued
+       lifecycle jobs are still going out — the emergency stop for the whole
+       EasyWeek queue is §8.2 of the activation runbook, not this flag.
+    2. ``easyweek_retention_send_enabled`` — PR-12's own fence.
+    3. the canary restriction — a MALFORMED value fails closed here rather than
+       silently reverting to bulk, because an operator who set it has decided at
+       most one message may go out.
+
+    Returns a stable, PII-free hold code. A hold is not a refusal: nothing is
+    cancelled, and the queue keeps its ``run_at`` and its zero attempts.
+    """
+    if not bool(settings.easyweek_notifications_enabled):
+        return RETENTION_NOTIFICATIONS_DISABLED
+    if not bool(settings.easyweek_retention_send_enabled):
+        return RETENTION_SEND_FENCE_CLOSED
+    canary = parse_retention_canary_job_id(settings.easyweek_retention_canary_job_id)
+    return canary.unavailable_reason
+
+
+def easyweek_retention_job_blocked(job: MessageJob) -> str | None:
+    """The configuration reason THIS retention job may not send now, or ``None``.
+
+    The per-job half of the gate above: everything that applies to the queue as a
+    whole, plus the canary restriction, which names one internal job id and holds
+    every other retention job untouched.
+    """
+    blocked = easyweek_retention_send_blocked()
+    if blocked is not None:
+        return blocked
+    canary = parse_retention_canary_job_id(settings.easyweek_retention_canary_job_id)
+    if canary.restricted and getattr(job, "id", None) != canary.job_id:
+        return RETENTION_CANARY_RESTRICTED
+    return None
+
+
 async def _lock_next_jobs(
     session: AsyncSession,
     batch_size: int,
@@ -468,6 +563,32 @@ async def _lock_next_jobs(
         stmt = stmt.where(
             ~((MessageJob.provider == PROVIDER_EASYWEEK) & (MessageJob.job_type.in_(EASYWEEK_REVIEW_JOB_TYPES)))
         )
+
+    # PR-12 send gate, the same shape again and for the same reasons: while it is
+    # shut an EasyWeek `repeat_10d` or `comeback_3d` is not claimed at all, so it
+    # keeps its `queued` status, its original `run_at` and its zero attempts
+    # while the rollout audits it.
+    #
+    # Scoped to one provider and exactly two job types. ALTEGIO's own
+    # `repeat_10d` and `comeback_3d` are untouched by this predicate — they share
+    # the job type but not the provider, and that is precisely the collision the
+    # provider column exists to survive. Every other EasyWeek job type is
+    # untouched too: lifecycle, reminders and review answer to their own fences.
+    #
+    # The gate itself is `easyweek_retention_send_blocked()`, so the claim cannot
+    # drift from the check the send path runs a moment later. The canary is
+    # expressed here as an EQUALITY on the claim rather than as a post-claim
+    # rejection: a claimed-then-requeued row would spin the worker on every due
+    # job in the queue, which is the opposite of a controlled canary.
+    _retention_rows = (MessageJob.provider == PROVIDER_EASYWEEK) & (
+        MessageJob.job_type.in_(EASYWEEK_RETENTION_JOB_TYPES)
+    )
+    if easyweek_retention_send_blocked() is not None:
+        stmt = stmt.where(~_retention_rows)
+    else:
+        _canary = parse_retention_canary_job_id(settings.easyweek_retention_canary_job_id)
+        if _canary.restricted:
+            stmt = stmt.where(~_retention_rows | (MessageJob.id == _canary.job_id))
     res = await session.execute(stmt)
     jobs = list(res.scalars().all())
 
@@ -476,6 +597,90 @@ async def _lock_next_jobs(
         job.locked_at = now
 
     return jobs
+
+
+# How often the expired-retention cleanup runs, and how many rows it takes.
+# Flat and generous on purpose: an expired job is not urgent, and the pass exists
+# to unblock a rollout rather than to keep a queue hot.
+RETENTION_CLEANUP_INTERVAL_SEC = 300.0
+RETENTION_CLEANUP_BATCH = 200
+
+# The reason written to a retention job the cleanup terminalizes. Stable and
+# PII-free: it reaches `job.last_error` and the operator's queue query.
+RETENTION_DEADLINE_EXPIRED_REASON = "EasyWeek retention canceled: retention_deadline_expired"
+
+
+async def cancel_expired_easyweek_retention_jobs(
+    session: AsyncSession,
+    *,
+    limit: int = RETENTION_CLEANUP_BATCH,
+) -> int:
+    """Terminalize EasyWeek retention jobs whose send deadline has already passed.
+
+    Returns how many rows were cancelled.
+
+    **Why this exists at all.** With the send fence shut, an expired retention
+    job is never claimed — so nothing can ever move it — while the read-only
+    preflight correctly reports it as ``deadline_expired`` and therefore refuses
+    to go green. That is a deadlock, not a safety property: the rollout can never
+    proceed, and the only escape an operator has left is hand-editing production
+    rows, which is exactly what the runbook forbids. A bounded, safe
+    terminalization is the narrow way out.
+
+    **Why it is safe to run with the fence shut.** It sends nothing. It writes no
+    ``OutboxMessage``, calls no Meta and no EasyWeek API, and never touches
+    ``attempts``. The only transition it makes is ``queued -> canceled`` on rows
+    that are already past the moment at which they could legitimately be sent —
+    a state the send path would reach for exactly the same rows, by exactly the
+    same rule, the instant the fence opened.
+
+    **The rule is not restated here.** Expiry is
+    :func:`easyweek_reminder_deadline_passed`, the same single function the send
+    path and the preflight ask. A second, similar-looking deadline would be the
+    one way this pass could cancel a job the worker would still have sent.
+
+    Scoped by construction: ``provider = 'easyweek'`` AND the two retention job
+    types AND ``status = 'queued'``. Altegio jobs — including its own
+    ``repeat_10d`` and ``comeback_3d`` — and every other EasyWeek job type are
+    outside the query entirely. Rows are locked with ``FOR UPDATE SKIP LOCKED``
+    so a row another worker is mid-flight on is left alone rather than waited on.
+
+    Idempotent: a second pass finds nothing, because the rows it cancelled are no
+    longer ``queued``.
+    """
+    stmt = (
+        select(MessageJob)
+        .where(MessageJob.provider == PROVIDER_EASYWEEK)
+        .where(MessageJob.job_type.in_(EASYWEEK_RETENTION_JOB_TYPES))
+        .where(MessageJob.status == "queued")
+        # Nothing whose moment is still ahead can possibly be expired, so the
+        # scan never reads the healthy part of the queue.
+        .where(MessageJob.run_at <= utcnow())
+        .order_by(MessageJob.run_at.asc(), MessageJob.id.asc())
+        .limit(limit)
+        .with_for_update(skip_locked=True)
+    )
+    jobs = list((await session.execute(stmt)).scalars().all())
+
+    cancelled = 0
+    for job in jobs:
+        record = await _load_record(session, job)
+        if not easyweek_reminder_deadline_passed(job, record):
+            # Still sendable. Deciding otherwise here is the one thing that would
+            # make this pass dangerous.
+            continue
+        job.status = "canceled"
+        job.locked_at = None
+        job.updated_at = utcnow()
+        job.last_error = RETENTION_DEADLINE_EXPIRED_REASON
+        cancelled += 1
+        logger.info(
+            "EasyWeek retention expired before the fence opened; canceled job_id=%s company_id=%s code=%s",
+            job.id,
+            job.company_id,
+            job.job_type,
+        )
+    return cancelled
 
 
 async def _requeue_processing_jobs(
@@ -984,6 +1189,197 @@ def _easyweek_review_presend_error(
     return None
 
 
+async def _easyweek_retention_presend_error(
+    session: AsyncSession,
+    job: MessageJob,
+    record: Record | None,
+    client: Client | None,
+) -> str | None:
+    """Re-prove an EasyWeek retention message immediately before Meta, or refuse it.
+
+    Runs on the first send AND on every delivery retry. Ten days (repeat) or
+    three (comeback) is long enough for every input to change: the customer can
+    come back, book again, unsubscribe, or have the booking restored under them.
+    Nothing proven at planning time is trusted here — the payload is compared,
+    never believed.
+
+    Every lookup is provider-scoped by construction. ``company_id`` alone is not
+    an identity: EasyWeek's is the numeric ``:location_id`` and shares an integer
+    space with Altegio's, so a query missing ``provider == 'easyweek'`` answers
+    for a different salon rather than returning nothing. Not one Altegio helper
+    is called from here — no ``client_has_future_appointments``, no
+    ``count_attended_client_visits``, no ``_client_returned_since``, no
+    ``BOOKING_LINKS`` — because each of them keys on an ``altegio_client_id``
+    this path does not have and must never invent.
+
+    Reasons are short, stable and PII-free: they reach ``job.last_error``, the
+    worker log and the preflight report alike, and none of them carries a name,
+    a phone, a link or a payload value.
+    """
+    payload = getattr(job, "payload", None)
+    if not isinstance(payload, dict):
+        return RETENTION_JOB_INCOMPLETE
+    if payload.get(PAYLOAD_PROOF_VERSION) != RETENTION_PROOF_VERSION:
+        # A job planned under a contract this code does not know. Refusing is the
+        # only safe answer: a newer, stricter guard cannot assume the fields an
+        # older payload never carried.
+        return RETENTION_PROOF_VERSION_UNKNOWN
+
+    ownership_error = easyweek_job_ownership_error(job.company_id)
+    if ownership_error is not None:
+        return ownership_error
+
+    if record is None or client is None:
+        return RETENTION_JOB_INCOMPLETE
+    if record.provider != PROVIDER_EASYWEEK or client.provider != PROVIDER_EASYWEEK:
+        return RETENTION_JOB_INCOMPLETE
+    if record.company_id != job.company_id or client.company_id != job.company_id:
+        return RETENTION_JOB_INCOMPLETE
+    if job.record_id is not None and job.record_id != record.id:
+        return RETENTION_JOB_INCOMPLETE
+    if record.client_id != client.id:
+        return RETENTION_JOB_INCOMPLETE
+
+    booking_uuid = _canonical_uuid_or_none(payload.get(PAYLOAD_BOOKING_UUID))
+    if booking_uuid is None:
+        return RETENTION_BOOKING_UUID_UNPROVEN
+    if _canonical_uuid_or_none(record.easyweek_booking_uuid) != booking_uuid:
+        return RETENTION_BOOKING_UUID_MISMATCH
+
+    if bool(getattr(client, "wa_opted_out", False)):
+        return RETENTION_CLIENT_UNSUBSCRIBED
+
+    # --- the source booking must still be in the state that earned the message
+    if job.job_type == REPEAT_10D:
+        if bool(getattr(record, "is_deleted", False)):
+            # The visit that earned this invitation was cancelled after the fact.
+            return RETENTION_SOURCE_NOT_FINISHED
+        planned_start = _parse_payload_datetime(payload.get(PAYLOAD_RECORD_STARTS_AT))
+        if planned_start is None:
+            return RETENTION_JOB_INCOMPLETE
+        if record.starts_at is None or _as_utc(record.starts_at) != planned_start:
+            # The appointment moved after the repeat was earned. The visit we are
+            # following up on is not the visit that happened.
+            return RETENTION_SOURCE_START_MISMATCH
+        # `repeat_10d` names ONE service, and it has to be the SAME one the visit
+        # was for. Proven here rather than left to the param preflight: a blank or
+        # wrong first parameter would fail the job only after a Meta attempt had
+        # been spent on it.
+        services = list(
+            (
+                await session.execute(
+                    select(RecordService)
+                    .where(RecordService.record_id == record.id)
+                    .order_by(RecordService.service_id.asc())
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if len(services) != 1 or not (services[0].title or "").strip():
+            return RETENTION_SERVICE_UNPROVEN
+        if services_count_from_record_raw(record.raw) != 1:
+            return RETENTION_SERVICE_UNPROVEN
+        # The frozen identity, compared through the shared definition so the
+        # preflight cannot answer differently. Ten days is long enough for a
+        # `booking-updated` to swap the service, and an invitation naming a
+        # treatment the customer never had is the failure this prevents. The
+        # TITLE is deliberately not compared: it is display text the salon may
+        # rewrite, and it is read from the current row only after this passes.
+        identity_reason = service_identity_reason(
+            frozen=payload.get(PAYLOAD_SOURCE_SERVICE_ID),
+            current=services[0].service_id,
+        )
+        if identity_reason is not None:
+            return identity_reason
+    else:
+        if not bool(getattr(record, "is_deleted", False)):
+            # The cancellation was undone: the booking is active again, and
+            # inviting the customer back to a salon they still have an
+            # appointment at is the exact message this must not send.
+            return RETENTION_SOURCE_NOT_CANCELED
+        if _parse_payload_datetime(payload.get(PAYLOAD_SOURCE_CANCELLED_AT)) is None:
+            # The frozen cancellation instant is what the three days were counted
+            # from. Without it this job cannot say what it is about.
+            return RETENTION_CANCELLED_AT_UNPROVEN
+
+    # --- has the customer already come back? -------------------------------
+    #
+    # The Client row is re-read under its full provider/company/id identity
+    # rather than trusting the object already loaded: this is the one value the
+    # whole message depends on, and it may have moved since the job was claimed.
+    current = (
+        (
+            await session.execute(
+                select(Client)
+                .where(Client.id == client.id)
+                .where(Client.provider == PROVIDER_EASYWEEK)
+                .where(Client.company_id == job.company_id)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    counter_reason = counter_refusal_reason(
+        baseline=payload.get(PAYLOAD_VISITS_BASELINE),
+        current=getattr(current, "easyweek_visits_total", None) if current is not None else None,
+    )
+    if counter_reason is not None:
+        return counter_reason
+    if current is not None and current.easyweek_visits_total_updated_at is None:
+        # PR-11 keeps the value and its moment as one fact; a count without one
+        # cannot be audited against the delivery that set it.
+        return RETENTION_COUNTER_UNSTAMPED
+
+    # --- a future appointment the customer has already made ----------------
+    #
+    # A completed visit is not the only way to have come back: a booking made
+    # for next week means the invitation is already answered. Scoped to this
+    # provider, this branch and this client row, and the source record is
+    # excluded so a repeat is never suppressed by the very booking that earned
+    # it.
+    future_stmt = (
+        select(Record.id)
+        .where(Record.provider == PROVIDER_EASYWEEK)
+        .where(Record.company_id == job.company_id)
+        .where(Record.client_id == client.id)
+        .where(Record.is_deleted.is_(False))
+        .where(Record.starts_at.is_not(None))
+        .where(Record.starts_at > utcnow())
+        .limit(1)
+    )
+    if record.id is not None:
+        future_stmt = future_stmt.where(Record.id != record.id)
+    if (await session.execute(future_stmt)).scalar_one_or_none() is not None:
+        return RETENTION_FUTURE_BOOKING
+
+    # --- one comeback per customer per window -------------------------------
+    if job.job_type == COMEBACK_3D:
+        cutoff = utcnow() - COMEBACK_REPEAT_WINDOW
+        sent_stmt = (
+            select(OutboxMessage.id)
+            .where(OutboxMessage.company_id == job.company_id)
+            .where(OutboxMessage.client_id == client.id)
+            .where(OutboxMessage.template_code == COMEBACK_3D)
+            .where(OutboxMessage.status.in_(SUCCESS_OUTBOX_STATUSES))
+            .where(OutboxMessage.sent_at > cutoff)
+            .limit(1)
+        )
+        if (await session.execute(sent_stmt)).scalar_one_or_none() is not None:
+            return RETENTION_COMEBACK_ALREADY_SENT
+
+    # --- the link the customer will tap ------------------------------------
+    #
+    # Proven here so an unusable registry page fails locally rather than after a
+    # Meta attempt on an empty parameter. It is the branch's own static page:
+    # never Altegio's BOOKING_LINKS, and never a link chosen by a numeric id
+    # that happens to match.
+    if not easyweek_effective_booking_link(record, job.job_type, company_id=job.company_id):
+        return RETENTION_BOOKING_PAGE_UNPROVEN
+
+    return None
+
+
 def easyweek_review_url_for_send(job: MessageJob, record: Record | None) -> str | None:
     """The one link an EasyWeek review may carry, or ``None``.
 
@@ -1244,6 +1640,13 @@ def easyweek_effective_booking_link(record: Record | None, template_code: str, *
     "book again", and pointing the customer at the management page of a booking
     that no longer exists is both useless and confusing.
 
+    PR-12 retention gets the static page for exactly the same reason, and it is
+    the reason rather than the code list that matters: ``repeat_10d`` follows a
+    visit that is over and ``comeback_3d`` follows a cancellation, so in both
+    cases the only useful destination is "book a new appointment". The manage
+    link of a finished or cancelled booking is the wrong one even when it still
+    verifies.
+
     ``record_created`` / ``record_updated`` may use ``Record.short_link``, but
     only after the stored pair is re-verified HERE, at send time, by the very
     same validator the normalizer used — :func:`extract_manage_link`. Re-using it
@@ -1268,7 +1671,7 @@ def easyweek_effective_booking_link(record: Record | None, template_code: str, *
         return ""
 
     static_page = validate_static_booking_page(location.booking_page_url) or ""
-    if record is None or template_code == "record_canceled":
+    if record is None or template_code == "record_canceled" or template_code in EASYWEEK_RETENTION_JOB_TYPES:
         return static_page
 
     link, _present = extract_manage_link(
@@ -1606,7 +2009,12 @@ def _defer_easyweek_configuration(
     return _schedule_retry_or_cancel(job, record, delay, reason)
 
 
-_EASYWEEK_DEADLINE_JOB_TYPES = EASYWEEK_REMINDER_JOB_TYPES | EASYWEEK_REVIEW_JOB_TYPES
+# PR-12 joins retention to the same criterion. It is not a new number either:
+# `repeat_10d` and `comeback_3d` are already in MARKETING_TRANSIENT_CAP_JOB_TYPES,
+# so `_retry_deadline_at` answers `anchor + 24h` for them. This matters exactly
+# during rollout — retention jobs pile up behind a closed fence, and opening it
+# must not release a backlog that went stale.
+_EASYWEEK_DEADLINE_JOB_TYPES = EASYWEEK_REMINDER_JOB_TYPES | EASYWEEK_REVIEW_JOB_TYPES | EASYWEEK_RETENTION_JOB_TYPES
 
 
 def easyweek_reminder_deadline_passed(job: MessageJob, record: Record | None) -> bool:
@@ -2932,6 +3340,52 @@ async def _run_job_logic(
             job.last_error = "Skipped: client unsubscribed"
             return
 
+    # PR-12: EasyWeek retention takes its own path, BEFORE every Altegio
+    # marketing branch below, for the same reason PR-9 does. Those branches read
+    # `Record.attendance` (a field EasyWeek never fills), ask the Altegio API
+    # with an `altegio_client_id` this path does not have, and search records by
+    # a bare numeric company/client id pair that EasyWeek shares an integer space
+    # with. Every one of them would answer confidently for the wrong salon.
+    is_easyweek_retention = job_provider == PROVIDER_EASYWEEK and job.job_type in EASYWEEK_RETENTION_JOB_TYPES
+    if is_easyweek_retention:
+        # The whole send gate, re-read at the moment of processing rather than
+        # only at the claim: the master notification fence, PR-12's own fence and
+        # the canary restriction. `_lock_next_jobs` applied the same rule when it
+        # ran, but a batch claimed a moment before an operator closed a fence
+        # would otherwise still be delivered.
+        #
+        # Handing the row back costs nothing: it returns to `queued` with its
+        # `run_at` and payload intact, `locked_at` cleared, and BEFORE `attempts`
+        # is incremented — so a closed fence never spends an attempt, and never a
+        # Meta request.
+        hold_reason = easyweek_retention_job_blocked(job)
+        if hold_reason is not None:
+            job.status = "queued"
+            job.locked_at = None
+            logger.info(
+                "EasyWeek retention held after claim job_id=%s company_id=%s code=%s reason=%s",
+                job.id,
+                job.company_id,
+                job.job_type,
+                hold_reason,
+            )
+            return None
+
+        retention_error = await _easyweek_retention_presend_error(session, job, record, client)
+        if retention_error is not None:
+            job.status = "canceled"
+            job.locked_at = None
+            job.last_error = f"{EASYWEEK_RETENTION_REFUSED}: {retention_error}"
+            logger.info(
+                "EasyWeek retention refused before send job_id=%s company_id=%s record_id=%s code=%s reason=%s",
+                job.id,
+                job.company_id,
+                getattr(record, "id", None),
+                job.job_type,
+                retention_error,
+            )
+            return None
+
     # PR-9: EasyWeek review takes its own path, BEFORE every Altegio review
     # branch below. Those branches prove attendance from `Record.attendance`,
     # count visits through the Altegio API and render a Google Maps link keyed
@@ -2953,7 +3407,11 @@ async def _run_job_logic(
                 review_error,
             )
             return
-    elif record is not None and job.job_type in ("review_3d", "repeat_10d"):
+    elif record is not None and job.job_type in ("review_3d", "repeat_10d") and not is_easyweek_retention:
+        # `Record.attendance` is an Altegio field. An EasyWeek record never
+        # carries it, so this check would cancel every EasyWeek repeat — which is
+        # why the proof of a finished visit there is a `booking-succeeded`
+        # delivery instead.
         if not _record_attended(record):
             job.status = "canceled"
             job.locked_at = None
@@ -2990,7 +3448,7 @@ async def _run_job_logic(
             job.last_error = f"Skipped: client has >{MAX_VISITS_FOR_REVIEW} attended visits (Altegio API)"
             return
 
-    if job.job_type == "repeat_10d":
+    if job.job_type == "repeat_10d" and not is_easyweek_retention:
         altegio_cid = getattr(client, "altegio_client_id", None) if client is not None else None
         if altegio_cid is None:
             job.status = "canceled"
@@ -3035,6 +3493,9 @@ async def _run_job_logic(
                 return
 
     if record is not None and getattr(record, "is_deleted", False):
+        # `comeback_3d` is the one message that is ABOUT a deleted record, for
+        # either provider. The EasyWeek guard above has already proven the
+        # deletion is the cancellation this job was planned from.
         allow_deleted = job.job_type in ("record_canceled", "comeback_3d")
         if not allow_deleted:
             job.status = "canceled"
@@ -3042,7 +3503,7 @@ async def _run_job_logic(
             job.last_error = "Skipped: record is deleted"
             return
 
-    if job.job_type == "comeback_3d":
+    if job.job_type == "comeback_3d" and not is_easyweek_retention:
         if record is None:
             job.status = "canceled"
             job.locked_at = None
@@ -4324,6 +4785,8 @@ async def run_loop(
         effective_poll_sec,
     )
 
+    last_retention_cleanup_at = 0.0
+
     while True:
         async with SessionLocal() as session:
             async with session.begin():
@@ -4333,6 +4796,25 @@ async def run_loop(
                         "Recovered stale processing jobs: %s",
                         recovered,
                     )
+
+        # PR-12. A slow, bounded pass that terminalizes retention jobs whose
+        # deadline has already passed. It runs regardless of the send fence on
+        # purpose: with the fence shut those rows are never claimed, so nothing
+        # else can ever move them, and the preflight would report
+        # `deadline_expired` forever. It sends nothing and touches no other
+        # provider or job type — see `cancel_expired_easyweek_retention_jobs`.
+        now_monotonic = time.monotonic()
+        if now_monotonic - last_retention_cleanup_at >= RETENTION_CLEANUP_INTERVAL_SEC:
+            last_retention_cleanup_at = now_monotonic
+            try:
+                async with SessionLocal() as session:
+                    async with session.begin():
+                        expired = await cancel_expired_easyweek_retention_jobs(session)
+                if expired:
+                    logger.warning("Canceled expired EasyWeek retention jobs: %s", expired)
+            except Exception as exc:  # noqa: BLE001 — class name only, never the text
+                # Housekeeping must never take the send loop down with it.
+                logger.error("EasyWeek retention cleanup pass failed type=%s", type(exc).__name__)
 
         job_ids: list[int] = []
 

@@ -1690,9 +1690,13 @@ LIMIT 20;
 ## 8. Откат: два режима
 
 Важно понимать, что именно гейтит флаг. `EASYWEEK_NOTIFICATIONS_ENABLED`
-проверяется **только в планировщике** (`easyweek_inbox_worker`): он перестаёт
-создавать новые `MessageJob`. `outbox_worker` этим флагом **не гейтится** — уже
-созданные job'ы он доработает.
+останавливает **планировщик** (`easyweek_inbox_worker`): он перестаёт создавать
+новые `MessageJob` любого типа. Уже созданные job'ы `outbox_worker` доработает.
+
+Единственное исключение появилось в PR-12: на send-side тот же флаг закрывает
+`repeat_10d` / `comeback_3d` (§16.1). Для lifecycle, reminders и review
+`outbox_worker` им по-прежнему **не гейтится**, поэтому вывод этого раздела не
+меняется: чтобы остановить уже созданную очередь, нужен §8.2, а не флаг.
 
 Поэтому режимов два, и выбор зависит от того, что не так.
 
@@ -3877,3 +3881,589 @@ $COMPOSE exec -T altegio-easyweek-inbox-worker /app/.venv/bin/python -c 'from al
 Схемный откат (`alembic downgrade`) в штатный rollback не входит: он удалил бы
 доказанные значения. Он предусмотрен в миграции и применяется только по
 отдельному решению владельца.
+
+---
+
+## 16. PR-12 — repeat_10d и comeback_3d поверх доказанного счётчика
+
+Отдельный функциональный этап поверх закрытых PR-11 и PR-11.1. Ничего из
+предыдущих PR не откатывается, миграций нет. Altegio-путь не меняется: его
+`repeat_10d` и `comeback_3d` продолжают работать ровно как раньше — предикаты
+новых fence ограничены `provider=easyweek`.
+
+### 16.1 Что именно добавлено
+
+Два клиентских сообщения EasyWeek и ничего больше:
+
+- **`repeat_10d`** — через 10 дней после **доказанного завершённого визита**.
+  Единственное доказательство — вебхук `booking-succeeded`. Не
+  `booking-created`, не `booking-updated` и не локальное наблюдение «время
+  записи уже прошло»: у EasyWeek нет поля attendance, а через час после начала
+  no-show и состоявшийся визит выглядят одинаково.
+- **`comeback_3d`** — через 3 дня после **доказанной отмены** записи. Момент
+  отмены фиксируется в payload job и не пересчитывается позже.
+
+Оба опираются на счётчик PR-11. У каждой job в payload заморожен
+`visits_baseline` — значение `Client.easyweek_visits_total`, доказанное в момент
+возникновения обязательства. Перед отправкой клиент перечитывается по полной
+identity `provider` + `company_id` + `id`, и:
+
+| Текущее значение | Что происходит |
+|---|---|
+| больше baseline | клиент уже завершил ещё один визит — job отменяется без отправки |
+| равно baseline | вопрос всё ещё открыт, проверки продолжаются |
+| отсутствует, меньше baseline или без timestamp | fail-closed, отправки нет |
+
+Счётчик здесь только читается. Он никогда не уменьшается и не пересчитывается
+этим путём, а `0` вместо отсутствующего значения не подставляется: «нет
+доказанного счётчика» не означает «новый клиент».
+
+Кроме завершённого визита проверяются локальные EasyWeek-записи: если у того же
+клиента в том же филиале уже есть будущая активная запись, сообщение не
+уходит. Запрос ограничен `provider=easyweek` и `company_id`, исходная запись
+исключается, а `canceled`/`deleted` записи активными не считаются.
+
+`repeat_10d` дополнительно замораживает **идентичность услуги**: в payload
+сохраняется технический `service_id` той единственной услуги, которая была у
+записи в момент доказанного визита. Перед отправкой он сверяется с текущей
+единственной `RecordService`. Если за десять дней услугу подменили
+`booking-updated`, job отменяется с кодом `retention_service_changed` до Meta.
+Сравнивается только id: название — это display-текст, салон вправе его
+переписать, и клиентский текст читается из текущей строки уже после совпадения
+identity.
+
+**Мастер-флаг останавливает и отправку — но только retention.** При
+`EASYWEEK_NOTIFICATIONS_ENABLED=false` уже созданные `repeat_10d` /
+`comeback_3d` не claim'ятся и не отправляются даже при открытом
+`EASYWEEK_RETENTION_SEND_ENABLED`: они остаются `queued` с прежними `run_at`,
+`attempts=0` и `locked_at=NULL`.
+
+Это узкое расширение, а не глобальный send fence. На send-side флаг не гейтит
+ни EasyWeek lifecycle, ни `reminder_24h` / `reminder_2h`, ни `review_3d` — у
+каждого свой контракт и свой фенс, — и не касается Altegio вообще. Для
+планирования флаг остаётся общим: при `false` inbox не создаёт новых EasyWeek
+jobs ни одного типа.
+
+**Поэтому `EASYWEEK_NOTIFICATIONS_ENABLED` читают ДВА long-running сервиса**, и
+изменение флага требует пересоздания обоих. Пересоздать только
+`altegio-easyweek-inbox-worker` недостаточно: планирование остановится, а
+outbox-worker останется с прежним runtime-значением `true` и продолжит
+отправлять клиентам уже накопленные `repeat_10d` / `comeback_3d`. Пауза в
+рассылке, которой не произошло, — это ровно тот сценарий, который мастер-флаг
+обязан закрывать.
+
+#### Выключение мастер-флага — остановка retention sends и нового planning
+
+Одна Compose-команда с двумя сервисами порядка **не** даёт. Docker Compose
+упорядочивает сервисы по dependency graph, а эти два worker'а друг от друга не
+зависят: они могут пересоздаваться параллельно или в обратном порядке. Между
+началом пересоздания inbox и фактической остановкой старого outbox остаётся
+окно, в котором старый outbox всё ещё работает с `notifications=true` и может
+захватить и отправить наступившую `repeat_10d` / `comeback_3d`.
+
+Порядок задаётся не аргументами одной команды, а **отдельными
+последовательными командами с проверкой между ними**. Сначала замолкает тот,
+кто отправляет.
+
+**Шаг 1.** В `easyweek.env`:
+
+```text
+EASYWEEK_NOTIFICATIONS_ENABLED=false
+```
+
+**Шаг 2.** Пересоздать отправляющий сервис — и только его:
+
+```bash
+cd /opt/altegio_bot
+$COMPOSE up -d --force-recreate altegio-outbox-worker
+```
+
+**Шаг 3.** Read-only проверка изнутри outbox-worker. Это gate, а не
+формальность: пока она не вернула `False`, retention sends не остановлены.
+
+```bash
+cd /opt/altegio_bot
+$COMPOSE exec -T altegio-outbox-worker /app/.venv/bin/python -c 'from altegio_bot.settings import settings; print({"notifications": settings.easyweek_notifications_enabled})'
+```
+
+Если вывод не `{'notifications': False}` — **остановиться здесь**. Не
+пересоздавать inbox-worker, не считать retention sends остановленными и не
+сообщать об этом. Наиболее частая причина — правка попала не в тот файл или
+сервис не был пересоздан (`docker compose restart` не перечитывает `env_file`).
+Исправить и повторить шаги 2–3.
+
+**Шаг 4.** Только после успешной проверки — пересоздать планирующий сервис:
+
+```bash
+cd /opt/altegio_bot
+$COMPOSE up -d --force-recreate altegio-easyweek-inbox-worker
+```
+
+**Шаг 5.** Та же read-only проверка изнутри inbox-worker:
+
+```bash
+cd /opt/altegio_bot
+$COMPOSE exec -T altegio-easyweek-inbox-worker /app/.venv/bin/python -c 'from altegio_bot.settings import settings; print({"notifications": settings.easyweek_notifications_enabled})'
+```
+
+**Что доказывают два `{'notifications': False}` — и что нет.**
+
+Доказано:
+
+- outbox больше не claim'ит и не отправляет **PR-12 retention jobs**
+  `repeat_10d` / `comeback_3d`;
+- inbox больше не планирует новые EasyWeek jobs любого типа.
+
+**НЕ доказано:** что EasyWeek перестал писать клиентам. На send-side мастер-флаг
+— это фенс **только** над retention. Уже созданные EasyWeek
+lifecycle (`record_created` / `record_updated` / `record_canceled`),
+`reminder_24h` / `reminder_2h` и `review_3d` продолжают подчиняться своим
+собственным send-time контрактам и **могут быть отправлены** после этой
+процедуры, если их фенсы (`EASYWEEK_REMINDER_API_GUARD_ENABLED`,
+`EASYWEEK_REVIEW_SEND_ENABLED`) открыты. Altegio эта процедура не касается
+вообще.
+
+Поэтому **это не аварийная остановка всего EasyWeek outbox.** Если нужна именно
+полная остановка всех клиентских отправок — используйте существующий hard-stop
+из §8.2 (остановка общего outbox-воркера, нейтрализация очереди, закрытие
+производителя delivery-retry) и закройте соответствующие feature-specific send
+fences. Второй процедуры hard-stop здесь нет и быть не должно: две расходящиеся
+инструкции аварийной остановки хуже одной.
+
+#### Обратное включение — это НЕ зеркало выключения
+
+Последовательность выше относится **только к выключению**. Универсального
+правила «всегда пересоздавать outbox первым» не существует, и переносить этот
+порядок на включение нельзя.
+
+Дальше два разных случая, и путать их опасно:
+
+- **первый rollout** — retention ещё ни разу не включался, send fence закрыт с
+  деплоя. Это раздел 16.2 целиком, с самого начала;
+- **возобновление после паузы мастер-флага** — retention уже работал, и его
+  выключили только процедурой выше. Это подраздел ниже.
+
+#### Возобновление после паузы мастер-флага
+
+**Опасность, которую закрывает этот подраздел.** Если retention уже был
+включён, то после паузы в `easyweek.env` осталось
+`EASYWEEK_RETENTION_SEND_ENABLED=true`, а `EASYWEEK_RETENTION_CANARY_JOB_ID`
+пуст. Send-gate не хранит никакого «разрешения от preflight»: он проверяет
+мастер-флаг, send fence и canary — и всё. Поэтому в момент, когда
+пересозданный outbox увидит `notifications=true`, **вся накопившаяся за паузу
+due retention-очередь становится claimable сразу**, без preflight и без canary.
+
+`EASYWEEK_RETENTION_ENABLED=false` от этого не защищает: это флаг
+**планирования**. Он не создаёт новых job, но уже созданную очередь не держит.
+Единственный send-side тормоз — `EASYWEEK_RETENTION_SEND_ENABLED`.
+
+Поэтому send fence закрывается **до** восстановления мастер-флага, и
+закрывается доказанно — в уже пересозданном outbox, а не только в файле.
+
+**Шаг A. Доказать исходную паузу.** Обе команды только читают и возвращают
+ненулевой код при несовпадении.
+
+```bash
+cd /opt/altegio_bot
+$COMPOSE exec -T altegio-outbox-worker /app/.venv/bin/python -c 'import sys; from altegio_bot.settings import settings as s; ok = s.easyweek_notifications_enabled is False; print({"notifications": s.easyweek_notifications_enabled, "retention_send": s.easyweek_retention_send_enabled, "gate": "PASS" if ok else "FAIL"}); sys.exit(0 if ok else 1)'
+```
+
+```bash
+cd /opt/altegio_bot
+$COMPOSE exec -T altegio-easyweek-inbox-worker /app/.venv/bin/python -c 'import sys; from altegio_bot.settings import settings as s; ok = s.easyweek_notifications_enabled is False; print({"notifications": s.easyweek_notifications_enabled, "retention": s.easyweek_retention_enabled, "gate": "PASS" if ok else "FAIL"}); sys.exit(0 if ok else 1)'
+```
+
+Записать напечатанные `retention_send` и `retention` — они понадобятся ниже.
+
+Если хотя бы одна команда вернула `FAIL` или ненулевой код, пауза **не
+доказана**. Не объявлять её состоявшейся и не продолжать: сначала выполнить
+процедуру «Выключение мастер-флага» выше целиком, вместе с её проверками.
+
+**Шаг B. Пока мастер-флаг ещё `false`**, закрыть send fence в `easyweek.env`:
+
+```text
+EASYWEEK_RETENTION_SEND_ENABLED=false
+```
+
+`EASYWEEK_RETENTION_ENABLED` при этом **не трогать**. Если retention-planning
+был включён — он остаётся включённым: выключать планирование ради удержания
+отправки бессмысленно (оно её не держит) и означало бы потерю обязательств,
+которые иначе были бы запланированы. Если он был выключен — он остаётся
+выключенным: включение planning это отдельное решение о rollout, а не часть
+возобновления.
+
+**Шаг C. Пересоздать только outbox** — мастер-флаг всё ещё `false`:
+
+```bash
+cd /opt/altegio_bot
+$COMPOSE up -d --force-recreate altegio-outbox-worker
+```
+
+Обязательный gate: оба значения читаются из НОВОГО контейнера.
+
+```bash
+cd /opt/altegio_bot
+$COMPOSE exec -T altegio-outbox-worker /app/.venv/bin/python -c 'import sys; from altegio_bot.settings import settings as s; ok = s.easyweek_notifications_enabled is False and s.easyweek_retention_send_enabled is False; print({"notifications": s.easyweek_notifications_enabled, "retention_send": s.easyweek_retention_send_enabled, "gate": "PASS" if ok else "FAIL"}); sys.exit(0 if ok else 1)'
+```
+
+`PASS` и код `0` — единственное разрешение идти дальше. Любой другой исход —
+`FAIL`, ненулевой код, ошибка команды, неожиданные значения — **запрещает**
+шаг D. Мастер-флаг при этом не трогать: пока он `false`, retention не уходит
+клиентам, и время на разбор есть.
+
+**Шаг D. Только после зелёного gate** восстановить мастер-флаг:
+
+```text
+EASYWEEK_NOTIFICATIONS_ENABLED=true
+```
+
+`EASYWEEK_RETENTION_SEND_ENABLED` остаётся `false`. Пересоздать оба сервиса
+отдельными последовательными командами.
+
+```bash
+cd /opt/altegio_bot
+$COMPOSE up -d --force-recreate altegio-easyweek-inbox-worker
+```
+
+```bash
+cd /opt/altegio_bot
+$COMPOSE exec -T -e EXPECTED_RETENTION_PLANNING=true altegio-easyweek-inbox-worker /app/.venv/bin/python -c 'import os, sys; from altegio_bot.settings import settings as s; expected = os.environ["EXPECTED_RETENTION_PLANNING"] == "true"; ok = s.easyweek_notifications_enabled is True and s.easyweek_retention_enabled is expected; print({"notifications": s.easyweek_notifications_enabled, "retention": s.easyweek_retention_enabled, "gate": "PASS" if ok else "FAIL"}); sys.exit(0 if ok else 1)'
+```
+
+Если на шаге A было напечатано `retention: False`, заменить в команде выше
+`EXPECTED_RETENTION_PLANNING=true` на `EXPECTED_RETENTION_PLANNING=false`:
+проверка обязана подтверждать сохранённое значение, а не желаемое.
+
+```bash
+cd /opt/altegio_bot
+$COMPOSE up -d --force-recreate altegio-outbox-worker
+```
+
+```bash
+cd /opt/altegio_bot
+$COMPOSE exec -T altegio-outbox-worker /app/.venv/bin/python -c 'import sys; from altegio_bot.settings import settings as s; ok = s.easyweek_notifications_enabled is True and s.easyweek_retention_send_enabled is False; print({"notifications": s.easyweek_notifications_enabled, "retention_send": s.easyweek_retention_send_enabled, "gate": "PASS" if ok else "FAIL"}); sys.exit(0 if ok else 1)'
+```
+
+**Шаг E. Мастер-флаг восстановлен, retention-отправки по-прежнему закрыты.**
+
+Что уже работает: capture, domain processing, планирование (включая retention,
+если его planning включён), lifecycle, reminders, review — по своим контрактам.
+Отложенные обязательства `booking-succeeded` восстанавливаются штатно.
+
+Что ещё закрыто: отправка `repeat_10d` / `comeback_3d`.
+
+Дальше — существующий путь раздела 16.2, без повторения первого деплоя.
+Шаги 1–7 (проверка счётчика, APPROVED-шаблоны, seed, включение planning) уже
+выполнены и не повторяются. Продолжать с:
+
+- **шаг 8** — read-only preflight по реальной очереди;
+- **шаги 10–14** — выбор canary job, preflight под canary, открытие fence для
+  canary, ожидание естественного `run_at`, проверка доставки;
+- **шаги 15–17** — закрыть fence обратно, пересоздать outbox, снять canary;
+- **шаг 18** — полный read-only аудит очереди;
+- **шаг 19** — bulk release.
+
+`EASYWEEK_RETENTION_CANARY_JOB_ID` автоматически не очищается. Любое изменение
+ограничения — только при доказанно закрытом send fence, по правилам шагов
+15–17.
+
+**Что эта процедура НЕ делает.** Она удерживает **retention**, а не все
+клиентские сообщения: уже созданные lifecycle, `reminder_24h` / `reminder_2h` и
+`review_3d` продолжают подчиняться своим send-time контрактам и могут уйти сразу
+после шага D. Read-only preflight работающий outbox не закрывает — он ничего не
+пишет и ничего не останавливает. Полная аварийная остановка всех EasyWeek
+отправок — это по-прежнему §8.2.
+
+Что PR-12 **не** добавляет: newsletters, newsletter follow-up, promo, campaign
+runner, общий marketing engine, backfill старых событий и jobs, новый scheduler,
+изменения Altegio-пути и любые mutation-вызовы EasyWeek API.
+
+### 16.2 Rollout
+
+Оба флага деплоятся `false` и включаются по очереди. `docker compose restart`
+не перечитывает `env_file` — только `--force-recreate`.
+
+**1. Deploy с закрытыми gates.** В `easyweek.env`:
+
+```text
+EASYWEEK_RETENTION_ENABLED=false
+EASYWEEK_RETENTION_SEND_ENABLED=false
+```
+
+Проверить effective config в обоих сервисах. Команды только читают.
+
+```bash
+cd /opt/altegio_bot
+$COMPOSE exec -T altegio-easyweek-inbox-worker /app/.venv/bin/python -c 'from altegio_bot.settings import settings; print({"notifications": settings.easyweek_notifications_enabled, "visit_counter": settings.easyweek_visit_counter_enabled, "retention": settings.easyweek_retention_enabled})'
+```
+
+```bash
+cd /opt/altegio_bot
+$COMPOSE exec -T altegio-outbox-worker /app/.venv/bin/python -c 'from altegio_bot.settings import settings; print({"notifications": settings.easyweek_notifications_enabled, "retention_send": settings.easyweek_retention_send_enabled, "retention_canary_job_id": settings.easyweek_retention_canary_job_id})'
+```
+
+Outbox-проверка печатает и мастер-флаг, а не только retention gates: с PR-12
+`EASYWEEK_NOTIFICATIONS_ENABLED` читают **оба** long-running сервиса, и именно
+значение внутри outbox-worker решает, уйдёт ли уже созданная retention job.
+Отчёт только про `retention_send` не отличает «отправка закрыта» от «outbox
+работает со старым окружением, где мастер-флаг ещё был `true`».
+
+**2. Подтвердить, что счётчик PR-11 уже включён и пишет.** Без него репит не
+получит доказанный baseline и не будет создан вовсе. `EASYWEEK_VISIT_COUNTER_ENABLED`
+должен быть `true` до включения планирования; preflight отдельно возвращает
+`config_error` `visit_counter_disabled`, если это не так.
+
+**3. Подтвердить APPROVED Meta templates** для каждого включаемого филиала:
+`kitilash_du_repeat_10d_v1`, `kitilash_du_comeback_3d_v1` и соответствующие
+`ra`-варианты. Не объявлять их APPROVED без проверки в Meta — отсутствующий или
+неодобренный шаблон блокирует rollout.
+
+**4. Seed по существующему contract** (идемпотентный, ничего не удаляет):
+
+```bash
+cd /opt/altegio_bot
+$COMPOSE exec -T altegio-outbox-worker /app/.venv/bin/python -m altegio_bot.scripts.seed_easyweek_templates
+```
+
+**5. Включить только planning.** `EASYWEEK_RETENTION_ENABLED=true`, затем:
+
+```bash
+cd /opt/altegio_bot
+$COMPOSE up -d --force-recreate altegio-easyweek-inbox-worker
+```
+
+**6. Дождаться настоящего кандидата.** Для `repeat_10d` — новая controlled
+запись разрешённой категории с одной услугой, доведённая до реального
+`booking-succeeded`. Для `comeback_3d` — реальная отмена такой записи.
+Байт-идентичный Resend старого события доказательством не является: он
+дедуплицируется по замыслу и проверяет дедупликацию, а не новый путь.
+
+**7. Проверить очередь** — ничего не отправлено. Команда только читает.
+
+```bash
+cd /opt/altegio_bot
+$COMPOSE exec -T postgres sh -lc 'psql -tAX -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT id, company_id, job_type, status, attempts, run_at FROM message_jobs WHERE provider = '"'"'easyweek'"'"' AND job_type IN ('"'"'repeat_10d'"'"','"'"'comeback_3d'"'"') ORDER BY id DESC LIMIT 5"'
+```
+
+Требуется `status=queued`, `attempts=0`, `run_at` = начало записи плюс десять
+суток (repeat) либо момент отмены плюс трое суток (comeback), и ноль строк в
+`outbox_messages` для этих job.
+
+**8. Read-only preflight** при всё ещё закрытом fence — в **свежем one-off
+container**, а не внутри работающего outbox worker:
+
+```bash
+cd /opt/altegio_bot
+$COMPOSE run --rm --no-deps --entrypoint /app/.venv/bin/python altegio-outbox-worker -m altegio_bot.scripts.easyweek_retention_preflight
+```
+
+`docker compose exec -T altegio-outbox-worker ... easyweek_retention_preflight`
+здесь **запрещён**. Тот контейнер создан на шаге 1, когда
+`EASYWEEK_RETENTION_ENABLED` был `false`, и держит именно то окружение: шаг 5
+менял `easyweek.env` и пересоздавал только inbox worker. Preflight внутри него
+увидел бы `easyweek_retention_enabled=False`, вернул бы `config_error`
+`retention_planning_disabled`, `ready=false` и exit code 1 — не потому, что
+rollout плох, а потому, что процесс читает устаревшее окружение. Не обходите
+это через `exec -e` и не «чините» пересозданием outbox worker: он обязан
+оставаться за закрытым fence до шага 10.
+
+Отчёт печатает `read_only=true` и `send_authorized=false`, содержит только
+счётчики, внутренние id и стабильные reason codes: ни телефона, ни имени, ни
+booking UUID, ни числа визитов, ни ссылок, ни raw payload.
+
+**9. Открывать fence только при `ready=true` и exit code 0.** Пустая очередь
+(`candidate_count=0`), `truncated=true`, любой blocked кандидат или
+`config_error` — это STOP. Пустое множество кандидатов разрешением на rollout не
+является: проверять было нечего.
+
+**10. Выбрать canary job и включить ограничение.** Массовая отправка не
+контролируется обещанием «в очереди сейчас одна job»: очередь может вырасти
+между preflight и открытием fence. Ограничение техническое — в `easyweek.env`:
+
+```text
+EASYWEEK_RETENTION_CANARY_JOB_ID=<message_jobs.id одной выбранной job>
+```
+
+Пока значение задано, worker имеет право claim'ить и отправлять **только** эту
+job. Остальные EasyWeek retention jobs остаются `queued` с прежними `run_at`,
+`attempts=0` и `locked_at=NULL`. Altegio и другие типы EasyWeek jobs
+ограничением не затронуты. Невалидное значение — fail-closed: не отправляется
+ни одна retention job, а preflight возвращает `retention_canary_job_id_invalid`.
+
+**11. Повторить preflight при всё ещё закрытом fence.** С заданным canary отчёт
+аудирует ровно эту job — тем же правилом, каким её ограничивает worker.
+Требуется `ready=true`, `candidate_count=1` и `canary_job_id`, равный
+выбранному. `retention_canary_job_not_found` означает, что id указывает не на
+открытую EasyWeek retention job — исправить id, а не открывать fence.
+
+```bash
+cd /opt/altegio_bot
+$COMPOSE run --rm --no-deps --entrypoint /app/.venv/bin/python altegio-outbox-worker -m altegio_bot.scripts.easyweek_retention_preflight
+```
+
+**12. Открыть send fence для canary.** `EASYWEEK_RETENTION_SEND_ENABLED=true`
+при всё ещё заданном `EASYWEEK_RETENTION_CANARY_JOB_ID`, затем пересоздать
+**только** outbox worker:
+
+```bash
+cd /opt/altegio_bot
+$COMPOSE up -d --force-recreate altegio-outbox-worker
+```
+
+Это первое пересоздание outbox worker с шага 1: до зелёного preflight он
+намеренно продолжал работать со старым окружением и закрытым fence.
+
+**13. Дождаться естественного `run_at`** выбранной job — не менять его
+SQL-командой, не редактировать payload и не подделывать событие.
+
+**14. Проверить цепочку доставки** — `message_jobs` (`status=done`) → одна
+строка `outbox_messages` (`sent`) → Meta `delivered`/`read` → зеркало Chatwoot.
+Статус `sent` финальным доказательством не считается.
+
+**15. Закрыть send fence обратно.** `EASYWEEK_RETENTION_SEND_ENABLED=false`.
+
+**16. Пересоздать outbox worker**, чтобы закрытие вступило в силу:
+
+```bash
+cd /opt/altegio_bot
+$COMPOSE up -d --force-recreate altegio-outbox-worker
+```
+
+**17. Снять canary restriction.** `EASYWEEK_RETENTION_CANARY_JOB_ID=` (пусто).
+
+**18. Повторить read-only preflight по всей очереди** — снова в свежем one-off
+контейнере:
+
+```bash
+cd /opt/altegio_bot
+$COMPOSE run --rm --no-deps --entrypoint /app/.venv/bin/python altegio-outbox-worker -m altegio_bot.scripts.easyweek_retention_preflight
+```
+
+Теперь без ограничения он аудирует каждую открытую retention job, и
+`ready=true` означает, что вся очередь пригодна к отправке. В отчёте
+`canary_job_id` должен быть `None` — иначе ограничение не снято. Если отчёт
+показывает `deadline_expired`, оператор **ждёт штатный bounded cleanup cycle**
+outbox worker (он отменяет только реально просроченные EasyWeek retention jobs,
+ничего не отправляя) и повторяет preflight. Открывать fence при
+`deadline_expired` и править строки SQL-командами запрещено.
+
+**19. Открыть bulk fence.** `EASYWEEK_RETENTION_SEND_ENABLED=true` при пустом
+canary, затем пересоздать **только** outbox worker:
+
+```bash
+cd /opt/altegio_bot
+$COMPOSE up -d --force-recreate altegio-outbox-worker
+```
+
+**20. Мониторинг.** Проверить логи обоих worker на отсутствие traceback, а также
+имени, телефона, email, booking UUID и token. Проверить, что число
+`repeat_10d` / `comeback_3d` job для EasyWeek растёт не быстрее числа реальных
+`booking-succeeded` и отмен.
+
+**21. Старые processed events автоматически не replay'ятся.** Включение флагов
+не создаёт job по уже обработанным событиям, и делать это вручную нельзя:
+backfill исторических маркетинговых сообщений вне scope PR-12. Единственное
+исключение уже встроено — `booking-succeeded`, помеченный как отложенное
+обязательство при закрытом мастер-флаге уведомлений, пересматривается
+автоматически, когда фенс открывается. Отметки раздельные: review и repeat
+восстанавливаются независимо, и функция, выключенная в момент события, задним
+числом сообщение не получает.
+
+### 16.3 Rollback
+
+Порядок обратный включению: **сначала закрывается отправка**.
+
+1. `EASYWEEK_RETENTION_SEND_ENABLED=false`.
+2. `$COMPOSE up -d --force-recreate altegio-outbox-worker`.
+   При активном canary достаточно закрыть fence: чистить
+   `EASYWEEK_RETENTION_CANARY_JOB_ID` для остановки не требуется, он лишь сужает
+   отправку, а не открывает её.
+3. Проверить effective `retention_send=False` командой из шага 1 rollout.
+4. Убедиться, что retention jobs больше не claim'ятся: `status` остаётся
+   `queued`, `attempts` не растёт.
+5. При необходимости `EASYWEEK_RETENTION_ENABLED=false`.
+6. `$COMPOSE up -d --force-recreate altegio-easyweek-inbox-worker`.
+7. `EASYWEEK_NOTIFICATIONS_ENABLED` **не** выключать — это остановило бы
+   планирование lifecycle, reminders и review. Если его всё же нужно закрыть
+   (остановка retention sends и нового EasyWeek planning, а не откат PR-12),
+   выполнять пять шагов «Выключение мастер-флага» из §16.1 — отдельными
+   командами, с проверкой внутри outbox-worker между ними. Одного inbox-worker
+   недостаточно, а одна Compose-команда с двумя сервисами порядка не даёт.
+   Эта процедура **не** останавливает уже созданные lifecycle/reminder/review
+   jobs: для полной остановки всех EasyWeek отправок — hard-stop из §8.2.
+8. `EASYWEEK_VISIT_COUNTER_ENABLED` **не** выключать и доказанные
+   `visits_total` **не** удалять: они описывают состоявшиеся визиты, и получить
+   их повторно неоткуда.
+9. Ничего не удалять и не выполнять массовый `DELETE`/`UPDATE` по job: ни
+   events, ни jobs, ни Outbox, ни templates, ни senders.
+10. Оставшаяся очередь проверяется только read-only запросом из шага 7 rollout и
+    повторным preflight перед следующим включением — снова через one-off
+    `run --rm --no-deps` из шага 8.
+
+Что продолжает работать после rollback: capture всех пяти триггеров, domain
+processing EasyWeek, lifecycle notifications, PR-8 reminders, PR-9/PR-10 review,
+PR-11 счётчик и весь Altegio path, включая его собственные `repeat_10d` и
+`comeback_3d`.
+
+### 16.4 Отказы retention на send-time
+
+После открытия send fence точная причина локального отказа записывается в
+`job.last_error` с префиксом `EasyWeek retention refused:`. Действия оператора:
+
+| Код | Действие оператора |
+|---|---|
+| `retention_job_incomplete` | Проверить целостность job и связанных domain-строк; не исправлять payload вручную. |
+| `retention_proof_version_unknown` | Job запланирована другим контрактом; не редактировать её, создавать следующую только из нового доказанного события. |
+| `retention_booking_uuid_unproven` | Проверить сохранённое доказательство identity записи; не синтезировать UUID. |
+| `retention_booking_uuid_mismatch` | Job указывает на чужую запись — расследовать, не «чинить» переуказанием record_id. |
+| `retention_baseline_unproven` | Проверить, что счётчик PR-11 был включён в момент планирования; не подставлять baseline вручную. |
+| `retention_counter_missing` | Клиент без доказанного `visits_total`: включить счётчик и дождаться нового события. |
+| `retention_counter_regressed` | Счётчик уехал назад — расследовать источник; не выравнивать значение вручную. |
+| `retention_counter_unstamped` | Значение без timestamp: расследовать, как строка получила счётчик в обход PR-11. |
+| `retention_client_returned` | Штатное подавление: клиент уже вернулся. Действий не требуется. |
+| `retention_future_booking` | Штатное подавление: у клиента есть будущая активная запись. Действий не требуется. |
+| `retention_service_unproven` | Запись без ровно одной пригодной услуги либо payload без замороженной identity услуги; repeat для неё не отправляется. |
+| `retention_service_changed` | Услуга записи изменилась после доказанного визита. Подавление корректно; не редактировать payload. |
+| `retention_source_not_finished` | Исходная запись перестала быть завершённой — расследовать, не отправлять. |
+| `retention_source_canceled_state_lost` | Отменённая запись снова активна: comeback подавлен корректно. |
+| `retention_source_start_mismatch` | Запись перенесена после того, как repeat был заработан. Действий не требуется. |
+| `retention_cancelled_at_unproven` | В payload нет момента отмены; не восстанавливать его вручную. |
+| `retention_comeback_already_sent` | Клиент уже получил comeback в установленном окне. Действий не требуется. |
+| `retention_client_unsubscribed` | Клиент отписан. Действий не требуется. |
+| `retention_booking_page_unproven` | Проверить `booking_page_url` филиала и `EASYWEEK_BOOKING_PAGE_ALLOWED_HOSTS`, пересоздать outbox worker, повторить preflight. |
+
+### 16.5 Hold codes: job не отменена, а придержана
+
+Эти коды пишутся в лог, но **не** отменяют job: строка остаётся `queued` с
+прежними `run_at` и payload, `attempts` не растёт, `locked_at` очищается, Meta
+не вызывается. Это пауза, а не отказ.
+
+| Код | Что означает |
+|---|---|
+| `retention_notifications_disabled` | Закрыт мастер-флаг `EASYWEEK_NOTIFICATIONS_ENABLED`. Retention не отправляется, даже если свой fence открыт. |
+| `retention_send_fence_closed` | Закрыт `EASYWEEK_RETENTION_SEND_ENABLED`. Штатное состояние до шага 12. |
+| `retention_canary_restricted` | Задан `EASYWEEK_RETENTION_CANARY_JOB_ID`, и это другая job. Штатное состояние во время canary. |
+| `retention_canary_job_id_invalid` | Значение canary нечитаемо. Fail-closed: не отправляется ни одна retention job. Исправить значение и пересоздать outbox worker. |
+
+### 16.6 Просроченные retention jobs и bounded cleanup
+
+Job, чей deadline истёк за закрытым fence, не может быть ни отправлена, ни
+claim'ена — а preflight обязан считать её blocked. Без отдельного пути это
+deadlock: fence нельзя открыть никогда.
+
+Outbox worker выполняет для этого узкий периодический проход. Он:
+
+- работает и при закрытом retention send fence;
+- использует ту же единственную deadline-функцию, что runtime и preflight;
+- берёт ограниченный batch под `FOR UPDATE SKIP LOCKED`;
+- переводит в `canceled` **только** реально просроченные EasyWeek `repeat_10d` /
+  `comeback_3d` со стабильной причиной `retention_deadline_expired`;
+- не создаёт `OutboxMessage`, не вызывает Meta и не увеличивает `attempts`;
+- не трогает свежие retention jobs, другие типы EasyWeek jobs и любые Altegio
+  jobs.
+
+Действие оператора при `deadline_expired` в отчёте: **дождаться очередного
+цикла cleanup и повторить preflight**. Открывать fence «чтобы просроченные
+ушли» и править строки SQL-командами запрещено — первое отправит сообщения о
+визитах двухнедельной давности, второе обходит единственную проверку, которая
+эти сообщения останавливает.

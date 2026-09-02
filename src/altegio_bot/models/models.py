@@ -134,6 +134,12 @@ class EasyWeekEvent(Base):
             "review_deferred_at",
             postgresql_where=text("review_deferred_at IS NOT NULL"),
         ),
+        # PR-12. Its own index for its own scan, matching its own predicate.
+        Index(
+            "ix_easyweek_events_retention_deferred",
+            "retention_deferred_at",
+            postgresql_where=text("retention_deferred_at IS NOT NULL"),
+        ),
     )
 
     id: Mapped[int] = mapped_column(
@@ -194,6 +200,31 @@ class EasyWeekEvent(Base):
     # строки за собой. Отдельная колонка под retry не заводится: у обязательства
     # ровно одно расписание, и второе поле могло бы с ним разойтись.
     review_deferred_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+    # PR-12. Тот же механизм для СВОЕГО обязательства — `repeat_10d`, — и
+    # намеренно отдельная колонка, а не переиспользование review-отметки.
+    #
+    # Одна колонка на два обязательства выглядела экономией, но означала «эта
+    # доставка что-то кому-то должна» без указания ЧТО. Восстановление тогда
+    # вынуждено спрашивать текущие флаги, а не то, что было заработано в момент
+    # события, и это даёт сразу два дефекта: выключенная в момент события
+    # функция может получить сообщение задним числом, а действительно
+    # заработанное — потеряться, когда чужой планировщик первым очистит общую
+    # отметку.
+    #
+    # Тип обязательства обязан быть durable, потому что durable — это
+    # единственное, что переживает изменение флагов между событием и
+    # восстановлением. Каждая отметка ставится только своим включённым в тот
+    # момент планировщиком, снимается или сдвигается только своим проходом
+    # восстановления, и recoverable-ошибка одного обязательства не трогает
+    # второе: у них разные транзакции.
+    #
+    # NULL — обязательства нет. Одно `booking-succeeded` может нести обе отметки
+    # одновременно; это нормальное состояние, а не конфликт.
+    retention_deferred_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
         nullable=True,
     )

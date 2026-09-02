@@ -68,14 +68,24 @@ from ..easyweek_normalizer import (
     normalize_succeeded_visit_event,
 )
 from ..easyweek_policy import (
+    COMEBACK_3D,
     EASYWEEK_LIFECYCLE_JOB_TYPES,
     EASYWEEK_REMINDER_JOB_TYPES,
     RECORD_CANCELED,
     RECORD_CREATED,
     RECORD_UPDATED,
+    REPEAT_10D,
     REVIEW_3D,
 )
 from ..easyweek_reminders import plan_reminders, reminder_job_payload
+from ..easyweek_retention import (
+    RETENTION_BASELINE_UNPROVEN,
+    RETENTION_SERVICE_UNPROVEN,
+    comeback_job_payload,
+    plan_comeback,
+    plan_repeat,
+    repeat_job_payload,
+)
 from ..easyweek_review import (
     google_review_url_for_company,
     plan_review,
@@ -226,6 +236,19 @@ def visit_counter_enabled() -> bool:
     return bool(settings.easyweek_visit_counter_enabled)
 
 
+def retention_planning_enabled() -> bool:
+    """THE effective gate for PR-12 planning — one definition, same shape as PR-9.
+
+    ``easyweek_retention_enabled`` alone is not the answer, for exactly the
+    reason the review gate documents above: a repeat or comeback invitation is a
+    customer notification, so the master switch governs it too. Asking the
+    narrower question in the claim and the wider one in the planner is how a
+    `booking-succeeded` gets claimed, produces nothing, and reaches `processed`
+    with the message it owed destroyed.
+    """
+    return bool(settings.easyweek_notifications_enabled) and bool(settings.easyweek_retention_enabled)
+
+
 def review_obligation_deferred() -> bool:
     """Does a `booking-succeeded` owe a review that cannot be considered now?
 
@@ -238,6 +261,15 @@ def review_obligation_deferred() -> bool:
     from it would queue messages nobody asked for the moment the fence opens.
     """
     return bool(settings.easyweek_reviews_enabled) and not review_planning_enabled()
+
+
+def retention_obligation_deferred() -> bool:
+    """Same question as :func:`review_obligation_deferred`, for the repeat.
+
+    Retention switched OFF is likewise a decision rather than a pause, so it
+    owes nothing. Only "wanted, but the master fence is shut" is an obligation.
+    """
+    return bool(settings.easyweek_retention_enabled) and not retention_planning_enabled()
 
 
 def succeeded_consumer_enabled() -> bool:
@@ -256,7 +288,7 @@ def succeeded_consumer_enabled() -> bool:
     Asking two separate questions in the claim and the branch is exactly how the
     second failure happens, so both ask this one.
     """
-    return review_planning_enabled() or visit_counter_enabled()
+    return review_planning_enabled() or visit_counter_enabled() or retention_planning_enabled()
 
 
 # Statuses that are NOT terminal: a row in one of these still owes the domain
@@ -1266,6 +1298,422 @@ async def plan_review_job(
     )
 
 
+async def plan_repeat_job(
+    session: AsyncSession,
+    *,
+    event: EasyWeekEvent,
+    registry: Any,
+    expected_customer_id: int | None = None,
+) -> None:
+    """PR-12: earn at most one ``repeat_10d`` from a proven succeeded delivery.
+
+    Runs inside the caller's transaction and AFTER :func:`record_visit_counter`,
+    so the counter this repeat is measured against is already written on the row
+    it reads. That ordering is the whole reason the two are not independent: the
+    baseline frozen here has to be the total EasyWeek stated for THIS visit, not
+    the one from the visit before it.
+
+    ``booking-succeeded`` is the only accepted evidence. Not ``booking-created``,
+    not ``booking-updated``, and never "the start time is in the past" — EasyWeek
+    has no attendance field, and a no-show looks exactly like a completed visit
+    once the hour has gone by.
+
+    Everything is a proof, and a failed proof is a silent no-op rather than an
+    error: a succeeded delivery we cannot turn into a repeat is still a perfectly
+    valid succeeded delivery that may owe a review and has already moved a
+    counter. What must never happen is an invitation sent to the wrong person,
+    for the wrong branch, or measured against a counter nobody proved.
+
+    Deliberately NOT ``plan_jobs_for_record_event``: the Altegio planner creates
+    its repeat from a create/update event, gates it on a live Altegio API visit
+    count and renders an Altegio-keyed ``BOOKING_LINKS`` entry. EasyWeek has none
+    of the three.
+
+    ``expected_customer_id`` is the external customer the ORIGINAL delivery
+    named; it is passed only by the deferred-obligation recovery, for the same
+    reason the review planner takes it — an arbitrary number of
+    ``booking-updated`` deliveries may have reassigned the booking while the
+    obligation waited.
+    """
+    if not retention_planning_enabled():
+        # Same gate the claim used, so a succeeded event is never claimed by one
+        # rule and then discarded by a stricter one.
+        return
+
+    try:
+        visit = normalize_succeeded_visit_event(
+            event_hint=event.event_hint,
+            payload=event.payload,
+            body_truncated=bool(event.body_truncated),
+            location_registry=registry.locations if registry.ready else {},
+        )
+    except NormalizationError as exc:
+        # No usable `visits_total`, no `customer_id`, or an identity this
+        # deployment does not own. Fail CLOSED and locally: a repeat decides
+        # whether to message a real person on the strength of a visit count, so
+        # a delivery that cannot prove one earns nothing. Raising instead would
+        # fail the whole event and destroy the review and counter beside it.
+        logger.info(
+            "easyweek repeat skipped event=%s reason=%s",
+            event.id,
+            exc.code,
+        )
+        return
+
+    record = (
+        (
+            await session.execute(
+                select(Record)
+                .where(Record.provider == PROVIDER)
+                .where(Record.easyweek_booking_uuid == visit.booking_uuid)
+                .with_for_update()
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if record is None:
+        # No `booking_uuid` in the line. The UUID identifies one customer's
+        # appointment, production logs are shipped and retained, and the event id
+        # already leads an operator to the row that holds it.
+        logger.info(
+            "easyweek repeat skipped event=%s reason=no_record",
+            event.id,
+        )
+        return
+    if record.company_id != visit.company_id:
+        # The booking UUID resolves to a record in another branch. Nothing here
+        # is safe to use: not the template, not the sender, not the link.
+        logger.warning(
+            "easyweek repeat refused event=%s record_id=%s reason=company_mismatch",
+            event.id,
+            record.id,
+        )
+        return
+    if record.altegio_record_id is not None and record.altegio_record_id != visit.booking_id:
+        logger.warning(
+            "easyweek repeat refused event=%s record_id=%s reason=booking_id_mismatch",
+            event.id,
+            record.id,
+        )
+        return
+    if bool(record.is_deleted) or record.starts_at is None:
+        return
+
+    client = None
+    if record.client_id is not None:
+        client = (
+            (
+                await session.execute(
+                    select(Client)
+                    .where(Client.id == record.client_id)
+                    .where(Client.provider == PROVIDER)
+                    .where(Client.company_id == record.company_id)
+                )
+            )
+            .scalars()
+            .first()
+        )
+    if client is None:
+        logger.info("easyweek repeat skipped event=%s record_id=%s reason=no_client", event.id, record.id)
+        return
+    if int(client.altegio_client_id) != visit.customer_id:
+        # The Record points at a client this delivery does not name. Never
+        # resolved by phone or name — that is how one person's invitation lands
+        # on another person's number.
+        logger.warning(
+            "easyweek repeat refused event=%s record_id=%s client_id=%s reason=client_mismatch",
+            event.id,
+            record.id,
+            client.id,
+        )
+        return
+    if expected_customer_id is not None and int(client.altegio_client_id) != expected_customer_id:
+        logger.warning(
+            "easyweek repeat refused event=%s record_id=%s client_id=%s reason=client_reassigned",
+            event.id,
+            record.id,
+            client.id,
+        )
+        return
+    if bool(getattr(client, "wa_opted_out", False)):
+        # Marketing, and this customer said no. Nothing else needs checking.
+        return
+
+    eligibility = evaluate_service_category(
+        record_raw=record.raw,
+        allowed_categories_raw=settings.easyweek_allowed_service_categories,
+    )
+    if not eligibility.allowed:
+        if eligibility.recoverable_configuration:
+            # Same contract as every other planner: a broken allowlist is not a
+            # decision. Roll back so the event stays claimable once it is fixed.
+            raise RecoverableCategoryConfigurationError(eligibility.reason)
+        logger.info(
+            "easyweek repeat suppressed event=%s record_id=%s reason=%s",
+            event.id,
+            record.id,
+            eligibility.reason,
+        )
+        return
+    if services_count_from_record_raw(record.raw) != 1:
+        # `repeat_10d` names ONE service in its message. An ambiguous booking has
+        # no single service to name, and picking one would invite the customer
+        # back for something they did not book.
+        logger.info(
+            "easyweek repeat suppressed event=%s record_id=%s reason=services_count_unproven",
+            event.id,
+            record.id,
+        )
+        return
+
+    # The service IDENTITY this repeat is about, frozen now and compared before
+    # every send. The payload snapshot says "one service"; this reads the row
+    # that service actually is, so a `booking-updated` swapping it during the ten
+    # days cannot deliver an invitation for a treatment the customer never had.
+    #
+    # Only the id is frozen — never the title. A title is display text the salon
+    # may legitimately rewrite, and the customer-facing name is read from the
+    # current row at send time, after the identity has matched.
+    services = list(
+        (
+            await session.execute(
+                select(RecordService)
+                .where(RecordService.record_id == record.id)
+                .order_by(RecordService.service_id.asc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if len(services) != 1:
+        logger.info(
+            "easyweek repeat suppressed event=%s record_id=%s reason=%s",
+            event.id,
+            record.id,
+            RETENTION_SERVICE_UNPROVEN,
+        )
+        return
+    source_service_id = services[0].service_id
+
+    # THE PR-11 dependency, stated as an equality rather than a presence check.
+    # The stored counter must be exactly the total this delivery proved: a row
+    # still holding an older number means the counter consumer did not accept
+    # this visit — it was switched off, or the snapshot was refused as stale —
+    # and a baseline that predates the visit would make the send-time comparison
+    # answer a question about the wrong appointment.
+    if client.easyweek_visits_total != visit.visits_total or client.easyweek_visits_total_updated_at is None:
+        logger.info(
+            "easyweek repeat skipped event=%s record_id=%s client_id=%s reason=%s",
+            event.id,
+            record.id,
+            client.id,
+            RETENTION_BASELINE_UNPROVEN,
+        )
+        return
+
+    planned = plan_repeat(
+        booking_uuid=visit.booking_uuid,
+        starts_at=record.starts_at,
+        now=utcnow(),
+        visits_baseline=int(client.easyweek_visits_total),
+        service_id=source_service_id,
+        is_deleted=bool(record.is_deleted),
+    )
+    if planned is None:
+        # A moment already ten days gone. There is no repeat to send, and
+        # inventing a late one is a backfill in disguise.
+        logger.info("easyweek repeat skipped event=%s record_id=%s reason=unplannable", event.id, record.id)
+        return
+
+    stmt = pg_insert(MessageJob).values(
+        provider=PROVIDER,
+        company_id=record.company_id,
+        record_id=record.id,
+        client_id=client.id,
+        job_type=REPEAT_10D,
+        run_at=planned.run_at,
+        status="queued",
+        dedupe_key=planned.dedupe_key,
+        payload=repeat_job_payload(
+            booking_uuid=visit.booking_uuid,
+            company_id=record.company_id,
+            starts_at=record.starts_at,
+            visits_baseline=planned.visits_baseline,
+            service_id=source_service_id,
+            source_event_id=event.id,
+            source_payload_hash=event.payload_hash,
+        ),
+    )
+    # One repeat per booking. A Resend, a second succeeded delivery with a
+    # different payload hash, a concurrent worker and a restart all describe the
+    # same earned message.
+    stmt = stmt.on_conflict_do_nothing(index_elements=[MessageJob.dedupe_key])
+    await session.execute(stmt)
+    logger.info(
+        "easyweek repeat planned event=%s record_id=%s company_id=%s",
+        event.id,
+        record.id,
+        record.company_id,
+    )
+
+
+async def sync_comeback_job(
+    session: AsyncSession,
+    *,
+    record: Record,
+    booking: NormalizedBooking,
+    client: Client | None,
+    event_id: int | None,
+    payload_hash: str | None,
+    cancelled_at: datetime | None,
+) -> None:
+    """PR-12: earn at most one ``comeback_3d`` from a proven cancellation.
+
+    Runs inside the caller's transaction, under the Record lock the domain write
+    already holds, so the invitation and the cancellation that justified it
+    commit together.
+
+    **Withdrawal comes first, and is unconditional**, exactly as it is for
+    reminders: a booking that is no longer cancelled owes no comeback, and
+    leaving a queued one would invite a customer back to an appointment they
+    still have. Only CREATION is gated.
+
+    Creation requires a proven cancellation delivery — not a local guess that a
+    booking looks gone. The moment the three days are counted from is
+    ``cancelled_at``, the instant this delivery was captured, and it is frozen
+    into the payload rather than recomputed later.
+
+    With the master notification fence shut nothing is planned and nothing is
+    deferred, which is the established lifecycle contract: the operator has said
+    no customer messages, and a cancellation is not evidence that survives the
+    way ``booking-succeeded`` is. `booking-succeeded` gets a durable obligation
+    because it also drives a counter that must commit regardless; a cancellation
+    has no such second consumer, and every other lifecycle notification behaves
+    exactly this way already.
+    """
+    if record.id is None:  # pragma: no cover - defensive
+        return
+
+    if not bool(record.is_deleted):
+        # The source booking is active again — restored, or never cancelled at
+        # all. Withdraw anything queued for it before considering anything else.
+        await session.execute(
+            update(MessageJob)
+            .where(MessageJob.provider == PROVIDER)
+            .where(MessageJob.record_id == record.id)
+            .where(MessageJob.job_type == COMEBACK_3D)
+            .where(MessageJob.status == "queued")
+            .values(
+                status="canceled",
+                locked_at=None,
+                last_error="EasyWeek comeback withdrawn: source booking is active again",
+            )
+        )
+        return
+
+    if booking.action != DELETE:
+        # A later delivery about an already-cancelled booking is not a second
+        # cancellation. Only the delivery that PROVED the cancellation earns
+        # this message, so nothing is planned from anything else.
+        return
+    if not retention_planning_enabled():
+        return
+
+    eligibility = evaluate_service_category(
+        record_raw=record.raw,
+        allowed_categories_raw=settings.easyweek_allowed_service_categories,
+    )
+    if not eligibility.allowed:
+        if eligibility.recoverable_configuration:
+            raise RecoverableCategoryConfigurationError(eligibility.reason)
+        logger.info(
+            "easyweek comeback suppressed event=%s record_id=%s reason=%s",
+            event_id,
+            record.id,
+            eligibility.reason,
+        )
+        return
+
+    resolved = client
+    if resolved is None and record.client_id is not None:
+        # Provider AND company are part of the lookup, not checked afterwards:
+        # the pair is the identity, and a numeric id alone is shared with
+        # Altegio.
+        resolved = (
+            (
+                await session.execute(
+                    select(Client)
+                    .where(Client.id == record.client_id)
+                    .where(Client.provider == PROVIDER)
+                    .where(Client.company_id == record.company_id)
+                )
+            )
+            .scalars()
+            .first()
+        )
+    if resolved is None:
+        logger.info("easyweek comeback skipped event=%s record_id=%s reason=no_client", event_id, record.id)
+        return
+    if bool(getattr(resolved, "wa_opted_out", False)):
+        return
+
+    # Fail CLOSED on the baseline, and never substitute a zero. A missing count
+    # does not mean "new customer"; it means we cannot answer the one question
+    # this message depends on — has this person already come back? Treating it
+    # as zero would make every unproven client look brand new and message them.
+    if resolved.easyweek_visits_total is None or resolved.easyweek_visits_total_updated_at is None:
+        logger.warning(
+            "easyweek comeback refused event=%s record_id=%s client_id=%s reason=%s",
+            event_id,
+            record.id,
+            resolved.id,
+            RETENTION_BASELINE_UNPROVEN,
+        )
+        return
+
+    planned = plan_comeback(
+        booking_uuid=booking.booking_uuid,
+        cancelled_at=cancelled_at,
+        now=utcnow(),
+        visits_baseline=int(resolved.easyweek_visits_total),
+    )
+    if planned is None:
+        logger.info("easyweek comeback skipped event=%s record_id=%s reason=unplannable", event_id, record.id)
+        return
+
+    stmt = pg_insert(MessageJob).values(
+        provider=PROVIDER,
+        company_id=record.company_id,
+        record_id=record.id,
+        client_id=resolved.id,
+        job_type=COMEBACK_3D,
+        run_at=planned.run_at,
+        status="queued",
+        dedupe_key=planned.dedupe_key,
+        payload=comeback_job_payload(
+            booking_uuid=booking.booking_uuid,
+            company_id=record.company_id,
+            cancelled_at=cancelled_at,
+            visits_baseline=planned.visits_baseline,
+            source_event_id=event_id,
+            source_payload_hash=payload_hash,
+        ),
+    )
+    # One comeback per cancelled booking. A Resend of the cancellation, a second
+    # cancel delivery captured at a different moment, and a concurrent worker all
+    # describe the same fact — and the key deliberately does not carry the
+    # cancellation instant, so two of them cannot become two messages.
+    stmt = stmt.on_conflict_do_nothing(index_elements=[MessageJob.dedupe_key])
+    await session.execute(stmt)
+    logger.info(
+        "easyweek comeback planned event=%s record_id=%s company_id=%s",
+        event_id,
+        record.id,
+        record.company_id,
+    )
+
+
 async def sync_reminder_jobs(
     session: AsyncSession,
     *,
@@ -1400,6 +1848,7 @@ async def apply_booking(
     event_hint: str,
     payload_hash: str | None,
     event_id: int | None = None,
+    event_received_at: datetime | None = None,
 ) -> Record | None:
     """Apply one validated delivery. Returns None when it was a no-op.
 
@@ -1410,6 +1859,12 @@ async def apply_booking(
        as ``processed``;
     2. cancel guard — a post-cancel delivery changes nothing at all;
     3. domain writes, service snapshot, lifecycle job.
+
+    ``event_received_at`` is the instant this delivery was CAPTURED, and it is
+    the only stable cancellation moment available: EasyWeek sends no cancelled-at
+    field, and ``Record.last_change_at`` is rewritten by every delivery that
+    touches the row. It is threaded through rather than read inside the comeback
+    planner so the planner stays a pure function of what it is handed.
     """
     record = await resolve_record(session, booking)
 
@@ -1438,6 +1893,19 @@ async def apply_booking(
     # reminder queue that disagreed with the appointment it belongs to would be
     # the whole failure mode.
     await sync_reminder_jobs(session, record=record, booking=booking, client=client)
+    # PR-12, after the reminders and under the same lock, for the same reason:
+    # the comeback is decided from the Record we just wrote, and a withdrawal
+    # that did not commit with the booking state that caused it would leave an
+    # invitation pointed at an appointment the customer still has.
+    await sync_comeback_job(
+        session,
+        record=record,
+        booking=booking,
+        client=client,
+        event_id=event_id,
+        payload_hash=payload_hash,
+        cancelled_at=event_received_at,
+    )
     return record
 
 
@@ -1463,9 +1931,10 @@ async def process_claimed_event(session: AsyncSession, event: EasyWeekEvent) -> 
     if booking is None:
         # booking-succeeded. Terminal for the lifecycle — it never rewrites the
         # name, phone, price, service, time or client link the lifecycle events
-        # proved — but two consumers read it as evidence that a visit finished:
-        # PR-9/PR-10 may earn exactly one review request from it, and PR-11
-        # stores the `visits_total` snapshot it carries.
+        # proved — but three consumers read it as evidence that a visit finished:
+        # PR-9/PR-10 may earn exactly one review request from it, PR-11 stores
+        # the `visits_total` snapshot it carries, and PR-12 may earn exactly one
+        # `repeat_10d` measured against that snapshot.
         if not succeeded_consumer_enabled():
             # The claim gate said yes and the flags changed underneath us.
             # Terminalizing now would destroy the only evidence this visit
@@ -1476,21 +1945,38 @@ async def process_claimed_event(session: AsyncSession, event: EasyWeekEvent) -> 
             raise RecoverableCategoryConfigurationError("succeeded_consumers_disabled")
         await record_visit_counter(session, event=event, registry=registry)
         await plan_review_job(session, event=event, registry=registry)
+        # AFTER the counter, deliberately: the baseline a repeat freezes has to
+        # be the total this delivery proved, and the counter is what writes it.
+        await plan_repeat_job(session, event=event, registry=registry)
+
+        # Two obligations, two markers, set INDEPENDENTLY of each other.
+        #
+        # The counter is committed and the queue must not be held, but a customer
+        # message this visit earned may not have been considered yet. Marking the
+        # row `processed` and stopping there would destroy it: a `processed` row
+        # is never claimed again, so opening the fence later could not recover
+        # it. Holding the row `captured` instead is not an option either — the
+        # counter write would have to roll back with it, and the row would become
+        # a predecessor blocking its own booking's later lifecycle events. So the
+        # row terminalizes AND carries whichever obligations it owes.
+        #
+        # WHICH obligation is the load-bearing part. A single marker meaning
+        # "something is owed" forces recovery to consult today's flags rather
+        # than what was earned when the visit happened — which both invents
+        # messages for a feature that was off at the time and loses ones that
+        # were genuinely earned.
+        deferred: list[str] = []
         if review_obligation_deferred():
-            # The counter is committed and the queue must not be held, but the
-            # review this visit earns has not been considered yet. Marking the
-            # row `processed` and stopping there would destroy it: a `processed`
-            # row is never claimed again, so opening the fence later could not
-            # recover it.
-            #
-            # Holding the row `captured` instead is not an option either — the
-            # counter write would have to roll back with it, and the row would
-            # become a predecessor blocking its own booking's later lifecycle
-            # events. So the row terminalizes AND carries the obligation.
             event.review_deferred_at = utcnow()
+            deferred.append(REVIEW_3D)
+        if retention_obligation_deferred():
+            event.retention_deferred_at = utcnow()
+            deferred.append(REPEAT_10D)
+        if deferred:
             logger.info(
-                "easyweek event=%s review deferred; notifications fence closed",
+                "easyweek event=%s obligations deferred=%s; notifications fence closed",
                 event_id,
+                ",".join(deferred),
             )
         mark_processed(event)
         logger.info("easyweek event=%s hint=%s succeeded processed", event_id, event_hint)
@@ -1515,6 +2001,7 @@ async def process_claimed_event(session: AsyncSession, event: EasyWeekEvent) -> 
         event_hint=str(event_hint),
         payload_hash=payload_hash,
         event_id=event_id,
+        event_received_at=event.received_at,
     )
     if applied is None:
         logger.info(
@@ -1717,6 +2204,12 @@ async def recover_deferred_reviews(*, limit: int | None = None) -> int:
     committed, and re-running it could only be a no-op or, if EasyWeek had
     meanwhile stated a different total, a change nobody proved from this event.
 
+    The marker means REVIEW and nothing else. PR-12 has its own marker and its
+    own pass (:func:`recover_deferred_retention`), because the obligation TYPE
+    has to be durable: a shared marker forces recovery to consult today's flags
+    instead of what the delivery actually earned, which invents messages for a
+    feature that was off at the time and loses ones that were not.
+
     Two things make the batch fair rather than a fixed prefix:
 
     * every outcome either clears the marker or pushes it into the future, so no
@@ -1729,7 +2222,8 @@ async def recover_deferred_reviews(*, limit: int | None = None) -> int:
     """
     if not review_planning_enabled():
         # The fence is still shut. Nothing here can be decided, and reading the
-        # rows to decide nothing is what would make this a busy loop.
+        # rows to decide nothing is what would make this a busy loop. The rows
+        # keep their marker: a closed fence is a pause, never a discharge.
         return 0
 
     batch = limit or REVIEW_RECOVERY_BATCH
@@ -1782,7 +2276,9 @@ async def recover_deferred_reviews(*, limit: int | None = None) -> int:
                         expected_customer_id=expected_customer_id,
                     )
                     # Considered — planned, or refused for a reason that will not
-                    # change. Either way the obligation is discharged.
+                    # change. Either way THIS obligation is discharged; a repeat
+                    # obligation on the same row is untouched and waits for its
+                    # own pass.
                     event.review_deferred_at = None
             decided += 1
         except NormalizationError as exc:
@@ -1811,6 +2307,134 @@ async def recover_deferred_reviews(*, limit: int | None = None) -> int:
             await _postpone_deferred_review(event_id, reason=type(exc).__name__)
     if decided:
         logger.info("easyweek deferred reviews decided=%s", decided)
+    return decided
+
+
+async def _discharge_deferred_retention(event_id: int, *, reason: str) -> None:
+    """Clear one repeat obligation for good, in its own short transaction.
+
+    Its own function rather than a parameter on the review one: two obligations
+    that share a mutator eventually share a bug, and the whole point of splitting
+    the markers was that one obligation's outcome must never touch the other's.
+    """
+    async with SessionLocal() as session:
+        async with session.begin():
+            event = (
+                await session.execute(select(EasyWeekEvent).where(EasyWeekEvent.id == event_id).with_for_update())
+            ).scalar_one_or_none()
+            if event is not None:
+                event.retention_deferred_at = None
+    logger.info("easyweek deferred retention discharged event=%s reason=%s", event_id, reason)
+
+
+async def _postpone_deferred_retention(event_id: int, *, reason: str) -> None:
+    """Keep the repeat obligation, but move it to the back of the queue."""
+    async with SessionLocal() as session:
+        async with session.begin():
+            event = (
+                await session.execute(select(EasyWeekEvent).where(EasyWeekEvent.id == event_id).with_for_update())
+            ).scalar_one_or_none()
+            if event is not None and event.retention_deferred_at is not None:
+                event.retention_deferred_at = utcnow() + timedelta(seconds=REVIEW_RECOVERY_RETRY_SEC)
+    logger.info("easyweek deferred retention postponed event=%s reason=%s", event_id, reason)
+
+
+async def recover_deferred_retention(*, limit: int | None = None) -> int:
+    """Reconsider the repeats that were owed while the fence was shut.
+
+    The exact mirror of :func:`recover_deferred_reviews`, on its OWN marker and
+    calling only its OWN planner. Returns how many obligations were DECIDED —
+    planned, or refused for a reason that will not change.
+
+    The separation is the fix, not a tidiness preference. Three properties depend
+    on it, and none of them survives a shared marker:
+
+    * a feature that was OFF when the visit happened earns no marker, so no later
+      flag change can invent a message for it retroactively;
+    * a feature that WAS on keeps its marker until its own pass decides it, so
+      the other planner running first cannot discharge it;
+    * a recoverable configuration error in one obligation rolls back only its own
+      transaction, leaving the other's marker exactly as it was.
+
+    It never re-runs the visit counter: that value is already committed, and the
+    baseline this repeat freezes must stay the number the original delivery
+    proved.
+    """
+    if not retention_planning_enabled():
+        # The fence is still shut. The rows keep their marker — a closed fence is
+        # a pause, never a discharge — and reading them to decide nothing is what
+        # would make this a busy loop.
+        return 0
+
+    batch = limit or REVIEW_RECOVERY_BATCH
+    registry = configured_easyweek_locations()
+    if not registry.ready:
+        return 0
+
+    now = utcnow()
+    async with SessionLocal() as session:
+        rows = list(
+            (
+                await session.execute(
+                    select(EasyWeekEvent.id)
+                    .where(EasyWeekEvent.retention_deferred_at.is_not(None))
+                    .where(EasyWeekEvent.retention_deferred_at <= now)
+                    .where(EasyWeekEvent.event_hint == SUCCEEDED_EVENT_HINT)
+                    .order_by(EasyWeekEvent.retention_deferred_at.asc(), EasyWeekEvent.id.asc())
+                    .limit(batch)
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    decided = 0
+    for event_id in rows:
+        try:
+            async with SessionLocal() as session:
+                async with session.begin():
+                    event = (
+                        await session.execute(
+                            select(EasyWeekEvent).where(EasyWeekEvent.id == event_id).with_for_update()
+                        )
+                    ).scalar_one_or_none()
+                    if event is None or event.retention_deferred_at is None:
+                        # Another pass got there first. The dedupe key makes a
+                        # double attempt harmless anyway.
+                        continue
+
+                    # The customer THIS delivery named, read from the captured
+                    # payload, which is never rewritten. Asking the Record instead
+                    # would follow a `booking-updated` that reassigned the booking
+                    # and invite the wrong person.
+                    expected_customer_id = normalize_succeeded_customer_id(event.payload)
+                    await plan_repeat_job(
+                        session,
+                        event=event,
+                        registry=registry,
+                        expected_customer_id=expected_customer_id,
+                    )
+                    event.retention_deferred_at = None
+            decided += 1
+        except NormalizationError as exc:
+            # A permanent property of the stored payload: it parses the same way
+            # on every future pass, so retrying forever would starve the rows
+            # behind it. Terminal, fail-closed, stable code only.
+            await _discharge_deferred_retention(event_id, reason=exc.code)
+            decided += 1
+        except RecoverableCategoryConfigurationError as exc:
+            await _postpone_deferred_retention(event_id, reason=exc.reason)
+        except Exception as exc:
+            # Class name only — a SQLAlchemy error renders bound parameters, and
+            # for this worker those are a customer's phone, e-mail and name.
+            logger.error(
+                "easyweek deferred retention recovery failed event=%s type=%s",
+                event_id,
+                type(exc).__name__,
+            )
+            await _postpone_deferred_retention(event_id, reason=type(exc).__name__)
+    if decided:
+        logger.info("easyweek deferred retention decided=%s", decided)
     return decided
 
 
@@ -1995,6 +2619,10 @@ async def run_loop(
             last_review_recovery_at = now_monotonic
             try:
                 await recover_deferred_reviews()
+                # Its own pass on its own marker, in the same slow slot: the two
+                # obligations are independent, and one failing must not stop the
+                # other from being reconsidered.
+                await recover_deferred_retention()
             except Exception as exc:
                 # Recovery is best-effort: the obligations stay recorded, and a
                 # failure here must not stop the worker claiming new events.
@@ -2078,8 +2706,12 @@ __all__ = [
     "retry_delay_for",
     "schedule_retry",
     "sync_record_service",
+    "plan_repeat_job",
     "plan_review_job",
+    "recover_deferred_retention",
+    "retention_planning_enabled",
     "review_planning_enabled",
+    "sync_comeback_job",
     "sync_reminder_jobs",
     "upsert_client",
     "upsert_record",

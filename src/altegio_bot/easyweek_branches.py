@@ -12,7 +12,7 @@ slug, fixes four things together:
 
 * the slug used as the top-level key of ``EASYWEEK_LOCATION_MAP``;
 * the human-readable name the EasyWeek API returns for that branch;
-* the Meta template prefix (``du`` / ``ra``) — and therefore the template names;
+* the Meta template prefix (``du`` / ``ka`` / ``ra``) — and therefore the names;
 * the storefront content (brand line, address, maps link) in the message footer.
 
 Anything the operator supplies is checked *against* a profile; nothing is
@@ -49,6 +49,12 @@ REMINDER_24H: Final = "reminder_24h"
 REMINDER_2H: Final = "reminder_2h"
 # PR-9: the review request earned by a proven booking-succeeded.
 REVIEW_3D: Final = "review_3d"
+# PR-12: the two retention messages. Seeded per branch exactly like every code
+# above, so each is bound to one branch's Meta name, body and footer by the same
+# contract — a retention message signed by the wrong salon is the failure this
+# binding exists to make impossible.
+REPEAT_10D: Final = "repeat_10d"
+COMEBACK_3D: Final = "comeback_3d"
 
 BRANCH_TEMPLATE_CODES: Final = (
     RECORD_CREATED,
@@ -58,6 +64,8 @@ BRANCH_TEMPLATE_CODES: Final = (
     REMINDER_24H,
     REMINDER_2H,
     REVIEW_3D,
+    REPEAT_10D,
+    COMEBACK_3D,
 )
 
 PRE_APPOINTMENT_NOTES_DE: Final = (
@@ -123,6 +131,32 @@ BRANCH_PROFILES: Final[dict[str, BranchProfile]] = {
             address_line="Pfinztalstraße 4, 76227 Karlsruhe-Durlach",
             contact_phone="+491742310386",
             maps_line="📍https://maps.app.goo.gl/HnVPnHaJHf2DW3Nn8",
+            instagram_line="📺 https://www.instagram.com/kitilash001",
+        ),
+    ),
+    # PR-11.1 migrated Karlsruhe's future bookings to EasyWeek, so the branch is
+    # in the production `EASYWEEK_LOCATION_MAP` and needs a source-controlled
+    # profile like every other one: without it the seed, the preflight and the
+    # send path all refuse the branch as unapproved.
+    #
+    # The storefront content is copied VERBATIM from the existing
+    # source-controlled Karlsruhe values in `scripts/seed_templates.py` — the
+    # same address, phone, maps link and Instagram handle Altegio has been
+    # sending for this salon. Nothing here is invented: an address or a maps URL
+    # guessed to look plausible is a customer sent to the wrong door.
+    #
+    # `brand_line` is `*KitiLash*` rather than `*KitiLash Karlsruhe*` for the
+    # same reason: that is the line the salon already uses, and "improving" it
+    # would be inventing branding.
+    "karlsruhe": BranchProfile(
+        slug="karlsruhe",
+        api_name="KitiLash Karlsruhe",
+        meta_template_prefix="ka",
+        content=BranchContent(
+            brand_line="*KitiLash*",
+            address_line="76133 Karlsruhe, Kaiserstraße, 68",
+            contact_phone="+491742310386",
+            maps_line="📍https://goo.gl/maps/p7quWqbAqY9cusuRA",
             instagram_line="📺 https://www.instagram.com/kitilash001",
         ),
     ),
@@ -239,6 +273,25 @@ def branch_template_contract(profile: BranchProfile, template_code: str) -> Bran
             "*Service:*\n"
             "{services}\n\n"
             f"Termin verwalten: {{booking_link}}{footer}"
+        ),
+        # PR-12. Three positional parameters: the name, the ONE service this
+        # booking was for, and the branch's booking page. No price and no total
+        # — a repeat invitation is about the next appointment, not the last
+        # invoice, and every value printed here has to stay true for ten days.
+        REPEAT_10D: (
+            "*{client_name}, hallo!*\n\n"
+            "Seit Ihrem Termin ({primary_service}) sind zehn Tage vergangen. "
+            "Möchten Sie den nächsten Termin buchen?\n\n"
+            f"Termin buchen: {{booking_link}}{footer}"
+        ),
+        # Two positional parameters only. A cancelled booking has no service to
+        # promise and no time to name, so the message says neither: it invites
+        # the customer back and nothing more.
+        COMEBACK_3D: (
+            "*{client_name}, hallo!*\n\n"
+            "Schade, dass Ihr Termin nicht stattgefunden hat. "
+            "Wir würden uns freuen, Sie bald wiederzusehen.\n\n"
+            f"Neuen Termin buchen: {{booking_link}}{footer}"
         ),
     }
     return BranchTemplateContract(
