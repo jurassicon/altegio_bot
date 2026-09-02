@@ -3934,23 +3934,83 @@ claim'ятся и не отправляются даже при открытом
 они остаются `queued` с прежними `run_at`, `attempts=0` и `locked_at=NULL`.
 
 **Поэтому `EASYWEEK_NOTIFICATIONS_ENABLED` читают ДВА long-running сервиса**, и
-изменение флага требует пересоздания обоих. Это единственный проверенный
-порядок; все места этого runbook, где меняется мастер-флаг, ссылаются сюда.
+изменение флага требует пересоздания обоих. Пересоздать только
+`altegio-easyweek-inbox-worker` недостаточно: планирование остановится, а
+outbox-worker останется с прежним runtime-значением `true` и продолжит
+отправлять клиентам уже накопленные `repeat_10d` / `comeback_3d`. Пауза в
+рассылке, которой не произошло, — это ровно тот сценарий, который мастер-флаг
+обязан закрывать.
+
+#### Выключение мастер-флага — единственная безопасная последовательность
+
+Одна Compose-команда с двумя сервисами порядка **не** даёт. Docker Compose
+упорядочивает сервисы по dependency graph, а эти два worker'а друг от друга не
+зависят: они могут пересоздаваться параллельно или в обратном порядке. Между
+началом пересоздания inbox и фактической остановкой старого outbox остаётся
+окно, в котором старый outbox всё ещё работает с `notifications=true` и может
+захватить и отправить наступившую `repeat_10d` / `comeback_3d`.
+
+Порядок задаётся не аргументами одной команды, а **отдельными
+последовательными командами с проверкой между ними**. Сначала замолкает тот,
+кто отправляет.
+
+**Шаг 1.** В `easyweek.env`:
+
+```text
+EASYWEEK_NOTIFICATIONS_ENABLED=false
+```
+
+**Шаг 2.** Пересоздать отправляющий сервис — и только его:
 
 ```bash
 cd /opt/altegio_bot
-$COMPOSE up -d --force-recreate altegio-outbox-worker altegio-easyweek-inbox-worker
+$COMPOSE up -d --force-recreate altegio-outbox-worker
 ```
 
-`altegio-outbox-worker` назван первым не случайно: именно он отправляет. Если
-пересоздать только `altegio-easyweek-inbox-worker` — как подсказывала таблица
-владельцев до этого исправления, — планирование остановится, а outbox-worker
-останется с прежним runtime-значением `true` и продолжит отправлять клиентам
-уже накопленные `repeat_10d` / `comeback_3d`. Пауза в рассылке, которой не
-произошло, — это ровно тот сценарий, который мастер-флаг обязан закрывать.
+**Шаг 3.** Read-only проверка изнутри outbox-worker. Это gate, а не
+формальность: пока она не вернула `False`, клиентские отправки не остановлены.
 
-Проверить, что оба контейнера действительно перечитали флаг, можно
-read-only-командами из шага 1 раздела 16.2: обе печатают `notifications`.
+```bash
+cd /opt/altegio_bot
+$COMPOSE exec -T altegio-outbox-worker /app/.venv/bin/python -c 'from altegio_bot.settings import settings; print({"notifications": settings.easyweek_notifications_enabled})'
+```
+
+Если вывод не `{'notifications': False}` — **остановиться здесь**. Не
+пересоздавать inbox-worker, не считать рассылку остановленной и не сообщать об
+этом. Наиболее частая причина — правка попала не в тот файл или сервис не был
+пересоздан (`docker compose restart` не перечитывает `env_file`). Исправить и
+повторить шаги 2–3.
+
+**Шаг 4.** Только после успешной проверки — пересоздать планирующий сервис:
+
+```bash
+cd /opt/altegio_bot
+$COMPOSE up -d --force-recreate altegio-easyweek-inbox-worker
+```
+
+**Шаг 5.** Та же read-only проверка изнутри inbox-worker:
+
+```bash
+cd /opt/altegio_bot
+$COMPOSE exec -T altegio-easyweek-inbox-worker /app/.venv/bin/python -c 'from altegio_bot.settings import settings; print({"notifications": settings.easyweek_notifications_enabled})'
+```
+
+Оба вывода `{'notifications': False}` — рассылка остановлена: outbox больше не
+claim'ит и не отправляет, inbox больше не планирует.
+
+#### Обратное включение — это НЕ зеркало выключения
+
+Последовательность выше относится **только к выключению**. Универсального
+правила «всегда пересоздавать outbox первым» не существует, и переносить этот
+порядок на включение нельзя: там открытие мастер-флага само по себе ничего не
+разрешает.
+
+Включение мастер-флага не открывает retention: `EASYWEEK_RETENTION_ENABLED` и
+`EASYWEEK_RETENTION_SEND_ENABLED` остаются собственными fence'ами, и
+последовательность включения — это раздел 16.2 целиком: planning при закрытом
+send fence, накопление реальных кандидатов, read-only preflight, canary по
+одному job, и только затем bulk. Пересоздание сервисов в другом порядке этих
+шагов не заменяет и их не сокращает.
 
 Что PR-12 **не** добавляет: newsletters, newsletter follow-up, promo, campaign
 runner, общий marketing engine, backfill старых событий и jobs, новый scheduler,
@@ -4163,9 +4223,10 @@ backfill исторических маркетинговых сообщений 
 6. `$COMPOSE up -d --force-recreate altegio-easyweek-inbox-worker`.
 7. `EASYWEEK_NOTIFICATIONS_ENABLED` **не** выключать — это остановило бы
    lifecycle, reminders и review. Если его всё же нужно закрыть (общая пауза
-   рассылки, а не откат PR-12), пересоздавать **оба** сервиса единой командой из
-   §16.1: одного inbox-worker недостаточно, outbox-worker продолжит отправлять
-   уже созданные retention jobs со старым runtime-значением.
+   рассылки, а не откат PR-12), выполнять пять шагов «Выключение мастер-флага»
+   из §16.1 — отдельными командами, с проверкой внутри outbox-worker между
+   ними. Одного inbox-worker недостаточно, а одна Compose-команда с двумя
+   сервисами порядка не даёт.
 8. `EASYWEEK_VISIT_COUNTER_ENABLED` **не** выключать и доказанные
    `visits_total` **не** удалять: они описывают состоявшиеся визиты, и получить
    их повторно неоткуда.

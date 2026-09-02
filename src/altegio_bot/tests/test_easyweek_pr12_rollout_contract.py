@@ -79,6 +79,19 @@ def pr12_section(runbook: str) -> str:
 
 
 @pytest.fixture(scope="module")
+def master_flag_shutdown(pr12_section: str) -> str:
+    """Only the "turning the master flag OFF" procedure in §16.1.
+
+    Bounded at both ends: the section that follows it is deliberately about
+    ENABLING, which must not inherit this ordering, and an unbounded slice would
+    let assertions about the shutdown pass on the enabling prose.
+    """
+    start = pr12_section.index("#### Выключение мастер-флага")
+    end = pr12_section.index("#### Обратное включение")
+    return pr12_section[start:end]
+
+
+@pytest.fixture(scope="module")
 def rollout_steps(pr12_section: str) -> str:
     """Only §16.2 — the numbered steps an operator executes in order.
 
@@ -535,29 +548,121 @@ def test_the_master_flag_paragraph_names_both_readers(env_example: str) -> None:
     assert "ОБОИХ" in paragraph
 
 
-def test_the_runbook_gives_one_recreate_order_for_the_master_flag(pr12_section: str) -> None:
-    """One canonical command, so no step has to invent its own."""
-    text = prose(pr12_section)
-    assert "читают ДВА long-running сервиса" in text
-    assert "единственный проверенный порядок" in text
+def test_the_shutdown_uses_two_separate_force_recreate_commands(master_flag_shutdown: str) -> None:
+    """Ordering comes from separate commands, never from argument order.
 
-    both = [
+    `docker compose up -d --force-recreate A B` orders services by the dependency
+    graph. These two workers do not depend on each other, so Compose may recreate
+    them in parallel or in the opposite order — and the window where the old
+    outbox is still running with notifications=true is exactly when a due
+    repeat_10d or comeback_3d gets claimed and sent.
+    """
+    recreates = [block for block in bash_blocks(master_flag_shutdown) if "--force-recreate" in block]
+
+    assert len(recreates) == 2, "one command per service, so the sequence is the operator's, not Compose's"
+    assert sum(OUTBOX_SERVICE in block for block in recreates) == 1
+    assert sum(INBOX_SERVICE in block for block in recreates) == 1
+
+
+def test_no_shutdown_command_recreates_both_workers_at_once(master_flag_shutdown: str) -> None:
+    """The refuted form must not come back as a shortcut.
+
+    A single command naming both services looks like the same thing and is not:
+    it hands the ordering back to Compose, which does not provide one here.
+    """
+    for block in bash_blocks(master_flag_shutdown):
+        if "--force-recreate" not in block:
+            continue
+        assert not (OUTBOX_SERVICE in block and INBOX_SERVICE in block), (
+            f"a combined force-recreate is not an ordering guarantee: {block}"
+        )
+
+
+def test_the_sending_worker_is_recreated_before_the_planning_one(master_flag_shutdown: str) -> None:
+    """Whoever sends goes quiet first."""
+    outbox_at = position(master_flag_shutdown, f"--force-recreate {OUTBOX_SERVICE}")
+    inbox_at = position(master_flag_shutdown, f"--force-recreate {INBOX_SERVICE}")
+
+    assert outbox_at < inbox_at
+
+
+def test_a_verified_outbox_gates_the_inbox_recreate(master_flag_shutdown: str) -> None:
+    """The check between them is a GATE, not a formality.
+
+    Without it the sequence is only a hope: the operator would move on to the
+    inbox worker while the sending one may still hold the old value.
+    """
+    outbox_at = position(master_flag_shutdown, f"--force-recreate {OUTBOX_SERVICE}")
+    inbox_at = position(master_flag_shutdown, f"--force-recreate {INBOX_SERVICE}")
+    between = master_flag_shutdown[outbox_at:inbox_at]
+
+    checks = [
         block
-        for block in bash_blocks(pr12_section)
-        if "--force-recreate" in block and OUTBOX_SERVICE in block and INBOX_SERVICE in block
+        for block in bash_blocks(between)
+        if OUTBOX_SERVICE in block and "settings.easyweek_notifications_enabled" in block
     ]
-    assert both, "the chapter must carry a command that recreates both readers together"
+    assert checks, "an effective-config read inside the outbox worker must sit between the two recreates"
+    assert "exec" in checks[0].split(), "the check is about THIS running container"
+
+
+def test_a_failed_outbox_check_stops_the_procedure(master_flag_shutdown: str) -> None:
+    """ "Could not verify" must never read as "messaging is paused"."""
+    text = prose(master_flag_shutdown)
+
+    assert "остановиться здесь" in text.lower()
+    assert "Не" in master_flag_shutdown and "пересоздавать inbox-worker" in text
+    assert "не считать рассылку остановленной" in text
+
+
+def test_the_shutdown_does_not_ask_for_a_dependency_between_the_workers(master_flag_shutdown: str) -> None:
+    """The fix is an operator sequence, not a topology change.
+
+    `depends_on` would make one consumer wait on the other for every deploy and
+    restart, which is a production topology change PR-12 has no reason to make.
+    """
+    assert "depends_on" not in master_flag_shutdown
+
+    services = yaml.safe_load(COMPOSE_FILE.read_text())["services"]
+    for name, other in ((INBOX_SERVICE, OUTBOX_SERVICE), (OUTBOX_SERVICE, INBOX_SERVICE)):
+        depends = services[name].get("depends_on") or {}
+        assert other not in depends, f"{name} must stay independent of {other}"
+
+
+def test_the_runbook_refutes_the_combined_command_as_an_ordering_claim(pr12_section: str) -> None:
+    """The wrong model is named and refuted, not merely dropped."""
+    text = prose(pr12_section)
+
+    assert "читают ДВА long-running сервиса" in text
+    assert "Одна Compose-команда с двумя сервисами порядка **не** даёт" in text
+    assert "dependency graph" in text
+    assert "друг от друга не зависят" in text
 
 
 def test_turning_the_master_flag_off_is_never_documented_as_one_service(pr12_section: str) -> None:
-    """Wherever the operator may close the master flag, both readers are named."""
+    """Wherever the operator may close the master flag, the sequence is named."""
     text = prose(pr12_section)
     rollback = text[text.index("16.3 Rollback") :]
 
     assert MASTER_FLAG in rollback
     master_note = rollback[rollback.index(MASTER_FLAG) :]
-    assert "оба" in master_note.lower(), "the rollback note must not imply one service is enough"
-    assert "16.1" in master_note, "and it must point at the single verified order"
+    assert "отдельными командами" in master_note, "the rollback note must not imply one command is enough"
+    assert "16.1" in master_note, "and it must point at the single verified sequence"
+
+
+def test_enabling_the_master_flag_gets_no_universal_ordering_advice(pr12_section: str) -> None:
+    """The shutdown order must not become a general "outbox first" rule.
+
+    Enabling is not the mirror of disabling: opening the master flag permits
+    nothing on its own, because retention answers to its own fences, its
+    preflight and its canary. A blanket ordering rule would read as a shortcut
+    past all three.
+    """
+    text = prose(pr12_section)
+
+    assert "Обратное включение — это НЕ зеркало выключения" in text
+    assert "Универсального правила «всегда пересоздавать outbox первым» не существует" in text
+    for gate in ("EASYWEEK_RETENTION_ENABLED", "EASYWEEK_RETENTION_SEND_ENABLED", "preflight", "canary"):
+        assert gate in text, f"the enabling path must still name {gate}"
 
 
 def test_the_outbox_runtime_check_shows_the_master_flag_with_the_retention_gates(
@@ -587,3 +692,41 @@ def test_the_runbook_explains_why_the_outbox_check_prints_the_master_flag(pr12_s
     text = prose(pr12_section)
     assert "читают **оба** long-running сервиса" in text
     assert "со старым окружением" in text
+
+
+def test_the_env_example_points_at_the_master_flag_section_not_the_rollout(env_example: str) -> None:
+    """The canonical shutdown instruction lives in §16.1, not §16.2.
+
+    §16.2 is the ENABLING rollout. An operator following a pointer to it while
+    trying to pause messaging would read the canary and preflight steps and find
+    nothing about shutting the flag down.
+    """
+    table = prose(_ownership_table(env_example))
+    entry = table[table.index(MASTER_FLAG) : table.index("EASYWEEK_ENABLED,")]
+
+    assert "раздел 16.1 runbook" in entry, "the shutdown sequence is documented in 16.1"
+    shutdown_at = entry.index("ВЫКЛЮЧЕНИЕ")
+    enabling_at = entry.index("ВКЛЮЧЕНИЕ")
+    assert shutdown_at < entry.index("раздел 16.1 runbook") < enabling_at, (
+        "the 16.1 pointer must belong to the shutdown half, not to the enabling half"
+    )
+
+
+def test_the_env_example_refutes_the_combined_command_ordering(env_example: str) -> None:
+    table = prose(_ownership_table(env_example))
+    entry = table[table.index(MASTER_FLAG) : table.index("EASYWEEK_ENABLED,")]
+
+    assert "НЕ аргументами одной Compose-команды" in entry
+    assert "dependency graph" in entry
+    assert "ОТДЕЛЬНЫЕ последовательные" in entry
+    assert "notifications == false" in entry
+
+
+def test_the_env_example_separates_shutdown_from_enabling(env_example: str) -> None:
+    """Two different procedures, and the file must not blur them."""
+    table = prose(_ownership_table(env_example))
+    entry = table[table.index(MASTER_FLAG) : table.index("EASYWEEK_ENABLED,")]
+
+    assert "ВКЛЮЧЕНИЕ — не зеркало выключения" in entry
+    assert "раздела 16.2" in entry, "enabling points at the rollout with its fences"
+    assert "«всегда outbox первым» не существует" in entry
