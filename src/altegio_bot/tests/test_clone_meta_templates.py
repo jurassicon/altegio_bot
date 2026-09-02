@@ -42,11 +42,13 @@ import re
 import sys
 from copy import deepcopy
 from typing import Any
+from unittest.mock import Mock
 
 import httpx
 import pytest
 import respx
 
+from altegio_bot.easyweek_branches import BRANCH_PROFILES
 from altegio_bot.scripts import clone_meta_templates_for_location as cloner
 from altegio_bot.scripts.clone_meta_templates_for_location import (
     DEFAULT_TARGET_ADDRESS,
@@ -409,10 +411,11 @@ def _neutral_args(*, include_neutral: bool = True) -> list[str]:
     ]
 
 
+@pytest.mark.parametrize("source_args", [[], ["--source-location", "ka"]], ids=["default-ka", "explicit-ka"])
 def test_targeted_neutral_dry_run_needs_no_other_branch_templates(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, source_args: list[str]
 ) -> None:
-    code, fake = _run_script(monkeypatch, _neutral_sources(), _neutral_args())
+    code, fake = _run_script(monkeypatch, _neutral_sources(), [*source_args, *_neutral_args()])
 
     assert code == 0
     assert fake.created == []
@@ -425,14 +428,17 @@ def test_targeted_neutral_dry_run_needs_no_other_branch_templates(
     assert _TOKEN not in output
 
 
+@pytest.mark.parametrize("source_args", [[], ["--source-location", "ka"]], ids=["default-ka", "explicit-ka"])
 def test_targeted_apply_copies_only_named_neutral_templates_without_content_changes(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, source_args: list[str]
 ) -> None:
     sources = _neutral_sources()
     original = deepcopy(sources)
     unrelated = _template("kitilash_ka_newsletter_new_clients_monthly_v1", body="Newsletter {{1}}")
 
-    code, fake = _run_script(monkeypatch, [*sources, unrelated, *_ka_sources()], [*_APPLY_ARGS, *_neutral_args()])
+    code, fake = _run_script(
+        monkeypatch, [*sources, unrelated, *_ka_sources()], [*_APPLY_ARGS, *source_args, *_neutral_args()]
+    )
 
     assert code == 0
     assert len(fake.created) == 3
@@ -456,6 +462,75 @@ def test_neutral_inclusion_requires_exact_selection_before_reading_meta(
     assert fake.list_calls == 0
     assert fake.created == []
     assert "requires explicit --template-name" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("source_location", ["du", "ra", "xx"])
+@pytest.mark.parametrize("apply", [False, True], ids=["dry-run", "apply-yes"])
+@pytest.mark.parametrize("credentials_present", [False, True], ids=["no-credentials", "fake-credentials"])
+def test_neutral_inclusion_rejects_non_karlsruhe_before_credentials_or_meta(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+    source_location: str,
+    apply: bool,
+    credentials_present: bool,
+) -> None:
+    name = f"kitilash_{source_location}_reminder_24h_v1"
+    body = _BODY
+    if source_location == "du":
+        # Regression: this real Durlach footer used to be classified as neutral
+        # and submitted unchanged under a Rastatt name with --include-neutral.
+        content = BRANCH_PROFILES["durlach"].content
+        body += "\n" + "\n".join((content.brand_line, content.address_line, content.maps_line))
+    fake = _FakeMetaClient([_template(name, body=body)])
+    factory = Mock(return_value=fake)
+    monkeypatch.setattr(cloner, "MetaTemplateClient", factory)
+    for key, value in (("WHATSAPP_ACCESS_TOKEN", _TOKEN), ("META_WABA_ID", "test-waba")):
+        if credentials_present:
+            monkeypatch.setenv(key, value)
+        else:
+            monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "clone_meta_templates_for_location.py",
+            "--source-location",
+            source_location,
+            "--target-location",
+            "ra" if source_location == "du" else "du",
+            "--address",
+            _RA_CFG.address_line if source_location == "du" else DEFAULT_TARGET_ADDRESS,
+            "--maps-url",
+            "https://maps.app.goo.gl/xvYYbJbPaWcnp9Xv5" if source_location == "du" else DEFAULT_TARGET_MAPS_URL,
+            "--include-neutral",
+            "--template-name",
+            name,
+            *(["--apply", "--yes"] if apply else []),
+        ],
+    )
+
+    assert cloner.main() == 1
+    assert "--include-neutral requires --source-location ka" in capsys.readouterr().err
+    factory.assert_not_called()
+    assert fake.list_calls == 0
+    assert fake.created == []
+
+
+@pytest.mark.parametrize("source_location", ["du", "ra", "xx"])
+def test_non_karlsruhe_without_neutral_opt_in_keeps_existing_source_checks(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, source_location: str
+) -> None:
+    name = f"kitilash_{source_location}_review_3d_v1"
+    code, fake = _run_script(
+        monkeypatch,
+        [_template(name, body=_NEUTRAL_BODIES["review_3d"])],
+        ["--source-location", source_location, "--target-location", "ka", "--template-name", name],
+    )
+
+    assert code == 1
+    assert fake.list_calls == 1
+    assert fake.created == []
+    assert "SOURCE_ADDRESS_PATTERNS / SOURCE_MAP_URLS do not cover" in capsys.readouterr().err
 
 
 def test_exact_selection_does_not_itself_authorize_neutral_copying(monkeypatch: pytest.MonkeyPatch) -> None:

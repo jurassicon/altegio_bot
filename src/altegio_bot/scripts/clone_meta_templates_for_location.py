@@ -23,6 +23,8 @@ Safety defaults:
 * a template with neither the address nor the Karlsruhe map link is skipped
   unless --include-neutral and exact --template-name selections are supplied;
   explicitly selected neutral templates are copied without changing content;
+  this opt-in requires source-location ka (also the default), because source
+  address/map recognition only covers Karlsruhe; other sources fail before GET;
 * a template whose address was not recognised while its Karlsruhe map link WAS
   found is a contradiction, not neutrality: it is reported as an error;
 * a branch-specific template whose Karlsruhe map link was not replaced is
@@ -854,7 +856,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--include-neutral",
         action="store_true",
-        help="also copy neutral templates unchanged; requires explicit --template-name selections",
+        help=(
+            "also copy neutral templates unchanged; requires --source-location ka (the default) "
+            "and explicit --template-name selections"
+        ),
     )
     parser.add_argument(
         "--address",
@@ -981,6 +986,10 @@ async def async_main(args: argparse.Namespace) -> int:
         raise ScriptError("source and target locations must be different")
     if args.timeout <= 0:
         raise ScriptError("--timeout must be greater than zero")
+    if args.include_neutral and args.source_location != "ka":
+        raise ScriptError(
+            "--include-neutral requires --source-location ka; source address/map recognition only covers Karlsruhe"
+        )
 
     graph_url = normalize_graph_url(args.graph_url)
     api_version = _normalize_api_version(args.api_version)
