@@ -3933,6 +3933,25 @@ identity.
 claim'ятся и не отправляются даже при открытом `EASYWEEK_RETENTION_SEND_ENABLED`:
 они остаются `queued` с прежними `run_at`, `attempts=0` и `locked_at=NULL`.
 
+**Поэтому `EASYWEEK_NOTIFICATIONS_ENABLED` читают ДВА long-running сервиса**, и
+изменение флага требует пересоздания обоих. Это единственный проверенный
+порядок; все места этого runbook, где меняется мастер-флаг, ссылаются сюда.
+
+```bash
+cd /opt/altegio_bot
+$COMPOSE up -d --force-recreate altegio-outbox-worker altegio-easyweek-inbox-worker
+```
+
+`altegio-outbox-worker` назван первым не случайно: именно он отправляет. Если
+пересоздать только `altegio-easyweek-inbox-worker` — как подсказывала таблица
+владельцев до этого исправления, — планирование остановится, а outbox-worker
+останется с прежним runtime-значением `true` и продолжит отправлять клиентам
+уже накопленные `repeat_10d` / `comeback_3d`. Пауза в рассылке, которой не
+произошло, — это ровно тот сценарий, который мастер-флаг обязан закрывать.
+
+Проверить, что оба контейнера действительно перечитали флаг, можно
+read-only-командами из шага 1 раздела 16.2: обе печатают `notifications`.
+
 Что PR-12 **не** добавляет: newsletters, newsletter follow-up, promo, campaign
 runner, общий marketing engine, backfill старых событий и jobs, новый scheduler,
 изменения Altegio-пути и любые mutation-вызовы EasyWeek API.
@@ -3958,8 +3977,14 @@ $COMPOSE exec -T altegio-easyweek-inbox-worker /app/.venv/bin/python -c 'from al
 
 ```bash
 cd /opt/altegio_bot
-$COMPOSE exec -T altegio-outbox-worker /app/.venv/bin/python -c 'from altegio_bot.settings import settings; print({"retention_send": settings.easyweek_retention_send_enabled})'
+$COMPOSE exec -T altegio-outbox-worker /app/.venv/bin/python -c 'from altegio_bot.settings import settings; print({"notifications": settings.easyweek_notifications_enabled, "retention_send": settings.easyweek_retention_send_enabled, "retention_canary_job_id": settings.easyweek_retention_canary_job_id})'
 ```
+
+Outbox-проверка печатает и мастер-флаг, а не только retention gates: с PR-12
+`EASYWEEK_NOTIFICATIONS_ENABLED` читают **оба** long-running сервиса, и именно
+значение внутри outbox-worker решает, уйдёт ли уже созданная retention job.
+Отчёт только про `retention_send` не отличает «отправка закрыта» от «outbox
+работает со старым окружением, где мастер-флаг ещё был `true`».
 
 **2. Подтвердить, что счётчик PR-11 уже включён и пишет.** Без него репит не
 получит доказанный baseline и не будет создан вовсе. `EASYWEEK_VISIT_COUNTER_ENABLED`
@@ -4137,7 +4162,10 @@ backfill исторических маркетинговых сообщений 
 5. При необходимости `EASYWEEK_RETENTION_ENABLED=false`.
 6. `$COMPOSE up -d --force-recreate altegio-easyweek-inbox-worker`.
 7. `EASYWEEK_NOTIFICATIONS_ENABLED` **не** выключать — это остановило бы
-   lifecycle, reminders и review.
+   lifecycle, reminders и review. Если его всё же нужно закрыть (общая пауза
+   рассылки, а не откат PR-12), пересоздавать **оба** сервиса единой командой из
+   §16.1: одного inbox-worker недостаточно, outbox-worker продолжит отправлять
+   уже созданные retention jobs со старым runtime-значением.
 8. `EASYWEEK_VISIT_COUNTER_ENABLED` **не** выключать и доказанные
    `visits_total` **не** удалять: они описывают состоявшиеся визиты, и получить
    их повторно неоткуда.

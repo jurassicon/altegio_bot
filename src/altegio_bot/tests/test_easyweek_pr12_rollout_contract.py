@@ -31,6 +31,7 @@ PLANNING_FLAG = "EASYWEEK_RETENTION_ENABLED"
 SEND_FLAG = "EASYWEEK_RETENTION_SEND_ENABLED"
 COUNTER_FLAG = "EASYWEEK_VISIT_COUNTER_ENABLED"
 CANARY_FLAG = "EASYWEEK_RETENTION_CANARY_JOB_ID"
+MASTER_FLAG = "EASYWEEK_NOTIFICATIONS_ENABLED"
 INBOX_SERVICE = "altegio-easyweek-inbox-worker"
 OUTBOX_SERVICE = "altegio-outbox-worker"
 PREFLIGHT_MODULE = "altegio_bot.scripts.easyweek_retention_preflight"
@@ -75,6 +76,18 @@ def pr12_section(runbook: str) -> str:
     following = re.search(r"^## \d+\. ", runbook[start + 1 :], flags=re.M)
     end = start + 1 + following.start() if following else len(runbook)
     return runbook[start:end]
+
+
+@pytest.fixture(scope="module")
+def rollout_steps(pr12_section: str) -> str:
+    """Only §16.2 — the numbered steps an operator executes in order.
+
+    The surrounding sections explain WHY (16.1) and what to do when something
+    goes wrong (16.3+); sequencing assertions belong to the steps themselves.
+    """
+    start = pr12_section.index("### 16.2")
+    end = pr12_section.index("### 16.3")
+    return pr12_section[start:end]
 
 
 # ---------------------------------------------------------------------------
@@ -263,10 +276,16 @@ def test_each_flag_change_is_followed_by_force_recreate_of_its_own_service(pr12_
     )
 
 
-def test_the_outbox_worker_is_not_recreated_before_the_preflight(pr12_section: str) -> None:
-    """Recreating it early would open the fence before the audit."""
-    preflight_at = position(pr12_section, PREFLIGHT_MODULE)
-    earlier = pr12_section[:preflight_at]
+def test_the_outbox_worker_is_not_recreated_before_the_preflight(rollout_steps: str) -> None:
+    """Recreating it early would open the fence before the audit.
+
+    Scoped to the ROLLOUT STEPS rather than the whole chapter. §16.1 documents
+    the master flag's own recreate order, which names the outbox worker on
+    purpose and is not a rollout step; asserting over the whole chapter would
+    read that reference as a premature fence opening.
+    """
+    preflight_at = position(rollout_steps, PREFLIGHT_MODULE)
+    earlier = rollout_steps[:preflight_at]
     assert f"--force-recreate {OUTBOX_SERVICE}" not in earlier
 
 
@@ -440,3 +459,131 @@ def test_no_command_prints_a_payload_or_customer_data(pr12_section: str) -> None
         lowered = block.lower()
         for forbidden in ("phone_e164", "display_name", "payload", "customer_phone", "booking_uuid"):
             assert forbidden not in lowered, f"a runbook command must not print {forbidden}"
+
+
+# ---------------------------------------------------------------------------
+# The master notification flag has TWO runtime readers
+#
+# Since PR-12, EASYWEEK_NOTIFICATIONS_ENABLED gates planning in the inbox worker
+# AND claim/send in the outbox worker. An operator who sets it to false and, on
+# the strength of an ownership table naming one service, recreates only the inbox
+# worker leaves the outbox worker running with the stale value `true` — and it
+# keeps delivering repeat_10d / comeback_3d jobs that were already queued. The
+# pause never happens, and nothing in the system says so.
+# ---------------------------------------------------------------------------
+
+
+def _ownership_table(env_example: str) -> str:
+    """The "which service to recreate" table at the head of the env example."""
+    start = env_example.index("Какой сервис пересоздавать после правки")
+    end = env_example.index("EASYWEEK_ENABLED=false")
+    return env_example[start:end]
+
+
+def test_the_ownership_table_names_both_services_for_the_master_flag(env_example: str) -> None:
+    table = prose(_ownership_table(env_example))
+
+    assert MASTER_FLAG in table, "the master flag must appear in the ownership table"
+    master_entry = table[table.index(MASTER_FLAG) :]
+    # Both services, before the next flag's entry begins.
+    entry = master_entry[: master_entry.index("EASYWEEK_ENABLED,")]
+    assert INBOX_SERVICE in entry
+    assert OUTBOX_SERVICE in entry
+
+
+def test_the_ownership_table_says_one_service_is_not_enough(env_example: str) -> None:
+    """The wrong model is refuted in words, not merely left unstated.
+
+    A table that simply lists two services still reads as "pick the one you
+    changed" to an operator in a hurry. The failure mode has to be named.
+    """
+    table = prose(_ownership_table(env_example))
+
+    assert "ОБА сервиса" in table
+    assert "НЕДОСТАТОЧНО" in table
+    assert "продолжит отправлять" in table
+
+
+def test_the_master_flag_is_not_listed_as_inbox_only(env_example: str) -> None:
+    """The regression itself: the flag must not sit in the inbox-only group.
+
+    This is what the table said before the fix, and it is what an operator
+    followed. Pinning it means a future edit cannot quietly restore it.
+    """
+    table = _ownership_table(env_example)
+    inbox_group_start = table.index("EASYWEEK_PROCESSING_ENABLED")
+    inbox_group = table[inbox_group_start : table.index(f"-> {INBOX_SERVICE}", inbox_group_start)]
+
+    assert MASTER_FLAG not in inbox_group, (
+        "the master flag must not be grouped with the inbox-worker-only settings: "
+        "recreating that service alone leaves the outbox worker sending"
+    )
+
+
+def test_the_master_flag_paragraph_names_both_readers(env_example: str) -> None:
+    """Its own declaration paragraph, not only the table at the top."""
+    # The ASSIGNMENT, at the start of a line: the ownership table above quotes
+    # the same text inside prose, and slicing on the first occurrence would cut
+    # the file before the declaration this test is about.
+    assignment = re.search(rf"^{MASTER_FLAG}=false$", env_example, flags=re.M)
+    assert assignment is not None, "the master flag must be declared in the example"
+    paragraph = prose(env_example[: assignment.start()])
+    paragraph = paragraph[paragraph.rindex("Создание EasyWeek MessageJob") :]
+
+    assert INBOX_SERVICE in paragraph
+    assert OUTBOX_SERVICE in paragraph
+    assert "ОБОИХ" in paragraph
+
+
+def test_the_runbook_gives_one_recreate_order_for_the_master_flag(pr12_section: str) -> None:
+    """One canonical command, so no step has to invent its own."""
+    text = prose(pr12_section)
+    assert "читают ДВА long-running сервиса" in text
+    assert "единственный проверенный порядок" in text
+
+    both = [
+        block
+        for block in bash_blocks(pr12_section)
+        if "--force-recreate" in block and OUTBOX_SERVICE in block and INBOX_SERVICE in block
+    ]
+    assert both, "the chapter must carry a command that recreates both readers together"
+
+
+def test_turning_the_master_flag_off_is_never_documented_as_one_service(pr12_section: str) -> None:
+    """Wherever the operator may close the master flag, both readers are named."""
+    text = prose(pr12_section)
+    rollback = text[text.index("16.3 Rollback") :]
+
+    assert MASTER_FLAG in rollback
+    master_note = rollback[rollback.index(MASTER_FLAG) :]
+    assert "оба" in master_note.lower(), "the rollback note must not imply one service is enough"
+    assert "16.1" in master_note, "and it must point at the single verified order"
+
+
+def test_the_outbox_runtime_check_shows_the_master_flag_with_the_retention_gates(
+    pr12_section: str,
+) -> None:
+    """A report of `retention_send` alone cannot distinguish two states.
+
+    "Sending is fenced off" and "the outbox worker is still running with the old
+    environment where the master flag was true" look identical unless the check
+    prints the master flag from inside that container.
+    """
+    checks = [
+        block
+        for block in bash_blocks(pr12_section)
+        if OUTBOX_SERVICE in block and "settings.easyweek_retention_send_enabled" in block
+    ]
+    assert checks, "the rollout must read the outbox worker's effective config"
+    for block in checks:
+        assert "settings.easyweek_notifications_enabled" in block, (
+            "the outbox effective-config check must print the master flag too"
+        )
+        assert "settings.easyweek_retention_canary_job_id" in block
+        assert "exec" in block.split(), "an effective-config read is about THIS running container"
+
+
+def test_the_runbook_explains_why_the_outbox_check_prints_the_master_flag(pr12_section: str) -> None:
+    text = prose(pr12_section)
+    assert "читают **оба** long-running сервиса" in text
+    assert "со старым окружением" in text
