@@ -631,6 +631,34 @@ class Settings(BaseSettings):
     # the rollback is the flag, never a DELETE.
     easyweek_visit_counter_enabled: bool = False
 
+    # --- PR-12: repeat_10d / comeback_3d retention ----------------------------
+    # The same two-flag shape as PR-8 and PR-9, and for the same reason:
+    # planning and sending are turned on at different points in the rollout.
+    #
+    #   easyweek_retention_enabled       -> ONLY planning repeat_10d and
+    #                                       comeback_3d (easyweek inbox worker)
+    #   easyweek_retention_send_enabled  -> the SEND FENCE (shared outbox worker)
+    #
+    # easyweek_notifications_enabled remains the master gate above both: a
+    # retention message is a customer notification, and the master switch must
+    # not be bypassed by a second flag.
+    #
+    # Narrow ON PURPOSE. This pair permits exactly `repeat_10d` and
+    # `comeback_3d` and nothing else — it is not a "marketing" or "campaigns"
+    # switch. Newsletters, promo and the campaign runner stay Altegio-only, and
+    # naming this flag after them would let a future job type inherit an
+    # authorisation nobody granted it.
+    #
+    # Deliberately NOT merged with easyweek_visit_counter_enabled either. The
+    # counter is domain bookkeeping that sends nothing and answers to no
+    # notification fence; these two decide whether a real person is messaged.
+    easyweek_retention_enabled: bool = False
+    # False means EasyWeek retention jobs are not claimed at all — they stay
+    # `queued`, spend no attempts and keep their run_at, which is exactly the
+    # state the read-only preflight is meant to inspect. Closing it does not
+    # cancel what is already queued, and turning planning off does not open it.
+    easyweek_retention_send_enabled: bool = False
+
     # PR-7.1: exact EasyWeek service-category allowlist as a JSON array of
     # strings. Parsing is deliberately deferred to the shared eligibility
     # helper so malformed input suppresses EasyWeek jobs without preventing the

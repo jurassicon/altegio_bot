@@ -132,10 +132,15 @@ async def _count(db: AsyncSession, model: Any, **where: Any) -> int:
 
 
 async def test_the_seed_writes_exactly_the_branch_template_suite(db: AsyncSession) -> None:
-    """Four lifecycle codes plus the two PR-8 reminders — and nothing else."""
+    """Four lifecycle codes, the two PR-8 reminders, review, and PR-12 retention.
+
+    The list is exhaustive on purpose: seeding a row is the first half of being
+    able to send it, so a code appearing here without a deliberate decision is
+    exactly the drift this assertion exists to catch.
+    """
     result = await _run_seed(db)
 
-    assert result.templates_created == 7
+    assert result.templates_created == 9
     rows = await _easyweek_templates(db)
     assert [r.code for r in rows] == sorted(
         [
@@ -146,6 +151,8 @@ async def test_the_seed_writes_exactly_the_branch_template_suite(db: AsyncSessio
             "reminder_24h",
             "reminder_2h",
             "review_3d",
+            "repeat_10d",
+            "comeback_3d",
         ]
     )
 
@@ -198,11 +205,11 @@ async def test_the_seed_writes_two_branch_specific_suites(db: AsyncSession, monk
     ]
 
     result = await _run_seed(db, api_locations=api_locations)
-    assert result.templates_created == 14
+    assert result.templates_created == 18
     assert result.senders_created == 2
 
     rows = await _easyweek_templates(db)
-    assert len(rows) == 14
+    assert len(rows) == 18
     by_company: dict[int, list[MessageTemplate]] = {}
     for row in rows:
         by_company.setdefault(row.company_id, []).append(row)
@@ -233,18 +240,21 @@ async def test_the_seed_writes_two_branch_specific_suites(db: AsyncSession, monk
     second = await seed_script.seed(db, plan=plan)
     await db.flush()
     assert second.templates_created == 0
-    assert second.templates_updated == 14
-    assert await _count(db, MessageTemplate, provider=PROVIDER_EASYWEEK) == 14
+    assert second.templates_updated == 18
+    assert await _count(db, MessageTemplate, provider=PROVIDER_EASYWEEK) == 18
     assert await _count(db, WhatsAppSender, provider=PROVIDER_EASYWEEK) == 2
 
 
-@pytest.mark.parametrize("absent_code", ["repeat_10d", "comeback_3d", "newsletter_new_clients_monthly"])
+@pytest.mark.parametrize(
+    "absent_code",
+    ["newsletter_new_clients_monthly", "newsletter_new_clients_followup", "promo_card_booking_reminder"],
+)
 async def test_the_seed_writes_no_deferred_marketing_codes(db: AsyncSession, absent_code: str) -> None:
-    """PR-8 admitted the two reminders and nothing else.
+    """PR-12 admitted repeat and comeback; it admitted nothing else.
 
-    Review, repeat, comeback and newsletters each need something EasyWeek has no
-    equivalent for, and seeding a row for one would be the first half of sending
-    it.
+    Newsletters and promo each need something EasyWeek has no equivalent for — an
+    Altegio-keyed link map, a campaign runner built around Altegio client ids —
+    and seeding a row for one would be the first half of sending it.
     """
     await _run_seed(db)
     assert await _count(db, MessageTemplate, provider=PROVIDER_EASYWEEK, code=absent_code) == 0
@@ -275,11 +285,11 @@ async def test_running_the_seed_twice_creates_no_duplicates(db: AsyncSession) ->
     second = await _run_seed(db)
     after = [(r.id, r.code, r.body, r.meta_template_name) for r in await _easyweek_templates(db)]
 
-    assert first.templates_created == 7
+    assert first.templates_created == 9
     assert second.templates_created == 0
-    assert second.templates_updated == 7
+    assert second.templates_updated == 9
     assert after == before, "a re-run must not add, renumber or rewrite rows"
-    assert await _count(db, MessageTemplate, provider=PROVIDER_EASYWEEK) == 7
+    assert await _count(db, MessageTemplate, provider=PROVIDER_EASYWEEK) == 9
 
 
 async def test_the_seed_reactivates_a_row_an_operator_disabled(db: AsyncSession) -> None:
@@ -435,7 +445,7 @@ async def test_the_seed_refuses_an_unconfigured_environment(
 async def test_a_matching_api_uuid_seeds(db: AsyncSession, capsys) -> None:
     result = await _run_seed(db)
 
-    assert result.templates_created == 7
+    assert result.templates_created == 9
     assert await _count(db, WhatsAppSender, provider=PROVIDER_EASYWEEK) == 1
     assert "KitiLash Durlach" in capsys.readouterr().out
 
@@ -665,9 +675,11 @@ async def test_canceled_uses_the_static_booking_page_not_the_manage_link(db: Asy
 async def test_an_unseeded_code_still_fails_closed(db: AsyncSession) -> None:
     """An EasyWeek job must never borrow an Altegio row of the same code.
 
-    PR-8 seeded the two reminder codes, so the code used here is one that is
-    still deliberately unseeded for EasyWeek. The invariant is unchanged and is
-    exactly what keeps a marketing template from becoming reachable the moment
+    PR-12 seeded the two retention codes, so the code used here is one that is
+    still deliberately unseeded for EasyWeek — and it is a UNIVERSAL code on the
+    Altegio side, which is what makes it the sharp case: universal codes are the
+    ones reachable by a cross-company fallback. The invariant is unchanged and is
+    exactly what keeps a newsletter template from becoming reachable the moment
     someone adds an Altegio row for the same company id.
     """
     await _run_seed(db)
@@ -676,9 +688,9 @@ async def test_an_unseeded_code_still_fails_closed(db: AsyncSession) -> None:
         MessageTemplate(
             provider=PROVIDER_ALTEGIO,
             company_id=DURLACH_LOCATION_ID,
-            code="repeat_10d",
+            code="newsletter_new_clients_monthly",
             language="de",
-            body="ALTEGIO REPEAT",
+            body="ALTEGIO NEWSLETTER",
             is_active=True,
         )
     )
@@ -688,7 +700,7 @@ async def test_an_unseeded_code_still_fails_closed(db: AsyncSession) -> None:
         await ow._render_message(
             db,
             company_id=DURLACH_LOCATION_ID,
-            template_code="repeat_10d",
+            template_code="newsletter_new_clients_monthly",
             record=record,
             client=client,
             provider=PROVIDER_EASYWEEK,
@@ -697,7 +709,49 @@ async def test_an_unseeded_code_still_fails_closed(db: AsyncSession) -> None:
     message = str(excinfo.value)
     assert "Template not found" in message
     assert PROVIDER_EASYWEEK in message
-    assert "ALTEGIO REPEAT" not in message
+    assert "ALTEGIO NEWSLETTER" not in message
+
+
+@pytest.mark.parametrize("code", ["repeat_10d", "comeback_3d"])
+async def test_a_seeded_retention_code_renders_from_the_easyweek_row(db: AsyncSession, code: str) -> None:
+    """PR-12: EasyWeek now owns these codes, and still never reads Altegio's row.
+
+    Both providers have a `repeat_10d` and a `comeback_3d` for the SAME numeric
+    company id here, which is the collision the provider predicate exists to
+    survive. The EasyWeek render must resolve its own branch-bound row — Meta
+    name, body and footer — and the Altegio body must not appear anywhere in it.
+    """
+    await _run_seed(db)
+    client, record = await _seed_durlach_domain(db)
+    db.add(
+        MessageTemplate(
+            provider=PROVIDER_ALTEGIO,
+            company_id=DURLACH_LOCATION_ID,
+            code=code,
+            language="de",
+            body="ALTEGIO RETENTION",
+            meta_template_name="kitilash_ka_altegio_v1",
+            is_active=True,
+        )
+    )
+    await db.flush()
+
+    body, _sender_id, _lang, ctx = await ow._render_message(
+        db,
+        company_id=DURLACH_LOCATION_ID,
+        template_code=code,
+        record=record,
+        client=client,
+        provider=PROVIDER_EASYWEEK,
+    )
+
+    assert ctx["meta_template_name"] == f"kitilash_du_{code}_v1"
+    assert "ALTEGIO RETENTION" not in body
+    assert "KitiLash Durlach" in body
+    # Both retention messages call the customer back to the branch's own booking
+    # page — never the manage link of a booking that is over or cancelled.
+    assert ctx["booking_link"] == STATIC_BOOKING_PAGE
+    assert VERIFIED_PAGE not in body.format(**ctx)
 
 
 async def test_a_seeded_reminder_renders_from_the_easyweek_row(db: AsyncSession) -> None:
@@ -1079,7 +1133,7 @@ async def test_both_correct_profiles_seed_a_full_suite_each_and_two_senders(
     await _run_seed(db, api_locations=_BOTH_API_LOCATIONS)
 
     templates, senders = await _easyweek_state(db)
-    assert (templates, senders) == (14, 2)
+    assert (templates, senders) == (18, 2)
 
     rows = await _easyweek_templates(db)
     by_company: dict[int, set[str]] = {}

@@ -32,6 +32,10 @@ REMINDER_2H = "reminder_2h"
 
 REVIEW_3D = "review_3d"
 
+# PR-12. The two retention messages, and deliberately only those two.
+REPEAT_10D = "repeat_10d"
+COMEBACK_3D = "comeback_3d"
+
 # A TEMPLATE CODE, deliberately not a job type.
 #
 # A first-time customer gets a different approved Meta template, which means a
@@ -73,16 +77,32 @@ EASYWEEK_REMINDER_JOB_TYPES: frozenset[str] = frozenset(
 # this union so a new EasyWeek notification kind has exactly one place to be
 # registered.
 #
-# repeat_10d, comeback_3d, newsletters, follow-up, promo and campaigns remain
-# Altegio-only. That is not an oversight to be relaxed by
-# whoever next touches a worker: each of those paths calls something EasyWeek
-# has no equivalent for — the Altegio API, an Altegio-keyed BOOKING_LINKS entry,
-# a campaign runner built around Altegio client ids.
+# Newsletters, follow-up, promo and campaigns remain Altegio-only. That is not
+# an oversight to be relaxed by whoever next touches a worker: each of those
+# paths calls something EasyWeek has no equivalent for — the Altegio API, an
+# Altegio-keyed BOOKING_LINKS entry, a campaign runner built around Altegio
+# client ids.
 # PR-9. Earned by a proven `booking-succeeded`, sent three days after the
 # appointment. Its own set because it is marketing rather than a lifecycle
 # notification: it carries a different param contract, a different link and its
 # own send fence, and it must never inherit the reminder or lifecycle rules.
 EASYWEEK_REVIEW_JOB_TYPES: frozenset[str] = frozenset({REVIEW_3D})
+
+# PR-12. Retention: the two messages that ask a customer to come back.
+#
+# Its OWN set, exactly like the review one, and for the same reason: these two
+# are gated by their own planning flag and their own send fence, they carry
+# their own param contracts, and their eligibility is decided by the proven
+# `Client.easyweek_visits_total` counter rather than by anything the reminder or
+# lifecycle rules know about.
+#
+# The set is closed at two members on purpose. Newsletters, newsletter
+# follow-up, promo and campaign execution are NOT retention and must not be
+# added here to "reuse the fence": each of them reaches an Altegio API, an
+# Altegio-keyed link map or a campaign runner built around Altegio client ids,
+# and a wider set here would silently let one of them through every EasyWeek
+# gate downstream.
+EASYWEEK_RETENTION_JOB_TYPES: frozenset[str] = frozenset({REPEAT_10D, COMEBACK_3D})
 
 # The job types whose rendering DEPENDS on a complete service snapshot: a single
 # RecordService with a title, a price, and a Record.total_cost that agrees with
@@ -99,10 +119,20 @@ EASYWEEK_REVIEW_JOB_TYPES: frozenset[str] = frozenset({REVIEW_3D})
 # customer's name and the proven review link — so a booking with an unknown
 # price still owes a perfectly sendable review, and failing it on a price it
 # never prints would lose the review outright.
+#
+# The PR-12 retention types are absent for the same reason, and the reason is
+# worth stating because `repeat_10d` DOES print a service. It prints the service
+# TITLE and nothing else: no price, no total. So the price half of this guard
+# would fail a perfectly sendable retention message over a number it never
+# renders. The title itself is proven instead by the retention pre-send guard,
+# which requires exactly one service carrying a non-blank one.
 EASYWEEK_SERVICE_SNAPSHOT_JOB_TYPES: frozenset[str] = EASYWEEK_LIFECYCLE_JOB_TYPES | EASYWEEK_REMINDER_JOB_TYPES
 
 EASYWEEK_CUSTOMER_JOB_TYPES: frozenset[str] = (
-    EASYWEEK_LIFECYCLE_JOB_TYPES | EASYWEEK_REMINDER_JOB_TYPES | EASYWEEK_REVIEW_JOB_TYPES
+    EASYWEEK_LIFECYCLE_JOB_TYPES
+    | EASYWEEK_REMINDER_JOB_TYPES
+    | EASYWEEK_REVIEW_JOB_TYPES
+    | EASYWEEK_RETENTION_JOB_TYPES
 )
 
 

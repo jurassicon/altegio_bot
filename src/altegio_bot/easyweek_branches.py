@@ -49,6 +49,12 @@ REMINDER_24H: Final = "reminder_24h"
 REMINDER_2H: Final = "reminder_2h"
 # PR-9: the review request earned by a proven booking-succeeded.
 REVIEW_3D: Final = "review_3d"
+# PR-12: the two retention messages. Seeded per branch exactly like every code
+# above, so each is bound to one branch's Meta name, body and footer by the same
+# contract — a retention message signed by the wrong salon is the failure this
+# binding exists to make impossible.
+REPEAT_10D: Final = "repeat_10d"
+COMEBACK_3D: Final = "comeback_3d"
 
 BRANCH_TEMPLATE_CODES: Final = (
     RECORD_CREATED,
@@ -58,6 +64,8 @@ BRANCH_TEMPLATE_CODES: Final = (
     REMINDER_24H,
     REMINDER_2H,
     REVIEW_3D,
+    REPEAT_10D,
+    COMEBACK_3D,
 )
 
 PRE_APPOINTMENT_NOTES_DE: Final = (
@@ -239,6 +247,25 @@ def branch_template_contract(profile: BranchProfile, template_code: str) -> Bran
             "*Service:*\n"
             "{services}\n\n"
             f"Termin verwalten: {{booking_link}}{footer}"
+        ),
+        # PR-12. Three positional parameters: the name, the ONE service this
+        # booking was for, and the branch's booking page. No price and no total
+        # — a repeat invitation is about the next appointment, not the last
+        # invoice, and every value printed here has to stay true for ten days.
+        REPEAT_10D: (
+            "*{client_name}, hallo!*\n\n"
+            "Seit Ihrem Termin ({primary_service}) sind zehn Tage vergangen. "
+            "Möchten Sie den nächsten Termin buchen?\n\n"
+            f"Termin buchen: {{booking_link}}{footer}"
+        ),
+        # Two positional parameters only. A cancelled booking has no service to
+        # promise and no time to name, so the message says neither: it invites
+        # the customer back and nothing more.
+        COMEBACK_3D: (
+            "*{client_name}, hallo!*\n\n"
+            "Schade, dass Ihr Termin nicht stattgefunden hat. "
+            "Wir würden uns freuen, Sie bald wiederzusehen.\n\n"
+            f"Neuen Termin buchen: {{booking_link}}{footer}"
         ),
     }
     return BranchTemplateContract(

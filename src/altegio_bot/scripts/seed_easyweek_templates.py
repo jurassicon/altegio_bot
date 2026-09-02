@@ -31,12 +31,14 @@ from altegio_bot.easyweek_branches import (
 from altegio_bot.easyweek_client import EasyWeekClient, EasyWeekError
 from altegio_bot.easyweek_locations import EasyWeekLocation, configured_easyweek_locations
 from altegio_bot.easyweek_policy import (
+    COMEBACK_3D,
     RECORD_CANCELED,
     RECORD_CREATED,
     RECORD_CREATED_NEW_CLIENT,
     RECORD_UPDATED,
     REMINDER_2H,
     REMINDER_24H,
+    REPEAT_10D,
     REVIEW_3D,
     validate_static_booking_page,
 )
@@ -46,7 +48,9 @@ from altegio_bot.settings import settings
 LANGUAGE = "de"
 # PR-8 adds the two reminder codes here rather than in a second seeding path:
 # a reminder row must be bound to its branch by exactly the contract the
-# lifecycle rows already use — one branch's Meta name, body and footer.
+# lifecycle rows already use — one branch's Meta name, body and footer. PR-12
+# adds the two retention codes on the same terms, and the seed stays idempotent
+# and delete-free: an existing row converges on the contract, nothing is dropped.
 TEMPLATE_CODES = (
     RECORD_CREATED,
     RECORD_CREATED_NEW_CLIENT,
@@ -55,6 +59,8 @@ TEMPLATE_CODES = (
     REMINDER_24H,
     REMINDER_2H,
     REVIEW_3D,
+    REPEAT_10D,
+    COMEBACK_3D,
 )
 
 

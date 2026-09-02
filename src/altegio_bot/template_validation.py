@@ -151,6 +151,18 @@ _LIFECYCLE_RULES: dict[str, _TemplateRule] = {
         2,
         ["client_name", "review_url"],
     ),
+    # PR-12 retention. Same counts and order as the approved Altegio templates
+    # for these codes, with the link slot named `booking_link` because EasyWeek
+    # fills it with the branch's proven booking page rather than a stored
+    # `short_link`.
+    "repeat_10d": (
+        3,
+        ["client_name", "primary_service", "booking_link"],
+    ),
+    "comeback_3d": (
+        2,
+        ["client_name", "booking_link"],
+    ),
 }
 
 
