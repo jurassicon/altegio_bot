@@ -14,11 +14,13 @@ Four defects made it unrunnable, and each is pinned here:
 from __future__ import annotations
 
 import re
+import shlex
 from pathlib import Path
 
 import pytest
 
 from altegio_bot.scripts import clone_meta_templates_for_location as cloner
+from altegio_bot.scripts import reconcile_easyweek_templates as reconciler
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 RUNBOOK = REPO_ROOT / "docs" / "easyweek" / "approved_template_contract_runbook.md"
@@ -40,8 +42,10 @@ def bash_blocks(text: str) -> list[str]:
 def command_args(block: str, module: str) -> list[str]:
     """The argv a `-m <module>` invocation would pass, as the operator typed it."""
     line = next(line for line in block.splitlines() if module in line)
-    tokens = re.findall(r'"[^"]*"|\S+', line)
-    tokens = [token.strip('"') for token in tokens]
+    # Parse the documented shell argv without executing any shell expansion.
+    line = line.replace("$(date -u +%Y%m%dT%H%M%SZ)", "20260903T120000Z")
+    assert "$(" not in line, "new shell substitutions need an explicit test fixture"
+    tokens = shlex.split(line)
     return tokens[tokens.index("-m") + 2 :]
 
 
@@ -185,6 +189,31 @@ def test_the_apply_step_writes_and_keeps_a_snapshot(runbook: str) -> None:
     assert "--snapshot" in reconcile
     assert "snapshot_written" in text
     assert "cannot be reconstructed afterwards" in text
+
+
+def test_all_reconcile_apply_commands_parse_with_persistent_snapshots(runbook: str) -> None:
+    blocks = [block for block in bash_blocks(runbook) if RECONCILE_MODULE in block and "--apply" in block]
+    assert len(blocks) >= 2, "template reconcile and sender activation both need full apply commands"
+    snapshots = []
+    for block in blocks:
+        args = reconciler._parse_args(command_args(block, RECONCILE_MODULE))
+        assert args.apply is True
+        assert args.snapshot.startswith("/app/outputs/easyweek_templates/")
+        assert "-v /opt/altegio_bot/outputs:/app/outputs" in block
+        snapshots.append(args.snapshot)
+    assert len(snapshots) == len(set(snapshots)), "sender activation must not reuse the BODY backup"
+
+
+def test_sender_activation_has_its_own_complete_apply_command(runbook: str) -> None:
+    sender = section(runbook, "## 7.")
+    blocks = [block for block in bash_blocks(sender) if RECONCILE_MODULE in block and "--apply" in block]
+    assert len(blocks) == 1
+    args = reconciler._parse_args(command_args(blocks[0], RECONCILE_MODULE))
+    assert args.branches == ["karlsruhe"]
+    assert set(args.codes) == {"review_3d", "repeat_10d", "comeback_3d"}
+    assert args.include_sender is True
+    assert args.snapshot.startswith("/app/outputs/easyweek_templates/karlsruhe-sender-")
+    assert "same command with `--apply`" not in prose(sender)
 
 
 def test_the_rollback_states_what_it_does_not_prove(rollback: str) -> None:

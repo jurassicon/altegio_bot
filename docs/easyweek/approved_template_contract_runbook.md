@@ -258,8 +258,19 @@ cd /opt/altegio_bot
 $COMPOSE run --rm --no-deps --entrypoint /app/.venv/bin/python altegio-outbox-worker -m altegio_bot.scripts.reconcile_easyweek_templates --branch karlsruhe --code review_3d --code repeat_10d --code comeback_3d --include-sender
 ```
 
-Then the same command with `--apply`. A sender pointing at a different WhatsApp
-line is refused, never rewritten.
+After reviewing that dry-run and approving the queue consequence, apply with a
+**new, separate snapshot** and the same persistent host mount as step 5:
+
+```bash
+cd /opt/altegio_bot
+$COMPOSE run --rm --no-deps -v /opt/altegio_bot/outputs:/app/outputs --entrypoint /app/.venv/bin/python altegio-outbox-worker -m altegio_bot.scripts.reconcile_easyweek_templates --branch karlsruhe --code review_3d --code repeat_10d --code comeback_3d --include-sender --apply --snapshot /app/outputs/easyweek_templates/karlsruhe-sender-$(date -u +%Y%m%dT%H%M%SZ).json
+```
+
+Keep the printed `snapshot_written` file for this run. It captures the template
+state immediately before **this** apply, not the earlier BODY changes; it does
+not replace step 5's snapshot. Never reuse an earlier snapshot path; an existing
+path is refused, not overwritten. Template restore does **not** roll back a
+sender. A sender pointing at a different WhatsApp line is refused, never rewritten.
 
 Do **not** re-drive `failed` jobs. And do not conclude that "Karlsruhe
 notifications are restored" from this: only three codes and one sender were
@@ -349,6 +360,19 @@ reverted afterwards.
 This is why step 5's apply requires `--snapshot`. That file is the only record of
 what the rows were, it lands on a host path, and it survives the `--rm`
 container.
+
+Snapshot **version 2** freezes the previous values and `expected_after` together
+for each `(provider, company_id, code, language)` key: exact BODY, Meta template
+name and activity, plus the original row id for an existing row. Restore accepts
+only the exact expected-after state or an already restored state. A created row
+is an idempotent no-op only when its BODY and name still match and it is inactive.
+An inactive row with edited text or name still blocks the **whole batch**, as
+does a later edit to an existing row's name or activity.
+
+The proof comes from the saved snapshot, never from the current branch registry.
+A missing/invalid registry cannot bypass it. Version 1 and incomplete snapshots
+without `expected_after` are refused before any write; do not hand-upgrade them
+or fill in guessed values. They require a separate manual rollback decision.
 
 **1. Close both send fences and prove it**, exactly as in step 2:
 

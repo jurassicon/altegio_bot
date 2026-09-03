@@ -124,7 +124,7 @@ ERROR_SNAPSHOT_UNWRITABLE: Final = "snapshot_path_not_writable"
 
 # Version of the snapshot artefact. A restore refuses a version it does not know
 # rather than guessing which fields an older file omitted.
-SNAPSHOT_VERSION: Final = 1
+SNAPSHOT_VERSION: Final = 2
 # Owner read/write only: the artefact names internal ids and branch slugs, and it
 # lands in a directory an operator may share.
 SNAPSHOT_MODE: Final = 0o600
@@ -144,6 +144,7 @@ class TemplatePlan:
     meta_template_name: str
     action: str
     blocked_by: str | None = None
+    expected_after: dict[str, Any] | None = None
 
     @property
     def writes(self) -> bool:
@@ -314,7 +315,9 @@ async def _existing_rows(session: AsyncSession, *, company_id: int, code: str, l
 
 
 def _template_action(row: MessageTemplate, *, name: str, body: str) -> str:
-    needs_update = (row.meta_template_name or "").strip() != name or row.body != body
+    # A no-op must leave the exact expected-after state, not just a name that
+    # normalises to it. Otherwise its snapshot would promise unwritten values.
+    needs_update = row.meta_template_name != name or row.body != body
     needs_activation = not bool(row.is_active)
     if needs_update and needs_activation:
         return ACTION_UPDATE_AND_ACTIVATE
@@ -386,6 +389,15 @@ async def plan_templates(
                     meta_template_name=contract.meta_template_name,
                     action=action,
                     blocked_by=blocker,
+                    expected_after=(
+                        {
+                            "body": contract.raw_body,
+                            "meta_template_name": contract.meta_template_name,
+                            "is_active": True,
+                        }
+                        if blocker is None
+                        else None
+                    ),
                 )
             )
     return plans
@@ -503,18 +515,30 @@ async def capture_snapshot(
     *,
     branches: Sequence[VerifiedBranch],
     codes: Sequence[str],
+    plans: Sequence[TemplatePlan],
     language: str,
 ) -> dict[str, Any]:
-    """Every selected key's state before the apply, existing or not."""
+    """Freeze before and intended after together, before the first mutation.
+
+    The restore must not derive its proof from a later registry or contract.
+    Evidence comes from the verified plan, never from the current database row.
+    """
     rows: list[dict[str, Any]] = []
+    by_key = {(plan.company_id, plan.code): plan for plan in plans}
     for branch in branches:
         company_id = branch.location.company_id
         for code in codes:
+            plan = by_key[(company_id, code)]
             existing = await _existing_rows(session, company_id=company_id, code=code, language=language)
-            if not existing:
-                rows.append(_snapshot_absent(company_id=company_id, code=code, language=language))
-                continue
-            rows.extend(_snapshot_row(row) for row in existing)
+            if plan.expected_after is None or plan.blocked_by or len(existing) > 1:
+                raise ReconcileError("snapshot_plan_not_proven")
+            entry = (
+                _snapshot_row(existing[0])
+                if existing
+                else _snapshot_absent(company_id=company_id, code=code, language=language)
+            )
+            entry["expected_after"] = dict(plan.expected_after)
+            rows.append(entry)
     return {
         "snapshot_version": SNAPSHOT_VERSION,
         "captured_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -708,7 +732,10 @@ async def run_reconcile(
         # rollback does not need; and a path that turns out to be unwritable
         # would be discovered with the rows already overwritten.
         write_snapshot(
-            snapshot_path, await capture_snapshot(session, branches=selected, codes=codes, language=plan.language)
+            snapshot_path,
+            await capture_snapshot(
+                session, branches=selected, codes=codes, plans=report.templates, language=plan.language
+            ),
         )
         report.snapshot_written = str(snapshot_path)
 

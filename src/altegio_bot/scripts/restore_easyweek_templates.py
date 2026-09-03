@@ -61,6 +61,7 @@ BLOCK_SNAPSHOT_SCOPE: Final = "snapshot_outside_supported_scope"
 BLOCK_ROW_VANISHED: Final = "row_no_longer_exists"
 BLOCK_ROW_DUPLICATED: Final = "rows_duplicated"
 BLOCK_ROW_CHANGED_SINCE: Final = "row_changed_after_the_apply"
+STATE_FIELDS: Final = ("body", "meta_template_name", "is_active")
 
 ERROR_CONFIGURATION: Final = "configuration_error"
 ERROR_UNEXPECTED: Final = "unexpected_error"
@@ -132,6 +133,16 @@ class RestoreReport:
         }
 
 
+def _valid_state(value: Any) -> bool:
+    return (
+        isinstance(value, dict)
+        and all(key in value for key in STATE_FIELDS)
+        and isinstance(value["body"], str)
+        and (value["meta_template_name"] is None or isinstance(value["meta_template_name"], str))
+        and type(value["is_active"]) is bool
+    )
+
+
 def load_snapshot(path: Path) -> dict[str, Any]:
     """Read and structurally validate the artefact. Never trusts its shape."""
     try:
@@ -147,27 +158,46 @@ def load_snapshot(path: Path) -> dict[str, Any]:
     rows = raw.get("rows")
     if not isinstance(rows, list) or not rows:
         raise ReconcileError(f"{BLOCK_SNAPSHOT_SHAPE}: {path.name}")
+    seen = set()
     for row in rows:
         if not isinstance(row, dict):
             raise ReconcileError(f"{BLOCK_SNAPSHOT_SHAPE}: {path.name}")
         if row.get("provider") != PROVIDER_EASYWEEK:
             raise ReconcileError(f"{BLOCK_SNAPSHOT_SCOPE}: {path.name}")
-        if row.get("code") not in RECONCILABLE_CODES:
+        if not isinstance(row.get("code"), str) or row["code"] not in RECONCILABLE_CODES:
             # The same closed set the apply is limited to. A snapshot naming a
             # lifecycle or reminder code did not come from that command.
             raise ReconcileError(f"{BLOCK_SNAPSHOT_SCOPE}: {path.name}")
-        if not isinstance(row.get("company_id"), int) or not isinstance(row.get("language"), str):
+        if (
+            type(row.get("company_id")) is not int
+            or row["company_id"] <= 0
+            or not isinstance(row.get("language"), str)
+            or not row["language"]
+        ):
+            raise ReconcileError(f"{BLOCK_SNAPSHOT_SHAPE}: {path.name}")
+        key = (row["provider"], row["company_id"], row["code"], row["language"])
+        if key in seen:
+            raise ReconcileError(f"{BLOCK_SNAPSHOT_SHAPE}: {path.name}")
+        seen.add(key)
+        after = row.get("expected_after")
+        if (
+            not _valid_state(after)
+            or after["is_active"] is not True
+            or not isinstance(after["meta_template_name"], str)
+            or not after["meta_template_name"].strip()
+        ):
+            # v1, incomplete or unproven evidence is never reconstructed from
+            # today's registry. Every reconcile result must be active.
             raise ReconcileError(f"{BLOCK_SNAPSHOT_SHAPE}: {path.name}")
         if row.get("existed") is True:
-            for key in ("id", "body", "meta_template_name", "is_active"):
-                if key not in row:
-                    raise ReconcileError(f"{BLOCK_SNAPSHOT_SHAPE}: {path.name}")
+            if not _valid_state(row) or type(row.get("id")) is not int or row["id"] <= 0:
+                raise ReconcileError(f"{BLOCK_SNAPSHOT_SHAPE}: {path.name}")
         elif row.get("existed") is not False:
             raise ReconcileError(f"{BLOCK_SNAPSHOT_SHAPE}: {path.name}")
     return raw
 
 
-async def _rows_for(session: AsyncSession, entry: dict[str, Any]) -> list[MessageTemplate]:
+async def _rows_for(session: AsyncSession, entry: dict[str, Any], *, lock: bool) -> list[MessageTemplate]:
     stmt = (
         select(MessageTemplate)
         .where(MessageTemplate.provider == PROVIDER_EASYWEEK)
@@ -175,11 +205,19 @@ async def _rows_for(session: AsyncSession, entry: dict[str, Any]) -> list[Messag
         .where(MessageTemplate.code == entry["code"])
         .where(MessageTemplate.language == entry["language"])
         .order_by(MessageTemplate.id.asc())
+        .execution_options(populate_existing=True)
     )
+    if lock:
+        stmt = stmt.with_for_update()
     return list((await session.execute(stmt)).scalars().all())
 
 
-def _plan_for(entry: dict[str, Any], rows: list[MessageTemplate], *, contract_body: str | None) -> RestorePlan:
+def _state_matches(row: MessageTemplate, state: dict[str, Any]) -> bool:
+    # Exact values, including nullable name and an inactive pre-apply state.
+    return all(getattr(row, key) == state[key] for key in STATE_FIELDS)
+
+
+def _plan_for(entry: dict[str, Any], rows: list[MessageTemplate]) -> RestorePlan:
     """What this key needs, or why it may not be touched."""
     base = {"company_id": entry["company_id"], "code": entry["code"], "language": entry["language"]}
 
@@ -194,15 +232,10 @@ def _plan_for(entry: dict[str, Any], rows: list[MessageTemplate], *, contract_bo
         row = rows[0]
         if row.id != entry["id"]:
             return RestorePlan(**base, action=ACTION_UNCHANGED, blocked_by=BLOCK_ROW_CHANGED_SINCE)
-        already = (
-            row.body == entry["body"]
-            and (row.meta_template_name or "") == (entry["meta_template_name"] or "")
-            and bool(row.is_active) == bool(entry["is_active"])
-        )
-        if already:
+        if _state_matches(row, entry):
             # Idempotent: a second restore over a restored row is a no-op.
             return RestorePlan(**base, action=ACTION_UNCHANGED)
-        if contract_body is not None and row.body not in (contract_body, entry["body"]):
+        if not _state_matches(row, entry["expected_after"]):
             # The row holds neither what the apply wrote nor what it replaced.
             # Something else edited it, and that edit is not ours to discard.
             return RestorePlan(**base, action=ACTION_UNCHANGED, blocked_by=BLOCK_ROW_CHANGED_SINCE)
@@ -212,36 +245,14 @@ def _plan_for(entry: dict[str, Any], rows: list[MessageTemplate], *, contract_bo
     if not rows:
         return RestorePlan(**base, action=ACTION_UNCHANGED)
     row = rows[0]
-    if not bool(row.is_active):
+    after = entry["expected_after"]
+    if _state_matches(row, {**after, "is_active": False}):
         return RestorePlan(**base, action=ACTION_UNCHANGED)
-    if contract_body is not None and row.body != contract_body:
+    if not _state_matches(row, after):
         # A created row that no longer holds what the apply wrote was edited
         # afterwards; deactivating it would silently retire someone's change.
         return RestorePlan(**base, action=ACTION_UNCHANGED, blocked_by=BLOCK_ROW_CHANGED_SINCE)
     return RestorePlan(**base, action=ACTION_DEACTIVATE)
-
-
-def _contract_body(company_id: int, code: str) -> str | None:
-    """What the apply would have written for this key, if it can be derived.
-
-    Used only to tell "still holds what the apply wrote" from "someone changed it
-    afterwards". It is never written by this command — the snapshot is the only
-    source of a restored value.
-    """
-    from altegio_bot.easyweek_branches import BRANCH_PROFILES, branch_template_contract
-    from altegio_bot.easyweek_locations import configured_easyweek_locations
-
-    registry = configured_easyweek_locations()
-    if not registry.ready:
-        return None
-    location = registry.locations.get(company_id)
-    if location is None:
-        return None
-    profile = BRANCH_PROFILES.get(location.name.strip().casefold())
-    if profile is None:
-        return None
-    contract = branch_template_contract(profile, code)
-    return contract.raw_body if contract is not None else None
 
 
 async def run_restore(session: AsyncSession, *, snapshot_path: Path, apply: bool = False) -> RestoreReport:
@@ -257,24 +268,27 @@ async def run_restore(session: AsyncSession, *, snapshot_path: Path, apply: bool
     entries = snapshot["rows"]
     # EVERY key is planned before any write, so one unusable row stops the whole
     # restore instead of leaving half of it applied.
+    planned_rows = []
     for entry in entries:
-        rows = await _rows_for(session, entry)
-        report.plans.append(_plan_for(entry, rows, contract_body=_contract_body(entry["company_id"], entry["code"])))
+        # Hold the checked rows until the caller commits/rolls back, so a later
+        # read cannot substitute an unverified manual edit before our write.
+        rows = await _rows_for(session, entry, lock=apply)
+        planned_rows.append(rows)
+        report.plans.append(_plan_for(entry, rows))
 
     if not apply or report.blocked:
         return report
 
-    for entry, plan in zip(entries, report.plans, strict=True):
+    for entry, plan, rows in zip(entries, report.plans, planned_rows, strict=True):
         if not plan.writes:
             continue
-        rows = await _rows_for(session, entry)
         row = rows[0]
         if plan.action == ACTION_DEACTIVATE:
             row.is_active = False
         else:
             row.body = entry["body"]
             row.meta_template_name = entry["meta_template_name"]
-            row.is_active = bool(entry["is_active"])
+            row.is_active = entry["is_active"]
         report.mutations_attempted += 1
     return report
 
