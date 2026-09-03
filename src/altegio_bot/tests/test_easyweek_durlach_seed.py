@@ -43,6 +43,10 @@ from altegio_bot.workers import outbox_worker as ow
 
 pytestmark = pytest.mark.asyncio
 
+# The three codes whose approved Meta bodies carry no branch footer. Branch
+# ownership is still proven — by the Meta name and by the row's own company_id.
+NEUTRAL_MARKETING_CODES = frozenset({"review_3d", "repeat_10d", "comeback_3d"})
+
 # A stand-in, never the production id — that lives in easyweek.env only, and a
 # repository-wide test enforces it. What these tests exercise is the MECHANISM:
 # the registry and the read-only API must agree, whatever the real number is.
@@ -215,10 +219,29 @@ async def test_the_seed_writes_two_branch_specific_suites(db: AsyncSession, monk
         by_company.setdefault(row.company_id, []).append(row)
     assert all(row.meta_template_name.startswith("kitilash_du_") for row in by_company[DURLACH_LOCATION_ID])
     assert all(row.meta_template_name.startswith("kitilash_ra_") for row in by_company[rastatt_id])
+
+    # The footer belongs to the BRANCH-SPECIFIC codes. The three marketing codes
+    # carry the approved Meta bodies, which name no branch at all — so asserting
+    # a footer on every row would assert the opposite of the approved content.
+    def _branch_specific(rows: list[MessageTemplate]) -> list[MessageTemplate]:
+        return [row for row in rows if row.code not in NEUTRAL_MARKETING_CODES]
+
     assert all(
-        "KitiLash Durlach" in row.body and "Pfinztalstraße" in row.body for row in by_company[DURLACH_LOCATION_ID]
+        "KitiLash Durlach" in row.body and "Pfinztalstraße" in row.body
+        for row in _branch_specific(by_company[DURLACH_LOCATION_ID])
     )
-    assert all("KitiLash Rastatt" in row.body and "Rathausstraße" in row.body for row in by_company[rastatt_id])
+    assert all(
+        "KitiLash Rastatt" in row.body and "Rathausstraße" in row.body
+        for row in _branch_specific(by_company[rastatt_id])
+    )
+    # And the neutral ones really are neutral, per branch, while still carrying
+    # that branch's own Meta name.
+    for company_id, prefix in ((DURLACH_LOCATION_ID, "du"), (rastatt_id, "ra")):
+        neutral = [row for row in by_company[company_id] if row.code in NEUTRAL_MARKETING_CODES]
+        assert len(neutral) == len(NEUTRAL_MARKETING_CODES)
+        for row in neutral:
+            assert "Pfinztalstraße" not in row.body and "Rathausstraße" not in row.body
+            assert row.meta_template_name == f"kitilash_{prefix}_{row.code}_v1"
 
     senders = list(
         (
@@ -747,7 +770,9 @@ async def test_a_seeded_retention_code_renders_from_the_easyweek_row(db: AsyncSe
 
     assert ctx["meta_template_name"] == f"kitilash_du_{code}_v1"
     assert "ALTEGIO RETENTION" not in body
-    assert "KitiLash Durlach" in body
+    # The approved retention bodies are neutral: the branch is proven by the Meta
+    # NAME and by the row this render resolved, not by an address in the text.
+    assert body == branch_template_contract(BRANCH_PROFILES["durlach"], code).raw_body
     # Both retention messages call the customer back to the branch's own booking
     # page — never the manage link of a booking that is over or cancelled.
     assert ctx["booking_link"] == STATIC_BOOKING_PAGE
@@ -1297,8 +1322,14 @@ async def test_the_karlsruhe_footer_is_its_own_source_controlled_content(
 
     rows = [row for row in await _easyweek_templates(db) if row.company_id == KARLSRUHE_LOCATION_ID]
     assert rows
-    for row in rows:
+    branch_specific = [row for row in rows if row.code not in NEUTRAL_MARKETING_CODES]
+    assert branch_specific, "the branch-specific codes are the ones that carry a footer"
+    for row in branch_specific:
         assert "76133 Karlsruhe, Kaiserstraße, 68" in row.body
+        assert "Pfinztalstraße" not in row.body
+        assert "Rathausstraße" not in row.body
+    # A neighbour's address must not appear in the neutral ones either.
+    for row in rows:
         assert "Pfinztalstraße" not in row.body
         assert "Rathausstraße" not in row.body
 

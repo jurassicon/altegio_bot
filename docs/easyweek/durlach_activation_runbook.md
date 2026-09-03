@@ -4182,6 +4182,17 @@ $COMPOSE exec -T altegio-outbox-worker /app/.venv/bin/python -c 'import sys; fro
 runner, общий marketing engine, backfill старых событий и jobs, новый scheduler,
 изменения Altegio-пути и любые mutation-вызовы EasyWeek API.
 
+**Перед первым включением отправки: шаблоны должны совпадать с одобренными в
+Meta.** Read-only аудит 2026-09-02 показал, что source-owned BODY трёх
+маркетинговых кодов (`review_3d`, `repeat_10d`, `comeback_3d`) расходился с
+APPROVED-содержимым Meta во всех трёх филиалах, поэтому runtime-проверка
+равенства BODY отклоняла их. Согласование кода, Meta и строк БД — отдельная
+операционная задача со своим порядком и своим CLI:
+[approved_template_contract_runbook.md](approved_template_contract_runbook.md).
+Она выполняется при закрытых `EASYWEEK_REVIEW_SEND_ENABLED` и
+`EASYWEEK_RETENTION_SEND_ENABLED` и НЕ заменяет ни один шаг раздела 16.2:
+согласованный шаблон — это предпосылка отправки, а не разрешение на неё.
+
 ### 16.2 Rollout
 
 Оба флага деплоятся `false` и включаются по очереди. `docker compose restart`
