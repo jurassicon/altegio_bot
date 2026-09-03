@@ -1,8 +1,9 @@
 """PostgreSQL contract for the targeted EasyWeek template reconciliation CLI.
 
-The command exists because a production audit found three branches disagreeing
-with Meta in three different ways at once. Its safety story is narrow and every
-part of it is pinned here:
+The command exists because a production audit compared the approved Meta content
+with this codebase's contract and found three branches out of step in three
+different ways at once. Its safety story is narrow and every part of it is pinned
+here:
 
 * it writes NOTHING without ``--apply``;
 * it touches only the branches and codes named on the command line;
@@ -655,3 +656,142 @@ async def test_the_report_names_the_selected_scope_only(db: AsyncSession) -> Non
         "kitilash_du_repeat_10d_v1",
         "kitilash_ka_repeat_10d_v1",
     }
+
+
+# ===========================================================================
+# The CLI error boundary
+#
+# `MetaTemplateClient` builds its ScriptError from Meta's own `error.message`,
+# and the paging guard interpolates a server-supplied cursor. Printing `str(exc)`
+# put both into a report that gets pasted into tickets. These tests drive main()
+# — the actual print path — rather than the report object.
+# ===========================================================================
+
+
+class _RaisingMeta:
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+
+    async def __aenter__(self) -> "_RaisingMeta":
+        return self
+
+    async def __aexit__(self, *_exc: object) -> None:
+        return None
+
+    async def list_templates(self) -> list[dict[str, Any]]:
+        raise self._exc
+
+
+async def _run_main(
+    monkeypatch: pytest.MonkeyPatch,
+    session_maker: async_sessionmaker[AsyncSession],
+    *,
+    meta_exc: Exception,
+    argv: list[str],
+) -> int:
+    monkeypatch.setattr(cli, "SessionLocal", session_maker, raising=False)
+    monkeypatch.setattr(cli, "_default_meta_client", lambda: _RaisingMeta(meta_exc))
+
+    real = cli.run_reconcile
+
+    async def _with_fake_locations(session, **kwargs):
+        kwargs["client_factory"] = lambda: _FakeLocations(API_LOCATIONS)
+        return await real(session, **kwargs)
+
+    monkeypatch.setattr(cli, "run_reconcile", _with_fake_locations)
+    return await cli.main(argv)
+
+
+def _meta_http_error() -> Exception:
+    """The exception `MetaTemplateClient` raises for an HTTP 400 from Meta."""
+    return cli.ScriptError(
+        "cannot read templates: HTTP 400 SECRET_PROVIDER_MARKER_9f31 "
+        "(https://graph.facebook.com/v20.0/12345/message_templates?after=CURSOR_MARKER_7b2a)"
+    )
+
+
+def _meta_paging_error() -> Exception:
+    return cli.ScriptError("Meta paging cursor repeated ('CURSOR_MARKER_7b2a'); refusing to loop")
+
+
+@pytest.mark.parametrize(
+    ("factory", "markers"),
+    [
+        pytest.param(_meta_http_error, ("SECRET_PROVIDER_MARKER_9f31", "CURSOR_MARKER_7b2a"), id="http_400"),
+        pytest.param(_meta_paging_error, ("CURSOR_MARKER_7b2a",), id="paging_cursor"),
+    ],
+)
+async def test_external_error_text_never_reaches_the_output(
+    session_maker: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+    factory,
+    markers: tuple[str, ...],
+) -> None:
+    with caplog.at_level("DEBUG"):
+        code = await _run_main(
+            monkeypatch,
+            session_maker,
+            meta_exc=factory(),
+            argv=["--branch", "durlach", "--code", "review_3d"],
+        )
+
+    captured = capsys.readouterr()
+    logged = "\n".join(record.getMessage() for record in caplog.records)
+    haystack = captured.out + captured.err + logged
+
+    assert code == 1, "a failure must exit non-zero"
+    for marker in markers:
+        assert marker not in haystack, f"external text leaked: {marker}"
+    assert cli.ERROR_META_READ_FAILED in captured.out
+    assert "'send_authorized': False" in captured.out
+
+
+async def test_a_failed_meta_read_leaves_the_database_untouched(
+    session_maker: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    code = await _run_main(
+        monkeypatch,
+        session_maker,
+        meta_exc=_meta_http_error(),
+        argv=[
+            "--branch",
+            "durlach",
+            "--code",
+            "review_3d",
+            "--apply",
+            "--snapshot",
+            str(tmp_path / "snap.json"),
+        ],
+    )
+
+    assert code == 1
+    assert "SECRET_PROVIDER_MARKER_9f31" not in capsys.readouterr().out
+    async with session_maker() as session:
+        rows = list((await session.execute(select(MessageTemplate))).scalars().all())
+    assert rows == [], "an apply that failed before its writes leaves nothing behind"
+
+
+async def test_our_own_configuration_errors_are_still_printed(
+    session_maker: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Our messages carry no external value, so they stay the operator's diagnosis."""
+    monkeypatch.setattr(cli, "SessionLocal", session_maker, raising=False)
+
+    async def _boom(*_args: Any, **_kwargs: Any) -> None:
+        raise cli.ReconcileError("selected branch not in the verified registry: ['ettlingen']")
+
+    monkeypatch.setattr(cli, "run_reconcile", _boom)
+
+    code = await cli.main(["--branch", "durlach", "--code", "review_3d"])
+    out = capsys.readouterr().out
+
+    assert code == 1
+    assert cli.ERROR_CONFIGURATION in out
+    assert "ettlingen" in out

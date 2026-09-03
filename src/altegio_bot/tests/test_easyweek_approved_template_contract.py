@@ -1,9 +1,11 @@
 """The three EasyWeek marketing bodies must equal the APPROVED Meta content.
 
-A read-only production audit found every one of the seven approved marketing
-templates disagreeing with what this codebase declared, which is why the runtime
-body-equality guard refused all of them. These tests pin the corrected contract
-against fixtures transcribed independently of the module they check.
+A read-only production audit compared the approved Meta content with this
+codebase's contract and found all seven marketing templates disagreeing. The
+runtime guard is a different comparison — the selected database row against the
+same contract, never against Meta — so rows written by the older code passed it
+while still differing from Meta. These tests pin the corrected contract against
+fixtures transcribed independently of the module they check.
 
 Two properties carry the file:
 

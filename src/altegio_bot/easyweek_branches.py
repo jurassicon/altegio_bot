@@ -86,11 +86,17 @@ _WHITESPACE_RE = re.compile(r"\s+")
 # ---------------------------------------------------------------------------
 #
 # These three are transcribed from the APPROVED Meta templates and must match
-# them byte for byte. A read-only production audit (2026-09-02) found the
-# opposite: all seven approved marketing templates across Durlach, Rastatt and
-# Karlsruhe disagreed with what this module declared, so the runtime
-# body-equality guard refused every one of them and the two review rows that did
-# exist were wrong in the same way.
+# them byte for byte. A read-only production audit (2026-09-02) compared the
+# approved Meta content against this module's contract and found all seven
+# approved marketing templates — Durlach, Rastatt and Karlsruhe — disagreeing
+# with it.
+#
+# That is not the same comparison the runtime performs. The runtime guard checks
+# the SELECTED DATABASE ROW's body and name against this contract; it never reads
+# Meta. So a row written by the older code matched the older contract and passed
+# that guard perfectly well while still differing from what Meta had approved —
+# which is exactly the state the two existing review rows were in. Correcting
+# these constants is what brings Meta, the code and the rows into agreement.
 #
 # Three rules apply to every character below, and each has cost something:
 #

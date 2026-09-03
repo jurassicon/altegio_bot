@@ -34,8 +34,20 @@ Read-only audit, 2026-09-02:
 
 And for all seven templates that do exist: `de`, MARKETING, POSITIONAL,
 BODY-only, parameter count and order confirmed — but the source-owned body did
-**not** match Meta. So the runtime body-equality guard refused every one of them,
-including the two review rows that existed and looked fine.
+**not** match the approved Meta content.
+
+Be precise about what that does and does not mean, because the two comparisons
+are different:
+
+- the **audit** compared APPROVED Meta content against the source contract, and
+  found them different;
+- the **runtime** guard compares the selected DB row's body and name against the
+  source contract — it does not read Meta.
+
+So a pre-existing row that matched the OLD code could pass the runtime guard
+perfectly well while still differing from what Meta had approved. That is the
+state the two existing review rows were in. This PR brings all three into
+agreement: Meta, the code and the database rows.
 
 Two facts worth keeping in mind while reading the rest:
 
@@ -117,17 +129,54 @@ Rastatt has no approved `repeat_10d` or `comeback_3d`. That is an external fact,
 not something any command here may work around: the reconcile CLI blocks on it,
 and it must never be satisfied by pointing Rastatt at the Karlsruhe template.
 
-The existing cloner creates them from the Karlsruhe originals. **Dry-run first**,
-and creation only after a separate operator decision:
+The existing cloner creates them from the Karlsruhe originals. It selects
+templates by **exact name**, repeated once per template — there is no `--only`
+flag — and `--include-neutral` is required because these two bodies contain no
+Karlsruhe address to rewrite.
+
+**(a) Dry-run.** Writes nothing and submits nothing.
 
 ```bash
 cd /opt/altegio_bot
-$COMPOSE run --rm --no-deps --entrypoint /app/.venv/bin/python altegio-outbox-worker -m altegio_bot.scripts.clone_meta_templates_for_location --source-location ka --target-location ra --only repeat_10d --only comeback_3d
+$COMPOSE run --rm --no-deps --entrypoint /app/.venv/bin/python altegio-outbox-worker -m altegio_bot.scripts.clone_meta_templates_for_location --source-location ka --target-location ra --language de --include-neutral --template-name kitilash_ka_repeat_10d_v1 --template-name kitilash_ka_comeback_3d_v1
 ```
 
-Review the printed plan. Only then re-run it with the cloner's own confirmation
-flag, and afterwards wait for Meta to move both templates to APPROVED. Until
-they are APPROVED, step 5 for Rastatt will block — correctly.
+Read the printed plan. It must name exactly two prepared templates,
+`kitilash_ra_repeat_10d_v1` and `kitilash_ra_comeback_3d_v1`, and no others.
+
+**(b) Apply, after the operator has reviewed that plan.** `--apply` refuses to
+inherit the dry-run defaults, so `--target-location`, `--address` and
+`--maps-url` must all be given explicitly — even though these two neutral bodies
+never print an address. The values are Rastatt's own, taken from the
+source-controlled branch profile:
+
+```bash
+cd /opt/altegio_bot
+$COMPOSE run --rm --no-deps --entrypoint /app/.venv/bin/python altegio-outbox-worker -m altegio_bot.scripts.clone_meta_templates_for_location --source-location ka --target-location ra --language de --include-neutral --template-name kitilash_ka_repeat_10d_v1 --template-name kitilash_ka_comeback_3d_v1 --address "76437 Rastatt, Rathausstraße 5" --maps-url https://maps.app.goo.gl/xvYYbJbPaWcnp9Xv5 --apply
+```
+
+The cloner then asks for its own confirmation phrase, which changes whenever the
+plan changes. For these two templates it is:
+
+```text
+CREATE:RA:2
+```
+
+Type it exactly. **Do not add `--yes`** — that flag skips the confirmation, and
+the confirmation is the point of this step.
+
+**(c) Read-only confirmation, after Meta has reviewed them.** Submission is not
+approval; Meta moves a new template through PENDING first.
+
+```bash
+cd /opt/altegio_bot
+$COMPOSE run --rm --no-deps --entrypoint /app/.venv/bin/python altegio-outbox-worker -m altegio_bot.scripts.clone_meta_templates_for_location --source-location ka --target-location ra --language de --include-neutral --template-name kitilash_ka_repeat_10d_v1 --template-name kitilash_ka_comeback_3d_v1
+```
+
+Re-running the dry-run reports what now exists on the target side. Both templates
+must be present under their `ra` names and APPROVED. **PENDING, absent, or an
+existing target that does not match is not readiness** — step 5 for Rastatt
+blocks until they are genuinely APPROVED, and that block is correct.
 
 Durlach and Karlsruhe need nothing here.
 
@@ -150,10 +199,22 @@ is refused rather than partially written, which is the point.
 
 When the plan is what you expect:
 
+`--apply` requires `--snapshot`: without a record of the previous rows there is
+no rollback. The path is on the host, under the directory the service already
+mounts, and the command refuses to overwrite an existing file.
+
 ```bash
 cd /opt/altegio_bot
-$COMPOSE run --rm --no-deps --entrypoint /app/.venv/bin/python altegio-outbox-worker -m altegio_bot.scripts.reconcile_easyweek_templates --branch durlach --branch karlsruhe --code review_3d --code repeat_10d --code comeback_3d --apply
+mkdir -p outputs/easyweek_templates
 ```
+
+```bash
+cd /opt/altegio_bot
+$COMPOSE run --rm --no-deps -v /opt/altegio_bot/outputs:/app/outputs --entrypoint /app/.venv/bin/python altegio-outbox-worker -m altegio_bot.scripts.reconcile_easyweek_templates --branch durlach --branch karlsruhe --code review_3d --code repeat_10d --code comeback_3d --apply --snapshot /app/outputs/easyweek_templates/reconcile-$(date -u +%Y%m%dT%H%M%SZ).json
+```
+
+The report prints `snapshot_written`. Keep that file: §9 needs it, and it cannot
+be reconstructed afterwards.
 
 Rastatt is added to the same commands only after step 4 has completed and both
 templates are APPROVED.
@@ -211,9 +272,53 @@ rows and their own state.
 
 Aligned templates are not permission to send.
 
-**Review.** Re-open `EASYWEEK_REVIEW_SEND_ENABLED` on its own, recreate the
-outbox worker, and confirm the effective value from inside the new container.
-Watch one real delivery before treating it as done.
+**Review — the PR-9 preflight is mandatory, and it comes first.**
+
+`EASYWEEK_REVIEW_SEND_ENABLED` is **global**, not per branch. Opening it releases
+queued `review_3d` for *every* EasyWeek branch, so a green result for the branch
+you happen to care about is not permission to open it.
+
+The gate is the existing `easyweek_review_preflight` and the rules of §13.2 of
+`durlach_activation_runbook.md`. Do **not** replay the original rollout from the
+beginning: no second broad seed, no webhook re-creation, and do not switch off
+planning that is already running.
+
+1. **The review send fence stays closed** through this whole step.
+2. Complete the template reconciliation (step 5) and make the sender decision
+   (step 7) *first*. A branch whose sender is missing cannot pass.
+3. Run the preflight in a **fresh one-off container**, same Compose project and
+   both production compose files:
+
+```bash
+cd /opt/altegio_bot
+$COMPOSE run --rm --no-deps --entrypoint /app/.venv/bin/python altegio-outbox-worker -m altegio_bot.scripts.easyweek_review_preflight
+```
+
+`docker compose exec` is wrong here, and `exec -e` to paper over a stale
+environment is not an alternative: the running worker holds the environment it
+was created with.
+
+4. Required to proceed, all of them: `ready=true`, exit code `0`,
+   `candidate_count > 0`, `truncated=false`, no `config_error`, no blocked
+   candidates.
+5. **If any branch fails, the correct action is STOP with the fence still
+   closed.** In particular, if Karlsruhe's sender was deliberately not activated
+   in step 7, its review candidates will report `sender_missing_or_inactive` and
+   the preflight will not go green. Do not work around that by removing the
+   branch from `EASYWEEK_LOCATION_MAP`, and do not invent a per-branch send gate
+   — neither exists, and both would be a bigger change than the one being made.
+6. Only on a fully green preflight does the operator separately set
+   `EASYWEEK_REVIEW_SEND_ENABLED=true`, recreate **only** the outbox worker, and
+   confirm the effective flag from inside the new container.
+7. Then watch one natural delivery through `message_jobs` → `outbox_messages` →
+   Meta `delivered`/`read`. Do not edit `run_at` or a payload to make it fire
+   sooner, and do not re-drive `failed` jobs.
+
+Review and retention are prepared independently. If Rastatt's `review_3d` is
+already APPROVED, it may be reconciled on its own with `--code review_3d` without
+waiting for its missing retention pair. What must not happen is opening the
+global review fence while another live branch still holds the old review body —
+that is precisely what step 5 exists to prevent.
 
 **Retention.** This one has its own sequence and it is unchanged — §16.2 of
 `durlach_activation_runbook.md`, in full:
@@ -234,14 +339,58 @@ hurried is not evidence about the job that would have gone out.
 
 ## 9. Rollback
 
-Roll the code version and the selected rows back **together**, with the two send
-fences shut:
+**Order matters, and not for the obvious reason.** `reconcile_easyweek_templates`
+and `restore_easyweek_templates` exist only in *this* version. Deploying the
+previous code first would take both away, and the ordinary apply would be no help
+anyway: it writes the current contract rather than restoring what was there. So
+the rows go back **while this version is still deployed**, and the code is
+reverted afterwards.
 
-1. close `EASYWEEK_REVIEW_SEND_ENABLED` and `EASYWEEK_RETENTION_SEND_ENABLED`,
-   recreate the outbox worker, confirm from inside it;
-2. deploy the previous code version;
-3. re-run the reconcile dry-run for the same selectors and read the plan;
-4. apply it, so the rows match the code that is actually running.
+This is why step 5's apply requires `--snapshot`. That file is the only record of
+what the rows were, it lands on a host path, and it survives the `--rm`
+container.
+
+**1. Close both send fences and prove it**, exactly as in step 2:
+
+```bash
+cd /opt/altegio_bot
+$COMPOSE exec -T altegio-outbox-worker /app/.venv/bin/python -c 'import sys; from altegio_bot.settings import settings as s; ok = s.easyweek_review_send_enabled is False and s.easyweek_retention_send_enabled is False; print({"review_send": s.easyweek_review_send_enabled, "retention_send": s.easyweek_retention_send_enabled, "gate": "PASS" if ok else "FAIL"}); sys.exit(0 if ok else 1)'
+```
+
+**2. Restore the rows, dry-run first**, still on this version. The snapshot lives
+under `outputs/`, which the compose service already mounts, so the same path is
+visible inside the one-off container:
+
+```bash
+cd /opt/altegio_bot
+$COMPOSE run --rm --no-deps -v /opt/altegio_bot/outputs:/app/outputs --entrypoint /app/.venv/bin/python altegio-outbox-worker -m altegio_bot.scripts.restore_easyweek_templates --snapshot /app/outputs/easyweek_templates/<the file step 5 wrote>
+```
+
+Read the plan. `restore` puts a previous row back; `deactivate` retires a row
+this apply created — created rows are never deleted, because their ids are
+referenced elsewhere. Any `blockers` entry means **stop**: a row changed again
+after the apply, and overwriting somebody's later edit is not a rollback.
+
+**3. Apply the restore**, same command plus `--apply`:
+
+```bash
+cd /opt/altegio_bot
+$COMPOSE run --rm --no-deps -v /opt/altegio_bot/outputs:/app/outputs --entrypoint /app/.venv/bin/python altegio-outbox-worker -m altegio_bot.scripts.restore_easyweek_templates --snapshot /app/outputs/easyweek_templates/<the file step 5 wrote> --apply
+```
+
+**4. Verify the rows** with the read-only query from step 1. Re-running the
+restore is safe and must report `unchanged` for everything.
+
+**5. Only now deploy the previous code version.**
+
+**6. Leave the send fences closed.** The rollback does not re-open them, and
+nothing here authorises it to: a restored body is the body that was there before,
+**not** evidence that it matches what Meta has approved today. Re-opening review
+goes through the preflight in step 8 again.
+
+The sender is untouched by all of this. A template rollback never activates,
+deactivates or re-points a sender — that is its own operation with its own
+decision.
 
 Do **not** restore a database backup, delete queues, or relax the body-equality
 check to "make it match". That check is the only thing that noticed this

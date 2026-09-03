@@ -3,10 +3,14 @@
 A read-only production audit (2026-09-02) found the three EasyWeek marketing
 codes — ``review_3d``, ``repeat_10d``, ``comeback_3d`` — out of step in three
 different ways at once: Durlach had one active row of three, Rastatt had one,
-Karlsruhe had none and no active sender, and every one of the seven approved
-Meta templates disagreed with the body this codebase declared. The runtime
-body-equality guard therefore refused all of them, and the two rows that did
-exist were wrong in exactly the same way.
+Karlsruhe had none and no active sender, and every one of the seven approved Meta
+templates disagreed with the body this codebase declared.
+
+The audit compared Meta against the source contract. The runtime guard compares
+the selected DATABASE ROW against that same contract and never reads Meta, so a
+row matching the older code passed it while still differing from Meta. Three
+things therefore have to be brought into agreement, and this command is the part
+that moves the rows.
 
 This command closes that gap for a NAMED set of branches and codes, and does
 nothing else.
@@ -43,8 +47,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
+import os
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Final
 
 from sqlalchemy import select
@@ -100,6 +108,27 @@ BLOCK_DB_DUPLICATE: Final = "db_rows_duplicated"
 BLOCK_SENDER_OTHER_LINE: Final = "sender_points_at_another_line"
 BLOCK_SENDER_LINE_UNCONFIGURED: Final = "sender_line_not_configured"
 
+# The reason printed when reading Meta fails. Deliberately a fixed string rather
+# than the exception's text: `ScriptError` is raised by the shared
+# `MetaTemplateClient`, which builds it from Meta's own `error.message`, and the
+# paging guard puts a server-supplied cursor into it. Both are external values,
+# and this output is pasted into tickets. The operator gets the code; the detail
+# is in the container logs of the run they just did.
+ERROR_META_READ_FAILED: Final = "meta_read_failed"
+# Our own configuration errors: raised by this module and by the seed helpers
+# from strings written here, so they are safe to print verbatim.
+ERROR_CONFIGURATION: Final = "configuration_error"
+ERROR_UNEXPECTED: Final = "unexpected_error"
+ERROR_SNAPSHOT_EXISTS: Final = "snapshot_path_exists"
+ERROR_SNAPSHOT_UNWRITABLE: Final = "snapshot_path_not_writable"
+
+# Version of the snapshot artefact. A restore refuses a version it does not know
+# rather than guessing which fields an older file omitted.
+SNAPSHOT_VERSION: Final = 1
+# Owner read/write only: the artefact names internal ids and branch slugs, and it
+# lands in a directory an operator may share.
+SNAPSHOT_MODE: Final = 0o600
+
 
 class ReconcileError(RuntimeError):
     """Configuration or evidence is not safe enough to write. Never carries API text."""
@@ -148,6 +177,9 @@ class ReconcileReport:
     templates: list[TemplatePlan] = field(default_factory=list)
     senders: list[SenderPlan] = field(default_factory=list)
     mutations_attempted: int = 0
+    # Where the pre-apply state was recorded, when one was requested. A file
+    # name, never its contents.
+    snapshot_written: str | None = None
 
     @property
     def blockers(self) -> list[str]:
@@ -174,6 +206,7 @@ class ReconcileReport:
             "mode": "apply" if self.apply else "dry-run",
             "send_authorized": False,
             "mutations_attempted": self.mutations_attempted,
+            "snapshot_written": self.snapshot_written,
             "scope": {"branches": sorted(self.branches), "codes": sorted(self.codes)},
             "template_actions": dict(sorted(actions.items())),
             "sender_actions": dict(sorted(sender_actions.items())),
@@ -418,6 +451,111 @@ async def plan_senders(
 
 
 # ---------------------------------------------------------------------------
+# The rollback snapshot
+# ---------------------------------------------------------------------------
+#
+# A reconcile apply overwrites rows. Restoring them afterwards needs the state
+# they were in BEFORE the write, and that state exists nowhere else once the
+# write lands — a later `git revert` brings back the old code but not the old
+# rows, and the ordinary apply path would only rewrite the current contract
+# again.
+#
+# So `--apply` captures the selected rows first, to a file the operator keeps.
+# Two properties make it usable rather than decorative: the file is written and
+# proven readable BEFORE any database mutation, and it records which rows did not
+# exist, so a restore can tell "put the old text back" from "this row is one the
+# apply created".
+
+
+def _snapshot_row(row: MessageTemplate) -> dict[str, Any]:
+    """The state one row was in. Technical keys only — no customer data here."""
+    return {
+        "existed": True,
+        "id": row.id,
+        "provider": row.provider,
+        "company_id": row.company_id,
+        "code": row.code,
+        "language": row.language,
+        "meta_template_name": row.meta_template_name,
+        "body": row.body,
+        "is_active": bool(row.is_active),
+    }
+
+
+def _snapshot_absent(*, company_id: int, code: str, language: str) -> dict[str, Any]:
+    """A key that had no row at all. Restoring it means deactivating, not deleting.
+
+    Deleting would destroy the id that outbox rows and audit trails reference. A
+    deactivated row is inert to the send path and still readable afterwards,
+    which is what an operator investigating a rollback actually needs.
+    """
+    return {
+        "existed": False,
+        "provider": PROVIDER_EASYWEEK,
+        "company_id": company_id,
+        "code": code,
+        "language": language,
+    }
+
+
+async def capture_snapshot(
+    session: AsyncSession,
+    *,
+    branches: Sequence[VerifiedBranch],
+    codes: Sequence[str],
+    language: str,
+) -> dict[str, Any]:
+    """Every selected key's state before the apply, existing or not."""
+    rows: list[dict[str, Any]] = []
+    for branch in branches:
+        company_id = branch.location.company_id
+        for code in codes:
+            existing = await _existing_rows(session, company_id=company_id, code=code, language=language)
+            if not existing:
+                rows.append(_snapshot_absent(company_id=company_id, code=code, language=language))
+                continue
+            rows.extend(_snapshot_row(row) for row in existing)
+    return {
+        "snapshot_version": SNAPSHOT_VERSION,
+        "captured_at_utc": datetime.now(timezone.utc).isoformat(),
+        "scope": {
+            "branches": sorted(branch.profile.slug for branch in branches),
+            "codes": sorted(codes),
+            "language": language,
+        },
+        "rows": rows,
+    }
+
+
+def write_snapshot(path: Path, snapshot: dict[str, Any]) -> None:
+    """Write the artefact, refusing to overwrite, and prove it reads back.
+
+    Both halves matter. Overwriting silently would destroy the only record of an
+    earlier apply; and a file that cannot be re-read is not a rollback plan, so
+    the read-back happens here — BEFORE the caller is allowed to touch the
+    database — rather than being discovered during an incident.
+    """
+    if path.exists():
+        raise ReconcileError(f"{ERROR_SNAPSHOT_EXISTS}: refusing to overwrite {path.name}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    serialized = json.dumps(snapshot, ensure_ascii=False, indent=1)
+    # Owner-only from the moment it exists, not chmod'ed afterwards.
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, SNAPSHOT_MODE)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(serialized)
+    except Exception:
+        path.unlink(missing_ok=True)
+        raise
+    try:
+        read_back = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ReconcileError(f"{ERROR_SNAPSHOT_UNWRITABLE}: {path.name} could not be read back") from exc
+    if read_back != snapshot:  # pragma: no cover - defensive
+        raise ReconcileError(f"{ERROR_SNAPSHOT_UNWRITABLE}: {path.name} did not round-trip")
+
+
+# ---------------------------------------------------------------------------
 # Applying
 # ---------------------------------------------------------------------------
 
@@ -521,6 +659,7 @@ async def run_reconcile(
     codes: Sequence[str],
     apply: bool = False,
     include_sender: bool = False,
+    snapshot_path: Path | None = None,
     client_factory: Callable[[], Any] | None = None,
     meta_client_factory: Callable[[], Any] | None = None,
 ) -> ReconcileReport:
@@ -563,6 +702,16 @@ async def run_reconcile(
         # state to re-audit.
         return report
 
+    if snapshot_path is not None:
+        # BEFORE the first mutation, on purpose. A snapshot written afterwards
+        # would describe the state the apply produced, which is the one thing a
+        # rollback does not need; and a path that turns out to be unwritable
+        # would be discovered with the rows already overwritten.
+        write_snapshot(
+            snapshot_path, await capture_snapshot(session, branches=selected, codes=codes, language=plan.language)
+        )
+        report.snapshot_written = str(snapshot_path)
+
     report.mutations_attempted = await apply_templates(
         session, branches=selected, plans=report.templates, language=plan.language
     )
@@ -588,6 +737,24 @@ def _default_meta_client() -> MetaTemplateClient:
         api_version=settings.whatsapp_api_version,
         timeout_seconds=30.0,
     )
+
+
+def _safe_error(*, apply: bool, reason: str, detail: str | None = None) -> dict[str, Any]:
+    """The one shape every failure prints. Never carries external text.
+
+    ``send_authorized`` is stated on the failure path too: an operator reading a
+    red line still needs to see that nothing was authorised, and a key that only
+    appears on success is a key nobody notices missing.
+    """
+    payload: dict[str, Any] = {
+        "mode": "apply" if apply else "dry-run",
+        "send_authorized": False,
+        "mutations_attempted": 0,
+        "error": reason,
+    }
+    if detail is not None:
+        payload["detail"] = detail
+    return payload
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -623,7 +790,19 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Also plan the branch's default sender. Never implied by a body reconciliation.",
     )
-    return parser.parse_args(argv)
+    parser.add_argument(
+        "--snapshot",
+        metavar="PATH",
+        default=None,
+        help=(
+            "Record the selected rows' state before applying, for restore_easyweek_templates. "
+            "Required with --apply: without it the previous rows cannot be put back."
+        ),
+    )
+    args = parser.parse_args(argv)
+    if args.apply and not args.snapshot:
+        parser.error("--apply requires --snapshot: a write with no recorded previous state cannot be rolled back")
+    return args
 
 
 async def main(argv: list[str] | None = None) -> int:
@@ -637,24 +816,30 @@ async def main(argv: list[str] | None = None) -> int:
                     codes=args.codes,
                     apply=args.apply,
                     include_sender=args.include_sender,
+                    snapshot_path=Path(args.snapshot) if args.snapshot else None,
                 )
                 if not args.apply or report.blocked:
                     # Dry-run and blocked applies leave nothing behind. A rollback
                     # is cheaper than trusting that no branch above wrote.
                     await session.rollback()
-    except (ReconcileError, SeedConfigError, ScriptError) as exc:
-        # Our own messages only. A raw Meta or driver error renders tokens and
-        # bound parameters, and this output is pasted into tickets.
-        print({"mode": "apply" if args.apply else "dry-run", "send_authorized": False, "error": str(exc)})
+    except ScriptError:
+        # NOT `str(exc)`. `MetaTemplateClient` composes this exception from
+        # Meta's `error.message` and from a server-supplied paging cursor, so its
+        # text is external content: it can carry a provider message, a response
+        # excerpt, a cursor or a URL. A stable code says the same operational
+        # thing without any of that reaching a ticket.
+        print(_safe_error(apply=args.apply, reason=ERROR_META_READ_FAILED))
+        return 1
+    except (ReconcileError, SeedConfigError) as exc:
+        # Both are raised from strings written in this repository — no external
+        # value is interpolated into either — so the message itself is the
+        # operator's diagnosis and is safe to print.
+        print(_safe_error(apply=args.apply, reason=ERROR_CONFIGURATION, detail=str(exc)))
         return 1
     except Exception as exc:  # noqa: BLE001 — class name only, never the text
-        print(
-            {
-                "mode": "apply" if args.apply else "dry-run",
-                "send_authorized": False,
-                "error": type(exc).__name__,
-            }
-        )
+        # A SQLAlchemy error renders bound parameters, and for this database
+        # those include customer rows.
+        print(_safe_error(apply=args.apply, reason=ERROR_UNEXPECTED, detail=type(exc).__name__))
         return 1
 
     print(report.as_safe_dict())
