@@ -81,6 +81,85 @@ PRE_APPOINTMENT_NOTES_DE: Final = (
 
 _WHITESPACE_RE = re.compile(r"\s+")
 
+# ---------------------------------------------------------------------------
+# Approved Meta bodies for the three marketing codes
+# ---------------------------------------------------------------------------
+#
+# These three are transcribed from the APPROVED Meta templates and must match
+# them byte for byte. A read-only production audit (2026-09-02) found the
+# opposite: all seven approved marketing templates across Durlach, Rastatt and
+# Karlsruhe disagreed with what this module declared, so the runtime
+# body-equality guard refused every one of them and the two review rows that did
+# exist were wrong in the same way.
+#
+# Three rules apply to every character below, and each has cost something:
+#
+# 1. **Do not "improve" the German.** "konnten aber ihn nicht wahrnehmen" is what
+#    Meta approved; correcting the word order would make the row stop matching
+#    the template it is bound to, and a template edit needs a new Meta review.
+# 2. **The double space after "uns," in comeback_3d is intentional.** It is in
+#    the approved text. A formatter or a well-meaning cleanup that collapses it
+#    breaks the equality check, which is exactly why it is called out here.
+# 3. **No address footer.** Unlike the lifecycle and reminder codes, these three
+#    are neutral: the approved bodies name no branch. That is a property of the
+#    approved content, not a decision taken here.
+#
+# Neutral TEXT is not neutral OWNERSHIP. Each branch still resolves its own
+# `kitilash_<prefix>_<code>_v1` Meta name and its own `message_templates` row;
+# there is no shared row and no fallback to the Karlsruhe template for another
+# branch. Two branches agreeing on the body is allowed; a branch borrowing
+# another's name or row is not.
+#
+# Placeholders are written in the NAMED form this codebase uses everywhere. The
+# positional `{{1}}`/`{{2}}`/`{{3}}` form Meta stores is derived from these by
+# `meta_positional_body` below, in the one fixed order the code's param contract
+# declares — never by matching text.
+
+APPROVED_REVIEW_3D_BODY: Final = (
+    "Hallo {client_name}!\n"
+    "Danke für Ihren Besuch bei KitiLash.\n"
+    "\n"
+    "Wenn Sie kurz Zeit haben, freuen wir uns über eine Bewertung:\n"
+    "{review_url}\n"
+    "\n"
+    "Oder antworten Sie mit STOP, um keine Nachrichten mehr zu erhalten.\n"
+    "Danke."
+)
+
+APPROVED_REPEAT_10D_BODY: Final = (
+    "Hallo, {client_name} 🙂\n"
+    "\n"
+    "Ich bin Julia vom Beautystudio KitiLash.\n"
+    "Vor 10 Tagen waren Sie bei uns für: {primary_service}.\n"
+    "\n"
+    "Bitte beachten Sie, dass der Auffüllpreis nur bis zu 3 Wochen nach der Behandlung gilt.\n"
+    "\n"
+    "Wenn Sie Auffüllen planen, buchen Sie bitte rechtzeitig:\n"
+    "{booking_link}\n"
+    "\n"
+    "Liebe Grüße, Julia\n"
+    "\n"
+    "Oder antworten Sie mit STOP, um keine Nachrichten mehr zu erhalten.\n"
+    "Danke."
+)
+
+APPROVED_COMEBACK_3D_BODY: Final = (
+    "Hallo, {client_name} 🙂\n"
+    "\n"
+    # Two spaces after "uns," — approved text, not a typo. See rule 2 above.
+    "Sie haben einen Termin bei uns,  KitiLash, gehabt, konnten aber ihn nicht "
+    "wahrnehmen. Möchten Sie einen neuen Termin vereinbaren? Wir würden uns "
+    "freuen, Sie zu sehen! 😊\n"
+    "\n"
+    "Sie können denselben Meister auswählen und die Behandlung buchen oder "
+    "etwas Neues ausprobieren.\n"
+    "\n"
+    "*Wir warten auf dich im KitiLash: {booking_link}*\n"
+    "\n"
+    "Oder antworten Sie mit STOP, um keine Nachrichten mehr zu erhalten.\n"
+    "Danke."
+)
+
 
 @dataclass(frozen=True)
 class BranchContent:
@@ -257,14 +336,11 @@ def branch_template_contract(profile: BranchProfile, template_code: str) -> Bran
             f"Termin verwalten: {{booking_link}}{footer}"
         ),
         # Two positional parameters only: the name and the proven review link.
-        # No price, no service list, no manage link — a review request asks one
-        # thing, and every extra field is another value to keep true for days.
-        REVIEW_3D: (
-            "*{client_name}, hallo!*\n\n"
-            "Vielen Dank für Ihren Besuch! Wir würden uns sehr über Ihre "
-            "Bewertung freuen:\n\n"
-            f"{{review_url}}{footer}"
-        ),
+        #
+        # The approved Meta body carries NO branch footer — see the approved
+        # constants above. It is shared verbatim by all three branches, while the
+        # Meta NAME and the `message_templates` row stay per branch.
+        REVIEW_3D: APPROVED_REVIEW_3D_BODY,
         REMINDER_2H: (
             "*{client_name}, hallo! Ihr Termin ist in 2 Stunden:*\n\n"
             "*Mitarbeiterin:* {staff_name}\n"
@@ -275,24 +351,10 @@ def branch_template_contract(profile: BranchProfile, template_code: str) -> Bran
             f"Termin verwalten: {{booking_link}}{footer}"
         ),
         # PR-12. Three positional parameters: the name, the ONE service this
-        # booking was for, and the branch's booking page. No price and no total
-        # — a repeat invitation is about the next appointment, not the last
-        # invoice, and every value printed here has to stay true for ten days.
-        REPEAT_10D: (
-            "*{client_name}, hallo!*\n\n"
-            "Seit Ihrem Termin ({primary_service}) sind zehn Tage vergangen. "
-            "Möchten Sie den nächsten Termin buchen?\n\n"
-            f"Termin buchen: {{booking_link}}{footer}"
-        ),
-        # Two positional parameters only. A cancelled booking has no service to
-        # promise and no time to name, so the message says neither: it invites
-        # the customer back and nothing more.
-        COMEBACK_3D: (
-            "*{client_name}, hallo!*\n\n"
-            "Schade, dass Ihr Termin nicht stattgefunden hat. "
-            "Wir würden uns freuen, Sie bald wiederzusehen.\n\n"
-            f"Neuen Termin buchen: {{booking_link}}{footer}"
-        ),
+        # booking was for, and the branch's booking page.
+        REPEAT_10D: APPROVED_REPEAT_10D_BODY,
+        # Two positional parameters only: the name and the branch's booking page.
+        COMEBACK_3D: APPROVED_COMEBACK_3D_BODY,
     }
     return BranchTemplateContract(
         profile=profile,
@@ -300,6 +362,53 @@ def branch_template_contract(profile: BranchProfile, template_code: str) -> Bran
         meta_template_name=meta_template_name(profile.meta_template_prefix, template_code),
         raw_body=bodies[template_code],
     )
+
+
+def meta_positional_body(profile: BranchProfile, template_code: str) -> str | None:
+    """The source-owned body in Meta's positional form, or ``None``.
+
+    Meta stores ``{{1}}`` / ``{{2}}`` / ``{{3}}``; this codebase writes
+    ``{client_name}`` / ``{review_url}`` / ``{booking_link}``. Comparing the two
+    needs a conversion, and the direction matters: the NAMED body is the
+    contract, and it is rendered INTO positional form. Going the other way —
+    parsing Meta's text and guessing which field each number is — would make the
+    remote content define the contract, which is exactly what must not happen.
+
+    The mapping is not inferred from the text. It is
+    ``LIFECYCLE_PARAM_FIELDS[code]``, the same fixed order the send path uses to
+    build the parameter list, so a body and the parameters that fill it cannot
+    disagree about which slot is which.
+
+    Substitution is positional and total: every declared field must appear
+    exactly once, and nothing else is touched. A body whose placeholders do not
+    match its declared fields returns ``None`` rather than a half-converted
+    string — an unconvertible body is an unusable one, not one to approximate.
+    """
+    from altegio_bot.meta_templates import LIFECYCLE_PARAM_FIELDS
+
+    contract = branch_template_contract(profile, template_code)
+    if contract is None:
+        return None
+    fields = LIFECYCLE_PARAM_FIELDS.get(template_code)
+    if not fields:
+        return None
+
+    body = contract.raw_body
+    for index, field in enumerate(fields, start=1):
+        token = "{" + field + "}"
+        if body.count(token) != 1:
+            # Declared but absent, or present twice: either way the positional
+            # form would be ambiguous, and ambiguity here is a wrong parameter
+            # in a customer's message.
+            return None
+        body = body.replace(token, "{{" + str(index) + "}}")
+
+    if re.search(r"(?<!\{)\{(?!\{)[a-z_]+\}", body):
+        # A named placeholder the param contract never declared. Converting the
+        # rest and leaving this one behind would produce a body that looks
+        # complete and renders a literal brace to a customer.
+        return None
+    return body
 
 
 def branch_template_contract_error(
