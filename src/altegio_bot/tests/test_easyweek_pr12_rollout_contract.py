@@ -229,6 +229,14 @@ def test_no_new_service_and_no_new_secret_distribution() -> None:
         # and separately from the migrator, because it holds a different power —
         # it can create a CUSTOMER and cannot create a booking.
         "easyweek-migration-prepare",
+        # PR-11.2 revision 24 (plan §30). The reminder handover reads the live
+        # EasyWeek API to prove every migrated booking before it plans anything,
+        # so it needs the same key. Same narrowest carrier: `ops` profile,
+        # `restart: "no"`, one command per container, never started by
+        # `docker compose up -d`. Admitted separately from the two above because
+        # it holds a third, different power — it can create and cancel MESSAGE
+        # JOBS, and can create neither a customer nor a booking.
+        "easyweek-migration-prepare-handover",
     }, f"easyweek.env reached an unexpected service: {with_easyweek_env}"
 
 

@@ -52,6 +52,7 @@ from altegio_bot.easyweek_migration.prepare import (
     PreparationSnapshot,
     PrepareError,
     PrepareInputs,
+    SourceCustomer,
     apply_confirmations,
     build_customer_directory_payload,
     build_customer_request,
@@ -124,7 +125,28 @@ def load(state_dir: Path) -> DecisionSet:
         return store.load()
 
 
-def live_snapshot(*records: CustomerDecision, proposals: tuple[Any, ...] = ()) -> PreparationSnapshot:
+def source_for(record: CustomerDecision, *, client_id: object = 42) -> SourceCustomer:
+    """The Altegio-side evidence behind one decision, as the live read saw it.
+
+    A correction binds to this, not to the decision — so a test that corrects a
+    customer has to say what the source proves about them.
+    """
+    return SourceCustomer(
+        phone=record.phone,
+        first_name=record.first_name,
+        last_name=record.last_name,
+        full_name=record.source_label or None,
+        email=record.email,
+        record_ids=list(range(900001, 900001 + record.linked_record_count)),
+        source_client_ids={client_id},
+    )
+
+
+def live_snapshot(
+    *records: CustomerDecision,
+    proposals: tuple[Any, ...] = (),
+    sources: dict[str, SourceCustomer] | None = None,
+) -> PreparationSnapshot:
     """A snapshot whose live data says exactly what these records say.
 
     The confirm path re-derives every customer from a fresh read, so a test that
@@ -143,7 +165,7 @@ def live_snapshot(*records: CustomerDecision, proposals: tuple[Any, ...] = ()) -
         catalog=CatalogSnapshot(location_uuid=KA_LOCATION_UUID, services=()),
         catalog_staff={},
         proposals=proposals,
-        customer_sources={},
+        customer_sources=sources if sources is not None else {r.phone: source_for(r) for r in records},
         customer_lookups={},
         customer_proposals={record.phone: record for record in records},
     )
@@ -942,3 +964,45 @@ def test_a_digest_the_operator_never_reviewed_is_refused(inputs: PrepareInputs, 
         )
 
     assert load(state_dir).get(PHONE).state == STATE_PENDING
+
+
+@pytest.mark.parametrize("state", [STATE_CREATED, STATE_IN_FLIGHT])
+def test_a_created_or_in_flight_customer_cannot_be_corrected(
+    state: str, inputs: PrepareInputs, state_dir: Path
+) -> None:
+    """A created card exists and an in-flight one may. Neither is editable here.
+
+    Correcting either would rewrite a real customer, or reopen a decision whose
+    POST may already have landed — the duplicate-card path the whole stage is
+    built to prevent.
+    """
+    record = decision(state=state, customer_uuid=UUID_A)
+    seed(state_dir, record)
+
+    with pytest.raises(PrepareError):
+        apply_confirmations(
+            inputs,
+            ConfirmRequest(correct_phone=PHONE, correct_first_name="Andere"),
+            snapshot=live_snapshot(record),
+        )
+
+    unchanged = load(state_dir).get(PHONE)
+    assert unchanged.state == state
+    assert unchanged.first_name == "Testkundin"
+
+
+def test_a_correction_is_refused_when_the_source_no_longer_proves_the_customer(
+    inputs: PrepareInputs, state_dir: Path
+) -> None:
+    """No source evidence, nothing to bind the correction to."""
+    record = decision()
+    seed(state_dir, record)
+
+    with pytest.raises(PrepareError):
+        apply_confirmations(
+            inputs,
+            ConfirmRequest(correct_phone=PHONE, correct_first_name="Andere"),
+            snapshot=live_snapshot(record, sources={}),
+        )
+
+    assert load(state_dir).get(PHONE).first_name == "Testkundin"

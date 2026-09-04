@@ -104,7 +104,8 @@ Europe/Berlin (плюс тот же момент в UTC), длительност
 
 | `blocked_reason` | Что делать |
 |---|---|
-| `source_name_not_split` | в источнике только полное имя. Разделите его сами (шаг 3, `--correct-customer`) — автоматически оно не делится |
+| `source_name_not_split` | в источнике только полное имя. Разделите его сами (шаг 3, `--correct-customer`) — автоматически оно не делится. Исправление сохраняется и переживает следующий `prepare` |
+| `correction_source_identity_changed` | исходные данные клиента изменились после исправления | посмотреть заново: прежнее исправление больше не применяется автоматически |
 | `source_customers_share_phone` | на одном номере два разных клиента Altegio. Слить их автоматически нельзя; разберитесь в Altegio |
 | `customer_ambiguous` | в EasyWeek две карточки на один номер. Разберитесь в EasyWeek |
 | `customer_already_exists` | клиент уже есть; создавать нечего, он попал в directory |
@@ -176,6 +177,16 @@ cd /path/to/altegio_bot && uv run python -m altegio_bot.scripts.easyweek_migrati
 а замена. Но оно меняет digest и возвращает клиента в `pending`, так что
 подтверждать придётся заново, уже глядя на исправленные значения. Исправить и
 подтвердить одного клиента одной командой нельзя: команда откажет.
+
+Исправление сохраняется отдельно и **переживает пересборку**: следующий
+`prepare` или `confirm` накладывает его поверх свежих исходных данных и заново
+считает digest, так что подтвердить исправленное предложение можно. Исправление
+привязано к доказанной исходной identity клиента — телефону, его Altegio-карточкам
+и составу связанных записей, — а не к имени. Если что-то из этого изменилось,
+исправление становится stale, клиент блокируется с
+`correction_source_identity_changed`, и его нужно посмотреть заново.
+Уже созданного (`created`) или находящегося в процессе создания (`in_flight`)
+клиента исправить нельзя.
 
 ---
 
@@ -253,11 +264,143 @@ canary.
 
 ---
 
+## 6b. Передача напоминаний после переноса
+
+План: §30. Отдельный одноразовый процесс. Выполняется **после** того, как волна
+перенесена и ledger подтвердил `status=created`.
+
+Зачем он нужен. Мигратор намеренно не создаёт `MessageJob`. Сразу после переноса
+у клиента есть запись в EasyWeek, её будущие напоминания всё ещё стоят в очереди
+со стороны Altegio и указывают на запись, с которой уже никто не работает, а со
+стороны EasyWeek напоминаний нет вообще.
+
+Наблюдавшиеся при первом запуске числа (56, 84, 223) — это evidence того
+конкретного дня, а не контракт. Каждый запуск считает всё заново.
+
+### 6b.1 Dry-run со снимком
+
+```bash
+cd /opt/altegio_bot && docker compose --profile ops run --rm --build easyweek-migration-prepare-handover plan --manifest /migration/input/manifest.json --company-id 758285 --snapshot /migration/state/reminder_handover.json
+```
+
+Команда читает ledger, доказывает каждую перенесённую запись живым
+`GET /bookings/{uuid}` и пишет приватный снимок. Она **не меняет ничего**: ни
+CRM, ни PostgreSQL, ни `MessageJob`, ни `Record`, ни ledger, ни `OutboxMessage`.
+Meta и Chatwoot не вызываются, сообщения не отправляются.
+
+Именно здесь выполняется весь обход API — пока outbox работает. Поэтому на шаге
+apply воркер останавливается лишь на время одной транзакции.
+
+### 6b.2 Прочитать отчёт
+
+В отчёте три разных ответа, и путать их нельзя:
+
+| Поле | Вопрос |
+|---|---|
+| `guard_ready` | существующие EasyWeek-напоминания корректны |
+| `coverage_ready` | все необходимые напоминания существуют |
+| `cutover_ready` | владение можно переключить атомарно прямо сейчас |
+
+Пустая очередь EasyWeek даёт `guard_ready=true` тривиально. Это ровно то
+состояние, которое здесь и исправляется, поэтому `guard_ready` сам по себе
+разрешением не является.
+
+Смотреть также `rows_with_blockers` (канонический ключ занят
+canceled/failed-заданием — решает человек, автоматически не переоткрывается) и
+`rows_with_processing_source_jobs`.
+
+### 6b.3 Apply
+
+Требуются одновременно: режим `apply`, флаг `--apply`, точный `--plan-digest`,
+точная фраза `--confirm` и переменная окружения. Ни один из них по отдельности
+разрешением не является. Снимок старше часа не принимается: обязательства
+двигаются вместе с часами.
+
+Остановка outbox — только на время транзакции, и `trap` возвращает воркер при
+любом выходе, включая ошибку и Ctrl-C:
+
+```bash
+cd /opt/altegio_bot && trap 'docker compose up -d altegio-outbox-worker' EXIT INT TERM && docker compose stop altegio-outbox-worker && docker compose --profile ops run --rm -e EASYWEEK_REMINDER_HANDOVER_ALLOW_APPLY=true easyweek-migration-prepare-handover apply --manifest /migration/input/manifest.json --company-id 758285 --snapshot /migration/state/reminder_handover.json --apply --plan-digest PLAN_DIGEST_ИЗ_ШАГА_6B1 --confirm 'apply reminder handover PLAN_DIGEST_ИЗ_ШАГА_6B1'
+```
+
+Inbox и capture при этом **не** останавливаются, и notification-флаги не
+трогаются. `EASYWEEK_NOTIFICATIONS_ENABLED` общим Altegio send fence не является
+и старые Altegio-напоминания не останавливает — не полагайтесь на него.
+
+Убедиться, что воркер поднялся:
+
+```bash
+cd /opt/altegio_bot && docker compose ps altegio-outbox-worker
+```
+
+Транзакция одна: сначала создаются все недостающие EasyWeek-напоминания, и
+только после этого отменяются старые `queued` Altegio-напоминания тех же
+записей. Порядок — это и есть гарантия: если создание не прошло, откат
+оставляет клиенту то напоминание, которое у него уже было.
+
+Если хотя бы одно относящееся к scope старое задание оказалось в
+`status=processing`, apply останавливается целиком и не меняет ничего.
+
+### 6b.4 Verify
+
+```bash
+cd /opt/altegio_bot && docker compose --profile ops run --rm easyweek-migration-prepare-handover verify --manifest /migration/input/manifest.json --company-id 758285 --snapshot /migration/state/reminder_handover.json
+```
+
+Затем существующий preflight по открытым EasyWeek-напоминаниям:
+
+```bash
+cd /opt/altegio_bot && docker compose --profile ops run --rm easyweek-migration-prepare-handover plan --manifest /migration/input/manifest.json --company-id 758285 --snapshot /migration/state/reminder_handover_after.json
+```
+
+```bash
+cd /opt/altegio_bot && docker compose run --rm --no-deps altegio-outbox-worker python -m altegio_bot.scripts.easyweek_reminder_preflight
+```
+
+Повторный `plan` должен показать `easyweek_reminders_to_create: 0` и
+`coverage_ready: true`. Повторный `apply` идемпотентен и ничего не меняет.
+
+Read-only сверка в базе:
+
+```bash
+cd /opt/altegio_bot && docker compose exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT provider, job_type, status, count(*) FROM message_jobs WHERE job_type IN ('reminder_24h','reminder_2h') GROUP BY 1,2,3 ORDER BY 1,2,3;"
+```
+
+### 6b.5 Если что-то пошло не так
+
+| Симптом | Что это значит | Что делать |
+|---|---|---|
+| `halted: source_reminder_processing` | воркер держит старое задание | ничего не изменено; подождать, повторить `plan` и `apply` |
+| `halted: local_target_mismatch` | запись сдвинулась или отменена после `plan` | новый `plan` |
+| `halted: ledger_not_created` | ledger-строка изменила статус | новый `plan`; разобраться, что её двигало |
+| `halted: reminder_boundary_passed` | напоминание уже прошло свой момент | новый `plan` |
+| `halted: obligation_not_created` | канонический ключ занят чужой записью | ничего не изменено; разобраться в `message_jobs` руками |
+| `the snapshot is ...s old` | снимок устарел | новый `plan` |
+| `rows_with_blockers` не пуст | ключ занят canceled/failed заданием | решение оператора; инструмент такие не переоткрывает |
+
+Отката как отдельной команды нет и он не нужен: apply либо проходит целиком,
+либо не меняет ничего. Если apply прошёл, а результат не устраивает, отменять
+созданные EasyWeek-напоминания и возвращать Altegio-задания — отдельное ручное
+решение, и делается оно после `verify`, с полным пониманием, какие записи
+затронуты.
+
+После переключения дальнейшее перепланирование — reschedule, update, cancel —
+целиком за обычными EasyWeek-вебхуками. Никакого фонового синхронизатора этот
+шаг не оставляет.
+
+---
+
 ## 7. Что этот этап не делает
 
 - Не переносит записи и не содержит второго мигратора.
 - Не сопоставляет услуги «похоже»: только точное совпадение канонического
   имени, всё остальное — на человека.
+- Не считает mapping из прошлой волны разрешением для мастера новой волны: если
+  каталог не отдаёт услугу тому, кто её реально ведёт, это
+  `existing_mapping_staff_unavailable`, а не готовность.
+- Не утверждает, что EasyWeek API принимает индивидуальную длительность или
+  цену. Запись, растянутая руками, попадает в `manual_adjustment_candidate` —
+  это работа человека, а не автоматический путь.
 - Не считает совпадение UUID достаточным: если у уже сопоставленной услуги в
   каталоге изменились имя, валюта, цена или длительность, это `drift`, а не
   готовность.
@@ -290,4 +433,6 @@ canary.
 | `the live data no longer matches the reviewed decision` | данные изменились после review | шаг 1 и 2 заново; ничего не изменено |
 | `existing_mapping_drift` | UUID тот же, но услуга в каталоге изменилась | сверить `drift_fields` и `existing_manifest_baseline` в review; manifest сам не переписывается |
 | `existing_mapping_baseline_incomplete` | в manifest нет замороженной identity услуги | дописать `catalog_service_name` и `catalog_currency` в manifest |
+| `existing_mapping_staff_unavailable` | услуга сопоставлена, но каталог не отдаёт её мастеру этой волны | открыть услугу мастеру в EasyWeek, затем повторить шаг 1 |
+| `correction_source_identity_changed` | исходные данные клиента изменились после исправления | шаг 1 и 2 заново; исправление молча не применяется |
 | `branch identity unproven` | manifest указывает не на тот филиал | проверить `EASYWEEK_LOCATION_MAP` и `easyweek_location_*` в manifest |

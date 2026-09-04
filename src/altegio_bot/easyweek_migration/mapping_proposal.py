@@ -60,6 +60,11 @@ PROPOSAL_BASELINE_DRIFT: Final = "existing_mapping_drift"
 # there is no baseline to compare the live catalogue against. Not drift — we
 # cannot tell — and for that reason not readiness either.
 PROPOSAL_BASELINE_INCOMPLETE: Final = "existing_mapping_baseline_incomplete"
+# The mapping is intact — right UUID, unchanged baseline — and the catalogue
+# nonetheless says this wave's master cannot perform it. A cumulative manifest
+# carries a mapping forward across waves; the masters do not come with it. Wave
+# A proved the service for master A, and that proves nothing about master B.
+PROPOSAL_STAFF_UNAVAILABLE: Final = "existing_mapping_staff_unavailable"
 PROPOSAL_SOURCE_NAME_UNUSABLE: Final = "source_name_unusable"
 
 # Whether the catalogue said this service can be booked with the chosen master.
@@ -142,7 +147,16 @@ class SourceService:
     # More than one means the bookings disagree about the service's own
     # baseline, which the operator has to see before choosing one.
     observed_prices: tuple[str, ...] = ()
+    # The SERVICE LINE's own length, when Altegio states one. A property of the
+    # catalogue entry, not of any particular appointment.
     observed_durations: tuple[int, ...] = ()
+    # The BOOKING's actual length, from the top-level `record.seance_length`.
+    # Deliberately separate: Altegio does not always repeat the service duration
+    # on the line, and a slot hand-stretched to 90 minutes carries its real
+    # length here and nowhere else. Reading only the service line made a
+    # stretched appointment indistinguishable from a standard one — including in
+    # the digest, so an agreement survived a change it should not have.
+    observed_booking_durations: tuple[int, ...] = ()
     # The Altegio staff ids that ACTUALLY perform this service in the in-scope
     # bookings — not the wave's staff list. The distinction is the whole point:
     # availability was judged against the union of every selected master, so a
@@ -242,11 +256,14 @@ class ServiceProposal:
 
     @property
     def settled(self) -> bool:
-        """Is this service done — mapped, matching, and needing no decision?
+        """Is this service done — mapped, matching, available, needing no decision?
 
-        Only an unchanged existing mapping qualifies. Drift and an unverifiable
-        baseline both mean the wave is NOT ready, which is the correction: a
-        matching UUID over a moved service used to read as readiness.
+        Only an unchanged existing mapping whose catalogue entry is not refused
+        to any master actually performing it in THIS wave qualifies. Drift, an
+        unverifiable baseline and a mapping the wave's master may not use all
+        mean the wave is NOT ready. Both of the last two used to read as
+        readiness: a matching UUID over a moved service, and a mapping inherited
+        from a wave whose master was a different person.
         """
         return self.status == PROPOSAL_ALREADY_MAPPED
 
@@ -272,6 +289,7 @@ class ServiceProposal:
             "booking_count": self.source.booking_count,
             "observed_source_prices": sorted(self.source.observed_prices),
             "observed_source_durations_minutes": sorted(self.source.observed_durations),
+            "observed_booking_durations_minutes": sorted(self.source.observed_booking_durations),
             "altegio_staff_ids": sorted(self.source.altegio_staff_ids),
             "status": self.status,
             "actionable": self.actionable,
@@ -319,6 +337,7 @@ def collect_source_services(records: list[dict[str, Any]], *, staff_ids: set[int
     names: dict[int, str] = {}
     prices: dict[int, set[str]] = {}
     durations: dict[int, set[int]] = {}
+    booking_durations: dict[int, set[int]] = {}
     performed_by: dict[int, set[int]] = {}
 
     for record in records:
@@ -335,15 +354,18 @@ def collect_source_services(records: list[dict[str, Any]], *, staff_ids: set[int
             counts[service_id] += 1
             if type(staff_id) is int:
                 performed_by.setdefault(service_id, set()).add(staff_id)
+            actual = whole_minutes(record.get("seance_length"))
+            if actual is not None:
+                booking_durations.setdefault(service_id, set()).add(actual)
             title = item.get("title")
             if isinstance(title, str) and title.strip() and service_id not in names:
                 names[service_id] = title.strip()
             price = _exact_price(item.get("cost"))
             if price is not None:
                 prices.setdefault(service_id, set()).add(price)
-            seance = item.get("seance_length")
-            if type(seance) is int and seance > 0 and seance % 60 == 0:
-                durations.setdefault(service_id, set()).add(seance // 60)
+            line = whole_minutes(item.get("seance_length"))
+            if line is not None:
+                durations.setdefault(service_id, set()).add(line)
 
     return [
         SourceService(
@@ -352,10 +374,23 @@ def collect_source_services(records: list[dict[str, Any]], *, staff_ids: set[int
             booking_count=count,
             observed_prices=tuple(sorted(prices.get(service_id, ()))),
             observed_durations=tuple(sorted(durations.get(service_id, ()))),
+            observed_booking_durations=tuple(sorted(booking_durations.get(service_id, ()))),
             altegio_staff_ids=tuple(sorted(performed_by.get(service_id, ()))),
         )
         for service_id, count in sorted(counts.items())
     ]
+
+
+def whole_minutes(raw: object) -> int | None:
+    """Altegio seconds as whole minutes, or ``None``.
+
+    A duration that is not a whole number of minutes cannot be represented and
+    is never rounded — the migration sends minutes, and a rounded one would move
+    the appointment's end.
+    """
+    if type(raw) is not int or raw <= 0 or raw % 60:
+        return None
+    return raw // 60
 
 
 def _staff_id_of(record: dict[str, Any]) -> object:
@@ -513,7 +548,15 @@ def propose_service_mapping(
                 status = PROPOSAL_BASELINE_INCOMPLETE
             else:
                 baseline, drift = _baseline_drift(existing, live)
-                status = PROPOSAL_BASELINE_DRIFT if drift else PROPOSAL_ALREADY_MAPPED
+                if drift:
+                    status = PROPOSAL_BASELINE_DRIFT
+                elif _candidate(live, source).staff_availability == STAFF_AVAILABILITY_ABSENT:
+                    # An inherited mapping is not inherited permission. The
+                    # baseline is fine and the service is still unbookable for
+                    # the master this wave has performing it.
+                    status = PROPOSAL_STAFF_UNAVAILABLE
+                else:
+                    status = PROPOSAL_ALREADY_MAPPED
             proposals.append(
                 ServiceProposal(
                     altegio_company_id=altegio_company_id,

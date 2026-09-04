@@ -64,8 +64,18 @@ from zoneinfo import ZoneInfo
 from altegio_bot.easyweek_migration.altegio_source import build_window, fetch_company_records
 from altegio_bot.easyweek_migration.branch_identity import verify_branch_identity
 from altegio_bot.easyweek_migration.classify import (
+    BLOCK_CUSTOM_DURATION,
+    BLOCK_CUSTOM_PRICE,
+    BLOCK_DURATION_UNKNOWN,
+    BLOCK_MULTI_SERVICE,
+    BLOCK_NO_RECORD_ID,
+    BLOCK_NO_SERVICES,
+    BLOCK_PRICE_BASELINE_MISSING,
+    BLOCK_PRICE_MALFORMED,
+    BLOCK_SERVICE_ID_INVALID,
     BLOCK_SERVICE_MAPPING_MISSING,
     BLOCK_STAFF_MAPPING_MISSING,
+    BLOCK_STATUS_UNRECOGNISED,
     BLOCKED,
     READY,
     SKIPPED,
@@ -96,6 +106,12 @@ from altegio_bot.easyweek_migration.customer_decisions import (
     CustomerDecisionStore,
     DecisionSet,
 )
+from altegio_bot.easyweek_migration.customer_overrides import (
+    OVERRIDE_STALE_IDENTITY,
+    CustomerOverride,
+    CustomerOverrideStore,
+    source_identity_digest,
+)
 from altegio_bot.easyweek_migration.customers import (
     CUSTOMER_AMBIGUOUS,
     CUSTOMER_FIRST_NAME_MISSING,
@@ -115,6 +131,7 @@ from altegio_bot.easyweek_migration.mapping_proposal import (
     proposal_digest,
     propose_service_mapping,
     read_service_staff_uuids,
+    whole_minutes,
 )
 from altegio_bot.easyweek_migration.service_catalog import (
     CatalogSnapshot,
@@ -290,6 +307,62 @@ def collect_source_customers(records: list[dict[str, Any]]) -> dict[str, SourceC
     return grouped
 
 
+# How a booking would have to be handled, and WHY. The distinction the vocabulary
+# exists to keep: "the EasyWeek API has no proven way to express this" is a
+# different fact from "the source data cannot be proven", and collapsing them
+# sends an operator to fix the wrong thing.
+#
+# None of these except `automatic` is an automatic path. Nothing here claims the
+# EasyWeek API supports a custom duration, a custom price or a multi-service
+# cart: no canary has proven any of those, so `cart_candidate` and
+# `manual_adjustment_candidate` name what a PERSON would have to do, not what
+# the tool will do.
+CLASS_AUTOMATIC: Final = "automatic"
+CLASS_CART_CANDIDATE: Final = "cart_candidate"
+CLASS_MANUAL_ADJUSTMENT: Final = "manual_adjustment_candidate"
+CLASS_FULLY_MANUAL: Final = "fully_manual"
+CLASS_BLOCKED_UNPROVEN: Final = "blocked_unproven"
+
+# The API cannot express it. A person recreates the booking in EasyWeek by hand.
+_API_LIMIT_CLASSES: Final = {
+    BLOCK_MULTI_SERVICE: CLASS_CART_CANDIDATE,
+    BLOCK_CUSTOM_DURATION: CLASS_MANUAL_ADJUSTMENT,
+    BLOCK_CUSTOM_PRICE: CLASS_MANUAL_ADJUSTMENT,
+}
+# The DATA cannot be proven. A person fixes the source, and it may then migrate
+# automatically after all.
+_UNPROVEN_DATA_BLOCKS: Final = frozenset(
+    {
+        BLOCK_DURATION_UNKNOWN,
+        BLOCK_PRICE_MALFORMED,
+        BLOCK_PRICE_BASELINE_MISSING,
+        BLOCK_NO_SERVICES,
+        BLOCK_SERVICE_ID_INVALID,
+        BLOCK_STATUS_UNRECOGNISED,
+        BLOCK_NO_RECORD_ID,
+    }
+)
+
+
+def handling_class(block_reason: str | None) -> str:
+    """Which of the five kinds of work this booking needs.
+
+    Reporting only. It changes no decision and authorises no path; it exists so
+    an operator reading "12 records need work" can tell which of them need a
+    data fix and which need a person in the EasyWeek interface.
+    """
+    if block_reason is None:
+        return CLASS_AUTOMATIC
+    if block_reason in _API_LIMIT_CLASSES:
+        return _API_LIMIT_CLASSES[block_reason]
+    if block_reason in _UNPROVEN_DATA_BLOCKS:
+        return CLASS_BLOCKED_UNPROVEN
+    if block_reason in PREPARABLE_BLOCKS:
+        # This stage's own job — a mapping or a customer it is about to resolve.
+        return CLASS_AUTOMATIC
+    return CLASS_FULLY_MANUAL
+
+
 def operator_record_row(record: dict[str, Any], *, block_reason: str | None) -> dict[str, Any]:
     """One booking as the operator has to check it against Altegio.
 
@@ -304,8 +377,12 @@ def operator_record_row(record: dict[str, Any], *, block_reason: str | None) -> 
     """
     services = record.get("services")
     service = services[0] if isinstance(services, list) and services and isinstance(services[0], dict) else {}
-    seance = record.get("seance_length")
-    minutes = seance // 60 if type(seance) is int and seance > 0 and seance % 60 == 0 else None
+    # THE APPOINTMENT's own length, from the top-level field. The service line's
+    # length is a property of the catalogue entry and is reported next to it, not
+    # instead of it: a slot hand-stretched to 90 minutes states its real length
+    # only here, and reading the line would show the standard hour.
+    minutes = whole_minutes(record.get("seance_length"))
+    service_minutes = whole_minutes(service.get("seance_length"))
 
     starts_local: str | None = None
     ends_local: str | None = None
@@ -326,7 +403,11 @@ def operator_record_row(record: dict[str, Any], *, block_reason: str | None) -> 
         "starts_at_local": starts_local,
         "ends_at_local": ends_local,
         "starts_at_utc": starts_utc,
+        # The booking's actual length, and separately the service line's own —
+        # a disagreement between them IS the per-booking override.
         "duration_minutes": minutes,
+        "service_line_duration_minutes": service_minutes,
+        "handling": handling_class(block_reason),
         "altegio_service_id": service.get("id"),
         "altegio_service_name": _text(service.get("title")),
         "price": _text(str(service.get("cost"))) if service.get("cost") is not None else None,
@@ -344,14 +425,51 @@ def _staff_id_of_record(record: dict[str, Any]) -> Any:
     return staff.get("id") if isinstance(staff, dict) else None
 
 
-def _proposal_from_source(source: SourceCustomer, lookup: CustomerLookup) -> CustomerDecision:
+def source_identity_of(source: SourceCustomer) -> str:
+    """The proven evidence about one source customer, as a digest.
+
+    What a manual correction is bound to. Not the name — a name is exactly what
+    an operator may be correcting, and two people in one salon share one often
+    enough that binding to it would write one person's surname onto the other.
+    """
+    return source_identity_digest(
+        phone=source.phone,
+        source_client_ids=source.source_client_ids,
+        record_ids=source.record_ids,
+    )
+
+
+def _proposal_from_source(
+    source: SourceCustomer,
+    lookup: CustomerLookup,
+    *,
+    override: CustomerOverride | None = None,
+) -> CustomerDecision:
     """Turn one person plus one lookup into a decision record.
 
     The only path to ``pending`` — a record a person may later confirm — is a
     proven absence with a usable name. Everything else is written down as blocked
     with the reason, because an operator has to see WHY a customer will not be
     created, not merely that they were not.
+
+    ``override`` is a correction a person entered earlier. It is applied ON TOP
+    of the fresh source data, before the blocking rules are evaluated and before
+    the digest is computed — so a customer whose source still has only a full
+    name becomes confirmable on the strength of the split the operator supplied,
+    and the digest they confirm covers the corrected values they can see.
+
+    An override for a DIFFERENT source identity never reaches this function; the
+    caller checks that first and blocks the customer as stale instead. Applying
+    one silently is how a correction ends up on somebody else's card.
     """
+    first_name = source.first_name
+    last_name = source.last_name
+    email = source.email
+    if override is not None:
+        first_name = override.first_name or first_name
+        last_name = override.last_name or last_name
+        email = override.email or email
+
     blocked: str | None = None
     if lookup.outcome != LOOKUP_ABSENT:
         blocked = {
@@ -363,16 +481,17 @@ def _proposal_from_source(source: SourceCustomer, lookup: CustomerLookup) -> Cus
         }.get(lookup.outcome, BLOCK_LOOKUP_UNDETERMINED)
     elif source.shares_phone:
         blocked = BLOCK_SHARED_PHONE
-    elif not source.first_name:
+    elif not first_name:
         # `POST /customers` needs a real given name. A full name is not one, and
-        # is not split automatically — the operator supplies the split.
+        # is not split automatically — the operator supplies the split, and once
+        # they have, the override above has already put it here.
         blocked = BLOCK_NAME_NOT_SPLIT if source.full_name else BLOCK_NAME_MISSING
 
     decision = CustomerDecision(
         phone=source.phone,
-        first_name=source.first_name,
-        last_name=source.last_name,
-        email=source.email,
+        first_name=first_name,
+        last_name=last_name,
+        email=email,
         linked_record_count=source.linked_record_count,
         source_label=source.full_name or "",
         state=STATE_BLOCKED if blocked else STATE_PENDING,
@@ -380,6 +499,21 @@ def _proposal_from_source(source: SourceCustomer, lookup: CustomerLookup) -> Cus
         blocked_reason=blocked,
     )
     return decision.with_digest()
+
+
+def _stale_correction(source: SourceCustomer, lookup: CustomerLookup) -> CustomerDecision:
+    """A customer whose stored correction no longer describes them.
+
+    Never silently applied, never silently dropped. The correction was evidence
+    about one person as the source then described them; the source has since
+    changed, so a person has to look again and either re-enter it or accept the
+    new data.
+    """
+    return replace(
+        _proposal_from_source(source, lookup),
+        state=STATE_BLOCKED,
+        blocked_reason=OVERRIDE_STALE_IDENTITY,
+    ).with_digest()
 
 
 # ---------------------------------------------------------------------------
@@ -534,6 +668,11 @@ class PreparationSnapshot:
     # Freshly derived from the live lookups, already digested. The confirm path
     # compares these against the stored decisions rather than trusting the file.
     customer_proposals: dict[str, CustomerDecision]
+    # Phones whose proposal carries a manual correction applied on top of the
+    # fresh source, and phones whose stored correction no longer describes the
+    # source it was made about. Disjoint by construction.
+    corrected_customers: frozenset[str] = frozenset()
+    stale_corrections: frozenset[str] = frozenset()
 
     def proposal_for(self, altegio_service_id: int) -> ServiceProposal | None:
         for proposal in self.proposals:
@@ -622,12 +761,30 @@ async def build_preparation_snapshot(
     )
 
     # -- customers ----------------------------------------------------------
+    # Corrections a person entered earlier, applied on top of the fresh source.
+    # Loaded before the lookups so a rebuild cannot discard them (plan §30.9).
+    overrides = CustomerOverrideStore(inputs.state_dir).load()
+
     sources = collect_source_customers(in_scope)
     lookups: dict[str, CustomerLookup] = {}
     customer_proposals: dict[str, CustomerDecision] = {}
+    corrected: set[str] = set()
+    stale_corrections: set[str] = set()
     for phone in sorted(sources):
+        source = sources[phone]
         lookups[phone] = await lookup_customer_by_phone(write_client, phone)
-        customer_proposals[phone] = _proposal_from_source(sources[phone], lookups[phone])
+        override = overrides.get(phone)
+        if override is None:
+            customer_proposals[phone] = _proposal_from_source(source, lookups[phone])
+            continue
+        if override.applies_to(source_identity_of(source)):
+            customer_proposals[phone] = _proposal_from_source(source, lookups[phone], override=override)
+            corrected.add(phone)
+        else:
+            # The evidence the correction was made about has moved. Applying it
+            # anyway would put a person's decision onto data they never saw.
+            customer_proposals[phone] = _stale_correction(source, lookups[phone])
+            stale_corrections.add(phone)
 
     return PreparationSnapshot(
         branch=branch,
@@ -642,6 +799,8 @@ async def build_preparation_snapshot(
         customer_sources=sources,
         customer_lookups=lookups,
         customer_proposals=customer_proposals,
+        corrected_customers=frozenset(corrected),
+        stale_corrections=frozenset(stale_corrections),
     )
 
 
@@ -689,6 +848,8 @@ async def run_prepare(
             proposals=list(snapshot.proposals),
             agreement=agreement,
             lookups=snapshot.customer_lookups,
+            corrections_applied=len(snapshot.corrected_customers),
+            corrections_stale=len(snapshot.stale_corrections),
             manual=snapshot.manual,
             ready_now=snapshot.ready_now,
             in_scope=len(snapshot.in_scope),
@@ -701,6 +862,8 @@ async def run_prepare(
             proposals=list(snapshot.proposals),
             sources=snapshot.customer_sources,
             records=list(snapshot.operator_records),
+            corrected=snapshot.corrected_customers,
+            stale=snapshot.stale_corrections,
         )
         _write_private_json(inputs.state_dir / FILE_MACHINE_REPORT, machine)
         _write_private_json(inputs.state_dir / FILE_OPERATOR_REVIEW, operator)
@@ -775,6 +938,8 @@ def _machine_report(
     in_scope: int,
     source_records: int,
     catalog_digest: str,
+    corrections_applied: int = 0,
+    corrections_stale: int = 0,
 ) -> dict[str, Any]:
     """Counts and codes only. Never a name, a number, an address or a body.
 
@@ -829,6 +994,10 @@ def _machine_report(
             "blocked": customers_blocked,
             "in_flight_needs_reconciliation": in_flight,
             "lookups_undetermined": unresolved_lookups,
+            # Counts only. WHICH customer was corrected, and to what, lives in
+            # the operator review; a machine report never carries a name.
+            "manual_corrections_applied": corrections_applied,
+            "manual_corrections_stale": corrections_stale,
             "pending_digest": pending_digest(decisions),
             "states": decisions.summary(),
         },
@@ -839,6 +1008,7 @@ def _machine_report(
             "records_ready": ready_now,
             "records_needing_manual_work": sum(manual.values()),
             "blocked_by_technical_error": unresolved_lookups + len(in_flight),
+            "manual_corrections_stale": corrections_stale,
             "all_clear": (
                 not mapping_outstanding
                 and customers_pending == 0
@@ -846,6 +1016,7 @@ def _machine_report(
                 and not customers_blocked
                 and unresolved_lookups == 0
                 and not in_flight
+                and corrections_stale == 0
             ),
         },
         "artefacts": {
@@ -863,6 +1034,8 @@ def _operator_report(
     proposals: list[ServiceProposal],
     sources: dict[str, SourceCustomer],
     records: list[dict[str, Any]],
+    corrected: frozenset[str] = frozenset(),
+    stale: frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
     """The reviewable document. HOLDS PII, by design and by necessity.
 
@@ -896,6 +1069,11 @@ def _operator_report(
                 # every field printed above, so a confirmation cannot be aimed
                 # at data the person never read.
                 "review_digest": record.shown_digest,
+                # Whether the values above include a correction a person
+                # entered, and whether a stored correction stopped applying
+                # because the source moved under it.
+                "manually_corrected": record.phone in corrected,
+                "correction_stale": record.phone in stale,
                 "note": (
                     "Creating a card does NOT transfer visit history: EasyWeek will "
                     "show this customer with no previous visits."
@@ -1024,7 +1202,7 @@ def apply_confirmations(
 
         # -- everything validated; now, and only now, mutate -----------------
         if request.correct_phone is not None:
-            corrected = _apply_correction(decisions, request)
+            corrected = _apply_correction(inputs, decisions, request, snapshot)
             outcome["corrected"].append(phone_fingerprint(corrected))
 
         for phone, state in planned:
@@ -1043,7 +1221,24 @@ def apply_confirmations(
     return outcome
 
 
-def _apply_correction(decisions: DecisionSet, request: ConfirmRequest) -> str:
+def _apply_correction(
+    inputs: PrepareInputs,
+    decisions: DecisionSet,
+    request: ConfirmRequest,
+    snapshot: PreparationSnapshot,
+) -> str:
+    """Record a correction durably, then reflect it in this run's decision.
+
+    The durable half is the point. Writing only the in-memory decision was the
+    defect: the next command rebuilds proposals from live data and
+    ``upsert_proposal`` replaces a pending record with the fresh one, so the
+    correction vanished and the customer blocked again — forever, however many
+    times it was retyped.
+
+    The override is bound to the PROVEN source identity, never to a name, and it
+    is written before the decision so a crash between the two leaves the
+    correction recorded rather than lost.
+    """
     phone = normalized_international_phone(request.correct_phone)
     if phone is None:
         raise _refuse("the phone number to correct is not a usable international number")
@@ -1051,12 +1246,36 @@ def _apply_correction(decisions: DecisionSet, request: ConfirmRequest) -> str:
     if record is None:
         raise _refuse("no customer decision for that number")
     if record.state in (STATE_CREATED, STATE_IN_FLIGHT):
-        raise _refuse("that customer has already been created or is mid-creation")
+        # Terminal and in-flight states are untouchable: a created card exists,
+        # and an in-flight one may. Editing either would either rewrite a real
+        # customer or authorise a second POST for one.
+        raise _refuse("that customer has already been created or is mid-creation", record.state)
+
+    source = snapshot.customer_sources.get(phone)
+    if source is None:
+        raise _refuse("that customer is no longer part of this wave")
+
+    first_name = _text(request.correct_first_name)
+    last_name = _text(request.correct_last_name)
+    email = _text(request.correct_email)
+    if not (first_name or last_name or email):
+        raise _refuse("a correction must set at least one of --first-name, --last-name, --email")
+
+    store = CustomerOverrideStore(inputs.state_dir)
+    overrides = store.load()
+    merged = replace(
+        overrides.merged(phone, first_name=first_name, last_name=last_name, email=email),
+        identity_digest=source_identity_of(source),
+        base_review_digest=record.shown_digest,
+    )
+    overrides.put(merged)
+    store.save(overrides)
+
     corrected = replace(
         record,
-        first_name=_text(request.correct_first_name) or record.first_name,
-        last_name=_text(request.correct_last_name) or record.last_name,
-        email=_text(request.correct_email) or record.email,
+        first_name=merged.first_name or record.first_name,
+        last_name=merged.last_name or record.last_name,
+        email=merged.email or record.email,
         # A correction always returns the record to pending: the person who
         # confirms it must see the corrected values, and its digest changes with
         # them, so the old agreement cannot survive the edit.

@@ -338,6 +338,38 @@ services:
     profiles:
       - ops
 
+  # The post-migration reminder handover (plan §30). A separate one-off service
+  # from `easyweek-migration-prepare` because it holds a different power: it can
+  # create and cancel MESSAGE JOBS, and cannot create a customer or a booking.
+  # `EASYWEEK_REMINDER_HANDOVER_ALLOW_APPLY` is deliberately NOT set here — an
+  # operator passes it on the one command that writes, alongside a typed flag,
+  # the plan digest and the confirmation phrase.
+  easyweek-migration-prepare-handover:
+    build: .
+    env_file:
+      - .env
+      - path: easyweek.env
+        required: false
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ${EASYWEEK_MIGRATION_INPUT_DIR:-./outputs/easyweek_migration/input}:/migration/input:ro
+      # The snapshot names real bookings and real job ids. Writable, 0600, and
+      # never committed.
+      - ${EASYWEEK_MIGRATION_STATE_DIR:-./outputs/easyweek_migration_prepare}:/migration/state
+    entrypoint:
+      [
+        "/app/.venv/bin/python",
+        "-m",
+        "altegio_bot.scripts.easyweek_reminder_handover",
+      ]
+    command: ["--help"]
+    working_dir: /app
+    restart: "no"
+    profiles:
+      - ops
+
 volumes:
   postgres_data:
   redis_data:

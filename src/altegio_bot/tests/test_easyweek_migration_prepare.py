@@ -22,6 +22,13 @@ from typing import Any
 import pytest
 
 from altegio_bot.easyweek_migration import prepare as prepare_module
+from altegio_bot.easyweek_migration.customer_decisions import (
+    STATE_BLOCKED,
+    STATE_CONFIRMED,
+    STATE_PENDING,
+    CustomerDecisionStore,
+)
+from altegio_bot.easyweek_migration.customer_overrides import CustomerOverrideError
 from altegio_bot.easyweek_migration.cutover import parse_cutover
 from altegio_bot.easyweek_migration.manifest import KARLSRUHE_COMPANY_ID, inventory_manifest, parse_manifest
 from altegio_bot.easyweek_migration.mapping_proposal import (
@@ -31,6 +38,7 @@ from altegio_bot.easyweek_migration.mapping_proposal import (
     PROPOSAL_BASELINE_DRIFT,
     PROPOSAL_BASELINE_INCOMPLETE,
     PROPOSAL_NO_CANDIDATE,
+    PROPOSAL_STAFF_UNAVAILABLE,
     PROPOSAL_UNIQUE_NAME,
     STAFF_AVAILABILITY_ABSENT,
     STAFF_AVAILABILITY_PROVEN,
@@ -44,6 +52,7 @@ from altegio_bot.easyweek_migration.mapping_proposal import (
     read_service_staff_uuids,
 )
 from altegio_bot.easyweek_migration.prepare import (
+    BLOCK_NAME_NOT_SPLIT,
     FILE_CUSTOMER_DIRECTORY,
     FILE_MANIFEST_PROPOSED,
     FILE_OPERATOR_REVIEW,
@@ -69,6 +78,7 @@ from altegio_bot.tests.test_easyweek_migration_planning import (
     KA_STAFF_UUID,
 )
 
+REPO_ROOT = Path(__file__).resolve().parents[3]
 CUTOVER = "2026-09-01T00:00:00Z"
 OTHER_SERVICE_UUID = "99999999-9999-4999-8999-999999999999"
 SECOND_SERVICE_ID = 6009
@@ -253,6 +263,12 @@ async def confirm_customer(inputs: PrepareInputs, review: Any, phone: str, *, cl
         ConfirmRequest(confirm_customers=(ConfirmTarget(identifier=phone, review_digest=digest),)),
         snapshot=await snapshot_for(inputs, client),
     )
+
+
+def load_decisions(state_dir: Path) -> Any:
+    store = CustomerDecisionStore(state_dir)
+    with store:
+        return store.load()
 
 
 def mapped_branch() -> Any:
@@ -521,6 +537,7 @@ async def test_readiness_is_reported_in_separate_lines_not_one_word(
         "records_ready",
         "records_needing_manual_work",
         "blocked_by_technical_error",
+        "manual_corrections_stale",
         "all_clear",
     }
 
@@ -1420,3 +1437,461 @@ def test_every_frozen_baseline_field_has_a_drift_check() -> None:
     compared = set(BASELINE_FIELDS) - {"easyweek_service_uuid"}
 
     assert compared == set(DRIFTS), "add the new baseline field to DRIFTS"
+
+
+# ---------------------------------------------------------------------------
+# A manual correction survives the next rebuild (plan §30.9)
+# ---------------------------------------------------------------------------
+
+
+FULL_NAME_ONLY = {"phone": PHONE, "name": "Anna Maria Schmidt", "id": 42}
+
+
+def unsplit_record(record_id: int = 900001) -> dict[str, Any]:
+    """A booking whose customer has a full name and no given name."""
+    return source_record(record_id, client=dict(FULL_NAME_ONLY))
+
+
+async def correct(inputs: PrepareInputs, **fields: str) -> dict[str, Any]:
+    return apply_confirmations(
+        inputs,
+        ConfirmRequest(correct_phone=PHONE, **fields),
+        snapshot=await snapshot_for(inputs),
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_correction_survives_a_process_exit_and_a_fresh_rebuild(
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The defect, end to end.
+
+    prepare blocks on source_name_not_split -> operator corrects -> the process
+    exits -> a fresh confirm rebuilds the live snapshot -> the corrected proposal
+    is still there, reviewable, and its digest is accepted.
+    """
+    stub_source(monkeypatch, [unsplit_record()])
+    inputs = make_inputs(state_dir)
+
+    blocked = await run_prepare(inputs, write_client=FakePrepareClient())
+    [shown] = blocked.operator["customers"]
+    assert shown["blocked_reason"] == BLOCK_NAME_NOT_SPLIT
+    assert shown["manually_corrected"] is False
+
+    await correct(inputs, correct_first_name="Anna Maria", correct_last_name="Schmidt")
+
+    # A completely fresh rebuild — the process could have exited in between.
+    rebuilt = await run_prepare(inputs, write_client=FakePrepareClient())
+    [review] = rebuilt.operator["customers"]
+
+    assert review["first_name"] == "Anna Maria"
+    assert review["last_name"] == "Schmidt"
+    assert review["state"] == STATE_PENDING
+    assert review["blocked_reason"] is None
+    assert review["manually_corrected"] is True
+    assert rebuilt.machine["customers"]["manual_corrections_applied"] == 1
+
+    outcome = apply_confirmations(
+        inputs,
+        ConfirmRequest(confirm_customers=(ConfirmTarget(identifier=PHONE, review_digest=review["review_digest"]),)),
+        snapshot=await snapshot_for(inputs),
+    )
+
+    assert outcome["customer_states"] == {STATE_CONFIRMED: 1}
+
+
+@pytest.mark.asyncio
+async def test_a_second_prepare_does_not_discard_the_override(state_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    stub_source(monkeypatch, [unsplit_record()])
+    inputs = make_inputs(state_dir)
+    await run_prepare(inputs, write_client=FakePrepareClient())
+    await correct(inputs, correct_first_name="Anna Maria")
+
+    for _ in range(3):
+        result = await run_prepare(inputs, write_client=FakePrepareClient())
+
+    [review] = result.operator["customers"]
+    assert review["first_name"] == "Anna Maria"
+    assert review["manually_corrected"] is True
+
+
+@pytest.mark.asyncio
+async def test_the_corrected_digest_differs_from_the_one_before_the_correction(
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A digest taken before the correction must not confirm the corrected row."""
+    stub_source(monkeypatch, [unsplit_record()])
+    inputs = make_inputs(state_dir)
+    before = await run_prepare(inputs, write_client=FakePrepareClient())
+    stale_digest = before.operator["customers"][0]["review_digest"]
+
+    await correct(inputs, correct_first_name="Anna Maria")
+    after = await run_prepare(inputs, write_client=FakePrepareClient())
+
+    assert after.operator["customers"][0]["review_digest"] != stale_digest
+    with pytest.raises(PrepareError):
+        apply_confirmations(
+            inputs,
+            ConfirmRequest(confirm_customers=(ConfirmTarget(identifier=PHONE, review_digest=stale_digest),)),
+            snapshot=await snapshot_for(inputs),
+        )
+    assert load_decisions(state_dir).get(PHONE).state == STATE_PENDING
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param(lambda rec: rec["client"].update({"id": 99}), id="source_customer_changed"),
+        pytest.param(lambda rec: rec["client"].update({"phone": "+4915199999999"}), id="phone_identity_changed"),
+        pytest.param(lambda rec: rec.update({"id": 900777}), id="linked_bookings_changed"),
+    ],
+)
+async def test_a_moved_source_makes_the_correction_stale_rather_than_applied(
+    mutate: Any, state_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The correction was evidence about a person the source no longer describes."""
+    record = unsplit_record()
+    stub_source(monkeypatch, [record])
+    inputs = make_inputs(state_dir)
+    await run_prepare(inputs, write_client=FakePrepareClient())
+    await correct(inputs, correct_first_name="Anna Maria")
+
+    moved = unsplit_record()
+    mutate(moved)
+    stub_source(monkeypatch, [moved])
+    result = await run_prepare(inputs, write_client=FakePrepareClient())
+
+    reviews = {row["phone"]: row for row in result.operator["customers"]}
+    target = reviews.get(moved["client"]["phone"], reviews.get(PHONE))
+    assert target["state"] == STATE_BLOCKED
+    assert target["correction_stale"] is True or target["first_name"] is None
+    assert result.machine["ready"]["all_clear"] is False
+
+
+@pytest.mark.asyncio
+async def test_a_stale_correction_is_never_applied_to_another_customer(
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A number that changed hands must not inherit somebody else's correction."""
+    stub_source(monkeypatch, [unsplit_record()])
+    inputs = make_inputs(state_dir)
+    await run_prepare(inputs, write_client=FakePrepareClient())
+    await correct(inputs, correct_first_name="Anna Maria")
+
+    somebody_else = source_record(900002, client={"phone": PHONE, "name": "Bea Weber", "id": 77})
+    stub_source(monkeypatch, [somebody_else])
+    result = await run_prepare(inputs, write_client=FakePrepareClient())
+
+    [review] = result.operator["customers"]
+    assert review["first_name"] != "Anna Maria", "a name match is not identity"
+    assert review["correction_stale"] is True
+    assert review["state"] == STATE_BLOCKED
+    assert result.machine["customers"]["manual_corrections_stale"] == 1
+
+
+@pytest.mark.asyncio
+async def test_a_correction_never_leaks_into_the_machine_report(
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    stub_source(monkeypatch, [unsplit_record()])
+    inputs = make_inputs(state_dir)
+    await run_prepare(inputs, write_client=FakePrepareClient())
+
+    with caplog.at_level("INFO"):
+        await correct(inputs, correct_first_name="Anna Maria", correct_email="anna@example.invalid")
+        result = await run_prepare(inputs, write_client=FakePrepareClient())
+
+    for blob in (json.dumps(result.machine, ensure_ascii=False), caplog.text):
+        for secret in (PHONE, "Anna Maria", "Schmidt", "anna@example.invalid"):
+            assert secret not in blob, secret
+
+
+@pytest.mark.asyncio
+async def test_a_correction_that_sets_nothing_is_refused(state_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    stub_source(monkeypatch, [unsplit_record()])
+    inputs = make_inputs(state_dir)
+    await run_prepare(inputs, write_client=FakePrepareClient())
+
+    with pytest.raises(PrepareError):
+        await correct(inputs)
+
+
+@pytest.mark.asyncio
+async def test_the_override_store_is_not_world_readable(state_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    stub_source(monkeypatch, [unsplit_record()])
+    inputs = make_inputs(state_dir)
+    await run_prepare(inputs, write_client=FakePrepareClient())
+    await correct(inputs, correct_first_name="Anna Maria")
+
+    assert (os.stat(state_dir / "customer_overrides.json").st_mode & 0o077) == 0
+
+
+@pytest.mark.asyncio
+async def test_a_corrupt_override_store_is_refused_not_ignored(
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ignoring it would silently discard a correction and re-block the customer."""
+    stub_source(monkeypatch, [unsplit_record()])
+    inputs = make_inputs(state_dir)
+    await run_prepare(inputs, write_client=FakePrepareClient())
+    await correct(inputs, correct_first_name="Anna Maria")
+    (state_dir / "customer_overrides.json").write_text("{ not json")
+
+    with pytest.raises(CustomerOverrideError):
+        await run_prepare(inputs, write_client=FakePrepareClient())
+
+
+@pytest.mark.asyncio
+async def test_an_override_store_from_the_future_is_refused(state_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    stub_source(monkeypatch, [unsplit_record()])
+    inputs = make_inputs(state_dir)
+    await run_prepare(inputs, write_client=FakePrepareClient())
+    (state_dir / "customer_overrides.json").write_text(json.dumps({"version": 99, "overrides": []}))
+
+    with pytest.raises(CustomerOverrideError):
+        await run_prepare(inputs, write_client=FakePrepareClient())
+
+
+@pytest.mark.asyncio
+async def test_the_decision_store_version_is_unchanged_by_this_feature(
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Corrections live in their own file: no terminal or in-flight state moves."""
+    from altegio_bot.easyweek_migration.customer_decisions import STORE_VERSION
+
+    stub_source(monkeypatch, [unsplit_record()])
+    inputs = make_inputs(state_dir)
+    await run_prepare(inputs, write_client=FakePrepareClient())
+    await correct(inputs, correct_first_name="Anna Maria")
+
+    stored = json.loads((state_dir / "customer_decisions.json").read_text())
+    assert stored["version"] == STORE_VERSION == 1
+
+
+# ---------------------------------------------------------------------------
+# A mapping is inherited across waves; permission is not (plan §30.9)
+# ---------------------------------------------------------------------------
+
+
+def wave_b_branch() -> Any:
+    """Wave B: a different master, on the manifest wave A already filled in."""
+    payload = json.loads(manifest_json())
+    branch = payload["branches"][str(KARLSRUHE_COMPANY_ID)]
+    branch["selected_altegio_staff_ids"] = [KA_SECOND_STAFF_ID]
+    branch["deferred_altegio_staff_ids"] = [KA_STAFF_ID]
+    branch["staff"][str(KA_SECOND_STAFF_ID)] = KA_SECOND_STAFF_UUID
+    return inventory_manifest(json.dumps(payload)).branch(KARLSRUHE_COMPANY_ID)
+
+
+def wave_b_record() -> dict[str, Any]:
+    record = source_record(service_name=BASELINE_NAME)
+    record["staff_id"] = KA_SECOND_STAFF_ID
+    return record
+
+
+def test_an_inherited_mapping_the_new_master_may_not_use_is_not_settled() -> None:
+    """Wave A mapped S for master A; wave B's master B may not perform it."""
+    [proposal] = propose(
+        [baseline_catalog_row(staff=[KA_STAFF_UUID])],
+        records=[wave_b_record()],
+        branch=wave_b_branch(),
+        staff={KA_SERVICE_UUID: frozenset({KA_STAFF_UUID})},
+        staff_ids={KA_SECOND_STAFF_ID},
+    )
+
+    assert proposal.status == PROPOSAL_STAFF_UNAVAILABLE
+    assert proposal.settled is False
+    assert proposal.actionable is False, "no automatic confirmation"
+    assert proposal.drift_fields == (), "the baseline itself is intact"
+    assert proposal.chosen is None
+
+
+def test_an_inherited_mapping_the_new_master_may_use_stays_settled() -> None:
+    [proposal] = propose(
+        [baseline_catalog_row(staff=[KA_STAFF_UUID, KA_SECOND_STAFF_UUID])],
+        records=[wave_b_record()],
+        branch=wave_b_branch(),
+        staff={KA_SERVICE_UUID: frozenset({KA_STAFF_UUID, KA_SECOND_STAFF_UUID})},
+        staff_ids={KA_SECOND_STAFF_ID},
+    )
+
+    assert proposal.status == PROPOSAL_ALREADY_MAPPED
+    assert proposal.settled is True
+
+
+def test_an_inherited_mapping_with_an_unstated_catalogue_keeps_current_semantics() -> None:
+    """UNSTATED is not turned into invented evidence, and not into a refusal."""
+    [proposal] = propose(
+        [baseline_catalog_row()],
+        records=[wave_b_record()],
+        branch=wave_b_branch(),
+        staff={KA_SERVICE_UUID: None},
+        staff_ids={KA_SECOND_STAFF_ID},
+    )
+
+    assert proposal.status == PROPOSAL_ALREADY_MAPPED
+    assert proposal.candidates[0].staff_availability == STAFF_AVAILABILITY_UNSTATED
+
+
+def test_the_check_uses_only_masters_who_actually_perform_the_service() -> None:
+    """Not the union of the wave: a bystander's access is still not evidence."""
+    both = json.loads(manifest_json())
+    branch_payload = both["branches"][str(KARLSRUHE_COMPANY_ID)]
+    branch_payload["selected_altegio_staff_ids"] = [KA_STAFF_ID, KA_SECOND_STAFF_ID]
+    branch_payload["deferred_altegio_staff_ids"] = []
+    branch_payload["staff"][str(KA_SECOND_STAFF_ID)] = KA_SECOND_STAFF_UUID
+    branch = inventory_manifest(json.dumps(both)).branch(KARLSRUHE_COMPANY_ID)
+
+    [proposal] = propose(
+        [baseline_catalog_row(staff=[KA_STAFF_UUID])],
+        records=[wave_b_record()],
+        branch=branch,
+        staff={KA_SERVICE_UUID: frozenset({KA_STAFF_UUID})},
+        staff_ids={KA_STAFF_ID, KA_SECOND_STAFF_ID},
+    )
+
+    assert proposal.chosen is None
+    assert proposal.status == PROPOSAL_STAFF_UNAVAILABLE
+    assert proposal.candidates[0].required_staff_uuids == (KA_SECOND_STAFF_UUID,)
+
+
+@pytest.mark.asyncio
+async def test_an_unavailable_inherited_mapping_blocks_the_wave(
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = json.loads(manifest_json())
+    branch = payload["branches"][str(KARLSRUHE_COMPANY_ID)]
+    branch["selected_altegio_staff_ids"] = [KA_SECOND_STAFF_ID]
+    branch["deferred_altegio_staff_ids"] = [KA_STAFF_ID]
+    branch["staff"][str(KA_SECOND_STAFF_ID)] = KA_SECOND_STAFF_UUID
+
+    stub_source(monkeypatch, [wave_b_record()])
+    inputs = make_inputs(state_dir, manifest_text=json.dumps(payload))
+    client = FakePrepareClient(catalog=[baseline_catalog_row(staff=[KA_STAFF_UUID])])
+
+    result = await run_prepare(inputs, write_client=client)
+
+    assert result.machine["ready"]["mapping_ready"] is False
+    assert result.machine["ready"]["all_clear"] is False
+    [shown] = result.machine["mapping"]["proposals"]
+    assert shown["status"] == PROPOSAL_STAFF_UNAVAILABLE
+    assert shown["settled"] is False
+    assert shown["actionable"] is False
+
+
+@pytest.mark.asyncio
+async def test_an_unavailable_inherited_mapping_cannot_be_confirmed(
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = json.loads(manifest_json())
+    branch = payload["branches"][str(KARLSRUHE_COMPANY_ID)]
+    branch["selected_altegio_staff_ids"] = [KA_SECOND_STAFF_ID]
+    branch["deferred_altegio_staff_ids"] = [KA_STAFF_ID]
+    branch["staff"][str(KA_SECOND_STAFF_ID)] = KA_SECOND_STAFF_UUID
+
+    stub_source(monkeypatch, [wave_b_record()])
+    inputs = make_inputs(state_dir, manifest_text=json.dumps(payload))
+    catalog = [baseline_catalog_row(staff=[KA_STAFF_UUID])]
+    review = await run_prepare(inputs, write_client=FakePrepareClient(catalog=catalog))
+    [shown] = review.operator["service_mapping"]
+
+    with pytest.raises(PrepareError):
+        apply_confirmations(
+            inputs,
+            ConfirmRequest(
+                confirm_services=(ConfirmTarget(identifier=str(KA_SERVICE_ID), review_digest=shown["review_digest"]),)
+            ),
+            snapshot=await snapshot_for(inputs, FakePrepareClient(catalog=catalog)),
+        )
+
+
+# ---------------------------------------------------------------------------
+# The booking's actual duration (plan §30.9)
+# ---------------------------------------------------------------------------
+
+
+def stretched(minutes: int) -> dict[str, Any]:
+    """A booking hand-stretched past its service's catalogue length."""
+    record = source_record()
+    record["seance_length"] = minutes * 60
+    return record
+
+
+def test_the_actual_booking_duration_comes_from_the_top_level_field() -> None:
+    """The service line says 60; the appointment is 90. The appointment wins."""
+    record = stretched(90)
+    record["services"][0]["seance_length"] = 3600
+
+    row = prepare_module.operator_record_row(record, block_reason=None)
+
+    assert row["duration_minutes"] == 90
+    assert row["service_line_duration_minutes"] == 60, "kept separately, not replaced"
+
+
+def test_a_changed_booking_duration_changes_the_digest() -> None:
+    """A stretched slot must not inherit an agreement made about a standard one."""
+    before = digest_of([catalog_row()], [stretched(60)])
+
+    assert digest_of([catalog_row()], [stretched(90)]) != before
+
+
+def test_the_booking_duration_and_the_service_line_duration_are_both_digested() -> None:
+    record = stretched(90)
+    record["services"][0]["seance_length"] = 3600
+    [proposal] = propose([catalog_row()], records=[record])
+    payload = proposal.review_payload()
+
+    assert payload["observed_booking_durations_minutes"] == [90]
+    assert payload["observed_source_durations_minutes"] == [60]
+
+
+def test_a_fractional_duration_is_reported_as_unknown_not_rounded() -> None:
+    record = source_record()
+    record["seance_length"] = 3630  # 60.5 minutes
+
+    assert prepare_module.operator_record_row(record, block_reason=None)["duration_minutes"] is None
+
+
+@pytest.mark.parametrize(
+    ("reason", "expected"),
+    [
+        (None, prepare_module.CLASS_AUTOMATIC),
+        ("multi_service_unsupported", prepare_module.CLASS_CART_CANDIDATE),
+        ("custom_duration_unsupported", prepare_module.CLASS_MANUAL_ADJUSTMENT),
+        ("custom_price_unsupported", prepare_module.CLASS_MANUAL_ADJUSTMENT),
+        ("duration_unknown", prepare_module.CLASS_BLOCKED_UNPROVEN),
+        ("price_malformed", prepare_module.CLASS_BLOCKED_UNPROVEN),
+        ("source_status_unrecognised", prepare_module.CLASS_BLOCKED_UNPROVEN),
+        ("staff_not_in_wave_scope", prepare_module.CLASS_FULLY_MANUAL),
+        ("service_mapping_missing", prepare_module.CLASS_AUTOMATIC),
+    ],
+)
+def test_api_limits_and_unprovable_data_are_classified_apart(reason: str | None, expected: str) -> None:
+    """ "The API cannot express this" is not "the data cannot be proven"."""
+    assert prepare_module.handling_class(reason) == expected
+
+
+@pytest.mark.asyncio
+async def test_a_stretched_booking_is_manual_adjustment_not_an_automatic_path(
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Nothing claims EasyWeek can take a custom duration; it needs a person."""
+    stub_source(monkeypatch, [stretched(90)])
+
+    result = await run_prepare(make_inputs(state_dir), write_client=FakePrepareClient())
+
+    assert result.machine["source"]["records_needing_manual_work"] == {"custom_duration_unsupported": 1}
+    [row] = result.operator["records"]
+    assert row["handling"] == prepare_module.CLASS_MANUAL_ADJUSTMENT
+    assert row["duration_minutes"] == 90
+
+
+def test_no_code_path_claims_easyweek_supports_a_custom_duration() -> None:
+    """The vocabulary names operator work, never a capability we have not proven."""
+    source = (REPO_ROOT / "src" / "altegio_bot" / "easyweek_migration" / "prepare.py").read_text()
+
+    assert "cart_candidate" in source
+    assert "no canary has proven any of those" in source
+    for claim in ("supports custom duration", "custom duration is supported", "cart API is available"):
+        assert claim not in source
