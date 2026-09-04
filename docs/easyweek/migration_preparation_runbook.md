@@ -282,12 +282,34 @@ canary.
 Наблюдавшиеся при первом запуске числа (56, 84, 223) — это evidence того
 конкретного дня, а не контракт. Каждый запуск считает всё заново.
 
+**Что такое ownership marker и зачем он.** Altegio inbox и capture во время
+handover намеренно не останавливаются: их остановка была бы куда большим
+простоем, чем нужно этой процедуре. Значит доставка Altegio, уже летевшая в этот
+момент или пришедшая минутой позже, всё равно доходит до обычного планировщика.
+А он создаёт напоминания через `add_job()`, который при совпадении ключа
+переводит отменённое задание обратно в очередь. Без отдельной отметки поздний
+`create` переоткрывал ровно то напоминание, которое handover только что отменил,
+а поздний `reschedule` добавлял новое под другим ключом — и у одной записи
+оказывались открытые напоминания сразу с обеих сторон.
+
+Поэтому apply записывает в ledger durable отметку: момент передачи владения и
+digest плана, под которым это произошло. Отметка ставится в той же транзакции и
+последней — волна, откатившаяся по любой причине, отметки не оставляет, а
+существующая отметка всегда означает, что отмена закоммичена.
+
+Дальше отметку читают два места. Обычный планировщик Altegio — перед созданием
+напоминания, внутри своей транзакции, так что доставка, ждавшая блокировки во
+время apply, увидит отметку сразу после commit. И сам outbox — непосредственно
+перед Meta, как вторая линия защиты для заданий, которые уже успели попасть в
+очередь. Ни одно из этих мест не подавляет ничего, кроме `reminder_24h` и
+`reminder_2h` этой конкретной source-записи.
+
 ### 6b.1 Dry-run со снимком
 
 ```bash
 cd /opt/altegio_bot
 dc() { docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml "$@"; }
-dc --profile ops run --rm --build --no-deps -T easyweek-migration-prepare-handover plan --manifest /migration/input/manifest.json --company-id 758285 --snapshot /migration/state/reminder_handover.v2.json
+dc --profile ops run --rm --build --no-deps -T easyweek-migration-prepare-handover plan --manifest /migration/input/manifest.json --company-id 758285 --snapshot /migration/state/reminder_handover.v3.json
 ```
 
 Команда читает ledger, доказывает каждую перенесённую запись живым
@@ -316,7 +338,7 @@ apply воркер останавливается лишь на время од�
 canceled/failed-заданием — решает человек, автоматически не переоткрывается) и
 `rows_with_processing_source_jobs`. Snapshot v2 содержит и защищает digest-ом
 весь eligible `status=created` scope, отказы доказательства, readiness, identity
-строк, каждое obligation и полный список старых job ID. Старый snapshot v1,
+строк, каждое obligation и полный список старых job ID. Старый snapshot v1 или v2,
 повреждённый JSON, неизвестное поле или изменение `created_at` write не
 разрешают. Нулевая или частично доказанная волна никогда не бывает
 `cutover_ready`.
@@ -361,7 +383,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 dc stop altegio-outbox-worker
-dc --profile ops run --rm --no-deps -T -e EASYWEEK_REMINDER_HANDOVER_ALLOW_APPLY=true easyweek-migration-prepare-handover apply --manifest /migration/input/manifest.json --company-id 758285 --snapshot /migration/state/reminder_handover.v2.json --apply-report /migration/state/reminder_handover.apply-report.v1.json --apply --plan-digest PLAN_DIGEST_ИЗ_ШАГА_6B1 --confirm 'apply reminder handover PLAN_DIGEST_ИЗ_ШАГА_6B1'
+dc --profile ops run --rm --no-deps -T -e EASYWEEK_REMINDER_HANDOVER_ALLOW_APPLY=true easyweek-migration-prepare-handover apply --manifest /migration/input/manifest.json --company-id 758285 --snapshot /migration/state/reminder_handover.v3.json --apply-report /migration/state/reminder_handover.apply-report.v2.json --apply --plan-digest PLAN_DIGEST_ИЗ_ШАГА_6B1 --confirm 'apply reminder handover PLAN_DIGEST_ИЗ_ШАГА_6B1'
 )
 ```
 
@@ -397,7 +419,7 @@ Verify не принимает отчёт от другого snapshot или о
 ```bash
 cd /opt/altegio_bot
 dc() { docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml "$@"; }
-dc --profile ops run --rm --no-deps -T easyweek-migration-prepare-handover verify --manifest /migration/input/manifest.json --company-id 758285 --snapshot /migration/state/reminder_handover.v2.json --apply-report /migration/state/reminder_handover.apply-report.v1.json
+dc --profile ops run --rm --no-deps -T easyweek-migration-prepare-handover verify --manifest /migration/input/manifest.json --company-id 758285 --snapshot /migration/state/reminder_handover.v3.json --apply-report /migration/state/reminder_handover.apply-report.v2.json
 ```
 
 Повторный apply того же snapshot — отдельная проверка идемпотентности. Используем
@@ -425,7 +447,7 @@ trap restore_outbox EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 dc stop altegio-outbox-worker
-dc --profile ops run --rm --no-deps -T -e EASYWEEK_REMINDER_HANDOVER_ALLOW_APPLY=true easyweek-migration-prepare-handover apply --manifest /migration/input/manifest.json --company-id 758285 --snapshot /migration/state/reminder_handover.v2.json --apply-report /migration/state/reminder_handover.repeat-apply-report.v1.json --apply --plan-digest PLAN_DIGEST_ИЗ_ШАГА_6B1 --confirm 'apply reminder handover PLAN_DIGEST_ИЗ_ШАГА_6B1'
+dc --profile ops run --rm --no-deps -T -e EASYWEEK_REMINDER_HANDOVER_ALLOW_APPLY=true easyweek-migration-prepare-handover apply --manifest /migration/input/manifest.json --company-id 758285 --snapshot /migration/state/reminder_handover.v3.json --apply-report /migration/state/reminder_handover.repeat-apply-report.v2.json --apply --plan-digest PLAN_DIGEST_ИЗ_ШАГА_6B1 --confirm 'apply reminder handover PLAN_DIGEST_ИЗ_ШАГА_6B1'
 )
 ```
 
@@ -435,7 +457,7 @@ dc --profile ops run --rm --no-deps -T -e EASYWEEK_REMINDER_HANDOVER_ALLOW_APPLY
 ```bash
 cd /opt/altegio_bot
 dc() { docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml "$@"; }
-dc --profile ops run --rm --no-deps -T easyweek-migration-prepare-handover plan --manifest /migration/input/manifest.json --company-id 758285 --snapshot /migration/state/reminder_handover.after.v2.json
+dc --profile ops run --rm --no-deps -T easyweek-migration-prepare-handover plan --manifest /migration/input/manifest.json --company-id 758285 --snapshot /migration/state/reminder_handover.after.v3.json
 ```
 
 Отдельно запускается существующий API preflight. Он повторно читает актуальные
@@ -456,6 +478,19 @@ dc() { docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.cha
 dc exec -T postgres psql -X -v ON_ERROR_STOP=1 -U altegio -d altegio_bot -c "BEGIN TRANSACTION READ ONLY; SELECT provider, job_type, status, count(*) FROM message_jobs WHERE job_type IN ('reminder_24h','reminder_2h') GROUP BY 1,2,3 ORDER BY 1,2,3; COMMIT;"
 ```
 
+Отметки владения и отсутствие открытых Altegio-напоминаний у переданных записей
+— одним read-only запросом:
+
+```bash
+cd /opt/altegio_bot
+dc() { docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml "$@"; }
+dc exec -T postgres psql -X -v ON_ERROR_STOP=1 -U altegio -d altegio_bot -c "BEGIN TRANSACTION READ ONLY; SELECT l.source_company_id, count(*) AS handed_over, count(DISTINCT l.reminder_handover_plan_digest) AS plans, count(j.id) AS still_open_altegio_reminders FROM easyweek_migration_ledger l LEFT JOIN records r ON r.provider = l.source_provider AND r.company_id = l.source_company_id AND r.altegio_record_id = l.source_record_id LEFT JOIN message_jobs j ON j.provider = 'altegio' AND j.record_id = r.id AND j.job_type IN ('reminder_24h','reminder_2h') AND j.status IN ('queued','processing') WHERE l.reminders_handed_over_at IS NOT NULL GROUP BY 1 ORDER BY 1; COMMIT;"
+```
+
+`still_open_altegio_reminders` обязан быть `0`. `plans` больше единицы означает,
+что записи филиала передавались разными планами — само по себе не ошибка, но
+повод свериться с историей apply-отчётов.
+
 ### 6b.5 Если что-то пошло не так
 
 | Симптом | Что это значит | Что делать |
@@ -466,6 +501,11 @@ dc exec -T postgres psql -X -v ON_ERROR_STOP=1 -U altegio -d altegio_bot -c "BEG
 | `halted: eligible_scope_changed` | полный company/status ledger scope изменился после plan | ничего не изменено; новый `plan` |
 | `halted: obligation_identity_mismatch` | dedupe key занят строкой с неверным status или identity | вся транзакция откатилась; проверить job вручную |
 | `halted: source_reminder_changed` | старый source job исчез или изменил identity/status | вся транзакция откатилась; новый `plan` |
+| `halted: source_reminder_scope_changed` | между `plan` и `apply` появилось новое открытое Altegio-напоминание | ничего не изменено; новый `plan` — он увидит и его |
+| `halted: reminder_marker_conflict` | у ledger-строки уже есть отметка от другого плана | ничего не изменено; чужое решение не переписывается, сверить историю apply-отчётов |
+| `marker_incomplete` в `rows_refused` | у ledger-строки заполнена половина отметки | строка вне волны; такое состояние БД запрещает CHECK, значит её писали в обход инструмента |
+| `verify: ledger_rows_missing_marker` | у переданной записи нет отметки | handover не доказан; не запускать повторно вслепую, разобраться |
+| `verify: ledger_rows_with_foreign_marker` | отметка принадлежит другому плану или другой паре | то же; сверить identity ledger-строки |
 | `halted: scoped_outbox_side_effect` | scoped Outbox before/after внутри apply не совпал | вся транзакция откатилась; расследовать до повтора |
 | `halted: local_target_mismatch` | запись сдвинулась или отменена после `plan` | новый `plan` |
 | `halted: ledger_not_created` | ledger-строка изменила статус | новый `plan`; разобраться, что её двигало |
@@ -482,6 +522,12 @@ dc exec -T postgres psql -X -v ON_ERROR_STOP=1 -U altegio -d altegio_bot -c "BEG
 После переключения дальнейшее перепланирование — reschedule, update, cancel —
 целиком за обычными EasyWeek-вебхуками. Никакого фонового синхронизатора этот
 шаг не оставляет.
+
+Altegio inbox и capture остаются включёнными и после handover. Поздние
+Altegio-события по переданным записям больше не создают и не переоткрывают
+напоминаний — их отсекает отметка владения, — но всё остальное на этом пути
+планируется как раньше: `record_*`, review, retention и campaign-задания
+затронуты не будут, как и записи, которые не переносились.
 
 ---
 

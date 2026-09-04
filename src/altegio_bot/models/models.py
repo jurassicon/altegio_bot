@@ -1595,6 +1595,27 @@ class EasyWeekMigrationLedger(Base):
             "attempts >= 0",
             name="ck_easyweek_migration_ledger_attempts_non_negative",
         ),
+        # A reminder handover marker is one fact in two columns: the instant it
+        # happened and the plan that authorised it. Half a marker would be a row
+        # that claims ownership moved without saying under what authority, or a
+        # digest with no handover behind it — and the runtime fence reads the
+        # instant while the apply compares the digest, so either half alone
+        # would let one of them answer while the other could not.
+        CheckConstraint(
+            "(reminders_handed_over_at IS NULL) = (reminder_handover_plan_digest IS NULL)",
+            name="ck_easyweek_migration_ledger_reminder_handover_complete",
+        ),
+        # The fence runs inside the Altegio planning transaction for every
+        # create/update delivery, so it has to be an index-only lookup. Partial
+        # on purpose: only handed-over rows are ever asked about, and the index
+        # stays a fraction of the table.
+        Index(
+            "ix_easyweek_migration_ledger_reminder_handover",
+            "source_provider",
+            "source_company_id",
+            "source_record_id",
+            postgresql_where=text("reminders_handed_over_at IS NOT NULL"),
+        ),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
@@ -1647,6 +1668,31 @@ class EasyWeekMigrationLedger(Base):
     # Stable technical code (`mapping_missing`, `customer_ambiguous`, …). Never a
     # provider message, never a payload excerpt, never a phone number.
     reason_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    # -- reminder ownership (PR-11.2, plan §30.11) -------------------------
+    # When the future reminders for this booking stopped being Altegio's and
+    # became EasyWeek's, and under which reviewed plan.
+    #
+    # Why this cannot be inferred from anything already on the row. `status`
+    # becomes `created` when the BOOKING was migrated, which happens long before
+    # — and independently of — the reminder handover; a cancelled `MessageJob`
+    # is not durable evidence either, because the Altegio planner's `add_job`
+    # resurrects a cancelled job on the next delivery of the same fact. So a
+    # late Altegio webhook had nothing to consult and would re-open a reminder
+    # the handover had just withdrawn, leaving one appointment with open
+    # reminders on both sides.
+    #
+    # Written atomically with the cancellation it describes, so a wave that
+    # rolls back leaves no marker, and a marker always means the withdrawal
+    # committed. Both columns move together — see the CHECK above.
+    reminders_handed_over_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    # The handover plan digest an operator reviewed and authorised. Kept so a
+    # repeat of the SAME snapshot is recognised as idempotent, and a different
+    # one is refused rather than silently re-marking the row.
+    reminder_handover_plan_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

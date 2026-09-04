@@ -22,7 +22,8 @@ from typing import Any
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import select
+from sqlalchemy import select, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from altegio_bot.easyweek_migration import ledger as ledger_module
@@ -38,12 +39,13 @@ from altegio_bot.easyweek_migration.reminder_handover_db import (
     build_plan,
     verify_handover,
 )
-from altegio_bot.easyweek_policy import REMINDER_2H, REMINDER_24H
+from altegio_bot.easyweek_policy import EASYWEEK_REMINDER_JOB_TYPES, REMINDER_2H, REMINDER_24H
 from altegio_bot.easyweek_reminders import (
     REMINDER_OFFSETS,
     easyweek_reminder_dedupe_key,
     reminder_job_payload,
 )
+from altegio_bot.message_planner import make_dedupe_key
 from altegio_bot.models.models import (
     PROVIDER_ALTEGIO,
     PROVIDER_EASYWEEK,
@@ -52,6 +54,7 @@ from altegio_bot.models.models import (
     OutboxMessage,
     Record,
 )
+from altegio_bot.reminder_ownership import REASON_HANDED_OVER, REASON_UNKNOWN, ReminderOwner
 from altegio_bot.settings import settings
 from altegio_bot.tests.easyweek_migration_harness import (
     KA_LOCATION_ID,
@@ -1357,3 +1360,648 @@ async def test_neither_the_report_nor_the_logs_carry_personal_data(session_maker
     for blob in (json_module.dumps(plan.as_safe_dict()), json_module.dumps(result.as_safe_dict()), caplog.text):
         for leaked in ("phone", "email", "first_name", "Bearer", "Workspace", "+49"):
             assert leaked not in blob, leaked
+
+
+# ---------------------------------------------------------------------------
+# The durable ownership marker (plan §30.11)
+# ---------------------------------------------------------------------------
+
+
+async def ledger_marker(session_maker: async_sessionmaker[AsyncSession]) -> tuple[Any, Any]:
+    async with session_maker() as session:
+        row = (await session.execute(select(EasyWeekMigrationLedger))).scalars().one()
+        return row.reminders_handed_over_at, row.reminder_handover_plan_digest
+
+
+@pytest.mark.asyncio
+async def test_a_clean_apply_stamps_the_marker_in_the_same_transaction(session_maker, seeded) -> None:
+    stale = await add_job(
+        session_maker,
+        provider=PROVIDER_ALTEGIO,
+        record_pk=seeded["source_pk"],
+        job_type=REMINDER_24H,
+        status="queued",
+        dedupe_key="altegio:reminder_24h:stale",
+    )
+    plan = await plan_for(session_maker, starts=seeded["starts"])
+    result = await run_apply(session_maker, plan)
+
+    assert result.halted is None
+    assert len(result.created_job_ids) == 2
+    assert result.canceled_job_ids == (stale,)
+    assert len(result.marked_ledger_ids) == 1
+
+    handed_at, digest = await ledger_marker(session_maker)
+    assert handed_at is not None
+    assert digest == plan.digest()
+
+
+@pytest.mark.asyncio
+async def test_an_exception_after_the_marker_rolls_the_whole_wave_back(session_maker, seeded) -> None:
+    """The marker, the created jobs and the cancellation are one fact."""
+    stale = await add_job(
+        session_maker,
+        provider=PROVIDER_ALTEGIO,
+        record_pk=seeded["source_pk"],
+        job_type=REMINDER_24H,
+        status="queued",
+        dedupe_key="altegio:reminder_24h:stale",
+    )
+    plan = await plan_for(session_maker, starts=seeded["starts"])
+
+    async with session_maker() as session:
+        with pytest.raises(RuntimeError):
+            async with session.begin():
+                await apply_plan(session, freeze_plan(plan))
+                raise RuntimeError("boom after the marker")
+
+    assert await ledger_marker(session_maker) == (None, None)
+    rows = {job.id: job for job in await jobs(session_maker)}
+    assert rows[stale].status == "queued"
+    assert [job for job in rows.values() if job.provider == PROVIDER_EASYWEEK] == []
+
+
+@pytest.mark.asyncio
+async def test_a_blocked_row_leaves_the_whole_batch_unmarked(session_maker, seeded) -> None:
+    plan = await plan_for(session_maker, starts=seeded["starts"])
+    # The target moves after the plan: the wave stops before anything is done.
+    async with session_maker() as session:
+        async with session.begin():
+            target = (await session.execute(select(Record).where(Record.id == seeded["target_pk"]))).scalars().one()
+            target.starts_at = seeded["starts"] + timedelta(hours=1)
+
+    result = await run_apply(session_maker, plan)
+
+    assert result.halted is not None
+    assert result.marked_ledger_ids == ()
+    assert await ledger_marker(session_maker) == (None, None)
+
+
+@pytest.mark.asyncio
+async def test_a_processing_source_reminder_leaves_the_marker_unset(session_maker, seeded) -> None:
+    await add_job(
+        session_maker,
+        provider=PROVIDER_ALTEGIO,
+        record_pk=seeded["source_pk"],
+        job_type=REMINDER_2H,
+        status="processing",
+        dedupe_key="altegio:reminder_2h:claimed",
+    )
+    plan = await plan_for(session_maker, starts=seeded["starts"])
+
+    assert (await run_apply(session_maker, plan)).halted == "source_reminder_processing"
+    assert await ledger_marker(session_maker) == (None, None)
+
+
+@pytest.mark.asyncio
+async def test_a_reminder_queued_after_the_plan_stops_the_apply(session_maker, seeded) -> None:
+    """Altegio inbox keeps running during a handover, so this is a live race.
+
+    Checking only the frozen ids would have missed it, and the new reminder
+    would have survived the wave — open, on the Altegio side, for a booking
+    whose reminders had just become EasyWeek's.
+    """
+    plan = await plan_for(session_maker, starts=seeded["starts"])
+    latecomer = await add_job(
+        session_maker,
+        provider=PROVIDER_ALTEGIO,
+        record_pk=seeded["source_pk"],
+        job_type=REMINDER_24H,
+        status="queued",
+        dedupe_key="altegio:reminder_24h:planned-after-the-snapshot",
+    )
+
+    result = await run_apply(session_maker, plan)
+
+    assert result.halted == "source_reminder_scope_changed"
+    assert result.marked_ledger_ids == ()
+    assert await ledger_marker(session_maker) == (None, None)
+    rows = {job.id: job for job in await jobs(session_maker)}
+    assert rows[latecomer].status == "queued", "nothing was touched"
+    assert [job for job in rows.values() if job.provider == PROVIDER_EASYWEEK] == []
+
+
+@pytest.mark.asyncio
+async def test_an_occupied_target_key_leaves_the_marker_unset(session_maker, seeded) -> None:
+    async with session_maker() as session:
+        async with session.begin():
+            thief = Record(
+                provider=PROVIDER_EASYWEEK,
+                company_id=LOCATION_ID,
+                altegio_record_id=1999999,
+                easyweek_booking_uuid=uuid_module.UUID("cccccccc-0000-4000-8000-000000000009"),
+                starts_at=seeded["starts"],
+            )
+            session.add(thief)
+            await session.flush()
+            thief_pk = thief.id
+
+    await add_job(
+        session_maker,
+        provider=PROVIDER_EASYWEEK,
+        record_pk=thief_pk,
+        job_type=REMINDER_24H,
+        status="queued",
+        dedupe_key=easyweek_reminder_dedupe_key(
+            booking_uuid=BOOKING, job_type=REMINDER_24H, starts_at=seeded["starts"]
+        ),
+    )
+    plan = await plan_for(session_maker, starts=seeded["starts"])
+    result = await run_apply(session_maker, plan)
+
+    assert result.halted is not None
+    assert await ledger_marker(session_maker) == (None, None)
+
+
+@pytest.mark.asyncio
+async def test_a_repeat_of_the_exact_snapshot_is_a_no_op(session_maker, seeded) -> None:
+    await add_job(
+        session_maker,
+        provider=PROVIDER_ALTEGIO,
+        record_pk=seeded["source_pk"],
+        job_type=REMINDER_24H,
+        status="queued",
+        dedupe_key="altegio:reminder_24h:stale",
+    )
+    plan = await plan_for(session_maker, starts=seeded["starts"])
+    await run_apply(session_maker, plan)
+    first_at, first_digest = await ledger_marker(session_maker)
+    before = {job.id: (job.status, job.dedupe_key) for job in await jobs(session_maker)}
+
+    second = await run_apply(session_maker, plan)
+
+    assert second.halted is None
+    assert second.created_job_ids == ()
+    assert second.canceled_job_ids == ()
+    assert second.marked_ledger_ids == (), "nothing new was marked"
+    assert second.already_marked_ledger_ids != (), "and the existing marker was recognised"
+    assert await ledger_marker(session_maker) == (first_at, first_digest), "the instant is never rewritten"
+    assert {job.id: (job.status, job.dedupe_key) for job in await jobs(session_maker)} == before
+
+
+@pytest.mark.asyncio
+async def test_a_marker_from_another_plan_blocks_the_apply(session_maker, seeded) -> None:
+    """Somebody else's reviewed decision is not ours to overwrite."""
+    plan = await plan_for(session_maker, starts=seeded["starts"])
+    async with session_maker() as session:
+        async with session.begin():
+            row = (await session.execute(select(EasyWeekMigrationLedger))).scalars().one()
+            row.reminders_handed_over_at = datetime.now(timezone.utc)
+            row.reminder_handover_plan_digest = "b" * 64
+
+    result = await run_apply(session_maker, plan)
+
+    assert result.halted == "reminder_marker_conflict"
+    assert [job for job in await jobs(session_maker) if job.provider == PROVIDER_EASYWEEK] == []
+    _at, digest = await ledger_marker(session_maker)
+    assert digest == "b" * 64, "the other plan's marker is intact"
+
+
+@pytest.mark.asyncio
+async def test_the_database_refuses_half_an_ownership_marker(session_maker, seeded) -> None:
+    """The two columns are one fact, enforced by PostgreSQL rather than by us.
+
+    The runtime fence reads the instant while an apply compares the digest, so
+    half a marker would let one of them answer while the other could not. The
+    CHECK makes that state unreachable, which is why the `marker_incomplete`
+    branch in `build_plan` is defence against a hand-written row and not a case
+    the supported paths can produce.
+    """
+    for statement in (
+        "UPDATE easyweek_migration_ledger SET reminders_handed_over_at = now()",
+        "UPDATE easyweek_migration_ledger SET reminder_handover_plan_digest = repeat('a', 64)",
+    ):
+        async with session_maker() as session:
+            with pytest.raises(IntegrityError):
+                async with session.begin():
+                    await session.execute(text(statement))
+
+    assert await ledger_marker(session_maker) == (None, None)
+
+
+@pytest.mark.asyncio
+async def test_a_fresh_plan_after_the_handover_shows_ownership_has_moved(session_maker, seeded) -> None:
+    plan = await plan_for(session_maker, starts=seeded["starts"])
+    await run_apply(session_maker, plan)
+
+    again = await plan_for(session_maker, starts=seeded["starts"])
+    [row] = [item for item in again.scoped]
+
+    assert row.marker_action == "already_handed_over"
+    assert row.marker_existing_digest == plan.digest()
+    assert again.to_create == 0
+    assert again.coverage_ready is True
+
+
+@pytest.mark.asyncio
+async def test_verify_fails_when_the_marker_is_missing(session_maker, seeded) -> None:
+    plan = await plan_for(session_maker, starts=seeded["starts"])
+    frozen = freeze_plan(plan)
+    result = await run_apply(session_maker, plan)
+    report = result.apply_report(frozen, applied_at=datetime.now(timezone.utc))
+
+    async with session_maker() as session:
+        async with session.begin():
+            row = (await session.execute(select(EasyWeekMigrationLedger))).scalars().one()
+            row.reminders_handed_over_at = None
+            row.reminder_handover_plan_digest = None
+
+    async with session_maker() as session:
+        verdict = await verify_handover(session, frozen, report)
+
+    assert verdict["passed"] is False
+    assert verdict["ledger_rows_missing_marker"]
+
+
+@pytest.mark.asyncio
+async def test_verify_fails_when_the_marker_belongs_to_another_plan(session_maker, seeded) -> None:
+    plan = await plan_for(session_maker, starts=seeded["starts"])
+    frozen = freeze_plan(plan)
+    result = await run_apply(session_maker, plan)
+    report = result.apply_report(frozen, applied_at=datetime.now(timezone.utc))
+
+    async with session_maker() as session:
+        async with session.begin():
+            row = (await session.execute(select(EasyWeekMigrationLedger))).scalars().one()
+            row.reminder_handover_plan_digest = "c" * 64
+
+    async with session_maker() as session:
+        verdict = await verify_handover(session, frozen, report)
+
+    assert verdict["passed"] is False
+    assert verdict["ledger_rows_with_foreign_marker"]
+
+
+@pytest.mark.asyncio
+async def test_verify_fails_when_the_apply_report_marker_ids_were_edited(session_maker, seeded) -> None:
+    from dataclasses import replace as dc_replace
+
+    plan = await plan_for(session_maker, starts=seeded["starts"])
+    frozen = freeze_plan(plan)
+    result = await run_apply(session_maker, plan)
+    report = result.apply_report(frozen, applied_at=datetime.now(timezone.utc))
+    edited = dc_replace(report, marked_ledger_ids=(*report.marked_ledger_ids, 99999))
+
+    async with session_maker() as session:
+        verdict = await verify_handover(session, frozen, edited)
+
+    assert verdict["passed"] is False
+    assert verdict["marker_matches_apply_report"] is False
+
+
+@pytest.mark.asyncio
+async def test_verify_passes_after_a_clean_marked_apply(session_maker, seeded) -> None:
+    await add_job(
+        session_maker,
+        provider=PROVIDER_ALTEGIO,
+        record_pk=seeded["source_pk"],
+        job_type=REMINDER_24H,
+        status="queued",
+        dedupe_key="altegio:reminder_24h:stale",
+    )
+    plan = await plan_for(session_maker, starts=seeded["starts"])
+    frozen = freeze_plan(plan)
+    result = await run_apply(session_maker, plan)
+    report = result.apply_report(frozen, applied_at=datetime.now(timezone.utc))
+
+    async with session_maker() as session:
+        verdict = await verify_handover(session, frozen, report)
+
+    assert verdict["passed"] is True
+    assert verdict["ledger_rows_marked"] == 1
+    assert verdict["marker_matches_apply_report"] is True
+
+
+# ---------------------------------------------------------------------------
+# Late Altegio deliveries after the handover (plan §30.11)
+# ---------------------------------------------------------------------------
+
+
+async def plan_altegio_event(
+    session_maker: async_sessionmaker[AsyncSession],
+    *,
+    record_pk: int,
+    status: str = "create",
+    starts_at: datetime | None = None,
+) -> None:
+    """One ordinary Altegio delivery, through the real planner."""
+    from altegio_bot.message_planner import plan_jobs_for_record_event
+
+    async with session_maker() as session:
+        async with session.begin():
+            record = (await session.execute(select(Record).where(Record.id == record_pk))).scalars().one()
+            if starts_at is not None:
+                record.starts_at = starts_at
+            await plan_jobs_for_record_event(
+                session,
+                company_id=record.company_id,
+                record=record,
+                event_status=status,
+            )
+
+
+async def altegio_reminders(session_maker: async_sessionmaker[AsyncSession], record_pk: int) -> list[MessageJob]:
+    return [
+        job
+        for job in await jobs(session_maker)
+        if job.provider == PROVIDER_ALTEGIO
+        and job.record_id == record_pk
+        and job.job_type in EASYWEEK_REMINDER_JOB_TYPES
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_late_create_does_not_reopen_a_handed_over_reminder(session_maker, seeded) -> None:
+    """The exact defect: `add_job` re-queues a cancelled job on conflict."""
+    stale = await add_job(
+        session_maker,
+        provider=PROVIDER_ALTEGIO,
+        record_pk=seeded["source_pk"],
+        job_type=REMINDER_24H,
+        status="queued",
+        dedupe_key=make_dedupe_key(
+            job_type=REMINDER_24H,
+            company_id=COMPANY,
+            record_id=seeded["source_pk"],
+            run_at=seeded["starts"] - timedelta(hours=24),
+        ),
+        run_at=seeded["starts"] - timedelta(hours=24),
+    )
+    plan = await plan_for(session_maker, starts=seeded["starts"])
+    await run_apply(session_maker, plan)
+    assert {job.id: job.status for job in await altegio_reminders(session_maker, seeded["source_pk"])} == {
+        stale: "canceled"
+    }
+
+    # The delayed webhook lands. Same booking, same start, same dedupe key.
+    await plan_altegio_event(session_maker, record_pk=seeded["source_pk"])
+
+    rows = {job.id: job.status for job in await altegio_reminders(session_maker, seeded["source_pk"])}
+    assert rows == {stale: "canceled"}, "the withdrawn reminder stayed withdrawn"
+
+
+@pytest.mark.asyncio
+async def test_a_late_update_with_an_unchanged_start_creates_no_reminder(session_maker, seeded) -> None:
+    plan = await plan_for(session_maker, starts=seeded["starts"])
+    await run_apply(session_maker, plan)
+
+    await plan_altegio_event(session_maker, record_pk=seeded["source_pk"], status="update")
+
+    assert await altegio_reminders(session_maker, seeded["source_pk"]) == []
+
+
+@pytest.mark.asyncio
+async def test_a_late_reschedule_creates_no_reminder_under_a_new_key(session_maker, seeded) -> None:
+    """A moved appointment yields a NEW dedupe key, which no cancellation covers."""
+    plan = await plan_for(session_maker, starts=seeded["starts"])
+    await run_apply(session_maker, plan)
+
+    await plan_altegio_event(
+        session_maker,
+        record_pk=seeded["source_pk"],
+        status="update",
+        starts_at=seeded["starts"] + timedelta(days=2),
+    )
+
+    assert await altegio_reminders(session_maker, seeded["source_pk"]) == []
+
+
+@pytest.mark.asyncio
+async def test_a_delivery_blocked_behind_the_apply_sees_the_marker_afterwards(session_maker, seeded) -> None:
+    """The post-commit half of the race, in the order production produces it."""
+    plan = await plan_for(session_maker, starts=seeded["starts"])
+    await run_apply(session_maker, plan)
+
+    # Only now is the waiting delivery unblocked, and it reads the committed row.
+    await plan_altegio_event(session_maker, record_pk=seeded["source_pk"], status="create")
+
+    assert await altegio_reminders(session_maker, seeded["source_pk"]) == []
+
+
+@pytest.mark.asyncio
+async def test_a_migrated_record_still_gets_its_other_jobs(session_maker, seeded) -> None:
+    """The fence covers reminders. Nothing else on the path is suppressed."""
+    plan = await plan_for(session_maker, starts=seeded["starts"])
+    await run_apply(session_maker, plan)
+
+    await plan_altegio_event(session_maker, record_pk=seeded["source_pk"], status="create")
+
+    other = [
+        job.job_type
+        for job in await jobs(session_maker)
+        if job.provider == PROVIDER_ALTEGIO
+        and job.record_id == seeded["source_pk"]
+        and job.job_type not in EASYWEEK_REMINDER_JOB_TYPES
+    ]
+    assert other, "the record_* job is still planned"
+
+
+@pytest.mark.asyncio
+async def test_an_unmigrated_record_keeps_planning_reminders(session_maker, seeded) -> None:
+    """No ledger row means nothing moved, and the ordinary path is untouched."""
+    async with session_maker() as session:
+        async with session.begin():
+            other = Record(
+                provider=PROVIDER_ALTEGIO,
+                company_id=COMPANY,
+                altegio_record_id=900555,
+                starts_at=seeded["starts"],
+                is_deleted=False,
+            )
+            session.add(other)
+            await session.flush()
+            other_pk = other.id
+
+    plan = await plan_for(session_maker, starts=seeded["starts"])
+    await run_apply(session_maker, plan)
+    await plan_altegio_event(session_maker, record_pk=other_pk, status="create")
+
+    planned = {job.job_type for job in await altegio_reminders(session_maker, other_pk)}
+    assert planned == {REMINDER_24H, REMINDER_2H}
+
+
+@pytest.mark.asyncio
+async def test_a_record_in_another_company_is_not_suppressed(session_maker, seeded) -> None:
+    async with session_maker() as session:
+        async with session.begin():
+            other = Record(
+                provider=PROVIDER_ALTEGIO,
+                company_id=1271200,
+                # The SAME source record id, in a different branch. Suppressing
+                # this one would mean the fence keys on the id alone.
+                altegio_record_id=SOURCE_RECORD_ID,
+                starts_at=seeded["starts"],
+                is_deleted=False,
+            )
+            session.add(other)
+            await session.flush()
+            other_pk = other.id
+
+    plan = await plan_for(session_maker, starts=seeded["starts"])
+    await run_apply(session_maker, plan)
+    await plan_altegio_event(session_maker, record_pk=other_pk, status="create")
+
+    assert {job.job_type for job in await altegio_reminders(session_maker, other_pk)} == {
+        REMINDER_24H,
+        REMINDER_2H,
+    }
+
+
+@pytest.mark.asyncio
+async def test_an_easyweek_reschedule_still_replaces_its_own_reminders(session_maker, seeded) -> None:
+    """The fence is Altegio-only: the EasyWeek planner keeps working."""
+    from altegio_bot.workers.easyweek_inbox_worker import sync_reminder_jobs
+
+    plan = await plan_for(session_maker, starts=seeded["starts"])
+    await run_apply(session_maker, plan)
+    before = {job.dedupe_key for job in await jobs(session_maker) if job.provider == PROVIDER_EASYWEEK}
+
+    moved = seeded["starts"] + timedelta(days=1)
+    async with session_maker() as session:
+        async with session.begin():
+            target = (await session.execute(select(Record).where(Record.id == seeded["target_pk"]))).scalars().one()
+            target.starts_at = moved
+            await sync_reminder_jobs(session, record=target, booking=webhook_booking(), client=None)
+
+    rows = [job for job in await jobs(session_maker) if job.provider == PROVIDER_EASYWEEK]
+    assert all(job.status == "canceled" for job in rows if job.dedupe_key in before)
+
+
+# ---------------------------------------------------------------------------
+# The send-time guard, the second line of defence (plan §30.11)
+# ---------------------------------------------------------------------------
+
+
+@pytest_asyncio.fixture
+async def no_meta(monkeypatch: pytest.MonkeyPatch):
+    """Meta and Chatwoot, wired to fail loudly if the guard ever lets one through."""
+    from unittest.mock import AsyncMock
+
+    from altegio_bot.workers import outbox_worker as worker
+
+    meta = AsyncMock(side_effect=AssertionError("Meta must not be called"))
+    monkeypatch.setattr(worker, "send_template_message", meta, raising=False)
+    return meta
+
+
+async def process(session_maker: async_sessionmaker[AsyncSession], job_id: int) -> MessageJob:
+    """Run one job through the real outbox path and read the row back."""
+    from altegio_bot.providers.dummy import DummyProvider
+    from altegio_bot.workers.outbox_worker import process_job_in_session
+
+    async with session_maker() as session:
+        async with session.begin():
+            await process_job_in_session(session=session, job_id=job_id, provider=DummyProvider())
+    async with session_maker() as session:
+        return (await session.execute(select(MessageJob).where(MessageJob.id == job_id))).scalars().one()
+
+
+@pytest.mark.asyncio
+async def test_a_queued_altegio_reminder_for_a_marked_record_is_terminalised(session_maker, seeded, no_meta) -> None:
+    """Queued by hand, by a race, or before the handover. It must not send."""
+    plan = await plan_for(session_maker, starts=seeded["starts"])
+    await run_apply(session_maker, plan)
+
+    job_id = await add_job(
+        session_maker,
+        provider=PROVIDER_ALTEGIO,
+        record_pk=seeded["source_pk"],
+        job_type=REMINDER_2H,
+        status="queued",
+        dedupe_key="altegio:reminder_2h:slipped-through",
+        run_at=seeded["starts"] - timedelta(hours=2),
+    )
+    before = await process(session_maker, job_id)
+
+    assert before.status == "canceled"
+    assert before.last_error == REASON_HANDED_OVER
+    assert before.locked_at is None
+    assert before.attempts == 0, "nothing was attempted, so nothing was spent"
+    no_meta.assert_not_awaited()
+
+    async with session_maker() as session:
+        assert (await session.execute(select(OutboxMessage))).scalars().all() == []
+
+
+@pytest.mark.asyncio
+async def test_the_send_guard_reason_carries_no_personal_data(session_maker, seeded, no_meta) -> None:
+    plan = await plan_for(session_maker, starts=seeded["starts"])
+    await run_apply(session_maker, plan)
+    job_id = await add_job(
+        session_maker,
+        provider=PROVIDER_ALTEGIO,
+        record_pk=seeded["source_pk"],
+        job_type=REMINDER_24H,
+        status="queued",
+        dedupe_key="altegio:reminder_24h:slipped-through",
+        run_at=seeded["starts"] - timedelta(hours=24),
+    )
+    job = await process(session_maker, job_id)
+
+    for leaked in ("phone", "@", "+49", "Testkundin"):
+        assert leaked not in (job.last_error or "")
+
+
+@pytest.mark.asyncio
+async def test_an_unmarked_altegio_reminder_is_not_touched_by_the_guard(session_maker, seeded) -> None:
+    """No handover for this record: the ordinary send path is unchanged.
+
+    The job still stops for its own unrelated reasons further down; what matters
+    is that it is NOT the ownership guard that stopped it.
+    """
+    job_id = await add_job(
+        session_maker,
+        provider=PROVIDER_ALTEGIO,
+        record_pk=seeded["source_pk"],
+        job_type=REMINDER_24H,
+        status="queued",
+        dedupe_key="altegio:reminder_24h:never-handed-over",
+        run_at=seeded["starts"] - timedelta(hours=24),
+    )
+    job = await process(session_maker, job_id)
+
+    assert job.last_error != REASON_HANDED_OVER
+    assert job.last_error != REASON_UNKNOWN
+
+
+@pytest.mark.asyncio
+async def test_an_easyweek_reminder_is_never_suppressed_by_the_guard(session_maker, seeded) -> None:
+    """It is the very thing the handover created."""
+    plan = await plan_for(session_maker, starts=seeded["starts"])
+    await run_apply(session_maker, plan)
+    created = [job for job in await jobs(session_maker) if job.provider == PROVIDER_EASYWEEK and job.status == "queued"]
+    assert created
+
+    job = await process(session_maker, created[0].id)
+
+    assert job.last_error != REASON_HANDED_OVER
+    assert job.last_error != REASON_UNKNOWN
+
+
+@pytest.mark.asyncio
+async def test_an_unanswerable_ownership_lookup_never_sends(session_maker, seeded, no_meta, monkeypatch) -> None:
+    """The database could not answer. That is not permission."""
+    from altegio_bot.workers import outbox_worker as worker
+
+    async def _cannot_tell(*args, **kwargs):
+        return True, ReminderOwner.UNKNOWN
+
+    monkeypatch.setattr(worker, "altegio_reminders_are_suppressed", _cannot_tell)
+    job_id = await add_job(
+        session_maker,
+        provider=PROVIDER_ALTEGIO,
+        record_pk=seeded["source_pk"],
+        job_type=REMINDER_24H,
+        status="queued",
+        dedupe_key="altegio:reminder_24h:unanswerable",
+        run_at=seeded["starts"] - timedelta(hours=24),
+    )
+    job = await process(session_maker, job_id)
+
+    assert job.status == "queued", "held for a later pass, not sent and not failed"
+    assert job.last_error == REASON_UNKNOWN
+    assert job.attempts == 0, "an unanswerable question is not a failed send"
+    assert job.payload.get("_reminder_ownership_attempts") == 1
+    no_meta.assert_not_awaited()
+    async with session_maker() as session:
+        assert (await session.execute(select(OutboxMessage))).scalars().all() == []

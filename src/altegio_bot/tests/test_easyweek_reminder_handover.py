@@ -26,6 +26,7 @@ import pytest
 from altegio_bot.easyweek_migration.reminder_handover import (
     APPLY_REPORT_VERSION,
     CANCEL_REASON,
+    MARKER_ALREADY,
     OBLIGATION_DONE,
     OBLIGATION_MISSING,
     OBLIGATION_OCCUPIED_CANCELED,
@@ -484,6 +485,8 @@ def test_apply_report_round_trips_and_is_bound_to_the_snapshot(tmp_path: Path) -
         created_job_ids=(10, 11),
         canceled_job_ids=(),
         already_present_count=0,
+        marked_ledger_ids=(1,),
+        already_marked_ledger_ids=(),
         scoped_outbox_ids_before=(),
         scoped_outbox_ids_after=(),
     )
@@ -506,6 +509,8 @@ def test_a_tampered_apply_report_is_refused(tmp_path: Path) -> None:
         created_job_ids=(10, 11),
         canceled_job_ids=(),
         already_present_count=0,
+        marked_ledger_ids=(1,),
+        already_marked_ledger_ids=(),
         scoped_outbox_ids_before=(),
         scoped_outbox_ids_after=(),
     )
@@ -530,6 +535,8 @@ def test_an_internally_inconsistent_apply_report_is_refused_even_with_a_new_dige
         created_job_ids=(10, 11),
         canceled_job_ids=(),
         already_present_count=0,
+        marked_ledger_ids=(1,),
+        already_marked_ledger_ids=(),
         scoped_outbox_ids_before=(),
         scoped_outbox_ids_after=(),
     )
@@ -766,3 +773,227 @@ def test_the_handover_reader_requires_both_terminal_flags(missing: str) -> None:
     del payload[missing]
 
     assert isinstance(read_booking_state(payload, booking_uuid=BOOKING, location=FakeLocation()), GuardResult)
+
+
+# ---------------------------------------------------------------------------
+# The ownership marker in the snapshot (plan §30.11)
+# ---------------------------------------------------------------------------
+
+
+def marked_row(**overrides: Any) -> HandoverRow:
+    """A row whose plan saw an existing marker."""
+    base: dict[str, Any] = {
+        "marker_action": MARKER_ALREADY,
+        "marker_existing_digest": "a" * 64,
+        "marker_handed_over_at": "2026-09-04T10:00:00Z",
+        "obligations": owed(48),
+    }
+    base.update(overrides)
+    return handover_row(**base)
+
+
+def test_the_snapshot_version_moved_for_the_marker() -> None:
+    """v2 described a snapshot that authorised a write with no marker at all."""
+    assert SNAPSHOT_VERSION == 3
+
+
+def test_a_v2_snapshot_authorises_nothing(tmp_path: Path) -> None:
+    path = write_snapshot(plan_with(handover_row(obligations=owed(48))), tmp_path / "plan.json")
+    payload = json.loads(path.read_text())
+    payload["version"] = 2
+    path.write_text(json.dumps(payload))
+
+    with pytest.raises(SnapshotError):
+        read_snapshot(path)
+
+
+def test_a_row_without_a_marker_block_is_refused(tmp_path: Path) -> None:
+    """An older snapshot shape cannot be smuggled in under the new version."""
+    path = write_snapshot(plan_with(handover_row(obligations=owed(48))), tmp_path / "plan.json")
+    payload = json.loads(path.read_text())
+    payload["rows"][0].pop("marker")
+    path.write_text(json.dumps(payload))
+
+    with pytest.raises(SnapshotError):
+        read_snapshot(path)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param(lambda m: m.update({"action": "something_else"}), id="unknown_action"),
+        pytest.param(lambda m: m.update({"existing_digest": "a" * 64}), id="set_with_a_digest"),
+        pytest.param(lambda m: m.update({"handed_over_at": "2026-09-04T10:00:00Z"}), id="set_with_an_instant"),
+    ],
+)
+def test_an_incoherent_marker_expectation_is_refused(mutate: Any, tmp_path: Path) -> None:
+    path = write_snapshot(plan_with(handover_row(obligations=owed(48))), tmp_path / "plan.json")
+    payload = json.loads(path.read_text())
+    mutate(payload["rows"][0]["marker"])
+    path.write_text(json.dumps(payload))
+
+    with pytest.raises(SnapshotError):
+        read_snapshot(path)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param(lambda m: m.update({"existing_digest": None}), id="already_without_a_digest"),
+        pytest.param(lambda m: m.update({"handed_over_at": None}), id="already_without_an_instant"),
+        pytest.param(lambda m: m.update({"existing_digest": "not-a-digest"}), id="already_with_junk"),
+    ],
+)
+def test_a_half_stated_existing_marker_is_refused(mutate: Any, tmp_path: Path) -> None:
+    path = write_snapshot(plan_with(marked_row()), tmp_path / "plan.json")
+    payload = json.loads(path.read_text())
+    mutate(payload["rows"][0]["marker"])
+    path.write_text(json.dumps(payload))
+
+    with pytest.raises(SnapshotError):
+        read_snapshot(path)
+
+
+def test_the_marker_expectation_is_inside_the_plan_digest() -> None:
+    """Switching a row from "will be marked" to "already marked" is a different plan."""
+    unmarked = plan_with(handover_row(obligations=owed(48))).digest()
+    already = plan_with(marked_row()).digest()
+
+    assert unmarked != already
+
+
+def test_a_different_existing_marker_digest_changes_the_plan_digest() -> None:
+    before = plan_with(marked_row()).digest()
+    after = plan_with(marked_row(marker_existing_digest="b" * 64)).digest()
+
+    assert before != after
+
+
+def test_an_edited_marker_expectation_breaks_the_snapshot_digest(tmp_path: Path) -> None:
+    path = write_snapshot(plan_with(marked_row()), tmp_path / "plan.json")
+    payload = json.loads(path.read_text())
+    payload["rows"][0]["marker"]["existing_digest"] = "b" * 64
+    path.write_text(json.dumps(payload))
+
+    with pytest.raises(SnapshotError):
+        read_snapshot(path)
+
+
+def test_the_apply_report_version_moved_with_the_marker_evidence() -> None:
+    assert APPLY_REPORT_VERSION == 2
+
+
+def test_an_apply_report_that_marks_no_row_is_refused(tmp_path: Path) -> None:
+    """A wave that withdrew reminders without recording ownership is not proven."""
+    frozen = frozen_for(tmp_path, plan_with(handover_row(obligations=owed(48))))
+    report = ApplyReport(
+        snapshot_version=SNAPSHOT_VERSION,
+        snapshot_digest=frozen.digest,
+        company_ids=frozen.company_ids,
+        applied_at=NOW,
+        eligible_created_rows=1,
+        rows_in_scope=1,
+        created_job_ids=(10, 11),
+        canceled_job_ids=(),
+        already_present_count=0,
+        marked_ledger_ids=(),
+        already_marked_ledger_ids=(),
+        scoped_outbox_ids_before=(),
+        scoped_outbox_ids_after=(),
+    )
+    path = write_apply_report(report, tmp_path / "report.json")
+
+    with pytest.raises(SnapshotError):
+        read_apply_report(path, frozen=frozen)
+
+
+def test_an_apply_report_whose_marker_lists_overlap_is_refused(tmp_path: Path) -> None:
+    frozen = frozen_for(tmp_path, plan_with(handover_row(obligations=owed(48))))
+    report = ApplyReport(
+        snapshot_version=SNAPSHOT_VERSION,
+        snapshot_digest=frozen.digest,
+        company_ids=frozen.company_ids,
+        applied_at=NOW,
+        eligible_created_rows=1,
+        rows_in_scope=1,
+        created_job_ids=(10, 11),
+        canceled_job_ids=(),
+        already_present_count=0,
+        marked_ledger_ids=(1,),
+        already_marked_ledger_ids=(1,),
+        scoped_outbox_ids_before=(),
+        scoped_outbox_ids_after=(),
+    )
+    path = write_apply_report(report, tmp_path / "report.json")
+
+    with pytest.raises(SnapshotError):
+        read_apply_report(path, frozen=frozen)
+
+
+def test_an_apply_report_marking_the_wrong_row_is_refused(tmp_path: Path) -> None:
+    frozen = frozen_for(tmp_path, plan_with(handover_row(obligations=owed(48))))
+    report = ApplyReport(
+        snapshot_version=SNAPSHOT_VERSION,
+        snapshot_digest=frozen.digest,
+        company_ids=frozen.company_ids,
+        applied_at=NOW,
+        eligible_created_rows=1,
+        rows_in_scope=1,
+        created_job_ids=(10, 11),
+        canceled_job_ids=(),
+        already_present_count=0,
+        marked_ledger_ids=(999,),
+        already_marked_ledger_ids=(),
+        scoped_outbox_ids_before=(),
+        scoped_outbox_ids_after=(),
+    )
+    path = write_apply_report(report, tmp_path / "report.json")
+
+    with pytest.raises(SnapshotError):
+        read_apply_report(path, frozen=frozen)
+
+
+def test_an_apply_report_disagreeing_with_the_snapshot_action_is_refused(tmp_path: Path) -> None:
+    """The plan said this row would be marked; the report says it already was."""
+    frozen = frozen_for(tmp_path, plan_with(handover_row(obligations=owed(48))))
+    report = ApplyReport(
+        snapshot_version=SNAPSHOT_VERSION,
+        snapshot_digest=frozen.digest,
+        company_ids=frozen.company_ids,
+        applied_at=NOW,
+        eligible_created_rows=1,
+        rows_in_scope=1,
+        created_job_ids=(10, 11),
+        canceled_job_ids=(),
+        already_present_count=0,
+        marked_ledger_ids=(),
+        already_marked_ledger_ids=(1,),
+        scoped_outbox_ids_before=(),
+        scoped_outbox_ids_after=(),
+    )
+    path = write_apply_report(report, tmp_path / "report.json")
+
+    with pytest.raises(SnapshotError):
+        read_apply_report(path, frozen=frozen)
+
+
+def test_a_marked_row_counts_as_a_mutation_in_the_report(tmp_path: Path) -> None:
+    frozen = frozen_for(tmp_path, plan_with(handover_row(obligations=owed(48))))
+    report = ApplyReport(
+        snapshot_version=SNAPSHOT_VERSION,
+        snapshot_digest=frozen.digest,
+        company_ids=frozen.company_ids,
+        applied_at=NOW,
+        eligible_created_rows=1,
+        rows_in_scope=1,
+        created_job_ids=(10, 11),
+        canceled_job_ids=(),
+        already_present_count=0,
+        marked_ledger_ids=(1,),
+        already_marked_ledger_ids=(),
+        scoped_outbox_ids_before=(),
+        scoped_outbox_ids_after=(),
+    )
+
+    assert report.mutation_count == 3
+    assert read_apply_report(write_apply_report(report, tmp_path / "r.json"), frozen=frozen) == report

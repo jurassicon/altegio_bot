@@ -43,12 +43,33 @@ class FakeRecord:
     staff_name: str = "Tanja"
     starts_at: datetime | None = None
     short_link: str = ""
+    # A real Altegio ``Record`` always carries this: it is NOT NULL, and it is
+    # the source identity the reminder-ownership fence looks the booking up by
+    # (plan §30.11). A fake without it would answer "cannot tell" and hold the
+    # send back for a reason production never has.
+    altegio_record_id: int = 900001
 
 
 class FakeOutbox:
     def __init__(self, **kwargs: Any) -> None:
         for key, value in kwargs.items():
             setattr(self, key, value)
+
+
+class _EmptyResult:
+    """An empty SQLAlchemy-shaped result, for the ownership fence's lookup."""
+
+    def all(self) -> list[Any]:
+        return []
+
+    def scalars(self) -> "_EmptyResult":
+        return self
+
+    def one_or_none(self) -> None:
+        return None
+
+    def scalar_one_or_none(self) -> None:
+        return None
 
 
 class FakeSession:
@@ -61,6 +82,16 @@ class FakeSession:
             self._pk += 1
             setattr(obj, "id", self._pk)
         self.added.append(obj)
+
+    async def execute(self, *args: Any, **kwargs: Any) -> Any:
+        """No ledger rows: this record was never migrated to EasyWeek.
+
+        The send path asks whether a booking's reminders were handed over
+        (plan §30.11). A record with no ledger row is the ordinary case, and the
+        honest answer is an empty result — which the fence reads as "Altegio
+        still owns these" and leaves the send path untouched.
+        """
+        return _EmptyResult()
 
 
 # Complete render context for kitilash_ka_record_updated_v1 (7 params).

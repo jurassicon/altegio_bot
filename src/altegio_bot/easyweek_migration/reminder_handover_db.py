@@ -35,6 +35,8 @@ from altegio_bot.easyweek_migration.manifest import MigrationManifest
 from altegio_bot.easyweek_migration.reminder_handover import (
     CANCEL_REASON,
     COVERING_STATUSES,
+    MARKER_ALREADY,
+    MARKER_SET,
     OBLIGATION_DONE,
     OBLIGATION_MISSING,
     OBLIGATION_PRESENT_OPEN,
@@ -44,6 +46,7 @@ from altegio_bot.easyweek_migration.reminder_handover import (
     ROW_COMPANY_MISMATCH,
     ROW_LEDGER_NOT_CREATED,
     ROW_LOCAL_TARGET_MISMATCH,
+    ROW_MARKER_INCOMPLETE,
     ROW_PROVIDER_MISMATCH,
     ROW_SOURCE_RECORD_MISSING,
     ROW_TARGET_RECORD_MISSING,
@@ -55,6 +58,7 @@ from altegio_bot.easyweek_migration.reminder_handover import (
     HandoverPlan,
     HandoverRow,
     canonical_uuid,
+    handover_timestamp,
     insert_values,
     obligations_for,
 )
@@ -85,6 +89,16 @@ HALT_OUTBOX_SIDE_EFFECT: Final = "scoped_outbox_side_effect"
 HALT_SNAPSHOT_INCOMPLETE: Final = "snapshot_incomplete_scope"
 HALT_SNAPSHOT_BLOCKED: Final = "snapshot_obligation_blocked"
 HALT_SOURCE_PROCESSING: Final = "source_reminder_processing"
+# The set of OPEN Altegio reminders for an in-scope source booking is no longer
+# the set the plan froze. Checking only the frozen ids would have missed exactly
+# the dangerous case: a delivery that landed between plan and apply and queued a
+# brand-new reminder, which the wave would then leave open next to the EasyWeek
+# ones it had just created.
+HALT_SOURCE_SCOPE_CHANGED: Final = "source_reminder_scope_changed"
+# The ledger's ownership marker contradicts what the snapshot expected — a row
+# marked by a different plan, or one that gained a marker since the plan was
+# taken. Never overwritten; a fresh operator-reviewed plan is the only way on.
+HALT_MARKER_CONFLICT: Final = "reminder_marker_conflict"
 
 
 class HandoverError(Exception):
@@ -299,6 +313,24 @@ async def build_plan(
         existing = await _existing_reminder_jobs(session, target.id)
         queued, processing = await _source_reminder_jobs(session, source.id)
 
+        # The durable ownership marker as it stands right now. A row that already
+        # carries one is reported as such rather than re-marked: the handover is
+        # a one-way, once-per-booking transfer, and re-writing the instant would
+        # erase when it actually happened.
+        if entry.reminders_handed_over_at is None and not entry.reminder_handover_plan_digest:
+            marker_action = MARKER_SET
+            marker_digest = None
+            marker_at = None
+        elif entry.reminders_handed_over_at is not None and entry.reminder_handover_plan_digest:
+            marker_action = MARKER_ALREADY
+            marker_digest = entry.reminder_handover_plan_digest
+            marker_at = handover_timestamp(_aware(entry.reminders_handed_over_at))
+        else:
+            # Half a marker. The database CHECK forbids it, so a row in this
+            # state was written outside every supported path.
+            _refuse(ROW_MARKER_INCOMPLETE)
+            continue
+
         rows.append(
             HandoverRow(
                 ledger_id=entry.id,
@@ -318,6 +350,9 @@ async def build_plan(
                     is_active=observed.is_active,
                     existing=existing,
                 ),
+                marker_action=marker_action,
+                marker_existing_digest=marker_digest,
+                marker_handed_over_at=marker_at,
                 stale_source_job_ids=tuple(queued),
                 processing_source_job_ids=tuple(processing),
             )
@@ -346,6 +381,12 @@ class ApplyResult:
     created_job_ids: tuple[int, ...] = ()
     canceled_job_ids: tuple[int, ...] = ()
     already_present: int = 0
+    # Ledger rows this apply stamped with the ownership marker, and those that
+    # already carried this exact plan's marker. Disjoint, and together they must
+    # cover the whole frozen scope — a partial marker apply is what verify
+    # refuses.
+    marked_ledger_ids: tuple[int, ...] = ()
+    already_marked_ledger_ids: tuple[int, ...] = ()
     scoped_outbox_ids_before: tuple[int, ...] = ()
     scoped_outbox_ids_after: tuple[int, ...] = ()
     halted: str | None = None
@@ -356,9 +397,13 @@ class ApplyResult:
             "easyweek_reminders_created": len(self.created_job_ids),
             "altegio_reminders_canceled": len(self.canceled_job_ids),
             "already_present": self.already_present,
-            "mutations": len(self.created_job_ids) + len(self.canceled_job_ids),
+            "mutations": len(self.created_job_ids) + len(self.canceled_job_ids) + len(self.marked_ledger_ids),
             "created_job_ids": list(self.created_job_ids),
             "canceled_job_ids": list(self.canceled_job_ids),
+            "reminder_ownership_marked": len(self.marked_ledger_ids),
+            "reminder_ownership_already_marked": len(self.already_marked_ledger_ids),
+            "marked_ledger_ids": list(self.marked_ledger_ids),
+            "already_marked_ledger_ids": list(self.already_marked_ledger_ids),
             "scoped_outbox_ids_before": list(self.scoped_outbox_ids_before),
             "scoped_outbox_ids_after": list(self.scoped_outbox_ids_after),
             "halted": self.halted,
@@ -377,6 +422,8 @@ class ApplyResult:
             created_job_ids=self.created_job_ids,
             canceled_job_ids=self.canceled_job_ids,
             already_present_count=self.already_present,
+            marked_ledger_ids=self.marked_ledger_ids,
+            already_marked_ledger_ids=self.already_marked_ledger_ids,
             scoped_outbox_ids_before=self.scoped_outbox_ids_before,
             scoped_outbox_ids_after=self.scoped_outbox_ids_after,
         )
@@ -587,6 +634,16 @@ async def _apply_plan_inner(
     if not await _eligible_scope_still_complete(session, frozen, lock=True):
         return ApplyResult(halted=HALT_ELIGIBLE_SCOPE_CHANGED)
 
+    # The COMPLETE set of open Altegio reminders, not merely the frozen ids.
+    #
+    # Checking only the ids the plan named would have missed the one case that
+    # matters: Altegio inbox is deliberately still running, so a delivery landing
+    # between plan and apply queues a brand-new reminder under a key the snapshot
+    # never saw. Cancelling only what was frozen would leave that one open, right
+    # next to the EasyWeek reminders this wave is about to create.
+    if await _source_scope_changed(session, frozen_rows, identities):
+        return ApplyResult(halted=HALT_SOURCE_SCOPE_CHANGED)
+
     drift = await _scope_still_matches(session, identities)
     if drift is not None:
         return ApplyResult(halted=drift)
@@ -646,6 +703,7 @@ async def _apply_plan_inner(
 
     # -- 2. prove every obligation is now held before withdrawing anything --
     unmet = await _unmet_obligations(session, frozen_rows, identities)
+
     if unmet:
         return ApplyResult(halted=HALT_OBLIGATION_IDENTITY)
 
@@ -699,6 +757,17 @@ async def _apply_plan_inner(
             return ApplyResult(halted=HALT_SOURCE_REMINDER_CHANGED)
         canceled.extend(changed)
 
+    # -- 4. record the durable ownership marker ----------------------------
+    # LAST, and inside the same transaction. It is the statement "these
+    # reminders are EasyWeek's now", and it must be true the instant it exists:
+    # written before the cancellation, a rollback would leave a marker for a
+    # handover that never happened, and every later Altegio delivery would be
+    # suppressed for a booking whose reminders were still Altegio's.
+    marker_result = await _write_markers(session, frozen, identities, moment=moment)
+    if isinstance(marker_result, str):
+        return ApplyResult(halted=marker_result)
+    marked, already_marked = marker_result
+
     outbox_after = await _scoped_outbox_ids(session, identities)
     if outbox_after != outbox_before:
         return ApplyResult(halted=HALT_OUTBOX_SIDE_EFFECT)
@@ -707,6 +776,8 @@ async def _apply_plan_inner(
         created_job_ids=tuple(sorted(created)),
         canceled_job_ids=tuple(sorted(canceled)),
         already_present=already_present,
+        marked_ledger_ids=tuple(sorted(marked)),
+        already_marked_ledger_ids=tuple(sorted(already_marked)),
         scoped_outbox_ids_before=outbox_before,
         scoped_outbox_ids_after=outbox_after,
     )
@@ -736,6 +807,123 @@ async def apply_plan(
     else:
         await savepoint.commit()
     return result
+
+
+async def _source_scope_changed(
+    session: AsyncSession,
+    frozen_rows: tuple[dict[str, Any], ...],
+    identities: list[dict[str, Any]],
+) -> bool:
+    """Has an Altegio reminder the plan never saw appeared since it was taken?
+
+    Reads the whole open set per source record rather than the frozen ids: a
+    reminder created between plan and apply is invisible to an id-by-id check,
+    and it is exactly the one that would survive the wave and later fire for a
+    booking whose reminders now belong to EasyWeek. Altegio inbox is deliberately
+    still running during a handover, so this is a live possibility, not a
+    theoretical one.
+
+    The comparison is containment, not equality. An id from the snapshot that is
+    no longer OPEN is the normal state of an idempotent repeat — this handover
+    cancelled it on the previous run — and step 3 re-proves each of those
+    individually anyway. What must never be tolerated is an id the snapshot does
+    not contain.
+    """
+    for row, identity in zip(frozen_rows, identities, strict=True):
+        known = set(row.get("stale_source_job_ids") or ()) | set(row.get("processing_source_job_ids") or ())
+        stmt = (
+            select(MessageJob.id)
+            .where(MessageJob.provider == PROVIDER_ALTEGIO)
+            .where(MessageJob.company_id == int(identity["source_company_id"]))
+            .where(MessageJob.record_id == int(identity["source_record_pk"]))
+            .where(MessageJob.job_type.in_(EASYWEEK_REMINDER_JOB_TYPES))
+            .where(MessageJob.status.in_(OPEN_STATUSES))
+        )
+        current = {int(job_id) for (job_id,) in (await session.execute(stmt)).all()}
+        unexpected = current - known
+        if unexpected:
+            logger.info(
+                "reminder_handover: unplanned source reminders ledger_id=%s count=%d",
+                identity["ledger_id"],
+                len(unexpected),
+            )
+            return True
+    return False
+
+
+async def _write_markers(
+    session: AsyncSession,
+    frozen: FrozenPlan,
+    identities: list[dict[str, Any]],
+    *,
+    moment: datetime,
+) -> tuple[list[int], list[int]] | str:
+    """Stamp the durable ownership marker, or refuse the whole wave.
+
+    Three cases, and only the first two are allowed to proceed:
+
+    * no marker and the snapshot expected none — write it;
+    * a marker whose digest is this plan's, and the snapshot expected exactly
+      that — an idempotent repeat of the same authorised handover. The instant
+      is NOT rewritten: when ownership moved is a fact, not a bookkeeping field;
+    * anything else — a marker from a different plan, one that appeared since
+      the plan was taken, or one that vanished — is a conflict. Never
+      overwritten, because a marker is somebody's reviewed decision about real
+      customers' messages.
+    """
+    marked: list[int] = []
+    already: list[int] = []
+
+    for row, identity in zip(frozen.rows, identities, strict=True):
+        ledger_id = int(identity["ledger_id"])
+        expected = row["marker"]
+        entry = (
+            (
+                await session.execute(
+                    select(EasyWeekMigrationLedger).where(EasyWeekMigrationLedger.id == ledger_id).with_for_update()
+                )
+            )
+            .scalars()
+            .one_or_none()
+        )
+        if entry is None:
+            return HALT_MARKER_CONFLICT
+
+        current_at = entry.reminders_handed_over_at
+        current_digest = entry.reminder_handover_plan_digest
+
+        if expected["action"] == MARKER_SET:
+            if current_at is None and not current_digest:
+                entry.reminders_handed_over_at = moment
+                entry.reminder_handover_plan_digest = frozen.digest
+                marked.append(ledger_id)
+                continue
+            if current_at is not None and current_digest == frozen.digest:
+                # A marker carrying THIS plan's digest can only have been written
+                # by this same authorised apply, so a repeat of the exact
+                # snapshot is idempotent rather than a conflict. The instant is
+                # left alone: when ownership moved is a fact about the past, and
+                # rewriting it would erase the only record of when the customers'
+                # reminders actually changed hands.
+                already.append(ledger_id)
+                continue
+            # A marker from a different plan, or half of one. Another operator,
+            # another wave, or a concurrent apply got here first, and their
+            # decision is not ours to overwrite.
+            return HALT_MARKER_CONFLICT
+
+        # MARKER_ALREADY: the snapshot was taken against an existing marker, so
+        # the row must still carry that exact one, and this apply must be the
+        # same authorised plan.
+        if current_at is None or not current_digest:
+            return HALT_MARKER_CONFLICT
+        if current_digest != expected["existing_digest"] or current_digest != frozen.digest:
+            return HALT_MARKER_CONFLICT
+        if handover_timestamp(_aware(current_at)) != expected["handed_over_at"]:
+            return HALT_MARKER_CONFLICT
+        already.append(ledger_id)
+
+    return marked, already
 
 
 def _source_job_has_identity(job: MessageJob, identity: dict[str, Any]) -> bool:
@@ -836,6 +1024,69 @@ def _parse_payload_timestamp(value: object) -> datetime | None:
 # ---------------------------------------------------------------------------
 
 
+async def _verify_markers(
+    session: AsyncSession,
+    frozen: FrozenPlan,
+    apply_report: ApplyReport,
+) -> dict[str, Any]:
+    """Prove every frozen row carries this plan's ownership marker.
+
+    Re-read from the ledger rather than taken from the report, and matched
+    against the report afterwards: a marker set for a different plan, a row that
+    lost one, and a report whose id lists were edited are all different failures
+    and all of them mean the handover is not proven.
+    """
+    ledger_ids = sorted({int(row["identity"]["ledger_id"]) for row in frozen.rows})
+    marked: list[int] = []
+    missing: list[int] = []
+    foreign: list[int] = []
+    if ledger_ids:
+        stmt = select(
+            EasyWeekMigrationLedger.id,
+            EasyWeekMigrationLedger.source_provider,
+            EasyWeekMigrationLedger.source_company_id,
+            EasyWeekMigrationLedger.source_record_id,
+            EasyWeekMigrationLedger.target_provider,
+            EasyWeekMigrationLedger.target_booking_uuid,
+            EasyWeekMigrationLedger.reminders_handed_over_at,
+            EasyWeekMigrationLedger.reminder_handover_plan_digest,
+        ).where(EasyWeekMigrationLedger.id.in_(ledger_ids))
+        rows = {row[0]: row for row in (await session.execute(stmt)).all()}
+        by_ledger = {int(row["identity"]["ledger_id"]): row["identity"] for row in frozen.rows}
+
+        for ledger_id in ledger_ids:
+            entry = rows.get(ledger_id)
+            identity = by_ledger[ledger_id]
+            if entry is None:
+                missing.append(ledger_id)
+                continue
+            (_id, src_provider, src_company, src_record, tgt_provider, tgt_uuid, handed_at, digest) = entry
+            if handed_at is None or not digest:
+                missing.append(ledger_id)
+                continue
+            # The marker has to belong to THIS exact pair, not merely to a row
+            # with the right primary key.
+            identity_ok = (
+                src_provider == PROVIDER_ALTEGIO
+                and tgt_provider == PROVIDER_EASYWEEK
+                and src_company == int(identity["source_company_id"])
+                and src_record == int(identity["source_record_id"])
+                and canonical_uuid(tgt_uuid) == canonical_uuid(identity["target_booking_uuid"])
+            )
+            if not identity_ok or digest != frozen.digest:
+                foreign.append(ledger_id)
+                continue
+            marked.append(ledger_id)
+
+    reported = set(apply_report.marked_ledger_ids) | set(apply_report.already_marked_ledger_ids)
+    return {
+        "marked": sorted(marked),
+        "missing": sorted(missing),
+        "foreign": sorted(foreign),
+        "report_matches": reported == set(marked) and not missing and not foreign,
+    }
+
+
 async def verify_handover(
     session: AsyncSession,
     frozen: FrozenPlan,
@@ -869,6 +1120,13 @@ async def verify_handover(
         ]
 
     unmet = await _unmet_obligations(session, frozen_rows, identities)
+
+    # The durable ownership marker: present on every frozen row, carrying this
+    # plan's digest, and matching what the apply report claims. Without this a
+    # verify could pass over a wave whose reminders were withdrawn but whose
+    # ownership was never recorded — leaving every one of them one late Altegio
+    # delivery away from being re-opened.
+    marker_state = await _verify_markers(session, frozen, apply_report)
 
     # Any EasyWeek reminder queued for an in-scope target whose key does not
     # belong to the appointment's current start instant. A leftover from an
@@ -976,6 +1234,10 @@ async def verify_handover(
     return {
         "mode": "verify",
         "snapshot_version": frozen.version,
+        "ledger_rows_marked": len(marker_state["marked"]),
+        "ledger_rows_missing_marker": marker_state["missing"],
+        "ledger_rows_with_foreign_marker": marker_state["foreign"],
+        "marker_matches_apply_report": marker_state["report_matches"],
         "snapshot_digest_matches_apply_report": apply_report.snapshot_digest == frozen.digest,
         "rows_in_scope": len(identities),
         "eligible_scope_complete": complete_scope,
@@ -994,6 +1256,9 @@ async def verify_handover(
         "passed": (
             complete_scope
             and counts_match
+            and not marker_state["missing"]
+            and not marker_state["foreign"]
+            and marker_state["report_matches"]
             and apply_report.snapshot_digest == frozen.digest
             and not created_invalid
             and not canceled_invalid

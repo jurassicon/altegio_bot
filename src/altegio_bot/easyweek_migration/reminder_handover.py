@@ -73,8 +73,8 @@ from altegio_bot.easyweek_reminders import (
 )
 from altegio_bot.models.models import PROVIDER_ALTEGIO, PROVIDER_EASYWEEK
 
-SNAPSHOT_VERSION: Final = 2
-APPLY_REPORT_VERSION: Final = 1
+SNAPSHOT_VERSION: Final = 3
+APPLY_REPORT_VERSION: Final = 2
 SNAPSHOT_MODE: Final = 0o600
 DIR_MODE: Final = 0o700
 
@@ -90,6 +90,15 @@ CONFIRMATION_TEMPLATE: Final = "apply reminder handover {digest}"
 # Why an old Altegio reminder was withdrawn. Stable, PII-free, and specific
 # enough that somebody reading `message_jobs` in six months knows what did it.
 CANCEL_REASON: Final = "superseded by migrated EasyWeek booking (reminder handover)"
+
+# What an apply would do to this row's durable ownership marker.
+#
+# The marker is the durable fact that a booking's future reminders stopped being
+# Altegio's. Without it a late Altegio delivery had nothing to consult, and
+# `add_job` — which re-queues a cancelled job on conflict — re-opened the very
+# reminder the handover had just withdrawn.
+MARKER_SET: Final = "set"
+MARKER_ALREADY: Final = "already_handed_over"
 
 # Per-obligation outcomes. Only MISSING leads to an insert.
 OBLIGATION_MISSING: Final = "missing"
@@ -111,6 +120,10 @@ ROW_BRANCH_UNPROVEN: Final = "branch_identity_unproven"
 ROW_TARGET_UNPROVEN: Final = "target_unproven"
 ROW_LOCAL_TARGET_MISMATCH: Final = "local_target_mismatch"
 ROW_NO_FUTURE_OBLIGATION: Final = "no_future_obligation"
+# Half an ownership marker on the ledger row. The database CHECK forbids it, so
+# a row in this state was written outside every supported path and is not
+# something to reason about.
+ROW_MARKER_INCOMPLETE: Final = "marker_incomplete"
 
 # Statuses an open reminder can hold. `processing` counts as open: a job the
 # worker claimed a second ago is still going to fire.
@@ -247,6 +260,13 @@ class HandoverRow:
     # Source reminder jobs the worker has already claimed. One of these stops
     # the whole apply: a claimed job may be mid-flight to Meta.
     processing_source_job_ids: tuple[int, ...] = ()
+    # The durable reminder-ownership marker as it stands right now, and what an
+    # apply would do to it. `MARKER_SET` means there is none yet; `MARKER_ALREADY`
+    # means this exact handover already ran and carries the digest it ran under,
+    # so a repeat of the same snapshot is recognised instead of re-marking.
+    marker_action: str = MARKER_SET
+    marker_existing_digest: str | None = None
+    marker_handed_over_at: str | None = None
     refusal: str | None = None
 
     @property
@@ -289,6 +309,14 @@ class HandoverRow:
             "obligations": [item.as_safe_dict() for item in self.obligations],
             "stale_source_job_ids": list(self.stale_source_job_ids),
             "processing_source_job_ids": list(self.processing_source_job_ids),
+            # Digested with everything else, so an edited marker expectation —
+            # a row switched from "set" to "already handed over", a swapped
+            # digest — invalidates the snapshot rather than authorising a write.
+            "marker": {
+                "action": self.marker_action,
+                "existing_digest": self.marker_existing_digest,
+                "handed_over_at": self.marker_handed_over_at,
+            },
             "refusal": self.refusal,
         }
 
@@ -549,6 +577,11 @@ class HandoverPlan:
         return payload
 
 
+def handover_timestamp(value: datetime) -> str:
+    """Canonical UTC timestamp, in the one format the snapshot validates."""
+    return _timestamp(value)
+
+
 def _timestamp(value: datetime) -> str:
     return _as_utc(value).isoformat().replace("+00:00", "Z")
 
@@ -601,12 +634,22 @@ class ApplyReport:
     created_job_ids: tuple[int, ...]
     canceled_job_ids: tuple[int, ...]
     already_present_count: int
+    # The durable evidence half. `marked` are the rows this apply stamped;
+    # `already_marked` are the rows that already carried THIS plan's marker, so
+    # an idempotent repeat reports zero mutations without losing the fact that
+    # the scope is fully covered.
+    marked_ledger_ids: tuple[int, ...]
+    already_marked_ledger_ids: tuple[int, ...]
     scoped_outbox_ids_before: tuple[int, ...]
     scoped_outbox_ids_after: tuple[int, ...]
 
     @property
     def mutation_count(self) -> int:
-        return len(self.created_job_ids) + len(self.canceled_job_ids)
+        return len(self.created_job_ids) + len(self.canceled_job_ids) + len(self.marked_ledger_ids)
+
+    @property
+    def marked_ledger_count(self) -> int:
+        return len(self.marked_ledger_ids)
 
     @property
     def created_job_count(self) -> int:
@@ -631,6 +674,10 @@ class ApplyReport:
             "canceled_job_ids": list(self.canceled_job_ids),
             "canceled_job_count": self.canceled_job_count,
             "already_present_count": self.already_present_count,
+            "marked_ledger_ids": list(self.marked_ledger_ids),
+            "marked_ledger_count": self.marked_ledger_count,
+            "already_marked_ledger_ids": list(self.already_marked_ledger_ids),
+            "already_marked_ledger_count": len(self.already_marked_ledger_ids),
             "scoped_outbox_ids_before": list(self.scoped_outbox_ids_before),
             "scoped_outbox_ids_after": list(self.scoped_outbox_ids_after),
             "mutation_count": self.mutation_count,
@@ -684,6 +731,10 @@ def read_apply_report(path: str | Path, *, frozen: FrozenPlan | None = None) -> 
         "canceled_job_ids",
         "canceled_job_count",
         "already_present_count",
+        "marked_ledger_ids",
+        "marked_ledger_count",
+        "already_marked_ledger_ids",
+        "already_marked_ledger_count",
         "scoped_outbox_ids_before",
         "scoped_outbox_ids_after",
         "mutation_count",
@@ -715,9 +766,19 @@ def read_apply_report(path: str | Path, *, frozen: FrozenPlan | None = None) -> 
     mutations = _non_negative_int(payload["mutation_count"], "mutation_count")
     created_count = _non_negative_int(payload["created_job_count"], "created_job_count")
     canceled_count = _non_negative_int(payload["canceled_job_count"], "canceled_job_count")
+    marked = _canonical_ids(payload["marked_ledger_ids"], "marked_ledger_ids")
+    already_marked = _canonical_ids(payload["already_marked_ledger_ids"], "already_marked_ledger_ids")
+    marked_count = _non_negative_int(payload["marked_ledger_count"], "marked_ledger_count")
+    already_marked_count = _non_negative_int(payload["already_marked_ledger_count"], "already_marked_ledger_count")
     if created_count != len(created) or canceled_count != len(canceled):
         raise SnapshotError("apply report job counts are inconsistent")
-    if mutations != created_count + canceled_count:
+    if marked_count != len(marked) or already_marked_count != len(already_marked):
+        raise SnapshotError("apply report marker counts are inconsistent")
+    if set(marked) & set(already_marked):
+        # A row cannot both have been stamped now and have carried the marker
+        # already; one of the two lists has been edited.
+        raise SnapshotError("apply report marker sets overlap")
+    if mutations != created_count + canceled_count + marked_count:
         raise SnapshotError("apply report mutation count is inconsistent")
     report = ApplyReport(
         snapshot_version=payload["snapshot_version"],
@@ -729,6 +790,8 @@ def read_apply_report(path: str | Path, *, frozen: FrozenPlan | None = None) -> 
         created_job_ids=created,
         canceled_job_ids=canceled,
         already_present_count=already,
+        marked_ledger_ids=marked,
+        already_marked_ledger_ids=already_marked,
         scoped_outbox_ids_before=before,
         scoped_outbox_ids_after=after,
     )
@@ -744,6 +807,17 @@ def read_apply_report(path: str | Path, *, frozen: FrozenPlan | None = None) -> 
         obligations = sum(len(row["obligations"]) for row in frozen.rows)
         if len(report.created_job_ids) + report.already_present_count != obligations:
             raise SnapshotError("the apply report does not account for every obligation")
+        # Every frozen row must appear in exactly one of the two marker lists.
+        # A partial marker apply is the state that would leave some bookings
+        # protected against a late Altegio delivery and others not.
+        frozen_ledger_ids = {int(row["identity"]["ledger_id"]) for row in frozen.rows}
+        if set(report.marked_ledger_ids) | set(report.already_marked_ledger_ids) != frozen_ledger_ids:
+            raise SnapshotError("the apply report does not mark every frozen ledger row")
+        expected_already = {
+            int(row["identity"]["ledger_id"]) for row in frozen.rows if row["marker"]["action"] == MARKER_ALREADY
+        }
+        if set(report.already_marked_ledger_ids) != expected_already:
+            raise SnapshotError("the apply report marker actions disagree with the snapshot")
     return report
 
 
@@ -945,7 +1019,7 @@ def _validate_refusal(value: object) -> dict[str, Any]:
 def _validate_row(value: object) -> dict[str, Any]:
     _exact_keys(
         value,
-        {"identity", "obligations", "stale_source_job_ids", "processing_source_job_ids", "refusal"},
+        {"identity", "obligations", "stale_source_job_ids", "processing_source_job_ids", "marker", "refusal"},
         "row",
     )
     assert isinstance(value, dict)
@@ -1003,8 +1077,37 @@ def _validate_row(value: object) -> dict[str, Any]:
         "obligations": obligations,
         "stale_source_job_ids": list(stale),
         "processing_source_job_ids": list(processing),
+        "marker": _validate_marker(value["marker"]),
         "refusal": None,
     }
+
+
+def _validate_marker(value: object) -> dict[str, Any]:
+    """The row's expected ownership-marker state, or refuse the snapshot.
+
+    Strict in both directions. ``set`` means the plan saw no marker and the
+    apply will write one, so it must carry neither a digest nor an instant;
+    ``already_handed_over`` means the plan read an existing one, so it must
+    carry both. A half-stated expectation would let an apply either re-mark a
+    row somebody else had already handed over, or skip marking one that needs it.
+    """
+    _exact_keys(value, {"action", "existing_digest", "handed_over_at"}, "row marker")
+    assert isinstance(value, dict)
+    action = value["action"]
+    if action not in (MARKER_SET, MARKER_ALREADY):
+        raise SnapshotError("row marker action is unknown")
+
+    digest = value["existing_digest"]
+    handed_over_at = value["handed_over_at"]
+    if action == MARKER_SET:
+        if digest is not None or handed_over_at is not None:
+            raise SnapshotError("a row to be marked cannot already carry a marker")
+        return {"action": action, "existing_digest": None, "handed_over_at": None}
+
+    if not isinstance(digest, str) or len(digest) != 64 or not all(c in "0123456789abcdef" for c in digest):
+        raise SnapshotError("row marker existing_digest is not a digest")
+    _parse_timestamp(handed_over_at, "row marker handed_over_at")
+    return {"action": action, "existing_digest": digest, "handed_over_at": handed_over_at}
 
 
 def _validate_obligation(value: object, *, booking_uuid: uuid_module.UUID, starts_at: datetime) -> dict[str, Any]:

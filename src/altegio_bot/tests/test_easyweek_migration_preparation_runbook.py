@@ -410,12 +410,29 @@ def test_handover_shell_commands_do_not_edit_notification_flags(handover: str) -
 
 
 def test_handover_sql_uses_credentials_inside_the_postgres_container(handover: str) -> None:
+    """Every documented query: real credentials, and read-only by construction."""
     sql = [line for block in bash_blocks(handover) for line in block.splitlines() if "psql " in line]
-    assert len(sql) == 1
-    assert "-U altegio -d altegio_bot" in sql[0]
-    assert "$POSTGRES_USER" not in sql[0]
-    assert "$POSTGRES_DB" not in sql[0]
-    assert "BEGIN TRANSACTION READ ONLY" in sql[0]
+    assert len(sql) == 2, "the job counts and the ownership markers"
+    for line in sql:
+        assert "-U altegio -d altegio_bot" in line
+        assert "$POSTGRES_USER" not in line
+        assert "$POSTGRES_DB" not in line
+        assert "BEGIN TRANSACTION READ ONLY" in line
+        for mutating in ("UPDATE ", "DELETE ", "INSERT ", "ALTER ", "DROP "):
+            assert mutating not in line.upper(), line
+
+
+def test_the_runbook_proves_the_markers_with_read_only_sql(handover: str) -> None:
+    sql = [line for block in bash_blocks(handover) for line in block.splitlines() if "psql " in line]
+    marker_query = [line for line in sql if "reminders_handed_over_at" in line]
+    assert len(marker_query) == 1
+
+    query = marker_query[0]
+    assert "easyweek_migration_ledger" in query
+    assert "still_open_altegio_reminders" in query
+    assert "reminder_handover_plan_digest" in query
+    assert "'queued','processing'" in query, "an open reminder is either"
+    assert "обязан быть `0`" in prose(handover)
 
 
 def test_the_runbook_states_the_three_readiness_questions(handover: str) -> None:
@@ -516,3 +533,60 @@ def test_the_runbook_claims_no_custom_duration_support(runbook: str) -> None:
 
     assert "Не утверждает, что EasyWeek API принимает индивидуальную длительность" in text
     assert "manual_adjustment_candidate" in text
+
+
+# ---------------------------------------------------------------------------
+# The ownership marker in the runbook (plan §30.11)
+# ---------------------------------------------------------------------------
+
+
+def test_the_documented_snapshot_and_report_versions_are_current(handover_commands: list[str]) -> None:
+    """A command naming last version's file would be refused at the worst moment."""
+    from altegio_bot.easyweek_migration.reminder_handover import APPLY_REPORT_VERSION, SNAPSHOT_VERSION
+    from altegio_bot.scripts import easyweek_reminder_handover as tool
+
+    parser = tool.build_parser()
+    seen_snapshots = 0
+    seen_reports = 0
+    for line in handover_commands:
+        args = parser.parse_args(handover_args(line))
+        # The value of the argument, never the whole line: an apply command names
+        # a v3 snapshot AND a v2 report, so a substring check over the line would
+        # read one version as the other.
+        assert args.snapshot.endswith(f".v{SNAPSHOT_VERSION}.json"), args.snapshot
+        seen_snapshots += 1
+        # Only where the runbook states one: `plan` leaves it at the CLI default,
+        # which is not a documented path and carries no version in its name.
+        report = getattr(args, "apply_report", None)
+        if report and "--apply-report" in line:
+            assert report.endswith(f".v{APPLY_REPORT_VERSION}.json"), report
+            seen_reports += 1
+    assert seen_snapshots and seen_reports
+
+
+def test_the_runbook_explains_the_marker_in_plain_language(handover: str) -> None:
+    text = prose(handover)
+
+    assert "ownership marker" in text
+    assert "add_job()" in text and "переводит отменённое задание обратно в очередь" in text
+    assert "в той же транзакции и последней" in text
+    assert "вторая линия защиты" in text
+
+
+def test_the_runbook_says_inbox_and_capture_stay_up_after_the_handover(handover: str) -> None:
+    text = prose(handover)
+
+    assert "остаются включёнными и после handover" in text
+    assert "затронуты не будут" in text
+
+
+def test_the_runbook_names_the_new_refusal_codes(handover: str) -> None:
+    text = prose(handover)
+
+    for code in (
+        "source_reminder_scope_changed",
+        "reminder_marker_conflict",
+        "ledger_rows_missing_marker",
+        "ledger_rows_with_foreign_marker",
+    ):
+        assert code in text, code

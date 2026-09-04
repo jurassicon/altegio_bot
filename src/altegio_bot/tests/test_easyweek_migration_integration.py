@@ -264,6 +264,46 @@ async def test_migration_compatibility_scenarios(temp_db_url) -> None:
         f"the marker index must be PARTIAL on the recovery scan's predicate: {marker_index}"
     )
 
+    # PR-11.2 revision 24 (f3c8a1e5d709): the reminder-ownership marker.
+    #
+    # Checked as a SHAPE for the same reason as the marker above. Two nullable
+    # columns held together by a CHECK, and a PARTIAL index carrying exactly the
+    # predicate the runtime fence uses — that fence runs inside the Altegio
+    # planning transaction on every create/update delivery, so a full index
+    # would quietly stop being the thing this migration claims to create.
+    handed_over = await _column(temp_db_url, _LEDGER_TABLE, _HANDOVER_AT_COLUMN)
+    assert handed_over is not None, f"{_HANDOVER_AT_COLUMN} is missing after upgrade head"
+    assert handed_over[0] == "timestamp with time zone", f"unexpected type: {handed_over}"
+    assert handed_over[1] == "YES", "NULL is how 'ownership has not moved' is expressed"
+
+    plan_digest = await _column(temp_db_url, _LEDGER_TABLE, _HANDOVER_DIGEST_COLUMN)
+    assert plan_digest is not None, f"{_HANDOVER_DIGEST_COLUMN} is missing after upgrade head"
+    assert plan_digest[0] == "character varying", f"unexpected type: {plan_digest}"
+    assert plan_digest[1] == "YES"
+    assert plan_digest[3] == 64, f"the digest column must hold a sha256 hex string: {plan_digest}"
+
+    assert _HANDOVER_CHECK in await _constraint_names(temp_db_url, _LEDGER_TABLE), (
+        "the two marker columns must be held together by a CHECK: half a marker "
+        "would let the planner fence answer while the apply's digest comparison could not"
+    )
+
+    handover_index = await _ledger_index(temp_db_url, _HANDOVER_INDEX)
+    assert handover_index is not None, f"{_HANDOVER_INDEX} is missing after upgrade head"
+    predicate = " ".join(handover_index.split()).lower()
+    assert f"where ({_HANDOVER_AT_COLUMN} is not null)" in predicate, (
+        f"the marker index must be PARTIAL on the fence's predicate: {handover_index}"
+    )
+    for column in ("source_provider", "source_company_id", "source_record_id"):
+        assert column in handover_index, f"the fence looks up by source identity: {handover_index}"
+
+    # And the CHECK is real, not merely declared: half a marker must be refused.
+    for half in (
+        f"UPDATE {_LEDGER_TABLE} SET {_HANDOVER_AT_COLUMN} = now()",
+        f"UPDATE {_LEDGER_TABLE} SET {_HANDOVER_DIGEST_COLUMN} = repeat('a', 64)",
+    ):
+        with pytest.raises(Exception):
+            await _exec(temp_db_url, half)
+
     current = _alembic_ok("current", db_url=temp_db_url)
     assert _HEAD_REVISION in current
 
@@ -311,6 +351,13 @@ async def test_migration_compatibility_scenarios(temp_db_url) -> None:
     # that the migration remembered to name both.
     assert await _easyweek_event_column(temp_db_url, _RETENTION_DEFERRED_COLUMN) is None
     assert await _easyweek_event_index(temp_db_url, _RETENTION_DEFERRED_INDEX) is None
+
+    # The reminder-ownership marker goes too — columns, CHECK and index. A
+    # downgrade that left any of them would leave an environment carrying a
+    # constraint no revision admits to owning.
+    assert await _column(temp_db_url, _LEDGER_TABLE, _HANDOVER_AT_COLUMN) is None
+    assert await _column(temp_db_url, _LEDGER_TABLE, _HANDOVER_DIGEST_COLUMN) is None
+    assert await _ledger_index(temp_db_url, _HANDOVER_INDEX) is None
 
     remaining_indexes = await _fetch(
         temp_db_url,
@@ -524,6 +571,21 @@ async def _counts(db_url: str) -> dict[str, int]:
 
 async def _providers(db_url: str, table: str) -> list[str]:
     return [row[0] for row in await _fetch(db_url, f"SELECT provider FROM {table}")]
+
+
+_LEDGER_TABLE = "easyweek_migration_ledger"
+_HANDOVER_AT_COLUMN = "reminders_handed_over_at"
+_HANDOVER_DIGEST_COLUMN = "reminder_handover_plan_digest"
+_HANDOVER_CHECK = "ck_easyweek_migration_ledger_reminder_handover_complete"
+_HANDOVER_INDEX = "ix_easyweek_migration_ledger_reminder_handover"
+
+
+async def _ledger_index(db_url: str, index: str) -> str | None:
+    rows = await _fetch(
+        db_url,
+        f"SELECT indexdef FROM pg_indexes WHERE tablename = '{_LEDGER_TABLE}' AND indexname = '{index}'",
+    )
+    return rows[0][0] if rows else None
 
 
 async def _column(db_url: str, table: str, column: str) -> tuple | None:
