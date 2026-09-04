@@ -1738,12 +1738,18 @@ class EasyWeekMigrationCanaryProof(Base):
         UniqueConstraint(
             "manifest_digest",
             "request_schema_version",
+            "contract_kind",
             "cutover_at",
             "source_company_id",
             "source_record_id",
             name="uq_easyweek_migration_canary_identity",
         ),
-        Index("ix_easyweek_migration_canary_lookup", "manifest_digest", "request_schema_version"),
+        Index(
+            "ix_easyweek_migration_canary_lookup",
+            "manifest_digest",
+            "request_schema_version",
+            "contract_kind",
+        ),
         # A proof row that did not verify is not a proof. It is still stored —
         # a failed canary is exactly what an operator needs to read — but the
         # bulk gate selects on `verified`, and a NULL target on a verified row
@@ -1755,6 +1761,22 @@ class EasyWeekMigrationCanaryProof(Base):
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+
+    # Which mutation contract this canary exercised: `single` for
+    # ``POST /bookings``, `cart_two` for ``POST /bookings/cart`` (plan §30.12).
+    #
+    # Part of the identity, not a label. The two contracts are different
+    # endpoints with different request bodies and different readback shapes, so
+    # a canary that proved one has proven nothing about the other — and a bulk
+    # run licensed by the wrong kind would write hundreds of bookings through a
+    # path no real booking has ever gone down. Existing rows default to `single`
+    # because that is the only contract that existed when they were written.
+    contract_kind: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        server_default=text("'single'"),
+        default="single",
+    )
 
     # -- what was proven --------------------------------------------------
     source_company_id: Mapped[int] = mapped_column(Integer, nullable=False)

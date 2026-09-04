@@ -42,6 +42,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Sequence
 from types import TracebackType
 from typing import Any, Awaitable, Callable, Final
 
@@ -233,6 +234,137 @@ def build_booking_request(
     # reason about. Caught here rather than by the server.
     assert frozenset(body) == BOOKING_REQUEST_FIELDS
     return body
+
+
+# The exact top-level keys of the cart body a live canary was answered 200 for
+# (plan §30.12). An allowlist, not a starting point: the plain `/bookings`
+# endpoint already cost one canary to a guessed schema, and this one is proven
+# only in the shape below.
+CART_REQUEST_FIELDS: Final[frozenset[str]] = frozenset(
+    {
+        "location_uuid",
+        "timezone",
+        "customer_phone",
+        "customer_first_name",
+        "booking_comment",
+        "items",
+    }
+)
+CART_ITEM_FIELDS: Final[frozenset[str]] = frozenset({"datetime_start", "services"})
+CART_SERVICE_FIELDS: Final[frozenset[str]] = frozenset({"service_uuid", "staffer_uuid"})
+
+_PATH_CART: Final = "cart"
+
+
+def build_cart_booking_request(
+    *,
+    location_uuid: str,
+    customer_phone: str,
+    customer_first_name: str,
+    datetime_start_utc_iso: str,
+    comment: str,
+    services: Sequence[tuple[str, str]],
+    timezone_name: str = EASYWEEK_BOOKING_TIMEZONE,
+) -> dict[str, Any]:
+    """Build the ``POST /bookings/cart`` body from the PROVEN canary shape.
+
+    ``services`` is a sequence of ``(service_uuid, staffer_uuid)`` in the order
+    the source lists them. That order is the request's order and is canonical
+    everywhere else too — a booking whose two services swapped places is a
+    different request, and a plan reviewed against the old one never authorised
+    it.
+
+    One item, always. The canary created one cart item holding both services and
+    got back exactly one booking; several items is a shape with no evidence, and
+    the `one Altegio record -> one EasyWeek booking` ledger relation depends on
+    the one-to-one the single item gives.
+
+    Field names are an allowlist rather than a starting point. The plain
+    ``/bookings`` endpoint already cost a canary to a guessed schema (see
+    :func:`build_booking_request`), and nothing here is sent that the successful
+    body did not contain — no duration, no price, no customer uuid. The length
+    and the money come from the catalogue services, which is exactly why the
+    classifier refuses any booking whose price or duration differs from its
+    reviewed baseline.
+    """
+    if len(services) != 2:
+        # The proven contract is two. One goes through `build_booking_request`;
+        # three or more has no evidence at all.
+        raise EasyWeekPermanentError(
+            "a cart booking carries exactly two services", operation="build_cart_booking_request"
+        )
+    if services[0][0] == services[1][0]:
+        raise EasyWeekPermanentError(
+            "a cart booking needs two different services", operation="build_cart_booking_request"
+        )
+    if services[0][1] != services[1][1]:
+        # The canary proved one staffer across both lines and nothing else.
+        raise EasyWeekPermanentError(
+            "a cart booking needs one staffer for both services", operation="build_cart_booking_request"
+        )
+
+    item = {
+        "datetime_start": datetime_start_utc_iso,
+        "services": [
+            {"service_uuid": service_uuid, "staffer_uuid": staffer_uuid} for service_uuid, staffer_uuid in services
+        ],
+    }
+    body = {
+        "location_uuid": location_uuid,
+        "timezone": timezone_name,
+        "customer_phone": customer_phone,
+        "customer_first_name": customer_first_name,
+        "booking_comment": comment,
+        "items": [item],
+    }
+    # A body that grew a field the proven shape does not name is a body we
+    # cannot reason about. Caught here rather than by the server.
+    assert frozenset(body) == CART_REQUEST_FIELDS
+    assert frozenset(item) == CART_ITEM_FIELDS
+    for line in item["services"]:
+        assert frozenset(line) == CART_SERVICE_FIELDS
+    return body
+
+
+def _cart_uuid_candidates(payload: object) -> list[str]:
+    """Every booking uuid a cart response states, in the order it states them.
+
+    The canary's response carried exactly one. This reader looks in the shapes a
+    list-or-object API can answer with — a bare object, a ``data`` envelope, a
+    list of bookings — and collects ALL of them rather than stopping at the
+    first, because "how many bookings did this create?" is the question the
+    caller has to be able to answer.
+    """
+    if isinstance(payload, dict):
+        inner = payload.get("data")
+        if isinstance(inner, (dict, list)):
+            payload = inner
+
+    rows: list[Any]
+    if isinstance(payload, dict):
+        # A single booking object, or an envelope naming its bookings.
+        for key in ("bookings", "items"):
+            nested = payload.get(key)
+            if isinstance(nested, list):
+                rows = nested
+                break
+        else:
+            rows = [payload]
+    elif isinstance(payload, list):
+        rows = payload
+    else:
+        return []
+
+    found: list[str] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        for key in ("uuid", "uid", "booking_uuid"):
+            candidate = row.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                found.append(candidate)
+                break
+    return found
 
 
 def _safe_validation_fields(response: httpx.Response) -> list[str]:
@@ -490,6 +622,135 @@ class EasyWeekMigrationWriteClient:
         raise EasyWeekUncertainMutation(
             "mutation succeeded but the response carried no usable booking uuid",
             operation="create_booking",
+        )
+
+    async def create_cart_booking(self, body: dict[str, Any]) -> BookingCreated:
+        """``POST /bookings/cart``. Returns only on a PROVEN single creation.
+
+        The same outcome taxonomy as :meth:`create_booking`, deliberately: 429 is
+        the only status that permits another POST, because a rate limiter refuses
+        the request before the handler runs. A timeout, a transport failure and
+        every 5xx are UNKNOWN — a write may already have landed, and EasyWeek
+        publishes no idempotency key that would make a second attempt safe.
+
+        One extra refusal this endpoint needs and the plain one does not: a cart
+        could in principle answer with several bookings. The canary's single item
+        produced exactly one, and the ledger's whole relation is
+        `one Altegio record -> one EasyWeek booking uuid` — so more than one uuid
+        in the response is uncertain rather than "take the first". Somebody has
+        to look at what was actually created before anything else happens.
+        """
+        url = "/".join([self._base_url, _PATH_BOOKINGS, _PATH_CART])
+        last_retryable: EasyWeekError | None = None
+
+        for attempt in range(1, self._max_attempts + 1):
+            await self._limiter.acquire()
+            try:
+                response = await self._client.post(url, headers=self._headers(), json=body)
+            except httpx.TimeoutException:
+                logger.error("easyweek_migration: create_cart_booking timeout attempt=%s — outcome UNKNOWN", attempt)
+                raise EasyWeekUncertainMutation(
+                    "cart mutation timed out; outcome unknown",
+                    operation="create_cart_booking",
+                    attempts=attempt,
+                ) from None
+            except httpx.HTTPError as exc:
+                logger.error(
+                    "easyweek_migration: create_cart_booking transport failure attempt=%s error_type=%s"
+                    " — outcome UNKNOWN",
+                    attempt,
+                    type(exc).__name__,
+                )
+                raise EasyWeekUncertainMutation(
+                    "cart mutation transport failure; outcome unknown",
+                    operation="create_cart_booking",
+                    attempts=attempt,
+                ) from None
+
+            status = response.status_code
+            logger.info("easyweek_migration: create_cart_booking status=%s attempt=%s", status, attempt)
+
+            if 200 <= status < 300:
+                return BookingCreated(booking_uuid=self._cart_booking_uuid_from(response), attempts=attempt)
+
+            if 500 <= status < 600:
+                logger.error(
+                    "easyweek_migration: create_cart_booking server error status=%s attempt=%s — outcome UNKNOWN",
+                    status,
+                    attempt,
+                )
+                raise EasyWeekUncertainMutation(
+                    "cart server error; outcome unknown",
+                    operation="create_cart_booking",
+                    status_code=status,
+                    attempts=attempt,
+                )
+
+            if status == 429:
+                last_retryable = EasyWeekRetryableError(
+                    "rate limited",
+                    operation="create_cart_booking",
+                    status_code=status,
+                    attempts=attempt,
+                )
+                if attempt < self._max_attempts:
+                    retry_after = _parse_retry_after(response.headers.get("Retry-After"))
+                    await self._sleep(retry_after if retry_after is not None else _backoff_delay(attempt))
+                    continue
+                break
+
+            # Permanent 4xx. The request was rejected and nothing was created —
+            # including the conflict a taken slot produces, which is how an
+            # unavailable source time reaches the operator as a named refusal
+            # rather than as a guess (plan §30.12.3).
+            fields = _safe_validation_fields(response)
+            detail = f"; fields: {', '.join(fields)}" if fields else ""
+            raise EasyWeekPermanentError(
+                f"cart mutation rejected{detail}",
+                operation="create_cart_booking",
+                status_code=status,
+                attempts=attempt,
+            )
+
+        assert last_retryable is not None
+        raise last_retryable
+
+    @staticmethod
+    def _cart_booking_uuid_from(response: httpx.Response) -> str:
+        """The ONE booking uuid a cart response is allowed to carry.
+
+        A 2xx we cannot read is not a success we can record: without a uuid there
+        is nothing to reconcile against and nothing to roll back. Neither is a
+        2xx naming several bookings — the ledger keys one source record to one
+        target, and picking one of two would leave the other unrecorded and
+        unrollbackable, which is worse than admitting we do not know.
+        """
+        try:
+            payload: Any = response.json()
+        except Exception:
+            raise EasyWeekUncertainMutation(
+                "cart mutation succeeded but the response was not JSON", operation="create_cart_booking"
+            ) from None
+
+        found: list[str] = []
+        for candidate in _cart_uuid_candidates(payload):
+            try:
+                canonical = _canonical_booking_uuid(candidate)
+            except EasyWeekPermanentError:
+                continue
+            if canonical not in found:
+                found.append(canonical)
+
+        if len(found) == 1:
+            return found[0]
+        if not found:
+            raise EasyWeekUncertainMutation(
+                "cart mutation succeeded but the response carried no usable booking uuid",
+                operation="create_cart_booking",
+            )
+        raise EasyWeekUncertainMutation(
+            f"cart mutation succeeded but the response named {len(found)} bookings",
+            operation="create_cart_booking",
         )
 
     async def get_booking(self, booking_uuid: str) -> dict[str, Any]:

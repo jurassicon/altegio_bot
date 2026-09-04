@@ -424,13 +424,16 @@ def test_a_string_staff_id_never_matches_an_integer_selector(manifest, directory
 # ---------------------------------------------------------------------------
 
 
-def test_a_multi_service_booking_is_blocked_not_flattened(manifest, directory, cutover):
+def test_a_three_service_booking_is_blocked_not_flattened(manifest, directory, cutover):
+    """Two is the widest shape a real canary proved; three has no evidence."""
     decision = classify(
         record(
             services=[
                 {"id": KA_SERVICE_ID, "cost": 90.0, "cost_to_pay": 90.0},
-                {"id": KA_SERVICE_ID, "cost": 30.0, "cost_to_pay": 30.0},
-            ]
+                {"id": KA_SERVICE_ID, "cost": 90.0, "cost_to_pay": 90.0},
+                {"id": KA_SERVICE_ID, "cost": 90.0, "cost_to_pay": 90.0},
+            ],
+            seance_length=10800,
         ),
         manifest=manifest,
         directory=directory,
@@ -438,6 +441,24 @@ def test_a_multi_service_booking_is_blocked_not_flattened(manifest, directory, c
     )
     assert decision.outcome == BLOCKED
     assert decision.reason == BLOCK_MULTI_SERVICE
+
+
+def test_a_two_service_booking_with_a_custom_price_is_still_blocked(manifest, directory, cutover):
+    """The cart contract needs standard prices; a discount is not one."""
+    decision = classify(
+        record(
+            services=[
+                {"id": KA_SERVICE_ID, "cost": 90.0, "cost_to_pay": 90.0},
+                {"id": KA_SERVICE_ID, "cost": 30.0, "cost_to_pay": 30.0},
+            ],
+            seance_length=7200,
+        ),
+        manifest=manifest,
+        directory=directory,
+        cutover=cutover,
+    )
+    assert decision.outcome == BLOCKED
+    assert decision.reason == "custom_price_unsupported"
 
 
 def test_a_custom_price_is_blocked_not_replaced_by_the_catalogue_price(manifest, directory, cutover):

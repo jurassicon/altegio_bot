@@ -30,6 +30,14 @@ from datetime import datetime
 from typing import Any, Final
 
 from altegio_bot.easyweek_migration.altegio_source import ACTIVE_ATTENDANCE
+from altegio_bot.easyweek_migration.bindings import (
+    MUTATION_CART_TWO,
+    MUTATION_SINGLE,
+    BindingError,
+    ServiceBinding,
+    total_duration_minutes,
+    validate_bindings,
+)
 from altegio_bot.easyweek_migration.customers import CustomerDirectory
 from altegio_bot.easyweek_migration.cutover import Cutover, LocalTimeError, parse_altegio_local_to_utc
 from altegio_bot.easyweek_migration.manifest import (
@@ -44,6 +52,7 @@ from altegio_bot.easyweek_migration.money import (
     amounts_differ,
     read_amount,
     read_duration_seconds,
+    to_minor_units,
 )
 
 # -- outcomes ---------------------------------------------------------------
@@ -84,6 +93,13 @@ BLOCK_SERVICE_MAPPING_MISSING: Final = "service_mapping_missing"
 BLOCK_SERVICE_ID_INVALID: Final = "service_id_invalid"
 BLOCK_NO_SERVICES: Final = "source_has_no_service"
 BLOCK_MULTI_SERVICE: Final = "multi_service_unsupported"
+# A two-service booking whose shape the cart canary did not prove: the same
+# service twice, two different masters, or two currencies.
+BLOCK_CART_UNSUPPORTED: Final = "cart_shape_unsupported"
+
+# The widest booking this migration can write. Two, and only because a real
+# canary created one and read it back (plan §30.12); three has no evidence.
+MAX_CART_SERVICES: Final = 2
 BLOCK_CUSTOM_DURATION: Final = "custom_duration_unsupported"
 BLOCK_CUSTOM_PRICE: Final = "custom_price_unsupported"
 BLOCK_DURATION_UNKNOWN: Final = "duration_unknown"
@@ -111,14 +127,45 @@ class Decision:
     source_record_id: int | None
     # Populated only for ``ready``: everything the writer needs, all proven.
     starts_at_utc: datetime | None = None
-    duration_minutes: int | None = None
     easyweek_location_uuid: str | None = None
     easyweek_staff_uuid: str | None = None
-    easyweek_service_uuid: str | None = None
     easyweek_customer_uuid: str | None = None
     source_fingerprint: str | None = None
+    # Which contract writes this booking, and what it is made of. One binding
+    # for `single`, two for `cart_two` — see `bindings`. The sequence is the
+    # source's own order and is canonical everywhere downstream.
+    mutation_kind: str = MUTATION_SINGLE
+    bindings: tuple[ServiceBinding, ...] = ()
     # Set when the ledger already knew this row.
     target_booking_uuid: str | None = None
+
+    @property
+    def easyweek_service_uuid(self) -> str | None:
+        """The single service's target uuid, or a refusal for a cart booking.
+
+        A convenience for the single-service write path, computed from the
+        bindings rather than stored beside them so the two can never disagree.
+        It REFUSES for `cart_two` rather than returning the first of two: a
+        caller reaching for "the service uuid" of a two-service booking is a
+        caller that has not been taught about carts, and quietly handing it one
+        of the pair is how half a booking gets written.
+        """
+        if not self.bindings:
+            return None
+        if self.mutation_kind != MUTATION_SINGLE:
+            raise BindingError("a cart booking has no single service uuid; read `bindings`")
+        return self.bindings[0].easyweek_service_uuid
+
+    @property
+    def duration_minutes(self) -> int | None:
+        """Total booked minutes: one service's, or the sum of the cart's two.
+
+        Safe for both kinds because a total is meaningful for both — unlike a
+        service uuid, of which a cart has two and no single answer.
+        """
+        if not self.bindings:
+            return None
+        return total_duration_minutes(self.bindings)
 
     def as_safe_dict(self) -> dict[str, Any]:
         """Ids, codes and a UTC instant. No phone, no name, no payload."""
@@ -130,6 +177,8 @@ class Decision:
             "starts_at_utc": self.starts_at_utc.isoformat().replace("+00:00", "Z")
             if self.starts_at_utc is not None
             else None,
+            "mutation_kind": self.mutation_kind,
+            "services": [item.as_safe_dict() for item in self.bindings],
             "target_booking_uuid": self.target_booking_uuid,
         }
 
@@ -168,15 +217,120 @@ def _services(record: dict[str, Any]) -> list[dict[str, Any]] | None:
     return [item for item in raw if isinstance(item, dict)]
 
 
+def _prove_service(
+    service: dict[str, Any],
+    *,
+    branch: BranchMapping,
+    staff_id: object,
+) -> ServiceBinding | str:
+    """One service line, proven against the manifest, or a block reason.
+
+    Extracted so a cart booking's second service goes through exactly the same
+    checks as its first — and as a single-service booking's only one. A second
+    copy of these rules is how one of two services would quietly migrate at a
+    price nobody reviewed.
+    """
+    service_id = _exact_int(service.get("id"))
+    if service_id is None or service_id <= 0:
+        return BLOCK_SERVICE_ID_INVALID
+
+    # Mapping first: price and duration are checked against a baseline an
+    # operator wrote down and verified. Without the mapping there is no
+    # baseline, so the override checks below would have nothing to compare
+    # against — and "nothing to compare against" must never read as "no
+    # override".
+    mapping = branch.service(service_id)
+    if mapping is None:
+        return BLOCK_SERVICE_MAPPING_MISSING
+    if not mapping.identity_complete:
+        # A writing mode needs the reviewed name and currency; without them
+        # there is nothing for a readback to compare a service line against.
+        return BLOCK_SERVICE_MAPPING_MISSING
+
+    # A per-booking price override has no proven EasyWeek equivalent. Migrating
+    # it as the catalogue price would quietly change what the customer was
+    # promised, so the row goes to a human instead.
+    #
+    # Every read below distinguishes ABSENT from ZERO. `cost=90, cost_to_pay=0`
+    # is a full discount, not a missing field, and the earlier "positive numbers
+    # only" helper silently dropped exactly that case — a booking promised free
+    # would have migrated at 90 EUR.
+    try:
+        price_to_pay = read_amount(service.get("cost_to_pay"))
+        listed_price = read_amount(service.get("cost"))
+        first_price = read_amount(service.get("first_cost"))
+        discount = read_amount(service.get("discount"))
+    except AmountError:
+        # NaN, infinity, a boolean, a negative or unparseable amount. Not a
+        # price we can reason about, so not a booking we migrate.
+        return BLOCK_PRICE_MALFORMED
+
+    catalog_price = mapping.catalog_price
+
+    # The booking must state a price at all: with none, there is nothing to
+    # compare to the catalogue and an override would be invisible.
+    if not price_to_pay.present and not listed_price.present:
+        return BLOCK_PRICE_BASELINE_MISSING
+
+    # Exact Decimal comparison throughout — a cent of difference IS the override.
+    for left, right in (
+        (price_to_pay, listed_price),
+        (first_price, listed_price),
+        (price_to_pay, catalog_price),
+        (listed_price, catalog_price),
+        (first_price, catalog_price),
+    ):
+        if amounts_differ(left, right):
+            return BLOCK_CUSTOM_PRICE
+    # A discount of zero is not a discount; any other stated discount is.
+    if discount.present and not discount.is_zero:
+        return BLOCK_CUSTOM_PRICE
+
+    # When Altegio DOES state the service's own length, it must equal the
+    # reviewed catalogue length — otherwise the manifest baseline has gone stale.
+    catalog_duration = mapping.catalog_duration
+    if catalog_duration.minutes is None:
+        return BLOCK_SERVICE_MAPPING_MISSING
+    try:
+        line_duration = read_duration_seconds(service.get("seance_length"))
+    except DurationError:
+        return BLOCK_CUSTOM_DURATION
+    if line_duration.present and line_duration.minutes != catalog_duration.minutes:
+        return BLOCK_CUSTOM_DURATION
+
+    staff_uuid = branch.staff_uuid(staff_id)
+    if staff_uuid is None:
+        return BLOCK_STAFF_MAPPING_MISSING
+
+    try:
+        price_minor = to_minor_units(catalog_price, currency=mapping.catalog_currency or "")
+    except AmountError:
+        # A currency this migration cannot express exactly. Comparing a readback
+        # against it would compare against a rounded number.
+        return BLOCK_PRICE_MALFORMED
+
+    assert mapping.catalog_service_name is not None
+    return ServiceBinding(
+        altegio_service_id=service_id,
+        easyweek_service_uuid=mapping.easyweek_service_uuid,
+        normalized_name=mapping.catalog_service_name,
+        currency=(mapping.catalog_currency or "").strip().upper(),
+        catalog_price_minor=price_minor,
+        catalog_duration_minutes=catalog_duration.minutes,
+        staffer_uuid=staff_uuid,
+    )
+
+
 def source_fingerprint(
     *,
     company_id: int,
     record_id: int,
     starts_at_utc: datetime,
     staff_uuid: str,
-    service_uuid: str,
-    duration_minutes: int,
     customer_uuid: str,
+    mutation_kind: str,
+    bindings: tuple[ServiceBinding, ...],
+    booked_duration_minutes: int,
 ) -> str:
     """Digest of the schedule identity this row was migrated as.
 
@@ -184,19 +338,26 @@ def source_fingerprint(
     in EasyWeek?". Nothing reversible to a person goes in — the customer appears
     as their EasyWeek UUID, which is an identifier we already store, not contact
     data.
+
+    Everything that decides WHAT would be written is folded in: the mutation
+    kind, every binding in the source's own order, and the booking's actual
+    length. Two services swapping places is a different request body, and a
+    catalogue price moving under an unchanged uuid is a different booking — so
+    both have to produce a different fingerprint, or a plan reviewed against the
+    old values would still look current.
     """
-    blob = "|".join(
-        [
-            str(company_id),
-            str(record_id),
-            starts_at_utc.isoformat(),
-            staff_uuid,
-            service_uuid,
-            str(duration_minutes),
-            customer_uuid,
-        ]
-    )
-    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+    parts = [
+        mutation_kind,
+        str(company_id),
+        str(record_id),
+        starts_at_utc.isoformat(),
+        staff_uuid,
+        str(booked_duration_minutes),
+        customer_uuid,
+    ]
+    for binding in bindings:
+        parts.extend(binding.digest_material())
+    return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -374,74 +535,35 @@ def classify_record(
         # deferred master's break is still somebody else's wave. The exclusion
         # cannot be used to launder a row past those checks.
         return _skip(SKIP_EMPTY_SERVICES)
-    if len(services) > 1:
-        # EasyWeek's representation of a multi-service booking is not proven, so
-        # it is refused outright rather than flattened to "the first service".
+    if len(services) > MAX_CART_SERVICES:
+        # Three or more. The cart canary proved a two-service booking and
+        # nothing wider, so anything larger is still refused outright rather
+        # than flattened to "the first service".
         return _block(BLOCK_MULTI_SERVICE)
 
-    service = services[0]
-    service_id = _exact_int(service.get("id"))
-    if service_id is None or service_id <= 0:
-        return _block(BLOCK_SERVICE_ID_INVALID)
+    # -- 3a. every service, proven against its own reviewed baseline --------
+    # One binding per service, in the SOURCE's order. That order is canonical
+    # from here on: it is what the request body sends, what the fingerprint
+    # covers and what a readback compares against.
+    kind = MUTATION_SINGLE if len(services) == 1 else MUTATION_CART_TWO
+    bindings: list[ServiceBinding] = []
+    for service in services:
+        proven = _prove_service(service, branch=branch, staff_id=staff_id)
+        if isinstance(proven, str):
+            return _block(proven)
+        bindings.append(proven)
 
-    # -- 3a. mapping first: the catalogue baseline lives in the manifest -----
-    # Price and duration are checked against a baseline an operator wrote down
-    # and verified. Without the mapping there is no baseline, so the override
-    # checks below would have nothing to compare against — and "nothing to
-    # compare against" must never read as "no override".
-    service_mapping = branch.service(service_id)
-    if service_mapping is None:
-        return _block(BLOCK_SERVICE_MAPPING_MISSING)
-    service_uuid = service_mapping.easyweek_service_uuid
-
-    # A per-booking price override has no proven EasyWeek equivalent. Migrating
-    # it as the catalogue price would quietly change what the customer was
-    # promised, so the row goes to a human instead.
-    #
-    # Every read below distinguishes ABSENT from ZERO. `cost=90, cost_to_pay=0`
-    # is a full discount, not a missing field, and the earlier "positive numbers
-    # only" helper silently dropped exactly that case — a booking promised free
-    # would have migrated at 90 EUR.
-    try:
-        price_to_pay = read_amount(service.get("cost_to_pay"))
-        listed_price = read_amount(service.get("cost"))
-        first_price = read_amount(service.get("first_cost"))
-        discount = read_amount(service.get("discount"))
-    except AmountError:
-        # NaN, infinity, a boolean, a negative or unparseable amount. Not a
-        # price we can reason about, so not a booking we migrate.
-        return _block(BLOCK_PRICE_MALFORMED)
-
-    catalog_price = service_mapping.catalog_price
-
-    # The booking must state a price at all: with none, there is nothing to
-    # compare to the catalogue and an override would be invisible.
-    if not price_to_pay.present and not listed_price.present:
-        return _block(BLOCK_PRICE_BASELINE_MISSING)
-
-    # Exact Decimal comparison throughout — a cent of difference IS the override.
-    if amounts_differ(price_to_pay, listed_price):
-        return _block(BLOCK_CUSTOM_PRICE)
-    if amounts_differ(first_price, listed_price):
-        return _block(BLOCK_CUSTOM_PRICE)
-    if amounts_differ(price_to_pay, catalog_price):
-        return _block(BLOCK_CUSTOM_PRICE)
-    if amounts_differ(listed_price, catalog_price):
-        return _block(BLOCK_CUSTOM_PRICE)
-    if amounts_differ(first_price, catalog_price):
-        return _block(BLOCK_CUSTOM_PRICE)
-    # A discount of zero is not a discount; any other stated discount is.
-    if discount.present and not discount.is_zero:
-        return _block(BLOCK_CUSTOM_PRICE)
-
-    # -- 4. duration -------------------------------------------------------
+    # -- 4. duration: the BOOKING's length against the catalogue total ------
     # The booking's own length, and the catalogue length it must equal. The
     # manifest always supplies the second one; Altegio does not always repeat it
     # on the booking row, and treating that silence as "no override" is how a
     # hand-stretched slot used to pass.
+    #
+    # For a cart booking the comparison is against the SUM: the canary's 180
+    # minutes were two standard services back to back, and a source slot that
+    # does not add up to them is a hand-adjusted booking, not a cart.
     try:
         booking_duration = read_duration_seconds(record.get("seance_length"))
-        service_duration = read_duration_seconds(service.get("seance_length"))
     except DurationError:
         # Zero, negative, fractional-second, non-finite or malformed.
         return _block(BLOCK_CUSTOM_DURATION)
@@ -451,16 +573,17 @@ def classify_record(
     assert booking_duration.minutes is not None
     duration_minutes = booking_duration.minutes
 
-    catalog_duration = service_mapping.catalog_duration
-    assert catalog_duration.minutes is not None
-    if duration_minutes != catalog_duration.minutes:
-        # A slot that does not match its service's catalogue length. EasyWeek's
+    if duration_minutes != total_duration_minutes(tuple(bindings)):
+        # A slot that does not match its services' catalogue length. EasyWeek's
         # custom-duration representation is not proven, so it is not guessed.
         return _block(BLOCK_CUSTOM_DURATION)
-    # When Altegio DOES state the service's own length, it must agree too —
-    # otherwise the manifest baseline has gone stale against the live catalogue.
-    if service_duration.present and service_duration.minutes != duration_minutes:
-        return _block(BLOCK_CUSTOM_DURATION)
+
+    try:
+        validate_bindings(kind, tuple(bindings))
+    except BindingError:
+        # Two lines on one catalogue entry, two different masters, or two
+        # currencies. Each is a shape the canary did not prove.
+        return _block(BLOCK_CART_UNSUPPORTED)
 
     # -- 5. staff mapping: exact, or blocked -------------------------------
     # A selected master is guaranteed a mapping by the manifest parser; this stays
@@ -485,9 +608,10 @@ def classify_record(
         record_id=record_id,
         starts_at_utc=starts_at,
         staff_uuid=staff_uuid,
-        service_uuid=service_uuid,
-        duration_minutes=duration_minutes,
         customer_uuid=customer_uuid,
+        mutation_kind=kind,
+        bindings=tuple(bindings),
+        booked_duration_minutes=duration_minutes,
     )
 
     # -- 7. has this already been migrated? --------------------------------
@@ -531,11 +655,11 @@ def classify_record(
                 source_company_id=company_id,
                 source_record_id=record_id,
                 starts_at_utc=starts_at,
-                duration_minutes=duration_minutes,
                 easyweek_location_uuid=branch.easyweek_location_uuid,
                 easyweek_staff_uuid=staff_uuid,
-                easyweek_service_uuid=service_uuid,
                 easyweek_customer_uuid=customer_uuid,
+                mutation_kind=kind,
+                bindings=tuple(bindings),
                 target_booking_uuid=ledger.target_booking_uuid,
                 source_fingerprint=fingerprint,
             )
@@ -548,10 +672,10 @@ def classify_record(
         source_company_id=company_id,
         source_record_id=record_id,
         starts_at_utc=starts_at,
-        duration_minutes=duration_minutes,
         easyweek_location_uuid=branch.easyweek_location_uuid,
         easyweek_staff_uuid=staff_uuid,
-        easyweek_service_uuid=service_uuid,
         easyweek_customer_uuid=customer_uuid,
+        mutation_kind=kind,
+        bindings=tuple(bindings),
         source_fingerprint=fingerprint,
     )

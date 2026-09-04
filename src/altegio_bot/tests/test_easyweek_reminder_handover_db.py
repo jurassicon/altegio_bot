@@ -2005,3 +2005,59 @@ async def test_an_unanswerable_ownership_lookup_never_sends(session_maker, seede
     no_meta.assert_not_awaited()
     async with session_maker() as session:
         assert (await session.execute(select(OutboxMessage))).scalars().all() == []
+
+
+@pytest.mark.asyncio
+async def test_a_corrupt_marker_is_refused_rather_than_crashing(session_maker, seeded, monkeypatch) -> None:
+    """Half a marker keeps the row out of the wave, and says why.
+
+    The database CHECK makes this state unreachable through every supported
+    path, so it can only come from a row written directly. That is precisely
+    when a defensive branch has to work — and this one called its own helper
+    with the wrong arity, so instead of refusing the row it raised TypeError and
+    took the whole plan down with it.
+
+    The corruption is injected at the boundary rather than in the table: writing
+    it for real is impossible, and weakening the CHECK to make the test easy
+    would remove the protection the test exists to complement.
+    """
+    from altegio_bot.easyweek_migration import reminder_handover_db as db
+
+    async with session_maker() as session:
+        entry = (await session.execute(select(EasyWeekMigrationLedger))).scalars().one()
+        corrupt = SimpleNamespace(
+            id=entry.id,
+            status=entry.status,
+            source_provider=entry.source_provider,
+            source_company_id=entry.source_company_id,
+            source_record_id=entry.source_record_id,
+            target_provider=entry.target_provider,
+            target_booking_uuid=entry.target_booking_uuid,
+            # The instant without the digest: the forbidden half.
+            reminders_handed_over_at=datetime.now(timezone.utc),
+            reminder_handover_plan_digest=None,
+        )
+
+    async def _corrupt_rows(*_args, **_kwargs):
+        return [corrupt]
+
+    monkeypatch.setattr(db, "_ledger_rows", _corrupt_rows)
+
+    client = FakeBookings(booking_body(seeded["starts"]))
+    jobs_before = {job.id: job.status for job in await jobs(session_maker)}
+
+    async with session_maker() as session:
+        plan = await db.build_plan(
+            session,
+            manifest=wave_manifest(),
+            company_ids=(COMPANY,),
+            client=client,
+            sleep=_no_sleep,
+        )
+
+    assert plan.scoped == ()
+    assert [item.reason for item in plan.eligible_refusals] == ["marker_incomplete"]
+    assert [item.ledger_id for item in plan.eligible_refusals] == [entry.id]
+    assert client.calls == [], "a corrupt row is refused before any API call"
+    assert {job.id: job.status for job in await jobs(session_maker)} == jobs_before
+    assert await ledger_marker(session_maker) == (None, None), "the real row is untouched"

@@ -38,6 +38,7 @@ from altegio_bot.easyweek_migration import baseline_store
 from altegio_bot.easyweek_migration import ledger as ledger_module
 from altegio_bot.easyweek_migration.altegio_source import build_window, fetch_company_records
 from altegio_bot.easyweek_migration.baseline_store import load_baselines
+from altegio_bot.easyweek_migration.bindings import MUTATION_CART_TWO, MUTATION_SINGLE
 from altegio_bot.easyweek_migration.branch_identity import BranchIdentityResult, verify_branch_identity
 from altegio_bot.easyweek_migration.canary import (
     CANARY_IDENTITY_REQUIRED,
@@ -136,9 +137,30 @@ from altegio_bot.easyweek_migration.write_client import (
     EasyWeekMigrationWriteClient,
     EasyWeekUncertainMutation,
     build_booking_request,
+    build_cart_booking_request,
 )
 
 logger = logging.getLogger("easyweek_migration.runner")
+
+# The mutation contracts this build can actually write END TO END. A decision
+# naming anything else is refused before the ledger claim: a contract with no
+# complete path is a row for a person, not an exception thrown half-way through
+# a bulk apply.
+#
+# `cart_two` is deliberately NOT here yet. Its classification, its request
+# builder, its write client and its canary isolation are all in place and
+# tested — what is missing is the readback: `TargetSnapshot` projects ONE
+# service, and proving a two-line booking needs it to carry both signatures,
+# which changes the fingerprint the ledger already stores for every migrated
+# single booking.
+#
+# Creating a real appointment we could not then prove is worse than not creating
+# it, so the gate stays shut until the readback proves two lines. Adding
+# `MUTATION_CART_TWO` here without that would write bookings whose correctness
+# nothing checks.
+SUPPORTED_MUTATION_KINDS: Final[frozenset[str]] = frozenset({MUTATION_SINGLE})
+# Stable, PII-free reason for that refusal.
+BLOCK_CONTRACT_UNSUPPORTED: Final = "mutation_contract_unsupported"
 
 MODE_INVENTORY: Final = "inventory"
 MODE_DRY_RUN: Final = "dry-run"
@@ -1004,8 +1026,20 @@ async def _apply_one(
     assert decision.duration_minutes is not None
     assert decision.easyweek_location_uuid is not None
     assert decision.easyweek_staff_uuid is not None
-    assert decision.easyweek_service_uuid is not None
     assert decision.easyweek_customer_uuid is not None
+
+    # Which contract writes this booking. The cart endpoint has its own proven
+    # body and its own readback shape (plan §30.12), and the two must not be
+    # confused: reaching for a single service uuid on a two-service booking
+    # would either write half of it or raise mid-apply.
+    #
+    # An unknown kind refuses HERE, before the ledger is claimed and before any
+    # request leaves — a contract this build cannot write is a row for a person,
+    # never a crash inside a bulk run.
+    if decision.mutation_kind not in SUPPORTED_MUTATION_KINDS:
+        return BLOCKED, BLOCK_CONTRACT_UNSUPPORTED
+    if decision.mutation_kind == MUTATION_SINGLE:
+        assert decision.easyweek_service_uuid is not None
 
     company_id = decision.source_company_id
     record_id = decision.source_record_id
@@ -1086,18 +1120,38 @@ async def _apply_one(
     marker = ledger_module.migration_marker(source_company_id=company_id, source_record_id=record_id)
     starts_at_iso = decision.starts_at_utc.isoformat().replace("+00:00", "Z")
 
-    body = build_booking_request(
-        location_uuid=decision.easyweek_location_uuid,
-        staffer_uuid=decision.easyweek_staff_uuid,
-        service_uuid=decision.easyweek_service_uuid,
-        customer_phone=card.phone,
-        customer_first_name=card.first_name or "",
-        reserved_on_utc_iso=starts_at_iso,
-        comment=marker,
-    )
+    # The endpoint follows the contract, and only the contract. `single` is the
+    # plain `POST /bookings` this migration has always used; `cart_two` is the
+    # `POST /bookings/cart` a real canary proved for exactly two services on one
+    # master (plan §30.12). Each has its own body builder, and neither builder
+    # accepts the other's shape.
+    if decision.mutation_kind == MUTATION_CART_TWO:
+        body = build_cart_booking_request(
+            location_uuid=decision.easyweek_location_uuid,
+            customer_phone=card.phone,
+            customer_first_name=card.first_name or "",
+            datetime_start_utc_iso=starts_at_iso,
+            comment=marker,
+            # The source's own order, unchanged from the plan the operator
+            # reviewed and from the fingerprint that covers it.
+            services=[(item.easyweek_service_uuid, item.staffer_uuid) for item in decision.bindings],
+        )
+    else:
+        body = build_booking_request(
+            location_uuid=decision.easyweek_location_uuid,
+            staffer_uuid=decision.easyweek_staff_uuid,
+            service_uuid=decision.easyweek_service_uuid,
+            customer_phone=card.phone,
+            customer_first_name=card.first_name or "",
+            reserved_on_utc_iso=starts_at_iso,
+            comment=marker,
+        )
 
     try:
-        created = await write_client.create_booking(body)
+        if decision.mutation_kind == MUTATION_CART_TWO:
+            created = await write_client.create_cart_booking(body)
+        else:
+            created = await write_client.create_booking(body)
     except EasyWeekUncertainMutation as exc:
         async with session_maker() as session:
             async with session.begin():

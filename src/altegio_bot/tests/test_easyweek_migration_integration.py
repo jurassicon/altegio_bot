@@ -34,6 +34,7 @@ from pathlib import Path
 import pytest
 import pytest_asyncio
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from altegio_bot.settings import Settings
@@ -296,13 +297,59 @@ async def test_migration_compatibility_scenarios(temp_db_url) -> None:
     for column in ("source_provider", "source_company_id", "source_record_id"):
         assert column in handover_index, f"the fence looks up by source identity: {handover_index}"
 
-    # And the CHECK is real, not merely declared: half a marker must be refused.
+    # And the CHECK is real, not merely declared.
+    #
+    # This needs a ROW. An UPDATE over an empty table touches nothing, so the
+    # constraint is never evaluated and `pytest.raises` fails — which is exactly
+    # what the first version of this test did, turning a mandatory CI check into
+    # one that could not pass. So: insert one minimal valid ledger row, prove
+    # each forbidden half is rejected, and then prove the legal pair is accepted.
+    await _exec(
+        temp_db_url,
+        f"INSERT INTO {_LEDGER_TABLE} "
+        "(source_provider, source_company_id, source_record_id, source_fingerprint, "
+        " target_provider, run_id, status) "
+        "VALUES ('altegio', 758285, 900001, repeat('f', 64), 'easyweek', 'check-probe', 'pending')",
+    )
+
+    # Each negative case in its own transaction: `_exec` opens and disposes one
+    # per call, so a failed statement cannot leave the next one running inside an
+    # aborted transaction and failing for the wrong reason.
     for half in (
         f"UPDATE {_LEDGER_TABLE} SET {_HANDOVER_AT_COLUMN} = now()",
         f"UPDATE {_LEDGER_TABLE} SET {_HANDOVER_DIGEST_COLUMN} = repeat('a', 64)",
     ):
-        with pytest.raises(Exception):
+        with pytest.raises(IntegrityError) as refused:
             await _exec(temp_db_url, half)
+        assert _HANDOVER_CHECK in str(refused.value), (
+            f"a different constraint refused this, not the marker CHECK: {refused.value}"
+        )
+
+    marker_state = await _fetch(
+        temp_db_url,
+        f"SELECT {_HANDOVER_AT_COLUMN}, {_HANDOVER_DIGEST_COLUMN} FROM {_LEDGER_TABLE}",
+    )
+    assert marker_state[0] == (None, None), "a refused UPDATE must have changed nothing"
+
+    # The legal pair goes through, so the CHECK is not simply rejecting writes.
+    await _exec(
+        temp_db_url,
+        f"UPDATE {_LEDGER_TABLE} SET {_HANDOVER_AT_COLUMN} = now(), {_HANDOVER_DIGEST_COLUMN} = repeat('a', 64)",
+    )
+    accepted = await _fetch(
+        temp_db_url,
+        f"SELECT {_HANDOVER_AT_COLUMN} IS NOT NULL, {_HANDOVER_DIGEST_COLUMN} FROM {_LEDGER_TABLE}",
+    )
+    assert accepted[0][0] is True
+    assert accepted[0][1] == "a" * 64
+
+    # Clearing both together is equally legal — ownership can only be recorded
+    # or absent, never half of either.
+    await _exec(
+        temp_db_url,
+        f"UPDATE {_LEDGER_TABLE} SET {_HANDOVER_AT_COLUMN} = NULL, {_HANDOVER_DIGEST_COLUMN} = NULL",
+    )
+    await _exec(temp_db_url, f"DELETE FROM {_LEDGER_TABLE} WHERE run_id = 'check-probe'")
 
     current = _alembic_ok("current", db_url=temp_db_url)
     assert _HEAD_REVISION in current

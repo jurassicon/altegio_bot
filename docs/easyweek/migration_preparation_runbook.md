@@ -336,11 +336,12 @@ apply воркер останавливается лишь на время од�
 
 Смотреть также `rows_with_blockers` (канонический ключ занят
 canceled/failed-заданием — решает человек, автоматически не переоткрывается) и
-`rows_with_processing_source_jobs`. Snapshot v2 содержит и защищает digest-ом
+`rows_with_processing_source_jobs`. Snapshot **v3** содержит и защищает digest-ом
 весь eligible `status=created` scope, отказы доказательства, readiness, identity
-строк, каждое obligation и полный список старых job ID. Старый snapshot v1 или v2,
-повреждённый JSON, неизвестное поле или изменение `created_at` write не
-разрешают. Нулевая или частично доказанная волна никогда не бывает
+строк, каждое obligation, полный список старых job ID и ожидаемое состояние
+ownership marker каждой ledger-строки. Любой snapshot более ранней версии — v1
+или v2, — повреждённый JSON, неизвестное поле или изменение `created_at` write
+не разрешают. Нулевая или частично доказанная волна никогда не бывает
 `cutover_ready`.
 
 ### 6b.3 Apply
@@ -409,9 +410,10 @@ test "$(dc ps --status running -q altegio-outbox-worker | wc -l | tr -d ' ')" -e
 Если хотя бы одно относящееся к scope старое задание оказалось в
 `status=processing`, apply останавливается целиком и не меняет ничего.
 
-Успешный apply после commit атомарно пишет приватный PII-free apply report v1.
+Успешный apply после commit атомарно пишет приватный PII-free apply report **v2**.
 В нём находятся snapshot version/digest, company scope, created/canceled job
-IDs и counts, already-present count и scoped Outbox before/after evidence.
+IDs и counts, already-present count, ID и счётчики проставленных и уже
+существовавших ownership markers, и scoped Outbox before/after evidence.
 Verify не принимает отчёт от другого snapshot или отредактированный отчёт.
 
 ### 6b.4 Verify

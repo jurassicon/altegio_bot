@@ -590,3 +590,36 @@ def test_the_runbook_names_the_new_refusal_codes(handover: str) -> None:
         "ledger_rows_with_foreign_marker",
     ):
         assert code in text, code
+
+
+def test_the_prose_names_the_same_versions_the_commands_use(handover: str) -> None:
+    """Version drift between the commands and the text is a real failure mode.
+
+    An operator reads the prose to know what the artefact is, and copies the
+    command to produce it. When the two disagreed — the commands already said v3
+    and v2 while the text still described v1 and v2 — the description of what a
+    snapshot protects belonged to a format that no longer authorises a write.
+    """
+    from altegio_bot.easyweek_migration.reminder_handover import APPLY_REPORT_VERSION, SNAPSHOT_VERSION
+
+    text = prose(handover)
+
+    assert f"Snapshot **v{SNAPSHOT_VERSION}**" in text
+    assert f"apply report **v{APPLY_REPORT_VERSION}**" in text
+    assert f"Snapshot v{SNAPSHOT_VERSION - 1} содержит" not in text
+    assert f"apply report v{APPLY_REPORT_VERSION - 1}." not in text
+
+
+def test_the_prose_says_older_snapshots_authorise_nothing(handover: str) -> None:
+    text = prose(handover)
+
+    assert "более ранней версии" in text
+    assert "write\nне разрешают" in handover or "не разрешают" in text
+
+
+def test_the_prose_describes_the_marker_evidence_in_the_report(handover: str) -> None:
+    """The report gained marker evidence when it went to v2; the text must say so."""
+    text = prose(handover)
+
+    assert "ownership markers" in text
+    assert "проставленных и уже" in text

@@ -279,6 +279,29 @@ async def build_plan(
             _refuse(entry, ROW_BRANCH_UNPROVEN)
             continue
 
+        # The durable ownership marker as it stands right now. Read BEFORE the
+        # live booking read: it is a local field, and a row whose marker cannot
+        # be interpreted must not spend an API request or a slice of the 60/min
+        # budget on its way to being refused.
+        #
+        # A row that already carries a marker is reported as such rather than
+        # re-marked: the handover is a one-way, once-per-booking transfer, and
+        # re-writing the instant would erase when it actually happened.
+        if entry.reminders_handed_over_at is None and not entry.reminder_handover_plan_digest:
+            marker_action = MARKER_SET
+            marker_digest = None
+            marker_at = None
+        elif entry.reminders_handed_over_at is not None and entry.reminder_handover_plan_digest:
+            marker_action = MARKER_ALREADY
+            marker_digest = entry.reminder_handover_plan_digest
+            marker_at = handover_timestamp(_aware(entry.reminders_handed_over_at))
+        else:
+            # Half a marker. The database CHECK forbids it, so a row in this
+            # state was written outside every supported path — which is exactly
+            # when a defensive branch has to refuse cleanly rather than raise.
+            _refuse(entry, ROW_MARKER_INCOMPLETE)
+            continue
+
         if api_calls:
             await pause(pause_sec)
         api_calls += 1
@@ -312,24 +335,6 @@ async def build_plan(
 
         existing = await _existing_reminder_jobs(session, target.id)
         queued, processing = await _source_reminder_jobs(session, source.id)
-
-        # The durable ownership marker as it stands right now. A row that already
-        # carries one is reported as such rather than re-marked: the handover is
-        # a one-way, once-per-booking transfer, and re-writing the instant would
-        # erase when it actually happened.
-        if entry.reminders_handed_over_at is None and not entry.reminder_handover_plan_digest:
-            marker_action = MARKER_SET
-            marker_digest = None
-            marker_at = None
-        elif entry.reminders_handed_over_at is not None and entry.reminder_handover_plan_digest:
-            marker_action = MARKER_ALREADY
-            marker_digest = entry.reminder_handover_plan_digest
-            marker_at = handover_timestamp(_aware(entry.reminders_handed_over_at))
-        else:
-            # Half a marker. The database CHECK forbids it, so a row in this
-            # state was written outside every supported path.
-            _refuse(ROW_MARKER_INCOMPLETE)
-            continue
 
         rows.append(
             HandoverRow(

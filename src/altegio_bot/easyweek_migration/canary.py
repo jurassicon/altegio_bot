@@ -47,6 +47,7 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from altegio_bot.easyweek_migration.bindings import MUTATION_KINDS, MUTATION_SINGLE
 from altegio_bot.easyweek_migration.branch_identity import BranchIdentityResult
 from altegio_bot.easyweek_migration.target_snapshot import (
     REQUEST_SCHEMA_VERSION,
@@ -103,7 +104,10 @@ class CanaryBinding:
                                  ``starts_before_cutover`` and stops checking them;
     ``horizon_days``             a narrower horizon drops the far end of the wave;
     ``branch_identity_digest``   a re-pointed branch proves a different salon;
-    ``request_schema_version``   a changed request shape was never canaried.
+    ``request_schema_version``   a changed request shape was never canaried;
+    ``contract_kind``            a different endpoint and body entirely — a
+                                 single-service canary has proven nothing about
+                                 the cart path, and vice versa (plan §30.12).
     """
 
     manifest_digest: str
@@ -112,6 +116,7 @@ class CanaryBinding:
     cutover_at: datetime
     horizon_days: int
     branch_identity_digest: str
+    contract_kind: str = MUTATION_SINGLE
 
     @property
     def wave_identity(self) -> str:
@@ -126,6 +131,7 @@ class CanaryBinding:
                 self.manifest_digest,
                 self.staff_scope_digest,
                 self.request_schema_version,
+                self.contract_kind,
                 self.cutover_at.isoformat(),
                 str(self.horizon_days),
                 self.branch_identity_digest,
@@ -139,6 +145,7 @@ class CanaryBinding:
             "manifest_digest": self.manifest_digest,
             "staff_scope_digest": self.staff_scope_digest,
             "request_schema_version": self.request_schema_version,
+            "contract_kind": self.contract_kind,
             "cutover_at": self.cutover_at.isoformat().replace("+00:00", "Z"),
             "horizon_days": self.horizon_days,
             "branch_identity_digest": self.branch_identity_digest,
@@ -152,7 +159,10 @@ def build_binding(
     cutover_at: datetime,
     horizon_days: int,
     branch_result: BranchIdentityResult,
+    contract_kind: str = MUTATION_SINGLE,
 ) -> CanaryBinding:
+    if contract_kind not in MUTATION_KINDS:
+        raise ValueError(f"unknown mutation contract: {contract_kind!r}")
     return CanaryBinding(
         manifest_digest=manifest_digest,
         staff_scope_digest=staff_scope_digest,
@@ -160,6 +170,7 @@ def build_binding(
         cutover_at=cutover_at.astimezone(timezone.utc),
         horizon_days=horizon_days,
         branch_identity_digest=branch_identity_digest(branch_result),
+        contract_kind=contract_kind,
     )
 
 
@@ -215,6 +226,7 @@ async def record_proof(
         "staff_scope_digest": binding.staff_scope_digest,
         "horizon_days": binding.horizon_days,
         "request_schema_version": binding.request_schema_version,
+        "contract_kind": binding.contract_kind,
         "cutover_at": binding.cutover_at,
         "branch_identity_digest": binding.branch_identity_digest,
         "verified": verified,
@@ -264,6 +276,7 @@ async def find_licensing_proof(session: AsyncSession, *, binding: CanaryBinding)
             .where(
                 EasyWeekMigrationCanaryProof.manifest_digest == binding.manifest_digest,
                 EasyWeekMigrationCanaryProof.request_schema_version == binding.request_schema_version,
+                EasyWeekMigrationCanaryProof.contract_kind == binding.contract_kind,
                 EasyWeekMigrationCanaryProof.cutover_at == binding.cutover_at,
                 EasyWeekMigrationCanaryProof.branch_identity_digest == binding.branch_identity_digest,
                 EasyWeekMigrationCanaryProof.staff_scope_digest == binding.staff_scope_digest,
@@ -322,6 +335,10 @@ SCOPE_CUTOVER_MISMATCH: Final = "migration_scope_cutover_mismatch"
 SCOPE_HORIZON_MISMATCH: Final = "migration_scope_horizon_mismatch"
 SCOPE_BRANCH_MISMATCH: Final = "migration_scope_branch_mismatch"
 SCOPE_SCHEMA_MISMATCH: Final = "migration_scope_schema_mismatch"
+# The stored proof exercised a different mutation contract — `single` against
+# `POST /bookings`, or `cart_two` against `POST /bookings/cart`. Different
+# endpoint, different body, different readback, so it proves nothing here.
+SCOPE_CONTRACT_MISMATCH: Final = "migration_scope_contract_mismatch"
 SCOPE_PROVEN: Final = "migration_scope_proven"
 
 # The one narrow admission that lets an UNVERIFIED proof be used — and only
@@ -364,6 +381,7 @@ def _stored_binding(row: EasyWeekMigrationCanaryProof) -> CanaryBinding | None:
         cutover_at=row.cutover_at.astimezone(timezone.utc),
         horizon_days=row.horizon_days,
         branch_identity_digest=row.branch_identity_digest,
+        contract_kind=row.contract_kind,
     )
 
 
@@ -386,6 +404,10 @@ def _first_difference(stored: CanaryBinding, current: CanaryBinding) -> str:
         return SCOPE_BRANCH_MISMATCH
     if stored.request_schema_version != current.request_schema_version:
         return SCOPE_SCHEMA_MISMATCH
+    if stored.contract_kind != current.contract_kind:
+        # A single-service canary licensing a cart bulk, or the reverse. Named
+        # separately because the fix is a whole extra canary run, not an edit.
+        return SCOPE_CONTRACT_MISMATCH
     # Unreachable while `wave_identity` covers exactly these fields; kept so a
     # future field cannot silently pass as "no difference".
     return SCOPE_AMBIGUOUS
@@ -422,6 +444,7 @@ async def find_proven_scope(session: AsyncSession, *, binding: CanaryBinding) ->
                 EasyWeekMigrationCanaryProof.manifest_digest == binding.manifest_digest,
                 EasyWeekMigrationCanaryProof.staff_scope_digest == binding.staff_scope_digest,
                 EasyWeekMigrationCanaryProof.request_schema_version == binding.request_schema_version,
+                EasyWeekMigrationCanaryProof.contract_kind == binding.contract_kind,
                 EasyWeekMigrationCanaryProof.cutover_at == binding.cutover_at,
                 EasyWeekMigrationCanaryProof.horizon_days == binding.horizon_days,
                 EasyWeekMigrationCanaryProof.branch_identity_digest == binding.branch_identity_digest,
@@ -533,6 +556,7 @@ async def find_recoverable_canary_attempt(
                 EasyWeekMigrationCanaryProof.manifest_digest == binding.manifest_digest,
                 EasyWeekMigrationCanaryProof.staff_scope_digest == binding.staff_scope_digest,
                 EasyWeekMigrationCanaryProof.request_schema_version == binding.request_schema_version,
+                EasyWeekMigrationCanaryProof.contract_kind == binding.contract_kind,
                 EasyWeekMigrationCanaryProof.cutover_at == binding.cutover_at,
                 EasyWeekMigrationCanaryProof.horizon_days == binding.horizon_days,
                 EasyWeekMigrationCanaryProof.branch_identity_digest == binding.branch_identity_digest,
