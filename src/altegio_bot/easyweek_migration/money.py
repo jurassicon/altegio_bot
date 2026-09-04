@@ -174,6 +174,23 @@ class DurationError(ValueError):
     """A duration field could not be read as a whole number of minutes."""
 
 
+def from_minor_units(minor: int, *, currency: str) -> Decimal:
+    """Exact decimal for an integer of minor units, or raise.
+
+    The inverse of :func:`to_minor_units`, and it reads the exponent from the
+    same table rather than dividing by a hard-coded 100 — a currency with no
+    minor unit, or three of them, would silently be shown at the wrong scale, and
+    a price shown wrong is a baseline confirmed wrong.
+    """
+    code = currency.strip().upper() if isinstance(currency, str) else ""
+    exponent = MINOR_UNIT_EXPONENT.get(code)
+    if exponent is None:
+        raise AmountError("currency is not supported for minor-unit comparison")
+    if isinstance(minor, bool) or not isinstance(minor, int):
+        raise AmountError("minor units must be an integer")
+    return Decimal(minor).scaleb(-exponent)
+
+
 def read_duration_seconds(raw: object) -> Duration:
     """Read a duration given in seconds and return it in whole minutes.
 

@@ -122,11 +122,10 @@ from altegio_bot.easyweek_migration.service_catalog import (
     CatalogSnapshot,
     ServiceBaseline,
     ServiceEvidenceError,
-    build_catalog_snapshot,
     expectation_from_manifest,
     prove_ordered_service,
+    read_full_catalog,
     read_ordered_service,
-    read_pagination,
     verify_baseline,
 )
 from altegio_bot.easyweek_migration.target_snapshot import (
@@ -289,32 +288,8 @@ class ServiceEvidence:
         Goes through the shared client, so the existing rate limiter and its
         bounded, safe GET retries still apply. Nothing here fans out.
         """
-        rows: list[Any] = []
-        page = 1
-        while True:
-            try:
-                payload = await write_client.list_location_services(location_uuid, page=page)
-            except EasyWeekError:
-                return self._refuse(location_uuid, CATALOG_UNREADABLE)
-            data = payload.get("data")
-            if not isinstance(data, list):
-                return self._refuse(location_uuid, CATALOG_UNREADABLE)
-            try:
-                last_page, total = read_pagination(payload.get("meta"), page=page)
-            except ServiceEvidenceError as exc:
-                return self._refuse(location_uuid, exc.reason)
-            rows.extend(data)
-            if page >= last_page:
-                if len(rows) != total:
-                    # A page set that does not add up to the stated total is a
-                    # partial catalogue, and a partial catalogue cannot prove
-                    # that anything in it is unique.
-                    return self._refuse(location_uuid, CATALOG_UNREADABLE)
-                break
-            page += 1
-
         try:
-            snapshot = build_catalog_snapshot(location_uuid, rows)
+            snapshot = await read_full_catalog(write_client, location_uuid=location_uuid)
         except ServiceEvidenceError as exc:
             return self._refuse(location_uuid, exc.reason)
         self._observations += 1

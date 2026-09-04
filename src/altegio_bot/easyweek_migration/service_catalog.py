@@ -46,8 +46,9 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
-from typing import Any, Final
+from typing import Any, Final, Protocol
 
+from altegio_bot.easyweek_client import EasyWeekError
 from altegio_bot.easyweek_migration.manifest import (
     ServiceMapping,
     canonical_service_name,
@@ -146,6 +147,13 @@ class CatalogService:
     currency: str
     price_minor: int
     duration_minutes: int
+    # The name exactly as the catalogue wrote it. Never compared and never part
+    # of `attributes` or the snapshot digest — identity is judged on the
+    # normalised form, and always has been. It exists so an operator reviewing a
+    # mapping sees the catalogue's own capitalisation instead of a case-folded
+    # rendering of it, which is harder to recognise and easy to mistake for a
+    # different entry.
+    display_name: str = ""
 
     @property
     def attributes(self) -> tuple[str, str, int, int]:
@@ -281,12 +289,14 @@ def read_catalog_service(row: object) -> CatalogService:
         raise ServiceEvidenceError(CATALOG_MALFORMED, "duration")
     minutes = _duration_minutes(duration)
 
+    raw_name = row.get("name")
     return CatalogService(
         uuid=service_uuid,
         normalized_name=name,
         currency=currency,
         price_minor=price,
         duration_minutes=minutes,
+        display_name=" ".join(raw_name.split()) if isinstance(raw_name, str) else "",
     )
 
 
@@ -317,6 +327,64 @@ def build_catalog_snapshot(location_uuid: str, rows: list[Any]) -> CatalogSnapsh
         seen.add(service.uuid)
         services.append(service)
     return CatalogSnapshot(location_uuid=location_uuid, services=tuple(services))
+
+
+class SupportsCatalogReads(Protocol):
+    """The one method a catalogue read needs. Kept structural so this module
+    stays free of the write client (and of the import cycle that would create)."""
+
+    async def list_location_services(self, location_uuid: str, *, page: int) -> dict[str, Any]: ...
+
+
+async def read_full_catalog(client: SupportsCatalogReads, *, location_uuid: str) -> CatalogSnapshot:
+    """Every page of one location's catalogue, read now, or raise."""
+    snapshot, _rows = await read_full_catalog_rows(client, location_uuid=location_uuid)
+    return snapshot
+
+
+async def read_full_catalog_rows(
+    client: SupportsCatalogReads, *, location_uuid: str
+) -> tuple[CatalogSnapshot, list[Any]]:
+    """The snapshot AND the raw rows it was projected from, in one walk.
+
+    The single implementation of the page walk: the cutover's service proof and
+    the preparation stage's mapping proposals must never disagree about what
+    "the catalogue" is, or a mapping could be proposed against a catalogue the
+    apply then reads differently.
+
+    The raw rows come back because a caller may need a field the projection
+    deliberately drops — the preparation stage reads whatever staff list a row
+    happens to carry. Walking the pages a second time for it would both double
+    the rate budget and let the two reads disagree about the same catalogue.
+
+    Never filtered — not by category, not by the wave's services, not by master.
+    Uniqueness is judged over the whole returned catalogue, and a filter would
+    hide exactly the look-alike that makes an attribute match ambiguous.
+    """
+    rows: list[Any] = []
+    page = 1
+    while True:
+        try:
+            payload = await client.list_location_services(location_uuid, page=page)
+        except EasyWeekError:
+            # Timeout, 5xx, auth, protocol — every one of them is one catalogue
+            # we did not read, and none of them is a catalogue we may reason on.
+            raise ServiceEvidenceError(CATALOG_UNREADABLE) from None
+        data = payload.get("data")
+        if not isinstance(data, list):
+            raise ServiceEvidenceError(CATALOG_UNREADABLE)
+        last_page, total = read_pagination(payload.get("meta"), page=page)
+        rows.extend(data)
+        if page >= last_page:
+            if len(rows) != total:
+                # A page set that does not add up to the stated total is a
+                # partial catalogue, and a partial catalogue cannot prove that
+                # anything in it is unique.
+                raise ServiceEvidenceError(CATALOG_UNREADABLE)
+            break
+        page += 1
+
+    return build_catalog_snapshot(location_uuid, rows), rows
 
 
 def _unique_entry(catalog: CatalogSnapshot, easyweek_service_uuid: str) -> CatalogService:

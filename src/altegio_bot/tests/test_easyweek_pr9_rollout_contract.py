@@ -234,6 +234,13 @@ def test_both_workers_still_read_easyweek_env_and_nothing_new_was_added() -> Non
         # one-off container that exists only for the length of one command and is
         # never started by `docker compose up -d`.
         "easyweek-booking-migration",
+        # PR-11.2 (plan §29). The preparation stage reads the EasyWeek catalogue
+        # and the workspace's customers, so it needs the same key. Same narrowest
+        # carrier: `ops` profile, `restart: "no"`, one command per container,
+        # never started by `docker compose up -d`. It is admitted deliberately
+        # and separately from the migrator, because it holds a different power —
+        # it can create a CUSTOMER and cannot create a booking.
+        "easyweek-migration-prepare",
     }, f"easyweek.env reached an unexpected service: {with_easyweek_env}"
 
 

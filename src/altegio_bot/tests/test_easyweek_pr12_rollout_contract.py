@@ -222,6 +222,13 @@ def test_no_new_service_and_no_new_secret_distribution() -> None:
         OUTBOX_SERVICE,
         "easyweek-legacy-retire",
         "easyweek-booking-migration",
+        # PR-11.2 (plan §29). The preparation stage reads the EasyWeek catalogue
+        # and the workspace's customers, so it needs the same key. Same narrowest
+        # carrier: `ops` profile, `restart: "no"`, one command per container,
+        # never started by `docker compose up -d`. It is admitted deliberately
+        # and separately from the migrator, because it holds a different power —
+        # it can create a CUSTOMER and cannot create a booking.
+        "easyweek-migration-prepare",
     }, f"easyweek.env reached an unexpected service: {with_easyweek_env}"
 
 

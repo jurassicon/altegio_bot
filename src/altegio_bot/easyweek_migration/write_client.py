@@ -69,6 +69,11 @@ logger = logging.getLogger("easyweek_migration.write")
 _PATH_BOOKINGS: Final = "bookings"
 _PATH_LOCATIONS: Final = "locations"
 _PATH_SERVICES: Final = "services"
+_PATH_CUSTOMERS: Final = "customers"
+
+# `GET /customers` defaults to 15 per page and caps at 100. Asking for the cap
+# keeps a workspace-wide directory to as few paged reads as the pacing allows.
+_CUSTOMERS_PER_PAGE: Final = 100
 
 # EasyWeek allows 60 requests/min per key (plan §1.1). The migration is the only
 # thing that ever runs at volume against that budget, but it is not alone on the
@@ -623,6 +628,103 @@ class EasyWeekMigrationWriteClient:
         absent under a control master.
         """
         return await self._get_json(_PATH_BOOKINGS, params=dict(params), operation="list_bookings")
+
+    async def list_customers(self, *, params: dict[str, Any]) -> dict[str, Any]:
+        """``GET /customers`` — one page of the documented filtered list.
+
+        Customers belong to the WORKSPACE, not to a location: the response
+        carries no location field, and the same person is reachable from every
+        branch. So this is never scoped to a branch, and a lookup that found
+        nothing in Durlach has not shown that the customer is new.
+
+        ``phone`` is an exact-match filter and EasyWeek normalises it to E.164 —
+        but it travels in the URL query string, which is the one place a phone
+        number reaches an access log. Callers pace and mask; this method never
+        logs the URL or the body.
+        """
+        merged = {"per_page": _CUSTOMERS_PER_PAGE, **dict(params)}
+        return await self._get_json(_PATH_CUSTOMERS, params=merged, operation="list_customers")
+
+    async def get_customer(self, customer_uuid: str) -> dict[str, Any]:
+        """``GET /customers/{uuid}`` — the read that PROVES a creation.
+
+        A ``POST`` response is what the server says it did; this is what the
+        workspace actually holds. The two are compared before a created customer
+        is written into the directory.
+        """
+        canonical = _canonical_booking_uuid(customer_uuid)
+        return await self._get_json(
+            "/".join([_PATH_CUSTOMERS, canonical]),
+            params={},
+            operation="get_customer",
+        )
+
+    async def create_customer(self, body: dict[str, Any]) -> dict[str, Any]:
+        """``POST /customers``. Returns the raw response only on a 2xx.
+
+        Deliberately shaped like :meth:`create_booking`, and for the same reason:
+        EasyWeek publishes no idempotency key, so a timeout or a transport
+        failure is an UNKNOWN outcome, never a failed one. Retrying it blindly is
+        how one person becomes two cards — and a duplicate card is worse than a
+        missing one, because the booking then lands on whichever of the two the
+        next lookup happens to return.
+
+        A 4xx that is not 429 is permanent: the workspace rejects a phone or
+        e-mail that another customer already holds, and the answer to that is to
+        look at who holds it, never to alter the contact details until the
+        collision goes away.
+
+        The caller proves the result with :meth:`get_customer`; this method does
+        not decide that a customer exists.
+        """
+        url = "/".join([self._base_url, _PATH_CUSTOMERS])
+
+        await self._limiter.acquire()
+        try:
+            response = await self._client.post(url, headers=self._headers(), json=dict(body))
+        except httpx.TimeoutException:
+            raise EasyWeekUncertainMutation(
+                "customer create timed out; outcome unknown", operation="create_customer"
+            ) from None
+        except httpx.HTTPError:
+            raise EasyWeekUncertainMutation(
+                "customer create transport failure; outcome unknown", operation="create_customer"
+            ) from None
+
+        status = response.status_code
+        # Status only. The request body is a person's name and phone number, and
+        # the response echoes them back.
+        logger.info("easyweek_migration: create_customer status=%s", status)
+        if 200 <= status < 300:
+            try:
+                payload: Any = response.json()
+            except Exception:
+                # 2xx with an unreadable body: the customer may well exist, and
+                # there is no uuid to prove it with. Uncertain, not failed.
+                raise EasyWeekUncertainMutation(
+                    "customer create returned an unreadable body; outcome unknown",
+                    operation="create_customer",
+                    status_code=status,
+                ) from None
+            if not isinstance(payload, dict):
+                raise EasyWeekUncertainMutation(
+                    "customer create returned a non-object body; outcome unknown",
+                    operation="create_customer",
+                    status_code=status,
+                )
+            return payload
+        if status in (401, 403):
+            raise EasyWeekAuthError(
+                "authentication or authorization failed", operation="create_customer", status_code=status
+            )
+        if status == 429 or 500 <= status < 600:
+            # 5xx after a POST is NOT a failed POST — the write may have landed.
+            raise EasyWeekUncertainMutation(
+                "customer create returned a retryable status; outcome unknown",
+                operation="create_customer",
+                status_code=status,
+            )
+        raise EasyWeekPermanentError("permanent client error", operation="create_customer", status_code=status)
 
     async def cancel_booking(self, booking_uuid: str) -> None:
         """Cancel one booking. Reached ONLY by a confirmed rollback.

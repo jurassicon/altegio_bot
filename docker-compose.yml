@@ -298,6 +298,46 @@ services:
     profiles:
       - ops
 
+  # Preparing a migration wave, BEFORE `easyweek-booking-migration` runs.
+  #
+  #   docker compose --profile ops run --rm --build easyweek-migration-prepare \
+  #     prepare --manifest /migration/input/manifest.json \
+  #     --company-id 758285 --cutover-at 2026-09-01T00:00:00+02:00
+  #
+  # A separate service, not a second mode of the migrator, because it holds a
+  # different power: this one can create CUSTOMERS and cannot create a booking.
+  # `EASYWEEK_MIGRATION_ALLOW_CUSTOMER_CREATE` is deliberately NOT set here — an
+  # operator sets it on the one command that creates customers, and the CLI also
+  # demands a typed flag alongside it.
+  easyweek-migration-prepare:
+    build: .
+    env_file:
+      - .env
+      - path: easyweek.env
+        required: false
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ${EASYWEEK_MIGRATION_INPUT_DIR:-./outputs/easyweek_migration/input}:/migration/input:ro
+      # Writable, and it holds PERSONAL DATA: the operator review, the decision
+      # store and the generated customer directory. Not committed; keep the host
+      # directory readable only by the operator.
+      - ${EASYWEEK_MIGRATION_STATE_DIR:-./outputs/easyweek_migration_prepare}:/migration/state
+    environment:
+      EASYWEEK_MIGRATION_STATE_DIR: /migration/state
+    entrypoint:
+      [
+        "/app/.venv/bin/python",
+        "-m",
+        "altegio_bot.scripts.easyweek_migration_prepare",
+      ]
+    command: ["--help"]
+    working_dir: /app
+    restart: "no"
+    profiles:
+      - ops
+
 volumes:
   postgres_data:
   redis_data:
