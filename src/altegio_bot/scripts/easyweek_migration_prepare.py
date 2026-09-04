@@ -53,15 +53,10 @@ from pathlib import Path
 from typing import Any, Final
 
 from altegio_bot.db import SessionLocal
-from altegio_bot.easyweek_migration.altegio_source import build_window, fetch_company_records
 from altegio_bot.easyweek_migration.customer_decisions import DecisionStoreError
 from altegio_bot.easyweek_migration.customers import load_customer_directory
 from altegio_bot.easyweek_migration.cutover import CutoverError, parse_cutover
 from altegio_bot.easyweek_migration.manifest import inventory_manifest, load_manifest
-from altegio_bot.easyweek_migration.mapping_proposal import (
-    collect_source_services,
-    propose_service_mapping,
-)
 from altegio_bot.easyweek_migration.prepare import (
     FILE_CUSTOMER_DIRECTORY,
     FILE_OPERATOR_REVIEW,
@@ -70,9 +65,11 @@ from altegio_bot.easyweek_migration.prepare import (
     MODE_PREPARE,
     MODE_VERIFY_DRY_RUN,
     ConfirmRequest,
+    ConfirmTarget,
     PrepareError,
     PrepareInputs,
     apply_confirmations,
+    build_preparation_snapshot,
     run_create_customers,
     run_prepare,
 )
@@ -83,7 +80,6 @@ from altegio_bot.easyweek_migration.runner import (
     new_run_id,
     run_inventory_or_dry_run,
 )
-from altegio_bot.easyweek_migration.service_catalog import ServiceEvidenceError, read_full_catalog
 from altegio_bot.easyweek_migration.write_client import EasyWeekMigrationWriteClient
 
 logger = logging.getLogger("easyweek_migration.prepare.cli")
@@ -127,7 +123,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="where decisions and the operator review live. HOLDS PII; never commit it.",
     )
 
-    parser.add_argument("--confirm-customer", action="append", default=[], metavar="PHONE")
+    parser.add_argument(
+        "--confirm-customer",
+        action="append",
+        default=[],
+        metavar="PHONE=DIGEST",
+        help=(
+            "confirm ONE customer. Takes the phone AND the review_digest printed next to that "
+            "customer in the operator review, joined by '=' — for example "
+            "--confirm-customer '+4915112345678=3f9a...'. The digest covers every field you were "
+            "shown, so a proposal that changed since you read it is refused instead of confirmed."
+        ),
+    )
     parser.add_argument("--skip-customer", action="append", default=[], metavar="PHONE")
     parser.add_argument(
         "--confirm-all-pending-customers",
@@ -140,7 +147,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--last-name")
     parser.add_argument("--email")
 
-    parser.add_argument("--confirm-service", action="append", type=int, default=[], metavar="ALTEGIO_SERVICE_ID")
+    parser.add_argument(
+        "--confirm-service",
+        action="append",
+        default=[],
+        metavar="ALTEGIO_SERVICE_ID=DIGEST",
+        help=(
+            "confirm ONE service mapping. Takes the Altegio service id AND the review_digest "
+            "printed next to that proposal, joined by '=' — for example "
+            "--confirm-service '6001=a71c...'. Same rule: the digest covers everything shown, "
+            "including the observed source prices and durations."
+        ),
+    )
     parser.add_argument(
         "--confirm-all-services",
         action="store_true",
@@ -184,31 +202,21 @@ def _create_permitted(args: argparse.Namespace) -> bool:
     return bool(args.authorise_customer_create) and env == "true"
 
 
-async def _load_proposals(inputs: PrepareInputs, write_client: Any) -> list[Any]:
-    """Re-derive the proposals a confirmation refers to, from the same sources.
+def _parse_confirm_target(raw: str, *, what: str) -> ConfirmTarget:
+    """Split ``IDENT=DIGEST``, or refuse.
 
-    Confirming has to see the same list ``prepare`` printed, and the digest check
-    is only meaningful if the list is rebuilt rather than read back from a file
-    the confirmation itself could have written.
+    A bare identifier is rejected rather than defaulted, because "confirm
+    whatever is under this id today" is precisely the instruction an operator
+    reviewing a printed list does not mean to give.
     """
-    branch = inputs.manifest.branch(inputs.altegio_company_id)
-    if branch is None:
-        raise PrepareError("manifest has no entry for that Altegio company id")
-    window = build_window(inputs.cutover.at, horizon_days=inputs.horizon_days)
-    records = await fetch_company_records(inputs.altegio_company_id, window)
-    services = collect_source_services(records, staff_ids=set(branch.selected_staff_ids) or None)
-    try:
-        catalog = await read_full_catalog(write_client, location_uuid=branch.easyweek_location_uuid)
-    except ServiceEvidenceError as error:
-        raise PrepareError(f"catalogue unreadable ({error.reason})") from None
-    return propose_service_mapping(
-        altegio_company_id=inputs.altegio_company_id,
-        source_services=services,
-        catalog=catalog,
-        catalog_staff={},
-        selected_staff_uuids=set(inputs.selected_staff_uuids),
-        branch=branch,
-    )
+    identifier, separator, digest = raw.partition("=")
+    identifier, digest = identifier.strip(), digest.strip()
+    if not separator or not identifier or not digest:
+        raise PrepareError(
+            f"--confirm-{what} needs IDENT=DIGEST, using the review_digest printed next to that "
+            f"{what} in the operator review; got a bare identifier"
+        )
+    return ConfirmTarget(identifier=identifier, review_digest=digest)
 
 
 async def _run(args: argparse.Namespace) -> int:
@@ -247,9 +255,6 @@ async def _run(args: argparse.Namespace) -> int:
         altegio_company_id=args.company_id,
         cutover=cutover,
         horizon_days=args.horizon_days,
-        selected_staff_uuids=frozenset(
-            uuid for staff_id, uuid in branch.staff.items() if staff_id in branch.selected_staff_ids
-        ),
         create_allowed=_create_permitted(args),
     )
 
@@ -267,7 +272,7 @@ async def _run(args: argparse.Namespace) -> int:
 
         if args.mode == MODE_CONFIRM:
             request = ConfirmRequest(
-                confirm_customers=tuple(args.confirm_customer),
+                confirm_customers=tuple(_parse_confirm_target(raw, what="customer") for raw in args.confirm_customer),
                 skip_customers=tuple(args.skip_customer),
                 confirm_all_pending=bool(args.confirm_all_pending_customers),
                 expected_pending_digest=args.pending_digest,
@@ -275,15 +280,18 @@ async def _run(args: argparse.Namespace) -> int:
                 correct_first_name=args.first_name,
                 correct_last_name=args.last_name,
                 correct_email=args.email,
-                confirm_services=tuple(args.confirm_service),
+                confirm_services=tuple(_parse_confirm_target(raw, what="service") for raw in args.confirm_service),
                 confirm_all_services=bool(args.confirm_all_services),
                 expected_mapping_digest=args.mapping_digest,
             )
-            proposals = None
-            if request.confirm_services or request.confirm_all_services:
-                async with EasyWeekMigrationWriteClient() as client:
-                    proposals = await _load_proposals(inputs, client)
-            outcome = apply_confirmations(inputs, request, proposals=proposals)
+            # The SAME builder `prepare` uses, always — not only when a service
+            # is being confirmed. Confirming re-verifies branch identity, re-runs
+            # the classifier and re-reads the catalogue and the customers, so a
+            # confirmation is checked against the world as it is now rather than
+            # against a file this command could have written itself.
+            async with EasyWeekMigrationWriteClient() as client:
+                snapshot = await build_preparation_snapshot(inputs, write_client=client)
+            outcome = apply_confirmations(inputs, request, snapshot=snapshot)
             _print(outcome)
             return 0
 

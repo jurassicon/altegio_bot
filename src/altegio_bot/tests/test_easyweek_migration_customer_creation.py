@@ -48,6 +48,8 @@ from altegio_bot.easyweek_migration.prepare import (
     FILE_CUSTOMER_DIRECTORY,
     MODE_CREATE_CUSTOMERS,
     ConfirmRequest,
+    ConfirmTarget,
+    PreparationSnapshot,
     PrepareError,
     PrepareInputs,
     apply_confirmations,
@@ -57,6 +59,7 @@ from altegio_bot.easyweek_migration.prepare import (
     pending_digest,
     run_create_customers,
 )
+from altegio_bot.easyweek_migration.service_catalog import CatalogSnapshot
 from altegio_bot.easyweek_migration.write_client import EasyWeekUncertainMutation
 from altegio_bot.tests.test_easyweek_migration_customer_lookup import (
     PHONE,
@@ -66,7 +69,7 @@ from altegio_bot.tests.test_easyweek_migration_customer_lookup import (
     card,
     page,
 )
-from altegio_bot.tests.test_easyweek_migration_planning import manifest_text
+from altegio_bot.tests.test_easyweek_migration_planning import KA_LOCATION_UUID, manifest_text
 
 OTHER_PHONE = "+4915199999999"
 
@@ -119,6 +122,31 @@ def load(state_dir: Path) -> DecisionSet:
     store = CustomerDecisionStore(state_dir)
     with store:
         return store.load()
+
+
+def live_snapshot(*records: CustomerDecision, proposals: tuple[Any, ...] = ()) -> PreparationSnapshot:
+    """A snapshot whose live data says exactly what these records say.
+
+    The confirm path re-derives every customer from a fresh read, so a test that
+    seeds the decision store has to state what that read would return. Passing
+    the same records is "nothing changed"; passing different ones is "the source
+    moved under the operator", which is its own test below.
+    """
+    manifest = parse_manifest(manifest_text())
+    return PreparationSnapshot(
+        branch=manifest.branch(KARLSRUHE_COMPANY_ID),
+        records=(),
+        in_scope=(),
+        operator_records=(),
+        manual={},
+        ready_now=0,
+        catalog=CatalogSnapshot(location_uuid=KA_LOCATION_UUID, services=()),
+        catalog_staff={},
+        proposals=proposals,
+        customer_sources={},
+        customer_lookups={},
+        customer_proposals={record.phone: record for record in records},
+    )
 
 
 class FakeCreateClient(FakeCustomerReads):
@@ -223,22 +251,110 @@ def test_a_deliberate_skip_is_not_re_opened() -> None:
 # ---------------------------------------------------------------------------
 
 
+def confirm_target(record: CustomerDecision) -> ConfirmTarget:
+    """What an operator copies out of the review: the phone and its digest."""
+    return ConfirmTarget(identifier=record.phone, review_digest=record.shown_digest)
+
+
 def test_a_confirmation_names_one_customer(inputs: PrepareInputs, state_dir: Path) -> None:
-    seed(state_dir, decision(), decision(OTHER_PHONE))
-    apply_confirmations(inputs, ConfirmRequest(confirm_customers=(PHONE,)))
+    mine, other = decision(), decision(OTHER_PHONE)
+    seed(state_dir, mine, other)
+
+    apply_confirmations(
+        inputs,
+        ConfirmRequest(confirm_customers=(confirm_target(mine),)),
+        snapshot=live_snapshot(mine, other),
+    )
 
     decisions = load(state_dir)
     assert decisions.get(PHONE).state == STATE_CONFIRMED
     assert decisions.get(OTHER_PHONE).state == STATE_PENDING
 
 
+def test_a_single_confirmation_without_a_digest_is_impossible_to_express() -> None:
+    """The type itself carries the digest, so there is no unbound form to send."""
+    with pytest.raises(TypeError):
+        ConfirmTarget(identifier=PHONE)  # type: ignore[call-arg]
+
+
+def test_a_single_confirmation_with_a_wrong_digest_is_refused(inputs: PrepareInputs, state_dir: Path) -> None:
+    record = decision()
+    seed(state_dir, record)
+
+    with pytest.raises(PrepareError):
+        apply_confirmations(
+            inputs,
+            ConfirmRequest(confirm_customers=(ConfirmTarget(identifier=PHONE, review_digest="wrong"),)),
+            snapshot=live_snapshot(record),
+        )
+
+    assert load(state_dir).get(PHONE).state == STATE_PENDING
+
+
+def test_a_single_confirmation_with_a_stale_digest_is_refused(inputs: PrepareInputs, state_dir: Path) -> None:
+    """The operator read one proposal; the live source now says another."""
+    reviewed = decision(first_name="Testkundin")
+    seed(state_dir, reviewed)
+    moved = decision(first_name="Andere")
+
+    with pytest.raises(PrepareError):
+        apply_confirmations(
+            inputs,
+            ConfirmRequest(confirm_customers=(confirm_target(reviewed),)),
+            snapshot=live_snapshot(moved),
+        )
+
+    record = load(state_dir).get(PHONE)
+    assert record.state == STATE_PENDING
+    assert record.first_name == "Testkundin", "a refusal changes nothing at all"
+
+
+def test_a_refused_confirmation_leaves_no_partial_change(inputs: PrepareInputs, state_dir: Path) -> None:
+    """One bad digest in a command stops the whole command, skips included."""
+    good, bad = decision(), decision(OTHER_PHONE)
+    seed(state_dir, good, bad)
+
+    with pytest.raises(PrepareError):
+        apply_confirmations(
+            inputs,
+            ConfirmRequest(
+                confirm_customers=(
+                    confirm_target(good),
+                    ConfirmTarget(identifier=OTHER_PHONE, review_digest="wrong"),
+                ),
+                skip_customers=(),
+            ),
+            snapshot=live_snapshot(good, bad),
+        )
+
+    decisions = load(state_dir)
+    assert decisions.get(PHONE).state == STATE_PENDING
+    assert decisions.get(OTHER_PHONE).state == STATE_PENDING
+
+
+def test_a_confirmation_for_somebody_no_longer_in_the_wave_is_refused(inputs: PrepareInputs, state_dir: Path) -> None:
+    record = decision()
+    seed(state_dir, record)
+
+    with pytest.raises(PrepareError):
+        apply_confirmations(
+            inputs,
+            ConfirmRequest(confirm_customers=(confirm_target(record),)),
+            snapshot=live_snapshot(),
+        )
+
+    assert load(state_dir).get(PHONE).state == STATE_PENDING
+
+
 def test_a_batch_confirmation_is_bound_to_the_printed_list(inputs: PrepareInputs, state_dir: Path) -> None:
-    seed(state_dir, decision(), decision(OTHER_PHONE))
+    mine, other = decision(), decision(OTHER_PHONE)
+    seed(state_dir, mine, other)
     printed = pending_digest(load(state_dir))
 
     apply_confirmations(
         inputs,
         ConfirmRequest(confirm_all_pending=True, expected_pending_digest=printed),
+        snapshot=live_snapshot(mine, other),
     )
 
     assert all(record.state == STATE_CONFIRMED for record in load(state_dir).records.values())
@@ -246,55 +362,90 @@ def test_a_batch_confirmation_is_bound_to_the_printed_list(inputs: PrepareInputs
 
 def test_a_batch_confirmation_refuses_a_list_that_moved(inputs: PrepareInputs, state_dir: Path) -> None:
     """A yes to one list is not a yes to a longer one."""
-    seed(state_dir, decision())
+    mine = decision()
+    seed(state_dir, mine)
     printed = pending_digest(load(state_dir))
-    seed(state_dir, decision(), decision(OTHER_PHONE))
+    other = decision(OTHER_PHONE)
+    seed(state_dir, mine, other)
 
     with pytest.raises(PrepareError):
-        apply_confirmations(inputs, ConfirmRequest(confirm_all_pending=True, expected_pending_digest=printed))
+        apply_confirmations(
+            inputs,
+            ConfirmRequest(confirm_all_pending=True, expected_pending_digest=printed),
+            snapshot=live_snapshot(mine, other),
+        )
 
     assert all(record.state == STATE_PENDING for record in load(state_dir).records.values())
 
 
 def test_a_batch_confirmation_without_a_digest_is_refused(inputs: PrepareInputs, state_dir: Path) -> None:
-    seed(state_dir, decision())
+    record = decision()
+    seed(state_dir, record)
 
     with pytest.raises(PrepareError):
-        apply_confirmations(inputs, ConfirmRequest(confirm_all_pending=True))
+        apply_confirmations(inputs, ConfirmRequest(confirm_all_pending=True), snapshot=live_snapshot(record))
 
 
-def test_a_confirmation_against_stale_data_is_refused(inputs: PrepareInputs, state_dir: Path) -> None:
+def test_a_confirmation_against_stale_stored_data_is_refused(inputs: PrepareInputs, state_dir: Path) -> None:
+    """A stored record inconsistent with its own digest is never acted on."""
     stale = replace(decision(), first_name="Andere")  # digest still describes the old name
     seed(state_dir, stale)
 
-    outcome = apply_confirmations(inputs, ConfirmRequest(confirm_customers=(PHONE,)))
+    with pytest.raises(PrepareError):
+        apply_confirmations(
+            inputs,
+            ConfirmRequest(confirm_customers=(confirm_target(stale),)),
+            snapshot=live_snapshot(stale),
+        )
 
     assert load(state_dir).get(PHONE).state == STATE_PENDING
-    assert {"reason": "decision_stale"} in outcome["refused"]
 
 
 def test_a_correction_returns_the_record_to_pending(inputs: PrepareInputs, state_dir: Path) -> None:
-    seed(
-        state_dir,
-        decision(
-            first_name=None, source_label="Anna Maria Schmidt", state=STATE_BLOCKED, blocked_reason=BLOCK_NAME_NOT_SPLIT
-        ),
+    record = decision(
+        first_name=None,
+        source_label="Anna Maria Schmidt",
+        state=STATE_BLOCKED,
+        blocked_reason=BLOCK_NAME_NOT_SPLIT,
     )
+    seed(state_dir, record)
 
     apply_confirmations(
         inputs,
         ConfirmRequest(correct_phone=PHONE, correct_first_name="Anna Maria", correct_last_name="Schmidt"),
+        snapshot=live_snapshot(record),
     )
 
-    record = load(state_dir).get(PHONE)
-    assert record.state == STATE_PENDING
-    assert (record.first_name, record.last_name) == ("Anna Maria", "Schmidt")
-    assert record.matches_shown()
+    corrected = load(state_dir).get(PHONE)
+    assert corrected.state == STATE_PENDING
+    assert (corrected.first_name, corrected.last_name) == ("Anna Maria", "Schmidt")
+    assert corrected.matches_shown()
+    assert corrected.shown_digest != record.shown_digest, "a correction invalidates the old agreement"
+
+
+def test_correcting_and_confirming_the_same_customer_is_refused(inputs: PrepareInputs, state_dir: Path) -> None:
+    """Self-contradictory: the correction resets exactly what the confirm sets."""
+    record = decision()
+    seed(state_dir, record)
+
+    with pytest.raises(PrepareError):
+        apply_confirmations(
+            inputs,
+            ConfirmRequest(
+                confirm_customers=(confirm_target(record),),
+                correct_phone=PHONE,
+                correct_first_name="Andere",
+            ),
+            snapshot=live_snapshot(record),
+        )
+
+    assert load(state_dir).get(PHONE).first_name == "Testkundin"
 
 
 def test_a_skip_is_recorded_and_creates_nothing(inputs: PrepareInputs, state_dir: Path) -> None:
-    seed(state_dir, decision())
-    apply_confirmations(inputs, ConfirmRequest(skip_customers=(PHONE,)))
+    record = decision()
+    seed(state_dir, record)
+    apply_confirmations(inputs, ConfirmRequest(skip_customers=(PHONE,)), snapshot=live_snapshot(record))
 
     assert load(state_dir).get(PHONE).state == STATE_SKIPPED
 
@@ -310,9 +461,14 @@ def test_confirming_never_reads_stdin(inputs: PrepareInputs, state_dir: Path, mo
         __iter__ = read
 
     monkeypatch.setattr("sys.stdin", Exploding())
-    seed(state_dir, decision())
+    record = decision()
+    seed(state_dir, record)
 
-    apply_confirmations(inputs, ConfirmRequest(confirm_customers=(PHONE,)))
+    apply_confirmations(
+        inputs,
+        ConfirmRequest(confirm_customers=(confirm_target(record),)),
+        snapshot=live_snapshot(record),
+    )
     assert load(state_dir).get(PHONE).state == STATE_CONFIRMED
 
 
@@ -685,3 +841,104 @@ def test_the_safe_shape_of_a_decision_carries_no_person(state_dir: Path) -> None
     for secret in (PHONE, "Testkundin", "a@example.invalid"):
         assert secret not in blob
     assert safe["has_first_name"] is True
+
+
+# ---------------------------------------------------------------------------
+# Every field a customer review shows is inside the digest (review finding 5)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"first_name": "Andere"},
+        {"last_name": "Schmidt"},
+        {"email": "neu@example.invalid"},
+        {"linked_record_count": 3},
+        {"phone": OTHER_PHONE},
+    ],
+    ids=["first_name", "last_name", "email", "linked_records", "phone"],
+)
+def test_changing_any_shown_customer_field_changes_the_digest(change: dict[str, Any]) -> None:
+    assert decision(**change).shown_digest != decision().shown_digest
+
+
+def test_the_customer_digest_covers_exactly_what_is_presented() -> None:
+    """The presentation IS the digest input; nothing shown sits outside it."""
+    record = decision(last_name="Schmidt", email="k@example.invalid")
+
+    assert set(record.presentation()) == {"phone", "first_name", "last_name", "email", "linked_record_count"}
+    assert record.matches_shown()
+    assert replace(record, linked_record_count=99).matches_shown() is False
+
+
+def test_a_changed_shown_field_cancels_an_existing_agreement(inputs: PrepareInputs, state_dir: Path) -> None:
+    """Confirmed at one set of values; the source then moved."""
+    reviewed = decision()
+    seed(state_dir, reviewed)
+    apply_confirmations(
+        inputs,
+        ConfirmRequest(confirm_customers=(confirm_target(reviewed),)),
+        snapshot=live_snapshot(reviewed),
+    )
+    assert load(state_dir).get(PHONE).state == STATE_CONFIRMED
+
+    moved = decision(email="neu@example.invalid")
+    apply_confirmations(inputs, ConfirmRequest(), snapshot=live_snapshot(moved))
+
+    record = load(state_dir).get(PHONE)
+    assert record.state == STATE_PENDING, "the agreement was about the old values"
+    assert record.email == "neu@example.invalid"
+
+
+def test_unchanged_data_keeps_the_agreement_through_a_confirm_run(inputs: PrepareInputs, state_dir: Path) -> None:
+    reviewed = decision()
+    seed(state_dir, reviewed)
+    apply_confirmations(
+        inputs,
+        ConfirmRequest(confirm_customers=(confirm_target(reviewed),)),
+        snapshot=live_snapshot(reviewed),
+    )
+
+    apply_confirmations(inputs, ConfirmRequest(), snapshot=live_snapshot(reviewed))
+
+    assert load(state_dir).get(PHONE).state == STATE_CONFIRMED
+
+
+def test_a_confirmation_is_refused_when_only_the_live_data_moved(inputs: PrepareInputs, state_dir: Path) -> None:
+    """The store and the operator agree; the workspace does not. Fail closed."""
+    stored = decision()
+    seed(state_dir, stored)
+    live = decision(linked_record_count=7)
+
+    with pytest.raises(PrepareError):
+        apply_confirmations(
+            inputs,
+            ConfirmRequest(confirm_customers=(confirm_target(stored),)),
+            snapshot=live_snapshot(live),
+        )
+
+    assert load(state_dir).get(PHONE).state == STATE_PENDING
+
+
+def test_a_digest_the_operator_never_reviewed_is_refused(inputs: PrepareInputs, state_dir: Path) -> None:
+    """The hole the review found, approached from the other side.
+
+    Here the operator supplies a digest matching the CURRENT live data
+    perfectly — obtained from somewhere other than the review they were handed:
+    a second machine's run, a colleague, an error message. The reviewed decision
+    on disk is still the older one, so this would be a yes to a proposal nobody
+    actually read.
+    """
+    reviewed = decision()
+    seed(state_dir, reviewed)
+    live = decision(linked_record_count=7)
+
+    with pytest.raises(PrepareError):
+        apply_confirmations(
+            inputs,
+            ConfirmRequest(confirm_customers=(confirm_target(live),)),
+            snapshot=live_snapshot(live),
+        )
+
+    assert load(state_dir).get(PHONE).state == STATE_PENDING

@@ -105,9 +105,8 @@ from altegio_bot.easyweek_migration.customers import (
     normalized_international_phone,
 )
 from altegio_bot.easyweek_migration.cutover import Cutover, LocalTimeError, parse_altegio_local_to_utc
-from altegio_bot.easyweek_migration.manifest import MigrationManifest
+from altegio_bot.easyweek_migration.manifest import BranchMapping, MigrationManifest
 from altegio_bot.easyweek_migration.mapping_proposal import (
-    PROPOSAL_ALREADY_MAPPED,
     MappingAgreement,
     ServiceProposal,
     collect_source_services,
@@ -118,6 +117,7 @@ from altegio_bot.easyweek_migration.mapping_proposal import (
     read_service_staff_uuids,
 )
 from altegio_bot.easyweek_migration.service_catalog import (
+    CatalogSnapshot,
     ServiceEvidenceError,
     read_full_catalog_rows,
 )
@@ -198,10 +198,6 @@ class PrepareInputs:
     altegio_company_id: int
     cutover: Cutover
     horizon_days: int
-    # The EasyWeek staff UUIDs of the masters in this wave, taken from the
-    # manifest's own staff mapping. Used only to ask the catalogue whether it
-    # says the service is available to them.
-    selected_staff_uuids: frozenset[str] = frozenset()
     create_allowed: bool = False
 
 
@@ -489,20 +485,74 @@ class PrepareResult:
 
 
 # ---------------------------------------------------------------------------
-# The read-only preparation pass
+# The one live read every command shares
 # ---------------------------------------------------------------------------
 
 
-async def run_prepare(
+@dataclass(frozen=True)
+class PreparationSnapshot:
+    """One complete, read-only observation of a wave. Built once per command.
+
+    Why this exists as a type rather than as steps inside ``prepare``: the
+    confirm path used to rebuild proposals its own way. It skipped the
+    classifier, so it collected services from every fetched booking rather than
+    from the ones actually in the wave; it re-read the catalogue without the raw
+    rows, so it judged staff availability against nothing; and it did not
+    re-verify branch identity. The two paths could therefore disagree about the
+    same unchanged data, and a service the catalogue withholds from the master
+    who books it could become confirmable at the moment of confirmation.
+
+    So there is one builder, and both paths call it. The properties it
+    guarantees, in order:
+
+    * branch identity is proven against the runtime registry, every time;
+    * the window and the fetch are derived from the same cutover and horizon;
+    * ``classify_record`` runs with the same manifest, cutover, empty customer
+      directory and absent ledger, so scope is decided identically;
+    * skipped rows and rows blocked for reasons this stage must not touch are
+      excluded before anything is proposed;
+    * services are collected from in-scope bookings only;
+    * the catalogue is read ONCE, in full, and both the snapshot and the staff
+      availability come from those same rows;
+    * everything is ordered deterministically before it is digested.
+
+    Anything that cannot be proven raises, so no caller reaches a decision file
+    with a half-built picture.
+    """
+
+    branch: BranchMapping
+    records: tuple[dict[str, Any], ...]
+    in_scope: tuple[dict[str, Any], ...]
+    operator_records: tuple[dict[str, Any], ...]
+    manual: dict[str, int]
+    ready_now: int
+    catalog: CatalogSnapshot
+    catalog_staff: dict[str, frozenset[str] | None]
+    proposals: tuple[ServiceProposal, ...]
+    customer_sources: dict[str, SourceCustomer]
+    customer_lookups: dict[str, CustomerLookup]
+    # Freshly derived from the live lookups, already digested. The confirm path
+    # compares these against the stored decisions rather than trusting the file.
+    customer_proposals: dict[str, CustomerDecision]
+
+    def proposal_for(self, altegio_service_id: int) -> ServiceProposal | None:
+        for proposal in self.proposals:
+            if proposal.source.altegio_service_id == altegio_service_id:
+                return proposal
+        return None
+
+
+async def build_preparation_snapshot(
     inputs: PrepareInputs,
     *,
     write_client: Any,
     http_client: Any | None = None,
-) -> PrepareResult:
-    """Collect, propose and look up. Writes local files; mutates no CRM.
+) -> PreparationSnapshot:
+    """Read Altegio, the catalogue and the workspace's customers. Writes nothing.
 
-    The EasyWeek client is used for ``GET`` only along this path — the catalogue
-    pages and the customer lookups. Nothing here can reach ``create_customer``.
+    ``GET`` only, along every branch of this function. The write client is used
+    for catalogue pages and customer lookups; nothing here can reach
+    ``create_customer``.
     """
     silence_http_request_logs()
 
@@ -514,12 +564,17 @@ async def run_prepare(
     if not identity.proven:
         # The manifest says which EasyWeek location a branch maps to; only the
         # runtime registry can say whether that location IS that branch. A wave
-        # prepared against the wrong location proposes the wrong services.
+        # prepared against the wrong location proposes the wrong services — and
+        # a confirmation recorded against it would be a decision about somebody
+        # else's catalogue.
         raise PrepareError(f"branch identity unproven ({', '.join(identity.failures)})")
 
     window = build_window(inputs.cutover.at, horizon_days=inputs.horizon_days)
     records = await fetch_company_records(inputs.altegio_company_id, window, http_client=http_client)
 
+    # The classifier decides scope. An empty-but-valid directory is passed on
+    # purpose: customers are this stage's job, so their absence must not change
+    # which bookings count as in scope.
     empty_directory = CustomerDirectory(valid=True, by_phone={})
     in_scope: list[dict[str, Any]] = []
     operator_records: list[dict[str, Any]] = []
@@ -553,6 +608,8 @@ async def run_prepare(
     try:
         catalog, catalog_rows = await read_full_catalog_rows(write_client, location_uuid=branch.easyweek_location_uuid)
     except ServiceEvidenceError as error:
+        # An unreadable catalogue proves nothing about any mapping, so no
+        # command continues on one.
         raise PrepareError(f"catalogue unreadable ({error.reason})") from None
 
     catalog_staff = _catalog_staff_map(catalog_rows)
@@ -561,44 +618,89 @@ async def run_prepare(
         source_services=source_services,
         catalog=catalog,
         catalog_staff=catalog_staff,
-        selected_staff_uuids=set(inputs.selected_staff_uuids),
         branch=branch,
     )
 
     # -- customers ----------------------------------------------------------
     sources = collect_source_customers(in_scope)
     lookups: dict[str, CustomerLookup] = {}
+    customer_proposals: dict[str, CustomerDecision] = {}
     for phone in sorted(sources):
         lookups[phone] = await lookup_customer_by_phone(write_client, phone)
+        customer_proposals[phone] = _proposal_from_source(sources[phone], lookups[phone])
+
+    return PreparationSnapshot(
+        branch=branch,
+        records=tuple(records),
+        in_scope=tuple(in_scope),
+        operator_records=tuple(operator_records),
+        manual=dict(manual),
+        ready_now=ready_now,
+        catalog=catalog,
+        catalog_staff=catalog_staff,
+        proposals=tuple(proposals),
+        customer_sources=sources,
+        customer_lookups=lookups,
+        customer_proposals=customer_proposals,
+    )
+
+
+# ---------------------------------------------------------------------------
+# The read-only preparation pass
+# ---------------------------------------------------------------------------
+
+
+async def run_prepare(
+    inputs: PrepareInputs,
+    *,
+    write_client: Any,
+    http_client: Any | None = None,
+    snapshot: PreparationSnapshot | None = None,
+) -> PrepareResult:
+    """Collect, propose and look up. Writes local files; mutates no CRM.
+
+    All the reading lives in :func:`build_preparation_snapshot`, which the
+    confirm path calls too — so what an operator is shown here and what a
+    confirmation is checked against are produced by the same code over the same
+    live data.
+    """
+    if snapshot is None:
+        snapshot = await build_preparation_snapshot(inputs, write_client=write_client, http_client=http_client)
 
     store = CustomerDecisionStore(inputs.state_dir)
     with store:
         decisions = store.load()
-        for phone in sorted(sources):
-            decisions.upsert_proposal(_proposal_from_source(sources[phone], lookups[phone]))
+        for phone in sorted(snapshot.customer_proposals):
+            decisions.upsert_proposal(snapshot.customer_proposals[phone])
         store.save(decisions)
 
         agreement = _load_agreement(inputs.state_dir)
-        _write_artefacts(inputs, decisions, proposals, agreement, catalog_digest=catalog.digest)
+        _write_artefacts(
+            inputs,
+            decisions,
+            list(snapshot.proposals),
+            agreement,
+            catalog_digest=snapshot.catalog.digest,
+        )
 
         machine = _machine_report(
             inputs,
             decisions=decisions,
-            proposals=proposals,
+            proposals=list(snapshot.proposals),
             agreement=agreement,
-            lookups=lookups,
-            manual=dict(manual),
-            ready_now=ready_now,
-            in_scope=len(in_scope),
-            source_records=len(records),
-            catalog_digest=catalog.digest,
+            lookups=snapshot.customer_lookups,
+            manual=snapshot.manual,
+            ready_now=snapshot.ready_now,
+            in_scope=len(snapshot.in_scope),
+            source_records=len(snapshot.records),
+            catalog_digest=snapshot.catalog.digest,
         )
         operator = _operator_report(
             inputs,
             decisions=decisions,
-            proposals=proposals,
-            sources=sources,
-            records=operator_records,
+            proposals=list(snapshot.proposals),
+            sources=snapshot.customer_sources,
+            records=list(snapshot.operator_records),
         )
         _write_private_json(inputs.state_dir / FILE_MACHINE_REPORT, machine)
         _write_private_json(inputs.state_dir / FILE_OPERATOR_REVIEW, operator)
@@ -682,11 +784,14 @@ def _machine_report(
     lookups all failed on a network error.
     """
     unresolved_lookups = sum(1 for lookup in lookups.values() if lookup.outcome == LOOKUP_UNDETERMINED)
+    # Outstanding = anything still needing a person. `settled` is the ONLY free
+    # pass, and it means an existing mapping whose live catalogue entry still
+    # matches the reviewed baseline. Drift used to hide here as `already_mapped`
+    # and report a wave ready while its override baseline had gone stale.
     mapping_outstanding = [
-        proposal.as_safe_dict()
-        for proposal in proposals
-        if proposal.status not in (PROPOSAL_ALREADY_MAPPED,) and not agreement.agreed(proposal)
+        proposal.as_safe_dict() for proposal in proposals if not proposal.settled and not agreement.agreed(proposal)
     ]
+    mapping_drift = [proposal.as_safe_dict() for proposal in proposals if proposal.drift_fields]
     customers_ready = len(build_customer_directory_payload(decisions))
     customers_pending = len(decisions.in_state(STATE_PENDING))
     customers_confirmed = len(decisions.in_state(STATE_CONFIRMED))
@@ -714,6 +819,7 @@ def _machine_report(
             "proposals": [proposal.as_safe_dict() for proposal in proposals],
             "outstanding": mapping_outstanding,
             "agreed": len(agreement.entries),
+            "drift": mapping_drift,
             "pending_digest": mapping_pending_digest(proposals, agreement),
         },
         "customers": {
@@ -786,6 +892,10 @@ def _operator_report(
                 "state": record.state,
                 "blocked_reason": record.blocked_reason,
                 "easyweek_customer_uuid": record.customer_uuid,
+                # Copy this into `--confirm-customer 'PHONE=DIGEST'`. It covers
+                # every field printed above, so a confirmation cannot be aimed
+                # at data the person never read.
+                "review_digest": record.shown_digest,
                 "note": (
                     "Creating a card does NOT transfer visit history: EasyWeek will "
                     "show this customer with no previous visits."
@@ -815,6 +925,20 @@ def _operator_report(
 
 
 @dataclass(frozen=True)
+class ConfirmTarget:
+    """One thing an operator confirmed, and the digest they saw next to it.
+
+    Both halves are required. An identifier alone says "confirm whatever is
+    under this number today", which is not what a person reviewing a list means
+    — and it is how a proposal that changed between the review and the command
+    could be agreed to unseen.
+    """
+
+    identifier: str
+    review_digest: str
+
+
+@dataclass(frozen=True)
 class ConfirmRequest:
     """One confirmation command, exactly as the operator spelled it out.
 
@@ -823,35 +947,57 @@ class ConfirmRequest:
     make that impossible is to have no code that could mistake it for consent.
     """
 
-    confirm_customers: tuple[str, ...] = ()
+    confirm_customers: tuple[ConfirmTarget, ...] = ()
     skip_customers: tuple[str, ...] = ()
     confirm_all_pending: bool = False
     expected_pending_digest: str | None = None
     # Corrections. Applied to ONE customer, and they reset the confirmation:
     # the digest changes, so the record returns to pending and has to be agreed
-    # to again with the new values visible.
+    # to again with the new values visible. No digest is required to correct
+    # something — a correction is not an approval, and demanding the digest of
+    # data the operator is about to replace would be theatre.
     correct_phone: str | None = None
     correct_first_name: str | None = None
     correct_last_name: str | None = None
     correct_email: str | None = None
     # Mapping.
-    confirm_services: tuple[int, ...] = ()
+    confirm_services: tuple[ConfirmTarget, ...] = ()
     confirm_all_services: bool = False
     expected_mapping_digest: str | None = None
+
+
+def _refuse(reason: str, detail: str = "") -> PrepareError:
+    """A fail-closed stop. The message is a code plus operator instructions."""
+    suffix = f" ({detail})" if detail else ""
+    return PrepareError(
+        f"{reason}{suffix}: nothing was changed. Re-run prepare, read the review output, "
+        "and confirm with the digest printed next to the item."
+    )
 
 
 def apply_confirmations(
     inputs: PrepareInputs,
     request: ConfirmRequest,
     *,
-    proposals: list[ServiceProposal] | None = None,
+    snapshot: PreparationSnapshot,
 ) -> dict[str, Any]:
-    """Record confirmations, skips and corrections. Touches no network.
+    """Record confirmations, skips and corrections against FRESH data.
 
-    A batch confirmation is accepted only against the digest of the list that
-    was printed. That is what makes "confirm everything" safe to offer at all:
-    it is not a standing permission, it is a yes to one specific set, and a set
-    that changed by so much as one customer no longer matches.
+    Three things have to agree before a single confirmation is honoured:
+
+    1. the digest the operator typed, from the review they read;
+    2. the digest of the proposal rebuilt from live data just now;
+    3. the stored decision's own internal consistency.
+
+    Checking only (3) was the hole: ``matches_shown`` compares a record's fields
+    against a digest stored beside those same fields, so a second ``prepare``
+    that replaced both left it happily consistent — and the operator could then
+    confirm a proposal they had never seen.
+
+    Every check runs before any mutation. A refusal leaves the decision store,
+    the mapping agreement and the proposed manifest exactly as they were: a
+    half-applied confirmation is worse than none, because the half that landed
+    looks reviewed.
     """
     store = CustomerDecisionStore(inputs.state_dir)
     outcome: dict[str, Any] = {"confirmed": [], "skipped": [], "corrected": [], "refused": []}
@@ -859,68 +1005,31 @@ def apply_confirmations(
     with store:
         decisions = store.load()
 
+        # What `prepare` last wrote, captured BEFORE the live data is folded in.
+        # The three checks below have to be independent, and an upsert-first
+        # order would quietly make two of them the same check: it rewrites a
+        # pending record to match the live read, after which "the store agrees
+        # with itself" and "the store agrees with live" are both true by
+        # construction, however far the data had actually moved.
+        stored = dict(decisions.records)
+
+        # Re-derive from live data, exactly as `prepare` does. A record whose
+        # source moved loses its confirmation here, before anything in this
+        # command is allowed to act on it.
+        for phone in sorted(snapshot.customer_proposals):
+            decisions.upsert_proposal(snapshot.customer_proposals[phone])
+
+        planned = _plan_customer_changes(decisions, stored, request, snapshot)
+        mapping_plan = _plan_mapping_changes(inputs, request, snapshot)
+
+        # -- everything validated; now, and only now, mutate -----------------
         if request.correct_phone is not None:
-            phone = normalized_international_phone(request.correct_phone)
-            if phone is None:
-                raise PrepareError("the phone number to correct is not a usable international number")
-            record = decisions.get(phone)
-            if record is None:
-                raise PrepareError("no customer decision for that number")
-            if record.state in (STATE_CREATED, STATE_IN_FLIGHT):
-                raise PrepareError("that customer has already been created or is mid-creation")
-            corrected = replace(
-                record,
-                first_name=_text(request.correct_first_name) or record.first_name,
-                last_name=_text(request.correct_last_name) or record.last_name,
-                email=_text(request.correct_email) or record.email,
-                # A correction always returns the record to pending: the person
-                # who confirms it must see the corrected values, not the old ones.
-                state=STATE_PENDING,
-                blocked_reason=None,
-            ).with_digest()
-            decisions.records[phone] = corrected
-            outcome["corrected"].append(phone_fingerprint(phone))
+            corrected = _apply_correction(decisions, request)
+            outcome["corrected"].append(phone_fingerprint(corrected))
 
-        for raw in request.skip_customers:
-            phone = normalized_international_phone(raw)
-            if phone is None or decisions.get(phone) is None:
-                outcome["refused"].append({"reason": "unknown_customer"})
-                continue
-            decisions.set_state(phone, STATE_SKIPPED)
-            outcome["skipped"].append(phone_fingerprint(phone))
-
-        targets: list[str] = []
-        if request.confirm_all_pending:
-            current = pending_digest(decisions)
-            if request.expected_pending_digest != current:
-                # The list moved between the review and the confirmation.
-                raise PrepareError(
-                    "the pending customer list has changed since it was printed; "
-                    "re-run prepare, read the new list, and confirm against the new digest"
-                )
-            targets = [record.phone for record in decisions.in_state(STATE_PENDING)]
-        else:
-            for raw in request.confirm_customers:
-                phone = normalized_international_phone(raw)
-                if phone is None:
-                    outcome["refused"].append({"reason": "phone_unusable"})
-                    continue
-                targets.append(phone)
-
-        for phone in targets:
-            record = decisions.get(phone)
-            if record is None:
-                outcome["refused"].append({"reason": "unknown_customer"})
-                continue
-            if record.state != STATE_PENDING:
-                outcome["refused"].append({"state": record.state, "reason": "not_pending"})
-                continue
-            if not record.matches_shown():
-                # The data moved under a confirmation aimed at the old values.
-                outcome["refused"].append({"reason": "decision_stale"})
-                continue
-            decisions.set_state(phone, STATE_CONFIRMED)
-            outcome["confirmed"].append(phone_fingerprint(phone))
+        for phone, state in planned:
+            decisions.set_state(phone, state, blocked_reason=None)
+            outcome["skipped" if state == STATE_SKIPPED else "confirmed"].append(phone_fingerprint(phone))
 
         store.save(decisions)
         outcome["customer_states"] = decisions.summary()
@@ -929,41 +1038,169 @@ def apply_confirmations(
         # Inside the lock: the mapping agreement and the proposed manifest live
         # in the same state directory, and a second run rewriting them while
         # this one is halfway through would leave the two disagreeing.
-        if proposals is not None and (request.confirm_services or request.confirm_all_services):
-            outcome["mapping"] = _confirm_mapping(inputs, request, proposals)
+        if mapping_plan is not None:
+            outcome["mapping"] = _commit_mapping(inputs, snapshot, mapping_plan)
     return outcome
 
 
-def _confirm_mapping(
-    inputs: PrepareInputs, request: ConfirmRequest, proposals: list[ServiceProposal]
-) -> dict[str, Any]:
+def _apply_correction(decisions: DecisionSet, request: ConfirmRequest) -> str:
+    phone = normalized_international_phone(request.correct_phone)
+    if phone is None:
+        raise _refuse("the phone number to correct is not a usable international number")
+    record = decisions.get(phone)
+    if record is None:
+        raise _refuse("no customer decision for that number")
+    if record.state in (STATE_CREATED, STATE_IN_FLIGHT):
+        raise _refuse("that customer has already been created or is mid-creation")
+    corrected = replace(
+        record,
+        first_name=_text(request.correct_first_name) or record.first_name,
+        last_name=_text(request.correct_last_name) or record.last_name,
+        email=_text(request.correct_email) or record.email,
+        # A correction always returns the record to pending: the person who
+        # confirms it must see the corrected values, and its digest changes with
+        # them, so the old agreement cannot survive the edit.
+        state=STATE_PENDING,
+        blocked_reason=None,
+    ).with_digest()
+    decisions.records[phone] = corrected
+    return phone
+
+
+def _plan_customer_changes(
+    decisions: DecisionSet,
+    stored: dict[str, CustomerDecision],
+    request: ConfirmRequest,
+    snapshot: PreparationSnapshot,
+) -> list[tuple[str, str]]:
+    """Validate every customer instruction. Returns the changes, or raises.
+
+    Nothing is written from here. The caller applies the returned list only if
+    this function returned at all.
+    """
+    planned: list[tuple[str, str]] = []
+    # A command that both corrects a customer and decides about the same one is
+    # self-contradictory: the correction resets them to pending, so whichever
+    # order it ran in, one half of the instruction would be silently discarded.
+    correcting = normalized_international_phone(request.correct_phone) if request.correct_phone else None
+
+    for raw in request.skip_customers:
+        phone = normalized_international_phone(raw)
+        if phone is None:
+            raise _refuse("a phone number to skip is not a usable international number")
+        if decisions.get(phone) is None:
+            raise _refuse("no customer decision for a number given to --skip-customer")
+        if phone == correcting:
+            raise _refuse("the same customer cannot be corrected and skipped in one command")
+        planned.append((phone, STATE_SKIPPED))
+
+    targets: list[tuple[str, str | None]] = []
+    if request.confirm_all_pending:
+        current = pending_digest(decisions)
+        if request.expected_pending_digest != current:
+            # The list moved between the review and the confirmation. A batch
+            # "yes" is a yes to one specific set, and this is not that set.
+            raise _refuse(
+                "the pending customer list has changed since it was printed",
+                f"expected {current[:12]}",
+            )
+        targets = [(record.phone, None) for record in decisions.in_state(STATE_PENDING)]
+    else:
+        for target in request.confirm_customers:
+            phone = normalized_international_phone(target.identifier)
+            if phone is None:
+                raise _refuse("a phone number to confirm is not a usable international number")
+            targets.append((phone, target.review_digest))
+
+    for phone, supplied in targets:
+        if phone == correcting:
+            raise _refuse("the same customer cannot be corrected and confirmed in one command")
+        record = decisions.get(phone)
+        if record is None:
+            raise _refuse("no customer decision for a number given to --confirm-customer")
+        fresh = snapshot.customer_proposals.get(phone)
+        if fresh is None:
+            # The customer is no longer in the wave at all — a booking moved,
+            # was cancelled, or fell outside the window.
+            raise _refuse("that customer is no longer part of this wave")
+        if record.state != STATE_PENDING:
+            raise _refuse("that customer is not awaiting confirmation", record.state)
+
+        # (3) the file `prepare` wrote is internally consistent,
+        reviewed = stored.get(phone)
+        if reviewed is None or not reviewed.matches_shown():
+            raise _refuse("the stored decision does not match its own digest")
+        # (2) the workspace still says what that file recorded,
+        if fresh.shown_digest != reviewed.shown_digest:
+            raise _refuse("the live data no longer matches the reviewed decision")
+        # (1) and the operator typed the digest of that very item.
+        if supplied is not None and supplied != fresh.shown_digest:
+            raise _refuse("the supplied review digest does not match this customer")
+        planned.append((phone, STATE_CONFIRMED))
+
+    return planned
+
+
+@dataclass(frozen=True)
+class _MappingPlan:
+    """Service ids to confirm, validated but not yet written."""
+
+    agreement: MappingAgreement
+    confirmed: tuple[int, ...]
+
+
+def _plan_mapping_changes(
+    inputs: PrepareInputs,
+    request: ConfirmRequest,
+    snapshot: PreparationSnapshot,
+) -> _MappingPlan | None:
+    """Validate every service instruction against the freshly built proposals."""
+    if not (request.confirm_services or request.confirm_all_services):
+        return None
+
     agreement = _load_agreement(inputs.state_dir)
+    proposals = list(snapshot.proposals)
+
     if request.confirm_all_services:
         current = mapping_pending_digest(proposals, agreement)
         if request.expected_mapping_digest != current:
-            raise PrepareError(
-                "the proposed service mapping has changed since it was printed; "
-                "re-run prepare and confirm against the new digest"
+            raise _refuse(
+                "the proposed service mapping has changed since it was printed",
+                f"expected {current[:12]}",
             )
+        chosen = [proposal for proposal in proposals if proposal.actionable and not agreement.agreed(proposal)]
+    else:
+        chosen = []
+        for target in request.confirm_services:
+            try:
+                service_id = int(target.identifier)
+            except ValueError:
+                raise _refuse("a service id to confirm is not an integer") from None
+            proposal = snapshot.proposal_for(service_id)
+            if proposal is None:
+                raise _refuse("that service is not part of this wave")
+            if not proposal.actionable:
+                # Ambiguous, absent from the catalogue, drifted from its
+                # baseline, or a service the catalogue withholds from the master
+                # who books it. None of those is something a confirmation fixes.
+                raise _refuse("that service proposal cannot be confirmed", proposal.status)
+            if target.review_digest != proposal_digest(proposal):
+                raise _refuse("the supplied review digest does not match this service")
+            chosen.append(proposal)
 
-    wanted = set(request.confirm_services)
-    confirmed: list[int] = []
-    refused: list[dict[str, Any]] = []
-    for proposal in proposals:
-        service_id = proposal.source.altegio_service_id
-        if not (request.confirm_all_services or service_id in wanted):
-            continue
-        if not proposal.actionable:
-            # Ambiguous, absent from the catalogue, or a service the catalogue
-            # says the chosen master cannot perform. None of those is something
-            # a confirmation can fix.
-            refused.append({"altegio_service_id": service_id, "status": proposal.status})
-            continue
+    for proposal in chosen:
         agreement.confirm(proposal)
-        confirmed.append(service_id)
+    return _MappingPlan(
+        agreement=agreement,
+        confirmed=tuple(sorted(proposal.source.altegio_service_id for proposal in chosen)),
+    )
 
-    _write_private_json(inputs.state_dir / FILE_MAPPING_AGREEMENT, agreement.to_json())
-    patch = manifest_service_patch(proposals, agreement)
+
+def _commit_mapping(inputs: PrepareInputs, snapshot: PreparationSnapshot, plan: _MappingPlan) -> dict[str, Any]:
+    """Write the validated agreement and the manifest it produces."""
+    proposals = list(snapshot.proposals)
+    _write_private_json(inputs.state_dir / FILE_MAPPING_AGREEMENT, plan.agreement.to_json())
+    patch = manifest_service_patch(proposals, plan.agreement)
     merged = merge_manifest_services(
         inputs.manifest_json,
         altegio_company_id=inputs.altegio_company_id,
@@ -971,10 +1208,9 @@ def _confirm_mapping(
     )
     _write_private_json(inputs.state_dir / FILE_MANIFEST_PROPOSED, merged)
     return {
-        "confirmed_service_ids": sorted(confirmed),
-        "refused": refused,
+        "confirmed_service_ids": list(plan.confirmed),
         "manifest_entries_written": len(patch),
-        "pending_digest": mapping_pending_digest(proposals, agreement),
+        "pending_digest": mapping_pending_digest(proposals, plan.agreement),
     }
 
 

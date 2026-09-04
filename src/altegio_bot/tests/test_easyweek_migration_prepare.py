@@ -25,8 +25,11 @@ from altegio_bot.easyweek_migration import prepare as prepare_module
 from altegio_bot.easyweek_migration.cutover import parse_cutover
 from altegio_bot.easyweek_migration.manifest import KARLSRUHE_COMPANY_ID, inventory_manifest, parse_manifest
 from altegio_bot.easyweek_migration.mapping_proposal import (
+    BASELINE_FIELDS,
     PROPOSAL_ALREADY_MAPPED,
     PROPOSAL_AMBIGUOUS,
+    PROPOSAL_BASELINE_DRIFT,
+    PROPOSAL_BASELINE_INCOMPLETE,
     PROPOSAL_NO_CANDIDATE,
     PROPOSAL_UNIQUE_NAME,
     STAFF_AVAILABILITY_ABSENT,
@@ -36,6 +39,7 @@ from altegio_bot.easyweek_migration.mapping_proposal import (
     collect_source_services,
     manifest_service_patch,
     merge_manifest_services,
+    proposal_digest,
     propose_service_mapping,
     read_service_staff_uuids,
 )
@@ -45,9 +49,12 @@ from altegio_bot.easyweek_migration.prepare import (
     FILE_OPERATOR_REVIEW,
     MODE_PREPARE,
     ConfirmRequest,
+    ConfirmTarget,
     PrepareError,
     PrepareInputs,
     apply_confirmations,
+    build_preparation_snapshot,
+    mapping_pending_digest,
     run_prepare,
 )
 from altegio_bot.easyweek_migration.service_catalog import build_catalog_snapshot
@@ -65,6 +72,11 @@ from altegio_bot.tests.test_easyweek_migration_planning import (
 CUTOVER = "2026-09-01T00:00:00Z"
 OTHER_SERVICE_UUID = "99999999-9999-4999-8999-999999999999"
 SECOND_SERVICE_ID = 6009
+# A master the manifest does not map to any EasyWeek uuid.
+KA_OTHER_STAFF_ID = 5099
+# A second master in the wave, with an EasyWeek uuid of her own.
+KA_SECOND_STAFF_ID = 5011
+KA_SECOND_STAFF_UUID = "aaaa1111-2222-4333-8444-555566667777"
 
 
 def catalog_row(
@@ -84,6 +96,25 @@ def catalog_row(
     }
     if staff is not None:
         row["employees"] = staff
+    return row
+
+
+# The manifest fixture freezes this identity for KA_SERVICE_ID. A catalogue row
+# built from it is what "unchanged existing mapping" looks like; changing one
+# field of it is what drift looks like.
+BASELINE_NAME = "Mascara Effekt"
+BASELINE_PRICE_MINOR = 9000
+BASELINE_MINUTES = 60
+
+
+def baseline_catalog_row(**overrides: Any) -> dict[str, Any]:
+    row = catalog_row(
+        KA_SERVICE_UUID,
+        name=BASELINE_NAME,
+        price=BASELINE_PRICE_MINOR,
+        minutes=BASELINE_MINUTES,
+    )
+    row.update(overrides)
     return row
 
 
@@ -150,7 +181,6 @@ def make_inputs(state_dir: Path, *, manifest_text: str | None = None, mode: str 
     text = manifest_text or manifest_json()
     manifest = inventory_manifest(text)
     assert manifest.valid, manifest.reason
-    branch = manifest.branch(KARLSRUHE_COMPANY_ID)
     return PrepareInputs(
         mode=mode,
         run_id="run-prepare",
@@ -160,9 +190,6 @@ def make_inputs(state_dir: Path, *, manifest_text: str | None = None, mode: str 
         altegio_company_id=KARLSRUHE_COMPANY_ID,
         cutover=parse_cutover(CUTOVER),
         horizon_days=30,
-        selected_staff_uuids=frozenset(
-            uuid for staff_id, uuid in branch.staff.items() if staff_id in branch.selected_staff_ids
-        ),
     )
 
 
@@ -190,18 +217,47 @@ def propose(
     records: list[dict[str, Any]] | None = None,
     branch: Any = None,
     staff: dict[str, Any] | None = None,
-    selected: set[str] | None = None,
+    staff_ids: set[int] | None = None,
 ):
+    """Build proposals the way the shared snapshot builder does.
+
+    ``branch`` defaults to a branch that maps the STAFF but no services, which is
+    what a fresh service proposal needs: availability is judged through the
+    Altegio-id → EasyWeek-uuid staff mapping, so a branch without it would make
+    every verdict `unstated` for the wrong reason. Pass `mapped_branch()` to
+    exercise an existing mapping.
+    """
+    if branch is None:
+        branch = inventory_manifest(manifest_without_service()).branch(KARLSRUHE_COMPANY_ID)
     snapshot = build_catalog_snapshot(KA_LOCATION_UUID, catalog_rows)
-    services = collect_source_services(records or [source_record()], staff_ids={KA_STAFF_ID})
+    services = collect_source_services(records or [source_record()], staff_ids=staff_ids or {KA_STAFF_ID})
     return propose_service_mapping(
         altegio_company_id=KARLSRUHE_COMPANY_ID,
         source_services=services,
         catalog=snapshot,
         catalog_staff=staff or {},
-        selected_staff_uuids=selected or set(),
         branch=branch,
     )
+
+
+async def snapshot_for(inputs: PrepareInputs, client: Any = None) -> Any:
+    """The same live snapshot the CLI builds before every confirm."""
+    return await build_preparation_snapshot(inputs, write_client=client or FakePrepareClient())
+
+
+async def confirm_customer(inputs: PrepareInputs, review: Any, phone: str, *, client: Any = None) -> dict[str, Any]:
+    """Confirm one customer the way an operator does: identifier plus digest."""
+    digest = next(row["review_digest"] for row in review.operator["customers"] if row["phone"] == phone)
+    return apply_confirmations(
+        inputs,
+        ConfirmRequest(confirm_customers=(ConfirmTarget(identifier=phone, review_digest=digest),)),
+        snapshot=await snapshot_for(inputs, client),
+    )
+
+
+def mapped_branch() -> Any:
+    """The Karlsruhe branch with its reviewed service baseline in place."""
+    return parse_manifest(manifest_json()).branch(KARLSRUHE_COMPANY_ID)
 
 
 def test_an_exact_name_match_is_proposed_with_its_numbers() -> None:
@@ -254,7 +310,6 @@ def test_a_service_the_master_cannot_perform_is_never_actionable() -> None:
     proposals = propose(
         [catalog_row(staff=["other-uuid"])],
         staff={KA_SERVICE_UUID: frozenset({"other-uuid"})},
-        selected={KA_STAFF_UUID},
     )
 
     assert proposals[0].chosen.staff_availability == STAFF_AVAILABILITY_ABSENT
@@ -265,18 +320,34 @@ def test_availability_is_proven_when_the_catalogue_names_the_master() -> None:
     proposals = propose(
         [catalog_row(staff=[KA_STAFF_UUID])],
         staff={KA_SERVICE_UUID: frozenset({KA_STAFF_UUID})},
-        selected={KA_STAFF_UUID},
     )
 
     assert proposals[0].chosen.staff_availability == STAFF_AVAILABILITY_PROVEN
+    assert proposals[0].chosen.required_staff_uuids == (KA_STAFF_UUID,)
 
 
 def test_a_catalogue_that_states_no_staff_says_so_rather_than_passing() -> None:
     """Silence is not a claim, and it is not invented into one."""
-    proposals = propose([catalog_row()], staff={KA_SERVICE_UUID: None}, selected={KA_STAFF_UUID})
+    proposals = propose([catalog_row()], staff={KA_SERVICE_UUID: None})
 
     assert proposals[0].chosen.staff_availability == STAFF_AVAILABILITY_UNSTATED
     assert proposals[0].actionable is True, "unprovable is not refused, it is flagged"
+
+
+def test_a_master_with_no_easyweek_uuid_leaves_availability_unstated() -> None:
+    """We cannot check coverage for somebody the manifest cannot name."""
+    unmapped = source_record()
+    unmapped["staff_id"] = KA_OTHER_STAFF_ID
+    proposals = propose(
+        [catalog_row(staff=[KA_STAFF_UUID])],
+        records=[unmapped],
+        staff={KA_SERVICE_UUID: frozenset({KA_STAFF_UUID})},
+        staff_ids={KA_OTHER_STAFF_ID},
+    )
+
+    candidate = proposals[0].chosen
+    assert candidate.staff_availability == STAFF_AVAILABILITY_UNSTATED
+    assert candidate.unmapped_staff_ids == (KA_OTHER_STAFF_ID,)
 
 
 def test_the_staff_reader_distinguishes_absent_from_empty() -> None:
@@ -286,20 +357,21 @@ def test_the_staff_reader_distinguishes_absent_from_empty() -> None:
     assert read_service_staff_uuids({"uuid": "x", "employees": [17]}) is None
 
 
-def test_an_already_mapped_service_is_not_re_proposed() -> None:
-    manifest = parse_manifest(manifest_json())
-    [proposal] = propose([catalog_row()], branch=manifest.branch(KARLSRUHE_COMPANY_ID))
+def test_an_unchanged_existing_mapping_is_not_re_proposed() -> None:
+    [proposal] = propose([baseline_catalog_row()], branch=mapped_branch())
 
     assert proposal.status == PROPOSAL_ALREADY_MAPPED
     assert proposal.existing_uuid == KA_SERVICE_UUID
+    assert proposal.drift_fields == ()
+    assert proposal.settled is True
 
 
 def test_a_mapped_uuid_missing_from_the_catalogue_is_flagged() -> None:
-    manifest = parse_manifest(manifest_json())
-    [proposal] = propose([catalog_row(OTHER_SERVICE_UUID)], branch=manifest.branch(KARLSRUHE_COMPANY_ID))
+    [proposal] = propose([catalog_row(OTHER_SERVICE_UUID)], branch=mapped_branch())
 
     assert proposal.status == "conflicts_with_manifest"
     assert proposal.actionable is False
+    assert proposal.settled is False
 
 
 # ---------------------------------------------------------------------------
@@ -568,8 +640,8 @@ async def test_prepare_is_idempotent_for_unchanged_data(state_dir: Path, monkeyp
     stub_source(monkeypatch, [source_record()])
     inputs = make_inputs(state_dir)
 
-    await run_prepare(inputs, write_client=FakePrepareClient())
-    apply_confirmations(inputs, ConfirmRequest(confirm_customers=(PHONE,)))
+    first = await run_prepare(inputs, write_client=FakePrepareClient())
+    await confirm_customer(inputs, first, PHONE)
     result = await run_prepare(inputs, write_client=FakePrepareClient())
 
     assert result.machine["customers"]["pending_confirmation"] == 0
@@ -616,7 +688,7 @@ async def test_a_confirmed_mapping_reaches_the_proposed_manifest(
             confirm_all_services=True,
             expected_mapping_digest=result.machine["mapping"]["pending_digest"],
         ),
-        proposals=propose([catalog_row()]),
+        snapshot=await snapshot_for(inputs),
     )
 
     merged = json.loads((state_dir / FILE_MANIFEST_PROPOSED).read_text())
@@ -637,8 +709,16 @@ async def test_a_mapping_batch_confirmation_refuses_a_moved_list(
         apply_confirmations(
             inputs,
             ConfirmRequest(confirm_all_services=True, expected_mapping_digest="stale"),
-            proposals=propose([catalog_row()]),
+            snapshot=await snapshot_for(inputs),
         )
+
+    assert (
+        not (state_dir / FILE_MANIFEST_PROPOSED).exists()
+        or json.loads((state_dir / FILE_MANIFEST_PROPOSED).read_text())["branches"][str(KARLSRUHE_COMPANY_ID)][
+            "services"
+        ]
+        == {}
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -828,3 +908,515 @@ async def test_the_handover_command_parses_with_the_migrators_own_parser(
     assert parsed.apply is True
     assert parsed.verified_dry_run_id == "d"
     assert parsed.confirm_native_notifications_disabled is True
+
+
+# ---------------------------------------------------------------------------
+# Prepare and confirm must see the same wave (review finding 1)
+# ---------------------------------------------------------------------------
+
+
+def out_of_scope_records() -> list[dict[str, Any]]:
+    """One booking before the cutover and one already cancelled.
+
+    Both are out of the wave, and the confirm path used to collect services from
+    every fetched booking — so a service only these rows use could be proposed,
+    digested and confirmed although nothing in the wave uses it.
+    """
+    past = source_record(900010, service_id=SECOND_SERVICE_ID, service_name="Alte Leistung")
+    past["date"] = "2026-08-20 12:00:00"
+    cancelled = source_record(900011, service_id=SECOND_SERVICE_ID, service_name="Alte Leistung")
+    cancelled["deleted"] = True
+    return [past, cancelled]
+
+
+@pytest.mark.asyncio
+async def test_prepare_proposes_only_services_the_wave_actually_uses(
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stub_source(monkeypatch, [source_record(), *out_of_scope_records()])
+
+    result = await run_prepare(
+        make_inputs(state_dir, manifest_text=manifest_without_service()), write_client=FakePrepareClient()
+    )
+
+    proposed = {row["altegio_service_id"] for row in result.machine["mapping"]["proposals"]}
+    assert proposed == {KA_SERVICE_ID}, "the pre-cutover and cancelled rows are not this wave"
+    assert result.machine["source"]["records_in_scope"] == 1
+    assert result.machine["source"]["records_fetched"] == 3
+
+
+@pytest.mark.asyncio
+async def test_confirm_rebuilds_the_same_wave_and_the_same_digests(
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unchanged inputs, identical proposals — item digests and list digest."""
+    stub_source(monkeypatch, [source_record(), *out_of_scope_records()])
+    inputs = make_inputs(state_dir, manifest_text=manifest_without_service())
+
+    review = await run_prepare(inputs, write_client=FakePrepareClient())
+    snapshot = await snapshot_for(inputs)
+
+    reviewed = {row["altegio_service_id"]: row["review_digest"] for row in result_proposals(review)}
+    rebuilt = {proposal.source.altegio_service_id: proposal_digest(proposal) for proposal in snapshot.proposals}
+    assert reviewed == rebuilt
+    assert (
+        mapping_pending_digest(list(snapshot.proposals), MappingAgreement())
+        == (review.machine["mapping"]["pending_digest"])
+    )
+    assert {row["phone"]: row["review_digest"] for row in review.operator["customers"]} == {
+        phone: record.shown_digest for phone, record in snapshot.customer_proposals.items()
+    }
+
+
+def result_proposals(review: Any) -> list[dict[str, Any]]:
+    return review.operator["service_mapping"]
+
+
+@pytest.mark.asyncio
+async def test_confirm_reads_the_catalogue_once_and_reverifies_branch_identity(
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from altegio_bot.settings import settings
+
+    stub_source(monkeypatch, [source_record()])
+    inputs = make_inputs(state_dir, manifest_text=manifest_without_service())
+
+    client = FakePrepareClient()
+    await build_preparation_snapshot(inputs, write_client=client)
+    assert client.calls.count("catalog") == 1
+
+    monkeypatch.setattr(settings, "easyweek_location_map", "{}", raising=False)
+    with pytest.raises(PrepareError):
+        await build_preparation_snapshot(inputs, write_client=FakePrepareClient())
+
+
+@pytest.mark.asyncio
+async def test_confirm_cannot_make_an_unavailable_service_actionable(
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The catalogue withholds the service from the master who books it."""
+    stub_source(monkeypatch, [source_record()])
+    inputs = make_inputs(state_dir, manifest_text=manifest_without_service())
+    client = FakePrepareClient(catalog=[catalog_row(staff=["somebody-else"])])
+
+    review = await run_prepare(inputs, write_client=client)
+    [shown] = review.machine["mapping"]["proposals"]
+    assert shown["actionable"] is False
+    assert shown["staff_availability"] == STAFF_AVAILABILITY_ABSENT
+
+    snapshot = await snapshot_for(inputs, FakePrepareClient(catalog=[catalog_row(staff=["somebody-else"])]))
+    with pytest.raises(PrepareError):
+        apply_confirmations(
+            inputs,
+            ConfirmRequest(
+                confirm_services=(ConfirmTarget(identifier=str(KA_SERVICE_ID), review_digest=shown["review_digest"]),)
+            ),
+            snapshot=snapshot,
+        )
+
+    merged = json.loads((state_dir / FILE_MANIFEST_PROPOSED).read_text())
+    assert merged["branches"][str(KARLSRUHE_COMPANY_ID)]["services"] == {}
+
+
+# ---------------------------------------------------------------------------
+# Availability is per service, not per wave (review finding 3)
+# ---------------------------------------------------------------------------
+
+
+def two_master_records() -> list[dict[str, Any]]:
+    """Master A books the service; master B is in the wave and books another."""
+    a = source_record(900001)
+    b = source_record(900002, service_id=SECOND_SERVICE_ID, service_name="Zweite Leistung")
+    b["staff_id"] = KA_SECOND_STAFF_ID
+    return [a, b]
+
+
+def two_master_branch() -> Any:
+    payload = json.loads(manifest_without_service())
+    branch = payload["branches"][str(KARLSRUHE_COMPANY_ID)]
+    branch["selected_altegio_staff_ids"] = [KA_STAFF_ID, KA_SECOND_STAFF_ID]
+    branch["deferred_altegio_staff_ids"] = []
+    branch["staff"][str(KA_SECOND_STAFF_ID)] = KA_SECOND_STAFF_UUID
+    return inventory_manifest(json.dumps(payload)).branch(KARLSRUHE_COMPANY_ID)
+
+
+def test_another_selected_masters_access_is_not_evidence() -> None:
+    """A books it; the catalogue offers it only to B. That proves nothing."""
+    proposals = propose(
+        [catalog_row(staff=[KA_SECOND_STAFF_UUID])],
+        records=two_master_records(),
+        branch=two_master_branch(),
+        staff={KA_SERVICE_UUID: frozenset({KA_SECOND_STAFF_UUID})},
+        staff_ids={KA_STAFF_ID, KA_SECOND_STAFF_ID},
+    )
+    by_id = {proposal.source.altegio_service_id: proposal for proposal in proposals}
+
+    candidate = by_id[KA_SERVICE_ID].chosen
+    assert candidate.staff_availability == STAFF_AVAILABILITY_ABSENT
+    assert candidate.required_staff_uuids == (KA_STAFF_UUID,), "A books it, so A is who must be covered"
+    assert by_id[KA_SERVICE_ID].actionable is False
+
+
+def test_every_master_who_books_the_service_must_be_covered() -> None:
+    """Both masters book it; the catalogue names only one. Not proven."""
+    shared = two_master_records()
+    shared[1]["services"][0]["id"] = KA_SERVICE_ID
+    shared[1]["services"][0]["title"] = "Wimpernverlängerung 2D"
+
+    [proposal] = propose(
+        [catalog_row(staff=[KA_STAFF_UUID])],
+        records=shared,
+        branch=two_master_branch(),
+        staff={KA_SERVICE_UUID: frozenset({KA_STAFF_UUID})},
+        staff_ids={KA_STAFF_ID, KA_SECOND_STAFF_ID},
+    )
+
+    assert proposal.chosen.required_staff_uuids == tuple(sorted((KA_STAFF_UUID, KA_SECOND_STAFF_UUID)))
+    assert proposal.chosen.staff_availability == STAFF_AVAILABILITY_ABSENT
+
+
+def test_availability_is_proven_when_every_actual_master_is_covered() -> None:
+    shared = two_master_records()
+    shared[1]["services"][0]["id"] = KA_SERVICE_ID
+    shared[1]["services"][0]["title"] = "Wimpernverlängerung 2D"
+
+    [proposal] = propose(
+        [catalog_row(staff=[KA_STAFF_UUID, KA_SECOND_STAFF_UUID])],
+        records=shared,
+        branch=two_master_branch(),
+        staff={KA_SERVICE_UUID: frozenset({KA_STAFF_UUID, KA_SECOND_STAFF_UUID})},
+        staff_ids={KA_STAFF_ID, KA_SECOND_STAFF_ID},
+    )
+
+    assert proposal.chosen.staff_availability == STAFF_AVAILABILITY_PROVEN
+    assert proposal.actionable is True
+
+
+def test_a_catalogue_naming_extra_masters_is_still_proven() -> None:
+    """Coverage is a superset test, not an equality one."""
+    [proposal] = propose(
+        [catalog_row(staff=[KA_STAFF_UUID, KA_SECOND_STAFF_UUID, "a-third-master"])],
+        staff={KA_SERVICE_UUID: frozenset({KA_STAFF_UUID, KA_SECOND_STAFF_UUID, "a-third-master"})},
+    )
+
+    assert proposal.chosen.staff_availability == STAFF_AVAILABILITY_PROVEN
+
+
+# ---------------------------------------------------------------------------
+# Existing mappings drift (review finding 4)
+# ---------------------------------------------------------------------------
+
+
+DRIFTS = {
+    "catalog_service_name": {"name": "Mascara Effekt XL"},
+    "catalog_currency": {"currency": "CHF"},
+    "catalog_price": {"price": 9500},
+    "catalog_duration_minutes": {"duration": {"value": 90, "label": "minutes"}},
+}
+
+
+def mapped_source() -> list[dict[str, Any]]:
+    """A booking whose service the manifest already maps."""
+    return [source_record(service_name=BASELINE_NAME)]
+
+
+def test_an_unchanged_existing_mapping_needs_no_confirmation() -> None:
+    [proposal] = propose([baseline_catalog_row()], records=mapped_source(), branch=mapped_branch())
+
+    assert proposal.status == PROPOSAL_ALREADY_MAPPED
+    assert proposal.settled is True
+    assert proposal.drift_fields == ()
+
+
+@pytest.mark.parametrize("field", sorted(DRIFTS))
+def test_each_drifted_baseline_field_is_reported_as_a_conflict(field: str) -> None:
+    """A matching UUID over a moved service is not a matching service."""
+    [proposal] = propose([baseline_catalog_row(**DRIFTS[field])], records=mapped_source(), branch=mapped_branch())
+
+    assert proposal.status == PROPOSAL_BASELINE_DRIFT
+    assert proposal.drift_fields == (field,)
+    assert proposal.settled is False
+    assert proposal.actionable is False, "drift is not something a confirmation resolves"
+
+
+def test_a_drifted_mapping_names_the_changed_field_to_the_operator() -> None:
+    [proposal] = propose(
+        [baseline_catalog_row(**DRIFTS["catalog_price"])], records=mapped_source(), branch=mapped_branch()
+    )
+    shown = proposal.as_operator_dict()
+
+    assert shown["drift_fields"] == ["catalog_price"]
+    assert shown["existing_manifest_baseline"]["catalog_price"] == "90.00"
+    assert shown["target"] is None, "a drifted mapping offers no target to accept"
+    assert shown["candidates"][0]["price"] == "95.00", "and the live value is shown next to it"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", sorted(DRIFTS))
+async def test_drift_makes_the_wave_not_ready_and_rewrites_no_manifest(
+    field: str, state_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stub_source(monkeypatch, mapped_source())
+    inputs = make_inputs(state_dir)
+    client = FakePrepareClient(catalog=[baseline_catalog_row(**DRIFTS[field])])
+
+    result = await run_prepare(inputs, write_client=client)
+
+    assert result.machine["ready"]["mapping_ready"] is False
+    assert [row["altegio_service_id"] for row in result.machine["mapping"]["drift"]] == [KA_SERVICE_ID]
+
+    merged = json.loads((state_dir / FILE_MANIFEST_PROPOSED).read_text())
+    entry = merged["branches"][str(KARLSRUHE_COMPANY_ID)]["services"][str(KA_SERVICE_ID)]
+    assert entry["catalog_service_name"] == BASELINE_NAME, "the reviewed baseline is never overwritten"
+    assert entry["catalog_price"] == "90.00"
+    assert entry["catalog_duration_minutes"] == 60
+
+
+@pytest.mark.asyncio
+async def test_an_unchanged_existing_mapping_reports_the_wave_mapping_ready(
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stub_source(monkeypatch, mapped_source())
+    client = FakePrepareClient(catalog=[baseline_catalog_row()])
+
+    result = await run_prepare(make_inputs(state_dir), write_client=client)
+
+    assert result.machine["ready"]["mapping_ready"] is True
+    assert result.machine["mapping"]["drift"] == []
+
+
+def test_a_mapping_without_a_reviewed_baseline_is_not_readiness() -> None:
+    """Mapped, present, and nothing recorded to compare it against."""
+    payload = json.loads(manifest_json())
+    entry = payload["branches"][str(KARLSRUHE_COMPANY_ID)]["services"][str(KA_SERVICE_ID)]
+    entry.pop("catalog_service_name")
+    entry.pop("catalog_currency")
+    branch = inventory_manifest(json.dumps(payload)).branch(KARLSRUHE_COMPANY_ID)
+
+    [proposal] = propose([baseline_catalog_row()], records=mapped_source(), branch=branch)
+
+    assert proposal.status == PROPOSAL_BASELINE_INCOMPLETE
+    assert proposal.settled is False
+    assert proposal.actionable is False
+
+
+# ---------------------------------------------------------------------------
+# The digest covers everything shown (review finding 5)
+# ---------------------------------------------------------------------------
+
+
+def digest_of(catalog_rows: list[dict[str, Any]], records: list[dict[str, Any]] | None = None) -> str:
+    [proposal] = propose(catalog_rows, records=records)
+    return proposal_digest(proposal)
+
+
+BASE_DIGEST_INPUTS: dict[str, Any] = {}
+
+
+def test_the_review_payload_and_the_digest_are_the_same_structure() -> None:
+    """One canonical payload, so a shown field cannot escape the digest."""
+    [proposal] = propose([catalog_row()])
+    shown = proposal.as_operator_dict()
+
+    rebuilt = dict(shown)
+    rebuilt.pop("review_digest")
+    assert rebuilt == proposal.review_payload()
+    assert shown["review_digest"] == proposal_digest(proposal)
+
+
+def test_a_changed_source_price_changes_the_digest() -> None:
+    before = digest_of([catalog_row()])
+    dearer = source_record()
+    dearer["services"][0]["cost"] = 95.0
+    dearer["services"][0]["cost_to_pay"] = 95.0
+
+    assert digest_of([catalog_row()], [dearer]) != before
+
+
+def test_a_changed_source_duration_changes_the_digest() -> None:
+    before = digest_of([catalog_row()])
+    longer = source_record()
+    # The service line's own length is what the review shows as the observed
+    # source duration, so that is the field the digest has to follow.
+    longer["services"][0]["seance_length"] = 5400
+
+    assert digest_of([catalog_row()], [longer]) != before
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"uuid": OTHER_SERVICE_UUID},
+        # Same service under the normalisation, different spelling on screen.
+        # It stays a unique-name match, so this isolates the DISPLAYED name.
+        {"name": "WIMPERNVERLÄNGERUNG 2D"},
+        {"currency": "CHF"},
+        {"price": 9500},
+        {"duration": {"value": 90, "label": "minutes"}},
+    ],
+    ids=["target_uuid", "target_name", "target_currency", "target_price", "target_duration"],
+)
+def test_a_changed_target_attribute_changes_the_digest(override: dict[str, Any]) -> None:
+    before = digest_of([catalog_row()])
+    row = catalog_row()
+    row.update(override)
+
+    assert digest_of([row]) != before
+
+
+def test_a_changed_availability_verdict_changes_the_digest() -> None:
+    """The evidence a verdict rests on is part of what was agreed."""
+    permissive = propose([catalog_row(staff=[KA_STAFF_UUID])], staff={KA_SERVICE_UUID: frozenset({KA_STAFF_UUID})})
+    silent = propose([catalog_row()], staff={KA_SERVICE_UUID: None})
+
+    assert proposal_digest(permissive[0]) != proposal_digest(silent[0])
+
+
+def test_reordering_equivalent_inputs_does_not_change_the_digest() -> None:
+    """The digest follows the data, not the order the API returned rows in."""
+    two = [source_record(900001), source_record(900002)]
+    forward = digest_of([catalog_row(), catalog_row(OTHER_SERVICE_UUID, name="Andere")], two)
+    reversed_rows = digest_of([catalog_row(OTHER_SERVICE_UUID, name="Andere"), catalog_row()], list(reversed(two)))
+
+    assert forward == reversed_rows
+
+
+def test_the_digest_carries_no_timestamp_or_sequence_field() -> None:
+    [proposal] = propose([catalog_row()])
+    blob = json.dumps(proposal.review_payload())
+
+    for unstable in ("timestamp", "fetched_at", "run_id", "page", "received", "_at"):
+        assert unstable not in blob, unstable
+
+
+# ---------------------------------------------------------------------------
+# Reporting hygiene and the contracts that must keep holding (findings 9, 10)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_neither_the_report_nor_the_logs_carry_personal_data(
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    booking_uuid = "cafe0000-0000-4000-8000-000000000123"
+    record = source_record(client={"phone": PHONE, "first_name": "Testkundin", "email": "k@example.invalid", "id": 42})
+    record["easyweek_booking_uuid"] = booking_uuid
+    stub_source(monkeypatch, [record])
+
+    with caplog.at_level("INFO"):
+        result = await run_prepare(make_inputs(state_dir), write_client=FakePrepareClient())
+
+    blobs = [json.dumps(result.machine, ensure_ascii=False), caplog.text]
+    for blob in blobs:
+        for secret in (PHONE, "Testkundin", "k@example.invalid", booking_uuid, "Wimpernverlängerung"):
+            assert secret not in blob, secret
+
+
+@pytest.mark.asyncio
+async def test_the_merge_stays_additive_after_a_confirmation(state_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A previous wave's reviewed mapping is never re-pointed by this one."""
+    both = [
+        source_record(service_name=BASELINE_NAME),
+        source_record(900002, service_id=SECOND_SERVICE_ID, service_name="Zweite Leistung"),
+    ]
+    stub_source(monkeypatch, both)
+    inputs = make_inputs(state_dir)
+    catalog = [baseline_catalog_row(), catalog_row(OTHER_SERVICE_UUID, name="Zweite Leistung")]
+
+    review = await run_prepare(inputs, write_client=FakePrepareClient(catalog=catalog))
+    shown = {row["altegio_service_id"]: row["review_digest"] for row in review.operator["service_mapping"]}
+
+    apply_confirmations(
+        inputs,
+        ConfirmRequest(
+            confirm_services=(ConfirmTarget(identifier=str(SECOND_SERVICE_ID), review_digest=shown[SECOND_SERVICE_ID]),)
+        ),
+        snapshot=await snapshot_for(inputs, FakePrepareClient(catalog=catalog)),
+    )
+
+    services = json.loads((state_dir / FILE_MANIFEST_PROPOSED).read_text())["branches"][str(KARLSRUHE_COMPANY_ID)][
+        "services"
+    ]
+    assert services[str(KA_SERVICE_ID)]["easyweek_service_uuid"] == KA_SERVICE_UUID, "untouched"
+    assert services[str(SECOND_SERVICE_ID)]["easyweek_service_uuid"] == OTHER_SERVICE_UUID
+
+
+@pytest.mark.asyncio
+async def test_a_service_confirmation_needs_the_digest_the_operator_saw(
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stub_source(monkeypatch, [source_record()])
+    inputs = make_inputs(state_dir, manifest_text=manifest_without_service())
+    review = await run_prepare(inputs, write_client=FakePrepareClient())
+    [shown] = review.operator["service_mapping"]
+
+    with pytest.raises(PrepareError):
+        apply_confirmations(
+            inputs,
+            ConfirmRequest(confirm_services=(ConfirmTarget(identifier=str(KA_SERVICE_ID), review_digest="wrong"),)),
+            snapshot=await snapshot_for(inputs),
+        )
+    assert (
+        json.loads((state_dir / FILE_MANIFEST_PROPOSED).read_text())["branches"][str(KARLSRUHE_COMPANY_ID)]["services"]
+        == {}
+    )
+
+    apply_confirmations(
+        inputs,
+        ConfirmRequest(
+            confirm_services=(ConfirmTarget(identifier=str(KA_SERVICE_ID), review_digest=shown["review_digest"]),)
+        ),
+        snapshot=await snapshot_for(inputs),
+    )
+    assert (
+        json.loads((state_dir / FILE_MANIFEST_PROPOSED).read_text())["branches"][str(KARLSRUHE_COMPANY_ID)]["services"][
+            str(KA_SERVICE_ID)
+        ]["easyweek_service_uuid"]
+        == KA_SERVICE_UUID
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_service_confirmation_with_a_stale_digest_is_refused(
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reviewed at one price, confirmed after the catalogue moved."""
+    stub_source(monkeypatch, [source_record()])
+    inputs = make_inputs(state_dir, manifest_text=manifest_without_service())
+    review = await run_prepare(inputs, write_client=FakePrepareClient())
+    [shown] = review.operator["service_mapping"]
+
+    moved = FakePrepareClient(catalog=[catalog_row(price=12000)])
+    with pytest.raises(PrepareError):
+        apply_confirmations(
+            inputs,
+            ConfirmRequest(
+                confirm_services=(ConfirmTarget(identifier=str(KA_SERVICE_ID), review_digest=shown["review_digest"]),)
+            ),
+            snapshot=await snapshot_for(inputs, moved),
+        )
+
+    assert (
+        json.loads((state_dir / FILE_MANIFEST_PROPOSED).read_text())["branches"][str(KARLSRUHE_COMPANY_ID)]["services"]
+        == {}
+    )
+
+
+def test_no_fuzzy_matching_survived_the_rewrite() -> None:
+    """Still exact canonical-name equality, and nothing else."""
+    assert propose([catalog_row(name="Wimpernverlangerung 2D")])[0].status == PROPOSAL_NO_CANDIDATE
+    assert propose([catalog_row(name="Wimpern 2D")])[0].status == PROPOSAL_NO_CANDIDATE
+    assert propose([catalog_row(name="WIMPERNVERLÄNGERUNG   2D")])[0].status == PROPOSAL_UNIQUE_NAME
+
+
+def test_every_frozen_baseline_field_has_a_drift_check() -> None:
+    """A new manifest baseline field must not arrive without a drift check.
+
+    ``BASELINE_FIELDS`` is the manifest's frozen identity. The UUID is checked by
+    presence in the catalogue rather than by comparison, so it is the one
+    exception; every other field has to appear in the drift parametrisation
+    above, or a service could move under that field unnoticed.
+    """
+    compared = set(BASELINE_FIELDS) - {"easyweek_service_uuid"}
+
+    assert compared == set(DRIFTS), "add the new baseline field to DRIFTS"

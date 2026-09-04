@@ -79,12 +79,19 @@ sudo cat /opt/altegio_bot/outputs/easyweek_migration_prepare/operator_review.jso
 В нём три блока.
 
 `customers` — имя и телефон из источника, email (только если он действительно
-есть), количество связанных записей и рядом с каждым клиентом напоминание, что
-**создание карточки не переносит историю визитов**. Клиент, созданный сейчас,
-выглядит в EasyWeek как пришедший впервые.
+есть), количество связанных записей, `review_digest` и рядом с каждым клиентом
+напоминание, что **создание карточки не переносит историю визитов**. Клиент,
+созданный сейчас, выглядит в EasyWeek как пришедший впервые.
 
 `service_mapping` — исходный service ID и точное имя, целевой service UUID и
-точное имя, цена с валютой, длительность и количество затронутых записей.
+точное имя, цена с валютой, длительность, количество затронутых записей,
+`staff_availability` с доказательством, `drift_fields` и `review_digest`.
+
+**`review_digest` — это то, что вы копируете в команду подтверждения.** Он
+покрывает все показанные поля целиком: имя, телефон, email и количество записей
+у клиента; исходную цену и длительность, целевой UUID, имя, валюту, цену,
+длительность и доказательство доступности у услуги. Если изменилось что-то одно,
+дайджест другой, и старое подтверждение больше не действует.
 
 `records` — каждая запись волны: `altegio_record_id`, мастер, начало и конец в
 Europe/Berlin (плюс тот же момент в UTC), длительность, услуга, цена и
@@ -110,10 +117,22 @@ Europe/Berlin (плюс тот же момент в UTC), длительност
 Ни одна команда этапа не читает stdin: Docker без TTY, закрытый pipe и EOF
 согласием не являются. Согласие — это явные аргументы.
 
-Услуги, по одной:
+**Порядок всегда один: сначала review из шага 2, потом команда.** Одиночное
+подтверждение принимает не идентификатор, а пару `ИДЕНТИФИКАТОР=DIGEST`, где
+digest — это `review_digest`, напечатанный рядом с этим самым элементом. Голый
+идентификатор командой отклоняется: он означал бы «подтверждаю то, что сегодня
+лежит под этим номером», а человек, читающий список, имеет в виду не это.
+
+`confirm` не верит сохранённому файлу. Он заново проверяет branch identity,
+заново классифицирует записи, заново читает каталог и клиентов — и сверяет три
+вещи: ваш digest, digest только что перестроенного предложения и внутреннюю
+целостность сохранённого решения. Расхождение в любой из трёх — STOP, при
+котором **ничего** не меняется: ни manifest, ни решения по клиентам.
+
+Услуги, по одной (id и digest из `service_mapping`):
 
 ```bash
-cd /path/to/altegio_bot && uv run python -m altegio_bot.scripts.easyweek_migration_prepare confirm --manifest outputs/easyweek_migration/input/manifest.json --company-id 758285 --cutover-at 2026-09-01T00:00:00+02:00 --confirm-service 6001 --confirm-service 6002
+cd /path/to/altegio_bot && uv run python -m altegio_bot.scripts.easyweek_migration_prepare confirm --manifest outputs/easyweek_migration/input/manifest.json --company-id 758285 --cutover-at 2026-09-01T00:00:00+02:00 --confirm-service '6001=REVIEW_DIGEST_УСЛУГИ_6001' --confirm-service '6002=REVIEW_DIGEST_УСЛУГИ_6002'
 ```
 
 Все однозначные сразу — только против дайджеста напечатанного списка
@@ -135,7 +154,7 @@ cd /path/to/altegio_bot && uv run python -m altegio_bot.scripts.easyweek_migrati
 Подтвердить клиента, пропустить клиента, подтвердить весь список:
 
 ```bash
-cd /path/to/altegio_bot && uv run python -m altegio_bot.scripts.easyweek_migration_prepare confirm --manifest outputs/easyweek_migration/input/manifest.json --company-id 758285 --cutover-at 2026-09-01T00:00:00+02:00 --confirm-customer +4915112345678
+cd /path/to/altegio_bot && uv run python -m altegio_bot.scripts.easyweek_migration_prepare confirm --manifest outputs/easyweek_migration/input/manifest.json --company-id 758285 --cutover-at 2026-09-01T00:00:00+02:00 --confirm-customer '+4915112345678=REVIEW_DIGEST_КЛИЕНТА'
 ```
 
 ```bash
@@ -149,7 +168,14 @@ cd /path/to/altegio_bot && uv run python -m altegio_bot.scripts.easyweek_migrati
 Подтверждение привязано к показанным данным. Если данные изменились,
 подтверждение снимается само, и клиент возвращается в `pending`.
 
-Повторный `prepare` **не переспрашивает** про то, что не изменилось.
+Повторный `prepare` **не переспрашивает** про то, что не изменилось: при
+неизменившихся входных данных `prepare` и `confirm` строят одинаковые
+предложения и одинаковые дайджесты.
+
+Исправление данных (`--correct-customer`) digest не требует — это не одобрение,
+а замена. Но оно меняет digest и возвращает клиента в `pending`, так что
+подтверждать придётся заново, уже глядя на исправленные значения. Исправить и
+подтвердить одного клиента одной командой нельзя: команда откажет.
 
 ---
 
@@ -232,6 +258,12 @@ canary.
 - Не переносит записи и не содержит второго мигратора.
 - Не сопоставляет услуги «похоже»: только точное совпадение канонического
   имени, всё остальное — на человека.
+- Не считает совпадение UUID достаточным: если у уже сопоставленной услуги в
+  каталоге изменились имя, валюта, цена или длительность, это `drift`, а не
+  готовность.
+- Не считает услугу доступной мастеру A на том основании, что каталог отдаёт её
+  мастеру B из той же волны. Покрыты должны быть все мастера, которые эту услугу
+  действительно ведут.
 - Не сливает клиентов, не выдумывает имя, email, телефон или историю визитов.
 - Не считает отсутствие клиента в EasyWeek доказательством первого визита и не
   обнуляет счётчики.
@@ -253,4 +285,9 @@ canary.
 | `blocked_reason: create_rejected_by_workspace` | телефон или email уже занят другим клиентом | найти владельца в EasyWeek. Контакты **не** менять ради обхода |
 | `DecisionStoreLocked` | идёт другой запуск | дождаться; файл блокировки снимать только вручную |
 | `the pending customer list has changed` | список изменился после печати | шаг 1, прочитать заново, подтвердить с новым дайджестом |
+| `needs IDENT=DIGEST` | передан голый идентификатор без дайджеста | скопировать `review_digest` из шага 2 |
+| `the supplied review digest does not match` | дайджест не от этого элемента или устарел | шаг 1 и 2 заново, взять свежий `review_digest` |
+| `the live data no longer matches the reviewed decision` | данные изменились после review | шаг 1 и 2 заново; ничего не изменено |
+| `existing_mapping_drift` | UUID тот же, но услуга в каталоге изменилась | сверить `drift_fields` и `existing_manifest_baseline` в review; manifest сам не переписывается |
+| `existing_mapping_baseline_incomplete` | в manifest нет замороженной identity услуги | дописать `catalog_service_name` и `catalog_currency` в manifest |
 | `branch identity unproven` | manifest указывает не на тот филиал | проверить `EASYWEEK_LOCATION_MAP` и `easyweek_location_*` в manifest |

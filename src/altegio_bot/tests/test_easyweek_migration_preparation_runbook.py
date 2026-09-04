@@ -190,3 +190,52 @@ def test_the_migrator_runbook_commands_are_not_duplicated_here(runbook: str) -> 
     assert parser.prog == "easyweek_migration"
     for line in [ln for block in bash_blocks(runbook) for ln in block.splitlines()]:
         assert "scripts.easyweek_migration " not in line, line
+
+
+# ---------------------------------------------------------------------------
+# Single confirmations are documented WITH their digests
+# ---------------------------------------------------------------------------
+
+
+def test_every_documented_single_confirmation_carries_a_digest(commands: list[str]) -> None:
+    """A bare identifier in the runbook would teach the unbound form back in."""
+    parser = prep.build_parser()
+    seen = 0
+    for line in commands:
+        args = parser.parse_args(command_args(line))
+        for raw in list(args.confirm_customer) + list(args.confirm_service):
+            seen += 1
+            target = prep._parse_confirm_target(raw, what="customer")
+            assert target.review_digest, line
+    assert seen >= 3, "the runbook must show confirming a customer and a service by digest"
+
+
+def test_the_runbook_states_the_digest_workflow(runbook: str) -> None:
+    text = prose(runbook)
+
+    assert "review_digest" in text
+    assert "сначала review из шага 2, потом команда" in text
+    assert "Голый идентификатор командой отклоняется" in text
+
+
+def test_the_runbook_says_confirm_rechecks_live_data(runbook: str) -> None:
+    text = prose(runbook)
+
+    assert "не верит сохранённому файлу" in text
+    assert "заново проверяет branch identity" in text
+    assert "сверяет три вещи" in text
+    assert "ничего** не меняется" in text
+
+
+def test_the_runbook_names_drift_and_per_master_availability(runbook: str) -> None:
+    text = prose(runbook)
+
+    assert "existing_mapping_drift" in text
+    assert "drift_fields" in text
+    assert "Не считает совпадение UUID достаточным" in text
+    assert "Покрыты должны быть все мастера" in text
+
+
+def test_the_runbook_promises_prepare_and_confirm_agree(runbook: str) -> None:
+    text = prose(runbook)
+    assert "одинаковые предложения и одинаковые дайджесты" in text

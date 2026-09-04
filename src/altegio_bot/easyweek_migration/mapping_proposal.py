@@ -35,8 +35,8 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Final
 
-from altegio_bot.easyweek_migration.manifest import BranchMapping
-from altegio_bot.easyweek_migration.money import AmountError, from_minor_units, read_amount
+from altegio_bot.easyweek_migration.manifest import BranchMapping, ServiceMapping, canonical_service_name
+from altegio_bot.easyweek_migration.money import AmountError, from_minor_units, read_amount, to_minor_units
 from altegio_bot.easyweek_migration.service_catalog import (
     CatalogService,
     CatalogSnapshot,
@@ -50,6 +50,16 @@ PROPOSAL_AMBIGUOUS: Final = "ambiguous_candidates"
 PROPOSAL_NO_CANDIDATE: Final = "no_candidate"
 PROPOSAL_ALREADY_MAPPED: Final = "already_mapped"
 PROPOSAL_CONFLICTS_WITH_MANIFEST: Final = "conflicts_with_manifest"
+# The manifest's UUID is still in the catalogue, but the service behind it has
+# moved: renamed, repriced, re-timed, or re-denominated. A matching UUID is not
+# a matching service, and reporting this as `already_mapped` told an operator a
+# wave was ready while the baseline every override check compares against had
+# quietly gone stale.
+PROPOSAL_BASELINE_DRIFT: Final = "existing_mapping_drift"
+# The manifest maps the service but never recorded the reviewed identity, so
+# there is no baseline to compare the live catalogue against. Not drift — we
+# cannot tell — and for that reason not readiness either.
+PROPOSAL_BASELINE_INCOMPLETE: Final = "existing_mapping_baseline_incomplete"
 PROPOSAL_SOURCE_NAME_UNUSABLE: Final = "source_name_unusable"
 
 # Whether the catalogue said this service can be booked with the chosen master.
@@ -63,6 +73,16 @@ STAFF_AVAILABILITY_ABSENT: Final = "not_available_for_selected_staff"
 STAFF_AVAILABILITY_UNSTATED: Final = "not_stated_by_catalogue"
 
 _STAFF_KEYS: Final = ("employees", "staff", "employee_uuids", "staff_uuids")
+
+# The baseline fields a manifest entry freezes, and the order they are reported
+# in. One tuple so the comparison, the report and the tests cannot drift apart.
+BASELINE_FIELDS: Final = (
+    "easyweek_service_uuid",
+    "catalog_service_name",
+    "catalog_currency",
+    "catalog_price",
+    "catalog_duration_minutes",
+)
 
 
 def _exact_price(raw: object) -> str | None:
@@ -123,6 +143,12 @@ class SourceService:
     # baseline, which the operator has to see before choosing one.
     observed_prices: tuple[str, ...] = ()
     observed_durations: tuple[int, ...] = ()
+    # The Altegio staff ids that ACTUALLY perform this service in the in-scope
+    # bookings — not the wave's staff list. The distinction is the whole point:
+    # availability was judged against the union of every selected master, so a
+    # service master A books, which the catalogue offers only to master B,
+    # counted as available because B happened to be in the same wave.
+    altegio_staff_ids: tuple[int, ...] = ()
 
     @property
     def normalized_name(self) -> str | None:
@@ -140,6 +166,15 @@ class CandidateService:
     price_minor: int
     duration_minutes: int
     staff_availability: str
+    # The evidence the availability verdict was reached on, so a reader — and
+    # the digest — can see WHY it says what it says. Required is the set of
+    # EasyWeek staff uuids the masters who actually book this service map to;
+    # stated is what the catalogue row named, or `None` when it named nothing.
+    required_staff_uuids: tuple[str, ...] = ()
+    stated_staff_uuids: tuple[str, ...] | None = None
+    # Masters who use the service but whose EasyWeek uuid the manifest does not
+    # give. Availability cannot be proven for somebody we cannot name.
+    unmapped_staff_ids: tuple[int, ...] = ()
 
     @property
     def price_text(self) -> str:
@@ -155,14 +190,23 @@ class CandidateService:
             return f"{self.price_minor} (minor units)"
 
     def as_operator_dict(self) -> dict[str, Any]:
+        """The canonical, deterministically ordered view of one candidate.
+
+        Feeds both the operator review and the proposal digest, so a field a
+        person was shown cannot change without the agreement lapsing.
+        """
         return {
             "easyweek_service_uuid": self.easyweek_service_uuid,
             "easyweek_service_name": self.name,
+            "easyweek_service_normalized_name": self.normalized_name,
             "currency": self.currency,
             "price": self.price_text,
             "price_minor_units": self.price_minor,
             "duration_minutes": self.duration_minutes,
             "staff_availability": self.staff_availability,
+            "required_staff_uuids": sorted(self.required_staff_uuids),
+            "stated_staff_uuids": sorted(self.stated_staff_uuids) if self.stated_staff_uuids is not None else None,
+            "unmapped_altegio_staff_ids": sorted(self.unmapped_staff_ids),
         }
 
 
@@ -175,6 +219,11 @@ class ServiceProposal:
     status: str
     candidates: tuple[CandidateService, ...] = ()
     existing_uuid: str | None = None
+    # The manifest baseline this proposal was compared against, and which of its
+    # fields disagree with the live catalogue. Empty when there is nothing
+    # mapped yet, or when the mapping still matches.
+    existing_baseline: tuple[tuple[str, str], ...] = ()
+    drift_fields: tuple[str, ...] = ()
 
     @property
     def chosen(self) -> CandidateService | None:
@@ -187,29 +236,58 @@ class ServiceProposal:
     def actionable(self) -> bool:
         """Can this proposal become a manifest entry once confirmed?"""
         candidate = self.chosen
-        # A service the catalogue says the chosen master cannot perform is never
-        # actionable, however exactly the names agree.
+        # A service the catalogue says the master who actually books it cannot
+        # perform is never actionable, however exactly the names agree.
         return candidate is not None and candidate.staff_availability != STAFF_AVAILABILITY_ABSENT
 
-    def presentation(self) -> dict[str, Any]:
-        """Exactly what a confirmation is about. Digested; see the decision store."""
+    @property
+    def settled(self) -> bool:
+        """Is this service done — mapped, matching, and needing no decision?
+
+        Only an unchanged existing mapping qualifies. Drift and an unverifiable
+        baseline both mean the wave is NOT ready, which is the correction: a
+        matching UUID over a moved service used to read as readiness.
+        """
+        return self.status == PROPOSAL_ALREADY_MAPPED
+
+    def review_payload(self) -> dict[str, Any]:
+        """THE canonical view of one proposal: shown to a person, and digested.
+
+        One structure for both jobs on purpose. When the review output and the
+        digest were built separately, a field could be displayed without being
+        covered — the observed source prices and durations were exactly that, so
+        a service whose bookings changed price kept an agreement made about the
+        old one.
+
+        Every collection here is sorted by a stable key, so two runs over the
+        same data digest identically however the API happened to order its rows.
+        Nothing time-, sequence- or transport-derived goes in.
+        """
         candidate = self.chosen
         return {
             "altegio_company_id": self.altegio_company_id,
             "altegio_service_id": self.source.altegio_service_id,
             "altegio_service_name": self.source.name,
+            "altegio_service_normalized_name": self.source.normalized_name,
             "booking_count": self.source.booking_count,
+            "observed_source_prices": sorted(self.source.observed_prices),
+            "observed_source_durations_minutes": sorted(self.source.observed_durations),
+            "altegio_staff_ids": sorted(self.source.altegio_staff_ids),
             "status": self.status,
+            "actionable": self.actionable,
             "target": candidate.as_operator_dict() if candidate else None,
+            "candidates": [
+                item.as_operator_dict() for item in sorted(self.candidates, key=lambda c: c.easyweek_service_uuid)
+            ],
+            "existing_manifest_uuid": self.existing_uuid,
+            "existing_manifest_baseline": {key: value for key, value in sorted(self.existing_baseline)},
+            "drift_fields": sorted(self.drift_fields),
         }
 
     def as_operator_dict(self) -> dict[str, Any]:
         """The reviewable form. Carries service names, so it is operator-only."""
-        payload = self.presentation()
-        payload["candidates"] = [candidate.as_operator_dict() for candidate in self.candidates]
-        payload["existing_manifest_uuid"] = self.existing_uuid
-        payload["observed_source_prices"] = list(self.source.observed_prices)
-        payload["observed_source_durations_minutes"] = list(self.source.observed_durations)
+        payload = self.review_payload()
+        payload["review_digest"] = proposal_digest(self)
         return payload
 
     def as_safe_dict(self) -> dict[str, Any]:
@@ -224,6 +302,9 @@ class ServiceProposal:
             "easyweek_service_uuid": candidate.easyweek_service_uuid if candidate else None,
             "staff_availability": candidate.staff_availability if candidate else None,
             "actionable": self.actionable,
+            "settled": self.settled,
+            "drift_fields": sorted(self.drift_fields),
+            "review_digest": proposal_digest(self),
         }
 
 
@@ -238,9 +319,11 @@ def collect_source_services(records: list[dict[str, Any]], *, staff_ids: set[int
     names: dict[int, str] = {}
     prices: dict[int, set[str]] = {}
     durations: dict[int, set[int]] = {}
+    performed_by: dict[int, set[int]] = {}
 
     for record in records:
-        if staff_ids is not None and _staff_id_of(record) not in staff_ids:
+        staff_id = _staff_id_of(record)
+        if staff_ids is not None and staff_id not in staff_ids:
             continue
         raw_services = record.get("services")
         if not isinstance(raw_services, list):
@@ -250,6 +333,8 @@ def collect_source_services(records: list[dict[str, Any]], *, staff_ids: set[int
                 continue
             service_id = item["id"]
             counts[service_id] += 1
+            if type(staff_id) is int:
+                performed_by.setdefault(service_id, set()).add(staff_id)
             title = item.get("title")
             if isinstance(title, str) and title.strip() and service_id not in names:
                 names[service_id] = title.strip()
@@ -267,6 +352,7 @@ def collect_source_services(records: list[dict[str, Any]], *, staff_ids: set[int
             booking_count=count,
             observed_prices=tuple(sorted(prices.get(service_id, ()))),
             observed_durations=tuple(sorted(durations.get(service_id, ()))),
+            altegio_staff_ids=tuple(sorted(performed_by.get(service_id, ()))),
         )
         for service_id, count in sorted(counts.items())
     ]
@@ -282,13 +368,77 @@ def _staff_id_of(record: dict[str, Any]) -> object:
     return None
 
 
-def _availability(service_uuid: str, staff_uuids: dict[str, frozenset[str] | None], selected: set[str]) -> str:
-    stated = staff_uuids.get(service_uuid)
+def _availability(stated: frozenset[str] | None, required: frozenset[str], *, unmapped: bool) -> str:
+    """Is this service available to every master who actually books it?
+
+    The correction. The previous rule asked whether the catalogue offered the
+    service to ANY selected master, so a wave containing masters A and B proved
+    a service that only B may perform even when only A ever books it — and the
+    apply would then place A's bookings on a service A cannot deliver.
+
+    ``required`` is now the set of EasyWeek staff uuids belonging to the masters
+    the in-scope bookings show performing this service. Every one of them has to
+    be covered; a stranger's coverage proves nothing.
+
+    A catalogue that states nothing, and a master we cannot name in EasyWeek,
+    both yield ``UNSTATED`` — the honest "we cannot tell", which the runbook
+    sends to a person rather than treating as a pass.
+    """
     if stated is None:
         return STAFF_AVAILABILITY_UNSTATED
-    if not selected:
+    if not required or unmapped:
+        # Nobody to check against, or somebody we cannot check. Either way the
+        # catalogue's list cannot be turned into a verdict.
         return STAFF_AVAILABILITY_UNSTATED
-    return STAFF_AVAILABILITY_PROVEN if selected & stated else STAFF_AVAILABILITY_ABSENT
+    return STAFF_AVAILABILITY_PROVEN if required <= stated else STAFF_AVAILABILITY_ABSENT
+
+
+def _baseline_drift(
+    existing: ServiceMapping, live: CatalogService
+) -> tuple[tuple[tuple[str, str], ...], tuple[str, ...]]:
+    """The manifest's frozen identity, and which of its fields the catalogue no
+    longer agrees with.
+
+    A UUID that is still in the catalogue used to be enough to call a mapping
+    ``already_mapped``. It is not: the manifest's four catalogue fields are the
+    baseline every per-booking override is detected against, so a service that
+    was renamed, repriced or re-timed under a stable UUID silently invalidates
+    that baseline while the report says the wave is ready.
+
+    Returns the baseline as displayable text plus the disagreeing field names.
+    """
+    baseline: list[tuple[str, str]] = [("easyweek_service_uuid", existing.easyweek_service_uuid)]
+    drift: list[str] = []
+
+    expected_name = canonical_service_name(existing.catalog_service_name)
+    baseline.append(("catalog_service_name", expected_name or ""))
+    if expected_name != live.normalized_name:
+        drift.append("catalog_service_name")
+
+    expected_currency = (existing.catalog_currency or "").strip().upper()
+    baseline.append(("catalog_currency", expected_currency))
+    if expected_currency != live.currency:
+        drift.append("catalog_currency")
+
+    # Price is compared in minor units under the MANIFEST's currency, which is
+    # the value an operator reviewed. A currency mismatch is already reported
+    # above; an amount we cannot express exactly is a disagreement, not a pass.
+    try:
+        expected_minor = to_minor_units(existing.catalog_price, currency=expected_currency)
+    except AmountError:
+        expected_minor = None
+    baseline.append(
+        ("catalog_price", str(existing.catalog_price.value) if existing.catalog_price.value is not None else "")
+    )
+    if expected_minor is None or expected_minor != live.price_minor:
+        drift.append("catalog_price")
+
+    expected_minutes = existing.catalog_duration.minutes
+    baseline.append(("catalog_duration_minutes", str(expected_minutes) if expected_minutes is not None else ""))
+    if expected_minutes != live.duration_minutes:
+        drift.append("catalog_duration_minutes")
+
+    return tuple(baseline), tuple(drift)
 
 
 def propose_service_mapping(
@@ -297,22 +447,34 @@ def propose_service_mapping(
     source_services: list[SourceService],
     catalog: CatalogSnapshot,
     catalog_staff: dict[str, frozenset[str] | None],
-    selected_staff_uuids: set[str],
     branch: BranchMapping | None,
 ) -> list[ServiceProposal]:
     """One proposal per source service. Decides nothing.
 
-    A service the manifest already maps is reported as such and left alone — the
-    mapping is cumulative, and re-proposing a mapping an earlier wave reviewed
-    would ask the operator to confirm the same thing every wave. It is only
-    flagged when the live catalogue no longer holds the mapped UUID, which is the
-    one case where "already mapped" has stopped being true.
+    A service the manifest already maps and whose live catalogue entry still
+    matches the reviewed baseline is reported as ``already_mapped`` and left
+    alone — the mapping is cumulative, and re-proposing it every wave is exactly
+    what this stage exists to stop. It stops being "already mapped" in two ways:
+    the UUID is gone from the catalogue, or the service behind that UUID has
+    moved. Both need a person, and neither is readiness.
+
+    Availability is judged per service against the masters who actually book it,
+    which is why ``branch`` supplies the Altegio-id → EasyWeek-uuid mapping
+    rather than the caller passing a flat set of the wave's staff.
     """
     by_name: dict[str, list[CatalogService]] = {}
     for service in catalog.services:
         by_name.setdefault(service.normalized_name, []).append(service)
 
-    def _candidate(service: CatalogService) -> CandidateService:
+    def _candidate(service: CatalogService, source: SourceService) -> CandidateService:
+        required: set[str] = set()
+        unmapped: list[int] = []
+        for staff_id in source.altegio_staff_ids:
+            target = branch.staff_uuid(staff_id) if branch is not None else None
+            if target is None:
+                unmapped.append(staff_id)
+            else:
+                required.add(target)
         return CandidateService(
             # The catalogue's own spelling for the person reading the proposal,
             # falling back to the normalised form when the row had none.
@@ -322,7 +484,16 @@ def propose_service_mapping(
             currency=service.currency,
             price_minor=service.price_minor,
             duration_minutes=service.duration_minutes,
-            staff_availability=_availability(service.uuid, catalog_staff, selected_staff_uuids),
+            staff_availability=_availability(
+                catalog_staff.get(service.uuid),
+                frozenset(required),
+                unmapped=bool(unmapped),
+            ),
+            required_staff_uuids=tuple(sorted(required)),
+            stated_staff_uuids=(
+                tuple(sorted(catalog_staff[service.uuid])) if catalog_staff.get(service.uuid) is not None else None
+            ),
+            unmapped_staff_ids=tuple(sorted(unmapped)),
         )
 
     proposals: list[ServiceProposal] = []
@@ -330,14 +501,28 @@ def propose_service_mapping(
         existing = branch.service(source.altegio_service_id) if branch is not None else None
         if existing is not None:
             live = catalog.by_uuid(existing.easyweek_service_uuid)
-            status = PROPOSAL_ALREADY_MAPPED if live is not None else PROPOSAL_CONFLICTS_WITH_MANIFEST
+            baseline: tuple[tuple[str, str], ...] = ()
+            drift: tuple[str, ...] = ()
+            if live is None:
+                # Includes the re-created-service case: the mapped UUID is not
+                # in the catalogue, and a new UUID is never adopted by name.
+                status = PROPOSAL_CONFLICTS_WITH_MANIFEST
+            elif not existing.identity_complete:
+                # Mapped, present, and nothing recorded to compare it against.
+                # Not drift; not readiness either.
+                status = PROPOSAL_BASELINE_INCOMPLETE
+            else:
+                baseline, drift = _baseline_drift(existing, live)
+                status = PROPOSAL_BASELINE_DRIFT if drift else PROPOSAL_ALREADY_MAPPED
             proposals.append(
                 ServiceProposal(
                     altegio_company_id=altegio_company_id,
                     source=source,
                     status=status,
-                    candidates=(_candidate(live),) if live is not None else (),
+                    candidates=(_candidate(live, source),) if live is not None else (),
                     existing_uuid=existing.easyweek_service_uuid,
+                    existing_baseline=baseline,
+                    drift_fields=drift,
                 )
             )
             continue
@@ -356,7 +541,7 @@ def propose_service_mapping(
             continue
 
         matches = by_name.get(normalized, [])
-        candidates = tuple(_candidate(service) for service in matches)
+        candidates = tuple(_candidate(service, source) for service in matches)
         if len(candidates) == 1:
             status = PROPOSAL_UNIQUE_NAME
         elif candidates:
@@ -383,8 +568,14 @@ def propose_service_mapping(
 
 
 def proposal_digest(proposal: ServiceProposal) -> str:
-    """Digest of exactly what an operator was shown about one service."""
-    blob = json.dumps(proposal.presentation(), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    """Digest of exactly what an operator was shown about one service.
+
+    Computed from :meth:`ServiceProposal.review_payload` — the same structure the
+    review prints — so "shown" and "digested" cannot come apart. Sorted keys and
+    canonically ordered collections, so the digest depends on the data and not on
+    the order the API happened to return its rows in.
+    """
+    blob = json.dumps(proposal.review_payload(), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
