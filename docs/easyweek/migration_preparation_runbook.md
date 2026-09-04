@@ -88,10 +88,15 @@ sudo cat /opt/altegio_bot/outputs/easyweek_migration_prepare/operator_review.jso
 `staff_availability` с доказательством, `drift_fields` и `review_digest`.
 
 **`review_digest` — это то, что вы копируете в команду подтверждения.** Он
-покрывает все показанные поля целиком: имя, телефон, email и количество записей
-у клиента; исходную цену и длительность, целевой UUID, имя, валюту, цену,
-длительность и доказательство доступности у услуги. Если изменилось что-то одно,
-дайджест другой, и старое подтверждение больше не действует.
+строится из того же канонического review payload, который показан оператору.
+Для клиента он покрывает контакты, source identity и record IDs, смысл свежего
+lookup, EasyWeek customer UUID, blocker/review evidence, intended action и
+состояние correction. Для услуги — исходные имя, цены, service-line и booking
+duration, фактических мастеров, target identity/baseline и доказательство
+доступности. Если решение или хотя бы одно из этих доказательств изменилось,
+дайджест другой, и старое подтверждение больше не действует. Старые pending или
+confirmed решения формата v1 без полного evidence автоматически write не
+разрешают: нужен свежий review.
 
 `records` — каждая запись волны: `altegio_record_id`, мастер, начало и конец в
 Europe/Berlin (плюс тот же момент в UTC), длительность, услуга, цена и
@@ -280,7 +285,9 @@ canary.
 ### 6b.1 Dry-run со снимком
 
 ```bash
-cd /opt/altegio_bot && docker compose --profile ops run --rm --build easyweek-migration-prepare-handover plan --manifest /migration/input/manifest.json --company-id 758285 --snapshot /migration/state/reminder_handover.json
+cd /opt/altegio_bot
+dc() { docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml "$@"; }
+dc --profile ops run --rm --build --no-deps -T easyweek-migration-prepare-handover plan --manifest /migration/input/manifest.json --company-id 758285 --snapshot /migration/state/reminder_handover.v2.json
 ```
 
 Команда читает ledger, доказывает каждую перенесённую запись живым
@@ -307,7 +314,12 @@ apply воркер останавливается лишь на время од�
 
 Смотреть также `rows_with_blockers` (канонический ключ занят
 canceled/failed-заданием — решает человек, автоматически не переоткрывается) и
-`rows_with_processing_source_jobs`.
+`rows_with_processing_source_jobs`. Snapshot v2 содержит и защищает digest-ом
+весь eligible `status=created` scope, отказы доказательства, readiness, identity
+строк, каждое obligation и полный список старых job ID. Старый snapshot v1,
+повреждённый JSON, неизвестное поле или изменение `created_at` write не
+разрешают. Нулевая или частично доказанная волна никогда не бывает
+`cutover_ready`.
 
 ### 6b.3 Apply
 
@@ -320,17 +332,51 @@ canceled/failed-заданием — решает человек, автомат
 любом выходе, включая ошибку и Ctrl-C:
 
 ```bash
-cd /opt/altegio_bot && trap 'docker compose up -d altegio-outbox-worker' EXIT INT TERM && docker compose stop altegio-outbox-worker && docker compose --profile ops run --rm -e EASYWEEK_REMINDER_HANDOVER_ALLOW_APPLY=true easyweek-migration-prepare-handover apply --manifest /migration/input/manifest.json --company-id 758285 --snapshot /migration/state/reminder_handover.json --apply --plan-digest PLAN_DIGEST_ИЗ_ШАГА_6B1 --confirm 'apply reminder handover PLAN_DIGEST_ИЗ_ШАГА_6B1'
+(
+set -euo pipefail
+cd /opt/altegio_bot
+
+dc() { docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml "$@"; }
+
+restore_outbox() {
+  original_rc=$?
+  trap - EXIT INT TERM
+  set +e
+  dc up -d altegio-outbox-worker
+  restart_rc=$?
+  dc ps altegio-outbox-worker
+  running="$(dc ps --status running -q altegio-outbox-worker | wc -l | tr -d ' ')"
+  if [ "$running" -ne 1 ]; then
+    restart_rc=1
+    echo 'STOP: altegio-outbox-worker не вернулся в running' >&2
+  fi
+  if [ "$original_rc" -ne 0 ]; then
+    exit "$original_rc"
+  fi
+  exit "$restart_rc"
+}
+
+trap restore_outbox EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+dc stop altegio-outbox-worker
+dc --profile ops run --rm --no-deps -T -e EASYWEEK_REMINDER_HANDOVER_ALLOW_APPLY=true easyweek-migration-prepare-handover apply --manifest /migration/input/manifest.json --company-id 758285 --snapshot /migration/state/reminder_handover.v2.json --apply-report /migration/state/reminder_handover.apply-report.v1.json --apply --plan-digest PLAN_DIGEST_ИЗ_ШАГА_6B1 --confirm 'apply reminder handover PLAN_DIGEST_ИЗ_ШАГА_6B1'
+)
 ```
 
 Inbox и capture при этом **не** останавливаются, и notification-флаги не
 трогаются. `EASYWEEK_NOTIFICATIONS_ENABLED` общим Altegio send fence не является
 и старые Altegio-напоминания не останавливает — не полагайтесь на него.
 
-Убедиться, что воркер поднялся:
+Trap сам проверяет, что воркер снова `running`. После выхода команды это можно
+доказать ещё раз независимо:
 
 ```bash
-cd /opt/altegio_bot && docker compose ps altegio-outbox-worker
+cd /opt/altegio_bot
+dc() { docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml "$@"; }
+dc ps altegio-outbox-worker
+test "$(dc ps --status running -q altegio-outbox-worker | wc -l | tr -d ' ')" -eq 1
 ```
 
 Транзакция одна: сначала создаются все недостающие EasyWeek-напоминания, и
@@ -341,29 +387,73 @@ cd /opt/altegio_bot && docker compose ps altegio-outbox-worker
 Если хотя бы одно относящееся к scope старое задание оказалось в
 `status=processing`, apply останавливается целиком и не меняет ничего.
 
+Успешный apply после commit атомарно пишет приватный PII-free apply report v1.
+В нём находятся snapshot version/digest, company scope, created/canceled job
+IDs и counts, already-present count и scoped Outbox before/after evidence.
+Verify не принимает отчёт от другого snapshot или отредактированный отчёт.
+
 ### 6b.4 Verify
 
 ```bash
-cd /opt/altegio_bot && docker compose --profile ops run --rm easyweek-migration-prepare-handover verify --manifest /migration/input/manifest.json --company-id 758285 --snapshot /migration/state/reminder_handover.json
+cd /opt/altegio_bot
+dc() { docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml "$@"; }
+dc --profile ops run --rm --no-deps -T easyweek-migration-prepare-handover verify --manifest /migration/input/manifest.json --company-id 758285 --snapshot /migration/state/reminder_handover.v2.json --apply-report /migration/state/reminder_handover.apply-report.v1.json
 ```
 
-Затем существующий preflight по открытым EasyWeek-напоминаниям:
+Повторный apply того же snapshot — отдельная проверка идемпотентности. Используем
+другой файл отчёта, чтобы не уничтожить evidence первого apply; результат обязан
+показать `mutations: 0`:
 
 ```bash
-cd /opt/altegio_bot && docker compose --profile ops run --rm easyweek-migration-prepare-handover plan --manifest /migration/input/manifest.json --company-id 758285 --snapshot /migration/state/reminder_handover_after.json
+(
+set -euo pipefail
+cd /opt/altegio_bot
+dc() { docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml "$@"; }
+restore_outbox() {
+  original_rc=$?
+  trap - EXIT INT TERM
+  set +e
+  dc up -d altegio-outbox-worker
+  restart_rc=$?
+  dc ps altegio-outbox-worker
+  running="$(dc ps --status running -q altegio-outbox-worker | wc -l | tr -d ' ')"
+  if [ "$running" -ne 1 ]; then restart_rc=1; fi
+  if [ "$original_rc" -ne 0 ]; then exit "$original_rc"; fi
+  exit "$restart_rc"
+}
+trap restore_outbox EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+dc stop altegio-outbox-worker
+dc --profile ops run --rm --no-deps -T -e EASYWEEK_REMINDER_HANDOVER_ALLOW_APPLY=true easyweek-migration-prepare-handover apply --manifest /migration/input/manifest.json --company-id 758285 --snapshot /migration/state/reminder_handover.v2.json --apply-report /migration/state/reminder_handover.repeat-apply-report.v1.json --apply --plan-digest PLAN_DIGEST_ИЗ_ШАГА_6B1 --confirm 'apply reminder handover PLAN_DIGEST_ИЗ_ШАГА_6B1'
+)
 ```
+
+Затем новый read-only plan обязан показать `easyweek_reminders_to_create: 0` и
+`coverage_ready: true`:
 
 ```bash
-cd /opt/altegio_bot && docker compose run --rm --no-deps altegio-outbox-worker python -m altegio_bot.scripts.easyweek_reminder_preflight
+cd /opt/altegio_bot
+dc() { docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml "$@"; }
+dc --profile ops run --rm --no-deps -T easyweek-migration-prepare-handover plan --manifest /migration/input/manifest.json --company-id 758285 --snapshot /migration/state/reminder_handover.after.v2.json
 ```
 
-Повторный `plan` должен показать `easyweek_reminders_to_create: 0` и
-`coverage_ready: true`. Повторный `apply` идемпотентен и ничего не меняет.
+Отдельно запускается существующий API preflight. Он повторно читает актуальные
+EasyWeek booking и прогоняет production reminder guard; DB verify его не
+подменяет:
+
+```bash
+cd /opt/altegio_bot
+dc() { docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml "$@"; }
+dc run --rm --no-deps -T --entrypoint /app/.venv/bin/python altegio-outbox-worker -m altegio_bot.scripts.easyweek_reminder_preflight --limit 200 --pause-sec 1.05
+```
 
 Read-only сверка в базе:
 
 ```bash
-cd /opt/altegio_bot && docker compose exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT provider, job_type, status, count(*) FROM message_jobs WHERE job_type IN ('reminder_24h','reminder_2h') GROUP BY 1,2,3 ORDER BY 1,2,3;"
+cd /opt/altegio_bot
+dc() { docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml "$@"; }
+dc exec -T postgres psql -X -v ON_ERROR_STOP=1 -U altegio -d altegio_bot -c "BEGIN TRANSACTION READ ONLY; SELECT provider, job_type, status, count(*) FROM message_jobs WHERE job_type IN ('reminder_24h','reminder_2h') GROUP BY 1,2,3 ORDER BY 1,2,3; COMMIT;"
 ```
 
 ### 6b.5 Если что-то пошло не так
@@ -371,10 +461,15 @@ cd /opt/altegio_bot && docker compose exec -T postgres psql -U "$POSTGRES_USER" 
 | Симптом | Что это значит | Что делать |
 |---|---|---|
 | `halted: source_reminder_processing` | воркер держит старое задание | ничего не изменено; подождать, повторить `plan` и `apply` |
+| `halted: snapshot_incomplete_scope` | snapshot пуст, содержит eligible refusal или неполный created scope | ничего не изменено; новый `plan`, устранить причину refusal |
+| `halted: snapshot_obligation_blocked` | snapshot содержит canceled/failed/unknown target obligation | ничего не изменено; решение оператора, автоматического reopen нет |
+| `halted: eligible_scope_changed` | полный company/status ledger scope изменился после plan | ничего не изменено; новый `plan` |
+| `halted: obligation_identity_mismatch` | dedupe key занят строкой с неверным status или identity | вся транзакция откатилась; проверить job вручную |
+| `halted: source_reminder_changed` | старый source job исчез или изменил identity/status | вся транзакция откатилась; новый `plan` |
+| `halted: scoped_outbox_side_effect` | scoped Outbox before/after внутри apply не совпал | вся транзакция откатилась; расследовать до повтора |
 | `halted: local_target_mismatch` | запись сдвинулась или отменена после `plan` | новый `plan` |
 | `halted: ledger_not_created` | ledger-строка изменила статус | новый `plan`; разобраться, что её двигало |
 | `halted: reminder_boundary_passed` | напоминание уже прошло свой момент | новый `plan` |
-| `halted: obligation_not_created` | канонический ключ занят чужой записью | ничего не изменено; разобраться в `message_jobs` руками |
 | `the snapshot is ...s old` | снимок устарел | новый `plan` |
 | `rows_with_blockers` не пуст | ключ занят canceled/failed заданием | решение оператора; инструмент такие не переоткрывает |
 
@@ -398,6 +493,9 @@ cd /opt/altegio_bot && docker compose exec -T postgres psql -U "$POSTGRES_USER" 
 - Не считает mapping из прошлой волны разрешением для мастера новой волны: если
   каталог не отдаёт услугу тому, кто её реально ведёт, это
   `existing_mapping_staff_unavailable`, а не готовность.
+- Не считает `staff_availability=UNSTATED` автоматической готовностью. Existing
+  mapping с неизменным target остаётся outstanding до явного подтверждения
+  точного current digest; подтверждение не перезаписывает UUID в manifest.
 - Не утверждает, что EasyWeek API принимает индивидуальную длительность или
   цену. Запись, растянутая руками, попадает в `manual_adjustment_candidate` —
   это работа человека, а не автоматический путь.

@@ -201,6 +201,41 @@ def _status_type_contradicts(payload: dict[str, Any]) -> str | None:
     return None
 
 
+def _observed_status_contradiction(
+    payload: dict[str, Any],
+    *,
+    is_canceled: bool,
+    is_completed: bool,
+) -> str | None:
+    """Judge optional status prose against status facts for handover reads.
+
+    The runtime send guard deliberately keeps its established ordering and
+    reason codes in :func:`_status_type_contradicts`.  The handover has a
+    different job: it must be able to *read* a consistently terminal booking so
+    it can retire the obsolete Altegio reminder without planning a replacement.
+    """
+    if is_canceled and is_completed:
+        return "status_flags_both_terminal"
+    status = payload.get("status")
+    if not isinstance(status, dict):
+        return None
+    status_type = status.get("type")
+    if not isinstance(status_type, str):
+        return None
+    normalized = status_type.strip().casefold()
+    canceled_types = {"canceled", "cancelled"}
+    completed_types = {"completed", "succeeded", "finished"}
+    if is_canceled:
+        return None if normalized in canceled_types else "status_type_vs_canceled"
+    if is_completed:
+        return None if normalized in completed_types else "status_type_vs_completed"
+    if normalized in canceled_types:
+        return "status_type_canceled"
+    if normalized in completed_types:
+        return "status_type_completed"
+    return None
+
+
 def _job_booking_uuid(job: MessageJob) -> uuid.UUID | None:
     payload = getattr(job, "payload", None)
     if not isinstance(payload, dict):
@@ -337,7 +372,13 @@ def read_booking_state(
     if completed_ok is None:
         return _refuse(GuardOutcome.MALFORMED_RESPONSE, "is_completed")
 
-    contradiction = _status_type_contradicts(payload)
+    is_canceled = not canceled_ok
+    is_completed = not completed_ok
+    contradiction = _observed_status_contradiction(
+        payload,
+        is_canceled=is_canceled,
+        is_completed=is_completed,
+    )
     if contradiction is not None:
         return _refuse(GuardOutcome.MALFORMED_RESPONSE, contradiction)
 
@@ -347,8 +388,8 @@ def read_booking_state(
         starts_at=api_start,
         # `_strict_false` returns True when the flag is a literal `false`, so
         # these read inverted: "the flag was cleanly false" means "not that".
-        is_canceled=not canceled_ok,
-        is_completed=not completed_ok,
+        is_canceled=is_canceled,
+        is_completed=is_completed,
     )
 
 

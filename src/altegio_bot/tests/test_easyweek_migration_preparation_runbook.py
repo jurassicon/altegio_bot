@@ -333,35 +333,89 @@ def test_the_documented_confirmation_matches_the_real_phrase(handover_commands: 
 
     parser = tool.build_parser()
     applies = [line for line in handover_commands if parser.parse_args(handover_args(line)).mode == "apply"]
-    assert len(applies) == 1
+    assert len(applies) == 2, "the primary and idempotency apply must both be copyable"
 
-    args = parser.parse_args(handover_args(applies[0]))
-    assert args.confirm == confirmation_phrase(args.plan_digest)
+    for line in applies:
+        args = parser.parse_args(handover_args(line))
+        assert args.confirm == confirmation_phrase(args.plan_digest)
+        assert args.apply_report.startswith("/migration/state/")
+    assert len({parser.parse_args(handover_args(line)).apply_report for line in applies}) == 2
 
 
 def test_the_apply_command_restores_the_outbox_on_any_exit(handover: str) -> None:
     """The stop must be survivable: an error must not leave the worker down."""
-    applies = [line for block in bash_blocks(handover) for line in block.splitlines() if "apply --manifest" in line]
-    assert len(applies) == 1
-    line = applies[0]
-
-    assert "trap 'docker compose up -d altegio-outbox-worker' EXIT INT TERM" in line
-    assert line.index("trap") < line.index("docker compose stop altegio-outbox-worker"), (
-        "the trap has to be armed BEFORE the worker goes down"
-    )
+    apply_blocks = [block for block in bash_blocks(handover) if " apply --manifest" in block]
+    assert len(apply_blocks) == 2
+    for block in apply_blocks:
+        assert "restore_outbox()" in block
+        assert "trap - EXIT INT TERM" in block, "restore must not recurse"
+        assert "trap restore_outbox EXIT" in block
+        assert "trap 'exit 130' INT" in block
+        assert "trap 'exit 143' TERM" in block
+        assert block.index("trap restore_outbox EXIT") < block.index("dc stop altegio-outbox-worker")
+        assert "original_rc=$?" in block
+        assert 'exit "$original_rc"' in block
+        assert "dc up -d altegio-outbox-worker" in block
 
 
 def test_only_the_outbox_worker_is_stopped(handover: str) -> None:
-    stops = [line for block in bash_blocks(handover) for line in block.splitlines() if "compose stop" in line]
+    stops = [
+        line.strip()
+        for block in bash_blocks(handover)
+        for line in block.splitlines()
+        if line.strip().startswith("dc stop")
+    ]
     assert stops
     for line in stops:
-        assert "altegio-outbox-worker" in line, line
-        for untouched in ("inbox", "capture", "postgres"):
-            assert f"stop {untouched}" not in line, line
+        assert line == "dc stop altegio-outbox-worker"
 
 
 def test_the_runbook_checks_the_outbox_came_back(handover: str) -> None:
-    assert "docker compose ps altegio-outbox-worker" in handover
+    assert "dc ps altegio-outbox-worker" in handover
+    assert "dc ps --status running -q altegio-outbox-worker" in handover
+
+
+def test_every_handover_compose_block_uses_the_production_dc_contract(handover: str) -> None:
+    definition = (
+        'dc() { docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml "$@"; }'
+    )
+    blocks = [block for block in bash_blocks(handover) if "docker compose" in block]
+    assert blocks
+    for block in blocks:
+        assert definition in block
+        compose_lines = [line.strip() for line in block.splitlines() if "docker compose" in line]
+        assert compose_lines == [definition], "all actual invocations must go through the one dc contract"
+
+
+def test_every_handover_one_off_container_is_removed(handover: str) -> None:
+    runs = [
+        line.strip()
+        for block in bash_blocks(handover)
+        for line in block.splitlines()
+        if line.strip().startswith("dc ") and " run " in line
+    ]
+    assert runs
+    assert all("--rm" in line for line in runs)
+
+
+def test_handover_shell_commands_do_not_edit_notification_flags(handover: str) -> None:
+    shell = "\n".join(bash_blocks(handover))
+    for key in (
+        "EASYWEEK_NOTIFICATIONS_ENABLED=",
+        "EASYWEEK_REVIEWS_ENABLED=",
+        "EASYWEEK_REMINDERS_ENABLED=",
+        "EASYWEEK_REMINDER_API_GUARD_ENABLED=",
+    ):
+        assert key not in shell
+
+
+def test_handover_sql_uses_credentials_inside_the_postgres_container(handover: str) -> None:
+    sql = [line for block in bash_blocks(handover) for line in block.splitlines() if "psql " in line]
+    assert len(sql) == 1
+    assert "-U altegio -d altegio_bot" in sql[0]
+    assert "$POSTGRES_USER" not in sql[0]
+    assert "$POSTGRES_DB" not in sql[0]
+    assert "BEGIN TRANSACTION READ ONLY" in sql[0]
 
 
 def test_the_runbook_states_the_three_readiness_questions(handover: str) -> None:

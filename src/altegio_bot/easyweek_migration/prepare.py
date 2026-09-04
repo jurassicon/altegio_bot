@@ -96,6 +96,7 @@ from altegio_bot.easyweek_migration.customer_api import (
     verify_customer,
 )
 from altegio_bot.easyweek_migration.customer_decisions import (
+    LEGACY_EVIDENCE_MISSING,
     STATE_BLOCKED,
     STATE_CONFIRMED,
     STATE_CREATED,
@@ -127,6 +128,7 @@ from altegio_bot.easyweek_migration.mapping_proposal import (
     ServiceProposal,
     collect_source_services,
     manifest_service_patch,
+    mapping_is_settled,
     merge_manifest_services,
     proposal_digest,
     propose_service_mapping,
@@ -494,6 +496,12 @@ def _proposal_from_source(
         email=email,
         linked_record_count=source.linked_record_count,
         source_label=source.full_name or "",
+        source_identity=source_identity_of(source),
+        source_record_ids=tuple(sorted(source.record_ids)),
+        lookup_outcome=lookup.outcome,
+        review_state=STATE_BLOCKED if blocked else STATE_PENDING,
+        intended_action="none" if blocked else "create_customer",
+        correction_applied=override is not None,
         state=STATE_BLOCKED if blocked else STATE_PENDING,
         customer_uuid=lookup.uuid,
         blocked_reason=blocked,
@@ -512,7 +520,10 @@ def _stale_correction(source: SourceCustomer, lookup: CustomerLookup) -> Custome
     return replace(
         _proposal_from_source(source, lookup),
         state=STATE_BLOCKED,
+        review_state=STATE_BLOCKED,
+        intended_action="none",
         blocked_reason=OVERRIDE_STALE_IDENTITY,
+        correction_stale=True,
     ).with_digest()
 
 
@@ -953,9 +964,16 @@ def _machine_report(
     # pass, and it means an existing mapping whose live catalogue entry still
     # matches the reviewed baseline. Drift used to hide here as `already_mapped`
     # and report a wave ready while its override baseline had gone stale.
-    mapping_outstanding = [
-        proposal.as_safe_dict() for proposal in proposals if not proposal.settled and not agreement.agreed(proposal)
-    ]
+    mapping_outstanding = []
+    mapping_proposals = []
+    for proposal in proposals:
+        settled = mapping_is_settled(proposal, agreement)
+        shown = proposal.as_safe_dict()
+        shown["settled"] = settled
+        mapping_proposals.append(shown)
+        if settled or (proposal.status != "already_mapped" and agreement.agreed(proposal)):
+            continue
+        mapping_outstanding.append(shown)
     mapping_drift = [proposal.as_safe_dict() for proposal in proposals if proposal.drift_fields]
     customers_ready = len(build_customer_directory_payload(decisions))
     customers_pending = len(decisions.in_state(STATE_PENDING))
@@ -981,7 +999,7 @@ def _machine_report(
             "records_needing_manual_work": manual,
         },
         "mapping": {
-            "proposals": [proposal.as_safe_dict() for proposal in proposals],
+            "proposals": mapping_proposals,
             "outstanding": mapping_outstanding,
             "agreed": len(agreement.entries),
             "drift": mapping_drift,
@@ -1052,28 +1070,21 @@ def _operator_report(
     """
     customers: list[dict[str, Any]] = []
     for record in sorted(decisions.records.values(), key=lambda item: item.phone):
-        source = sources.get(record.phone)
+        review = record.review_payload()
         customers.append(
             {
-                "phone": record.phone,
-                "first_name": record.first_name,
-                "last_name": record.last_name,
+                **review,
                 "full_name_from_source": record.source_label or None,
-                "email": record.email,
                 "linked_records": record.linked_record_count,
-                "source_record_ids": list(source.record_ids) if source else [],
                 "state": record.state,
-                "blocked_reason": record.blocked_reason,
-                "easyweek_customer_uuid": record.customer_uuid,
-                # Copy this into `--confirm-customer 'PHONE=DIGEST'`. It covers
-                # every field printed above, so a confirmation cannot be aimed
-                # at data the person never read.
+                # Copy this into `--confirm-customer 'PHONE=DIGEST'`. It is the
+                # digest of the canonical review fields above; mutable state and
+                # explanatory prose are intentionally outside that contract.
                 "review_digest": record.shown_digest,
                 # Whether the values above include a correction a person
                 # entered, and whether a stored correction stopped applying
                 # because the source moved under it.
-                "manually_corrected": record.phone in corrected,
-                "correction_stale": record.phone in stale,
+                "manually_corrected": review["correction_applied"],
                 "note": (
                     "Creating a card does NOT transfer visit history: EasyWeek will "
                     "show this customer with no previous visits."
@@ -1280,6 +1291,10 @@ def _apply_correction(
         # confirms it must see the corrected values, and its digest changes with
         # them, so the old agreement cannot survive the edit.
         state=STATE_PENDING,
+        review_state=STATE_PENDING,
+        intended_action="create_customer",
+        correction_applied=True,
+        correction_stale=False,
         blocked_reason=None,
     ).with_digest()
     decisions.records[phone] = corrected
@@ -1347,10 +1362,20 @@ def _plan_customer_changes(
 
         # (3) the file `prepare` wrote is internally consistent,
         reviewed = stored.get(phone)
-        if reviewed is None or not reviewed.matches_shown():
+        if (
+            reviewed is None
+            or reviewed.review_payload().get("review_state") != STATE_PENDING
+            or reviewed.review_payload().get("intended_action") != "create_customer"
+            or not reviewed.matches_shown()
+        ):
             raise _refuse("the stored decision does not match its own digest")
         # (2) the workspace still says what that file recorded,
-        if fresh.shown_digest != reviewed.shown_digest:
+        if (
+            fresh.review_payload().get("review_state") != STATE_PENDING
+            or fresh.review_payload().get("intended_action") != "create_customer"
+            or fresh.review_payload() != reviewed.review_payload()
+            or fresh.shown_digest != reviewed.shown_digest
+        ):
             raise _refuse("the live data no longer matches the reviewed decision")
         # (1) and the operator typed the digest of that very item.
         if supplied is not None and supplied != fresh.shown_digest:
@@ -1476,9 +1501,21 @@ async def reconcile_in_flight(
         if lookup.outcome in (LOOKUP_FOUND, LOOKUP_FIRST_NAME_MISSING) and lookup.uuid:
             decisions.set_state(record.phone, STATE_CREATED, customer_uuid=lookup.uuid, blocked_reason=None)
         elif lookup.outcome == LOOKUP_ABSENT:
-            # The POST did not land. Back to confirmed — the confirmation itself
-            # is still good, and its digest still binds it to the same data.
-            decisions.set_state(record.phone, STATE_CONFIRMED, blocked_reason=None)
+            if record.evidence_current:
+                # The POST did not land. Back to confirmed — the current-format
+                # confirmation itself is still good, and its digest still binds
+                # it to the same data.
+                decisions.set_state(record.phone, STATE_CONFIRMED, blocked_reason=None)
+            else:
+                # A legacy in-flight marker still prevents a duplicate while the
+                # lookup is uncertain, but old review evidence cannot authorise
+                # another POST once absence is known. A fresh prepare/review is
+                # required instead of silently reopening the v1 decision.
+                decisions.set_state(
+                    record.phone,
+                    STATE_BLOCKED,
+                    blocked_reason=LEGACY_EVIDENCE_MISSING,
+                )
         elif lookup.outcome == LOOKUP_AMBIGUOUS:
             # Two cards on the number now. Possibly a duplicate this migration
             # created. A person looks at it; nothing here picks a winner.

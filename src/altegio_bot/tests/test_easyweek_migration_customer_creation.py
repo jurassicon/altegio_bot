@@ -23,6 +23,7 @@ import pytest
 
 from altegio_bot.easyweek_client import EasyWeekAuthError, EasyWeekPermanentError, EasyWeekRetryableError
 from altegio_bot.easyweek_migration.customer_decisions import (
+    LEGACY_EVIDENCE_MISSING,
     STATE_BLOCKED,
     STATE_CONFIRMED,
     STATE_CREATED,
@@ -83,8 +84,14 @@ def decision(phone: str = PHONE, **overrides: Any) -> CustomerDecision:
         "email": None,
         "linked_record_count": 2,
         "source_label": "",
+        "source_identity": "a" * 64,
+        "source_record_ids": (900001, 900002),
+        "lookup_outcome": "absent",
     }
     base.update(overrides)
+    state = base.get("state", STATE_PENDING)
+    base.setdefault("review_state", STATE_BLOCKED if state == STATE_BLOCKED else STATE_PENDING)
+    base.setdefault("intended_action", "none" if state == STATE_BLOCKED else "create_customer")
     return CustomerDecision(**base).with_digest()  # type: ignore[arg-type]
 
 
@@ -889,9 +896,185 @@ def test_the_customer_digest_covers_exactly_what_is_presented() -> None:
     """The presentation IS the digest input; nothing shown sits outside it."""
     record = decision(last_name="Schmidt", email="k@example.invalid")
 
-    assert set(record.presentation()) == {"phone", "first_name", "last_name", "email", "linked_record_count"}
+    assert set(record.presentation()) == {
+        "phone",
+        "first_name",
+        "last_name",
+        "email",
+        "linked_record_count",
+        "source_identity",
+        "source_record_ids",
+        "source_record_count",
+        "lookup_outcome",
+        "easyweek_customer_uuid",
+        "review_state",
+        "intended_action",
+        "blocked_reason",
+        "correction_applied",
+        "correction_stale",
+        "evidence_current",
+    }
     assert record.matches_shown()
     assert replace(record, linked_record_count=99).matches_shown() is False
+
+
+@pytest.mark.parametrize(
+    ("old_lookup", "old_reason"),
+    [
+        ("found", BLOCK_ALREADY_EXISTS),
+        ("ambiguous", "customer_ambiguous"),
+        ("undetermined", BLOCK_LOOKUP_UNDETERMINED),
+    ],
+)
+def test_a_blocked_lookup_digest_never_authorises_a_later_absent_customer(
+    old_lookup: str,
+    old_reason: str,
+    inputs: PrepareInputs,
+    state_dir: Path,
+) -> None:
+    reviewed = decision(
+        state=STATE_BLOCKED,
+        lookup_outcome=old_lookup,
+        blocked_reason=old_reason,
+        customer_uuid=UUID_A if old_lookup == "found" else None,
+    )
+    fresh = decision()
+    assert reviewed.shown_digest != fresh.shown_digest
+    seed(state_dir, reviewed)
+
+    with pytest.raises(PrepareError):
+        apply_confirmations(
+            inputs,
+            ConfirmRequest(confirm_customers=(confirm_target(reviewed),)),
+            snapshot=live_snapshot(fresh),
+        )
+
+    assert load(state_dir).get(PHONE).state == STATE_BLOCKED
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"customer_uuid": UUID_B},
+        {"source_identity": "b" * 64},
+        {"source_record_ids": (900001, 900003)},
+        {"lookup_outcome": "undetermined"},
+        {"intended_action": "none"},
+    ],
+    ids=["customer_uuid", "source_identity", "source_records", "lookup", "intended_action"],
+)
+def test_customer_decision_evidence_changes_the_review_and_batch_digest(change: dict[str, Any]) -> None:
+    before = decision(customer_uuid=UUID_A)
+    after_values = {"customer_uuid": UUID_A, **change}
+    after = decision(**after_values)
+
+    assert before.shown_digest != after.shown_digest
+    assert pending_digest(DecisionSet(records={PHONE: before})) != pending_digest(DecisionSet(records={PHONE: after}))
+
+
+def test_an_unchanged_pending_create_accepts_its_current_digest(inputs: PrepareInputs, state_dir: Path) -> None:
+    reviewed = decision()
+    seed(state_dir, reviewed)
+
+    apply_confirmations(
+        inputs,
+        ConfirmRequest(confirm_customers=(confirm_target(reviewed),)),
+        snapshot=live_snapshot(reviewed),
+    )
+
+    assert load(state_dir).get(PHONE).state == STATE_CONFIRMED
+
+
+def test_a_legacy_confirmed_decision_loses_write_authority(state_dir: Path) -> None:
+    legacy = decision(state=STATE_CONFIRMED).to_json()
+    for key in (
+        "source_identity",
+        "source_record_ids",
+        "lookup_outcome",
+        "review_state",
+        "intended_action",
+        "correction_applied",
+        "correction_stale",
+        "evidence_current",
+    ):
+        legacy.pop(key)
+    state_dir.mkdir(parents=True)
+    (state_dir / "customer_decisions.json").write_text(
+        json.dumps({"version": 1, "decisions": [legacy]}),
+        encoding="utf-8",
+    )
+
+    loaded = load(state_dir).get(PHONE)
+
+    assert loaded is not None
+    assert loaded.state == STATE_BLOCKED
+    assert loaded.creatable is False
+    assert loaded.shown_digest == ""
+
+
+@pytest.mark.asyncio
+async def test_a_legacy_in_flight_absence_requires_fresh_review_before_retry(
+    inputs: PrepareInputs,
+    state_dir: Path,
+) -> None:
+    legacy = decision(state=STATE_IN_FLIGHT).to_json()
+    for key in (
+        "source_identity",
+        "source_record_ids",
+        "lookup_outcome",
+        "review_state",
+        "intended_action",
+        "correction_applied",
+        "correction_stale",
+        "evidence_current",
+    ):
+        legacy.pop(key)
+    state_dir.mkdir(parents=True)
+    (state_dir / "customer_decisions.json").write_text(
+        json.dumps({"version": 1, "decisions": [legacy]}),
+        encoding="utf-8",
+    )
+    client = FakeCreateClient(pages=[page([])])
+
+    await run_create_customers(inputs, write_client=client)
+
+    stored = load(state_dir).get(PHONE)
+    assert client.posts == []
+    assert stored is not None
+    assert stored.state == STATE_BLOCKED
+    assert stored.blocked_reason == LEGACY_EVIDENCE_MISSING
+    assert stored.evidence_current is False
+
+
+def test_a_legacy_created_marker_survives_v2_rewrite_and_reload(state_dir: Path) -> None:
+    legacy = decision(state=STATE_CREATED, customer_uuid=UUID_A).to_json()
+    for key in (
+        "source_identity",
+        "source_record_ids",
+        "lookup_outcome",
+        "review_state",
+        "intended_action",
+        "correction_applied",
+        "correction_stale",
+        "evidence_current",
+    ):
+        legacy.pop(key)
+    state_dir.mkdir(parents=True)
+    (state_dir / "customer_decisions.json").write_text(
+        json.dumps({"version": 1, "decisions": [legacy]}),
+        encoding="utf-8",
+    )
+
+    store = CustomerDecisionStore(state_dir)
+    with store:
+        records = store.load()
+        store.save(records)
+
+    preserved = load(state_dir).get(PHONE)
+    assert preserved is not None
+    assert preserved.state == STATE_CREATED
+    assert preserved.customer_uuid == UUID_A
+    assert preserved.evidence_current is False
 
 
 def test_a_changed_shown_field_cancels_an_existing_agreement(inputs: PrepareInputs, state_dir: Path) -> None:

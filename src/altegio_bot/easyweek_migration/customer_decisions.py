@@ -39,7 +39,8 @@ from typing import Any, Final
 
 from altegio_bot.easyweek_migration.customer_api import phone_fingerprint
 
-STORE_VERSION: Final = 1
+STORE_VERSION: Final = 2
+LEGACY_EVIDENCE_MISSING: Final = "decision_evidence_version_stale"
 STORE_MODE: Final = 0o600
 DIR_MODE: Final = 0o700
 
@@ -94,6 +95,14 @@ class CustomerDecision:
     email: str | None
     linked_record_count: int
     source_label: str
+    source_identity: str = ""
+    source_record_ids: tuple[int, ...] = ()
+    lookup_outcome: str = "absent"
+    review_state: str | None = None
+    intended_action: str | None = None
+    correction_applied: bool = False
+    correction_stale: bool = False
+    evidence_current: bool = True
     state: str = STATE_PENDING
     customer_uuid: str | None = None
     shown_digest: str = ""
@@ -110,26 +119,43 @@ class CustomerDecision:
         """``POST`` is permitted only from a confirmed record with a real name."""
         return self.state == STATE_CONFIRMED and bool(self.phone) and bool(self.first_name)
 
-    def presentation(self) -> dict[str, Any]:
-        """The fields a confirmation is *about*.
+    def review_payload(self) -> dict[str, Any]:
+        """The single immutable representation shown, individually and in batch.
 
-        Deliberately excludes state and bookkeeping: re-running the read-only
-        pass must not invalidate a confirmation, but a changed name, number,
-        e-mail or record count must.
+        ``state`` is mutable bookkeeping and therefore excluded.  ``review_state``
+        and ``intended_action`` are the stable facts the operator reviewed; a
+        later transition from pending to confirmed cannot invalidate itself.
         """
+        review_state = self.review_state or (STATE_BLOCKED if self.state == STATE_BLOCKED else STATE_PENDING)
+        intended_action = self.intended_action or ("create_customer" if review_state == STATE_PENDING else "none")
         return {
             "phone": self.phone,
             "first_name": self.first_name,
             "last_name": self.last_name,
             "email": self.email,
             "linked_record_count": self.linked_record_count,
+            "source_identity": self.source_identity,
+            "source_record_ids": sorted(self.source_record_ids),
+            "source_record_count": len(self.source_record_ids),
+            "lookup_outcome": self.lookup_outcome,
+            "easyweek_customer_uuid": self.customer_uuid,
+            "review_state": review_state,
+            "intended_action": intended_action,
+            "blocked_reason": self.blocked_reason,
+            "correction_applied": self.correction_applied,
+            "correction_stale": self.correction_stale,
+            "evidence_current": self.evidence_current,
         }
 
+    def presentation(self) -> dict[str, Any]:
+        """Backward-compatible name for the canonical review payload."""
+        return self.review_payload()
+
     def with_digest(self) -> CustomerDecision:
-        return replace(self, shown_digest=_digest(self.presentation()))
+        return replace(self, shown_digest=_digest(self.review_payload()))
 
     def matches_shown(self) -> bool:
-        return bool(self.shown_digest) and self.shown_digest == _digest(self.presentation())
+        return bool(self.shown_digest) and self.shown_digest == _digest(self.review_payload())
 
     def as_safe_dict(self) -> dict[str, Any]:
         """Log/report shape: a fingerprint and a state, never a person."""
@@ -144,6 +170,7 @@ class CustomerDecision:
         }
 
     def to_json(self) -> dict[str, Any]:
+        review = self.review_payload()
         return {
             "phone": self.phone,
             "first_name": self.first_name,
@@ -151,6 +178,14 @@ class CustomerDecision:
             "email": self.email,
             "linked_record_count": self.linked_record_count,
             "source_label": self.source_label,
+            "source_identity": self.source_identity,
+            "source_record_ids": list(self.source_record_ids),
+            "lookup_outcome": self.lookup_outcome,
+            "review_state": review["review_state"],
+            "intended_action": review["intended_action"],
+            "correction_applied": self.correction_applied,
+            "correction_stale": self.correction_stale,
+            "evidence_current": self.evidence_current,
             "state": self.state,
             "customer_uuid": self.customer_uuid,
             "shown_digest": self.shown_digest,
@@ -160,7 +195,7 @@ class CustomerDecision:
         }
 
     @classmethod
-    def from_json(cls, payload: object) -> CustomerDecision:
+    def from_json(cls, payload: object, *, legacy: bool = False) -> CustomerDecision:
         if not isinstance(payload, dict):
             raise DecisionStoreError("decision record is not an object")
         phone = payload.get("phone")
@@ -184,6 +219,45 @@ class CustomerDecision:
             value = payload.get(key)
             return value if isinstance(value, str) and value else None
 
+        source_record_ids = payload.get("source_record_ids", [])
+        if not isinstance(source_record_ids, list) or any(
+            type(item) is not int or item <= 0 for item in source_record_ids
+        ):
+            raise DecisionStoreError("decision record has invalid source_record_ids")
+        if source_record_ids != sorted(set(source_record_ids)):
+            raise DecisionStoreError("decision record has non-canonical source_record_ids")
+        evidence_current = not legacy
+        if not legacy:
+            source_identity = payload.get("source_identity")
+            lookup_outcome = payload.get("lookup_outcome")
+            review_state = payload.get("review_state")
+            intended_action = payload.get("intended_action")
+            if type(payload.get("evidence_current")) is not bool:
+                raise DecisionStoreError("decision record has invalid evidence version")
+            evidence_current = payload["evidence_current"]
+            if evidence_current:
+                if not isinstance(source_identity, str) or not source_identity:
+                    raise DecisionStoreError("decision record has no current source identity")
+                if not source_record_ids or len(source_record_ids) != count:
+                    raise DecisionStoreError("decision record source identity/count does not match")
+            elif state in {STATE_PENDING, STATE_CONFIRMED}:
+                raise DecisionStoreError("decision record grants authority without current evidence")
+            if not isinstance(lookup_outcome, str) or not lookup_outcome:
+                raise DecisionStoreError("decision record has no lookup evidence")
+            if review_state not in {STATE_PENDING, STATE_BLOCKED}:
+                raise DecisionStoreError("decision record has no stable review state")
+            if intended_action not in {"create_customer", "none"}:
+                raise DecisionStoreError("decision record has no stable intended action")
+            if type(payload.get("correction_applied")) is not bool or type(payload.get("correction_stale")) is not bool:
+                raise DecisionStoreError("decision record has invalid correction evidence")
+        loaded_state = state
+        blocked_reason = _text("blocked_reason")
+        shown_digest = _text("shown_digest") or ""
+        if legacy and state in {STATE_PENDING, STATE_CONFIRMED}:
+            loaded_state = STATE_BLOCKED
+            blocked_reason = LEGACY_EVIDENCE_MISSING
+            shown_digest = ""
+
         return cls(
             phone=phone,
             first_name=_text("first_name"),
@@ -191,10 +265,18 @@ class CustomerDecision:
             email=_text("email"),
             linked_record_count=count,
             source_label=_text("source_label") or "",
-            state=state,
+            source_identity=_text("source_identity") or "",
+            source_record_ids=tuple(source_record_ids),
+            lookup_outcome=_text("lookup_outcome") or "legacy_unproven",
+            review_state=_text("review_state"),
+            intended_action=_text("intended_action"),
+            correction_applied=payload.get("correction_applied") is True,
+            correction_stale=payload.get("correction_stale") is True,
+            evidence_current=evidence_current,
+            state=loaded_state,
             customer_uuid=_text("customer_uuid"),
-            shown_digest=_text("shown_digest") or "",
-            blocked_reason=_text("blocked_reason"),
+            shown_digest=shown_digest,
+            blocked_reason=blocked_reason,
             attempt_id=_text("attempt_id"),
             updated_at=float(payload.get("updated_at") or 0.0),
         )
@@ -325,15 +407,16 @@ class CustomerDecisionStore:
             # A truncated store is not an empty store. Starting fresh here would
             # forget which customers already exist and create them again.
             raise DecisionStoreError("the decision store is not valid JSON") from None
-        if not isinstance(payload, dict) or payload.get("version") != STORE_VERSION:
+        if not isinstance(payload, dict) or payload.get("version") not in {1, STORE_VERSION}:
             raise DecisionStoreError("the decision store has an unexpected version")
+        legacy = payload.get("version") == 1
         rows = payload.get("decisions")
         if not isinstance(rows, list):
             raise DecisionStoreError("the decision store has no decisions array")
 
         records: dict[str, CustomerDecision] = {}
         for row in rows:
-            record = CustomerDecision.from_json(row)
+            record = CustomerDecision.from_json(row, legacy=legacy)
             records[record.key] = record
         return DecisionSet(records=records)
 

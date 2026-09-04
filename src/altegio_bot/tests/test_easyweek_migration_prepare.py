@@ -46,6 +46,7 @@ from altegio_bot.easyweek_migration.mapping_proposal import (
     MappingAgreement,
     collect_source_services,
     manifest_service_patch,
+    mapping_is_settled,
     merge_manifest_services,
     proposal_digest,
     propose_service_mapping,
@@ -379,7 +380,7 @@ def test_an_unchanged_existing_mapping_is_not_re_proposed() -> None:
     assert proposal.status == PROPOSAL_ALREADY_MAPPED
     assert proposal.existing_uuid == KA_SERVICE_UUID
     assert proposal.drift_fields == ()
-    assert proposal.settled is True
+    assert proposal.settled is False, "target identity is not current-wave permission"
 
 
 def test_a_mapped_uuid_missing_from_the_catalogue_is_flagged() -> None:
@@ -1137,11 +1138,11 @@ def mapped_source() -> list[dict[str, Any]]:
     return [source_record(service_name=BASELINE_NAME)]
 
 
-def test_an_unchanged_existing_mapping_needs_no_confirmation() -> None:
+def test_an_unchanged_existing_mapping_needs_current_confirmation() -> None:
     [proposal] = propose([baseline_catalog_row()], records=mapped_source(), branch=mapped_branch())
 
     assert proposal.status == PROPOSAL_ALREADY_MAPPED
-    assert proposal.settled is True
+    assert mapping_is_settled(proposal, MappingAgreement()) is False
     assert proposal.drift_fields == ()
 
 
@@ -1190,7 +1191,7 @@ async def test_drift_makes_the_wave_not_ready_and_rewrites_no_manifest(
 
 
 @pytest.mark.asyncio
-async def test_an_unchanged_existing_mapping_reports_the_wave_mapping_ready(
+async def test_an_unchanged_existing_mapping_is_outstanding_until_confirmed(
     state_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     stub_source(monkeypatch, mapped_source())
@@ -1198,7 +1199,8 @@ async def test_an_unchanged_existing_mapping_reports_the_wave_mapping_ready(
 
     result = await run_prepare(make_inputs(state_dir), write_client=client)
 
-    assert result.machine["ready"]["mapping_ready"] is True
+    assert result.machine["ready"]["mapping_ready"] is False
+    assert len(result.machine["mapping"]["outstanding"]) == 1
     assert result.machine["mapping"]["drift"] == []
 
 
@@ -1654,7 +1656,7 @@ async def test_an_override_store_from_the_future_is_refused(state_dir: Path, mon
 
 
 @pytest.mark.asyncio
-async def test_the_decision_store_version_is_unchanged_by_this_feature(
+async def test_the_decision_store_is_upgraded_for_complete_review_evidence(
     state_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Corrections live in their own file: no terminal or in-flight state moves."""
@@ -1666,7 +1668,7 @@ async def test_the_decision_store_version_is_unchanged_by_this_feature(
     await correct(inputs, correct_first_name="Anna Maria")
 
     stored = json.loads((state_dir / "customer_decisions.json").read_text())
-    assert stored["version"] == STORE_VERSION == 1
+    assert stored["version"] == STORE_VERSION == 2
 
 
 # ---------------------------------------------------------------------------
@@ -1707,7 +1709,7 @@ def test_an_inherited_mapping_the_new_master_may_not_use_is_not_settled() -> Non
     assert proposal.chosen is None
 
 
-def test_an_inherited_mapping_the_new_master_may_use_stays_settled() -> None:
+def test_an_inherited_mapping_the_new_master_may_use_needs_current_agreement() -> None:
     [proposal] = propose(
         [baseline_catalog_row(staff=[KA_STAFF_UUID, KA_SECOND_STAFF_UUID])],
         records=[wave_b_record()],
@@ -1717,7 +1719,10 @@ def test_an_inherited_mapping_the_new_master_may_use_stays_settled() -> None:
     )
 
     assert proposal.status == PROPOSAL_ALREADY_MAPPED
-    assert proposal.settled is True
+    agreement = MappingAgreement()
+    assert mapping_is_settled(proposal, agreement) is False
+    agreement.confirm(proposal)
+    assert mapping_is_settled(proposal, agreement) is True
 
 
 def test_an_inherited_mapping_with_an_unstated_catalogue_keeps_current_semantics() -> None:
@@ -1732,6 +1737,79 @@ def test_an_inherited_mapping_with_an_unstated_catalogue_keeps_current_semantics
 
     assert proposal.status == PROPOSAL_ALREADY_MAPPED
     assert proposal.candidates[0].staff_availability == STAFF_AVAILABILITY_UNSTATED
+    agreement = MappingAgreement()
+    assert mapping_is_settled(proposal, agreement) is False
+
+    agreement.confirm(proposal)
+
+    assert mapping_is_settled(proposal, agreement) is True
+    assert manifest_service_patch([proposal], agreement) == {}, "reviewing inherited evidence never rewrites manifest"
+
+
+def test_unchanged_existing_mapping_evidence_keeps_its_current_agreement() -> None:
+    kwargs = {
+        "records": [wave_b_record()],
+        "branch": wave_b_branch(),
+        "staff": {KA_SERVICE_UUID: None},
+        "staff_ids": {KA_SECOND_STAFF_ID},
+    }
+    [reviewed] = propose([baseline_catalog_row()], **kwargs)
+    agreement = MappingAgreement()
+    agreement.confirm(reviewed)
+    [fresh] = propose([baseline_catalog_row()], **kwargs)
+
+    assert proposal_digest(fresh) == proposal_digest(reviewed)
+    assert mapping_is_settled(fresh, agreement) is True
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"service_name": "Vollständig andere Leistung"},
+        {"service_cost": 123.0},
+        {"service_duration": 5400},
+        {"booking_duration": 5400},
+    ],
+    ids=["source_name", "source_price", "service_duration", "booking_duration"],
+)
+def test_changed_source_evidence_invalidates_an_existing_mapping_agreement(change: dict[str, Any]) -> None:
+    original = source_record(service_name=BASELINE_NAME)
+    [reviewed] = propose([baseline_catalog_row()], records=[original], branch=mapped_branch())
+    agreement = MappingAgreement()
+    agreement.confirm(reviewed)
+
+    changed = source_record(service_name=change.get("service_name", BASELINE_NAME))
+    if "service_cost" in change:
+        changed["services"][0]["cost"] = change["service_cost"]
+    if "service_duration" in change:
+        changed["services"][0]["seance_length"] = change["service_duration"]
+    if "booking_duration" in change:
+        changed["seance_length"] = change["booking_duration"]
+    [fresh] = propose([baseline_catalog_row()], records=[changed], branch=mapped_branch())
+
+    assert proposal_digest(fresh) != proposal_digest(reviewed)
+    assert mapping_is_settled(fresh, agreement) is False
+
+
+def test_changed_actual_staff_evidence_invalidates_an_existing_mapping_agreement() -> None:
+    [reviewed] = propose(
+        [baseline_catalog_row(staff=[KA_STAFF_UUID, KA_SECOND_STAFF_UUID])],
+        records=mapped_source(),
+        branch=wave_b_branch(),
+        staff={KA_SERVICE_UUID: frozenset({KA_STAFF_UUID, KA_SECOND_STAFF_UUID})},
+    )
+    agreement = MappingAgreement()
+    agreement.confirm(reviewed)
+    [fresh] = propose(
+        [baseline_catalog_row(staff=[KA_STAFF_UUID, KA_SECOND_STAFF_UUID])],
+        records=[wave_b_record()],
+        branch=wave_b_branch(),
+        staff={KA_SERVICE_UUID: frozenset({KA_STAFF_UUID, KA_SECOND_STAFF_UUID})},
+        staff_ids={KA_SECOND_STAFF_ID},
+    )
+
+    assert proposal_digest(fresh) != proposal_digest(reviewed)
+    assert mapping_is_settled(fresh, agreement) is False
 
 
 def test_the_check_uses_only_masters_who_actually_perform_the_service() -> None:

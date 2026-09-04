@@ -242,7 +242,7 @@ class ServiceProposal:
     @property
     def chosen(self) -> CandidateService | None:
         """The single candidate a confirmation would accept, or nothing."""
-        if self.status != PROPOSAL_UNIQUE_NAME or len(self.candidates) != 1:
+        if self.status not in {PROPOSAL_UNIQUE_NAME, PROPOSAL_ALREADY_MAPPED} or len(self.candidates) != 1:
             return None
         return self.candidates[0]
 
@@ -265,7 +265,10 @@ class ServiceProposal:
         readiness: a matching UUID over a moved service, and a mapping inherited
         from a wave whose master was a different person.
         """
-        return self.status == PROPOSAL_ALREADY_MAPPED
+        # An existing manifest UUID is target identity, not current-wave
+        # permission.  Settlement also needs an agreement over this exact
+        # proposal, which is evaluated by ``mapping_is_settled`` below.
+        return False
 
     def review_payload(self) -> dict[str, Any]:
         """THE canonical view of one proposal: shown to a person, and digested.
@@ -665,6 +668,11 @@ class MappingAgreement:
         return cls(entries=dict(agreed))
 
 
+def mapping_is_settled(proposal: ServiceProposal, agreement: MappingAgreement) -> bool:
+    """Whether current source, target baseline and staff evidence were reviewed."""
+    return proposal.status == PROPOSAL_ALREADY_MAPPED and proposal.actionable and agreement.agreed(proposal)
+
+
 def manifest_service_patch(proposals: list[ServiceProposal], agreement: MappingAgreement) -> dict[str, dict[str, Any]]:
     """The manifest ``services`` entries the CONFIRMED proposals would add.
 
@@ -677,6 +685,10 @@ def manifest_service_patch(proposals: list[ServiceProposal], agreement: MappingA
     for proposal in proposals:
         candidate = proposal.chosen
         if candidate is None or not proposal.actionable or not agreement.agreed(proposal):
+            continue
+        if proposal.existing_uuid is not None:
+            # Confirming current evidence for an inherited mapping never
+            # rewrites or re-points the cumulative manifest.
             continue
         # A currency with no exact minor-unit form has no manifest price, and a
         # manifest entry without one would be refused by the parser anyway.

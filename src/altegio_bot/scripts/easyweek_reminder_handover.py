@@ -49,6 +49,8 @@ import sys
 from datetime import datetime, timezone
 from typing import Any, Final
 
+from sqlalchemy import text
+
 from altegio_bot.db import SessionLocal
 from altegio_bot.easyweek_client import EasyWeekClient
 from altegio_bot.easyweek_migration.manifest import load_manifest
@@ -58,7 +60,9 @@ from altegio_bot.easyweek_migration.reminder_handover import (
     boundary_still_future,
     check_snapshot_usable,
     confirmation_phrase,
+    read_apply_report,
     read_snapshot,
+    write_apply_report,
     write_snapshot,
 )
 from altegio_bot.easyweek_migration.reminder_handover_db import (
@@ -78,6 +82,9 @@ MODES: Final = (MODE_PLAN, MODE_APPLY, MODE_VERIFY)
 
 DEFAULT_SNAPSHOT: Final = (
     os.environ.get("EASYWEEK_REMINDER_HANDOVER_SNAPSHOT") or "outputs/easyweek_reminder_handover/plan.json"
+)
+DEFAULT_APPLY_REPORT: Final = (
+    os.environ.get("EASYWEEK_REMINDER_HANDOVER_APPLY_REPORT") or "outputs/easyweek_reminder_handover/apply-report.json"
 )
 
 # The host-side half of the permission. Checked in addition to the typed flag,
@@ -113,6 +120,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--snapshot",
         default=DEFAULT_SNAPSHOT,
         help="where the frozen plan lives. Holds real ids; written 0600 and never committed.",
+    )
+    parser.add_argument(
+        "--apply-report",
+        default=DEFAULT_APPLY_REPORT,
+        help="durable PII-free apply evidence. Required by verify and written 0600 after a committed apply.",
     )
     parser.add_argument(
         "--pause-sec",
@@ -209,8 +221,14 @@ async def _run(args: argparse.Namespace) -> int:
         return _fail("the snapshot was planned for a different set of companies; re-run plan")
 
     if args.mode == MODE_VERIFY:
+        try:
+            apply_report = read_apply_report(args.apply_report, frozen=frozen)
+        except SnapshotError as error:
+            return _fail(str(error))
         async with SessionLocal() as session:
-            report = await verify_handover(session, frozen.rows)
+            async with session.begin():
+                await session.execute(text("SET TRANSACTION READ ONLY"))
+                report = await verify_handover(session, frozen, apply_report)
         _print(report)
         return 0 if report["passed"] else 1
 
@@ -237,17 +255,23 @@ async def _run(args: argparse.Namespace) -> int:
         return _fail(f"{crossed}: a planned reminder has passed its moment; re-run plan")
 
     async with SessionLocal() as session:
-        async with session.begin():
-            result = await apply_plan(session, frozen.rows, now=now)
+        transaction = await session.begin()
+        try:
+            result = await apply_plan(session, frozen, now=now)
             if result.halted is not None:
-                # Roll the whole wave back: a partly applied handover leaves
-                # customers split between two systems, and the half that landed
-                # looks deliberate.
-                await session.rollback()
+                await transaction.rollback()
+            else:
+                await transaction.commit()
+        except Exception:
+            await transaction.rollback()
+            raise
     report = result.as_safe_dict()
     _print(report)
     if result.halted is not None:
         return _fail(f"halted ({result.halted}); nothing was changed")
+    durable = result.apply_report(frozen, applied_at=now)
+    path = write_apply_report(durable, args.apply_report)
+    print(f"easyweek_reminder_handover: apply report written to {path}", file=sys.stderr)
     return 0
 
 
