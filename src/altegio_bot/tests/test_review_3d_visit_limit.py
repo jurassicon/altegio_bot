@@ -66,6 +66,11 @@ class FakeJob:
 class FakeRecord:
     id: int
     company_id: int
+    # A real Altegio record always carries its source id, and both
+    # post-migration fences look the booking up by it. Without it the identity
+    # cannot be stated at all, which is UNKNOWN — fail closed in production, and
+    # here it would hide the visit-limit guard these tests are about.
+    altegio_record_id: int | None = 777001
     client_id: int | None = CLIENT_ID
     attendance: int = 1
     visit_attendance: int = 0
@@ -83,12 +88,37 @@ class FakeClient:
     altegio_client_id: int | None = ALTEGIO_CLIENT_ID
 
 
+class _EmptyResult:
+    """What a SELECT over an empty table returns."""
+
+    def all(self) -> list[Any]:
+        return []
+
+    def scalars(self) -> "_EmptyResult":
+        return self
+
+    def scalar_one_or_none(self) -> None:
+        return None
+
+
 class FakeSession:
     def __init__(self) -> None:
         self.added: list[Any] = []
 
     def add(self, obj: Any) -> None:
         self.added.append(obj)
+
+    async def execute(self, *args: Any, **kwargs: Any) -> _EmptyResult:
+        """Answer the ownership lookups the worker now performs.
+
+        These fixtures are UNMIGRATED Altegio bookings, so "no ledger row" is
+        the truthful answer, and both post-migration fences (§30 reminders and
+        §31 marketing jobs) correctly conclude the ordinary Altegio path owns
+        them. A session that cannot answer at all would make the fences fail
+        closed — which is right in production and would hide the guard this
+        file is actually about.
+        """
+        return _EmptyResult()
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -586,6 +616,16 @@ FUTURE_STARTS_AT = datetime(2026, 3, 15, 10, 0, tzinfo=timezone.utc)
 
 class _PlannerFakeSession:
     """Minimal async session for planner tests."""
+
+    async def execute(self, *args: Any, **kwargs: Any) -> _EmptyResult:
+        """The post-migration ownership lookups the planner now performs.
+
+        Unmigrated fixtures, so "no ledger row" is the truthful answer and the
+        ordinary Altegio planning continues — which is what these tests are
+        about. A session that could not answer would fail closed instead, and
+        the visit-limit guard under test would never be reached.
+        """
+        return _EmptyResult()
 
     async def get(self, model: Any, pk: Any) -> Any:
         if getattr(model, "__tablename__", None) == "records":

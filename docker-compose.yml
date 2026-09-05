@@ -370,6 +370,41 @@ services:
     profiles:
       - ops
 
+  # The post-booking marketing handover (plan §31). Its own one-off service,
+  # because it holds its own power and its own permission: it can only CANCEL
+  # Altegio `review_3d` / `repeat_10d` / `comeback_3d` and write its own marker,
+  # and it can create nothing at all — no booking, no customer, no message job,
+  # no OutboxMessage. `EASYWEEK_POST_BOOKING_HANDOVER_ALLOW_APPLY` is
+  # deliberately NOT set here: an operator passes it on the one command that
+  # writes, alongside the typed flag, the plan digest and the phrase. It is a
+  # different variable from the §30 one so neither permission can authorise the
+  # other.
+  easyweek-migration-post-booking-handover:
+    build: .
+    # `.env` only, and deliberately NOT `easyweek.env`: this tool makes no
+    # EasyWeek request in any mode, so it has no business carrying the API key.
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ${EASYWEEK_MIGRATION_INPUT_DIR:-./outputs/easyweek_migration/input}:/migration/input:ro
+      # The snapshot names real bookings and real job ids. Writable, 0600, and
+      # never committed.
+      - ${EASYWEEK_POST_BOOKING_STATE_DIR:-./outputs/easyweek_post_booking_handover}:/migration/state
+    entrypoint:
+      [
+        "/app/.venv/bin/python",
+        "-m",
+        "altegio_bot.scripts.easyweek_post_booking_handover",
+      ]
+    command: ["--help"]
+    working_dir: /app
+    restart: "no"
+    profiles:
+      - ops
+
 volumes:
   postgres_data:
   redis_data:

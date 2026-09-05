@@ -13,9 +13,10 @@ Every source booking lands in exactly one of four buckets:
                       created.
 
 The rule that shapes all of it: **anything not proven is blocked, never
-approximated.** A booking an operator moves by hand costs five minutes. A booking
-we place with the wrong master, at the wrong time, or on someone else's profile
-costs a customer, and it is discovered by the customer.
+approximated.** The only explicit exception is an owner-approved, staff-scoped
+manifest policy that replaces a custom source duration with the reviewed target
+catalogue duration while preserving the exact source start time. It is visible
+in the plan and its digest; price, customer, service and staff are never relaxed.
 
 Blocking is per-row. One unmapped master does not stop the run — the other
 bookings are independent and keep going, which is what makes the blocked list
@@ -147,6 +148,10 @@ class Decision:
     # source's own order and is canonical everywhere downstream.
     mutation_kind: str = MUTATION_SINGLE
     bindings: tuple[ServiceBinding, ...] = ()
+    # The source slot and the target catalogue total are reported separately
+    # when an explicit manifest policy normalizes a stretched/shortened booking.
+    source_booked_duration_minutes: int | None = None
+    duration_normalized_to_catalog: bool = False
     # Set when the ledger already knew this row.
     target_booking_uuid: str | None = None
 
@@ -189,6 +194,9 @@ class Decision:
             if self.starts_at_utc is not None
             else None,
             "mutation_kind": self.mutation_kind,
+            "source_booked_duration_minutes": self.source_booked_duration_minutes,
+            "target_duration_minutes": self.duration_minutes,
+            "duration_normalized_to_catalog": self.duration_normalized_to_catalog,
             "services": [item.as_safe_dict() for item in self.bindings],
             "target_booking_uuid": self.target_booking_uuid,
         }
@@ -321,7 +329,11 @@ def _prove_service(
         line_duration = read_duration_seconds(service.get("seance_length"))
     except DurationError:
         return BLOCK_CUSTOM_DURATION
-    if line_duration.present and line_duration.minutes != catalog_duration.minutes:
+    if (
+        line_duration.present
+        and line_duration.minutes != catalog_duration.minutes
+        and not branch.normalizes_duration_to_catalog(staff_id)
+    ):
         return BLOCK_CUSTOM_DURATION
 
     staff_uuid = branch.staff_uuid(staff_id)
@@ -683,7 +695,7 @@ def classify_record(
             # and only a human can tell them apart.
             return _block(BLOCK_STAFF_NOT_IN_WAVE)
 
-    # -- 3. exactly one service, no overrides ------------------------------
+    # -- 3. one supported service shape, no price overrides ----------------
     services = _services(record)
     if services is None:
         # Missing, null, not a list, or an entry that is not an object. A data
@@ -733,9 +745,12 @@ def classify_record(
     assert booking_duration.minutes is not None
     duration_minutes = booking_duration.minutes
 
-    if duration_minutes != total_duration_minutes(tuple(bindings)):
+    target_duration_minutes = total_duration_minutes(tuple(bindings))
+    duration_normalized = duration_minutes != target_duration_minutes
+    if duration_normalized and not branch.normalizes_duration_to_catalog(staff_id):
         # A slot that does not match its services' catalogue length. EasyWeek's
-        # custom-duration representation is not proven, so it is not guessed.
+        # custom-duration representation is not proven, so the default stays
+        # fail-closed. Only the explicit staff policy above changes that answer.
         return _block(BLOCK_CUSTOM_DURATION)
 
     try:
@@ -840,6 +855,8 @@ def classify_record(
                 easyweek_customer_uuid=customer_uuid,
                 mutation_kind=kind,
                 bindings=tuple(bindings),
+                source_booked_duration_minutes=duration_minutes,
+                duration_normalized_to_catalog=duration_normalized,
                 target_booking_uuid=ledger.target_booking_uuid,
                 source_fingerprint=fingerprint,
             )
@@ -873,5 +890,7 @@ def classify_record(
         easyweek_customer_uuid=customer_uuid,
         mutation_kind=kind,
         bindings=tuple(bindings),
+        source_booked_duration_minutes=duration_minutes,
+        duration_normalized_to_catalog=duration_normalized,
         source_fingerprint=fingerprint,
     )

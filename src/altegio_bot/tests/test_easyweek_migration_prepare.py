@@ -205,7 +205,15 @@ def make_inputs(state_dir: Path, *, manifest_text: str | None = None, mode: str 
 
 
 def stub_source(monkeypatch: pytest.MonkeyPatch, records: list[dict[str, Any]]) -> None:
-    async def _fetch(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+    async def _fetch(
+        *,
+        company_id: int,
+        window: Any,
+        client: Any | None = None,
+    ) -> list[dict[str, Any]]:
+        assert company_id == KARLSRUHE_COMPANY_ID
+        assert window is not None
+        assert client is None
         return list(records)
 
     monkeypatch.setattr(prepare_module, "fetch_company_records", _fetch)
@@ -1896,12 +1904,20 @@ def stretched(minutes: int) -> dict[str, Any]:
     return record
 
 
+def karlsruhe_branch() -> Any:
+    manifest = parse_manifest(manifest_json())
+    assert manifest.valid
+    branch = manifest.branch(KARLSRUHE_COMPANY_ID)
+    assert branch is not None
+    return branch
+
+
 def test_the_actual_booking_duration_comes_from_the_top_level_field() -> None:
     """The service line says 60; the appointment is 90. The appointment wins."""
     record = stretched(90)
     record["services"][0]["seance_length"] = 3600
 
-    row = prepare_module.operator_record_row(record, block_reason=None)
+    row = prepare_module.operator_record_row(record, branch=karlsruhe_branch(), block_reason=None)
 
     assert row["duration_minutes"] == 90
     assert row["service_line_duration_minutes"] == 60, "kept separately, not replaced"
@@ -1928,7 +1944,29 @@ def test_a_fractional_duration_is_reported_as_unknown_not_rounded() -> None:
     record = source_record()
     record["seance_length"] = 3630  # 60.5 minutes
 
-    assert prepare_module.operator_record_row(record, block_reason=None)["duration_minutes"] is None
+    assert (
+        prepare_module.operator_record_row(
+            record,
+            branch=karlsruhe_branch(),
+            block_reason=None,
+        )["duration_minutes"]
+        is None
+    )
+
+
+def test_operator_row_shows_the_explicit_standard_duration_normalization() -> None:
+    payload = json.loads(manifest_json())
+    payload["branches"][str(KARLSRUHE_COMPANY_ID)]["normalize_duration_to_catalog_for_staff_ids"] = [KA_STAFF_ID]
+    manifest = parse_manifest(json.dumps(payload))
+    assert manifest.valid
+    branch = manifest.branch(KARLSRUHE_COMPANY_ID)
+    assert branch is not None
+
+    row = prepare_module.operator_record_row(stretched(90), branch=branch, block_reason=None)
+
+    assert row["duration_minutes"] == 90
+    assert row["target_catalog_duration_minutes"] == 60
+    assert row["duration_normalized_to_catalog"] is True
 
 
 @pytest.mark.parametrize(

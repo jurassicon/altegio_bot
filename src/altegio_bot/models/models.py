@@ -1612,6 +1612,26 @@ class EasyWeekMigrationLedger(Base):
             "(rollback_attempted_at IS NULL) = (rollback_attempt_run_id IS NULL)",
             name="ck_easyweek_migration_ledger_rollback_attempt_complete",
         ),
+        # PR-12.1 (§31). The same shape as the reminder marker and deliberately
+        # NOT the same columns: §30 proves that timed EasyWeek reminders were
+        # created, while this proves that source marketing ownership was given
+        # up WITHOUT creating any target obligation. Merging them would let one
+        # proof stand in for the other.
+        CheckConstraint(
+            "(post_booking_jobs_handed_over_at IS NULL) = (post_booking_handover_plan_digest IS NULL)",
+            name="ck_easyweek_migration_ledger_post_booking_handover_complete",
+        ),
+        # Read by the Altegio planner on every create/update/delete delivery and
+        # by the outbox immediately before a send, so it has to be index-only.
+        # Partial for the same reason as the reminder one: only handed-over rows
+        # are ever asked about.
+        Index(
+            "ix_easyweek_migration_ledger_post_booking_handover",
+            "source_provider",
+            "source_company_id",
+            "source_record_id",
+            postgresql_where=text("post_booking_jobs_handed_over_at IS NOT NULL"),
+        ),
         # The fence runs inside the Altegio planning transaction for every
         # create/update delivery, so it has to be an index-only lookup. Partial
         # on purpose: only handed-over rows are ever asked about, and the index
@@ -1700,6 +1720,30 @@ class EasyWeekMigrationLedger(Base):
     # repeat of the SAME snapshot is recognised as idempotent, and a different
     # one is refused rather than silently re-marking the row.
     reminder_handover_plan_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    # -- post-booking marketing ownership (PR-12.1, plan §31.6) ------------
+    # When this booking's `review_3d` / `repeat_10d` / `comeback_3d` stopped
+    # being Altegio's, and under which reviewed plan.
+    #
+    # A separate marker from the reminder one, and the difference is the whole
+    # point. §30 says "the EasyWeek reminders for this booking exist"; this says
+    # "the Altegio marketing obligations for this booking are withdrawn and no
+    # target obligation was created in their place" — because a migrated future
+    # booking proves no completed visit, and only a real EasyWeek outcome event
+    # may ever create the EasyWeek equivalents.
+    #
+    # It is written for EVERY eligible row of the wave, including rows that
+    # carry no such job right now: without it, a late Altegio delivery would
+    # create the FIRST obligation after the handover, and there would be nothing
+    # for the runtime fences to find.
+    post_booking_jobs_handed_over_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    # The reviewed plan digest that authorised it. A repeat of the same snapshot
+    # is idempotent; a different digest is refused rather than silently
+    # overwriting somebody else's authorisation.
+    post_booking_handover_plan_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     # -- rollback attempt (PR-11.2, plan §30.12) ---------------------------
     # When a confirmed rollback was about to send this row's cancel, and which

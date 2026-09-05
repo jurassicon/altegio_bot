@@ -447,6 +447,11 @@ def _run(coro: Any) -> Any:
 class _FakeRecord:
     id: int
     company_id: int
+    # A real Altegio record carries its source id, and the post-migration
+    # fences look the booking up by it. Absent, the identity cannot be stated
+    # at all — UNKNOWN, which fails closed in production and would hide the
+    # guard these tests are about.
+    altegio_record_id: int | None = 777010
     client_id: int | None = 1
     attendance: int = 1
     visit_attendance: int = 0
@@ -481,12 +486,33 @@ class _FakeJob:
     payload: dict = field(default_factory=dict)
 
 
+class _EmptyResult:
+    """What a SELECT over an empty table returns."""
+
+    def all(self) -> list[Any]:
+        return []
+
+    def scalars(self) -> "_EmptyResult":
+        return self
+
+    def scalar_one_or_none(self) -> None:
+        return None
+
+
 class _FakeSession:
     def __init__(self) -> None:
         self.added: list[Any] = []
 
     def add(self, obj: Any) -> None:
         self.added.append(obj)
+
+    async def execute(self, *args: Any, **kwargs: Any) -> _EmptyResult:
+        """Answer the post-migration ownership lookups.
+
+        These fixtures are unmigrated bookings, so "no ledger row" is the
+        truthful answer and the ordinary Altegio path keeps owning them.
+        """
+        return _EmptyResult()
 
 
 def _make_fake_repeat_job(**overrides: Any) -> _FakeJob:

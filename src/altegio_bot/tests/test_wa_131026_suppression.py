@@ -265,6 +265,11 @@ class _FakeClient:
 @dataclass
 class _FakeRecord:
     id: int = 10
+    company_id: int = 758285
+    # A real Altegio record carries its source id; the post-migration fences
+    # look the booking up by it, and an identity that cannot be stated is
+    # UNKNOWN rather than permission.
+    altegio_record_id: int | None = 777020
     client_id: int | None = 1
     starts_at: datetime | None = field(default_factory=lambda: NOW - timedelta(days=4))
     is_deleted: bool = False
@@ -274,6 +279,17 @@ class _FakeRecord:
 class _FakeScalarResult:
     def scalar_one_or_none(self) -> None:
         return None
+
+    def all(self) -> list[Any]:
+        """No rows — including for the post-migration ownership lookups.
+
+        These fixtures are unmigrated bookings, so "no ledger row" is the
+        truthful answer and the ordinary Altegio path keeps owning them.
+        """
+        return []
+
+    def scalars(self) -> "_FakeScalarResult":
+        return self
 
 
 class _FakeSession:

@@ -14,6 +14,7 @@ and nothing else — no phone, no name, no e-mail, no export.
 | `easyweek_location_uuid` | `GET /locations` (`scripts/easyweek_probe.py`), matched by the human-readable branch name |
 | `selected_altegio_staff_ids` | the masters migrating in THIS wave, by Altegio staff id |
 | `deferred_altegio_staff_ids` | every other master — held back for a later wave, or already migrated by an earlier one |
+| `normalize_duration_to_catalog_for_staff_ids` | explicit staff-scoped opt-in: keep the Altegio start, but create with the reviewed EasyWeek catalogue duration |
 | `staff.<altegio_staff_id>` | EasyWeek staff UUID for that master, read from the EasyWeek UI/API. Selected AND already-migrated masters both belong here |
 | `services.<altegio_service_id>.easyweek_service_uuid` | EasyWeek service UUID for that service |
 | `services.<altegio_service_id>.catalog_duration_minutes` | the service's catalogue length, whole minutes |
@@ -79,6 +80,15 @@ fetched.
 
   Both lists are part of the manifest digest, so moving a master between waves
   invalidates the verified dry-run and the canary proof.
+- **Duration normalization is explicit and staff-scoped.** A non-standard
+  source duration remains blocked by default. An id in
+  `normalize_duration_to_catalog_for_staff_ids` authorizes only that exact
+  mapped and classified master to keep the Altegio start time while EasyWeek
+  uses the sum of the reviewed catalogue durations. Source and target durations
+  are both shown in the plan. The policy is part of the manifest digest and
+  remains in cumulative manifests while those bookings are live. It never
+  authorizes a custom price, discount, malformed duration, extra service, or
+  another master.
 - **`selected_altegio_staff_ids` may be empty for one branch, never for all of
   them.** From the second wave on, a branch can have nothing new to migrate and
   still be obliged to stay in the file, because its earlier waves' bookings are

@@ -136,6 +136,17 @@ from altegio_bot.models.models import (
     WhatsAppSender,
 )
 from altegio_bot.perf import perf_log
+from altegio_bot.post_booking_ownership import (
+    POST_BOOKING_JOB_TYPES,
+    PostBookingOwner,
+    altegio_post_booking_jobs_are_suppressed,
+)
+from altegio_bot.post_booking_ownership import (
+    REASON_HANDED_OVER as POST_BOOKING_REASON_HANDED_OVER,
+)
+from altegio_bot.post_booking_ownership import (
+    REASON_UNKNOWN as POST_BOOKING_REASON_UNKNOWN,
+)
 from altegio_bot.promo_discount_apply import process_promo_apply_existing_booking_job
 from altegio_bot.providers.base import WhatsAppProvider
 from altegio_bot.providers.dummy import safe_send, safe_send_template
@@ -241,6 +252,9 @@ MAX_API_GUARD_ATTEMPTS = 5
 # separate from `attempts`, and it ends in `failed` rather than in a send.
 MAX_REMINDER_OWNERSHIP_ATTEMPTS = 5
 _REMINDER_OWNERSHIP_ATTEMPTS_KEY = "_reminder_ownership_attempts"
+# The same idea for the PR-12.1 fence, under its own key: the two questions are
+# different and their bounded retries must not share a counter.
+_POST_BOOKING_OWNERSHIP_ATTEMPTS_KEY = "_post_booking_ownership_attempts"
 
 # Separate counter for the follow-up live Altegio guard stored in job.payload.
 # Independent from _api_guard_attempts (which serves review_3d / repeat_10d / comeback_3d)
@@ -434,6 +448,34 @@ def _handle_reminder_ownership_unproven(job: MessageJob) -> None:
     job.locked_at = None
     job.updated_at = utcnow()
     job.last_error = REASON_UNKNOWN
+
+    if count >= MAX_REMINDER_OWNERSHIP_ATTEMPTS:
+        job.status = "failed"
+        return
+
+    job.status = "queued"
+    job.run_at = utcnow() + timedelta(seconds=_retry_delay_seconds(count))
+
+
+def _handle_post_booking_ownership_unproven(job: MessageJob) -> None:
+    """Requeue a marketing job whose ownership could not be proven (§31.7).
+
+    Identical in shape to the reminder version and deliberately separate: it
+    counts on its own payload key, so a booking whose reminder question was
+    unanswerable does not spend this job's budget or the other way round.
+
+    After the bounded retries the job FAILS rather than sending. An ownership
+    lookup that never becomes answerable is a state a person has to look at, and
+    the outcome that must not follow from it is a customer being asked to review
+    an appointment that now lives in another system.
+    """
+    payload = dict(getattr(job, "payload", None) or {})
+    count = int(payload.get(_POST_BOOKING_OWNERSHIP_ATTEMPTS_KEY, 0)) + 1
+    payload[_POST_BOOKING_OWNERSHIP_ATTEMPTS_KEY] = count
+    job.payload = payload
+    job.locked_at = None
+    job.updated_at = utcnow()
+    job.last_error = POST_BOOKING_REASON_UNKNOWN
 
     if count >= MAX_REMINDER_OWNERSHIP_ATTEMPTS:
         job.status = "failed"
@@ -3196,6 +3238,49 @@ async def _run_job_logic(
             _handle_reminder_ownership_unproven(job)
             logger.error(
                 "Altegio reminder ownership unproven: job_id=%s company=%s job_type=%s",
+                job.id,
+                job.company_id,
+                job.job_type,
+            )
+            return
+
+    # The PR-12.1 fence (plan §31.7), in the same place and for the same reason
+    # as the reminder one above: this is the last point before the template, the
+    # render, the sender, the Altegio API, Meta and the Chatwoot mirror, so a
+    # job whose ownership moved costs no external call and no `attempts`.
+    #
+    # Altegio only, and only these three job types. An EasyWeek `review_3d` is
+    # exactly what a proven `booking-succeeded` created; suppressing it here
+    # would undo the correct path instead of protecting it. `record is not None`
+    # for the same reason as above: without a Record there is no source identity
+    # to look the handover up by.
+    if record is not None and job_provider == PROVIDER_ALTEGIO and job.job_type in POST_BOOKING_JOB_TYPES:
+        suppressed, owner = await altegio_post_booking_jobs_are_suppressed(
+            session,
+            company_id=job.company_id,
+            altegio_record_id=getattr(record, "altegio_record_id", None),
+        )
+        if suppressed and owner is PostBookingOwner.EASYWEEK:
+            # Proven: the Altegio side gave this booking's marketing follow-ups
+            # up. Terminal, and NOT a failed send — nothing was attempted, so
+            # `attempts` is untouched.
+            job.status = "canceled"
+            job.locked_at = None
+            job.updated_at = utcnow()
+            job.last_error = POST_BOOKING_REASON_HANDED_OVER
+            logger.info(
+                "Altegio post-booking job suppressed: job_id=%s company=%s job_type=%s owner=easyweek",
+                job.id,
+                job.company_id,
+                job.job_type,
+            )
+            return
+        if suppressed:
+            # Unanswerable. Not a licence to send and not a terminal verdict:
+            # requeued on its own counter, never silently becoming a message.
+            _handle_post_booking_ownership_unproven(job)
+            logger.error(
+                "Altegio post-booking ownership unproven: job_id=%s company=%s job_type=%s",
                 job.id,
                 job.company_id,
                 job.job_type,
