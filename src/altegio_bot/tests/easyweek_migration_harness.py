@@ -302,6 +302,21 @@ class RecordingTransport:
         # test can pre-cancel one WITHOUT recording a mutation, which is how the
         # idempotent "already cancelled" path is exercised.
         self.canceled_uuids: set[str] = set()
+        # Every PUT that actually LEFT, in order — including the ones the
+        # fixture then fails. `cancelled` counts proven cancels; this counts
+        # requests, which is what "no second PUT" has to be measured against.
+        self.cancel_puts: list[str] = []
+        # booking uuid -> how the cancel PUT itself should fail: an int status
+        # or an exception instance (a timeout, a transport error).
+        self.cancel_fail_with: dict[str, object] = {}
+        # Makes a FAILING cancel still cancel the booking. This is the case the
+        # whole recovery exists for: the workspace changed, the answer did not
+        # arrive.
+        self.cancel_side_effect_on_failure = False
+        # booking uuid -> how the CONFIRMATION read (the GET after the PUT)
+        # should fail, independently of the PUT: an int status, an exception, or
+        # one of "malformed", "missing", "non_bool", "false".
+        self.confirm_get_fail_with: dict[str, object] = {}
         self.bookings: dict[str, dict] = {}
         # booking uuid -> the staffer the POST named. Held OUTSIDE the booking,
         # exactly as EasyWeek holds it: the only way to read it back is the
@@ -347,6 +362,22 @@ class RecordingTransport:
             uuid = path.split("/")[-3]
             body = json.loads(request.content.decode() or "{}")
             assert set(body) == {"cancel_reason", "internal_notes"}, f"unexpected cancel body: {sorted(body)}"
+            assert body["cancel_reason"] == "other", f"unproven cancel_reason: {body['cancel_reason']}"
+            assert isinstance(body["internal_notes"], str), "internal_notes must be a string"
+            # Counted BEFORE any modelled failure: a request that left is a
+            # request that left, whatever came back.
+            self.cancel_puts.append(uuid)
+
+            failure = self.cancel_fail_with.get(uuid)
+            if failure is not None:
+                if self.cancel_side_effect_on_failure:
+                    # The cancel landed; only the answer did not.
+                    self.canceled_uuids.add(uuid)
+                if isinstance(failure, Exception):
+                    raise failure
+                assert isinstance(failure, int)
+                return httpx.Response(failure, json={"error": "no"})
+
             self.cancelled.append(uuid)
             # The booking now reads back as cancelled, which is what the client
             # checks before it reports a rollback as done.
@@ -424,6 +455,25 @@ class RecordingTransport:
             # cancelled has to READ as cancelled, or the client is right to
             # report the outcome as unproven.
             booking = {**booking, "is_canceled": True, "status": {"type": "CANCELED"}}
+
+        # Only the CONFIRMATION read can be broken this way: the preflight read
+        # happens before this booking has ever been PUT to, so it is untouched.
+        # That separation is the point — an error before the mutation and an
+        # error after it are different facts and must be testable apart.
+        if uuid in self.cancel_puts:
+            failure = self.confirm_get_fail_with.get(uuid)
+            if isinstance(failure, Exception):
+                raise failure
+            if isinstance(failure, int):
+                return httpx.Response(failure, json={"error": "unavailable"})
+            if failure == "malformed":
+                return httpx.Response(200, content=b"{not json", headers={"content-type": "application/json"})
+            if failure == "missing":
+                booking = {key: value for key, value in booking.items() if key != "is_canceled"}
+            elif failure == "non_bool":
+                booking = {**booking, "is_canceled": "yes"}
+            elif failure == "false":
+                booking = {**booking, "is_canceled": False}
         return httpx.Response(200, json=booking)
 
     # -- POST /bookings ------------------------------------------------------

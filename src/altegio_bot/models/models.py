@@ -1605,6 +1605,13 @@ class EasyWeekMigrationLedger(Base):
             "(reminders_handed_over_at IS NULL) = (reminder_handover_plan_digest IS NULL)",
             name="ck_easyweek_migration_ledger_reminder_handover_complete",
         ),
+        # A rollback attempt is one fact in two columns, for the same reason the
+        # handover marker is: half of it would be an attempt with no run to
+        # attribute it to, or a run id claiming an attempt that never happened.
+        CheckConstraint(
+            "(rollback_attempted_at IS NULL) = (rollback_attempt_run_id IS NULL)",
+            name="ck_easyweek_migration_ledger_rollback_attempt_complete",
+        ),
         # The fence runs inside the Altegio planning transaction for every
         # create/update delivery, so it has to be an index-only lookup. Partial
         # on purpose: only handed-over rows are ever asked about, and the index
@@ -1693,6 +1700,30 @@ class EasyWeekMigrationLedger(Base):
     # repeat of the SAME snapshot is recognised as idempotent, and a different
     # one is refused rather than silently re-marking the row.
     reminder_handover_plan_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    # -- rollback attempt (PR-11.2, plan §30.12) ---------------------------
+    # When a confirmed rollback was about to send this row's cancel, and which
+    # run was about to send it. Written and COMMITTED before the PUT leaves.
+    #
+    # It exists because a cancel can end in three states, and only one of them
+    # is knowable from EasyWeek alone. A booking that reads as cancelled today
+    # is either one this tool cancelled (whose response we may never have seen)
+    # or one a person cancelled by hand — and those must not be treated the
+    # same: the first may finish as `rolled_back`, the second is a target
+    # somebody modified and is not ours to claim.
+    #
+    # The marker is the only durable difference between them, so it is written
+    # BEFORE the mutation rather than after it. A crash between the write and
+    # the PUT therefore leaves a row that says "a cancel may have been sent" —
+    # which is exactly what happened, and which the next run resolves by
+    # reading the booking rather than by sending a second PUT.
+    rollback_attempted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    # Kept beside the instant so an operator can tell WHICH rollback run left an
+    # unresolved attempt without joining anything.
+    rollback_attempt_run_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

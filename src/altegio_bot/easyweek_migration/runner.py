@@ -139,6 +139,7 @@ from altegio_bot.easyweek_migration.service_catalog import (
 from altegio_bot.easyweek_migration.target_snapshot import (
     TargetSnapshotError,
     project_target,
+    prove_canceled_target,
 )
 from altegio_bot.easyweek_migration.write_client import (
     EasyWeekMigrationWriteClient,
@@ -199,6 +200,17 @@ ROLLBACK_UNCERTAIN: Final = "rollback_uncertain"
 # untouched.
 ROLLBACK_REFUSED: Final = "rollback_refused"
 ROLLBACK_NO_SNAPSHOT: Final = "rollback_target_snapshot_missing"
+# A durable attempt of OURS exists and the booking now reads as cancelled: the
+# PUT did land, we simply never saw it. The row is completed WITHOUT a second
+# mutation — this is the recovery the attempt marker exists for.
+ROLLBACK_RECOVERED: Final = "rollback_recovered_from_attempt"
+# The same situation seen by a dry-run, which proves it and writes nothing.
+ROLLBACK_RECOVERY_AVAILABLE: Final = "rollback_recovery_available"
+# Our attempt exists and the booking is STILL live. A second PUT is exactly the
+# unknown-outcome repeat this design bans, so nothing is sent and an operator
+# decides. Deliberately distinct from `rollback_uncertain`, which describes the
+# attempt that has just happened rather than one found on a later run.
+ROLLBACK_ATTEMPT_UNRESOLVED: Final = "rollback_attempt_unresolved"
 # The booking names no master, so rollback proves one the same way every other
 # path does. An unproven master is an unproven target, and an unproven target is
 # never cancelled.
@@ -2291,11 +2303,20 @@ async def run_rollback(
                 row.target_booking_uuid,
                 row.target_snapshot_fingerprint,
                 row.source_fingerprint,
+                row.rollback_attempted_at is not None,
             )
             for row in rows
         ]
 
-    for safe_row, company_id, record_id, target, stored_fingerprint, source_fingerprint in candidates:
+    for (
+        safe_row,
+        company_id,
+        record_id,
+        target,
+        stored_fingerprint,
+        source_fingerprint,
+        attempted_at,
+    ) in candidates:
         entry = dict(safe_row)
 
         def _refuse(reason: str) -> None:
@@ -2324,6 +2345,65 @@ async def run_rollback(
             continue
 
         marker = ledger_module.migration_marker(source_company_id=company_id, source_record_id=record_id)
+
+        # -- did OUR cancel already land? -----------------------------------
+        # Asked before the projection, because the projection refuses a
+        # cancelled booking and cannot tell the two cancellations apart:
+        #
+        #   * a booking cancelled by a person is a target somebody modified —
+        #     unchanged behaviour, and never claimed as our rollback;
+        #   * a booking cancelled while OUR attempt marker was standing is our
+        #     own PUT whose result we never saw, and finishing that row costs
+        #     no mutation at all.
+        #
+        # The marker is proven inside `prove_canceled_target`, so a booking that
+        # is not one this migration wrote can never reach either branch.
+        try:
+            already_canceled = prove_canceled_target(booking, expected_marker=marker)
+        except TargetSnapshotError:
+            _refuse(ROLLBACK_TARGET_MODIFIED)
+            continue
+
+        if already_canceled:
+            # Nothing is weakened by answering here, before the snapshot, staff
+            # and service proofs: those exist to decide whether a booking may be
+            # CANCELLED, and this branch cancels nothing. They also cannot run
+            # on a cancelled booking at all — `project_target` refuses one by
+            # design. What licenses the completion instead is the attempt marker
+            # itself: it is only ever written after every one of those proofs
+            # passed, moments before the PUT that this row is still waiting on.
+            if not attempted_at:
+                # Cancelled by somebody else, or before this tool ever tried.
+                # Not ours to claim, and not a rollback we performed.
+                _refuse(ROLLBACK_TARGET_MODIFIED)
+                continue
+            if not inputs.rollback_confirmed:
+                # A dry-run states the finding and changes nothing.
+                entry["rollback_outcome"] = ROLLBACK_RECOVERY_AVAILABLE
+                report.reasons[ROLLBACK_RECOVERY_AVAILABLE] += 1
+                report.created_rows.append(entry)
+                continue
+            async with session_maker() as session:
+                async with session.begin():
+                    await ledger_module.record_rolled_back(
+                        session,
+                        run_id=inputs.run_id,
+                        source_company_id=company_id,
+                        source_record_id=record_id,
+                    )
+            entry["rollback_outcome"] = ROLLBACK_RECOVERED
+            report.reasons[ROLLBACK_RECOVERED] += 1
+            report.created_rows.append(entry)
+            continue
+
+        if attempted_at:
+            # Our attempt is on the row and the booking is still live. Either the
+            # PUT never left, or it left and did nothing. Both readings forbid an
+            # automatic second PUT: EasyWeek publishes no idempotency key, and a
+            # blind repeat is the unknown mutation this design refuses to make.
+            _refuse(ROLLBACK_ATTEMPT_UNRESOLVED)
+            continue
+
         try:
             live = project_target(booking, expected_marker=marker)
         except TargetSnapshotError:
@@ -2396,6 +2476,20 @@ async def run_rollback(
             report.reasons[ROLLBACK_ELIGIBLE] += 1
             report.created_rows.append(entry)
             continue
+
+        # The attempt is recorded and COMMITTED before the request goes out, in
+        # its own transaction. Written afterwards it would be missing in the one
+        # case it exists for — the run that never got an answer — and a crash
+        # between this commit and the PUT leaves precisely the truth: a cancel
+        # may have been sent, and the next run must read rather than repeat.
+        async with session_maker() as session:
+            async with session.begin():
+                await ledger_module.record_rollback_attempt(
+                    session,
+                    run_id=inputs.run_id,
+                    source_company_id=company_id,
+                    source_record_id=record_id,
+                )
 
         report.mutations_attempted += 1
         try:

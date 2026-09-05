@@ -1060,6 +1060,10 @@ class EasyWeekMigrationWriteClient:
         canonical = _canonical_booking_uuid(booking_uuid)
 
         # 1. Is it already cancelled? Proven by a read, before any mutation.
+        #
+        # A failure HERE is not uncertain and must not pretend to be: nothing
+        # was sent, so the caller's own error taxonomy applies unchanged and the
+        # ledger keeps saying exactly what it said before.
         if await self._booking_is_canceled(canonical):
             logger.info("easyweek_migration: cancel_booking already canceled — no mutation issued")
             return
@@ -1100,7 +1104,26 @@ class EasyWeekMigrationWriteClient:
             raise EasyWeekPermanentError("permanent client error", operation="cancel_booking", status_code=status)
 
         # 2. The status code said yes; the workspace has to agree.
-        if not await self._booking_is_canceled(canonical):
+        #
+        # EVERY failure of this read is uncertain, not an error. The PUT has
+        # already been sent — a timeout, a 404, a 500, a rate limit, malformed
+        # JSON or an `is_canceled` that is not a boolean all leave the same
+        # question open: did the cancel land? Letting the read's own exception
+        # type out would answer it, wrongly. `EasyWeekRetryableError` in
+        # particular would surface as a refusal in the runner and go on to say
+        # the booking was NOT cancelled, when it may well have been.
+        try:
+            proven = await self._booking_is_canceled(canonical)
+        except EasyWeekError as exc:
+            raise EasyWeekUncertainMutation(
+                "cancel returned success but the booking could not be read back",
+                operation="cancel_booking",
+                status_code=status,
+            ) from exc
+        if not proven:
+            # A literal `false` is no better: the workspace says the booking is
+            # still live, and we cannot tell a cancel that failed from one that
+            # has not propagated yet. Neither may be recorded as a rollback.
             raise EasyWeekUncertainMutation(
                 "cancel returned success but the booking does not read as canceled",
                 operation="cancel_booking",

@@ -25,6 +25,7 @@ short enough for a human to work through.
 from __future__ import annotations
 
 import hashlib
+import hmac
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Final
@@ -386,6 +387,139 @@ def source_fingerprint(
     return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
 
 
+def legacy_source_fingerprint(
+    *,
+    company_id: int,
+    record_id: int,
+    starts_at_utc: datetime,
+    staff_uuid: str,
+    service_uuid: str,
+    duration_minutes: int,
+    customer_uuid: str,
+) -> str:
+    """The fingerprint format every ledger row written before bindings carries.
+
+    This is not a re-derivation or an approximation: it is the exact algorithm
+    that ran in production from the first migration wave until `ServiceBinding`
+    replaced the loose scalars, copied field for field and in the same order.
+    It is frozen. Changing it would not "improve" anything — it would silently
+    stop recognising rows that already exist in PostgreSQL.
+
+    It knows only one service, because the contract it was written for could
+    only ever migrate one, and it carries no quantity, because the code that
+    produced it never read `amount`. Both facts constrain when it may be
+    trusted; see `_legacy_candidate`.
+    """
+    blob = "|".join(
+        [
+            str(company_id),
+            str(record_id),
+            starts_at_utc.isoformat(),
+            staff_uuid,
+            service_uuid,
+            str(duration_minutes),
+            customer_uuid,
+        ]
+    )
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _legacy_candidate(
+    *,
+    mutation_kind: str,
+    bindings: tuple[ServiceBinding, ...],
+    company_id: int,
+    record_id: int,
+    starts_at_utc: datetime | None,
+    staff_uuid: str | None,
+    customer_uuid: str | None,
+    booked_duration_minutes: int | None,
+) -> str | None:
+    """The legacy fingerprint THIS source booking would have produced, or None.
+
+    `None` means "no legacy value can honestly be computed here", and the caller
+    must then treat a mismatch as a mismatch. The conditions are the exact
+    boundary of what the legacy format ever described:
+
+    * `single` only — the legacy contract had no cart, so a cart row's stored
+      hash can never legitimately be a legacy hash of anything;
+    * exactly one binding, for the same reason;
+    * `amount` exactly `1`, as an `int` and never a `bool`. The old code never
+      read the quantity, so a booking that is TWO units today would recompute to
+      the same legacy hash as the one unit that was migrated. Requiring the
+      quantity to be one now is what stops `amount=2` from hiding behind the old
+      format; and
+    * every field the legacy blob needs actually present.
+
+    Everything else about the booking has already been proven by the modern
+    classifier before this is reached — this only decides whether the stored
+    hash may be COMPARED against the old shape.
+    """
+    if mutation_kind != MUTATION_SINGLE or len(bindings) != 1:
+        return None
+    binding = bindings[0]
+    if type(binding.source_amount) is not int or binding.source_amount != PROVEN_SERVICE_AMOUNT:
+        return None
+    if starts_at_utc is None or staff_uuid is None or customer_uuid is None or booked_duration_minutes is None:
+        return None
+    return legacy_source_fingerprint(
+        company_id=company_id,
+        record_id=record_id,
+        starts_at_utc=starts_at_utc,
+        staff_uuid=staff_uuid,
+        service_uuid=binding.easyweek_service_uuid,
+        duration_minutes=booked_duration_minutes,
+        customer_uuid=customer_uuid,
+    )
+
+
+def _matches(stored: str | None, *, current: str, legacy: str | None) -> bool:
+    """The ONE place a stored fingerprint is compared against anything.
+
+    Two accepted values and no third: the fingerprint this build computes, and —
+    only when `_legacy_candidate` was able to compute one — the exact hash the
+    pre-binding production code would have written for the very same booking.
+
+    Centralised on purpose. The comparison used to be a bare `!=` in four
+    modules; adding a second accepted format there would have meant four chances
+    to write `or` slightly too generously, in code paths that cancel real
+    appointments. Everything fails closed here: an empty stored value never
+    matches, and a legacy value that could not be computed is not a licence.
+    """
+    if not stored:
+        return False
+    if hmac.compare_digest(stored, current):
+        return True
+    if legacy is None:
+        return False
+    return hmac.compare_digest(stored, legacy)
+
+
+def fingerprint_matches_decision(stored: str | None, decision: Decision) -> bool:
+    """Does a stored ledger fingerprint describe THIS freshly classified booking?
+
+    The decision must already be a modern, fully proven one — this answers only
+    the format question, never the "is the source still valid" question, which
+    every caller has asked before it gets here.
+    """
+    if decision.source_fingerprint is None or decision.source_record_id is None:
+        return False
+    return _matches(
+        stored,
+        current=decision.source_fingerprint,
+        legacy=_legacy_candidate(
+            mutation_kind=decision.mutation_kind,
+            bindings=decision.bindings,
+            company_id=decision.source_company_id,
+            record_id=decision.source_record_id,
+            starts_at_utc=decision.starts_at_utc,
+            staff_uuid=decision.easyweek_staff_uuid,
+            customer_uuid=decision.easyweek_customer_uuid,
+            booked_duration_minutes=decision.duration_minutes,
+        ),
+    )
+
+
 @dataclass(frozen=True)
 class LedgerView:
     """What the ledger already knows about one source booking."""
@@ -657,7 +791,27 @@ def classify_record(
                 target_booking_uuid=ledger.target_booking_uuid,
             )
         if ledger.status == "created":
-            if ledger.source_fingerprint != fingerprint:
+            # Both formats, one comparison. A row migrated before the binding
+            # model exists in PostgreSQL with the old hash and cannot be
+            # recomputed into the new one without re-proving the source and the
+            # target — so it is recognised, not rewritten. `_matches` decides,
+            # and it only offers the legacy value for a booking that is still a
+            # single service of exactly one unit.
+            stored_matches = _matches(
+                ledger.source_fingerprint,
+                current=fingerprint,
+                legacy=_legacy_candidate(
+                    mutation_kind=kind,
+                    bindings=tuple(bindings),
+                    company_id=company_id,
+                    record_id=record_id,
+                    starts_at_utc=starts_at,
+                    staff_uuid=staff_uuid,
+                    customer_uuid=customer_uuid,
+                    booked_duration_minutes=duration_minutes,
+                ),
+            )
+            if not stored_matches:
                 # It was migrated, and then Altegio changed underneath. Creating
                 # a second booking would double-book; silently accepting the old
                 # one would leave the customer with a stale appointment. Human.

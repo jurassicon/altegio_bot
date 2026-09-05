@@ -319,6 +319,46 @@ async def record_rolled_back(
     )
 
 
+async def record_rollback_attempt(
+    session: AsyncSession,
+    *,
+    run_id: str,
+    source_company_id: int,
+    source_record_id: int,
+) -> None:
+    """Write down that a cancel for this row is ABOUT to be sent.
+
+    Called immediately before the PUT and committed on its own, so the marker
+    exists whatever happens next — including a crash between this and the
+    request. That ordering is the whole point: a marker written afterwards would
+    be missing in exactly the case it is needed for, the one where the response
+    never came back.
+
+    It does NOT touch `status`. The row stays `created` until a cancel is
+    proven; the marker says a cancel may have been attempted, which is a
+    different claim and is kept in different columns.
+
+    Idempotent: a repeat leaves the first attempt's instant and run in place, so
+    the earliest evidence survives a re-run.
+    """
+    row = (
+        await session.execute(
+            select(EasyWeekMigrationLedger).where(
+                EasyWeekMigrationLedger.source_provider == PROVIDER_ALTEGIO,
+                EasyWeekMigrationLedger.source_company_id == source_company_id,
+                EasyWeekMigrationLedger.source_record_id == source_record_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        raise RuntimeError(f"migration ledger row vanished company_id={source_company_id} record_id={source_record_id}")
+    if row.rollback_attempted_at is None:
+        row.rollback_attempted_at = _utcnow()
+        row.rollback_attempt_run_id = run_id
+        row.updated_at = _utcnow()
+    await session.flush()
+
+
 async def rows_for_run(
     session: AsyncSession,
     *,
@@ -374,6 +414,8 @@ def row_as_safe_dict(row: EasyWeekMigrationLedger) -> dict[str, Any]:
         "status": row.status,
         "attempts": row.attempts,
         "reason_code": row.reason_code,
+        "rollback_attempted_at": row.rollback_attempted_at.isoformat() if row.rollback_attempted_at else None,
+        "rollback_attempt_run_id": row.rollback_attempt_run_id,
         "created_at": row.created_at.isoformat() if row.created_at else None,
         "updated_at": row.updated_at.isoformat() if row.updated_at else None,
     }

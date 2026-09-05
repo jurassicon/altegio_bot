@@ -293,6 +293,33 @@ def _require_active(payload: dict[str, Any]) -> bool:
     return True
 
 
+def prove_canceled_target(payload: dict[str, Any], *, expected_marker: str) -> bool:
+    """Is this OUR booking, and does it literally read as cancelled?
+
+    Needed because `project_target` refuses a cancelled booking outright — which
+    is right for "is this untouched?" and useless for "did our cancel land?".
+    The rollback recovery has to ask the second question about a booking the
+    first one has already rejected.
+
+    Deliberately narrow. It proves the marker first, so a booking that is not
+    one this migration wrote can never answer the question at all, and it reads
+    ``is_canceled`` as a literal boolean: a missing field, a string, a number or
+    a ``null`` is a shape nobody proved, and treating it as cancelled would let
+    a live appointment be recorded as rolled back.
+
+    Raises :class:`TargetSnapshotError` when the payload is not ours or not
+    readable; the caller treats that as "cannot say", never as "cancelled".
+    """
+    if not isinstance(payload, dict):
+        raise TargetSnapshotError(SNAPSHOT_FIELD_MISSING, "booking")
+    _require_uuid(payload, "uuid", "uid", field_name="booking_uuid")
+    _require_marker(payload, expected_marker=expected_marker)
+    flag = payload.get("is_canceled")
+    if type(flag) is not bool:
+        raise TargetSnapshotError(SNAPSHOT_FIELD_MISSING, "is_canceled")
+    return flag
+
+
 def project_target(payload: dict[str, Any], *, expected_marker: str) -> TargetSnapshot:
     """Project one live EasyWeek booking into its comparable snapshot.
 

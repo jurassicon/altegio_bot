@@ -625,6 +625,11 @@ _HANDOVER_AT_COLUMN = "reminders_handed_over_at"
 _HANDOVER_DIGEST_COLUMN = "reminder_handover_plan_digest"
 _HANDOVER_CHECK = "ck_easyweek_migration_ledger_reminder_handover_complete"
 _HANDOVER_INDEX = "ix_easyweek_migration_ledger_reminder_handover"
+# PR-11.2 revision 26 (c4b7e2f1a983): the rollback attempt marker.
+_ROLLBACK_AT_COLUMN = "rollback_attempted_at"
+_ROLLBACK_RUN_COLUMN = "rollback_attempt_run_id"
+_ROLLBACK_CHECK = "ck_easyweek_migration_ledger_rollback_attempt_complete"
+_ROLLBACK_PARENT_REVISION = "a7d1f4c82b95"
 
 
 async def _ledger_index(db_url: str, index: str) -> str | None:
@@ -927,3 +932,96 @@ async def test_upgrade_fails_closed_on_unexpected_schema_objects(temp_db_url) ->
     _alembic_ok("downgrade", _PRE_PROVIDER_SCOPE_REVISION, db_url=temp_db_url)
     _alembic_ok("upgrade", "head", db_url=temp_db_url)
     assert await _counts(temp_db_url) == before
+
+
+@pytest.mark.asyncio
+async def test_rollback_attempt_marker_migration_round_trip(temp_db_url) -> None:
+    """Revision c4b7e2f1a983, upgraded, downgraded and upgraded again.
+
+    The marker is what separates "our cancel landed and we never saw the answer"
+    from "somebody cancelled this by hand", and the second run reads it before
+    deciding whether a booking may be recorded as rolled back. A column that
+    survives only until the next downgrade would take that distinction with it,
+    so the round trip is proven rather than assumed.
+
+    Existing rows must come out of the upgrade with NULL — no environment gets
+    told it once attempted a rollback it never attempted.
+    """
+    _alembic_ok("upgrade", "head", db_url=temp_db_url)
+
+    attempted = await _column(temp_db_url, _LEDGER_TABLE, _ROLLBACK_AT_COLUMN)
+    assert attempted is not None, f"{_ROLLBACK_AT_COLUMN} is missing after upgrade head"
+    assert attempted[0] == "timestamp with time zone", f"unexpected type: {attempted}"
+    assert attempted[1] == "YES", "NULL is how 'no cancel was ever attempted' is expressed"
+
+    attempt_run = await _column(temp_db_url, _LEDGER_TABLE, _ROLLBACK_RUN_COLUMN)
+    assert attempt_run is not None, f"{_ROLLBACK_RUN_COLUMN} is missing after upgrade head"
+    assert attempt_run[0] == "character varying", f"unexpected type: {attempt_run}"
+    assert attempt_run[1] == "YES"
+    assert attempt_run[3] == 64, f"a run id column: {attempt_run}"
+
+    assert _ROLLBACK_CHECK in await _constraint_names(temp_db_url, _LEDGER_TABLE)
+
+    # A row inserted BEFORE the marker existed reads as "never attempted".
+    await _exec(
+        temp_db_url,
+        f"INSERT INTO {_LEDGER_TABLE} "
+        "(source_provider, source_company_id, source_record_id, source_fingerprint, "
+        " target_provider, target_booking_uuid, run_id, status) "
+        "VALUES ('altegio', 758285, 900042, repeat('e', 64), 'easyweek', "
+        " '0e9a1111-2222-4333-8444-555566667777', 'rollback-probe', 'created')",
+    )
+    state = await _fetch(
+        temp_db_url,
+        f"SELECT {_ROLLBACK_AT_COLUMN}, {_ROLLBACK_RUN_COLUMN} FROM {_LEDGER_TABLE} WHERE run_id = 'rollback-probe'",
+    )
+    assert state[0] == (None, None), "an existing row must not claim an attempt it never made"
+
+    # The CHECK is real: half a marker is refused, the pair is accepted.
+    for half in (
+        f"UPDATE {_LEDGER_TABLE} SET {_ROLLBACK_AT_COLUMN} = now() WHERE run_id = 'rollback-probe'",
+        f"UPDATE {_LEDGER_TABLE} SET {_ROLLBACK_RUN_COLUMN} = 'r-1' WHERE run_id = 'rollback-probe'",
+    ):
+        with pytest.raises(IntegrityError) as refused:
+            await _exec(temp_db_url, half)
+        assert _ROLLBACK_CHECK in str(refused.value), (
+            f"a different constraint refused this, not the attempt CHECK: {refused.value}"
+        )
+
+    await _exec(
+        temp_db_url,
+        f"UPDATE {_LEDGER_TABLE} SET {_ROLLBACK_AT_COLUMN} = now(), {_ROLLBACK_RUN_COLUMN} = 'r-1' "
+        "WHERE run_id = 'rollback-probe'",
+    )
+    accepted = await _fetch(
+        temp_db_url,
+        f"SELECT {_ROLLBACK_AT_COLUMN} IS NOT NULL, {_ROLLBACK_RUN_COLUMN} "
+        f"FROM {_LEDGER_TABLE} WHERE run_id = 'rollback-probe'",
+    )
+    assert accepted[0] == (True, "r-1")
+
+    # ---------------------------------------------------------------- down
+    _alembic_ok("downgrade", _ROLLBACK_PARENT_REVISION, db_url=temp_db_url)
+    assert _ROLLBACK_PARENT_REVISION in _alembic_ok("current", db_url=temp_db_url)
+    assert await _column(temp_db_url, _LEDGER_TABLE, _ROLLBACK_AT_COLUMN) is None
+    assert await _column(temp_db_url, _LEDGER_TABLE, _ROLLBACK_RUN_COLUMN) is None
+    assert _ROLLBACK_CHECK not in await _constraint_names(temp_db_url, _LEDGER_TABLE)
+    # The ledger row itself survives the downgrade — only the marker goes.
+    survived = await _fetch(temp_db_url, f"SELECT status FROM {_LEDGER_TABLE} WHERE run_id = 'rollback-probe'")
+    assert survived[0][0] == "created"
+
+    # ------------------------------------------------------------------ up
+    _alembic_ok("upgrade", "head", db_url=temp_db_url)
+    assert _HEAD_REVISION in _alembic_ok("current", db_url=temp_db_url)
+    assert await _column(temp_db_url, _LEDGER_TABLE, _ROLLBACK_AT_COLUMN) is not None
+    assert await _column(temp_db_url, _LEDGER_TABLE, _ROLLBACK_RUN_COLUMN) is not None
+    assert _ROLLBACK_CHECK in await _constraint_names(temp_db_url, _LEDGER_TABLE)
+    # And the re-upgrade does not invent an attempt for the row that survived.
+    restored = await _fetch(
+        temp_db_url,
+        f"SELECT {_ROLLBACK_AT_COLUMN}, {_ROLLBACK_RUN_COLUMN} FROM {_LEDGER_TABLE} WHERE run_id = 'rollback-probe'",
+    )
+    assert restored[0] == (None, None)
+
+    await _exec(temp_db_url, f"DELETE FROM {_LEDGER_TABLE} WHERE run_id = 'rollback-probe'")
+    assert _alembic_ok("heads", db_url=temp_db_url).count("(head)") == 1
