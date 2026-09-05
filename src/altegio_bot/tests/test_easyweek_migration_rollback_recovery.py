@@ -17,10 +17,12 @@ paths: an old ledger row has to reconcile and roll back, not merely classify.
 
 from __future__ import annotations
 
+import asyncio
+
 import httpx
 import pytest
 import pytest_asyncio
-from sqlalchemy import select, update
+from sqlalchemy import insert, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from altegio_bot.easyweek_client import (
@@ -28,6 +30,7 @@ from altegio_bot.easyweek_client import (
     EasyWeekNotFoundError,
     EasyWeekPermanentError,
 )
+from altegio_bot.easyweek_migration import ledger as ledger_module
 from altegio_bot.easyweek_migration.classify import classify_record, legacy_source_fingerprint
 from altegio_bot.easyweek_migration.manifest import KARLSRUHE_COMPANY_ID, RASTATT_COMPANY_ID
 from altegio_bot.easyweek_migration.runner import (
@@ -36,6 +39,9 @@ from altegio_bot.easyweek_migration.runner import (
     MODE_RECONCILE,
     MODE_ROLLBACK_DRY_RUN,
     ROLLBACK_ATTEMPT_UNRESOLVED,
+    ROLLBACK_CANCELED_ELSEWHERE,
+    ROLLBACK_CLAIM_LOST,
+    ROLLBACK_NOT_SENT,
     ROLLBACK_RECOVERED,
     ROLLBACK_RECOVERY_AVAILABLE,
     ROLLBACK_TARGET_MODIFIED,
@@ -480,3 +486,487 @@ async def test_a_legacy_row_whose_source_changed_is_still_blocked(session_local,
     assert totals["already_migrated"] == 2
     codes = plan.as_safe_dict()["reason_codes"]
     assert codes["source_service_quantity_unsupported"] == 1
+
+
+# ---------------------------------------------------------------------------
+# One owner of the mutation, proven against PostgreSQL
+# ---------------------------------------------------------------------------
+
+
+async def _seed_created_row(session_local, *, run_id: str, record_id: int, target: str) -> None:
+    async with session_local() as session:
+        async with session.begin():
+            await session.execute(
+                insert(EasyWeekMigrationLedger).values(
+                    source_provider="altegio",
+                    source_company_id=KARLSRUHE_COMPANY_ID,
+                    source_record_id=record_id,
+                    source_fingerprint="f" * 64,
+                    target_provider="easyweek",
+                    target_booking_uuid=target,
+                    target_snapshot_fingerprint="a" * 64,
+                    run_id=run_id,
+                    status="created",
+                    attempts=1,
+                )
+            )
+
+
+async def _wait_until_blocked_on_a_lock(session_local) -> None:
+    """Return once another session is genuinely waiting on a row lock.
+
+    A barrier, not a delay: it observes the database's own wait state rather
+    than guessing how long a statement takes. Without it the two claims can be
+    issued in sequence — the first committing before the second even reaches the
+    server — and the test would pass against a read-then-write implementation
+    that has no atomicity at all.
+    """
+    for _ in range(20000):
+        async with session_local() as probe:
+            waiting = (
+                await probe.execute(
+                    text(
+                        "SELECT count(*) FROM pg_stat_activity "
+                        "WHERE wait_event_type = 'Lock' AND state = 'active' "
+                        "AND query ILIKE '%easyweek_migration_ledger%'"
+                    )
+                )
+            ).scalar_one()
+        if waiting:
+            return
+        await asyncio.sleep(0)
+    raise AssertionError("no session ever blocked on the ledger row; the two claims did not overlap")
+
+
+async def test_two_runs_racing_for_one_row_produce_exactly_one_owner(session_local):
+    """Row-level concurrency, against the real database.
+
+    Two rollback runs reach the same ledger row at the same moment, and their
+    statements genuinely overlap: the winner holds an uncommitted claim while the
+    loser is blocked on the same row. The claim is one conditional UPDATE, so
+    when the loser is released it matches nothing — which is the whole
+    guarantee, and the reason a read-then-write version cannot pass this test:
+    its SELECT would see an uncommitted NULL marker and conclude it may write.
+    """
+    target = "0e9a1111-2222-4333-8444-555566667777"
+    await _seed_created_row(session_local, run_id="origin-run", record_id=900501, target=target)
+
+    first_claimed = asyncio.Event()
+    release_first = asyncio.Event()
+    results: dict[str, ledger_module.RollbackClaim] = {}
+
+    async def contender(name: str) -> None:
+        async with session_local() as session:
+            async with session.begin():
+                results[name] = await ledger_module.claim_rollback_attempt(
+                    session,
+                    run_id=name,
+                    source_company_id=KARLSRUHE_COMPANY_ID,
+                    source_record_id=900501,
+                    origin_run_id="origin-run",
+                    target_booking_uuid=target,
+                )
+                if name == "first":
+                    first_claimed.set()
+                    # Hold the transaction open — and the row locked — until the
+                    # loser is provably waiting on it.
+                    await release_first.wait()
+
+    async def loser() -> None:
+        await first_claimed.wait()
+        await contender("second")
+
+    async def referee() -> None:
+        await first_claimed.wait()
+        await _wait_until_blocked_on_a_lock(session_local)
+        release_first.set()
+
+    await asyncio.gather(contender("first"), loser(), referee())
+
+    assert results["first"].won is True
+    assert results["second"].won is False
+    assert results["second"].reason == ledger_module.CLAIM_HELD_BY_ANOTHER_RUN
+    assert results["second"].owner_run_id == "first"
+
+    async with session_local() as session:
+        row = (
+            await session.execute(
+                select(EasyWeekMigrationLedger).where(EasyWeekMigrationLedger.source_record_id == 900501)
+            )
+        ).scalar_one()
+    assert row.rollback_attempt_run_id == "first"
+
+
+@pytest.mark.parametrize(
+    "mutate, expected",
+    [
+        pytest.param(
+            {"status": "rolled_back"},
+            ledger_module.CLAIM_ROW_CHANGED,
+            id="status-moved",
+        ),
+        pytest.param(
+            {"target_booking_uuid": "0e9a2222-2222-4333-8444-555566667777"},
+            ledger_module.CLAIM_ROW_CHANGED,
+            id="target-replaced",
+        ),
+        pytest.param(
+            {"run_id": "another-origin"},
+            ledger_module.CLAIM_ROW_CHANGED,
+            id="origin-run-changed",
+        ),
+    ],
+)
+async def test_a_row_that_moved_under_the_candidate_cannot_be_claimed(session_local, mutate, expected):
+    """Every fact the decision rested on is re-tested by the claim itself."""
+    target = "0e9a1111-2222-4333-8444-555566667777"
+    await _seed_created_row(session_local, run_id="origin-run", record_id=900502, target=target)
+
+    async with session_local() as session:
+        async with session.begin():
+            await session.execute(
+                update(EasyWeekMigrationLedger)
+                .where(EasyWeekMigrationLedger.source_record_id == 900502)
+                .values(**mutate)
+            )
+
+    async with session_local() as session:
+        async with session.begin():
+            claim = await ledger_module.claim_rollback_attempt(
+                session,
+                run_id="late-run",
+                source_company_id=KARLSRUHE_COMPANY_ID,
+                source_record_id=900502,
+                origin_run_id="origin-run",
+                target_booking_uuid=target,
+            )
+
+    assert claim.won is False
+    assert claim.reason == expected
+    async with session_local() as session:
+        row = (
+            await session.execute(
+                select(EasyWeekMigrationLedger).where(EasyWeekMigrationLedger.source_record_id == 900502)
+            )
+        ).scalar_one()
+    assert row.rollback_attempted_at is None, "a lost claim must not leave a marker"
+
+
+async def test_a_release_only_works_for_the_run_that_owns_the_marker(session_local):
+    target = "0e9a1111-2222-4333-8444-555566667777"
+    await _seed_created_row(session_local, run_id="origin-run", record_id=900503, target=target)
+    async with session_local() as session:
+        async with session.begin():
+            await ledger_module.claim_rollback_attempt(
+                session,
+                run_id="owner",
+                source_company_id=KARLSRUHE_COMPANY_ID,
+                source_record_id=900503,
+                origin_run_id="origin-run",
+                target_booking_uuid=target,
+            )
+
+    async with session_local() as session:
+        async with session.begin():
+            stolen = await ledger_module.release_rollback_attempt(
+                session,
+                run_id="somebody-else",
+                source_company_id=KARLSRUHE_COMPANY_ID,
+                source_record_id=900503,
+            )
+    assert stolen is False, "one run must not clear another run's marker"
+
+    async with session_local() as session:
+        async with session.begin():
+            released = await ledger_module.release_rollback_attempt(
+                session,
+                run_id="owner",
+                source_company_id=KARLSRUHE_COMPANY_ID,
+                source_record_id=900503,
+            )
+    assert released is True
+    async with session_local() as session:
+        row = (
+            await session.execute(
+                select(EasyWeekMigrationLedger).where(EasyWeekMigrationLedger.source_record_id == 900503)
+            )
+        ).scalar_one()
+    assert row.rollback_attempted_at is None
+    assert row.rollback_attempt_run_id is None
+
+
+async def test_a_finalisation_needs_the_attempt_it_claims_to_finish(session_local):
+    target = "0e9a1111-2222-4333-8444-555566667777"
+    await _seed_created_row(session_local, run_id="origin-run", record_id=900504, target=target)
+    async with session_local() as session:
+        async with session.begin():
+            await ledger_module.claim_rollback_attempt(
+                session,
+                run_id="owner",
+                source_company_id=KARLSRUHE_COMPANY_ID,
+                source_record_id=900504,
+                origin_run_id="origin-run",
+                target_booking_uuid=target,
+            )
+
+    async with session_local() as session:
+        async with session.begin():
+            wrong = await ledger_module.record_rolled_back(
+                session,
+                run_id="reporter",
+                source_company_id=KARLSRUHE_COMPANY_ID,
+                source_record_id=900504,
+                expected_attempt_run_id="somebody-else",
+            )
+    assert wrong is False
+
+    async with session_local() as session:
+        async with session.begin():
+            right = await ledger_module.record_rolled_back(
+                session,
+                run_id="reporter",
+                source_company_id=KARLSRUHE_COMPANY_ID,
+                source_record_id=900504,
+                expected_attempt_run_id="owner",
+            )
+    assert right is True
+    async with session_local() as session:
+        row = (
+            await session.execute(
+                select(EasyWeekMigrationLedger).where(EasyWeekMigrationLedger.source_record_id == 900504)
+            )
+        ).scalar_one()
+    assert row.status == "rolled_back"
+    assert row.last_resolution_run_id == "reporter"
+    assert row.run_id == "origin-run", "the origin run is never rewritten"
+
+
+# ---------------------------------------------------------------------------
+# The four states, through the real runner
+# ---------------------------------------------------------------------------
+
+
+def _hook_claim(monkeypatch, *, before=None, after=None):
+    """Run `before` / `after` around the runner's real atomic claim.
+
+    Deterministic by construction: the hook fires at the exact instant the race
+    it models would happen — after every proof, around the one statement that
+    grants the right to mutate. No sleeps, no timing assumptions.
+    """
+    real = ledger_module.claim_rollback_attempt
+
+    async def wrapper(session, **kwargs):
+        if before is not None:
+            await before(kwargs)
+        claim = await real(session, **kwargs)
+        if after is not None and claim.won:
+            await after(kwargs)
+        return claim
+
+    monkeypatch.setattr(ledger_module, "claim_rollback_attempt", wrapper)
+
+
+async def test_a_run_that_loses_the_claim_sends_nothing(session_local, source, monkeypatch):
+    """Two runs, one row: the loser is out of the mutation path entirely."""
+    transport = RecordingTransport()
+    run_id = await applied_run(session_local, transport)
+    target = CREATED_UUIDS[KA_RECORD_B]
+    real = ledger_module.claim_rollback_attempt
+
+    async def competing_run(kwargs):
+        if kwargs["source_record_id"] != KA_RECORD_B:
+            return
+        async with session_local() as other:
+            async with other.begin():
+                claim = await real(other, **{**kwargs, "run_id": "competing-run"})
+        assert claim.won, "the competitor must really own the row"
+
+    _hook_claim(monkeypatch, before=competing_run)
+
+    report = await rollback(session_local, transport, run_id=run_id, confirmed=True)
+
+    assert target not in transport.cancel_puts
+    codes = report.as_safe_dict()["reason_codes"]
+    assert codes[ROLLBACK_CLAIM_LOST] == 1
+    row = await row_for(session_local, KA_RECORD_B)
+    assert row.status == "created"
+    assert row.rollback_attempt_run_id == "competing-run", "the marker still names its owner"
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        pytest.param(httpx.TimeoutException("timeout"), id="preflight-timeout"),
+        pytest.param(httpx.ConnectError("disconnected"), id="preflight-disconnect"),
+        pytest.param(429, id="preflight-rate-limited"),
+        pytest.param(503, id="preflight-503"),
+        pytest.param(401, id="preflight-auth"),
+        pytest.param(404, id="preflight-not-found"),
+    ],
+)
+async def test_a_read_that_fails_before_the_put_leaves_no_unknown_mutation(session_local, source, monkeypatch, failure):
+    """(A) Proven not sent: the marker must not survive it.
+
+    The claim is taken, and then the read the client runs immediately before its
+    PUT fails. No request was made, so a marker claiming one would turn any
+    later manual cancellation into "our attempt finishing late".
+    """
+    transport = RecordingTransport()
+    run_id = await applied_run(session_local, transport)
+    target = CREATED_UUIDS[KA_RECORD_B]
+
+    async def break_the_preflight(kwargs):
+        if kwargs["source_record_id"] == KA_RECORD_B:
+            transport.get_status_override[target] = failure
+
+    _hook_claim(monkeypatch, after=break_the_preflight)
+
+    report = await rollback(session_local, transport, run_id=run_id, confirmed=True)
+
+    assert target not in transport.cancel_puts
+    assert report.as_safe_dict()["reason_codes"][ROLLBACK_NOT_SENT] == 1
+    row = await row_for(session_local, KA_RECORD_B)
+    assert row.status == "created"
+    assert row.rollback_attempted_at is None, "no request was sent, so no marker may remain"
+    assert row.rollback_attempt_run_id is None
+
+
+async def test_a_manual_cancel_after_a_pre_put_failure_is_not_our_recovery(session_local, source, monkeypatch):
+    """The consequence of the rule above, spelled out end to end."""
+    transport = RecordingTransport()
+    run_id = await applied_run(session_local, transport)
+    target = CREATED_UUIDS[KA_RECORD_B]
+
+    armed = [True]
+
+    async def break_the_preflight(kwargs):
+        # Only the FIRST run's read fails; the hook disarms itself rather than
+        # undoing the monkeypatch, which would also unwind the fixtures.
+        if kwargs["source_record_id"] == KA_RECORD_B and armed:
+            armed.clear()
+            transport.get_status_override[target] = 503
+
+    _hook_claim(monkeypatch, after=break_the_preflight)
+    await rollback(session_local, transport, run_id=run_id, confirmed=True)
+
+    # An operator cancels the appointment by hand afterwards.
+    transport.get_status_override.pop(target, None)
+    transport.canceled_uuids.add(target)
+
+    report = await rollback(session_local, transport, run_id=run_id, confirmed=True)
+
+    assert target not in transport.cancel_puts
+    codes = report.as_safe_dict()["reason_codes"]
+    assert codes.get(ROLLBACK_RECOVERED) is None
+    assert codes[ROLLBACK_TARGET_MODIFIED] == 1
+    row = await row_for(session_local, KA_RECORD_B)
+    assert row.status == "created"
+
+
+@pytest.mark.parametrize("status", [401, 403, 404, 422, 429], ids=["401", "403", "404", "422", "429"])
+async def test_a_deterministic_refusal_returns_the_mutation_right(session_local, source, status):
+    """(B) The request was answered and nothing changed: the claim goes back."""
+    transport = RecordingTransport()
+    run_id = await applied_run(session_local, transport)
+    target = CREATED_UUIDS[KA_RECORD_B]
+    transport.cancel_fail_with[target] = status
+
+    report = await rollback(session_local, transport, run_id=run_id, confirmed=True)
+
+    assert transport.cancel_puts.count(target) == 1
+    assert report.as_safe_dict()["reason_codes"]["rollback_refused"] == 1
+    row = await row_for(session_local, KA_RECORD_B)
+    assert row.status == "created"
+    assert row.rollback_attempted_at is None, "a refusal is not an unknown mutation"
+
+
+async def test_a_refused_row_can_be_cancelled_once_the_cause_is_fixed(session_local, source):
+    """And exactly once: the released claim is takeable again, not repeatable."""
+    transport = RecordingTransport()
+    run_id = await applied_run(session_local, transport)
+    target = CREATED_UUIDS[KA_RECORD_B]
+    transport.cancel_fail_with[target] = 403
+
+    await rollback(session_local, transport, run_id=run_id, confirmed=True)
+    assert transport.cancel_puts.count(target) == 1
+
+    # The operator fixes the token and runs the rollback again, explicitly.
+    transport.cancel_fail_with.pop(target)
+    report = await rollback(session_local, transport, run_id=run_id, confirmed=True)
+
+    assert transport.cancel_puts.count(target) == 2, "one deliberate attempt per explicit run"
+    assert report.as_safe_dict()["reason_codes"]["rolled_back"] == 1
+    row = await row_for(session_local, KA_RECORD_B)
+    assert row.status == "rolled_back"
+    assert row.rollback_attempt_run_id is not None
+
+
+async def test_a_manual_cancel_after_a_deterministic_refusal_is_not_our_recovery(session_local, source):
+    transport = RecordingTransport()
+    run_id = await applied_run(session_local, transport)
+    target = CREATED_UUIDS[KA_RECORD_B]
+    transport.cancel_fail_with[target] = 403
+
+    await rollback(session_local, transport, run_id=run_id, confirmed=True)
+    puts = transport.cancel_puts.count(target)
+    # Somebody cancels it in the UI afterwards.
+    transport.canceled_uuids.add(target)
+
+    report = await rollback(session_local, transport, run_id=run_id, confirmed=True)
+
+    assert transport.cancel_puts.count(target) == puts
+    codes = report.as_safe_dict()["reason_codes"]
+    assert codes.get(ROLLBACK_RECOVERED) is None
+    assert codes[ROLLBACK_TARGET_MODIFIED] == 1
+
+
+async def test_a_booking_cancelled_between_the_claim_and_the_put_is_not_our_rollback(
+    session_local, source, monkeypatch
+):
+    """The already-cancelled race, at its narrowest.
+
+    Everything above the claim saw a live booking; somebody cancels it in the
+    instant before this run's own PUT. The client's read catches it, no request
+    is sent, and the row is not credited to this rollback.
+    """
+    transport = RecordingTransport()
+    run_id = await applied_run(session_local, transport)
+    target = CREATED_UUIDS[KA_RECORD_B]
+
+    async def cancel_it_elsewhere(kwargs):
+        if kwargs["source_record_id"] == KA_RECORD_B:
+            transport.canceled_uuids.add(target)
+
+    _hook_claim(monkeypatch, after=cancel_it_elsewhere)
+
+    report = await rollback(session_local, transport, run_id=run_id, confirmed=True)
+
+    assert target not in transport.cancel_puts
+    codes = report.as_safe_dict()["reason_codes"]
+    assert codes[ROLLBACK_CANCELED_ELSEWHERE] == 1
+    assert codes.get("rolled_back") is None or codes["rolled_back"] == 1  # the OTHER row of the wave
+    row = await row_for(session_local, KA_RECORD_B)
+    assert row.status == "created", "somebody else's cancellation is not this run's rollback"
+    assert row.rollback_attempted_at is None
+
+
+async def test_the_marker_survives_only_the_unknown_result(session_local, source):
+    """(C) The one state that keeps the marker, next to the ones that release it."""
+    transport = RecordingTransport()
+    run_id = await applied_run(session_local, transport)
+    target = CREATED_UUIDS[KA_RECORD_B]
+    transport.cancel_fail_with[target] = httpx.TimeoutException("timeout")
+
+    await rollback(session_local, transport, run_id=run_id, confirmed=True)
+
+    row = await row_for(session_local, KA_RECORD_B)
+    assert row.rollback_attempted_at is not None
+    assert row.rollback_attempt_run_id is not None
+    assert row.status == "created"
+
+
+async def test_no_new_reason_code_carries_pii(session_local, source):
+    for code in (ROLLBACK_CLAIM_LOST, ROLLBACK_NOT_SENT, ROLLBACK_CANCELED_ELSEWHERE):
+        assert code == code.lower()
+        for leaked in ("phone", "+49", "@", "Testkundin"):
+            assert leaked not in code

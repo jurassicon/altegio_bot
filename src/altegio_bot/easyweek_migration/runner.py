@@ -142,6 +142,8 @@ from altegio_bot.easyweek_migration.target_snapshot import (
     prove_canceled_target,
 )
 from altegio_bot.easyweek_migration.write_client import (
+    CancelOutcome,
+    EasyWeekCancelNotSent,
     EasyWeekMigrationWriteClient,
     EasyWeekUncertainMutation,
     build_booking_request,
@@ -211,6 +213,16 @@ ROLLBACK_RECOVERY_AVAILABLE: Final = "rollback_recovery_available"
 # decides. Deliberately distinct from `rollback_uncertain`, which describes the
 # attempt that has just happened rather than one found on a later run.
 ROLLBACK_ATTEMPT_UNRESOLVED: Final = "rollback_attempt_unresolved"
+# The mutation right went to another run, or the row moved between the candidate
+# list and the claim. Nothing was sent, and nothing about the row was changed.
+ROLLBACK_CLAIM_LOST: Final = "rollback_claim_not_acquired"
+# Proven that the cancel never left: the read immediately before it failed. The
+# row keeps no marker, because there is no unknown mutation to keep one for.
+ROLLBACK_NOT_SENT: Final = "rollback_cancel_not_sent"
+# The booking was already cancelled when this run looked, moments before its own
+# PUT. Somebody else did it — another process, another operator, the UI — so it
+# is not recorded as this run's rollback.
+ROLLBACK_CANCELED_ELSEWHERE: Final = "rollback_target_canceled_elsewhere"
 # The booking names no master, so rollback proves one the same way every other
 # path does. An unproven master is an unproven target, and an unproven target is
 # never cancelled.
@@ -2304,6 +2316,8 @@ async def run_rollback(
                 row.target_snapshot_fingerprint,
                 row.source_fingerprint,
                 row.rollback_attempted_at is not None,
+                row.rollback_attempt_run_id,
+                row.run_id,
             )
             for row in rows
         ]
@@ -2316,6 +2330,8 @@ async def run_rollback(
         stored_fingerprint,
         source_fingerprint,
         attempted_at,
+        attempt_run_id,
+        origin_run_id,
     ) in candidates:
         entry = dict(safe_row)
 
@@ -2383,14 +2399,24 @@ async def run_rollback(
                 report.reasons[ROLLBACK_RECOVERY_AVAILABLE] += 1
                 report.created_rows.append(entry)
                 continue
+            # Finishing SOMEBODY'S attempt — this run's own, or the earlier
+            # run's whose result was never seen. Conditional on that exact
+            # attempt still standing: if it was released or replaced while this
+            # booking was being read, the evidence moved and the conclusion goes
+            # with it.
+            assert attempt_run_id is not None
             async with session_maker() as session:
                 async with session.begin():
-                    await ledger_module.record_rolled_back(
+                    recorded = await ledger_module.record_rolled_back(
                         session,
                         run_id=inputs.run_id,
                         source_company_id=company_id,
                         source_record_id=record_id,
+                        expected_attempt_run_id=attempt_run_id,
                     )
+            if not recorded:
+                _refuse(ROLLBACK_ATTEMPT_UNRESOLVED)
+                continue
             entry["rollback_outcome"] = ROLLBACK_RECOVERED
             report.reasons[ROLLBACK_RECOVERED] += 1
             report.created_rows.append(entry)
@@ -2477,52 +2503,113 @@ async def run_rollback(
             report.created_rows.append(entry)
             continue
 
-        # The attempt is recorded and COMMITTED before the request goes out, in
-        # its own transaction. Written afterwards it would be missing in the one
-        # case it exists for — the run that never got an answer — and a crash
-        # between this commit and the PUT leaves precisely the truth: a cancel
-        # may have been sent, and the next run must read rather than repeat.
+        # -- take the mutation right, atomically -----------------------------
+        # ONE conditional UPDATE is both the marker and the lock. Two rollback
+        # runs walking the same wave used to read a NULL marker and both go on
+        # to send a cancel; now exactly one of them can win the row, and the
+        # loser is out of the mutation path entirely.
+        #
+        # The claim also re-tests every fact the decision above rested on —
+        # status, origin run, target uuid — so a row that moved while these
+        # proofs were being fetched is not mutated on stale evidence.
         async with session_maker() as session:
             async with session.begin():
-                await ledger_module.record_rollback_attempt(
+                claim = await ledger_module.claim_rollback_attempt(
                     session,
                     run_id=inputs.run_id,
                     source_company_id=company_id,
                     source_record_id=record_id,
+                    origin_run_id=origin_run_id,
+                    target_booking_uuid=target,
                 )
+        if not claim.won:
+            # A loser sends nothing, ever. It reports what it found and leaves
+            # the row to whoever owns it — including the case where that owner
+            # is a run whose own outcome is still unknown.
+            entry["rollback_outcome"] = ROLLBACK_CLAIM_LOST
+            entry["reason"] = claim.reason
+            report.reasons[ROLLBACK_CLAIM_LOST] += 1
+            report.created_rows.append(entry)
+            continue
+
+        async def _release(entry: dict[str, Any], reason: str) -> None:
+            """Hand the mutation right back, then report `reason`.
+
+            Used only where it is PROVEN that no cancel is in flight. If the
+            release itself does not take — somebody else owns the marker, or it
+            is already gone — the row is reported unresolved instead: claiming a
+            retry is safe when the durable state says otherwise is exactly the
+            direction this design never goes.
+            """
+            async with session_maker() as session:
+                async with session.begin():
+                    released = await ledger_module.release_rollback_attempt(
+                        session,
+                        run_id=inputs.run_id,
+                        source_company_id=company_id,
+                        source_record_id=record_id,
+                    )
+            outcome = reason if released else ROLLBACK_ATTEMPT_UNRESOLVED
+            entry["rollback_outcome"] = outcome
+            report.reasons[outcome] += 1
+            report.created_rows.append(entry)
 
         report.mutations_attempted += 1
         try:
-            await write_client.cancel_booking(target)
+            outcome = await write_client.cancel_booking(target)
+        except EasyWeekCancelNotSent:
+            # (A) Proven NOT sent: the read immediately before the PUT failed.
+            # There is no unknown mutation, so there must be no marker claiming
+            # one — otherwise a cancellation somebody makes by hand tomorrow
+            # would be read as this attempt finishing late.
+            await _release(entry, ROLLBACK_NOT_SENT)
+            continue
         except EasyWeekUncertainMutation:
-            # The cancel may or may not have landed, or it landed and the
+            # (C) The cancel may or may not have landed, or it landed and the
             # booking would not read back as cancelled. Either way the ledger
             # keeps saying `created`: `rolled_back` is a claim about a real
             # appointment, and recording it on an unproven cancel would hide a
             # live booking from every later reconciliation.
+            #
+            # The marker STAYS. This is the one state it exists for.
             entry["rollback_outcome"] = ROLLBACK_UNCERTAIN
             report.reasons[ROLLBACK_UNCERTAIN] += 1
             report.created_rows.append(entry)
             continue
         except EasyWeekError as exc:
-            # A deterministic refusal: nothing was cancelled, and nothing about
-            # the ledger changes. The code is named so an operator can tell a
-            # 404 from an auth failure without reading a provider message.
-            entry["rollback_outcome"] = ROLLBACK_REFUSED
+            # (B) A deterministic refusal: the request was answered, and the
+            # answer says nothing changed. That is not an unknown mutation
+            # either, so the marker goes back — otherwise the cause could be
+            # fixed and the next explicit rollback would find itself locked out
+            # by a claim about a cancel that provably never happened.
             entry["reason"] = _safe_error_code(exc)
-            report.reasons[ROLLBACK_REFUSED] += 1
-            report.created_rows.append(entry)
+            await _release(entry, ROLLBACK_REFUSED)
             continue
 
-        # Proven cancelled — `cancel_booking` read it back before returning.
+        if outcome is CancelOutcome.ALREADY_CANCELED_NO_MUTATION:
+            # Somebody cancelled it between the proofs above and this run's own
+            # PUT. No mutation was sent, so the marker goes back — and the row
+            # is NOT recorded as this rollback's work, because it is not.
+            await _release(entry, ROLLBACK_CANCELED_ELSEWHERE)
+            continue
+
+        # (D) Proven cancelled — `cancel_booking` read it back before returning.
+        # Finalised conditionally on this run still owning the attempt, so a
+        # marker that changed underneath cannot be finished by the wrong run.
         async with session_maker() as session:
             async with session.begin():
-                await ledger_module.record_rolled_back(
+                recorded = await ledger_module.record_rolled_back(
                     session,
                     run_id=inputs.run_id,
                     source_company_id=company_id,
                     source_record_id=record_id,
+                    expected_attempt_run_id=inputs.run_id,
                 )
+        if not recorded:
+            entry["rollback_outcome"] = ROLLBACK_ATTEMPT_UNRESOLVED
+            report.reasons[ROLLBACK_ATTEMPT_UNRESOLVED] += 1
+            report.created_rows.append(entry)
+            continue
         entry["rollback_outcome"] = ledger_module.STATUS_ROLLED_BACK
         report.reasons[ledger_module.STATUS_ROLLED_BACK] += 1
         report.created_rows.append(entry)

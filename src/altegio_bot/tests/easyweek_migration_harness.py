@@ -332,7 +332,7 @@ class RecordingTransport:
         self.readback_override = readback_override or {}
         # booking uuid -> HTTP status a GET should answer with instead. Models a
         # target that exists but cannot be read right now.
-        self.get_status_override: dict[str, int] = {}
+        self.get_status_override: dict[str, int | Exception] = {}
         # Status a catalogue or list GET should answer with instead.
         self.catalog_status_override: int | None = None
         self.list_status_override: int | None = None
@@ -445,6 +445,11 @@ class RecordingTransport:
     def _one_booking(self, path: str) -> httpx.Response:
         uuid = path.rsplit("/", 1)[-1]
         status = self.get_status_override.get(uuid)
+        # An exception models a timeout or a dropped connection; an int models a
+        # status. Both are needed: the read that runs immediately before the
+        # cancel can fail either way, and the two must be provable separately.
+        if isinstance(status, Exception):
+            raise status
         if status is not None:
             return httpx.Response(status, json={"error": "unavailable"})
         booking = self.bookings.get(uuid)

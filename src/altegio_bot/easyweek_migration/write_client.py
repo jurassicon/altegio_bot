@@ -43,6 +43,7 @@ import asyncio
 import logging
 import time
 from collections.abc import Sequence
+from enum import Enum
 from types import TracebackType
 from typing import Any, Awaitable, Callable, Final
 
@@ -96,6 +97,43 @@ class EasyWeekUncertainMutation(EasyWeekError):
     Deliberately not a subclass of the retryable error: the whole point is that
     no generic "retryable?" check can sweep it up. A caller has to name it.
     """
+
+
+class EasyWeekCancelNotSent(EasyWeekError):
+    """The cancel was NOT sent: something before the mutation stopped it.
+
+    The opposite of :class:`EasyWeekUncertainMutation`, and the distinction is
+    the whole reason this class exists. "Unknown" obliges the caller to keep a
+    durable marker and never repeat the request; "not sent" obliges it to give
+    the mutation right back, because nothing happened and a later cancellation
+    by somebody else must not be read as this tool's own work finishing late.
+
+    Raised only where it can be PROVEN that no PUT left: the read that runs
+    immediately before it failed. The original failure travels as `__cause__`
+    and never reaches a report — a provider message is not a reason code.
+    """
+
+
+class CancelOutcome(str, Enum):
+    """What a cancel call actually did. Never inferred from a bare `None`.
+
+    Both members mean the booking is cancelled, and they mean completely
+    different things about WHO cancelled it, so the runner has to be told rather
+    than left to guess:
+
+    ``CANCELED_AND_PROVEN``
+        this call sent the PUT and then proved `is_canceled` by a separate read.
+        This — and only this — is a rollback the current run performed.
+
+    ``ALREADY_CANCELED_NO_MUTATION``
+        the read before the mutation found the booking already cancelled, so
+        nothing was sent. Somebody else cancelled it: another operator, another
+        process, or a person in the EasyWeek UI. Recording it as this run's
+        rollback would credit the tool with a change it did not make.
+    """
+
+    CANCELED_AND_PROVEN = "canceled_and_proven"
+    ALREADY_CANCELED_NO_MUTATION = "already_canceled_no_mutation"
 
     retryable = False
 
@@ -1026,7 +1064,7 @@ class EasyWeekMigrationWriteClient:
             )
         raise EasyWeekPermanentError("permanent client error", operation="create_customer", status_code=status)
 
-    async def cancel_booking(self, booking_uuid: str) -> None:
+    async def cancel_booking(self, booking_uuid: str) -> CancelOutcome:
         """Cancel one booking, and PROVE it. Reached ONLY by a confirmed rollback.
 
         The endpoint is ``PUT /bookings/{uuid}/status/cancel``, which a live
@@ -1037,13 +1075,19 @@ class EasyWeekMigrationWriteClient:
         not-found for every booking and left the operator with a run that
         reported failures for appointments that were still live.
 
-        Three properties, in order:
+        Four properties, in order:
 
         **Already cancelled is not cancelled again.** A ``GET`` runs first. If
-        the booking is already ``is_canceled``, this returns without issuing a
-        mutation at all — a rollback re-run must be idempotent, and a second
-        cancel on a cancelled booking is a request whose outcome nobody has
-        proven.
+        the booking is already ``is_canceled``, this returns
+        ``ALREADY_CANCELED_NO_MUTATION`` without issuing a mutation at all — a
+        rollback re-run must be idempotent, and a second cancel on a cancelled
+        booking is a request whose outcome nobody has proven.
+
+        **The caller is told which of those happened.** The return value
+        distinguishes "this call cancelled it" from "it was already cancelled",
+        because they are different facts about who changed a real appointment,
+        and a bare `None` for both let the runner record somebody else's
+        cancellation as its own rollback.
 
         **An unknown outcome is never repeated.** A timeout, a transport failure
         and every 5xx leave it genuinely unknown whether the cancel landed, and
@@ -1062,11 +1106,20 @@ class EasyWeekMigrationWriteClient:
         # 1. Is it already cancelled? Proven by a read, before any mutation.
         #
         # A failure HERE is not uncertain and must not pretend to be: nothing
-        # was sent, so the caller's own error taxonomy applies unchanged and the
-        # ledger keeps saying exactly what it said before.
-        if await self._booking_is_canceled(canonical):
+        # was sent. It is raised as `EasyWeekCancelNotSent` precisely so the
+        # caller can say that with certainty and hand the mutation right back —
+        # a caller that only saw "some error" would have to assume the worst and
+        # keep a marker claiming a request that never happened.
+        try:
+            already = await self._booking_is_canceled(canonical)
+        except EasyWeekError as exc:
+            raise EasyWeekCancelNotSent(
+                "cancel preflight read failed; no mutation was sent",
+                operation="cancel_booking",
+            ) from exc
+        if already:
             logger.info("easyweek_migration: cancel_booking already canceled — no mutation issued")
-            return
+            return CancelOutcome.ALREADY_CANCELED_NO_MUTATION
 
         url = "/".join([self._base_url, _PATH_BOOKINGS, canonical, _PATH_STATUS, _PATH_CANCEL])
 
@@ -1129,6 +1182,8 @@ class EasyWeekMigrationWriteClient:
                 operation="cancel_booking",
                 status_code=status,
             )
+
+        return CancelOutcome.CANCELED_AND_PROVEN
 
     async def _booking_is_canceled(self, canonical_uuid: str) -> bool:
         """Read one booking and answer whether it is cancelled, or raise.

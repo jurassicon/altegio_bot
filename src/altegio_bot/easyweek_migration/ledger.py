@@ -42,6 +42,7 @@ operator fixes the manifest. It lives in the report, not in the ledger.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Final
 
@@ -300,47 +301,119 @@ async def record_rolled_back(
     run_id: str,
     source_company_id: int,
     source_record_id: int,
-) -> None:
-    """The target booking was cancelled by a confirmed rollback.
+    expected_attempt_run_id: str,
+) -> bool:
+    """The target booking was cancelled, by the attempt this call names.
 
     The target UUID is deliberately KEPT. An operator asking "what did the
     rollback touch?" six months later needs the identifier, and clearing it would
     make the answer unrecoverable.
+
+    Conditional on the attempt it is finishing. `expected_attempt_run_id` is the
+    run whose marker licensed this cancellation — the current run when it sent
+    the PUT itself, or the earlier run whose unknown result this one just proved
+    by reading the booking. If that marker is gone or now belongs to somebody
+    else, the row is NOT finalised: the evidence this conclusion rested on moved
+    while the conclusion was being drawn.
+
+    Returns whether the row was recorded, so a caller that lost the race reports
+    an unresolved row instead of a rollback it cannot stand behind.
     """
-    await _finalize(
-        session,
-        run_id=run_id,
-        source_company_id=source_company_id,
-        source_record_id=source_record_id,
-        status=STATUS_ROLLED_BACK,
-        target_booking_uuid=None,
-        reason_code=None,
-        count_attempt=False,
-    )
+    recorded = (
+        await session.execute(
+            update(EasyWeekMigrationLedger)
+            .where(
+                EasyWeekMigrationLedger.source_provider == PROVIDER_ALTEGIO,
+                EasyWeekMigrationLedger.source_company_id == source_company_id,
+                EasyWeekMigrationLedger.source_record_id == source_record_id,
+                EasyWeekMigrationLedger.status == STATUS_CREATED,
+                EasyWeekMigrationLedger.rollback_attempt_run_id == expected_attempt_run_id,
+            )
+            .values(
+                status=STATUS_ROLLED_BACK,
+                last_resolution_run_id=run_id,
+                reason_code=None,
+                updated_at=_utcnow(),
+            )
+            .returning(EasyWeekMigrationLedger.id)
+        )
+    ).scalar_one_or_none()
+    return recorded is not None
 
 
-async def record_rollback_attempt(
+@dataclass(frozen=True)
+class RollbackClaim:
+    """Whether THIS run holds the right to send one cancel for one row."""
+
+    won: bool
+    # Why not, when it lost. A stable code, never a provider message.
+    reason: str | None = None
+    # The run that holds the attempt, when somebody else does. Reported so an
+    # operator can find the run that has to be resolved first.
+    owner_run_id: str | None = None
+    status: str | None = None
+
+
+# Stable, PII-free reasons a claim can fail.
+CLAIM_ROW_MISSING: Final = "rollback_claim_row_missing"
+CLAIM_HELD_BY_ANOTHER_RUN: Final = "rollback_claim_held_by_another_run"
+CLAIM_ROW_CHANGED: Final = "rollback_claim_row_changed"
+
+
+async def claim_rollback_attempt(
     session: AsyncSession,
     *,
     run_id: str,
     source_company_id: int,
     source_record_id: int,
-) -> None:
-    """Write down that a cancel for this row is ABOUT to be sent.
+    origin_run_id: str,
+    target_booking_uuid: str,
+) -> RollbackClaim:
+    """Take the exclusive right to send ONE cancel for this row, atomically.
 
-    Called immediately before the PUT and committed on its own, so the marker
-    exists whatever happens next — including a crash between this and the
-    request. That ordering is the whole point: a marker written afterwards would
-    be missing in exactly the case it is needed for, the one where the response
-    never came back.
+    The mutation right is the row itself: a single conditional UPDATE both tests
+    every precondition and takes ownership, so two runs walking the same wave
+    cannot both conclude they may send a PUT. The previous version read the row
+    and then wrote it, and two readers of a NULL marker both proceeded — two
+    cancels for one appointment, with no idempotency key to make the second one
+    safe.
 
-    It does NOT touch `status`. The row stays `created` until a cancel is
-    proven; the marker says a cancel may have been attempted, which is a
-    different claim and is kept in different columns.
+    The WHERE clause carries every fact the decision rested on, not just the
+    marker: the source identity, the ORIGIN run whose rollback this is, the
+    status that made the row a candidate, and the exact target uuid that was
+    proven. A row that moved between the candidate list and this statement
+    therefore loses the claim instead of being mutated on stale evidence.
 
-    Idempotent: a repeat leaves the first attempt's instant and run in place, so
-    the earliest evidence survives a re-run.
+    Returns rather than raises: losing is an ordinary outcome with a report line
+    of its own, and the caller must be able to tell "somebody else owns this"
+    from "it vanished". Whatever the reason, a loser sends nothing.
     """
+    claimed = (
+        await session.execute(
+            update(EasyWeekMigrationLedger)
+            .where(
+                EasyWeekMigrationLedger.source_provider == PROVIDER_ALTEGIO,
+                EasyWeekMigrationLedger.source_company_id == source_company_id,
+                EasyWeekMigrationLedger.source_record_id == source_record_id,
+                EasyWeekMigrationLedger.run_id == origin_run_id,
+                EasyWeekMigrationLedger.status == STATUS_CREATED,
+                EasyWeekMigrationLedger.target_booking_uuid == target_booking_uuid,
+                EasyWeekMigrationLedger.rollback_attempted_at.is_(None),
+            )
+            .values(
+                rollback_attempted_at=_utcnow(),
+                rollback_attempt_run_id=run_id,
+                updated_at=_utcnow(),
+            )
+            .returning(EasyWeekMigrationLedger.id)
+        )
+    ).scalar_one_or_none()
+    if claimed is not None:
+        return RollbackClaim(won=True)
+
+    # Lost. Say WHY from the row as it stands now — the caller re-reads the
+    # target before deciding what to do, and an operator needs to know whether
+    # to look for another run or for a changed booking.
     row = (
         await session.execute(
             select(EasyWeekMigrationLedger).where(
@@ -351,12 +424,55 @@ async def record_rollback_attempt(
         )
     ).scalar_one_or_none()
     if row is None:
-        raise RuntimeError(f"migration ledger row vanished company_id={source_company_id} record_id={source_record_id}")
-    if row.rollback_attempted_at is None:
-        row.rollback_attempted_at = _utcnow()
-        row.rollback_attempt_run_id = run_id
-        row.updated_at = _utcnow()
-    await session.flush()
+        return RollbackClaim(won=False, reason=CLAIM_ROW_MISSING)
+    if row.rollback_attempted_at is not None:
+        return RollbackClaim(
+            won=False,
+            reason=CLAIM_HELD_BY_ANOTHER_RUN,
+            owner_run_id=row.rollback_attempt_run_id,
+            status=row.status,
+        )
+    return RollbackClaim(won=False, reason=CLAIM_ROW_CHANGED, status=row.status)
+
+
+async def release_rollback_attempt(
+    session: AsyncSession,
+    *,
+    run_id: str,
+    source_company_id: int,
+    source_record_id: int,
+) -> bool:
+    """Give the mutation right back, and ONLY if this run still holds it.
+
+    Called when it is proven that no unknown mutation exists: the read before
+    the PUT failed, the booking turned out to be already cancelled, or the PUT
+    itself came back with a deterministic refusal. Leaving the marker there
+    would state that a cancel may be in flight, and a later cancellation by a
+    person would then be credited to this tool.
+
+    Conditional on ownership, so one run can never clear another run's marker —
+    that marker is the only thing standing between an unresolved cancel and a
+    second PUT.
+
+    Returns whether the marker was actually released. `False` means somebody
+    else owns it or it was already gone, and the caller must fail closed rather
+    than assume a retry is safe.
+    """
+    released = (
+        await session.execute(
+            update(EasyWeekMigrationLedger)
+            .where(
+                EasyWeekMigrationLedger.source_provider == PROVIDER_ALTEGIO,
+                EasyWeekMigrationLedger.source_company_id == source_company_id,
+                EasyWeekMigrationLedger.source_record_id == source_record_id,
+                EasyWeekMigrationLedger.rollback_attempt_run_id == run_id,
+                EasyWeekMigrationLedger.rollback_attempted_at.is_not(None),
+            )
+            .values(rollback_attempted_at=None, rollback_attempt_run_id=None, updated_at=_utcnow())
+            .returning(EasyWeekMigrationLedger.id)
+        )
+    ).scalar_one_or_none()
+    return released is not None
 
 
 async def rows_for_run(
