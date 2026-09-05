@@ -2528,6 +2528,21 @@ async def run_rollback(
             # is a run whose own outcome is still unknown.
             entry["rollback_outcome"] = ROLLBACK_CLAIM_LOST
             entry["reason"] = claim.reason
+            if claim.owner_run_id is not None:
+                # Which run to go and read. Without it `rollback_claim_lost` says
+                # only that somebody else got there first, and an operator has no
+                # way to find the report that says what happened to this booking.
+                #
+                # It comes from the claim — the row as it stood at that instant —
+                # never from the candidate snapshot, which was read before the
+                # race and says nobody owned the row. And it is only set when an
+                # owner was actually observed: a row that vanished or moved has
+                # no owner to name, and inventing one would send an operator
+                # looking for a run that never existed.
+                #
+                # A run id is a technical identifier: no customer, no booking
+                # content, no provider text.
+                entry["rollback_claim_owner_run_id"] = claim.owner_run_id
             report.reasons[ROLLBACK_CLAIM_LOST] += 1
             report.created_rows.append(entry)
             continue

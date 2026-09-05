@@ -22,7 +22,7 @@ import asyncio
 import httpx
 import pytest
 import pytest_asyncio
-from sqlalchemy import insert, select, text, update
+from sqlalchemy import delete, insert, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from altegio_bot.easyweek_client import (
@@ -51,7 +51,11 @@ from altegio_bot.easyweek_migration.runner import (
     run_reconcile,
     run_rollback,
 )
-from altegio_bot.easyweek_migration.write_client import EasyWeekUncertainMutation
+from altegio_bot.easyweek_migration.write_client import (
+    CancelOutcome,
+    EasyWeekCancelNotSent,
+    EasyWeekUncertainMutation,
+)
 from altegio_bot.models.models import EasyWeekMigrationLedger
 from altegio_bot.tests.easyweek_migration_harness import (
     CREATED_UUIDS,
@@ -767,11 +771,32 @@ def _hook_claim(monkeypatch, *, before=None, after=None):
 
 
 async def test_a_run_that_loses_the_claim_sends_nothing(session_local, source, monkeypatch):
-    """Two runs, one row: the loser is out of the mutation path entirely."""
+    """Two runs, one row: the loser is out of the mutation path entirely.
+
+    And it says WHOSE row it now is. `rollback_claim_lost` on its own tells an
+    operator only that somebody got there first; the owning run id is what turns
+    that into an investigation — the report of that run says whether the booking
+    was cancelled, refused or left unresolved.
+    """
     transport = RecordingTransport()
     run_id = await applied_run(session_local, transport)
     target = CREATED_UUIDS[KA_RECORD_B]
     real = ledger_module.claim_rollback_attempt
+    released: list[int] = []
+    finalised: list[int] = []
+    real_release = ledger_module.release_rollback_attempt
+    real_finalize = ledger_module.record_rolled_back
+
+    async def spy_release(session, **kwargs):
+        released.append(kwargs["source_record_id"])
+        return await real_release(session, **kwargs)
+
+    async def spy_finalize(session, **kwargs):
+        finalised.append(kwargs["source_record_id"])
+        return await real_finalize(session, **kwargs)
+
+    monkeypatch.setattr(ledger_module, "release_rollback_attempt", spy_release)
+    monkeypatch.setattr(ledger_module, "record_rolled_back", spy_finalize)
 
     async def competing_run(kwargs):
         if kwargs["source_record_id"] != KA_RECORD_B:
@@ -788,9 +813,75 @@ async def test_a_run_that_loses_the_claim_sends_nothing(session_local, source, m
     assert target not in transport.cancel_puts
     codes = report.as_safe_dict()["reason_codes"]
     assert codes[ROLLBACK_CLAIM_LOST] == 1
+
+    lost = [row for row in report.created_rows if row.get("rollback_outcome") == ROLLBACK_CLAIM_LOST]
+    assert len(lost) == 1
+    entry = lost[0]
+    assert entry["rollback_claim_owner_run_id"] == "competing-run"
+    # Not this run, and not the stale snapshot value either: the candidate was
+    # read before the race, when nobody owned the row.
+    assert entry["rollback_claim_owner_run_id"] != report.run_id
+    assert entry["rollback_attempt_run_id"] is None
+    assert entry["reason"] == ledger_module.CLAIM_HELD_BY_ANOTHER_RUN
+
+    # The loser acts for nobody on the row it lost: no release, no
+    # finalisation, no request. (The other row of the same wave, which this run
+    # did win, is cancelled normally — that is what makes the contrast real.)
+    assert KA_RECORD_B not in released
+    assert KA_RECORD_B not in finalised
+    assert RA_RECORD_A in finalised
     row = await row_for(session_local, KA_RECORD_B)
     assert row.status == "created"
     assert row.rollback_attempt_run_id == "competing-run", "the marker still names its owner"
+
+    # A run id is technical. Nothing about the customer travels with it.
+    blob = report.to_json()
+    for leaked in ("+4915112345678", "Testkundin"):
+        assert leaked not in blob
+
+
+@pytest.mark.parametrize(
+    "mutate, expected",
+    [
+        pytest.param({"status": "rolled_back"}, ledger_module.CLAIM_ROW_CHANGED, id="row-changed"),
+        pytest.param(None, ledger_module.CLAIM_ROW_MISSING, id="row-missing"),
+    ],
+)
+async def test_a_lost_claim_with_no_proven_owner_names_nobody(session_local, source, monkeypatch, mutate, expected):
+    """No owner observed, no owner reported — not even an empty placeholder.
+
+    A row that vanished or moved was never claimed by anyone, and printing a
+    made-up id would send an operator looking for a run that does not exist.
+    """
+    transport = RecordingTransport()
+    run_id = await applied_run(session_local, transport)
+    target = CREATED_UUIDS[KA_RECORD_B]
+
+    async def move_the_row(kwargs):
+        if kwargs["source_record_id"] != KA_RECORD_B:
+            return
+        async with session_local() as other:
+            async with other.begin():
+                if mutate is None:
+                    await other.execute(
+                        delete(EasyWeekMigrationLedger).where(EasyWeekMigrationLedger.source_record_id == KA_RECORD_B)
+                    )
+                else:
+                    await other.execute(
+                        update(EasyWeekMigrationLedger)
+                        .where(EasyWeekMigrationLedger.source_record_id == KA_RECORD_B)
+                        .values(**mutate)
+                    )
+
+    _hook_claim(monkeypatch, before=move_the_row)
+
+    report = await rollback(session_local, transport, run_id=run_id, confirmed=True)
+
+    assert target not in transport.cancel_puts
+    lost = [row for row in report.created_rows if row.get("rollback_outcome") == ROLLBACK_CLAIM_LOST]
+    assert len(lost) == 1
+    assert lost[0]["reason"] == expected
+    assert "rollback_claim_owner_run_id" not in lost[0]
 
 
 @pytest.mark.parametrize(
@@ -970,3 +1061,42 @@ async def test_no_new_reason_code_carries_pii(session_local, source):
         assert code == code.lower()
         for leaked in ("phone", "+49", "@", "Testkundin"):
             assert leaked not in code
+
+
+# ---------------------------------------------------------------------------
+# The cancel result type
+# ---------------------------------------------------------------------------
+
+
+def test_the_cancel_outcome_enum_has_exactly_two_members():
+    """A plain assignment in an Enum body is another member, not a flag.
+
+    `retryable = False` sat in this enum and became `CancelOutcome.retryable`
+    with the value `"False"` — a third possible outcome of a cancel that the
+    cancel flow can never return and no caller ever handles. It belonged to the
+    exception class above it, where the base class already provides it.
+    """
+    assert list(CancelOutcome) == [
+        CancelOutcome.CANCELED_AND_PROVEN,
+        CancelOutcome.ALREADY_CANCELED_NO_MUTATION,
+    ]
+    assert len(CancelOutcome) == 2
+    assert CancelOutcome.CANCELED_AND_PROVEN.value == "canceled_and_proven"
+    assert CancelOutcome.ALREADY_CANCELED_NO_MUTATION.value == "already_canceled_no_mutation"
+
+
+def test_retryable_is_not_a_cancel_outcome():
+    assert "retryable" not in CancelOutcome.__members__
+    assert not hasattr(CancelOutcome, "retryable")
+    assert [member.value for member in CancelOutcome] == [
+        "canceled_and_proven",
+        "already_canceled_no_mutation",
+    ]
+
+
+def test_the_unrepeatable_errors_are_still_not_retryable():
+    """Where `retryable` actually belongs, inherited from the base error."""
+    assert EasyWeekUncertainMutation.retryable is False
+    assert EasyWeekCancelNotSent.retryable is False
+    assert EasyWeekUncertainMutation("x", operation="cancel_booking").retryable is False
+    assert EasyWeekCancelNotSent("x", operation="cancel_booking").retryable is False

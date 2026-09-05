@@ -132,10 +132,13 @@ class CancelOutcome(str, Enum):
         rollback would credit the tool with a change it did not make.
     """
 
+    # Exactly two, and nothing else may be written in this body: a plain
+    # assignment inside an Enum becomes another MEMBER. `retryable = False`
+    # stood here and made `CancelOutcome.retryable == "False"` a third outcome
+    # the cancel flow could never produce — it belonged to the exception above,
+    # where it is already the inherited default.
     CANCELED_AND_PROVEN = "canceled_and_proven"
     ALREADY_CANCELED_NO_MUTATION = "already_canceled_no_mutation"
-
-    retryable = False
 
 
 class RateLimiter:
