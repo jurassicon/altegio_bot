@@ -139,12 +139,48 @@ async def test_a_proven_cancel_sends_exactly_one_put(session_local, source):
     transport = RecordingTransport()
     run_id = await applied_run(session_local, transport)
 
-    await rollback(session_local, transport, run_id=run_id, confirmed=True)
+    report = await rollback(session_local, transport, run_id=run_id, confirmed=True)
 
     assert sorted(transport.cancel_puts) == sorted([CREATED_UUIDS[KA_RECORD_B], CREATED_UUIDS[RA_RECORD_A]])
     assert len(transport.cancel_puts) == 2
+    assert report.mutations_attempted == len(transport.cancel_puts) == 2
     rolled = [row for row in await ledger_rows(session_local) if row.status == "rolled_back"]
     assert len(rolled) == 2
+
+
+async def test_a_dry_run_attempts_no_mutation_at_all(session_local, source):
+    transport = RecordingTransport()
+    run_id = await applied_run(session_local, transport)
+
+    report = await rollback(session_local, transport, run_id=run_id, confirmed=False)
+
+    assert transport.cancel_puts == []
+    assert report.mutations_attempted == 0
+
+
+async def test_the_counter_equals_the_cancels_that_actually_left(session_local, source, monkeypatch):
+    """The invariant, over a wave that exercises three different endings at once.
+
+    One row is refused by its own preflight read, one is cancelled and proven,
+    and the wave-level number must equal what the transport really saw. Counting
+    on entry to the mutation path instead — the defect — makes this two ahead of
+    reality precisely when a run changed less than it looks like it did.
+    """
+    transport = RecordingTransport()
+    run_id = await applied_run(session_local, transport)
+    stopped = CREATED_UUIDS[KA_RECORD_B]
+
+    async def break_the_preflight(kwargs):
+        if kwargs["source_record_id"] == KA_RECORD_B:
+            transport.get_status_override[stopped] = 503
+
+    _hook_claim(monkeypatch, after=break_the_preflight)
+
+    report = await rollback(session_local, transport, run_id=run_id, confirmed=True)
+
+    assert stopped not in transport.cancel_puts
+    assert CREATED_UUIDS[RA_RECORD_A] in transport.cancel_puts
+    assert report.mutations_attempted == len(transport.cancel_puts) == 1
 
 
 @pytest.mark.parametrize(
@@ -166,6 +202,8 @@ async def test_a_failing_put_is_uncertain_and_is_never_repeated(session_local, s
 
     assert transport.cancel_puts.count(target) == 1
     assert report.as_safe_dict()["reason_codes"][ROLLBACK_UNCERTAIN] == 1
+    # The request left, so it is an attempt whatever the answer was.
+    assert report.mutations_attempted == len(transport.cancel_puts)
     row = await row_for(session_local, KA_RECORD_B)
     assert row.status == "created", "an unproven cancel must not claim a rollback"
     assert row.rollback_attempted_at is not None, "the attempt is durable even when the answer is not"
@@ -818,6 +856,9 @@ async def test_a_run_that_loses_the_claim_sends_nothing(session_local, source, m
     assert len(lost) == 1
     entry = lost[0]
     assert entry["rollback_claim_owner_run_id"] == "competing-run"
+    # Holding no claim means sending nothing, and sending nothing means
+    # counting nothing — the wave's other row is the only cancel here.
+    assert report.mutations_attempted == len(transport.cancel_puts) == 1
     # Not this run, and not the stale snapshot value either: the candidate was
     # read before the race, when nobody owned the row.
     assert entry["rollback_claim_owner_run_id"] != report.run_id
@@ -916,6 +957,9 @@ async def test_a_read_that_fails_before_the_put_leaves_no_unknown_mutation(sessi
 
     assert target not in transport.cancel_puts
     assert report.as_safe_dict()["reason_codes"][ROLLBACK_NOT_SENT] == 1
+    # This row charged the wave nothing: the wave's other row was cancelled
+    # normally, and the counter equals the cancels that actually left.
+    assert report.mutations_attempted == len(transport.cancel_puts) == 1
     row = await row_for(session_local, KA_RECORD_B)
     assert row.status == "created"
     assert row.rollback_attempted_at is None, "no request was sent, so no marker may remain"
@@ -966,6 +1010,8 @@ async def test_a_deterministic_refusal_returns_the_mutation_right(session_local,
 
     assert transport.cancel_puts.count(target) == 1
     assert report.as_safe_dict()["reason_codes"]["rollback_refused"] == 1
+    # Answered by the provider, so the request was made and counts.
+    assert report.mutations_attempted == len(transport.cancel_puts)
     row = await row_for(session_local, KA_RECORD_B)
     assert row.status == "created"
     assert row.rollback_attempted_at is None, "a refusal is not an unknown mutation"
@@ -1036,6 +1082,8 @@ async def test_a_booking_cancelled_between_the_claim_and_the_put_is_not_our_roll
     codes = report.as_safe_dict()["reason_codes"]
     assert codes[ROLLBACK_CANCELED_ELSEWHERE] == 1
     assert codes.get("rolled_back") is None or codes["rolled_back"] == 1  # the OTHER row of the wave
+    # Nothing was sent for this row: the counter matches the wave's real cancels.
+    assert report.mutations_attempted == len(transport.cancel_puts) == 1
     row = await row_for(session_local, KA_RECORD_B)
     assert row.status == "created", "somebody else's cancellation is not this run's rollback"
     assert row.rollback_attempted_at is None

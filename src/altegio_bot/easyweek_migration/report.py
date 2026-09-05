@@ -134,6 +134,11 @@ class MigrationReport:
     failed_rows: list[dict[str, Any]] = field(default_factory=list)
 
     errors: list[str] = field(default_factory=list)
+    # External mutation requests that actually left for EasyWeek: a create, or a
+    # cancel whose PUT was issued. Counted whatever the answer was — a refusal
+    # and an unknown outcome are both attempts — and NOT counted for a path that
+    # decided against the request before making it, such as a cancel stopped by
+    # its own preflight read or a booking somebody had already cancelled.
     mutations_attempted: int = 0
 
     def note_source(self, company_id: int, fetched: int) -> None:

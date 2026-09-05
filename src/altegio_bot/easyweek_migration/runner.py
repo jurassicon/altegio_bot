@@ -2569,7 +2569,13 @@ async def run_rollback(
             report.reasons[outcome] += 1
             report.created_rows.append(entry)
 
-        report.mutations_attempted += 1
+        # `mutations_attempted` counts EXTERNAL mutation requests, and holding
+        # the claim is not one. `cancel_booking` begins with a read of its own,
+        # so counting here charged the wave for two paths where the PUT provably
+        # never left — a failed preflight and a booking somebody had already
+        # cancelled — and the number an operator uses to ask "what did this run
+        # change in EasyWeek?" was therefore too high exactly when nothing was
+        # changed. Each branch below counts for itself.
         try:
             outcome = await write_client.cancel_booking(target)
         except EasyWeekCancelNotSent:
@@ -2577,6 +2583,8 @@ async def run_rollback(
             # There is no unknown mutation, so there must be no marker claiming
             # one — otherwise a cancellation somebody makes by hand tomorrow
             # would be read as this attempt finishing late.
+            #
+            # Not counted: no request reached the cancel endpoint.
             await _release(entry, ROLLBACK_NOT_SENT)
             continue
         except EasyWeekUncertainMutation:
@@ -2587,6 +2595,10 @@ async def run_rollback(
             # live booking from every later reconciliation.
             #
             # The marker STAYS. This is the one state it exists for.
+            #
+            # Counted: the PUT left, which is precisely why its outcome is
+            # unknown. An attempt is what was attempted, not what succeeded.
+            report.mutations_attempted += 1
             entry["rollback_outcome"] = ROLLBACK_UNCERTAIN
             report.reasons[ROLLBACK_UNCERTAIN] += 1
             report.created_rows.append(entry)
@@ -2597,6 +2609,9 @@ async def run_rollback(
             # either, so the marker goes back — otherwise the cause could be
             # fixed and the next explicit rollback would find itself locked out
             # by a claim about a cancel that provably never happened.
+            #
+            # Counted: the request was made and the provider answered it.
+            report.mutations_attempted += 1
             entry["reason"] = _safe_error_code(exc)
             await _release(entry, ROLLBACK_REFUSED)
             continue
@@ -2605,12 +2620,17 @@ async def run_rollback(
             # Somebody cancelled it between the proofs above and this run's own
             # PUT. No mutation was sent, so the marker goes back — and the row
             # is NOT recorded as this rollback's work, because it is not.
+            #
+            # Not counted: the read found the booking already cancelled and the
+            # cancel endpoint was never called.
             await _release(entry, ROLLBACK_CANCELED_ELSEWHERE)
             continue
 
         # (D) Proven cancelled — `cancel_booking` read it back before returning.
-        # Finalised conditionally on this run still owning the attempt, so a
-        # marker that changed underneath cannot be finished by the wrong run.
+        # One PUT left and its effect was read back, so it counts. Finalised
+        # conditionally on this run still owning the attempt, so a marker that
+        # changed underneath cannot be finished by the wrong run.
+        report.mutations_attempted += 1
         async with session_maker() as session:
             async with session.begin():
                 recorded = await ledger_module.record_rolled_back(
