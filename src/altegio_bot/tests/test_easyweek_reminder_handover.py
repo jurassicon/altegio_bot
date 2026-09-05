@@ -168,6 +168,8 @@ def handover_row(**overrides: Any) -> HandoverRow:
         "target_company_id": 308001,
         "target_booking_uuid": str(BOOKING),
         "target_starts_at": NOW + timedelta(hours=48),
+        "target_client_id": 1,
+        "evidence": dict.fromkeys(("ledger", "source", "target", "clients", "source_jobs"), "a" * 64),
     }
     base.update(overrides)
     return HandoverRow(**base)
@@ -214,6 +216,9 @@ def test_a_handover_row_carries_no_personal_data() -> None:
 
 def plan_with(*rows: HandoverRow, **kwargs: Any) -> HandoverPlan:
     kwargs.setdefault("ledger_rows_seen", len(rows))
+    kwargs.setdefault("run_ids", ("run-1",))
+    for key in ("manifest_digest", "configuration_digest", "candidate_fingerprint"):
+        kwargs.setdefault(key, "a" * 64)
     return HandoverPlan(company_ids=(758285,), created_at=NOW, rows=rows, **kwargs)
 
 
@@ -794,7 +799,7 @@ def marked_row(**overrides: Any) -> HandoverRow:
 
 def test_the_snapshot_version_moved_for_the_marker() -> None:
     """v2 described a snapshot that authorised a write with no marker at all."""
-    assert SNAPSHOT_VERSION == 3
+    assert SNAPSHOT_VERSION == 4
 
 
 def test_a_v2_snapshot_authorises_nothing(tmp_path: Path) -> None:

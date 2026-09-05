@@ -49,6 +49,7 @@ from altegio_bot.message_planner import make_dedupe_key
 from altegio_bot.models.models import (
     PROVIDER_ALTEGIO,
     PROVIDER_EASYWEEK,
+    Client,
     EasyWeekMigrationLedger,
     MessageJob,
     OutboxMessage,
@@ -86,6 +87,7 @@ def wave_manifest() -> Any:
 def registry(monkeypatch: pytest.MonkeyPatch) -> None:
     """The runtime branch registry the handover proves the manifest against."""
     apply_production_flags(monkeypatch)
+    monkeypatch.setattr(settings, "easyweek_allowed_service_categories", '["Wimpernverlängerung"]')
 
 
 def booking_body(
@@ -156,10 +158,14 @@ async def seeded(session_maker: async_sessionmaker[AsyncSession]):
     starts = datetime.now(timezone.utc) + timedelta(hours=48)
     async with session_maker() as session:
         async with session.begin():
+            client = await session.get(Client, 1)
+            client.provider = PROVIDER_EASYWEEK
+            client.company_id = LOCATION_ID
             source = Record(
                 provider=PROVIDER_ALTEGIO,
                 company_id=COMPANY,
                 altegio_record_id=SOURCE_RECORD_ID,
+                staff_id=5001,
                 starts_at=starts,
                 is_deleted=False,
             )
@@ -171,6 +177,7 @@ async def seeded(session_maker: async_sessionmaker[AsyncSession]):
                 starts_at=starts,
                 is_deleted=False,
                 client_id=1,
+                raw={"easyweek": {"service_category": "Wimpernverlängerung", "services_count": 1}},
             )
             session.add_all([source, target])
             await session.flush()
@@ -230,6 +237,7 @@ async def add_job(
                 provider=provider,
                 company_id=company_id,
                 record_id=record_pk,
+                client_id=record.client_id,
                 job_type=job_type,
                 run_at=run_at or (datetime.now(timezone.utc) + timedelta(hours=24)),
                 status=status,
@@ -254,6 +262,7 @@ async def add_migrated_pair(
                 provider=PROVIDER_ALTEGIO,
                 company_id=COMPANY,
                 altegio_record_id=source_record_id,
+                staff_id=5001,
                 starts_at=starts_at,
                 is_deleted=False,
             )
@@ -265,6 +274,7 @@ async def add_migrated_pair(
                 starts_at=starts_at,
                 is_deleted=False,
                 client_id=1,
+                raw={"easyweek": {"service_category": "Wimpernverlängerung", "services_count": 1}},
             )
             session.add_all([source, target])
             await session.flush()
@@ -319,6 +329,7 @@ async def plan_for(
             session,
             manifest=wave_manifest(),
             company_ids=(COMPANY,),
+            run_ids=("run-1", "run-2"),
             client=client,
             sleep=_no_sleep,
         )
@@ -358,7 +369,14 @@ async def test_a_dry_run_mutates_nothing(session_maker, seeded) -> None:
 async def test_a_dry_run_proves_the_target_with_one_live_read(session_maker, seeded) -> None:
     client = FakeBookings(booking_body(seeded["starts"]))
     async with session_maker() as session:
-        await build_plan(session, manifest=wave_manifest(), company_ids=(COMPANY,), client=client, sleep=_no_sleep)
+        await build_plan(
+            session,
+            manifest=wave_manifest(),
+            company_ids=(COMPANY,),
+            run_ids=("run-1",),
+            client=client,
+            sleep=_no_sleep,
+        )
 
     assert client.calls == [str(BOOKING)]
 
@@ -476,6 +494,7 @@ async def test_one_failed_live_proof_blocks_the_entire_two_row_scope(session_mak
             session,
             manifest=wave_manifest(),
             company_ids=(COMPANY,),
+            run_ids=("run-1", "run-2"),
             client=client,
             sleep=_no_sleep,
         )
@@ -708,6 +727,7 @@ async def test_one_blocker_preserves_every_row_in_a_two_booking_batch(session_ma
             session,
             manifest=wave_manifest(),
             company_ids=(COMPANY,),
+            run_ids=("run-1", "run-2"),
             client=client,
             sleep=_no_sleep,
         )
@@ -990,6 +1010,10 @@ async def test_verify_passes_after_a_clean_apply(session_maker, seeded) -> None:
     assert report["passed"] is True
     assert report["open_altegio_reminders"] == []
     assert report["unmet_obligations"] == 0
+    expected_closures = len(frozen.company_ids) * len(frozen.wave["run_ids"])
+    assert report["wave_closures_expected"] == report["wave_closures_verified"] == expected_closures
+    assert report["wave_closures_missing"] == []
+    assert report["wave_closures_with_foreign_digest"] == []
 
 
 @pytest.mark.asyncio
@@ -1212,7 +1236,8 @@ async def test_a_key_held_by_another_record_stops_the_cancellation(session_maker
     plan = await plan_for(session_maker, starts=seeded["starts"])
     result = await run_apply(session_maker, plan)
 
-    assert result.halted == "obligation_identity_mismatch"
+    assert plan.refused == {"obligation_identity_mismatch": 1}
+    assert result.halted == "snapshot_incomplete_scope"
     rows = {job.id: job for job in await jobs(session_maker)}
     assert rows[stale].status == "queued", "the customer keeps the reminder they had"
 
@@ -1265,7 +1290,7 @@ async def test_a_concurrent_key_with_wrong_identity_rolls_back_the_whole_apply(
 
     result = await run_apply(session_maker, plan)
 
-    assert result.halted == "obligation_identity_mismatch"
+    assert result.halted == ("company_mismatch" if conflict == "company" else "obligation_identity_mismatch")
     current = {job.id: job for job in await jobs(session_maker)}
     assert current[stale].status == "queued"
     assert set(current) == {stale, conflict_id}, "the other missing obligation was rolled back too"
@@ -2051,6 +2076,7 @@ async def test_a_corrupt_marker_is_refused_rather_than_crashing(session_maker, s
             session,
             manifest=wave_manifest(),
             company_ids=(COMPANY,),
+            run_ids=("run-1", "run-2"),
             client=client,
             sleep=_no_sleep,
         )

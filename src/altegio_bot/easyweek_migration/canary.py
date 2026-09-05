@@ -355,6 +355,17 @@ RECOVERY_ADMITTED: Final = "canary_recovery_admitted"
 RECOVERY_NO_ATTEMPT: Final = "canary_recovery_no_matching_attempt"
 RECOVERY_NOT_UNCERTAIN_OUTCOME: Final = "canary_recovery_failure_not_an_unknown_outcome"
 RECOVERY_ALREADY_VERIFIED: Final = "canary_recovery_proof_already_verified"
+RECOVERY_PROOF_CHANGED: Final = "canary_recovery_proof_changed_during_resolution"
+
+
+class CanaryRecoveryProofChanged(RuntimeError):
+    """The admitted canary attempt changed while its live proof was built."""
+
+    def __init__(self, *, source_company_id: int, source_record_id: int) -> None:
+        super().__init__(RECOVERY_PROOF_CHANGED)
+        self.reason = RECOVERY_PROOF_CHANGED
+        self.source_company_id = source_company_id
+        self.source_record_id = source_record_id
 
 
 @dataclass(frozen=True)
@@ -393,6 +404,53 @@ def _stored_binding(row: EasyWeekMigrationCanaryProof) -> CanaryBinding | None:
         horizon_days=row.horizon_days,
         branch_identity_digest=row.branch_identity_digest,
         contract_kind=row.contract_kind,
+    )
+
+
+@dataclass(frozen=True)
+class RecoveryProofExpectation:
+    """Immutable version of the one unverified proof admitted for recovery."""
+
+    proof_id: int
+    binding: CanaryBinding
+    source_company_id: int
+    source_record_id: int
+    source_fingerprint: str
+    target_booking_uuid: str | None
+    target_snapshot_fingerprint: str | None
+    verified: bool
+    failure_reason: str | None
+    run_id: str
+    verified_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+
+
+def _as_utc(value: datetime) -> datetime:
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+
+
+def recovery_proof_expectation(row: EasyWeekMigrationCanaryProof) -> RecoveryProofExpectation:
+    """Freeze the exact proof row before any external recovery proof begins."""
+    binding = _stored_binding(row)
+    if row.id is None or binding is None or row.created_at is None or row.updated_at is None:
+        raise RuntimeError("canary recovery proof has no durable identity/version/binding")
+    return RecoveryProofExpectation(
+        proof_id=int(row.id),
+        binding=binding,
+        source_company_id=int(row.source_company_id),
+        source_record_id=int(row.source_record_id),
+        source_fingerprint=str(row.source_fingerprint),
+        target_booking_uuid=str(row.target_booking_uuid) if row.target_booking_uuid is not None else None,
+        target_snapshot_fingerprint=(
+            str(row.target_snapshot_fingerprint) if row.target_snapshot_fingerprint is not None else None
+        ),
+        verified=bool(row.verified),
+        failure_reason=str(row.failure_reason) if row.failure_reason is not None else None,
+        run_id=str(row.run_id),
+        verified_at=_as_utc(row.verified_at) if row.verified_at is not None else None,
+        created_at=_as_utc(row.created_at),
+        updated_at=_as_utc(row.updated_at),
     )
 
 
@@ -596,7 +654,7 @@ async def find_recoverable_canary_attempt(
 async def promote_proof_to_verified(
     session: AsyncSession,
     *,
-    proof_id: int,
+    expected: RecoveryProofExpectation,
     target_booking_uuid: str,
     target_snapshot: TargetSnapshot,
 ) -> None:
@@ -607,13 +665,29 @@ async def promote_proof_to_verified(
     field matched. This function records that verdict; it never decides it.
 
     The caller runs it inside the SAME transaction that flips the ledger row, so
-    the two can never disagree about whether the canary is proven.
+    the two can never disagree about whether the canary is proven. ``expected``
+    is the exact unverified proof admitted before the external read: refreshing,
+    replacing or verifying that attempt while the read is in flight invalidates
+    the result instead of attaching it to a different attempt.
     """
     row = (
-        await session.execute(select(EasyWeekMigrationCanaryProof).where(EasyWeekMigrationCanaryProof.id == proof_id))
+        await session.execute(
+            select(EasyWeekMigrationCanaryProof)
+            .where(EasyWeekMigrationCanaryProof.id == expected.proof_id)
+            .with_for_update()
+        )
     ).scalar_one_or_none()
-    if row is None:
-        raise RuntimeError(f"canary proof vanished proof_id={proof_id}")
+    valid_expectation = (
+        not expected.verified
+        and expected.failure_reason in _RECOVERABLE_FAILURE_REASONS
+        and row is not None
+        and recovery_proof_expectation(row) == expected
+    )
+    if not valid_expectation:
+        raise CanaryRecoveryProofChanged(
+            source_company_id=expected.source_company_id,
+            source_record_id=expected.source_record_id,
+        )
 
     now = datetime.now(timezone.utc)
     row.verified = True

@@ -44,24 +44,30 @@ import argparse
 import asyncio
 import json
 import logging
+import math
 import os
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Final
 
 from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 
 from altegio_bot.db import SessionLocal
 from altegio_bot.easyweek_client import EasyWeekClient
 from altegio_bot.easyweek_migration.manifest import load_manifest
 from altegio_bot.easyweek_migration.reminder_handover import (
     DEFAULT_MAX_SNAPSHOT_AGE_SEC,
+    SNAPSHOT_INVALIDATED,
     SnapshotError,
     boundary_still_future,
     check_snapshot_usable,
     confirmation_phrase,
+    invalidate_snapshot,
     read_apply_report,
     read_snapshot,
+    validate_run_ids,
     write_apply_report,
     write_snapshot,
 )
@@ -71,6 +77,7 @@ from altegio_bot.easyweek_migration.reminder_handover_db import (
     apply_plan,
     build_plan,
     verify_handover,
+    verify_live_scope,
 )
 
 logger = logging.getLogger("easyweek_migration.reminder_handover.cli")
@@ -91,12 +98,18 @@ DEFAULT_APPLY_REPORT: Final = (
 # the digest and the phrase: the flag proves somebody meant it now, this proves
 # the host is one where the handover is allowed at all.
 APPLY_ENV_FLAG: Final = "EASYWEEK_REMINDER_HANDOVER_ALLOW_APPLY"
+# This CLI destroys an old plan authorisation before normal parsing. Both
+# parsers must therefore recognise exactly the same option names: accepting an
+# abbreviation in only one of them can destroy the wrong snapshot or preserve
+# the one the operator meant to replace.
+ALLOW_OPTION_ABBREVIATIONS: Final = False
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="easyweek_reminder_handover",
         description="Hand future reminders over from migrated Altegio bookings to their EasyWeek twins.",
+        allow_abbrev=ALLOW_OPTION_ABBREVIATIONS,
     )
     parser.add_argument("mode", nargs="?", default=MODE_PLAN, choices=MODES)
     parser.add_argument(
@@ -115,6 +128,12 @@ def build_parser() -> argparse.ArgumentParser:
             "the migration manifest for this wave. It is what pairs each Altegio company with its "
             "EasyWeek location; the runtime registry then proves that location IS that branch."
         ),
+    )
+    parser.add_argument(
+        "--run-id",
+        action="append",
+        required=True,
+        help="exact ledger run_id; repeat for a multi-run wave",
     )
     parser.add_argument(
         "--snapshot",
@@ -173,8 +192,46 @@ def _apply_permitted(args: argparse.Namespace) -> bool:
     return bool(args.apply) and env == "true"
 
 
+# Suffixes an operator may reach for when a plan has been superseded. Refused by
+# name as well as by content: the content check is the guarantee, this one makes
+# the mistake obvious before anything is opened.
+ARCHIVE_SUFFIXES: Final = (".invalidated", ".tombstone", ".bak", ".old")
+
+
+def _invalidate_previous_plan(path: str, *, reason: str) -> str | None:
+    """Destroy the old authorisation, or say why it could not be destroyed.
+
+    Called for every real plan attempt, including one that never reaches its
+    arguments: a plan run means the operator has decided the previous permission
+    is superseded, and it must stop being usable at that moment rather than at
+    the moment the new plan happens to succeed.
+    """
+    try:
+        invalidate_snapshot(path, reason=reason)
+    except OSError:
+        # Fail closed. An old permission we could not destroy is exactly the
+        # thing that must not survive quietly.
+        return "snapshot_invalidation_failed"
+    return None
+
+
 async def _run(args: argparse.Namespace) -> int:
+    if args.mode == MODE_PLAN:
+        # Invalidating before any fallible read also covers invalid manifests,
+        # API/configuration errors and interruption, not only blocked reports.
+        # `main` has already done this for the argv it could read; repeating it
+        # here costs one stat and covers callers that build args themselves.
+        if failure := _invalidate_previous_plan(args.snapshot, reason="superseded_by_new_plan"):
+            return _fail(failure)
+    if args.mode in (MODE_APPLY, MODE_VERIFY) and Path(args.snapshot).suffix in ARCHIVE_SUFFIXES:
+        # Before the database session, before the manifest, before anything.
+        return _fail(SNAPSHOT_INVALIDATED)
+    if not math.isfinite(args.pause_sec) or args.pause_sec < DEFAULT_PAUSE_SEC:
+        return _fail("api_pacing_invalid")
+    if not 1 <= args.max_snapshot_age_sec <= DEFAULT_MAX_SNAPSHOT_AGE_SEC:
+        return _fail("snapshot_age_limit_invalid")
     companies = tuple(sorted(set(args.company_id)))
+    runs = validate_run_ids(sorted(set(args.run_id)))
     if not companies:
         return _fail("--company-id is required; nothing is in scope by default")
 
@@ -183,13 +240,14 @@ async def _run(args: argparse.Namespace) -> int:
         if not manifest.valid:
             return _fail(f"manifest is unusable ({manifest.reason})")
 
-        client = EasyWeekClient()
+        client = EasyWeekClient(max_attempts=1)
         try:
             async with SessionLocal() as session:
                 plan = await build_plan(
                     session,
                     manifest=manifest,
                     company_ids=companies,
+                    run_ids=runs,
                     client=client,
                     pause_sec=args.pause_sec,
                 )
@@ -202,12 +260,22 @@ async def _run(args: argparse.Namespace) -> int:
         report = plan.as_safe_dict()
         _print(report)
         print(f"easyweek_reminder_handover: snapshot written to {path}", file=sys.stderr)
-        print(
-            "easyweek_reminder_handover: to apply this plan, pass\n"
-            f"  --plan-digest {report['plan_digest']}\n"
-            f"  --confirm '{confirmation_phrase(report['plan_digest'])}'",
-            file=sys.stderr,
-        )
+        if report["cutover_ready"]:
+            print(
+                "easyweek_reminder_handover: to apply this plan, pass\n"
+                f"  --plan-digest {report['plan_digest']}\n"
+                f"  --confirm '{confirmation_phrase(report['plan_digest'])}'",
+                file=sys.stderr,
+            )
+        else:
+            # A snapshot that cannot authorise a cutover must not be handed to
+            # the operator with the command that would attempt one. The file is
+            # still written: it is the diagnostic artefact that says why.
+            blockers = ", ".join(report["wave_blockers"]) or "cutover_not_ready"
+            print(
+                f"easyweek_reminder_handover: this plan cannot be applied ({blockers}); resolve it and run plan again",
+                file=sys.stderr,
+            )
         # A plan is informational: it exits 0 whenever it could read the world,
         # and says separately whether a cutover is possible.
         return 0 if report["cutover_ready"] else 1
@@ -219,16 +287,32 @@ async def _run(args: argparse.Namespace) -> int:
 
     if tuple(sorted(frozen.company_ids)) != companies:
         return _fail("the snapshot was planned for a different set of companies; re-run plan")
+    manifest = load_manifest(args.manifest)
+    if not manifest.valid or manifest.digest != frozen.wave["manifest_digest"] or list(runs) != frozen.wave["run_ids"]:
+        return _fail("migration_wave_changed")
 
     if args.mode == MODE_VERIFY:
         try:
             apply_report = read_apply_report(args.apply_report, frozen=frozen)
         except SnapshotError as error:
             return _fail(str(error))
-        async with SessionLocal() as session:
-            async with session.begin():
-                await session.execute(text("SET TRANSACTION READ ONLY"))
-                report = await verify_handover(session, frozen, apply_report)
+        client = EasyWeekClient(max_attempts=1)
+        try:
+            async with SessionLocal() as session:
+                async with session.begin():
+                    await session.execute(text("SET TRANSACTION READ ONLY"))
+                    report = await verify_handover(session, frozen, apply_report)
+                    live_ready = report["passed"] and await verify_live_scope(
+                        session, frozen, client=client, pause_sec=args.pause_sec
+                    )
+                    # A webhook/outbox may run during the API walk. Refresh the
+                    # identity map and prove the DB half once more before PASS.
+                    session.expire_all()
+                    report = await verify_handover(session, frozen, apply_report)
+                    report["api_guard_ready"] = live_ready
+                    report["passed"] = bool(report["passed"] and live_ready)
+        finally:
+            await client.aclose()
         _print(report)
         return 0 if report["passed"] else 1
 
@@ -257,7 +341,7 @@ async def _run(args: argparse.Namespace) -> int:
     async with SessionLocal() as session:
         transaction = await session.begin()
         try:
-            result = await apply_plan(session, frozen, now=now)
+            result = await apply_plan(session, frozen, max_age_sec=args.max_snapshot_age_sec)
             if result.halted is not None:
                 await transaction.rollback()
             else:
@@ -269,25 +353,177 @@ async def _run(args: argparse.Namespace) -> int:
     _print(report)
     if result.halted is not None:
         return _fail(f"halted ({result.halted}); nothing was changed")
-    durable = result.apply_report(frozen, applied_at=now)
+    durable = result.apply_report(frozen, applied_at=datetime.now(timezone.utc))
     path = write_apply_report(durable, args.apply_report)
     print(f"easyweek_reminder_handover: apply report written to {path}", file=sys.stderr)
     return 0
 
 
+def build_pre_parser() -> argparse.ArgumentParser:
+    """A parser whose ONLY job is to answer two questions before the real one.
+
+    It mirrors the real parser's option ARITY — that is the whole point. A hand
+    written scan of argv cannot: it took the first token that did not start with
+    a dash as the mode, and in `--company-id not-a-number --run-id run-1` that
+    token is an option's value. The command was a plan, the scan decided it was
+    not, argparse then exited on the malformed company id, and the previous
+    authorisation stayed applicable at its usual path.
+
+    Everything is optional here and nothing is validated: unknown arguments and
+    malformed values are somebody else's error, and this parser must survive
+    them to answer at all. `parse_known_args` on an argparse parser that knows
+    the arity is the smallest construction with unambiguous semantics.
+    """
+    parser = argparse.ArgumentParser(
+        add_help=False,
+        allow_abbrev=ALLOW_OPTION_ABBREVIATIONS,
+        exit_on_error=False,
+    )
+    parser.add_argument("mode", nargs="?", default=None)
+    parser.add_argument("--snapshot", default=None)
+    # Declared so their VALUES can never be mistaken for the mode. Types stay
+    # `str`: a malformed company id must still parse here, or the very command
+    # this exists for would be the one it cannot read.
+    for option in ("--company-id", "--run-id", "--manifest", "--apply-report"):
+        parser.add_argument(option, action="append", default=[])
+    for option in ("--plan-digest", "--confirm", "--pause-sec", "--max-snapshot-age-sec"):
+        parser.add_argument(option, default=None)
+    parser.add_argument("--apply", action="store_true")
+    return parser
+
+
+def _recover_pre_parse(tokens: list[str]) -> tuple[str | None, str | None]:
+    """Recover mode/path even when the deliberately shallow parser cannot.
+
+    `argparse` returns no partial namespace when one of its known options is
+    missing a value. That failure must not turn an explicit (or default) plan
+    back into "unknown intent", because the real parser then exits while the old
+    authorisation remains usable. This scanner is driven by the pre-parser's own
+    option arity: known values are skipped, so `--run-id plan` is never confused
+    with a mode, while a missing value still leaves the surrounding mode and
+    snapshot visible.
+
+    An unrecognised option plus an otherwise unrecognised positional is treated
+    as the default plan. That is the fail-closed interpretation of
+    `--future-option value`: the current real parser cannot execute an apply or a
+    verify from it, so it must not preserve an older plan permission either.
+    """
+    option_actions = {option: action for action in build_pre_parser()._actions for option in action.option_strings}
+    positionals: list[str] = []
+    snapshot: str | None = None
+    unknown_option = False
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--":
+            # argparse stops recognising options here. Everything after the
+            # separator is a positional — including literal `--help` and names
+            # that would otherwise consume a value.
+            positionals.extend(tokens[index + 1 :])
+            break
+        if token.startswith("-"):
+            option, separator, inline_value = token.partition("=")
+            action = option_actions.get(option)
+            if action is None:
+                unknown_option = True
+                index += 1
+                continue
+            if action.nargs == 0:
+                index += 1
+                continue
+
+            value: str | None = inline_value if separator else None
+            if not separator and index + 1 < len(tokens):
+                candidate = tokens[index + 1]
+                candidate_option = candidate.partition("=")[0]
+                # A following option means this value is missing. Negative
+                # numbers remain values; all handover options use long names.
+                if not candidate.startswith("--") and candidate_option not in option_actions:
+                    value = candidate
+                    index += 1
+            if option == "--snapshot" and value is not None:
+                snapshot = value
+            index += 1
+            continue
+
+        positionals.append(token)
+        index += 1
+
+    if not positionals:
+        return MODE_PLAN, snapshot
+    if positionals[0] in MODES:
+        return positionals[0], snapshot
+    # Unknown options have unknown arity. If their apparent value is followed
+    # by an explicit mode, prefer that mode over guessing that the first
+    # positional was the command. In particular, malformed apply/verify must
+    # never become destructive merely because a rejected option preceded it.
+    for mode in (MODE_APPLY, MODE_VERIFY):
+        if mode in positionals:
+            return mode, snapshot
+    if MODE_PLAN in positionals:
+        return MODE_PLAN, snapshot
+    if unknown_option:
+        return MODE_PLAN, snapshot
+    return None, snapshot
+
+
+def _intended_plan_snapshot(argv: list[str] | None) -> str | None:
+    """The snapshot a plan command would replace, or ``None`` if it is not one.
+
+    Answered before `parse_args`, because a plan whose arguments do not parse is
+    still a plan attempt: the operator has decided the previous permission is
+    superseded, and it must stop being applicable at that moment rather than at
+    the moment a plan happens to succeed.
+
+    `--help` is not an attempt. Neither is an apply or a verify — including one
+    whose option value happens to be the string "plan", which is why the mode is
+    read by a parser that knows what is a value and what is not.
+    """
+    tokens = list(sys.argv[1:] if argv is None else argv)
+    option_tokens = tokens[: tokens.index("--")] if "--" in tokens else tokens
+    if any(token in ("-h", "--help") for token in option_tokens):
+        return None
+    try:
+        parsed, _unknown = build_pre_parser().parse_known_args(tokens)
+    except (argparse.ArgumentError, SystemExit):
+        mode, snapshot = _recover_pre_parse(tokens)
+    else:
+        mode = parsed.mode if parsed.mode in MODES else (MODE_PLAN if parsed.mode is None else None)
+        snapshot = parsed.snapshot
+        if mode is None:
+            # Usually an unknown option's value was accepted as the optional
+            # positional mode. Recover with option arity before deciding this
+            # was not the default plan.
+            mode, snapshot = _recover_pre_parse(tokens)
+    if mode != MODE_PLAN:
+        return None
+    return snapshot or DEFAULT_SNAPSHOT
+
+
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    intended = _intended_plan_snapshot(argv)
+    if intended is not None:
+        if failure := _invalidate_previous_plan(intended, reason="superseded_by_new_plan"):
+            return _fail(failure)
     args = build_parser().parse_args(argv)
-    if args.pause_sec < 0:
-        return _fail("--pause-sec must not be negative")
-    if args.max_snapshot_age_sec < 1:
-        return _fail("--max-snapshot-age-sec must be at least 1")
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     print(
         f"easyweek_reminder_handover: snapshot path {args.snapshot} names real bookings; "
         "it is not committed and must not be shared",
         file=sys.stderr,
     )
-    return asyncio.run(_run(args))
+    try:
+        return asyncio.run(_run(args))
+    except (SnapshotError, HandoverError) as error:
+        return _fail(str(error))
+    except SQLAlchemyError:
+        return _fail("database_error")
+    except OSError:
+        return _fail("private_artifact_io_error")
+    except Exception:
+        return _fail("handover_unexpected_error")
 
 
 if __name__ == "__main__":

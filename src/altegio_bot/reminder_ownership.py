@@ -115,7 +115,7 @@ async def reminder_owner(
         # The question could not be put to the database at all. That is not an
         # answer, and it is certainly not permission: the caller treats UNKNOWN
         # as "do not create, do not send" and retries later.
-        logger.exception(
+        logger.error(
             "reminder ownership lookup failed: company_id=%s source_record_id=%s",
             company_id,
             altegio_record_id,

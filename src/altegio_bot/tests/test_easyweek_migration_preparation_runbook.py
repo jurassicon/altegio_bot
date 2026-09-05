@@ -412,7 +412,7 @@ def test_handover_shell_commands_do_not_edit_notification_flags(handover: str) -
 def test_handover_sql_uses_credentials_inside_the_postgres_container(handover: str) -> None:
     """Every documented query: real credentials, and read-only by construction."""
     sql = [line for block in bash_blocks(handover) for line in block.splitlines() if "psql " in line]
-    assert len(sql) == 2, "the job counts and the ownership markers"
+    assert len(sql) == 3, "wave discovery, job counts and ownership markers"
     for line in sql:
         assert "-U altegio -d altegio_bot" in line
         assert "$POSTGRES_USER" not in line

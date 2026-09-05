@@ -41,17 +41,23 @@ operator fixes the manifest. It lives in the report, not in the ledger.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Final
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.easyweek_migration.classify import LedgerView
-from altegio_bot.models.models import PROVIDER_ALTEGIO, PROVIDER_EASYWEEK, EasyWeekMigrationLedger
+from altegio_bot.models.models import (
+    PROVIDER_ALTEGIO,
+    PROVIDER_EASYWEEK,
+    EasyWeekMigrationLedger,
+    EasyWeekMigrationWaveClosure,
+)
 
 logger = logging.getLogger("easyweek_migration.ledger")
 
@@ -111,6 +117,194 @@ async def load_ledger_views(
     }
 
 
+# ---------------------------------------------------------------------------
+# One migration wave, one writer at a time
+# ---------------------------------------------------------------------------
+# A wave is (provider, source company, origin run). Two things have to be true
+# about it at once, and neither is expressible as a row lock:
+#
+#   * while the reminder handover walks a wave, nobody may ADD an eligible row
+#     to it — a row lock cannot lock a row that does not exist yet; and
+#   * once a wave's reminders have been handed over to EasyWeek, nobody may add
+#     one afterwards either, because that booking's reminders would belong to
+#     nobody: the handover has already proved and marked everything it saw.
+#
+# The first is an advisory transaction lock keyed on the wave; the second is the
+# handover marker already stored on the wave's rows. Together they mean a writer
+# either goes first (and the handover then sees the extra row and refuses the
+# whole wave) or second (and is refused itself, before any EasyWeek request).
+#
+# Advisory, so it binds only the code paths that take it — which is why it lives
+# here, beside every path that can create an eligible row, rather than in the
+# handover alone.
+WAVE_LOCK_NAMESPACE: Final = 1163280712
+# The refusal a writer gets when the wave's reminders are already EasyWeek's.
+WAVE_CLOSED: Final = "migration_wave_closed"
+# A live proof only authorises the exact ledger version it was built from. If
+# anything moved while the network was being read, the proof is stale and must
+# not be attached to the replacement attempt.
+LEDGER_CHANGED_DURING_RESOLUTION: Final = "migration_ledger_changed_during_resolution"
+
+
+def _wave_lock_key(*, source_company_id: int, run_id: str) -> int:
+    """A stable int32 for one (provider, company, run). Not a secret, not an id."""
+    material = f"{PROVIDER_ALTEGIO}:{source_company_id}:{run_id}".encode("utf-8")
+    return int.from_bytes(hashlib.blake2b(material, digest_size=4).digest(), "big", signed=True)
+
+
+async def lock_migration_wave(session: AsyncSession, *, source_company_id: int, run_id: str) -> None:
+    """Serialise this transaction against every other writer of the same wave.
+
+    Transaction-scoped: released by the commit or the rollback, never left
+    behind by a crashed process. Keyed narrowly on provider, company and run, so
+    a different wave — another company, another run, another provider — is not
+    delayed by so much as a millisecond, and the existing isolation tests keep
+    passing unchanged.
+
+    Must be taken BEFORE the read that decides whether to write. Taken after,
+    it would serialise the writes while leaving the decisions racing.
+    """
+    await session.execute(
+        select(
+            func.pg_advisory_xact_lock(
+                WAVE_LOCK_NAMESPACE, _wave_lock_key(source_company_id=source_company_id, run_id=run_id)
+            )
+        )
+    )
+
+
+class WaveClosed(RuntimeError):
+    """This wave's reminders are EasyWeek's; it may not gain another booking.
+
+    An exception rather than a return value on purpose. The check protects a
+    real appointment from being created with no reminder ownership at all, and a
+    future caller that forgets to read a boolean would create it anyway.
+    """
+
+    def __init__(self, *, source_company_id: int, run_id: str) -> None:
+        super().__init__(WAVE_CLOSED)
+        self.reason = WAVE_CLOSED
+        self.source_company_id = source_company_id
+        self.run_id = run_id
+
+
+class LedgerChangedDuringResolution(RuntimeError):
+    """The unresolved ledger fact changed while its live proof was built."""
+
+    def __init__(self, *, source_company_id: int, source_record_id: int) -> None:
+        super().__init__(LEDGER_CHANGED_DURING_RESOLUTION)
+        self.reason = LEDGER_CHANGED_DURING_RESOLUTION
+        self.source_company_id = source_company_id
+        self.source_record_id = source_record_id
+
+
+async def close_migration_wave(
+    session: AsyncSession,
+    *,
+    source_company_id: int,
+    run_id: str,
+    plan_digest: str,
+) -> bool:
+    """Record durably that this exact company/run pair has been handed over.
+
+    Called inside the handover's own transaction, so a rollback leaves no
+    closure and a commit closes every pair the snapshot claimed — including a
+    pair with no `created` row at all, which is exactly the case a per-row
+    marker could not express.
+
+    Idempotent for the SAME authorisation: a repeat of the same snapshot finds
+    its own row and reports success without writing twice. A different plan
+    digest is refused, because two different authorisations cannot both have
+    closed one wave.
+    """
+    existing = (
+        await session.execute(
+            select(EasyWeekMigrationWaveClosure).where(
+                EasyWeekMigrationWaveClosure.source_provider == PROVIDER_ALTEGIO,
+                EasyWeekMigrationWaveClosure.source_company_id == source_company_id,
+                EasyWeekMigrationWaveClosure.run_id == run_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        return existing.plan_digest == plan_digest
+    await session.execute(
+        pg_insert(EasyWeekMigrationWaveClosure)
+        .values(
+            source_provider=PROVIDER_ALTEGIO,
+            source_company_id=source_company_id,
+            run_id=run_id,
+            plan_digest=plan_digest,
+            closed_at=_utcnow(),
+        )
+        .on_conflict_do_nothing(constraint="uq_easyweek_migration_wave_closure_identity")
+    )
+    return True
+
+
+async def wave_handed_over(session: AsyncSession, *, source_company_id: int, run_id: str) -> bool:
+    """Have this wave's reminders already been handed over to EasyWeek?
+
+    Two sources, and the first is the authority. A closure row is written for
+    every company/run pair a handover claims, so it answers for pairs that hold
+    no `created` row and could therefore never carry a marker — the case where
+    this used to answer "no" the moment the advisory lock was released, letting
+    a late retry POST a booking into a closed wave.
+
+    The row-level marker is still accepted, so a wave closed by an earlier
+    revision — before closure rows existed — keeps being recognised.
+
+    Read under `lock_migration_wave`, or the answer can change while it is being
+    acted on.
+    """
+    closed = (
+        await session.execute(
+            select(EasyWeekMigrationWaveClosure.id).where(
+                EasyWeekMigrationWaveClosure.source_provider == PROVIDER_ALTEGIO,
+                EasyWeekMigrationWaveClosure.source_company_id == source_company_id,
+                EasyWeekMigrationWaveClosure.run_id == run_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if closed is not None:
+        return True
+    found = (
+        await session.execute(
+            select(EasyWeekMigrationLedger.id)
+            .where(
+                EasyWeekMigrationLedger.source_provider == PROVIDER_ALTEGIO,
+                EasyWeekMigrationLedger.source_company_id == source_company_id,
+                EasyWeekMigrationLedger.run_id == run_id,
+                EasyWeekMigrationLedger.reminders_handed_over_at.is_not(None),
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    return found is not None
+
+
+async def wave_unresolved_statuses(session: AsyncSession, *, source_company_id: int, run_id: str) -> tuple[str, ...]:
+    """Statuses in this wave that could still turn into `created`.
+
+    `pending` and `uncertain` are both "a booking may exist and we cannot say".
+    Either can become `created` later, by a reconciliation or by a resumed
+    apply — after a handover has closed the wave, which would leave that row
+    without reminder ownership. The runbook already requires a clean
+    reconciliation before the handover; this is that requirement, enforced.
+    """
+    rows = await session.execute(
+        select(EasyWeekMigrationLedger.status)
+        .where(
+            EasyWeekMigrationLedger.source_provider == PROVIDER_ALTEGIO,
+            EasyWeekMigrationLedger.source_company_id == source_company_id,
+            EasyWeekMigrationLedger.run_id == run_id,
+            EasyWeekMigrationLedger.status.in_(UNRESOLVED_STATUSES),
+        )
+        .distinct()
+    )
+    return tuple(sorted(str(value) for (value,) in rows.all()))
+
+
 async def claim_for_apply(
     session: AsyncSession,
     *,
@@ -129,7 +323,15 @@ async def claim_for_apply(
     arbitrates rather than a read-then-write race in the tool. This is the reason
     a concurrent second apply cannot double-book: only one INSERT wins, and only
     the winner is allowed to call EasyWeek.
+
+    Raises :class:`WaveClosed` when this wave's reminders have already moved to
+    EasyWeek. The check lives HERE rather than in the caller: it is the last
+    point before a real appointment is created, and a guard that only one caller
+    happens to perform is a guard the next caller will not.
     """
+    await lock_migration_wave(session, source_company_id=source_company_id, run_id=run_id)
+    if await wave_handed_over(session, source_company_id=source_company_id, run_id=run_id):
+        raise WaveClosed(source_company_id=source_company_id, run_id=run_id)
     now = _utcnow()
     stmt = (
         pg_insert(EasyWeekMigrationLedger)
@@ -207,11 +409,11 @@ async def _finalize(
     ).scalar_one_or_none()
     if row is None:
         raise RuntimeError(f"migration ledger row vanished company_id={source_company_id} record_id={source_record_id}")
-    # `run_id` is the ORIGIN run and is never rewritten here. A reconciliation or
-    # a resolution that stamped its own id over it would remove the booking from
-    # the rollback set of the apply that actually created it — the one run an
-    # operator would reach for. Bookkeeping about a row must not rewrite the
-    # row's origin.
+    # `row.run_id` is the ORIGIN run and is never rewritten here. The `run_id`
+    # argument names the current bookkeeping/resolution run and belongs only in
+    # `last_resolution_run_id`. Stamping it over the origin would remove the
+    # booking from the rollback set of the apply that actually created it — the
+    # one run an operator would reach for.
     row.last_resolution_run_id = run_id
     row.status = status
     if target_booking_uuid is not None:
@@ -239,7 +441,16 @@ async def record_created(
     ``target_snapshot_fingerprint`` is the digest of the booking as written. It is
     what rollback later compares a live GET against, so a booking somebody moved
     or reassigned by hand is refused instead of cancelled.
+
+    Takes the wave lock — this is a transition INTO `created`, so it changes what
+    a reminder handover of the same wave would see. It does not refuse a closed
+    wave: the booking already exists in EasyWeek by the time this is called, and
+    an unrecordable real appointment is far worse than a row an operator has to
+    hand over separately. Refusing belongs at the claim, before the POST; the
+    handover refuses the wave from its own side when an unresolved row is still
+    able to reach `created`.
     """
+    await lock_migration_wave(session, source_company_id=source_company_id, run_id=run_id)
     await _finalize(
         session,
         run_id=run_id,
@@ -499,6 +710,61 @@ async def rows_for_run(
 UNRESOLVED_STATUSES: Final = (STATUS_UNCERTAIN, STATUS_PENDING)
 
 
+@dataclass(frozen=True)
+class ResolutionExpectation:
+    """Immutable, PII-free ledger version that one live proof authorises.
+
+    ``updated_at`` is the optimistic version token. The surrounding fields make
+    the comparison explicit and independently protect the provider, source,
+    target and attempt identity. In particular, ``updated_at`` catches the
+    pending -> failed -> pending cycle where a reclaim deliberately reuses the
+    same run id and every other visible value could return to its old value.
+    """
+
+    ledger_id: int
+    source_provider: str
+    source_company_id: int
+    source_record_id: int
+    target_provider: str
+    origin_run_id: str
+    status: str
+    source_fingerprint: str
+    target_booking_uuid: str | None
+    target_snapshot_fingerprint: str | None
+    attempts: int
+    last_resolution_run_id: str | None
+    reason_code: str | None
+    updated_at: datetime
+
+
+def _as_utc(value: datetime) -> datetime:
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+
+
+def resolution_expectation(row: EasyWeekMigrationLedger) -> ResolutionExpectation:
+    """Freeze the exact ledger version before any external proof begins."""
+    if row.id is None or row.updated_at is None:
+        raise RuntimeError("migration ledger row has no durable identity/version")
+    return ResolutionExpectation(
+        ledger_id=int(row.id),
+        source_provider=str(row.source_provider),
+        source_company_id=int(row.source_company_id),
+        source_record_id=int(row.source_record_id),
+        target_provider=str(row.target_provider),
+        origin_run_id=str(row.run_id),
+        status=str(row.status),
+        source_fingerprint=str(row.source_fingerprint),
+        target_booking_uuid=str(row.target_booking_uuid) if row.target_booking_uuid is not None else None,
+        target_snapshot_fingerprint=(
+            str(row.target_snapshot_fingerprint) if row.target_snapshot_fingerprint is not None else None
+        ),
+        attempts=int(row.attempts or 0),
+        last_resolution_run_id=(str(row.last_resolution_run_id) if row.last_resolution_run_id is not None else None),
+        reason_code=str(row.reason_code) if row.reason_code is not None else None,
+        updated_at=_as_utc(row.updated_at),
+    )
+
+
 async def uncertain_rows(session: AsyncSession) -> list[EasyWeekMigrationLedger]:
     """Every row with an unknown outcome, across all runs.
 
@@ -553,21 +819,37 @@ async def resolve_uncertain_as_created(
     run_id: str,
     source_company_id: int,
     source_record_id: int,
+    expected: ResolutionExpectation,
     target_booking_uuid: str,
     target_snapshot_fingerprint: str,
 ) -> None:
     """Record an operator-supplied target that the tool has already PROVEN.
 
     The caller must have fetched the booking and matched its marker, branch and
-    write-critical fields first; this function only writes the verdict down. The
-    origin ``run_id`` is preserved, so the booking stays inside the rollback set
-    of the apply that created it.
+    write-critical fields first; this function only writes the verdict down.
+    ``run_id`` names the CURRENT resolution for audit. ``expected`` is mandatory:
+    it is the exact row version the caller read before the live proof. The write
+    locks that expected origin wave, then the row, and refuses if any part moved
+    in between. The origin itself remains unchanged, and the booking stays inside
+    the rollback set of the apply that created it.
     """
+    row = await _lock_expected_resolution_row(
+        session,
+        source_company_id=source_company_id,
+        source_record_id=source_record_id,
+        expected=expected,
+    )
+    if await wave_handed_over(session, source_company_id=source_company_id, run_id=expected.origin_run_id):
+        # Promoting a row into a closed wave would leave that booking's
+        # reminders owned by nobody. The row stays unresolved, so the booking
+        # remains visible to reconciliation and needs an operator.
+        raise WaveClosed(source_company_id=source_company_id, run_id=expected.origin_run_id)
+
     await _finalize(
         session,
         run_id=run_id,
-        source_company_id=source_company_id,
-        source_record_id=source_record_id,
+        source_company_id=row.source_company_id,
+        source_record_id=row.source_record_id,
         status=STATUS_CREATED,
         target_booking_uuid=target_booking_uuid,
         reason_code=None,
@@ -576,12 +858,59 @@ async def resolve_uncertain_as_created(
     )
 
 
+async def _lock_expected_resolution_row(
+    session: AsyncSession,
+    *,
+    source_company_id: int,
+    source_record_id: int,
+    expected: ResolutionExpectation,
+) -> EasyWeekMigrationLedger:
+    """Lock and re-prove the exact unresolved ledger version a caller read."""
+    identity_matches = (
+        expected.source_provider == PROVIDER_ALTEGIO
+        and expected.target_provider == PROVIDER_EASYWEEK
+        and expected.source_company_id == source_company_id
+        and expected.source_record_id == source_record_id
+        and expected.status in UNRESOLVED_STATUSES
+    )
+    if not identity_matches:
+        raise LedgerChangedDuringResolution(
+            source_company_id=source_company_id,
+            source_record_id=source_record_id,
+        )
+
+    # Expected origin first, row second. A reclaim under another run may not
+    # share this advisory key, but its row update serialises on FOR UPDATE and
+    # the full optimistic comparison below then refuses the stale proof.
+    await lock_migration_wave(
+        session,
+        source_company_id=source_company_id,
+        run_id=expected.origin_run_id,
+    )
+    row = (
+        await session.execute(
+            select(EasyWeekMigrationLedger)
+            .where(
+                EasyWeekMigrationLedger.id == expected.ledger_id,
+            )
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if row is None or resolution_expectation(row) != expected or row.status not in UNRESOLVED_STATUSES:
+        raise LedgerChangedDuringResolution(
+            source_company_id=source_company_id,
+            source_record_id=source_record_id,
+        )
+    return row
+
+
 async def resolve_uncertain_as_absent(
     session: AsyncSession,
     *,
     run_id: str,
     source_company_id: int,
     source_record_id: int,
+    expected: ResolutionExpectation,
     reason_code: str,
 ) -> None:
     """Record that an operator checked EasyWeek and the booking is NOT there.
@@ -593,16 +922,29 @@ async def resolve_uncertain_as_absent(
     Nothing here decides that on its own — the CLI requires a separate, explicit
     multi-step confirmation, and no automatic path ever reaches this function.
     """
+    row = await _lock_expected_resolution_row(
+        session,
+        source_company_id=source_company_id,
+        source_record_id=source_record_id,
+        expected=expected,
+    )
     await _finalize(
         session,
         run_id=run_id,
-        source_company_id=source_company_id,
-        source_record_id=source_record_id,
+        source_company_id=row.source_company_id,
+        source_record_id=row.source_record_id,
         status=STATUS_FAILED,
         target_booking_uuid=None,
         reason_code=reason_code,
         count_attempt=False,
     )
+    # The absence proof invalidates any previously stored target observation.
+    # A later reclaim must start without carrying the old UUID/fingerprint into
+    # its new pending attempt, where they could be mistaken for that attempt's
+    # result by reconciliation.
+    row.target_booking_uuid = None
+    row.target_snapshot_fingerprint = None
+    await session.flush()
 
 
 async def get_row(

@@ -564,7 +564,9 @@ class RecordingTransport:
         request carries neither), the marker lands in `public_notes`, and the
         staffer is filed away where only the filtered list can see it.
         """
-        uuid = CREATED_UUIDS[record_id]
+        # A booking uuid for any source record, so a test may add one without
+        # editing this table. Deterministic, and distinct per record id.
+        uuid = CREATED_UUIDS.get(record_id) or f"0de4feed-0000-4000-8000-{record_id:012d}"
         entry = catalog_entry(body["location_uuid"], body["service_uuid"], catalog=self.catalog)
         start = datetime.fromisoformat(body["reserved_on"].replace("Z", "+00:00"))
         end = start + timedelta(minutes=entry["minutes"])
