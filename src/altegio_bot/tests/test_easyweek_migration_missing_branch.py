@@ -112,7 +112,7 @@ def add_new_rastatt_booking(source) -> None:
             id=NEW_RASTATT_RECORD,
             date="2026-09-18 10:00:00",
             staff_id=RA_STAFF_ID,
-            services=[{"id": RA_SERVICE_ID, "cost": 90.0, "cost_to_pay": 90.0}],
+            services=[{"id": RA_SERVICE_ID, "cost": 90.0, "cost_to_pay": 90.0, "amount": 1}],
         )
     )
 

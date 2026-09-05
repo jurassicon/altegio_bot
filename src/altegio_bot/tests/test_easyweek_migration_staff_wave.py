@@ -237,8 +237,8 @@ def test_a_deferred_master_is_skipped_even_when_her_booking_is_otherwise_blocked
         record(
             staff_id=KA_DEFERRED_STAFF_ID,
             services=[
-                {"id": KA_SERVICE_ID, "cost": 90.0, "cost_to_pay": 90.0},
-                {"id": KA_SERVICE_ID, "cost": 30.0, "cost_to_pay": 30.0},
+                {"id": KA_SERVICE_ID, "cost": 90.0, "cost_to_pay": 90.0, "amount": 1},
+                {"id": KA_SERVICE_ID, "cost": 30.0, "cost_to_pay": 30.0, "amount": 1},
             ],
         ),
         wave_manifest(selected=[KA_STAFF_ID], deferred=[KA_DEFERRED_STAFF_ID]),

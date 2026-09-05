@@ -119,7 +119,7 @@ def stub_altegio_source(monkeypatch: pytest.MonkeyPatch) -> dict[int, list[dict]
             record(
                 id=RA_RECORD_A,
                 staff_id=RA_STAFF_ID,
-                services=[{"id": RA_SERVICE_ID, "cost": 90.0, "cost_to_pay": 90.0}],
+                services=[{"id": RA_SERVICE_ID, "cost": 90.0, "cost_to_pay": 90.0, "amount": 1}],
             )
         ],
     }
@@ -252,6 +252,9 @@ ORDER_LINE_UUIDS = {
     RA_RECORD_A: "0de41111-0000-4000-8000-000000000003",
 }
 _FALLBACK_ORDER_LINE = "0de41111-0000-4000-8000-0000000000ff"
+# The booking uuid a cart POST returns for a record the fixture has no dedicated
+# uuid for.
+_FALLBACK_CART_UUID = "0ca47111-0000-4000-8000-0000000000ff"
 
 CATALOG_PER_PAGE = 2
 
@@ -295,6 +298,10 @@ class RecordingTransport:
         self.requests: list[httpx.Request] = []
         self.fail_with = fail_with or {}
         self.cancelled: list[str] = []
+        # Bookings the fixture has cancelled. Kept apart from `cancelled` so a
+        # test can pre-cancel one WITHOUT recording a mutation, which is how the
+        # idempotent "already cancelled" path is exercised.
+        self.canceled_uuids: set[str] = set()
         self.bookings: dict[str, dict] = {}
         # booking uuid -> the staffer the POST named. Held OUTSIDE the booking,
         # exactly as EasyWeek holds it: the only way to read it back is the
@@ -330,9 +337,20 @@ class RecordingTransport:
             return self._booking_list(request)
         if request.method == "GET":
             return self._one_booking(path)
-        if path.endswith("set-booking-cancel"):
-            uuid = path.split("/")[-2]
+        if request.method == "POST" and path.rstrip("/").endswith("/bookings/cart"):
+            return self._create_cart(request)
+        if request.method == "PUT" and path.endswith("/status/cancel"):
+            # The PROVEN cancel: `PUT /bookings/{uuid}/status/cancel`. The old
+            # `POST .../set-booking-cancel` is deliberately NOT handled here —
+            # the real API answers 404 for it, and a fixture that accepted it
+            # would let a rollback that cannot cancel anything look green.
+            uuid = path.split("/")[-3]
+            body = json.loads(request.content.decode() or "{}")
+            assert set(body) == {"cancel_reason", "internal_notes"}, f"unexpected cancel body: {sorted(body)}"
             self.cancelled.append(uuid)
+            # The booking now reads back as cancelled, which is what the client
+            # checks before it reports a rollback as done.
+            self.canceled_uuids.add(uuid)
             return httpx.Response(200, json={})
         return self._create(request)
 
@@ -401,6 +419,11 @@ class RecordingTransport:
         booking = self.bookings.get(uuid)
         if booking is None:
             return httpx.Response(404)
+        if uuid in self.canceled_uuids:
+            # The read the cancel path proves itself with. A booking the fixture
+            # cancelled has to READ as cancelled, or the client is right to
+            # report the outcome as unproven.
+            booking = {**booking, "is_canceled": True, "status": {"type": "CANCELED"}}
         return httpx.Response(200, json=booking)
 
     # -- POST /bookings ------------------------------------------------------
@@ -418,6 +441,64 @@ class RecordingTransport:
             return httpx.Response(failure, json={"error": "no"})
 
         uuid = self._store(body, record_id)
+        return httpx.Response(201, json={"uuid": uuid})
+
+    def _create_cart(self, request: httpx.Request) -> httpx.Response:
+        """`POST /bookings/cart`, answering the way the live canary answered it.
+
+        One cart item with two services came back as ONE booking carrying TWO
+        order lines. The fixture reproduces that rather than the convenient
+        single-line shape: a two-line booking is exactly what the readback
+        cannot yet project, and a fixture that returned one line would hide the
+        very gap the closed cart gate exists for.
+        """
+        body = json.loads(request.content.decode())
+        record_id = int(str(body["booking_comment"]).rsplit(":", 1)[-1])
+        failure = self.fail_with.get(record_id)
+        if isinstance(failure, Exception):
+            raise failure
+        if isinstance(failure, int):
+            return httpx.Response(failure, json={"error": "no"})
+
+        item = body["items"][0]
+        uuid = CREATED_UUIDS.get(record_id, _FALLBACK_CART_UUID)
+        entries = [
+            catalog_entry(body["location_uuid"], service["service_uuid"], catalog=self.catalog)
+            for service in item["services"]
+        ]
+        minutes = sum(entry["minutes"] for entry in entries)
+        start = datetime.fromisoformat(item["datetime_start"].replace("Z", "+00:00"))
+        total = sum(entry["price"] for entry in entries)
+
+        self.bookings[uuid] = {
+            "uuid": uuid,
+            "location_uuid": body["location_uuid"],
+            "start_time": item["datetime_start"],
+            "end_time": (start + timedelta(minutes=minutes)).isoformat().replace("+00:00", "Z"),
+            "timezone": body["timezone"],
+            "duration": _duration_object(minutes),
+            "quantity": 1,
+            "is_canceled": False,
+            "is_completed": False,
+            "public_notes": body["booking_comment"],
+            "currency": "EUR",
+            "customer": {"uuid": CUSTOMER_UUID},
+            "order": {"total": total, "subtotal": total},
+            "ordered_services": [
+                {
+                    "uuid": f"{_FALLBACK_ORDER_LINE[:-2]}{index:02d}",
+                    "name": entry["name"],
+                    "quantity": 1,
+                    "currency": "EUR",
+                    "price": entry["price"],
+                    "original_price": entry["price"],
+                    "duration": _duration_object(entry["minutes"]),
+                    "original_duration": _duration_object(entry["minutes"]),
+                }
+                for index, entry in enumerate(entries)
+            ],
+        }
+        self.assignments[uuid] = item["services"][0]["staffer_uuid"]
         return httpx.Response(201, json={"uuid": uuid})
 
     def _store(self, body: dict, record_id: int) -> str:
@@ -498,7 +579,7 @@ class RecordingTransport:
         marker_tail = f":{record_id}"
         count = 0
         for request in self.requests:
-            if request.method != "POST" or request.url.path.endswith("set-booking-cancel"):
+            if request.method != "POST":
                 continue
             body = json.loads(request.content.decode())
             if str(body.get("booking_comment", "")).endswith(marker_tail):

@@ -42,6 +42,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Final
 
+from altegio_bot.easyweek_migration.bindings import MUTATION_CART_TWO, MUTATION_SINGLE
 from altegio_bot.easyweek_migration.branch_identity import BranchIdentityResult
 from altegio_bot.easyweek_migration.canary import CanaryVerdict
 from altegio_bot.easyweek_migration.customers import CustomerDirectory
@@ -68,6 +69,17 @@ GATE_CANARY_NOTIFICATION_OBSERVED: Final = "canary_notification_observed"
 GATE_BRANCH_IDENTITY_UNPROVEN: Final = "target_branch_identity_unproven"
 # A bulk apply needs a machine-checked canary, not an operator's recollection.
 GATE_CANARY_PROOF_MISSING: Final = "canary_proof_missing_or_stale"
+# The same refusal for the cart contract, under its own name. One proof licenses
+# ONE contract, so a plan containing cart bookings needs a cart canary that a
+# single-booking canary can never stand in for — and an operator reading
+# `canary_proof_missing_or_stale` next to a verified single canary would
+# reasonably conclude the tool was wrong. The code says which proof is missing.
+GATE_CART_CANARY_PROOF_MISSING: Final = "cart_canary_proof_missing_or_stale"
+# Refusal codes by contract, so the mapping lives in one place.
+CANARY_PROOF_FAILURES: Final[dict[str, str]] = {
+    MUTATION_SINGLE: GATE_CANARY_PROOF_MISSING,
+    MUTATION_CART_TWO: GATE_CART_CANARY_PROOF_MISSING,
+}
 # The manifest of wave N must still carry the mappings and catalogue baselines
 # that waves 1..N-1 were migrated against. See `previous_wave`.
 GATE_PREVIOUS_WAVE_CONTEXT_UNPROVEN: Final = "previous_wave_context_unprovable"
@@ -224,7 +236,11 @@ def evaluate_apply_gate(
     # request schema, cutover and branch mapping. The canary run itself is the
     # one apply that legitimately has no proof yet.
     if require_canary_proof and (canary_verdict is None or not canary_verdict.licensed):
-        failures.append(GATE_CANARY_PROOF_MISSING)
+        # An unknown contract has no code of its own, and inventing one from the
+        # kind string would put unvalidated text into a stable reason code.
+        # It falls back to the generic refusal, which is still a refusal.
+        kind = canary_verdict.contract_kind if canary_verdict is not None else MUTATION_SINGLE
+        failures.append(CANARY_PROOF_FAILURES.get(kind, GATE_CANARY_PROOF_MISSING))
 
     # Every wave after the first inherits the previous waves' live `created`
     # rows, and its manifest has to keep proving them. Required on the two paths

@@ -200,7 +200,7 @@ def directory():
 def test_a_full_discount_to_zero_is_blocked(directory):
     """cost=90, cost_to_pay=0. The regression this whole module exists for."""
     decision = classify(
-        booking(service={"id": KA_SERVICE_ID, "cost": 90.0, "cost_to_pay": 0}),
+        booking(service={"id": KA_SERVICE_ID, "cost": 90.0, "cost_to_pay": 0, "amount": 1}),
         manifest=manifest_with(catalog_price="90.00"),
         directory=directory,
     )
@@ -210,7 +210,7 @@ def test_a_full_discount_to_zero_is_blocked(directory):
 
 def test_a_zero_first_cost_against_a_paid_catalogue_is_blocked(directory):
     decision = classify(
-        booking(service={"id": KA_SERVICE_ID, "cost": 90.0, "cost_to_pay": 90.0, "first_cost": 0}),
+        booking(service={"id": KA_SERVICE_ID, "cost": 90.0, "cost_to_pay": 90.0, "first_cost": 0, "amount": 1}),
         manifest=manifest_with(catalog_price="90.00"),
         directory=directory,
     )
@@ -221,7 +221,7 @@ def test_a_zero_first_cost_against_a_paid_catalogue_is_blocked(directory):
 def test_a_genuinely_free_catalogue_service_migrates(directory):
     """Zero is only an override when the catalogue says otherwise."""
     decision = classify(
-        booking(service={"id": KA_SERVICE_ID, "cost": 0, "cost_to_pay": 0}),
+        booking(service={"id": KA_SERVICE_ID, "cost": 0, "cost_to_pay": 0, "amount": 1}),
         manifest=manifest_with(catalog_price="0"),
         directory=directory,
     )
@@ -231,7 +231,9 @@ def test_a_genuinely_free_catalogue_service_migrates(directory):
 def test_a_booking_with_no_price_at_all_is_blocked(directory):
     """No stated price means an override would be invisible."""
     decision = classify(
-        booking(service={"id": KA_SERVICE_ID}),
+        # A real line always states its amount; what is missing here is the
+        # PRICE, which is what this test is about.
+        booking(service={"id": KA_SERVICE_ID, "amount": 1}),
         manifest=manifest_with(catalog_price="90.00"),
         directory=directory,
     )
@@ -242,7 +244,7 @@ def test_a_booking_with_no_price_at_all_is_blocked(directory):
 @pytest.mark.parametrize("bad", [float("nan"), float("inf"), True, -5])
 def test_a_malformed_price_is_blocked_not_ignored(directory, bad):
     decision = classify(
-        booking(service={"id": KA_SERVICE_ID, "cost": 90.0, "cost_to_pay": bad}),
+        booking(service={"id": KA_SERVICE_ID, "cost": 90.0, "cost_to_pay": bad, "amount": 1}),
         manifest=manifest_with(catalog_price="90.00"),
         directory=directory,
     )
@@ -252,7 +254,7 @@ def test_a_malformed_price_is_blocked_not_ignored(directory, bad):
 
 def test_a_zero_discount_is_not_a_discount(directory):
     decision = classify(
-        booking(service={"id": KA_SERVICE_ID, "cost": 90.0, "cost_to_pay": 90.0, "discount": 0}),
+        booking(service={"id": KA_SERVICE_ID, "cost": 90.0, "cost_to_pay": 90.0, "discount": 0, "amount": 1}),
         manifest=manifest_with(catalog_price="90.00"),
         directory=directory,
     )
@@ -261,7 +263,7 @@ def test_a_zero_discount_is_not_a_discount(directory):
 
 def test_a_price_that_differs_from_the_catalogue_is_blocked(directory):
     decision = classify(
-        booking(service={"id": KA_SERVICE_ID, "cost": 70.0, "cost_to_pay": 70.0}),
+        booking(service={"id": KA_SERVICE_ID, "cost": 70.0, "cost_to_pay": 70.0, "amount": 1}),
         manifest=manifest_with(catalog_price="90.00"),
         directory=directory,
     )
@@ -272,7 +274,7 @@ def test_a_price_that_differs_from_the_catalogue_is_blocked(directory):
 def test_a_stretched_slot_is_blocked_even_when_altegio_states_no_service_duration(directory):
     """The second half of the bug: no service baseline used to mean no override."""
     decision = classify(
-        booking(service={"id": KA_SERVICE_ID, "cost": 90.0, "cost_to_pay": 90.0}, seance_length=5400),
+        booking(service={"id": KA_SERVICE_ID, "cost": 90.0, "cost_to_pay": 90.0, "amount": 1}, seance_length=5400),
         manifest=manifest_with(catalog_price="90.00", catalog_minutes=60),
         directory=directory,
     )
@@ -282,7 +284,7 @@ def test_a_stretched_slot_is_blocked_even_when_altegio_states_no_service_duratio
 
 def test_a_booking_with_no_duration_at_all_is_blocked(directory):
     decision = classify(
-        booking(service={"id": KA_SERVICE_ID, "cost": 90.0, "cost_to_pay": 90.0}, seance_length=None),
+        booking(service={"id": KA_SERVICE_ID, "cost": 90.0, "cost_to_pay": 90.0, "amount": 1}, seance_length=None),
         manifest=manifest_with(catalog_price="90.00"),
         directory=directory,
     )
@@ -293,7 +295,7 @@ def test_a_booking_with_no_duration_at_all_is_blocked(directory):
 @pytest.mark.parametrize("bad", [0, -60, 3630, True])
 def test_zero_negative_and_fractional_durations_are_blocked(directory, bad):
     decision = classify(
-        booking(service={"id": KA_SERVICE_ID, "cost": 90.0, "cost_to_pay": 90.0}, seance_length=bad),
+        booking(service={"id": KA_SERVICE_ID, "cost": 90.0, "cost_to_pay": 90.0, "amount": 1}, seance_length=bad),
         manifest=manifest_with(catalog_price="90.00"),
         directory=directory,
     )
@@ -305,7 +307,7 @@ def test_a_service_duration_disagreeing_with_the_manifest_baseline_is_blocked(di
     """A stale manifest baseline must surface, not be quietly preferred."""
     decision = classify(
         booking(
-            service={"id": KA_SERVICE_ID, "cost": 90.0, "cost_to_pay": 90.0, "seance_length": 5400},
+            service={"id": KA_SERVICE_ID, "cost": 90.0, "cost_to_pay": 90.0, "seance_length": 5400, "amount": 1},
             seance_length=3600,
         ),
         manifest=manifest_with(catalog_price="90.00", catalog_minutes=60),
@@ -317,7 +319,7 @@ def test_a_service_duration_disagreeing_with_the_manifest_baseline_is_blocked(di
 
 def test_a_correct_price_and_duration_migrate(directory):
     decision = classify(
-        booking(service={"id": KA_SERVICE_ID, "cost": 90.0, "cost_to_pay": 90.0, "seance_length": 3600}),
+        booking(service={"id": KA_SERVICE_ID, "cost": 90.0, "cost_to_pay": 90.0, "seance_length": 3600, "amount": 1}),
         manifest=manifest_with(catalog_price="90.00", catalog_minutes=60),
         directory=directory,
     )

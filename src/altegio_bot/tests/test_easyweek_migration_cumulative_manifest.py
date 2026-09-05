@@ -103,7 +103,7 @@ def lash_record() -> dict:
         "staff_id": LASH_STAFF_ID,
         "seance_length": 3600,
         "client": {"phone": CUSTOMER_PHONE},
-        "services": [{"id": LASH_SERVICE_ID, "cost": 90.0, "cost_to_pay": 90.0}],
+        "services": [{"id": LASH_SERVICE_ID, "cost": 90.0, "cost_to_pay": 90.0, "amount": 1}],
     }
 
 
@@ -114,7 +114,7 @@ def nail_record() -> dict:
         "staff_id": NAIL_STAFF_ID,
         "seance_length": 5400,
         "client": {"phone": CUSTOMER_PHONE},
-        "services": [{"id": NAIL_SERVICE_ID, "cost": 120.0, "cost_to_pay": 120.0}],
+        "services": [{"id": NAIL_SERVICE_ID, "cost": 120.0, "cost_to_pay": 120.0, "amount": 1}],
     }
 
 
@@ -264,7 +264,7 @@ class TwoServiceTransport(RecordingTransport):
         one the migration actually sent, which is what the read-back compares.
         """
         for request in reversed(self.requests):
-            if request.method != "POST" or request.url.path.endswith("set-booking-cancel"):
+            if request.method != "POST":
                 continue
             body = json.loads(request.content.decode())
             if int(body["booking_comment"].rsplit(":", 1)[-1]) == record_id:

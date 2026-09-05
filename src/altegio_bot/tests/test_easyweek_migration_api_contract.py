@@ -645,7 +645,7 @@ def test_a_broken_service_list_is_a_data_error_not_a_break(services, label):
 
 def test_a_free_service_and_an_unnamed_one_are_not_treated_as_breaks():
     """Zero price and an empty label are not heuristics for a break (§28.4)."""
-    free = _classify([{"id": KA_SERVICE_ID, "cost": 0.0, "cost_to_pay": 0.0, "title": ""}])
+    free = _classify([{"id": KA_SERVICE_ID, "cost": 0.0, "cost_to_pay": 0.0, "title": "", "amount": 1}])
     assert free.reason != SKIP_EMPTY_SERVICES
 
 

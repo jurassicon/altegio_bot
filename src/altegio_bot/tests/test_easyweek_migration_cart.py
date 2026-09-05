@@ -32,10 +32,12 @@ from altegio_bot.easyweek_migration.bindings import (
 )
 from altegio_bot.easyweek_migration.classify import (
     BLOCK_CART_UNSUPPORTED,
+    BLOCK_CONTRACT_UNSUPPORTED,
     BLOCK_CUSTOM_DURATION,
     BLOCK_CUSTOM_PRICE,
     BLOCK_MULTI_SERVICE,
     BLOCK_SERVICE_MAPPING_MISSING,
+    BLOCK_SERVICE_QUANTITY,
     BLOCKED,
     READY,
     classify_record,
@@ -84,8 +86,8 @@ def cart_record(**overrides: Any) -> dict[str, Any]:
     """The proven shape: two different standard services, 60 + 120 minutes."""
     base = record(
         services=[
-            {"id": KA_SERVICE_ID, "cost": 90.0, "cost_to_pay": 90.0},
-            {"id": SECOND_SERVICE_ID, "cost": 90.0, "cost_to_pay": 90.0},
+            {"id": KA_SERVICE_ID, "cost": 90.0, "cost_to_pay": 90.0, "amount": 1},
+            {"id": SECOND_SERVICE_ID, "cost": 90.0, "cost_to_pay": 90.0, "amount": 1},
         ],
         seance_length=(60 + 120) * 60,
     )
@@ -137,7 +139,10 @@ PAIR = (
 def test_two_different_standard_services_are_a_cart_booking() -> None:
     decision = classify(cart_record())
 
-    assert decision.outcome == READY
+    # Recognised as a cart, and blocked on the contract rather than on the
+    # booking: the shape is understood, the write path is not built yet.
+    assert decision.outcome == BLOCKED
+    assert decision.reason == BLOCK_CONTRACT_UNSUPPORTED
     assert decision.mutation_kind == MUTATION_CART_TWO
     assert len(decision.bindings) == 2
     assert decision.duration_minutes == 180, "the canary's 180 minutes, as the sum"
@@ -184,7 +189,7 @@ def test_a_cart_decision_refuses_the_single_service_convenience() -> None:
 
 def test_three_services_are_refused() -> None:
     payload = cart_record()
-    payload["services"].append({"id": KA_SERVICE_ID, "cost": 90.0, "cost_to_pay": 90.0})
+    payload["services"].append({"id": KA_SERVICE_ID, "cost": 90.0, "cost_to_pay": 90.0, "amount": 1})
     payload["seance_length"] = (60 + 120 + 60) * 60
 
     decision = classify(payload)
@@ -197,8 +202,8 @@ def test_the_same_service_twice_is_refused() -> None:
     """Two lines on one catalogue entry is a quantity question nobody answered."""
     payload = record(
         services=[
-            {"id": KA_SERVICE_ID, "cost": 90.0, "cost_to_pay": 90.0},
-            {"id": KA_SERVICE_ID, "cost": 90.0, "cost_to_pay": 90.0},
+            {"id": KA_SERVICE_ID, "cost": 90.0, "cost_to_pay": 90.0, "amount": 1},
+            {"id": KA_SERVICE_ID, "cost": 90.0, "cost_to_pay": 90.0, "amount": 1},
         ],
         seance_length=7200,
     )
@@ -784,3 +789,389 @@ def test_the_safe_shape_carries_no_service_names() -> None:
     # The operator-facing shape does carry them, which is what it is for.
     binding_obj = classify(cart_record()).bindings[0]
     assert "service_name" in binding_obj.as_operator_dict()
+
+
+# ---------------------------------------------------------------------------
+# Cancellation: the endpoint that actually exists (plan §30.12)
+# ---------------------------------------------------------------------------
+
+
+def booking_payload(*, canceled: bool = False) -> dict[str, Any]:
+    return {
+        "uuid": BOOKING_A,
+        "location_uuid": LOCATION_UUID,
+        "start_time": "2026-09-10T10:00:00Z",
+        "is_canceled": canceled,
+        "is_completed": False,
+    }
+
+
+class CancelRecorder:
+    """Records every request so the test can assert the real HTTP contract."""
+
+    def __init__(self, *, put_status: int = 200, canceled_before: bool = False, put_raises: Any = None) -> None:
+        self.put_status = put_status
+        self.canceled = canceled_before
+        self.put_raises = put_raises
+        self.requests: list[tuple[str, str, bytes]] = []
+
+    def __call__(self, request: Any) -> Any:
+        import httpx
+
+        self.requests.append((request.method, request.url.path, request.content))
+        if request.method == "GET":
+            return httpx.Response(200, json=booking_payload(canceled=self.canceled))
+        if self.put_raises is not None:
+            raise self.put_raises
+        if 200 <= self.put_status < 300:
+            self.canceled = True
+        return httpx.Response(self.put_status, json={})
+
+    @property
+    def puts(self) -> list[tuple[str, str, bytes]]:
+        return [item for item in self.requests if item[0] == "PUT"]
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_uses_the_proven_method_path_and_body() -> None:
+    """The old `POST .../set-booking-cancel` answered 404 on the real API."""
+    recorder = CancelRecorder()
+
+    async with cart_client(recorder) as client:
+        await client.cancel_booking(BOOKING_A)
+
+    assert len(recorder.puts) == 1
+    method, path, content = recorder.puts[0]
+    assert method == "PUT"
+    assert path.endswith(f"/bookings/{BOOKING_A}/status/cancel")
+    assert json.loads(content.decode()) == {
+        "cancel_reason": "other",
+        "internal_notes": "altegio migration rollback",
+    }
+
+
+@pytest.mark.asyncio
+async def test_no_request_ever_names_the_dead_endpoint() -> None:
+    recorder = CancelRecorder()
+
+    async with cart_client(recorder) as client:
+        await client.cancel_booking(BOOKING_A)
+
+    for _method, path, _content in recorder.requests:
+        assert "set-booking-cancel" not in path
+
+
+@pytest.mark.asyncio
+async def test_the_cancel_note_carries_no_personal_data() -> None:
+    recorder = CancelRecorder()
+
+    async with cart_client(recorder) as client:
+        await client.cancel_booking(BOOKING_A)
+
+    body = recorder.puts[0][2].decode()
+    for leaked in (CUSTOMER_PHONE, "Testkundin", "@"):
+        assert leaked not in body
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_is_proven_by_reading_the_booking_back() -> None:
+    """A 2xx is what the server says it did; the read is what it holds."""
+    recorder = CancelRecorder()
+
+    async with cart_client(recorder) as client:
+        await client.cancel_booking(BOOKING_A)
+
+    methods = [item[0] for item in recorder.requests]
+    assert methods.count("GET") == 2, "one before the mutation, one to prove it"
+    assert methods.index("PUT") == 1, "the pre-check runs first"
+
+
+@pytest.mark.asyncio
+async def test_a_2xx_the_booking_does_not_confirm_is_uncertain() -> None:
+    """Success reported, cancellation not visible. Manual review, not a rollback."""
+    import httpx
+
+    from altegio_bot.easyweek_migration.write_client import EasyWeekUncertainMutation
+
+    puts: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json=booking_payload(canceled=False))
+        puts.append(1)
+        return httpx.Response(200, json={})
+
+    async with cart_client(handler) as client:
+        with pytest.raises(EasyWeekUncertainMutation):
+            await client.cancel_booking(BOOKING_A)
+
+    assert len(puts) == 1, "and it is never repeated"
+
+
+@pytest.mark.asyncio
+async def test_an_already_cancelled_booking_issues_no_mutation() -> None:
+    """A rollback re-run must be idempotent without a second cancel."""
+    recorder = CancelRecorder(canceled_before=True)
+
+    async with cart_client(recorder) as client:
+        await client.cancel_booking(BOOKING_A)
+
+    assert recorder.puts == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [500, 502, 503])
+async def test_a_server_error_on_cancel_is_uncertain_and_never_repeated(status: int) -> None:
+    from altegio_bot.easyweek_migration.write_client import EasyWeekUncertainMutation
+
+    recorder = CancelRecorder(put_status=status)
+
+    async with cart_client(recorder) as client:
+        with pytest.raises(EasyWeekUncertainMutation):
+            await client.cancel_booking(BOOKING_A)
+
+    assert len(recorder.puts) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["timeout", "disconnect"])
+async def test_a_timeout_or_disconnect_on_cancel_never_repeats_the_put(kind: str) -> None:
+    import httpx
+
+    from altegio_bot.easyweek_migration.write_client import EasyWeekUncertainMutation
+
+    failure = httpx.TimeoutException("slow") if kind == "timeout" else httpx.ConnectError("gone")
+    recorder = CancelRecorder(put_raises=failure)
+
+    async with cart_client(recorder) as client:
+        with pytest.raises(EasyWeekUncertainMutation):
+            await client.cancel_booking(BOOKING_A)
+
+    assert len(recorder.puts) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        (401, "EasyWeekAuthError"),
+        (403, "EasyWeekAuthError"),
+        (404, "EasyWeekNotFoundError"),
+        (422, "EasyWeekPermanentError"),
+    ],
+)
+async def test_a_deterministic_refusal_is_permanent(status: int, expected: str) -> None:
+    from altegio_bot import easyweek_client
+
+    recorder = CancelRecorder(put_status=status)
+
+    async with cart_client(recorder) as client:
+        with pytest.raises(getattr(easyweek_client, expected)):
+            await client.cancel_booking(BOOKING_A)
+
+    assert len(recorder.puts) == 1
+
+
+# ---------------------------------------------------------------------------
+# Source quantity: one unit, and only one (plan §30.12)
+# ---------------------------------------------------------------------------
+
+
+def test_a_single_service_with_one_unit_is_ready() -> None:
+    assert classify(record()).outcome == READY
+
+
+def test_a_cart_of_two_single_unit_services_passes_the_quantity_check() -> None:
+    decision = classify(cart_record())
+
+    # Blocked on the contract, NOT on the quantity: both lines are one unit, so
+    # the quantity check let them through and the bindings carry the proof.
+    assert decision.reason == BLOCK_CONTRACT_UNSUPPORTED
+    assert [item.source_amount for item in decision.bindings] == [1, 1]
+
+
+@pytest.mark.parametrize(
+    "amount",
+    [2, 0, -1, 1.5, True, "1", None],
+    ids=["two", "zero", "negative", "fractional", "boolean", "string", "null"],
+)
+def test_any_amount_but_an_exact_one_is_blocked(amount: Any) -> None:
+    """Neither request shape carries a quantity, so two units cannot be sent.
+
+    `amount: 2` was the dangerous one: it classified as ready and would have
+    migrated as a single unit — half the length and half the price the customer
+    booked. `True` is here because `True == 1` in Python and a loose check would
+    read a boolean as a quantity.
+    """
+    payload = record()
+    payload["services"][0]["amount"] = amount
+
+    decision = classify(payload)
+
+    assert decision.outcome == BLOCKED
+    assert decision.reason == BLOCK_SERVICE_QUANTITY
+
+
+def test_a_missing_amount_is_blocked_rather_than_assumed() -> None:
+    """Silence is not evidence of one unit."""
+    payload = record()
+    payload["services"][0].pop("amount")
+
+    decision = classify(payload)
+
+    assert decision.outcome == BLOCKED
+    assert decision.reason == BLOCK_SERVICE_QUANTITY
+
+
+@pytest.mark.parametrize("index", [0, 1])
+def test_a_bad_amount_on_either_cart_service_is_blocked(index: int) -> None:
+    payload = cart_record()
+    payload["services"][index]["amount"] = 2
+
+    decision = classify(payload)
+
+    assert decision.outcome == BLOCKED
+    assert decision.reason == BLOCK_SERVICE_QUANTITY
+
+
+def test_a_blocked_quantity_never_reaches_a_binding_or_a_target() -> None:
+    """Blocked before the ledger claim, so no mutation is even possible."""
+    payload = record()
+    payload["services"][0]["amount"] = 2
+
+    decision = classify(payload)
+
+    assert decision.bindings == ()
+    assert decision.source_fingerprint is None
+    assert decision.target_booking_uuid is None
+
+
+def test_the_quantity_reason_carries_no_personal_data() -> None:
+    assert BLOCK_SERVICE_QUANTITY == "source_service_quantity_unsupported"
+    for leaked in ("phone", "@", "+49", CUSTOMER_PHONE):
+        assert leaked not in BLOCK_SERVICE_QUANTITY
+
+
+def test_the_quantity_is_inside_the_fingerprint() -> None:
+    """A source line that changed quantity after the dry-run must stop the plan."""
+    moved = list(PAIR)
+    moved[0] = binding(**{**PAIR[0].__dict__, "source_amount": 2})
+
+    assert fingerprint_of(bindings=tuple(moved)) != fingerprint_of()
+
+
+def test_the_quantity_is_reported_safely() -> None:
+    [service] = classify(record()).as_safe_dict()["services"]
+
+    assert service["source_amount"] == 1
+
+
+def test_a_hand_built_binding_with_a_bad_quantity_is_refused() -> None:
+    """Defence in depth behind the classifier's own named refusal."""
+    with pytest.raises(BindingError):
+        validate_bindings(MUTATION_SINGLE, (binding(source_amount=2),))
+
+
+def test_no_request_body_ever_carries_a_quantity() -> None:
+    """Sending one would claim a contract no canary proved."""
+    from altegio_bot.easyweek_migration.write_client import build_booking_request
+
+    single = build_booking_request(
+        location_uuid=LOCATION_UUID,
+        staffer_uuid=KA_STAFF_UUID,
+        service_uuid=KA_SERVICE_UUID,
+        customer_phone=CUSTOMER_PHONE,
+        customer_first_name="Testkundin",
+        reserved_on_utc_iso="2026-09-10T10:00:00Z",
+        comment="marker",
+    )
+
+    for body in (single, cart_body()):
+        blob = json.dumps(body)
+        for absent in ("amount", "quantity", "qty"):
+            assert absent not in blob, absent
+
+
+# ---------------------------------------------------------------------------
+# Validation diagnostics: contract-aware, and still PII-free
+# ---------------------------------------------------------------------------
+
+
+async def cart_refusal_message(errors: dict[str, Any]) -> str:
+    import httpx
+
+    from altegio_bot.easyweek_client import EasyWeekPermanentError
+
+    async with cart_client(lambda request: httpx.Response(422, json={"errors": errors})) as client:
+        with pytest.raises(EasyWeekPermanentError) as refused:
+            await client.create_cart_booking(cart_body())
+    return str(refused.value)
+
+
+@pytest.mark.asyncio
+async def test_a_cart_field_the_plain_contract_never_had_is_reported() -> None:
+    """`items` is a cart field; filtering it through the booking allowlist lost it."""
+    message = await cart_refusal_message({"items": ["at least one item is required"]})
+
+    assert "items" in message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "field",
+    ["items", "datetime_start", "services", "service_uuid", "staffer_uuid", "location_uuid", "timezone"],
+)
+async def test_every_cart_field_survives_the_filter(field: str) -> None:
+    message = await cart_refusal_message({field: ["invalid"]})
+
+    assert field in message
+
+
+@pytest.mark.asyncio
+async def test_a_nested_laravel_path_reports_its_known_fields() -> None:
+    """`items.0.services.1.service_uuid` names three fields and one index."""
+    message = await cart_refusal_message({"items.0.services.1.service_uuid": ["not found"]})
+
+    for named in ("items", "services", "service_uuid"):
+        assert named in message
+    assert "items.0" not in message, "the index is not a field an operator can act on"
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_key_is_dropped() -> None:
+    message = await cart_refusal_message({"internal_column_x": ["boom"]})
+
+    assert "internal_column_x" not in message
+    assert "fields:" not in message, "nothing recognised, so nothing claimed"
+
+
+@pytest.mark.asyncio
+async def test_a_message_and_a_submitted_value_never_survive() -> None:
+    message = await cart_refusal_message(
+        {
+            "customer_phone": [f"The phone {CUSTOMER_PHONE} belongs to Testkundin"],
+            f"customer.{CUSTOMER_PHONE}": ["nope"],
+        }
+    )
+
+    assert "customer_phone" in message, "the field NAME is actionable"
+    assert CUSTOMER_PHONE not in message
+    assert "Testkundin" not in message
+    assert "belongs to" not in message
+
+
+def test_the_plain_contract_keeps_its_own_allowlist() -> None:
+    """A cart-only field in a plain booking rejection is still not ours."""
+    import httpx
+
+    from altegio_bot.easyweek_migration.write_client import (
+        BOOKING_REQUEST_FIELDS,
+        CART_ERROR_FIELDS,
+        _safe_validation_fields,
+    )
+
+    response = httpx.Response(422, json={"errors": {"items": ["x"], "service_uuid": ["y"]}})
+
+    assert _safe_validation_fields(response) == ["service_uuid"], "plain contract"
+    assert _safe_validation_fields(response, allowed=CART_ERROR_FIELDS) == ["items", "service_uuid"]
+    assert "items" not in BOOKING_REQUEST_FIELDS

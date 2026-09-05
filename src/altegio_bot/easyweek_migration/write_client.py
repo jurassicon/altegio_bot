@@ -254,6 +254,18 @@ CART_ITEM_FIELDS: Final[frozenset[str]] = frozenset({"datetime_start", "services
 CART_SERVICE_FIELDS: Final[frozenset[str]] = frozenset({"service_uuid", "staffer_uuid"})
 
 _PATH_CART: Final = "cart"
+_PATH_STATUS: Final = "status"
+_PATH_CANCEL: Final = "cancel"
+
+# The exact cancel body a live canary was answered 2xx for. An allowlist, like
+# every other request shape here: `internal_notes` is a fixed technical string
+# and never carries a customer's name, phone, or anything read off the record —
+# it is written into somebody else's CRM and stays there.
+CANCEL_REQUEST_BODY: Final[dict[str, str]] = {
+    "cancel_reason": "other",
+    "internal_notes": "altegio migration rollback",
+}
+CANCEL_REQUEST_FIELDS: Final[frozenset[str]] = frozenset(CANCEL_REQUEST_BODY)
 
 
 def build_cart_booking_request(
@@ -367,16 +379,34 @@ def _cart_uuid_candidates(payload: object) -> list[str]:
     return found
 
 
-def _safe_validation_fields(response: httpx.Response) -> list[str]:
-    """Field NAMES a 422 complained about, filtered to ones we sent.
+# Every field name either proven request shape can legitimately be complained
+# about, including the ones only the cart body has. The allowlist is the whole
+# mechanism: a validation body is written by the server and can carry anything —
+# the submitted phone echoed back, a stack frame, an internal column name — so a
+# key survives only if this migration itself put it in a request.
+CART_ERROR_FIELDS: Final[frozenset[str]] = CART_REQUEST_FIELDS | CART_ITEM_FIELDS | CART_SERVICE_FIELDS
 
-    Deliberately narrow. A validation body is written by the server and can carry
-    anything — the submitted phone number echoed back, a stack frame, an internal
-    column name. So nothing is read out of it except keys, and a key survives only
-    if it is a field this migration itself put in the request.
 
-    A workspace that requires an undocumented Form Builder field therefore shows
-    up as "no recognised field named", which is the correct answer: we cannot fix
+def _safe_validation_fields(
+    response: httpx.Response,
+    *,
+    allowed: frozenset[str] = BOOKING_REQUEST_FIELDS,
+) -> list[str]:
+    """Field NAMES a 4xx complained about, filtered to ones we sent.
+
+    Contract-aware, because the two request shapes have different fields. The
+    plain booking allowlist knows nothing about ``items`` or ``datetime_start``,
+    so filtering a cart rejection through it discarded every useful name and
+    told the operator "no recognised field" for a body the server had named
+    precisely.
+
+    Laravel reports nested failures as dotted paths — ``items.0.services.1.
+    service_uuid``. The path is walked and every segment that is a known field
+    survives; numeric indices and anything unrecognised are dropped. So a
+    caller learns WHICH field, and never learns what value was in it.
+
+    A workspace that requires an undocumented Form Builder field still shows up
+    as "no recognised field named", which is the correct answer: we cannot fix
     it by guessing, and the runbook says to ask the operator.
     """
     try:
@@ -386,12 +416,21 @@ def _safe_validation_fields(response: httpx.Response) -> list[str]:
     if not isinstance(payload, dict):
         return []
 
-    candidates: set[str] = set()
+    keys: set[str] = set()
     # Laravel-shaped: {"errors": {"field": [...]}}, and the flat variant.
     for container in (payload.get("errors"), payload):
         if isinstance(container, dict):
-            candidates.update(key for key in container if isinstance(key, str))
-    return sorted(candidates & BOOKING_REQUEST_FIELDS)
+            keys.update(key for key in container if isinstance(key, str))
+
+    recognised: set[str] = set()
+    for key in keys:
+        # A dotted path names several fields; a plain key names one. Either way
+        # only the segments in the allowlist survive, and the ORDER is dropped —
+        # what an operator needs is which fields, not the index that failed.
+        for segment in key.split("."):
+            if segment in allowed:
+                recognised.add(segment)
+    return sorted(recognised)
 
 
 class EasyWeekMigrationWriteClient:
@@ -703,7 +742,7 @@ class EasyWeekMigrationWriteClient:
             # including the conflict a taken slot produces, which is how an
             # unavailable source time reaches the operator as a named refusal
             # rather than as a guess (plan §30.12.3).
-            fields = _safe_validation_fields(response)
+            fields = _safe_validation_fields(response, allowed=CART_ERROR_FIELDS)
             detail = f"; fields: {', '.join(fields)}" if fields else ""
             raise EasyWeekPermanentError(
                 f"cart mutation rejected{detail}",
@@ -988,19 +1027,48 @@ class EasyWeekMigrationWriteClient:
         raise EasyWeekPermanentError("permanent client error", operation="create_customer", status_code=status)
 
     async def cancel_booking(self, booking_uuid: str) -> None:
-        """Cancel one booking. Reached ONLY by a confirmed rollback.
+        """Cancel one booking, and PROVE it. Reached ONLY by a confirmed rollback.
 
-        Uses the plan's documented ``set-booking-cancel`` action (§1.1). Like
-        ``create_booking``, an unknown outcome is raised as uncertain rather than
-        retried: a cancel that may or may not have landed must be looked at, not
-        repeated.
+        The endpoint is ``PUT /bookings/{uuid}/status/cancel``, which a live
+        canary exercised successfully. The previous one — ``POST
+        /bookings/{uuid}/set-booking-cancel``, taken from the plan's early
+        endpoint list — answered **404** against the real API. A rollback built
+        on it could never have cancelled anything: it would have raised
+        not-found for every booking and left the operator with a run that
+        reported failures for appointments that were still live.
+
+        Three properties, in order:
+
+        **Already cancelled is not cancelled again.** A ``GET`` runs first. If
+        the booking is already ``is_canceled``, this returns without issuing a
+        mutation at all — a rollback re-run must be idempotent, and a second
+        cancel on a cancelled booking is a request whose outcome nobody has
+        proven.
+
+        **An unknown outcome is never repeated.** A timeout, a transport failure
+        and every 5xx leave it genuinely unknown whether the cancel landed, and
+        EasyWeek publishes no idempotency key that would make a second PUT safe.
+        They raise :class:`EasyWeekUncertainMutation`; a 401/403 and every
+        deterministic 4xx are permanent refusals, because nothing was changed.
+
+        **A 2xx is not proof.** After a successful status change the booking is
+        read back and ``is_canceled`` has to be true. A 2xx we cannot confirm is
+        reported as uncertain and sent to manual review rather than recorded as
+        a rollback — the ledger's ``rolled_back`` is a claim about a real
+        appointment, and it must not rest on a status code alone.
         """
         canonical = _canonical_booking_uuid(booking_uuid)
-        url = "/".join([self._base_url, _PATH_BOOKINGS, canonical, "set-booking-cancel"])
+
+        # 1. Is it already cancelled? Proven by a read, before any mutation.
+        if await self._booking_is_canceled(canonical):
+            logger.info("easyweek_migration: cancel_booking already canceled — no mutation issued")
+            return
+
+        url = "/".join([self._base_url, _PATH_BOOKINGS, canonical, _PATH_STATUS, _PATH_CANCEL])
 
         await self._limiter.acquire()
         try:
-            response = await self._client.post(url, headers=self._headers(), json={})
+            response = await self._client.put(url, headers=self._headers(), json=dict(CANCEL_REQUEST_BODY))
         except httpx.TimeoutException:
             raise EasyWeekUncertainMutation("cancel timed out; outcome unknown", operation="cancel_booking") from None
         except httpx.HTTPError:
@@ -1010,14 +1078,48 @@ class EasyWeekMigrationWriteClient:
 
         status = response.status_code
         logger.info("easyweek_migration: cancel_booking status=%s", status)
-        if 200 <= status < 300:
-            return
+
+        if 500 <= status < 600:
+            # NOT retryable. A 5xx does not prove the cancel did not land, and a
+            # second PUT against a booking that may already be cancelled is a
+            # mutation with an unproven outcome.
+            raise EasyWeekUncertainMutation(
+                "cancel server error; outcome unknown", operation="cancel_booking", status_code=status
+            )
+        if status == 429:
+            # Refused before the handler ran, so nothing changed. The caller
+            # decides whether to come back; this method does not loop.
+            raise EasyWeekRetryableError("rate limited", operation="cancel_booking", status_code=status)
         if status in (401, 403):
             raise EasyWeekAuthError(
                 "authentication or authorization failed", operation="cancel_booking", status_code=status
             )
         if status == 404:
             raise EasyWeekNotFoundError("resource not found", operation="cancel_booking", status_code=status)
-        if status == 429 or 500 <= status < 600:
-            raise EasyWeekRetryableError("retryable cancel status", operation="cancel_booking", status_code=status)
-        raise EasyWeekPermanentError("permanent client error", operation="cancel_booking", status_code=status)
+        if not (200 <= status < 300):
+            raise EasyWeekPermanentError("permanent client error", operation="cancel_booking", status_code=status)
+
+        # 2. The status code said yes; the workspace has to agree.
+        if not await self._booking_is_canceled(canonical):
+            raise EasyWeekUncertainMutation(
+                "cancel returned success but the booking does not read as canceled",
+                operation="cancel_booking",
+                status_code=status,
+            )
+
+    async def _booking_is_canceled(self, canonical_uuid: str) -> bool:
+        """Read one booking and answer whether it is cancelled, or raise.
+
+        ``is_canceled`` is read strictly: anything that is not a literal boolean
+        is a shape we have not proven, and reading it loosely here would let an
+        unparseable field pass as "already cancelled" and skip the mutation
+        entirely.
+        """
+        payload = await self.get_booking(canonical_uuid)
+        body = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+        if not isinstance(body, dict):
+            raise EasyWeekProtocolError("booking response is not an object", operation="cancel_booking")
+        flag = body.get("is_canceled")
+        if not isinstance(flag, bool):
+            raise EasyWeekProtocolError("booking is_canceled is not a boolean", operation="cancel_booking")
+        return flag

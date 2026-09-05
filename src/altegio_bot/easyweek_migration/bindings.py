@@ -42,6 +42,24 @@ MUTATION_KINDS: Final[frozenset[str]] = frozenset({MUTATION_SINGLE, MUTATION_CAR
 # kind's count is not a booking this migration knows how to write.
 SERVICES_PER_KIND: Final[dict[str, int]] = {MUTATION_SINGLE: 1, MUTATION_CART_TWO: 2}
 
+# Units of one service on one booking. Exactly one, and only one, has ever been
+# proven: neither `POST /bookings` nor `POST /bookings/cart` carries a quantity
+# field, so there is no way to express two of the same service — and sending the
+# line once would migrate half of what the customer booked.
+PROVEN_SERVICE_AMOUNT: Final = 1
+
+# The contracts this build can write END TO END — request, readback,
+# reconciliation and rollback. Not "what the API supports": `cart_two` has a
+# proven endpoint, a proven body and a tested writer, and it is still absent
+# here because `TargetSnapshot` projects ONE service, so a two-line booking
+# cannot be proven after creation.
+#
+# It lives in the domain rather than in the runner because the CLASSIFIER reads
+# it: a contract with no complete path must be refused while a plan is being
+# built, so a dry-run and an apply say the same thing. Deciding it later would
+# let a booking read as `ready` in the review and block during the write.
+SUPPORTED_MUTATION_KINDS: Final[frozenset[str]] = frozenset({MUTATION_SINGLE})
+
 
 class BindingError(ValueError):
     """A question asked of the wrong shape. Never a reason to guess an answer."""
@@ -71,6 +89,12 @@ class ServiceBinding:
     # thing the cart canary proved is a single staffer across both lines, which
     # is a fact worth being able to check rather than to assume.
     staffer_uuid: str
+    # How many units of this service the SOURCE booking carries. Always 1 here,
+    # because 1 is the only value any canary has proven: neither request body
+    # has a quantity field, so a source line saying `amount: 2` would migrate as
+    # one unit and silently halve what the customer booked. Recorded rather than
+    # assumed so it reaches the fingerprint and the report.
+    source_amount: int = 1
 
     def digest_material(self) -> tuple[str, ...]:
         """The parts a fingerprint or a plan digest folds in, in fixed order."""
@@ -82,6 +106,7 @@ class ServiceBinding:
             str(self.catalog_price_minor),
             str(self.catalog_duration_minutes),
             self.staffer_uuid,
+            str(self.source_amount),
         )
 
     def as_safe_dict(self) -> dict[str, Any]:
@@ -93,6 +118,7 @@ class ServiceBinding:
             "catalog_price_minor_units": self.catalog_price_minor,
             "catalog_duration_minutes": self.catalog_duration_minutes,
             "easyweek_staffer_uuid": self.staffer_uuid,
+            "source_amount": self.source_amount,
         }
 
     def as_operator_dict(self) -> dict[str, Any]:
@@ -114,6 +140,12 @@ def validate_bindings(kind: str, bindings: tuple[ServiceBinding, ...]) -> None:
     expected = SERVICES_PER_KIND[kind]
     if len(bindings) != expected:
         raise BindingError(f"{kind} needs exactly {expected} service(s), got {len(bindings)}")
+
+    for item in bindings:
+        if item.source_amount != PROVEN_SERVICE_AMOUNT:
+            # Defence in depth: the classifier refuses this first, with its own
+            # named reason. Reaching here means a binding was hand-built.
+            raise BindingError("only one unit per service is proven")
 
     if kind == MUTATION_CART_TWO:
         if bindings[0].easyweek_service_uuid == bindings[1].easyweek_service_uuid:

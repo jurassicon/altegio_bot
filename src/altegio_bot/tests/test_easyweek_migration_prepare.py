@@ -143,7 +143,7 @@ def source_record(
         "staff_id": KA_STAFF_ID,
         "seance_length": 3600,
         "client": client if client is not None else {"phone": phone, "first_name": "Testkundin", "id": 42},
-        "services": [{"id": service_id, "title": service_name, "cost": 90.0, "cost_to_pay": 90.0}],
+        "services": [{"id": service_id, "title": service_name, "cost": 90.0, "cost_to_pay": 90.0, "amount": 1}],
     }
 
 

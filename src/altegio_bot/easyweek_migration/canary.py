@@ -184,11 +184,16 @@ class CanaryVerdict:
     source_record_id: int | None = None
     target_booking_uuid: str | None = None
     verified_at: str | None = None
+    # Which mutation contract this verdict is about. A verdict never speaks for
+    # a contract it did not look up: the caller asks once per contract it means
+    # to execute, and each answer carries the question back with it.
+    contract_kind: str = MUTATION_SINGLE
 
     def as_safe_dict(self) -> dict[str, Any]:
         return {
             "licensed": self.licensed,
             "reason": self.reason,
+            "contract_kind": self.contract_kind,
             "source_company_id": self.source_company_id,
             "source_record_id": self.source_record_id,
             "target_booking_uuid": self.target_booking_uuid,
@@ -340,6 +345,9 @@ SCOPE_SCHEMA_MISMATCH: Final = "migration_scope_schema_mismatch"
 # endpoint, different body, different readback, so it proves nothing here.
 SCOPE_CONTRACT_MISMATCH: Final = "migration_scope_contract_mismatch"
 SCOPE_PROVEN: Final = "migration_scope_proven"
+# A scope check was asked to prove an empty set of contracts. Nothing to prove
+# is not the same as proven, and this says so under its own name.
+SCOPE_CONTRACTS_UNKNOWN: Final = "migration_scope_contracts_unknown"
 
 # The one narrow admission that lets an UNVERIFIED proof be used — and only
 # to recover the very row it belongs to. See `find_recoverable_canary_attempt`.
@@ -356,12 +364,15 @@ class ScopeVerdict:
     proven: bool
     reason: str
     wave_identity: str | None = None
+    # The contract this verdict was asked about; see `CanaryVerdict.contract_kind`.
+    contract_kind: str = MUTATION_SINGLE
 
     def as_safe_dict(self) -> dict[str, Any]:
         return {
             "scope_proven": self.proven,
             "scope_reason": self.reason,
             "wave_identity": self.wave_identity,
+            "contract_kind": self.contract_kind,
         }
 
 

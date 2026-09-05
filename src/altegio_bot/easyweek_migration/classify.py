@@ -33,6 +33,8 @@ from altegio_bot.easyweek_migration.altegio_source import ACTIVE_ATTENDANCE
 from altegio_bot.easyweek_migration.bindings import (
     MUTATION_CART_TWO,
     MUTATION_SINGLE,
+    PROVEN_SERVICE_AMOUNT,
+    SUPPORTED_MUTATION_KINDS,
     BindingError,
     ServiceBinding,
     total_duration_minutes,
@@ -96,6 +98,14 @@ BLOCK_MULTI_SERVICE: Final = "multi_service_unsupported"
 # A two-service booking whose shape the cart canary did not prove: the same
 # service twice, two different masters, or two currencies.
 BLOCK_CART_UNSUPPORTED: Final = "cart_shape_unsupported"
+# The source line books more (or fewer, or an unreadable number) than one unit
+# of its service. No request shape this migration can send carries a quantity,
+# so anything but an exact integer 1 is a booking it cannot express.
+BLOCK_SERVICE_QUANTITY: Final = "source_service_quantity_unsupported"
+# The booking's shape maps to a mutation contract this build cannot yet write
+# end to end. Named separately from every data problem: nothing is wrong with
+# the booking, and no operator action on the source will change it.
+BLOCK_CONTRACT_UNSUPPORTED: Final = "mutation_contract_unsupported"
 
 # The widest booking this migration can write. Two, and only because a real
 # canary created one and read it back (plan §30.12); three has no evidence.
@@ -234,6 +244,21 @@ def _prove_service(
     if service_id is None or service_id <= 0:
         return BLOCK_SERVICE_ID_INVALID
 
+    # How many units of this service the booking carries.
+    #
+    # Neither request body has a quantity field — not `POST /bookings`, not the
+    # proven cart shape — so the only amount this migration can express is one.
+    # A source line saying `amount: 2` would be sent once and migrate half of
+    # what the customer booked, at half the price and half the length.
+    #
+    # Strict `int` on purpose: `True` is not a quantity even though `True == 1`,
+    # `"1"` is a string somebody typed, `1.0` is a float whose companions are
+    # `1.5`, and a MISSING field is not evidence of one either. Each of them
+    # blocks with the same named reason rather than being coerced.
+    amount = service.get("amount")
+    if type(amount) is not int or amount != PROVEN_SERVICE_AMOUNT:
+        return BLOCK_SERVICE_QUANTITY
+
     # Mapping first: price and duration are checked against a baseline an
     # operator wrote down and verified. Without the mapping there is no
     # baseline, so the override checks below would have nothing to compare
@@ -318,6 +343,7 @@ def _prove_service(
         catalog_price_minor=price_minor,
         catalog_duration_minutes=catalog_duration.minutes,
         staffer_uuid=staff_uuid,
+        source_amount=amount,
     )
 
 
@@ -666,9 +692,25 @@ def classify_record(
         # `blocked` / `failed` ledger rows carry no target, so the row is simply
         # re-evaluated from scratch and may become ready once the cause is fixed.
 
+    # -- 8. can this build actually WRITE this contract? -------------------
+    # Last, and deliberately so. Everything above has been proven: the shape,
+    # the mapping, the prices, the durations, the customer. What is missing is
+    # nothing about this booking — it is a complete write path for its contract.
+    #
+    # Refused HERE rather than at apply time so a dry-run and an apply say the
+    # same thing about the same booking. A row that reviewed as `ready` and then
+    # blocked mid-write would be a surprise at the worst possible moment, and
+    # the operator would have approved a plan the tool never meant to execute.
+    #
+    # The decision still carries its full shape — kind, bindings, fingerprint —
+    # so the candidate remains visible in the report. Visible is not migratable:
+    # the outcome is `blocked`, so no gate, no ledger claim and no POST can ever
+    # reach it while the write path is missing.
+    contract_ready = kind in SUPPORTED_MUTATION_KINDS
+
     return Decision(
-        outcome=READY,
-        reason=None,
+        outcome=READY if contract_ready else BLOCKED,
+        reason=None if contract_ready else BLOCK_CONTRACT_UNSUPPORTED,
         source_company_id=company_id,
         source_record_id=record_id,
         starts_at_utc=starts_at,

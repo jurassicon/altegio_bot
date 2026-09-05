@@ -155,7 +155,10 @@ def record(**overrides):
         "staff_id": KA_STAFF_ID,
         "seance_length": 3600,
         "client": {"phone": CUSTOMER_PHONE},
-        "services": [{"id": KA_SERVICE_ID, "cost": 90.0, "cost_to_pay": 90.0}],
+        # `amount` is what a real Altegio service line carries, and the
+        # classifier requires an exact 1 — the only quantity either request
+        # shape can express (plan §30.12).
+        "services": [{"id": KA_SERVICE_ID, "cost": 90.0, "cost_to_pay": 90.0, "amount": 1}],
     }
     base.update(overrides)
     return base
@@ -325,7 +328,7 @@ def test_karlsruhe_and_rastatt_are_provider_and_branch_scoped(manifest, director
     """A Rastatt booking must never resolve through Karlsruhe's mapping."""
     ka = classify(record(), manifest=manifest, directory=directory, cutover=cutover)
     ra = classify(
-        record(staff_id=RA_STAFF_ID, services=[{"id": RA_SERVICE_ID, "cost": 90.0, "cost_to_pay": 90.0}]),
+        record(staff_id=RA_STAFF_ID, services=[{"id": RA_SERVICE_ID, "cost": 90.0, "cost_to_pay": 90.0, "amount": 1}]),
         manifest=manifest,
         directory=directory,
         cutover=cutover,
@@ -337,7 +340,7 @@ def test_karlsruhe_and_rastatt_are_provider_and_branch_scoped(manifest, director
     # Karlsruhe's staff id in a Rastatt booking is in neither of Rastatt's wave
     # lists, so it is an unknown master there — not a missing mapping.
     crossed = classify(
-        record(services=[{"id": RA_SERVICE_ID, "cost": 90.0, "cost_to_pay": 90.0}]),
+        record(services=[{"id": RA_SERVICE_ID, "cost": 90.0, "cost_to_pay": 90.0, "amount": 1}]),
         manifest=manifest,
         directory=directory,
         cutover=cutover,
@@ -403,7 +406,7 @@ def test_an_unlisted_master_blocks_that_row_only(manifest, directory, cutover):
 
 def test_a_missing_service_mapping_blocks(manifest, directory, cutover):
     decision = classify(
-        record(services=[{"id": 424242, "cost": 90.0, "cost_to_pay": 90.0}]),
+        record(services=[{"id": 424242, "cost": 90.0, "cost_to_pay": 90.0, "amount": 1}]),
         manifest=manifest,
         directory=directory,
         cutover=cutover,
@@ -429,9 +432,9 @@ def test_a_three_service_booking_is_blocked_not_flattened(manifest, directory, c
     decision = classify(
         record(
             services=[
-                {"id": KA_SERVICE_ID, "cost": 90.0, "cost_to_pay": 90.0},
-                {"id": KA_SERVICE_ID, "cost": 90.0, "cost_to_pay": 90.0},
-                {"id": KA_SERVICE_ID, "cost": 90.0, "cost_to_pay": 90.0},
+                {"id": KA_SERVICE_ID, "cost": 90.0, "cost_to_pay": 90.0, "amount": 1},
+                {"id": KA_SERVICE_ID, "cost": 90.0, "cost_to_pay": 90.0, "amount": 1},
+                {"id": KA_SERVICE_ID, "cost": 90.0, "cost_to_pay": 90.0, "amount": 1},
             ],
             seance_length=10800,
         ),
@@ -448,8 +451,8 @@ def test_a_two_service_booking_with_a_custom_price_is_still_blocked(manifest, di
     decision = classify(
         record(
             services=[
-                {"id": KA_SERVICE_ID, "cost": 90.0, "cost_to_pay": 90.0},
-                {"id": KA_SERVICE_ID, "cost": 30.0, "cost_to_pay": 30.0},
+                {"id": KA_SERVICE_ID, "cost": 90.0, "cost_to_pay": 90.0, "amount": 1},
+                {"id": KA_SERVICE_ID, "cost": 30.0, "cost_to_pay": 30.0, "amount": 1},
             ],
             seance_length=7200,
         ),
@@ -463,7 +466,7 @@ def test_a_two_service_booking_with_a_custom_price_is_still_blocked(manifest, di
 
 def test_a_custom_price_is_blocked_not_replaced_by_the_catalogue_price(manifest, directory, cutover):
     decision = classify(
-        record(services=[{"id": KA_SERVICE_ID, "cost": 90.0, "cost_to_pay": 70.0}]),
+        record(services=[{"id": KA_SERVICE_ID, "cost": 90.0, "cost_to_pay": 70.0, "amount": 1}]),
         manifest=manifest,
         directory=directory,
         cutover=cutover,
@@ -474,7 +477,7 @@ def test_a_custom_price_is_blocked_not_replaced_by_the_catalogue_price(manifest,
 
 def test_a_discount_counts_as_a_custom_price(manifest, directory, cutover):
     decision = classify(
-        record(services=[{"id": KA_SERVICE_ID, "cost": 90.0, "cost_to_pay": 90.0, "discount": 10}]),
+        record(services=[{"id": KA_SERVICE_ID, "cost": 90.0, "cost_to_pay": 90.0, "discount": 10, "amount": 1}]),
         manifest=manifest,
         directory=directory,
         cutover=cutover,
@@ -487,7 +490,7 @@ def test_a_hand_stretched_slot_is_blocked_not_rounded(manifest, directory, cutov
     decision = classify(
         record(
             seance_length=5400,
-            services=[{"id": KA_SERVICE_ID, "cost": 90.0, "cost_to_pay": 90.0, "seance_length": 3600}],
+            services=[{"id": KA_SERVICE_ID, "cost": 90.0, "cost_to_pay": 90.0, "seance_length": 3600, "amount": 1}],
         ),
         manifest=manifest,
         directory=directory,
