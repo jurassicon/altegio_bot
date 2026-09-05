@@ -337,8 +337,9 @@ verify отказываются ещё и по имени пути (`.invalidate
 `.old`) — до открытия write-сессии.
 
 Инвалидация выполняется **до разбора аргументов**, поэтому команда plan с
-ошибкой аргументов (пропущенный `--run-id`, нечисловой `--company-id`,
-неизвестный флаг) тоже не оставляет старое разрешение применимым. Режим и путь
+ошибкой аргументов (пропущенный `--run-id`, отсутствующее значение опции,
+нечисловой `--company-id`, неизвестный флаг или неизвестная опция со значением)
+тоже не оставляет старое разрешение применимым. Режим и путь
 snapshot определяются отдельным минимальным argparse-препарсером, который знает
 арность опций: значение опции больше не принимается за mode, а `--run-id plan`
 в команде apply/verify не инвалидирует снимок. `--help` попыткой plan не
@@ -482,6 +483,13 @@ cd /opt/altegio_bot
 dc() { docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml "$@"; }
 dc --profile ops run --rm --no-deps -T easyweek-migration-prepare-handover verify --manifest /migration/input/manifest.json --company-id 758285 --run-id MIGRATION_RUN_ID --snapshot /migration/state/reminder_handover.v4.json --apply-report /migration/state/reminder_handover.apply-report.v2.json
 ```
+
+PASS требует не только ownership markers каждой созданной ledger-строки, но и
+durable closure каждой заявленной пары company/run. Проверить в JSON-отчёте:
+`wave_closures_expected == wave_closures_verified`,
+`wave_closures_missing == []` и
+`wave_closures_with_foreign_digest == []`. Это отдельная гарантия для пустых и
+`failed`-only пар, у которых нет строки `status=created`, способной нести marker.
 
 Повторный apply того же snapshot — отдельная проверка идемпотентности. Используем
 другой файл отчёта, чтобы не уничтожить evidence первого apply; результат обязан

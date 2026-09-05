@@ -1010,6 +1010,10 @@ async def test_verify_passes_after_a_clean_apply(session_maker, seeded) -> None:
     assert report["passed"] is True
     assert report["open_altegio_reminders"] == []
     assert report["unmet_obligations"] == 0
+    expected_closures = len(frozen.company_ids) * len(frozen.wave["run_ids"])
+    assert report["wave_closures_expected"] == report["wave_closures_verified"] == expected_closures
+    assert report["wave_closures_missing"] == []
+    assert report["wave_closures_with_foreign_digest"] == []
 
 
 @pytest.mark.asyncio

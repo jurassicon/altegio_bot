@@ -84,10 +84,20 @@ lock проверка отвечала «нет», и поздний retry с э
 
 Отказ живёт внутри `claim_for_apply` и `resolve_uncertain_as_created`
 (исключение `WaveClosed`), а не только в вызывающем коде: это последняя точка
-перед созданием реальной записи. `resolve-created` в закрытой волне оставляет
-строку `uncertain` — бронирование остаётся зафиксированным и видимым
-reconciliation, но требует оператора. `record_created` не отказывает никогда:
-запись к тому моменту уже создана в EasyWeek, и скрывать её нельзя.
+перед созданием реальной записи. Guarded promotion сам выводит origin wave из
+неизменяемого `ledger.run_id`; `run_id` текущего `resolve-created` или
+`reconcile` остаётся только аудитом в `last_resolution_run_id`. Поэтому оба
+production recovery-пути в закрытой origin-волне оставляют строку `uncertain` —
+бронирование остаётся зафиксированным и видимым reconciliation, но требует
+оператора. `record_created` не отказывает в обычном apply: запись к тому моменту
+уже создана в EasyWeek, и скрывать её нельзя.
+
+`verify` независимо читает closure-таблицу и требует строку с digest текущего
+snapshot для каждой пары company/run. В отчёте это
+`wave_closures_expected`, `wave_closures_verified`,
+`wave_closures_missing` и `wave_closures_with_foreign_digest`. Это обязательно
+в том числе для пустой/`failed`-only пары, у которой по определению нет
+row-level marker; отсутствующая или чужая closure делает `passed=false`.
 
 Волна с нерешёнными строками (`pending`, `uncertain`) к handover не допускается:
 такая строка может стать `created` уже после закрытия волны, а отказать ей
@@ -96,7 +106,8 @@ reconciliation, но требует оператора. `record_created` не о
 же самое сообщает **plan**: `pending`/`uncertain` в точном scope дают
 `cutover_ready=false`, `wave_blockers=["migration_wave_unresolved"]` и ненулевой
 exit code, а CLI не печатает команду apply. Snapshot при этом сохраняется как
-диагностический read-only артефакт и мутацию не разрешает. Транзакционная
+диагностический read-only артефакт: strict reader читает и сохраняет его false
+readiness, а отдельный usability gate не разрешает мутацию. Транзакционная
 проверка под lock остаётся: plan не заменяет её. `failed` блокером не является —
 его безопасность обеспечивает durable closure, `rolled_back` и прочие статусы
 блокерами не считаются.

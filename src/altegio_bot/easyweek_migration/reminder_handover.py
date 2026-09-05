@@ -1096,7 +1096,7 @@ def read_snapshot(path: str | Path) -> FrozenPlan:
     _exact_keys(readiness, {"guard_ready", "coverage_ready", "cutover_ready"}, "readiness")
     if not all(type(readiness[key]) is bool for key in readiness):
         raise SnapshotError("readiness contains a non-boolean value")
-    expected_readiness = _readiness(rows, refusals, eligible_count)
+    expected_readiness = _readiness(rows, refusals, eligible_count, historical)
     if wave["candidate_set_changed"]:
         expected_readiness = dict.fromkeys(expected_readiness, False)
     if readiness != expected_readiness:
@@ -1349,6 +1349,7 @@ def _readiness(
     rows: tuple[dict[str, Any], ...],
     refusals: tuple[dict[str, Any], ...],
     eligible_count: int,
+    historical_rows: dict[str, int],
 ) -> dict[str, bool]:
     obligations = [item for row in rows for item in row["obligations"]]
     blocked_outcomes = {
@@ -1358,7 +1359,8 @@ def _readiness(
     }
     blocker = any(item["outcome"] in blocked_outcomes for item in obligations)
     processing = any(row["processing_source_job_ids"] for row in rows)
-    guard = not blocker and not refusals
+    unresolved = any(historical_rows.get(status, 0) for status in UNRESOLVED_LEDGER_STATUSES)
+    guard = not blocker and not refusals and not unresolved
     return {
         "guard_ready": guard,
         "coverage_ready": guard and not any(item["outcome"] == OBLIGATION_MISSING for item in obligations),

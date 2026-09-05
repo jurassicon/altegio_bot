@@ -278,6 +278,29 @@ async def test_a_full_match_promotes_the_row_and_stores_the_fingerprint(session_
     assert resolved.target_snapshot_fingerprint
 
 
+async def test_reconcile_cannot_promote_a_row_into_its_closed_origin_wave(session_local, source):
+    """The reconcile run id is audit metadata, never the wave to guard."""
+    transport = RecordingTransport()
+    origin_run = await uncertain_row_with_known_target(session_local, source, transport)
+    reconcile_inputs = make_inputs(MODE_RECONCILE)
+    assert reconcile_inputs.run_id != origin_run
+    async with session_local() as session:
+        async with session.begin():
+            assert await ledger_module.close_migration_wave(
+                session,
+                source_company_id=KARLSRUHE_COMPANY_ID,
+                run_id=origin_run,
+                plan_digest="a" * 64,
+            )
+
+    async with make_write_client(transport) as client:
+        report = await run_reconcile(session_local, reconcile_inputs, write_client=client)
+
+    rows = {row.source_record_id: row for row in await ledger_rows(session_local)}
+    assert rows[KA_RECORD_B].status == "uncertain"
+    assert report.as_safe_dict()["reason_codes"][ledger_module.WAVE_CLOSED] == 1
+
+
 async def test_an_unreadable_target_leaves_the_row_uncertain(session_local, source):
     transport = RecordingTransport()
     await uncertain_row_with_known_target(session_local, source, transport)
@@ -312,17 +335,17 @@ async def test_reconcile_without_a_customer_directory_cannot_promote(session_loc
 # ---------------------------------------------------------------------------
 
 
-async def uncertain_without_target(session_local, source, transport) -> None:
+async def uncertain_without_target(session_local, source, transport) -> str:
     """The ordinary timeout shape: uncertain, and no target UUID recorded."""
     timeout = httpx.ReadTimeout("timed out", request=httpx.Request("POST", "https://my.easyweek.io/"))
     await license_bulk(session_local, transport)
     transport.fail_with = {KA_RECORD_B: timeout}
     plan = await run_dry_run(session_local)
+    inputs = make_inputs(MODE_APPLY, verified_dry_run_id=plan.plan_digest)
     async with make_write_client(transport) as client:
-        await run_apply(
-            session_local, make_inputs(MODE_APPLY, verified_dry_run_id=plan.plan_digest), write_client=client
-        )
+        await run_apply(session_local, inputs, write_client=client)
     transport.fail_with = {}
+    return inputs.run_id
 
 
 def resolve_inputs(**overrides):
@@ -347,6 +370,29 @@ async def test_a_correct_target_is_fully_confirmed(session_local, source):
     rows = {row.source_record_id: row for row in await ledger_rows(session_local)}
     assert rows[KA_RECORD_B].status == "created"
     assert rows[KA_RECORD_B].target_snapshot_fingerprint
+
+
+async def test_resolve_created_checks_the_closed_origin_not_the_resolution_run(session_local, source):
+    transport = RecordingTransport()
+    origin_run = await uncertain_without_target(session_local, source, transport)
+    transport.plant_booking(CREATED_UUIDS[KA_RECORD_B], record_id=KA_RECORD_B)
+    inputs = resolve_inputs()
+    assert inputs.run_id != origin_run
+    async with session_local() as session:
+        async with session.begin():
+            assert await ledger_module.close_migration_wave(
+                session,
+                source_company_id=KARLSRUHE_COMPANY_ID,
+                run_id=origin_run,
+                plan_digest="a" * 64,
+            )
+
+    async with make_write_client(transport) as client:
+        report = await run_resolve_created(session_local, inputs, write_client=client)
+
+    rows = {row.source_record_id: row for row in await ledger_rows(session_local)}
+    assert rows[KA_RECORD_B].status == "uncertain"
+    assert report.errors == [ledger_module.WAVE_CLOSED]
 
 
 @pytest.mark.parametrize("label,mutate", TARGET_MUTATIONS, ids=MUTATION_IDS)

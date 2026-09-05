@@ -14,6 +14,7 @@ from sqlalchemy.exc import DBAPIError
 from altegio_bot.easyweek_migration import reminder_handover_db as db
 from altegio_bot.easyweek_migration.reminder_handover import (
     SnapshotError,
+    check_snapshot_usable,
     confirmation_phrase,
     freeze_plan,
     invalidate_snapshot,
@@ -912,6 +913,18 @@ def _is_destroyed(path: Path) -> bool:
         ),
         pytest.param(["--company-id", "758285"], id="default-plan-missing-required"),
         pytest.param(["plan", "--company-id", "758285", "--unknown-flag"], id="unknown-argument"),
+        pytest.param(
+            ["plan", "--run-id", "run-1", "--company-id"],
+            id="explicit-plan-missing-option-value",
+        ),
+        pytest.param(
+            ["--run-id", "run-1", "--company-id"],
+            id="default-plan-missing-option-value",
+        ),
+        pytest.param(
+            ["--unknown-option", "future-value"],
+            id="default-plan-unknown-option-with-value",
+        ),
     ],
 )
 def test_a_plan_attempt_destroys_the_old_permission_however_it_fails(tmp_path, argv):
@@ -929,6 +942,17 @@ def test_a_plan_attempt_destroys_the_old_permission_however_it_fails(tmp_path, a
 
     assert exited.value.code == 2, "argparse still refuses the command"
     assert _is_destroyed(snapshot)
+
+
+def test_a_malformed_apply_never_invalidates_the_snapshot(tmp_path):
+    """Recovery from a pre-parse error must not turn apply into plan."""
+    snapshot = _applicable_snapshot(tmp_path / "plan.json")
+
+    with pytest.raises(SystemExit) as exited:
+        cli.main(["apply", "--run-id", "run-1", "--company-id", "--snapshot", str(snapshot)])
+
+    assert exited.value.code == 2
+    assert read_snapshot(snapshot).digest
 
 
 def test_options_before_an_explicit_plan_still_name_the_right_snapshot(tmp_path):
@@ -1031,7 +1055,7 @@ async def _add_ledger_row(session_maker, *, status: str, source_record_id: int, 
 
 
 @pytest.mark.parametrize("status", ["pending", "uncertain"])
-async def test_an_unresolved_row_makes_the_plan_refuse_the_cutover(session_maker, seeded, status):
+async def test_an_unresolved_row_makes_the_plan_refuse_the_cutover(session_maker, seeded, status, tmp_path):
     """The plan used to authorise a cutover the apply was certain to refuse.
 
     One fully proven `created` row beside one `uncertain` row read as
@@ -1051,6 +1075,21 @@ async def test_an_unresolved_row_makes_the_plan_refuse_the_cutover(session_maker
     assert report["cutover_ready"] is False
     # PII-free: a status name and a count, nothing about a person.
     assert report["unresolved_rows"] == {status: 1}
+
+    # The blocked snapshot is legitimate diagnostic evidence, not a corrupt
+    # file. The strict reader preserves its false readiness; the separate
+    # usability gate is what refuses to authorise an apply.
+    snapshot = write_snapshot(planned, tmp_path / f"{status}.json")
+    frozen = read_snapshot(snapshot)
+    assert frozen.historical_rows[status] == 1
+    assert frozen.guard_ready is False and frozen.cutover_ready is False
+    with pytest.raises(SnapshotError, match="the frozen plan is not cutover-ready"):
+        check_snapshot_usable(
+            frozen,
+            supplied_digest=frozen.digest,
+            supplied_confirmation=confirmation_phrase(frozen.digest),
+            now=planned.created_at,
+        )
 
 
 async def test_resolving_the_row_restores_readiness(session_maker, seeded):
@@ -1218,6 +1257,42 @@ async def test_a_foreign_plan_digest_cannot_close_an_already_closed_wave(session
                 plan_digest="f" * 64,
             )
     assert accepted is False, "a different authorisation is a conflict, not an update"
+
+
+@pytest.mark.parametrize("damage", ["missing", "foreign"])
+async def test_verify_proves_the_closure_of_an_empty_pair(session_maker, seeded, damage):
+    """Row markers cannot prove closure for the run that has no created row."""
+    await _add_ledger_row(session_maker, status="failed", source_record_id=900810, run_id="run-2")
+    planned = await plan(session_maker, seeded, runs=("run-1", "run-2"))
+    frozen = freeze_plan(planned)
+    result = await h.run_apply(session_maker, planned)
+    assert result.halted is None
+    apply_report = result.apply_report(frozen, applied_at=datetime.now(timezone.utc))
+
+    async with session_maker() as session:
+        async with session.begin():
+            closure = (
+                (
+                    await session.execute(
+                        select(EasyWeekMigrationWaveClosure).where(EasyWeekMigrationWaveClosure.run_id == "run-2")
+                    )
+                )
+                .scalars()
+                .one()
+            )
+            if damage == "missing":
+                await session.delete(closure)
+            else:
+                closure.plan_digest = "f" * 64
+
+    async with session_maker() as session:
+        verdict = await db.verify_handover(session, frozen, apply_report)
+
+    assert verdict["passed"] is False
+    assert verdict["wave_closures_expected"] == 2
+    assert verdict["wave_closures_verified"] == 1
+    field = "wave_closures_missing" if damage == "missing" else "wave_closures_with_foreign_digest"
+    assert verdict[field] == [{"source_company_id": h.COMPANY, "run_id": "run-2"}]
 
 
 async def test_a_closed_wave_does_not_close_another_run_or_company(session_maker, seeded):

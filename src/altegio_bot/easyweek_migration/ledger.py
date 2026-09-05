@@ -395,11 +395,11 @@ async def _finalize(
     ).scalar_one_or_none()
     if row is None:
         raise RuntimeError(f"migration ledger row vanished company_id={source_company_id} record_id={source_record_id}")
-    # `run_id` is the ORIGIN run and is never rewritten here. A reconciliation or
-    # a resolution that stamped its own id over it would remove the booking from
-    # the rollback set of the apply that actually created it — the one run an
-    # operator would reach for. Bookkeeping about a row must not rewrite the
-    # row's origin.
+    # `row.run_id` is the ORIGIN run and is never rewritten here. The `run_id`
+    # argument names the current bookkeeping/resolution run and belongs only in
+    # `last_resolution_run_id`. Stamping it over the origin would remove the
+    # booking from the rollback set of the apply that actually created it — the
+    # one run an operator would reach for.
     row.last_resolution_run_id = run_id
     row.status = status
     if target_booking_uuid is not None:
@@ -756,17 +756,51 @@ async def resolve_uncertain_as_created(
     """Record an operator-supplied target that the tool has already PROVEN.
 
     The caller must have fetched the booking and matched its marker, branch and
-    write-critical fields first; this function only writes the verdict down. The
-    origin ``run_id`` is preserved, so the booking stays inside the rollback set
-    of the apply that created it.
+    write-critical fields first; this function only writes the verdict down.
+    ``run_id`` names the CURRENT resolution for audit. The wave that must be
+    locked and checked is derived from the ledger row's immutable origin
+    ``row.run_id`` here, inside the write primitive, so no caller can accidentally
+    guard the resolution run instead. The origin itself remains unchanged, and
+    the booking stays inside the rollback set of the apply that created it.
     """
-    await lock_migration_wave(session, source_company_id=source_company_id, run_id=run_id)
-    if await wave_handed_over(session, source_company_id=source_company_id, run_id=run_id):
+    origin_run_id = (
+        await session.execute(
+            select(EasyWeekMigrationLedger.run_id).where(
+                EasyWeekMigrationLedger.source_provider == PROVIDER_ALTEGIO,
+                EasyWeekMigrationLedger.source_company_id == source_company_id,
+                EasyWeekMigrationLedger.source_record_id == source_record_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if origin_run_id is None:
+        raise RuntimeError(f"migration ledger row vanished company_id={source_company_id} record_id={source_record_id}")
+
+    await lock_migration_wave(session, source_company_id=source_company_id, run_id=origin_run_id)
+    row = (
+        await session.execute(
+            select(EasyWeekMigrationLedger)
+            .where(
+                EasyWeekMigrationLedger.source_provider == PROVIDER_ALTEGIO,
+                EasyWeekMigrationLedger.source_company_id == source_company_id,
+                EasyWeekMigrationLedger.source_record_id == source_record_id,
+            )
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        raise RuntimeError(f"migration ledger row vanished company_id={source_company_id} record_id={source_record_id}")
+    if row.run_id != origin_run_id or row.status not in UNRESOLVED_STATUSES:
+        # The origin read above exists only to determine which advisory lock to
+        # take. Re-prove it under the wave lock and a row lock before writing,
+        # so a concurrent absent-resolution/reclaim cannot move the row to a new
+        # origin between those two operations.
+        raise RuntimeError(f"migration ledger row changed company_id={source_company_id} record_id={source_record_id}")
+    if await wave_handed_over(session, source_company_id=source_company_id, run_id=origin_run_id):
         # Promoting a row into a closed wave would leave that booking's
         # reminders owned by nobody. The row stays `uncertain`, so the booking
         # is still recorded and still visible to reconciliation — it needs an
         # operator, not a silent promotion.
-        raise WaveClosed(source_company_id=source_company_id, run_id=run_id)
+        raise WaveClosed(source_company_id=source_company_id, run_id=origin_run_id)
 
     await _finalize(
         session,

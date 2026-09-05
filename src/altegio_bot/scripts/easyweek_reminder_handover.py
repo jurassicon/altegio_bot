@@ -368,7 +368,7 @@ def build_pre_parser() -> argparse.ArgumentParser:
     them to answer at all. `parse_known_args` on an argparse parser that knows
     the arity is the smallest construction with unambiguous semantics.
     """
-    parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False, exit_on_error=False)
     parser.add_argument("mode", nargs="?", default=None)
     parser.add_argument("--snapshot", default=None)
     # Declared so their VALUES can never be mistaken for the mode. Types stay
@@ -379,6 +379,66 @@ def build_pre_parser() -> argparse.ArgumentParser:
     for option in ("--plan-digest", "--confirm", "--pause-sec", "--max-snapshot-age-sec"):
         parser.add_argument(option, default=None)
     return parser
+
+
+def _recover_pre_parse(tokens: list[str]) -> tuple[str | None, str | None]:
+    """Recover mode/path even when the deliberately shallow parser cannot.
+
+    `argparse` returns no partial namespace when one of its known options is
+    missing a value. That failure must not turn an explicit (or default) plan
+    back into "unknown intent", because the real parser then exits while the old
+    authorisation remains usable. This scanner is driven by the pre-parser's own
+    option arity: known values are skipped, so `--run-id plan` is never confused
+    with a mode, while a missing value still leaves the surrounding mode and
+    snapshot visible.
+
+    An unrecognised option plus an otherwise unrecognised positional is treated
+    as the default plan. That is the fail-closed interpretation of
+    `--future-option value`: the current real parser cannot execute an apply or a
+    verify from it, so it must not preserve an older plan permission either.
+    """
+    option_actions = {option: action for action in build_pre_parser()._actions for option in action.option_strings}
+    positionals: list[str] = []
+    snapshot: str | None = None
+    unknown_option = False
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token.startswith("-"):
+            option, separator, inline_value = token.partition("=")
+            action = option_actions.get(option)
+            if action is None:
+                unknown_option = True
+                index += 1
+                continue
+            if action.nargs == 0:
+                index += 1
+                continue
+
+            value: str | None = inline_value if separator else None
+            if not separator and index + 1 < len(tokens):
+                candidate = tokens[index + 1]
+                candidate_option = candidate.partition("=")[0]
+                # A following option means this value is missing. Negative
+                # numbers remain values; all handover options use long names.
+                if not candidate.startswith("--") and candidate_option not in option_actions:
+                    value = candidate
+                    index += 1
+            if option == "--snapshot" and value is not None:
+                snapshot = value
+            index += 1
+            continue
+
+        positionals.append(token)
+        index += 1
+
+    if not positionals:
+        return MODE_PLAN, snapshot
+    if positionals[0] in MODES:
+        return positionals[0], snapshot
+    if unknown_option:
+        return MODE_PLAN, snapshot
+    return None, snapshot
 
 
 def _intended_plan_snapshot(argv: list[str] | None) -> str | None:
@@ -398,14 +458,19 @@ def _intended_plan_snapshot(argv: list[str] | None) -> str | None:
         return None
     try:
         parsed, _unknown = build_pre_parser().parse_known_args(tokens)
-    except SystemExit:
-        # argparse gave up even on this. Nothing can be said about the intent,
-        # and destroying an authorisation on a guess is not a fail-closed move.
-        return None
-    mode = parsed.mode if parsed.mode in MODES else (MODE_PLAN if parsed.mode is None else None)
+    except (argparse.ArgumentError, SystemExit):
+        mode, snapshot = _recover_pre_parse(tokens)
+    else:
+        mode = parsed.mode if parsed.mode in MODES else (MODE_PLAN if parsed.mode is None else None)
+        snapshot = parsed.snapshot
+        if mode is None:
+            # Usually an unknown option's value was accepted as the optional
+            # positional mode. Recover with option arity before deciding this
+            # was not the default plan.
+            mode, snapshot = _recover_pre_parse(tokens)
     if mode != MODE_PLAN:
         return None
-    return parsed.snapshot or DEFAULT_SNAPSHOT
+    return snapshot or DEFAULT_SNAPSHOT
 
 
 def main(argv: list[str] | None = None) -> int:

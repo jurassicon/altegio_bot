@@ -1530,16 +1530,26 @@ async def run_reconcile(
             _leave_uncertain(reason)
             continue
 
-        async with session_maker() as session:
-            async with session.begin():
-                await ledger_module.record_created(
-                    session,
-                    run_id=inputs.run_id,
-                    source_company_id=company_id,
-                    source_record_id=record_id,
-                    target_booking_uuid=live.booking_uuid,
-                    target_snapshot_fingerprint=live.fingerprint,
-                )
+        # A successful proof still may not promote the row when its ORIGIN wave
+        # has already handed reminder ownership to EasyWeek. Use the same
+        # guarded primitive as explicit `resolve-created`: it derives the origin
+        # run from the ledger row, takes that wave's lock and checks its durable
+        # closure before changing the status. The current reconcile run remains
+        # audit metadata only.
+        try:
+            async with session_maker() as session:
+                async with session.begin():
+                    await ledger_module.resolve_uncertain_as_created(
+                        session,
+                        run_id=inputs.run_id,
+                        source_company_id=company_id,
+                        source_record_id=record_id,
+                        target_booking_uuid=live.booking_uuid,
+                        target_snapshot_fingerprint=live.fingerprint,
+                    )
+        except ledger_module.WaveClosed:
+            _leave_uncertain(ledger_module.WAVE_CLOSED)
+            continue
         entry["reconcile_outcome"] = RECONCILE_CONFIRMED_CREATED
         report.reasons[RECONCILE_CONFIRMED_CREATED] += 1
         report.created_rows.append(entry)
@@ -2160,10 +2170,10 @@ async def run_resolve_created(
     # keep the wave locked out of bulk forever or, worse, be read as an
     # unverified wave that somehow produced bookings. Either both land or
     # neither does.
-    # `resolve_uncertain_as_created` takes the wave lock and refuses a closed
-    # wave itself; the row then stays `uncertain`, which keeps the booking
-    # recorded and visible to reconciliation rather than promoting it into a
-    # wave whose reminders already moved.
+    # `resolve_uncertain_as_created` derives the immutable ORIGIN run from the
+    # ledger row, takes that wave's lock and refuses its durable closure. The
+    # current `inputs.run_id` is only the resolution audit id; using it as the
+    # wave identity would check the wrong wave on every later recovery run.
     try:
         async with session_maker() as session:
             async with session.begin():

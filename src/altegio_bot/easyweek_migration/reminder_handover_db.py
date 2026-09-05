@@ -89,6 +89,7 @@ from altegio_bot.models.models import (
     PROVIDER_EASYWEEK,
     Client,
     EasyWeekMigrationLedger,
+    EasyWeekMigrationWaveClosure,
     MessageJob,
     OutboxMessage,
     Record,
@@ -1316,6 +1317,47 @@ async def _verify_markers(
     }
 
 
+def _safe_wave_pair(source_company_id: int, run_id: str) -> dict[str, int | str]:
+    """PII-free identity used by the operator-facing closure verdict."""
+    return {"source_company_id": source_company_id, "run_id": run_id}
+
+
+async def _verify_wave_closures(session: AsyncSession, frozen: FrozenPlan) -> dict[str, Any]:
+    """Prove durable closure for every company/run pair the snapshot claimed.
+
+    Row markers cannot answer for an empty or `failed`-only pair. This table is
+    the only fact that survives the handover transaction for those pairs, so a
+    verify that did not read it could report PASS while a late migration claim
+    was once again allowed into the supposedly closed wave.
+    """
+    expected = tuple(
+        sorted((int(company_id), str(run_id)) for company_id in frozen.company_ids for run_id in frozen.wave["run_ids"])
+    )
+    rows = (
+        await session.execute(
+            select(
+                EasyWeekMigrationWaveClosure.source_company_id,
+                EasyWeekMigrationWaveClosure.run_id,
+                EasyWeekMigrationWaveClosure.plan_digest,
+            ).where(
+                EasyWeekMigrationWaveClosure.source_provider == PROVIDER_ALTEGIO,
+                EasyWeekMigrationWaveClosure.source_company_id.in_(frozen.company_ids),
+                EasyWeekMigrationWaveClosure.run_id.in_(frozen.wave["run_ids"]),
+            )
+        )
+    ).all()
+    actual = {(int(company_id), str(run_id)): str(digest) for company_id, run_id, digest in rows}
+    verified = [pair for pair in expected if actual.get(pair) == frozen.digest]
+    missing = [pair for pair in expected if pair not in actual]
+    foreign = [pair for pair in expected if pair in actual and actual[pair] != frozen.digest]
+    return {
+        "expected": len(expected),
+        "verified": len(verified),
+        "missing": [_safe_wave_pair(*pair) for pair in missing],
+        "foreign": [_safe_wave_pair(*pair) for pair in foreign],
+    }
+
+
 async def verify_handover(
     session: AsyncSession,
     frozen: FrozenPlan,
@@ -1370,6 +1412,7 @@ async def verify_handover(
     # ownership was never recorded — leaving every one of them one late Altegio
     # delivery away from being re-opened.
     marker_state = await _verify_markers(session, frozen, apply_report)
+    closure_state = await _verify_wave_closures(session, frozen)
 
     # Any EasyWeek reminder queued for an in-scope target whose key does not
     # belong to the appointment's current start instant. A leftover from an
@@ -1485,6 +1528,10 @@ async def verify_handover(
         "ledger_rows_missing_marker": marker_state["missing"],
         "ledger_rows_with_foreign_marker": marker_state["foreign"],
         "marker_matches_apply_report": marker_state["report_matches"],
+        "wave_closures_expected": closure_state["expected"],
+        "wave_closures_verified": closure_state["verified"],
+        "wave_closures_missing": closure_state["missing"],
+        "wave_closures_with_foreign_digest": closure_state["foreign"],
         "snapshot_digest_matches_apply_report": apply_report.snapshot_digest == frozen.digest,
         "rows_in_scope": len(identities),
         "eligible_scope_complete": complete_scope,
@@ -1507,6 +1554,9 @@ async def verify_handover(
             and not marker_state["missing"]
             and not marker_state["foreign"]
             and marker_state["report_matches"]
+            and closure_state["verified"] == closure_state["expected"]
+            and not closure_state["missing"]
+            and not closure_state["foreign"]
             and apply_report.snapshot_digest == frozen.digest
             and not created_invalid
             and not canceled_invalid
