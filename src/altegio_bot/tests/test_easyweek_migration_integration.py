@@ -630,6 +630,10 @@ _ROLLBACK_AT_COLUMN = "rollback_attempted_at"
 _ROLLBACK_RUN_COLUMN = "rollback_attempt_run_id"
 _ROLLBACK_CHECK = "ck_easyweek_migration_ledger_rollback_attempt_complete"
 _ROLLBACK_PARENT_REVISION = "a7d1f4c82b95"
+# PR-11.2 revision 27 (b6f2c9d41a70): durable wave closure.
+_CLOSURE_TABLE = "easyweek_migration_wave_closure"
+_CLOSURE_UNIQUE = "uq_easyweek_migration_wave_closure_identity"
+_CLOSURE_PARENT_REVISION = "c4b7e2f1a983"
 
 
 async def _ledger_index(db_url: str, index: str) -> str | None:
@@ -1024,4 +1028,64 @@ async def test_rollback_attempt_marker_migration_round_trip(temp_db_url) -> None
     assert restored[0] == (None, None)
 
     await _exec(temp_db_url, f"DELETE FROM {_LEDGER_TABLE} WHERE run_id = 'rollback-probe'")
+    assert _alembic_ok("heads", db_url=temp_db_url).count("(head)") == 1
+
+
+@pytest.mark.asyncio
+async def test_wave_closure_migration_round_trip(temp_db_url) -> None:
+    """Revision b6f2c9d41a70, upgraded, downgraded and upgraded again.
+
+    The closure row is the only durable evidence that a company/run pair with no
+    `created` row was handed over, so a table that survives only until the next
+    downgrade would take that evidence — and the refusal that depends on it —
+    with it.
+    """
+    _alembic_ok("upgrade", "head", db_url=temp_db_url)
+
+    for column, expected in (
+        ("source_provider", "character varying"),
+        ("run_id", "character varying"),
+        ("plan_digest", "character varying"),
+        ("closed_at", "timestamp with time zone"),
+    ):
+        found = await _column(temp_db_url, _CLOSURE_TABLE, column)
+        assert found is not None, f"{column} is missing after upgrade head"
+        assert found[0] == expected, f"unexpected type for {column}: {found}"
+        assert found[1] == "NO", f"{column} must be NOT NULL: {found}"
+
+    assert _CLOSURE_UNIQUE in await _constraint_names(temp_db_url, _CLOSURE_TABLE)
+
+    # One closure per wave, enforced by the database rather than by the tool.
+    insert = (
+        f"INSERT INTO {_CLOSURE_TABLE} (source_provider, source_company_id, run_id, plan_digest) "
+        "VALUES ('altegio', 758285, 'run-1', repeat('a', 64))"
+    )
+    await _exec(temp_db_url, insert)
+    with pytest.raises(IntegrityError) as refused:
+        await _exec(temp_db_url, insert)
+    assert _CLOSURE_UNIQUE in str(refused.value)
+
+    # A different run of the same company is a different wave.
+    await _exec(
+        temp_db_url,
+        f"INSERT INTO {_CLOSURE_TABLE} (source_provider, source_company_id, run_id, plan_digest) "
+        "VALUES ('altegio', 758285, 'run-2', repeat('a', 64))",
+    )
+    rows = await _fetch(temp_db_url, f"SELECT count(*) FROM {_CLOSURE_TABLE}")
+    assert rows[0][0] == 2
+
+    # ---------------------------------------------------------------- down
+    _alembic_ok("downgrade", _CLOSURE_PARENT_REVISION, db_url=temp_db_url)
+    assert _CLOSURE_PARENT_REVISION in _alembic_ok("current", db_url=temp_db_url)
+    exists = await _fetch(temp_db_url, f"SELECT to_regclass('public.{_CLOSURE_TABLE}') IS NOT NULL")
+    assert exists[0][0] is False
+
+    # ------------------------------------------------------------------ up
+    _alembic_ok("upgrade", "head", db_url=temp_db_url)
+    assert _HEAD_REVISION in _alembic_ok("current", db_url=temp_db_url)
+    assert await _column(temp_db_url, _CLOSURE_TABLE, "run_id") is not None
+    assert _CLOSURE_UNIQUE in await _constraint_names(temp_db_url, _CLOSURE_TABLE)
+    # A fresh table: no environment is told it once closed a wave it never closed.
+    rows = await _fetch(temp_db_url, f"SELECT count(*) FROM {_CLOSURE_TABLE}")
+    assert rows[0][0] == 0
     assert _alembic_ok("heads", db_url=temp_db_url).count("(head)") == 1

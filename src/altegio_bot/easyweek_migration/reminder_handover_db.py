@@ -119,6 +119,9 @@ HALT_MARKER_CONFLICT: Final = "reminder_marker_conflict"
 # The wave still holds a row that could become `created` after this handover
 # closed it — a `pending` claim or an `uncertain` outcome. Reconcile first.
 HALT_WAVE_UNRESOLVED: Final = "migration_wave_unresolved"
+# A company/run pair this snapshot claims to close is already closed by a
+# DIFFERENT authorisation. Two plans cannot both have handed the same wave over.
+HALT_WAVE_CLOSURE_CONFLICT: Final = "migration_wave_closure_conflict"
 
 
 class HandoverError(Exception):
@@ -929,6 +932,28 @@ async def _apply_plan_inner(
     if isinstance(marker_result, str):
         return ApplyResult(halted=marker_result)
     marked, already_marked = marker_result
+
+    # -- 5. close every company/run pair this snapshot claimed --------------
+    # The row markers above can only exist where a `created` row exists. A pair
+    # the snapshot named but that held no created row — empty, or `failed` only
+    # — carried no evidence at all, so the closure check answered "no" the
+    # moment this transaction's advisory lock was released and a late retry
+    # under that run id could create a booking into a wave already handed over.
+    #
+    # The closure row is that evidence, written for the EXACT pairs claimed and
+    # in this same transaction: a rollback leaves none, a commit closes all of
+    # them. A pair already closed by a different plan is a conflict, not an
+    # update — two authorisations cannot both have closed one wave.
+    for company_id, run_id in sorted(
+        (int(company), str(run)) for company in frozen.company_ids for run in frozen.wave["run_ids"]
+    ):
+        if not await ledger_module.close_migration_wave(
+            session,
+            source_company_id=company_id,
+            run_id=run_id,
+            plan_digest=frozen.digest,
+        ):
+            return ApplyResult(halted=HALT_WAVE_CLOSURE_CONFLICT)
 
     outbox_after = await _scoped_outbox_ids(session, identities)
     if outbox_after != outbox_before:

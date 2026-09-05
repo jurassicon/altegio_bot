@@ -1209,33 +1209,22 @@ async def _apply_one(
     if card is None:
         return BLOCKED, CUSTOMER_UNADDRESSABLE
 
-    wave_closed = False
-    async with session_maker() as session:
-        async with session.begin():
-            # The wave, before the claim and in the same transaction. Two facts
-            # come from it: nobody else may add a row to this wave while we
-            # decide, and a wave whose reminders already moved to EasyWeek may
-            # not gain one at all — that booking's reminders would belong to
-            # neither side, because the handover has already proved and marked
-            # everything it could see. Refused HERE, before any POST: a booking
-            # not created is a row for an operator, a booking created and then
-            # unrecordable is a real appointment nobody owns.
-            await ledger_module.lock_migration_wave(session, source_company_id=company_id, run_id=inputs.run_id)
-            wave_closed = await ledger_module.wave_handed_over(
-                session, source_company_id=company_id, run_id=inputs.run_id
-            )
-            claimed = (
-                False
-                if wave_closed
-                else await ledger_module.claim_for_apply(
+    # The claim takes the wave lock and refuses a closed wave itself, so this
+    # cannot be reached with a booking about to be created into a wave whose
+    # reminders have already moved. Refused BEFORE any POST: a booking not
+    # created is a row for an operator, a booking created and then unrecordable
+    # is a real appointment nobody owns.
+    try:
+        async with session_maker() as session:
+            async with session.begin():
+                claimed = await ledger_module.claim_for_apply(
                     session,
                     run_id=inputs.run_id,
                     source_company_id=company_id,
                     source_record_id=record_id,
                     source_fingerprint=decision.source_fingerprint,
                 )
-            )
-    if wave_closed:
+    except ledger_module.WaveClosed:
         return BLOCKED, BLOCK_WAVE_CLOSED
     if not claimed:
         # Somebody else owns this source booking — a concurrent apply, or a row
@@ -2171,35 +2160,32 @@ async def run_resolve_created(
     # keep the wave locked out of bulk forever or, worse, be read as an
     # unverified wave that somehow produced bookings. Either both land or
     # neither does.
-    async with session_maker() as session:
-        async with session.begin():
-            # Same wave gate as an apply, for the same reason: promoting an
-            # uncertain row to `created` after the handover closed the wave
-            # would leave that booking's reminders owned by nobody.
-            await ledger_module.lock_migration_wave(
-                session, source_company_id=company_id, run_id=row_snapshot["run_id"]
-            )
-            if await ledger_module.wave_handed_over(
-                session, source_company_id=company_id, run_id=row_snapshot["run_id"]
-            ):
-                report.errors.append(ledger_module.WAVE_CLOSED)
-                report.reasons[ledger_module.WAVE_CLOSED] += 1
-                return report
-            await ledger_module.resolve_uncertain_as_created(
-                session,
-                run_id=inputs.run_id,
-                source_company_id=company_id,
-                source_record_id=record_id,
-                target_booking_uuid=live.booking_uuid,
-                target_snapshot_fingerprint=live.fingerprint,
-            )
-            if recoverable_proof_id is not None:
-                await promote_proof_to_verified(
+    # `resolve_uncertain_as_created` takes the wave lock and refuses a closed
+    # wave itself; the row then stays `uncertain`, which keeps the booking
+    # recorded and visible to reconciliation rather than promoting it into a
+    # wave whose reminders already moved.
+    try:
+        async with session_maker() as session:
+            async with session.begin():
+                await ledger_module.resolve_uncertain_as_created(
                     session,
-                    proof_id=recoverable_proof_id,
+                    run_id=inputs.run_id,
+                    source_company_id=company_id,
+                    source_record_id=record_id,
                     target_booking_uuid=live.booking_uuid,
-                    target_snapshot=live,
+                    target_snapshot_fingerprint=live.fingerprint,
                 )
+                if recoverable_proof_id is not None:
+                    await promote_proof_to_verified(
+                        session,
+                        proof_id=recoverable_proof_id,
+                        target_booking_uuid=live.booking_uuid,
+                        target_snapshot=live,
+                    )
+    except ledger_module.WaveClosed:
+        report.errors.append(ledger_module.WAVE_CLOSED)
+        report.reasons[ledger_module.WAVE_CLOSED] += 1
+        return report
 
     entry = dict(row_snapshot)
     entry["reconcile_outcome"] = RESOLVE_CONFIRMED

@@ -27,6 +27,7 @@ from altegio_bot.models.models import (
     PROVIDER_EASYWEEK,
     Client,
     EasyWeekMigrationLedger,
+    EasyWeekMigrationWaveClosure,
     MessageJob,
     Record,
 )
@@ -588,8 +589,15 @@ def test_invalidation_is_not_a_rename_contract():
     assert "invalidate_snapshot" in cli_source
 
 
-async def test_a_failed_apply_does_not_invalidate_the_snapshot(session_maker, seeded, tmp_path, monkeypatch):
-    """Invalidation belongs to a NEW plan attempt, and to nothing else."""
+def test_a_failed_apply_does_not_invalidate_the_snapshot(tmp_path, monkeypatch, capsys):
+    """Invalidation belongs to a NEW plan attempt, and to nothing else.
+
+    Synchronous deliberately. `cli.main` calls `asyncio.run`, and inside an
+    async test that raises immediately and is swallowed as
+    `handover_unexpected_error` — the exit code would be 1 for a reason that has
+    nothing to do with the permission gate, and the coroutine would never be
+    awaited. The stderr assertion below is what proves the real path was taken.
+    """
     snapshot = _applicable_snapshot(tmp_path / "plan.json")
     monkeypatch.delenv(cli.APPLY_ENV_FLAG, raising=False)
 
@@ -613,6 +621,12 @@ async def test_a_failed_apply_does_not_invalidate_the_snapshot(session_maker, se
     )
 
     assert exit_code == 1
+    stderr = capsys.readouterr().err
+    # A real refusal from the apply path — the manifest this argv names does not
+    # exist — and NOT the catch-all that an `asyncio.run` inside a running loop
+    # would have produced.
+    assert "migration_wave_changed" in stderr, stderr
+    assert "handover_unexpected_error" not in stderr
     assert read_snapshot(snapshot).digest, "a refused apply must leave the operator's plan intact"
 
 
@@ -817,7 +831,13 @@ async def test_an_unresolved_row_in_the_wave_stops_the_handover(session_maker, s
     planned = await plan(session_maker, seeded)
     result = await h.run_apply(session_maker, planned)
 
-    assert result.halted == db.HALT_WAVE_UNRESOLVED
+    # Refused twice over, and the first refusal wins: the plan itself is no
+    # longer cutover-ready, so the snapshot cannot authorise anything. The
+    # transactional guard behind it is proven by
+    # `test_an_unresolved_row_appearing_after_the_snapshot_still_blocks_apply`,
+    # where the row appears after a clean snapshot was taken.
+    assert planned.cutover_ready is False
+    assert result.halted == "snapshot_not_cutover_ready"
     assert await h.jobs(session_maker) == []
     # Halted, so nothing was marked either — the wave is left exactly as it was
     # for the operator to reconcile first.
@@ -858,3 +878,363 @@ def test_the_wave_lock_key_is_scoped_to_provider_company_and_run():
     assert base != key(source_company_id=h.COMPANY, run_id="run-2")
     assert base != key(source_company_id=h.COMPANY + 1, run_id="run-1")
     assert -(2**31) <= base < 2**31, "must fit the advisory lock's int32"
+
+
+# ---------------------------------------------------------------------------
+# Blocker 2: which command is a plan, decided before argparse
+# ---------------------------------------------------------------------------
+#
+# Every case goes through the real `cli.main()` and then asks `read_snapshot`,
+# because the helper answering correctly proves nothing about what the command
+# actually did to the file. All of them are synchronous: `cli.main` calls
+# `asyncio.run`, which inside a running loop would raise and be swallowed as
+# `handover_unexpected_error` — a green test for the wrong reason.
+
+
+def _is_destroyed(path: Path) -> bool:
+    try:
+        read_snapshot(path)
+    except SnapshotError as error:
+        return str(error) == "snapshot_invalidated"
+    return False
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        pytest.param(
+            ["plan", "--company-id", "not-a-number", "--run-id", "run-1", "--manifest", "m.json"],
+            id="explicit-plan-malformed-company",
+        ),
+        pytest.param(
+            ["--company-id", "not-a-number", "--run-id", "run-1", "--manifest", "m.json"],
+            id="default-plan-malformed-company",
+        ),
+        pytest.param(["--company-id", "758285"], id="default-plan-missing-required"),
+        pytest.param(["plan", "--company-id", "758285", "--unknown-flag"], id="unknown-argument"),
+    ],
+)
+def test_a_plan_attempt_destroys_the_old_permission_however_it_fails(tmp_path, argv):
+    """A plan whose arguments never parse is still a plan attempt.
+
+    The previous scanner took the first token without a leading dash as the
+    mode. In `--company-id not-a-number ...` that token is an option's VALUE, so
+    the command was read as "not a plan" and the old authorisation survived
+    argparse's exit — still applicable, at its usual path.
+    """
+    snapshot = _applicable_snapshot(tmp_path / "plan.json")
+
+    with pytest.raises(SystemExit) as exited:
+        cli.main([*argv, "--snapshot", str(snapshot)])
+
+    assert exited.value.code == 2, "argparse still refuses the command"
+    assert _is_destroyed(snapshot)
+
+
+def test_options_before_an_explicit_plan_still_name_the_right_snapshot(tmp_path):
+    """`--snapshot custom.json plan ...`: the value is not the mode."""
+    custom = _applicable_snapshot(tmp_path / "custom.json")
+    default = _applicable_snapshot(tmp_path / "default.json")
+
+    with pytest.raises(SystemExit):
+        cli.main(["--snapshot", str(custom), "plan", "--company-id", "not-a-number", "--manifest", "m.json"])
+
+    assert _is_destroyed(custom)
+    assert read_snapshot(default).digest, "an explicit custom path must not take the default one with it"
+
+
+def test_an_inline_snapshot_value_is_honoured(tmp_path):
+    custom = _applicable_snapshot(tmp_path / "custom.json")
+    default = _applicable_snapshot(tmp_path / "default.json")
+
+    with pytest.raises(SystemExit):
+        cli.main(["plan", f"--snapshot={custom}", "--company-id", "not-a-number"])
+
+    assert _is_destroyed(custom)
+    assert read_snapshot(default).digest
+
+
+@pytest.mark.parametrize("mode", ["apply", "verify"])
+def test_an_option_value_of_plan_does_not_invalidate_anything(tmp_path, mode):
+    """The opposite error: a value that happens to read as a mode."""
+    snapshot = _applicable_snapshot(tmp_path / "plan.json")
+
+    cli.main(
+        [
+            mode,
+            "--company-id",
+            "758285",
+            "--run-id",
+            "plan",
+            "--manifest",
+            "plan",
+            "--snapshot",
+            str(snapshot),
+        ]
+    )
+
+    assert read_snapshot(snapshot).digest, "an apply or a verify must never destroy an authorisation"
+
+
+def test_a_bare_help_invalidates_nothing(tmp_path, monkeypatch):
+    snapshot = _applicable_snapshot(tmp_path / "plan.json")
+    monkeypatch.setattr(cli, "DEFAULT_SNAPSHOT", str(snapshot))
+
+    with pytest.raises(SystemExit) as exited:
+        cli.main(["--help"])
+
+    assert exited.value.code == 0
+    assert read_snapshot(snapshot).digest
+
+
+def test_the_pre_parser_mirrors_the_real_option_arity():
+    """A contract, so the two parsers cannot drift into disagreeing.
+
+    Every option the real parser takes a value for must take one here too;
+    otherwise its value becomes a positional and can be read as the mode.
+    """
+    real = {
+        action.option_strings[0]: action.nargs
+        for action in cli.build_parser()._actions
+        if action.option_strings and action.nargs != 0
+    }
+    pre = {
+        action.option_strings[0]: action.nargs
+        for action in cli.build_pre_parser()._actions
+        if action.option_strings and action.nargs != 0
+    }
+    missing = sorted(set(real) - set(pre))
+    assert missing == [], f"the pre-parser does not know these take a value: {missing}"
+
+
+# ---------------------------------------------------------------------------
+# Blocker 3: a plan that cannot be applied says so
+# ---------------------------------------------------------------------------
+
+
+async def _add_ledger_row(session_maker, *, status: str, source_record_id: int, run_id: str = "run-1") -> int:
+    async with session_maker() as session:
+        async with session.begin():
+            row = EasyWeekMigrationLedger(
+                source_provider=PROVIDER_ALTEGIO,
+                source_company_id=h.COMPANY,
+                source_record_id=source_record_id,
+                source_fingerprint="b" * 64,
+                target_provider=PROVIDER_EASYWEEK,
+                target_booking_uuid=None,
+                run_id=run_id,
+                status=status,
+            )
+            session.add(row)
+            await session.flush()
+            return int(row.id)
+
+
+@pytest.mark.parametrize("status", ["pending", "uncertain"])
+async def test_an_unresolved_row_makes_the_plan_refuse_the_cutover(session_maker, seeded, status):
+    """The plan used to authorise a cutover the apply was certain to refuse.
+
+    One fully proven `created` row beside one `uncertain` row read as
+    `cutover_ready`, the CLI printed the apply command, and the operator stopped
+    the outbox worker for a transaction that could only answer
+    `migration_wave_unresolved`.
+    """
+    await _add_ledger_row(session_maker, status=status, source_record_id=900801)
+
+    planned = await plan(session_maker, seeded)
+
+    assert planned.unresolved_rows == {status: 1}
+    assert planned.guard_ready is False
+    assert planned.cutover_ready is False
+    report = planned.as_safe_dict()
+    assert report["wave_blockers"] == ["migration_wave_unresolved"]
+    assert report["cutover_ready"] is False
+    # PII-free: a status name and a count, nothing about a person.
+    assert report["unresolved_rows"] == {status: 1}
+
+
+async def test_resolving_the_row_restores_readiness(session_maker, seeded):
+    row_id = await _add_ledger_row(session_maker, status="uncertain", source_record_id=900802)
+    assert (await plan(session_maker, seeded)).cutover_ready is False
+
+    async with session_maker() as session:
+        async with session.begin():
+            await session.execute(
+                update(EasyWeekMigrationLedger).where(EasyWeekMigrationLedger.id == row_id).values(status="rolled_back")
+            )
+
+    planned = await plan(session_maker, seeded)
+    assert planned.unresolved_rows == {}
+    assert planned.cutover_ready is True
+    assert planned.as_safe_dict()["wave_blockers"] == []
+
+
+async def test_an_unresolved_row_appearing_after_the_snapshot_still_blocks_apply(session_maker, seeded):
+    """The plan check does not replace the transactional guard."""
+    planned = await plan(session_maker, seeded)
+    assert planned.cutover_ready is True
+
+    await _add_ledger_row(session_maker, status="pending", source_record_id=900803)
+
+    result = await h.run_apply(session_maker, planned)
+    assert result.halted == db.HALT_WAVE_UNRESOLVED
+    assert await h.jobs(session_maker) == []
+
+
+# ---------------------------------------------------------------------------
+# Blocker 1: closing a company/run pair that holds no created row
+# ---------------------------------------------------------------------------
+
+
+async def _closure_rows(session_maker) -> list[tuple[int, str]]:
+    async with session_maker() as session:
+        rows = (
+            await session.execute(select(EasyWeekMigrationWaveClosure).order_by(EasyWeekMigrationWaveClosure.run_id))
+        ).scalars()
+        return [(row.source_company_id, row.run_id) for row in rows]
+
+
+async def test_every_claimed_pair_is_closed_including_an_empty_one(session_maker, seeded):
+    """The empty pair is the whole defect.
+
+    A snapshot naming R1 and R2 where R2 holds no `created` row had nothing to
+    carry a marker, so the closure check answered "no" for R2 the moment the
+    advisory lock was released — and a late retry under R2 could POST a booking
+    into a wave that had already been handed over.
+    """
+    await _add_ledger_row(session_maker, status="failed", source_record_id=900804, run_id="run-2")
+
+    planned = await plan(session_maker, seeded, runs=("run-1", "run-2"))
+    assert planned.cutover_ready is True, "a failed row is not unresolved"
+
+    result = await h.run_apply(session_maker, planned)
+    assert result.halted is None, result.halted
+
+    # BOTH pairs are durably closed, including the one with no created row.
+    assert await _closure_rows(session_maker) == [(h.COMPANY, "run-1"), (h.COMPANY, "run-2")]
+    async with session_maker() as session:
+        for run_id in ("run-1", "run-2"):
+            assert await db.ledger_module.wave_handed_over(session, source_company_id=h.COMPANY, run_id=run_id)
+
+
+async def test_a_late_claim_into_the_empty_pair_is_refused_by_the_ledger(session_maker, seeded):
+    """Through the production entry point, not a direct INSERT.
+
+    `claim_for_apply` is what every migration apply calls before its POST, and
+    it is where the refusal lives — so no caller can reach EasyWeek by skipping
+    a check that happens to live in the runner.
+    """
+    await _add_ledger_row(session_maker, status="failed", source_record_id=900805, run_id="run-2")
+    planned = await plan(session_maker, seeded, runs=("run-1", "run-2"))
+    assert (await h.run_apply(session_maker, planned)).halted is None
+
+    # A retry of the FAILED row: failed → pending is the re-claim path.
+    with pytest.raises(db.ledger_module.WaveClosed):
+        async with session_maker() as session:
+            async with session.begin():
+                await db.ledger_module.claim_for_apply(
+                    session,
+                    run_id="run-2",
+                    source_company_id=h.COMPANY,
+                    source_record_id=900805,
+                    source_fingerprint="b" * 64,
+                )
+
+    # A brand-new booking under the same run id: same refusal, same reason.
+    with pytest.raises(db.ledger_module.WaveClosed):
+        async with session_maker() as session:
+            async with session.begin():
+                await db.ledger_module.claim_for_apply(
+                    session,
+                    run_id="run-2",
+                    source_company_id=h.COMPANY,
+                    source_record_id=900806,
+                    source_fingerprint="b" * 64,
+                )
+
+    async with session_maker() as session:
+        rows = (
+            await session.execute(select(EasyWeekMigrationLedger).where(EasyWeekMigrationLedger.run_id == "run-2"))
+        ).scalars()
+        statuses = sorted(row.status for row in rows)
+    assert statuses == ["failed"], "no row was created or re-claimed in a closed wave"
+
+
+async def test_promoting_an_uncertain_row_into_a_closed_wave_is_refused(session_maker, seeded):
+    """`resolve-created` is a production entry point too, and it is guarded."""
+    planned = await plan(session_maker, seeded)
+    assert (await h.run_apply(session_maker, planned)).halted is None
+    row_id = await _add_ledger_row(session_maker, status="uncertain", source_record_id=900807)
+
+    with pytest.raises(db.ledger_module.WaveClosed):
+        async with session_maker() as session:
+            async with session.begin():
+                await db.ledger_module.resolve_uncertain_as_created(
+                    session,
+                    run_id="run-1",
+                    source_company_id=h.COMPANY,
+                    source_record_id=900807,
+                    target_booking_uuid=str(h.BOOKING_TWO),
+                    target_snapshot_fingerprint="e" * 64,
+                )
+
+    async with session_maker() as session:
+        row = await session.get(EasyWeekMigrationLedger, row_id)
+    assert row.status == "uncertain", "the booking stays recorded and visible to reconciliation"
+
+
+async def test_a_halted_handover_leaves_no_closure_behind(session_maker, seeded):
+    """Rollback means rollback: closure, jobs, cancellations and markers."""
+    planned = await plan(session_maker, seeded)
+    await _add_ledger_row(session_maker, status="pending", source_record_id=900808)
+
+    result = await h.run_apply(session_maker, planned)
+
+    assert result.halted == db.HALT_WAVE_UNRESOLVED
+    assert await _closure_rows(session_maker) == []
+    assert await h.jobs(session_maker) == []
+
+
+async def test_repeating_the_same_handover_is_idempotent_for_the_closure(session_maker, seeded):
+    planned = await plan(session_maker, seeded)
+    first = await h.run_apply(session_maker, planned)
+    second = await h.run_apply(session_maker, planned)
+
+    assert first.halted is None and second.halted is None
+    assert await _closure_rows(session_maker) == [(h.COMPANY, "run-1")]
+    assert second.created_job_ids == ()
+
+
+async def test_a_foreign_plan_digest_cannot_close_an_already_closed_wave(session_maker, seeded):
+    planned = await plan(session_maker, seeded)
+    assert (await h.run_apply(session_maker, planned)).halted is None
+
+    async with session_maker() as session:
+        async with session.begin():
+            accepted = await db.ledger_module.close_migration_wave(
+                session,
+                source_company_id=h.COMPANY,
+                run_id="run-1",
+                plan_digest="f" * 64,
+            )
+    assert accepted is False, "a different authorisation is a conflict, not an update"
+
+
+async def test_a_closed_wave_does_not_close_another_run_or_company(session_maker, seeded):
+    planned = await plan(session_maker, seeded)
+    assert (await h.run_apply(session_maker, planned)).halted is None
+
+    async with session_maker() as session:
+        assert not await db.ledger_module.wave_handed_over(session, source_company_id=h.COMPANY, run_id="run-9")
+        assert not await db.ledger_module.wave_handed_over(session, source_company_id=h.COMPANY + 1, run_id="run-1")
+    # And a claim there is not refused either.
+    async with session_maker() as session:
+        async with session.begin():
+            claimed = await db.ledger_module.claim_for_apply(
+                session,
+                run_id="run-9",
+                source_company_id=h.COMPANY,
+                source_record_id=900809,
+                source_fingerprint="b" * 64,
+            )
+    assert claimed is True

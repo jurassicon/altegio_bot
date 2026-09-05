@@ -1738,6 +1738,64 @@ class EasyWeekMigrationLedger(Base):
     )
 
 
+class EasyWeekMigrationWaveClosure(Base):
+    """One durable fact: this wave's reminders are EasyWeek's now.
+
+    A wave is (source provider, source company, origin run). After a supervised
+    reminder handover, no booking may be added to it: the handover proved and
+    marked everything it could see, and a booking created afterwards would have
+    its reminders withdrawn on the Altegio side and never created on the
+    EasyWeek one.
+
+    Why this is a row of its own rather than the per-ledger-row handover marker.
+    The marker can only exist where a `created` row exists, so a company/run pair
+    the snapshot named but that held no created row — an empty pair, or one with
+    only `failed` rows — had nothing to carry it. `wave_handed_over` therefore
+    answered "no" for that pair the moment the transaction's advisory lock was
+    released, and a late migration retry under that run id could POST a booking
+    into a wave that had already been closed. The advisory lock serialises; only
+    a committed row can outlive the transaction that took it.
+
+    Written in the SAME transaction as the reminder jobs, the cancellations and
+    the row markers, so a rolled-back handover leaves no closure behind, and a
+    committed one closes every pair it claimed — including the empty ones.
+
+    PII-free by construction: ids, a run id, a plan digest and an instant.
+    """
+
+    __tablename__ = "easyweek_migration_wave_closure"
+    __table_args__ = (
+        # One closure per wave. A repeat of the same handover finds its own row
+        # and changes nothing; a different plan digest is a conflict, not an
+        # update, because two different authorisations cannot both have closed
+        # the same wave.
+        UniqueConstraint(
+            "source_provider",
+            "source_company_id",
+            "run_id",
+            name="uq_easyweek_migration_wave_closure_identity",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    source_provider: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        server_default=_PROVIDER_SERVER_DEFAULT,
+    )
+    source_company_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    # The ORIGIN run of the migration wave, exactly as the ledger stores it.
+    run_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    # The reviewed snapshot that authorised the closure. Kept so a repeat can be
+    # recognised as the same handover rather than as a second one.
+    plan_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    closed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+
 class EasyWeekMigrationCanaryProof(Base):
     """Durable evidence that ONE real booking was created and read back correctly.
 

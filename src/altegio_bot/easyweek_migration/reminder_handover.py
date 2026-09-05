@@ -74,6 +74,12 @@ from altegio_bot.easyweek_reminders import (
 from altegio_bot.models.models import PROVIDER_ALTEGIO, PROVIDER_EASYWEEK
 
 SNAPSHOT_VERSION: Final = 4
+
+# Ledger statuses that may still turn into `created`. Named here because the
+# plan's readiness depends on them and this module must not import the runner.
+UNRESOLVED_LEDGER_STATUSES: Final = ("pending", "uncertain")
+# The blocker an operator sees for them, in both the plan report and the apply.
+WAVE_UNRESOLVED: Final = "migration_wave_unresolved"
 APPLY_REPORT_VERSION: Final = 2
 SNAPSHOT_MODE: Final = 0o600
 DIR_MODE: Final = 0o700
@@ -491,6 +497,28 @@ class HandoverPlan:
         return tuple(row for row in self.scoped if row.processing_source_job_ids)
 
     @property
+    def unresolved_rows(self) -> dict[str, int]:
+        """Rows in the exact scope that could still become `created`.
+
+        `pending` means some process claimed a booking and never said what
+        happened; `uncertain` says the same out loud. Either can turn into a
+        `created` row later — after a handover has closed the wave, and with no
+        reminder ownership of its own.
+
+        The apply refuses such a wave under its lock, and used to be the FIRST
+        place that said so: a plan could report `cutover_ready` for a wave the
+        apply was guaranteed to reject, so an operator stopped the outbox worker
+        for a cutover that could never happen. It is a blocker at plan time now,
+        and the count comes from the same scoped ledger read the snapshot
+        already carries, so nothing new enters the digest material.
+        """
+        return {
+            status: count
+            for status, count in sorted(self.historical_rows.items())
+            if status in UNRESOLVED_LEDGER_STATUSES and count
+        }
+
+    @property
     def guard_ready(self) -> bool:
         """Are the EasyWeek reminders that already exist in a sane state?
 
@@ -498,7 +526,12 @@ class HandoverPlan:
         satisfies this trivially, which is precisely the trap the standalone
         preflight falls into after a migration.
         """
-        return not self.blocked_rows and not self.eligible_refusals and not self.candidate_set_changed
+        return (
+            not self.blocked_rows
+            and not self.eligible_refusals
+            and not self.candidate_set_changed
+            and not self.unresolved_rows
+        )
 
     @property
     def coverage_ready(self) -> bool:
@@ -582,6 +615,9 @@ class HandoverPlan:
             "easyweek_reminders_to_create": self.to_create,
             "altegio_reminders_to_cancel": self.to_cancel,
             "rows_with_blockers": [row.ledger_id for row in self.blocked_rows],
+            # Stable, PII-free, and the reason an apply would refuse this wave.
+            "wave_blockers": [WAVE_UNRESOLVED] if self.unresolved_rows else [],
+            "unresolved_rows": dict(self.unresolved_rows),
             "rows_with_processing_source_jobs": [row.ledger_id for row in self.processing_rows],
             # Three questions, three answers. See the module docstring.
             "guard_ready": self.guard_ready,

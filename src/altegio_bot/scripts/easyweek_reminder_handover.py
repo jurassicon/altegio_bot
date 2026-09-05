@@ -254,12 +254,22 @@ async def _run(args: argparse.Namespace) -> int:
         report = plan.as_safe_dict()
         _print(report)
         print(f"easyweek_reminder_handover: snapshot written to {path}", file=sys.stderr)
-        print(
-            "easyweek_reminder_handover: to apply this plan, pass\n"
-            f"  --plan-digest {report['plan_digest']}\n"
-            f"  --confirm '{confirmation_phrase(report['plan_digest'])}'",
-            file=sys.stderr,
-        )
+        if report["cutover_ready"]:
+            print(
+                "easyweek_reminder_handover: to apply this plan, pass\n"
+                f"  --plan-digest {report['plan_digest']}\n"
+                f"  --confirm '{confirmation_phrase(report['plan_digest'])}'",
+                file=sys.stderr,
+            )
+        else:
+            # A snapshot that cannot authorise a cutover must not be handed to
+            # the operator with the command that would attempt one. The file is
+            # still written: it is the diagnostic artefact that says why.
+            blockers = ", ".join(report["wave_blockers"]) or "cutover_not_ready"
+            print(
+                f"easyweek_reminder_handover: this plan cannot be applied ({blockers}); resolve it and run plan again",
+                file=sys.stderr,
+            )
         # A plan is informational: it exits 0 whenever it could read the world,
         # and says separately whether a cutover is possible.
         return 0 if report["cutover_ready"] else 1
@@ -343,35 +353,59 @@ async def _run(args: argparse.Namespace) -> int:
     return 0
 
 
+def build_pre_parser() -> argparse.ArgumentParser:
+    """A parser whose ONLY job is to answer two questions before the real one.
+
+    It mirrors the real parser's option ARITY — that is the whole point. A hand
+    written scan of argv cannot: it took the first token that did not start with
+    a dash as the mode, and in `--company-id not-a-number --run-id run-1` that
+    token is an option's value. The command was a plan, the scan decided it was
+    not, argparse then exited on the malformed company id, and the previous
+    authorisation stayed applicable at its usual path.
+
+    Everything is optional here and nothing is validated: unknown arguments and
+    malformed values are somebody else's error, and this parser must survive
+    them to answer at all. `parse_known_args` on an argparse parser that knows
+    the arity is the smallest construction with unambiguous semantics.
+    """
+    parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    parser.add_argument("mode", nargs="?", default=None)
+    parser.add_argument("--snapshot", default=None)
+    # Declared so their VALUES can never be mistaken for the mode. Types stay
+    # `str`: a malformed company id must still parse here, or the very command
+    # this exists for would be the one it cannot read.
+    for option in ("--company-id", "--run-id", "--manifest", "--apply-report"):
+        parser.add_argument(option, action="append", default=[])
+    for option in ("--plan-digest", "--confirm", "--pause-sec", "--max-snapshot-age-sec"):
+        parser.add_argument(option, default=None)
+    return parser
+
+
 def _intended_plan_snapshot(argv: list[str] | None) -> str | None:
-    """The snapshot a plan command would write, read straight from argv.
+    """The snapshot a plan command would replace, or ``None`` if it is not one.
 
-    `parse_args` exits on a bad argument, so a plan whose `--run-id` is missing
-    or whose company id is malformed never reaches `_run` — and used to leave the
-    previous authorisation sitting at its usual path, still applicable. The
-    operator's intent was already expressed by typing `plan`, so the old
-    permission has to go even when the rest of the command does not parse.
+    Answered before `parse_args`, because a plan whose arguments do not parse is
+    still a plan attempt: the operator has decided the previous permission is
+    superseded, and it must stop being applicable at that moment rather than at
+    the moment a plan happens to succeed.
 
-    Deliberately tolerant and tiny: it reads the mode and `--snapshot` and
-    nothing else. `--help` is not a plan attempt.
+    `--help` is not an attempt. Neither is an apply or a verify — including one
+    whose option value happens to be the string "plan", which is why the mode is
+    read by a parser that knows what is a value and what is not.
     """
     tokens = list(sys.argv[1:] if argv is None else argv)
     if any(token in ("-h", "--help") for token in tokens):
         return None
-    mode = MODE_PLAN
-    for token in tokens:
-        if not token.startswith("-"):
-            mode = token
-            break
+    try:
+        parsed, _unknown = build_pre_parser().parse_known_args(tokens)
+    except SystemExit:
+        # argparse gave up even on this. Nothing can be said about the intent,
+        # and destroying an authorisation on a guess is not a fail-closed move.
+        return None
+    mode = parsed.mode if parsed.mode in MODES else (MODE_PLAN if parsed.mode is None else None)
     if mode != MODE_PLAN:
         return None
-    snapshot = DEFAULT_SNAPSHOT
-    for index, token in enumerate(tokens):
-        if token == "--snapshot" and index + 1 < len(tokens):
-            snapshot = tokens[index + 1]
-        elif token.startswith("--snapshot="):
-            snapshot = token.split("=", 1)[1]
-    return snapshot
+    return parsed.snapshot or DEFAULT_SNAPSHOT
 
 
 def main(argv: list[str] | None = None) -> int:

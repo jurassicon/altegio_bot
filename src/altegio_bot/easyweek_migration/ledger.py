@@ -52,7 +52,12 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.easyweek_migration.classify import LedgerView
-from altegio_bot.models.models import PROVIDER_ALTEGIO, PROVIDER_EASYWEEK, EasyWeekMigrationLedger
+from altegio_bot.models.models import (
+    PROVIDER_ALTEGIO,
+    PROVIDER_EASYWEEK,
+    EasyWeekMigrationLedger,
+    EasyWeekMigrationWaveClosure,
+)
 
 logger = logging.getLogger("easyweek_migration.ledger")
 
@@ -164,18 +169,91 @@ async def lock_migration_wave(session: AsyncSession, *, source_company_id: int, 
     )
 
 
+class WaveClosed(RuntimeError):
+    """This wave's reminders are EasyWeek's; it may not gain another booking.
+
+    An exception rather than a return value on purpose. The check protects a
+    real appointment from being created with no reminder ownership at all, and a
+    future caller that forgets to read a boolean would create it anyway.
+    """
+
+    def __init__(self, *, source_company_id: int, run_id: str) -> None:
+        super().__init__(WAVE_CLOSED)
+        self.reason = WAVE_CLOSED
+        self.source_company_id = source_company_id
+        self.run_id = run_id
+
+
+async def close_migration_wave(
+    session: AsyncSession,
+    *,
+    source_company_id: int,
+    run_id: str,
+    plan_digest: str,
+) -> bool:
+    """Record durably that this exact company/run pair has been handed over.
+
+    Called inside the handover's own transaction, so a rollback leaves no
+    closure and a commit closes every pair the snapshot claimed — including a
+    pair with no `created` row at all, which is exactly the case a per-row
+    marker could not express.
+
+    Idempotent for the SAME authorisation: a repeat of the same snapshot finds
+    its own row and reports success without writing twice. A different plan
+    digest is refused, because two different authorisations cannot both have
+    closed one wave.
+    """
+    existing = (
+        await session.execute(
+            select(EasyWeekMigrationWaveClosure).where(
+                EasyWeekMigrationWaveClosure.source_provider == PROVIDER_ALTEGIO,
+                EasyWeekMigrationWaveClosure.source_company_id == source_company_id,
+                EasyWeekMigrationWaveClosure.run_id == run_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        return existing.plan_digest == plan_digest
+    await session.execute(
+        pg_insert(EasyWeekMigrationWaveClosure)
+        .values(
+            source_provider=PROVIDER_ALTEGIO,
+            source_company_id=source_company_id,
+            run_id=run_id,
+            plan_digest=plan_digest,
+            closed_at=_utcnow(),
+        )
+        .on_conflict_do_nothing(constraint="uq_easyweek_migration_wave_closure_identity")
+    )
+    return True
+
+
 async def wave_handed_over(session: AsyncSession, *, source_company_id: int, run_id: str) -> bool:
     """Have this wave's reminders already been handed over to EasyWeek?
 
-    True as soon as ONE row carries the marker: the handover marks every row of
-    the wave in a single transaction, so one marker means the whole wave was
-    proved, covered and closed. A booking added after that would be a `created`
-    row with no reminder ownership on either side — which is precisely the state
-    the handover exists to make impossible.
+    Two sources, and the first is the authority. A closure row is written for
+    every company/run pair a handover claims, so it answers for pairs that hold
+    no `created` row and could therefore never carry a marker — the case where
+    this used to answer "no" the moment the advisory lock was released, letting
+    a late retry POST a booking into a closed wave.
+
+    The row-level marker is still accepted, so a wave closed by an earlier
+    revision — before closure rows existed — keeps being recognised.
 
     Read under `lock_migration_wave`, or the answer can change while it is being
     acted on.
     """
+    closed = (
+        await session.execute(
+            select(EasyWeekMigrationWaveClosure.id).where(
+                EasyWeekMigrationWaveClosure.source_provider == PROVIDER_ALTEGIO,
+                EasyWeekMigrationWaveClosure.source_company_id == source_company_id,
+                EasyWeekMigrationWaveClosure.run_id == run_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if closed is not None:
+        return True
     found = (
         await session.execute(
             select(EasyWeekMigrationLedger.id)
@@ -231,7 +309,15 @@ async def claim_for_apply(
     arbitrates rather than a read-then-write race in the tool. This is the reason
     a concurrent second apply cannot double-book: only one INSERT wins, and only
     the winner is allowed to call EasyWeek.
+
+    Raises :class:`WaveClosed` when this wave's reminders have already moved to
+    EasyWeek. The check lives HERE rather than in the caller: it is the last
+    point before a real appointment is created, and a guard that only one caller
+    happens to perform is a guard the next caller will not.
     """
+    await lock_migration_wave(session, source_company_id=source_company_id, run_id=run_id)
+    if await wave_handed_over(session, source_company_id=source_company_id, run_id=run_id):
+        raise WaveClosed(source_company_id=source_company_id, run_id=run_id)
     now = _utcnow()
     stmt = (
         pg_insert(EasyWeekMigrationLedger)
@@ -674,6 +760,14 @@ async def resolve_uncertain_as_created(
     origin ``run_id`` is preserved, so the booking stays inside the rollback set
     of the apply that created it.
     """
+    await lock_migration_wave(session, source_company_id=source_company_id, run_id=run_id)
+    if await wave_handed_over(session, source_company_id=source_company_id, run_id=run_id):
+        # Promoting a row into a closed wave would leave that booking's
+        # reminders owned by nobody. The row stays `uncertain`, so the booking
+        # is still recorded and still visible to reconciliation — it needs an
+        # operator, not a silent promotion.
+        raise WaveClosed(source_company_id=source_company_id, run_id=run_id)
+
     await _finalize(
         session,
         run_id=run_id,
