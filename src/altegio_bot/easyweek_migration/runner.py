@@ -26,7 +26,8 @@ from __future__ import annotations
 import logging
 import uuid as uuid_module
 from collections import Counter
-from dataclasses import dataclass
+from collections.abc import Collection
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, Final
 
@@ -38,6 +39,11 @@ from altegio_bot.easyweek_migration import baseline_store
 from altegio_bot.easyweek_migration import ledger as ledger_module
 from altegio_bot.easyweek_migration.altegio_source import build_window, fetch_company_records
 from altegio_bot.easyweek_migration.baseline_store import load_baselines
+from altegio_bot.easyweek_migration.bindings import (
+    MUTATION_CART_TWO,
+    MUTATION_SINGLE,
+    SUPPORTED_MUTATION_KINDS,
+)
 from altegio_bot.easyweek_migration.branch_identity import BranchIdentityResult, verify_branch_identity
 from altegio_bot.easyweek_migration.canary import (
     CANARY_IDENTITY_REQUIRED,
@@ -47,6 +53,7 @@ from altegio_bot.easyweek_migration.canary import (
     CANARY_POST_UNCERTAIN,
     CANARY_READBACK_FAILED,
     CANARY_REPROOF_FAILED,
+    SCOPE_CONTRACTS_UNKNOWN,
     CanaryBinding,
     CanaryVerdict,
     RecoveryAdmission,
@@ -60,6 +67,7 @@ from altegio_bot.easyweek_migration.canary import (
 )
 from altegio_bot.easyweek_migration.classify import (
     ALREADY_MIGRATED,
+    BLOCK_CONTRACT_UNSUPPORTED,
     BLOCK_SOURCE_CHANGED,
     BLOCKED,
     READY,
@@ -122,24 +130,46 @@ from altegio_bot.easyweek_migration.service_catalog import (
     CatalogSnapshot,
     ServiceBaseline,
     ServiceEvidenceError,
-    build_catalog_snapshot,
     expectation_from_manifest,
     prove_ordered_service,
+    read_full_catalog,
     read_ordered_service,
-    read_pagination,
     verify_baseline,
 )
 from altegio_bot.easyweek_migration.target_snapshot import (
     TargetSnapshotError,
     project_target,
+    prove_canceled_target,
 )
 from altegio_bot.easyweek_migration.write_client import (
+    CancelOutcome,
+    EasyWeekCancelNotSent,
     EasyWeekMigrationWriteClient,
     EasyWeekUncertainMutation,
     build_booking_request,
+    build_cart_booking_request,
 )
 
 logger = logging.getLogger("easyweek_migration.runner")
+
+# The mutation contracts this build can actually write END TO END. A decision
+# naming anything else is refused before the ledger claim: a contract with no
+# complete path is a row for a person, not an exception thrown half-way through
+# a bulk apply.
+#
+# `cart_two` is deliberately NOT written yet. Its classification, its request
+# builder, its write client and its canary isolation are all in place and
+# tested — what is missing is the readback: `TargetSnapshot` projects ONE
+# service, and proving a two-line booking needs it to carry both signatures,
+# which changes the fingerprint the ledger already stores for every migrated
+# single booking.
+#
+# Creating a real appointment we could not then prove is worse than not creating
+# it, so the gate stays shut until the readback proves two lines.
+#
+# The set itself now lives in `bindings`, because the CLASSIFIER enforces it:
+# refusing the contract while the plan is built is what makes a dry-run and an
+# apply say the same thing about the same booking.
 
 MODE_INVENTORY: Final = "inventory"
 MODE_DRY_RUN: Final = "dry-run"
@@ -163,7 +193,36 @@ ROLLBACK_TARGET_MISSING: Final = "rollback_target_missing"
 ROLLBACK_TARGET_MODIFIED: Final = "rollback_target_modified_after_migration"
 ROLLBACK_TARGET_UNREADABLE: Final = "rollback_target_unreadable"
 ROLLBACK_ELIGIBLE: Final = "rollback_eligible"
+# The cancel was attempted and its outcome could not be proven: a timeout, a
+# transport failure, a 5xx, or a 2xx the booking did not read back as cancelled.
+# The ledger stays `created` — a live booking recorded as rolled back would
+# disappear from every later reconciliation.
+ROLLBACK_UNCERTAIN: Final = "rollback_uncertain"
+# The cancel was refused deterministically: nothing changed, and the ledger is
+# untouched.
+ROLLBACK_REFUSED: Final = "rollback_refused"
 ROLLBACK_NO_SNAPSHOT: Final = "rollback_target_snapshot_missing"
+# A durable attempt of OURS exists and the booking now reads as cancelled: the
+# PUT did land, we simply never saw it. The row is completed WITHOUT a second
+# mutation — this is the recovery the attempt marker exists for.
+ROLLBACK_RECOVERED: Final = "rollback_recovered_from_attempt"
+# The same situation seen by a dry-run, which proves it and writes nothing.
+ROLLBACK_RECOVERY_AVAILABLE: Final = "rollback_recovery_available"
+# Our attempt exists and the booking is STILL live. A second PUT is exactly the
+# unknown-outcome repeat this design bans, so nothing is sent and an operator
+# decides. Deliberately distinct from `rollback_uncertain`, which describes the
+# attempt that has just happened rather than one found on a later run.
+ROLLBACK_ATTEMPT_UNRESOLVED: Final = "rollback_attempt_unresolved"
+# The mutation right went to another run, or the row moved between the candidate
+# list and the claim. Nothing was sent, and nothing about the row was changed.
+ROLLBACK_CLAIM_LOST: Final = "rollback_claim_not_acquired"
+# Proven that the cancel never left: the read immediately before it failed. The
+# row keeps no marker, because there is no unknown mutation to keep one for.
+ROLLBACK_NOT_SENT: Final = "rollback_cancel_not_sent"
+# The booking was already cancelled when this run looked, moments before its own
+# PUT. Somebody else did it — another process, another operator, the UI — so it
+# is not recorded as this run's rollback.
+ROLLBACK_CANCELED_ELSEWHERE: Final = "rollback_target_canceled_elsewhere"
 # The booking names no master, so rollback proves one the same way every other
 # path does. An unproven master is an unproven target, and an unproven target is
 # never cancelled.
@@ -289,32 +348,8 @@ class ServiceEvidence:
         Goes through the shared client, so the existing rate limiter and its
         bounded, safe GET retries still apply. Nothing here fans out.
         """
-        rows: list[Any] = []
-        page = 1
-        while True:
-            try:
-                payload = await write_client.list_location_services(location_uuid, page=page)
-            except EasyWeekError:
-                return self._refuse(location_uuid, CATALOG_UNREADABLE)
-            data = payload.get("data")
-            if not isinstance(data, list):
-                return self._refuse(location_uuid, CATALOG_UNREADABLE)
-            try:
-                last_page, total = read_pagination(payload.get("meta"), page=page)
-            except ServiceEvidenceError as exc:
-                return self._refuse(location_uuid, exc.reason)
-            rows.extend(data)
-            if page >= last_page:
-                if len(rows) != total:
-                    # A page set that does not add up to the stated total is a
-                    # partial catalogue, and a partial catalogue cannot prove
-                    # that anything in it is unique.
-                    return self._refuse(location_uuid, CATALOG_UNREADABLE)
-                break
-            page += 1
-
         try:
-            snapshot = build_catalog_snapshot(location_uuid, rows)
+            snapshot = await read_full_catalog(write_client, location_uuid=location_uuid)
         except ServiceEvidenceError as exc:
             return self._refuse(location_uuid, exc.reason)
         self._observations += 1
@@ -646,11 +681,22 @@ async def run_inventory_or_dry_run(
     return report
 
 
-def _binding_for(inputs: RunInputs, branch_identity: BranchIdentityResult) -> CanaryBinding:
-    """The durable identity of the wave these inputs describe.
+def _binding_for(
+    inputs: RunInputs,
+    branch_identity: BranchIdentityResult,
+    *,
+    contract_kind: str,
+) -> CanaryBinding:
+    """The durable identity of the wave these inputs describe, for ONE contract.
 
     One place, so a command that continues a wave cannot compute the wave's name
     slightly differently from the command that created it.
+
+    ``contract_kind`` is required rather than defaulted. A default would be a
+    silent answer to the one question this function exists to keep honest: a
+    cart canary stored under `single` would license single bulk applies, and a
+    single canary read back as cart would license cart ones. Every caller has to
+    say which contract it is talking about.
     """
     return build_binding(
         manifest_digest=inputs.manifest.digest,
@@ -658,13 +704,16 @@ def _binding_for(inputs: RunInputs, branch_identity: BranchIdentityResult) -> Ca
         cutover_at=inputs.cutover.at,
         horizon_days=inputs.horizon_days,
         branch_result=branch_identity,
+        contract_kind=contract_kind,
     )
 
 
 async def _require_proven_scope(
     session_maker: async_sessionmaker[AsyncSession],
     inputs: RunInputs,
-) -> tuple[ScopeVerdict, CanaryBinding | None]:
+    *,
+    contract_kinds: Collection[str] = SUPPORTED_MUTATION_KINDS,
+) -> tuple[ScopeVerdict, tuple[CanaryBinding, ...]]:
     """Prove that these arguments describe the wave that was actually migrated.
 
     Every command that *continues* a wave — the reconciliations and the
@@ -678,11 +727,34 @@ async def _require_proven_scope(
     """
     branch_identity = verify_branch_identity(inputs.manifest)
     if not branch_identity.proven:
-        return ScopeVerdict(proven=False, reason=GATE_BRANCH_IDENTITY_UNPROVEN), None
-    binding = _binding_for(inputs, branch_identity)
+        return ScopeVerdict(proven=False, reason=GATE_BRANCH_IDENTITY_UNPROVEN), ()
+
+    # One binding per contract, and EVERY one of them has to be proven.
+    #
+    # The ledger does not record which contract created a row, so a command that
+    # continues a wave cannot narrow the question to the contracts it will
+    # actually meet — it has to answer for the full set this build can write.
+    # That is the conservative direction: it can refuse a wave whose rows all
+    # came from one contract, and it can never pass a wave containing a contract
+    # no canary ever proved. When the ledger learns to name its contract this
+    # narrows to the kinds actually present in scope.
+    bindings = tuple(_binding_for(inputs, branch_identity, contract_kind=kind) for kind in sorted(contract_kinds))
+    if not bindings:
+        # Nothing to prove means nothing was proven.
+        return ScopeVerdict(proven=False, reason=SCOPE_CONTRACTS_UNKNOWN), ()
+
+    proven: ScopeVerdict | None = None
     async with session_maker() as session:
-        verdict = await find_proven_scope(session, binding=binding)
-    return verdict, binding
+        for binding in bindings:
+            verdict = replace(
+                await find_proven_scope(session, binding=binding),
+                contract_kind=binding.contract_kind,
+            )
+            if not verdict.proven:
+                return verdict, bindings
+            proven = verdict
+    assert proven is not None  # `bindings` is non-empty and every one passed.
+    return proven, bindings
 
 
 async def _prepare_write_gate(
@@ -732,9 +804,32 @@ async def _prepare_write_gate(
 
     canary_verdict: CanaryVerdict | None = None
     if require_canary_proof:
-        binding = _binding_for(inputs, branch_identity)
+        # A proof licenses ONE contract. The apply therefore asks once per
+        # contract it is actually going to execute — the kinds carried by the
+        # decisions it will write, not the kinds it could theoretically meet —
+        # and the first missing proof shuts the gate.
+        #
+        # This is what stops a mixed plan from riding on one canary: a wave of
+        # single bookings plus one two-service booking needs BOTH proofs, and a
+        # verified single canary answers only for the single half.
+        # With nothing ready to write — a rerun whose rows are all already
+        # migrated — the question falls back to the wave's own contract. That is
+        # not a weakening: a plan with no ready row creates nothing whatever the
+        # verdict says, and asking about `single` keeps the report carrying a
+        # real answer instead of a licence computed from an empty set.
+        pending_kinds = sorted({decision.mutation_kind for decision in decisions if decision.outcome == READY}) or [
+            MUTATION_SINGLE
+        ]
         async with session_maker() as session:
-            canary_verdict = await find_licensing_proof(session, binding=binding)
+            for kind in pending_kinds:
+                binding = _binding_for(inputs, branch_identity, contract_kind=kind)
+                verdict = replace(
+                    await find_licensing_proof(session, binding=binding),
+                    contract_kind=kind,
+                )
+                canary_verdict = verdict
+                if not verdict.licensed:
+                    break
 
     gate: ApplyGateResult = evaluate_apply_gate(
         apply_requested=inputs.apply_requested,
@@ -867,9 +962,6 @@ async def run_canary(
         require_canary_proof=False,
         http_client=http_client,
     )
-    binding = _binding_for(inputs, branch_identity)
-    report.canary_binding = binding.as_safe_dict()
-
     chosen: Decision | None = None
     for decision in decisions:
         if (
@@ -892,6 +984,13 @@ async def run_canary(
         report.note(chosen)
         report.errors.append(CANARY_NOT_READY)
         return report
+
+    # The binding is built from the contract the canary is ABOUT TO EXECUTE, not
+    # from a default. A cart canary stored under `single` would be evidence
+    # about a two-service POST filed under the name of the one-service POST, and
+    # every later bulk apply of single bookings would read it as its licence.
+    binding = _binding_for(inputs, branch_identity, contract_kind=chosen.mutation_kind)
+    report.canary_binding = binding.as_safe_dict()
 
     evidence = await load_service_evidence(session_maker, inputs)
     report.service_evidence = evidence.as_safe_dict()
@@ -1029,8 +1128,20 @@ async def _apply_one(
     assert decision.duration_minutes is not None
     assert decision.easyweek_location_uuid is not None
     assert decision.easyweek_staff_uuid is not None
-    assert decision.easyweek_service_uuid is not None
     assert decision.easyweek_customer_uuid is not None
+
+    # Which contract writes this booking. The cart endpoint has its own proven
+    # body and its own readback shape (plan §30.12), and the two must not be
+    # confused: reaching for a single service uuid on a two-service booking
+    # would either write half of it or raise mid-apply.
+    #
+    # An unknown kind refuses HERE, before the ledger is claimed and before any
+    # request leaves — a contract this build cannot write is a row for a person,
+    # never a crash inside a bulk run.
+    if decision.mutation_kind not in SUPPORTED_MUTATION_KINDS:
+        return BLOCKED, BLOCK_CONTRACT_UNSUPPORTED
+    if decision.mutation_kind == MUTATION_SINGLE:
+        assert decision.easyweek_service_uuid is not None
 
     company_id = decision.source_company_id
     record_id = decision.source_record_id
@@ -1111,18 +1222,38 @@ async def _apply_one(
     marker = ledger_module.migration_marker(source_company_id=company_id, source_record_id=record_id)
     starts_at_iso = decision.starts_at_utc.isoformat().replace("+00:00", "Z")
 
-    body = build_booking_request(
-        location_uuid=decision.easyweek_location_uuid,
-        staffer_uuid=decision.easyweek_staff_uuid,
-        service_uuid=decision.easyweek_service_uuid,
-        customer_phone=card.phone,
-        customer_first_name=card.first_name or "",
-        reserved_on_utc_iso=starts_at_iso,
-        comment=marker,
-    )
+    # The endpoint follows the contract, and only the contract. `single` is the
+    # plain `POST /bookings` this migration has always used; `cart_two` is the
+    # `POST /bookings/cart` a real canary proved for exactly two services on one
+    # master (plan §30.12). Each has its own body builder, and neither builder
+    # accepts the other's shape.
+    if decision.mutation_kind == MUTATION_CART_TWO:
+        body = build_cart_booking_request(
+            location_uuid=decision.easyweek_location_uuid,
+            customer_phone=card.phone,
+            customer_first_name=card.first_name or "",
+            datetime_start_utc_iso=starts_at_iso,
+            comment=marker,
+            # The source's own order, unchanged from the plan the operator
+            # reviewed and from the fingerprint that covers it.
+            services=[(item.easyweek_service_uuid, item.staffer_uuid) for item in decision.bindings],
+        )
+    else:
+        body = build_booking_request(
+            location_uuid=decision.easyweek_location_uuid,
+            staffer_uuid=decision.easyweek_staff_uuid,
+            service_uuid=decision.easyweek_service_uuid,
+            customer_phone=card.phone,
+            customer_first_name=card.first_name or "",
+            reserved_on_utc_iso=starts_at_iso,
+            comment=marker,
+        )
 
     try:
-        created = await write_client.create_booking(body)
+        if decision.mutation_kind == MUTATION_CART_TWO:
+            created = await write_client.create_cart_booking(body)
+        else:
+            created = await write_client.create_booking(body)
     except EasyWeekUncertainMutation as exc:
         async with session_maker() as session:
             async with session.begin():
@@ -1299,7 +1430,7 @@ async def run_reconcile(
     # Which wave is this? Asked FIRST, before the live source or any target is
     # read, so a command describing a different wave cannot reach a verdict —
     # let alone a passing one — about this wave's bookings.
-    scope, _binding = await _require_proven_scope(session_maker, inputs)
+    scope, _bindings = await _require_proven_scope(session_maker, inputs)
     report.scope = scope.as_safe_dict()
     if not scope.proven:
         report.errors.append(scope.reason)
@@ -1920,7 +2051,7 @@ async def run_resolve_created(
     # whatever scope the operator happens to be holding today. A different
     # cutover would re-classify the source and rebuild a different "expected"
     # booking to compare the live one against.
-    scope, binding = await _require_proven_scope(session_maker, inputs)
+    scope, bindings = await _require_proven_scope(session_maker, inputs)
     report.scope = scope.as_safe_dict()
 
     recoverable_proof_id: int | None = None
@@ -1942,18 +2073,29 @@ async def run_resolve_created(
         # Widening the trigger does not widen the door: `_admit_canary_recovery`
         # still demands an EXACT binding, so wave A's proof can never admit
         # wave B, and every other use of an unverified proof stays shut.
-        if binding is None:
+        if not bindings:
             report.errors.append(scope.reason)
             report.reasons[scope.reason] += 1
             return report
 
-        admission, recoverable_proof_id = await _admit_canary_recovery(
-            session_maker,
-            inputs,
-            binding=binding,
-            company_id=company_id,
-            record_id=record_id,
-        )
+        # One attempt per contract. `_admit_canary_recovery` demands an EXACT
+        # binding, so at most one of these can match: the contract the stuck
+        # canary was actually written under. Trying them in turn is how the
+        # recovery finds that contract without being told which one it was, and
+        # it opens no door — a proof filed under another contract still fails
+        # the exact match.
+        admission = None
+        for candidate in bindings:
+            admission, recoverable_proof_id = await _admit_canary_recovery(
+                session_maker,
+                inputs,
+                binding=candidate,
+                company_id=company_id,
+                record_id=record_id,
+            )
+            if admission.admitted:
+                break
+        assert admission is not None  # `bindings` is non-empty here.
         report.canary_recovery = admission.as_safe_dict()
         if not admission.admitted:
             # Neither an ordinary verified wave nor a recoverable canary attempt.
@@ -2173,11 +2315,24 @@ async def run_rollback(
                 row.target_booking_uuid,
                 row.target_snapshot_fingerprint,
                 row.source_fingerprint,
+                row.rollback_attempted_at is not None,
+                row.rollback_attempt_run_id,
+                row.run_id,
             )
             for row in rows
         ]
 
-    for safe_row, company_id, record_id, target, stored_fingerprint, source_fingerprint in candidates:
+    for (
+        safe_row,
+        company_id,
+        record_id,
+        target,
+        stored_fingerprint,
+        source_fingerprint,
+        attempted_at,
+        attempt_run_id,
+        origin_run_id,
+    ) in candidates:
         entry = dict(safe_row)
 
         def _refuse(reason: str) -> None:
@@ -2206,6 +2361,75 @@ async def run_rollback(
             continue
 
         marker = ledger_module.migration_marker(source_company_id=company_id, source_record_id=record_id)
+
+        # -- did OUR cancel already land? -----------------------------------
+        # Asked before the projection, because the projection refuses a
+        # cancelled booking and cannot tell the two cancellations apart:
+        #
+        #   * a booking cancelled by a person is a target somebody modified —
+        #     unchanged behaviour, and never claimed as our rollback;
+        #   * a booking cancelled while OUR attempt marker was standing is our
+        #     own PUT whose result we never saw, and finishing that row costs
+        #     no mutation at all.
+        #
+        # The marker is proven inside `prove_canceled_target`, so a booking that
+        # is not one this migration wrote can never reach either branch.
+        try:
+            already_canceled = prove_canceled_target(booking, expected_marker=marker)
+        except TargetSnapshotError:
+            _refuse(ROLLBACK_TARGET_MODIFIED)
+            continue
+
+        if already_canceled:
+            # Nothing is weakened by answering here, before the snapshot, staff
+            # and service proofs: those exist to decide whether a booking may be
+            # CANCELLED, and this branch cancels nothing. They also cannot run
+            # on a cancelled booking at all — `project_target` refuses one by
+            # design. What licenses the completion instead is the attempt marker
+            # itself: it is only ever written after every one of those proofs
+            # passed, moments before the PUT that this row is still waiting on.
+            if not attempted_at:
+                # Cancelled by somebody else, or before this tool ever tried.
+                # Not ours to claim, and not a rollback we performed.
+                _refuse(ROLLBACK_TARGET_MODIFIED)
+                continue
+            if not inputs.rollback_confirmed:
+                # A dry-run states the finding and changes nothing.
+                entry["rollback_outcome"] = ROLLBACK_RECOVERY_AVAILABLE
+                report.reasons[ROLLBACK_RECOVERY_AVAILABLE] += 1
+                report.created_rows.append(entry)
+                continue
+            # Finishing SOMEBODY'S attempt — this run's own, or the earlier
+            # run's whose result was never seen. Conditional on that exact
+            # attempt still standing: if it was released or replaced while this
+            # booking was being read, the evidence moved and the conclusion goes
+            # with it.
+            assert attempt_run_id is not None
+            async with session_maker() as session:
+                async with session.begin():
+                    recorded = await ledger_module.record_rolled_back(
+                        session,
+                        run_id=inputs.run_id,
+                        source_company_id=company_id,
+                        source_record_id=record_id,
+                        expected_attempt_run_id=attempt_run_id,
+                    )
+            if not recorded:
+                _refuse(ROLLBACK_ATTEMPT_UNRESOLVED)
+                continue
+            entry["rollback_outcome"] = ROLLBACK_RECOVERED
+            report.reasons[ROLLBACK_RECOVERED] += 1
+            report.created_rows.append(entry)
+            continue
+
+        if attempted_at:
+            # Our attempt is on the row and the booking is still live. Either the
+            # PUT never left, or it left and did nothing. Both readings forbid an
+            # automatic second PUT: EasyWeek publishes no idempotency key, and a
+            # blind repeat is the unknown mutation this design refuses to make.
+            _refuse(ROLLBACK_ATTEMPT_UNRESOLVED)
+            continue
+
         try:
             live = project_target(booking, expected_marker=marker)
         except TargetSnapshotError:
@@ -2279,16 +2503,148 @@ async def run_rollback(
             report.created_rows.append(entry)
             continue
 
-        await write_client.cancel_booking(target)
-        report.mutations_attempted += 1
+        # -- take the mutation right, atomically -----------------------------
+        # ONE conditional UPDATE is both the marker and the lock. Two rollback
+        # runs walking the same wave used to read a NULL marker and both go on
+        # to send a cancel; now exactly one of them can win the row, and the
+        # loser is out of the mutation path entirely.
+        #
+        # The claim also re-tests every fact the decision above rested on —
+        # status, origin run, target uuid — so a row that moved while these
+        # proofs were being fetched is not mutated on stale evidence.
         async with session_maker() as session:
             async with session.begin():
-                await ledger_module.record_rolled_back(
+                claim = await ledger_module.claim_rollback_attempt(
                     session,
                     run_id=inputs.run_id,
                     source_company_id=company_id,
                     source_record_id=record_id,
+                    origin_run_id=origin_run_id,
+                    target_booking_uuid=target,
                 )
+        if not claim.won:
+            # A loser sends nothing, ever. It reports what it found and leaves
+            # the row to whoever owns it — including the case where that owner
+            # is a run whose own outcome is still unknown.
+            entry["rollback_outcome"] = ROLLBACK_CLAIM_LOST
+            entry["reason"] = claim.reason
+            if claim.owner_run_id is not None:
+                # Which run to go and read. Without it `rollback_claim_lost` says
+                # only that somebody else got there first, and an operator has no
+                # way to find the report that says what happened to this booking.
+                #
+                # It comes from the claim — the row as it stood at that instant —
+                # never from the candidate snapshot, which was read before the
+                # race and says nobody owned the row. And it is only set when an
+                # owner was actually observed: a row that vanished or moved has
+                # no owner to name, and inventing one would send an operator
+                # looking for a run that never existed.
+                #
+                # A run id is a technical identifier: no customer, no booking
+                # content, no provider text.
+                entry["rollback_claim_owner_run_id"] = claim.owner_run_id
+            report.reasons[ROLLBACK_CLAIM_LOST] += 1
+            report.created_rows.append(entry)
+            continue
+
+        async def _release(entry: dict[str, Any], reason: str) -> None:
+            """Hand the mutation right back, then report `reason`.
+
+            Used only where it is PROVEN that no cancel is in flight. If the
+            release itself does not take — somebody else owns the marker, or it
+            is already gone — the row is reported unresolved instead: claiming a
+            retry is safe when the durable state says otherwise is exactly the
+            direction this design never goes.
+            """
+            async with session_maker() as session:
+                async with session.begin():
+                    released = await ledger_module.release_rollback_attempt(
+                        session,
+                        run_id=inputs.run_id,
+                        source_company_id=company_id,
+                        source_record_id=record_id,
+                    )
+            outcome = reason if released else ROLLBACK_ATTEMPT_UNRESOLVED
+            entry["rollback_outcome"] = outcome
+            report.reasons[outcome] += 1
+            report.created_rows.append(entry)
+
+        # `mutations_attempted` counts EXTERNAL mutation requests, and holding
+        # the claim is not one. `cancel_booking` begins with a read of its own,
+        # so counting here charged the wave for two paths where the PUT provably
+        # never left — a failed preflight and a booking somebody had already
+        # cancelled — and the number an operator uses to ask "what did this run
+        # change in EasyWeek?" was therefore too high exactly when nothing was
+        # changed. Each branch below counts for itself.
+        try:
+            outcome = await write_client.cancel_booking(target)
+        except EasyWeekCancelNotSent:
+            # (A) Proven NOT sent: the read immediately before the PUT failed.
+            # There is no unknown mutation, so there must be no marker claiming
+            # one — otherwise a cancellation somebody makes by hand tomorrow
+            # would be read as this attempt finishing late.
+            #
+            # Not counted: no request reached the cancel endpoint.
+            await _release(entry, ROLLBACK_NOT_SENT)
+            continue
+        except EasyWeekUncertainMutation:
+            # (C) The cancel may or may not have landed, or it landed and the
+            # booking would not read back as cancelled. Either way the ledger
+            # keeps saying `created`: `rolled_back` is a claim about a real
+            # appointment, and recording it on an unproven cancel would hide a
+            # live booking from every later reconciliation.
+            #
+            # The marker STAYS. This is the one state it exists for.
+            #
+            # Counted: the PUT left, which is precisely why its outcome is
+            # unknown. An attempt is what was attempted, not what succeeded.
+            report.mutations_attempted += 1
+            entry["rollback_outcome"] = ROLLBACK_UNCERTAIN
+            report.reasons[ROLLBACK_UNCERTAIN] += 1
+            report.created_rows.append(entry)
+            continue
+        except EasyWeekError as exc:
+            # (B) A deterministic refusal: the request was answered, and the
+            # answer says nothing changed. That is not an unknown mutation
+            # either, so the marker goes back — otherwise the cause could be
+            # fixed and the next explicit rollback would find itself locked out
+            # by a claim about a cancel that provably never happened.
+            #
+            # Counted: the request was made and the provider answered it.
+            report.mutations_attempted += 1
+            entry["reason"] = _safe_error_code(exc)
+            await _release(entry, ROLLBACK_REFUSED)
+            continue
+
+        if outcome is CancelOutcome.ALREADY_CANCELED_NO_MUTATION:
+            # Somebody cancelled it between the proofs above and this run's own
+            # PUT. No mutation was sent, so the marker goes back — and the row
+            # is NOT recorded as this rollback's work, because it is not.
+            #
+            # Not counted: the read found the booking already cancelled and the
+            # cancel endpoint was never called.
+            await _release(entry, ROLLBACK_CANCELED_ELSEWHERE)
+            continue
+
+        # (D) Proven cancelled — `cancel_booking` read it back before returning.
+        # One PUT left and its effect was read back, so it counts. Finalised
+        # conditionally on this run still owning the attempt, so a marker that
+        # changed underneath cannot be finished by the wrong run.
+        report.mutations_attempted += 1
+        async with session_maker() as session:
+            async with session.begin():
+                recorded = await ledger_module.record_rolled_back(
+                    session,
+                    run_id=inputs.run_id,
+                    source_company_id=company_id,
+                    source_record_id=record_id,
+                    expected_attempt_run_id=inputs.run_id,
+                )
+        if not recorded:
+            entry["rollback_outcome"] = ROLLBACK_ATTEMPT_UNRESOLVED
+            report.reasons[ROLLBACK_ATTEMPT_UNRESOLVED] += 1
+            report.created_rows.append(entry)
+            continue
         entry["rollback_outcome"] = ledger_module.STATUS_ROLLED_BACK
         report.reasons[ledger_module.STATUS_ROLLED_BACK] += 1
         report.created_rows.append(entry)

@@ -139,6 +139,13 @@ from altegio_bot.perf import perf_log
 from altegio_bot.promo_discount_apply import process_promo_apply_existing_booking_job
 from altegio_bot.providers.base import WhatsAppProvider
 from altegio_bot.providers.dummy import safe_send, safe_send_template
+from altegio_bot.reminder_ownership import (
+    HANDOVER_JOB_TYPES,
+    REASON_HANDED_OVER,
+    REASON_UNKNOWN,
+    ReminderOwner,
+    altegio_reminders_are_suppressed,
+)
 from altegio_bot.services import meta_circuit
 from altegio_bot.services.meta_error_classifier import (
     is_permanent_meta_template_error,
@@ -229,6 +236,11 @@ MAX_EASYWEEK_CONFIG_BACKOFF_EXPONENT = 5
 # real WhatsApp send attempts. This prevents transient Altegio API outages from
 # consuming the send-attempt budget.
 MAX_API_GUARD_ATTEMPTS = 5
+
+# Bounded retries for an unanswerable reminder-ownership lookup. Its own budget,
+# separate from `attempts`, and it ends in `failed` rather than in a send.
+MAX_REMINDER_OWNERSHIP_ATTEMPTS = 5
+_REMINDER_OWNERSHIP_ATTEMPTS_KEY = "_reminder_ownership_attempts"
 
 # Separate counter for the follow-up live Altegio guard stored in job.payload.
 # Independent from _api_guard_attempts (which serves review_3d / repeat_10d / comeback_3d)
@@ -400,6 +412,35 @@ def _handle_api_guard_error(job: MessageJob, exc: Exception) -> None:
     job.locked_at = None
     job.run_at = utcnow() + timedelta(seconds=delay)
     job.last_error = f"Altegio API error: {exc}"
+
+
+def _handle_reminder_ownership_unproven(job: MessageJob) -> None:
+    """Requeue a reminder whose ownership could not be proven (plan §30.11).
+
+    Its own counter in ``job.payload``, for the same reason the API guard has
+    one: ``attempts`` is the budget for real WhatsApp send attempts, and a
+    question the database could not answer is not a failed send. Burning one
+    here would push a later, genuine retry closer to `Max attempts reached`.
+
+    After the bounded retries the job FAILS rather than sending. An ownership
+    lookup that never becomes answerable is a state a person has to look at,
+    and the one outcome that must not follow from it is a customer being told
+    about an appointment that now lives in another system.
+    """
+    payload = dict(getattr(job, "payload", None) or {})
+    count = int(payload.get(_REMINDER_OWNERSHIP_ATTEMPTS_KEY, 0)) + 1
+    payload[_REMINDER_OWNERSHIP_ATTEMPTS_KEY] = count
+    job.payload = payload
+    job.locked_at = None
+    job.updated_at = utcnow()
+    job.last_error = REASON_UNKNOWN
+
+    if count >= MAX_REMINDER_OWNERSHIP_ATTEMPTS:
+        job.status = "failed"
+        return
+
+    job.status = "queued"
+    job.run_at = utcnow() + timedelta(seconds=_retry_delay_seconds(count))
 
 
 def _followup_live_guard_delay_seconds(attempt: int) -> int:
@@ -3106,6 +3147,59 @@ async def _run_job_logic(
             job.status = "canceled"
             job.locked_at = None
             job.last_error = _stale_err
+            return
+
+    # Reminder ownership, the second line of defence (plan §30.11).
+    #
+    # The planner fence is not enough on its own: a reminder queued before the
+    # handover, inserted by hand, or created by a delivery that raced the
+    # handover's commit is already sitting here. This is the last point at which
+    # it can be stopped, and it is deliberately BEFORE the template, the render,
+    # the sender, Meta and the Chatwoot mirror — so a job whose ownership moved
+    # costs no external call at all.
+    #
+    # Altegio only. An EasyWeek reminder carries the same two job types and is
+    # the very thing the handover created; suppressing it here would undo the
+    # handover instead of protecting it.
+    # `record is not None` on purpose: without a Record there is no source
+    # identity to look the handover up by, and a reminder with no record is
+    # already handled by the checks that follow. Widening the fence to cover it
+    # would replace an existing, unrelated verdict with this one.
+    if record is not None and job_provider == PROVIDER_ALTEGIO and job.job_type in HANDOVER_JOB_TYPES:
+        suppressed, owner = await altegio_reminders_are_suppressed(
+            session,
+            company_id=job.company_id,
+            altegio_record_id=getattr(record, "altegio_record_id", None),
+        )
+        if suppressed and owner is ReminderOwner.EASYWEEK:
+            # Proven: EasyWeek owns this booking's reminders. Terminal, and NOT
+            # a failed send — `attempts` is untouched because nothing was
+            # attempted, and burning one would push an unrelated future retry
+            # closer to `Max attempts reached`.
+            job.status = "canceled"
+            job.locked_at = None
+            job.updated_at = utcnow()
+            job.last_error = REASON_HANDED_OVER
+            logger.info(
+                "Altegio reminder suppressed: job_id=%s company=%s job_type=%s owner=easyweek",
+                job.id,
+                job.company_id,
+                job.job_type,
+            )
+            return
+        if suppressed:
+            # Could not be answered. Not a licence to send, and not a terminal
+            # verdict either. Requeued on its own payload counter, exactly like
+            # the Altegio API guard above, so a question we could not answer
+            # never spends the `attempts` budget reserved for real send
+            # attempts — and never silently becomes a message.
+            _handle_reminder_ownership_unproven(job)
+            logger.error(
+                "Altegio reminder ownership unproven: job_id=%s company=%s job_type=%s",
+                job.id,
+                job.company_id,
+                job.job_type,
+            )
             return
 
     if _deadline_passed_for_send(job, record):

@@ -34,6 +34,7 @@ from pathlib import Path
 import pytest
 import pytest_asyncio
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from altegio_bot.settings import Settings
@@ -264,6 +265,92 @@ async def test_migration_compatibility_scenarios(temp_db_url) -> None:
         f"the marker index must be PARTIAL on the recovery scan's predicate: {marker_index}"
     )
 
+    # PR-11.2 revision 24 (f3c8a1e5d709): the reminder-ownership marker.
+    #
+    # Checked as a SHAPE for the same reason as the marker above. Two nullable
+    # columns held together by a CHECK, and a PARTIAL index carrying exactly the
+    # predicate the runtime fence uses — that fence runs inside the Altegio
+    # planning transaction on every create/update delivery, so a full index
+    # would quietly stop being the thing this migration claims to create.
+    handed_over = await _column(temp_db_url, _LEDGER_TABLE, _HANDOVER_AT_COLUMN)
+    assert handed_over is not None, f"{_HANDOVER_AT_COLUMN} is missing after upgrade head"
+    assert handed_over[0] == "timestamp with time zone", f"unexpected type: {handed_over}"
+    assert handed_over[1] == "YES", "NULL is how 'ownership has not moved' is expressed"
+
+    plan_digest = await _column(temp_db_url, _LEDGER_TABLE, _HANDOVER_DIGEST_COLUMN)
+    assert plan_digest is not None, f"{_HANDOVER_DIGEST_COLUMN} is missing after upgrade head"
+    assert plan_digest[0] == "character varying", f"unexpected type: {plan_digest}"
+    assert plan_digest[1] == "YES"
+    assert plan_digest[3] == 64, f"the digest column must hold a sha256 hex string: {plan_digest}"
+
+    assert _HANDOVER_CHECK in await _constraint_names(temp_db_url, _LEDGER_TABLE), (
+        "the two marker columns must be held together by a CHECK: half a marker "
+        "would let the planner fence answer while the apply's digest comparison could not"
+    )
+
+    handover_index = await _ledger_index(temp_db_url, _HANDOVER_INDEX)
+    assert handover_index is not None, f"{_HANDOVER_INDEX} is missing after upgrade head"
+    predicate = " ".join(handover_index.split()).lower()
+    assert f"where ({_HANDOVER_AT_COLUMN} is not null)" in predicate, (
+        f"the marker index must be PARTIAL on the fence's predicate: {handover_index}"
+    )
+    for column in ("source_provider", "source_company_id", "source_record_id"):
+        assert column in handover_index, f"the fence looks up by source identity: {handover_index}"
+
+    # And the CHECK is real, not merely declared.
+    #
+    # This needs a ROW. An UPDATE over an empty table touches nothing, so the
+    # constraint is never evaluated and `pytest.raises` fails — which is exactly
+    # what the first version of this test did, turning a mandatory CI check into
+    # one that could not pass. So: insert one minimal valid ledger row, prove
+    # each forbidden half is rejected, and then prove the legal pair is accepted.
+    await _exec(
+        temp_db_url,
+        f"INSERT INTO {_LEDGER_TABLE} "
+        "(source_provider, source_company_id, source_record_id, source_fingerprint, "
+        " target_provider, run_id, status) "
+        "VALUES ('altegio', 758285, 900001, repeat('f', 64), 'easyweek', 'check-probe', 'pending')",
+    )
+
+    # Each negative case in its own transaction: `_exec` opens and disposes one
+    # per call, so a failed statement cannot leave the next one running inside an
+    # aborted transaction and failing for the wrong reason.
+    for half in (
+        f"UPDATE {_LEDGER_TABLE} SET {_HANDOVER_AT_COLUMN} = now()",
+        f"UPDATE {_LEDGER_TABLE} SET {_HANDOVER_DIGEST_COLUMN} = repeat('a', 64)",
+    ):
+        with pytest.raises(IntegrityError) as refused:
+            await _exec(temp_db_url, half)
+        assert _HANDOVER_CHECK in str(refused.value), (
+            f"a different constraint refused this, not the marker CHECK: {refused.value}"
+        )
+
+    marker_state = await _fetch(
+        temp_db_url,
+        f"SELECT {_HANDOVER_AT_COLUMN}, {_HANDOVER_DIGEST_COLUMN} FROM {_LEDGER_TABLE}",
+    )
+    assert marker_state[0] == (None, None), "a refused UPDATE must have changed nothing"
+
+    # The legal pair goes through, so the CHECK is not simply rejecting writes.
+    await _exec(
+        temp_db_url,
+        f"UPDATE {_LEDGER_TABLE} SET {_HANDOVER_AT_COLUMN} = now(), {_HANDOVER_DIGEST_COLUMN} = repeat('a', 64)",
+    )
+    accepted = await _fetch(
+        temp_db_url,
+        f"SELECT {_HANDOVER_AT_COLUMN} IS NOT NULL, {_HANDOVER_DIGEST_COLUMN} FROM {_LEDGER_TABLE}",
+    )
+    assert accepted[0][0] is True
+    assert accepted[0][1] == "a" * 64
+
+    # Clearing both together is equally legal — ownership can only be recorded
+    # or absent, never half of either.
+    await _exec(
+        temp_db_url,
+        f"UPDATE {_LEDGER_TABLE} SET {_HANDOVER_AT_COLUMN} = NULL, {_HANDOVER_DIGEST_COLUMN} = NULL",
+    )
+    await _exec(temp_db_url, f"DELETE FROM {_LEDGER_TABLE} WHERE run_id = 'check-probe'")
+
     current = _alembic_ok("current", db_url=temp_db_url)
     assert _HEAD_REVISION in current
 
@@ -311,6 +398,13 @@ async def test_migration_compatibility_scenarios(temp_db_url) -> None:
     # that the migration remembered to name both.
     assert await _easyweek_event_column(temp_db_url, _RETENTION_DEFERRED_COLUMN) is None
     assert await _easyweek_event_index(temp_db_url, _RETENTION_DEFERRED_INDEX) is None
+
+    # The reminder-ownership marker goes too — columns, CHECK and index. A
+    # downgrade that left any of them would leave an environment carrying a
+    # constraint no revision admits to owning.
+    assert await _column(temp_db_url, _LEDGER_TABLE, _HANDOVER_AT_COLUMN) is None
+    assert await _column(temp_db_url, _LEDGER_TABLE, _HANDOVER_DIGEST_COLUMN) is None
+    assert await _ledger_index(temp_db_url, _HANDOVER_INDEX) is None
 
     remaining_indexes = await _fetch(
         temp_db_url,
@@ -524,6 +618,26 @@ async def _counts(db_url: str) -> dict[str, int]:
 
 async def _providers(db_url: str, table: str) -> list[str]:
     return [row[0] for row in await _fetch(db_url, f"SELECT provider FROM {table}")]
+
+
+_LEDGER_TABLE = "easyweek_migration_ledger"
+_HANDOVER_AT_COLUMN = "reminders_handed_over_at"
+_HANDOVER_DIGEST_COLUMN = "reminder_handover_plan_digest"
+_HANDOVER_CHECK = "ck_easyweek_migration_ledger_reminder_handover_complete"
+_HANDOVER_INDEX = "ix_easyweek_migration_ledger_reminder_handover"
+# PR-11.2 revision 26 (c4b7e2f1a983): the rollback attempt marker.
+_ROLLBACK_AT_COLUMN = "rollback_attempted_at"
+_ROLLBACK_RUN_COLUMN = "rollback_attempt_run_id"
+_ROLLBACK_CHECK = "ck_easyweek_migration_ledger_rollback_attempt_complete"
+_ROLLBACK_PARENT_REVISION = "a7d1f4c82b95"
+
+
+async def _ledger_index(db_url: str, index: str) -> str | None:
+    rows = await _fetch(
+        db_url,
+        f"SELECT indexdef FROM pg_indexes WHERE tablename = '{_LEDGER_TABLE}' AND indexname = '{index}'",
+    )
+    return rows[0][0] if rows else None
 
 
 async def _column(db_url: str, table: str, column: str) -> tuple | None:
@@ -818,3 +932,96 @@ async def test_upgrade_fails_closed_on_unexpected_schema_objects(temp_db_url) ->
     _alembic_ok("downgrade", _PRE_PROVIDER_SCOPE_REVISION, db_url=temp_db_url)
     _alembic_ok("upgrade", "head", db_url=temp_db_url)
     assert await _counts(temp_db_url) == before
+
+
+@pytest.mark.asyncio
+async def test_rollback_attempt_marker_migration_round_trip(temp_db_url) -> None:
+    """Revision c4b7e2f1a983, upgraded, downgraded and upgraded again.
+
+    The marker is what separates "our cancel landed and we never saw the answer"
+    from "somebody cancelled this by hand", and the second run reads it before
+    deciding whether a booking may be recorded as rolled back. A column that
+    survives only until the next downgrade would take that distinction with it,
+    so the round trip is proven rather than assumed.
+
+    Existing rows must come out of the upgrade with NULL — no environment gets
+    told it once attempted a rollback it never attempted.
+    """
+    _alembic_ok("upgrade", "head", db_url=temp_db_url)
+
+    attempted = await _column(temp_db_url, _LEDGER_TABLE, _ROLLBACK_AT_COLUMN)
+    assert attempted is not None, f"{_ROLLBACK_AT_COLUMN} is missing after upgrade head"
+    assert attempted[0] == "timestamp with time zone", f"unexpected type: {attempted}"
+    assert attempted[1] == "YES", "NULL is how 'no cancel was ever attempted' is expressed"
+
+    attempt_run = await _column(temp_db_url, _LEDGER_TABLE, _ROLLBACK_RUN_COLUMN)
+    assert attempt_run is not None, f"{_ROLLBACK_RUN_COLUMN} is missing after upgrade head"
+    assert attempt_run[0] == "character varying", f"unexpected type: {attempt_run}"
+    assert attempt_run[1] == "YES"
+    assert attempt_run[3] == 64, f"a run id column: {attempt_run}"
+
+    assert _ROLLBACK_CHECK in await _constraint_names(temp_db_url, _LEDGER_TABLE)
+
+    # A row inserted BEFORE the marker existed reads as "never attempted".
+    await _exec(
+        temp_db_url,
+        f"INSERT INTO {_LEDGER_TABLE} "
+        "(source_provider, source_company_id, source_record_id, source_fingerprint, "
+        " target_provider, target_booking_uuid, run_id, status) "
+        "VALUES ('altegio', 758285, 900042, repeat('e', 64), 'easyweek', "
+        " '0e9a1111-2222-4333-8444-555566667777', 'rollback-probe', 'created')",
+    )
+    state = await _fetch(
+        temp_db_url,
+        f"SELECT {_ROLLBACK_AT_COLUMN}, {_ROLLBACK_RUN_COLUMN} FROM {_LEDGER_TABLE} WHERE run_id = 'rollback-probe'",
+    )
+    assert state[0] == (None, None), "an existing row must not claim an attempt it never made"
+
+    # The CHECK is real: half a marker is refused, the pair is accepted.
+    for half in (
+        f"UPDATE {_LEDGER_TABLE} SET {_ROLLBACK_AT_COLUMN} = now() WHERE run_id = 'rollback-probe'",
+        f"UPDATE {_LEDGER_TABLE} SET {_ROLLBACK_RUN_COLUMN} = 'r-1' WHERE run_id = 'rollback-probe'",
+    ):
+        with pytest.raises(IntegrityError) as refused:
+            await _exec(temp_db_url, half)
+        assert _ROLLBACK_CHECK in str(refused.value), (
+            f"a different constraint refused this, not the attempt CHECK: {refused.value}"
+        )
+
+    await _exec(
+        temp_db_url,
+        f"UPDATE {_LEDGER_TABLE} SET {_ROLLBACK_AT_COLUMN} = now(), {_ROLLBACK_RUN_COLUMN} = 'r-1' "
+        "WHERE run_id = 'rollback-probe'",
+    )
+    accepted = await _fetch(
+        temp_db_url,
+        f"SELECT {_ROLLBACK_AT_COLUMN} IS NOT NULL, {_ROLLBACK_RUN_COLUMN} "
+        f"FROM {_LEDGER_TABLE} WHERE run_id = 'rollback-probe'",
+    )
+    assert accepted[0] == (True, "r-1")
+
+    # ---------------------------------------------------------------- down
+    _alembic_ok("downgrade", _ROLLBACK_PARENT_REVISION, db_url=temp_db_url)
+    assert _ROLLBACK_PARENT_REVISION in _alembic_ok("current", db_url=temp_db_url)
+    assert await _column(temp_db_url, _LEDGER_TABLE, _ROLLBACK_AT_COLUMN) is None
+    assert await _column(temp_db_url, _LEDGER_TABLE, _ROLLBACK_RUN_COLUMN) is None
+    assert _ROLLBACK_CHECK not in await _constraint_names(temp_db_url, _LEDGER_TABLE)
+    # The ledger row itself survives the downgrade — only the marker goes.
+    survived = await _fetch(temp_db_url, f"SELECT status FROM {_LEDGER_TABLE} WHERE run_id = 'rollback-probe'")
+    assert survived[0][0] == "created"
+
+    # ------------------------------------------------------------------ up
+    _alembic_ok("upgrade", "head", db_url=temp_db_url)
+    assert _HEAD_REVISION in _alembic_ok("current", db_url=temp_db_url)
+    assert await _column(temp_db_url, _LEDGER_TABLE, _ROLLBACK_AT_COLUMN) is not None
+    assert await _column(temp_db_url, _LEDGER_TABLE, _ROLLBACK_RUN_COLUMN) is not None
+    assert _ROLLBACK_CHECK in await _constraint_names(temp_db_url, _LEDGER_TABLE)
+    # And the re-upgrade does not invent an attempt for the row that survived.
+    restored = await _fetch(
+        temp_db_url,
+        f"SELECT {_ROLLBACK_AT_COLUMN}, {_ROLLBACK_RUN_COLUMN} FROM {_LEDGER_TABLE} WHERE run_id = 'rollback-probe'",
+    )
+    assert restored[0] == (None, None)
+
+    await _exec(temp_db_url, f"DELETE FROM {_LEDGER_TABLE} WHERE run_id = 'rollback-probe'")
+    assert _alembic_ok("heads", db_url=temp_db_url).count("(head)") == 1

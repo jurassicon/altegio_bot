@@ -525,7 +525,7 @@ async def test_wave_b_still_blocks_an_unknown_master(session_local, source):
             id=900099,
             date="2026-09-18 10:00:00",
             staff_id=987654,
-            services=[{"id": KA_SERVICE_ID, "cost": 90.0, "cost_to_pay": 90.0}],
+            services=[{"id": KA_SERVICE_ID, "cost": 90.0, "cost_to_pay": 90.0, "amount": 1}],
         )
     )
 

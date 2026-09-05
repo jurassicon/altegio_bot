@@ -43,6 +43,7 @@ from altegio_bot.easyweek_migration.classify import (
     Decision,
     classify_record,
     classify_source_liveness,
+    fingerprint_matches_decision,
 )
 from altegio_bot.easyweek_migration.customers import CustomerDirectory
 from altegio_bot.easyweek_migration.cutover import Cutover
@@ -174,6 +175,11 @@ async def reprove_source_booking(
         # reason code says which, and it is already PII-free.
         return ReproofResult(confirmed=False, reason=REPROOF_SOURCE_CHANGED, detail=fresh.reason)
 
+    # Deliberately an EXACT comparison, not `fingerprint_matches_decision`:
+    # both sides were computed by this build moments apart, so there is no
+    # legacy format in play, and accepting the old shape here would let a
+    # quantity that changed between the dry-run and the POST slip through the
+    # one check placed to catch it.
     if fresh.source_fingerprint != decision.source_fingerprint:
         # Still migratable, but not as the booking that was approved: the time,
         # master, service, duration or customer moved. It needs a new dry-run and
@@ -252,7 +258,7 @@ async def reclassify_source_for_resolution(
     if fresh.outcome != READY:
         return ReproofResult(confirmed=False, reason=REPROOF_SOURCE_CHANGED, detail=fresh.reason), None
 
-    if fresh.source_fingerprint != expected_fingerprint:
+    if not fingerprint_matches_decision(expected_fingerprint, fresh):
         # The booking still migrates, but not as the booking that was attempted:
         # resolving it against the old attempt would record a target that does
         # not describe the appointment any more.
@@ -406,7 +412,7 @@ async def reclassify_source_lifecycle(
     )
 
     if fresh.outcome == READY:
-        if fresh.source_fingerprint == expected_fingerprint:
+        if fingerprint_matches_decision(expected_fingerprint, fresh):
             return _result(LIFECYCLE_ACTIVE_UNCHANGED)
         # Still a live booking, but no longer the one we migrated: moved, given
         # to another master, re-serviced or reassigned. The target we created

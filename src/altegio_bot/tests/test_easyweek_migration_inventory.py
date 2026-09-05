@@ -98,7 +98,7 @@ def source(monkeypatch: pytest.MonkeyPatch):
                 id=900003,
                 date="2026-09-12 10:00:00",
                 staff_id=UNMAPPED_STAFF_ID,
-                services=[{"id": UNMAPPED_SERVICE_ID, "cost": 90.0, "cost_to_pay": 90.0}],
+                services=[{"id": UNMAPPED_SERVICE_ID, "cost": 90.0, "cost_to_pay": 90.0, "amount": 1}],
             ),
             # A past booking: skipped, and therefore NOT counted — inventory is
             # about the ids the cutover will actually need.

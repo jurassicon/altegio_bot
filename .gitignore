@@ -68,6 +68,14 @@ AGENTS.md
 # in the repository.
 outputs/
 
+# The migration PREPARATION stage's state directory (plan §29). It holds the
+# operator review, the decision store and the generated customer directory —
+# names, phone numbers and e-mail addresses. Covered by `outputs/` at the
+# default path, and named explicitly so that moving the default does not
+# silently start tracking personal data.
+outputs/easyweek_migration_prepare/
+easyweek_migration_prepare/
+
 # Customer exports and any spreadsheet dropped into the tree. These are PII by
 # definition: EasyWeek customer exports, Altegio client lists, visit-counter
 # import files.

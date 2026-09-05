@@ -179,6 +179,20 @@ and that export is a **full, fresh** one every wave — never filtered to the
 selected masters, because it also has to resolve the customers of earlier waves'
 live bookings.
 
+Since plan §29 that export no longer has to be produced by hand. The preparation
+stage (`altegio_bot.scripts.easyweek_migration_prepare`, see
+`migration_preparation_runbook.md`) builds it from the live workspace and writes
+it into its state directory in exactly this format, having proven every UUID in
+it — either found in EasyWeek or created and then read back. The format, the
+freshness rule and the "never commit it" rule are unchanged; only the way the
+file is produced is.
+
+The same stage can also fill in this file's `services` block, additively: a
+service an earlier wave already mapped is never re-pointed, and every entry it
+writes carries all four catalogue fields, because a writing mode requires them.
+It writes a **proposed** manifest next to the original rather than editing the
+reviewed file in place.
+
 Nothing real goes into the committed example. No production Altegio company,
 staff or service ids, no EasyWeek location/staff/service UUIDs, no customer
 UUIDs, no names and no phone numbers — placeholders only, including after a wave

@@ -102,7 +102,7 @@ def source(monkeypatch: pytest.MonkeyPatch) -> dict[int, list[dict]]:
             id=KA_RECORD_B,
             date="2026-09-11 10:00:00",
             staff_id=KA_STAFF_ID,
-            services=[{"id": SERVICE_B_ID, "cost": 90.0, "cost_to_pay": 90.0}],
+            services=[{"id": SERVICE_B_ID, "cost": 90.0, "cost_to_pay": 90.0, "amount": 1}],
         ),
         record(id=KA_RECORD_C, date="2026-09-12 10:00:00", staff_id=KA_STAFF_ID),
     ]
@@ -377,7 +377,7 @@ async def test_a_reviewed_plan_that_contradicts_a_stored_baseline_creates_nothin
     # with it and the refusal can only come from the stored expectation.
     for row in source[KARLSRUHE_COMPANY_ID]:
         if row["id"] == KA_RECORD_C:
-            row["services"] = [{"id": KA_SERVICE_ID, "cost": 100.0, "cost_to_pay": 100.0}]
+            row["services"] = [{"id": KA_SERVICE_ID, "cost": 100.0, "cost_to_pay": 100.0, "amount": 1}]
 
     plan = await run_dry_run(session_local, manifest=repriced)
     async with make_write_client(t) as client:
@@ -427,7 +427,7 @@ async def test_an_intentional_reprice_is_refused_even_with_a_fresh_manifest_and_
     del t.bookings[next(iter(t.bookings))]
     for row in source[KARLSRUHE_COMPANY_ID]:
         if row["id"] == KA_RECORD_A:
-            row["services"] = [{"id": KA_SERVICE_ID, "cost": 100.0, "cost_to_pay": 100.0}]
+            row["services"] = [{"id": KA_SERVICE_ID, "cost": 100.0, "cost_to_pay": 100.0, "amount": 1}]
     t.catalog[KA_LOCATION_UUID][0] = {**t.catalog[KA_LOCATION_UUID][0], "price": 10000}
 
     repriced = repriced_manifest()

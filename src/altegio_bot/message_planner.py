@@ -11,9 +11,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from altegio_bot.altegio_records import count_attended_client_visits
 from altegio_bot.db import SessionLocal  # noqa: F401 – re-exported
 from altegio_bot.models.models import Client, MessageJob, Record
+from altegio_bot.reminder_ownership import altegio_reminders_are_suppressed
 from altegio_bot.utils import utcnow
 
 logger = logging.getLogger(__name__)
+
+
+def _exact_int(value: object) -> int | None:
+    """Exact ``int``. ``bool`` is not an id and ``"3"`` is not a number."""
+    return value if type(value) is int else None
+
 
 RECORD_CREATED = "record_created"
 RECORD_UPDATED = "record_updated"
@@ -288,7 +295,39 @@ async def plan_jobs_for_record_event(
 
     starts_at = record_obj.starts_at
 
+    # Reminder ownership fence (plan §30.11). Deliberately narrow: it guards the
+    # two reminder `add_job` calls below and nothing else.
+    #
+    # It is needed because `add_job` resurrects a `canceled` job on conflict, so
+    # after the post-migration handover a late `create` re-opened the very
+    # reminder the handover had just withdrawn — and a late `reschedule` added a
+    # fresh one under a new key. Both left the appointment with open reminders on
+    # the Altegio AND the EasyWeek side.
+    #
+    # Read HERE, inside this transaction and after the Record state is in hand,
+    # so a delivery that was queued behind the handover's own row locks sees the
+    # committed marker rather than an answer taken before it existed.
+    #
+    # `UNKNOWN` suppresses too: an ownership question we cannot answer is not
+    # permission to message somebody. Nothing else on this path is affected —
+    # the record_* job above, review, repeat, comeback and every campaign job
+    # are planned exactly as before, for migrated and unmigrated records alike.
+    reminders_suppressed = False
     if norm_status in ("create", "update") and starts_at is not None:
+        reminders_suppressed, reminder_owner_state = await altegio_reminders_are_suppressed(
+            session,
+            company_id=cid,
+            altegio_record_id=_exact_int(getattr(record_obj, "altegio_record_id", None)),
+        )
+        if reminders_suppressed:
+            logger.info(
+                "altegio reminders suppressed company_id=%s record_id=%s owner=%s",
+                cid,
+                record_obj.id,
+                reminder_owner_state.value,
+            )
+
+    if norm_status in ("create", "update") and starts_at is not None and not reminders_suppressed:
         run_at_24h = starts_at - timedelta(hours=24)
         if run_at_24h > now:
             await add_job(

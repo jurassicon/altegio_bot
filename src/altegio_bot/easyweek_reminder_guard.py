@@ -201,6 +201,41 @@ def _status_type_contradicts(payload: dict[str, Any]) -> str | None:
     return None
 
 
+def _observed_status_contradiction(
+    payload: dict[str, Any],
+    *,
+    is_canceled: bool,
+    is_completed: bool,
+) -> str | None:
+    """Judge optional status prose against status facts for handover reads.
+
+    The runtime send guard deliberately keeps its established ordering and
+    reason codes in :func:`_status_type_contradicts`.  The handover has a
+    different job: it must be able to *read* a consistently terminal booking so
+    it can retire the obsolete Altegio reminder without planning a replacement.
+    """
+    if is_canceled and is_completed:
+        return "status_flags_both_terminal"
+    status = payload.get("status")
+    if not isinstance(status, dict):
+        return None
+    status_type = status.get("type")
+    if not isinstance(status_type, str):
+        return None
+    normalized = status_type.strip().casefold()
+    canceled_types = {"canceled", "cancelled"}
+    completed_types = {"completed", "succeeded", "finished"}
+    if is_canceled:
+        return None if normalized in canceled_types else "status_type_vs_canceled"
+    if is_completed:
+        return None if normalized in completed_types else "status_type_vs_completed"
+    if normalized in canceled_types:
+        return "status_type_canceled"
+    if normalized in completed_types:
+        return "status_type_completed"
+    return None
+
+
 def _job_booking_uuid(job: MessageJob) -> uuid.UUID | None:
     payload = getattr(job, "payload", None)
     if not isinstance(payload, dict):
@@ -266,6 +301,96 @@ def check_local_preconditions(
         return _refuse(GuardOutcome.LOCATION_MISMATCH, "registry_location_uuid")
 
     return None
+
+
+@dataclass(frozen=True)
+class ObservedBooking:
+    """What ``GET /bookings/{uuid}`` says a booking IS, right now.
+
+    The send guard asks a different question — "does this booking still match the
+    reminder we planned?" — and answers it against an expectation it was given.
+    The post-migration handover has no expectation to compare against: it is
+    working out what reminders a booking OWES, so it needs the booking's current
+    start and status read out rather than judged.
+
+    Deliberately a second reader over the SAME field-parsing helpers rather than
+    a refactor of :func:`check_api_response`. That function's refusal ORDER is
+    part of its contract — a payload with both a wrong start and a malformed
+    ``is_canceled`` must keep reporting the start mismatch — and reordering it to
+    share a code path would have changed the runtime guard's behaviour to serve a
+    caller that is not the runtime. Nothing about the send path moves.
+    """
+
+    booking_uuid: uuid.UUID
+    location_uuid: uuid.UUID
+    starts_at: datetime
+    is_canceled: bool
+    is_completed: bool
+
+    @property
+    def is_active(self) -> bool:
+        return not (self.is_canceled or self.is_completed)
+
+
+def read_booking_state(
+    payload: object,
+    *,
+    booking_uuid: uuid.UUID,
+    location: EasyWeekLocation,
+) -> ObservedBooking | GuardResult:
+    """Read one booking body into facts, or refuse with the guard's own codes.
+
+    Identity is still PROVEN, not assumed: the body must name the uuid that was
+    asked for and the branch the caller claims, or nothing is read out of it.
+    Only after that are the start and the two status flags taken at face value —
+    and a flag that is neither ``true`` nor ``false`` is malformed, never
+    optimistically read as "not cancelled".
+    """
+    if not isinstance(payload, dict):
+        return _refuse(GuardOutcome.MALFORMED_RESPONSE, "not_an_object")
+
+    api_uuid = _canonical_uuid(payload.get("uuid"))
+    if api_uuid is None:
+        return _refuse(GuardOutcome.MALFORMED_RESPONSE, "uuid")
+    if api_uuid != booking_uuid:
+        return _refuse(GuardOutcome.IDENTITY_MISMATCH, "api_uuid")
+
+    api_location = _canonical_uuid(payload.get("location_uuid"))
+    if api_location is None:
+        return _refuse(GuardOutcome.MALFORMED_RESPONSE, "location_uuid")
+    if api_location != _canonical_uuid(location.location_uuid):
+        return _refuse(GuardOutcome.LOCATION_MISMATCH, "api_location_uuid")
+
+    api_start = _aware_utc(payload.get("start_time"))
+    if api_start is None:
+        return _refuse(GuardOutcome.MALFORMED_RESPONSE, "start_time")
+
+    canceled_ok = _strict_false(payload.get("is_canceled"))
+    if canceled_ok is None:
+        return _refuse(GuardOutcome.MALFORMED_RESPONSE, "is_canceled")
+    completed_ok = _strict_false(payload.get("is_completed"))
+    if completed_ok is None:
+        return _refuse(GuardOutcome.MALFORMED_RESPONSE, "is_completed")
+
+    is_canceled = not canceled_ok
+    is_completed = not completed_ok
+    contradiction = _observed_status_contradiction(
+        payload,
+        is_canceled=is_canceled,
+        is_completed=is_completed,
+    )
+    if contradiction is not None:
+        return _refuse(GuardOutcome.MALFORMED_RESPONSE, contradiction)
+
+    return ObservedBooking(
+        booking_uuid=api_uuid,
+        location_uuid=api_location,
+        starts_at=api_start,
+        # `_strict_false` returns True when the flag is a literal `false`, so
+        # these read inverted: "the flag was cleanly false" means "not that".
+        is_canceled=is_canceled,
+        is_completed=is_completed,
+    )
 
 
 def check_api_response(

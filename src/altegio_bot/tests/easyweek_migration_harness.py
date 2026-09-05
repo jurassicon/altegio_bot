@@ -119,7 +119,7 @@ def stub_altegio_source(monkeypatch: pytest.MonkeyPatch) -> dict[int, list[dict]
             record(
                 id=RA_RECORD_A,
                 staff_id=RA_STAFF_ID,
-                services=[{"id": RA_SERVICE_ID, "cost": 90.0, "cost_to_pay": 90.0}],
+                services=[{"id": RA_SERVICE_ID, "cost": 90.0, "cost_to_pay": 90.0, "amount": 1}],
             )
         ],
     }
@@ -252,6 +252,9 @@ ORDER_LINE_UUIDS = {
     RA_RECORD_A: "0de41111-0000-4000-8000-000000000003",
 }
 _FALLBACK_ORDER_LINE = "0de41111-0000-4000-8000-0000000000ff"
+# The booking uuid a cart POST returns for a record the fixture has no dedicated
+# uuid for.
+_FALLBACK_CART_UUID = "0ca47111-0000-4000-8000-0000000000ff"
 
 CATALOG_PER_PAGE = 2
 
@@ -295,6 +298,25 @@ class RecordingTransport:
         self.requests: list[httpx.Request] = []
         self.fail_with = fail_with or {}
         self.cancelled: list[str] = []
+        # Bookings the fixture has cancelled. Kept apart from `cancelled` so a
+        # test can pre-cancel one WITHOUT recording a mutation, which is how the
+        # idempotent "already cancelled" path is exercised.
+        self.canceled_uuids: set[str] = set()
+        # Every PUT that actually LEFT, in order — including the ones the
+        # fixture then fails. `cancelled` counts proven cancels; this counts
+        # requests, which is what "no second PUT" has to be measured against.
+        self.cancel_puts: list[str] = []
+        # booking uuid -> how the cancel PUT itself should fail: an int status
+        # or an exception instance (a timeout, a transport error).
+        self.cancel_fail_with: dict[str, object] = {}
+        # Makes a FAILING cancel still cancel the booking. This is the case the
+        # whole recovery exists for: the workspace changed, the answer did not
+        # arrive.
+        self.cancel_side_effect_on_failure = False
+        # booking uuid -> how the CONFIRMATION read (the GET after the PUT)
+        # should fail, independently of the PUT: an int status, an exception, or
+        # one of "malformed", "missing", "non_bool", "false".
+        self.confirm_get_fail_with: dict[str, object] = {}
         self.bookings: dict[str, dict] = {}
         # booking uuid -> the staffer the POST named. Held OUTSIDE the booking,
         # exactly as EasyWeek holds it: the only way to read it back is the
@@ -310,7 +332,7 @@ class RecordingTransport:
         self.readback_override = readback_override or {}
         # booking uuid -> HTTP status a GET should answer with instead. Models a
         # target that exists but cannot be read right now.
-        self.get_status_override: dict[str, int] = {}
+        self.get_status_override: dict[str, int | Exception] = {}
         # Status a catalogue or list GET should answer with instead.
         self.catalog_status_override: int | None = None
         self.list_status_override: int | None = None
@@ -330,9 +352,36 @@ class RecordingTransport:
             return self._booking_list(request)
         if request.method == "GET":
             return self._one_booking(path)
-        if path.endswith("set-booking-cancel"):
-            uuid = path.split("/")[-2]
+        if request.method == "POST" and path.rstrip("/").endswith("/bookings/cart"):
+            return self._create_cart(request)
+        if request.method == "PUT" and path.endswith("/status/cancel"):
+            # The PROVEN cancel: `PUT /bookings/{uuid}/status/cancel`. The old
+            # `POST .../set-booking-cancel` is deliberately NOT handled here —
+            # the real API answers 404 for it, and a fixture that accepted it
+            # would let a rollback that cannot cancel anything look green.
+            uuid = path.split("/")[-3]
+            body = json.loads(request.content.decode() or "{}")
+            assert set(body) == {"cancel_reason", "internal_notes"}, f"unexpected cancel body: {sorted(body)}"
+            assert body["cancel_reason"] == "other", f"unproven cancel_reason: {body['cancel_reason']}"
+            assert isinstance(body["internal_notes"], str), "internal_notes must be a string"
+            # Counted BEFORE any modelled failure: a request that left is a
+            # request that left, whatever came back.
+            self.cancel_puts.append(uuid)
+
+            failure = self.cancel_fail_with.get(uuid)
+            if failure is not None:
+                if self.cancel_side_effect_on_failure:
+                    # The cancel landed; only the answer did not.
+                    self.canceled_uuids.add(uuid)
+                if isinstance(failure, Exception):
+                    raise failure
+                assert isinstance(failure, int)
+                return httpx.Response(failure, json={"error": "no"})
+
             self.cancelled.append(uuid)
+            # The booking now reads back as cancelled, which is what the client
+            # checks before it reports a rollback as done.
+            self.canceled_uuids.add(uuid)
             return httpx.Response(200, json={})
         return self._create(request)
 
@@ -396,11 +445,40 @@ class RecordingTransport:
     def _one_booking(self, path: str) -> httpx.Response:
         uuid = path.rsplit("/", 1)[-1]
         status = self.get_status_override.get(uuid)
+        # An exception models a timeout or a dropped connection; an int models a
+        # status. Both are needed: the read that runs immediately before the
+        # cancel can fail either way, and the two must be provable separately.
+        if isinstance(status, Exception):
+            raise status
         if status is not None:
             return httpx.Response(status, json={"error": "unavailable"})
         booking = self.bookings.get(uuid)
         if booking is None:
             return httpx.Response(404)
+        if uuid in self.canceled_uuids:
+            # The read the cancel path proves itself with. A booking the fixture
+            # cancelled has to READ as cancelled, or the client is right to
+            # report the outcome as unproven.
+            booking = {**booking, "is_canceled": True, "status": {"type": "CANCELED"}}
+
+        # Only the CONFIRMATION read can be broken this way: the preflight read
+        # happens before this booking has ever been PUT to, so it is untouched.
+        # That separation is the point — an error before the mutation and an
+        # error after it are different facts and must be testable apart.
+        if uuid in self.cancel_puts:
+            failure = self.confirm_get_fail_with.get(uuid)
+            if isinstance(failure, Exception):
+                raise failure
+            if isinstance(failure, int):
+                return httpx.Response(failure, json={"error": "unavailable"})
+            if failure == "malformed":
+                return httpx.Response(200, content=b"{not json", headers={"content-type": "application/json"})
+            if failure == "missing":
+                booking = {key: value for key, value in booking.items() if key != "is_canceled"}
+            elif failure == "non_bool":
+                booking = {**booking, "is_canceled": "yes"}
+            elif failure == "false":
+                booking = {**booking, "is_canceled": False}
         return httpx.Response(200, json=booking)
 
     # -- POST /bookings ------------------------------------------------------
@@ -418,6 +496,64 @@ class RecordingTransport:
             return httpx.Response(failure, json={"error": "no"})
 
         uuid = self._store(body, record_id)
+        return httpx.Response(201, json={"uuid": uuid})
+
+    def _create_cart(self, request: httpx.Request) -> httpx.Response:
+        """`POST /bookings/cart`, answering the way the live canary answered it.
+
+        One cart item with two services came back as ONE booking carrying TWO
+        order lines. The fixture reproduces that rather than the convenient
+        single-line shape: a two-line booking is exactly what the readback
+        cannot yet project, and a fixture that returned one line would hide the
+        very gap the closed cart gate exists for.
+        """
+        body = json.loads(request.content.decode())
+        record_id = int(str(body["booking_comment"]).rsplit(":", 1)[-1])
+        failure = self.fail_with.get(record_id)
+        if isinstance(failure, Exception):
+            raise failure
+        if isinstance(failure, int):
+            return httpx.Response(failure, json={"error": "no"})
+
+        item = body["items"][0]
+        uuid = CREATED_UUIDS.get(record_id, _FALLBACK_CART_UUID)
+        entries = [
+            catalog_entry(body["location_uuid"], service["service_uuid"], catalog=self.catalog)
+            for service in item["services"]
+        ]
+        minutes = sum(entry["minutes"] for entry in entries)
+        start = datetime.fromisoformat(item["datetime_start"].replace("Z", "+00:00"))
+        total = sum(entry["price"] for entry in entries)
+
+        self.bookings[uuid] = {
+            "uuid": uuid,
+            "location_uuid": body["location_uuid"],
+            "start_time": item["datetime_start"],
+            "end_time": (start + timedelta(minutes=minutes)).isoformat().replace("+00:00", "Z"),
+            "timezone": body["timezone"],
+            "duration": _duration_object(minutes),
+            "quantity": 1,
+            "is_canceled": False,
+            "is_completed": False,
+            "public_notes": body["booking_comment"],
+            "currency": "EUR",
+            "customer": {"uuid": CUSTOMER_UUID},
+            "order": {"total": total, "subtotal": total},
+            "ordered_services": [
+                {
+                    "uuid": f"{_FALLBACK_ORDER_LINE[:-2]}{index:02d}",
+                    "name": entry["name"],
+                    "quantity": 1,
+                    "currency": "EUR",
+                    "price": entry["price"],
+                    "original_price": entry["price"],
+                    "duration": _duration_object(entry["minutes"]),
+                    "original_duration": _duration_object(entry["minutes"]),
+                }
+                for index, entry in enumerate(entries)
+            ],
+        }
+        self.assignments[uuid] = item["services"][0]["staffer_uuid"]
         return httpx.Response(201, json={"uuid": uuid})
 
     def _store(self, body: dict, record_id: int) -> str:
@@ -498,7 +634,7 @@ class RecordingTransport:
         marker_tail = f":{record_id}"
         count = 0
         for request in self.requests:
-            if request.method != "POST" or request.url.path.endswith("set-booking-cancel"):
+            if request.method != "POST":
                 continue
             body = json.loads(request.content.decode())
             if str(body.get("booking_comment", "")).endswith(marker_tail):

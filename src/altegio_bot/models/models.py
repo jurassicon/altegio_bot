@@ -1595,6 +1595,34 @@ class EasyWeekMigrationLedger(Base):
             "attempts >= 0",
             name="ck_easyweek_migration_ledger_attempts_non_negative",
         ),
+        # A reminder handover marker is one fact in two columns: the instant it
+        # happened and the plan that authorised it. Half a marker would be a row
+        # that claims ownership moved without saying under what authority, or a
+        # digest with no handover behind it — and the runtime fence reads the
+        # instant while the apply compares the digest, so either half alone
+        # would let one of them answer while the other could not.
+        CheckConstraint(
+            "(reminders_handed_over_at IS NULL) = (reminder_handover_plan_digest IS NULL)",
+            name="ck_easyweek_migration_ledger_reminder_handover_complete",
+        ),
+        # A rollback attempt is one fact in two columns, for the same reason the
+        # handover marker is: half of it would be an attempt with no run to
+        # attribute it to, or a run id claiming an attempt that never happened.
+        CheckConstraint(
+            "(rollback_attempted_at IS NULL) = (rollback_attempt_run_id IS NULL)",
+            name="ck_easyweek_migration_ledger_rollback_attempt_complete",
+        ),
+        # The fence runs inside the Altegio planning transaction for every
+        # create/update delivery, so it has to be an index-only lookup. Partial
+        # on purpose: only handed-over rows are ever asked about, and the index
+        # stays a fraction of the table.
+        Index(
+            "ix_easyweek_migration_ledger_reminder_handover",
+            "source_provider",
+            "source_company_id",
+            "source_record_id",
+            postgresql_where=text("reminders_handed_over_at IS NOT NULL"),
+        ),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
@@ -1648,6 +1676,55 @@ class EasyWeekMigrationLedger(Base):
     # provider message, never a payload excerpt, never a phone number.
     reason_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
+    # -- reminder ownership (PR-11.2, plan §30.11) -------------------------
+    # When the future reminders for this booking stopped being Altegio's and
+    # became EasyWeek's, and under which reviewed plan.
+    #
+    # Why this cannot be inferred from anything already on the row. `status`
+    # becomes `created` when the BOOKING was migrated, which happens long before
+    # — and independently of — the reminder handover; a cancelled `MessageJob`
+    # is not durable evidence either, because the Altegio planner's `add_job`
+    # resurrects a cancelled job on the next delivery of the same fact. So a
+    # late Altegio webhook had nothing to consult and would re-open a reminder
+    # the handover had just withdrawn, leaving one appointment with open
+    # reminders on both sides.
+    #
+    # Written atomically with the cancellation it describes, so a wave that
+    # rolls back leaves no marker, and a marker always means the withdrawal
+    # committed. Both columns move together — see the CHECK above.
+    reminders_handed_over_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    # The handover plan digest an operator reviewed and authorised. Kept so a
+    # repeat of the SAME snapshot is recognised as idempotent, and a different
+    # one is refused rather than silently re-marking the row.
+    reminder_handover_plan_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    # -- rollback attempt (PR-11.2, plan §30.12) ---------------------------
+    # When a confirmed rollback was about to send this row's cancel, and which
+    # run was about to send it. Written and COMMITTED before the PUT leaves.
+    #
+    # It exists because a cancel can end in three states, and only one of them
+    # is knowable from EasyWeek alone. A booking that reads as cancelled today
+    # is either one this tool cancelled (whose response we may never have seen)
+    # or one a person cancelled by hand — and those must not be treated the
+    # same: the first may finish as `rolled_back`, the second is a target
+    # somebody modified and is not ours to claim.
+    #
+    # The marker is the only durable difference between them, so it is written
+    # BEFORE the mutation rather than after it. A crash between the write and
+    # the PUT therefore leaves a row that says "a cancel may have been sent" —
+    # which is exactly what happened, and which the next run resolves by
+    # reading the booking rather than by sending a second PUT.
+    rollback_attempted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    # Kept beside the instant so an operator can tell WHICH rollback run left an
+    # unresolved attempt without joining anything.
+    rollback_attempt_run_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),
@@ -1692,12 +1769,18 @@ class EasyWeekMigrationCanaryProof(Base):
         UniqueConstraint(
             "manifest_digest",
             "request_schema_version",
+            "contract_kind",
             "cutover_at",
             "source_company_id",
             "source_record_id",
             name="uq_easyweek_migration_canary_identity",
         ),
-        Index("ix_easyweek_migration_canary_lookup", "manifest_digest", "request_schema_version"),
+        Index(
+            "ix_easyweek_migration_canary_lookup",
+            "manifest_digest",
+            "request_schema_version",
+            "contract_kind",
+        ),
         # A proof row that did not verify is not a proof. It is still stored —
         # a failed canary is exactly what an operator needs to read — but the
         # bulk gate selects on `verified`, and a NULL target on a verified row
@@ -1709,6 +1792,22 @@ class EasyWeekMigrationCanaryProof(Base):
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+
+    # Which mutation contract this canary exercised: `single` for
+    # ``POST /bookings``, `cart_two` for ``POST /bookings/cart`` (plan §30.12).
+    #
+    # Part of the identity, not a label. The two contracts are different
+    # endpoints with different request bodies and different readback shapes, so
+    # a canary that proved one has proven nothing about the other — and a bulk
+    # run licensed by the wrong kind would write hundreds of bookings through a
+    # path no real booking has ever gone down. Existing rows default to `single`
+    # because that is the only contract that existed when they were written.
+    contract_kind: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        server_default=text("'single'"),
+        default="single",
+    )
 
     # -- what was proven --------------------------------------------------
     source_company_id: Mapped[int] = mapped_column(Integer, nullable=False)
