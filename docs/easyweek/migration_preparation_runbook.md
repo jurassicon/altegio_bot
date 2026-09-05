@@ -306,10 +306,41 @@ digest плана, под которым это произошло. Отметк
 
 ### 6b.1 Dry-run со снимком
 
+Выберите точный manifest миграции и `run_id` из сохранённого отчёта её canary/apply.
+Это исходный `run_id` ledger, а не `last_resolution_run_id` последующего reconcile.
+В командах ниже замените `MIGRATION_RUN_ID` на это значение; если волна включает
+несколько запусков, повторите `--run-id` для каждого во **всех** трёх режимах.
+Список проверяется вместе с canonical digest manifest; филиал без выбранных
+мастеров и записи других запусков в handover не входят.
+
+При отсутствии отчёта получите доступные ID на сервере read-only командой и
+сверьте их с журналом конкретной миграции, прежде чем выбирать волну:
+
 ```bash
 cd /opt/altegio_bot
 dc() { docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml "$@"; }
-dc --profile ops run --rm --build --no-deps -T easyweek-migration-prepare-handover plan --manifest /migration/input/manifest.json --company-id 758285 --snapshot /migration/state/reminder_handover.v3.json
+dc exec -T postgres psql -X -v ON_ERROR_STOP=1 -U altegio -d altegio_bot -c "BEGIN TRANSACTION READ ONLY; SELECT source_company_id, run_id, status, count(*) FROM easyweek_migration_ledger WHERE source_provider = 'altegio' AND target_provider = 'easyweek' AND source_company_id = 758285 GROUP BY 1,2,3 ORDER BY 1,2,3; COMMIT;"
+```
+
+Snapshot v4 включает выбранные run IDs, digest manifest и конфигурации, client
+identity и fingerprints локальных данных. Старые v3 снимки не применяются.
+Plan использует `SET TRANSACTION READ ONLY`, повторно читает данные после API
+обхода и при `candidate_set_changed=true` запрещает apply. Один booking GET
+выполняется без автоматического retry, пауза между запросами — минимум 1 секунда.
+Новый plan сначала инвалидирует предыдущий файл по тому же пути, даже если
+затем обнаружит ошибку manifest или API. Файл `.invalidated` — приватный архив,
+его нельзя использовать для нового apply.
+
+Snapshot действителен не дольше 3600 секунд; после ожидания блокировок возраст
+и границы времени проверяются заново. Изменение client, ownership, jobs или
+конфигурации требует нового plan. Notification flags для handover не меняются:
+snapshot фиксирует их текущие значения; API guard/preflight проверяет актуальность
+отдельно от разрешения отправки. Plan никогда не расширяет category allowlist.
+
+```bash
+cd /opt/altegio_bot
+dc() { docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml "$@"; }
+dc --profile ops run --rm --build --no-deps -T easyweek-migration-prepare-handover plan --manifest /migration/input/manifest.json --company-id 758285 --run-id MIGRATION_RUN_ID --snapshot /migration/state/reminder_handover.v4.json
 ```
 
 Команда читает ledger, доказывает каждую перенесённую запись живым
@@ -336,11 +367,11 @@ apply воркер останавливается лишь на время од�
 
 Смотреть также `rows_with_blockers` (канонический ключ занят
 canceled/failed-заданием — решает человек, автоматически не переоткрывается) и
-`rows_with_processing_source_jobs`. Snapshot **v3** содержит и защищает digest-ом
-весь eligible `status=created` scope, отказы доказательства, readiness, identity
+`rows_with_processing_source_jobs`. Snapshot **v4** содержит и защищает digest-ом
+весь eligible `status=created` scope выбранных run IDs, отказы доказательства, readiness, identity
 строк, каждое obligation, полный список старых job ID и ожидаемое состояние
 ownership marker каждой ledger-строки. Любой snapshot более ранней версии — v1
-или v2, — повреждённый JSON, неизвестное поле или изменение `created_at` write
+v2 или v3, — повреждённый JSON, неизвестное поле или изменение `created_at` write
 не разрешают. Нулевая или частично доказанная волна никогда не бывает
 `cutover_ready`.
 
@@ -363,7 +394,7 @@ dc() { docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.cha
 
 restore_outbox() {
   original_rc=$?
-  trap - EXIT INT TERM
+  trap - EXIT INT TERM HUP
   set +e
   dc up -d altegio-outbox-worker
   restart_rc=$?
@@ -382,9 +413,10 @@ restore_outbox() {
 trap restore_outbox EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+trap 'exit 129' HUP
 
 dc stop altegio-outbox-worker
-dc --profile ops run --rm --no-deps -T -e EASYWEEK_REMINDER_HANDOVER_ALLOW_APPLY=true easyweek-migration-prepare-handover apply --manifest /migration/input/manifest.json --company-id 758285 --snapshot /migration/state/reminder_handover.v3.json --apply-report /migration/state/reminder_handover.apply-report.v2.json --apply --plan-digest PLAN_DIGEST_ИЗ_ШАГА_6B1 --confirm 'apply reminder handover PLAN_DIGEST_ИЗ_ШАГА_6B1'
+dc --profile ops run --rm --no-deps -T -e EASYWEEK_REMINDER_HANDOVER_ALLOW_APPLY=true easyweek-migration-prepare-handover apply --manifest /migration/input/manifest.json --company-id 758285 --run-id MIGRATION_RUN_ID --snapshot /migration/state/reminder_handover.v4.json --apply-report /migration/state/reminder_handover.apply-report.v2.json --apply --plan-digest PLAN_DIGEST_ИЗ_ШАГА_6B1 --confirm 'apply reminder handover PLAN_DIGEST_ИЗ_ШАГА_6B1'
 )
 ```
 
@@ -421,7 +453,7 @@ Verify не принимает отчёт от другого snapshot или о
 ```bash
 cd /opt/altegio_bot
 dc() { docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml "$@"; }
-dc --profile ops run --rm --no-deps -T easyweek-migration-prepare-handover verify --manifest /migration/input/manifest.json --company-id 758285 --snapshot /migration/state/reminder_handover.v3.json --apply-report /migration/state/reminder_handover.apply-report.v2.json
+dc --profile ops run --rm --no-deps -T easyweek-migration-prepare-handover verify --manifest /migration/input/manifest.json --company-id 758285 --run-id MIGRATION_RUN_ID --snapshot /migration/state/reminder_handover.v4.json --apply-report /migration/state/reminder_handover.apply-report.v2.json
 ```
 
 Повторный apply того же snapshot — отдельная проверка идемпотентности. Используем
@@ -435,7 +467,7 @@ cd /opt/altegio_bot
 dc() { docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml "$@"; }
 restore_outbox() {
   original_rc=$?
-  trap - EXIT INT TERM
+  trap - EXIT INT TERM HUP
   set +e
   dc up -d altegio-outbox-worker
   restart_rc=$?
@@ -448,8 +480,9 @@ restore_outbox() {
 trap restore_outbox EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+trap 'exit 129' HUP
 dc stop altegio-outbox-worker
-dc --profile ops run --rm --no-deps -T -e EASYWEEK_REMINDER_HANDOVER_ALLOW_APPLY=true easyweek-migration-prepare-handover apply --manifest /migration/input/manifest.json --company-id 758285 --snapshot /migration/state/reminder_handover.v3.json --apply-report /migration/state/reminder_handover.repeat-apply-report.v2.json --apply --plan-digest PLAN_DIGEST_ИЗ_ШАГА_6B1 --confirm 'apply reminder handover PLAN_DIGEST_ИЗ_ШАГА_6B1'
+dc --profile ops run --rm --no-deps -T -e EASYWEEK_REMINDER_HANDOVER_ALLOW_APPLY=true easyweek-migration-prepare-handover apply --manifest /migration/input/manifest.json --company-id 758285 --run-id MIGRATION_RUN_ID --snapshot /migration/state/reminder_handover.v4.json --apply-report /migration/state/reminder_handover.repeat-apply-report.v2.json --apply --plan-digest PLAN_DIGEST_ИЗ_ШАГА_6B1 --confirm 'apply reminder handover PLAN_DIGEST_ИЗ_ШАГА_6B1'
 )
 ```
 
@@ -459,12 +492,13 @@ dc --profile ops run --rm --no-deps -T -e EASYWEEK_REMINDER_HANDOVER_ALLOW_APPLY
 ```bash
 cd /opt/altegio_bot
 dc() { docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml "$@"; }
-dc --profile ops run --rm --no-deps -T easyweek-migration-prepare-handover plan --manifest /migration/input/manifest.json --company-id 758285 --snapshot /migration/state/reminder_handover.after.v3.json
+dc --profile ops run --rm --no-deps -T easyweek-migration-prepare-handover plan --manifest /migration/input/manifest.json --company-id 758285 --run-id MIGRATION_RUN_ID --snapshot /migration/state/reminder_handover.after.v4.json
 ```
 
 Отдельно запускается существующий API preflight. Он повторно читает актуальные
-EasyWeek booking и прогоняет production reminder guard; DB verify его не
-подменяет:
+EasyWeek booking и прогоняет production reminder guard для всей открытой очереди.
+CLI verify уже делает GET-проверку frozen scope; отдельный preflight проверяет
+остальные открытые напоминания и не подменяет проверку полноты handover:
 
 ```bash
 cd /opt/altegio_bot
@@ -494,6 +528,24 @@ dc exec -T postgres psql -X -v ON_ERROR_STOP=1 -U altegio -d altegio_bot -c "BEG
 повод свериться с историей apply-отчётов.
 
 ### 6b.5 Если что-то пошло не так
+
+`ownership_unproven`, `target_client_unproven`, `staff_scope_unproven`,
+`ledger_duplicate_target`, `stale_target_reminder`, `configuration_changed`,
+`migration_wave_changed`, `candidate_set_changed`, `snapshot_expired` и
+`reminder_boundary_passed` — STOP. Любой `*_changed` в apply также означает
+откат всей волны. При `database_lock_timeout`/`database_statement_timeout`
+откат обязателен; повторите свежий plan после устранения конкурирующей операции.
+Outbox восстанавливается через trap при EXIT, INT, TERM и HUP. При потере SSH
+проверьте его состояние после переподключения; SIGKILL/выключение хоста trap
+обработать не может.
+
+Повтор того же свежего snapshot с исходным digest является проверкой с нулевыми
+мутациями. Новый snapshot после уже выполненного handover показывает покрытие,
+но не разрешает переписать исходный ownership marker чужим digest.
+Если commit прошёл, а файл apply-report записать не удалось, сохраните исходный
+snapshot и повторите его с тем же digest, пока он свежий, в отдельный report.
+Если он уже истёк, остановитесь для разбора; не снимайте marker и не переоткрывайте
+jobs вручную. Восстановление выполняется вперёд, по доказанному текущему состоянию.
 
 | Симптом | Что это значит | Что делать |
 |---|---|---|

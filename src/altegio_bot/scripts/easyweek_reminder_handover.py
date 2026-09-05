@@ -44,12 +44,15 @@ import argparse
 import asyncio
 import json
 import logging
+import math
 import os
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Final
 
 from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 
 from altegio_bot.db import SessionLocal
 from altegio_bot.easyweek_client import EasyWeekClient
@@ -62,6 +65,7 @@ from altegio_bot.easyweek_migration.reminder_handover import (
     confirmation_phrase,
     read_apply_report,
     read_snapshot,
+    validate_run_ids,
     write_apply_report,
     write_snapshot,
 )
@@ -71,6 +75,7 @@ from altegio_bot.easyweek_migration.reminder_handover_db import (
     apply_plan,
     build_plan,
     verify_handover,
+    verify_live_scope,
 )
 
 logger = logging.getLogger("easyweek_migration.reminder_handover.cli")
@@ -115,6 +120,12 @@ def build_parser() -> argparse.ArgumentParser:
             "the migration manifest for this wave. It is what pairs each Altegio company with its "
             "EasyWeek location; the runtime registry then proves that location IS that branch."
         ),
+    )
+    parser.add_argument(
+        "--run-id",
+        action="append",
+        required=True,
+        help="exact ledger run_id; repeat for a multi-run wave",
     )
     parser.add_argument(
         "--snapshot",
@@ -174,7 +185,18 @@ def _apply_permitted(args: argparse.Namespace) -> bool:
 
 
 async def _run(args: argparse.Namespace) -> int:
+    if args.mode == MODE_PLAN:
+        # Invalidating before any fallible read also covers invalid manifests,
+        # API/configuration errors and interruption, not only blocked reports.
+        snapshot = Path(args.snapshot)
+        if snapshot.exists():
+            snapshot.replace(snapshot.with_suffix(snapshot.suffix + ".invalidated"))
+    if not math.isfinite(args.pause_sec) or args.pause_sec < DEFAULT_PAUSE_SEC:
+        return _fail("api_pacing_invalid")
+    if not 1 <= args.max_snapshot_age_sec <= DEFAULT_MAX_SNAPSHOT_AGE_SEC:
+        return _fail("snapshot_age_limit_invalid")
     companies = tuple(sorted(set(args.company_id)))
+    runs = validate_run_ids(sorted(set(args.run_id)))
     if not companies:
         return _fail("--company-id is required; nothing is in scope by default")
 
@@ -183,13 +205,14 @@ async def _run(args: argparse.Namespace) -> int:
         if not manifest.valid:
             return _fail(f"manifest is unusable ({manifest.reason})")
 
-        client = EasyWeekClient()
+        client = EasyWeekClient(max_attempts=1)
         try:
             async with SessionLocal() as session:
                 plan = await build_plan(
                     session,
                     manifest=manifest,
                     company_ids=companies,
+                    run_ids=runs,
                     client=client,
                     pause_sec=args.pause_sec,
                 )
@@ -219,16 +242,32 @@ async def _run(args: argparse.Namespace) -> int:
 
     if tuple(sorted(frozen.company_ids)) != companies:
         return _fail("the snapshot was planned for a different set of companies; re-run plan")
+    manifest = load_manifest(args.manifest)
+    if not manifest.valid or manifest.digest != frozen.wave["manifest_digest"] or list(runs) != frozen.wave["run_ids"]:
+        return _fail("migration_wave_changed")
 
     if args.mode == MODE_VERIFY:
         try:
             apply_report = read_apply_report(args.apply_report, frozen=frozen)
         except SnapshotError as error:
             return _fail(str(error))
-        async with SessionLocal() as session:
-            async with session.begin():
-                await session.execute(text("SET TRANSACTION READ ONLY"))
-                report = await verify_handover(session, frozen, apply_report)
+        client = EasyWeekClient(max_attempts=1)
+        try:
+            async with SessionLocal() as session:
+                async with session.begin():
+                    await session.execute(text("SET TRANSACTION READ ONLY"))
+                    report = await verify_handover(session, frozen, apply_report)
+                    live_ready = report["passed"] and await verify_live_scope(
+                        session, frozen, client=client, pause_sec=args.pause_sec
+                    )
+                    # A webhook/outbox may run during the API walk. Refresh the
+                    # identity map and prove the DB half once more before PASS.
+                    session.expire_all()
+                    report = await verify_handover(session, frozen, apply_report)
+                    report["api_guard_ready"] = live_ready
+                    report["passed"] = bool(report["passed"] and live_ready)
+        finally:
+            await client.aclose()
         _print(report)
         return 0 if report["passed"] else 1
 
@@ -257,7 +296,7 @@ async def _run(args: argparse.Namespace) -> int:
     async with SessionLocal() as session:
         transaction = await session.begin()
         try:
-            result = await apply_plan(session, frozen, now=now)
+            result = await apply_plan(session, frozen, max_age_sec=args.max_snapshot_age_sec)
             if result.halted is not None:
                 await transaction.rollback()
             else:
@@ -269,7 +308,7 @@ async def _run(args: argparse.Namespace) -> int:
     _print(report)
     if result.halted is not None:
         return _fail(f"halted ({result.halted}); nothing was changed")
-    durable = result.apply_report(frozen, applied_at=now)
+    durable = result.apply_report(frozen, applied_at=datetime.now(timezone.utc))
     path = write_apply_report(durable, args.apply_report)
     print(f"easyweek_reminder_handover: apply report written to {path}", file=sys.stderr)
     return 0
@@ -278,16 +317,23 @@ async def _run(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     args = build_parser().parse_args(argv)
-    if args.pause_sec < 0:
-        return _fail("--pause-sec must not be negative")
-    if args.max_snapshot_age_sec < 1:
-        return _fail("--max-snapshot-age-sec must be at least 1")
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     print(
         f"easyweek_reminder_handover: snapshot path {args.snapshot} names real bookings; "
         "it is not committed and must not be shared",
         file=sys.stderr,
     )
-    return asyncio.run(_run(args))
+    try:
+        return asyncio.run(_run(args))
+    except (SnapshotError, HandoverError) as error:
+        return _fail(str(error))
+    except SQLAlchemyError:
+        return _fail("database_error")
+    except OSError:
+        return _fail("private_artifact_io_error")
+    except Exception:
+        return _fail("handover_unexpected_error")
 
 
 if __name__ == "__main__":

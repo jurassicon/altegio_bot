@@ -73,7 +73,7 @@ from altegio_bot.easyweek_reminders import (
 )
 from altegio_bot.models.models import PROVIDER_ALTEGIO, PROVIDER_EASYWEEK
 
-SNAPSHOT_VERSION: Final = 3
+SNAPSHOT_VERSION: Final = 4
 APPLY_REPORT_VERSION: Final = 2
 SNAPSHOT_MODE: Final = 0o600
 DIR_MODE: Final = 0o700
@@ -268,6 +268,8 @@ class HandoverRow:
     marker_existing_digest: str | None = None
     marker_handed_over_at: str | None = None
     refusal: str | None = None
+    target_client_id: int | None = None
+    evidence: dict[str, str] = field(default_factory=dict)
 
     @property
     def in_scope(self) -> bool:
@@ -294,6 +296,7 @@ class HandoverRow:
             "target_starts_at": _as_utc(self.target_starts_at).isoformat().replace("+00:00", "Z"),
             "target_is_canceled": self.target_is_canceled,
             "target_is_completed": self.target_is_completed,
+            "target_client_id": self.target_client_id,
         }
 
     def as_safe_dict(self) -> dict[str, Any]:
@@ -318,6 +321,7 @@ class HandoverRow:
                 "handed_over_at": self.marker_handed_over_at,
             },
             "refusal": self.refusal,
+            "evidence": self.evidence,
         }
 
 
@@ -448,6 +452,11 @@ class HandoverPlan:
     eligible_refusals: tuple[EligibleRefusal, ...] = ()
     ledger_rows_seen: int = 0
     eligible_created_rows: int | None = None
+    run_ids: tuple[str, ...] = ()
+    manifest_digest: str = ""
+    configuration_digest: str = ""
+    candidate_fingerprint: str = ""
+    candidate_set_changed: bool = False
 
     def __post_init__(self) -> None:
         if self.eligible_created_rows is None:
@@ -489,7 +498,7 @@ class HandoverPlan:
         satisfies this trivially, which is precisely the trap the standalone
         preflight falls into after a migration.
         """
-        return not self.blocked_rows and not self.eligible_refusals
+        return not self.blocked_rows and not self.eligible_refusals and not self.candidate_set_changed
 
     @property
     def coverage_ready(self) -> bool:
@@ -516,6 +525,13 @@ class HandoverPlan:
             "mode": "read-only",
             "created_at": _timestamp(self.created_at),
             "company_ids": sorted(self.company_ids),
+            "wave": {
+                "run_ids": list(self.run_ids),
+                "manifest_digest": self.manifest_digest,
+                "configuration_digest": self.configuration_digest,
+                "candidate_fingerprint": self.candidate_fingerprint,
+                "candidate_set_changed": self.candidate_set_changed,
+            },
             "ledger_rows_seen": self.ledger_rows_seen,
             "eligible_created_rows": self.eligible_created_rows,
             "historical_rows": dict(sorted(self.historical_rows.items())),
@@ -553,6 +569,8 @@ class HandoverPlan:
             "company_ids": sorted(self.company_ids),
             "created_at": _timestamp(self.created_at),
             "plan_digest": self.digest(),
+            "run_ids": list(self.run_ids),
+            "candidate_set_changed": self.candidate_set_changed,
             "ledger_rows_seen": self.ledger_rows_seen,
             "eligible_created_rows": self.eligible_created_rows,
             "rows_in_scope": len(self.scoped),
@@ -816,7 +834,10 @@ def read_apply_report(path: str | Path, *, frozen: FrozenPlan | None = None) -> 
         expected_already = {
             int(row["identity"]["ledger_id"]) for row in frozen.rows if row["marker"]["action"] == MARKER_ALREADY
         }
-        if set(report.already_marked_ledger_ids) != expected_already:
+        if not expected_already.issubset(report.already_marked_ledger_ids):
+            raise SnapshotError("the apply report marker actions disagree with the snapshot")
+        replayed = set(report.already_marked_ledger_ids) - expected_already
+        if replayed and (report.mutation_count or set(report.already_marked_ledger_ids) != frozen_ledger_ids):
             raise SnapshotError("the apply report marker actions disagree with the snapshot")
     return report
 
@@ -845,6 +866,7 @@ class FrozenPlan:
     guard_ready: bool
     coverage_ready: bool
     cutover_ready: bool
+    wave: dict[str, Any] = field(default_factory=dict)
 
     def age_seconds(self, now: datetime) -> float:
         return (_as_utc(now) - _as_utc(self.created_at)).total_seconds()
@@ -867,6 +889,7 @@ def freeze_plan(plan: HandoverPlan) -> FrozenPlan:
         guard_ready=readiness["guard_ready"],
         coverage_ready=readiness["coverage_ready"],
         cutover_ready=readiness["cutover_ready"],
+        wave=material["wave"],
     )
 
 
@@ -895,8 +918,20 @@ def read_snapshot(path: str | Path) -> FrozenPlan:
         "obligation_outcomes",
         "readiness",
         "plan_digest",
+        "wave",
     }
     _exact_keys(payload, expected_top, "snapshot")
+    wave = payload["wave"]
+    _exact_keys(
+        wave,
+        {"run_ids", "manifest_digest", "configuration_digest", "candidate_fingerprint", "candidate_set_changed"},
+        "wave",
+    )
+    validate_run_ids(wave["run_ids"])
+    for key in ("manifest_digest", "configuration_digest", "candidate_fingerprint"):
+        _validate_digest(wave[key], key)
+    if type(wave["candidate_set_changed"]) is not bool:
+        raise SnapshotError("candidate_set_changed is not boolean")
     if payload["mode"] != "read-only":
         raise SnapshotError("the snapshot mode is invalid")
 
@@ -926,6 +961,26 @@ def read_snapshot(path: str | Path) -> FrozenPlan:
     if not isinstance(raw_rows, list):
         raise SnapshotError("rows is not an array")
     rows = tuple(_validate_row(item) for item in raw_rows)
+    for key in ("source_record_pk", "target_record_pk", "target_booking_uuid"):
+        values = [row["identity"][key] for row in rows]
+        if len(values) != len(set(values)):
+            raise SnapshotError("ledger_pair_ambiguous")
+    job_ids = [job_id for row in rows for job_id in row["stale_source_job_ids"] + row["processing_source_job_ids"]]
+    job_ids += [item["existing_job_id"] for row in rows for item in row["obligations"] if item["existing_job_id"]]
+    if len(job_ids) != len(set(job_ids)):
+        raise SnapshotError("duplicate_job_identity")
+    for row in rows:
+        identity = row["identity"]
+        if identity["source_company_id"] not in companies:
+            raise SnapshotError("company_mismatch")
+        planned = plan_reminders(
+            booking_uuid=canonical_uuid(identity["target_booking_uuid"]),
+            starts_at=_parse_timestamp(identity["target_starts_at"], "target_starts_at"),
+            now=created_at,
+            is_deleted=identity["target_is_canceled"] or identity["target_is_completed"],
+        )
+        if {item.dedupe_key for item in planned} != {item["dedupe_key"] for item in row["obligations"]}:
+            raise SnapshotError("snapshot_obligations_incomplete")
     ledger_ids = [int(item["identity"]["ledger_id"]) for item in rows]
     if ledger_ids != sorted(set(ledger_ids)):
         raise SnapshotError("rows contains duplicate or unsorted identity")
@@ -944,6 +999,8 @@ def read_snapshot(path: str | Path) -> FrozenPlan:
     if not all(type(readiness[key]) is bool for key in readiness):
         raise SnapshotError("readiness contains a non-boolean value")
     expected_readiness = _readiness(rows, refusals, eligible_count)
+    if wave["candidate_set_changed"]:
+        expected_readiness = dict.fromkeys(expected_readiness, False)
     if readiness != expected_readiness:
         raise SnapshotError("readiness does not match the frozen evidence")
 
@@ -969,12 +1026,34 @@ def read_snapshot(path: str | Path) -> FrozenPlan:
         guard_ready=readiness["guard_ready"],
         coverage_ready=readiness["coverage_ready"],
         cutover_ready=readiness["cutover_ready"],
+        wave=dict(wave),
     )
 
 
 def _exact_keys(value: object, expected: set[str], label: str) -> None:
     if not isinstance(value, dict) or set(value) != expected:
         raise SnapshotError(f"{label} has missing or unknown fields")
+
+
+def validate_run_ids(value: object) -> tuple[str, ...]:
+    if (
+        not isinstance(value, (tuple, list))
+        or not value
+        or any(
+            not isinstance(item, str)
+            or not 1 <= len(item) <= 64
+            or any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for char in item)
+            for item in value
+        )
+        or list(value) != sorted(set(value))
+    ):
+        raise SnapshotError("migration_run_scope_invalid")
+    return tuple(value)
+
+
+def _validate_digest(value: object, label: str) -> None:
+    if not isinstance(value, str) or len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
+        raise SnapshotError(f"{label}: invalid digest")
 
 
 def _is_non_negative_int(value: object) -> bool:
@@ -1019,7 +1098,15 @@ def _validate_refusal(value: object) -> dict[str, Any]:
 def _validate_row(value: object) -> dict[str, Any]:
     _exact_keys(
         value,
-        {"identity", "obligations", "stale_source_job_ids", "processing_source_job_ids", "marker", "refusal"},
+        {
+            "identity",
+            "obligations",
+            "stale_source_job_ids",
+            "processing_source_job_ids",
+            "marker",
+            "refusal",
+            "evidence",
+        },
         "row",
     )
     assert isinstance(value, dict)
@@ -1037,6 +1124,7 @@ def _validate_row(value: object) -> dict[str, Any]:
         "target_starts_at",
         "target_is_canceled",
         "target_is_completed",
+        "target_client_id",
     }
     _exact_keys(identity, identity_keys, "row identity")
     assert isinstance(identity, dict)
@@ -1071,6 +1159,9 @@ def _validate_row(value: object) -> dict[str, Any]:
     order = [(item["run_at"], item["job_type"]) for item in obligations]
     if order != sorted(set(order)):
         raise SnapshotError("obligations are duplicate or not canonical")
+    _exact_keys(value["evidence"], {"ledger", "source", "target", "clients", "source_jobs"}, "row evidence")
+    for key, digest in value["evidence"].items():
+        _validate_digest(digest, key)
 
     return {
         "identity": dict(identity),
@@ -1079,6 +1170,7 @@ def _validate_row(value: object) -> dict[str, Any]:
         "processing_source_job_ids": list(processing),
         "marker": _validate_marker(value["marker"]),
         "refusal": None,
+        "evidence": dict(value["evidence"]),
     }
 
 
@@ -1205,7 +1297,7 @@ def check_snapshot_usable(
     age = frozen.age_seconds(now)
     if age < 0:
         raise SnapshotError("the snapshot claims to be from the future; re-run plan")
-    if age > max_age_sec:
+    if age > min(max_age_sec, DEFAULT_MAX_SNAPSHOT_AGE_SEC):
         # Obligations move with the clock. A plan old enough that a two-hour
         # reminder has fallen past its moment is a plan about a different world.
         raise SnapshotError(f"the snapshot is {int(age)}s old (limit {max_age_sec}s); re-run plan")

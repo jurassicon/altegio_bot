@@ -20,21 +20,33 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Final
 
 from sqlalchemy import select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.easyweek_locations import configured_easyweek_locations
 from altegio_bot.easyweek_migration import ledger as ledger_module
 from altegio_bot.easyweek_migration.branch_identity import verify_branch_identity
+from altegio_bot.easyweek_migration.handover_evidence import (
+    candidate_fingerprint,
+    configuration_digest,
+    configuration_ready,
+    local_refusal,
+    row_evidence,
+    wave_entries,
+)
 from altegio_bot.easyweek_migration.manifest import MigrationManifest
 from altegio_bot.easyweek_migration.reminder_handover import (
     CANCEL_REASON,
     COVERING_STATUSES,
+    DEFAULT_MAX_SNAPSHOT_AGE_SEC,
     MARKER_ALREADY,
     MARKER_SET,
     OBLIGATION_DONE,
@@ -57,20 +69,25 @@ from altegio_bot.easyweek_migration.reminder_handover import (
     FrozenPlan,
     HandoverPlan,
     HandoverRow,
+    boundary_still_future,
     canonical_uuid,
     handover_timestamp,
     insert_values,
     obligations_for,
+    validate_run_ids,
 )
 from altegio_bot.easyweek_policy import EASYWEEK_REMINDER_JOB_TYPES
 from altegio_bot.easyweek_reminder_guard import (
+    GuardOutcome,
     ObservedBooking,
+    check_api_response,
     classify_client_error,
     read_booking_state,
 )
 from altegio_bot.models.models import (
     PROVIDER_ALTEGIO,
     PROVIDER_EASYWEEK,
+    Client,
     EasyWeekMigrationLedger,
     MessageJob,
     OutboxMessage,
@@ -120,15 +137,8 @@ def _aware(value: datetime | None) -> datetime | None:
 # ---------------------------------------------------------------------------
 
 
-async def _ledger_rows(session: AsyncSession, company_ids: tuple[int, ...]) -> list[EasyWeekMigrationLedger]:
-    stmt = (
-        select(EasyWeekMigrationLedger)
-        .where(EasyWeekMigrationLedger.source_provider == PROVIDER_ALTEGIO)
-        .where(EasyWeekMigrationLedger.target_provider == PROVIDER_EASYWEEK)
-        .where(EasyWeekMigrationLedger.source_company_id.in_(company_ids))
-        .order_by(EasyWeekMigrationLedger.id.asc())
-    )
-    return list((await session.execute(stmt)).scalars().all())
+async def _ledger_rows(session: AsyncSession, company_ids: tuple[int, ...], run_ids: tuple[str, ...]):
+    return await wave_entries(session, company_ids, run_ids)
 
 
 async def _existing_reminder_jobs(session: AsyncSession, record_pk: int) -> dict[str, tuple[int, str]]:
@@ -175,6 +185,7 @@ async def build_plan(
     *,
     manifest: MigrationManifest,
     company_ids: tuple[int, ...],
+    run_ids: tuple[str, ...],
     client: Any,
     now: datetime | None = None,
     pause_sec: float = DEFAULT_PAUSE_SEC,
@@ -189,6 +200,20 @@ async def build_plan(
     """
     moment = _aware(now) or _utcnow()
     pause = sleep if sleep is not None else asyncio.sleep
+    validate_run_ids(run_ids)
+    if not math.isfinite(pause_sec) or pause_sec < DEFAULT_PAUSE_SEC:
+        raise HandoverError("api_pacing_invalid")
+    if not manifest.valid or not set(company_ids).issubset(manifest.company_ids):
+        raise HandoverError("manifest_scope_invalid")
+    if not configuration_ready():
+        raise HandoverError("configuration_unproven")
+    # First statement in the transaction, including when called directly. Never
+    # silently inherit an already-used read/write transaction from a caller.
+    if session.in_transaction():
+        raise HandoverError("plan_requires_fresh_transaction")
+    await session.execute(text("SET TRANSACTION READ ONLY"))
+    config_digest = configuration_digest()
+    before = await candidate_fingerprint(session, company_ids, run_ids)
 
     # The manifest says which EasyWeek location each Altegio company migrated
     # into; only the runtime registry can prove that location IS that branch.
@@ -217,7 +242,7 @@ async def build_plan(
             )
         )
 
-    ledger_rows = await _ledger_rows(session, company_ids)
+    ledger_rows = await _ledger_rows(session, company_ids, run_ids)
     for entry in ledger_rows:
         if entry.status != ledger_module.STATUS_CREATED:
             historical_rows[entry.status] = historical_rows.get(entry.status, 0) + 1
@@ -279,6 +304,11 @@ async def build_plan(
             _refuse(entry, ROW_BRANCH_UNPROVEN)
             continue
 
+        refusal = await local_refusal(session, entry, source, target, manifest)
+        if refusal:
+            _refuse(entry, refusal)
+            continue
+
         # The durable ownership marker as it stands right now. Read BEFORE the
         # live booking read: it is a local field, and a row whose marker cannot
         # be interpreted must not spend an API request or a slice of the 60/min
@@ -302,18 +332,27 @@ async def build_plan(
             _refuse(entry, ROW_MARKER_INCOMPLETE)
             continue
 
+        evidence = await row_evidence(session, entry, source, target)
         if api_calls:
             await pause(pause_sec)
         api_calls += 1
         try:
             payload = await client.get_booking(str(booking_uuid))
         except Exception as exc:  # noqa: BLE001 — mapped by class, text never kept
+            outcome = classify_client_error(exc).outcome
             logger.info(
                 "reminder_handover: target unproven ledger_id=%s outcome=%s",
                 entry.id,
-                classify_client_error(exc).outcome.value,
+                outcome.value,
             )
-            _refuse(entry, ROW_TARGET_UNPROVEN)
+            reason = {
+                GuardOutcome.NOT_FOUND: "api_not_found",
+                GuardOutcome.CONFIGURATION_UNAVAILABLE: "api_unauthorized",
+                GuardOutcome.MALFORMED_RESPONSE: "api_malformed_response",
+            }.get(outcome, ROW_TARGET_UNPROVEN)
+            if getattr(exc, "status_code", None) == 429:
+                reason = "api_rate_limited"
+            _refuse(entry, reason)
             continue
 
         observed = read_booking_state(payload, booking_uuid=booking_uuid, location=location)
@@ -348,6 +387,8 @@ async def build_plan(
                 target_starts_at=observed.starts_at,
                 target_is_canceled=observed.is_canceled,
                 target_is_completed=observed.is_completed,
+                target_client_id=target.client_id,
+                evidence=evidence,
                 obligations=obligations_for(
                     booking_uuid=booking_uuid,
                     starts_at=observed.starts_at,
@@ -363,6 +404,15 @@ async def build_plan(
             )
         )
 
+        row = rows[-1]
+        unmet = await _unmet_obligations(session, (row.as_safe_dict(),), [row.identity()], missing_allowed=True)
+        stray = await _stray_target_jobs(session, (row.as_safe_dict(),))
+        if unmet or stray:
+            rows.pop()
+            _refuse(entry, "stale_target_reminder" if stray else HALT_OBLIGATION_IDENTITY)
+
+    after = await candidate_fingerprint(session, company_ids, run_ids)
+
     return HandoverPlan(
         company_ids=tuple(sorted(company_ids)),
         created_at=moment,
@@ -371,6 +421,11 @@ async def build_plan(
         eligible_refusals=tuple(eligible_refusals),
         ledger_rows_seen=len(ledger_rows),
         eligible_created_rows=sum(entry.status == ledger_module.STATUS_CREATED for entry in ledger_rows),
+        run_ids=run_ids,
+        manifest_digest=manifest.digest,
+        configuration_digest=config_digest,
+        candidate_fingerprint=before,
+        candidate_set_changed=before != after or config_digest != configuration_digest(),
     )
 
 
@@ -460,6 +515,12 @@ async def _lock_scope(session: AsyncSession, identities: list[dict[str, Any]]) -
         select(Record.id).where(Record.id.in_(record_pks)).order_by(Record.id.asc()).with_for_update()
     )
     await session.execute(
+        select(Client.id)
+        .where(Client.id.in_(select(Record.client_id).where(Record.id.in_(record_pks))))
+        .order_by(Client.id)
+        .with_for_update()
+    )
+    await session.execute(
         select(MessageJob.id)
         .where(MessageJob.record_id.in_(record_pks))
         .where(MessageJob.job_type.in_(EASYWEEK_REMINDER_JOB_TYPES))
@@ -498,6 +559,8 @@ async def _scope_still_matches(session: AsyncSession, identities: list[dict[str,
             return ROW_TARGET_RECORD_MISSING
         if target.company_id != int(item["target_company_id"]):
             return ROW_COMPANY_MISMATCH
+        if target.client_id != item["target_client_id"]:
+            return "target_client_unproven"
         if canonical_uuid(target.easyweek_booking_uuid) != canonical_uuid(item["target_booking_uuid"]):
             return ROW_TARGET_RECORD_MISSING
         if bool(target.is_deleted) != bool(item["target_is_canceled"]):
@@ -518,6 +581,8 @@ async def _scope_still_matches(session: AsyncSession, identities: list[dict[str,
             return ROW_SOURCE_RECORD_MISSING
         if source.company_id != int(item["source_company_id"]):
             return ROW_COMPANY_MISMATCH
+        if source.altegio_record_id != int(item["source_record_id"]):
+            return ROW_SOURCE_RECORD_MISSING
     return None
 
 
@@ -528,20 +593,14 @@ async def _eligible_scope_still_complete(
     lock: bool,
 ) -> bool:
     """Re-read the whole existing company/status scope while its rows are locked."""
-    if lock:
-        # Row locks do not protect this predicate from a newly inserted ledger
-        # row. SHARE blocks ledger INSERT/UPDATE for this short transaction, so
-        # the frozen company/status scope cannot acquire a phantom eligible row.
-        await session.execute(text("LOCK TABLE easyweek_migration_ledger IN SHARE MODE"))
     stmt = (
         select(EasyWeekMigrationLedger)
         .where(EasyWeekMigrationLedger.source_provider == PROVIDER_ALTEGIO)
         .where(EasyWeekMigrationLedger.target_provider == PROVIDER_EASYWEEK)
         .where(EasyWeekMigrationLedger.source_company_id.in_(frozen.company_ids))
+        .where(EasyWeekMigrationLedger.run_id.in_(frozen.wave["run_ids"]))
         .order_by(EasyWeekMigrationLedger.id.asc())
     )
-    if lock:
-        stmt = stmt.with_for_update()
     current = list((await session.execute(stmt)).scalars().all())
     created = [entry for entry in current if entry.status == ledger_module.STATUS_CREATED]
     expected = {
@@ -603,6 +662,7 @@ async def _apply_plan_inner(
     frozen: FrozenPlan,
     *,
     now: datetime | None = None,
+    max_age_sec: int = DEFAULT_MAX_SNAPSHOT_AGE_SEC,
 ) -> ApplyResult:
     """Create the missing EasyWeek reminders, then withdraw the old Altegio ones.
 
@@ -617,6 +677,8 @@ async def _apply_plan_inner(
     permanently — with none.
     """
     moment = _aware(now) or _utcnow()
+    began = time.monotonic()
+    started_at = moment
     if frozen.eligible_refusals or not frozen.rows or frozen.eligible_created_rows != len(frozen.rows):
         return ApplyResult(halted=HALT_SNAPSHOT_INCOMPLETE)
     if any(
@@ -635,6 +697,19 @@ async def _apply_plan_inner(
     identities = [row["identity"] for row in frozen_rows]
 
     await _lock_scope(session, identities)
+    # Include actual lock wait even when tests/operator inject the initial clock.
+    from datetime import timedelta
+
+    moment += timedelta(seconds=time.monotonic() - began)
+    age = frozen.age_seconds(moment)
+    if age < 0:
+        return ApplyResult(halted="snapshot_time_invalid")
+    if boundary := boundary_still_future(frozen.rows, now=moment):
+        return ApplyResult(halted=boundary)
+    if age > min(max_age_sec, DEFAULT_MAX_SNAPSHOT_AGE_SEC):
+        return ApplyResult(halted="snapshot_expired")
+    if frozen.wave.get("configuration_digest") != configuration_digest():
+        return ApplyResult(halted="configuration_changed")
 
     if not await _eligible_scope_still_complete(session, frozen, lock=True):
         return ApplyResult(halted=HALT_ELIGIBLE_SCOPE_CHANGED)
@@ -652,6 +727,21 @@ async def _apply_plan_inner(
     drift = await _scope_still_matches(session, identities)
     if drift is not None:
         return ApplyResult(halted=drift)
+    for row in frozen_rows:
+        identity = row["identity"]
+        entry = await session.get(EasyWeekMigrationLedger, identity["ledger_id"], populate_existing=True)
+        if entry.reminders_handed_over_at is not None and entry.reminder_handover_plan_digest != frozen.digest:
+            return ApplyResult(halted=HALT_MARKER_CONFLICT)
+        source = await session.get(Record, identity["source_record_pk"], populate_existing=True)
+        target = await session.get(Record, identity["target_record_pk"], populate_existing=True)
+        if refusal := await local_refusal(session, entry, source, target):
+            return ApplyResult(halted=refusal)
+        evidence = await row_evidence(session, entry, source, target)
+        for key, expected in row["evidence"].items():
+            if evidence[key] != expected:
+                return ApplyResult(halted=f"{key}_changed")
+    if await _stray_target_jobs(session, frozen_rows):
+        return ApplyResult(halted="stale_target_reminder")
 
     processing = await _processing_in_scope(session, identities)
     if processing:
@@ -679,6 +769,12 @@ async def _apply_plan_inner(
         )
         for item in row.get("obligations") or ():
             if not isinstance(item, dict) or item.get("outcome") != OBLIGATION_MISSING:
+                continue
+            entry = await session.get(EasyWeekMigrationLedger, identity["ledger_id"])
+            if entry.reminders_handed_over_at is not None:
+                # A repeat proves coverage but never repairs a subsequently
+                # removed job under an already-consumed authorisation.
+                already_present += 1
                 continue
             run_at = _aware(datetime.fromisoformat(str(item["run_at"]).replace("Z", "+00:00")))
             if run_at is None or run_at <= moment:
@@ -711,6 +807,13 @@ async def _apply_plan_inner(
 
     if unmet:
         return ApplyResult(halted=HALT_OBLIGATION_IDENTITY)
+    if not await _eligible_scope_still_complete(session, frozen, lock=False):
+        return ApplyResult(halted=HALT_ELIGIBLE_SCOPE_CHANGED)
+    moment = started_at + timedelta(seconds=time.monotonic() - began)
+    if boundary := boundary_still_future(frozen.rows, now=moment):
+        return ApplyResult(halted=boundary)
+    if frozen.age_seconds(moment) > min(max_age_sec, DEFAULT_MAX_SNAPSHOT_AGE_SEC):
+        return ApplyResult(halted="snapshot_expired")
 
     # -- 3. prove and cancel -----------------------------------------------
     canceled: list[int] = []
@@ -793,6 +896,9 @@ async def apply_plan(
     frozen: FrozenPlan,
     *,
     now: datetime | None = None,
+    max_age_sec: int = DEFAULT_MAX_SNAPSHOT_AGE_SEC,
+    lock_timeout_ms: int = 5000,
+    statement_timeout_ms: int = 15000,
 ) -> ApplyResult:
     """Apply atomically, rolling back even when a caller mishandles a refusal.
 
@@ -803,7 +909,19 @@ async def apply_plan(
     """
     savepoint = await session.begin_nested()
     try:
-        result = await _apply_plan_inner(session, frozen, now=now)
+        await session.execute(
+            text("SELECT set_config('lock_timeout', :value, true)"), {"value": f"{lock_timeout_ms}ms"}
+        )
+        await session.execute(
+            text("SELECT set_config('statement_timeout', :value, true)"), {"value": f"{statement_timeout_ms}ms"}
+        )
+        result = await _apply_plan_inner(session, frozen, now=now, max_age_sec=max_age_sec)
+    except DBAPIError as error:
+        await savepoint.rollback()
+        code = getattr(error.orig, "sqlstate", None)
+        return ApplyResult(
+            halted={"55P03": "database_lock_timeout", "57014": "database_statement_timeout"}.get(code, "database_error")
+        )
     except Exception:
         await savepoint.rollback()
         raise
@@ -955,6 +1073,8 @@ async def _unmet_obligations(
     session: AsyncSession,
     frozen_rows: tuple[dict[str, Any], ...],
     identities: list[dict[str, Any]],
+    *,
+    missing_allowed: bool = False,
 ) -> list[str]:
     """Keys the snapshot said were owed and the database still does not hold.
 
@@ -975,6 +1095,12 @@ async def _unmet_obligations(
     unmet: list[str] = []
     for key, (identity, obligation) in sorted(wanted.items()):
         job = held.get(key)
+        if missing_allowed and (
+            job is None
+            or obligation["outcome"]
+            not in {OBLIGATION_MISSING, OBLIGATION_PRESENT_OPEN, OBLIGATION_PROCESSING, OBLIGATION_DONE}
+        ):
+            continue
         if job is None or not _job_covers_obligation(job, identity, obligation):
             unmet.append(key)
     return unmet
@@ -990,6 +1116,7 @@ def _job_covers_obligation(
         job.provider != PROVIDER_EASYWEEK
         or job.company_id != int(identity["target_company_id"])
         or job.record_id != int(identity["target_record_pk"])
+        or job.client_id != identity["target_client_id"]
         or job.job_type != obligation["job_type"]
         or job.status not in COVERING_STATUSES
         or job.dedupe_key != obligation["dedupe_key"]
@@ -1022,6 +1149,24 @@ def _parse_payload_timestamp(value: object) -> datetime | None:
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         return None
+
+
+async def _stray_target_jobs(session: AsyncSession, rows: tuple[dict[str, Any], ...]) -> list[int]:
+    expected = {
+        row["identity"]["target_record_pk"]: {item["dedupe_key"] for item in row["obligations"]} for row in rows
+    }
+    if not expected:
+        return []
+    jobs = await session.scalars(
+        select(MessageJob)
+        .where(
+            MessageJob.record_id.in_(expected),
+            MessageJob.job_type.in_(EASYWEEK_REMINDER_JOB_TYPES),
+            MessageJob.status.in_(OPEN_STATUSES),
+        )
+        .execution_options(populate_existing=True)
+    )
+    return sorted(job.id for job in jobs if job.dedupe_key not in expected[job.record_id])
 
 
 # ---------------------------------------------------------------------------
@@ -1107,6 +1252,20 @@ async def verify_handover(
     identities = [row["identity"] for row in frozen_rows]
     source_pks = sorted({int(item["source_record_pk"]) for item in identities})
     target_pks = sorted({int(item["target_record_pk"]) for item in identities})
+    drift = await _scope_still_matches(session, identities)
+    if not drift and frozen.wave.get("configuration_digest") != configuration_digest():
+        drift = "configuration_changed"
+    if not drift:
+        for row, identity in zip(frozen_rows, identities, strict=True):
+            entry = await session.get(EasyWeekMigrationLedger, identity["ledger_id"], populate_existing=True)
+            source = await session.get(Record, identity["source_record_pk"], populate_existing=True)
+            target = await session.get(Record, identity["target_record_pk"], populate_existing=True)
+            if refusal := await local_refusal(session, entry, source, target):
+                drift = refusal
+                break
+            if await row_evidence(session, entry, source, target) != row["evidence"]:
+                drift = "local_state_changed"
+                break
 
     open_source = []
     if source_pks:
@@ -1238,6 +1397,8 @@ async def verify_handover(
 
     return {
         "mode": "verify",
+        "scope_drift": drift,
+        "uncovered_obligations": len(unmet),
         "snapshot_version": frozen.version,
         "ledger_rows_marked": len(marker_state["marked"]),
         "ledger_rows_missing_marker": marker_state["missing"],
@@ -1260,6 +1421,7 @@ async def verify_handover(
         "messages_sent_by_handover": 0 if outbox_unchanged else None,
         "passed": (
             complete_scope
+            and not drift
             and counts_match
             and not marker_state["missing"]
             and not marker_state["foreign"]
@@ -1274,3 +1436,43 @@ async def verify_handover(
             and outbox_unchanged
         ),
     }
+
+
+async def verify_live_scope(
+    session: AsyncSession, frozen: FrozenPlan, *, client: Any, pause_sec: float = DEFAULT_PAUSE_SEC
+) -> bool:
+    """One paced GET per frozen pair; same proof used by the runtime send guard."""
+    registry = configured_easyweek_locations()
+    if not registry.ready:
+        return False
+    for index, row in enumerate(frozen.rows):
+        identity = row["identity"]
+        location = registry.locations.get(identity["target_company_id"])
+        if location is None:
+            return False
+        if index:
+            await asyncio.sleep(max(DEFAULT_PAUSE_SEC, pause_sec))
+        try:
+            payload = await client.get_booking(identity["target_booking_uuid"])
+        except Exception:
+            return False
+        booking_uuid = canonical_uuid(identity["target_booking_uuid"])
+        observed = read_booking_state(payload, booking_uuid=booking_uuid, location=location)
+        if not isinstance(observed, ObservedBooking):
+            return False
+        expected_start = _parse_payload_timestamp(identity["target_starts_at"])
+        if (
+            observed.starts_at != expected_start
+            or observed.is_canceled != identity["target_is_canceled"]
+            or observed.is_completed != identity["target_is_completed"]
+        ):
+            return False
+        if (
+            observed.is_active
+            and check_api_response(
+                payload, booking_uuid=booking_uuid, location=location, expected_start=expected_start
+            ).outcome
+            is not GuardOutcome.PROVEN_CURRENT
+        ):
+            return False
+    return True

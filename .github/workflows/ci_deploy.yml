@@ -182,11 +182,23 @@ jobs:
           ALTEGIO_REQUIRE_NGINX_LOGTEST: "1"
         run: uv run pytest -q src/altegio_bot/tests/test_nginx_webhook_logging_integration.py
 
+      - name: Run required reminder handover tests
+        env:
+          REQUIRE_PG_CONCURRENCY: "1"
+        run: |
+          uv run pytest -q \
+            src/altegio_bot/tests/test_easyweek_reminder_handover.py \
+            src/altegio_bot/tests/test_easyweek_reminder_handover_db.py \
+            src/altegio_bot/tests/test_easyweek_reminder_handover_safety.py
+
       # Both Docker-dependent suites above already ran under their own mandatory
       # gates; re-running them here would only duplicate container work.
       - name: Run tests
         run: |
           uv run pytest -q \
+            --ignore=src/altegio_bot/tests/test_easyweek_reminder_handover.py \
+            --ignore=src/altegio_bot/tests/test_easyweek_reminder_handover_db.py \
+            --ignore=src/altegio_bot/tests/test_easyweek_reminder_handover_safety.py \
             --ignore=src/altegio_bot/tests/test_easyweek_migration_integration.py \
             --ignore=src/altegio_bot/tests/test_nginx_webhook_logging_integration.py
 
