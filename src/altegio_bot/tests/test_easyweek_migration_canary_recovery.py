@@ -16,12 +16,16 @@ uncertain row, on a full proof, and nothing else. This file is mostly about the
 
 from __future__ import annotations
 
+import asyncio
+
 import httpx
 import pytest
 import pytest_asyncio
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from altegio_bot.easyweek_migration import ledger as ledger_module
+from altegio_bot.easyweek_migration import runner as runner_module
 from altegio_bot.easyweek_migration.canary import (
     CANARY_POST_FAILED,
     CANARY_READBACK_FAILED,
@@ -29,6 +33,7 @@ from altegio_bot.easyweek_migration.canary import (
     RECOVERY_ALREADY_VERIFIED,
     RECOVERY_NO_ATTEMPT,
     RECOVERY_NOT_UNCERTAIN_OUTCOME,
+    RECOVERY_PROOF_CHANGED,
 )
 from altegio_bot.easyweek_migration.cutover import parse_cutover
 from altegio_bot.easyweek_migration.manifest import KARLSRUHE_COMPANY_ID, parse_manifest
@@ -186,6 +191,121 @@ async def test_the_operator_can_recover_the_uncertain_canary(session_local, sour
     assert proof.target_booking_uuid == CREATED_UUIDS[KA_RECORD_A]
     assert proof.target_snapshot_fingerprint == row.target_snapshot_fingerprint
     assert proof.verified_at is not None
+
+
+async def test_canary_recovery_rejects_a_row_changed_after_admission(
+    session_local,
+    source,
+    monkeypatch,
+):
+    """Admission is a versioned snapshot, not a reusable permission."""
+    transport = RecordingTransport()
+    await uncertain_canary(session_local, transport)
+    transport.plant_booking(CREATED_UUIDS[KA_RECORD_A], record_id=KA_RECORD_A)
+    proof_started = asyncio.Event()
+    release_proof = asyncio.Event()
+    original = runner_module._prove_uncertain_row_against_target
+
+    async def _paused_proof(*args, **kwargs):
+        proof_started.set()
+        await release_proof.wait()
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(runner_module, "_prove_uncertain_row_against_target", _paused_proof)
+    inputs = resolve_inputs(run_id="stale-canary-resolver")
+    async with make_write_client(transport) as client:
+        task = asyncio.create_task(run_resolve_created(session_local, inputs, write_client=client))
+        await proof_started.wait()
+        async with session_local() as session:
+            async with session.begin():
+                row = await ledger_module.get_row(
+                    session,
+                    source_company_id=KARLSRUHE_COMPANY_ID,
+                    source_record_id=KA_RECORD_A,
+                )
+                assert row is not None
+                fingerprint = row.source_fingerprint
+                await ledger_module.resolve_uncertain_as_absent(
+                    session,
+                    run_id="concurrent-absent",
+                    source_company_id=KARLSRUHE_COMPANY_ID,
+                    source_record_id=KA_RECORD_A,
+                    expected=ledger_module.resolution_expectation(row),
+                    reason_code="concurrent_absent_proof",
+                )
+        async with session_local() as session:
+            async with session.begin():
+                assert await ledger_module.claim_for_apply(
+                    session,
+                    run_id="replacement-canary-run",
+                    source_company_id=KARLSRUHE_COMPANY_ID,
+                    source_record_id=KA_RECORD_A,
+                    source_fingerprint=fingerprint,
+                )
+        release_proof.set()
+        report = await task
+
+    row = {item.source_record_id: item for item in await ledger_rows(session_local)}[KA_RECORD_A]
+    proof = (await proof_rows(session_local))[0]
+    assert report.errors == [ledger_module.LEDGER_CHANGED_DURING_RESOLUTION]
+    assert row.status == ledger_module.STATUS_PENDING
+    assert row.run_id == "replacement-canary-run"
+    assert row.last_resolution_run_id == "concurrent-absent"
+    assert row.target_booking_uuid is None
+    assert row.target_snapshot_fingerprint is None
+    assert proof.verified is False
+    assert proof.failure_reason == "canary_post_uncertain"
+    assert proof.target_booking_uuid is None
+
+
+async def test_canary_recovery_rejects_a_proof_refreshed_during_live_read(
+    session_local,
+    source,
+    monkeypatch,
+):
+    transport = RecordingTransport()
+    origin_run = await uncertain_canary(session_local, transport)
+    transport.plant_booking(CREATED_UUIDS[KA_RECORD_A], record_id=KA_RECORD_A)
+    proof_started = asyncio.Event()
+    release_proof = asyncio.Event()
+    original = runner_module._prove_uncertain_row_against_target
+
+    async def _paused_proof(*args, **kwargs):
+        proof_started.set()
+        await release_proof.wait()
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(runner_module, "_prove_uncertain_row_against_target", _paused_proof)
+    async with make_write_client(transport) as client:
+        task = asyncio.create_task(
+            run_resolve_created(
+                session_local,
+                resolve_inputs(run_id="stale-canary-resolver"),
+                write_client=client,
+            )
+        )
+        await proof_started.wait()
+        async with session_local() as session:
+            await session.execute(
+                text(
+                    "UPDATE easyweek_migration_canary_proof "
+                    "SET run_id = 'refreshed-canary-run', updated_at = clock_timestamp()"
+                )
+            )
+            await session.commit()
+        release_proof.set()
+        report = await task
+
+    row = {item.source_record_id: item for item in await ledger_rows(session_local)}[KA_RECORD_A]
+    proof = (await proof_rows(session_local))[0]
+    assert report.errors == [RECOVERY_PROOF_CHANGED]
+    assert row.status == ledger_module.STATUS_UNCERTAIN
+    assert row.run_id == origin_run
+    assert row.target_booking_uuid is None
+    assert row.target_snapshot_fingerprint is None
+    assert proof.verified is False
+    assert proof.run_id == "refreshed-canary-run"
+    assert proof.failure_reason == "canary_post_uncertain"
 
 
 async def test_the_recovered_proof_then_licenses_the_bulk(session_local, source):

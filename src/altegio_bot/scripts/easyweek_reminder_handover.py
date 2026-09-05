@@ -98,12 +98,18 @@ DEFAULT_APPLY_REPORT: Final = (
 # the digest and the phrase: the flag proves somebody meant it now, this proves
 # the host is one where the handover is allowed at all.
 APPLY_ENV_FLAG: Final = "EASYWEEK_REMINDER_HANDOVER_ALLOW_APPLY"
+# This CLI destroys an old plan authorisation before normal parsing. Both
+# parsers must therefore recognise exactly the same option names: accepting an
+# abbreviation in only one of them can destroy the wrong snapshot or preserve
+# the one the operator meant to replace.
+ALLOW_OPTION_ABBREVIATIONS: Final = False
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="easyweek_reminder_handover",
         description="Hand future reminders over from migrated Altegio bookings to their EasyWeek twins.",
+        allow_abbrev=ALLOW_OPTION_ABBREVIATIONS,
     )
     parser.add_argument("mode", nargs="?", default=MODE_PLAN, choices=MODES)
     parser.add_argument(
@@ -368,7 +374,11 @@ def build_pre_parser() -> argparse.ArgumentParser:
     them to answer at all. `parse_known_args` on an argparse parser that knows
     the arity is the smallest construction with unambiguous semantics.
     """
-    parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False, exit_on_error=False)
+    parser = argparse.ArgumentParser(
+        add_help=False,
+        allow_abbrev=ALLOW_OPTION_ABBREVIATIONS,
+        exit_on_error=False,
+    )
     parser.add_argument("mode", nargs="?", default=None)
     parser.add_argument("--snapshot", default=None)
     # Declared so their VALUES can never be mistaken for the mode. Types stay
@@ -378,6 +388,7 @@ def build_pre_parser() -> argparse.ArgumentParser:
         parser.add_argument(option, action="append", default=[])
     for option in ("--plan-digest", "--confirm", "--pause-sec", "--max-snapshot-age-sec"):
         parser.add_argument(option, default=None)
+    parser.add_argument("--apply", action="store_true")
     return parser
 
 
@@ -404,6 +415,12 @@ def _recover_pre_parse(tokens: list[str]) -> tuple[str | None, str | None]:
     index = 0
     while index < len(tokens):
         token = tokens[index]
+        if token == "--":
+            # argparse stops recognising options here. Everything after the
+            # separator is a positional — including literal `--help` and names
+            # that would otherwise consume a value.
+            positionals.extend(tokens[index + 1 :])
+            break
         if token.startswith("-"):
             option, separator, inline_value = token.partition("=")
             action = option_actions.get(option)
@@ -436,6 +453,15 @@ def _recover_pre_parse(tokens: list[str]) -> tuple[str | None, str | None]:
         return MODE_PLAN, snapshot
     if positionals[0] in MODES:
         return positionals[0], snapshot
+    # Unknown options have unknown arity. If their apparent value is followed
+    # by an explicit mode, prefer that mode over guessing that the first
+    # positional was the command. In particular, malformed apply/verify must
+    # never become destructive merely because a rejected option preceded it.
+    for mode in (MODE_APPLY, MODE_VERIFY):
+        if mode in positionals:
+            return mode, snapshot
+    if MODE_PLAN in positionals:
+        return MODE_PLAN, snapshot
     if unknown_option:
         return MODE_PLAN, snapshot
     return None, snapshot
@@ -454,7 +480,8 @@ def _intended_plan_snapshot(argv: list[str] | None) -> str | None:
     read by a parser that knows what is a value and what is not.
     """
     tokens = list(sys.argv[1:] if argv is None else argv)
-    if any(token in ("-h", "--help") for token in tokens):
+    option_tokens = tokens[: tokens.index("--")] if "--" in tokens else tokens
+    if any(token in ("-h", "--help") for token in option_tokens):
         return None
     try:
         parsed, _unknown = build_pre_parser().parse_known_args(tokens)

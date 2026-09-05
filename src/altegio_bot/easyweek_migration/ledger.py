@@ -140,6 +140,10 @@ async def load_ledger_views(
 WAVE_LOCK_NAMESPACE: Final = 1163280712
 # The refusal a writer gets when the wave's reminders are already EasyWeek's.
 WAVE_CLOSED: Final = "migration_wave_closed"
+# A live proof only authorises the exact ledger version it was built from. If
+# anything moved while the network was being read, the proof is stale and must
+# not be attached to the replacement attempt.
+LEDGER_CHANGED_DURING_RESOLUTION: Final = "migration_ledger_changed_during_resolution"
 
 
 def _wave_lock_key(*, source_company_id: int, run_id: str) -> int:
@@ -182,6 +186,16 @@ class WaveClosed(RuntimeError):
         self.reason = WAVE_CLOSED
         self.source_company_id = source_company_id
         self.run_id = run_id
+
+
+class LedgerChangedDuringResolution(RuntimeError):
+    """The unresolved ledger fact changed while its live proof was built."""
+
+    def __init__(self, *, source_company_id: int, source_record_id: int) -> None:
+        super().__init__(LEDGER_CHANGED_DURING_RESOLUTION)
+        self.reason = LEDGER_CHANGED_DURING_RESOLUTION
+        self.source_company_id = source_company_id
+        self.source_record_id = source_record_id
 
 
 async def close_migration_wave(
@@ -696,6 +710,61 @@ async def rows_for_run(
 UNRESOLVED_STATUSES: Final = (STATUS_UNCERTAIN, STATUS_PENDING)
 
 
+@dataclass(frozen=True)
+class ResolutionExpectation:
+    """Immutable, PII-free ledger version that one live proof authorises.
+
+    ``updated_at`` is the optimistic version token. The surrounding fields make
+    the comparison explicit and independently protect the provider, source,
+    target and attempt identity. In particular, ``updated_at`` catches the
+    pending -> failed -> pending cycle where a reclaim deliberately reuses the
+    same run id and every other visible value could return to its old value.
+    """
+
+    ledger_id: int
+    source_provider: str
+    source_company_id: int
+    source_record_id: int
+    target_provider: str
+    origin_run_id: str
+    status: str
+    source_fingerprint: str
+    target_booking_uuid: str | None
+    target_snapshot_fingerprint: str | None
+    attempts: int
+    last_resolution_run_id: str | None
+    reason_code: str | None
+    updated_at: datetime
+
+
+def _as_utc(value: datetime) -> datetime:
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+
+
+def resolution_expectation(row: EasyWeekMigrationLedger) -> ResolutionExpectation:
+    """Freeze the exact ledger version before any external proof begins."""
+    if row.id is None or row.updated_at is None:
+        raise RuntimeError("migration ledger row has no durable identity/version")
+    return ResolutionExpectation(
+        ledger_id=int(row.id),
+        source_provider=str(row.source_provider),
+        source_company_id=int(row.source_company_id),
+        source_record_id=int(row.source_record_id),
+        target_provider=str(row.target_provider),
+        origin_run_id=str(row.run_id),
+        status=str(row.status),
+        source_fingerprint=str(row.source_fingerprint),
+        target_booking_uuid=str(row.target_booking_uuid) if row.target_booking_uuid is not None else None,
+        target_snapshot_fingerprint=(
+            str(row.target_snapshot_fingerprint) if row.target_snapshot_fingerprint is not None else None
+        ),
+        attempts=int(row.attempts or 0),
+        last_resolution_run_id=(str(row.last_resolution_run_id) if row.last_resolution_run_id is not None else None),
+        reason_code=str(row.reason_code) if row.reason_code is not None else None,
+        updated_at=_as_utc(row.updated_at),
+    )
+
+
 async def uncertain_rows(session: AsyncSession) -> list[EasyWeekMigrationLedger]:
     """Every row with an unknown outcome, across all runs.
 
@@ -750,6 +819,7 @@ async def resolve_uncertain_as_created(
     run_id: str,
     source_company_id: int,
     source_record_id: int,
+    expected: ResolutionExpectation,
     target_booking_uuid: str,
     target_snapshot_fingerprint: str,
 ) -> None:
@@ -757,56 +827,29 @@ async def resolve_uncertain_as_created(
 
     The caller must have fetched the booking and matched its marker, branch and
     write-critical fields first; this function only writes the verdict down.
-    ``run_id`` names the CURRENT resolution for audit. The wave that must be
-    locked and checked is derived from the ledger row's immutable origin
-    ``row.run_id`` here, inside the write primitive, so no caller can accidentally
-    guard the resolution run instead. The origin itself remains unchanged, and
-    the booking stays inside the rollback set of the apply that created it.
+    ``run_id`` names the CURRENT resolution for audit. ``expected`` is mandatory:
+    it is the exact row version the caller read before the live proof. The write
+    locks that expected origin wave, then the row, and refuses if any part moved
+    in between. The origin itself remains unchanged, and the booking stays inside
+    the rollback set of the apply that created it.
     """
-    origin_run_id = (
-        await session.execute(
-            select(EasyWeekMigrationLedger.run_id).where(
-                EasyWeekMigrationLedger.source_provider == PROVIDER_ALTEGIO,
-                EasyWeekMigrationLedger.source_company_id == source_company_id,
-                EasyWeekMigrationLedger.source_record_id == source_record_id,
-            )
-        )
-    ).scalar_one_or_none()
-    if origin_run_id is None:
-        raise RuntimeError(f"migration ledger row vanished company_id={source_company_id} record_id={source_record_id}")
-
-    await lock_migration_wave(session, source_company_id=source_company_id, run_id=origin_run_id)
-    row = (
-        await session.execute(
-            select(EasyWeekMigrationLedger)
-            .where(
-                EasyWeekMigrationLedger.source_provider == PROVIDER_ALTEGIO,
-                EasyWeekMigrationLedger.source_company_id == source_company_id,
-                EasyWeekMigrationLedger.source_record_id == source_record_id,
-            )
-            .with_for_update()
-        )
-    ).scalar_one_or_none()
-    if row is None:
-        raise RuntimeError(f"migration ledger row vanished company_id={source_company_id} record_id={source_record_id}")
-    if row.run_id != origin_run_id or row.status not in UNRESOLVED_STATUSES:
-        # The origin read above exists only to determine which advisory lock to
-        # take. Re-prove it under the wave lock and a row lock before writing,
-        # so a concurrent absent-resolution/reclaim cannot move the row to a new
-        # origin between those two operations.
-        raise RuntimeError(f"migration ledger row changed company_id={source_company_id} record_id={source_record_id}")
-    if await wave_handed_over(session, source_company_id=source_company_id, run_id=origin_run_id):
+    row = await _lock_expected_resolution_row(
+        session,
+        source_company_id=source_company_id,
+        source_record_id=source_record_id,
+        expected=expected,
+    )
+    if await wave_handed_over(session, source_company_id=source_company_id, run_id=expected.origin_run_id):
         # Promoting a row into a closed wave would leave that booking's
-        # reminders owned by nobody. The row stays `uncertain`, so the booking
-        # is still recorded and still visible to reconciliation — it needs an
-        # operator, not a silent promotion.
-        raise WaveClosed(source_company_id=source_company_id, run_id=origin_run_id)
+        # reminders owned by nobody. The row stays unresolved, so the booking
+        # remains visible to reconciliation and needs an operator.
+        raise WaveClosed(source_company_id=source_company_id, run_id=expected.origin_run_id)
 
     await _finalize(
         session,
         run_id=run_id,
-        source_company_id=source_company_id,
-        source_record_id=source_record_id,
+        source_company_id=row.source_company_id,
+        source_record_id=row.source_record_id,
         status=STATUS_CREATED,
         target_booking_uuid=target_booking_uuid,
         reason_code=None,
@@ -815,12 +858,59 @@ async def resolve_uncertain_as_created(
     )
 
 
+async def _lock_expected_resolution_row(
+    session: AsyncSession,
+    *,
+    source_company_id: int,
+    source_record_id: int,
+    expected: ResolutionExpectation,
+) -> EasyWeekMigrationLedger:
+    """Lock and re-prove the exact unresolved ledger version a caller read."""
+    identity_matches = (
+        expected.source_provider == PROVIDER_ALTEGIO
+        and expected.target_provider == PROVIDER_EASYWEEK
+        and expected.source_company_id == source_company_id
+        and expected.source_record_id == source_record_id
+        and expected.status in UNRESOLVED_STATUSES
+    )
+    if not identity_matches:
+        raise LedgerChangedDuringResolution(
+            source_company_id=source_company_id,
+            source_record_id=source_record_id,
+        )
+
+    # Expected origin first, row second. A reclaim under another run may not
+    # share this advisory key, but its row update serialises on FOR UPDATE and
+    # the full optimistic comparison below then refuses the stale proof.
+    await lock_migration_wave(
+        session,
+        source_company_id=source_company_id,
+        run_id=expected.origin_run_id,
+    )
+    row = (
+        await session.execute(
+            select(EasyWeekMigrationLedger)
+            .where(
+                EasyWeekMigrationLedger.id == expected.ledger_id,
+            )
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if row is None or resolution_expectation(row) != expected or row.status not in UNRESOLVED_STATUSES:
+        raise LedgerChangedDuringResolution(
+            source_company_id=source_company_id,
+            source_record_id=source_record_id,
+        )
+    return row
+
+
 async def resolve_uncertain_as_absent(
     session: AsyncSession,
     *,
     run_id: str,
     source_company_id: int,
     source_record_id: int,
+    expected: ResolutionExpectation,
     reason_code: str,
 ) -> None:
     """Record that an operator checked EasyWeek and the booking is NOT there.
@@ -832,16 +922,29 @@ async def resolve_uncertain_as_absent(
     Nothing here decides that on its own — the CLI requires a separate, explicit
     multi-step confirmation, and no automatic path ever reaches this function.
     """
+    row = await _lock_expected_resolution_row(
+        session,
+        source_company_id=source_company_id,
+        source_record_id=source_record_id,
+        expected=expected,
+    )
     await _finalize(
         session,
         run_id=run_id,
-        source_company_id=source_company_id,
-        source_record_id=source_record_id,
+        source_company_id=row.source_company_id,
+        source_record_id=row.source_record_id,
         status=STATUS_FAILED,
         target_booking_uuid=None,
         reason_code=reason_code,
         count_attempt=False,
     )
+    # The absence proof invalidates any previously stored target observation.
+    # A later reclaim must start without carrying the old UUID/fingerprint into
+    # its new pending attempt, where they could be mistaken for that attempt's
+    # result by reconciliation.
+    row.target_booking_uuid = None
+    row.target_snapshot_fingerprint = None
+    await session.flush()
 
 
 async def get_row(

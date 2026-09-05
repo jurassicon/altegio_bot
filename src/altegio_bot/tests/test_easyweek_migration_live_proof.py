@@ -17,6 +17,7 @@ so the proof is exercised through the actual commands, not around them.
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 import httpx
@@ -25,6 +26,7 @@ import pytest_asyncio
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from altegio_bot.easyweek_migration import ledger as ledger_module
+from altegio_bot.easyweek_migration import runner as runner_module
 from altegio_bot.easyweek_migration.customers import CustomerDirectory
 from altegio_bot.easyweek_migration.runner import (
     MODE_APPLY,
@@ -502,6 +504,146 @@ async def test_resolution_preserves_the_origin_run_and_never_posts(session_local
     assert resolved.run_id == apply_inputs.run_id
     assert resolved.last_resolution_run_id != apply_inputs.run_id
     assert transport.mutations == posts_before
+
+
+async def _resolve_absent_then_reclaim(
+    session_local,
+    *,
+    new_run_id: str,
+    resolution_run_id: str = "concurrent-absent",
+) -> None:
+    """Move the tested row through failed to a fresh pending attempt."""
+    async with session_local() as session:
+        async with session.begin():
+            row = await ledger_module.get_row(
+                session,
+                source_company_id=KARLSRUHE_COMPANY_ID,
+                source_record_id=KA_RECORD_B,
+            )
+            assert row is not None
+            fingerprint = row.source_fingerprint
+            await ledger_module.resolve_uncertain_as_absent(
+                session,
+                run_id=resolution_run_id,
+                source_company_id=KARLSRUHE_COMPANY_ID,
+                source_record_id=KA_RECORD_B,
+                expected=ledger_module.resolution_expectation(row),
+                reason_code="concurrent_absent_proof",
+            )
+    async with session_local() as session:
+        async with session.begin():
+            assert await ledger_module.claim_for_apply(
+                session,
+                run_id=new_run_id,
+                source_company_id=KARLSRUHE_COMPANY_ID,
+                source_record_id=KA_RECORD_B,
+                source_fingerprint=fingerprint,
+            )
+
+
+@pytest.mark.parametrize("reuse_origin", [False, True], ids=["new-run", "same-run"])
+async def test_resolve_created_rejects_a_proof_for_a_reclaimed_row(
+    session_local,
+    source,
+    monkeypatch,
+    reuse_origin,
+):
+    """The proof snapshot, not a fresh helper read, owns the final verdict."""
+    transport = RecordingTransport()
+    origin_run = await uncertain_without_target(session_local, source, transport)
+    transport.plant_booking(CREATED_UUIDS[KA_RECORD_B], record_id=KA_RECORD_B)
+    proof_started = asyncio.Event()
+    release_proof = asyncio.Event()
+    original = runner_module._prove_uncertain_row_against_target
+
+    async def _paused_proof(*args, **kwargs):
+        proof_started.set()
+        await release_proof.wait()
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(runner_module, "_prove_uncertain_row_against_target", _paused_proof)
+    inputs = resolve_inputs(run_id="stale-resolver")
+    async with make_write_client(transport) as client:
+        task = asyncio.create_task(run_resolve_created(session_local, inputs, write_client=client))
+        await proof_started.wait()
+        await _resolve_absent_then_reclaim(
+            session_local,
+            new_run_id=origin_run if reuse_origin else "replacement-run",
+        )
+        release_proof.set()
+        report = await task
+
+    row = {item.source_record_id: item for item in await ledger_rows(session_local)}[KA_RECORD_B]
+    assert report.errors == [ledger_module.LEDGER_CHANGED_DURING_RESOLUTION]
+    assert row.status == ledger_module.STATUS_PENDING
+    assert row.run_id == (origin_run if reuse_origin else "replacement-run")
+    assert row.target_booking_uuid is None
+    assert row.target_snapshot_fingerprint is None
+    assert row.last_resolution_run_id == "concurrent-absent"
+
+
+async def test_reconcile_rejects_a_proof_for_a_reclaimed_row(session_local, source, monkeypatch):
+    transport = RecordingTransport()
+    await uncertain_row_with_known_target(session_local, source, transport)
+    proof_started = asyncio.Event()
+    release_proof = asyncio.Event()
+    original = runner_module._prove_uncertain_row_against_target
+
+    async def _paused_proof(*args, **kwargs):
+        proof_started.set()
+        await release_proof.wait()
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(runner_module, "_prove_uncertain_row_against_target", _paused_proof)
+    async with make_write_client(transport) as client:
+        task = asyncio.create_task(run_reconcile(session_local, make_inputs(MODE_RECONCILE), write_client=client))
+        await proof_started.wait()
+        await _resolve_absent_then_reclaim(session_local, new_run_id="replacement-run")
+        release_proof.set()
+        report = await task
+
+    row = {item.source_record_id: item for item in await ledger_rows(session_local)}[KA_RECORD_B]
+    assert report.as_safe_dict()["reason_codes"][ledger_module.LEDGER_CHANGED_DURING_RESOLUTION] == 1
+    assert row.status == ledger_module.STATUS_PENDING
+    assert row.run_id == "replacement-run"
+    assert row.last_resolution_run_id == "concurrent-absent"
+
+
+async def test_two_resolvers_can_record_at_most_one_verdict(session_local, source, monkeypatch):
+    transport = RecordingTransport()
+    origin_run = await uncertain_without_target(session_local, source, transport)
+    transport.plant_booking(CREATED_UUIDS[KA_RECORD_B], record_id=KA_RECORD_B)
+    both_started = asyncio.Event()
+    release_proofs = asyncio.Event()
+    arrivals = 0
+    original = runner_module._prove_uncertain_row_against_target
+
+    async def _barrier_proof(*args, **kwargs):
+        nonlocal arrivals
+        arrivals += 1
+        if arrivals == 2:
+            both_started.set()
+        await release_proofs.wait()
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(runner_module, "_prove_uncertain_row_against_target", _barrier_proof)
+    first_inputs = resolve_inputs(run_id="resolver-one")
+    second_inputs = resolve_inputs(run_id="resolver-two")
+    async with make_write_client(transport) as first_client, make_write_client(transport) as second_client:
+        first = asyncio.create_task(run_resolve_created(session_local, first_inputs, write_client=first_client))
+        second = asyncio.create_task(run_resolve_created(session_local, second_inputs, write_client=second_client))
+        await both_started.wait()
+        release_proofs.set()
+        reports = await asyncio.gather(first, second)
+
+    successes = [report for report in reports if not report.errors]
+    conflicts = [report for report in reports if report.errors == [ledger_module.LEDGER_CHANGED_DURING_RESOLUTION]]
+    assert len(successes) == len(conflicts) == 1
+    row = {item.source_record_id: item for item in await ledger_rows(session_local)}[KA_RECORD_B]
+    assert row.status == ledger_module.STATUS_CREATED
+    assert row.run_id == origin_run
+    assert row.last_resolution_run_id in {"resolver-one", "resolver-two"}
+    assert row.last_resolution_run_id == successes[0].run_id
 
 
 def test_the_cli_refuses_resolve_created_without_a_customer_directory(tmp_path):

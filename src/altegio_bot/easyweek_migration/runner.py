@@ -53,10 +53,13 @@ from altegio_bot.easyweek_migration.canary import (
     CANARY_POST_UNCERTAIN,
     CANARY_READBACK_FAILED,
     CANARY_REPROOF_FAILED,
+    RECOVERY_PROOF_CHANGED,
     SCOPE_CONTRACTS_UNKNOWN,
     CanaryBinding,
+    CanaryRecoveryProofChanged,
     CanaryVerdict,
     RecoveryAdmission,
+    RecoveryProofExpectation,
     ScopeVerdict,
     build_binding,
     find_licensing_proof,
@@ -64,6 +67,7 @@ from altegio_bot.easyweek_migration.canary import (
     find_recoverable_canary_attempt,
     promote_proof_to_verified,
     record_proof,
+    recovery_proof_expectation,
 )
 from altegio_bot.easyweek_migration.classify import (
     ALREADY_MIGRATED,
@@ -1468,9 +1472,16 @@ async def run_reconcile(
         # The source fingerprint is carried alongside the report-safe row: it is
         # what the proof compares the live source against, and it never reaches
         # the report itself.
-        snapshot = [(ledger_module.row_as_safe_dict(row), row.source_fingerprint) for row in pending]
+        snapshot = [
+            (
+                ledger_module.row_as_safe_dict(row),
+                row.source_fingerprint,
+                ledger_module.resolution_expectation(row),
+            )
+            for row in pending
+        ]
 
-    for row, stored_fingerprint in snapshot:
+    for row, stored_fingerprint, row_expectation in snapshot:
         entry = dict(row)
         target = row.get("target_booking_uuid")
         company_id = int(row["source_company_id"])
@@ -1490,15 +1501,20 @@ async def run_reconcile(
         try:
             await write_client.get_booking(str(target))
         except EasyWeekNotFoundError:
-            async with session_maker() as session:
-                async with session.begin():
-                    await ledger_module.record_failed(
-                        session,
-                        run_id=inputs.run_id,
-                        source_company_id=company_id,
-                        source_record_id=record_id,
-                        reason_code=RECONCILE_CONFIRMED_ABSENT,
-                    )
+            try:
+                async with session_maker() as session:
+                    async with session.begin():
+                        await ledger_module.resolve_uncertain_as_absent(
+                            session,
+                            run_id=inputs.run_id,
+                            source_company_id=company_id,
+                            source_record_id=record_id,
+                            expected=row_expectation,
+                            reason_code=RECONCILE_CONFIRMED_ABSENT,
+                        )
+            except ledger_module.LedgerChangedDuringResolution:
+                _leave_uncertain(ledger_module.LEDGER_CHANGED_DURING_RESOLUTION)
+                continue
             entry["reconcile_outcome"] = RECONCILE_CONFIRMED_ABSENT
             report.reasons[RECONCILE_CONFIRMED_ABSENT] += 1
             report.failed_rows.append(entry)
@@ -1544,11 +1560,15 @@ async def run_reconcile(
                         run_id=inputs.run_id,
                         source_company_id=company_id,
                         source_record_id=record_id,
+                        expected=row_expectation,
                         target_booking_uuid=live.booking_uuid,
                         target_snapshot_fingerprint=live.fingerprint,
                     )
         except ledger_module.WaveClosed:
             _leave_uncertain(ledger_module.WAVE_CLOSED)
+            continue
+        except ledger_module.LedgerChangedDuringResolution:
+            _leave_uncertain(ledger_module.LEDGER_CHANGED_DURING_RESOLUTION)
             continue
         entry["reconcile_outcome"] = RECONCILE_CONFIRMED_CREATED
         report.reasons[RECONCILE_CONFIRMED_CREATED] += 1
@@ -2000,7 +2020,11 @@ async def _admit_canary_recovery(
     binding: CanaryBinding,
     company_id: int,
     record_id: int,
-) -> tuple[RecoveryAdmission, int | None]:
+) -> tuple[
+    RecoveryAdmission,
+    RecoveryProofExpectation | None,
+    ledger_module.ResolutionExpectation | None,
+]:
     """May this row be resolved against its own unverified canary attempt?
 
     The canary-side conditions live in :func:`find_recoverable_canary_attempt`;
@@ -2024,19 +2048,29 @@ async def _admit_canary_recovery(
             source_record_id=record_id,
         )
         if not admission.admitted or proof is None:
-            return admission, None
+            return admission, None, None
 
         row = await ledger_module.get_row(session, source_company_id=company_id, source_record_id=record_id)
         if row is None:
-            return RecoveryAdmission(admitted=False, reason=RESOLVE_ROW_MISSING), None
+            return RecoveryAdmission(admitted=False, reason=RESOLVE_ROW_MISSING), None, None
         if row.status not in (ledger_module.STATUS_UNCERTAIN, ledger_module.STATUS_PENDING):
-            return RecoveryAdmission(admitted=False, reason=RESOLVE_NOT_UNCERTAIN), None
+            return RecoveryAdmission(admitted=False, reason=RESOLVE_NOT_UNCERTAIN), None, None
         if row.run_id != proof.run_id:
-            return RecoveryAdmission(admitted=False, reason=RECOVERY_RUN_MISMATCH), None
+            return RecoveryAdmission(admitted=False, reason=RECOVERY_RUN_MISMATCH), None, None
         if (row.attempts or 0) != 1:
-            return RecoveryAdmission(admitted=False, reason=RECOVERY_ATTEMPTS_UNEXPECTED), None
+            return RecoveryAdmission(admitted=False, reason=RECOVERY_ATTEMPTS_UNEXPECTED), None, None
+        if (
+            row.source_fingerprint != proof.source_fingerprint
+            or row.target_booking_uuid != proof.target_booking_uuid
+            or row.target_snapshot_fingerprint != proof.target_snapshot_fingerprint
+        ):
+            return RecoveryAdmission(admitted=False, reason=RECOVERY_RUN_MISMATCH), None, None
 
-        return admission, proof.id
+        return (
+            admission,
+            recovery_proof_expectation(proof),
+            ledger_module.resolution_expectation(row),
+        )
 
 
 async def run_resolve_created(
@@ -2077,7 +2111,8 @@ async def run_resolve_created(
     scope, bindings = await _require_proven_scope(session_maker, inputs)
     report.scope = scope.as_safe_dict()
 
-    recoverable_proof_id: int | None = None
+    recoverable_proof: RecoveryProofExpectation | None = None
+    admitted_ledger: ledger_module.ResolutionExpectation | None = None
     if not scope.proven:
         # One exception, and only one: the canary whose own POST outcome is
         # unknown. Its proof is the wave's first, it is unverified precisely
@@ -2109,7 +2144,7 @@ async def run_resolve_created(
         # the exact match.
         admission = None
         for candidate in bindings:
-            admission, recoverable_proof_id = await _admit_canary_recovery(
+            admission, recoverable_proof, admitted_ledger = await _admit_canary_recovery(
                 session_maker,
                 inputs,
                 binding=candidate,
@@ -2133,6 +2168,7 @@ async def run_resolve_created(
         row = await ledger_module.get_row(session, source_company_id=company_id, source_record_id=record_id)
         row_snapshot = ledger_module.row_as_safe_dict(row) if row is not None else None
         stored_source_fingerprint = row.source_fingerprint if row is not None else None
+        row_expectation = ledger_module.resolution_expectation(row) if row is not None else None
 
     if row is None or row_snapshot is None or stored_source_fingerprint is None:
         report.errors.append(RESOLVE_ROW_MISSING)
@@ -2140,6 +2176,11 @@ async def run_resolve_created(
     if row_snapshot["status"] not in (ledger_module.STATUS_UNCERTAIN, ledger_module.STATUS_PENDING):
         report.errors.append(RESOLVE_NOT_UNCERTAIN)
         return report
+    if admitted_ledger is not None and row_expectation != admitted_ledger:
+        report.errors.append(ledger_module.LEDGER_CHANGED_DURING_RESOLUTION)
+        report.reasons[ledger_module.LEDGER_CHANGED_DURING_RESOLUTION] += 1
+        return report
+    assert row_expectation is not None
 
     evidence = await load_service_evidence(session_maker, inputs)
     report.service_evidence = evidence.as_safe_dict()
@@ -2182,19 +2223,28 @@ async def run_resolve_created(
                     run_id=inputs.run_id,
                     source_company_id=company_id,
                     source_record_id=record_id,
+                    expected=row_expectation,
                     target_booking_uuid=live.booking_uuid,
                     target_snapshot_fingerprint=live.fingerprint,
                 )
-                if recoverable_proof_id is not None:
+                if recoverable_proof is not None:
                     await promote_proof_to_verified(
                         session,
-                        proof_id=recoverable_proof_id,
+                        expected=recoverable_proof,
                         target_booking_uuid=live.booking_uuid,
                         target_snapshot=live,
                     )
     except ledger_module.WaveClosed:
         report.errors.append(ledger_module.WAVE_CLOSED)
         report.reasons[ledger_module.WAVE_CLOSED] += 1
+        return report
+    except ledger_module.LedgerChangedDuringResolution:
+        report.errors.append(ledger_module.LEDGER_CHANGED_DURING_RESOLUTION)
+        report.reasons[ledger_module.LEDGER_CHANGED_DURING_RESOLUTION] += 1
+        return report
+    except CanaryRecoveryProofChanged:
+        report.errors.append(RECOVERY_PROOF_CHANGED)
+        report.reasons[RECOVERY_PROOF_CHANGED] += 1
         return report
 
     entry = dict(row_snapshot)
@@ -2236,6 +2286,7 @@ async def run_resolve_absent(
     async with session_maker() as session:
         row = await ledger_module.get_row(session, source_company_id=company_id, source_record_id=record_id)
         row_snapshot = ledger_module.row_as_safe_dict(row) if row is not None else None
+        row_expectation = ledger_module.resolution_expectation(row) if row is not None else None
 
     if row is None or row_snapshot is None:
         report.errors.append(RESOLVE_ROW_MISSING)
@@ -2243,16 +2294,23 @@ async def run_resolve_absent(
     if row_snapshot["status"] not in (ledger_module.STATUS_UNCERTAIN, ledger_module.STATUS_PENDING):
         report.errors.append(RESOLVE_NOT_UNCERTAIN)
         return report
+    assert row_expectation is not None
 
-    async with session_maker() as session:
-        async with session.begin():
-            await ledger_module.resolve_uncertain_as_absent(
-                session,
-                run_id=inputs.run_id,
-                source_company_id=company_id,
-                source_record_id=record_id,
-                reason_code=RESOLVE_ABSENT_CONFIRMED,
-            )
+    try:
+        async with session_maker() as session:
+            async with session.begin():
+                await ledger_module.resolve_uncertain_as_absent(
+                    session,
+                    run_id=inputs.run_id,
+                    source_company_id=company_id,
+                    source_record_id=record_id,
+                    expected=row_expectation,
+                    reason_code=RESOLVE_ABSENT_CONFIRMED,
+                )
+    except ledger_module.LedgerChangedDuringResolution:
+        report.errors.append(ledger_module.LEDGER_CHANGED_DURING_RESOLUTION)
+        report.reasons[ledger_module.LEDGER_CHANGED_DURING_RESOLUTION] += 1
+        return report
 
     entry = dict(row_snapshot)
     entry["reconcile_outcome"] = RESOLVE_ABSENT_CONFIRMED

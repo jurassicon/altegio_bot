@@ -1029,6 +1029,153 @@ def test_the_pre_parser_mirrors_the_real_option_arity():
     }
     missing = sorted(set(real) - set(pre))
     assert missing == [], f"the pre-parser does not know these take a value: {missing}"
+    real_names = {
+        option
+        for action in cli.build_parser()._actions
+        for option in action.option_strings
+        if option not in {"-h", "--help"}
+    }
+    pre_names = {option for action in cli.build_pre_parser()._actions for option in action.option_strings}
+    assert pre_names == real_names, "the pre-parser option vocabulary drifted from the real parser"
+
+
+def test_both_parsers_reject_option_abbreviations():
+    real = cli.build_parser()
+    pre = cli.build_pre_parser()
+    assert real.allow_abbrev is pre.allow_abbrev is False
+
+    with pytest.raises(SystemExit) as exited:
+        real.parse_args(["plan", "--snap", "custom.json"])
+    assert exited.value.code == 2
+
+
+def test_a_rejected_snapshot_abbreviation_never_touches_its_value(tmp_path, monkeypatch):
+    custom = _applicable_snapshot(tmp_path / "custom.json")
+    default = _applicable_snapshot(tmp_path / "default.json")
+    monkeypatch.setattr(cli, "DEFAULT_SNAPSHOT", str(default))
+
+    with pytest.raises(SystemExit) as exited:
+        cli.main(["plan", "--snap", str(custom), "--company-id", "not-a-number"])
+
+    assert exited.value.code == 2
+    assert _is_destroyed(default), "the explicit plan still supersedes its valid default path"
+    assert read_snapshot(custom).digest, "a rejected abbreviation cannot select an arbitrary path"
+
+
+@pytest.mark.parametrize("mode", ["apply", "verify"])
+@pytest.mark.parametrize("mode_first", [True, False], ids=["mode-first", "option-first"])
+def test_malformed_non_plan_modes_with_unknown_options_never_invalidate(
+    tmp_path,
+    monkeypatch,
+    mode,
+    mode_first,
+):
+    custom = _applicable_snapshot(tmp_path / "custom.json")
+    default = _applicable_snapshot(tmp_path / "default.json")
+    monkeypatch.setattr(cli, "DEFAULT_SNAPSHOT", str(default))
+    argv = [mode, "--snap", str(custom)] if mode_first else ["--snap", str(custom), mode]
+
+    with pytest.raises(SystemExit) as exited:
+        cli.main(argv)
+
+    assert exited.value.code == 2
+    assert read_snapshot(custom).digest
+    assert read_snapshot(default).digest
+
+
+@pytest.mark.parametrize("mode", ["apply", "verify"])
+def test_full_options_before_non_plan_mode_preserve_the_snapshot(tmp_path, mode):
+    custom = _applicable_snapshot(tmp_path / "custom.json")
+
+    with pytest.raises(SystemExit) as exited:
+        cli.main(
+            [
+                "--snapshot",
+                str(custom),
+                "--run-id",
+                "plan",
+                "--company-id",
+                "758285",
+                "--manifest",
+                "m.json",
+                mode,
+                "--unknown-option",
+            ]
+        )
+
+    assert exited.value.code == 2
+    assert read_snapshot(custom).digest
+
+
+@pytest.mark.parametrize("mode", ["plan", "apply", "verify"])
+def test_a_missing_option_value_preserves_the_real_mode_policy(tmp_path, monkeypatch, mode):
+    snapshot = _applicable_snapshot(tmp_path / "plan.json")
+    monkeypatch.setattr(cli, "DEFAULT_SNAPSHOT", str(snapshot))
+
+    with pytest.raises(SystemExit) as exited:
+        cli.main([mode, "--company-id", "758285", "--snapshot"])
+
+    assert exited.value.code == 2
+    if mode == "plan":
+        assert _is_destroyed(snapshot)
+    else:
+        assert read_snapshot(snapshot).digest
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--help"],
+        ["plan", "--snapshot", "unused.json", "--help"],
+        ["--company-id", "758285", "--help"],
+    ],
+)
+def test_help_anywhere_before_the_separator_invalidates_nothing(tmp_path, monkeypatch, argv):
+    snapshot = _applicable_snapshot(tmp_path / "plan.json")
+    monkeypatch.setattr(cli, "DEFAULT_SNAPSHOT", str(snapshot))
+
+    with pytest.raises(SystemExit) as exited:
+        cli.main(argv)
+
+    assert exited.value.code == 0
+    assert read_snapshot(snapshot).digest
+
+
+@pytest.mark.parametrize("mode,destroyed", [("plan", True), ("apply", False), ("verify", False)])
+def test_literal_help_after_the_separator_follows_the_mode(tmp_path, mode, destroyed):
+    snapshot = _applicable_snapshot(tmp_path / "plan.json")
+
+    with pytest.raises(SystemExit) as exited:
+        cli.main([mode, "--snapshot", str(snapshot), "--", "--help"])
+
+    assert exited.value.code == 2
+    assert _is_destroyed(snapshot) is destroyed
+
+
+@pytest.mark.parametrize("mode,destroyed", [("plan", True), ("apply", False), ("verify", False)])
+def test_a_mode_after_the_separator_keeps_its_policy(tmp_path, monkeypatch, mode, destroyed):
+    snapshot = _applicable_snapshot(tmp_path / "plan.json")
+    monkeypatch.setattr(cli, "DEFAULT_SNAPSHOT", str(snapshot))
+
+    with pytest.raises(SystemExit) as exited:
+        cli.main(["--", mode])
+
+    assert exited.value.code == 2
+    assert _is_destroyed(snapshot) is destroyed
+
+
+@pytest.mark.parametrize("mode", ["apply", "verify"])
+def test_unknown_option_with_an_apparent_value_before_mode_is_not_a_plan(tmp_path, monkeypatch, mode):
+    custom = _applicable_snapshot(tmp_path / "custom.json")
+    default = _applicable_snapshot(tmp_path / "default.json")
+    monkeypatch.setattr(cli, "DEFAULT_SNAPSHOT", str(default))
+
+    with pytest.raises(SystemExit) as exited:
+        cli.main(["--future-option", "future-value", mode, "--snapshot", str(custom)])
+
+    assert exited.value.code == 2
+    assert read_snapshot(custom).digest
+    assert read_snapshot(default).digest
 
 
 # ---------------------------------------------------------------------------
@@ -1208,11 +1355,14 @@ async def test_promoting_an_uncertain_row_into_a_closed_wave_is_refused(session_
     with pytest.raises(db.ledger_module.WaveClosed):
         async with session_maker() as session:
             async with session.begin():
+                row = await session.get(EasyWeekMigrationLedger, row_id)
+                assert row is not None
                 await db.ledger_module.resolve_uncertain_as_created(
                     session,
                     run_id="run-1",
                     source_company_id=h.COMPANY,
                     source_record_id=900807,
+                    expected=db.ledger_module.resolution_expectation(row),
                     target_booking_uuid=str(h.BOOKING_TWO),
                     target_snapshot_fingerprint="e" * 64,
                 )

@@ -21,6 +21,8 @@
 | Repeat apply report не проходил собственный reader | Нулевой повтор исходного snapshot читается и подтверждается verify; противоречивый report всё ещё отвергается |
 | Verify не доказывал актуальные локальные данные и CRM-состояние | DB-проверки scope/client/evidence + один GET на пару через общий runtime proof + повторная DB-проверка после API walk |
 | Ошибка до build_plan оставляла старый применимый файл | Новый plan инвалидирует прежний snapshot до проверок; повреждённый manifest не оставляет старое разрешение по тому же пути |
+| Live proof можно было записать уже в повторно claim-нутую ledger-строку | `resolve-created` и `reconcile` фиксируют полную optimistic-версию строки до API walk; финальная транзакция под origin-wave lock и `SELECT FOR UPDATE` принимает verdict только для той же версии |
+| Основной parser принимал сокращения опций, а pre-parser их отвергал | Оба parser явно используют `allow_abbrev=False`; regression-тесты через настоящий `main` проверяют plan/apply/verify, options-before-mode, missing values, inline values, help и `--` |
 | Handover не имел отдельного обязательного CI-step | Все три handover test files явно перечислены с `REQUIRE_PG_CONCURRENCY=1`; contract test защищает шаг от пропусков и ослабления |
 
 ## Identity и архитектура
@@ -92,6 +94,24 @@ production recovery-пути в закрытой origin-волне оставл�
 оператора. `record_created` не отказывает в обычном apply: запись к тому моменту
 уже создана в EasyWeek, и скрывать её нельзя.
 
+Live resolution не держит PostgreSQL lock во время сетевого proof. До API walk
+сохраняется неизменяемое ожидание: ledger PK, provider/source/target identity,
+origin run, status, source/target fingerprints, attempts, audit/reason state и
+`updated_at`. После proof транзакция берёт advisory lock **ожидаемой** origin
+wave, затем точную ledger-строку через `SELECT FOR UPDATE` и сравнивает всё
+ожидание. `updated_at` служит optimistic token и обнаруживает также цикл
+`pending → failed → pending`, когда reclaim повторно использовал те же run ID и
+source fingerprint. Конфликт возвращает
+`migration_ledger_changed_during_resolution`, не меняет UUID/fingerprint или
+`last_resolution_run_id`; `reconcile` оставляет актуальную строку как есть и
+продолжает. `migration_wave_closed` остаётся отдельным исходом.
+
+Canary recovery в той же финальной транзакции дополнительно блокирует и
+сравнивает точную версию ранее admitted proof. Его binding, origin run,
+source/target facts, unknown-outcome reason и version token должны остаться
+неизменными. Поэтому обновлённый canary attempt нельзя повысить доказательством,
+полученным для старой попытки; откат ledger verdict и proof promotion общий.
+
 `verify` независимо читает closure-таблицу и требует строку с digest текущего
 snapshot для каждой пары company/run. В отчёте это
 `wave_closures_expected`, `wave_closures_verified`,
@@ -139,6 +159,14 @@ send-time fence сохраняют узкую защиту от поздних A
 до разбора аргументов, поэтому plan с ошибочными аргументами тоже не оставляет
 применимого разрешения; неуспешные apply и verify snapshot не трогают.
 
+Опции CLI не имеют сокращений: основной parser и предварительный parser
+используют одну политику `allow_abbrev=False` и одинаковую arity известных
+опций. Поэтому `--snap`, `--comp`, `--man` и `--run` не могут быть приняты
+основным parser после другого решения pre-parser. Fallback учитывает `--`,
+inline values и missing values; help считается help только до `--`. Явные или
+восстановленные `apply`/`verify` никогда не уничтожают snapshot, а распознаваемая
+попытка `plan` инвалидирует только путь, выбранный полной допустимой опцией.
+
 Повтор исходного snapshot с тем же digest допускает только нулевые мутации
 при сохранившемся coverage. Новое разрешение не переписывает marker чужого
 digest. Исчезнувшие или failed/canceled target jobs автоматически не чинятся.
@@ -153,7 +181,9 @@ Identity/scope: `migration_run_scope_invalid`, `manifest_scope_invalid`,
 `target_client_unproven`, `source_client_mismatch`, `local_target_mismatch`.
 
 Snapshots/state: `snapshot_invalidated`, `snapshot_invalidation_failed`,
-`migration_wave_unresolved`, `migration_wave_closed`, `candidate_set_changed`,
+`migration_wave_unresolved`, `migration_wave_closed`,
+`migration_ledger_changed_during_resolution`,
+`canary_recovery_proof_changed_during_resolution`, `candidate_set_changed`,
 `snapshot_incomplete_scope`,
 `snapshot_not_cutover_ready`, `snapshot_obligation_blocked`,
 `snapshot_obligations_incomplete`, `duplicate_job_identity`,
