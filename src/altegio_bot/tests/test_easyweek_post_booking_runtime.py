@@ -423,3 +423,44 @@ def test_the_compose_service_grants_no_standing_write_permission():
     # The permission is passed on the one command that writes, never baked in.
     body = yaml.safe_dump(service)
     assert "EASYWEEK_POST_BOOKING_HANDOVER_ALLOW_APPLY" not in body
+
+
+# ---------------------------------------------------------------------------
+# Review fix: an unanswerable question must not consume the obligation
+# ---------------------------------------------------------------------------
+
+
+async def test_an_unprovable_lookup_fails_the_delivery_rather_than_dropping_it(session_maker, monkeypatch):
+    """Suppressing on UNKNOWN is right for a send and wrong for planning.
+
+    The planner runs once per delivery and its caller acks the event, so a
+    transient lookup failure that merely skipped would lose the follow-up for
+    good — a client silently never asked for a review, with one log line as the
+    only trace. Raising leaves the event visible and re-drivable, and still
+    creates nothing.
+    """
+    from altegio_bot.post_booking_ownership import PostBookingOwner, PostBookingOwnershipUnproven
+
+    record_pk = await _seed_record(session_maker, migrated=True, handed_over=False)
+
+    async def unanswerable(*args, **kwargs):
+        return True, PostBookingOwner.UNKNOWN
+
+    monkeypatch.setattr(planner_mod, "altegio_post_booking_jobs_are_suppressed", unanswerable)
+
+    with pytest.raises(PostBookingOwnershipUnproven):
+        await _plan_event(session_maker, record_pk, status="create")
+
+    # Nothing was created for the three types, and nothing was silently skipped.
+    planned = await _jobs(session_maker, record_pk)
+    assert REVIEW_3D not in planned
+    assert REPEAT_10D not in planned
+
+
+def test_the_unproven_error_carries_no_pii():
+    from altegio_bot.post_booking_ownership import REASON_UNKNOWN, PostBookingOwnershipUnproven
+
+    message = str(PostBookingOwnershipUnproven())
+    assert message == REASON_UNKNOWN
+    for leaked in ("+49", "@", "http"):
+        assert leaked not in message

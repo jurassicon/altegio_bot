@@ -49,6 +49,7 @@ from altegio_bot.easyweek_migration.post_booking_handover import (
     STOP_SOURCE_JOB_SET_CHANGED,
     STOP_SOURCE_PROCESSING,
     STOP_SOURCE_RECORD,
+    STOP_TARGET_BRANCH_MISMATCH,
     STOP_TARGET_JOB_SET_CHANGED,
     STOP_TARGET_RECORD,
     STOP_WAVE_NOT_CLOSED,
@@ -235,6 +236,17 @@ async def build_plan(
         )
         if target is None:
             _refuse(STOP_TARGET_RECORD)
+            continue
+        # The booking uuid alone is not identity. The manifest says which
+        # EasyWeek location this Altegio company migrated into, and a target
+        # filed under another branch means source and target are crossed —
+        # cancelling that booking's Altegio follow-ups and marking the row
+        # would hand ownership to a branch nobody proved. The apply re-checks
+        # the value it froze, and the CLI pins the manifest digest, so proving
+        # it here binds the whole chain.
+        branch = manifest.branch(entry.source_company_id)
+        if branch is None or int(target.company_id) != int(branch.easyweek_location_id):
+            _refuse(STOP_TARGET_BRANCH_MISMATCH)
             continue
 
         source_jobs = await _jobs_for(session, provider=PROVIDER_ALTEGIO, record_pk=int(source.id))
@@ -609,12 +621,20 @@ async def verify_handover(
 
     open_source: list[int] = []
     target_now: list[int] = []
+    target_changed: list[int] = []
     outbox_now: list[int] = []
     for row in frozen.rows:
         source_jobs = await _jobs_for(session, provider=PROVIDER_ALTEGIO, record_pk=int(row["source_record_pk"]))
         open_source.extend(int(job.id) for job in source_jobs if job.status in {"queued", "processing"})
         target_jobs = await _jobs_for(session, provider=PROVIDER_EASYWEEK, record_pk=int(row["target_record_pk"]))
         target_now.extend(int(job.id) for job in target_jobs)
+        # Ids AND statuses. Comparing ids alone let a target `review_3d` be
+        # cancelled after the apply and still pass the check whose whole job is
+        # to prove the EasyWeek side was left exactly as it was reviewed.
+        if {int(job.id): str(job.status) for job in target_jobs} != {
+            int(item["job_id"]): str(item["status"]) for item in row["target_jobs"]
+        }:
+            target_changed.append(int(row["ledger_id"]))
         outbox_now.extend(
             int(value)
             for (value,) in (
@@ -640,6 +660,7 @@ async def verify_handover(
             "rows_missing_reminder_marker": sorted(set(lost_reminder_marker)),
             "open_source_job_ids": sorted(set(open_source)),
             "target_job_ids": sorted(set(target_now)),
+            "rows_with_changed_target_jobs": sorted(set(target_changed)),
             "scoped_outbox_ids": sorted(set(outbox_now)),
             "wave_closed": wave_closed,
             "report_marked": sorted(set(report.marked_ledger_ids) | set(report.already_marked_ledger_ids)),
@@ -656,6 +677,7 @@ async def verify_handover(
         and not findings["rows_missing_marker"]
         and not findings["rows_missing_reminder_marker"]
         and not findings["open_source_job_ids"]
+        and not findings["rows_with_changed_target_jobs"]
         and findings["counts_match"]
     )
     return findings

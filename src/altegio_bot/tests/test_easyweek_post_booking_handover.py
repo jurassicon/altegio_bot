@@ -34,6 +34,7 @@ from altegio_bot.easyweek_migration.post_booking_handover import (
     STOP_REMINDER_HANDOVER_INCOMPLETE,
     STOP_SOURCE_JOB_SET_CHANGED,
     STOP_SOURCE_PROCESSING,
+    STOP_TARGET_BRANCH_MISMATCH,
     STOP_TARGET_JOB_SET_CHANGED,
     STOP_WAVE_NOT_CLOSED,
     STOP_WAVE_UNRESOLVED,
@@ -51,6 +52,7 @@ from altegio_bot.models.models import (
     EasyWeekMigrationLedger,
     MessageJob,
     OutboxMessage,
+    Record,
 )
 from altegio_bot.post_booking_ownership import (
     PostBookingOwner,
@@ -932,3 +934,61 @@ def test_the_apply_report_shape_is_stable(tmp_path):
     payload: dict[str, Any] = json.loads(path.read_text())
     assert payload["kind"] == "post_booking_handover_apply"
     assert path.stat().st_mode & 0o777 == 0o600
+
+
+# ---------------------------------------------------------------------------
+# Review fixes: the target side is proven, not assumed
+# ---------------------------------------------------------------------------
+
+
+async def test_verify_fails_when_a_target_job_status_changed(session_maker, prepared):
+    """Ids alone were not proof: a cancelled target keeps its id.
+
+    The EasyWeek job is exactly what a proven `booking-succeeded` created and
+    what this phase must leave standing, so a verify that only counted ids
+    reported success for a wave whose target obligation had been withdrawn.
+    """
+    target = await add_target_job(session_maker, prepared, job_type=REVIEW)
+    planned = await plan(session_maker)
+    frozen = freeze_plan(planned)
+    result = await apply(session_maker, planned)
+    assert result.halted is None
+    report = result.apply_report(frozen, applied_at=datetime.now(timezone.utc))
+
+    async with session_maker() as session:
+        findings = await db.verify_handover(session, frozen, report)
+    assert findings["passed"] is True
+
+    async with session_maker() as session:
+        async with session.begin():
+            await session.execute(update(MessageJob).where(MessageJob.id == target).values(status="canceled"))
+
+    async with session_maker() as session:
+        findings = await db.verify_handover(session, frozen, report)
+    assert findings["passed"] is False
+    assert findings["rows_with_changed_target_jobs"] == [(await ledger_row(session_maker)).id]
+    # The id set is unchanged, which is exactly why it was not enough.
+    assert findings["target_job_ids"] == [target]
+
+
+async def test_a_target_in_another_branch_is_refused_by_the_plan(session_maker, prepared):
+    """The booking uuid alone is not identity.
+
+    The manifest says which EasyWeek location this Altegio company migrated
+    into. A target filed under a different one means source and target are
+    crossed, and cancelling that booking's Altegio follow-ups would hand
+    ownership to a branch nobody proved — durably, because the marker stays.
+    """
+    async with session_maker() as session:
+        async with session.begin():
+            await session.execute(
+                update(Record).where(Record.id == prepared["target_pk"]).values(company_id=h.LOCATION_ID + 1)
+            )
+
+    planned = await plan(session_maker)
+
+    assert planned.rows == ()
+    assert planned.refusals == {STOP_TARGET_BRANCH_MISMATCH: 1}
+    assert planned.apply_ready is False
+    # And nothing was written by asking.
+    assert (await ledger_row(session_maker)).post_booking_jobs_handed_over_at is None

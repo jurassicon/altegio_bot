@@ -70,6 +70,25 @@ REASON_HANDED_OVER: Final = "Canceled: post-booking marketing ownership handed o
 REASON_UNKNOWN: Final = "post-booking marketing ownership could not be proven"
 
 
+class PostBookingOwnershipUnproven(RuntimeError):
+    """The planner could not answer the ownership question at all.
+
+    Raised rather than returned, and only on the PLANNING side. Suppressing on
+    an unanswerable question is right for a send — nothing is lost by not
+    sending — but the planner runs once per delivery and its caller acks the
+    event afterwards, so quietly skipping would consume the obligation: the
+    booking would simply never get its follow-up, with a log line as the only
+    trace.
+
+    The inbox worker records the event as `failed` with this stable, PII-free
+    reason, which leaves it visible and re-drivable. Fail-closed either way; the
+    difference is whether a person can see it.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(REASON_UNKNOWN)
+
+
 class PostBookingOwner(str, Enum):
     """Who is responsible for this booking's marketing follow-ups."""
 

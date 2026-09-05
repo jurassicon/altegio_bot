@@ -75,6 +75,9 @@ STOP_WAVE_UNRESOLVED: Final = "migration_wave_unresolved"
 STOP_LEDGER_SCOPE_CHANGED: Final = "ledger_scope_changed"
 STOP_SOURCE_RECORD: Final = "source_record_unproven"
 STOP_TARGET_RECORD: Final = "target_record_unproven"
+# The target booking exists but is filed under another EasyWeek location than
+# the manifest pairs this Altegio company with. Source and target are crossed.
+STOP_TARGET_BRANCH_MISMATCH: Final = "target_branch_mismatch"
 STOP_SOURCE_PROCESSING: Final = "source_job_processing"
 STOP_NON_TERMINAL_OUTBOX: Final = "source_job_outbox_non_terminal"
 STOP_SOURCE_JOB_SET_CHANGED: Final = "source_job_set_changed"

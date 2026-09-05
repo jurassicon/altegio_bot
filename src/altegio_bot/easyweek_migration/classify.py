@@ -516,6 +516,21 @@ def fingerprint_matches_decision(stored: str | None, decision: Decision) -> bool
     """
     if decision.source_fingerprint is None or decision.source_record_id is None:
         return False
+    # The SOURCE slot, never the catalogue total. The legacy format stored
+    # `record.seance_length`, and until the staff-scoped duration normalization
+    # existed the two were always equal, so `duration_minutes` was harmless
+    # here. It is not any more: for a normalized master a booking stretched
+    # from 60 to 90 minutes keeps a catalogue total of 60, so recomputing the
+    # legacy hash from it matched the stored one and every path that asks this
+    # question — rollback, resolve, the previous-wave context and the final
+    # reconciliation — read a changed booking as unchanged, while
+    # `classify_record` (which uses the source slot) called it changed.
+    #
+    # The fallback keeps decisions built without the field answering exactly as
+    # before; a `ready` decision from the classifier always carries it.
+    booked = decision.source_booked_duration_minutes
+    if booked is None:
+        booked = decision.duration_minutes
     return _matches(
         stored,
         current=decision.source_fingerprint,
@@ -527,7 +542,7 @@ def fingerprint_matches_decision(stored: str | None, decision: Decision) -> bool
             starts_at_utc=decision.starts_at_utc,
             staff_uuid=decision.easyweek_staff_uuid,
             customer_uuid=decision.easyweek_customer_uuid,
-            booked_duration_minutes=decision.duration_minutes,
+            booked_duration_minutes=booked,
         ),
     )
 

