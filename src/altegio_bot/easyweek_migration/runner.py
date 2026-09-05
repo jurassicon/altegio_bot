@@ -171,6 +171,11 @@ logger = logging.getLogger("easyweek_migration.runner")
 # refusing the contract while the plan is built is what makes a dry-run and an
 # apply say the same thing about the same booking.
 
+# This wave's reminders already belong to EasyWeek. Adding a booking to it now
+# would create a row the handover can never have marked, so the apply refuses
+# and the operator migrates it under a NEW run id.
+BLOCK_WAVE_CLOSED: Final = ledger_module.WAVE_CLOSED
+
 MODE_INVENTORY: Final = "inventory"
 MODE_DRY_RUN: Final = "dry-run"
 MODE_APPLY: Final = "apply"
@@ -1204,15 +1209,34 @@ async def _apply_one(
     if card is None:
         return BLOCKED, CUSTOMER_UNADDRESSABLE
 
+    wave_closed = False
     async with session_maker() as session:
         async with session.begin():
-            claimed = await ledger_module.claim_for_apply(
-                session,
-                run_id=inputs.run_id,
-                source_company_id=company_id,
-                source_record_id=record_id,
-                source_fingerprint=decision.source_fingerprint,
+            # The wave, before the claim and in the same transaction. Two facts
+            # come from it: nobody else may add a row to this wave while we
+            # decide, and a wave whose reminders already moved to EasyWeek may
+            # not gain one at all — that booking's reminders would belong to
+            # neither side, because the handover has already proved and marked
+            # everything it could see. Refused HERE, before any POST: a booking
+            # not created is a row for an operator, a booking created and then
+            # unrecordable is a real appointment nobody owns.
+            await ledger_module.lock_migration_wave(session, source_company_id=company_id, run_id=inputs.run_id)
+            wave_closed = await ledger_module.wave_handed_over(
+                session, source_company_id=company_id, run_id=inputs.run_id
             )
+            claimed = (
+                False
+                if wave_closed
+                else await ledger_module.claim_for_apply(
+                    session,
+                    run_id=inputs.run_id,
+                    source_company_id=company_id,
+                    source_record_id=record_id,
+                    source_fingerprint=decision.source_fingerprint,
+                )
+            )
+    if wave_closed:
+        return BLOCKED, BLOCK_WAVE_CLOSED
     if not claimed:
         # Somebody else owns this source booking — a concurrent apply, or a row
         # that reached a terminal state between the plan and now. Not ours to
@@ -2149,6 +2173,18 @@ async def run_resolve_created(
     # neither does.
     async with session_maker() as session:
         async with session.begin():
+            # Same wave gate as an apply, for the same reason: promoting an
+            # uncertain row to `created` after the handover closed the wave
+            # would leave that booking's reminders owned by nobody.
+            await ledger_module.lock_migration_wave(
+                session, source_company_id=company_id, run_id=row_snapshot["run_id"]
+            )
+            if await ledger_module.wave_handed_over(
+                session, source_company_id=company_id, run_id=row_snapshot["run_id"]
+            ):
+                report.errors.append(ledger_module.WAVE_CLOSED)
+                report.reasons[ledger_module.WAVE_CLOSED] += 1
+                return report
             await ledger_module.resolve_uncertain_as_created(
                 session,
                 run_id=inputs.run_id,

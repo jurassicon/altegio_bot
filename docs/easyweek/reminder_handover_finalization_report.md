@@ -48,8 +48,38 @@ Reminder obligations рассчитываются существующими `pl
 
 ## Транзакция и конкуренция
 
-Lock order: ledger IDs → source/target Record IDs → связанные Client IDs →
-reminder MessageJob IDs, в каждом наборе по возрастанию ID.
+Lock order: **wave lock** (по одному на каждую пару company/run снимка, в
+отсортированном порядке) → ledger IDs → source/target Record IDs → связанные
+Client IDs → reminder MessageJob IDs, в каждом наборе по возрастанию ID.
+
+Wave lock — это transaction-scoped advisory lock, ключ которого выведен из
+`provider:company:run`. Он нужен потому, что row lock не может заблокировать
+строку, которой ещё нет: параллельный migration apply мог вставить новую
+`status=created` строку в ту же волну после последней проверки полноты и до
+commit, и handover сообщил бы успех для волны с бронированием, которое он не
+проверял, не покрывал и не помечал.
+
+Тот же lock берут все пути, способные добавить eligible-строку или перевести
+строку волны в `created`: ledger claim обычного apply, `resolve-created` и
+запись `created`. Возможны ровно два исхода:
+
+- писатель успел первым — handover видит лишнюю строку и целиком
+  останавливается с `eligible_scope_changed`, откатывая созданные target jobs,
+  отмены source jobs и markers;
+- handover успел первым — писатель ждёт освобождения и затем получает отказ
+  `migration_wave_closed`, потому что волна с перенесёнными напоминаниями не
+  может получить новое бронирование. Отказ происходит **до** запроса к EasyWeek,
+  поэтому запись вообще не создаётся.
+
+Волна с нерешёнными строками (`pending`, `uncertain`) к handover не допускается:
+такая строка может стать `created` уже после закрытия волны, а отказать ей
+позже нельзя — бронирование к тому моменту реально существует. Причина остановки
+— `migration_wave_unresolved`; сначала выполняется reconcile.
+
+Действия оператора при scope drift: выполнить reconcile до нуля нерешённых
+строк, затем новый plan; переносить бронирования, появившиеся после закрытия
+волны, отдельным новым `--run-id`. Другой run, другая компания и другой provider
+lock не берут и не ждут его.
 Apply задаёт локальные `lock_timeout=5s` и `statement_timeout=15s`.
 После locks повторно проверяются scope, полный source reminder set,
 fingerprints, configuration, identity, expiry и boundaries.
@@ -64,6 +94,15 @@ durable marker → commit. Любой halted результат откатыва
 send-time fence сохраняют узкую защиту от поздних Altegio-событий. Общая
 семантика `add_job`, lifecycle, review, retention и campaigns не изменена.
 
+Старое разрешение уничтожается, а не архивируется: попытка нового plan
+перезаписывает файл snapshot PII-free tombstone (`mode="invalidated"`,
+`invalidated_at`, `reason`), атомарно и с сохранением прав `0600`/`0700`.
+Авторизующих байт не остаётся, `read_snapshot` отвечает `snapshot_invalidated`,
+переименование tombstone ничего не восстанавливает, а apply/verify отказываются
+и по имени архивного пути — до открытия write-сессии. Инвалидация выполняется
+до разбора аргументов, поэтому plan с ошибочными аргументами тоже не оставляет
+применимого разрешения; неуспешные apply и verify snapshot не трогают.
+
 Повтор исходного snapshot с тем же digest допускает только нулевые мутации
 при сохранившемся coverage. Новое разрешение не переписывает marker чужого
 digest. Исчезнувшие или failed/canceled target jobs автоматически не чинятся.
@@ -77,7 +116,9 @@ Identity/scope: `migration_run_scope_invalid`, `manifest_scope_invalid`,
 `target_record_missing`, `provider_mismatch`, `company_mismatch`,
 `target_client_unproven`, `source_client_mismatch`, `local_target_mismatch`.
 
-Snapshots/state: `candidate_set_changed`, `snapshot_incomplete_scope`,
+Snapshots/state: `snapshot_invalidated`, `snapshot_invalidation_failed`,
+`migration_wave_unresolved`, `migration_wave_closed`, `candidate_set_changed`,
+`snapshot_incomplete_scope`,
 `snapshot_not_cutover_ready`, `snapshot_obligation_blocked`,
 `snapshot_obligations_incomplete`, `duplicate_job_identity`,
 `ledger_pair_ambiguous`, `eligible_scope_changed`, `ledger_changed`,

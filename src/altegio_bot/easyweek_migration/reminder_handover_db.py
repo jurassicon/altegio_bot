@@ -116,6 +116,9 @@ HALT_SOURCE_SCOPE_CHANGED: Final = "source_reminder_scope_changed"
 # marked by a different plan, or one that gained a marker since the plan was
 # taken. Never overwritten; a fresh operator-reviewed plan is the only way on.
 HALT_MARKER_CONFLICT: Final = "reminder_marker_conflict"
+# The wave still holds a row that could become `created` after this handover
+# closed it — a `pending` claim or an `uncertain` outcome. Reconcile first.
+HALT_WAVE_UNRESOLVED: Final = "migration_wave_unresolved"
 
 
 class HandoverError(Exception):
@@ -489,6 +492,32 @@ class ApplyResult:
         )
 
 
+async def _lock_wave(session: AsyncSession, frozen: FrozenPlan) -> None:
+    """Take the wave lock for every (company, run) this snapshot authorises.
+
+    Row locks cannot protect this handover on their own, and the gap is not
+    subtle: a row that does not exist yet cannot be locked. A concurrent
+    migration apply could therefore INSERT a brand-new `created` row into this
+    very wave after the last completeness check and before the commit, and the
+    handover would report success for a wave that had grown a booking it never
+    proved, never covered and never marked.
+
+    The wave lock closes that: every path able to add such a row — the apply's
+    ledger claim, the resolution of an uncertain row, the transition into
+    `created` — takes the same lock first. One of the two goes first. If the
+    writer does, this handover sees the extra row and refuses the whole wave; if
+    this handover does, the writer waits and is then refused by the marker it
+    finds, because a wave whose reminders have moved may not gain a booking.
+
+    Sorted, so two handovers of overlapping waves cannot deadlock.
+    """
+    pairs = sorted(
+        (int(company_id), str(run_id)) for company_id in frozen.company_ids for run_id in frozen.wave["run_ids"]
+    )
+    for company_id, run_id in pairs:
+        await ledger_module.lock_migration_wave(session, source_company_id=company_id, run_id=run_id)
+
+
 async def _lock_scope(session: AsyncSession, identities: list[dict[str, Any]]) -> None:
     """Take row locks on everything the transaction will read or write.
 
@@ -497,6 +526,8 @@ async def _lock_scope(session: AsyncSession, identities: list[dict[str, Any]]) -
     reminder between our check and our insert — the unique key would still save
     us from a duplicate, but the cancel half would then run against a picture
     that had already moved.
+
+    Rows only. What the wave may GROW by is `_lock_wave`'s job.
     """
     if not identities:
         return
@@ -586,13 +617,18 @@ async def _scope_still_matches(session: AsyncSession, identities: list[dict[str,
     return None
 
 
-async def _eligible_scope_still_complete(
-    session: AsyncSession,
-    frozen: FrozenPlan,
-    *,
-    lock: bool,
-) -> bool:
-    """Re-read the whole existing company/status scope while its rows are locked."""
+async def _eligible_scope_still_complete(session: AsyncSession, frozen: FrozenPlan) -> str | None:
+    """Re-read the whole company/run scope and name what moved, or ``None``.
+
+    Called under `_lock_wave`, which is what makes the answer still true at
+    commit time. Without that lock this was a plain ``SELECT`` whose result a
+    concurrent writer could invalidate a moment later — the `lock` parameter it
+    used to take was never anything but a comment.
+
+    Two different failures, named separately because the operator's next step
+    differs: a wave that CHANGED needs a fresh plan, while a wave still holding
+    an unresolved row needs a reconciliation first.
+    """
     stmt = (
         select(EasyWeekMigrationLedger)
         .where(EasyWeekMigrationLedger.source_provider == PROVIDER_ALTEGIO)
@@ -615,13 +651,26 @@ async def _eligible_scope_still_complete(
     actual = {
         (entry.id, entry.source_company_id, entry.source_record_id, str(entry.target_booking_uuid)) for entry in created
     }
-    return (
+    complete = (
         frozen.cutover_ready
         and not frozen.eligible_refusals
         and frozen.eligible_created_rows == len(frozen.rows)
         and len(created) == frozen.eligible_created_rows
         and actual == expected
     )
+    if not complete:
+        return HALT_ELIGIBLE_SCOPE_CHANGED
+
+    # A `pending` claim or an `uncertain` outcome is a booking that may still
+    # become `created` — after this transaction has closed the wave, and with no
+    # marker of its own. The wave lock cannot help there: that transition is
+    # legitimate and must not be refused once a real booking exists in EasyWeek.
+    # So the wave is required to be resolved BEFORE its reminders move, which is
+    # what the runbook already prescribes.
+    unresolved = {entry.status for entry in current if entry.status in ledger_module.UNRESOLVED_STATUSES}
+    if unresolved:
+        return HALT_WAVE_UNRESOLVED
+    return None
 
 
 async def _scoped_outbox_ids(session: AsyncSession, identities: list[dict[str, Any]]) -> tuple[int, ...]:
@@ -696,6 +745,9 @@ async def _apply_plan_inner(
     frozen_rows = frozen.rows
     identities = [row["identity"] for row in frozen_rows]
 
+    # Wave first, then rows: the wave lock decides who may ADD to this scope, and
+    # taking it after the row locks would leave that decision racing.
+    await _lock_wave(session, frozen)
     await _lock_scope(session, identities)
     # Include actual lock wait even when tests/operator inject the initial clock.
     from datetime import timedelta
@@ -711,8 +763,8 @@ async def _apply_plan_inner(
     if frozen.wave.get("configuration_digest") != configuration_digest():
         return ApplyResult(halted="configuration_changed")
 
-    if not await _eligible_scope_still_complete(session, frozen, lock=True):
-        return ApplyResult(halted=HALT_ELIGIBLE_SCOPE_CHANGED)
+    if reason := await _eligible_scope_still_complete(session, frozen):
+        return ApplyResult(halted=reason)
 
     # The COMPLETE set of open Altegio reminders, not merely the frozen ids.
     #
@@ -807,8 +859,10 @@ async def _apply_plan_inner(
 
     if unmet:
         return ApplyResult(halted=HALT_OBLIGATION_IDENTITY)
-    if not await _eligible_scope_still_complete(session, frozen, lock=False):
-        return ApplyResult(halted=HALT_ELIGIBLE_SCOPE_CHANGED)
+    # The same question again, after the inserts and still under the wave lock:
+    # nothing may have entered this wave while its reminders were being created.
+    if reason := await _eligible_scope_still_complete(session, frozen):
+        return ApplyResult(halted=reason)
     moment = started_at + timedelta(seconds=time.monotonic() - began)
     if boundary := boundary_still_future(frozen.rows, now=moment):
         return ApplyResult(halted=boundary)
@@ -1384,7 +1438,9 @@ async def verify_handover(
 
     current_outbox = await _scoped_outbox_ids(session, identities)
     outbox_unchanged = apply_report.scoped_outbox_ids_before == apply_report.scoped_outbox_ids_after == current_outbox
-    complete_scope = await _eligible_scope_still_complete(session, frozen, lock=False)
+    # A verify is read-only and takes no wave lock: it reports the state it
+    # finds. `None` is "the wave is still exactly the one that was applied".
+    complete_scope = await _eligible_scope_still_complete(session, frozen) is None
 
     counts_match = (
         len(apply_report.created_job_ids) == len(set(apply_report.created_job_ids))

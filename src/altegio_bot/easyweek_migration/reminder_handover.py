@@ -639,6 +639,63 @@ class SnapshotError(Exception):
     """The snapshot cannot authorise an apply. Always a full stop."""
 
 
+# What a destroyed authorisation leaves behind. `mode` is what `read_snapshot`
+# recognises, and nothing in the file can authorise anything: no rows, no job
+# ids, no booking uuids, no digest an apply could be pointed at.
+TOMBSTONE_MODE: Final = "invalidated"
+SNAPSHOT_INVALIDATED: Final = "snapshot_invalidated"
+
+
+def invalidate_snapshot(path: str | Path, *, reason: str, now: datetime | None = None) -> Path | None:
+    """Destroy an authorisation in place, leaving PII-free evidence that it existed.
+
+    Renaming was not enough, and the gap was not theoretical: the bytes stayed
+    valid, `read_snapshot` accepted them, and an operator could apply a plan the
+    tool had already decided not to stand behind — including one superseded
+    because the live EasyWeek picture had moved.
+
+    So the authorising bytes are OVERWRITTEN, at the same path, by a tombstone
+    that no reader accepts. There is no second copy to rename back, and the file
+    that remains says only that a plan was invalidated, when, and why.
+
+    Atomic: written to a temporary file in the same directory, fsynced, then
+    `os.replace`d over the original, so a crash leaves either the old snapshot
+    or the tombstone and never a half-written file. 0600 on the file, 0700 on
+    the directory, exactly like a snapshot.
+
+    Returns the tombstone path, or ``None`` when there was nothing to destroy.
+    Raises ``OSError`` — a failure to destroy an old authorisation is not
+    something a caller may shrug off.
+    """
+    target = Path(path)
+    if not target.exists():
+        return None
+    moment = now or datetime.now(timezone.utc)
+    payload = {
+        "version": SNAPSHOT_VERSION,
+        "mode": TOMBSTONE_MODE,
+        "invalidated_at": moment.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "reason": reason,
+    }
+    target.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(target.parent, DIR_MODE)
+    tmp = target.with_suffix(target.suffix + ".tombstone-tmp")
+    fd = os.open(tmp, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, SNAPSHOT_MODE)
+    try:
+        os.write(fd, json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"))
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp, target)
+    os.chmod(target, SNAPSHOT_MODE)
+    dir_fd = os.open(target.parent, os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+    return target
+
+
 @dataclass(frozen=True)
 class ApplyReport:
     """Durable, PII-free evidence emitted by one committed apply."""
@@ -903,6 +960,11 @@ def read_snapshot(path: str | Path) -> FrozenPlan:
         payload = json.loads(raw)
     except Exception:
         raise SnapshotError("the snapshot is not valid JSON") from None
+    if isinstance(payload, dict) and payload.get("mode") == TOMBSTONE_MODE:
+        # A destroyed authorisation. Named explicitly so an operator reading the
+        # refusal knows a plan was invalidated rather than corrupted, and so no
+        # amount of renaming turns this file back into a permission.
+        raise SnapshotError(SNAPSHOT_INVALIDATED)
     if not isinstance(payload, dict) or payload.get("version") != SNAPSHOT_VERSION:
         raise SnapshotError("the snapshot has an unexpected version")
     expected_top = {

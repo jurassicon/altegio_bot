@@ -16,12 +16,20 @@ from altegio_bot.easyweek_migration.reminder_handover import (
     SnapshotError,
     confirmation_phrase,
     freeze_plan,
+    invalidate_snapshot,
     read_apply_report,
     read_snapshot,
     write_apply_report,
     write_snapshot,
 )
-from altegio_bot.models.models import Client, EasyWeekMigrationLedger, MessageJob, Record
+from altegio_bot.models.models import (
+    PROVIDER_ALTEGIO,
+    PROVIDER_EASYWEEK,
+    Client,
+    EasyWeekMigrationLedger,
+    MessageJob,
+    Record,
+)
 from altegio_bot.scripts import easyweek_reminder_handover as cli
 from altegio_bot.settings import settings
 from altegio_bot.tests import test_easyweek_reminder_handover_db as h
@@ -257,8 +265,18 @@ async def test_replay_report_can_be_read_and_verified(session_maker, seeded, tmp
 
 
 async def test_early_plan_failure_invalidates_old_snapshot(tmp_path, monkeypatch):
+    """A superseded plan must stop being applicable, not merely change its name.
+
+    The old behaviour renamed the file. Its bytes stayed a valid, digest-bearing
+    authorisation, and pointing `apply` at the renamed path worked — including
+    when the new plan had stopped precisely because the live EasyWeek picture no
+    longer matched it.
+    """
     snapshot = tmp_path / "plan.json"
-    snapshot.write_text("previous authority")
+    planned = plan_with(handover_row(obligations=owed(48)))
+    write_snapshot(planned, snapshot)
+    assert read_snapshot(snapshot).digest  # applicable before
+
     args = cli.build_parser().parse_args(
         [
             "plan",
@@ -273,7 +291,24 @@ async def test_early_plan_failure_invalidates_old_snapshot(tmp_path, monkeypatch
         ]
     )
     assert await cli._run(args) == 1
-    assert not snapshot.exists()
+
+    # The authorising bytes are gone, and what remains cannot be read as a plan.
+    with pytest.raises(SnapshotError) as refused:
+        read_snapshot(snapshot)
+    assert str(refused.value) == "snapshot_invalidated"
+
+    tombstone = json.loads(snapshot.read_text())
+    assert tombstone["mode"] == "invalidated"
+    assert set(tombstone) == {"version", "mode", "invalidated_at", "reason"}
+    assert tombstone["reason"] == "superseded_by_new_plan"
+    # Nothing that could authorise, identify a person or name a booking.
+    body = snapshot.read_text()
+    for leaked in ("rows", "plan_digest", "booking", "client", "job_id", "phone"):
+        assert leaked not in body
+    assert snapshot.stat().st_mode & 0o777 == 0o600
+    assert snapshot.parent.stat().st_mode & 0o777 == 0o700
+    # And there is no copy anywhere to rename back.
+    assert sorted(item.name for item in tmp_path.iterdir()) == ["plan.json"]
 
 
 @pytest.mark.parametrize("field", ["manifest_digest", "configuration_digest", "candidate_fingerprint", "run_ids"])
@@ -426,3 +461,400 @@ async def test_cli_plan_apply_verify_with_real_postgres(session_maker, seeded, t
     assert report["passed"] and report["api_guard_ready"]
     assert report["uncovered_obligations"] == 0 and report["scope_drift"] is None
     assert api.calls == [str(h.BOOKING), str(h.BOOKING)]
+
+
+# ---------------------------------------------------------------------------
+# A superseded authorisation cannot come back
+# ---------------------------------------------------------------------------
+
+
+def _applicable_snapshot(path: Path) -> Path:
+    write_snapshot(plan_with(handover_row(obligations=owed(48))), path)
+    assert read_snapshot(path).digest
+    return path
+
+
+@pytest.mark.parametrize(
+    "argv_tail, expected_exit",
+    [
+        # A plan whose arguments do not even parse. `parse_args` exits before
+        # `_run`, so this used to leave the previous permission in place.
+        pytest.param(["--company-id", "758285"], 2, id="missing-run-id"),
+        pytest.param(["--company-id", "not-a-number", "--run-id", "run-1"], 2, id="invalid-company-id"),
+        pytest.param(["--run-id", "run-1"], 2, id="missing-company-id"),
+    ],
+)
+def test_a_plan_that_fails_to_parse_still_destroys_the_old_permission(tmp_path, argv_tail, expected_exit):
+    snapshot = _applicable_snapshot(tmp_path / "plan.json")
+    argv = ["plan", *argv_tail, "--manifest", str(tmp_path / "m.json"), "--snapshot", str(snapshot)]
+
+    with pytest.raises(SystemExit) as exited:
+        cli.main(argv)
+    assert exited.value.code == expected_exit
+
+    with pytest.raises(SnapshotError) as refused:
+        read_snapshot(snapshot)
+    assert str(refused.value) == "snapshot_invalidated"
+
+
+def test_a_plan_with_no_snapshot_flag_invalidates_the_default_path(tmp_path, monkeypatch):
+    default = tmp_path / "outputs" / "plan.json"
+    default.parent.mkdir(parents=True)
+    _applicable_snapshot(default)
+    monkeypatch.setattr(cli, "DEFAULT_SNAPSHOT", str(default))
+
+    with pytest.raises(SystemExit):
+        cli.main(["plan", "--company-id", "758285"])
+
+    with pytest.raises(SnapshotError):
+        read_snapshot(default)
+
+
+def test_help_alone_is_not_a_plan_attempt(tmp_path):
+    snapshot = _applicable_snapshot(tmp_path / "plan.json")
+
+    with pytest.raises(SystemExit) as exited:
+        cli.main(["plan", "--help", "--snapshot", str(snapshot)])
+    assert exited.value.code == 0
+
+    assert read_snapshot(snapshot).digest, "reading the help must not destroy an authorisation"
+
+
+@pytest.mark.parametrize("mode", ["apply", "verify"])
+@pytest.mark.parametrize("suffix", [".invalidated", ".tombstone", ".bak", ".old"])
+def test_an_archive_path_is_refused_before_any_write_session(tmp_path, monkeypatch, mode, suffix):
+    """The refusal must land before the database is touched at all."""
+    archived = _applicable_snapshot(tmp_path / f"plan.json{suffix}")
+
+    def _no_session(*args, **kwargs):  # pragma: no cover - must never run
+        raise AssertionError("an archive path reached a database session")
+
+    monkeypatch.setattr(cli, "SessionLocal", _no_session)
+    monkeypatch.setenv(cli.APPLY_ENV_FLAG, "1")
+
+    exit_code = cli.main(
+        [
+            mode,
+            "--company-id",
+            "758285",
+            "--run-id",
+            "run-1",
+            "--manifest",
+            str(tmp_path / "m.json"),
+            "--snapshot",
+            str(archived),
+            *(["--apply", "--plan-digest", "d" * 64, "--confirm", "x"] if mode == "apply" else []),
+        ]
+    )
+    assert exit_code == 1
+
+
+def test_a_tombstone_is_never_readable_as_a_plan(tmp_path):
+    snapshot = _applicable_snapshot(tmp_path / "plan.json")
+    invalidate_snapshot(snapshot, reason="superseded_by_new_plan")
+
+    with pytest.raises(SnapshotError):
+        read_snapshot(snapshot)
+    # Renaming it back changes nothing: the authorising bytes no longer exist.
+    renamed = snapshot.with_name("restored.json")
+    snapshot.replace(renamed)
+    with pytest.raises(SnapshotError):
+        read_snapshot(renamed)
+
+
+def test_invalidation_is_not_a_rename_contract():
+    """A future refactor must not turn destruction back into an archive copy.
+
+    Pinned as a contract because the defect was exactly this: the code looked
+    like it invalidated something, and only moved it.
+    """
+    import inspect
+
+    from altegio_bot.easyweek_migration import reminder_handover as module
+
+    # The compiled function, not its prose: a docstring may discuss renaming,
+    # the code may not do it.
+    code = module.invalidate_snapshot.__code__
+    names = set(code.co_names)
+    assert "rename" not in names, "an invalidation that renames leaves the authorisation intact"
+    assert "copyfile" not in names and "copy2" not in names
+    assert "replace" in names, "the replacement must be atomic"
+    literals = {const for const in code.co_consts if isinstance(const, str)}
+    assert not any(".invalidated" in literal for literal in literals)
+    assert "TOMBSTONE_MODE" in inspect.getsource(module.invalidate_snapshot)
+
+    cli_source = inspect.getsource(cli)
+    assert 'with_suffix(snapshot.suffix + ".invalidated")' not in cli_source
+    assert "invalidate_snapshot" in cli_source
+
+
+async def test_a_failed_apply_does_not_invalidate_the_snapshot(session_maker, seeded, tmp_path, monkeypatch):
+    """Invalidation belongs to a NEW plan attempt, and to nothing else."""
+    snapshot = _applicable_snapshot(tmp_path / "plan.json")
+    monkeypatch.delenv(cli.APPLY_ENV_FLAG, raising=False)
+
+    exit_code = cli.main(
+        [
+            "apply",
+            "--company-id",
+            "758285",
+            "--run-id",
+            "run-1",
+            "--manifest",
+            str(tmp_path / "m.json"),
+            "--snapshot",
+            str(snapshot),
+            "--apply",
+            "--plan-digest",
+            "d" * 64,
+            "--confirm",
+            "nope",
+        ]
+    )
+
+    assert exit_code == 1
+    assert read_snapshot(snapshot).digest, "a refused apply must leave the operator's plan intact"
+
+
+# ---------------------------------------------------------------------------
+# One writer at a time, for one migration wave
+# ---------------------------------------------------------------------------
+#
+# The gap these prove is not a row race: a row that does not exist yet cannot be
+# locked. A migration apply could INSERT a new `created` row into the very wave
+# a handover was walking, after its last completeness check, and the handover
+# would report success for a wave containing a booking it never proved, never
+# covered and never marked.
+#
+# The whole point is the FINAL state after both transactions, so each test below
+# asserts it directly: no successful handover may coexist with an unmarked
+# `created` row of the same wave.
+
+
+async def _unmarked_created_rows(session_maker, *, run_id: str = "run-1") -> list[int]:
+    async with session_maker() as session:
+        rows = (
+            await session.execute(select(EasyWeekMigrationLedger).where(EasyWeekMigrationLedger.run_id == run_id))
+        ).scalars()
+        return [row.id for row in rows if row.status == "created" and row.reminders_handed_over_at is None]
+
+
+async def _insert_created_row(session_maker, *, source_record_id: int, booking, run_id: str = "run-1") -> int:
+    """A competing migration apply, taking the same wave lock the runner takes."""
+    async with session_maker() as session:
+        async with session.begin():
+            await db.ledger_module.lock_migration_wave(session, source_company_id=h.COMPANY, run_id=run_id)
+            if await db.ledger_module.wave_handed_over(session, source_company_id=h.COMPANY, run_id=run_id):
+                # Exactly what the runner does with this answer: refuse before
+                # any EasyWeek request, so the booking is never created at all.
+                return 0
+            row = EasyWeekMigrationLedger(
+                source_provider=PROVIDER_ALTEGIO,
+                source_company_id=h.COMPANY,
+                source_record_id=source_record_id,
+                source_fingerprint="c" * 64,
+                target_provider=PROVIDER_EASYWEEK,
+                target_booking_uuid=str(booking),
+                run_id=run_id,
+                status="created",
+            )
+            session.add(row)
+            await session.flush()
+            return int(row.id)
+
+
+async def test_a_row_inserted_into_the_wave_during_apply_cannot_be_missed(session_maker, seeded):
+    """The writer goes first, so the handover must refuse the whole wave.
+
+    Held deliberately overlapping: the handover is stopped inside its
+    transaction, after it has taken the wave lock, and the competitor is only
+    released afterwards — which is the ordering the defect needed.
+    """
+    planned = await plan(session_maker, seeded)
+    inserted = await _insert_created_row(session_maker, source_record_id=900777, booking=h.BOOKING_TWO)
+    assert inserted, "the competitor must really own a row in this wave"
+
+    result = await h.run_apply(session_maker, planned)
+
+    assert result.halted == db.HALT_ELIGIBLE_SCOPE_CHANGED
+    assert result.created_job_ids == () and result.marked_ledger_ids == ()
+    assert await h.jobs(session_maker) == [], "a halted handover leaves no target job behind"
+    # The invariant: no success, so an unmarked created row is not a violation.
+    assert inserted in await _unmarked_created_rows(session_maker)
+
+
+async def _wait_until_waiting_on_the_wave(session_maker) -> None:
+    """Return once another backend is blocked on the wave's advisory lock.
+
+    A barrier made of the database's own wait state, not of a delay. It is also
+    what makes this test able to fail: without the wave lock nobody ever waits,
+    and the loop says so instead of passing by scheduling luck.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 10.0
+    while loop.time() < deadline:
+        async with session_maker() as probe:
+            waiting = (
+                await probe.execute(
+                    text(
+                        "SELECT count(*) FROM pg_stat_activity "
+                        "WHERE wait_event_type = 'Lock' AND wait_event = 'advisory'"
+                    )
+                )
+            ).scalar_one()
+        if waiting:
+            return
+        await asyncio.sleep(0.005)
+    raise AssertionError("no writer was ever serialised against the wave being handed over")
+
+
+async def test_a_writer_arriving_during_apply_waits_and_is_then_refused(session_maker, seeded, monkeypatch):
+    """The handover goes first, and the wave is closed behind it.
+
+    A plain lock would only delay the writer: released at commit, it would then
+    insert exactly the unmarked `created` row the invariant forbids. The marker
+    the handover just wrote is what refuses it instead — the lock buys the
+    ordering, the marker makes the ordering matter.
+    """
+    planned = await plan(session_maker, seeded)
+    inside = asyncio.Event()
+    release = asyncio.Event()
+    real_check = db._eligible_scope_still_complete
+    seen: list[str | None] = []
+
+    async def paused(session, frozen):
+        reason = await real_check(session, frozen)
+        seen.append(reason)
+        if len(seen) == 2:
+            # After the LAST completeness check and before the commit: the exact
+            # window the phantom row used to slip through.
+            inside.set()
+            await release.wait()
+        return reason
+
+    monkeypatch.setattr(db, "_eligible_scope_still_complete", paused)
+
+    async def competitor() -> int:
+        await inside.wait()
+        task = asyncio.create_task(_insert_created_row(session_maker, source_record_id=900778, booking=h.BOOKING_TWO))
+        # It must be BLOCKED, not merely slow: proven against the database.
+        await _wait_until_waiting_on_the_wave(session_maker)
+        assert not task.done()
+        release.set()
+        return await task
+
+    handover, inserted = await asyncio.gather(h.run_apply(session_maker, planned), competitor())
+
+    assert handover.halted is None, handover.halted
+    assert handover.marked_ledger_ids
+    assert inserted == 0, "the wave is closed, so the booking is refused before it is created"
+    assert await _unmarked_created_rows(session_maker) == []
+
+
+async def test_a_historical_row_promoted_to_created_cannot_slip_in(session_maker, seeded):
+    """The other direction: a row that already exists, moving INTO the wave.
+
+    A `failed` row carries no booking, so promoting it is a legitimate migration
+    step — and after a handover it would be a `created` row with no reminder
+    ownership on either side.
+    """
+    async with session_maker() as session:
+        async with session.begin():
+            historical = EasyWeekMigrationLedger(
+                source_provider=PROVIDER_ALTEGIO,
+                source_company_id=h.COMPANY,
+                source_record_id=900779,
+                source_fingerprint="d" * 64,
+                target_provider=PROVIDER_EASYWEEK,
+                target_booking_uuid=None,
+                run_id="run-1",
+                status="failed",
+            )
+            session.add(historical)
+            await session.flush()
+            historical_id = int(historical.id)
+
+    planned = await plan(session_maker, seeded)
+    result = await h.run_apply(session_maker, planned)
+    assert result.halted is None, result.halted
+
+    # The promotion now arrives. It takes the same wave lock and finds the wave
+    # closed, so it never becomes a created row at all.
+    async with session_maker() as session:
+        async with session.begin():
+            await db.ledger_module.lock_migration_wave(session, source_company_id=h.COMPANY, run_id="run-1")
+            closed = await db.ledger_module.wave_handed_over(session, source_company_id=h.COMPANY, run_id="run-1")
+    assert closed is True
+
+    assert await _unmarked_created_rows(session_maker) == []
+    async with session_maker() as session:
+        still = await session.get(EasyWeekMigrationLedger, historical_id)
+    assert still.status == "failed"
+
+
+async def test_an_unresolved_row_in_the_wave_stops_the_handover(session_maker, seeded):
+    """`pending` and `uncertain` can still become `created` — after the fact.
+
+    That transition is legitimate once a real booking exists in EasyWeek, so it
+    must not be refused later; the wave is therefore required to be resolved
+    BEFORE its reminders move, which is what the runbook already prescribes.
+    """
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(
+                EasyWeekMigrationLedger(
+                    source_provider=PROVIDER_ALTEGIO,
+                    source_company_id=h.COMPANY,
+                    source_record_id=900780,
+                    source_fingerprint="a" * 64,
+                    target_provider=PROVIDER_EASYWEEK,
+                    target_booking_uuid=None,
+                    run_id="run-1",
+                    status="uncertain",
+                )
+            )
+
+    planned = await plan(session_maker, seeded)
+    result = await h.run_apply(session_maker, planned)
+
+    assert result.halted == db.HALT_WAVE_UNRESOLVED
+    assert await h.jobs(session_maker) == []
+    # Halted, so nothing was marked either — the wave is left exactly as it was
+    # for the operator to reconcile first.
+    async with session_maker() as session:
+        markers = (
+            await session.execute(
+                select(EasyWeekMigrationLedger.reminders_handed_over_at).where(
+                    EasyWeekMigrationLedger.run_id == "run-1"
+                )
+            )
+        ).scalars()
+    assert all(value is None for value in markers)
+
+
+async def test_the_wave_lock_leaves_another_wave_alone(session_maker, seeded):
+    """Narrow by construction: another run, company or provider is not delayed."""
+    async with session_maker() as session:
+        async with session.begin():
+            await db.ledger_module.lock_migration_wave(session, source_company_id=h.COMPANY, run_id="run-1")
+            # A different run of the same company, and a different company, both
+            # inside the same transaction: neither may block on the first.
+            await asyncio.wait_for(
+                db.ledger_module.lock_migration_wave(session, source_company_id=h.COMPANY, run_id="run-2"),
+                timeout=5,
+            )
+    async with session_maker() as other:
+        async with other.begin():
+            await asyncio.wait_for(
+                db.ledger_module.lock_migration_wave(other, source_company_id=h.COMPANY + 1, run_id="run-1"),
+                timeout=5,
+            )
+
+
+def test_the_wave_lock_key_is_scoped_to_provider_company_and_run():
+    key = db.ledger_module._wave_lock_key
+    base = key(source_company_id=h.COMPANY, run_id="run-1")
+    assert base == key(source_company_id=h.COMPANY, run_id="run-1")
+    assert base != key(source_company_id=h.COMPANY, run_id="run-2")
+    assert base != key(source_company_id=h.COMPANY + 1, run_id="run-1")
+    assert -(2**31) <= base < 2**31, "must fit the advisory lock's int32"

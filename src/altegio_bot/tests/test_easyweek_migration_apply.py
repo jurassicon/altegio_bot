@@ -1047,3 +1047,69 @@ async def test_normal_logs_carry_no_pii(session_local, source, caplog):
     # report is where identifiers belong.
     assert KA_LOCATION_UUID not in text_log
     assert CREATED_UUIDS[KA_RECORD_A] not in text_log
+
+
+async def test_a_wave_whose_reminders_moved_refuses_a_new_booking(session_local, source):
+    """A closed wave may not gain a booking, and the refusal is before the POST.
+
+    Once the reminder handover has proved and marked a wave, a `created` row
+    added to it afterwards would be an appointment whose reminders belong to
+    neither side: Altegio's were withdrawn for the wave, and EasyWeek's are
+    created only for what the handover saw. So the apply refuses the row rather
+    than creating a booking nobody owns — and refuses it at the ledger claim,
+    before any request, because an unrecordable real appointment is worse than a
+    row an operator has to migrate under a new run id.
+    """
+    transport = RecordingTransport()
+    run_id = await _applied_run(session_local, source, transport)
+
+    # The handover ran for this wave.
+    async with session_local() as session:
+        async with session.begin():
+            await session.execute(
+                text(
+                    "UPDATE easyweek_migration_ledger "
+                    "SET reminders_handed_over_at = now(), reminder_handover_plan_digest = :digest "
+                    "WHERE run_id = :run_id"
+                ),
+                {"digest": "a" * 64, "run_id": run_id},
+            )
+
+    # A booking that was not in that wave now appears, and an operator re-runs
+    # the SAME run id over it.
+    source[KARLSRUHE_COMPANY_ID].append(record(id=900123, date="2026-09-13 10:00:00"))
+    plan = await run_dry_run(session_local)
+    before = len(transport.requests)
+    async with make_write_client(transport) as client:
+        report = await run_apply(
+            session_local,
+            make_inputs(MODE_APPLY, run_id=run_id, verified_dry_run_id=plan.plan_digest),
+            write_client=client,
+        )
+
+    blocked = [row for row in report.blocked_rows if row["source_record_id"] == 900123]
+    assert [row["reason"] for row in blocked] == ["migration_wave_closed"]
+    assert transport.requests[before:] == [] or not any(
+        request.method == "POST" and "900123" in request.content.decode() for request in transport.requests[before:]
+    )
+    rows = await ledger_rows(session_local)
+    assert all(row.source_record_id != 900123 for row in rows)
+
+
+async def test_a_wave_that_never_handed_over_still_accepts_new_bookings(session_local, source):
+    """The gate is the marker, not the run id: an open wave is unaffected."""
+    transport = RecordingTransport()
+    run_id = await _applied_run(session_local, source, transport)
+
+    source[KARLSRUHE_COMPANY_ID].append(record(id=900124, date="2026-09-13 10:00:00"))
+    plan = await run_dry_run(session_local)
+    async with make_write_client(transport) as client:
+        report = await run_apply(
+            session_local,
+            make_inputs(MODE_APPLY, run_id=run_id, verified_dry_run_id=plan.plan_digest),
+            write_client=client,
+        )
+
+    assert report.as_safe_dict()["totals"]["created"] == 1
+    rows = await ledger_rows(session_local)
+    assert any(row.source_record_id == 900124 and row.status == "created" for row in rows)

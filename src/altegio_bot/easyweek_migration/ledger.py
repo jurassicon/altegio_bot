@@ -41,12 +41,13 @@ operator fixes the manifest. It lives in the report, not in the ledger.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Final
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -109,6 +110,107 @@ async def load_ledger_views(
         )
         for row in rows
     }
+
+
+# ---------------------------------------------------------------------------
+# One migration wave, one writer at a time
+# ---------------------------------------------------------------------------
+# A wave is (provider, source company, origin run). Two things have to be true
+# about it at once, and neither is expressible as a row lock:
+#
+#   * while the reminder handover walks a wave, nobody may ADD an eligible row
+#     to it — a row lock cannot lock a row that does not exist yet; and
+#   * once a wave's reminders have been handed over to EasyWeek, nobody may add
+#     one afterwards either, because that booking's reminders would belong to
+#     nobody: the handover has already proved and marked everything it saw.
+#
+# The first is an advisory transaction lock keyed on the wave; the second is the
+# handover marker already stored on the wave's rows. Together they mean a writer
+# either goes first (and the handover then sees the extra row and refuses the
+# whole wave) or second (and is refused itself, before any EasyWeek request).
+#
+# Advisory, so it binds only the code paths that take it — which is why it lives
+# here, beside every path that can create an eligible row, rather than in the
+# handover alone.
+WAVE_LOCK_NAMESPACE: Final = 1163280712
+# The refusal a writer gets when the wave's reminders are already EasyWeek's.
+WAVE_CLOSED: Final = "migration_wave_closed"
+
+
+def _wave_lock_key(*, source_company_id: int, run_id: str) -> int:
+    """A stable int32 for one (provider, company, run). Not a secret, not an id."""
+    material = f"{PROVIDER_ALTEGIO}:{source_company_id}:{run_id}".encode("utf-8")
+    return int.from_bytes(hashlib.blake2b(material, digest_size=4).digest(), "big", signed=True)
+
+
+async def lock_migration_wave(session: AsyncSession, *, source_company_id: int, run_id: str) -> None:
+    """Serialise this transaction against every other writer of the same wave.
+
+    Transaction-scoped: released by the commit or the rollback, never left
+    behind by a crashed process. Keyed narrowly on provider, company and run, so
+    a different wave — another company, another run, another provider — is not
+    delayed by so much as a millisecond, and the existing isolation tests keep
+    passing unchanged.
+
+    Must be taken BEFORE the read that decides whether to write. Taken after,
+    it would serialise the writes while leaving the decisions racing.
+    """
+    await session.execute(
+        select(
+            func.pg_advisory_xact_lock(
+                WAVE_LOCK_NAMESPACE, _wave_lock_key(source_company_id=source_company_id, run_id=run_id)
+            )
+        )
+    )
+
+
+async def wave_handed_over(session: AsyncSession, *, source_company_id: int, run_id: str) -> bool:
+    """Have this wave's reminders already been handed over to EasyWeek?
+
+    True as soon as ONE row carries the marker: the handover marks every row of
+    the wave in a single transaction, so one marker means the whole wave was
+    proved, covered and closed. A booking added after that would be a `created`
+    row with no reminder ownership on either side — which is precisely the state
+    the handover exists to make impossible.
+
+    Read under `lock_migration_wave`, or the answer can change while it is being
+    acted on.
+    """
+    found = (
+        await session.execute(
+            select(EasyWeekMigrationLedger.id)
+            .where(
+                EasyWeekMigrationLedger.source_provider == PROVIDER_ALTEGIO,
+                EasyWeekMigrationLedger.source_company_id == source_company_id,
+                EasyWeekMigrationLedger.run_id == run_id,
+                EasyWeekMigrationLedger.reminders_handed_over_at.is_not(None),
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    return found is not None
+
+
+async def wave_unresolved_statuses(session: AsyncSession, *, source_company_id: int, run_id: str) -> tuple[str, ...]:
+    """Statuses in this wave that could still turn into `created`.
+
+    `pending` and `uncertain` are both "a booking may exist and we cannot say".
+    Either can become `created` later, by a reconciliation or by a resumed
+    apply — after a handover has closed the wave, which would leave that row
+    without reminder ownership. The runbook already requires a clean
+    reconciliation before the handover; this is that requirement, enforced.
+    """
+    rows = await session.execute(
+        select(EasyWeekMigrationLedger.status)
+        .where(
+            EasyWeekMigrationLedger.source_provider == PROVIDER_ALTEGIO,
+            EasyWeekMigrationLedger.source_company_id == source_company_id,
+            EasyWeekMigrationLedger.run_id == run_id,
+            EasyWeekMigrationLedger.status.in_(UNRESOLVED_STATUSES),
+        )
+        .distinct()
+    )
+    return tuple(sorted(str(value) for (value,) in rows.all()))
 
 
 async def claim_for_apply(
@@ -239,7 +341,16 @@ async def record_created(
     ``target_snapshot_fingerprint`` is the digest of the booking as written. It is
     what rollback later compares a live GET against, so a booking somebody moved
     or reassigned by hand is refused instead of cancelled.
+
+    Takes the wave lock — this is a transition INTO `created`, so it changes what
+    a reminder handover of the same wave would see. It does not refuse a closed
+    wave: the booking already exists in EasyWeek by the time this is called, and
+    an unrecordable real appointment is far worse than a row an operator has to
+    hand over separately. Refusing belongs at the claim, before the POST; the
+    handover refuses the wave from its own side when an unresolved row is still
+    able to reach `created`.
     """
+    await lock_migration_wave(session, source_company_id=source_company_id, run_id=run_id)
     await _finalize(
         session,
         run_id=run_id,

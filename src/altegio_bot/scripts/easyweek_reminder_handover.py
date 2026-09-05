@@ -59,10 +59,12 @@ from altegio_bot.easyweek_client import EasyWeekClient
 from altegio_bot.easyweek_migration.manifest import load_manifest
 from altegio_bot.easyweek_migration.reminder_handover import (
     DEFAULT_MAX_SNAPSHOT_AGE_SEC,
+    SNAPSHOT_INVALIDATED,
     SnapshotError,
     boundary_still_future,
     check_snapshot_usable,
     confirmation_phrase,
+    invalidate_snapshot,
     read_apply_report,
     read_snapshot,
     validate_run_ids,
@@ -184,13 +186,40 @@ def _apply_permitted(args: argparse.Namespace) -> bool:
     return bool(args.apply) and env == "true"
 
 
+# Suffixes an operator may reach for when a plan has been superseded. Refused by
+# name as well as by content: the content check is the guarantee, this one makes
+# the mistake obvious before anything is opened.
+ARCHIVE_SUFFIXES: Final = (".invalidated", ".tombstone", ".bak", ".old")
+
+
+def _invalidate_previous_plan(path: str, *, reason: str) -> str | None:
+    """Destroy the old authorisation, or say why it could not be destroyed.
+
+    Called for every real plan attempt, including one that never reaches its
+    arguments: a plan run means the operator has decided the previous permission
+    is superseded, and it must stop being usable at that moment rather than at
+    the moment the new plan happens to succeed.
+    """
+    try:
+        invalidate_snapshot(path, reason=reason)
+    except OSError:
+        # Fail closed. An old permission we could not destroy is exactly the
+        # thing that must not survive quietly.
+        return "snapshot_invalidation_failed"
+    return None
+
+
 async def _run(args: argparse.Namespace) -> int:
     if args.mode == MODE_PLAN:
         # Invalidating before any fallible read also covers invalid manifests,
         # API/configuration errors and interruption, not only blocked reports.
-        snapshot = Path(args.snapshot)
-        if snapshot.exists():
-            snapshot.replace(snapshot.with_suffix(snapshot.suffix + ".invalidated"))
+        # `main` has already done this for the argv it could read; repeating it
+        # here costs one stat and covers callers that build args themselves.
+        if failure := _invalidate_previous_plan(args.snapshot, reason="superseded_by_new_plan"):
+            return _fail(failure)
+    if args.mode in (MODE_APPLY, MODE_VERIFY) and Path(args.snapshot).suffix in ARCHIVE_SUFFIXES:
+        # Before the database session, before the manifest, before anything.
+        return _fail(SNAPSHOT_INVALIDATED)
     if not math.isfinite(args.pause_sec) or args.pause_sec < DEFAULT_PAUSE_SEC:
         return _fail("api_pacing_invalid")
     if not 1 <= args.max_snapshot_age_sec <= DEFAULT_MAX_SNAPSHOT_AGE_SEC:
@@ -314,8 +343,43 @@ async def _run(args: argparse.Namespace) -> int:
     return 0
 
 
+def _intended_plan_snapshot(argv: list[str] | None) -> str | None:
+    """The snapshot a plan command would write, read straight from argv.
+
+    `parse_args` exits on a bad argument, so a plan whose `--run-id` is missing
+    or whose company id is malformed never reaches `_run` — and used to leave the
+    previous authorisation sitting at its usual path, still applicable. The
+    operator's intent was already expressed by typing `plan`, so the old
+    permission has to go even when the rest of the command does not parse.
+
+    Deliberately tolerant and tiny: it reads the mode and `--snapshot` and
+    nothing else. `--help` is not a plan attempt.
+    """
+    tokens = list(sys.argv[1:] if argv is None else argv)
+    if any(token in ("-h", "--help") for token in tokens):
+        return None
+    mode = MODE_PLAN
+    for token in tokens:
+        if not token.startswith("-"):
+            mode = token
+            break
+    if mode != MODE_PLAN:
+        return None
+    snapshot = DEFAULT_SNAPSHOT
+    for index, token in enumerate(tokens):
+        if token == "--snapshot" and index + 1 < len(tokens):
+            snapshot = tokens[index + 1]
+        elif token.startswith("--snapshot="):
+            snapshot = token.split("=", 1)[1]
+    return snapshot
+
+
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    intended = _intended_plan_snapshot(argv)
+    if intended is not None:
+        if failure := _invalidate_previous_plan(intended, reason="superseded_by_new_plan"):
+            return _fail(failure)
     args = build_parser().parse_args(argv)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
