@@ -7906,17 +7906,33 @@ async def test_a_review_already_authorised_makes_the_next_visit_wait(
         assert client is not None and client.easyweek_visits_total == 4, "and the fourth visit was not lost"
 
 
+@pytest.mark.parametrize("warmed_up", ["counter", "outbox"])
 async def test_the_two_paths_serialise_instead_of_deadlocking(
     db: AsyncSession,
     session_maker: async_sessionmaker[AsyncSession],
     capture: CaptureProvider,
     monkeypatch: pytest.MonkeyPatch,
+    warmed_up: str,
 ) -> None:
     """Both take `Record` then `Client`, so neither can hold what the other wants.
 
-    Started together and bounded by a timeout: a lock-order inversion would show
-    up here as a PostgreSQL deadlock or as a test that never finishes, not as a
-    silently wrong count.
+    The two transactions race for one customer row and the test does NOT decide
+    who wins — it decides what each outcome has to look like. The evidence is
+    read where it is unambiguous: inside the counter's own transaction, right
+    after it takes the customer row, it asks whether this job's `OutboxMessage`
+    already exists. That single fact orders the two events for us:
+
+    * visible — the send was authorised AND made durable before the fourth visit
+      was recorded, which is the only way a review may go out here;
+    * not visible — the fourth visit landed first, so the review must be refused
+      rather than sent on a count that had already moved.
+
+    Asserting the equivalence in both directions is what makes this a proof: a
+    guard that no longer reads the count under a lock produces a sent review
+    whose Outbox row the counter never saw, and that combination fails here.
+
+    Bounded by a timeout throughout, so a lock-order inversion surfaces as a
+    PostgreSQL deadlock or a failed wait rather than as a silently wrong count.
     """
     monkeypatch.setattr(settings, "easyweek_review_send_enabled", True, raising=False)
     monkeypatch.setattr(settings, "easyweek_visit_counter_enabled", True, raising=False)
@@ -7924,24 +7940,61 @@ async def test_the_two_paths_serialise_instead_of_deadlocking(
     job_id, client_id = int(job.id), int(job.client_id)
     await _visits(db, job, 3)
     second = await _seed_second_booking_of_the_same_client(db, job)
+    second_pk = int(second.id)
     second_uuid, second_id = second.easyweek_booking_uuid, int(second.altegio_record_id)
     await db.commit()
+
+    counter_holds_its_record = asyncio.Event()
+    send_was_durable_first: list[bool] = []
 
     async def _count_the_second_visit() -> None:
         async with session_maker() as inbox_session:
             async with inbox_session.begin():
+                # The counter's OWN first lock, taken here so the race for the
+                # shared customer row starts from a known point for both sides.
+                # It is the same row `record_visit_counter` locks a moment later,
+                # in the same transaction, so nothing about its behaviour changes.
+                await inbox_session.execute(select(Record).where(Record.id == second_pk).with_for_update())
+                counter_holds_its_record.set()
+
                 await _record_visit_counter(
                     inbox_session,
                     _succeeded_visit_payload(booking_uuid=second_uuid, booking_id=second_id, visits_total=4),
                 )
+                # The customer row is ours now. Anything the outbox committed
+                # for this job happened strictly before this moment; anything it
+                # has not committed cannot be visible yet.
+                rows = (
+                    (await inbox_session.execute(select(OutboxMessage).where(OutboxMessage.job_id == job_id)))
+                    .scalars()
+                    .all()
+                )
+                send_was_durable_first.append(len(rows) == 1)
 
-    await asyncio.wait_for(
-        asyncio.gather(
-            _process_job_in_new_transaction(session_maker, job_id),
-            _count_the_second_visit(),
-        ),
-        timeout=15,
-    )
+    # Which side gets a head start is a parameter, not an outcome: the assertions
+    # below are the same either way, and each run states only that whatever
+    # happened is one of the two orders that may happen. Running both is what
+    # exercises both branches instead of leaving one of them theoretical.
+    outbox_reached_guard = asyncio.Event()
+    original_guard = ow._easyweek_review_visit_limit_error
+
+    async def _observed_guard(session: AsyncSession, candidate: MessageJob, record, client):
+        if candidate.id == job_id:
+            outbox_reached_guard.set()
+        return await original_guard(session, candidate, record, client)
+
+    monkeypatch.setattr(ow, "_easyweek_review_visit_limit_error", _observed_guard)
+
+    if warmed_up == "counter":
+        counter_task = asyncio.create_task(_count_the_second_visit())
+        await asyncio.wait_for(counter_holds_its_record.wait(), timeout=5)
+        outbox_task = asyncio.create_task(_process_job_in_new_transaction(session_maker, job_id))
+    else:
+        outbox_task = asyncio.create_task(_process_job_in_new_transaction(session_maker, job_id))
+        await asyncio.wait_for(outbox_reached_guard.wait(), timeout=5)
+        counter_task = asyncio.create_task(_count_the_second_visit())
+
+    await asyncio.wait_for(asyncio.gather(counter_task, outbox_task), timeout=15)
 
     async with session_maker() as verification:
         persisted = await verification.get(MessageJob, job_id)
@@ -7949,9 +8002,16 @@ async def test_the_two_paths_serialise_instead_of_deadlocking(
         rows = (await verification.execute(select(OutboxMessage).where(OutboxMessage.job_id == job_id))).scalars().all()
     assert client is not None and client.easyweek_visits_total == 4, "the visit is recorded either way"
     assert persisted is not None
-    # Whichever order the two transactions took, the outcome is one of exactly
-    # two correct ones — never a send decided on a count that had already moved.
-    if persisted.status == "done":
+    assert len(send_was_durable_first) == 1, "the counter finished exactly once"
+
+    # The equivalence, both ways: a review exists if and only if it was already
+    # durable when the fourth visit was recorded.
+    assert (persisted.status == "done") == send_was_durable_first[0], (
+        f"{warmed_up} first: status={persisted.status} but the counter "
+        f"{'saw' if send_was_durable_first[0] else 'did not see'} a committed send"
+    )
+
+    if send_was_durable_first[0]:
         assert len(rows) == 1
         assert len(capture.template_calls) == 1
     else:
